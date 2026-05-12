@@ -47,3 +47,6 @@ unused_must_use = "deny"
 dbg_macro = "warn"
 todo = "warn"
 unimplemented = "warn"
+
+[profile.release]
+strip = "symbols"
