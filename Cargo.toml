@@ -24,7 +24,7 @@ categories = ["compression"]
 [workspace.dependencies]
 aes = { version = "0.8", features = ["zeroize"] }
 clap = { version = "4.5", features = ["derive", "wrap_help"] }
-getrandom = "0.2"
+getrandom = "0.4"
 hmac = "0.12"
 libc = "0.2"
 rars = { version = "0.1.0", path = "crates/rars" }
