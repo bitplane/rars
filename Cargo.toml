@@ -34,7 +34,7 @@ rars-crc32 = { version = "0.1.0", path = "crates/rars-crc32" }
 rars-format = { version = "0.1.0", path = "crates/rars-format" }
 rars-recovery = { version = "0.1.0", path = "crates/rars-recovery" }
 rpassword = "7"
-sha1 = "0.10"
+sha1 = "0.11"
 sha2 = "0.11"
 zeroize = { version = "1.8", default-features = false, features = ["alloc", "zeroize_derive"] }
 
