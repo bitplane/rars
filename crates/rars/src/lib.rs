@@ -8,6 +8,7 @@
 pub use rars_format::{
     detect_archive_family, find_archive_start, rar13, rar15_40, rar50, ArchiveFamily,
     ArchiveReadOptions, ArchiveSignature, ArchiveVersion, Error, FeatureSet, Result,
+    SFX_SCAN_LIMIT,
 };
 use std::io::{Read, Write};
 use std::path::Path;
@@ -451,7 +452,8 @@ impl ArchiveReader {
 
     /// Parses an archive from memory using explicit read options.
     pub fn read_with_options(input: &[u8], options: ArchiveReadOptions<'_>) -> Result<Archive> {
-        let signature = find_archive_start(input, 128 * 1024).ok_or(Error::UnsupportedSignature)?;
+        let signature =
+            find_archive_start(input, SFX_SCAN_LIMIT).ok_or(Error::UnsupportedSignature)?;
         match signature.family {
             ArchiveFamily::Rar13 => Ok(Archive::Rar13(rar13::Archive::parse(input)?)),
             ArchiveFamily::Rar15To40 => Ok(Archive::Rar15To40(
@@ -470,7 +472,7 @@ impl ArchiveReader {
         options: ArchiveReadOptions<'_>,
     ) -> Result<Archive> {
         let signature =
-            find_archive_start(&input, 128 * 1024).ok_or(Error::UnsupportedSignature)?;
+            find_archive_start(&input, SFX_SCAN_LIMIT).ok_or(Error::UnsupportedSignature)?;
         match signature.family {
             ArchiveFamily::Rar13 => Ok(Archive::Rar13(rar13::Archive::parse_owned(input)?)),
             ArchiveFamily::Rar15To40 => Ok(Archive::Rar15To40(
@@ -496,9 +498,10 @@ impl ArchiveReader {
         let path = path.as_ref();
         let mut file = std::fs::File::open(path)?;
         let len = file.metadata()?.len();
-        let mut scan = vec![0; len.min(128 * 1024) as usize];
+        let mut scan = vec![0; len.min(SFX_SCAN_LIMIT as u64) as usize];
         file.read_exact(&mut scan)?;
-        let signature = find_archive_start(&scan, 128 * 1024).ok_or(Error::UnsupportedSignature)?;
+        let signature =
+            find_archive_start(&scan, SFX_SCAN_LIMIT).ok_or(Error::UnsupportedSignature)?;
         match signature.family {
             ArchiveFamily::Rar13 => Ok(Archive::Rar13(rar13::Archive::parse_path_with_signature(
                 path, signature,

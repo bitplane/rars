@@ -1,4 +1,4 @@
-use crate::detect::{find_archive_start, ArchiveSignature, RAR50_SIGNATURE};
+use crate::detect::{find_archive_start, ArchiveSignature, RAR50_SIGNATURE, SFX_SCAN_LIMIT};
 use crate::error::{Error, Result};
 use crate::io_util::{align16 as checked_align16, read_exact_at, read_u32};
 pub(crate) use crate::source::ArchiveSource;
@@ -440,10 +440,10 @@ impl Archive {
         let path = Arc::new(path.as_ref().to_path_buf());
         let mut file = File::open(path.as_ref())?;
         let len = file.metadata()?.len();
-        let scan_len = len.min(128 * 1024) as usize;
+        let scan_len = len.min(SFX_SCAN_LIMIT as u64) as usize;
         let mut scan = vec![0; scan_len];
         file.read_exact(&mut scan)?;
-        let sig = find_archive_start(&scan, 128 * 1024).ok_or(Error::UnsupportedSignature)?;
+        let sig = find_archive_start(&scan, SFX_SCAN_LIMIT).ok_or(Error::UnsupportedSignature)?;
         if sig.family != ArchiveFamily::Rar50Plus {
             return Err(Error::UnsupportedSignature);
         }
@@ -493,7 +493,7 @@ impl Archive {
     }
 
     fn parse_shared(input: Arc<[u8]>, password: Option<&[u8]>) -> Result<Self> {
-        let sig = find_archive_start(&input, 128 * 1024).ok_or(Error::UnsupportedSignature)?;
+        let sig = find_archive_start(&input, SFX_SCAN_LIMIT).ok_or(Error::UnsupportedSignature)?;
         if sig.family != ArchiveFamily::Rar50Plus {
             return Err(Error::UnsupportedSignature);
         }

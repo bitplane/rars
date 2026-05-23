@@ -23,7 +23,7 @@ mod source;
 mod volume_extract;
 mod x86_filter_scan;
 
-pub use detect::{detect_archive_family, find_archive_start, ArchiveSignature};
+pub use detect::{detect_archive_family, find_archive_start, ArchiveSignature, SFX_SCAN_LIMIT};
 pub use error::{Error, Result};
 pub use features::FeatureSet;
 pub use version::{ArchiveFamily, ArchiveVersion};

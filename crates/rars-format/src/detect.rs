@@ -4,6 +4,12 @@ pub const RAR13_SIGNATURE: &[u8; 4] = b"RE~^";
 pub const RAR15_SIGNATURE: &[u8; 7] = b"Rar!\x1a\x07\x00";
 pub const RAR50_SIGNATURE: &[u8; 8] = b"Rar!\x1a\x07\x01\x00";
 
+/// Default upper bound for scanning past an SFX stub when looking for the RAR
+/// signature. Most installers in the wild place the archive within a few
+/// hundred KiB, but large SFX modules (notably WinRAR's own installer plus a
+/// bundled runtime) can push the offset past 1 MiB.
+pub const SFX_SCAN_LIMIT: usize = 8 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ArchiveSignature {
@@ -94,5 +100,16 @@ mod tests {
         assert_eq!(sig.family, ArchiveFamily::Rar13);
         assert_eq!(sig.offset, 11);
         assert_eq!(sig.length, RAR13_SIGNATURE.len());
+    }
+
+    #[test]
+    fn sfx_scan_limit_finds_signature_past_128kib_stub() {
+        // Real SFX installers routinely place the RAR payload past 128 KiB
+        // (modern WinRAR-built SFXes, Nero, anti-virus installers, etc.).
+        let mut stub = vec![0u8; 300 * 1024];
+        stub.extend_from_slice(RAR15_SIGNATURE);
+        let sig = find_archive_start(&stub, SFX_SCAN_LIMIT).unwrap();
+        assert_eq!(sig.family, ArchiveFamily::Rar15To40);
+        assert_eq!(sig.offset, 300 * 1024);
     }
 }
