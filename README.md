@@ -2,7 +2,7 @@
 
 A Rust implementation of RAR.
 
-* [🏠 home](https://bitplane.net/rust/rars)
+* [🏠 home](https://bitplane.net/dev/rust/rars)
 * [🦀 crate](https://crates.io/crates/rars)
 * [🐱 source](https://github.com/bitplane/rars)
 
