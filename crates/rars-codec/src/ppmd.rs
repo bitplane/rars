@@ -2,10 +2,126 @@ use crate::{Error, Result};
 
 const MAX_FREQ: u32 = 124;
 const MIN_MODEL_CONTEXTS: usize = 1;
-// Compatibility cap for the virtual PPMd suballocator. RAR stores context
-// nodes in a compact allocator; using the Rust Context struct size here would
-// force model restarts earlier than compatible decoders.
+// Legacy cap retained for `model_context_limit`; the per-unit suballocator
+// is the actual restart trigger.
 const PPMD_CONTEXT_BYTES: usize = 16;
+
+// PPMd-H suballocator parameters, per the format-level spec at
+// rar-research/doc/PPMD_ALGORITHM_SPECIFICATION.md §4.
+const ALLOC_UNIT_BYTES: usize = 12;
+const N_BUCKETS: usize = 38;
+const MAX_BUCKET_UNITS: usize = 128;
+
+// Lookup tables built once from the spec's bucket-construction algorithm
+// (§4.2):
+//   for i in 0..38: step = if i >= 12 { 4 } else { i / 4 + 1 }
+//                   repeat step times: units_to_index[k++] = i
+//                   index_to_units[i] = k
+struct AllocTables {
+    units_to_index: [u8; MAX_BUCKET_UNITS],
+    index_to_units: [u8; N_BUCKETS],
+}
+
+fn build_alloc_tables() -> AllocTables {
+    let mut units_to_index = [0u8; MAX_BUCKET_UNITS];
+    let mut index_to_units = [0u8; N_BUCKETS];
+    let mut k: usize = 0;
+    for i in 0..N_BUCKETS {
+        let step = if i >= 12 { 4 } else { i / 4 + 1 };
+        for _ in 0..step {
+            if k < units_to_index.len() {
+                units_to_index[k] = i as u8;
+            }
+            k += 1;
+        }
+        index_to_units[i] = k.min(u8::MAX as usize) as u8;
+    }
+    AllocTables { units_to_index, index_to_units }
+}
+
+fn alloc_tables() -> &'static AllocTables {
+    use std::sync::OnceLock;
+    static TABLES: OnceLock<AllocTables> = OnceLock::new();
+    TABLES.get_or_init(build_alloc_tables)
+}
+
+#[derive(Debug, Clone)]
+struct Suballocator {
+    // Total byte budget (= dict_mb * 1 MiB).
+    pool_bytes: usize,
+    // Bytes currently committed to live unit allocations.
+    units_used: usize,
+    // Reserved-text byte budget (1/8 of the pool rounded to whole units,
+    // matching spec §5.2). text_ptr reaching this triggers a restart.
+    text_capacity: usize,
+    // Free-list block counts per bucket. We track counts only — no addresses,
+    // so we can't run the block-coalescing (glue) pass from §4.3. Without
+    // gluing, fragmentation makes us reach exhaustion fractionally earlier
+    // than the reference, but the restart trigger is the same condition.
+    free_counts: [u32; N_BUCKETS],
+}
+
+impl Default for Suballocator {
+    fn default() -> Self {
+        Self {
+            pool_bytes: 0,
+            units_used: 0,
+            text_capacity: 0,
+            free_counts: [0; N_BUCKETS],
+        }
+    }
+}
+
+impl Suballocator {
+    fn reset(&mut self, pool_bytes: usize) {
+        self.pool_bytes = pool_bytes;
+        self.units_used = 0;
+        self.text_capacity = (pool_bytes / 8 / ALLOC_UNIT_BYTES) * ALLOC_UNIT_BYTES;
+        self.free_counts = [0; N_BUCKETS];
+    }
+
+    fn bucket_for(units: usize) -> Option<usize> {
+        if units == 0 || units > MAX_BUCKET_UNITS {
+            return None;
+        }
+        Some(alloc_tables().units_to_index[units - 1] as usize)
+    }
+
+    fn bucket_units(bucket: usize) -> usize {
+        alloc_tables().index_to_units[bucket] as usize
+    }
+
+    fn alloc(&mut self, units: usize) -> bool {
+        let Some(bucket) = Self::bucket_for(units) else {
+            return false;
+        };
+        if self.free_counts[bucket] > 0 {
+            self.free_counts[bucket] -= 1;
+            return true;
+        }
+        let bytes = Self::bucket_units(bucket) * ALLOC_UNIT_BYTES;
+        // Uninitialised pool (test fixtures that bypass decode_init): act
+        // as unbounded rather than refusing everything.
+        if self.pool_bytes > 0 && self.units_used + bytes > self.pool_bytes {
+            return false;
+        }
+        self.units_used += bytes;
+        true
+    }
+
+    fn free(&mut self, units: usize) {
+        if let Some(bucket) = Self::bucket_for(units) {
+            self.free_counts[bucket] += 1;
+        }
+    }
+
+    fn text_has_room(&self, text_len: usize) -> bool {
+        // When pool isn't initialised (test fixtures that bypass decode_init),
+        // text_capacity is 0 — treat that as "unbounded" so we don't break
+        // out-of-band callers.
+        self.text_capacity == 0 || text_len < self.text_capacity
+    }
+}
 const BIN_SCALE: u32 = 1 << 14;
 const INT_BITS: u32 = 7;
 const PERIOD_BITS: u8 = 7;
@@ -42,6 +158,7 @@ pub struct PpmdDecoder {
     range: RangeDecoder,
     allocated: bool,
     max_contexts: usize,
+    suballoc: Suballocator,
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +264,18 @@ impl PpmdDecoder {
             range: RangeDecoder::new(),
             allocated: false,
             max_contexts: MIN_MODEL_CONTEXTS,
+            suballoc: Suballocator::default(),
+        }
+    }
+
+    // Units occupied by a context's state array. Single-state (binary)
+    // contexts store the state inline, so the array is 0 units. Otherwise
+    // ceil(n/2) units fit n states at 2-per-unit (states are 6 bytes each).
+    fn state_array_units(n: usize) -> usize {
+        if n < 2 {
+            0
+        } else {
+            (n + 1) / 2
         }
     }
 
@@ -176,6 +305,8 @@ impl PpmdDecoder {
             }
             let dictionary_mb = max_mb.unwrap_or(0) as usize + 1;
             self.max_contexts = model_context_limit(dictionary_mb);
+            self.suballoc
+                .reset(dictionary_mb.saturating_mul(1024 * 1024));
             self.init_model(max_order);
             self.allocated = true;
         } else if !self.allocated {
@@ -429,6 +560,12 @@ impl PpmdDecoder {
     fn init_model(&mut self, max_order: usize) {
         self.contexts.clear();
         self.text.clear();
+        // Spec §5.2 RestartModel: clear free lists, reserve root context
+        // (1 unit) + its 256-state array (128 units).
+        let pool = self.suballoc.pool_bytes;
+        self.suballoc.reset(pool);
+        self.suballoc.alloc(1);
+        self.suballoc.alloc(128);
         self.max_order = max_order;
         self.order_fall = max_order;
         self.init_rl = -(max_order.min(12) as i32) - 1;
@@ -654,6 +791,11 @@ impl PpmdDecoder {
             return Ok(());
         }
 
+        // Spec §8.3 step 3: text_ptr reaching units_start triggers a restart.
+        if !self.suballoc.text_has_room(self.text.len()) {
+            self.init_model(self.max_order);
+            return Ok(());
+        }
         self.text.push(found_symbol);
         let max_successor = Successor::Raw(self.text.len());
         let mut min_successor = fs.successor;
@@ -728,6 +870,11 @@ impl PpmdDecoder {
                     + u32::from(cf >= 12 * sf)
                     + u32::from(cf >= 15 * sf);
                 sum += cf;
+            }
+            let old_n = self.contexts[c].states.len();
+            if !self.grow_state_array(old_n, old_n + 1) {
+                self.init_model(self.max_order);
+                return Ok(());
             }
             self.contexts[c].states.push(State {
                 symbol: found_symbol,
@@ -818,13 +965,74 @@ impl PpmdDecoder {
         if self.contexts.len() >= self.max_contexts {
             return None;
         }
+        // 1 unit for the context header; binary contexts (1 state) carry
+        // their state inline, multi-state contexts also need a state array
+        // (allocated below).
+        if !self.suballoc.alloc(1) {
+            return None;
+        }
+        let array_units = Self::state_array_units(context.states.len());
+        if array_units > 0 && !self.suballoc.alloc(array_units) {
+            self.suballoc.free(1);
+            return None;
+        }
         let index = self.contexts.len();
         self.contexts.push(context);
         Some(index)
     }
 
+    // Grow a context's state array from `old_n` → `new_n` states. Models
+    // ExpandUnits: if the same bucket still fits, no realloc happens;
+    // otherwise allocate the new size first, then release the old slot.
+    fn grow_state_array(&mut self, old_n: usize, new_n: usize) -> bool {
+        let old_units = Self::state_array_units(old_n);
+        let new_units = Self::state_array_units(new_n);
+        if new_units == 0 || new_units <= old_units {
+            return true;
+        }
+        if old_units > 0 {
+            let old_b = Suballocator::bucket_for(old_units);
+            let new_b = Suballocator::bucket_for(new_units);
+            if old_b == new_b {
+                return true;
+            }
+        }
+        if !self.suballoc.alloc(new_units) {
+            return false;
+        }
+        if old_units > 0 {
+            self.suballoc.free(old_units);
+        }
+        true
+    }
+
+    // Rescale shrinks a state array. Models ShrinkUnits: if the surviving
+    // states still fit in the original bucket, nothing changes; otherwise
+    // return the old slot and reallocate at the smaller bucket.
+    fn shrink_state_array(&mut self, old_n: usize, new_n: usize) {
+        let old_units = Self::state_array_units(old_n);
+        let new_units = Self::state_array_units(new_n);
+        if old_units == 0 || new_units >= old_units {
+            return;
+        }
+        let old_b = Suballocator::bucket_for(old_units);
+        let new_b = if new_units > 0 {
+            Suballocator::bucket_for(new_units)
+        } else {
+            None
+        };
+        if old_b == new_b && new_b.is_some() {
+            return;
+        }
+        self.suballoc.free(old_units);
+        if new_units > 0 {
+            let _ = self.suballoc.alloc(new_units);
+        }
+    }
+
     fn rescale(&mut self) {
         let ctx = self.min_context;
+        let original_state_count = self.contexts[ctx].states.len();
         let mut states = self.contexts[ctx].states.clone();
         let found = self.found_state.index;
         if found != 0 {
@@ -860,11 +1068,13 @@ impl PpmdDecoder {
                 freq = (freq + 1) >> 1;
             }
             states[0].freq = freq as u8;
+            self.shrink_state_array(original_state_count, 1);
             self.contexts[ctx].states = states;
             self.found_state.index = 0;
             return;
         }
         self.contexts[ctx].summ_freq = (sum_freq + esc_freq - (esc_freq >> 1)) as u16;
+        self.shrink_state_array(original_state_count, states.len());
         self.contexts[ctx].states = states;
         self.found_state.index = 0;
     }
@@ -895,6 +1105,8 @@ impl PpmdEncoder {
         }
         let mut model = PpmdDecoder::new();
         model.max_contexts = model_context_limit(dictionary_mb);
+        model.suballoc
+            .reset(dictionary_mb.saturating_mul(1024 * 1024));
         model.init_model(max_order);
         model.allocated = true;
         Ok(Self {
@@ -1097,6 +1309,77 @@ fn model_context_limit(dictionary_mb: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alloc_tables_match_spec_pattern() {
+        let t = alloc_tables();
+        // Spec §4.2: bucket sizes are 1,2,3,4 then groups of 4 at strides 1,2,3,4.
+        // First 12 buckets cover 1..4, then 6,8,10,12, then 15,18,21,24.
+        assert_eq!(t.index_to_units[0], 1);
+        assert_eq!(t.index_to_units[1], 2);
+        assert_eq!(t.index_to_units[2], 3);
+        assert_eq!(t.index_to_units[3], 4);
+        assert_eq!(t.index_to_units[4], 6);
+        assert_eq!(t.index_to_units[5], 8);
+        assert_eq!(t.index_to_units[6], 10);
+        assert_eq!(t.index_to_units[7], 12);
+        assert_eq!(t.index_to_units[8], 15);
+        assert_eq!(t.index_to_units[9], 18);
+        assert_eq!(t.index_to_units[10], 21);
+        assert_eq!(t.index_to_units[11], 24);
+        // From bucket 12 onward, stride is 4: 28, 32, 36, 40 ... up to 128.
+        assert_eq!(t.index_to_units[12], 28);
+        assert_eq!(t.index_to_units[N_BUCKETS - 1], 128);
+
+        // 1-unit requests resolve to bucket 0; 2 → 1; 5,6 → 4 (the 6-unit bucket).
+        assert_eq!(t.units_to_index[0], 0);
+        assert_eq!(t.units_to_index[1], 1);
+        assert_eq!(t.units_to_index[4], 4); // 5 units
+        assert_eq!(t.units_to_index[5], 4); // 6 units (same bucket as 5)
+    }
+
+    #[test]
+    fn suballoc_alloc_until_exhaustion() {
+        let mut s = Suballocator::default();
+        s.reset(4 * ALLOC_UNIT_BYTES); // 48 bytes = 4 units
+        assert!(s.alloc(2)); // bucket 1 = 2 units
+        assert!(s.alloc(2)); // another 2 units → 4 used
+        assert!(!s.alloc(1)); // pool full
+    }
+
+    #[test]
+    fn suballoc_reuses_freed_bucket() {
+        let mut s = Suballocator::default();
+        s.reset(4 * ALLOC_UNIT_BYTES);
+        assert!(s.alloc(2));
+        assert!(s.alloc(2));
+        assert!(!s.alloc(2)); // full
+        s.free(2); // freed → bucket 1 has 1 slot
+        assert!(s.alloc(2)); // reuses freed slot
+        assert!(!s.alloc(2)); // pool truly full again
+    }
+
+    #[test]
+    fn suballoc_uninitialised_pool_acts_unbounded() {
+        let mut s = Suballocator::default();
+        // pool_bytes=0; the suballoc shouldn't reject any allocation since the
+        // model hasn't been told its budget yet.
+        for _ in 0..1000 {
+            assert!(s.alloc(2));
+        }
+        assert!(s.text_has_room(usize::MAX / 2));
+    }
+
+    #[test]
+    fn state_array_units_handles_boundaries() {
+        assert_eq!(PpmdDecoder::state_array_units(0), 0);
+        assert_eq!(PpmdDecoder::state_array_units(1), 0); // binary: inline
+        assert_eq!(PpmdDecoder::state_array_units(2), 1);
+        assert_eq!(PpmdDecoder::state_array_units(3), 2);
+        assert_eq!(PpmdDecoder::state_array_units(4), 2);
+        assert_eq!(PpmdDecoder::state_array_units(255), 128);
+        assert_eq!(PpmdDecoder::state_array_units(256), 128);
+    }
 
     struct Bytes<'a> {
         input: &'a [u8],
