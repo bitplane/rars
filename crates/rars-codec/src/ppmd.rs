@@ -11,6 +11,11 @@ const PPMD_CONTEXT_BYTES: usize = 16;
 const ALLOC_UNIT_BYTES: usize = 12;
 const N_BUCKETS: usize = 38;
 const MAX_BUCKET_UNITS: usize = 128;
+// Spec §4.3: countdown reset value after a successful glue pass.
+const GLUE_RESET: u32 = 255;
+// Sentinel offset for "no allocation" (binary contexts carry their state
+// inline; their array_offset field is unused but typed `u32`).
+const NULL_OFFSET: u32 = u32::MAX;
 
 // Lookup tables built once from the spec's bucket-construction algorithm
 // (§4.2):
@@ -45,39 +50,72 @@ fn alloc_tables() -> &'static AllocTables {
     TABLES.get_or_init(build_alloc_tables)
 }
 
+// Spec §4.1 layout: contexts grow downward from `hi_unit`, state arrays
+// grow upward from `lo_unit`. Tracking the side matters for adjacency
+// patterns (gluing) and for which bump pointer advances.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AllocSide {
+    Lo, // state arrays
+    Hi, // context headers
+}
+
 #[derive(Debug, Clone)]
 struct Suballocator {
-    // Total byte budget (= dict_mb * 1 MiB).
-    pool_bytes: usize,
-    // Bytes currently committed to live unit allocations.
-    units_used: usize,
-    // Reserved-text byte budget (1/8 of the pool rounded to whole units,
-    // matching spec §5.2). text_ptr reaching this triggers a restart.
-    text_capacity: usize,
-    // Free-list block counts per bucket. We track counts only — no addresses,
-    // so we can't run the block-coalescing (glue) pass from §4.3. Without
-    // gluing, fragmentation makes us reach exhaustion fractionally earlier
-    // than the reference, but the restart trigger is the same condition.
-    free_counts: [u32; N_BUCKETS],
+    // Total unit budget (= dict_mb * 1 MiB / 12, capped at u32::MAX).
+    pool_units: u32,
+    // Text region capacity in bytes (= pool_units / 8 * 12, per spec §5.2).
+    // text_ptr reaching this triggers a restart.
+    text_capacity_bytes: usize,
+    // Bump pointers (in units). lo_bump grows up, hi_bump grows down;
+    // valid bumpable space is [lo_bump, hi_bump). Both start at units_start.
+    units_start: u32,
+    lo_bump: u32,
+    hi_bump: u32,
+    // Free lists hold released block offsets (in units), one list per bucket.
+    free_lists: [Vec<u32>; N_BUCKETS],
+    // Countdown for the glue pass (spec §4.3). Starts at 0, gets refreshed
+    // to GLUE_RESET after each successful glue.
+    glue_count: u32,
+    // Test escape hatch: when reset hasn't been called (pool_units == 0),
+    // act as unbounded so unit tests bypassing decode_init still work.
+    unbounded: bool,
 }
 
 impl Default for Suballocator {
     fn default() -> Self {
+        const EMPTY: Vec<u32> = Vec::new();
         Self {
-            pool_bytes: 0,
-            units_used: 0,
-            text_capacity: 0,
-            free_counts: [0; N_BUCKETS],
+            pool_units: 0,
+            text_capacity_bytes: 0,
+            units_start: 0,
+            lo_bump: 0,
+            hi_bump: 0,
+            free_lists: [EMPTY; N_BUCKETS],
+            glue_count: 0,
+            unbounded: true,
         }
     }
 }
 
 impl Suballocator {
     fn reset(&mut self, pool_bytes: usize) {
-        self.pool_bytes = pool_bytes;
-        self.units_used = 0;
-        self.text_capacity = (pool_bytes / 8 / ALLOC_UNIT_BYTES) * ALLOC_UNIT_BYTES;
-        self.free_counts = [0; N_BUCKETS];
+        let pool_units_usize = pool_bytes / ALLOC_UNIT_BYTES;
+        // Cap at u32::MAX-1 (NULL_OFFSET is u32::MAX). Even 256 MiB / 12 =
+        // ~22M fits comfortably, so this is theoretical.
+        let pool_units = pool_units_usize.min(u32::MAX as usize - 1) as u32;
+        // Spec §5.2: units_start = hi_unit - 7 * (size / 8 / UNIT_SIZE) units.
+        // Equivalently: text region occupies pool_units / 8 units at the bottom.
+        let text_units = pool_units / 8;
+        self.pool_units = pool_units;
+        self.text_capacity_bytes = text_units as usize * ALLOC_UNIT_BYTES;
+        self.units_start = text_units;
+        self.lo_bump = text_units;
+        self.hi_bump = pool_units;
+        for fl in &mut self.free_lists {
+            fl.clear();
+        }
+        self.glue_count = 0;
+        self.unbounded = pool_bytes == 0;
     }
 
     fn bucket_for(units: usize) -> Option<usize> {
@@ -91,27 +129,128 @@ impl Suballocator {
         alloc_tables().index_to_units[bucket] as usize
     }
 
-    fn alloc(&mut self, units: usize) -> bool {
-        let Some(bucket) = Self::bucket_for(units) else {
-            return false;
-        };
-        if self.free_counts[bucket] > 0 {
-            self.free_counts[bucket] -= 1;
-            return true;
+    // Largest bucket whose size fits within `available_units` (used by the
+    // glue redistribution to chunk merged runs back into bucket-sized pieces).
+    fn largest_bucket_fitting(available_units: u32) -> Option<usize> {
+        if available_units == 0 {
+            return None;
         }
-        let bytes = Self::bucket_units(bucket) * ALLOC_UNIT_BYTES;
-        // Uninitialised pool (test fixtures that bypass decode_init): act
-        // as unbounded rather than refusing everything.
-        if self.pool_bytes > 0 && self.units_used + bytes > self.pool_bytes {
-            return false;
+        let cap = available_units.min(MAX_BUCKET_UNITS as u32) as usize;
+        // bucket_for(cap) returns the smallest bucket whose size >= cap; we
+        // want the largest bucket whose size <= cap. Walk down from there.
+        let mut bucket = alloc_tables().units_to_index[cap - 1] as usize;
+        while Self::bucket_units(bucket) > cap {
+            if bucket == 0 {
+                return None;
+            }
+            bucket -= 1;
         }
-        self.units_used += bytes;
-        true
+        Some(bucket)
     }
 
-    fn free(&mut self, units: usize) {
+    fn alloc(&mut self, units: usize, side: AllocSide) -> Option<u32> {
+        let bucket = Self::bucket_for(units)?;
+        if let Some(offset) = self.free_lists[bucket].pop() {
+            return Some(offset);
+        }
+        if let Some(offset) = self.try_bump(bucket, side) {
+            return Some(offset);
+        }
+        // Bump failed: trigger glue if cooled down, then retry.
+        if self.glue_count == 0 {
+            self.glue();
+            self.glue_count = GLUE_RESET;
+            if let Some(offset) = self.free_lists[bucket].pop() {
+                return Some(offset);
+            }
+            return self.try_bump(bucket, side);
+        }
+        self.glue_count = self.glue_count.saturating_sub(1);
+        None
+    }
+
+    fn try_bump(&mut self, bucket: usize, side: AllocSide) -> Option<u32> {
+        let block = Self::bucket_units(bucket) as u32;
+        if self.unbounded {
+            // No real pool; hand out monotonic offsets so each alloc is
+            // distinguishable but never adjacent to another (so gluing is
+            // a no-op for the tests).
+            let off = self.lo_bump;
+            self.lo_bump = self.lo_bump.saturating_add(block);
+            return Some(off);
+        }
+        // hi_bump - lo_bump is the bumpable headroom in units.
+        if self.hi_bump.saturating_sub(self.lo_bump) < block {
+            return None;
+        }
+        match side {
+            AllocSide::Lo => {
+                let off = self.lo_bump;
+                self.lo_bump += block;
+                Some(off)
+            }
+            AllocSide::Hi => {
+                self.hi_bump -= block;
+                Some(self.hi_bump)
+            }
+        }
+    }
+
+    fn free(&mut self, offset: u32, units: usize) {
+        if offset == NULL_OFFSET {
+            return;
+        }
         if let Some(bucket) = Self::bucket_for(units) {
-            self.free_counts[bucket] += 1;
+            self.free_lists[bucket].push(offset);
+        }
+    }
+
+    // Spec §4.3 GlueFreeBlocks: collect all free blocks, sort by offset,
+    // merge adjacent runs, then redistribute back into the free lists,
+    // splitting runs larger than MAX_BUCKET_UNITS into bucket-sized chunks.
+    fn glue(&mut self) {
+        // Collect every (offset, size_units) pair from all buckets.
+        let mut blocks: Vec<(u32, u32)> = Vec::new();
+        for bucket in 0..N_BUCKETS {
+            let size = Self::bucket_units(bucket) as u32;
+            for &offset in &self.free_lists[bucket] {
+                blocks.push((offset, size));
+            }
+            self.free_lists[bucket].clear();
+        }
+        if blocks.is_empty() {
+            return;
+        }
+        blocks.sort_unstable_by_key(|&(o, _)| o);
+
+        // Merge adjacent blocks into runs.
+        let mut run_start = blocks[0].0;
+        let mut run_size = blocks[0].1;
+        for &(off, size) in &blocks[1..] {
+            if run_start + run_size == off {
+                run_size += size;
+            } else {
+                self.emit_run(run_start, run_size);
+                run_start = off;
+                run_size = size;
+            }
+        }
+        self.emit_run(run_start, run_size);
+    }
+
+    // Re-bucket a run into the largest-fitting bucket(s), pushing offsets
+    // back onto the corresponding free lists.
+    fn emit_run(&mut self, mut offset: u32, mut remaining: u32) {
+        while remaining > 0 {
+            let Some(bucket) = Self::largest_bucket_fitting(remaining) else {
+                // Should not happen: any nonzero remaining has at least the
+                // 1-unit bucket available. Defensive: drop the residue.
+                return;
+            };
+            let size = Self::bucket_units(bucket) as u32;
+            self.free_lists[bucket].push(offset);
+            offset += size;
+            remaining -= size;
         }
     }
 
@@ -119,7 +258,7 @@ impl Suballocator {
         // When pool isn't initialised (test fixtures that bypass decode_init),
         // text_capacity is 0 — treat that as "unbounded" so we don't break
         // out-of-band callers.
-        self.text_capacity == 0 || text_len < self.text_capacity
+        self.text_capacity_bytes == 0 || text_len < self.text_capacity_bytes
     }
 }
 const BIN_SCALE: u32 = 1 << 14;
@@ -173,6 +312,12 @@ struct Context {
     states: Vec<State>,
     summ_freq: u16,
     suffix: Option<usize>,
+    // Simulated suballoc offsets so gluing (spec §4.3) can detect adjacency.
+    // header_offset: from Hi side (1 unit). array_offset: from Lo side,
+    // set to NULL_OFFSET for binary contexts (states.len() == 1) which
+    // carry their state inline.
+    header_offset: u32,
+    array_offset: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -561,11 +706,19 @@ impl PpmdDecoder {
         self.contexts.clear();
         self.text.clear();
         // Spec §5.2 RestartModel: clear free lists, reserve root context
-        // (1 unit) + its 256-state array (128 units).
-        let pool = self.suballoc.pool_bytes;
-        self.suballoc.reset(pool);
-        self.suballoc.alloc(1);
-        self.suballoc.alloc(128);
+        // (1 unit from Hi) + its 256-state array (128 units from Lo).
+        let pool_bytes = self.suballoc.pool_units as usize * ALLOC_UNIT_BYTES;
+        let unbounded_before = self.suballoc.unbounded;
+        let reset_arg = if unbounded_before { 0 } else { pool_bytes };
+        self.suballoc.reset(reset_arg);
+        let header_offset = self
+            .suballoc
+            .alloc(1, AllocSide::Hi)
+            .unwrap_or(NULL_OFFSET);
+        let array_offset = self
+            .suballoc
+            .alloc(128, AllocSide::Lo)
+            .unwrap_or(NULL_OFFSET);
         self.max_order = max_order;
         self.order_fall = max_order;
         self.init_rl = -(max_order.min(12) as i32) - 1;
@@ -583,6 +736,8 @@ impl PpmdDecoder {
             states,
             summ_freq: 257,
             suffix: None,
+            header_offset,
+            array_offset,
         });
         self.min_context = 0;
         self.max_context = 0;
@@ -872,7 +1027,7 @@ impl PpmdDecoder {
                 sum += cf;
             }
             let old_n = self.contexts[c].states.len();
-            if !self.grow_state_array(old_n, old_n + 1) {
+            if !self.grow_state_array(c, old_n + 1) {
                 self.init_model(self.max_order);
                 return Ok(());
             }
@@ -954,6 +1109,8 @@ impl PpmdDecoder {
                 }],
                 summ_freq: 0,
                 suffix: Some(c),
+                header_offset: NULL_OFFSET,
+                array_offset: NULL_OFFSET,
             })?;
             self.state_mut(state_ref).ok()?.successor = Successor::Context(context);
             c = context;
@@ -961,30 +1118,40 @@ impl PpmdDecoder {
         Some(c)
     }
 
-    fn push_context(&mut self, context: Context) -> Option<usize> {
+    fn push_context(&mut self, mut context: Context) -> Option<usize> {
         if self.contexts.len() >= self.max_contexts {
             return None;
         }
-        // 1 unit for the context header; binary contexts (1 state) carry
-        // their state inline, multi-state contexts also need a state array
-        // (allocated below).
-        if !self.suballoc.alloc(1) {
-            return None;
-        }
+        // 1 unit for the context header (Hi side); binary contexts (1 state)
+        // carry their state inline, multi-state contexts also need a state
+        // array (Lo side).
+        let header_offset = self.suballoc.alloc(1, AllocSide::Hi)?;
         let array_units = Self::state_array_units(context.states.len());
-        if array_units > 0 && !self.suballoc.alloc(array_units) {
-            self.suballoc.free(1);
-            return None;
-        }
+        let array_offset = if array_units > 0 {
+            match self.suballoc.alloc(array_units, AllocSide::Lo) {
+                Some(off) => off,
+                None => {
+                    self.suballoc.free(header_offset, 1);
+                    return None;
+                }
+            }
+        } else {
+            NULL_OFFSET
+        };
+        context.header_offset = header_offset;
+        context.array_offset = array_offset;
         let index = self.contexts.len();
         self.contexts.push(context);
         Some(index)
     }
 
-    // Grow a context's state array from `old_n` → `new_n` states. Models
-    // ExpandUnits: if the same bucket still fits, no realloc happens;
-    // otherwise allocate the new size first, then release the old slot.
-    fn grow_state_array(&mut self, old_n: usize, new_n: usize) -> bool {
+    // Grow a context's state array from its current size → `new_n` states.
+    // Models ExpandUnits: if the same bucket still fits, no realloc happens;
+    // otherwise allocate the new size first, then release the old slot. The
+    // context's array_offset is updated to point at the new block when
+    // moved.
+    fn grow_state_array(&mut self, ctx_idx: usize, new_n: usize) -> bool {
+        let old_n = self.contexts[ctx_idx].states.len();
         let old_units = Self::state_array_units(old_n);
         let new_units = Self::state_array_units(new_n);
         if new_units == 0 || new_units <= old_units {
@@ -997,19 +1164,25 @@ impl PpmdDecoder {
                 return true;
             }
         }
-        if !self.suballoc.alloc(new_units) {
-            return false;
-        }
+        let new_offset = match self.suballoc.alloc(new_units, AllocSide::Lo) {
+            Some(off) => off,
+            None => return false,
+        };
         if old_units > 0 {
-            self.suballoc.free(old_units);
+            let old_offset = self.contexts[ctx_idx].array_offset;
+            self.suballoc.free(old_offset, old_units);
         }
+        self.contexts[ctx_idx].array_offset = new_offset;
         true
     }
 
     // Rescale shrinks a state array. Models ShrinkUnits: if the surviving
     // states still fit in the original bucket, nothing changes; otherwise
-    // return the old slot and reallocate at the smaller bucket.
-    fn shrink_state_array(&mut self, old_n: usize, new_n: usize) {
+    // return the old slot and reallocate at the smaller bucket. If the
+    // smaller reallocation fails, the context drops its array entirely
+    // (signaled by NULL_OFFSET) — rare, and consistent with spec §11.1
+    // marking shrink-failure as a restart trigger.
+    fn shrink_state_array(&mut self, ctx_idx: usize, old_n: usize, new_n: usize) {
         let old_units = Self::state_array_units(old_n);
         let new_units = Self::state_array_units(new_n);
         if old_units == 0 || new_units >= old_units {
@@ -1024,9 +1197,15 @@ impl PpmdDecoder {
         if old_b == new_b && new_b.is_some() {
             return;
         }
-        self.suballoc.free(old_units);
+        let old_offset = self.contexts[ctx_idx].array_offset;
+        self.suballoc.free(old_offset, old_units);
         if new_units > 0 {
-            let _ = self.suballoc.alloc(new_units);
+            match self.suballoc.alloc(new_units, AllocSide::Lo) {
+                Some(off) => self.contexts[ctx_idx].array_offset = off,
+                None => self.contexts[ctx_idx].array_offset = NULL_OFFSET,
+            }
+        } else {
+            self.contexts[ctx_idx].array_offset = NULL_OFFSET;
         }
     }
 
@@ -1068,13 +1247,13 @@ impl PpmdDecoder {
                 freq = (freq + 1) >> 1;
             }
             states[0].freq = freq as u8;
-            self.shrink_state_array(original_state_count, 1);
+            self.shrink_state_array(ctx, original_state_count, 1);
             self.contexts[ctx].states = states;
             self.found_state.index = 0;
             return;
         }
         self.contexts[ctx].summ_freq = (sum_freq + esc_freq - (esc_freq >> 1)) as u16;
-        self.shrink_state_array(original_state_count, states.len());
+        self.shrink_state_array(ctx, original_state_count, states.len());
         self.contexts[ctx].states = states;
         self.found_state.index = 0;
     }
@@ -1340,23 +1519,28 @@ mod tests {
 
     #[test]
     fn suballoc_alloc_until_exhaustion() {
+        // Pool needs the text reservation (1/8) plus units area. 16 units
+        // total gives 2-unit text region + 14 units of headroom for bumping.
         let mut s = Suballocator::default();
-        s.reset(4 * ALLOC_UNIT_BYTES); // 48 bytes = 4 units
-        assert!(s.alloc(2)); // bucket 1 = 2 units
-        assert!(s.alloc(2)); // another 2 units → 4 used
-        assert!(!s.alloc(1)); // pool full
+        s.reset(16 * ALLOC_UNIT_BYTES);
+        // 14 units between lo_bump and hi_bump → can hand out 7 × 2-unit blocks.
+        for _ in 0..7 {
+            assert!(s.alloc(2, AllocSide::Lo).is_some());
+        }
+        assert!(s.alloc(2, AllocSide::Lo).is_none()); // pool full
     }
 
     #[test]
     fn suballoc_reuses_freed_bucket() {
         let mut s = Suballocator::default();
-        s.reset(4 * ALLOC_UNIT_BYTES);
-        assert!(s.alloc(2));
-        assert!(s.alloc(2));
-        assert!(!s.alloc(2)); // full
-        s.free(2); // freed → bucket 1 has 1 slot
-        assert!(s.alloc(2)); // reuses freed slot
-        assert!(!s.alloc(2)); // pool truly full again
+        s.reset(16 * ALLOC_UNIT_BYTES);
+        let offsets: Vec<u32> = (0..7)
+            .map(|_| s.alloc(2, AllocSide::Lo).expect("alloc"))
+            .collect();
+        assert!(s.alloc(2, AllocSide::Lo).is_none()); // full
+        s.free(offsets[0], 2); // freed → bucket 1 has 1 slot
+        assert!(s.alloc(2, AllocSide::Lo).is_some()); // reuses freed slot
+        assert!(s.alloc(2, AllocSide::Lo).is_none()); // truly full again
     }
 
     #[test]
@@ -1365,9 +1549,131 @@ mod tests {
         // pool_bytes=0; the suballoc shouldn't reject any allocation since the
         // model hasn't been told its budget yet.
         for _ in 0..1000 {
-            assert!(s.alloc(2));
+            assert!(s.alloc(2, AllocSide::Lo).is_some());
         }
         assert!(s.text_has_room(usize::MAX / 2));
+    }
+
+    // Spec §4.3: free blocks that are address-adjacent should merge into a
+    // larger run during glue, and that merged run should be visible in the
+    // bucket whose size matches.
+    #[test]
+    fn glue_merges_adjacent_free_blocks() {
+        let mut s = Suballocator::default();
+        s.reset(16 * ALLOC_UNIT_BYTES);
+        // Allocate 4 consecutive 1-unit blocks from the Lo side. They will
+        // be at offsets [units_start, units_start+1, units_start+2,
+        // units_start+3], i.e. adjacent.
+        let a = s.alloc(1, AllocSide::Lo).unwrap();
+        let b = s.alloc(1, AllocSide::Lo).unwrap();
+        let c = s.alloc(1, AllocSide::Lo).unwrap();
+        let d = s.alloc(1, AllocSide::Lo).unwrap();
+        assert_eq!(b, a + 1);
+        assert_eq!(c, a + 2);
+        assert_eq!(d, a + 3);
+        // Free them — bucket 0 now has 4 entries, bucket 3 (size 4) has none.
+        s.free(a, 1);
+        s.free(b, 1);
+        s.free(c, 1);
+        s.free(d, 1);
+        assert_eq!(s.free_lists[0].len(), 4);
+        assert!(s.free_lists[3].is_empty());
+        s.glue();
+        // After gluing, the 4-adjacent run becomes one 4-unit block in bucket 3.
+        assert!(s.free_lists[0].is_empty());
+        assert_eq!(s.free_lists[3].len(), 1);
+        // And we can satisfy a 4-unit request from the merged block.
+        assert_eq!(s.alloc(4, AllocSide::Lo), Some(a));
+    }
+
+    // Non-adjacent free blocks shouldn't merge even though their bucket sizes
+    // are compatible.
+    #[test]
+    fn glue_keeps_non_adjacent_blocks_separate() {
+        let mut s = Suballocator::default();
+        s.reset(16 * ALLOC_UNIT_BYTES);
+        // Two 1-unit blocks separated by a still-live 2-unit allocation.
+        let a = s.alloc(1, AllocSide::Lo).unwrap();
+        let _live = s.alloc(2, AllocSide::Lo).unwrap();
+        let b = s.alloc(1, AllocSide::Lo).unwrap();
+        s.free(a, 1);
+        s.free(b, 1);
+        s.glue();
+        // Still two separate 1-unit free entries; no merged 2-unit block.
+        assert_eq!(s.free_lists[0].len(), 2);
+    }
+
+    // A merged run larger than the biggest bucket (128 units) should be
+    // chunked into multiple bucket-sized pieces during redistribution.
+    #[test]
+    fn glue_splits_oversized_run_into_buckets() {
+        // 256-unit pool (text=32, bumpable=224). Adjacent 64-unit + 64-unit
+        // blocks combine to 128, which is the biggest bucket — exactly one
+        // entry. Push it to 192 and we get a 128 + a 64 (closest bucket).
+        let mut s = Suballocator::default();
+        s.reset(256 * ALLOC_UNIT_BYTES);
+        // Three adjacent 64-unit allocs → run of 192 units after freeing.
+        // 64 is bucket 18 in the spec table.
+        let bucket_64 = Suballocator::bucket_for(64).unwrap();
+        assert_eq!(Suballocator::bucket_units(bucket_64), 64);
+        let a = s.alloc(64, AllocSide::Lo).unwrap();
+        let b = s.alloc(64, AllocSide::Lo).unwrap();
+        let c = s.alloc(64, AllocSide::Lo).unwrap();
+        assert_eq!(b, a + 64);
+        assert_eq!(c, a + 128);
+        s.free(a, 64);
+        s.free(b, 64);
+        s.free(c, 64);
+        s.glue();
+        // Should emit one 128-unit block + one 64-unit block.
+        let bucket_128 = Suballocator::bucket_for(128).unwrap();
+        assert_eq!(s.free_lists[bucket_128].len(), 1);
+        assert_eq!(s.free_lists[bucket_64].len(), 1);
+        // The 128 block starts at `a`, the 64 follows.
+        assert_eq!(s.free_lists[bucket_128][0], a);
+        assert_eq!(s.free_lists[bucket_64][0], a + 128);
+    }
+
+    // glue_count debounce: a single bump failure runs the glue pass exactly
+    // once, then subsequent failures decrement instead of re-gluing.
+    #[test]
+    fn glue_count_debounces_subsequent_failures() {
+        let mut s = Suballocator::default();
+        s.reset(16 * ALLOC_UNIT_BYTES);
+        // Fill the pool to capacity (14 bumpable units in a 16-unit pool;
+        // text region is 2 units). All 14 calls succeed — glue_count stays 0.
+        for _ in 0..14 {
+            assert!(s.alloc(1, AllocSide::Lo).is_some());
+        }
+        assert_eq!(s.glue_count, 0);
+        // 15th call fails: triggers glue (no-op, no free blocks) and sets
+        // glue_count to GLUE_RESET.
+        assert!(s.alloc(1, AllocSide::Lo).is_none());
+        assert_eq!(s.glue_count, GLUE_RESET);
+        // Subsequent failure decrements glue_count without re-gluing.
+        assert!(s.alloc(1, AllocSide::Lo).is_none());
+        assert_eq!(s.glue_count, GLUE_RESET - 1);
+    }
+
+    // After exhaustion, freeing two adjacent blocks lets a larger request
+    // succeed via glue.
+    #[test]
+    fn glue_recovers_capacity_for_larger_request() {
+        let mut s = Suballocator::default();
+        s.reset(16 * ALLOC_UNIT_BYTES);
+        // Fill the pool to capacity (14 × 1-unit) without triggering a
+        // failure, so glue_count remains 0.
+        let mut held = Vec::new();
+        for _ in 0..14 {
+            held.push(s.alloc(1, AllocSide::Lo).unwrap());
+        }
+        // Free two adjacent 1-unit blocks at the bottom of the units region.
+        s.free(held[0], 1);
+        s.free(held[1], 1);
+        // alloc(2) needs bucket 1 (size 2). Empty, bump exhausted, but
+        // glue_count == 0 so glue fires, merging into one 2-unit block at
+        // held[0]. Retry pop succeeds.
+        assert_eq!(s.alloc(2, AllocSide::Lo), Some(held[0]));
     }
 
     #[test]
@@ -1484,6 +1790,8 @@ mod tests {
                 states: Vec::new(),
                 summ_freq: 0,
                 suffix: None,
+                header_offset: NULL_OFFSET,
+                array_offset: NULL_OFFSET,
             }),
             None
         );
@@ -1508,6 +1816,8 @@ mod tests {
             ],
             summ_freq: 2,
             suffix: Some(0),
+            header_offset: NULL_OFFSET,
+            array_offset: NULL_OFFSET,
         });
         decoder.min_context = 1;
 
@@ -1529,6 +1839,8 @@ mod tests {
             }],
             summ_freq: 1,
             suffix: Some(0),
+            header_offset: NULL_OFFSET,
+            array_offset: NULL_OFFSET,
         });
         decoder.min_context = 1;
         decoder.max_context = 0;
