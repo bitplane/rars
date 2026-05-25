@@ -14,7 +14,6 @@ const LENGTH_COUNT: usize = 28;
 const LEVEL_COUNT: usize = 20;
 const TABLE_COUNT: usize = MAIN_COUNT + OFFSET_COUNT + LOW_OFFSET_COUNT + LENGTH_COUNT;
 const MAX_HISTORY: usize = 4 * 1024 * 1024;
-const INPUT_CHUNK: usize = 64 * 1024;
 const STREAM_CHUNK: usize = 1024 * 1024;
 const MAX_VM_FILTER_BLOCK_SIZE: usize = 128 * 1024;
 // The standard AUDIO bytecode uses separate input/output regions inside RARVM
@@ -1784,31 +1783,17 @@ impl Unpack29 {
             .ok_or(Error::InvalidData("RAR 2.9 output size overflows"))?;
         let mut flushed = start;
         let mut target = start.saturating_add(STREAM_CHUNK).min(final_target);
-        let mut input_done = false;
-        let mut buffer = [0u8; INPUT_CHUNK];
+        let mut packed = Vec::new();
+        input
+            .read_to_end(&mut packed)
+            .map_err(|_| Error::InvalidData("RAR 2.9 input read failed"))?;
+        self.bits.append(&packed);
 
         while flushed < final_target {
-            loop {
-                let checkpoint = self.clone();
-                match self.decode_until(target) {
-                    Ok(()) => break,
-                    Err(Error::NeedMoreInput) if !input_done => {
-                        *self = checkpoint;
-                        let read = input
-                            .read(&mut buffer)
-                            .map_err(|_| Error::InvalidData("RAR 2.9 input read failed"))?;
-                        if read == 0 {
-                            input_done = true;
-                        } else {
-                            self.bits.append(&buffer[..read]);
-                        }
-                    }
-                    Err(Error::NeedMoreInput) => {
-                        return Err(Error::InvalidData("RAR 2.9 bitstream is truncated"));
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
+            self.decode_until(target).map_err(|error| match error {
+                Error::NeedMoreInput => Error::InvalidData("RAR 2.9 bitstream is truncated"),
+                error => error,
+            })?;
 
             let safe_end = self.safe_flush_end(flushed, target, final_target)?;
             if safe_end <= flushed {
@@ -1834,38 +1819,10 @@ impl Unpack29 {
                 .saturating_add(STREAM_CHUNK)
                 .min(final_target);
         }
-        loop {
-            let checkpoint = self.clone();
-            match self.finish_member() {
-                Ok(()) => break,
-                Err(Error::NeedMoreInput) if !input_done => {
-                    *self = checkpoint;
-                    let read = input
-                        .read(&mut buffer)
-                        .map_err(|_| Error::InvalidData("RAR 2.9 input read failed"))?;
-                    if read == 0 {
-                        input_done = true;
-                    } else {
-                        self.bits.append(&buffer[..read]);
-                    }
-                }
-                Err(Error::NeedMoreInput) => {
-                    return Err(Error::InvalidData("RAR 2.9 bitstream is truncated"));
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        if self.block_mode == BlockMode::Ppmd {
-            loop {
-                let read = input
-                    .read(&mut buffer)
-                    .map_err(|_| Error::InvalidData("RAR 2.9 input read failed"))?;
-                if read == 0 {
-                    break;
-                }
-                self.bits.append(&buffer[..read]);
-            }
-        }
+        self.finish_member().map_err(|error| match error {
+            Error::NeedMoreInput => Error::InvalidData("RAR 2.9 bitstream is truncated"),
+            error => error,
+        })?;
         Ok(())
     }
 

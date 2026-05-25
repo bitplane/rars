@@ -10,7 +10,6 @@ const AUDIO_COUNT: usize = 257;
 const MAX_CHANNELS: usize = 4;
 const OLD_LEVEL_COUNT: usize = AUDIO_COUNT * MAX_CHANNELS;
 const MAX_HISTORY: usize = 1024 * 1024;
-const INPUT_CHUNK: usize = 64 * 1024;
 
 const LENGTH_BASES: [usize; LENGTH_COUNT] = [
     0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 28, 32, 40, 48, 56, 64, 80, 96, 112, 128,
@@ -1405,40 +1404,15 @@ impl Unpack20 {
             .checked_add(output_size)
             .ok_or(Error::InvalidData("RAR 2.0 output size overflows"))?;
         self.bits = BitReader::new();
-        let mut input_done = false;
-        let mut buffer = [0u8; INPUT_CHUNK];
-
-        while self.current_pos() < target {
-            let checkpoint = self.clone();
-            match self.decode_until(target) {
-                Ok(()) => {}
-                Err(Error::NeedMoreInput) if !input_done => {
-                    *self = checkpoint;
-                    let read = input
-                        .read(&mut buffer)
-                        .map_err(|_| Error::InvalidData("RAR 2.0 input read failed"))?;
-                    if read == 0 {
-                        input_done = true;
-                    } else {
-                        self.bits.append(&buffer[..read]);
-                    }
-                }
-                Err(Error::NeedMoreInput) => {
-                    return Err(Error::InvalidData("RAR 2.0 bitstream is truncated"));
-                }
-                Err(error) => return Err(error),
-            }
-        }
-
-        loop {
-            let read = input
-                .read(&mut buffer)
-                .map_err(|_| Error::InvalidData("RAR 2.0 input read failed"))?;
-            if read == 0 {
-                break;
-            }
-            self.bits.append(&buffer[..read]);
-        }
+        let mut packed = Vec::new();
+        input
+            .read_to_end(&mut packed)
+            .map_err(|_| Error::InvalidData("RAR 2.0 input read failed"))?;
+        self.bits.append(&packed);
+        self.decode_until(target).map_err(|error| match error {
+            Error::NeedMoreInput => Error::InvalidData("RAR 2.0 bitstream is truncated"),
+            error => error,
+        })?;
         self.read_last_tables()?;
 
         let decoded = self.raw_range(start, target)?;

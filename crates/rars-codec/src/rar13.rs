@@ -1525,46 +1525,30 @@ impl Unpack15 {
         solid: bool,
         out: &mut impl Write,
     ) -> Result<()> {
-        const INPUT_CHUNK: usize = 64 * 1024;
         const OUTPUT_CHUNK: usize = 64 * 1024;
 
         self.init_member(target, solid);
         self.bits = BitReader::new(&[]);
-        let mut input_done = false;
-        let mut buffer = [0u8; INPUT_CHUNK];
+        let mut packed = Vec::new();
+        input
+            .read_to_end(&mut packed)
+            .map_err(|_| Error::InvalidData("RAR 1.3 input read failed"))?;
+        self.bits.append(&packed);
+        self.bits.finish();
 
         while self.output_written < self.target {
             let chunk_target = self
                 .output_written
                 .saturating_add(OUTPUT_CHUNK)
                 .min(self.target);
-            loop {
-                let checkpoint = self.clone();
-                let mut chunk = Vec::with_capacity(chunk_target - self.output_written);
-                match self.decode_loop_until(chunk_target, &mut chunk) {
-                    Ok(()) => {
-                        out.write_all(&chunk)
-                            .map_err(|_| Error::InvalidData("RAR 1.3 output write failed"))?;
-                        break;
-                    }
-                    Err(Error::NeedMoreInput) if !input_done => {
-                        *self = checkpoint;
-                        let read = input
-                            .read(&mut buffer)
-                            .map_err(|_| Error::InvalidData("RAR 1.3 input read failed"))?;
-                        if read == 0 {
-                            input_done = true;
-                            self.bits.finish();
-                        } else {
-                            self.bits.append(&buffer[..read]);
-                        }
-                    }
-                    Err(Error::NeedMoreInput) => {
-                        return Err(Error::InvalidData("RAR 1.3 bitstream is truncated"));
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
+            let mut chunk = Vec::with_capacity(chunk_target - self.output_written);
+            self.decode_loop_until(chunk_target, &mut chunk)
+                .map_err(|error| match error {
+                    Error::NeedMoreInput => Error::InvalidData("RAR 1.3 bitstream is truncated"),
+                    error => error,
+                })?;
+            out.write_all(&chunk)
+                .map_err(|_| Error::InvalidData("RAR 1.3 output write failed"))?;
         }
         Ok(())
     }
