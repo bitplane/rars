@@ -1409,6 +1409,13 @@ impl Unpack20 {
             .read_to_end(&mut packed)
             .map_err(|_| Error::InvalidData("RAR 2.0 input read failed"))?;
         self.bits.append(&packed);
+        if !self.in_block && self.bits.remaining_bytes_from_current() > 0 {
+            self.read_tables().map_err(|error| match error {
+                Error::NeedMoreInput => Error::InvalidData("RAR 2.0 bitstream is truncated"),
+                error => error,
+            })?;
+            self.in_block = true;
+        }
         self.decode_until(target).map_err(|error| match error {
             Error::NeedMoreInput => Error::InvalidData("RAR 2.0 bitstream is truncated"),
             error => error,
@@ -1722,13 +1729,21 @@ impl Unpack20 {
             return Ok(());
         }
         if self.audio_block {
+            if self.audio_tables[self.cur_channel].symbols.is_empty() {
+                return Ok(());
+            }
             if self.audio_tables[self.cur_channel].decode(&mut self.bits)? == 256 {
                 self.read_tables()?;
                 self.in_block = true;
             }
-        } else if self.main.decode(&mut self.bits)? == 269 {
-            self.read_tables()?;
-            self.in_block = true;
+        } else {
+            if self.main.symbols.is_empty() {
+                return Ok(());
+            }
+            if self.main.decode(&mut self.bits)? == 269 {
+                self.read_tables()?;
+                self.in_block = true;
+            }
         }
         Ok(())
     }

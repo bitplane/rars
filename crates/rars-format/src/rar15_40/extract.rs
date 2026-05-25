@@ -199,7 +199,7 @@ impl<'a> DecoderSession<'a> {
         file: &FileHeader,
         out: &mut impl Write,
     ) -> Result<()> {
-        let solid = self.solid && self.decoded_files != 0;
+        let solid = self.file_is_solid(file);
         let password = self.password;
         self.codec_for(file)?
             .write_file_to(archive, file, solid, password, out)?;
@@ -213,7 +213,7 @@ impl<'a> DecoderSession<'a> {
         final_file: &FileHeader,
         out: &mut impl Write,
     ) -> Result<()> {
-        let solid = self.solid && self.decoded_files != 0;
+        let solid = self.file_is_solid(final_file);
         let password = self.password;
         self.codec_for(final_file)?
             .write_split_to(input, final_file, solid, password, out)?;
@@ -226,14 +226,23 @@ impl<'a> DecoderSession<'a> {
         archive: &Archive,
         file: &FileHeader,
     ) -> Result<Vec<u8>> {
-        let solid = self.solid && self.decoded_files != 0;
+        let solid = self.file_is_solid(file);
         let password = self.password;
         self.codec_for(file)?
             .decode_file_data(archive, file, solid, password)
     }
 
+    fn file_is_solid(&self, file: &FileHeader) -> bool {
+        if !self.solid || self.decoded_files == 0 {
+            return false;
+        }
+        // FHD_SOLID is not meaningful for unpack version < 20; rely on the
+        // archive-level MHD_SOLID flag in that case.
+        file.unp_ver < 20 || file.is_solid()
+    }
+
     fn codec_for(&mut self, file: &FileHeader) -> Result<&mut CodecState> {
-        let reset = !self.solid
+        let reset = !self.file_is_solid(file)
             || self
                 .codec
                 .as_ref()
