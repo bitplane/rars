@@ -1788,6 +1788,18 @@ impl Unpack29 {
             .read_to_end(&mut packed)
             .map_err(|_| Error::InvalidData("RAR 2.9 input read failed"))?;
         self.bits.append(&packed);
+        // Empty members in solid mode still carry their own block init bytes
+        // (typically the (esc, 0) end-of-block marker + 4-byte range coder
+        // flush). When output_size is zero, decode_until skips its loop body
+        // and never reads tables, so do the init here so finish_member can
+        // observe the block end.
+        if final_target == start && !self.in_lz_block && !packed.is_empty() {
+            self.read_tables().map_err(|error| match error {
+                Error::NeedMoreInput => Error::InvalidData("RAR 2.9 bitstream is truncated"),
+                error => error,
+            })?;
+            self.in_lz_block = true;
+        }
 
         while flushed < final_target {
             self.decode_until(target).map_err(|error| match error {
@@ -2020,7 +2032,10 @@ impl Unpack29 {
                     return Ok(());
                 }
                 1 | 6..=u8::MAX => self.output.push(self.ppmd_esc),
-                2 => return Ok(()),
+                2 => {
+                    self.in_lz_block = false;
+                    return Ok(());
+                }
                 3 => {
                     self.read_vm_code_ppmd()?;
                 }

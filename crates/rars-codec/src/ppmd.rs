@@ -864,9 +864,11 @@ impl PpmdDecoder {
             .ok_or(Error::InvalidData("RAR PPMd masked-state count is invalid"))?;
         let suffix = self.contexts[mc].suffix.unwrap_or(mc);
         let suffix_stats = self.contexts[suffix].states.len();
-        let suffix_delta = suffix_stats
-            .checked_sub(num_stats)
-            .ok_or(Error::InvalidData("RAR PPMd suffix-state count is invalid"))?;
+        // Spec §9.1: the subtraction is unsigned C wraparound — when
+        // `suffix.num_stats < min_context.num_stats`, the underflow yields a
+        // very large value and the `non_masked < suffix_delta` comparison
+        // evaluates to TRUE. Replicate the wraparound here.
+        let suffix_delta = suffix_stats.wrapping_sub(num_stats);
         let col = (non_masked < suffix_delta) as usize
             + 2 * ((self.contexts[mc].summ_freq as usize) < 11 * num_stats) as usize
             + 4 * (num_masked > non_masked) as usize
