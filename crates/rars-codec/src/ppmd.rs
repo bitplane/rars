@@ -148,7 +148,7 @@ impl Suballocator {
         Some(bucket)
     }
 
-    fn alloc(&mut self, units: usize, side: AllocSide) -> Option<u32> {
+    fn alloc(&mut self, units: usize, side: AllocSide, text_len_bytes: usize) -> Option<u32> {
         let bucket = Self::bucket_for(units)?;
         if let Some(offset) = self.free_lists[bucket].pop() {
             return Some(offset);
@@ -156,17 +156,50 @@ impl Suballocator {
         if let Some(offset) = self.try_bump(bucket, side) {
             return Some(offset);
         }
-        // Bump failed: trigger glue if cooled down, then retry.
+        // Rare path (mirrors Ppmd7_AllocUnitsRare):
+        //   1. If glue_count == 0, glue and retry the bucket's free list.
+        //   2. Walk upward through larger buckets; if found, split.
+        //   3. Otherwise shrink units_start (consume text-reservation).
         if self.glue_count == 0 {
             self.glue();
             self.glue_count = GLUE_RESET;
             if let Some(offset) = self.free_lists[bucket].pop() {
                 return Some(offset);
             }
-            return self.try_bump(bucket, side);
+        }
+        for i in (bucket + 1)..N_BUCKETS {
+            if let Some(offset) = self.free_lists[i].pop() {
+                let large_size = Self::bucket_units(i) as u32;
+                let need = Self::bucket_units(bucket) as u32;
+                let leftover = large_size - need;
+                self.emit_run(offset + need, leftover);
+                return Some(offset);
+            }
         }
         self.glue_count = self.glue_count.saturating_sub(1);
-        None
+        self.fallback_bump(bucket, text_len_bytes)
+    }
+
+    // Spec / ref Ppmd7_AllocUnitsRare bump-fallback: when no free block at
+    // any bucket size satisfies the request, shrink `units_start` downward
+    // (into the text-reservation zone). Succeeds only if the new units
+    // floor would still sit above the current text-write position.
+    fn fallback_bump(&mut self, bucket: usize, text_len_bytes: usize) -> Option<u32> {
+        if self.unbounded {
+            return None;
+        }
+        let need_units = Self::bucket_units(bucket) as u32;
+        let need_bytes = need_units as u64 * ALLOC_UNIT_BYTES as u64;
+        let units_start_bytes = self.units_start as u64 * ALLOC_UNIT_BYTES as u64;
+        // Match C: `(us - Text) > numBytes`. Strict greater-than (not ≥).
+        if units_start_bytes <= text_len_bytes as u64 + need_bytes {
+            return None;
+        }
+        let new_units_start = self.units_start - need_units;
+        self.units_start = new_units_start;
+        // Lower the text capacity so text_has_room reflects the new boundary.
+        self.text_capacity_bytes = (new_units_start as u64 * ALLOC_UNIT_BYTES as u64) as usize;
+        Some(new_units_start)
     }
 
     fn try_bump(&mut self, bucket: usize, side: AllocSide) -> Option<u32> {
@@ -461,6 +494,10 @@ impl PpmdDecoder {
     }
 
     pub fn decode_symbol(&mut self, input: &mut impl PpmdByteReader) -> Result<Option<u8>> {
+        self.decode_symbol_inner(input)
+    }
+
+    fn decode_symbol_inner(&mut self, input: &mut impl PpmdByteReader) -> Result<Option<u8>> {
         let mut mask = [true; 256];
         let min = self.min_context;
         if self.contexts[min].states.len() != 1 {
@@ -527,16 +564,25 @@ impl PpmdDecoder {
             self.prev_success = 0;
         }
 
+        let trace_esc = std::env::var_os("RARS_PPMD_TRACE_ESC").is_some();
         loop {
             self.range.normalize(input)?;
             let mut mc = self.min_context;
             let num_masked = self.contexts[mc].states.len();
+            if trace_esc {
+                eprintln!("[esc] iter start: mc={} NumStats={} order_fall={} range={} code={} low={}",
+                    mc, num_masked, self.order_fall, self.range.range, self.range.code, self.range.low);
+            }
             loop {
                 self.order_fall += 1;
                 let Some(suffix) = self.contexts[mc].suffix else {
+                    if trace_esc { eprintln!("[esc] descent reached root, returning None"); }
                     return Ok(None);
                 };
                 mc = suffix;
+                if trace_esc {
+                    eprintln!("[esc] descent step: mc={} NumStats={}", mc, self.contexts[mc].states.len());
+                }
                 if self.contexts[mc].states.len() != num_masked {
                     break;
                 }
@@ -551,10 +597,20 @@ impl PpmdDecoder {
                 .sum::<u32>();
             let (see_ref, esc_freq) = self.make_esc_freq(num_masked)?;
             let freq_sum = hi_cnt + esc_freq;
+            if trace_esc {
+                eprintln!("[esc] arrived: mc={} NumStats={} summ_freq={} hi_cnt={} esc_freq={} freq_sum={}",
+                    mc, self.contexts[mc].states.len(), self.contexts[mc].summ_freq, hi_cnt, esc_freq, freq_sum);
+                eprintln!("[esc] mc.states (non-masked marked *): {:?}",
+                    self.contexts[mc].states.iter().map(|s| (s.symbol, s.freq, if mask[s.symbol as usize] {'*'} else {'_'})).collect::<Vec<_>>());
+            }
             if freq_sum > self.range.range {
                 return Err(Error::InvalidData("RAR PPMd escape range is invalid"));
             }
             let mut count = self.range.get_threshold(freq_sum)?;
+            if trace_esc {
+                eprintln!("[esc] count={} (range after div={}, code-low={})",
+                    count, self.range.range, self.range.code.wrapping_sub(self.range.low));
+            }
             if count < hi_cnt {
                 let mut start = 0u32;
                 for (index, state) in self.contexts[mc].states.iter().enumerate() {
@@ -581,8 +637,15 @@ impl PpmdDecoder {
             }
             self.range.decode(hi_cnt, freq_sum - hi_cnt);
             self.add_see_summ(see_ref, freq_sum);
+            if trace_esc {
+                eprintln!("[esc] pre-mask: mask[5]={} mask[53]={}", mask[5], mask[53]);
+            }
             for state in &self.contexts[mc].states {
                 mask[state.symbol as usize] = false;
+            }
+            if trace_esc {
+                eprintln!("[esc] post-mask: mask[5]={} mask[53]={} (mc={} mc.states.len={})",
+                    mask[5], mask[53], mc, self.contexts[mc].states.len());
             }
         }
     }
@@ -711,13 +774,14 @@ impl PpmdDecoder {
         let unbounded_before = self.suballoc.unbounded;
         let reset_arg = if unbounded_before { 0 } else { pool_bytes };
         self.suballoc.reset(reset_arg);
+        // At init time text is empty.
         let header_offset = self
             .suballoc
-            .alloc(1, AllocSide::Hi)
+            .alloc(1, AllocSide::Hi, 0)
             .unwrap_or(NULL_OFFSET);
         let array_offset = self
             .suballoc
-            .alloc(128, AllocSide::Lo)
+            .alloc(128, AllocSide::Lo, 0)
             .unwrap_or(NULL_OFFSET);
         self.max_order = max_order;
         self.order_fall = max_order;
@@ -1125,10 +1189,11 @@ impl PpmdDecoder {
         // 1 unit for the context header (Hi side); binary contexts (1 state)
         // carry their state inline, multi-state contexts also need a state
         // array (Lo side).
-        let header_offset = self.suballoc.alloc(1, AllocSide::Hi)?;
+        let text_len = self.text.len();
+        let header_offset = self.suballoc.alloc(1, AllocSide::Hi, text_len)?;
         let array_units = Self::state_array_units(context.states.len());
         let array_offset = if array_units > 0 {
-            match self.suballoc.alloc(array_units, AllocSide::Lo) {
+            match self.suballoc.alloc(array_units, AllocSide::Lo, text_len) {
                 Some(off) => off,
                 None => {
                     self.suballoc.free(header_offset, 1);
@@ -1164,7 +1229,8 @@ impl PpmdDecoder {
                 return true;
             }
         }
-        let new_offset = match self.suballoc.alloc(new_units, AllocSide::Lo) {
+        let text_len = self.text.len();
+        let new_offset = match self.suballoc.alloc(new_units, AllocSide::Lo, text_len) {
             Some(off) => off,
             None => return false,
         };
@@ -1200,7 +1266,8 @@ impl PpmdDecoder {
         let old_offset = self.contexts[ctx_idx].array_offset;
         self.suballoc.free(old_offset, old_units);
         if new_units > 0 {
-            match self.suballoc.alloc(new_units, AllocSide::Lo) {
+            let text_len = self.text.len();
+            match self.suballoc.alloc(new_units, AllocSide::Lo, text_len) {
                 Some(off) => self.contexts[ctx_idx].array_offset = off,
                 None => self.contexts[ctx_idx].array_offset = NULL_OFFSET,
             }
@@ -1525,9 +1592,9 @@ mod tests {
         s.reset(16 * ALLOC_UNIT_BYTES);
         // 14 units between lo_bump and hi_bump → can hand out 7 × 2-unit blocks.
         for _ in 0..7 {
-            assert!(s.alloc(2, AllocSide::Lo).is_some());
+            assert!(s.alloc(2, AllocSide::Lo, 0).is_some());
         }
-        assert!(s.alloc(2, AllocSide::Lo).is_none()); // pool full
+        assert!(s.alloc(2, AllocSide::Lo, 0).is_none()); // pool full
     }
 
     #[test]
@@ -1535,12 +1602,12 @@ mod tests {
         let mut s = Suballocator::default();
         s.reset(16 * ALLOC_UNIT_BYTES);
         let offsets: Vec<u32> = (0..7)
-            .map(|_| s.alloc(2, AllocSide::Lo).expect("alloc"))
+            .map(|_| s.alloc(2, AllocSide::Lo, 0).expect("alloc"))
             .collect();
-        assert!(s.alloc(2, AllocSide::Lo).is_none()); // full
+        assert!(s.alloc(2, AllocSide::Lo, 0).is_none()); // full
         s.free(offsets[0], 2); // freed → bucket 1 has 1 slot
-        assert!(s.alloc(2, AllocSide::Lo).is_some()); // reuses freed slot
-        assert!(s.alloc(2, AllocSide::Lo).is_none()); // truly full again
+        assert!(s.alloc(2, AllocSide::Lo, 0).is_some()); // reuses freed slot
+        assert!(s.alloc(2, AllocSide::Lo, 0).is_none()); // truly full again
     }
 
     #[test]
@@ -1549,7 +1616,7 @@ mod tests {
         // pool_bytes=0; the suballoc shouldn't reject any allocation since the
         // model hasn't been told its budget yet.
         for _ in 0..1000 {
-            assert!(s.alloc(2, AllocSide::Lo).is_some());
+            assert!(s.alloc(2, AllocSide::Lo, 0).is_some());
         }
         assert!(s.text_has_room(usize::MAX / 2));
     }
@@ -1564,10 +1631,10 @@ mod tests {
         // Allocate 4 consecutive 1-unit blocks from the Lo side. They will
         // be at offsets [units_start, units_start+1, units_start+2,
         // units_start+3], i.e. adjacent.
-        let a = s.alloc(1, AllocSide::Lo).unwrap();
-        let b = s.alloc(1, AllocSide::Lo).unwrap();
-        let c = s.alloc(1, AllocSide::Lo).unwrap();
-        let d = s.alloc(1, AllocSide::Lo).unwrap();
+        let a = s.alloc(1, AllocSide::Lo, 0).unwrap();
+        let b = s.alloc(1, AllocSide::Lo, 0).unwrap();
+        let c = s.alloc(1, AllocSide::Lo, 0).unwrap();
+        let d = s.alloc(1, AllocSide::Lo, 0).unwrap();
         assert_eq!(b, a + 1);
         assert_eq!(c, a + 2);
         assert_eq!(d, a + 3);
@@ -1583,7 +1650,7 @@ mod tests {
         assert!(s.free_lists[0].is_empty());
         assert_eq!(s.free_lists[3].len(), 1);
         // And we can satisfy a 4-unit request from the merged block.
-        assert_eq!(s.alloc(4, AllocSide::Lo), Some(a));
+        assert_eq!(s.alloc(4, AllocSide::Lo, 0), Some(a));
     }
 
     // Non-adjacent free blocks shouldn't merge even though their bucket sizes
@@ -1593,9 +1660,9 @@ mod tests {
         let mut s = Suballocator::default();
         s.reset(16 * ALLOC_UNIT_BYTES);
         // Two 1-unit blocks separated by a still-live 2-unit allocation.
-        let a = s.alloc(1, AllocSide::Lo).unwrap();
-        let _live = s.alloc(2, AllocSide::Lo).unwrap();
-        let b = s.alloc(1, AllocSide::Lo).unwrap();
+        let a = s.alloc(1, AllocSide::Lo, 0).unwrap();
+        let _live = s.alloc(2, AllocSide::Lo, 0).unwrap();
+        let b = s.alloc(1, AllocSide::Lo, 0).unwrap();
         s.free(a, 1);
         s.free(b, 1);
         s.glue();
@@ -1616,9 +1683,9 @@ mod tests {
         // 64 is bucket 18 in the spec table.
         let bucket_64 = Suballocator::bucket_for(64).unwrap();
         assert_eq!(Suballocator::bucket_units(bucket_64), 64);
-        let a = s.alloc(64, AllocSide::Lo).unwrap();
-        let b = s.alloc(64, AllocSide::Lo).unwrap();
-        let c = s.alloc(64, AllocSide::Lo).unwrap();
+        let a = s.alloc(64, AllocSide::Lo, 0).unwrap();
+        let b = s.alloc(64, AllocSide::Lo, 0).unwrap();
+        let c = s.alloc(64, AllocSide::Lo, 0).unwrap();
         assert_eq!(b, a + 64);
         assert_eq!(c, a + 128);
         s.free(a, 64);
@@ -1642,17 +1709,23 @@ mod tests {
         s.reset(16 * ALLOC_UNIT_BYTES);
         // Fill the pool to capacity (14 bumpable units in a 16-unit pool;
         // text region is 2 units). All 14 calls succeed — glue_count stays 0.
+        // Pass a text_len that occupies the entire 2-unit text region so
+        // the fallback_bump path can't grab any more.
+        let text_len_full = 2 * ALLOC_UNIT_BYTES;
         for _ in 0..14 {
-            assert!(s.alloc(1, AllocSide::Lo).is_some());
+            assert!(s.alloc(1, AllocSide::Lo, text_len_full).is_some());
         }
         assert_eq!(s.glue_count, 0);
-        // 15th call fails: triggers glue (no-op, no free blocks) and sets
-        // glue_count to GLUE_RESET.
-        assert!(s.alloc(1, AllocSide::Lo).is_none());
-        assert_eq!(s.glue_count, GLUE_RESET);
-        // Subsequent failure decrements glue_count without re-gluing.
-        assert!(s.alloc(1, AllocSide::Lo).is_none());
+        // 15th call fails: triggers glue (no-op, no free blocks) then
+        // walks up larger buckets (none), then fallback_bump fails (text
+        // already fills text region), and on the fallback path we
+        // decrement glue_count once. Mirrors C's `p->GlueCount--` inside
+        // the bump-fallback branch of AllocUnitsRare.
+        assert!(s.alloc(1, AllocSide::Lo, text_len_full).is_none());
         assert_eq!(s.glue_count, GLUE_RESET - 1);
+        // Subsequent failure decrements again (no re-glue because count > 0).
+        assert!(s.alloc(1, AllocSide::Lo, text_len_full).is_none());
+        assert_eq!(s.glue_count, GLUE_RESET - 2);
     }
 
     // After exhaustion, freeing two adjacent blocks lets a larger request
@@ -1665,7 +1738,7 @@ mod tests {
         // failure, so glue_count remains 0.
         let mut held = Vec::new();
         for _ in 0..14 {
-            held.push(s.alloc(1, AllocSide::Lo).unwrap());
+            held.push(s.alloc(1, AllocSide::Lo, 0).unwrap());
         }
         // Free two adjacent 1-unit blocks at the bottom of the units region.
         s.free(held[0], 1);
@@ -1673,7 +1746,7 @@ mod tests {
         // alloc(2) needs bucket 1 (size 2). Empty, bump exhausted, but
         // glue_count == 0 so glue fires, merging into one 2-unit block at
         // held[0]. Retry pop succeeds.
-        assert_eq!(s.alloc(2, AllocSide::Lo), Some(held[0]));
+        assert_eq!(s.alloc(2, AllocSide::Lo, 0), Some(held[0]));
     }
 
     #[test]
