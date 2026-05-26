@@ -9,6 +9,10 @@ description = "Python bindings for rars RAR archive toolkit"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT OR Apache-2.0"
+authors = [
+    { name = "Yehor Smoliakov", email = "yehors@ukr.net" },
+    { name = "Gareth Davidson", email = "gaz@bitplane.net" },
+]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
