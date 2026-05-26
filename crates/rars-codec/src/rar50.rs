@@ -610,21 +610,11 @@ fn encode_filter_data(
             Ok((FilterType::Delta, channels))
         }
         Rar50FilterKind::E8 => {
-            filters::encode_in_place(
-                FilterOp::E8,
-                data,
-                file_offset as u32,
-                rar50_delta_messages(),
-            )?;
+            e8e9_encode(data, file_offset as u32, false);
             Ok((FilterType::E8, 0))
         }
         Rar50FilterKind::E8E9 => {
-            filters::encode_in_place(
-                FilterOp::E8E9,
-                data,
-                file_offset as u32,
-                rar50_delta_messages(),
-            )?;
+            e8e9_encode(data, file_offset as u32, true);
             Ok((FilterType::E8E9, 0))
         }
         Rar50FilterKind::Arm => {
@@ -2069,8 +2059,8 @@ fn apply_filters(output: &mut [u8], filters: &[PendingFilter]) -> Result<()> {
                 let decoded = filters::delta_decode(data, filter.channels, rar50_delta_messages())?;
                 data.copy_from_slice(&decoded);
             }
-            FilterType::E8 => filters::e8e9_decode(data, filter.start as u32, false),
-            FilterType::E8E9 => filters::e8e9_decode(data, filter.start as u32, true),
+            FilterType::E8 => e8e9_decode(data, filter.start as u32, false),
+            FilterType::E8E9 => e8e9_decode(data, filter.start as u32, true),
             FilterType::Arm => arm_decode(data, filter.start as u32),
         }
     }
@@ -2084,6 +2074,69 @@ fn rar50_delta_messages() -> DeltaErrorMessages {
         truncated_source: "RAR 5 DELTA filter source is truncated",
     }
 }
+
+fn e8e9_decode(data: &mut [u8], file_offset: u32, include_e9: bool) {
+    if data.len() <= 4 {
+        return;
+    }
+    let cmp_mask = if include_e9 { 0xfe } else { 0xff };
+    let opcode_limit = data.len() - 4;
+    let mut opcode_pos = 0usize;
+    while let Some(pos) = crate::fast::next_x86_opcode(data, opcode_pos, opcode_limit, cmp_mask) {
+        let cur_pos = pos + 1;
+        let offset = file_offset.wrapping_add(cur_pos as u32) % X86_FILTER_FILE_SIZE;
+        let addr = u32::from_le_bytes([
+            data[cur_pos],
+            data[cur_pos + 1],
+            data[cur_pos + 2],
+            data[cur_pos + 3],
+        ]);
+        let new_addr = if addr & 0x8000_0000 != 0 {
+            (addr.wrapping_add(offset) & 0x8000_0000 == 0)
+                .then(|| addr.wrapping_add(X86_FILTER_FILE_SIZE))
+        } else {
+            (addr.wrapping_sub(X86_FILTER_FILE_SIZE) & 0x8000_0000 != 0)
+                .then(|| addr.wrapping_sub(offset))
+        };
+        if let Some(value) = new_addr {
+            data[cur_pos..cur_pos + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        opcode_pos = pos + 5;
+    }
+}
+
+fn e8e9_encode(data: &mut [u8], file_offset: u32, include_e9: bool) {
+    if data.len() <= 4 {
+        return;
+    }
+    let cmp_mask = if include_e9 { 0xfe } else { 0xff };
+    let opcode_limit = data.len() - 4;
+    let mut opcode_pos = 0usize;
+    while let Some(pos) = crate::fast::next_x86_opcode(data, opcode_pos, opcode_limit, cmp_mask) {
+        let cur_pos = pos + 1;
+        let offset = file_offset.wrapping_add(cur_pos as u32) % X86_FILTER_FILE_SIZE;
+        let addr = u32::from_le_bytes([
+            data[cur_pos],
+            data[cur_pos + 1],
+            data[cur_pos + 2],
+            data[cur_pos + 3],
+        ]);
+        let candidate = addr.wrapping_add(offset);
+        let new_addr = if candidate < X86_FILTER_FILE_SIZE {
+            Some(candidate)
+        } else {
+            let candidate = addr.wrapping_sub(X86_FILTER_FILE_SIZE);
+            (candidate & 0x8000_0000 != 0 && candidate.wrapping_add(offset) & 0x8000_0000 == 0)
+                .then_some(candidate)
+        };
+        if let Some(value) = new_addr {
+            data[cur_pos..cur_pos + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        opcode_pos = pos + 5;
+    }
+}
+
+const X86_FILTER_FILE_SIZE: u32 = 0x0100_0000;
 
 fn arm_decode(data: &mut [u8], file_offset: u32) {
     let mut pos = 0usize;
@@ -3132,6 +3185,20 @@ mod tests {
 
         assert_eq!(output, data);
         assert_ne!(lengths.main[256], 0);
+    }
+
+    #[test]
+    fn rar50_e8_filter_wraps_file_offset_modulo_16m() {
+        let file_offset = 0x0110_0000;
+        let mut encoded = vec![0xe8];
+        encoded.extend_from_slice(&0x0010_0c08u32.to_le_bytes());
+
+        let mut decoded = encoded.clone();
+        e8e9_decode(&mut decoded, file_offset, false);
+
+        assert_eq!(&decoded[1..5], &0x0000_0c07u32.to_le_bytes());
+        e8e9_encode(&mut decoded, file_offset, false);
+        assert_eq!(decoded, encoded);
     }
 
     #[test]
