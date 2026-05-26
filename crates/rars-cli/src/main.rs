@@ -137,13 +137,10 @@ where
 }
 
 fn test_extract_options(password: Option<&[u8]>) -> ArchiveReadOptions<'_> {
-    let options = match password {
+    match password {
         Some(password) => ArchiveReadOptions::with_password(password),
         None => ArchiveReadOptions::new(),
-    };
-    // `rars test` writes to sink(), so keep RAR5 buffering below normal
-    // extraction's compatibility cap to bound corpus-run RSS.
-    options.with_rar50_buffered_decode_limit(128 * 1024 * 1024)
+    }
 }
 
 fn display_text(text: impl AsRef<str>) -> String {
