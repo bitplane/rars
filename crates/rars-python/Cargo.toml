@@ -1,0 +1,29 @@
+[package]
+name = "rars-python"
+version = "0.1.0"
+description = "PyO3 bindings for the rars RAR archive toolkit."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+name = "rars"
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true
+
+[features]
+default = ["parallel"]
+extension-module = ["pyo3/extension-module"]
+parallel = ["rars_rs/parallel"]
+fast = ["rars_rs/fast"]
+
+[dependencies]
+libc.workspace = true
+pyo3 = { workspace = true, features = ["abi3-py310"] }
+rars_rs = { package = "rars", version = "0.1.0", path = "../rars" }

@@ -1,0 +1,35 @@
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[project]
+name = "rars"
+version = "0.1.0"
+description = "Python bindings for the RustedBytes rars RAR archive toolkit"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT OR Apache-2.0"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Rust",
+    "Topic :: System :: Archiving :: Compression",
+]
+
+[tool.maturin]
+manifest-path = "crates/rars-python/Cargo.toml"
+module-name = "rars"
+features = ["extension-module"]
+
+[tool.pytest.ini_options]
+testpaths = ["python/tests"]
+
+[dependency-groups]
+dev = [
+    "maturin>=1.13.3",
+    "pytest>=9.0.3",
+]

@@ -6,6 +6,7 @@ members = [
     "crates/rars-crypto",
     "crates/rars-crc32",
     "crates/rars-format",
+    "crates/rars-python",
     "crates/rars-recovery",
 ]
 resolver = "2"
@@ -27,6 +28,7 @@ clap = { version = "4.6", features = ["derive", "wrap_help"] }
 getrandom = "0.4"
 hmac = "0.13"
 libc = "0.2"
+pyo3 = "0.28.3"
 rayon = "1.12.0"
 rars = { version = "0.2.0", path = "crates/rars" }
 rars-codec = { version = "0.2.0", path = "crates/rars-codec" }

@@ -86,6 +86,23 @@ multi-member compression and extraction.
 When `--threads` is omitted, `rars` uses all available cores. Passing
 `--threads` to a CLI built without `parallel` is rejected.
 
+## Python bindings
+
+The workspace includes PyO3 bindings packaged as the `rars` Python module for
+Python 3.10 and newer. The default Python build enables the Rust `parallel`
+feature; the optional `fast` feature is available for nightly Rust builds only
+because it relies on `std::simd`.
+
+```sh
+maturin develop
+RUSTUP_TOOLCHAIN=nightly maturin develop --features fast
+```
+
+The Python API exposes a `rarfile`-style `RarFile` for listing, reading,
+testing, and extracting archives, plus `RarBuilder` for creating or rewriting
+archives. Rewrites are staged into a new archive; existing RAR files are not
+edited in place.
+
 ## Development
 
 Run the test suite:
