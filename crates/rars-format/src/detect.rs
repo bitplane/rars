@@ -24,7 +24,32 @@ pub fn detect_archive_family(input: &[u8]) -> Option<ArchiveSignature> {
 
 pub fn find_archive_start(input: &[u8], max_scan: usize) -> Option<ArchiveSignature> {
     let limit = input.len().min(max_scan);
-    (0..=limit).find_map(|offset| detect_at(input, offset))
+    let mut first_rar13 = None;
+    for offset in 0..=limit {
+        let tail = input.get(offset..)?;
+        if tail.starts_with(RAR50_SIGNATURE) {
+            return Some(ArchiveSignature {
+                family: ArchiveFamily::Rar50Plus,
+                offset,
+                length: RAR50_SIGNATURE.len(),
+            });
+        }
+        if tail.starts_with(RAR15_SIGNATURE) {
+            return Some(ArchiveSignature {
+                family: ArchiveFamily::Rar15To40,
+                offset,
+                length: RAR15_SIGNATURE.len(),
+            });
+        }
+        if first_rar13.is_none() && tail.starts_with(RAR13_SIGNATURE) {
+            first_rar13 = Some(ArchiveSignature {
+                family: ArchiveFamily::Rar13,
+                offset,
+                length: RAR13_SIGNATURE.len(),
+            });
+        }
+    }
+    first_rar13
 }
 
 fn detect_at(input: &[u8], offset: usize) -> Option<ArchiveSignature> {
@@ -80,6 +105,13 @@ mod tests {
         let sig = find_archive_start(b"stub bytes RE~^payload", 128).unwrap();
         assert_eq!(sig.family, ArchiveFamily::Rar13);
         assert_eq!(sig.offset, 11);
+    }
+
+    #[test]
+    fn sfx_scan_prefers_stronger_rar15_signature_over_earlier_rar13_bytes() {
+        let sig = find_archive_start(b"stub RE~^ bytes Rar!\x1a\x07\x00payload", 128).unwrap();
+        assert_eq!(sig.family, ArchiveFamily::Rar15To40);
+        assert_eq!(sig.offset, 16);
     }
 
     #[test]

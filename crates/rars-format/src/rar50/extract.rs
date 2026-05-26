@@ -258,6 +258,9 @@ impl FileHeader {
             }
             return Ok(packed.to_vec());
         }
+        if self.unpacked_size == 0 && packed.is_empty() {
+            return Ok(Vec::new());
+        }
 
         let info = self.decoded_compression_info()?;
         let dictionary_size = usize::try_from(info.dictionary_size).map_err(|_| {
@@ -1930,6 +1933,18 @@ mod tests {
         let archive = archive_with_blocks(vec![Block::File(file.clone())], payload.to_vec());
         let decoded = file.decoded_data_unverified(&archive, None).unwrap();
         assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn decoded_data_unverified_accepts_empty_compressed_member() {
+        let mut file = plain_file(b"empty.txt", b"", None);
+        file.compression_info = 5 << 7;
+        file.data_crc32 = Some(0);
+
+        let archive = archive_with_blocks(vec![Block::File(file.clone())], Vec::new());
+        let decoded = file.decoded_data_unverified(&archive, None).unwrap();
+
+        assert!(decoded.is_empty());
     }
 
     #[test]

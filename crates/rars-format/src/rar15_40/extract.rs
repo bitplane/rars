@@ -199,6 +199,10 @@ impl<'a> DecoderSession<'a> {
         file: &FileHeader,
         out: &mut impl Write,
     ) -> Result<()> {
+        if file.is_empty_compressed_payload() {
+            file.crc_result(0, self.password)?;
+            return Ok(());
+        }
         let solid = self.file_is_solid(file);
         let password = self.password;
         self.codec_for(file)?
@@ -226,6 +230,10 @@ impl<'a> DecoderSession<'a> {
         archive: &Archive,
         file: &FileHeader,
     ) -> Result<Vec<u8>> {
+        if file.is_empty_compressed_payload() {
+            file.crc_result(0, self.password)?;
+            return Ok(Vec::new());
+        }
         let solid = self.file_is_solid(file);
         let password = self.password;
         self.codec_for(file)?
@@ -253,6 +261,12 @@ impl<'a> DecoderSession<'a> {
         self.codec
             .as_mut()
             .ok_or(Error::InvalidHeader("RAR 1.5 codec state is missing"))
+    }
+}
+
+impl FileHeader {
+    fn is_empty_compressed_payload(&self) -> bool {
+        !self.is_stored() && self.pack_size == 0 && self.unp_size == 0
     }
 }
 
@@ -1048,6 +1062,41 @@ mod tests {
         assert!(unpack29.supports(&f));
         f.unp_ver = 20;
         assert!(!unpack29.supports(&f));
+    }
+
+    #[test]
+    fn decoder_session_empty_compressed_payload_does_not_reset_solid_codec() {
+        let mut session = DecoderSession::new(true);
+        let mut first = file(b"first.txt", 0);
+        first.unp_ver = 29;
+        first.method = 0x35;
+        session.codec = Some(CodecState::new_for(&first).unwrap());
+        session.decoded_files = 4;
+
+        let mut empty = file(b"empty.txt", super::super::FHD_SOLID);
+        empty.unp_ver = 20;
+        empty.method = 0x33;
+        empty.file_crc = 0;
+        let archive = Archive {
+            sfx_offset: 0,
+            main: MainHeader {
+                head_crc: 0,
+                flags: super::super::MHD_SOLID,
+                head_size: 13,
+                reserved1: 0,
+                reserved2: 0,
+                encrypt_version: None,
+            },
+            blocks: vec![Block::File(empty.clone())],
+            source: ArchiveSource::Memory(Arc::from([])),
+        };
+
+        let mut out = Vec::new();
+        session.write_file_to(&archive, &empty, &mut out).unwrap();
+
+        assert!(out.is_empty());
+        assert_eq!(session.decoded_files, 4);
+        assert!(matches!(session.codec, Some(CodecState::Unpack29(_))));
     }
 
     #[test]

@@ -87,15 +87,15 @@ fn volume_name_key(path: &Path) -> Option<String> {
                 .bytes()
                 .all(|b| b.is_ascii_digit())
         {
-            return Some(base.to_string());
+            return Some(format!("part:{}", &name[..base.len()]));
         }
     }
     if lower.ends_with(".rar") {
-        return lower.strip_suffix(".rar").map(str::to_string);
+        return Some(format!("old:{}", &name[..name.len() - 4]));
     }
     if let Some((base, ext)) = lower.rsplit_once('.') {
         if ext.len() == 3 && ext.starts_with('r') && ext[1..].bytes().all(|b| b.is_ascii_digit()) {
-            return Some(base.to_string());
+            return Some(format!("old:{}", &name[..base.len()]));
         }
     }
     None
@@ -206,4 +206,61 @@ pub(crate) fn infer_part_index(path: &Path, data_count: u16) -> Option<usize> {
         }
     };
     (index < usize::from(data_count)).then_some(index)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn volume_name_key_preserves_base_case() {
+        assert_eq!(
+            volume_name_key(Path::new("setup.rar")).as_deref(),
+            Some("old:setup")
+        );
+        assert_eq!(
+            volume_name_key(Path::new("Setup.rar")).as_deref(),
+            Some("old:Setup")
+        );
+        assert_eq!(
+            volume_name_key(Path::new("setup.R00")).as_deref(),
+            Some("old:setup")
+        );
+        assert_eq!(
+            volume_name_key(Path::new("setup.part1.rar")).as_deref(),
+            Some("part:setup")
+        );
+    }
+
+    #[test]
+    fn discover_sibling_volumes_does_not_merge_case_distinct_bases() {
+        let dir = std::env::temp_dir().join(format!("rars-volume-case-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir(&dir).unwrap();
+        let lower = dir.join("setup.rar");
+        let upper = dir.join("Setup.rar");
+        fs::write(&lower, []).unwrap();
+        fs::write(&upper, []).unwrap();
+
+        let discovered = discover_sibling_volumes(&lower.to_string_lossy());
+
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(discovered, vec![lower.to_string_lossy().into_owned()]);
+    }
+
+    #[test]
+    fn discover_sibling_volumes_does_not_merge_part_and_plain_rar_names() {
+        let dir = std::env::temp_dir().join(format!("rars-volume-style-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir(&dir).unwrap();
+        let plain = dir.join("setup.rar");
+        let part = dir.join("setup.part1.rar");
+        fs::write(&plain, []).unwrap();
+        fs::write(&part, []).unwrap();
+
+        let discovered = discover_sibling_volumes(&plain.to_string_lossy());
+
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(discovered, vec![plain.to_string_lossy().into_owned()]);
+    }
 }
