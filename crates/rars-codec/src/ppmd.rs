@@ -1,10 +1,89 @@
 use crate::{Error, Result};
 
+// Diagnostic instrumentation, used only when RARS_PPMD_DUMP_BYTES /
+// RARS_PPMD_DUMP_ALLOC env vars are set. Built for differential testing
+// against a reference RAR-flavour PPMdH decoder. Free to leave compiled in
+// at zero runtime cost when the env vars are unset.
+pub(crate) mod diag {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static DUMPED: AtomicU64 = AtomicU64::new(0);
+
+    pub fn dumped_pos() -> u64 {
+        DUMPED.load(Ordering::Relaxed)
+    }
+
+    pub fn dump_byte(b: u8) {
+        DUMPED.fetch_add(1, Ordering::Relaxed);
+        if let Some(f) = handle("RARS_PPMD_DUMP_BYTES") {
+            let _ = f.lock().unwrap().write_all(&[b]);
+        }
+    }
+
+    static DECODED_N: AtomicU64 = AtomicU64::new(0);
+    pub fn decoded_pos() -> u64 {
+        DECODED_N.load(Ordering::Relaxed)
+    }
+
+    pub fn dump_decoded(b: u8) {
+        DECODED_N.fetch_add(1, Ordering::Relaxed);
+        if let Some(f) = handle("RARS_PPMD_DUMP_DECODED") {
+            let _ = f.lock().unwrap().write_all(&[b]);
+        }
+    }
+
+    pub fn alloc_event(line: &str) {
+        if let Some(f) = handle("RARS_PPMD_DUMP_ALLOC") {
+            let mut g = f.lock().unwrap();
+            let _ = g.write_all(line.as_bytes());
+            let _ = g.write_all(b"\n");
+        }
+    }
+
+    pub fn alloc_enabled() -> bool {
+        handle("RARS_PPMD_DUMP_ALLOC").is_some()
+    }
+
+    // Truncate all dump files back to empty (start of a new non-solid file).
+    pub fn new_file() {
+        use std::io::{Seek, SeekFrom};
+        DUMPED.store(0, Ordering::Relaxed);
+        DECODED_N.store(0, Ordering::Relaxed);
+        for env in ["RARS_PPMD_DUMP_BYTES", "RARS_PPMD_DUMP_DECODED", "RARS_PPMD_DUMP_ALLOC"] {
+            if let Some(f) = handle(env) {
+                let mut g = f.lock().unwrap();
+                let _ = g.seek(SeekFrom::Start(0));
+                let _ = g.set_len(0);
+            }
+        }
+    }
+
+    fn handle(env: &str) -> Option<&'static std::sync::Mutex<std::fs::File>> {
+        super::diag_handle(env)
+    }
+}
+
+fn diag_handle(env: &str) -> Option<&'static std::sync::Mutex<std::fs::File>> {
+    use std::fs::File;
+    use std::sync::{Mutex, OnceLock};
+    static BYTES: OnceLock<Option<Mutex<File>>> = OnceLock::new();
+    static DECODED: OnceLock<Option<Mutex<File>>> = OnceLock::new();
+    static ALLOC: OnceLock<Option<Mutex<File>>> = OnceLock::new();
+    let cell = match env {
+        "RARS_PPMD_DUMP_BYTES" => &BYTES,
+        "RARS_PPMD_DUMP_DECODED" => &DECODED,
+        "RARS_PPMD_DUMP_ALLOC" => &ALLOC,
+        _ => return None,
+    };
+    cell.get_or_init(|| {
+        std::env::var_os(env).map(|p| Mutex::new(File::create(p).expect("dump open")))
+    })
+    .as_ref()
+}
+
 const MAX_FREQ: u32 = 124;
 const MIN_MODEL_CONTEXTS: usize = 1;
-// Legacy cap retained for `model_context_limit`; the per-unit suballocator
-// is the actual restart trigger.
-const PPMD_CONTEXT_BYTES: usize = 16;
 
 // PPMd-H suballocator parameters, per the format-level spec at
 // rar-research/doc/PPMD_ALGORITHM_SPECIFICATION.md §4.
@@ -61,10 +140,24 @@ enum AllocSide {
 
 #[derive(Debug, Clone)]
 struct Suballocator {
+    // Trace suppression for init phase (root-context allocs after restart);
+    // mirrors C's RestartModel which does direct pointer math instead of
+    // going through Ppmd7_AllocUnits. Off by default.
+    trace_suppress: bool,
+    // Original pool size in bytes (C's p->Size). Preserved across restarts so
+    // the text/units split — which depends on the exact byte size, not the
+    // unit-truncated one — stays identical to the reference each restart.
+    size_bytes: usize,
     // Total unit budget (= dict_mb * 1 MiB / 12, capped at u32::MAX).
     pool_units: u32,
-    // Text region capacity in bytes (= pool_units / 8 * 12, per spec §5.2).
-    // text_ptr reaching this triggers a restart.
+    // Byte slack at the pool top (= Size % UNIT_SIZE). The C reference sets
+    // HiUnit = Base + Size with Size not necessarily a unit multiple, so all
+    // its pointers sit at `unit*12 + rem`. We keep unit offsets but fold this
+    // remainder into byte-domain comparisons (text capacity / fallback bump)
+    // so restart timing matches the reference exactly.
+    rem: u32,
+    // Text region capacity in bytes. text_ptr reaching this triggers a
+    // restart. Mirrors C's UnitsStart byte pointer (= Size - 84*text_units).
     text_capacity_bytes: usize,
     // Bump pointers (in units). lo_bump grows up, hi_bump grows down;
     // valid bumpable space is [lo_bump, hi_bump). Both start at units_start.
@@ -85,7 +178,10 @@ impl Default for Suballocator {
     fn default() -> Self {
         const EMPTY: Vec<u32> = Vec::new();
         Self {
+            trace_suppress: false,
+            size_bytes: 0,
             pool_units: 0,
+            rem: 0,
             text_capacity_bytes: 0,
             units_start: 0,
             lo_bump: 0,
@@ -98,19 +194,34 @@ impl Default for Suballocator {
 }
 
 impl Suballocator {
+    fn trace_on(&self) -> bool {
+        !self.trace_suppress && crate::ppmd::diag::alloc_enabled()
+    }
+
     fn reset(&mut self, pool_bytes: usize) {
         let pool_units_usize = pool_bytes / ALLOC_UNIT_BYTES;
         // Cap at u32::MAX-1 (NULL_OFFSET is u32::MAX). Even 256 MiB / 12 =
         // ~22M fits comfortably, so this is theoretical.
         let pool_units = pool_units_usize.min(u32::MAX as usize - 1) as u32;
-        // Spec §5.2: units_start = hi_unit - 7 * (size / 8 / UNIT_SIZE) units.
-        // Equivalently: text region occupies pool_units / 8 units at the bottom.
-        let text_units = pool_units / 8;
+        // Ppmd7_RestartModel byte layout:
+        //   text_units  = Size / 8 / UNIT_SIZE
+        //   UnitsStart  = HiUnit - 7 * text_units * UNIT_SIZE
+        // i.e. the units region is exactly 7*text_units units carved off the
+        // top; the leftover slack (Size % 96, plus Size % 12) all stays in the
+        // text region. The previous code took `pool_units / 8` for text and
+        // gave the slack to the units region — 5+ extra bump units versus the
+        // reference, which desynchronised restart timing on large inputs.
+        let text_units = (pool_bytes / 8 / ALLOC_UNIT_BYTES) as u32;
+        let units_region = text_units.saturating_mul(7).min(pool_units);
+        self.size_bytes = pool_bytes;
         self.pool_units = pool_units;
-        self.text_capacity_bytes = text_units as usize * ALLOC_UNIT_BYTES;
-        self.units_start = text_units;
-        self.lo_bump = text_units;
+        self.rem = (pool_bytes % ALLOC_UNIT_BYTES) as u32;
+        self.units_start = pool_units - units_region;
+        self.lo_bump = self.units_start;
         self.hi_bump = pool_units;
+        // UnitsStart byte pointer = units_start*12 + rem (= Size - 84*text_units).
+        self.text_capacity_bytes =
+            self.units_start as usize * ALLOC_UNIT_BYTES + self.rem as usize;
         for fl in &mut self.free_lists {
             fl.clear();
         }
@@ -129,32 +240,38 @@ impl Suballocator {
         alloc_tables().index_to_units[bucket] as usize
     }
 
-    // Largest bucket whose size fits within `available_units` (used by the
-    // glue redistribution to chunk merged runs back into bucket-sized pieces).
-    fn largest_bucket_fitting(available_units: u32) -> Option<usize> {
-        if available_units == 0 {
-            return None;
-        }
-        let cap = available_units.min(MAX_BUCKET_UNITS as u32) as usize;
-        // bucket_for(cap) returns the smallest bucket whose size >= cap; we
-        // want the largest bucket whose size <= cap. Walk down from there.
-        let mut bucket = alloc_tables().units_to_index[cap - 1] as usize;
-        while Self::bucket_units(bucket) > cap {
-            if bucket == 0 {
-                return None;
-            }
-            bucket -= 1;
-        }
-        Some(bucket)
-    }
-
     fn alloc(&mut self, units: usize, side: AllocSide, text_len_bytes: usize) -> Option<u32> {
         let bucket = Self::bucket_for(units)?;
-        if let Some(offset) = self.free_lists[bucket].pop() {
-            return Some(offset);
-        }
-        if let Some(offset) = self.try_bump(bucket, side) {
-            return Some(offset);
+        // Reference ordering differs by side. Lo-side state arrays go through
+        // `Ppmd7_AllocUnits` (free_list first, then lo-bump, then rare). Hi-side
+        // 1-unit context headers go through the inlined sequence in
+        // `Ppmd7_CreateSuccessors` (hi-bump first, then free_list[0], then
+        // `Ppmd7_AllocUnitsRare(0)`). The two are not interchangeable: every
+        // time a free 1-unit block exists alongside hi-side headroom, the two
+        // orderings consume different memory cells. Adjacency at the next glue
+        // diverges, and the drift compounds across millions of decode steps.
+        let trace = self.trace_on();
+        match side {
+            AllocSide::Hi => {
+                if let Some(offset) = self.try_bump(bucket, side) {
+                    if trace { crate::ppmd::diag::alloc_event(&format!("Bh {}", offset)); }
+                    return Some(offset);
+                }
+                if let Some(offset) = self.free_lists[bucket].pop() {
+                    if trace { crate::ppmd::diag::alloc_event(&format!("X {} {}", bucket, offset)); }
+                    return Some(offset);
+                }
+            }
+            AllocSide::Lo => {
+                if let Some(offset) = self.free_lists[bucket].pop() {
+                    if trace { crate::ppmd::diag::alloc_event(&format!("X {} {}", bucket, offset)); }
+                    return Some(offset);
+                }
+                if let Some(offset) = self.try_bump(bucket, side) {
+                    if trace { crate::ppmd::diag::alloc_event(&format!("Bl {}", offset)); }
+                    return Some(offset);
+                }
+            }
         }
         // Rare path (mirrors Ppmd7_AllocUnitsRare):
         //   1. If glue_count == 0, glue and retry the bucket's free list.
@@ -164,11 +281,13 @@ impl Suballocator {
             self.glue();
             self.glue_count = GLUE_RESET;
             if let Some(offset) = self.free_lists[bucket].pop() {
+                if trace { crate::ppmd::diag::alloc_event(&format!("X {} {}", bucket, offset)); }
                 return Some(offset);
             }
         }
         for i in (bucket + 1)..N_BUCKETS {
             if let Some(offset) = self.free_lists[i].pop() {
+                if trace { crate::ppmd::diag::alloc_event(&format!("X {} {}", i, offset)); }
                 let large_size = Self::bucket_units(i) as u32;
                 let need = Self::bucket_units(bucket) as u32;
                 let leftover = large_size - need;
@@ -177,7 +296,15 @@ impl Suballocator {
             }
         }
         self.glue_count = self.glue_count.saturating_sub(1);
-        self.fallback_bump(bucket, text_len_bytes)
+        let r = self.fallback_bump(bucket, text_len_bytes);
+        if trace {
+            if let Some(o) = r {
+                crate::ppmd::diag::alloc_event(&format!("Bu {}", o));
+            } else {
+                crate::ppmd::diag::alloc_event("FAIL");
+            }
+        }
+        r
     }
 
     // Spec / ref Ppmd7_AllocUnitsRare bump-fallback: when no free block at
@@ -190,7 +317,10 @@ impl Suballocator {
         }
         let need_units = Self::bucket_units(bucket) as u32;
         let need_bytes = need_units as u64 * ALLOC_UNIT_BYTES as u64;
-        let units_start_bytes = self.units_start as u64 * ALLOC_UNIT_BYTES as u64;
+        // UnitsStart byte pointer includes the pool-top remainder, matching
+        // the C reference (all its pointers sit at unit*12 + rem).
+        let units_start_bytes =
+            self.units_start as u64 * ALLOC_UNIT_BYTES as u64 + self.rem as u64;
         // Match C: `(us - Text) > numBytes`. Strict greater-than (not ≥).
         if units_start_bytes <= text_len_bytes as u64 + need_bytes {
             return None;
@@ -198,7 +328,8 @@ impl Suballocator {
         let new_units_start = self.units_start - need_units;
         self.units_start = new_units_start;
         // Lower the text capacity so text_has_room reflects the new boundary.
-        self.text_capacity_bytes = (new_units_start as u64 * ALLOC_UNIT_BYTES as u64) as usize;
+        self.text_capacity_bytes =
+            new_units_start as usize * ALLOC_UNIT_BYTES + self.rem as usize;
         Some(new_units_start)
     }
 
@@ -235,55 +366,152 @@ impl Suballocator {
         }
         if let Some(bucket) = Self::bucket_for(units) {
             self.free_lists[bucket].push(offset);
+            if self.trace_on() {
+                crate::ppmd::diag::alloc_event(&format!("P {} {}", bucket, offset));
+            }
         }
     }
 
-    // Spec §4.3 GlueFreeBlocks: collect all free blocks, sort by offset,
-    // merge adjacent runs, then redistribute back into the free lists,
-    // splitting runs larger than MAX_BUCKET_UNITS into bucket-sized chunks.
+    // Ppmd7_SplitBlock: carve a block of `old_units` (bucket I2U value) down
+    // to `new_units` (bucket I2U value) in place. The first `new_units`
+    // stay at `base_offset`; the (old_units - new_units) residue is pushed
+    // onto the appropriate smaller bucket(s). The "kept" prefix is NOT
+    // pushed — the caller is still using it as live storage.
+    fn split_in_place(&mut self, base_offset: u32, old_units: u32, new_units: u32) {
+        let nu = old_units - new_units;
+        let residue_offset = base_offset + new_units;
+        let Some(mut i) = Self::bucket_for(nu as usize) else {
+            return;
+        };
+        if Self::bucket_units(i) as u32 != nu {
+            // Inexact fit: the C reference pushes the smaller piece first
+            // (at offset + bucket_units(i-1)) onto bucket index `nu - k - 1`,
+            // then the i-1-sized prefix onto bucket i-1. Order across
+            // buckets is irrelevant; per-bucket LIFO is unaffected.
+            let k = Self::bucket_units(i - 1) as u32;
+            let small_bucket = (nu - k - 1) as usize;
+            self.free_lists[small_bucket].push(residue_offset + k);
+            if self.trace_on() {
+                crate::ppmd::diag::alloc_event(&format!(
+                    "P {} {}", small_bucket, residue_offset + k
+                ));
+            }
+            i -= 1;
+        }
+        self.free_lists[i].push(residue_offset);
+        if self.trace_on() {
+            crate::ppmd::diag::alloc_event(&format!("P {} {}", i, residue_offset));
+        }
+    }
+
     fn glue(&mut self) {
-        // Collect every (offset, size_units) pair from all buckets.
-        let mut blocks: Vec<(u32, u32)> = Vec::new();
+        if self.trace_on() {
+            crate::ppmd::diag::alloc_event("G");
+        }
+        self.glue_inner()
+    }
+
+    // Faithful port of Ppmd7_GlueFreeBlocks (§4.4). The earlier
+    // sort-by-offset version diverged from the reference in three ways that
+    // all change the resulting free-list state — and therefore the timing of
+    // the next allocation failure / model restart:
+    //   1. Threading order: the reference walks free_list[0..38], each list
+    //      head-first (most-recent first), prepending every node to a single
+    //      glue list. We rebuild that exact order so the fill pass re-buckets
+    //      runs in the same sequence (per-bucket LIFO must match).
+    //   2. Merge cap: a merged run may not reach 0x10000 units (NU is 16-bit).
+    //   3. Fill split: runs are emitted as repeated 128-unit blocks, then the
+    //      <=128 remainder via Ppmd7_SplitBlock's exact-or-two-piece rule —
+    //      not "largest bucket fitting" greedily.
+    fn glue_inner(&mut self) {
+        use std::collections::HashMap;
+        // Step 1: thread free blocks into the reference's list order.
+        // list[k] = (offset, nu). Reference prepends; we emulate with a
+        // front-growing build then it is naturally bucket-37-first.
+        let mut list: Vec<(u32, u32)> = Vec::new();
         for bucket in 0..N_BUCKETS {
-            let size = Self::bucket_units(bucket) as u32;
-            for &offset in &self.free_lists[bucket] {
-                blocks.push((offset, size));
+            let nu = Self::bucket_units(bucket) as u32;
+            // Reference walks the bucket list head-first (recent->oldest) and
+            // prepends each node. Iterating our Vec recent->oldest and
+            // prepending reproduces that; doing it per-bucket with the whole
+            // bucket prepended keeps later buckets in front.
+            for &off in self.free_lists[bucket].iter().rev() {
+                list.insert(0, (off, nu));
             }
             self.free_lists[bucket].clear();
         }
-        if blocks.is_empty() {
+        if list.is_empty() {
             return;
         }
-        blocks.sort_unstable_by_key(|&(o, _)| o);
 
-        // Merge adjacent blocks into runs.
-        let mut run_start = blocks[0].0;
-        let mut run_size = blocks[0].1;
-        for &(off, size) in &blocks[1..] {
-            if run_start + run_size == off {
-                run_size += size;
-            } else {
-                self.emit_run(run_start, run_size);
-                run_start = off;
-                run_size = size;
-            }
+        // Step 2: glue pass. Absorb the physically-next free block while the
+        // combined size stays < 0x10000. `nu_at` maps a block's start offset
+        // to its current size; absorbed blocks are set to 0.
+        let mut nu_at: HashMap<u32, u32> = HashMap::with_capacity(list.len() * 2);
+        for &(off, nu) in &list {
+            nu_at.insert(off, nu);
         }
-        self.emit_run(run_start, run_size);
+        for &(off, _) in &list {
+            let mut cur = match nu_at.get(&off) {
+                Some(&n) if n != 0 => n,
+                _ => continue,
+            };
+            loop {
+                let next_off = off + cur;
+                match nu_at.get(&next_off) {
+                    Some(&n2) => {
+                        let new = cur + n2;
+                        if new >= 0x10000 {
+                            break;
+                        }
+                        cur = new;
+                        nu_at.insert(next_off, 0);
+                    }
+                    None => break,
+                }
+            }
+            nu_at.insert(off, cur);
+        }
+
+        // Step 3: fill pass in list order.
+        for &(off, _) in &list {
+            let nu = match nu_at.get(&off) {
+                Some(&n) if n != 0 => n,
+                _ => continue,
+            };
+            self.emit_run(off, nu);
+        }
     }
 
-    // Re-bucket a run into the largest-fitting bucket(s), pushing offsets
-    // back onto the corresponding free lists.
+    // Re-bucket a single merged run exactly as Ppmd7_GlueFreeBlocks' fill /
+    // Ppmd7_SplitBlock do: peel 128-unit (bucket 37) blocks, then split the
+    // <=128 remainder into its exact bucket, or two pieces when inexact.
     fn emit_run(&mut self, mut offset: u32, mut remaining: u32) {
-        while remaining > 0 {
-            let Some(bucket) = Self::largest_bucket_fitting(remaining) else {
-                // Should not happen: any nonzero remaining has at least the
-                // 1-unit bucket available. Defensive: drop the residue.
-                return;
-            };
-            let size = Self::bucket_units(bucket) as u32;
-            self.free_lists[bucket].push(offset);
-            offset += size;
-            remaining -= size;
+        const LAST_BUCKET: usize = N_BUCKETS - 1; // 37 == 128 units
+        while remaining > MAX_BUCKET_UNITS as u32 {
+            self.push_free(LAST_BUCKET, offset);
+            offset += MAX_BUCKET_UNITS as u32;
+            remaining -= MAX_BUCKET_UNITS as u32;
+        }
+        if remaining == 0 {
+            return;
+        }
+        let Some(mut i) = Self::bucket_for(remaining as usize) else {
+            return;
+        };
+        if Self::bucket_units(i) as u32 != remaining {
+            let k = Self::bucket_units(i - 1) as u32;
+            let small_bucket = (remaining - k - 1) as usize;
+            self.push_free(small_bucket, offset + k);
+            i -= 1;
+        }
+        self.push_free(i, offset);
+    }
+
+    fn push_free(&mut self, bucket: usize, offset: u32) {
+        self.free_lists[bucket].push(offset);
+        if self.trace_on() {
+            crate::ppmd::diag::alloc_event(&format!("P {} {}", bucket, offset));
         }
     }
 
@@ -463,6 +691,10 @@ impl PpmdDecoder {
         input: &mut impl PpmdByteReader,
         esc_char: &mut u8,
     ) -> Result<()> {
+        // Synthesize first_byte into the dump stream: it is read by the
+        // upstream bit reader, not by PpmdByteReader, so the C reference
+        // would otherwise miss it.
+        diag::dump_byte(first_byte);
         let reset = first_byte & 0x20 != 0;
         let max_mb = if reset {
             Some(input.read_ppmd_byte()?)
@@ -494,7 +726,9 @@ impl PpmdDecoder {
     }
 
     pub fn decode_symbol(&mut self, input: &mut impl PpmdByteReader) -> Result<Option<u8>> {
-        self.decode_symbol_inner(input)
+        let r = self.decode_symbol_inner(input);
+        if let Ok(Some(b)) = r { diag::dump_decoded(b); }
+        r
     }
 
     fn decode_symbol_inner(&mut self, input: &mut impl PpmdByteReader) -> Result<Option<u8>> {
@@ -564,25 +798,16 @@ impl PpmdDecoder {
             self.prev_success = 0;
         }
 
-        let trace_esc = std::env::var_os("RARS_PPMD_TRACE_ESC").is_some();
         loop {
             self.range.normalize(input)?;
             let mut mc = self.min_context;
             let num_masked = self.contexts[mc].states.len();
-            if trace_esc {
-                eprintln!("[esc] iter start: mc={} NumStats={} order_fall={} range={} code={} low={}",
-                    mc, num_masked, self.order_fall, self.range.range, self.range.code, self.range.low);
-            }
             loop {
                 self.order_fall += 1;
                 let Some(suffix) = self.contexts[mc].suffix else {
-                    if trace_esc { eprintln!("[esc] descent reached root, returning None"); }
                     return Ok(None);
                 };
                 mc = suffix;
-                if trace_esc {
-                    eprintln!("[esc] descent step: mc={} NumStats={}", mc, self.contexts[mc].states.len());
-                }
                 if self.contexts[mc].states.len() != num_masked {
                     break;
                 }
@@ -597,20 +822,10 @@ impl PpmdDecoder {
                 .sum::<u32>();
             let (see_ref, esc_freq) = self.make_esc_freq(num_masked)?;
             let freq_sum = hi_cnt + esc_freq;
-            if trace_esc {
-                eprintln!("[esc] arrived: mc={} NumStats={} summ_freq={} hi_cnt={} esc_freq={} freq_sum={}",
-                    mc, self.contexts[mc].states.len(), self.contexts[mc].summ_freq, hi_cnt, esc_freq, freq_sum);
-                eprintln!("[esc] mc.states (non-masked marked *): {:?}",
-                    self.contexts[mc].states.iter().map(|s| (s.symbol, s.freq, if mask[s.symbol as usize] {'*'} else {'_'})).collect::<Vec<_>>());
-            }
             if freq_sum > self.range.range {
                 return Err(Error::InvalidData("RAR PPMd escape range is invalid"));
             }
             let mut count = self.range.get_threshold(freq_sum)?;
-            if trace_esc {
-                eprintln!("[esc] count={} (range after div={}, code-low={})",
-                    count, self.range.range, self.range.code.wrapping_sub(self.range.low));
-            }
             if count < hi_cnt {
                 let mut start = 0u32;
                 for (index, state) in self.contexts[mc].states.iter().enumerate() {
@@ -637,15 +852,8 @@ impl PpmdDecoder {
             }
             self.range.decode(hi_cnt, freq_sum - hi_cnt);
             self.add_see_summ(see_ref, freq_sum);
-            if trace_esc {
-                eprintln!("[esc] pre-mask: mask[5]={} mask[53]={}", mask[5], mask[53]);
-            }
             for state in &self.contexts[mc].states {
                 mask[state.symbol as usize] = false;
-            }
-            if trace_esc {
-                eprintln!("[esc] post-mask: mask[5]={} mask[53]={} (mc={} mc.states.len={})",
-                    mask[5], mask[53], mc, self.contexts[mc].states.len());
             }
         }
     }
@@ -766,14 +974,21 @@ impl PpmdDecoder {
     }
 
     fn init_model(&mut self, max_order: usize) {
+        if crate::ppmd::diag::alloc_enabled() {
+            crate::ppmd::diag::alloc_event(&format!("R {}", max_order));
+        }
         self.contexts.clear();
         self.text.clear();
         // Spec §5.2 RestartModel: clear free lists, reserve root context
         // (1 unit from Hi) + its 256-state array (128 units from Lo).
-        let pool_bytes = self.suballoc.pool_units as usize * ALLOC_UNIT_BYTES;
+        // Reuse the exact original byte size (C's p->Size) so the text/units
+        // split and the pool-top remainder survive the restart unchanged.
         let unbounded_before = self.suballoc.unbounded;
-        let reset_arg = if unbounded_before { 0 } else { pool_bytes };
+        let reset_arg = if unbounded_before { 0 } else { self.suballoc.size_bytes };
         self.suballoc.reset(reset_arg);
+        // Init allocs mirror C's RestartModel direct pointer math; trace is
+        // suppressed so the dumps stay aligned with the C reference.
+        self.suballoc.trace_suppress = true;
         // At init time text is empty.
         let header_offset = self
             .suballoc
@@ -783,6 +998,7 @@ impl PpmdDecoder {
             .suballoc
             .alloc(128, AllocSide::Lo, 0)
             .unwrap_or(NULL_OFFSET);
+        self.suballoc.trace_suppress = false;
         self.max_order = max_order;
         self.order_fall = max_order;
         self.init_rl = -(max_order.min(12) as i32) - 1;
@@ -1003,6 +1219,7 @@ impl PpmdDecoder {
 
         if self.order_fall == 0 {
             let Some(context) = self.create_successors() else {
+                if crate::ppmd::diag::alloc_enabled() { crate::ppmd::diag::alloc_event("RT cs0"); }
                 self.init_model(self.max_order);
                 return Ok(());
             };
@@ -1012,17 +1229,23 @@ impl PpmdDecoder {
             return Ok(());
         }
 
-        // Spec §8.3 step 3: text_ptr reaching units_start triggers a restart.
+        // Match Ppmd7_UpdateModel exactly: advance text first, then check
+        // `text >= UnitsStart`. The previous "check then push" version
+        // restarted one symbol later than the reference, advancing the range
+        // coder by one extra symbol before resetting — which left the
+        // post-restart state out of sync.
+        self.text.push(found_symbol);
+        let max_successor = Successor::Raw(self.text.len());
         if !self.suballoc.text_has_room(self.text.len()) {
+            if crate::ppmd::diag::alloc_enabled() { crate::ppmd::diag::alloc_event("RT text"); }
             self.init_model(self.max_order);
             return Ok(());
         }
-        self.text.push(found_symbol);
-        let max_successor = Successor::Raw(self.text.len());
         let mut min_successor = fs.successor;
         if min_successor != Successor::None {
             if matches!(min_successor, Successor::Raw(_)) {
                 let Some(context) = self.create_successors() else {
+                    if crate::ppmd::diag::alloc_enabled() { crate::ppmd::diag::alloc_event("RT csmin"); }
                     self.init_model(self.max_order);
                     return Ok(());
                 };
@@ -1094,6 +1317,7 @@ impl PpmdDecoder {
             }
             let old_n = self.contexts[c].states.len();
             if !self.grow_state_array(c, old_n + 1) {
+                if crate::ppmd::diag::alloc_enabled() { crate::ppmd::diag::alloc_event("RT grow"); }
                 self.init_model(self.max_order);
                 return Ok(());
             }
@@ -1244,37 +1468,53 @@ impl PpmdDecoder {
         true
     }
 
-    // Rescale shrinks a state array. Models ShrinkUnits: if the surviving
-    // states still fit in the original bucket, nothing changes; otherwise
-    // return the old slot and reallocate at the smaller bucket. If the
-    // smaller reallocation fails, the context drops its array entirely
-    // (signaled by NULL_OFFSET) — rare, and consistent with spec §11.1
-    // marking shrink-failure as a restart trigger.
+    // Rescale shrinks a state array. Mirrors Ppmd7_Rescale's branch at
+    // Ppmd7.c:901-919: if the target bucket has a free block, swap to it
+    // (pop i1, push old to i0); otherwise SplitBlock the existing block in
+    // place — the first i1 units stay at the current address as the new
+    // array, the (i0 - i1)-unit residue is bucketed onto smaller free lists.
+    // No bump is consumed on the in-place path, which matters because over
+    // many rescales the reference never grows lo_bump from shrinks.
+    //
+    // Collapse-to-unary (new_n == 1, new_units == 0) is handled by Rescale's
+    // earlier branch (Ppmd7.c:881-898), which frees `stats` at bucket
+    // U2I(n0) and copies the surviving state into the inline OneState slot.
     fn shrink_state_array(&mut self, ctx_idx: usize, old_n: usize, new_n: usize) {
         let old_units = Self::state_array_units(old_n);
         let new_units = Self::state_array_units(new_n);
         if old_units == 0 || new_units >= old_units {
             return;
         }
-        let old_b = Suballocator::bucket_for(old_units);
-        let new_b = if new_units > 0 {
-            Suballocator::bucket_for(new_units)
-        } else {
-            None
-        };
-        if old_b == new_b && new_b.is_some() {
+        if new_units == 0 {
+            // Collapse to unary: free the whole array, clear the pointer.
+            let old_offset = self.contexts[ctx_idx].array_offset;
+            self.suballoc.free(old_offset, old_units);
+            self.contexts[ctx_idx].array_offset = NULL_OFFSET;
+            return;
+        }
+        let Some(i0) = Suballocator::bucket_for(old_units) else { return };
+        let Some(i1) = Suballocator::bucket_for(new_units) else { return };
+        if i0 == i1 {
             return;
         }
         let old_offset = self.contexts[ctx_idx].array_offset;
-        self.suballoc.free(old_offset, old_units);
-        if new_units > 0 {
-            let text_len = self.text.len();
-            match self.suballoc.alloc(new_units, AllocSide::Lo, text_len) {
-                Some(off) => self.contexts[ctx_idx].array_offset = off,
-                None => self.contexts[ctx_idx].array_offset = NULL_OFFSET,
+        if let Some(swap_offset) = self.suballoc.free_lists[i1].pop() {
+            // Swap path: take a same-sized block from the target bucket,
+            // return the oversized block to its bucket. Data lives in
+            // self.contexts[ctx_idx].states (Vec), so no MEM_12_CPY needed.
+            if self.suballoc.trace_on() {
+                crate::ppmd::diag::alloc_event(&format!("X {} {}", i1, swap_offset));
             }
+            self.suballoc.free(old_offset, old_units);
+            self.contexts[ctx_idx].array_offset = swap_offset;
         } else {
-            self.contexts[ctx_idx].array_offset = NULL_OFFSET;
+            // SplitBlock in place: keep the first I2U(i1) units at the same
+            // address, bucket the residue. Matches Ppmd7_SplitBlock.
+            let i0_units = Suballocator::bucket_units(i0) as u32;
+            let i1_units = Suballocator::bucket_units(i1) as u32;
+            self.suballoc
+                .split_in_place(old_offset, i0_units, i1_units);
+            // array_offset is unchanged.
         }
     }
 
@@ -1546,10 +1786,19 @@ fn hi_bits_flag(symbol: u8, bits: u32) -> u32 {
     ((symbol as u32 + 0xc0) >> (8 - bits)) & (1 << bits)
 }
 
+// Upper bound on the number of live context records. The C reference
+// (Ppmd7.c) has NO independent context cap — model restart is driven solely
+// by suballocator exhaustion (`Ppmd7_AllocUnits`/`AllocUnitsRare` returning
+// NULL). A context header is one 12-byte unit, and headers + state arrays
+// share the pool, so the live context count can never exceed `pool_units`
+// (= Size / UNIT_SIZE). Sizing the cap to that makes the suballocator the
+// binding constraint, exactly as in the reference, while still bounding Vec
+// growth defensively. A smaller cap (the old Size/16) forced a premature
+// RestartModel that desynchronised the decoder from the reference.
 fn model_context_limit(dictionary_mb: usize) -> usize {
     dictionary_mb
         .saturating_mul(1024 * 1024)
-        .checked_div(PPMD_CONTEXT_BYTES)
+        .checked_div(ALLOC_UNIT_BYTES)
         .unwrap_or(usize::MAX)
         .max(MIN_MODEL_CONTEXTS)
 }

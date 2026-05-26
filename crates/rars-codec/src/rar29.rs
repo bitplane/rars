@@ -1647,6 +1647,10 @@ enum StandardFilter {
 
 impl Unpack29 {
     pub fn new() -> Self {
+        // For differential testing: each fresh decoder corresponds to a new
+        // (non-solid) file; truncate the dumps so only the current file's
+        // bytes/symbols remain, letting the C reference decode it in isolation.
+        crate::ppmd::diag::new_file();
         Self {
             bits: BitReader::new(),
             levels: [0; TABLE_COUNT],
@@ -2678,7 +2682,9 @@ impl BitReader {
 
 impl PpmdByteReader for BitReader {
     fn read_ppmd_byte(&mut self) -> Result<u8> {
-        self.read_bits(8).map(|value| value as u8)
+        let v = self.read_bits(8).map(|value| value as u8)?;
+        crate::ppmd::diag::dump_byte(v);
+        Ok(v)
     }
 }
 
