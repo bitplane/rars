@@ -23,8 +23,8 @@ const MAX_VM_DELTA_FILTER_BLOCK_SIZE: usize = 120_000;
 const MAX_VM_AUDIO_FILTER_BLOCK_SIZE: usize = 120_000;
 const MAX_VM_GLOBAL_DATA: usize = 0x2000;
 const MAX_VM_CODE_SIZE: usize = 64 * 1024;
-const MAX_VM_PROGRAMS: usize = 1024;
-const MAX_VM_FILTERS: usize = 1024;
+const MAX_VM_PROGRAMS: usize = 8192;
+const MAX_VM_FILTERS: usize = 8192;
 
 const LENGTH_BASES: [usize; LENGTH_COUNT] = [
     0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 28, 32, 40, 48, 56, 64, 80, 96, 112, 128,
@@ -1612,6 +1612,13 @@ enum BlockMode {
     Ppmd,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LzBlockEnd {
+    SameFileNewTable,
+    NewFileKeepTables,
+    NewFileNewTables,
+}
+
 #[derive(Debug, Clone)]
 struct VmFilter {
     program: usize,
@@ -1647,10 +1654,6 @@ enum StandardFilter {
 
 impl Unpack29 {
     pub fn new() -> Self {
-        // For differential testing: each fresh decoder corresponds to a new
-        // (non-solid) file; truncate the dumps so only the current file's
-        // bytes/symbols remain, letting the C reference decode it in isolation.
-        crate::ppmd::diag::new_file();
         Self {
             bits: BitReader::new(),
             levels: [0; TABLE_COUNT],
@@ -2101,24 +2104,41 @@ impl Unpack29 {
     }
 
     fn finish_lz_member(&mut self) -> Result<()> {
-        if !self.in_lz_block {
-            return Ok(());
+        loop {
+            if !self.in_lz_block {
+                return Ok(());
+            }
+            let symbol = self.main.decode(&mut self.bits)?;
+            if symbol != 256 {
+                return Err(Error::InvalidData("RAR 2.9 LZ member has trailing data"));
+            }
+            match self.read_end_of_block()? {
+                LzBlockEnd::SameFileNewTable => {
+                    if let Err(error) = self.read_tables() {
+                        if error == Error::NeedMoreInput {
+                            return Ok(());
+                        }
+                        return Err(error);
+                    }
+                    self.in_lz_block = true;
+                }
+                LzBlockEnd::NewFileKeepTables | LzBlockEnd::NewFileNewTables => return Ok(()),
+            }
         }
-        let symbol = self.main.decode(&mut self.bits)?;
-        if symbol != 256 {
-            return Err(Error::InvalidData("RAR 2.9 LZ member has trailing data"));
-        }
-        self.read_end_of_block()
     }
 
-    fn read_end_of_block(&mut self) -> Result<()> {
-        let new_table = if self.bits.read_bit()? != 0 {
-            true
+    fn read_end_of_block(&mut self) -> Result<LzBlockEnd> {
+        if self.bits.read_bit()? != 0 {
+            self.in_lz_block = false;
+            return Ok(LzBlockEnd::SameFileNewTable);
+        }
+        if self.bits.read_bit()? != 0 {
+            self.in_lz_block = false;
+            Ok(LzBlockEnd::NewFileNewTables)
         } else {
-            self.bits.read_bit()? != 0
-        };
-        self.in_lz_block = !new_table;
-        Ok(())
+            self.in_lz_block = true;
+            Ok(LzBlockEnd::NewFileKeepTables)
+        }
     }
 
     fn read_offset(&mut self) -> Result<usize> {
@@ -2682,9 +2702,7 @@ impl BitReader {
 
 impl PpmdByteReader for BitReader {
     fn read_ppmd_byte(&mut self) -> Result<u8> {
-        let v = self.read_bits(8).map(|value| value as u8)?;
-        crate::ppmd::diag::dump_byte(v);
-        Ok(v)
+        self.read_bits(8).map(|value| value as u8)
     }
 }
 
