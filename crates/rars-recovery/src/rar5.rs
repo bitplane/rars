@@ -338,7 +338,7 @@ where
 
     let plan = first.plan;
     let shard_len = usize::try_from(plan.group_count).map_err(|_| Error::PlanOverflow)?;
-    if shard_len % 2 != 0 {
+    if !shard_len.is_multiple_of(2) {
         return Err(Error::OddShardSize);
     }
     let shard_ranges = split_prefix_shard_ranges(protected_size, plan)?;
@@ -551,7 +551,7 @@ pub fn reconstruct_data_shards(
         .map(|(_, shard)| shard.len())
         .or_else(|| data_shards.iter().flatten().map(|shard| shard.len()).max())
         .ok_or(Error::TooManyDamagedShards)?;
-    if shard_len % 2 != 0 {
+    if !shard_len.is_multiple_of(2) {
         return Err(Error::OddShardSize);
     }
     if recovery_shards
@@ -880,7 +880,7 @@ pub fn encode_parity_shards(data: &[&[u8]], recovery_shards: usize) -> Result<Ve
     let Some(first) = data.first() else {
         return Err(Error::TooManyShards);
     };
-    if first.len() % 2 != 0 {
+    if !first.len().is_multiple_of(2) {
         return Err(Error::OddShardSize);
     }
     if data.iter().any(|shard| shard.len() != first.len()) {

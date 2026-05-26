@@ -126,7 +126,7 @@ fn derive_key_iv_slow(raw: &mut [u8]) -> ([u8; 16], [u8; 16]) {
             ((i >> 16) & 0xff) as u8,
         ]);
         pos = pos.wrapping_add(3);
-        if i % (HASH_ROUNDS / 16) == 0 {
+        if i.is_multiple_of(HASH_ROUNDS / 16) {
             let digest = sha1.clone().finalize();
             iv[(i / (HASH_ROUNDS / 16)) as usize] = digest[19];
         }
@@ -164,7 +164,7 @@ fn derive_key_iv_fast(raw: &[u8]) -> ([u8; 16], [u8; 16]) {
             ((i >> 8) & 0xff) as u8,
             ((i >> 16) & 0xff) as u8,
         ]);
-        if i % (HASH_ROUNDS / 16) == 0 {
+        if i.is_multiple_of(HASH_ROUNDS / 16) {
             let digest = sha1.clone().finalize();
             iv[(i / (HASH_ROUNDS / 16)) as usize] = digest[19];
         }

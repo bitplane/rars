@@ -319,6 +319,7 @@ impl RarBuilder {
         volume_size = None,
         filters = None
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         format: &str,
         compression: u8,

@@ -279,11 +279,7 @@ impl Archive {
     /// Solid archives, split members, multivolume sets, and RAR 1.3/1.4
     /// archives use the regular streaming extractor.
     #[cfg(feature = "parallel")]
-    pub fn extract_to_parallel_buffered<F>(
-        &self,
-        password: Option<&[u8]>,
-        mut open: F,
-    ) -> Result<()>
+    pub fn extract_to_parallel_buffered<F>(&self, password: Option<&[u8]>, open: F) -> Result<()>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {

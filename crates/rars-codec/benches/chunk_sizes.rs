@@ -7,7 +7,7 @@ use rars_codec::rar50::{
 };
 use std::hint::black_box;
 
-const CHUNK_SIZES: &[usize] = &[1 * 1024, 4 * 1024, 16 * 1024, 64 * 1024, 256 * 1024];
+const CHUNK_SIZES: &[usize] = &[1024, 4 * 1024, 16 * 1024, 64 * 1024, 256 * 1024];
 
 fn payload(size: usize) -> Vec<u8> {
     const PHRASE: &[u8] = b"rars benchmark payload with repeated text and changing literals\n";

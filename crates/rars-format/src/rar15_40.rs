@@ -1546,7 +1546,7 @@ fn repair_newsub_recovery_bytes(
     let tag_len = protected_sectors
         .checked_mul(2)
         .ok_or(Error::InvalidHeader("RAR 3.x recovery tag size overflows"))?;
-    if recovery_data.len() <= tag_len || (recovery_data.len() - tag_len) % 512 != 0 {
+    if recovery_data.len() <= tag_len || !(recovery_data.len() - tag_len).is_multiple_of(512) {
         return Err(Error::InvalidHeader(
             "RAR 3.x recovery data size is invalid",
         ));

@@ -28,7 +28,7 @@ fn build_alloc_tables() -> AllocTables {
     let mut units_to_index = [0u8; MAX_BUCKET_UNITS];
     let mut index_to_units = [0u8; N_BUCKETS];
     let mut k: usize = 0;
-    for i in 0..N_BUCKETS {
+    for (i, index_to_unit) in index_to_units.iter_mut().enumerate() {
         let step = if i >= 12 { 4 } else { i / 4 + 1 };
         for _ in 0..step {
             if k < units_to_index.len() {
@@ -36,7 +36,7 @@ fn build_alloc_tables() -> AllocTables {
             }
             k += 1;
         }
-        index_to_units[i] = k.min(u8::MAX as usize) as u8;
+        *index_to_unit = k.min(u8::MAX as usize) as u8;
     }
     AllocTables {
         units_to_index,
@@ -558,7 +558,7 @@ impl PpmdDecoder {
         if n < 2 {
             0
         } else {
-            (n + 1) / 2
+            n.div_ceil(2)
         }
     }
 
