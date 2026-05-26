@@ -3,8 +3,10 @@
 A Rust implementation of RAR.
 
 * [🏠 home](https://bitplane.net/dev/rust/rars)
+  * [🪵 blog](https://bitplane.net/log/2026/05/rars/)
 * [🦀 crate](https://crates.io/crates/rars)
 * [🐱 source](https://github.com/bitplane/rars)
+* [📃 spec](https://github.com/bitplane/rar-research)
 
 ## Current Status
 
