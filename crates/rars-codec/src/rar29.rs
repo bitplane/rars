@@ -2114,6 +2114,9 @@ impl Unpack29 {
             }
             match self.read_end_of_block()? {
                 LzBlockEnd::SameFileNewTable => {
+                    if self.bits.remaining_bits_are_zero() {
+                        return Ok(());
+                    }
                     if let Err(error) = self.read_tables() {
                         if error == Error::NeedMoreInput {
                             return Ok(());
@@ -2667,6 +2670,25 @@ impl BitReader {
         let value = self.peek_bits(count)?;
         self.bit_pos += count as usize;
         Ok(value)
+    }
+
+    fn remaining_bits_are_zero(&self) -> bool {
+        let full_bytes = self.bit_pos / 8;
+        let bit_offset = self.bit_pos % 8;
+        let Some((&first, rest)) = self
+            .input
+            .get(full_bytes)
+            .zip(self.input.get(full_bytes + 1..))
+        else {
+            return true;
+        };
+        if bit_offset != 0 && first << bit_offset != 0 {
+            return false;
+        }
+        if bit_offset == 0 && first != 0 {
+            return false;
+        }
+        rest.iter().all(|&byte| byte == 0)
     }
 
     fn peek_bits(&self, count: u8) -> Result<u32> {
