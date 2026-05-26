@@ -295,6 +295,7 @@ impl FileHeader {
         packed: &mut R,
         keys: Option<&Rar50Keys>,
         decoder: &mut Unpack50Decoder,
+        buffered_decode_limit: u64,
         writer: &mut dyn Write,
     ) -> Result<()> {
         if self.is_stored() {
@@ -333,9 +334,9 @@ impl FileHeader {
             )
             .map_err(|error| match error {
                 StreamDecodeError::Decode(error) => Error::from(error),
-                StreamDecodeError::FilteredMember => Error::UnsupportedFeature {
-                    version: crate::version::ArchiveVersion::Rar50,
-                    feature: "RAR 5 filtered compressed member above buffered decode limit",
+                StreamDecodeError::FilteredMember => Error::Rar50BufferedDecodeLimitExceeded {
+                    limit: buffered_decode_limit,
+                    required: self.unpacked_size,
                 },
                 StreamDecodeError::Sink(error) => Error::from(error),
             })?;
@@ -614,8 +615,14 @@ impl<'a> DecoderSession<'a> {
         let (mut packed, keys) = file
             .packed_reader_with_password(archive, self.password)
             .map_err(|error| file.entry_error("reading", error))?;
-        file.stream_packed_with_decoder(&mut packed, keys.as_ref(), &mut streaming_decoder, writer)
-            .map_err(|error| file.entry_error("decoding", error))?;
+        file.stream_packed_with_decoder(
+            &mut packed,
+            keys.as_ref(),
+            &mut streaming_decoder,
+            self.buffered_decode_limit,
+            writer,
+        )
+        .map_err(|error| file.entry_error("decoding", error))?;
         self.decoder = streaming_decoder;
         Ok(())
     }
@@ -1251,10 +1258,7 @@ mod tests {
                 operation: "decoding",
                 source,
                 ..
-            } if matches!(*source, Error::UnsupportedFeature {
-                feature: "RAR 5 filtered compressed member above buffered decode limit",
-                ..
-            })
+            } if matches!(*source, Error::Rar50BufferedDecodeLimitExceeded { .. })
         ));
     }
 
@@ -1806,6 +1810,7 @@ mod tests {
                 &mut Cursor::new(Vec::<u8>::new()),
                 None,
                 &mut decoder,
+                BUFFERED_DECODE_LIMIT,
                 &mut out,
             )
             .unwrap_err();

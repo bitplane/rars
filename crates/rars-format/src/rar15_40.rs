@@ -564,6 +564,7 @@ impl FileHeader {
             Error::UnsupportedSignature
             | Error::UnsupportedVersion(_)
             | Error::UnsupportedFeature { .. }
+            | Error::Rar50BufferedDecodeLimitExceeded { .. }
             | Error::UnsupportedFamilyFeature { .. }
             | Error::UnsupportedCompression { .. }
             | Error::UnsupportedEncryption { .. }

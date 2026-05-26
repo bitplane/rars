@@ -50,6 +50,13 @@ pub(crate) struct PasswordArgs {
 }
 
 #[derive(Args)]
+pub(crate) struct ReadOptionsArgs {
+    /// Maximum RAR 5 filtered member size to buffer while decoding (e.g. 512m, 1g)
+    #[arg(long, value_name = "SIZE", value_parser = crate::parse_size_string)]
+    pub rar50_buffered_decode_limit: Option<usize>,
+}
+
+#[derive(Args)]
 pub(crate) struct InfoArgs {
     #[command(flatten)]
     pub password: PasswordArgs,
@@ -65,6 +72,8 @@ pub(crate) struct InfoArgs {
 pub(crate) struct TestArgs {
     #[command(flatten)]
     pub password: PasswordArgs,
+    #[command(flatten)]
+    pub read_options: ReadOptionsArgs,
     /// Archive path (first volume of a multi-part set), optionally followed by sibling parts
     #[arg(value_name = "ARCHIVE", required = true)]
     pub paths: Vec<String>,
@@ -74,6 +83,8 @@ pub(crate) struct TestArgs {
 pub(crate) struct ExtractArgs {
     #[command(flatten)]
     pub password: PasswordArgs,
+    #[command(flatten)]
+    pub read_options: ReadOptionsArgs,
     /// Behaviour when an extracted file already exists on disk
     #[arg(long, value_enum, default_value_t = OverwriteCli::Never)]
     pub overwrite: OverwriteCli,

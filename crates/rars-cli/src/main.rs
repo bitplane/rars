@@ -29,8 +29,8 @@ use rars::rar15_40::{
     WriterOptions as Rar15WriterOptions,
 };
 use rars::{
-    extract_volumes_to, extract_volumes_to_with_options, Archive as DetectedArchive,
-    ArchiveReadOptions, ArchiveReader, ArchiveVersion, FeatureSet,
+    extract_volumes_to_with_options, Archive as DetectedArchive, ArchiveReadOptions, ArchiveReader,
+    ArchiveVersion, FeatureSet,
 };
 use repair::cmd_repair;
 use std::collections::HashSet;
@@ -56,10 +56,11 @@ fn main() {
 
 impl From<rars::Error> for CliError {
     fn from(error: rars::Error) -> Self {
+        let message = format!("{error}{}", rar50_buffered_decode_limit_hint(&error));
         if error_is_password_class(&error) {
-            Self::password(error.to_string())
+            Self::password(message)
         } else {
-            Self::general(error.to_string())
+            Self::general(message)
         }
     }
 }
@@ -100,24 +101,6 @@ fn configure_threads(threads: Option<usize>) -> CliResult<()> {
     Ok(())
 }
 
-fn extract_archive_to<F>(
-    archive: &DetectedArchive,
-    password: Option<&[u8]>,
-    open: F,
-) -> rars::Result<()>
-where
-    F: FnMut(&rars::ExtractedEntryMeta) -> rars::Result<Box<dyn Write>>,
-{
-    #[cfg(feature = "parallel")]
-    {
-        archive.extract_to_parallel_buffered(password, open)
-    }
-    #[cfg(not(feature = "parallel"))]
-    {
-        archive.extract_to(password, open)
-    }
-}
-
 fn extract_archive_to_with_options<F>(
     archive: &DetectedArchive,
     options: ArchiveReadOptions<'_>,
@@ -136,10 +119,38 @@ where
     }
 }
 
-fn test_extract_options(password: Option<&[u8]>) -> ArchiveReadOptions<'_> {
-    match password {
+fn extract_options(
+    password: Option<&[u8]>,
+    rar50_buffered_decode_limit: Option<usize>,
+) -> ArchiveReadOptions<'_> {
+    let options = match password {
         Some(password) => ArchiveReadOptions::with_password(password),
         None => ArchiveReadOptions::new(),
+    };
+    match rar50_buffered_decode_limit {
+        Some(limit) => options.with_rar50_buffered_decode_limit(limit as u64),
+        None => options,
+    }
+}
+
+fn rar50_buffered_decode_limit_hint(error: &rars::Error) -> String {
+    let Some((_, required)) = find_rar50_buffered_decode_limit_error(error) else {
+        return String::new();
+    };
+    format!(
+        "\nhint: retry with --rar50-buffered-decode-limit {required} if you trust this archive and have enough memory"
+    )
+}
+
+fn find_rar50_buffered_decode_limit_error(error: &rars::Error) -> Option<(u64, u64)> {
+    match error {
+        rars::Error::Rar50BufferedDecodeLimitExceeded { limit, required } => {
+            Some((*limit, *required))
+        }
+        rars::Error::AtEntry { source, .. } | rars::Error::AtArchiveOffset { source, .. } => {
+            find_rar50_buffered_decode_limit_error(source)
+        }
+        _ => None,
     }
 }
 
@@ -561,14 +572,21 @@ fn cmd_test(args: TestArgs) -> CliResult<()> {
         ensure_password_for_extract(&archive, &mut password)?;
         warn_rar50_redirections(&archive);
         let mut entries = Vec::new();
-        let options = test_extract_options(password_bytes(&password));
+        let options = extract_options(
+            password_bytes(&password),
+            args.read_options.rar50_buffered_decode_limit,
+        );
         extract_archive_to_with_options(&archive, options, |meta| {
             entries.push(meta.clone());
             Ok(Box::new(std::io::sink()))
         })
         .map_err(|err| {
             classify_rars_error(err, |err| {
-                format!("failed to test archive '{}': {err}", paths[0])
+                format!(
+                    "failed to test archive '{}': {err}{}",
+                    paths[0],
+                    rar50_buffered_decode_limit_hint(err)
+                )
             })
         })?;
         for entry in &entries {
@@ -581,14 +599,21 @@ fn cmd_test(args: TestArgs) -> CliResult<()> {
             warn_rar50_redirections(archive);
         }
         let mut entries = Vec::new();
-        let options = test_extract_options(password_bytes(&password));
+        let options = extract_options(
+            password_bytes(&password),
+            args.read_options.rar50_buffered_decode_limit,
+        );
         extract_volumes_to_with_options(&archives, options, |meta| {
             entries.push(meta.clone());
             Ok(Box::new(std::io::sink()))
         })
         .map_err(|err| {
             classify_rars_error(err, |err| {
-                format!("failed to test volume set '{}': {err}", paths.join(", "))
+                format!(
+                    "failed to test volume set '{}': {err}{}",
+                    paths.join(", "),
+                    rar50_buffered_decode_limit_hint(err)
+                )
             })
         })?;
         for entry in &entries {
@@ -622,7 +647,11 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
         let family = archive.family();
         let mut outputs = Vec::new();
         let mut planned_paths = HashSet::new();
-        extract_archive_to(&archive, password_bytes(&password), |meta| {
+        let options = extract_options(
+            password_bytes(&password),
+            args.read_options.rar50_buffered_decode_limit,
+        );
+        extract_archive_to_with_options(&archive, options, |meta| {
             let planned = output_path_for_entry(&out_dir, meta)?;
             if !planned_paths.insert(planned.clone()) {
                 return Err(rars::Error::InvalidHeader(
@@ -641,8 +670,9 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
         .map_err(|err| {
             classify_rars_error(err, |err| {
                 format!(
-                    "failed to write extracted entry to '{}': {err}",
-                    out_dir.display()
+                    "failed to write extracted entry to '{}': {err}{}",
+                    out_dir.display(),
+                    rar50_buffered_decode_limit_hint(err)
                 )
             })
         })?;
@@ -667,7 +697,11 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
             .ok_or("no archive parts provided")?;
         let mut outputs = Vec::new();
         let mut planned_paths = HashSet::new();
-        extract_volumes_to(&archives, password_bytes(&password), |meta| {
+        let options = extract_options(
+            password_bytes(&password),
+            args.read_options.rar50_buffered_decode_limit,
+        );
+        extract_volumes_to_with_options(&archives, options, |meta| {
             let planned = output_path_for_entry(&out_dir, meta)?;
             if !planned_paths.insert(planned.clone()) {
                 return Err(rars::Error::InvalidHeader(
@@ -685,7 +719,11 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
         })
         .map_err(|err| {
             classify_rars_error(err, |err| {
-                format!("failed to extract volume set '{}': {err}", paths.join(", "))
+                format!(
+                    "failed to extract volume set '{}': {err}{}",
+                    paths.join(", "),
+                    rar50_buffered_decode_limit_hint(err)
+                )
             })
         })?;
         restore_output_metadata(&outputs).map_err(|err| {
@@ -1716,7 +1754,7 @@ pub(crate) fn resolve_password_args(args: &PasswordArgs) -> CliResult<Option<Pas
 
 #[cfg(test)]
 mod tests {
-    use super::parse_size;
+    use super::{parse_size, rar50_buffered_decode_limit_hint};
     use crate::output::{checked_output_path, output_relative_path, redirection_warning};
     use crate::password::{error_needs_password, should_prompt_password};
     use crate::volumes::{infer_part_index, rar50_volume_part_path, volume_part_path};
@@ -1760,6 +1798,23 @@ mod tests {
         assert_eq!(parse_size("2g").unwrap(), 2 * 1024 * 1024 * 1024);
         assert!(parse_size("m").is_err());
         assert!(parse_size("").is_err());
+    }
+
+    #[test]
+    fn rar50_buffered_decode_limit_hint_names_cli_option() {
+        let error = Error::AtEntry {
+            name: b"large.bin".to_vec(),
+            operation: "decoding",
+            source: Box::new(Error::Rar50BufferedDecodeLimitExceeded {
+                limit: 512 * 1024 * 1024,
+                required: 900 * 1024 * 1024,
+            }),
+        };
+
+        assert_eq!(
+            rar50_buffered_decode_limit_hint(&error),
+            "\nhint: retry with --rar50-buffered-decode-limit 943718400 if you trust this archive and have enough memory"
+        );
     }
 
     #[test]
