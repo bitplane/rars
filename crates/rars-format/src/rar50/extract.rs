@@ -182,7 +182,7 @@ impl FileHeader {
         password: Option<&[u8]>,
         out: &mut impl Write,
     ) -> Result<()> {
-        let mut session = DecoderSession::new_with_password(password);
+        let mut session = DecoderSession::new_with_password(password, BUFFERED_DECODE_LIMIT);
         session.write_file_to(archive, self, out)
     }
 
@@ -431,7 +431,9 @@ impl Archive {
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
-        let mut session = DecoderSession::new_with_password(options.password);
+        let buffered_decode_limit = rar50_buffered_decode_limit(options);
+        let mut session =
+            DecoderSession::new_with_password(options.password, buffered_decode_limit);
         for file in self.files() {
             if file.redirection.is_some() {
                 continue;
@@ -463,7 +465,7 @@ impl Archive {
             || self.files().any(|file| {
                 file.is_split_before()
                     || file.is_split_after()
-                    || file.should_stream_decode()
+                    || file.should_stream_decode(rar50_buffered_decode_limit(options))
                     || file.decoded_compression_info().is_ok_and(|info| info.solid)
             })
         {
@@ -471,12 +473,13 @@ impl Archive {
         }
 
         let password = options.password;
+        let buffered_decode_limit = rar50_buffered_decode_limit(options);
         let files: Vec<_> = self.files().collect();
         if files.len() < 2 {
             return self.extract_to(options, open);
         }
         let entries = crate::parallel::map_collect(files, |file| {
-            decode_parallel_entry(self, file, password)
+            decode_parallel_entry(self, file, password, buffered_decode_limit)
         })?;
         for entry in entries {
             write_parallel_entry(entry, &mut open)?;
@@ -500,6 +503,7 @@ fn decode_parallel_entry(
     archive: &Archive,
     file: &FileHeader,
     password: Option<&[u8]>,
+    buffered_decode_limit: u64,
 ) -> Result<ParallelExtractedEntry> {
     if file.redirection.is_some() {
         return Ok(ParallelExtractedEntry::Skipped);
@@ -514,7 +518,7 @@ fn decode_parallel_entry(
         return Ok(ParallelExtractedEntry::Directory(meta));
     }
     let mut data = Vec::new();
-    let mut session = DecoderSession::new_with_password(password);
+    let mut session = DecoderSession::new_with_password(password, buffered_decode_limit);
     session.write_file_to(archive, file, &mut data)?;
     Ok(ParallelExtractedEntry::File { meta, data })
 }
@@ -545,13 +549,15 @@ struct DecodedData {
 struct DecoderSession<'a> {
     decoder: Unpack50Decoder,
     password: Option<&'a [u8]>,
+    buffered_decode_limit: u64,
 }
 
 impl<'a> DecoderSession<'a> {
-    fn new_with_password(password: Option<&'a [u8]>) -> Self {
+    fn new_with_password(password: Option<&'a [u8]>, buffered_decode_limit: u64) -> Self {
         Self {
             decoder: Unpack50Decoder::new(),
             password,
+            buffered_decode_limit,
         }
     }
 
@@ -564,7 +570,7 @@ impl<'a> DecoderSession<'a> {
         if file.is_stored() {
             return file.write_stored_to(archive, self.password, writer);
         }
-        if file.should_stream_decode() {
+        if file.should_stream_decode(self.buffered_decode_limit) {
             return self.stream_file_to(archive, file, writer);
         }
         let checkpoint = self.decoder.clone();
@@ -635,9 +641,15 @@ impl<'a> DecoderSession<'a> {
 }
 
 impl FileHeader {
-    fn should_stream_decode(&self) -> bool {
-        !self.is_stored() && self.unpacked_size > BUFFERED_DECODE_LIMIT
+    fn should_stream_decode(&self, buffered_decode_limit: u64) -> bool {
+        !self.is_stored() && self.unpacked_size > buffered_decode_limit
     }
+}
+
+fn rar50_buffered_decode_limit(options: crate::ArchiveReadOptions<'_>) -> u64 {
+    options
+        .rar50_buffered_decode_limit
+        .unwrap_or(BUFFERED_DECODE_LIMIT)
 }
 
 /// Streams a RAR 5 multivolume archive set to caller-provided writers.
@@ -655,7 +667,8 @@ where
 
     let password = options.password;
     let mut split = SplitVolumeState::new();
-    let mut session = DecoderSession::new_with_password(password);
+    let buffered_decode_limit = rar50_buffered_decode_limit(options);
+    let mut session = DecoderSession::new_with_password(password, buffered_decode_limit);
 
     for (volume_index, archive) in volumes.iter().enumerate() {
         for (file_index, file) in archive.files().enumerate() {
@@ -1191,7 +1204,7 @@ mod tests {
         .unwrap();
         let archive = Archive::parse(&archive).unwrap();
         let file = archive.files().next().unwrap();
-        assert!(!file.should_stream_decode());
+        assert!(!file.should_stream_decode(BUFFERED_DECODE_LIMIT));
 
         let mut out = Vec::new();
         file.write_to(&archive, None, &mut out).unwrap();
@@ -1224,7 +1237,7 @@ mod tests {
         .unwrap();
         let archive = Archive::parse(&archive).unwrap();
         let file = archive.files().next().unwrap();
-        assert!(file.should_stream_decode());
+        assert!(file.should_stream_decode(BUFFERED_DECODE_LIMIT));
 
         let mut out = Vec::new();
         let error = file.write_to(&archive, None, &mut out).unwrap_err();

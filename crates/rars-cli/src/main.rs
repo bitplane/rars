@@ -29,7 +29,8 @@ use rars::rar15_40::{
     WriterOptions as Rar15WriterOptions,
 };
 use rars::{
-    extract_volumes_to, Archive as DetectedArchive, ArchiveReader, ArchiveVersion, FeatureSet,
+    extract_volumes_to, extract_volumes_to_with_options, Archive as DetectedArchive,
+    ArchiveReadOptions, ArchiveReader, ArchiveVersion, FeatureSet,
 };
 use repair::cmd_repair;
 use std::collections::HashSet;
@@ -115,6 +116,34 @@ where
     {
         archive.extract_to(password, open)
     }
+}
+
+fn extract_archive_to_with_options<F>(
+    archive: &DetectedArchive,
+    options: ArchiveReadOptions<'_>,
+    open: F,
+) -> rars::Result<()>
+where
+    F: FnMut(&rars::ExtractedEntryMeta) -> rars::Result<Box<dyn Write>>,
+{
+    #[cfg(feature = "parallel")]
+    {
+        archive.extract_to_parallel_buffered_with_options(options, open)
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        archive.extract_to_with_options(options, open)
+    }
+}
+
+fn test_extract_options(password: Option<&[u8]>) -> ArchiveReadOptions<'_> {
+    let options = match password {
+        Some(password) => ArchiveReadOptions::with_password(password),
+        None => ArchiveReadOptions::new(),
+    };
+    // `rars test` writes to sink(), so keep RAR5 buffering below normal
+    // extraction's compatibility cap to bound corpus-run RSS.
+    options.with_rar50_buffered_decode_limit(128 * 1024 * 1024)
 }
 
 fn display_text(text: impl AsRef<str>) -> String {
@@ -535,7 +564,8 @@ fn cmd_test(args: TestArgs) -> CliResult<()> {
         ensure_password_for_extract(&archive, &mut password)?;
         warn_rar50_redirections(&archive);
         let mut entries = Vec::new();
-        extract_archive_to(&archive, password_bytes(&password), |meta| {
+        let options = test_extract_options(password_bytes(&password));
+        extract_archive_to_with_options(&archive, options, |meta| {
             entries.push(meta.clone());
             Ok(Box::new(std::io::sink()))
         })
@@ -554,7 +584,8 @@ fn cmd_test(args: TestArgs) -> CliResult<()> {
             warn_rar50_redirections(archive);
         }
         let mut entries = Vec::new();
-        extract_volumes_to(&archives, password_bytes(&password), |meta| {
+        let options = test_extract_options(password_bytes(&password));
+        extract_volumes_to_with_options(&archives, options, |meta| {
             entries.push(meta.clone());
             Ok(Box::new(std::io::sink()))
         })

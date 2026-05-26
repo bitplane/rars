@@ -415,11 +415,17 @@ impl Archive {
     }
 
     pub fn parse_with_password(input: &[u8], password: Option<&[u8]>) -> Result<Self> {
-        Self::parse_with_options(input, crate::ArchiveReadOptions { password })
+        Self::parse_with_options(
+            input,
+            crate::ArchiveReadOptions::with_optional_password(password),
+        )
     }
 
     pub fn parse_owned_with_password(input: Vec<u8>, password: Option<&[u8]>) -> Result<Self> {
-        Self::parse_owned_with_options(input, crate::ArchiveReadOptions { password })
+        Self::parse_owned_with_options(
+            input,
+            crate::ArchiveReadOptions::with_optional_password(password),
+        )
     }
 
     pub fn parse_path(path: impl AsRef<Path>) -> Result<Self> {

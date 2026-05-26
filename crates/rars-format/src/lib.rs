@@ -34,6 +34,12 @@ pub use version::{ArchiveFamily, ArchiveVersion};
 pub struct ArchiveReadOptions<'a> {
     /// Password bytes used for encrypted headers or payloads.
     pub password: Option<&'a [u8]>,
+    /// Optional RAR 5 whole-member buffered decode limit.
+    ///
+    /// Filtered RAR 5 members need whole-member transforms. Compressed members
+    /// above this limit use the streaming path and reject filtered streams
+    /// with an unsupported-feature error instead of buffering the full member.
+    pub rar50_buffered_decode_limit: Option<u64>,
 }
 
 impl<'a> ArchiveReadOptions<'a> {
@@ -46,6 +52,21 @@ impl<'a> ArchiveReadOptions<'a> {
     pub fn with_password(password: &'a [u8]) -> Self {
         Self {
             password: Some(password),
+            ..Self::default()
         }
+    }
+
+    /// Creates read options with an optional password.
+    pub fn with_optional_password(password: Option<&'a [u8]>) -> Self {
+        Self {
+            password,
+            ..Self::default()
+        }
+    }
+
+    /// Sets the RAR 5 whole-member buffered decode limit.
+    pub fn with_rar50_buffered_decode_limit(mut self, limit: u64) -> Self {
+        self.rar50_buffered_decode_limit = Some(limit);
+        self
     }
 }

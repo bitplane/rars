@@ -246,18 +246,30 @@ impl Archive {
     }
 
     /// Streams extracted entries to caller-provided writers.
-    pub fn extract_to<F>(&self, password: Option<&[u8]>, mut open: F) -> Result<()>
+    pub fn extract_to<F>(&self, password: Option<&[u8]>, open: F) -> Result<()>
+    where
+        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    {
+        self.extract_to_with_options(read_options(password), open)
+    }
+
+    /// Streams extracted entries to caller-provided writers with read options.
+    pub fn extract_to_with_options<F>(
+        &self,
+        options: ArchiveReadOptions<'_>,
+        mut open: F,
+    ) -> Result<()>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
         match self {
-            Self::Rar13(archive) => archive.extract_to(password, |meta| open(&rar13_meta(meta))),
+            Self::Rar13(archive) => {
+                archive.extract_to(options.password, |meta| open(&rar13_meta(meta)))
+            }
             Self::Rar15To40(archive) => {
-                archive.extract_to(read_options(password), |meta| open(&rar15_40_meta(meta)))
+                archive.extract_to(options, |meta| open(&rar15_40_meta(meta)))
             }
-            Self::Rar50Plus(archive) => {
-                archive.extract_to(read_options(password), |meta| open(&rar50_meta(meta)))
-            }
+            Self::Rar50Plus(archive) => archive.extract_to(options, |meta| open(&rar50_meta(meta))),
         }
     }
 
@@ -275,16 +287,29 @@ impl Archive {
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
+        self.extract_to_parallel_buffered_with_options(read_options(password), open)
+    }
+
+    /// Extracts independent non-solid members in parallel with read options.
+    #[cfg(feature = "parallel")]
+    pub fn extract_to_parallel_buffered_with_options<F>(
+        &self,
+        options: ArchiveReadOptions<'_>,
+        mut open: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    {
         match self {
-            Self::Rar13(archive) => archive.extract_to(password, |meta| open(&rar13_meta(meta))),
-            Self::Rar15To40(archive) => archive
-                .extract_to_parallel_buffered(read_options(password), |meta| {
-                    open(&rar15_40_meta(meta))
-                }),
-            Self::Rar50Plus(archive) => archive
-                .extract_to_parallel_buffered(read_options(password), |meta| {
-                    open(&rar50_meta(meta))
-                }),
+            Self::Rar13(archive) => {
+                archive.extract_to(options.password, |meta| open(&rar13_meta(meta)))
+            }
+            Self::Rar15To40(archive) => {
+                archive.extract_to_parallel_buffered(options, |meta| open(&rar15_40_meta(meta)))
+            }
+            Self::Rar50Plus(archive) => {
+                archive.extract_to_parallel_buffered(options, |meta| open(&rar50_meta(meta)))
+            }
         }
     }
 
@@ -525,9 +550,17 @@ fn read_options(password: Option<&[u8]>) -> ArchiveReadOptions<'_> {
 }
 
 /// Streams a multivolume archive set to caller-provided writers.
-pub fn extract_volumes_to<F>(
+pub fn extract_volumes_to<F>(archives: &[Archive], password: Option<&[u8]>, open: F) -> Result<()>
+where
+    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+{
+    extract_volumes_to_with_options(archives, read_options(password), open)
+}
+
+/// Streams a multivolume archive set to caller-provided writers with read options.
+pub fn extract_volumes_to_with_options<F>(
     archives: &[Archive],
-    password: Option<&[u8]>,
+    options: ArchiveReadOptions<'_>,
     mut open: F,
 ) -> Result<()>
 where
@@ -540,19 +573,15 @@ where
     match first.family() {
         ArchiveFamily::Rar13 => {
             let typed = rar13_volumes(archives)?;
-            rar13::extract_volumes_to(&typed, password, |meta| open(&rar13_meta(meta)))
+            rar13::extract_volumes_to(&typed, options.password, |meta| open(&rar13_meta(meta)))
         }
         ArchiveFamily::Rar15To40 => {
             let typed = rar15_40_volumes(archives)?;
-            rar15_40::extract_volumes_to(&typed, read_options(password), |meta| {
-                open(&rar15_40_meta(meta))
-            })
+            rar15_40::extract_volumes_to(&typed, options, |meta| open(&rar15_40_meta(meta)))
         }
         ArchiveFamily::Rar50Plus => {
             let typed = rar50_volumes(archives)?;
-            rar50::extract_volumes_to(&typed, read_options(password), |meta| {
-                open(&rar50_meta(meta))
-            })
+            rar50::extract_volumes_to(&typed, options, |meta| open(&rar50_meta(meta)))
         }
         _ => Err(Error::UnsupportedSignature),
     }
