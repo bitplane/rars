@@ -584,14 +584,14 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rars"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rars-format",
 ]
 
 [[package]]
 name = "rars-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "libc",
@@ -604,7 +604,7 @@ dependencies = [
 
 [[package]]
 name = "rars-codec"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "criterion",
  "rars-crc32",
@@ -612,11 +612,11 @@ dependencies = [
 
 [[package]]
 name = "rars-crc32"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "rars-crypto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes",
  "hmac",
@@ -628,7 +628,7 @@ dependencies = [
 
 [[package]]
 name = "rars-format"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "criterion",
  "getrandom",
@@ -641,7 +641,7 @@ dependencies = [
 
 [[package]]
 name = "rars-recovery"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "rayon"
