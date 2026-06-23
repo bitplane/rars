@@ -29,6 +29,7 @@ parallel = [
 ]
 
 [dependencies]
+aho-corasick.workspace = true
 getrandom.workspace = true
 rayon = { workspace = true, optional = true }
 rars-codec.workspace = true

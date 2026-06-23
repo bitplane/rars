@@ -24,6 +24,7 @@ categories = ["compression"]
 
 [workspace.dependencies]
 aes = { version = "0.9", features = ["zeroize"] }
+aho-corasick = "1.1"
 clap = { version = "4.6", features = ["derive", "wrap_help"] }
 getrandom = "0.4"
 hmac = "0.13"
