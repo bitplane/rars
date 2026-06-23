@@ -1,4 +1,6 @@
 use crate::version::ArchiveFamily;
+use aho_corasick::AhoCorasick;
+use std::sync::OnceLock;
 
 pub const RAR13_SIGNATURE: &[u8; 4] = b"RE~^";
 pub const RAR15_SIGNATURE: &[u8; 7] = b"Rar!\x1a\x07\x00";
@@ -22,34 +24,65 @@ pub fn detect_archive_family(input: &[u8]) -> Option<ArchiveSignature> {
     detect_at(input, 0)
 }
 
-pub fn find_archive_start(input: &[u8], max_scan: usize) -> Option<ArchiveSignature> {
-    let limit = input.len().min(max_scan);
-    let mut first_rar13 = None;
-    for offset in 0..=limit {
-        let tail = input.get(offset..)?;
-        if tail.starts_with(RAR50_SIGNATURE) {
-            return Some(ArchiveSignature {
-                family: ArchiveFamily::Rar50Plus,
-                offset,
-                length: RAR50_SIGNATURE.len(),
-            });
+const SIGNATURES: &[&[u8]] = &[RAR50_SIGNATURE, RAR15_SIGNATURE, RAR13_SIGNATURE];
+const MAX_SIGNATURE_LEN: usize = {
+    let mut max_len = 0;
+    let mut i = 0;
+    while i < SIGNATURES.len() {
+        if SIGNATURES[i].len() > max_len {
+            max_len = SIGNATURES[i].len();
         }
-        if tail.starts_with(RAR15_SIGNATURE) {
-            return Some(ArchiveSignature {
-                family: ArchiveFamily::Rar15To40,
-                offset,
-                length: RAR15_SIGNATURE.len(),
-            });
-        }
-        if first_rar13.is_none() && tail.starts_with(RAR13_SIGNATURE) {
-            first_rar13 = Some(ArchiveSignature {
-                family: ArchiveFamily::Rar13,
-                offset,
-                length: RAR13_SIGNATURE.len(),
-            });
-        }
+        i += 1;
     }
-    first_rar13
+    max_len
+};
+
+fn signatures_searcher() -> &'static AhoCorasick {
+    static INSTANCE: OnceLock<AhoCorasick> = OnceLock::new();
+    INSTANCE.get_or_init(|| AhoCorasick::new(SIGNATURES).unwrap())
+}
+
+fn signatures_searcher_only_15_plus() -> &'static AhoCorasick {
+    static INSTANCE: OnceLock<AhoCorasick> = OnceLock::new();
+    INSTANCE.get_or_init(|| AhoCorasick::new(&SIGNATURES[..2]).unwrap())
+}
+
+pub fn find_archive_start(input: &[u8], max_scan: usize) -> Option<ArchiveSignature> {
+    // The limit is the maximum offset to find the signature, so we need to look
+    // up to the longest signature after that point.
+    let limit = input.len().min(max_scan.saturating_add(MAX_SIGNATURE_LEN));
+    let input = &input[..limit];
+    let mut first_rar13 = None;
+    let mut it = signatures_searcher().find_iter(input);
+    while let Some(m) = it.next() {
+        let family = match m.pattern().as_u32() {
+            0 => ArchiveFamily::Rar50Plus,
+            1 => ArchiveFamily::Rar15To40,
+            2 => {
+                // Only find the first rar13 signature
+                debug_assert!(first_rar13.is_none());
+                first_rar13 = Some(ArchiveSignature {
+                    family: ArchiveFamily::Rar13,
+                    offset: m.start(),
+                    length: m.len(),
+                });
+                // Switch to a searcher that doesn't have the rar13 signature anymore
+                it = signatures_searcher_only_15_plus()
+                    .find_iter(aho_corasick::Input::new(input).range(m.end()..));
+                continue;
+            }
+            _ => unreachable!(),
+        };
+        if m.start() > max_scan {
+            break;
+        }
+        return Some(ArchiveSignature {
+            family,
+            offset: m.start(),
+            length: m.len(),
+        });
+    }
+    first_rar13.filter(|sig| sig.offset <= max_scan)
 }
 
 fn detect_at(input: &[u8], offset: usize) -> Option<ArchiveSignature> {

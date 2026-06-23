@@ -700,6 +700,7 @@ dependencies = [
 name = "rars-format"
 version = "0.2.0"
 dependencies = [
+ "aho-corasick",
  "criterion",
  "getrandom",
  "rars-codec",
