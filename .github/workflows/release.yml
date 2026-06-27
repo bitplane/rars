@@ -10,7 +10,7 @@ on:
       ref:
         description: "Tag or ref to publish"
         required: true
-        default: "v0.3.0"
+        default: "v0.3.1"
       publish:
         description: "Release path to run"
         required: true
@@ -315,22 +315,18 @@ jobs:
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             manylinux: "2014"
-            sdist: true
           - label: linux-aarch64
             os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             manylinux: "2014"
-            sdist: false
           - label: macos-universal2
             os: macos-latest
             target: universal2-apple-darwin
             manylinux: "off"
-            sdist: false
           - label: windows-x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
             manylinux: "off"
-            sdist: false
     steps:
       - uses: actions/checkout@v7
         with:
@@ -350,12 +346,40 @@ jobs:
             --locked
             --compatibility pypi
             --out dist
-            ${{ matrix.sdist && '--sdist' || '' }}
 
       - name: Upload Python artifacts
         uses: actions/upload-artifact@v7
         with:
           name: python-${{ needs.verify-tag.outputs.version }}-${{ matrix.label }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  build-python-sdist:
+    name: Build Python sdist
+    needs: [verify-tag, test]
+    if: github.event_name == 'push' || inputs.publish == 'pypi' || inputs.publish == 'all'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_REF }}
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+
+      - name: Upload Python sdist
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-${{ needs.verify-tag.outputs.version }}-sdist
           path: dist/*
           if-no-files-found: error
           retention-days: 7
@@ -366,11 +390,12 @@ jobs:
   # ----------------------------------------------------------------------
   publish-pypi:
     name: Publish Python package to PyPI
-    needs: [verify-tag, build-python-wheels, publish-crates]
+    needs: [verify-tag, build-python-wheels, build-python-sdist, publish-crates]
     if: >-
       always()
       && needs.verify-tag.result == 'success'
       && needs.build-python-wheels.result == 'success'
+      && needs.build-python-sdist.result == 'success'
       && (
         needs.publish-crates.result == 'success'
         || (github.event_name == 'workflow_dispatch' && inputs.publish == 'pypi' && needs.publish-crates.result == 'skipped')

@@ -1,6 +1,6 @@
 [package]
 name = "rars-format"
-version = "0.3.0"
+version = "0.3.1"
 description = "RAR archive format parser and writer implementation used by rars."
 edition.workspace = true
 rust-version.workspace = true

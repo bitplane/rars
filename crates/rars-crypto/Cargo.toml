@@ -1,6 +1,6 @@
 [package]
 name = "rars-crypto"
-version = "0.3.0"
+version = "0.3.1"
 description = "RAR legacy and modern archive encryption primitives."
 edition.workspace = true
 rust-version.workspace = true

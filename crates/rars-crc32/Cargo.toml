@@ -1,6 +1,6 @@
 [package]
 name = "rars-crc32"
-version = "0.3.0"
+version = "0.3.1"
 description = "Shared CRC-32 primitives for the rars workspace."
 edition.workspace = true
 rust-version.workspace = true
