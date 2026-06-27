@@ -68,6 +68,16 @@ jobs:
                       f"::error::{name} version {version} does not match tag {tag_version}"
                   )
               raise SystemExit(1)
+
+          with open("pyproject.toml", "rb") as f:
+              pyproject = __import__("tomllib").load(f)
+          py_version = pyproject["project"]["version"]
+          print(f"pyproject = {py_version}")
+          if py_version != tag_version:
+              print(
+                  f"::error::pyproject version {py_version} does not match tag {tag_version}"
+              )
+              raise SystemExit(1)
           PY
           echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
 
@@ -262,11 +272,95 @@ jobs:
           publish rars-cli
 
   # ----------------------------------------------------------------------
-  # 5. Publish the packaged binaries to the tagged GitHub Release.
+  # 5. Build Python wheels and an sdist for PyPI. The Python extension uses
+  #    abi3-py310, so one wheel per OS/architecture covers CPython 3.10+.
+  # ----------------------------------------------------------------------
+  build-python-wheels:
+    name: Build Python ${{ matrix.label }}
+    needs: [verify-tag, test]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            manylinux: "2014"
+            sdist: true
+          - label: linux-aarch64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            manylinux: "2014"
+            sdist: false
+          - label: macos-universal2
+            os: macos-latest
+            target: universal2-apple-darwin
+            manylinux: "off"
+            sdist: false
+          - label: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            manylinux: "off"
+            sdist: false
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: >-
+            --release
+            --locked
+            --compatibility pypi
+            --out dist
+            ${{ matrix.sdist && '--sdist' || '' }}
+
+      - name: Upload Python artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-${{ needs.verify-tag.outputs.version }}-${{ matrix.label }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # ----------------------------------------------------------------------
+  # 6. Publish Python wheels and sdist to PyPI using Trusted Publishing.
+  #    Configure the `release` environment as a PyPI trusted publisher.
+  # ----------------------------------------------------------------------
+  publish-pypi:
+    name: Publish Python package to PyPI
+    needs: [verify-tag, build-python-wheels, publish-crates]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download Python artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: python-${{ needs.verify-tag.outputs.version }}-*
+          merge-multiple: true
+
+      - name: Publish Python package
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  # ----------------------------------------------------------------------
+  # 7. Publish the packaged binaries to the tagged GitHub Release.
   # ----------------------------------------------------------------------
   publish-github-release:
     name: Publish GitHub Release
-    needs: [verify-tag, build, publish-crates]
+    needs: [verify-tag, build, publish-crates, publish-pypi]
     runs-on: ubuntu-latest
     permissions:
       contents: write
