@@ -1,6 +1,6 @@
 [package]
 name = "rars-codec"
-version = "0.2.0"
+version = "0.3.0"
 description = "RAR compression codecs, filters, PPMd, and RARVM components."
 edition.workspace = true
 rust-version.workspace = true

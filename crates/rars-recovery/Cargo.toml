@@ -1,6 +1,6 @@
 [package]
 name = "rars-recovery"
-version = "0.2.0"
+version = "0.3.0"
 description = "RAR recovery record planning and repair primitives."
 edition.workspace = true
 rust-version.workspace = true
