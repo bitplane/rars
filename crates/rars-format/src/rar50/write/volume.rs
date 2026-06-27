@@ -640,12 +640,12 @@ fn write_volume_from_body_pass(
             HEAD_END,
             0,
             None,
-            &[],
+            &end_header_specific(0),
             &[],
             &[],
         )?);
     } else {
-        write_block(&mut out, HEAD_END, 0, None, &[], &[], &[])?;
+        write_end_header(&mut out, 0)?;
     }
     Ok((out, recovery_offset))
 }

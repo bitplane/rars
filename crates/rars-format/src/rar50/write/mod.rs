@@ -1328,12 +1328,12 @@ fn emit_resolved_writer_plan_pass(
             HEAD_END,
             0,
             None,
-            &[],
+            &end_header_specific(0),
             &[],
             &[],
         )?);
     } else {
-        write_block(&mut out, HEAD_END, 0, None, &[], &[], &[])?;
+        write_end_header(&mut out, 0)?;
     }
     Ok((out, next_quick_open_offset, next_recovery_offset))
 }
@@ -2419,6 +2419,24 @@ fn write_block(
     Ok(())
 }
 
+pub(super) fn write_end_header(out: &mut Vec<u8>, end_flags: u64) -> Result<()> {
+    write_block(
+        out,
+        HEAD_END,
+        0,
+        None,
+        &end_header_specific(end_flags),
+        &[],
+        &[],
+    )
+}
+
+pub(super) fn end_header_specific(end_flags: u64) -> Vec<u8> {
+    let mut specific = Vec::new();
+    write_vint(&mut specific, end_flags);
+    specific
+}
+
 fn write_block_with_cache(
     out: &mut Vec<u8>,
     cached_headers: &mut Vec<CachedHeader>,
@@ -2690,7 +2708,7 @@ mod tests {
             &packed,
         )
         .unwrap();
-        write_block(&mut archive, HEAD_END, 0, None, &[], &[], &[]).unwrap();
+        write_end_header(&mut archive, 0).unwrap();
 
         let parsed = Archive::parse(&archive).unwrap();
         let file = parsed.files().next().unwrap();
@@ -3032,7 +3050,7 @@ mod tests {
             &packed,
         )
         .unwrap();
-        write_block(&mut archive, HEAD_END, 0, None, &[], &[], &[]).unwrap();
+        write_end_header(&mut archive, 0).unwrap();
 
         let mut path = std::env::temp_dir();
         path.push(format!(
@@ -3093,7 +3111,7 @@ mod tests {
             &packed,
         )
         .unwrap();
-        write_block(&mut archive, HEAD_END, 0, None, &[], &[], &[]).unwrap();
+        write_end_header(&mut archive, 0).unwrap();
 
         let mut path = std::env::temp_dir();
         path.push(format!("rars-rar50-match-{}.rar", std::process::id()));

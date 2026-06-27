@@ -5,7 +5,7 @@ use rars_crc32::crc32;
 use rars_crypto::rar50::{Rar50Cipher, Rar50Keys};
 use rars_format::rar50::{
     extract_volumes_to, repair_inline_recovery_bytes, repair_rev5_volumes_to, Archive,
-    ArchiveMetadataEntry, EncryptedArchiveCommentEntry, EncryptedCompressedEntry,
+    ArchiveMetadataEntry, Block, EncryptedArchiveCommentEntry, EncryptedCompressedEntry,
     EncryptedStoredEntry, EncryptedStoredEntryWithServices, EncryptedStoredServiceEntry,
     FilterKind, FilterPolicy, Rev5Volume, Rev5VolumeMeta, StoredEntryWithServices,
     StoredServiceEntry,
@@ -62,6 +62,22 @@ impl Write for CollectWriter {
 
 fn collect_extract(archive: &Archive) -> Result<Vec<CollectedEntry>, Error> {
     collect_extract_with_password(archive, None)
+}
+
+fn assert_rar50_end_header_has_flags_vint(archive: &Archive) {
+    let end = archive
+        .blocks
+        .iter()
+        .find_map(|block| match block {
+            Block::End(header) => Some(header),
+            _ => None,
+        })
+        .expect("archive has end header");
+    assert_eq!(end.header_type, 5);
+    assert_eq!(
+        end.header_size, 3,
+        "RAR 5 end header must include End of Archive Flags vint"
+    );
 }
 
 fn collect_extract_with_password(
@@ -728,6 +744,7 @@ fn writes_store_only_rar50_archive_that_reader_extracts() {
     assert_eq!(&bytes[..8], b"Rar!\x1a\x07\x01\0");
     let archive = Archive::parse(&bytes).unwrap();
     assert_eq!(archive.main.archive_flags, 0);
+    assert_rar50_end_header_has_flags_vint(&archive);
     let files: Vec<_> = archive.files().collect();
     assert_eq!(files.len(), 2);
     assert!(files.iter().all(|file| file.is_stored()));
@@ -1211,6 +1228,9 @@ fn writes_compressed_rar50_volume_set_that_reader_reassembles() {
         .iter()
         .map(|part| Archive::parse(part).unwrap())
         .collect();
+    for archive in &archives {
+        assert_rar50_end_header_has_flags_vint(archive);
+    }
     assert!(archives.iter().all(|archive| archive.main.is_volume()));
     let first = archives[0].files().next().unwrap();
     let last = archives.last().unwrap().files().next().unwrap();
