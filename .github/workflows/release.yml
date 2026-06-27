@@ -5,18 +5,33 @@ on:
     tags:
       - "v*.*.*"
       - "v*.*.*-*"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag or ref to publish"
+        required: true
+        default: "v0.3.0"
+      publish:
+        description: "Release path to run"
+        required: true
+        default: "pypi"
+        type: choice
+        options:
+          - pypi
+          - all
 
 # Default deny; each job re-grants only what it needs.
 permissions: {}
 
 # Releases must never be cancelled mid-flight.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
   BIN_NAME: rars
+  RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref_name }}
 
 jobs:
   # ----------------------------------------------------------------------
@@ -33,6 +48,8 @@ jobs:
       version: ${{ steps.check.outputs.version }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_REF }}
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -40,7 +57,7 @@ jobs:
         name: Check versions
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF##*/}"             # v0.1.0-alpha.1
+          TAG="${RELEASE_REF##*/}"            # v0.1.0-alpha.1
           TAG_VERSION="${TAG#v}"              # 0.1.0-alpha.1
           echo "tag = $TAG_VERSION"
 
@@ -93,6 +110,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_REF }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -112,6 +131,7 @@ jobs:
   build:
     name: Build ${{ matrix.label }}
     needs: [verify-tag, test]
+    if: github.event_name == 'push' || inputs.publish == 'all'
     permissions:
       contents: read
     strategy:
@@ -137,6 +157,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_REF }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -217,6 +239,7 @@ jobs:
   publish-crates:
     name: Publish crates to crates.io
     needs: [verify-tag, test]
+    if: github.event_name == 'push' || inputs.publish == 'all'
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -225,6 +248,8 @@ jobs:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_REF }}
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -278,6 +303,7 @@ jobs:
   build-python-wheels:
     name: Build Python ${{ matrix.label }}
     needs: [verify-tag, test]
+    if: github.event_name == 'push' || inputs.publish == 'pypi' || inputs.publish == 'all'
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -307,6 +333,8 @@ jobs:
             sdist: false
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_REF }}
 
       - uses: actions/setup-python@v6
         with:
@@ -339,6 +367,14 @@ jobs:
   publish-pypi:
     name: Publish Python package to PyPI
     needs: [verify-tag, build-python-wheels, publish-crates]
+    if: >-
+      always()
+      && needs.verify-tag.result == 'success'
+      && needs.build-python-wheels.result == 'success'
+      && (
+        needs.publish-crates.result == 'success'
+        || (github.event_name == 'workflow_dispatch' && inputs.publish == 'pypi' && needs.publish-crates.result == 'skipped')
+      )
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -354,6 +390,8 @@ jobs:
 
       - name: Publish Python package
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
 
   # ----------------------------------------------------------------------
   # 7. Publish the packaged binaries to the tagged GitHub Release.
@@ -361,6 +399,7 @@ jobs:
   publish-github-release:
     name: Publish GitHub Release
     needs: [verify-tag, build, publish-crates, publish-pypi]
+    if: github.event_name == 'push' || inputs.publish == 'all'
     runs-on: ubuntu-latest
     permissions:
       contents: write
