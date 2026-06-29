@@ -40,6 +40,16 @@ pub struct ExtractedEntryMeta {
 }
 
 impl ExtractedEntryMeta {
+    /// Creates common metadata for extraction callbacks.
+    pub fn new(name: Vec<u8>, file_time: u32, file_attr: u64, is_directory: bool) -> Self {
+        Self {
+            name,
+            file_time,
+            file_attr,
+            is_directory,
+        }
+    }
+
     /// Raw entry name bytes as stored by the archive family.
     pub fn name_bytes(&self) -> &[u8] {
         &self.name

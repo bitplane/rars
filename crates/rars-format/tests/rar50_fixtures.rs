@@ -3893,6 +3893,54 @@ fn skips_rar50_redirection_entries_when_extracting() {
 }
 
 #[test]
+fn reports_rar50_redirection_entries_when_requested() {
+    for fixture_name in [
+        "wild/hardlink.rar",
+        "wild/symlink.rar",
+        "wild/rarfile_hlink.rar",
+    ] {
+        let bytes = std::fs::read(fixture(fixture_name)).unwrap();
+        let archive = Archive::parse(&bytes).unwrap();
+        let redirections = RefCell::new(Vec::new());
+
+        archive
+            .extract_to_with_redirections(
+                read_options(None),
+                |_meta| {
+                    let data = Rc::new(RefCell::new(Vec::new()));
+                    let writer: Box<dyn Write> = Box::new(CollectWriter { data });
+                    Ok(writer)
+                },
+                |meta, redirection| {
+                    redirections.borrow_mut().push((
+                        meta.name.clone(),
+                        redirection.redirection_type,
+                        redirection.flags,
+                        redirection.target_name.clone(),
+                    ));
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        let expected: Vec<_> = archive
+            .files()
+            .filter_map(|file| {
+                file.redirection.as_ref().map(|redirection| {
+                    (
+                        file.name.clone(),
+                        redirection.redirection_type,
+                        redirection.flags,
+                        redirection.target_name.clone(),
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(redirections.into_inner(), expected, "{fixture_name}");
+    }
+}
+
+#[test]
 fn extracts_wild_rar50_solid_archives_with_redundant_filter_records() {
     for fixture_name in [
         "wild/rarfile_solid.rar",

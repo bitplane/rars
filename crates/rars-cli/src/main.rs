@@ -13,8 +13,9 @@ use cli::{AddArgs, Command, ExtractArgs, InfoArgs, PasswordArgs, TestArgs};
 use error::{CliError, CliResult};
 use input::{rar15_file_attr, rar50_file_attr, read_inputs};
 use output::{
-    open_output_writer, output_path_for_entry, print_ok_entry, restore_output_metadata,
-    warn_rar50_redirections, ExtractedOutput, OverwritePolicy,
+    create_rar50_redirection as create_rar50_redirection_output, open_output_writer,
+    output_path_for_entry, output_path_for_rar50_entry, output_relative_path, print_ok_entry,
+    restore_output_metadata, warn_rar50_redirections, ExtractedOutput, OverwritePolicy,
 };
 use password::{
     classify_rars_error, ensure_password_for_archives_extract, ensure_password_for_extract,
@@ -33,7 +34,8 @@ use rars::{
     ArchiveVersion, FeatureSet,
 };
 use repair::cmd_repair;
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -643,31 +645,13 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
     if paths.len() == 1 {
         let archive = read_archive_path_prompting(&paths[0], &mut password)?;
         ensure_password_for_extract(&archive, &mut password)?;
-        warn_rar50_redirections(&archive);
         let family = archive.family();
-        let mut outputs = Vec::new();
-        let mut planned_paths = HashSet::new();
+        let state = RefCell::new(ExtractOutputState::new(&out_dir, overwrite, family));
         let options = extract_options(
             password_bytes(&password),
             args.read_options.rar50_buffered_decode_limit,
         );
-        extract_archive_to_with_options(&archive, options, |meta| {
-            let planned = output_path_for_entry(&out_dir, meta)?;
-            if !planned_paths.insert(planned.clone()) {
-                return Err(rars::Error::InvalidHeader(
-                    "multiple archive entries map to the same output path",
-                ));
-            }
-            let (path, writer) = open_output_writer(&out_dir, meta, overwrite)?;
-            outputs.push(ExtractedOutput {
-                name: meta.name.clone(),
-                path,
-                meta: meta.clone(),
-                family,
-            });
-            Ok(writer)
-        })
-        .map_err(|err| {
+        extract_single_archive(&archive, options, &state).map_err(|err| {
             classify_rars_error(err, |err| {
                 format!(
                     "failed to write extracted entry to '{}': {err}{}",
@@ -676,6 +660,7 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
                 )
             })
         })?;
+        let outputs = state.into_inner().outputs;
         restore_output_metadata(&outputs).map_err(|err| {
             CliError::general(format!(
                 "failed to restore extracted metadata under '{}': {err}",
@@ -688,36 +673,16 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
     } else {
         let archives = parse_archives_prompting(&paths, &mut password)?;
         ensure_password_for_archives_extract(&archives, &mut password)?;
-        for archive in &archives {
-            warn_rar50_redirections(archive);
-        }
         let family = archives
             .first()
             .map(DetectedArchive::family)
             .ok_or("no archive parts provided")?;
-        let mut outputs = Vec::new();
-        let mut planned_paths = HashSet::new();
+        let state = RefCell::new(ExtractOutputState::new(&out_dir, overwrite, family));
         let options = extract_options(
             password_bytes(&password),
             args.read_options.rar50_buffered_decode_limit,
         );
-        extract_volumes_to_with_options(&archives, options, |meta| {
-            let planned = output_path_for_entry(&out_dir, meta)?;
-            if !planned_paths.insert(planned.clone()) {
-                return Err(rars::Error::InvalidHeader(
-                    "multiple archive entries map to the same output path",
-                ));
-            }
-            let (path, writer) = open_output_writer(&out_dir, meta, overwrite)?;
-            outputs.push(ExtractedOutput {
-                name: meta.name.clone(),
-                path,
-                meta: meta.clone(),
-                family,
-            });
-            Ok(writer)
-        })
-        .map_err(|err| {
+        extract_volume_archives(&archives, options, &state).map_err(|err| {
             classify_rars_error(err, |err| {
                 format!(
                     "failed to extract volume set '{}': {err}{}",
@@ -726,6 +691,7 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
                 )
             })
         })?;
+        let outputs = state.into_inner().outputs;
         restore_output_metadata(&outputs).map_err(|err| {
             CliError::general(format!(
                 "failed to restore extracted metadata under '{}': {err}",
@@ -737,6 +703,166 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
         }
     }
     Ok(())
+}
+
+struct ExtractOutputState<'a> {
+    out_dir: &'a Path,
+    overwrite: OverwritePolicy,
+    family: rars::ArchiveFamily,
+    outputs: Vec<ExtractedOutput>,
+    planned_paths: HashSet<PathBuf>,
+    created_paths: HashMap<PathBuf, PathBuf>,
+}
+
+impl<'a> ExtractOutputState<'a> {
+    fn new(out_dir: &'a Path, overwrite: OverwritePolicy, family: rars::ArchiveFamily) -> Self {
+        Self {
+            out_dir,
+            overwrite,
+            family,
+            outputs: Vec::new(),
+            planned_paths: HashSet::new(),
+            created_paths: HashMap::new(),
+        }
+    }
+
+    fn open_entry(&mut self, meta: &rars::ExtractedEntryMeta) -> rars::Result<Box<dyn Write>> {
+        let planned = output_path_for_entry(self.out_dir, meta)?;
+        self.reserve_output_path(planned)?;
+        let (path, writer) = open_output_writer(self.out_dir, meta, self.overwrite)?;
+        self.record_created_path(&meta.name, path.clone())?;
+        self.outputs.push(ExtractedOutput {
+            name: meta.name.clone(),
+            path,
+            meta: meta.clone(),
+            family: self.family,
+            restore_metadata: true,
+        });
+        Ok(writer)
+    }
+
+    fn open_rar50_entry(
+        &mut self,
+        meta: &rars::rar50::ExtractedEntryMeta,
+    ) -> rars::Result<Box<dyn Write>> {
+        let common = rar50_extracted_meta(meta);
+        let planned = output_path_for_rar50_entry(self.out_dir, meta)?;
+        self.reserve_output_path(planned)?;
+        let (path, writer) = open_output_writer(self.out_dir, &common, self.overwrite)?;
+        self.record_created_path(&meta.name, path.clone())?;
+        self.outputs.push(ExtractedOutput {
+            name: meta.name.clone(),
+            path,
+            meta: common,
+            family: self.family,
+            restore_metadata: true,
+        });
+        Ok(writer)
+    }
+
+    fn create_rar50_redirection(
+        &mut self,
+        meta: &rars::rar50::ExtractedEntryMeta,
+        redirection: &rars::rar50::FileRedirection,
+    ) -> rars::Result<()> {
+        let planned = output_path_for_rar50_entry(self.out_dir, meta)?;
+        self.reserve_output_path(planned)?;
+        let (path, restore_metadata) = create_rar50_redirection_output(
+            self.out_dir,
+            meta,
+            redirection,
+            self.overwrite,
+            &self.created_paths,
+        )?;
+        self.record_created_path(&meta.name, path.clone())?;
+        self.outputs.push(ExtractedOutput {
+            name: meta.name.clone(),
+            path,
+            meta: rar50_extracted_meta(meta),
+            family: self.family,
+            restore_metadata,
+        });
+        Ok(())
+    }
+
+    fn reserve_output_path(&mut self, path: PathBuf) -> rars::Result<()> {
+        if !self.planned_paths.insert(path) {
+            return Err(rars::Error::InvalidHeader(
+                "multiple archive entries map to the same output path",
+            ));
+        }
+        Ok(())
+    }
+
+    fn record_created_path(&mut self, name: &[u8], path: PathBuf) -> rars::Result<()> {
+        let key = output_relative_path(name)
+            .map_err(|_| rars::Error::InvalidHeader("unsafe archive path"))?;
+        self.created_paths.insert(key, path);
+        Ok(())
+    }
+}
+
+fn rar50_extracted_meta(meta: &rars::rar50::ExtractedEntryMeta) -> rars::ExtractedEntryMeta {
+    rars::ExtractedEntryMeta::new(
+        meta.name.clone(),
+        meta.file_time,
+        meta.attr,
+        meta.is_directory,
+    )
+}
+
+fn extract_single_archive(
+    archive: &DetectedArchive,
+    options: ArchiveReadOptions<'_>,
+    state: &RefCell<ExtractOutputState<'_>>,
+) -> rars::Result<()> {
+    match archive {
+        DetectedArchive::Rar50Plus(archive) => archive.extract_to_with_redirections(
+            options,
+            |meta| state.borrow_mut().open_rar50_entry(meta),
+            |meta, redirection| {
+                state
+                    .borrow_mut()
+                    .create_rar50_redirection(meta, redirection)
+            },
+        ),
+        _ => extract_archive_to_with_options(archive, options, |meta| {
+            state.borrow_mut().open_entry(meta)
+        }),
+    }
+}
+
+fn extract_volume_archives(
+    archives: &[DetectedArchive],
+    options: ArchiveReadOptions<'_>,
+    state: &RefCell<ExtractOutputState<'_>>,
+) -> rars::Result<()> {
+    if archives
+        .iter()
+        .all(|archive| matches!(archive, DetectedArchive::Rar50Plus(_)))
+    {
+        let rar50_archives: Vec<_> = archives
+            .iter()
+            .map(|archive| match archive {
+                DetectedArchive::Rar50Plus(archive) => archive.clone(),
+                _ => unreachable!("all archives are RAR5"),
+            })
+            .collect();
+        return rars::rar50::extract_volumes_to_with_redirections(
+            &rar50_archives,
+            options,
+            |meta| state.borrow_mut().open_rar50_entry(meta),
+            |meta, redirection| {
+                state
+                    .borrow_mut()
+                    .create_rar50_redirection(meta, redirection)
+            },
+        );
+    }
+
+    extract_volumes_to_with_options(archives, options, |meta| {
+        state.borrow_mut().open_entry(meta)
+    })
 }
 
 fn validate_extract_destination(out_dir: &Path) -> CliResult<()> {

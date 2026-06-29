@@ -545,6 +545,53 @@ fn rejects_output_path_that_is_existing_symlink() {
 
 #[cfg(unix)]
 #[test]
+fn extracts_rar50_symlink_redirection_entries() {
+    let dir = scratch("rar50-symlink-redirection");
+    let out_dir = dir.join("out");
+    let extract = rars()
+        .arg("x")
+        .arg(fixture_rar50("wild/symlink.rar"))
+        .arg(&out_dir)
+        .output()
+        .unwrap();
+
+    assert!(extract.status.success(), "stderr: {}", stderr(&extract));
+    assert_eq!(fs::read(out_dir.join("file.txt")).unwrap(), b"1234\n");
+    assert_eq!(
+        fs::read_link(out_dir.join("symlink.txt")).unwrap(),
+        PathBuf::from("file.txt")
+    );
+    assert_eq!(
+        fs::read_link(out_dir.join("dirlink")).unwrap(),
+        PathBuf::from("dir")
+    );
+    assert!(out_dir.join("dir").is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn extracts_rar50_hardlink_redirection_entries() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = scratch("rar50-hardlink-redirection");
+    let out_dir = dir.join("out");
+    let extract = rars()
+        .arg("x")
+        .arg(fixture_rar50("wild/hardlink.rar"))
+        .arg(&out_dir)
+        .output()
+        .unwrap();
+
+    assert!(extract.status.success(), "stderr: {}", stderr(&extract));
+    assert_eq!(fs::read(out_dir.join("hardlink.txt")).unwrap(), b"1234\n");
+    let original = fs::metadata(out_dir.join("file.txt")).unwrap();
+    let linked = fs::metadata(out_dir.join("hardlink.txt")).unwrap();
+    assert_eq!(original.dev(), linked.dev());
+    assert_eq!(original.ino(), linked.ino());
+}
+
+#[cfg(unix)]
+#[test]
 fn create_and_extract_preserve_mtime_and_permissions() {
     use std::os::unix::fs::PermissionsExt;
 

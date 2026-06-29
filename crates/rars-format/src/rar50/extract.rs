@@ -1,4 +1,4 @@
-use super::{blake2sp, Archive, ExtractedEntryMeta, FileHeader};
+use super::{blake2sp, Archive, ExtractedEntryMeta, FileHeader, FileRedirection};
 use crate::error::{Error, Result};
 use crate::volume_extract::{ChainedReader, SplitVolumeState, SplitVolumeStep};
 use rars_codec::rar50::{DecodeMode, DecodedChunk, StreamDecodeError, Unpack50Decoder};
@@ -435,11 +435,41 @@ impl Archive {
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
+        self.extract_to_impl(options, &mut open, &mut |_, _| Ok(()), false)
+    }
+
+    pub fn extract_to_with_redirections<F, R>(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+        mut open: F,
+        mut redirect: R,
+    ) -> Result<()>
+    where
+        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+        R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
+    {
+        self.extract_to_impl(options, &mut open, &mut redirect, true)
+    }
+
+    fn extract_to_impl<F, R>(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+        open: &mut F,
+        redirect: &mut R,
+        emit_redirections: bool,
+    ) -> Result<()>
+    where
+        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+        R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
+    {
         let buffered_decode_limit = rar50_buffered_decode_limit(options);
         let mut session =
             DecoderSession::new_with_password(options.password, buffered_decode_limit);
         for file in self.files() {
-            if file.redirection.is_some() {
+            if let Some(redirection) = &file.redirection {
+                if emit_redirections {
+                    redirect(&file.metadata(), redirection)?;
+                }
                 continue;
             }
             if file.is_split_before() || file.is_split_after() {
@@ -486,7 +516,7 @@ impl Archive {
             decode_parallel_entry(self, file, password, buffered_decode_limit)
         })?;
         for entry in entries {
-            write_parallel_entry(entry, &mut open)?;
+            write_parallel_entry(entry, &mut open, &mut |_, _| Ok(()))?;
         }
         Ok(())
     }
@@ -499,7 +529,10 @@ enum ParallelExtractedEntry {
         meta: ExtractedEntryMeta,
         data: Vec<u8>,
     },
-    Skipped,
+    Redirection {
+        meta: ExtractedEntryMeta,
+        redirection: FileRedirection,
+    },
 }
 
 #[cfg(feature = "parallel")]
@@ -509,8 +542,11 @@ fn decode_parallel_entry(
     password: Option<&[u8]>,
     buffered_decode_limit: u64,
 ) -> Result<ParallelExtractedEntry> {
-    if file.redirection.is_some() {
-        return Ok(ParallelExtractedEntry::Skipped);
+    if let Some(redirection) = &file.redirection {
+        return Ok(ParallelExtractedEntry::Redirection {
+            meta: file.metadata(),
+            redirection: redirection.clone(),
+        });
     }
     if file.is_split_before() || file.is_split_after() {
         return Err(Error::InvalidHeader(
@@ -528,9 +564,14 @@ fn decode_parallel_entry(
 }
 
 #[cfg(feature = "parallel")]
-fn write_parallel_entry<F>(entry: ParallelExtractedEntry, open: &mut F) -> Result<()>
+fn write_parallel_entry<F, R>(
+    entry: ParallelExtractedEntry,
+    open: &mut F,
+    redirect: &mut R,
+) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
 {
     match entry {
         ParallelExtractedEntry::Directory(meta) => {
@@ -540,7 +581,9 @@ where
             let mut writer = open(&meta)?;
             writer.write_all(&data)?;
         }
-        ParallelExtractedEntry::Skipped => {}
+        ParallelExtractedEntry::Redirection { meta, redirection } => {
+            redirect(&meta, &redirection)?;
+        }
     }
     Ok(())
 }
@@ -671,6 +714,33 @@ pub fn extract_volumes_to<F>(
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
 {
+    extract_volumes_to_impl(volumes, options, &mut open, &mut |_, _| Ok(()), false)
+}
+
+pub fn extract_volumes_to_with_redirections<F, R>(
+    volumes: &[Archive],
+    options: crate::ArchiveReadOptions<'_>,
+    mut open: F,
+    mut redirect: R,
+) -> Result<()>
+where
+    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
+{
+    extract_volumes_to_impl(volumes, options, &mut open, &mut redirect, true)
+}
+
+fn extract_volumes_to_impl<F, R>(
+    volumes: &[Archive],
+    options: crate::ArchiveReadOptions<'_>,
+    open: &mut F,
+    redirect: &mut R,
+    emit_redirections: bool,
+) -> Result<()>
+where
+    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
+{
     if volumes.is_empty() {
         return Err(Error::InvalidHeader("RAR 5 volume set is empty"));
     }
@@ -684,7 +754,10 @@ where
         for (file_index, file) in archive.files().enumerate() {
             match split.advance(file.is_split_before(), file.is_split_after()) {
                 SplitVolumeStep::Regular => {
-                    if file.redirection.is_some() {
+                    if let Some(redirection) = &file.redirection {
+                        if emit_redirections {
+                            redirect(&file.metadata(), redirection)?;
+                        }
                         continue;
                     }
                     let meta = file.metadata();
@@ -704,7 +777,7 @@ where
                 SplitVolumeStep::Finish(mut completed) => {
                     validate_split_continuation_refs(&completed, file, password)?;
                     completed.append(volume_index, file_index);
-                    completed.write_to(volumes, file, &mut session, &mut open)?;
+                    completed.write_to(volumes, file, &mut session, &mut *open)?;
                 }
                 SplitVolumeStep::MissingFirst => {
                     return Err(Error::InvalidHeader(
@@ -1788,6 +1861,30 @@ mod tests {
     }
 
     #[test]
+    fn archive_extract_to_with_redirections_reports_redirection_entries() {
+        let mut redirect = plain_file(b"link", b"", None);
+        redirect.redirection = Some(super::super::FileRedirection {
+            redirection_type: 1,
+            flags: 0,
+            target_name: b"target".to_vec(),
+        });
+        let archive = archive_with_blocks(vec![Block::File(redirect)], Vec::new());
+        let mut seen = Vec::new();
+        archive
+            .extract_to_with_redirections(
+                crate::ArchiveReadOptions::default(),
+                never_open,
+                |meta, redirection| {
+                    seen.push((meta.name.clone(), redirection.target_name.clone()));
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(seen, vec![(b"link".to_vec(), b"target".to_vec())]);
+    }
+
+    #[test]
     fn extract_volumes_to_skips_redirection_entries_without_opening_writer() {
         let mut redirect = plain_file(b"link", b"", None);
         redirect.redirection = Some(super::super::FileRedirection {
@@ -1797,6 +1894,30 @@ mod tests {
         });
         let volumes = vec![archive_with_blocks(vec![Block::File(redirect)], Vec::new())];
         extract_volumes_to(&volumes, crate::ArchiveReadOptions::default(), never_open).unwrap();
+    }
+
+    #[test]
+    fn extract_volumes_to_with_redirections_reports_redirection_entries() {
+        let mut redirect = plain_file(b"link", b"", None);
+        redirect.redirection = Some(super::super::FileRedirection {
+            redirection_type: 5,
+            flags: 0,
+            target_name: b"target".to_vec(),
+        });
+        let volumes = vec![archive_with_blocks(vec![Block::File(redirect)], Vec::new())];
+        let mut seen = Vec::new();
+        extract_volumes_to_with_redirections(
+            &volumes,
+            crate::ArchiveReadOptions::default(),
+            never_open,
+            |meta, redirection| {
+                seen.push((meta.name.clone(), redirection.target_name.clone()));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(seen, vec![(b"link".to_vec(), b"target".to_vec())]);
     }
 
     #[test]
