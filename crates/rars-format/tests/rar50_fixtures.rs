@@ -3711,6 +3711,28 @@ fn parses_rar50_header_encrypted_archive_from_path_with_password() {
 }
 
 #[test]
+fn parses_winrar721_header_encrypted_quick_open_archive_with_password() {
+    let bytes = std::fs::read(fixture("winrar721_header_encrypted_quickopen.rar")).unwrap();
+
+    assert!(matches!(Archive::parse(&bytes), Err(Error::NeedPassword)));
+    assert!(matches!(
+        Archive::parse_with_password(&bytes, Some(b"wrong")),
+        Err(Error::WrongPasswordOrCorruptData)
+    ));
+
+    let archive = Archive::parse_with_password(&bytes, Some(b"Password")).unwrap();
+    let locator = archive.main.locator().unwrap();
+    assert!(locator.quick_open_offset.is_some_and(|offset| offset > 0));
+    assert_eq!(service_names(&archive), ["QO"]);
+    assert!(archive.services().next().unwrap().encrypted);
+
+    let extracted = collect_extract(&archive).unwrap();
+    assert_eq!(extracted.len(), 1);
+    assert_eq!(extracted[0].name, b"tmp/rars-threshold2-8191/random.bin");
+    assert_eq!(extracted[0].data.len(), 8191);
+}
+
+#[test]
 fn extracts_rar50_header_encrypted_comment_service_with_password() {
     let bytes = std::fs::read(fixture("header_encrypted_comment.rar")).unwrap();
 

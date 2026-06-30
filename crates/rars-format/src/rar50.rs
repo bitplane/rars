@@ -1225,6 +1225,17 @@ fn attach_file_crypto(file: &mut FileHeader, password: Option<&[u8]>) -> Result<
     Ok(())
 }
 
+fn attach_service_crypto(service: &mut FileHeader, password: Option<&[u8]>) -> Result<()> {
+    // WinRAR can emit encrypted QO metadata whose service-local password
+    // check does not validate with the archive password. QuickOpen is an
+    // optional cache, so keep archive parsing and file extraction independent
+    // from that service.
+    if service.name == b"QO" {
+        return Ok(());
+    }
+    attach_file_crypto(service, password)
+}
+
 fn map_rar50_crypto_error(error: rars_crypto::rar50::Error) -> Error {
     match error {
         rars_crypto::rar50::Error::KdfCountTooLarge => Error::UnsupportedFeature {
@@ -1302,7 +1313,7 @@ where
             HEAD_SERVICE => {
                 let mut service = parse_file_header_bytes(&parsed)
                     .map_err(|error| error.at_archive_offset(pos))?;
-                attach_file_crypto(&mut service, password)
+                attach_service_crypto(&mut service, password)
                     .map_err(|error| error.at_archive_offset(pos))?;
                 blocks.push(Block::Service(service));
             }
