@@ -1,6 +1,6 @@
+use rars::crc32::crc32;
 use rars::rar13::{write_stored_archive, StoredEntry, WriterOptions};
 use rars::rar15_40;
-use rars_crc32::crc32;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -9,19 +9,19 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../rars-format/tests/fixtures/rar13")
+        .join("../rars/tests/fixtures/rar13")
         .join(name)
 }
 
 fn fixture_rar15_40(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../rars-format/tests/fixtures/rar15_40")
+        .join("../rars/tests/fixtures/rar15_40")
         .join(name)
 }
 
 fn fixture_rar50(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../rars-format/tests/fixtures/rar50")
+        .join("../rars/tests/fixtures/rar50")
         .join(name)
 }
 

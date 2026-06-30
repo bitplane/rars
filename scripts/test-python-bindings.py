@@ -44,7 +44,7 @@ def install_dev_tools(python: Path) -> None:
 
 
 def smoke_script() -> str:
-    fixture = ROOT / "crates/rars-format/tests/fixtures/rar50/stored.rar"
+    fixture = ROOT / "crates/rars/tests/fixtures/rar50/stored.rar"
     return f"""
 from pathlib import Path
 import tempfile

@@ -1,5 +1,5 @@
 use crate::CliResult;
-use rars_crc32::crc32;
+use rars::crc32::crc32;
 use std::fs;
 use std::path::{Path, PathBuf};
 

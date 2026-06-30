@@ -1,6 +1,6 @@
 [package]
 name = "rars"
-version = "0.3.2"
+version = "0.4.0"
 description = "High-level Rust API for reading, extracting, writing, and repairing RAR archives."
 edition.workspace = true
 rust-version.workspace = true
@@ -19,8 +19,26 @@ workspace = true
 all-features = true
 
 [features]
-fast = ["rars-format/fast"]
-parallel = ["rars-format/parallel"]
+fast = []
+parallel = ["dep:rayon"]
 
 [dependencies]
-rars-format.workspace = true
+aes.workspace = true
+aho-corasick.workspace = true
+getrandom.workspace = true
+hmac.workspace = true
+rayon = { workspace = true, optional = true }
+sha1.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "chunk_sizes"
+harness = false
+
+[[bench]]
+name = "parallel"
+harness = false

@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use rars_codec::rarvm::{Invocation, Program};
+use rars::codec::rarvm::{Invocation, Program};
 
 const MAX_PROGRAM_BYTES: usize = 4096;
 const MAX_FILTER_INPUT: usize = 4096;

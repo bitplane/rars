@@ -1,6 +1,6 @@
 [package]
 name = "rars-cli"
-version = "0.3.2"
+version = "0.4.0"
 description = "Command-line interface for the rars RAR archive toolkit."
 edition.workspace = true
 rust-version.workspace = true
@@ -19,8 +19,8 @@ workspace = true
 all-features = true
 
 [features]
-fast = ["rars/fast", "rars-crc32/fast"]
-parallel = ["dep:rayon", "rars/parallel", "rars-crc32/parallel"]
+fast = ["rars/fast"]
+parallel = ["dep:rayon", "rars/parallel"]
 
 [[bin]]
 name = "rars"
@@ -31,6 +31,5 @@ clap.workspace = true
 libc.workspace = true
 rayon = { workspace = true, optional = true }
 rars.workspace = true
-rars-crc32.workspace = true
 rpassword.workspace = true
 zeroize.workspace = true

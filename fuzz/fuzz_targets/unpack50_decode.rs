@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use rars_codec::rar50::{DecodeMode, Unpack50Decoder};
+use rars::codec::rar50::{DecodeMode, Unpack50Decoder};
 
 const MAX_INPUT_SIZE: usize = 128 * 1024;
 const MAX_OUTPUT_SIZE: usize = 128 * 1024;

@@ -5,8 +5,8 @@ import rars
 
 
 ROOT = Path(__file__).resolve().parents[2]
-RAR50_STORED = ROOT / "crates/rars-format/tests/fixtures/rar50/stored.rar"
-RAR50_PASSWORD = ROOT / "crates/rars-format/tests/fixtures/rar50/password_crc32.rar"
+RAR50_STORED = ROOT / "crates/rars/tests/fixtures/rar50/stored.rar"
+RAR50_PASSWORD = ROOT / "crates/rars/tests/fixtures/rar50/password_crc32.rar"
 
 
 def test_rarfile_lists_and_reads_fixture():

@@ -5,15 +5,81 @@
 //! common member metadata, and streams extraction or recovery output to
 //! caller-provided writers without requiring callers to buffer whole archives
 //! in memory. New Rust users should depend on this crate rather than the
-//! lower-level `rars-*` implementation crates.
+//! lower-level `rars-*` implementation crates, which ended at 0.3.x.
 
-pub use rars_format::{
-    detect_archive_family, find_archive_start, rar13, rar15_40, rar50, ArchiveFamily,
-    ArchiveReadOptions, ArchiveSignature, ArchiveVersion, Error, FeatureSet, Result,
-    SFX_SCAN_LIMIT,
-};
+#![cfg_attr(feature = "fast", feature(portable_simd))]
+
+#[doc(hidden)]
+pub mod codec;
+pub mod crc32;
+#[doc(hidden)]
+pub mod crypto;
+pub mod detect;
+pub mod error;
+mod fast;
+pub mod features;
+mod io_util;
+#[cfg(feature = "parallel")]
+mod parallel;
+pub mod rar13;
+pub mod rar15_40;
+pub mod rar50;
+#[doc(hidden)]
+pub mod recovery;
+mod source;
+pub mod version;
+mod volume_extract;
+mod x86_filter_scan;
+
+pub use detect::{detect_archive_family, find_archive_start, ArchiveSignature, SFX_SCAN_LIMIT};
+pub use error::{Error, Result};
+pub use features::FeatureSet;
 use std::io::{Read, Write};
 use std::path::Path;
+pub use version::{ArchiveFamily, ArchiveVersion};
+
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
+/// Options used while parsing or extracting archives.
+pub struct ArchiveReadOptions<'a> {
+    /// Password bytes used for encrypted headers or payloads.
+    pub password: Option<&'a [u8]>,
+    /// Optional RAR 5 whole-member buffered decode limit.
+    ///
+    /// Filtered RAR 5 members need whole-member transforms. Compressed members
+    /// above this limit use the streaming path and reject filtered streams
+    /// with an unsupported-feature error instead of buffering the full member.
+    pub rar50_buffered_decode_limit: Option<u64>,
+}
+
+impl<'a> ArchiveReadOptions<'a> {
+    /// Creates read options without a password.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates read options with a password.
+    pub fn with_password(password: &'a [u8]) -> Self {
+        Self {
+            password: Some(password),
+            ..Self::default()
+        }
+    }
+
+    /// Creates read options with an optional password.
+    pub fn with_optional_password(password: Option<&'a [u8]>) -> Self {
+        Self {
+            password,
+            ..Self::default()
+        }
+    }
+
+    /// Sets the RAR 5 whole-member buffered decode limit.
+    pub fn with_rar50_buffered_decode_limit(mut self, limit: u64) -> Self {
+        self.rar50_buffered_decode_limit = Some(limit);
+        self
+    }
+}
 
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -495,7 +561,6 @@ impl ArchiveReader {
             ArchiveFamily::Rar50Plus => Ok(Archive::Rar50Plus(rar50::Archive::parse_with_options(
                 input, options,
             )?)),
-            _ => Err(Error::UnsupportedSignature),
         }
     }
 
@@ -514,7 +579,6 @@ impl ArchiveReader {
             ArchiveFamily::Rar50Plus => Ok(Archive::Rar50Plus(
                 rar50::Archive::parse_owned_with_options(input, options)?,
             )),
-            _ => Err(Error::UnsupportedSignature),
         }
     }
 
@@ -545,7 +609,6 @@ impl ArchiveReader {
             ArchiveFamily::Rar50Plus => Ok(Archive::Rar50Plus(
                 rar50::Archive::parse_path_with_signature(path, signature, options)?,
             )),
-            _ => Err(Error::UnsupportedSignature),
         }
     }
 }
@@ -591,7 +654,6 @@ where
             let typed = rar50_volumes(archives)?;
             rar50::extract_volumes_to(&typed, options, |meta| open(&rar50_meta(meta)))
         }
-        _ => Err(Error::UnsupportedSignature),
     }
 }
 
@@ -690,7 +752,7 @@ mod tests {
 
     fn rar15_40_fixture(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../rars-format/tests/fixtures/rar15_40")
+            .join("tests/fixtures/rar15_40")
             .join(name)
     }
 

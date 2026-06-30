@@ -127,28 +127,28 @@ do
   run_unrar "$winrar420_prefix" "$unrar420" "$archive"
 done
 
-cargo test -p rars-format --test rar15_40_fixtures \
+cargo test -p rars --test rar15_40_fixtures \
   reference_unrar_accepts_rar29_segmented_e8_filter_record \
   -- --ignored --exact
-cargo test -p rars-format --test rar15_40_fixtures \
+cargo test -p rars --test rar15_40_fixtures \
   reference_unrar_accepts_rar29_segmented_e8e9_filter_record \
   -- --ignored --exact
-cargo test -p rars-format --test rar15_40_fixtures \
+cargo test -p rars --test rar15_40_fixtures \
   reference_unrar_accepts_rar29_segmented_delta_filter_record \
   -- --ignored --exact
-cargo test -p rars-format --test rar15_40_fixtures \
+cargo test -p rars --test rar15_40_fixtures \
   reference_unrar_accepts_rar29_segmented_itanium_filter_record \
   -- --ignored --exact
-cargo test -p rars-format --test rar15_40_fixtures \
+cargo test -p rars --test rar15_40_fixtures \
   reference_unrar_accepts_rar29_segmented_rgb_filter_record \
   -- --ignored --exact
-cargo test -p rars-format --test rar15_40_fixtures \
+cargo test -p rars --test rar15_40_fixtures \
   reference_unrar_accepts_rar29_segmented_audio_filter_record \
   -- --ignored --exact
-cargo test -p rars-format --test rar15_40_fixtures \
+cargo test -p rars --test rar15_40_fixtures \
   reference_unrar300_accepts_rar29_segmented_filter_records \
   -- --ignored --exact
-cargo test -p rars-format --test rar15_40_fixtures \
+cargo test -p rars --test rar15_40_fixtures \
   reference_unrar_accepts_rar29_solid_e8_filter_record \
   -- --ignored --exact
 

@@ -2,8 +2,8 @@ use crate::cli::RepairArgs;
 use crate::password::read_archive_path_prompting;
 use crate::volumes::{infer_part_index, parse_rar3_rev_volume, path_has_extension};
 use crate::{resolve_password_args, CliError, CliResult};
+use rars::crc32::crc32;
 use rars::Error;
-use rars_crc32::crc32;
 use std::fs;
 use std::path::{Path, PathBuf};
 

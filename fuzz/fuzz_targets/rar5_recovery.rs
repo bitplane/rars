@@ -1,8 +1,8 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use rars_format::rar50::{repair_inline_recovery_bytes, Rev5Volume, Rev5VolumeMeta};
-use rars_recovery::rar5::{
+use rars::rar50::{repair_inline_recovery_bytes, Rev5Volume, Rev5VolumeMeta};
+use rars::recovery::rar5::{
     build_structural_inline_recovery_data, repair_inline_recovery_archive,
     repair_inline_recovery_prefix,
 };

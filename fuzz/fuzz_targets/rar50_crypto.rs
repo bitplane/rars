@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use rars_crypto::rar50::{Rar50Cipher, Rar50Keys};
+use rars::crypto::rar50::{Rar50Cipher, Rar50Keys};
 
 const MAX_DATA_SIZE: usize = 64 * 1024;
 

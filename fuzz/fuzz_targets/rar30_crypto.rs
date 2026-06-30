@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use rars_crypto::rar30::Rar30Cipher;
+use rars::crypto::rar30::Rar30Cipher;
 
 const MAX_PASSWORD_SIZE: usize = 96;
 const MAX_DATA_SIZE: usize = 64 * 1024;

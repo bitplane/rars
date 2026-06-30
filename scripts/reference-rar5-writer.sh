@@ -165,7 +165,7 @@ rar t -ppass "$tmpdir/encrypted-compressed-recovery-volume.part1.rar"
 rar t -ppass "$tmpdir/header-encrypted-recovery.rar"
 rar t -ppass "$tmpdir/header-encrypted-compressed-recovery.rar"
 
-cargo test -p rars-format --test rar50_fixtures \
+cargo test -p rars --test rar50_fixtures \
   reference_rar_accepts_rar50_acl_and_stream_file_service_records \
   -- --ignored --exact
 

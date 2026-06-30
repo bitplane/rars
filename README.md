@@ -15,10 +15,11 @@ compression and decompression. It's not fast, but it works. ish.
 
 ## Rust API
 
-Use the `rars` crate for Rust applications and libraries. The lower-level
-`rars-format`, `rars-codec`, `rars-crypto`, `rars-crc32`, and `rars-recovery`
-crates are deprecated as standalone dependencies; they remain implementation
-details for this release and are planned to be folded into `rars`.
+Use the `rars` crate for Rust applications and libraries. Since 0.4, the
+lower-level `rars-format`, `rars-codec`, `rars-crypto`, `rars-crc32`, and
+`rars-recovery` crates are folded into `rars`; those standalone crates ended at
+0.3.x. Applications should depend on `rars`, and command-line installs should
+use `rars-cli`.
 
 ## CLI
 
@@ -62,7 +63,7 @@ Run the fast test and benchmark paths:
 
 ```sh
 cargo +nightly test --workspace --features fast
-cargo +nightly bench -p rars-codec --bench chunk_sizes --features fast
+cargo +nightly bench -p rars --bench chunk_sizes --features fast
 ```
 
 ## Parallel Builds
@@ -85,8 +86,8 @@ cargo test --workspace --features parallel
 Measure parallel archive-member work with Criterion:
 
 ```sh
-cargo bench -p rars-format --bench parallel --features parallel
-cargo +nightly bench -p rars-format --bench parallel --features fast,parallel
+cargo bench -p rars --bench parallel --features parallel
+cargo +nightly bench -p rars --bench parallel --features fast,parallel
 ```
 
 The parallel benchmark reports `1_thread` and `all_threads_N` cases for RAR5

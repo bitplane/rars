@@ -654,74 +654,39 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rars"
-version = "0.3.2"
-dependencies = [
- "rars-format",
-]
-
-[[package]]
-name = "rars-cli"
-version = "0.3.2"
-dependencies = [
- "clap",
- "libc",
- "rars",
- "rars-crc32",
- "rayon",
- "rpassword",
- "zeroize",
-]
-
-[[package]]
-name = "rars-codec"
-version = "0.3.2"
-dependencies = [
- "criterion",
- "rars-crc32",
-]
-
-[[package]]
-name = "rars-crc32"
-version = "0.3.2"
-
-[[package]]
-name = "rars-crypto"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "aes",
+ "aho-corasick",
+ "criterion",
+ "getrandom",
  "hmac",
- "rars-crc32",
+ "rayon",
  "sha1",
  "sha2",
  "zeroize",
 ]
 
 [[package]]
-name = "rars-format"
-version = "0.3.2"
+name = "rars-cli"
+version = "0.4.0"
 dependencies = [
- "aho-corasick",
- "criterion",
- "getrandom",
- "rars-codec",
- "rars-crc32",
- "rars-crypto",
- "rars-recovery",
+ "clap",
+ "libc",
+ "rars",
  "rayon",
+ "rpassword",
+ "zeroize",
 ]
 
 [[package]]
 name = "rars-python"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "libc",
  "pyo3",
  "rars",
 ]
-
-[[package]]
-name = "rars-recovery"
-version = "0.3.2"
 
 [[package]]
 name = "rayon"

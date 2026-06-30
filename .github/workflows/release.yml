@@ -10,7 +10,7 @@ on:
       ref:
         description: "Tag or ref to publish"
         required: true
-        default: "v0.3.1"
+        default: "v0.4.0"
       publish:
         description: "Release path to run"
         required: true
@@ -232,7 +232,7 @@ jobs:
           retention-days: 7
 
   # ----------------------------------------------------------------------
-  # 4. Publish all crates to crates.io in dependency order. Requires the
+  # 4. Publish public crates to crates.io in dependency order. Requires the
   #    `release` environment so CARGO_REGISTRY_TOKEN is reachable. Configure
   #    that environment in GitHub repo settings and put the token there.
   # ----------------------------------------------------------------------
@@ -288,11 +288,6 @@ jobs:
             rm -f "$log"
           }
 
-          publish rars-crc32
-          publish rars-crypto
-          publish rars-codec
-          publish rars-recovery
-          publish rars-format
           publish rars
           publish rars-cli
 

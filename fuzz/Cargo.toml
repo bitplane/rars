@@ -12,10 +12,6 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 rars = { path = "../crates/rars" }
-rars-codec = { path = "../crates/rars-codec" }
-rars-crypto = { path = "../crates/rars-crypto" }
-rars-format = { path = "../crates/rars-format" }
-rars-recovery = { path = "../crates/rars-recovery" }
 
 [[bin]]
 name = "archive_parse"

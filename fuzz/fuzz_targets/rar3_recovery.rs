@@ -1,8 +1,8 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use rars_format::rar15_40::{repair_rev3_volumes_to, Archive};
-use rars_recovery::rar3::reconstruct_data_volumes;
+use rars::rar15_40::{repair_rev3_volumes_to, Archive};
+use rars::recovery::rar3::reconstruct_data_volumes;
 
 const MAX_ARCHIVE_SIZE: usize = 512 * 1024;
 const MAX_SHARD_SIZE: usize = 8 * 1024;
@@ -15,7 +15,7 @@ fuzz_target!(|data: &[u8]| {
         let _ = archive.protect_records().count();
         let _ = archive
             .new_subs()
-            .filter(|sub| sub.kind == rars_format::rar15_40::NewSubKind::RecoveryRecord)
+            .filter(|sub| sub.kind == rars::rar15_40::NewSubKind::RecoveryRecord)
             .count();
         let _ = archive.repair_protect_head();
     }

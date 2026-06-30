@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use rars_codec::rar29::Unpack29;
+use rars::codec::rar29::Unpack29;
 
 const MAX_OUTPUT_SIZE: usize = 64 * 1024;
 
