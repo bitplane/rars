@@ -2,6 +2,10 @@
 
 //! Version-specific RAR archive format support.
 //!
+//! Deprecated as a standalone public dependency: this crate remains an
+//! implementation detail for the current release. New Rust users should depend
+//! on the `rars` crate instead.
+//!
 //! This crate contains the wire-format parsers, writers, recovery handling, and
 //! extraction orchestration used by the high-level `rars` facade. It keeps the
 //! concrete RAR families separate so callers can inspect format-specific header

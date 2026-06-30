@@ -13,6 +13,13 @@ A Rust implementation of RAR.
 `rars` covers the RAR lineage from early `RE~^` archives through RAR 7,
 compression and decompression. It's not fast, but it works. ish.
 
+## Rust API
+
+Use the `rars` crate for Rust applications and libraries. The lower-level
+`rars-format`, `rars-codec`, `rars-crypto`, `rars-crc32`, and `rars-recovery`
+crates are deprecated as standalone dependencies; they remain implementation
+details for this release and are planned to be folded into `rars`.
+
 ## CLI
 
 Inspect, test, and extract archives:

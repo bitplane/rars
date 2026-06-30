@@ -654,14 +654,14 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rars"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "rars-format",
 ]
 
 [[package]]
 name = "rars-cli"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "clap",
  "libc",
@@ -674,7 +674,7 @@ dependencies = [
 
 [[package]]
 name = "rars-codec"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "criterion",
  "rars-crc32",
@@ -682,11 +682,11 @@ dependencies = [
 
 [[package]]
 name = "rars-crc32"
-version = "0.3.1"
+version = "0.3.2"
 
 [[package]]
 name = "rars-crypto"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "aes",
  "hmac",
@@ -698,7 +698,7 @@ dependencies = [
 
 [[package]]
 name = "rars-format"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "aho-corasick",
  "criterion",
@@ -712,7 +712,7 @@ dependencies = [
 
 [[package]]
 name = "rars-python"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "libc",
  "pyo3",
@@ -721,7 +721,7 @@ dependencies = [
 
 [[package]]
 name = "rars-recovery"
-version = "0.3.1"
+version = "0.3.2"
 
 [[package]]
 name = "rayon"

@@ -1,7 +1,7 @@
 [package]
 name = "rars-crc32"
-version = "0.3.1"
-description = "Shared CRC-32 primitives for the rars workspace."
+version = "0.3.2"
+description = "Deprecated standalone implementation crate for rars; depend on the rars crate instead."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

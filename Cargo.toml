@@ -31,12 +31,12 @@ hmac = "0.13"
 libc = "0.2"
 pyo3 = "0.28.3"
 rayon = "1.12.0"
-rars = { version = "0.3.1", path = "crates/rars" }
-rars-codec = { version = "0.3.1", path = "crates/rars-codec" }
-rars-crypto = { version = "0.3.1", path = "crates/rars-crypto" }
-rars-crc32 = { version = "0.3.1", path = "crates/rars-crc32" }
-rars-format = { version = "0.3.1", path = "crates/rars-format" }
-rars-recovery = { version = "0.3.1", path = "crates/rars-recovery" }
+rars = { version = "0.3.2", path = "crates/rars" }
+rars-codec = { version = "0.3.2", path = "crates/rars-codec" }
+rars-crypto = { version = "0.3.2", path = "crates/rars-crypto" }
+rars-crc32 = { version = "0.3.2", path = "crates/rars-crc32" }
+rars-format = { version = "0.3.2", path = "crates/rars-format" }
+rars-recovery = { version = "0.3.2", path = "crates/rars-recovery" }
 rpassword = "7"
 sha1 = "0.11"
 sha2 = "0.11"

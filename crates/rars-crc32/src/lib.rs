@@ -1,6 +1,10 @@
 #![cfg_attr(feature = "fast", feature(portable_simd))]
 
 //! Shared RAR CRC-32 primitives.
+//!
+//! Deprecated as a standalone public dependency: this crate remains an
+//! implementation detail for the current release. New Rust users should depend
+//! on the `rars` crate instead.
 
 mod fast;
 

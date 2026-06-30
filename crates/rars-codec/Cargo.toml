@@ -1,7 +1,7 @@
 [package]
 name = "rars-codec"
-version = "0.3.1"
-description = "RAR compression codecs, filters, PPMd, and RARVM components."
+version = "0.3.2"
+description = "Deprecated standalone implementation crate for rars; depend on the rars crate instead."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

@@ -1,9 +1,11 @@
 //! High-level RAR archive API.
 //!
-//! This crate is the public facade over the version-specific format modules. It
-//! detects archive families, exposes common member metadata, and streams
-//! extraction or recovery output to caller-provided writers without requiring
-//! callers to buffer whole archives in memory.
+//! This crate is the supported public Rust API for `rars`. It is the facade
+//! over the version-specific format modules, detects archive families, exposes
+//! common member metadata, and streams extraction or recovery output to
+//! caller-provided writers without requiring callers to buffer whole archives
+//! in memory. New Rust users should depend on this crate rather than the
+//! lower-level `rars-*` implementation crates.
 
 pub use rars_format::{
     detect_archive_family, find_archive_start, rar13, rar15_40, rar50, ArchiveFamily,

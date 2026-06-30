@@ -1,5 +1,11 @@
 #![cfg_attr(feature = "fast", feature(portable_simd))]
 
+//! Deprecated as a standalone public dependency: this crate remains an
+//! implementation detail for the current release. New Rust users should depend
+//! on the `rars` crate instead.
+//!
+//! RAR compression codecs, filters, PPMd, and RARVM components used by `rars`.
+
 mod fast;
 mod filters;
 mod huffman;
