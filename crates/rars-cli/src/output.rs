@@ -186,6 +186,21 @@ pub(crate) fn restore_output_metadata(outputs: &[ExtractedOutput]) -> std::io::R
     Ok(())
 }
 
+#[cfg(windows)]
+fn set_modified_time(path: &Path, time: SystemTime) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+    OpenOptions::new()
+        .access_mode(FILE_WRITE_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?
+        .set_modified(time)
+}
+
+#[cfg(not(windows))]
 fn set_modified_time(path: &Path, time: SystemTime) -> std::io::Result<()> {
     File::open(path)?.set_modified(time)
 }
@@ -312,4 +327,51 @@ fn set_no_follow(_options: &mut OpenOptions) {
     // checked_output_path validates archive path components before open. The
     // standard library does not expose a cross-platform final-component
     // no-follow flag for this target family.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{restore_output_metadata, ExtractedOutput};
+    use rars::{ArchiveFamily, ExtractedEntryMeta};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rars-output-{name}-{nonce}"));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn restore_output_metadata_updates_file_and_directory_times() {
+        let root = scratch("metadata-times");
+        let file = root.join("payload.exe");
+        let dir = root.join("nested");
+        fs::write(&file, b"payload").unwrap();
+        fs::create_dir(&dir).unwrap();
+
+        let outputs = [
+            ExtractedOutput {
+                name: b"payload.exe".to_vec(),
+                path: file,
+                meta: ExtractedEntryMeta::new(b"payload.exe".to_vec(), 1_704_067_200, 0x20, false),
+                family: ArchiveFamily::Rar50Plus,
+                restore_metadata: true,
+            },
+            ExtractedOutput {
+                name: b"nested".to_vec(),
+                path: dir,
+                meta: ExtractedEntryMeta::new(b"nested".to_vec(), 1_704_067_200, 0x10, true),
+                family: ArchiveFamily::Rar50Plus,
+                restore_metadata: true,
+            },
+        ];
+
+        restore_output_metadata(&outputs).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
 }
