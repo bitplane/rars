@@ -46,6 +46,10 @@ use volumes::{
 
 const DOS_DIRECTORY_ATTR: u8 = 0x10;
 const DOS_ARCHIVE_ATTR: u8 = 0x20;
+#[cfg(windows)]
+const RAR50_HOST_NATIVE: u64 = 0;
+#[cfg(not(windows))]
+const RAR50_HOST_NATIVE: u64 = 1;
 const RAR50_STRUCTURAL_RR_WARNING: &str =
     "warning: RAR 5 recovery writer emits validation-ready RR metadata; WinRAR recovery layout matching is not expected";
 
@@ -1235,7 +1239,7 @@ fn cmd_add(args: AddArgs) -> CliResult<()> {
                         data: &entry.data,
                         mtime: entry.unix_mtime,
                         attributes: rar50_file_attr(entry),
-                        host_os: 3,
+                        host_os: RAR50_HOST_NATIVE,
                     })
                 })
                 .collect::<std::result::Result<_, _>>()?;
@@ -1267,7 +1271,7 @@ fn cmd_add(args: AddArgs) -> CliResult<()> {
                             data: &entry.data,
                             mtime: entry.unix_mtime,
                             attributes: rar50_file_attr(entry),
-                            host_os: 3,
+                            host_os: RAR50_HOST_NATIVE,
                             password,
                         };
                         rars::rar50::Rar50VolumeWriter::new(options)
@@ -1283,7 +1287,7 @@ fn cmd_add(args: AddArgs) -> CliResult<()> {
                                 data: &entry.data,
                                 mtime: entry.unix_mtime,
                                 attributes: rar50_file_attr(entry),
-                                host_os: 3,
+                                host_os: RAR50_HOST_NATIVE,
                                 password,
                             })
                             .collect();
@@ -1310,7 +1314,7 @@ fn cmd_add(args: AddArgs) -> CliResult<()> {
                                 data: &entry.data,
                                 mtime: entry.unix_mtime,
                                 attributes: rar50_file_attr(entry),
-                                host_os: 3,
+                                host_os: RAR50_HOST_NATIVE,
                             })
                             .collect();
                         rars::rar50::Rar50VolumeWriter::new(options)
@@ -1346,7 +1350,7 @@ fn cmd_add(args: AddArgs) -> CliResult<()> {
                         data: &entry.data,
                         mtime: entry.unix_mtime,
                         attributes: rar50_file_attr(entry),
-                        host_os: 3,
+                        host_os: RAR50_HOST_NATIVE,
                         password,
                     })
                     .collect();
@@ -1397,7 +1401,7 @@ fn cmd_add(args: AddArgs) -> CliResult<()> {
                             data: &entry.data,
                             mtime: entry.unix_mtime,
                             attributes: rar50_file_attr(entry),
-                            host_os: 3,
+                            host_os: RAR50_HOST_NATIVE,
                             password,
                         })
                         .collect();
@@ -1462,7 +1466,7 @@ fn cmd_add(args: AddArgs) -> CliResult<()> {
                             data: &entry.data,
                             mtime: entry.unix_mtime,
                             attributes: rar50_file_attr(entry),
-                            host_os: 3,
+                            host_os: RAR50_HOST_NATIVE,
                         })
                         .collect();
                     if let Some(recovery_percent) = recovery_percent {

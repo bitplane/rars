@@ -968,6 +968,33 @@ fn add_accepts_equals_flags_and_double_dash_input() {
 }
 
 #[test]
+fn rar50_add_uses_rar5_host_os_values() {
+    let dir = scratch("rar50-host-os");
+    let source = dir.join("foo.txt");
+    let archive = dir.join("foo.rar");
+    fs::write(&source, b"rar50 host os compatibility\n").unwrap();
+
+    let create = rars()
+        .args(["a", "--format", "rar50", "--store"])
+        .arg(&archive)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(create.status.success(), "stderr: {}", stderr(&create));
+
+    let parsed = rars::rar50::Archive::parse_path(&archive).unwrap();
+    let file = parsed.files().next().unwrap();
+    assert_eq!(file.host_os, 1);
+
+    assert_archive_tests_and_extracts_file(
+        &archive,
+        None,
+        "foo.txt",
+        b"rar50 host os compatibility\n",
+    );
+}
+
+#[test]
 fn rejects_multivolume_with_multiple_inputs() {
     let dir = scratch("multivolume-multiple-inputs");
     let first = dir.join("first.txt");
