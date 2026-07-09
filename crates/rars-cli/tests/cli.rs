@@ -4189,7 +4189,7 @@ fn repairs_rar300_old_style_rev_missing_data_volume_set() {
         .output()
         .unwrap();
     assert!(test.status.success(), "stderr: {}", stderr(&test));
-    assert!(stdout(&test).contains("OK tmp\\\\rars-rar3-rev-gen\\\\payload.bin"));
+    assert!(stdout(&test).contains("OK tmp\\rars-rar3-rev-gen\\payload.bin"));
 }
 
 #[test]
@@ -4223,7 +4223,7 @@ fn repairs_rar4_new_style_rev_missing_data_volume_set() {
         .output()
         .unwrap();
     assert!(test.status.success(), "stderr: {}", stderr(&test));
-    assert!(stdout(&test).contains("OK tmp\\\\rars-rar4-rev-gen\\\\payload.bin"));
+    assert!(stdout(&test).contains("OK tmp\\rars-rar4-rev-gen\\payload.bin"));
 }
 
 #[test]

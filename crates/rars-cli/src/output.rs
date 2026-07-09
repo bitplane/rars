@@ -265,10 +265,18 @@ pub(crate) fn redirection_warning(name: impl AsRef<str>) -> String {
 }
 
 fn display_archive_text(text: impl AsRef<str>) -> String {
-    text.as_ref()
-        .chars()
-        .flat_map(char::escape_default)
-        .collect()
+    let mut out = String::new();
+    for ch in text.as_ref().chars() {
+        // Escape control characters (e.g. terminal escape sequences) so a
+        // hostile archive name can't manipulate the terminal, but pass
+        // printable Unicode such as Cyrillic or CJK through unchanged.
+        if ch.is_control() {
+            out.extend(ch.escape_default());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 fn display_archive_bytes(bytes: &[u8]) -> String {
@@ -331,7 +339,7 @@ fn set_no_follow(_options: &mut OpenOptions) {
 
 #[cfg(test)]
 mod tests {
-    use super::{restore_output_metadata, ExtractedOutput};
+    use super::{display_archive_text, restore_output_metadata, ExtractedOutput};
     use rars::{ArchiveFamily, ExtractedEntryMeta};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -344,6 +352,18 @@ mod tests {
         let path = std::env::temp_dir().join(format!("rars-output-{name}-{nonce}"));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn display_archive_text_keeps_unicode_and_escapes_controls() {
+        assert_eq!(
+            display_archive_text("ваапап/WinRAR.exe"),
+            "ваапап/WinRAR.exe"
+        );
+        assert_eq!(
+            display_archive_text("x\u{1b}]0;evil\u{7}"),
+            "x\\u{1b}]0;evil\\u{7}"
+        );
     }
 
     #[test]

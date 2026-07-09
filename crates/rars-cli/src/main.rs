@@ -161,10 +161,18 @@ fn find_rar50_buffered_decode_limit_error(error: &rars::Error) -> Option<(u64, u
 }
 
 fn display_text(text: impl AsRef<str>) -> String {
-    text.as_ref()
-        .chars()
-        .flat_map(char::escape_default)
-        .collect()
+    let mut out = String::new();
+    for ch in text.as_ref().chars() {
+        // Escape control characters (e.g. terminal escape sequences) so a
+        // hostile archive name can't manipulate the terminal, but pass
+        // printable Unicode such as Cyrillic or CJK through unchanged.
+        if ch.is_control() {
+            out.extend(ch.escape_default());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 fn display_bytes_lossy(bytes: &[u8]) -> String {
@@ -1884,12 +1892,22 @@ pub(crate) fn resolve_password_args(args: &PasswordArgs) -> CliResult<Option<Pas
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_size, rar50_buffered_decode_limit_hint};
+    use super::{display_text, parse_size, rar50_buffered_decode_limit_hint};
     use crate::output::{checked_output_path, output_relative_path, redirection_warning};
     use crate::password::{error_needs_password, should_prompt_password};
     use crate::volumes::{infer_part_index, rar50_volume_part_path, volume_part_path};
     use rars::Error;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn display_text_preserves_printable_unicode_but_escapes_control_chars() {
+        // Cyrillic and CJK filenames must render as themselves, not \u{...}.
+        assert_eq!(display_text("ваапап"), "ваапап");
+        assert_eq!(display_text("日本語.txt"), "日本語.txt");
+        // Control characters (terminal escape injection) are still escaped.
+        assert_eq!(display_text("a\u{1b}[31mb"), "a\\u{1b}[31mb");
+        assert_eq!(display_text("line\nfeed"), "line\\nfeed");
+    }
 
     #[test]
     fn infer_part_index_accepts_new_and_old_numbered_volume_names() {
