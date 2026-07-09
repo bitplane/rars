@@ -10,7 +10,7 @@ on:
       ref:
         description: "Tag or ref to publish"
         required: true
-        default: "v0.4.1"
+        default: "v0.4.2"
       publish:
         description: "Release path to run"
         required: true
