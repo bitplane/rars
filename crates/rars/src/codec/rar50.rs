@@ -808,10 +808,10 @@ fn encode_lz_block(
         }
     }
 
-    lengths.main = huffman::lengths_for_frequencies(&main_frequencies, 15);
-    lengths.distance = huffman::lengths_for_frequencies(&distance_frequencies, 15);
-    lengths.length = huffman::lengths_for_frequencies(&length_frequencies, 15);
-    lengths.align = huffman::lengths_for_frequencies(&align_frequencies, 15);
+    lengths.main = huffman::complete_lengths_for_frequencies(&main_frequencies, 15);
+    lengths.distance = huffman::complete_lengths_for_frequencies(&distance_frequencies, 15);
+    lengths.length = huffman::complete_lengths_for_frequencies(&length_frequencies, 15);
+    lengths.align = huffman::complete_lengths_for_frequencies(&align_frequencies, 15);
 
     let main_table = HuffmanTable::from_lengths(&lengths.main)?;
     let distance_table = HuffmanTable::from_lengths(&lengths.distance)?;
@@ -2537,18 +2537,15 @@ fn emit_zero_level_run(tokens: &mut Vec<LevelToken>, mut run: usize) {
 }
 
 fn level_code_lengths_for_tokens(tokens: &[LevelToken]) -> [u8; LEVEL_TABLE_SIZE] {
-    let mut used = [false; LEVEL_TABLE_SIZE];
-    for token in tokens {
-        used[token.symbol] = true;
-    }
-    let used_count = used.iter().filter(|&&used| used).count();
-    let len = huffman::bits_for_symbol_count(used_count);
+    // Mark used level symbols, then normalise to a *complete* canonical code.
+    // The pre-table is rebuilt by strict decoders (7-Zip's `k_BuildMode_Full`),
+    // which reject an under-full table, so a uniform length assignment is only
+    // valid when the used-symbol count is a power of two.
     let mut lengths = [0u8; LEVEL_TABLE_SIZE];
-    for (symbol, is_used) in used.into_iter().enumerate() {
-        if is_used {
-            lengths[symbol] = len;
-        }
+    for token in tokens {
+        lengths[token.symbol] = 1;
     }
+    huffman::assign_flat_complete_code(&mut lengths);
     lengths
 }
 
@@ -2927,6 +2924,49 @@ mod tests {
 
         assert_eq!(output, data);
         assert!(lengths.main[b'a' as usize] < lengths.main[b'z' as usize]);
+    }
+
+    fn code_is_complete(lengths: &[u8]) -> bool {
+        let max_len = lengths.iter().copied().max().unwrap_or(0);
+        if max_len == 0 {
+            return true;
+        }
+        let sum: u64 = lengths
+            .iter()
+            .filter(|&&len| len != 0)
+            .map(|&len| 1u64 << (max_len - len))
+            .sum();
+        sum == (1u64 << max_len)
+    }
+
+    #[test]
+    fn degenerate_inputs_emit_complete_huffman_tables() {
+        // Highly repetitive data collapses the distance/length/align tables to a
+        // single symbol. Those tables must still be transmitted as *complete*
+        // prefix codes, or strict RAR 5 decoders (7-Zip / WinRAR, which build
+        // with `Full_or_Empty`) reject the archive with a spurious data error.
+        // See issue #19.
+        let inputs: &[Vec<u8>] = &[
+            vec![b'a'; 4000],
+            b"ab".repeat(4000),
+            (0u8..16).cycle().take(50_000).collect(),
+            b"lorem ipsum dolor sit amet ".repeat(2000),
+        ];
+        for data in inputs {
+            let input = encode_lz_member_with_options(data, 0, EncodeOptions::new(0)).unwrap();
+            let block = parse_compressed_block(&input).unwrap();
+            let (lengths, _) = read_table_lengths(&input[block.payload], 0).unwrap();
+
+            assert!(code_is_complete(&lengths.main), "main table incomplete");
+            assert!(
+                code_is_complete(&lengths.distance),
+                "distance table incomplete"
+            );
+            assert!(code_is_complete(&lengths.length), "length table incomplete");
+            assert!(code_is_complete(&lengths.align), "align table incomplete");
+
+            assert_eq!(&decode_lz(&input, 0, data.len()).unwrap(), data);
+        }
     }
 
     #[test]
