@@ -13,7 +13,7 @@ categories.workspace = true
 
 [lib]
 name = "rars"
-crate-type = ["cdylib", "rlib"]
+crate-type = ["cdylib"]
 
 [lints]
 workspace = true
