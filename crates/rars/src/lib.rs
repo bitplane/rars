@@ -29,6 +29,7 @@ pub mod recovery;
 mod source;
 pub mod version;
 mod volume_extract;
+mod write_progress;
 mod x86_filter_scan;
 
 pub use detect::{detect_archive_family, find_archive_start, ArchiveSignature, SFX_SCAN_LIMIT};
@@ -37,6 +38,7 @@ pub use features::FeatureSet;
 use std::io::{Read, Write};
 use std::path::Path;
 pub use version::{ArchiveFamily, ArchiveVersion};
+pub use write_progress::{WriteOperation, WriteProgress, WriteProgressEvent};
 
 #[derive(Debug, Clone, Copy, Default)]
 #[non_exhaustive]

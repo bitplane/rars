@@ -937,7 +937,7 @@ mod tests {
         write_opcode(&mut bits, Opcode::Ret);
 
         let program = Program::parse(&with_xor(bits.finish())).unwrap();
-        assert_eq!(program.static_data, []);
+        assert!(program.static_data.is_empty());
         assert_eq!(program.instructions.len(), 4);
         assert_eq!(program.instructions[0].opcode, Opcode::Mov);
         assert!(!program.instructions[0].byte_mode);

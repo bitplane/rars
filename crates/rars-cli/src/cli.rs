@@ -19,8 +19,18 @@ pub(crate) struct Cli {
     /// Worker threads for parallel compression and extraction (default: all available cores)
     #[arg(long, value_name = "N", global = true, value_parser = crate::parse_thread_count)]
     pub threads: Option<usize>,
+    /// Progress reporting mode for long-running operations
+    #[arg(long, value_enum, default_value_t = ProgressMode::Auto, global = true)]
+    pub progress: ProgressMode,
     #[command(subcommand)]
     pub command: Command,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum ProgressMode {
+    Auto,
+    Always,
+    Never,
 }
 
 #[derive(Subcommand)]

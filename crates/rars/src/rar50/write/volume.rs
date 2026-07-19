@@ -626,9 +626,15 @@ fn write_volume_from_body_pass(
     let recovery_offset = if let Some(recovery_percent) = recovery_percent {
         let rr_pos = out.len();
         if let Some(header_keys) = header_keys {
-            write_header_encrypted_recovery_service(&mut out, recovery_percent, &header_keys.keys)?;
+            write_header_encrypted_recovery_service(
+                &mut out,
+                recovery_percent,
+                &header_keys.keys,
+                None,
+                1,
+            )?;
         } else {
-            write_recovery_service(&mut out, recovery_percent)?;
+            write_recovery_service(&mut out, recovery_percent, None, 1)?;
         }
         (rr_pos - RAR50_SIGNATURE.len()) as u64
     } else {

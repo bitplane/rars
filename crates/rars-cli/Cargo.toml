@@ -28,6 +28,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+indicatif.workspace = true
 libc.workspace = true
 rayon = { workspace = true, optional = true }
 rars.workspace = true

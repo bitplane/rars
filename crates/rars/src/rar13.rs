@@ -9,6 +9,7 @@ use crate::features::FeatureSet;
 use crate::io_util::{read_exact_at, read_u16, read_u32};
 pub(crate) use crate::source::ArchiveSource;
 use crate::version::{ArchiveFamily, ArchiveVersion};
+use crate::{WriteOperation, WriteProgress, WriteProgressEvent};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
@@ -1049,6 +1050,15 @@ pub fn write_compressed_archive_with_comment(
     options: WriterOptions,
     archive_comment: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
+    write_compressed_archive_with_comment_and_progress(entries, options, archive_comment, None)
+}
+
+pub fn write_compressed_archive_with_comment_and_progress(
+    entries: &[FileEntry<'_>],
+    options: WriterOptions,
+    archive_comment: Option<&[u8]>,
+    progress: Option<&dyn WriteProgress>,
+) -> Result<Vec<u8>> {
     if !options.target.is_rar13_family() {
         return Err(Error::UnsupportedVersion(options.target));
     }
@@ -1065,7 +1075,10 @@ pub fn write_compressed_archive_with_comment(
         .solid
         .then(|| Unpack15Encoder::with_options(encode_options));
 
-    for entry in entries {
+    let total_bytes = entries.iter().map(|entry| entry.data.len() as u64).sum();
+    report_compression_operation(progress, true, total_bytes, entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        report_compression_entry(progress, true, index, entries.len(), entry);
         validate_file_entry(entry.name, entry.data)?;
         let solid = solid_encoder.is_some();
         let mut packed = if let Some(encoder) = solid_encoder.as_mut() {
@@ -1113,7 +1126,10 @@ pub fn write_compressed_archive_with_comment(
                 extra: &file_extra,
             },
         )?;
+        report_compression_entry(progress, false, index, entries.len(), entry);
     }
+
+    report_compression_operation(progress, false, total_bytes, entries.len());
 
     Ok(out)
 }
@@ -1155,6 +1171,15 @@ pub fn write_compressed_volumes(
     options: WriterOptions,
     max_packed_per_volume: usize,
 ) -> Result<Vec<Vec<u8>>> {
+    write_compressed_volumes_with_progress(entry, options, max_packed_per_volume, None)
+}
+
+pub fn write_compressed_volumes_with_progress(
+    entry: FileEntry<'_>,
+    options: WriterOptions,
+    max_packed_per_volume: usize,
+    progress: Option<&dyn WriteProgress>,
+) -> Result<Vec<Vec<u8>>> {
     if !options.target.is_rar13_family() {
         return Err(Error::UnsupportedVersion(options.target));
     }
@@ -1169,6 +1194,8 @@ pub fn write_compressed_volumes(
     )?;
 
     validate_compression_level(options)?;
+    report_compression_operation(progress, true, entry.data.len() as u64, 1);
+    report_compression_entry(progress, true, 0, 1, &entry);
     let mut packed = encode_verified_rar15_payload(
         entry.data,
         rar15_encode_options_for_level(options.compression_level)?,
@@ -1180,7 +1207,7 @@ pub fn write_compressed_volumes(
     } else {
         METHOD_BEST
     };
-    write_split_volumes(SplitVolumeRecord {
+    let result = write_split_volumes(SplitVolumeRecord {
         name: entry.name,
         unpacked: entry.data,
         packed: &packed,
@@ -1190,7 +1217,61 @@ pub fn write_compressed_volumes(
         base_flags: 0,
         features: options.features,
         max_packed_per_volume,
-    })
+    });
+    report_compression_entry(progress, false, 0, 1, &entry);
+    report_compression_operation(progress, false, entry.data.len() as u64, 1);
+    result
+}
+
+fn report_compression_operation(
+    progress: Option<&dyn WriteProgress>,
+    started: bool,
+    total_bytes: u64,
+    total_entries: usize,
+) {
+    let Some(progress) = progress else { return };
+    if started {
+        progress.report(WriteProgressEvent::OperationStarted {
+            operation: WriteOperation::Compression,
+            total_bytes: Some(total_bytes),
+            total_entries: Some(total_entries),
+            pass: 1,
+        });
+    } else {
+        progress.report(WriteProgressEvent::OperationFinished {
+            operation: WriteOperation::Compression,
+            total_bytes: Some(total_bytes),
+            total_entries: Some(total_entries),
+            pass: 1,
+        });
+    }
+}
+
+fn report_compression_entry(
+    progress: Option<&dyn WriteProgress>,
+    started: bool,
+    index: usize,
+    total_entries: usize,
+    entry: &FileEntry<'_>,
+) {
+    let Some(progress) = progress else { return };
+    if started {
+        progress.report(WriteProgressEvent::EntryStarted {
+            operation: WriteOperation::Compression,
+            index,
+            total_entries,
+            name: entry.name,
+            input_bytes: entry.data.len() as u64,
+        });
+    } else {
+        progress.report(WriteProgressEvent::EntryFinished {
+            operation: WriteOperation::Compression,
+            index,
+            total_entries,
+            name: entry.name,
+            input_bytes: entry.data.len() as u64,
+        });
+    }
 }
 
 fn validate_stored_writer_features(version: ArchiveVersion, features: FeatureSet) -> Result<()> {
@@ -1587,8 +1668,63 @@ mod tests {
     use crate::codec::rar13::{find_long_lz, LongLz};
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct CollectWriter(Rc<RefCell<Vec<u8>>>);
+
+    #[test]
+    fn compressed_writer_reports_balanced_progress_events() {
+        let entries = [
+            FileEntry {
+                name: b"one.txt",
+                data: b"one one one one",
+                file_time: 0,
+                file_attr: 0x20,
+                password: None,
+                file_comment: None,
+            },
+            FileEntry {
+                name: b"two.txt",
+                data: b"two two two two",
+                file_time: 0,
+                file_attr: 0x20,
+                password: None,
+                file_comment: None,
+            },
+        ];
+        let operation_starts = AtomicUsize::new(0);
+        let operation_finishes = AtomicUsize::new(0);
+        let entry_starts = AtomicUsize::new(0);
+        let entry_finishes = AtomicUsize::new(0);
+        let reporter = |event: WriteProgressEvent<'_>| match event {
+            WriteProgressEvent::OperationStarted { .. } => {
+                operation_starts.fetch_add(1, Ordering::Relaxed);
+            }
+            WriteProgressEvent::OperationFinished { .. } => {
+                operation_finishes.fetch_add(1, Ordering::Relaxed);
+            }
+            WriteProgressEvent::EntryStarted { .. } => {
+                entry_starts.fetch_add(1, Ordering::Relaxed);
+            }
+            WriteProgressEvent::EntryFinished { .. } => {
+                entry_finishes.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        };
+
+        write_compressed_archive_with_comment_and_progress(
+            &entries,
+            WriterOptions::default(),
+            None,
+            Some(&reporter),
+        )
+        .unwrap();
+
+        assert_eq!(operation_starts.load(Ordering::Relaxed), 1);
+        assert_eq!(operation_finishes.load(Ordering::Relaxed), 1);
+        assert_eq!(entry_starts.load(Ordering::Relaxed), entries.len());
+        assert_eq!(entry_finishes.load(Ordering::Relaxed), entries.len());
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct CollectedEntry {

@@ -2,7 +2,9 @@ use super::*;
 pub use crate::codec::rar50::Rar50FilterKind as FilterKind;
 use crate::codec::rar50::{EncodeOptions, Unpack50Encoder};
 use crate::crypto::rar50::{Rar50Cipher, Rar50Keys};
-use crate::recovery::rar5::build_structural_inline_recovery_data;
+use crate::recovery::rar5::build_structural_inline_recovery_data_with_progress;
+use crate::write_progress::ProgressReporter;
+use crate::{WriteOperation, WriteProgress, WriteProgressEvent};
 
 mod filter_policy;
 mod volume;
@@ -157,6 +159,7 @@ pub struct Rar50Writer<'a> {
     filter_policy: FilterPolicy,
     recovery_percent: Option<u64>,
     recovery_password: Option<&'a [u8]>,
+    progress: Option<ProgressReporter<'a>>,
 }
 
 #[derive(Debug, Clone)]
@@ -166,6 +169,7 @@ pub struct Rar50VolumeWriter<'a> {
     entries: Option<Rar50VolumeEntries<'a>>,
     max_payload_per_volume: Option<usize>,
     recovery_percent: Option<u64>,
+    progress: Option<ProgressReporter<'a>>,
 }
 
 #[derive(Debug, Clone)]
@@ -210,6 +214,7 @@ impl<'a> Rar50VolumeWriter<'a> {
             entries: None,
             max_payload_per_volume: None,
             recovery_percent: None,
+            progress: None,
         }
     }
 
@@ -246,13 +251,42 @@ impl<'a> Rar50VolumeWriter<'a> {
         self
     }
 
+    pub fn progress(mut self, progress: &'a dyn WriteProgress) -> Self {
+        self.progress = Some(ProgressReporter(progress));
+        self
+    }
+
     pub fn finish(self) -> Result<Vec<Vec<u8>>> {
         let max_payload_per_volume = self.max_payload_per_volume.ok_or(Error::InvalidHeader(
             "RAR 5 volume payload size is required",
         ))?;
-        match self.entries.ok_or(Error::InvalidHeader(
+        let entries = self.entries.ok_or(Error::InvalidHeader(
             "RAR 5 volume writer needs an entry set",
-        ))? {
+        ))?;
+        let (compressed, total_bytes, total_entries) = match &entries {
+            Rar50VolumeEntries::Compressed(entries) => (
+                true,
+                entries.iter().map(|entry| entry.data.len() as u64).sum(),
+                entries.len(),
+            ),
+            Rar50VolumeEntries::EncryptedCompressed(entries) => (
+                true,
+                entries.iter().map(|entry| entry.data.len() as u64).sum(),
+                entries.len(),
+            ),
+            Rar50VolumeEntries::Stored(entry) => (false, entry.data.len() as u64, 1),
+            Rar50VolumeEntries::EncryptedStored(entry) => (false, entry.data.len() as u64, 1),
+        };
+        if compressed {
+            report_operation_started(
+                self.progress,
+                WriteOperation::Compression,
+                total_bytes,
+                total_entries,
+                1,
+            );
+        }
+        let result = match entries {
             Rar50VolumeEntries::Stored(entry) => write_stored_volumes_impl(
                 entry,
                 self.options,
@@ -279,7 +313,17 @@ impl<'a> Rar50VolumeWriter<'a> {
                     self.recovery_percent,
                 )
             }
+        };
+        if compressed {
+            report_operation_finished(
+                self.progress,
+                WriteOperation::Compression,
+                total_bytes,
+                total_entries,
+                1,
+            );
         }
+        result
     }
 }
 
@@ -293,6 +337,7 @@ impl<'a> Rar50Writer<'a> {
             filter_policy: FilterPolicy::None,
             recovery_percent: None,
             recovery_password: None,
+            progress: None,
         }
     }
 
@@ -387,8 +432,42 @@ impl<'a> Rar50Writer<'a> {
         self
     }
 
+    pub fn progress(mut self, progress: &'a dyn WriteProgress) -> Self {
+        self.progress = Some(ProgressReporter(progress));
+        self
+    }
+
     pub fn finish(self) -> Result<Vec<u8>> {
-        emit_resolved_writer_plan(self.resolve()?)
+        let progress = self.progress;
+        let compressed = self.members.first().is_some_and(|member| {
+            matches!(
+                member.kind(),
+                Rar50WriteMemberKind::Compressed | Rar50WriteMemberKind::EncryptedCompressed
+            )
+        });
+        let total_bytes = self.members.iter().map(Rar50WriteMember::input_size).sum();
+        let total_entries = self.members.len();
+        if compressed {
+            report_operation_started(
+                progress,
+                WriteOperation::Compression,
+                total_bytes,
+                total_entries,
+                1,
+            );
+        }
+        let resolved = self.resolve();
+        if compressed {
+            report_operation_finished(
+                progress,
+                WriteOperation::Compression,
+                total_bytes,
+                total_entries,
+                1,
+            );
+        }
+        let plan = resolved?;
+        emit_resolved_writer_plan_with_progress(plan, progress)
     }
 
     fn resolve(self) -> Result<ResolvedRar50WritePlan<'a>> {
@@ -796,6 +875,17 @@ impl<'a> Rar50WriteMember<'a> {
         }
     }
 
+    fn input_size(&self) -> u64 {
+        match self {
+            Self::Stored(entry) => entry.data.len() as u64,
+            Self::StoredWithServices(entry) => entry.entry.data.len() as u64,
+            Self::Compressed(entry) => entry.data.len() as u64,
+            Self::EncryptedStored(entry) => entry.data.len() as u64,
+            Self::EncryptedStoredWithServices(entry) => entry.entry.data.len() as u64,
+            Self::EncryptedCompressed(entry) => entry.data.len() as u64,
+        }
+    }
+
     fn into_stored(self, target: crate::ArchiveVersion) -> Result<StoredEntry<'a>> {
         match self {
             Self::Stored(entry) => Ok(entry),
@@ -879,6 +969,40 @@ fn mixed_member_plan_error(target: crate::ArchiveVersion) -> Error {
     Error::UnsupportedFeature {
         version: target,
         feature: "RAR 5 mixed stored/compressed writer plan",
+    }
+}
+
+fn report_operation_started(
+    progress: Option<ProgressReporter<'_>>,
+    operation: WriteOperation,
+    total_bytes: u64,
+    total_entries: usize,
+    pass: usize,
+) {
+    if let Some(progress) = progress {
+        progress.report(WriteProgressEvent::OperationStarted {
+            operation,
+            total_bytes: Some(total_bytes),
+            total_entries: Some(total_entries),
+            pass,
+        });
+    }
+}
+
+fn report_operation_finished(
+    progress: Option<ProgressReporter<'_>>,
+    operation: WriteOperation,
+    total_bytes: u64,
+    total_entries: usize,
+    pass: usize,
+) {
+    if let Some(progress) = progress {
+        progress.report(WriteProgressEvent::OperationFinished {
+            operation,
+            total_bytes: Some(total_bytes),
+            total_entries: Some(total_entries),
+            pass,
+        });
     }
 }
 
@@ -1110,11 +1234,14 @@ enum ResolvedRar50WriteMember<'a> {
     },
 }
 
-fn emit_resolved_writer_plan(plan: ResolvedRar50WritePlan<'_>) -> Result<Vec<u8>> {
+fn emit_resolved_writer_plan_with_progress(
+    plan: ResolvedRar50WritePlan<'_>,
+    progress: Option<ProgressReporter<'_>>,
+) -> Result<Vec<u8>> {
     if plan.quick_open {
         return resolve_writer_plan_offset(
-            |quick_open_offset| {
-                emit_resolved_writer_plan_pass(&plan, Some(quick_open_offset), None)
+            |quick_open_offset, _| {
+                emit_resolved_writer_plan_pass(&plan, Some(quick_open_offset), None, progress, 1)
                     .map(|(out, next_quick_open_offset, _)| (out, next_quick_open_offset))
             },
             "RAR 5 quick-open pass did not report an offset",
@@ -1123,15 +1250,15 @@ fn emit_resolved_writer_plan(plan: ResolvedRar50WritePlan<'_>) -> Result<Vec<u8>
     }
     if plan.recovery_percent.is_some() {
         return resolve_writer_plan_offset(
-            |recovery_offset| {
-                emit_resolved_writer_plan_pass(&plan, None, Some(recovery_offset))
+            |recovery_offset, pass| {
+                emit_resolved_writer_plan_pass(&plan, None, Some(recovery_offset), progress, pass)
                     .map(|(out, _, next_recovery_offset)| (out, next_recovery_offset))
             },
             "RAR 5 recovery pass did not report an offset",
             "RAR 5 recovery offset did not converge",
         );
     }
-    emit_resolved_writer_plan_pass(&plan, None, None).map(|(out, _, _)| out)
+    emit_resolved_writer_plan_pass(&plan, None, None, progress, 1).map(|(out, _, _)| out)
 }
 
 fn resolve_writer_plan_offset<F>(
@@ -1140,11 +1267,11 @@ fn resolve_writer_plan_offset<F>(
     convergence_error: &'static str,
 ) -> Result<Vec<u8>>
 where
-    F: FnMut(u64) -> Result<(Vec<u8>, Option<u64>)>,
+    F: FnMut(u64, usize) -> Result<(Vec<u8>, Option<u64>)>,
 {
     let mut offset = 0;
-    for _ in 0..4 {
-        let (out, next_offset) = pass(offset)?;
+    for pass_index in 1..=4 {
+        let (out, next_offset) = pass(offset, pass_index)?;
         if next_offset == Some(offset) {
             return Ok(out);
         }
@@ -1157,6 +1284,8 @@ fn emit_resolved_writer_plan_pass(
     plan: &ResolvedRar50WritePlan<'_>,
     quick_open_offset: Option<u64>,
     recovery_offset: Option<u64>,
+    progress: Option<ProgressReporter<'_>>,
+    recovery_pass: usize,
 ) -> Result<(Vec<u8>, Option<u64>, Option<u64>)> {
     let mut out = Vec::new();
     let mut cached_headers = Vec::new();
@@ -1314,9 +1443,15 @@ fn emit_resolved_writer_plan_pass(
     let next_recovery_offset = if let Some(recovery_percent) = plan.recovery_percent {
         let rr_pos = out.len();
         if let Some(header_keys) = &plan.header_keys {
-            write_header_encrypted_recovery_service(&mut out, recovery_percent, &header_keys.keys)?;
+            write_header_encrypted_recovery_service(
+                &mut out,
+                recovery_percent,
+                &header_keys.keys,
+                progress,
+                recovery_pass,
+            )?;
         } else {
-            write_recovery_service(&mut out, recovery_percent)?;
+            write_recovery_service(&mut out, recovery_percent, progress, recovery_pass)?;
         }
         Some((rr_pos - RAR50_SIGNATURE.len()) as u64)
     } else {
@@ -2134,13 +2269,19 @@ fn write_stored_service(out: &mut Vec<u8>, name: &[u8], data: &[u8]) -> Result<(
     )
 }
 
-fn write_recovery_service(out: &mut Vec<u8>, recovery_percent: u64) -> Result<()> {
+fn write_recovery_service(
+    out: &mut Vec<u8>,
+    recovery_percent: u64,
+    progress: Option<ProgressReporter<'_>>,
+    pass: usize,
+) -> Result<()> {
     let mut service_data = Vec::new();
     write_vint(&mut service_data, recovery_percent);
     let mut extra = Vec::new();
     write_extra_record(&mut extra, FHEXTRA_SUBDATA, &service_data);
 
-    let data = build_structural_inline_recovery_data(out, recovery_percent)?;
+    let data =
+        build_structural_inline_recovery_data_with_progress(out, recovery_percent, progress, pass)?;
     let specific = stored_file_specific(b"RR", data.len() as u64, Some(crc32(&data)), 0, None, 0)?;
     write_block(
         out,
@@ -2197,10 +2338,13 @@ fn write_header_encrypted_recovery_service(
     out: &mut Vec<u8>,
     recovery_percent: u64,
     header_keys: &Rar50Keys,
+    progress: Option<ProgressReporter<'_>>,
+    pass: usize,
 ) -> Result<()> {
     let mut service_data = Vec::new();
     write_vint(&mut service_data, recovery_percent);
-    let data = build_structural_inline_recovery_data(out, recovery_percent)?;
+    let data =
+        build_structural_inline_recovery_data_with_progress(out, recovery_percent, progress, pass)?;
     let mut extra = Vec::new();
     write_extra_record(&mut extra, FHEXTRA_SUBDATA, &service_data);
     let specific = stored_file_specific(b"RR", data.len() as u64, Some(crc32(&data)), 0, None, 0)?;
@@ -2592,13 +2736,71 @@ mod tests {
     use crate::codec::rar50::{encode_literal_only, encode_lz_member};
     use crate::codec::rar50::{encode_lz_member_with_options, EncodeOptions, Rar50FilterSpec};
     use crate::x86_filter_scan::auto_x86_filter_ranges;
+    use crate::{ArchiveVersion, FeatureSet};
     use std::cell::RefCell;
     use std::fs;
     use std::io::{Result as IoResult, Write};
     use std::process::Command;
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct CollectWriter(Rc<RefCell<Vec<u8>>>);
+
+    #[test]
+    fn recovery_writer_reports_determinate_pass_progress() {
+        let entry = StoredEntry {
+            name: b"payload.bin",
+            data: b"recovery progress payload",
+            mtime: None,
+            attributes: 0x20,
+            host_os: 1,
+        };
+        let starts = AtomicUsize::new(0);
+        let advances = AtomicUsize::new(0);
+        let finishes = AtomicUsize::new(0);
+        let reporter = |event: WriteProgressEvent<'_>| match event {
+            WriteProgressEvent::OperationStarted {
+                operation: WriteOperation::Recovery,
+                total_bytes: Some(total),
+                ..
+            } => {
+                assert!(total > 0);
+                starts.fetch_add(1, Ordering::Relaxed);
+            }
+            WriteProgressEvent::Advanced {
+                operation: WriteOperation::Recovery,
+                completed_bytes,
+                total_bytes,
+                ..
+            } => {
+                assert!(completed_bytes <= total_bytes);
+                advances.fetch_add(1, Ordering::Relaxed);
+            }
+            WriteProgressEvent::OperationFinished {
+                operation: WriteOperation::Recovery,
+                ..
+            } => {
+                finishes.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        };
+        let mut features = FeatureSet::store_only();
+        features.recovery_record = true;
+
+        Rar50Writer::new(WriterOptions::new(ArchiveVersion::Rar50, features))
+            .stored_entries(&[entry])
+            .recovery_percent(Some(10))
+            .progress(&reporter)
+            .finish()
+            .unwrap();
+
+        assert!(starts.load(Ordering::Relaxed) >= 1);
+        assert!(advances.load(Ordering::Relaxed) >= 1);
+        assert_eq!(
+            starts.load(Ordering::Relaxed),
+            finishes.load(Ordering::Relaxed)
+        );
+    }
 
     impl Write for CollectWriter {
         fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
@@ -2646,7 +2848,7 @@ mod tests {
     fn writer_plan_offset_resolution_errors_if_offset_never_converges() {
         let mut offsets = Vec::new();
         let result = resolve_writer_plan_offset(
-            |offset| {
+            |offset, _| {
                 offsets.push(offset);
                 Ok((Vec::new(), Some(offset + 1)))
             },
@@ -2664,7 +2866,7 @@ mod tests {
     #[test]
     fn writer_plan_offset_resolution_rejects_missing_reported_offset() {
         let result = resolve_writer_plan_offset(
-            |_| Ok((Vec::new(), None)),
+            |_, _| Ok((Vec::new(), None)),
             "missing offset",
             "did not converge",
         );

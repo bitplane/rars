@@ -12,6 +12,7 @@ use crate::codec::rar29::{
 pub use crate::codec::rar29::{Rar29FilterKind as FilterKind, Rar29FilterSpec as FilterSpec};
 use crate::io_util::align16 as checked_align16;
 use crate::x86_filter_scan::auto_x86_filter_ranges;
+use crate::{WriteOperation, WriteProgress, WriteProgressEvent};
 
 const AUTO_RGB_WIDTHS: [usize; 4] = [24, 48, 96, 192];
 const AUTO_DELTA_EDGE_SKIP: usize = 64;
@@ -65,6 +66,27 @@ pub fn write_compressed_archive(
 }
 
 pub fn write_compressed_archive_with_comment(
+    entries: &[FileEntry<'_>],
+    options: WriterOptions,
+    archive_comment: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    write_compressed_archive_with_comment_and_progress(entries, options, archive_comment, None)
+}
+
+pub fn write_compressed_archive_with_comment_and_progress(
+    entries: &[FileEntry<'_>],
+    options: WriterOptions,
+    archive_comment: Option<&[u8]>,
+    progress: Option<&dyn WriteProgress>,
+) -> Result<Vec<u8>> {
+    let total_bytes = entries.iter().map(|entry| entry.data.len() as u64).sum();
+    report_compression_operation(progress, true, total_bytes, entries.len());
+    let result = write_compressed_archive_with_comment_impl(entries, options, archive_comment);
+    report_compression_operation(progress, false, total_bytes, entries.len());
+    result
+}
+
+fn write_compressed_archive_with_comment_impl(
     entries: &[FileEntry<'_>],
     options: WriterOptions,
     archive_comment: Option<&[u8]>,
@@ -132,12 +154,25 @@ pub fn write_rar29_compressed_archive_with_filter_policy(
     options: WriterOptions,
     policy: FilterPolicy,
 ) -> Result<Vec<u8>> {
+    write_rar29_compressed_archive_with_filter_policy_and_progress(entries, options, policy, None)
+}
+
+pub fn write_rar29_compressed_archive_with_filter_policy_and_progress(
+    entries: &[FileEntry<'_>],
+    options: WriterOptions,
+    policy: FilterPolicy,
+    progress: Option<&dyn WriteProgress>,
+) -> Result<Vec<u8>> {
+    let total_bytes = entries.iter().map(|entry| entry.data.len() as u64).sum();
+    report_compression_operation(progress, true, total_bytes, entries.len());
     validate_rar29_filter_policy(&policy)?;
     let encode_options = rar29_encode_options_for_options(options)?;
     let lz_method = compression_method_for_level(options)?;
-    write_rar29_filtered_archive(entries, options, |entry| {
+    let result = write_rar29_filtered_archive(entries, options, |entry| {
         encode_rar29_policy_filtered_payload(entry.data, &policy, encode_options, lz_method)
-    })
+    });
+    report_compression_operation(progress, false, total_bytes, entries.len());
+    result
 }
 
 fn encode_rar29_policy_filtered_payload(
@@ -700,6 +735,26 @@ pub fn write_compressed_volumes(
     options: WriterOptions,
     max_packed_per_volume: usize,
 ) -> Result<Vec<Vec<u8>>> {
+    write_compressed_volumes_with_progress(entry, options, max_packed_per_volume, None)
+}
+
+pub fn write_compressed_volumes_with_progress(
+    entry: FileEntry<'_>,
+    options: WriterOptions,
+    max_packed_per_volume: usize,
+    progress: Option<&dyn WriteProgress>,
+) -> Result<Vec<Vec<u8>>> {
+    report_compression_operation(progress, true, entry.data.len() as u64, 1);
+    let result = write_compressed_volumes_impl(entry, options, max_packed_per_volume);
+    report_compression_operation(progress, false, entry.data.len() as u64, 1);
+    result
+}
+
+fn write_compressed_volumes_impl(
+    entry: FileEntry<'_>,
+    options: WriterOptions,
+    max_packed_per_volume: usize,
+) -> Result<Vec<Vec<u8>>> {
     validate_compressed_writer_options(options, false, false)?;
     validate_volume_writer_inputs(
         entry.name,
@@ -744,6 +799,30 @@ pub fn write_compressed_volumes(
         password: entry.password,
         max_packed_per_volume,
     })
+}
+
+fn report_compression_operation(
+    progress: Option<&dyn WriteProgress>,
+    started: bool,
+    total_bytes: u64,
+    total_entries: usize,
+) {
+    let Some(progress) = progress else { return };
+    if started {
+        progress.report(WriteProgressEvent::OperationStarted {
+            operation: WriteOperation::Compression,
+            total_bytes: Some(total_bytes),
+            total_entries: Some(total_entries),
+            pass: 1,
+        });
+    } else {
+        progress.report(WriteProgressEvent::OperationFinished {
+            operation: WriteOperation::Compression,
+            total_bytes: Some(total_bytes),
+            total_entries: Some(total_entries),
+            pass: 1,
+        });
+    }
 }
 
 fn validate_stored_writer_options(

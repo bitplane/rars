@@ -968,6 +968,53 @@ fn add_accepts_equals_flags_and_double_dash_input() {
 }
 
 #[test]
+fn add_progress_modes_are_plain_when_stderr_is_captured() {
+    let dir = scratch("add-progress-modes");
+    let source = dir.join("payload.txt");
+    fs::write(&source, b"progress reporting payload payload payload\n").unwrap();
+
+    let auto_archive = dir.join("auto.rar");
+    let auto = rars()
+        .args(["--progress", "auto", "add"])
+        .arg(&auto_archive)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(auto.status.success(), "stderr: {}", stderr(&auto));
+    let auto_stderr = stderr(&auto);
+    assert!(auto_stderr.contains("progress: Scanning inputs"));
+    assert!(auto_stderr.contains("progress: Preparing compression"));
+    assert!(auto_stderr.contains("progress: Compressing archive"));
+    assert!(auto_stderr.contains("progress: Writing archive"));
+    assert!(!auto_stderr.contains('\x1b'));
+    assert!(!auto_stderr.contains('\r'));
+    assert!(!auto_stderr.contains('\x08'));
+
+    let quiet_archive = dir.join("quiet.rar");
+    let quiet = rars()
+        .args(["--progress", "never", "add"])
+        .arg(&quiet_archive)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(quiet.status.success(), "stderr: {}", stderr(&quiet));
+    assert!(!stderr(&quiet).contains("progress:"));
+
+    let always_archive = dir.join("always.rar");
+    let always = rars()
+        .args(["--progress", "always", "add"])
+        .arg(&always_archive)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(always.status.success(), "stderr: {}", stderr(&always));
+    let always_stderr = stderr(&always);
+    assert!(always_stderr.contains("progress: Scanning inputs"));
+    assert!(!always_stderr.contains('\x1b'));
+    assert!(!always_stderr.contains('\r'));
+}
+
+#[test]
 fn rar50_add_uses_rar5_host_os_values() {
     let dir = scratch("rar50-host-os");
     let source = dir.join("foo.txt");

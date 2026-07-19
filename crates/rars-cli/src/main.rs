@@ -5,13 +5,14 @@ mod error;
 mod input;
 mod output;
 mod password;
+mod progress;
 mod repair;
 mod time;
 mod volumes;
 
 use cli::{AddArgs, Command, ExtractArgs, InfoArgs, PasswordArgs, TestArgs};
 use error::{CliError, CliResult};
-use input::{rar15_file_attr, rar50_file_attr, read_inputs};
+use input::{rar15_file_attr, rar50_file_attr, read_inputs_with_progress};
 use output::{
     create_rar50_redirection as create_rar50_redirection_output, open_output_writer,
     output_path_for_entry, output_path_for_rar50_entry, output_relative_path, print_ok_entry,
@@ -22,6 +23,7 @@ use password::{
     error_is_password_class, parse_archives_prompting, password_bytes, read_archive_path_prompting,
     resolve_password, Password,
 };
+use progress::CliProgress;
 use rars::rar13::{
     self, FileEntry, StoredEntry as Rar13StoredEntry, WriterOptions as Rar13WriterOptions,
 };
@@ -79,7 +81,7 @@ fn run() -> CliResult<()> {
         Command::Test(args) => cmd_test(args),
         Command::Extract(args) => cmd_extract(args),
         Command::Repair(args) => cmd_repair(args),
-        Command::Add(args) => cmd_add(args),
+        Command::Add(args) => cmd_add(args, CliProgress::new(cli.progress)),
     }
 }
 
@@ -1043,7 +1045,7 @@ fn build_add_command(args: AddArgs) -> CliResult<AddCommand> {
     })
 }
 
-fn cmd_add(args: AddArgs) -> CliResult<()> {
+fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
     let AddCommand {
         password,
         target,
@@ -1110,7 +1112,27 @@ fn cmd_add(args: AddArgs) -> CliResult<()> {
     {
         return Err("multivolume writer currently supports one input file".into());
     }
-    let owned = read_inputs(input_paths, password_bytes(&password))?;
+    progress.spinner("Scanning inputs");
+    let owned = read_inputs_with_progress(
+        input_paths,
+        password_bytes(&password),
+        |files, bytes| progress.bar(format!("Reading {files} files"), bytes),
+        |bytes, name| {
+            progress.set_message(format!("Reading {}", display_bytes_lossy(name)));
+            progress.advance(bytes);
+        },
+    )?;
+    let input_bytes: u64 = owned.iter().map(|entry| entry.data.len() as u64).sum();
+    progress.finish(format!(
+        "Read {} files ({})",
+        owned.len(),
+        indicatif::HumanBytes(input_bytes)
+    ));
+    if compress {
+        progress.spinner("Preparing compression");
+    } else {
+        progress.spinner("Preparing archive");
+    }
     if matches!(
         target,
         ArchiveVersion::Rar14
@@ -1283,6 +1305,7 @@ fn cmd_add(args: AddArgs) -> CliResult<()> {
                             password,
                         };
                         rars::rar50::Rar50VolumeWriter::new(options)
+                            .progress(&progress)
                             .encrypted_stored_entry(entry)
                             .max_payload_per_volume(volume_size)
                             .recovery_percent(recovery_percent)
@@ -1300,6 +1323,7 @@ fn cmd_add(args: AddArgs) -> CliResult<()> {
                             })
                             .collect();
                         rars::rar50::Rar50VolumeWriter::new(options)
+                            .progress(&progress)
                             .encrypted_compressed_entries(&compressed_entries)
                             .max_payload_per_volume(volume_size)
                             .recovery_percent(recovery_percent)
@@ -1310,6 +1334,7 @@ fn cmd_add(args: AddArgs) -> CliResult<()> {
                     let entry = entries.first().expect("one input checked above");
                     if store {
                         rars::rar50::Rar50VolumeWriter::new(options)
+                            .progress(&progress)
                             .stored_entry(*entry)
                             .max_payload_per_volume(volume_size)
                             .recovery_percent(recovery_percent)
@@ -1326,13 +1351,14 @@ fn cmd_add(args: AddArgs) -> CliResult<()> {
                             })
                             .collect();
                         rars::rar50::Rar50VolumeWriter::new(options)
+                            .progress(&progress)
                             .compressed_entries(&compressed_entries)
                             .max_payload_per_volume(volume_size)
                             .recovery_percent(recovery_percent)
                             .finish()?
                     }
                 };
-                write_rar50_volume_parts(&archive_path, &parts).map_err(|err| {
+                write_rar50_volume_parts(&archive_path, &parts, &progress).map_err(|err| {
                     format!(
                         "failed to write RAR 5 volume set starting at '{}': {err}",
                         archive_path.display()
@@ -1367,6 +1393,7 @@ fn cmd_add(args: AddArgs) -> CliResult<()> {
                     .map(|data| rars::rar50::EncryptedArchiveCommentEntry { data, password });
                 if let Some(recovery_percent) = recovery_percent.filter(|_| store) {
                     rars::rar50::Rar50Writer::new(options)
+                        .progress(&progress)
                         .encrypted_stored_entries(&entries)
                         .recovery_percent(Some(recovery_percent))
                         .recovery_password(Some(password))
@@ -1393,10 +1420,12 @@ fn cmd_add(args: AddArgs) -> CliResult<()> {
                         )
                         .collect();
                     rars::rar50::Rar50Writer::new(options)
+                        .progress(&progress)
                         .encrypted_stored_entries_with_services(&entries_with_services)
                         .finish()?
                 } else if store {
                     rars::rar50::Rar50Writer::new(options)
+                        .progress(&progress)
                         .encrypted_stored_entries(&entries)
                         .encrypted_archive_comment(archive_comment)
                         .archive_metadata(archive_metadata)
@@ -1415,11 +1444,13 @@ fn cmd_add(args: AddArgs) -> CliResult<()> {
                         .collect();
                     if let Some(recovery_percent) = recovery_percent {
                         rars::rar50::Rar50Writer::new(options)
+                            .progress(&progress)
                             .encrypted_compressed_entries(&compressed_entries)
                             .recovery_percent(Some(recovery_percent))
                             .finish()?
                     } else {
                         rars::rar50::Rar50Writer::new(options)
+                            .progress(&progress)
                             .encrypted_compressed_entries(&compressed_entries)
                             .encrypted_archive_comment(archive_comment)
                             .archive_metadata(archive_metadata)
@@ -1436,6 +1467,7 @@ fn cmd_add(args: AddArgs) -> CliResult<()> {
                         });
                 if let Some(recovery_percent) = recovery_percent.filter(|_| store) {
                     rars::rar50::Rar50Writer::new(options)
+                        .progress(&progress)
                         .stored_entries(&entries)
                         .recovery_percent(Some(recovery_percent))
                         .finish()?
@@ -1458,10 +1490,12 @@ fn cmd_add(args: AddArgs) -> CliResult<()> {
                         })
                         .collect();
                     rars::rar50::Rar50Writer::new(options)
+                        .progress(&progress)
                         .stored_entries_with_services(&entries_with_services)
                         .finish()?
                 } else if store {
                     rars::rar50::Rar50Writer::new(options)
+                        .progress(&progress)
                         .stored_entries(&entries)
                         .archive_comment(archive_comment.as_deref())
                         .archive_metadata(archive_metadata)
@@ -1479,11 +1513,13 @@ fn cmd_add(args: AddArgs) -> CliResult<()> {
                         .collect();
                     if let Some(recovery_percent) = recovery_percent {
                         rars::rar50::Rar50Writer::new(options)
+                            .progress(&progress)
                             .compressed_entries(&compressed_entries)
                             .recovery_percent(Some(recovery_percent))
                             .finish()?
                     } else if let Some(channels) = delta_filter {
                         rars::rar50::Rar50Writer::new(options)
+                            .progress(&progress)
                             .compressed_entries(&compressed_entries)
                             .filter_policy(rars::rar50::FilterPolicy::Explicit(
                                 rars::rar50::FilterKind::Delta { channels },
@@ -1496,11 +1532,13 @@ fn cmd_add(args: AddArgs) -> CliResult<()> {
                             rars::rar50::FilterKind::E8
                         };
                         rars::rar50::Rar50Writer::new(options)
+                            .progress(&progress)
                             .compressed_entries(&compressed_entries)
                             .filter_policy(rars::rar50::FilterPolicy::Explicit(filter))
                             .finish()?
                     } else if arm_filter {
                         rars::rar50::Rar50Writer::new(options)
+                            .progress(&progress)
                             .compressed_entries(&compressed_entries)
                             .filter_policy(rars::rar50::FilterPolicy::Explicit(
                                 rars::rar50::FilterKind::Arm,
@@ -1512,11 +1550,13 @@ fn cmd_add(args: AddArgs) -> CliResult<()> {
                             && !options.features.solid)
                     {
                         rars::rar50::Rar50Writer::new(options)
+                            .progress(&progress)
                             .compressed_entries(&compressed_entries)
                             .filter_policy(rars::rar50::FilterPolicy::AutoSize)
                             .finish()?
                     } else {
                         rars::rar50::Rar50Writer::new(options)
+                            .progress(&progress)
                             .compressed_entries(&compressed_entries)
                             .archive_comment(archive_comment.as_deref())
                             .archive_metadata(archive_metadata)
@@ -1524,7 +1564,7 @@ fn cmd_add(args: AddArgs) -> CliResult<()> {
                     }
                 }
             };
-            write_archive_output(&archive_path, &bytes)?;
+            write_archive_output(&archive_path, &bytes, &progress)?;
             if recovery_percent.is_some() {
                 eprintln!("{RAR50_STRUCTURAL_RR_WARNING}");
             }
@@ -1571,9 +1611,14 @@ fn cmd_add(args: AddArgs) -> CliResult<()> {
                         password: entry.password.as_deref().map(Vec::as_slice),
                         file_comment: None,
                     };
-                    rars::rar15_40::write_compressed_volumes(entry, options, volume_size)?
+                    rars::rar15_40::write_compressed_volumes_with_progress(
+                        entry,
+                        options,
+                        volume_size,
+                        Some(&progress),
+                    )?
                 };
-                write_volume_parts(&archive_path, &parts).map_err(|err| {
+                write_volume_parts(&archive_path, &parts, &progress).map_err(|err| {
                     format!(
                         "failed to write volume set starting at '{}': {err}",
                         archive_path.display()
@@ -1663,8 +1708,11 @@ fn cmd_add(args: AddArgs) -> CliResult<()> {
                 } else {
                     rars::rar15_40::FilterPolicy::Explicit(explicit_filter())
                 };
-                rars::rar15_40::write_rar29_compressed_archive_with_filter_policy(
-                    &entries, options, policy,
+                rars::rar15_40::write_rar29_compressed_archive_with_filter_policy_and_progress(
+                    &entries,
+                    options,
+                    policy,
+                    Some(&progress),
                 )?
             } else {
                 let mut entries = Vec::with_capacity(owned.len());
@@ -1682,13 +1730,14 @@ fn cmd_add(args: AddArgs) -> CliResult<()> {
                         file_comment: file_comment.as_deref(),
                     });
                 }
-                rars::rar15_40::write_compressed_archive_with_comment(
+                rars::rar15_40::write_compressed_archive_with_comment_and_progress(
                     &entries,
                     options,
                     archive_comment.as_deref(),
+                    Some(&progress),
                 )?
             };
-            write_archive_output(&archive_path, &bytes)?;
+            write_archive_output(&archive_path, &bytes, &progress)?;
             Ok(())
         }
         AddWritePlan::Rar13 => {
@@ -1710,7 +1759,12 @@ fn cmd_add(args: AddArgs) -> CliResult<()> {
                         password: entry.password.as_deref().map(Vec::as_slice),
                         file_comment: file_comment.as_deref(),
                     };
-                    rar13::write_compressed_volumes(entry, options, volume_size)?
+                    rar13::write_compressed_volumes_with_progress(
+                        entry,
+                        options,
+                        volume_size,
+                        Some(&progress),
+                    )?
                 } else {
                     let entry = Rar13StoredEntry {
                         name: &entry.name,
@@ -1722,7 +1776,7 @@ fn cmd_add(args: AddArgs) -> CliResult<()> {
                     };
                     rar13::write_stored_volumes(entry, options, volume_size)?
                 };
-                write_volume_parts(&archive_path, &parts).map_err(|err| {
+                write_volume_parts(&archive_path, &parts, &progress).map_err(|err| {
                     format!(
                         "failed to write volume set starting at '{}': {err}",
                         archive_path.display()
@@ -1743,10 +1797,11 @@ fn cmd_add(args: AddArgs) -> CliResult<()> {
                         file_comment: file_comment.as_deref(),
                     })
                     .collect();
-                rar13::write_compressed_archive_with_comment(
+                rar13::write_compressed_archive_with_comment_and_progress(
                     &entries,
                     options,
                     archive_comment.as_deref(),
+                    Some(&progress),
                 )?
             } else {
                 let entries: Vec<_> = owned
@@ -1766,21 +1821,38 @@ fn cmd_add(args: AddArgs) -> CliResult<()> {
                     archive_comment.as_deref(),
                 )?
             };
-            write_archive_output(&archive_path, &bytes)?;
+            write_archive_output(&archive_path, &bytes, &progress)?;
             Ok(())
         }
     }
 }
 
-fn write_archive_output(path: &Path, bytes: &[u8]) -> CliResult<()> {
+fn write_archive_output(path: &Path, bytes: &[u8], progress: &CliProgress) -> CliResult<()> {
+    progress.bar("Writing archive", bytes.len() as u64);
     if path == Path::new("-") || path == Path::new("/dev/stdout") {
-        std::io::Write::write_all(&mut std::io::stdout(), bytes)?;
+        write_bytes_with_progress(&mut std::io::stdout(), bytes, progress)?;
+        progress.finish("Archive written");
         eprintln!("created {}", path.display());
         return Ok(());
     }
-    fs::write(path, bytes)
+    let mut file = fs::File::create(path)
         .map_err(|err| format!("failed to write archive '{}': {err}", path.display()))?;
+    write_bytes_with_progress(&mut file, bytes, progress)
+        .map_err(|err| format!("failed to write archive '{}': {err}", path.display()))?;
+    progress.finish("Archive written");
     println!("created {}", path.display());
+    Ok(())
+}
+
+fn write_bytes_with_progress(
+    writer: &mut impl Write,
+    bytes: &[u8],
+    progress: &CliProgress,
+) -> std::io::Result<()> {
+    for chunk in bytes.chunks(1024 * 1024) {
+        writer.write_all(chunk)?;
+        progress.advance(chunk.len() as u64);
+    }
     Ok(())
 }
 
@@ -1821,24 +1893,40 @@ fn validate_rar15_40_add_options(
     Ok(())
 }
 
-fn write_volume_parts(first_path: &Path, parts: &[Vec<u8>]) -> CliResult<()> {
+fn write_volume_parts(
+    first_path: &Path,
+    parts: &[Vec<u8>],
+    progress: &CliProgress,
+) -> CliResult<()> {
+    let total = parts.iter().map(|part| part.len() as u64).sum();
+    progress.bar(format!("Writing {} volumes", parts.len()), total);
     let mut paths = Vec::with_capacity(parts.len());
     for (index, bytes) in parts.iter().enumerate() {
         let path = volume_part_path(first_path, index)?;
-        fs::write(&path, bytes)?;
+        let mut file = fs::File::create(&path)?;
+        write_bytes_with_progress(&mut file, bytes, progress)?;
         paths.push(path);
     }
+    progress.finish("Volumes written");
     print_created_volumes(&paths);
     Ok(())
 }
 
-fn write_rar50_volume_parts(first_path: &Path, parts: &[Vec<u8>]) -> CliResult<()> {
+fn write_rar50_volume_parts(
+    first_path: &Path,
+    parts: &[Vec<u8>],
+    progress: &CliProgress,
+) -> CliResult<()> {
+    let total = parts.iter().map(|part| part.len() as u64).sum();
+    progress.bar(format!("Writing {} volumes", parts.len()), total);
     let mut paths = Vec::with_capacity(parts.len());
     for (index, bytes) in parts.iter().enumerate() {
         let path = rar50_volume_part_path(first_path, index, parts.len())?;
-        fs::write(&path, bytes)?;
+        let mut file = fs::File::create(&path)?;
+        write_bytes_with_progress(&mut file, bytes, progress)?;
         paths.push(path);
     }
+    progress.finish("Volumes written");
     print_created_volumes(&paths);
     Ok(())
 }
