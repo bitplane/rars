@@ -4,4 +4,5 @@ verify = false             # `just check` is the pre-release gate
 push = true
 tag-name = "v{{version}}"
 allow-branch = ["master"]
-pre-release-hook = ["python3", "tools/sync-release-version.py", "{{version}}"]
+# cargo-release runs workspace hooks from each member's manifest directory.
+pre-release-hook = ["python3", "../../tools/sync-release-version.py", "{{version}}"]
