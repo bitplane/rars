@@ -84,13 +84,10 @@ pub fn plan_inline_recovery(
     }
     let mut group_count = archive_size.div_ceil(data_shards);
     group_count += group_count & 1;
-    let scale_factor = group_count.div_ceil(0x10000).max(1);
-    let header_size = (data_shards
+    let header_size = data_shards
         .checked_mul(8)
         .and_then(|value| value.checked_add(RAR5_RECOVERY_CHUNK_FIXED_HEADER_SIZE))
-        .ok_or(Error::PlanOverflow)?)
-    .checked_mul(scale_factor)
-    .ok_or(Error::PlanOverflow)?;
+        .ok_or(Error::PlanOverflow)?;
     let shard_size = header_size
         .checked_add(group_count)
         .ok_or(Error::PlanOverflow)?;
@@ -233,14 +230,28 @@ pub fn build_structural_inline_recovery_data(
             out.extend_from_slice(&state.to_le_bytes());
         }
         out.extend_from_slice(&final_state.to_le_bytes());
-        debug_assert_eq!(out.len() - chunk_start, header_size);
+        if out.len() - chunk_start != header_size {
+            return Err(Error::PlanOverflow);
+        }
         out.extend_from_slice(payload);
-        debug_assert_eq!(out.len() - chunk_start, shard_size);
+        if out.len() - chunk_start != shard_size {
+            return Err(Error::PlanOverflow);
+        }
 
-        let crc = crc64_xz(&out[chunk_start + 0x0c..chunk_start + shard_size]);
-        out[chunk_start + 0x04..chunk_start + 0x0c].copy_from_slice(&crc.to_le_bytes());
+        let chunk_end = chunk_start
+            .checked_add(shard_size)
+            .ok_or(Error::PlanOverflow)?;
+        let crc_start = chunk_start.checked_add(0x0c).ok_or(Error::PlanOverflow)?;
+        let crc = crc64_xz(out.get(crc_start..chunk_end).ok_or(Error::PlanOverflow)?);
+        let crc_field_start = chunk_start.checked_add(0x04).ok_or(Error::PlanOverflow)?;
+        let crc_field_end = chunk_start.checked_add(0x0c).ok_or(Error::PlanOverflow)?;
+        out.get_mut(crc_field_start..crc_field_end)
+            .ok_or(Error::PlanOverflow)?
+            .copy_from_slice(&crc.to_le_bytes());
     }
-    debug_assert_eq!(out.len(), total_len);
+    if out.len() != total_len {
+        return Err(Error::PlanOverflow);
+    }
     debug_assert_eq!(parity.len(), recovery_shards);
     debug_assert_eq!(data_shard_states.len(), data_shards);
     Ok(out)
@@ -912,7 +923,7 @@ mod tests {
         make_encoder_matrix, plan_inline_recovery, reconstruct_data_shards,
         repair_inline_recovery_archive, repair_inline_recovery_prefix,
         repair_inline_recovery_prefix_shards, shared_gf16, split_prefix_shard_ranges,
-        split_prefix_shards, Error, Gf16, InlineRecoveryPlan,
+        split_prefix_shards, Error, Gf16, InlineRecoveryPlan, MAX_WINRAR602_DATA_SHARDS,
     };
 
     #[test]
@@ -959,6 +970,31 @@ mod tests {
                 group_count: 1024,
                 header_size: 1672,
                 shard_size: 2696,
+            }
+        );
+    }
+
+    #[test]
+    fn rar5_inline_recovery_plan_keeps_fixed_header_above_64k_groups() {
+        let boundary = MAX_WINRAR602_DATA_SHARDS * 0x10000;
+        assert_eq!(
+            plan_inline_recovery(boundary, 1).unwrap(),
+            InlineRecoveryPlan {
+                data_shards: 200,
+                recovery_shards: 2,
+                group_count: 65_536,
+                header_size: 1672,
+                shard_size: 67_208,
+            }
+        );
+        assert_eq!(
+            plan_inline_recovery(boundary + 1, 1).unwrap(),
+            InlineRecoveryPlan {
+                data_shards: 200,
+                recovery_shards: 2,
+                group_count: 65_538,
+                header_size: 1672,
+                shard_size: 67_210,
             }
         );
     }
@@ -1178,6 +1214,46 @@ mod tests {
             }
             assert_eq!(&chunk[plan.header_size as usize..], payload);
         }
+    }
+
+    #[test]
+    fn rar5_structural_inline_recovery_round_trips_above_64k_groups() {
+        let prefix_len = (MAX_WINRAR602_DATA_SHARDS * 0x10000 + 1) as usize;
+        let prefix: Vec<u8> = (0..prefix_len).map(|index| index as u8).collect();
+        let plan = plan_inline_recovery(prefix.len() as u64, 1).unwrap();
+        let recovery_data = build_structural_inline_recovery_data(&prefix, 1).unwrap();
+
+        assert_eq!(plan.header_size, 1672);
+        assert_eq!(plan.group_count, 65_538);
+        assert_eq!(recovery_data.len(), plan.payload_size().unwrap() as usize);
+        for shard_index in 0..plan.recovery_shards as usize {
+            let chunk_start = shard_index * plan.shard_size as usize;
+            let chunk_end = chunk_start + plan.shard_size as usize;
+            let chunk = &recovery_data[chunk_start..chunk_end];
+            assert_eq!(
+                u32::from_le_bytes(chunk[0x0c..0x10].try_into().unwrap()) as u64,
+                plan.shard_size
+            );
+            assert_eq!(
+                u32::from_le_bytes(chunk[0x10..0x14].try_into().unwrap()) as u64,
+                plan.header_size
+            );
+            assert_eq!(
+                u64::from_le_bytes(chunk[0x04..0x0c].try_into().unwrap()),
+                crc64_xz(&chunk[0x0c..])
+            );
+        }
+
+        assert_eq!(
+            repair_inline_recovery_prefix(&prefix, &recovery_data).unwrap(),
+            prefix
+        );
+        let mut damaged = prefix.clone();
+        damaged[0] ^= 0xff;
+        assert_eq!(
+            repair_inline_recovery_prefix(&damaged, &recovery_data).unwrap(),
+            prefix
+        );
     }
 
     #[test]
