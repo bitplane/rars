@@ -1,0 +1,7 @@
+# `just release [level]` drives this via cargo-release.
+publish = false            # the v* tag workflow publishes after CI checks
+verify = false             # `just check` is the pre-release gate
+push = true
+tag-name = "v{{version}}"
+allow-branch = ["master"]
+pre-release-hook = ["python3", "tools/sync-release-version.py", "{{version}}"]
