@@ -1,6 +1,6 @@
 [package]
 name = "rars"
-version = "0.4.5"
+version = "0.4.6"
 description = "High-level Rust API for reading, extracting, writing, and repairing RAR archives."
 edition.workspace = true
 rust-version.workspace = true
