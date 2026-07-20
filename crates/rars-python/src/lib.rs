@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 create_exception!(rars, Error, pyo3::exceptions::PyException);
@@ -17,6 +18,158 @@ create_exception!(rars, UnsafeArchivePath, Error);
 
 const DOS_ARCHIVE_ATTR: u8 = 0x20;
 const DEFAULT_HOST_OS_UNIX: u64 = 3;
+
+#[pyclass(frozen, module = "rars", skip_from_py_object)]
+#[derive(Debug, Clone)]
+struct ProgressEvent {
+    #[pyo3(get)]
+    phase: String,
+    #[pyo3(get)]
+    completed: u64,
+    #[pyo3(get)]
+    total: u64,
+    #[pyo3(get)]
+    pass_number: usize,
+    #[pyo3(get)]
+    entry_name: Option<Vec<u8>>,
+    #[pyo3(get)]
+    entry_index: Option<usize>,
+    #[pyo3(get)]
+    total_entries: Option<usize>,
+}
+
+#[pymethods]
+impl ProgressEvent {
+    #[getter]
+    fn percentage(&self) -> f64 {
+        if self.total == 0 {
+            100.0
+        } else {
+            self.completed as f64 * 100.0 / self.total as f64
+        }
+    }
+}
+
+struct PythonProgress {
+    callback: Py<PyAny>,
+    state: Mutex<ProgressEvent>,
+    error: Mutex<Option<PyErr>>,
+    cancelled: AtomicBool,
+}
+
+impl PythonProgress {
+    fn new(callback: Py<PyAny>) -> Self {
+        Self {
+            callback,
+            state: Mutex::new(ProgressEvent {
+                phase: "compression".to_string(),
+                completed: 0,
+                total: 0,
+                pass_number: 1,
+                entry_name: None,
+                entry_index: None,
+                total_entries: None,
+            }),
+            error: Mutex::new(None),
+            cancelled: AtomicBool::new(false),
+        }
+    }
+
+    fn take_error(&self) -> Option<PyErr> {
+        self.error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+}
+
+impl rars_rs::WriteProgress for PythonProgress {
+    fn report(&self, event: rars_rs::WriteProgressEvent<'_>) {
+        if self.cancelled.load(Ordering::Relaxed) {
+            return;
+        }
+        let snapshot = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match event {
+                rars_rs::WriteProgressEvent::OperationStarted {
+                    operation,
+                    total_bytes,
+                    total_entries,
+                    pass,
+                } => {
+                    state.phase = progress_phase(operation).to_string();
+                    state.completed = 0;
+                    state.total = total_bytes.unwrap_or(0);
+                    state.pass_number = pass;
+                    state.total_entries = total_entries;
+                    state.entry_name = None;
+                    state.entry_index = None;
+                }
+                rars_rs::WriteProgressEvent::EntryStarted {
+                    index,
+                    total_entries,
+                    name,
+                    ..
+                } => {
+                    state.entry_name = Some(name.to_vec());
+                    state.entry_index = Some(index);
+                    state.total_entries = Some(total_entries);
+                }
+                rars_rs::WriteProgressEvent::EntryFinished { .. } => {}
+                rars_rs::WriteProgressEvent::Advanced {
+                    operation,
+                    completed_bytes,
+                    total_bytes,
+                    pass,
+                } => {
+                    state.phase = progress_phase(operation).to_string();
+                    state.completed = completed_bytes;
+                    state.total = total_bytes;
+                    state.pass_number = pass;
+                }
+                rars_rs::WriteProgressEvent::OperationFinished {
+                    operation,
+                    total_bytes,
+                    pass,
+                    ..
+                } => {
+                    state.phase = progress_phase(operation).to_string();
+                    state.total = total_bytes.unwrap_or(state.total);
+                    state.completed = state.total;
+                    state.pass_number = pass;
+                }
+                _ => {}
+            }
+            state.clone()
+        };
+        let result = Python::attach(|py| {
+            let event = Py::new(py, snapshot)?;
+            self.callback.call1(py, (event,)).map(|_| ())
+        });
+        if let Err(error) = result {
+            self.cancelled.store(true, Ordering::Relaxed);
+            *self
+                .error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+}
+
+fn progress_phase(operation: rars_rs::WriteOperation) -> &'static str {
+    match operation {
+        rars_rs::WriteOperation::Compression => "compression",
+        rars_rs::WriteOperation::Recovery => "recovery",
+        _ => "writing",
+    }
+}
 
 #[pyclass(frozen, module = "rars", skip_from_py_object)]
 #[derive(Debug, Clone)]
@@ -304,6 +457,39 @@ struct BuilderEntry {
     mode: Option<u32>,
 }
 
+fn python_progress(callback: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Arc<PythonProgress>>> {
+    callback
+        .map(|callback| {
+            if !callback.is_callable() {
+                return Err(PyValueError::new_err("progress must be callable"));
+            }
+            Ok(Arc::new(PythonProgress::new(callback.clone().unbind())))
+        })
+        .transpose()
+}
+
+fn rar50_writer<'a>(
+    options: rars_rs::rar50::WriterOptions,
+    progress: Option<&'a PythonProgress>,
+) -> rars_rs::rar50::Rar50Writer<'a> {
+    let writer = rars_rs::rar50::Rar50Writer::new(options);
+    match progress {
+        Some(progress) => writer.progress(progress),
+        None => writer,
+    }
+}
+
+fn rar50_volume_writer<'a>(
+    options: rars_rs::rar50::WriterOptions,
+    progress: Option<&'a PythonProgress>,
+) -> rars_rs::rar50::Rar50VolumeWriter<'a> {
+    let writer = rars_rs::rar50::Rar50VolumeWriter::new(options);
+    match progress {
+        Some(progress) => writer.progress(progress),
+        None => writer,
+    }
+}
+
 #[pymethods]
 impl RarBuilder {
     #[new]
@@ -461,26 +647,39 @@ impl RarBuilder {
         Ok(())
     }
 
-    fn to_bytes(&self, py: Python<'_>) -> PyResult<Vec<u8>> {
-        let this = self.clone();
-        py.detach(move || this.build_single_archive())
-            .map_err(map_error)
+    #[pyo3(signature = (*, progress = None))]
+    fn to_bytes(&self, py: Python<'_>, progress: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<u8>> {
+        self.to_bytes_with_progress(py, progress)
     }
 
-    fn write(&self, py: Python<'_>, path: &Bound<'_, PyAny>) -> PyResult<()> {
+    #[pyo3(signature = (path, *, progress = None))]
+    fn write(
+        &self,
+        py: Python<'_>,
+        path: &Bound<'_, PyAny>,
+        progress: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
         let path = py_path_buf(py, path)?;
-        let data = self.to_bytes(py)?;
+        let data = self.to_bytes_with_progress(py, progress)?;
         py.detach(|| fs::write(&path, data)).map_err(map_io_error)
     }
 
+    #[pyo3(signature = (first_path, *, progress = None))]
     fn write_volumes(
         &self,
         py: Python<'_>,
         first_path: &Bound<'_, PyAny>,
+        progress: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<PathBuf>> {
-        let first_path = py_path_buf(py, first_path)?;
+        let progress = python_progress(progress)?;
         let this = self.clone();
-        let parts = py.detach(move || this.build_volumes()).map_err(map_error)?;
+        let first_path = py_path_buf(py, first_path)?;
+        let worker_progress = progress.clone();
+        let result = py.detach(move || this.build_volumes(worker_progress.as_deref()));
+        if let Some(error) = progress.as_ref().and_then(|progress| progress.take_error()) {
+            return Err(error);
+        }
+        let parts = result.map_err(map_error)?;
         let mut paths = Vec::with_capacity(parts.len());
         for (index, part) in parts.iter().enumerate() {
             let path = if matches!(
@@ -499,6 +698,21 @@ impl RarBuilder {
 }
 
 impl RarBuilder {
+    fn to_bytes_with_progress(
+        &self,
+        py: Python<'_>,
+        callback: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Vec<u8>> {
+        let progress = python_progress(callback)?;
+        let worker_progress = progress.clone();
+        let this = self.clone();
+        let result = py.detach(move || this.build_single_archive(worker_progress.as_deref()));
+        if let Some(error) = progress.as_ref().and_then(|progress| progress.take_error()) {
+            return Err(error);
+        }
+        result.map_err(map_error)
+    }
+
     fn features(&self) -> rars_rs::FeatureSet {
         let mut features = rars_rs::FeatureSet::store_only();
         features.solid = self.solid;
@@ -509,7 +723,7 @@ impl RarBuilder {
         features
     }
 
-    fn build_single_archive(&self) -> rars_rs::Result<Vec<u8>> {
+    fn build_single_archive(&self, progress: Option<&PythonProgress>) -> rars_rs::Result<Vec<u8>> {
         if self.entries.is_empty() {
             return Err(rars_rs::Error::InvalidHeader(
                 "archive builder has no entries",
@@ -521,14 +735,14 @@ impl RarBuilder {
             ));
         }
         match self.format.family() {
-            rars_rs::ArchiveFamily::Rar50Plus => self.build_rar50_single(),
-            rars_rs::ArchiveFamily::Rar15To40 => self.build_rar15_single(),
-            rars_rs::ArchiveFamily::Rar13 => self.build_rar13_single(),
+            rars_rs::ArchiveFamily::Rar50Plus => self.build_rar50_single(progress),
+            rars_rs::ArchiveFamily::Rar15To40 => self.build_rar15_single(progress),
+            rars_rs::ArchiveFamily::Rar13 => self.build_rar13_single(progress),
             _ => Err(rars_rs::Error::UnsupportedSignature),
         }
     }
 
-    fn build_volumes(&self) -> rars_rs::Result<Vec<Vec<u8>>> {
+    fn build_volumes(&self, progress: Option<&PythonProgress>) -> rars_rs::Result<Vec<Vec<u8>>> {
         let volume_size = self
             .volume_size
             .ok_or(rars_rs::Error::InvalidHeader("volume_size is required"))?;
@@ -538,14 +752,14 @@ impl RarBuilder {
             ));
         }
         match self.format.family() {
-            rars_rs::ArchiveFamily::Rar50Plus => self.build_rar50_volumes(volume_size),
-            rars_rs::ArchiveFamily::Rar15To40 => self.build_rar15_volumes(volume_size),
-            rars_rs::ArchiveFamily::Rar13 => self.build_rar13_volumes(volume_size),
+            rars_rs::ArchiveFamily::Rar50Plus => self.build_rar50_volumes(volume_size, progress),
+            rars_rs::ArchiveFamily::Rar15To40 => self.build_rar15_volumes(volume_size, progress),
+            rars_rs::ArchiveFamily::Rar13 => self.build_rar13_volumes(volume_size, progress),
             _ => Err(rars_rs::Error::UnsupportedSignature),
         }
     }
 
-    fn build_rar50_single(&self) -> rars_rs::Result<Vec<u8>> {
+    fn build_rar50_single(&self, progress: Option<&PythonProgress>) -> rars_rs::Result<Vec<u8>> {
         let mut options = rars_rs::rar50::WriterOptions::new(self.format, self.features());
         if let Some(level) = self.compression {
             options = options.with_compression_level(level);
@@ -564,7 +778,7 @@ impl RarBuilder {
                         password,
                     })
                     .collect();
-                rars_rs::rar50::Rar50Writer::new(options)
+                rar50_writer(options, progress)
                     .encrypted_stored_entries(&entries)
                     .encrypted_archive_comment(self.comment.as_deref().map(|data| {
                         rars_rs::rar50::EncryptedArchiveCommentEntry { data, password }
@@ -585,7 +799,7 @@ impl RarBuilder {
                         password,
                     })
                     .collect();
-                rars_rs::rar50::Rar50Writer::new(options)
+                rar50_writer(options, progress)
                     .encrypted_compressed_entries(&entries)
                     .encrypted_archive_comment(self.comment.as_deref().map(|data| {
                         rars_rs::rar50::EncryptedArchiveCommentEntry { data, password }
@@ -605,7 +819,7 @@ impl RarBuilder {
                     host_os: DEFAULT_HOST_OS_UNIX,
                 })
                 .collect();
-            rars_rs::rar50::Rar50Writer::new(options)
+            rar50_writer(options, progress)
                 .stored_entries(&entries)
                 .archive_comment(self.comment.as_deref())
                 .recovery_percent(self.recovery_percent)
@@ -622,7 +836,7 @@ impl RarBuilder {
                     host_os: DEFAULT_HOST_OS_UNIX,
                 })
                 .collect();
-            rars_rs::rar50::Rar50Writer::new(options)
+            rar50_writer(options, progress)
                 .compressed_entries(&entries)
                 .archive_comment(self.comment.as_deref())
                 .recovery_percent(self.recovery_percent)
@@ -630,7 +844,7 @@ impl RarBuilder {
         }
     }
 
-    fn build_rar15_single(&self) -> rars_rs::Result<Vec<u8>> {
+    fn build_rar15_single(&self, progress: Option<&PythonProgress>) -> rars_rs::Result<Vec<u8>> {
         let mut options = rars_rs::rar15_40::WriterOptions::new(self.format, self.features());
         if let Some(level) = self.compression {
             options = options.with_compression_level(level);
@@ -668,15 +882,16 @@ impl RarBuilder {
                     file_comment: None,
                 })
                 .collect();
-            rars_rs::rar15_40::write_compressed_archive_with_comment(
+            rars_rs::rar15_40::write_compressed_archive_with_comment_and_progress(
                 &entries,
                 options,
                 self.comment.as_deref(),
+                progress.map(|progress| progress as &dyn rars_rs::WriteProgress),
             )
         }
     }
 
-    fn build_rar13_single(&self) -> rars_rs::Result<Vec<u8>> {
+    fn build_rar13_single(&self, progress: Option<&PythonProgress>) -> rars_rs::Result<Vec<u8>> {
         let mut options = rars_rs::rar13::WriterOptions::new(self.format, self.features());
         if let Some(level) = self.compression {
             options = options.with_compression_level(level);
@@ -712,15 +927,20 @@ impl RarBuilder {
                     file_comment: None,
                 })
                 .collect();
-            rars_rs::rar13::write_compressed_archive_with_comment(
+            rars_rs::rar13::write_compressed_archive_with_comment_and_progress(
                 &entries,
                 options,
                 self.comment.as_deref(),
+                progress.map(|progress| progress as &dyn rars_rs::WriteProgress),
             )
         }
     }
 
-    fn build_rar50_volumes(&self, volume_size: usize) -> rars_rs::Result<Vec<Vec<u8>>> {
+    fn build_rar50_volumes(
+        &self,
+        volume_size: usize,
+        progress: Option<&PythonProgress>,
+    ) -> rars_rs::Result<Vec<Vec<u8>>> {
         if self.comment.is_some() {
             return Err(rars_rs::Error::InvalidHeader(
                 "RAR 5 volume comments are not supported",
@@ -738,7 +958,7 @@ impl RarBuilder {
                     ));
                 }
                 let entry = &self.entries[0];
-                rars_rs::rar50::Rar50VolumeWriter::new(options)
+                rar50_volume_writer(options, progress)
                     .encrypted_stored_entry(rars_rs::rar50::EncryptedStoredEntry {
                         name: &entry.name,
                         data: &entry.data,
@@ -763,7 +983,7 @@ impl RarBuilder {
                         password,
                     })
                     .collect();
-                rars_rs::rar50::Rar50VolumeWriter::new(options)
+                rar50_volume_writer(options, progress)
                     .encrypted_compressed_entries(&entries)
                     .max_payload_per_volume(volume_size)
                     .recovery_percent(self.recovery_percent)
@@ -776,7 +996,7 @@ impl RarBuilder {
                 ));
             }
             let entry = &self.entries[0];
-            rars_rs::rar50::Rar50VolumeWriter::new(options)
+            rar50_volume_writer(options, progress)
                 .stored_entry(rars_rs::rar50::StoredEntry {
                     name: &entry.name,
                     data: &entry.data,
@@ -799,7 +1019,7 @@ impl RarBuilder {
                     host_os: DEFAULT_HOST_OS_UNIX,
                 })
                 .collect();
-            rars_rs::rar50::Rar50VolumeWriter::new(options)
+            rar50_volume_writer(options, progress)
                 .compressed_entries(&entries)
                 .max_payload_per_volume(volume_size)
                 .recovery_percent(self.recovery_percent)
@@ -807,7 +1027,11 @@ impl RarBuilder {
         }
     }
 
-    fn build_rar15_volumes(&self, volume_size: usize) -> rars_rs::Result<Vec<Vec<u8>>> {
+    fn build_rar15_volumes(
+        &self,
+        volume_size: usize,
+        progress: Option<&PythonProgress>,
+    ) -> rars_rs::Result<Vec<Vec<u8>>> {
         if self.entries.len() != 1 {
             return Err(rars_rs::Error::InvalidHeader(
                 "legacy volumes support one input",
@@ -833,7 +1057,7 @@ impl RarBuilder {
                 volume_size,
             )
         } else {
-            rars_rs::rar15_40::write_compressed_volumes(
+            rars_rs::rar15_40::write_compressed_volumes_with_progress(
                 rars_rs::rar15_40::FileEntry {
                     name: &entry.name,
                     data: &entry.data,
@@ -845,11 +1069,16 @@ impl RarBuilder {
                 },
                 options,
                 volume_size,
+                progress.map(|progress| progress as &dyn rars_rs::WriteProgress),
             )
         }
     }
 
-    fn build_rar13_volumes(&self, volume_size: usize) -> rars_rs::Result<Vec<Vec<u8>>> {
+    fn build_rar13_volumes(
+        &self,
+        volume_size: usize,
+        progress: Option<&PythonProgress>,
+    ) -> rars_rs::Result<Vec<Vec<u8>>> {
         if self.entries.len() != 1 {
             return Err(rars_rs::Error::InvalidHeader(
                 "legacy volumes support one input",
@@ -874,7 +1103,7 @@ impl RarBuilder {
                 volume_size,
             )
         } else {
-            rars_rs::rar13::write_compressed_volumes(
+            rars_rs::rar13::write_compressed_volumes_with_progress(
                 rars_rs::rar13::FileEntry {
                     name: &entry.name,
                     data: &entry.data,
@@ -885,6 +1114,7 @@ impl RarBuilder {
                 },
                 options,
                 volume_size,
+                progress.map(|progress| progress as &dyn rars_rs::WriteProgress),
             )
         }
     }
@@ -965,6 +1195,7 @@ fn rars(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RarFile>()?;
     m.add_class::<RarInfo>()?;
     m.add_class::<RarBuilder>()?;
+    m.add_class::<ProgressEvent>()?;
     m.add_function(wrap_pyfunction!(repair, m)?)?;
     m.add_function(wrap_pyfunction!(repair_to_path, m)?)?;
     m.add_function(wrap_pyfunction!(extract_volumes, m)?)?;
@@ -1638,7 +1869,7 @@ mod tests {
             mode: None,
         });
 
-        let bytes = builder.build_single_archive().unwrap();
+        let bytes = builder.build_single_archive(None).unwrap();
         let archive = rars_rs::ArchiveReader::read_owned(bytes).unwrap();
         let names: Vec<_> = archive.members().map(|member| member.meta.name).collect();
         assert_eq!(names, vec![b"hello.txt".to_vec()]);

@@ -1,5 +1,5 @@
 use crate::codec::rar13::{
-    unpack15_decode, unpack15_encode, unpack15_encode_with_options,
+    unpack15_decode, unpack15_encode, unpack15_encode_with_options_and_progress,
     EncodeOptions as Rar15EncodeOptions, Unpack15, Unpack15Encoder,
 };
 use crate::crypto::rar13::{Rar13Cipher, Rar13DecryptReader};
@@ -9,6 +9,7 @@ use crate::features::FeatureSet;
 use crate::io_util::{read_exact_at, read_u16, read_u32};
 pub(crate) use crate::source::ArchiveSource;
 use crate::version::{ArchiveFamily, ArchiveVersion};
+use crate::write_progress::{ProgressReporter, WorkTracker};
 use crate::{WriteOperation, WriteProgress, WriteProgressEvent};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -1075,18 +1076,38 @@ pub fn write_compressed_archive_with_comment_and_progress(
         .solid
         .then(|| Unpack15Encoder::with_options(encode_options));
 
-    let total_bytes = entries.iter().map(|entry| entry.data.len() as u64).sum();
-    report_compression_operation(progress, true, total_bytes, entries.len());
+    let total_bytes: u64 = entries.iter().map(|entry| entry.data.len() as u64).sum();
+    let attempts = if options.features.solid || options.compression_level == Some(0) {
+        1
+    } else {
+        rar15_encode_fallback_options(encode_options).len() as u64
+    };
+    let total_work = total_bytes.saturating_mul(attempts);
+    report_compression_operation(progress, true, total_work, entries.len());
+    let work = WorkTracker::new(
+        progress.map(ProgressReporter),
+        WriteOperation::Compression,
+        total_work,
+    );
     for (index, entry) in entries.iter().enumerate() {
         report_compression_entry(progress, true, index, entries.len(), entry);
         validate_file_entry(entry.name, entry.data)?;
         let solid = solid_encoder.is_some();
+        let mut last = 0usize;
+        let mut advance = |position: usize| {
+            if position < last {
+                last = 0;
+            }
+            let delta = position.saturating_sub(last);
+            last = position;
+            work.advance(delta as u64)
+        };
         let mut packed = if let Some(encoder) = solid_encoder.as_mut() {
-            encoder.encode_member(entry.data)?
+            encoder.encode_member_with_progress(entry.data, &mut advance)?
         } else if options.compression_level == Some(0) {
             entry.data.to_vec()
         } else {
-            encode_verified_rar15_payload(entry.data, encode_options)?
+            encode_verified_rar15_payload_with_progress(entry.data, encode_options, &mut advance)?
                 .unwrap_or_else(|| entry.data.to_vec())
         };
         let method = if options.compression_level == Some(0)
@@ -1129,7 +1150,11 @@ pub fn write_compressed_archive_with_comment_and_progress(
         report_compression_entry(progress, false, index, entries.len(), entry);
     }
 
-    report_compression_operation(progress, false, total_bytes, entries.len());
+    if !work.finish() {
+        return Err(Error::Cancelled);
+    }
+
+    report_compression_operation(progress, false, total_work, entries.len());
 
     Ok(out)
 }
@@ -1194,13 +1219,28 @@ pub fn write_compressed_volumes_with_progress(
     )?;
 
     validate_compression_level(options)?;
-    report_compression_operation(progress, true, entry.data.len() as u64, 1);
+    let encode_options = rar15_encode_options_for_level(options.compression_level)?;
+    let total_work = (entry.data.len() as u64)
+        .saturating_mul(rar15_encode_fallback_options(encode_options).len() as u64);
+    report_compression_operation(progress, true, total_work, 1);
+    let work = WorkTracker::new(
+        progress.map(ProgressReporter),
+        WriteOperation::Compression,
+        total_work,
+    );
     report_compression_entry(progress, true, 0, 1, &entry);
-    let mut packed = encode_verified_rar15_payload(
-        entry.data,
-        rar15_encode_options_for_level(options.compression_level)?,
-    )?
-    .unwrap_or_else(|| entry.data.to_vec());
+    let mut last = 0usize;
+    let mut advance = |position: usize| {
+        if position < last {
+            last = 0;
+        }
+        let delta = position.saturating_sub(last);
+        last = position;
+        work.advance(delta as u64)
+    };
+    let mut packed =
+        encode_verified_rar15_payload_with_progress(entry.data, encode_options, &mut advance)?
+            .unwrap_or_else(|| entry.data.to_vec());
     let method = if packed.len() >= entry.data.len() {
         packed = entry.data.to_vec();
         METHOD_STORE
@@ -1219,7 +1259,10 @@ pub fn write_compressed_volumes_with_progress(
         max_packed_per_volume,
     });
     report_compression_entry(progress, false, 0, 1, &entry);
-    report_compression_operation(progress, false, entry.data.len() as u64, 1);
+    if result.is_ok() && !work.finish() {
+        return Err(Error::Cancelled);
+    }
+    report_compression_operation(progress, false, total_work, 1);
     result
 }
 
@@ -1368,12 +1411,28 @@ fn rar15_encode_options_for_level(level: Option<u8>) -> Result<Rar15EncodeOption
     }
 }
 
-fn encode_verified_rar15_payload(
+fn encode_verified_rar15_payload_with_progress(
     data: &[u8],
     options: Rar15EncodeOptions,
+    progress: &mut dyn FnMut(usize) -> bool,
 ) -> Result<Option<Vec<u8>>> {
-    for candidate_options in rar15_encode_fallback_options(options) {
-        let packed = unpack15_encode_with_options(data, candidate_options)?;
+    let mut candidates = rar15_encode_fallback_options(options).into_iter();
+    let Some(first) = candidates.next() else {
+        return Ok(None);
+    };
+    let packed = match unpack15_encode_with_options_and_progress(data, first, progress) {
+        Err(crate::codec::Error::Cancelled) => return Err(Error::Cancelled),
+        result => result?,
+    };
+    if unpack15_payload_matches(&packed, data)? {
+        return Ok(Some(packed));
+    }
+    for candidate_options in candidates {
+        let packed =
+            match unpack15_encode_with_options_and_progress(data, candidate_options, progress) {
+                Err(crate::codec::Error::Cancelled) => return Err(Error::Cancelled),
+                result => result?,
+            };
         if unpack15_payload_matches(&packed, data)? {
             return Ok(Some(packed));
         }
@@ -1668,7 +1727,7 @@ mod tests {
     use crate::codec::rar13::{find_long_lz, LongLz};
     use std::cell::RefCell;
     use std::rc::Rc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     struct CollectWriter(Rc<RefCell<Vec<u8>>>);
 
@@ -1696,9 +1755,13 @@ mod tests {
         let operation_finishes = AtomicUsize::new(0);
         let entry_starts = AtomicUsize::new(0);
         let entry_finishes = AtomicUsize::new(0);
+        let advances = AtomicUsize::new(0);
+        let last_completed = AtomicU64::new(0);
+        let expected_total = AtomicU64::new(0);
         let reporter = |event: WriteProgressEvent<'_>| match event {
-            WriteProgressEvent::OperationStarted { .. } => {
+            WriteProgressEvent::OperationStarted { total_bytes, .. } => {
                 operation_starts.fetch_add(1, Ordering::Relaxed);
+                expected_total.store(total_bytes.unwrap_or(0), Ordering::Relaxed);
             }
             WriteProgressEvent::OperationFinished { .. } => {
                 operation_finishes.fetch_add(1, Ordering::Relaxed);
@@ -1709,7 +1772,15 @@ mod tests {
             WriteProgressEvent::EntryFinished { .. } => {
                 entry_finishes.fetch_add(1, Ordering::Relaxed);
             }
-            _ => {}
+            WriteProgressEvent::Advanced {
+                completed_bytes,
+                total_bytes,
+                ..
+            } => {
+                assert!(completed_bytes >= last_completed.swap(completed_bytes, Ordering::Relaxed));
+                assert!(completed_bytes <= total_bytes);
+                advances.fetch_add(1, Ordering::Relaxed);
+            }
         };
 
         write_compressed_archive_with_comment_and_progress(
@@ -1724,6 +1795,11 @@ mod tests {
         assert_eq!(operation_finishes.load(Ordering::Relaxed), 1);
         assert_eq!(entry_starts.load(Ordering::Relaxed), entries.len());
         assert_eq!(entry_finishes.load(Ordering::Relaxed), entries.len());
+        assert!(advances.load(Ordering::Relaxed) >= entries.len());
+        assert_eq!(
+            last_completed.load(Ordering::Relaxed),
+            expected_total.load(Ordering::Relaxed)
+        );
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]

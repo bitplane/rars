@@ -2,6 +2,7 @@ use crate::cli::ProgressMode;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rars::{WriteOperation, WriteProgress, WriteProgressEvent};
 use std::io::IsTerminal;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -21,6 +22,7 @@ struct PlainState {
     active: bool,
     stop: bool,
     message: String,
+    last_percent: u8,
 }
 
 pub(crate) struct CliProgress {
@@ -28,6 +30,7 @@ pub(crate) struct CliProgress {
     bar: ProgressBar,
     plain: Arc<(Mutex<PlainState>, Condvar)>,
     heartbeat: Mutex<Option<JoinHandle<()>>>,
+    determinate: AtomicBool,
 }
 
 impl CliProgress {
@@ -56,12 +59,15 @@ impl CliProgress {
             bar,
             plain,
             heartbeat: Mutex::new(heartbeat),
+            determinate: AtomicBool::new(false),
         }
     }
 
     pub(crate) fn spinner(&self, message: impl Into<String>) {
         let message = message.into();
         self.set_plain_state(true, &message);
+        self.determinate.store(false, Ordering::Relaxed);
+        self.reset_plain_percent();
         match self.mode {
             RenderMode::Terminal => {
                 // A previous phase may have used `finish_and_clear`, which leaves an
@@ -89,6 +95,8 @@ impl CliProgress {
     pub(crate) fn bar(&self, message: impl Into<String>, total: u64) {
         let message = message.into();
         self.set_plain_state(true, &message);
+        self.determinate.store(true, Ordering::Relaxed);
+        self.reset_plain_percent();
         if self.mode == RenderMode::Terminal {
             self.bar.reset();
             self.bar.disable_steady_tick();
@@ -145,6 +153,36 @@ impl CliProgress {
         state.message.push_str(message);
         wake.notify_all();
     }
+
+    fn reset_plain_percent(&self) {
+        let (lock, _) = &*self.plain;
+        lock.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .last_percent = 0;
+    }
+
+    fn report_plain_percent(&self, completed: u64, total: u64) {
+        if total == 0 || !matches!(self.mode, RenderMode::Milestones | RenderMode::Periodic) {
+            return;
+        }
+        let percent = completed
+            .saturating_mul(100)
+            .checked_div(total)
+            .unwrap_or(100)
+            .min(100) as u8;
+        let step = if self.mode == RenderMode::Periodic {
+            10
+        } else {
+            25
+        };
+        let threshold = percent / step * step;
+        let (lock, _) = &*self.plain;
+        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if threshold > state.last_percent {
+            state.last_percent = threshold;
+            eprintln!("progress: {threshold}% {}", state.message);
+        }
+    }
 }
 
 impl WriteProgress for CliProgress {
@@ -165,13 +203,19 @@ impl WriteProgress for CliProgress {
             }
             WriteProgressEvent::EntryFinished { input_bytes, .. } => self.advance(input_bytes),
             WriteProgressEvent::Advanced {
+                operation,
                 completed_bytes,
                 total_bytes,
-                ..
+                pass,
             } => {
                 if self.mode == RenderMode::Terminal {
+                    if !self.determinate.swap(true, Ordering::Relaxed) {
+                        self.bar(operation_label(operation, pass), total_bytes);
+                    }
                     self.bar.set_length(total_bytes);
                     self.bar.set_position(completed_bytes);
+                } else {
+                    self.report_plain_percent(completed_bytes, total_bytes);
                 }
             }
             WriteProgressEvent::OperationFinished {

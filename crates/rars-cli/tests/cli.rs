@@ -985,6 +985,7 @@ fn add_progress_modes_are_plain_when_stderr_is_captured() {
     assert!(auto_stderr.contains("progress: Scanning inputs"));
     assert!(auto_stderr.contains("progress: Preparing compression"));
     assert!(auto_stderr.contains("progress: Compressing archive"));
+    assert!(auto_stderr.contains("progress: 100%"));
     assert!(auto_stderr.contains("progress: Writing archive"));
     assert!(!auto_stderr.contains('\x1b'));
     assert!(!auto_stderr.contains('\r'));

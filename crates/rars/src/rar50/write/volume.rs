@@ -69,6 +69,7 @@ pub(super) fn write_compressed_volume_set_impl(
     options: WriterOptions,
     max_packed_per_volume: usize,
     recovery_percent: Option<u64>,
+    progress: Option<&WorkTracker<'_>>,
 ) -> Result<Vec<Vec<u8>>> {
     if recovery_percent.is_some() {
         validate_compressed_recovery_options(options)?;
@@ -107,17 +108,32 @@ pub(super) fn write_compressed_volume_set_impl(
             members.push(CompressedVolumeMember::Stored { entry_index: index });
             continue;
         }
+        let mut last = 0usize;
+        let mut report = |position: usize| {
+            if position < last {
+                last = 0;
+            }
+            let delta = position.saturating_sub(last);
+            last = position;
+            progress.is_none_or(|progress| progress.advance(delta as u64))
+        };
         let (packed, solid_continuation) = if let Some(encoder) = encoder.as_mut() {
-            encode_with_solid_reset_policy(
+            encode_with_solid_reset_policy_and_progress(
                 encoder,
                 entry.data,
                 algorithm_version,
                 encode_options,
                 index,
+                Some(&mut report),
             )?
         } else {
             (
-                encode_safe_lz_member(entry.data, algorithm_version, encode_options)?,
+                encode_safe_lz_member_with_progress(
+                    entry.data,
+                    algorithm_version,
+                    encode_options,
+                    &mut report,
+                )?,
                 false,
             )
         };
@@ -277,6 +293,7 @@ pub(super) fn write_encrypted_compressed_volume_set_impl(
     options: WriterOptions,
     max_encrypted_per_volume: usize,
     recovery_percent: Option<u64>,
+    progress: Option<&WorkTracker<'_>>,
 ) -> Result<Vec<Vec<u8>>> {
     if recovery_percent.is_some() {
         validate_encrypted_compressed_recovery_options(options)?;
@@ -319,17 +336,32 @@ pub(super) fn write_encrypted_compressed_volume_set_impl(
             });
             continue;
         }
+        let mut last = 0usize;
+        let mut report = |position: usize| {
+            if position < last {
+                last = 0;
+            }
+            let delta = position.saturating_sub(last);
+            last = position;
+            progress.is_none_or(|progress| progress.advance(delta as u64))
+        };
         let (packed, solid_continuation) = if let Some(encoder) = solid_encoder.as_mut() {
-            encode_with_solid_reset_policy(
+            encode_with_solid_reset_policy_and_progress(
                 encoder,
                 entry.data,
                 algorithm_version,
                 encode_options,
                 index,
+                Some(&mut report),
             )?
         } else {
             (
-                encode_safe_lz_member(entry.data, algorithm_version, encode_options)?,
+                encode_safe_lz_member_with_progress(
+                    entry.data,
+                    algorithm_version,
+                    encode_options,
+                    &mut report,
+                )?,
                 false,
             )
         };

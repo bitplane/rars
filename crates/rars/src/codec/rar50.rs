@@ -517,6 +517,7 @@ pub fn encode_lz_member_with_history(
         algorithm_version,
         &[],
         EncodeOptions::default(),
+        None,
     )
 }
 
@@ -528,13 +529,22 @@ pub fn encode_lz_member_with_options(
     encode_lz_member_with_history_and_options(data, &[], algorithm_version, options)
 }
 
+pub(crate) fn encode_lz_member_with_options_and_progress(
+    data: &[u8],
+    algorithm_version: u8,
+    options: EncodeOptions,
+    progress: &mut dyn FnMut(usize) -> bool,
+) -> Result<Vec<u8>> {
+    encode_lz_member_inner(data, &[], algorithm_version, &[], options, Some(progress))
+}
+
 pub fn encode_lz_member_with_history_and_options(
     data: &[u8],
     history: &[u8],
     algorithm_version: u8,
     options: EncodeOptions,
 ) -> Result<Vec<u8>> {
-    encode_lz_member_inner(data, history, algorithm_version, &[], options)
+    encode_lz_member_inner(data, history, algorithm_version, &[], options, None)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -664,6 +674,7 @@ fn filtered_lz_blocks(
             &records,
             options,
             chunk_end == data.len(),
+            None,
         )?);
         block_history.extend_from_slice(&chunk);
         let keep_from = block_history
@@ -707,14 +718,21 @@ fn encode_lz_member_inner(
     algorithm_version: u8,
     initial_filters: &[EncodeFilter],
     options: EncodeOptions,
+    mut progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<u8>> {
     if data.len() > MAX_COMPRESSED_BLOCK_OUTPUT && initial_filters.is_empty() {
         let mut out = Vec::new();
         let mut block_history =
             history[history.len().saturating_sub(options.max_match_distance)..].to_vec();
         let mut chunks = data.chunks(MAX_COMPRESSED_BLOCK_OUTPUT).peekable();
+        let mut completed = 0usize;
         while let Some(chunk) = chunks.next() {
             let is_last = chunks.peek().is_none();
+            let mut chunk_progress = |position: usize| {
+                progress
+                    .as_deref_mut()
+                    .is_none_or(|report| report(completed.saturating_add(position)))
+            };
             out.extend(encode_lz_block(
                 chunk,
                 &block_history,
@@ -722,7 +740,9 @@ fn encode_lz_member_inner(
                 &[],
                 options,
                 is_last,
+                Some(&mut chunk_progress),
             )?);
+            completed = completed.saturating_add(chunk.len());
             block_history.extend_from_slice(chunk);
             let keep_from = block_history
                 .len()
@@ -741,6 +761,7 @@ fn encode_lz_member_inner(
         initial_filters,
         options,
         true,
+        progress,
     )
 }
 
@@ -751,6 +772,7 @@ fn encode_lz_block(
     initial_filters: &[EncodeFilter],
     options: EncodeOptions,
     is_last: bool,
+    progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<u8>> {
     let distance_size = match algorithm_version {
         0 => DISTANCE_TABLE_SIZE_50,
@@ -763,7 +785,13 @@ fn encode_lz_block(
     };
     let mut tokens = Vec::new();
     tokens.extend(initial_filters.iter().copied().map(EncodeToken::Filter));
-    tokens.extend(encode_tokens(data, history, options, distance_size));
+    tokens.extend(encode_tokens_with_progress(
+        data,
+        history,
+        options,
+        distance_size,
+        progress,
+    )?);
     let mut lengths = TableLengths {
         main: vec![0; MAIN_TABLE_SIZE],
         distance: vec![0; distance_size],
@@ -919,6 +947,24 @@ impl Unpack50Encoder {
         Ok(packed)
     }
 
+    pub(crate) fn encode_member_with_progress(
+        &mut self,
+        input: &[u8],
+        algorithm_version: u8,
+        progress: &mut dyn FnMut(usize) -> bool,
+    ) -> Result<Vec<u8>> {
+        let packed = encode_lz_member_inner(
+            input,
+            &self.history,
+            algorithm_version,
+            &[],
+            self.options,
+            Some(progress),
+        )?;
+        self.remember(input);
+        Ok(packed)
+    }
+
     pub fn encode_member_with_filter(
         &mut self,
         input: &[u8],
@@ -952,6 +998,7 @@ impl Unpack50Encoder {
             algorithm_version,
             &records,
             self.options,
+            None,
         )?;
         self.remember(input);
         Ok(packed)
@@ -1063,12 +1110,24 @@ impl EncoderMatchState {
     }
 }
 
+#[cfg(test)]
 fn encode_tokens(
     input: &[u8],
     history: &[u8],
     options: EncodeOptions,
     distance_size: usize,
 ) -> Vec<EncodeToken> {
+    encode_tokens_with_progress(input, history, options, distance_size, None)
+        .expect("encoding without cancellation cannot be cancelled")
+}
+
+fn encode_tokens_with_progress(
+    input: &[u8],
+    history: &[u8],
+    options: EncodeOptions,
+    distance_size: usize,
+    mut progress: Option<&mut dyn FnMut(usize) -> bool>,
+) -> Result<Vec<EncodeToken>> {
     let mut tokens = Vec::new();
     let mut buckets = vec![Vec::new(); MATCH_HASH_BUCKETS];
     let history = &history[history.len().saturating_sub(options.max_match_distance)..];
@@ -1082,6 +1141,7 @@ fn encode_tokens(
     let mut pos = history.len();
     let end = combined.len();
     let mut state = EncoderMatchState::default();
+    let mut next_report = 0usize;
     while pos < end {
         if let Some(candidate) = best_match(
             &combined,
@@ -1120,8 +1180,21 @@ fn encode_tokens(
             insert_match_position(&combined, pos, &mut buckets);
             pos += 1;
         }
+        let consumed = pos.saturating_sub(history.len());
+        if consumed >= next_report {
+            if progress
+                .as_deref_mut()
+                .is_some_and(|report| !report(consumed))
+            {
+                return Err(Error::Cancelled);
+            }
+            next_report = consumed.saturating_add(1024 * 1024);
+        }
     }
-    tokens
+    if progress.is_some_and(|report| !report(input.len())) {
+        return Err(Error::Cancelled);
+    }
+    Ok(tokens)
 }
 
 fn should_lazy_emit_literal(

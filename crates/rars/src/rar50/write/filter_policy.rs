@@ -1,6 +1,7 @@
 use super::*;
 use crate::codec::rar50::{
-    encode_lz_member_with_options, EncodeOptions, Rar50FilterSpec, Unpack50Encoder,
+    encode_lz_member_with_options, encode_lz_member_with_options_and_progress, EncodeOptions,
+    Rar50FilterSpec, Unpack50Encoder,
 };
 use crate::x86_filter_scan::auto_x86_filter_ranges;
 
@@ -50,6 +51,7 @@ pub(super) fn should_store_compressed_payload(
     !solid && !matches!(policy, FilterPolicy::Explicit(_)) && packed.len() >= data.len()
 }
 
+#[cfg(test)]
 pub(super) fn encode_with_solid_reset_policy(
     encoder: &mut Unpack50Encoder,
     data: &[u8],
@@ -57,21 +59,57 @@ pub(super) fn encode_with_solid_reset_policy(
     options: EncodeOptions,
     index: usize,
 ) -> Result<(Vec<u8>, bool)> {
+    encode_with_solid_reset_policy_and_progress(
+        encoder,
+        data,
+        algorithm_version,
+        options,
+        index,
+        None,
+    )
+}
+
+pub(super) fn encode_with_solid_reset_policy_and_progress(
+    encoder: &mut Unpack50Encoder,
+    data: &[u8],
+    algorithm_version: u8,
+    options: EncodeOptions,
+    index: usize,
+    mut progress: Option<&mut dyn FnMut(usize) -> bool>,
+) -> Result<(Vec<u8>, bool)> {
     if index == 0 {
-        let packed = encoder
-            .encode_member(data, algorithm_version)
-            .map_err(Error::from)?;
+        let packed = if let Some(progress) = progress.as_deref_mut() {
+            encoder
+                .encode_member_with_progress(data, algorithm_version, progress)
+                .map_err(Error::from)?
+        } else {
+            encoder
+                .encode_member(data, algorithm_version)
+                .map_err(Error::from)?
+        };
         return Ok((packed, false));
     }
 
     let mut continued = encoder.clone();
-    let continued_packed = continued
-        .encode_member(data, algorithm_version)
-        .map_err(Error::from)?;
+    let continued_packed = if let Some(progress) = progress.as_deref_mut() {
+        continued
+            .encode_member_with_progress(data, algorithm_version, progress)
+            .map_err(Error::from)?
+    } else {
+        continued
+            .encode_member(data, algorithm_version)
+            .map_err(Error::from)?
+    };
     let mut fresh = Unpack50Encoder::with_options(options);
-    let fresh_packed = fresh
-        .encode_member(data, algorithm_version)
-        .map_err(Error::from)?;
+    let fresh_packed = if let Some(progress) = progress {
+        fresh
+            .encode_member_with_progress(data, algorithm_version, progress)
+            .map_err(Error::from)?
+    } else {
+        fresh
+            .encode_member(data, algorithm_version)
+            .map_err(Error::from)?
+    };
     if fresh_packed.len() < continued_packed.len() {
         *encoder = fresh;
         Ok((fresh_packed, false))
@@ -256,6 +294,16 @@ pub(super) fn encode_safe_lz_member(
     options: EncodeOptions,
 ) -> Result<Vec<u8>> {
     encode_lz_member_with_options(data, algorithm_version, options).map_err(Error::from)
+}
+
+pub(super) fn encode_safe_lz_member_with_progress(
+    data: &[u8],
+    algorithm_version: u8,
+    options: EncodeOptions,
+    progress: &mut dyn FnMut(usize) -> bool,
+) -> Result<Vec<u8>> {
+    encode_lz_member_with_options_and_progress(data, algorithm_version, options, progress)
+        .map_err(Error::from)
 }
 
 pub(super) fn encode_member_with_auto_size_filter(

@@ -17,6 +17,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     InvalidData(&'static str),
     NeedMoreInput,
+    Cancelled,
 }
 
 impl std::fmt::Display for Error {
@@ -24,6 +25,7 @@ impl std::fmt::Display for Error {
         match self {
             Self::InvalidData(msg) => write!(f, "{msg}"),
             Self::NeedMoreInput => write!(f, "codec input is truncated"),
+            Self::Cancelled => f.write_str("codec operation was cancelled"),
         }
     }
 }

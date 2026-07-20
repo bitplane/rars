@@ -52,6 +52,17 @@ pub fn unpack15_encode_with_options(input: &[u8], options: EncodeOptions) -> Res
     encoder.encode_member(input)
 }
 
+pub(crate) fn unpack15_encode_with_options_and_progress(
+    input: &[u8],
+    options: EncodeOptions,
+    progress: &mut dyn FnMut(usize) -> bool,
+) -> Result<Vec<u8>> {
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+    Unpack15Encoder::with_options(options).encode_member_with_progress(input, progress)
+}
+
 pub fn unpack15_decode(input: &[u8], output_size: usize) -> Result<Vec<u8>> {
     let mut decoder = Unpack15::new();
     decoder.decode_member(input, output_size, false)
@@ -221,12 +232,29 @@ impl Unpack15Encoder {
     }
 
     pub fn encode_member(&mut self, input: &[u8]) -> Result<Vec<u8>> {
+        self.encode_member_inner(input, None)
+    }
+
+    pub(crate) fn encode_member_with_progress(
+        &mut self,
+        input: &[u8],
+        progress: &mut dyn FnMut(usize) -> bool,
+    ) -> Result<Vec<u8>> {
+        self.encode_member_inner(input, Some(progress))
+    }
+
+    fn encode_member_inner(
+        &mut self,
+        input: &[u8],
+        mut progress: Option<&mut dyn FnMut(usize) -> bool>,
+    ) -> Result<Vec<u8>> {
         if input.is_empty() {
             return Ok(Vec::new());
         }
         self.bits = BitWriter::new();
         let buckets = long_lz_buckets(input);
         let mut pos = 0usize;
+        let mut next_report = 0usize;
         while pos < input.len() {
             let mut flags = 0u8;
             let mut flag_bits = 0usize;
@@ -287,6 +315,15 @@ impl Unpack15Encoder {
                 }
                 self.emit_stmode_exit()?;
             }
+            if pos >= next_report {
+                if progress.as_deref_mut().is_some_and(|report| !report(pos)) {
+                    return Err(Error::Cancelled);
+                }
+                next_report = pos.saturating_add(1024 * 1024);
+            }
+        }
+        if progress.is_some_and(|report| !report(input.len())) {
+            return Err(Error::Cancelled);
         }
         Ok(std::mem::take(&mut self.bits).finish())
     }

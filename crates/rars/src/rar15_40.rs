@@ -573,7 +573,8 @@ impl FileHeader {
             | Error::TooShort
             | Error::Io(_)
             | Error::AtArchiveOffset { .. }
-            | Error::AtEntry { .. } => error,
+            | Error::AtEntry { .. }
+            | Error::Cancelled => error,
             Error::InvalidHeader(_)
             | Error::Codec(_)
             | Error::Rar3Recovery(_)

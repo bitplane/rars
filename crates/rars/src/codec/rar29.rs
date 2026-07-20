@@ -130,6 +130,14 @@ pub fn unpack29_encode_literals_with_options(
     encode_member_with_options(input, &[], options)
 }
 
+pub(crate) fn unpack29_encode_literals_with_options_and_progress(
+    input: &[u8],
+    options: EncodeOptions,
+    progress: &mut dyn FnMut(usize) -> bool,
+) -> Result<Vec<u8>> {
+    encode_member_with_options_and_progress(input, &[], options, progress)
+}
+
 pub fn unpack29_encode_ppmd_literals(input: &[u8]) -> Result<Vec<u8>> {
     encode_ppmd_member(input, false, &[])
 }
@@ -470,6 +478,17 @@ impl Unpack29Encoder {
         Ok(packed)
     }
 
+    pub(crate) fn encode_member_with_progress(
+        &mut self,
+        input: &[u8],
+        progress: &mut dyn FnMut(usize) -> bool,
+    ) -> Result<Vec<u8>> {
+        let packed =
+            encode_member_with_options_and_progress(input, &self.history, self.options, progress)?;
+        self.remember(input);
+        Ok(packed)
+    }
+
     pub fn encode_member_with_filter(
         &mut self,
         input: &[u8],
@@ -527,12 +546,30 @@ fn encode_member_with_options(
     history: &[u8],
     options: EncodeOptions,
 ) -> Result<Vec<u8>> {
+    encode_member_with_options_impl(input, history, options, None)
+}
+
+fn encode_member_with_options_and_progress(
+    input: &[u8],
+    history: &[u8],
+    options: EncodeOptions,
+    progress: &mut dyn FnMut(usize) -> bool,
+) -> Result<Vec<u8>> {
+    encode_member_with_options_impl(input, history, options, Some(progress))
+}
+
+fn encode_member_with_options_impl(
+    input: &[u8],
+    history: &[u8],
+    options: EncodeOptions,
+    progress: Option<&mut dyn FnMut(usize) -> bool>,
+) -> Result<Vec<u8>> {
     if let Some(block_size) = options.block_size.filter(|&size| size != 0) {
         if input.len() > block_size {
-            return encode_member_blocks(input, history, options, block_size);
+            return encode_member_blocks(input, history, options, block_size, progress);
         }
     }
-    encode_member_inner(input, history, &[], options)
+    encode_member_inner(input, history, &[], options, progress)
 }
 
 fn encode_member_blocks(
@@ -540,12 +577,26 @@ fn encode_member_blocks(
     history: &[u8],
     mut options: EncodeOptions,
     block_size: usize,
+    mut progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<u8>> {
     options.block_size = None;
     let mut out = Vec::new();
     let mut local_history = history[history.len().saturating_sub(MAX_HISTORY)..].to_vec();
+    let mut completed = 0usize;
     for chunk in input.chunks(block_size) {
-        out.extend_from_slice(&encode_member_inner(chunk, &local_history, &[], options)?);
+        let mut chunk_progress = |position: usize| {
+            progress
+                .as_deref_mut()
+                .is_none_or(|report| report(completed.saturating_add(position)))
+        };
+        out.extend_from_slice(&encode_member_inner(
+            chunk,
+            &local_history,
+            &[],
+            options,
+            Some(&mut chunk_progress),
+        )?);
+        completed = completed.saturating_add(chunk.len());
         local_history.extend_from_slice(chunk);
         let keep_from = local_history.len().saturating_sub(MAX_HISTORY);
         if keep_from != 0 {
@@ -561,7 +612,7 @@ fn encode_member_with_initial_filters(
     filters: &[Vec<u8>],
     options: EncodeOptions,
 ) -> Result<Vec<u8>> {
-    encode_member_inner(input, history, filters, options)
+    encode_member_inner(input, history, filters, options, None)
 }
 
 fn encode_member_inner(
@@ -569,8 +620,9 @@ fn encode_member_inner(
     history: &[u8],
     initial_filters: &[Vec<u8>],
     options: EncodeOptions,
+    progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<u8>> {
-    let tokens = encode_tokens(input, history, options);
+    let tokens = encode_tokens_with_progress(input, history, options, progress)?;
     let mut main_frequencies = vec![0usize; MAIN_COUNT];
     let mut offset_frequencies = vec![0usize; OFFSET_COUNT];
     let mut low_offset_frequencies = vec![0usize; LOW_OFFSET_COUNT];
@@ -1064,7 +1116,18 @@ impl EncoderMatchState {
     }
 }
 
+#[cfg(test)]
 fn encode_tokens(input: &[u8], history: &[u8], options: EncodeOptions) -> Vec<EncodeToken> {
+    encode_tokens_with_progress(input, history, options, None)
+        .expect("encoding without cancellation cannot be cancelled")
+}
+
+fn encode_tokens_with_progress(
+    input: &[u8],
+    history: &[u8],
+    options: EncodeOptions,
+    mut progress: Option<&mut dyn FnMut(usize) -> bool>,
+) -> Result<Vec<EncodeToken>> {
     let mut tokens = Vec::new();
     let mut buckets = vec![Vec::new(); MATCH_HASH_BUCKETS];
     let history = &history[history.len().saturating_sub(options.max_match_distance)..];
@@ -1078,6 +1141,7 @@ fn encode_tokens(input: &[u8], history: &[u8], options: EncodeOptions) -> Vec<En
     let mut pos = history.len();
     let end = combined.len();
     let mut state = EncoderMatchState::default();
+    let mut next_report = 0usize;
     while pos < end {
         if let Some(candidate) = best_match(&combined, pos, end, &buckets, options, &state) {
             if should_lazy_emit_literal(&combined, pos, end, &buckets, options, &state, candidate) {
@@ -1098,8 +1162,21 @@ fn encode_tokens(input: &[u8], history: &[u8], options: EncodeOptions) -> Vec<En
             insert_match_position(&combined, pos, &mut buckets);
             pos += 1;
         }
+        let consumed = pos.saturating_sub(history.len());
+        if consumed >= next_report {
+            if progress
+                .as_deref_mut()
+                .is_some_and(|report| !report(consumed))
+            {
+                return Err(Error::Cancelled);
+            }
+            next_report = consumed.saturating_add(1024 * 1024);
+        }
     }
-    tokens
+    if progress.is_some_and(|report| !report(input.len())) {
+        return Err(Error::Cancelled);
+    }
+    Ok(tokens)
 }
 
 fn should_lazy_emit_literal(

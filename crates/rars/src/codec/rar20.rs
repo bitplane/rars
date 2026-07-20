@@ -47,7 +47,7 @@ pub fn unpack20_encode_literals_with_options(
     input: &[u8],
     options: EncodeOptions,
 ) -> Result<Vec<u8>> {
-    encode_member(input, &[], None, options)
+    encode_member(input, &[], None, options, None)
 }
 
 pub fn unpack20_encode_auto(input: &[u8]) -> Result<Vec<u8>> {
@@ -57,6 +57,26 @@ pub fn unpack20_encode_auto(input: &[u8]) -> Result<Vec<u8>> {
 pub fn unpack20_encode_auto_with_options(input: &[u8], options: EncodeOptions) -> Result<Vec<u8>> {
     let lz = unpack20_encode_literals_with_options(input, options)?;
     let mut best = lz;
+    if options.try_audio {
+        for channels in 1..=MAX_CHANNELS {
+            if input.len() < channels * 64 {
+                continue;
+            }
+            let audio = encode_audio_member(input, channels)?;
+            if audio.len() < best.len() {
+                best = audio;
+            }
+        }
+    }
+    Ok(best)
+}
+
+pub(crate) fn unpack20_encode_auto_with_options_and_progress(
+    input: &[u8],
+    options: EncodeOptions,
+    progress: &mut dyn FnMut(usize) -> bool,
+) -> Result<Vec<u8>> {
+    let mut best = encode_member(input, &[], None, options, Some(progress))?;
     if options.try_audio {
         for channels in 1..=MAX_CHANNELS {
             if input.len() < channels * 64 {
@@ -144,6 +164,22 @@ impl Unpack20Encoder {
     }
 
     pub fn encode_member(&mut self, input: &[u8]) -> Result<Vec<u8>> {
+        self.encode_member_inner(input, None)
+    }
+
+    pub(crate) fn encode_member_with_progress(
+        &mut self,
+        input: &[u8],
+        progress: &mut dyn FnMut(usize) -> bool,
+    ) -> Result<Vec<u8>> {
+        self.encode_member_inner(input, Some(progress))
+    }
+
+    fn encode_member_inner(
+        &mut self,
+        input: &[u8],
+        progress: Option<&mut dyn FnMut(usize) -> bool>,
+    ) -> Result<Vec<u8>> {
         if input.is_empty() {
             return Ok(Vec::new());
         }
@@ -155,7 +191,7 @@ impl Unpack20Encoder {
                 table
             }
         };
-        let packed = encode_member(input, &self.history, Some(table), self.options)?;
+        let packed = encode_member(input, &self.history, Some(table), self.options, progress)?;
         self.remember(input);
         Ok(packed)
     }
@@ -177,12 +213,18 @@ fn encode_member(
     history: &[u8],
     fixed_table: Option<FixedEncodeTable>,
     options: EncodeOptions,
+    mut progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<u8>> {
     if input.is_empty() {
         return Ok(Vec::new());
     }
 
-    let tokens = encode_tokens(input, history, options, None);
+    let tokens = match progress.as_mut() {
+        Some(report) => {
+            encode_tokens_with_progress(input, history, options, None, Some(&mut **report))?
+        }
+        None => encode_tokens_with_progress(input, history, options, None, None)?,
+    };
     let table_lengths = table_lengths_for_tokens(&tokens, fixed_table)?;
     let packed = encode_member_with_tables(&tokens, history, fixed_table, &table_lengths)?;
     if fixed_table.is_some() {
@@ -190,7 +232,16 @@ fn encode_member(
     }
 
     let cost_model = CostModel::new(&table_lengths);
-    let refined_tokens = encode_tokens(input, history, options, Some(&cost_model));
+    let refined_tokens = match progress.as_mut() {
+        Some(report) => encode_tokens_with_progress(
+            input,
+            history,
+            options,
+            Some(&cost_model),
+            Some(&mut **report),
+        )?,
+        None => encode_tokens_with_progress(input, history, options, Some(&cost_model), None)?,
+    };
     if refined_tokens == tokens {
         return Ok(packed);
     }
@@ -418,12 +469,24 @@ enum EncodeToken {
     },
 }
 
+#[cfg(test)]
 fn encode_tokens(
     input: &[u8],
     history: &[u8],
     options: EncodeOptions,
     cost_model: Option<&CostModel>,
 ) -> Vec<EncodeToken> {
+    encode_tokens_with_progress(input, history, options, cost_model, None)
+        .expect("encoding without cancellation cannot be cancelled")
+}
+
+fn encode_tokens_with_progress(
+    input: &[u8],
+    history: &[u8],
+    options: EncodeOptions,
+    cost_model: Option<&CostModel>,
+    mut progress: Option<&mut dyn FnMut(usize) -> bool>,
+) -> Result<Vec<EncodeToken>> {
     let mut tokens = Vec::new();
     let mut buckets = vec![Vec::new(); MATCH_HASH_BUCKETS];
     let history = &history[history.len().saturating_sub(options.max_match_distance)..];
@@ -438,6 +501,7 @@ fn encode_tokens(
     let end = combined.len();
     let mut last_match = None;
     let mut old_offsets = [0usize; 4];
+    let mut next_report = 0usize;
     while pos < end {
         let selected = select_match(
             &combined,
@@ -507,8 +571,21 @@ fn encode_tokens(
             insert_match_position(&combined, pos, &mut buckets);
             pos += 1;
         }
+        let consumed = pos.saturating_sub(history.len());
+        if consumed >= next_report {
+            if progress
+                .as_deref_mut()
+                .is_some_and(|report| !report(consumed))
+            {
+                return Err(Error::Cancelled);
+            }
+            next_report = consumed.saturating_add(1024 * 1024);
+        }
     }
-    tokens
+    if progress.is_some_and(|report| !report(input.len())) {
+        return Err(Error::Cancelled);
+    }
+    Ok(tokens)
 }
 
 #[derive(Debug, Clone, Copy)]

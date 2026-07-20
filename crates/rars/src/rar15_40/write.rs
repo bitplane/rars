@@ -1,16 +1,19 @@
 use super::*;
 use crate::codec::rar13::{
-    unpack15_encode_with_options, EncodeOptions as Rar15EncodeOptions, Unpack15Encoder,
+    unpack15_encode_with_options_and_progress, EncodeOptions as Rar15EncodeOptions, Unpack15Encoder,
 };
 use crate::codec::rar20::{
-    unpack20_encode_auto_with_options, EncodeOptions as Rar20EncodeOptions, Unpack20Encoder,
+    unpack20_encode_auto_with_options_and_progress, EncodeOptions as Rar20EncodeOptions,
+    Unpack20Encoder,
 };
 use crate::codec::rar29::{
-    unpack29_encode_literals, unpack29_encode_literals_with_options, unpack29_encode_ppmd,
+    unpack29_encode_literals, unpack29_encode_literals_with_options,
+    unpack29_encode_literals_with_options_and_progress, unpack29_encode_ppmd,
     unpack29_encode_ppmd_with_filter, EncodeOptions as Rar29EncodeOptions, Unpack29Encoder,
 };
 pub use crate::codec::rar29::{Rar29FilterKind as FilterKind, Rar29FilterSpec as FilterSpec};
 use crate::io_util::align16 as checked_align16;
+use crate::write_progress::{ProgressReporter, WorkTracker};
 use crate::x86_filter_scan::auto_x86_filter_ranges;
 use crate::{WriteOperation, WriteProgress, WriteProgressEvent};
 
@@ -79,10 +82,24 @@ pub fn write_compressed_archive_with_comment_and_progress(
     archive_comment: Option<&[u8]>,
     progress: Option<&dyn WriteProgress>,
 ) -> Result<Vec<u8>> {
-    let total_bytes = entries.iter().map(|entry| entry.data.len() as u64).sum();
-    report_compression_operation(progress, true, total_bytes, entries.len());
-    let result = write_compressed_archive_with_comment_impl(entries, options, archive_comment);
-    report_compression_operation(progress, false, total_bytes, entries.len());
+    let total_bytes: u64 = entries.iter().map(|entry| entry.data.len() as u64).sum();
+    let total_work = if options.target == ArchiveVersion::Rar20 && !options.features.solid {
+        total_bytes.saturating_mul(2)
+    } else {
+        total_bytes
+    };
+    report_compression_operation(progress, true, total_work, entries.len());
+    let work = WorkTracker::new(
+        progress.map(ProgressReporter),
+        WriteOperation::Compression,
+        total_work,
+    );
+    let result =
+        write_compressed_archive_with_comment_impl(entries, options, archive_comment, Some(&work));
+    if result.is_ok() && !work.finish() {
+        return Err(Error::Cancelled);
+    }
+    report_compression_operation(progress, false, total_work, entries.len());
     result
 }
 
@@ -90,6 +107,7 @@ fn write_compressed_archive_with_comment_impl(
     entries: &[FileEntry<'_>],
     options: WriterOptions,
     archive_comment: Option<&[u8]>,
+    progress: Option<&WorkTracker<'_>>,
 ) -> Result<Vec<u8>> {
     let has_file_comment = entries.iter().any(|entry| entry.file_comment.is_some());
     validate_compressed_writer_options(options, archive_comment.is_some(), has_file_comment)?;
@@ -109,7 +127,8 @@ fn write_compressed_archive_with_comment_impl(
         let mut solid_encoder = SolidEncoder::for_target(options, true)?;
         let mut solid_run_has_member = false;
         for entry in entries {
-            let payload = encode_or_store_payload(entry.data, options, &mut solid_encoder)?;
+            let payload =
+                encode_or_store_payload(entry.data, options, &mut solid_encoder, progress)?;
             let solid_continuation = payload.method != 0x30 && solid_run_has_member;
             write_compressed_entry(
                 &mut out,
@@ -123,7 +142,7 @@ fn write_compressed_archive_with_comment_impl(
             solid_run_has_member = payload.method != 0x30;
         }
     } else {
-        let payloads = encode_independent_payloads(entries, options)?;
+        let payloads = encode_independent_payloads(entries, options, progress)?;
         for (entry, payload) in entries.iter().zip(&payloads) {
             write_compressed_entry(
                 &mut out,
@@ -652,7 +671,7 @@ fn write_header_encrypted_compressed_archive(
         let mut solid_encoder = SolidEncoder::for_target(options, true)?;
         let mut solid_run_has_member = false;
         for entry in entries {
-            let payload = encode_or_store_payload(entry.data, options, &mut solid_encoder)?;
+            let payload = encode_or_store_payload(entry.data, options, &mut solid_encoder, None)?;
             let solid_continuation = payload.method != 0x30 && solid_run_has_member;
             write_header_encrypted_compressed_entry(
                 &mut out,
@@ -666,7 +685,7 @@ fn write_header_encrypted_compressed_archive(
             solid_run_has_member = payload.method != 0x30;
         }
     } else {
-        let payloads = encode_independent_payloads(entries, options)?;
+        let payloads = encode_independent_payloads(entries, options, None)?;
         for (entry, payload) in entries.iter().zip(&payloads) {
             write_header_encrypted_compressed_entry(
                 &mut out,
@@ -744,9 +763,22 @@ pub fn write_compressed_volumes_with_progress(
     max_packed_per_volume: usize,
     progress: Option<&dyn WriteProgress>,
 ) -> Result<Vec<Vec<u8>>> {
-    report_compression_operation(progress, true, entry.data.len() as u64, 1);
-    let result = write_compressed_volumes_impl(entry, options, max_packed_per_volume);
-    report_compression_operation(progress, false, entry.data.len() as u64, 1);
+    let total_work = if options.target == ArchiveVersion::Rar20 && !options.features.solid {
+        (entry.data.len() as u64).saturating_mul(2)
+    } else {
+        entry.data.len() as u64
+    };
+    report_compression_operation(progress, true, total_work, 1);
+    let work = WorkTracker::new(
+        progress.map(ProgressReporter),
+        WriteOperation::Compression,
+        total_work,
+    );
+    let result = write_compressed_volumes_impl(entry, options, max_packed_per_volume, Some(&work));
+    if result.is_ok() && !work.finish() {
+        return Err(Error::Cancelled);
+    }
+    report_compression_operation(progress, false, total_work, 1);
     result
 }
 
@@ -754,6 +786,7 @@ fn write_compressed_volumes_impl(
     entry: FileEntry<'_>,
     options: WriterOptions,
     max_packed_per_volume: usize,
+    progress: Option<&WorkTracker<'_>>,
 ) -> Result<Vec<Vec<u8>>> {
     validate_compressed_writer_options(options, false, false)?;
     validate_volume_writer_inputs(
@@ -765,7 +798,7 @@ fn write_compressed_volumes_impl(
     )?;
 
     let mut solid_encoder = None;
-    let payload = encode_or_store_payload(entry.data, options, &mut solid_encoder)?;
+    let payload = encode_or_store_payload(entry.data, options, &mut solid_encoder, progress)?;
     if options.features.header_encryption {
         return write_header_encrypted_split_volumes(SplitVolumeRecord {
             name: entry.name,
@@ -1137,25 +1170,30 @@ struct EncodedPayload {
     method: u8,
 }
 
-fn encode_independent_payload(data: &[u8], options: WriterOptions) -> Result<EncodedPayload> {
+fn encode_independent_payload(
+    data: &[u8],
+    options: WriterOptions,
+    progress: Option<&WorkTracker<'_>>,
+) -> Result<EncodedPayload> {
     let mut solid_encoder = None;
-    encode_or_store_payload(data, options, &mut solid_encoder)
+    encode_or_store_payload(data, options, &mut solid_encoder, progress)
 }
 
 fn encode_independent_payloads(
     entries: &[FileEntry<'_>],
     options: WriterOptions,
+    progress: Option<&WorkTracker<'_>>,
 ) -> Result<Vec<EncodedPayload>> {
     #[cfg(feature = "parallel")]
     {
         if entries.len() > 1 {
             crate::parallel::map_slice_collect(entries, |entry| {
-                encode_independent_payload(entry.data, options)
+                encode_independent_payload(entry.data, options, progress)
             })
         } else {
             entries
                 .iter()
-                .map(|entry| encode_independent_payload(entry.data, options))
+                .map(|entry| encode_independent_payload(entry.data, options, progress))
                 .collect()
         }
     }
@@ -1163,7 +1201,7 @@ fn encode_independent_payloads(
     {
         entries
             .iter()
-            .map(|entry| encode_independent_payload(entry.data, options))
+            .map(|entry| encode_independent_payload(entry.data, options, progress))
             .collect()
     }
 }
@@ -1190,6 +1228,7 @@ fn encode_or_store_payload(
     data: &[u8],
     options: WriterOptions,
     solid_encoder: &mut Option<SolidEncoder>,
+    progress: Option<&WorkTracker<'_>>,
 ) -> Result<EncodedPayload> {
     let target = options.target;
     if options.compression_level == Some(0) {
@@ -1212,7 +1251,7 @@ fn encode_or_store_payload(
         }
         return encode_rar29_auto_filtered_member(data, encode_options, lz_method, true);
     }
-    let compressed = encode_compressed_payload(data, options, solid_encoder.as_mut())?;
+    let compressed = encode_compressed_payload(data, options, solid_encoder.as_mut(), progress)?;
     if should_store_fallback(target, solid, data.len(), compressed.len()) {
         if solid {
             *solid_encoder = SolidEncoder::for_target(options, true)?;
@@ -1232,32 +1271,60 @@ fn encode_compressed_payload(
     data: &[u8],
     options: WriterOptions,
     solid_encoder: Option<&mut SolidEncoder>,
+    progress: Option<&WorkTracker<'_>>,
 ) -> Result<Vec<u8>> {
     let target = options.target;
-    match (target, solid_encoder) {
-        (ArchiveVersion::Rar15, Some(SolidEncoder::Rar15(encoder))) => {
-            encoder.encode_member(data).map_err(Error::from)
+    let mut last = 0usize;
+    let mut advance = |position: usize| {
+        if position < last {
+            last = 0;
         }
-        (ArchiveVersion::Rar15, None) => unpack15_encode_with_options(
+        let delta = position.saturating_sub(last);
+        last = position;
+        progress.is_none_or(|progress| progress.advance(delta as u64))
+    };
+    match (target, solid_encoder) {
+        (ArchiveVersion::Rar15, Some(SolidEncoder::Rar15(encoder))) => encoder
+            .encode_member_with_progress(data, &mut advance)
+            .map_err(map_codec_cancel),
+        (ArchiveVersion::Rar15, None) => unpack15_encode_with_options_and_progress(
             data,
             rar15_encode_options_for_level(options.compression_level)?,
+            &mut advance,
         )
-        .map_err(Error::from),
-        (ArchiveVersion::Rar20, None) => {
-            unpack20_encode_auto_with_options(data, rar20_encode_options_for_options(options)?)
-                .map_err(Error::from)
-        }
-        (ArchiveVersion::Rar20, Some(SolidEncoder::Rar20(encoder))) => {
-            encoder.encode_member(data).map_err(Error::from)
-        }
+        .map_err(map_codec_cancel),
+        (ArchiveVersion::Rar20, None) => unpack20_encode_auto_with_options_and_progress(
+            data,
+            rar20_encode_options_for_options(options)?,
+            &mut advance,
+        )
+        .map_err(map_codec_cancel),
+        (ArchiveVersion::Rar20, Some(SolidEncoder::Rar20(encoder))) => encoder
+            .encode_member_with_progress(data, &mut advance)
+            .map_err(map_codec_cancel),
         (ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40, None) => {
-            unpack29_encode_literals(data).map_err(Error::from)
+            unpack29_encode_literals_with_options_and_progress(
+                data,
+                Rar29EncodeOptions::default(),
+                &mut advance,
+            )
+            .map_err(map_codec_cancel)
         }
         (
             ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40,
             Some(SolidEncoder::Rar29(encoder)),
-        ) => encoder.encode_member(data).map_err(Error::from),
+        ) => encoder
+            .encode_member_with_progress(data, &mut advance)
+            .map_err(map_codec_cancel),
         _ => Err(Error::UnsupportedVersion(target)),
+    }
+}
+
+fn map_codec_cancel(error: crate::codec::Error) -> Error {
+    if error == crate::codec::Error::Cancelled {
+        Error::Cancelled
+    } else {
+        Error::from(error)
     }
 }
 

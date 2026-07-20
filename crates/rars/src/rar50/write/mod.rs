@@ -3,18 +3,21 @@ pub use crate::codec::rar50::Rar50FilterKind as FilterKind;
 use crate::codec::rar50::{EncodeOptions, Unpack50Encoder};
 use crate::crypto::rar50::{Rar50Cipher, Rar50Keys};
 use crate::recovery::rar5::build_structural_inline_recovery_data_with_progress;
-use crate::write_progress::ProgressReporter;
+use crate::write_progress::{ProgressReporter, WorkTracker};
 use crate::{WriteOperation, WriteProgress, WriteProgressEvent};
 
 mod filter_policy;
 mod volume;
 #[cfg(test)]
 use filter_policy::encode_member_with_filter_policy;
+#[cfg(test)]
+use filter_policy::encode_with_solid_reset_policy;
 use filter_policy::{
     compression_info, compression_method_for_level, dictionary_size_for_options,
     encode_member_with_filter_policy_candidates, encode_option_candidates_for_level,
-    encode_options_for_level, encode_safe_lz_member, encode_with_solid_reset_policy,
-    rar50_algorithm_version, should_store_compressed_payload, validate_compression_level,
+    encode_options_for_level, encode_safe_lz_member_with_progress,
+    encode_with_solid_reset_policy_and_progress, rar50_algorithm_version,
+    should_store_compressed_payload, validate_compression_level,
 };
 use volume::{
     write_compressed_volume_set_impl, write_encrypted_compressed_volume_set_impl,
@@ -277,15 +280,33 @@ impl<'a> Rar50VolumeWriter<'a> {
             Rar50VolumeEntries::Stored(entry) => (false, entry.data.len() as u64, 1),
             Rar50VolumeEntries::EncryptedStored(entry) => (false, entry.data.len() as u64, 1),
         };
+        let total_work = if compressed && self.options.features.solid {
+            match &entries {
+                Rar50VolumeEntries::Compressed(entries) => entries
+                    .iter()
+                    .enumerate()
+                    .map(|(index, entry)| entry.data.len() as u64 * if index == 0 { 1 } else { 2 })
+                    .sum(),
+                Rar50VolumeEntries::EncryptedCompressed(entries) => entries
+                    .iter()
+                    .enumerate()
+                    .map(|(index, entry)| entry.data.len() as u64 * if index == 0 { 1 } else { 2 })
+                    .sum(),
+                _ => total_bytes,
+            }
+        } else {
+            total_bytes
+        };
         if compressed {
             report_operation_started(
                 self.progress,
                 WriteOperation::Compression,
-                total_bytes,
+                total_work,
                 total_entries,
                 1,
             );
         }
+        let work = WorkTracker::new(self.progress, WriteOperation::Compression, total_work);
         let result = match entries {
             Rar50VolumeEntries::Stored(entry) => write_stored_volumes_impl(
                 entry,
@@ -298,6 +319,7 @@ impl<'a> Rar50VolumeWriter<'a> {
                 self.options,
                 max_payload_per_volume,
                 self.recovery_percent,
+                compressed.then_some(&work),
             ),
             Rar50VolumeEntries::EncryptedStored(entry) => write_encrypted_stored_volumes_impl(
                 entry,
@@ -311,14 +333,18 @@ impl<'a> Rar50VolumeWriter<'a> {
                     self.options,
                     max_payload_per_volume,
                     self.recovery_percent,
+                    compressed.then_some(&work),
                 )
             }
         };
         if compressed {
+            if result.is_ok() && !work.finish() {
+                return Err(Error::Cancelled);
+            }
             report_operation_finished(
                 self.progress,
                 WriteOperation::Compression,
-                total_bytes,
+                total_work,
                 total_entries,
                 1,
             );
@@ -447,21 +473,35 @@ impl<'a> Rar50Writer<'a> {
         });
         let total_bytes = self.members.iter().map(Rar50WriteMember::input_size).sum();
         let total_entries = self.members.len();
+        let total_work = if compressed {
+            compression_work_total(
+                &self.members,
+                self.options.features.solid,
+                self.options.compression_level == Some(5)
+                    && self.filter_policy == FilterPolicy::None,
+            )
+        } else {
+            total_bytes
+        };
         if compressed {
             report_operation_started(
                 progress,
                 WriteOperation::Compression,
-                total_bytes,
+                total_work,
                 total_entries,
                 1,
             );
         }
-        let resolved = self.resolve();
+        let work = WorkTracker::new(progress, WriteOperation::Compression, total_work);
+        let resolved = self.resolve(compressed.then_some(&work));
+        if compressed && resolved.is_ok() && !work.finish() {
+            return Err(Error::Cancelled);
+        }
         if compressed {
             report_operation_finished(
                 progress,
                 WriteOperation::Compression,
-                total_bytes,
+                total_work,
                 total_entries,
                 1,
             );
@@ -470,7 +510,11 @@ impl<'a> Rar50Writer<'a> {
         emit_resolved_writer_plan_with_progress(plan, progress)
     }
 
-    fn resolve(self) -> Result<ResolvedRar50WritePlan<'a>> {
+    fn resolve(
+        self,
+        compression_progress: Option<&WorkTracker<'_>>,
+    ) -> Result<ResolvedRar50WritePlan<'a>> {
+        let total_entries = self.members.len();
         let member_kind = self.members.iter().try_fold(None, |seen, member| {
             let kind = member.kind();
             if seen.is_some_and(|seen| seen != kind) {
@@ -597,19 +641,36 @@ impl<'a> Rar50Writer<'a> {
                 if let Some(encoder) = solid_encoder.as_mut() {
                     for (index, member) in self.members.into_iter().enumerate() {
                         let entry = member.into_compressed(self.options.target)?;
+                        let entry_name = entry.name;
+                        let entry_size = entry.data.len() as u64;
+                        if let Some(progress) = compression_progress {
+                            progress.entry_started(index, total_entries, entry_name, entry_size);
+                        }
                         validate_compressed_entry(&entry)?;
                         if compression_method == 0 {
                             resolved_members
                                 .push(ResolvedRar50WriteMember::StoredCompressed(entry));
                             continue;
                         }
-                        let (packed, solid_continuation) = encode_with_solid_reset_policy(
-                            encoder,
-                            entry.data,
-                            algorithm_version,
-                            encode_options,
-                            index,
-                        )?;
+                        let mut last = 0usize;
+                        let mut report = |position: usize| {
+                            if position < last {
+                                last = 0;
+                            }
+                            let delta = position.saturating_sub(last);
+                            last = position;
+                            compression_progress
+                                .is_none_or(|progress| progress.advance(delta as u64))
+                        };
+                        let (packed, solid_continuation) =
+                            encode_with_solid_reset_policy_and_progress(
+                                encoder,
+                                entry.data,
+                                algorithm_version,
+                                encode_options,
+                                index,
+                                Some(&mut report),
+                            )?;
                         if should_store_compressed_payload(
                             entry.data,
                             &packed,
@@ -628,6 +689,9 @@ impl<'a> Rar50Writer<'a> {
                                 solid_continuation,
                             });
                         }
+                        if let Some(progress) = compression_progress {
+                            progress.entry_finished(index, total_entries, entry_name, entry_size);
+                        }
                     }
                 } else {
                     resolved_members = resolve_compressed_members(
@@ -638,6 +702,7 @@ impl<'a> Rar50Writer<'a> {
                         dictionary_size,
                         self.filter_policy,
                         &encode_option_candidates,
+                        compression_progress,
                     )?;
                 }
                 Ok(ResolvedRar50WritePlan {
@@ -768,6 +833,11 @@ impl<'a> Rar50Writer<'a> {
                 if let Some(encoder) = solid_encoder.as_mut() {
                     for (index, member) in self.members.into_iter().enumerate() {
                         let entry = member.into_encrypted_compressed(self.options.target)?;
+                        let entry_name = entry.name;
+                        let entry_size = entry.data.len() as u64;
+                        if let Some(progress) = compression_progress {
+                            progress.entry_started(index, total_entries, entry_name, entry_size);
+                        }
                         validate_encrypted_compressed_entry(&entry)?;
                         if compression_method == 0 {
                             let encrypted = encrypted_stored_payload(entry.data, entry.password)?;
@@ -779,13 +849,25 @@ impl<'a> Rar50Writer<'a> {
                             );
                             continue;
                         }
-                        let (packed, solid_continuation) = encode_with_solid_reset_policy(
-                            encoder,
-                            entry.data,
-                            algorithm_version,
-                            encode_options,
-                            index,
-                        )?;
+                        let mut last = 0usize;
+                        let mut report = |position: usize| {
+                            if position < last {
+                                last = 0;
+                            }
+                            let delta = position.saturating_sub(last);
+                            last = position;
+                            compression_progress
+                                .is_none_or(|progress| progress.advance(delta as u64))
+                        };
+                        let (packed, solid_continuation) =
+                            encode_with_solid_reset_policy_and_progress(
+                                encoder,
+                                entry.data,
+                                algorithm_version,
+                                encode_options,
+                                index,
+                                Some(&mut report),
+                            )?;
                         if should_store_compressed_payload(
                             entry.data,
                             &packed,
@@ -810,6 +892,9 @@ impl<'a> Rar50Writer<'a> {
                                 solid_continuation,
                             });
                         }
+                        if let Some(progress) = compression_progress {
+                            progress.entry_finished(index, total_entries, entry_name, entry_size);
+                        }
                     }
                 } else {
                     resolved_members = resolve_encrypted_compressed_members(
@@ -819,6 +904,7 @@ impl<'a> Rar50Writer<'a> {
                         algorithm_version,
                         dictionary_size,
                         &encode_option_candidates,
+                        compression_progress,
                     )?;
                 }
                 Ok(ResolvedRar50WritePlan {
@@ -972,6 +1058,31 @@ fn mixed_member_plan_error(target: crate::ArchiveVersion) -> Error {
     }
 }
 
+fn compression_work_total(
+    members: &[Rar50WriteMember<'_>],
+    solid: bool,
+    level_five_candidates: bool,
+) -> u64 {
+    members
+        .iter()
+        .enumerate()
+        .map(|(index, member)| {
+            let attempts = if solid {
+                if index == 0 {
+                    1
+                } else {
+                    2
+                }
+            } else if level_five_candidates {
+                5
+            } else {
+                1
+            };
+            member.input_size().saturating_mul(attempts)
+        })
+        .sum()
+}
+
 fn report_operation_started(
     progress: Option<ProgressReporter<'_>>,
     operation: WriteOperation,
@@ -1006,6 +1117,7 @@ fn report_operation_finished(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_compressed_members<'a>(
     members: Vec<Rar50WriteMember<'a>>,
     target: crate::ArchiveVersion,
@@ -1014,33 +1126,42 @@ fn resolve_compressed_members<'a>(
     dictionary_size: u64,
     filter_policy: FilterPolicy,
     encode_option_candidates: &[EncodeOptions],
+    progress: Option<&WorkTracker<'_>>,
 ) -> Result<Vec<ResolvedRar50WriteMember<'a>>> {
+    let total_entries = members.len();
+    let members: Vec<_> = members.into_iter().enumerate().collect();
     #[cfg(feature = "parallel")]
     {
         if members.len() > 1 {
-            crate::parallel::map_collect(members, |member| {
+            crate::parallel::map_collect(members, |(index, member)| {
                 resolve_compressed_member(
                     member,
+                    index,
+                    total_entries,
                     target,
                     compression_method,
                     algorithm_version,
                     dictionary_size,
                     filter_policy,
                     encode_option_candidates,
+                    progress,
                 )
             })
         } else {
             members
                 .into_iter()
-                .map(|member| {
+                .map(|(index, member)| {
                     resolve_compressed_member(
                         member,
+                        index,
+                        total_entries,
                         target,
                         compression_method,
                         algorithm_version,
                         dictionary_size,
                         filter_policy,
                         encode_option_candidates,
+                        progress,
                     )
                 })
                 .collect()
@@ -1050,53 +1171,132 @@ fn resolve_compressed_members<'a>(
     {
         members
             .into_iter()
-            .map(|member| {
+            .map(|(index, member)| {
                 resolve_compressed_member(
                     member,
+                    index,
+                    total_entries,
                     target,
                     compression_method,
                     algorithm_version,
                     dictionary_size,
                     filter_policy,
                     encode_option_candidates,
+                    progress,
                 )
             })
             .collect()
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_compressed_member<'a>(
     member: Rar50WriteMember<'a>,
+    index: usize,
+    total_entries: usize,
     target: crate::ArchiveVersion,
     compression_method: u8,
     algorithm_version: u8,
     dictionary_size: u64,
     filter_policy: FilterPolicy,
     encode_option_candidates: &[EncodeOptions],
+    progress: Option<&WorkTracker<'_>>,
 ) -> Result<ResolvedRar50WriteMember<'a>> {
     let entry = member.into_compressed(target)?;
+    let entry_name = entry.name;
+    let entry_size = entry.data.len() as u64;
+    if let Some(progress) = progress {
+        progress.entry_started(index, total_entries, entry_name, entry_size);
+    }
     validate_compressed_entry(&entry)?;
     if compression_method == 0 {
+        if let Some(progress) = progress {
+            progress.entry_finished(index, total_entries, entry_name, entry_size);
+        }
         return Ok(ResolvedRar50WriteMember::StoredCompressed(entry));
     }
-    let packed = encode_member_with_filter_policy_candidates(
-        entry.data,
-        algorithm_version,
-        filter_policy,
-        encode_option_candidates,
-    )?;
-    if should_store_compressed_payload(entry.data, &packed, false, filter_policy) {
-        Ok(ResolvedRar50WriteMember::StoredCompressed(entry))
+    let packed = if filter_policy == FilterPolicy::None {
+        encode_candidates_with_progress(
+            entry.data,
+            algorithm_version,
+            encode_option_candidates,
+            progress,
+        )?
     } else {
-        Ok(ResolvedRar50WriteMember::Compressed {
+        let packed = encode_member_with_filter_policy_candidates(
+            entry.data,
+            algorithm_version,
+            filter_policy,
+            encode_option_candidates,
+        )?;
+        if let Some(progress) = progress {
+            progress.advance(entry.data.len() as u64);
+        }
+        packed
+    };
+    if should_store_compressed_payload(entry.data, &packed, false, filter_policy) {
+        let resolved = ResolvedRar50WriteMember::StoredCompressed(entry);
+        if let Some(progress) = progress {
+            progress.entry_finished(index, total_entries, entry_name, entry_size);
+        }
+        Ok(resolved)
+    } else {
+        let resolved = ResolvedRar50WriteMember::Compressed {
             entry,
             packed,
             algorithm_version,
             compression_method,
             dictionary_size,
             solid_continuation: false,
-        })
+        };
+        if let Some(progress) = progress {
+            progress.entry_finished(index, total_entries, entry_name, entry_size);
+        }
+        Ok(resolved)
     }
+}
+
+fn encode_candidates_with_progress(
+    data: &[u8],
+    algorithm_version: u8,
+    candidates: &[EncodeOptions],
+    progress: Option<&WorkTracker<'_>>,
+) -> Result<Vec<u8>> {
+    let (first, rest) = candidates.split_first().ok_or(Error::InvalidHeader(
+        "RAR 5 compression level has no encoder options",
+    ))?;
+    let mut last = 0usize;
+    let mut report = |position: usize| {
+        if position < last {
+            last = 0;
+        }
+        let delta = position.saturating_sub(last);
+        last = position;
+        progress.is_none_or(|progress| progress.advance(delta as u64))
+    };
+    let mut best =
+        match encode_safe_lz_member_with_progress(data, algorithm_version, *first, &mut report) {
+            Err(Error::Codec(crate::codec::Error::Cancelled)) => return Err(Error::Cancelled),
+            result => result?,
+        };
+    for options in rest {
+        if progress.is_some_and(WorkTracker::is_cancelled) {
+            return Err(Error::Cancelled);
+        }
+        let packed = match encode_safe_lz_member_with_progress(
+            data,
+            algorithm_version,
+            *options,
+            &mut report,
+        ) {
+            Err(Error::Codec(crate::codec::Error::Cancelled)) => return Err(Error::Cancelled),
+            result => result?,
+        };
+        if packed.len() < best.len() {
+            best = packed;
+        }
+    }
+    Ok(best)
 }
 
 fn resolve_encrypted_compressed_members<'a>(
@@ -1106,31 +1306,40 @@ fn resolve_encrypted_compressed_members<'a>(
     algorithm_version: u8,
     dictionary_size: u64,
     encode_option_candidates: &[EncodeOptions],
+    progress: Option<&WorkTracker<'_>>,
 ) -> Result<Vec<ResolvedRar50WriteMember<'a>>> {
+    let total_entries = members.len();
+    let members: Vec<_> = members.into_iter().enumerate().collect();
     #[cfg(feature = "parallel")]
     {
         if members.len() > 1 {
-            crate::parallel::map_collect(members, |member| {
+            crate::parallel::map_collect(members, |(index, member)| {
                 resolve_encrypted_compressed_member(
                     member,
+                    index,
+                    total_entries,
                     target,
                     compression_method,
                     algorithm_version,
                     dictionary_size,
                     encode_option_candidates,
+                    progress,
                 )
             })
         } else {
             members
                 .into_iter()
-                .map(|member| {
+                .map(|(index, member)| {
                     resolve_encrypted_compressed_member(
                         member,
+                        index,
+                        total_entries,
                         target,
                         compression_method,
                         algorithm_version,
                         dictionary_size,
                         encode_option_candidates,
+                        progress,
                     )
                 })
                 .collect()
@@ -1140,54 +1349,74 @@ fn resolve_encrypted_compressed_members<'a>(
     {
         members
             .into_iter()
-            .map(|member| {
+            .map(|(index, member)| {
                 resolve_encrypted_compressed_member(
                     member,
+                    index,
+                    total_entries,
                     target,
                     compression_method,
                     algorithm_version,
                     dictionary_size,
                     encode_option_candidates,
+                    progress,
                 )
             })
             .collect()
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_encrypted_compressed_member<'a>(
     member: Rar50WriteMember<'a>,
+    index: usize,
+    total_entries: usize,
     target: crate::ArchiveVersion,
     compression_method: u8,
     algorithm_version: u8,
     dictionary_size: u64,
     encode_option_candidates: &[EncodeOptions],
+    progress: Option<&WorkTracker<'_>>,
 ) -> Result<ResolvedRar50WriteMember<'a>> {
     let entry = member.into_encrypted_compressed(target)?;
+    let entry_name = entry.name;
+    let entry_size = entry.data.len() as u64;
+    if let Some(progress) = progress {
+        progress.entry_started(index, total_entries, entry_name, entry_size);
+    }
     validate_encrypted_compressed_entry(&entry)?;
     if compression_method == 0 {
         let encrypted = encrypted_stored_payload(entry.data, entry.password)?;
+        if let Some(progress) = progress {
+            progress.entry_finished(index, total_entries, entry_name, entry_size);
+        }
         return Ok(ResolvedRar50WriteMember::EncryptedStoredCompressed { entry, encrypted });
     }
-    let packed = encode_member_with_filter_policy_candidates(
+    let packed = encode_candidates_with_progress(
         entry.data,
         algorithm_version,
-        FilterPolicy::None,
         encode_option_candidates,
+        progress,
     )?;
-    if should_store_compressed_payload(entry.data, &packed, false, FilterPolicy::None) {
-        let encrypted = encrypted_stored_payload(entry.data, entry.password)?;
-        Ok(ResolvedRar50WriteMember::EncryptedStoredCompressed { entry, encrypted })
-    } else {
-        let encrypted = encrypted_payload(&packed, entry.data, entry.password)?;
-        Ok(ResolvedRar50WriteMember::EncryptedCompressed {
-            entry,
-            encrypted,
-            algorithm_version,
-            compression_method,
-            dictionary_size,
-            solid_continuation: false,
-        })
+    let resolved =
+        if should_store_compressed_payload(entry.data, &packed, false, FilterPolicy::None) {
+            let encrypted = encrypted_stored_payload(entry.data, entry.password)?;
+            ResolvedRar50WriteMember::EncryptedStoredCompressed { entry, encrypted }
+        } else {
+            let encrypted = encrypted_payload(&packed, entry.data, entry.password)?;
+            ResolvedRar50WriteMember::EncryptedCompressed {
+                entry,
+                encrypted,
+                algorithm_version,
+                compression_method,
+                dictionary_size,
+                solid_continuation: false,
+            }
+        };
+    if let Some(progress) = progress {
+        progress.entry_finished(index, total_entries, entry_name, entry_size);
     }
+    Ok(resolved)
 }
 
 struct ResolvedRar50WritePlan<'a> {
@@ -2745,6 +2974,45 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct CollectWriter(Rc<RefCell<Vec<u8>>>);
+
+    #[test]
+    fn compressed_writer_reports_determinate_progress() {
+        let data = b"compression progress payload ".repeat(4096);
+        let entry = CompressedEntry {
+            name: b"payload.bin",
+            data: &data,
+            mtime: None,
+            attributes: 0x20,
+            host_os: 1,
+        };
+        let last = std::sync::atomic::AtomicU64::new(0);
+        let advances = AtomicUsize::new(0);
+        let reporter = |event: WriteProgressEvent<'_>| {
+            if let WriteProgressEvent::Advanced {
+                operation: WriteOperation::Compression,
+                completed_bytes,
+                total_bytes,
+                ..
+            } = event
+            {
+                assert!(completed_bytes >= last.swap(completed_bytes, Ordering::Relaxed));
+                assert!(completed_bytes <= total_bytes);
+                advances.fetch_add(1, Ordering::Relaxed);
+            }
+        };
+
+        Rar50Writer::new(WriterOptions::new(
+            ArchiveVersion::Rar70,
+            FeatureSet::default(),
+        ))
+        .compressed_entries(&[entry])
+        .progress(&reporter)
+        .finish()
+        .unwrap();
+
+        assert!(advances.load(Ordering::Relaxed) >= 1);
+        assert_eq!(last.load(Ordering::Relaxed), data.len() as u64);
+    }
 
     #[test]
     fn recovery_writer_reports_determinate_pass_progress() {

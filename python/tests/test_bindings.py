@@ -47,6 +47,36 @@ def test_builder_creates_archive_and_rewrite_model():
     assert output.read("renamed.txt") == b"two"
 
 
+def test_builder_reports_compression_progress():
+    builder = rars.RarBuilder(format="rar70", compression=3, solid=True)
+    builder.add_bytes(b"progress payload " * 8192, "payload.txt")
+    events = []
+
+    data = builder.to_bytes(progress=events.append)
+
+    assert data
+    assert events
+    compression = [event for event in events if event.phase == "compression"]
+    assert compression
+    assert compression[-1].completed == compression[-1].total
+    assert compression[-1].percentage == 100.0
+    assert all(left.completed <= right.completed for left, right in zip(compression, compression[1:]))
+
+
+def test_builder_progress_exception_cancels_and_is_reraised():
+    builder = rars.RarBuilder(format="rar50", compression=3)
+    builder.add_bytes(b"cancel me " * 8192, "payload.txt")
+
+    class StopCompression(Exception):
+        pass
+
+    def stop(_event):
+        raise StopCompression("stop now")
+
+    with pytest.raises(StopCompression, match="stop now"):
+        builder.to_bytes(progress=stop)
+
+
 def test_builder_writes_and_extracts_volumes(tmp_path):
     builder = rars.RarBuilder(format="rar50", store=True, volume_size=64)
     builder.add_bytes(b"0123456789" * 20, "large.txt")
