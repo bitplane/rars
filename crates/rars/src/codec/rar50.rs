@@ -640,6 +640,7 @@ fn filtered_lz_blocks(
     history: &[u8],
     algorithm_version: u8,
     options: EncodeOptions,
+    mut progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<u8>> {
     let filters = normalized_filter_specs(data.len(), filters)?;
     let mut out = Vec::new();
@@ -667,6 +668,11 @@ fn filtered_lz_blocks(
                 channels,
             });
         }
+        let mut chunk_progress = |position: usize| {
+            progress
+                .as_deref_mut()
+                .is_none_or(|report| report(chunk_start.saturating_add(position)))
+        };
         out.extend(encode_lz_block(
             &chunk,
             &block_history,
@@ -674,7 +680,7 @@ fn filtered_lz_blocks(
             &records,
             options,
             chunk_end == data.len(),
-            None,
+            Some(&mut chunk_progress),
         )?);
         block_history.extend_from_slice(&chunk);
         let keep_from = block_history
@@ -987,6 +993,7 @@ impl Unpack50Encoder {
                 &self.history,
                 algorithm_version,
                 self.options,
+                None,
             )?;
             self.remember(input);
             return Ok(packed);
@@ -1000,6 +1007,37 @@ impl Unpack50Encoder {
             self.options,
             None,
         )?;
+        self.remember(input);
+        Ok(packed)
+    }
+
+    pub(crate) fn encode_member_with_filters_and_progress(
+        &mut self,
+        input: &[u8],
+        algorithm_version: u8,
+        filters: &[Rar50FilterSpec],
+        progress: &mut dyn FnMut(usize) -> bool,
+    ) -> Result<Vec<u8>> {
+        let packed = if input.len() > MAX_FILTER_BLOCK_LENGTH {
+            filtered_lz_blocks(
+                input,
+                filters,
+                &self.history,
+                algorithm_version,
+                self.options,
+                Some(progress),
+            )?
+        } else {
+            let (filtered, records) = filtered_lz_member(input, filters)?;
+            encode_lz_member_inner(
+                &filtered,
+                &self.history,
+                algorithm_version,
+                &records,
+                self.options,
+                Some(progress),
+            )?
+        };
         self.remember(input);
         Ok(packed)
     }

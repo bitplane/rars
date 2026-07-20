@@ -14,10 +14,10 @@ use filter_policy::encode_member_with_filter_policy;
 use filter_policy::encode_with_solid_reset_policy;
 use filter_policy::{
     compression_info, compression_method_for_level, dictionary_size_for_options,
-    encode_member_with_filter_policy_candidates, encode_option_candidates_for_level,
+    encode_member_with_filter_policy_candidates_and_progress, encode_option_candidates_for_level,
     encode_options_for_level, encode_safe_lz_member_with_progress,
-    encode_with_solid_reset_policy_and_progress, rar50_algorithm_version,
-    should_store_compressed_payload, validate_compression_level,
+    encode_with_solid_reset_policy_and_progress, filter_policy_attempt_count,
+    rar50_algorithm_version, should_store_compressed_payload, validate_compression_level,
 };
 use volume::{
     write_compressed_volume_set_impl, write_encrypted_compressed_volume_set_impl,
@@ -477,8 +477,12 @@ impl<'a> Rar50Writer<'a> {
             compression_work_total(
                 &self.members,
                 self.options.features.solid,
-                self.options.compression_level == Some(5)
-                    && self.filter_policy == FilterPolicy::None,
+                self.filter_policy,
+                encode_option_candidates_for_level(
+                    self.options.compression_level,
+                    dictionary_size_for_options(self.options)?,
+                )?
+                .len() as u64,
             )
         } else {
             total_bytes
@@ -972,6 +976,17 @@ impl<'a> Rar50WriteMember<'a> {
         }
     }
 
+    fn input_data(&self) -> &'a [u8] {
+        match self {
+            Self::Stored(entry) => entry.data,
+            Self::StoredWithServices(entry) => entry.entry.data,
+            Self::Compressed(entry) => entry.data,
+            Self::EncryptedStored(entry) => entry.data,
+            Self::EncryptedStoredWithServices(entry) => entry.entry.data,
+            Self::EncryptedCompressed(entry) => entry.data,
+        }
+    }
+
     fn into_stored(self, target: crate::ArchiveVersion) -> Result<StoredEntry<'a>> {
         match self {
             Self::Stored(entry) => Ok(entry),
@@ -1061,7 +1076,8 @@ fn mixed_member_plan_error(target: crate::ArchiveVersion) -> Error {
 fn compression_work_total(
     members: &[Rar50WriteMember<'_>],
     solid: bool,
-    level_five_candidates: bool,
+    filter_policy: FilterPolicy,
+    option_candidates: u64,
 ) -> u64 {
     members
         .iter()
@@ -1073,10 +1089,11 @@ fn compression_work_total(
                 } else {
                     2
                 }
-            } else if level_five_candidates {
-                5
             } else {
-                1
+                option_candidates.saturating_mul(filter_policy_attempt_count(
+                    member.input_data(),
+                    filter_policy,
+                ))
             };
             member.input_size().saturating_mul(attempts)
         })
@@ -1223,16 +1240,22 @@ fn resolve_compressed_member<'a>(
             progress,
         )?
     } else {
-        let packed = encode_member_with_filter_policy_candidates(
+        let mut last = 0usize;
+        let mut report = |position: usize| {
+            if position < last {
+                last = 0;
+            }
+            let delta = position.saturating_sub(last);
+            last = position;
+            progress.is_none_or(|progress| progress.advance(delta as u64))
+        };
+        encode_member_with_filter_policy_candidates_and_progress(
             entry.data,
             algorithm_version,
             filter_policy,
             encode_option_candidates,
-        )?;
-        if let Some(progress) = progress {
-            progress.advance(entry.data.len() as u64);
-        }
-        packed
+            Some(&mut report),
+        )?
     };
     if should_store_compressed_payload(entry.data, &packed, false, filter_policy) {
         let resolved = ResolvedRar50WriteMember::StoredCompressed(entry);
@@ -2959,7 +2982,8 @@ fn write_vint(out: &mut Vec<u8>, mut value: u64) {
 mod tests {
     use super::filter_policy::{
         auto_delta_filter_range, disjoint_filter_ranges, encode_member_with_auto_size_filter,
-        encode_member_with_filter_spec, encode_member_with_filter_specs,
+        encode_member_with_filter_policy_candidates, encode_member_with_filter_spec,
+        encode_member_with_filter_specs,
     };
     use super::*;
     use crate::codec::rar50::{encode_literal_only, encode_lz_member};
@@ -2977,7 +3001,9 @@ mod tests {
 
     #[test]
     fn compressed_writer_reports_determinate_progress() {
-        let data = b"compression progress payload ".repeat(4096);
+        let data: Vec<u8> = (0usize..128 * 1024)
+            .map(|i| (i.wrapping_mul(37) % 251) as u8)
+            .collect();
         let entry = CompressedEntry {
             name: b"payload.bin",
             data: &data,
@@ -2987,6 +3013,7 @@ mod tests {
         };
         let last = std::sync::atomic::AtomicU64::new(0);
         let advances = AtomicUsize::new(0);
+        let intermediate = std::sync::atomic::AtomicBool::new(false);
         let reporter = |event: WriteProgressEvent<'_>| {
             if let WriteProgressEvent::Advanced {
                 operation: WriteOperation::Compression,
@@ -2997,6 +3024,9 @@ mod tests {
             {
                 assert!(completed_bytes >= last.swap(completed_bytes, Ordering::Relaxed));
                 assert!(completed_bytes <= total_bytes);
+                if completed_bytes < total_bytes {
+                    intermediate.store(true, Ordering::Relaxed);
+                }
                 advances.fetch_add(1, Ordering::Relaxed);
             }
         };
@@ -3006,12 +3036,14 @@ mod tests {
             FeatureSet::default(),
         ))
         .compressed_entries(&[entry])
+        .filter_policy(FilterPolicy::AutoSize)
         .progress(&reporter)
         .finish()
         .unwrap();
 
         assert!(advances.load(Ordering::Relaxed) >= 1);
-        assert_eq!(last.load(Ordering::Relaxed), data.len() as u64);
+        assert!(intermediate.load(Ordering::Relaxed));
+        assert!(last.load(Ordering::Relaxed) > data.len() as u64);
     }
 
     #[test]
