@@ -116,6 +116,25 @@ impl CliProgress {
         }
     }
 
+    fn work_bar(&self, message: String, total: u64) {
+        self.set_plain_state(true, &message);
+        self.determinate.store(true, Ordering::Relaxed);
+        self.reset_plain_percent();
+        self.bar.reset();
+        self.bar.disable_steady_tick();
+        self.bar.set_length(total);
+        self.bar.set_position(0);
+        self.bar.reset_elapsed();
+        self.bar.set_style(
+            ProgressStyle::with_template(
+                "[{elapsed_precise}] {bar:32.cyan/blue} {percent:>3}% ETA {eta} {wide_msg}",
+            )
+            .expect("valid compression progress bar template")
+            .progress_chars("=>-"),
+        );
+        self.bar.set_message(message);
+    }
+
     pub(crate) fn advance(&self, bytes: u64) {
         if self.mode == RenderMode::Terminal {
             self.bar.inc(bytes);
@@ -210,7 +229,13 @@ impl WriteProgress for CliProgress {
             } => {
                 if self.mode == RenderMode::Terminal {
                     if !self.determinate.swap(true, Ordering::Relaxed) {
-                        self.bar(operation_label(operation, pass), total_bytes);
+                        let current = self.bar.message();
+                        let message = if current.is_empty() {
+                            operation_label(operation, pass)
+                        } else {
+                            current.to_string()
+                        };
+                        self.work_bar(message, total_bytes);
                     }
                     self.bar.set_length(total_bytes);
                     self.bar.set_position(completed_bytes);
