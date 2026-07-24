@@ -656,7 +656,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rars"
-version = "0.4.6"
+version = "0.4.7"
 dependencies = [
  "aes",
  "aho-corasick",
@@ -671,7 +671,7 @@ dependencies = [
 
 [[package]]
 name = "rars-cli"
-version = "0.4.6"
+version = "0.4.7"
 dependencies = [
  "clap",
  "indicatif",
@@ -684,7 +684,7 @@ dependencies = [
 
 [[package]]
 name = "rars-python"
-version = "0.4.6"
+version = "0.4.7"
 dependencies = [
  "libc",
  "pyo3",
