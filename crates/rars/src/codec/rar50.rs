@@ -13,7 +13,6 @@ pub const LENGTH_TABLE_SIZE: usize = 44;
 const DEFAULT_DICTIONARY_SIZE: usize = 4 * 1024 * 1024;
 const MAX_INITIAL_OUTPUT_CAPACITY: usize = 1024 * 1024;
 const STREAM_FLUSH_THRESHOLD: usize = 64 * 1024;
-const STREAM_HISTORY_LIMIT: usize = 64 * 1024 * 1024;
 const MAX_ENCODER_MATCH_OFFSET: usize = DEFAULT_DICTIONARY_SIZE;
 const MAX_ENCODER_MATCH_LENGTH: usize = 4096;
 const MAX_COMPRESSED_BLOCK_OUTPUT: usize = 4 * 1024 * 1024;
@@ -1682,7 +1681,11 @@ impl Unpack50Decoder {
             self.reset();
         }
 
-        let history_limit = dictionary_size.min(STREAM_HISTORY_LIMIT);
+        // VecDeque grows as decoded bytes arrive, so using the declared
+        // dictionary here does not allocate a potentially huge RAR 7 window
+        // up front. It does, however, retain every byte that a legal match may
+        // reference instead of silently truncating the window at 64 MiB.
+        let history_limit = dictionary_size;
         if self.history.len() > history_limit {
             let discard = self.history.len() - history_limit;
             self.history.drain(..discard);
@@ -3860,6 +3863,52 @@ mod tests {
             .unwrap();
         assert_eq!(decoded, b"BAAB");
         assert_eq!(decoder.history, b"BABAAB");
+    }
+
+    #[test]
+    fn streaming_window_accepts_match_beyond_old_64_mib_cap() {
+        const OLD_STREAM_HISTORY_LIMIT: usize = 64 * 1024 * 1024;
+        let distance = OLD_STREAM_HISTORY_LIMIT + 1;
+        let history = vec![b'A'; distance];
+        let mut output = StreamingOutput::new(history, 1, distance, distance);
+        let mut decoded = Vec::new();
+
+        output
+            .copy_match(distance, 1, &mut |chunk| {
+                match chunk {
+                    DecodedChunk::Bytes(bytes) => decoded.extend_from_slice(bytes),
+                    DecodedChunk::Repeated { byte, len } => {
+                        decoded.extend(std::iter::repeat_n(byte, len));
+                    }
+                }
+                Ok::<(), std::io::Error>(())
+            })
+            .unwrap();
+        output
+            .finish(&mut |chunk| {
+                match chunk {
+                    DecodedChunk::Bytes(bytes) => decoded.extend_from_slice(bytes),
+                    DecodedChunk::Repeated { byte, len } => {
+                        decoded.extend(std::iter::repeat_n(byte, len));
+                    }
+                }
+                Ok::<(), std::io::Error>(())
+            })
+            .unwrap();
+
+        assert_eq!(decoded, b"A");
+    }
+
+    #[test]
+    fn streaming_window_rejects_match_beyond_declared_dictionary() {
+        let mut output = StreamingOutput::new(vec![b'A'; 8], 1, 7, 8);
+
+        assert!(matches!(
+            output.copy_match(8, 1, &mut |_| Ok::<(), std::io::Error>(())),
+            Err(StreamDecodeError::Decode(Error::InvalidData(
+                "RAR 5 match distance exceeds dictionary"
+            )))
+        ));
     }
 
     fn literal_only_payload(data: &[u8]) -> Vec<u8> {
