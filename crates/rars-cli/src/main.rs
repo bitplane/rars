@@ -1074,6 +1074,8 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
     let input_paths = input_paths.as_slice();
     let compress = !store;
 
+    validate_archive_output_path(&archive_path)?;
+
     if quick_open && !matches!(target, ArchiveVersion::Rar50 | ArchiveVersion::Rar70) {
         return Err("Quick Open is only available for RAR 5+ writers".into());
     }
@@ -1825,6 +1827,37 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
             Ok(())
         }
     }
+}
+
+fn validate_archive_output_path(path: &Path) -> CliResult<()> {
+    if path == Path::new("-") || path == Path::new("/dev/stdout") {
+        return Ok(());
+    }
+    if path.is_dir() || has_trailing_path_separator(path) {
+        return Err(format!(
+            "archive output path '{}' is a directory; provide an archive filename",
+            path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn has_trailing_path_separator(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    path.as_os_str().as_bytes().last() == Some(&b'/')
+}
+
+#[cfg(windows)]
+fn has_trailing_path_separator(path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+
+    path.as_os_str()
+        .encode_wide()
+        .last()
+        .is_some_and(|ch| ch == b'/' as u16 || ch == b'\\' as u16)
 }
 
 fn write_archive_output(path: &Path, bytes: &[u8], progress: &CliProgress) -> CliResult<()> {

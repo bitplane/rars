@@ -1242,6 +1242,38 @@ fn add_rejects_symlink_input() {
 }
 
 #[test]
+fn add_rejects_directory_archive_path_before_scanning_inputs() {
+    let dir = scratch("add-directory-archive-path");
+    let source = dir.join("source.txt");
+    fs::write(&source, b"source\n").unwrap();
+
+    let existing = dir.join("existing-directory");
+    fs::create_dir(&existing).unwrap();
+    let missing_with_separator = format!(
+        "{}{}",
+        dir.join("missing-directory").display(),
+        std::path::MAIN_SEPARATOR
+    );
+
+    for archive in [existing.display().to_string(), missing_with_separator] {
+        let create = rars()
+            .args(["a", "--format", "rar50", "--store"])
+            .arg(&archive)
+            .arg(&source)
+            .output()
+            .unwrap();
+
+        assert!(!create.status.success());
+        let stderr = stderr(&create);
+        assert!(
+            stderr.contains("is a directory; provide an archive filename"),
+            "stderr: {stderr}"
+        );
+        assert!(!stderr.contains("Scanning inputs"), "stderr: {stderr}");
+    }
+}
+
+#[test]
 fn add_recurses_directory_inputs_and_preserves_relative_paths() {
     let dir = scratch("add-recursive-relative");
     let tree = dir.join("tree");
