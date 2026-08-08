@@ -1810,14 +1810,28 @@ impl Unpack50Decoder {
         {
             return Err(Error::InvalidData("RAR 5 match exceeds output limit"));
         }
-        for _ in 0..length {
+        let mut remaining = length;
+        while remaining > 0 {
             if distance <= output.len() {
-                let index = output.len() - distance;
-                output.push(output[index]);
+                // The match lies entirely in already-decoded output: copy in
+                // runs rather than one byte at a time.
+                if distance == 1 {
+                    // A one-byte repeat is a fill, not a copy.
+                    let b = output[output.len() - 1];
+                    output.resize(output.len() + remaining, b);
+                    remaining = 0;
+                } else {
+                    let start = output.len() - distance;
+                    let take = remaining.min(distance);
+                    output.extend_from_within(start..start + take);
+                    remaining -= take;
+                }
             } else {
                 let history_distance = distance - output.len();
                 let index = self.history.len() - history_distance;
-                output.push(self.history[index]);
+                let take = remaining.min(history_distance);
+                output.extend_from_slice(&self.history[index..index + take]);
+                remaining -= take;
             }
         }
         Ok(())
