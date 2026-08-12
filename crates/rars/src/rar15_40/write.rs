@@ -1029,7 +1029,8 @@ fn rar20_encode_options_for_level(level: Option<u8>) -> Result<Rar20EncodeOption
 }
 
 fn rar20_encode_options_for_options(options: WriterOptions) -> Result<Rar20EncodeOptions> {
-    rar20_encode_options_for_level(options.compression_level)
+    Ok(rar20_encode_options_for_level(options.compression_level)?
+        .with_max_match_distance(dictionary_size_for_options(options)?))
 }
 
 fn rar15_encode_options_for_level(level: Option<u8>) -> Result<Rar15EncodeOptions> {
@@ -2113,8 +2114,9 @@ mod tests {
     use super::{
         auto_delta_filter_range, auto_x86_filter_ranges, disjoint_filter_ranges,
         encode_rar29_auto_filtered_member, encode_rar29_filtered_member,
-        encode_rar29_filtered_members, is_audio_filter_candidate, rar29_encode_options_for_options,
-        FilterKind, FilterSpec, AUTO_DELTA_EDGE_SKIP, RAR29_LARGE_TEXT_PPMD_THRESHOLD,
+        encode_rar29_filtered_members, is_audio_filter_candidate, rar20_encode_options_for_options,
+        rar29_encode_options_for_options, FilterKind, FilterSpec, AUTO_DELTA_EDGE_SKIP,
+        RAR29_LARGE_TEXT_PPMD_THRESHOLD,
     };
     use crate::codec::rar29::{unpack29_decode, EncodeOptions};
     use crate::{ArchiveVersion, FeatureSet};
@@ -2392,6 +2394,28 @@ mod tests {
             .unwrap()
             .max_match_distance,
             4 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn rar20_options_cap_match_distance_to_header_dictionary() {
+        assert_eq!(
+            rar20_encode_options_for_options(super::WriterOptions::new(
+                ArchiveVersion::Rar20,
+                FeatureSet::store_only(),
+            ))
+            .unwrap()
+            .max_match_distance,
+            64 * 1024
+        );
+        assert_eq!(
+            rar20_encode_options_for_options(
+                super::WriterOptions::new(ArchiveVersion::Rar20, FeatureSet::store_only())
+                    .with_dictionary_size(1024 * 1024),
+            )
+            .unwrap()
+            .max_match_distance,
+            1024 * 1024
         );
     }
 }
