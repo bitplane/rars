@@ -329,123 +329,42 @@ fn encode_rar29_auto_filtered_member(
     if is_text_ppmd_candidate(data) {
         return Ok(best);
     }
-    let mut candidates = Vec::new();
+    // Filter choice depends on how the transformed data compresses relative
+    // to the alternatives, not on squeezing out the last few bits, so a cheap
+    // greedy parse ranks candidates almost identically to the full-effort
+    // parse at a fraction of the cost. Cheap sizes are only comparable to
+    // other cheap sizes, so the no-filter reference is ranked at the same
+    // effort and only the winner is re-encoded with the real options.
+    let ranking_options = rar29_filter_ranking_options(options);
+    let filter_candidates = rar29_auto_filter_candidates(data);
+    let none_rank = unpack29_encode_literals_with_options(data, ranking_options)
+        .map_err(Error::from)?
+        .len();
+    let mut winner: Option<&[FilterSpec]> = None;
+    let mut winner_rank = none_rank;
+    for specs in &filter_candidates {
+        let rank = encode_rar29_filtered_members(data, specs, ranking_options)?.len();
+        if rank < winner_rank {
+            winner_rank = rank;
+            winner = Some(specs);
+        }
+    }
+    if let Some(specs) = winner {
+        let packed = encode_rar29_filtered_members(data, specs, options)?;
+        if packed.len() < best.data.len() {
+            best = EncodedPayload {
+                data: packed,
+                method: lz_method,
+            };
+        }
+    }
     if include_ppmd && is_auto_ppmd_candidate(data) {
-        candidates.push(EncodedPayload {
+        let ppmd = EncodedPayload {
             data: unpack29_encode_ppmd(data).map_err(Error::from)?,
             method: 0x35,
-        });
-    }
-    candidates.extend([
-        EncodedPayload {
-            data: encode_rar29_filtered_member(data, FilterSpec::whole(FilterKind::E8), options)?,
-            method: lz_method,
-        },
-        EncodedPayload {
-            data: encode_rar29_filtered_member(data, FilterSpec::whole(FilterKind::E8E9), options)?,
-            method: lz_method,
-        },
-        EncodedPayload {
-            data: encode_rar29_filtered_member(
-                data,
-                FilterSpec::whole(FilterKind::Itanium),
-                options,
-            )?,
-            method: lz_method,
-        },
-    ]);
-    let e8_candidates = auto_x86_filter_ranges(data, false);
-    for range in e8_candidates.iter().cloned() {
-        candidates.push(EncodedPayload {
-            data: encode_rar29_filtered_member(
-                data,
-                FilterSpec::range(FilterKind::E8, range),
-                options,
-            )?,
-            method: lz_method,
-        });
-    }
-    let e8_ranges = disjoint_filter_ranges(e8_candidates);
-    if e8_ranges.len() > 1 {
-        let filters: Vec<_> = e8_ranges
-            .into_iter()
-            .map(|range| FilterSpec::range(FilterKind::E8, range))
-            .collect();
-        candidates.push(EncodedPayload {
-            data: encode_rar29_filtered_members(data, &filters, options)?,
-            method: lz_method,
-        });
-    }
-    let e8e9_candidates = auto_x86_filter_ranges(data, true);
-    for range in e8e9_candidates.iter().cloned() {
-        candidates.push(EncodedPayload {
-            data: encode_rar29_filtered_member(
-                data,
-                FilterSpec::range(FilterKind::E8E9, range),
-                options,
-            )?,
-            method: lz_method,
-        });
-    }
-    let e8e9_ranges = disjoint_filter_ranges(e8e9_candidates);
-    if e8e9_ranges.len() > 1 {
-        let filters: Vec<_> = e8e9_ranges
-            .into_iter()
-            .map(|range| FilterSpec::range(FilterKind::E8E9, range))
-            .collect();
-        candidates.push(EncodedPayload {
-            data: encode_rar29_filtered_members(data, &filters, options)?,
-            method: lz_method,
-        });
-    }
-    for channels in 1..=4 {
-        candidates.push(EncodedPayload {
-            data: encode_rar29_filtered_member(
-                data,
-                FilterSpec::whole(FilterKind::Delta { channels }),
-                options,
-            )?,
-            method: lz_method,
-        });
-        if is_audio_filter_candidate(data, channels) {
-            candidates.push(EncodedPayload {
-                data: encode_rar29_filtered_member(
-                    data,
-                    FilterSpec::whole(FilterKind::Audio { channels }),
-                    options,
-                )?,
-                method: lz_method,
-            });
-        }
-    }
-    for channels in 1..=4 {
-        if let Some(range) = auto_delta_filter_range(data, channels) {
-            candidates.push(EncodedPayload {
-                data: encode_rar29_filtered_member(
-                    data,
-                    FilterSpec::range(FilterKind::Delta { channels }, range),
-                    options,
-                )?,
-                method: lz_method,
-            });
-        }
-    }
-    for width in AUTO_RGB_WIDTHS {
-        if data.len() >= width {
-            candidates.push(EncodedPayload {
-                data: encode_rar29_filtered_member(
-                    data,
-                    FilterSpec::whole(FilterKind::Rgb { width, pos_r: 0 }),
-                    options,
-                )?,
-                method: lz_method,
-            });
-        }
-    }
-
-    for candidate in candidates {
-        if candidate.data.len() < best.data.len() {
-            best = candidate;
+        };
+        if ppmd.data.len() < best.data.len() {
+            best = ppmd;
         }
     }
     if best.data.len() >= data.len() {
@@ -455,6 +374,72 @@ fn encode_rar29_auto_filtered_member(
         });
     }
     Ok(best)
+}
+
+/// Options used to rank auto filter candidates cheaply before the winner is
+/// re-encoded with the caller's full options.
+fn rar29_filter_ranking_options(options: Rar29EncodeOptions) -> Rar29EncodeOptions {
+    let mut ranking = Rar29EncodeOptions::new(options.max_match_candidates.min(8))
+        .with_lazy_matching(false)
+        .with_max_match_distance(options.max_match_distance);
+    if let Some(block_size) = options.block_size {
+        ranking = ranking.with_block_size(block_size);
+    }
+    ranking
+}
+
+fn rar29_auto_filter_candidates(data: &[u8]) -> Vec<Vec<FilterSpec>> {
+    let mut candidates = vec![
+        vec![FilterSpec::whole(FilterKind::E8)],
+        vec![FilterSpec::whole(FilterKind::E8E9)],
+        vec![FilterSpec::whole(FilterKind::Itanium)],
+    ];
+    let e8_candidates = auto_x86_filter_ranges(data, false);
+    for range in e8_candidates.iter().cloned() {
+        candidates.push(vec![FilterSpec::range(FilterKind::E8, range)]);
+    }
+    let e8_ranges = disjoint_filter_ranges(e8_candidates);
+    if e8_ranges.len() > 1 {
+        candidates.push(
+            e8_ranges
+                .into_iter()
+                .map(|range| FilterSpec::range(FilterKind::E8, range))
+                .collect(),
+        );
+    }
+    let e8e9_candidates = auto_x86_filter_ranges(data, true);
+    for range in e8e9_candidates.iter().cloned() {
+        candidates.push(vec![FilterSpec::range(FilterKind::E8E9, range)]);
+    }
+    let e8e9_ranges = disjoint_filter_ranges(e8e9_candidates);
+    if e8e9_ranges.len() > 1 {
+        candidates.push(
+            e8e9_ranges
+                .into_iter()
+                .map(|range| FilterSpec::range(FilterKind::E8E9, range))
+                .collect(),
+        );
+    }
+    for channels in 1..=4 {
+        candidates.push(vec![FilterSpec::whole(FilterKind::Delta { channels })]);
+        if is_audio_filter_candidate(data, channels) {
+            candidates.push(vec![FilterSpec::whole(FilterKind::Audio { channels })]);
+        }
+    }
+    for channels in 1..=4 {
+        if let Some(range) = auto_delta_filter_range(data, channels) {
+            candidates.push(vec![FilterSpec::range(
+                FilterKind::Delta { channels },
+                range,
+            )]);
+        }
+    }
+    for width in AUTO_RGB_WIDTHS {
+        if data.len() >= width {
+            candidates.push(vec![FilterSpec::whole(FilterKind::Rgb { width, pos_r: 0 })]);
+        }
+    }
+    candidates
 }
 
 fn is_large_text_ppmd_candidate(data: &[u8]) -> bool {

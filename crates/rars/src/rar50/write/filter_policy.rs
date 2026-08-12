@@ -88,14 +88,8 @@ pub(super) fn filter_policy_attempt_count(data: &[u8], policy: FilterPolicy) -> 
     {
         return 1;
     }
-    let delta_ranges = (1..=4)
-        .filter(|&channels| auto_delta_filter_range(data, channels).is_some())
-        .count();
-    let e8 = auto_x86_filter_ranges(data, false);
-    let e8e9 = auto_x86_filter_ranges(data, true);
-    let e8_combined = usize::from(disjoint_filter_ranges(e8.clone()).len() > 1);
-    let e8e9_combined = usize::from(disjoint_filter_ranges(e8e9.clone()).len() > 1);
-    (8 + delta_ranges + e8.len() + e8_combined + e8e9.len() + e8e9_combined) as u64
+    // One cheap ranking pass per candidate plus the final full-effort encode.
+    auto_size_filter_candidates(data).len() as u64 + 1
 }
 
 #[cfg(test)]
@@ -392,13 +386,68 @@ pub(super) fn encode_member_with_auto_size_filter(
     encode_member_with_auto_size_filter_progress(data, algorithm_version, options, None)
 }
 
+/// Options used to rank auto-size filter candidates. Filter choice depends on
+/// how the transformed data compresses relative to the alternatives, not on
+/// squeezing out the last few bits, so a cheap greedy parse ranks candidates
+/// almost identically to the full-effort parse at a fraction of the cost.
+fn filter_ranking_options(options: EncodeOptions) -> EncodeOptions {
+    EncodeOptions::new(options.max_match_candidates.min(8))
+        .with_lazy_matching(false)
+        .with_max_match_distance(options.max_match_distance)
+}
+
+fn auto_size_filter_candidates(data: &[u8]) -> Vec<Vec<Rar50FilterSpec>> {
+    let mut candidates: Vec<Vec<Rar50FilterSpec>> = vec![Vec::new()];
+    for kind in [FilterKind::E8, FilterKind::E8E9, FilterKind::Arm] {
+        candidates.push(vec![Rar50FilterSpec::new(kind)]);
+    }
+    for channels in 1..=4 {
+        candidates.push(vec![Rar50FilterSpec::new(FilterKind::Delta { channels })]);
+    }
+    for channels in 1..=4 {
+        if let Some(range) = auto_delta_filter_range(data, channels) {
+            candidates.push(vec![Rar50FilterSpec::range(
+                FilterKind::Delta { channels },
+                range,
+            )]);
+        }
+    }
+    let e8_candidates = auto_x86_filter_ranges(data, false);
+    for range in e8_candidates.iter().cloned() {
+        candidates.push(vec![Rar50FilterSpec::range(FilterKind::E8, range)]);
+    }
+    let e8_ranges = disjoint_filter_ranges(e8_candidates);
+    if e8_ranges.len() > 1 {
+        candidates.push(
+            e8_ranges
+                .into_iter()
+                .map(|range| Rar50FilterSpec::range(FilterKind::E8, range))
+                .collect(),
+        );
+    }
+    let e8e9_candidates = auto_x86_filter_ranges(data, true);
+    for range in e8e9_candidates.iter().cloned() {
+        candidates.push(vec![Rar50FilterSpec::range(FilterKind::E8E9, range)]);
+    }
+    let e8e9_ranges = disjoint_filter_ranges(e8e9_candidates);
+    if e8e9_ranges.len() > 1 {
+        candidates.push(
+            e8e9_ranges
+                .into_iter()
+                .map(|range| Rar50FilterSpec::range(FilterKind::E8E9, range))
+                .collect(),
+        );
+    }
+    candidates
+}
+
 fn encode_member_with_auto_size_filter_progress(
     data: &[u8],
     algorithm_version: u8,
     options: EncodeOptions,
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<u8>> {
-    if data.is_empty() {
+    if data.is_empty() || is_text_like_filter_skip_candidate(data) {
         return encode_member_with_filter_policy_and_progress(
             data,
             algorithm_version,
@@ -407,113 +456,32 @@ fn encode_member_with_auto_size_filter_progress(
             progress,
         );
     }
-    let mut best = encode_member_with_filter_policy_and_progress(
+    let ranking_options = filter_ranking_options(options);
+    let candidates = auto_size_filter_candidates(data);
+    let mut best_specs: &[Rar50FilterSpec] = &candidates[0];
+    let mut best_len = usize::MAX;
+    for specs in &candidates {
+        let packed = encode_member_with_filter_specs_progress(
+            data,
+            algorithm_version,
+            specs,
+            ranking_options,
+            borrow_progress(&mut progress),
+        )
+        .map_err(Error::from)?;
+        if packed.len() < best_len {
+            best_len = packed.len();
+            best_specs = specs;
+        }
+    }
+    encode_member_with_filter_specs_progress(
         data,
         algorithm_version,
-        FilterPolicy::None,
+        best_specs,
         options,
         borrow_progress(&mut progress),
-    )?;
-    if is_text_like_filter_skip_candidate(data) {
-        return Ok(best);
-    }
-    let mut candidates = vec![FilterKind::E8, FilterKind::E8E9, FilterKind::Arm];
-    for channels in 1..=4 {
-        candidates.push(FilterKind::Delta { channels });
-    }
-    for filter in candidates {
-        let packed = encode_member_with_filter_progress(
-            data,
-            algorithm_version,
-            filter,
-            options,
-            borrow_progress(&mut progress),
-        )
-        .map_err(Error::from)?;
-        if packed.len() < best.len() {
-            best = packed;
-        }
-    }
-    for channels in 1..=4 {
-        if let Some(range) = auto_delta_filter_range(data, channels) {
-            let packed = encode_member_with_filter_spec_progress(
-                data,
-                algorithm_version,
-                Rar50FilterSpec::range(FilterKind::Delta { channels }, range),
-                options,
-                borrow_progress(&mut progress),
-            )
-            .map_err(Error::from)?;
-            if packed.len() < best.len() {
-                best = packed;
-            }
-        }
-    }
-    let e8_candidates = auto_x86_filter_ranges(data, false);
-    for range in e8_candidates.iter().cloned() {
-        let packed = encode_member_with_filter_spec_progress(
-            data,
-            algorithm_version,
-            Rar50FilterSpec::range(FilterKind::E8, range),
-            options,
-            borrow_progress(&mut progress),
-        )
-        .map_err(Error::from)?;
-        if packed.len() < best.len() {
-            best = packed;
-        }
-    }
-    let e8_ranges = disjoint_filter_ranges(e8_candidates);
-    if e8_ranges.len() > 1 {
-        let filters: Vec<_> = e8_ranges
-            .into_iter()
-            .map(|range| Rar50FilterSpec::range(FilterKind::E8, range))
-            .collect();
-        let packed = encode_member_with_filter_specs_progress(
-            data,
-            algorithm_version,
-            &filters,
-            options,
-            borrow_progress(&mut progress),
-        )
-        .map_err(Error::from)?;
-        if packed.len() < best.len() {
-            best = packed;
-        }
-    }
-    let e8e9_candidates = auto_x86_filter_ranges(data, true);
-    for range in e8e9_candidates.iter().cloned() {
-        let packed = encode_member_with_filter_spec_progress(
-            data,
-            algorithm_version,
-            Rar50FilterSpec::range(FilterKind::E8E9, range),
-            options,
-            borrow_progress(&mut progress),
-        )
-        .map_err(Error::from)?;
-        if packed.len() < best.len() {
-            best = packed;
-        }
-    }
-    let e8e9_ranges = disjoint_filter_ranges(e8e9_candidates);
-    if e8e9_ranges.len() > 1 {
-        let filters: Vec<_> = e8e9_ranges
-            .into_iter()
-            .map(|range| Rar50FilterSpec::range(FilterKind::E8E9, range))
-            .collect();
-        let packed = encode_member_with_filter_specs_progress(
-            data,
-            algorithm_version,
-            &filters,
-            options,
-            borrow_progress(&mut progress),
-        )
-        .map_err(Error::from)?;
-        if packed.len() < best.len() {
-            best = packed;
-        }
-    }
-    Ok(best)
+    )
+    .map_err(Error::from)
 }
 
 fn is_text_like_filter_skip_candidate(data: &[u8]) -> bool {
@@ -582,16 +550,6 @@ fn encode_member_with_filter_progress(
             Rar50FilterSpec::new(filter),
         )
     }
-}
-
-fn encode_member_with_filter_spec_progress(
-    data: &[u8],
-    algorithm_version: u8,
-    filter: Rar50FilterSpec,
-    options: EncodeOptions,
-    progress: Option<&mut dyn FnMut(usize) -> bool>,
-) -> crate::codec::Result<Vec<u8>> {
-    encode_member_with_filter_specs_progress(data, algorithm_version, &[filter], options, progress)
 }
 
 fn encode_member_with_filter_specs_progress(

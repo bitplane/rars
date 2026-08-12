@@ -1,4 +1,4 @@
-use super::{huffman, Error, Result};
+use super::{huffman, match_finder, Error, Result};
 use std::io::{Read, Write};
 
 const MAIN_COUNT: usize = 298;
@@ -31,8 +31,9 @@ const SHORT_BASES: [usize; 8] = [0, 4, 8, 16, 32, 64, 128, 192];
 const SHORT_BITS: [u8; 8] = [2, 2, 3, 4, 5, 6, 6, 6];
 const MAX_ENCODER_MATCH_OFFSET: usize = MAX_HISTORY;
 const MAX_ENCODER_MATCH_LENGTH: usize = 258;
-const MATCH_HASH_BUCKETS: usize = 4096;
 const MAX_MATCH_CANDIDATES: usize = 256;
+
+type Rar20MatchFinder = match_finder::MatchFinder<3>;
 
 pub fn unpack20_decode(input: &[u8], output_size: usize) -> Result<Vec<u8>> {
     let mut decoder = Unpack20::new();
@@ -488,13 +489,13 @@ fn encode_tokens_with_progress(
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<EncodeToken>> {
     let mut tokens = Vec::new();
-    let mut buckets = vec![Vec::new(); MATCH_HASH_BUCKETS];
     let history = &history[history.len().saturating_sub(options.max_match_distance)..];
     let mut combined = Vec::with_capacity(history.len() + input.len());
     combined.extend_from_slice(history);
     combined.extend_from_slice(input);
-    for history_pos in 0..history.len().saturating_sub(2) {
-        insert_match_position(&combined, history_pos, &mut buckets);
+    let mut finder = Rar20MatchFinder::new(combined.len());
+    for history_pos in 0..history.len() {
+        finder.insert(&combined, history_pos);
     }
 
     let mut pos = history.len();
@@ -507,7 +508,7 @@ fn encode_tokens_with_progress(
             &combined,
             pos,
             end,
-            &buckets,
+            &finder,
             options,
             &old_offsets,
             cost_model,
@@ -516,14 +517,14 @@ fn encode_tokens_with_progress(
             let lazy = LazyMatchContext {
                 input: &combined,
                 end,
-                buckets: &buckets,
+                finder: &finder,
                 options,
                 old_offsets: &old_offsets,
                 cost_model,
             };
             if should_lazy_emit_literal(pos, selected, lazy) {
                 tokens.push(EncodeToken::Literal(combined[pos]));
-                insert_match_position(&combined, pos, &mut buckets);
+                finder.insert(&combined, pos);
                 pos += 1;
                 continue;
             }
@@ -563,12 +564,12 @@ fn encode_tokens_with_progress(
             };
             push_old_offset(&mut old_offsets, offset);
             for history_pos in pos..pos + length {
-                insert_match_position(&combined, history_pos, &mut buckets);
+                finder.insert(&combined, history_pos);
             }
             pos += length;
         } else {
             tokens.push(EncodeToken::Literal(combined[pos]));
-            insert_match_position(&combined, pos, &mut buckets);
+            finder.insert(&combined, pos);
             pos += 1;
         }
         let consumed = pos.saturating_sub(history.len());
@@ -680,12 +681,12 @@ fn select_match(
     input: &[u8],
     pos: usize,
     end: usize,
-    buckets: &[Vec<usize>],
+    finder: &Rar20MatchFinder,
     options: EncodeOptions,
     old_offsets: &[usize; 4],
     cost_model: Option<&CostModel<'_>>,
 ) -> Option<SelectedMatch> {
-    let fresh = best_match(input, pos, end, buckets, options, cost_model)
+    let fresh = best_match(input, pos, end, finder, options, cost_model)
         .map(|(length, offset)| SelectedMatch::Fresh { length, offset });
     let old = best_old_offset_match(input, pos, end, old_offsets, cost_model).map(
         |(index, length, offset)| SelectedMatch::OldOffset {
@@ -741,7 +742,7 @@ fn select_match(
 struct LazyMatchContext<'a> {
     input: &'a [u8],
     end: usize,
-    buckets: &'a [Vec<usize>],
+    finder: &'a Rar20MatchFinder,
     options: EncodeOptions,
     old_offsets: &'a [usize; 4],
     cost_model: Option<&'a CostModel<'a>>,
@@ -763,7 +764,7 @@ fn should_lazy_emit_literal(
                 context.input,
                 pos + offset,
                 context.end,
-                context.buckets,
+                context.finder,
                 context.options,
                 context.old_offsets,
                 context.cost_model,
@@ -787,7 +788,7 @@ fn best_match(
     input: &[u8],
     pos: usize,
     end: usize,
-    buckets: &[Vec<usize>],
+    finder: &Rar20MatchFinder,
     options: EncodeOptions,
     cost_model: Option<&CostModel<'_>>,
 ) -> Option<(usize, usize)> {
@@ -800,11 +801,12 @@ fn best_match(
     {
         return None;
     }
-    let bucket = &buckets[match_hash(input, pos)];
     let mut best = None;
     let mut checked = 0usize;
-    for &candidate in bucket.iter().rev() {
+    let mut candidate = finder.first(input, pos);
+    while candidate != match_finder::NO_POSITION {
         if candidate >= pos {
+            candidate = finder.previous(candidate);
             continue;
         }
         let offset = pos - candidate;
@@ -812,20 +814,29 @@ fn best_match(
             break;
         }
         checked += 1;
-        let mut length = 0usize;
-        while length < max_length && input[pos + length] == input[pos + length - offset] {
-            length += 1;
-        }
-        let encodable = length >= 3 + match_length_adjustment(offset);
-        if encodable && is_better_fresh_match(cost_model, length, offset, best) {
-            best = Some((length, offset));
-            if length == max_length {
-                break;
+        // Without a cost model, a candidate can only improve on the current
+        // best when it matches at least one byte past the best length, so
+        // probe that byte first. The cost-model pass may prefer shorter but
+        // cheaper matches, so it must evaluate every candidate. Probing is
+        // safe because a best match reaching `max_length` breaks the loop.
+        let best_length = best.map_or(0, |(length, _)| length);
+        let probe_ok = cost_model.is_some()
+            || best_length == 0
+            || input[candidate + best_length] == input[pos + best_length];
+        if probe_ok {
+            let length = super::fast::match_length(input, pos, offset, max_length);
+            let encodable = length >= 3 + match_length_adjustment(offset);
+            if encodable && is_better_fresh_match(cost_model, length, offset, best) {
+                best = Some((length, offset));
+                if length == max_length {
+                    break;
+                }
             }
         }
         if checked >= options.max_match_candidates {
             break;
         }
+        candidate = finder.previous(candidate);
     }
     best
 }
@@ -926,11 +937,7 @@ fn best_short_offset_match(input: &[u8], pos: usize, end: usize) -> Option<Selec
 }
 
 fn match_length_at_offset(input: &[u8], pos: usize, max_length: usize, offset: usize) -> usize {
-    let mut length = 0usize;
-    while length < max_length && input[pos + length] == input[pos + length - offset] {
-        length += 1;
-    }
-    length
+    super::fast::match_length(input, pos, offset, max_length)
 }
 
 fn match_length_adjustment(offset: usize) -> usize {
@@ -946,18 +953,6 @@ fn push_old_offset(old_offsets: &mut [usize; 4], offset: usize) {
     old_offsets[2] = old_offsets[1];
     old_offsets[1] = old_offsets[0];
     old_offsets[0] = offset;
-}
-
-fn insert_match_position(input: &[u8], pos: usize, buckets: &mut [Vec<usize>]) {
-    if pos + 2 < input.len() {
-        buckets[match_hash(input, pos)].push(pos);
-    }
-}
-
-fn match_hash(input: &[u8], pos: usize) -> usize {
-    let value =
-        ((input[pos] as usize) << 8) ^ ((input[pos + 1] as usize) << 4) ^ input[pos + 2] as usize;
-    value & (MATCH_HASH_BUCKETS - 1)
 }
 
 fn length_slot_for_match(length: usize) -> Result<(usize, usize)> {

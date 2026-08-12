@@ -3,6 +3,7 @@
 mod fast;
 mod filters;
 mod huffman;
+mod match_finder;
 mod ppmd;
 pub mod rar13;
 pub mod rar20;

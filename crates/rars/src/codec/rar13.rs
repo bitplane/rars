@@ -1,7 +1,46 @@
 use super::{Error, Result};
 use std::io::{Read, Write};
 
-const MATCH_HASH_BUCKETS: usize = 4096;
+/// Prebuilt long-LZ candidate index. Unlike the other encoders, rar13 builds
+/// the index for the whole member up front and then queries it at arbitrary
+/// positions, so candidates are stored per hash as position-sorted arrays: a
+/// binary search finds the newest candidate before the query position and
+/// iteration proceeds toward older ones with array locality. A linked-chain
+/// finder is a poor fit here because its head always points at the newest
+/// position in the member, forcing every query to pointer-chase past all
+/// not-yet-reached positions.
+#[derive(Debug, Clone)]
+struct Rar13MatchFinder {
+    buckets: Vec<Vec<usize>>,
+}
+
+const LONG_LZ_HASH_BITS: u32 = 16;
+
+impl Rar13MatchFinder {
+    fn build(input: &[u8]) -> Self {
+        let mut buckets = vec![Vec::new(); 1 << LONG_LZ_HASH_BITS];
+        for pos in 0..input.len().saturating_sub(2) {
+            buckets[Self::hash(input, pos)].push(pos);
+        }
+        Self { buckets }
+    }
+
+    fn hash(input: &[u8], pos: usize) -> usize {
+        let value = u32::from(input[pos])
+            | (u32::from(input[pos + 1]) << 8)
+            | (u32::from(input[pos + 2]) << 16);
+        (value.wrapping_mul(0x9E37_79B1) >> (32 - LONG_LZ_HASH_BITS)) as usize
+    }
+
+    /// Candidate positions strictly before `pos` sharing its 3-byte hash,
+    /// newest first. The caller must ensure 3 bytes are readable at `pos`.
+    fn candidates_before(&self, input: &[u8], pos: usize) -> impl Iterator<Item = usize> + '_ {
+        let bucket = &self.buckets[Self::hash(input, pos)];
+        let end = bucket.partition_point(|&candidate| candidate < pos);
+        bucket[..end].iter().rev().copied()
+    }
+}
+
 const MAX_LONG_MATCH_CANDIDATES: usize = 64;
 const MAX_LONG_LZ_DISTANCE: usize = 0x7fff;
 
@@ -223,7 +262,7 @@ impl Unpack15Encoder {
             self.emit_payloads(payloads)?;
             if group_enters_stmode {
                 if self.options.stmode_literal_runs {
-                    self.emit_stmode_literal_run(input, &[], &mut pos, false)?;
+                    self.emit_stmode_literal_run(input, None, &mut pos)?;
                 }
                 self.emit_stmode_exit()?;
             }
@@ -311,7 +350,7 @@ impl Unpack15Encoder {
             self.emit_payloads(payloads)?;
             if group_enters_stmode {
                 if self.options.stmode_literal_runs {
-                    self.emit_stmode_literal_run(input, &buckets, &mut pos, true)?;
+                    self.emit_stmode_literal_run(input, Some(&buckets), &mut pos)?;
                 }
                 self.emit_stmode_exit()?;
             }
@@ -375,7 +414,7 @@ impl Unpack15Encoder {
         &self,
         input: &[u8],
         pos: usize,
-        buckets: &[Vec<usize>],
+        buckets: &Rar13MatchFinder,
         state: LzPlanState,
         flag_bits: usize,
     ) -> Option<EncodedToken> {
@@ -530,28 +569,29 @@ impl Unpack15Encoder {
     fn emit_stmode_literal_run(
         &mut self,
         input: &[u8],
-        buckets: &[Vec<usize>],
+        buckets: Option<&Rar13MatchFinder>,
         pos: &mut usize,
-        allow_lz: bool,
     ) -> Result<()> {
         while *pos + 1 < input.len() {
-            if allow_lz
-                && find_lz_token(
-                    input,
-                    *pos,
-                    buckets,
-                    LzPlanState {
-                        last_dist: self.last_dist,
-                        last_length: self.last_length,
-                        old_dist: self.old_dist,
-                        old_dist_ptr: self.old_dist_ptr,
-                        max_dist3: self.max_dist3,
-                        nlzb: self.nlzb,
-                        nhfb: self.nhfb,
-                        l_count: self.l_count,
-                    },
-                    self.options,
-                )
+            if buckets
+                .and_then(|buckets| {
+                    find_lz_token(
+                        input,
+                        *pos,
+                        buckets,
+                        LzPlanState {
+                            last_dist: self.last_dist,
+                            last_length: self.last_length,
+                            old_dist: self.old_dist,
+                            old_dist_ptr: self.old_dist_ptr,
+                            max_dist3: self.max_dist3,
+                            nlzb: self.nlzb,
+                            nhfb: self.nhfb,
+                            l_count: self.l_count,
+                        },
+                        self.options,
+                    )
+                })
                 .is_some()
             {
                 break;
@@ -1029,7 +1069,7 @@ fn l_count_break_bit_cost(l_count: u32) -> usize {
 fn find_lz_token(
     input: &[u8],
     pos: usize,
-    buckets: &[Vec<usize>],
+    buckets: &Rar13MatchFinder,
     state: LzPlanState,
     options: EncodeOptions,
 ) -> Option<EncodedToken> {
@@ -1041,7 +1081,7 @@ fn find_lz_token(
 fn find_lz_tokens(
     input: &[u8],
     pos: usize,
-    buckets: &[Vec<usize>],
+    buckets: &Rar13MatchFinder,
     state: LzPlanState,
     options: EncodeOptions,
 ) -> Vec<EncodedToken> {
@@ -1080,7 +1120,7 @@ fn find_lz_tokens(
 fn should_lazy_emit_literal(
     input: &[u8],
     pos: usize,
-    buckets: &[Vec<usize>],
+    buckets: &Rar13MatchFinder,
     current: EncodedToken,
     max_dist3: u32,
     options: EncodeOptions,
@@ -1250,13 +1290,7 @@ pub fn find_long_lz(input: &[u8], pos: usize, max_match_distance: usize) -> Opti
         length: 0,
     };
     for distance in 257..=max_distance {
-        let mut length = 0usize;
-        while length < 258
-            && pos + length < input.len()
-            && input[pos + length] == input[pos + length - distance]
-        {
-            length += 1;
-        }
+        let length = super::fast::match_length(input, pos, distance, 258);
         if length >= 3 && length > best.length as usize {
             best = LongLz {
                 distance: distance as u32,
@@ -1272,7 +1306,7 @@ fn find_long_lz_with_buckets(
     input: &[u8],
     pos: usize,
     max_match_distance: usize,
-    buckets: &[Vec<usize>],
+    buckets: &Rar13MatchFinder,
     max_candidates: usize,
 ) -> Option<LongLz> {
     if pos < 257 || pos + 2 >= input.len() || max_candidates == 0 {
@@ -1289,10 +1323,7 @@ fn find_long_lz_with_buckets(
         length: 0,
     };
     let mut checked = 0usize;
-    for &candidate in buckets[match_hash(input, pos)].iter().rev() {
-        if candidate >= pos {
-            continue;
-        }
+    for candidate in buckets.candidates_before(input, pos) {
         let distance = pos - candidate;
         if distance > max_distance {
             break;
@@ -1301,20 +1332,25 @@ fn find_long_lz_with_buckets(
             continue;
         }
         checked += 1;
-        let mut length = 0usize;
-        while length < max_length && input[pos + length] == input[pos + length - distance] {
-            length += 1;
-        }
-        if length >= 3
-            && (length > best.length as usize
-                || (length == best.length as usize && distance < best.distance as usize))
+        // A candidate can only improve on the current best when it matches at
+        // least one byte past the best length, so probe that byte first. The
+        // loop breaks once best reaches `max_length`, so the probe index stays
+        // in bounds.
+        if best.length == 0
+            || input[candidate + best.length as usize] == input[pos + best.length as usize]
         {
-            best = LongLz {
-                distance: distance as u32,
-                length: length as u32,
-            };
-            if length == max_length {
-                break;
+            let length = super::fast::match_length(input, pos, distance, max_length);
+            if length >= 3
+                && (length > best.length as usize
+                    || (length == best.length as usize && distance < best.distance as usize))
+            {
+                best = LongLz {
+                    distance: distance as u32,
+                    length: length as u32,
+                };
+                if length == max_length {
+                    break;
+                }
             }
         }
         if checked >= max_candidates {
@@ -1325,18 +1361,8 @@ fn find_long_lz_with_buckets(
     (best.length >= 3).then_some(best)
 }
 
-fn long_lz_buckets(input: &[u8]) -> Vec<Vec<usize>> {
-    let mut buckets = vec![Vec::new(); MATCH_HASH_BUCKETS];
-    for pos in 0..input.len().saturating_sub(2) {
-        buckets[match_hash(input, pos)].push(pos);
-    }
-    buckets
-}
-
-fn match_hash(input: &[u8], pos: usize) -> usize {
-    let value =
-        ((input[pos] as usize) << 8) ^ ((input[pos + 1] as usize) << 4) ^ input[pos + 2] as usize;
-    value & (MATCH_HASH_BUCKETS - 1)
+fn long_lz_buckets(input: &[u8]) -> Rar13MatchFinder {
+    Rar13MatchFinder::build(input)
 }
 
 fn emit_long_lz_length(bits: &mut BitWriter, avr_ln2: u32, length_code: u32) -> Result<()> {

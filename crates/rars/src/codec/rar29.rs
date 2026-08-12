@@ -2,7 +2,7 @@ use super::filters::{self, DeltaErrorMessages, FilterOp};
 use super::huffman;
 use super::ppmd::{PpmdByteReader, PpmdDecoder, PpmdEncoder};
 use super::rarvm;
-use super::{Error, Result};
+use super::{match_finder, Error, Result};
 use crate::crc32::crc32;
 use std::io::{Read, Write};
 use std::ops::Range;
@@ -49,11 +49,12 @@ const SHORT_BASES: [usize; 8] = [0, 4, 8, 16, 32, 64, 128, 192];
 const SHORT_BITS: [u8; 8] = [2, 2, 3, 4, 5, 6, 6, 6];
 const MAX_ENCODER_MATCH_OFFSET: usize = 1024 * 1024;
 const MAX_ENCODER_MATCH_LENGTH: usize = 258;
-const MATCH_HASH_BUCKETS: usize = 4096;
 const MAX_MATCH_CANDIDATES: usize = 256;
 const MAX_PPMD_MATCH_LENGTH: usize = 255;
 const MIN_PPMD_MATCH_LENGTH: usize = 32;
 const MAX_PPMD_REPEAT_LENGTH: usize = 259;
+
+type Rar29MatchFinder = match_finder::MatchFinder<4>;
 
 // RAR 3.x standard filters are stored as RARVM bytecode in the compressed
 // stream. RAR15_40_FORMAT_SPECIFICATION.md §20 and FILTER_TRANSFORMS.md §9
@@ -1129,37 +1130,44 @@ fn encode_tokens_with_progress(
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<EncodeToken>> {
     let mut tokens = Vec::new();
-    let mut buckets = vec![Vec::new(); MATCH_HASH_BUCKETS];
     let history = &history[history.len().saturating_sub(options.max_match_distance)..];
     let mut combined = Vec::with_capacity(history.len() + input.len());
     combined.extend_from_slice(history);
     combined.extend_from_slice(input);
-    for history_pos in 0..history.len().saturating_sub(2) {
-        insert_match_position(&combined, history_pos, &mut buckets);
+    let mut finder = Rar29MatchFinder::new(combined.len());
+    for history_pos in 0..history.len() {
+        finder.insert(&combined, history_pos);
     }
 
     let mut pos = history.len();
     let end = combined.len();
     let mut state = EncoderMatchState::default();
     let mut next_report = 0usize;
+    let mut pending_match: Option<MatchCandidate> = None;
     while pos < end {
-        if let Some(candidate) = best_match(&combined, pos, end, &buckets, options, &state) {
-            if should_lazy_emit_literal(&combined, pos, end, &buckets, options, &state, candidate) {
+        let candidate = pending_match
+            .take()
+            .or_else(|| best_match(&combined, pos, end, &finder, options, &state));
+        if let Some(candidate) = candidate {
+            let (emit_literal, cached_next) =
+                lazy_match_decision(&combined, pos, &finder, options, &state, candidate);
+            if emit_literal {
                 tokens.push(EncodeToken::Literal(combined[pos]));
-                insert_match_position(&combined, pos, &mut buckets);
+                finder.insert(&combined, pos);
                 pos += 1;
+                pending_match = cached_next;
                 continue;
             }
             let MatchCandidate { length, offset, .. } = candidate;
             tokens.push(EncodeToken::Match { length, offset });
             state.remember(length, offset);
             for history_pos in pos..pos + length {
-                insert_match_position(&combined, history_pos, &mut buckets);
+                finder.insert(&combined, history_pos);
             }
             pos += length;
         } else {
             tokens.push(EncodeToken::Literal(combined[pos]));
-            insert_match_position(&combined, pos, &mut buckets);
+            finder.insert(&combined, pos);
             pos += 1;
         }
         let consumed = pos.saturating_sub(history.len());
@@ -1179,27 +1187,50 @@ fn encode_tokens_with_progress(
     Ok(tokens)
 }
 
+/// Decides whether a literal should be emitted instead of `current` because a
+/// better match starts within the lazy lookahead window. Also returns the
+/// match found one byte ahead (when computed) so the caller can reuse it for
+/// the next position instead of searching again.
+fn lazy_match_decision(
+    input: &[u8],
+    pos: usize,
+    finder: &Rar29MatchFinder,
+    options: EncodeOptions,
+    state: &EncoderMatchState,
+    current: MatchCandidate,
+) -> (bool, Option<MatchCandidate>) {
+    let end = input.len();
+    if !options.lazy_matching || pos + 1 >= end {
+        return (false, None);
+    }
+    let lookahead = options.lazy_lookahead.max(1);
+    let mut cached_next = None;
+    for offset in 1..=lookahead {
+        if pos + offset >= end {
+            break;
+        }
+        let next = best_match(input, pos + offset, end, finder, options, state);
+        if offset == 1 {
+            cached_next = next;
+        }
+        let skipped_literal_score = offset as isize * 8;
+        if next.is_some_and(|next| next.score > current.score + skipped_literal_score) {
+            return (true, cached_next);
+        }
+    }
+    (false, None)
+}
+
+#[cfg(test)]
 fn should_lazy_emit_literal(
     input: &[u8],
     pos: usize,
-    end: usize,
-    buckets: &[Vec<usize>],
+    finder: &Rar29MatchFinder,
     options: EncodeOptions,
     state: &EncoderMatchState,
     current: MatchCandidate,
 ) -> bool {
-    if !options.lazy_matching || pos + 1 >= end {
-        return false;
-    }
-    let lookahead = options.lazy_lookahead.max(1);
-    (1..=lookahead)
-        .take_while(|offset| pos + offset < end)
-        .any(|offset| {
-            best_match(input, pos + offset, end, buckets, options, state).is_some_and(|next| {
-                let skipped_literal_score = offset as isize * 8;
-                next.score > current.score + skipped_literal_score
-            })
-        })
+    lazy_match_decision(input, pos, finder, options, state, current).0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1219,29 +1250,29 @@ fn encode_ppmd_tokens(input: &[u8], lz_escapes: bool) -> Vec<PpmdEncodeToken> {
     }
 
     let mut tokens = Vec::new();
-    let mut buckets = vec![Vec::new(); MATCH_HASH_BUCKETS];
+    let mut finder = Rar29MatchFinder::new(input.len());
     let mut pos = 0usize;
     while pos < input.len() {
         if let Some(length) = ppmd_offset_one_repeat(input, pos) {
             tokens.push(PpmdEncodeToken::RepeatOffsetOne { length });
             for history_pos in pos..pos + length {
-                insert_match_position(input, history_pos, &mut buckets);
+                finder.insert(input, history_pos);
             }
             pos += length;
             continue;
         }
 
-        if let Some((length, offset)) = best_ppmd_match(input, pos, &buckets) {
+        if let Some((length, offset)) = best_ppmd_match(input, pos, &finder) {
             tokens.push(PpmdEncodeToken::Match { offset, length });
             for history_pos in pos..pos + length {
-                insert_match_position(input, history_pos, &mut buckets);
+                finder.insert(input, history_pos);
             }
             pos += length;
             continue;
         }
 
         tokens.push(PpmdEncodeToken::Literal(input[pos]));
-        insert_match_position(input, pos, &mut buckets);
+        finder.insert(input, pos);
         pos += 1;
     }
     tokens
@@ -1261,17 +1292,18 @@ fn ppmd_offset_one_repeat(input: &[u8], pos: usize) -> Option<usize> {
     (length >= 4).then_some(length)
 }
 
-fn best_ppmd_match(input: &[u8], pos: usize, buckets: &[Vec<usize>]) -> Option<(usize, usize)> {
+fn best_ppmd_match(input: &[u8], pos: usize, finder: &Rar29MatchFinder) -> Option<(usize, usize)> {
     let max_offset = pos.min(0x1000001).min(MAX_ENCODER_MATCH_OFFSET);
     let max_length = (input.len() - pos).min(MAX_PPMD_MATCH_LENGTH);
-    if max_offset < 2 || max_length < MIN_PPMD_MATCH_LENGTH || pos + 2 >= input.len() {
+    if max_offset < 2 || max_length < MIN_PPMD_MATCH_LENGTH || pos + 3 >= input.len() {
         return None;
     }
-    let bucket = &buckets[match_hash(input, pos)];
     let mut best = None;
     let mut checked = 0usize;
-    for &candidate in bucket.iter().rev() {
+    let mut candidate = finder.first(input, pos);
+    while candidate != match_finder::NO_POSITION {
         if candidate >= pos {
+            candidate = finder.previous(candidate);
             continue;
         }
         let offset = pos - candidate;
@@ -1279,13 +1311,11 @@ fn best_ppmd_match(input: &[u8], pos: usize, buckets: &[Vec<usize>]) -> Option<(
             break;
         }
         if offset < 2 {
+            candidate = finder.previous(candidate);
             continue;
         }
         checked += 1;
-        let mut length = 0usize;
-        while length < max_length && input[pos + length] == input[pos + length - offset] {
-            length += 1;
-        }
+        let length = match_length(input, pos, offset, max_length);
         if length >= MIN_PPMD_MATCH_LENGTH
             && best.is_none_or(|(best_length, best_offset)| {
                 length > best_length || (length == best_length && offset < best_offset)
@@ -1299,6 +1329,7 @@ fn best_ppmd_match(input: &[u8], pos: usize, buckets: &[Vec<usize>]) -> Option<(
         if checked >= MAX_MATCH_CANDIDATES {
             break;
         }
+        candidate = finder.previous(candidate);
     }
     best
 }
@@ -1307,7 +1338,7 @@ fn best_match(
     input: &[u8],
     pos: usize,
     end: usize,
-    buckets: &[Vec<usize>],
+    finder: &Rar29MatchFinder,
     options: EncodeOptions,
     state: &EncoderMatchState,
 ) -> Option<MatchCandidate> {
@@ -1316,11 +1347,10 @@ fn best_match(
     if options.max_match_candidates == 0
         || max_offset == 0
         || max_length < 4
-        || pos + 2 >= input.len()
+        || pos + 3 >= input.len()
     {
         return None;
     }
-    let bucket = &buckets[match_hash(input, pos)];
     let mut best = None;
     let mut checked = 0usize;
     for offset in state.old_offsets {
@@ -1330,8 +1360,15 @@ fn best_match(
         let length = match_length(input, pos, offset, max_length);
         consider_match_candidate(&mut best, state, length, offset);
     }
-    for &candidate in bucket.iter().rev() {
+    if let Some(best) = best {
+        if best.length == max_length {
+            return Some(best);
+        }
+    }
+    let mut candidate = finder.first(input, pos);
+    while candidate != match_finder::NO_POSITION {
         if candidate >= pos {
+            candidate = finder.previous(candidate);
             continue;
         }
         let offset = pos - candidate;
@@ -1339,14 +1376,20 @@ fn best_match(
             break;
         }
         checked += 1;
-        let length = match_length(input, pos, offset, max_length);
-        consider_match_candidate(&mut best, state, length, offset);
+        // A candidate can only improve on the current best when it matches at
+        // least one byte past the best length, so probe that byte first.
+        let best_length = best.map_or(0, |best: MatchCandidate| best.length);
+        if best_length == 0 || input[candidate + best_length] == input[pos + best_length] {
+            let length = match_length(input, pos, offset, max_length);
+            consider_match_candidate(&mut best, state, length, offset);
+        }
         if best.is_some_and(|candidate| candidate.length == max_length) {
             break;
         }
         if checked >= options.max_match_candidates {
             break;
         }
+        candidate = finder.previous(candidate);
     }
     best
 }
@@ -1404,18 +1447,6 @@ fn estimated_match_cost(state: &EncoderMatchState, length: usize, offset: usize)
 
 fn match_length_adjustment(offset: usize) -> usize {
     usize::from(offset >= 0x2000) + usize::from(offset >= 0x40000)
-}
-
-fn insert_match_position(input: &[u8], pos: usize, buckets: &mut [Vec<usize>]) {
-    if pos + 2 < input.len() {
-        buckets[match_hash(input, pos)].push(pos);
-    }
-}
-
-fn match_hash(input: &[u8], pos: usize) -> usize {
-    let value =
-        ((input[pos] as usize) << 8) ^ ((input[pos + 1] as usize) << 4) ^ input[pos + 2] as usize;
-    value & (MATCH_HASH_BUCKETS - 1)
 }
 
 fn length_slot_for_match(length: usize) -> Result<(usize, usize)> {
@@ -3061,16 +3092,15 @@ mod tests {
 
     use super::{
         apply_standard_filter, audio_encode, best_match, encode_ppmd_tokens,
-        encode_table_level_tokens, encode_tokens, encoded_filter_records, insert_match_position,
-        itanium_decode, itanium_encode, should_lazy_emit_literal, split_large_filter,
-        unpack29_decode, unpack29_encode_literals, unpack29_encode_ppmd,
-        unpack29_encode_ppmd_literals, unpack29_encode_ppmd_with_filter, BitReader, BitWriter,
-        EncodeOptions, EncodeToken, EncoderMatchState, Error, Huffman, LevelToken,
-        OwnedVmFilterRecord, PpmdEncodeToken, Rar29FilterKind, Rar29FilterSpec, Result,
-        StandardFilter, Unpack29, Unpack29Encoder, VmFilter, VmProgram, VmProgramKind, MAIN_COUNT,
-        MATCH_HASH_BUCKETS, MAX_MATCH_CANDIDATES, MAX_VM_AUDIO_FILTER_BLOCK_SIZE,
-        MAX_VM_DELTA_FILTER_BLOCK_SIZE, MAX_VM_FILTER_BLOCK_SIZE, RAR3_AUDIO_FILTER_BYTECODE,
-        TABLE_COUNT,
+        encode_table_level_tokens, encode_tokens, encoded_filter_records, itanium_decode,
+        itanium_encode, should_lazy_emit_literal, split_large_filter, unpack29_decode,
+        unpack29_encode_literals, unpack29_encode_ppmd, unpack29_encode_ppmd_literals,
+        unpack29_encode_ppmd_with_filter, BitReader, BitWriter, EncodeOptions, EncodeToken,
+        EncoderMatchState, Error, Huffman, LevelToken, OwnedVmFilterRecord, PpmdEncodeToken,
+        Rar29FilterKind, Rar29FilterSpec, Rar29MatchFinder, Result, StandardFilter, Unpack29,
+        Unpack29Encoder, VmFilter, VmProgram, VmProgramKind, MAIN_COUNT, MAX_MATCH_CANDIDATES,
+        MAX_VM_AUDIO_FILTER_BLOCK_SIZE, MAX_VM_DELTA_FILTER_BLOCK_SIZE, MAX_VM_FILTER_BLOCK_SIZE,
+        RAR3_AUDIO_FILTER_BYTECODE, TABLE_COUNT,
     };
 
     const COMPRESSED_TEXT: &[u8] = &[
@@ -3169,15 +3199,15 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         input[106] = b'!';
         input[pos - 10..pos - 5].copy_from_slice(b"ABCD!");
         input[pos..pos + 7].copy_from_slice(b"ABCDEFG");
-        let mut buckets = vec![Vec::new(); MATCH_HASH_BUCKETS];
-        insert_match_position(&input, 100, &mut buckets);
-        insert_match_position(&input, pos - 10, &mut buckets);
+        let mut finder = Rar29MatchFinder::new(input.len());
+        finder.insert(&input, 100);
+        finder.insert(&input, pos - 10);
 
         let current = best_match(
             &input,
             pos,
             input.len(),
-            &buckets,
+            &finder,
             EncodeOptions::new(MAX_MATCH_CANDIDATES),
             &EncoderMatchState::default(),
         )
@@ -3186,7 +3216,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
             &input,
             pos + 1,
             input.len(),
-            &buckets,
+            &finder,
             EncodeOptions::new(MAX_MATCH_CANDIDATES),
             &EncoderMatchState::default(),
         )
@@ -3199,8 +3229,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         assert!(!should_lazy_emit_literal(
             &input,
             pos,
-            input.len(),
-            &buckets,
+            &finder,
             EncodeOptions::new(MAX_MATCH_CANDIDATES).with_lazy_matching(true),
             &EncoderMatchState::default(),
             current,
@@ -3217,15 +3246,15 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         input[pos - 80..pos - 64].copy_from_slice(b"CDEFGHIJKLMNOPQR");
         input[pos..pos + 18].copy_from_slice(b"ABCDEFGHIJKLMNOPQR");
 
-        let mut buckets = vec![Vec::new(); MATCH_HASH_BUCKETS];
+        let mut finder = Rar29MatchFinder::new(input.len());
         for candidate in 0..pos {
-            insert_match_position(&input, candidate, &mut buckets);
+            finder.insert(&input, candidate);
         }
         let current = best_match(
             &input,
             pos,
             input.len(),
-            &buckets,
+            &finder,
             EncodeOptions::default(),
             &EncoderMatchState::default(),
         )
@@ -3235,8 +3264,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         assert!(!should_lazy_emit_literal(
             &input,
             pos,
-            input.len(),
-            &buckets,
+            &finder,
             EncodeOptions::default()
                 .with_lazy_matching(true)
                 .with_lazy_lookahead(1),
@@ -3246,8 +3274,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         assert!(should_lazy_emit_literal(
             &input,
             pos,
-            input.len(),
-            &buckets,
+            &finder,
             EncodeOptions::default()
                 .with_lazy_matching(true)
                 .with_lazy_lookahead(2),
@@ -3287,15 +3314,15 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         input[pos - 22] = 0x11;
         input[pos - 503] = 0x22;
         input[pos + 9] = 0x33;
-        let mut buckets = vec![Vec::new(); MATCH_HASH_BUCKETS];
-        insert_match_position(&input, pos - 30, &mut buckets);
-        insert_match_position(&input, pos - 512, &mut buckets);
+        let mut finder = Rar29MatchFinder::new(input.len());
+        finder.insert(&input, pos - 30);
+        finder.insert(&input, pos - 512);
 
         let fresh = best_match(
             &input,
             pos,
             input.len(),
-            &buckets,
+            &finder,
             EncodeOptions::default(),
             &EncoderMatchState::default(),
         )
@@ -3304,7 +3331,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
             &input,
             pos,
             input.len(),
-            &buckets,
+            &finder,
             EncodeOptions::default(),
             &EncoderMatchState {
                 old_offsets: [30, 0, 0, 0],

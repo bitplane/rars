@@ -42,6 +42,19 @@ fn match_length_scalar(
     max_length: usize,
     mut length: usize,
 ) -> usize {
+    while length + 8 <= max_length {
+        let current = u64::from_le_bytes(input[pos + length..pos + length + 8].try_into().unwrap());
+        let previous = u64::from_le_bytes(
+            input[pos + length - distance..pos + length - distance + 8]
+                .try_into()
+                .unwrap(),
+        );
+        let difference = current ^ previous;
+        if difference != 0 {
+            return length + (difference.trailing_zeros() / 8) as usize;
+        }
+        length += 8;
+    }
     while length < max_length && input[pos + length] == input[pos + length - distance] {
         length += 1;
     }
