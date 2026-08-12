@@ -18,9 +18,6 @@ workspace = true
 [package.metadata.docs.rs]
 all-features = true
 
-[features]
-parallel = ["dep:rayon", "rars/parallel"]
-
 [[bin]]
 name = "rars"
 path = "src/main.rs"
@@ -29,7 +26,7 @@ path = "src/main.rs"
 clap.workspace = true
 indicatif.workspace = true
 libc.workspace = true
-rayon = { workspace = true, optional = true }
+rayon.workspace = true
 rars.workspace = true
 rpassword.workspace = true
 zeroize.workspace = true

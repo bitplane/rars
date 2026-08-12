@@ -70,24 +70,14 @@ fn write_rar50_archive(fixture: &ArchiveFixture) -> Vec<u8> {
 }
 
 fn extract_rar50_archive(archive: &Archive) {
-    #[cfg(feature = "parallel")]
     archive
         .extract_to_parallel_buffered(ArchiveReadOptions::new(), |meta| {
             assert!(!meta.is_directory);
             Ok(Box::new(std::io::sink()))
         })
         .expect("RAR 5 parallel benchmark extraction should succeed");
-
-    #[cfg(not(feature = "parallel"))]
-    archive
-        .extract_to(ArchiveReadOptions::new(), |meta| {
-            assert!(!meta.is_directory);
-            Ok(Box::new(std::io::sink()))
-        })
-        .expect("RAR 5 benchmark extraction should succeed");
 }
 
-#[cfg(feature = "parallel")]
 fn thread_counts() -> Vec<usize> {
     let available = std::thread::available_parallelism().map_or(1, usize::from);
     if available == 1 {
@@ -95,11 +85,6 @@ fn thread_counts() -> Vec<usize> {
     } else {
         vec![1, available]
     }
-}
-
-#[cfg(not(feature = "parallel"))]
-fn thread_counts() -> Vec<usize> {
-    vec![1]
 }
 
 fn thread_label(threads: usize) -> String {
@@ -111,7 +96,6 @@ fn thread_label(threads: usize) -> String {
     }
 }
 
-#[cfg(feature = "parallel")]
 fn with_threads<T>(threads: usize, run: impl FnOnce() -> T + Send) -> T
 where
     T: Send,
@@ -121,11 +105,6 @@ where
         .build()
         .expect("benchmark Rayon pool should build")
         .install(run)
-}
-
-#[cfg(not(feature = "parallel"))]
-fn with_threads<T>(_threads: usize, run: impl FnOnce() -> T) -> T {
-    run()
 }
 
 fn bench_parallel_compression(c: &mut Criterion) {

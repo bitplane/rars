@@ -1436,14 +1436,7 @@ fn extract_to_best<F>(
 where
     F: FnMut(&rars_rs::ExtractedEntryMeta) -> rars_rs::Result<Box<dyn Write>>,
 {
-    #[cfg(feature = "parallel")]
-    {
-        archive.extract_to_parallel_buffered(password, open)
-    }
-    #[cfg(not(feature = "parallel"))]
-    {
-        archive.extract_to(password, open)
-    }
+    archive.extract_to_parallel_buffered(password, open)
 }
 
 struct SharedVecWriter(Arc<Mutex<Vec<u8>>>);

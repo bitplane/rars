@@ -44,40 +44,38 @@ header encryption where implemented, comments, RARVM filters, RAR5 quick-open
 records, and supported recovery records. Run `rars --help` for the exact option
 set.
 
-## Parallel Builds
+## Parallel work
 
-The optional `parallel` feature enables Rayon worker threads for independent
-archive members. It parallelizes non-solid compression planning for supported
+Rayon worker threads process independent archive members. This parallelizes
+non-solid compression planning for supported
 writers and buffered extraction of non-solid, non-split single archives while
 preserving archive order for output. Solid archives and multivolume extraction
 fall back to the existing sequential stream because their codec state depends on
 member order.
 
-Build or run the CLI with parallel workers:
+Control the number of workers with `--threads`:
 
 ```sh
-cargo run -p rars-cli --features parallel -- --threads 4 a --format rar50 archive.rar files...
-cargo run -p rars-cli --features parallel -- x --threads 4 archive.rar out/
-cargo test --workspace --features parallel
+cargo run -p rars-cli -- --threads 4 a --format rar50 archive.rar files...
+cargo run -p rars-cli -- x --threads 4 archive.rar out/
 ```
 
 Measure parallel archive-member work with Criterion:
 
 ```sh
-cargo bench -p rars --bench parallel --features parallel
+cargo bench -p rars --bench parallel
 ```
 
 The parallel benchmark reports `1_thread` and `all_threads_N` cases for RAR5
 multi-member compression and extraction.
 
-When `--threads` is omitted, `rars` uses all available cores. Passing
-`--threads` to a CLI built without `parallel` is rejected.
+When `--threads` is omitted, `rars` uses all available cores. Pass
+`--threads 1` to run member work serially.
 
 ## Python bindings
 
 The workspace includes PyO3 bindings packaged as the `rars` Python module for
-Python 3.10 and newer. The default Python build enables the Rust `parallel`
-feature.
+Python 3.10 and newer. Independent archive members are processed in parallel.
 
 ```sh
 maturin develop

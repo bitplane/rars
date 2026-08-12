@@ -17,7 +17,6 @@ pub mod error;
 mod fast;
 pub mod features;
 mod io_util;
-#[cfg(feature = "parallel")]
 mod parallel;
 pub mod rar13;
 pub mod rar15_40;
@@ -356,7 +355,6 @@ impl Archive {
     ///
     /// Solid archives, split members, multivolume sets, and RAR 1.3/1.4
     /// archives use the regular streaming extractor.
-    #[cfg(feature = "parallel")]
     pub fn extract_to_parallel_buffered<F>(&self, password: Option<&[u8]>, open: F) -> Result<()>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -365,7 +363,6 @@ impl Archive {
     }
 
     /// Extracts independent non-solid members in parallel with read options.
-    #[cfg(feature = "parallel")]
     pub fn extract_to_parallel_buffered_with_options<F>(
         &self,
         options: ArchiveReadOptions<'_>,

@@ -1170,44 +1170,16 @@ fn encode_independent_payloads(
     options: WriterOptions,
     progress: Option<&WorkTracker<'_>>,
 ) -> Result<Vec<EncodedPayload>> {
-    #[cfg(feature = "parallel")]
-    {
-        if entries.len() > 1 {
-            crate::parallel::map_slice_collect(entries, |entry| {
-                encode_independent_payload(entry.data, options, progress)
-            })
-        } else {
-            entries
-                .iter()
-                .map(|entry| encode_independent_payload(entry.data, options, progress))
-                .collect()
-        }
-    }
-    #[cfg(not(feature = "parallel"))]
-    {
-        entries
-            .iter()
-            .map(|entry| encode_independent_payload(entry.data, options, progress))
-            .collect()
-    }
+    crate::parallel::map_slice_collect(entries, |entry| {
+        encode_independent_payload(entry.data, options, progress)
+    })
 }
 
 fn encode_filtered_payloads<F>(entries: &[FileEntry<'_>], encode: &F) -> Result<Vec<EncodedPayload>>
 where
     F: Fn(&FileEntry<'_>) -> Result<EncodedPayload> + Sync,
 {
-    #[cfg(feature = "parallel")]
-    {
-        if entries.len() > 1 {
-            crate::parallel::map_slice_collect(entries, encode)
-        } else {
-            entries.iter().map(encode).collect()
-        }
-    }
-    #[cfg(not(feature = "parallel"))]
-    {
-        entries.iter().map(encode).collect()
-    }
+    crate::parallel::map_slice_collect(entries, encode)
 }
 
 fn encode_or_store_payload(

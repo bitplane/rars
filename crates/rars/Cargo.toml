@@ -18,15 +18,12 @@ workspace = true
 [package.metadata.docs.rs]
 all-features = true
 
-[features]
-parallel = ["dep:rayon"]
-
 [dependencies]
 aes.workspace = true
 aho-corasick.workspace = true
 getrandom.workspace = true
 hmac.workspace = true
-rayon = { workspace = true, optional = true }
+rayon.workspace = true
 sha1.workspace = true
 sha2.workspace = true
 zeroize.workspace = true

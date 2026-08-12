@@ -1147,63 +1147,20 @@ fn resolve_compressed_members<'a>(
 ) -> Result<Vec<ResolvedRar50WriteMember<'a>>> {
     let total_entries = members.len();
     let members: Vec<_> = members.into_iter().enumerate().collect();
-    #[cfg(feature = "parallel")]
-    {
-        if members.len() > 1 {
-            crate::parallel::map_collect(members, |(index, member)| {
-                resolve_compressed_member(
-                    member,
-                    index,
-                    total_entries,
-                    target,
-                    compression_method,
-                    algorithm_version,
-                    dictionary_size,
-                    filter_policy,
-                    encode_option_candidates,
-                    progress,
-                )
-            })
-        } else {
-            members
-                .into_iter()
-                .map(|(index, member)| {
-                    resolve_compressed_member(
-                        member,
-                        index,
-                        total_entries,
-                        target,
-                        compression_method,
-                        algorithm_version,
-                        dictionary_size,
-                        filter_policy,
-                        encode_option_candidates,
-                        progress,
-                    )
-                })
-                .collect()
-        }
-    }
-    #[cfg(not(feature = "parallel"))]
-    {
-        members
-            .into_iter()
-            .map(|(index, member)| {
-                resolve_compressed_member(
-                    member,
-                    index,
-                    total_entries,
-                    target,
-                    compression_method,
-                    algorithm_version,
-                    dictionary_size,
-                    filter_policy,
-                    encode_option_candidates,
-                    progress,
-                )
-            })
-            .collect()
-    }
+    crate::parallel::map_collect(members, |(index, member)| {
+        resolve_compressed_member(
+            member,
+            index,
+            total_entries,
+            target,
+            compression_method,
+            algorithm_version,
+            dictionary_size,
+            filter_policy,
+            encode_option_candidates,
+            progress,
+        )
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1333,60 +1290,19 @@ fn resolve_encrypted_compressed_members<'a>(
 ) -> Result<Vec<ResolvedRar50WriteMember<'a>>> {
     let total_entries = members.len();
     let members: Vec<_> = members.into_iter().enumerate().collect();
-    #[cfg(feature = "parallel")]
-    {
-        if members.len() > 1 {
-            crate::parallel::map_collect(members, |(index, member)| {
-                resolve_encrypted_compressed_member(
-                    member,
-                    index,
-                    total_entries,
-                    target,
-                    compression_method,
-                    algorithm_version,
-                    dictionary_size,
-                    encode_option_candidates,
-                    progress,
-                )
-            })
-        } else {
-            members
-                .into_iter()
-                .map(|(index, member)| {
-                    resolve_encrypted_compressed_member(
-                        member,
-                        index,
-                        total_entries,
-                        target,
-                        compression_method,
-                        algorithm_version,
-                        dictionary_size,
-                        encode_option_candidates,
-                        progress,
-                    )
-                })
-                .collect()
-        }
-    }
-    #[cfg(not(feature = "parallel"))]
-    {
-        members
-            .into_iter()
-            .map(|(index, member)| {
-                resolve_encrypted_compressed_member(
-                    member,
-                    index,
-                    total_entries,
-                    target,
-                    compression_method,
-                    algorithm_version,
-                    dictionary_size,
-                    encode_option_candidates,
-                    progress,
-                )
-            })
-            .collect()
-    }
+    crate::parallel::map_collect(members, |(index, member)| {
+        resolve_encrypted_compressed_member(
+            member,
+            index,
+            total_entries,
+            target,
+            compression_method,
+            algorithm_version,
+            dictionary_size,
+            encode_option_candidates,
+            progress,
+        )
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

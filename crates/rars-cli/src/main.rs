@@ -85,7 +85,6 @@ fn run() -> CliResult<()> {
     }
 }
 
-#[cfg(feature = "parallel")]
 fn configure_threads(threads: Option<usize>) -> CliResult<()> {
     let default_threads = std::thread::available_parallelism()
         .ok()
@@ -99,16 +98,6 @@ fn configure_threads(threads: Option<usize>) -> CliResult<()> {
         .map_err(|err| CliError::general(format!("failed to configure parallel workers: {err}")))
 }
 
-#[cfg(not(feature = "parallel"))]
-fn configure_threads(threads: Option<usize>) -> CliResult<()> {
-    if threads.is_some() {
-        return Err(CliError::usage(
-            "--threads requires building rars-cli with --features parallel",
-        ));
-    }
-    Ok(())
-}
-
 fn extract_archive_to_with_options<F>(
     archive: &DetectedArchive,
     options: ArchiveReadOptions<'_>,
@@ -117,14 +106,7 @@ fn extract_archive_to_with_options<F>(
 where
     F: FnMut(&rars::ExtractedEntryMeta) -> rars::Result<Box<dyn Write>>,
 {
-    #[cfg(feature = "parallel")]
-    {
-        archive.extract_to_parallel_buffered_with_options(options, open)
-    }
-    #[cfg(not(feature = "parallel"))]
-    {
-        archive.extract_to_with_options(options, open)
-    }
+    archive.extract_to_parallel_buffered_with_options(options, open)
 }
 
 fn extract_options(

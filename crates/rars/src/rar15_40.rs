@@ -1189,7 +1189,6 @@ impl Archive {
         Ok(())
     }
 
-    #[cfg(feature = "parallel")]
     pub fn extract_to_parallel_buffered<F>(
         &self,
         options: crate::ArchiveReadOptions<'_>,
@@ -1208,9 +1207,6 @@ impl Archive {
 
         let password = options.password;
         let files: Vec<_> = self.files().collect();
-        if files.len() < 2 {
-            return self.extract_to(options, open);
-        }
         let entries = crate::parallel::map_collect(files, |file| {
             decode_parallel_entry(self, file, password)
         })?;
@@ -1240,7 +1236,6 @@ impl Archive {
     }
 }
 
-#[cfg(feature = "parallel")]
 enum ParallelExtractedEntry {
     Directory(ExtractedEntryMeta),
     File {
@@ -1249,7 +1244,6 @@ enum ParallelExtractedEntry {
     },
 }
 
-#[cfg(feature = "parallel")]
 fn decode_parallel_entry(
     archive: &Archive,
     file: &FileHeader,
@@ -1277,7 +1271,6 @@ fn decode_parallel_entry(
     Ok(ParallelExtractedEntry::File { meta, data })
 }
 
-#[cfg(feature = "parallel")]
 fn write_parallel_entry<F>(entry: ParallelExtractedEntry, open: &mut F) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
