@@ -1,7 +1,9 @@
 use super::filters::{self, DeltaErrorMessages, FilterOp};
 use super::{huffman, match_finder, Error, Result};
 use std::collections::VecDeque;
-use std::io::{Read, Write};
+use std::io::Read;
+#[cfg(test)]
+use std::io::Write;
 use std::ops::Range;
 
 pub const LEVEL_TABLE_SIZE: usize = 20;
@@ -541,6 +543,7 @@ pub(crate) fn encode_lz_member_with_options_and_progress(
     encode_lz_member_inner(data, &[], algorithm_version, &[], options, Some(progress))
 }
 
+#[cfg(test)]
 pub(crate) fn encode_lz_reader_to(
     reader: &mut dyn Read,
     input_size: u64,
@@ -595,6 +598,24 @@ pub(crate) fn encode_lz_reader_to(
         ));
     }
     Ok(())
+}
+
+pub(crate) fn encode_lz_streaming_block(
+    data: &[u8],
+    history: &[u8],
+    algorithm_version: u8,
+    options: EncodeOptions,
+    is_last: bool,
+) -> Result<Vec<u8>> {
+    encode_lz_block(
+        data,
+        history,
+        algorithm_version,
+        &[],
+        options,
+        is_last,
+        None,
+    )
 }
 
 pub fn encode_lz_member_with_history_and_options(

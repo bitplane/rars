@@ -119,6 +119,21 @@ struct PreparedStreamingEntry {
     store: bool,
 }
 
+struct StreamingLzState {
+    entry_index: usize,
+    reader: Box<dyn crate::EntryReader>,
+    remaining: u64,
+    history: Vec<u8>,
+    packed: Spool,
+}
+
+struct StreamingLzJob {
+    entry_index: usize,
+    data: Vec<u8>,
+    history: Vec<u8>,
+    is_last: bool,
+}
+
 /// Writes a non-solid RAR 5 or RAR 7 archive without retaining member payloads.
 pub fn write_streaming_compressed_archive_to(
     entries: &[StreamingCompressedEntry],
@@ -138,51 +153,21 @@ pub fn write_streaming_compressed_archive_to(
     let encode_options = encode_options_for_level(options.compression_level, dictionary_size)?;
     let method = compression_method_for_level(options.compression_level)?;
     let block_size = 1024 * 1024usize;
-    let required = streaming_lz_workspace(dictionary_size, block_size);
-    let prepared = crate::parallel::map_slice_collect(entries, |entry| -> Result<_> {
-        validate_file_entry(&entry.name)?;
-        let input_size = entry.source.len()?;
-        let _permit = resources.acquire(required, dictionary_size)?;
-        let mut crc = Crc32::new();
-        let mut hash = blake2sp::Hasher::new();
-        let mut reader = entry.source.open()?;
-        let mut buffer = vec![0u8; block_size];
-        let mut observed = 0u64;
-        loop {
-            let read = reader.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            observed += read as u64;
-            crc.update(&buffer[..read]);
-            hash.update(&buffer[..read]);
-        }
-        if observed != input_size {
-            return Err(Error::InvalidHeader(
-                "entry source size changed while reading",
-            ));
-        }
-
-        let mut packed = Spool::create(resources)?;
-        let mut reader = entry.source.open()?;
-        crate::codec::rar50::encode_lz_reader_to(
-            &mut reader,
-            input_size,
-            &mut packed,
-            algorithm_version,
-            encode_options,
-            block_size,
-            None,
-        )?;
-        let store = packed.len() >= input_size;
-        Ok(PreparedStreamingEntry {
-            input_size,
-            crc32: crc.finish(),
-            hash: hash.finalize(),
-            packed,
-            store,
+    let sources: Vec<_> = entries
+        .iter()
+        .map(|entry| {
+            validate_file_entry(&entry.name)?;
+            Ok(entry.source.clone())
         })
-    })?;
+        .collect::<Result<_>>()?;
+    let prepared = prepare_streaming_lz_entries(
+        &sources,
+        algorithm_version,
+        encode_options,
+        dictionary_size,
+        block_size,
+        resources,
+    )?;
 
     output.write_all(RAR50_SIGNATURE)?;
     let mut main = Vec::new();
@@ -245,6 +230,144 @@ pub fn write_streaming_compressed_archive_to(
     Ok(())
 }
 
+fn prepare_streaming_lz_entries(
+    sources: &[EntrySource],
+    algorithm_version: u8,
+    encode_options: EncodeOptions,
+    dictionary_size: u64,
+    block_size: usize,
+    resources: &WriterResources,
+) -> Result<Vec<PreparedStreamingEntry>> {
+    let mut integrity = Vec::with_capacity(sources.len());
+    for source in sources {
+        let input_size = source.len()?;
+        let (crc32, hash) = source_integrity(source, input_size, block_size)?;
+        integrity.push((input_size, crc32, hash));
+    }
+
+    let required = streaming_lz_workspace(dictionary_size, block_size);
+    let max_jobs_by_memory = resources.memory_limit() / required;
+    if max_jobs_by_memory == 0 {
+        resources.acquire(required, dictionary_size)?;
+        unreachable!("oversized workspace acquisition must fail");
+    }
+    let batch_capacity = usize::try_from(max_jobs_by_memory)
+        .unwrap_or(usize::MAX)
+        .min(rayon::current_num_threads())
+        .max(1);
+    let mut prepared = Vec::with_capacity(sources.len());
+    for (group_index, source_group) in sources.chunks(batch_capacity).enumerate() {
+        let group_start = group_index * batch_capacity;
+        let integrity_group = &integrity[group_start..group_start + source_group.len()];
+        let mut states = source_group
+            .iter()
+            .zip(integrity_group)
+            .enumerate()
+            .map(|(entry_index, (source, (input_size, _, _)))| {
+                Ok(StreamingLzState {
+                    entry_index,
+                    reader: source.open()?,
+                    remaining: *input_size,
+                    history: Vec::new(),
+                    packed: Spool::create(resources)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        compress_streaming_lz_group(
+            &mut states,
+            algorithm_version,
+            encode_options,
+            dictionary_size,
+            block_size,
+            required,
+            batch_capacity,
+            resources,
+        )?;
+        prepared.extend(states.into_iter().zip(integrity_group).map(
+            |(state, &(input_size, crc32, hash))| PreparedStreamingEntry {
+                input_size,
+                crc32,
+                hash,
+                store: state.packed.len() >= input_size,
+                packed: state.packed,
+            },
+        ));
+    }
+    Ok(prepared)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compress_streaming_lz_group(
+    states: &mut [StreamingLzState],
+    algorithm_version: u8,
+    encode_options: EncodeOptions,
+    dictionary_size: u64,
+    block_size: usize,
+    required: u64,
+    batch_capacity: usize,
+    resources: &WriterResources,
+) -> Result<()> {
+    let mut cursor = 0usize;
+    while states.iter().any(|state| state.remaining != 0) {
+        let reserved = required.saturating_mul(batch_capacity as u64);
+        let _permit = resources.acquire(reserved, dictionary_size)?;
+        let mut jobs = Vec::with_capacity(batch_capacity);
+        let mut misses = 0usize;
+        while jobs.len() < batch_capacity && misses < states.len() {
+            let state_count = states.len();
+            let state = &mut states[cursor];
+            cursor = (cursor + 1) % state_count;
+            if state.remaining == 0 {
+                misses += 1;
+                continue;
+            }
+            misses = 0;
+            let wanted = usize::try_from(state.remaining.min(block_size as u64))
+                .map_err(|_| Error::InvalidHeader("RAR 5 block size overflows usize"))?;
+            let mut data = vec![0u8; wanted];
+            state.reader.read_exact(&mut data)?;
+            state.remaining -= wanted as u64;
+            let is_last = state.remaining == 0;
+            if is_last {
+                let mut trailing = [0u8; 1];
+                if state.reader.read(&mut trailing)? != 0 {
+                    return Err(Error::InvalidHeader(
+                        "entry source size changed while compressing",
+                    ));
+                }
+            }
+            jobs.push(StreamingLzJob {
+                entry_index: state.entry_index,
+                data,
+                history: state.history.clone(),
+                is_last,
+            });
+            state.history.extend_from_slice(&jobs.last().unwrap().data);
+            let keep_from = state
+                .history
+                .len()
+                .saturating_sub(encode_options.max_match_distance);
+            if keep_from != 0 {
+                state.history.drain(..keep_from);
+            }
+        }
+        let packed_blocks = crate::parallel::map_collect(jobs, |job| {
+            let packed = crate::codec::rar50::encode_lz_streaming_block(
+                &job.data,
+                &job.history,
+                algorithm_version,
+                encode_options,
+                job.is_last,
+            )?;
+            Ok::<_, crate::codec::Error>((job.entry_index, packed))
+        })?;
+        for (entry_index, packed) in packed_blocks {
+            states[entry_index].packed.write_all(&packed)?;
+        }
+    }
+    Ok(())
+}
+
 /// Writes an encrypted, non-solid RAR 5 or RAR 7 archive with bounded memory.
 pub fn write_streaming_encrypted_compressed_archive_to(
     entries: &[StreamingEncryptedCompressedEntry],
@@ -264,27 +387,24 @@ pub fn write_streaming_encrypted_compressed_archive_to(
     let encode_options = encode_options_for_level(options.compression_level, dictionary_size)?;
     let method = compression_method_for_level(options.compression_level)?;
     let block_size = 1024 * 1024usize;
-    let required =
-        streaming_lz_workspace(dictionary_size, block_size).saturating_add(block_size as u64);
-
-    let prepared = crate::parallel::map_slice_collect(entries, |entry| -> Result<_> {
-        validate_file_entry(&entry.name)?;
-        let input_size = entry.source.len()?;
-        let _permit = resources.acquire(required, dictionary_size)?;
-        let (crc32, hash) = source_integrity(&entry.source, input_size, block_size)?;
-        let mut packed = Spool::create(resources)?;
-        let mut reader = entry.source.open()?;
-        crate::codec::rar50::encode_lz_reader_to(
-            &mut reader,
-            input_size,
-            &mut packed,
-            algorithm_version,
-            encode_options,
-            block_size,
-            None,
-        )?;
-        let store = packed.len() >= input_size;
-
+    let sources: Vec<_> = entries
+        .iter()
+        .map(|entry| {
+            validate_file_entry(&entry.name)?;
+            Ok(entry.source.clone())
+        })
+        .collect::<Result<_>>()?;
+    let compressed = prepare_streaming_lz_entries(
+        &sources,
+        algorithm_version,
+        encode_options,
+        dictionary_size,
+        block_size,
+        resources,
+    )?;
+    let mut prepared = Vec::with_capacity(entries.len());
+    for (entry, mut compressed) in entries.iter().zip(compressed) {
+        let _permit = resources.acquire(block_size as u64, dictionary_size)?;
         let mut salt = [0u8; 16];
         let mut iv = [0u8; 16];
         getrandom::fill(&mut salt)
@@ -294,21 +414,21 @@ pub fn write_streaming_encrypted_compressed_archive_to(
         let keys =
             Rar50Keys::derive(&entry.password, salt, 0).map_err(super::map_rar50_crypto_error)?;
         let mut encrypted = Spool::create(resources)?;
-        if store {
+        if compressed.store {
             let mut reader = entry.source.open()?;
             encrypt_reader_to(
                 &mut *reader,
-                input_size,
+                compressed.input_size,
                 &mut encrypted,
                 &keys,
                 iv,
                 block_size,
             )?;
         } else {
-            packed.rewind()?;
-            let packed_size = packed.len();
+            compressed.packed.rewind()?;
+            let packed_size = compressed.packed.len();
             encrypt_reader_to(
-                &mut packed,
+                &mut compressed.packed,
                 packed_size,
                 &mut encrypted,
                 &keys,
@@ -316,17 +436,17 @@ pub fn write_streaming_encrypted_compressed_archive_to(
                 block_size,
             )?;
         }
-        Ok(PreparedEncryptedStreamingEntry {
-            input_size,
-            crc32_mac: keys.mac_crc32(crc32),
-            hash_mac: keys.mac_hash32(hash),
+        prepared.push(PreparedEncryptedStreamingEntry {
+            input_size: compressed.input_size,
+            crc32_mac: keys.mac_crc32(compressed.crc32),
+            hash_mac: keys.mac_hash32(compressed.hash),
             encrypted,
-            store,
+            store: compressed.store,
             salt,
             iv,
             check_value: keys.password_check_record(),
-        })
-    })?;
+        });
+    }
 
     output.write_all(RAR50_SIGNATURE)?;
     let mut main = Vec::new();
@@ -407,11 +527,13 @@ fn source_integrity(
 
 fn streaming_lz_workspace(dictionary_size: u64, block_size: usize) -> u64 {
     // The hash-chain finder has one usize link per byte in history + input,
-    // in addition to the byte buffers and a worst-case literal token per input
-    // byte. Leave headroom for Huffman tables and allocator rounding.
+    // alongside byte buffers, worst-case literal tokens, parser candidates,
+    // and allocations retained by the system allocator between block jobs.
+    // Keep this deliberately conservative: it is the admission weight for
+    // concurrent blocks, not a prediction of the final packed size.
     dictionary_size
-        .saturating_mul(10)
-        .saturating_add((block_size as u64).saturating_mul(40))
+        .saturating_mul(12)
+        .saturating_add((block_size as u64).saturating_mul(112))
         .saturating_add(2 * 1024 * 1024)
 }
 
@@ -3273,7 +3395,7 @@ mod tests {
     use crate::{ArchiveVersion, FeatureSet};
     use std::cell::RefCell;
     use std::fs;
-    use std::io::{Result as IoResult, Write};
+    use std::io::{Cursor, Result as IoResult, Write};
     use std::process::Command;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3466,6 +3588,119 @@ mod tests {
             &mut Vec::new(),
         );
         assert!(matches!(result, Err(Error::MemoryLimitExceeded { .. })));
+    }
+
+    #[test]
+    fn parallel_streaming_blocks_are_byte_identical_to_serial_blocks() {
+        let mut data = Vec::new();
+        for index in 0..52_000u32 {
+            data.extend_from_slice(b"parallel block identity payload ");
+            data.extend_from_slice(&index.to_le_bytes());
+        }
+        let options = WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only());
+        let algorithm_version = rar50_algorithm_version(options).unwrap();
+        let dictionary_size = dictionary_size_for_options(options).unwrap();
+        let encode_options =
+            encode_options_for_level(options.compression_level, dictionary_size).unwrap();
+        let block_size = 1024 * 1024;
+        let mut serial = Vec::new();
+        crate::codec::rar50::encode_lz_reader_to(
+            &mut Cursor::new(&data),
+            data.len() as u64,
+            &mut serial,
+            algorithm_version,
+            encode_options,
+            block_size,
+            None,
+        )
+        .unwrap();
+
+        let source = EntrySource::from_bytes(Arc::<[u8]>::from(data));
+        let required = streaming_lz_workspace(dictionary_size, block_size);
+        let mut prepared = prepare_streaming_lz_entries(
+            &[source],
+            algorithm_version,
+            encode_options,
+            dictionary_size,
+            block_size,
+            &WriterResources::new(required.saturating_mul(4)),
+        )
+        .unwrap();
+        let mut parallel = Vec::new();
+        prepared[0].packed.copy_to(&mut parallel).unwrap();
+        assert_eq!(parallel, serial);
+    }
+
+    #[test]
+    fn streaming_entry_order_is_identical_at_one_and_many_job_budgets() {
+        let entries: Vec<_> = (0..4u8)
+            .map(|index| {
+                let mut data = vec![index; 1_300_000];
+                data.extend((0..300_000).map(|offset| (offset as u8).wrapping_add(index)));
+                StreamingCompressedEntry {
+                    name: format!("entry-{index}.bin").into_bytes(),
+                    source: EntrySource::from_bytes(Arc::<[u8]>::from(data)),
+                    mtime: None,
+                    attributes: 0x20,
+                    host_os: 1,
+                }
+            })
+            .collect();
+        let options = WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only());
+        let dictionary_size = dictionary_size_for_options(options).unwrap();
+        let required = streaming_lz_workspace(dictionary_size, 1024 * 1024);
+        let mut one_job = Vec::new();
+        write_streaming_compressed_archive_to(
+            &entries,
+            options,
+            &WriterResources::new(required),
+            &mut one_job,
+        )
+        .unwrap();
+        let mut many_jobs = Vec::new();
+        write_streaming_compressed_archive_to(
+            &entries,
+            options,
+            &WriterResources::new(required.saturating_mul(4)),
+            &mut many_jobs,
+        )
+        .unwrap();
+        assert_eq!(many_jobs, one_job);
+    }
+
+    #[test]
+    fn streaming_writer_rejects_a_source_that_grows_between_passes() {
+        let opens = Arc::new(AtomicUsize::new(0));
+        let source = EntrySource::from_opener(4, {
+            let opens = Arc::clone(&opens);
+            move || {
+                let data = if opens.fetch_add(1, Ordering::SeqCst) == 0 {
+                    b"data".to_vec()
+                } else {
+                    b"data!".to_vec()
+                };
+                Ok(Box::new(Cursor::new(data)))
+            }
+        });
+        let entry = StreamingCompressedEntry {
+            name: b"changing.bin".to_vec(),
+            source,
+            mtime: None,
+            attributes: 0x20,
+            host_os: 1,
+        };
+        let result = write_streaming_compressed_archive_to(
+            &[entry],
+            WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only()),
+            &WriterResources::default(),
+            &mut Vec::new(),
+        );
+        assert!(matches!(
+            result,
+            Err(Error::InvalidHeader(
+                "entry source size changed while compressing"
+            ))
+        ));
     }
 
     #[test]
