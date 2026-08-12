@@ -44,6 +44,16 @@ header encryption where implemented, comments, RARVM filters, RAR5 quick-open
 records, and supported recovery records. Run `rars --help` for the exact option
 set.
 
+Non-solid RAR 5 and RAR 7 creation streams path inputs through bounded codec
+windows and disk-backed payload spools. The global compression workspace limit
+defaults to 256 MiB and is shared by Rayon jobs; a dictionary that cannot fit is
+rejected before compression starts. Temporary payloads are created beside the
+output archive by default.
+
+```sh
+rars a --memory-limit 128m --temp-dir /path/with/space archive.rar files...
+```
+
 ## Parallel work
 
 Rayon worker threads process independent archive members. This parallelizes
@@ -84,7 +94,10 @@ maturin develop
 The Python API exposes a `rarfile`-style `RarFile` for listing, reading,
 testing, and extracting archives, plus `RarBuilder` for creating or rewriting
 archives. Rewrites are staged into a new archive; existing RAR files are not
-edited in place.
+edited in place. `RarBuilder.add()` keeps path inputs lazy, and the common
+non-solid RAR 5/7 `write()` path writes directly instead of first constructing
+the complete archive in memory. `add_bytes()` and `to_bytes()` remain available
+as convenience wrappers.
 
 ## Development
 

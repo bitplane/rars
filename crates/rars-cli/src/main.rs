@@ -12,7 +12,7 @@ mod volumes;
 
 use cli::{AddArgs, Command, ExtractArgs, InfoArgs, PasswordArgs, TestArgs};
 use error::{CliError, CliResult};
-use input::{rar15_file_attr, rar50_file_attr, read_inputs_with_progress};
+use input::{collect_inputs, rar15_file_attr, rar50_file_attr, read_inputs_with_progress};
 use output::{
     create_rar50_redirection as create_rar50_redirection_output, open_output_writer,
     output_path_for_entry, output_path_for_rar50_entry, output_relative_path, print_ok_entry,
@@ -950,6 +950,8 @@ struct AddCommand {
     store: bool,
     compression_level: Option<u8>,
     dictionary_size: Option<usize>,
+    memory_limit: usize,
+    temp_dir: Option<PathBuf>,
     solid: bool,
     header_encryption: bool,
     quick_open: bool,
@@ -1006,6 +1008,8 @@ fn build_add_command(args: AddArgs) -> CliResult<AddCommand> {
         store,
         compression_level,
         dictionary_size: args.dict_size,
+        memory_limit: args.memory_limit,
+        temp_dir: args.temp_dir.map(PathBuf::from),
         solid: args.solid,
         header_encryption: args.encrypt_headers,
         quick_open: args.quick_open,
@@ -1034,6 +1038,8 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
         store,
         compression_level,
         dictionary_size,
+        memory_limit,
+        temp_dir,
         solid,
         header_encryption,
         quick_open,
@@ -1095,6 +1101,36 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
         && input_paths.len() != 1
     {
         return Err("multivolume writer currently supports one input file".into());
+    }
+    let plain_rar50_streaming = matches!(target, ArchiveVersion::Rar50 | ArchiveVersion::Rar70)
+        && !solid
+        && !header_encryption
+        && !quick_open
+        && archive_comment.is_none()
+        && archive_name.is_none()
+        && file_comment.is_none()
+        && recovery_percent.is_none()
+        && volume_size.is_none()
+        && delta_filter.is_none()
+        && e8_filter.is_none()
+        && !itanium_filter
+        && rgb_filter.is_none()
+        && audio_filter.is_none()
+        && !arm_filter
+        && !auto_filter
+        && !ppmd;
+    if plain_rar50_streaming {
+        return write_plain_rar50_streaming(
+            input_paths,
+            &archive_path,
+            target,
+            if store { Some(0) } else { compression_level },
+            dictionary_size,
+            memory_limit,
+            temp_dir.as_deref(),
+            password_bytes(&password),
+            &progress,
+        );
     }
     progress.spinner("Scanning inputs");
     let owned = read_inputs_with_progress(
@@ -1809,6 +1845,156 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
             Ok(())
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_plain_rar50_streaming(
+    input_paths: &[String],
+    archive_path: &Path,
+    target: ArchiveVersion,
+    compression_level: Option<u8>,
+    dictionary_size: Option<usize>,
+    memory_limit: usize,
+    temp_dir: Option<&Path>,
+    password: Option<&[u8]>,
+    progress: &CliProgress,
+) -> CliResult<()> {
+    progress.spinner("Scanning inputs");
+    let inputs = collect_inputs(input_paths)?;
+    let total: u64 = inputs.iter().map(|entry| entry.size).sum();
+    progress.finish(format!(
+        "Found {} files ({})",
+        inputs.len(),
+        indicatif::HumanBytes(total)
+    ));
+    let entries: Vec<_> = inputs
+        .into_iter()
+        .map(|entry| rars::rar50::StreamingCompressedEntry {
+            name: entry.name,
+            source: rars::EntrySource::from_path(entry.path),
+            mtime: entry.unix_mtime,
+            attributes: u64::from(
+                entry
+                    .unix_mode
+                    .unwrap_or_else(|| u32::from(entry.file_attr)),
+            ),
+            host_os: RAR50_HOST_NATIVE,
+        })
+        .collect();
+    let mut features = FeatureSet::store_only();
+    features.file_encryption = password.is_some();
+    let mut options = rars::rar50::WriterOptions::new(target, features);
+    if let Some(level) = compression_level {
+        options = options.with_compression_level(level);
+    }
+    if let Some(size) = dictionary_size {
+        options = options.with_dictionary_size(size as u64);
+    }
+    let default_temp = archive_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let mut resources = rars::WriterResources::new(memory_limit as u64);
+    if let Some(directory) = temp_dir.or(default_temp) {
+        resources = resources.with_temp_dir(directory);
+    }
+    progress.spinner("Preparing compression");
+    progress.bar("Compressing archive", total);
+    if archive_path == Path::new("-") || archive_path == Path::new("/dev/stdout") {
+        if let Some(password) = password {
+            let encrypted = encrypted_streaming_entries(&entries, password);
+            rars::rar50::write_streaming_encrypted_compressed_archive_to(
+                &encrypted,
+                options,
+                &resources,
+                &mut std::io::stdout(),
+            )?;
+        } else {
+            rars::rar50::write_streaming_compressed_archive_to(
+                &entries,
+                options,
+                &resources,
+                &mut std::io::stdout(),
+            )?;
+        }
+    } else {
+        let (temporary, mut output) = create_streaming_archive_temp(archive_path)?;
+        let result = (|| -> CliResult<()> {
+            if let Some(password) = password {
+                let encrypted = encrypted_streaming_entries(&entries, password);
+                rars::rar50::write_streaming_encrypted_compressed_archive_to(
+                    &encrypted,
+                    options,
+                    &resources,
+                    &mut output,
+                )?;
+            } else {
+                rars::rar50::write_streaming_compressed_archive_to(
+                    &entries,
+                    options,
+                    &resources,
+                    &mut output,
+                )?;
+            }
+            output.sync_all()?;
+            fs::rename(&temporary, archive_path)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result?;
+    }
+    progress.finish("100%");
+    progress.spinner("Writing archive");
+    progress.finish("Archive written");
+    eprintln!("created {}", archive_path.display());
+    Ok(())
+}
+
+fn create_streaming_archive_temp(archive_path: &Path) -> CliResult<(PathBuf, fs::File)> {
+    let file_name = archive_path
+        .file_name()
+        .ok_or("archive output path has no file name")?
+        .to_string_lossy();
+    for sequence in 0..128u8 {
+        let temporary = archive_path.with_file_name(format!(
+            ".{file_name}.rars-writing-{}-{sequence:02x}",
+            std::process::id()
+        ));
+        match fs::File::options()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => return Ok((temporary, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "failed to create temporary archive '{}': {error}",
+                    temporary.display()
+                )
+                .into())
+            }
+        }
+    }
+    Err("could not allocate a unique temporary archive file".into())
+}
+
+fn encrypted_streaming_entries(
+    entries: &[rars::rar50::StreamingCompressedEntry],
+    password: &[u8],
+) -> Vec<rars::rar50::StreamingEncryptedCompressedEntry> {
+    entries
+        .iter()
+        .map(|entry| rars::rar50::StreamingEncryptedCompressedEntry {
+            name: entry.name.clone(),
+            source: entry.source.clone(),
+            mtime: entry.mtime,
+            attributes: entry.attributes,
+            host_os: entry.host_os,
+            password: password.to_vec(),
+        })
+        .collect()
 }
 
 fn validate_archive_output_path(path: &Path) -> CliResult<()> {

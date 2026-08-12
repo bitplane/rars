@@ -34,6 +34,7 @@ pub(crate) enum ProgressMode {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Command {
     /// Display archive metadata
     Info(InfoArgs),
@@ -128,6 +129,12 @@ pub(crate) struct AddArgs {
     /// Dictionary size (e.g. 4m, 128k)
     #[arg(long, value_name = "SIZE", value_parser = crate::parse_size_string)]
     pub dict_size: Option<usize>,
+    /// Maximum total compression working memory (default: 256m)
+    #[arg(long, value_name = "SIZE", default_value = "256m", value_parser = crate::parse_size_string)]
+    pub memory_limit: usize,
+    /// Directory for temporary compressed payloads
+    #[arg(long, value_name = "PATH")]
+    pub temp_dir: Option<String>,
     /// Use solid compression (treats inputs as one continuous stream)
     #[arg(long)]
     pub solid: bool,

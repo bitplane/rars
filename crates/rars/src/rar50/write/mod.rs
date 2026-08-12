@@ -1,10 +1,13 @@
 use super::*;
 pub use crate::codec::rar50::Rar50FilterKind as FilterKind;
 use crate::codec::rar50::{EncodeOptions, Unpack50Encoder};
+use crate::crc32::Crc32;
 use crate::crypto::rar50::{Rar50Cipher, Rar50Keys};
 use crate::recovery::rar5::build_structural_inline_recovery_data_with_progress;
+use crate::streaming::Spool;
 use crate::write_progress::{ProgressReporter, WorkTracker};
-use crate::{WriteOperation, WriteProgress, WriteProgressEvent};
+use crate::{EntrySource, WriteOperation, WriteProgress, WriteProgressEvent, WriterResources};
+use std::io::{Read, Write};
 
 mod filter_policy;
 mod volume;
@@ -85,6 +88,368 @@ pub struct CompressedEntry<'a> {
     pub mtime: Option<u32>,
     pub attributes: u64,
     pub host_os: u64,
+}
+
+#[derive(Debug, Clone)]
+/// A non-encrypted member backed by a reopenable streaming source.
+pub struct StreamingCompressedEntry {
+    pub name: Vec<u8>,
+    pub source: EntrySource,
+    pub mtime: Option<u32>,
+    pub attributes: u64,
+    pub host_os: u64,
+}
+
+#[derive(Debug, Clone)]
+/// An encrypted member backed by a reopenable streaming source.
+pub struct StreamingEncryptedCompressedEntry {
+    pub name: Vec<u8>,
+    pub source: EntrySource,
+    pub mtime: Option<u32>,
+    pub attributes: u64,
+    pub host_os: u64,
+    pub password: Vec<u8>,
+}
+
+struct PreparedStreamingEntry {
+    input_size: u64,
+    crc32: u32,
+    hash: [u8; 32],
+    packed: Spool,
+    store: bool,
+}
+
+/// Writes a non-solid RAR 5 or RAR 7 archive without retaining member payloads.
+pub fn write_streaming_compressed_archive_to(
+    entries: &[StreamingCompressedEntry],
+    options: WriterOptions,
+    resources: &WriterResources,
+    output: &mut dyn Write,
+) -> Result<()> {
+    validate_compressed_options(options)?;
+    if options.features.solid {
+        return Err(Error::UnsupportedFeature {
+            version: options.target,
+            feature: "streaming solid compression",
+        });
+    }
+    let algorithm_version = rar50_algorithm_version(options)?;
+    let dictionary_size = dictionary_size_for_options(options)?;
+    let encode_options = encode_options_for_level(options.compression_level, dictionary_size)?;
+    let method = compression_method_for_level(options.compression_level)?;
+    let block_size = 1024 * 1024usize;
+    let required = streaming_lz_workspace(dictionary_size, block_size);
+    let prepared = crate::parallel::map_slice_collect(entries, |entry| -> Result<_> {
+        validate_file_entry(&entry.name)?;
+        let input_size = entry.source.len()?;
+        let _permit = resources.acquire(required, dictionary_size)?;
+        let mut crc = Crc32::new();
+        let mut hash = blake2sp::Hasher::new();
+        let mut reader = entry.source.open()?;
+        let mut buffer = vec![0u8; block_size];
+        let mut observed = 0u64;
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            observed += read as u64;
+            crc.update(&buffer[..read]);
+            hash.update(&buffer[..read]);
+        }
+        if observed != input_size {
+            return Err(Error::InvalidHeader(
+                "entry source size changed while reading",
+            ));
+        }
+
+        let mut packed = Spool::create(resources)?;
+        let mut reader = entry.source.open()?;
+        crate::codec::rar50::encode_lz_reader_to(
+            &mut reader,
+            input_size,
+            &mut packed,
+            algorithm_version,
+            encode_options,
+            block_size,
+            None,
+        )?;
+        let store = packed.len() >= input_size;
+        Ok(PreparedStreamingEntry {
+            input_size,
+            crc32: crc.finish(),
+            hash: hash.finalize(),
+            packed,
+            store,
+        })
+    })?;
+
+    output.write_all(RAR50_SIGNATURE)?;
+    let mut main = Vec::new();
+    write_main_header(&mut main, 0, None, &[])?;
+    output.write_all(&main)?;
+
+    for (entry, mut prepared) in entries.iter().zip(prepared) {
+        let packed_size = if prepared.store {
+            prepared.input_size
+        } else {
+            prepared.packed.len()
+        };
+        let compression_info = compression_info(
+            algorithm_version,
+            if prepared.store { 0 } else { method },
+            dictionary_size,
+            false,
+        )?;
+        let specific = file_specific(
+            &entry.name,
+            prepared.input_size,
+            Some(prepared.crc32),
+            entry.attributes,
+            entry.mtime,
+            compression_info,
+            entry.host_os,
+        )?;
+        let mut extra = Vec::new();
+        write_hash_record_with_value(&mut extra, prepared.hash);
+        let header = block_header_image(
+            HEAD_FILE,
+            HFL_EXTRA | HFL_DATA,
+            Some(packed_size),
+            &specific,
+            &extra,
+        )?;
+        output.write_all(&header)?;
+        if prepared.store {
+            let mut reader = entry.source.open()?;
+            let copied = std::io::copy(&mut reader.by_ref().take(prepared.input_size), output)?;
+            if copied != prepared.input_size {
+                return Err(Error::InvalidHeader(
+                    "entry source size changed while writing",
+                ));
+            }
+            let mut trailing = [0u8; 1];
+            if reader.read(&mut trailing)? != 0 {
+                return Err(Error::InvalidHeader(
+                    "entry source size changed while writing",
+                ));
+            }
+        } else {
+            prepared.packed.copy_to(output)?;
+        }
+    }
+
+    let mut end = Vec::new();
+    write_end_header(&mut end, 0)?;
+    output.write_all(&end)?;
+    Ok(())
+}
+
+/// Writes an encrypted, non-solid RAR 5 or RAR 7 archive with bounded memory.
+pub fn write_streaming_encrypted_compressed_archive_to(
+    entries: &[StreamingEncryptedCompressedEntry],
+    options: WriterOptions,
+    resources: &WriterResources,
+    output: &mut dyn Write,
+) -> Result<()> {
+    validate_encrypted_compressed_options(options)?;
+    if options.features.solid || options.features.header_encryption {
+        return Err(Error::UnsupportedFeature {
+            version: options.target,
+            feature: "streaming solid or header encryption",
+        });
+    }
+    let algorithm_version = rar50_algorithm_version(options)?;
+    let dictionary_size = dictionary_size_for_options(options)?;
+    let encode_options = encode_options_for_level(options.compression_level, dictionary_size)?;
+    let method = compression_method_for_level(options.compression_level)?;
+    let block_size = 1024 * 1024usize;
+    let required =
+        streaming_lz_workspace(dictionary_size, block_size).saturating_add(block_size as u64);
+
+    let prepared = crate::parallel::map_slice_collect(entries, |entry| -> Result<_> {
+        validate_file_entry(&entry.name)?;
+        let input_size = entry.source.len()?;
+        let _permit = resources.acquire(required, dictionary_size)?;
+        let (crc32, hash) = source_integrity(&entry.source, input_size, block_size)?;
+        let mut packed = Spool::create(resources)?;
+        let mut reader = entry.source.open()?;
+        crate::codec::rar50::encode_lz_reader_to(
+            &mut reader,
+            input_size,
+            &mut packed,
+            algorithm_version,
+            encode_options,
+            block_size,
+            None,
+        )?;
+        let store = packed.len() >= input_size;
+
+        let mut salt = [0u8; 16];
+        let mut iv = [0u8; 16];
+        getrandom::fill(&mut salt)
+            .map_err(|_| Error::InvalidHeader("RAR 5 writer could not generate encryption salt"))?;
+        getrandom::fill(&mut iv)
+            .map_err(|_| Error::InvalidHeader("RAR 5 writer could not generate encryption IV"))?;
+        let keys =
+            Rar50Keys::derive(&entry.password, salt, 0).map_err(super::map_rar50_crypto_error)?;
+        let mut encrypted = Spool::create(resources)?;
+        if store {
+            let mut reader = entry.source.open()?;
+            encrypt_reader_to(
+                &mut *reader,
+                input_size,
+                &mut encrypted,
+                &keys,
+                iv,
+                block_size,
+            )?;
+        } else {
+            packed.rewind()?;
+            let packed_size = packed.len();
+            encrypt_reader_to(
+                &mut packed,
+                packed_size,
+                &mut encrypted,
+                &keys,
+                iv,
+                block_size,
+            )?;
+        }
+        Ok(PreparedEncryptedStreamingEntry {
+            input_size,
+            crc32_mac: keys.mac_crc32(crc32),
+            hash_mac: keys.mac_hash32(hash),
+            encrypted,
+            store,
+            salt,
+            iv,
+            check_value: keys.password_check_record(),
+        })
+    })?;
+
+    output.write_all(RAR50_SIGNATURE)?;
+    let mut main = Vec::new();
+    write_main_header(&mut main, 0, None, &[])?;
+    output.write_all(&main)?;
+    for (entry, mut prepared) in entries.iter().zip(prepared) {
+        let compression_info = compression_info(
+            algorithm_version,
+            if prepared.store { 0 } else { method },
+            dictionary_size,
+            false,
+        )?;
+        let specific = file_specific(
+            &entry.name,
+            prepared.input_size,
+            Some(prepared.crc32_mac),
+            entry.attributes,
+            entry.mtime,
+            compression_info,
+            entry.host_os,
+        )?;
+        let mut extra = Vec::new();
+        write_file_encryption_record(&mut extra, prepared.salt, prepared.iv, prepared.check_value);
+        write_hash_record_with_value(&mut extra, prepared.hash_mac);
+        let header = block_header_image(
+            HEAD_FILE,
+            HFL_EXTRA | HFL_DATA,
+            Some(prepared.encrypted.len()),
+            &specific,
+            &extra,
+        )?;
+        output.write_all(&header)?;
+        prepared.encrypted.copy_to(output)?;
+    }
+    let mut end = Vec::new();
+    write_end_header(&mut end, 0)?;
+    output.write_all(&end)?;
+    Ok(())
+}
+
+struct PreparedEncryptedStreamingEntry {
+    input_size: u64,
+    crc32_mac: u32,
+    hash_mac: [u8; 32],
+    encrypted: Spool,
+    store: bool,
+    salt: [u8; 16],
+    iv: [u8; 16],
+    check_value: [u8; 12],
+}
+
+fn source_integrity(
+    source: &EntrySource,
+    expected_size: u64,
+    block_size: usize,
+) -> Result<(u32, [u8; 32])> {
+    let mut crc = Crc32::new();
+    let mut hash = blake2sp::Hasher::new();
+    let mut reader = source.open()?;
+    let mut buffer = vec![0u8; block_size];
+    let mut observed = 0u64;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        observed += read as u64;
+        crc.update(&buffer[..read]);
+        hash.update(&buffer[..read]);
+    }
+    if observed != expected_size {
+        return Err(Error::InvalidHeader(
+            "entry source size changed while reading",
+        ));
+    }
+    Ok((crc.finish(), hash.finalize()))
+}
+
+fn streaming_lz_workspace(dictionary_size: u64, block_size: usize) -> u64 {
+    // The hash-chain finder has one usize link per byte in history + input,
+    // in addition to the byte buffers and a worst-case literal token per input
+    // byte. Leave headroom for Huffman tables and allocator rounding.
+    dictionary_size
+        .saturating_mul(10)
+        .saturating_add((block_size as u64).saturating_mul(40))
+        .saturating_add(2 * 1024 * 1024)
+}
+
+fn encrypt_reader_to(
+    reader: &mut dyn Read,
+    input_size: u64,
+    output: &mut Spool,
+    keys: &Rar50Keys,
+    iv: [u8; 16],
+    block_size: usize,
+) -> Result<()> {
+    let mut cipher = Rar50Cipher::new(keys.key, iv);
+    let chunk_size = block_size.max(16) & !15;
+    let mut buffer = vec![0u8; chunk_size];
+    let mut remaining = input_size;
+    while remaining >= chunk_size as u64 {
+        reader.read_exact(&mut buffer)?;
+        cipher
+            .encrypt_in_place(&mut buffer)
+            .map_err(super::map_rar50_crypto_error)?;
+        output.write_all(&buffer)?;
+        remaining -= chunk_size as u64;
+    }
+    let final_plain = usize::try_from(remaining)
+        .map_err(|_| Error::InvalidHeader("RAR 5 encrypted data size overflows"))?;
+    let final_padded = final_plain
+        .checked_add(15)
+        .ok_or(Error::InvalidHeader("RAR 5 encrypted data size overflows"))?
+        & !15;
+    if final_padded != 0 {
+        buffer[..final_padded].fill(0);
+        reader.read_exact(&mut buffer[..final_plain])?;
+        cipher
+            .encrypt_in_place(&mut buffer[..final_padded])
+            .map_err(super::map_rar50_crypto_error)?;
+        output.write_all(&buffer[..final_padded])?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3058,6 +3423,90 @@ mod tests {
                 is_directory: meta.is_directory,
             })
             .collect())
+    }
+
+    #[test]
+    fn streaming_writer_round_trips_across_input_blocks() {
+        let data = b"bounded streaming member data\n".repeat(80_000);
+        let entry = StreamingCompressedEntry {
+            name: b"large.txt".to_vec(),
+            source: EntrySource::from_bytes(Arc::<[u8]>::from(data.clone())),
+            mtime: None,
+            attributes: 0x20,
+            host_os: 1,
+        };
+        let mut bytes = Vec::new();
+        write_streaming_compressed_archive_to(
+            &[entry],
+            WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only()),
+            &WriterResources::default(),
+            &mut bytes,
+        )
+        .unwrap();
+        let archive = Archive::parse(&bytes).unwrap();
+        let extracted = collect_extract(&archive).unwrap();
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0].name, b"large.txt");
+        assert_eq!(extracted[0].data, data);
+    }
+
+    #[test]
+    fn streaming_writer_rejects_workspace_larger_than_budget() {
+        let entry = StreamingCompressedEntry {
+            name: b"small.txt".to_vec(),
+            source: EntrySource::from_bytes(Arc::<[u8]>::from(&b"small"[..])),
+            mtime: None,
+            attributes: 0x20,
+            host_os: 1,
+        };
+        let result = write_streaming_compressed_archive_to(
+            &[entry],
+            WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only()),
+            &WriterResources::new(1024),
+            &mut Vec::new(),
+        );
+        assert!(matches!(result, Err(Error::MemoryLimitExceeded { .. })));
+    }
+
+    #[test]
+    fn encrypted_streaming_writer_round_trips_across_input_blocks() {
+        let data = b"encrypted bounded streaming member data\n".repeat(40_000);
+        let entry = StreamingEncryptedCompressedEntry {
+            name: b"secret.txt".to_vec(),
+            source: EntrySource::from_bytes(Arc::<[u8]>::from(data.clone())),
+            mtime: None,
+            attributes: 0x20,
+            host_os: 1,
+            password: b"password".to_vec(),
+        };
+        let mut features = FeatureSet::store_only();
+        features.file_encryption = true;
+        let mut bytes = Vec::new();
+        write_streaming_encrypted_compressed_archive_to(
+            &[entry],
+            WriterOptions::new(ArchiveVersion::Rar50, features),
+            &WriterResources::default(),
+            &mut bytes,
+        )
+        .unwrap();
+        let archive = Archive::parse(&bytes).unwrap();
+        let entries = RefCell::new(Vec::new());
+        archive
+            .extract_to(
+                crate::ArchiveReadOptions::with_password(b"password"),
+                |meta| {
+                    let output = Rc::new(RefCell::new(Vec::new()));
+                    entries
+                        .borrow_mut()
+                        .push((meta.name.clone(), Rc::clone(&output)));
+                    Ok(Box::new(CollectWriter(output)))
+                },
+            )
+            .unwrap();
+        let entries = entries.into_inner();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, b"secret.txt");
+        assert_eq!(*entries[0].1.borrow(), data);
     }
 
     #[test]

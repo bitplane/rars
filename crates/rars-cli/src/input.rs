@@ -17,14 +17,28 @@ pub(crate) struct OwnedInput {
     pub(crate) password: Option<Password>,
 }
 
-struct PendingInput {
-    path: PathBuf,
-    name: Vec<u8>,
-    size: u64,
-    file_attr: u8,
-    unix_mode: Option<u32>,
-    unix_mtime: Option<u32>,
-    dos_mtime: u32,
+pub(crate) struct LazyInput {
+    pub(crate) path: PathBuf,
+    pub(crate) name: Vec<u8>,
+    pub(crate) size: u64,
+    pub(crate) file_attr: u8,
+    pub(crate) unix_mode: Option<u32>,
+    pub(crate) unix_mtime: Option<u32>,
+    pub(crate) dos_mtime: u32,
+}
+
+pub(crate) fn collect_inputs(paths: &[String]) -> CliResult<Vec<LazyInput>> {
+    let mut pending = Vec::new();
+    for path in paths {
+        let path = Path::new(path);
+        let base = input_archive_base(path)?;
+        collect_input(path, &base, &mut pending)?;
+    }
+    if pending.is_empty() {
+        return Err("no regular input files found".into());
+    }
+    reject_duplicate_input_names(pending.iter().map(|entry| entry.name.as_slice()))?;
+    Ok(pending)
 }
 
 pub(crate) fn read_inputs_with_progress<F, G>(
@@ -37,16 +51,7 @@ where
     F: FnOnce(usize, u64),
     G: FnMut(u64, &[u8]),
 {
-    let mut pending = Vec::new();
-    for path in paths {
-        let path = Path::new(path);
-        let base = input_archive_base(path)?;
-        collect_input(path, &base, &mut pending)?;
-    }
-    if pending.is_empty() {
-        return Err("no regular input files found".into());
-    }
-    reject_duplicate_input_names(pending.iter().map(|entry| entry.name.as_slice()))?;
+    let pending = collect_inputs(paths)?;
     discovered(pending.len(), pending.iter().map(|entry| entry.size).sum());
     let mut out = Vec::with_capacity(pending.len());
     for entry in pending {
@@ -65,7 +70,7 @@ where
     Ok(out)
 }
 
-fn collect_input(path: &Path, archive_name: &Path, out: &mut Vec<PendingInput>) -> CliResult<()> {
+fn collect_input(path: &Path, archive_name: &Path, out: &mut Vec<LazyInput>) -> CliResult<()> {
     let link_meta = fs::symlink_metadata(path)
         .map_err(|err| format!("failed to stat input '{}': {err}", path.display()))?;
     if link_meta.file_type().is_symlink() {
@@ -93,7 +98,7 @@ fn collect_input(path: &Path, archive_name: &Path, out: &mut Vec<PendingInput>) 
         let dos_mtime = source_dos_mtime(&meta);
         let unix_mode = source_unix_mode(&meta);
         let name = archive_path_bytes(archive_name)?;
-        out.push(PendingInput {
+        out.push(LazyInput {
             path: path.to_path_buf(),
             name,
             size: meta.len(),

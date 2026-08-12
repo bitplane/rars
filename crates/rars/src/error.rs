@@ -48,6 +48,11 @@ pub enum Error {
         limit: u64,
         required: u64,
     },
+    MemoryLimitExceeded {
+        limit: u64,
+        required: u64,
+        dictionary_size: u64,
+    },
     UnsupportedFamilyFeature {
         family: ArchiveFamily,
         feature: &'static str,
@@ -112,6 +117,14 @@ impl std::fmt::Display for Error {
             Self::Rar50BufferedDecodeLimitExceeded { limit, required } => write!(
                 f,
                 "RAR 5 filtered member requires buffered decoding of {required} bytes, above the configured limit of {limit} bytes"
+            ),
+            Self::MemoryLimitExceeded {
+                limit,
+                required,
+                dictionary_size,
+            } => write!(
+                f,
+                "compression needs at least {required} bytes of working memory for a {dictionary_size}-byte dictionary, above the configured limit of {limit} bytes"
             ),
             Self::UnsupportedFamilyFeature { family, feature } => {
                 write!(f, "feature {feature} is not supported by {family:?}")

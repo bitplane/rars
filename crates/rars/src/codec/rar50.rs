@@ -1,7 +1,7 @@
 use super::filters::{self, DeltaErrorMessages, FilterOp};
 use super::{huffman, match_finder, Error, Result};
 use std::collections::VecDeque;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::ops::Range;
 
 pub const LEVEL_TABLE_SIZE: usize = 20;
@@ -539,6 +539,62 @@ pub(crate) fn encode_lz_member_with_options_and_progress(
     progress: &mut dyn FnMut(usize) -> bool,
 ) -> Result<Vec<u8>> {
     encode_lz_member_inner(data, &[], algorithm_version, &[], options, Some(progress))
+}
+
+pub(crate) fn encode_lz_reader_to(
+    reader: &mut dyn Read,
+    input_size: u64,
+    output: &mut dyn Write,
+    algorithm_version: u8,
+    options: EncodeOptions,
+    block_size: usize,
+    mut progress: Option<&mut dyn FnMut(u64) -> bool>,
+) -> crate::Result<()> {
+    if block_size == 0 {
+        return Err(crate::Error::InvalidHeader(
+            "RAR 5 streaming block size is zero",
+        ));
+    }
+    let block_size = block_size.min(MAX_COMPRESSED_BLOCK_OUTPUT);
+    let mut history = Vec::new();
+    let mut buffer = vec![0; block_size];
+    let mut remaining = input_size;
+    let mut completed = 0u64;
+    while remaining != 0 {
+        let wanted = usize::try_from(remaining.min(block_size as u64))
+            .map_err(|_| crate::Error::InvalidHeader("RAR 5 block size overflows usize"))?;
+        reader.read_exact(&mut buffer[..wanted])?;
+        remaining -= wanted as u64;
+        let packed = encode_lz_block(
+            &buffer[..wanted],
+            &history,
+            algorithm_version,
+            &[],
+            options,
+            remaining == 0,
+            None,
+        )?;
+        output.write_all(&packed)?;
+        history.extend_from_slice(&buffer[..wanted]);
+        let keep_from = history.len().saturating_sub(options.max_match_distance);
+        if keep_from != 0 {
+            history.drain(..keep_from);
+        }
+        completed += wanted as u64;
+        if progress
+            .as_deref_mut()
+            .is_some_and(|report| !report(completed))
+        {
+            return Err(crate::Error::Cancelled);
+        }
+    }
+    let mut trailing = [0u8; 1];
+    if reader.read(&mut trailing)? != 0 {
+        return Err(crate::Error::InvalidHeader(
+            "entry source size changed while compressing",
+        ));
+    }
+    Ok(())
 }
 
 pub fn encode_lz_member_with_history_and_options(

@@ -24,6 +24,7 @@ pub mod rar50;
 #[doc(hidden)]
 pub mod recovery;
 mod source;
+mod streaming;
 pub mod version;
 mod volume_extract;
 mod write_progress;
@@ -34,6 +35,7 @@ pub use error::{Error, Result};
 pub use features::FeatureSet;
 use std::io::{Read, Write};
 use std::path::Path;
+pub use streaming::{EntryReader, EntrySource, WriterResources, DEFAULT_WRITER_MEMORY_LIMIT};
 pub use version::{ArchiveFamily, ArchiveVersion};
 pub use write_progress::{WriteOperation, WriteProgress, WriteProgressEvent};
 

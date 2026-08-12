@@ -567,6 +567,7 @@ impl FileHeader {
             | Error::UnsupportedVersion(_)
             | Error::UnsupportedFeature { .. }
             | Error::Rar50BufferedDecodeLimitExceeded { .. }
+            | Error::MemoryLimitExceeded { .. }
             | Error::UnsupportedFamilyFeature { .. }
             | Error::UnsupportedCompression { .. }
             | Error::UnsupportedEncryption { .. }
