@@ -1,7 +1,5 @@
 //! Shared RAR CRC-32 primitives.
 
-mod fast;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Crc32 {
     value: u32,
@@ -59,12 +57,6 @@ fn update_raw_byte(crc: u32, byte: u8) -> u32 {
     (crc >> 8) ^ table_entry((crc as u8) ^ byte)
 }
 
-#[cfg(feature = "fast")]
-fn update_raw(crc: u32, input: &[u8]) -> u32 {
-    fast::update_raw(crc, input)
-}
-
-#[cfg(not(feature = "fast"))]
 fn update_raw(mut crc: u32, mut input: &[u8]) -> u32 {
     while input.len() >= 8 {
         let word = u32::from_le_bytes([input[0], input[1], input[2], input[3]]);
@@ -119,8 +111,6 @@ fn gf2_matrix_square(matrix: &[u32; 32]) -> [u32; 32] {
 
 const TABLES: [[u32; 256]; 8] = crc32_tables();
 const TABLE: [u32; 256] = TABLES[0];
-#[cfg(feature = "fast")]
-const TABLES_FLAT: [u32; 8 * 256] = crc32_tables_flat();
 
 const fn crc32_tables() -> [[u32; 256]; 8] {
     let mut tables = [[0; 256]; 8];
@@ -148,21 +138,6 @@ const fn crc32_tables() -> [[u32; 256]; 8] {
         table += 1;
     }
     tables
-}
-
-#[cfg(feature = "fast")]
-const fn crc32_tables_flat() -> [u32; 8 * 256] {
-    let mut flat = [0; 8 * 256];
-    let mut table = 0;
-    while table < 8 {
-        let mut index = 0;
-        while index < 256 {
-            flat[table * 256 + index] = TABLES[table][index];
-            index += 1;
-        }
-        table += 1;
-    }
-    flat
 }
 
 #[cfg(test)]

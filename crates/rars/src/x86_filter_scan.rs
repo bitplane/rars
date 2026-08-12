@@ -210,7 +210,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_x86_filter_ranges_match_scalar_scanner_at_lane_boundaries() {
+    fn auto_x86_filter_ranges_match_reference_scanner_at_chunk_boundaries() {
         let mut data = vec![0x41u8; 150_000];
         for pos in [
             31usize, 32, 33, 1024, 1088, 4096, 4160, 80_000, 80_032, 80_064,

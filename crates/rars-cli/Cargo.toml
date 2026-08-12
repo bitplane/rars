@@ -19,7 +19,6 @@ workspace = true
 all-features = true
 
 [features]
-fast = ["rars/fast"]
 parallel = ["dep:rayon", "rars/parallel"]
 
 [[bin]]

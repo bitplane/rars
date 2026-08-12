@@ -306,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn e8e9_transform_matches_scalar_at_lane_boundaries_and_skips_payloads() {
+    fn e8e9_transform_matches_reference_at_chunk_boundaries_and_skips_payloads() {
         let mut input = vec![0x41u8; 104];
         for (pos, address) in [
             (0usize, 0x0000_00e8u32),

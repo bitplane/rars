@@ -19,7 +19,6 @@ workspace = true
 all-features = true
 
 [features]
-fast = []
 parallel = ["dep:rayon"]
 
 [dependencies]

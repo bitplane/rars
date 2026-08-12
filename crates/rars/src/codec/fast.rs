@@ -1,37 +1,9 @@
-#[cfg(feature = "fast")]
-use std::simd::{cmp::SimdPartialEq, Simd};
-
-#[cfg(feature = "fast")]
-const LANES: usize = 32;
-
 pub(crate) fn match_length(input: &[u8], pos: usize, distance: usize, max_length: usize) -> usize {
     if distance == 0 || distance > pos {
         return 0;
     }
 
     let max_length = max_length.min(input.len().saturating_sub(pos));
-    match_length_impl(input, pos, distance, max_length)
-}
-
-#[cfg(feature = "fast")]
-fn match_length_impl(input: &[u8], pos: usize, distance: usize, max_length: usize) -> usize {
-    let mut length = 0usize;
-    while length + LANES <= max_length {
-        let current = Simd::<u8, LANES>::from_slice(&input[pos + length..pos + length + LANES]);
-        let previous = Simd::<u8, LANES>::from_slice(
-            &input[pos + length - distance..pos + length - distance + LANES],
-        );
-        if let Some(mismatch) = current.simd_ne(previous).first_set() {
-            return length + mismatch;
-        }
-        length += LANES;
-    }
-
-    match_length_scalar(input, pos, distance, max_length, length)
-}
-
-#[cfg(not(feature = "fast"))]
-fn match_length_impl(input: &[u8], pos: usize, distance: usize, max_length: usize) -> usize {
     match_length_scalar(input, pos, distance, max_length, 0)
 }
 
@@ -42,6 +14,25 @@ fn match_length_scalar(
     max_length: usize,
     mut length: usize,
 ) -> usize {
+    while length + 32 <= max_length {
+        for offset in [0, 8, 16, 24] {
+            let current = u64::from_le_bytes(
+                input[pos + length + offset..pos + length + offset + 8]
+                    .try_into()
+                    .unwrap(),
+            );
+            let previous = u64::from_le_bytes(
+                input[pos + length + offset - distance..pos + length + offset - distance + 8]
+                    .try_into()
+                    .unwrap(),
+            );
+            let difference = current ^ previous;
+            if difference != 0 {
+                return length + offset + (difference.trailing_zeros() / 8) as usize;
+            }
+        }
+        length += 32;
+    }
     while length + 8 <= max_length {
         let current = u64::from_le_bytes(input[pos + length..pos + length + 8].try_into().unwrap());
         let previous = u64::from_le_bytes(
@@ -72,37 +63,6 @@ pub(crate) fn next_x86_opcode(
         return None;
     }
 
-    next_x86_opcode_impl(data, start, end, cmp_mask)
-}
-
-#[cfg(feature = "fast")]
-fn next_x86_opcode_impl(
-    data: &[u8],
-    start: usize,
-    end_exclusive: usize,
-    cmp_mask: u8,
-) -> Option<usize> {
-    let mask = Simd::<u8, LANES>::splat(cmp_mask);
-    let needle = Simd::<u8, LANES>::splat(0xe8);
-    let mut pos = start;
-    while pos + LANES <= end_exclusive {
-        let bytes = Simd::<u8, LANES>::from_slice(&data[pos..pos + LANES]);
-        if let Some(lane) = (bytes & mask).simd_eq(needle).first_set() {
-            return Some(pos + lane);
-        }
-        pos += LANES;
-    }
-
-    next_x86_opcode_scalar(data, pos, end_exclusive, cmp_mask)
-}
-
-#[cfg(not(feature = "fast"))]
-fn next_x86_opcode_impl(
-    data: &[u8],
-    start: usize,
-    end_exclusive: usize,
-    cmp_mask: u8,
-) -> Option<usize> {
     next_x86_opcode_scalar(data, start, end_exclusive, cmp_mask)
 }
 
@@ -136,7 +96,7 @@ mod tests {
     }
 
     #[test]
-    fn match_length_matches_scalar_around_lane_boundaries() {
+    fn match_length_matches_scalar_around_chunk_boundaries() {
         let mut input = Vec::new();
         input.extend((0..192).map(|index| (index % 251) as u8));
         input.extend_from_within(64..192);
@@ -150,7 +110,7 @@ mod tests {
     }
 
     #[test]
-    fn match_length_stops_at_first_mismatch_in_vector_tail() {
+    fn match_length_stops_at_first_mismatch_in_chunk_tail() {
         let mut input = b"abcdefghijklmnopqrstuvwxyz012345".repeat(4);
         let pos = 64;
         input[pos + 37] ^= 0x55;

@@ -11,7 +11,7 @@ A Rust implementation of RAR.
 ## Current Status
 
 `rars` covers the RAR lineage from early `RE~^` archives through RAR 7,
-compression and decompression. It's not fast, but it works. ish.
+compression and decompression. It's getting faster, and kinda works.
 
 ## Rust API
 
@@ -44,28 +44,6 @@ header encryption where implemented, comments, RARVM filters, RAR5 quick-open
 records, and supported recovery records. Run `rars --help` for the exact option
 set.
 
-## Fast Builds
-
-The optional `fast` feature enables safe portable SIMD paths for selected hot
-compression and decompression helpers, including LZ match scanning, x86 filter
-scanning, and CRC-32 updates. It uses Rust's experimental `std::simd` API, so it
-requires a nightly toolchain. Default builds do not enable this feature and
-remain stable-compatible.
-
-Build or run the CLI with the fast path:
-
-```sh
-cargo +nightly run -p rars-cli --features fast -- info archive.rar
-cargo +nightly build --workspace --features fast
-```
-
-Run the fast test and benchmark paths:
-
-```sh
-cargo +nightly test --workspace --features fast
-cargo +nightly bench -p rars --bench chunk_sizes --features fast
-```
-
 ## Parallel Builds
 
 The optional `parallel` feature enables Rayon worker threads for independent
@@ -87,7 +65,6 @@ Measure parallel archive-member work with Criterion:
 
 ```sh
 cargo bench -p rars --bench parallel --features parallel
-cargo +nightly bench -p rars --bench parallel --features fast,parallel
 ```
 
 The parallel benchmark reports `1_thread` and `all_threads_N` cases for RAR5
@@ -100,12 +77,10 @@ When `--threads` is omitted, `rars` uses all available cores. Passing
 
 The workspace includes PyO3 bindings packaged as the `rars` Python module for
 Python 3.10 and newer. The default Python build enables the Rust `parallel`
-feature; the optional `fast` feature is available for nightly Rust builds only
-because it relies on `std::simd`.
+feature.
 
 ```sh
 maturin develop
-RUSTUP_TOOLCHAIN=nightly maturin develop --features fast
 ```
 
 The Python API exposes a `rarfile`-style `RarFile` for listing, reading,

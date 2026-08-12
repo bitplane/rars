@@ -7,8 +7,6 @@
 //! in memory. New Rust users should depend on this crate rather than the
 //! lower-level `rars-*` implementation crates, which ended at 0.3.x.
 
-#![cfg_attr(feature = "fast", feature(portable_simd))]
-
 #[doc(hidden)]
 pub mod codec;
 pub mod crc32;

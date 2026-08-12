@@ -1,9 +1,3 @@
-#[cfg(feature = "fast")]
-use std::simd::{cmp::SimdPartialEq, Simd};
-
-#[cfg(feature = "fast")]
-const LANES: usize = 32;
-
 pub(crate) fn next_x86_opcode(
     data: &[u8],
     start: usize,
@@ -15,37 +9,6 @@ pub(crate) fn next_x86_opcode(
         return None;
     }
 
-    next_x86_opcode_impl(data, start, end, cmp_mask)
-}
-
-#[cfg(feature = "fast")]
-fn next_x86_opcode_impl(
-    data: &[u8],
-    start: usize,
-    end_exclusive: usize,
-    cmp_mask: u8,
-) -> Option<usize> {
-    let mask = Simd::<u8, LANES>::splat(cmp_mask);
-    let needle = Simd::<u8, LANES>::splat(0xe8);
-    let mut pos = start;
-    while pos + LANES <= end_exclusive {
-        let bytes = Simd::<u8, LANES>::from_slice(&data[pos..pos + LANES]);
-        if let Some(lane) = (bytes & mask).simd_eq(needle).first_set() {
-            return Some(pos + lane);
-        }
-        pos += LANES;
-    }
-
-    next_x86_opcode_scalar(data, pos, end_exclusive, cmp_mask)
-}
-
-#[cfg(not(feature = "fast"))]
-fn next_x86_opcode_impl(
-    data: &[u8],
-    start: usize,
-    end_exclusive: usize,
-    cmp_mask: u8,
-) -> Option<usize> {
     next_x86_opcode_scalar(data, start, end_exclusive, cmp_mask)
 }
 
@@ -66,7 +29,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn x86_opcode_scan_matches_scalar_at_lane_boundaries() {
+    fn x86_opcode_scan_matches_reference_at_chunk_boundaries() {
         let mut data = vec![0x90u8; 128];
         for pos in [0, 1, 31, 32, 33, 63, 64, 95, 123] {
             data[pos] = 0xe8;

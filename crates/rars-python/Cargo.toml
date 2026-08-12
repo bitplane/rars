@@ -22,7 +22,6 @@ workspace = true
 default = ["parallel"]
 extension-module = ["pyo3/extension-module"]
 parallel = ["rars_rs/parallel"]
-fast = ["rars_rs/fast"]
 
 [dependencies]
 libc.workspace = true
