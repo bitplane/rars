@@ -202,6 +202,14 @@ fn split_large_filter(
         return Err(Error::InvalidData("RAR 2.9 VM filter range is invalid"));
     }
 
+    // The smallest run of bytes each filter can still transform. A trailing
+    // chunk shorter than this is left unfiltered rather than handed to a filter
+    // that cannot process it.
+    let unit = match rar29_filter(filter.kind)? {
+        Rar29Filter::Delta { channels } | Rar29Filter::Audio { channels } => channels,
+        Rar29Filter::Rgb { width, .. } => width.max(3),
+        Rar29Filter::E8 | Rar29Filter::E8E9 | Rar29Filter::Itanium => 4,
+    };
     let chunk_size = match rar29_filter(filter.kind)? {
         Rar29Filter::Delta { channels } => {
             if channels == 0 || channels > MAX_VM_DELTA_FILTER_BLOCK_SIZE {
@@ -242,6 +250,12 @@ fn split_large_filter(
     let mut start = range.start;
     while start < range.end {
         let end = (start + chunk_size).min(range.end);
+        // Chunking can leave a remainder the filter has no way to transform.
+        // Those bytes stay as they are; a filter covering part of a member is
+        // exactly what a range is for.
+        if end - start < unit {
+            break;
+        }
         filters.push(crate::FilterSpec::range(filter.kind, start..end));
         start = end;
     }

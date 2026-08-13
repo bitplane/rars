@@ -6107,3 +6107,69 @@ fn rar29_chooses_engine_and_filter_independently() {
         "PPMd plus a filter search must be refused"
     );
 }
+
+/// The automatic search now emits one filter per merged code region, which is a
+/// shape the RarVM program emitter never saw while the two copies of the range
+/// merger disagreed and this one dropped overlaps instead of merging them.
+#[test]
+fn rar29_auto_filter_round_trips_a_member_with_two_distant_code_regions() {
+    let mut payload = vec![0x41u8; 900_000];
+    for region_start in [40_000, 700_000] {
+        for index in 0..2_000u32 {
+            let pos = region_start + index as usize * 32;
+            payload[pos] = 0xe8;
+            payload[pos + 1..pos + 5].copy_from_slice(&(0x4000u32 + index).to_le_bytes());
+        }
+    }
+    let entries = [FileEntry {
+        name: b"two-regions.bin",
+        data: &payload,
+        file_time: 0x5a21_0000,
+        file_attr: 0x20,
+        host_os: 3,
+        password: None,
+        file_comment: None,
+    }];
+
+    let bytes = write_rar29_compressed_archive_with_filter_policy(
+        &entries,
+        WriterOptions::new(ArchiveVersion::Rar29, FeatureSet::store_only()),
+        FilterPolicy::Auto,
+    )
+    .unwrap();
+
+    let archive = Archive::parse(&bytes).unwrap();
+    assert_eq!(collect_extract(&archive).unwrap()[0].data, payload);
+}
+
+/// A filter whose chunking left a remainder shorter than its own scanline width
+/// used to fail the whole write. Those bytes are simply left unfiltered now.
+#[test]
+fn rar29_rgb_filter_handles_a_length_that_leaves_a_short_trailing_chunk() {
+    // 131_072 splits into one 131_064-byte chunk and an 8-byte remainder, which
+    // is shorter than the 24-byte scanline.
+    let payload = vec![0x40u8; 131_072];
+    let entries = [FileEntry {
+        name: b"short-tail.rgb",
+        data: &payload,
+        file_time: 0x5a21_0000,
+        file_attr: 0x20,
+        host_os: 3,
+        password: None,
+        file_comment: None,
+    }];
+
+    let bytes = write_rar29_compressed_archive_with_filter_policy(
+        &entries,
+        WriterOptions::new(ArchiveVersion::Rar29, FeatureSet::store_only())
+            .with_method(Rar29Method::Lz),
+        FilterPolicy::Explicit(FilterSpec::whole(FilterKind::Rgb {
+            width: 24,
+            pos_r: 0,
+        })),
+    )
+    .unwrap();
+
+    let archive = Archive::parse(&bytes).unwrap();
+    assert_eq!(collect_extract(&archive).unwrap()[0].data, payload);
+}

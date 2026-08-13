@@ -218,12 +218,15 @@ fn x86_helps_sample<S: FilterSearch>(
     if sample.len() < SCREEN_SAMPLE_ALIGNMENT {
         return Ok(false);
     }
-    let screen_options = search.screen_options(options);
-    let baseline = search.encode_plain(sample, screen_options, None)?;
+    // Measured at the caller's real settings, not the cheaper screen ones. The
+    // detectorless screens rank many candidates against each other, where a
+    // reduced parse ranks them the same way; this is a single yes or no with no
+    // margin under it, and two sample encodes are cheap enough to get right.
+    let baseline = search.encode_plain(sample, options, None)?;
     let filtered = search.encode_filtered(
         sample,
         &[FilterSpec::whole(FilterKind::E8E9)],
-        screen_options,
+        options,
         None,
     )?;
     // No margin here, unlike the detectorless filters: the scanner has already
