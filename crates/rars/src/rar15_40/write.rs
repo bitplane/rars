@@ -11,7 +11,7 @@ use crate::codec::rar29::{
     unpack29_encode_literals_with_options_and_progress, unpack29_encode_ppmd,
     unpack29_encode_ppmd_with_filter, EncodeOptions as Rar29EncodeOptions, Unpack29Encoder,
 };
-pub use crate::codec::rar29::{Rar29FilterKind as FilterKind, Rar29FilterSpec as FilterSpec};
+pub use crate::filter::{FilterKind, FilterSpec};
 use crate::io_util::align16 as checked_align16;
 use crate::write_progress::{ProgressReporter, WorkTracker};
 use crate::x86_filter_scan::auto_x86_filter_ranges;
@@ -252,6 +252,13 @@ fn validate_rar29_filter_policy(policy: &FilterPolicy) -> Result<()> {
             }
         }
         FilterKind::E8 | FilterKind::E8E9 | FilterKind::Itanium => {}
+        // Refused here rather than in the codec, so nothing is compressed
+        // before the caller is told the filter cannot be written.
+        FilterKind::Arm => {
+            return Err(Error::InvalidHeader(
+                "the ARM filter is only available for RAR 5 and RAR 7 writers",
+            ))
+        }
     }
     Ok(())
 }

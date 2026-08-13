@@ -768,7 +768,7 @@ impl RarBuilder {
         let filter_policy = if self.solid || self.store {
             rars_rs::rar50::FilterPolicy::None
         } else {
-            rars_rs::rar50::FilterPolicy::AutoSize
+            rars_rs::rar50::FilterPolicy::Auto
         };
         let mut extras = rars_rs::rar50::ArchiveExtras::default()
             .with_recovery_percent(self.recovery_percent)

@@ -637,36 +637,47 @@ pub fn encode_lz_member_with_history_and_options(
     encode_lz_member_inner(data, history, algorithm_version, &[], options, None)
 }
 
+/// The filters RAR 5 has a builtin type for.
+///
+/// Narrower than [`crate::FilterKind`], which names every filter any format
+/// can apply. The conversion below is where a filter RAR 5 cannot encode is
+/// turned away.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Rar50FilterKind {
+pub(crate) enum Rar50Filter {
     Delta { channels: usize },
     E8,
     E8E9,
     Arm,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Rar50FilterSpec {
-    pub kind: Rar50FilterKind,
-    pub range: Option<Range<usize>>,
+/// The writer rejects these before compressing anything, so reaching this is
+/// either a direct `codec` caller or a bug. Either way the codec stays total.
+fn rar50_filter(kind: crate::FilterKind) -> Result<Rar50Filter> {
+    Rar50Filter::try_from(kind)
+        .map_err(|_| Error::InvalidData("RAR 5 has no builtin type for this filter"))
 }
 
-impl Rar50FilterSpec {
-    pub fn new(kind: Rar50FilterKind) -> Self {
-        Self { kind, range: None }
-    }
+impl TryFrom<crate::FilterKind> for Rar50Filter {
+    type Error = crate::UnsupportedFilterKind;
 
-    pub fn range(kind: Rar50FilterKind, range: Range<usize>) -> Self {
-        Self {
-            kind,
-            range: Some(range),
+    fn try_from(kind: crate::FilterKind) -> std::result::Result<Self, Self::Error> {
+        use crate::FilterKind as Kind;
+        match kind {
+            Kind::Delta { channels } => Ok(Self::Delta { channels }),
+            Kind::E8 => Ok(Self::E8),
+            Kind::E8E9 => Ok(Self::E8E9),
+            Kind::Arm => Ok(Self::Arm),
+            // No wildcard arm: an eighth filter has to be decided about here.
+            kind @ (Kind::Itanium | Kind::Rgb { .. } | Kind::Audio { .. }) => {
+                Err(crate::UnsupportedFilterKind(kind))
+            }
         }
     }
 }
 
 fn filtered_lz_member(
     data: &[u8],
-    filters: &[Rar50FilterSpec],
+    filters: &[crate::FilterSpec],
 ) -> Result<(Vec<u8>, Vec<EncodeFilter>)> {
     let mut filtered = data.to_vec();
     let mut records = Vec::with_capacity(filters.len());
@@ -680,7 +691,8 @@ fn filtered_lz_member(
         }
 
         let filter_data = &mut filtered[range.clone()];
-        let (filter_type, channels) = encode_filter_data(filter.kind, filter_data, range.start)?;
+        let (filter_type, channels) =
+            encode_filter_data(rar50_filter(filter.kind)?, filter_data, range.start)?;
         records.push(EncodeFilter {
             offset: range.start,
             length: range.len(),
@@ -692,7 +704,7 @@ fn filtered_lz_member(
 }
 
 fn encode_filter_data(
-    kind: Rar50FilterKind,
+    kind: Rar50Filter,
     data: &mut [u8],
     file_offset: usize,
 ) -> Result<(FilterType, usize)> {
@@ -700,7 +712,7 @@ fn encode_filter_data(
         return Err(Error::InvalidData("RAR 5 filter offset is too large"));
     }
     match kind {
-        Rar50FilterKind::Delta { channels } => {
+        Rar50Filter::Delta { channels } => {
             filters::encode_in_place(
                 FilterOp::Delta { channels },
                 data,
@@ -709,15 +721,15 @@ fn encode_filter_data(
             )?;
             Ok((FilterType::Delta, channels))
         }
-        Rar50FilterKind::E8 => {
+        Rar50Filter::E8 => {
             e8e9_encode(data, file_offset as u32, false);
             Ok((FilterType::E8, 0))
         }
-        Rar50FilterKind::E8E9 => {
+        Rar50Filter::E8E9 => {
             e8e9_encode(data, file_offset as u32, true);
             Ok((FilterType::E8E9, 0))
         }
-        Rar50FilterKind::Arm => {
+        Rar50Filter::Arm => {
             arm_encode(data, file_offset as u32);
             Ok((FilterType::Arm, 0))
         }
@@ -726,7 +738,7 @@ fn encode_filter_data(
 
 fn filtered_lz_blocks(
     data: &[u8],
-    filters: &[Rar50FilterSpec],
+    filters: &[crate::FilterSpec],
     history: &[u8],
     algorithm_version: u8,
     options: EncodeOptions,
@@ -786,13 +798,13 @@ fn filtered_lz_blocks(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NormalizedFilterSpec {
-    kind: Rar50FilterKind,
+    kind: Rar50Filter,
     range: Range<usize>,
 }
 
 fn normalized_filter_specs(
     data_len: usize,
-    filters: &[Rar50FilterSpec],
+    filters: &[crate::FilterSpec],
 ) -> Result<Vec<NormalizedFilterSpec>> {
     let mut normalized = Vec::with_capacity(filters.len());
     for filter in filters {
@@ -801,7 +813,7 @@ fn normalized_filter_specs(
             return Err(Error::InvalidData("RAR 5 filter range is invalid"));
         }
         normalized.push(NormalizedFilterSpec {
-            kind: filter.kind,
+            kind: rar50_filter(filter.kind)?,
             range,
         });
     }
@@ -1065,7 +1077,7 @@ impl Unpack50Encoder {
         &mut self,
         input: &[u8],
         algorithm_version: u8,
-        filter: Rar50FilterSpec,
+        filter: crate::FilterSpec,
     ) -> Result<Vec<u8>> {
         self.encode_member_with_filters(input, algorithm_version, &[filter])
     }
@@ -1074,7 +1086,7 @@ impl Unpack50Encoder {
         &mut self,
         input: &[u8],
         algorithm_version: u8,
-        filters: &[Rar50FilterSpec],
+        filters: &[crate::FilterSpec],
     ) -> Result<Vec<u8>> {
         if input.len() > MAX_FILTER_BLOCK_LENGTH {
             let packed = filtered_lz_blocks(
@@ -1105,7 +1117,7 @@ impl Unpack50Encoder {
         &mut self,
         input: &[u8],
         algorithm_version: u8,
-        filters: &[Rar50FilterSpec],
+        filters: &[crate::FilterSpec],
         progress: &mut dyn FnMut(usize) -> bool,
     ) -> Result<Vec<u8>> {
         let packed = if input.len() > MAX_FILTER_BLOCK_LENGTH {
@@ -3414,15 +3426,15 @@ mod tests {
         ));
     }
 
-    fn encode_lz_member_with_filter(data: &[u8], kind: Rar50FilterKind) -> Result<Vec<u8>> {
-        Unpack50Encoder::new().encode_member_with_filter(data, 0, Rar50FilterSpec::new(kind))
+    fn encode_lz_member_with_filter(data: &[u8], kind: crate::FilterKind) -> Result<Vec<u8>> {
+        Unpack50Encoder::new().encode_member_with_filter(data, 0, crate::FilterSpec::whole(kind))
     }
 
     #[test]
     fn encodes_lz_member_with_delta_filter_record() {
         let data: Vec<u8> = (0..96).map(|index| (index * 7 + index / 3) as u8).collect();
         let input =
-            encode_lz_member_with_filter(&data, Rar50FilterKind::Delta { channels: 3 }).unwrap();
+            encode_lz_member_with_filter(&data, crate::FilterKind::Delta { channels: 3 }).unwrap();
         let block = parse_compressed_block(&input).unwrap();
         let (lengths, _) = read_table_lengths(&input[block.payload], 0).unwrap();
 
@@ -3435,13 +3447,13 @@ mod tests {
     #[test]
     fn rejects_invalid_delta_filter_channel_count() {
         assert_eq!(
-            encode_lz_member_with_filter(b"abc", Rar50FilterKind::Delta { channels: 0 }),
+            encode_lz_member_with_filter(b"abc", crate::FilterKind::Delta { channels: 0 }),
             Err(Error::InvalidData(
                 "RAR 5 DELTA filter channel count is invalid"
             ))
         );
         assert_eq!(
-            encode_lz_member_with_filter(b"abc", Rar50FilterKind::Delta { channels: 33 }),
+            encode_lz_member_with_filter(b"abc", crate::FilterKind::Delta { channels: 33 }),
             Err(Error::InvalidData(
                 "RAR 5 DELTA filter channel count is invalid"
             ))
@@ -3452,7 +3464,7 @@ mod tests {
     fn encodes_lz_member_with_e8_filter_record() {
         let mut data = b"\xe8\0\0\0\0plain text after call".to_vec();
         data.extend_from_slice(&[0xe8, 3, 0, 0, 0, b'X']);
-        let input = encode_lz_member_with_filter(&data, Rar50FilterKind::E8).unwrap();
+        let input = encode_lz_member_with_filter(&data, crate::FilterKind::E8).unwrap();
         let block = parse_compressed_block(&input).unwrap();
         let (lengths, _) = read_table_lengths(&input[block.payload], 0).unwrap();
 
@@ -3479,7 +3491,7 @@ mod tests {
     #[test]
     fn streaming_decode_reports_filtered_member_with_typed_sentinel() {
         let data = b"\xe8\0\0\0\0plain text after call".to_vec();
-        let input = encode_lz_member_with_filter(&data, Rar50FilterKind::E8).unwrap();
+        let input = encode_lz_member_with_filter(&data, crate::FilterKind::E8).unwrap();
         let mut reader = input.as_slice();
         let mut decoder = Unpack50Decoder::new();
 
@@ -3500,7 +3512,7 @@ mod tests {
     #[test]
     fn encodes_lz_member_with_e8e9_filter_record() {
         let data = b"\xe9\0\0\0\0jump target through e9".to_vec();
-        let input = encode_lz_member_with_filter(&data, Rar50FilterKind::E8E9).unwrap();
+        let input = encode_lz_member_with_filter(&data, crate::FilterKind::E8E9).unwrap();
         let block = parse_compressed_block(&input).unwrap();
         let (lengths, _) = read_table_lengths(&input[block.payload], 0).unwrap();
 
@@ -3528,7 +3540,7 @@ mod tests {
             .encode_member_with_filter(
                 &data,
                 0,
-                Rar50FilterSpec::range(Rar50FilterKind::E8E9, range),
+                crate::FilterSpec::range(crate::FilterKind::E8E9, range),
             )
             .unwrap();
         let block = parse_compressed_block(&input).unwrap();
@@ -3556,8 +3568,8 @@ mod tests {
                 &data,
                 0,
                 &[
-                    Rar50FilterSpec::range(Rar50FilterKind::E8, first_start..first_end),
-                    Rar50FilterSpec::range(Rar50FilterKind::E8, second_start..second_end),
+                    crate::FilterSpec::range(crate::FilterKind::E8, first_start..first_end),
+                    crate::FilterSpec::range(crate::FilterKind::E8, second_start..second_end),
                 ],
             )
             .unwrap();
@@ -3583,7 +3595,7 @@ mod tests {
     #[test]
     fn encodes_lz_member_with_arm_filter_record() {
         let data = [0x04, 0x00, 0x00, 0xeb, b'A', b'R', b'M', b'!'];
-        let input = encode_lz_member_with_filter(&data, Rar50FilterKind::Arm).unwrap();
+        let input = encode_lz_member_with_filter(&data, crate::FilterKind::Arm).unwrap();
         let block = parse_compressed_block(&input).unwrap();
         let (lengths, _) = read_table_lengths(&input[block.payload], 0).unwrap();
 
@@ -3665,7 +3677,7 @@ mod tests {
             .encode_member_with_filter(
                 &data,
                 0,
-                Rar50FilterSpec::range(Rar50FilterKind::E8, 0..data.len()),
+                crate::FilterSpec::range(crate::FilterKind::E8, 0..data.len()),
             )
             .unwrap();
         let mut cursor = std::io::Cursor::new(encoded.as_slice());
@@ -3698,7 +3710,7 @@ mod tests {
         .encode_member_with_filter(
             &data,
             0,
-            Rar50FilterSpec::new(Rar50FilterKind::Delta { channels: 4 }),
+            crate::FilterSpec::whole(crate::FilterKind::Delta { channels: 4 }),
         )
         .unwrap();
         let mut cursor = std::io::Cursor::new(encoded.as_slice());

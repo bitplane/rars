@@ -5,7 +5,6 @@ use super::rarvm;
 use super::{match_finder, Error, Result};
 use crate::crc32::crc32;
 use std::io::{Read, Write};
-use std::ops::Range;
 
 const MAIN_COUNT: usize = 299;
 const OFFSET_COUNT: usize = 60;
@@ -147,20 +146,23 @@ pub fn unpack29_encode_ppmd(input: &[u8]) -> Result<Vec<u8>> {
     encode_ppmd_member(input, true, &[])
 }
 
-pub fn unpack29_encode_ppmd_with_filter(input: &[u8], filter: Rar29FilterSpec) -> Result<Vec<u8>> {
+pub fn unpack29_encode_ppmd_with_filter(
+    input: &[u8],
+    filter: crate::FilterSpec,
+) -> Result<Vec<u8>> {
     encode_ppmd_filtered_member(input, filter, true)
 }
 
 pub fn unpack29_encode_ppmd_literals_with_filter(
     input: &[u8],
-    filter: Rar29FilterSpec,
+    filter: crate::FilterSpec,
 ) -> Result<Vec<u8>> {
     encode_ppmd_filtered_member(input, filter, false)
 }
 
 fn encode_ppmd_filtered_member(
     input: &[u8],
-    filter: Rar29FilterSpec,
+    filter: crate::FilterSpec,
     lz_escapes: bool,
 ) -> Result<Vec<u8>> {
     let filters = split_large_filter(input.len(), filter)?;
@@ -169,7 +171,7 @@ fn encode_ppmd_filtered_member(
     encode_ppmd_member(&filtered.data, lz_escapes, &records)
 }
 
-fn filtered_members(input: &[u8], filters: &[Rar29FilterSpec]) -> Result<FilteredMembers> {
+fn filtered_members(input: &[u8], filters: &[crate::FilterSpec]) -> Result<FilteredMembers> {
     let mut data = input.to_vec();
     let mut records = Vec::with_capacity(filters.len());
     for filter in filters {
@@ -191,14 +193,17 @@ struct FilteredMembers {
     records: Vec<OwnedVmFilterRecord>,
 }
 
-fn split_large_filter(input_len: usize, filter: Rar29FilterSpec) -> Result<Vec<Rar29FilterSpec>> {
+fn split_large_filter(
+    input_len: usize,
+    filter: crate::FilterSpec,
+) -> Result<Vec<crate::FilterSpec>> {
     let range = filter.range.clone().unwrap_or(0..input_len);
     if range.start >= range.end || range.end > input_len {
         return Err(Error::InvalidData("RAR 2.9 VM filter range is invalid"));
     }
 
-    let chunk_size = match filter.kind {
-        Rar29FilterKind::Delta { channels } => {
+    let chunk_size = match rar29_filter(filter.kind)? {
+        Rar29Filter::Delta { channels } => {
             if channels == 0 || channels > MAX_VM_DELTA_FILTER_BLOCK_SIZE {
                 return Err(Error::InvalidData(
                     "RAR 2.9 VM filter channel count is invalid",
@@ -206,7 +211,7 @@ fn split_large_filter(input_len: usize, filter: Rar29FilterSpec) -> Result<Vec<R
             }
             MAX_VM_DELTA_FILTER_BLOCK_SIZE - (MAX_VM_DELTA_FILTER_BLOCK_SIZE % channels)
         }
-        Rar29FilterKind::Audio { channels } => {
+        Rar29Filter::Audio { channels } => {
             if channels == 0 || channels > MAX_VM_AUDIO_FILTER_BLOCK_SIZE {
                 return Err(Error::InvalidData(
                     "RAR 2.9 VM filter channel count is invalid",
@@ -214,7 +219,7 @@ fn split_large_filter(input_len: usize, filter: Rar29FilterSpec) -> Result<Vec<R
             }
             MAX_VM_AUDIO_FILTER_BLOCK_SIZE - (MAX_VM_AUDIO_FILTER_BLOCK_SIZE % channels)
         }
-        Rar29FilterKind::Rgb { width, .. } => {
+        Rar29Filter::Rgb { width, .. } => {
             if width == 0 || width > MAX_VM_FILTER_BLOCK_SIZE {
                 return Err(Error::InvalidData(
                     "RAR 2.9 RGB filter scanline width is invalid",
@@ -222,9 +227,7 @@ fn split_large_filter(input_len: usize, filter: Rar29FilterSpec) -> Result<Vec<R
             }
             MAX_VM_FILTER_BLOCK_SIZE - (MAX_VM_FILTER_BLOCK_SIZE % width)
         }
-        Rar29FilterKind::E8 | Rar29FilterKind::E8E9 | Rar29FilterKind::Itanium => {
-            MAX_VM_FILTER_BLOCK_SIZE
-        }
+        Rar29Filter::E8 | Rar29Filter::E8E9 | Rar29Filter::Itanium => MAX_VM_FILTER_BLOCK_SIZE,
     };
     if range.len() <= chunk_size {
         return Ok(vec![filter]);
@@ -239,7 +242,7 @@ fn split_large_filter(input_len: usize, filter: Rar29FilterSpec) -> Result<Vec<R
     let mut start = range.start;
     while start < range.end {
         let end = (start + chunk_size).min(range.end);
-        filters.push(Rar29FilterSpec::range(filter.kind, start..end));
+        filters.push(crate::FilterSpec::range(filter.kind, start..end));
         start = end;
     }
     Ok(filters)
@@ -296,33 +299,44 @@ enum PpmdEncodeToken {
     Match { offset: usize, length: usize },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Rar29FilterSpec {
-    pub kind: Rar29FilterKind,
-    pub range: Option<Range<usize>>,
-}
-
-impl Rar29FilterSpec {
-    pub fn whole(kind: Rar29FilterKind) -> Self {
-        Self { kind, range: None }
-    }
-
-    pub fn range(kind: Rar29FilterKind, range: Range<usize>) -> Self {
-        Self {
-            kind,
-            range: Some(range),
-        }
-    }
-}
-
+/// The filters the RAR 2.9 family ships as RarVM programs.
+///
+/// Narrower than [`crate::FilterKind`], which names every filter any format
+/// can apply. The conversion below is where a filter this family cannot encode
+/// is turned away.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Rar29FilterKind {
+pub(crate) enum Rar29Filter {
     E8,
     E8E9,
     Delta { channels: usize },
     Itanium,
     Rgb { width: usize, pos_r: usize },
     Audio { channels: usize },
+}
+
+impl TryFrom<crate::FilterKind> for Rar29Filter {
+    type Error = crate::UnsupportedFilterKind;
+
+    fn try_from(kind: crate::FilterKind) -> std::result::Result<Self, Self::Error> {
+        use crate::FilterKind as Kind;
+        match kind {
+            Kind::E8 => Ok(Self::E8),
+            Kind::E8E9 => Ok(Self::E8E9),
+            Kind::Delta { channels } => Ok(Self::Delta { channels }),
+            Kind::Itanium => Ok(Self::Itanium),
+            Kind::Rgb { width, pos_r } => Ok(Self::Rgb { width, pos_r }),
+            Kind::Audio { channels } => Ok(Self::Audio { channels }),
+            // No wildcard arm: an eighth filter has to be decided about here.
+            kind @ Kind::Arm => Err(crate::UnsupportedFilterKind(kind)),
+        }
+    }
+}
+
+/// The writer rejects these before compressing anything, so reaching this is
+/// either a direct `codec` caller or a bug. Either way the codec stays total.
+fn rar29_filter(kind: crate::FilterKind) -> Result<Rar29Filter> {
+    Rar29Filter::try_from(kind)
+        .map_err(|_| Error::InvalidData("the RAR 2.9 family has no program for this filter"))
 }
 
 struct FilteredMember {
@@ -333,14 +347,14 @@ struct FilteredMember {
     code: &'static [u8],
 }
 
-fn filtered_member(input: &[u8], filter: &Rar29FilterSpec) -> Result<FilteredMember> {
+fn filtered_member(input: &[u8], filter: &crate::FilterSpec) -> Result<FilteredMember> {
     let range = filter.range.clone().unwrap_or(0..input.len());
     if range.start >= range.end || range.end > input.len() {
         return Err(Error::InvalidData("RAR 2.9 VM filter range is invalid"));
     }
     let mut filtered = input.to_vec();
-    let (init_regs, code): (Vec<(usize, u32)>, &'static [u8]) = match filter.kind {
-        Rar29FilterKind::E8 => {
+    let (init_regs, code): (Vec<(usize, u32)>, &'static [u8]) = match rar29_filter(filter.kind)? {
+        Rar29Filter::E8 => {
             filters::encode_in_place(
                 FilterOp::E8,
                 &mut filtered[range.clone()],
@@ -349,7 +363,7 @@ fn filtered_member(input: &[u8], filter: &Rar29FilterSpec) -> Result<FilteredMem
             )?;
             (Vec::new(), RAR3_E8_FILTER_BYTECODE)
         }
-        Rar29FilterKind::E8E9 => {
+        Rar29Filter::E8E9 => {
             filters::encode_in_place(
                 FilterOp::E8E9,
                 &mut filtered[range.clone()],
@@ -358,7 +372,7 @@ fn filtered_member(input: &[u8], filter: &Rar29FilterSpec) -> Result<FilteredMem
             )?;
             (Vec::new(), RAR3_E8E9_FILTER_BYTECODE)
         }
-        Rar29FilterKind::Delta { channels } => {
+        Rar29Filter::Delta { channels } => {
             filters::encode_in_place(
                 FilterOp::Delta { channels },
                 &mut filtered[range.clone()],
@@ -367,11 +381,11 @@ fn filtered_member(input: &[u8], filter: &Rar29FilterSpec) -> Result<FilteredMem
             )?;
             (vec![(0, channels as u32)], RAR3_DELTA_FILTER_BYTECODE)
         }
-        Rar29FilterKind::Itanium => {
+        Rar29Filter::Itanium => {
             itanium_encode(&mut filtered[range.clone()], range.start as u32);
             (Vec::new(), RAR3_ITANIUM_FILTER_BYTECODE)
         }
-        Rar29FilterKind::Rgb { width, pos_r } => {
+        Rar29Filter::Rgb { width, pos_r } => {
             filtered[range.clone()].copy_from_slice(&rgb_encode(
                 &input[range.clone()],
                 width,
@@ -384,7 +398,7 @@ fn filtered_member(input: &[u8], filter: &Rar29FilterSpec) -> Result<FilteredMem
             };
             (init_regs, RAR3_RGB_FILTER_BYTECODE)
         }
-        Rar29FilterKind::Audio { channels } => {
+        Rar29Filter::Audio { channels } => {
             filtered[range.clone()]
                 .copy_from_slice(&audio_encode(&input[range.clone()], channels)?);
             (vec![(0, channels as u32)], RAR3_AUDIO_FILTER_BYTECODE)
@@ -493,7 +507,7 @@ impl Unpack29Encoder {
     pub fn encode_member_with_filter(
         &mut self,
         input: &[u8],
-        filter: Rar29FilterSpec,
+        filter: crate::FilterSpec,
     ) -> Result<Vec<u8>> {
         let filters = split_large_filter(input.len(), filter)?;
         let filtered = filtered_members(input, &filters)?;
@@ -511,7 +525,7 @@ impl Unpack29Encoder {
     pub fn encode_member_with_filters(
         &mut self,
         input: &[u8],
-        filters: &[Rar29FilterSpec],
+        filters: &[crate::FilterSpec],
     ) -> Result<Vec<u8>> {
         let mut split_filters = Vec::new();
         for filter in filters {
@@ -3097,10 +3111,10 @@ mod tests {
         unpack29_encode_literals, unpack29_encode_ppmd, unpack29_encode_ppmd_literals,
         unpack29_encode_ppmd_with_filter, BitReader, BitWriter, EncodeOptions, EncodeToken,
         EncoderMatchState, Error, Huffman, LevelToken, OwnedVmFilterRecord, PpmdEncodeToken,
-        Rar29FilterKind, Rar29FilterSpec, Rar29MatchFinder, Result, StandardFilter, Unpack29,
-        Unpack29Encoder, VmFilter, VmProgram, VmProgramKind, MAIN_COUNT, MAX_MATCH_CANDIDATES,
-        MAX_VM_AUDIO_FILTER_BLOCK_SIZE, MAX_VM_DELTA_FILTER_BLOCK_SIZE, MAX_VM_FILTER_BLOCK_SIZE,
-        RAR3_AUDIO_FILTER_BYTECODE, TABLE_COUNT,
+        Rar29MatchFinder, Result, StandardFilter, Unpack29, Unpack29Encoder, VmFilter, VmProgram,
+        VmProgramKind, MAIN_COUNT, MAX_MATCH_CANDIDATES, MAX_VM_AUDIO_FILTER_BLOCK_SIZE,
+        MAX_VM_DELTA_FILTER_BLOCK_SIZE, MAX_VM_FILTER_BLOCK_SIZE, RAR3_AUDIO_FILTER_BYTECODE,
+        TABLE_COUNT,
     };
 
     const COMPRESSED_TEXT: &[u8] = &[
@@ -3476,38 +3490,41 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     #[test]
     fn ppmd_encoder_emits_embedded_vm_filter_escape() {
         let input = b"\xe8\0\0\0\0rar29 ppmd embedded e8 filter payload\n".repeat(16);
-        let packed =
-            unpack29_encode_ppmd_with_filter(&input, Rar29FilterSpec::whole(Rar29FilterKind::E8))
-                .unwrap();
+        let packed = unpack29_encode_ppmd_with_filter(
+            &input,
+            crate::FilterSpec::whole(crate::FilterKind::E8),
+        )
+        .unwrap();
         let plain_ppmd = unpack29_encode_ppmd(&input).unwrap();
         let filtered_lz = Unpack29Encoder::new()
-            .encode_member_with_filter(&input, Rar29FilterSpec::whole(Rar29FilterKind::E8))
+            .encode_member_with_filter(&input, crate::FilterSpec::whole(crate::FilterKind::E8))
             .unwrap();
 
         assert!(packed.len() != plain_ppmd.len() || packed.len() != filtered_lz.len());
         assert_eq!(unpack29_decode(&packed, input.len()).unwrap(), input);
     }
 
-    fn encode_with_filter(input: &[u8], kind: Rar29FilterKind) -> Result<Vec<u8>> {
-        Unpack29Encoder::new().encode_member_with_filter(input, Rar29FilterSpec::whole(kind))
+    fn encode_with_filter(input: &[u8], kind: crate::FilterKind) -> Result<Vec<u8>> {
+        Unpack29Encoder::new().encode_member_with_filter(input, crate::FilterSpec::whole(kind))
     }
 
     fn encode_with_filter_range(
         input: &[u8],
-        kind: Rar29FilterKind,
+        kind: crate::FilterKind,
         range: Range<usize>,
     ) -> Result<Vec<u8>> {
-        Unpack29Encoder::new().encode_member_with_filter(input, Rar29FilterSpec::range(kind, range))
+        Unpack29Encoder::new()
+            .encode_member_with_filter(input, crate::FilterSpec::range(kind, range))
     }
 
     fn encode_with_filter_ranges(
         input: &[u8],
-        kind: Rar29FilterKind,
+        kind: crate::FilterKind,
         ranges: Vec<Range<usize>>,
     ) -> Result<Vec<u8>> {
         let filters: Vec<_> = ranges
             .into_iter()
-            .map(|range| Rar29FilterSpec::range(kind, range))
+            .map(|range| crate::FilterSpec::range(kind, range))
             .collect();
         Unpack29Encoder::new().encode_member_with_filters(input, &filters)
     }
@@ -3556,7 +3573,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     #[test]
     fn encoder_emits_rar29_e8_vm_filter_record() {
         let input = b"\xe8\0\0\0\0rar29 e8 filter writer payload\n".repeat(8);
-        let packed = encode_with_filter(&input, Rar29FilterKind::E8).unwrap();
+        let packed = encode_with_filter(&input, crate::FilterKind::E8).unwrap();
         let decoded = unpack29_decode(&packed, input.len()).unwrap();
 
         assert!(
@@ -3568,7 +3585,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     #[test]
     fn encoder_emits_rar29_e8e9_vm_filter_record() {
         let input = b"\xe9\0\0\0\0rar29 e8e9 filter writer payload\n".repeat(8);
-        let packed = encode_with_filter(&input, Rar29FilterKind::E8E9).unwrap();
+        let packed = encode_with_filter(&input, crate::FilterKind::E8E9).unwrap();
         let decoded = unpack29_decode(&packed, input.len()).unwrap();
 
         assert_eq!(decoded, input);
@@ -3581,7 +3598,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         input.extend_from_slice(b"\xe8\0\0\0\0segmented e8 filtered payload\n");
         let end = input.len();
         input.extend_from_slice(b" suffix data that should also remain raw");
-        let packed = encode_with_filter_range(&input, Rar29FilterKind::E8, start..end).unwrap();
+        let packed = encode_with_filter_range(&input, crate::FilterKind::E8, start..end).unwrap();
         let decoded = unpack29_decode(&packed, input.len()).unwrap();
 
         assert_eq!(decoded, input);
@@ -3600,7 +3617,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
 
         let packed = encode_with_filter_ranges(
             &input,
-            Rar29FilterKind::E8,
+            crate::FilterKind::E8,
             vec![8_000..8_512, 60_000..60_512],
         )
         .unwrap();
@@ -3616,7 +3633,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         input.extend_from_slice(b"\xe9\0\0\0\0segmented e8e9 filtered payload\n");
         let end = input.len();
         input.extend_from_slice(b" suffix data that should also remain raw");
-        let packed = encode_with_filter_range(&input, Rar29FilterKind::E8E9, start..end).unwrap();
+        let packed = encode_with_filter_range(&input, crate::FilterKind::E8E9, start..end).unwrap();
         let decoded = unpack29_decode(&packed, input.len()).unwrap();
 
         assert_eq!(decoded, input);
@@ -3625,7 +3642,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     #[test]
     fn encoder_emits_rar29_delta_vm_filter_record() {
         let input: Vec<u8> = (0..192).map(|index| (index * 13 + 7) as u8).collect();
-        let packed = encode_with_filter(&input, Rar29FilterKind::Delta { channels: 3 }).unwrap();
+        let packed = encode_with_filter(&input, crate::FilterKind::Delta { channels: 3 }).unwrap();
         let decoded = unpack29_decode(&packed, input.len()).unwrap();
 
         assert_eq!(decoded, input);
@@ -3639,7 +3656,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         let end = input.len();
         input.extend_from_slice(b" suffix bytes after delta segment");
         let packed =
-            encode_with_filter_range(&input, Rar29FilterKind::Delta { channels: 3 }, start..end)
+            encode_with_filter_range(&input, crate::FilterKind::Delta { channels: 3 }, start..end)
                 .unwrap();
         let decoded = unpack29_decode(&packed, input.len()).unwrap();
 
@@ -3652,7 +3669,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         input[16] = 22;
         input[21] = 20;
         input.extend_from_slice(b"rar29 itanium filter writer payload\n");
-        let packed = encode_with_filter(&input, Rar29FilterKind::Itanium).unwrap();
+        let packed = encode_with_filter(&input, crate::FilterKind::Itanium).unwrap();
         let decoded = unpack29_decode(&packed, input.len()).unwrap();
 
         assert_eq!(decoded, input);
@@ -3669,7 +3686,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         let end = input.len();
         input.extend_from_slice(b" suffix bytes after itanium segment");
         let packed =
-            encode_with_filter_range(&input, Rar29FilterKind::Itanium, start..end).unwrap();
+            encode_with_filter_range(&input, crate::FilterKind::Itanium, start..end).unwrap();
         let decoded = unpack29_decode(&packed, input.len()).unwrap();
 
         assert_eq!(decoded, input);
@@ -3679,7 +3696,8 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     fn encoder_emits_rar29_rgb_vm_filter_record() {
         let width = 12;
         let input: Vec<u8> = (0..96).map(|index| (index * 29 + 11) as u8).collect();
-        let packed = encode_with_filter(&input, Rar29FilterKind::Rgb { width, pos_r: 0 }).unwrap();
+        let packed =
+            encode_with_filter(&input, crate::FilterKind::Rgb { width, pos_r: 0 }).unwrap();
         let decoded = unpack29_decode(&packed, input.len()).unwrap();
 
         assert_eq!(decoded, input);
@@ -3693,9 +3711,12 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         input.extend((0..96).map(|index| (index * 29 + 11) as u8));
         let end = input.len();
         input.extend_from_slice(b" suffix bytes after rgb segment");
-        let packed =
-            encode_with_filter_range(&input, Rar29FilterKind::Rgb { width, pos_r: 0 }, start..end)
-                .unwrap();
+        let packed = encode_with_filter_range(
+            &input,
+            crate::FilterKind::Rgb { width, pos_r: 0 },
+            start..end,
+        )
+        .unwrap();
         let decoded = unpack29_decode(&packed, input.len()).unwrap();
 
         assert_eq!(decoded, input);
@@ -3704,7 +3725,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     #[test]
     fn encoder_rejects_rar29_rgb_filter_with_unaligned_scanline_width() {
         let input: Vec<u8> = (0..96).map(|index| (index * 29 + 11) as u8).collect();
-        assert!(encode_with_filter(&input, Rar29FilterKind::Rgb { width: 8, pos_r: 0 }).is_err());
+        assert!(encode_with_filter(&input, crate::FilterKind::Rgb { width: 8, pos_r: 0 }).is_err());
     }
 
     #[test]
@@ -3712,7 +3733,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         let input: Vec<u8> = (0..160)
             .map(|index| (index * 7 + index / 3) as u8)
             .collect();
-        let packed = encode_with_filter(&input, Rar29FilterKind::Audio { channels: 2 }).unwrap();
+        let packed = encode_with_filter(&input, crate::FilterKind::Audio { channels: 2 }).unwrap();
         let decoded = unpack29_decode(&packed, input.len()).unwrap();
 
         assert_eq!(decoded, input);
@@ -3743,7 +3764,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     fn large_audio_filters_are_split_into_rarvm_safe_blocks() {
         let filters = split_large_filter(
             MAX_VM_FILTER_BLOCK_SIZE * 2 + 123,
-            Rar29FilterSpec::whole(Rar29FilterKind::Audio { channels: 4 }),
+            crate::FilterSpec::whole(crate::FilterKind::Audio { channels: 4 }),
         )
         .unwrap();
 
@@ -3763,7 +3784,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     fn large_delta_filters_are_split_into_rarvm_safe_blocks() {
         let filters = split_large_filter(
             MAX_VM_FILTER_BLOCK_SIZE * 2 + 123,
-            Rar29FilterSpec::whole(Rar29FilterKind::Delta { channels: 4 }),
+            crate::FilterSpec::whole(crate::FilterKind::Delta { channels: 4 }),
         )
         .unwrap();
 
@@ -3809,7 +3830,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         let end = input.len();
         input.extend_from_slice(b" suffix bytes after audio segment");
         let packed =
-            encode_with_filter_range(&input, Rar29FilterKind::Audio { channels: 2 }, start..end)
+            encode_with_filter_range(&input, crate::FilterKind::Audio { channels: 2 }, start..end)
                 .unwrap();
         let decoded = unpack29_decode(&packed, input.len()).unwrap();
 
@@ -3821,7 +3842,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         let input: Vec<u8> = (0..(MAX_VM_AUDIO_FILTER_BLOCK_SIZE * 2 + 64))
             .map(|index| (index * 7 + index / 3 + index / 257) as u8)
             .collect();
-        let packed = encode_with_filter(&input, Rar29FilterKind::Audio { channels: 4 }).unwrap();
+        let packed = encode_with_filter(&input, crate::FilterKind::Audio { channels: 4 }).unwrap();
         let decoded = unpack29_decode(&packed, input.len()).unwrap();
 
         assert_eq!(decoded, input);
@@ -3832,7 +3853,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         let input: Vec<u8> = (0..(MAX_VM_DELTA_FILTER_BLOCK_SIZE * 2 + 64))
             .map(|index| (index * 11 + index / 5 + index / 251) as u8)
             .collect();
-        let packed = encode_with_filter(&input, Rar29FilterKind::Delta { channels: 4 }).unwrap();
+        let packed = encode_with_filter(&input, crate::FilterKind::Delta { channels: 4 }).unwrap();
         let decoded = unpack29_decode(&packed, input.len()).unwrap();
 
         assert_eq!(decoded, input);

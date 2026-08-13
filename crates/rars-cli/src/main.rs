@@ -1567,7 +1567,7 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
                         rars::rar50::Rar50Writer::new(options)
                             .progress(&progress)
                             .compressed_entries(&compressed_entries)
-                            .filter_policy(rars::rar50::FilterPolicy::Explicit(
+                            .filter_policy(rars::rar50::FilterPolicy::explicit(
                                 rars::rar50::FilterKind::Delta { channels },
                             ))
                             .finish()?
@@ -1580,13 +1580,13 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
                         rars::rar50::Rar50Writer::new(options)
                             .progress(&progress)
                             .compressed_entries(&compressed_entries)
-                            .filter_policy(rars::rar50::FilterPolicy::Explicit(filter))
+                            .filter_policy(rars::rar50::FilterPolicy::explicit(filter))
                             .finish()?
                     } else if arm_filter {
                         rars::rar50::Rar50Writer::new(options)
                             .progress(&progress)
                             .compressed_entries(&compressed_entries)
-                            .filter_policy(rars::rar50::FilterPolicy::Explicit(
+                            .filter_policy(rars::rar50::FilterPolicy::explicit(
                                 rars::rar50::FilterKind::Arm,
                             ))
                             .finish()?
@@ -1598,7 +1598,7 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
                         rars::rar50::Rar50Writer::new(options)
                             .progress(&progress)
                             .compressed_entries(&compressed_entries)
-                            .filter_policy(rars::rar50::FilterPolicy::AutoSize)
+                            .filter_policy(rars::rar50::FilterPolicy::Auto)
                             .finish()?
                     } else {
                         rars::rar50::Rar50Writer::new(options)
@@ -2109,7 +2109,7 @@ fn rar50_filter_policy(
     if no_filter || store || (solid && !auto_filter) {
         return rars::rar50::FilterPolicy::None;
     }
-    rars::rar50::FilterPolicy::AutoSize
+    rars::rar50::FilterPolicy::Auto
 }
 
 fn streaming_extras<'a>(

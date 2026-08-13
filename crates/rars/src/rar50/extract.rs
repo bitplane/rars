@@ -1275,7 +1275,7 @@ mod tests {
             attributes: 0x20,
             host_os: 3,
         }])
-        .filter_policy(FilterPolicy::Explicit(FilterKind::E8))
+        .filter_policy(FilterPolicy::explicit(FilterKind::E8))
         .finish()
         .unwrap();
         let archive = Archive::parse(&archive).unwrap();
@@ -1308,7 +1308,7 @@ mod tests {
             attributes: 0x20,
             host_os: 3,
         }])
-        .filter_policy(FilterPolicy::Explicit(FilterKind::E8))
+        .filter_policy(FilterPolicy::explicit(FilterKind::E8))
         .finish()
         .unwrap();
         let archive = Archive::parse(&archive).unwrap();

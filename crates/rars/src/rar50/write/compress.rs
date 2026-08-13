@@ -208,7 +208,7 @@ fn compress_members_whole(
                     // progress.
                     let walk = super::filter_policy_walk_bytes(
                         &data,
-                        plan.filter_policy,
+                        &plan.filter_policy,
                         plan.candidates.len(),
                     )
                     .max(input_size)
@@ -234,7 +234,7 @@ fn compress_members_whole(
                     let packed = encode_member_with_filter_policy_candidates_and_progress(
                         &data,
                         plan.algorithm_version,
-                        plan.filter_policy,
+                        &plan.filter_policy,
                         &plan.candidates,
                         Some(&mut report),
                     )?;
@@ -244,14 +244,14 @@ fn compress_members_whole(
                         &data,
                         &packed,
                         plan.solid,
-                        plan.filter_policy,
+                        &plan.filter_policy,
                     );
                     if !stored {
                         packed_spool.write_all(&packed)?;
                     }
                 }
                 Err(error) => {
-                    if plan.filter_policy != FilterPolicy::AutoSize {
+                    if plan.filter_policy != FilterPolicy::Auto {
                         return Err(error);
                     }
                     // Too big to filter; compress it as a stream instead.

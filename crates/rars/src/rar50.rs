@@ -21,8 +21,8 @@ pub use write::{
     write_streaming_encrypted_compressed_archive_to, write_streaming_volumes_to, ArchiveEntry,
     ArchiveExtras, ArchiveMetadataEntry, CompressedEntry, EncryptedArchiveCommentEntry,
     EncryptedCompressedEntry, EncryptedStoredEntry, EncryptedStoredEntryWithServices,
-    EncryptedStoredServiceEntry, FilterKind, FilterPolicy, Rar50VolumeWriter, Rar50Writer,
-    ServiceEntry, StoredEntry, StoredEntryWithServices, StoredServiceEntry,
+    EncryptedStoredServiceEntry, FilterKind, FilterPolicy, FilterSpec, Rar50VolumeWriter,
+    Rar50Writer, ServiceEntry, StoredEntry, StoredEntryWithServices, StoredServiceEntry,
     StreamingCompressedEntry, StreamingEncryptedCompressedEntry, VolumeSink, WriterOptions,
 };
 

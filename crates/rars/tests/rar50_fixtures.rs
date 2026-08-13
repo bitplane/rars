@@ -970,7 +970,7 @@ fn rar50_writer_builder_writes_filtered_compressed_archive() {
         FeatureSet::store_only(),
     ))
     .compressed_entries(&entries)
-    .filter_policy(FilterPolicy::Explicit(rar50::FilterKind::E8))
+    .filter_policy(FilterPolicy::explicit(rar50::FilterKind::E8))
     .finish()
     .unwrap();
 
@@ -1046,7 +1046,7 @@ fn writes_delta_filtered_compressed_rar50_archive_that_reader_extracts() {
     let bytes = write_compressed_archive_with_filter_policy(
         &entries,
         rar50::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only()),
-        FilterPolicy::Explicit(FilterKind::Delta { channels: 3 }),
+        FilterPolicy::explicit(FilterKind::Delta { channels: 3 }),
     )
     .unwrap();
 
@@ -1077,7 +1077,7 @@ fn writes_e8_filtered_compressed_rar50_archive_that_reader_extracts() {
     let bytes = write_compressed_archive_with_filter_policy(
         &entries,
         rar50::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only()),
-        FilterPolicy::Explicit(FilterKind::E8),
+        FilterPolicy::explicit(FilterKind::E8),
     )
     .unwrap();
 
@@ -1107,7 +1107,7 @@ fn writes_e8e9_filtered_compressed_rar50_archive_that_reader_extracts() {
     let bytes = write_compressed_archive_with_filter_policy(
         &entries,
         rar50::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only()),
-        FilterPolicy::Explicit(FilterKind::E8E9),
+        FilterPolicy::explicit(FilterKind::E8E9),
     )
     .unwrap();
 
@@ -1131,7 +1131,7 @@ fn writes_arm_filtered_compressed_rar50_archive_that_reader_extracts() {
     let bytes = write_compressed_archive_with_filter_policy(
         &entries,
         rar50::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only()),
-        FilterPolicy::Explicit(FilterKind::Arm),
+        FilterPolicy::explicit(FilterKind::Arm),
     )
     .unwrap();
 
@@ -1164,8 +1164,7 @@ fn writes_auto_filtered_compressed_rar50_archive_that_reader_extracts() {
     let options = rar50::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only());
     let plain = write_compressed_archive(&entries, options).unwrap();
     let auto =
-        write_compressed_archive_with_filter_policy(&entries, options, FilterPolicy::AutoSize)
-            .unwrap();
+        write_compressed_archive_with_filter_policy(&entries, options, FilterPolicy::Auto).unwrap();
 
     let plain_archive = Archive::parse(&plain).unwrap();
     let auto_archive = Archive::parse(&auto).unwrap();
@@ -1191,7 +1190,7 @@ fn auto_filtered_compressed_rar50_writer_accepts_empty_member() {
     let bytes = write_compressed_archive_with_filter_policy(
         &entries,
         rar50::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only()),
-        FilterPolicy::AutoSize,
+        FilterPolicy::Auto,
     )
     .unwrap();
 
@@ -5241,7 +5240,7 @@ fn streaming_writer_applies_filters_when_asked() {
     let filtered = write_with_extras(
         &entries,
         FeatureSet::store_only(),
-        rar50::ArchiveExtras::default().with_filter_policy(rar50::FilterPolicy::AutoSize),
+        rar50::ArchiveExtras::default().with_filter_policy(rar50::FilterPolicy::Auto),
     );
 
     assert!(
@@ -5267,7 +5266,7 @@ fn streaming_writer_drops_an_automatic_filter_it_cannot_afford() {
         &entries,
         rar50::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
             .with_compression_level(1),
-        rar50::ArchiveExtras::default().with_filter_policy(rar50::FilterPolicy::AutoSize),
+        rar50::ArchiveExtras::default().with_filter_policy(rar50::FilterPolicy::Auto),
         &rars::WriterResources::new(160 * 1024 * 1024),
         &mut out,
     )

@@ -16,6 +16,7 @@ pub mod detect;
 pub mod error;
 mod fast;
 pub mod features;
+pub mod filter;
 mod io_util;
 mod parallel;
 pub mod rar13;
@@ -33,6 +34,7 @@ mod x86_filter_scan;
 pub use detect::{detect_archive_family, find_archive_start, ArchiveSignature, SFX_SCAN_LIMIT};
 pub use error::{Error, Result};
 pub use features::FeatureSet;
+pub use filter::{FilterKind, FilterPolicy, FilterSpec, UnsupportedFilterKind};
 use std::io::{Read, Write};
 use std::path::Path;
 pub use streaming::{EntryReader, EntrySource, WriterResources, DEFAULT_WRITER_MEMORY_LIMIT};
@@ -2597,7 +2599,7 @@ mod tests {
                 attributes: 0x20,
                 host_os: 3,
             }])
-            .filter_policy(rar50::FilterPolicy::Explicit(rar50::FilterKind::Delta {
+            .filter_policy(rar50::FilterPolicy::explicit(rar50::FilterKind::Delta {
                 channels: 3,
             }))
             .finish()
@@ -2619,7 +2621,7 @@ mod tests {
                 attributes: 0x20,
                 host_os: 3,
             }])
-            .filter_policy(rar50::FilterPolicy::Explicit(rar50::FilterKind::E8))
+            .filter_policy(rar50::FilterPolicy::explicit(rar50::FilterKind::E8))
             .finish()
             .unwrap();
 
@@ -2639,7 +2641,7 @@ mod tests {
                 attributes: 0x20,
                 host_os: 3,
             }])
-            .filter_policy(rar50::FilterPolicy::Explicit(rar50::FilterKind::Arm))
+            .filter_policy(rar50::FilterPolicy::explicit(rar50::FilterKind::Arm))
             .finish()
             .unwrap();
 
@@ -2659,7 +2661,7 @@ mod tests {
                 attributes: 0x20,
                 host_os: 3,
             }])
-            .filter_policy(rar50::FilterPolicy::AutoSize)
+            .filter_policy(rar50::FilterPolicy::Auto)
             .finish()
             .unwrap();
 

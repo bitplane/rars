@@ -1,7 +1,7 @@
 use super::*;
 use crate::codec::rar50::{
     encode_lz_member_with_options, encode_lz_member_with_options_and_progress, EncodeOptions,
-    Rar50FilterSpec, Unpack50Encoder,
+    Unpack50Encoder,
 };
 use crate::x86_filter_scan::auto_x86_filter_ranges;
 
@@ -18,7 +18,7 @@ fn borrow_progress<'a>(
 pub(super) fn encode_member_with_filter_policy(
     data: &[u8],
     algorithm_version: u8,
-    policy: FilterPolicy,
+    policy: &FilterPolicy,
     options: EncodeOptions,
 ) -> Result<Vec<u8>> {
     encode_member_with_filter_policy_and_progress(data, algorithm_version, policy, options, None)
@@ -27,7 +27,7 @@ pub(super) fn encode_member_with_filter_policy(
 fn encode_member_with_filter_policy_and_progress(
     data: &[u8],
     algorithm_version: u8,
-    policy: FilterPolicy,
+    policy: &FilterPolicy,
     options: EncodeOptions,
     progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<u8>> {
@@ -38,11 +38,15 @@ fn encode_member_with_filter_policy_and_progress(
             }
             None => encode_safe_lz_member(data, algorithm_version, options),
         },
-        FilterPolicy::Explicit(filter) => {
-            encode_member_with_filter_progress(data, algorithm_version, filter, options, progress)
-                .map_err(Error::from)
-        }
-        FilterPolicy::AutoSize => {
+        FilterPolicy::Explicit(filter) => encode_member_with_filter_specs_progress(
+            data,
+            algorithm_version,
+            std::slice::from_ref(filter),
+            options,
+            progress,
+        )
+        .map_err(Error::from),
+        FilterPolicy::Auto => {
             encode_member_with_auto_size_filter_progress(data, algorithm_version, options, progress)
         }
     }
@@ -51,7 +55,7 @@ fn encode_member_with_filter_policy_and_progress(
 pub(super) fn encode_member_with_filter_policy_candidates_and_progress(
     data: &[u8],
     algorithm_version: u8,
-    policy: FilterPolicy,
+    policy: &FilterPolicy,
     candidates: &[EncodeOptions],
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<u8>> {
@@ -63,7 +67,7 @@ pub(super) fn encode_member_with_filter_policy_candidates_and_progress(
     // Searching for a filter once and then trying the encoder settings against
     // it is the difference between a handful of passes over the member and one
     // whole search per setting.
-    if policy == FilterPolicy::AutoSize && auto_size_filter_search_applies(data) {
+    if *policy == FilterPolicy::Auto && auto_size_filter_search_applies(data) {
         let (specs, mut best) = choose_auto_size_filter(
             data,
             algorithm_version,
@@ -122,12 +126,12 @@ fn auto_size_filter_search_applies(data: &[u8]) -> bool {
 /// predicting.
 pub(super) fn filter_policy_walk_bytes(
     data: &[u8],
-    policy: FilterPolicy,
+    policy: &FilterPolicy,
     encoder_candidates: usize,
 ) -> u64 {
     let member = data.len() as u64;
     let encoder_candidates = encoder_candidates.max(1) as u64;
-    if policy != FilterPolicy::AutoSize || !auto_size_filter_search_applies(data) {
+    if *policy != FilterPolicy::Auto || !auto_size_filter_search_applies(data) {
         return member * encoder_candidates;
     }
     // The screens encode a sample once unfiltered and once per filter they are
@@ -149,7 +153,7 @@ pub(super) fn filter_policy_walk_bytes(
 pub(super) fn encode_member_with_filter_policy_candidates(
     data: &[u8],
     algorithm_version: u8,
-    policy: FilterPolicy,
+    policy: &FilterPolicy,
     candidates: &[EncodeOptions],
 ) -> Result<Vec<u8>> {
     let mut candidates = candidates.iter().copied();
@@ -170,7 +174,7 @@ pub(super) fn should_store_compressed_payload(
     data: &[u8],
     packed: &[u8],
     solid: bool,
-    policy: FilterPolicy,
+    policy: &FilterPolicy,
 ) -> bool {
     !solid && !matches!(policy, FilterPolicy::Explicit(_)) && packed.len() >= data.len()
 }
@@ -514,7 +518,7 @@ fn screened_filter_kinds(
         let packed = encode_member_with_filter_specs_progress(
             sample,
             algorithm_version,
-            &[Rar50FilterSpec::new(kind)],
+            &[FilterSpec::whole(kind)],
             options,
             None,
         )
@@ -567,7 +571,7 @@ fn x86_filter_helps_sample(
     let filtered = encode_member_with_filter_specs_progress(
         sample,
         algorithm_version,
-        &[Rar50FilterSpec::new(FilterKind::E8E9)],
+        &[FilterSpec::whole(FilterKind::E8E9)],
         options,
         None,
     )
@@ -586,22 +590,19 @@ fn x86_filter_helps_sample(
 /// percent, so this keeps the two that are structurally different: filter
 /// everything, or filter only where the scanner saw code. The second is only
 /// worth an encode when there is enough non-code to protect.
-fn x86_filter_finalists(
-    data: &[u8],
-    regions: &[std::ops::Range<usize>],
-) -> Vec<Vec<Rar50FilterSpec>> {
+fn x86_filter_finalists(data: &[u8], regions: &[std::ops::Range<usize>]) -> Vec<Vec<FilterSpec>> {
     let covered: usize = regions.iter().map(|range| range.len()).sum();
     let (numerator, denominator) = X86_CODE_COVERAGE_RATIO;
     let sparse = covered * denominator < data.len() * numerator;
 
     let mut finalists = Vec::new();
     for kind in [FilterKind::E8E9, FilterKind::E8] {
-        finalists.push(vec![Rar50FilterSpec::new(kind)]);
+        finalists.push(vec![FilterSpec::whole(kind)]);
         if sparse {
             finalists.push(
                 regions
                     .iter()
-                    .map(|range| Rar50FilterSpec::range(kind, range.clone()))
+                    .map(|range| FilterSpec::range(kind, range.clone()))
                     .collect(),
             );
         }
@@ -620,7 +621,7 @@ fn auto_size_filter_finalists(
     data: &[u8],
     algorithm_version: u8,
     options: EncodeOptions,
-) -> Result<Vec<(Vec<Rar50FilterSpec>, Option<Vec<u8>>)>> {
+) -> Result<Vec<(Vec<FilterSpec>, Option<Vec<u8>>)>> {
     let screen = screened_filter_kinds(data, algorithm_version, options)?;
     let mut finalists = vec![(Vec::new(), screen.plain)];
 
@@ -634,10 +635,10 @@ fn auto_size_filter_finalists(
     }
 
     for (kind, packed) in screen.kinds {
-        finalists.push((vec![Rar50FilterSpec::new(kind)], packed));
+        finalists.push((vec![FilterSpec::whole(kind)], packed));
         if let FilterKind::Delta { channels } = kind {
             if let Some(range) = auto_delta_filter_range(data, channels) {
-                finalists.push((vec![Rar50FilterSpec::range(kind, range)], None));
+                finalists.push((vec![FilterSpec::range(kind, range)], None));
             }
         }
     }
@@ -660,8 +661,8 @@ fn choose_auto_size_filter(
     algorithm_version: u8,
     options: EncodeOptions,
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
-) -> Result<(Vec<Rar50FilterSpec>, Vec<u8>)> {
-    let mut best: Option<(Vec<Rar50FilterSpec>, Vec<u8>)> = None;
+) -> Result<(Vec<FilterSpec>, Vec<u8>)> {
+    let mut best: Option<(Vec<FilterSpec>, Vec<u8>)> = None;
     for (specs, measured) in auto_size_filter_finalists(data, algorithm_version, options)? {
         let packed = match measured {
             Some(packed) => packed,
@@ -694,7 +695,7 @@ fn encode_member_with_auto_size_filter_progress(
         return encode_member_with_filter_policy_and_progress(
             data,
             algorithm_version,
-            FilterPolicy::None,
+            &FilterPolicy::None,
             options,
             progress,
         );
@@ -747,34 +748,10 @@ pub(super) fn disjoint_filter_ranges(
     disjoint
 }
 
-fn encode_member_with_filter_progress(
-    data: &[u8],
-    algorithm_version: u8,
-    filter: FilterKind,
-    options: EncodeOptions,
-    progress: Option<&mut dyn FnMut(usize) -> bool>,
-) -> crate::codec::Result<Vec<u8>> {
-    let mut encoder = Unpack50Encoder::with_options(options);
-    if let Some(progress) = progress {
-        encoder.encode_member_with_filters_and_progress(
-            data,
-            algorithm_version,
-            &[Rar50FilterSpec::new(filter)],
-            progress,
-        )
-    } else {
-        Unpack50Encoder::with_options(options).encode_member_with_filter(
-            data,
-            algorithm_version,
-            Rar50FilterSpec::new(filter),
-        )
-    }
-}
-
 fn encode_member_with_filter_specs_progress(
     data: &[u8],
     algorithm_version: u8,
-    filters: &[Rar50FilterSpec],
+    filters: &[FilterSpec],
     options: EncodeOptions,
     progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> crate::codec::Result<Vec<u8>> {
@@ -809,7 +786,7 @@ fn encode_member_with_filter_specs_progress(
 pub(super) fn encode_member_with_filter_spec(
     data: &[u8],
     algorithm_version: u8,
-    filter: Rar50FilterSpec,
+    filter: FilterSpec,
     options: EncodeOptions,
 ) -> crate::codec::Result<Vec<u8>> {
     Unpack50Encoder::with_options(options).encode_member_with_filter(
@@ -823,7 +800,7 @@ pub(super) fn encode_member_with_filter_spec(
 pub(super) fn encode_member_with_filter_specs(
     data: &[u8],
     algorithm_version: u8,
-    filters: &[Rar50FilterSpec],
+    filters: &[FilterSpec],
     options: EncodeOptions,
 ) -> crate::codec::Result<Vec<u8>> {
     Unpack50Encoder::with_options(options).encode_member_with_filters(

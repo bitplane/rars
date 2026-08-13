@@ -1,8 +1,8 @@
 use super::*;
-pub use crate::codec::rar50::Rar50FilterKind as FilterKind;
 use crate::codec::rar50::Unpack50Encoder;
 use crate::crc32::Crc32;
 use crate::crypto::rar50::{Rar50Cipher, Rar50Keys};
+pub use crate::filter::{FilterKind, FilterPolicy, FilterSpec};
 use crate::recovery::rar5::build_structural_inline_recovery_data_with_progress;
 use crate::write_progress::{ProgressReporter, WorkTracker};
 use crate::{EntrySource, WriteOperation, WriteProgress, WriteProgressEvent, WriterResources};
@@ -607,15 +607,6 @@ pub struct EncryptedCompressedEntry<'a> {
 pub struct EncryptedArchiveCommentEntry<'a> {
     pub data: &'a [u8],
     pub password: &'a [u8],
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[non_exhaustive]
-pub enum FilterPolicy {
-    #[default]
-    None,
-    AutoSize,
-    Explicit(FilterKind),
 }
 
 #[derive(Debug, Clone)]
@@ -1870,7 +1861,7 @@ mod tests {
     };
     use super::*;
     use crate::codec::rar50::{encode_literal_only, encode_lz_member};
-    use crate::codec::rar50::{encode_lz_member_with_options, EncodeOptions, Rar50FilterSpec};
+    use crate::codec::rar50::{encode_lz_member_with_options, EncodeOptions};
     use crate::x86_filter_scan::auto_x86_filter_ranges;
     use crate::{ArchiveVersion, FeatureSet};
     use std::cell::RefCell;
@@ -1919,7 +1910,7 @@ mod tests {
             FeatureSet::default(),
         ))
         .compressed_entries(&[entry])
-        .filter_policy(FilterPolicy::AutoSize)
+        .filter_policy(FilterPolicy::Auto)
         .progress(&reporter)
         .finish()
         .unwrap();
@@ -2386,11 +2377,11 @@ mod tests {
         assert!(fallback_candidates.len() > 1);
 
         let level_five_only =
-            encode_member_with_filter_policy(&data, 0, FilterPolicy::None, level_five).unwrap();
+            encode_member_with_filter_policy(&data, 0, &FilterPolicy::None, level_five).unwrap();
         let chosen = encode_member_with_filter_policy_candidates(
             &data,
             0,
-            FilterPolicy::None,
+            &FilterPolicy::None,
             &fallback_candidates,
         )
         .unwrap();
@@ -2454,7 +2445,7 @@ mod tests {
         let ranges = disjoint_filter_ranges(auto_x86_filter_ranges(&data, false));
         let filters: Vec<_> = ranges
             .into_iter()
-            .map(|range| Rar50FilterSpec::range(FilterKind::E8, range))
+            .map(|range| FilterSpec::range(FilterKind::E8, range))
             .collect();
 
         let packed =
@@ -2502,7 +2493,7 @@ mod tests {
         let ranged = encode_member_with_filter_spec(
             &data,
             0,
-            Rar50FilterSpec::range(
+            FilterSpec::range(
                 FilterKind::Delta { channels: 2 },
                 auto_delta_filter_range(&data, 2).unwrap(),
             ),
@@ -2532,7 +2523,7 @@ mod tests {
         let packed = encode_member_with_filter_policy(
             &data,
             0,
-            FilterPolicy::Explicit(FilterKind::Delta { channels: 1 }),
+            &FilterPolicy::explicit(FilterKind::Delta { channels: 1 }),
             EncodeOptions::new(0),
         )
         .unwrap();

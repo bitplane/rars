@@ -141,7 +141,7 @@ pub(super) fn write_compressed_volume_set_impl(
             entry.data,
             &packed,
             options.features.solid,
-            FilterPolicy::None,
+            &FilterPolicy::None,
         ) {
             members.push(CompressedVolumeMember::Stored { entry_index: index });
         } else {
@@ -369,7 +369,7 @@ pub(super) fn write_encrypted_compressed_volume_set_impl(
             entry.data,
             &packed,
             options.features.solid,
-            FilterPolicy::None,
+            &FilterPolicy::None,
         ) {
             let encrypted = encrypted_stored_payload(entry.data, entry.password)?;
             members.push(EncryptedCompressedVolumeMember::Stored {
