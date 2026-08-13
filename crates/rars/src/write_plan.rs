@@ -82,10 +82,11 @@ pub enum WriterOption {
     ArchiveMetadata,
     Password,
     MemoryLimit,
+    TempDir,
 }
 
 impl WriterOption {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::Feature(Feature::Solid),
         Self::Feature(Feature::HeaderEncryption),
         Self::Feature(Feature::QuickOpen),
@@ -99,6 +100,7 @@ impl WriterOption {
         Self::ArchiveMetadata,
         Self::Password,
         Self::MemoryLimit,
+        Self::TempDir,
     ];
 
     /// How this option is named in a library message. The command line
@@ -116,6 +118,7 @@ impl WriterOption {
             Self::ArchiveMetadata => "archive metadata",
             Self::Password => "encryption",
             Self::MemoryLimit => "a memory limit",
+            Self::TempDir => "a temporary directory",
         }
     }
 }
@@ -177,9 +180,9 @@ pub fn supports(target: ArchiveVersion, option: WriterOption, shape: PlanShape) 
         }
         WriterOption::ArchiveMetadata => family == ArchiveFamily::Rar50Plus,
         WriterOption::Password => true,
-        // Only the RAR 5 engine works to a budget; the others build the whole
-        // archive in memory.
-        WriterOption::MemoryLimit => family == ArchiveFamily::Rar50Plus,
+        // Only the RAR 5 engine works to a budget or spills to disk; the others
+        // build the whole archive in memory.
+        WriterOption::MemoryLimit | WriterOption::TempDir => family == ArchiveFamily::Rar50Plus,
     }
 }
 

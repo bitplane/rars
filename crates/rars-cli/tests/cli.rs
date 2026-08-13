@@ -5477,6 +5477,16 @@ const REJECTED_COMBINATIONS: &[(&[&str], &str)] = &[
          or --format rar70",
     ),
     (
+        &["--format", "rar29", "--memory-limit", "64m"],
+        "error: --memory-limit is not supported by --format rar29; use --format rar50 \
+         or --format rar70",
+    ),
+    (
+        &["--format", "rar29", "--temp-dir", "."],
+        "error: --temp-dir is not supported by --format rar29; use --format rar50 \
+         or --format rar70",
+    ),
+    (
         &["--format", "rar30", "--file-comment", "note"],
         "error: --file-comment is not supported by --format rar30; use --format rar14, \
          --format rar15, --format rar20, --format rar29, --format rar50 or --format rar70",

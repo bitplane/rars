@@ -129,9 +129,13 @@ pub(crate) struct AddArgs {
     /// Dictionary size (e.g. 4m, 128k)
     #[arg(long, value_name = "SIZE", value_parser = crate::parse_size_string)]
     pub dict_size: Option<usize>,
-    /// Maximum total compression working memory (default: 256m)
-    #[arg(long, value_name = "SIZE", default_value = "256m", value_parser = crate::parse_size_string)]
-    pub memory_limit: usize,
+    /// Maximum total compression working memory (default: 256m; RAR 5+)
+    ///
+    /// Left unset rather than defaulted here, so the formats that build the
+    /// whole archive in memory can tell an explicit request from a default and
+    /// refuse the one they cannot honour.
+    #[arg(long, value_name = "SIZE", value_parser = crate::parse_size_string)]
+    pub memory_limit: Option<usize>,
     /// Directory for temporary compressed payloads
     #[arg(long, value_name = "PATH")]
     pub temp_dir: Option<String>,

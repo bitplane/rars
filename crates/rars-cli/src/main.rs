@@ -951,7 +951,7 @@ struct AddCommand {
     store: bool,
     compression_level: Option<u8>,
     dictionary_size: Option<usize>,
-    memory_limit: usize,
+    memory_limit: Option<usize>,
     temp_dir: Option<PathBuf>,
     solid: bool,
     header_encryption: bool,
@@ -1114,6 +1114,8 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
             (rars::WriterOption::FileComment, file_comment.is_some()),
             (rars::WriterOption::ArchiveMetadata, archive_name.is_some()),
             (rars::WriterOption::Password, password.is_some()),
+            (rars::WriterOption::MemoryLimit, memory_limit.is_some()),
+            (rars::WriterOption::TempDir, temp_dir.is_some()),
         ],
     )?;
     add_plan::reject_unsupported_filter(target, &asked_filters)?;
@@ -1554,7 +1556,7 @@ fn write_plain_rar50_streaming(
     target: ArchiveVersion,
     compression_level: Option<u8>,
     dictionary_size: Option<usize>,
-    memory_limit: usize,
+    memory_limit: Option<usize>,
     temp_dir: Option<&Path>,
     password: Option<&[u8]>,
     solid: bool,
@@ -1617,7 +1619,9 @@ fn write_plain_rar50_streaming(
     let default_temp = archive_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty());
-    let mut resources = rars::WriterResources::new(memory_limit as u64);
+    let mut resources = rars::WriterResources::new(
+        memory_limit.map_or(rars::DEFAULT_WRITER_MEMORY_LIMIT, |limit| limit as u64),
+    );
     if let Some(directory) = temp_dir.or(default_temp) {
         resources = resources.with_temp_dir(directory);
     }

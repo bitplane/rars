@@ -29,6 +29,7 @@ pub(crate) fn flag_for(option: WriterOption, asked: &AskedFilters) -> &'static s
         WriterOption::ArchiveMetadata => "--archive-name",
         WriterOption::Password => "--password",
         WriterOption::MemoryLimit => "--memory-limit",
+        WriterOption::TempDir => "--temp-dir",
         // WriterOption is non_exhaustive in the library, so this arm cannot be
         // dropped, but every variant above is named deliberately.
         _ => "that option",
