@@ -126,7 +126,7 @@ pub(crate) struct AddArgs {
     /// Compression level (0..5; 0 implies --store)
     #[arg(long, value_name = "LEVEL")]
     pub level: Option<u8>,
-    /// Dictionary size (e.g. 4m, 128k)
+    /// Dictionary size (e.g. 4m, 128k; RAR 1.5+)
     #[arg(long, value_name = "SIZE", value_parser = crate::parse_size_string)]
     pub dict_size: Option<usize>,
     /// Maximum total compression working memory (default: 256m; RAR 5+)
@@ -136,13 +136,13 @@ pub(crate) struct AddArgs {
     /// refuse the one they cannot honour.
     #[arg(long, value_name = "SIZE", value_parser = crate::parse_size_string)]
     pub memory_limit: Option<usize>,
-    /// Directory for temporary compressed payloads
+    /// Directory for temporary compressed payloads (RAR 5+)
     #[arg(long, value_name = "PATH")]
     pub temp_dir: Option<String>,
     /// Use solid compression (treats inputs as one continuous stream)
     #[arg(long)]
     pub solid: bool,
-    /// Encrypt archive headers (requires --password)
+    /// Encrypt archive headers (RAR 3.x/4.x and RAR 5+) (requires --password)
     #[arg(long = "encrypt-headers")]
     pub encrypt_headers: bool,
     /// Emit a quick-open service block (RAR 5+ only)
@@ -154,7 +154,7 @@ pub(crate) struct AddArgs {
     /// Archive name to embed in archive metadata service (RAR 5+)
     #[arg(long = "archive-name", value_name = "NAME")]
     pub archive_name: Option<String>,
-    /// Per-file comment
+    /// Per-file comment (not RAR 3.x/4.x)
     #[arg(long = "file-comment", value_name = "TEXT")]
     pub file_comment: Option<String>,
     /// Add a recovery record at the given percentage (1..100; RAR 5+)
@@ -163,31 +163,31 @@ pub(crate) struct AddArgs {
     /// Split archive into volumes of this size
     #[arg(long = "volume-size", value_name = "SIZE", value_parser = crate::parse_size_string)]
     pub volume_size: Option<usize>,
-    /// Delta filter with the given channel count
+    /// Delta filter with the given channel count (RAR 2.9+)
     #[arg(long = "delta-filter", value_name = "CHANNELS")]
     pub delta_filter: Option<usize>,
-    /// E8 x86 call filter
+    /// E8 x86 call filter (RAR 2.9+)
     #[arg(long = "e8-filter", conflicts_with = "e8e9_filter")]
     pub e8_filter: bool,
-    /// E8E9 x86 call/jump filter
+    /// E8E9 x86 call/jump filter (RAR 2.9+)
     #[arg(long = "e8e9-filter")]
     pub e8e9_filter: bool,
-    /// Itanium filter
+    /// Itanium filter (RAR 2.9/3.x/4.x only)
     #[arg(long = "itanium-filter")]
     pub itanium_filter: bool,
-    /// RGB image filter with the given pixel width
+    /// RGB image filter with the given pixel width (RAR 2.9/3.x/4.x only)
     #[arg(long = "rgb-filter", value_name = "WIDTH")]
     pub rgb_filter: Option<usize>,
-    /// Audio filter with the given channel count
+    /// Audio filter with the given channel count (RAR 2.9/3.x/4.x only)
     #[arg(long = "audio-filter", value_name = "CHANNELS")]
     pub audio_filter: Option<usize>,
-    /// ARM filter
+    /// ARM filter (RAR 5+ only)
     #[arg(long = "arm-filter")]
     pub arm_filter: bool,
     /// Auto-detect data filter (RAR 5+ does this by default)
     #[arg(long = "auto-filter")]
     pub auto_filter: bool,
-    /// Skip filter detection, compressing the data as it is
+    /// Skip filter detection, compressing the data as it is (RAR 2.9+)
     #[arg(long = "no-filter", conflicts_with = "auto_filter")]
     pub no_filter: bool,
     /// Use the PPMd compression algorithm (RAR 2.9/3.x/4.x only)

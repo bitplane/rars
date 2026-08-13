@@ -55,9 +55,26 @@ executables and costs compression time rather than memory; `--no-filter` turns
 it off, and solid archives do not use one because they share a dictionary
 across members. Choosing a filter, and comparing candidate settings at
 `--level 5`, both need a whole member in memory, and fall back to streaming
-without them when the budget is too small to allow it. Per-file comments, PPMd and
-the RAR 1.3-4.x formats still assemble archives in memory; the CLI warns
-before doing that with a large input.
+without them when the budget is too small to allow it.
+
+RAR 2.9 and later look for a filter the same way. Candidates are screened on a
+sample of the member before anything is compressed in full, so filters that were
+never going to help cost a fraction of a member rather than one whole encode
+each.
+
+The RAR 1.3 to 4.x writers still assemble archives in memory and hold every
+input while they do it, which peaks at several times the size of the input. The
+CLI warns before starting one of those on a large input and points at RAR 5,
+which streams.
+
+Every option either works for the format you chose or is refused before any
+input is read, naming the flag and a format that would have worked:
+
+```
+$ rars a --format rar15 --encrypt-headers --password pw archive.rar files...
+error: --encrypt-headers is not supported by --format rar15; use --format rar30,
+--format rar40, --format rar50 or --format rar70
+```
 
 
 ## Python bindings
