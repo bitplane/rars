@@ -251,12 +251,10 @@ pub(crate) fn build_structural_inline_recovery_data_with_progress(
 /// straddle a chunk boundary.
 pub(crate) const RECOVERY_IO_BLOCK: usize = 256 * 1024;
 /// Striped mode never claims more than this, however large the budget is.
-#[cfg_attr(not(test), allow(dead_code))]
 const STRIPE_BUDGET_CAP: u64 = 64 * 1024 * 1024;
 /// Below this a stripe pass seeks far more than it reads, so rather than
 /// thrash we report what striping would actually cost and let the caller
 /// refuse the job.
-#[cfg_attr(not(test), allow(dead_code))]
 const MIN_STRIPE_LEN: u64 = 4 * 1024;
 
 /// How a recovery pass holds parity while it works.
@@ -268,13 +266,11 @@ pub(crate) enum RecoveryMemoryMode {
     /// Parity is built one column stripe at a time and spilled to scratch
     /// storage, so memory is bounded regardless of archive size. Costs one
     /// seek per data shard per stripe.
-    #[cfg_attr(not(test), allow(dead_code))]
     Striped { stripe_len: usize },
 }
 
 /// Picks a memory mode for `plan` under `memory_limit`, returning the mode and
 /// the number of bytes the caller should reserve for it.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn choose_recovery_memory_mode(
     plan: InlineRecoveryPlan,
     memory_limit: u64,
@@ -309,7 +305,6 @@ pub(crate) fn choose_recovery_memory_mode(
 /// What a streaming recovery pass produced, so the caller can frame the
 /// service block around the payload it just wrote.
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct StreamedRecoveryOutput {
     pub(crate) plan: InlineRecoveryPlan,
     pub(crate) payload_len: u64,

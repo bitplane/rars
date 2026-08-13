@@ -12,9 +12,6 @@ mod compress;
 mod engine;
 mod filter_policy;
 mod headers;
-// Consumed by the streaming engine; until that lands only its own tests
-// exercise it.
-#[cfg_attr(not(test), allow(dead_code))]
 mod layout;
 mod volume;
 #[cfg(test)]

@@ -1135,6 +1135,15 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
             &progress,
         );
     }
+    warn_if_buffered_write_is_large(
+        input_paths,
+        matches!(target, ArchiveVersion::Rar50 | ArchiveVersion::Rar70),
+        quick_open,
+        archive_comment.is_some() || file_comment.is_some(),
+        archive_name.is_some(),
+        volume_size.is_some(),
+        ppmd,
+    );
     progress.spinner("Scanning inputs");
     let owned = read_inputs_with_progress(
         input_paths,
@@ -1949,6 +1958,57 @@ fn write_plain_rar50_streaming(
     progress.finish("Archive written");
     eprintln!("created {}", archive_path.display());
     Ok(())
+}
+
+/// Warns before an archive is built in memory rather than streamed.
+///
+/// The streaming writer keeps memory flat regardless of input size; the
+/// remaining features assemble the whole archive in memory, so a large input
+/// can exhaust it. Saying so up front beats an allocation failure an hour in.
+#[allow(clippy::too_many_arguments)]
+fn warn_if_buffered_write_is_large(
+    input_paths: &[String],
+    rar50_family: bool,
+    quick_open: bool,
+    comments: bool,
+    metadata: bool,
+    volumes: bool,
+    ppmd: bool,
+) {
+    const WARN_THRESHOLD: u64 = 512 * 1024 * 1024;
+
+    let Ok(inputs) = collect_inputs(input_paths) else {
+        return;
+    };
+    let total: u64 = inputs.iter().map(|entry| entry.size).sum();
+    if total < WARN_THRESHOLD {
+        return;
+    }
+
+    // Only name a reason for RAR5 and RAR7, where streaming is the norm and
+    // one specific feature is what fell back.
+    let reason = if !rar50_family {
+        Some("this archive format")
+    } else if volumes {
+        Some("--volume-size")
+    } else if quick_open {
+        Some("--quick-open")
+    } else if metadata {
+        Some("--archive-name")
+    } else if comments {
+        Some("archive or file comments")
+    } else if ppmd {
+        Some("--ppmd")
+    } else {
+        Some("the requested filters")
+    };
+
+    eprintln!(
+        "warning: {} is built in memory, so this write needs several times the {} of input; \
+         it may run out of memory",
+        reason.unwrap_or("this archive"),
+        indicatif::HumanBytes(total)
+    );
 }
 
 fn create_streaming_archive_temp(archive_path: &Path) -> CliResult<(PathBuf, fs::File)> {

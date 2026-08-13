@@ -48,9 +48,9 @@ pub(super) struct ResolvedLayout {
     /// The extra area to put in the main header, with settled offsets.
     pub(super) main_extra: Vec<u8>,
     pub(super) main_header_len: u64,
-    /// Value to store in the locator: the block's position measured from the
-    /// end of the signature.
-    pub(super) quick_open_offset: Option<u64>,
+    /// Value stored in the locator: the block's position measured from the end
+    /// of the signature. The quick-open offset is settled the same way but is
+    /// only ever written into `main_extra`, so it is not repeated here.
     pub(super) recovery_offset: Option<u64>,
     /// Bytes the recovery record protects, i.e. everything before it.
     pub(super) recovery_prefix_len: Option<u64>,
@@ -89,7 +89,6 @@ pub(super) fn resolve_layout(inputs: &LayoutInputs<'_>) -> Result<ResolvedLayout
             return Ok(ResolvedLayout {
                 main_extra,
                 main_header_len,
-                quick_open_offset,
                 recovery_offset,
                 recovery_prefix_len: inputs.recovery_percent.map(|_| recovery_position),
             });
@@ -185,9 +184,6 @@ mod tests {
         let rebuilt = super::main_header_len(inputs, &layout.main_extra).unwrap();
         assert_eq!(rebuilt, layout.main_header_len, "main header size moved");
 
-        if let Some(offset) = layout.quick_open_offset {
-            assert_eq!(offset, quick_open_position - signature_len);
-        }
         if let Some(offset) = layout.recovery_offset {
             let quick_open_block_len = match inputs.quick_open_payload_len {
                 Some(len) => {
@@ -228,12 +224,9 @@ mod tests {
             inputs.quick_open_payload_len = Some(4096);
             let layout = resolve_layout(&inputs).unwrap();
 
-            assert!(layout.quick_open_offset.is_some());
+            // assert_self_consistent checks that the recovery offset leaves
+            // room for the whole quick-open block ahead of it.
             assert!(layout.recovery_offset.is_some());
-            assert!(
-                layout.recovery_offset > layout.quick_open_offset,
-                "recovery follows quick-open"
-            );
             assert_self_consistent(&inputs, &layout);
         }
     }
@@ -259,7 +252,6 @@ mod tests {
         inputs.recovery_percent = None;
         let layout = resolve_layout(&inputs).unwrap();
 
-        assert_eq!(layout.quick_open_offset, None);
         assert_eq!(layout.recovery_offset, None);
         assert_eq!(layout.recovery_prefix_len, None);
         assert!(layout.main_extra.is_empty());

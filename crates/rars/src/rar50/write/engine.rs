@@ -134,21 +134,27 @@ pub(super) fn write_archive(
             mirror: mirror.as_mut(),
         };
 
-        sink.write_all(RAR50_SIGNATURE)?;
-        sink.write_all(&head_crypt)?;
-        match &header_keys {
-            Some(keys) => sink.write_all(&encrypted_main_header_block(
-                &keys.keys,
-                main_flags,
-                None,
-                &layout.main_extra,
-            )?)?,
+        let main = match &header_keys {
+            Some(keys) => {
+                encrypted_main_header_block(&keys.keys, main_flags, None, &layout.main_extra)?
+            }
             None => {
                 let mut main = Vec::new();
                 write_main_header(&mut main, main_flags, None, &layout.main_extra)?;
-                sink.write_all(&main)?;
+                main
             }
-        }
+        };
+        // The layout predicted this before any of it existed. If the
+        // prediction is off, every offset in the locator is off with it.
+        debug_assert_eq!(
+            main.len() as u64,
+            layout.main_header_len,
+            "main header size differs from the size its layout was built on"
+        );
+
+        sink.write_all(RAR50_SIGNATURE)?;
+        sink.write_all(&head_crypt)?;
+        sink.write_all(&main)?;
 
         for member in members {
             sink.write_all(&member.header)?;
@@ -158,7 +164,14 @@ pub(super) fn write_archive(
 
     if let Some(recovery_percent) = plan.recovery_percent {
         let mirror = mirror.as_mut().expect("recovery mirrors the archive");
+        // The recovery block has to start exactly where the locator in the
+        // main header says it does.
         debug_assert_eq!(layout.recovery_prefix_len, Some(mirror.len()));
+        debug_assert_eq!(
+            layout.recovery_offset,
+            Some(mirror.len() - RAR50_SIGNATURE.len() as u64),
+            "recovery record is not where the locator points"
+        );
         write_recovery_service(
             recovery_percent,
             mirror,
@@ -357,6 +370,8 @@ fn write_recovery_service(
         progress,
         1,
     )?;
+
+    debug_assert_eq!(built.plan.payload_size(), Ok(built.payload_len));
 
     let mut service_data = Vec::new();
     write_vint(&mut service_data, recovery_percent);

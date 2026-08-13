@@ -10,12 +10,36 @@ where
     items.into_par_iter().map(map).collect()
 }
 
-pub(crate) fn map_slice_collect<'a, T, O, E, F>(items: &'a [T], map: F) -> Result<Vec<O>, E>
+/// Maps `items` in parallel but keeps only a window of results alive, handing
+/// each to `consume` in order before starting the next window.
+///
+/// Mapping everything up front is simpler, but it holds every result at once;
+/// when the results are compressed file payloads that is the difference
+/// between one copy of the archive in memory and two.
+pub(crate) fn map_slice_windowed<'a, T, O, E, F, C>(
+    items: &'a [T],
+    window: usize,
+    map: F,
+    mut consume: C,
+) -> Result<(), E>
 where
     T: Sync + 'a,
     O: Send,
     E: Send,
     F: Fn(&'a T) -> Result<O, E> + Sync + Send,
+    C: FnMut(&'a T, O) -> Result<(), E>,
 {
-    items.par_iter().map(map).collect()
+    let window = window.max(1);
+    for chunk in items.chunks(window) {
+        let mapped: Vec<O> = chunk.par_iter().map(&map).collect::<Result<_, E>>()?;
+        for (item, output) in chunk.iter().zip(mapped) {
+            consume(item, output)?;
+        }
+    }
+    Ok(())
+}
+
+/// How many members to keep in flight at once.
+pub(crate) fn default_window() -> usize {
+    rayon::current_num_threads().max(1)
 }

@@ -142,18 +142,18 @@ fn write_compressed_archive_with_comment_impl(
             solid_run_has_member = payload.method != 0x30;
         }
     } else {
-        let payloads = encode_independent_payloads(entries, options, progress)?;
-        for (entry, payload) in entries.iter().zip(&payloads) {
+        let dictionary_flags = dictionary_flags_for_options(options)?;
+        encode_independent_payloads(entries, options, progress, |entry, payload| {
             write_compressed_entry(
                 &mut out,
                 entry,
                 &payload.data,
                 payload.method,
                 options.target,
-                dictionary_flags_for_options(options)?,
+                dictionary_flags,
                 false,
-            )?;
-        }
+            )
+        })?;
     }
     Ok(out)
 }
@@ -591,8 +591,7 @@ fn write_rar29_filtered_archive(
             solid_run_has_member = payload.method != 0x30;
         }
     } else {
-        let payloads = encode_filtered_payloads(entries, &encode)?;
-        for (entry, payload) in entries.iter().zip(&payloads) {
+        encode_filtered_payloads(entries, &encode, |entry, payload| {
             if let Some(password) = header_password {
                 write_header_encrypted_compressed_entry(
                     &mut out,
@@ -614,7 +613,8 @@ fn write_rar29_filtered_archive(
                     false,
                 )?;
             }
-        }
+            Ok(())
+        })?;
     }
     Ok(out)
 }
@@ -670,8 +670,7 @@ fn write_header_encrypted_compressed_archive(
             solid_run_has_member = payload.method != 0x30;
         }
     } else {
-        let payloads = encode_independent_payloads(entries, options, None)?;
-        for (entry, payload) in entries.iter().zip(&payloads) {
+        encode_independent_payloads(entries, options, None, |entry, payload| {
             write_header_encrypted_compressed_entry(
                 &mut out,
                 entry,
@@ -680,8 +679,8 @@ fn write_header_encrypted_compressed_archive(
                 options,
                 false,
                 password,
-            )?;
-        }
+            )
+        })?;
     }
     Ok(out)
 }
@@ -1165,21 +1164,35 @@ fn encode_independent_payload(
     encode_or_store_payload(data, options, &mut solid_encoder, progress)
 }
 
-fn encode_independent_payloads(
-    entries: &[FileEntry<'_>],
+/// Compresses independent members a windowful at a time, writing each out
+/// before the next window starts so their payloads do not all pile up.
+fn encode_independent_payloads<'a, C>(
+    entries: &'a [FileEntry<'a>],
     options: WriterOptions,
     progress: Option<&WorkTracker<'_>>,
-) -> Result<Vec<EncodedPayload>> {
-    crate::parallel::map_slice_collect(entries, |entry| {
-        encode_independent_payload(entry.data, options, progress)
-    })
+    consume: C,
+) -> Result<()>
+where
+    C: FnMut(&'a FileEntry<'a>, EncodedPayload) -> Result<()>,
+{
+    crate::parallel::map_slice_windowed(
+        entries,
+        crate::parallel::default_window(),
+        |entry| encode_independent_payload(entry.data, options, progress),
+        consume,
+    )
 }
 
-fn encode_filtered_payloads<F>(entries: &[FileEntry<'_>], encode: &F) -> Result<Vec<EncodedPayload>>
+fn encode_filtered_payloads<'a, F, C>(
+    entries: &'a [FileEntry<'a>],
+    encode: &F,
+    consume: C,
+) -> Result<()>
 where
     F: Fn(&FileEntry<'_>) -> Result<EncodedPayload> + Sync,
+    C: FnMut(&'a FileEntry<'a>, EncodedPayload) -> Result<()>,
 {
-    crate::parallel::map_slice_collect(entries, encode)
+    crate::parallel::map_slice_windowed(entries, crate::parallel::default_window(), encode, consume)
 }
 
 fn encode_or_store_payload(
