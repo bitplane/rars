@@ -4874,6 +4874,38 @@ fn rejects_ppmd_for_rar5_writer() {
     assert!(stderr(&output).contains("--ppmd is only available"));
 }
 
+/// These three name RAR 2.9 RarVM programs that RAR 5 has no filter type for.
+/// They used to be counted as filters and then quietly dropped, so the archive
+/// came out auto-filtered instead of filtered the way it was asked for.
+#[test]
+fn rejects_rar29_only_filters_for_rar5_writer() {
+    let dir = scratch("reject-rar5-rar29-filters");
+    let source = dir.join("payload.bin");
+    fs::write(&source, vec![0xe8u8; 4096]).unwrap();
+
+    for (flag, value) in [
+        ("--itanium-filter", None),
+        ("--rgb-filter", Some("3")),
+        ("--audio-filter", Some("2")),
+    ] {
+        let archive = dir.join(format!("created{}.rar", flag.trim_start_matches('-')));
+        let mut command = rars();
+        command.args(["a", "--format", "rar50", flag]);
+        if let Some(value) = value {
+            command.arg(value);
+        }
+        let output = command.arg(&archive).arg(&source).output().unwrap();
+
+        assert!(!output.status.success(), "{flag} was accepted");
+        assert!(
+            stderr(&output).contains(&format!("{flag} is only available")),
+            "{flag}: {}",
+            stderr(&output)
+        );
+        assert!(!archive.exists(), "{flag} still wrote an archive");
+    }
+}
+
 #[test]
 fn creates_rar50_solid_compressed_multivolume_archive_that_can_be_tested() {
     let dir = scratch("create-rar50-solid-compressed-multivolume");

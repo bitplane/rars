@@ -1221,11 +1221,22 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
             if ppmd {
                 return Err("--ppmd is only available for RAR 2.9/3.x/4.x writers".into());
             }
+            // These three are RAR 2.9 RarVM programs with no RAR 5 filter type
+            // behind them. Counting them as filters and then having no branch
+            // to apply them wrote an auto-filtered archive instead.
+            if let Some(flag) = [
+                itanium_filter.then_some("--itanium-filter"),
+                rgb_filter.is_some().then_some("--rgb-filter"),
+                audio_filter.is_some().then_some("--audio-filter"),
+            ]
+            .into_iter()
+            .flatten()
+            .next()
+            {
+                return Err(format!("{flag} is only available for RAR 2.9/3.x/4.x writers").into());
+            }
             let filter_count = usize::from(delta_filter.is_some())
                 + usize::from(e8_filter.is_some())
-                + usize::from(itanium_filter)
-                + usize::from(rgb_filter.is_some())
-                + usize::from(audio_filter.is_some())
                 + usize::from(arm_filter)
                 + usize::from(auto_filter);
             let filtered = filter_count != 0;
