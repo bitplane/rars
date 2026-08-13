@@ -1034,7 +1034,7 @@ impl RarBuilder {
     fn build_rar50_volumes(
         &self,
         volume_size: usize,
-        _progress: Option<&PythonProgress>,
+        progress: Option<&PythonProgress>,
     ) -> rars_rs::Result<Vec<Vec<u8>>> {
         if self.comment.is_some() {
             return Err(rars_rs::Error::InvalidHeader(
@@ -1042,13 +1042,14 @@ impl RarBuilder {
             ));
         }
         let mut sink = CollectedVolumes::default();
-        rars_rs::rar50::write_streaming_volumes_to(
+        rars_rs::rar50::write_streaming_volumes_with_progress(
             &self.rar50_entries(),
             self.rar50_options(),
             rars_rs::rar50::ArchiveExtras::default().with_recovery_percent(self.recovery_percent),
             volume_size as u64,
             &mut sink,
             &rars_rs::WriterResources::default(),
+            progress.map(|progress| progress as &dyn rars_rs::WriteProgress),
         )?;
         let volumes = sink.0.lock().unwrap().clone();
         Ok(volumes)

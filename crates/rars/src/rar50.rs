@@ -17,9 +17,9 @@ mod write;
 
 pub use extract::{extract_volumes_to, extract_volumes_to_with_redirections};
 pub use write::{
-    write_streaming_archive_to, write_streaming_volumes_to, ArchiveEntry, ArchiveExtras,
-    ArchiveMetadataEntry, FilterKind, FilterPolicy, FilterSpec, Rar50Writer, ServiceEntry,
-    VolumeSink, WriterOptions,
+    write_streaming_archive_to, write_streaming_archive_with_progress, write_streaming_volumes_to,
+    write_streaming_volumes_with_progress, ArchiveEntry, ArchiveExtras, ArchiveMetadataEntry,
+    FilterKind, FilterPolicy, FilterSpec, Rar50Writer, ServiceEntry, VolumeSink, WriterOptions,
 };
 
 const HEAD_MAIN: u64 = 1;

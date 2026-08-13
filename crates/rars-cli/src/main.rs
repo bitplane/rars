@@ -1610,13 +1610,14 @@ fn write_plain_rar50_streaming(
             first_path: archive_path,
             temporaries: Vec::new(),
         };
-        let result = rars::rar50::write_streaming_volumes_to(
+        let result = rars::rar50::write_streaming_volumes_with_progress(
             &entries,
             options,
             extras,
             volume_size,
             &mut sink,
             &resources,
+            Some(progress),
         );
         let paths = sink.finish(result)?;
         progress.finish("Volumes written");
@@ -1624,21 +1625,23 @@ fn write_plain_rar50_streaming(
         return Ok(());
     }
     if archive_path == Path::new("-") || archive_path == Path::new("/dev/stdout") {
-        rars::rar50::write_streaming_archive_to(
+        rars::rar50::write_streaming_archive_with_progress(
             &entries,
             options,
             extras.clone(),
             &resources,
+            Some(progress),
             &mut std::io::stdout(),
         )?;
     } else {
         let (temporary, mut output) = create_streaming_archive_temp(archive_path)?;
         let result = (|| -> CliResult<()> {
-            rars::rar50::write_streaming_archive_to(
+            rars::rar50::write_streaming_archive_with_progress(
                 &entries,
                 options,
                 extras.clone(),
                 &resources,
+                Some(progress),
                 &mut output,
             )?;
             output.sync_all()?;

@@ -68,14 +68,6 @@ struct MemberStream {
     packed: Spool,
 }
 
-pub(super) fn compress_members(
-    sources: &[EntrySource],
-    plan: CompressPlan,
-    resources: &WriterResources,
-) -> Result<Vec<CompressedMember>> {
-    compress_members_reporting(sources, plan, resources, &mut |_| true)
-}
-
 /// `advance` is called with each newly completed chunk of work and returns
 /// false when the caller wants to stop.
 pub(super) fn compress_members_reporting(

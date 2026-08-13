@@ -166,6 +166,28 @@ pub fn write_streaming_volumes_to(
     sink: &mut dyn VolumeSink,
     resources: &WriterResources,
 ) -> Result<()> {
+    write_streaming_volumes_with_progress(
+        entries,
+        options,
+        extras,
+        max_payload_per_volume,
+        sink,
+        resources,
+        None,
+    )
+}
+
+/// As [`write_streaming_volumes_to`], reporting compression progress as it
+/// goes.
+pub fn write_streaming_volumes_with_progress(
+    entries: &[ArchiveEntry],
+    options: WriterOptions,
+    extras: ArchiveExtras<'_>,
+    max_payload_per_volume: u64,
+    sink: &mut dyn VolumeSink,
+    resources: &WriterResources,
+    progress: Option<&dyn WriteProgress>,
+) -> Result<()> {
     let encrypted = entries.iter().any(|entry| entry.password.is_some());
     if encrypted && !entries.iter().all(|entry| entry.password.is_some()) {
         return Err(Error::UnsupportedFeature {
@@ -211,7 +233,7 @@ pub fn write_streaming_volumes_to(
             archive_comment: None,
             archive_metadata: None,
             quick_open: false,
-            progress: None,
+            progress: progress.map(ProgressReporter),
         },
         max_payload_per_volume,
         sink,
@@ -282,10 +304,30 @@ pub fn write_streaming_archive_to(
     resources: &WriterResources,
     output: &mut dyn Write,
 ) -> Result<()> {
-    write_streaming_archive_with_progress(entries, options, extras, resources, None, output)
+    write_streaming_archive_reporting(entries, options, extras, resources, None, output)
 }
 
-pub(crate) fn write_streaming_archive_with_progress(
+/// As [`write_streaming_archive_to`], reporting compression progress as it
+/// goes.
+pub fn write_streaming_archive_with_progress(
+    entries: &[ArchiveEntry],
+    options: WriterOptions,
+    extras: ArchiveExtras<'_>,
+    resources: &WriterResources,
+    progress: Option<&dyn WriteProgress>,
+    output: &mut dyn Write,
+) -> Result<()> {
+    write_streaming_archive_reporting(
+        entries,
+        options,
+        extras,
+        resources,
+        progress.map(ProgressReporter),
+        output,
+    )
+}
+
+pub(crate) fn write_streaming_archive_reporting(
     entries: &[ArchiveEntry],
     options: WriterOptions,
     extras: ArchiveExtras<'_>,
@@ -558,7 +600,7 @@ impl<'a> Rar50Writer<'a> {
             extras = extras.with_metadata(metadata);
         }
 
-        write_streaming_archive_with_progress(
+        write_streaming_archive_reporting(
             &self.entries,
             self.options,
             extras,
@@ -949,7 +991,7 @@ mod tests {
 
         let source = EntrySource::from_bytes(Arc::<[u8]>::from(data));
         let required = streaming_lz_workspace(dictionary_size, block_size);
-        let mut prepared = compress::compress_members(
+        let mut prepared = compress::compress_members_reporting(
             &[source],
             compress::CompressPlan {
                 algorithm_version,
@@ -962,6 +1004,7 @@ mod tests {
                 candidates: vec![encode_options],
             },
             &WriterResources::new(required.saturating_mul(4)),
+            &mut |_| true,
         )
         .unwrap();
         let mut parallel = Vec::new();

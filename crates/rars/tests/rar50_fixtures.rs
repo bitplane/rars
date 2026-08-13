@@ -4888,6 +4888,73 @@ fn write_volume_set(
     volumes
 }
 
+/// A volume set used to report nothing at all: the writer built its plan with
+/// `progress: None` and its compression stage was called without the callback
+/// the single-archive path uses.
+#[test]
+fn a_volume_set_reports_compression_progress() {
+    use rars::{WriteOperation, WriteProgressEvent};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    // Blocks are a megabyte, so three of them is what proves the reporting is
+    // incremental rather than one jump at the end.
+    let payload = volume_payload(3 * 1024 * 1024);
+    let entries = [streaming_entry("progress.bin", &payload)];
+
+    let started = AtomicBool::new(false);
+    let finished = AtomicBool::new(false);
+    let last = AtomicU64::new(0);
+    let advances = AtomicU64::new(0);
+    let reporter = |event: WriteProgressEvent<'_>| match event {
+        WriteProgressEvent::OperationStarted {
+            operation: WriteOperation::Compression,
+            total_bytes,
+            ..
+        } => {
+            assert_eq!(total_bytes, Some(payload.len() as u64));
+            started.store(true, Ordering::Relaxed);
+        }
+        WriteProgressEvent::Advanced {
+            operation: WriteOperation::Compression,
+            completed_bytes,
+            total_bytes,
+            ..
+        } => {
+            assert!(completed_bytes >= last.swap(completed_bytes, Ordering::Relaxed));
+            assert!(completed_bytes <= total_bytes);
+            advances.fetch_add(1, Ordering::Relaxed);
+        }
+        WriteProgressEvent::OperationFinished {
+            operation: WriteOperation::Compression,
+            ..
+        } => finished.store(true, Ordering::Relaxed),
+        _ => {}
+    };
+
+    let mut sink = CollectingVolumeSink::default();
+    rar50::write_streaming_volumes_with_progress(
+        &entries,
+        rar50::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
+            .with_compression_level(1),
+        rar50::ArchiveExtras::default(),
+        900_000,
+        &mut sink,
+        &rars::WriterResources::default(),
+        Some(&reporter),
+    )
+    .unwrap();
+
+    assert!(started.load(Ordering::Relaxed), "no operation start");
+    assert!(finished.load(Ordering::Relaxed), "no operation finish");
+    assert!(
+        advances.load(Ordering::Relaxed) >= 3,
+        "expected a report per block, got {}",
+        advances.load(Ordering::Relaxed)
+    );
+    assert_eq!(last.load(Ordering::Relaxed), payload.len() as u64);
+    assert!(sink.volumes.lock().unwrap().len() > 1);
+}
+
 #[test]
 fn streaming_volume_set_round_trips() {
     let payload = volume_payload(120_000);
