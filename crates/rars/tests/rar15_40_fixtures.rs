@@ -2626,8 +2626,8 @@ fn solid_rar29_writer_stores_incompressible_member_and_resets_solid_run() {
 }
 
 #[test]
-fn solid_auto_filtered_rar29_writer_stores_incompressible_member_and_resets_solid_run() {
-    let first_data = b"solid auto filtered phrase alpha beta gamma ".repeat(96);
+fn solid_rar29_explicit_filter_codes_members_into_one_chain() {
+    let first_data = b"solid filtered phrase alpha beta gamma ".repeat(96);
     let mut state = 0x1357_9bdfu32;
     let randomish: Vec<_> = (0..8192)
         .map(|_| {
@@ -2637,10 +2637,10 @@ fn solid_auto_filtered_rar29_writer_stores_incompressible_member_and_resets_soli
             state as u8
         })
         .collect();
-    let second_data = b"solid auto filtered phrase alpha beta gamma ".repeat(64);
+    let second_data = b"solid filtered phrase alpha beta gamma ".repeat(64);
     let entries = [
         FileEntry {
-            name: b"solid-auto-before.txt",
+            name: b"solid-filter-before.txt",
             data: &first_data,
             file_time: 0x5a21_0000,
             file_attr: 0x20,
@@ -2649,7 +2649,7 @@ fn solid_auto_filtered_rar29_writer_stores_incompressible_member_and_resets_soli
             file_comment: None,
         },
         FileEntry {
-            name: b"solid-auto-random.bin",
+            name: b"solid-filter-random.bin",
             data: &randomish,
             file_time: 0x5a21_0000,
             file_attr: 0x20,
@@ -2658,7 +2658,7 @@ fn solid_auto_filtered_rar29_writer_stores_incompressible_member_and_resets_soli
             file_comment: None,
         },
         FileEntry {
-            name: b"solid-auto-after.txt",
+            name: b"solid-filter-after.txt",
             data: &second_data,
             file_time: 0x5a21_0000,
             file_attr: 0x20,
@@ -2673,7 +2673,7 @@ fn solid_auto_filtered_rar29_writer_stores_incompressible_member_and_resets_soli
     let bytes = write_rar29_compressed_archive_with_filter_policy(
         &entries,
         WriterOptions::new(ArchiveVersion::Rar29, features),
-        FilterPolicy::Auto,
+        FilterPolicy::Explicit(FilterSpec::whole(FilterKind::E8)),
     )
     .unwrap();
     let archive = Archive::parse(&bytes).unwrap();
@@ -2681,16 +2681,113 @@ fn solid_auto_filtered_rar29_writer_stores_incompressible_member_and_resets_soli
 
     assert!(archive.main.is_solid());
     assert_eq!(files.len(), 3);
-    assert_eq!(files[1].method, 0x30);
-    assert_eq!(files[1].pack_size, randomish.len() as u64);
+    // The chain runs through all three, including the member that does not
+    // compress: storing one would rebuild the encoder and end the chain.
+    assert!(files.iter().all(|file| file.method != 0x30));
     assert!(!files[0].is_solid());
-    assert!(!files[1].is_solid());
-    assert!(!files[2].is_solid());
+    assert!(files[1].is_solid());
+    assert!(files[2].is_solid());
 
     let extracted = collect_extract(&archive).unwrap();
     assert_eq!(extracted[0].data, first_data);
     assert_eq!(extracted[1].data, randomish);
     assert_eq!(extracted[2].data, second_data);
+}
+
+/// A filtered member used to be coded on its own whatever the archive said,
+/// while its header still claimed to continue the chain.
+#[test]
+fn a_solid_rar29_chain_survives_a_filter_and_stays_solid() {
+    let member = |seed: u32, len: usize| -> Vec<u8> {
+        let mut state = seed;
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            if out.len() % 64 == 0 {
+                out.push(0xe8);
+                out.extend_from_slice(&(state >> 8).to_le_bytes()[..3]);
+            } else {
+                out.push((state >> 16) as u8);
+            }
+        }
+        out.truncate(len);
+        out
+    };
+    let first = member(1, 120_000);
+    // The second member repeats the first, so only a real chain can pack it
+    // into almost nothing.
+    let second = first.clone();
+    let entries = [
+        FileEntry {
+            name: b"chain-one.bin",
+            data: &first,
+            file_time: 0x5a21_0000,
+            file_attr: 0x20,
+            host_os: 3,
+            password: None,
+            file_comment: None,
+        },
+        FileEntry {
+            name: b"chain-two.bin",
+            data: &second,
+            file_time: 0x5a21_0000,
+            file_attr: 0x20,
+            host_os: 3,
+            password: None,
+            file_comment: None,
+        },
+    ];
+    let mut features = FeatureSet::store_only();
+    features.solid = true;
+
+    let bytes = write_rar29_compressed_archive_with_filter_policy(
+        &entries,
+        WriterOptions::new(ArchiveVersion::Rar29, features),
+        FilterPolicy::Explicit(FilterSpec::whole(FilterKind::E8)),
+    )
+    .unwrap();
+    let archive = Archive::parse(&bytes).unwrap();
+    let files: Vec<_> = archive.files().collect();
+
+    assert!(
+        files[1].is_solid(),
+        "the second member must continue the chain"
+    );
+    assert!(
+        files[1].pack_size * 8 < files[0].pack_size,
+        "a repeat of the first member should pack to almost nothing, \
+         got {} against {}",
+        files[1].pack_size,
+        files[0].pack_size
+    );
+
+    let extracted = collect_extract(&archive).unwrap();
+    assert_eq!(extracted[0].data, first);
+    assert_eq!(extracted[1].data, second);
+}
+
+#[test]
+fn a_filter_search_is_refused_inside_a_solid_rar29_archive() {
+    let entries = [FileEntry {
+        name: b"searched.bin",
+        data: b"solid filter search payload",
+        file_time: 0x5a21_0000,
+        file_attr: 0x20,
+        host_os: 3,
+        password: None,
+        file_comment: None,
+    }];
+    let mut features = FeatureSet::store_only();
+    features.solid = true;
+
+    assert!(matches!(
+        write_rar29_compressed_archive_with_filter_policy(
+            &entries,
+            WriterOptions::new(ArchiveVersion::Rar29, features),
+            FilterPolicy::Auto,
+        ),
+        Err(Error::InvalidHeader(_))
+    ));
 }
 
 #[test]

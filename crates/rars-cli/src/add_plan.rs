@@ -156,26 +156,40 @@ pub(crate) fn reject_coding_without_compression(
     )))
 }
 
-/// Refuses a filter on a solid RAR 5 or RAR 7 archive.
+/// Refuses the filter requests a solid archive cannot honour.
 ///
-/// Those members share one dictionary and are coded as one chain, so the
-/// writer's filter search never runs for them. It used to take the request and
-/// drop it. RAR 2.9 codes a filtered member on its own even inside a solid
-/// archive, so this does not apply there.
+/// RAR 5 and RAR 7 code solid members as one chain and skip the filter search
+/// entirely, so neither a named filter nor `--auto-filter` reaches them; both
+/// used to be taken and dropped. RAR 2.9 does apply a named filter inside the
+/// chain, so only the search is refused there: measuring candidates means
+/// encoding each one against the history so far.
 pub(crate) fn reject_filter_with_solid(
     target: ArchiveVersion,
     filters: &AskedFilters,
     auto_filter: bool,
     solid: bool,
 ) -> Result<(), CliError> {
-    if target.family() != rars::ArchiveFamily::Rar50Plus {
+    if !solid {
         return Ok(());
     }
-    if !solid || (filters.count() == 0 && !auto_filter) {
+    let searches_only = target.family() != rars::ArchiveFamily::Rar50Plus;
+    let searching = auto_filter && filters.count() == 0;
+    let refused = if searches_only {
+        searching
+    } else {
+        filters.count() > 0 || auto_filter
+    };
+    if !refused {
         return Ok(());
     }
+    // Pointing at a named filter only helps where one would be accepted.
+    let because = if searches_only {
+        "; name a filter instead"
+    } else {
+        "; solid members share one dictionary"
+    };
     Err(CliError::usage(format!(
-        "{} cannot be used with --solid; solid members share one dictionary",
+        "{} cannot be used with --solid{because}",
         flag_for(WriterOption::Filter, filters),
     )))
 }

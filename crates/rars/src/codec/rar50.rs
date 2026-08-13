@@ -1091,6 +1091,11 @@ impl Unpack50Encoder {
             self.options,
             None,
         )?;
+        // Remembering the caller's input rather than the filtered bytes only
+        // matters once history is carried between members, and the RAR 5
+        // writer refuses a filter in a solid archive, so it never is. The RAR
+        // 2.9 encoder had the same shape and did carry history: every member
+        // after a filtered one referred to bytes no decoder had.
         self.remember(input);
         Ok(packed)
     }

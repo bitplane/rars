@@ -174,7 +174,7 @@ fn write_archive_to(
         has_file_comment,
     )?;
     if let MemberCoding::Filtered(policy) = &coding {
-        validate_rar29_filter_policy(policy, options.method)?;
+        validate_rar29_filter_policy(policy, options.method, options.features.solid)?;
     }
     let header_password = if options.features.header_encryption {
         validate_header_encrypted_archive_options(
@@ -373,12 +373,24 @@ fn ppmd_trial_pays(level: Option<u8>) -> bool {
     !matches!(level, Some(1..=4))
 }
 
-fn validate_rar29_filter_policy(policy: &FilterPolicy, method: Rar29Method) -> Result<()> {
+fn validate_rar29_filter_policy(
+    policy: &FilterPolicy,
+    method: Rar29Method,
+    solid: bool,
+) -> Result<()> {
     // Searching for a filter means measuring candidates against each other,
     // and the search only knows how to measure them through LZ.
     if matches!(policy, FilterPolicy::Auto) && method == Rar29Method::Ppmd {
         return Err(Error::InvalidHeader(
             "RAR 2.9 cannot search for a filter while PPMd is forced",
+        ));
+    }
+    // Every candidate would have to be measured against the history so far,
+    // which means encoding each one against the live chain. Naming the filter
+    // costs nothing extra and is what the search would settle on anyway.
+    if matches!(policy, FilterPolicy::Auto) && solid {
+        return Err(Error::InvalidHeader(
+            "RAR 2.9 cannot search for a filter in a solid archive; name one instead",
         ));
     }
     let filter = match policy {
@@ -775,14 +787,9 @@ fn encode_member<'a>(
         MemberCoding::Compressed => {
             encode_or_store_payload(&data, options, solid_encoder, progress)?
         }
-        MemberCoding::Filtered(policy) => encode_rar29_policy_filtered_payload(
-            &data,
-            policy,
-            options.method,
-            rar29_encode_options_for_options(options)?,
-            compression_method_for_level(options)?,
-            ppmd_trial_pays(options.compression_level),
-        )?,
+        MemberCoding::Filtered(policy) => {
+            encode_filtered_payload(&data, policy, options, solid_encoder)?
+        }
     };
     Ok(EncodedMember {
         payload: MemberPayload::Packed(payload.data),
@@ -1235,6 +1242,39 @@ impl SolidEncoder {
 struct EncodedPayload {
     data: Vec<u8>,
     method: u8,
+}
+
+/// Codes a filtered member, continuing the solid chain when there is one.
+///
+/// A filtered member used to be coded on its own whatever the archive said,
+/// while its header still claimed to continue the chain. That cost the whole
+/// benefit of `--solid`: three 400 KB members went from 550 KB to 1.2 MB, and
+/// the flag on the members was a plain lie about how they had been coded.
+fn encode_filtered_payload(
+    data: &[u8],
+    policy: &FilterPolicy,
+    options: WriterOptions,
+    solid_encoder: &mut Option<SolidEncoder>,
+) -> Result<EncodedPayload> {
+    let lz_method = compression_method_for_level(options)?;
+    if let (Some(SolidEncoder::Rar29(encoder)), FilterPolicy::Explicit(filter), false) = (
+        solid_encoder.as_mut(),
+        policy,
+        lz_method == 0x30 || options.method == Rar29Method::Ppmd,
+    ) {
+        return Ok(EncodedPayload {
+            data: encoder.encode_member_with_filters(data, std::slice::from_ref(filter))?,
+            method: lz_method,
+        });
+    }
+    encode_rar29_policy_filtered_payload(
+        data,
+        policy,
+        options.method,
+        rar29_encode_options_for_options(options)?,
+        lz_method,
+        ppmd_trial_pays(options.compression_level),
+    )
 }
 
 fn encode_or_store_payload(

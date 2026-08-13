@@ -534,7 +534,11 @@ impl Unpack29Encoder {
             &filtered.records,
             self.options,
         )?;
-        self.remember(input);
+        // The LZ layer coded the filtered bytes, so that is what a decoder's
+        // window holds and what the next member in a solid chain can match
+        // against. Remembering the caller's input instead leaves every member
+        // after this one referring to bytes no decoder ever had.
+        self.remember(&filtered.data);
         Ok(packed)
     }
 
@@ -554,7 +558,11 @@ impl Unpack29Encoder {
             &filtered.records,
             self.options,
         )?;
-        self.remember(input);
+        // The LZ layer coded the filtered bytes, so that is what a decoder's
+        // window holds and what the next member in a solid chain can match
+        // against. Remembering the caller's input instead leaves every member
+        // after this one referring to bytes no decoder ever had.
+        self.remember(&filtered.data);
         Ok(packed)
     }
 
