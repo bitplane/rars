@@ -192,6 +192,7 @@ pub(crate) struct Spool {
     path: PathBuf,
     file: File,
     len: u64,
+    pos: u64,
 }
 
 impl Spool {
@@ -209,7 +210,14 @@ impl Spool {
                 .create_new(true)
                 .open(&path)
             {
-                Ok(file) => return Ok(Self { path, file, len: 0 }),
+                Ok(file) => {
+                    return Ok(Self {
+                        path,
+                        file,
+                        len: 0,
+                        pos: 0,
+                    })
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error.into()),
             }
@@ -226,20 +234,28 @@ impl Spool {
     }
 
     pub(crate) fn rewind(&mut self) -> Result<()> {
-        self.file.seek(SeekFrom::Start(0))?;
+        self.seek_to(0)
+    }
+
+    /// Moves the read/write cursor to an absolute offset.
+    pub(crate) fn seek_to(&mut self, pos: u64) -> Result<()> {
+        self.pos = self.file.seek(SeekFrom::Start(pos))?;
         Ok(())
     }
 
     pub(crate) fn copy_to(&mut self, output: &mut dyn Write) -> Result<u64> {
         self.rewind()?;
-        Ok(std::io::copy(&mut self.file, output)?)
+        let copied = std::io::copy(&mut self.file, output)?;
+        self.pos = self.pos.saturating_add(copied);
+        Ok(copied)
     }
 }
 
 impl Write for Spool {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         let written = self.file.write(buffer)?;
-        self.len = self.len.saturating_add(written as u64);
+        self.pos = self.pos.saturating_add(written as u64);
+        self.len = self.len.max(self.pos);
         Ok(written)
     }
 
@@ -250,7 +266,16 @@ impl Write for Spool {
 
 impl Read for Spool {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        self.file.read(buffer)
+        let read = self.file.read(buffer)?;
+        self.pos = self.pos.saturating_add(read as u64);
+        Ok(read)
+    }
+}
+
+impl Seek for Spool {
+    fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+        self.pos = self.file.seek(from)?;
+        Ok(self.pos)
     }
 }
 
@@ -287,6 +312,41 @@ mod tests {
         second.read_to_end(&mut b).unwrap();
         assert_eq!(a, b"hello");
         assert_eq!(b, b"hello");
+    }
+
+    #[test]
+    fn spool_tracks_length_across_seeks_and_overwrites() {
+        let resources = WriterResources::default().with_temp_dir(std::env::temp_dir());
+        let mut spool = Spool::create(&resources).unwrap();
+        spool.write_all(b"0123456789").unwrap();
+        assert_eq!(spool.len(), 10);
+
+        // Rewriting earlier bytes must not extend the spool.
+        spool.seek_to(4).unwrap();
+        spool.write_all(b"ab").unwrap();
+        assert_eq!(spool.len(), 10);
+
+        // Writing past the end does extend it.
+        spool.seek_to(9).unwrap();
+        spool.write_all(b"xyz").unwrap();
+        assert_eq!(spool.len(), 12);
+
+        let mut copied = Vec::new();
+        spool.copy_to(&mut copied).unwrap();
+        assert_eq!(copied, b"0123ab678xyz");
+    }
+
+    #[test]
+    fn spool_reads_from_the_seeked_position() {
+        let resources = WriterResources::default().with_temp_dir(std::env::temp_dir());
+        let mut spool = Spool::create(&resources).unwrap();
+        spool.write_all(b"abcdefgh").unwrap();
+        spool.seek(SeekFrom::Start(3)).unwrap();
+
+        let mut buffer = [0u8; 4];
+        spool.read_exact(&mut buffer).unwrap();
+        assert_eq!(&buffer, b"defg");
+        assert_eq!(spool.stream_position().unwrap(), 7);
     }
 
     #[test]

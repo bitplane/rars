@@ -855,6 +855,16 @@ impl RarBuilder {
                 "archive builder has no entries",
             ));
         }
+        if self.entries.iter().any(|entry| entry.source.is_some()) {
+            let mut materialized = self.clone();
+            for entry in &mut materialized.entries {
+                if let Some(source) = entry.source.take() {
+                    let mut reader = source.open()?;
+                    reader.read_to_end(&mut entry.data)?;
+                }
+            }
+            return materialized.build_volumes(progress);
+        }
         match self.format.family() {
             rars_rs::ArchiveFamily::Rar50Plus => self.build_rar50_volumes(volume_size, progress),
             rars_rs::ArchiveFamily::Rar15To40 => self.build_rar15_volumes(volume_size, progress),

@@ -89,6 +89,21 @@ def test_builder_writes_and_extracts_volumes(tmp_path):
     assert (out_dir / "large.txt").read_bytes() == b"0123456789" * 20
 
 
+def test_builder_writes_volumes_from_added_paths(tmp_path):
+    source = tmp_path / "large.txt"
+    source.write_bytes(b"0123456789" * 20)
+
+    builder = rars.RarBuilder(format="rar50", store=True, volume_size=64)
+    builder.add(source)
+    paths = builder.write_volumes(tmp_path / "archive.part01.rar")
+
+    assert len(paths) > 1
+    rars.test_volumes(paths)
+    out_dir = tmp_path / "out"
+    rars.extract_volumes(paths, out_dir)
+    assert (out_dir / "large.txt").read_bytes() == b"0123456789" * 20
+
+
 def test_password_errors_are_typed():
     with pytest.raises(rars.PasswordRequired):
         rars.RarFile(RAR50_PASSWORD).testrar()

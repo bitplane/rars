@@ -43,4 +43,6 @@ todo = "warn"
 unimplemented = "warn"
 
 [profile.release]
-strip = "symbols"
+# Keep symbols and line tables so crash reports from users are readable.
+debug = "line-tables-only"
+strip = "none"

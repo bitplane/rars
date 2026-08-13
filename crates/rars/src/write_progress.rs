@@ -6,6 +6,8 @@ pub enum WriteOperation {
     Compression,
     /// Building a RAR 5 recovery record.
     Recovery,
+    /// Writing finished archive bytes to the output.
+    Emission,
 }
 
 /// Progress reported by archive writers.
@@ -43,6 +45,12 @@ pub enum WriteProgressEvent<'a> {
         completed_bytes: u64,
         total_bytes: u64,
         pass: usize,
+    },
+    /// One volume of a multi-volume set has been written out.
+    VolumeFinished {
+        volume_number: usize,
+        total_volumes: Option<usize>,
+        bytes: u64,
     },
     /// An operation has finished.
     OperationFinished {

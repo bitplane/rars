@@ -1781,6 +1781,7 @@ mod tests {
                 assert!(completed_bytes <= total_bytes);
                 advances.fetch_add(1, Ordering::Relaxed);
             }
+            _ => {}
         };
 
         write_compressed_archive_with_comment_and_progress(
