@@ -6163,3 +6163,69 @@ fn rar29_rgb_filter_handles_a_length_that_leaves_a_short_trailing_chunk() {
     let archive = Archive::parse(&bytes).unwrap();
     assert_eq!(collect_extract(&archive).unwrap()[0].data, payload);
 }
+
+/// A filter record's start is read relative to the head of the block that
+/// declares it, and the decoder masks that offset against its window. Declaring
+/// every record at the head of the member wrote offsets the window could not
+/// express, so a filter aimed past the first window landed somewhere else and
+/// the member came out corrupt. Our own decoder made the same mistake, so it
+/// agreed with the writer and only an external tool disagreed.
+#[test]
+fn rar29_applies_a_filter_that_starts_beyond_the_dictionary() {
+    // Calls to one address, written as the relative displacements a compiler
+    // would emit. The filter turns them back into the same absolute address, so
+    // it pays off only if it reaches them. The default RAR 2.9 dictionary is
+    // 1 MiB, and the calls start past it.
+    let mut payload: Vec<u8> = (0..3_000_000u32).map(|index| (index % 251) as u8).collect();
+    const TARGET: u32 = 0x0020_1000;
+    for pos in (1_500_000..2_800_000).step_by(16) {
+        payload[pos] = 0xe8;
+        let displacement = TARGET.wrapping_sub(pos as u32);
+        payload[pos + 1..pos + 5].copy_from_slice(&displacement.to_le_bytes());
+    }
+    let entries = [FileEntry {
+        name: b"late-filter.bin",
+        data: &payload,
+        file_time: 0x5a21_0000,
+        file_attr: 0x20,
+        host_os: 3,
+        password: None,
+        file_comment: None,
+    }];
+
+    for policy in [
+        FilterPolicy::Auto,
+        FilterPolicy::Explicit(FilterSpec::range(FilterKind::E8E9, 1_500_000..2_800_000)),
+    ] {
+        let bytes = write_rar29_compressed_archive_with_filter_policy(
+            &entries,
+            WriterOptions::new(ArchiveVersion::Rar29, FeatureSet::store_only())
+                .with_method(Rar29Method::Lz),
+            policy.clone(),
+        )
+        .unwrap();
+
+        let archive = Archive::parse(&bytes).unwrap();
+        assert_eq!(collect_extract(&archive).unwrap()[0].data, payload);
+
+        // A round trip alone would not have caught this, because the decoder
+        // read the offsets back the same way the writer wrote them. The size
+        // is what shows the filter reached the bytes it was aimed at, so the
+        // named one has to pay off. The automatic policy is free to decline.
+        if matches!(policy, FilterPolicy::Explicit(_)) {
+            let unfiltered = write_rar29_compressed_archive_with_filter_policy(
+                &entries,
+                WriterOptions::new(ArchiveVersion::Rar29, FeatureSet::store_only())
+                    .with_method(Rar29Method::Lz),
+                FilterPolicy::None,
+            )
+            .unwrap();
+            assert!(
+                bytes.len() < unfiltered.len(),
+                "the filter did not reach its bytes: {} against {} unfiltered",
+                bytes.len(),
+                unfiltered.len()
+            );
+        }
+    }
+}

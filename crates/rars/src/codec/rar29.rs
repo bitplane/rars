@@ -167,7 +167,10 @@ fn encode_ppmd_filtered_member(
 ) -> Result<Vec<u8>> {
     let filters = split_large_filter(input.len(), filter)?;
     let filtered = filtered_members(input, &filters)?;
-    let records = encoded_filter_records(&filtered.records)?;
+    // PPMd codes the member as one unit rather than in LZ blocks, so every
+    // record is declared at the start and the window does not constrain them.
+    let refs: Vec<&OwnedVmFilterRecord> = filtered.records.iter().collect();
+    let records = encoded_filter_records_at(&refs, 0, usize::MAX, &mut Vec::new())?;
     encode_ppmd_member(&filtered.data, lz_escapes, &records)
 }
 
@@ -525,11 +528,10 @@ impl Unpack29Encoder {
     ) -> Result<Vec<u8>> {
         let filters = split_large_filter(input.len(), filter)?;
         let filtered = filtered_members(input, &filters)?;
-        let records = encoded_filter_records(&filtered.records)?;
-        let packed = encode_member_with_initial_filters(
+        let packed = encode_filtered_member_blocks(
             &filtered.data,
             &self.history,
-            &records,
+            &filtered.records,
             self.options,
         )?;
         self.remember(input);
@@ -546,11 +548,10 @@ impl Unpack29Encoder {
             split_filters.extend(split_large_filter(input.len(), filter.clone())?);
         }
         let filtered = filtered_members(input, &split_filters)?;
-        let records = encoded_filter_records(&filtered.records)?;
-        let packed = encode_member_with_initial_filters(
+        let packed = encode_filtered_member_blocks(
             &filtered.data,
             &self.history,
-            &records,
+            &filtered.records,
             self.options,
         )?;
         self.remember(input);
@@ -633,15 +634,6 @@ fn encode_member_blocks(
         }
     }
     Ok(out)
-}
-
-fn encode_member_with_initial_filters(
-    input: &[u8],
-    history: &[u8],
-    filters: &[Vec<u8>],
-    options: EncodeOptions,
-) -> Result<Vec<u8>> {
-    encode_member_inner(input, history, filters, options, None)
 }
 
 fn encode_member_inner(
@@ -823,8 +815,22 @@ fn encode_member_inner(
     Ok(bits.finish())
 }
 
-fn encoded_filter_records(filters: &[OwnedVmFilterRecord]) -> Result<Vec<Vec<u8>>> {
-    let mut programs: Vec<&'static [u8]> = Vec::new();
+/// Encodes the filter records for one LZ block.
+///
+/// `base` is where the block starts in the member, because a record's block
+/// start is read relative to the decoder's current output position, and that
+/// position is the head of the block the record is declared in. Writing the
+/// member-absolute offset instead makes the decoder mask it against the window
+/// and apply the filter in the wrong place.
+///
+/// `programs` carries across blocks so a program declared once is referenced by
+/// index afterwards, which is what the decoder expects.
+fn encoded_filter_records_at(
+    filters: &[&OwnedVmFilterRecord],
+    base: usize,
+    window: usize,
+    programs: &mut Vec<&'static [u8]>,
+) -> Result<Vec<Vec<u8>>> {
     let mut records = Vec::with_capacity(filters.len());
     for filter in filters {
         let existing = (filter.code != RAR3_AUDIO_FILTER_BYTECODE)
@@ -847,9 +853,25 @@ fn encoded_filter_records(filters: &[OwnedVmFilterRecord]) -> Result<Vec<Vec<u8>
                 (selector, true)
             }
         };
+        let block_start = filter
+            .block_start
+            .checked_sub(base)
+            .ok_or(Error::InvalidData(
+                "RAR 2.9 VM filter starts before its block",
+            ))?;
+        // The decoder masks this against its window, so a record reaching past
+        // one lands somewhere else entirely and the member decodes to the wrong
+        // bytes. Our own decoder reads it back the way it was written and so
+        // agrees, which is why this is checked here rather than left to a round
+        // trip to notice.
+        if block_start >= window {
+            return Err(Error::InvalidData(
+                "RAR 2.9 VM filter starts further past its block than the window can express",
+            ));
+        }
         records.push(encode_vm_filter_record_inner(
             VmFilterRecord {
-                block_start: filter.block_start,
+                block_start,
                 block_size: filter.block_size,
                 init_regs: &filter.init_regs,
                 code: filter.code,
@@ -859,6 +881,58 @@ fn encoded_filter_records(filters: &[OwnedVmFilterRecord]) -> Result<Vec<Vec<u8>
         )?);
     }
     Ok(records)
+}
+
+/// Codes filtered bytes a block at a time, so that no filter is declared
+/// further ahead of its block than the decoder's window can express, and so a
+/// large member does not need a whole LZ pass in memory at once.
+fn encode_filtered_member_blocks(
+    data: &[u8],
+    history: &[u8],
+    filters: &[OwnedVmFilterRecord],
+    options: EncodeOptions,
+) -> Result<Vec<u8>> {
+    // A record's offset is relative to the head of its own block, so a block no
+    // larger than the window keeps every offset inside it.
+    let block_size = options
+        .block_size
+        .filter(|&size| size != 0)
+        .unwrap_or(data.len().max(1))
+        .min(options.max_match_distance.max(1))
+        .max(1);
+    let window = options.max_match_distance.max(1);
+    let mut inner = options;
+    inner.block_size = None;
+    let mut programs: Vec<&'static [u8]> = Vec::new();
+    let mut out = Vec::new();
+    let mut local_history = history[history.len().saturating_sub(MAX_HISTORY)..].to_vec();
+    let mut base = 0usize;
+    while base < data.len().max(1) {
+        let end = (base + block_size).min(data.len());
+        let chunk = &data[base..end];
+        let in_block: Vec<&OwnedVmFilterRecord> = filters
+            .iter()
+            .filter(|record| record.block_start >= base && record.block_start < end.max(base + 1))
+            .collect();
+        let records = encoded_filter_records_at(&in_block, base, window, &mut programs)?;
+        out.extend_from_slice(&encode_member_inner(
+            chunk,
+            &local_history,
+            &records,
+            inner,
+            None,
+        )?);
+        local_history.extend_from_slice(chunk);
+        let keep_from = local_history.len().saturating_sub(MAX_HISTORY);
+        if keep_from != 0 {
+            local_history.drain(..keep_from);
+        }
+        base = end;
+        if chunk.is_empty() {
+            break;
+        }
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3120,7 +3194,7 @@ mod tests {
 
     use super::{
         apply_standard_filter, audio_encode, best_match, encode_ppmd_tokens,
-        encode_table_level_tokens, encode_tokens, encoded_filter_records, itanium_decode,
+        encode_table_level_tokens, encode_tokens, encoded_filter_records_at, itanium_decode,
         itanium_encode, should_lazy_emit_literal, split_large_filter, unpack29_decode,
         unpack29_encode_literals, unpack29_encode_ppmd, unpack29_encode_ppmd_literals,
         unpack29_encode_ppmd_with_filter, BitReader, BitWriter, EncodeOptions, EncodeToken,
@@ -3830,7 +3904,8 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
                 code: RAR3_AUDIO_FILTER_BYTECODE,
             },
         ];
-        let records = encoded_filter_records(&filters).unwrap();
+        let refs: Vec<&OwnedVmFilterRecord> = filters.iter().collect();
+        let records = encoded_filter_records_at(&refs, 0, usize::MAX, &mut Vec::new()).unwrap();
 
         assert_vm_filter_declares_program(&records[0], 0);
         assert_vm_filter_declares_program(&records[1], 2);
