@@ -4,12 +4,12 @@ use crate::codec::rar50::{EncodeOptions, Unpack50Encoder};
 use crate::crc32::Crc32;
 use crate::crypto::rar50::{Rar50Cipher, Rar50Keys};
 use crate::recovery::rar5::build_structural_inline_recovery_data_with_progress;
-use crate::streaming::Spool;
 use crate::write_progress::{ProgressReporter, WorkTracker};
 use crate::{EntrySource, WriteOperation, WriteProgress, WriteProgressEvent, WriterResources};
 use std::io::{Read, Write};
 
 mod compress;
+mod engine;
 mod filter_policy;
 mod headers;
 // Consumed by the streaming engine; until that lands only its own tests
@@ -125,6 +125,117 @@ pub struct StreamingEncryptedCompressedEntry {
     pub password: Vec<u8>,
 }
 
+/// An archive member, read from a reopenable source when it is needed.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ArchiveEntry {
+    pub name: Vec<u8>,
+    pub source: EntrySource,
+    pub mtime: Option<u32>,
+    pub attributes: u64,
+    pub host_os: u64,
+    /// Encrypts this member's payload. With header encryption every member
+    /// must use the same password.
+    pub password: Option<Vec<u8>>,
+}
+
+impl ArchiveEntry {
+    pub fn new(name: impl Into<Vec<u8>>, source: EntrySource) -> Self {
+        Self {
+            name: name.into(),
+            source,
+            mtime: None,
+            attributes: 0,
+            host_os: 0,
+            password: None,
+        }
+    }
+
+    pub fn with_mtime(mut self, mtime: Option<u32>) -> Self {
+        self.mtime = mtime;
+        self
+    }
+
+    pub fn with_attributes(mut self, attributes: u64) -> Self {
+        self.attributes = attributes;
+        self
+    }
+
+    pub fn with_host_os(mut self, host_os: u64) -> Self {
+        self.host_os = host_os;
+        self
+    }
+
+    pub fn with_password(mut self, password: impl Into<Vec<u8>>) -> Self {
+        self.password = Some(password.into());
+        self
+    }
+}
+
+/// Writes a RAR 5 or RAR 7 archive straight to `output`, keeping memory within
+/// `resources` however large the members are.
+///
+/// Supports solid compression, per-member and header encryption, and recovery
+/// records, in any combination.
+pub fn write_streaming_archive_to(
+    entries: &[ArchiveEntry],
+    options: WriterOptions,
+    recovery_percent: Option<u64>,
+    resources: &WriterResources,
+    output: &mut dyn Write,
+) -> Result<()> {
+    write_streaming_archive_with_progress(
+        entries,
+        options,
+        recovery_percent,
+        resources,
+        None,
+        output,
+    )
+}
+
+pub(crate) fn write_streaming_archive_with_progress(
+    entries: &[ArchiveEntry],
+    options: WriterOptions,
+    recovery_percent: Option<u64>,
+    resources: &WriterResources,
+    progress: Option<ProgressReporter<'_>>,
+    output: &mut dyn Write,
+) -> Result<()> {
+    let encrypted = entries.iter().any(|entry| entry.password.is_some());
+    if encrypted && !entries.iter().all(|entry| entry.password.is_some()) {
+        return Err(Error::UnsupportedFeature {
+            version: options.target,
+            feature: "RAR 5 writer mixing encrypted and plain members",
+        });
+    }
+    match (encrypted, recovery_percent.is_some()) {
+        (true, true) => validate_encrypted_compressed_recovery_options(options)?,
+        (true, false) => validate_encrypted_compressed_options(options)?,
+        (false, true) => validate_compressed_recovery_options(options)?,
+        (false, false) => validate_compressed_options(options)?,
+    }
+    if let Some(percent) = recovery_percent {
+        validate_recovery_percent(percent)?;
+    }
+    if options.features.header_encryption && !encrypted {
+        return Err(Error::NeedPassword);
+    }
+
+    engine::write_archive(
+        entries,
+        engine::EnginePlan {
+            compress: streaming_compress_plan(options)?,
+            method: compression_method_for_level(options.compression_level)?,
+            recovery_percent,
+            header_encrypted: options.features.header_encryption,
+            progress,
+        },
+        resources,
+        output,
+    )
+}
+
 /// Writes a RAR 5 or RAR 7 archive without retaining member payloads.
 pub fn write_streaming_compressed_archive_to(
     entries: &[StreamingCompressedEntry],
@@ -132,72 +243,16 @@ pub fn write_streaming_compressed_archive_to(
     resources: &WriterResources,
     output: &mut dyn Write,
 ) -> Result<()> {
-    validate_compressed_options(options)?;
-    let plan = streaming_compress_plan(options)?;
-    let method = compression_method_for_level(options.compression_level)?;
-    let sources: Vec<_> = entries
+    let entries: Vec<_> = entries
         .iter()
         .map(|entry| {
-            validate_file_entry(&entry.name)?;
-            Ok(entry.source.clone())
+            ArchiveEntry::new(entry.name.clone(), entry.source.clone())
+                .with_mtime(entry.mtime)
+                .with_attributes(entry.attributes)
+                .with_host_os(entry.host_os)
         })
-        .collect::<Result<_>>()?;
-    let prepared = compress::compress_members(&sources, plan, resources)?;
-
-    output.write_all(RAR50_SIGNATURE)?;
-    let mut main = Vec::new();
-    write_main_header(&mut main, archive_flags_for_plan(&plan), None, &[])?;
-    output.write_all(&main)?;
-
-    for (entry, mut prepared) in entries.iter().zip(prepared) {
-        let packed_size = if prepared.store {
-            prepared.input_size
-        } else {
-            prepared.packed.len()
-        };
-        let compression_info = compress::member_compression_info(&plan, &prepared, method)?;
-        let specific = file_specific(
-            &entry.name,
-            prepared.input_size,
-            Some(prepared.crc32),
-            entry.attributes,
-            entry.mtime,
-            compression_info,
-            entry.host_os,
-        )?;
-        let mut extra = Vec::new();
-        write_hash_record_with_value(&mut extra, prepared.hash);
-        let header = block_header_image(
-            HEAD_FILE,
-            HFL_EXTRA | HFL_DATA,
-            Some(packed_size),
-            &specific,
-            &extra,
-        )?;
-        output.write_all(&header)?;
-        if prepared.store {
-            let mut reader = entry.source.open()?;
-            let copied = std::io::copy(&mut reader.by_ref().take(prepared.input_size), output)?;
-            if copied != prepared.input_size {
-                return Err(Error::InvalidHeader(
-                    "entry source size changed while writing",
-                ));
-            }
-            let mut trailing = [0u8; 1];
-            if reader.read(&mut trailing)? != 0 {
-                return Err(Error::InvalidHeader(
-                    "entry source size changed while writing",
-                ));
-            }
-        } else {
-            prepared.packed.copy_to(output)?;
-        }
-    }
-
-    let mut end = Vec::new();
-    write_end_header(&mut end, 0)?;
-    output.write_all(&end)?;
-    Ok(())
+        .collect();
+    write_streaming_archive_to(&entries, options, None, resources, output)
 }
 
 /// Compression settings shared by the streaming writers.
@@ -212,136 +267,24 @@ fn streaming_compress_plan(options: WriterOptions) -> Result<compress::CompressP
     })
 }
 
-fn archive_flags_for_plan(plan: &compress::CompressPlan) -> u64 {
-    if plan.solid {
-        MHFL_SOLID
-    } else {
-        0
-    }
-}
-
-/// Writes an encrypted, non-solid RAR 5 or RAR 7 archive with bounded memory.
+/// Writes an encrypted RAR 5 or RAR 7 archive with bounded memory.
 pub fn write_streaming_encrypted_compressed_archive_to(
     entries: &[StreamingEncryptedCompressedEntry],
     options: WriterOptions,
     resources: &WriterResources,
     output: &mut dyn Write,
 ) -> Result<()> {
-    validate_encrypted_compressed_options(options)?;
-    if options.features.header_encryption {
-        return Err(Error::UnsupportedFeature {
-            version: options.target,
-            feature: "streaming header encryption",
-        });
-    }
-    let plan = streaming_compress_plan(options)?;
-    let dictionary_size = plan.dictionary_size;
-    let method = compression_method_for_level(options.compression_level)?;
-    let block_size = plan.block_size;
-    let sources: Vec<_> = entries
+    let entries: Vec<_> = entries
         .iter()
         .map(|entry| {
-            validate_file_entry(&entry.name)?;
-            Ok(entry.source.clone())
+            ArchiveEntry::new(entry.name.clone(), entry.source.clone())
+                .with_mtime(entry.mtime)
+                .with_attributes(entry.attributes)
+                .with_host_os(entry.host_os)
+                .with_password(entry.password.clone())
         })
-        .collect::<Result<_>>()?;
-    let compressed = compress::compress_members(&sources, plan, resources)?;
-    let mut prepared = Vec::with_capacity(entries.len());
-    for (entry, mut compressed) in entries.iter().zip(compressed) {
-        let _permit = resources.acquire(block_size as u64, dictionary_size)?;
-        let mut salt = [0u8; 16];
-        let mut iv = [0u8; 16];
-        getrandom::fill(&mut salt)
-            .map_err(|_| Error::InvalidHeader("RAR 5 writer could not generate encryption salt"))?;
-        getrandom::fill(&mut iv)
-            .map_err(|_| Error::InvalidHeader("RAR 5 writer could not generate encryption IV"))?;
-        let keys =
-            Rar50Keys::derive(&entry.password, salt, 0).map_err(super::map_rar50_crypto_error)?;
-        let mut encrypted = Spool::create(resources)?;
-        if compressed.store {
-            let mut reader = entry.source.open()?;
-            encrypt_reader_to(
-                &mut *reader,
-                compressed.input_size,
-                &mut encrypted,
-                &keys,
-                iv,
-                block_size,
-            )?;
-        } else {
-            compressed.packed.rewind()?;
-            let packed_size = compressed.packed.len();
-            encrypt_reader_to(
-                &mut compressed.packed,
-                packed_size,
-                &mut encrypted,
-                &keys,
-                iv,
-                block_size,
-            )?;
-        }
-        prepared.push(PreparedEncryptedStreamingEntry {
-            input_size: compressed.input_size,
-            crc32_mac: keys.mac_crc32(compressed.crc32),
-            hash_mac: keys.mac_hash32(compressed.hash),
-            encrypted,
-            store: compressed.store,
-            solid_continuation: compressed.solid_continuation,
-            salt,
-            iv,
-            check_value: keys.password_check_record(),
-        });
-    }
-
-    output.write_all(RAR50_SIGNATURE)?;
-    let mut main = Vec::new();
-    write_main_header(&mut main, archive_flags_for_plan(&plan), None, &[])?;
-    output.write_all(&main)?;
-    for (entry, mut prepared) in entries.iter().zip(prepared) {
-        let compression_info = compression_info(
-            plan.algorithm_version,
-            if prepared.store { 0 } else { method },
-            dictionary_size,
-            prepared.solid_continuation,
-        )?;
-        let specific = file_specific(
-            &entry.name,
-            prepared.input_size,
-            Some(prepared.crc32_mac),
-            entry.attributes,
-            entry.mtime,
-            compression_info,
-            entry.host_os,
-        )?;
-        let mut extra = Vec::new();
-        write_file_encryption_record(&mut extra, prepared.salt, prepared.iv, prepared.check_value);
-        write_hash_record_with_value(&mut extra, prepared.hash_mac);
-        let header = block_header_image(
-            HEAD_FILE,
-            HFL_EXTRA | HFL_DATA,
-            Some(prepared.encrypted.len()),
-            &specific,
-            &extra,
-        )?;
-        output.write_all(&header)?;
-        prepared.encrypted.copy_to(output)?;
-    }
-    let mut end = Vec::new();
-    write_end_header(&mut end, 0)?;
-    output.write_all(&end)?;
-    Ok(())
-}
-
-struct PreparedEncryptedStreamingEntry {
-    input_size: u64,
-    crc32_mac: u32,
-    hash_mac: [u8; 32],
-    encrypted: Spool,
-    store: bool,
-    solid_continuation: bool,
-    salt: [u8; 16],
-    iv: [u8; 16],
-    check_value: [u8; 12],
+        .collect();
+    write_streaming_archive_to(&entries, options, None, resources, output)
 }
 
 fn source_integrity(
@@ -386,7 +329,7 @@ fn streaming_lz_workspace(dictionary_size: u64, block_size: usize) -> u64 {
 fn encrypt_reader_to(
     reader: &mut dyn Read,
     input_size: u64,
-    output: &mut Spool,
+    output: &mut dyn Write,
     keys: &Rar50Keys,
     iv: [u8; 16],
     block_size: usize,

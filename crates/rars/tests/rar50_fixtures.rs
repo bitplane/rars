@@ -4887,3 +4887,195 @@ fn reference_rar_accepts_streaming_solid_archive() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// The exact flag combination from issue #29, which used to abort trying to
+/// allocate more than ten gigabytes.
+#[test]
+fn streaming_writer_handles_solid_encrypted_headers_and_recovery_together() {
+    let entries: Vec<_> = (0..3u8)
+        .map(|index| {
+            let data: Vec<u8> = (0..900_000u32)
+                .map(|offset| (offset.wrapping_mul(2_654_435_761) >> 25) as u8)
+                .chain(std::iter::once(index))
+                .collect();
+            rar50::ArchiveEntry::new(
+                format!("member-{index}.bin"),
+                rars::EntrySource::from_bytes(std::sync::Arc::<[u8]>::from(data)),
+            )
+            .with_attributes(0x20)
+            .with_password(b"issue-29".to_vec())
+        })
+        .collect();
+
+    let mut features = FeatureSet::store_only();
+    features.solid = true;
+    features.file_encryption = true;
+    features.header_encryption = true;
+    features.recovery_record = true;
+    let options =
+        rar50::WriterOptions::new(ArchiveVersion::Rar70, features).with_compression_level(5);
+
+    // A budget far below the archive size: if anything buffered a member or
+    // the archive, this could not succeed.
+    let resources = rars::WriterResources::new(192 * 1024 * 1024);
+    let mut archive_bytes = Vec::new();
+    rar50::write_streaming_archive_to(&entries, options, Some(10), &resources, &mut archive_bytes)
+        .unwrap();
+
+    let archive = Archive::parse_with_options(
+        &archive_bytes,
+        ArchiveReadOptions::with_password(b"issue-29"),
+    )
+    .unwrap();
+    assert!(archive.main.is_solid());
+    assert!(archive.main.has_recovery_record());
+
+    let extracted = collect_extract_with_password(&archive, Some(b"issue-29")).unwrap();
+    assert_eq!(extracted.len(), 3);
+    for (index, entry) in extracted.iter().enumerate() {
+        let mut expected = Vec::new();
+        entries[index]
+            .source
+            .open()
+            .unwrap()
+            .read_to_end(&mut expected)
+            .unwrap();
+        assert_eq!(entry.data, expected, "member {index} did not survive");
+    }
+
+    if let Some(output) =
+        reference_test_archive_with_password("issue-29", &archive_bytes, "issue-29")
+    {
+        assert!(
+            output.status.success(),
+            "the reference tool rejected the archive\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // The recovery record has to be usable, not merely present.
+    let data_range = archive.files().next().unwrap().block.data_range.clone();
+    let mut damaged = archive_bytes.clone();
+    damaged[data_range.start + 32..data_range.start + 512].fill(0xa5);
+
+    let damaged_archive =
+        Archive::parse_with_options(&damaged, ArchiveReadOptions::with_password(b"issue-29"))
+            .unwrap();
+    let mut repaired = Vec::new();
+    damaged_archive.repair_recovery_to(&mut repaired).unwrap();
+    assert_eq!(
+        repaired, archive_bytes,
+        "the recovery record should restore the archive exactly"
+    );
+}
+
+fn reference_test_archive_with_password(
+    label: &str,
+    archive: &[u8],
+    password: &str,
+) -> Option<std::process::Output> {
+    let mut path = std::env::temp_dir();
+    path.push(format!("rars-{label}-{}.rar", std::process::id()));
+    fs::write(&path, archive).unwrap();
+
+    let mut result = None;
+    for tool in ["unrar", "rar"] {
+        match Command::new(tool)
+            .arg("t")
+            .arg(format!("-p{password}"))
+            .arg(&path)
+            .output()
+        {
+            Ok(output) => {
+                result = Some(output);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => panic!("failed to run {tool}: {error}"),
+        }
+    }
+    let _ = fs::remove_file(&path);
+    result
+}
+
+/// Generates deterministic incompressible bytes without holding them, so the
+/// source itself does not dominate the memory being measured.
+struct GeneratedSource {
+    remaining: u64,
+    state: u64,
+}
+
+impl std::io::Read for GeneratedSource {
+    fn read(&mut self, buffer: &mut [u8]) -> IoResult<usize> {
+        let want = buffer.len().min(self.remaining as usize);
+        for slot in buffer.iter_mut().take(want) {
+            self.state = self
+                .state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *slot = (self.state >> 33) as u8;
+        }
+        self.remaining -= want as u64;
+        Ok(want)
+    }
+}
+
+impl std::io::Seek for GeneratedSource {
+    fn seek(&mut self, _: std::io::SeekFrom) -> IoResult<u64> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "generated sources are read once per pass",
+        ))
+    }
+}
+
+/// Writes an archive far larger than the memory budget it is given, with a
+/// recovery record whose parity also exceeds that budget. Run with
+/// `/usr/bin/time -v` to see the peak resident size.
+#[test]
+#[ignore = "writes a 300 MiB archive; run manually to measure peak memory"]
+fn streaming_writer_stays_within_its_memory_budget_on_a_large_archive() {
+    const MEMBER_BYTES: u64 = 300 * 1024 * 1024;
+    const BUDGET: u64 = 128 * 1024 * 1024;
+
+    let entry = rar50::ArchiveEntry::new(
+        "large.bin",
+        rars::EntrySource::from_opener(MEMBER_BYTES, || {
+            Ok(Box::new(GeneratedSource {
+                remaining: MEMBER_BYTES,
+                state: 0x2545_f491_4f6c_dd1d,
+            }))
+        }),
+    )
+    .with_password(b"issue-29".to_vec());
+
+    let mut features = FeatureSet::store_only();
+    features.solid = true;
+    features.file_encryption = true;
+    features.header_encryption = true;
+    features.recovery_record = true;
+    let options =
+        rar50::WriterOptions::new(ArchiveVersion::Rar70, features).with_compression_level(1);
+
+    let temp = std::env::temp_dir().join(format!("rars-large-{}.rar", std::process::id()));
+    let mut output = fs::File::create(&temp).unwrap();
+    // 50% recovery over a ~300 MiB archive needs more parity than the budget
+    // allows to hold at once, which forces the striped recovery pass.
+    rar50::write_streaming_archive_to(
+        std::slice::from_ref(&entry),
+        options,
+        Some(50),
+        &rars::WriterResources::new(BUDGET).with_temp_dir(std::env::temp_dir()),
+        &mut output,
+    )
+    .unwrap();
+    drop(output);
+
+    let written = fs::metadata(&temp).unwrap().len();
+    let _ = fs::remove_file(&temp);
+    assert!(
+        written > MEMBER_BYTES,
+        "a 50% recovery record should make the archive larger than its input"
+    );
+}
