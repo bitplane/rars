@@ -11,6 +11,10 @@ use std::io::{Read, Write};
 
 mod filter_policy;
 mod headers;
+// Consumed by the streaming engine; until that lands only its own tests
+// exercise it.
+#[cfg_attr(not(test), allow(dead_code))]
+mod layout;
 mod volume;
 #[cfg(test)]
 use filter_policy::encode_member_with_filter_policy;
