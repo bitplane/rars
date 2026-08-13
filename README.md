@@ -50,9 +50,12 @@ bounds the working set: raise it to compress more blocks at once, which on a
 machine with many cores is what limits throughput. The number of `--threads`
 defaults to your core count.
 
-Two things still need a whole member in memory, and fall back to streaming
-without it when the budget is too small to allow it: choosing a data filter,
-and comparing candidate settings at `--level 5`. Per-file comments, PPMd and
+RAR 5 and RAR 7 look for a data filter by default, which is worth around 6% on
+executables and costs compression time rather than memory; `--no-filter` turns
+it off, and solid archives do not use one because they share a dictionary
+across members. Choosing a filter, and comparing candidate settings at
+`--level 5`, both need a whole member in memory, and fall back to streaming
+without them when the budget is too small to allow it. Per-file comments, PPMd and
 the RAR 1.3-4.x formats still assemble archives in memory; the CLI warns
 before doing that with a large input.
 

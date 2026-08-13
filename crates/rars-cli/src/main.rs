@@ -967,6 +967,7 @@ struct AddCommand {
     audio_filter: Option<usize>,
     arm_filter: bool,
     auto_filter: bool,
+    no_filter: bool,
     ppmd: bool,
     archive_path: PathBuf,
     input_paths: Vec<String>,
@@ -1025,6 +1026,7 @@ fn build_add_command(args: AddArgs) -> CliResult<AddCommand> {
         audio_filter: args.audio_filter,
         arm_filter: args.arm_filter,
         auto_filter: args.auto_filter,
+        no_filter: args.no_filter,
         ppmd: args.ppmd,
         archive_path: PathBuf::from(args.archive),
         input_paths: args.files,
@@ -1055,6 +1057,7 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
         audio_filter,
         arm_filter,
         auto_filter,
+        no_filter,
         ppmd,
         archive_path,
         input_paths,
@@ -1129,7 +1132,7 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
             solid,
             header_encryption,
             recovery_percent,
-            auto_filter,
+            rar50_filter_policy(auto_filter, no_filter, solid, store),
             quick_open,
             archive_comment.as_deref(),
             archive_name.as_deref(),
@@ -1872,7 +1875,7 @@ fn write_plain_rar50_streaming(
     solid: bool,
     header_encryption: bool,
     recovery_percent: Option<u64>,
-    auto_filter: bool,
+    filter_policy: rars::rar50::FilterPolicy,
     quick_open: bool,
     archive_comment: Option<&[u8]>,
     archive_name: Option<&[u8]>,
@@ -1937,7 +1940,7 @@ fn write_plain_rar50_streaming(
     });
     let extras = streaming_extras(
         recovery_percent,
-        auto_filter,
+        filter_policy,
         quick_open,
         archive_comment,
         metadata,
@@ -2082,19 +2085,33 @@ impl rars::rar50::VolumeSink for CliVolumeSink<'_> {
 }
 
 /// Archive-level options for a streaming write.
+/// RAR 5 looks for a data filter by default, because it usually pays and the
+/// cost is compression time rather than memory. Solid archives share one
+/// dictionary across members and so cannot carry per-member filters, and
+/// stored members are not compressed at all, so neither takes one.
+fn rar50_filter_policy(
+    auto_filter: bool,
+    no_filter: bool,
+    solid: bool,
+    store: bool,
+) -> rars::rar50::FilterPolicy {
+    if no_filter || store || (solid && !auto_filter) {
+        return rars::rar50::FilterPolicy::None;
+    }
+    rars::rar50::FilterPolicy::AutoSize
+}
+
 fn streaming_extras<'a>(
     recovery_percent: Option<u64>,
-    auto_filter: bool,
+    filter_policy: rars::rar50::FilterPolicy,
     quick_open: bool,
     comment: Option<&'a [u8]>,
     metadata: Option<rars::rar50::ArchiveMetadataEntry<'a>>,
 ) -> rars::rar50::ArchiveExtras<'a> {
     let mut extras = rars::rar50::ArchiveExtras::default()
         .with_recovery_percent(recovery_percent)
-        .with_quick_open(quick_open);
-    if auto_filter {
-        extras = extras.with_filter_policy(rars::rar50::FilterPolicy::AutoSize);
-    }
+        .with_quick_open(quick_open)
+        .with_filter_policy(filter_policy);
     if let Some(comment) = comment {
         extras = extras.with_comment(comment);
     }

@@ -5311,3 +5311,42 @@ fn stored_rar50_members_hold_their_payload_verbatim() {
     let test = rars().arg("test").arg(&archive).output().unwrap();
     assert!(test.status.success(), "stderr: {}", stderr(&test));
 }
+
+/// RAR 5 looks for a data filter by default, which is what makes executables
+/// compress well. `--no-filter` opts out.
+#[test]
+fn rar50_looks_for_a_data_filter_by_default() {
+    let dir = scratch("rar50-default-filter");
+    let source = dir.join("program.bin");
+    // x86-shaped: call instructions with absolute targets, which the E8
+    // filter rewrites into something far more repetitive.
+    let mut data = Vec::new();
+    for index in 0..40_000u32 {
+        data.push(0xe8);
+        data.extend_from_slice(&index.wrapping_mul(4).to_le_bytes());
+        data.extend_from_slice(b"\x55\x89\xe5\x83\xec");
+    }
+    fs::write(&source, &data).unwrap();
+
+    let filtered = dir.join("filtered.rar");
+    let plain = dir.join("plain.rar");
+    for (path, extra) in [(&filtered, None), (&plain, Some("--no-filter"))] {
+        let mut command = rars();
+        command.args(["a", "--format", "rar50"]);
+        if let Some(extra) = extra {
+            command.arg(extra);
+        }
+        let output = command.arg(path).arg(&source).output().unwrap();
+        assert!(output.status.success(), "stderr: {}", stderr(&output));
+    }
+
+    let filtered_len = fs::metadata(&filtered).unwrap().len();
+    let plain_len = fs::metadata(&plain).unwrap().len();
+    assert!(
+        filtered_len < plain_len,
+        "the default should find the filter: {filtered_len} vs {plain_len} unfiltered"
+    );
+
+    let test = rars().arg("test").arg(&filtered).output().unwrap();
+    assert!(test.status.success(), "stderr: {}", stderr(&test));
+}

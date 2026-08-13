@@ -764,8 +764,15 @@ impl RarBuilder {
         output: &mut dyn io::Write,
         resources: &rars_rs::WriterResources,
     ) -> rars_rs::Result<()> {
-        let mut extras =
-            rars_rs::rar50::ArchiveExtras::default().with_recovery_percent(self.recovery_percent);
+        // Look for a data filter unless the archive cannot carry one.
+        let filter_policy = if self.solid || self.store {
+            rars_rs::rar50::FilterPolicy::None
+        } else {
+            rars_rs::rar50::FilterPolicy::AutoSize
+        };
+        let mut extras = rars_rs::rar50::ArchiveExtras::default()
+            .with_recovery_percent(self.recovery_percent)
+            .with_filter_policy(filter_policy);
         if let Some(comment) = self.comment.as_deref() {
             extras = extras.with_comment(comment);
         }

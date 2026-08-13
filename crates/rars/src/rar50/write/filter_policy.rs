@@ -88,8 +88,9 @@ pub(super) fn filter_policy_attempt_count(data: &[u8], policy: FilterPolicy) -> 
     {
         return 1;
     }
-    // One cheap ranking pass per candidate plus the final full-effort encode.
-    auto_size_filter_candidates(data).len() as u64 + 1
+    // One cheap ranking pass per candidate, then the winner and the unfiltered
+    // baseline at full effort.
+    auto_size_filter_candidates(data).len() as u64 + 2
 }
 
 #[cfg(test)]
@@ -474,14 +475,34 @@ fn encode_member_with_auto_size_filter_progress(
             best_specs = specs;
         }
     }
-    encode_member_with_filter_specs_progress(
+    let filtered = encode_member_with_filter_specs_progress(
         data,
         algorithm_version,
         best_specs,
         options,
         borrow_progress(&mut progress),
     )
-    .map_err(Error::from)
+    .map_err(Error::from)?;
+    if best_specs.is_empty() {
+        return Ok(filtered);
+    }
+
+    // The ranking above compares candidates at reduced effort, which can order
+    // them differently from a full encode. Checking the winner against no
+    // filter at all is what stops an automatic filter making a member bigger.
+    let plain = encode_member_with_filter_specs_progress(
+        data,
+        algorithm_version,
+        &[],
+        options,
+        borrow_progress(&mut progress),
+    )
+    .map_err(Error::from)?;
+    Ok(if plain.len() <= filtered.len() {
+        plain
+    } else {
+        filtered
+    })
 }
 
 fn is_text_like_filter_skip_candidate(data: &[u8]) -> bool {

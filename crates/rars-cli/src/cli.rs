@@ -180,9 +180,12 @@ pub(crate) struct AddArgs {
     /// ARM filter
     #[arg(long = "arm-filter")]
     pub arm_filter: bool,
-    /// Auto-detect data filter
+    /// Auto-detect data filter (RAR 5+ does this by default)
     #[arg(long = "auto-filter")]
     pub auto_filter: bool,
+    /// Skip filter detection, compressing the data as it is
+    #[arg(long = "no-filter", conflicts_with = "auto_filter")]
+    pub no_filter: bool,
     /// Use the PPMd compression algorithm (RAR 2.9/3.x/4.x only)
     #[arg(long)]
     pub ppmd: bool,
