@@ -594,6 +594,7 @@ impl FileHeader {
             Error::UnsupportedSignature
             | Error::UnsupportedVersion(_)
             | Error::UnsupportedFeature { .. }
+            | Error::UnsupportedWriterOption { .. }
             | Error::Rar50BufferedDecodeLimitExceeded { .. }
             | Error::MemoryLimitExceeded { .. }
             | Error::UnsupportedFamilyFeature { .. }
@@ -2670,8 +2671,7 @@ mod tests {
 
     #[test]
     fn archive_parse_owned_with_password_unlocks_encrypted_archive() {
-        let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
+        let features = FeatureSet::store_only();
         let bytes = write_stored_archive(
             &[StoredEntry {
                 name: b"locked.txt",

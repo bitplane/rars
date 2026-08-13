@@ -1,4 +1,5 @@
 use super::*;
+use crate::write_plan::PlanShape;
 
 pub(super) fn write_stored_volumes_impl(
     entry: StoredEntry<'_>,
@@ -6,18 +7,8 @@ pub(super) fn write_stored_volumes_impl(
     max_data_per_volume: usize,
     recovery_percent: Option<u64>,
 ) -> Result<Vec<Vec<u8>>> {
-    if recovery_percent.is_some() {
-        validate_recovery_options(options)?;
-    } else {
-        validate_options(options)?;
-    }
+    validate_plan(options, PlanShape::new().volumes(true))?;
     validate_entry(&entry)?;
-    if options.features.archive_comment {
-        return Err(Error::UnsupportedFeature {
-            version: options.target,
-            feature: "RAR 5 volume comments",
-        });
-    }
     if max_data_per_volume == 0 {
         return Err(Error::InvalidHeader(
             "RAR 5 volume payload size must be non-zero",
@@ -71,11 +62,7 @@ pub(super) fn write_compressed_volume_set_impl(
     recovery_percent: Option<u64>,
     progress: Option<&WorkTracker<'_>>,
 ) -> Result<Vec<Vec<u8>>> {
-    if recovery_percent.is_some() {
-        validate_compressed_recovery_options(options)?;
-    } else {
-        validate_compressed_options(options)?;
-    }
+    validate_plan(options, PlanShape::new().compressed(true).volumes(true))?;
     if max_packed_per_volume == 0 {
         return Err(Error::InvalidHeader(
             "RAR 5 compressed volume payload size must be non-zero",
@@ -223,18 +210,8 @@ pub(super) fn write_encrypted_stored_volumes_impl(
     max_encrypted_per_volume: usize,
     recovery_percent: Option<u64>,
 ) -> Result<Vec<Vec<u8>>> {
-    if recovery_percent.is_some() {
-        validate_encrypted_recovery_options(options)?;
-    } else {
-        validate_encrypted_options(options)?;
-    }
+    validate_plan(options, PlanShape::new().volumes(true))?;
     validate_encrypted_entry(&entry)?;
-    if options.features.archive_comment {
-        return Err(Error::UnsupportedFeature {
-            version: options.target,
-            feature: "RAR 5 volume comments",
-        });
-    }
     if max_encrypted_per_volume == 0 {
         return Err(Error::InvalidHeader(
             "RAR 5 encrypted volume payload size must be non-zero",
@@ -295,11 +272,7 @@ pub(super) fn write_encrypted_compressed_volume_set_impl(
     recovery_percent: Option<u64>,
     progress: Option<&WorkTracker<'_>>,
 ) -> Result<Vec<Vec<u8>>> {
-    if recovery_percent.is_some() {
-        validate_encrypted_compressed_recovery_options(options)?;
-    } else {
-        validate_encrypted_compressed_options(options)?;
-    }
+    validate_plan(options, PlanShape::new().compressed(true).volumes(true))?;
     if max_encrypted_per_volume == 0 {
         return Err(Error::InvalidHeader(
             "RAR 5 encrypted compressed volume payload size must be non-zero",

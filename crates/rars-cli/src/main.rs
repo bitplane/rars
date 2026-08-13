@@ -1245,10 +1245,7 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
         AddWritePlan::Rar15To40 => {
             let mut features = FeatureSet::store_only();
             features.solid = solid;
-            features.file_encryption = password.is_some();
             features.header_encryption = header_encryption;
-            features.archive_comment = archive_comment.is_some();
-            features.file_comment = file_comment.is_some();
             let mut options = Rar15WriterOptions::new(target, features);
             if let Some(level) = compression_level {
                 options = options.with_compression_level(level);
@@ -1565,12 +1562,8 @@ fn write_plain_rar50_streaming(
         })
         .collect();
     let mut features = FeatureSet::store_only();
-    features.file_encryption = password.is_some();
     features.header_encryption = header_encryption;
     features.solid = solid;
-    features.recovery_record = recovery_percent.is_some();
-    features.archive_comment = archive_comment.is_some();
-    features.file_comment = file_comment.is_some();
     features.quick_open = quick_open;
     let mut options = rars::rar50::WriterOptions::new(target, features);
     if let Some(level) = compression_level {

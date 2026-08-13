@@ -745,11 +745,8 @@ impl RarBuilder {
 
     fn streaming_options(&self) -> rars_rs::rar50::WriterOptions {
         let mut features = rars_rs::FeatureSet::store_only();
-        features.file_encryption = self.password.is_some();
         features.header_encryption = self.encrypt_headers;
         features.solid = self.solid;
-        features.archive_comment = self.comment.is_some();
-        features.recovery_record = self.recovery_percent.is_some();
         let mut options = rars_rs::rar50::WriterOptions::new(self.format, features);
         if let Some(level) = self.compression {
             options = options.with_compression_level(if self.store { 0 } else { level });
@@ -817,10 +814,7 @@ impl RarBuilder {
     fn features(&self) -> rars_rs::FeatureSet {
         let mut features = rars_rs::FeatureSet::store_only();
         features.solid = self.solid;
-        features.file_encryption = self.password.is_some();
         features.header_encryption = self.encrypt_headers;
-        features.archive_comment = self.comment.is_some();
-        features.recovery_record = self.recovery_percent.is_some();
         features
     }
 

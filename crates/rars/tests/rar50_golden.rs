@@ -145,8 +145,7 @@ fn golden_comment_and_metadata_layout_is_stable() {
     let data = deterministic_bytes(1024, 3);
     let entries = [entry(b"payload.bin", &data)];
 
-    let mut features = FeatureSet::store_only();
-    features.archive_comment = true;
+    let features = FeatureSet::store_only();
     let options = WriterOptions::new(ArchiveVersion::Rar50, features);
 
     let commented = Rar50Writer::new(options)
@@ -192,8 +191,7 @@ fn golden_recovery_record_layout_is_stable() {
     let data = deterministic_bytes(8192, 5);
     let entries = [entry(b"protected.bin", &data)];
 
-    let mut features = FeatureSet::store_only();
-    features.recovery_record = true;
+    let features = FeatureSet::store_only();
     let options = WriterOptions::new(ArchiveVersion::Rar50, features);
 
     for percent in [1u64, 5, 10, 50] {
@@ -213,8 +211,7 @@ fn golden_recovery_record_over_200kib_is_stable() {
     let data = deterministic_bytes(300 * 1024, 6);
     let entries = [entry(b"large.bin", &data)];
 
-    let mut features = FeatureSet::store_only();
-    features.recovery_record = true;
+    let features = FeatureSet::store_only();
     let options = WriterOptions::new(ArchiveVersion::Rar50, features);
 
     let archive = Rar50Writer::new(options)

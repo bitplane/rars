@@ -271,12 +271,6 @@ pub(super) fn encode_option_candidates_for_level(
     Ok(candidates)
 }
 
-pub(super) fn validate_compression_level(options: WriterOptions) -> Result<()> {
-    compression_method_for_level(options.compression_level)?;
-    let dictionary_size = dictionary_size_for_options(options)?;
-    encode_options_for_level(options.compression_level, dictionary_size).map(|_| ())
-}
-
 pub(super) fn rar50_algorithm_version(options: WriterOptions) -> Result<u8> {
     match options.target {
         crate::ArchiveVersion::Rar50 => Ok(0),

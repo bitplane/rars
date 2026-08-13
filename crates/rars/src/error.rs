@@ -44,6 +44,15 @@ pub enum Error {
         version: ArchiveVersion,
         feature: &'static str,
     },
+    /// A writer option that would change the output, for a format that cannot
+    /// honour it.
+    UnsupportedWriterOption {
+        target: ArchiveVersion,
+        option: crate::write_plan::WriterOption,
+        /// Why, when the format alone is not the reason: "in a compressed
+        /// archive", "levels run from 0 to 5". Rendered after the format.
+        because: Option<&'static str>,
+    },
     Rar50BufferedDecodeLimitExceeded {
         limit: u64,
         required: u64,
@@ -110,10 +119,20 @@ impl std::fmt::Display for Error {
                     String::from_utf8_lossy(name)
                 )
             }
-            Self::UnsupportedVersion(version) => write!(f, "unsupported version: {version:?}"),
+            Self::UnsupportedVersion(version) => write!(f, "unsupported version: {version}"),
             Self::UnsupportedFeature { version, feature } => {
-                write!(f, "feature {feature} is not supported by {version:?}")
+                write!(f, "feature {feature} is not supported by {version}")
             }
+            Self::UnsupportedWriterOption {
+                target,
+                option,
+                because,
+            } => match because {
+                Some(reason) => {
+                    write!(f, "{} is not supported by {target} ({reason})", option.name())
+                }
+                None => write!(f, "{} is not supported by {target}", option.name()),
+            },
             Self::Rar50BufferedDecodeLimitExceeded { limit, required } => write!(
                 f,
                 "RAR 5 filtered member requires buffered decoding of {required} bytes, above the configured limit of {limit} bytes"
@@ -467,7 +486,7 @@ mod tests {
         );
         assert_eq!(
             Error::UnsupportedVersion(ArchiveVersion::Rar50).to_string(),
-            "unsupported version: Rar50"
+            "unsupported version: rar50"
         );
         assert_eq!(
             Error::UnsupportedFeature {
@@ -475,7 +494,7 @@ mod tests {
                 feature: "quantum compression",
             }
             .to_string(),
-            "feature quantum compression is not supported by Rar50"
+            "feature quantum compression is not supported by rar50"
         );
         assert_eq!(
             Error::Rar50BufferedDecodeLimitExceeded {

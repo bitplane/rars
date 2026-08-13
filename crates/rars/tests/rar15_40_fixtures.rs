@@ -565,8 +565,7 @@ fn generated_rar29_encrypted_e8_filtered_archive_round_trips() {
         password: Some(b"password"),
         file_comment: None,
     }];
-    let mut features = FeatureSet::store_only();
-    features.file_encryption = true;
+    let features = FeatureSet::store_only();
 
     let bytes = write_rar29_filter(
         &entries,
@@ -600,7 +599,6 @@ fn generated_rar30_header_encrypted_e8_filtered_archive_round_trips() {
         file_comment: None,
     }];
     let mut features = FeatureSet::store_only();
-    features.file_encryption = true;
     features.header_encryption = true;
 
     let bytes = write_rar29_filter(
@@ -1552,8 +1550,7 @@ fn writes_store_only_rar15_archive_that_reader_extracts() {
 
 #[test]
 fn writes_stored_rar15_archive_comment_that_reader_decodes() {
-    let mut features = FeatureSet::store_only();
-    features.archive_comment = true;
+    let features = FeatureSet::store_only();
     let entries = [StoredEntry {
         name: b"hello.txt",
         data: b"hello with comment\n",
@@ -1582,8 +1579,7 @@ fn writes_stored_rar15_archive_comment_that_reader_decodes() {
 
 #[test]
 fn writes_rar15_file_comments_that_reader_decodes() {
-    let mut features = FeatureSet::store_only();
-    features.file_comment = true;
+    let features = FeatureSet::store_only();
 
     let stored = [StoredEntry {
         name: b"stored-comment.txt",
@@ -1637,8 +1633,7 @@ fn writes_rar15_file_comments_that_reader_decodes() {
 
 #[test]
 fn writes_rar20_old_style_comments_that_reader_decodes() {
-    let mut archive_features = FeatureSet::store_only();
-    archive_features.archive_comment = true;
+    let archive_features = FeatureSet::store_only();
     let stored = [StoredEntry {
         name: b"rar20-commented.txt",
         data: b"rar20 archive comment payload\n",
@@ -1662,8 +1657,7 @@ fn writes_rar20_old_style_comments_that_reader_decodes() {
     );
     assert_eq!(collect_extract(&archive).unwrap()[0].data, stored[0].data);
 
-    let mut file_features = FeatureSet::store_only();
-    file_features.file_comment = true;
+    let file_features = FeatureSet::store_only();
     let compressed = [FileEntry {
         name: b"rar20-file-commented.txt",
         data: b"rar20 compressed file comment payload payload payload\n",
@@ -1695,8 +1689,7 @@ fn writes_rar20_old_style_comments_that_reader_decodes() {
 
 #[test]
 fn writes_rar29_old_style_comments_that_reader_decodes() {
-    let mut archive_features = FeatureSet::store_only();
-    archive_features.archive_comment = true;
+    let archive_features = FeatureSet::store_only();
     let stored = [StoredEntry {
         name: b"rar29-commented.txt",
         data: b"rar29 archive comment payload\n",
@@ -1720,8 +1713,7 @@ fn writes_rar29_old_style_comments_that_reader_decodes() {
     );
     assert_eq!(collect_extract(&archive).unwrap()[0].data, stored[0].data);
 
-    let mut file_features = FeatureSet::store_only();
-    file_features.file_comment = true;
+    let file_features = FeatureSet::store_only();
     let compressed = [FileEntry {
         name: b"rar29-file-commented.txt",
         data: b"rar29 compressed file comment payload payload payload\n",
@@ -1753,8 +1745,7 @@ fn writes_rar29_old_style_comments_that_reader_decodes() {
 
 #[test]
 fn writes_rar29_archive_comment_with_empty_auto_members() {
-    let mut features = FeatureSet::store_only();
-    features.archive_comment = true;
+    let features = FeatureSet::store_only();
     let entries = [
         FileEntry {
             name: b"file1.txt",
@@ -1799,8 +1790,7 @@ fn writes_rar29_archive_comment_with_empty_auto_members() {
 #[test]
 fn writes_rar3_newsub_archive_comment_that_reader_decodes() {
     for target in [ArchiveVersion::Rar30, ArchiveVersion::Rar40] {
-        let mut features = FeatureSet::store_only();
-        features.archive_comment = true;
+        let features = FeatureSet::store_only();
         let entries = [FileEntry {
             name: b"rar3-commented.txt",
             data: b"rar3 NEWSUB comment payload payload payload\n",
@@ -2181,8 +2171,7 @@ fn rar20_writer_stores_member_when_lz_payload_would_grow() {
 
 #[test]
 fn writes_encrypted_rar20_archives_that_reader_extracts_with_password() {
-    let mut features = FeatureSet::store_only();
-    features.file_encryption = true;
+    let features = FeatureSet::store_only();
     let options = WriterOptions::new(ArchiveVersion::Rar20, features);
 
     let stored = [StoredEntry {
@@ -2240,8 +2229,7 @@ fn writes_encrypted_rar20_archives_that_reader_extracts_with_password() {
 
 #[test]
 fn writes_encrypted_rar29_archives_that_reader_extracts_with_password() {
-    let mut features = FeatureSet::store_only();
-    features.file_encryption = true;
+    let features = FeatureSet::store_only();
     let options = WriterOptions::new(ArchiveVersion::Rar29, features);
 
     let stored = [StoredEntry {
@@ -3468,8 +3456,7 @@ fn writes_solid_compressed_rar15_archive_that_reader_extracts() {
 
 #[test]
 fn writes_encrypted_rar15_archives_that_reader_extracts_with_password() {
-    let mut features = FeatureSet::store_only();
-    features.file_encryption = true;
+    let features = FeatureSet::store_only();
 
     let stored = [StoredEntry {
         name: b"secret-store.txt",
@@ -3519,8 +3506,7 @@ fn writes_encrypted_rar15_archives_that_reader_extracts_with_password() {
 
 #[test]
 fn writes_aes_encrypted_rar3_and_rar4_archives_that_reader_extracts_with_password() {
-    let mut features = FeatureSet::store_only();
-    features.file_encryption = true;
+    let features = FeatureSet::store_only();
 
     for target in [ArchiveVersion::Rar30, ArchiveVersion::Rar40] {
         let stored = [StoredEntry {
@@ -3587,7 +3573,6 @@ fn writes_aes_encrypted_rar3_and_rar4_archives_that_reader_extracts_with_passwor
 fn writes_header_encrypted_rar3_and_rar4_archives_that_reader_extracts_with_password() {
     for target in [ArchiveVersion::Rar30, ArchiveVersion::Rar40] {
         let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
         features.header_encryption = true;
         let entries = [FileEntry {
             name: b"header-secret.txt",
@@ -3619,7 +3604,6 @@ fn writes_header_encrypted_rar3_and_rar4_archives_that_reader_extracts_with_pass
 fn writes_solid_header_encrypted_rar3_and_rar4_archives_that_reader_extracts_with_password() {
     for target in [ArchiveVersion::Rar30, ArchiveVersion::Rar40] {
         let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
         features.header_encryption = true;
         features.solid = true;
         let entries = [
@@ -3663,8 +3647,7 @@ fn writes_solid_header_encrypted_rar3_and_rar4_archives_that_reader_extracts_wit
 
 #[test]
 fn rar3_and_rar4_aes_writer_uses_fresh_salts() {
-    let mut features = FeatureSet::store_only();
-    features.file_encryption = true;
+    let features = FeatureSet::store_only();
     let entry = [FileEntry {
         name: b"aes-salt.txt",
         data: b"same plaintext same password\n",
@@ -3826,8 +3809,7 @@ fn writes_compressed_rar29_volume_set_that_reader_reassembles() {
 
 #[test]
 fn writes_encrypted_rar15_volume_sets_that_reader_reassembles_with_password() {
-    let mut features = FeatureSet::store_only();
-    features.file_encryption = true;
+    let features = FeatureSet::store_only();
     let options = WriterOptions::new(ArchiveVersion::Rar15, features);
 
     let stored = StoredEntry {
@@ -3883,8 +3865,7 @@ fn writes_encrypted_rar15_volume_sets_that_reader_reassembles_with_password() {
 
 #[test]
 fn writes_encrypted_rar20_volume_sets_that_reader_reassembles_with_password() {
-    let mut features = FeatureSet::store_only();
-    features.file_encryption = true;
+    let features = FeatureSet::store_only();
     let options = WriterOptions::new(ArchiveVersion::Rar20, features);
 
     let stored = StoredEntry {
@@ -3944,8 +3925,7 @@ fn writes_encrypted_rar20_volume_sets_that_reader_reassembles_with_password() {
 
 #[test]
 fn writes_encrypted_rar29_volume_sets_that_reader_reassembles_with_password() {
-    let mut features = FeatureSet::store_only();
-    features.file_encryption = true;
+    let features = FeatureSet::store_only();
     let options = WriterOptions::new(ArchiveVersion::Rar29, features);
 
     let stored = StoredEntry {
@@ -4026,8 +4006,7 @@ fn writes_header_encrypted_rar3_and_rar4_volume_sets_that_reader_reassembles_wit
 }
 
 fn assert_encrypted_rar3_volume_sets_round_trip(target: ArchiveVersion) {
-    let mut features = FeatureSet::store_only();
-    features.file_encryption = true;
+    let features = FeatureSet::store_only();
     let options = WriterOptions::new(target, features);
 
     let stored = StoredEntry {
@@ -4105,7 +4084,6 @@ fn assert_encrypted_rar3_volume_sets_round_trip(target: ArchiveVersion) {
 
 fn assert_header_encrypted_rar3_volume_sets_round_trip(target: ArchiveVersion) {
     let mut features = FeatureSet::store_only();
-    features.file_encryption = true;
     features.header_encryption = true;
     let options = WriterOptions::new(target, features);
 
@@ -4262,10 +4240,12 @@ fn extracts_rars_generated_rar15_writer_volume_oracles() {
     assert_eq!(encrypted[0].data, RARS_GENERATED_PAYLOAD);
 }
 
+/// RAR 1.5 has no header encryption, and used to be told so only by a message
+/// naming neither the option nor a format that does support it.
 #[test]
-fn rar15_store_only_writer_rejects_non_baseline_features() {
+fn rar15_writer_rejects_header_encryption_by_name() {
     let mut features = FeatureSet::store_only();
-    features.archive_comment = true;
+    features.header_encryption = true;
     let options = WriterOptions::new(ArchiveVersion::Rar15, features);
     let entry = StoredEntry {
         name: b"hello.txt",
@@ -4277,13 +4257,23 @@ fn rar15_store_only_writer_rejects_non_baseline_features() {
         file_comment: None,
     };
 
-    assert!(matches!(
-        write_stored_archive(&[entry], options),
-        Err(Error::UnsupportedFeature {
-            version: ArchiveVersion::Rar15,
-            ..
-        })
-    ));
+    let error = write_stored_archive(&[entry], options).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "header encryption is not supported by rar15"
+    );
+    assert_eq!(
+        rars::formats_supporting(
+            rars::WriterOption::Feature(rars::Feature::HeaderEncryption),
+            rars::PlanShape::new(),
+        ),
+        vec![
+            ArchiveVersion::Rar30,
+            ArchiveVersion::Rar40,
+            ArchiveVersion::Rar50,
+            ArchiveVersion::Rar70,
+        ]
+    );
 }
 
 #[test]

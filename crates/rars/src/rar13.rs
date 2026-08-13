@@ -9,6 +9,7 @@ use crate::features::FeatureSet;
 use crate::io_util::{read_exact_at, read_u16, read_u32};
 pub(crate) use crate::source::ArchiveSource;
 use crate::version::{ArchiveFamily, ArchiveVersion};
+use crate::write_plan::{PlanShape, WriterOption};
 use crate::write_progress::{ProgressReporter, WorkTracker};
 use crate::{WriteOperation, WriteProgress, WriteProgressEvent};
 use std::fs::File;
@@ -1025,8 +1026,7 @@ pub fn write_stored_archive_with_comment(
     if !options.target.is_rar13_family() {
         return Err(Error::UnsupportedVersion(options.target));
     }
-    options.features.validate_for(options.target)?;
-    validate_stored_writer_features(options.target, options.features)?;
+    validate_plan(options, PlanShape::new())?;
 
     let mut out = Vec::new();
     write_main_header(&mut out, options.features, archive_comment)?;
@@ -1063,9 +1063,7 @@ pub fn write_compressed_archive_with_comment_and_progress(
     if !options.target.is_rar13_family() {
         return Err(Error::UnsupportedVersion(options.target));
     }
-    options.features.validate_for(options.target)?;
-    validate_compressed_writer_features(options.target, options.features)?;
-    validate_compression_level(options)?;
+    validate_plan(options, PlanShape::new().compressed(true))?;
 
     let mut out = Vec::new();
     write_main_header(&mut out, options.features, archive_comment)?;
@@ -1167,8 +1165,7 @@ pub fn write_stored_volumes(
     if !options.target.is_rar13_family() {
         return Err(Error::UnsupportedVersion(options.target));
     }
-    options.features.validate_for(options.target)?;
-    validate_stored_writer_features(options.target, options.features)?;
+    validate_plan(options, PlanShape::new())?;
     validate_volume_writer_inputs(
         entry.name,
         entry.data,
@@ -1208,8 +1205,7 @@ pub fn write_compressed_volumes_with_progress(
     if !options.target.is_rar13_family() {
         return Err(Error::UnsupportedVersion(options.target));
     }
-    options.features.validate_for(options.target)?;
-    validate_compressed_writer_features(options.target, options.features)?;
+    validate_plan(options, PlanShape::new().compressed(true))?;
     validate_volume_writer_inputs(
         entry.name,
         entry.data,
@@ -1218,7 +1214,6 @@ pub fn write_compressed_volumes_with_progress(
         options,
     )?;
 
-    validate_compression_level(options)?;
     let encode_options = rar15_encode_options_for_level(options.compression_level)?;
     let total_work = (entry.data.len() as u64)
         .saturating_mul(rar15_encode_fallback_options(encode_options).len() as u64);
@@ -1317,14 +1312,10 @@ fn report_compression_entry(
     }
 }
 
-fn validate_stored_writer_features(version: ArchiveVersion, features: FeatureSet) -> Result<()> {
-    reject_writer_feature(version, features.sfx, "sfx")?;
-    reject_writer_feature(
-        version,
-        features.authenticity_verification,
-        "authenticity_verification",
-    )?;
-    Ok(())
+/// Everything this writer refuses, in one place, before anything is written.
+fn validate_plan(options: WriterOptions, shape: PlanShape) -> Result<()> {
+    crate::write_plan::validate_features(options.target, options.features, shape)?;
+    crate::write_plan::validate_compression_level(options.target, options.compression_level)
 }
 
 fn validate_volume_writer_inputs(
@@ -1336,44 +1327,18 @@ fn validate_volume_writer_inputs(
 ) -> Result<()> {
     validate_file_entry(name, data)?;
     if password.is_some() {
-        return Err(Error::UnsupportedFeature {
-            version: options.target,
-            feature: "volume_password",
+        return Err(Error::UnsupportedWriterOption {
+            target: options.target,
+            option: WriterOption::Password,
+            because: Some("in a volume set"),
         });
     }
-    if file_comment.is_some() || options.features.file_comment {
-        return Err(Error::UnsupportedFeature {
-            version: options.target,
-            feature: "volume_file_comment",
+    if file_comment.is_some() {
+        return Err(Error::UnsupportedWriterOption {
+            target: options.target,
+            option: WriterOption::FileComment,
+            because: Some("in a volume set"),
         });
-    }
-    if options.features.archive_comment {
-        return Err(Error::UnsupportedFeature {
-            version: options.target,
-            feature: "volume_archive_comment",
-        });
-    }
-    Ok(())
-}
-
-fn validate_compressed_writer_features(
-    version: ArchiveVersion,
-    features: FeatureSet,
-) -> Result<()> {
-    reject_writer_feature(version, features.sfx, "sfx")?;
-    reject_writer_feature(
-        version,
-        features.authenticity_verification,
-        "authenticity_verification",
-    )?;
-    Ok(())
-}
-
-fn validate_compression_level(options: WriterOptions) -> Result<()> {
-    if matches!(options.compression_level, Some(level) if level > 5) {
-        return Err(Error::InvalidHeader(
-            "RAR compression level must be in the range 0..5",
-        ));
     }
     Ok(())
 }
@@ -1460,18 +1425,6 @@ fn unpack15_payload_matches(packed: &[u8], data: &[u8]) -> Result<bool> {
     match unpack15_decode(packed, data.len()) {
         Ok(decoded) => Ok(decoded == data),
         Err(_) => Ok(false),
-    }
-}
-
-fn reject_writer_feature(
-    version: ArchiveVersion,
-    enabled: bool,
-    feature: &'static str,
-) -> Result<()> {
-    if enabled {
-        Err(Error::UnsupportedFeature { version, feature })
-    } else {
-        Ok(())
     }
 }
 
@@ -2591,17 +2544,22 @@ mod tests {
         let err = write_stored_archive(&[], options).unwrap_err();
         assert_eq!(
             err,
-            Error::UnsupportedFeature {
-                version: ArchiveVersion::Rar13,
-                feature: "quick_open"
+            Error::UnsupportedWriterOption {
+                target: ArchiveVersion::Rar13,
+                option: WriterOption::Feature(crate::Feature::QuickOpen),
+                because: None,
             }
+        );
+        assert_eq!(
+            err.to_string(),
+            "a quick-open index is not supported by rar13"
         );
     }
 
     #[test]
-    fn rejects_unimplemented_rar13_writer_features() {
+    fn rejects_header_encryption_for_rar13() {
         let mut features = FeatureSet::store_only();
-        features.sfx = true;
+        features.header_encryption = true;
 
         let options = WriterOptions {
             target: ArchiveVersion::Rar14,
@@ -2610,11 +2568,8 @@ mod tests {
         };
         let err = write_stored_archive(&[], options).unwrap_err();
         assert_eq!(
-            err,
-            Error::UnsupportedFeature {
-                version: ArchiveVersion::Rar14,
-                feature: "sfx"
-            }
+            err.to_string(),
+            "header encryption is not supported by rar14"
         );
     }
 
@@ -3111,41 +3066,32 @@ mod tests {
         let err = write_stored_volumes(entry, WriterOptions::default(), 16).unwrap_err();
         assert_eq!(
             err,
-            Error::UnsupportedFeature {
-                version: ArchiveVersion::Rar14,
-                feature: "volume_password",
+            Error::UnsupportedWriterOption {
+                target: ArchiveVersion::Rar14,
+                option: WriterOption::Password,
+                because: Some("in a volume set"),
             }
+        );
+        assert_eq!(
+            err.to_string(),
+            "encryption is not supported by rar14 (in a volume set)"
         );
     }
 
     #[test]
-    fn write_compressed_volumes_rejects_archive_comment_feature() {
-        let mut features = FeatureSet::store_only();
-        features.archive_comment = true;
+    fn write_compressed_volumes_rejects_file_comments() {
         let entry = FileEntry {
             name: b"with-comment.bin",
             data: b"data",
             file_time: 0,
             file_attr: 0x20,
             password: None,
-            file_comment: None,
+            file_comment: Some(b"note"),
         };
-        let err = write_compressed_volumes(
-            entry,
-            WriterOptions {
-                target: ArchiveVersion::Rar14,
-                features,
-                ..WriterOptions::default()
-            },
-            16,
-        )
-        .unwrap_err();
+        let err = write_compressed_volumes(entry, WriterOptions::default(), 16).unwrap_err();
         assert_eq!(
-            err,
-            Error::UnsupportedFeature {
-                version: ArchiveVersion::Rar14,
-                feature: "volume_archive_comment",
-            }
+            err.to_string(),
+            "a per-file comment is not supported by rar14 (in a volume set)"
         );
     }
 

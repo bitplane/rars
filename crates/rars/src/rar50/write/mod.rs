@@ -4,6 +4,7 @@ use crate::crc32::Crc32;
 use crate::crypto::rar50::{Rar50Cipher, Rar50Keys};
 pub use crate::filter::{FilterKind, FilterPolicy, FilterSpec};
 use crate::recovery::rar5::build_structural_inline_recovery_data_with_progress;
+use crate::write_plan::{PlanShape, WriterOption};
 use crate::write_progress::{ProgressReporter, WorkTracker};
 use crate::{EntrySource, WriteOperation, WriteProgress, WriteProgressEvent, WriterResources};
 use std::io::{Read, Write};
@@ -23,7 +24,6 @@ use filter_policy::{
     encode_option_candidates_for_level, encode_options_for_level,
     encode_safe_lz_member_with_progress, encode_with_solid_reset_policy_and_progress,
     filter_policy_walk_bytes, rar50_algorithm_version, should_store_compressed_payload,
-    validate_compression_level,
 };
 use headers::{
     encrypted_header_block, encrypted_main_header_block, file_specific, header_encryption_keys,
@@ -235,12 +235,13 @@ pub fn write_streaming_volumes_to(
             feature: "RAR 5 volume writer comments, metadata or quick-open",
         });
     }
-    match (encrypted, extras.recovery_percent.is_some()) {
-        (true, true) => validate_encrypted_compressed_recovery_options(options)?,
-        (true, false) => validate_encrypted_compressed_options(options)?,
-        (false, true) => validate_compressed_recovery_options(options)?,
-        (false, false) => validate_compressed_options(options)?,
-    }
+    validate_plan(
+        options,
+        PlanShape::new()
+            .compressed(true)
+            .volumes(true)
+            .filtered(extras.filter_policy != FilterPolicy::None),
+    )?;
     if let Some(percent) = extras.recovery_percent {
         validate_recovery_percent(percent)?;
     }
@@ -356,12 +357,12 @@ pub(crate) fn write_streaming_archive_with_progress(
         });
     }
     let recovery_percent = extras.recovery_percent;
-    match (encrypted, recovery_percent.is_some()) {
-        (true, true) => validate_encrypted_compressed_recovery_options(options)?,
-        (true, false) => validate_encrypted_compressed_options(options)?,
-        (false, true) => validate_compressed_recovery_options(options)?,
-        (false, false) => validate_compressed_options(options)?,
-    }
+    validate_plan(
+        options,
+        PlanShape::new()
+            .compressed(true)
+            .filtered(extras.filter_policy != FilterPolicy::None),
+    )?;
     if let Some(percent) = recovery_percent {
         validate_recovery_percent(percent)?;
     }
@@ -936,37 +937,16 @@ impl<'a> Rar50Writer<'a> {
             ) | None
         );
 
-        // Stored and compressed writers reject different feature sets, and
-        // say so differently.
-        let recovery = self.recovery_percent.is_some();
-        match member_kind {
-            Some(Rar50WriteMemberKind::StoredWithServices) => {
-                validate_file_service_options(self.options)?
-            }
-            Some(Rar50WriteMemberKind::EncryptedStoredWithServices) => {
-                validate_encrypted_file_service_options(self.options)?
-            }
-            Some(Rar50WriteMemberKind::Stored) | None if recovery => {
-                validate_recovery_options(self.options)?
-            }
-            Some(Rar50WriteMemberKind::Stored) | None => validate_options(self.options)?,
-            Some(Rar50WriteMemberKind::EncryptedStored) if recovery => {
-                validate_encrypted_recovery_options(self.options)?
-            }
-            Some(Rar50WriteMemberKind::EncryptedStored) => {
-                validate_encrypted_options(self.options)?
-            }
-            Some(Rar50WriteMemberKind::Compressed) if recovery => {
-                validate_compressed_recovery_options(self.options)?
-            }
-            Some(Rar50WriteMemberKind::Compressed) => validate_compressed_options(self.options)?,
-            Some(Rar50WriteMemberKind::EncryptedCompressed) if recovery => {
-                validate_encrypted_compressed_recovery_options(self.options)?
-            }
-            Some(Rar50WriteMemberKind::EncryptedCompressed) => {
-                validate_encrypted_compressed_options(self.options)?
-            }
-        }
+        let compressed = matches!(
+            member_kind,
+            Some(Rar50WriteMemberKind::Compressed | Rar50WriteMemberKind::EncryptedCompressed)
+        );
+        validate_plan(
+            self.options,
+            PlanShape::new()
+                .compressed(compressed)
+                .filtered(self.filter_policy != FilterPolicy::None),
+        )?;
         if let Some(percent) = self.recovery_percent {
             validate_recovery_percent(percent)?;
         }
@@ -1210,181 +1190,26 @@ fn report_operation_finished(
     }
 }
 
-fn validate_options(options: WriterOptions) -> Result<()> {
-    validate_plain_options(options, false)
-}
-
-fn validate_recovery_options(options: WriterOptions) -> Result<()> {
-    validate_plain_options(options, true)
-}
-
-fn validate_plain_options(options: WriterOptions, allow_recovery_record: bool) -> Result<()> {
-    validate_compression_level(options)?;
-    if !matches!(
-        options.target,
-        crate::ArchiveVersion::Rar50 | crate::ArchiveVersion::Rar70
-    ) {
+/// Everything this writer refuses, in one place, before anything is written.
+///
+/// This replaced a six-by-two matrix of near-identical checks, one per shape of
+/// member the builder accepts. Each built a set of allowed features and compared
+/// it with the request, and several built it by assigning a flag to itself,
+/// which accepted the flag whatever it said.
+fn validate_plan(options: WriterOptions, shape: PlanShape) -> Result<()> {
+    if options.target.family() != crate::version::ArchiveFamily::Rar50Plus {
         return Err(Error::UnsupportedVersion(options.target));
     }
-    let mut allowed = crate::FeatureSet::store_only();
-    allowed.archive_comment = options.features.archive_comment;
-    allowed.quick_open = options.features.quick_open;
-    if allow_recovery_record {
-        allowed.recovery_record = options.features.recovery_record;
-    }
-    if options.features != allowed {
-        return Err(Error::UnsupportedFeature {
-            version: options.target,
-            feature: "RAR 5 writer feature",
-        });
-    }
-    Ok(())
-}
-
-fn validate_file_service_options(options: WriterOptions) -> Result<()> {
-    validate_compression_level(options)?;
-    if !matches!(
-        options.target,
-        crate::ArchiveVersion::Rar50 | crate::ArchiveVersion::Rar70
-    ) {
-        return Err(Error::UnsupportedVersion(options.target));
-    }
-    let mut allowed = crate::FeatureSet::store_only();
-    allowed.file_comment = options.features.file_comment;
-    if options.features != allowed {
-        return Err(Error::UnsupportedFeature {
-            version: options.target,
-            feature: "RAR 5 stored file-service writer feature",
-        });
-    }
-    Ok(())
-}
-
-fn validate_compressed_options(options: WriterOptions) -> Result<()> {
-    validate_compressed_feature_options(options, false)
-}
-
-fn validate_compressed_recovery_options(options: WriterOptions) -> Result<()> {
-    validate_compressed_feature_options(options, true)
-}
-
-fn validate_compressed_feature_options(
-    options: WriterOptions,
-    allow_recovery_record: bool,
-) -> Result<()> {
-    validate_compression_level(options)?;
-    if !matches!(
-        options.target,
-        crate::ArchiveVersion::Rar50 | crate::ArchiveVersion::Rar70
-    ) {
-        return Err(Error::UnsupportedVersion(options.target));
-    }
-    let mut allowed = crate::FeatureSet::store_only();
-    allowed.solid = options.features.solid;
-    allowed.archive_comment = options.features.archive_comment;
-    allowed.file_comment = options.features.file_comment;
-    allowed.quick_open = options.features.quick_open;
-    if allow_recovery_record {
-        allowed.recovery_record = options.features.recovery_record;
-    }
-    if options.features != allowed {
-        return Err(Error::UnsupportedFeature {
-            version: options.target,
-            feature: "RAR 5 compressed writer feature",
-        });
-    }
-    Ok(())
-}
-
-fn validate_encrypted_compressed_options(options: WriterOptions) -> Result<()> {
-    validate_encrypted_compressed_feature_options(options, false)
-}
-
-fn validate_encrypted_compressed_recovery_options(options: WriterOptions) -> Result<()> {
-    validate_encrypted_compressed_feature_options(options, true)
-}
-
-fn validate_encrypted_compressed_feature_options(
-    options: WriterOptions,
-    allow_recovery_record: bool,
-) -> Result<()> {
-    validate_compression_level(options)?;
-    if !matches!(
-        options.target,
-        crate::ArchiveVersion::Rar50 | crate::ArchiveVersion::Rar70
-    ) {
-        return Err(Error::UnsupportedVersion(options.target));
-    }
-    let mut allowed = crate::FeatureSet::store_only();
-    allowed.file_encryption = true;
-    allowed.header_encryption = options.features.header_encryption;
-    allowed.solid = options.features.solid;
-    allowed.archive_comment = options.features.archive_comment;
-    allowed.file_comment = options.features.file_comment;
-    allowed.quick_open = options.features.quick_open;
-    if allow_recovery_record {
-        allowed.recovery_record = options.features.recovery_record;
-    }
-    if options.features != allowed {
-        return Err(Error::UnsupportedFeature {
-            version: options.target,
-            feature: "RAR 5 encrypted compressed writer feature",
-        });
-    }
-    Ok(())
-}
-
-fn validate_encrypted_options(options: WriterOptions) -> Result<()> {
-    validate_encrypted_feature_options(options, false)
-}
-
-fn validate_encrypted_recovery_options(options: WriterOptions) -> Result<()> {
-    validate_encrypted_feature_options(options, true)
-}
-
-fn validate_encrypted_feature_options(
-    options: WriterOptions,
-    allow_recovery_record: bool,
-) -> Result<()> {
-    validate_compression_level(options)?;
-    if !matches!(
-        options.target,
-        crate::ArchiveVersion::Rar50 | crate::ArchiveVersion::Rar70
-    ) {
-        return Err(Error::UnsupportedVersion(options.target));
-    }
-    let mut allowed = crate::FeatureSet::store_only();
-    allowed.file_encryption = true;
-    allowed.header_encryption = options.features.header_encryption;
-    allowed.archive_comment = options.features.archive_comment;
-    if allow_recovery_record {
-        allowed.recovery_record = options.features.recovery_record;
-    }
-    if options.features != allowed {
-        return Err(Error::UnsupportedFeature {
-            version: options.target,
-            feature: "RAR 5 encrypted stored writer feature",
-        });
-    }
-    Ok(())
-}
-
-fn validate_encrypted_file_service_options(options: WriterOptions) -> Result<()> {
-    validate_compression_level(options)?;
-    if !matches!(
-        options.target,
-        crate::ArchiveVersion::Rar50 | crate::ArchiveVersion::Rar70
-    ) {
-        return Err(Error::UnsupportedVersion(options.target));
-    }
-    let mut allowed = crate::FeatureSet::store_only();
-    allowed.file_encryption = true;
-    allowed.header_encryption = options.features.header_encryption;
-    allowed.file_comment = options.features.file_comment;
-    if options.features != allowed {
-        return Err(Error::UnsupportedFeature {
-            version: options.target,
-            feature: "RAR 5 encrypted stored file-service writer feature",
+    crate::write_plan::validate_features(options.target, options.features, shape)?;
+    crate::write_plan::validate_compression_level(options.target, options.compression_level)?;
+    let _ = dictionary_size_for_options(options)?;
+    // Quick-open is an index of the headers, so it has nothing to index once
+    // they are encrypted.
+    if options.features.quick_open && options.features.header_encryption {
+        return Err(Error::UnsupportedWriterOption {
+            target: options.target,
+            option: WriterOption::Feature(crate::Feature::QuickOpen),
+            because: Some("with header encryption"),
         });
     }
     Ok(())
@@ -1961,8 +1786,7 @@ mod tests {
             }
             _ => {}
         };
-        let mut features = FeatureSet::store_only();
-        features.recovery_record = true;
+        let features = FeatureSet::store_only();
 
         Rar50Writer::new(WriterOptions::new(ArchiveVersion::Rar50, features))
             .stored_entries(&[entry])
@@ -2194,8 +2018,7 @@ mod tests {
             host_os: 1,
             password: b"password".to_vec(),
         };
-        let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
+        let features = FeatureSet::store_only();
         let mut bytes = Vec::new();
         write_streaming_encrypted_compressed_archive_to(
             &[entry],

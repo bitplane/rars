@@ -13,6 +13,7 @@ use crate::codec::rar29::{
 };
 pub use crate::filter::{FilterKind, FilterPolicy, FilterSpec};
 use crate::io_util::align16 as checked_align16;
+use crate::write_plan::{PlanShape, WriterOption};
 use crate::write_progress::{ProgressReporter, WorkTracker};
 use crate::{WriteOperation, WriteProgress, WriteProgressEvent};
 
@@ -37,7 +38,12 @@ pub fn write_stored_archive_with_comment(
     archive_comment: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
     let has_file_comment = entries.iter().any(|entry| entry.file_comment.is_some());
-    validate_stored_writer_options(options, archive_comment.is_some(), has_file_comment)?;
+    validate_plan(
+        options,
+        PlanShape::new(),
+        archive_comment.is_some(),
+        has_file_comment,
+    )?;
     if options.features.header_encryption {
         return write_header_encrypted_stored_archive(entries, options, archive_comment);
     }
@@ -108,7 +114,12 @@ fn write_compressed_archive_with_comment_impl(
     progress: Option<&WorkTracker<'_>>,
 ) -> Result<Vec<u8>> {
     let has_file_comment = entries.iter().any(|entry| entry.file_comment.is_some());
-    validate_compressed_writer_options(options, archive_comment.is_some(), has_file_comment)?;
+    validate_plan(
+        options,
+        PlanShape::new().compressed(true),
+        archive_comment.is_some(),
+        has_file_comment,
+    )?;
     if options.features.header_encryption {
         return write_header_encrypted_compressed_archive(entries, options, archive_comment);
     }
@@ -544,9 +555,18 @@ fn write_rar29_filtered_archive(
     options: WriterOptions,
     encode: impl Fn(&FileEntry<'_>) -> Result<EncodedPayload> + Sync,
 ) -> Result<Vec<u8>> {
-    validate_rar29_filtered_writer_options(options)?;
+    validate_plan(
+        options,
+        PlanShape::new().compressed(true).filtered(true),
+        false,
+        false,
+    )?;
     if options.features.header_encryption {
-        validate_header_encrypted_archive_options(options, false, options.features.solid)?;
+        validate_header_encrypted_archive_options(
+            options.target,
+            false,
+            entries.iter().any(|entry| entry.password.is_some()),
+        )?;
     }
     let mut out = Vec::new();
     out.extend_from_slice(RAR15_SIGNATURE);
@@ -626,7 +646,11 @@ fn write_header_encrypted_stored_archive(
     options: WriterOptions,
     archive_comment: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
-    validate_header_encrypted_archive_options(options, archive_comment.is_some(), false)?;
+    validate_header_encrypted_archive_options(
+        options.target,
+        archive_comment.is_some(),
+        entries.iter().any(|entry| entry.password.is_some()),
+    )?;
     let password = header_encryption_password(entries.iter().map(|entry| entry.password))?;
 
     let mut out = Vec::new();
@@ -644,9 +668,9 @@ fn write_header_encrypted_compressed_archive(
     archive_comment: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
     validate_header_encrypted_archive_options(
-        options,
+        options.target,
         archive_comment.is_some(),
-        options.features.solid,
+        entries.iter().any(|entry| entry.password.is_some()),
     )?;
     let password = header_encryption_password(entries.iter().map(|entry| entry.password))?;
 
@@ -692,7 +716,7 @@ pub fn write_stored_volumes(
     options: WriterOptions,
     max_packed_per_volume: usize,
 ) -> Result<Vec<Vec<u8>>> {
-    validate_stored_writer_options(options, false, false)?;
+    validate_plan(options, PlanShape::new().volumes(true), false, false)?;
     validate_volume_writer_inputs(
         entry.name,
         entry.data,
@@ -774,7 +798,12 @@ fn write_compressed_volumes_impl(
     max_packed_per_volume: usize,
     progress: Option<&WorkTracker<'_>>,
 ) -> Result<Vec<Vec<u8>>> {
-    validate_compressed_writer_options(options, false, false)?;
+    validate_plan(
+        options,
+        PlanShape::new().compressed(true).volumes(true),
+        false,
+        false,
+    )?;
     validate_volume_writer_inputs(
         entry.name,
         entry.data,
@@ -844,148 +873,53 @@ fn report_compression_operation(
     }
 }
 
-fn validate_stored_writer_options(
+/// Everything this writer refuses, in one place, before anything is written.
+///
+/// The three near-identical checks this replaced each built a set of allowed
+/// features out of the target and the request together, compared it with the
+/// request, and on a mismatch said only that some feature was unsupported.
+fn validate_plan(
     options: WriterOptions,
+    shape: PlanShape,
     has_archive_comment: bool,
     has_file_comment: bool,
 ) -> Result<()> {
-    validate_compression_level(options)?;
-    if !matches!(
-        options.target,
-        ArchiveVersion::Rar15
-            | ArchiveVersion::Rar20
-            | ArchiveVersion::Rar29
-            | ArchiveVersion::Rar30
-            | ArchiveVersion::Rar40
-    ) {
+    if options.target.family() != crate::version::ArchiveFamily::Rar15To40 {
         return Err(Error::UnsupportedVersion(options.target));
     }
-    let mut allowed = FeatureSet::store_only();
-    allowed.file_encryption =
-        writer_supports_file_encryption(options.target) && options.features.file_encryption;
-    allowed.header_encryption =
-        writer_supports_header_encryption(options.target) && options.features.header_encryption;
-    allowed.archive_comment = matches!(
-        options.target,
-        ArchiveVersion::Rar15
-            | ArchiveVersion::Rar20
-            | ArchiveVersion::Rar29
-            | ArchiveVersion::Rar30
-            | ArchiveVersion::Rar40
-    ) && has_archive_comment;
-    allowed.file_comment = matches!(
-        options.target,
-        ArchiveVersion::Rar15 | ArchiveVersion::Rar20 | ArchiveVersion::Rar29
-    ) && has_file_comment;
-    if options.features != allowed {
-        return Err(Error::UnsupportedFeature {
-            version: options.target,
-            feature: "RAR 1.5 writer feature",
-        });
+    crate::write_plan::validate_features(options.target, options.features, shape)?;
+    crate::write_plan::validate_compression_level(options.target, options.compression_level)?;
+    let _ = dictionary_flags_for_options(options)?;
+    if has_archive_comment {
+        crate::write_plan::validate_option(options.target, WriterOption::ArchiveComment, shape)?;
+    }
+    if has_file_comment {
+        crate::write_plan::validate_option(options.target, WriterOption::FileComment, shape)?;
     }
     Ok(())
 }
 
-fn validate_compressed_writer_options(
-    options: WriterOptions,
-    has_archive_comment: bool,
-    has_file_comment: bool,
-) -> Result<()> {
-    validate_compression_level(options)?;
-    if !matches!(
-        options.target,
-        ArchiveVersion::Rar15
-            | ArchiveVersion::Rar20
-            | ArchiveVersion::Rar29
-            | ArchiveVersion::Rar30
-            | ArchiveVersion::Rar40
-    ) {
-        return Err(Error::UnsupportedVersion(options.target));
-    }
-    let mut allowed = FeatureSet::store_only();
-    allowed.solid = matches!(
-        options.target,
-        ArchiveVersion::Rar15
-            | ArchiveVersion::Rar20
-            | ArchiveVersion::Rar29
-            | ArchiveVersion::Rar30
-            | ArchiveVersion::Rar40
-    ) && options.features.solid;
-    allowed.file_encryption =
-        writer_supports_file_encryption(options.target) && options.features.file_encryption;
-    allowed.header_encryption =
-        writer_supports_header_encryption(options.target) && options.features.header_encryption;
-    allowed.archive_comment = matches!(
-        options.target,
-        ArchiveVersion::Rar15
-            | ArchiveVersion::Rar20
-            | ArchiveVersion::Rar29
-            | ArchiveVersion::Rar30
-            | ArchiveVersion::Rar40
-    ) && has_archive_comment;
-    allowed.file_comment = matches!(
-        options.target,
-        ArchiveVersion::Rar15 | ArchiveVersion::Rar20 | ArchiveVersion::Rar29
-    ) && has_file_comment;
-    if options.features != allowed {
-        return Err(Error::UnsupportedFeature {
-            version: options.target,
-            feature: "RAR 1.5 writer feature",
-        });
-    }
-    Ok(())
-}
-
-fn validate_rar29_filtered_writer_options(options: WriterOptions) -> Result<()> {
-    validate_compression_level(options)?;
-    if !matches!(
-        options.target,
-        ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
-    ) {
-        return Err(Error::UnsupportedVersion(options.target));
-    }
-    let mut allowed = FeatureSet::store_only();
-    allowed.solid = options.features.solid;
-    allowed.file_encryption =
-        writer_supports_file_encryption(options.target) && options.features.file_encryption;
-    allowed.header_encryption =
-        writer_supports_header_encryption(options.target) && options.features.header_encryption;
-    if options.features != allowed {
-        return Err(Error::UnsupportedFeature {
-            version: options.target,
-            feature: "RAR 2.9 RARVM-filtered compressed writer feature",
-        });
-    }
-    Ok(())
-}
-
+/// Cross-flag rules: relations between options rather than per-option
+/// capability, so they are checked after the capability table has had its say.
 fn validate_header_encrypted_archive_options(
-    options: WriterOptions,
+    target: ArchiveVersion,
     has_archive_comment: bool,
-    _solid: bool,
+    has_password: bool,
 ) -> Result<()> {
     if has_archive_comment {
-        return Err(Error::UnsupportedFeature {
-            version: options.target,
-            feature: "RAR 3.x header-encrypted archive comments",
+        return Err(Error::UnsupportedWriterOption {
+            target,
+            option: WriterOption::ArchiveComment,
+            because: Some("with header encryption"),
         });
     }
-    if !options.features.file_encryption {
-        return Err(Error::UnsupportedFeature {
-            version: options.target,
-            feature: "RAR 3.x header encryption without file encryption",
+    if !has_password {
+        return Err(Error::UnsupportedWriterOption {
+            target,
+            option: WriterOption::Feature(crate::Feature::HeaderEncryption),
+            because: Some("without a password"),
         });
     }
-    Ok(())
-}
-
-fn validate_compression_level(options: WriterOptions) -> Result<()> {
-    if matches!(options.compression_level, Some(level) if level > 5) {
-        return Err(Error::InvalidHeader(
-            "RAR compression level must be in the range 0..5",
-        ));
-    }
-    let _ = dictionary_flags_for_options(options)?;
     Ok(())
 }
 
@@ -1438,10 +1372,6 @@ fn writer_supports_file_encryption(target: ArchiveVersion) -> bool {
             | ArchiveVersion::Rar30
             | ArchiveVersion::Rar40
     )
-}
-
-fn writer_supports_header_encryption(target: ArchiveVersion) -> bool {
-    matches!(target, ArchiveVersion::Rar30 | ArchiveVersion::Rar40)
 }
 
 fn header_encryption_password<'a>(
@@ -1995,23 +1925,7 @@ fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
 }
 
 fn write_header_encrypted_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
-    validate_header_encrypted_archive_options(
-        WriterOptions {
-            target: entry.target,
-            features: {
-                let mut features = FeatureSet::store_only();
-                features.file_encryption = entry.password.is_some();
-                features.header_encryption = true;
-                features.solid = entry.main_flags & MHD_SOLID != 0;
-                features
-            },
-            compression_level: None,
-            dictionary_size: None,
-            method: Rar29Method::Auto,
-        },
-        false,
-        entry.main_flags & MHD_SOLID != 0,
-    )?;
+    validate_header_encrypted_archive_options(entry.target, false, entry.password.is_some())?;
     let password = entry.password.ok_or(Error::NeedPassword)?;
     if entry.max_packed_per_volume == 0 {
         return Err(Error::InvalidHeader(

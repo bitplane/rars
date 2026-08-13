@@ -29,17 +29,19 @@ mod source;
 mod streaming;
 pub mod version;
 mod volume_extract;
+pub mod write_plan;
 mod write_progress;
 mod x86_filter_scan;
 
 pub use detect::{detect_archive_family, find_archive_start, ArchiveSignature, SFX_SCAN_LIMIT};
 pub use error::{Error, Result};
-pub use features::FeatureSet;
+pub use features::{Feature, FeatureSet};
 pub use filter::{FilterKind, FilterPolicy, FilterSpec, UnsupportedFilterKind};
 use std::io::{Read, Write};
 use std::path::Path;
 pub use streaming::{EntryReader, EntrySource, WriterResources, DEFAULT_WRITER_MEMORY_LIMIT};
 pub use version::{ArchiveFamily, ArchiveVersion};
+pub use write_plan::{formats_supporting, supported_features, supports, PlanShape, WriterOption};
 pub use write_progress::{WriteOperation, WriteProgress, WriteProgressEvent};
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1101,8 +1103,7 @@ mod tests {
 
     #[test]
     fn archive_members_exposes_rar15_40_common_metadata_and_typed_detail() {
-        let mut features = FeatureSet::store_only();
-        features.file_comment = true;
+        let features = FeatureSet::store_only();
         let payload = b"rar 2.9 member metadata ".repeat(32);
         let bytes = rar15_40::write_compressed_archive(
             &[rar15_40::FileEntry {
@@ -1401,8 +1402,7 @@ mod tests {
     #[test]
     fn direct_writer_creates_rar29_encrypted_e8_filtered_compressed_archive() {
         let payload = b"\xe8\0\0\0\0facade rar29 encrypted e8 payload\n".repeat(12);
-        let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
+        let features = FeatureSet::store_only();
         let bytes = write_rar29_filter(
             rar15_options_with_features(ArchiveVersion::Rar29, features),
             &[rar15_40::FileEntry {
@@ -1435,7 +1435,6 @@ mod tests {
     fn direct_writer_creates_rar30_header_encrypted_e8_filtered_compressed_archive() {
         let payload = b"\xe8\0\0\0\0facade rar30 header encrypted e8 payload\n".repeat(12);
         let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
         features.header_encryption = true;
         let bytes = write_rar29_filter(
             rar15_options_with_features(ArchiveVersion::Rar30, features),
@@ -1842,8 +1841,7 @@ mod tests {
 
     #[test]
     fn direct_writer_creates_rar15_archive_comment() {
-        let mut features = FeatureSet::store_only();
-        features.archive_comment = true;
+        let features = FeatureSet::store_only();
         let bytes = rar15_40::write_compressed_archive_with_comment(
             &[rar15_40::FileEntry {
                 name: b"commented.txt",
@@ -1873,8 +1871,7 @@ mod tests {
 
     #[test]
     fn direct_writer_creates_rar15_file_comment() {
-        let mut features = FeatureSet::store_only();
-        features.file_comment = true;
+        let features = FeatureSet::store_only();
         let bytes = rar15_40::write_stored_archive(
             &[rar15_40::StoredEntry {
                 name: b"file-comment.txt",
@@ -1904,8 +1901,7 @@ mod tests {
 
     #[test]
     fn direct_writer_creates_rar20_old_style_comments() {
-        let mut archive_features = FeatureSet::store_only();
-        archive_features.archive_comment = true;
+        let archive_features = FeatureSet::store_only();
         let bytes = rar15_40::write_compressed_archive_with_comment(
             &[rar15_40::FileEntry {
                 name: b"rar20-commented.txt",
@@ -1928,8 +1924,7 @@ mod tests {
             Some(b"facade rar20 archive note".as_slice())
         );
 
-        let mut file_features = FeatureSet::store_only();
-        file_features.file_comment = true;
+        let file_features = FeatureSet::store_only();
         let bytes = rar15_40::write_compressed_archive(
             &[rar15_40::FileEntry {
                 name: b"rar20-file-commented.txt",
@@ -1955,8 +1950,7 @@ mod tests {
 
     #[test]
     fn direct_writer_creates_rar29_old_style_comments() {
-        let mut archive_features = FeatureSet::store_only();
-        archive_features.archive_comment = true;
+        let archive_features = FeatureSet::store_only();
         let bytes = rar15_40::write_compressed_archive_with_comment(
             &[rar15_40::FileEntry {
                 name: b"rar29-commented.txt",
@@ -1979,8 +1973,7 @@ mod tests {
             Some(b"facade rar29 archive note".as_slice())
         );
 
-        let mut file_features = FeatureSet::store_only();
-        file_features.file_comment = true;
+        let file_features = FeatureSet::store_only();
         let bytes = rar15_40::write_compressed_archive(
             &[rar15_40::FileEntry {
                 name: b"rar29-file-commented.txt",
@@ -2006,8 +1999,7 @@ mod tests {
 
     #[test]
     fn direct_writer_creates_rar30_newsub_archive_comment() {
-        let mut features = FeatureSet::store_only();
-        features.archive_comment = true;
+        let features = FeatureSet::store_only();
         let bytes = rar15_40::write_compressed_archive_with_comment(
             &[rar15_40::FileEntry {
                 name: b"rar30-commented.txt",
@@ -2072,8 +2064,7 @@ mod tests {
 
     #[test]
     fn direct_writer_creates_rar15_encrypted_compressed_archive() {
-        let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
+        let features = FeatureSet::store_only();
         let bytes = rar15_40::write_compressed_archive(
             &[rar15_40::FileEntry {
                 name: b"secret.txt",
@@ -2185,8 +2176,7 @@ mod tests {
 
     #[test]
     fn direct_writer_creates_rar29_encrypted_compressed_volumes() {
-        let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
+        let features = FeatureSet::store_only();
         let parts = rar15_40::write_compressed_volumes(
             rar15_40::FileEntry {
                 name: b"split-rar29-secret.txt",
@@ -2220,8 +2210,7 @@ mod tests {
 
     #[test]
     fn direct_writer_creates_rar15_encrypted_compressed_volumes() {
-        let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
+        let features = FeatureSet::store_only();
         let parts = rar15_40::write_compressed_volumes(
             rar15_40::FileEntry {
                 name: b"split-secret.txt",
@@ -2255,8 +2244,7 @@ mod tests {
 
     #[test]
     fn direct_writer_creates_rar30_encrypted_compressed_volumes() {
-        let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
+        let features = FeatureSet::store_only();
         let parts = rar15_40::write_compressed_volumes(
             rar15_40::FileEntry {
                 name: b"split-rar30-secret.txt",
@@ -2291,7 +2279,6 @@ mod tests {
     #[test]
     fn direct_writer_creates_rar30_header_encrypted_compressed_volumes() {
         let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
         features.header_encryption = true;
         let parts = rar15_40::write_compressed_volumes(
             rar15_40::FileEntry {
@@ -2326,8 +2313,7 @@ mod tests {
 
     #[test]
     fn direct_writer_creates_rar30_aes_encrypted_compressed_archive() {
-        let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
+        let features = FeatureSet::store_only();
         let bytes = rar15_40::write_compressed_archive(
             &[rar15_40::FileEntry {
                 name: b"rar30-secret.txt",
@@ -2353,8 +2339,7 @@ mod tests {
 
     #[test]
     fn direct_writer_creates_rar29_aes_encrypted_compressed_archive() {
-        let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
+        let features = FeatureSet::store_only();
         let bytes = rar15_40::write_compressed_archive(
             &[rar15_40::FileEntry {
                 name: b"rar29-secret.txt",
@@ -2385,8 +2370,7 @@ mod tests {
 
     #[test]
     fn direct_writer_creates_rar20_encrypted_compressed_archive() {
-        let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
+        let features = FeatureSet::store_only();
         let bytes = rar15_40::write_compressed_archive(
             &[rar15_40::FileEntry {
                 name: b"rar20-secret.txt",
@@ -2420,7 +2404,6 @@ mod tests {
     #[test]
     fn direct_writer_creates_rar30_header_encrypted_compressed_archive() {
         let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
         features.header_encryption = true;
         let bytes = rar15_40::write_compressed_archive(
             &[rar15_40::FileEntry {
@@ -2458,7 +2441,6 @@ mod tests {
     #[test]
     fn direct_writer_creates_rar30_solid_header_encrypted_compressed_archive() {
         let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
         features.header_encryption = true;
         features.solid = true;
         let bytes = rar15_40::write_compressed_archive(
@@ -2673,8 +2655,7 @@ mod tests {
 
     #[test]
     fn direct_writer_creates_rar50_stored_archive_with_comment_service() {
-        let mut features = FeatureSet::store_only();
-        features.archive_comment = true;
+        let features = FeatureSet::store_only();
         let bytes =
             rar50::Rar50Writer::new(rar50_options_with_features(ArchiveVersion::Rar50, features))
                 .stored_entries(&[rar50::StoredEntry {
@@ -2741,9 +2722,7 @@ mod tests {
             data: b"facade encrypted rar5 file comment\n",
             password: b"password",
         }];
-        let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
-        features.file_comment = true;
+        let features = FeatureSet::store_only();
         let bytes =
             rar50::Rar50Writer::new(rar50_options_with_features(ArchiveVersion::Rar50, features))
                 .encrypted_stored_entries_with_services(&[
@@ -2785,9 +2764,7 @@ mod tests {
             password: b"password",
         }];
         let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
         features.header_encryption = true;
-        features.file_comment = true;
         let bytes =
             rar50::Rar50Writer::new(rar50_options_with_features(ArchiveVersion::Rar50, features))
                 .encrypted_stored_entries_with_services(&[
@@ -2901,8 +2878,7 @@ mod tests {
 
     #[test]
     fn direct_writer_creates_rar50_stored_archive_with_recovery_service() {
-        let mut features = FeatureSet::store_only();
-        features.recovery_record = true;
+        let features = FeatureSet::store_only();
         let bytes =
             rar50::Rar50Writer::new(rar50_options_with_features(ArchiveVersion::Rar50, features))
                 .stored_entries(&[rar50::StoredEntry {
@@ -2929,8 +2905,7 @@ mod tests {
 
     #[test]
     fn archive_facade_repairs_rar50_inline_recovery_damage() {
-        let mut features = FeatureSet::store_only();
-        features.recovery_record = true;
+        let features = FeatureSet::store_only();
         let payload = b"facade rar5 repair payload\n".repeat(64);
         let bytes =
             rar50::Rar50Writer::new(rar50_options_with_features(ArchiveVersion::Rar50, features))
@@ -3037,8 +3012,7 @@ mod tests {
 
     #[test]
     fn direct_writer_creates_rar50_compressed_archive_with_recovery_service() {
-        let mut features = FeatureSet::store_only();
-        features.recovery_record = true;
+        let features = FeatureSet::store_only();
         let payload = b"facade rar5 compressed recovery payload repeated repeated\n".repeat(8);
         let bytes =
             rar50::Rar50Writer::new(rar50_options_with_features(ArchiveVersion::Rar50, features))
@@ -3121,8 +3095,7 @@ mod tests {
     #[test]
     fn direct_writer_creates_rar50_compressed_archive_with_comment() {
         let payload = b"facade rar5 compressed archive comment payload repeated\n".repeat(8);
-        let mut features = FeatureSet::store_only();
-        features.archive_comment = true;
+        let features = FeatureSet::store_only();
         let bytes =
             rar50::Rar50Writer::new(rar50_options_with_features(ArchiveVersion::Rar50, features))
                 .compressed_entries(&[rar50::CompressedEntry {
@@ -3146,8 +3119,7 @@ mod tests {
 
     #[test]
     fn direct_writer_creates_rar70_encrypted_stored_archive_with_metadata() {
-        let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
+        let features = FeatureSet::store_only();
         let bytes =
             rar50::Rar50Writer::new(rar50_options_with_features(ArchiveVersion::Rar70, features))
                 .encrypted_stored_entries(&[rar50::EncryptedStoredEntry {
@@ -3180,8 +3152,7 @@ mod tests {
 
     #[test]
     fn direct_writer_creates_rar70_encrypted_compressed_archive_with_metadata() {
-        let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
+        let features = FeatureSet::store_only();
         let payload = b"facade rar7 encrypted compressed metadata payload repeated\n".repeat(8);
         let bytes =
             rar50::Rar50Writer::new(rar50_options_with_features(ArchiveVersion::Rar70, features))
@@ -3213,7 +3184,6 @@ mod tests {
     #[test]
     fn direct_writer_creates_rar70_header_encrypted_stored_archive_with_metadata() {
         let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
         features.header_encryption = true;
         let bytes =
             rar50::Rar50Writer::new(rar50_options_with_features(ArchiveVersion::Rar70, features))
@@ -3256,7 +3226,6 @@ mod tests {
     #[test]
     fn direct_writer_creates_rar70_header_encrypted_compressed_archive_with_metadata() {
         let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
         features.header_encryption = true;
         let payload =
             b"facade rar7 header encrypted compressed metadata payload repeated\n".repeat(8);
@@ -3297,8 +3266,7 @@ mod tests {
 
     #[test]
     fn direct_writer_creates_rar50_encrypted_stored_archive() {
-        let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
+        let features = FeatureSet::store_only();
         let bytes =
             rar50::Rar50Writer::new(rar50_options_with_features(ArchiveVersion::Rar50, features))
                 .encrypted_stored_entries(&[rar50::EncryptedStoredEntry {
@@ -3328,8 +3296,7 @@ mod tests {
 
     #[test]
     fn direct_writer_creates_rar50_encrypted_compressed_archive() {
-        let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
+        let features = FeatureSet::store_only();
         let payload = b"facade rar5 encrypted compressed\n".repeat(16);
         let bytes =
             rar50::Rar50Writer::new(rar50_options_with_features(ArchiveVersion::Rar50, features))
@@ -3356,7 +3323,6 @@ mod tests {
     #[test]
     fn direct_writer_creates_rar50_encrypted_solid_compressed_archive() {
         let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
         features.solid = true;
         let first = b"facade rar50 encrypted solid shared phrase alpha beta gamma\n".repeat(12);
         let second =
@@ -3399,7 +3365,6 @@ mod tests {
     #[test]
     fn direct_writer_creates_rar50_header_encrypted_compressed_archive() {
         let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
         features.header_encryption = true;
         let bytes = rar50::Rar50Writer::new(rar50_options_with_features(ArchiveVersion::Rar50, features))
             .encrypted_compressed_entries(&[rar50::EncryptedCompressedEntry {
@@ -3436,7 +3401,6 @@ mod tests {
     #[test]
     fn direct_writer_creates_rar50_header_encrypted_solid_compressed_archive() {
         let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
         features.header_encryption = true;
         features.solid = true;
         let first =
@@ -3489,9 +3453,7 @@ mod tests {
 
     #[test]
     fn direct_writer_creates_rar50_encrypted_stored_archive_with_comment() {
-        let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
-        features.archive_comment = true;
+        let features = FeatureSet::store_only();
         let bytes =
             rar50::Rar50Writer::new(rar50_options_with_features(ArchiveVersion::Rar50, features))
                 .encrypted_stored_entries(&[rar50::EncryptedStoredEntry {
@@ -3524,9 +3486,7 @@ mod tests {
     #[test]
     fn direct_writer_creates_rar50_encrypted_compressed_archive_with_comment() {
         let payload = b"facade rar5 encrypted compressed comment payload\n".repeat(8);
-        let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
-        features.archive_comment = true;
+        let features = FeatureSet::store_only();
         let bytes =
             rar50::Rar50Writer::new(rar50_options_with_features(ArchiveVersion::Rar50, features))
                 .encrypted_compressed_entries(&[rar50::EncryptedCompressedEntry {
@@ -3559,7 +3519,6 @@ mod tests {
     #[test]
     fn direct_writer_creates_rar50_header_encrypted_stored_archive() {
         let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
         features.header_encryption = true;
         let bytes =
             rar50::Rar50Writer::new(rar50_options_with_features(ArchiveVersion::Rar50, features))
@@ -3597,9 +3556,7 @@ mod tests {
     #[test]
     fn direct_writer_creates_rar50_header_encrypted_stored_archive_with_comment() {
         let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
         features.header_encryption = true;
-        features.archive_comment = true;
         let bytes =
             rar50::Rar50Writer::new(rar50_options_with_features(ArchiveVersion::Rar50, features))
                 .encrypted_stored_entries(&[rar50::EncryptedStoredEntry {
@@ -3636,9 +3593,7 @@ mod tests {
     fn direct_writer_creates_rar50_header_encrypted_compressed_archive_with_comment() {
         let payload = b"facade rar5 header encrypted compressed comment payload\n".repeat(8);
         let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
         features.header_encryption = true;
-        features.archive_comment = true;
         let bytes =
             rar50::Rar50Writer::new(rar50_options_with_features(ArchiveVersion::Rar50, features))
                 .encrypted_compressed_entries(&[rar50::EncryptedCompressedEntry {
@@ -3673,9 +3628,7 @@ mod tests {
 
     #[test]
     fn direct_writer_creates_rar50_encrypted_stored_archive_with_recovery() {
-        let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
-        features.recovery_record = true;
+        let features = FeatureSet::store_only();
         let bytes =
             rar50::Rar50Writer::new(rar50_options_with_features(ArchiveVersion::Rar50, features))
                 .encrypted_stored_entries(&[rar50::EncryptedStoredEntry {
@@ -3716,9 +3669,7 @@ mod tests {
 
     #[test]
     fn direct_writer_creates_rar50_encrypted_compressed_archive_with_recovery() {
-        let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
-        features.recovery_record = true;
+        let features = FeatureSet::store_only();
         let payload = b"facade rar5 encrypted compressed recovery payload repeated\n".repeat(8);
         let bytes =
             rar50::Rar50Writer::new(rar50_options_with_features(ArchiveVersion::Rar50, features))
@@ -3751,9 +3702,7 @@ mod tests {
     #[test]
     fn direct_writer_creates_rar50_header_encrypted_stored_archive_with_recovery() {
         let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
         features.header_encryption = true;
-        features.recovery_record = true;
         let bytes =
             rar50::Rar50Writer::new(rar50_options_with_features(ArchiveVersion::Rar50, features))
                 .encrypted_stored_entries(&[rar50::EncryptedStoredEntry {
@@ -3800,9 +3749,7 @@ mod tests {
     #[test]
     fn direct_writer_creates_rar50_header_encrypted_compressed_archive_with_recovery() {
         let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
         features.header_encryption = true;
-        features.recovery_record = true;
         let payload =
             b"facade rar5 header encrypted compressed recovery payload repeated\n".repeat(8);
         let bytes =
@@ -3840,8 +3787,7 @@ mod tests {
 
     #[test]
     fn direct_writer_creates_rar50_encrypted_stored_volumes() {
-        let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
+        let features = FeatureSet::store_only();
         let payload = b"facade rar5 encrypted split payload\n".repeat(12);
         let parts = rar50::Rar50VolumeWriter::new(rar50_options_with_features(
             ArchiveVersion::Rar50,
@@ -3870,9 +3816,7 @@ mod tests {
 
     #[test]
     fn direct_writer_creates_rar50_encrypted_stored_volumes_with_recovery() {
-        let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
-        features.recovery_record = true;
+        let features = FeatureSet::store_only();
         let payload = b"facade rar5 encrypted recovery split payload\n".repeat(12);
         let parts = rar50::Rar50VolumeWriter::new(rar50_options_with_features(
             ArchiveVersion::Rar50,
@@ -3904,9 +3848,7 @@ mod tests {
     #[test]
     fn direct_writer_creates_rar50_header_encrypted_stored_volumes_with_recovery() {
         let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
         features.header_encryption = true;
-        features.recovery_record = true;
         let payload = b"facade rar5 header encrypted recovery split payload\n".repeat(4);
         let parts = rar50::Rar50VolumeWriter::new(rar50_options_with_features(
             ArchiveVersion::Rar50,
@@ -3942,7 +3884,6 @@ mod tests {
     #[test]
     fn direct_writer_creates_rar50_header_encrypted_stored_volumes() {
         let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
         features.header_encryption = true;
         let payload = b"facade rar5 header encrypted split payload\n".repeat(12);
         let parts = rar50::Rar50VolumeWriter::new(rar50_options_with_features(
@@ -3976,8 +3917,7 @@ mod tests {
 
     #[test]
     fn direct_writer_creates_rar50_encrypted_compressed_volumes() {
-        let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
+        let features = FeatureSet::store_only();
         let payload = b"facade rar5 encrypted compressed split payload\n".repeat(12);
         let parts = rar50::Rar50VolumeWriter::new(rar50_options_with_features(
             ArchiveVersion::Rar50,
@@ -4006,9 +3946,7 @@ mod tests {
 
     #[test]
     fn direct_writer_creates_rar50_encrypted_compressed_volumes_with_recovery() {
-        let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
-        features.recovery_record = true;
+        let features = FeatureSet::store_only();
         let payload = b"facade rar5 encrypted compressed recovery split payload\n".repeat(12);
         let entries = [rar50::EncryptedCompressedEntry {
             name: b"split-secret-compressed50-rr.txt",
@@ -4041,9 +3979,7 @@ mod tests {
     #[test]
     fn direct_writer_creates_rar50_header_encrypted_compressed_volumes_with_recovery() {
         let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
         features.header_encryption = true;
-        features.recovery_record = true;
         let payload =
             b"facade rar5 header encrypted compressed recovery split payload\n".repeat(12);
         let entries = [rar50::EncryptedCompressedEntry {
@@ -4084,7 +4020,6 @@ mod tests {
     #[test]
     fn direct_writer_creates_rar50_encrypted_solid_compressed_volumes() {
         let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
         features.solid = true;
         let payload = b"facade rar5 encrypted solid compressed split payload\n".repeat(12);
         let parts = rar50::Rar50VolumeWriter::new(rar50_options_with_features(
@@ -4116,7 +4051,6 @@ mod tests {
     #[test]
     fn direct_writer_creates_rar50_header_encrypted_compressed_volumes() {
         let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
         features.header_encryption = true;
         let payload: Vec<u8> = (0..512).map(|index| (index * 37 + 11) as u8).collect();
         let parts = rar50::Rar50VolumeWriter::new(rar50_options_with_features(
@@ -4151,7 +4085,6 @@ mod tests {
     #[test]
     fn direct_writer_creates_rar50_header_encrypted_solid_compressed_volumes() {
         let mut features = FeatureSet::store_only();
-        features.file_encryption = true;
         features.header_encryption = true;
         features.solid = true;
         let payload = b"facade rar5 header encrypted solid compressed split payload\n".repeat(12);
@@ -4214,8 +4147,7 @@ mod tests {
 
     #[test]
     fn direct_writer_creates_rar50_stored_volumes_with_recovery() {
-        let mut features = FeatureSet::store_only();
-        features.recovery_record = true;
+        let features = FeatureSet::store_only();
         let payload = b"facade rar5 stored recovery split payload\n".repeat(20);
         let parts = rar50::Rar50VolumeWriter::new(rar50_options_with_features(
             ArchiveVersion::Rar50,
@@ -4269,8 +4201,7 @@ mod tests {
 
     #[test]
     fn direct_writer_creates_rar50_compressed_volumes_with_recovery() {
-        let mut features = FeatureSet::store_only();
-        features.recovery_record = true;
+        let features = FeatureSet::store_only();
         let payload: Vec<u8> = (0..512).map(|index| (index * 53 + 17) as u8).collect();
         let entries = [rar50::CompressedEntry {
             name: b"split-compressed50-rr.txt",

@@ -1899,8 +1899,7 @@ mod tests {
 
     fn build_archive_with_optional_comment(comment: Option<&[u8]>) -> Archive {
         use crate::FeatureSet;
-        let mut features = FeatureSet::store_only();
-        features.archive_comment = comment.is_some();
+        let features = FeatureSet::store_only();
         let entries = [crate::rar50::StoredEntry {
             name: b"payload.txt",
             data: b"payload bytes",
@@ -1952,8 +1951,7 @@ mod tests {
             },
             services: &services,
         };
-        let mut features = FeatureSet::store_only();
-        features.file_comment = true;
+        let features = FeatureSet::store_only();
         let bytes = crate::rar50::Rar50Writer::new(crate::rar50::WriterOptions::new(
             crate::version::ArchiveVersion::Rar50,
             features,
