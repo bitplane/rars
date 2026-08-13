@@ -1432,18 +1432,14 @@ fn writer_file_flags(
     flags
 }
 
+/// Builds the comment block that goes inside a file header.
+///
+/// RAR 1.3 and 1.4 wrote a bare size and the text, and this writer used to copy
+/// that. From 1.5 on it is the same comment block the archive comment uses,
+/// covered by the file header's size but not by its CRC.
 fn encode_file_comment(comment: Option<&[u8]>) -> Result<Vec<u8>> {
-    let Some(comment) = comment else {
-        return Ok(Vec::new());
-    };
-    if comment.len() > u16::MAX as usize {
-        return Err(Error::InvalidHeader(
-            "RAR 1.5 file comment is longer than 65535 bytes",
-        ));
-    }
-    let mut out = Vec::with_capacity(2 + comment.len());
-    out.extend_from_slice(&(comment.len() as u16).to_le_bytes());
-    out.extend_from_slice(comment);
+    let mut out = Vec::new();
+    write_comment_header(&mut out, comment)?;
     Ok(out)
 }
 
@@ -1568,7 +1564,7 @@ fn write_comment_header(out: &mut Vec<u8>, comment: Option<&[u8]>) -> Result<()>
         return Ok(());
     };
     let unp_size = u16::try_from(comment.len())
-        .map_err(|_| Error::InvalidHeader("RAR 1.5 archive comment is too long"))?;
+        .map_err(|_| Error::InvalidHeader("RAR 1.5 comment is longer than 65535 bytes"))?;
     let head_size = 13usize
         .checked_add(comment.len())
         .ok_or(Error::InvalidHeader(
@@ -1955,7 +1951,11 @@ fn write_header_crc(out: &mut [u8], start: usize) {
 
 fn write_file_header_crc(out: &mut [u8], start: usize, name_len: usize, flags: u16) {
     let end = if flags & FHD_COMMENT != 0 {
-        start + 32 + name_len
+        // Readers stop the CRC where the fields they parse stop, which leaves
+        // out the comment block. Miss the salt out of the range and an
+        // encrypted member with a comment gets a CRC nothing agrees with.
+        let salt_len = if flags & FHD_SALT != 0 { 8 } else { 0 };
+        start + 32 + name_len + salt_len
     } else {
         out.len()
     };

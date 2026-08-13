@@ -42,7 +42,7 @@ fn level_sensitive_payload() -> Vec<u8> {
 }
 
 const RARS_GENERATED_FIXTURE_BYTES: &[(&str, usize, u32)] = &[
-    ("comments.rar", 122, 0x23ef_1c79),
+    ("comments.rar", 133, 0x5694_01c1),
     ("compressed.rar", 87, 0x13ca_0571),
     ("encrypted.rar", 87, 0x04af_0eb7),
     ("solid.rar", 153, 0x8deb_98d1),
@@ -4178,6 +4178,26 @@ fn extracts_rars_generated_rar15_writer_oracles() {
     }
 }
 
+/// Rebuilds `rars_generated/comments.rar` from the writer.
+///
+/// The other oracles in that directory are pinned by size and CRC alone. This
+/// one is pinned byte for byte, because the file comment inside it is the one
+/// piece of the RAR 1.5 header layout the writer got wrong for six releases.
+fn rars_generated_comments_archive() -> Vec<u8> {
+    let entries = [FileEntry {
+        name: b"payload.txt",
+        data: RARS_GENERATED_PAYLOAD,
+        file_time: 0,
+        file_attr: 0x20,
+        host_os: 3,
+        password: None,
+        file_comment: Some(b"file-note"),
+    }];
+    let mut options = WriterOptions::default();
+    options.target = ArchiveVersion::Rar15;
+    write_compressed_archive_with_comment(&entries, options, Some(b"oracle-note")).unwrap()
+}
+
 #[test]
 fn extracts_rars_generated_rar15_comments_and_encryption_oracles() {
     let comment_bytes = std::fs::read(fixture("rars_generated/comments.rar")).unwrap();
@@ -4195,6 +4215,7 @@ fn extracts_rars_generated_rar15_comments_and_encryption_oracles() {
         collect_extract(&comment_archive).unwrap()[0].data,
         RARS_GENERATED_PAYLOAD
     );
+    assert_eq!(comment_bytes, rars_generated_comments_archive());
 
     let encrypted_bytes = std::fs::read(fixture("rars_generated/encrypted.rar")).unwrap();
     let encrypted_archive = Archive::parse(&encrypted_bytes).unwrap();
@@ -4323,6 +4344,88 @@ fn parses_rar202_main_header_with_embedded_comment_subblock() {
     assert_eq!(files[0].unp_ver, 20);
     assert_eq!(files[1].unp_ver, 20);
     assert!(files.iter().all(|file| file.block.flags & 0x0008 != 0));
+}
+
+#[test]
+fn reads_rar202_comments_written_by_winrar() {
+    let bytes = std::fs::read(fixture("rar202/comment_nopsw.rar")).unwrap();
+    let archive = Archive::parse(&bytes).unwrap();
+
+    // Nested in the main header and compressed with the RAR 2.0 codec, which
+    // is two reasons this one went unread until 0.7.
+    assert_eq!(
+        archive.archive_comment().unwrap().as_deref(),
+        Some(&b"RARcomment"[..])
+    );
+
+    let files: Vec<_> = archive.files().collect();
+    assert_eq!(
+        files[0].file_comment().unwrap().as_deref(),
+        Some(&b"file1comment"[..])
+    );
+    assert_eq!(
+        files[1].file_comment().unwrap().as_deref(),
+        Some(&b"file2comment"[..])
+    );
+}
+
+#[test]
+fn a_written_file_comment_matches_the_block_winrar_writes() {
+    let winrar = std::fs::read(fixture("rar202/comment_nopsw.rar")).unwrap();
+    let entries = [StoredEntry {
+        name: b"FILE1.TXT",
+        data: b"file1\r\n",
+        file_time: 0,
+        file_attr: 0x20,
+        host_os: 0,
+        password: None,
+        file_comment: Some(b"file1comment"),
+    }];
+    let mut options = WriterOptions::default();
+    options.target = ArchiveVersion::Rar20;
+    let bytes = write_stored_archive(&entries, options).unwrap();
+
+    // WinRAR 2.02 puts the block last in the header, after a 9 byte name.
+    let expected = &winrar[0x3a + 41..0x3a + 66];
+    assert!(
+        bytes
+            .windows(expected.len())
+            .any(|window| window == expected),
+        "written header has no comment block matching {expected:02x?}"
+    );
+}
+
+#[test]
+fn an_encrypted_member_with_a_comment_keeps_its_header_checksum() {
+    // The comment sits outside the header CRC, the salt inside it. Reading the
+    // salt as part of the comment cost eight bytes of coverage and left an
+    // archive this reader would not parse.
+    for target in [
+        ArchiveVersion::Rar15,
+        ArchiveVersion::Rar20,
+        ArchiveVersion::Rar29,
+    ] {
+        let entries = [FileEntry {
+            name: b"secret.txt",
+            data: b"salted and commented\n",
+            file_time: 0,
+            file_attr: 0x20,
+            host_os: 3,
+            password: Some(b"pw"),
+            file_comment: Some(b"note"),
+        }];
+        let mut options = WriterOptions::default();
+        options.target = target;
+        let bytes = write_compressed_archive(&entries, options).unwrap();
+
+        let archive = Archive::parse(&bytes).unwrap_or_else(|err| panic!("{target:?}: {err}"));
+        let file = archive.files().next().unwrap();
+        assert_eq!(file.file_comment().unwrap().as_deref(), Some(&b"note"[..]));
+        assert_eq!(
+            collect_extract_with_password(&archive, Some(b"pw")).unwrap()[0].data,
+            b"salted and commented\n"
+        );
+    }
 }
 
 #[test]
@@ -6484,9 +6587,7 @@ fn a_solid_rar15_run_survives_a_member_that_does_not_compress() {
     // Incompressible, and past the 1 KiB floor, so the store fallback wants it.
     let incompressible: Vec<u8> = (0..90_000u32)
         .map(|index| {
-            let mixed = index
-                .wrapping_mul(2_654_435_761)
-                .rotate_left(index % 17);
+            let mixed = index.wrapping_mul(2_654_435_761).rotate_left(index % 17);
             (mixed >> 13) as u8
         })
         .collect();
@@ -6525,9 +6626,7 @@ fn an_empty_member_does_not_restart_a_broken_solid_chain() {
     let opener = b"a short opening member\n".repeat(3);
     let incompressible: Vec<u8> = (0..40_000u32)
         .map(|index| {
-            let mixed = index
-                .wrapping_mul(0x9e37_79b9)
-                .rotate_left(index % 23);
+            let mixed = index.wrapping_mul(0x9e37_79b9).rotate_left(index % 23);
             (mixed >> 11) as u8
         })
         .collect();

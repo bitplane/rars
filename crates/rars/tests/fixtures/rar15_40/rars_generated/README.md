@@ -8,3 +8,8 @@ public-reader behavior. The spec-repo originals live under
 their SHA-256 table.
 
 Password for encrypted fixtures: `pass`.
+
+`comments.rar` was regenerated for 0.7. Its file comment used to be a bare size
+and text, which is the RAR 1.3 layout and wrong from RAR 1.5 on; it is now the
+comment block WinRAR writes. The spec-repo copy and its SHA-256 entry need the
+same replacement.

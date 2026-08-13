@@ -62,6 +62,11 @@ const FHD_SALT: u16 = 0x0400;
 const FHD_EXTTIME: u16 = 0x1000;
 const FHD_DIRECTORY_MASK: u16 = 0x00e0;
 
+/// Bytes in a comment block before its data starts.
+const COMMENT_HEADER_SIZE: usize = 13;
+/// Bytes in a main header before a nested comment block starts.
+const MAIN_HEADER_SIZE: usize = 13;
+
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Archive {
@@ -387,17 +392,27 @@ impl FileHeader {
         self.block.flags & FHD_COMMENT != 0 && !self.file_comment.is_empty()
     }
 
+    /// Decodes the comment block RAR 1.5 to 2.9 stored inside the file header.
+    ///
+    /// The block is a comment header followed by its data, both covered by the
+    /// file header's size but not by its CRC.
     pub fn file_comment(&self) -> Result<Option<Vec<u8>>> {
         if !self.has_file_comment() {
             return Ok(None);
         }
-        let size = read_u16(&self.file_comment, 0)? as usize;
-        let start = 2usize;
-        let end = start
-            .checked_add(size)
-            .ok_or(Error::InvalidHeader("RAR 1.5 file comment size overflows"))?;
-        let comment = self.file_comment.get(start..end).ok_or(Error::TooShort)?;
-        Ok(Some(comment.to_vec()))
+        let block = parse_block_header(&self.file_comment, 0)?;
+        if block.head_type != COMM_HEAD {
+            return Err(Error::InvalidHeader(
+                "RAR 1.5 file comment is not a comment block",
+            ));
+        }
+        let head_size = block.head_size as usize;
+        let header = parse_comment_header(&self.file_comment, block)?;
+        let packed = self
+            .file_comment
+            .get(COMMENT_HEADER_SIZE..head_size)
+            .ok_or(Error::TooShort)?;
+        header.decode(packed).map(Some)
     }
 
     pub fn is_stored(&self) -> bool {
@@ -858,17 +873,25 @@ impl CommentHeader {
     }
 
     fn unpacked_data(&self, archive: &Archive) -> Result<Vec<u8>> {
+        self.decode(&self.packed_data(archive)?)
+    }
+
+    /// Unpacks comment data and checks it against the header's 16-bit CRC.
+    fn decode(&self, packed: &[u8]) -> Result<Vec<u8>> {
         let target = usize::from(self.unp_size);
         let data = if self.method == 0x30 {
-            let data = self.packed_data(archive)?;
-            if data.len() != target {
+            if packed.len() != target {
                 return Err(Error::InvalidHeader(
                     "RAR 1.5 stored comment has mismatched packed and unpacked sizes",
                 ));
             }
-            data
+            packed.to_vec()
         } else if self.unp_ver == 15 {
-            Unpack15::default().decode_member(&self.packed_data(archive)?, target, false)?
+            Unpack15::default().decode_member(packed, target, false)?
+        } else if self.unp_ver == 20 || self.unp_ver == 26 {
+            let mut data = Vec::new();
+            Unpack20::new().decode_member_from_reader(&mut &packed[..], target, &mut data)?;
+            data
         } else {
             return Err(Error::UnsupportedCompression {
                 family: "RAR 1.5 comment",
@@ -1005,6 +1028,13 @@ impl Archive {
         let main = parse_main_header(archive, &main_block)?;
         let mut pos = main_block.offset + main_block.head_size as usize;
         let mut blocks = Vec::new();
+        if let Some(comment) = nested_main_comment(
+            &archive[main_block.offset..pos],
+            &main_block,
+            sig.offset + main_block.offset,
+        )? {
+            blocks.push(Block::Comment(comment));
+        }
         let mut encrypted_header_ciphers = EncryptedHeaderCipherCache::default();
 
         while pos < archive.len() {
@@ -1109,6 +1139,11 @@ impl Archive {
         let main = parse_main_header(&main_header, &relative_block(&main_block))?;
         let mut pos = main_block.offset + main_block.head_size as usize;
         let mut blocks = Vec::new();
+        if let Some(comment) =
+            nested_main_comment(&main_header, &main_block, sfx_offset + main_block.offset)?
+        {
+            blocks.push(Block::Comment(comment));
+        }
         let mut encrypted_header_ciphers = EncryptedHeaderCipherCache::default();
 
         while (sfx_offset + pos) as u64 + 7 <= file_len {
@@ -1423,6 +1458,49 @@ fn parse_comment_header(input: &[u8], block: BlockHeader) -> Result<CommentHeade
         comment_crc: read_u16(input, start + 11)?,
         packed_range: 0..0,
     })
+}
+
+/// Finds where a comment block starting at `start` ends, or `None` when the
+/// bytes there are not one that fits inside `head_end`.
+///
+/// Old readers skipped what they could not make sense of here rather than
+/// rejecting the file, and a comment is never worth losing a member over.
+fn comment_block_end(input: &[u8], start: usize, head_end: usize) -> Option<usize> {
+    if start + COMMENT_HEADER_SIZE > head_end {
+        return None;
+    }
+    let head_size = read_u16(input, start + 5).ok()? as usize;
+    let end = start.checked_add(head_size)?;
+    (input.get(start + 2) == Some(&COMM_HEAD)
+        && head_size >= COMMENT_HEADER_SIZE
+        && end <= head_end)
+        .then_some(end)
+}
+
+/// Reads the archive comment RAR 1.5 to 2.9 could nest inside the main header.
+///
+/// The main header's size covers the comment block, so the block loop steps
+/// straight over it and this is the only place it can be seen. `main` locates
+/// the main header inside the archive, `main_header` holds its bytes on their
+/// own, and `source_offset` is where those bytes sit in the file.
+fn nested_main_comment(
+    main_header: &[u8],
+    main: &BlockHeader,
+    source_offset: usize,
+) -> Result<Option<CommentHeader>> {
+    if main.flags & MHD_COMMENT == 0 {
+        return Ok(None);
+    }
+    let head_size = main.head_size as usize;
+    let Some(end) = comment_block_end(main_header, MAIN_HEADER_SIZE, head_size) else {
+        return Ok(None);
+    };
+    let block = parse_block_header(main_header, MAIN_HEADER_SIZE)?;
+    let mut comment = parse_comment_header(main_header, block)?;
+    comment.block.offset = main.offset + MAIN_HEADER_SIZE;
+    comment.packed_range =
+        source_offset + MAIN_HEADER_SIZE + COMMENT_HEADER_SIZE..source_offset + end;
+    Ok(Some(comment))
 }
 
 fn parse_protect_header(
@@ -2019,23 +2097,13 @@ fn parse_file_like_header(
     };
 
     let file_comment = if block.flags & FHD_COMMENT != 0 {
-        if pos + 2 <= head_end {
-            let comment_len = read_u16(input, pos)? as usize;
-            let comment_total = comment_len
-                .checked_add(2)
-                .ok_or(Error::InvalidHeader("RAR 1.5 file comment size overflows"))?;
-            let comment_end = pos
-                .checked_add(comment_total)
-                .ok_or(Error::InvalidHeader("RAR 1.5 file comment size overflows"))?;
-            if comment_end <= head_end {
+        match comment_block_end(input, pos, head_end) {
+            Some(comment_end) => {
                 let comment = input[pos..comment_end].to_vec();
                 pos = comment_end;
                 comment
-            } else {
-                Vec::new()
             }
-        } else {
-            Vec::new()
+            None => Vec::new(),
         }
     } else {
         Vec::new()
@@ -2614,15 +2682,30 @@ mod tests {
         assert!(!packed.is_stored());
     }
 
+    /// A stored comment block holding `text`, as it sits inside a file header.
+    fn comment_block(text: &[u8]) -> Vec<u8> {
+        let head_size = (COMMENT_HEADER_SIZE + text.len()) as u16;
+        let mut block = vec![0, 0, COMM_HEAD, 0, 0];
+        block.extend_from_slice(&head_size.to_le_bytes());
+        block.extend_from_slice(&(text.len() as u16).to_le_bytes());
+        block.push(15);
+        block.push(0x30);
+        block.extend_from_slice(&((crc32(text) & 0xffff) as u16).to_le_bytes());
+        block.extend_from_slice(text);
+        let crc = (crc32(&block[2..COMMENT_HEADER_SIZE]) & 0xffff) as u16;
+        block[..2].copy_from_slice(&crc.to_le_bytes());
+        block
+    }
+
     #[test]
-    fn file_header_comment_extracts_payload_after_two_byte_size_prefix() {
+    fn file_header_comment_decodes_the_nested_comment_block() {
         let mut without_flag = file_header_with(0);
-        without_flag.file_comment = vec![3, 0, b'a', b'b', b'c'];
+        without_flag.file_comment = comment_block(b"abc");
         assert!(!without_flag.has_file_comment());
         assert_eq!(without_flag.file_comment().unwrap(), None);
 
         let mut with_flag = file_header_with(FHD_COMMENT);
-        with_flag.file_comment = vec![3, 0, b'h', b'e', b'y'];
+        with_flag.file_comment = comment_block(b"hey");
         assert!(with_flag.has_file_comment());
         assert_eq!(with_flag.file_comment().unwrap().unwrap(), b"hey");
 
@@ -2631,8 +2714,23 @@ mod tests {
         assert!(!empty_flagged.has_file_comment());
 
         let mut truncated = file_header_with(FHD_COMMENT);
-        truncated.file_comment = vec![10, 0, b'a'];
+        truncated.file_comment = comment_block(b"hey");
+        truncated.file_comment.pop();
         assert!(matches!(truncated.file_comment(), Err(Error::TooShort)));
+
+        let mut corrupt = file_header_with(FHD_COMMENT);
+        corrupt.file_comment = comment_block(b"hey");
+        *corrupt.file_comment.last_mut().unwrap() = b'!';
+        assert!(matches!(
+            corrupt.file_comment(),
+            Err(Error::CrcMismatch { .. })
+        ));
+
+        // The bare size and text RAR 1.3 uses, which this writer emitted by
+        // mistake until 0.7.
+        let mut bare_size = file_header_with(FHD_COMMENT);
+        bare_size.file_comment = vec![3, 0, b'h', b'e', b'y'];
+        assert!(bare_size.file_comment().is_err());
     }
 
     #[test]
