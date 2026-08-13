@@ -439,7 +439,7 @@ fn streaming_compress_plan(options: WriterOptions) -> Result<compress::CompressP
         algorithm_version: rar50_algorithm_version(options)?,
         encode_options: encode_options_for_level(options.compression_level, dictionary_size)?,
         dictionary_size,
-        block_size: 1024 * 1024,
+        block_size: crate::codec::rar50::LZ_BLOCK_SIZE,
         solid: options.features.solid,
         method: compression_method_for_level(options.compression_level)?,
         filter_policy: FilterPolicy::None,

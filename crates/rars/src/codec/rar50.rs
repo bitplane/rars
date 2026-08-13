@@ -17,7 +17,17 @@ const MAX_INITIAL_OUTPUT_CAPACITY: usize = 1024 * 1024;
 const STREAM_FLUSH_THRESHOLD: usize = 64 * 1024;
 const MAX_ENCODER_MATCH_OFFSET: usize = DEFAULT_DICTIONARY_SIZE;
 const MAX_ENCODER_MATCH_LENGTH: usize = 4096;
+/// The largest block the format allows a writer to emit.
 const MAX_COMPRESSED_BLOCK_OUTPUT: usize = 4 * 1024 * 1024;
+/// How much input goes into one compressed block.
+///
+/// Every block carries its own Huffman tables and starts matching afresh, so
+/// smaller blocks cost a little overhead but adapt faster to changes in the
+/// data. A mebibyte measures at least as well as the 4 MiB cap on everything
+/// tried, and it is what the streaming writer uses, so both paths produce the
+/// same blocks for the same input.
+pub(crate) const LZ_BLOCK_SIZE: usize = 1024 * 1024;
+const _: () = assert!(LZ_BLOCK_SIZE <= MAX_COMPRESSED_BLOCK_OUTPUT);
 const MAX_FILTER_BLOCK_LENGTH: usize = 0x3ffff;
 const NICE_MATCH_LENGTH: usize = 512;
 
@@ -806,11 +816,11 @@ fn encode_lz_member_inner(
     options: EncodeOptions,
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<u8>> {
-    if data.len() > MAX_COMPRESSED_BLOCK_OUTPUT && initial_filters.is_empty() {
+    if data.len() > LZ_BLOCK_SIZE && initial_filters.is_empty() {
         let mut out = Vec::new();
         let mut block_history =
             history[history.len().saturating_sub(options.max_match_distance)..].to_vec();
-        let mut chunks = data.chunks(MAX_COMPRESSED_BLOCK_OUTPUT).peekable();
+        let mut chunks = data.chunks(LZ_BLOCK_SIZE).peekable();
         let mut completed = 0usize;
         while let Some(chunk) = chunks.next() {
             let is_last = chunks.peek().is_none();
@@ -3626,7 +3636,7 @@ mod tests {
 
     #[test]
     fn large_lz_members_are_split_into_multiple_compressed_blocks() {
-        let data = vec![0u8; MAX_COMPRESSED_BLOCK_OUTPUT + 1];
+        let data = vec![0u8; LZ_BLOCK_SIZE + 1];
         let encoded = encode_lz_member_with_options(&data, 0, EncodeOptions::new(16)).unwrap();
         let mut cursor = std::io::Cursor::new(encoded.as_slice());
         let first = read_compressed_block(&mut cursor).unwrap();
@@ -3645,14 +3655,11 @@ mod tests {
 
     #[test]
     fn large_filtered_lz_members_split_filter_records_by_block() {
-        let mut data: Vec<_> = (0..MAX_COMPRESSED_BLOCK_OUTPUT + 512)
-            .map(|index| index as u8)
-            .collect();
+        let mut data: Vec<_> = (0..LZ_BLOCK_SIZE + 512).map(|index| index as u8).collect();
         data[256] = 0xe8;
         data[257..261].copy_from_slice(&0x20u32.to_le_bytes());
-        data[MAX_COMPRESSED_BLOCK_OUTPUT + 64] = 0xe8;
-        data[MAX_COMPRESSED_BLOCK_OUTPUT + 65..MAX_COMPRESSED_BLOCK_OUTPUT + 69]
-            .copy_from_slice(&0x40u32.to_le_bytes());
+        data[LZ_BLOCK_SIZE + 64] = 0xe8;
+        data[LZ_BLOCK_SIZE + 65..LZ_BLOCK_SIZE + 69].copy_from_slice(&0x40u32.to_le_bytes());
 
         let encoded = Unpack50Encoder::with_options(EncodeOptions::new(0))
             .encode_member_with_filter(

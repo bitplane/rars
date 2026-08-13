@@ -55,10 +55,62 @@ pub(super) fn encode_member_with_filter_policy_candidates_and_progress(
     candidates: &[EncodeOptions],
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<u8>> {
-    let mut candidates = candidates.iter().copied();
-    let first = candidates.next().ok_or(Error::InvalidHeader(
+    let mut remaining = candidates.iter().copied();
+    let first = remaining.next().ok_or(Error::InvalidHeader(
         "RAR 5 compression level has no encoder options",
     ))?;
+
+    // Searching for a filter once and then trying the encoder settings against
+    // it is the difference between a handful of passes over the member and one
+    // whole search per setting.
+    if policy == FilterPolicy::AutoSize
+        && candidates.len() > 1
+        && !data.is_empty()
+        && !is_text_like_filter_skip_candidate(data)
+    {
+        let specs = choose_auto_size_filter(
+            data,
+            algorithm_version,
+            first,
+            borrow_progress(&mut progress),
+        )?;
+        let mut best = None;
+        for options in candidates.iter().copied() {
+            let packed = encode_member_with_filter_specs_progress(
+                data,
+                algorithm_version,
+                &specs,
+                options,
+                borrow_progress(&mut progress),
+            )
+            .map_err(Error::from)?;
+            if best
+                .as_ref()
+                .is_none_or(|best: &Vec<u8>| packed.len() < best.len())
+            {
+                best = Some(packed);
+            }
+        }
+        let best = best.expect("at least one candidate");
+        if specs.is_empty() {
+            return Ok(best);
+        }
+        // Keep the filter only if it actually beat leaving the data alone.
+        let plain = encode_member_with_filter_specs_progress(
+            data,
+            algorithm_version,
+            &[],
+            first,
+            borrow_progress(&mut progress),
+        )
+        .map_err(Error::from)?;
+        return Ok(if plain.len() <= best.len() {
+            plain
+        } else {
+            best
+        });
+    }
+
     let mut best = encode_member_with_filter_policy_and_progress(
         data,
         algorithm_version,
@@ -66,7 +118,7 @@ pub(super) fn encode_member_with_filter_policy_candidates_and_progress(
         first,
         borrow_progress(&mut progress),
     )?;
-    for options in candidates {
+    for options in remaining {
         let packed = encode_member_with_filter_policy_and_progress(
             data,
             algorithm_version,
@@ -442,6 +494,38 @@ fn auto_size_filter_candidates(data: &[u8]) -> Vec<Vec<Rar50FilterSpec>> {
     candidates
 }
 
+/// Ranks the filter candidates at reduced effort and returns the winner.
+///
+/// Which filter suits a member is a property of the data, not of how hard the
+/// encoder is trying, so this is worth doing once even when several encoder
+/// settings are going to be compared afterwards.
+fn choose_auto_size_filter(
+    data: &[u8],
+    algorithm_version: u8,
+    options: EncodeOptions,
+    mut progress: Option<&mut dyn FnMut(usize) -> bool>,
+) -> Result<Vec<Rar50FilterSpec>> {
+    let ranking_options = filter_ranking_options(options);
+    let candidates = auto_size_filter_candidates(data);
+    let mut best_specs = candidates[0].clone();
+    let mut best_len = usize::MAX;
+    for specs in &candidates {
+        let packed = encode_member_with_filter_specs_progress(
+            data,
+            algorithm_version,
+            specs,
+            ranking_options,
+            borrow_progress(&mut progress),
+        )
+        .map_err(Error::from)?;
+        if packed.len() < best_len {
+            best_len = packed.len();
+            best_specs = specs.clone();
+        }
+    }
+    Ok(best_specs)
+}
+
 fn encode_member_with_auto_size_filter_progress(
     data: &[u8],
     algorithm_version: u8,
@@ -457,24 +541,13 @@ fn encode_member_with_auto_size_filter_progress(
             progress,
         );
     }
-    let ranking_options = filter_ranking_options(options);
-    let candidates = auto_size_filter_candidates(data);
-    let mut best_specs: &[Rar50FilterSpec] = &candidates[0];
-    let mut best_len = usize::MAX;
-    for specs in &candidates {
-        let packed = encode_member_with_filter_specs_progress(
-            data,
-            algorithm_version,
-            specs,
-            ranking_options,
-            borrow_progress(&mut progress),
-        )
-        .map_err(Error::from)?;
-        if packed.len() < best_len {
-            best_len = packed.len();
-            best_specs = specs;
-        }
-    }
+    let best_specs = choose_auto_size_filter(
+        data,
+        algorithm_version,
+        options,
+        borrow_progress(&mut progress),
+    )?;
+    let best_specs = best_specs.as_slice();
     let filtered = encode_member_with_filter_specs_progress(
         data,
         algorithm_version,
