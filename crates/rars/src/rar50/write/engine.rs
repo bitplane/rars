@@ -846,7 +846,13 @@ impl VolumeWriter<'_> {
             let fragment_len = room.min(remaining);
             let split_after = start + fragment_len < member.payload_len;
 
-            let header = fragment_header(member, fragment_len, split_before, split_after)?;
+            let header = fragment_header(
+                member,
+                fragment_len,
+                split_before,
+                split_after,
+                self.header_keys,
+            )?;
             let body = self.body.as_mut().expect("volume started");
             body.write_all(&header)?;
             if fragment_len != 0 {
@@ -1002,6 +1008,7 @@ fn fragment_header(
     fragment_len: u64,
     split_before: bool,
     split_after: bool,
+    header_keys: Option<&HeaderEncryptionKeys>,
 ) -> Result<Vec<u8>> {
     let mut extra = Vec::new();
     if let Some((salt, iv, check_value)) = member.encryption {
@@ -1030,5 +1037,16 @@ fn fragment_header(
     if !extra.is_empty() {
         flags |= HFL_EXTRA;
     }
-    block_header_image(HEAD_FILE, flags, Some(fragment_len), &specific, &extra)
+    match header_keys {
+        Some(keys) => encrypted_header_block(
+            &keys.keys,
+            HEAD_FILE,
+            flags,
+            Some(fragment_len),
+            &specific,
+            &extra,
+            &[],
+        ),
+        None => block_header_image(HEAD_FILE, flags, Some(fragment_len), &specific, &extra),
+    }
 }

@@ -1108,7 +1108,6 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
         // Quick-open indexes plaintext headers, so the two cannot combine.
         && !(quick_open && header_encryption)
         && file_comment.is_none()
-        && volume_size.is_none()
         && delta_filter.is_none()
         && e8_filter.is_none()
         && !itanium_filter
@@ -1134,6 +1133,7 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
             quick_open,
             archive_comment.as_deref(),
             archive_name.as_deref(),
+            volume_size.map(|size| size as u64),
             &progress,
         );
     }
@@ -1876,6 +1876,7 @@ fn write_plain_rar50_streaming(
     quick_open: bool,
     archive_comment: Option<&[u8]>,
     archive_name: Option<&[u8]>,
+    volume_size: Option<u64>,
     progress: &CliProgress,
 ) -> CliResult<()> {
     progress.spinner("Scanning inputs");
@@ -1943,6 +1944,27 @@ fn write_plain_rar50_streaming(
     );
     progress.spinner("Preparing compression");
     progress.bar("Compressing archive", total);
+    if let Some(volume_size) = volume_size {
+        if archive_path == Path::new("-") || archive_path == Path::new("/dev/stdout") {
+            return Err("volume sets cannot be written to stdout".into());
+        }
+        let mut sink = CliVolumeSink {
+            first_path: archive_path,
+            temporaries: Vec::new(),
+        };
+        let result = rars::rar50::write_streaming_volumes_to(
+            &entries,
+            options,
+            extras,
+            volume_size,
+            &mut sink,
+            &resources,
+        );
+        let paths = sink.finish(result)?;
+        progress.finish("Volumes written");
+        print_created_volumes(&paths);
+        return Ok(());
+    }
     if archive_path == Path::new("-") || archive_path == Path::new("/dev/stdout") {
         rars::rar50::write_streaming_archive_to(
             &entries,
@@ -2019,6 +2041,44 @@ fn warn_if_buffered_write_is_large(
         reason,
         indicatif::HumanBytes(total)
     );
+}
+
+/// Writes each volume to a temporary file, then renames the set once the
+/// number of volumes is known, since that decides how the parts are numbered.
+struct CliVolumeSink<'a> {
+    first_path: &'a Path,
+    temporaries: Vec<PathBuf>,
+}
+
+impl CliVolumeSink<'_> {
+    /// Renames the finished set, or clears it up if the write failed.
+    fn finish(self, result: rars::Result<()>) -> CliResult<Vec<PathBuf>> {
+        if result.is_err() {
+            for temporary in &self.temporaries {
+                let _ = fs::remove_file(temporary);
+            }
+        }
+        result?;
+
+        let total = self.temporaries.len();
+        let mut paths = Vec::with_capacity(total);
+        for (index, temporary) in self.temporaries.iter().enumerate() {
+            let path = rar50_volume_part_path(self.first_path, index, total)?;
+            fs::rename(temporary, &path)?;
+            paths.push(path);
+        }
+        Ok(paths)
+    }
+}
+
+impl rars::rar50::VolumeSink for CliVolumeSink<'_> {
+    fn start_volume(&mut self, index: u64) -> rars::Result<Box<dyn std::io::Write + Send>> {
+        let parent = self.first_path.parent().unwrap_or_else(|| Path::new(""));
+        let temporary = parent.join(format!(".rars-volume-{}-{index:06}", std::process::id()));
+        let file = fs::File::create(&temporary)?;
+        self.temporaries.push(temporary);
+        Ok(Box::new(file))
+    }
 }
 
 /// Archive-level options for a streaming write.
