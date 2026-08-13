@@ -12,8 +12,6 @@ mod engine;
 mod filter_policy;
 mod headers;
 mod layout;
-#[cfg(test)]
-use filter_policy::encode_member_with_filter_policy;
 use filter_policy::{
     compression_method_for_level, dictionary_size_for_options, encode_option_candidates_for_level,
     encode_options_for_level, filter_policy_walk_bytes, rar50_algorithm_version,
@@ -746,8 +744,7 @@ fn validate_service(service: &ServiceEntry) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::filter_policy::{
-        encode_member_with_auto_size_filter, encode_member_with_filter_policy_candidates,
-        encode_member_with_filter_spec, encode_member_with_filter_specs,
+        encode_member_with_auto_size_filter_progress, encode_member_with_filter_policy_and_progress,
     };
     use super::headers::{
         file_specific, write_block, write_end_header, write_hash_record_with_value,
@@ -755,7 +752,7 @@ mod tests {
     };
     use super::*;
     use crate::codec::rar50::{encode_literal_only, encode_lz_member};
-    use crate::codec::rar50::{encode_lz_member_with_options, EncodeOptions};
+    use crate::codec::rar50::{encode_lz_member_with_options, EncodeOptions, Unpack50Encoder};
     use crate::filter_search::{
         auto_delta_filter_range, disjoint_filter_ranges, AUTO_DELTA_EDGE_SKIP,
     };
@@ -770,6 +767,78 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct CollectWriter(Rc<RefCell<Vec<u8>>>);
+
+    fn encode_member_with_filter_policy(
+        data: &[u8],
+        algorithm_version: u8,
+        policy: &FilterPolicy,
+        options: EncodeOptions,
+    ) -> Result<Vec<u8>> {
+        encode_member_with_filter_policy_and_progress(
+            data,
+            algorithm_version,
+            policy,
+            options,
+            None,
+        )
+    }
+
+    /// Encodes with each candidate and keeps the smallest, which is what the
+    /// writer does across a level's options.
+    fn encode_member_with_filter_policy_candidates(
+        data: &[u8],
+        algorithm_version: u8,
+        policy: &FilterPolicy,
+        candidates: &[EncodeOptions],
+    ) -> Result<Vec<u8>> {
+        let mut candidates = candidates.iter().copied();
+        let first = candidates.next().ok_or(Error::InvalidHeader(
+            "RAR 5 compression level has no encoder options",
+        ))?;
+        let mut best = encode_member_with_filter_policy(data, algorithm_version, policy, first)?;
+        for options in candidates {
+            let packed =
+                encode_member_with_filter_policy(data, algorithm_version, policy, options)?;
+            if packed.len() < best.len() {
+                best = packed;
+            }
+        }
+        Ok(best)
+    }
+
+    fn encode_member_with_auto_size_filter(
+        data: &[u8],
+        algorithm_version: u8,
+        options: EncodeOptions,
+    ) -> Result<Vec<u8>> {
+        encode_member_with_auto_size_filter_progress(data, algorithm_version, options, None)
+    }
+
+    fn encode_member_with_filter_spec(
+        data: &[u8],
+        algorithm_version: u8,
+        filter: FilterSpec,
+        options: EncodeOptions,
+    ) -> crate::codec::Result<Vec<u8>> {
+        Unpack50Encoder::with_options(options).encode_member_with_filter(
+            data,
+            algorithm_version,
+            filter,
+        )
+    }
+
+    fn encode_member_with_filter_specs(
+        data: &[u8],
+        algorithm_version: u8,
+        filters: &[FilterSpec],
+        options: EncodeOptions,
+    ) -> crate::codec::Result<Vec<u8>> {
+        Unpack50Encoder::with_options(options).encode_member_with_filters(
+            data,
+            algorithm_version,
+            filters,
+        )
+    }
 
     /// Builds a member from bytes the test already holds.
     fn entry(name: &[u8], data: &[u8]) -> ArchiveEntry {

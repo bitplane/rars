@@ -13,17 +13,7 @@ fn borrow_progress<'a>(
     }
 }
 
-#[cfg(test)]
-pub(super) fn encode_member_with_filter_policy(
-    data: &[u8],
-    algorithm_version: u8,
-    policy: &FilterPolicy,
-    options: EncodeOptions,
-) -> Result<Vec<u8>> {
-    encode_member_with_filter_policy_and_progress(data, algorithm_version, policy, options, None)
-}
-
-fn encode_member_with_filter_policy_and_progress(
+pub(super) fn encode_member_with_filter_policy_and_progress(
     data: &[u8],
     algorithm_version: u8,
     policy: &FilterPolicy,
@@ -128,27 +118,6 @@ pub(super) fn filter_policy_walk_bytes(
         return member * encoder_candidates.max(1) as u64;
     }
     crate::filter_search::walk_bytes(&Rar50Search { algorithm_version }, data, encoder_candidates)
-}
-
-#[cfg(test)]
-pub(super) fn encode_member_with_filter_policy_candidates(
-    data: &[u8],
-    algorithm_version: u8,
-    policy: &FilterPolicy,
-    candidates: &[EncodeOptions],
-) -> Result<Vec<u8>> {
-    let mut candidates = candidates.iter().copied();
-    let first = candidates.next().ok_or(Error::InvalidHeader(
-        "RAR 5 compression level has no encoder options",
-    ))?;
-    let mut best = encode_member_with_filter_policy(data, algorithm_version, policy, first)?;
-    for options in candidates {
-        let packed = encode_member_with_filter_policy(data, algorithm_version, policy, options)?;
-        if packed.len() < best.len() {
-            best = packed;
-        }
-    }
-    Ok(best)
 }
 
 pub(super) fn should_store_compressed_payload(
@@ -345,15 +314,6 @@ pub(super) fn encode_safe_lz_member_with_progress(
         .map_err(Error::from)
 }
 
-#[cfg(test)]
-pub(super) fn encode_member_with_auto_size_filter(
-    data: &[u8],
-    algorithm_version: u8,
-    options: EncodeOptions,
-) -> Result<Vec<u8>> {
-    encode_member_with_auto_size_filter_progress(data, algorithm_version, options, None)
-}
-
 /// How RAR 5 measures a filter candidate, for the shared search.
 #[derive(Clone, Copy)]
 struct Rar50Search {
@@ -421,7 +381,7 @@ fn choose_auto_size_filter(
     crate::filter_search::choose_filter(&Rar50Search { algorithm_version }, data, options, progress)
 }
 
-fn encode_member_with_auto_size_filter_progress(
+pub(super) fn encode_member_with_auto_size_filter_progress(
     data: &[u8],
     algorithm_version: u8,
     options: EncodeOptions,
@@ -472,34 +432,6 @@ fn encode_member_with_filter_specs_progress(
         ),
         None => encoder.encode_member_with_filters(data, algorithm_version, filters),
     }
-}
-
-#[cfg(test)]
-pub(super) fn encode_member_with_filter_spec(
-    data: &[u8],
-    algorithm_version: u8,
-    filter: FilterSpec,
-    options: EncodeOptions,
-) -> crate::codec::Result<Vec<u8>> {
-    Unpack50Encoder::with_options(options).encode_member_with_filter(
-        data,
-        algorithm_version,
-        filter,
-    )
-}
-
-#[cfg(test)]
-pub(super) fn encode_member_with_filter_specs(
-    data: &[u8],
-    algorithm_version: u8,
-    filters: &[FilterSpec],
-    options: EncodeOptions,
-) -> crate::codec::Result<Vec<u8>> {
-    Unpack50Encoder::with_options(options).encode_member_with_filters(
-        data,
-        algorithm_version,
-        filters,
-    )
 }
 
 pub(super) fn solid_compression_flag(solid_continuation: bool) -> u64 {
