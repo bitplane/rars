@@ -5382,3 +5382,45 @@ fn rar50_looks_for_a_data_filter_by_default() {
     let test = rars().arg("test").arg(&filtered).output().unwrap();
     assert!(test.status.success(), "stderr: {}", stderr(&test));
 }
+
+/// The buffered RAR 5 path refused to combine an explicit filter with
+/// encryption, recovery records, comments, metadata, volumes or solid mode.
+/// None of those were format limits; they were limits of the writer that path
+/// used, and the streaming engine has none of them.
+#[test]
+fn rar5_explicit_filters_combine_with_the_rest_of_the_writer() {
+    let dir = scratch("rar5-filters-combine");
+    let source = dir.join("payload.bin");
+    let mut payload = vec![0x41u8; 300_000];
+    for index in 0..4_000u32 {
+        let pos = 8_000 + index as usize * 64;
+        payload[pos] = 0xe8;
+        payload[pos + 1..pos + 5].copy_from_slice(&(0x3000u32 + index).to_le_bytes());
+    }
+    fs::write(&source, &payload).unwrap();
+
+    for (name, extra) in [
+        ("password", vec!["--password", "pw"]),
+        ("recovery", vec!["--recovery-percent", "5"]),
+        ("comment", vec!["--comment", "hello"]),
+        ("metadata", vec!["--archive-name", "set.rar"]),
+        ("solid", vec!["--solid"]),
+        ("file-comment", vec!["--file-comment", "note"]),
+    ] {
+        let archive = dir.join(format!("{name}.rar"));
+        let output = rars()
+            .args(["a", "--format", "rar50", "--e8-filter"])
+            .args(&extra)
+            .arg(&archive)
+            .arg(&source)
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "--e8-filter with {name} was refused: {}",
+            stderr(&output)
+        );
+        assert!(archive.exists(), "{name} wrote no archive");
+    }
+}

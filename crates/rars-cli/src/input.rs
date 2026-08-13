@@ -7,12 +7,13 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use zeroize::Zeroizing;
 
+/// An input read fully into memory, for the RAR 1.3 and RAR 1.5-4.x writers.
+/// Those formats record DOS timestamps, so the Unix one is not carried here.
 pub(crate) struct OwnedInput {
     pub(crate) name: Vec<u8>,
     pub(crate) data: Vec<u8>,
     pub(crate) file_attr: u8,
     pub(crate) unix_mode: Option<u32>,
-    pub(crate) unix_mtime: Option<u32>,
     pub(crate) dos_mtime: u32,
     pub(crate) password: Option<Password>,
 }
@@ -62,7 +63,6 @@ where
             data,
             file_attr: entry.file_attr,
             unix_mode: entry.unix_mode,
-            unix_mtime: entry.unix_mtime,
             dos_mtime: entry.dos_mtime,
             password: password.map(|p| Zeroizing::new(p.to_vec())),
         });
@@ -198,12 +198,4 @@ pub(crate) fn rar15_file_attr(entry: &OwnedInput) -> u32 {
     entry
         .unix_mode
         .unwrap_or_else(|| u32::from(entry.file_attr))
-}
-
-pub(crate) fn rar50_file_attr(entry: &OwnedInput) -> u64 {
-    u64::from(
-        entry
-            .unix_mode
-            .unwrap_or_else(|| u32::from(entry.file_attr)),
-    )
 }
