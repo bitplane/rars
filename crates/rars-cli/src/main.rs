@@ -1116,7 +1116,6 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
         && rgb_filter.is_none()
         && audio_filter.is_none()
         && !arm_filter
-        && !auto_filter
         && !ppmd
         && (!header_encryption || password.is_some());
     if rar50_streaming {
@@ -1132,6 +1131,7 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
             solid,
             header_encryption,
             recovery_percent,
+            auto_filter,
             &progress,
         );
     }
@@ -1872,6 +1872,7 @@ fn write_plain_rar50_streaming(
     solid: bool,
     header_encryption: bool,
     recovery_percent: Option<u64>,
+    auto_filter: bool,
     progress: &CliProgress,
 ) -> CliResult<()> {
     progress.spinner("Scanning inputs");
@@ -1930,7 +1931,7 @@ fn write_plain_rar50_streaming(
         rars::rar50::write_streaming_archive_to(
             &entries,
             options,
-            recovery_percent,
+            streaming_extras(recovery_percent, auto_filter),
             &resources,
             &mut std::io::stdout(),
         )?;
@@ -1940,7 +1941,7 @@ fn write_plain_rar50_streaming(
             rars::rar50::write_streaming_archive_to(
                 &entries,
                 options,
-                recovery_percent,
+                streaming_extras(recovery_percent, auto_filter),
                 &resources,
                 &mut output,
             )?;
@@ -2009,6 +2010,19 @@ fn warn_if_buffered_write_is_large(
         reason.unwrap_or("this archive"),
         indicatif::HumanBytes(total)
     );
+}
+
+/// Archive-level options for a streaming write.
+fn streaming_extras(
+    recovery_percent: Option<u64>,
+    auto_filter: bool,
+) -> rars::rar50::ArchiveExtras<'static> {
+    let extras = rars::rar50::ArchiveExtras::default().with_recovery_percent(recovery_percent);
+    if auto_filter {
+        extras.with_filter_policy(rars::rar50::FilterPolicy::AutoSize)
+    } else {
+        extras
+    }
 }
 
 fn create_streaming_archive_temp(archive_path: &Path) -> CliResult<(PathBuf, fs::File)> {

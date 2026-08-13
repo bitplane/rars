@@ -38,18 +38,39 @@ pub(super) struct EnginePlan<'a> {
     pub(super) method: u8,
     pub(super) recovery_percent: Option<u64>,
     pub(super) header_encrypted: bool,
+    pub(super) archive_comment: Option<ArchiveCommentPlan<'a>>,
+    pub(super) archive_metadata: Option<crate::rar50::ArchiveMetadataEntry<'a>>,
+    pub(super) quick_open: bool,
     pub(super) progress: Option<ProgressReporter<'a>>,
 }
 
-/// A member with its framing settled: the header bytes are final and the
+pub(super) enum ArchiveCommentPlan<'a> {
+    Plain(&'a [u8]),
+    Encrypted { data: &'a [u8], password: &'a [u8] },
+}
+
+/// A block with its framing settled: the header bytes are final and the
 /// payload only has to be copied.
-struct PreparedMember {
+struct PreparedBlock {
     header: Vec<u8>,
     payload: Payload,
     payload_len: u64,
+    /// Quick-open repeats the headers of members and plain comments so a
+    /// reader can list an archive without walking it.
+    quick_open_cached: bool,
+}
+
+impl PreparedBlock {
+    fn len(&self) -> Result<u64> {
+        (self.header.len() as u64)
+            .checked_add(self.payload_len)
+            .ok_or(Error::InvalidHeader("RAR 5 archive block size overflows"))
+    }
 }
 
 enum Payload {
+    /// Small enough to have been built in memory: comments and services.
+    Inline(Vec<u8>),
     /// Copied straight from the source, which is re-read at write time.
     Stored(crate::EntrySource),
     Packed(Spool),
@@ -81,19 +102,42 @@ pub(super) fn write_archive(
     };
 
     let sources: Vec<_> = entries.iter().map(|entry| entry.source.clone()).collect();
-    let compressed = compress::compress_members(&sources, plan.compress, resources)?;
+    let compressed = compress::compress_members(&sources, plan.compress.clone(), resources)?;
 
-    let mut members = Vec::with_capacity(entries.len());
+    // Everything between the main header and the quick-open block, in order.
+    let mut blocks: Vec<PreparedBlock> = Vec::with_capacity(entries.len() + 1);
+    if let Some(comment) = &plan.archive_comment {
+        blocks.push(prepare_comment(comment, header_keys.as_ref())?);
+    }
     for (entry, member) in entries.iter().zip(compressed) {
-        members.push(prepare_member(entry, member, &plan, header_keys.as_ref())?);
+        blocks.push(prepare_member(entry, member, &plan, header_keys.as_ref())?);
+        for service in &entry.services {
+            blocks.push(prepare_service(service, header_keys.as_ref())?);
+        }
     }
 
-    let body_len = members.iter().try_fold(0u64, |total, member| {
+    let body_len = blocks.iter().try_fold(0u64, |total, block| {
         total
-            .checked_add(member.header.len() as u64)
-            .and_then(|value| value.checked_add(member.payload_len))
+            .checked_add(block.len()?)
             .ok_or(Error::InvalidHeader("RAR 5 archive body size overflows"))
     })?;
+
+    // Quick-open stores how far back each cached header sits from the
+    // quick-open block itself. Both move together when the prefix grows, so
+    // the distances only need positions within the body.
+    let quick_open_payload = if plan.quick_open {
+        let mut payload = Vec::new();
+        let mut offset = 0u64;
+        for block in &blocks {
+            if block.quick_open_cached {
+                append_quick_open_entry(&mut payload, body_len - offset, &block.header)?;
+            }
+            offset += block.len()?;
+        }
+        Some(payload)
+    } else {
+        None
+    };
 
     let head_crypt = match &header_keys {
         Some(keys) => {
@@ -117,9 +161,11 @@ pub(super) fn write_archive(
         head_crypt_len: head_crypt.len() as u64,
         main_flags,
         volume_number: None,
-        archive_metadata: None,
+        archive_metadata: plan.archive_metadata,
         body_len,
-        quick_open_payload_len: None,
+        quick_open_payload_len: quick_open_payload
+            .as_ref()
+            .map(|payload| payload.len() as u64),
         recovery_percent: plan.recovery_percent,
     })?;
 
@@ -156,9 +202,15 @@ pub(super) fn write_archive(
         sink.write_all(&head_crypt)?;
         sink.write_all(&main)?;
 
-        for member in members {
-            sink.write_all(&member.header)?;
-            write_payload(member.payload, member.payload_len, &mut sink, resources)?;
+        for block in blocks {
+            sink.write_all(&block.header)?;
+            write_payload(block.payload, block.payload_len, &mut sink, resources)?;
+        }
+
+        if let Some(payload) = &quick_open_payload {
+            let block = stored_service_block(b"QO", payload, &[], header_keys.as_ref())?;
+            sink.write_all(&block.header)?;
+            write_payload(block.payload, block.payload_len, &mut sink, resources)?;
         }
     }
 
@@ -201,13 +253,156 @@ pub(super) fn write_archive(
     Ok(())
 }
 
+/// Appends one quick-open record: how far back the header sits, then the
+/// header itself.
+fn append_quick_open_entry(payload: &mut Vec<u8>, distance: u64, header: &[u8]) -> Result<()> {
+    let mut body = Vec::new();
+    write_vint(&mut body, 0);
+    write_vint(&mut body, distance);
+    write_vint(&mut body, header.len() as u64);
+    body.extend_from_slice(header);
+
+    payload.extend_from_slice(&crate::crc32::crc32(&body).to_le_bytes());
+    write_vint(payload, body.len() as u64);
+    payload.extend_from_slice(&body);
+    Ok(())
+}
+
+/// A stored service block: a small named payload such as a comment or the
+/// quick-open index.
+fn stored_service_block(
+    name: &[u8],
+    data: &[u8],
+    service_data: &[u8],
+    header_keys: Option<&HeaderEncryptionKeys>,
+) -> Result<PreparedBlock> {
+    let mut extra = Vec::new();
+    write_extra_record(&mut extra, FHEXTRA_SUBDATA, service_data);
+    let specific = stored_file_specific(
+        name,
+        data.len() as u64,
+        Some(crate::crc32::crc32(data)),
+        0,
+        None,
+        0,
+    )?;
+    let header = match header_keys {
+        Some(keys) => encrypted_header_block(
+            &keys.keys,
+            HEAD_SERVICE,
+            HFL_EXTRA | HFL_DATA,
+            Some(data.len() as u64),
+            &specific,
+            &extra,
+            &[],
+        )?,
+        None => block_header_image(
+            HEAD_SERVICE,
+            HFL_EXTRA | HFL_DATA,
+            Some(data.len() as u64),
+            &specific,
+            &extra,
+        )?,
+    };
+    Ok(PreparedBlock {
+        header,
+        payload: Payload::Inline(data.to_vec()),
+        payload_len: data.len() as u64,
+        quick_open_cached: false,
+    })
+}
+
+fn prepare_comment(
+    comment: &ArchiveCommentPlan<'_>,
+    header_keys: Option<&HeaderEncryptionKeys>,
+) -> Result<PreparedBlock> {
+    match comment {
+        ArchiveCommentPlan::Plain(data) => {
+            let mut block = stored_service_block(b"CMT", data, &[], header_keys)?;
+            // Plain comments are listed by quick-open; encrypted ones are not.
+            block.quick_open_cached = header_keys.is_none();
+            Ok(block)
+        }
+        ArchiveCommentPlan::Encrypted { data, password } => {
+            encrypted_service_block(b"CMT", data, &[], password, header_keys)
+        }
+    }
+}
+
+fn prepare_service(
+    service: &super::ServiceEntry,
+    header_keys: Option<&HeaderEncryptionKeys>,
+) -> Result<PreparedBlock> {
+    match service.password.as_deref() {
+        Some(password) => {
+            encrypted_service_block(&service.name, &service.data, &[], password, header_keys)
+        }
+        None => stored_service_block(&service.name, &service.data, &[], header_keys),
+    }
+}
+
+/// A service block whose payload is encrypted with its own password.
+fn encrypted_service_block(
+    name: &[u8],
+    data: &[u8],
+    service_data: &[u8],
+    password: &[u8],
+    header_keys: Option<&HeaderEncryptionKeys>,
+) -> Result<PreparedBlock> {
+    super::validate_nonempty_password(password)?;
+    let encrypted = super::encrypted_stored_payload(data, password)?;
+
+    let mut extra = Vec::new();
+    write_extra_record(&mut extra, FHEXTRA_SUBDATA, service_data);
+    write_file_encryption_record(
+        &mut extra,
+        encrypted.salt,
+        encrypted.iv,
+        encrypted.check_value,
+    );
+    write_hash_record_with_value(&mut extra, encrypted.blake2sp_mac);
+    let specific = stored_file_specific(
+        name,
+        data.len() as u64,
+        Some(encrypted.crc32_mac),
+        0,
+        None,
+        0,
+    )?;
+    let payload_len = encrypted.data.len() as u64;
+    let header = match header_keys {
+        Some(keys) => encrypted_header_block(
+            &keys.keys,
+            HEAD_SERVICE,
+            HFL_EXTRA | HFL_DATA,
+            Some(payload_len),
+            &specific,
+            &extra,
+            &[],
+        )?,
+        None => block_header_image(
+            HEAD_SERVICE,
+            HFL_EXTRA | HFL_DATA,
+            Some(payload_len),
+            &specific,
+            &extra,
+        )?,
+    };
+    Ok(PreparedBlock {
+        header,
+        payload: Payload::Inline(encrypted.data),
+        payload_len,
+        quick_open_cached: false,
+    })
+}
+
 /// Builds a member's final header and decides how its payload will be written.
 fn prepare_member(
     entry: &ArchiveEntry,
     member: CompressedMember,
     plan: &EnginePlan<'_>,
     header_keys: Option<&HeaderEncryptionKeys>,
-) -> Result<PreparedMember> {
+) -> Result<PreparedBlock> {
     let compression_info = compress::member_compression_info(&plan.compress, &member, plan.method)?;
     let plain_len = if member.store {
         member.input_size
@@ -280,10 +475,11 @@ fn prepare_member(
         )?,
     };
 
-    Ok(PreparedMember {
+    Ok(PreparedBlock {
         header,
         payload,
         payload_len,
+        quick_open_cached: true,
     })
 }
 
@@ -294,6 +490,10 @@ fn write_payload(
     resources: &WriterResources,
 ) -> Result<()> {
     match payload {
+        Payload::Inline(data) => {
+            output.write_all(&data)?;
+            Ok(())
+        }
         Payload::Stored(source) => {
             let mut reader = source.open()?;
             let copied = std::io::copy(&mut reader.by_ref().take(payload_len), output)?;
@@ -328,8 +528,10 @@ fn write_payload(
                     packed.rewind()?;
                     encrypt_reader_to(&mut packed, len, output, &keys, iv, ENCRYPT_CHUNK)
                 }
-                Payload::Encrypted { .. } => Err(Error::InvalidHeader(
-                    "RAR 5 payload cannot be encrypted twice",
+                // Inline payloads are encrypted where they are built, and
+                // nothing is encrypted twice.
+                Payload::Inline(_) | Payload::Encrypted { .. } => Err(Error::InvalidHeader(
+                    "RAR 5 payload cannot be encrypted here",
                 )),
             }
         }

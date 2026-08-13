@@ -12,7 +12,10 @@
 //! single walk through the members in order — the walk is just reading, which
 //! is cheap, so waves of blocks still compress in parallel.
 
-use super::filter_policy::compression_info;
+use super::filter_policy::{
+    compression_info, encode_member_with_filter_policy_candidates_and_progress,
+};
+use super::FilterPolicy;
 use crate::codec::rar50::{encode_lz_streaming_block, EncodeOptions};
 use crate::streaming::Spool;
 use crate::{EntrySource, Error, Result, WriterResources};
@@ -31,7 +34,7 @@ pub(super) struct CompressedMember {
     pub(super) solid_continuation: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(super) struct CompressPlan {
     pub(super) algorithm_version: u8,
     pub(super) encode_options: EncodeOptions,
@@ -41,6 +44,10 @@ pub(super) struct CompressPlan {
     /// The RAR 5 compression method. Method zero means the members are stored
     /// verbatim, so nothing is compressed at all.
     pub(super) method: u8,
+    /// Filters and multi-candidate encoding both need the whole member at
+    /// once, so they only run for members that fit the memory budget.
+    pub(super) filter_policy: FilterPolicy,
+    pub(super) candidates: Vec<EncodeOptions>,
 }
 
 /// One block of input waiting to be compressed.
@@ -82,6 +89,15 @@ pub(super) fn compress_members(
         .unwrap_or(usize::MAX)
         .min(rayon::current_num_threads())
         .max(1);
+
+    // Filters and multi-candidate encoding both need the whole member at once.
+    // Members that fit the budget take that path; the rest stream, losing the
+    // filter but staying within memory.
+    let wants_whole_member =
+        plan.method != 0 && (plan.filter_policy != FilterPolicy::None || plan.candidates.len() > 1);
+    if wants_whole_member && !plan.solid {
+        return compress_members_whole(sources, &integrity, &plan, resources);
+    }
 
     // Storing is not "compress and hope it does not help": the header records
     // method zero, so the payload must be the source bytes.
@@ -129,6 +145,85 @@ pub(super) fn compress_members(
             },
         )
         .collect())
+}
+
+/// Working memory a member needs to be filtered as a whole: the member, the
+/// filtered copy, and the candidate packed outputs being compared.
+fn whole_member_workspace(input_size: u64) -> u64 {
+    input_size.saturating_mul(4).saturating_add(2 * 1024 * 1024)
+}
+
+/// Compresses members one at a time with the whole member resident, which is
+/// what filter selection and candidate comparison need.
+///
+/// A member too large for the budget falls back to streaming: an automatic
+/// filter is a best-effort size win, so dropping it beats refusing the job.
+/// An explicitly requested filter is not best-effort, so that one errors.
+fn compress_members_whole(
+    sources: &[EntrySource],
+    integrity: &[(u64, u32, [u8; 32])],
+    plan: &CompressPlan,
+    resources: &WriterResources,
+) -> Result<Vec<CompressedMember>> {
+    let mut members = Vec::with_capacity(sources.len());
+    for (index, source) in sources.iter().enumerate() {
+        let (input_size, crc32, hash) = integrity[index];
+        let required = whole_member_workspace(input_size);
+
+        let mut packed_spool = Spool::create(resources)?;
+        let mut stored = input_size == 0;
+        if !stored {
+            match resources.acquire(required, plan.dictionary_size) {
+                Ok(_permit) => {
+                    let mut data = Vec::with_capacity(input_size as usize);
+                    source.open()?.read_to_end(&mut data)?;
+                    if data.len() as u64 != input_size {
+                        return Err(Error::InvalidHeader(
+                            "entry source size changed while compressing",
+                        ));
+                    }
+                    let packed = encode_member_with_filter_policy_candidates_and_progress(
+                        &data,
+                        plan.algorithm_version,
+                        plan.filter_policy,
+                        &plan.candidates,
+                        None,
+                    )?;
+                    stored = packed.len() as u64 >= input_size;
+                    if !stored {
+                        packed_spool.write_all(&packed)?;
+                    }
+                }
+                Err(error) => {
+                    if plan.filter_policy != FilterPolicy::AutoSize {
+                        return Err(error);
+                    }
+                    // Too big to filter; compress it as a stream instead.
+                    let streamed = compress_members(
+                        std::slice::from_ref(source),
+                        CompressPlan {
+                            filter_policy: FilterPolicy::None,
+                            candidates: vec![plan.encode_options],
+                            ..plan.clone()
+                        },
+                        resources,
+                    )?;
+                    members.extend(streamed);
+                    continue;
+                }
+            }
+        }
+
+        members.push(CompressedMember {
+            input_size,
+            crc32,
+            hash,
+            store: stored,
+            packed: packed_spool,
+            solid_continuation: false,
+        });
+    }
+    Ok(members)
 }
 
 /// Members with independent dictionaries, interleaved so a batch of small

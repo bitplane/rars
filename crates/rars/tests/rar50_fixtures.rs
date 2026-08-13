@@ -4919,8 +4919,14 @@ fn streaming_writer_handles_solid_encrypted_headers_and_recovery_together() {
     // the archive, this could not succeed.
     let resources = rars::WriterResources::new(192 * 1024 * 1024);
     let mut archive_bytes = Vec::new();
-    rar50::write_streaming_archive_to(&entries, options, Some(10), &resources, &mut archive_bytes)
-        .unwrap();
+    rar50::write_streaming_archive_to(
+        &entries,
+        options,
+        rar50::ArchiveExtras::default().with_recovery_percent(Some(10)),
+        &resources,
+        &mut archive_bytes,
+    )
+    .unwrap();
 
     let archive = Archive::parse_with_options(
         &archive_bytes,
@@ -5065,7 +5071,7 @@ fn streaming_writer_stays_within_its_memory_budget_on_a_large_archive() {
     rar50::write_streaming_archive_to(
         std::slice::from_ref(&entry),
         options,
-        Some(50),
+        rar50::ArchiveExtras::default().with_recovery_percent(Some(50)),
         &rars::WriterResources::new(BUDGET).with_temp_dir(std::env::temp_dir()),
         &mut output,
     )
@@ -5078,4 +5084,195 @@ fn streaming_writer_stays_within_its_memory_budget_on_a_large_archive() {
         written > MEMBER_BYTES,
         "a 50% recovery record should make the archive larger than its input"
     );
+}
+
+fn streaming_entry(name: &str, data: &[u8]) -> rar50::ArchiveEntry {
+    rar50::ArchiveEntry::new(
+        name,
+        rars::EntrySource::from_bytes(std::sync::Arc::<[u8]>::from(data.to_vec())),
+    )
+    .with_attributes(0x20)
+}
+
+fn write_with_extras(
+    entries: &[rar50::ArchiveEntry],
+    features: FeatureSet,
+    extras: rar50::ArchiveExtras<'_>,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    rar50::write_streaming_archive_to(
+        entries,
+        rar50::WriterOptions::new(ArchiveVersion::Rar50, features).with_compression_level(1),
+        extras,
+        &rars::WriterResources::default(),
+        &mut out,
+    )
+    .unwrap();
+    out
+}
+
+#[test]
+fn streaming_writer_stores_an_archive_comment() {
+    let entries = [streaming_entry("member.txt", b"comment carrier payload\n")];
+    let mut features = FeatureSet::store_only();
+    features.archive_comment = true;
+
+    let bytes = write_with_extras(
+        &entries,
+        features,
+        rar50::ArchiveExtras::default().with_comment(b"streamed archive comment"),
+    );
+
+    let archive = Archive::parse(&bytes).unwrap();
+    let comment = archive
+        .blocks
+        .iter()
+        .find_map(|block| match block {
+            Block::Service(header) if header.name == b"CMT" => Some(header),
+            _ => None,
+        })
+        .expect("archive has a comment service record");
+    assert_eq!(comment.unpacked_size, 24);
+    assert_eq!(collect_extract(&archive).unwrap().len(), 1);
+}
+
+#[test]
+fn streaming_writer_records_archive_metadata() {
+    let entries = [streaming_entry("member.txt", b"metadata carrier\n")];
+    let bytes = write_with_extras(
+        &entries,
+        FeatureSet::store_only(),
+        rar50::ArchiveExtras::default().with_metadata(rar50::ArchiveMetadataEntry {
+            name: Some(b"original.rar"),
+            creation_time: Some(0x01D9_0000_0000_0000),
+        }),
+    );
+
+    let archive = Archive::parse(&bytes).unwrap();
+    let metadata = archive
+        .main
+        .extras
+        .iter()
+        .find_map(|extra| match extra {
+            rar50::MainExtraRecord::ArchiveMetadata(record) => Some(record),
+            _ => None,
+        })
+        .expect("main header carries archive metadata");
+    assert_eq!(metadata.name.as_deref(), Some(b"original.rar".as_slice()));
+}
+
+#[test]
+fn streaming_writer_attaches_file_services() {
+    let entries = [streaming_entry("member.txt", b"service carrier payload\n")
+        .with_service(rar50::ServiceEntry::new("CMT", "a file comment"))];
+    let mut features = FeatureSet::store_only();
+    features.file_comment = true;
+
+    let bytes = write_with_extras(&entries, features, rar50::ArchiveExtras::default());
+    let archive = Archive::parse(&bytes).unwrap();
+
+    let services: Vec<_> = archive
+        .blocks
+        .iter()
+        .filter_map(|block| match block {
+            Block::Service(header) => Some(header.name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(services, vec![b"CMT".to_vec()]);
+    assert_eq!(collect_extract(&archive).unwrap().len(), 1);
+}
+
+#[test]
+fn streaming_writer_writes_a_usable_quick_open_index() {
+    let entries: Vec<_> = (0..4u8)
+        .map(|index| {
+            streaming_entry(
+                &format!("member-{index}.txt"),
+                format!("quick open payload {index}\n").repeat(8).as_bytes(),
+            )
+        })
+        .collect();
+    let mut features = FeatureSet::store_only();
+    features.quick_open = true;
+
+    let bytes = write_with_extras(
+        &entries,
+        features,
+        rar50::ArchiveExtras::default().with_quick_open(true),
+    );
+
+    let archive = Archive::parse(&bytes).unwrap();
+    assert!(
+        archive
+            .blocks
+            .iter()
+            .any(|block| matches!(block, Block::Service(header) if header.name == b"QO")),
+        "archive has a quick-open index"
+    );
+    assert_eq!(collect_extract(&archive).unwrap().len(), 4);
+
+    if let Some(output) = reference_test_archive("streaming-quick-open", &bytes) {
+        assert!(
+            output.status.success(),
+            "the reference tool rejected the quick-open archive\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn streaming_writer_applies_filters_when_asked() {
+    // x86-shaped data, which the E8 filter is meant to help with.
+    let mut data = Vec::new();
+    for index in 0..20_000u32 {
+        data.push(0xe8);
+        data.extend_from_slice(&index.to_le_bytes());
+        data.extend_from_slice(b"\x55\x89\xe5");
+    }
+    let entries = [streaming_entry("program.bin", &data)];
+
+    let plain = write_with_extras(
+        &entries,
+        FeatureSet::store_only(),
+        rar50::ArchiveExtras::default(),
+    );
+    let filtered = write_with_extras(
+        &entries,
+        FeatureSet::store_only(),
+        rar50::ArchiveExtras::default().with_filter_policy(rar50::FilterPolicy::AutoSize),
+    );
+
+    assert!(
+        filtered.len() < plain.len(),
+        "the filter should pay for itself: {} filtered vs {} plain",
+        filtered.len(),
+        plain.len()
+    );
+
+    let archive = Archive::parse(&filtered).unwrap();
+    assert_eq!(collect_extract(&archive).unwrap()[0].data, data);
+}
+
+#[test]
+fn streaming_writer_drops_an_automatic_filter_it_cannot_afford() {
+    // Too large to hold whole under this budget, so the filter is skipped
+    // rather than the write failing.
+    let data = vec![0xe8u8; 8 * 1024 * 1024];
+    let entries = [streaming_entry("large.bin", &data)];
+
+    let mut out = Vec::new();
+    rar50::write_streaming_archive_to(
+        &entries,
+        rar50::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
+            .with_compression_level(1),
+        rar50::ArchiveExtras::default().with_filter_policy(rar50::FilterPolicy::AutoSize),
+        &rars::WriterResources::new(160 * 1024 * 1024),
+        &mut out,
+    )
+    .unwrap();
+
+    let archive = Archive::parse(&out).unwrap();
+    assert_eq!(collect_extract(&archive).unwrap()[0].data, data);
 }

@@ -134,6 +134,33 @@ pub struct ArchiveEntry {
     /// Encrypts this member's payload. With header encryption every member
     /// must use the same password.
     pub password: Option<Vec<u8>>,
+    /// Service records attached to this member, such as a file comment.
+    pub services: Vec<ServiceEntry>,
+}
+
+/// A small named record attached to an archive or a member.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ServiceEntry {
+    /// Service name, such as `CMT`, `ACL` or `STM`.
+    pub name: Vec<u8>,
+    pub data: Vec<u8>,
+    pub password: Option<Vec<u8>>,
+}
+
+impl ServiceEntry {
+    pub fn new(name: impl Into<Vec<u8>>, data: impl Into<Vec<u8>>) -> Self {
+        Self {
+            name: name.into(),
+            data: data.into(),
+            password: None,
+        }
+    }
+
+    pub fn with_password(mut self, password: impl Into<Vec<u8>>) -> Self {
+        self.password = Some(password.into());
+        self
+    }
 }
 
 impl ArchiveEntry {
@@ -145,7 +172,13 @@ impl ArchiveEntry {
             attributes: 0,
             host_os: 0,
             password: None,
+            services: Vec::new(),
         }
+    }
+
+    pub fn with_service(mut self, service: ServiceEntry) -> Self {
+        self.services.push(service);
+        self
     }
 
     pub fn with_mtime(mut self, mtime: Option<u32>) -> Self {
@@ -169,6 +202,57 @@ impl ArchiveEntry {
     }
 }
 
+/// Archive-level options that sit alongside the members.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct ArchiveExtras<'a> {
+    /// Archive comment, stored as a `CMT` service record.
+    pub comment: Option<&'a [u8]>,
+    /// Encrypts the comment. Without it the comment is stored in the clear.
+    pub comment_password: Option<&'a [u8]>,
+    pub metadata: Option<ArchiveMetadataEntry<'a>>,
+    /// Writes a quick-open index so readers can list the archive without
+    /// walking every header.
+    pub quick_open: bool,
+    /// Whether to look for a data filter that makes members compress better.
+    pub filter_policy: FilterPolicy,
+    /// Percentage of the archive to spend on a recovery record.
+    pub recovery_percent: Option<u64>,
+}
+
+impl<'a> ArchiveExtras<'a> {
+    pub fn with_comment(mut self, comment: &'a [u8]) -> Self {
+        self.comment = Some(comment);
+        self
+    }
+
+    pub fn with_encrypted_comment(mut self, comment: &'a [u8], password: &'a [u8]) -> Self {
+        self.comment = Some(comment);
+        self.comment_password = Some(password);
+        self
+    }
+
+    pub fn with_metadata(mut self, metadata: ArchiveMetadataEntry<'a>) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+
+    pub fn with_quick_open(mut self, quick_open: bool) -> Self {
+        self.quick_open = quick_open;
+        self
+    }
+
+    pub fn with_filter_policy(mut self, policy: FilterPolicy) -> Self {
+        self.filter_policy = policy;
+        self
+    }
+
+    pub fn with_recovery_percent(mut self, percent: Option<u64>) -> Self {
+        self.recovery_percent = percent;
+        self
+    }
+}
+
 /// Writes a RAR 5 or RAR 7 archive straight to `output`, keeping memory within
 /// `resources` however large the members are.
 ///
@@ -177,24 +261,17 @@ impl ArchiveEntry {
 pub fn write_streaming_archive_to(
     entries: &[ArchiveEntry],
     options: WriterOptions,
-    recovery_percent: Option<u64>,
+    extras: ArchiveExtras<'_>,
     resources: &WriterResources,
     output: &mut dyn Write,
 ) -> Result<()> {
-    write_streaming_archive_with_progress(
-        entries,
-        options,
-        recovery_percent,
-        resources,
-        None,
-        output,
-    )
+    write_streaming_archive_with_progress(entries, options, extras, resources, None, output)
 }
 
 pub(crate) fn write_streaming_archive_with_progress(
     entries: &[ArchiveEntry],
     options: WriterOptions,
-    recovery_percent: Option<u64>,
+    extras: ArchiveExtras<'_>,
     resources: &WriterResources,
     progress: Option<ProgressReporter<'_>>,
     output: &mut dyn Write,
@@ -206,6 +283,7 @@ pub(crate) fn write_streaming_archive_with_progress(
             feature: "RAR 5 writer mixing encrypted and plain members",
         });
     }
+    let recovery_percent = extras.recovery_percent;
     match (encrypted, recovery_percent.is_some()) {
         (true, true) => validate_encrypted_compressed_recovery_options(options)?,
         (true, false) => validate_encrypted_compressed_options(options)?,
@@ -218,14 +296,37 @@ pub(crate) fn write_streaming_archive_with_progress(
     if options.features.header_encryption && !encrypted {
         return Err(Error::NeedPassword);
     }
+    if extras.quick_open && options.features.header_encryption {
+        return Err(Error::UnsupportedFeature {
+            version: options.target,
+            feature: "RAR 5 quick-open index in a header-encrypted archive",
+        });
+    }
 
     engine::write_archive(
         entries,
         engine::EnginePlan {
-            compress: streaming_compress_plan(options)?,
+            compress: {
+                let mut compress = streaming_compress_plan(options)?;
+                compress.filter_policy = extras.filter_policy;
+                compress.candidates = encode_option_candidates_for_level(
+                    options.compression_level,
+                    compress.dictionary_size,
+                )?;
+                compress
+            },
             method: compression_method_for_level(options.compression_level)?,
             recovery_percent,
             header_encrypted: options.features.header_encryption,
+            archive_comment: match (extras.comment, extras.comment_password) {
+                (Some(data), Some(password)) => {
+                    Some(engine::ArchiveCommentPlan::Encrypted { data, password })
+                }
+                (Some(data), None) => Some(engine::ArchiveCommentPlan::Plain(data)),
+                (None, _) => None,
+            },
+            archive_metadata: extras.metadata,
+            quick_open: extras.quick_open,
             progress,
         },
         resources,
@@ -249,7 +350,13 @@ pub fn write_streaming_compressed_archive_to(
                 .with_host_os(entry.host_os)
         })
         .collect();
-    write_streaming_archive_to(&entries, options, None, resources, output)
+    write_streaming_archive_to(
+        &entries,
+        options,
+        ArchiveExtras::default(),
+        resources,
+        output,
+    )
 }
 
 /// Compression settings shared by the streaming writers.
@@ -262,6 +369,11 @@ fn streaming_compress_plan(options: WriterOptions) -> Result<compress::CompressP
         block_size: 1024 * 1024,
         solid: options.features.solid,
         method: compression_method_for_level(options.compression_level)?,
+        filter_policy: FilterPolicy::None,
+        candidates: vec![encode_options_for_level(
+            options.compression_level,
+            dictionary_size,
+        )?],
     })
 }
 
@@ -282,7 +394,13 @@ pub fn write_streaming_encrypted_compressed_archive_to(
                 .with_password(entry.password.clone())
         })
         .collect();
-    write_streaming_archive_to(&entries, options, None, resources, output)
+    write_streaming_archive_to(
+        &entries,
+        options,
+        ArchiveExtras::default(),
+        resources,
+        output,
+    )
 }
 
 fn source_integrity(
@@ -418,9 +536,10 @@ pub struct EncryptedArchiveCommentEntry<'a> {
     pub password: &'a [u8],
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum FilterPolicy {
+    #[default]
     None,
     AutoSize,
     Explicit(FilterKind),
@@ -1987,6 +2106,8 @@ fn validate_compressed_feature_options(
     let mut allowed = crate::FeatureSet::store_only();
     allowed.solid = options.features.solid;
     allowed.archive_comment = options.features.archive_comment;
+    allowed.file_comment = options.features.file_comment;
+    allowed.quick_open = options.features.quick_open;
     if allow_recovery_record {
         allowed.recovery_record = options.features.recovery_record;
     }
@@ -2023,6 +2144,8 @@ fn validate_encrypted_compressed_feature_options(
     allowed.header_encryption = options.features.header_encryption;
     allowed.solid = options.features.solid;
     allowed.archive_comment = options.features.archive_comment;
+    allowed.file_comment = options.features.file_comment;
+    allowed.quick_open = options.features.quick_open;
     if allow_recovery_record {
         allowed.recovery_record = options.features.recovery_record;
     }
@@ -3067,6 +3190,8 @@ mod tests {
                 block_size,
                 solid: false,
                 method: 1,
+                filter_policy: FilterPolicy::None,
+                candidates: vec![encode_options],
             },
             &WriterResources::new(required.saturating_mul(4)),
         )
