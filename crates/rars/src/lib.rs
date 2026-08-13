@@ -17,6 +17,7 @@ pub mod error;
 mod fast;
 pub mod features;
 pub mod filter;
+mod filter_search;
 mod io_util;
 mod parallel;
 pub mod rar13;

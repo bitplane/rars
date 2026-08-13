@@ -3,7 +3,6 @@ use crate::codec::rar50::{
     encode_lz_member_with_options, encode_lz_member_with_options_and_progress, EncodeOptions,
     Unpack50Encoder,
 };
-use crate::x86_filter_scan::auto_x86_filter_ranges;
 
 fn borrow_progress<'a>(
     progress: &'a mut Option<&mut dyn FnMut(usize) -> bool>,
@@ -114,39 +113,21 @@ pub(super) fn encode_member_with_filter_policy_candidates_and_progress(
     Ok(best)
 }
 
-fn auto_size_filter_search_applies(data: &[u8]) -> bool {
-    !data.is_empty() && !is_text_like_filter_skip_candidate(data)
-}
+use crate::filter_search::search_applies as auto_size_filter_search_applies;
 
-/// How many bytes the encoder will walk while packing this member.
-///
-/// Progress is reported by encoder position, and the filter search walks the
-/// member several times over, so the reporter needs the total to scale by. The
-/// screens this repeats are byte counting, cheap next to the encodes they are
-/// predicting.
+/// How many bytes the encoder will walk while packing this member, for progress
+/// to scale by.
 pub(super) fn filter_policy_walk_bytes(
     data: &[u8],
     policy: &FilterPolicy,
+    algorithm_version: u8,
     encoder_candidates: usize,
 ) -> u64 {
     let member = data.len() as u64;
-    let encoder_candidates = encoder_candidates.max(1) as u64;
     if *policy != FilterPolicy::Auto || !auto_size_filter_search_applies(data) {
-        return member * encoder_candidates;
+        return member * encoder_candidates.max(1) as u64;
     }
-    // The screens encode a sample once unfiltered and once per filter they are
-    // deciding on. What survives them is not knowable without doing the work,
-    // so this assumes one detectorless filter does: a progress bar that
-    // finishes a little early or a little late is not worth a second search to
-    // predict exactly.
-    let sample = filter_screen_sample(data).len() as u64;
-    let regions = x86_code_regions(data);
-    let screen = sample * (SCREENED_FILTER_KINDS.len() as u64 + 1)
-        + if regions.is_empty() { 0 } else { sample * 2 };
-    let finalists = 1 + x86_filter_finalists(data, &regions).len() as u64 + 1;
-    // Every finalist gets a whole-member encode, then the extra encoder
-    // settings re-encode the winner.
-    screen + member * (finalists + encoder_candidates - 1)
+    crate::filter_search::walk_bytes(&Rar50Search { algorithm_version }, data, encoder_candidates)
 }
 
 #[cfg(test)]
@@ -443,246 +424,71 @@ pub(super) fn encode_member_with_auto_size_filter(
     encode_member_with_auto_size_filter_progress(data, algorithm_version, options, None)
 }
 
-/// How much of the member the screens encode when deciding whether a filter is
-/// worth a whole-member encode.
-const FILTER_SCREEN_SAMPLE_LEN: usize = 128 * 1024;
-
-/// Keeps the screen sample's delta planes aligned the way they fall in the
-/// whole member: the lowest common multiple of the delta widths tried.
-const FILTER_SCREEN_SAMPLE_ALIGNMENT: usize = 12;
-
-/// How much smaller a filter has to make the sample before it earns a
-/// whole-member encode, as a percentage.
-///
-/// A filter that pays off does so by a mile: delta on 16-bit audio takes 43% off
-/// and on interleaved counters 96%. A sample that comes out a fraction of a
-/// percent smaller is measurement noise from the shorter history, and chasing it
-/// costs a whole-member encode per filter to find out.
-const FILTER_SCREEN_MARGIN_PERCENT: usize = 1;
-
-fn filter_screen_wins(filtered: usize, baseline: usize) -> bool {
-    filtered * 100 < baseline * (100 - FILTER_SCREEN_MARGIN_PERCENT)
-}
-
-/// The filters with no detector of their own, so they have to be measured.
-const SCREENED_FILTER_KINDS: [FilterKind; 5] = [
-    FilterKind::Arm,
-    FilterKind::Delta { channels: 1 },
-    FilterKind::Delta { channels: 2 },
-    FilterKind::Delta { channels: 3 },
-    FilterKind::Delta { channels: 4 },
-];
-
-/// How much of the member x86 detection has to cover before filtering the whole
-/// thing is as good as filtering only the detected regions, as a fraction.
-const X86_CODE_COVERAGE_RATIO: (usize, usize) = (9, 10);
-
-/// A window from the middle of the member, used to screen the filters that have
-/// nothing but a trial encode to go on.
-fn filter_screen_sample(data: &[u8]) -> &[u8] {
-    if data.len() <= FILTER_SCREEN_SAMPLE_LEN {
-        return data;
-    }
-    let middle = (data.len() - FILTER_SCREEN_SAMPLE_LEN) / 2;
-    let start = middle / FILTER_SCREEN_SAMPLE_ALIGNMENT * FILTER_SCREEN_SAMPLE_ALIGNMENT;
-    &data[start..start + FILTER_SCREEN_SAMPLE_LEN]
-}
-
-/// Which of the detectorless filters shrink a sample of the member.
-///
-/// Delta and ARM used to cost a whole-member encode each to prove they made the
-/// member bigger, which on a binary is most of the search. Whether they help is
-/// a local property of the byte layout, so a slice of the member answers it for
-/// a few per cent of the price. This measures the real filter rather than a
-/// statistic standing in for it, because the wins do not all show up as
-/// entropy: RAR's delta reorders into planes first, and what that buys is
-/// repetition the encoder can match, not a flatter byte histogram.
-fn screened_filter_kinds(
-    data: &[u8],
+/// How RAR 5 measures a filter candidate, for the shared search.
+#[derive(Clone, Copy)]
+struct Rar50Search {
     algorithm_version: u8,
-    options: EncodeOptions,
-) -> Result<ScreenOutcome> {
-    let sample = filter_screen_sample(data);
-    let mut outcome = ScreenOutcome::default();
-    if sample.len() < FILTER_SCREEN_SAMPLE_ALIGNMENT {
-        return Ok(outcome);
+}
+
+impl crate::filter_search::FilterSearch for Rar50Search {
+    type Options = EncodeOptions;
+
+    fn screened_kinds(&self, _data: &[u8]) -> Vec<FilterKind> {
+        vec![
+            FilterKind::Arm,
+            FilterKind::Delta { channels: 1 },
+            FilterKind::Delta { channels: 2 },
+            FilterKind::Delta { channels: 3 },
+            FilterKind::Delta { channels: 4 },
+        ]
     }
-    // A member no bigger than the sample is the sample, so the screen's encodes
-    // are whole-member measurements and the search should keep them rather than
-    // repeat them.
-    let whole_member = sample.len() == data.len();
-    let baseline =
-        encode_member_with_filter_specs_progress(sample, algorithm_version, &[], options, None)
-            .map_err(Error::from)?;
-    for kind in SCREENED_FILTER_KINDS {
-        let packed = encode_member_with_filter_specs_progress(
-            sample,
-            algorithm_version,
-            &[FilterSpec::whole(kind)],
-            options,
-            None,
-        )
-        .map_err(Error::from)?;
-        if filter_screen_wins(packed.len(), baseline.len()) {
-            outcome.kinds.push((kind, whole_member.then_some(packed)));
+
+    fn encode_plain(
+        &self,
+        data: &[u8],
+        options: EncodeOptions,
+        progress: Option<&mut dyn FnMut(usize) -> bool>,
+    ) -> Result<Vec<u8>> {
+        match progress {
+            Some(progress) => encode_lz_member_with_options_and_progress(
+                data,
+                self.algorithm_version,
+                options,
+                progress,
+            ),
+            None => encode_lz_member_with_options(data, self.algorithm_version, options),
         }
+        .map_err(Error::from)
     }
-    if whole_member {
-        outcome.plain = Some(baseline);
-    }
-    Ok(outcome)
-}
 
-/// What the screen learned, along with any encodes the search can reuse.
-#[derive(Default)]
-struct ScreenOutcome {
-    kinds: Vec<(FilterKind, Option<Vec<u8>>)>,
-    plain: Option<Vec<u8>>,
-}
-
-/// Where the scanner thinks x86 code lives, merged into disjoint regions.
-fn x86_code_regions(data: &[u8]) -> Vec<std::ops::Range<usize>> {
-    disjoint_filter_ranges(auto_x86_filter_ranges(data, true))
-}
-
-/// Whether the x86 filter earns its keep on a slice of what the scanner called
-/// code.
-///
-/// Byte patterns that look like call opcodes turn up in compressed data by
-/// chance, and the scanner cannot tell those from a real code section. Trying
-/// the filter inside the largest region it found separates the two for the price
-/// of a sample encode instead of two whole-member ones.
-fn x86_filter_helps_sample(
-    data: &[u8],
-    regions: &[std::ops::Range<usize>],
-    algorithm_version: u8,
-    options: EncodeOptions,
-) -> Result<bool> {
-    let Some(largest) = regions.iter().max_by_key(|range| range.len()) else {
-        return Ok(false);
-    };
-    let sample = filter_screen_sample(&data[largest.clone()]);
-    if sample.len() < FILTER_SCREEN_SAMPLE_ALIGNMENT {
-        return Ok(false);
-    }
-    let baseline =
-        encode_member_with_filter_specs_progress(sample, algorithm_version, &[], options, None)
-            .map_err(Error::from)?;
-    let filtered = encode_member_with_filter_specs_progress(
-        sample,
-        algorithm_version,
-        &[FilterSpec::whole(FilterKind::E8E9)],
-        options,
-        None,
-    )
-    .map_err(Error::from)?;
-    // No margin here, unlike the detectorless filters: the scanner has already
-    // ruled on where code is, so a small win on this sample is evidence rather
-    // than noise.
-    Ok(filtered.len() < baseline.len())
-}
-
-/// The x86 filter specs worth measuring against the whole member.
-///
-/// The scanner proposes overlapping regions at several clustering distances,
-/// and the old search priced every one of them with its own whole-member
-/// encode. Measured at full effort the whole spread is worth about a third of a
-/// percent, so this keeps the two that are structurally different: filter
-/// everything, or filter only where the scanner saw code. The second is only
-/// worth an encode when there is enough non-code to protect.
-fn x86_filter_finalists(data: &[u8], regions: &[std::ops::Range<usize>]) -> Vec<Vec<FilterSpec>> {
-    let covered: usize = regions.iter().map(|range| range.len()).sum();
-    let (numerator, denominator) = X86_CODE_COVERAGE_RATIO;
-    let sparse = covered * denominator < data.len() * numerator;
-
-    let mut finalists = Vec::new();
-    for kind in [FilterKind::E8E9, FilterKind::E8] {
-        finalists.push(vec![FilterSpec::whole(kind)]);
-        if sparse {
-            finalists.push(
-                regions
-                    .iter()
-                    .map(|range| FilterSpec::range(kind, range.clone()))
-                    .collect(),
-            );
+    fn encode_filtered(
+        &self,
+        data: &[u8],
+        filters: &[FilterSpec],
+        options: EncodeOptions,
+        progress: Option<&mut dyn FnMut(usize) -> bool>,
+    ) -> Result<Vec<u8>> {
+        let mut encoder = Unpack50Encoder::with_options(options);
+        match progress {
+            Some(progress) => encoder.encode_member_with_filters_and_progress(
+                data,
+                self.algorithm_version,
+                filters,
+                progress,
+            ),
+            None => encoder.encode_member_with_filters(data, self.algorithm_version, filters),
         }
+        .map_err(Error::from)
     }
-    finalists
 }
 
-/// The filter specs worth measuring against the whole member, paired with the
-/// bytes for any the screen already measured.
-///
-/// Everything expensive happens downstream of this, one whole-member encode per
-/// unmeasured finalist, so the job here is to hand back a handful rather than
-/// the several dozen the scanner and the delta widths can between them suggest.
-#[allow(clippy::type_complexity)]
-fn auto_size_filter_finalists(
-    data: &[u8],
-    algorithm_version: u8,
-    options: EncodeOptions,
-) -> Result<Vec<(Vec<FilterSpec>, Option<Vec<u8>>)>> {
-    let screen = screened_filter_kinds(data, algorithm_version, options)?;
-    let mut finalists = vec![(Vec::new(), screen.plain)];
-
-    let regions = x86_code_regions(data);
-    if x86_filter_helps_sample(data, &regions, algorithm_version, options)? {
-        finalists.extend(
-            x86_filter_finalists(data, &regions)
-                .into_iter()
-                .map(|specs| (specs, None)),
-        );
-    }
-
-    for (kind, packed) in screen.kinds {
-        finalists.push((vec![FilterSpec::whole(kind)], packed));
-        if let FilterKind::Delta { channels } = kind {
-            if let Some(range) = auto_delta_filter_range(data, channels) {
-                finalists.push((vec![FilterSpec::range(kind, range)], None));
-            }
-        }
-    }
-
-    Ok(finalists)
-}
-
-/// Picks the filter for a member, returning the winning specs together with the
-/// bytes they produced so the caller does not have to encode the winner again.
-///
-/// Which filter suits a member is a property of the data, not of how hard the
-/// encoder is trying, so this is worth doing once even when several encoder
-/// settings are going to be compared afterwards.
-///
-/// Every finalist is measured at the caller's own encoder settings and the
-/// unfiltered member is always one of them, so the result can never be larger
-/// than leaving the data alone.
 fn choose_auto_size_filter(
     data: &[u8],
     algorithm_version: u8,
     options: EncodeOptions,
-    mut progress: Option<&mut dyn FnMut(usize) -> bool>,
+    progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<(Vec<FilterSpec>, Vec<u8>)> {
-    let mut best: Option<(Vec<FilterSpec>, Vec<u8>)> = None;
-    for (specs, measured) in auto_size_filter_finalists(data, algorithm_version, options)? {
-        let packed = match measured {
-            Some(packed) => packed,
-            None => encode_member_with_filter_specs_progress(
-                data,
-                algorithm_version,
-                &specs,
-                options,
-                borrow_progress(&mut progress),
-            )
-            .map_err(Error::from)?,
-        };
-        if best
-            .as_ref()
-            .is_none_or(|(_, best): &(_, Vec<u8>)| packed.len() < best.len())
-        {
-            best = Some((specs, packed));
-        }
-    }
-    Ok(best.expect("the unfiltered member is always a finalist"))
+    crate::filter_search::choose_filter(&Rar50Search { algorithm_version }, data, options, progress)
 }
 
 fn encode_member_with_auto_size_filter_progress(
@@ -702,50 +508,6 @@ fn encode_member_with_auto_size_filter_progress(
     }
     let (_, packed) = choose_auto_size_filter(data, algorithm_version, options, progress)?;
     Ok(packed)
-}
-
-fn is_text_like_filter_skip_candidate(data: &[u8]) -> bool {
-    let sample_len = data.len().min(8192);
-    if sample_len == 0 {
-        return false;
-    }
-    let sample = &data[..sample_len];
-    let text_bytes = sample
-        .iter()
-        .filter(|&&byte| matches!(byte, b'\t' | b'\n' | b'\r' | 0x20..=0x7e))
-        .count();
-    text_bytes * 100 / sample_len >= 95
-}
-
-pub(super) fn auto_delta_filter_range(
-    data: &[u8],
-    channels: usize,
-) -> Option<std::ops::Range<usize>> {
-    if channels == 0 || data.len() <= AUTO_DELTA_EDGE_SKIP * 2 + channels * 8 {
-        return None;
-    }
-    let start = AUTO_DELTA_EDGE_SKIP;
-    let end = data.len() - AUTO_DELTA_EDGE_SKIP;
-    let aligned_start = start + ((channels - start % channels) % channels);
-    let aligned_end = end - (end - aligned_start) % channels;
-    (aligned_start + channels * 8 <= aligned_end).then_some(aligned_start..aligned_end)
-}
-
-pub(super) fn disjoint_filter_ranges(
-    mut ranges: Vec<std::ops::Range<usize>>,
-) -> Vec<std::ops::Range<usize>> {
-    ranges.sort_by_key(|range| (range.start, range.end));
-    let mut disjoint: Vec<std::ops::Range<usize>> = Vec::new();
-    for range in ranges {
-        if let Some(last) = disjoint.last_mut() {
-            if range.start <= last.end {
-                last.end = last.end.max(range.end);
-                continue;
-            }
-        }
-        disjoint.push(range);
-    }
-    disjoint
 }
 
 fn encode_member_with_filter_specs_progress(
@@ -815,101 +577,5 @@ pub(super) fn solid_compression_flag(solid_continuation: bool) -> u64 {
         0x40
     } else {
         0
-    }
-}
-
-#[cfg(test)]
-mod screen_tests {
-    use super::*;
-
-    fn options() -> EncodeOptions {
-        encode_options_for_level(None, 128 * 1024).unwrap()
-    }
-
-    /// Interleaved counters: RAR's delta reorders them into planes of near
-    /// constants, which is a huge win the byte histogram cannot see.
-    fn interleaved_counters() -> Vec<u8> {
-        let mut data = Vec::new();
-        for index in 0..20_000u32 {
-            data.push(0xe8);
-            data.extend_from_slice(&index.to_le_bytes());
-            data.extend_from_slice(b"\x55\x89\xe5");
-        }
-        data
-    }
-
-    #[test]
-    fn screen_keeps_a_delta_width_that_pays_off() {
-        let data = interleaved_counters();
-        let kinds: Vec<_> = screened_filter_kinds(&data, 0, options())
-            .unwrap()
-            .kinds
-            .into_iter()
-            .map(|(kind, _)| kind)
-            .collect();
-        assert!(
-            kinds.contains(&FilterKind::Delta { channels: 4 }),
-            "delta 4 turns this into planes of constants, so it has to survive: {kinds:?}"
-        );
-    }
-
-    #[test]
-    fn screen_rejects_filters_on_incompressible_data() {
-        let mut state = 0x2545_f491_4f6c_dd1du64;
-        let data: Vec<u8> = std::iter::repeat_with(|| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state as u8
-        })
-        .take(400_000)
-        .collect();
-        assert!(
-            screened_filter_kinds(&data, 0, options())
-                .unwrap()
-                .kinds
-                .is_empty(),
-            "nothing helps random bytes, and finding that out must not cost whole-member encodes"
-        );
-    }
-
-    #[test]
-    fn a_short_member_reuses_the_screens_encodes() {
-        let data = interleaved_counters()[..100_000].to_vec();
-        assert!(data.len() <= FILTER_SCREEN_SAMPLE_LEN);
-        let screen = screened_filter_kinds(&data, 0, options()).unwrap();
-        assert!(screen.plain.is_some(), "the unfiltered encode is reusable");
-        assert!(
-            screen.kinds.iter().all(|(_, packed)| packed.is_some()),
-            "so is every survivor's"
-        );
-    }
-
-    #[test]
-    fn the_search_never_loses_to_no_filter() {
-        for data in [
-            interleaved_counters(),
-            b"the quick brown fox ".repeat(20_000),
-            (0..300_000u32).map(|index| (index / 3) as u8).collect(),
-        ] {
-            let plain = encode_safe_lz_member(&data, 0, options()).unwrap();
-            let (specs, packed) = choose_auto_size_filter(&data, 0, options(), None).unwrap();
-            assert!(
-                packed.len() <= plain.len(),
-                "{specs:?} came out at {} against {} unfiltered",
-                packed.len(),
-                plain.len()
-            );
-        }
-    }
-
-    #[test]
-    fn the_screen_sample_sits_in_the_middle_and_keeps_delta_planes_aligned() {
-        let data = vec![0u8; 5 * FILTER_SCREEN_SAMPLE_LEN + 7];
-        let sample = filter_screen_sample(&data);
-        assert_eq!(sample.len(), FILTER_SCREEN_SAMPLE_LEN);
-        let start = sample.as_ptr() as usize - data.as_ptr() as usize;
-        assert_eq!(start % FILTER_SCREEN_SAMPLE_ALIGNMENT, 0);
-        assert!(start > 0 && start + sample.len() < data.len());
     }
 }

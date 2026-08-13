@@ -39,7 +39,6 @@ use volume::{
 
 const MAX_MATCH_CANDIDATES_DEFAULT: usize = 256;
 const DEFAULT_RAR50_DICTIONARY_SIZE: u64 = 128 * 1024;
-const AUTO_DELTA_EDGE_SKIP: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1855,13 +1854,15 @@ fn validate_file_entry(name: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::filter_policy::{
-        auto_delta_filter_range, disjoint_filter_ranges, encode_member_with_auto_size_filter,
-        encode_member_with_filter_policy_candidates, encode_member_with_filter_spec,
-        encode_member_with_filter_specs,
+        encode_member_with_auto_size_filter, encode_member_with_filter_policy_candidates,
+        encode_member_with_filter_spec, encode_member_with_filter_specs,
     };
     use super::*;
     use crate::codec::rar50::{encode_literal_only, encode_lz_member};
     use crate::codec::rar50::{encode_lz_member_with_options, EncodeOptions};
+    use crate::filter_search::{
+        auto_delta_filter_range, disjoint_filter_ranges, AUTO_DELTA_EDGE_SKIP,
+    };
     use crate::x86_filter_scan::auto_x86_filter_ranges;
     use crate::{ArchiveVersion, FeatureSet};
     use std::cell::RefCell;
@@ -2463,19 +2464,6 @@ mod tests {
 
         assert_eq!(filters.len(), 2);
         assert_eq!(output, data);
-    }
-
-    #[test]
-    fn auto_delta_filter_range_skips_container_edges_and_aligns_channels() {
-        let data = vec![0u8; 512];
-
-        let range = auto_delta_filter_range(&data, 3).unwrap();
-
-        assert!(range.start >= AUTO_DELTA_EDGE_SKIP);
-        assert!(range.end <= data.len() - AUTO_DELTA_EDGE_SKIP);
-        assert_eq!(range.start % 3, 0);
-        assert_eq!((range.end - range.start) % 3, 0);
-        assert!(auto_delta_filter_range(&data[..80], 3).is_none());
     }
 
     #[test]

@@ -209,6 +209,7 @@ fn compress_members_whole(
                     let walk = super::filter_policy_walk_bytes(
                         &data,
                         &plan.filter_policy,
+                        plan.algorithm_version,
                         plan.candidates.len(),
                     )
                     .max(input_size)
