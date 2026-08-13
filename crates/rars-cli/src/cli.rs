@@ -222,6 +222,22 @@ impl TargetFormat {
             Self::Rar70 => ArchiveVersion::Rar70,
         }
     }
+
+    /// The `--format` value for a version, if the argument accepts one.
+    /// ArchiveVersion::Rar13 has no spelling here, so it is never suggested.
+    pub(crate) fn from_archive_version(version: ArchiveVersion) -> Option<Self> {
+        match version {
+            ArchiveVersion::Rar14 => Some(Self::Rar14),
+            ArchiveVersion::Rar15 => Some(Self::Rar15),
+            ArchiveVersion::Rar20 => Some(Self::Rar20),
+            ArchiveVersion::Rar29 => Some(Self::Rar29),
+            ArchiveVersion::Rar30 => Some(Self::Rar30),
+            ArchiveVersion::Rar40 => Some(Self::Rar40),
+            ArchiveVersion::Rar50 => Some(Self::Rar50),
+            ArchiveVersion::Rar70 => Some(Self::Rar70),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Copy, Clone, ValueEnum)]

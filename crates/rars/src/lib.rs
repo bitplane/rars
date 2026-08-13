@@ -36,7 +36,9 @@ mod x86_filter_scan;
 pub use detect::{detect_archive_family, find_archive_start, ArchiveSignature, SFX_SCAN_LIMIT};
 pub use error::{Error, Result};
 pub use features::{Feature, FeatureSet};
-pub use filter::{FilterKind, FilterPolicy, FilterSpec, UnsupportedFilterKind};
+pub use filter::{
+    formats_supporting_filter, FilterKind, FilterPolicy, FilterSpec, UnsupportedFilterKind,
+};
 use std::io::{Read, Write};
 use std::path::Path;
 pub use streaming::{EntryReader, EntrySource, WriterResources, DEFAULT_WRITER_MEMORY_LIMIT};

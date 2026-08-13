@@ -100,6 +100,36 @@ impl FilterPolicy {
     }
 }
 
+impl FilterKind {
+    /// Whether this format's writer can encode this filter.
+    ///
+    /// Answered by the same conversions the writers use, so the question and
+    /// the refusal cannot disagree.
+    pub fn is_supported_by(self, target: crate::ArchiveVersion) -> bool {
+        match target.family() {
+            crate::version::ArchiveFamily::Rar50Plus => {
+                crate::codec::rar50::Rar50Filter::try_from(self).is_ok()
+            }
+            crate::version::ArchiveFamily::Rar15To40 => {
+                // RAR 1.5 and 2.0 predate the filter VM entirely.
+                !matches!(
+                    target,
+                    crate::ArchiveVersion::Rar15 | crate::ArchiveVersion::Rar20
+                ) && crate::codec::rar29::Rar29Filter::try_from(self).is_ok()
+            }
+            crate::version::ArchiveFamily::Rar13 => false,
+        }
+    }
+}
+
+/// Every format whose writer can encode `kind`.
+pub fn formats_supporting_filter(kind: FilterKind) -> Vec<crate::ArchiveVersion> {
+    crate::ArchiveVersion::ALL
+        .into_iter()
+        .filter(|&target| kind.is_supported_by(target))
+        .collect()
+}
+
 /// A filter the target format has no way to encode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UnsupportedFilterKind(pub FilterKind);
@@ -153,6 +183,37 @@ mod tests {
                 Err(UnsupportedFilterKind(kind)),
                 "{kind:?}"
             );
+        }
+    }
+
+    #[test]
+    fn each_filter_names_the_formats_that_can_write_it() {
+        use crate::ArchiveVersion;
+        assert_eq!(
+            formats_supporting_filter(FilterKind::Arm),
+            vec![ArchiveVersion::Rar50, ArchiveVersion::Rar70]
+        );
+        assert_eq!(
+            formats_supporting_filter(FilterKind::Itanium),
+            vec![
+                ArchiveVersion::Rar29,
+                ArchiveVersion::Rar30,
+                ArchiveVersion::Rar40
+            ]
+        );
+        // Delta is the one every filtering format has.
+        assert_eq!(
+            formats_supporting_filter(FilterKind::Delta { channels: 2 }),
+            vec![
+                ArchiveVersion::Rar29,
+                ArchiveVersion::Rar30,
+                ArchiveVersion::Rar40,
+                ArchiveVersion::Rar50,
+                ArchiveVersion::Rar70
+            ]
+        );
+        for kind in ALL {
+            assert!(!formats_supporting_filter(kind).is_empty(), "{kind:?}");
         }
     }
 

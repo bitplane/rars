@@ -1,5 +1,6 @@
 //! Command-line frontend for the `rars` RAR archive toolkit.
 
+mod add_plan;
 mod cli;
 mod error;
 mod input;
@@ -1067,14 +1068,55 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
 
     validate_archive_output_path(&archive_path)?;
 
-    if quick_open && !matches!(target, ArchiveVersion::Rar50 | ArchiveVersion::Rar70) {
-        return Err("Quick Open is only available for RAR 5+ writers".into());
-    }
-    if recovery_percent.is_some()
-        && !matches!(target, ArchiveVersion::Rar50 | ArchiveVersion::Rar70)
-    {
-        return Err("recovery records are only available for RAR 5+ writers".into());
-    }
+    // Everything the chosen format cannot do is refused here, before a single
+    // input is read, and named by the flag that asked for it.
+    let asked_filters = add_plan::AskedFilters {
+        delta: delta_filter.is_some(),
+        e8: e8_filter == Some(false),
+        e8e9: e8_filter == Some(true),
+        itanium: itanium_filter,
+        rgb: rgb_filter.is_some(),
+        audio: audio_filter.is_some(),
+        arm: arm_filter,
+    };
+    let shape = rars::PlanShape::new()
+        .compressed(compress)
+        .volumes(volume_size.is_some())
+        .filtered(asked_filters.count() > 0 || auto_filter);
+    add_plan::reject_unsupported(
+        target,
+        shape,
+        &asked_filters,
+        &[
+            (rars::WriterOption::Feature(rars::Feature::Solid), solid),
+            (
+                rars::WriterOption::Feature(rars::Feature::HeaderEncryption),
+                header_encryption,
+            ),
+            (
+                rars::WriterOption::Feature(rars::Feature::QuickOpen),
+                quick_open,
+            ),
+            (
+                rars::WriterOption::DictionarySize,
+                dictionary_size.is_some(),
+            ),
+            (rars::WriterOption::Filter, asked_filters.count() > 0),
+            (
+                rars::WriterOption::RecoveryRecord,
+                recovery_percent.is_some(),
+            ),
+            (rars::WriterOption::VolumeSize, volume_size.is_some()),
+            (
+                rars::WriterOption::ArchiveComment,
+                archive_comment.is_some(),
+            ),
+            (rars::WriterOption::FileComment, file_comment.is_some()),
+            (rars::WriterOption::ArchiveMetadata, archive_name.is_some()),
+            (rars::WriterOption::Password, password.is_some()),
+        ],
+    )?;
+    add_plan::reject_unsupported_filter(target, &asked_filters)?;
     if matches!(
         target,
         ArchiveVersion::Rar15

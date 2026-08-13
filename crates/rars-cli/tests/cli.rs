@@ -1719,7 +1719,8 @@ fn rejects_dictionary_size_for_rar13_writer() {
         .unwrap();
 
     assert!(!create.status.success());
-    assert!(stderr(&create).contains("--dict-size is available only for RAR 1.5+"));
+    assert!(stderr(&create)
+        .contains("--dict-size is not supported by --format rar14; use --format rar15"));
 }
 
 #[test]
@@ -4898,7 +4899,10 @@ fn rejects_rar29_only_filters_for_rar5_writer() {
 
         assert!(!output.status.success(), "{flag} was accepted");
         assert!(
-            stderr(&output).contains(&format!("{flag} is only available")),
+            stderr(&output).contains(&format!(
+                "{flag} is not supported by --format rar50; \
+                 use --format rar29, --format rar30 or --format rar40"
+            )),
             "{flag}: {}",
             stderr(&output)
         );
@@ -5422,5 +5426,129 @@ fn rar5_explicit_filters_combine_with_the_rest_of_the_writer() {
             stderr(&output)
         );
         assert!(archive.exists(), "{name} wrote no archive");
+    }
+}
+
+/// Every flag-and-format pair the add path refuses, with its exact wording.
+///
+/// Full equality rather than `contains`, because the convention of matching a
+/// prefix is why these messages grew three different openers and two tense
+/// conventions without anyone noticing.
+const REJECTED_COMBINATIONS: &[(&[&str], &str)] = &[
+    (
+        &["--format", "rar14", "--dict-size", "512k"],
+        "error: --dict-size is not supported by --format rar14; use --format rar15, \
+         --format rar20, --format rar29, --format rar30, --format rar40, --format rar50 \
+         or --format rar70",
+    ),
+    (
+        &["--format", "rar14", "--quick-open"],
+        "error: --quick-open is not supported by --format rar14; use --format rar50 \
+         or --format rar70",
+    ),
+    (
+        &["--format", "rar29", "--recovery-percent", "5"],
+        "error: --recovery-percent is not supported by --format rar29; use --format rar50 \
+         or --format rar70",
+    ),
+    (
+        &["--format", "rar29", "--archive-name", "set.rar"],
+        "error: --archive-name is not supported by --format rar29; use --format rar50 \
+         or --format rar70",
+    ),
+    (
+        &["--format", "rar15", "--encrypt-headers", "--password", "pw"],
+        "error: --encrypt-headers is not supported by --format rar15; use --format rar30, \
+         --format rar40, --format rar50 or --format rar70",
+    ),
+    (
+        &["--format", "rar50", "--rgb-filter", "3"],
+        "error: --rgb-filter is not supported by --format rar50; use --format rar29, \
+         --format rar30 or --format rar40",
+    ),
+    (
+        &["--format", "rar50", "--itanium-filter"],
+        "error: --itanium-filter is not supported by --format rar50; use --format rar29, \
+         --format rar30 or --format rar40",
+    ),
+    (
+        &["--format", "rar29", "--arm-filter"],
+        "error: --arm-filter is not supported by --format rar29; use --format rar50 \
+         or --format rar70",
+    ),
+    (
+        &["--format", "rar30", "--file-comment", "note"],
+        "error: --file-comment is not supported by --format rar30; use --format rar14, \
+         --format rar15, --format rar20, --format rar29, --format rar50 or --format rar70",
+    ),
+];
+
+#[test]
+fn add_refuses_unsupported_flags_by_name_and_says_where_to_go() {
+    let dir = scratch("add-rejections");
+    let source = dir.join("payload.txt");
+    fs::write(&source, b"payload\n").unwrap();
+
+    for (extra, expected) in REJECTED_COMBINATIONS {
+        let archive = dir.join("created.rar");
+        let _ = fs::remove_file(&archive);
+        let output = rars()
+            .arg("a")
+            .args(*extra)
+            .arg(&archive)
+            .arg(&source)
+            .output()
+            .unwrap();
+
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{extra:?} should be a usage error\n{}",
+            stderr(&output)
+        );
+        assert_eq!(stderr(&output).trim(), *expected, "{extra:?}");
+        assert!(!archive.exists(), "{extra:?} still wrote an archive");
+    }
+}
+
+/// The mirror of the table above. A flag asking for what the format already
+/// does has to stay silent, or refusing things becomes its own kind of noise.
+#[test]
+fn add_accepts_flags_that_ask_for_what_already_happens() {
+    let dir = scratch("add-silent-acceptance");
+    let source = dir.join("payload.txt");
+    fs::write(&source, b"payload that compresses a little\n".repeat(64)).unwrap();
+
+    for (index, extra) in [
+        // Neither format looks for a filter, so asking it not to changes nothing.
+        vec!["--format", "rar14", "--no-filter"],
+        vec!["--format", "rar20", "--no-filter"],
+        // RAR 5 already searches by default.
+        vec!["--format", "rar50", "--auto-filter"],
+        // RAR 1.3 does write solid archives.
+        vec!["--format", "rar14", "--solid"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let archive = dir.join(format!("quiet{index}.rar"));
+        let output = rars()
+            .arg("a")
+            .args(&extra)
+            .arg(&archive)
+            .arg(&source)
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "{extra:?} was refused: {}",
+            stderr(&output)
+        );
+        assert!(
+            !stderr(&output).contains("warning"),
+            "{extra:?} warned: {}",
+            stderr(&output)
+        );
     }
 }
