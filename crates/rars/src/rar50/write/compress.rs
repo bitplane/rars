@@ -14,6 +14,7 @@
 
 use super::filter_policy::{
     compression_info, encode_member_with_filter_policy_candidates_and_progress,
+    should_store_compressed_payload,
 };
 use super::FilterPolicy;
 use crate::codec::rar50::{encode_lz_streaming_block, EncodeOptions};
@@ -72,6 +73,17 @@ pub(super) fn compress_members(
     plan: CompressPlan,
     resources: &WriterResources,
 ) -> Result<Vec<CompressedMember>> {
+    compress_members_reporting(sources, plan, resources, &mut |_| true)
+}
+
+/// `advance` is called with each newly completed chunk of work and returns
+/// false when the caller wants to stop.
+pub(super) fn compress_members_reporting(
+    sources: &[EntrySource],
+    plan: CompressPlan,
+    resources: &WriterResources,
+    advance: &mut dyn FnMut(u64) -> bool,
+) -> Result<Vec<CompressedMember>> {
     let mut integrity = Vec::with_capacity(sources.len());
     for source in sources {
         let input_size = source.len()?;
@@ -96,12 +108,17 @@ pub(super) fn compress_members(
     let wants_whole_member =
         plan.method != 0 && (plan.filter_policy != FilterPolicy::None || plan.candidates.len() > 1);
     if wants_whole_member && !plan.solid {
-        return compress_members_whole(sources, &integrity, &plan, resources);
+        return compress_members_whole(sources, &integrity, &plan, resources, advance);
     }
 
     // Storing is not "compress and hope it does not help": the header records
     // method zero, so the payload must be the source bytes.
     let packed = if plan.method == 0 {
+        for (input_size, _, _) in &integrity {
+            if !advance(*input_size) {
+                return Err(Error::Cancelled);
+            }
+        }
         integrity
             .iter()
             .map(|_| Spool::create(resources))
@@ -114,6 +131,7 @@ pub(super) fn compress_members(
             batch_capacity,
             required,
             resources,
+            advance,
         )?
     } else {
         compress_independent_members(
@@ -123,6 +141,7 @@ pub(super) fn compress_members(
             batch_capacity,
             required,
             resources,
+            advance,
         )?
     };
 
@@ -164,6 +183,7 @@ fn compress_members_whole(
     integrity: &[(u64, u32, [u8; 32])],
     plan: &CompressPlan,
     resources: &WriterResources,
+    advance: &mut dyn FnMut(u64) -> bool,
 ) -> Result<Vec<CompressedMember>> {
     let mut members = Vec::with_capacity(sources.len());
     for (index, source) in sources.iter().enumerate() {
@@ -182,14 +202,42 @@ fn compress_members_whole(
                             "entry source size changed while compressing",
                         ));
                     }
+                    // The encoder walks the member once per attempt, so its
+                    // positions are scaled down to the member's share of the
+                    // total: many passes, one member's worth of progress.
+                    let attempts = super::filter_policy_attempt_count(&data, plan.filter_policy)
+                        .max(1)
+                        * plan.candidates.len().max(1) as u64;
+                    let mut reported = 0u64;
+                    let mut charged = 0u64;
+                    let mut report = |position: usize| {
+                        let position = position as u64;
+                        if position < reported {
+                            // A new attempt restarted at the beginning.
+                            reported = 0;
+                        }
+                        let delta = position - reported;
+                        reported = position;
+                        let target = (charged + delta).min(input_size.saturating_mul(attempts));
+                        let scaled = target / attempts - charged / attempts;
+                        charged = target;
+                        advance(scaled)
+                    };
                     let packed = encode_member_with_filter_policy_candidates_and_progress(
                         &data,
                         plan.algorithm_version,
                         plan.filter_policy,
                         &plan.candidates,
-                        None,
+                        Some(&mut report),
                     )?;
-                    stored = packed.len() as u64 >= input_size;
+                    // An explicitly requested filter is not discarded just
+                    // because the result did not shrink.
+                    stored = should_store_compressed_payload(
+                        &data,
+                        &packed,
+                        plan.solid,
+                        plan.filter_policy,
+                    );
                     if !stored {
                         packed_spool.write_all(&packed)?;
                     }
@@ -199,7 +247,7 @@ fn compress_members_whole(
                         return Err(error);
                     }
                     // Too big to filter; compress it as a stream instead.
-                    let streamed = compress_members(
+                    let streamed = compress_members_reporting(
                         std::slice::from_ref(source),
                         CompressPlan {
                             filter_policy: FilterPolicy::None,
@@ -207,6 +255,7 @@ fn compress_members_whole(
                             ..plan.clone()
                         },
                         resources,
+                        advance,
                     )?;
                     members.extend(streamed);
                     continue;
@@ -228,6 +277,7 @@ fn compress_members_whole(
 
 /// Members with independent dictionaries, interleaved so a batch of small
 /// members can still saturate the machine.
+#[allow(clippy::too_many_arguments)]
 fn compress_independent_members(
     sources: &[EntrySource],
     integrity: &[(u64, u32, [u8; 32])],
@@ -235,6 +285,7 @@ fn compress_independent_members(
     batch_capacity: usize,
     required: u64,
     resources: &WriterResources,
+    advance: &mut dyn FnMut(u64) -> bool,
 ) -> Result<Vec<Spool>> {
     let mut packed = Vec::with_capacity(sources.len());
     for (group_index, group) in sources.chunks(batch_capacity).enumerate() {
@@ -286,7 +337,7 @@ fn compress_independent_members(
                 );
             }
 
-            compress_wave(jobs, plan, &mut streams)?;
+            compress_wave(jobs, plan, &mut streams, advance)?;
         }
 
         packed.extend(streams.into_iter().map(|stream| stream.packed));
@@ -295,6 +346,7 @@ fn compress_independent_members(
 }
 
 /// One dictionary running through every member in order.
+#[allow(clippy::too_many_arguments)]
 fn compress_solid_chain(
     sources: &[EntrySource],
     integrity: &[(u64, u32, [u8; 32])],
@@ -302,6 +354,7 @@ fn compress_solid_chain(
     batch_capacity: usize,
     required: u64,
     resources: &WriterResources,
+    advance: &mut dyn FnMut(u64) -> bool,
 ) -> Result<Vec<Spool>> {
     let mut streams = sources
         .iter()
@@ -353,7 +406,7 @@ fn compress_solid_chain(
         if jobs.is_empty() {
             break;
         }
-        compress_wave(jobs, plan, &mut streams)?;
+        compress_wave(jobs, plan, &mut streams, advance)?;
     }
 
     Ok(streams.into_iter().map(|stream| stream.packed).collect())
@@ -393,7 +446,9 @@ fn compress_wave(
     jobs: Vec<BlockJob>,
     plan: &CompressPlan,
     streams: &mut [MemberStream],
+    advance: &mut dyn FnMut(u64) -> bool,
 ) -> Result<()> {
+    let wave_bytes: u64 = jobs.iter().map(|job| job.data.len() as u64).sum();
     let packed_blocks = crate::parallel::map_collect(jobs, |job| {
         let packed = encode_lz_streaming_block(
             &job.data,
@@ -406,6 +461,9 @@ fn compress_wave(
     })?;
     for (member, packed) in packed_blocks {
         streams[member].packed.write_all(&packed)?;
+    }
+    if !advance(wave_bytes) {
+        return Err(Error::Cancelled);
     }
     Ok(())
 }

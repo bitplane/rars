@@ -152,10 +152,6 @@ impl<'a> WorkTracker<'a> {
         self.advance(self.total.saturating_sub(completed))
     }
 
-    pub(crate) fn is_cancelled(&self) -> bool {
-        self.progress.is_some_and(ProgressReporter::is_cancelled)
-    }
-
     pub(crate) fn entry_started(
         &self,
         index: usize,

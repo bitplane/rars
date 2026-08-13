@@ -102,18 +102,55 @@ pub(super) fn write_archive(
     };
 
     let sources: Vec<_> = entries.iter().map(|entry| entry.source.clone()).collect();
-    let compressed = compress::compress_members(&sources, plan.compress.clone(), resources)?;
+    let total_input: u64 = sources
+        .iter()
+        .map(|source| source.len())
+        .sum::<Result<u64>>()?;
+    let total_entries = entries.len();
+    if let Some(progress) = plan.progress {
+        progress.report(crate::WriteProgressEvent::OperationStarted {
+            operation: crate::WriteOperation::Compression,
+            total_bytes: Some(total_input),
+            total_entries: Some(total_entries),
+            pass: 1,
+        });
+    }
+    let work = crate::write_progress::WorkTracker::new(
+        plan.progress,
+        crate::WriteOperation::Compression,
+        total_input,
+    );
+    let compressed = compress::compress_members_reporting(
+        &sources,
+        plan.compress.clone(),
+        resources,
+        &mut |done| work.advance(done),
+    )?;
 
     // Everything between the main header and the quick-open block, in order.
     let mut blocks: Vec<PreparedBlock> = Vec::with_capacity(entries.len() + 1);
     if let Some(comment) = &plan.archive_comment {
         blocks.push(prepare_comment(comment, header_keys.as_ref())?);
     }
-    for (entry, member) in entries.iter().zip(compressed) {
+    for (index, (entry, member)) in entries.iter().zip(compressed).enumerate() {
+        work.entry_started(index, total_entries, &entry.name, member.input_size);
+        let input_size = member.input_size;
         blocks.push(prepare_member(entry, member, &plan, header_keys.as_ref())?);
         for service in &entry.services {
             blocks.push(prepare_service(service, header_keys.as_ref())?);
         }
+        work.entry_finished(index, total_entries, &entry.name, input_size);
+    }
+    if !work.finish() {
+        return Err(Error::Cancelled);
+    }
+    if let Some(progress) = plan.progress {
+        progress.report(crate::WriteProgressEvent::OperationFinished {
+            operation: crate::WriteOperation::Compression,
+            total_bytes: Some(total_input),
+            total_entries: Some(total_entries),
+            pass: 1,
+        });
     }
 
     let body_len = blocks.iter().try_fold(0u64, |total, block| {
