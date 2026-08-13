@@ -1452,46 +1452,6 @@ fn encode_decode_num_prefix(
     None
 }
 
-#[cfg(test)]
-fn decode_num_prefix_is_stable(
-    code: u32,
-    len: usize,
-    target: u32,
-    start_pos: u32,
-    dec_tab: &[u16],
-    pos_tab: &[u16],
-) -> bool {
-    let relevant_tail_bits = 16usize.saturating_sub(len + 4);
-    for tail in 0..(1u32 << relevant_tail_bits) {
-        let bit_field = (code << (16 - len)) | (tail << 4);
-        let (decoded, consumed) = simulate_decode_num(bit_field, start_pos, dec_tab, pos_tab);
-        if decoded != target || consumed != len {
-            return false;
-        }
-    }
-    true
-}
-
-#[cfg(test)]
-fn simulate_decode_num(
-    bit_field: u32,
-    mut start_pos: u32,
-    dec_tab: &[u16],
-    pos_tab: &[u16],
-) -> (u32, usize) {
-    let num = bit_field & 0xfff0;
-    let mut i = 0usize;
-    while dec_tab[i] as u32 <= num {
-        start_pos += 1;
-        i += 1;
-    }
-    (
-        ((num - if i > 0 { dec_tab[i - 1] as u32 } else { 0 }) >> (16 - start_pos))
-            + pos_tab[start_pos as usize] as u32,
-        start_pos as usize,
-    )
-}
-
 #[derive(Clone)]
 pub struct Unpack15 {
     bits: BitReader,
@@ -2130,12 +2090,50 @@ fn corr_huff(char_set: &mut [u16; 256], num_to_place: &mut [u8; 256]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_num_bit_cost, decode_num_prefix_is_stable, find_long_lz, find_lz_token,
-        find_old_dist_lz, long_lz_buckets, should_lazy_emit_literal, unpack15_decode,
-        unpack15_encode, EncodeOptions, EncodedToken, LongLz, LzPlanState, OldDistLz, ShortLz,
-        Unpack15, Unpack15Encoder, DEC_HF0, DEC_HF1, DEC_HF2, DEC_HF3, DEC_HF4, DEC_L1, DEC_L2,
-        POS_HF0, POS_HF1, POS_HF2, POS_HF3, POS_HF4, POS_L1, POS_L2,
+        decode_num_bit_cost, find_long_lz, find_lz_token, find_old_dist_lz, long_lz_buckets,
+        should_lazy_emit_literal, unpack15_decode, unpack15_encode, EncodeOptions, EncodedToken,
+        LongLz, LzPlanState, OldDistLz, ShortLz, Unpack15, Unpack15Encoder, DEC_HF0, DEC_HF1,
+        DEC_HF2, DEC_HF3, DEC_HF4, DEC_L1, DEC_L2, POS_HF0, POS_HF1, POS_HF2, POS_HF3, POS_HF4,
+        POS_L1, POS_L2,
     };
+
+    fn decode_num_prefix_is_stable(
+        code: u32,
+        len: usize,
+        target: u32,
+        start_pos: u32,
+        dec_tab: &[u16],
+        pos_tab: &[u16],
+    ) -> bool {
+        let relevant_tail_bits = 16usize.saturating_sub(len + 4);
+        for tail in 0..(1u32 << relevant_tail_bits) {
+            let bit_field = (code << (16 - len)) | (tail << 4);
+            let (decoded, consumed) = simulate_decode_num(bit_field, start_pos, dec_tab, pos_tab);
+            if decoded != target || consumed != len {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn simulate_decode_num(
+        bit_field: u32,
+        mut start_pos: u32,
+        dec_tab: &[u16],
+        pos_tab: &[u16],
+    ) -> (u32, usize) {
+        let num = bit_field & 0xfff0;
+        let mut i = 0usize;
+        while dec_tab[i] as u32 <= num {
+            start_pos += 1;
+            i += 1;
+        }
+        (
+            ((num - if i > 0 { dec_tab[i - 1] as u32 } else { 0 }) >> (16 - start_pos))
+                + pos_tab[start_pos as usize] as u32,
+            start_pos as usize,
+        )
+    }
 
     #[test]
     fn probe_rar15_solid() {

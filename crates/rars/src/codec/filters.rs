@@ -14,33 +14,6 @@ pub(crate) struct DeltaErrorMessages {
     pub truncated_source: &'static str,
 }
 
-#[cfg(test)]
-pub(crate) fn encode(op: FilterOp, data: &[u8], file_offset: u32) -> Result<Vec<u8>> {
-    encode_with_messages(op, data, file_offset, DeltaErrorMessages::generic())
-}
-
-#[cfg(test)]
-pub(crate) fn encode_with_messages(
-    op: FilterOp,
-    data: &[u8],
-    file_offset: u32,
-    messages: DeltaErrorMessages,
-) -> Result<Vec<u8>> {
-    match op {
-        FilterOp::E8 => {
-            let mut out = data.to_vec();
-            e8e9_encode(&mut out, file_offset, false);
-            Ok(out)
-        }
-        FilterOp::E8E9 => {
-            let mut out = data.to_vec();
-            e8e9_encode(&mut out, file_offset, true);
-            Ok(out)
-        }
-        FilterOp::Delta { channels } => delta_encode(data, channels, messages),
-    }
-}
-
 pub(crate) fn encode_in_place(
     op: FilterOp,
     data: &mut [u8],
@@ -184,20 +157,24 @@ pub(crate) fn delta_encode(
     Ok(out)
 }
 
-impl DeltaErrorMessages {
-    #[cfg(test)]
-    pub(crate) const fn generic() -> Self {
-        Self {
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn generic_messages() -> DeltaErrorMessages {
+        DeltaErrorMessages {
             invalid_channels: "DELTA filter channel count is invalid",
             zero_channels: "DELTA filter has zero channels",
             truncated_source: "DELTA filter source is truncated",
         }
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    /// Filters a copy, going through the same dispatch the writers use.
+    fn encode(op: FilterOp, data: &[u8], file_offset: u32) -> Result<Vec<u8>> {
+        let mut out = data.to_vec();
+        encode_in_place(op, &mut out, file_offset, generic_messages())?;
+        Ok(out)
+    }
 
     fn x86_sample() -> Vec<u8> {
         let mut data = b"prefix ".to_vec();
@@ -278,13 +255,7 @@ mod tests {
         let input = x86_sample();
         let mut filtered = encode(FilterOp::E8, &input, 4096).unwrap();
 
-        decode_in_place(
-            FilterOp::E8,
-            &mut filtered,
-            4096,
-            DeltaErrorMessages::generic(),
-        )
-        .unwrap();
+        decode_in_place(FilterOp::E8, &mut filtered, 4096, generic_messages()).unwrap();
 
         assert_eq!(filtered, input);
     }
@@ -294,13 +265,7 @@ mod tests {
         let input = x86_sample();
         let mut filtered = encode(FilterOp::E8E9, &input, 8192).unwrap();
 
-        decode_in_place(
-            FilterOp::E8E9,
-            &mut filtered,
-            8192,
-            DeltaErrorMessages::generic(),
-        )
-        .unwrap();
+        decode_in_place(FilterOp::E8E9, &mut filtered, 8192, generic_messages()).unwrap();
 
         assert_eq!(filtered, input);
     }
@@ -344,7 +309,7 @@ mod tests {
             FilterOp::Delta { channels: 3 },
             &mut filtered,
             0,
-            DeltaErrorMessages::generic(),
+            generic_messages(),
         )
         .unwrap();
 
@@ -360,7 +325,7 @@ mod tests {
                 FilterOp::Delta { channels: 33 },
                 &mut filtered,
                 0,
-                DeltaErrorMessages::generic(),
+                generic_messages(),
             ),
             Err(Error::InvalidData("DELTA filter channel count is invalid"))
         );
@@ -372,13 +337,7 @@ mod tests {
         let expected = encode(FilterOp::E8E9, &input, 1234).unwrap();
         let mut actual = input;
 
-        encode_in_place(
-            FilterOp::E8E9,
-            &mut actual,
-            1234,
-            DeltaErrorMessages::generic(),
-        )
-        .unwrap();
+        encode_in_place(FilterOp::E8E9, &mut actual, 1234, generic_messages()).unwrap();
 
         assert_eq!(actual, expected);
     }

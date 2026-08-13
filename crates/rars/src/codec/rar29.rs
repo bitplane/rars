@@ -1227,12 +1227,6 @@ impl EncoderMatchState {
     }
 }
 
-#[cfg(test)]
-fn encode_tokens(input: &[u8], history: &[u8], options: EncodeOptions) -> Vec<EncodeToken> {
-    encode_tokens_with_progress(input, history, options, None)
-        .expect("encoding without cancellation cannot be cancelled")
-}
-
 fn encode_tokens_with_progress(
     input: &[u8],
     history: &[u8],
@@ -1329,18 +1323,6 @@ fn lazy_match_decision(
         }
     }
     (false, None)
-}
-
-#[cfg(test)]
-fn should_lazy_emit_literal(
-    input: &[u8],
-    pos: usize,
-    finder: &Rar29MatchFinder,
-    options: EncodeOptions,
-    state: &EncoderMatchState,
-    current: MatchCandidate,
-) -> bool {
-    lazy_match_decision(input, pos, finder, options, state, current).0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3200,17 +3182,33 @@ mod tests {
     use super::rarvm::{Instruction, Opcode, Operand, Program};
     use std::ops::Range;
 
+    fn encode_tokens(input: &[u8], history: &[u8], options: EncodeOptions) -> Vec<EncodeToken> {
+        encode_tokens_with_progress(input, history, options, None)
+            .expect("encoding without cancellation cannot be cancelled")
+    }
+
+    fn should_lazy_emit_literal(
+        input: &[u8],
+        pos: usize,
+        finder: &Rar29MatchFinder,
+        options: EncodeOptions,
+        state: &EncoderMatchState,
+        current: MatchCandidate,
+    ) -> bool {
+        lazy_match_decision(input, pos, finder, options, state, current).0
+    }
+
     use super::{
         apply_standard_filter, audio_encode, best_match, encode_ppmd_tokens,
-        encode_table_level_tokens, encode_tokens, encoded_filter_records_at, itanium_decode,
-        itanium_encode, should_lazy_emit_literal, split_large_filter, unpack29_decode,
+        encode_table_level_tokens, encode_tokens_with_progress, encoded_filter_records_at,
+        itanium_decode, itanium_encode, lazy_match_decision, split_large_filter, unpack29_decode,
         unpack29_encode_literals, unpack29_encode_ppmd, unpack29_encode_ppmd_literals,
         unpack29_encode_ppmd_with_filter, BitReader, BitWriter, EncodeOptions, EncodeToken,
-        EncoderMatchState, Error, Huffman, LevelToken, OwnedVmFilterRecord, PpmdEncodeToken,
-        Rar29MatchFinder, Result, StandardFilter, Unpack29, Unpack29Encoder, VmFilter, VmProgram,
-        VmProgramKind, MAIN_COUNT, MAX_MATCH_CANDIDATES, MAX_VM_AUDIO_FILTER_BLOCK_SIZE,
-        MAX_VM_DELTA_FILTER_BLOCK_SIZE, MAX_VM_FILTER_BLOCK_SIZE, RAR3_AUDIO_FILTER_BYTECODE,
-        TABLE_COUNT,
+        EncoderMatchState, Error, Huffman, LevelToken, MatchCandidate, OwnedVmFilterRecord,
+        PpmdEncodeToken, Rar29MatchFinder, Result, StandardFilter, Unpack29, Unpack29Encoder,
+        VmFilter, VmProgram, VmProgramKind, MAIN_COUNT, MAX_MATCH_CANDIDATES,
+        MAX_VM_AUDIO_FILTER_BLOCK_SIZE, MAX_VM_DELTA_FILTER_BLOCK_SIZE, MAX_VM_FILTER_BLOCK_SIZE,
+        RAR3_AUDIO_FILTER_BYTECODE, TABLE_COUNT,
     };
 
     const COMPRESSED_TEXT: &[u8] = &[

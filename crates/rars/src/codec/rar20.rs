@@ -470,17 +470,6 @@ enum EncodeToken {
     },
 }
 
-#[cfg(test)]
-fn encode_tokens(
-    input: &[u8],
-    history: &[u8],
-    options: EncodeOptions,
-    cost_model: Option<&CostModel>,
-) -> Vec<EncodeToken> {
-    encode_tokens_with_progress(input, history, options, cost_model, None)
-        .expect("encoding without cancellation cannot be cancelled")
-}
-
 fn encode_tokens_with_progress(
     input: &[u8],
     history: &[u8],
@@ -2087,9 +2076,19 @@ impl BitWriter {
 #[cfg(test)]
 mod tests {
     use super::{
-        encode_tokens, unpack20_decode, unpack20_encode_literals, BitWriter, EncodeOptions,
-        EncodeToken, Error, Huffman, Unpack20, Unpack20Encoder,
+        encode_tokens_with_progress, unpack20_decode, unpack20_encode_literals, BitWriter,
+        CostModel, EncodeOptions, EncodeToken, Error, Huffman, Unpack20, Unpack20Encoder,
     };
+
+    fn encode_tokens(
+        input: &[u8],
+        history: &[u8],
+        options: EncodeOptions,
+        cost_model: Option<&CostModel>,
+    ) -> Vec<EncodeToken> {
+        encode_tokens_with_progress(input, history, options, cost_model, None)
+            .expect("encoding without cancellation cannot be cancelled")
+    }
 
     const AUTOREJ_PACKED: &[u8] = &[
         0x09, 0x14, 0x0c, 0x94, 0x00, 0x00, 0x00, 0x00, 0x00, 0xce, 0xf8, 0x1f, 0xc1, 0xe6, 0x05,

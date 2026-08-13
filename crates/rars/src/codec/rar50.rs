@@ -1237,17 +1237,6 @@ impl EncoderMatchState {
     }
 }
 
-#[cfg(test)]
-fn encode_tokens(
-    input: &[u8],
-    history: &[u8],
-    options: EncodeOptions,
-    distance_size: usize,
-) -> Vec<EncodeToken> {
-    encode_tokens_with_progress(input, history, options, distance_size, None)
-        .expect("encoding without cancellation cannot be cancelled")
-}
-
 fn encode_tokens_with_progress(
     input: &[u8],
     history: &[u8],
@@ -1363,19 +1352,6 @@ fn lazy_match_decision(
         }
     }
     (false, None)
-}
-
-#[cfg(test)]
-fn should_lazy_emit_literal(
-    input: &[u8],
-    pos: usize,
-    finder: &Rar50MatchFinder,
-    options: EncodeOptions,
-    state: &EncoderMatchState,
-    distance_size: usize,
-    current: MatchCandidate,
-) -> bool {
-    lazy_match_decision(input, pos, finder, options, state, distance_size, current).0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2816,6 +2792,27 @@ fn write_level_lengths(writer: &mut BitWriter, lengths: &[u8; LEVEL_TABLE_SIZE])
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn encode_tokens(
+        input: &[u8],
+        history: &[u8],
+        options: EncodeOptions,
+        distance_size: usize,
+    ) -> Vec<EncodeToken> {
+        encode_tokens_with_progress(input, history, options, distance_size, None)
+            .expect("encoding without cancellation cannot be cancelled")
+    }
+    fn should_lazy_emit_literal(
+        input: &[u8],
+        pos: usize,
+        finder: &Rar50MatchFinder,
+        options: EncodeOptions,
+        state: &EncoderMatchState,
+        distance_size: usize,
+        current: MatchCandidate,
+    ) -> bool {
+        lazy_match_decision(input, pos, finder, options, state, distance_size, current).0
+    }
 
     fn checksum(flags: u8, size_bytes: &[u8]) -> u8 {
         size_bytes
