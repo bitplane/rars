@@ -480,14 +480,31 @@ fn rar50_writer<'a>(
     }
 }
 
-fn rar50_volume_writer<'a>(
-    options: rars_rs::rar50::WriterOptions,
-    progress: Option<&'a PythonProgress>,
-) -> rars_rs::rar50::Rar50VolumeWriter<'a> {
-    let writer = rars_rs::rar50::Rar50VolumeWriter::new(options);
-    match progress {
-        Some(progress) => writer.progress(progress),
-        None => writer,
+/// Collects a RAR 5 volume set in memory, which is what the Python API hands
+/// back. The writer itself still holds one volume at a time.
+#[derive(Default)]
+struct CollectedVolumes(Arc<std::sync::Mutex<Vec<Vec<u8>>>>);
+
+struct CollectedVolume(Arc<std::sync::Mutex<Vec<Vec<u8>>>>, usize);
+
+impl std::io::Write for CollectedVolume {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap()[self.1].extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl rars_rs::rar50::VolumeSink for CollectedVolumes {
+    fn start_volume(&mut self, index: u64) -> rars_rs::Result<Box<dyn std::io::Write + Send>> {
+        self.0.lock().unwrap().push(Vec::new());
+        Ok(Box::new(CollectedVolume(
+            Arc::clone(&self.0),
+            index as usize,
+        )))
     }
 }
 
@@ -879,88 +896,47 @@ impl RarBuilder {
         }
     }
 
-    fn build_rar50_single(&self, progress: Option<&PythonProgress>) -> rars_rs::Result<Vec<u8>> {
+    /// Storing is a compression level, not a kind of member, so `store` wins
+    /// over any level the caller asked for.
+    fn rar50_options(&self) -> rars_rs::rar50::WriterOptions {
         let mut options = rars_rs::rar50::WriterOptions::new(self.format, self.features());
         if let Some(level) = self.compression {
             options = options.with_compression_level(level);
         }
-        if let Some(password) = self.password.as_deref() {
-            if self.store {
-                let entries: Vec<_> = self
-                    .entries
-                    .iter()
-                    .map(|entry| rars_rs::rar50::EncryptedStoredEntry {
-                        name: &entry.name,
-                        data: &entry.data,
-                        mtime: entry.mtime,
-                        attributes: rar50_attr(entry),
-                        host_os: DEFAULT_HOST_OS_UNIX,
-                        password,
-                    })
-                    .collect();
-                rar50_writer(options, progress)
-                    .encrypted_stored_entries(&entries)
-                    .encrypted_archive_comment(self.comment.as_deref().map(|data| {
-                        rars_rs::rar50::EncryptedArchiveCommentEntry { data, password }
-                    }))
-                    .recovery_percent(self.recovery_percent)
-                    .finish()
-            } else {
-                let entries: Vec<_> = self
-                    .entries
-                    .iter()
-                    .map(|entry| rars_rs::rar50::EncryptedCompressedEntry {
-                        name: &entry.name,
-                        data: &entry.data,
-                        mtime: entry.mtime,
-                        attributes: rar50_attr(entry),
-                        host_os: DEFAULT_HOST_OS_UNIX,
-                        password,
-                    })
-                    .collect();
-                rar50_writer(options, progress)
-                    .encrypted_compressed_entries(&entries)
-                    .encrypted_archive_comment(self.comment.as_deref().map(|data| {
-                        rars_rs::rar50::EncryptedArchiveCommentEntry { data, password }
-                    }))
-                    .recovery_percent(self.recovery_percent)
-                    .finish()
-            }
-        } else if self.store {
-            let entries: Vec<_> = self
-                .entries
-                .iter()
-                .map(|entry| rars_rs::rar50::StoredEntry {
-                    name: &entry.name,
-                    data: &entry.data,
-                    mtime: entry.mtime,
-                    attributes: rar50_attr(entry),
-                    host_os: DEFAULT_HOST_OS_UNIX,
-                })
-                .collect();
-            rar50_writer(options, progress)
-                .stored_entries(&entries)
-                .archive_comment(self.comment.as_deref())
-                .recovery_percent(self.recovery_percent)
-                .finish()
-        } else {
-            let entries: Vec<_> = self
-                .entries
-                .iter()
-                .map(|entry| rars_rs::rar50::CompressedEntry {
-                    name: &entry.name,
-                    data: &entry.data,
-                    mtime: entry.mtime,
-                    attributes: rar50_attr(entry),
-                    host_os: DEFAULT_HOST_OS_UNIX,
-                })
-                .collect();
-            rar50_writer(options, progress)
-                .compressed_entries(&entries)
-                .archive_comment(self.comment.as_deref())
-                .recovery_percent(self.recovery_percent)
-                .finish()
+        if self.store {
+            options = options.with_compression_level(0);
         }
+        options
+    }
+
+    fn rar50_entries(&self) -> Vec<rars_rs::rar50::ArchiveEntry> {
+        self.entries
+            .iter()
+            .map(|entry| {
+                let built = rars_rs::rar50::ArchiveEntry::new(
+                    entry.name.clone(),
+                    rars_rs::EntrySource::from_bytes(Arc::<[u8]>::from(entry.data.clone())),
+                )
+                .with_mtime(entry.mtime)
+                .with_attributes(rar50_attr(entry))
+                .with_host_os(DEFAULT_HOST_OS_UNIX);
+                match self.password.as_deref() {
+                    Some(password) => built.with_password(password.to_vec()),
+                    None => built,
+                }
+            })
+            .collect()
+    }
+
+    fn build_rar50_single(&self, progress: Option<&PythonProgress>) -> rars_rs::Result<Vec<u8>> {
+        let writer = rar50_writer(self.rar50_options(), progress)
+            .entries(self.rar50_entries())
+            .recovery_percent(self.recovery_percent);
+        let writer = match (self.comment.as_deref(), self.password.as_deref()) {
+            (Some(comment), Some(password)) => writer.encrypted_archive_comment(comment, password),
+            (comment, _) => writer.archive_comment(comment),
+        };
+        writer.finish()
     }
 
     fn build_rar15_single(&self, progress: Option<&PythonProgress>) -> rars_rs::Result<Vec<u8>> {
@@ -1058,92 +1034,24 @@ impl RarBuilder {
     fn build_rar50_volumes(
         &self,
         volume_size: usize,
-        progress: Option<&PythonProgress>,
+        _progress: Option<&PythonProgress>,
     ) -> rars_rs::Result<Vec<Vec<u8>>> {
         if self.comment.is_some() {
             return Err(rars_rs::Error::InvalidHeader(
                 "RAR 5 volume comments are not supported",
             ));
         }
-        let mut options = rars_rs::rar50::WriterOptions::new(self.format, self.features());
-        if let Some(level) = self.compression {
-            options = options.with_compression_level(level);
-        }
-        if let Some(password) = self.password.as_deref() {
-            if self.store {
-                if self.entries.len() != 1 {
-                    return Err(rars_rs::Error::InvalidHeader(
-                        "stored RAR 5 volumes support one input",
-                    ));
-                }
-                let entry = &self.entries[0];
-                rar50_volume_writer(options, progress)
-                    .encrypted_stored_entry(rars_rs::rar50::EncryptedStoredEntry {
-                        name: &entry.name,
-                        data: &entry.data,
-                        mtime: entry.mtime,
-                        attributes: rar50_attr(entry),
-                        host_os: DEFAULT_HOST_OS_UNIX,
-                        password,
-                    })
-                    .max_payload_per_volume(volume_size)
-                    .recovery_percent(self.recovery_percent)
-                    .finish()
-            } else {
-                let entries: Vec<_> = self
-                    .entries
-                    .iter()
-                    .map(|entry| rars_rs::rar50::EncryptedCompressedEntry {
-                        name: &entry.name,
-                        data: &entry.data,
-                        mtime: entry.mtime,
-                        attributes: rar50_attr(entry),
-                        host_os: DEFAULT_HOST_OS_UNIX,
-                        password,
-                    })
-                    .collect();
-                rar50_volume_writer(options, progress)
-                    .encrypted_compressed_entries(&entries)
-                    .max_payload_per_volume(volume_size)
-                    .recovery_percent(self.recovery_percent)
-                    .finish()
-            }
-        } else if self.store {
-            if self.entries.len() != 1 {
-                return Err(rars_rs::Error::InvalidHeader(
-                    "stored RAR 5 volumes support one input",
-                ));
-            }
-            let entry = &self.entries[0];
-            rar50_volume_writer(options, progress)
-                .stored_entry(rars_rs::rar50::StoredEntry {
-                    name: &entry.name,
-                    data: &entry.data,
-                    mtime: entry.mtime,
-                    attributes: rar50_attr(entry),
-                    host_os: DEFAULT_HOST_OS_UNIX,
-                })
-                .max_payload_per_volume(volume_size)
-                .recovery_percent(self.recovery_percent)
-                .finish()
-        } else {
-            let entries: Vec<_> = self
-                .entries
-                .iter()
-                .map(|entry| rars_rs::rar50::CompressedEntry {
-                    name: &entry.name,
-                    data: &entry.data,
-                    mtime: entry.mtime,
-                    attributes: rar50_attr(entry),
-                    host_os: DEFAULT_HOST_OS_UNIX,
-                })
-                .collect();
-            rar50_volume_writer(options, progress)
-                .compressed_entries(&entries)
-                .max_payload_per_volume(volume_size)
-                .recovery_percent(self.recovery_percent)
-                .finish()
-        }
+        let mut sink = CollectedVolumes::default();
+        rars_rs::rar50::write_streaming_volumes_to(
+            &self.rar50_entries(),
+            self.rar50_options(),
+            rars_rs::rar50::ArchiveExtras::default().with_recovery_percent(self.recovery_percent),
+            volume_size as u64,
+            &mut sink,
+            &rars_rs::WriterResources::default(),
+        )?;
+        let volumes = sink.0.lock().unwrap().clone();
+        Ok(volumes)
     }
 
     fn build_rar15_volumes(

@@ -1055,24 +1055,6 @@ impl Unpack50Encoder {
         Ok(packed)
     }
 
-    pub(crate) fn encode_member_with_progress(
-        &mut self,
-        input: &[u8],
-        algorithm_version: u8,
-        progress: &mut dyn FnMut(usize) -> bool,
-    ) -> Result<Vec<u8>> {
-        let packed = encode_lz_member_inner(
-            input,
-            &self.history,
-            algorithm_version,
-            &[],
-            self.options,
-            Some(progress),
-        )?;
-        self.remember(input);
-        Ok(packed)
-    }
-
     pub fn encode_member_with_filter(
         &mut self,
         input: &[u8],

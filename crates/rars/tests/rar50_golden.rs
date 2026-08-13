@@ -11,10 +11,8 @@
 //! Regenerate after an intentional format change with:
 //! `RARS_BLESS_GOLDEN=1 cargo test -p rars --test rar50_golden`
 
-use rars::rar50::{
-    ArchiveMetadataEntry, Rar50VolumeWriter, Rar50Writer, StoredEntry, WriterOptions,
-};
-use rars::{ArchiveVersion, Error, FeatureSet};
+use rars::rar50::{ArchiveEntry, ArchiveMetadataEntry, Rar50Writer, VolumeSink, WriterOptions};
+use rars::{ArchiveVersion, EntrySource, Error, FeatureSet, WriterResources};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
@@ -42,14 +40,13 @@ fn deterministic_bytes(len: usize, seed: u32) -> Vec<u8> {
         .collect()
 }
 
-fn entry<'a>(name: &'a [u8], data: &'a [u8]) -> StoredEntry<'a> {
-    StoredEntry {
-        name,
-        data,
-        mtime: Some(0x5000_0000),
-        attributes: 0x20,
-        host_os: 0,
-    }
+fn entry(name: &[u8], data: &[u8]) -> ArchiveEntry {
+    ArchiveEntry::new(
+        name.to_vec(),
+        EntrySource::from_bytes(std::sync::Arc::<[u8]>::from(data.to_vec())),
+    )
+    .with_mtime(Some(0x5000_0000))
+    .with_attributes(0x20)
 }
 
 fn assert_golden(name: &str, produced: &[u8]) {
@@ -117,11 +114,38 @@ fn assert_golden_digest(name: &str, produced: &[u8]) {
 }
 
 fn stored_options(target: ArchiveVersion) -> WriterOptions {
-    WriterOptions::new(target, FeatureSet::store_only())
+    WriterOptions::new(target, FeatureSet::store_only()).with_compression_level(0)
 }
 
-fn write_stored(entries: &[StoredEntry<'_>], options: WriterOptions) -> Result<Vec<u8>, Error> {
-    Rar50Writer::new(options).stored_entries(entries).finish()
+fn write_stored(entries: &[ArchiveEntry], options: WriterOptions) -> Result<Vec<u8>, Error> {
+    Rar50Writer::new(options).entries(entries.to_vec()).finish()
+}
+
+/// Collects a volume set so the golden files can be compared one by one.
+#[derive(Default)]
+struct GoldenVolumes(std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>);
+
+struct GoldenVolume(std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>, usize);
+
+impl std::io::Write for GoldenVolume {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap()[self.1].extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl VolumeSink for GoldenVolumes {
+    fn start_volume(&mut self, index: u64) -> Result<Box<dyn std::io::Write + Send>, Error> {
+        self.0.lock().unwrap().push(Vec::new());
+        Ok(Box::new(GoldenVolume(
+            std::sync::Arc::clone(&self.0),
+            index as usize,
+        )))
+    }
 }
 
 #[test]
@@ -149,14 +173,14 @@ fn golden_comment_and_metadata_layout_is_stable() {
     let options = WriterOptions::new(ArchiveVersion::Rar50, features);
 
     let commented = Rar50Writer::new(options)
-        .stored_entries(&entries)
+        .entries(entries.to_vec())
         .archive_comment(Some(b"golden archive comment"))
         .finish()
         .unwrap();
     assert_golden("stored_comment.rar", &commented);
 
     let with_metadata = Rar50Writer::new(options)
-        .stored_entries(&entries)
+        .entries(entries.to_vec())
         .archive_comment(Some(b"golden archive comment"))
         .archive_metadata(Some(ArchiveMetadataEntry {
             name: Some(b"golden.rar"),
@@ -191,12 +215,11 @@ fn golden_recovery_record_layout_is_stable() {
     let data = deterministic_bytes(8192, 5);
     let entries = [entry(b"protected.bin", &data)];
 
-    let features = FeatureSet::store_only();
-    let options = WriterOptions::new(ArchiveVersion::Rar50, features);
+    let options = stored_options(ArchiveVersion::Rar50);
 
     for percent in [1u64, 5, 10, 50] {
         let archive = Rar50Writer::new(options)
-            .stored_entries(&entries)
+            .entries(entries.to_vec())
             .recovery_percent(Some(percent))
             .finish()
             .unwrap();
@@ -211,11 +234,10 @@ fn golden_recovery_record_over_200kib_is_stable() {
     let data = deterministic_bytes(300 * 1024, 6);
     let entries = [entry(b"large.bin", &data)];
 
-    let features = FeatureSet::store_only();
-    let options = WriterOptions::new(ArchiveVersion::Rar50, features);
+    let options = stored_options(ArchiveVersion::Rar50);
 
     let archive = Rar50Writer::new(options)
-        .stored_entries(&entries)
+        .entries(entries.to_vec())
         .recovery_percent(Some(10))
         .finish()
         .unwrap();
@@ -227,11 +249,17 @@ fn golden_volume_set_layout_is_stable() {
     let data = deterministic_bytes(5000, 7);
     let options = stored_options(ArchiveVersion::Rar50);
 
-    let volumes = Rar50VolumeWriter::new(options)
-        .stored_entry(entry(b"split.bin", &data))
-        .max_payload_per_volume(1500)
-        .finish()
-        .unwrap();
+    let mut sink = GoldenVolumes::default();
+    rars::rar50::write_streaming_volumes_to(
+        &[entry(b"split.bin", &data)],
+        options,
+        rars::rar50::ArchiveExtras::default(),
+        1500,
+        &mut sink,
+        &WriterResources::default(),
+    )
+    .unwrap();
+    let volumes = sink.0.lock().unwrap().clone();
 
     assert!(volumes.len() > 1, "expected a multi-volume set");
     for (index, volume) in volumes.iter().enumerate() {

@@ -5412,7 +5412,6 @@ fn rar5_explicit_filters_combine_with_the_rest_of_the_writer() {
         ("recovery", vec!["--recovery-percent", "5"]),
         ("comment", vec!["--comment", "hello"]),
         ("metadata", vec!["--archive-name", "set.rar"]),
-        ("solid", vec!["--solid"]),
         ("file-comment", vec!["--file-comment", "note"]),
     ] {
         let archive = dir.join(format!("{name}.rar"));

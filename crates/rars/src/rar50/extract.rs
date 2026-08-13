@@ -1164,7 +1164,7 @@ impl<R: Read> Read for Rar50DecryptingReader<R> {
 #[cfg(test)]
 mod tests {
     use super::super::{
-        ArchiveSource, Block, BlockHeader, CompressedEntry, FileEncryption, FileHash, FilterKind,
+        ArchiveEntry, ArchiveSource, Block, BlockHeader, FileEncryption, FileHash, FilterKind,
         FilterPolicy, MainHeader, Rar50Writer, WriterOptions, HEAD_FILE, HFL_SPLIT_AFTER,
         HFL_SPLIT_BEFORE,
     };
@@ -1173,6 +1173,14 @@ mod tests {
     use std::io::Cursor;
     use std::rc::Rc;
     use std::sync::Arc;
+
+    /// Builds a member from bytes the test already holds.
+    fn entry(name: &[u8], data: &[u8]) -> ArchiveEntry {
+        ArchiveEntry::new(
+            name.to_vec(),
+            crate::EntrySource::from_bytes(Arc::<[u8]>::from(data.to_vec())),
+        )
+    }
 
     fn plain_file(name: &[u8], data: &[u8], hash: Option<FileHash>) -> FileHeader {
         FileHeader {
@@ -1268,13 +1276,12 @@ mod tests {
             compression_level: None,
             dictionary_size: None,
         })
-        .compressed_entries(&[CompressedEntry {
-            name: b"filtered.bin",
-            data: &data,
-            mtime: None,
-            attributes: 0x20,
-            host_os: 3,
-        }])
+        .entries(
+            [entry(b"filtered.bin", &data)
+                .with_attributes(0x20)
+                .with_host_os(3)]
+            .to_vec(),
+        )
         .filter_policy(FilterPolicy::explicit(FilterKind::E8))
         .finish()
         .unwrap();
@@ -1301,13 +1308,12 @@ mod tests {
             compression_level: None,
             dictionary_size: None,
         })
-        .compressed_entries(&[CompressedEntry {
-            name: b"filtered.bin",
-            data: &data,
-            mtime: None,
-            attributes: 0x20,
-            host_os: 3,
-        }])
+        .entries(
+            [entry(b"filtered.bin", &data)
+                .with_attributes(0x20)
+                .with_host_os(3)]
+            .to_vec(),
+        )
         .filter_policy(FilterPolicy::explicit(FilterKind::E8))
         .finish()
         .unwrap();

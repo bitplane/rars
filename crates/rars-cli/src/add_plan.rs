@@ -156,6 +156,30 @@ pub(crate) fn reject_coding_without_compression(
     )))
 }
 
+/// Refuses a filter on a solid RAR 5 or RAR 7 archive.
+///
+/// Those members share one dictionary and are coded as one chain, so the
+/// writer's filter search never runs for them. It used to take the request and
+/// drop it. RAR 2.9 codes a filtered member on its own even inside a solid
+/// archive, so this does not apply there.
+pub(crate) fn reject_filter_with_solid(
+    target: ArchiveVersion,
+    filters: &AskedFilters,
+    auto_filter: bool,
+    solid: bool,
+) -> Result<(), CliError> {
+    if target.family() != rars::ArchiveFamily::Rar50Plus {
+        return Ok(());
+    }
+    if !solid || (filters.count() == 0 && !auto_filter) {
+        return Ok(());
+    }
+    Err(CliError::usage(format!(
+        "{} cannot be used with --solid; solid members share one dictionary",
+        flag_for(WriterOption::Filter, filters),
+    )))
+}
+
 /// Formats the user could have asked for instead, in `--format` spelling.
 ///
 /// Computed from the library rather than written down, so a writer that gains a

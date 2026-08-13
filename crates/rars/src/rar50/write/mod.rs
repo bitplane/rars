@@ -1,12 +1,10 @@
 use super::*;
-use crate::codec::rar50::Unpack50Encoder;
 use crate::crc32::Crc32;
 use crate::crypto::rar50::{Rar50Cipher, Rar50Keys};
 pub use crate::filter::{FilterKind, FilterPolicy, FilterSpec};
-use crate::recovery::rar5::build_structural_inline_recovery_data_with_progress;
 use crate::write_plan::{PlanShape, WriterOption};
-use crate::write_progress::{ProgressReporter, WorkTracker};
-use crate::{EntrySource, WriteOperation, WriteProgress, WriteProgressEvent, WriterResources};
+use crate::write_progress::ProgressReporter;
+use crate::{EntrySource, WriteProgress, WriterResources};
 use std::io::{Read, Write};
 
 mod compress;
@@ -14,28 +12,13 @@ mod engine;
 mod filter_policy;
 mod headers;
 mod layout;
-mod volume;
 #[cfg(test)]
 use filter_policy::encode_member_with_filter_policy;
-#[cfg(test)]
-use filter_policy::encode_with_solid_reset_policy;
 use filter_policy::{
-    compression_info, compression_method_for_level, dictionary_size_for_options,
-    encode_option_candidates_for_level, encode_options_for_level,
-    encode_safe_lz_member_with_progress, encode_with_solid_reset_policy_and_progress,
-    filter_policy_walk_bytes, rar50_algorithm_version, should_store_compressed_payload,
+    compression_method_for_level, dictionary_size_for_options, encode_option_candidates_for_level,
+    encode_options_for_level, filter_policy_walk_bytes, rar50_algorithm_version,
 };
-use headers::{
-    encrypted_header_block, encrypted_main_header_block, file_specific, header_encryption_keys,
-    header_encryption_password, stored_file_specific, write_block, write_extra_record,
-    write_file_encryption_record, write_hash_record, write_hash_record_with_value,
-    write_head_crypt, write_locator_record, write_main_header, write_vint, HeaderEncryptionKeys,
-};
-pub(super) use headers::{end_header_specific, write_end_header};
-use volume::{
-    write_compressed_volume_set_impl, write_encrypted_compressed_volume_set_impl,
-    write_encrypted_stored_volumes_impl, write_stored_volumes_impl,
-};
+pub(super) use headers::end_header_specific;
 
 const MAX_MATCH_CANDIDATES_DEFAULT: usize = 256;
 const DEFAULT_RAR50_DICTIONARY_SIZE: u64 = 128 * 1024;
@@ -79,24 +62,6 @@ impl Default for WriterOptions {
             dictionary_size: None,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StoredEntry<'a> {
-    pub name: &'a [u8],
-    pub data: &'a [u8],
-    pub mtime: Option<u32>,
-    pub attributes: u64,
-    pub host_os: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CompressedEntry<'a> {
-    pub name: &'a [u8],
-    pub data: &'a [u8],
-    pub mtime: Option<u32>,
-    pub attributes: u64,
-    pub host_os: u64,
 }
 
 /// An archive member, read from a reopenable source when it is needed.
@@ -354,6 +319,15 @@ pub(crate) fn write_streaming_archive_with_progress(
             feature: "RAR 5 quick-open index in a header-encrypted archive",
         });
     }
+    // Solid members share one dictionary, so there is nowhere to put a filter
+    // that applies to some of them and not others. Only the buffered writer
+    // used to say so; this path took the request and quietly dropped it.
+    if extras.filter_policy != FilterPolicy::None && options.features.solid {
+        return Err(Error::UnsupportedFeature {
+            version: options.target,
+            feature: "RAR 5 solid filtered compressed writer",
+        });
+    }
 
     engine::write_archive(
         entries,
@@ -482,249 +456,35 @@ fn encrypt_reader_to(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StoredServiceEntry<'a> {
-    pub name: &'a [u8],
-    pub data: &'a [u8],
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StoredEntryWithServices<'a> {
-    pub entry: StoredEntry<'a>,
-    pub services: &'a [StoredServiceEntry<'a>],
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EncryptedStoredServiceEntry<'a> {
-    pub name: &'a [u8],
-    pub data: &'a [u8],
-    pub password: &'a [u8],
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EncryptedStoredEntryWithServices<'a> {
-    pub entry: EncryptedStoredEntry<'a>,
-    pub services: &'a [EncryptedStoredServiceEntry<'a>],
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArchiveMetadataEntry<'a> {
     pub name: Option<&'a [u8]>,
     pub creation_time: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EncryptedStoredEntry<'a> {
-    pub name: &'a [u8],
-    pub data: &'a [u8],
-    pub mtime: Option<u32>,
-    pub attributes: u64,
-    pub host_os: u64,
-    pub password: &'a [u8],
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EncryptedCompressedEntry<'a> {
-    pub name: &'a [u8],
-    pub data: &'a [u8],
-    pub mtime: Option<u32>,
-    pub attributes: u64,
-    pub host_os: u64,
-    pub password: &'a [u8],
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EncryptedArchiveCommentEntry<'a> {
-    pub data: &'a [u8],
-    pub password: &'a [u8],
-}
-
+/// Builds a RAR 5 or RAR 7 archive from members held in memory.
+///
+/// [`write_streaming_archive_to`] is the same writer without the buffer; this
+/// exists for callers that want the bytes back.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Rar50Writer<'a> {
     options: WriterOptions,
-    members: Vec<Rar50WriteMember<'a>>,
-    archive_comment: Option<ArchiveComment<'a>>,
+    entries: Vec<ArchiveEntry>,
+    archive_comment: Option<&'a [u8]>,
+    archive_comment_password: Option<&'a [u8]>,
     archive_metadata: Option<ArchiveMetadataEntry<'a>>,
     filter_policy: FilterPolicy,
     recovery_percent: Option<u64>,
     progress: Option<ProgressReporter<'a>>,
 }
 
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct Rar50VolumeWriter<'a> {
-    options: WriterOptions,
-    entries: Option<Rar50VolumeEntries<'a>>,
-    max_payload_per_volume: Option<usize>,
-    recovery_percent: Option<u64>,
-    progress: Option<ProgressReporter<'a>>,
-}
-
-#[derive(Debug, Clone)]
-enum Rar50VolumeEntries<'a> {
-    Stored(StoredEntry<'a>),
-    Compressed(&'a [CompressedEntry<'a>]),
-    EncryptedStored(EncryptedStoredEntry<'a>),
-    EncryptedCompressed(&'a [EncryptedCompressedEntry<'a>]),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ArchiveComment<'a> {
-    Plain(&'a [u8]),
-    Encrypted(EncryptedArchiveCommentEntry<'a>),
-}
-
-impl<'a> ArchiveComment<'a> {}
-
-impl<'a> Rar50VolumeWriter<'a> {
-    pub fn new(options: WriterOptions) -> Self {
-        Self {
-            options,
-            entries: None,
-            max_payload_per_volume: None,
-            recovery_percent: None,
-            progress: None,
-        }
-    }
-
-    pub fn stored_entry(mut self, entry: StoredEntry<'a>) -> Self {
-        self.entries = Some(Rar50VolumeEntries::Stored(entry));
-        self
-    }
-
-    pub fn compressed_entries(mut self, entries: &'a [CompressedEntry<'a>]) -> Self {
-        self.entries = Some(Rar50VolumeEntries::Compressed(entries));
-        self
-    }
-
-    pub fn encrypted_stored_entry(mut self, entry: EncryptedStoredEntry<'a>) -> Self {
-        self.entries = Some(Rar50VolumeEntries::EncryptedStored(entry));
-        self
-    }
-
-    pub fn encrypted_compressed_entries(
-        mut self,
-        entries: &'a [EncryptedCompressedEntry<'a>],
-    ) -> Self {
-        self.entries = Some(Rar50VolumeEntries::EncryptedCompressed(entries));
-        self
-    }
-
-    pub fn max_payload_per_volume(mut self, size: usize) -> Self {
-        self.max_payload_per_volume = Some(size);
-        self
-    }
-
-    pub fn recovery_percent(mut self, percent: Option<u64>) -> Self {
-        self.recovery_percent = percent;
-        self
-    }
-
-    pub fn progress(mut self, progress: &'a dyn WriteProgress) -> Self {
-        self.progress = Some(ProgressReporter(progress));
-        self
-    }
-
-    pub fn finish(self) -> Result<Vec<Vec<u8>>> {
-        let max_payload_per_volume = self.max_payload_per_volume.ok_or(Error::InvalidHeader(
-            "RAR 5 volume payload size is required",
-        ))?;
-        let entries = self.entries.ok_or(Error::InvalidHeader(
-            "RAR 5 volume writer needs an entry set",
-        ))?;
-        let (compressed, total_bytes, total_entries) = match &entries {
-            Rar50VolumeEntries::Compressed(entries) => (
-                true,
-                entries.iter().map(|entry| entry.data.len() as u64).sum(),
-                entries.len(),
-            ),
-            Rar50VolumeEntries::EncryptedCompressed(entries) => (
-                true,
-                entries.iter().map(|entry| entry.data.len() as u64).sum(),
-                entries.len(),
-            ),
-            Rar50VolumeEntries::Stored(entry) => (false, entry.data.len() as u64, 1),
-            Rar50VolumeEntries::EncryptedStored(entry) => (false, entry.data.len() as u64, 1),
-        };
-        let total_work = if compressed && self.options.features.solid {
-            match &entries {
-                Rar50VolumeEntries::Compressed(entries) => entries
-                    .iter()
-                    .enumerate()
-                    .map(|(index, entry)| entry.data.len() as u64 * if index == 0 { 1 } else { 2 })
-                    .sum(),
-                Rar50VolumeEntries::EncryptedCompressed(entries) => entries
-                    .iter()
-                    .enumerate()
-                    .map(|(index, entry)| entry.data.len() as u64 * if index == 0 { 1 } else { 2 })
-                    .sum(),
-                _ => total_bytes,
-            }
-        } else {
-            total_bytes
-        };
-        if compressed {
-            report_operation_started(
-                self.progress,
-                WriteOperation::Compression,
-                total_work,
-                total_entries,
-                1,
-            );
-        }
-        let work = WorkTracker::new(self.progress, WriteOperation::Compression, total_work);
-        let result = match entries {
-            Rar50VolumeEntries::Stored(entry) => write_stored_volumes_impl(
-                entry,
-                self.options,
-                max_payload_per_volume,
-                self.recovery_percent,
-            ),
-            Rar50VolumeEntries::Compressed(entries) => write_compressed_volume_set_impl(
-                entries,
-                self.options,
-                max_payload_per_volume,
-                self.recovery_percent,
-                compressed.then_some(&work),
-            ),
-            Rar50VolumeEntries::EncryptedStored(entry) => write_encrypted_stored_volumes_impl(
-                entry,
-                self.options,
-                max_payload_per_volume,
-                self.recovery_percent,
-            ),
-            Rar50VolumeEntries::EncryptedCompressed(entries) => {
-                write_encrypted_compressed_volume_set_impl(
-                    entries,
-                    self.options,
-                    max_payload_per_volume,
-                    self.recovery_percent,
-                    compressed.then_some(&work),
-                )
-            }
-        };
-        if compressed {
-            if result.is_ok() && !work.finish() {
-                return Err(Error::Cancelled);
-            }
-            report_operation_finished(
-                self.progress,
-                WriteOperation::Compression,
-                total_work,
-                total_entries,
-                1,
-            );
-        }
-        result
-    }
-}
-
 impl<'a> Rar50Writer<'a> {
     pub fn new(options: WriterOptions) -> Self {
         Self {
             options,
-            members: Vec::new(),
+            entries: Vec::new(),
             archive_comment: None,
+            archive_comment_password: None,
             archive_metadata: None,
             filter_policy: FilterPolicy::None,
             recovery_percent: None,
@@ -732,74 +492,25 @@ impl<'a> Rar50Writer<'a> {
         }
     }
 
-    pub fn stored_entries(mut self, entries: &[StoredEntry<'a>]) -> Self {
-        self.members
-            .extend(entries.iter().copied().map(Rar50WriteMember::Stored));
+    pub fn entry(mut self, entry: ArchiveEntry) -> Self {
+        self.entries.push(entry);
         self
     }
 
-    pub fn compressed_entries(mut self, entries: &[CompressedEntry<'a>]) -> Self {
-        self.members
-            .extend(entries.iter().copied().map(Rar50WriteMember::Compressed));
-        self
-    }
-
-    pub fn encrypted_stored_entries(mut self, entries: &[EncryptedStoredEntry<'a>]) -> Self {
-        self.members.extend(
-            entries
-                .iter()
-                .copied()
-                .map(Rar50WriteMember::EncryptedStored),
-        );
-        self
-    }
-
-    pub fn stored_entries_with_services(mut self, entries: &[StoredEntryWithServices<'a>]) -> Self {
-        self.members.extend(
-            entries
-                .iter()
-                .copied()
-                .map(Rar50WriteMember::StoredWithServices),
-        );
-        self
-    }
-
-    pub fn encrypted_compressed_entries(
-        mut self,
-        entries: &[EncryptedCompressedEntry<'a>],
-    ) -> Self {
-        self.members.extend(
-            entries
-                .iter()
-                .copied()
-                .map(Rar50WriteMember::EncryptedCompressed),
-        );
-        self
-    }
-
-    pub fn encrypted_stored_entries_with_services(
-        mut self,
-        entries: &[EncryptedStoredEntryWithServices<'a>],
-    ) -> Self {
-        self.members.extend(
-            entries
-                .iter()
-                .copied()
-                .map(Rar50WriteMember::EncryptedStoredWithServices),
-        );
+    pub fn entries(mut self, entries: impl IntoIterator<Item = ArchiveEntry>) -> Self {
+        self.entries.extend(entries);
         self
     }
 
     pub fn archive_comment(mut self, comment: Option<&'a [u8]>) -> Self {
-        self.archive_comment = comment.map(ArchiveComment::Plain);
+        self.archive_comment = comment;
+        self.archive_comment_password = None;
         self
     }
 
-    pub fn encrypted_archive_comment(
-        mut self,
-        comment: Option<EncryptedArchiveCommentEntry<'a>>,
-    ) -> Self {
-        self.archive_comment = comment.map(ArchiveComment::Encrypted);
+    pub fn encrypted_archive_comment(mut self, comment: &'a [u8], password: &'a [u8]) -> Self {
+        self.archive_comment = Some(comment);
+        self.archive_comment_password = Some(password);
         self
     }
 
@@ -833,76 +544,12 @@ impl<'a> Rar50Writer<'a> {
 
     /// Writes the archive straight to `output` without ever holding it.
     pub fn write_to(self, output: &mut dyn Write, resources: &WriterResources) -> Result<()> {
-        let member_kind = self.members.iter().try_fold(None, |seen, member| {
-            let kind = member.kind();
-            if seen.is_some_and(|seen| seen != kind) {
-                return Err(mixed_member_plan_error(self.options.target));
-            }
-            Ok(Some(kind))
-        })?;
-
-        let _encrypted = matches!(
-            member_kind,
-            Some(
-                Rar50WriteMemberKind::EncryptedStored
-                    | Rar50WriteMemberKind::EncryptedStoredWithServices
-                    | Rar50WriteMemberKind::EncryptedCompressed
-            )
-        );
-        let stored = matches!(
-            member_kind,
-            Some(
-                Rar50WriteMemberKind::Stored
-                    | Rar50WriteMemberKind::StoredWithServices
-                    | Rar50WriteMemberKind::EncryptedStored
-                    | Rar50WriteMemberKind::EncryptedStoredWithServices
-            ) | None
-        );
-
-        let compressed = matches!(
-            member_kind,
-            Some(Rar50WriteMemberKind::Compressed | Rar50WriteMemberKind::EncryptedCompressed)
-        );
-        validate_plan(
-            self.options,
-            PlanShape::new()
-                .compressed(compressed)
-                .filtered(self.filter_policy != FilterPolicy::None),
-        )?;
-        if let Some(percent) = self.recovery_percent {
-            validate_recovery_percent(percent)?;
-        }
-        if self.filter_policy != FilterPolicy::None && self.options.features.solid {
-            return Err(Error::UnsupportedFeature {
-                version: self.options.target,
-                feature: "RAR 5 solid filtered compressed writer",
-            });
-        }
-        for member in &self.members {
-            member.validate_member()?;
-        }
-
-        // A stored member set is written verbatim whatever the level says.
-        let mut options = self.options;
-        if stored {
-            options = options.with_compression_level(0);
-        }
-
-        let comment_password = match &self.archive_comment {
-            Some(ArchiveComment::Encrypted(comment)) => Some(comment.password),
-            _ => None,
-        };
-        let comment = match &self.archive_comment {
-            Some(ArchiveComment::Plain(data)) => Some(*data),
-            Some(ArchiveComment::Encrypted(comment)) => Some(comment.data),
-            None => None,
-        };
         let mut extras = ArchiveExtras::default()
             .with_recovery_percent(self.recovery_percent)
             .with_quick_open(self.options.features.quick_open)
             .with_filter_policy(self.filter_policy);
-        if let Some(comment) = comment {
-            extras = match comment_password {
+        if let Some(comment) = self.archive_comment {
+            extras = match self.archive_comment_password {
                 Some(password) => extras.with_encrypted_comment(comment, password),
                 None => extras.with_comment(comment),
             };
@@ -911,204 +558,14 @@ impl<'a> Rar50Writer<'a> {
             extras = extras.with_metadata(metadata);
         }
 
-        let entries: Vec<_> = self
-            .members
-            .into_iter()
-            .map(Rar50WriteMember::into_archive_entry)
-            .collect();
         write_streaming_archive_with_progress(
-            &entries,
-            options,
+            &self.entries,
+            self.options,
             extras,
             resources,
             self.progress,
             output,
         )
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Rar50WriteMemberKind {
-    Stored,
-    StoredWithServices,
-    Compressed,
-    EncryptedStored,
-    EncryptedStoredWithServices,
-    EncryptedCompressed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Rar50WriteMember<'a> {
-    Stored(StoredEntry<'a>),
-    StoredWithServices(StoredEntryWithServices<'a>),
-    Compressed(CompressedEntry<'a>),
-    EncryptedStored(EncryptedStoredEntry<'a>),
-    EncryptedStoredWithServices(EncryptedStoredEntryWithServices<'a>),
-    EncryptedCompressed(EncryptedCompressedEntry<'a>),
-}
-
-impl Rar50WriteMember<'_> {
-    fn kind(&self) -> Rar50WriteMemberKind {
-        match self {
-            Self::Stored(_) => Rar50WriteMemberKind::Stored,
-            Self::StoredWithServices(_) => Rar50WriteMemberKind::StoredWithServices,
-            Self::Compressed(_) => Rar50WriteMemberKind::Compressed,
-            Self::EncryptedStored(_) => Rar50WriteMemberKind::EncryptedStored,
-            Self::EncryptedStoredWithServices(_) => {
-                Rar50WriteMemberKind::EncryptedStoredWithServices
-            }
-            Self::EncryptedCompressed(_) => Rar50WriteMemberKind::EncryptedCompressed,
-        }
-    }
-
-    fn validate_member(&self) -> Result<()> {
-        match self {
-            Self::Stored(entry) => validate_entry(entry),
-            Self::Compressed(entry) => validate_compressed_entry(entry),
-            Self::EncryptedStored(entry) => validate_encrypted_entry(entry),
-            Self::EncryptedCompressed(entry) => validate_encrypted_compressed_entry(entry),
-            Self::StoredWithServices(member) => {
-                validate_entry(&member.entry)?;
-                member.services.iter().try_for_each(validate_file_service)
-            }
-            Self::EncryptedStoredWithServices(member) => {
-                validate_encrypted_entry(&member.entry)?;
-                member
-                    .services
-                    .iter()
-                    .try_for_each(validate_encrypted_file_service)
-            }
-        }
-    }
-
-    /// Converts a builder member into the engine's entry form. The data is
-    /// copied because the engine reads members from reopenable sources; the
-    /// caller already holds it in memory either way.
-    fn into_archive_entry(self) -> ArchiveEntry {
-        fn entry(
-            name: &[u8],
-            data: &[u8],
-            mtime: Option<u32>,
-            attributes: u64,
-            host_os: u64,
-        ) -> ArchiveEntry {
-            ArchiveEntry::new(
-                name.to_vec(),
-                EntrySource::from_bytes(std::sync::Arc::<[u8]>::from(data.to_vec())),
-            )
-            .with_mtime(mtime)
-            .with_attributes(attributes)
-            .with_host_os(host_os)
-        }
-
-        match self {
-            Self::Stored(member) => entry(
-                member.name,
-                member.data,
-                member.mtime,
-                member.attributes,
-                member.host_os,
-            ),
-            Self::Compressed(member) => entry(
-                member.name,
-                member.data,
-                member.mtime,
-                member.attributes,
-                member.host_os,
-            ),
-            Self::StoredWithServices(member) => {
-                let mut built = entry(
-                    member.entry.name,
-                    member.entry.data,
-                    member.entry.mtime,
-                    member.entry.attributes,
-                    member.entry.host_os,
-                );
-                for service in member.services {
-                    built = built.with_service(ServiceEntry::new(
-                        service.name.to_vec(),
-                        service.data.to_vec(),
-                    ));
-                }
-                built
-            }
-            Self::EncryptedStored(member) => entry(
-                member.name,
-                member.data,
-                member.mtime,
-                member.attributes,
-                member.host_os,
-            )
-            .with_password(member.password.to_vec()),
-            Self::EncryptedCompressed(member) => entry(
-                member.name,
-                member.data,
-                member.mtime,
-                member.attributes,
-                member.host_os,
-            )
-            .with_password(member.password.to_vec()),
-            Self::EncryptedStoredWithServices(member) => {
-                let mut built = entry(
-                    member.entry.name,
-                    member.entry.data,
-                    member.entry.mtime,
-                    member.entry.attributes,
-                    member.entry.host_os,
-                )
-                .with_password(member.entry.password.to_vec());
-                for service in member.services {
-                    built = built.with_service(
-                        ServiceEntry::new(service.name.to_vec(), service.data.to_vec())
-                            .with_password(service.password.to_vec()),
-                    );
-                }
-                built
-            }
-        }
-    }
-}
-
-impl<'a> Rar50WriteMember<'a> {}
-
-fn mixed_member_plan_error(target: crate::ArchiveVersion) -> Error {
-    Error::UnsupportedFeature {
-        version: target,
-        feature: "RAR 5 mixed stored/compressed writer plan",
-    }
-}
-
-fn report_operation_started(
-    progress: Option<ProgressReporter<'_>>,
-    operation: WriteOperation,
-    total_bytes: u64,
-    total_entries: usize,
-    pass: usize,
-) {
-    if let Some(progress) = progress {
-        progress.report(WriteProgressEvent::OperationStarted {
-            operation,
-            total_bytes: Some(total_bytes),
-            total_entries: Some(total_entries),
-            pass,
-        });
-    }
-}
-
-fn report_operation_finished(
-    progress: Option<ProgressReporter<'_>>,
-    operation: WriteOperation,
-    total_bytes: u64,
-    total_entries: usize,
-    pass: usize,
-) {
-    if let Some(progress) = progress {
-        progress.report(WriteProgressEvent::OperationFinished {
-            operation,
-            total_bytes: Some(total_bytes),
-            total_entries: Some(total_entries),
-            pass,
-        });
     }
 }
 
@@ -1135,83 +592,6 @@ fn validate_plan(options: WriterOptions, shape: PlanShape) -> Result<()> {
         });
     }
     Ok(())
-}
-
-fn stored_entry_from_compressed_entry<'a>(entry: &CompressedEntry<'a>) -> StoredEntry<'a> {
-    StoredEntry {
-        name: entry.name,
-        data: entry.data,
-        mtime: entry.mtime,
-        attributes: entry.attributes,
-        host_os: entry.host_os,
-    }
-}
-
-struct CompressedFragment<'a, 'b> {
-    entry: &'a CompressedEntry<'b>,
-    data: &'a [u8],
-    algorithm_version: u8,
-    compression_method: u8,
-    dictionary_size: u64,
-    solid_continuation: bool,
-    split_before: bool,
-    split_after: bool,
-}
-
-fn write_compressed_entry_fragment(
-    out: &mut Vec<u8>,
-    fragment: CompressedFragment<'_, '_>,
-) -> Result<()> {
-    let CompressedFragment {
-        entry,
-        data,
-        algorithm_version,
-        compression_method,
-        dictionary_size,
-        solid_continuation,
-        split_before,
-        split_after,
-    } = fragment;
-
-    let mut extra = Vec::new();
-    if !split_after {
-        write_hash_record(&mut extra, entry.data);
-    }
-    let compression_info = compression_info(
-        algorithm_version,
-        compression_method,
-        dictionary_size,
-        solid_continuation,
-    )?;
-    let specific = file_specific(
-        entry.name,
-        entry.data.len() as u64,
-        (!split_after).then_some(crc32(entry.data)),
-        entry.attributes,
-        entry.mtime,
-        compression_info,
-        entry.host_os,
-    )?;
-    let mut block_flags = HFL_DATA;
-    if split_before {
-        block_flags |= HFL_SPLIT_BEFORE;
-    }
-    if split_after {
-        block_flags |= HFL_SPLIT_AFTER;
-    }
-    if !extra.is_empty() {
-        block_flags |= HFL_EXTRA;
-    }
-
-    write_block(
-        out,
-        HEAD_FILE,
-        block_flags,
-        Some(data.len() as u64),
-        &specific,
-        &extra,
-        data,
-    )
 }
 
 struct EncryptedStoredPayload {
@@ -1261,318 +641,6 @@ fn encrypted_payload(
     })
 }
 
-fn write_encrypted_stored_entry_fragment_with_header_keys(
-    out: &mut Vec<u8>,
-    entry: &EncryptedStoredEntry<'_>,
-    data: &[u8],
-    encrypted: &EncryptedStoredPayload,
-    split_before: bool,
-    split_after: bool,
-    header_keys: Option<&Rar50Keys>,
-) -> Result<()> {
-    let mut extra = Vec::new();
-    write_file_encryption_record(
-        &mut extra,
-        encrypted.salt,
-        encrypted.iv,
-        encrypted.check_value,
-    );
-    if !split_after {
-        write_hash_record_with_value(&mut extra, encrypted.blake2sp_mac);
-    }
-
-    let specific = stored_file_specific(
-        entry.name,
-        entry.data.len() as u64,
-        (!split_after).then_some(encrypted.crc32_mac),
-        entry.attributes,
-        entry.mtime,
-        entry.host_os,
-    )?;
-    let mut block_flags = HFL_EXTRA | HFL_DATA;
-    if split_before {
-        block_flags |= HFL_SPLIT_BEFORE;
-    }
-    if split_after {
-        block_flags |= HFL_SPLIT_AFTER;
-    }
-
-    if let Some(header_keys) = header_keys {
-        out.extend_from_slice(&encrypted_header_block(
-            header_keys,
-            HEAD_FILE,
-            block_flags,
-            Some(data.len() as u64),
-            &specific,
-            &extra,
-            data,
-        )?);
-        Ok(())
-    } else {
-        write_block(
-            out,
-            HEAD_FILE,
-            block_flags,
-            Some(data.len() as u64),
-            &specific,
-            &extra,
-            data,
-        )
-    }
-}
-
-fn encrypted_stored_entry_from_compressed_entry<'a>(
-    entry: &EncryptedCompressedEntry<'a>,
-) -> EncryptedStoredEntry<'a> {
-    EncryptedStoredEntry {
-        name: entry.name,
-        data: entry.data,
-        mtime: entry.mtime,
-        attributes: entry.attributes,
-        host_os: entry.host_os,
-        password: entry.password,
-    }
-}
-
-struct EncryptedCompressedFragment<'a, 'b> {
-    entry: &'a EncryptedCompressedEntry<'b>,
-    data: &'a [u8],
-    encrypted: &'a EncryptedStoredPayload,
-    algorithm_version: u8,
-    compression_method: u8,
-    dictionary_size: u64,
-    solid_continuation: bool,
-    split_before: bool,
-    split_after: bool,
-}
-
-fn write_encrypted_compressed_entry_fragment_with_header_keys(
-    out: &mut Vec<u8>,
-    fragment: EncryptedCompressedFragment<'_, '_>,
-    header_keys: Option<&Rar50Keys>,
-) -> Result<()> {
-    let EncryptedCompressedFragment {
-        entry,
-        data,
-        encrypted,
-        algorithm_version,
-        compression_method,
-        dictionary_size,
-        solid_continuation,
-        split_before,
-        split_after,
-    } = fragment;
-
-    let mut extra = Vec::new();
-    write_file_encryption_record(
-        &mut extra,
-        encrypted.salt,
-        encrypted.iv,
-        encrypted.check_value,
-    );
-    if !split_after {
-        write_hash_record_with_value(&mut extra, encrypted.blake2sp_mac);
-    }
-
-    let compression_info = compression_info(
-        algorithm_version,
-        compression_method,
-        dictionary_size,
-        solid_continuation,
-    )?;
-    let specific = file_specific(
-        entry.name,
-        entry.data.len() as u64,
-        (!split_after).then_some(encrypted.crc32_mac),
-        entry.attributes,
-        entry.mtime,
-        compression_info,
-        entry.host_os,
-    )?;
-    let mut block_flags = HFL_EXTRA | HFL_DATA;
-    if split_before {
-        block_flags |= HFL_SPLIT_BEFORE;
-    }
-    if split_after {
-        block_flags |= HFL_SPLIT_AFTER;
-    }
-
-    if let Some(header_keys) = header_keys {
-        out.extend_from_slice(&encrypted_header_block(
-            header_keys,
-            HEAD_FILE,
-            block_flags,
-            Some(data.len() as u64),
-            &specific,
-            &extra,
-            data,
-        )?);
-        Ok(())
-    } else {
-        write_block(
-            out,
-            HEAD_FILE,
-            block_flags,
-            Some(data.len() as u64),
-            &specific,
-            &extra,
-            data,
-        )
-    }
-}
-
-fn write_stored_entry_fragment(
-    out: &mut Vec<u8>,
-    entry: &StoredEntry<'_>,
-    data: &[u8],
-    unpacked_size: u64,
-    data_crc32: Option<u32>,
-    split_before: bool,
-    split_after: bool,
-) -> Result<()> {
-    let mut extra = Vec::new();
-    if !split_before && !split_after {
-        write_hash_record(&mut extra, data);
-    }
-    let specific = stored_file_specific(
-        entry.name,
-        unpacked_size,
-        data_crc32,
-        entry.attributes,
-        entry.mtime,
-        entry.host_os,
-    )?;
-    let mut block_flags = HFL_DATA;
-    if split_before {
-        block_flags |= HFL_SPLIT_BEFORE;
-    }
-    if split_after {
-        block_flags |= HFL_SPLIT_AFTER;
-    }
-    if !extra.is_empty() {
-        block_flags |= HFL_EXTRA;
-    }
-
-    write_block(
-        out,
-        HEAD_FILE,
-        block_flags,
-        Some(data.len() as u64),
-        &specific,
-        &extra,
-        data,
-    )
-}
-
-fn write_recovery_service(
-    out: &mut Vec<u8>,
-    recovery_percent: u64,
-    progress: Option<ProgressReporter<'_>>,
-    pass: usize,
-) -> Result<()> {
-    let mut service_data = Vec::new();
-    write_vint(&mut service_data, recovery_percent);
-    let mut extra = Vec::new();
-    write_extra_record(&mut extra, FHEXTRA_SUBDATA, &service_data);
-
-    let data =
-        build_structural_inline_recovery_data_with_progress(out, recovery_percent, progress, pass)?;
-    let specific = stored_file_specific(b"RR", data.len() as u64, Some(crc32(&data)), 0, None, 0)?;
-    write_block(
-        out,
-        HEAD_SERVICE,
-        HFL_EXTRA | HFL_DATA,
-        Some(data.len() as u64),
-        &specific,
-        &extra,
-        &data,
-    )
-}
-
-fn write_header_encrypted_recovery_service(
-    out: &mut Vec<u8>,
-    recovery_percent: u64,
-    header_keys: &Rar50Keys,
-    progress: Option<ProgressReporter<'_>>,
-    pass: usize,
-) -> Result<()> {
-    let mut service_data = Vec::new();
-    write_vint(&mut service_data, recovery_percent);
-    let data =
-        build_structural_inline_recovery_data_with_progress(out, recovery_percent, progress, pass)?;
-    let mut extra = Vec::new();
-    write_extra_record(&mut extra, FHEXTRA_SUBDATA, &service_data);
-    let specific = stored_file_specific(b"RR", data.len() as u64, Some(crc32(&data)), 0, None, 0)?;
-    out.extend_from_slice(&encrypted_header_block(
-        header_keys,
-        HEAD_SERVICE,
-        HFL_EXTRA | HFL_DATA,
-        Some(data.len() as u64),
-        &specific,
-        &extra,
-        &data,
-    )?);
-    Ok(())
-}
-
-fn validate_entry(entry: &StoredEntry<'_>) -> Result<()> {
-    validate_file_entry(entry.name)
-}
-
-fn validate_compressed_entry(entry: &CompressedEntry<'_>) -> Result<()> {
-    validate_file_entry(entry.name)
-}
-
-fn validate_encrypted_entry(entry: &EncryptedStoredEntry<'_>) -> Result<()> {
-    validate_file_entry(entry.name)?;
-    if entry.password.is_empty() {
-        return Err(Error::InvalidHeader(
-            "RAR 5 encrypted writer needs a non-empty password",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_encrypted_compressed_entry(entry: &EncryptedCompressedEntry<'_>) -> Result<()> {
-    validate_file_entry(entry.name)?;
-    if entry.password.is_empty() {
-        return Err(Error::InvalidHeader(
-            "RAR 5 encrypted writer needs a non-empty password",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_file_service(service: &StoredServiceEntry<'_>) -> Result<()> {
-    if !matches!(service.name, b"ACL" | b"STM" | b"CMT") {
-        return Err(Error::UnsupportedFeature {
-            version: crate::ArchiveVersion::Rar50,
-            feature: "RAR 5 stored file service name",
-        });
-    }
-    if service.data.is_empty() {
-        return Err(Error::InvalidHeader(
-            "RAR 5 stored file service data is empty",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_encrypted_file_service(service: &EncryptedStoredServiceEntry<'_>) -> Result<()> {
-    if !matches!(service.name, b"CMT") {
-        return Err(Error::UnsupportedFeature {
-            version: crate::ArchiveVersion::Rar50,
-            feature: "RAR 5 encrypted stored file service name",
-        });
-    }
-    if service.data.is_empty() {
-        return Err(Error::InvalidHeader(
-            "RAR 5 encrypted stored file service data is empty",
-        ));
-    }
-    validate_nonempty_password(service.password)
-}
-
 fn validate_recovery_percent(percent: u64) -> Result<()> {
     if !(1..=100).contains(&percent) {
         return Err(Error::InvalidHeader(
@@ -1598,11 +666,50 @@ fn validate_file_entry(name: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Checks one member and everything hanging off it.
+///
+/// Both entry points run this now. It used to be six near-identical validators,
+/// one per shape of member the builder took, and the streaming path ran none of
+/// them beyond the name.
+fn validate_entry(entry: &ArchiveEntry) -> Result<()> {
+    validate_file_entry(&entry.name)?;
+    if let Some(password) = &entry.password {
+        validate_nonempty_password(password)?;
+    }
+    entry.services.iter().try_for_each(validate_service)
+}
+
+fn validate_service(service: &ServiceEntry) -> Result<()> {
+    // Encrypting a service record is only wired up for comments, so an
+    // encrypted ACL or STM would be written in the clear.
+    let allowed: &[&[u8]] = match service.password {
+        Some(_) => &[b"CMT"],
+        None => &[b"ACL", b"STM", b"CMT"],
+    };
+    if !allowed.contains(&service.name.as_slice()) {
+        return Err(Error::UnsupportedFeature {
+            version: crate::ArchiveVersion::Rar50,
+            feature: "RAR 5 file service name",
+        });
+    }
+    if service.data.is_empty() {
+        return Err(Error::InvalidHeader("RAR 5 file service data is empty"));
+    }
+    match &service.password {
+        Some(password) => validate_nonempty_password(password),
+        None => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::filter_policy::{
         encode_member_with_auto_size_filter, encode_member_with_filter_policy_candidates,
         encode_member_with_filter_spec, encode_member_with_filter_specs,
+    };
+    use super::headers::{
+        file_specific, write_block, write_end_header, write_hash_record_with_value,
+        write_main_header,
     };
     use super::*;
     use crate::codec::rar50::{encode_literal_only, encode_lz_member};
@@ -1612,6 +719,7 @@ mod tests {
     };
     use crate::x86_filter_scan::auto_x86_filter_ranges;
     use crate::{ArchiveVersion, FeatureSet};
+    use crate::{WriteOperation, WriteProgressEvent};
     use std::cell::RefCell;
     use std::fs;
     use std::io::{Cursor, Result as IoResult, Write};
@@ -1621,18 +729,22 @@ mod tests {
 
     struct CollectWriter(Rc<RefCell<Vec<u8>>>);
 
+    /// Builds a member from bytes the test already holds.
+    fn entry(name: &[u8], data: &[u8]) -> ArchiveEntry {
+        ArchiveEntry::new(
+            name.to_vec(),
+            EntrySource::from_bytes(std::sync::Arc::<[u8]>::from(data.to_vec())),
+        )
+    }
+
     #[test]
     fn compressed_writer_reports_determinate_progress() {
         let data: Vec<u8> = (0usize..128 * 1024)
             .map(|i| (i.wrapping_mul(37) % 251) as u8)
             .collect();
-        let entry = CompressedEntry {
-            name: b"payload.bin",
-            data: &data,
-            mtime: None,
-            attributes: 0x20,
-            host_os: 1,
-        };
+        let entry = entry(b"payload.bin", &data)
+            .with_attributes(0x20)
+            .with_host_os(1);
         let last = std::sync::atomic::AtomicU64::new(0);
         let advances = AtomicUsize::new(0);
         let intermediate = std::sync::atomic::AtomicBool::new(false);
@@ -1657,7 +769,7 @@ mod tests {
             ArchiveVersion::Rar70,
             FeatureSet::default(),
         ))
-        .compressed_entries(&[entry])
+        .entries([entry].to_vec())
         .filter_policy(FilterPolicy::Auto)
         .progress(&reporter)
         .finish()
@@ -1672,13 +784,9 @@ mod tests {
 
     #[test]
     fn recovery_writer_reports_determinate_pass_progress() {
-        let entry = StoredEntry {
-            name: b"payload.bin",
-            data: b"recovery progress payload",
-            mtime: None,
-            attributes: 0x20,
-            host_os: 1,
-        };
+        let entry = entry(b"payload.bin", b"recovery progress payload")
+            .with_attributes(0x20)
+            .with_host_os(1);
         let starts = AtomicUsize::new(0);
         let advances = AtomicUsize::new(0);
         let finishes = AtomicUsize::new(0);
@@ -1710,12 +818,14 @@ mod tests {
         };
         let features = FeatureSet::store_only();
 
-        Rar50Writer::new(WriterOptions::new(ArchiveVersion::Rar50, features))
-            .stored_entries(&[entry])
-            .recovery_percent(Some(10))
-            .progress(&reporter)
-            .finish()
-            .unwrap();
+        Rar50Writer::new(
+            WriterOptions::new(ArchiveVersion::Rar50, features).with_compression_level(0),
+        )
+        .entries([entry].to_vec())
+        .recovery_percent(Some(10))
+        .progress(&reporter)
+        .finish()
+        .unwrap();
 
         assert!(starts.load(Ordering::Relaxed) >= 1);
         assert!(advances.load(Ordering::Relaxed) >= 1);
@@ -1982,7 +1092,7 @@ mod tests {
         write_main_header(&mut archive, 0, None, &[]).unwrap();
 
         let mut extra = Vec::new();
-        write_hash_record(&mut extra, data);
+        write_hash_record_with_value(&mut extra, blake2sp::hash(data));
         let compression_info = 1 << 7; // RAR5 v0, non-solid, method m1, 128 KiB dictionary.
         let specific = file_specific(
             name,
@@ -2023,15 +1133,11 @@ mod tests {
         let options =
             WriterOptions::new(crate::ArchiveVersion::Rar50, crate::FeatureSet::default())
                 .with_dictionary_size(512 * 1024);
-        let entries = [CompressedEntry {
-            name: b"dict.bin",
-            data: &data,
-            mtime: None,
-            attributes: 0x20,
-            host_os: 3,
-        }];
+        let entries = [entry(b"dict.bin", &data)
+            .with_attributes(0x20)
+            .with_host_os(3)];
         let archive = Rar50Writer::new(options)
-            .compressed_entries(&entries)
+            .entries(entries.to_vec())
             .finish()
             .unwrap();
 
@@ -2055,15 +1161,11 @@ mod tests {
         let options =
             WriterOptions::new(crate::ArchiveVersion::Rar70, crate::FeatureSet::default())
                 .with_dictionary_size(192 * 1024);
-        let entries = [CompressedEntry {
-            name: b"dict7.bin",
-            data: &data,
-            mtime: None,
-            attributes: 0x20,
-            host_os: 3,
-        }];
+        let entries = [entry(b"dict7.bin", &data)
+            .with_attributes(0x20)
+            .with_host_os(3)];
         let archive = Rar50Writer::new(options)
-            .compressed_entries(&entries)
+            .entries(entries.to_vec())
             .finish()
             .unwrap();
 
@@ -2086,18 +1188,12 @@ mod tests {
         let options =
             WriterOptions::new(crate::ArchiveVersion::Rar50, crate::FeatureSet::default())
                 .with_dictionary_size(192 * 1024);
-        let entries = [CompressedEntry {
-            name: b"bad.bin",
-            data: b"data data data data",
-            mtime: None,
-            attributes: 0x20,
-            host_os: 3,
-        }];
+        let entries = [entry(b"bad.bin", b"data data data data")
+            .with_attributes(0x20)
+            .with_host_os(3)];
 
         assert!(matches!(
-            Rar50Writer::new(options)
-                .compressed_entries(&entries)
-                .finish(),
+            Rar50Writer::new(options).entries(entries.to_vec()).finish(),
             Err(Error::InvalidHeader(
                 "RAR 5 v0 dictionary size must be a power-of-two multiple of 128 KiB"
             ))
@@ -2279,28 +1375,6 @@ mod tests {
     }
 
     #[test]
-    fn solid_reset_policy_chooses_smaller_of_continued_and_fresh_streams() {
-        let options = EncodeOptions::default();
-        let first = b"solid reset policy unrelated prefix data\n".repeat(32);
-        let second = b"second member second member second member\n".repeat(16);
-        let mut encoder = Unpack50Encoder::with_options(options);
-        encoder.encode_member(&first, 0).unwrap();
-
-        let mut continued = encoder.clone();
-        let continued_packed = continued.encode_member(&second, 0).unwrap();
-        let mut fresh = Unpack50Encoder::with_options(options);
-        let fresh_packed = fresh.encode_member(&second, 0).unwrap();
-        let expected_fresh = fresh_packed.len() < continued_packed.len();
-        let expected_len = continued_packed.len().min(fresh_packed.len());
-
-        let (packed, solid_continuation) =
-            encode_with_solid_reset_policy(&mut encoder, &second, 0, options, 1).unwrap();
-
-        assert_eq!(packed.len(), expected_len);
-        assert_eq!(solid_continuation, !expected_fresh);
-    }
-
-    #[test]
     #[ignore = "requires local rar command; used for reference-validating experimental RAR5 compressed output"]
     fn reference_rar_accepts_internal_literal_only_compressed_member() {
         let data = b"RAR5 literal-only compressed reference experiment\n";
@@ -2312,7 +1386,7 @@ mod tests {
         write_main_header(&mut archive, 0, None, &[]).unwrap();
 
         let mut extra = Vec::new();
-        write_hash_record(&mut extra, data);
+        write_hash_record_with_value(&mut extra, blake2sp::hash(data));
         let specific = file_specific(
             name,
             data.len() as u64,
@@ -2373,7 +1447,7 @@ mod tests {
         write_main_header(&mut archive, 0, None, &[]).unwrap();
 
         let mut extra = Vec::new();
-        write_hash_record(&mut extra, &data);
+        write_hash_record_with_value(&mut extra, blake2sp::hash(&data));
         let specific = file_specific(
             name,
             data.len() as u64,
@@ -2424,38 +1498,5 @@ mod tests {
         let options = WriterOptions::default();
         assert_eq!(options.target, crate::ArchiveVersion::Rar50);
         assert_eq!(options.features, crate::FeatureSet::store_only());
-    }
-
-    #[test]
-    fn writer_rejects_mixed_member_kinds_without_panicking() {
-        let stored = [StoredEntry {
-            name: b"stored.txt",
-            data: b"stored",
-            mtime: None,
-            attributes: 0x20,
-            host_os: 3,
-        }];
-        let compressed = [CompressedEntry {
-            name: b"compressed.txt",
-            data: b"compressed compressed compressed",
-            mtime: None,
-            attributes: 0x20,
-            host_os: 3,
-        }];
-        let result = Rar50Writer::new(WriterOptions::new(
-            crate::ArchiveVersion::Rar50,
-            crate::FeatureSet::store_only(),
-        ))
-        .stored_entries(&stored)
-        .compressed_entries(&compressed)
-        .finish();
-
-        assert!(matches!(
-            result,
-            Err(Error::UnsupportedFeature {
-                version: crate::ArchiveVersion::Rar50,
-                feature: "RAR 5 mixed stored/compressed writer plan",
-            })
-        ));
     }
 }

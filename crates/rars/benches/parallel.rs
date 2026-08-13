@@ -1,6 +1,6 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use rars::rar50::{Archive, CompressedEntry, Rar50Writer, WriterOptions};
-use rars::{ArchiveReadOptions, ArchiveVersion, FeatureSet};
+use rars::rar50::{Archive, ArchiveEntry, Rar50Writer, WriterOptions};
+use rars::{ArchiveReadOptions, ArchiveVersion, EntrySource, FeatureSet};
 use std::hint::black_box;
 
 const MEMBER_COUNT: usize = 8;
@@ -26,16 +26,17 @@ impl ArchiveFixture {
         self.data.iter().map(|data| data.len() as u64).sum()
     }
 
-    fn compressed_entries(&self) -> Vec<CompressedEntry<'_>> {
+    fn compressed_entries(&self) -> Vec<ArchiveEntry> {
         self.names
             .iter()
             .zip(&self.data)
-            .map(|(name, data)| CompressedEntry {
-                name,
-                data,
-                mtime: None,
-                attributes: 0x20,
-                host_os: 3,
+            .map(|(name, data)| {
+                ArchiveEntry::new(
+                    name.clone(),
+                    EntrySource::from_bytes(std::sync::Arc::<[u8]>::from(data.clone())),
+                )
+                .with_attributes(0x20)
+                .with_host_os(3)
             })
             .collect()
     }
@@ -62,9 +63,8 @@ fn rar50_options() -> WriterOptions {
 }
 
 fn write_rar50_archive(fixture: &ArchiveFixture) -> Vec<u8> {
-    let entries = fixture.compressed_entries();
     Rar50Writer::new(rar50_options())
-        .compressed_entries(&entries)
+        .entries(fixture.compressed_entries())
         .finish()
         .expect("RAR 5 benchmark archive writing should succeed")
 }

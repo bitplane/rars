@@ -1123,6 +1123,7 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
     )?;
     add_plan::reject_unsupported_filter(target, &asked_filters)?;
     add_plan::reject_multiple_filters(&asked_filters)?;
+    add_plan::reject_filter_with_solid(target, &asked_filters, auto_filter, solid)?;
     if store {
         add_plan::reject_coding_without_compression(&asked_filters, auto_filter, ppmd)?;
     }

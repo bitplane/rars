@@ -17,7 +17,7 @@ use super::headers::{
     write_head_crypt, write_main_header, write_vint, HeaderEncryptionKeys,
 };
 use super::layout::{resolve_layout, LayoutInputs};
-use super::{encrypt_reader_to, validate_file_entry, ArchiveEntry};
+use super::{encrypt_reader_to, ArchiveEntry};
 use crate::crypto::rar50::Rar50Keys;
 use crate::detect::RAR50_SIGNATURE;
 use crate::rar50::{
@@ -89,7 +89,7 @@ pub(super) fn write_archive(
     output: &mut dyn Write,
 ) -> Result<()> {
     for entry in entries {
-        validate_file_entry(&entry.name)?;
+        super::validate_entry(entry)?;
     }
 
     let header_keys = if plan.header_encrypted {
@@ -724,7 +724,7 @@ pub(super) fn write_volumes(
         return Err(Error::InvalidHeader("RAR 5 volume payload size is zero"));
     }
     for entry in entries {
-        validate_file_entry(&entry.name)?;
+        super::validate_entry(entry)?;
     }
 
     let header_keys = if plan.header_encrypted {

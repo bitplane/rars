@@ -18,10 +18,8 @@ mod write;
 pub use extract::{extract_volumes_to, extract_volumes_to_with_redirections};
 pub use write::{
     write_streaming_archive_to, write_streaming_volumes_to, ArchiveEntry, ArchiveExtras,
-    ArchiveMetadataEntry, CompressedEntry, EncryptedArchiveCommentEntry, EncryptedCompressedEntry,
-    EncryptedStoredEntry, EncryptedStoredEntryWithServices, EncryptedStoredServiceEntry,
-    FilterKind, FilterPolicy, FilterSpec, Rar50VolumeWriter, Rar50Writer, ServiceEntry,
-    StoredEntry, StoredEntryWithServices, StoredServiceEntry, VolumeSink, WriterOptions,
+    ArchiveMetadataEntry, FilterKind, FilterPolicy, FilterSpec, Rar50Writer, ServiceEntry,
+    VolumeSink, WriterOptions,
 };
 
 const HEAD_MAIN: u64 = 1;
@@ -1895,21 +1893,25 @@ mod tests {
         assert_eq!(file.name_lossy(), "\u{fffd}.bin");
     }
 
+    /// Builds a member from bytes the test already holds.
+    fn rar50_entry(name: &[u8], data: &[u8]) -> crate::rar50::ArchiveEntry {
+        crate::rar50::ArchiveEntry::new(
+            name.to_vec(),
+            crate::EntrySource::from_bytes(std::sync::Arc::<[u8]>::from(data.to_vec())),
+        )
+    }
+
     fn build_archive_with_optional_comment(comment: Option<&[u8]>) -> Archive {
         use crate::FeatureSet;
         let features = FeatureSet::store_only();
-        let entries = [crate::rar50::StoredEntry {
-            name: b"payload.txt",
-            data: b"payload bytes",
-            mtime: None,
-            attributes: 0x20,
-            host_os: 3,
-        }];
-        let bytes = crate::rar50::Rar50Writer::new(crate::rar50::WriterOptions::new(
-            crate::version::ArchiveVersion::Rar50,
-            features,
-        ))
-        .stored_entries(&entries)
+        let entries = [rar50_entry(b"payload.txt", b"payload bytes")
+            .with_attributes(0x20)
+            .with_host_os(3)];
+        let bytes = crate::rar50::Rar50Writer::new(
+            crate::rar50::WriterOptions::new(crate::version::ArchiveVersion::Rar50, features)
+                .with_compression_level(0),
+        )
+        .entries(entries.to_vec())
         .archive_comment(comment)
         .finish()
         .unwrap();
@@ -1935,26 +1937,19 @@ mod tests {
         // Service blocks that follow a File block belong to that file, not the
         // archive — archive_comment should not surface them.
         use crate::FeatureSet;
-        let services = [crate::rar50::StoredServiceEntry {
-            name: b"CMT",
-            data: b"per-file comment",
-        }];
-        let entry = crate::rar50::StoredEntryWithServices {
-            entry: crate::rar50::StoredEntry {
-                name: b"payload.txt",
-                data: b"payload bytes",
-                mtime: None,
-                attributes: 0x20,
-                host_os: 3,
-            },
-            services: &services,
-        };
+        let entry = rar50_entry(b"payload.txt", b"payload bytes")
+            .with_attributes(0x20)
+            .with_host_os(3)
+            .with_service(crate::rar50::ServiceEntry::new(
+                b"CMT".to_vec(),
+                b"per-file comment".to_vec(),
+            ));
         let features = FeatureSet::store_only();
         let bytes = crate::rar50::Rar50Writer::new(crate::rar50::WriterOptions::new(
             crate::version::ArchiveVersion::Rar50,
             features,
         ))
-        .stored_entries_with_services(std::slice::from_ref(&entry))
+        .entry(entry)
         .finish()
         .unwrap();
         let archive = Archive::parse(&bytes).unwrap();

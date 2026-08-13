@@ -8,10 +8,10 @@
 use super::ArchiveMetadataEntry;
 use crate::crypto::rar50::{Rar50Cipher, Rar50Keys};
 use crate::rar50::{
-    blake2sp, map_rar50_crypto_error, FHEXTRA_CRYPT, FHEXTRA_HASH, FHFL_CRC32, FHFL_MTIME,
-    HEAD_CRYPT, HEAD_END, HEAD_MAIN, HFL_EXTRA, MHEXTRA_ARCHIVE_METADATA,
-    MHEXTRA_ARCHIVE_METADATA_NAME, MHEXTRA_ARCHIVE_METADATA_TIME, MHEXTRA_LOCATOR,
-    MHEXTRA_LOCATOR_QUICK_OPEN, MHEXTRA_LOCATOR_RECOVERY,
+    map_rar50_crypto_error, FHEXTRA_CRYPT, FHEXTRA_HASH, FHFL_CRC32, FHFL_MTIME, HEAD_CRYPT,
+    HEAD_END, HEAD_MAIN, HFL_EXTRA, MHEXTRA_ARCHIVE_METADATA, MHEXTRA_ARCHIVE_METADATA_NAME,
+    MHEXTRA_ARCHIVE_METADATA_TIME, MHEXTRA_LOCATOR, MHEXTRA_LOCATOR_QUICK_OPEN,
+    MHEXTRA_LOCATOR_RECOVERY,
 };
 use crate::{crc32::crc32, Error, Result};
 
@@ -29,10 +29,6 @@ pub(super) fn write_extra_record(out: &mut Vec<u8>, record_type: u64, data: &[u8
     body.extend_from_slice(data);
     write_vint(out, body.len() as u64);
     out.extend_from_slice(&body);
-}
-
-pub(super) fn write_hash_record(out: &mut Vec<u8>, data: &[u8]) {
-    write_hash_record_with_value(out, blake2sp::hash(data));
 }
 
 pub(super) fn write_hash_record_with_value(out: &mut Vec<u8>, hash: [u8; 32]) {
