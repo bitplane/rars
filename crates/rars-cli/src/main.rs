@@ -1140,9 +1140,7 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
     warn_if_buffered_write_is_large(
         input_paths,
         matches!(target, ArchiveVersion::Rar50 | ArchiveVersion::Rar70),
-        quick_open,
-        archive_comment.is_some() || file_comment.is_some(),
-        archive_name.is_some(),
+        file_comment.is_some(),
         volume_size.is_some(),
         ppmd,
     );
@@ -1984,13 +1982,10 @@ fn write_plain_rar50_streaming(
 /// The streaming writer keeps memory flat regardless of input size; the
 /// remaining features assemble the whole archive in memory, so a large input
 /// can exhaust it. Saying so up front beats an allocation failure an hour in.
-#[allow(clippy::too_many_arguments)]
 fn warn_if_buffered_write_is_large(
     input_paths: &[String],
     rar50_family: bool,
-    quick_open: bool,
-    comments: bool,
-    metadata: bool,
+    file_comments: bool,
     volumes: bool,
     ppmd: bool,
 ) {
@@ -2007,25 +2002,21 @@ fn warn_if_buffered_write_is_large(
     // Only name a reason for RAR5 and RAR7, where streaming is the norm and
     // one specific feature is what fell back.
     let reason = if !rar50_family {
-        Some("this archive format")
+        "this archive format"
     } else if volumes {
-        Some("--volume-size")
-    } else if quick_open {
-        Some("--quick-open")
-    } else if metadata {
-        Some("--archive-name")
-    } else if comments {
-        Some("archive or file comments")
+        "--volume-size"
+    } else if file_comments {
+        "--file-comment"
     } else if ppmd {
-        Some("--ppmd")
+        "--ppmd"
     } else {
-        Some("the requested filters")
+        "the requested filters"
     };
 
     eprintln!(
         "warning: {} is built in memory, so this write needs several times the {} of input; \
          it may run out of memory",
-        reason.unwrap_or("this archive"),
+        reason,
         indicatif::HumanBytes(total)
     );
 }
