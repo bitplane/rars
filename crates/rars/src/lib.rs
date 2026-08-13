@@ -31,6 +31,7 @@ pub mod version;
 mod volume_extract;
 pub mod write_plan;
 mod write_progress;
+mod write_stream;
 mod x86_filter_scan;
 
 pub use detect::{detect_archive_family, find_archive_start, ArchiveSignature, SFX_SCAN_LIMIT};
@@ -43,7 +44,9 @@ use std::io::{Read, Write};
 use std::path::Path;
 pub use streaming::{EntryReader, EntrySource, WriterResources, DEFAULT_WRITER_MEMORY_LIMIT};
 pub use version::{ArchiveFamily, ArchiveVersion};
-pub use write_plan::{formats_supporting, supported_features, supports, PlanShape, WriterOption};
+pub use write_plan::{
+    formats_supporting, supported_features, supports, MemberCoding, PlanShape, WriterOption,
+};
 pub use write_progress::{WriteOperation, WriteProgress, WriteProgressEvent};
 
 #[derive(Debug, Clone, Copy, Default)]

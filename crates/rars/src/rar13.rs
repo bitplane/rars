@@ -8,9 +8,12 @@ use crate::error::{Error, Result};
 use crate::features::FeatureSet;
 use crate::io_util::{read_exact_at, read_u16, read_u32};
 pub(crate) use crate::source::ArchiveSource;
+pub use crate::streaming::{EntrySource, WriterResources};
 use crate::version::{ArchiveFamily, ArchiveVersion};
+pub use crate::write_plan::MemberCoding;
 use crate::write_plan::{PlanShape, WriterOption};
 use crate::write_progress::{ProgressReporter, WorkTracker};
+use crate::write_stream::{MemberBytes, MemberPayload};
 use crate::{WriteOperation, WriteProgress, WriteProgressEvent};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -152,6 +155,55 @@ pub struct FileEntry<'a> {
     pub file_attr: u8,
     pub password: Option<&'a [u8]>,
     pub file_comment: Option<&'a [u8]>,
+}
+
+/// One member of an archive written a member at a time.
+///
+/// The bytes are opened when the member is coded and dropped once it is
+/// written, so an archive of many files never holds more than one of them. A
+/// stored member is copied straight from its source and never lands on the heap
+/// at all.
+#[derive(Debug, Clone)]
+pub struct StreamingEntry {
+    pub name: Vec<u8>,
+    pub source: EntrySource,
+    pub file_time: u32,
+    pub file_attr: u8,
+    pub password: Option<Vec<u8>>,
+    pub file_comment: Option<Vec<u8>>,
+}
+
+impl StreamingEntry {
+    pub fn new(name: impl Into<Vec<u8>>, source: EntrySource) -> Self {
+        Self {
+            name: name.into(),
+            source,
+            file_time: 0,
+            file_attr: 0,
+            password: None,
+            file_comment: None,
+        }
+    }
+
+    pub fn with_file_time(mut self, file_time: u32) -> Self {
+        self.file_time = file_time;
+        self
+    }
+
+    pub fn with_file_attr(mut self, file_attr: u8) -> Self {
+        self.file_attr = file_attr;
+        self
+    }
+
+    pub fn with_password(mut self, password: impl Into<Vec<u8>>) -> Self {
+        self.password = Some(password.into());
+        self
+    }
+
+    pub fn with_file_comment(mut self, comment: impl Into<Vec<u8>>) -> Self {
+        self.file_comment = Some(comment.into());
+        self
+    }
 }
 
 impl MainHeader {
@@ -1023,20 +1075,14 @@ pub fn write_stored_archive_with_comment(
     options: WriterOptions,
     archive_comment: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
-    if !options.target.is_rar13_family() {
-        return Err(Error::UnsupportedVersion(options.target));
-    }
-    validate_plan(options, PlanShape::new())?;
-
-    let mut out = Vec::new();
-    write_main_header(&mut out, options.features, archive_comment)?;
-
-    for entry in entries {
-        validate_stored_entry(entry)?;
-        write_stored_entry(&mut out, entry, options.features)?;
-    }
-
-    Ok(out)
+    let members: Vec<_> = entries.iter().map(Member::from_stored).collect();
+    collect_archive(
+        &members,
+        options,
+        MemberCoding::Stored,
+        archive_comment,
+        None,
+    )
 }
 
 pub fn write_compressed_archive(
@@ -1060,104 +1106,343 @@ pub fn write_compressed_archive_with_comment_and_progress(
     archive_comment: Option<&[u8]>,
     progress: Option<&dyn WriteProgress>,
 ) -> Result<Vec<u8>> {
+    let members: Vec<_> = entries.iter().map(Member::from_file).collect();
+    collect_archive(
+        &members,
+        options,
+        MemberCoding::Compressed,
+        archive_comment,
+        progress,
+    )
+}
+
+/// Writes an archive straight to `output`, holding only the member being coded
+/// rather than every input at once.
+///
+/// `resources` bounds the working set. RAR 1.3 compresses a member as a unit,
+/// so a member larger than the budget is coded on its own rather than refused.
+pub fn write_streaming_archive_to(
+    entries: &[StreamingEntry],
+    options: WriterOptions,
+    coding: MemberCoding,
+    archive_comment: Option<&[u8]>,
+    resources: &WriterResources,
+    progress: Option<&dyn WriteProgress>,
+    output: &mut dyn Write,
+) -> Result<()> {
+    let members: Vec<_> = entries.iter().map(Member::from_streaming).collect();
+    write_archive_to(
+        &members,
+        options,
+        coding,
+        archive_comment,
+        resources,
+        progress,
+        output,
+    )
+}
+
+/// One member, however the caller supplied it.
+struct Member<'a> {
+    name: &'a [u8],
+    bytes: MemberBytes<'a>,
+    file_time: u32,
+    file_attr: u8,
+    password: Option<&'a [u8]>,
+    file_comment: Option<&'a [u8]>,
+}
+
+impl<'a> Member<'a> {
+    fn from_stored(entry: &'a StoredEntry<'a>) -> Self {
+        Self {
+            name: entry.name,
+            bytes: MemberBytes::Borrowed(entry.data),
+            file_time: entry.file_time,
+            file_attr: entry.file_attr,
+            password: entry.password,
+            file_comment: entry.file_comment,
+        }
+    }
+
+    fn from_file(entry: &'a FileEntry<'a>) -> Self {
+        Self {
+            name: entry.name,
+            bytes: MemberBytes::Borrowed(entry.data),
+            file_time: entry.file_time,
+            file_attr: entry.file_attr,
+            password: entry.password,
+            file_comment: entry.file_comment,
+        }
+    }
+
+    fn from_streaming(entry: &'a StreamingEntry) -> Self {
+        Self {
+            name: &entry.name,
+            bytes: MemberBytes::Source(&entry.source),
+            file_time: entry.file_time,
+            file_attr: entry.file_attr,
+            password: entry.password.as_deref(),
+            file_comment: entry.file_comment.as_deref(),
+        }
+    }
+
+    fn unpacked_size(&self) -> Result<usize> {
+        usize::try_from(self.bytes.len()?)
+            .map_err(|_| Error::InvalidHeader("RAR 1.3 file is larger than 32-bit size fields"))
+    }
+
+    /// Checksums a member without holding it, which is how a stored one is
+    /// written straight from its source.
+    fn checksum(&self) -> Result<u16> {
+        let mut checksum = Rar13Checksum::new();
+        self.bytes.walk(|chunk| checksum.update(chunk))?;
+        Ok(checksum.finish())
+    }
+}
+
+/// Runs the streaming writer into a buffer, for the callers that want the
+/// archive as bytes.
+fn collect_archive(
+    members: &[Member<'_>],
+    options: WriterOptions,
+    coding: MemberCoding,
+    archive_comment: Option<&[u8]>,
+    progress: Option<&dyn WriteProgress>,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    write_archive_to(
+        members,
+        options,
+        coding,
+        archive_comment,
+        &WriterResources::default(),
+        progress,
+        &mut out,
+    )?;
+    Ok(out)
+}
+
+fn write_archive_to(
+    members: &[Member<'_>],
+    options: WriterOptions,
+    coding: MemberCoding,
+    archive_comment: Option<&[u8]>,
+    resources: &WriterResources,
+    progress: Option<&dyn WriteProgress>,
+    output: &mut dyn Write,
+) -> Result<()> {
     if !options.target.is_rar13_family() {
         return Err(Error::UnsupportedVersion(options.target));
     }
-    validate_plan(options, PlanShape::new().compressed(true))?;
+    validate_plan(options, coding.shape())?;
+    if coding.is_filtered() {
+        return Err(Error::UnsupportedWriterOption {
+            target: options.target,
+            option: crate::write_plan::WriterOption::Filter,
+            because: None,
+        });
+    }
 
-    let mut out = Vec::new();
-    write_main_header(&mut out, options.features, archive_comment)?;
+    let mut head = Vec::new();
+    write_main_header(&mut head, options.features, archive_comment)?;
+    output.write_all(&head)?;
 
     let encode_options = rar15_encode_options_for_level(options.compression_level)?;
-    let mut solid_encoder = options
-        .features
-        .solid
+    let mut solid_encoder = (options.features.solid && coding.compresses())
         .then(|| Unpack15Encoder::with_options(encode_options));
 
-    let total_bytes: u64 = entries.iter().map(|entry| entry.data.len() as u64).sum();
-    let attempts = if options.features.solid || options.compression_level == Some(0) {
-        1
-    } else {
-        rar15_encode_fallback_options(encode_options).len() as u64
-    };
+    let mut total_bytes = 0u64;
+    for member in members {
+        total_bytes = total_bytes.saturating_add(member.unpacked_size()? as u64);
+    }
+    // Without a solid chain the writer tries each fallback setting in turn, so
+    // its progress total counts every byte once per attempt.
+    let attempts =
+        if !coding.compresses() || options.features.solid || options.compression_level == Some(0) {
+            1
+        } else {
+            rar15_encode_fallback_options(encode_options).len() as u64
+        };
     let total_work = total_bytes.saturating_mul(attempts);
-    report_compression_operation(progress, true, total_work, entries.len());
+    let reporting = coding.compresses().then_some(progress).flatten();
+    report_compression_operation(reporting, true, total_work, members.len());
     let work = WorkTracker::new(
-        progress.map(ProgressReporter),
+        reporting.map(ProgressReporter),
         WriteOperation::Compression,
         total_work,
     );
-    for (index, entry) in entries.iter().enumerate() {
-        report_compression_entry(progress, true, index, entries.len(), entry);
-        validate_file_entry(entry.name, entry.data)?;
-        let solid = solid_encoder.is_some();
-        let mut last = 0usize;
-        let mut advance = |position: usize| {
-            if position < last {
-                last = 0;
-            }
-            let delta = position.saturating_sub(last);
-            last = position;
-            work.advance(delta as u64)
-        };
-        let mut packed = if let Some(encoder) = solid_encoder.as_mut() {
-            encoder.encode_member_with_progress(entry.data, &mut advance)?
-        } else if options.compression_level == Some(0) {
-            entry.data.to_vec()
-        } else {
-            encode_verified_rar15_payload_with_progress(entry.data, encode_options, &mut advance)?
-                .unwrap_or_else(|| entry.data.to_vec())
-        };
-        let method = if options.compression_level == Some(0)
-            || crate::write_plan::StoreFallback::new().applies(
-                solid,
-                entry.data.len(),
-                packed.len(),
-            ) {
-            packed = entry.data.to_vec();
-            METHOD_STORE
-        } else {
-            METHOD_BEST
-        };
-        if let Some(password) = entry.password {
-            Rar13Cipher::new(password).encrypt_in_place(&mut packed);
-        }
-        let mut flags = 0;
-        if options.features.solid {
-            flags |= LHD_SOLID;
-        }
-        if entry.password.is_some() {
-            flags |= LHD_PASSWORD;
-        }
-        if entry.file_comment.is_some() {
-            flags |= LHD_COMMENT;
-        }
-        let file_extra = encode_file_comment(entry.file_comment)?;
-        write_file_entry(
-            &mut out,
-            FileEntryRecord {
-                name: entry.name,
-                unpacked_size: entry.data.len() as u32,
-                file_crc: file_checksum(entry.data),
-                packed: &packed,
-                file_time: entry.file_time,
-                file_attr: entry.file_attr,
-                flags,
-                unp_ver: DEFAULT_UNP_VER,
-                method,
-                extra: &file_extra,
-            },
+
+    for (index, member) in members.iter().enumerate() {
+        let unpacked_size = member.unpacked_size()?;
+        report_compression_entry(reporting, true, index, members.len(), member, unpacked_size);
+        let encoded = encode_member(
+            member,
+            options,
+            &coding,
+            encode_options,
+            solid_encoder.as_mut(),
+            resources,
+            &work,
         )?;
-        report_compression_entry(progress, false, index, entries.len(), entry);
+        write_member(output, member, encoded, options)?;
+        report_compression_entry(
+            reporting,
+            false,
+            index,
+            members.len(),
+            member,
+            unpacked_size,
+        );
     }
 
     if !work.finish() {
         return Err(Error::Cancelled);
     }
+    report_compression_operation(reporting, false, total_work, members.len());
+    Ok(())
+}
 
-    report_compression_operation(progress, false, total_work, entries.len());
+struct EncodedMember<'a> {
+    payload: MemberPayload<'a>,
+    method: u8,
+    unpacked_size: usize,
+    file_crc: u16,
+}
 
-    Ok(out)
+/// Working memory one member needs while it is coded. This is the admission
+/// weight that keeps concurrent writers from piling up, not a prediction.
+fn member_workspace(unpacked: u64, compressing: bool) -> u64 {
+    if !compressing {
+        return 1024 * 1024;
+    }
+    unpacked.saturating_mul(4).saturating_add(2 * 1024 * 1024)
+}
+
+/// Codes one member, holding its bytes only while it is being coded.
+#[allow(clippy::too_many_arguments)]
+fn encode_member<'a>(
+    member: &Member<'a>,
+    options: WriterOptions,
+    coding: &MemberCoding,
+    encode_options: Rar15EncodeOptions,
+    solid_encoder: Option<&mut Unpack15Encoder>,
+    resources: &WriterResources,
+    work: &WorkTracker<'_>,
+) -> Result<EncodedMember<'a>> {
+    let unpacked_size = member.unpacked_size()?;
+    validate_member(member.name, unpacked_size)?;
+    let _permit =
+        resources.acquire_serialising(member_workspace(unpacked_size as u64, coding.compresses()));
+
+    // A stored member never needs to be resident: checksum it from its source
+    // and let the writer copy it straight through.
+    if let (MemberCoding::Stored, None, Some(source)) =
+        (coding, member.password, member.bytes.source())
+    {
+        return Ok(EncodedMember {
+            payload: MemberPayload::Copied(source),
+            method: METHOD_STORE,
+            unpacked_size,
+            file_crc: member.checksum()?,
+        });
+    }
+
+    let data = member.bytes.load()?;
+    let file_crc = file_checksum(&data);
+    if !coding.compresses() {
+        return Ok(EncodedMember {
+            payload: MemberPayload::Packed(data.into_owned()),
+            method: METHOD_STORE,
+            unpacked_size,
+            file_crc,
+        });
+    }
+
+    let solid = solid_encoder.is_some();
+    let mut last = 0usize;
+    let mut advance = |position: usize| {
+        if position < last {
+            last = 0;
+        }
+        let delta = position.saturating_sub(last);
+        last = position;
+        work.advance(delta as u64)
+    };
+    let mut packed = if let Some(encoder) = solid_encoder {
+        encoder.encode_member_with_progress(&data, &mut advance)?
+    } else if options.compression_level == Some(0) {
+        data.to_vec()
+    } else {
+        encode_verified_rar15_payload_with_progress(&data, encode_options, &mut advance)?
+            .unwrap_or_else(|| data.to_vec())
+    };
+    let method = if options.compression_level == Some(0)
+        || crate::write_plan::StoreFallback::new().applies(solid, data.len(), packed.len())
+    {
+        packed = data.into_owned();
+        METHOD_STORE
+    } else {
+        METHOD_BEST
+    };
+    Ok(EncodedMember {
+        payload: MemberPayload::Packed(packed),
+        method,
+        unpacked_size,
+        file_crc,
+    })
+}
+
+/// Writes one member's header and payload.
+fn write_member(
+    output: &mut dyn Write,
+    member: &Member<'_>,
+    encoded: EncodedMember<'_>,
+    options: WriterOptions,
+) -> Result<()> {
+    let payload = match encoded.payload {
+        MemberPayload::Packed(mut packed) => {
+            if let Some(password) = member.password {
+                Rar13Cipher::new(password).encrypt_in_place(&mut packed);
+            }
+            MemberPayload::Packed(packed)
+        }
+        // Unencrypted by construction, so the stored bytes are their own
+        // payload.
+        copied => copied,
+    };
+    let packed_size = payload.size(encoded.unpacked_size as u64);
+    let packed_size = u32::try_from(packed_size)
+        .map_err(|_| Error::InvalidHeader("RAR 1.3 file is larger than 32-bit size fields"))?;
+
+    let mut flags = 0u8;
+    if options.features.solid {
+        flags |= LHD_SOLID;
+    }
+    if member.password.is_some() {
+        flags |= LHD_PASSWORD;
+    }
+    if member.file_comment.is_some() {
+        flags |= LHD_COMMENT;
+    }
+    let file_extra = encode_file_comment(member.file_comment)?;
+    let mut header = Vec::new();
+    write_file_header(
+        &mut header,
+        FileEntryRecord {
+            name: member.name,
+            unpacked_size: encoded.unpacked_size as u32,
+            file_crc: encoded.file_crc,
+            packed_size,
+            file_time: member.file_time,
+            file_attr: member.file_attr,
+            flags,
+            unp_ver: DEFAULT_UNP_VER,
+            method: encoded.method,
+            extra: &file_extra,
+        },
+    )?;
+    output.write_all(&header)?;
+    payload.write_to(output, u64::from(packed_size))
 }
 
 pub fn write_stored_volumes(
@@ -1226,7 +1511,14 @@ pub fn write_compressed_volumes_with_progress(
         WriteOperation::Compression,
         total_work,
     );
-    report_compression_entry(progress, true, 0, 1, &entry);
+    report_compression_entry(
+        progress,
+        true,
+        0,
+        1,
+        &Member::from_file(&entry),
+        entry.data.len(),
+    );
     let mut last = 0usize;
     let mut advance = |position: usize| {
         if position < last {
@@ -1257,7 +1549,14 @@ pub fn write_compressed_volumes_with_progress(
         features: options.features,
         max_packed_per_volume,
     });
-    report_compression_entry(progress, false, 0, 1, &entry);
+    report_compression_entry(
+        progress,
+        false,
+        0,
+        1,
+        &Member::from_file(&entry),
+        entry.data.len(),
+    );
     if result.is_ok() && !work.finish() {
         return Err(Error::Cancelled);
     }
@@ -1294,24 +1593,27 @@ fn report_compression_entry(
     started: bool,
     index: usize,
     total_entries: usize,
-    entry: &FileEntry<'_>,
+    member: &Member<'_>,
+    input_bytes: usize,
 ) {
     let Some(progress) = progress else { return };
+    let name = member.name;
+    let input_bytes = input_bytes as u64;
     if started {
         progress.report(WriteProgressEvent::EntryStarted {
             operation: WriteOperation::Compression,
             index,
             total_entries,
-            name: entry.name,
-            input_bytes: entry.data.len() as u64,
+            name,
+            input_bytes,
         });
     } else {
         progress.report(WriteProgressEvent::EntryFinished {
             operation: WriteOperation::Compression,
             index,
             total_entries,
-            name: entry.name,
-            input_bytes: entry.data.len() as u64,
+            name,
+            input_bytes,
         });
     }
 }
@@ -1468,55 +1770,11 @@ fn write_main_header_with_flags(
     Ok(())
 }
 
-fn write_stored_entry(
-    out: &mut Vec<u8>,
-    entry: &StoredEntry<'_>,
-    features: FeatureSet,
-) -> Result<()> {
-    let mut flags = 0u8;
-    if entry.password.is_some() {
-        flags |= LHD_PASSWORD;
-    }
-    if entry.file_comment.is_some() {
-        flags |= LHD_COMMENT;
-    }
-    if features.solid {
-        flags |= LHD_SOLID;
-    }
-
-    let mut body = entry.data.to_vec();
-    if let Some(password) = entry.password {
-        Rar13Cipher::new(password).encrypt_in_place(&mut body);
-    }
-
-    let file_extra = encode_file_comment(entry.file_comment)?;
-    write_file_entry(
-        out,
-        FileEntryRecord {
-            name: entry.name,
-            unpacked_size: entry.data.len() as u32,
-            file_crc: file_checksum(entry.data),
-            packed: &body,
-            file_time: entry.file_time,
-            file_attr: entry.file_attr,
-            flags,
-            unp_ver: DEFAULT_UNP_VER,
-            method: METHOD_STORE,
-            extra: &file_extra,
-        },
-    )?;
-    Ok(())
-}
-
-fn validate_stored_entry(entry: &StoredEntry<'_>) -> Result<()> {
-    validate_file_entry(entry.name, entry.data)
-}
-
 struct FileEntryRecord<'a> {
     name: &'a [u8],
     unpacked_size: u32,
     file_crc: u16,
-    packed: &'a [u8],
+    packed_size: u32,
     file_time: u32,
     file_attr: u8,
     flags: u8,
@@ -1525,9 +1783,15 @@ struct FileEntryRecord<'a> {
     extra: &'a [u8],
 }
 
-fn write_file_entry(out: &mut Vec<u8>, entry: FileEntryRecord<'_>) -> Result<()> {
+fn write_file_entry(out: &mut Vec<u8>, entry: FileEntryRecord<'_>, packed: &[u8]) -> Result<()> {
+    write_file_header(out, entry)?;
+    out.extend_from_slice(packed);
+    Ok(())
+}
+
+fn write_file_header(out: &mut Vec<u8>, entry: FileEntryRecord<'_>) -> Result<()> {
     let head_size = FILE_HEAD_BASE_SIZE + entry.name.len() + entry.extra.len();
-    out.extend_from_slice(&(entry.packed.len() as u32).to_le_bytes());
+    out.extend_from_slice(&entry.packed_size.to_le_bytes());
     out.extend_from_slice(&entry.unpacked_size.to_le_bytes());
     out.extend_from_slice(&entry.file_crc.to_le_bytes());
     out.extend_from_slice(&(head_size as u16).to_le_bytes());
@@ -1539,7 +1803,6 @@ fn write_file_entry(out: &mut Vec<u8>, entry: FileEntryRecord<'_>) -> Result<()>
     out.push(entry.method);
     out.extend_from_slice(entry.name);
     out.extend_from_slice(entry.extra);
-    out.extend_from_slice(entry.packed);
     Ok(())
 }
 
@@ -1598,7 +1861,7 @@ fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
                 name: entry.name,
                 unpacked_size: entry.unpacked.len() as u32,
                 file_crc: file_checksum(checksum_data),
-                packed: chunk,
+                packed_size: chunk.len() as u32,
                 file_time: entry.file_time,
                 file_attr: entry.file_attr,
                 flags,
@@ -1606,6 +1869,7 @@ fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
                 method: entry.method,
                 extra: &[],
             },
+            chunk,
         )?;
         volumes.push(out);
     }
@@ -1656,6 +1920,10 @@ fn encode_file_comment(comment: Option<&[u8]>) -> Result<Vec<u8>> {
 }
 
 fn validate_file_entry(name: &[u8], data: &[u8]) -> Result<()> {
+    validate_member(name, data.len())
+}
+
+fn validate_member(name: &[u8], unpacked_size: usize) -> Result<()> {
     if name.is_empty() {
         return Err(Error::InvalidHeader("RAR 1.3 file name is empty"));
     }
@@ -1664,7 +1932,7 @@ fn validate_file_entry(name: &[u8], data: &[u8]) -> Result<()> {
             "RAR 1.3 file name is longer than 255 bytes",
         ));
     }
-    if data.len() > u32::MAX as usize {
+    if unpacked_size > u32::MAX as usize {
         return Err(Error::InvalidHeader(
             "RAR 1.3 file is larger than 32-bit size fields",
         ));

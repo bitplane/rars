@@ -20,6 +20,7 @@ pub(crate) fn flag_for(option: WriterOption, asked: &AskedFilters) -> &'static s
         WriterOption::Feature(Feature::HeaderEncryption) => "--encrypt-headers",
         WriterOption::Feature(Feature::QuickOpen) => "--quick-open",
         WriterOption::CompressionLevel => "--level",
+        WriterOption::CompressionMethod => "--ppmd",
         WriterOption::DictionarySize => "--dict-size",
         WriterOption::Filter => asked.flag(),
         WriterOption::RecoveryRecord => "--recovery-percent",
@@ -118,6 +119,40 @@ pub(crate) fn reject_unsupported_filter(
     Err(CliError::usage(format!(
         "{} is not supported by --format {target}{names}",
         flag_for(WriterOption::Filter, filters),
+    )))
+}
+
+/// Refuses more than one explicit filter.
+///
+/// A member carries one transform, so naming two is asking for something no
+/// format can do, whichever formats they are.
+pub(crate) fn reject_multiple_filters(filters: &AskedFilters) -> Result<(), CliError> {
+    if filters.count() > 1 {
+        return Err(CliError::usage(
+            "only one filter can be asked for at a time",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses a filter or an engine choice on an archive that is not compressed.
+///
+/// Both exist to make compression go further, so with `--store` they ask for
+/// nothing. Saying so beats writing an archive that quietly ignored the flag.
+pub(crate) fn reject_coding_without_compression(
+    filters: &AskedFilters,
+    auto_filter: bool,
+    ppmd: bool,
+) -> Result<(), CliError> {
+    let flag = if ppmd {
+        "--ppmd"
+    } else if filters.count() > 0 || auto_filter {
+        flag_for(WriterOption::Filter, filters)
+    } else {
+        return Ok(());
+    };
+    Err(CliError::usage(format!(
+        "{flag} needs something to compress; drop --store or --level 0"
     )))
 }
 

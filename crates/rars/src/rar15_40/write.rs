@@ -11,11 +11,15 @@ use crate::codec::rar29::{
     unpack29_encode_literals_with_options_and_progress, unpack29_encode_ppmd,
     unpack29_encode_ppmd_with_filter, EncodeOptions as Rar29EncodeOptions, Unpack29Encoder,
 };
+use crate::crc32::Crc32;
 pub use crate::filter::{FilterKind, FilterPolicy, FilterSpec};
 use crate::io_util::align16 as checked_align16;
-use crate::write_plan::{PlanShape, WriterOption};
+use crate::streaming::WriterResources;
+use crate::write_plan::{MemberCoding, PlanShape, WriterOption};
 use crate::write_progress::{ProgressReporter, WorkTracker};
+use crate::write_stream::{MemberBytes, MemberPayload};
 use crate::{WriteOperation, WriteProgress, WriteProgressEvent};
+use std::io::Write;
 
 const AUTO_RGB_WIDTHS: [usize; 4] = [24, 48, 96, 192];
 const MIN_STORE_FALLBACK_SIZE: usize = 1024;
@@ -37,32 +41,14 @@ pub fn write_stored_archive_with_comment(
     options: WriterOptions,
     archive_comment: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
-    let has_file_comment = entries.iter().any(|entry| entry.file_comment.is_some());
-    validate_plan(
+    let members: Vec<_> = entries.iter().map(Member::from_stored).collect();
+    collect_archive(
+        &members,
         options,
-        PlanShape::new(),
-        archive_comment.is_some(),
-        has_file_comment,
-    )?;
-    if options.features.header_encryption {
-        return write_header_encrypted_stored_archive(entries, options, archive_comment);
-    }
-
-    let mut out = Vec::new();
-    out.extend_from_slice(RAR15_SIGNATURE);
-    write_main_header(
-        &mut out,
-        if archive_comment.is_some() && uses_old_style_archive_comment(options.target) {
-            MHD_COMMENT
-        } else {
-            0
-        },
-    );
-    write_archive_comment(&mut out, archive_comment, options.target)?;
-    for entry in entries {
-        write_stored_entry(&mut out, entry, options)?;
-    }
-    Ok(out)
+        MemberCoding::Stored,
+        archive_comment,
+        None,
+    )
 }
 
 pub fn write_compressed_archive(
@@ -86,85 +72,14 @@ pub fn write_compressed_archive_with_comment_and_progress(
     archive_comment: Option<&[u8]>,
     progress: Option<&dyn WriteProgress>,
 ) -> Result<Vec<u8>> {
-    let total_bytes: u64 = entries.iter().map(|entry| entry.data.len() as u64).sum();
-    let total_work = if options.target == ArchiveVersion::Rar20 && !options.features.solid {
-        total_bytes.saturating_mul(2)
-    } else {
-        total_bytes
-    };
-    report_compression_operation(progress, true, total_work, entries.len());
-    let work = WorkTracker::new(
-        progress.map(ProgressReporter),
-        WriteOperation::Compression,
-        total_work,
-    );
-    let result =
-        write_compressed_archive_with_comment_impl(entries, options, archive_comment, Some(&work));
-    if result.is_ok() && !work.finish() {
-        return Err(Error::Cancelled);
-    }
-    report_compression_operation(progress, false, total_work, entries.len());
-    result
-}
-
-fn write_compressed_archive_with_comment_impl(
-    entries: &[FileEntry<'_>],
-    options: WriterOptions,
-    archive_comment: Option<&[u8]>,
-    progress: Option<&WorkTracker<'_>>,
-) -> Result<Vec<u8>> {
-    let has_file_comment = entries.iter().any(|entry| entry.file_comment.is_some());
-    validate_plan(
+    let members: Vec<_> = entries.iter().map(Member::from_file).collect();
+    collect_archive(
+        &members,
         options,
-        PlanShape::new().compressed(true),
-        archive_comment.is_some(),
-        has_file_comment,
-    )?;
-    if options.features.header_encryption {
-        return write_header_encrypted_compressed_archive(entries, options, archive_comment);
-    }
-
-    let mut out = Vec::new();
-    out.extend_from_slice(RAR15_SIGNATURE);
-    let mut main_flags = if options.features.solid { MHD_SOLID } else { 0 };
-    if archive_comment.is_some() && uses_old_style_archive_comment(options.target) {
-        main_flags |= MHD_COMMENT;
-    }
-    write_main_header(&mut out, main_flags);
-    write_archive_comment(&mut out, archive_comment, options.target)?;
-    if options.features.solid {
-        let mut solid_encoder = SolidEncoder::for_target(options, true)?;
-        let mut solid_run_has_member = false;
-        for entry in entries {
-            let payload =
-                encode_or_store_payload(entry.data, options, &mut solid_encoder, progress)?;
-            let solid_continuation = payload.method != 0x30 && solid_run_has_member;
-            write_compressed_entry(
-                &mut out,
-                entry,
-                &payload.data,
-                payload.method,
-                options.target,
-                dictionary_flags_for_options(options)?,
-                solid_continuation,
-            )?;
-            solid_run_has_member = payload.method != 0x30;
-        }
-    } else {
-        let dictionary_flags = dictionary_flags_for_options(options)?;
-        encode_independent_payloads(entries, options, progress, |entry, payload| {
-            write_compressed_entry(
-                &mut out,
-                entry,
-                &payload.data,
-                payload.method,
-                options.target,
-                dictionary_flags,
-                false,
-            )
-        })?;
-    }
-    Ok(out)
+        MemberCoding::Compressed,
+        archive_comment,
+        progress,
+    )
 }
 
 pub fn write_rar29_compressed_archive_with_filter_policy(
@@ -181,23 +96,198 @@ pub fn write_rar29_compressed_archive_with_filter_policy_and_progress(
     policy: FilterPolicy,
     progress: Option<&dyn WriteProgress>,
 ) -> Result<Vec<u8>> {
-    let total_bytes = entries.iter().map(|entry| entry.data.len() as u64).sum();
-    report_compression_operation(progress, true, total_bytes, entries.len());
-    validate_rar29_filter_policy(&policy, options.method)?;
-    let encode_options = rar29_encode_options_for_options(options)?;
-    let lz_method = compression_method_for_level(options)?;
-    let result = write_rar29_filtered_archive(entries, options, |entry| {
-        encode_rar29_policy_filtered_payload(
-            entry.data,
-            &policy,
-            options.method,
-            encode_options,
-            lz_method,
-            ppmd_trial_pays(options.compression_level),
-        )
-    });
-    report_compression_operation(progress, false, total_bytes, entries.len());
+    let members: Vec<_> = entries.iter().map(Member::from_file).collect();
+    collect_archive(
+        &members,
+        options,
+        MemberCoding::Filtered(policy),
+        None,
+        progress,
+    )
+}
+
+/// Writes an archive straight to `output`, holding only the members being
+/// compressed rather than every input at once.
+///
+/// `resources` bounds how many members are in flight, which is what keeps the
+/// peak flat across an archive of many files. One member still has to fit:
+/// these codecs compress a member as a unit, so a member larger than the budget
+/// is compressed on its own rather than refused.
+pub fn write_streaming_archive_to(
+    entries: &[StreamingEntry],
+    options: WriterOptions,
+    coding: MemberCoding,
+    archive_comment: Option<&[u8]>,
+    resources: &WriterResources,
+    progress: Option<&dyn WriteProgress>,
+    output: &mut dyn Write,
+) -> Result<()> {
+    let members: Vec<_> = entries.iter().map(Member::from_streaming).collect();
+    write_archive_to(
+        &members,
+        options,
+        coding,
+        archive_comment,
+        resources,
+        progress,
+        output,
+    )
+}
+
+/// Runs the streaming writer into a buffer, for the callers that want the
+/// archive as bytes. The budget still applies, so a many-file archive holds one
+/// window of members rather than all of them.
+fn collect_archive(
+    members: &[Member<'_>],
+    options: WriterOptions,
+    coding: MemberCoding,
+    archive_comment: Option<&[u8]>,
+    progress: Option<&dyn WriteProgress>,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    write_archive_to(
+        members,
+        options,
+        coding,
+        archive_comment,
+        &WriterResources::default(),
+        progress,
+        &mut out,
+    )?;
+    Ok(out)
+}
+
+fn write_archive_to(
+    members: &[Member<'_>],
+    options: WriterOptions,
+    coding: MemberCoding,
+    archive_comment: Option<&[u8]>,
+    resources: &WriterResources,
+    progress: Option<&dyn WriteProgress>,
+    output: &mut dyn Write,
+) -> Result<()> {
+    let has_file_comment = members.iter().any(|member| member.file_comment.is_some());
+    validate_plan(
+        options,
+        coding.shape(),
+        archive_comment.is_some(),
+        has_file_comment,
+    )?;
+    if let MemberCoding::Filtered(policy) = &coding {
+        validate_rar29_filter_policy(policy, options.method)?;
+    }
+    let header_password = if options.features.header_encryption {
+        validate_header_encrypted_archive_options(
+            options.target,
+            archive_comment.is_some(),
+            members.iter().any(|member| member.password.is_some()),
+        )?;
+        Some(header_encryption_password(
+            members.iter().map(|member| member.password),
+        )?)
+    } else {
+        None
+    };
+
+    let mut total_bytes = 0u64;
+    for member in members {
+        total_bytes = total_bytes.saturating_add(member.unpacked_size()? as u64);
+    }
+    // RAR 2.0 walks a non-solid member twice, once to pick a method and once to
+    // encode it, so its progress total counts every byte twice.
+    let total_work = if options.target == ArchiveVersion::Rar20
+        && !options.features.solid
+        && coding.compresses()
+    {
+        total_bytes.saturating_mul(2)
+    } else {
+        total_bytes
+    };
+    let reporting = coding.compresses().then_some(progress).flatten();
+    report_compression_operation(reporting, true, total_work, members.len());
+    let work = WorkTracker::new(
+        reporting.map(ProgressReporter),
+        WriteOperation::Compression,
+        total_work,
+    );
+
+    let result = write_members_to(
+        members,
+        options,
+        &coding,
+        archive_comment,
+        header_password,
+        resources,
+        Some(&work),
+        output,
+    );
+    if result.is_ok() && !work.finish() {
+        return Err(Error::Cancelled);
+    }
+    report_compression_operation(reporting, false, total_work, members.len());
     result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_members_to(
+    members: &[Member<'_>],
+    options: WriterOptions,
+    coding: &MemberCoding,
+    archive_comment: Option<&[u8]>,
+    header_password: Option<&[u8]>,
+    resources: &WriterResources,
+    progress: Option<&WorkTracker<'_>>,
+    output: &mut dyn Write,
+) -> Result<()> {
+    output.write_all(RAR15_SIGNATURE)?;
+    let mut main_flags = 0;
+    if options.features.solid && coding.compresses() {
+        main_flags |= MHD_SOLID;
+    }
+    if header_password.is_some() {
+        main_flags |= MHD_PASSWORD;
+    }
+    if archive_comment.is_some() && uses_old_style_archive_comment(options.target) {
+        main_flags |= MHD_COMMENT;
+    }
+    let mut head = Vec::new();
+    write_main_header(&mut head, main_flags);
+    write_archive_comment(&mut head, archive_comment, options.target)?;
+    output.write_all(&head)?;
+
+    // Solid members share one encoder, so they are coded in order. Independent
+    // ones are coded a window at a time and written as each window lands.
+    if options.features.solid && coding.compresses() {
+        let mut solid_encoder = SolidEncoder::for_target(options, true)?;
+        let mut solid_run_has_member = false;
+        for member in members {
+            let encoded = encode_member(
+                member,
+                options,
+                coding,
+                &mut solid_encoder,
+                resources,
+                progress,
+            )?;
+            let solid_continuation = encoded.method != 0x30 && solid_run_has_member;
+            solid_run_has_member = encoded.method != 0x30;
+            write_member(
+                output,
+                member,
+                encoded,
+                options,
+                solid_continuation,
+                header_password,
+            )?;
+        }
+        return Ok(());
+    }
+    crate::parallel::map_slice_windowed(
+        members,
+        crate::parallel::default_window(),
+        |member| encode_member(member, options, coding, &mut None, resources, progress),
+        |member, encoded| write_member(output, member, encoded, options, false, header_password),
+    )
 }
 
 /// Encodes one member, choosing an engine and a filter independently.
@@ -550,165 +640,201 @@ fn is_audio_filter_candidate(data: &[u8], channels: usize) -> bool {
     compared != 0 && total_delta <= compared * 24 && small_delta * 100 >= compared * 55
 }
 
-fn write_rar29_filtered_archive(
-    entries: &[FileEntry<'_>],
+/// One member, however the caller supplied it.
+struct Member<'a> {
+    name: &'a [u8],
+    bytes: MemberBytes<'a>,
+    file_time: u32,
+    file_attr: u32,
+    host_os: u8,
+    password: Option<&'a [u8]>,
+    file_comment: Option<&'a [u8]>,
+}
+
+impl<'a> Member<'a> {
+    fn from_stored(entry: &'a StoredEntry<'a>) -> Self {
+        Self {
+            name: entry.name,
+            bytes: MemberBytes::Borrowed(entry.data),
+            file_time: entry.file_time,
+            file_attr: entry.file_attr,
+            host_os: entry.host_os,
+            password: entry.password,
+            file_comment: entry.file_comment,
+        }
+    }
+
+    fn from_file(entry: &'a FileEntry<'a>) -> Self {
+        Self {
+            name: entry.name,
+            bytes: MemberBytes::Borrowed(entry.data),
+            file_time: entry.file_time,
+            file_attr: entry.file_attr,
+            host_os: entry.host_os,
+            password: entry.password,
+            file_comment: entry.file_comment,
+        }
+    }
+
+    fn from_streaming(entry: &'a StreamingEntry) -> Self {
+        Self {
+            name: &entry.name,
+            bytes: MemberBytes::Source(&entry.source),
+            file_time: entry.file_time,
+            file_attr: entry.file_attr,
+            host_os: entry.host_os,
+            password: entry.password.as_deref(),
+            file_comment: entry.file_comment.as_deref(),
+        }
+    }
+
+    fn unpacked_size(&self) -> Result<usize> {
+        usize::try_from(self.bytes.len()?)
+            .map_err(|_| Error::InvalidHeader("RAR 1.5 writer does not support large files"))
+    }
+
+    /// Checksums a member without holding it, which is how a stored one is
+    /// written straight from its source.
+    fn checksum(&self) -> Result<u32> {
+        let mut crc = Crc32::new();
+        self.bytes.walk(|chunk| crc.update(chunk))?;
+        Ok(crc.finish())
+    }
+}
+
+struct EncodedMember<'a> {
+    payload: MemberPayload<'a>,
+    method: u8,
+    unpacked_size: usize,
+    file_crc: u32,
+}
+
+/// Working memory one member needs while it is coded.
+///
+/// This is the admission weight that decides how many members run at once, not
+/// a prediction: the encoder holds the member, its packed output, and a match
+/// finder sized by the block it works in.
+fn member_workspace(options: WriterOptions, unpacked: u64, compressing: bool) -> u64 {
+    if !compressing {
+        return 1024 * 1024;
+    }
+    let dictionary = dictionary_size_for_options(options).unwrap_or(RAR29_LZ_BLOCK_SIZE) as u64;
+    unpacked
+        .saturating_mul(2)
+        .saturating_add(dictionary.saturating_mul(12))
+        .saturating_add(2 * 1024 * 1024)
+}
+
+/// Codes one member, holding its bytes only while it is being coded.
+fn encode_member<'a>(
+    member: &Member<'a>,
     options: WriterOptions,
-    encode: impl Fn(&FileEntry<'_>) -> Result<EncodedPayload> + Sync,
-) -> Result<Vec<u8>> {
-    validate_plan(
+    coding: &MemberCoding,
+    solid_encoder: &mut Option<SolidEncoder>,
+    resources: &WriterResources,
+    progress: Option<&WorkTracker<'_>>,
+) -> Result<EncodedMember<'a>> {
+    let unpacked_size = member.unpacked_size()?;
+    validate_member(member.name, unpacked_size)?;
+    let _permit = resources.acquire_serialising(member_workspace(
         options,
-        PlanShape::new().compressed(true).filtered(true),
-        false,
-        false,
-    )?;
-    if options.features.header_encryption {
-        validate_header_encrypted_archive_options(
-            options.target,
-            false,
-            entries.iter().any(|entry| entry.password.is_some()),
-        )?;
+        unpacked_size as u64,
+        coding.compresses(),
+    ));
+
+    // A stored member never needs to be resident: checksum it from its source
+    // and let the writer copy it straight through.
+    if let (MemberCoding::Stored, None, Some(source)) =
+        (coding, member.password, member.bytes.source())
+    {
+        return Ok(EncodedMember {
+            payload: MemberPayload::Copied(source),
+            method: 0x30,
+            unpacked_size,
+            file_crc: member.checksum()?,
+        });
     }
-    let mut out = Vec::new();
-    out.extend_from_slice(RAR15_SIGNATURE);
-    let main_flags = if options.features.solid { MHD_SOLID } else { 0 }
-        | if options.features.header_encryption {
-            MHD_PASSWORD
-        } else {
-            0
-        };
-    write_main_header(&mut out, main_flags);
-    let header_password = if options.features.header_encryption {
-        Some(header_encryption_password(
-            entries.iter().map(|entry| entry.password),
-        )?)
-    } else {
-        None
+
+    let data = member.bytes.load()?;
+    let file_crc = crc32(&data);
+    let payload = match coding {
+        MemberCoding::Stored => EncodedPayload {
+            data: data.into_owned(),
+            method: 0x30,
+        },
+        MemberCoding::Compressed => {
+            encode_or_store_payload(&data, options, solid_encoder, progress)?
+        }
+        MemberCoding::Filtered(policy) => encode_rar29_policy_filtered_payload(
+            &data,
+            policy,
+            options.method,
+            rar29_encode_options_for_options(options)?,
+            compression_method_for_level(options)?,
+            ppmd_trial_pays(options.compression_level),
+        )?,
     };
-    if options.features.solid {
-        let mut solid_run_has_member = false;
-        for entry in entries {
-            let payload = encode(entry)?;
-            let solid_continuation = payload.method != 0x30 && solid_run_has_member;
-            if let Some(password) = header_password {
-                write_header_encrypted_compressed_entry(
-                    &mut out,
-                    entry,
-                    &payload.data,
-                    payload.method,
-                    options,
-                    solid_continuation,
-                    password,
-                )?;
-            } else {
-                write_compressed_entry(
-                    &mut out,
-                    entry,
-                    &payload.data,
-                    payload.method,
-                    options.target,
-                    dictionary_flags_for_options(options)?,
-                    solid_continuation,
-                )?;
-            }
-            solid_run_has_member = payload.method != 0x30;
-        }
-    } else {
-        encode_filtered_payloads(entries, &encode, |entry, payload| {
-            if let Some(password) = header_password {
-                write_header_encrypted_compressed_entry(
-                    &mut out,
-                    entry,
-                    &payload.data,
-                    payload.method,
-                    options,
-                    false,
-                    password,
-                )?;
-            } else {
-                write_compressed_entry(
-                    &mut out,
-                    entry,
-                    &payload.data,
-                    payload.method,
-                    options.target,
-                    dictionary_flags_for_options(options)?,
-                    false,
-                )?;
-            }
-            Ok(())
-        })?;
-    }
-    Ok(out)
+    Ok(EncodedMember {
+        payload: MemberPayload::Packed(payload.data),
+        method: payload.method,
+        unpacked_size,
+        file_crc,
+    })
 }
 
-fn write_header_encrypted_stored_archive(
-    entries: &[StoredEntry<'_>],
+/// Writes one member's header and payload, encrypting either if asked.
+fn write_member(
+    output: &mut dyn Write,
+    member: &Member<'_>,
+    encoded: EncodedMember<'_>,
     options: WriterOptions,
-    archive_comment: Option<&[u8]>,
-) -> Result<Vec<u8>> {
-    validate_header_encrypted_archive_options(
-        options.target,
-        archive_comment.is_some(),
-        entries.iter().any(|entry| entry.password.is_some()),
-    )?;
-    let password = header_encryption_password(entries.iter().map(|entry| entry.password))?;
-
-    let mut out = Vec::new();
-    out.extend_from_slice(RAR15_SIGNATURE);
-    write_main_header(&mut out, MHD_PASSWORD);
-    for entry in entries {
-        write_header_encrypted_stored_entry(&mut out, entry, options, password)?;
-    }
-    Ok(out)
-}
-
-fn write_header_encrypted_compressed_archive(
-    entries: &[FileEntry<'_>],
-    options: WriterOptions,
-    archive_comment: Option<&[u8]>,
-) -> Result<Vec<u8>> {
-    validate_header_encrypted_archive_options(
-        options.target,
-        archive_comment.is_some(),
-        entries.iter().any(|entry| entry.password.is_some()),
-    )?;
-    let password = header_encryption_password(entries.iter().map(|entry| entry.password))?;
-
-    let mut out = Vec::new();
-    out.extend_from_slice(RAR15_SIGNATURE);
-    let main_flags = MHD_PASSWORD | if options.features.solid { MHD_SOLID } else { 0 };
-    write_main_header(&mut out, main_flags);
-    if options.features.solid {
-        let mut solid_encoder = SolidEncoder::for_target(options, true)?;
-        let mut solid_run_has_member = false;
-        for entry in entries {
-            let payload = encode_or_store_payload(entry.data, options, &mut solid_encoder, None)?;
-            let solid_continuation = payload.method != 0x30 && solid_run_has_member;
-            write_header_encrypted_compressed_entry(
-                &mut out,
-                entry,
-                &payload.data,
-                payload.method,
-                options,
-                solid_continuation,
-                password,
-            )?;
-            solid_run_has_member = payload.method != 0x30;
+    solid_continuation: bool,
+    header_password: Option<&[u8]>,
+) -> Result<()> {
+    let target = options.target;
+    validate_writer_password(target, member.password)?;
+    let (payload, salt) = match encoded.payload {
+        MemberPayload::Packed(mut packed) => {
+            let salt = encrypt_packed_data_for_writer(&mut packed, target, member.password)?;
+            (MemberPayload::Packed(packed), salt)
         }
-    } else {
-        encode_independent_payloads(entries, options, None, |entry, payload| {
-            write_header_encrypted_compressed_entry(
-                &mut out,
-                entry,
-                &payload.data,
-                payload.method,
-                options,
-                false,
-                password,
-            )
-        })?;
+        // Unencrypted by construction, so the stored bytes are their own
+        // payload and their size is the member's.
+        copied => (copied, None),
+    };
+    let packed_size = payload.size(encoded.unpacked_size as u64);
+    let packed_size = usize::try_from(packed_size)
+        .map_err(|_| Error::InvalidHeader("RAR 1.5 packed size overflows u32"))?;
+    let mut flags = writer_file_flags(member.password, member.file_comment, solid_continuation);
+    if salt.is_some() {
+        flags |= FHD_SALT;
     }
-    Ok(out)
+    let file_comment = encode_file_comment(member.file_comment)?;
+    let mut header = Vec::new();
+    write_file_header(
+        &mut header,
+        &FileRecord {
+            head_type: FILE_HEAD,
+            name: member.name,
+            unpacked_size: encoded.unpacked_size,
+            file_crc: encoded.file_crc,
+            packed_size,
+            file_time: member.file_time,
+            file_attr: member.file_attr,
+            host_os: member.host_os,
+            target,
+            method: encoded.method,
+            dictionary_flags: dictionary_flags_for_options(options)?,
+            flags,
+            salt,
+            extra: &file_comment,
+        },
+    )?;
+    match header_password {
+        Some(password) => write_encrypted_header(output, &header, password)?,
+        None => output.write_all(&header)?,
+    }
+    payload.write_to(output, packed_size as u64)
 }
 
 pub fn write_stored_volumes(
@@ -889,6 +1015,16 @@ fn validate_plan(
     }
     crate::write_plan::validate_features(options.target, options.features, shape)?;
     crate::write_plan::validate_compression_level(options.target, options.compression_level)?;
+    if options.method == Rar29Method::Ppmd {
+        crate::write_plan::validate_option(options.target, WriterOption::CompressionMethod, shape)?;
+    }
+    // A filter policy routes the member through the RAR 2.9 engine, so the
+    // formats without one have to be turned away here. This used to be
+    // computed into the shape and then never asked about, which let RAR 1.5
+    // accept a policy and write an archive that failed its own checksum.
+    if shape.filtered {
+        crate::write_plan::validate_option(options.target, WriterOption::Filter, shape)?;
+    }
     let _ = dictionary_flags_for_options(options)?;
     if has_archive_comment {
         crate::write_plan::validate_option(options.target, WriterOption::ArchiveComment, shape)?;
@@ -1089,46 +1225,6 @@ impl SolidEncoder {
 struct EncodedPayload {
     data: Vec<u8>,
     method: u8,
-}
-
-fn encode_independent_payload(
-    data: &[u8],
-    options: WriterOptions,
-    progress: Option<&WorkTracker<'_>>,
-) -> Result<EncodedPayload> {
-    let mut solid_encoder = None;
-    encode_or_store_payload(data, options, &mut solid_encoder, progress)
-}
-
-/// Compresses independent members a windowful at a time, writing each out
-/// before the next window starts so their payloads do not all pile up.
-fn encode_independent_payloads<'a, C>(
-    entries: &'a [FileEntry<'a>],
-    options: WriterOptions,
-    progress: Option<&WorkTracker<'_>>,
-    consume: C,
-) -> Result<()>
-where
-    C: FnMut(&'a FileEntry<'a>, EncodedPayload) -> Result<()>,
-{
-    crate::parallel::map_slice_windowed(
-        entries,
-        crate::parallel::default_window(),
-        |entry| encode_independent_payload(entry.data, options, progress),
-        consume,
-    )
-}
-
-fn encode_filtered_payloads<'a, F, C>(
-    entries: &'a [FileEntry<'a>],
-    encode: &F,
-    consume: C,
-) -> Result<()>
-where
-    F: Fn(&FileEntry<'_>) -> Result<EncodedPayload> + Sync,
-    C: FnMut(&'a FileEntry<'a>, EncodedPayload) -> Result<()>,
-{
-    crate::parallel::map_slice_windowed(entries, crate::parallel::default_window(), encode, consume)
 }
 
 fn encode_or_store_payload(
@@ -1515,7 +1611,7 @@ fn write_newsub_archive_comment(out: &mut Vec<u8>, comment: Option<&[u8]>) -> Re
             name: b"CMT",
             unpacked_size: comment.len(),
             file_crc: crc32(comment),
-            packed: &packed,
+            packed_size: packed.len(),
             file_time: 0,
             file_attr: 0,
             host_os: 3,
@@ -1526,171 +1622,11 @@ fn write_newsub_archive_comment(out: &mut Vec<u8>, comment: Option<&[u8]>) -> Re
             salt: None,
             extra: &[],
         },
+        &packed,
     )
 }
 
-fn write_stored_entry(
-    out: &mut Vec<u8>,
-    entry: &StoredEntry<'_>,
-    options: WriterOptions,
-) -> Result<()> {
-    let target = options.target;
-    validate_stored_entry(entry)?;
-    validate_writer_password(target, entry.password)?;
-    let mut packed = entry.data.to_vec();
-    let salt = encrypt_packed_data_for_writer(&mut packed, target, entry.password)?;
-    let mut flags = writer_file_flags(entry.password, entry.file_comment, false);
-    if salt.is_some() {
-        flags |= FHD_SALT;
-    }
-    let file_comment = encode_file_comment(entry.file_comment)?;
-    write_file_header_and_data(
-        out,
-        FileRecord {
-            head_type: FILE_HEAD,
-            name: entry.name,
-            unpacked_size: entry.data.len(),
-            file_crc: crc32(entry.data),
-            packed: &packed,
-            file_time: entry.file_time,
-            file_attr: entry.file_attr,
-            host_os: entry.host_os,
-            target,
-            method: 0x30,
-            dictionary_flags: dictionary_flags_for_options(options)?,
-            flags,
-            salt,
-            extra: &file_comment,
-        },
-    )
-}
-
-fn write_compressed_entry(
-    out: &mut Vec<u8>,
-    entry: &FileEntry<'_>,
-    packed: &[u8],
-    method: u8,
-    target: ArchiveVersion,
-    dictionary_flags: u16,
-    solid_continuation: bool,
-) -> Result<()> {
-    validate_file_entry(entry.name, entry.data)?;
-    validate_writer_password(target, entry.password)?;
-    let mut packed = packed.to_vec();
-    let salt = encrypt_packed_data_for_writer(&mut packed, target, entry.password)?;
-    let mut flags = writer_file_flags(entry.password, entry.file_comment, solid_continuation);
-    if salt.is_some() {
-        flags |= FHD_SALT;
-    }
-    let file_comment = encode_file_comment(entry.file_comment)?;
-    write_file_header_and_data(
-        out,
-        FileRecord {
-            head_type: FILE_HEAD,
-            name: entry.name,
-            unpacked_size: entry.data.len(),
-            file_crc: crc32(entry.data),
-            packed: &packed,
-            file_time: entry.file_time,
-            file_attr: entry.file_attr,
-            host_os: entry.host_os,
-            target,
-            method,
-            dictionary_flags,
-            flags,
-            salt,
-            extra: &file_comment,
-        },
-    )
-}
-
-fn write_header_encrypted_stored_entry(
-    out: &mut Vec<u8>,
-    entry: &StoredEntry<'_>,
-    options: WriterOptions,
-    header_password: &[u8],
-) -> Result<()> {
-    let target = options.target;
-    validate_stored_entry(entry)?;
-    validate_writer_password(target, entry.password)?;
-    let mut packed = entry.data.to_vec();
-    let salt = encrypt_packed_data_for_writer(&mut packed, target, entry.password)?;
-    let mut flags = writer_file_flags(entry.password, entry.file_comment, false);
-    if salt.is_some() {
-        flags |= FHD_SALT;
-    }
-    let file_comment = encode_file_comment(entry.file_comment)?;
-    let mut header = Vec::new();
-    write_file_header(
-        &mut header,
-        &FileRecord {
-            head_type: FILE_HEAD,
-            name: entry.name,
-            unpacked_size: entry.data.len(),
-            file_crc: crc32(entry.data),
-            packed: &packed,
-            file_time: entry.file_time,
-            file_attr: entry.file_attr,
-            host_os: entry.host_os,
-            target,
-            method: 0x30,
-            dictionary_flags: dictionary_flags_for_options(options)?,
-            flags,
-            salt,
-            extra: &file_comment,
-        },
-    )?;
-    write_encrypted_header_and_data(out, &header, &packed, header_password)
-}
-
-fn write_header_encrypted_compressed_entry(
-    out: &mut Vec<u8>,
-    entry: &FileEntry<'_>,
-    packed: &[u8],
-    method: u8,
-    options: WriterOptions,
-    solid_continuation: bool,
-    header_password: &[u8],
-) -> Result<()> {
-    let target = options.target;
-    validate_file_entry(entry.name, entry.data)?;
-    validate_writer_password(target, entry.password)?;
-    let mut packed = packed.to_vec();
-    let salt = encrypt_packed_data_for_writer(&mut packed, target, entry.password)?;
-    let mut flags = writer_file_flags(entry.password, entry.file_comment, solid_continuation);
-    if salt.is_some() {
-        flags |= FHD_SALT;
-    }
-    let file_comment = encode_file_comment(entry.file_comment)?;
-    let mut header = Vec::new();
-    write_file_header(
-        &mut header,
-        &FileRecord {
-            head_type: FILE_HEAD,
-            name: entry.name,
-            unpacked_size: entry.data.len(),
-            file_crc: crc32(entry.data),
-            packed: &packed,
-            file_time: entry.file_time,
-            file_attr: entry.file_attr,
-            host_os: entry.host_os,
-            target,
-            method,
-            dictionary_flags: dictionary_flags_for_options(options)?,
-            flags,
-            salt,
-            extra: &file_comment,
-        },
-    )?;
-    write_encrypted_header_and_data(out, &header, &packed, header_password)
-}
-
-fn write_encrypted_header_and_data(
-    out: &mut Vec<u8>,
-    header: &[u8],
-    data: &[u8],
-    password: &[u8],
-) -> Result<()> {
+fn write_encrypted_header(out: &mut dyn Write, header: &[u8], password: &[u8]) -> Result<()> {
     let salt = random_rar30_salt()?;
     let encrypted_size = checked_align16(header.len(), RAR15_ALIGN_OVERFLOW)?;
     let mut encrypted_header = Vec::with_capacity(encrypted_size);
@@ -1700,9 +1636,8 @@ fn write_encrypted_header_and_data(
         .map_err(super::map_rar30_crypto_error)?
         .encrypt_in_place(&mut encrypted_header)
         .map_err(super::map_rar30_crypto_error)?;
-    out.extend_from_slice(&salt);
-    out.extend_from_slice(&encrypted_header);
-    out.extend_from_slice(data);
+    out.write_all(&salt)?;
+    out.write_all(&encrypted_header)?;
     Ok(())
 }
 
@@ -1716,29 +1651,14 @@ fn validate_writer_password(target: ArchiveVersion, password: Option<&[u8]>) -> 
     Ok(())
 }
 
-fn validate_stored_entry(entry: &StoredEntry<'_>) -> Result<()> {
-    if entry.name.is_empty() {
-        return Err(Error::InvalidHeader("RAR 1.5 file name is empty"));
-    }
-    if entry.name.len() > u16::MAX as usize {
-        return Err(Error::InvalidHeader("RAR 1.5 file name is too long"));
-    }
-    if entry.data.len() > u32::MAX as usize {
-        return Err(Error::InvalidHeader(
-            "RAR 1.5 store-only writer does not support large files",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_file_entry(name: &[u8], data: &[u8]) -> Result<()> {
+fn validate_member(name: &[u8], unpacked_size: usize) -> Result<()> {
     if name.is_empty() {
         return Err(Error::InvalidHeader("RAR 1.5 file name is empty"));
     }
     if name.len() > u16::MAX as usize {
         return Err(Error::InvalidHeader("RAR 1.5 file name is too long"));
     }
-    if data.len() > u32::MAX as usize {
+    if unpacked_size > u32::MAX as usize {
         return Err(Error::InvalidHeader(
             "RAR 1.5 writer does not support large files",
         ));
@@ -1746,12 +1666,16 @@ fn validate_file_entry(name: &[u8], data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn validate_file_entry(name: &[u8], data: &[u8]) -> Result<()> {
+    validate_member(name, data.len())
+}
+
 struct FileRecord<'a> {
     head_type: u8,
     name: &'a [u8],
     unpacked_size: usize,
     file_crc: u32,
-    packed: &'a [u8],
+    packed_size: usize,
     file_time: u32,
     file_attr: u32,
     host_os: u8,
@@ -1763,9 +1687,13 @@ struct FileRecord<'a> {
     extra: &'a [u8],
 }
 
-fn write_file_header_and_data(out: &mut Vec<u8>, record: FileRecord<'_>) -> Result<()> {
+fn write_file_header_and_data(
+    out: &mut Vec<u8>,
+    record: FileRecord<'_>,
+    packed: &[u8],
+) -> Result<()> {
     write_file_header(out, &record)?;
-    out.extend_from_slice(record.packed);
+    out.extend_from_slice(packed);
     Ok(())
 }
 
@@ -1774,7 +1702,7 @@ fn write_file_header(out: &mut Vec<u8>, record: &FileRecord<'_>) -> Result<()> {
     let flags = record.flags | record.dictionary_flags;
     let (host_os, file_attr) =
         rar15_compatible_metadata(record.target, record.host_os, record.file_attr);
-    let packed_size = u32::try_from(record.packed.len())
+    let packed_size = u32::try_from(record.packed_size)
         .map_err(|_| Error::InvalidHeader("RAR 1.5 packed size overflows u32"))?;
     let unpacked_size = u32::try_from(record.unpacked_size)
         .map_err(|_| Error::InvalidHeader("RAR 1.5 unpacked size overflows u32"))?;
@@ -1911,7 +1839,7 @@ fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
                 } else {
                     unpacked_crc
                 },
-                packed: chunk,
+                packed_size: chunk.len(),
                 file_time: entry.file_time,
                 file_attr: entry.file_attr,
                 host_os: entry.host_os,
@@ -1922,6 +1850,7 @@ fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
                 salt: split_salt,
                 extra: &[],
             },
+            chunk,
         )?;
         volumes.push(out);
     }
@@ -1986,7 +1915,7 @@ fn write_header_encrypted_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<
                 } else {
                     unpacked_crc
                 },
-                packed: chunk,
+                packed_size: chunk.len(),
                 file_time: entry.file_time,
                 file_attr: entry.file_attr,
                 host_os: entry.host_os,
@@ -1998,7 +1927,8 @@ fn write_header_encrypted_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<
                 extra: &[],
             },
         )?;
-        write_encrypted_header_and_data(&mut out, &header, chunk, password)?;
+        write_encrypted_header(&mut out, &header, password)?;
+        out.extend_from_slice(chunk);
         volumes.push(out);
     }
 

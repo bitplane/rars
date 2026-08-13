@@ -12,7 +12,44 @@
 
 use crate::error::{Error, Result};
 use crate::features::{Feature, FeatureSet};
+use crate::filter::FilterPolicy;
 use crate::version::{ArchiveFamily, ArchiveVersion};
+
+/// How the members of an archive are coded.
+///
+/// The three arms are the three questions a writer has to answer before it
+/// touches a member, and they used to be three entry points per format that
+/// differed in a handful of lines each.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MemberCoding {
+    /// Store every member as it is.
+    Stored,
+    /// Compress, letting the writer decide how. The RAR 2.9 family looks for a
+    /// filter unless PPMd was asked for; RAR 1.3 to 2.0 have none to look for.
+    #[default]
+    Compressed,
+    /// Compress under a filter policy the caller named. RAR 2.9 and later only.
+    Filtered(FilterPolicy),
+}
+
+impl MemberCoding {
+    pub fn compresses(&self) -> bool {
+        !matches!(self, Self::Stored)
+    }
+
+    pub fn is_filtered(&self) -> bool {
+        matches!(self, Self::Filtered(_))
+    }
+
+    /// The shape of archive this coding produces, so validation and the
+    /// capability table are asked the same question the writer will answer.
+    pub fn shape(&self) -> PlanShape {
+        PlanShape::new()
+            .compressed(self.compresses())
+            .filtered(self.is_filtered())
+    }
+}
 
 /// What kind of archive is being built. Capability answers depend on this as
 /// well as on the format: RAR 5 will write a file comment into a stored archive
@@ -73,6 +110,8 @@ impl PlanShape {
 pub enum WriterOption {
     Feature(Feature),
     CompressionLevel,
+    /// An engine other than the format's default, which today means PPMd.
+    CompressionMethod,
     DictionarySize,
     Filter,
     RecoveryRecord,
@@ -86,11 +125,12 @@ pub enum WriterOption {
 }
 
 impl WriterOption {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::Feature(Feature::Solid),
         Self::Feature(Feature::HeaderEncryption),
         Self::Feature(Feature::QuickOpen),
         Self::CompressionLevel,
+        Self::CompressionMethod,
         Self::DictionarySize,
         Self::Filter,
         Self::RecoveryRecord,
@@ -109,6 +149,7 @@ impl WriterOption {
         match self {
             Self::Feature(feature) => feature.name(),
             Self::CompressionLevel => "a compression level",
+            Self::CompressionMethod => "an alternative compression method",
             Self::DictionarySize => "a dictionary size",
             Self::Filter => "a data filter",
             Self::RecoveryRecord => "a recovery record",
@@ -159,18 +200,29 @@ pub fn supports(target: ArchiveVersion, option: WriterOption, shape: PlanShape) 
         // Quick-open indexes headers, so it cannot cover encrypted ones.
         WriterOption::Feature(Feature::QuickOpen) => family == ArchiveFamily::Rar50Plus,
         WriterOption::CompressionLevel => true,
-        WriterOption::DictionarySize => !family_is(family, ArchiveFamily::Rar13),
-        // RAR 1.3 and 1.5 have no filters at all; RAR 2.0 predates the VM.
-        WriterOption::Filter => !matches!(
+        // PPMd arrived with RAR 2.9 and left again with RAR 5.
+        WriterOption::CompressionMethod => matches!(
             target,
-            ArchiveVersion::Rar13
-                | ArchiveVersion::Rar14
-                | ArchiveVersion::Rar15
-                | ArchiveVersion::Rar20
+            ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
         ),
+        WriterOption::DictionarySize => !family_is(family, ArchiveFamily::Rar13),
+        // RAR 1.3 and 1.5 have no filters at all; RAR 2.0 predates the VM. The
+        // legacy volume writer takes a payload rather than a policy, so a
+        // filter cannot be asked for across a split set.
+        WriterOption::Filter => {
+            !matches!(
+                target,
+                ArchiveVersion::Rar13
+                    | ArchiveVersion::Rar14
+                    | ArchiveVersion::Rar15
+                    | ArchiveVersion::Rar20
+            ) && (family == ArchiveFamily::Rar50Plus || !shape.volumes)
+        }
         WriterOption::RecoveryRecord => family == ArchiveFamily::Rar50Plus,
         WriterOption::VolumeSize => true,
-        WriterOption::ArchiveComment => true,
+        // The legacy volume writer emits the split member and nothing else, so
+        // a comment has nowhere to go in a split set.
+        WriterOption::ArchiveComment => family == ArchiveFamily::Rar50Plus || !shape.volumes,
         // RAR 3.x and 4.x moved file comments into a form this writer does not
         // emit. RAR 5 carries them as a service record, which the legacy
         // writers cannot split across volumes.
@@ -180,9 +232,12 @@ pub fn supports(target: ArchiveVersion, option: WriterOption, shape: PlanShape) 
         }
         WriterOption::ArchiveMetadata => family == ArchiveFamily::Rar50Plus,
         WriterOption::Password => true,
-        // Only the RAR 5 engine works to a budget or spills to disk; the others
-        // build the whole archive in memory.
-        WriterOption::MemoryLimit | WriterOption::TempDir => family == ArchiveFamily::Rar50Plus,
+        // Every writer compresses to a budget now: RAR 5 sizes its blocks by
+        // it, and the older ones use it to decide how many members to have in
+        // flight. A legacy volume set is the exception, still built in memory.
+        WriterOption::MemoryLimit => family == ArchiveFamily::Rar50Plus || !shape.volumes,
+        // Only the RAR 5 engine spills to disk.
+        WriterOption::TempDir => family == ArchiveFamily::Rar50Plus,
     }
 }
 

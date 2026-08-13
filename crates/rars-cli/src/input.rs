@@ -194,8 +194,8 @@ fn source_unix_mode(_metadata: &fs::Metadata) -> Option<u32> {
     None
 }
 
-pub(crate) fn rar15_file_attr(entry: &OwnedInput) -> u32 {
-    entry
-        .unix_mode
-        .unwrap_or_else(|| u32::from(entry.file_attr))
+/// The attribute word the RAR 1.5+ writers record, preferring the Unix mode
+/// where there is one.
+pub(crate) fn rar15_file_attr(unix_mode: Option<u32>, file_attr: u8) -> u32 {
+    unix_mode.unwrap_or_else(|| u32::from(file_attr))
 }

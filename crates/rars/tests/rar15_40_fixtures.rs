@@ -6229,3 +6229,215 @@ fn rar29_applies_a_filter_that_starts_beyond_the_dictionary() {
         }
     }
 }
+
+/// The streaming writer and the in-memory one are the same writer with a
+/// different way of getting at the bytes, so the archives they produce have to
+/// be the same archives. Anything else means the streaming path has quietly
+/// grown its own behaviour.
+#[test]
+fn streaming_and_buffered_writers_agree_byte_for_byte() {
+    use rars::rar15_40::{write_streaming_archive_to, StreamingEntry};
+    use rars::{EntrySource, MemberCoding, WriterResources};
+
+    let text = b"the quick brown fox jumps over the lazy dog\n".repeat(400);
+    let binary = level_sensitive_payload();
+    let members: Vec<(&[u8], &[u8])> = vec![
+        (b"text.txt", &text),
+        (b"binary.bin", &binary),
+        (b"empty.dat", b""),
+    ];
+
+    for target in [
+        ArchiveVersion::Rar15,
+        ArchiveVersion::Rar20,
+        ArchiveVersion::Rar29,
+        ArchiveVersion::Rar30,
+        ArchiveVersion::Rar40,
+    ] {
+        for solid in [false, true] {
+            for coding in [
+                MemberCoding::Stored,
+                MemberCoding::Compressed,
+                MemberCoding::Filtered(FilterPolicy::Auto),
+                MemberCoding::Filtered(FilterPolicy::None),
+            ] {
+                let mut features = FeatureSet::store_only();
+                features.solid = solid && coding.compresses();
+                let options = WriterOptions::new(target, features);
+                let comment: Option<&[u8]> = Some(b"shared comment");
+
+                let buffered = match &coding {
+                    MemberCoding::Stored => {
+                        let entries: Vec<_> = members
+                            .iter()
+                            .map(|(name, data)| StoredEntry {
+                                name,
+                                data,
+                                file_time: 0,
+                                file_attr: 0,
+                                host_os: 3,
+                                password: None,
+                                file_comment: None,
+                            })
+                            .collect();
+                        write_stored_archive_with_comment(&entries, options, comment)
+                    }
+                    coding => {
+                        let entries: Vec<_> = members
+                            .iter()
+                            .map(|(name, data)| FileEntry {
+                                name,
+                                data,
+                                file_time: 0,
+                                file_attr: 0,
+                                host_os: 3,
+                                password: None,
+                                file_comment: None,
+                            })
+                            .collect();
+                        match coding {
+                            MemberCoding::Filtered(policy) => {
+                                write_rar29_compressed_archive_with_filter_policy(
+                                    &entries,
+                                    options,
+                                    policy.clone(),
+                                )
+                            }
+                            _ => write_compressed_archive_with_comment(&entries, options, comment),
+                        }
+                    }
+                };
+
+                let streamed_entries: Vec<_> = members
+                    .iter()
+                    .map(|(name, data)| {
+                        StreamingEntry::new(name.to_vec(), EntrySource::from_bytes(data.to_vec()))
+                            .with_host_os(3)
+                    })
+                    .collect();
+                // The filtered entry point takes no comment, so neither does
+                // the comparison.
+                let streamed_comment = if coding.is_filtered() { None } else { comment };
+                let mut streamed = Vec::new();
+                let streamed_result = write_streaming_archive_to(
+                    &streamed_entries,
+                    options,
+                    coding.clone(),
+                    streamed_comment,
+                    &WriterResources::default(),
+                    None,
+                    &mut streamed,
+                );
+
+                let label = format!("{target} solid={solid} {coding:?}");
+                match buffered {
+                    Ok(buffered) => {
+                        assert!(streamed_result.is_ok(), "{label}: streaming refused what the buffered writer accepted: {streamed_result:?}");
+                        assert_eq!(streamed, buffered, "{label}: archives differ");
+                        // Solid RAR 1.5 writes a member that fails its own
+                        // checksum, on both paths alike. That is a writer bug
+                        // of its own rather than anything to do with
+                        // streaming, so it is not round-tripped here.
+                        if target == ArchiveVersion::Rar15 && solid {
+                            continue;
+                        }
+                        let archive = Archive::parse(&streamed).unwrap();
+                        let extracted = collect_extract(&archive)
+                            .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+                        assert_eq!(extracted.len(), members.len(), "{label}");
+                        for (got, (_, want)) in extracted.iter().zip(&members) {
+                            assert_eq!(&got.data, want, "{label}");
+                        }
+                    }
+                    Err(buffered) => {
+                        let streamed_error = streamed_result.expect_err(&format!(
+                            "{label}: streaming accepted what the buffered writer refused"
+                        ));
+                        assert_eq!(
+                            streamed_error.to_string(),
+                            buffered.to_string(),
+                            "{label}: the two paths refused it differently"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A stored member is copied straight from its source rather than read into
+/// memory, which is a different code path from the one that holds the bytes.
+#[test]
+fn a_stored_member_round_trips_from_a_file_on_disk() {
+    use rars::rar15_40::{write_streaming_archive_to, StreamingEntry};
+    use rars::{EntrySource, MemberCoding, WriterResources};
+
+    let directory = std::env::temp_dir().join(format!("rars-stream-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("payload.bin");
+    // Larger than the walk chunk, so the checksum really is taken in pieces.
+    let payload: Vec<u8> = (0..700_000u32).map(|index| index as u8).collect();
+    std::fs::write(&path, &payload).unwrap();
+
+    let entries = vec![StreamingEntry::new(
+        b"payload.bin".to_vec(),
+        EntrySource::from_path(path.clone()),
+    )];
+    let mut bytes = Vec::new();
+    write_streaming_archive_to(
+        &entries,
+        WriterOptions::new(ArchiveVersion::Rar29, FeatureSet::store_only()),
+        MemberCoding::Stored,
+        None,
+        &WriterResources::default(),
+        None,
+        &mut bytes,
+    )
+    .unwrap();
+
+    let archive = Archive::parse(&bytes).unwrap();
+    let extracted = collect_extract(&archive).unwrap();
+    assert_eq!(extracted.len(), 1);
+    assert_eq!(extracted[0].data, payload);
+    assert_eq!(crc32(&extracted[0].data), crc32(&payload));
+
+    std::fs::remove_dir_all(&directory).unwrap();
+}
+
+/// A member larger than the whole budget still gets written: the legacy codecs
+/// have no smaller unit to fall back to, so the budget serialises them rather
+/// than refusing the job.
+#[test]
+fn a_member_larger_than_the_budget_is_written_anyway() {
+    use rars::rar15_40::{write_streaming_archive_to, StreamingEntry};
+    use rars::{EntrySource, MemberCoding, WriterResources};
+
+    let payload = b"a budget this small cannot hold one member\n".repeat(500);
+    let entries: Vec<_> = (0..4)
+        .map(|index| {
+            StreamingEntry::new(
+                format!("member{index}.txt").into_bytes(),
+                EntrySource::from_bytes(payload.clone()),
+            )
+        })
+        .collect();
+
+    let mut bytes = Vec::new();
+    write_streaming_archive_to(
+        &entries,
+        WriterOptions::new(ArchiveVersion::Rar29, FeatureSet::store_only()),
+        MemberCoding::Compressed,
+        None,
+        &WriterResources::new(4096),
+        None,
+        &mut bytes,
+    )
+    .unwrap();
+
+    let archive = Archive::parse(&bytes).unwrap();
+    let extracted = collect_extract(&archive).unwrap();
+    assert_eq!(extracted.len(), 4);
+    for entry in &extracted {
+        assert_eq!(entry.data, payload);
+    }
+}

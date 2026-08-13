@@ -147,6 +147,17 @@ impl WriterResources {
         }
         Ok(self.budget.acquire(required))
     }
+
+    /// Reserves what a member needs, or the whole budget if one member needs
+    /// more than that.
+    ///
+    /// The RAR 1.3 to 4.x codecs compress a member as a unit, so there is no
+    /// smaller piece to fall back to when one does not fit. Here the budget
+    /// decides how many members are compressed at once rather than whether the
+    /// job can run at all, and a member larger than the budget runs alone.
+    pub(crate) fn acquire_serialising(&self, required: u64) -> MemoryPermit {
+        self.budget.acquire(required.min(self.memory_limit))
+    }
 }
 
 #[derive(Debug)]

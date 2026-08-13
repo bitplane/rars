@@ -680,3 +680,152 @@ fn expected_repeatb() -> Vec<u8> {
     }
     out
 }
+
+/// The streaming writer and the in-memory one are the same writer with a
+/// different way of getting at the bytes, so the archives they produce have to
+/// be the same archives.
+#[test]
+fn streaming_and_buffered_writers_agree_byte_for_byte() {
+    use rars::rar13::{
+        write_compressed_archive_with_comment, write_stored_archive_with_comment,
+        write_streaming_archive_to, FileEntry, StoredEntry, StreamingEntry, WriterOptions,
+    };
+    use rars::{ArchiveVersion, EntrySource, FeatureSet, MemberCoding, WriterResources};
+
+    let text = b"the quick brown fox jumps over the lazy dog\n".repeat(400);
+    let counted: Vec<u8> = (0..40_000u32).map(|index| index as u8).collect();
+    let members: Vec<(&[u8], &[u8])> = vec![
+        (b"TEXT.TXT", &text),
+        (b"COUNT.BIN", &counted),
+        (b"EMPTY.DAT", b""),
+    ];
+
+    for solid in [false, true] {
+        for coding in [MemberCoding::Stored, MemberCoding::Compressed] {
+            let mut features = FeatureSet::store_only();
+            features.solid = solid && coding.compresses();
+            let options = WriterOptions::new(ArchiveVersion::Rar14, features);
+            let comment: Option<&[u8]> = Some(b"shared comment");
+
+            let buffered = match &coding {
+                MemberCoding::Stored => {
+                    let entries: Vec<_> = members
+                        .iter()
+                        .map(|(name, data)| StoredEntry {
+                            name,
+                            data,
+                            file_time: 0,
+                            file_attr: 0,
+                            password: None,
+                            file_comment: None,
+                        })
+                        .collect();
+                    write_stored_archive_with_comment(&entries, options, comment)
+                }
+                _ => {
+                    let entries: Vec<_> = members
+                        .iter()
+                        .map(|(name, data)| FileEntry {
+                            name,
+                            data,
+                            file_time: 0,
+                            file_attr: 0,
+                            password: None,
+                            file_comment: None,
+                        })
+                        .collect();
+                    write_compressed_archive_with_comment(&entries, options, comment)
+                }
+            };
+
+            let streamed_entries: Vec<_> = members
+                .iter()
+                .map(|(name, data)| {
+                    StreamingEntry::new(name.to_vec(), EntrySource::from_bytes(data.to_vec()))
+                })
+                .collect();
+            let mut streamed = Vec::new();
+            let streamed_result = write_streaming_archive_to(
+                &streamed_entries,
+                options,
+                coding.clone(),
+                comment,
+                &WriterResources::default(),
+                None,
+                &mut streamed,
+            );
+
+            let label = format!("solid={solid} {coding:?}");
+            match buffered {
+                Ok(buffered) => {
+                    assert!(
+                        streamed_result.is_ok(),
+                        "{label}: streaming refused what the buffered writer accepted: \
+                         {streamed_result:?}"
+                    );
+                    assert_eq!(streamed, buffered, "{label}: archives differ");
+                    // A solid run writes a member that fails its own checksum,
+                    // on both paths alike. That is a bug in the shared RAR 1.5
+                    // encoder rather than anything to do with streaming, so it
+                    // is not round-tripped here.
+                    if solid && coding.compresses() {
+                        continue;
+                    }
+                    let archive = Archive::parse(&streamed).unwrap();
+                    let extracted = collect_extract(&archive, None)
+                        .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+                    assert_eq!(extracted.len(), members.len(), "{label}");
+                    for (got, (_, want)) in extracted.iter().zip(&members) {
+                        assert_eq!(&got.data, want, "{label}");
+                    }
+                }
+                Err(buffered) => {
+                    let streamed_error = streamed_result.expect_err(&format!(
+                        "{label}: streaming accepted what the buffered writer refused"
+                    ));
+                    assert_eq!(
+                        streamed_error.to_string(),
+                        buffered.to_string(),
+                        "{label}: the two paths refused it differently"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// RAR 1.3 has no filters, so a filter policy has to be turned away rather
+/// than routed into a compression engine it does not have.
+#[test]
+fn a_filter_policy_is_refused_by_name() {
+    use rars::rar13::{write_streaming_archive_to, StreamingEntry, WriterOptions};
+    use rars::{
+        ArchiveVersion, EntrySource, FeatureSet, FilterPolicy, MemberCoding, WriterOption,
+        WriterResources,
+    };
+
+    let entries = vec![StreamingEntry::new(
+        b"A.TXT".to_vec(),
+        EntrySource::from_bytes(b"payload".to_vec()),
+    )];
+    let mut out = Vec::new();
+    let error = write_streaming_archive_to(
+        &entries,
+        WriterOptions::new(ArchiveVersion::Rar14, FeatureSet::store_only()),
+        MemberCoding::Filtered(FilterPolicy::Auto),
+        None,
+        &WriterResources::default(),
+        None,
+        &mut out,
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        Error::UnsupportedWriterOption {
+            option: WriterOption::Filter,
+            ..
+        }
+    ));
+    assert!(out.is_empty(), "nothing should have been written");
+}

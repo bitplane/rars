@@ -20,6 +20,8 @@ use std::sync::Arc;
 
 mod extract;
 mod write;
+pub use crate::streaming::{EntrySource, WriterResources};
+pub use crate::write_plan::MemberCoding;
 pub use extract::extract_volumes_to;
 use extract::{DecoderSession, DecryptingReader};
 pub use write::{
@@ -27,7 +29,8 @@ pub use write::{
     write_compressed_archive_with_comment_and_progress, write_compressed_volumes,
     write_compressed_volumes_with_progress, write_rar29_compressed_archive_with_filter_policy,
     write_rar29_compressed_archive_with_filter_policy_and_progress, write_stored_archive,
-    write_stored_archive_with_comment, write_stored_volumes, FilterKind, FilterPolicy, FilterSpec,
+    write_stored_archive_with_comment, write_stored_volumes, write_streaming_archive_to,
+    FilterKind, FilterPolicy, FilterSpec,
 };
 
 const MARK_HEAD: u8 = 0x72;
@@ -276,6 +279,62 @@ pub struct FileEntry<'a> {
     pub host_os: u8,
     pub password: Option<&'a [u8]>,
     pub file_comment: Option<&'a [u8]>,
+}
+
+/// One member of an archive written a member at a time.
+///
+/// The bytes are opened when the member is coded and dropped once it is
+/// written, so an archive of many files never holds more than the members
+/// being worked on. A stored member is copied straight from its source and
+/// never lands on the heap at all.
+#[derive(Debug, Clone)]
+pub struct StreamingEntry {
+    pub name: Vec<u8>,
+    pub source: EntrySource,
+    pub file_time: u32,
+    pub file_attr: u32,
+    pub host_os: u8,
+    pub password: Option<Vec<u8>>,
+    pub file_comment: Option<Vec<u8>>,
+}
+
+impl StreamingEntry {
+    pub fn new(name: impl Into<Vec<u8>>, source: EntrySource) -> Self {
+        Self {
+            name: name.into(),
+            source,
+            file_time: 0,
+            file_attr: 0,
+            host_os: 3,
+            password: None,
+            file_comment: None,
+        }
+    }
+
+    pub fn with_file_time(mut self, file_time: u32) -> Self {
+        self.file_time = file_time;
+        self
+    }
+
+    pub fn with_file_attr(mut self, file_attr: u32) -> Self {
+        self.file_attr = file_attr;
+        self
+    }
+
+    pub fn with_host_os(mut self, host_os: u8) -> Self {
+        self.host_os = host_os;
+        self
+    }
+
+    pub fn with_password(mut self, password: impl Into<Vec<u8>>) -> Self {
+        self.password = Some(password.into());
+        self
+    }
+
+    pub fn with_file_comment(mut self, comment: impl Into<Vec<u8>>) -> Self {
+        self.file_comment = Some(comment.into());
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

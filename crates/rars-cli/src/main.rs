@@ -34,7 +34,7 @@ use rars::rar15_40::{
 };
 use rars::{
     extract_volumes_to_with_options, Archive as DetectedArchive, ArchiveReadOptions, ArchiveReader,
-    ArchiveVersion, FeatureSet,
+    ArchiveVersion, FeatureSet, MemberCoding,
 };
 use repair::cmd_repair;
 use std::cell::RefCell;
@@ -47,7 +47,6 @@ use volumes::{
     discover_sibling_volumes, rar50_volume_part_path, sort_volume_paths, volume_part_path,
 };
 
-const DOS_DIRECTORY_ATTR: u8 = 0x10;
 const DOS_ARCHIVE_ATTR: u8 = 0x20;
 #[cfg(windows)]
 const RAR50_HOST_NATIVE: u64 = 0;
@@ -1101,7 +1100,11 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
                 rars::WriterOption::DictionarySize,
                 dictionary_size.is_some(),
             ),
-            (rars::WriterOption::Filter, asked_filters.count() > 0),
+            (
+                rars::WriterOption::Filter,
+                asked_filters.count() > 0 || auto_filter,
+            ),
+            (rars::WriterOption::CompressionMethod, ppmd),
             (
                 rars::WriterOption::RecoveryRecord,
                 recovery_percent.is_some(),
@@ -1119,22 +1122,16 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
         ],
     )?;
     add_plan::reject_unsupported_filter(target, &asked_filters)?;
-    if matches!(
-        target,
-        ArchiveVersion::Rar15
-            | ArchiveVersion::Rar20
-            | ArchiveVersion::Rar29
-            | ArchiveVersion::Rar30
-            | ArchiveVersion::Rar40
-    ) {
-        validate_rar15_40_add_options(
-            target,
-            password_bytes(&password),
-            archive_comment.as_deref(),
-            file_comment.as_deref(),
-            volume_size,
-            header_encryption,
-        )?;
+    add_plan::reject_multiple_filters(&asked_filters)?;
+    if store {
+        add_plan::reject_coding_without_compression(&asked_filters, auto_filter, ppmd)?;
+    }
+    // A cross-flag rule rather than a capability: every format that encrypts
+    // headers needs the key to do it with.
+    if header_encryption && password.is_none() {
+        return Err(CliError::usage(
+            "--encrypt-headers needs a --password to encrypt them with",
+        ));
     }
     if matches!(
         target,
@@ -1150,32 +1147,6 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
         return Err("multivolume writer currently supports one input file".into());
     }
     if matches!(target, ArchiveVersion::Rar50 | ArchiveVersion::Rar70) {
-        if ppmd {
-            return Err("--ppmd is only available for RAR 2.9/3.x/4.x writers".into());
-        }
-        // These three name RAR 2.9 RarVM programs with no RAR 5 filter type
-        // behind them.
-        if let Some(flag) = [
-            itanium_filter.then_some("--itanium-filter"),
-            rgb_filter.is_some().then_some("--rgb-filter"),
-            audio_filter.is_some().then_some("--audio-filter"),
-        ]
-        .into_iter()
-        .flatten()
-        .next()
-        {
-            return Err(format!("{flag} is only available for RAR 2.9/3.x/4.x writers").into());
-        }
-        if usize::from(delta_filter.is_some())
-            + usize::from(e8_filter.is_some())
-            + usize::from(arm_filter)
-            > 1
-        {
-            return Err("RAR 5 writer accepts only one explicit filter option".into());
-        }
-        if header_encryption && password.is_none() {
-            return Err("RAR 5 header encryption requires --password".into());
-        }
         // Quick-open indexes plaintext headers, so the two cannot combine.
         if quick_open && header_encryption {
             return Err("RAR 5 quick-open cannot be combined with header encryption".into());
@@ -1209,338 +1180,333 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
             &progress,
         );
     }
-    warn_if_buffered_write_is_large(input_paths, target);
+    let write_plan = AddWritePlan::for_target(target)?;
+
+    // A volume set is still built in memory: the split has to see the whole
+    // packed payload before it can decide where the parts break.
+    if let Some(volume_size) = volume_size {
+        return write_legacy_volumes(
+            LegacyVolumeWrite {
+                write_plan,
+                input_paths,
+                archive_path: &archive_path,
+                target,
+                compression_level,
+                dictionary_size,
+                password: password_bytes(&password),
+                solid,
+                header_encryption,
+                file_comment: file_comment.as_deref(),
+                volume_size,
+                compress,
+            },
+            &progress,
+        );
+    }
+
+    progress.spinner("Scanning inputs");
+    let inputs = collect_inputs(input_paths)?;
+    let total: u64 = inputs.iter().map(|entry| entry.size).sum();
+    progress.finish(format!(
+        "Found {} files ({})",
+        inputs.len(),
+        indicatif::HumanBytes(total)
+    ));
+    progress.spinner(if compress {
+        "Preparing compression"
+    } else {
+        "Preparing archive"
+    });
+
+    let coding = if store {
+        MemberCoding::Stored
+    } else if let Some(policy) = legacy_filter_policy(
+        target,
+        auto_filter,
+        no_filter,
+        delta_filter,
+        e8_filter,
+        itanium_filter,
+        rgb_filter,
+        audio_filter,
+    ) {
+        MemberCoding::Filtered(policy)
+    } else {
+        MemberCoding::Compressed
+    };
+    let mut features = FeatureSet::store_only();
+    features.solid = solid;
+    features.header_encryption = header_encryption;
+    let password = password_bytes(&password);
+    let resources = rars::WriterResources::new(
+        memory_limit.map_or(rars::DEFAULT_WRITER_MEMORY_LIMIT, |limit| limit as u64),
+    );
+    progress.bar("Compressing archive", total);
+
+    write_archive_streaming(&archive_path, |output| {
+        let written = match write_plan {
+            AddWritePlan::Rar15To40 => {
+                let entries: Vec<_> = inputs
+                    .iter()
+                    .map(|input| {
+                        let entry = rars::rar15_40::StreamingEntry::new(
+                            input.name.clone(),
+                            rars::EntrySource::from_path(input.path.clone()),
+                        )
+                        .with_file_time(input.dos_mtime)
+                        .with_file_attr(rar15_file_attr(input.unix_mode, input.file_attr))
+                        .with_host_os(3);
+                        let entry = match file_comment.as_deref() {
+                            Some(comment) => entry.with_file_comment(comment.to_vec()),
+                            None => entry,
+                        };
+                        match password {
+                            Some(password) => entry.with_password(password.to_vec()),
+                            None => entry,
+                        }
+                    })
+                    .collect();
+                let mut options = Rar15WriterOptions::new(target, features);
+                if let Some(level) = compression_level {
+                    options = options.with_compression_level(level);
+                }
+                if let Some(size) = dictionary_size {
+                    options = options.with_dictionary_size(size);
+                }
+                options = options.with_method(if ppmd {
+                    rars::rar15_40::Rar29Method::Ppmd
+                } else if coding.is_filtered() && !auto_filter && !no_filter {
+                    // A named filter is a request for that filter, not an
+                    // invitation to weigh it against another engine.
+                    rars::rar15_40::Rar29Method::Lz
+                } else {
+                    rars::rar15_40::Rar29Method::Auto
+                });
+                rars::rar15_40::write_streaming_archive_to(
+                    &entries,
+                    options,
+                    coding.clone(),
+                    archive_comment.as_deref(),
+                    &resources,
+                    Some(&progress),
+                    output,
+                )
+            }
+            AddWritePlan::Rar13 => {
+                let entries: Vec<_> = inputs
+                    .iter()
+                    .map(|input| {
+                        let entry = rars::rar13::StreamingEntry::new(
+                            input.name.clone(),
+                            rars::EntrySource::from_path(input.path.clone()),
+                        )
+                        .with_file_time(input.dos_mtime)
+                        .with_file_attr(input.file_attr);
+                        let entry = match file_comment.as_deref() {
+                            Some(comment) => entry.with_file_comment(comment.to_vec()),
+                            None => entry,
+                        };
+                        match password {
+                            Some(password) => entry.with_password(password.to_vec()),
+                            None => entry,
+                        }
+                    })
+                    .collect();
+                let mut options = Rar13WriterOptions::new(target, features);
+                if let Some(level) = compression_level {
+                    options = options.with_compression_level(level);
+                }
+                rars::rar13::write_streaming_archive_to(
+                    &entries,
+                    options,
+                    coding.clone(),
+                    archive_comment.as_deref(),
+                    &resources,
+                    Some(&progress),
+                    output,
+                )
+            }
+        };
+        written.map_err(|error| add_plan::map_write_error(error, shape, &asked_filters))
+    })?;
+    progress.finish("100%");
+    eprintln!("created {}", archive_path.display());
+    Ok(())
+}
+
+/// The filter policy the flags ask for, or `None` when nothing filter-related
+/// was asked and the writer should choose for itself.
+///
+/// `--no-filter` only becomes a policy where there is a search to turn off. On
+/// RAR 1.3 to 2.0 there is none, so the flag asks for what already happens and
+/// passes without comment.
+#[allow(clippy::too_many_arguments)]
+fn legacy_filter_policy(
+    target: ArchiveVersion,
+    auto_filter: bool,
+    no_filter: bool,
+    delta_filter: Option<usize>,
+    e8_filter: Option<bool>,
+    itanium_filter: bool,
+    rgb_filter: Option<usize>,
+    audio_filter: Option<usize>,
+) -> Option<rars::FilterPolicy> {
+    use rars::{FilterKind, FilterSpec};
+
+    let kind = if let Some(channels) = delta_filter {
+        FilterKind::Delta { channels }
+    } else if e8_filter == Some(true) {
+        FilterKind::E8E9
+    } else if e8_filter == Some(false) {
+        FilterKind::E8
+    } else if itanium_filter {
+        FilterKind::Itanium
+    } else if let Some(width) = rgb_filter {
+        FilterKind::Rgb { width, pos_r: 0 }
+    } else if let Some(channels) = audio_filter {
+        FilterKind::Audio { channels }
+    } else if auto_filter {
+        return Some(rars::FilterPolicy::Auto);
+    } else if no_filter
+        && rars::supports(
+            target,
+            rars::WriterOption::Filter,
+            rars::PlanShape::new().compressed(true),
+        )
+    {
+        return Some(rars::FilterPolicy::None);
+    } else {
+        return None;
+    };
+    Some(rars::FilterPolicy::Explicit(FilterSpec::whole(kind)))
+}
+
+/// What a legacy volume set needs, which is still every input in memory.
+struct LegacyVolumeWrite<'a> {
+    write_plan: AddWritePlan,
+    input_paths: &'a [String],
+    archive_path: &'a Path,
+    target: ArchiveVersion,
+    compression_level: Option<u8>,
+    dictionary_size: Option<usize>,
+    password: Option<&'a [u8]>,
+    solid: bool,
+    header_encryption: bool,
+    file_comment: Option<&'a [u8]>,
+    volume_size: usize,
+    compress: bool,
+}
+
+fn write_legacy_volumes(plan: LegacyVolumeWrite<'_>, progress: &CliProgress) -> CliResult<()> {
+    warn_if_buffered_write_is_large(plan.input_paths, plan.target);
     progress.spinner("Scanning inputs");
     let owned = read_inputs_with_progress(
-        input_paths,
-        password_bytes(&password),
+        plan.input_paths,
+        plan.password,
         |files, bytes| progress.bar(format!("Reading {files} files"), bytes),
         |bytes, name| {
             progress.set_message(format!("Reading {}", display_bytes_lossy(name)));
             progress.advance(bytes);
         },
     )?;
-    let input_bytes: u64 = owned.iter().map(|entry| entry.data.len() as u64).sum();
+    // Invariant: one input, checked before anything was read.
+    let entry = owned.first().expect("one input checked above");
     progress.finish(format!(
-        "Read {} files ({})",
-        owned.len(),
-        indicatif::HumanBytes(input_bytes)
+        "Read 1 file ({})",
+        indicatif::HumanBytes(entry.data.len() as u64)
     ));
-    if compress {
-        progress.spinner("Preparing compression");
+    progress.spinner(if plan.compress {
+        "Preparing compression"
     } else {
-        progress.spinner("Preparing archive");
-    }
-    if matches!(
-        target,
-        ArchiveVersion::Rar14
-            | ArchiveVersion::Rar15
-            | ArchiveVersion::Rar20
-            | ArchiveVersion::Rar29
-            | ArchiveVersion::Rar30
-            | ArchiveVersion::Rar40
-    ) && (delta_filter.is_some()
-        || e8_filter.is_some()
-        || itanium_filter
-        || rgb_filter.is_some()
-        || audio_filter.is_some()
-        || arm_filter
-        || auto_filter
-        || ppmd)
-    {
-        let filter_count = usize::from(delta_filter.is_some())
-            + usize::from(e8_filter.is_some())
-            + usize::from(itanium_filter)
-            + usize::from(rgb_filter.is_some())
-            + usize::from(audio_filter.is_some())
-            + usize::from(auto_filter);
-        if !matches!(
-            target,
-            ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
-        ) || arm_filter
-            || (!ppmd && filter_count != 1)
-            || (ppmd && (auto_filter || filter_count > 1))
-        {
-            return Err(
-                "RAR 1.5-4.x writer currently supports --ppmd alone, --ppmd with one explicit standard filter, or one of --auto-filter/--delta-filter/--e8-filter/--e8e9-filter/--itanium-filter/--rgb-filter/--audio-filter on RAR 2.9+".into(),
-            );
-        }
-        if store {
-            return Err("RAR 2.9 compression policy requires compression".into());
-        }
-        if volume_size.is_some() {
-            return Err("unsupported option combination: RAR 2.9 compression policy cannot currently be used with --volume-size".into());
-        }
-        if archive_comment.is_some() || file_comment.is_some() {
-            return Err("unsupported option combination: RAR 2.9 compression policy cannot currently be combined with archive or file comments".into());
-        }
-    }
-    let write_plan = AddWritePlan::for_target(target)?;
-    if dictionary_size.is_some() && matches!(write_plan, AddWritePlan::Rar13) {
-        return Err("--dict-size is available only for RAR 1.5+ writers".into());
-    }
-    match write_plan {
+        "Preparing archive"
+    });
+
+    let mut features = FeatureSet::store_only();
+    features.solid = plan.solid;
+    features.header_encryption = plan.header_encryption;
+    let password = entry.password.as_deref().map(Vec::as_slice);
+    let parts = match plan.write_plan {
         AddWritePlan::Rar15To40 => {
-            let mut features = FeatureSet::store_only();
-            features.solid = solid;
-            features.header_encryption = header_encryption;
-            let mut options = Rar15WriterOptions::new(target, features);
-            if let Some(level) = compression_level {
+            let mut options = Rar15WriterOptions::new(plan.target, features);
+            if let Some(level) = plan.compression_level {
                 options = options.with_compression_level(level);
             }
-            if let Some(dictionary_size) = dictionary_size {
-                options = options.with_dictionary_size(dictionary_size);
+            if let Some(size) = plan.dictionary_size {
+                options = options.with_dictionary_size(size);
             }
-            if let Some(volume_size) = volume_size {
-                // Invariant: clap requires at least one input file.
-                let entry = owned.first().expect("one input checked above");
-                if entry.file_attr == DOS_DIRECTORY_ATTR {
-                    return Err("RAR 1.5 writer currently rejects directories".into());
-                }
-                let parts = if store {
-                    let entry = Rar15StoredEntry {
+            if plan.compress {
+                rars::rar15_40::write_compressed_volumes_with_progress(
+                    Rar15FileEntry {
                         name: &entry.name,
                         data: &entry.data,
                         file_time: entry.dos_mtime,
-                        file_attr: rar15_file_attr(entry),
+                        file_attr: rar15_file_attr(entry.unix_mode, entry.file_attr),
                         host_os: 3,
-                        password: entry.password.as_deref().map(Vec::as_slice),
-                        file_comment: None,
-                    };
-                    rars::rar15_40::write_stored_volumes(entry, options, volume_size)?
-                } else {
-                    let entry = Rar15FileEntry {
-                        name: &entry.name,
-                        data: &entry.data,
-                        file_time: entry.dos_mtime,
-                        file_attr: rar15_file_attr(entry),
-                        host_os: 3,
-                        password: entry.password.as_deref().map(Vec::as_slice),
-                        file_comment: None,
-                    };
-                    rars::rar15_40::write_compressed_volumes_with_progress(
-                        entry,
-                        options,
-                        volume_size,
-                        Some(&progress),
-                    )?
-                };
-                write_volume_parts(&archive_path, &parts, &progress).map_err(|err| {
-                    format!(
-                        "failed to write volume set starting at '{}': {err}",
-                        archive_path.display()
-                    )
-                })?;
-                return Ok(());
-            }
-
-            let bytes = if store {
-                let mut entries = Vec::with_capacity(owned.len());
-                for entry in &owned {
-                    if entry.file_attr == DOS_DIRECTORY_ATTR {
-                        return Err("RAR 1.5 writer currently rejects directories".into());
-                    }
-                    entries.push(Rar15StoredEntry {
-                        name: &entry.name,
-                        data: &entry.data,
-                        file_time: entry.dos_mtime,
-                        file_attr: rar15_file_attr(entry),
-                        host_os: 3,
-                        password: entry.password.as_deref().map(Vec::as_slice),
-                        file_comment: file_comment.as_deref(),
-                    });
-                }
-                rars::rar15_40::write_stored_archive_with_comment(
-                    &entries,
+                        password,
+                        file_comment: plan.file_comment,
+                    },
                     options,
-                    archive_comment.as_deref(),
-                )?
-            } else if e8_filter.is_some()
-                || delta_filter.is_some()
-                || itanium_filter
-                || rgb_filter.is_some()
-                || audio_filter.is_some()
-                || auto_filter
-                || ppmd
-            {
-                let mut entries = Vec::with_capacity(owned.len());
-                for entry in &owned {
-                    if entry.file_attr == DOS_DIRECTORY_ATTR {
-                        return Err("RAR 1.5 writer currently rejects directories".into());
-                    }
-                    entries.push(Rar15FileEntry {
-                        name: &entry.name,
-                        data: &entry.data,
-                        file_time: entry.dos_mtime,
-                        file_attr: rar15_file_attr(entry),
-                        host_os: 3,
-                        password: entry.password.as_deref().map(Vec::as_slice),
-                        file_comment: None,
-                    });
-                }
-                let explicit_filter = || {
-                    if let Some(channels) = delta_filter {
-                        rars::rar15_40::FilterSpec::whole(rars::rar15_40::FilterKind::Delta {
-                            channels,
-                        })
-                    } else if e8_filter == Some(true) {
-                        rars::rar15_40::FilterSpec::whole(rars::rar15_40::FilterKind::E8E9)
-                    } else if itanium_filter {
-                        rars::rar15_40::FilterSpec::whole(rars::rar15_40::FilterKind::Itanium)
-                    } else if let Some(width) = rgb_filter {
-                        rars::rar15_40::FilterSpec::whole(rars::rar15_40::FilterKind::Rgb {
-                            width,
-                            pos_r: 0,
-                        })
-                    } else if let Some(channels) = audio_filter {
-                        rars::rar15_40::FilterSpec::whole(rars::rar15_40::FilterKind::Audio {
-                            channels,
-                        })
-                    } else {
-                        rars::rar15_40::FilterSpec::whole(rars::rar15_40::FilterKind::E8)
-                    }
-                };
-                // The engine and the filter are separate choices now, so the
-                // flags map onto them separately rather than onto one of five
-                // combined policies.
-                let explicit_filter_asked = delta_filter.is_some()
-                    || e8_filter.is_some()
-                    || itanium_filter
-                    || rgb_filter.is_some()
-                    || audio_filter.is_some();
-                let policy = if auto_filter {
-                    rars::rar15_40::FilterPolicy::Auto
-                } else if explicit_filter_asked {
-                    rars::rar15_40::FilterPolicy::Explicit(explicit_filter())
-                } else {
-                    rars::rar15_40::FilterPolicy::None
-                };
-                let options = options.with_method(if ppmd {
-                    rars::rar15_40::Rar29Method::Ppmd
-                } else if explicit_filter_asked {
-                    // An explicitly named filter is a request for that filter,
-                    // not an invitation to weigh it against another engine.
-                    rars::rar15_40::Rar29Method::Lz
-                } else {
-                    rars::rar15_40::Rar29Method::Auto
-                });
-                rars::rar15_40::write_rar29_compressed_archive_with_filter_policy_and_progress(
-                    &entries,
-                    options,
-                    policy,
-                    Some(&progress),
+                    plan.volume_size,
+                    Some(progress),
                 )?
             } else {
-                let mut entries = Vec::with_capacity(owned.len());
-                for entry in &owned {
-                    if entry.file_attr == DOS_DIRECTORY_ATTR {
-                        return Err("RAR 1.5 writer currently rejects directories".into());
-                    }
-                    entries.push(Rar15FileEntry {
+                rars::rar15_40::write_stored_volumes(
+                    Rar15StoredEntry {
                         name: &entry.name,
                         data: &entry.data,
                         file_time: entry.dos_mtime,
-                        file_attr: rar15_file_attr(entry),
+                        file_attr: rar15_file_attr(entry.unix_mode, entry.file_attr),
                         host_os: 3,
-                        password: entry.password.as_deref().map(Vec::as_slice),
-                        file_comment: file_comment.as_deref(),
-                    });
-                }
-                rars::rar15_40::write_compressed_archive_with_comment_and_progress(
-                    &entries,
+                        password,
+                        file_comment: plan.file_comment,
+                    },
                     options,
-                    archive_comment.as_deref(),
-                    Some(&progress),
+                    plan.volume_size,
                 )?
-            };
-            write_archive_output(&archive_path, &bytes, &progress)?;
-            Ok(())
+            }
         }
         AddWritePlan::Rar13 => {
-            let mut features = FeatureSet::store_only();
-            features.solid = solid;
-            let mut options = Rar13WriterOptions::new(target, features);
-            if let Some(level) = compression_level {
+            let mut options = Rar13WriterOptions::new(plan.target, features);
+            if let Some(level) = plan.compression_level {
                 options = options.with_compression_level(level);
             }
-            if let Some(volume_size) = volume_size {
-                // Invariant: clap requires at least one input file.
-                let entry = owned.first().expect("one input checked above");
-                let parts = if compress {
-                    let entry = FileEntry {
+            if plan.compress {
+                rar13::write_compressed_volumes_with_progress(
+                    FileEntry {
                         name: &entry.name,
                         data: &entry.data,
                         file_time: entry.dos_mtime,
                         file_attr: entry.file_attr,
-                        password: entry.password.as_deref().map(Vec::as_slice),
-                        file_comment: file_comment.as_deref(),
-                    };
-                    rar13::write_compressed_volumes_with_progress(
-                        entry,
-                        options,
-                        volume_size,
-                        Some(&progress),
-                    )?
-                } else {
-                    let entry = Rar13StoredEntry {
-                        name: &entry.name,
-                        data: &entry.data,
-                        file_time: entry.dos_mtime,
-                        file_attr: entry.file_attr,
-                        password: entry.password.as_deref().map(Vec::as_slice),
-                        file_comment: file_comment.as_deref(),
-                    };
-                    rar13::write_stored_volumes(entry, options, volume_size)?
-                };
-                write_volume_parts(&archive_path, &parts, &progress).map_err(|err| {
-                    format!(
-                        "failed to write volume set starting at '{}': {err}",
-                        archive_path.display()
-                    )
-                })?;
-                return Ok(());
-            }
-
-            let bytes = if compress {
-                let entries: Vec<_> = owned
-                    .iter()
-                    .map(|entry| FileEntry {
-                        name: &entry.name,
-                        data: &entry.data,
-                        file_time: entry.dos_mtime,
-                        file_attr: entry.file_attr,
-                        password: entry.password.as_deref().map(Vec::as_slice),
-                        file_comment: file_comment.as_deref(),
-                    })
-                    .collect();
-                rar13::write_compressed_archive_with_comment_and_progress(
-                    &entries,
+                        password,
+                        file_comment: plan.file_comment,
+                    },
                     options,
-                    archive_comment.as_deref(),
-                    Some(&progress),
+                    plan.volume_size,
+                    Some(progress),
                 )?
             } else {
-                let entries: Vec<_> = owned
-                    .iter()
-                    .map(|entry| Rar13StoredEntry {
+                rar13::write_stored_volumes(
+                    Rar13StoredEntry {
                         name: &entry.name,
                         data: &entry.data,
                         file_time: entry.dos_mtime,
                         file_attr: entry.file_attr,
-                        password: entry.password.as_deref().map(Vec::as_slice),
-                        file_comment: file_comment.as_deref(),
-                    })
-                    .collect();
-                rar13::write_stored_archive_with_comment(
-                    &entries,
+                        password,
+                        file_comment: plan.file_comment,
+                    },
                     options,
-                    archive_comment.as_deref(),
+                    plan.volume_size,
                 )?
-            };
-            write_archive_output(&archive_path, &bytes, &progress)?;
-            Ok(())
+            }
         }
-    }
+    };
+    write_volume_parts(plan.archive_path, &parts, progress).map_err(|err| {
+        format!(
+            "failed to write volume set starting at '{}': {err}",
+            plan.archive_path.display()
+        )
+    })?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1814,6 +1780,29 @@ fn streaming_extras<'a>(
     extras
 }
 
+/// Writes an archive to its final path through a temporary file, so a write
+/// that fails part way leaves no half-finished archive behind. `-` and
+/// `/dev/stdout` go straight out, where there is nothing to rename.
+fn write_archive_streaming(
+    archive_path: &Path,
+    write: impl FnOnce(&mut dyn Write) -> CliResult<()>,
+) -> CliResult<()> {
+    if archive_path == Path::new("-") || archive_path == Path::new("/dev/stdout") {
+        return write(&mut std::io::stdout());
+    }
+    let (temporary, mut output) = create_streaming_archive_temp(archive_path)?;
+    let result = (|| -> CliResult<()> {
+        write(&mut output)?;
+        output.sync_all()?;
+        fs::rename(&temporary, archive_path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
 fn create_streaming_archive_temp(archive_path: &Path) -> CliResult<(PathBuf, fs::File)> {
     let file_name = archive_path
         .file_name()
@@ -1874,23 +1863,6 @@ fn has_trailing_path_separator(path: &Path) -> bool {
         .is_some_and(|ch| ch == b'/' as u16 || ch == b'\\' as u16)
 }
 
-fn write_archive_output(path: &Path, bytes: &[u8], progress: &CliProgress) -> CliResult<()> {
-    progress.bar("Writing archive", bytes.len() as u64);
-    if path == Path::new("-") || path == Path::new("/dev/stdout") {
-        write_bytes_with_progress(&mut std::io::stdout(), bytes, progress)?;
-        progress.finish("Archive written");
-        eprintln!("created {}", path.display());
-        return Ok(());
-    }
-    let mut file = fs::File::create(path)
-        .map_err(|err| format!("failed to write archive '{}': {err}", path.display()))?;
-    write_bytes_with_progress(&mut file, bytes, progress)
-        .map_err(|err| format!("failed to write archive '{}': {err}", path.display()))?;
-    progress.finish("Archive written");
-    println!("created {}", path.display());
-    Ok(())
-}
-
 fn write_bytes_with_progress(
     writer: &mut impl Write,
     bytes: &[u8],
@@ -1899,43 +1871,6 @@ fn write_bytes_with_progress(
     for chunk in bytes.chunks(1024 * 1024) {
         writer.write_all(chunk)?;
         progress.advance(chunk.len() as u64);
-    }
-    Ok(())
-}
-
-fn validate_rar15_40_add_options(
-    target: ArchiveVersion,
-    password: Option<&[u8]>,
-    archive_comment: Option<&[u8]>,
-    file_comment: Option<&[u8]>,
-    volume_size: Option<usize>,
-    header_encryption: bool,
-) -> CliResult<()> {
-    if archive_comment.is_some() && volume_size.is_some() {
-        return Err("RAR 1.5 writer does not support comments on volumes yet".into());
-    }
-    if file_comment.is_some() && volume_size.is_some() {
-        return Err("RAR 1.5 writer does not support file comments on volumes yet".into());
-    }
-    if matches!(
-        target,
-        ArchiveVersion::Rar20
-            | ArchiveVersion::Rar29
-            | ArchiveVersion::Rar30
-            | ArchiveVersion::Rar40
-    ) {
-        if matches!(target, ArchiveVersion::Rar30 | ArchiveVersion::Rar40) && file_comment.is_some()
-        {
-            return Err("unsupported option combination: RAR 3.x/4.x file comments are not currently writable".into());
-        }
-        if header_encryption {
-            if !matches!(target, ArchiveVersion::Rar30 | ArchiveVersion::Rar40) {
-                return Err("RAR 3.x header encryption requires rar30 or rar40".into());
-            }
-            if password.is_none() {
-                return Err("RAR 3.x header encryption requires --password".into());
-            }
-        }
     }
     Ok(())
 }

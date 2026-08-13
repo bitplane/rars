@@ -4871,8 +4871,12 @@ fn rejects_ppmd_for_rar5_writer() {
         .output()
         .unwrap();
 
-    assert!(!output.status.success());
-    assert!(stderr(&output).contains("--ppmd is only available"));
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        stderr(&output).trim(),
+        "error: --ppmd is not supported by --format rar50; use --format rar29, \
+         --format rar30 or --format rar40"
+    );
 }
 
 /// These three name RAR 2.9 RarVM programs that RAR 5 has no filter type for.
@@ -5477,11 +5481,6 @@ const REJECTED_COMBINATIONS: &[(&[&str], &str)] = &[
          or --format rar70",
     ),
     (
-        &["--format", "rar29", "--memory-limit", "64m"],
-        "error: --memory-limit is not supported by --format rar29; use --format rar50 \
-         or --format rar70",
-    ),
-    (
         &["--format", "rar29", "--temp-dir", "."],
         "error: --temp-dir is not supported by --format rar29; use --format rar50 \
          or --format rar70",
@@ -5537,6 +5536,10 @@ fn add_accepts_flags_that_ask_for_what_already_happens() {
         vec!["--format", "rar50", "--auto-filter"],
         // RAR 1.3 does write solid archives.
         vec!["--format", "rar14", "--solid"],
+        // The legacy writers stream now, so a budget bounds them too.
+        vec!["--format", "rar29", "--memory-limit", "64m"],
+        // RAR 2.9 does search, so turning it off is a real request.
+        vec!["--format", "rar29", "--no-filter"],
     ]
     .into_iter()
     .enumerate()
@@ -5561,4 +5564,49 @@ fn add_accepts_flags_that_ask_for_what_already_happens() {
             stderr(&output)
         );
     }
+}
+
+/// `--no-filter` used to be read only on the RAR 5 streaming path, so on
+/// RAR 2.9 it was accepted and then ignored: the archive came out auto-filtered
+/// exactly as if the flag had not been typed.
+#[test]
+fn no_filter_turns_off_the_rar29_search() {
+    let dir = scratch("rar29-no-filter");
+    let source = dir.join("payload.bin");
+    // x86 calls to a fixed target, which is what an E8 filter is for. Without
+    // the filter the displacements stay different from each other and the
+    // member compresses worse.
+    const TARGET: u32 = 0x0020_1000;
+    let mut payload = Vec::new();
+    while payload.len() < 400_000 {
+        let position = payload.len() as u32;
+        payload.push(0xe8);
+        payload.extend_from_slice(&TARGET.wrapping_sub(position).to_le_bytes());
+        payload.extend_from_slice(&[0x90; 11]);
+    }
+    fs::write(&source, &payload).unwrap();
+
+    let mut sizes = Vec::new();
+    for extra in [&[][..], &["--no-filter"][..]] {
+        let archive = dir.join(format!("out{}.rar", extra.len()));
+        let output = rars()
+            .args(["a", "--format", "rar29"])
+            .args(extra)
+            .arg(&archive)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+        let test = rars().arg("test").arg(&archive).output().unwrap();
+        assert!(test.status.success(), "stderr: {}", stderr(&test));
+        sizes.push(fs::metadata(&archive).unwrap().len());
+    }
+
+    assert!(
+        sizes[0] < sizes[1],
+        "--no-filter did not turn the search off: {} filtered against {} unfiltered",
+        sizes[0],
+        sizes[1]
+    );
 }
