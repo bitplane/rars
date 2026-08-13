@@ -270,7 +270,17 @@ fn write_members_to(
                 progress,
             )?;
             let solid_continuation = encoded.method != 0x30 && solid_run_has_member;
-            solid_run_has_member = encoded.method != 0x30;
+            // Storing a member rebuilds the encoder, so the chain ends there.
+            // An empty compressed member leaves the chain exactly as it was:
+            // it feeds the encoder nothing, and readers pass over an empty
+            // payload without advancing their decoder. Counting one as a
+            // member left the next one flagged as continuing a chain that had
+            // been broken by a stored member two places back.
+            if encoded.method == 0x30 {
+                solid_run_has_member = false;
+            } else if encoded.unpacked_size != 0 {
+                solid_run_has_member = true;
+            }
             write_member(
                 output,
                 member,
@@ -1348,9 +1358,7 @@ fn should_store_fallback(
     packed_len: usize,
 ) -> bool {
     // RAR 2.0 onwards store any member compression did not help. RAR 1.5 pays
-    // more header for a stored member, so a small one stays compressed. A solid
-    // member can be stored here because the writer rebuilds its encoder when it
-    // happens.
+    // more header for a stored member, so a small one stays compressed.
     let stores_any_size = !solid
         && matches!(
             target,
@@ -1359,8 +1367,13 @@ fn should_store_fallback(
                 | ArchiveVersion::Rar30
                 | ArchiveVersion::Rar40
         );
+    // Storing a member part way through a solid run rebuilds the encoder, so
+    // the member after it has to say it starts a fresh chain. Only RAR 2.0
+    // onwards can: RAR 1.5 file headers have no solid bit, and readers take
+    // every member of a solid RAR 1.5 archive as a continuation whatever the
+    // header says. Breaking the chain there writes an archive nothing can read.
     crate::write_plan::StoreFallback::new()
-        .allow_solid(true)
+        .allow_solid(target != ArchiveVersion::Rar15)
         .min_size(if stores_any_size {
             0
         } else {

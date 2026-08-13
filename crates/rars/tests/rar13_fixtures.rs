@@ -764,13 +764,6 @@ fn streaming_and_buffered_writers_agree_byte_for_byte() {
                          {streamed_result:?}"
                     );
                     assert_eq!(streamed, buffered, "{label}: archives differ");
-                    // A solid run writes a member that fails its own checksum,
-                    // on both paths alike. That is a bug in the shared RAR 1.5
-                    // encoder rather than anything to do with streaming, so it
-                    // is not round-tripped here.
-                    if solid && coding.compresses() {
-                        continue;
-                    }
                     let archive = Archive::parse(&streamed).unwrap();
                     let extracted = collect_extract(&archive, None)
                         .unwrap_or_else(|error| panic!("{label}: {error:?}"));

@@ -6334,13 +6334,6 @@ fn streaming_and_buffered_writers_agree_byte_for_byte() {
                     Ok(buffered) => {
                         assert!(streamed_result.is_ok(), "{label}: streaming refused what the buffered writer accepted: {streamed_result:?}");
                         assert_eq!(streamed, buffered, "{label}: archives differ");
-                        // Solid RAR 1.5 writes a member that fails its own
-                        // checksum, on both paths alike. That is a writer bug
-                        // of its own rather than anything to do with
-                        // streaming, so it is not round-tripped here.
-                        if target == ArchiveVersion::Rar15 && solid {
-                            continue;
-                        }
                         let archive = Archive::parse(&streamed).unwrap();
                         let extracted = collect_extract(&archive)
                             .unwrap_or_else(|error| panic!("{label}: {error:?}"));
@@ -6439,5 +6432,135 @@ fn a_member_larger_than_the_budget_is_written_anyway() {
     assert_eq!(extracted.len(), 4);
     for entry in &extracted {
         assert_eq!(entry.data, payload);
+    }
+}
+
+/// Tests an archive with a locally installed reference tool, returning `None`
+/// when there is not one.
+fn local_reference_test(label: &str, archive: &[u8]) -> Option<std::process::Output> {
+    let mut path = std::env::temp_dir();
+    path.push(format!("rars-{label}-{}.rar", std::process::id()));
+    std::fs::write(&path, archive).unwrap();
+    let mut result = None;
+    for tool in ["unrar", "rar"] {
+        if let Ok(output) = Command::new(tool).arg("t").arg(&path).output() {
+            result = Some(output);
+            break;
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+    result
+}
+
+fn solid_options(target: ArchiveVersion) -> WriterOptions {
+    let mut features = FeatureSet::store_only();
+    features.solid = true;
+    WriterOptions::new(target, features)
+}
+
+fn file_entries<'a>(members: &'a [(&'a [u8], Vec<u8>)]) -> Vec<FileEntry<'a>> {
+    members
+        .iter()
+        .map(|(name, data)| FileEntry {
+            name,
+            data,
+            file_time: 0,
+            file_attr: 0,
+            host_os: 3,
+            password: None,
+            file_comment: None,
+        })
+        .collect()
+}
+
+/// A member compression cannot shrink is stored instead, which rebuilds the
+/// encoder and so starts a fresh solid chain. Only RAR 2.0 onwards can say so:
+/// its file headers carry a solid bit. RAR 1.5 has none, and readers take every
+/// member of a solid RAR 1.5 archive as a continuation whatever the header
+/// says, so breaking the chain there wrote an archive nothing could read.
+#[test]
+fn a_solid_rar15_run_survives_a_member_that_does_not_compress() {
+    let compressible = b"solid chain payload that repeats and repeats\n".repeat(400);
+    // Incompressible, and past the 1 KiB floor, so the store fallback wants it.
+    let incompressible: Vec<u8> = (0..90_000u32)
+        .map(|index| {
+            let mixed = index
+                .wrapping_mul(2_654_435_761)
+                .rotate_left(index % 17);
+            (mixed >> 13) as u8
+        })
+        .collect();
+    let tail = b"and a short tail afterwards\n".repeat(50);
+    let members: Vec<(&[u8], Vec<u8>)> = vec![
+        (b"first.txt", compressible),
+        (b"middle.bin", incompressible),
+        (b"last.txt", tail),
+    ];
+    let entries = file_entries(&members);
+
+    let bytes = write_compressed_archive(&entries, solid_options(ArchiveVersion::Rar15)).unwrap();
+    let archive = Archive::parse(&bytes).unwrap();
+    let extracted = collect_extract(&archive).unwrap();
+    assert_eq!(extracted.len(), members.len());
+    for (got, (_, want)) in extracted.iter().zip(&members) {
+        assert_eq!(&got.data, want);
+    }
+
+    if let Some(output) = local_reference_test("rar15-solid-store", &bytes) {
+        assert!(
+            output.status.success(),
+            "the reference tool rejected a solid RAR 1.5 archive\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// An empty member neither carries the solid chain nor breaks it: it feeds the
+/// encoder nothing, and a reader passes over an empty payload without advancing
+/// its decoder. Counting one as a member left the member after it flagged as
+/// continuing a chain that a stored member two places back had already broken.
+#[test]
+fn an_empty_member_does_not_restart_a_broken_solid_chain() {
+    let opener = b"a short opening member\n".repeat(3);
+    let incompressible: Vec<u8> = (0..40_000u32)
+        .map(|index| {
+            let mixed = index
+                .wrapping_mul(0x9e37_79b9)
+                .rotate_left(index % 23);
+            (mixed >> 11) as u8
+        })
+        .collect();
+    let members: Vec<(&[u8], Vec<u8>)> = vec![
+        (b"opener.txt", opener),
+        (b"incompressible.bin", incompressible),
+        (b"empty.dat", Vec::new()),
+        (b"after.txt", b"the member after the empty one\n".repeat(4)),
+    ];
+    let entries = file_entries(&members);
+
+    for target in [
+        ArchiveVersion::Rar20,
+        ArchiveVersion::Rar29,
+        ArchiveVersion::Rar30,
+        ArchiveVersion::Rar40,
+    ] {
+        let bytes = write_compressed_archive(&entries, solid_options(target)).unwrap();
+        let archive = Archive::parse(&bytes).unwrap();
+        let extracted =
+            collect_extract(&archive).unwrap_or_else(|error| panic!("{target}: {error:?}"));
+        assert_eq!(extracted.len(), members.len(), "{target}");
+        for (got, (_, want)) in extracted.iter().zip(&members) {
+            assert_eq!(&got.data, want, "{target}");
+        }
+
+        if let Some(output) = local_reference_test("solid-empty-member", &bytes) {
+            assert!(
+                output.status.success(),
+                "{target}: the reference tool rejected it\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 }

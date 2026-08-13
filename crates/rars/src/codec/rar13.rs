@@ -291,6 +291,14 @@ impl Unpack15Encoder {
             return Ok(Vec::new());
         }
         self.bits = BitWriter::new();
+        // Everything the decoder drops at a member boundary has to be dropped
+        // here too. The adaptive tables carry across a solid run, but the
+        // short-LZ literal run does not: `Unpack15::init_member` clears it for
+        // every member, solid or not. Leaving it set here made the encoder
+        // write a break bit at the start of the next member that no decoder
+        // was going to read, and one stray bit desynchronises the rest of the
+        // archive.
+        self.l_count = 0;
         let buckets = long_lz_buckets(input);
         let mut pos = 0usize;
         let mut next_report = 0usize;
@@ -1523,8 +1531,16 @@ pub struct Unpack15 {
 }
 
 impl Unpack15 {
+    /// A decoder ready to read either a fresh member or a solid continuation.
+    ///
+    /// The starting state comes from `reset_non_solid` rather than being
+    /// hand-copied, because the two drifted: the tables `init_huff` fills were
+    /// left zeroed here. Nothing noticed while every archive opened with a
+    /// non-solid member, since that member resets them before the first symbol
+    /// is read. A first member carrying the solid flag skips the reset and
+    /// decoded against zeroes.
     pub fn new() -> Self {
-        Self {
+        let mut decoder = Self {
             bits: BitReader::new(&[]),
             target: 0,
             output_written: 0,
@@ -1539,25 +1555,27 @@ impl Unpack15 {
             n_to_pl: [0; 256],
             n_to_pl_b: [0; 256],
             n_to_pl_c: [0; 256],
-            avr_plc: 0x3500,
+            avr_plc: 0,
             avr_plc_b: 0,
             avr_ln1: 0,
             avr_ln2: 0,
             avr_ln3: 0,
-            max_dist3: 0x2001,
-            nhfb: 0x80,
-            nlzb: 0x80,
+            max_dist3: 0,
+            nhfb: 0,
+            nlzb: 0,
             num_huf: 0,
             buf60: 0,
             st_mode: false,
             l_count: 0,
             flag_buf: 0,
             flags_cnt: 0,
-            old_dist: [u32::MAX; 4],
+            old_dist: [0; 4],
             old_dist_ptr: 0,
-            last_dist: u32::MAX,
+            last_dist: 0,
             last_length: 0,
-        }
+        };
+        decoder.reset_non_solid();
+        decoder
     }
 
     pub fn decode_member(&mut self, input: &[u8], target: usize, solid: bool) -> Result<Vec<u8>> {
@@ -2119,6 +2137,34 @@ mod tests {
         POS_HF0, POS_HF1, POS_HF2, POS_HF3, POS_HF4, POS_L1, POS_L2,
     };
 
+    #[test]
+    fn probe_rar15_solid() {
+        let Ok(dir) = std::env::var("RARS_PROBE_DIR") else {
+            return;
+        };
+        let options = EncodeOptions::new().with_lazy_matching(false);
+        let mut names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        names.sort();
+        let mut enc = Unpack15Encoder::with_options(options);
+        let mut dec = Unpack15::new();
+        for path in &names {
+            let data = std::fs::read(path).unwrap();
+            let packed = enc.encode_member(&data).unwrap();
+            match dec.decode_member(&packed, data.len(), true) {
+                Ok(out) if out == data => println!("{:?} solid OK", path.file_name().unwrap()),
+                Ok(out) => println!(
+                    "{:?} solid WRONG at {:?}",
+                    path.file_name().unwrap(),
+                    out.iter().zip(data.iter()).position(|(a, b)| a != b)
+                ),
+                Err(e) => println!("{:?} solid ERROR {e:?}", path.file_name().unwrap()),
+            }
+        }
+    }
+
     fn brute_decode_num_bit_cost(
         target: u32,
         start_pos: u32,
@@ -2593,5 +2639,102 @@ impl BitWriter {
 
     fn finish(self) -> Vec<u8> {
         self.output
+    }
+}
+
+#[cfg(test)]
+mod solid_regressions {
+    use super::{EncodeOptions, Unpack15, Unpack15Encoder};
+
+    /// The options the RAR 1.3 writer uses at its default level.
+    fn rar13_options() -> EncodeOptions {
+        EncodeOptions::new()
+            .with_old_distance_tokens(false)
+            .with_lazy_matching(false)
+    }
+
+    fn encode_solid_run(members: &[&[u8]], options: EncodeOptions) -> Vec<Vec<u8>> {
+        let mut encoder = Unpack15Encoder::with_options(options);
+        members
+            .iter()
+            .map(|member| encoder.encode_member(member).unwrap())
+            .collect()
+    }
+
+    fn decode_solid_run(packed: &[Vec<u8>], members: &[&[u8]]) -> Vec<Vec<u8>> {
+        let mut decoder = Unpack15::new();
+        packed
+            .iter()
+            .zip(members)
+            .map(|(packed, member)| decoder.decode_member(packed, member.len(), true).unwrap())
+            .collect()
+    }
+
+    /// The short-LZ literal run does not survive a member boundary: the decoder
+    /// clears it for every member, solid or not. The encoder kept it, so where
+    /// a member happened to end mid-run the next one opened with a break bit
+    /// nothing would read, and every symbol after it was a bit out of step.
+    ///
+    /// This pair is the smallest one that ends a member with the run at two.
+    #[test]
+    fn a_member_boundary_clears_the_short_lz_literal_run() {
+        let first: Vec<u8> = b"abcdefgh".iter().cycle().take(128).copied().collect();
+        let second = vec![0u8; 16];
+        let members: Vec<&[u8]> = vec![&first, &second];
+
+        let packed = encode_solid_run(&members, rar13_options());
+        let decoded = decode_solid_run(&packed, &members);
+
+        assert_eq!(decoded[0], first);
+        assert_eq!(
+            decoded[1], second,
+            "the second member decoded a bit out of step"
+        );
+    }
+
+    /// A decoder handed a solid member first skips the non-solid reset, so
+    /// whatever it was constructed with is what decodes the member. It used to
+    /// be constructed with the Huffman tables left at zero.
+    #[test]
+    fn a_first_member_marked_solid_decodes_against_real_tables() {
+        let member = b"the quick brown fox jumps over the lazy dog\n".repeat(40);
+        let members: Vec<&[u8]> = vec![&member];
+        let packed = encode_solid_run(&members, rar13_options());
+
+        let mut fresh = Unpack15::new();
+        let solid = fresh.decode_member(&packed[0], member.len(), true).unwrap();
+        assert_eq!(solid, member);
+
+        // And it agrees with the same member read as a fresh one.
+        let mut other = Unpack15::new();
+        let plain = other
+            .decode_member(&packed[0], member.len(), false)
+            .unwrap();
+        assert_eq!(plain, member);
+    }
+
+    /// Several members in a row, with the shapes that move the adaptive state
+    /// around: a long run, incompressible bytes, a short member and an empty
+    /// one.
+    #[test]
+    fn a_long_solid_run_round_trips() {
+        let repetitive = b"solid chain payload ".repeat(500);
+        let counted: Vec<u8> = (0..30_000u32)
+            .map(|index| (index * 7 % 251) as u8)
+            .collect();
+        let short = b"tail".to_vec();
+        let empty = Vec::new();
+        let members: Vec<&[u8]> = vec![&repetitive, &counted, &short, &empty, &repetitive];
+
+        for options in [
+            rar13_options(),
+            EncodeOptions::new().with_lazy_matching(false),
+        ] {
+            let packed = encode_solid_run(&members, options);
+            let decoded = decode_solid_run(&packed, &members);
+            for (index, (got, want)) in decoded.iter().zip(&members).enumerate() {
+                assert_eq!(got, want, "member {index} did not survive the solid run");
+            }
+        }
     }
 }
