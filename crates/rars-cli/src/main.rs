@@ -1105,9 +1105,8 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
     // Everything the streaming engine can serve goes to it; what remains are
     // the features still only the buffered writer knows how to assemble.
     let rar50_streaming = matches!(target, ArchiveVersion::Rar50 | ArchiveVersion::Rar70)
-        && !quick_open
-        && archive_comment.is_none()
-        && archive_name.is_none()
+        // Quick-open indexes plaintext headers, so the two cannot combine.
+        && !(quick_open && header_encryption)
         && file_comment.is_none()
         && volume_size.is_none()
         && delta_filter.is_none()
@@ -1132,6 +1131,9 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
             header_encryption,
             recovery_percent,
             auto_filter,
+            quick_open,
+            archive_comment.as_deref(),
+            archive_name.as_deref(),
             &progress,
         );
     }
@@ -1873,6 +1875,9 @@ fn write_plain_rar50_streaming(
     header_encryption: bool,
     recovery_percent: Option<u64>,
     auto_filter: bool,
+    quick_open: bool,
+    archive_comment: Option<&[u8]>,
+    archive_name: Option<&[u8]>,
     progress: &CliProgress,
 ) -> CliResult<()> {
     progress.spinner("Scanning inputs");
@@ -1908,6 +1913,8 @@ fn write_plain_rar50_streaming(
     features.header_encryption = header_encryption;
     features.solid = solid;
     features.recovery_record = recovery_percent.is_some();
+    features.archive_comment = archive_comment.is_some();
+    features.quick_open = quick_open;
     let mut options = rars::rar50::WriterOptions::new(target, features);
     if let Some(level) = compression_level {
         options = options.with_compression_level(level);
@@ -1925,13 +1932,24 @@ fn write_plain_rar50_streaming(
     if recovery_percent.is_some() {
         eprintln!("{RAR50_STRUCTURAL_RR_WARNING}");
     }
+    let metadata = archive_name.map(|name| rars::rar50::ArchiveMetadataEntry {
+        name: Some(name),
+        creation_time: Some(current_filetime()),
+    });
+    let extras = streaming_extras(
+        recovery_percent,
+        auto_filter,
+        quick_open,
+        archive_comment,
+        metadata,
+    );
     progress.spinner("Preparing compression");
     progress.bar("Compressing archive", total);
     if archive_path == Path::new("-") || archive_path == Path::new("/dev/stdout") {
         rars::rar50::write_streaming_archive_to(
             &entries,
             options,
-            streaming_extras(recovery_percent, auto_filter),
+            extras.clone(),
             &resources,
             &mut std::io::stdout(),
         )?;
@@ -1941,7 +1959,7 @@ fn write_plain_rar50_streaming(
             rars::rar50::write_streaming_archive_to(
                 &entries,
                 options,
-                streaming_extras(recovery_percent, auto_filter),
+                extras.clone(),
                 &resources,
                 &mut output,
             )?;
@@ -2013,16 +2031,26 @@ fn warn_if_buffered_write_is_large(
 }
 
 /// Archive-level options for a streaming write.
-fn streaming_extras(
+fn streaming_extras<'a>(
     recovery_percent: Option<u64>,
     auto_filter: bool,
-) -> rars::rar50::ArchiveExtras<'static> {
-    let extras = rars::rar50::ArchiveExtras::default().with_recovery_percent(recovery_percent);
+    quick_open: bool,
+    comment: Option<&'a [u8]>,
+    metadata: Option<rars::rar50::ArchiveMetadataEntry<'a>>,
+) -> rars::rar50::ArchiveExtras<'a> {
+    let mut extras = rars::rar50::ArchiveExtras::default()
+        .with_recovery_percent(recovery_percent)
+        .with_quick_open(quick_open);
     if auto_filter {
-        extras.with_filter_policy(rars::rar50::FilterPolicy::AutoSize)
-    } else {
-        extras
+        extras = extras.with_filter_policy(rars::rar50::FilterPolicy::AutoSize);
     }
+    if let Some(comment) = comment {
+        extras = extras.with_comment(comment);
+    }
+    if let Some(metadata) = metadata {
+        extras = extras.with_metadata(metadata);
+    }
+    extras
 }
 
 fn create_streaming_archive_temp(archive_path: &Path) -> CliResult<(PathBuf, fs::File)> {
