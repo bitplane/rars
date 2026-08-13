@@ -264,6 +264,7 @@ fn streaming_compress_plan(options: WriterOptions) -> Result<compress::CompressP
         dictionary_size,
         block_size: 1024 * 1024,
         solid: options.features.solid,
+        method: compression_method_for_level(options.compression_level)?,
     })
 }
 
@@ -3068,6 +3069,7 @@ mod tests {
                 dictionary_size,
                 block_size,
                 solid: false,
+                method: 1,
             },
             &WriterResources::new(required.saturating_mul(4)),
         )

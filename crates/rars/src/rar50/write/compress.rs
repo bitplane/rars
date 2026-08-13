@@ -38,6 +38,9 @@ pub(super) struct CompressPlan {
     pub(super) dictionary_size: u64,
     pub(super) block_size: usize,
     pub(super) solid: bool,
+    /// The RAR 5 compression method. Method zero means the members are stored
+    /// verbatim, so nothing is compressed at all.
+    pub(super) method: u8,
 }
 
 /// One block of input waiting to be compressed.
@@ -80,7 +83,14 @@ pub(super) fn compress_members(
         .min(rayon::current_num_threads())
         .max(1);
 
-    let packed = if plan.solid {
+    // Storing is not "compress and hope it does not help": the header records
+    // method zero, so the payload must be the source bytes.
+    let packed = if plan.method == 0 {
+        integrity
+            .iter()
+            .map(|_| Spool::create(resources))
+            .collect::<Result<Vec<_>>>()?
+    } else if plan.solid {
         compress_solid_chain(
             sources,
             &integrity,
@@ -111,7 +121,9 @@ pub(super) fn compress_members(
                 hash,
                 // A solid member must never fall back to stored: the members
                 // after it decode against the dictionary it contributes to.
-                store: input_size == 0 || (!plan.solid && packed.len() >= input_size),
+                store: plan.method == 0
+                    || input_size == 0
+                    || (!plan.solid && packed.len() >= input_size),
                 packed,
                 solid_continuation: plan.solid && member > 0,
             },

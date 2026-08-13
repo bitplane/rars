@@ -5279,3 +5279,35 @@ fn expected_rar15_40_stored_volume_payload() -> Vec<u8> {
 fn expected_rar15_40_compressed_text_payload() -> Vec<u8> {
     "Hello, RAR 3.x fixture world.\n".repeat(80).into_bytes()
 }
+
+/// `--store` must not compress. It used to run the encoder anyway and keep
+/// the compressed block while labelling the member as stored, which produced
+/// archives that neither rars nor unrar could read.
+#[test]
+fn stored_rar50_members_hold_their_payload_verbatim() {
+    let dir = scratch("rar50-store-verbatim");
+    let source = dir.join("payload.txt");
+    let archive = dir.join("stored.rar");
+    // Compressible enough that an encoder would happily shrink it.
+    let payload = b"stored payload that compresses very well indeed\n".repeat(64);
+    fs::write(&source, &payload).unwrap();
+
+    let create = rars()
+        .args(["a", "--format", "rar50", "--store"])
+        .arg(&archive)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(create.status.success(), "stderr: {}", stderr(&create));
+
+    let bytes = fs::read(&archive).unwrap();
+    assert!(
+        bytes
+            .windows(payload.len())
+            .any(|window| window == payload.as_slice()),
+        "a stored member must appear in the archive unchanged"
+    );
+
+    let test = rars().arg("test").arg(&archive).output().unwrap();
+    assert!(test.status.success(), "stderr: {}", stderr(&test));
+}
