@@ -5276,3 +5276,204 @@ fn streaming_writer_drops_an_automatic_filter_it_cannot_afford() {
     let archive = Archive::parse(&out).unwrap();
     assert_eq!(collect_extract(&archive).unwrap()[0].data, data);
 }
+
+/// Collects a volume set in memory so tests can inspect it, while the writer
+/// itself only ever holds one volume.
+#[derive(Default)]
+struct CollectingVolumeSink {
+    volumes: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    finished: Vec<(u64, u64)>,
+}
+
+/// The writer a sink hands back outlives the call that made it, so the shared
+/// buffer is shared rather than borrowed.
+struct VolumeWriterHandle {
+    volumes: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    index: usize,
+}
+
+impl Write for VolumeWriterHandle {
+    fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
+        self.volumes.lock().unwrap()[self.index].extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> IoResult<()> {
+        Ok(())
+    }
+}
+
+impl rar50::VolumeSink for CollectingVolumeSink {
+    fn start_volume(&mut self, index: u64) -> Result<Box<dyn Write + Send>, Error> {
+        let mut volumes = self.volumes.lock().unwrap();
+        assert_eq!(volumes.len() as u64, index, "volumes must arrive in order");
+        volumes.push(Vec::new());
+        drop(volumes);
+        Ok(Box::new(VolumeWriterHandle {
+            volumes: std::sync::Arc::clone(&self.volumes),
+            index: index as usize,
+        }))
+    }
+
+    fn finish_volume(&mut self, index: u64, len: u64) -> Result<(), Error> {
+        assert_eq!(
+            self.volumes.lock().unwrap()[index as usize].len() as u64,
+            len,
+            "reported volume length must match what was written"
+        );
+        self.finished.push((index, len));
+        Ok(())
+    }
+}
+
+/// Barely compressible bytes, so the packed payload stays big enough to span
+/// several volumes.
+fn volume_payload(len: u32) -> Vec<u8> {
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    (0..len)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as u8
+        })
+        .collect()
+}
+
+fn write_volume_set(
+    entries: &[rar50::ArchiveEntry],
+    features: FeatureSet,
+    extras: rar50::ArchiveExtras<'_>,
+    max_payload: u64,
+) -> Vec<Vec<u8>> {
+    let mut sink = CollectingVolumeSink::default();
+    rar50::write_streaming_volumes_to(
+        entries,
+        rar50::WriterOptions::new(ArchiveVersion::Rar50, features).with_compression_level(1),
+        extras,
+        max_payload,
+        &mut sink,
+        &rars::WriterResources::default(),
+    )
+    .unwrap();
+    let volumes = sink.volumes.lock().unwrap().clone();
+    assert_eq!(sink.finished.len(), volumes.len());
+    volumes
+}
+
+#[test]
+fn streaming_volume_set_round_trips() {
+    let payload = volume_payload(120_000);
+    let entries = [streaming_entry("split.bin", &payload)];
+
+    let volumes = write_volume_set(
+        &entries,
+        FeatureSet::store_only(),
+        rar50::ArchiveExtras::default(),
+        20_000,
+    );
+    assert!(volumes.len() > 2, "expected several volumes");
+
+    let archives: Vec<_> = volumes
+        .iter()
+        .map(|bytes| Archive::parse(bytes).unwrap())
+        .collect();
+    let extracted = collect_extract_volumes(&archives).unwrap();
+    assert_eq!(extracted.len(), 1);
+    assert_eq!(extracted[0].data, payload);
+}
+
+#[test]
+fn streaming_volume_set_carries_encryption_across_splits() {
+    let payload = volume_payload(90_000);
+    let entries = [streaming_entry("secret.bin", &payload).with_password(b"volume-pass".to_vec())];
+    let mut features = FeatureSet::store_only();
+    features.file_encryption = true;
+
+    // A payload size that is not a multiple of the cipher block, so splits
+    // land mid-block.
+    let volumes = write_volume_set(&entries, features, rar50::ArchiveExtras::default(), 12_345);
+    assert!(volumes.len() > 2);
+
+    let archives: Vec<_> = volumes
+        .iter()
+        .map(|bytes| {
+            Archive::parse_with_options(bytes, ArchiveReadOptions::with_password(b"volume-pass"))
+                .unwrap()
+        })
+        .collect();
+    let extracted = collect_extract_volumes_with_password(&archives, Some(b"volume-pass")).unwrap();
+    assert_eq!(extracted[0].data, payload);
+}
+
+#[test]
+fn streaming_volume_set_recovers_each_volume() {
+    let payload = volume_payload(80_000);
+    let entries = [streaming_entry("protected.bin", &payload)];
+    let mut features = FeatureSet::store_only();
+    features.recovery_record = true;
+
+    let volumes = write_volume_set(
+        &entries,
+        features,
+        rar50::ArchiveExtras::default().with_recovery_percent(Some(20)),
+        30_000,
+    );
+    assert!(volumes.len() > 1);
+
+    // Damage the first volume's payload and repair it from its own record.
+    let clean = Archive::parse(&volumes[0]).unwrap();
+    let data_range = clean.files().next().unwrap().block.data_range.clone();
+    let mut damaged = volumes[0].clone();
+    damaged[data_range.start + 16..data_range.start + 200].fill(0xa5);
+
+    let damaged_archive = Archive::parse(&damaged).unwrap();
+    let mut repaired = Vec::new();
+    damaged_archive.repair_recovery_to(&mut repaired).unwrap();
+    assert_eq!(repaired, volumes[0]);
+}
+
+#[test]
+#[ignore = "requires a local unrar or rar command"]
+fn reference_rar_accepts_a_streaming_volume_set() {
+    let payload = volume_payload(150_000);
+    let entries = [streaming_entry("split.bin", &payload)];
+    let volumes = write_volume_set(
+        &entries,
+        FeatureSet::store_only(),
+        rar50::ArchiveExtras::default(),
+        25_000,
+    );
+    assert!(volumes.len() > 2);
+
+    let dir = std::env::temp_dir().join(format!("rars-volset-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    for (index, volume) in volumes.iter().enumerate() {
+        fs::write(dir.join(format!("set.part{:02}.rar", index + 1)), volume).unwrap();
+    }
+
+    let first = dir.join("set.part01.rar");
+    let mut result = None;
+    for tool in ["unrar", "rar"] {
+        match Command::new(tool).arg("t").arg(&first).output() {
+            Ok(output) => {
+                result = Some(output);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => panic!("failed to run {tool}: {error}"),
+        }
+    }
+    let _ = fs::remove_dir_all(&dir);
+
+    let Some(output) = result else {
+        eprintln!("skipping reference test: no unrar or rar command is installed");
+        return;
+    };
+    assert!(
+        output.status.success(),
+        "the reference tool rejected the volume set\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

@@ -249,6 +249,27 @@ impl Spool {
         self.pos = self.pos.saturating_add(copied);
         Ok(copied)
     }
+
+    /// Copies `len` bytes starting at `start` to `output`, which is how a
+    /// volume set takes one fragment of a member at a time.
+    pub(crate) fn copy_range_to(
+        &mut self,
+        start: u64,
+        len: u64,
+        output: &mut dyn Write,
+    ) -> Result<u64> {
+        self.seek_to(start)?;
+        let copied = std::io::copy(&mut (&mut self.file).take(len), output)?;
+        if copied != len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "spooled range is shorter than expected",
+            )
+            .into());
+        }
+        self.pos = self.pos.saturating_add(copied);
+        Ok(copied)
+    }
 }
 
 impl Write for Spool {

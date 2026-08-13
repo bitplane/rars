@@ -202,6 +202,80 @@ impl ArchiveEntry {
     }
 }
 
+/// Receives each volume of a multi-volume archive as it is finished.
+pub trait VolumeSink {
+    /// Opens the output for volume `index`, numbered from zero.
+    fn start_volume(&mut self, index: u64) -> Result<Box<dyn Write + Send>>;
+
+    /// Called once volume `index` has been written and flushed.
+    fn finish_volume(&mut self, index: u64, len: u64) -> Result<()> {
+        let _ = (index, len);
+        Ok(())
+    }
+}
+
+/// Writes a multi-volume RAR 5 or RAR 7 archive, handing each volume to `sink`
+/// as it completes so the set is never held in memory.
+pub fn write_streaming_volumes_to(
+    entries: &[ArchiveEntry],
+    options: WriterOptions,
+    extras: ArchiveExtras<'_>,
+    max_payload_per_volume: u64,
+    sink: &mut dyn VolumeSink,
+    resources: &WriterResources,
+) -> Result<()> {
+    let encrypted = entries.iter().any(|entry| entry.password.is_some());
+    if encrypted && !entries.iter().all(|entry| entry.password.is_some()) {
+        return Err(Error::UnsupportedFeature {
+            version: options.target,
+            feature: "RAR 5 writer mixing encrypted and plain members",
+        });
+    }
+    if extras.quick_open || extras.comment.is_some() || extras.metadata.is_some() {
+        return Err(Error::UnsupportedFeature {
+            version: options.target,
+            feature: "RAR 5 volume writer comments, metadata or quick-open",
+        });
+    }
+    match (encrypted, extras.recovery_percent.is_some()) {
+        (true, true) => validate_encrypted_compressed_recovery_options(options)?,
+        (true, false) => validate_encrypted_compressed_options(options)?,
+        (false, true) => validate_compressed_recovery_options(options)?,
+        (false, false) => validate_compressed_options(options)?,
+    }
+    if let Some(percent) = extras.recovery_percent {
+        validate_recovery_percent(percent)?;
+    }
+    if options.features.header_encryption && !encrypted {
+        return Err(Error::NeedPassword);
+    }
+
+    engine::write_volumes(
+        entries,
+        engine::EnginePlan {
+            compress: {
+                let mut compress = streaming_compress_plan(options)?;
+                compress.filter_policy = extras.filter_policy;
+                compress.candidates = encode_option_candidates_for_level(
+                    options.compression_level,
+                    compress.dictionary_size,
+                )?;
+                compress
+            },
+            method: compression_method_for_level(options.compression_level)?,
+            recovery_percent: extras.recovery_percent,
+            header_encrypted: options.features.header_encryption,
+            archive_comment: None,
+            archive_metadata: None,
+            quick_open: false,
+            progress: None,
+        },
+        max_payload_per_volume,
+        sink,
+        resources,
+    )
+}
+
 /// Archive-level options that sit alongside the members.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
