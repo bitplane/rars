@@ -904,7 +904,6 @@ impl RarBuilder {
                         rars_rs::rar50::EncryptedArchiveCommentEntry { data, password }
                     }))
                     .recovery_percent(self.recovery_percent)
-                    .recovery_password(self.recovery_percent.map(|_| password))
                     .finish()
             } else {
                 let entries: Vec<_> = self

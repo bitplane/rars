@@ -129,11 +129,11 @@ pub(crate) struct AddArgs {
     /// Dictionary size (e.g. 4m, 128k; RAR 1.5+)
     #[arg(long, value_name = "SIZE", value_parser = crate::parse_size_string)]
     pub dict_size: Option<usize>,
-    /// Maximum total compression working memory (default: 256m; RAR 5+)
+    /// Maximum total compression working memory (default: 256m)
     ///
-    /// Left unset rather than defaulted here, so the formats that build the
-    /// whole archive in memory can tell an explicit request from a default and
-    /// refuse the one they cannot honour.
+    /// Left unset rather than defaulted here, so a volume set below RAR 5, which
+    /// is still built in memory, can tell an explicit request from a default and
+    /// refuse the one it cannot honour.
     #[arg(long, value_name = "SIZE", value_parser = crate::parse_size_string)]
     pub memory_limit: Option<usize>,
     /// Directory for temporary compressed payloads (RAR 5+)
@@ -187,10 +187,14 @@ pub(crate) struct AddArgs {
     /// Auto-detect data filter (RAR 5+ does this by default)
     #[arg(long = "auto-filter")]
     pub auto_filter: bool,
-    /// Skip filter detection, compressing the data as it is (RAR 2.9+)
+    /// Skip filter detection, compressing the data as it is (RAR 2.9+; the
+    /// older formats never look, so the flag passes without comment there)
     #[arg(long = "no-filter", conflicts_with = "auto_filter")]
     pub no_filter: bool,
     /// Use the PPMd compression algorithm (RAR 2.9/3.x/4.x only)
+    ///
+    /// Cannot be combined with --auto-filter: choosing a filter means measuring
+    /// candidates through LZ, which forcing PPMd leaves nothing to measure.
     #[arg(long)]
     pub ppmd: bool,
     /// Output archive path

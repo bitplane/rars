@@ -401,12 +401,10 @@ fn write_encrypted_stored_archive_with_recovery(
     entries: &[EncryptedStoredEntry<'_>],
     options: rar50::WriterOptions,
     recovery_percent: u64,
-    recovery_password: &[u8],
 ) -> Result<Vec<u8>, Error> {
     rar50::Rar50Writer::new(options)
         .encrypted_stored_entries(entries)
         .recovery_percent(Some(recovery_percent))
-        .recovery_password(Some(recovery_password))
         .finish()
 }
 
@@ -1964,7 +1962,6 @@ fn repairs_encrypted_rar50_inline_recovery_payload_damage_with_password() {
         &entries,
         rar50::WriterOptions::new(ArchiveVersion::Rar50, features),
         20,
-        b"password",
     )
     .unwrap();
     let clean = Archive::parse_with_password(&bytes, Some(b"password")).unwrap();
@@ -2000,7 +1997,6 @@ fn repairs_header_encrypted_rar50_inline_recovery_payload_damage_with_password()
         &entries,
         rar50::WriterOptions::new(ArchiveVersion::Rar50, features),
         20,
-        b"password",
     )
     .unwrap();
     let clean = Archive::parse_with_password(&bytes, Some(b"password")).unwrap();
@@ -2623,14 +2619,12 @@ fn writes_encrypted_rar50_recovery_service_that_reader_extracts_with_password() 
         &entries,
         rar50::WriterOptions::new(ArchiveVersion::Rar50, features),
         6,
-        b"password",
     )
     .unwrap();
     let second = write_encrypted_stored_archive_with_recovery(
         &entries,
         rar50::WriterOptions::new(ArchiveVersion::Rar50, features),
         6,
-        b"password",
     )
     .unwrap();
 
@@ -2958,7 +2952,6 @@ fn writes_header_encrypted_rar50_recovery_service_that_reader_extracts_with_pass
         &entries,
         rar50::WriterOptions::new(ArchiveVersion::Rar50, features),
         4,
-        b"password",
     )
     .unwrap();
 
@@ -4628,7 +4621,7 @@ fn parse_path_family_accepts_os_string_paths() {
 
 /// Members whose contents overlap heavily, and which together fit inside the
 /// default dictionary, so a shared dictionary has something obvious to find.
-fn solid_test_entries() -> Vec<rar50::StreamingCompressedEntry> {
+fn solid_test_entries() -> Vec<rar50::ArchiveEntry> {
     let base: Vec<u8> = (0..800u32)
         .flat_map(|index| {
             let mut bytes = b"solid dictionary sharing payload ".to_vec();
@@ -4638,23 +4631,25 @@ fn solid_test_entries() -> Vec<rar50::StreamingCompressedEntry> {
         .collect();
 
     (0..3u8)
-        .map(|index| rar50::StreamingCompressedEntry {
-            name: format!("member-{index}.bin").into_bytes(),
-            source: rars::EntrySource::from_bytes(std::sync::Arc::<[u8]>::from(base.clone())),
-            mtime: Some(0x5000_0000),
-            attributes: 0x20,
-            host_os: 0,
+        .map(|index| {
+            rar50::ArchiveEntry::new(
+                format!("member-{index}.bin").into_bytes(),
+                rars::EntrySource::from_bytes(std::sync::Arc::<[u8]>::from(base.clone())),
+            )
+            .with_mtime(Some(0x5000_0000))
+            .with_attributes(0x20)
         })
         .collect()
 }
 
-fn write_streaming(entries: &[rar50::StreamingCompressedEntry], solid: bool) -> Vec<u8> {
+fn write_streaming(entries: &[rar50::ArchiveEntry], solid: bool) -> Vec<u8> {
     let mut features = FeatureSet::store_only();
     features.solid = solid;
     let mut out = Vec::new();
-    rar50::write_streaming_compressed_archive_to(
+    rar50::write_streaming_archive_to(
         entries,
         rar50::WriterOptions::new(ArchiveVersion::Rar50, features).with_compression_level(3),
+        rar50::ArchiveExtras::default(),
         &rars::WriterResources::default(),
         &mut out,
     )
@@ -4724,13 +4719,11 @@ fn streaming_solid_chains_history_across_block_and_member_boundaries() {
                 .map(|offset| (offset.wrapping_mul(2_654_435_761) >> 24) as u8)
                 .collect();
             data[0] = index;
-            rar50::StreamingCompressedEntry {
-                name: format!("big-{index}.bin").into_bytes(),
-                source: rars::EntrySource::from_bytes(std::sync::Arc::<[u8]>::from(data)),
-                mtime: None,
-                attributes: 0x20,
-                host_os: 0,
-            }
+            rar50::ArchiveEntry::new(
+                format!("big-{index}.bin").into_bytes(),
+                rars::EntrySource::from_bytes(std::sync::Arc::<[u8]>::from(data)),
+            )
+            .with_attributes(0x20)
         })
         .collect();
 
@@ -4770,18 +4763,20 @@ fn streaming_solid_output_does_not_depend_on_the_memory_budget() {
     // The default budget compresses a couple of blocks at a time; the larger
     // one lets every core work at once.
     let mut tight = Vec::new();
-    rar50::write_streaming_compressed_archive_to(
+    rar50::write_streaming_archive_to(
         &entries,
         options,
+        rar50::ArchiveExtras::default(),
         &rars::WriterResources::default(),
         &mut tight,
     )
     .unwrap();
 
     let mut roomy = Vec::new();
-    rar50::write_streaming_compressed_archive_to(
+    rar50::write_streaming_archive_to(
         &entries,
         options,
+        rar50::ArchiveExtras::default(),
         &rars::WriterResources::new(4 * 1024 * 1024 * 1024),
         &mut roomy,
     )

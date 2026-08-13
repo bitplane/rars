@@ -17,13 +17,11 @@ mod write;
 
 pub use extract::{extract_volumes_to, extract_volumes_to_with_redirections};
 pub use write::{
-    write_streaming_archive_to, write_streaming_compressed_archive_to,
-    write_streaming_encrypted_compressed_archive_to, write_streaming_volumes_to, ArchiveEntry,
-    ArchiveExtras, ArchiveMetadataEntry, CompressedEntry, EncryptedArchiveCommentEntry,
-    EncryptedCompressedEntry, EncryptedStoredEntry, EncryptedStoredEntryWithServices,
-    EncryptedStoredServiceEntry, FilterKind, FilterPolicy, FilterSpec, Rar50VolumeWriter,
-    Rar50Writer, ServiceEntry, StoredEntry, StoredEntryWithServices, StoredServiceEntry,
-    StreamingCompressedEntry, StreamingEncryptedCompressedEntry, VolumeSink, WriterOptions,
+    write_streaming_archive_to, write_streaming_volumes_to, ArchiveEntry, ArchiveExtras,
+    ArchiveMetadataEntry, CompressedEntry, EncryptedArchiveCommentEntry, EncryptedCompressedEntry,
+    EncryptedStoredEntry, EncryptedStoredEntryWithServices, EncryptedStoredServiceEntry,
+    FilterKind, FilterPolicy, FilterSpec, Rar50VolumeWriter, Rar50Writer, ServiceEntry,
+    StoredEntry, StoredEntryWithServices, StoredServiceEntry, VolumeSink, WriterOptions,
 };
 
 const HEAD_MAIN: u64 = 1;

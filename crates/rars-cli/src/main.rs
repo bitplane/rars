@@ -1656,17 +1656,13 @@ fn write_plain_rar50_streaming(
     Ok(())
 }
 
-/// Warns before an archive is built in memory rather than streamed.
+/// Warns before a volume set that will not fit comfortably in memory.
 ///
-/// The streaming writer keeps memory flat regardless of input size; the
-/// remaining features assemble the whole archive in memory, so a large input
-/// can exhaust it. Saying so up front beats an allocation failure an hour in.
-/// Warns before a write that will not fit comfortably in memory.
-///
-/// RAR 1.3 through 4.x hold every input and the whole archive while they work.
-/// Measured on a single 20 MB member that peaks near seventeen times the input,
-/// and on a few hundred small files nearer six. RAR 5 and RAR 7 stream, so this
-/// never applies to them.
+/// Every writer streams a plain archive now, but a legacy volume set is still
+/// built whole: the split has to see the entire packed payload before it can
+/// decide where the parts break, so the input, the packed member and every part
+/// are all resident at once. RAR 5 and RAR 7 split as they go, so this never
+/// applies to them. Saying so up front beats an allocation failure an hour in.
 fn warn_if_buffered_write_is_large(input_paths: &[String], target: ArchiveVersion) {
     const WARN_THRESHOLD: u64 = 256 * 1024 * 1024;
 
@@ -1682,8 +1678,8 @@ fn warn_if_buffered_write_is_large(input_paths: &[String], target: ArchiveVersio
     }
 
     eprintln!(
-        "warning: --format {target} builds the whole archive in memory, so this write needs \
-         several times the {} of input and may run out; --format rar50 streams instead",
+        "warning: --format {target} builds a volume set in memory, so this write needs \
+         several times the {} of input and may run out; --format rar50 splits as it goes",
         indicatif::HumanBytes(total)
     );
 }

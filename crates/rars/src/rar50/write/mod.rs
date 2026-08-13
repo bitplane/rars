@@ -99,27 +99,6 @@ pub struct CompressedEntry<'a> {
     pub host_os: u64,
 }
 
-#[derive(Debug, Clone)]
-/// A non-encrypted member backed by a reopenable streaming source.
-pub struct StreamingCompressedEntry {
-    pub name: Vec<u8>,
-    pub source: EntrySource,
-    pub mtime: Option<u32>,
-    pub attributes: u64,
-    pub host_os: u64,
-}
-
-#[derive(Debug, Clone)]
-/// An encrypted member backed by a reopenable streaming source.
-pub struct StreamingEncryptedCompressedEntry {
-    pub name: Vec<u8>,
-    pub source: EntrySource,
-    pub mtime: Option<u32>,
-    pub attributes: u64,
-    pub host_os: u64,
-    pub password: Vec<u8>,
-}
-
 /// An archive member, read from a reopenable source when it is needed.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -408,30 +387,6 @@ pub(crate) fn write_streaming_archive_with_progress(
 }
 
 /// Writes a RAR 5 or RAR 7 archive without retaining member payloads.
-pub fn write_streaming_compressed_archive_to(
-    entries: &[StreamingCompressedEntry],
-    options: WriterOptions,
-    resources: &WriterResources,
-    output: &mut dyn Write,
-) -> Result<()> {
-    let entries: Vec<_> = entries
-        .iter()
-        .map(|entry| {
-            ArchiveEntry::new(entry.name.clone(), entry.source.clone())
-                .with_mtime(entry.mtime)
-                .with_attributes(entry.attributes)
-                .with_host_os(entry.host_os)
-        })
-        .collect();
-    write_streaming_archive_to(
-        &entries,
-        options,
-        ArchiveExtras::default(),
-        resources,
-        output,
-    )
-}
-
 /// Compression settings shared by the streaming writers.
 fn streaming_compress_plan(options: WriterOptions) -> Result<compress::CompressPlan> {
     let dictionary_size = dictionary_size_for_options(options)?;
@@ -448,32 +403,6 @@ fn streaming_compress_plan(options: WriterOptions) -> Result<compress::CompressP
             dictionary_size,
         )?],
     })
-}
-
-/// Writes an encrypted RAR 5 or RAR 7 archive with bounded memory.
-pub fn write_streaming_encrypted_compressed_archive_to(
-    entries: &[StreamingEncryptedCompressedEntry],
-    options: WriterOptions,
-    resources: &WriterResources,
-    output: &mut dyn Write,
-) -> Result<()> {
-    let entries: Vec<_> = entries
-        .iter()
-        .map(|entry| {
-            ArchiveEntry::new(entry.name.clone(), entry.source.clone())
-                .with_mtime(entry.mtime)
-                .with_attributes(entry.attributes)
-                .with_host_os(entry.host_os)
-                .with_password(entry.password.clone())
-        })
-        .collect();
-    write_streaming_archive_to(
-        &entries,
-        options,
-        ArchiveExtras::default(),
-        resources,
-        output,
-    )
 }
 
 fn source_integrity(
@@ -618,7 +547,6 @@ pub struct Rar50Writer<'a> {
     archive_metadata: Option<ArchiveMetadataEntry<'a>>,
     filter_policy: FilterPolicy,
     recovery_percent: Option<u64>,
-    recovery_password: Option<&'a [u8]>,
     progress: Option<ProgressReporter<'a>>,
 }
 
@@ -800,7 +728,6 @@ impl<'a> Rar50Writer<'a> {
             archive_metadata: None,
             filter_policy: FilterPolicy::None,
             recovery_percent: None,
-            recovery_password: None,
             progress: None,
         }
     }
@@ -888,11 +815,6 @@ impl<'a> Rar50Writer<'a> {
 
     pub fn recovery_percent(mut self, percent: Option<u64>) -> Self {
         self.recovery_percent = percent;
-        self
-    }
-
-    pub fn recovery_password(mut self, password: Option<&'a [u8]>) -> Self {
-        self.recovery_password = password;
         self
     }
 
@@ -1848,17 +1770,18 @@ mod tests {
     #[test]
     fn streaming_writer_round_trips_across_input_blocks() {
         let data = b"bounded streaming member data\n".repeat(80_000);
-        let entry = StreamingCompressedEntry {
-            name: b"large.txt".to_vec(),
-            source: EntrySource::from_bytes(Arc::<[u8]>::from(data.clone())),
-            mtime: None,
-            attributes: 0x20,
-            host_os: 1,
-        };
+        let entry = ArchiveEntry::new(
+            b"large.txt".to_vec(),
+            EntrySource::from_bytes(Arc::<[u8]>::from(data.clone())),
+        )
+        .with_mtime(None)
+        .with_attributes(0x20)
+        .with_host_os(1);
         let mut bytes = Vec::new();
-        write_streaming_compressed_archive_to(
+        write_streaming_archive_to(
             &[entry],
             WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only()),
+            ArchiveExtras::default(),
             &WriterResources::default(),
             &mut bytes,
         )
@@ -1872,16 +1795,17 @@ mod tests {
 
     #[test]
     fn streaming_writer_rejects_workspace_larger_than_budget() {
-        let entry = StreamingCompressedEntry {
-            name: b"small.txt".to_vec(),
-            source: EntrySource::from_bytes(Arc::<[u8]>::from(&b"small"[..])),
-            mtime: None,
-            attributes: 0x20,
-            host_os: 1,
-        };
-        let result = write_streaming_compressed_archive_to(
+        let entry = ArchiveEntry::new(
+            b"small.txt".to_vec(),
+            EntrySource::from_bytes(Arc::<[u8]>::from(&b"small"[..])),
+        )
+        .with_mtime(None)
+        .with_attributes(0x20)
+        .with_host_os(1);
+        let result = write_streaming_archive_to(
             &[entry],
             WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only()),
+            ArchiveExtras::default(),
             &WriterResources::new(1024),
             &mut Vec::new(),
         );
@@ -1941,30 +1865,32 @@ mod tests {
             .map(|index| {
                 let mut data = vec![index; 1_300_000];
                 data.extend((0..300_000).map(|offset| (offset as u8).wrapping_add(index)));
-                StreamingCompressedEntry {
-                    name: format!("entry-{index}.bin").into_bytes(),
-                    source: EntrySource::from_bytes(Arc::<[u8]>::from(data)),
-                    mtime: None,
-                    attributes: 0x20,
-                    host_os: 1,
-                }
+                ArchiveEntry::new(
+                    format!("entry-{index}.bin").into_bytes(),
+                    EntrySource::from_bytes(Arc::<[u8]>::from(data)),
+                )
+                .with_mtime(None)
+                .with_attributes(0x20)
+                .with_host_os(1)
             })
             .collect();
         let options = WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only());
         let dictionary_size = dictionary_size_for_options(options).unwrap();
         let required = streaming_lz_workspace(dictionary_size, 1024 * 1024);
         let mut one_job = Vec::new();
-        write_streaming_compressed_archive_to(
+        write_streaming_archive_to(
             &entries,
             options,
+            ArchiveExtras::default(),
             &WriterResources::new(required),
             &mut one_job,
         )
         .unwrap();
         let mut many_jobs = Vec::new();
-        write_streaming_compressed_archive_to(
+        write_streaming_archive_to(
             &entries,
             options,
+            ArchiveExtras::default(),
             &WriterResources::new(required.saturating_mul(4)),
             &mut many_jobs,
         )
@@ -1986,16 +1912,13 @@ mod tests {
                 Ok(Box::new(Cursor::new(data)))
             }
         });
-        let entry = StreamingCompressedEntry {
-            name: b"changing.bin".to_vec(),
-            source,
-            mtime: None,
-            attributes: 0x20,
-            host_os: 1,
-        };
-        let result = write_streaming_compressed_archive_to(
+        let entry = ArchiveEntry::new(b"changing.bin".to_vec(), source)
+            .with_attributes(0x20)
+            .with_host_os(1);
+        let result = write_streaming_archive_to(
             &[entry],
             WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only()),
+            ArchiveExtras::default(),
             &WriterResources::default(),
             &mut Vec::new(),
         );
@@ -2010,19 +1933,20 @@ mod tests {
     #[test]
     fn encrypted_streaming_writer_round_trips_across_input_blocks() {
         let data = b"encrypted bounded streaming member data\n".repeat(40_000);
-        let entry = StreamingEncryptedCompressedEntry {
-            name: b"secret.txt".to_vec(),
-            source: EntrySource::from_bytes(Arc::<[u8]>::from(data.clone())),
-            mtime: None,
-            attributes: 0x20,
-            host_os: 1,
-            password: b"password".to_vec(),
-        };
+        let entry = ArchiveEntry::new(
+            b"secret.txt".to_vec(),
+            EntrySource::from_bytes(Arc::<[u8]>::from(data.clone())),
+        )
+        .with_mtime(None)
+        .with_attributes(0x20)
+        .with_host_os(1)
+        .with_password(b"password".to_vec());
         let features = FeatureSet::store_only();
         let mut bytes = Vec::new();
-        write_streaming_encrypted_compressed_archive_to(
+        write_streaming_archive_to(
             &[entry],
             WriterOptions::new(ArchiveVersion::Rar50, features),
+            ArchiveExtras::default(),
             &WriterResources::default(),
             &mut bytes,
         )

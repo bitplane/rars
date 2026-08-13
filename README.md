@@ -43,12 +43,14 @@ The writer supports stored and compressed members, split volumes, passwords,
 header encryption where implemented, comments, RARVM filters, RAR5 quick-open
 records, and supported recovery records. Run `rars --help` for more info.
 
-RAR 5 and RAR 7 archives are written in a single pass without being held in
-memory, so the peak stays flat whatever the inputs weigh. Members compress into
-temporary files under `--temp-dir`, and `--memory-limit` (256MB by default)
-bounds the working set: raise it to compress more blocks at once, which on a
-machine with many cores is what limits throughput. The number of `--threads`
-defaults to your core count.
+Archives are written straight to their output rather than assembled in memory,
+whatever the format. `--memory-limit` (256MB by default) bounds the working set,
+and the number of `--threads` defaults to your core count.
+
+RAR 5 and RAR 7 go furthest with this: members compress into temporary files
+under `--temp-dir`, so the peak stays flat whatever the inputs weigh, and
+raising the limit compresses more blocks at once, which on a machine with many
+cores is what limits throughput.
 
 RAR 5 and RAR 7 look for a data filter by default, which is worth around 6% on
 executables and costs compression time rather than memory; `--no-filter` turns
@@ -62,10 +64,16 @@ sample of the member before anything is compressed in full, so filters that were
 never going to help cost a fraction of a member rather than one whole encode
 each.
 
-The RAR 1.3 to 4.x writers still assemble archives in memory and hold every
-input while they do it, which peaks at several times the size of the input. The
-CLI warns before starting one of those on a large input and points at RAR 5,
-which streams.
+RAR 1.3 to 4.x compress a member as a unit, so one member has to fit in memory
+even though the archive does not. There the limit decides how many members are
+compressed at once, and a member too big for the whole budget is compressed on
+its own rather than refused. Stored members are copied straight from disk and
+never land in memory at all.
+
+Volume sets are the exception: below RAR 5 the split has to see the whole packed
+payload before it can decide where the parts break, so those are still built in
+memory. The CLI warns before starting a large one and points at RAR 5, which
+splits as it goes.
 
 Every option either works for the format you chose or is refused before any
 input is read, naming the flag and a format that would have worked:

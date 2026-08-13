@@ -3645,7 +3645,6 @@ mod tests {
                     password: b"password",
                 }])
                 .recovery_percent(Some(6))
-                .recovery_password(Some(b"password"))
                 .finish()
                 .unwrap();
 
@@ -3719,7 +3718,6 @@ mod tests {
                     password: b"password",
                 }])
                 .recovery_percent(Some(4))
-                .recovery_password(Some(b"password"))
                 .finish()
                 .unwrap();
 
