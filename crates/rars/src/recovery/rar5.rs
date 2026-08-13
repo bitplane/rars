@@ -27,6 +27,7 @@ pub enum Error {
     ShardSizeMismatch,
     TooManyShards,
     SingularElement,
+    Io(std::io::ErrorKind),
 }
 
 impl std::fmt::Display for Error {
@@ -44,11 +45,18 @@ impl std::fmt::Display for Error {
             Self::ShardSizeMismatch => f.write_str("RAR 5 recovery shard sizes differ"),
             Self::TooManyShards => f.write_str("RAR 5 recovery shard count is invalid"),
             Self::SingularElement => f.write_str("RAR 5 recovery matrix is singular"),
+            Self::Io(kind) => write!(f, "RAR 5 recovery I/O failed: {kind}"),
         }
     }
 }
 
 impl std::error::Error for Error {}
+
+impl From<std::io::Error> for Error {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error.kind())
+    }
+}
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -225,89 +233,505 @@ pub(crate) fn build_structural_inline_recovery_data_with_progress(
     progress: Option<ProgressReporter<'_>>,
     pass: usize,
 ) -> Result<Vec<u8>> {
-    let (plan, parity) = encode_inline_recovery_parity_with_progress(
-        archive_prefix,
+    let mut out = Vec::new();
+    build_streamed_inline_recovery(
+        &mut std::io::Cursor::new(archive_prefix),
+        archive_prefix.len() as u64,
         recovery_percent,
+        RecoveryMemoryMode::Resident,
+        None,
+        &mut out,
         progress,
         pass,
     )?;
-    let shard_ranges = split_prefix_shard_ranges(archive_prefix.len(), plan)?;
-    let total_len = usize::try_from(plan.payload_size()?).map_err(|_| Error::PlanOverflow)?;
-    let header_size = usize::try_from(plan.header_size).map_err(|_| Error::PlanOverflow)?;
-    let shard_size = usize::try_from(plan.shard_size).map_err(|_| Error::PlanOverflow)?;
-    let data_shards = usize::try_from(plan.data_shards).map_err(|_| Error::PlanOverflow)?;
-    let recovery_shards = usize::try_from(plan.recovery_shards).map_err(|_| Error::PlanOverflow)?;
+    Ok(out)
+}
+
+/// Read buffer size for streaming recovery passes. Even, so words never
+/// straddle a chunk boundary.
+pub(crate) const RECOVERY_IO_BLOCK: usize = 256 * 1024;
+/// Striped mode never claims more than this, however large the budget is.
+#[cfg_attr(not(test), allow(dead_code))]
+const STRIPE_BUDGET_CAP: u64 = 64 * 1024 * 1024;
+/// Below this a stripe pass seeks far more than it reads, so rather than
+/// thrash we report what striping would actually cost and let the caller
+/// refuse the job.
+#[cfg_attr(not(test), allow(dead_code))]
+const MIN_STRIPE_LEN: u64 = 4 * 1024;
+
+/// How a recovery pass holds parity while it works.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoveryMemoryMode {
+    /// Every parity row stays in memory and the body is read straight
+    /// through. Needs `recovery_shards * group_count` bytes.
+    Resident,
+    /// Parity is built one column stripe at a time and spilled to scratch
+    /// storage, so memory is bounded regardless of archive size. Costs one
+    /// seek per data shard per stripe.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Striped { stripe_len: usize },
+}
+
+/// Picks a memory mode for `plan` under `memory_limit`, returning the mode and
+/// the number of bytes the caller should reserve for it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn choose_recovery_memory_mode(
+    plan: InlineRecoveryPlan,
+    memory_limit: u64,
+) -> Result<(RecoveryMemoryMode, u64)> {
+    let parity_bytes = plan
+        .recovery_shards
+        .checked_mul(plan.group_count)
+        .ok_or(Error::PlanOverflow)?;
+    let resident_bytes = parity_bytes.saturating_add(RECOVERY_IO_BLOCK as u64);
+    if resident_bytes <= memory_limit {
+        return Ok((RecoveryMemoryMode::Resident, resident_bytes));
+    }
+
+    // One buffer per parity row plus one for the data being read.
+    let rows = plan.recovery_shards.saturating_add(1).max(1);
+    let budget = memory_limit.min(STRIPE_BUDGET_CAP);
+    let mut stripe_len = (budget / rows).min(plan.group_count) & !1;
+    if stripe_len < MIN_STRIPE_LEN {
+        stripe_len = MIN_STRIPE_LEN.min(plan.group_count.max(2));
+    }
+    stripe_len = stripe_len.max(2);
+    let stripe_len_usize = usize::try_from(stripe_len).map_err(|_| Error::PlanOverflow)?;
+    let required = rows.saturating_mul(stripe_len);
+    Ok((
+        RecoveryMemoryMode::Striped {
+            stripe_len: stripe_len_usize,
+        },
+        required,
+    ))
+}
+
+/// What a streaming recovery pass produced, so the caller can frame the
+/// service block around the payload it just wrote.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct StreamedRecoveryOutput {
+    pub(crate) plan: InlineRecoveryPlan,
+    pub(crate) payload_len: u64,
+    pub(crate) payload_crc32: u32,
+}
+
+pub(crate) trait ReadSeek: std::io::Read + std::io::Seek {}
+impl<T: std::io::Read + std::io::Seek> ReadSeek for T {}
+
+pub(crate) trait ReadWriteSeek: std::io::Read + std::io::Write + std::io::Seek {}
+impl<T: std::io::Read + std::io::Write + std::io::Seek> ReadWriteSeek for T {}
+
+/// Builds the inline recovery payload for `body` and writes it to `sink`.
+///
+/// The body is read exactly once to build parity, then each parity row is
+/// framed into a `{RB}` chunk. Output is byte-identical to computing the whole
+/// thing in memory; only the working set differs.
+///
+/// `parity_scratch` must be supplied for [`RecoveryMemoryMode::Striped`] and
+/// is where partial parity lives between stripes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_streamed_inline_recovery(
+    body: &mut dyn ReadSeek,
+    body_len: u64,
+    recovery_percent: u64,
+    mode: RecoveryMemoryMode,
+    parity_scratch: Option<&mut dyn ReadWriteSeek>,
+    sink: &mut dyn std::io::Write,
+    progress: Option<ProgressReporter<'_>>,
+    pass: usize,
+) -> Result<StreamedRecoveryOutput> {
+    let plan = plan_inline_recovery(body_len, recovery_percent)?;
+    let payload_len = plan.payload_size()?;
+
+    // Fail on unrepresentable geometry before doing any work.
     let total_size = u32::try_from(plan.shard_size).map_err(|_| Error::PlanOverflow)?;
     let header_size_u32 = u32::try_from(plan.header_size).map_err(|_| Error::PlanOverflow)?;
     let data_shards_u16 = u16::try_from(plan.data_shards).map_err(|_| Error::PlanOverflow)?;
     let recovery_shards_u16 =
         u16::try_from(plan.recovery_shards).map_err(|_| Error::PlanOverflow)?;
-    let chunk_data_extent = shard_ranges.last().map_or(0usize, std::ops::Range::len);
+    let data_shards = usize::try_from(plan.data_shards).map_err(|_| Error::PlanOverflow)?;
+    let recovery_shards = usize::try_from(plan.recovery_shards).map_err(|_| Error::PlanOverflow)?;
+    let group_count = usize::try_from(plan.group_count).map_err(|_| Error::PlanOverflow)?;
+    let header_size = usize::try_from(plan.header_size).map_err(|_| Error::PlanOverflow)?;
+    if body_len > plan.group_count.saturating_mul(plan.data_shards) {
+        return Err(Error::PrefixExceedsPlan);
+    }
+
+    if let Some(progress) = progress {
+        progress.report(WriteProgressEvent::OperationStarted {
+            operation: WriteOperation::Recovery,
+            total_bytes: Some(payload_len),
+            total_entries: None,
+            pass,
+        });
+    }
+
+    // Phase A budget is the parity bytes; phase B adds the chunk headers.
+    let encode_units = plan
+        .recovery_shards
+        .checked_mul(plan.group_count)
+        .ok_or(Error::PlanOverflow)?;
+    let report = |completed: u64| {
+        if let Some(progress) = progress {
+            progress.report(WriteProgressEvent::Advanced {
+                operation: WriteOperation::Recovery,
+                completed_bytes: completed.min(payload_len),
+                total_bytes: payload_len,
+                pass,
+            });
+        }
+    };
+
+    let matrix = make_encoder_matrix(data_shards, recovery_shards)?;
+    let mut shard_states = vec![0u64; data_shards];
+
+    let mut rows = match mode {
+        RecoveryMemoryMode::Resident => {
+            let parity = encode_parity_resident(
+                body,
+                body_len,
+                &plan,
+                &matrix,
+                &mut shard_states,
+                encode_units,
+                &report,
+            )?;
+            ParityRows::Resident(parity)
+        }
+        RecoveryMemoryMode::Striped { stripe_len } => {
+            let scratch = parity_scratch.ok_or(Error::PlanOverflow)?;
+            encode_parity_striped(
+                body,
+                body_len,
+                &plan,
+                &matrix,
+                &mut shard_states,
+                stripe_len,
+                scratch,
+                encode_units,
+                &report,
+            )?;
+            ParityRows::Spooled {
+                scratch,
+                group_count: plan.group_count,
+            }
+        }
+    };
+
+    // Every chunk repeats the CRC state of parity row 0, so it has to be
+    // known before the first chunk can be framed.
+    let mut buffer = vec![0u8; RECOVERY_IO_BLOCK.min(group_count.max(1))];
+    let mut final_state = 0u64;
+    if recovery_shards > 0 {
+        rows.for_each_chunk(0, &mut buffer, |chunk| {
+            final_state = crc64_update(chunk, final_state);
+        })?;
+    }
+
+    let chunk_data_extent = body_len
+        .saturating_sub(
+            plan.group_count
+                .saturating_mul(plan.data_shards.saturating_sub(1)),
+        )
+        .min(plan.group_count);
     let chunk_data_extent_u32 =
         u32::try_from(chunk_data_extent).map_err(|_| Error::PlanOverflow)?;
-    let data_shard_states: Vec<u64> = shard_ranges
-        .iter()
-        .map(|range| crc64_rar_state(&archive_prefix[range.clone()]))
-        .collect();
-    let final_state = parity
-        .first()
-        .map(|payload| crc64_rar_state(payload))
-        .unwrap_or(0);
 
-    let mut out = Vec::with_capacity(total_len);
-    for (shard_index, payload) in parity.iter().enumerate() {
-        if payload.len() + header_size != shard_size {
-            return Err(Error::PlanOverflow);
-        }
-
-        let chunk_start = out.len();
-        out.extend_from_slice(b"{RB}");
-        out.extend_from_slice(&0u64.to_le_bytes());
-        out.extend_from_slice(&total_size.to_le_bytes());
-        out.extend_from_slice(&header_size_u32.to_le_bytes());
-        out.push(1);
-        out.push(1);
-        out.extend_from_slice(&0u64.to_le_bytes());
-        out.extend_from_slice(&chunk_data_extent_u32.to_le_bytes());
-        out.extend_from_slice(&(archive_prefix.len() as u64).to_le_bytes());
-        out.extend_from_slice(&plan.group_count.to_le_bytes());
-        out.extend_from_slice(&plan.shard_size.to_le_bytes());
-        out.extend_from_slice(&data_shards_u16.to_le_bytes());
-        out.extend_from_slice(&recovery_shards_u16.to_le_bytes());
-        out.extend_from_slice(
+    let mut payload_crc32 = crate::crc32::Crc32::new();
+    let mut written = 0u64;
+    for shard_index in 0..recovery_shards {
+        let mut header = Vec::with_capacity(header_size);
+        header.extend_from_slice(b"{RB}");
+        header.extend_from_slice(&0u64.to_le_bytes());
+        header.extend_from_slice(&total_size.to_le_bytes());
+        header.extend_from_slice(&header_size_u32.to_le_bytes());
+        header.push(1);
+        header.push(1);
+        header.extend_from_slice(&0u64.to_le_bytes());
+        header.extend_from_slice(&chunk_data_extent_u32.to_le_bytes());
+        header.extend_from_slice(&body_len.to_le_bytes());
+        header.extend_from_slice(&plan.group_count.to_le_bytes());
+        header.extend_from_slice(&plan.shard_size.to_le_bytes());
+        header.extend_from_slice(&data_shards_u16.to_le_bytes());
+        header.extend_from_slice(&recovery_shards_u16.to_le_bytes());
+        header.extend_from_slice(
             &u16::try_from(shard_index)
                 .map_err(|_| Error::PlanOverflow)?
                 .to_le_bytes(),
         );
-        for &state in &data_shard_states {
-            out.extend_from_slice(&state.to_le_bytes());
+        for &state in &shard_states {
+            header.extend_from_slice(&state.to_le_bytes());
         }
-        out.extend_from_slice(&final_state.to_le_bytes());
-        if out.len() - chunk_start != header_size {
-            return Err(Error::PlanOverflow);
-        }
-        out.extend_from_slice(payload);
-        if out.len() - chunk_start != shard_size {
+        header.extend_from_slice(&final_state.to_le_bytes());
+        if header.len() != header_size {
             return Err(Error::PlanOverflow);
         }
 
-        let chunk_end = chunk_start
-            .checked_add(shard_size)
-            .ok_or(Error::PlanOverflow)?;
-        let crc_start = chunk_start.checked_add(0x0c).ok_or(Error::PlanOverflow)?;
-        let crc = crc64_xz(out.get(crc_start..chunk_end).ok_or(Error::PlanOverflow)?);
-        let crc_field_start = chunk_start.checked_add(0x04).ok_or(Error::PlanOverflow)?;
-        let crc_field_end = chunk_start.checked_add(0x0c).ok_or(Error::PlanOverflow)?;
-        out.get_mut(crc_field_start..crc_field_end)
-            .ok_or(Error::PlanOverflow)?
-            .copy_from_slice(&crc.to_le_bytes());
+        // The chunk CRC covers everything from 0x0c onwards, so compute it
+        // over the header and the parity row before either is emitted.
+        let mut chunk_crc = crc64_update(&header[0x0c..], CRC64_XZ_INIT);
+        rows.for_each_chunk(shard_index, &mut buffer, |chunk| {
+            chunk_crc = crc64_update(chunk, chunk_crc);
+        })?;
+        header[0x04..0x0c].copy_from_slice(&(chunk_crc ^ CRC64_XZ_INIT).to_le_bytes());
+
+        sink.write_all(&header)?;
+        payload_crc32.update(&header);
+        written += header.len() as u64;
+
+        let mut row_written = 0u64;
+        let mut sink_error = None;
+        rows.for_each_chunk(shard_index, &mut buffer, |chunk| {
+            if sink_error.is_some() {
+                return;
+            }
+            if let Err(error) = sink.write_all(chunk) {
+                sink_error = Some(error);
+                return;
+            }
+            payload_crc32.update(chunk);
+            row_written += chunk.len() as u64;
+        })?;
+        if let Some(error) = sink_error {
+            return Err(error.into());
+        }
+        if row_written != plan.group_count {
+            return Err(Error::PlanOverflow);
+        }
+        written += row_written;
+
+        report(encode_units + (shard_index as u64 + 1) * plan.header_size);
     }
-    if out.len() != total_len {
+
+    if written != payload_len {
         return Err(Error::PlanOverflow);
     }
-    debug_assert_eq!(parity.len(), recovery_shards);
-    debug_assert_eq!(data_shard_states.len(), data_shards);
-    Ok(out)
+    if let Some(progress) = progress {
+        progress.report(WriteProgressEvent::OperationFinished {
+            operation: WriteOperation::Recovery,
+            total_bytes: Some(payload_len),
+            total_entries: None,
+            pass,
+        });
+    }
+
+    Ok(StreamedRecoveryOutput {
+        plan,
+        payload_len,
+        payload_crc32: payload_crc32.finish(),
+    })
+}
+
+/// Parity rows, wherever they happen to live.
+enum ParityRows<'a> {
+    Resident(Vec<Vec<u8>>),
+    Spooled {
+        scratch: &'a mut dyn ReadWriteSeek,
+        group_count: u64,
+    },
+}
+
+impl ParityRows<'_> {
+    /// Feeds row `index` to `visit` in buffer-sized pieces.
+    fn for_each_chunk(
+        &mut self,
+        index: usize,
+        buffer: &mut [u8],
+        mut visit: impl FnMut(&[u8]),
+    ) -> Result<()> {
+        match self {
+            Self::Resident(rows) => {
+                let row = rows.get(index).ok_or(Error::PlanOverflow)?;
+                if !row.is_empty() {
+                    visit(row);
+                }
+                Ok(())
+            }
+            Self::Spooled {
+                scratch,
+                group_count,
+            } => {
+                if buffer.is_empty() {
+                    return Ok(());
+                }
+                let start = (index as u64)
+                    .checked_mul(*group_count)
+                    .ok_or(Error::PlanOverflow)?;
+                scratch.seek(std::io::SeekFrom::Start(start))?;
+                let mut remaining = *group_count;
+                while remaining != 0 {
+                    let want = usize::try_from(remaining.min(buffer.len() as u64))
+                        .map_err(|_| Error::PlanOverflow)?;
+                    scratch.read_exact(&mut buffer[..want])?;
+                    visit(&buffer[..want]);
+                    remaining -= want as u64;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Accumulates `coefficient * source` into `destination` over GF(2^16).
+///
+/// A trailing odd byte is treated as the low half of a word whose high half is
+/// the zero padding every shard carries.
+fn accumulate_scaled(destination: &mut [u8], source: &[u8], coefficient: u16, gf: &Gf16) {
+    let words = source.len() / 2;
+    for word in 0..words {
+        let offset = word * 2;
+        let value = u16::from_le_bytes([source[offset], source[offset + 1]]);
+        let scaled = gf.mul(coefficient, value);
+        if scaled == 0 {
+            continue;
+        }
+        let current = u16::from_le_bytes([destination[offset], destination[offset + 1]]);
+        destination[offset..offset + 2].copy_from_slice(&(current ^ scaled).to_le_bytes());
+    }
+    if !source.len().is_multiple_of(2) {
+        let offset = words * 2;
+        let value = u16::from_le_bytes([source[offset], 0]);
+        let scaled = gf.mul(coefficient, value);
+        if scaled != 0 {
+            let current = u16::from_le_bytes([destination[offset], destination[offset + 1]]);
+            destination[offset..offset + 2].copy_from_slice(&(current ^ scaled).to_le_bytes());
+        }
+    }
+}
+
+/// Single forward pass over the body, holding every parity row in memory.
+fn encode_parity_resident(
+    body: &mut dyn ReadSeek,
+    body_len: u64,
+    plan: &InlineRecoveryPlan,
+    matrix: &[Vec<u16>],
+    shard_states: &mut [u64],
+    encode_units: u64,
+    report: &dyn Fn(u64),
+) -> Result<Vec<Vec<u8>>> {
+    let group_count = usize::try_from(plan.group_count).map_err(|_| Error::PlanOverflow)?;
+    let recovery_shards = usize::try_from(plan.recovery_shards).map_err(|_| Error::PlanOverflow)?;
+    let mut parity = vec![vec![0u8; group_count]; recovery_shards];
+    if group_count == 0 || body_len == 0 {
+        return Ok(parity);
+    }
+
+    let gf = shared_gf16();
+    let mut buffer = vec![0u8; RECOVERY_IO_BLOCK.min(group_count)];
+    body.seek(std::io::SeekFrom::Start(0))?;
+
+    let mut consumed = 0u64;
+    for (shard_index, state) in shard_states.iter_mut().enumerate() {
+        let shard_start = (shard_index as u64)
+            .checked_mul(plan.group_count)
+            .ok_or(Error::PlanOverflow)?;
+        if shard_start >= body_len {
+            break;
+        }
+        let shard_bytes = plan.group_count.min(body_len - shard_start);
+
+        let mut offset = 0u64;
+        while offset < shard_bytes {
+            let want = usize::try_from((shard_bytes - offset).min(buffer.len() as u64))
+                .map_err(|_| Error::PlanOverflow)?;
+            body.read_exact(&mut buffer[..want])?;
+            *state = crc64_update(&buffer[..want], *state);
+
+            let destination_offset = usize::try_from(offset).map_err(|_| Error::PlanOverflow)?;
+            for (row, parity_row) in matrix.iter().zip(parity.iter_mut()) {
+                accumulate_scaled(
+                    &mut parity_row[destination_offset..],
+                    &buffer[..want],
+                    row[shard_index],
+                    gf,
+                );
+            }
+
+            offset += want as u64;
+            consumed += want as u64;
+            report(scaled_progress(consumed, body_len, encode_units));
+        }
+    }
+
+    Ok(parity)
+}
+
+/// Column-stripe pass: bounded memory, one seek per data shard per stripe,
+/// and the body still read exactly once in total.
+#[allow(clippy::too_many_arguments)]
+fn encode_parity_striped(
+    body: &mut dyn ReadSeek,
+    body_len: u64,
+    plan: &InlineRecoveryPlan,
+    matrix: &[Vec<u16>],
+    shard_states: &mut [u64],
+    stripe_len: usize,
+    scratch: &mut dyn ReadWriteSeek,
+    encode_units: u64,
+    report: &dyn Fn(u64),
+) -> Result<()> {
+    let recovery_shards = usize::try_from(plan.recovery_shards).map_err(|_| Error::PlanOverflow)?;
+    if plan.group_count == 0 {
+        return Ok(());
+    }
+    let stripe_len = stripe_len.max(2);
+    let gf = shared_gf16();
+    let mut stripe = vec![vec![0u8; stripe_len]; recovery_shards];
+    let mut buffer = vec![0u8; stripe_len];
+    let mut consumed = 0u64;
+
+    let mut column = 0u64;
+    while column < plan.group_count {
+        let width = (plan.group_count - column).min(stripe_len as u64);
+        let width_usize = usize::try_from(width).map_err(|_| Error::PlanOverflow)?;
+        for row in stripe.iter_mut() {
+            row[..width_usize].fill(0);
+        }
+
+        for (shard_index, state) in shard_states.iter_mut().enumerate() {
+            let shard_start = (shard_index as u64)
+                .checked_mul(plan.group_count)
+                .ok_or(Error::PlanOverflow)?;
+            let shard_bytes = plan.group_count.min(body_len.saturating_sub(shard_start));
+            if column >= shard_bytes {
+                continue;
+            }
+            let span = width.min(shard_bytes - column);
+            let span_usize = usize::try_from(span).map_err(|_| Error::PlanOverflow)?;
+
+            body.seek(std::io::SeekFrom::Start(shard_start + column))?;
+            body.read_exact(&mut buffer[..span_usize])?;
+            *state = crc64_update(&buffer[..span_usize], *state);
+
+            for (row, stripe_row) in matrix.iter().zip(stripe.iter_mut()) {
+                accumulate_scaled(stripe_row, &buffer[..span_usize], row[shard_index], gf);
+            }
+
+            consumed += span;
+            report(scaled_progress(consumed, body_len, encode_units));
+        }
+
+        for (shard_index, stripe_row) in stripe.iter().enumerate() {
+            let position = (shard_index as u64)
+                .checked_mul(plan.group_count)
+                .and_then(|start| start.checked_add(column))
+                .ok_or(Error::PlanOverflow)?;
+            scratch.seek(std::io::SeekFrom::Start(position))?;
+            scratch.write_all(&stripe_row[..width_usize])?;
+        }
+
+        column += width;
+    }
+
+    Ok(())
+}
+
+fn scaled_progress(consumed: u64, total: u64, units: u64) -> u64 {
+    if total == 0 {
+        return units;
+    }
+    ((consumed as u128 * units as u128) / total as u128) as u64
 }
 
 #[derive(Debug, Clone)]
@@ -977,6 +1401,99 @@ fn encode_parity_shards_with_progress(
     Ok(parity)
 }
 
+/// The pre-streaming recovery writer, kept verbatim as the oracle for
+/// byte-identity tests. If these two ever disagree, the streaming rewrite has
+/// changed the format.
+#[cfg(test)]
+mod legacy_reference {
+    use super::*;
+
+    pub(super) fn build_structural_inline_recovery_data(
+        archive_prefix: &[u8],
+        recovery_percent: u64,
+    ) -> Result<Vec<u8>> {
+        let (plan, parity) = encode_inline_recovery_parity(archive_prefix, recovery_percent)?;
+        let shard_ranges = split_prefix_shard_ranges(archive_prefix.len(), plan)?;
+        let total_len = usize::try_from(plan.payload_size()?).map_err(|_| Error::PlanOverflow)?;
+        let header_size = usize::try_from(plan.header_size).map_err(|_| Error::PlanOverflow)?;
+        let shard_size = usize::try_from(plan.shard_size).map_err(|_| Error::PlanOverflow)?;
+        let data_shards = usize::try_from(plan.data_shards).map_err(|_| Error::PlanOverflow)?;
+        let recovery_shards =
+            usize::try_from(plan.recovery_shards).map_err(|_| Error::PlanOverflow)?;
+        let total_size = u32::try_from(plan.shard_size).map_err(|_| Error::PlanOverflow)?;
+        let header_size_u32 = u32::try_from(plan.header_size).map_err(|_| Error::PlanOverflow)?;
+        let data_shards_u16 = u16::try_from(plan.data_shards).map_err(|_| Error::PlanOverflow)?;
+        let recovery_shards_u16 =
+            u16::try_from(plan.recovery_shards).map_err(|_| Error::PlanOverflow)?;
+        let chunk_data_extent = shard_ranges.last().map_or(0usize, std::ops::Range::len);
+        let chunk_data_extent_u32 =
+            u32::try_from(chunk_data_extent).map_err(|_| Error::PlanOverflow)?;
+        let data_shard_states: Vec<u64> = shard_ranges
+            .iter()
+            .map(|range| crc64_rar_state(&archive_prefix[range.clone()]))
+            .collect();
+        let final_state = parity
+            .first()
+            .map(|payload| crc64_rar_state(payload))
+            .unwrap_or(0);
+
+        let mut out = Vec::with_capacity(total_len);
+        for (shard_index, payload) in parity.iter().enumerate() {
+            if payload.len() + header_size != shard_size {
+                return Err(Error::PlanOverflow);
+            }
+
+            let chunk_start = out.len();
+            out.extend_from_slice(b"{RB}");
+            out.extend_from_slice(&0u64.to_le_bytes());
+            out.extend_from_slice(&total_size.to_le_bytes());
+            out.extend_from_slice(&header_size_u32.to_le_bytes());
+            out.push(1);
+            out.push(1);
+            out.extend_from_slice(&0u64.to_le_bytes());
+            out.extend_from_slice(&chunk_data_extent_u32.to_le_bytes());
+            out.extend_from_slice(&(archive_prefix.len() as u64).to_le_bytes());
+            out.extend_from_slice(&plan.group_count.to_le_bytes());
+            out.extend_from_slice(&plan.shard_size.to_le_bytes());
+            out.extend_from_slice(&data_shards_u16.to_le_bytes());
+            out.extend_from_slice(&recovery_shards_u16.to_le_bytes());
+            out.extend_from_slice(
+                &u16::try_from(shard_index)
+                    .map_err(|_| Error::PlanOverflow)?
+                    .to_le_bytes(),
+            );
+            for &state in &data_shard_states {
+                out.extend_from_slice(&state.to_le_bytes());
+            }
+            out.extend_from_slice(&final_state.to_le_bytes());
+            if out.len() - chunk_start != header_size {
+                return Err(Error::PlanOverflow);
+            }
+            out.extend_from_slice(payload);
+            if out.len() - chunk_start != shard_size {
+                return Err(Error::PlanOverflow);
+            }
+
+            let chunk_end = chunk_start
+                .checked_add(shard_size)
+                .ok_or(Error::PlanOverflow)?;
+            let crc_start = chunk_start.checked_add(0x0c).ok_or(Error::PlanOverflow)?;
+            let crc = crc64_xz(out.get(crc_start..chunk_end).ok_or(Error::PlanOverflow)?);
+            let crc_field_start = chunk_start.checked_add(0x04).ok_or(Error::PlanOverflow)?;
+            let crc_field_end = chunk_start.checked_add(0x0c).ok_or(Error::PlanOverflow)?;
+            out.get_mut(crc_field_start..crc_field_end)
+                .ok_or(Error::PlanOverflow)?
+                .copy_from_slice(&crc.to_le_bytes());
+        }
+        if out.len() != total_len {
+            return Err(Error::PlanOverflow);
+        }
+        debug_assert_eq!(parity.len(), recovery_shards);
+        debug_assert_eq!(data_shard_states.len(), data_shards);
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -987,6 +1504,130 @@ mod tests {
         repair_inline_recovery_prefix_shards, shared_gf16, split_prefix_shard_ranges,
         split_prefix_shards, Error, Gf16, InlineRecoveryPlan, MAX_WINRAR602_DATA_SHARDS,
     };
+
+    fn recovery_test_bytes(len: usize, seed: u32) -> Vec<u8> {
+        let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+        (0..len)
+            .map(|index| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                if index % 5 == 0 {
+                    (index % 251) as u8
+                } else {
+                    (state >> 24) as u8
+                }
+            })
+            .collect()
+    }
+
+    /// Sizes and percentages that between them cover an empty body, odd tails,
+    /// the sub-200 KiB shard formula, the 200-shard switchover, and a body big
+    /// enough to need many stripes.
+    const RECOVERY_CASES: &[usize] = &[
+        0,
+        1,
+        2,
+        3,
+        1023,
+        1024,
+        1025,
+        2050,
+        200 * 1024 - 1,
+        200 * 1024,
+        200 * 1024 + 1,
+        1024 * 1024 + 7,
+    ];
+
+    #[test]
+    fn streamed_recovery_matches_the_legacy_writer_byte_for_byte() {
+        for &len in RECOVERY_CASES {
+            let body = recovery_test_bytes(len, len as u32);
+            // High percentages on the large cases cost O(shards^2) work for no
+            // extra coverage: the geometry is already pinned by the small ones.
+            let percents: &[u64] = if len < 200 * 1024 {
+                &[1, 5, 10, 50, 100]
+            } else {
+                &[1, 10]
+            };
+            for &percent in percents {
+                let expected =
+                    super::legacy_reference::build_structural_inline_recovery_data(&body, percent)
+                        .unwrap();
+                let produced = build_structural_inline_recovery_data(&body, percent).unwrap();
+                assert_eq!(
+                    produced, expected,
+                    "streamed output differs for {len} bytes at {percent}%"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn striped_recovery_matches_resident_recovery_byte_for_byte() {
+        // Small bodies get a deliberately tiny stripe so stripe boundaries land
+        // everywhere; large ones use a realistic stripe, since their job is to
+        // cover the 200-shard geometry rather than boundary arithmetic.
+        for &len in RECOVERY_CASES {
+            let body = recovery_test_bytes(len, len as u32 ^ 0x5555);
+            let (stripe_len, percents): (usize, &[u64]) = if len <= 4096 {
+                (64, &[1, 10, 100])
+            } else {
+                (4096, &[1, 10])
+            };
+            for &percent in percents {
+                let expected = build_structural_inline_recovery_data(&body, percent).unwrap();
+
+                let plan = plan_inline_recovery(body.len() as u64, percent).unwrap();
+                let mut scratch = std::io::Cursor::new(vec![
+                    0u8;
+                    (plan.recovery_shards * plan.group_count)
+                        as usize
+                ]);
+                let mut produced = Vec::new();
+                let output = super::build_streamed_inline_recovery(
+                    &mut std::io::Cursor::new(&body),
+                    body.len() as u64,
+                    percent,
+                    super::RecoveryMemoryMode::Striped { stripe_len },
+                    Some(&mut scratch),
+                    &mut produced,
+                    None,
+                    1,
+                )
+                .unwrap();
+
+                assert_eq!(
+                    produced, expected,
+                    "striped output differs for {len} bytes at {percent}%"
+                );
+                assert_eq!(output.plan, plan);
+                assert_eq!(output.payload_len, produced.len() as u64);
+                assert_eq!(output.payload_crc32, crate::crc32::crc32(&produced));
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_memory_mode_switches_to_striping_under_pressure() {
+        let plan = plan_inline_recovery(4 * 1024 * 1024, 10).unwrap();
+        let parity_bytes = plan.recovery_shards * plan.group_count;
+
+        let (mode, required) =
+            super::choose_recovery_memory_mode(plan, parity_bytes + 1024 * 1024).unwrap();
+        assert_eq!(mode, super::RecoveryMemoryMode::Resident);
+        assert!(required >= parity_bytes);
+
+        let limit = parity_bytes / 2;
+        let (mode, required) = super::choose_recovery_memory_mode(plan, limit).unwrap();
+        let super::RecoveryMemoryMode::Striped { stripe_len } = mode else {
+            panic!("expected striped mode when parity does not fit");
+        };
+        assert!(stripe_len.is_multiple_of(2), "stripes must be word aligned");
+        assert!(
+            required <= limit,
+            "striping must fit the budget it was given: {required} > {limit}"
+        );
+        assert!(required < parity_bytes);
+    }
 
     #[test]
     fn rar5_inline_recovery_plan_matches_fixture_formula_examples() {
