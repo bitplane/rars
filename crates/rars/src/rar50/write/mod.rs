@@ -22,7 +22,7 @@ use filter_policy::{
     compression_info, compression_method_for_level, dictionary_size_for_options,
     encode_option_candidates_for_level, encode_options_for_level,
     encode_safe_lz_member_with_progress, encode_with_solid_reset_policy_and_progress,
-    filter_policy_attempt_count, rar50_algorithm_version, should_store_compressed_payload,
+    filter_policy_walk_bytes, rar50_algorithm_version, should_store_compressed_payload,
     validate_compression_level,
 };
 use headers::{

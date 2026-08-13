@@ -202,24 +202,32 @@ fn compress_members_whole(
                             "entry source size changed while compressing",
                         ));
                     }
-                    // The encoder walks the member once per attempt, so its
-                    // positions are scaled down to the member's share of the
-                    // total: many passes, one member's worth of progress.
-                    let attempts = super::filter_policy_attempt_count(&data, plan.filter_policy)
-                        .max(1)
-                        * plan.candidates.len().max(1) as u64;
+                    // The filter search walks the member many times over, so
+                    // encoder positions are scaled down to the member's share
+                    // of that total: many passes, one member's worth of
+                    // progress.
+                    let walk = super::filter_policy_walk_bytes(
+                        &data,
+                        plan.filter_policy,
+                        plan.candidates.len(),
+                    )
+                    .max(input_size)
+                    .max(1);
+                    let share = |bytes: u64| {
+                        (u128::from(bytes) * u128::from(input_size) / u128::from(walk)) as u64
+                    };
                     let mut reported = 0u64;
                     let mut charged = 0u64;
                     let mut report = |position: usize| {
                         let position = position as u64;
                         if position < reported {
-                            // A new attempt restarted at the beginning.
+                            // A new pass restarted at the beginning.
                             reported = 0;
                         }
                         let delta = position - reported;
                         reported = position;
-                        let target = (charged + delta).min(input_size.saturating_mul(attempts));
-                        let scaled = target / attempts - charged / attempts;
+                        let target = (charged + delta).min(walk);
+                        let scaled = share(target) - share(charged);
                         charged = target;
                         advance(scaled)
                     };
