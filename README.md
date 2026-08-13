@@ -43,9 +43,18 @@ The writer supports stored and compressed members, split volumes, passwords,
 header encryption where implemented, comments, RARVM filters, RAR5 quick-open
 records, and supported recovery records. Run `rars --help` for more info.
 
-By default, `--memory-limit` is set to 256MB and the number of `--threads` is
-your core count. This might limit compression on machines with lots of CPU
-cores; experiment and override as required.
+RAR 5 and RAR 7 archives are written in a single pass without being held in
+memory, so the peak stays flat whatever the inputs weigh. Members compress into
+temporary files under `--temp-dir`, and `--memory-limit` (256MB by default)
+bounds the working set: raise it to compress more blocks at once, which on a
+machine with many cores is what limits throughput. The number of `--threads`
+defaults to your core count.
+
+Two things still need a whole member in memory, and fall back to streaming
+without it when the budget is too small to allow it: choosing a data filter,
+and comparing candidate settings at `--level 5`. Per-file comments, PPMd and
+the RAR 1.3-4.x formats still assemble archives in memory; the CLI warns
+before doing that with a large input.
 
 
 ## Python bindings
