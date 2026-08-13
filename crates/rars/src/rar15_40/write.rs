@@ -11,7 +11,7 @@ use crate::codec::rar29::{
     unpack29_encode_literals_with_options_and_progress, unpack29_encode_ppmd,
     unpack29_encode_ppmd_with_filter, EncodeOptions as Rar29EncodeOptions, Unpack29Encoder,
 };
-pub use crate::filter::{FilterKind, FilterSpec};
+pub use crate::filter::{FilterKind, FilterPolicy, FilterSpec};
 use crate::io_util::align16 as checked_align16;
 use crate::write_progress::{ProgressReporter, WorkTracker};
 use crate::x86_filter_scan::auto_x86_filter_ranges;
@@ -158,16 +158,6 @@ fn write_compressed_archive_with_comment_impl(
     Ok(out)
 }
 
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub enum FilterPolicy {
-    Lz,
-    Auto,
-    Explicit(FilterSpec),
-    Ppmd,
-    PpmdFiltered(FilterSpec),
-}
-
 pub fn write_rar29_compressed_archive_with_filter_policy(
     entries: &[FileEntry<'_>],
     options: WriterOptions,
@@ -184,21 +174,35 @@ pub fn write_rar29_compressed_archive_with_filter_policy_and_progress(
 ) -> Result<Vec<u8>> {
     let total_bytes = entries.iter().map(|entry| entry.data.len() as u64).sum();
     report_compression_operation(progress, true, total_bytes, entries.len());
-    validate_rar29_filter_policy(&policy)?;
+    validate_rar29_filter_policy(&policy, options.method)?;
     let encode_options = rar29_encode_options_for_options(options)?;
     let lz_method = compression_method_for_level(options)?;
     let result = write_rar29_filtered_archive(entries, options, |entry| {
-        encode_rar29_policy_filtered_payload(entry.data, &policy, encode_options, lz_method)
+        encode_rar29_policy_filtered_payload(
+            entry.data,
+            &policy,
+            options.method,
+            encode_options,
+            lz_method,
+            ppmd_trial_pays(options.compression_level),
+        )
     });
     report_compression_operation(progress, false, total_bytes, entries.len());
     result
 }
 
+/// Encodes one member, choosing an engine and a filter independently.
+///
+/// The two are separate questions: which engine compresses this content best,
+/// and which transform makes it easier to compress. They used to be one enum,
+/// which meant some combinations simply could not be asked for.
 fn encode_rar29_policy_filtered_payload(
     data: &[u8],
     policy: &FilterPolicy,
+    method: Rar29Method,
     options: Rar29EncodeOptions,
     lz_method: u8,
+    ppmd_trial: bool,
 ) -> Result<EncodedPayload> {
     if lz_method == 0x30 {
         return Ok(EncodedPayload {
@@ -206,28 +210,71 @@ fn encode_rar29_policy_filtered_payload(
             method: 0x30,
         });
     }
-    match policy {
-        FilterPolicy::Lz => encode_rar29_lz_member(data, options, lz_method),
-        FilterPolicy::Auto => encode_rar29_auto_filtered_member(data, options, lz_method, true),
-        FilterPolicy::Explicit(filter) => Ok(EncodedPayload {
-            data: encode_rar29_filtered_member(data, filter.clone(), options)?,
-            method: lz_method,
-        }),
-        FilterPolicy::Ppmd => Ok(EncodedPayload {
+    let ppmd = |data: &[u8]| -> Result<EncodedPayload> {
+        Ok(EncodedPayload {
             data: unpack29_encode_ppmd(data).map_err(Error::from)?,
             method: 0x35,
-        }),
-        FilterPolicy::PpmdFiltered(filter) => Ok(EncodedPayload {
+        })
+    };
+    match (method, policy) {
+        (Rar29Method::Ppmd, FilterPolicy::None) => ppmd(data),
+        (Rar29Method::Ppmd, FilterPolicy::Explicit(filter)) => Ok(EncodedPayload {
             data: unpack29_encode_ppmd_with_filter(data, filter.clone()).map_err(Error::from)?,
             method: 0x35,
         }),
+        // Rejected by validate_rar29_filter_policy before any encoding starts.
+        (Rar29Method::Ppmd, FilterPolicy::Auto) => Err(Error::InvalidHeader(
+            "RAR 2.9 cannot search for a filter while PPMd is forced",
+        )),
+        (Rar29Method::Lz, FilterPolicy::None) => encode_rar29_lz_member(data, options, lz_method),
+        (Rar29Method::Lz, FilterPolicy::Auto) => {
+            encode_rar29_auto_filtered_member(data, options, lz_method, false)
+        }
+        (Rar29Method::Lz, FilterPolicy::Explicit(filter)) => Ok(EncodedPayload {
+            data: encode_rar29_filtered_member(data, filter.clone(), options)?,
+            method: lz_method,
+        }),
+        (Rar29Method::Auto, FilterPolicy::Auto) => {
+            encode_rar29_auto_filtered_member(data, options, lz_method, ppmd_trial)
+        }
+        (Rar29Method::Auto, policy) => {
+            let mut best = match policy {
+                FilterPolicy::Explicit(filter) => EncodedPayload {
+                    data: encode_rar29_filtered_member(data, filter.clone(), options)?,
+                    method: lz_method,
+                },
+                _ => encode_rar29_lz_member(data, options, lz_method)?,
+            };
+            // Gated on the content, so a binary member never pays for a PPMd
+            // encode it was always going to lose.
+            if ppmd_trial && is_auto_ppmd_candidate(data) {
+                let candidate = ppmd(data)?;
+                if candidate.data.len() < best.data.len() {
+                    best = candidate;
+                }
+            }
+            Ok(best)
+        }
     }
 }
 
-fn validate_rar29_filter_policy(policy: &FilterPolicy) -> Result<()> {
+/// Levels 1 to 4 are asking for speed, so they skip the PPMd trial the way they
+/// always have.
+fn ppmd_trial_pays(level: Option<u8>) -> bool {
+    !matches!(level, Some(1..=4))
+}
+
+fn validate_rar29_filter_policy(policy: &FilterPolicy, method: Rar29Method) -> Result<()> {
+    // Searching for a filter means measuring candidates against each other,
+    // and the search only knows how to measure them through LZ.
+    if matches!(policy, FilterPolicy::Auto) && method == Rar29Method::Ppmd {
+        return Err(Error::InvalidHeader(
+            "RAR 2.9 cannot search for a filter while PPMd is forced",
+        ));
+    }
     let filter = match policy {
-        FilterPolicy::Explicit(filter) | FilterPolicy::PpmdFiltered(filter) => filter,
-        FilterPolicy::Lz | FilterPolicy::Auto | FilterPolicy::Ppmd => return Ok(()),
+        FilterPolicy::Explicit(filter) => filter,
+        FilterPolicy::None | FilterPolicy::Auto => return Ok(()),
     };
     match filter.kind {
         FilterKind::Delta { channels } => {
@@ -1224,10 +1271,20 @@ fn encode_or_store_payload(
     {
         let encode_options = rar29_encode_options_for_options(options)?;
         let lz_method = compression_method_for_level(options)?;
-        if matches!(options.compression_level, Some(1..=4)) {
-            return encode_rar29_auto_filtered_member(data, encode_options, lz_method, false);
-        }
-        return encode_rar29_auto_filtered_member(data, encode_options, lz_method, true);
+        // Forcing PPMd leaves nothing for a filter search to measure against.
+        let policy = if options.method == Rar29Method::Ppmd {
+            FilterPolicy::None
+        } else {
+            FilterPolicy::Auto
+        };
+        return encode_rar29_policy_filtered_payload(
+            data,
+            &policy,
+            options.method,
+            encode_options,
+            lz_method,
+            ppmd_trial_pays(options.compression_level),
+        );
     }
     let compressed = encode_compressed_payload(data, options, solid_encoder.as_mut(), progress)?;
     if should_store_fallback(target, solid, data.len(), compressed.len()) {
@@ -2002,6 +2059,7 @@ fn write_header_encrypted_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<
             },
             compression_level: None,
             dictionary_size: None,
+            method: Rar29Method::Auto,
         },
         false,
         entry.main_flags & MHD_SOLID != 0,

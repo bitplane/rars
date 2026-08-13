@@ -4,7 +4,7 @@ use rars::rar15_40::{
     write_compressed_archive_with_comment, write_compressed_volumes,
     write_rar29_compressed_archive_with_filter_policy, write_stored_archive,
     write_stored_archive_with_comment, write_stored_volumes, Archive, Block, FileEntry, FilterKind,
-    FilterPolicy, FilterSpec, NewSubKind, ProtectHeader, StoredEntry, WriterOptions,
+    FilterPolicy, FilterSpec, NewSubKind, ProtectHeader, Rar29Method, StoredEntry, WriterOptions,
 };
 use rars::{
     detect_archive_family, ArchiveFamily, ArchiveReadOptions, ArchiveVersion, Error, FeatureSet,
@@ -3250,9 +3250,12 @@ fn default_rar29_writer_uses_auto_policy_for_audio_shaped_data() {
         FilterPolicy::Explicit(FilterSpec::whole(FilterKind::Audio { channels: 4 })),
     )
     .unwrap();
-    let ppmd =
-        write_rar29_compressed_archive_with_filter_policy(&entries, options, FilterPolicy::Ppmd)
-            .unwrap();
+    let ppmd = write_rar29_compressed_archive_with_filter_policy(
+        &entries,
+        options.with_method(Rar29Method::Ppmd),
+        FilterPolicy::None,
+    )
+    .unwrap();
     let default_archive = Archive::parse(&default).unwrap();
     let audio_archive = Archive::parse(&explicit_audio).unwrap();
     let ppmd_archive = Archive::parse(&ppmd).unwrap();
@@ -3342,8 +3345,9 @@ fn ppmd_rar29_writer_emits_method_35_member() {
 
     let bytes = write_rar29_compressed_archive_with_filter_policy(
         &entries,
-        WriterOptions::new(ArchiveVersion::Rar29, FeatureSet::store_only()),
-        FilterPolicy::Ppmd,
+        WriterOptions::new(ArchiveVersion::Rar29, FeatureSet::store_only())
+            .with_method(Rar29Method::Ppmd),
+        FilterPolicy::None,
     )
     .unwrap();
     let archive = Archive::parse(&bytes).unwrap();
@@ -3377,9 +3381,12 @@ fn ppmd_rar29_writer_uses_period_compatible_lz_escapes_for_repeated_data() {
     }];
     let options = WriterOptions::new(ArchiveVersion::Rar29, FeatureSet::store_only());
 
-    let ppmd =
-        write_rar29_compressed_archive_with_filter_policy(&entries, options, FilterPolicy::Ppmd)
-            .unwrap();
+    let ppmd = write_rar29_compressed_archive_with_filter_policy(
+        &entries,
+        options.with_method(Rar29Method::Ppmd),
+        FilterPolicy::None,
+    )
+    .unwrap();
     let codec_packed = rars::codec::rar29::unpack29_encode_ppmd(&payload).unwrap();
     let archive = Archive::parse(&ppmd).unwrap();
     let file = archive.files().next().unwrap();
@@ -3404,8 +3411,9 @@ fn ppmd_rar29_writer_embeds_vm_filter_record() {
 
     let bytes = write_rar29_compressed_archive_with_filter_policy(
         &entries,
-        WriterOptions::new(ArchiveVersion::Rar29, FeatureSet::store_only()),
-        FilterPolicy::PpmdFiltered(FilterSpec::whole(FilterKind::E8)),
+        WriterOptions::new(ArchiveVersion::Rar29, FeatureSet::store_only())
+            .with_method(Rar29Method::Ppmd),
+        FilterPolicy::explicit(FilterKind::E8),
     )
     .unwrap();
     let archive = Archive::parse(&bytes).unwrap();
@@ -6039,4 +6047,63 @@ fn expected_rar250_big_lz_payload() -> Vec<u8> {
         data.extend_from_slice(&[(i * 17) as u8, (i * 31) as u8, b'\r', b'\n']);
     }
     data
+}
+
+/// The engine and the filter used to be one five-variant enum, so some pairings
+/// could not be asked for at all. These are the ones that were missing.
+#[test]
+fn rar29_chooses_engine_and_filter_independently() {
+    // Text, so the PPMd trial is worth taking; the delta filter below is asked
+    // for explicitly rather than because it suits the content.
+    let payload = b"rar29 two axis payload alpha beta gamma delta epsilon\n".repeat(400);
+    let entries = [FileEntry {
+        name: b"two-axis.txt",
+        data: &payload,
+        file_time: 0x5a21_0000,
+        file_attr: 0x20,
+        host_os: 3,
+        password: None,
+        file_comment: None,
+    }];
+    let options = WriterOptions::new(ArchiveVersion::Rar29, FeatureSet::store_only());
+
+    let method_of = |options: WriterOptions, policy: FilterPolicy| {
+        let bytes =
+            write_rar29_compressed_archive_with_filter_policy(&entries, options, policy).unwrap();
+        let archive = Archive::parse(&bytes).unwrap();
+        let method = archive.files().next().unwrap().method;
+        let extracted = collect_extract(&archive).unwrap();
+        assert_eq!(
+            extracted[0].data, payload,
+            "round trip failed for {method:#x}"
+        );
+        method
+    };
+
+    // Searching for a filter with PPMd off: new, and the search must not reach
+    // for PPMd behind the caller's back.
+    assert_ne!(
+        method_of(options.with_method(Rar29Method::Lz), FilterPolicy::Auto),
+        0x35,
+        "forcing LZ must not produce a PPMd member"
+    );
+    // Weighing an explicitly named filter against PPMd: also new.
+    assert_eq!(
+        method_of(
+            options.with_method(Rar29Method::Auto),
+            FilterPolicy::explicit(FilterKind::Delta { channels: 2 })
+        ),
+        0x35,
+        "text with an explicit filter should still be allowed to pick PPMd"
+    );
+    // Forcing PPMd leaves the filter search nothing to measure against.
+    let refused = write_rar29_compressed_archive_with_filter_policy(
+        &entries,
+        options.with_method(Rar29Method::Ppmd),
+        FilterPolicy::Auto,
+    );
+    assert!(
+        refused.is_err(),
+        "PPMd plus a filter search must be refused"
+    );
 }

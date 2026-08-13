@@ -1314,8 +1314,8 @@ mod tests {
                 password: None,
                 file_comment: None,
             }],
-            rar15_options(ArchiveVersion::Rar29),
-            rar15_40::FilterPolicy::Ppmd,
+            rar15_options(ArchiveVersion::Rar29).with_method(rar15_40::Rar29Method::Ppmd),
+            rar15_40::FilterPolicy::None,
         )
         .unwrap();
 

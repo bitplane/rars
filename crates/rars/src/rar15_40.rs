@@ -194,6 +194,27 @@ pub struct WriterOptions {
     pub features: FeatureSet,
     pub compression_level: Option<u8>,
     pub dictionary_size: Option<usize>,
+    /// Which engine compresses a member. Only the RAR 2.9 family has more than
+    /// one, so the other targets ignore anything but the default.
+    pub method: Rar29Method,
+}
+
+/// Which compression engine the RAR 2.9 family writer uses for a member.
+///
+/// PPMd is an alternative to LZ, not a filter, even though the writer used to
+/// carry it as one. Keeping the two apart is what lets a filter be chosen
+/// without also deciding the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum Rar29Method {
+    /// Let the content decide. Text-shaped members are measured against PPMd;
+    /// anything else goes straight to LZ, so a binary member never pays for a
+    /// PPMd encode it was always going to lose. Compression levels 1 to 4 skip
+    /// the trial entirely, since those settings are asking for speed.
+    #[default]
+    Auto,
+    Lz,
+    Ppmd,
 }
 
 impl WriterOptions {
@@ -203,7 +224,13 @@ impl WriterOptions {
             features,
             compression_level: None,
             dictionary_size: None,
+            method: Rar29Method::Auto,
         }
+    }
+
+    pub const fn with_method(mut self, method: Rar29Method) -> Self {
+        self.method = method;
+        self
     }
 
     pub const fn with_compression_level(mut self, level: u8) -> Self {
@@ -224,6 +251,7 @@ impl Default for WriterOptions {
             features: FeatureSet::store_only(),
             compression_level: None,
             dictionary_size: None,
+            method: Rar29Method::Auto,
         }
     }
 }
@@ -2659,6 +2687,7 @@ mod tests {
                 features,
                 compression_level: None,
                 dictionary_size: None,
+                method: Rar29Method::Auto,
             },
         )
         .unwrap();

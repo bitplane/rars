@@ -1739,21 +1739,30 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
                         rars::rar15_40::FilterSpec::whole(rars::rar15_40::FilterKind::E8)
                     }
                 };
-                let policy = if ppmd
-                    && (delta_filter.is_some()
-                        || e8_filter.is_some()
-                        || itanium_filter
-                        || rgb_filter.is_some()
-                        || audio_filter.is_some())
-                {
-                    rars::rar15_40::FilterPolicy::PpmdFiltered(explicit_filter())
-                } else if ppmd {
-                    rars::rar15_40::FilterPolicy::Ppmd
-                } else if auto_filter {
+                // The engine and the filter are separate choices now, so the
+                // flags map onto them separately rather than onto one of five
+                // combined policies.
+                let explicit_filter_asked = delta_filter.is_some()
+                    || e8_filter.is_some()
+                    || itanium_filter
+                    || rgb_filter.is_some()
+                    || audio_filter.is_some();
+                let policy = if auto_filter {
                     rars::rar15_40::FilterPolicy::Auto
-                } else {
+                } else if explicit_filter_asked {
                     rars::rar15_40::FilterPolicy::Explicit(explicit_filter())
+                } else {
+                    rars::rar15_40::FilterPolicy::None
                 };
+                let options = options.with_method(if ppmd {
+                    rars::rar15_40::Rar29Method::Ppmd
+                } else if explicit_filter_asked {
+                    // An explicitly named filter is a request for that filter,
+                    // not an invitation to weigh it against another engine.
+                    rars::rar15_40::Rar29Method::Lz
+                } else {
+                    rars::rar15_40::Rar29Method::Auto
+                });
                 rars::rar15_40::write_rar29_compressed_archive_with_filter_policy_and_progress(
                     &entries,
                     options,
