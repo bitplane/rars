@@ -712,31 +712,51 @@ impl RarBuilder {
 }
 
 impl RarBuilder {
+    /// Everything the streaming writer serves, which for RAR 5 and RAR 7 is
+    /// now everything the builder can ask for except volume sets, which have
+    /// their own entry point.
     fn streaming_rar50_supported(&self) -> bool {
         matches!(
             self.format,
             rars_rs::ArchiveVersion::Rar50 | rars_rs::ArchiveVersion::Rar70
-        ) && !self.solid
-            && !self.encrypt_headers
-            && self.comment.is_none()
-            && self.recovery_percent.is_none()
-            && self.volume_size.is_none()
+        ) && self.volume_size.is_none()
+            && (!self.encrypt_headers || self.password.is_some())
     }
 
-    fn streaming_entries(&self) -> Vec<rars_rs::rar50::StreamingCompressedEntry> {
+    fn streaming_archive_entries(&self) -> Vec<rars_rs::rar50::ArchiveEntry> {
         self.entries
             .iter()
-            .map(|entry| rars_rs::rar50::StreamingCompressedEntry {
-                name: entry.name.clone(),
-                source: match &entry.source {
-                    Some(source) => source.clone(),
-                    None => rars_rs::EntrySource::from_bytes(Arc::<[u8]>::from(entry.data.clone())),
-                },
-                mtime: entry.mtime,
-                attributes: rar50_attr(entry),
-                host_os: DEFAULT_HOST_OS_UNIX,
+            .map(|entry| {
+                let source = entry.source.clone().unwrap_or_else(|| {
+                    rars_rs::EntrySource::from_bytes(std::sync::Arc::<[u8]>::from(
+                        entry.data.clone(),
+                    ))
+                });
+                let built = rars_rs::rar50::ArchiveEntry::new(entry.name.clone(), source)
+                    .with_mtime(entry.mtime)
+                    .with_attributes(u64::from(entry.mode.unwrap_or(0)));
+                match self.password.as_deref() {
+                    Some(password) => built.with_password(password.to_vec()),
+                    None => built,
+                }
             })
             .collect()
+    }
+
+    fn streaming_options(&self) -> rars_rs::rar50::WriterOptions {
+        let mut features = rars_rs::FeatureSet::store_only();
+        features.file_encryption = self.password.is_some();
+        features.header_encryption = self.encrypt_headers;
+        features.solid = self.solid;
+        features.archive_comment = self.comment.is_some();
+        features.recovery_record = self.recovery_percent.is_some();
+        let mut options = rars_rs::rar50::WriterOptions::new(self.format, features);
+        if let Some(level) = self.compression {
+            options = options.with_compression_level(if self.store { 0 } else { level });
+        } else if self.store {
+            options = options.with_compression_level(0);
+        }
+        options
     }
 
     fn write_streaming_rar50_to(
@@ -744,33 +764,18 @@ impl RarBuilder {
         output: &mut dyn io::Write,
         resources: &rars_rs::WriterResources,
     ) -> rars_rs::Result<()> {
-        let mut features = rars_rs::FeatureSet::store_only();
-        features.file_encryption = self.password.is_some();
-        let mut options = rars_rs::rar50::WriterOptions::new(self.format, features);
-        if let Some(level) = self.compression {
-            options = options.with_compression_level(if self.store { 0 } else { level });
+        let mut extras =
+            rars_rs::rar50::ArchiveExtras::default().with_recovery_percent(self.recovery_percent);
+        if let Some(comment) = self.comment.as_deref() {
+            extras = extras.with_comment(comment);
         }
-        let entries = self.streaming_entries();
-        if let Some(password) = self.password.as_deref() {
-            let encrypted: Vec<_> = entries
-                .iter()
-                .map(|entry| rars_rs::rar50::StreamingEncryptedCompressedEntry {
-                    name: entry.name.clone(),
-                    source: entry.source.clone(),
-                    mtime: entry.mtime,
-                    attributes: entry.attributes,
-                    host_os: entry.host_os,
-                    password: password.to_vec(),
-                })
-                .collect();
-            rars_rs::rar50::write_streaming_encrypted_compressed_archive_to(
-                &encrypted, options, resources, output,
-            )
-        } else {
-            rars_rs::rar50::write_streaming_compressed_archive_to(
-                &entries, options, resources, output,
-            )
-        }
+        rars_rs::rar50::write_streaming_archive_to(
+            &self.streaming_archive_entries(),
+            self.streaming_options(),
+            extras,
+            resources,
+            output,
+        )
     }
 
     fn write_streaming_rar50_path(&self, path: &Path) -> rars_rs::Result<()> {

@@ -110,3 +110,27 @@ def test_password_errors_are_typed():
 
     archive = rars.RarFile(RAR50_PASSWORD, password="password")
     archive.testrar()
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"solid": True},
+        {"comment": "a streamed comment"},
+        {"recovery_percent": 5},
+        {"password": "secret", "encrypt_headers": True},
+        {"solid": True, "password": "secret", "encrypt_headers": True, "recovery_percent": 5},
+    ],
+)
+def test_builder_writes_every_supported_feature_combination(tmp_path, kwargs):
+    archive_path = tmp_path / "archive.rar"
+    builder = rars.RarBuilder(format="rar50", **kwargs)
+    builder.add_bytes(b"streamed payload\n" * 500, "a.txt")
+    builder.add_bytes(b"second payload\n" * 500, "b.txt")
+    builder.write(archive_path)
+
+    password = kwargs.get("password")
+    archive = rars.RarFile(archive_path, password=password)
+    archive.testrar()
+    assert sorted(info.filename for info in archive.infolist()) == ["a.txt", "b.txt"]
+    assert archive.read("a.txt") == b"streamed payload\n" * 500
