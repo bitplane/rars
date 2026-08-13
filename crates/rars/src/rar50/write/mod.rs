@@ -9,6 +9,7 @@ use crate::write_progress::{ProgressReporter, WorkTracker};
 use crate::{EntrySource, WriteOperation, WriteProgress, WriteProgressEvent, WriterResources};
 use std::io::{Read, Write};
 
+mod compress;
 mod filter_policy;
 mod headers;
 // Consumed by the streaming engine; until that lands only its own tests
@@ -124,30 +125,7 @@ pub struct StreamingEncryptedCompressedEntry {
     pub password: Vec<u8>,
 }
 
-struct PreparedStreamingEntry {
-    input_size: u64,
-    crc32: u32,
-    hash: [u8; 32],
-    packed: Spool,
-    store: bool,
-}
-
-struct StreamingLzState {
-    entry_index: usize,
-    reader: Box<dyn crate::EntryReader>,
-    remaining: u64,
-    history: Vec<u8>,
-    packed: Spool,
-}
-
-struct StreamingLzJob {
-    entry_index: usize,
-    data: Vec<u8>,
-    history: Vec<u8>,
-    is_last: bool,
-}
-
-/// Writes a non-solid RAR 5 or RAR 7 archive without retaining member payloads.
+/// Writes a RAR 5 or RAR 7 archive without retaining member payloads.
 pub fn write_streaming_compressed_archive_to(
     entries: &[StreamingCompressedEntry],
     options: WriterOptions,
@@ -155,17 +133,8 @@ pub fn write_streaming_compressed_archive_to(
     output: &mut dyn Write,
 ) -> Result<()> {
     validate_compressed_options(options)?;
-    if options.features.solid {
-        return Err(Error::UnsupportedFeature {
-            version: options.target,
-            feature: "streaming solid compression",
-        });
-    }
-    let algorithm_version = rar50_algorithm_version(options)?;
-    let dictionary_size = dictionary_size_for_options(options)?;
-    let encode_options = encode_options_for_level(options.compression_level, dictionary_size)?;
+    let plan = streaming_compress_plan(options)?;
     let method = compression_method_for_level(options.compression_level)?;
-    let block_size = 1024 * 1024usize;
     let sources: Vec<_> = entries
         .iter()
         .map(|entry| {
@@ -173,18 +142,11 @@ pub fn write_streaming_compressed_archive_to(
             Ok(entry.source.clone())
         })
         .collect::<Result<_>>()?;
-    let prepared = prepare_streaming_lz_entries(
-        &sources,
-        algorithm_version,
-        encode_options,
-        dictionary_size,
-        block_size,
-        resources,
-    )?;
+    let prepared = compress::compress_members(&sources, plan, resources)?;
 
     output.write_all(RAR50_SIGNATURE)?;
     let mut main = Vec::new();
-    write_main_header(&mut main, 0, None, &[])?;
+    write_main_header(&mut main, archive_flags_for_plan(&plan), None, &[])?;
     output.write_all(&main)?;
 
     for (entry, mut prepared) in entries.iter().zip(prepared) {
@@ -193,12 +155,7 @@ pub fn write_streaming_compressed_archive_to(
         } else {
             prepared.packed.len()
         };
-        let compression_info = compression_info(
-            algorithm_version,
-            if prepared.store { 0 } else { method },
-            dictionary_size,
-            false,
-        )?;
+        let compression_info = compress::member_compression_info(&plan, &prepared, method)?;
         let specific = file_specific(
             &entry.name,
             prepared.input_size,
@@ -243,142 +200,24 @@ pub fn write_streaming_compressed_archive_to(
     Ok(())
 }
 
-fn prepare_streaming_lz_entries(
-    sources: &[EntrySource],
-    algorithm_version: u8,
-    encode_options: EncodeOptions,
-    dictionary_size: u64,
-    block_size: usize,
-    resources: &WriterResources,
-) -> Result<Vec<PreparedStreamingEntry>> {
-    let mut integrity = Vec::with_capacity(sources.len());
-    for source in sources {
-        let input_size = source.len()?;
-        let (crc32, hash) = source_integrity(source, input_size, block_size)?;
-        integrity.push((input_size, crc32, hash));
-    }
-
-    let required = streaming_lz_workspace(dictionary_size, block_size);
-    let max_jobs_by_memory = resources.memory_limit() / required;
-    if max_jobs_by_memory == 0 {
-        resources.acquire(required, dictionary_size)?;
-        unreachable!("oversized workspace acquisition must fail");
-    }
-    let batch_capacity = usize::try_from(max_jobs_by_memory)
-        .unwrap_or(usize::MAX)
-        .min(rayon::current_num_threads())
-        .max(1);
-    let mut prepared = Vec::with_capacity(sources.len());
-    for (group_index, source_group) in sources.chunks(batch_capacity).enumerate() {
-        let group_start = group_index * batch_capacity;
-        let integrity_group = &integrity[group_start..group_start + source_group.len()];
-        let mut states = source_group
-            .iter()
-            .zip(integrity_group)
-            .enumerate()
-            .map(|(entry_index, (source, (input_size, _, _)))| {
-                Ok(StreamingLzState {
-                    entry_index,
-                    reader: source.open()?,
-                    remaining: *input_size,
-                    history: Vec::new(),
-                    packed: Spool::create(resources)?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        compress_streaming_lz_group(
-            &mut states,
-            algorithm_version,
-            encode_options,
-            dictionary_size,
-            block_size,
-            required,
-            batch_capacity,
-            resources,
-        )?;
-        prepared.extend(states.into_iter().zip(integrity_group).map(
-            |(state, &(input_size, crc32, hash))| PreparedStreamingEntry {
-                input_size,
-                crc32,
-                hash,
-                store: state.packed.len() >= input_size,
-                packed: state.packed,
-            },
-        ));
-    }
-    Ok(prepared)
+/// Compression settings shared by the streaming writers.
+fn streaming_compress_plan(options: WriterOptions) -> Result<compress::CompressPlan> {
+    let dictionary_size = dictionary_size_for_options(options)?;
+    Ok(compress::CompressPlan {
+        algorithm_version: rar50_algorithm_version(options)?,
+        encode_options: encode_options_for_level(options.compression_level, dictionary_size)?,
+        dictionary_size,
+        block_size: 1024 * 1024,
+        solid: options.features.solid,
+    })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn compress_streaming_lz_group(
-    states: &mut [StreamingLzState],
-    algorithm_version: u8,
-    encode_options: EncodeOptions,
-    dictionary_size: u64,
-    block_size: usize,
-    required: u64,
-    batch_capacity: usize,
-    resources: &WriterResources,
-) -> Result<()> {
-    let mut cursor = 0usize;
-    while states.iter().any(|state| state.remaining != 0) {
-        let reserved = required.saturating_mul(batch_capacity as u64);
-        let _permit = resources.acquire(reserved, dictionary_size)?;
-        let mut jobs = Vec::with_capacity(batch_capacity);
-        let mut misses = 0usize;
-        while jobs.len() < batch_capacity && misses < states.len() {
-            let state_count = states.len();
-            let state = &mut states[cursor];
-            cursor = (cursor + 1) % state_count;
-            if state.remaining == 0 {
-                misses += 1;
-                continue;
-            }
-            misses = 0;
-            let wanted = usize::try_from(state.remaining.min(block_size as u64))
-                .map_err(|_| Error::InvalidHeader("RAR 5 block size overflows usize"))?;
-            let mut data = vec![0u8; wanted];
-            state.reader.read_exact(&mut data)?;
-            state.remaining -= wanted as u64;
-            let is_last = state.remaining == 0;
-            if is_last {
-                let mut trailing = [0u8; 1];
-                if state.reader.read(&mut trailing)? != 0 {
-                    return Err(Error::InvalidHeader(
-                        "entry source size changed while compressing",
-                    ));
-                }
-            }
-            jobs.push(StreamingLzJob {
-                entry_index: state.entry_index,
-                data,
-                history: state.history.clone(),
-                is_last,
-            });
-            state.history.extend_from_slice(&jobs.last().unwrap().data);
-            let keep_from = state
-                .history
-                .len()
-                .saturating_sub(encode_options.max_match_distance);
-            if keep_from != 0 {
-                state.history.drain(..keep_from);
-            }
-        }
-        let packed_blocks = crate::parallel::map_collect(jobs, |job| {
-            let packed = crate::codec::rar50::encode_lz_streaming_block(
-                &job.data,
-                &job.history,
-                algorithm_version,
-                encode_options,
-                job.is_last,
-            )?;
-            Ok::<_, crate::codec::Error>((job.entry_index, packed))
-        })?;
-        for (entry_index, packed) in packed_blocks {
-            states[entry_index].packed.write_all(&packed)?;
-        }
+fn archive_flags_for_plan(plan: &compress::CompressPlan) -> u64 {
+    if plan.solid {
+        MHFL_SOLID
+    } else {
+        0
     }
-    Ok(())
 }
 
 /// Writes an encrypted, non-solid RAR 5 or RAR 7 archive with bounded memory.
@@ -389,17 +228,16 @@ pub fn write_streaming_encrypted_compressed_archive_to(
     output: &mut dyn Write,
 ) -> Result<()> {
     validate_encrypted_compressed_options(options)?;
-    if options.features.solid || options.features.header_encryption {
+    if options.features.header_encryption {
         return Err(Error::UnsupportedFeature {
             version: options.target,
-            feature: "streaming solid or header encryption",
+            feature: "streaming header encryption",
         });
     }
-    let algorithm_version = rar50_algorithm_version(options)?;
-    let dictionary_size = dictionary_size_for_options(options)?;
-    let encode_options = encode_options_for_level(options.compression_level, dictionary_size)?;
+    let plan = streaming_compress_plan(options)?;
+    let dictionary_size = plan.dictionary_size;
     let method = compression_method_for_level(options.compression_level)?;
-    let block_size = 1024 * 1024usize;
+    let block_size = plan.block_size;
     let sources: Vec<_> = entries
         .iter()
         .map(|entry| {
@@ -407,14 +245,7 @@ pub fn write_streaming_encrypted_compressed_archive_to(
             Ok(entry.source.clone())
         })
         .collect::<Result<_>>()?;
-    let compressed = prepare_streaming_lz_entries(
-        &sources,
-        algorithm_version,
-        encode_options,
-        dictionary_size,
-        block_size,
-        resources,
-    )?;
+    let compressed = compress::compress_members(&sources, plan, resources)?;
     let mut prepared = Vec::with_capacity(entries.len());
     for (entry, mut compressed) in entries.iter().zip(compressed) {
         let _permit = resources.acquire(block_size as u64, dictionary_size)?;
@@ -455,6 +286,7 @@ pub fn write_streaming_encrypted_compressed_archive_to(
             hash_mac: keys.mac_hash32(compressed.hash),
             encrypted,
             store: compressed.store,
+            solid_continuation: compressed.solid_continuation,
             salt,
             iv,
             check_value: keys.password_check_record(),
@@ -463,14 +295,14 @@ pub fn write_streaming_encrypted_compressed_archive_to(
 
     output.write_all(RAR50_SIGNATURE)?;
     let mut main = Vec::new();
-    write_main_header(&mut main, 0, None, &[])?;
+    write_main_header(&mut main, archive_flags_for_plan(&plan), None, &[])?;
     output.write_all(&main)?;
     for (entry, mut prepared) in entries.iter().zip(prepared) {
         let compression_info = compression_info(
-            algorithm_version,
+            plan.algorithm_version,
             if prepared.store { 0 } else { method },
             dictionary_size,
-            false,
+            prepared.solid_continuation,
         )?;
         let specific = file_specific(
             &entry.name,
@@ -506,6 +338,7 @@ struct PreparedEncryptedStreamingEntry {
     hash_mac: [u8; 32],
     encrypted: Spool,
     store: bool,
+    solid_continuation: bool,
     salt: [u8; 16],
     iv: [u8; 16],
     check_value: [u8; 12],
@@ -3284,12 +3117,15 @@ mod tests {
 
         let source = EntrySource::from_bytes(Arc::<[u8]>::from(data));
         let required = streaming_lz_workspace(dictionary_size, block_size);
-        let mut prepared = prepare_streaming_lz_entries(
+        let mut prepared = compress::compress_members(
             &[source],
-            algorithm_version,
-            encode_options,
-            dictionary_size,
-            block_size,
+            compress::CompressPlan {
+                algorithm_version,
+                encode_options,
+                dictionary_size,
+                block_size,
+                solid: false,
+            },
             &WriterResources::new(required.saturating_mul(4)),
         )
         .unwrap();

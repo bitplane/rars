@@ -4681,3 +4681,209 @@ fn parse_path_family_accepts_os_string_paths() {
     let no_password = Archive::parse_path_with_password(path, None).unwrap();
     assert_eq!(no_password.files().count(), 1);
 }
+
+/// Members whose contents overlap heavily, and which together fit inside the
+/// default dictionary, so a shared dictionary has something obvious to find.
+fn solid_test_entries() -> Vec<rar50::StreamingCompressedEntry> {
+    let base: Vec<u8> = (0..800u32)
+        .flat_map(|index| {
+            let mut bytes = b"solid dictionary sharing payload ".to_vec();
+            bytes.extend_from_slice(&index.to_le_bytes());
+            bytes
+        })
+        .collect();
+
+    (0..3u8)
+        .map(|index| rar50::StreamingCompressedEntry {
+            name: format!("member-{index}.bin").into_bytes(),
+            source: rars::EntrySource::from_bytes(std::sync::Arc::<[u8]>::from(base.clone())),
+            mtime: Some(0x5000_0000),
+            attributes: 0x20,
+            host_os: 0,
+        })
+        .collect()
+}
+
+fn write_streaming(entries: &[rar50::StreamingCompressedEntry], solid: bool) -> Vec<u8> {
+    let mut features = FeatureSet::store_only();
+    features.solid = solid;
+    let mut out = Vec::new();
+    rar50::write_streaming_compressed_archive_to(
+        entries,
+        rar50::WriterOptions::new(ArchiveVersion::Rar50, features).with_compression_level(3),
+        &rars::WriterResources::default(),
+        &mut out,
+    )
+    .unwrap();
+    out
+}
+
+#[test]
+fn streaming_solid_members_share_one_dictionary() {
+    let entries = solid_test_entries();
+    let solid = write_streaming(&entries, true);
+    let independent = write_streaming(&entries, false);
+
+    // Members two and three repeat member one, so a dictionary that carries
+    // across members should collapse them almost entirely.
+    assert!(
+        solid.len() * 2 < independent.len(),
+        "solid archive ({}) should be far smaller than independent members ({})",
+        solid.len(),
+        independent.len()
+    );
+
+    let archive = Archive::parse(&solid).unwrap();
+    assert!(archive.main.is_solid(), "archive must be flagged solid");
+    let solid_flags: Vec<bool> = archive
+        .files()
+        .map(|file| file.decoded_compression_info().unwrap().solid)
+        .collect();
+    assert_eq!(
+        solid_flags,
+        vec![false, true, true],
+        "the first member starts the chain and the rest continue it"
+    );
+}
+
+#[test]
+fn streaming_solid_archives_round_trip() {
+    let entries = solid_test_entries();
+    let archive_bytes = write_streaming(&entries, true);
+    let archive = Archive::parse(&archive_bytes).unwrap();
+    let extracted = collect_extract(&archive).unwrap();
+
+    assert_eq!(extracted.len(), entries.len());
+    let expected = {
+        let mut buffer = Vec::new();
+        entries[0]
+            .source
+            .open()
+            .unwrap()
+            .read_to_end(&mut buffer)
+            .unwrap();
+        buffer
+    };
+    for (index, entry) in extracted.iter().enumerate() {
+        assert_eq!(entry.name, format!("member-{index}.bin").into_bytes());
+        assert_eq!(entry.data, expected, "member {index} did not survive");
+    }
+}
+
+#[test]
+fn streaming_solid_chains_history_across_block_and_member_boundaries() {
+    // Members larger than the 1 MiB block size, so the dictionary has to carry
+    // both from block to block and from member to member.
+    let entries: Vec<_> = (0..3u8)
+        .map(|index| {
+            let mut data: Vec<u8> = (0..1_600_000u32)
+                .map(|offset| (offset.wrapping_mul(2_654_435_761) >> 24) as u8)
+                .collect();
+            data[0] = index;
+            rar50::StreamingCompressedEntry {
+                name: format!("big-{index}.bin").into_bytes(),
+                source: rars::EntrySource::from_bytes(std::sync::Arc::<[u8]>::from(data)),
+                mtime: None,
+                attributes: 0x20,
+                host_os: 0,
+            }
+        })
+        .collect();
+
+    let archive_bytes = write_streaming(&entries, true);
+    let archive = Archive::parse(&archive_bytes).unwrap();
+    let extracted = collect_extract(&archive).unwrap();
+
+    assert_eq!(extracted.len(), 3);
+    for (index, entry) in extracted.iter().enumerate() {
+        let mut expected = Vec::new();
+        entries[index]
+            .source
+            .open()
+            .unwrap()
+            .read_to_end(&mut expected)
+            .unwrap();
+        assert_eq!(entry.data, expected, "member {index} did not survive");
+    }
+
+    if let Some(output) = reference_test_archive("solid-multiblock", &archive_bytes) {
+        assert!(
+            output.status.success(),
+            "the reference tool rejected a multi-block solid archive\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn streaming_solid_output_does_not_depend_on_the_memory_budget() {
+    let entries = solid_test_entries();
+    let mut features = FeatureSet::store_only();
+    features.solid = true;
+    let options = rar50::WriterOptions::new(ArchiveVersion::Rar50, features);
+
+    // The default budget compresses a couple of blocks at a time; the larger
+    // one lets every core work at once.
+    let mut tight = Vec::new();
+    rar50::write_streaming_compressed_archive_to(
+        &entries,
+        options,
+        &rars::WriterResources::default(),
+        &mut tight,
+    )
+    .unwrap();
+
+    let mut roomy = Vec::new();
+    rar50::write_streaming_compressed_archive_to(
+        &entries,
+        options,
+        &rars::WriterResources::new(4 * 1024 * 1024 * 1024),
+        &mut roomy,
+    )
+    .unwrap();
+
+    assert_eq!(
+        tight, roomy,
+        "the number of blocks compressed at once must not change the output"
+    );
+}
+
+/// Tests an archive with whichever reference tool is installed, returning
+/// `None` when neither is.
+fn reference_test_archive(label: &str, archive: &[u8]) -> Option<std::process::Output> {
+    let mut path = std::env::temp_dir();
+    path.push(format!("rars-{label}-{}.rar", std::process::id()));
+    fs::write(&path, archive).unwrap();
+
+    let mut result = None;
+    for tool in ["unrar", "rar"] {
+        match Command::new(tool).arg("t").arg(&path).output() {
+            Ok(output) => {
+                result = Some(output);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => panic!("failed to run {tool}: {error}"),
+        }
+    }
+    let _ = fs::remove_file(&path);
+    result
+}
+
+#[test]
+#[ignore = "requires a local unrar or rar command"]
+fn reference_rar_accepts_streaming_solid_archive() {
+    let archive = write_streaming(&solid_test_entries(), true);
+    let Some(output) = reference_test_archive("streaming-solid", &archive) else {
+        eprintln!("skipping reference test: no unrar or rar command is installed");
+        return;
+    };
+
+    assert!(
+        output.status.success(),
+        "the reference tool rejected the streaming solid archive\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
