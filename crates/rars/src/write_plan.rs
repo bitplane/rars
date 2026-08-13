@@ -251,6 +251,61 @@ pub fn validate_option(
     }
 }
 
+/// Whether a compressed member should be written as stored bytes instead.
+///
+/// Compression that does not shrink a member costs the reader time for nothing.
+/// The formats disagree about when that trade is worth making, so what differs
+/// between them is parameters here rather than three separate rules.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StoreFallback {
+    /// Members below this size stay compressed. Where a stored member costs
+    /// enough header of its own, swapping a small one can lose more than the
+    /// compression was wasting.
+    pub(crate) min_size: usize,
+    /// Whether a solid member may be swapped. RAR 5 runs one dictionary across
+    /// every member and cannot go back on what it has already fed in; the
+    /// RAR 1.5 family rebuilds its encoder at that point instead.
+    pub(crate) allow_solid: bool,
+    /// A filter the caller named is not discarded because the result did not
+    /// shrink. They asked for it.
+    pub(crate) filter_requested: bool,
+}
+
+impl StoreFallback {
+    pub(crate) const fn new() -> Self {
+        Self {
+            min_size: 0,
+            allow_solid: false,
+            filter_requested: false,
+        }
+    }
+
+    pub(crate) const fn min_size(mut self, size: usize) -> Self {
+        self.min_size = size;
+        self
+    }
+
+    pub(crate) const fn allow_solid(mut self, allow: bool) -> Self {
+        self.allow_solid = allow;
+        self
+    }
+
+    pub(crate) const fn filter_requested(mut self, requested: bool) -> Self {
+        self.filter_requested = requested;
+        self
+    }
+
+    pub(crate) fn applies(&self, solid: bool, unpacked: usize, packed: usize) -> bool {
+        if packed < unpacked || self.filter_requested {
+            return false;
+        }
+        if solid && !self.allow_solid {
+            return false;
+        }
+        unpacked >= self.min_size
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,6 +369,26 @@ mod tests {
             Feature::HeaderEncryption => set.header_encryption,
             Feature::QuickOpen => set.quick_open,
         }
+    }
+
+    #[test]
+    fn a_member_is_only_stored_when_compressing_it_gained_nothing() {
+        let plain = StoreFallback::new();
+        assert!(plain.applies(false, 100, 100));
+        assert!(plain.applies(false, 100, 120));
+        assert!(!plain.applies(false, 100, 99));
+
+        // A named filter survives a result that did not shrink.
+        assert!(!plain.filter_requested(true).applies(false, 100, 200));
+
+        // Solid is refused unless the format can rebuild its chain.
+        assert!(!plain.applies(true, 100, 100));
+        assert!(plain.allow_solid(true).applies(true, 100, 100));
+
+        // The floor keeps small members compressed.
+        let floored = plain.min_size(1024);
+        assert!(!floored.applies(false, 1023, 1023));
+        assert!(floored.applies(false, 1024, 1024));
     }
 
     #[test]

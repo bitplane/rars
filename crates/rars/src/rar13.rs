@@ -1109,8 +1109,11 @@ pub fn write_compressed_archive_with_comment_and_progress(
                 .unwrap_or_else(|| entry.data.to_vec())
         };
         let method = if options.compression_level == Some(0)
-            || (!solid && packed.len() >= entry.data.len())
-        {
+            || crate::write_plan::StoreFallback::new().applies(
+                solid,
+                entry.data.len(),
+                packed.len(),
+            ) {
             packed = entry.data.to_vec();
             METHOD_STORE
         } else {
@@ -1236,12 +1239,13 @@ pub fn write_compressed_volumes_with_progress(
     let mut packed =
         encode_verified_rar15_payload_with_progress(entry.data, encode_options, &mut advance)?
             .unwrap_or_else(|| entry.data.to_vec());
-    let method = if packed.len() >= entry.data.len() {
-        packed = entry.data.to_vec();
-        METHOD_STORE
-    } else {
-        METHOD_BEST
-    };
+    let method =
+        if crate::write_plan::StoreFallback::new().applies(false, entry.data.len(), packed.len()) {
+            packed = entry.data.to_vec();
+            METHOD_STORE
+        } else {
+            METHOD_BEST
+        };
     let result = write_split_volumes(SplitVolumeRecord {
         name: entry.name,
         unpacked: entry.data,

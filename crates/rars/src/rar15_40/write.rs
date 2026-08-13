@@ -1251,21 +1251,26 @@ fn should_store_fallback(
     unpacked_len: usize,
     packed_len: usize,
 ) -> bool {
-    if packed_len < unpacked_len {
-        return false;
-    }
-    if !solid
+    // RAR 2.0 onwards store any member compression did not help. RAR 1.5 pays
+    // more header for a stored member, so a small one stays compressed. A solid
+    // member can be stored here because the writer rebuilds its encoder when it
+    // happens.
+    let stores_any_size = !solid
         && matches!(
             target,
             ArchiveVersion::Rar20
                 | ArchiveVersion::Rar29
                 | ArchiveVersion::Rar30
                 | ArchiveVersion::Rar40
-        )
-    {
-        return true;
-    }
-    unpacked_len >= MIN_STORE_FALLBACK_SIZE
+        );
+    crate::write_plan::StoreFallback::new()
+        .allow_solid(true)
+        .min_size(if stores_any_size {
+            0
+        } else {
+            MIN_STORE_FALLBACK_SIZE
+        })
+        .applies(solid, unpacked_len, packed_len)
 }
 
 fn validate_volume_writer_inputs(

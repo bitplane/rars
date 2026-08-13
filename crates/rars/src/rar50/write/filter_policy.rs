@@ -157,7 +157,11 @@ pub(super) fn should_store_compressed_payload(
     solid: bool,
     policy: &FilterPolicy,
 ) -> bool {
-    !solid && !matches!(policy, FilterPolicy::Explicit(_)) && packed.len() >= data.len()
+    // A solid member is decoded against the dictionary the members before it
+    // filled, so this writer can never go back and store one.
+    crate::write_plan::StoreFallback::new()
+        .filter_requested(matches!(policy, FilterPolicy::Explicit(_)))
+        .applies(solid, data.len(), packed.len())
 }
 
 #[cfg(test)]
