@@ -313,7 +313,11 @@ fn encode_rar29_policy_filtered_payload(
     lz_method: u8,
     ppmd_trial: bool,
 ) -> Result<EncodedPayload> {
-    if lz_method == 0x30 {
+    // An empty member is stored whatever was asked for. A filter over it is a
+    // 0..0 range, which the codec refuses, so an archive holding one empty file
+    // used to compress every other member and then fail at the last step. Only
+    // the search path guarded this; every explicit policy walked into it.
+    if lz_method == 0x30 || data.is_empty() {
         return Ok(EncodedPayload {
             data: data.to_vec(),
             method: 0x30,
@@ -1262,8 +1266,18 @@ fn encode_filtered_payload(
         policy,
         lz_method == 0x30 || options.method == Rar29Method::Ppmd,
     ) {
+        // An empty member has no range to filter, but it still goes through
+        // the chain's encoder like any other member. Storing it instead would
+        // end the chain in the headers while leaving the encoder's history
+        // untouched, so the member after it would be coded against a
+        // dictionary its own flags told the decoder to throw away.
+        let packed = if data.is_empty() {
+            encoder.encode_member(data)?
+        } else {
+            encoder.encode_member_with_filters(data, std::slice::from_ref(filter))?
+        };
         return Ok(EncodedPayload {
-            data: encoder.encode_member_with_filters(data, std::slice::from_ref(filter))?,
+            data: packed,
             method: lz_method,
         });
     }

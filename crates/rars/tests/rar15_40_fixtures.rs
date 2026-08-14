@@ -2694,6 +2694,134 @@ fn solid_rar29_explicit_filter_codes_members_into_one_chain() {
     assert_eq!(extracted[2].data, second_data);
 }
 
+/// An explicit filter over a zero-byte member asks for a 0..0 range, which the
+/// codec refuses. One empty file in a directory used to compress every other
+/// member and then fail at the last step, writing no archive at all.
+#[test]
+fn an_empty_member_is_written_under_every_explicit_filter() {
+    let payload = b"filter me \xe8\x00\x00\x00\x00 and me too\n".repeat(64);
+    for kind in [
+        FilterKind::E8,
+        FilterKind::E8E9,
+        FilterKind::Delta { channels: 1 },
+        FilterKind::Itanium,
+        FilterKind::Rgb { width: 3, pos_r: 0 },
+        FilterKind::Audio { channels: 2 },
+    ] {
+        let entries = [
+            FileEntry {
+                name: b"empty.bin",
+                data: b"",
+                file_time: 0x5a21_0000,
+                file_attr: 0x20,
+                host_os: 3,
+                password: None,
+                file_comment: None,
+            },
+            FileEntry {
+                name: b"payload.bin",
+                data: &payload,
+                file_time: 0x5a21_0000,
+                file_attr: 0x20,
+                host_os: 3,
+                password: None,
+                file_comment: None,
+            },
+        ];
+
+        let bytes = write_rar29_compressed_archive_with_filter_policy(
+            &entries,
+            WriterOptions::new(ArchiveVersion::Rar29, FeatureSet::store_only()),
+            FilterPolicy::Explicit(FilterSpec::whole(kind)),
+        )
+        .unwrap_or_else(|err| panic!("{kind:?}: {err}"));
+
+        let archive = Archive::parse(&bytes).unwrap();
+        let extracted = collect_extract(&archive).unwrap();
+        assert_eq!(extracted[0].data, b"");
+        assert_eq!(extracted[1].data, payload);
+    }
+}
+
+/// The empty member must go through the chain's encoder like any other. Storing
+/// it ends the chain in the headers while leaving the encoder's history in
+/// place, so the member after it decodes against a dictionary its own flags
+/// told the reader to discard.
+#[test]
+fn an_empty_member_keeps_a_filtered_solid_chain_intact() {
+    // Low internal repetition, so the first member packs large and a repeat of
+    // it can only be small if the chain is genuinely reaching back.
+    let mut state = 0x2545_f491u32;
+    let payload: Vec<u8> = (0..900)
+        .flat_map(|index| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let mut record = format!("record {index:05} {state:08x} ").into_bytes();
+            // An x86 call for the filter to find, so the filter is doing work
+            // rather than being a no-op the chain could hide.
+            record.extend_from_slice(&[0xe8, 0, 0, 0, 0, b'\n']);
+            record
+        })
+        .collect();
+    let entries = [
+        FileEntry {
+            name: b"first.bin",
+            data: &payload,
+            file_time: 0x5a21_0000,
+            file_attr: 0x20,
+            host_os: 3,
+            password: None,
+            file_comment: None,
+        },
+        FileEntry {
+            name: b"empty.bin",
+            data: b"",
+            file_time: 0x5a21_0000,
+            file_attr: 0x20,
+            host_os: 3,
+            password: None,
+            file_comment: None,
+        },
+        FileEntry {
+            name: b"second.bin",
+            data: &payload,
+            file_time: 0x5a21_0000,
+            file_attr: 0x20,
+            host_os: 3,
+            password: None,
+            file_comment: None,
+        },
+    ];
+    let mut features = FeatureSet::store_only();
+    features.solid = true;
+
+    let bytes = write_rar29_compressed_archive_with_filter_policy(
+        &entries,
+        WriterOptions::new(ArchiveVersion::Rar29, features),
+        FilterPolicy::Explicit(FilterSpec::whole(FilterKind::E8)),
+    )
+    .unwrap();
+    let archive = Archive::parse(&bytes).unwrap();
+    let files: Vec<_> = archive.files().collect();
+
+    assert!(
+        files[1].is_solid(),
+        "the empty member must not end the chain"
+    );
+    assert!(files[2].is_solid(), "the member after it must continue it");
+    assert!(
+        files[2].pack_size * 8 < files[0].pack_size,
+        "a repeat across the empty member should still reach the chain, \
+         got {} against {}",
+        files[2].pack_size,
+        files[0].pack_size
+    );
+
+    let extracted = collect_extract(&archive).unwrap();
+    assert_eq!(extracted[0].data, payload);
+    assert_eq!(extracted[1].data, b"");
+    assert_eq!(extracted[2].data, payload);
+}
+
 /// A filtered member used to be coded on its own whatever the archive said,
 /// while its header still claimed to continue the chain.
 #[test]
