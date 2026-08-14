@@ -119,11 +119,39 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # The write matrix hands every archive shape to a decoder we did not
+      # write. Both are pinned and checksummed: unrar comes from source because
+      # distributions ship unrar-free under the same name, which cannot read
+      # RAR 5, and 7-Zip comes from upstream because the Debian and Ubuntu
+      # package has the RAR decompressor removed.
+      - name: Install unrar
+        run: |
+          set -euo pipefail
+          curl -sSfLO https://www.rarlab.com/rar/unrarsrc-7.1.6.tar.gz
+          echo "ca5e1da37dd6fa1b78bb5ed675486413f79e4a917709744aa04b6f93dfd914f0  unrarsrc-7.1.6.tar.gz" | sha256sum -c -
+          tar xf unrarsrc-7.1.6.tar.gz
+          make -C unrar -j"$(nproc)"
+          sudo install -m 0755 unrar/unrar /usr/local/bin/unrar
+          unrar | head -2
+
+      - name: Install 7-Zip
+        run: |
+          set -euo pipefail
+          curl -sSfLO https://github.com/ip7z/7zip/releases/download/26.00/7z2600-linux-x64.tar.xz
+          echo "c74dc4a48492cde43f5fec10d53fb2a66f520e4a62a69d630c44cb22c477edc6  7z2600-linux-x64.tar.xz" | sha256sum -c -
+          mkdir -p 7zip && tar -C 7zip -xf 7z2600-linux-x64.tar.xz
+          sudo install -m 0755 7zip/7zz /usr/local/bin/7zz
+          7zz | head -2
+
       - run: cargo fmt --all -- --check
 
       - run: cargo clippy --all-targets -- -D warnings
 
       - run: cargo test --workspace --all-targets --locked
+        env:
+          # Turn a missing decoder into a failed gate rather than a skipped
+          # matrix.
+          RARS_REQUIRE_EXTERNAL_DECODERS: "1"
 
   # ----------------------------------------------------------------------
   # 3. Build release binaries for the supported targets.

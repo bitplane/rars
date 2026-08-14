@@ -98,6 +98,19 @@ Run the test suite:
 cargo test --workspace --all-targets
 ```
 
+Part of that suite writes an archive for every format, method, filter and
+encryption combination and hands each one to a decoder we did not write. It
+skips if it cannot find one, so install both to get the coverage:
+
+```sh
+sudo apt-get install unrar          # or build unrarsrc from rarlab.com
+# and the official 7zz from github.com/ip7z/7zip — distribution 7zip
+# packages ship the RAR handler with the decompressor removed
+```
+
+`scripts/release-gate.sh` runs the same suite with `RARS_REQUIRE_EXTERNAL_DECODERS=1`,
+which turns a missing decoder into a failure rather than a skip.
+
 Generate a local coverage report:
 
 ```sh

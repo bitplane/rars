@@ -1,11 +1,17 @@
 # Rars build and release recipes. Cargo remains the build system; these are
 # short, memorable entry points for the local workflow.
 
-# Run the same checks as CI before cutting a release.
+# Everyday checks. The external decoder matrix skips whatever it cannot find,
+# so this passes without unrar or 7zz installed; `just gate` is the strict one.
 check:
     cargo fmt --all -- --check
     cargo clippy --all-targets -- -D warnings
     cargo test --workspace --all-targets --locked
+
+# What CI runs before a release, including the external decoders. Fails rather
+# than skips when they are missing.
+gate:
+    ./scripts/release-gate.sh
 
 # Bump the version (patch/minor/major or X.Y.Z), commit, tag vX.Y.Z and push.
 # The pushed tag triggers the release workflow, which publishes the Rust crates,
