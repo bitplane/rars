@@ -1244,14 +1244,13 @@ fn level_code_lengths_for_symbols(symbols: &[usize]) -> [u8; LEVEL_COUNT] {
 }
 
 fn level_code_lengths_for_used_symbols(used: [bool; LEVEL_COUNT]) -> [u8; LEVEL_COUNT] {
-    let used_count = used.iter().filter(|&&used| used).count();
-    let len = huffman::bits_for_symbol_count(used_count);
     let mut lengths = [0u8; LEVEL_COUNT];
     for (symbol, is_used) in used.into_iter().enumerate() {
         if is_used {
-            lengths[symbol] = len;
+            lengths[symbol] = 1;
         }
     }
+    huffman::assign_flat_complete_code(&mut lengths);
     lengths
 }
 
@@ -2076,9 +2075,39 @@ impl BitWriter {
 #[cfg(test)]
 mod tests {
     use super::{
-        encode_tokens_with_progress, unpack20_decode, unpack20_encode_literals, BitWriter,
-        CostModel, EncodeOptions, EncodeToken, Error, Huffman, Unpack20, Unpack20Encoder,
+        encode_tokens_with_progress, level_code_lengths_for_used_symbols, unpack20_decode,
+        unpack20_encode_literals, BitWriter, CostModel, EncodeOptions, EncodeToken, Error, Huffman,
+        Unpack20, Unpack20Encoder, LEVEL_COUNT,
     };
+
+    /// 7-Zip builds the RAR pre-table with `k_BuildMode_Full` and refuses a
+    /// code that leaves part of the code space unassigned, where unrar takes
+    /// it. Giving every used symbol the same length only fills the space when
+    /// the count is a power of two, so the flat table we used to emit was
+    /// under-full for 3, 5, 6, 7, 9 symbols and so on, and 7-Zip rejected the
+    /// archive before decoding a byte.
+    #[test]
+    fn the_pre_table_fills_its_code_space_for_every_symbol_count() {
+        for count in 1..=LEVEL_COUNT {
+            let mut used = [false; LEVEL_COUNT];
+            for slot in used.iter_mut().take(count) {
+                *slot = true;
+            }
+            let lengths = level_code_lengths_for_used_symbols(used);
+
+            let longest = lengths.iter().copied().max().unwrap();
+            let kraft: u32 = lengths
+                .iter()
+                .filter(|&&len| len != 0)
+                .map(|&len| 1u32 << (longest - len))
+                .sum();
+            assert_eq!(
+                kraft,
+                1 << longest,
+                "{count} symbols gave the incomplete code {lengths:?}"
+            );
+        }
+    }
 
     fn encode_tokens(
         input: &[u8],

@@ -822,7 +822,16 @@ fn encode_member_inner(
         "RAR 2.9 encoder missing end-of-block Huffman code",
     ))?;
     bits.write_bits(end.code as u32, end.len);
-    bits.write_bit(true); // end member, no following table.
+    // The end-of-block symbol on its own does not end the member: the next bit
+    // says whether another table follows, and only a zero means "that was the
+    // last block". Writing a one here left decoders reading the byte padding as
+    // a table header. unrar and our own reader stop on the unpacked size before
+    // they get there, so only a decoder that reads to the terminator noticed,
+    // which is why every RAR 2.9 LZ archive we have ever written fails in
+    // 7-Zip. The second bit is what the reader carries into a solid follower:
+    // a one tells it to read its own tables, which is what we write.
+    bits.write_bit(false);
+    bits.write_bit(true);
     Ok(bits.finish())
 }
 
@@ -1733,17 +1742,10 @@ fn emit_zero_level_run(tokens: &mut Vec<LevelToken>, mut run: usize) {
 
 fn level_code_lengths(tokens: &[LevelToken]) -> [u8; LEVEL_COUNT] {
     let mut lengths = [0u8; LEVEL_COUNT];
-    let mut used = [false; LEVEL_COUNT];
     for token in tokens {
-        used[token.symbol] = true;
+        lengths[token.symbol] = 1;
     }
-    let used_count = used.iter().filter(|&&used| used).count();
-    let len = huffman::bits_for_symbol_count(used_count);
-    for (symbol, is_used) in used.into_iter().enumerate() {
-        if is_used {
-            lengths[symbol] = len;
-        }
-    }
+    huffman::assign_flat_complete_code(&mut lengths);
     lengths
 }
 
@@ -1807,6 +1809,7 @@ pub struct Unpack29 {
     last_filter: usize,
     base_offset: usize,
     output: Vec<u8>,
+    stale_terminator: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1879,6 +1882,7 @@ impl Unpack29 {
             last_filter: 0,
             base_offset: 0,
             output: Vec::new(),
+            stale_terminator: false,
         }
     }
 
@@ -2318,6 +2322,10 @@ impl Unpack29 {
             match self.read_end_of_block()? {
                 LzBlockEnd::SameFileNewTable => {
                     if self.bits.remaining_bits_are_zero() {
+                        // rars wrote this bit set on every member it packed
+                        // until the terminator fix, so what follows is the byte
+                        // padding rather than a table. Kept for those archives.
+                        self.stale_terminator = true;
                         return Ok(());
                     }
                     if let Err(error) = self.read_tables() {
@@ -3243,6 +3251,28 @@ mod tests {
         let packed = unpack29_encode_literals(input).unwrap();
 
         assert_eq!(unpack29_decode(&packed, input.len()).unwrap(), input);
+    }
+
+    /// The end-of-block symbol is followed by a bit saying whether another
+    /// table comes next, and the encoder used to set it, so every member
+    /// claimed a table that was really the byte padding. unrar and our own
+    /// reader stop on the unpacked size and never reach it, which is why only
+    /// 7-Zip noticed, and it refused every RAR 2.9 LZ archive we had written.
+    ///
+    /// The reader still tolerates the old shape, so a round trip proves
+    /// nothing. What proves it is that the tolerance goes unused.
+    #[test]
+    fn an_lz_member_ends_with_a_terminator_and_not_a_promise_of_more_tables() {
+        let input = b"RAR 2.9 terminator check, with repeated text to force a match: \
+RAR 2.9 terminator check\n";
+        let packed = unpack29_encode_literals(input).unwrap();
+
+        let mut decoder = Unpack29::new();
+        assert_eq!(decoder.decode_member(&packed, input.len()).unwrap(), input);
+        assert!(
+            !decoder.stale_terminator,
+            "the member ended by claiming another table follows"
+        );
     }
 
     #[test]

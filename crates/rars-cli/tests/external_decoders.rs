@@ -582,44 +582,11 @@ const KNOWN_BAD: &[Known] = &[
         decoder: "unrar",
         task: "#59",
     },
-    // #64. Legacy streams 7-Zip refuses and unrar accepts, most likely issue
-    // #19's incomplete Huffman tables in the encoders the fix never reached.
+    // #65. A member that continues across a volume boundary. The legacy
+    // formats had this too until the RAR 2.9 terminator fix, which leaves it
+    // to the separate RAR 5 volume writer.
     Known {
-        formats: &["rar20"],
-        cells: &[
-            "level-1",
-            "level-5",
-            "level-5-solid",
-            "level-5-no-filter",
-            "dict-4m",
-            "comment",
-            "file-comment-old-style",
-        ],
-        decoder: "7zz",
-        task: "#64",
-    },
-    Known {
-        formats: &["rar29", "rar30", "rar40"],
-        cells: &[
-            "level-1",
-            "level-5-solid",
-            "level-5-solid-encrypted",
-            "delta-filter",
-            "e8-filter",
-            "e8e9-filter",
-            "itanium-filter",
-            "rgb-filter",
-            "audio-filter",
-            "filter-solid",
-            "ppmd-solid",
-        ],
-        decoder: "7zz",
-        task: "#64",
-    },
-    // #65. A member that continues across a volume boundary. Every format that
-    // writes volumes has it.
-    Known {
-        formats: &["rar20", "rar29", "rar30", "rar40", "rar50", "rar70"],
+        formats: &["rar50", "rar70"],
         cells: &["volumes", "volumes-encrypted"],
         decoder: "7zz",
         task: "#65",
