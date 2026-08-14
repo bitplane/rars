@@ -232,11 +232,12 @@ pub fn supports(target: ArchiveVersion, option: WriterOption, shape: PlanShape) 
         // because a volume set has no single place to put one.
         WriterOption::ArchiveComment => !shape.volumes,
         // RAR 3.x and 4.x moved file comments into a form this writer does not
-        // emit. RAR 5 carries them as a service record, which the legacy
-        // writers cannot split across volumes.
+        // emit. Everywhere else they are per-member data that no volume writer
+        // carries: the legacy one emits the split member alone, and the RAR 5
+        // one cuts members at arbitrary byte boundaries with nowhere to put the
+        // service block that holds the comment.
         WriterOption::FileComment => {
-            !matches!(target, ArchiveVersion::Rar30 | ArchiveVersion::Rar40)
-                && (family == ArchiveFamily::Rar50Plus || !shape.volumes)
+            !matches!(target, ArchiveVersion::Rar30 | ArchiveVersion::Rar40) && !shape.volumes
         }
         WriterOption::ArchiveMetadata => family == ArchiveFamily::Rar50Plus && !shape.volumes,
         WriterOption::Password => true,

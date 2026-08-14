@@ -4886,11 +4886,13 @@ fn the_volume_writer_refuses_exactly_what_the_table_refuses() {
     for option in [
         WriterOption::ArchiveComment,
         WriterOption::ArchiveMetadata,
+        WriterOption::FileComment,
         WriterOption::Feature(rars::Feature::QuickOpen),
         WriterOption::RecoveryRecord,
     ] {
         let mut features = FeatureSet::store_only();
         let mut extras = rar50::ArchiveExtras::default();
+        let mut entries = entries.clone();
         match option {
             WriterOption::ArchiveComment => extras = extras.with_comment(b"comment"),
             WriterOption::ArchiveMetadata => {
@@ -4898,6 +4900,11 @@ fn the_volume_writer_refuses_exactly_what_the_table_refuses() {
                     name: Some(b"set.rar"),
                     creation_time: Some(0x01dc_d60e_662d_7a32),
                 })
+            }
+            WriterOption::FileComment => {
+                entries[0] = entries[0]
+                    .clone()
+                    .with_service(rar50::ServiceEntry::new(b"CMT".to_vec(), b"note".to_vec()))
             }
             WriterOption::Feature(rars::Feature::QuickOpen) => features.quick_open = true,
             WriterOption::RecoveryRecord => extras = extras.with_recovery_percent(Some(5)),
@@ -4920,6 +4927,68 @@ fn the_volume_writer_refuses_exactly_what_the_table_refuses() {
             "{option:?}: the table and the volume writer disagree, writer said {result:?}"
         );
     }
+}
+
+/// A file comment on a volume set was validated with the member and then
+/// dropped: `prepare_volume_member` never reads an entry's services, so the
+/// comment appeared in no volume and the write reported success.
+///
+/// Asserting the refusal alone would not have caught it, because the
+/// capability table agreed with the writer that it was supported. What the
+/// writer must never do is accept the request and lose it.
+#[test]
+fn a_file_comment_on_a_volume_set_is_refused_or_written() {
+    let payload = volume_payload(40_000);
+    let entries = [
+        streaming_entry("member.bin", &payload).with_service(rar50::ServiceEntry::new(
+            b"CMT".to_vec(),
+            b"volume note".to_vec(),
+        )),
+    ];
+
+    let mut sink = CollectingVolumeSink::default();
+    let result = rar50::write_streaming_volumes_to(
+        &entries,
+        rar50::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
+            .with_compression_level(1),
+        rar50::ArchiveExtras::default(),
+        20_000,
+        &mut sink,
+        &rars::WriterResources::default(),
+    );
+
+    if result.is_err() {
+        return;
+    }
+    let volumes = sink.volumes.lock().unwrap().clone();
+    let found = volumes.iter().any(|volume| {
+        Archive::parse(volume)
+            .is_ok_and(|archive| archive.services().any(|service| service.name == b"CMT"))
+    });
+    assert!(
+        found,
+        "the write was accepted, so the comment has to be in one of the {} volumes",
+        volumes.len()
+    );
+}
+
+/// A set with no members used to report success while writing no volumes at
+/// all: the member loop never ran, and the writer finished without asking the
+/// sink to start one. The volume writer that was deleted refused this.
+#[test]
+fn a_volume_set_with_no_members_is_refused() {
+    let mut sink = CollectingVolumeSink::default();
+    let result = rar50::write_streaming_volumes_to(
+        &[],
+        rar50::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only()),
+        rar50::ArchiveExtras::default(),
+        20_000,
+        &mut sink,
+        &rars::WriterResources::default(),
+    );
+
+    assert!(result.is_err(), "an empty set reported success");
+    assert!(sink.volumes.lock().unwrap().is_empty());
 }
 
 /// Solid members are coded as one chain, so the filter search never runs for

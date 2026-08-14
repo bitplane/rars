@@ -208,6 +208,19 @@ pub fn write_streaming_volumes_with_progress(
     if extras.metadata.is_some() {
         crate::write_plan::validate_option(options.target, WriterOption::ArchiveMetadata, shape)?;
     }
+    // A member's services are validated with it and then had nowhere to go:
+    // `prepare_volume_member` never reads them, so a file comment asked for on
+    // a split set was accepted and then dropped without a word.
+    if entries.iter().any(|entry| !entry.services.is_empty()) {
+        crate::write_plan::validate_option(options.target, WriterOption::FileComment, shape)?;
+    }
+    // A set with no members produces no volumes at all: the writer would
+    // return success having never asked the sink for a single one.
+    if entries.is_empty() {
+        return Err(Error::InvalidHeader(
+            "RAR 5 volume writer needs at least one member",
+        ));
+    }
     if let Some(percent) = extras.recovery_percent {
         validate_recovery_percent(percent)?;
     }
