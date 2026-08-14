@@ -778,15 +778,9 @@ impl RarBuilder {
         output: &mut dyn io::Write,
         resources: &rars_rs::WriterResources,
     ) -> rars_rs::Result<()> {
-        // Look for a data filter unless the archive cannot carry one.
-        let filter_policy = if self.solid || self.store {
-            rars_rs::rar50::FilterPolicy::None
-        } else {
-            rars_rs::rar50::FilterPolicy::Auto
-        };
         let mut extras = rars_rs::rar50::ArchiveExtras::default()
             .with_recovery_percent(self.recovery_percent)
-            .with_filter_policy(filter_policy);
+            .with_filter_policy(self.rar50_filter_policy());
         if let Some(comment) = self.comment.as_deref() {
             extras = extras.with_comment(comment);
         }
@@ -928,9 +922,22 @@ impl RarBuilder {
             .collect()
     }
 
+    /// Whether to look for a data filter, which the archive has to be able to
+    /// carry. One answer for every RAR 5 path: the streaming one worked this
+    /// out for itself, so an archive built from `add_bytes` came out unfiltered
+    /// and larger than the same archive built from `add_path`.
+    fn rar50_filter_policy(&self) -> rars_rs::rar50::FilterPolicy {
+        if self.solid || self.store {
+            rars_rs::rar50::FilterPolicy::None
+        } else {
+            rars_rs::rar50::FilterPolicy::Auto
+        }
+    }
+
     fn build_rar50_single(&self, progress: Option<&PythonProgress>) -> rars_rs::Result<Vec<u8>> {
         let writer = rar50_writer(self.rar50_options(), progress)
             .entries(self.rar50_entries())
+            .filter_policy(self.rar50_filter_policy())
             .recovery_percent(self.recovery_percent);
         let writer = match (self.comment.as_deref(), self.password.as_deref()) {
             (Some(comment), Some(password)) => writer.encrypted_archive_comment(comment, password),
@@ -1045,7 +1052,9 @@ impl RarBuilder {
         rars_rs::rar50::write_streaming_volumes_with_progress(
             &self.rar50_entries(),
             self.rar50_options(),
-            rars_rs::rar50::ArchiveExtras::default().with_recovery_percent(self.recovery_percent),
+            rars_rs::rar50::ArchiveExtras::default()
+                .with_recovery_percent(self.recovery_percent)
+                .with_filter_policy(self.rar50_filter_policy()),
             volume_size as u64,
             &mut sink,
             &rars_rs::WriterResources::default(),
