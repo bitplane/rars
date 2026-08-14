@@ -1,5 +1,3 @@
-use crate::version::ArchiveVersion;
-
 /// What a caller is asking a writer to do, beyond the data it hands over.
 ///
 /// Only choices that cannot be read off the data itself live here. Whether an
@@ -64,10 +62,6 @@ impl FeatureSet {
         Feature::ALL
             .into_iter()
             .find(|feature| feature.get(self) && !feature.get(supported))
-    }
-
-    pub fn validate_for(self, version: ArchiveVersion) -> crate::error::Result<()> {
-        crate::write_plan::validate_features(version, self, crate::write_plan::PlanShape::default())
     }
 }
 

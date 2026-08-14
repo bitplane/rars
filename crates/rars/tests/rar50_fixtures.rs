@@ -4867,6 +4867,103 @@ fn volume_payload(len: u32) -> Vec<u8> {
         .collect()
 }
 
+/// What the capability table says about a RAR 5 volume set has to be what the
+/// volume writer does.
+///
+/// The table used to promise comments, metadata and quick-open for split RAR 5
+/// sets while the writer refused all three, so refusals for other formats sent
+/// people to rar50 and rar50 failed too. The matrix test in write_plan.rs
+/// compares `supports` with `validate_plan`, which are two halves of the same
+/// table; nothing compared either with the writer.
+#[test]
+fn the_volume_writer_refuses_exactly_what_the_table_refuses() {
+    use rars::WriterOption;
+
+    let payload = volume_payload(40_000);
+    let entries = [streaming_entry("member.bin", &payload)];
+    let shape = rars::PlanShape::new().compressed(true).volumes(true);
+
+    for option in [
+        WriterOption::ArchiveComment,
+        WriterOption::ArchiveMetadata,
+        WriterOption::Feature(rars::Feature::QuickOpen),
+        WriterOption::RecoveryRecord,
+    ] {
+        let mut features = FeatureSet::store_only();
+        let mut extras = rar50::ArchiveExtras::default();
+        match option {
+            WriterOption::ArchiveComment => extras = extras.with_comment(b"comment"),
+            WriterOption::ArchiveMetadata => {
+                extras = extras.with_metadata(rar50::ArchiveMetadataEntry {
+                    name: Some(b"set.rar"),
+                    creation_time: Some(0x01dc_d60e_662d_7a32),
+                })
+            }
+            WriterOption::Feature(rars::Feature::QuickOpen) => features.quick_open = true,
+            WriterOption::RecoveryRecord => extras = extras.with_recovery_percent(Some(5)),
+            _ => unreachable!("every option in the list above is handled"),
+        }
+
+        let mut sink = CollectingVolumeSink::default();
+        let result = rar50::write_streaming_volumes_to(
+            &entries,
+            rar50::WriterOptions::new(ArchiveVersion::Rar50, features).with_compression_level(1),
+            extras,
+            20_000,
+            &mut sink,
+            &rars::WriterResources::default(),
+        );
+
+        assert_eq!(
+            result.is_ok(),
+            rars::supports(ArchiveVersion::Rar50, option, shape),
+            "{option:?}: the table and the volume writer disagree, writer said {result:?}"
+        );
+    }
+}
+
+/// Solid members are coded as one chain, so the filter search never runs for
+/// them. Both entry points have to say so; the archive path used to and the
+/// volume path silently dropped the request.
+#[test]
+fn both_rar50_entry_points_refuse_a_filter_with_solid() {
+    let payload = volume_payload(40_000);
+    let entries = [streaming_entry("member.bin", &payload)];
+    let mut features = FeatureSet::store_only();
+    features.solid = true;
+    let options =
+        rar50::WriterOptions::new(ArchiveVersion::Rar50, features).with_compression_level(1);
+    let extras = || {
+        rar50::ArchiveExtras::default().with_filter_policy(rar50::FilterPolicy::Explicit(
+            rars::FilterSpec::whole(rars::FilterKind::E8),
+        ))
+    };
+
+    let mut sink = CollectingVolumeSink::default();
+    let volumes = rar50::write_streaming_volumes_to(
+        &entries,
+        options,
+        extras(),
+        20_000,
+        &mut sink,
+        &rars::WriterResources::default(),
+    );
+    let mut out = Vec::new();
+    let archive = rar50::write_streaming_archive_to(
+        &entries,
+        options,
+        extras(),
+        &rars::WriterResources::default(),
+        &mut out,
+    );
+
+    assert!(
+        volumes.is_err(),
+        "the volume path took the filter and dropped it"
+    );
+    assert!(archive.is_err());
+}
+
 fn write_volume_set(
     entries: &[rar50::ArchiveEntry],
     features: FeatureSet,

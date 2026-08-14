@@ -1044,7 +1044,7 @@ fn rejects_multivolume_with_multiple_inputs() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(stderr(&output).contains("multivolume writer currently supports one input file"));
+    assert!(stderr(&output).contains("multivolume writer supports one input file"));
 }
 
 #[test]
@@ -5488,6 +5488,24 @@ const REJECTED_COMBINATIONS: &[(&[&str], &str)] = &[
         &["--format", "rar30", "--file-comment", "note"],
         "error: --file-comment is not supported by --format rar30; use --format rar14, \
          --format rar15, --format rar20, --format rar29, --format rar50 or --format rar70",
+    ),
+    // Two filters have to be reported as the conflict they are. Asking which
+    // one the format supports has no answer, and the two checks rank the flags
+    // differently, so the format check used to name a flag it never looked at:
+    // rar50 was told it could not write --delta-filter, which it can.
+    (
+        &[
+            "--format",
+            "rar50",
+            "--delta-filter",
+            "1",
+            "--itanium-filter",
+        ],
+        "error: only one filter can be asked for at a time",
+    ),
+    (
+        &["--format", "rar29", "--e8-filter", "--audio-filter", "2"],
+        "error: only one filter can be asked for at a time",
     ),
 ];
 

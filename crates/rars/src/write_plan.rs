@@ -197,14 +197,21 @@ pub fn supports(target: ArchiveVersion, option: WriterOption, shape: PlanShape) 
                 | ArchiveVersion::Rar50
                 | ArchiveVersion::Rar70
         ),
-        // Quick-open indexes headers, so it cannot cover encrypted ones.
-        WriterOption::Feature(Feature::QuickOpen) => family == ArchiveFamily::Rar50Plus,
+        // Quick-open indexes headers, so it cannot cover encrypted ones, and
+        // no volume writer emits the index.
+        WriterOption::Feature(Feature::QuickOpen) => {
+            family == ArchiveFamily::Rar50Plus && !shape.volumes
+        }
         WriterOption::CompressionLevel => true,
-        // PPMd arrived with RAR 2.9 and left again with RAR 5.
-        WriterOption::CompressionMethod => matches!(
-            target,
-            ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
-        ),
+        // PPMd arrived with RAR 2.9 and left again with RAR 5. The legacy
+        // volume writer takes a packed payload rather than a method, so a
+        // split set is always LZ.
+        WriterOption::CompressionMethod => {
+            matches!(
+                target,
+                ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
+            ) && !shape.volumes
+        }
         WriterOption::DictionarySize => !family_is(family, ArchiveFamily::Rar13),
         // RAR 1.3 and 1.5 have no filters at all; RAR 2.0 predates the VM. The
         // legacy volume writer takes a payload rather than a policy, so a
@@ -220,9 +227,10 @@ pub fn supports(target: ArchiveVersion, option: WriterOption, shape: PlanShape) 
         }
         WriterOption::RecoveryRecord => family == ArchiveFamily::Rar50Plus,
         WriterOption::VolumeSize => true,
-        // The legacy volume writer emits the split member and nothing else, so
-        // a comment has nowhere to go in a split set.
-        WriterOption::ArchiveComment => family == ArchiveFamily::Rar50Plus || !shape.volumes,
+        // No volume writer carries a comment: the legacy one emits the split
+        // member and nothing else, and the RAR 5 one refuses comments outright
+        // because a volume set has no single place to put one.
+        WriterOption::ArchiveComment => !shape.volumes,
         // RAR 3.x and 4.x moved file comments into a form this writer does not
         // emit. RAR 5 carries them as a service record, which the legacy
         // writers cannot split across volumes.
@@ -230,7 +238,7 @@ pub fn supports(target: ArchiveVersion, option: WriterOption, shape: PlanShape) 
             !matches!(target, ArchiveVersion::Rar30 | ArchiveVersion::Rar40)
                 && (family == ArchiveFamily::Rar50Plus || !shape.volumes)
         }
-        WriterOption::ArchiveMetadata => family == ArchiveFamily::Rar50Plus,
+        WriterOption::ArchiveMetadata => family == ArchiveFamily::Rar50Plus && !shape.volumes,
         WriterOption::Password => true,
         // Every writer compresses to a budget now: RAR 5 sizes its blocks by
         // it, and the older ones use it to decide how many members to have in

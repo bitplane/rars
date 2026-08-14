@@ -193,19 +193,21 @@ pub fn write_streaming_volumes_with_progress(
             feature: "RAR 5 writer mixing encrypted and plain members",
         });
     }
-    if extras.quick_open || extras.comment.is_some() || extras.metadata.is_some() {
-        return Err(Error::UnsupportedFeature {
-            version: options.target,
-            feature: "RAR 5 volume writer comments, metadata or quick-open",
-        });
+    let shape = PlanShape::new()
+        .compressed(true)
+        .volumes(true)
+        .filtered(extras.filter_policy != FilterPolicy::None);
+    // One option at a time, so a refusal names the one that was asked for.
+    // This used to be a single check over all three, which reported a string
+    // naming every option it covered whichever one the caller had set. Quick
+    // open rides on the feature set, so `validate_plan` catches that one.
+    validate_plan(options, shape)?;
+    if extras.comment.is_some() {
+        crate::write_plan::validate_option(options.target, WriterOption::ArchiveComment, shape)?;
     }
-    validate_plan(
-        options,
-        PlanShape::new()
-            .compressed(true)
-            .volumes(true)
-            .filtered(extras.filter_policy != FilterPolicy::None),
-    )?;
+    if extras.metadata.is_some() {
+        crate::write_plan::validate_option(options.target, WriterOption::ArchiveMetadata, shape)?;
+    }
     if let Some(percent) = extras.recovery_percent {
         validate_recovery_percent(percent)?;
     }
@@ -357,15 +359,6 @@ pub(crate) fn write_streaming_archive_reporting(
         return Err(Error::UnsupportedFeature {
             version: options.target,
             feature: "RAR 5 quick-open index in a header-encrypted archive",
-        });
-    }
-    // Solid members share one dictionary, so there is nowhere to put a filter
-    // that applies to some of them and not others. Only the buffered writer
-    // used to say so; this path took the request and quietly dropped it.
-    if extras.filter_policy != FilterPolicy::None && options.features.solid {
-        return Err(Error::UnsupportedFeature {
-            version: options.target,
-            feature: "RAR 5 solid filtered compressed writer",
         });
     }
 
@@ -629,6 +622,17 @@ fn validate_plan(options: WriterOptions, shape: PlanShape) -> Result<()> {
             target: options.target,
             option: WriterOption::Feature(crate::Feature::QuickOpen),
             because: Some("with header encryption"),
+        });
+    }
+    // Solid members share one dictionary and are coded as one chain, so the
+    // filter search never runs for them. Relations between two requests cannot
+    // be expressed in the capability table, which is why this lives here rather
+    // than in `supports`.
+    if shape.filtered && options.features.solid {
+        return Err(Error::UnsupportedWriterOption {
+            target: options.target,
+            option: WriterOption::Filter,
+            because: Some("in a solid archive"),
         });
     }
     Ok(())

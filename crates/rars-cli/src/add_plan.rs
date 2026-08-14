@@ -258,11 +258,16 @@ pub(crate) fn reject_unsupported(
 ) -> Result<(), CliError> {
     for &(option, wanted) in asked {
         if wanted && !rars::supports(target, option, shape) {
+            // Several options are refused only once the archive is split, so
+            // "not supported by --format rar50" on its own would read as a gap
+            // in the format rather than a reason to drop --volume-size.
+            let because = (shape.volumes && rars::supports(target, option, without_volumes(shape)))
+                .then_some("in a volume set");
             return Err(map_write_error(
                 rars::Error::UnsupportedWriterOption {
                     target,
                     option,
-                    because: None,
+                    because,
                 },
                 shape,
                 filters,
@@ -270,6 +275,13 @@ pub(crate) fn reject_unsupported(
         }
     }
     Ok(())
+}
+
+/// The same plan without the split, to ask whether splitting is the reason.
+fn without_volumes(shape: PlanShape) -> PlanShape {
+    PlanShape::new()
+        .compressed(shape.compressed)
+        .filtered(shape.filtered)
 }
 
 #[cfg(test)]

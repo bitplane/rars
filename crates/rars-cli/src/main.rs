@@ -1121,8 +1121,11 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
             (rars::WriterOption::TempDir, temp_dir.is_some()),
         ],
     )?;
-    add_plan::reject_unsupported_filter(target, &asked_filters)?;
+    // Before anything that asks which filter was requested: with two of them
+    // asked for, "which one" has no answer, and the two helpers rank them
+    // differently, so the format check would name a flag it had not looked at.
     add_plan::reject_multiple_filters(&asked_filters)?;
+    add_plan::reject_unsupported_filter(target, &asked_filters)?;
     add_plan::reject_filter_with_solid(target, &asked_filters, auto_filter, solid)?;
     if store {
         add_plan::reject_coding_without_compression(&asked_filters, auto_filter, ppmd)?;
@@ -1134,18 +1137,17 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
             "--encrypt-headers needs a --password to encrypt them with",
         ));
     }
-    if matches!(
-        target,
-        ArchiveVersion::Rar14
-            | ArchiveVersion::Rar15
-            | ArchiveVersion::Rar20
-            | ArchiveVersion::Rar29
-            | ArchiveVersion::Rar30
-            | ArchiveVersion::Rar40
-    ) && volume_size.is_some()
+    // Every writer below RAR 5 splits a single packed payload, so a set can
+    // only hold one member. This was a hand-written list of six versions with
+    // rar13 already missing from it, harmless only because `--format rar13`
+    // has no spelling yet: adding one would have let a set through to
+    // `owned.first()`, which archives the first input and drops the rest
+    // without a word.
+    if target.family() != rars::ArchiveFamily::Rar50Plus
+        && volume_size.is_some()
         && input_paths.len() != 1
     {
-        return Err("multivolume writer currently supports one input file".into());
+        return Err("multivolume writer supports one input file".into());
     }
     if matches!(target, ArchiveVersion::Rar50 | ArchiveVersion::Rar70) {
         // Quick-open indexes plaintext headers, so the two cannot combine.
