@@ -352,8 +352,14 @@ pub(crate) fn choose_filter<S: FilterSearch>(
 /// Progress is reported by encoder position, and the search walks the member
 /// several times over, so the reporter needs the total to scale by. What
 /// survives the screens is not knowable without doing the work, so this assumes
-/// one detectorless filter does: a progress bar that finishes a little early or
-/// a little late is not worth a second search to predict exactly.
+/// one detectorless filter does, and that the x86 detector finds code and
+/// proposes its usual pair of specs.
+///
+/// Deliberately does not run the detector to find out. This is called for every
+/// member before anything is compressed, and scanning here only to scan again
+/// inside the search cost a second pass over the member to sharpen a percentage.
+/// A progress bar that finishes a little early or a little late is not worth
+/// that.
 pub(crate) fn walk_bytes<S: FilterSearch>(
     search: &S,
     data: &[u8],
@@ -363,14 +369,14 @@ pub(crate) fn walk_bytes<S: FilterSearch>(
     let encoder_candidates = encoder_candidates.max(1) as u64;
     let sample = screen_sample(data).len() as u64;
     let screened = search.screened_kinds(data).len() as u64;
-    let regions = search.detects_x86().then(|| x86_code_regions(data));
-    let x86 = regions
-        .as_ref()
-        .map_or(0, |regions| if regions.is_empty() { 0 } else { sample * 2 });
-    let screen = sample * (screened + 1) + x86;
-    let x86_finalists = regions
-        .as_ref()
-        .map_or(0, |regions| x86_finalists(data, regions).len() as u64);
+    // Two sample encodes for the x86 screen, and the two specs it proposes when
+    // the detector does find code.
+    let (x86_screen, x86_finalists) = if search.detects_x86() {
+        (sample * 2, 2)
+    } else {
+        (0, 0)
+    };
+    let screen = sample * (screened + 1) + x86_screen;
     // The unfiltered member, the x86 finalists, and one assumed screen survivor.
     let finalists = 2 + x86_finalists;
     screen + member * (finalists + encoder_candidates - 1)

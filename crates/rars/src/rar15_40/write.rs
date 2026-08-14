@@ -556,11 +556,21 @@ fn encode_rar29_auto_filtered_member(
             method: 0x35,
         });
     }
+    // The search measures the unfiltered member as one of its own candidates
+    // and returns the winner's bytes, so encoding the member plainly here as
+    // well was a second full pass over every binary member on the default
+    // settings. Text goes nowhere near the search, so it still needs one.
+    let text = is_text_ppmd_candidate(data);
+    let searching = !text && crate::filter_search::search_applies(data);
     let mut best = EncodedPayload {
-        data: unpack29_encode_literals_with_options(data, options).map_err(Error::from)?,
+        data: if searching {
+            crate::filter_search::choose_filter(&Rar29Search, data, options, None)?.1
+        } else {
+            unpack29_encode_literals_with_options(data, options).map_err(Error::from)?
+        },
         method: lz_method,
     };
-    if include_ppmd && data.len() <= 1024 * 1024 && is_text_ppmd_candidate(data) {
+    if include_ppmd && data.len() <= 1024 * 1024 && text {
         let ppmd = EncodedPayload {
             data: unpack29_encode_ppmd(data).map_err(Error::from)?,
             method: 0x35,
@@ -570,17 +580,8 @@ fn encode_rar29_auto_filtered_member(
         }
         return Ok(best);
     }
-    if is_text_ppmd_candidate(data) {
+    if text {
         return Ok(best);
-    }
-    if crate::filter_search::search_applies(data) {
-        let (_, packed) = crate::filter_search::choose_filter(&Rar29Search, data, options, None)?;
-        if packed.len() < best.data.len() {
-            best = EncodedPayload {
-                data: packed,
-                method: lz_method,
-            };
-        }
     }
     if include_ppmd && is_auto_ppmd_candidate(data) {
         let ppmd = EncodedPayload {
