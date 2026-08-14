@@ -573,15 +573,6 @@ struct Known {
 }
 
 const KNOWN_BAD: &[Known] = &[
-    // #65. A member that continues across a volume boundary. The legacy
-    // formats had this too until the RAR 2.9 terminator fix, which leaves it
-    // to the separate RAR 5 volume writer.
-    Known {
-        formats: &["rar50", "rar70"],
-        cells: &["volumes", "volumes-encrypted"],
-        decoder: "7zz",
-        task: "#65",
-    },
     // #66. RAR 3.x and 4.x header encryption, which 7-Zip cannot open at all.
     Known {
         formats: &["rar30", "rar40"],

@@ -71,11 +71,43 @@ fn assert_rar50_end_header_has_flags_vint(archive: &Archive) {
             _ => None,
         })
         .expect("archive has end header");
-    assert_eq!(end.header_type, 5);
+    assert_eq!(end.block.header_type, 5);
     assert_eq!(
-        end.header_size, 3,
+        end.block.header_size, 3,
         "RAR 5 end header must include End of Archive Flags vint"
     );
+}
+
+/// Every volume but the last has to say another one follows. unrar guesses
+/// from the file names and does not care, but 7-Zip believes the flag: with it
+/// clear it stops at the volume it was handed, and a member continuing into the
+/// next one comes out truncated as a data error.
+fn assert_volume_set_links_its_parts(parts: &[Vec<u8>], password: Option<&[u8]>) {
+    for (index, part) in parts.iter().enumerate() {
+        let archive = match password {
+            Some(password) => {
+                Archive::parse_with_options(part, ArchiveReadOptions::with_password(password))
+                    .unwrap()
+            }
+            None => Archive::parse(part).unwrap(),
+        };
+        let end = archive
+            .blocks
+            .iter()
+            .find_map(|block| match block {
+                Block::End(header) => Some(header),
+                _ => None,
+            })
+            .expect("a volume ends with an end header");
+        let last = index + 1 == parts.len();
+        assert_eq!(
+            end.has_next_volume(),
+            !last,
+            "volume {} of {} has the wrong next-volume flag",
+            index + 1,
+            parts.len()
+        );
+    }
 }
 
 fn collect_extract_with_password(
@@ -999,6 +1031,7 @@ fn writes_compressed_rar50_volume_set_that_reader_reassembles() {
         None,
     )
     .unwrap();
+    assert_volume_set_links_its_parts(&parts, None);
 
     assert!(parts.len() >= 2);
     let archives: Vec<_> = parts
@@ -1038,6 +1071,7 @@ fn compressed_rar50_volume_writer_stores_member_when_lz_payload_would_grow() {
         None,
     )
     .unwrap();
+    assert_volume_set_links_its_parts(&parts, None);
 
     assert!(parts.len() >= 2);
     let archives: Vec<_> = parts
@@ -1068,6 +1102,7 @@ fn writes_compressed_rar50_volume_set_with_recovery_records() {
         Some(8),
     )
     .unwrap();
+    assert_volume_set_links_its_parts(&parts, None);
 
     assert!(parts.len() >= 2);
     let archives: Vec<_> = parts
@@ -1106,6 +1141,7 @@ fn writes_solid_compressed_rar50_volume_set_that_reader_reassembles() {
         None,
     )
     .unwrap();
+    assert_volume_set_links_its_parts(&parts, None);
 
     assert!(parts.len() >= 2);
     let archives: Vec<_> = parts
@@ -1150,6 +1186,7 @@ fn writes_multi_file_solid_compressed_rar50_volume_set_that_reader_reassembles()
         None,
     )
     .unwrap();
+    assert_volume_set_links_its_parts(&parts, None);
 
     assert!(parts.len() >= 2);
     let archives: Vec<_> = parts
@@ -1809,6 +1846,7 @@ fn writes_stored_rar50_volume_set_that_reader_reassembles() {
         None,
     )
     .unwrap();
+    assert_volume_set_links_its_parts(&parts, None);
     assert!(parts.len() > 2);
 
     let archives: Vec<_> = parts
@@ -1850,6 +1888,7 @@ fn writes_stored_rar50_volume_set_with_recovery_records() {
         Some(8),
     )
     .unwrap();
+    assert_volume_set_links_its_parts(&parts, None);
     assert!(parts.len() > 2);
 
     let archives: Vec<_> = parts
@@ -2686,6 +2725,7 @@ fn writes_encrypted_stored_rar50_volume_set_that_reader_reassembles_with_passwor
         None,
     )
     .unwrap();
+    assert_volume_set_links_its_parts(&parts, None);
     let second_parts = write_volumes(
         std::slice::from_ref(&entry),
         stored(rar50::WriterOptions::new(ArchiveVersion::Rar50, features)),
@@ -2755,6 +2795,7 @@ fn writes_encrypted_stored_rar50_volume_set_with_recovery_records() {
         Some(8),
     )
     .unwrap();
+    assert_volume_set_links_its_parts(&parts, None);
 
     let archives: Vec<_> = parts
         .iter()
@@ -2795,6 +2836,7 @@ fn writes_header_encrypted_stored_rar50_volume_set_that_reader_reassembles_with_
         None,
     )
     .unwrap();
+    assert_volume_set_links_its_parts(&parts, Some(b"password"));
     let second_parts = write_volumes(
         std::slice::from_ref(&entry),
         stored(rar50::WriterOptions::new(ArchiveVersion::Rar50, features)),
@@ -2844,6 +2886,7 @@ fn writes_encrypted_compressed_rar50_volume_set_that_reader_reassembles_with_pas
         None,
     )
     .unwrap();
+    assert_volume_set_links_its_parts(&parts, None);
     let second_parts = write_volumes(
         std::slice::from_ref(&entry),
         rar50::WriterOptions::new(ArchiveVersion::Rar50, features),
@@ -2893,6 +2936,7 @@ fn encrypted_compressed_rar50_volume_writer_stores_member_when_lz_payload_would_
         None,
     )
     .unwrap();
+    assert_volume_set_links_its_parts(&parts, None);
 
     assert!(parts.len() >= 2);
     let archives: Vec<_> = parts
@@ -2925,6 +2969,7 @@ fn writes_encrypted_compressed_rar50_volume_set_with_recovery_records() {
         Some(8),
     )
     .unwrap();
+    assert_volume_set_links_its_parts(&parts, None);
 
     let archives: Vec<_> = parts
         .iter()
@@ -2964,6 +3009,7 @@ fn writes_encrypted_solid_compressed_rar50_volume_set_that_reader_reassembles_wi
         None,
     )
     .unwrap();
+    assert_volume_set_links_its_parts(&parts, None);
 
     let archives: Vec<_> = parts
         .iter()
@@ -2996,6 +3042,7 @@ fn writes_header_encrypted_compressed_rar50_volume_set_that_reader_reassembles_w
         None,
     )
     .unwrap();
+    assert_volume_set_links_its_parts(&parts, Some(b"password"));
     let second_parts = write_volumes(
         std::slice::from_ref(&entry),
         rar50::WriterOptions::new(ArchiveVersion::Rar50, features),
@@ -3044,6 +3091,7 @@ fn writes_header_encrypted_solid_compressed_rar50_volume_set_that_reader_reassem
         None,
     )
     .unwrap();
+    assert_volume_set_links_its_parts(&parts, Some(b"password"));
     assert!(matches!(
         Archive::parse(&parts[0]),
         Err(Error::NeedPassword)
@@ -3091,6 +3139,7 @@ fn writes_encrypted_multi_file_solid_compressed_rar50_volume_set_that_reader_rea
         None,
     )
     .unwrap();
+    assert_volume_set_links_its_parts(&parts, None);
 
     let archives: Vec<_> = parts
         .iter()
@@ -3135,6 +3184,7 @@ fn writes_header_encrypted_multi_file_solid_compressed_rar50_volume_set_that_rea
         None,
     )
     .unwrap();
+    assert_volume_set_links_its_parts(&parts, Some(b"password"));
     assert!(matches!(
         Archive::parse(&parts[0]),
         Err(Error::NeedPassword)

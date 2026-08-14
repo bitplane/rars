@@ -35,6 +35,11 @@ const HFL_DATA: u64 = 0x0002;
 const HFL_SPLIT_BEFORE: u64 = 0x0008;
 const HFL_SPLIT_AFTER: u64 = 0x0010;
 
+/// Set on the end-of-archive block of every volume that is not the last, so a
+/// reader knows to look for the next one rather than stopping where the file
+/// does.
+const EFL_NEXT_VOLUME: u64 = 0x0001;
+
 const MHFL_VOLUME: u64 = 0x0001;
 const MHFL_VOLUME_NUMBER: u64 = 0x0002;
 const MHFL_SOLID: u64 = 0x0004;
@@ -135,8 +140,24 @@ pub struct ArchiveMetadataRecord {
 pub enum Block {
     File(FileHeader),
     Service(FileHeader),
-    End(BlockHeader),
+    End(EndHeader),
     Unknown(BlockHeader),
+}
+
+/// The block that closes an archive. Its one field says whether the set carries
+/// on into another volume, which a reader has to honour: a volume set is not
+/// over because the file is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct EndHeader {
+    pub block: BlockHeader,
+    pub flags: u64,
+}
+
+impl EndHeader {
+    pub fn has_next_volume(&self) -> bool {
+        self.flags & EFL_NEXT_VOLUME != 0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1323,7 +1344,21 @@ where
                 });
             }
             HEAD_END => {
-                blocks.push(Block::End(parsed.block));
+                // A block with no room for the vint reads as no flags rather
+                // than as a broken archive. Hand-built and truncated archives
+                // do turn up with an empty end block, and the field only says
+                // whether to look for another volume.
+                let flags = read_vint_at(
+                    &parsed.header,
+                    parsed.type_specific_range.start,
+                    parsed.type_specific_range.end,
+                )
+                .map(|(flags, _)| flags)
+                .unwrap_or(0);
+                blocks.push(Block::End(EndHeader {
+                    block: parsed.block,
+                    flags,
+                }));
                 break;
             }
             _ => blocks.push(Block::Unknown(parsed.block)),

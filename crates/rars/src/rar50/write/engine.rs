@@ -912,7 +912,13 @@ impl VolumeWriter<'_> {
         let mut split_before = false;
         // Zero-length members still need a header of their own.
         loop {
-            if self.body.is_none() || self.payload_in_volume == self.max_payload_per_volume {
+            // A volume that filled exactly is left open until something asks
+            // for room, because until then we cannot say whether it is the last
+            // one, and its end-of-archive block has to say which.
+            if self.body.is_some() && self.payload_in_volume == self.max_payload_per_volume {
+                self.finish_volume(true)?;
+            }
+            if self.body.is_none() {
                 self.start_volume()?;
             }
             let room = self.max_payload_per_volume - self.payload_in_volume;
@@ -937,9 +943,6 @@ impl VolumeWriter<'_> {
             start += fragment_len;
             split_before = true;
 
-            if self.payload_in_volume == self.max_payload_per_volume {
-                self.finish_volume()?;
-            }
             if start >= member.payload_len {
                 return Ok(());
             }
@@ -948,7 +951,7 @@ impl VolumeWriter<'_> {
 
     fn finish(mut self) -> Result<()> {
         if self.body.is_some() {
-            self.finish_volume()?;
+            self.finish_volume(false)?;
         }
         Ok(())
     }
@@ -959,7 +962,7 @@ impl VolumeWriter<'_> {
         Ok(())
     }
 
-    fn finish_volume(&mut self) -> Result<()> {
+    fn finish_volume(&mut self, more_volumes_follow: bool) -> Result<()> {
         let mut body = self.body.take().expect("volume started");
         let volume_number = self.volume_index;
         self.volume_index += 1;
@@ -1048,19 +1051,24 @@ impl VolumeWriter<'_> {
             )?;
         }
 
+        let end_flags = if more_volumes_follow {
+            crate::rar50::EFL_NEXT_VOLUME
+        } else {
+            0
+        };
         let end = match self.header_keys {
             Some(keys) => encrypted_header_block(
                 &keys.keys,
                 HEAD_END,
                 0,
                 None,
-                &super::end_header_specific(0),
+                &super::end_header_specific(end_flags),
                 &[],
                 &[],
             )?,
             None => {
                 let mut end = Vec::new();
-                write_end_header(&mut end, 0)?;
+                write_end_header(&mut end, end_flags)?;
                 end
             }
         };
