@@ -675,7 +675,9 @@ impl TryFrom<crate::FilterKind> for Rar50Filter {
     }
 }
 
-fn filtered_lz_member(
+/// Applies `filters` to a copy of `data`, returning the transformed bytes and
+/// the records that describe them.
+pub(crate) fn filtered_lz_member(
     data: &[u8],
     filters: &[crate::FilterSpec],
 ) -> Result<(Vec<u8>, Vec<EncodeFilter>)> {
@@ -1151,7 +1153,7 @@ enum EncodeToken {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct EncodeFilter {
+pub(crate) struct EncodeFilter {
     offset: usize,
     length: usize,
     filter_type: FilterType,

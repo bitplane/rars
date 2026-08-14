@@ -1,7 +1,7 @@
 //! RAR compression codecs, filters, PPMd, and RARVM components used by `rars`.
 
 mod fast;
-mod filters;
+pub(crate) mod filters;
 mod huffman;
 mod match_finder;
 mod ppmd;

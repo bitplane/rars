@@ -174,7 +174,10 @@ fn encode_ppmd_filtered_member(
     encode_ppmd_member(&filtered.data, lz_escapes, &records)
 }
 
-fn filtered_members(input: &[u8], filters: &[crate::FilterSpec]) -> Result<FilteredMembers> {
+pub(crate) fn filtered_members(
+    input: &[u8],
+    filters: &[crate::FilterSpec],
+) -> Result<FilteredMembers> {
     let mut data = input.to_vec();
     let mut records = Vec::with_capacity(filters.len());
     for filter in filters {
@@ -191,8 +194,8 @@ fn filtered_members(input: &[u8], filters: &[crate::FilterSpec]) -> Result<Filte
     Ok(FilteredMembers { data, records })
 }
 
-struct FilteredMembers {
-    data: Vec<u8>,
+pub(crate) struct FilteredMembers {
+    pub(crate) data: Vec<u8>,
     records: Vec<OwnedVmFilterRecord>,
 }
 

@@ -512,6 +512,12 @@ impl crate::filter_search::FilterSearch for Rar29Search {
         ranking
     }
 
+    fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Vec<u8>> {
+        crate::codec::rar29::filtered_members(data, filters)
+            .map(|filtered| filtered.data)
+            .map_err(Error::from)
+    }
+
     fn encode_plain(
         &self,
         data: &[u8],

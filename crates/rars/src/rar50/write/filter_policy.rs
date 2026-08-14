@@ -316,8 +316,8 @@ pub(super) fn encode_safe_lz_member_with_progress(
 
 /// How RAR 5 measures a filter candidate, for the shared search.
 #[derive(Clone, Copy)]
-struct Rar50Search {
-    algorithm_version: u8,
+pub(crate) struct Rar50Search {
+    pub(crate) algorithm_version: u8,
 }
 
 impl crate::filter_search::FilterSearch for Rar50Search {
@@ -331,6 +331,12 @@ impl crate::filter_search::FilterSearch for Rar50Search {
             FilterKind::Delta { channels: 3 },
             FilterKind::Delta { channels: 4 },
         ]
+    }
+
+    fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Vec<u8>> {
+        crate::codec::rar50::filtered_lz_member(data, filters)
+            .map(|(filtered, _)| filtered)
+            .map_err(Error::from)
     }
 
     fn encode_plain(

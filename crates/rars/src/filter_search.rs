@@ -78,6 +78,20 @@ pub(crate) trait FilterSearch {
         options
     }
 
+    /// Apply the filters to a copy of `data`, without encoding it.
+    ///
+    /// The screens measure a transform by compressing its output against the
+    /// unfiltered bytes. Comparing a filtered *encode* with an unfiltered one
+    /// measured something else: on a 396 KB binary the 128 KiB sample said the
+    /// E8E9 filter cost 10% (74322 plain against 81744 filtered) while the same
+    /// filter was worth 7.4% of the finished archive, so every x86 member was
+    /// screened out before anything measured it. Compressing the transformed
+    /// bytes put the sample back in agreement with the member: 73579.
+    ///
+    /// Why the two encode paths disagree by that much on real data is not
+    /// settled; on synthetic x86 they differ by a few bytes.
+    fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Vec<u8>>;
+
     /// Encode without filters.
     ///
     /// Separate from [`FilterSearch::encode_filtered`] because carrying filters
@@ -181,10 +195,13 @@ fn screen_kinds<S: FilterSearch>(
     let reusable = sample.len() == data.len() && screen_options == options;
     let baseline = search.encode_plain(sample, screen_options, None)?;
     for kind in search.screened_kinds(data) {
-        let packed =
-            search.encode_filtered(sample, &[FilterSpec::whole(kind)], screen_options, None)?;
+        let transformed = search.filtered_bytes(sample, &[FilterSpec::whole(kind)])?;
+        let packed = search.encode_plain(&transformed, screen_options, None)?;
         if screen_wins(packed.len(), baseline.len()) {
-            outcome.kinds.push((kind, reusable.then_some(packed)));
+            // The screen measured the transform, not the encode the writer
+            // would emit, so this is evidence for a finalist rather than a
+            // measurement the search can reuse.
+            outcome.kinds.push((kind, None));
         }
     }
     if reusable {
@@ -223,12 +240,8 @@ fn x86_helps_sample<S: FilterSearch>(
     // reduced parse ranks them the same way; this is a single yes or no with no
     // margin under it, and two sample encodes are cheap enough to get right.
     let baseline = search.encode_plain(sample, options, None)?;
-    let filtered = search.encode_filtered(
-        sample,
-        &[FilterSpec::whole(FilterKind::E8E9)],
-        options,
-        None,
-    )?;
+    let transformed = search.filtered_bytes(sample, &[FilterSpec::whole(FilterKind::E8E9)])?;
+    let filtered = search.encode_plain(&transformed, options, None)?;
     // No margin here, unlike the detectorless filters: the scanner has already
     // ruled on where code is, so a small win on this sample is evidence rather
     // than noise.
@@ -424,6 +437,12 @@ mod tests {
             ]
         }
 
+        fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Vec<u8>> {
+            crate::codec::rar50::filtered_lz_member(data, filters)
+                .map(|(filtered, _)| filtered)
+                .map_err(crate::Error::from)
+        }
+
         fn screen_options(&self, options: EncodeOptions) -> EncodeOptions {
             if self.cheap_screens {
                 EncodeOptions::new(4).with_max_match_distance(options.max_match_distance)
@@ -518,15 +537,15 @@ mod tests {
     }
 
     #[test]
-    fn a_short_member_reuses_the_screens_encodes() {
+    fn a_short_member_reuses_only_the_unfiltered_encode() {
         let data = interleaved_counters()[..100_000].to_vec();
         assert!(data.len() <= SCREEN_SAMPLE_LEN);
         let screen = screen_kinds(&FULL, &data, options()).unwrap();
         assert!(screen.plain.is_some(), "the unfiltered encode is reusable");
-        assert!(
-            screen.kinds.iter().all(|(_, packed)| packed.is_some()),
-            "so is every survivor's"
-        );
+        // A survivor's number came from compressing the transformed bytes, not
+        // from the encode the writer would emit, so it cannot stand in for a
+        // measurement however long the member is.
+        assert!(screen.kinds.iter().all(|(_, packed)| packed.is_none()));
     }
 
     /// A screen run at cheaper settings measured something the finalists will
@@ -541,6 +560,43 @@ mod tests {
         let screen = screen_kinds(&cheap, &data, options()).unwrap();
         assert!(screen.plain.is_none());
         assert!(screen.kinds.iter().all(|(_, packed)| packed.is_none()));
+    }
+
+    /// x86 code the E8E9 filter plainly helps, in a member big enough that the
+    /// screen has to sample it.
+    fn x86_like(len: usize) -> Vec<u8> {
+        let mut state = 0x2545_f491u32;
+        let mut data = Vec::with_capacity(len);
+        while data.len() < len {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            if state.is_multiple_of(11) {
+                // A call to one of a few fixed addresses, which the filter turns
+                // into a handful of repeated relative offsets.
+                let target = 0x4000u32 + (state >> 28) * 0x400;
+                data.push(0xe8);
+                data.extend_from_slice(&target.to_le_bytes());
+            } else {
+                data.extend_from_slice(&[0x48, 0x89, (state >> 16) as u8, 0xe5]);
+            }
+        }
+        data.truncate(len);
+        data
+    }
+
+    /// The search has to end up with the filter when one plainly helps.
+    #[test]
+    fn the_screen_finds_a_filter_worth_having_on_a_sampled_member() {
+        let data = x86_like(SCREEN_SAMPLE_LEN * 4);
+        let (specs, packed) = choose_filter(&FULL, &data, options(), None).unwrap();
+        let plain = FULL.encode_plain(&data, options(), None).unwrap();
+
+        assert!(
+            !specs.is_empty(),
+            "the search left the filter on the table: {} against {} unfiltered",
+            packed.len(),
+            plain.len()
+        );
+        assert!(packed.len() < plain.len());
     }
 
     #[test]
