@@ -120,9 +120,13 @@ pub(super) fn filter_policy_walk_bytes(
     crate::filter_search::walk_bytes(&Rar50Search { algorithm_version }, data, encoder_candidates)
 }
 
+/// Whether a member compression did not help is better off stored.
+///
+/// Takes lengths rather than the bytes, because the streaming path decides this
+/// for a payload it has already spilled to disk.
 pub(super) fn should_store_compressed_payload(
-    data: &[u8],
-    packed: &[u8],
+    unpacked: u64,
+    packed: u64,
     solid: bool,
     policy: &FilterPolicy,
 ) -> bool {
@@ -130,7 +134,7 @@ pub(super) fn should_store_compressed_payload(
     // filled, so this writer can never go back and store one.
     crate::write_plan::StoreFallback::new()
         .filter_requested(matches!(policy, FilterPolicy::Explicit(_)))
-        .applies(solid, data.len(), packed.len())
+        .applies(solid, unpacked as usize, packed as usize)
 }
 
 pub(super) fn encode_options_for_level(

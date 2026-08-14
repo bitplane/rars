@@ -146,11 +146,19 @@ pub(super) fn compress_members_reporting(
                 input_size,
                 crc32,
                 hash,
-                // A solid member must never fall back to stored: the members
-                // after it decode against the dictionary it contributes to.
+                // One rule, shared with the whole-member path and the legacy
+                // writers, plus the two cases that are not really fallbacks:
+                // storing was asked for, and an empty member has nothing to
+                // pack. `StoreFallback` refuses to store a solid member, whose
+                // successors decode against the dictionary it fills.
                 store: plan.method == 0
                     || input_size == 0
-                    || (!plan.solid && packed.len() >= input_size),
+                    || should_store_compressed_payload(
+                        input_size,
+                        packed.len(),
+                        plan.solid,
+                        &plan.filter_policy,
+                    ),
                 packed,
                 solid_continuation: plan.solid && member > 0,
             },
@@ -234,8 +242,8 @@ fn compress_members_whole(
                     // An explicitly requested filter is not discarded just
                     // because the result did not shrink.
                     stored = should_store_compressed_payload(
-                        &data,
-                        &packed,
+                        data.len() as u64,
+                        packed.len() as u64,
                         plan.solid,
                         &plan.filter_policy,
                     );
