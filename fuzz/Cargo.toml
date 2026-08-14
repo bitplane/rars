@@ -75,3 +75,10 @@ path = "fuzz_targets/rar30_crypto.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "unpack15_round_trip"
+path = "fuzz_targets/unpack15_round_trip.rs"
+test = false
+doc = false
+bench = false
