@@ -573,15 +573,6 @@ struct Known {
 }
 
 const KNOWN_BAD: &[Known] = &[
-    // #59. PPMd on data with a wide symbol alphabet. rar29 packs the same
-    // bytes and unrar accepts those, so the difference is in what the header
-    // declares rather than in the stream.
-    Known {
-        formats: &["rar30", "rar40"],
-        cells: &["ppmd-mixed", "ppmd-mixed-encrypted"],
-        decoder: "unrar",
-        task: "#59",
-    },
     // #65. A member that continues across a volume boundary. The legacy
     // formats had this too until the RAR 2.9 terminator fix, which leaves it
     // to the separate RAR 5 volume writer.

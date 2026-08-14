@@ -15,6 +15,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
 
+/// What the writer declares for RAR 2.9, and so the distance limit PPMd has to
+/// encode within. Passing anything else here compares the codec against an
+/// archive the writer would not have written.
+const RAR29_DICTIONARY: usize = 1024 * 1024;
+
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/rar15_40")
@@ -3013,7 +3018,7 @@ fn auto_filtered_rar29_writer_chooses_ppmd_for_text_when_smaller() {
         );
     }
     let lz_packed = rars::codec::rar29::unpack29_encode_literals(&payload).unwrap();
-    let ppmd_packed = rars::codec::rar29::unpack29_encode_ppmd(&payload).unwrap();
+    let ppmd_packed = rars::codec::rar29::unpack29_encode_ppmd(&payload, RAR29_DICTIONARY).unwrap();
     assert!(
         ppmd_packed.len() < lz_packed.len(),
         "fixture must exercise the auto-policy PPMd candidate"
@@ -3063,7 +3068,7 @@ fn default_rar29_writer_uses_auto_policy_for_text() {
     .unwrap();
     let archive = Archive::parse(&bytes).unwrap();
     let file = archive.files().next().unwrap();
-    let ppmd_packed = rars::codec::rar29::unpack29_encode_ppmd(&payload).unwrap();
+    let ppmd_packed = rars::codec::rar29::unpack29_encode_ppmd(&payload, RAR29_DICTIONARY).unwrap();
 
     assert_eq!(file.method, 0x35);
     assert_eq!(file.pack_size, ppmd_packed.len() as u64);
@@ -3650,7 +3655,8 @@ fn ppmd_rar29_writer_uses_period_compatible_lz_escapes_for_repeated_data() {
         FilterPolicy::None,
     )
     .unwrap();
-    let codec_packed = rars::codec::rar29::unpack29_encode_ppmd(&payload).unwrap();
+    let codec_packed =
+        rars::codec::rar29::unpack29_encode_ppmd(&payload, RAR29_DICTIONARY).unwrap();
     let archive = Archive::parse(&ppmd).unwrap();
     let file = archive.files().next().unwrap();
 

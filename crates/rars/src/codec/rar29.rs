@@ -139,31 +139,37 @@ pub(crate) fn unpack29_encode_literals_with_options_and_progress(
 }
 
 pub fn unpack29_encode_ppmd_literals(input: &[u8]) -> Result<Vec<u8>> {
-    encode_ppmd_member(input, false, &[])
+    encode_ppmd_member(input, false, &[], 0)
 }
 
-pub fn unpack29_encode_ppmd(input: &[u8]) -> Result<Vec<u8>> {
-    encode_ppmd_member(input, true, &[])
+/// `max_match_distance` is the dictionary the file header declares. PPMd's
+/// escape-4 matches copy out of the same window the LZ decoder uses, so a match
+/// that reaches further back than the header promises lands on whatever the
+/// decoder still happens to hold, and unrar fails the member on its checksum.
+pub fn unpack29_encode_ppmd(input: &[u8], max_match_distance: usize) -> Result<Vec<u8>> {
+    encode_ppmd_member(input, true, &[], max_match_distance)
 }
 
 pub fn unpack29_encode_ppmd_with_filter(
     input: &[u8],
     filter: crate::FilterSpec,
+    max_match_distance: usize,
 ) -> Result<Vec<u8>> {
-    encode_ppmd_filtered_member(input, filter, true)
+    encode_ppmd_filtered_member(input, filter, true, max_match_distance)
 }
 
 pub fn unpack29_encode_ppmd_literals_with_filter(
     input: &[u8],
     filter: crate::FilterSpec,
 ) -> Result<Vec<u8>> {
-    encode_ppmd_filtered_member(input, filter, false)
+    encode_ppmd_filtered_member(input, filter, false, 0)
 }
 
 fn encode_ppmd_filtered_member(
     input: &[u8],
     filter: crate::FilterSpec,
     lz_escapes: bool,
+    max_match_distance: usize,
 ) -> Result<Vec<u8>> {
     let filters = split_large_filter(input.len(), filter)?;
     let filtered = filtered_members(input, &filters)?;
@@ -171,7 +177,7 @@ fn encode_ppmd_filtered_member(
     // record is declared at the start and the window does not constrain them.
     let refs: Vec<&OwnedVmFilterRecord> = filtered.records.iter().collect();
     let records = encoded_filter_records_at(&refs, 0, usize::MAX, &mut Vec::new())?;
-    encode_ppmd_member(&filtered.data, lz_escapes, &records)
+    encode_ppmd_member(&filtered.data, lz_escapes, &records, max_match_distance)
 }
 
 pub(crate) fn filtered_members(
@@ -279,14 +285,16 @@ fn encode_ppmd_member(
     input: &[u8],
     lz_escapes: bool,
     initial_filters: &[Vec<u8>],
+    max_match_distance: usize,
 ) -> Result<Vec<u8>> {
-    encode_ppmd_block(input, lz_escapes, initial_filters)
+    encode_ppmd_block(input, lz_escapes, initial_filters, max_match_distance)
 }
 
 fn encode_ppmd_block(
     input: &[u8],
     lz_escapes: bool,
     initial_filters: &[Vec<u8>],
+    max_match_distance: usize,
 ) -> Result<Vec<u8>> {
     const PPMD_ORDER: usize = 8;
     const PPMD_DICTIONARY_MB: u8 = 25;
@@ -299,7 +307,7 @@ fn encode_ppmd_block(
     for record in initial_filters {
         encoder.encode_vm_filter_record(record)?;
     }
-    for token in encode_ppmd_tokens(input, lz_escapes) {
+    for token in encode_ppmd_tokens(input, lz_escapes, max_match_distance) {
         match token {
             PpmdEncodeToken::Literal(byte) => encoder.encode_literal(byte)?,
             PpmdEncodeToken::RepeatOffsetOne { length } => {
@@ -1344,7 +1352,11 @@ struct MatchCandidate {
     score: isize,
 }
 
-fn encode_ppmd_tokens(input: &[u8], lz_escapes: bool) -> Vec<PpmdEncodeToken> {
+fn encode_ppmd_tokens(
+    input: &[u8],
+    lz_escapes: bool,
+    max_match_distance: usize,
+) -> Vec<PpmdEncodeToken> {
     if !lz_escapes {
         return input
             .iter()
@@ -1366,7 +1378,7 @@ fn encode_ppmd_tokens(input: &[u8], lz_escapes: bool) -> Vec<PpmdEncodeToken> {
             continue;
         }
 
-        if let Some((length, offset)) = best_ppmd_match(input, pos, &finder) {
+        if let Some((length, offset)) = best_ppmd_match(input, pos, &finder, max_match_distance) {
             tokens.push(PpmdEncodeToken::Match { offset, length });
             for history_pos in pos..pos + length {
                 finder.insert(input, history_pos);
@@ -1396,8 +1408,16 @@ fn ppmd_offset_one_repeat(input: &[u8], pos: usize) -> Option<usize> {
     (length >= 4).then_some(length)
 }
 
-fn best_ppmd_match(input: &[u8], pos: usize, finder: &Rar29MatchFinder) -> Option<(usize, usize)> {
-    let max_offset = pos.min(0x1000001).min(MAX_ENCODER_MATCH_OFFSET);
+fn best_ppmd_match(
+    input: &[u8],
+    pos: usize,
+    finder: &Rar29MatchFinder,
+    max_match_distance: usize,
+) -> Option<(usize, usize)> {
+    let max_offset = pos
+        .min(0x1000001)
+        .min(MAX_ENCODER_MATCH_OFFSET)
+        .min(max_match_distance);
     let max_length = (input.len() - pos).min(MAX_PPMD_MATCH_LENGTH);
     if max_offset < 2 || max_length < MIN_PPMD_MATCH_LENGTH || pos + 3 >= input.len() {
         return None;
@@ -3217,9 +3237,9 @@ mod tests {
         unpack29_encode_ppmd_with_filter, BitReader, BitWriter, EncodeOptions, EncodeToken,
         EncoderMatchState, Error, Huffman, LevelToken, MatchCandidate, OwnedVmFilterRecord,
         PpmdEncodeToken, Rar29MatchFinder, Result, StandardFilter, Unpack29, Unpack29Encoder,
-        VmFilter, VmProgram, VmProgramKind, MAIN_COUNT, MAX_MATCH_CANDIDATES,
-        MAX_VM_AUDIO_FILTER_BLOCK_SIZE, MAX_VM_DELTA_FILTER_BLOCK_SIZE, MAX_VM_FILTER_BLOCK_SIZE,
-        RAR3_AUDIO_FILTER_BYTECODE, TABLE_COUNT,
+        VmFilter, VmProgram, VmProgramKind, MAIN_COUNT, MAX_ENCODER_MATCH_OFFSET,
+        MAX_MATCH_CANDIDATES, MAX_VM_AUDIO_FILTER_BLOCK_SIZE, MAX_VM_DELTA_FILTER_BLOCK_SIZE,
+        MAX_VM_FILTER_BLOCK_SIZE, RAR3_AUDIO_FILTER_BYTECODE, TABLE_COUNT,
     };
 
     const COMPRESSED_TEXT: &[u8] = &[
@@ -3557,7 +3577,9 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
 
     #[test]
     fn ppmd_encoder_advertises_period_compatible_model_for_external_decoders() {
-        let packed = unpack29_encode_ppmd(b"rar29 ppmd dictionary header").unwrap();
+        let packed =
+            unpack29_encode_ppmd(b"rar29 ppmd dictionary header", MAX_ENCODER_MATCH_OFFSET)
+                .unwrap();
 
         assert_eq!(packed[0], 0xa7);
         assert_eq!(packed[1], 24);
@@ -3570,13 +3592,57 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
             .copied()
             .chain(std::iter::repeat_n(b'Z', 512))
             .collect::<Vec<_>>();
-        let tokens = encode_ppmd_tokens(&input, true);
-        let packed = unpack29_encode_ppmd(&input).unwrap();
+        let tokens = encode_ppmd_tokens(&input, true, MAX_ENCODER_MATCH_OFFSET);
+        let packed = unpack29_encode_ppmd(&input, MAX_ENCODER_MATCH_OFFSET).unwrap();
 
         assert!(tokens.iter().any(
             |token| matches!(token, PpmdEncodeToken::RepeatOffsetOne { length } if *length >= 4)
         ));
         assert_eq!(unpack29_decode(&packed, input.len()).unwrap(), input);
+    }
+
+    /// PPMd's escape-4 matches copy out of the same window the LZ decoder
+    /// keeps, so a match reaching further back than the dictionary the file
+    /// header declares lands on whatever the decoder still happens to hold.
+    /// Nothing bounded them, so every RAR 3.0 and 4.0 PPMd member of a large
+    /// enough file failed its checksum in unrar; RAR 2.9 escaped only because
+    /// it declares a dictionary eight times larger.
+    #[test]
+    fn ppmd_matches_stay_inside_the_declared_dictionary() {
+        let dictionary = 16 * 1024;
+        // A distinctive block, repeated once inside the dictionary and once
+        // well outside it. The near copy is the match the encoder should still
+        // take, and it is what stops this passing merely because the bound
+        // suppressed every match there was.
+        let block: Vec<u8> = (0..2048u32)
+            .map(|index| (index.wrapping_mul(2_654_435_761) >> 24) as u8)
+            .collect();
+        let mut input = block.clone();
+        let filler = |input: &mut Vec<u8>, until: usize| {
+            while input.len() < until {
+                input.extend_from_slice(
+                    format!("filler line {:06} for the gap\n", input.len()).as_bytes(),
+                );
+            }
+        };
+        filler(&mut input, dictionary / 2);
+        input.extend_from_slice(&block);
+        filler(&mut input, 3 * dictionary);
+        input.extend_from_slice(&block);
+        let tokens = encode_ppmd_tokens(&input, true, dictionary);
+
+        let furthest = tokens
+            .iter()
+            .filter_map(|token| match token {
+                PpmdEncodeToken::Match { offset, .. } => Some(*offset),
+                _ => None,
+            })
+            .max()
+            .expect("the payload has to produce matches for this to mean anything");
+        assert!(
+            furthest <= dictionary,
+            "a match reached {furthest} bytes back, past the {dictionary} byte dictionary"
+        );
     }
 
     #[test]
@@ -3588,8 +3654,8 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         input.extend_from_slice(phrase);
         input.extend_from_slice(phrase);
         input.extend_from_slice(b"tail");
-        let tokens = encode_ppmd_tokens(&input, true);
-        let packed = unpack29_encode_ppmd(&input).unwrap();
+        let tokens = encode_ppmd_tokens(&input, true, MAX_ENCODER_MATCH_OFFSET);
+        let packed = unpack29_encode_ppmd(&input, MAX_ENCODER_MATCH_OFFSET).unwrap();
 
         assert!(tokens
             .iter()
@@ -3604,7 +3670,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         for _ in 0..200 {
             input.extend_from_slice(phrase);
         }
-        let tokens = encode_ppmd_tokens(&input, true);
+        let tokens = encode_ppmd_tokens(&input, true, MAX_ENCODER_MATCH_OFFSET);
 
         assert!(tokens.iter().any(
             |token| matches!(token, PpmdEncodeToken::Match { offset, length } if *offset > 1 && *length >= 32)
@@ -3620,9 +3686,10 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         let packed = unpack29_encode_ppmd_with_filter(
             &input,
             crate::FilterSpec::whole(crate::FilterKind::E8),
+            MAX_ENCODER_MATCH_OFFSET,
         )
         .unwrap();
-        let plain_ppmd = unpack29_encode_ppmd(&input).unwrap();
+        let plain_ppmd = unpack29_encode_ppmd(&input, MAX_ENCODER_MATCH_OFFSET).unwrap();
         let filtered_lz = Unpack29Encoder::new()
             .encode_member_with_filter(&input, crate::FilterSpec::whole(crate::FilterKind::E8))
             .unwrap();

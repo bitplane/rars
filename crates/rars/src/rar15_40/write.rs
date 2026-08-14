@@ -325,14 +325,19 @@ fn encode_rar29_policy_filtered_payload(
     }
     let ppmd = |data: &[u8]| -> Result<EncodedPayload> {
         Ok(EncodedPayload {
-            data: unpack29_encode_ppmd(data).map_err(Error::from)?,
+            data: unpack29_encode_ppmd(data, options.max_match_distance).map_err(Error::from)?,
             method: 0x35,
         })
     };
     match (method, policy) {
         (Rar29Method::Ppmd, FilterPolicy::None) => ppmd(data),
         (Rar29Method::Ppmd, FilterPolicy::Explicit(filter)) => Ok(EncodedPayload {
-            data: unpack29_encode_ppmd_with_filter(data, filter.clone()).map_err(Error::from)?,
+            data: unpack29_encode_ppmd_with_filter(
+                data,
+                filter.clone(),
+                options.max_match_distance,
+            )
+            .map_err(Error::from)?,
             method: 0x35,
         }),
         // Rejected by validate_rar29_filter_policy before any encoding starts.
@@ -552,7 +557,7 @@ fn encode_rar29_auto_filtered_member(
     }
     if include_ppmd && is_large_text_ppmd_candidate(data) {
         return Ok(EncodedPayload {
-            data: unpack29_encode_ppmd(data).map_err(Error::from)?,
+            data: unpack29_encode_ppmd(data, options.max_match_distance).map_err(Error::from)?,
             method: 0x35,
         });
     }
@@ -572,7 +577,7 @@ fn encode_rar29_auto_filtered_member(
     };
     if include_ppmd && data.len() <= 1024 * 1024 && text {
         let ppmd = EncodedPayload {
-            data: unpack29_encode_ppmd(data).map_err(Error::from)?,
+            data: unpack29_encode_ppmd(data, options.max_match_distance).map_err(Error::from)?,
             method: 0x35,
         };
         if ppmd.data.len() < best.data.len() {
@@ -585,7 +590,7 @@ fn encode_rar29_auto_filtered_member(
     }
     if include_ppmd && is_auto_ppmd_candidate(data) {
         let ppmd = EncodedPayload {
-            data: unpack29_encode_ppmd(data).map_err(Error::from)?,
+            data: unpack29_encode_ppmd(data, options.max_match_distance).map_err(Error::from)?,
             method: 0x35,
         };
         if ppmd.data.len() < best.data.len() {
