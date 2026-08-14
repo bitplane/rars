@@ -3881,6 +3881,38 @@ fn writes_header_encrypted_rar3_and_rar4_archives_that_reader_extracts_with_pass
     }
 }
 
+/// A reader that finds the headers encrypted expects every one of them to be
+/// introduced by its own salt, so when the last member's payload ends it reads
+/// eight more bytes looking for the next group. Ending the file there is a short
+/// read rather than a clean end, and 7-Zip treats it as a failed decryption and
+/// refuses to open the archive at all. unrar stops at the last member and never
+/// looks, which is why every header-encrypted archive we wrote was unreadable in
+/// 7-Zip and nothing said so.
+#[test]
+fn a_header_encrypted_archive_ends_with_an_end_of_archive_block() {
+    for target in [ArchiveVersion::Rar30, ArchiveVersion::Rar40] {
+        let mut features = FeatureSet::store_only();
+        features.header_encryption = true;
+        let entries = [FileEntry {
+            name: b"header-secret.txt",
+            data: b"RAR 3.x header encrypted writer payload\n",
+            file_time: 0x5a21_0000,
+            file_attr: 0x20,
+            host_os: 3,
+            password: Some(b"password"),
+            file_comment: None,
+        }];
+        let bytes =
+            write_compressed_archive(&entries, WriterOptions::new(target, features)).unwrap();
+        let archive = Archive::parse_with_password(&bytes, Some(b"password")).unwrap();
+
+        assert!(
+            matches!(archive.blocks.last(), Some(Block::End(_))),
+            "{target:?} archive does not end with an end-of-archive block"
+        );
+    }
+}
+
 #[test]
 fn writes_solid_header_encrypted_rar3_and_rar4_archives_that_reader_extracts_with_password() {
     for target in [ArchiveVersion::Rar30, ArchiveVersion::Rar40] {

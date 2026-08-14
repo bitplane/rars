@@ -290,14 +290,20 @@ fn write_members_to(
                 header_password,
             )?;
         }
-        return Ok(());
+    } else {
+        crate::parallel::map_slice_windowed(
+            members,
+            crate::parallel::default_window(),
+            |member| encode_member(member, options, coding, &mut None, resources, progress),
+            |member, encoded| {
+                write_member(output, member, encoded, options, false, header_password)
+            },
+        )?;
     }
-    crate::parallel::map_slice_windowed(
-        members,
-        crate::parallel::default_window(),
-        |member| encode_member(member, options, coding, &mut None, resources, progress),
-        |member, encoded| write_member(output, member, encoded, options, false, header_password),
-    )
+    if let Some(password) = header_password {
+        write_encrypted_end_block(output, password)?;
+    }
+    Ok(())
 }
 
 /// Encodes one member, choosing an engine and a filter independently.
@@ -1629,6 +1635,11 @@ fn random_rar30_salt() -> Result<[u8; 8]> {
     Ok(salt)
 }
 
+/// What WinRAR writes on an end-of-archive block. The bit marks the block as
+/// one a reader may skip without understanding it.
+const ENDARC_FLAGS: u16 = 0x4000;
+const END_HEADER_SIZE: usize = 7;
+
 fn write_main_header(out: &mut Vec<u8>, flags: u16) {
     let start = out.len();
     out.extend_from_slice(&0u16.to_le_bytes());
@@ -1714,6 +1725,27 @@ fn write_newsub_archive_comment(out: &mut Vec<u8>, comment: Option<&[u8]>) -> Re
         },
         &packed,
     )
+}
+
+/// Closes a header-encrypted archive with an end-of-archive block in a group of
+/// its own.
+///
+/// Every encrypted header carries its own salt, so a reader that reaches the end
+/// of the last member's payload reads eight more bytes looking for the next
+/// group's salt. With nothing there it stops on a short read rather than on a
+/// clean end, and 7-Zip treats that as a decryption failure and refuses to open
+/// the archive at all. WinRAR closes the same way. unrar stops at the last
+/// member and never looks, which is why nothing caught this.
+fn write_encrypted_end_block(out: &mut dyn Write, password: &[u8]) -> Result<()> {
+    let mut header = Vec::new();
+    let start = header.len();
+    header.extend_from_slice(&0u16.to_le_bytes());
+    header.push(ENDARC_HEAD);
+    header.extend_from_slice(&ENDARC_FLAGS.to_le_bytes());
+    header.extend_from_slice(&(END_HEADER_SIZE as u16).to_le_bytes());
+    write_header_crc(&mut header, start);
+    debug_assert_eq!(header.len(), END_HEADER_SIZE);
+    write_encrypted_header(out, &header, password)
 }
 
 fn write_encrypted_header(out: &mut dyn Write, header: &[u8], password: &[u8]) -> Result<()> {

@@ -572,15 +572,7 @@ struct Known {
     task: &'static str,
 }
 
-const KNOWN_BAD: &[Known] = &[
-    // #66. RAR 3.x and 4.x header encryption, which 7-Zip cannot open at all.
-    Known {
-        formats: &["rar30", "rar40"],
-        cells: &["encrypted-headers"],
-        decoder: "7zz",
-        task: "#66",
-    },
-];
+const KNOWN_BAD: &[Known] = &[];
 
 impl Known {
     fn matches(&self, format: &str, cell: &str, decoder: &str) -> bool {
