@@ -2681,17 +2681,67 @@ fn solid_rar29_explicit_filter_codes_members_into_one_chain() {
 
     assert!(archive.main.is_solid());
     assert_eq!(files.len(), 3);
-    // The chain runs through all three, including the member that does not
-    // compress: storing one would rebuild the encoder and end the chain.
-    assert!(files.iter().all(|file| file.method != 0x30));
+    // The middle member does not compress, so it is stored, exactly as it
+    // would be without a filter. That rebuilds the encoder, so the chain ends
+    // there and the member after it starts a fresh one rather than claiming a
+    // history the decoder will not have.
+    assert_eq!(files[1].method, 0x30);
     assert!(!files[0].is_solid());
-    assert!(files[1].is_solid());
-    assert!(files[2].is_solid());
+    assert!(!files[1].is_solid());
+    assert!(!files[2].is_solid());
 
     let extracted = collect_extract(&archive).unwrap();
     assert_eq!(extracted[0].data, first_data);
     assert_eq!(extracted[1].data, randomish);
     assert_eq!(extracted[2].data, second_data);
+}
+
+/// `--no-filter` reaches the writer as a filter policy, and only an explicit
+/// filter was routed through the solid chain, so asking for no filter used to
+/// cost the whole benefit of `--solid` while the members still claimed to
+/// continue a chain that was never built.
+#[test]
+fn a_solid_chain_survives_asking_for_no_filter() {
+    let mut state = 0x51ed_2701u32;
+    let payload: Vec<u8> = (0..900)
+        .flat_map(|index| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            format!("line {index:05} {state:08x} unfiltered body\n").into_bytes()
+        })
+        .collect();
+    let entry = |name: &'static [u8]| FileEntry {
+        name,
+        data: &payload,
+        file_time: 0x5a21_0000,
+        file_attr: 0x20,
+        host_os: 3,
+        password: None,
+        file_comment: None,
+    };
+    let entries = [entry(b"first.bin"), entry(b"second.bin")];
+    let mut features = FeatureSet::store_only();
+    features.solid = true;
+
+    let bytes = write_rar29_compressed_archive_with_filter_policy(
+        &entries,
+        WriterOptions::new(ArchiveVersion::Rar29, features),
+        FilterPolicy::None,
+    )
+    .unwrap();
+    let archive = Archive::parse(&bytes).unwrap();
+    let files: Vec<_> = archive.files().collect();
+
+    assert!(files[1].is_solid());
+    assert!(
+        files[1].pack_size * 8 < files[0].pack_size,
+        "the second member has to reach the chain, got {} against {}",
+        files[1].pack_size,
+        files[0].pack_size
+    );
+
+    let extracted = collect_extract(&archive).unwrap();
+    assert_eq!(extracted[0].data, payload);
+    assert_eq!(extracted[1].data, payload);
 }
 
 /// An explicit filter over a zero-byte member asks for a 0..0 range, which the

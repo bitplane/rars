@@ -1261,34 +1261,49 @@ fn encode_filtered_payload(
     solid_encoder: &mut Option<SolidEncoder>,
 ) -> Result<EncodedPayload> {
     let lz_method = compression_method_for_level(options)?;
-    if let (Some(SolidEncoder::Rar29(encoder)), FilterPolicy::Explicit(filter), false) = (
-        solid_encoder.as_mut(),
-        policy,
-        lz_method == 0x30 || options.method == Rar29Method::Ppmd,
-    ) {
-        // An empty member has no range to filter, but it still goes through
-        // the chain's encoder like any other member. Storing it instead would
-        // end the chain in the headers while leaving the encoder's history
-        // untouched, so the member after it would be coded against a
-        // dictionary its own flags told the decoder to throw away.
-        let packed = if data.is_empty() {
-            encoder.encode_member(data)?
-        } else {
+    let codes_through_the_chain = lz_method != 0x30
+        && options.method != Rar29Method::Ppmd
+        && !matches!(policy, FilterPolicy::Auto)
+        && matches!(solid_encoder, Some(SolidEncoder::Rar29(_)));
+    if !codes_through_the_chain {
+        return encode_rar29_policy_filtered_payload(
+            data,
+            policy,
+            options.method,
+            rar29_encode_options_for_options(options)?,
+            lz_method,
+            ppmd_trial_pays(options.compression_level),
+        );
+    }
+
+    let Some(SolidEncoder::Rar29(encoder)) = solid_encoder.as_mut() else {
+        unreachable!("the chain was just checked for a RAR 2.9 encoder");
+    };
+    // An empty member has no range to filter, and `--no-filter` asked for none,
+    // but both still go through the chain's encoder like any other member.
+    // Coding either one on its own would leave the encoder's history in place
+    // while the headers said the chain had ended, so the member after it would
+    // be coded against a dictionary its own flags told the decoder to discard.
+    let packed = match policy {
+        FilterPolicy::Explicit(filter) if !data.is_empty() => {
             encoder.encode_member_with_filters(data, std::slice::from_ref(filter))?
-        };
+        }
+        _ => encoder.encode_member(data)?,
+    };
+
+    // A member the encoder could not shrink is stored, exactly as an unfiltered
+    // one is, which rebuilds the encoder and ends the chain here.
+    if should_store_fallback(options.target, true, data.len(), packed.len()) {
+        *solid_encoder = SolidEncoder::for_target(options, true)?;
         return Ok(EncodedPayload {
-            data: packed,
-            method: lz_method,
+            data: data.to_vec(),
+            method: 0x30,
         });
     }
-    encode_rar29_policy_filtered_payload(
-        data,
-        policy,
-        options.method,
-        rar29_encode_options_for_options(options)?,
-        lz_method,
-        ppmd_trial_pays(options.compression_level),
-    )
+    Ok(EncodedPayload {
+        data: packed,
+        method: lz_method,
+    })
 }
 
 fn encode_or_store_payload(
