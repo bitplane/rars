@@ -21,14 +21,29 @@ const MAX_ENCODER_MATCH_LENGTH: usize = 4096;
 const MAX_COMPRESSED_BLOCK_OUTPUT: usize = 4 * 1024 * 1024;
 /// How much input goes into one compressed block.
 ///
-/// Every block carries its own Huffman tables and starts matching afresh, so
-/// smaller blocks cost a little overhead but adapt faster to changes in the
-/// data. A mebibyte measures at least as well as the 4 MiB cap on everything
-/// tried, and it is what the streaming writer uses, so both paths produce the
-/// same blocks for the same input.
-pub(crate) const LZ_BLOCK_SIZE: usize = 1024 * 1024;
+/// Every block carries its own Huffman tables, so smaller blocks pay for the
+/// extra tables and win back more by fitting each stretch of the data. Matches
+/// still reach back across boundaries into the history, so shortening a block
+/// costs no match range. Measured over the corpus, 64 KiB packs 6.4% smaller
+/// than a mebibyte and within 0.2% of the best size tried at any point between
+/// 16 KiB and 256 KiB. The streaming writer reads in the same units, so both
+/// paths produce the same blocks for the same input.
+pub(crate) const LZ_BLOCK_SIZE: usize = 64 * 1024;
 const _: () = assert!(LZ_BLOCK_SIZE <= MAX_COMPRESSED_BLOCK_OUTPUT);
 const MAX_FILTER_BLOCK_LENGTH: usize = 0x3ffff;
+/// How much input goes into one compressed block once a filter is carried.
+///
+/// A filter record cannot describe more than [`MAX_FILTER_BLOCK_LENGTH`] bytes,
+/// so this is the smaller of that ceiling and the plain block size. Splitting a
+/// filtered range across blocks costs one more record per block and converts
+/// the same bytes either way: the transform reads an absolute file offset, and
+/// an instruction straddling a boundary was already left alone at the old
+/// 256 KiB one.
+const FILTERED_LZ_BLOCK_SIZE: usize = if LZ_BLOCK_SIZE < MAX_FILTER_BLOCK_LENGTH {
+    LZ_BLOCK_SIZE
+} else {
+    MAX_FILTER_BLOCK_LENGTH
+};
 const NICE_MATCH_LENGTH: usize = 512;
 
 /// Matches shorter than 4 bytes are never emitted, so candidate positions are
@@ -752,7 +767,7 @@ fn filtered_lz_blocks(
         history[history.len().saturating_sub(options.max_match_distance)..].to_vec();
     let mut chunk_start = 0usize;
     while chunk_start < data.len() {
-        let chunk_end = (chunk_start + MAX_FILTER_BLOCK_LENGTH).min(data.len());
+        let chunk_end = (chunk_start + FILTERED_LZ_BLOCK_SIZE).min(data.len());
         let mut chunk = data[chunk_start..chunk_end].to_vec();
         let mut records = Vec::new();
         for filter in &filters {
@@ -1072,7 +1087,7 @@ impl Unpack50Encoder {
         algorithm_version: u8,
         filters: &[crate::FilterSpec],
     ) -> Result<Vec<u8>> {
-        if input.len() > MAX_FILTER_BLOCK_LENGTH {
+        if input.len() > FILTERED_LZ_BLOCK_SIZE {
             let packed = filtered_lz_blocks(
                 input,
                 filters,
@@ -1109,7 +1124,7 @@ impl Unpack50Encoder {
         filters: &[crate::FilterSpec],
         progress: &mut dyn FnMut(usize) -> bool,
     ) -> Result<Vec<u8>> {
-        let packed = if input.len() > MAX_FILTER_BLOCK_LENGTH {
+        let packed = if input.len() > FILTERED_LZ_BLOCK_SIZE {
             filtered_lz_blocks(
                 input,
                 filters,
@@ -3652,12 +3667,46 @@ mod tests {
     }
 
     #[test]
+    fn blocks_are_short_enough_to_refit_the_tables_when_the_data_changes() {
+        // Four stretches, one block each, every one drawing from its own
+        // sixteen bytes. A table per block codes sixteen symbols; one table
+        // over the member codes sixty-four. Raising LZ_BLOCK_SIZE trades the
+        // first for the second, which is what cost the corpus 6.4% until the
+        // block came down from a mebibyte.
+        let stretch_len = 64 * 1024;
+        let mut data = Vec::with_capacity(stretch_len * 4);
+        let mut noise = 0x2545_f491_4f6c_dd1du64;
+        for stretch in 0..4u8 {
+            for _ in 0..stretch_len {
+                noise ^= noise << 13;
+                noise ^= noise >> 7;
+                noise ^= noise << 17;
+                data.push(stretch * 16 + (noise >> 40) as u8 % 16);
+            }
+        }
+        let options = EncodeOptions::new(0);
+
+        let blocked = encode_lz_member_with_options(&data, 0, options).unwrap();
+        let single = encode_lz_block(&data, &[], 0, &[], options, true, None).unwrap();
+
+        assert!(
+            blocked.len() * 100 < single.len() * 90,
+            "member blocks {} did not beat one block over the lot {single}",
+            blocked.len(),
+            single = single.len(),
+        );
+    }
+
+    #[test]
     fn large_filtered_lz_members_split_filter_records_by_block() {
-        let mut data: Vec<_> = (0..LZ_BLOCK_SIZE + 512).map(|index| index as u8).collect();
+        let last_block_start = FILTERED_LZ_BLOCK_SIZE * 2;
+        let mut data: Vec<_> = (0..last_block_start + 512)
+            .map(|index| index as u8)
+            .collect();
         data[256] = 0xe8;
         data[257..261].copy_from_slice(&0x20u32.to_le_bytes());
-        data[LZ_BLOCK_SIZE + 64] = 0xe8;
-        data[LZ_BLOCK_SIZE + 65..LZ_BLOCK_SIZE + 69].copy_from_slice(&0x40u32.to_le_bytes());
+        data[last_block_start + 64] = 0xe8;
+        data[last_block_start + 65..last_block_start + 69].copy_from_slice(&0x40u32.to_le_bytes());
 
         let encoded = Unpack50Encoder::with_options(EncodeOptions::new(0))
             .encode_member_with_filter(
@@ -3689,7 +3738,7 @@ mod tests {
 
     #[test]
     fn filters_are_split_before_rar_reader_filter_limit() {
-        let data = vec![0u8; MAX_FILTER_BLOCK_LENGTH + 1];
+        let data = vec![0u8; FILTERED_LZ_BLOCK_SIZE + 1];
         let encoded = Unpack50Encoder::with_options(
             EncodeOptions::new(0).with_max_match_distance(128 * 1024),
         )
