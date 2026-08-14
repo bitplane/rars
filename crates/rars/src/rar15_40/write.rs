@@ -182,7 +182,7 @@ fn collect_archive(
 
 fn write_archive_to(
     members: &[Member<'_>],
-    options: WriterOptions,
+    mut options: WriterOptions,
     coding: MemberCoding,
     archive_comment: Option<&[u8]>,
     resources: &WriterResources,
@@ -213,8 +213,22 @@ fn write_archive_to(
     };
 
     let mut total_bytes = 0u64;
+    let mut largest_member = 0u64;
     for member in members {
-        total_bytes = total_bytes.saturating_add(member.unpacked_size()? as u64);
+        let unpacked = member.unpacked_size()? as u64;
+        total_bytes = total_bytes.saturating_add(unpacked);
+        largest_member = largest_member.max(unpacked);
+    }
+    if options.dictionary_size.is_none() {
+        // A solid run is one stream, so its window has to reach back across the
+        // members it already coded; independent members only ever look inside
+        // themselves.
+        let reach = if options.features.solid && coding.compresses() {
+            total_bytes
+        } else {
+            largest_member
+        };
+        options.dictionary_size = Some(fitted_dictionary_size(options.target, reach));
     }
     // RAR 2.0 walks a non-solid member twice, once to pick a method and once to
     // encode it, so its progress total counts every byte twice.
@@ -983,7 +997,7 @@ pub fn write_compressed_volumes_with_progress(
 
 fn write_compressed_volumes_impl(
     entry: FileEntry<'_>,
-    options: WriterOptions,
+    mut options: WriterOptions,
     max_packed_per_volume: usize,
     progress: Option<&WorkTracker<'_>>,
 ) -> Result<Vec<Vec<u8>>> {
@@ -1000,6 +1014,14 @@ fn write_compressed_volumes_impl(
         entry.file_comment,
         options,
     )?;
+    // A volume set holds one member, and splitting it changes nothing about
+    // how far back the window has to reach.
+    if options.dictionary_size.is_none() {
+        options.dictionary_size = Some(fitted_dictionary_size(
+            options.target,
+            entry.data.len() as u64,
+        ));
+    }
 
     let mut solid_encoder = None;
     let payload = encode_or_store_payload(entry.data, options, &mut solid_encoder, progress)?;
@@ -1195,6 +1217,43 @@ fn rar15_encode_options_for_level(level: Option<u8>) -> Result<Rar15EncodeOption
             "RAR compression level must be in the range 0..5",
         )),
     }
+}
+
+/// The smallest and largest dictionary worth declaring for a target.
+///
+/// RAR 1.5 and older ignore the field: their decoders have a fixed window, and
+/// measuring confirms the packed size does not move with it, so those stay
+/// pinned. WinRAR 1.54 writes 64K in every archive we have from it.
+fn dictionary_range(target: ArchiveVersion) -> (usize, usize) {
+    match target {
+        ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40 => {
+            (128 * 1024, RAR29_MAX_DICTIONARY_SIZE)
+        }
+        ArchiveVersion::Rar20 => (64 * 1024, RAR29_MAX_DICTIONARY_SIZE),
+        _ => (64 * 1024, 64 * 1024),
+    }
+}
+
+/// The smallest dictionary the format encodes that reaches past `content`, so a
+/// match can span everything the window is meant to cover.
+///
+/// Picking one number for every archive is the wrong shape: too small loses
+/// half the ratio on content whose repeats sit far apart, and too large costs a
+/// decoder memory it never needs for a thirty byte file. WinRAR sizes it to the
+/// data, and reading the dictionary bits out of its own archives against their
+/// largest member shows exactly this rule:
+///
+/// ```text
+/// content   130048   196608   262144   705644   1048576
+/// declared    128K     256K     512K    1024K     2048K
+/// ```
+fn fitted_dictionary_size(target: ArchiveVersion, content: u64) -> usize {
+    let (floor, cap) = dictionary_range(target);
+    let mut size = floor;
+    while size < cap && size as u64 <= content {
+        size *= 2;
+    }
+    size
 }
 
 fn rar29_default_dictionary_size(target: ArchiveVersion) -> usize {

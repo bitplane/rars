@@ -3208,34 +3208,56 @@ fn rar29_family_writer_levels_increase_lz_match_effort() {
     }
 }
 
+/// The declared dictionary is fitted to the member rather than fixed per
+/// target: the smallest size the format encodes that reaches past the content,
+/// floored at what the target's decoders expect. The pairs below are what
+/// WinRAR declares for members of that size in our own fixtures.
+///
+/// A fixed default was wrong in both directions. 128K lost half the ratio on
+/// content whose repeats sit further apart than that, and RAR 2.9's old 1M
+/// default made a reader allocate a megabyte to unpack thirty bytes.
 #[test]
-fn rar29_family_writer_stamps_oracle_dict_bits_by_target() {
-    let entries = [StoredEntry {
-        name: b"stored-dict.txt",
-        data: b"stored dict stamp payload\n",
-        file_time: 0x5a21_0000,
-        file_attr: 0x20,
-        host_os: 3,
-        password: None,
-        file_comment: None,
-    }];
-
-    for (target, expected_dict_flags) in [
-        (ArchiveVersion::Rar29, 0x0080),
-        (ArchiveVersion::Rar30, 0x0020),
-        (ArchiveVersion::Rar40, 0x0020),
+fn the_writer_fits_the_dictionary_to_the_member() {
+    for (content, expected) in [
+        (26usize, 128 * 1024usize),
+        (130_048, 128 * 1024),
+        (196_608, 256 * 1024),
+        (262_144, 512 * 1024),
+        (705_644, 1024 * 1024),
     ] {
-        let bytes = write_stored_archive(
-            &entries,
-            WriterOptions::new(target, FeatureSet::store_only()).with_compression_level(0),
-        )
-        .unwrap();
-        let archive = Archive::parse(&bytes).unwrap();
-        let file = archive.files().next().unwrap();
+        let data = vec![b'z'; content];
+        let entries = [StoredEntry {
+            name: b"fitted-dict.bin",
+            data: &data,
+            file_time: 0x5a21_0000,
+            file_attr: 0x20,
+            host_os: 3,
+            password: None,
+            file_comment: None,
+        }];
+        let expected_flags = ((expected.trailing_zeros() as u16) - 16) << 5;
 
-        assert_eq!(file.method, 0x30, "{target:?}");
-        assert_eq!(file.block.flags & 0x00e0, expected_dict_flags, "{target:?}");
-        assert_eq!(collect_extract(&archive).unwrap()[0].data, entries[0].data);
+        for target in [
+            ArchiveVersion::Rar29,
+            ArchiveVersion::Rar30,
+            ArchiveVersion::Rar40,
+        ] {
+            let bytes = write_stored_archive(
+                &entries,
+                WriterOptions::new(target, FeatureSet::store_only()).with_compression_level(0),
+            )
+            .unwrap();
+            let archive = Archive::parse(&bytes).unwrap();
+            let file = archive.files().next().unwrap();
+
+            assert_eq!(file.method, 0x30, "{target:?}");
+            assert_eq!(
+                file.block.flags & 0x00e0,
+                expected_flags,
+                "{target:?} declared the wrong dictionary for {content} bytes"
+            );
+            assert_eq!(collect_extract(&archive).unwrap()[0].data, data);
+        }
     }
 }
 
