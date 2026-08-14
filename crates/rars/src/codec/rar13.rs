@@ -233,7 +233,8 @@ impl Unpack15Encoder {
         }
         self.bits = BitWriter::new();
         let mut pos = 0usize;
-        while pos < input.len() {
+        let mut straddle: Option<Straddle> = None;
+        while pos < input.len() || straddle.is_some() {
             let mut flags = 0u8;
             let mut flag_bits = 0usize;
             let mut payloads = Vec::new();
@@ -242,9 +243,24 @@ impl Unpack15Encoder {
             let mut plan_num_huf = self.num_huf;
             let mut group_enters_stmode = false;
 
+            if let Some(carried) = straddle.take() {
+                write_planned_flag_bits(&mut flags, 0, carried.rest);
+                flag_bits = carried.rest.len();
+                payloads.push(carried.token);
+                plan_num_huf += 1;
+                plan_huff_effect(&mut plan_nhfb, &mut plan_nlzb);
+            }
+
             while flag_bits < 8 && pos < input.len() {
                 let flag = huff_flag_bits(plan_nlzb <= plan_nhfb);
                 if flag_bits + flag.len() > 8 {
+                    straddle = Some(split_flag(
+                        &mut flags,
+                        flag_bits,
+                        flag,
+                        EncodedToken::Literal(input[pos]),
+                    ));
+                    pos += 1;
                     break;
                 }
                 write_planned_flag_bits(&mut flags, flag_bits, flag);
@@ -302,12 +318,20 @@ impl Unpack15Encoder {
         let buckets = long_lz_buckets(input);
         let mut pos = 0usize;
         let mut next_report = 0usize;
-        while pos < input.len() {
+        let mut straddle: Option<Straddle> = None;
+        while pos < input.len() || straddle.is_some() {
             let mut flags = 0u8;
             let mut flag_bits = 0usize;
             let mut payloads = Vec::new();
             let mut plan_encoder = self.clone_for_planning();
             let mut group_enters_stmode = false;
+
+            if let Some(carried) = straddle.take() {
+                write_planned_flag_bits(&mut flags, 0, carried.rest);
+                flag_bits = carried.rest.len();
+                payloads.push(carried.token);
+                plan_encoder.emit_payloads(vec![carried.token])?;
+            }
 
             while flag_bits < 8 && pos < input.len() {
                 let state = plan_encoder.lz_plan_state();
@@ -341,6 +365,13 @@ impl Unpack15Encoder {
 
                 let flag = huff_flag_bits(plan_encoder.nlzb <= plan_encoder.nhfb);
                 if flag_bits + flag.len() > 8 {
+                    straddle = Some(split_flag(
+                        &mut flags,
+                        flag_bits,
+                        flag,
+                        EncodedToken::Literal(input[pos]),
+                    ));
+                    pos += 1;
                     break;
                 }
                 write_planned_flag_bits(&mut flags, flag_bits, flag);
@@ -1051,6 +1082,35 @@ fn long_lz_flag_bits(prefer_long_lz_on_one: bool) -> &'static [bool] {
         &[true]
     } else {
         &[false, true]
+    }
+}
+
+/// A token whose flag did not fit in what was left of a flags byte.
+///
+/// `Unpack15` fetches the next flags byte the moment it runs out of bits, and
+/// it does that in the middle of reading a flag, not between tokens. So a
+/// two-bit flag at the last bit of a byte is legal: its first bit closes that
+/// byte and its second opens the next one, and only then does the decoder read
+/// the token's payload. Padding the byte out instead leaves a bit the decoder
+/// still reads as a flag, which desynchronises everything after it.
+#[derive(Clone, Copy)]
+struct Straddle {
+    token: EncodedToken,
+    /// The flag bits that belong at the front of the next flags byte.
+    rest: &'static [bool],
+}
+
+fn split_flag(
+    flags: &mut u8,
+    flag_bits: usize,
+    flag: &'static [bool],
+    token: EncodedToken,
+) -> Straddle {
+    let fits = 8 - flag_bits;
+    write_planned_flag_bits(flags, flag_bits, &flag[..fits]);
+    Straddle {
+        token,
+        rest: &flag[fits..],
     }
 }
 
@@ -2091,10 +2151,10 @@ fn corr_huff(char_set: &mut [u16; 256], num_to_place: &mut [u8; 256]) {
 mod tests {
     use super::{
         decode_num_bit_cost, find_long_lz, find_lz_token, find_old_dist_lz, long_lz_buckets,
-        should_lazy_emit_literal, unpack15_decode, unpack15_encode, EncodeOptions, EncodedToken,
-        LongLz, LzPlanState, OldDistLz, ShortLz, Unpack15, Unpack15Encoder, DEC_HF0, DEC_HF1,
-        DEC_HF2, DEC_HF3, DEC_HF4, DEC_L1, DEC_L2, POS_HF0, POS_HF1, POS_HF2, POS_HF3, POS_HF4,
-        POS_L1, POS_L2,
+        should_lazy_emit_literal, unpack15_decode, unpack15_encode, unpack15_encode_with_options,
+        EncodeOptions, EncodedToken, LongLz, LzPlanState, OldDistLz, ShortLz, Unpack15,
+        Unpack15Encoder, DEC_HF0, DEC_HF1, DEC_HF2, DEC_HF3, DEC_HF4, DEC_L1, DEC_L2, POS_HF0,
+        POS_HF1, POS_HF2, POS_HF3, POS_HF4, POS_L1, POS_L2,
     };
 
     fn decode_num_prefix_is_stable(
@@ -2542,6 +2602,54 @@ mod tests {
             .position(|(actual, expected)| actual != expected);
         assert_eq!(first_diff, None, "first differing byte in decoded payload");
         assert_eq!(decoded, input);
+    }
+
+    /// Match-heavy input drives `nlzb` above `nhfb`, which widens the literal
+    /// flag to two bits, which is what lets a flag reach the last bit of a
+    /// flags byte with a bit still to place. The encoder used to pad the byte
+    /// and start the next group cleanly; the decoder read that padding as a
+    /// flag and everything after it decoded to the wrong bytes.
+    #[test]
+    fn a_flag_straddling_two_flags_bytes_round_trips() {
+        let input = match_heavy_payload(176, 8000);
+
+        let packed =
+            unpack15_encode_with_options(&input, EncodeOptions::new().with_lazy_matching(false))
+                .unwrap();
+        let decoded = unpack15_decode(&packed, input.len()).unwrap();
+
+        let first_diff = decoded
+            .iter()
+            .zip(&input)
+            .position(|(actual, expected)| actual != expected);
+        assert_eq!(first_diff, None, "first differing byte in decoded payload");
+    }
+
+    fn match_heavy_payload(seed: u64, len: usize) -> Vec<u8> {
+        let mut state = seed | 1;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            let value = next();
+            if out.len() > 4096 && value % 3 != 0 {
+                let distance = 64 + (value >> 8) as usize % (out.len() - 64);
+                let length = 3 + (value >> 40) as usize % 24;
+                let start = out.len() - distance;
+                for index in 0..length {
+                    let byte = out[start + index % distance];
+                    out.push(byte);
+                }
+            } else {
+                out.push((value >> 24) as u8);
+            }
+        }
+        out.truncate(len);
+        out
     }
 }
 
