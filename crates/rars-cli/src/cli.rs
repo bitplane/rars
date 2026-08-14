@@ -127,6 +127,11 @@ pub(crate) struct AddArgs {
     #[arg(long, value_name = "LEVEL")]
     pub level: Option<u8>,
     /// Dictionary size (e.g. 4m, 128k; RAR 1.5+)
+    ///
+    /// Left unset, the writer fits one to the data: the smallest size that
+    /// reaches across the largest member, or the whole archive when --solid
+    /// shares one window. A larger dictionary can pack better and always costs
+    /// time and memory to search.
     #[arg(long, value_name = "SIZE", value_parser = crate::parse_size_string)]
     pub dict_size: Option<usize>,
     /// Maximum total compression working memory (default: 256m)

@@ -180,11 +180,10 @@ pub(super) fn encode_option_candidates_for_level(
     Ok(candidates)
 }
 
-pub(super) fn rar50_algorithm_version(options: WriterOptions) -> Result<u8> {
+pub(super) fn rar50_algorithm_version(options: WriterOptions, dictionary_size: u64) -> Result<u8> {
     match options.target {
         crate::ArchiveVersion::Rar50 => Ok(0),
         crate::ArchiveVersion::Rar70 => {
-            let dictionary_size = dictionary_size_for_options(options)?;
             if dictionary_size_fields(0, dictionary_size).is_ok() {
                 Ok(0)
             } else {
@@ -205,10 +204,56 @@ pub(super) fn compression_method_for_level(level: Option<u8>) -> Result<u8> {
     }
 }
 
-pub(super) fn dictionary_size_for_options(options: WriterOptions) -> Result<u64> {
-    let size = options
-        .dictionary_size
-        .unwrap_or(DEFAULT_RAR50_DICTIONARY_SIZE);
+/// The largest dictionary the writer picks on its own.
+///
+/// The format goes far higher and `--dict-size` still does, but the match
+/// finder walks longer hash chains as the window grows and the corpus stops
+/// paying for it: 128 KiB to 1 MiB takes 6.0% off and costs about twice the
+/// encode time, 1 MiB to 4 MiB takes another 1.1% off for two and a half times
+/// the time again, and 4 MiB to 16 MiB is worth 0.1%.
+const RAR50_FITTED_DICTIONARY_CAP: u64 = 1024 * 1024;
+
+/// The smallest dictionary that still reaches past `content`.
+///
+/// A window larger than the data cannot match anything extra, so a small member
+/// keeps a small window and stays as quick as it was. Sizes are the format's
+/// own: 128 KiB doubled.
+pub(super) fn fitted_dictionary_size(content: u64) -> u64 {
+    let mut size = DEFAULT_RAR50_DICTIONARY_SIZE;
+    while size < RAR50_FITTED_DICTIONARY_CAP && size <= content {
+        size *= 2;
+    }
+    size
+}
+
+/// The dictionary to write with, either the caller's or one fitted to the data.
+///
+/// `content` is what one window has to reach across: the whole archive when the
+/// members share a dictionary, otherwise the largest member. `memory_limit` is
+/// the workspace budget the write has to stay inside.
+///
+/// A dictionary the caller named is validated and used as given: if it does not
+/// fit the budget the write fails saying so, which is the answer to a request
+/// that cannot be met. A fitted one is shrunk to fit instead, because it has no
+/// business failing a write that the smaller default would have finished.
+pub(super) fn dictionary_size_for_options(
+    options: WriterOptions,
+    content: u64,
+    memory_limit: u64,
+) -> Result<u64> {
+    let size = match options.dictionary_size {
+        Some(size) => size,
+        None => {
+            let mut fitted = fitted_dictionary_size(content);
+            while fitted > DEFAULT_RAR50_DICTIONARY_SIZE
+                && super::streaming_lz_workspace(fitted, crate::codec::rar50::LZ_BLOCK_SIZE)
+                    > memory_limit
+            {
+                fitted /= 2;
+            }
+            fitted
+        }
+    };
     validate_dictionary_size(options.target, size)?;
     Ok(size)
 }

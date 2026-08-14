@@ -310,7 +310,11 @@ pub fn write_streaming_volumes_with_progress(
         entries,
         engine::EnginePlan {
             compress: {
-                let mut compress = streaming_compress_plan(options)?;
+                let mut compress = streaming_compress_plan(
+                    options,
+                    dictionary_reach(entries, options.features.solid),
+                    resources.memory_limit(),
+                )?;
                 compress.filter_policy = extras.filter_policy;
                 compress.candidates = encode_option_candidates_for_level(
                     options.compression_level,
@@ -457,7 +461,11 @@ pub(crate) fn write_streaming_archive_reporting(
         entries,
         engine::EnginePlan {
             compress: {
-                let mut compress = streaming_compress_plan(options)?;
+                let mut compress = streaming_compress_plan(
+                    options,
+                    dictionary_reach(entries, options.features.solid),
+                    resources.memory_limit(),
+                )?;
                 compress.filter_policy = extras.filter_policy;
                 compress.candidates = encode_option_candidates_for_level(
                     options.compression_level,
@@ -486,15 +494,42 @@ pub(crate) fn write_streaming_archive_reporting(
 
 /// Writes a RAR 5 or RAR 7 archive without retaining member payloads.
 /// Compression settings shared by the streaming writers.
-fn streaming_compress_plan(options: WriterOptions) -> Result<compress::CompressPlan> {
-    let dictionary_size = dictionary_size_for_options(options)?;
+/// How far one dictionary has to reach for these members.
+///
+/// Solid members are coded as one chain through a single window, so a match can
+/// point back into an earlier member and the whole archive is in reach.
+/// Otherwise each member starts afresh and only the largest one matters. A
+/// source that cannot say how long it is takes the largest window the writer
+/// fits on its own, rather than the smallest.
+fn dictionary_reach(entries: &[ArchiveEntry], solid: bool) -> u64 {
+    let sizes = entries
+        .iter()
+        .map(|entry| entry.source.len().unwrap_or(u64::MAX));
+    if solid {
+        sizes.fold(0u64, u64::saturating_add)
+    } else {
+        sizes.max().unwrap_or(0)
+    }
+}
+
+fn streaming_compress_plan(
+    options: WriterOptions,
+    content: u64,
+    memory_limit: u64,
+) -> Result<compress::CompressPlan> {
+    let method = compression_method_for_level(options.compression_level)?;
+    // A stored member has no window to reach across, and the size still lands in
+    // its header, so fitting one to the data would only inflate what the header
+    // claims.
+    let reach = if method == 0 { 0 } else { content };
+    let dictionary_size = dictionary_size_for_options(options, reach, memory_limit)?;
     Ok(compress::CompressPlan {
-        algorithm_version: rar50_algorithm_version(options)?,
+        algorithm_version: rar50_algorithm_version(options, dictionary_size)?,
         encode_options: encode_options_for_level(options.compression_level, dictionary_size)?,
         dictionary_size,
         block_size: crate::codec::rar50::LZ_BLOCK_SIZE,
         solid: options.features.solid,
-        method: compression_method_for_level(options.compression_level)?,
+        method,
         filter_policy: FilterPolicy::None,
         candidates: vec![encode_options_for_level(
             options.compression_level,
@@ -705,7 +740,7 @@ fn validate_plan(options: WriterOptions, shape: PlanShape) -> Result<()> {
     }
     crate::write_plan::validate_features(options.target, options.features, shape)?;
     crate::write_plan::validate_compression_level(options.target, options.compression_level)?;
-    let _ = dictionary_size_for_options(options)?;
+    let _ = dictionary_size_for_options(options, 0, u64::MAX)?;
     // Quick-open is an index of the headers, so it has nothing to index once
     // they are encrypted.
     if options.features.quick_open && options.features.header_encryption {
@@ -862,6 +897,57 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct CollectWriter(Rc<RefCell<Vec<u8>>>);
+
+    #[test]
+    fn the_writer_fits_the_dictionary_to_what_one_window_has_to_reach() {
+        let options = WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
+            .with_compression_level(3);
+        let fitted = |content: u64| {
+            dictionary_size_for_options(options, content, u64::MAX).expect("a legal dictionary")
+        };
+
+        // The smallest window that still reaches past the data, and never below
+        // the format's floor or above the cap the writer picks on its own.
+        assert_eq!(fitted(0), 128 * 1024);
+        assert_eq!(fitted(130_000), 128 * 1024);
+        assert_eq!(fitted(200_000), 256 * 1024);
+        assert_eq!(fitted(700_000), 1024 * 1024);
+        assert_eq!(fitted(64 * 1024 * 1024), 1024 * 1024);
+
+        // What the caller asked for stands, in both directions.
+        assert_eq!(
+            dictionary_size_for_options(options.with_dictionary_size(4 * 1024 * 1024), 0, u64::MAX)
+                .unwrap(),
+            4 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn a_fitted_dictionary_shrinks_to_the_workspace_budget() {
+        let options = WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
+            .with_compression_level(3);
+        let block = crate::codec::rar50::LZ_BLOCK_SIZE;
+        let room_for_256k = streaming_lz_workspace(256 * 1024, block);
+
+        // A budget that cannot hold the fitted window takes the largest one it
+        // can, rather than failing a write the old 128 KiB default would have
+        // finished.
+        let fitted = dictionary_size_for_options(options, 8 * 1024 * 1024, room_for_256k).unwrap();
+
+        assert_eq!(fitted, 256 * 1024);
+        assert!(streaming_lz_workspace(fitted, block) <= room_for_256k);
+        // A dictionary the caller named is used as asked, so the write fails
+        // later saying what it needed instead of quietly writing something else.
+        assert_eq!(
+            dictionary_size_for_options(
+                options.with_dictionary_size(4 * 1024 * 1024),
+                8 * 1024 * 1024,
+                room_for_256k
+            )
+            .unwrap(),
+            4 * 1024 * 1024
+        );
+    }
 
     fn encode_member_with_filter_policy(
         data: &[u8],
@@ -1136,8 +1222,9 @@ mod tests {
             data.extend_from_slice(&index.to_le_bytes());
         }
         let options = WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only());
-        let algorithm_version = rar50_algorithm_version(options).unwrap();
-        let dictionary_size = dictionary_size_for_options(options).unwrap();
+        let dictionary_size =
+            dictionary_size_for_options(options, data.len() as u64, u64::MAX).unwrap();
+        let algorithm_version = rar50_algorithm_version(options, dictionary_size).unwrap();
         let encode_options =
             encode_options_for_level(options.compression_level, dictionary_size).unwrap();
         let block_size = 1024 * 1024;
@@ -1192,7 +1279,9 @@ mod tests {
             })
             .collect();
         let options = WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only());
-        let dictionary_size = dictionary_size_for_options(options).unwrap();
+        let dictionary_size =
+            dictionary_size_for_options(options, dictionary_reach(&entries, false), u64::MAX)
+                .unwrap();
         let required = streaming_lz_workspace(dictionary_size, 1024 * 1024);
         let mut one_job = Vec::new();
         write_streaming_archive_to(
