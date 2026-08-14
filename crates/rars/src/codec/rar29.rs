@@ -618,7 +618,7 @@ fn encode_member_with_options_impl(
             return encode_member_blocks(input, history, options, block_size, progress);
         }
     }
-    encode_member_inner(input, history, &[], options, progress)
+    encode_member_inner(input, history, &[], options, false, progress)
 }
 
 fn encode_member_blocks(
@@ -632,7 +632,8 @@ fn encode_member_blocks(
     let mut out = Vec::new();
     let mut local_history = history[history.len().saturating_sub(MAX_HISTORY)..].to_vec();
     let mut completed = 0usize;
-    for chunk in input.chunks(block_size) {
+    let block_count = input.chunks(block_size).count();
+    for (index, chunk) in input.chunks(block_size).enumerate() {
         let mut chunk_progress = |position: usize| {
             progress
                 .as_deref_mut()
@@ -643,6 +644,7 @@ fn encode_member_blocks(
             &local_history,
             &[],
             options,
+            index + 1 < block_count,
             Some(&mut chunk_progress),
         )?);
         completed = completed.saturating_add(chunk.len());
@@ -655,11 +657,18 @@ fn encode_member_blocks(
     Ok(out)
 }
 
+/// `more_blocks_follow` is what the block's terminator says.
+///
+/// The end-of-block symbol is followed by a bit meaning "another table comes
+/// next". A member split across blocks needs that bit set on every block but
+/// the last, and clear on the last so the member ends. Getting either one
+/// wrong leaves a reader parsing whatever comes after as the wrong thing.
 fn encode_member_inner(
     input: &[u8],
     history: &[u8],
     initial_filters: &[Vec<u8>],
     options: EncodeOptions,
+    more_blocks_follow: bool,
     progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<u8>> {
     let tokens = encode_tokens_with_progress(input, history, options, progress)?;
@@ -831,15 +840,16 @@ fn encode_member_inner(
     ))?;
     bits.write_bits(end.code as u32, end.len);
     // The end-of-block symbol on its own does not end the member: the next bit
-    // says whether another table follows, and only a zero means "that was the
-    // last block". Writing a one here left decoders reading the byte padding as
-    // a table header. unrar and our own reader stop on the unpacked size before
-    // they get there, so only a decoder that reads to the terminator noticed,
-    // which is why every RAR 2.9 LZ archive we have ever written fails in
-    // 7-Zip. The second bit is what the reader carries into a solid follower:
-    // a one tells it to read its own tables, which is what we write.
-    bits.write_bit(false);
-    bits.write_bit(true);
+    // says whether another table follows. A block in the middle of a member
+    // sets it, because one does. The last block clears it and then writes a
+    // second bit, which is what the reader carries into a solid follower: a one
+    // tells it to read its own tables.
+    if more_blocks_follow {
+        bits.write_bit(true);
+    } else {
+        bits.write_bit(false);
+        bits.write_bit(true);
+    }
     Ok(bits.finish())
 }
 
@@ -948,6 +958,7 @@ fn encode_filtered_member_blocks(
             &local_history,
             &records,
             inner,
+            end < data.len(),
             None,
         )?);
         local_history.extend_from_slice(chunk);
@@ -1830,6 +1841,9 @@ pub struct Unpack29 {
     base_offset: usize,
     output: Vec<u8>,
     stale_terminator: bool,
+    /// Set when a block claimed the member was over and the member was not.
+    member_ended_early: bool,
+    last_block_end: Option<LzBlockEnd>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1903,6 +1917,8 @@ impl Unpack29 {
             base_offset: 0,
             output: Vec::new(),
             stale_terminator: false,
+            member_ended_early: false,
+            last_block_end: None,
         }
     }
 
@@ -2079,6 +2095,16 @@ impl Unpack29 {
                 break;
             }
             if !self.in_lz_block {
+                // A block that said "new file" while the member still owes
+                // output is an encoder bug, not a format feature. Reading its
+                // tables anyway is the tolerance that let rars ship members
+                // split across blocks that unrar refused.
+                if matches!(
+                    self.last_block_end,
+                    Some(LzBlockEnd::NewFileKeepTables | LzBlockEnd::NewFileNewTables)
+                ) {
+                    self.member_ended_early = true;
+                }
                 self.read_tables()?;
                 self.in_lz_block = true;
             }
@@ -2362,6 +2388,12 @@ impl Unpack29 {
     }
 
     fn read_end_of_block(&mut self) -> Result<LzBlockEnd> {
+        let end = self.read_end_of_block_inner()?;
+        self.last_block_end = Some(end);
+        Ok(end)
+    }
+
+    fn read_end_of_block_inner(&mut self) -> Result<LzBlockEnd> {
         if self.bits.read_bit()? != 0 {
             self.in_lz_block = false;
             return Ok(LzBlockEnd::SameFileNewTable);
@@ -3292,6 +3324,30 @@ RAR 2.9 terminator check\n";
         assert!(
             !decoder.stale_terminator,
             "the member ended by claiming another table follows"
+        );
+    }
+
+    /// A member split across LZ blocks marks every block but the last as having
+    /// another table after it. Getting that wrong on the intermediate blocks
+    /// tells a reader the member finished early, and unrar and 7-Zip both throw
+    /// the archive out. Our own reader reads the next block's tables regardless,
+    /// so a round trip proves nothing and the tolerance has to be watched
+    /// instead.
+    #[test]
+    fn every_block_but_the_last_says_another_table_follows() {
+        let input = b"rar29 multi block terminator check with repeated filler text\n".repeat(400);
+        let packed = super::encode_member_with_options(
+            &input,
+            &[],
+            EncodeOptions::new(96).with_block_size(4096),
+        )
+        .unwrap();
+
+        let mut decoder = Unpack29::new();
+        assert_eq!(decoder.decode_member(&packed, input.len()).unwrap(), input);
+        assert!(
+            !decoder.member_ended_early,
+            "a block in the middle of the member said the member was over"
         );
     }
 

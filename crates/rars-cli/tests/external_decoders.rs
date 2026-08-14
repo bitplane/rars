@@ -95,6 +95,16 @@ enum Inputs {
     /// One member, large enough to split. The legacy volume writers take a
     /// single input file and refuse more.
     Single,
+    /// One member big enough to span several LZ blocks.
+    ///
+    /// Every other payload here fits in one block, which is what let a member
+    /// split across blocks ship broken: the RAR 2.9 writer marked every block
+    /// as ending the member, and unrar and 7-Zip both refused anything past the
+    /// first while our own reader read on regardless. This is end-to-end
+    /// confirmation at the block size we ship; the guard that cannot go stale
+    /// is `every_block_but_the_last_says_another_table_follows`, which sets its
+    /// own block size.
+    MultiBlock,
 }
 
 impl Inputs {
@@ -111,6 +121,7 @@ impl Inputs {
             }
             Inputs::PpmdStress => vec![("mixed.bin", mixed_payload(320 * 1024))],
             Inputs::Single => vec![("one.bin", mixed_payload(192 * 1024))],
+            Inputs::MultiBlock => vec![("wide.bin", mixed_payload(512 * 1024))],
         }
     }
 }
@@ -497,6 +508,23 @@ const CELLS: &[Cell] = &[
         flags: &["--level", "5", "--archive-name", "inner.rar"],
         inputs: Inputs::Standard,
         formats: MODERN,
+        judge: Judge::Everything,
+    },
+    Cell {
+        name: "multi-block",
+        flags: &["--level", "5", "--no-filter"],
+        inputs: Inputs::MultiBlock,
+        formats: ALL,
+        judge: Judge::Everything,
+    },
+    // An explicit filter rather than the auto search: the filtered block loop
+    // is separate code and worth covering, but running the search over this
+    // payload in every format at once is what the matrix cannot afford.
+    Cell {
+        name: "multi-block-filtered",
+        flags: &["--level", "5", "--e8e9-filter"],
+        inputs: Inputs::MultiBlock,
+        formats: &["rar29", "rar30", "rar40", "rar50", "rar70"],
         judge: Judge::Everything,
     },
     // Volumes. One input file, because that is all the legacy volume writers

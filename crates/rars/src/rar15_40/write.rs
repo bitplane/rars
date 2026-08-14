@@ -26,7 +26,30 @@ const MIN_STORE_FALLBACK_SIZE: usize = 1024;
 const RAR29_LARGE_TEXT_PPMD_THRESHOLD: usize = 16 * 1024 * 1024;
 const RAR29_TEXT_SAMPLE_SIZE: usize = 8192;
 const RAR29_AUDIO_SAMPLE_SIZE: usize = 8192;
-const RAR29_LZ_BLOCK_SIZE: usize = 1024 * 1024;
+/// How much data one RAR 2.9 LZ block covers.
+///
+/// Every block carries its own Huffman tables, so this is the distance over
+/// which the tables have to fit the data. A megabyte was far too long a lease:
+/// a binary's code and its data want different tables, and one set fitted to
+/// both is worse than either. Measured on `--level 5`, packed bytes:
+///
+/// ```text
+/// block         16K      32K      64K     128K       1M
+/// libc       686400   683942   684278   704689   797692
+/// python     632452   628926   627862   648835   738624
+/// mixed      136376   135530   135264   146831   149372
+/// lorem       16186    16186    16186    16186    16186
+/// ```
+///
+/// 64K is the best or within a rounding error of it on everything measured,
+/// and text does not care either way. The curve turns back up below 32K, where
+/// re-sending the tables starts to cost more than fitting them gains.
+const RAR29_LZ_BLOCK_SIZE: usize = 64 * 1024;
+
+/// The largest dictionary the format encodes, used when a memory estimate
+/// cannot resolve the real one. It has to stay an upper bound, so it does not
+/// follow the block size.
+const RAR29_MAX_DICTIONARY_SIZE: usize = 4 * 1024 * 1024;
 const RAR15_ALIGN_OVERFLOW: &str = "RAR 1.5 block size overflows usize";
 
 pub fn write_stored_archive(
@@ -762,7 +785,8 @@ fn member_workspace(options: WriterOptions, unpacked: u64, compressing: bool) ->
     if !compressing {
         return 1024 * 1024;
     }
-    let dictionary = dictionary_size_for_options(options).unwrap_or(RAR29_LZ_BLOCK_SIZE) as u64;
+    let dictionary =
+        dictionary_size_for_options(options).unwrap_or(RAR29_MAX_DICTIONARY_SIZE) as u64;
     unpacked
         .saturating_mul(2)
         .saturating_add(dictionary.saturating_mul(12))
