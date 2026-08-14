@@ -1368,21 +1368,25 @@ fn encode_member<'a>(
         last = position;
         work.advance(delta as u64)
     };
-    let mut packed = if let Some(encoder) = solid_encoder {
-        encoder.encode_member_with_progress(&data, &mut advance)?
+    // Every arm that ends up stored hands the payload back below, so none of
+    // them builds a copy of the member to be thrown away. At level zero and
+    // where the encoder gave nothing back, that copy was the whole member.
+    let packed = if let Some(encoder) = solid_encoder {
+        Some(encoder.encode_member_with_progress(&data, &mut advance)?)
     } else if options.compression_level == Some(0) {
-        data.to_vec()
+        None
     } else {
         encode_verified_rar15_payload_with_progress(&data, encode_options, &mut advance)?
-            .unwrap_or_else(|| data.to_vec())
     };
-    let method = if options.compression_level == Some(0)
-        || crate::write_plan::StoreFallback::new().applies(solid, data.len(), packed.len())
-    {
-        packed = data.into_owned();
-        METHOD_STORE
-    } else {
-        METHOD_BEST
+    let stored = match &packed {
+        Some(packed) => {
+            crate::write_plan::StoreFallback::new().applies(solid, data.len(), packed.len())
+        }
+        None => true,
+    };
+    let (packed, method) = match packed {
+        Some(packed) if !stored => (packed, METHOD_BEST),
+        _ => (data.into_owned(), METHOD_STORE),
     };
     Ok(EncodedMember {
         payload: MemberPayload::Packed(packed),

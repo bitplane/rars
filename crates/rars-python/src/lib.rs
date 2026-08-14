@@ -480,34 +480,6 @@ fn rar50_writer<'a>(
     }
 }
 
-/// Collects a RAR 5 volume set in memory, which is what the Python API hands
-/// back. The writer itself still holds one volume at a time.
-#[derive(Default)]
-struct CollectedVolumes(Arc<std::sync::Mutex<Vec<Vec<u8>>>>);
-
-struct CollectedVolume(Arc<std::sync::Mutex<Vec<Vec<u8>>>>, usize);
-
-impl std::io::Write for CollectedVolume {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap()[self.1].extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl rars_rs::rar50::VolumeSink for CollectedVolumes {
-    fn start_volume(&mut self, index: u64) -> rars_rs::Result<Box<dyn std::io::Write + Send>> {
-        self.0.lock().unwrap().push(Vec::new());
-        Ok(Box::new(CollectedVolume(
-            Arc::clone(&self.0),
-            index as usize,
-        )))
-    }
-}
-
 #[pymethods]
 impl RarBuilder {
     #[new]
@@ -746,7 +718,7 @@ impl RarBuilder {
             .map(|entry| {
                 let source = entry.source.clone().unwrap_or_else(|| {
                     rars_rs::EntrySource::from_bytes(std::sync::Arc::<[u8]>::from(
-                        entry.data.clone(),
+                        entry.data.as_slice(),
                     ))
                 });
                 let built = rars_rs::rar50::ArchiveEntry::new(entry.name.clone(), source)
@@ -909,7 +881,9 @@ impl RarBuilder {
             .map(|entry| {
                 let built = rars_rs::rar50::ArchiveEntry::new(
                     entry.name.clone(),
-                    rars_rs::EntrySource::from_bytes(Arc::<[u8]>::from(entry.data.clone())),
+                    // From the slice, not the Vec: `From<Vec<u8>>` cannot reuse
+                    // the buffer, so cloning first copied every member twice.
+                    rars_rs::EntrySource::from_bytes(Arc::<[u8]>::from(entry.data.as_slice())),
                 )
                 .with_mtime(entry.mtime)
                 .with_attributes(rar50_attr(entry))
@@ -1048,7 +1022,7 @@ impl RarBuilder {
                 "RAR 5 volume comments are not supported",
             ));
         }
-        let mut sink = CollectedVolumes::default();
+        let mut sink = rars_rs::rar50::CollectedVolumes::new();
         rars_rs::rar50::write_streaming_volumes_with_progress(
             &self.rar50_entries(),
             self.rar50_options(),
@@ -1060,8 +1034,7 @@ impl RarBuilder {
             &rars_rs::WriterResources::default(),
             progress.map(|progress| progress as &dyn rars_rs::WriteProgress),
         )?;
-        let volumes = sink.0.lock().unwrap().clone();
-        Ok(volumes)
+        Ok(sink.take())
     }
 
     fn build_rar15_volumes(

@@ -11,7 +11,7 @@
 //! Regenerate after an intentional format change with:
 //! `RARS_BLESS_GOLDEN=1 cargo test -p rars --test rar50_golden`
 
-use rars::rar50::{ArchiveEntry, ArchiveMetadataEntry, Rar50Writer, VolumeSink, WriterOptions};
+use rars::rar50::{ArchiveEntry, ArchiveMetadataEntry, Rar50Writer, WriterOptions};
 use rars::{ArchiveVersion, EntrySource, Error, FeatureSet, WriterResources};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -121,33 +121,6 @@ fn write_stored(entries: &[ArchiveEntry], options: WriterOptions) -> Result<Vec<
     Rar50Writer::new(options).entries(entries.to_vec()).finish()
 }
 
-/// Collects a volume set so the golden files can be compared one by one.
-#[derive(Default)]
-struct GoldenVolumes(std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>);
-
-struct GoldenVolume(std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>, usize);
-
-impl std::io::Write for GoldenVolume {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap()[self.1].extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl VolumeSink for GoldenVolumes {
-    fn start_volume(&mut self, index: u64) -> Result<Box<dyn std::io::Write + Send>, Error> {
-        self.0.lock().unwrap().push(Vec::new());
-        Ok(Box::new(GoldenVolume(
-            std::sync::Arc::clone(&self.0),
-            index as usize,
-        )))
-    }
-}
-
 #[test]
 fn golden_stored_archive_layout_is_stable() {
     let first = deterministic_bytes(4096, 1);
@@ -249,7 +222,7 @@ fn golden_volume_set_layout_is_stable() {
     let data = deterministic_bytes(5000, 7);
     let options = stored_options(ArchiveVersion::Rar50);
 
-    let mut sink = GoldenVolumes::default();
+    let mut sink = rars::rar50::CollectedVolumes::new();
     rars::rar50::write_streaming_volumes_to(
         &[entry(b"split.bin", &data)],
         options,
@@ -259,7 +232,7 @@ fn golden_volume_set_layout_is_stable() {
         &WriterResources::default(),
     )
     .unwrap();
-    let volumes = sink.0.lock().unwrap().clone();
+    let volumes = sink.take();
 
     assert!(volumes.len() > 1, "expected a multi-volume set");
     for (index, volume) in volumes.iter().enumerate() {

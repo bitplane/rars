@@ -932,44 +932,13 @@ mod tests {
         )
     }
 
-    /// Collects a volume set in memory. The writer itself still holds one
-    /// volume at a time; only the test keeps them all.
-    #[derive(Default)]
-    struct CollectedVolumes(std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>);
-
-    struct CollectedVolume(std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>, usize);
-
-    impl std::io::Write for CollectedVolume {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap()[self.1].extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl rar50::VolumeSink for CollectedVolumes {
-        fn start_volume(&mut self, index: u64) -> Result<Box<dyn std::io::Write + Send>> {
-            let mut volumes = self.0.lock().unwrap();
-            assert_eq!(volumes.len() as u64, index, "volumes must arrive in order");
-            volumes.push(Vec::new());
-            drop(volumes);
-            Ok(Box::new(CollectedVolume(
-                std::sync::Arc::clone(&self.0),
-                index as usize,
-            )))
-        }
-    }
-
     fn write_rar50_volume_set(
         entries: &[rar50::ArchiveEntry],
         options: rar50::WriterOptions,
         max_payload_per_volume: u64,
         recovery_percent: Option<u64>,
     ) -> Vec<Vec<u8>> {
-        let mut sink = CollectedVolumes::default();
+        let mut sink = rar50::CollectedVolumes::new();
         rar50::write_streaming_volumes_to(
             entries,
             options,
@@ -979,8 +948,7 @@ mod tests {
             &WriterResources::default(),
         )
         .unwrap();
-        let volumes = sink.0.lock().unwrap().clone();
-        volumes
+        sink.take()
     }
 
     fn write_rar29_filter(

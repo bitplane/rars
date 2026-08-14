@@ -1626,35 +1626,17 @@ fn write_plain_rar50_streaming(
         print_created_volumes(&paths);
         return Ok(());
     }
-    if archive_path == Path::new("-") || archive_path == Path::new("/dev/stdout") {
+    write_archive_streaming(archive_path, |output| {
         rars::rar50::write_streaming_archive_with_progress(
             &entries,
             options,
             extras.clone(),
             &resources,
             Some(progress),
-            &mut std::io::stdout(),
+            output,
         )?;
-    } else {
-        let (temporary, mut output) = create_streaming_archive_temp(archive_path)?;
-        let result = (|| -> CliResult<()> {
-            rars::rar50::write_streaming_archive_with_progress(
-                &entries,
-                options,
-                extras.clone(),
-                &resources,
-                Some(progress),
-                &mut output,
-            )?;
-            output.sync_all()?;
-            fs::rename(&temporary, archive_path)?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result?;
-    }
+        Ok(())
+    })?;
     progress.finish("100%");
     progress.spinner("Writing archive");
     progress.finish("Archive written");

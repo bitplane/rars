@@ -386,7 +386,7 @@ fn write_volumes(
     max_payload_per_volume: u64,
     recovery_percent: Option<u64>,
 ) -> Result<Vec<Vec<u8>>, Error> {
-    let mut sink = CollectingVolumeSink::default();
+    let mut sink = rar50::CollectedVolumes::new();
     rar50::write_streaming_volumes_to(
         entries,
         options,
@@ -395,7 +395,7 @@ fn write_volumes(
         &mut sink,
         &rars::WriterResources::default(),
     )?;
-    let volumes = sink.volumes.lock().unwrap().clone();
+    let volumes = sink.take();
     Ok(volumes)
 }
 
@@ -4805,54 +4805,6 @@ fn streaming_writer_drops_an_automatic_filter_it_cannot_afford() {
     assert_eq!(collect_extract(&archive).unwrap()[0].data, data);
 }
 
-/// Collects a volume set in memory so tests can inspect it, while the writer
-/// itself only ever holds one volume.
-#[derive(Default)]
-struct CollectingVolumeSink {
-    volumes: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
-    finished: Vec<(u64, u64)>,
-}
-
-/// The writer a sink hands back outlives the call that made it, so the shared
-/// buffer is shared rather than borrowed.
-struct VolumeWriterHandle {
-    volumes: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
-    index: usize,
-}
-
-impl Write for VolumeWriterHandle {
-    fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
-        self.volumes.lock().unwrap()[self.index].extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> IoResult<()> {
-        Ok(())
-    }
-}
-
-impl rar50::VolumeSink for CollectingVolumeSink {
-    fn start_volume(&mut self, index: u64) -> Result<Box<dyn Write + Send>, Error> {
-        let mut volumes = self.volumes.lock().unwrap();
-        assert_eq!(volumes.len() as u64, index, "volumes must arrive in order");
-        volumes.push(Vec::new());
-        drop(volumes);
-        Ok(Box::new(VolumeWriterHandle {
-            volumes: std::sync::Arc::clone(&self.volumes),
-            index: index as usize,
-        }))
-    }
-
-    fn finish_volume(&mut self, index: u64, len: u64) -> Result<(), Error> {
-        assert_eq!(
-            self.volumes.lock().unwrap()[index as usize].len() as u64,
-            len,
-            "reported volume length must match what was written"
-        );
-        self.finished.push((index, len));
-        Ok(())
-    }
-}
-
 /// Barely compressible bytes, so the packed payload stays big enough to span
 /// several volumes.
 fn volume_payload(len: u32) -> Vec<u8> {
@@ -4911,7 +4863,7 @@ fn the_volume_writer_refuses_exactly_what_the_table_refuses() {
             _ => unreachable!("every option in the list above is handled"),
         }
 
-        let mut sink = CollectingVolumeSink::default();
+        let mut sink = rar50::CollectedVolumes::new();
         let result = rar50::write_streaming_volumes_to(
             &entries,
             rar50::WriterOptions::new(ArchiveVersion::Rar50, features).with_compression_level(1),
@@ -4946,7 +4898,7 @@ fn a_file_comment_on_a_volume_set_is_refused_or_written() {
         )),
     ];
 
-    let mut sink = CollectingVolumeSink::default();
+    let mut sink = rar50::CollectedVolumes::new();
     let result = rar50::write_streaming_volumes_to(
         &entries,
         rar50::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
@@ -4960,7 +4912,7 @@ fn a_file_comment_on_a_volume_set_is_refused_or_written() {
     if result.is_err() {
         return;
     }
-    let volumes = sink.volumes.lock().unwrap().clone();
+    let volumes = sink.take();
     let found = volumes.iter().any(|volume| {
         Archive::parse(volume)
             .is_ok_and(|archive| archive.services().any(|service| service.name == b"CMT"))
@@ -4977,7 +4929,7 @@ fn a_file_comment_on_a_volume_set_is_refused_or_written() {
 /// sink to start one. The volume writer that was deleted refused this.
 #[test]
 fn a_volume_set_with_no_members_is_refused() {
-    let mut sink = CollectingVolumeSink::default();
+    let mut sink = rar50::CollectedVolumes::new();
     let result = rar50::write_streaming_volumes_to(
         &[],
         rar50::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only()),
@@ -4988,7 +4940,7 @@ fn a_volume_set_with_no_members_is_refused() {
     );
 
     assert!(result.is_err(), "an empty set reported success");
-    assert!(sink.volumes.lock().unwrap().is_empty());
+    assert!(sink.take().is_empty());
 }
 
 /// Solid members are coded as one chain, so the filter search never runs for
@@ -5008,7 +4960,7 @@ fn both_rar50_entry_points_refuse_a_filter_with_solid() {
         ))
     };
 
-    let mut sink = CollectingVolumeSink::default();
+    let mut sink = rar50::CollectedVolumes::new();
     let volumes = rar50::write_streaming_volumes_to(
         &entries,
         options,
@@ -5039,7 +4991,7 @@ fn write_volume_set(
     extras: rar50::ArchiveExtras<'_>,
     max_payload: u64,
 ) -> Vec<Vec<u8>> {
-    let mut sink = CollectingVolumeSink::default();
+    let mut sink = rar50::CollectedVolumes::new();
     rar50::write_streaming_volumes_to(
         entries,
         rar50::WriterOptions::new(ArchiveVersion::Rar50, features).with_compression_level(1),
@@ -5049,9 +5001,7 @@ fn write_volume_set(
         &rars::WriterResources::default(),
     )
     .unwrap();
-    let volumes = sink.volumes.lock().unwrap().clone();
-    assert_eq!(sink.finished.len(), volumes.len());
-    volumes
+    sink.take()
 }
 
 /// A volume set used to report nothing at all: the writer built its plan with
@@ -5097,7 +5047,7 @@ fn a_volume_set_reports_compression_progress() {
         _ => {}
     };
 
-    let mut sink = CollectingVolumeSink::default();
+    let mut sink = rar50::CollectedVolumes::new();
     rar50::write_streaming_volumes_with_progress(
         &entries,
         rar50::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
@@ -5118,7 +5068,7 @@ fn a_volume_set_reports_compression_progress() {
         advances.load(Ordering::Relaxed)
     );
     assert_eq!(last.load(Ordering::Relaxed), payload.len() as u64);
-    assert!(sink.volumes.lock().unwrap().len() > 1);
+    assert!(sink.take().len() > 1);
 }
 
 #[test]
