@@ -1834,12 +1834,9 @@ fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
         ));
     }
 
+    // One volume is a legitimate answer when the payload fits; see the note in
+    // rar15_40::write::write_split_volumes.
     let chunks: Vec<&[u8]> = entry.packed.chunks(entry.max_packed_per_volume).collect();
-    if chunks.len() < 2 {
-        return Err(Error::InvalidHeader(
-            "RAR 1.3 volume writer needs at least two volumes",
-        ));
-    }
 
     let mut volumes = Vec::with_capacity(chunks.len());
     for (index, chunk) in chunks.iter().enumerate() {

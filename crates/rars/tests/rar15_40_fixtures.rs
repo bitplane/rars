@@ -4066,6 +4066,41 @@ fn writes_stored_rar15_volume_set_that_reader_reassembles() {
     assert_eq!(extracted[0].data, entry.data);
 }
 
+/// Compressing well enough to need only one volume used to be an error, so a
+/// script with a fixed `--volume-size` could start failing because compression
+/// improved. RAR 5 always wrote the single volume; the legacy writers refused.
+#[test]
+fn a_volume_set_that_fits_in_one_volume_is_written_not_refused() {
+    let entry = StoredEntry {
+        name: b"fits-in-one.bin",
+        data: b"abcdefghijklmnopqrstuvwxyz0123456789",
+        file_time: 0x5a21_0000,
+        file_attr: 0x20,
+        host_os: 3,
+        password: None,
+        file_comment: None,
+    };
+
+    let parts = write_stored_volumes(entry, WriterOptions::default(), 4096).unwrap();
+    assert_eq!(parts.len(), 1);
+
+    let archives: Vec<_> = parts
+        .iter()
+        .map(|part| Archive::parse(part).unwrap())
+        .collect();
+    let file = archives[0].files().next().unwrap();
+    // It is a volume set, of one, so the member is whole: nothing continues
+    // into a part that was never written.
+    assert!(archives[0].main.is_volume());
+    assert!(archives[0].main.is_first_volume());
+    assert!(!file.is_split_before());
+    assert!(!file.is_split_after());
+
+    let extracted = collect_extract_volumes(&archives).unwrap();
+    assert_eq!(extracted.len(), 1);
+    assert_eq!(extracted[0].data, entry.data);
+}
+
 #[test]
 fn writes_compressed_rar15_volume_set_that_reader_reassembles() {
     let entry = FileEntry {

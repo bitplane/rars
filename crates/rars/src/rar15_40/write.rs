@@ -2125,12 +2125,13 @@ fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
     };
     let base_flags = entry.base_flags | if split_salt.is_some() { FHD_SALT } else { 0 };
 
+    // Packing well enough to need only one volume is not an error. The loop
+    // below already writes that set correctly: with one chunk neither split
+    // flag is set, so the member is an ordinary unsplit file inside a volume
+    // set of one, which is what WinRAR writes and what RAR 5 here already did.
+    // Refusing it meant a fixed `--volume-size` in a script could start failing
+    // because compression improved, which is how it was found.
     let chunks: Vec<&[u8]> = packed.chunks(entry.max_packed_per_volume).collect();
-    if chunks.len() < 2 {
-        return Err(Error::InvalidHeader(
-            "RAR 1.5 volume writer needs at least two volumes",
-        ));
-    }
 
     let mut volumes = Vec::with_capacity(chunks.len());
     let unpacked_crc = crc32(entry.unpacked);
@@ -2200,12 +2201,13 @@ fn write_header_encrypted_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<
     let mut packed = entry.packed.to_vec();
     let split_salt = encrypt_split_packed_data(&mut packed, entry.target, password)?;
     let base_flags = entry.base_flags | FHD_SALT;
+    // Packing well enough to need only one volume is not an error. The loop
+    // below already writes that set correctly: with one chunk neither split
+    // flag is set, so the member is an ordinary unsplit file inside a volume
+    // set of one, which is what WinRAR writes and what RAR 5 here already did.
+    // Refusing it meant a fixed `--volume-size` in a script could start failing
+    // because compression improved, which is how it was found.
     let chunks: Vec<&[u8]> = packed.chunks(entry.max_packed_per_volume).collect();
-    if chunks.len() < 2 {
-        return Err(Error::InvalidHeader(
-            "RAR 1.5 volume writer needs at least two volumes",
-        ));
-    }
 
     let mut volumes = Vec::with_capacity(chunks.len());
     let unpacked_crc = crc32(entry.unpacked);
