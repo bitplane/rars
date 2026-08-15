@@ -1490,6 +1490,51 @@ mod tests {
     }
 
     #[test]
+    fn only_the_top_level_pays_for_the_optimal_parse() {
+        for level in 0..=4u8 {
+            let options =
+                encode_options_for_level(Some(level), DEFAULT_RAR50_DICTIONARY_SIZE).unwrap();
+            assert!(!options.optimal_parse, "level {level} priced every path");
+        }
+        let five = encode_options_for_level(Some(5), DEFAULT_RAR50_DICTIONARY_SIZE).unwrap();
+        assert!(five.optimal_parse);
+        assert!(
+            !encode_options_for_level(None, DEFAULT_RAR50_DICTIONARY_SIZE)
+                .unwrap()
+                .optimal_parse,
+            "an absent level is the default level, which is not the top of the ladder",
+        );
+
+        // The fallbacks exist to catch a member that packs smaller with less
+        // search. They are levels one to four, so none of them pays for the
+        // parse a second time.
+        let candidates =
+            encode_option_candidates_for_level(Some(5), DEFAULT_RAR50_DICTIONARY_SIZE).unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|options| options.optimal_parse)
+                .count(),
+            1,
+        );
+    }
+
+    #[test]
+    fn a_filter_screen_does_not_pay_for_the_optimal_parse() {
+        use crate::filter_search::FilterSearch;
+
+        let search = crate::rar50::write::filter_policy::Rar50Search {
+            algorithm_version: 0,
+        };
+        let five = encode_options_for_level(Some(5), DEFAULT_RAR50_DICTIONARY_SIZE).unwrap();
+        let screen = search.screen_options(five);
+
+        assert!(!screen.optimal_parse);
+        assert_eq!(screen.max_match_candidates, five.max_match_candidates);
+        assert_eq!(screen.max_match_distance, five.max_match_distance);
+    }
+
+    #[test]
     fn non_solid_level_five_considers_lower_level_parse_fallbacks() {
         let long_tail = b"stable long match payload for RAR5 best-level search ".repeat(10);
         let mut data = Vec::new();

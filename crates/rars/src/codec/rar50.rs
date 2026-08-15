@@ -502,6 +502,7 @@ pub struct EncodeOptions {
     pub lazy_matching: bool,
     pub lazy_lookahead: usize,
     pub max_match_distance: usize,
+    pub optimal_parse: bool,
 }
 
 impl EncodeOptions {
@@ -511,7 +512,13 @@ impl EncodeOptions {
             lazy_matching: false,
             lazy_lookahead: 1,
             max_match_distance: MAX_ENCODER_MATCH_OFFSET,
+            optimal_parse: false,
         }
+    }
+
+    pub const fn with_optimal_parse(mut self, enabled: bool) -> Self {
+        self.optimal_parse = enabled;
+        self
     }
 
     pub const fn with_lazy_matching(mut self, enabled: bool) -> Self {
@@ -917,54 +924,7 @@ fn encode_lz_block(
         distance_size,
         progress,
     )?);
-    let mut lengths = TableLengths {
-        main: vec![0; MAIN_TABLE_SIZE],
-        distance: vec![0; distance_size],
-        align: vec![0; ALIGN_TABLE_SIZE],
-        length: vec![0; LENGTH_TABLE_SIZE],
-    };
-
-    let mut main_frequencies = vec![0usize; MAIN_TABLE_SIZE];
-    let mut distance_frequencies = vec![0usize; distance_size];
-    let mut align_frequencies = vec![0usize; ALIGN_TABLE_SIZE];
-    let mut length_frequencies = vec![0usize; LENGTH_TABLE_SIZE];
-    let mut state = EncoderMatchState::default();
-    for token in &tokens {
-        match *token {
-            EncodeToken::Filter(_) => main_frequencies[256] += 1,
-            EncodeToken::Literal(byte) => main_frequencies[byte as usize] += 1,
-            EncodeToken::Match { length, distance } => {
-                match state.encode_match(length, distance, distance_size)? {
-                    EncodedMatch::LastLengthRepeat => main_frequencies[257] += 1,
-                    EncodedMatch::RepeatDistance {
-                        index, length_slot, ..
-                    } => {
-                        main_frequencies[258 + index] += 1;
-                        length_frequencies[length_slot] += 1;
-                    }
-                    EncodedMatch::New {
-                        length_slot,
-                        distance_slot,
-                        distance_extra,
-                        distance_bit_count,
-                        ..
-                    } => {
-                        main_frequencies[262 + length_slot] += 1;
-                        distance_frequencies[distance_slot] += 1;
-                        if distance_bit_count >= 4 {
-                            align_frequencies[distance_extra & 0x0f] += 1;
-                        }
-                    }
-                }
-                state.remember(length, distance);
-            }
-        }
-    }
-
-    lengths.main = huffman::complete_lengths_for_frequencies(&main_frequencies, 15);
-    lengths.distance = huffman::complete_lengths_for_frequencies(&distance_frequencies, 15);
-    lengths.length = huffman::complete_lengths_for_frequencies(&length_frequencies, 15);
-    lengths.align = huffman::complete_lengths_for_frequencies(&align_frequencies, 15);
+    let lengths = table_lengths_for_tokens(&tokens, distance_size)?;
 
     let main_table = HuffmanTable::from_lengths(&lengths.main)?;
     let distance_table = HuffmanTable::from_lengths(&lengths.distance)?;
@@ -1254,6 +1214,308 @@ impl EncoderMatchState {
     }
 }
 
+/// The Huffman code lengths a block of tokens produces. The block writer needs
+/// these to emit the tables; the optimal parse needs them to know what each
+/// token it is considering will actually cost.
+fn table_lengths_for_tokens(tokens: &[EncodeToken], distance_size: usize) -> Result<TableLengths> {
+    let mut main_frequencies = vec![0usize; MAIN_TABLE_SIZE];
+    let mut distance_frequencies = vec![0usize; distance_size];
+    let mut align_frequencies = vec![0usize; ALIGN_TABLE_SIZE];
+    let mut length_frequencies = vec![0usize; LENGTH_TABLE_SIZE];
+    let mut state = EncoderMatchState::default();
+    for token in tokens {
+        match *token {
+            EncodeToken::Filter(_) => main_frequencies[256] += 1,
+            EncodeToken::Literal(byte) => main_frequencies[byte as usize] += 1,
+            EncodeToken::Match { length, distance } => {
+                match state.encode_match(length, distance, distance_size)? {
+                    EncodedMatch::LastLengthRepeat => main_frequencies[257] += 1,
+                    EncodedMatch::RepeatDistance {
+                        index, length_slot, ..
+                    } => {
+                        main_frequencies[258 + index] += 1;
+                        length_frequencies[length_slot] += 1;
+                    }
+                    EncodedMatch::New {
+                        length_slot,
+                        distance_slot,
+                        distance_extra,
+                        distance_bit_count,
+                        ..
+                    } => {
+                        main_frequencies[262 + length_slot] += 1;
+                        distance_frequencies[distance_slot] += 1;
+                        if distance_bit_count >= 4 {
+                            align_frequencies[distance_extra & 0x0f] += 1;
+                        }
+                    }
+                }
+                state.remember(length, distance);
+            }
+        }
+    }
+
+    Ok(TableLengths {
+        main: huffman::complete_lengths_for_frequencies(&main_frequencies, 15),
+        distance: huffman::complete_lengths_for_frequencies(&distance_frequencies, 15),
+        align: huffman::complete_lengths_for_frequencies(&align_frequencies, 15),
+        length: huffman::complete_lengths_for_frequencies(&length_frequencies, 15),
+    })
+}
+
+/// What a literal is assumed to cost before any block has been coded, in the
+/// same bit units [`estimated_match_cost`] reports. A literal is one main-table
+/// symbol out of 256 plus the odds that the table is skewed, so eight is the
+/// floor and nine is what real blocks measure.
+const ESTIMATED_LITERAL_COST: u32 = 9;
+
+/// How many times the optimal parse runs over a block. The first pass guesses
+/// prices; the rest reprice against the tables the pass before produced.
+const OPTIMAL_PARSE_PASSES: usize = 3;
+
+/// What a symbol the first pass never used is assumed to cost. Reaching for
+/// one is not forbidden, only expensive: the tables are rebuilt from whatever
+/// the last pass chose, so a symbol that earns its place gets a real code.
+const UNUSED_SYMBOL_COST: usize = 15;
+
+/// Prices a token against the code lengths a previous pass produced, which is
+/// what the block will really spend, rather than against the flat guess in
+/// [`estimated_match_cost`].
+struct TokenPrices<'a> {
+    lengths: &'a TableLengths,
+}
+
+impl TokenPrices<'_> {
+    fn code(bits: u8) -> usize {
+        if bits == 0 {
+            UNUSED_SYMBOL_COST
+        } else {
+            usize::from(bits)
+        }
+    }
+
+    fn literal(&self, byte: u8) -> usize {
+        Self::code(self.lengths.main[byte as usize])
+    }
+
+    fn match_cost(
+        &self,
+        state: &EncoderMatchState,
+        length: usize,
+        distance: usize,
+        distance_size: usize,
+    ) -> Result<usize> {
+        Ok(match state.encode_match(length, distance, distance_size)? {
+            EncodedMatch::LastLengthRepeat => Self::code(self.lengths.main[257]),
+            EncodedMatch::RepeatDistance {
+                index, length_slot, ..
+            } => {
+                Self::code(self.lengths.main[258 + index])
+                    + Self::code(self.lengths.length[length_slot])
+                    + usize::from(length_slot_extra_bits(length_slot)?)
+            }
+            EncodedMatch::New {
+                length_slot,
+                distance_slot,
+                distance_extra,
+                distance_bit_count,
+                ..
+            } => {
+                let align = if distance_bit_count >= 4 {
+                    distance_bit_count - 4 + Self::code(self.lengths.align[distance_extra & 0x0f])
+                } else {
+                    distance_bit_count
+                };
+                Self::code(self.lengths.main[262 + length_slot])
+                    + usize::from(length_slot_extra_bits(length_slot)?)
+                    + Self::code(self.lengths.distance[distance_slot])
+                    + align
+            }
+        })
+    }
+}
+
+/// Prices every path through the block and keeps the cheapest, instead of
+/// taking the longest match at each position and checking one or two bytes
+/// ahead. Prices come from [`estimated_match_cost`], so this is only as good
+/// as that estimate, but it sees the whole block where lazy matching sees two
+/// bytes.
+///
+/// The repeated-distance discount depends on the path taken, which a forward
+/// pass does not know. Each node carries the match that arrives at it and
+/// prices the next hop against that one distance, which catches
+/// same-distance runs and misses the deeper three slots.
+fn optimal_tokens(
+    combined: &[u8],
+    start: usize,
+    options: EncodeOptions,
+    distance_size: usize,
+    prices: Option<&TokenPrices<'_>>,
+) -> Result<Vec<EncodeToken>> {
+    let end = combined.len();
+    let span = end - start;
+    let mut finder = Rar50MatchFinder::new(end);
+    for history_pos in 0..start {
+        finder.insert(combined, history_pos);
+    }
+
+    let mut price = vec![u32::MAX; span + 1];
+    let mut arrive_length = vec![0u32; span + 1];
+    let mut arrive_distance = vec![0u32; span + 1];
+    price[0] = 0;
+
+    // Runs of `(shortest, longest, distance)` from the position being priced,
+    // in the order the chain found them. Reused to keep one allocation.
+    let mut reaches: Vec<(usize, usize, usize)> = Vec::new();
+
+    for index in 0..span {
+        let pos = start + index;
+        finder.insert(combined, pos);
+        let here = price[index];
+        if here == u32::MAX {
+            continue;
+        }
+        let literal_cost = prices.map_or(ESTIMATED_LITERAL_COST, |prices| {
+            prices.literal(combined[pos]) as u32
+        });
+        let literal = here.saturating_add(literal_cost);
+        if literal < price[index + 1] {
+            price[index + 1] = literal;
+            arrive_length[index + 1] = 0;
+            arrive_distance[index + 1] = 0;
+        }
+
+        let max_distance = pos.min(options.max_match_distance);
+        let max_length = (end - pos).min(MAX_ENCODER_MATCH_LENGTH);
+        if options.max_match_candidates == 0 || max_distance == 0 || max_length < 4 {
+            continue;
+        }
+
+        let mut state = EncoderMatchState::default();
+        state.reps[0] = arrive_distance[index] as usize;
+        state.last_length = arrive_length[index] as usize;
+
+        // The chain walks nearest first, so the first distance to reach a
+        // length is the cheapest one that can. Each step that improves on the
+        // longest so far owns one run of lengths.
+        reaches.clear();
+        let mut longest = 0usize;
+        let mut checked = 0usize;
+        let mut candidate = finder.first(combined, pos);
+        while candidate != match_finder::NO_POSITION
+            && longest < max_length
+            && longest < NICE_MATCH_LENGTH
+        {
+            if candidate >= pos {
+                candidate = finder.previous(candidate);
+                continue;
+            }
+            let distance = pos - candidate;
+            if distance > max_distance {
+                break;
+            }
+            checked += 1;
+            if combined[candidate + longest] == combined[pos + longest] {
+                let length = match_length(combined, pos, distance, max_length);
+                if length > longest {
+                    reaches.push((longest + 1, length, distance));
+                    longest = length;
+                }
+            }
+            if checked >= options.max_match_candidates {
+                break;
+            }
+            candidate = finder.previous(candidate);
+        }
+
+        // Matches that share a distance and a length slot cost the same, so
+        // only the longest of each run is worth pricing. Stepping slot to
+        // slot turns a four-thousand-step loop into a few dozen on data that
+        // matches long.
+        for &(run_start, run_end, distance) in reaches.iter() {
+            let mut length = run_start.max(4);
+            while length <= run_end {
+                let reach =
+                    same_price_run_end(&state, length, distance, distance_size).min(run_end);
+                let cost = match prices {
+                    Some(prices) => prices.match_cost(&state, reach, distance, distance_size),
+                    None => estimated_match_cost(&state, reach, distance, distance_size),
+                };
+                if let Ok(cost) = cost {
+                    let reached = here.saturating_add(cost as u32);
+                    let target = index + reach;
+                    if reached < price[target] {
+                        price[target] = reached;
+                        arrive_length[target] = reach as u32;
+                        arrive_distance[target] = distance as u32;
+                    }
+                }
+                length = reach + 1;
+            }
+        }
+    }
+
+    let mut reversed = Vec::new();
+    let mut index = span;
+    while index > 0 {
+        let length = arrive_length[index] as usize;
+        if length == 0 {
+            reversed.push(EncodeToken::Literal(combined[start + index - 1]));
+            index -= 1;
+        } else {
+            reversed.push(EncodeToken::Match {
+                length,
+                distance: arrive_distance[index] as usize,
+            });
+            index -= length;
+        }
+    }
+    reversed.reverse();
+    Ok(reversed)
+}
+
+/// The longest match at `distance` that costs exactly what a match of
+/// `length` costs. Only the length slot varies with length, and a slot covers
+/// a run of consecutive lengths, so the end of that run is the last length
+/// worth pricing.
+fn same_price_run_end(
+    state: &EncoderMatchState,
+    length: usize,
+    distance: usize,
+    distance_size: usize,
+) -> usize {
+    // Repeating the last distance at the last length codes in two bits, so
+    // that one length must be priced on its own rather than folded into the
+    // run around it.
+    let repeat_length = (distance == state.reps[0] && state.last_length != 0)
+        .then_some(state.last_length)
+        .filter(|&repeat_length| repeat_length >= length);
+    if repeat_length == Some(length) {
+        return length;
+    }
+    let repeated = state
+        .reps
+        .iter()
+        .any(|&repeat_distance| repeat_distance == distance && repeat_distance != 0);
+    let bonus = if repeated { 0 } else { length_bonus(distance) };
+    let Some(value) = length.checked_sub(2 + bonus) else {
+        return length;
+    };
+    if value < 8 {
+        return length;
+    }
+    let bit_count = value.ilog2() as usize - 2;
+    let last_value = (((value >> bit_count) + 1) << bit_count) - 1;
+    let mut end = (last_value + 2 + bonus).max(length);
+    if let Some(repeat_length) = repeat_length {
+        end = end.min(repeat_length - 1);
+    }
+    // A distance whose extra bits change with length would break the run, but
+    // the distance is fixed here, so only the length slot moves.
+    let _ = distance_size;
+    end.max(length).min(MAX_ENCODER_MATCH_LENGTH)
+}
+
 fn encode_tokens_with_progress(
     input: &[u8],
     history: &[u8],
@@ -1266,6 +1528,27 @@ fn encode_tokens_with_progress(
     let mut combined = Vec::with_capacity(history.len() + input.len());
     combined.extend_from_slice(history);
     combined.extend_from_slice(input);
+    if options.optimal_parse {
+        // The prices come from the Huffman tables, and the tables come from
+        // the parse, so the first pass has to guess. Each pass after it prices
+        // against what the pass before actually produced.
+        let mut tokens = optimal_tokens(&combined, history.len(), options, distance_size, None)?;
+        for _ in 1..OPTIMAL_PARSE_PASSES {
+            let lengths = table_lengths_for_tokens(&tokens, distance_size)?;
+            let prices = TokenPrices { lengths: &lengths };
+            tokens = optimal_tokens(
+                &combined,
+                history.len(),
+                options,
+                distance_size,
+                Some(&prices),
+            )?;
+        }
+        if progress.is_some_and(|report| !report(input.len())) {
+            return Err(Error::Cancelled);
+        }
+        return Ok(tokens);
+    }
     let mut finder = Rar50MatchFinder::new(combined.len());
     for history_pos in 0..history.len() {
         finder.insert(&combined, history_pos);
@@ -3663,6 +3946,108 @@ mod tests {
                 .decode_member(&encoded, 0, data.len(), false, DecodeMode::Lz)
                 .unwrap(),
             data
+        );
+    }
+
+    /// Words drawn from a small vocabulary in a repeating-but-not-periodic
+    /// order. Every position has several matches at different distances and
+    /// lengths, which is the case where taking the longest one and checking
+    /// two bytes ahead leaves bits on the floor.
+    fn wordy_text(len: usize) -> Vec<u8> {
+        const WORDS: [&str; 12] = [
+            "the ", "quick ", "brown ", "fox ", "jumps ", "over ", "lazy ", "dog ", "and ",
+            "then ", "runs ", "away ",
+        ];
+        let mut out = Vec::with_capacity(len + 16);
+        let mut noise = 0x2545_f491_4f6c_dd1du64;
+        while out.len() < len {
+            noise ^= noise << 13;
+            noise ^= noise >> 7;
+            noise ^= noise << 17;
+            out.extend_from_slice(WORDS[(noise >> 40) as usize % WORDS.len()].as_bytes());
+            if (noise >> 20).is_multiple_of(11) {
+                out.push(b'\n');
+            }
+        }
+        out.truncate(len);
+        out
+    }
+
+    #[test]
+    fn the_optimal_parse_round_trips() {
+        for data in [
+            Vec::new(),
+            b"a".to_vec(),
+            b"abcabcabcabc".to_vec(),
+            wordy_text(3),
+            wordy_text(LZ_BLOCK_SIZE + 4096),
+            vec![0u8; LZ_BLOCK_SIZE * 2],
+        ] {
+            let options = EncodeOptions::new(64).with_optimal_parse(true);
+            let encoded = encode_lz_member_with_options(&data, 0, options).unwrap();
+            let decoded = Unpack50Decoder::new()
+                .decode_member(&encoded, 0, data.len(), false, DecodeMode::Lz)
+                .unwrap();
+            assert_eq!(decoded, data, "{} bytes did not round trip", data.len());
+        }
+    }
+
+    #[test]
+    fn the_optimal_parse_beats_lazy_matching_at_the_same_depth() {
+        let data = wordy_text(256 * 1024);
+        let base = EncodeOptions::new(64);
+        let lazy = encode_lz_member_with_options(
+            &data,
+            0,
+            base.with_lazy_matching(true).with_lazy_lookahead(2),
+        )
+        .unwrap();
+        let optimal =
+            encode_lz_member_with_options(&data, 0, base.with_optimal_parse(true)).unwrap();
+
+        assert!(
+            optimal.len() < lazy.len(),
+            "optimal parse packed {} against lazy matching's {}",
+            optimal.len(),
+            lazy.len(),
+        );
+    }
+
+    #[test]
+    fn repricing_against_the_first_pass_beats_the_flat_guess() {
+        let data = wordy_text(256 * 1024);
+        let options = EncodeOptions::new(64).with_optimal_parse(true);
+        let distance_size = DISTANCE_TABLE_SIZE_50;
+        let guessed = optimal_tokens(&data, 0, options, distance_size, None).unwrap();
+        let lengths = table_lengths_for_tokens(&guessed, distance_size).unwrap();
+        let prices = TokenPrices { lengths: &lengths };
+        let repriced = optimal_tokens(&data, 0, options, distance_size, Some(&prices)).unwrap();
+
+        let bits = |tokens: &[EncodeToken]| -> usize {
+            let lengths = table_lengths_for_tokens(tokens, distance_size).unwrap();
+            let prices = TokenPrices { lengths: &lengths };
+            let mut state = EncoderMatchState::default();
+            let mut total = 0;
+            for token in tokens {
+                match *token {
+                    EncodeToken::Filter(_) => {}
+                    EncodeToken::Literal(byte) => total += prices.literal(byte),
+                    EncodeToken::Match { length, distance } => {
+                        total += prices
+                            .match_cost(&state, length, distance, distance_size)
+                            .unwrap();
+                        state.remember(length, distance);
+                    }
+                }
+            }
+            total
+        };
+
+        assert!(
+            bits(&repriced) < bits(&guessed),
+            "repriced {} bits against the guess's {}",
+            bits(&repriced),
+            bits(&guessed),
         );
     }
 

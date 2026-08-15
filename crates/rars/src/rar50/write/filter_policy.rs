@@ -195,6 +195,11 @@ pub(super) fn encode_options_for_level(
         // Four is worse than one, which is its own question (#83).
         .with_lazy_matching(level >= 3)
         .with_lazy_lookahead(2)
+        // Pricing the whole block and keeping the cheapest path takes 2.4% off
+        // a stripped ELF and 4.3% off manpage text against lazy matching at the
+        // same search depth, and costs six times the time. That trade belongs
+        // at the top of the ladder and nowhere else: level 3 is the default.
+        .with_optimal_parse(level >= 5)
         .with_max_match_distance(max_match_distance))
 }
 
@@ -421,6 +426,14 @@ impl crate::filter_search::FilterSearch for Rar50Search {
         crate::codec::rar50::filtered_lz_member(data, filters)
             .map(|(filtered, _)| filtered)
             .map_err(Error::from)
+    }
+
+    /// Screens rank filters against each other, and the optimal parse costs six
+    /// encodes' worth of time to sharpen a ranking that the same parse on both
+    /// sides already gets right. Everything else about the settings stays, so a
+    /// screen still measures what the writer will do.
+    fn screen_options(&self, options: EncodeOptions) -> EncodeOptions {
+        options.with_optimal_parse(false)
     }
 
     fn encode_plain(
