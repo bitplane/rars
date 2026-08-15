@@ -2,11 +2,13 @@
 
 A Rust implementation of RAR.
 
-* [🏠 home](https://bitplane.net/dev/rust/rars)
-  * [🪵 blog](https://bitplane.net/log/2026/05/rars/)
-* [🦀 crate](https://crates.io/crates/rars)
-* [🐱 source](https://github.com/bitplane/rars)
-* [📃 spec](https://github.com/bitplane/rar-research)
+* 🏠 [home](https://bitplane.net/dev/rust/rars)
+  * 🪵 [blog](https://bitplane.net/log/2026/05/rars/)
+* 📦 [downloads](https://github.com/bitplane/rars/releases)
+  * 🦀 [crates](https://crates.io/crates/rars)
+  * 🐍 [pypi](https://pypi.org/project/rars)
+* 🐱 [source](https://github.com/bitplane/rars)
+  * 📃 [spec](https://github.com/bitplane/rar-research)
 
 ## Current Status
 
@@ -15,11 +17,8 @@ compression and decompression. It's getting faster, and kinda works.
 
 ## Rust API
 
-Use the `rars` crate for Rust applications and libraries. Since 0.4, the
-lower-level `rars-format`, `rars-codec`, `rars-crypto`, `rars-crc32`, and
-`rars-recovery` crates are folded into `rars`; those standalone crates ended at
-0.3.x. Applications should depend on `rars`, and command-line installs should
-use `rars-cli`.
+Use the `rars` crate for Rust applications and libraries. This is what the
+Python package uses. For the cli it's `rars-cli`.
 
 ## CLI
 

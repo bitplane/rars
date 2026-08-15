@@ -281,6 +281,13 @@ fn x86_code_regions(data: &[u8]) -> Vec<Range<usize>> {
 /// 0.4%; leaving it in was worse than not filtering at all. Ties are kept: a
 /// sample with no convertible opcodes in it is not evidence against the region
 /// it came from.
+///
+/// A kept region is then asked the second question: does leaving the jump
+/// opcodes alone beat converting them as well. That decides whether the E8-only
+/// filter is worth a whole-member encode of its own, and the answer is usually
+/// no. Over twenty-four members it won seven times and never by more than
+/// 0.21%, while carrying the pair cost a third of the search; screening it here
+/// keeps the wins and spends the encode only where a sample gives a reason to.
 fn x86_screened_regions<S: FilterSearch>(
     search: &S,
     data: &[u8],
@@ -292,7 +299,7 @@ fn x86_screened_regions<S: FilterSearch>(
     for region in regions {
         let sample = screen_sample(&data[region.clone()]);
         if sample.len() < SCREEN_SAMPLE_ALIGNMENT {
-            kept.push(region.clone());
+            kept.push((region.clone(), None));
             continue;
         }
         // Measured at the caller's real settings, not the cheaper screen ones.
@@ -310,21 +317,47 @@ fn x86_screened_regions<S: FilterSearch>(
         // already ruled on where code is, so a small win on this sample is
         // evidence rather than noise.
         helped |= filtered.len() < baseline.len();
-        kept.push(region.clone());
+        kept.push((region.clone(), Some(filtered.len())));
     }
+    let rejected_a_region = kept.len() < regions.len();
+    if !helped {
+        return Ok(X86Screen::default());
+    }
+
+    // Held back until the regions are known to be worth filtering at all. Asking
+    // per region inside the loop above priced the jump opcodes on members that
+    // then declined every filter, which is a sample encode each for an answer
+    // nothing reads.
+    let mut jumps_cost_more = false;
+    for (region, e8e9) in &kept {
+        let Some(e8e9) = *e8e9 else { continue };
+        let sample = screen_sample(&data[region.clone()]);
+        let e8_only = search.filtered_bytes(sample, &[FilterSpec::whole(FilterKind::E8)])?;
+        let e8_only = search.encode_plain(&e8_only, options, None)?;
+        jumps_cost_more |= e8_only.len() < e8e9;
+    }
+
     Ok(X86Screen {
-        rejected_a_region: kept.len() < regions.len(),
-        kept: if helped { kept } else { Vec::new() },
+        rejected_a_region,
+        kept: kept.into_iter().map(|(region, _)| region).collect(),
+        jumps_cost_more,
     })
 }
 
 /// What the x86 screen made of the regions the scanner proposed.
+#[derive(Default)]
 struct X86Screen {
     /// The regions worth filtering, empty when none of them is.
     kept: Vec<Range<usize>>,
     /// Whether any region came out bigger under the filter, which rules out
     /// filtering the member end to end.
     rejected_a_region: bool,
+    /// Whether any kept region did better with the jump opcodes left alone,
+    /// which is the only reason to price the E8-only filter separately. A tie
+    /// does not count: it usually means the sample held no jump opcodes at all,
+    /// so it is an absence of evidence, and acting on it costs a whole-member
+    /// encode.
+    jumps_cost_more: bool,
 }
 
 /// The x86 filter specs worth measuring against the whole member, given what the
@@ -342,19 +375,25 @@ struct X86Screen {
 /// out bigger; on all seven binaries measured the kept regions beat it. Filtering
 /// only the regions is the same thing as filtering everything when they cover
 /// nearly the whole member. So each case is worth one candidate per kind, not
-/// two, which is what keeps an unstripped binary to three whole-member encodes
-/// rather than five.
-fn x86_finalists(
-    data: &[u8],
-    regions: &[Range<usize>],
-    rejected_a_region: bool,
-) -> Vec<Vec<FilterSpec>> {
+/// two.
+///
+/// And usually one kind rather than two, because the screen has already asked
+/// whether the jump opcodes are worth converting. That takes an unstripped
+/// binary from five whole-member encodes to two.
+fn x86_finalists(data: &[u8], screen: &X86Screen) -> Vec<Vec<FilterSpec>> {
+    let regions = &screen.kept;
     let covered: usize = regions.iter().map(|range| range.len()).sum();
     let (numerator, denominator) = X86_CODE_COVERAGE_RATIO;
     let sparse = covered * denominator < data.len() * numerator;
+    let rejected_a_region = screen.rejected_a_region;
+
+    let mut kinds = vec![FilterKind::E8E9];
+    if screen.jumps_cost_more {
+        kinds.push(FilterKind::E8);
+    }
 
     let mut finalists = Vec::new();
-    for kind in [FilterKind::E8E9, FilterKind::E8] {
+    for kind in kinds {
         if rejected_a_region || sparse {
             finalists.push(
                 regions
@@ -389,7 +428,7 @@ fn finalists<S: FilterSearch>(
         let screen = x86_screened_regions(search, data, &x86_code_regions(data), options)?;
         if !screen.kept.is_empty() {
             finalists.extend(
-                x86_finalists(data, &screen.kept, screen.rejected_a_region)
+                x86_finalists(data, &screen)
                     .into_iter()
                     .map(|specs| (specs, None)),
             );
@@ -849,6 +888,30 @@ mod tests {
             screen.kept
         );
         assert!(screen.rejected_a_region);
+    }
+
+    /// The E8-only filter costs a whole-member encode to ask whether leaving
+    /// the jump opcodes alone packs better. Over twenty-four members it won
+    /// seven times and never by more than 0.21%, so it only earns that encode
+    /// when a sample says it might.
+    #[test]
+    fn the_jump_opcodes_are_priced_on_a_sample_before_they_earn_an_encode() {
+        let (data, _) = code_then_debug();
+        let regions = x86_code_regions(&data);
+        let screen = x86_screened_regions(&FULL, &data, &regions, options()).unwrap();
+        let kinds: Vec<_> = x86_finalists(&data, &screen)
+            .iter()
+            .map(|specs| specs[0].kind)
+            .collect();
+
+        // Every call here goes to a fixed address, which is what the jump
+        // conversion is for, so this member is one where converting both pays.
+        assert!(!screen.jumps_cost_more, "{kinds:?}");
+        assert_eq!(
+            kinds,
+            [FilterKind::E8E9],
+            "the E8-only candidate cost an encode nothing asked for"
+        );
     }
 
     /// And the member as a whole has to come out smaller for it.
