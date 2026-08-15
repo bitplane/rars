@@ -3043,7 +3043,10 @@ fn auto_filtered_rar29_writer_chooses_ppmd_for_text_when_smaller() {
     let archive = Archive::parse(&bytes).unwrap();
     let file = archive.files().next().unwrap();
 
-    assert_eq!(file.method, 0x35);
+    // The method byte is the level asked for, here the default 0x33. PPMd is
+    // signalled in the stream, so the pack size against a known PPMd encode is
+    // what shows which engine answered.
+    assert_eq!(file.method, 0x33);
     assert_eq!(file.pack_size, ppmd_packed.len() as u64);
     assert_eq!(collect_extract(&archive).unwrap()[0].data, payload);
 }
@@ -3070,7 +3073,10 @@ fn default_rar29_writer_uses_auto_policy_for_text() {
     let file = archive.files().next().unwrap();
     let ppmd_packed = rars::codec::rar29::unpack29_encode_ppmd(&payload, RAR29_DICTIONARY).unwrap();
 
-    assert_eq!(file.method, 0x35);
+    // The method byte is the level asked for, here the default 0x33. PPMd is
+    // signalled in the stream, so the pack size against a known PPMd encode is
+    // what shows which engine answered.
+    assert_eq!(file.method, 0x33);
     assert_eq!(file.pack_size, ppmd_packed.len() as u64);
     assert_eq!(collect_extract(&archive).unwrap()[0].data, payload);
 }
@@ -3619,8 +3625,12 @@ fn auto_filtered_rar29_writer_spans_separated_x86_call_clusters() {
     assert_eq!(collect_extract(&auto).unwrap()[0].data, payload);
 }
 
+/// The method byte names the level, not the engine. It used to be stamped 0x35
+/// for every PPMd payload, which was only ever right at level 5: WinRAR 3.00
+/// writes 0x34 on the PPMd archive it produces at -m4, and RAR 2.9 signals the
+/// engine inside the stream, which is why our decoder takes no method byte.
 #[test]
-fn ppmd_rar29_writer_emits_method_35_member() {
+fn ppmd_rar29_writer_stamps_the_level_and_still_reads_back_as_ppmd() {
     let mut payload = b"rar29 ppmd writer text alpha beta gamma delta\n".repeat(128);
     payload.extend_from_slice(&[2, 2, 2, b'p', b'p', b'm', b'd']);
     let entries = [FileEntry {
@@ -3643,7 +3653,14 @@ fn ppmd_rar29_writer_emits_method_35_member() {
     let archive = Archive::parse(&bytes).unwrap();
     let file = archive.files().next().unwrap();
 
-    assert_eq!(file.method, 0x35);
+    let ppmd_packed = rars::codec::rar29::unpack29_encode_ppmd(&payload, RAR29_DICTIONARY).unwrap();
+
+    assert_eq!(file.method, 0x33, "the default level, not the engine");
+    assert_eq!(
+        file.pack_size,
+        ppmd_packed.len() as u64,
+        "and the payload is still PPMd"
+    );
     assert_eq!(file.unp_ver, 29);
     assert_eq!(collect_extract(&archive).unwrap()[0].data, payload);
 }
@@ -3682,7 +3699,7 @@ fn ppmd_rar29_writer_uses_period_compatible_lz_escapes_for_repeated_data() {
     let archive = Archive::parse(&ppmd).unwrap();
     let file = archive.files().next().unwrap();
 
-    assert_eq!(file.method, 0x35);
+    assert_eq!(file.method, 0x33);
     assert_eq!(file.pack_size, codec_packed.len() as u64);
     assert_eq!(collect_extract(&archive).unwrap()[0].data, payload);
 }
@@ -3710,7 +3727,7 @@ fn ppmd_rar29_writer_embeds_vm_filter_record() {
     let archive = Archive::parse(&bytes).unwrap();
     let file = archive.files().next().unwrap();
 
-    assert_eq!(file.method, 0x35);
+    assert_eq!(file.method, 0x33);
     assert_eq!(collect_extract(&archive).unwrap()[0].data, payload);
 }
 
@@ -6495,33 +6512,32 @@ fn rar29_chooses_engine_and_filter_independently() {
     }];
     let options = WriterOptions::new(ArchiveVersion::Rar29, FeatureSet::store_only());
 
-    let method_of = |options: WriterOptions, policy: FilterPolicy| {
+    // The method byte names the level, so it cannot say which engine ran. The
+    // pack size against a known PPMd encode of the same payload can.
+    let ppmd_packed = rars::codec::rar29::unpack29_encode_ppmd(&payload, RAR29_DICTIONARY).unwrap();
+    let is_ppmd = |options: WriterOptions, policy: FilterPolicy| {
         let bytes =
             write_rar29_compressed_archive_with_filter_policy(&entries, options, policy).unwrap();
         let archive = Archive::parse(&bytes).unwrap();
-        let method = archive.files().next().unwrap().method;
+        let file = archive.files().next().unwrap();
+        let pack_size = file.pack_size;
         let extracted = collect_extract(&archive).unwrap();
-        assert_eq!(
-            extracted[0].data, payload,
-            "round trip failed for {method:#x}"
-        );
-        method
+        assert_eq!(extracted[0].data, payload, "round trip failed");
+        pack_size == ppmd_packed.len() as u64
     };
 
     // Searching for a filter with PPMd off: new, and the search must not reach
     // for PPMd behind the caller's back.
-    assert_ne!(
-        method_of(options.with_method(Rar29Method::Lz), FilterPolicy::Auto),
-        0x35,
+    assert!(
+        !is_ppmd(options.with_method(Rar29Method::Lz), FilterPolicy::Auto),
         "forcing LZ must not produce a PPMd member"
     );
     // Weighing an explicitly named filter against PPMd: also new.
-    assert_eq!(
-        method_of(
+    assert!(
+        is_ppmd(
             options.with_method(Rar29Method::Auto),
             FilterPolicy::explicit(FilterKind::Delta { channels: 2 })
         ),
-        0x35,
         "text with an explicit filter should still be allowed to pick PPMd"
     );
     // Forcing PPMd leaves the filter search nothing to measure against.

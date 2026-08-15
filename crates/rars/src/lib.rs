@@ -1286,7 +1286,11 @@ mod tests {
 
         let archive = ArchiveReader::read(&bytes).unwrap();
         let raw = archive.as_rar15_40().unwrap();
-        assert_eq!(raw.files().next().unwrap().method, 0x35);
+        // The byte is the level that was asked for, and nothing here asked for
+        // one, so it is the default 0x33. Which engine answered is signalled in
+        // the stream, which is why the round trip below is what proves PPMd
+        // read back. WinRAR stamps 0x34 on the PPMd archive it writes at -m4.
+        assert_eq!(raw.files().next().unwrap().method, 0x33);
         let extracted = collect_extract(&archive, None).unwrap();
         assert_eq!(extracted[0].data, payload);
     }
@@ -1358,7 +1362,9 @@ mod tests {
         let archive = ArchiveReader::read(&bytes).unwrap();
         let raw = archive.as_rar15_40().unwrap();
         let file = raw.files().next().unwrap();
-        assert_eq!(file.method, 0x35);
+        // Forcing PPMd does not change the level, so this is still the default
+        // 0x33; extracting it is what shows PPMd was used.
+        assert_eq!(file.method, 0x33);
         assert_eq!(collect_extract(&archive, None).unwrap()[0].data, payload);
     }
 

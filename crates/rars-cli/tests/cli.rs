@@ -4794,7 +4794,10 @@ fn creates_rar29_default_compressed_archive_with_auto_policy() {
 
     let parsed = rar15_40::Archive::parse_path(&archive).unwrap();
     let file = parsed.files().next().unwrap();
-    assert_eq!(file.method, 0x35);
+    // The method byte is the level, and no level was asked for, so it is the
+    // default 0x33 whether the writer settled on LZ or PPMd. `test` below is
+    // what proves the member reads back.
+    assert_eq!(file.method, 0x33);
 
     let test = rars().arg("test").arg(&archive).output().unwrap();
     assert!(test.status.success(), "stderr: {}", stderr(&test));
@@ -4822,7 +4825,7 @@ fn creates_rar29_ppmd_compressed_archive_that_can_be_tested() {
 
     let info = rars().args(["info", "-v"]).arg(&archive).output().unwrap();
     assert!(info.status.success(), "stderr: {}", stderr(&info));
-    assert!(stdout(&info).contains("method=0x35"));
+    assert!(stdout(&info).contains("method=0x33"));
 
     let test = rars().arg("test").arg(&archive).output().unwrap();
     assert!(test.status.success(), "stderr: {}", stderr(&test));
@@ -4850,7 +4853,7 @@ fn creates_rar29_ppmd_filtered_archive_that_can_be_tested() {
 
     let info = rars().args(["info", "-v"]).arg(&archive).output().unwrap();
     assert!(info.status.success(), "stderr: {}", stderr(&info));
-    assert!(stdout(&info).contains("method=0x35"));
+    assert!(stdout(&info).contains("method=0x33"));
 
     let test = rars().arg("test").arg(&archive).output().unwrap();
     assert!(test.status.success(), "stderr: {}", stderr(&test));

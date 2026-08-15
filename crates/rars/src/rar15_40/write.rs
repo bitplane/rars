@@ -24,6 +24,16 @@ use std::io::Write;
 const AUTO_RGB_WIDTHS: [usize; 4] = [24, 48, 96, 192];
 const MIN_STORE_FALLBACK_SIZE: usize = 1024;
 const RAR29_TEXT_SAMPLE_SIZE: usize = 8192;
+
+/// How long a run of NUL has to be before the text screen reads it as padding
+/// and stops counting it either way.
+///
+/// Sixteen is well past what falls out of text (a run of NUL in a source file
+/// is already unusual) and well short of the 512 byte blocks tar pads to.
+/// Measured across 400 binaries over 200 KB in `/usr/bin` and
+/// `/usr/lib/x86_64-linux-gnu`, 8, 16 and 32 all give the same answer, so the
+/// exact number is not load-bearing.
+const RAR29_NUL_RUN_IS_PADDING: usize = 16;
 const RAR29_AUDIO_SAMPLE_SIZE: usize = 8192;
 /// How much data one RAR 2.9 LZ block covers.
 ///
@@ -365,10 +375,16 @@ fn encode_rar29_policy_filtered_payload(
             method: 0x30,
         });
     }
+    // The method byte carries the level that was asked for, not which engine
+    // answered. RAR 2.9 signals PPMd inside the stream (our own decoder takes
+    // no method byte at all), and WinRAR 3.00 stamps 0x34 on the PPMd archive
+    // it writes at -m4. Stamping 0x35 on every PPMd payload only looked right
+    // while the trial ran at level 5, and made a level 3 archive claim to be a
+    // level 5 one as soon as it ran anywhere else.
     let ppmd = |data: &[u8]| -> Result<EncodedPayload> {
         Ok(EncodedPayload {
             data: unpack29_encode_ppmd(data, options.max_match_distance).map_err(Error::from)?,
-            method: 0x35,
+            method: lz_method,
         })
     };
     match (method, policy) {
@@ -380,7 +396,7 @@ fn encode_rar29_policy_filtered_payload(
                 options.max_match_distance,
             )
             .map_err(Error::from)?,
-            method: 0x35,
+            method: lz_method,
         }),
         // Rejected by validate_rar29_filter_policy before any encoding starts.
         (Rar29Method::Ppmd, FilterPolicy::Auto) => Err(Error::InvalidHeader(
@@ -418,10 +434,20 @@ fn encode_rar29_policy_filtered_payload(
     }
 }
 
-/// Levels 1 to 4 are asking for speed, so they skip the PPMd trial the way they
-/// always have.
-fn ppmd_trial_pays(level: Option<u8>) -> bool {
-    !matches!(level, Some(1..=4))
+/// Whether this level is willing to encode the member twice to choose an engine.
+///
+/// Takes the resolved level, not the option. Reading `Option<u8>` meant an
+/// absent level and `--level 3` disagreed, though both write method 0x33: the
+/// default paid for the trial and the level that names the same number did not,
+/// so the two produced archives 24% apart on the same 4 MiB of text.
+///
+/// Levels 1 and 2 are the ones asking for speed and still skip it. Level 3 is
+/// the default and where most archives are written, and it is worth about a
+/// fifth of the size on text for roughly twice the encode. WinRAR turns PPMd on
+/// one level later, at m4: on the bench text member WinRAR 3.00 packs 657,294
+/// bytes at m3 and 585,357 at m4, where we now write 540,517 at both.
+fn ppmd_trial_pays(level: u8) -> bool {
+    level >= 3
 }
 
 fn validate_rar29_filter_policy(
@@ -631,7 +657,7 @@ fn encode_rar29_auto_filtered_member(
     if include_ppmd && text {
         let ppmd = EncodedPayload {
             data: unpack29_encode_ppmd(data, options.max_match_distance).map_err(Error::from)?,
-            method: 0x35,
+            method: lz_method,
         };
         if ppmd.data.len() < best.data.len() {
             best = ppmd;
@@ -677,9 +703,23 @@ fn score_text_window(window: &[u8]) -> (usize, usize, usize) {
     while index < window.len() {
         let byte = window[index];
         if byte == 0 {
-            nul += 1;
-            total += 1;
-            index += 1;
+            let run = window[index..]
+                .iter()
+                .take_while(|&&byte| byte == 0)
+                .count();
+            index += run;
+            // A run this long is padding rather than content, and padding says
+            // nothing about what surrounds it, so it is left out of the count
+            // instead of counted against the member. A tar pads every file to a
+            // 512 byte block and ends with a block of nothing, which put 27% NUL
+            // in front of a 1% bar and sent a tar of source files to LZ as if it
+            // were binary. What is left either side of the padding still decides
+            // it: a tar of text reads 99.8% text, and an ELF only climbs from
+            // 34% to 38%, nowhere near the bar.
+            if run < RAR29_NUL_RUN_IS_PADDING {
+                nul += run;
+                total += run;
+            }
         } else if byte.is_ascii_graphic() || matches!(byte, b'\n' | b'\r' | b'\t' | b' ') {
             printable += 1;
             total += 1;
@@ -1420,7 +1460,7 @@ fn encode_filtered_payload(
             options.method,
             rar29_encode_options_for_options(options)?,
             lz_method,
-            ppmd_trial_pays(options.compression_level),
+            ppmd_trial_pays(lz_method.saturating_sub(0x30)),
         );
     }
 
@@ -1488,7 +1528,7 @@ fn encode_or_store_payload(
             options.method,
             encode_options,
             lz_method,
-            ppmd_trial_pays(options.compression_level),
+            ppmd_trial_pays(lz_method.saturating_sub(0x30)),
         );
     }
     let compressed = encode_compressed_payload(data, options, solid_encoder.as_mut(), progress)?;
@@ -2266,11 +2306,23 @@ mod tests {
         assert!(super::is_text_ppmd_candidate(&data));
     }
 
+    /// Reading past padding leaves the question of a member that is nothing
+    /// else. There is no evidence either way in it, and PPMd is not the answer
+    /// to a member the store rule is about to take anyway.
     #[test]
-    fn large_text_ppmd_candidate_rejects_binary_payloads() {
-        let mut data = vec![0u8; OVER_THE_OLD_TRIAL_LIMIT];
-        for index in (0..data.len()).step_by(257) {
-            data[index] = b'A';
+    fn a_member_of_nothing_but_padding_is_not_text() {
+        let data = vec![0u8; OVER_THE_OLD_TRIAL_LIMIT];
+
+        assert!(!super::is_text_ppmd_candidate(&data));
+    }
+
+    /// Scattered NULs are not padding and still count against the member: a
+    /// run has to be long enough to be structure before it is discounted.
+    #[test]
+    fn scattered_nuls_still_read_as_binary() {
+        let mut data = vec![b'A'; OVER_THE_OLD_TRIAL_LIMIT];
+        for index in (0..data.len()).step_by(3) {
+            data[index] = 0;
         }
 
         assert!(!super::is_text_ppmd_candidate(&data));
@@ -2308,6 +2360,82 @@ mod tests {
             .collect();
 
         assert!(!super::is_text_ppmd_candidate(&data));
+    }
+
+    /// A tar pads every member to a 512 byte block and closes with a block of
+    /// nothing, which is 27% NUL in front of a 1% bar. The source tree in the
+    /// bench corpus was read as binary and packed 22% behind WinRAR 3.00 for it.
+    #[test]
+    fn the_text_screen_reads_past_tar_padding() {
+        let mut data = Vec::new();
+        for index in 0..512 {
+            let mut header = vec![0u8; 512];
+            let name = format!("src/module{index}.rs");
+            header[..name.len()].copy_from_slice(name.as_bytes());
+            data.extend_from_slice(&header);
+            let body = format!(
+                "pub fn thing{index}(value: usize) -> usize {{\n    value.wrapping_mul({index})\n}}\n"
+            );
+            data.extend_from_slice(body.as_bytes());
+            // Every member is padded out to the next block boundary.
+            data.resize(data.len().next_multiple_of(512), 0);
+        }
+        data.extend_from_slice(&[0u8; 1024]);
+
+        let nul = data.iter().filter(|&&byte| byte == 0).count();
+        assert!(
+            nul * 100 / data.len() > 15,
+            "the padding has to be heavy enough to have failed the old rule"
+        );
+        assert!(super::is_text_ppmd_candidate(&data));
+    }
+
+    /// The other side of that: an object file is full of NUL runs too, and
+    /// reading past them must not turn its code into text. A member wrongly
+    /// called text skips the x86 filter search, so this one costs bytes.
+    #[test]
+    fn reading_past_padding_does_not_make_an_object_file_text() {
+        let mut state = 0x8badf00du32;
+        let mut data = Vec::new();
+        for section in 0..64 {
+            // Alignment padding, the way a linker leaves it.
+            data.resize(data.len() + 64, 0);
+            data.extend_from_slice(format!("_ZN4rars{section}E\0").as_bytes());
+            for _ in 0..1024 {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                data.push(state as u8);
+            }
+        }
+
+        assert!(!super::is_text_ppmd_candidate(&data));
+    }
+
+    /// Naming the level you were already getting must not change the archive.
+    /// The default resolves to method 0x33, the same as `--level 3`, but the
+    /// trial decision read the option rather than the level and the two came
+    /// out 24% apart on the same text.
+    #[test]
+    fn the_default_level_and_level_three_agree_about_the_ppmd_trial() {
+        let options = crate::rar15_40::WriterOptions {
+            target: crate::ArchiveVersion::Rar30,
+            ..Default::default()
+        };
+        let default_level = super::compression_method_for_level(options).unwrap();
+        let named_level = super::compression_method_for_level(crate::rar15_40::WriterOptions {
+            compression_level: Some(3),
+            ..options
+        })
+        .unwrap();
+
+        assert_eq!(default_level, named_level);
+        assert_eq!(
+            super::ppmd_trial_pays(default_level - 0x30),
+            super::ppmd_trial_pays(named_level - 0x30),
+        );
+        assert!(super::ppmd_trial_pays(3));
+        assert!(!super::ppmd_trial_pays(2));
     }
 
     #[test]
