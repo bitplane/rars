@@ -897,20 +897,23 @@ fn encode_lz_member_inner(
     )
 }
 
-/// How far back the finder has to remember. Nothing further than the maximum
-/// distance is ever accepted as a match, so a link to anything older can be
-/// dropped, and the block being parsed has to fit whatever the caller set.
-fn finder_window(options: EncodeOptions) -> usize {
-    options.max_match_distance.max(LZ_BLOCK_SIZE)
+/// How far back a parse over `reach` bytes has to remember.
+///
+/// Nothing further than the maximum distance is ever accepted as a match, so a
+/// link to anything older can be dropped. Neither can a match reach back past
+/// the start of what is being parsed, so a member shorter than the dictionary
+/// sets the window instead: asking for `--dict-size 32m` on a one-megabyte
+/// member should not reserve thirty-two megabytes of links that can never name
+/// a position.
+fn finder_window(options: EncodeOptions, reach: usize) -> usize {
+    options.max_match_distance.min(reach).max(LZ_BLOCK_SIZE)
 }
 
-/// A finder holding everything a parse starting at `block_start` may reach back
-/// to, and nothing older.
 /// A finder for the whole member, seeded with the history it carries in. It
 /// keeps growing as the blocks are parsed, so it is sized to the widest window
 /// the member could ever want rather than to any one block.
 fn member_finder(combined: &[u8], start: usize, options: EncodeOptions) -> Rar50MatchFinder {
-    let mut finder = Rar50MatchFinder::new(finder_window(options));
+    let mut finder = Rar50MatchFinder::new(finder_window(options, combined.len()));
     for pos in 0..start {
         finder.insert(combined, pos);
     }

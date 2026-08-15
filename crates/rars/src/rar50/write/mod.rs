@@ -559,16 +559,37 @@ fn source_integrity(
     Ok((crc.finish(), hash.finalize()))
 }
 
+/// What one compression job holds, for admitting jobs against the memory limit
+/// and for shrinking a fitted dictionary until it fits.
+///
+/// Nearly all of it is the match finder's chain links: one `usize` per byte of
+/// window, and the window is a power of two, so a dictionary just over one costs
+/// almost double the one just under. That rounding is why a flat multiple of the
+/// dictionary never described this well. It used to charge twelve times the
+/// dictionary, which is the middle of the eight-to-sixteen the rounding
+/// produces, so it over-charged a dictionary that was already a power of two and
+/// came close to under-charging one that had just crossed.
+///
+/// Peak resident bytes for one member encode, over the member itself:
+///
+///     dictionary    measured    links alone
+///      256 KiB      3,584,000     2,097,152
+///        1 MiB     10,227,712     8,388,608
+///        3 MiB     35,901,440    33,554,432
+///        4 MiB     35,999,744    33,554,432
+///        8 MiB     70,246,400    67,108,864
+///
+/// The links account for the whole shape; what is left is the hash heads, the
+/// token buffer for one block, and the packed output. Three megabytes covers
+/// those with room to spare, and the ninth byte per window position absorbs the
+/// rest rather than pretending to predict it.
 fn streaming_lz_workspace(dictionary_size: u64, block_size: usize) -> u64 {
-    // The hash-chain finder has one usize link per byte in history + input,
-    // alongside byte buffers, worst-case literal tokens, parser candidates,
-    // and allocations retained by the system allocator between block jobs.
-    // Keep this deliberately conservative: it is the admission weight for
-    // concurrent blocks, not a prediction of the final packed size.
     dictionary_size
-        .saturating_mul(12)
-        .saturating_add((block_size as u64).saturating_mul(112))
-        .saturating_add(2 * 1024 * 1024)
+        .checked_next_power_of_two()
+        .unwrap_or(dictionary_size)
+        .saturating_mul(9)
+        .saturating_add((block_size as u64).saturating_mul(64))
+        .saturating_add(3 * 1024 * 1024)
 }
 
 fn encrypt_reader_to(
@@ -937,6 +958,52 @@ mod tests {
             dictionary_size_for_options(absent, plenty, u64::MAX).unwrap(),
             capped(3),
         );
+    }
+
+    #[test]
+    fn the_workspace_charge_covers_what_a_member_measured() {
+        let block = crate::codec::rar50::LZ_BLOCK_SIZE;
+        // Peak resident bytes over the member, one encode per row, taken with
+        // `/proc/self/status` VmHWM so the allocator could not be involved.
+        // Anything that raises what the encoder holds has to move these too.
+        let measured: [(u64, u64); 5] = [
+            (256 * 1024, 3_584_000),
+            (1024 * 1024, 10_227_712),
+            (3 * 1024 * 1024, 35_901_440),
+            (4 * 1024 * 1024, 35_999_744),
+            (8 * 1024 * 1024, 70_246_400),
+        ];
+        for (dictionary, peak) in measured {
+            let charged = streaming_lz_workspace(dictionary, block);
+            assert!(
+                charged >= peak,
+                "a {dictionary}-byte dictionary measured {peak} against a charge of {charged}",
+            );
+            // Headroom is for the allocator and the packed output, not for a
+            // multiple nobody has checked since.
+            assert!(
+                charged < peak * 3,
+                "a {dictionary}-byte dictionary is charged {charged} for a measured {peak}",
+            );
+        }
+    }
+
+    #[test]
+    fn the_workspace_charge_never_falls_as_the_dictionary_grows() {
+        let block = crate::codec::rar50::LZ_BLOCK_SIZE;
+        let mut previous = 0;
+        let mut dictionary = 128 * 1024u64;
+        while dictionary <= 64 * 1024 * 1024 {
+            let charged = streaming_lz_workspace(dictionary, block);
+            assert!(
+                charged >= previous,
+                "{dictionary} charged less than the size below it"
+            );
+            previous = charged;
+            // Every size the format allows, not just the powers of two, because
+            // the rounding inside is the whole reason this function exists.
+            dictionary += 128 * 1024;
+        }
     }
 
     #[test]
