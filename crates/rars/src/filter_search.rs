@@ -89,16 +89,20 @@ pub(crate) trait FilterSearch {
 
     /// Apply the filters to a copy of `data`, without encoding it.
     ///
-    /// The screens measure a transform by compressing its output against the
-    /// unfiltered bytes. Comparing a filtered *encode* with an unfiltered one
-    /// measured something else: on a 396 KB binary the 128 KiB sample said the
-    /// E8E9 filter cost 10% (74322 plain against 81744 filtered) while the same
-    /// filter was worth 7.4% of the finished archive, so every x86 member was
-    /// screened out before anything measured it. Compressing the transformed
-    /// bytes put the sample back in agreement with the member: 73579.
+    /// This is how a screen prices a filter it can only afford to try on a slice
+    /// of the member: compress the transformed bytes and compare against the
+    /// unfiltered ones. Comparing a filtered *encode* with an unfiltered one used
+    /// to measure something else entirely. On a 396 KB binary the 128 KiB sample
+    /// said the E8E9 filter cost 10% (74322 plain against 81744 filtered) while
+    /// the same filter was worth 7.4% of the finished archive, so every x86
+    /// member was screened out before anything measured it.
     ///
-    /// Why the two encode paths disagree by that much on real data is not
-    /// settled; on synthetic x86 they differ by a few bytes.
+    /// That gap was the two paths cutting blocks at different sizes, fixed in
+    /// 6ce759c: they now agree to within a filter token per block. So a screen
+    /// that can encode the whole member goes straight to
+    /// [`FilterSearch::encode_filtered`] and keeps the result, and this stays for
+    /// the case it was written for, where the sample is a slice and there is
+    /// nothing to keep.
     fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Vec<u8>>;
 
     /// Encode without filters.
@@ -170,10 +174,21 @@ fn screen_sample(data: &[u8]) -> &[u8] {
     &data[start..start + SCREEN_SAMPLE_LEN]
 }
 
+/// What the screen made of one filter kind.
+struct ScreenedKind {
+    kind: FilterKind,
+    /// The bytes, when the screen encoded the whole member the way the writer
+    /// would write it, so the search can take this as its measurement.
+    measured: Option<Vec<u8>>,
+    /// Whether it beat leaving the data alone by enough to be worth spending
+    /// another encode on a narrower range of the same filter.
+    worth_a_range: bool,
+}
+
 /// What the screen learned, along with any encodes the search can reuse.
 #[derive(Default)]
 struct ScreenOutcome {
-    kinds: Vec<(FilterKind, Option<Vec<u8>>)>,
+    kinds: Vec<ScreenedKind>,
     plain: Option<Vec<u8>>,
 }
 
@@ -186,6 +201,13 @@ struct ScreenOutcome {
 /// standing in for it, because the wins do not all show up as entropy: RAR's
 /// delta reorders into planes first, and what that buys is repetition the
 /// encoder can match, not a flatter byte histogram.
+///
+/// A member no bigger than one sample is a special case worth taking. There is
+/// no slice to approximate with, so the screen encodes it the way the writer
+/// would and every number it produces is the measurement the search was going to
+/// spend an encode on anyway. That skips a second encode per surviving kind, and
+/// it lets kinds that win by too little to be worth chasing stay in the running,
+/// because keeping a candidate the screen has already paid for costs nothing.
 fn screen_kinds<S: FilterSearch>(
     search: &S,
     data: &[u8],
@@ -197,23 +219,38 @@ fn screen_kinds<S: FilterSearch>(
         return Ok(outcome);
     }
     let screen_options = search.screen_options(options);
-    // A member no bigger than the sample is the sample, so as long as the screen
-    // measured it at the settings the finalists will use, those encodes are
-    // whole-member measurements and the search should keep them rather than
-    // repeat them.
-    let reusable = sample.len() == data.len() && screen_options == options;
+    // Only when the screen measures at the settings the finalists will use. A
+    // format that screens at reduced effort, which RAR 2.9 does, is measuring
+    // something else and keeps the two-encode path.
+    let measures_the_member = sample.len() == data.len() && screen_options == options;
     let baseline = search.encode_plain(sample, screen_options, None)?;
     for kind in search.screened_kinds(data) {
-        let transformed = search.filtered_bytes(sample, &[FilterSpec::whole(kind)])?;
-        let packed = search.encode_plain(&transformed, screen_options, None)?;
-        if screen_wins(packed.len(), baseline.len()) {
+        let filters = [FilterSpec::whole(kind)];
+        let packed = if measures_the_member {
+            search.encode_filtered(data, &filters, options, None)?
+        } else {
+            let transformed = search.filtered_bytes(sample, &filters)?;
+            search.encode_plain(&transformed, screen_options, None)?
+        };
+        let worth_a_range = screen_wins(packed.len(), baseline.len());
+        if measures_the_member {
+            outcome.kinds.push(ScreenedKind {
+                kind,
+                measured: Some(packed),
+                worth_a_range,
+            });
+        } else if worth_a_range {
             // The screen measured the transform, not the encode the writer
             // would emit, so this is evidence for a finalist rather than a
             // measurement the search can reuse.
-            outcome.kinds.push((kind, None));
+            outcome.kinds.push(ScreenedKind {
+                kind,
+                measured: None,
+                worth_a_range,
+            });
         }
     }
-    if reusable {
+    if measures_the_member {
         outcome.plain = Some(baseline);
     }
     Ok(outcome)
@@ -359,11 +396,11 @@ fn finalists<S: FilterSearch>(
         }
     }
 
-    for (kind, packed) in screen.kinds {
-        finalists.push((vec![FilterSpec::whole(kind)], packed));
-        if let FilterKind::Delta { channels } = kind {
+    for screened in screen.kinds {
+        finalists.push((vec![FilterSpec::whole(screened.kind)], screened.measured));
+        if let (true, FilterKind::Delta { channels }) = (screened.worth_a_range, screened.kind) {
             if let Some(range) = auto_delta_filter_range(data, channels) {
-                finalists.push((vec![FilterSpec::range(kind, range)], None));
+                finalists.push((vec![FilterSpec::range(screened.kind, range)], None));
             }
         }
     }
@@ -438,7 +475,16 @@ pub(crate) fn walk_bytes<S: FilterSearch>(
     };
     let screen = sample * (screened + 1) + x86_screen;
     // The unfiltered member, the x86 finalists, and one assumed screen survivor.
-    let finalists = 2 + x86_finalists;
+    // When the sample is the whole member the screen encodes it the way the
+    // writer would, so both of those are already counted in `screen`. That reads
+    // the sample rather than asking whether this format screens at full effort,
+    // which needs the caller's settings; RAR 5 is the only format that reports
+    // progress through here and it always does.
+    let finalists = if sample == member {
+        x86_finalists
+    } else {
+        2 + x86_finalists
+    };
     screen + member * (finalists + encoder_candidates - 1)
 }
 
@@ -583,7 +629,7 @@ mod tests {
             .unwrap()
             .kinds
             .into_iter()
-            .map(|(kind, _)| kind)
+            .map(|screened| screened.kind)
             .collect();
         assert!(
             kinds.contains(&FilterKind::Delta { channels: 4 }),
@@ -602,16 +648,34 @@ mod tests {
         );
     }
 
+    /// A member that fits in one sample has no slice to approximate with, so
+    /// the screen encodes it the way the writer would and the search keeps every
+    /// number rather than paying for the winners twice.
     #[test]
-    fn a_short_member_reuses_only_the_unfiltered_encode() {
+    fn a_short_member_is_measured_by_the_screen_rather_than_encoded_twice() {
         let data = interleaved_counters()[..100_000].to_vec();
         assert!(data.len() <= SCREEN_SAMPLE_LEN);
         let screen = screen_kinds(&FULL, &data, options()).unwrap();
+
         assert!(screen.plain.is_some(), "the unfiltered encode is reusable");
-        // A survivor's number came from compressing the transformed bytes, not
-        // from the encode the writer would emit, so it cannot stand in for a
-        // measurement however long the member is.
-        assert!(screen.kinds.iter().all(|(_, packed)| packed.is_none()));
+        assert_eq!(
+            screen.kinds.len(),
+            FULL.screened_kinds(&data).len(),
+            "a kind the screen has already encoded is worth keeping whether or \
+             not it won by the margin"
+        );
+        for screened in &screen.kinds {
+            let measured = screened
+                .measured
+                .as_ref()
+                .unwrap_or_else(|| panic!("{:?} came back without its bytes", screened.kind));
+            // Not just present: the same bytes the writer would emit for it.
+            // Anything else is a number the search cannot stand on.
+            let written = FULL
+                .encode_filtered(&data, &[FilterSpec::whole(screened.kind)], options(), None)
+                .unwrap();
+            assert_eq!(*measured, written, "{:?}", screened.kind);
+        }
     }
 
     /// A screen run at cheaper settings measured something the finalists will
@@ -625,7 +689,10 @@ mod tests {
         };
         let screen = screen_kinds(&cheap, &data, options()).unwrap();
         assert!(screen.plain.is_none());
-        assert!(screen.kinds.iter().all(|(_, packed)| packed.is_none()));
+        assert!(screen
+            .kinds
+            .iter()
+            .all(|screened| screened.measured.is_none()));
     }
 
     /// A member big enough that the screens have to sample it, with a filter in
