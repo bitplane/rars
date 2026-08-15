@@ -34,6 +34,10 @@ const RAR29_TEXT_SAMPLE_SIZE: usize = 8192;
 /// `/usr/lib/x86_64-linux-gnu`, 8, 16 and 32 all give the same answer, so the
 /// exact number is not load-bearing.
 const RAR29_NUL_RUN_IS_PADDING: usize = 16;
+
+/// The level an absent `--level` means for RAR 2.0, matching the method byte
+/// `compression_method_for_level` writes for it.
+const RAR20_DEFAULT_LEVEL: u8 = 3;
 const RAR29_AUDIO_SAMPLE_SIZE: usize = 8192;
 /// How much data one RAR 2.9 LZ block covers.
 ///
@@ -1257,18 +1261,47 @@ fn rar29_encode_options_for_options(options: WriterOptions) -> Result<Rar29Encod
         .with_max_match_distance(dictionary_size_for_options(options)?))
 }
 
+/// RAR 2.0 levels, as candidates searched per position.
+///
+/// The ladder used to run 16, 64, 256, 96, 128, so the top two levels searched
+/// less than the middle one and asking for more compression got less of it: on
+/// 4 MiB of man pages level 3 packed 848,854 bytes, level 5 packed 861,371 and
+/// level 4 packed 867,857, which is the candidate order exactly.
+///
+/// Lazy matching was off at every level, which cost more than the ladder did.
+/// Measured on that member, packed bytes and seconds:
+///
+/// ```text
+/// candidates       16       64      256      512     1024
+/// lazy off    937,906  878,958  848,790  840,496  835,622
+/// lazy on     886,854  837,531  813,252  806,728  803,006
+/// seconds        2.37     4.41     8.67    12.78    17.43
+/// ```
+///
+/// It is worth 4% on text and 3% on a stripped binary, at every count, for
+/// about half again the time. Candidates cost more and give less: the last
+/// doubling buys 0.5%. So lazy matching is on wherever anything is compressed,
+/// and the level chooses how far to search.
 fn rar20_encode_options_for_level(level: Option<u8>) -> Result<Rar20EncodeOptions> {
-    match level {
-        None | Some(3) => Ok(Rar20EncodeOptions::default()),
-        Some(1) => Ok(Rar20EncodeOptions::new(16).with_try_audio(false)),
-        Some(2) => Ok(Rar20EncodeOptions::new(64)),
-        Some(4) => Ok(Rar20EncodeOptions::new(96).with_lazy_matching(false)),
-        Some(5) => Ok(Rar20EncodeOptions::new(128).with_lazy_matching(false)),
-        Some(0) => Ok(Rar20EncodeOptions::new(0)),
-        Some(_) => Err(Error::InvalidHeader(
-            "RAR compression level must be in the range 0..5",
-        )),
-    }
+    let level = level.unwrap_or(RAR20_DEFAULT_LEVEL);
+    let candidates = match level {
+        0 => return Ok(Rar20EncodeOptions::new(0)),
+        1 => 16,
+        2 => 64,
+        3 => 256,
+        4 => 512,
+        5 => 1024,
+        _ => {
+            return Err(Error::InvalidHeader(
+                "RAR compression level must be in the range 0..5",
+            ))
+        }
+    };
+    Ok(Rar20EncodeOptions::new(candidates)
+        .with_lazy_matching(true)
+        // The audio trial is a second encode of the member, which is the one
+        // thing level 1 is trying not to pay for.
+        .with_try_audio(level > 1))
 }
 
 fn rar20_encode_options_for_options(options: WriterOptions) -> Result<Rar20EncodeOptions> {
