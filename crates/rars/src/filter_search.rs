@@ -8,11 +8,12 @@
 //!
 //! So the candidates are cut down before any whole-member encode happens.
 //! Filters with a structural detector behind them, which today means the x86
-//! pair, get their regions from the detector and one sample encode to confirm
-//! the detector was not fooled by chance byte patterns. Filters with no detector
-//! are measured on a sample of the member and have to win by a clear margin to
-//! earn a whole-member encode. What survives is a handful of finalists, each
-//! encoded once at the caller's real settings, smallest wins.
+//! pair, get their regions from the detector and a sample encode per region to
+//! confirm the detector was not fooled by chance byte patterns and to drop the
+//! regions where the filter would cost more than it saves. Filters with no
+//! detector are measured on a sample of the member and have to win by a clear
+//! margin to earn a whole-member encode. What survives is a handful of
+//! finalists, each encoded once at the caller's real settings, smallest wins.
 //!
 //! The unfiltered member is always one of the finalists, so the result can never
 //! be larger than leaving the data alone.
@@ -41,6 +42,14 @@ const SCREEN_MARGIN_PERCENT: usize = 1;
 /// How much of the member x86 detection has to cover before filtering the whole
 /// thing is as good as filtering only the detected regions, as a fraction.
 const X86_CODE_COVERAGE_RATIO: (usize, usize) = (9, 10);
+
+/// How many x86 regions the progress estimate assumes the scanner will find.
+///
+/// Only used to scale a progress bar, and deliberately not measured: finding out
+/// means scanning the member, which is a whole extra pass to sharpen a
+/// percentage. Two to five is what the binaries measured came to, with an
+/// unstripped 25 MB outlier at eleven.
+const X86_ASSUMED_REGIONS: u64 = 4;
 
 /// Bytes at each end of a member that a ranged delta filter skips, because
 /// container headers and trailers are not part of the sampled signal.
@@ -215,62 +224,110 @@ fn x86_code_regions(data: &[u8]) -> Vec<Range<usize>> {
     disjoint_filter_ranges(auto_x86_filter_ranges(data, true))
 }
 
-/// Whether the x86 filter earns its keep on a slice of what the scanner called
-/// code.
+/// Which of the scanner's regions the x86 filter should cover, empty when none
+/// of them is worth filtering.
 ///
 /// Byte patterns that look like call opcodes turn up in compressed data by
-/// chance, and the scanner cannot tell those from a real code section. Trying
-/// the filter inside the largest region it found separates the two for the price
-/// of a sample encode instead of two whole-member ones.
-fn x86_helps_sample<S: FilterSearch>(
+/// chance, and the scanner cannot tell those from a real code section. A sample
+/// encode inside a region separates the two for a fraction of what a
+/// whole-member encode costs.
+///
+/// Every region gets its own sample, because on an unstripped binary the biggest
+/// region is the debug data rather than the code. Screening only the largest, as
+/// this did, declined the filter on every unstripped binary measured: it read
+/// DWARF, saw no win, and stopped before anything measured the member. Regions
+/// are disjoint, so the samples together never come to more than the member.
+///
+/// A region the filter makes bigger is dropped rather than counted against the
+/// rest, which is what keeps the debug data out of the ranged candidate. On a
+/// 20 MB unstripped binary that turns a filter worth 0.2% into one worth
+/// 0.4%; leaving it in was worse than not filtering at all. Ties are kept: a
+/// sample with no convertible opcodes in it is not evidence against the region
+/// it came from.
+fn x86_screened_regions<S: FilterSearch>(
     search: &S,
     data: &[u8],
     regions: &[Range<usize>],
     options: S::Options,
-) -> Result<bool> {
-    let Some(largest) = regions.iter().max_by_key(|range| range.len()) else {
-        return Ok(false);
-    };
-    let sample = screen_sample(&data[largest.clone()]);
-    if sample.len() < SCREEN_SAMPLE_ALIGNMENT {
-        return Ok(false);
+) -> Result<X86Screen> {
+    let mut kept = Vec::new();
+    let mut helped = false;
+    for region in regions {
+        let sample = screen_sample(&data[region.clone()]);
+        if sample.len() < SCREEN_SAMPLE_ALIGNMENT {
+            kept.push(region.clone());
+            continue;
+        }
+        // Measured at the caller's real settings, not the cheaper screen ones.
+        // The detectorless screens rank many candidates against each other,
+        // where a reduced parse ranks them the same way; this is a yes or no
+        // with no margin under it, and a sample encode is cheap enough to get
+        // right.
+        let baseline = search.encode_plain(sample, options, None)?;
+        let transformed = search.filtered_bytes(sample, &[FilterSpec::whole(FilterKind::E8E9)])?;
+        let filtered = search.encode_plain(&transformed, options, None)?;
+        if filtered.len() > baseline.len() {
+            continue;
+        }
+        // No margin here, unlike the detectorless filters: the scanner has
+        // already ruled on where code is, so a small win on this sample is
+        // evidence rather than noise.
+        helped |= filtered.len() < baseline.len();
+        kept.push(region.clone());
     }
-    // Measured at the caller's real settings, not the cheaper screen ones. The
-    // detectorless screens rank many candidates against each other, where a
-    // reduced parse ranks them the same way; this is a single yes or no with no
-    // margin under it, and two sample encodes are cheap enough to get right.
-    let baseline = search.encode_plain(sample, options, None)?;
-    let transformed = search.filtered_bytes(sample, &[FilterSpec::whole(FilterKind::E8E9)])?;
-    let filtered = search.encode_plain(&transformed, options, None)?;
-    // No margin here, unlike the detectorless filters: the scanner has already
-    // ruled on where code is, so a small win on this sample is evidence rather
-    // than noise.
-    Ok(filtered.len() < baseline.len())
+    Ok(X86Screen {
+        rejected_a_region: kept.len() < regions.len(),
+        kept: if helped { kept } else { Vec::new() },
+    })
 }
 
-/// The x86 filter specs worth measuring against the whole member.
+/// What the x86 screen made of the regions the scanner proposed.
+struct X86Screen {
+    /// The regions worth filtering, empty when none of them is.
+    kept: Vec<Range<usize>>,
+    /// Whether any region came out bigger under the filter, which rules out
+    /// filtering the member end to end.
+    rejected_a_region: bool,
+}
+
+/// The x86 filter specs worth measuring against the whole member, given what the
+/// screen made of the regions the scanner proposed.
 ///
 /// The scanner proposes overlapping regions at several clustering distances, and
 /// the search this replaced priced every one of them with its own whole-member
 /// encode. Measured at full effort the whole spread is worth about a third of a
 /// percent, so this keeps the two that are structurally different: filter
-/// everything, or filter only where the scanner saw code. The second is only
-/// worth an encode when there is enough non-code to protect.
-fn x86_finalists(data: &[u8], regions: &[Range<usize>]) -> Vec<Vec<FilterSpec>> {
+/// everything, or filter only where the screen saw code.
+///
+/// Which of the two is worth an encode is mostly already known. Filtering
+/// everything covers the regions the screen rejected as well, so once it has
+/// rejected one, that candidate is asking to be told again that those bytes come
+/// out bigger; on all seven binaries measured the kept regions beat it. Filtering
+/// only the regions is the same thing as filtering everything when they cover
+/// nearly the whole member. So each case is worth one candidate per kind, not
+/// two, which is what keeps an unstripped binary to three whole-member encodes
+/// rather than five.
+fn x86_finalists(
+    data: &[u8],
+    regions: &[Range<usize>],
+    rejected_a_region: bool,
+) -> Vec<Vec<FilterSpec>> {
     let covered: usize = regions.iter().map(|range| range.len()).sum();
     let (numerator, denominator) = X86_CODE_COVERAGE_RATIO;
     let sparse = covered * denominator < data.len() * numerator;
 
     let mut finalists = Vec::new();
     for kind in [FilterKind::E8E9, FilterKind::E8] {
-        finalists.push(vec![FilterSpec::whole(kind)]);
-        if sparse {
+        if rejected_a_region || sparse {
             finalists.push(
                 regions
                     .iter()
                     .map(|range| FilterSpec::range(kind, range.clone()))
                     .collect(),
             );
+        }
+        if !rejected_a_region {
+            finalists.push(vec![FilterSpec::whole(kind)]);
         }
     }
     finalists
@@ -292,10 +349,10 @@ fn finalists<S: FilterSearch>(
     let mut finalists = vec![(Vec::new(), screen.plain)];
 
     if search.detects_x86() {
-        let regions = x86_code_regions(data);
-        if x86_helps_sample(search, data, &regions, options)? {
+        let screen = x86_screened_regions(search, data, &x86_code_regions(data), options)?;
+        if !screen.kept.is_empty() {
             finalists.extend(
-                x86_finalists(data, &regions)
+                x86_finalists(data, &screen.kept, screen.rejected_a_region)
                     .into_iter()
                     .map(|specs| (specs, None)),
             );
@@ -369,10 +426,13 @@ pub(crate) fn walk_bytes<S: FilterSearch>(
     let encoder_candidates = encoder_candidates.max(1) as u64;
     let sample = screen_sample(data).len() as u64;
     let screened = search.screened_kinds(data).len() as u64;
-    // Two sample encodes for the x86 screen, and the two specs it proposes when
-    // the detector does find code.
+    // Two sample encodes per region for the x86 screen, and the two specs it
+    // proposes when the detector does find code. How many regions there are is
+    // not knowable without scanning, so this assumes [`X86_ASSUMED_REGIONS`],
+    // bounded by the member: the regions are disjoint, so however many the
+    // scanner finds, their samples together cannot come to more than that.
     let (x86_screen, x86_finalists) = if search.detects_x86() {
-        (sample * 2, 2)
+        ((sample * X86_ASSUMED_REGIONS).min(member) * 2, 2)
     } else {
         (0, 0)
     };
@@ -568,8 +628,11 @@ mod tests {
         assert!(screen.kinds.iter().all(|(_, packed)| packed.is_none()));
     }
 
-    /// x86 code the E8E9 filter plainly helps, in a member big enough that the
-    /// screen has to sample it.
+    /// A member big enough that the screens have to sample it, with a filter in
+    /// it worth finding. The call targets here are absolute rather than
+    /// relative, so it is the delta filter that pays off on it, not the x86
+    /// one; see [`calls_to_fixed_addresses`] for code shaped the way the x86
+    /// filter wants.
     fn x86_like(len: usize) -> Vec<u8> {
         let mut state = 0x2545_f491u32;
         let mut data = Vec::with_capacity(len);
@@ -603,6 +666,144 @@ mod tests {
             plain.len()
         );
         assert!(packed.len() < plain.len());
+    }
+
+    /// Calls to a handful of fixed addresses, in bodies that repeat. Unfiltered
+    /// the call breaks every repeat, because the displacement counts from wherever
+    /// the call sits; converted to an absolute address the bodies match each
+    /// other again. That is what the x86 filter is for, and it is why a stretch
+    /// of real code screens as a win.
+    fn calls_to_fixed_addresses(len: usize) -> Vec<u8> {
+        const BODIES: [[u8; 11]; 4] = [
+            [
+                0x55, 0x48, 0x89, 0xe5, 0x48, 0x83, 0xec, 0x20, 0x89, 0x7d, 0xfc,
+            ],
+            [
+                0x48, 0x8b, 0x45, 0xf8, 0x48, 0x8b, 0x00, 0x48, 0x89, 0xc7, 0x90,
+            ],
+            [
+                0x8b, 0x45, 0xfc, 0x83, 0xc0, 0x01, 0x89, 0x45, 0xfc, 0x66, 0x90,
+            ],
+            [
+                0x48, 0x8d, 0x35, 0x00, 0x00, 0x00, 0x00, 0x31, 0xc0, 0x0f, 0x1f,
+            ],
+        ];
+        let mut state = 0x2545_f491u32;
+        let mut data = Vec::with_capacity(len);
+        while data.len() < len {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            data.extend_from_slice(&BODIES[(state >> 28) as usize % BODIES.len()]);
+            // Far enough ahead that the address stays in the range the filter
+            // converts however the member is sliced.
+            let target = 0x0010_0000u32 + ((state >> 24) & 7) * 0x400;
+            let call_end = (data.len() + 5) as u32;
+            data.push(0xe8);
+            data.extend_from_slice(&target.wrapping_sub(call_end).to_le_bytes());
+        }
+        data.truncate(len);
+        data
+    }
+
+    /// Debug data: strings and symbol names, with enough stray call opcodes in
+    /// the numbers between them for the scanner to call it code.
+    ///
+    /// The numbers behind those opcodes repeat, so converting them by position
+    /// is the wrong way round: it turns a handful of repeated values into a
+    /// different one every time and costs the encoder the matches. That is why
+    /// filtering a whole unstripped binary makes it bigger.
+    fn debug_like(len: usize) -> Vec<u8> {
+        const WORDS: [&[u8]; 6] = [
+            b"_ZN4llvm12FunctionPassE",
+            b"/usr/include/c++/14/bits/",
+            b"DW_AT_decl_file",
+            b"unsigned long long int",
+            b"__gnu_cxx::__normal_iterator",
+            b"DW_TAG_subprogram",
+        ];
+        let mut state = 0x9e37_79b9u32;
+        let mut data = Vec::with_capacity(len);
+        while data.len() < len {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            if state.is_multiple_of(37) {
+                data.push(0xe8);
+                data.extend_from_slice(
+                    &(0x0004_0000u32 + ((state >> 20) & 3) * 0x40).to_le_bytes(),
+                );
+            } else {
+                data.extend_from_slice(WORDS[(state >> 28) as usize % WORDS.len()]);
+                data.push(0);
+                data.extend_from_slice(&state.rotate_left(7).to_le_bytes());
+            }
+        }
+        data.truncate(len);
+        data
+    }
+
+    /// An unstripped binary in miniature: a code section, then a debug section
+    /// several times its size that carries enough stray call opcodes to look
+    /// like code to the scanner. Returns the member and where the code ends.
+    fn code_then_debug() -> (Vec<u8>, usize) {
+        let code_len = 132 * 1024;
+        // Wider than the scanner's clustering gap, so the two stay separate
+        // regions rather than merging into one.
+        let gap = 48 * 1024;
+        let mut data = calls_to_fixed_addresses(code_len);
+        data.resize(code_len + gap, 0x5a);
+        data.extend_from_slice(&debug_like(220 * 1024));
+        (data, code_len)
+    }
+
+    /// The screen has to look past the biggest region. On an unstripped binary
+    /// the biggest thing the scanner calls code is the debug data, and sampling
+    /// only that declined the filter on every unstripped binary measured.
+    #[test]
+    fn the_x86_screen_looks_past_the_largest_region_to_the_code() {
+        let (data, code_len) = code_then_debug();
+        let regions = x86_code_regions(&data);
+        let largest = regions
+            .iter()
+            .max_by_key(|range| range.len())
+            .expect("the scanner has to find something");
+        assert!(
+            largest.start >= code_len,
+            "this proves nothing unless the debug section is the largest region: {regions:?}"
+        );
+
+        let screen = x86_screened_regions(&FULL, &data, &regions, options()).unwrap();
+        assert_eq!(
+            screen.kept.len(),
+            1,
+            "the code region is the only one worth filtering: {:?}",
+            screen.kept
+        );
+        assert!(
+            screen.kept[0].end <= code_len + 1024,
+            "kept {:?}",
+            screen.kept
+        );
+        assert!(screen.rejected_a_region);
+    }
+
+    /// And the member as a whole has to come out smaller for it.
+    #[test]
+    fn the_search_filters_the_code_in_an_unstripped_binary() {
+        let (data, _) = code_then_debug();
+        let plain = FULL.encode_plain(&data, options(), None).unwrap();
+        let (specs, packed) = choose_filter(&FULL, &data, options(), None).unwrap();
+
+        assert!(
+            matches!(
+                specs.as_slice(),
+                [FilterSpec {
+                    kind: FilterKind::E8E9 | FilterKind::E8,
+                    range: Some(_)
+                }]
+            ),
+            "expected a ranged x86 filter, got {specs:?} at {} against {} unfiltered",
+            packed.len(),
+            plain.len()
+        );
+        assert!(packed.len() * 100 < plain.len() * 97);
     }
 
     #[test]
