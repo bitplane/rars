@@ -8,8 +8,14 @@ check:
     cargo clippy --all-targets -- -D warnings
     cargo test --workspace --all-targets --locked
 
-# What CI runs before a release, including the external decoders. Fails rather
-# than skips when they are missing.
+# Build the Python extension into a throwaway virtualenv and run python/tests
+# against it. Separate from `check` because it compiles the extension and needs
+# to fetch maturin and pytest; `gate` runs it.
+python:
+    python3 scripts/test-python-bindings.py
+
+# What CI runs before a release, including the external decoders and the Python
+# bindings. Fails rather than skips when the decoders are missing.
 gate:
     ./scripts/release-gate.sh
 

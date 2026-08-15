@@ -11,3 +11,9 @@ export RARS_REQUIRE_EXTERNAL_DECODERS=1
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test --workspace --all-targets --locked
+
+# The Python package ships from the same tag as the crates, so the gate covers
+# it too. This builds the extension into a throwaway virtualenv and runs
+# python/tests against it, which nothing else does: until this line existed the
+# suite had never run anywhere, in CI or out of it.
+python3 scripts/test-python-bindings.py

@@ -143,15 +143,20 @@ jobs:
           sudo install -m 0755 7zip/7zz /usr/local/bin/7zz
           7zz | head -2
 
-      - run: cargo fmt --all -- --check
+      # Python 3.10 is what the wheels target, so the gate builds the extension
+      # against the oldest version it claims to support.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
 
-      - run: cargo clippy --all-targets -- -D warnings
-
-      - run: cargo test --workspace --all-targets --locked
-        env:
-          # Turn a missing decoder into a failed gate rather than a skipped
-          # matrix.
-          RARS_REQUIRE_EXTERNAL_DECODERS: "1"
+      # The same script `just gate` runs. Spelling the steps out here again is
+      # how the Python suite came to run in neither place: it was added to the
+      # script nobody called, and CI had its own copy of the cargo commands that
+      # knew nothing about it. One list, two callers.
+      #
+      # RARS_REQUIRE_EXTERNAL_DECODERS is set inside the script, so a missing
+      # decoder fails the gate rather than skipping the matrix.
+      - run: ./scripts/release-gate.sh
 
   # ----------------------------------------------------------------------
   # 3. Build release binaries for the supported targets.

@@ -108,8 +108,17 @@ sudo apt-get install unrar          # or build unrarsrc from rarlab.com
 # packages ship the RAR handler with the decompressor removed
 ```
 
-`scripts/release-gate.sh` runs the same suite with `RARS_REQUIRE_EXTERNAL_DECODERS=1`,
-which turns a missing decoder into a failure rather than a skip.
+The Python bindings have their own suite, which needs the extension built
+first. `just python` does both in a throwaway virtualenv:
+
+```sh
+python3 scripts/test-python-bindings.py
+```
+
+`scripts/release-gate.sh` runs the Rust suite with `RARS_REQUIRE_EXTERNAL_DECODERS=1`,
+which turns a missing decoder into a failure rather than a skip, and then the
+Python suite. It is what CI runs before a release, so `just gate` locally and
+the release workflow check the same list.
 
 Generate a local coverage report:
 
