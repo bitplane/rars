@@ -853,39 +853,39 @@ fn encode_lz_member_inner(
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<u8>> {
     if data.len() > LZ_BLOCK_SIZE && initial_filters.is_empty() {
+        // One finder for the whole member. It used to be built per block, which
+        // meant rehashing a window of history every 64 KiB: on a 16 MiB member
+        // that was half the encode. The optimal parse cannot share it, because
+        // it walks each block more than once, so it keeps its own.
+        let (combined, start) = member_window(data, history, options);
+        let mut shared = (!options.optimal_parse).then(|| member_finder(&combined, start, options));
+
         let mut out = Vec::new();
-        let mut block_history =
-            history[history.len().saturating_sub(options.max_match_distance)..].to_vec();
-        let mut chunks = data.chunks(LZ_BLOCK_SIZE).peekable();
         let mut completed = 0usize;
-        while let Some(chunk) = chunks.next() {
-            let is_last = chunks.peek().is_none();
+        let mut block_start = start;
+        while block_start < combined.len() {
+            let block_end = (block_start + LZ_BLOCK_SIZE).min(combined.len());
+            let is_last = block_end == combined.len();
             let mut chunk_progress = |position: usize| {
                 progress
                     .as_deref_mut()
                     .is_none_or(|report| report(completed.saturating_add(position)))
             };
-            out.extend(encode_lz_block(
-                chunk,
-                &block_history,
+            out.extend(encode_lz_block_in_window(
+                &combined,
+                block_start..block_end,
+                shared.as_mut(),
                 algorithm_version,
                 &[],
                 options,
                 is_last,
                 Some(&mut chunk_progress),
             )?);
-            completed = completed.saturating_add(chunk.len());
-            block_history.extend_from_slice(chunk);
-            let keep_from = block_history
-                .len()
-                .saturating_sub(options.max_match_distance);
-            if keep_from != 0 {
-                block_history.drain(..keep_from);
-            }
+            completed = completed.saturating_add(block_end - block_start);
+            block_start = block_end;
         }
         return Ok(out);
     }
-
     encode_lz_block(
         data,
         history,
@@ -897,9 +897,93 @@ fn encode_lz_member_inner(
     )
 }
 
+/// How far back the finder has to remember. Nothing further than the maximum
+/// distance is ever accepted as a match, so a link to anything older can be
+/// dropped, and the block being parsed has to fit whatever the caller set.
+fn finder_window(options: EncodeOptions) -> usize {
+    options.max_match_distance.max(LZ_BLOCK_SIZE)
+}
+
+/// A finder holding everything a parse starting at `block_start` may reach back
+/// to, and nothing older.
+/// A finder for the whole member, seeded with the history it carries in. It
+/// keeps growing as the blocks are parsed, so it is sized to the widest window
+/// the member could ever want rather than to any one block.
+fn member_finder(combined: &[u8], start: usize, options: EncodeOptions) -> Rar50MatchFinder {
+    let mut finder = Rar50MatchFinder::new(finder_window(options));
+    for pos in 0..start {
+        finder.insert(combined, pos);
+    }
+    finder
+}
+
+/// A finder holding everything a parse of `block` may reach back to, and
+/// nothing older.
+fn seeded_finder(
+    combined: &[u8],
+    block: std::ops::Range<usize>,
+    options: EncodeOptions,
+) -> Rar50MatchFinder {
+    // Sized to what this block can actually reach, not to the maximum distance,
+    // so the first blocks of a member do not clear a window the data is not yet
+    // long enough to fill.
+    let behind = block.start.min(options.max_match_distance);
+    let mut finder = Rar50MatchFinder::new(behind + (block.end - block.start));
+    for pos in block.start - behind..block.start {
+        finder.insert(combined, pos);
+    }
+    finder
+}
+
+/// The bytes one member's parse reaches across, and where its own data starts.
+///
+/// A member with no history to carry borrows its own data rather than copying
+/// it, which is every member of a non-solid archive.
+fn member_window<'a>(
+    data: &'a [u8],
+    history: &[u8],
+    options: EncodeOptions,
+) -> (std::borrow::Cow<'a, [u8]>, usize) {
+    let history = &history[history.len().saturating_sub(options.max_match_distance)..];
+    if history.is_empty() {
+        return (std::borrow::Cow::Borrowed(data), 0);
+    }
+    let mut combined = Vec::with_capacity(history.len() + data.len());
+    combined.extend_from_slice(history);
+    combined.extend_from_slice(data);
+    (std::borrow::Cow::Owned(combined), history.len())
+}
+
+/// One block, with its own history and its own finder. The member path shares
+/// a finder across blocks instead; this is for the callers that encode a block
+/// on its own, which are the filtered path and the tests.
 fn encode_lz_block(
     data: &[u8],
     history: &[u8],
+    algorithm_version: u8,
+    initial_filters: &[EncodeFilter],
+    options: EncodeOptions,
+    is_last: bool,
+    progress: Option<&mut dyn FnMut(usize) -> bool>,
+) -> Result<Vec<u8>> {
+    let (combined, start) = member_window(data, history, options);
+    encode_lz_block_in_window(
+        &combined,
+        start..combined.len(),
+        None,
+        algorithm_version,
+        initial_filters,
+        options,
+        is_last,
+        progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_lz_block_in_window(
+    combined: &[u8],
+    block: std::ops::Range<usize>,
+    finder: Option<&mut Rar50MatchFinder>,
     algorithm_version: u8,
     initial_filters: &[EncodeFilter],
     options: EncodeOptions,
@@ -918,8 +1002,9 @@ fn encode_lz_block(
     let mut tokens = Vec::new();
     tokens.extend(initial_filters.iter().copied().map(EncodeToken::Filter));
     tokens.extend(encode_tokens_with_progress(
-        data,
-        history,
+        combined,
+        block,
+        finder,
         options,
         distance_size,
         progress,
@@ -1345,19 +1430,22 @@ impl TokenPrices<'_> {
 /// pass does not know. Each node carries the match that arrives at it and
 /// prices the next hop against that one distance, which catches
 /// same-distance runs and misses the deeper three slots.
+/// Builds its own finder rather than sharing the member's, because it walks the
+/// block more than once and a shared one cannot be rewound. Seeding a finder
+/// with one window of history costs less than the alternative: inserting the
+/// block up front instead leaves every chain walk stepping over positions ahead
+/// of the one being priced, which measured four times slower on a binary.
 fn optimal_tokens(
     combined: &[u8],
-    start: usize,
+    block: std::ops::Range<usize>,
     options: EncodeOptions,
     distance_size: usize,
     prices: Option<&TokenPrices<'_>>,
 ) -> Result<Vec<EncodeToken>> {
-    let end = combined.len();
+    let start = block.start;
+    let end = block.end;
     let span = end - start;
-    let mut finder = Rar50MatchFinder::new(end);
-    for history_pos in 0..start {
-        finder.insert(combined, history_pos);
-    }
+    let mut finder = seeded_finder(combined, block.clone(), options);
 
     let mut price = vec![u32::MAX; span + 1];
     let mut arrive_length = vec![0u32; span + 1];
@@ -1517,57 +1605,60 @@ fn same_price_run_end(
 }
 
 fn encode_tokens_with_progress(
-    input: &[u8],
-    history: &[u8],
+    combined: &[u8],
+    block: std::ops::Range<usize>,
+    finder: Option<&mut Rar50MatchFinder>,
     options: EncodeOptions,
     distance_size: usize,
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<EncodeToken>> {
-    let mut tokens = Vec::new();
-    let history = &history[history.len().saturating_sub(options.max_match_distance)..];
-    let mut combined = Vec::with_capacity(history.len() + input.len());
-    combined.extend_from_slice(history);
-    combined.extend_from_slice(input);
+    let start = block.start;
+    let end = block.end;
     if options.optimal_parse {
         // The prices come from the Huffman tables, and the tables come from
         // the parse, so the first pass has to guess. Each pass after it prices
         // against what the pass before actually produced.
-        let mut tokens = optimal_tokens(&combined, history.len(), options, distance_size, None)?;
+        let mut tokens = optimal_tokens(combined, block.clone(), options, distance_size, None)?;
         for _ in 1..OPTIMAL_PARSE_PASSES {
             let lengths = table_lengths_for_tokens(&tokens, distance_size)?;
             let prices = TokenPrices { lengths: &lengths };
             tokens = optimal_tokens(
-                &combined,
-                history.len(),
+                combined,
+                block.clone(),
                 options,
                 distance_size,
                 Some(&prices),
             )?;
         }
-        if progress.is_some_and(|report| !report(input.len())) {
+        if progress.is_some_and(|report| !report(end - start)) {
             return Err(Error::Cancelled);
         }
         return Ok(tokens);
     }
-    let mut finder = Rar50MatchFinder::new(combined.len());
-    for history_pos in 0..history.len() {
-        finder.insert(&combined, history_pos);
-    }
 
-    let mut pos = history.len();
-    let end = combined.len();
+    let mut own;
+    let finder = match finder {
+        Some(finder) => finder,
+        None => {
+            own = seeded_finder(combined, start..end, options);
+            &mut own
+        }
+    };
+    let mut tokens = Vec::new();
+    let mut pos = start;
     let mut state = EncoderMatchState::default();
     let mut next_report = 0usize;
     let mut pending_match: Option<MatchCandidate> = None;
     while pos < end {
         let candidate = pending_match
             .take()
-            .or_else(|| best_match(&combined, pos, end, &finder, options, &state, distance_size));
+            .or_else(|| best_match(combined, pos, end, finder, options, &state, distance_size));
         if let Some(candidate) = candidate {
             let (emit_literal, cached_next) = lazy_match_decision(
-                &combined,
+                combined,
                 pos,
-                &finder,
+                end,
+                finder,
                 options,
                 &state,
                 distance_size,
@@ -1575,7 +1666,7 @@ fn encode_tokens_with_progress(
             );
             if emit_literal {
                 tokens.push(EncodeToken::Literal(combined[pos]));
-                finder.insert(&combined, pos);
+                finder.insert(combined, pos);
                 pos += 1;
                 pending_match = cached_next;
                 continue;
@@ -1586,15 +1677,15 @@ fn encode_tokens_with_progress(
             tokens.push(EncodeToken::Match { length, distance });
             state.remember(length, distance);
             for history_pos in pos..pos + length {
-                finder.insert(&combined, history_pos);
+                finder.insert(combined, history_pos);
             }
             pos += length;
         } else {
             tokens.push(EncodeToken::Literal(combined[pos]));
-            finder.insert(&combined, pos);
+            finder.insert(combined, pos);
             pos += 1;
         }
-        let consumed = pos.saturating_sub(history.len());
+        let consumed = pos - start;
         if consumed >= next_report {
             if progress
                 .as_deref_mut()
@@ -1605,7 +1696,7 @@ fn encode_tokens_with_progress(
             next_report = consumed.saturating_add(1024 * 1024);
         }
     }
-    if progress.is_some_and(|report| !report(input.len())) {
+    if progress.is_some_and(|report| !report(end - start)) {
         return Err(Error::Cancelled);
     }
     Ok(tokens)
@@ -1615,16 +1706,17 @@ fn encode_tokens_with_progress(
 /// better match starts within the lazy lookahead window. Also returns the
 /// match found one byte ahead (when computed) so the caller can reuse it for
 /// the next position instead of searching again.
+#[allow(clippy::too_many_arguments)]
 fn lazy_match_decision(
     input: &[u8],
     pos: usize,
+    end: usize,
     finder: &Rar50MatchFinder,
     options: EncodeOptions,
     state: &EncoderMatchState,
     distance_size: usize,
     current: MatchCandidate,
 ) -> (bool, Option<MatchCandidate>) {
-    let end = input.len();
     if !options.lazy_matching || pos + 1 >= end {
         return (false, None);
     }
@@ -3099,8 +3191,16 @@ mod tests {
         options: EncodeOptions,
         distance_size: usize,
     ) -> Vec<EncodeToken> {
-        encode_tokens_with_progress(input, history, options, distance_size, None)
-            .expect("encoding without cancellation cannot be cancelled")
+        let (combined, start) = member_window(input, history, options);
+        encode_tokens_with_progress(
+            &combined,
+            start..combined.len(),
+            None,
+            options,
+            distance_size,
+            None,
+        )
+        .expect("encoding without cancellation cannot be cancelled")
     }
     fn should_lazy_emit_literal(
         input: &[u8],
@@ -3111,7 +3211,17 @@ mod tests {
         distance_size: usize,
         current: MatchCandidate,
     ) -> bool {
-        lazy_match_decision(input, pos, finder, options, state, distance_size, current).0
+        lazy_match_decision(
+            input,
+            pos,
+            input.len(),
+            finder,
+            options,
+            state,
+            distance_size,
+            current,
+        )
+        .0
     }
 
     fn checksum(flags: u8, size_bytes: &[u8]) -> u8 {
@@ -4018,10 +4128,11 @@ mod tests {
         let data = wordy_text(256 * 1024);
         let options = EncodeOptions::new(64).with_optimal_parse(true);
         let distance_size = DISTANCE_TABLE_SIZE_50;
-        let guessed = optimal_tokens(&data, 0, options, distance_size, None).unwrap();
+        let guessed = optimal_tokens(&data, 0..data.len(), options, distance_size, None).unwrap();
         let lengths = table_lengths_for_tokens(&guessed, distance_size).unwrap();
         let prices = TokenPrices { lengths: &lengths };
-        let repriced = optimal_tokens(&data, 0, options, distance_size, Some(&prices)).unwrap();
+        let repriced =
+            optimal_tokens(&data, 0..data.len(), options, distance_size, Some(&prices)).unwrap();
 
         let bits = |tokens: &[EncodeToken]| -> usize {
             let lengths = table_lengths_for_tokens(tokens, distance_size).unwrap();

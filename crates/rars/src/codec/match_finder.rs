@@ -6,6 +6,15 @@
 //! with the same hash. Walking a chain therefore visits candidates from the
 //! smallest distance to the largest, so callers can stop as soon as a
 //! candidate falls outside their window.
+//!
+//! `prev` holds one link per position in a window rather than one per position
+//! in the input, indexed by position modulo the window. A link is only followed
+//! while the candidate it names is inside the window, and a slot is only reused
+//! once the position it held has fallen out, so the two never overlap. That
+//! bounds the finder by the window instead of by the data, which is what lets
+//! one finder span every block of a member: rebuilding it per block meant
+//! rehashing the whole history each time, which measured at about 40% of the
+//! encode on a 16 MiB member.
 
 /// Sentinel for "no position" in `head`/`prev` chains.
 pub(crate) const NO_POSITION: usize = usize::MAX;
@@ -14,6 +23,7 @@ pub(crate) const NO_POSITION: usize = usize::MAX;
 pub(crate) struct MatchFinder<const MIN_MATCH: usize> {
     head: Vec<usize>,
     prev: Vec<usize>,
+    mask: usize,
 }
 
 impl<const MIN_MATCH: usize> MatchFinder<MIN_MATCH> {
@@ -23,10 +33,19 @@ impl<const MIN_MATCH: usize> MatchFinder<MIN_MATCH> {
         _ => panic!("match finder supports MIN_MATCH of 3 or 4"),
     };
 
-    pub(crate) fn new(len: usize) -> Self {
+    /// Builds a finder that remembers the last `window` positions.
+    ///
+    /// The caller must not accept a match further back than `window`, which is
+    /// the check it already makes against its own maximum distance. A link to a
+    /// position that has fallen out of the window is still readable, and still
+    /// names the position it named, so that check rejects it the same way it
+    /// rejects a match that is merely too far away.
+    pub(crate) fn new(window: usize) -> Self {
+        let window = window.max(1).next_power_of_two();
         Self {
             head: vec![NO_POSITION; 1 << Self::HASH_BITS],
-            prev: vec![NO_POSITION; len],
+            prev: vec![NO_POSITION; window],
+            mask: window - 1,
         }
     }
 
@@ -46,7 +65,7 @@ impl<const MIN_MATCH: usize> MatchFinder<MIN_MATCH> {
     pub(crate) fn insert(&mut self, input: &[u8], pos: usize) {
         if pos + MIN_MATCH <= input.len() {
             let hash = Self::hash(input, pos);
-            self.prev[pos] = self.head[hash];
+            self.prev[pos & self.mask] = self.head[hash];
             self.head[hash] = pos;
         }
     }
@@ -61,6 +80,6 @@ impl<const MIN_MATCH: usize> MatchFinder<MIN_MATCH> {
     /// Returns the next-older candidate in `candidate`'s chain, or
     /// [`NO_POSITION`].
     pub(crate) fn previous(&self, candidate: usize) -> usize {
-        self.prev[candidate]
+        self.prev[candidate & self.mask]
     }
 }
