@@ -23,7 +23,6 @@ use std::io::Write;
 
 const AUTO_RGB_WIDTHS: [usize; 4] = [24, 48, 96, 192];
 const MIN_STORE_FALLBACK_SIZE: usize = 1024;
-const RAR29_LARGE_TEXT_PPMD_THRESHOLD: usize = 16 * 1024 * 1024;
 const RAR29_TEXT_SAMPLE_SIZE: usize = 8192;
 const RAR29_AUDIO_SAMPLE_SIZE: usize = 8192;
 /// How much data one RAR 2.9 LZ block covers.
@@ -408,7 +407,7 @@ fn encode_rar29_policy_filtered_payload(
             };
             // Gated on the content, so a binary member never pays for a PPMd
             // encode it was always going to lose.
-            if ppmd_trial && is_auto_ppmd_candidate(data) {
+            if ppmd_trial && is_text_ppmd_candidate(data) {
                 let candidate = ppmd(data)?;
                 if candidate.data.len() < best.data.len() {
                     best = candidate;
@@ -598,12 +597,6 @@ fn encode_rar29_auto_filtered_member(
             method: 0x30,
         });
     }
-    if include_ppmd && is_large_text_ppmd_candidate(data) {
-        return Ok(EncodedPayload {
-            data: unpack29_encode_ppmd(data, options.max_match_distance).map_err(Error::from)?,
-            method: 0x35,
-        });
-    }
     // The search measures the unfiltered member as one of its own candidates
     // and returns the winner's bytes, so encoding the member plainly here as
     // well was a second full pass over every binary member on the default
@@ -618,20 +611,24 @@ fn encode_rar29_auto_filtered_member(
         },
         method: lz_method,
     };
-    if include_ppmd && data.len() <= 1024 * 1024 && text {
-        let ppmd = EncodedPayload {
-            data: unpack29_encode_ppmd(data, options.max_match_distance).map_err(Error::from)?,
-            method: 0x35,
-        };
-        if ppmd.data.len() < best.data.len() {
-            best = ppmd;
-        }
-        return Ok(best);
-    }
-    if text {
-        return Ok(best);
-    }
-    if include_ppmd && is_auto_ppmd_candidate(data) {
+    // Whichever engine wins, it wins because it was measured against the other
+    // over the whole member. Size used to decide it instead: under 1 MiB text
+    // was measured, over 16 MiB it went to PPMd unmeasured, and everything
+    // between kept the LZ bytes without ever encoding PPMd to compare. That
+    // middle band cost 24% on 2 MiB of man pages and 12% on 4 MiB, and the
+    // unmeasured end can lose just as badly the other way: 8 MiB of content
+    // that repeats every 4 MiB packs to 843 KB under LZ and 1.44 MB under PPMd.
+    //
+    // Screening on a sample first, the way the filter search earns its
+    // candidates, was tried and does not work here. The two engines are only
+    // comparable once there is enough output to compare: on 128 KiB of one
+    // repeating phrase LZ lands on 213 bytes and PPMd on 118, so the screen
+    // reads a 45% PPMd win off what is almost entirely archive overhead. And
+    // in the case worth catching, repetition further apart than the sample is
+    // wide, the sample cannot see the repetition at all. PPMd costs about
+    // three times LZ on the same bytes, so text at the top two levels pays for
+    // both engines. Levels 1 to 4 skip the trial as they always have.
+    if include_ppmd && text {
         let ppmd = EncodedPayload {
             data: unpack29_encode_ppmd(data, options.max_match_distance).map_err(Error::from)?,
             method: 0x35,
@@ -649,31 +646,81 @@ fn encode_rar29_auto_filtered_member(
     Ok(best)
 }
 
-fn is_large_text_ppmd_candidate(data: &[u8]) -> bool {
-    data.len() >= RAR29_LARGE_TEXT_PPMD_THRESHOLD && is_text_ppmd_candidate(data)
-}
-
-fn is_auto_ppmd_candidate(data: &[u8]) -> bool {
-    is_text_ppmd_candidate(data)
-}
-
 fn is_text_ppmd_candidate(data: &[u8]) -> bool {
     let mut printable = 0usize;
     let mut nul = 0usize;
     let mut total = 0usize;
     for start in text_sample_offsets(data.len()) {
         let end = start.saturating_add(RAR29_TEXT_SAMPLE_SIZE).min(data.len());
-        for &byte in &data[start..end] {
-            total += 1;
-            if byte == 0 {
-                nul += 1;
-            }
-            if byte.is_ascii_graphic() || matches!(byte, b'\n' | b'\r' | b'\t' | b' ') {
-                printable += 1;
-            }
-        }
+        let (window_printable, window_nul, window_total) = score_text_window(&data[start..end]);
+        printable += window_printable;
+        nul += window_nul;
+        total += window_total;
     }
     total != 0 && nul * 100 <= total && printable * 100 >= total * 85
+}
+
+/// Counts one sampled window as printable, NUL and total bytes.
+///
+/// Counting only ASCII read every non-English member as binary. The bench's
+/// text member is a set of translated man pages, 23% of it well-formed
+/// multibyte UTF-8, and it scored 77% against the 85% bar and went to LZ. A
+/// multibyte sequence is as much text as an ASCII letter. Accepting them costs
+/// no precision either, because random binary almost never forms one: a lead
+/// byte followed by a continuation byte is about 3% of positions, nowhere near
+/// enough to carry a binary member over the bar.
+fn score_text_window(window: &[u8]) -> (usize, usize, usize) {
+    let mut printable = 0usize;
+    let mut nul = 0usize;
+    let mut total = 0usize;
+    let mut index = 0usize;
+    while index < window.len() {
+        let byte = window[index];
+        if byte == 0 {
+            nul += 1;
+            total += 1;
+            index += 1;
+        } else if byte.is_ascii_graphic() || matches!(byte, b'\n' | b'\r' | b'\t' | b' ') {
+            printable += 1;
+            total += 1;
+            index += 1;
+        } else if let Some(len) = utf8_sequence_len(window, index) {
+            printable += len;
+            total += len;
+            index += len;
+        } else if utf8_lead_len(byte).is_some_and(|len| index + len > window.len()) {
+            // The window cut a sequence in half. That is an artefact of where
+            // the sample lands, not evidence of binary, so the window ends here.
+            break;
+        } else {
+            total += 1;
+            index += 1;
+        }
+    }
+    (printable, nul, total)
+}
+
+/// How many bytes the sequence starting with this byte claims, if it can start
+/// one. Overlong forms (`0xc0`, `0xc1`) and anything past U+10FFFF cannot.
+fn utf8_lead_len(byte: u8) -> Option<usize> {
+    match byte {
+        0xc2..=0xdf => Some(2),
+        0xe0..=0xef => Some(3),
+        0xf0..=0xf4 => Some(4),
+        _ => None,
+    }
+}
+
+/// The length of the well-formed UTF-8 sequence at `index`, if there is one.
+fn utf8_sequence_len(window: &[u8], index: usize) -> Option<usize> {
+    let len = utf8_lead_len(window[index])?;
+    if index + len > window.len() {
+        return None;
+    }
+    window[index + 1..index + len]
+        .iter()
+        .all(|byte| (0x80..=0xbf).contains(byte))
+        .then_some(len)
 }
 
 fn text_sample_offsets(len: usize) -> [usize; 3] {
@@ -2170,9 +2217,14 @@ mod tests {
     use super::{
         encode_rar29_auto_filtered_member, encode_rar29_filtered_member,
         encode_rar29_filtered_members, is_audio_filter_candidate, rar20_encode_options_for_options,
-        rar29_encode_options_for_options, FilterKind, FilterSpec, RAR29_LARGE_TEXT_PPMD_THRESHOLD,
+        rar29_encode_options_for_options, FilterKind, FilterSpec,
     };
     use crate::codec::rar29::{unpack29_decode, EncodeOptions};
+
+    /// A member comfortably past the 1 MiB ceiling the PPMd trial used to have.
+    /// Text this size kept the LZ bytes without PPMd ever being encoded to
+    /// compare against, all the way up to 16 MiB.
+    const OVER_THE_OLD_TRIAL_LIMIT: usize = 1024 * 1024 + 4096;
     use crate::filter_search::{
         auto_delta_filter_range, disjoint_filter_ranges, AUTO_DELTA_EDGE_SKIP,
     };
@@ -2205,23 +2257,57 @@ mod tests {
 
     #[test]
     fn large_text_ppmd_candidate_accepts_html_like_payloads() {
-        let mut data = vec![b'a'; RAR29_LARGE_TEXT_PPMD_THRESHOLD + 1];
+        let mut data = vec![b'a'; OVER_THE_OLD_TRIAL_LIMIT];
         for index in (0..data.len()).step_by(79) {
             data[index] = b'\n';
         }
         data[..32].copy_from_slice(b"<html><body>RAR PPMd text sample");
 
-        assert!(super::is_large_text_ppmd_candidate(&data));
+        assert!(super::is_text_ppmd_candidate(&data));
     }
 
     #[test]
     fn large_text_ppmd_candidate_rejects_binary_payloads() {
-        let mut data = vec![0u8; RAR29_LARGE_TEXT_PPMD_THRESHOLD + 1];
+        let mut data = vec![0u8; OVER_THE_OLD_TRIAL_LIMIT];
         for index in (0..data.len()).step_by(257) {
             data[index] = b'A';
         }
 
-        assert!(!super::is_large_text_ppmd_candidate(&data));
+        assert!(!super::is_text_ppmd_candidate(&data));
+    }
+
+    /// The bench corpus is man pages in several languages, and counting only
+    /// ASCII scored the sample 77% against an 85% bar and sent it to LZ.
+    #[test]
+    fn the_text_screen_reads_multibyte_utf8_as_text() {
+        let line = "Überprüfen Sie die Größe der Datei — ändern Sie sie nicht. \
+                    日本語のマニュアルページもテキストです。\n";
+        let data = line.repeat(4096).into_bytes();
+
+        let high = data.iter().filter(|&&byte| byte >= 0x80).count();
+        assert!(
+            high * 100 / data.len() > 15,
+            "sample must be multibyte enough to have failed the ASCII-only test"
+        );
+        assert!(super::is_text_ppmd_candidate(&data));
+    }
+
+    /// Accepting multibyte sequences must not accept binary that happens to
+    /// contain a few: a lead byte followed by a continuation byte turns up at
+    /// random often enough to notice, nowhere near often enough to pass.
+    #[test]
+    fn the_text_screen_still_rejects_high_entropy_binary() {
+        let mut state = 0x1234_5678u32;
+        let data: Vec<_> = (0..64_000)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect();
+
+        assert!(!super::is_text_ppmd_candidate(&data));
     }
 
     #[test]
@@ -2234,14 +2320,14 @@ mod tests {
             data.extend_from_slice(&right.to_le_bytes());
         }
 
-        assert!(!super::is_auto_ppmd_candidate(&data));
+        assert!(!super::is_text_ppmd_candidate(&data));
     }
 
     #[test]
     fn auto_ppmd_candidate_accepts_text_payloads() {
         let data = b"fn main() {\n    println!(\"rar ppmd text candidate\");\n}\n".repeat(256);
 
-        assert!(super::is_auto_ppmd_candidate(&data));
+        assert!(super::is_text_ppmd_candidate(&data));
     }
 
     #[test]
@@ -2275,14 +2361,96 @@ mod tests {
         }
     }
 
-    #[test]
-    fn auto_filtered_rar29_large_text_uses_ppmd_before_lz_candidates() {
-        let mut data = vec![b'x'; RAR29_LARGE_TEXT_PPMD_THRESHOLD + 1];
-        for index in (0..data.len()).step_by(97) {
-            data[index] = b' ';
+    /// Prose with no long repeats: PPMd's model has plenty to work with and LZ
+    /// has little to match, which is the shape the engine choice exists for.
+    fn prose_like_text(len: usize) -> Vec<u8> {
+        const WORDS: [&str; 24] = [
+            "archive",
+            "compression",
+            "dictionary",
+            "encoder",
+            "filter",
+            "header",
+            "member",
+            "method",
+            "offset",
+            "payload",
+            "reader",
+            "solid",
+            "stream",
+            "volume",
+            "window",
+            "writer",
+            "the",
+            "of",
+            "a",
+            "and",
+            "to",
+            "in",
+            "that",
+            "with",
+        ];
+        let mut state = 0x9e37_79b9u32;
+        let mut out = Vec::with_capacity(len + 16);
+        while out.len() < len {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            out.extend_from_slice(WORDS[state as usize % WORDS.len()].as_bytes());
+            out.push(if state.is_multiple_of(13) {
+                b'\n'
+            } else {
+                b' '
+            });
         }
+        out.truncate(len);
+        out
+    }
 
-        assert!(super::is_large_text_ppmd_candidate(&data));
+    /// Text past the trial limit used to keep the LZ bytes without ever
+    /// encoding PPMd to compare, which cost 24% on 2 MiB of man pages and 12%
+    /// on 4 MiB. The method byte cannot tell the two engines apart (PPMd and
+    /// `-m5` LZ both write 0x35), so ask for the member both ways instead.
+    #[test]
+    fn text_over_the_trial_limit_is_measured_against_ppmd() {
+        let data = prose_like_text(OVER_THE_OLD_TRIAL_LIMIT);
+        assert!(super::is_text_ppmd_candidate(&data));
+
+        let offered =
+            encode_rar29_auto_filtered_member(&data, EncodeOptions::default(), 0x35, true).unwrap();
+        let lz_only =
+            encode_rar29_auto_filtered_member(&data, EncodeOptions::default(), 0x35, false)
+                .unwrap();
+
+        assert!(
+            offered.data.len() < lz_only.data.len(),
+            "PPMd should have won this member: offered {} bytes, LZ alone {}",
+            offered.data.len(),
+            lz_only.data.len()
+        );
+    }
+
+    /// The other half of the same rule: winning is measured, not assumed. Text
+    /// that is one phrase repeating is all match and belongs to LZ, and the
+    /// member has to come back no larger than LZ alone would have made it.
+    #[test]
+    fn text_ppmd_cannot_lose_to_the_engine_it_replaced() {
+        let data = b"the quick brown fox jumps over the lazy dog. "
+            .repeat(OVER_THE_OLD_TRIAL_LIMIT / 45 + 64);
+        assert!(super::is_text_ppmd_candidate(&data));
+
+        let offered =
+            encode_rar29_auto_filtered_member(&data, EncodeOptions::default(), 0x35, true).unwrap();
+        let lz_only =
+            encode_rar29_auto_filtered_member(&data, EncodeOptions::default(), 0x35, false)
+                .unwrap();
+
+        assert!(
+            offered.data.len() <= lz_only.data.len(),
+            "offering PPMd made the member bigger: {} bytes against {}",
+            offered.data.len(),
+            lz_only.data.len()
+        );
     }
 
     #[test]
