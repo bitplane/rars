@@ -1265,6 +1265,88 @@ fn writes_compressed_rar50_archive_comment_service_record() {
     assert_eq!(extracted[0].data, payload);
 }
 
+/// What `supports` promises for the quick-open index is what each writer does
+/// with it, for every shape RAR 5 has.
+///
+/// The capability conformance test in `write_plan.rs` proves the table and
+/// `validate_plan` agree, which is not the same as proving the writer agrees
+/// with either. Quick open was said in two places, `FeatureSet::quick_open` and
+/// an `ArchiveExtras` field, and validation only ever read the first: an archive
+/// asking through the feature set passed validation and then had its index
+/// dropped, and a volume set asking through the extras got past validation
+/// entirely and was dropped too. Both looked like success.
+///
+/// So this asks each writer for the index and goes looking for the block,
+/// rather than asking the table what it thinks.
+#[test]
+fn every_rar50_writer_agrees_with_the_table_about_quick_open() {
+    fn wrote_the_index(bytes: &[u8]) -> bool {
+        let archive = Archive::parse(bytes).unwrap();
+        let located = archive
+            .main
+            .locator()
+            .and_then(|locator| locator.quick_open_offset)
+            .is_some_and(|offset| offset > 0);
+        let stored = archive.services().any(|service| service.name == b"QO");
+        assert_eq!(
+            located, stored,
+            "a locator pointing at no QO record, or a QO record nothing points at"
+        );
+        located
+    }
+
+    let mut features = FeatureSet::store_only();
+    features.quick_open = true;
+    let options = rar50::WriterOptions::new(ArchiveVersion::Rar50, features);
+    let entries = [entry(b"qo.txt", b"quick-open conformance payload\n")
+        .with_attributes(0x20)
+        .with_host_os(3)];
+
+    let one_archive = rars::PlanShape::new().compressed(true);
+    assert!(rars::supports(
+        ArchiveVersion::Rar50,
+        rars::WriterOption::Feature(rars::Feature::QuickOpen),
+        one_archive,
+    ));
+    let bytes = write_stored_archive(&entries, options).unwrap();
+    assert!(wrote_the_index(&bytes), "the buffered writer dropped it");
+
+    let mut streamed = Vec::new();
+    rar50::write_streaming_archive_to(
+        &entries,
+        stored(options),
+        rar50::ArchiveExtras::default(),
+        &rars::WriterResources::default(),
+        &mut streamed,
+    )
+    .unwrap();
+    assert!(
+        wrote_the_index(&streamed),
+        "the streaming writer accepted the feature and wrote no index"
+    );
+
+    let volumes = rars::PlanShape::new().compressed(true).volumes(true);
+    assert!(!rars::supports(
+        ArchiveVersion::Rar50,
+        rars::WriterOption::Feature(rars::Feature::QuickOpen),
+        volumes,
+    ));
+    let mut sink = rar50::CollectedVolumes::new();
+    let refused = rar50::write_streaming_volumes_to(
+        &entries,
+        stored(options),
+        rar50::ArchiveExtras::default(),
+        4096,
+        &mut sink,
+        &rars::WriterResources::default(),
+    )
+    .unwrap_err();
+    assert!(
+        refused.to_string().contains("quick-open"),
+        "a volume set has to say which option it cannot carry: {refused}"
+    );
+}
+
 #[test]
 fn writes_rar50_quick_open_service_record() {
     let entries = [
@@ -4774,11 +4856,10 @@ fn streaming_writer_writes_a_usable_quick_open_index() {
     let mut features = FeatureSet::store_only();
     features.quick_open = true;
 
-    let bytes = write_with_extras(
-        &entries,
-        features,
-        rar50::ArchiveExtras::default().with_quick_open(true),
-    );
+    // Asked for through the feature set alone, which is the only way to ask.
+    // This used to say it twice, through an `ArchiveExtras` field as well, and
+    // that is why it passed while the feature set on its own was being dropped.
+    let bytes = write_with_extras(&entries, features, rar50::ArchiveExtras::default());
 
     let archive = Archive::parse(&bytes).unwrap();
     assert!(

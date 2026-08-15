@@ -327,6 +327,9 @@ pub fn write_streaming_volumes_with_progress(
             header_encrypted: options.features.header_encryption,
             archive_comment: None,
             archive_metadata: None,
+            // No volume writer emits the index, and `validate_plan` refuses a
+            // set that asks for one, so this is the only value that can get
+            // here rather than a decision taken quietly on the caller's behalf.
             quick_open: false,
             progress: progress.map(ProgressReporter),
         },
@@ -345,9 +348,6 @@ pub struct ArchiveExtras<'a> {
     /// Encrypts the comment. Without it the comment is stored in the clear.
     pub comment_password: Option<&'a [u8]>,
     pub metadata: Option<ArchiveMetadataEntry<'a>>,
-    /// Writes a quick-open index so readers can list the archive without
-    /// walking every header.
-    pub quick_open: bool,
     /// Whether to look for a data filter that makes members compress better.
     pub filter_policy: FilterPolicy,
     /// Percentage of the archive to spend on a recovery record.
@@ -368,11 +368,6 @@ impl<'a> ArchiveExtras<'a> {
 
     pub fn with_metadata(mut self, metadata: ArchiveMetadataEntry<'a>) -> Self {
         self.metadata = Some(metadata);
-        self
-    }
-
-    pub fn with_quick_open(mut self, quick_open: bool) -> Self {
-        self.quick_open = quick_open;
         self
     }
 
@@ -450,7 +445,7 @@ pub(crate) fn write_streaming_archive_reporting(
     if options.features.header_encryption && !encrypted {
         return Err(Error::NeedPassword);
     }
-    if extras.quick_open && options.features.header_encryption {
+    if options.features.quick_open && options.features.header_encryption {
         return Err(Error::UnsupportedFeature {
             version: options.target,
             feature: "RAR 5 quick-open index in a header-encrypted archive",
@@ -484,7 +479,7 @@ pub(crate) fn write_streaming_archive_reporting(
                 (None, _) => None,
             },
             archive_metadata: extras.metadata,
-            quick_open: extras.quick_open,
+            quick_open: options.features.quick_open,
             progress,
         },
         resources,
@@ -705,7 +700,6 @@ impl<'a> Rar50Writer<'a> {
     pub fn write_to(self, output: &mut dyn Write, resources: &WriterResources) -> Result<()> {
         let mut extras = ArchiveExtras::default()
             .with_recovery_percent(self.recovery_percent)
-            .with_quick_open(self.options.features.quick_open)
             .with_filter_policy(self.filter_policy);
         if let Some(comment) = self.archive_comment {
             extras = match self.archive_comment_password {

@@ -1595,13 +1595,7 @@ fn write_plain_rar50_streaming(
         name: Some(name),
         creation_time: Some(current_filetime()),
     });
-    let extras = streaming_extras(
-        recovery_percent,
-        filter_policy,
-        quick_open,
-        archive_comment,
-        metadata,
-    );
+    let extras = streaming_extras(recovery_percent, filter_policy, archive_comment, metadata);
     progress.spinner("Preparing compression");
     progress.bar("Compressing archive", total);
     if let Some(volume_size) = volume_size {
@@ -1744,16 +1738,17 @@ fn rar50_filter_policy(
     FilterPolicy::Auto
 }
 
+/// Quick open is deliberately absent: it rides on the feature set, which is
+/// what `validate_plan` reads, and saying it twice is how the streaming writer
+/// came to accept it in one place and drop it in the other.
 fn streaming_extras<'a>(
     recovery_percent: Option<u64>,
     filter_policy: rars::rar50::FilterPolicy,
-    quick_open: bool,
     comment: Option<&'a [u8]>,
     metadata: Option<rars::rar50::ArchiveMetadataEntry<'a>>,
 ) -> rars::rar50::ArchiveExtras<'a> {
     let mut extras = rars::rar50::ArchiveExtras::default()
         .with_recovery_percent(recovery_percent)
-        .with_quick_open(quick_open)
         .with_filter_policy(filter_policy);
     if let Some(comment) = comment {
         extras = extras.with_comment(comment);
