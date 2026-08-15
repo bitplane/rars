@@ -3088,7 +3088,7 @@ fn creates_rar50_encrypted_compressed_archive_that_can_be_tested() {
 
     let info = rars().args(["info", "-v"]).arg(&archive).output().unwrap();
     assert!(info.status.success(), "stderr: {}", stderr(&info));
-    assert!(stdout(&info).contains("method=1"));
+    assert!(stdout(&info).contains("method=3"));
 
     let wrong = rars()
         .args(["test", "--password", "wrong"])
@@ -3184,7 +3184,7 @@ fn creates_rar50_header_encrypted_compressed_archive_that_can_be_tested() {
         .output()
         .unwrap();
     assert!(info.status.success(), "stderr: {}", stderr(&info));
-    assert!(stdout(&info).contains("method=1"));
+    assert!(stdout(&info).contains("method=3"));
 
     let test = rars()
         .args(["test", "--password", "pass"])
@@ -4310,7 +4310,7 @@ fn creates_rar50_compressed_archive_that_can_be_tested() {
 
     let info = rars().args(["info", "-v"]).arg(&archive).output().unwrap();
     assert!(info.status.success(), "stderr: {}", stderr(&info));
-    assert!(stdout(&info).contains("method=1"));
+    assert!(stdout(&info).contains("method=3"));
 
     assert_archive_tests_and_extracts_file(&archive, None, "payload.txt", &payload);
 }
@@ -4403,7 +4403,7 @@ fn creates_rar50_delta_filtered_compressed_archive_that_can_be_tested() {
 
     let info = rars().args(["info", "-v"]).arg(&archive).output().unwrap();
     assert!(info.status.success(), "stderr: {}", stderr(&info));
-    assert!(stdout(&info).contains("method=1"));
+    assert!(stdout(&info).contains("method=3"));
 
     assert_archive_tests_and_extracts_file(&archive, None, "payload.bin", &payload);
 }

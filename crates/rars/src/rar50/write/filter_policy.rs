@@ -137,30 +137,64 @@ pub(super) fn should_store_compressed_payload(
         .applies(solid, unpacked as usize, packed as usize)
 }
 
+/// How hard each level looks for a match, and where the default sits.
+///
+/// The ladder used to run 8, 32, 64, 48, 64 with the absent level on 256, so
+/// asking for the most compression got you less of it than asking for nothing:
+/// `--level 5` searched 64 positions where the default searched 256, and level
+/// 4 searched fewer than level 3. On 4 MiB of man pages the default packed
+/// 679,368 bytes and `--level 5` packed 691,274.
+///
+/// Measured on that member, packed bytes against seconds, at lookahead 2:
+///
+/// ```text
+/// candidates     64     128     256     512    1024
+/// packed     686,891 680,315 675,746 672,645 670,061
+/// seconds       1.67    2.35    3.53    4.71    6.65
+/// ```
+///
+/// It flattens out: the last doubling buys 0.4% for another two seconds. So
+/// the top of the ladder sits at 512 rather than chasing it, and level 3 stays
+/// near what the default already cost.
+fn match_candidates_for_level(level: u8) -> Result<usize> {
+    match level {
+        0 => Ok(0),
+        1 => Ok(8),
+        2 => Ok(32),
+        3 => Ok(128),
+        4 => Ok(256),
+        5 => Ok(512),
+        _ => Err(Error::InvalidHeader(
+            "RAR 5 compression level must be in the range 0..5",
+        )),
+    }
+}
+
+/// The level an absent `--level` means. Resolved once, so the effort spent, the
+/// method byte written and the fallback ladder cannot disagree about it.
+pub(super) const RAR50_DEFAULT_LEVEL: u8 = 3;
+
+pub(super) fn resolved_level(level: Option<u8>) -> u8 {
+    level.unwrap_or(RAR50_DEFAULT_LEVEL)
+}
+
 pub(super) fn encode_options_for_level(
     level: Option<u8>,
     dictionary_size: u64,
 ) -> Result<EncodeOptions> {
-    let candidates = match level {
-        None => MAX_MATCH_CANDIDATES_DEFAULT,
-        Some(0) => 0,
-        Some(1) => 8,
-        Some(2) => 32,
-        Some(3) => 64,
-        Some(4) => 48,
-        Some(5) => 64,
-        Some(_) => {
-            return Err(Error::InvalidHeader(
-                "RAR 5 compression level must be in the range 0..5",
-            ))
-        }
-    };
+    let level = resolved_level(level);
+    let candidates = match_candidates_for_level(level)?;
     let max_match_distance = usize::try_from(dictionary_size).map_err(|_| {
         Error::InvalidHeader("RAR 5 dictionary size exceeds this platform's address space")
     })?;
     Ok(EncodeOptions::new(candidates)
-        .with_lazy_matching(matches!(level, None | Some(4..=5)))
-        .with_lazy_lookahead(1)
+        // Looking one byte further ahead before settling for the match at hand
+        // is both smaller and quicker than not: at 64 candidates it took 4,383
+        // bytes off that member and half a second off the encode, because a
+        // longer match covers ground the finder then does not have to search.
+        // Four is worse than one, which is its own question (#83).
+        .with_lazy_matching(level >= 3)
+        .with_lazy_lookahead(2)
         .with_max_match_distance(max_match_distance))
 }
 
@@ -169,7 +203,7 @@ pub(super) fn encode_option_candidates_for_level(
     dictionary_size: u64,
 ) -> Result<Vec<EncodeOptions>> {
     let mut candidates = vec![encode_options_for_level(level, dictionary_size)?];
-    if matches!(level, Some(5)) {
+    if resolved_level(level) == 5 {
         for fallback_level in (1..5).rev() {
             candidates.push(encode_options_for_level(
                 Some(fallback_level),
@@ -194,14 +228,15 @@ pub(super) fn rar50_algorithm_version(options: WriterOptions, dictionary_size: u
     }
 }
 
+/// The level written into the member header.
+///
+/// It is the resolved level, so an archive says what it was compressed at. An
+/// absent level used to write 1 while spending more search than `--level 5`
+/// did, which described neither what was asked for nor what was done.
 pub(super) fn compression_method_for_level(level: Option<u8>) -> Result<u8> {
-    match level {
-        None => Ok(1),
-        Some(level @ 0..=5) => Ok(level),
-        Some(_) => Err(Error::InvalidHeader(
-            "RAR 5 compression level must be in the range 0..5",
-        )),
-    }
+    let level = resolved_level(level);
+    match_candidates_for_level(level)?;
+    Ok(level)
 }
 
 /// The largest dictionary the writer picks on its own.

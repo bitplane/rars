@@ -18,7 +18,6 @@ use filter_policy::{
 };
 pub(super) use headers::end_header_specific;
 
-const MAX_MATCH_CANDIDATES_DEFAULT: usize = 256;
 const DEFAULT_RAR50_DICTIONARY_SIZE: u64 = 128 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

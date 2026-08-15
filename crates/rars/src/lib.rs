@@ -2569,7 +2569,7 @@ mod tests {
         let archive = ArchiveReader::read(&bytes).unwrap();
         let raw = archive.as_rar50().unwrap();
         let file = raw.files().next().unwrap();
-        assert_eq!(file.decoded_compression_info().unwrap().method, 1);
+        assert_eq!(file.decoded_compression_info().unwrap().method, 3);
         let extracted = collect_extract(&archive, None).unwrap();
         assert_eq!(
             extracted[0].data,
@@ -3365,7 +3365,7 @@ mod tests {
         let raw = archive.as_rar50().unwrap();
         let file = raw.files().next().unwrap();
         assert!(file.encrypted);
-        assert_eq!(file.decoded_compression_info().unwrap().method, 1);
+        assert_eq!(file.decoded_compression_info().unwrap().method, 3);
         let extracted = collect_extract(&archive, Some(b"password")).unwrap();
         assert_eq!(extracted[0].data, payload);
     }
@@ -3428,7 +3428,7 @@ mod tests {
         let raw = archive.as_rar50().unwrap();
         let file = raw.files().next().unwrap();
         assert!(file.encrypted);
-        assert_eq!(file.decoded_compression_info().unwrap().method, 1);
+        assert_eq!(file.decoded_compression_info().unwrap().method, 3);
         let extracted = collect_extract(&archive, None).unwrap();
         assert_eq!(
             extracted[0].data,

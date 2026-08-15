@@ -879,7 +879,7 @@ fn writes_delta_filtered_compressed_rar50_archive_that_reader_extracts() {
 
     let archive = Archive::parse(&bytes).unwrap();
     let file = archive.files().next().unwrap();
-    assert_eq!(file.decoded_compression_info().unwrap().method, 1);
+    assert_eq!(file.decoded_compression_info().unwrap().method, 3);
     let packed = file.packed_data(&archive).unwrap();
     let block = parse_compressed_block(&packed).unwrap();
     let (lengths, _) = read_table_lengths(&packed[block.payload], 0).unwrap();
@@ -1047,7 +1047,7 @@ fn writes_compressed_rar50_volume_set_that_reader_reassembles() {
     assert!(first.is_split_after());
     assert!(last.is_split_before());
     assert!(!last.is_split_after());
-    assert_eq!(last.decoded_compression_info().unwrap().method, 1);
+    assert_eq!(last.decoded_compression_info().unwrap().method, 3);
     assert!(last.hash.is_some());
 
     let extracted = collect_extract_volumes_with_password(&archives, Some(b"password")).unwrap();
@@ -2183,7 +2183,7 @@ fn writes_encrypted_compressed_rar50_archive_that_reader_extracts_with_password(
     let file = archive.files().next().unwrap();
     let second_file = second_archive.files().next().unwrap();
     assert!(file.encrypted);
-    assert_eq!(file.decoded_compression_info().unwrap().method, 1);
+    assert_eq!(file.decoded_compression_info().unwrap().method, 3);
     let encryption = file.encryption.as_ref().unwrap();
     let second_encryption = second_file.encryption.as_ref().unwrap();
     assert_ne!(encryption.salt, second_encryption.salt);
@@ -2552,7 +2552,7 @@ fn writes_header_encrypted_compressed_rar50_archive_that_reader_extracts_with_pa
     let archive = Archive::parse_with_password(&bytes, Some(b"password")).unwrap();
     let file = archive.files().next().unwrap();
     assert_eq!(file.name, b"header-compressed-secret.txt");
-    assert_eq!(file.decoded_compression_info().unwrap().method, 1);
+    assert_eq!(file.decoded_compression_info().unwrap().method, 3);
     assert!(file.encrypted);
     let extracted = collect_extract(&archive).unwrap();
     assert_eq!(extracted[0].data, entry_data(&entries[0]));
@@ -2989,7 +2989,7 @@ fn writes_encrypted_compressed_rar50_volume_set_that_reader_reassembles_with_pas
     let first = archives[0].files().next().unwrap();
     let second_first = second_archives[0].files().next().unwrap();
     assert!(first.encrypted);
-    assert_eq!(first.decoded_compression_info().unwrap().method, 1);
+    assert_eq!(first.decoded_compression_info().unwrap().method, 3);
     let encryption = first.encryption.as_ref().unwrap();
     let second_encryption = second_first.encryption.as_ref().unwrap();
     assert_ne!(encryption.salt, second_encryption.salt);
@@ -3148,7 +3148,7 @@ fn writes_header_encrypted_compressed_rar50_volume_set_that_reader_reassembles_w
         .collect();
     let first = archives[0].files().next().unwrap();
     assert!(first.encrypted);
-    assert_eq!(first.decoded_compression_info().unwrap().method, 1);
+    assert_eq!(first.decoded_compression_info().unwrap().method, 3);
 
     let extracted = collect_extract_volumes(&archives).unwrap();
     assert_eq!(extracted[0].name, b"split-header-secret-compressed50.txt");
