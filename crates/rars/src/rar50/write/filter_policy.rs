@@ -244,23 +244,44 @@ pub(super) fn compression_method_for_level(level: Option<u8>) -> Result<u8> {
     Ok(level)
 }
 
-/// The largest dictionary the writer picks on its own.
+/// The largest dictionary the writer picks on its own at each level.
 ///
-/// The format goes far higher and `--dict-size` still does, but the match
-/// finder walks longer hash chains as the window grows and the corpus stops
-/// paying for it: 128 KiB to 1 MiB takes 6.0% off and costs about twice the
-/// encode time, 1 MiB to 4 MiB takes another 1.1% off for two and a half times
-/// the time again, and 4 MiB to 16 MiB is worth 0.1%.
-const RAR50_FITTED_DICTIONARY_CAP: u64 = 1024 * 1024;
+/// The format goes far higher and `--dict-size` still does. What stops the
+/// writer reaching for it is that the hash chains lengthen with the window, so
+/// a wider one costs time that is not always repaid. How often it is repaid
+/// depends entirely on the data. Over 16 MiB of manpage text and 16 MiB of
+/// shared libraries at level 3:
+///
+///     dictionary       text     seconds        binary     seconds
+///          1 MiB  3,480,749         6.6     4,646,481        14.1
+///          2 MiB  2,223,009         8.1     4,590,488        25.3
+///          4 MiB  2,061,307        14.8     4,514,109        53.0
+///          8 MiB  2,043,138        21.7     4,505,410        83.2
+///         16 MiB  2,040,730        27.6     4,507,232       105.0
+///
+/// A 1 MiB cap costs text 41% and buys binaries most of their speed. One
+/// number cannot serve both, so the level picks, which is what a level is for.
+/// Text keeps paying up to about 8 MiB; binaries stop at 4 and are slightly
+/// worse by 16.
+fn fitted_dictionary_cap(level: u8) -> u64 {
+    let megabytes = match level {
+        0..=2 => 1,
+        3 => 4,
+        4 => 8,
+        _ => 16,
+    };
+    megabytes * 1024 * 1024
+}
 
 /// The smallest dictionary that still reaches past `content`.
 ///
 /// A window larger than the data cannot match anything extra, so a small member
 /// keeps a small window and stays as quick as it was. Sizes are the format's
 /// own: 128 KiB doubled.
-pub(super) fn fitted_dictionary_size(content: u64) -> u64 {
+pub(super) fn fitted_dictionary_size(content: u64, level: u8) -> u64 {
+    let cap = fitted_dictionary_cap(level);
     let mut size = DEFAULT_RAR50_DICTIONARY_SIZE;
-    while size < RAR50_FITTED_DICTIONARY_CAP && size <= content {
+    while size < cap && size <= content {
         size *= 2;
     }
     size
@@ -284,7 +305,8 @@ pub(super) fn dictionary_size_for_options(
     let size = match options.dictionary_size {
         Some(size) => size,
         None => {
-            let mut fitted = fitted_dictionary_size(content);
+            let mut fitted =
+                fitted_dictionary_size(content, resolved_level(options.compression_level));
             while fitted > DEFAULT_RAR50_DICTIONARY_SIZE
                 && super::streaming_lz_workspace(fitted, crate::codec::rar50::LZ_BLOCK_SIZE)
                     > memory_limit

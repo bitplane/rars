@@ -905,13 +905,37 @@ mod tests {
         assert_eq!(fitted(130_000), 128 * 1024);
         assert_eq!(fitted(200_000), 256 * 1024);
         assert_eq!(fitted(700_000), 1024 * 1024);
-        assert_eq!(fitted(64 * 1024 * 1024), 1024 * 1024);
+        assert_eq!(fitted(64 * 1024 * 1024), 4 * 1024 * 1024);
 
         // What the caller asked for stands, in both directions.
         assert_eq!(
             dictionary_size_for_options(options.with_dictionary_size(4 * 1024 * 1024), 0, u64::MAX)
                 .unwrap(),
             4 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn the_cap_on_a_fitted_dictionary_climbs_with_the_level() {
+        let plenty = 64 * 1024 * 1024;
+        let capped = |level: u8| {
+            let options = WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
+                .with_compression_level(level);
+            dictionary_size_for_options(options, plenty, u64::MAX).expect("a legal dictionary")
+        };
+
+        assert_eq!(capped(1), 1024 * 1024);
+        assert_eq!(capped(2), 1024 * 1024);
+        assert_eq!(capped(3), 4 * 1024 * 1024);
+        assert_eq!(capped(4), 8 * 1024 * 1024);
+        assert_eq!(capped(5), 16 * 1024 * 1024);
+
+        // An absent level is the default level, and picks the same window it
+        // would if the default had been spelled out.
+        let absent = WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only());
+        assert_eq!(
+            dictionary_size_for_options(absent, plenty, u64::MAX).unwrap(),
+            capped(3),
         );
     }
 
