@@ -562,32 +562,33 @@ fn source_integrity(
 /// What one compression job holds, for admitting jobs against the memory limit
 /// and for shrinking a fitted dictionary until it fits.
 ///
-/// Nearly all of it is the match finder's chain links: one `usize` per byte of
+/// Nearly all of it is the match finder's chain links: four bytes per byte of
 /// window, and the window is a power of two, so a dictionary just over one costs
 /// almost double the one just under. That rounding is why a flat multiple of the
 /// dictionary never described this well. It used to charge twelve times the
-/// dictionary, which is the middle of the eight-to-sixteen the rounding
-/// produces, so it over-charged a dictionary that was already a power of two and
+/// dictionary, which is the middle of the eight-to-sixteen the rounding then
+/// produced, so it over-charged a dictionary that was already a power of two and
 /// came close to under-charging one that had just crossed.
 ///
-/// Peak resident bytes for one member encode, over the member itself:
+/// Peak resident bytes for one member encode, over the member itself, taken on a
+/// 16 MiB member so every window is filled:
 ///
 ///     dictionary    measured    links alone
-///      256 KiB      3,584,000     2,097,152
-///        1 MiB     10,227,712     8,388,608
-///        3 MiB     35,901,440    33,554,432
-///        4 MiB     35,999,744    33,554,432
-///        8 MiB     70,246,400    67,108,864
+///      256 KiB      6,197,248     1,048,576
+///        1 MiB      9,170,944     4,194,304
+///        3 MiB     20,152,320    16,777,216
+///        4 MiB     20,234,240    16,777,216
+///        8 MiB     36,941,824    33,554,432
 ///
 /// The links account for the whole shape; what is left is the hash heads, the
 /// token buffer for one block, and the packed output. Three megabytes covers
-/// those with room to spare, and the ninth byte per window position absorbs the
+/// those with room to spare, and the fifth byte per window position absorbs the
 /// rest rather than pretending to predict it.
 fn streaming_lz_workspace(dictionary_size: u64, block_size: usize) -> u64 {
     dictionary_size
         .checked_next_power_of_two()
         .unwrap_or(dictionary_size)
-        .saturating_mul(9)
+        .saturating_mul(5)
         .saturating_add((block_size as u64).saturating_mul(64))
         .saturating_add(3 * 1024 * 1024)
 }
@@ -967,11 +968,11 @@ mod tests {
         // `/proc/self/status` VmHWM so the allocator could not be involved.
         // Anything that raises what the encoder holds has to move these too.
         let measured: [(u64, u64); 5] = [
-            (256 * 1024, 3_584_000),
-            (1024 * 1024, 10_227_712),
-            (3 * 1024 * 1024, 35_901_440),
-            (4 * 1024 * 1024, 35_999_744),
-            (8 * 1024 * 1024, 70_246_400),
+            (256 * 1024, 6_197_248),
+            (1024 * 1024, 9_170_944),
+            (3 * 1024 * 1024, 20_152_320),
+            (4 * 1024 * 1024, 20_234_240),
+            (8 * 1024 * 1024, 36_941_824),
         ];
         for (dictionary, peak) in measured {
             let charged = streaming_lz_workspace(dictionary, block);
