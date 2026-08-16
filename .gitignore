@@ -1,5 +1,6 @@
 target
 __pycache__/
+.rars-spool*
 
 .codex
 .claude
