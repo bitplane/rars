@@ -252,12 +252,14 @@ pub(super) fn compression_method_for_level(level: Option<u8>) -> Result<u8> {
 /// depends entirely on the data. Over 16 MiB of manpage text and 16 MiB of
 /// shared libraries at level 3:
 ///
-///     dictionary       text     seconds        binary     seconds
-///          1 MiB  3,480,749         6.6     4,646,481        14.1
-///          2 MiB  2,223,009         8.1     4,590,488        25.3
-///          4 MiB  2,061,307        14.8     4,514,109        53.0
-///          8 MiB  2,043,138        21.7     4,505,410        83.2
-///         16 MiB  2,040,730        27.6     4,507,232       105.0
+/// ```text
+/// dictionary       text     seconds        binary     seconds
+///      1 MiB  3,480,749         6.6     4,646,481        14.1
+///      2 MiB  2,223,009         8.1     4,590,488        25.3
+///      4 MiB  2,061,307        14.8     4,514,109        53.0
+///      8 MiB  2,043,138        21.7     4,505,410        83.2
+///     16 MiB  2,040,730        27.6     4,507,232       105.0
+/// ```
 ///
 /// A 1 MiB cap costs text 41% and buys binaries most of their speed. One
 /// number cannot serve both, so the level picks, which is what a level is for.
@@ -442,6 +444,10 @@ impl crate::filter_search::FilterSearch for Rar50Search {
             FilterKind::Delta { channels: 3 },
             FilterKind::Delta { channels: 4 },
         ]
+    }
+
+    fn max_delta_channels(&self) -> usize {
+        crate::codec::rar50::MAX_DELTA_CHANNELS
     }
 
     fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Vec<u8>> {

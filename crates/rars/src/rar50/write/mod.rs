@@ -573,12 +573,14 @@ fn source_integrity(
 /// Peak resident bytes for one member encode, over the member itself, taken on a
 /// 16 MiB member so every window is filled:
 ///
-///     dictionary    measured    links alone
-///      256 KiB      6,197,248     1,048,576
-///        1 MiB      9,170,944     4,194,304
-///        3 MiB     20,152,320    16,777,216
-///        4 MiB     20,234,240    16,777,216
-///        8 MiB     36,941,824    33,554,432
+/// ```text
+/// dictionary    measured    links alone
+///  256 KiB      6,197,248     1,048,576
+///    1 MiB      9,170,944     4,194,304
+///    3 MiB     20,152,320    16,777,216
+///    4 MiB     20,234,240    16,777,216
+///    8 MiB     36,941,824    33,554,432
+/// ```
 ///
 /// The links account for the whole shape; what is left is the hash heads, the
 /// token buffer for one block, and the packed output. Three megabytes covers

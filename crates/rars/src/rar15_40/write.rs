@@ -589,6 +589,13 @@ impl crate::filter_search::FilterSearch for Rar29Search {
         ranking
     }
 
+    /// The VM filter splits a range into blocks it can address, and a delta
+    /// block holds whole records, so the channel count is bounded by the block
+    /// rather than by a field width the way RAR 5's is.
+    fn max_delta_channels(&self) -> usize {
+        crate::codec::rar29::MAX_VM_DELTA_FILTER_BLOCK_SIZE
+    }
+
     fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Vec<u8>> {
         crate::codec::rar29::filtered_members(data, filters)
             .map(|filtered| filtered.data)

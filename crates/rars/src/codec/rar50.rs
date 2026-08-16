@@ -31,6 +31,9 @@ const MAX_COMPRESSED_BLOCK_OUTPUT: usize = 4 * 1024 * 1024;
 pub(crate) const LZ_BLOCK_SIZE: usize = 64 * 1024;
 const _: () = assert!(LZ_BLOCK_SIZE <= MAX_COMPRESSED_BLOCK_OUTPUT);
 const MAX_FILTER_BLOCK_LENGTH: usize = 0x3ffff;
+/// The most channels a RAR 5 delta filter record can name. The count is written
+/// as five bits biased by one, so this is what the format can say, not a policy.
+pub(crate) const MAX_DELTA_CHANNELS: usize = 32;
 /// How much input goes into one compressed block once a filter is carried.
 ///
 /// A filter record cannot describe more than [`MAX_FILTER_BLOCK_LENGTH`] bytes,
@@ -2653,7 +2656,7 @@ fn write_filter(writer: &mut BitWriter, filter: EncodeFilter) -> Result<()> {
     write_filter_data(writer, filter.length as u32);
     match filter.filter_type {
         FilterType::Delta => {
-            if filter.channels == 0 || filter.channels > 32 {
+            if filter.channels == 0 || filter.channels > MAX_DELTA_CHANNELS {
                 return Err(Error::InvalidData(
                     "RAR 5 DELTA filter channel count is invalid",
                 ));

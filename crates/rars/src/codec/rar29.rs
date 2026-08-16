@@ -18,7 +18,7 @@ const MAX_VM_FILTER_BLOCK_SIZE: usize = 128 * 1024;
 // The standard AUDIO bytecode uses separate input/output regions inside RARVM
 // memory. Keep generated blocks below the overlap boundary accepted by period
 // decoders.
-const MAX_VM_DELTA_FILTER_BLOCK_SIZE: usize = 120_000;
+pub(crate) const MAX_VM_DELTA_FILTER_BLOCK_SIZE: usize = 120_000;
 const MAX_VM_AUDIO_FILTER_BLOCK_SIZE: usize = 120_000;
 const MAX_VM_GLOBAL_DATA: usize = 0x2000;
 const MAX_VM_CODE_SIZE: usize = 64 * 1024;

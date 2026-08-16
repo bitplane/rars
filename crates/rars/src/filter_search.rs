@@ -7,13 +7,16 @@
 //! do not help.
 //!
 //! So the candidates are cut down before any whole-member encode happens.
-//! Filters with a structural detector behind them, which today means the x86
-//! pair, get their regions from the detector and a sample encode per region to
-//! confirm the detector was not fooled by chance byte patterns and to drop the
-//! regions where the filter would cost more than it saves. Filters with no
-//! detector are measured on a sample of the member and have to win by a clear
-//! margin to earn a whole-member encode. What survives is a handful of
-//! finalists, each encoded once at the caller's real settings, smallest wins.
+//! Filters with a structural detector behind them get their regions from the
+//! detector and a sample encode per region to confirm the detector was not
+//! fooled by chance byte patterns and to drop the regions where the filter
+//! would cost more than it saves. The x86 pair detect code by its opcodes; the
+//! table scanner detects arrays of fixed-size records by the stride they
+//! repeat at, and its regions become ranged delta filters at the record size.
+//! Filters with no detector are measured on a sample of the member and have to
+//! win by a clear margin to earn a whole-member encode. What survives is a
+//! handful of finalists, each encoded once at the caller's real settings,
+//! smallest wins.
 //!
 //! The unfiltered member is always one of the finalists, so the result can never
 //! be larger than leaving the data alone.
@@ -55,6 +58,48 @@ const X86_ASSUMED_REGIONS: u64 = 4;
 /// container headers and trailers are not part of the sampled signal.
 pub(crate) const AUTO_DELTA_EDGE_SKIP: usize = 64;
 
+/// How much of the member the table scanner judges at a time.
+///
+/// A window is the resolution of the region boundaries: a table loses at most
+/// one window at each end. Smaller windows find smaller tables and cost more
+/// scanning per member.
+const TABLE_SCAN_WINDOW: usize = 16 * 1024;
+
+/// The widest record stride the table scanner looks for.
+///
+/// This is the scanner's own ceiling, traded against what it costs: every extra
+/// stride is another comparison per byte of the member. What the *format* can
+/// encode is a separate question, answered by
+/// [`FilterSearch::max_delta_channels`], and the scan uses whichever is lower.
+const MAX_TABLE_STRIDE: usize = 32;
+
+/// How close a byte has to be to the one a stride back to count as part of the
+/// record structure. Not just equal: a field that creeps, like an address
+/// column, is exactly what delta flattens.
+const TABLE_STRIDE_NEAR: u8 = 2;
+
+/// How much of a window has to repeat at the winning stride before the window
+/// counts as table-like, as a percentage. Code and text sit well under half
+/// this at every stride; an array of structs sits well over it at the record
+/// size, because most fields barely change from one record to the next.
+const TABLE_STRIDE_HIT_PERCENT: usize = 40;
+
+/// How close to the best stride's score a shorter stride has to come to be
+/// preferred, as a percentage. An 8-byte record repeats at 16, 24 and 32 too,
+/// and the shortest period is the record size; the tolerance keeps noise from
+/// picking a harmonic.
+const TABLE_STRIDE_TIE_PERCENT: usize = 95;
+
+/// The smallest run of table-like windows worth a filter of its own.
+const MIN_TABLE_REGION: usize = 2 * TABLE_SCAN_WINDOW;
+
+/// How many table regions the progress estimate assumes the scanner will find.
+///
+/// Same reasoning as [`X86_ASSUMED_REGIONS`], and the same refusal to go and
+/// measure: the binaries this was built for have one or two, being a
+/// relocation table and sometimes a symbol table beside it.
+const TABLE_ASSUMED_REGIONS: u64 = 2;
+
 /// What a writer has to tell the search about its format.
 ///
 /// Implementors describe a format at fixed encoder settings and hold no state,
@@ -75,6 +120,15 @@ pub(crate) trait FilterSearch {
     fn detects_x86(&self) -> bool {
         true
     }
+
+    /// The most channels this format's delta filter can carry.
+    ///
+    /// The table scanner picks a stride from the data rather than from
+    /// [`FilterSearch::screened_kinds`], so this is how a format keeps it
+    /// inside what the writer can encode. Deliberately has no default: a
+    /// format that gets this wrong proposes a filter its own writer must then
+    /// refuse, and there is no safe guess to make on its behalf.
+    fn max_delta_channels(&self) -> usize;
 
     /// Cheaper settings for the screens, when ranking candidates at less than
     /// full effort ranks them the same way.
@@ -409,6 +463,148 @@ fn x86_finalists(data: &[u8], screen: &X86Screen) -> Vec<Vec<FilterSpec>> {
     finalists
 }
 
+/// The record stride this window repeats at, when it looks like an array of
+/// fixed-size records at all.
+///
+/// An array of structs repeats at its record size: most fields hold the same or
+/// a slowly moving value from one record to the next, so the byte one stride
+/// back predicts this one. Code and text have no such period. The score is how
+/// many bytes land within [`TABLE_STRIDE_NEAR`] of the byte a stride back,
+/// and the shortest stride within [`TABLE_STRIDE_TIE_PERCENT`] of the best
+/// wins, because a period repeats at its own multiples.
+fn table_stride(window: &[u8], max_stride: usize) -> Option<usize> {
+    if max_stride == 0 || window.len() < max_stride * 8 {
+        return None;
+    }
+    let mut hits = [0usize; MAX_TABLE_STRIDE + 1];
+    for index in max_stride..window.len() {
+        let byte = window[index];
+        for stride in 1..=max_stride {
+            let diff = (byte.wrapping_sub(window[index - stride]) as i8).unsigned_abs();
+            hits[stride] += usize::from(diff <= TABLE_STRIDE_NEAR);
+        }
+    }
+    let total = window.len() - max_stride;
+    let best = *hits[1..=max_stride]
+        .iter()
+        .max()
+        .expect("there is at least one stride");
+    if best * 100 < total * TABLE_STRIDE_HIT_PERCENT {
+        return None;
+    }
+    (1..=max_stride).find(|&stride| hits[stride] * 100 >= best * TABLE_STRIDE_TIE_PERCENT)
+}
+
+/// Where the member holds arrays of fixed-size records, each with the stride
+/// it repeats at.
+///
+/// This is what the whole-member delta screens cannot see: a relocation table
+/// is a few hundred kilobytes of 24-byte records inside a binary that delta
+/// with stride 24 nearly halves, while the same filter over the whole member
+/// is a disaster. On a 3.6 MB shared object the table packed to 32,767 bytes
+/// against 59,512 unfiltered; delta 24 over the whole member came out 85%
+/// *bigger* than no filter at all. The filter has to cover the table and stop.
+fn delta_table_regions(data: &[u8], max_stride: usize) -> Vec<(Range<usize>, usize)> {
+    let max_stride = max_stride.min(MAX_TABLE_STRIDE);
+    let mut regions: Vec<(Range<usize>, usize)> = Vec::new();
+    for start in (0..).map(|window| window * TABLE_SCAN_WINDOW) {
+        let Some(window) = data.get(start..start + TABLE_SCAN_WINDOW) else {
+            break;
+        };
+        let Some(stride) = table_stride(window, max_stride) else {
+            continue;
+        };
+        match regions.last_mut() {
+            Some((last, last_stride)) if *last_stride == stride && last.end == start => {
+                last.end = start + TABLE_SCAN_WINDOW;
+            }
+            _ => regions.push((start..start + TABLE_SCAN_WINDOW, stride)),
+        }
+    }
+    regions.retain(|(range, _)| range.len() >= MIN_TABLE_REGION);
+    regions
+}
+
+/// Which of the scanner's table regions the delta filter actually shrinks.
+///
+/// The scanner reads byte statistics, and repetition at a stride is also
+/// something the match finder can sometimes reach on its own; a run of
+/// constant bytes scores as a table at every stride and needs no filter at
+/// all. A sample encode inside the region separates the tables delta helps
+/// from the ones LZ was already handling, the same way the x86 screen checks
+/// its scanner.
+fn table_screened_regions<S: FilterSearch>(
+    search: &S,
+    data: &[u8],
+    regions: &[(Range<usize>, usize)],
+    options: S::Options,
+) -> Result<Vec<(Range<usize>, usize)>> {
+    let screen_options = search.screen_options(options);
+    let mut kept = Vec::new();
+    for (region, stride) in regions {
+        let sample = screen_sample(&data[region.clone()]);
+        if sample.len() < SCREEN_SAMPLE_ALIGNMENT {
+            continue;
+        }
+        let baseline = search.encode_plain(sample, screen_options, None)?;
+        let filters = [FilterSpec::whole(FilterKind::Delta { channels: *stride })];
+        let transformed = search.filtered_bytes(sample, &filters)?;
+        let filtered = search.encode_plain(&transformed, screen_options, None)?;
+        if screen_wins(filtered.len(), baseline.len()) {
+            kept.push((region.clone(), *stride));
+        }
+    }
+    Ok(kept)
+}
+
+/// `range` with the `removed` ranges cut out of it. `removed` must be sorted
+/// and disjoint.
+fn subtract_ranges(range: Range<usize>, removed: &[Range<usize>]) -> Vec<Range<usize>> {
+    let mut kept = Vec::new();
+    let mut start = range.start;
+    for cut in removed {
+        if cut.end <= start {
+            continue;
+        }
+        if cut.start >= range.end {
+            break;
+        }
+        if cut.start > start {
+            kept.push(start..cut.start);
+        }
+        start = start.max(cut.end);
+    }
+    if start < range.end {
+        kept.push(start..range.end);
+    }
+    kept
+}
+
+/// One candidate that filters each region of the member with what suits it:
+/// delta at the record stride over the tables, the x86 filter over the code
+/// the screen kept, nothing over the rest.
+///
+/// The tables win where the two overlap. A verified table stride is worth
+/// tens of percent of its region where the x86 filter is worth a few, and if
+/// trimming the code coverage was the wrong call, the x86-only finalists are
+/// still in the running to prove it.
+fn table_finalist(
+    tables: &[(Range<usize>, usize)],
+    code_regions: &[Range<usize>],
+) -> Vec<FilterSpec> {
+    let table_ranges: Vec<Range<usize>> = tables.iter().map(|(range, _)| range.clone()).collect();
+    let mut specs: Vec<FilterSpec> = code_regions
+        .iter()
+        .flat_map(|region| subtract_ranges(region.clone(), &table_ranges))
+        .map(|range| FilterSpec::range(FilterKind::E8E9, range))
+        .collect();
+    specs.extend(tables.iter().map(|(range, stride)| {
+        FilterSpec::range(FilterKind::Delta { channels: *stride }, range.clone())
+    }));
+    specs.sort_by_key(|spec| spec.range.as_ref().map_or(0, |range| range.start));
+    specs
+}
+
 /// The filter specs worth measuring against the whole member, paired with the
 /// bytes for any the screen already measured.
 ///
@@ -424,15 +620,23 @@ fn finalists<S: FilterSearch>(
     let screen = screen_kinds(search, data, options)?;
     let mut finalists = vec![(Vec::new(), screen.plain)];
 
+    let mut code_regions = Vec::new();
     if search.detects_x86() {
         let screen = x86_screened_regions(search, data, &x86_code_regions(data), options)?;
         if !screen.kept.is_empty() {
+            code_regions.clone_from(&screen.kept);
             finalists.extend(
                 x86_finalists(data, &screen)
                     .into_iter()
                     .map(|specs| (specs, None)),
             );
         }
+    }
+
+    let table_regions = delta_table_regions(data, search.max_delta_channels());
+    let tables = table_screened_regions(search, data, &table_regions, options)?;
+    if !tables.is_empty() {
+        finalists.push((table_finalist(&tables, &code_regions), None));
     }
 
     for screened in screen.kinds {
@@ -512,17 +716,22 @@ pub(crate) fn walk_bytes<S: FilterSearch>(
     } else {
         (0, 0)
     };
-    let screen = sample * (screened + 1) + x86_screen;
-    // The unfiltered member, the x86 finalists, and one assumed screen survivor.
-    // When the sample is the whole member the screen encodes it the way the
-    // writer would, so both of those are already counted in `screen`. That reads
-    // the sample rather than asking whether this format screens at full effort,
-    // which needs the caller's settings; RAR 5 is the only format that reports
-    // progress through here and it always does.
+    // And two more per table region, on the same assumption and with the same
+    // bound. The table candidate is always a whole-member encode of its own: it
+    // filters several regions at once, so no screen can have measured it.
+    let table_screen = (sample * TABLE_ASSUMED_REGIONS).min(member) * 2;
+    let screen = sample * (screened + 1) + x86_screen + table_screen;
+    // The unfiltered member, the x86 finalists, the table candidate, and one
+    // assumed screen survivor. When the sample is the whole member the screen
+    // encodes it the way the writer would, so the unfiltered member and the
+    // survivor are already counted in `screen`. That reads the sample rather
+    // than asking whether this format screens at full effort, which needs the
+    // caller's settings; RAR 5 is the only format that reports progress through
+    // here and it always does.
     let finalists = if sample == member {
-        x86_finalists
+        x86_finalists + 1
     } else {
-        2 + x86_finalists
+        3 + x86_finalists
     };
     screen + member * (finalists + encoder_candidates - 1)
 }
@@ -586,6 +795,10 @@ mod tests {
                 FilterKind::Delta { channels: 3 },
                 FilterKind::Delta { channels: 4 },
             ]
+        }
+
+        fn max_delta_channels(&self) -> usize {
+            crate::codec::rar50::MAX_DELTA_CHANNELS
         }
 
         fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Vec<u8>> {
@@ -934,6 +1147,185 @@ mod tests {
             plain.len()
         );
         assert!(packed.len() * 100 < plain.len() * 97);
+    }
+
+    /// A relocation table in miniature: 24-byte records of three 8-byte fields
+    /// that creep or repeat from one record to the next. What makes it a filter
+    /// case is that the creeping fields never repeat exactly, so the match
+    /// finder gets nothing, while their stride-24 differences are constants.
+    fn reloc_table(records: usize) -> Vec<u8> {
+        let mut data = Vec::with_capacity(records * 24);
+        for index in 0..records as u64 {
+            data.extend_from_slice(&(0x7f80_1234_0000 + index * 24).to_le_bytes());
+            data.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+            data.extend_from_slice(&(0x4455_6677_0000 | ((index * 7) & 0xffff)).to_le_bytes());
+        }
+        data
+    }
+
+    #[test]
+    fn a_struct_table_scans_as_its_record_stride() {
+        let data = reloc_table(20_000);
+        let regions = delta_table_regions(&data, MAX_TABLE_STRIDE);
+        assert_eq!(regions.len(), 1, "{regions:?}");
+        let (region, stride) = &regions[0];
+        assert_eq!(*stride, 24, "the record size is the shortest true period");
+        assert!(
+            region.len() * 10 >= data.len() * 9,
+            "the region has to cover the table: {region:?} of {}",
+            data.len()
+        );
+    }
+
+    #[test]
+    fn text_and_random_bytes_do_not_scan_as_tables() {
+        for data in [
+            b"the quick brown fox jumps over the lazy dog ".repeat(6_000),
+            incompressible(256 * 1024),
+        ] {
+            assert_eq!(
+                delta_table_regions(&data, MAX_TABLE_STRIDE),
+                vec![],
+                "{} bytes",
+                data.len()
+            );
+        }
+    }
+
+    /// x86 instructions are variable length, so code has no byte period for the
+    /// scanner to lock onto. [`calls_to_fixed_addresses`] is no use for proving
+    /// that: it emits a fixed 16-byte unit, which really is a record array as
+    /// far as any stride test can tell. This mixes instruction lengths the way
+    /// a compiler does, so a false table here would be a false table on a real
+    /// `.text`.
+    fn variable_length_code(len: usize) -> Vec<u8> {
+        const INSTRUCTIONS: [&[u8]; 7] = [
+            &[0x55],                                     // push rbp
+            &[0x48, 0x89, 0xe5],                         // mov rbp, rsp
+            &[0x8b, 0x45, 0xfc],                         // mov eax, [rbp-4]
+            &[0x48, 0x83, 0xec, 0x20],                   // sub rsp, 32
+            &[0x0f, 0xb6, 0x54, 0x18, 0x01],             // movzx edx, [rax+rbx+1]
+            &[0x48, 0x8d, 0x35, 0x12, 0x00, 0x00, 0x00], // lea rsi, [rip+18]
+            &[0x66, 0x0f, 0x1f, 0x84, 0x00, 0, 0, 0, 0], // nop word [rax+rax]
+        ];
+        let mut state = 0x2545_f491u32;
+        let mut data = Vec::with_capacity(len);
+        while data.len() < len {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            data.extend_from_slice(INSTRUCTIONS[(state >> 27) as usize % INSTRUCTIONS.len()]);
+        }
+        data.truncate(len);
+        data
+    }
+
+    #[test]
+    fn real_shaped_code_does_not_scan_as_a_table() {
+        let data = variable_length_code(256 * 1024);
+        assert_eq!(
+            delta_table_regions(&data, MAX_TABLE_STRIDE),
+            vec![],
+            "variable-length instructions have no record stride to find"
+        );
+    }
+
+    /// And the property that actually matters: even where the scanner does fire
+    /// on code, nothing reaches the encoder unless a sample encode agrees.
+    #[test]
+    fn code_never_reaches_the_encoder_as_a_delta_candidate() {
+        for data in [
+            variable_length_code(256 * 1024),
+            calls_to_fixed_addresses(256 * 1024),
+        ] {
+            let regions = delta_table_regions(&data, MAX_TABLE_STRIDE);
+            assert_eq!(
+                table_screened_regions(&FULL, &data, &regions, options()).unwrap(),
+                vec![],
+                "the screen let a delta filter onto code: {regions:?}"
+            );
+        }
+    }
+
+    /// A format that cannot encode a wide delta must never be handed one. The
+    /// scan is bounded by what the writer can say, not only by the data.
+    #[test]
+    fn the_scan_stays_inside_what_the_format_can_encode() {
+        let data = reloc_table(20_000);
+        assert_eq!(delta_table_regions(&data, MAX_TABLE_STRIDE)[0].1, 24);
+        for (region, stride) in delta_table_regions(&data, 8) {
+            assert!(stride <= 8, "{region:?} asked for {stride} channels");
+        }
+        assert_eq!(delta_table_regions(&data, 0), vec![]);
+    }
+
+    /// Constant bytes repeat at every stride, so the scanner calls them a
+    /// table, but the encoder handles a run perfectly well on its own. The
+    /// sample encode is what stops a useless filter there.
+    #[test]
+    fn a_run_of_constant_bytes_screens_out_of_the_table_regions() {
+        let data = vec![0u8; 200 * 1024];
+        let regions = delta_table_regions(&data, MAX_TABLE_STRIDE);
+        assert!(!regions.is_empty(), "the scanner sees repetition in a run");
+        assert_eq!(
+            table_screened_regions(&FULL, &data, &regions, options()).unwrap(),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn subtracting_ranges_cuts_the_tables_out_of_the_code() {
+        assert_eq!(
+            subtract_ranges(0..1000, &[200..300, 600..700]),
+            vec![0..200, 300..600, 700..1000]
+        );
+        assert_eq!(
+            subtract_ranges(100..200, &[0..250, 300..400]),
+            Vec::<Range<usize>>::new()
+        );
+        assert_eq!(
+            subtract_ranges(100..200, &[0..50, 300..400]),
+            vec![100..200]
+        );
+        assert_eq!(
+            subtract_ranges(100..200, &[150..400, 500..600]),
+            vec![100..150]
+        );
+    }
+
+    /// The point of the whole scanner: a binary with a table in it comes out
+    /// with delta at the record stride over the table, and only there.
+    #[test]
+    fn the_search_deltas_the_table_inside_a_binary() {
+        let code_len = 132 * 1024;
+        let mut data = calls_to_fixed_addresses(code_len);
+        let table_start = data.len();
+        data.extend_from_slice(&reloc_table(20_000));
+
+        let plain = FULL.encode_plain(&data, options(), None).unwrap();
+        let (specs, packed) = choose_filter(&FULL, &data, options(), None).unwrap();
+
+        let delta = specs
+            .iter()
+            .find(|spec| matches!(spec.kind, FilterKind::Delta { channels: 24 }))
+            .unwrap_or_else(|| panic!("no stride-24 delta among {specs:?}"));
+        let range = delta.range.clone().expect("the table filter is ranged");
+        assert!(
+            range.start >= table_start.saturating_sub(TABLE_SCAN_WINDOW)
+                && range.start < table_start + TABLE_SCAN_WINDOW,
+            "the filter starts at the table, not the code: {range:?} against {table_start}"
+        );
+        for spec in &specs {
+            let other = spec.range.clone().expect("every spec here is ranged");
+            assert!(
+                spec == delta || other.end <= range.start || other.start >= range.end,
+                "{specs:?} overlap"
+            );
+        }
+        assert!(
+            packed.len() * 100 < plain.len() * 90,
+            "the table filter is worth a lot more than this: {} against {}",
+            packed.len(),
+            plain.len()
+        );
     }
 
     #[test]
