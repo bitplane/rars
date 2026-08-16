@@ -580,29 +580,39 @@ fn subtract_ranges(range: Range<usize>, removed: &[Range<usize>]) -> Vec<Range<u
     kept
 }
 
-/// One candidate that filters each region of the member with what suits it:
-/// delta at the record stride over the tables, the x86 filter over the code
-/// the screen kept, nothing over the rest.
+/// A finalist with the screened tables riding along: the table ranges are cut
+/// out of whatever the specs covered, and delta at the record stride takes
+/// their place. Empty specs come out as a tables-only candidate.
 ///
 /// The tables win where the two overlap. A verified table stride is worth
-/// tens of percent of its region where the x86 filter is worth a few, and if
-/// trimming the code coverage was the wrong call, the x86-only finalists are
-/// still in the running to prove it.
-fn table_finalist(
+/// tens of percent of its region where the x86 filter is worth a few. This
+/// used to build one bundled candidate that competed with the x86 finalists
+/// instead, and on an unstripped binary the x86-only finalist won, taking the
+/// tables down with the debug data they were bundled against. Grafting the
+/// tables into every finalist lets them ride with whichever x86 variant wins.
+fn graft_tables(
+    specs: Vec<FilterSpec>,
     tables: &[(Range<usize>, usize)],
-    code_regions: &[Range<usize>],
+    member: usize,
 ) -> Vec<FilterSpec> {
+    if tables.is_empty() {
+        return specs;
+    }
     let table_ranges: Vec<Range<usize>> = tables.iter().map(|(range, _)| range.clone()).collect();
-    let mut specs: Vec<FilterSpec> = code_regions
-        .iter()
-        .flat_map(|region| subtract_ranges(region.clone(), &table_ranges))
-        .map(|range| FilterSpec::range(FilterKind::E8E9, range))
+    let mut grafted: Vec<FilterSpec> = specs
+        .into_iter()
+        .flat_map(|spec| {
+            let covered = spec.range.clone().unwrap_or(0..member);
+            subtract_ranges(covered, &table_ranges)
+                .into_iter()
+                .map(move |range| FilterSpec::range(spec.kind, range))
+        })
         .collect();
-    specs.extend(tables.iter().map(|(range, stride)| {
+    grafted.extend(tables.iter().map(|(range, stride)| {
         FilterSpec::range(FilterKind::Delta { channels: *stride }, range.clone())
     }));
-    specs.sort_by_key(|spec| spec.range.as_ref().map_or(0, |range| range.start));
-    specs
+    grafted.sort_by_key(|spec| spec.range.as_ref().map_or(0, |range| range.start));
+    grafted
 }
 
 /// The filter specs worth measuring against the whole member, paired with the
@@ -620,23 +630,27 @@ fn finalists<S: FilterSearch>(
     let screen = screen_kinds(search, data, options)?;
     let mut finalists = vec![(Vec::new(), screen.plain)];
 
-    let mut code_regions = Vec::new();
+    let table_regions = delta_table_regions(data, search.max_delta_channels());
+    let tables = table_screened_regions(search, data, &table_regions, options)?;
+
+    // The tables graft into every x86 finalist rather than competing against
+    // them, so when the x86 screen kept anything they cost no encode of their
+    // own. Only a member with tables and no code pays for a tables-only
+    // candidate.
+    let mut tables_carried = false;
     if search.detects_x86() {
         let screen = x86_screened_regions(search, data, &x86_code_regions(data), options)?;
         if !screen.kept.is_empty() {
-            code_regions.clone_from(&screen.kept);
+            tables_carried = !tables.is_empty();
             finalists.extend(
                 x86_finalists(data, &screen)
                     .into_iter()
-                    .map(|specs| (specs, None)),
+                    .map(|specs| (graft_tables(specs, &tables, data.len()), None)),
             );
         }
     }
-
-    let table_regions = delta_table_regions(data, search.max_delta_channels());
-    let tables = table_screened_regions(search, data, &table_regions, options)?;
-    if !tables.is_empty() {
-        finalists.push((table_finalist(&tables, &code_regions), None));
+    if !tables.is_empty() && !tables_carried {
+        finalists.push((graft_tables(Vec::new(), &tables, data.len()), None));
     }
 
     for screened in screen.kinds {
@@ -717,21 +731,22 @@ pub(crate) fn walk_bytes<S: FilterSearch>(
         (0, 0)
     };
     // And two more per table region, on the same assumption and with the same
-    // bound. The table candidate is always a whole-member encode of its own: it
-    // filters several regions at once, so no screen can have measured it.
+    // bound. Tables graft into the x86 finalists rather than earning an encode
+    // of their own, and this already assumes the detector finds code, so they
+    // add nothing beyond their screens here.
     let table_screen = (sample * TABLE_ASSUMED_REGIONS).min(member) * 2;
     let screen = sample * (screened + 1) + x86_screen + table_screen;
-    // The unfiltered member, the x86 finalists, the table candidate, and one
-    // assumed screen survivor. When the sample is the whole member the screen
-    // encodes it the way the writer would, so the unfiltered member and the
-    // survivor are already counted in `screen`. That reads the sample rather
-    // than asking whether this format screens at full effort, which needs the
-    // caller's settings; RAR 5 is the only format that reports progress through
-    // here and it always does.
+    // The unfiltered member, the x86 finalists, and one assumed screen
+    // survivor. When the sample is the whole member the screen encodes it the
+    // way the writer would, so the unfiltered member and the survivor are
+    // already counted in `screen`. That reads the sample rather than asking
+    // whether this format screens at full effort, which needs the caller's
+    // settings; RAR 5 is the only format that reports progress through here
+    // and it always does.
     let finalists = if sample == member {
-        x86_finalists + 1
+        x86_finalists
     } else {
-        3 + x86_finalists
+        2 + x86_finalists
     };
     screen + member * (finalists + encoder_candidates - 1)
 }
@@ -1325,6 +1340,61 @@ mod tests {
             "the table filter is worth a lot more than this: {} against {}",
             packed.len(),
             plain.len()
+        );
+    }
+
+    #[test]
+    fn grafting_cuts_the_tables_out_of_whatever_the_specs_covered() {
+        let tables = [(200..300, 24), (600..700, 8)];
+        assert_eq!(
+            graft_tables(vec![FilterSpec::whole(FilterKind::E8E9)], &tables, 1000),
+            vec![
+                FilterSpec::range(FilterKind::E8E9, 0..200),
+                FilterSpec::range(FilterKind::Delta { channels: 24 }, 200..300),
+                FilterSpec::range(FilterKind::E8E9, 300..600),
+                FilterSpec::range(FilterKind::Delta { channels: 8 }, 600..700),
+                FilterSpec::range(FilterKind::E8E9, 700..1000),
+            ]
+        );
+        assert_eq!(
+            graft_tables(Vec::new(), &tables[..1], 1000),
+            vec![FilterSpec::range(
+                FilterKind::Delta { channels: 24 },
+                200..300
+            )]
+        );
+        let code_only = vec![FilterSpec::range(FilterKind::E8, 0..100)];
+        assert_eq!(graft_tables(code_only.clone(), &[], 1000), code_only);
+    }
+
+    /// The member this change exists for: an unstripped binary with a
+    /// relocation table in it. The bundled candidate this replaces lost to the
+    /// x86-only finalist here, because it carried the tables and the trimmed
+    /// code coverage as one bet, and the table went unfiltered with it.
+    #[test]
+    fn the_winner_filters_the_code_and_deltas_the_table_in_one_member() {
+        let (mut data, code_len) = code_then_debug();
+        let table_start = data.len();
+        data.extend_from_slice(&reloc_table(20_000));
+
+        let (specs, _) = choose_filter(&FULL, &data, options(), None).unwrap();
+        let filters_the_code = specs.iter().any(|spec| {
+            matches!(spec.kind, FilterKind::E8 | FilterKind::E8E9)
+                && spec
+                    .range
+                    .as_ref()
+                    .is_some_and(|range| range.start < code_len)
+        });
+        let deltas_the_table = specs.iter().any(|spec| {
+            matches!(spec.kind, FilterKind::Delta { channels: 24 })
+                && spec
+                    .range
+                    .as_ref()
+                    .is_some_and(|range| range.start >= table_start - TABLE_SCAN_WINDOW)
+        });
+        assert!(
+            filters_the_code && deltas_the_table,
+            "one of the two regions went unfiltered: {specs:?}"
         );
     }
 
