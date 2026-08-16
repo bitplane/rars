@@ -1430,9 +1430,12 @@ impl TokenPrices<'_> {
 /// bytes.
 ///
 /// The repeated-distance discount depends on the path taken, which a forward
-/// pass does not know. Each node carries the match that arrives at it and
-/// prices the next hop against that one distance, which catches
-/// same-distance runs and misses the deeper three slots.
+/// pass does not know. Each node carries the whole four-slot distance memory
+/// the cheapest path to it leaves behind, so the next hop is priced against
+/// what that path would really have remembered. Two paths reaching one node
+/// with different memories still collapse into whichever was cheaper, so this
+/// stays an approximation, just a far closer one than carrying the arriving
+/// match alone.
 /// Builds its own finder rather than sharing the member's, because it walks the
 /// block more than once and a shared one cannot be rewound. Seeding a finder
 /// with one window of history costs less than the alternative: inserting the
@@ -1453,6 +1456,12 @@ fn optimal_tokens(
     let mut price = vec![u32::MAX; span + 1];
     let mut arrive_length = vec![0u32; span + 1];
     let mut arrive_distance = vec![0u32; span + 1];
+    // The encoder state the cheapest path leaves behind at each node, which is
+    // what the next hop is priced against. Carrying only the arriving match
+    // meant a literal wiped the remembered distances, so a stream that
+    // alternates literals and matches could never price a repeat at all.
+    let mut arrive_reps = vec![[0u32; 4]; span + 1];
+    let mut arrive_last_length = vec![0u32; span + 1];
     price[0] = 0;
 
     // Runs of `(shortest, longest, distance)` from the position being priced,
@@ -1474,6 +1483,10 @@ fn optimal_tokens(
             price[index + 1] = literal;
             arrive_length[index + 1] = 0;
             arrive_distance[index + 1] = 0;
+            // A literal emits no distance, so it leaves the remembered ones
+            // exactly as it found them.
+            arrive_reps[index + 1] = arrive_reps[index];
+            arrive_last_length[index + 1] = arrive_last_length[index];
         }
 
         let max_distance = pos.min(options.max_match_distance);
@@ -1482,15 +1495,32 @@ fn optimal_tokens(
             continue;
         }
 
-        let mut state = EncoderMatchState::default();
-        state.reps[0] = arrive_distance[index] as usize;
-        state.last_length = arrive_length[index] as usize;
+        let state = EncoderMatchState {
+            reps: arrive_reps[index].map(|distance| distance as usize),
+            last_length: arrive_last_length[index] as usize,
+        };
+
+        reaches.clear();
+        let mut longest = 0usize;
+
+        // A match at a remembered distance is priced out of the main table
+        // alone, a handful of bits against twenty for a fresh distance, so it
+        // earns its place even when it is shorter than anything the chain will
+        // turn up. The chain only reports a candidate that beats the longest
+        // found so far, so these have to be asked for separately.
+        for repeat in state.reps {
+            if repeat == 0 || repeat > max_distance {
+                continue;
+            }
+            let length = match_length(combined, pos, repeat, max_length);
+            if length >= 4 {
+                reaches.push((4, length, repeat));
+            }
+        }
 
         // The chain walks nearest first, so the first distance to reach a
         // length is the cheapest one that can. Each step that improves on the
         // longest so far owns one run of lengths.
-        reaches.clear();
-        let mut longest = 0usize;
         let mut checked = 0usize;
         let mut candidate = finder.first(combined, pos);
         while candidate != match_finder::NO_POSITION
@@ -1539,6 +1569,10 @@ fn optimal_tokens(
                         price[target] = reached;
                         arrive_length[target] = reach as u32;
                         arrive_distance[target] = distance as u32;
+                        let mut next = state;
+                        next.remember(reach, distance);
+                        arrive_reps[target] = next.reps.map(|distance| distance as u32);
+                        arrive_last_length[target] = next.last_length as u32;
                     }
                 }
                 length = reach + 1;
@@ -4124,6 +4158,72 @@ mod tests {
             optimal.len(),
             lazy.len(),
         );
+    }
+
+    /// One chunk, copied once per round with fresh literals in between, so
+    /// every match after the first sits at the same distance and every one of
+    /// them is separated from the last by literals.
+    fn strided_repeats(gap: usize, rounds: usize) -> Vec<u8> {
+        let mut noise = 0x1234_5678u32;
+        let mut byte = move || {
+            noise = noise.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (noise >> 24) as u8
+        };
+        let chunk: Vec<u8> = (0..48).map(|_| byte()).collect();
+        let mut data = chunk.clone();
+        for _ in 0..rounds {
+            data.extend((0..gap).map(|_| byte()));
+            data.extend_from_slice(&chunk);
+        }
+        data
+    }
+
+    #[test]
+    fn the_optimal_parse_reuses_a_distance_across_the_literals_between_matches() {
+        let data = strided_repeats(8, 3000);
+        let options = EncodeOptions::new(64).with_optimal_parse(true);
+        let distance_size = DISTANCE_TABLE_SIZE_50;
+        let tokens = optimal_tokens(&data, 0..data.len(), options, distance_size, None).unwrap();
+
+        let mut state = EncoderMatchState::default();
+        let (mut repeated, mut fresh) = (0, 0);
+        for token in &tokens {
+            if let EncodeToken::Match { length, distance } = *token {
+                match state.encode_match(length, distance, distance_size).unwrap() {
+                    EncodedMatch::New { .. } => fresh += 1,
+                    _ => repeated += 1,
+                }
+                state.remember(length, distance);
+            }
+        }
+
+        // Every match here is at the one distance the data repeats at, so all
+        // but the first should be priced against what the path remembers.
+        // Carrying only the arriving match instead left this at 244 repeated
+        // against 2,756 fresh, because a literal wiped the distance before the
+        // next match could be priced against it.
+        assert!(
+            fresh * 10 < repeated,
+            "{repeated} matches reused a distance against {fresh} that did not",
+        );
+    }
+
+    #[test]
+    fn reusing_a_remembered_distance_packs_strided_data_smaller() {
+        let data = strided_repeats(8, 3000);
+        let options = EncodeOptions::new(64).with_optimal_parse(true);
+        let packed = encode_lz_member_with_options(&data, 0, options).unwrap();
+
+        // 26,178 bytes when the path carries its remembered distances, 28,447
+        // when it does not. The bound sits between the two.
+        assert!(
+            packed.len() < 27_000,
+            "{} bytes packed from {}",
+            packed.len(),
+            data.len(),
+        );
+        let decoded = decode_lz(&packed, 0, data.len()).unwrap();
+        assert_eq!(decoded, data);
     }
 
     #[test]
