@@ -47,6 +47,22 @@ const FILTERED_LZ_BLOCK_SIZE: usize = if LZ_BLOCK_SIZE < MAX_FILTER_BLOCK_LENGTH
 } else {
     MAX_FILTER_BLOCK_LENGTH
 };
+/// Where the encoder stops looking for anything better.
+///
+/// A chain walk that has reached this far ends, and the optimal parse takes the
+/// match and steps over the bytes it covers instead of pricing each of them. The
+/// second half matters more than it sounds. The parse prices every position in a
+/// block, because a cheaper path can arrive at any of them, so without it a
+/// 4 KiB match gets confirmed at all 4096 of its positions to learn what the
+/// first one already said. On a mebibyte that repeats, that cost level 5
+/// fifty-three seconds to save four bytes over level 3.
+///
+/// 512 is where committing is free. On a mebibyte of source at level 5 it packs
+/// two bytes smaller than pricing every position and finishes in 7.08s rather
+/// than 7.31s, and the repeating mebibyte drops to 1.19s. Committing sooner does
+/// buy time, and it is not worth it: at 128 the source packs 0.16% larger for
+/// 1.2x, at 64 it packs 0.47% larger for 1.5x, and neither closes the distance
+/// to WinRAR.
 const NICE_MATCH_LENGTH: usize = 512;
 
 /// Matches shorter than 4 bytes are never emitted, so candidate positions are
@@ -1438,7 +1454,9 @@ impl TokenPrices<'_> {
 /// what that path would really have remembered. Two paths reaching one node
 /// with different memories still collapse into whichever was cheaper, so this
 /// stays an approximation, just a far closer one than carrying the arriving
-/// match alone.
+/// match alone. It is also not quite every path: once a match reaches
+/// [`NICE_MATCH_LENGTH`] the parse takes it and steps over the bytes it covers
+/// rather than pricing each of them.
 /// Builds its own finder rather than sharing the member's, because it walks the
 /// block more than once and a shared one cannot be rewound. Seeding a finder
 /// with one window of history costs less than the alternative: inserting the
@@ -1470,10 +1488,17 @@ fn optimal_tokens(
     // Runs of `(shortest, longest, distance)` from the position being priced,
     // in the order the chain found them. Reused to keep one allocation.
     let mut reaches: Vec<(usize, usize, usize)> = Vec::new();
+    // The first position past a match the parse committed to. Positions before
+    // it still go into the finder, so later ones can match against them, but
+    // nothing is priced from them. See [`NICE_MATCH_LENGTH`].
+    let mut committed_through = 0usize;
 
     for index in 0..span {
         let pos = start + index;
         finder.insert(combined, pos);
+        if index < committed_through {
+            continue;
+        }
         let here = price[index];
         if here == u32::MAX {
             continue;
@@ -1579,6 +1604,19 @@ fn optimal_tokens(
                     }
                 }
                 length = reach + 1;
+            }
+        }
+
+        // The loop above has priced every run to its end, so the longest match
+        // here is already on the board. If it is long enough to commit to,
+        // stepping over the bytes it covers changes nothing except the work not
+        // done. Only step over a node the parse can actually reach: pricing a
+        // match can fail, and skipping to a node no path arrives at would leave
+        // the rest of the block unreachable and emitted as literals.
+        let longest_reach = reaches.iter().map(|&(_, length, _)| length).max();
+        if let Some(reach) = longest_reach {
+            if reach >= NICE_MATCH_LENGTH && price[index + reach] != u32::MAX {
+                committed_through = index + reach;
             }
         }
     }
@@ -4227,6 +4265,43 @@ mod tests {
         );
         let decoded = decode_lz(&packed, 0, data.len()).unwrap();
         assert_eq!(decoded, data);
+    }
+
+    /// Once the parse commits to a match it steps over the bytes that match
+    /// covers, so a block that repeats is emitted as whole matches back to back
+    /// rather than as the cheapest split of each one. That is the difference
+    /// between the parse pricing 4096 positions per match and pricing one, which
+    /// is worth 53.41s against 1.19s on a mebibyte of this.
+    #[test]
+    fn the_optimal_parse_steps_over_a_match_it_has_committed_to() {
+        let block: Vec<u8> = (0..4096u32)
+            .map(|index| (index * 7 + (index >> 5)) as u8)
+            .collect();
+        let data = block.repeat(16);
+        let options = EncodeOptions::new(64).with_optimal_parse(true);
+        let tokens =
+            optimal_tokens(&data, 0..data.len(), options, DISTANCE_TABLE_SIZE_50, None).unwrap();
+
+        let first = tokens
+            .iter()
+            .position(|token| {
+                matches!(token, EncodeToken::Match { length, .. } if *length >= NICE_MATCH_LENGTH)
+            })
+            .expect("no match reached the length the parse commits at");
+        for token in &tokens[first..] {
+            let EncodeToken::Match { length, .. } = *token else {
+                panic!("{token:?} interrupts the committed matches");
+            };
+            assert!(
+                length >= NICE_MATCH_LENGTH,
+                "a {length}-byte match interrupts the committed ones",
+            );
+        }
+        // The first block is the only one with nothing behind it to match.
+        assert_eq!(tokens.len() - first, data.len() / block.len() - 1);
+
+        let packed = encode_lz_member_with_options(&data, 0, options).unwrap();
+        assert_eq!(decode_lz(&packed, 0, data.len()).unwrap(), data);
     }
 
     #[test]
