@@ -8,6 +8,14 @@ check:
     cargo clippy --all-targets -- -D warnings
     cargo test --workspace --all-targets --locked
 
+# A minute of timings over three kinds of data, before and after anything that
+# touches the encoder. A ratio sweep takes an hour and says nothing about speed;
+# this says how long a megabyte costs at each level. Add --decompose to split
+# level 5 into its parse and its re-encodes.
+speed *ARGS:
+    cargo build --release
+    python3 scripts/speed.py {{ ARGS }}
+
 # Build the Python extension into a throwaway virtualenv and run python/tests
 # against it. Separate from `check` because it compiles the extension and needs
 # to fetch maturin and pytest; `gate` runs it.
