@@ -49,7 +49,8 @@ const FILTERED_LZ_BLOCK_SIZE: usize = if LZ_BLOCK_SIZE < MAX_FILTER_BLOCK_LENGTH
 };
 /// Where the encoder stops looking for anything better.
 ///
-/// A chain walk that has reached this far ends, and the optimal parse takes the
+/// A search that has reached this far ends, whether it is a chain walk or a
+/// tree descent, and the optimal parse takes the
 /// match and steps over the bytes it covers instead of pricing each of them. The
 /// second half matters more than it sounds. The parse prices every position in a
 /// block, because a cheaper path can arrive at any of them, so without it a
@@ -872,12 +873,16 @@ fn encode_lz_member_inner(
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<u8>> {
     if data.len() > LZ_BLOCK_SIZE && initial_filters.is_empty() {
-        // One finder for the whole member. It used to be built per block, which
-        // meant rehashing a window of history every 64 KiB: on a 16 MiB member
-        // that was half the encode. The optimal parse cannot share it, because
-        // it walks each block more than once, so it keeps its own.
+        // One search state for the whole member. It used to be built per
+        // block, which meant rehashing a window of history every 64 KiB: on a
+        // 16 MiB member that was half the encode. The optimal parse used to be
+        // worse still, rebuilding per pass; its collector searches each block
+        // once and lets the passes replay the answers.
         let (combined, start) = member_window(data, history, options);
-        let mut shared = (!options.optimal_parse).then(|| member_finder(&combined, start, options));
+        let mut lazy = (!options.optimal_parse).then(|| member_finder(&combined, start, options));
+        let mut collector = options
+            .optimal_parse
+            .then(|| OptimalCollector::new(&combined, start, options));
 
         let mut out = Vec::new();
         let mut completed = 0usize;
@@ -893,7 +898,11 @@ fn encode_lz_member_inner(
             out.extend(encode_lz_block_in_window(
                 &combined,
                 block_start..block_end,
-                shared.as_mut(),
+                match (&mut lazy, &mut collector) {
+                    (Some(finder), _) => MemberSearch::Lazy(finder),
+                    (_, Some(collector)) => MemberSearch::Optimal(collector),
+                    _ => MemberSearch::Fresh,
+                },
                 algorithm_version,
                 &[],
                 options,
@@ -957,6 +966,199 @@ fn seeded_finder(
     finder
 }
 
+/// The search state a member shares across its blocks, when it has any.
+enum MemberSearch<'a> {
+    /// Nothing shared: the block builds what it needs and drops it.
+    Fresh,
+    /// The member's chain finder, which the lazy path feeds block by block.
+    Lazy(&'a mut Rar50MatchFinder),
+    /// The member's match collector, which the optimal parse feeds block by
+    /// block.
+    Optimal(&'a mut OptimalCollector),
+}
+
+/// The matches at every position of one block, found once and priced by every
+/// pass of the optimal parse. The runs at one position carry strictly
+/// increasing lengths and distances, so each is the nearest distance found
+/// that reaches its length.
+///
+/// One position holds at most one run per length it can reach, so the whole
+/// block is bounded by the block size times [`NICE_MATCH_LENGTH`]. Nothing
+/// approaches that: the worst measured is about six runs per position, on a
+/// mebibyte of two-symbol noise, where every position has many candidates whose
+/// lengths creep up one byte at a time. That block cost three megabytes.
+struct BlockMatches {
+    /// Every position's runs, one position after another.
+    runs: Vec<(u32, u32)>,
+    /// Where each position's runs start in `runs`, with one extra entry to
+    /// close the last position.
+    starts: Vec<u32>,
+}
+
+impl BlockMatches {
+    fn at(&self, index: usize) -> &[(u32, u32)] {
+        &self.runs[self.starts[index] as usize..self.starts[index + 1] as usize]
+    }
+}
+
+/// One match finder for a member's whole optimal parse, and the walk that asks
+/// it about each block once.
+///
+/// The parse prices each block [`OPTIMAL_PARSE_PASSES`] times, but nothing the
+/// finder answers depends on the prices, so it used to be asked the same
+/// questions once per pass, through a finder rebuilt and reseeded once per
+/// pass. Collecting the answers first and replaying them lets every pass after
+/// the first skip the finder entirely.
+///
+/// Searching once is also what makes the tree finder affordable, and the tree
+/// is where the speed is: pricing every position means searching at every
+/// position, which is the load a chain walk carries worst and a tree carries
+/// best. A member that starts with no history gets the tree. One that carries
+/// history keeps the chains, because the only way into a tree is a descent per
+/// position, and paying that across a dictionary of history would cost more
+/// than the chains ever did.
+struct OptimalCollector {
+    finder: CollectorFinder,
+}
+
+enum CollectorFinder {
+    Tree(match_finder::TreeMatchFinder),
+    Chains(Rar50MatchFinder),
+}
+
+impl OptimalCollector {
+    fn new(combined: &[u8], start: usize, options: EncodeOptions) -> Self {
+        let finder = if start == 0 {
+            CollectorFinder::Tree(match_finder::TreeMatchFinder::new(finder_window(
+                options,
+                combined.len(),
+            )))
+        } else {
+            CollectorFinder::Chains(member_finder(combined, start, options))
+        };
+        Self { finder }
+    }
+
+    /// Finds the matches the parse will price at each position of `block`,
+    /// taking the positions into the finder as it goes. Blocks must arrive in
+    /// order, each exactly once, the same discipline the member's shared chain
+    /// finder already asks of the lazy path.
+    ///
+    /// Searching stops where the parse stops pricing. A match that reaches
+    /// [`NICE_MATCH_LENGTH`] is one the parse commits to and steps over, so the
+    /// positions it covers are not searched from either. Skipping the pricing
+    /// alone would have left the search doing all the work it used to: on a
+    /// mebibyte that repeats, one search per 4 KiB became a million.
+    fn collect(
+        &mut self,
+        combined: &[u8],
+        block: std::ops::Range<usize>,
+        options: EncodeOptions,
+    ) -> BlockMatches {
+        let span = block.end - block.start;
+        let mut matches = BlockMatches {
+            // One run per position to start with, which is where data that
+            // matches at all lands, so the common case grows this once.
+            runs: Vec::with_capacity(span),
+            starts: Vec::with_capacity(span + 1),
+        };
+        // The first position past a match the parse will commit to. The parse
+        // reaches the same decision from the same lengths, so the two agree on
+        // which positions matter without having to be told.
+        let mut committed_through = block.start;
+        for pos in block.clone() {
+            matches.starts.push(matches.runs.len() as u32);
+            let searching = pos >= committed_through && options.max_match_candidates != 0;
+            let max_distance = pos.min(options.max_match_distance);
+            let before = matches.runs.len();
+            match &mut self.finder {
+                CollectorFinder::Tree(tree) => {
+                    // Inserting into a tree is the same descent as searching
+                    // it, so a position the parse steps over is stepped over
+                    // here too rather than inserted for nothing. Its bytes are
+                    // a copy of what the match already points at, so the tree
+                    // loses little by not holding them.
+                    let avail = combined.len() - pos;
+                    if !searching || avail < 4 {
+                        continue;
+                    }
+                    // Compares stop where the parse stops caring about better
+                    // alternatives. A match that reaches that far is measured
+                    // out to its real end, which is the length the parse
+                    // commits to and steps over.
+                    let len_limit = avail.min(NICE_MATCH_LENGTH);
+                    tree.matches(
+                        combined,
+                        pos,
+                        len_limit,
+                        max_distance,
+                        options.max_match_candidates,
+                        &mut matches.runs,
+                    );
+                    if let Some(last) = matches.runs[before..].last_mut() {
+                        let limit = avail.min(MAX_ENCODER_MATCH_LENGTH);
+                        if last.0 as usize == len_limit && len_limit < limit {
+                            last.0 = match_length(combined, pos, last.1 as usize, limit) as u32;
+                        }
+                    }
+                }
+                CollectorFinder::Chains(finder) => {
+                    // Inserting into a chain is one store, so every position
+                    // goes in whether or not it is searched from. That keeps a
+                    // solid member's candidates exactly what they were.
+                    finder.insert(combined, pos);
+                    let max_length = (block.end - pos).min(MAX_ENCODER_MATCH_LENGTH);
+                    if !searching || max_distance == 0 || max_length < 4 {
+                        continue;
+                    }
+                    // The chain walks nearest first, so the first distance to
+                    // reach a length is the cheapest one that can.
+                    let mut longest = 0usize;
+                    let mut checked = 0usize;
+                    let mut candidate = finder.first(combined, pos);
+                    while candidate != match_finder::NO_POSITION
+                        && longest < max_length
+                        && longest < NICE_MATCH_LENGTH
+                    {
+                        if candidate >= pos {
+                            candidate = finder.previous(candidate);
+                            continue;
+                        }
+                        let distance = pos - candidate;
+                        if distance > max_distance {
+                            break;
+                        }
+                        checked += 1;
+                        if combined[candidate + longest] == combined[pos + longest] {
+                            let length = match_length(combined, pos, distance, max_length);
+                            if length > longest {
+                                matches.runs.push((length as u32, distance as u32));
+                                longest = length;
+                            }
+                        }
+                        if checked >= options.max_match_candidates {
+                            break;
+                        }
+                        candidate = finder.previous(candidate);
+                    }
+                }
+            }
+            // The parse can only take a match the block still has room for, so
+            // the reach it will commit to is measured the way it measures it.
+            if let Some(&(length, _)) = matches.runs[before..].last() {
+                let reach = (length as usize)
+                    .min(block.end - pos)
+                    .min(MAX_ENCODER_MATCH_LENGTH);
+                if reach >= NICE_MATCH_LENGTH {
+                    committed_through = pos + reach;
+                }
+            }
+        }
+        matches.starts.push(matches.runs.len() as u32);
+        matches
+    }
+}
+
 /// The bytes one member's parse reaches across, and where its own data starts.
 ///
 /// A member with no history to carry borrows its own data rather than copying
@@ -992,7 +1194,7 @@ fn encode_lz_block(
     encode_lz_block_in_window(
         &combined,
         start..combined.len(),
-        None,
+        MemberSearch::Fresh,
         algorithm_version,
         initial_filters,
         options,
@@ -1005,7 +1207,7 @@ fn encode_lz_block(
 fn encode_lz_block_in_window(
     combined: &[u8],
     block: std::ops::Range<usize>,
-    finder: Option<&mut Rar50MatchFinder>,
+    search: MemberSearch<'_>,
     algorithm_version: u8,
     initial_filters: &[EncodeFilter],
     options: EncodeOptions,
@@ -1026,7 +1228,7 @@ fn encode_lz_block_in_window(
     tokens.extend(encode_tokens_with_progress(
         combined,
         block,
-        finder,
+        search,
         options,
         distance_size,
         progress,
@@ -1457,22 +1659,21 @@ impl TokenPrices<'_> {
 /// match alone. It is also not quite every path: once a match reaches
 /// [`NICE_MATCH_LENGTH`] the parse takes it and steps over the bytes it covers
 /// rather than pricing each of them.
-/// Builds its own finder rather than sharing the member's, because it walks the
-/// block more than once and a shared one cannot be rewound. Seeding a finder
-/// with one window of history costs less than the alternative: inserting the
-/// block up front instead leaves every chain walk stepping over positions ahead
-/// of the one being priced, which measured four times slower on a binary.
+///
+/// Does no searching of its own: `matches` holds what an [`OptimalCollector`]
+/// found at each position of this block, and prices never change what a
+/// search would find, so every pass prices the same collection.
 fn optimal_tokens(
     combined: &[u8],
     block: std::ops::Range<usize>,
     options: EncodeOptions,
     distance_size: usize,
     prices: Option<&TokenPrices<'_>>,
+    matches: &BlockMatches,
 ) -> Result<Vec<EncodeToken>> {
     let start = block.start;
     let end = block.end;
     let span = end - start;
-    let mut finder = seeded_finder(combined, block.clone(), options);
 
     let mut price = vec![u32::MAX; span + 1];
     let mut arrive_length = vec![0u32; span + 1];
@@ -1486,16 +1687,14 @@ fn optimal_tokens(
     price[0] = 0;
 
     // Runs of `(shortest, longest, distance)` from the position being priced,
-    // in the order the chain found them. Reused to keep one allocation.
+    // in the order the collector found them. Reused to keep one allocation.
     let mut reaches: Vec<(usize, usize, usize)> = Vec::new();
-    // The first position past a match the parse committed to. Positions before
-    // it still go into the finder, so later ones can match against them, but
-    // nothing is priced from them. See [`NICE_MATCH_LENGTH`].
+    // The first position past a match the parse committed to. Nothing is
+    // priced from the positions before it. See [`NICE_MATCH_LENGTH`].
     let mut committed_through = 0usize;
 
     for index in 0..span {
         let pos = start + index;
-        finder.insert(combined, pos);
         if index < committed_through {
             continue;
         }
@@ -1533,8 +1732,8 @@ fn optimal_tokens(
 
         // A match at a remembered distance is priced out of the main table
         // alone, a handful of bits against twenty for a fresh distance, so it
-        // earns its place even when it is shorter than anything the chain will
-        // turn up. The chain only reports a candidate that beats the longest
+        // earns its place even when it is shorter than anything the collector
+        // found. The collector only reports a candidate that beats the longest
         // found so far, so these have to be asked for separately.
         for repeat in state.reps {
             if repeat == 0 || repeat > max_distance {
@@ -1546,35 +1745,17 @@ fn optimal_tokens(
             }
         }
 
-        // The chain walks nearest first, so the first distance to reach a
-        // length is the cheapest one that can. Each step that improves on the
-        // longest so far owns one run of lengths.
-        let mut checked = 0usize;
-        let mut candidate = finder.first(combined, pos);
-        while candidate != match_finder::NO_POSITION
-            && longest < max_length
-            && longest < NICE_MATCH_LENGTH
-        {
-            if candidate >= pos {
-                candidate = finder.previous(candidate);
-                continue;
+        // The collector reports nearest first, so the first distance to reach
+        // a length is the cheapest one that can. Each report that improves on
+        // the longest so far owns one run of lengths. The tree measures
+        // against the whole member where the chains stopped at the block, so
+        // a length is capped here to what this block can still hold.
+        for &(length, distance) in matches.at(index) {
+            let length = (length as usize).min(max_length);
+            if length > longest {
+                reaches.push((longest + 1, length, distance as usize));
+                longest = length;
             }
-            let distance = pos - candidate;
-            if distance > max_distance {
-                break;
-            }
-            checked += 1;
-            if combined[candidate + longest] == combined[pos + longest] {
-                let length = match_length(combined, pos, distance, max_length);
-                if length > longest {
-                    reaches.push((longest + 1, length, distance));
-                    longest = length;
-                }
-            }
-            if checked >= options.max_match_candidates {
-                break;
-            }
-            candidate = finder.previous(candidate);
         }
 
         // Matches that share a distance and a length slot cost the same, so
@@ -1685,7 +1866,7 @@ fn same_price_run_end(
 fn encode_tokens_with_progress(
     combined: &[u8],
     block: std::ops::Range<usize>,
-    finder: Option<&mut Rar50MatchFinder>,
+    search: MemberSearch<'_>,
     options: EncodeOptions,
     distance_size: usize,
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
@@ -1693,10 +1874,26 @@ fn encode_tokens_with_progress(
     let start = block.start;
     let end = block.end;
     if options.optimal_parse {
+        let mut own;
+        let collector = match search {
+            MemberSearch::Optimal(collector) => collector,
+            _ => {
+                own = OptimalCollector::new(combined, start, options);
+                &mut own
+            }
+        };
+        let matches = collector.collect(combined, block.clone(), options);
         // The prices come from the Huffman tables, and the tables come from
         // the parse, so the first pass has to guess. Each pass after it prices
         // against what the pass before actually produced.
-        let mut tokens = optimal_tokens(combined, block.clone(), options, distance_size, None)?;
+        let mut tokens = optimal_tokens(
+            combined,
+            block.clone(),
+            options,
+            distance_size,
+            None,
+            &matches,
+        )?;
         for _ in 1..OPTIMAL_PARSE_PASSES {
             let lengths = table_lengths_for_tokens(&tokens, distance_size)?;
             let prices = TokenPrices { lengths: &lengths };
@@ -1706,6 +1903,7 @@ fn encode_tokens_with_progress(
                 options,
                 distance_size,
                 Some(&prices),
+                &matches,
             )?;
         }
         if progress.is_some_and(|report| !report(end - start)) {
@@ -1715,9 +1913,9 @@ fn encode_tokens_with_progress(
     }
 
     let mut own;
-    let finder = match finder {
-        Some(finder) => finder,
-        None => {
+    let finder = match search {
+        MemberSearch::Lazy(finder) => finder,
+        _ => {
             own = seeded_finder(combined, start..end, options);
             &mut own
         }
@@ -3273,12 +3471,33 @@ mod tests {
         encode_tokens_with_progress(
             &combined,
             start..combined.len(),
-            None,
+            MemberSearch::Fresh,
             options,
             distance_size,
             None,
         )
         .expect("encoding without cancellation cannot be cancelled")
+    }
+
+    /// One block through the optimal parse, collecting its matches first the
+    /// way [`encode_tokens_with_progress`] does.
+    fn collected_optimal_tokens(
+        data: &[u8],
+        options: EncodeOptions,
+        distance_size: usize,
+        prices: Option<&TokenPrices<'_>>,
+    ) -> Vec<EncodeToken> {
+        let mut collector = OptimalCollector::new(data, 0, options);
+        let matches = collector.collect(data, 0..data.len(), options);
+        optimal_tokens(
+            data,
+            0..data.len(),
+            options,
+            distance_size,
+            prices,
+            &matches,
+        )
+        .unwrap()
     }
     fn should_lazy_emit_literal(
         input: &[u8],
@@ -4224,7 +4443,7 @@ mod tests {
         let data = strided_repeats(8, 3000);
         let options = EncodeOptions::new(64).with_optimal_parse(true);
         let distance_size = DISTANCE_TABLE_SIZE_50;
-        let tokens = optimal_tokens(&data, 0..data.len(), options, distance_size, None).unwrap();
+        let tokens = collected_optimal_tokens(&data, options, distance_size, None);
 
         let mut state = EncoderMatchState::default();
         let (mut repeated, mut fresh) = (0, 0);
@@ -4279,8 +4498,7 @@ mod tests {
             .collect();
         let data = block.repeat(16);
         let options = EncodeOptions::new(64).with_optimal_parse(true);
-        let tokens =
-            optimal_tokens(&data, 0..data.len(), options, DISTANCE_TABLE_SIZE_50, None).unwrap();
+        let tokens = collected_optimal_tokens(&data, options, DISTANCE_TABLE_SIZE_50, None);
 
         let first = tokens
             .iter()
@@ -4309,11 +4527,10 @@ mod tests {
         let data = wordy_text(256 * 1024);
         let options = EncodeOptions::new(64).with_optimal_parse(true);
         let distance_size = DISTANCE_TABLE_SIZE_50;
-        let guessed = optimal_tokens(&data, 0..data.len(), options, distance_size, None).unwrap();
+        let guessed = collected_optimal_tokens(&data, options, distance_size, None);
         let lengths = table_lengths_for_tokens(&guessed, distance_size).unwrap();
         let prices = TokenPrices { lengths: &lengths };
-        let repriced =
-            optimal_tokens(&data, 0..data.len(), options, distance_size, Some(&prices)).unwrap();
+        let repriced = collected_optimal_tokens(&data, options, distance_size, Some(&prices));
 
         let bits = |tokens: &[EncodeToken]| -> usize {
             let lengths = table_lengths_for_tokens(tokens, distance_size).unwrap();

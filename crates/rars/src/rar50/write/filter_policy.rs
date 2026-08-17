@@ -307,11 +307,18 @@ pub(super) fn dictionary_size_for_options(
     let size = match options.dictionary_size {
         Some(size) => size,
         None => {
-            let mut fitted =
-                fitted_dictionary_size(content, resolved_level(options.compression_level));
+            let level = resolved_level(options.compression_level);
+            let mut fitted = fitted_dictionary_size(content, level);
+            // Whether the level parses optimally decides how much a window
+            // costs, and the level owns that answer. The size passed here does
+            // not change it.
+            let optimal_parse = encode_options_for_level(Some(level), fitted)?.optimal_parse;
             while fitted > DEFAULT_RAR50_DICTIONARY_SIZE
-                && super::streaming_lz_workspace(fitted, crate::codec::rar50::LZ_BLOCK_SIZE)
-                    > memory_limit
+                && super::streaming_lz_workspace(
+                    fitted,
+                    crate::codec::rar50::LZ_BLOCK_SIZE,
+                    optimal_parse,
+                ) > memory_limit
             {
                 fitted /= 2;
             }

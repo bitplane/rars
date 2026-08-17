@@ -83,7 +83,13 @@ pub(super) fn compress_members_reporting(
         integrity.push((input_size, crc32, hash));
     }
 
-    let required = super::streaming_lz_workspace(plan.dictionary_size, plan.block_size);
+    // Any candidate that parses optimally searches a tree, so the charge has to
+    // cover the widest finder the member could build, not the one the level
+    // finally writes with.
+    let optimal_parse = plan.encode_options.optimal_parse
+        || plan.candidates.iter().any(|options| options.optimal_parse);
+    let required =
+        super::streaming_lz_workspace(plan.dictionary_size, plan.block_size, optimal_parse);
     let max_jobs_by_memory = resources.memory_limit() / required;
     if max_jobs_by_memory == 0 {
         resources.acquire(required, plan.dictionary_size)?;

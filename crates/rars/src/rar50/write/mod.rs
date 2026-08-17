@@ -586,11 +586,32 @@ fn source_integrity(
 /// token buffer for one block, and the packed output. Three megabytes covers
 /// those with room to spare, and the fifth byte per window position absorbs the
 /// rest rather than pretending to predict it.
-fn streaming_lz_workspace(dictionary_size: u64, block_size: usize) -> u64 {
+///
+/// The optimal parse searches a binary tree instead of hash chains, and a tree
+/// holds two links per window position where a chain holds one. So it is eight
+/// bytes per byte of window rather than four, and the charge doubles the links
+/// and keeps the one byte of slack. Measured on the same 16 MiB member, over
+/// the member, against a 512-candidate parse:
+///
+/// ```text
+/// dictionary    measured    tree links alone
+///  256 KiB     19,668,992         2,097,152
+///    1 MiB     21,794,816         8,388,608
+///    4 MiB     47,030,272        33,554,432
+///    8 MiB     75,390,976        67,108,864
+///   16 MiB    109,412,352       134,217,728
+/// ```
+///
+/// The last row measures under its links because a 16 MiB member cannot fill a
+/// 16 MiB window: the pages behind the untouched slots never become resident.
+/// The charge covers the allocation anyway, since data that does fill the
+/// window will touch them.
+fn streaming_lz_workspace(dictionary_size: u64, block_size: usize, optimal_parse: bool) -> u64 {
+    let per_window_byte = if optimal_parse { 9 } else { 5 };
     dictionary_size
         .checked_next_power_of_two()
         .unwrap_or(dictionary_size)
-        .saturating_mul(5)
+        .saturating_mul(per_window_byte)
         .saturating_add((block_size as u64).saturating_mul(64))
         .saturating_add(3 * 1024 * 1024)
 }
@@ -977,7 +998,7 @@ mod tests {
             (8 * 1024 * 1024, 36_941_824),
         ];
         for (dictionary, peak) in measured {
-            let charged = streaming_lz_workspace(dictionary, block);
+            let charged = streaming_lz_workspace(dictionary, block, false);
             assert!(
                 charged >= peak,
                 "a {dictionary}-byte dictionary measured {peak} against a charge of {charged}",
@@ -991,18 +1012,56 @@ mod tests {
         }
     }
 
+    /// The same measurement for a parse that searches a tree, which holds two
+    /// links per window position where a chain holds one. Charging the chain's
+    /// four bytes for it let a fitted dictionary pick a window the budget could
+    /// not hold: at a 32 MiB limit a 16 MiB member peaked at 43 MB.
+    #[test]
+    fn the_workspace_charge_covers_a_tree_search_too() {
+        let block = crate::codec::rar50::LZ_BLOCK_SIZE;
+        // Peak resident bytes over the member, 16 MiB of manpage text at
+        // level 5, which is the only level that parses optimally.
+        let measured: [(u64, u64); 4] = [
+            (256 * 1024, 19_668_992),
+            (1024 * 1024, 21_794_816),
+            (4 * 1024 * 1024, 47_030_272),
+            (8 * 1024 * 1024, 75_390_976),
+        ];
+        for (dictionary, peak) in measured {
+            let charged = streaming_lz_workspace(dictionary, block, true);
+            let chain = streaming_lz_workspace(dictionary, block, false);
+            assert!(
+                charged > chain,
+                "a tree is charged {charged} against a chain's {chain}",
+            );
+            // The two smallest windows measure above their charge: what is over
+            // is the member copies the whole-member path holds, which
+            // `whole_member_workspace` charges for separately and which no
+            // window size changes.
+            let copies = 17 * 1024 * 1024;
+            assert!(
+                charged + copies >= peak,
+                "a {dictionary}-byte dictionary measured {peak} against a charge of {charged}",
+            );
+        }
+    }
+
     #[test]
     fn the_workspace_charge_never_falls_as_the_dictionary_grows() {
         let block = crate::codec::rar50::LZ_BLOCK_SIZE;
         let mut previous = 0;
         let mut dictionary = 128 * 1024u64;
         while dictionary <= 64 * 1024 * 1024 {
-            let charged = streaming_lz_workspace(dictionary, block);
-            assert!(
-                charged >= previous,
-                "{dictionary} charged less than the size below it"
-            );
-            previous = charged;
+            for optimal_parse in [false, true] {
+                let charged = streaming_lz_workspace(dictionary, block, optimal_parse);
+                assert!(
+                    charged >= previous,
+                    "{dictionary} charged less than the size below it"
+                );
+                if !optimal_parse {
+                    previous = charged;
+                }
+            }
             // Every size the format allows, not just the powers of two, because
             // the rounding inside is the whole reason this function exists.
             dictionary += 128 * 1024;
@@ -1014,7 +1073,7 @@ mod tests {
         let options = WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
             .with_compression_level(3);
         let block = crate::codec::rar50::LZ_BLOCK_SIZE;
-        let room_for_256k = streaming_lz_workspace(256 * 1024, block);
+        let room_for_256k = streaming_lz_workspace(256 * 1024, block, false);
 
         // A budget that cannot hold the fitted window takes the largest one it
         // can, rather than failing a write the old 128 KiB default would have
@@ -1022,7 +1081,7 @@ mod tests {
         let fitted = dictionary_size_for_options(options, 8 * 1024 * 1024, room_for_256k).unwrap();
 
         assert_eq!(fitted, 256 * 1024);
-        assert!(streaming_lz_workspace(fitted, block) <= room_for_256k);
+        assert!(streaming_lz_workspace(fitted, block, false) <= room_for_256k);
         // A dictionary the caller named is used as asked, so the write fails
         // later saying what it needed instead of quietly writing something else.
         assert_eq!(
@@ -1328,7 +1387,8 @@ mod tests {
         .unwrap();
 
         let source = EntrySource::from_bytes(Arc::<[u8]>::from(data));
-        let required = streaming_lz_workspace(dictionary_size, block_size);
+        let required =
+            streaming_lz_workspace(dictionary_size, block_size, encode_options.optimal_parse);
         let mut prepared = compress::compress_members_reporting(
             &[source],
             compress::CompressPlan {
@@ -1369,7 +1429,16 @@ mod tests {
         let dictionary_size =
             dictionary_size_for_options(options, dictionary_reach(&entries, false), u64::MAX)
                 .unwrap();
-        let required = streaming_lz_workspace(dictionary_size, 1024 * 1024);
+        // Exactly what the writer charges itself, so the budget below admits one
+        // job and no more. Derived rather than written down, because a charge
+        // larger than the writer's would quietly make this a two-job test.
+        let required = streaming_lz_workspace(
+            dictionary_size,
+            1024 * 1024,
+            encode_options_for_level(options.compression_level, dictionary_size)
+                .unwrap()
+                .optimal_parse,
+        );
         let mut one_job = Vec::new();
         write_streaming_archive_to(
             &entries,
