@@ -1517,6 +1517,15 @@ impl PpmdEncoder {
         Ok(())
     }
 
+    /// Bits spent so far, to fractional precision. log2 of the range register
+    /// falls as symbols narrow the interval and rises by eight for every byte
+    /// normalisation flushes, so the difference between two readings is the
+    /// cost of whatever was coded between them. The RAR 2.9 tokeniser reads
+    /// this to price escape tokens against the literals they would replace.
+    pub(crate) fn spent_bits(&self) -> f64 {
+        8.0 * self.range.out.len() as f64 - f64::from(self.range.range.max(1)).log2()
+    }
+
     pub fn finish(mut self) -> Result<Vec<u8>> {
         self.model.encode_symbol(self.esc_char, &mut self.range)?;
         self.model.encode_symbol(2, &mut self.range)?;

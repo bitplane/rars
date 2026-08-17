@@ -9,7 +9,8 @@ use crate::codec::rar20::{
 use crate::codec::rar29::{
     unpack29_encode_literals, unpack29_encode_literals_with_options,
     unpack29_encode_literals_with_options_and_progress, unpack29_encode_ppmd,
-    unpack29_encode_ppmd_with_filter, EncodeOptions as Rar29EncodeOptions, Unpack29Encoder,
+    unpack29_encode_ppmd_literals, unpack29_encode_ppmd_with_filter,
+    EncodeOptions as Rar29EncodeOptions, Unpack29Encoder,
 };
 use crate::crc32::Crc32;
 pub use crate::filter::{FilterKind, FilterPolicy, FilterSpec};
@@ -672,6 +673,19 @@ fn encode_rar29_auto_filtered_member(
         };
         if ppmd.data.len() < best.data.len() {
             best = ppmd;
+        }
+        // The escape tokens price themselves against costs measured off the
+        // stream they are shaping, so a member where every escape loses can
+        // still ratify a few before the measurements catch up. A pure-literal
+        // stream is the direct check. It costs a second PPMd pass over the
+        // member, paid only where PPMd is already being tried: text at the
+        // top two levels.
+        let ppmd_literals = EncodedPayload {
+            data: unpack29_encode_ppmd_literals(data).map_err(Error::from)?,
+            method: lz_method,
+        };
+        if ppmd_literals.data.len() < best.data.len() {
+            best = ppmd_literals;
         }
     }
     if best.data.len() >= data.len() {

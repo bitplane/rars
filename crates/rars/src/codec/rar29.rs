@@ -52,6 +52,27 @@ const MAX_MATCH_CANDIDATES: usize = 256;
 const MAX_PPMD_MATCH_LENGTH: usize = 255;
 const MIN_PPMD_MATCH_LENGTH: usize = 32;
 const MAX_PPMD_REPEAT_LENGTH: usize = 259;
+// The parameters rar 3.00 itself declares at -m5, read out of its streams.
+const PPMD_ORDER: usize = 8;
+const PPMD_DICTIONARY_MB: u8 = 25;
+const PPMD_ESC: u8 = 2;
+// Seeds and weights for the escape-token cost model in `encode_ppmd_hybrid`.
+// The seeds only steer the first few decisions; measured costs take over as
+// the member is coded. All five are tuning knobs, not format constants.
+const PPMD_LITERAL_BITS_SEED: f64 = 4.0;
+const PPMD_MATCH_BITS_SEED: f64 = 60.0;
+const PPMD_REPEAT_BITS_SEED: f64 = 24.0;
+const PPMD_LITERAL_EMA_WEIGHT: f64 = 1.0 / 32.0;
+const PPMD_TOKEN_EMA_WEIGHT: f64 = 1.0 / 8.0;
+// An escape token's copied bytes never reach the model, so the literals right
+// after it are predicted from the token's own bytes and pay for the broken
+// context. That cost lands on the literals' ledger, not the token's, so the
+// token is charged a flat estimate of it here.
+const PPMD_CONTEXT_BREAK_BITS: f64 = 16.0;
+// After a match is priced out, nearby positions almost always price out the
+// same way, so the search sleeps a few bytes rather than re-walking the hash
+// chain at every literal.
+const PPMD_REJECT_SEARCH_COOLDOWN: usize = 8;
 
 type Rar29MatchFinder = match_finder::MatchFinder<4>;
 
@@ -296,10 +317,6 @@ fn encode_ppmd_block(
     initial_filters: &[Vec<u8>],
     max_match_distance: usize,
 ) -> Result<Vec<u8>> {
-    const PPMD_ORDER: usize = 8;
-    const PPMD_DICTIONARY_MB: u8 = 25;
-    const PPMD_ESC: u8 = 2;
-
     let mut out = Vec::new();
     out.push(0x80 | 0x20 | ((PPMD_ORDER as u8) - 1));
     out.push(PPMD_DICTIONARY_MB - 1);
@@ -307,13 +324,11 @@ fn encode_ppmd_block(
     for record in initial_filters {
         encoder.encode_vm_filter_record(record)?;
     }
-    for token in encode_ppmd_tokens(input, lz_escapes, max_match_distance) {
-        match token {
-            PpmdEncodeToken::Literal(byte) => encoder.encode_literal(byte)?,
-            PpmdEncodeToken::RepeatOffsetOne { length } => {
-                encoder.encode_repeat_offset_one(length)?
-            }
-            PpmdEncodeToken::Match { offset, length } => encoder.encode_match(offset, length)?,
+    if lz_escapes {
+        encode_ppmd_hybrid(input, max_match_distance, &mut encoder, |_| ())?;
+    } else {
+        for &byte in input {
+            encoder.encode_literal(byte)?;
         }
     }
     out.extend_from_slice(&encoder.finish()?);
@@ -1363,46 +1378,119 @@ struct MatchCandidate {
     score: isize,
 }
 
-fn encode_ppmd_tokens(
-    input: &[u8],
-    lz_escapes: bool,
-    max_match_distance: usize,
-) -> Vec<PpmdEncodeToken> {
-    if !lz_escapes {
-        return input
-            .iter()
-            .copied()
-            .map(PpmdEncodeToken::Literal)
-            .collect();
+/// The running price of each token kind, measured off the range coder as the
+/// member is encoded. An escape token is far from free: a match is six model
+/// symbols (escape, 4, three offset bytes, a length) and a repeat is three,
+/// coded through contexts where the escape byte is rare, and the copied bytes
+/// never enter the model. On text the model predicts a repeated span for a
+/// fraction of a bit per byte, so a minimum-length match can cost several
+/// times the literals it replaces. Emitting every legal match is what left
+/// PPMd members 30-45% behind rar 3.00 on log-shaped text.
+///
+/// The literal average answers "what does a byte cost as a literal right
+/// now", which is the opportunity cost of a match, so it moves slowly. The
+/// token averages track a near-fixed overhead, so they move fast. All three
+/// are only ever compared against each other, so the model self-corrects: a
+/// token kind that keeps losing keeps its measured price and stays rejected.
+struct PpmdTokenCosts {
+    literal_bits: f64,
+    match_bits: f64,
+    repeat_bits: f64,
+}
+
+impl PpmdTokenCosts {
+    fn new() -> Self {
+        Self {
+            literal_bits: PPMD_LITERAL_BITS_SEED,
+            match_bits: PPMD_MATCH_BITS_SEED,
+            repeat_bits: PPMD_REPEAT_BITS_SEED,
+        }
     }
 
-    let mut tokens = Vec::new();
+    fn match_pays(&self, length: usize) -> bool {
+        length as f64 * self.literal_bits > self.match_bits + PPMD_CONTEXT_BREAK_BITS
+    }
+
+    fn repeat_pays(&self, length: usize) -> bool {
+        length as f64 * self.literal_bits > self.repeat_bits + PPMD_CONTEXT_BREAK_BITS
+    }
+
+    fn record_literal(&mut self, bits: f64) {
+        ema(&mut self.literal_bits, bits, PPMD_LITERAL_EMA_WEIGHT);
+    }
+
+    fn record_match(&mut self, bits: f64) {
+        ema(&mut self.match_bits, bits, PPMD_TOKEN_EMA_WEIGHT);
+    }
+
+    fn record_repeat(&mut self, bits: f64) {
+        ema(&mut self.repeat_bits, bits, PPMD_TOKEN_EMA_WEIGHT);
+    }
+}
+
+fn ema(slot: &mut f64, sample: f64, weight: f64) {
+    *slot += weight * (sample - *slot);
+}
+
+/// Feed the member through PPMd, escaping to an LZ token only where the token
+/// prices in cheaper than letting the model code the same bytes as literals.
+/// Tokenising and encoding are one loop so each decision can read the cost of
+/// the last one straight off the range coder; a separate tokenising pass has
+/// no way to know what the model would have charged.
+///
+/// `on_token` sees every emitted token, in order. Production passes a no-op;
+/// the tests collect them.
+fn encode_ppmd_hybrid(
+    input: &[u8],
+    max_match_distance: usize,
+    encoder: &mut PpmdEncoder,
+    mut on_token: impl FnMut(PpmdEncodeToken),
+) -> Result<()> {
+    let mut costs = PpmdTokenCosts::new();
     let mut finder = Rar29MatchFinder::new(input.len());
     let mut pos = 0usize;
+    let mut search_from = 0usize;
     while pos < input.len() {
         if let Some(length) = ppmd_offset_one_repeat(input, pos) {
-            tokens.push(PpmdEncodeToken::RepeatOffsetOne { length });
-            for history_pos in pos..pos + length {
-                finder.insert(input, history_pos);
+            if costs.repeat_pays(length) {
+                let before = encoder.spent_bits();
+                encoder.encode_repeat_offset_one(length)?;
+                costs.record_repeat(encoder.spent_bits() - before);
+                on_token(PpmdEncodeToken::RepeatOffsetOne { length });
+                for history_pos in pos..pos + length {
+                    finder.insert(input, history_pos);
+                }
+                pos += length;
+                continue;
             }
-            pos += length;
-            continue;
         }
 
-        if let Some((length, offset)) = best_ppmd_match(input, pos, &finder, max_match_distance) {
-            tokens.push(PpmdEncodeToken::Match { offset, length });
-            for history_pos in pos..pos + length {
-                finder.insert(input, history_pos);
+        if pos >= search_from {
+            if let Some((length, offset)) = best_ppmd_match(input, pos, &finder, max_match_distance)
+            {
+                if costs.match_pays(length) {
+                    let before = encoder.spent_bits();
+                    encoder.encode_match(offset, length)?;
+                    costs.record_match(encoder.spent_bits() - before);
+                    on_token(PpmdEncodeToken::Match { offset, length });
+                    for history_pos in pos..pos + length {
+                        finder.insert(input, history_pos);
+                    }
+                    pos += length;
+                    continue;
+                }
+                search_from = pos + PPMD_REJECT_SEARCH_COOLDOWN;
             }
-            pos += length;
-            continue;
         }
 
-        tokens.push(PpmdEncodeToken::Literal(input[pos]));
+        let before = encoder.spent_bits();
+        encoder.encode_literal(input[pos])?;
+        costs.record_literal(encoder.spent_bits() - before);
+        on_token(PpmdEncodeToken::Literal(input[pos]));
         finder.insert(input, pos);
         pos += 1;
     }
-    tokens
+    Ok(())
 }
 
 fn ppmd_offset_one_repeat(input: &[u8], pos: usize) -> Option<usize> {
@@ -3262,17 +3350,31 @@ mod tests {
     }
 
     use super::{
-        apply_standard_filter, audio_encode, best_match, encode_ppmd_tokens,
+        apply_standard_filter, audio_encode, best_match, encode_ppmd_hybrid,
         encode_table_level_tokens, encode_tokens_with_progress, encoded_filter_records_at,
         itanium_decode, itanium_encode, lazy_match_decision, split_large_filter, unpack29_decode,
         unpack29_encode_literals, unpack29_encode_ppmd, unpack29_encode_ppmd_literals,
         unpack29_encode_ppmd_with_filter, BitReader, BitWriter, EncodeOptions, EncodeToken,
         EncoderMatchState, Error, Huffman, LevelToken, MatchCandidate, OwnedVmFilterRecord,
-        PpmdEncodeToken, Rar29MatchFinder, Result, StandardFilter, Unpack29, Unpack29Encoder,
-        VmFilter, VmProgram, VmProgramKind, MAIN_COUNT, MAX_ENCODER_MATCH_OFFSET,
+        PpmdEncodeToken, PpmdEncoder, Rar29MatchFinder, Result, StandardFilter, Unpack29,
+        Unpack29Encoder, VmFilter, VmProgram, VmProgramKind, MAIN_COUNT, MAX_ENCODER_MATCH_OFFSET,
         MAX_MATCH_CANDIDATES, MAX_VM_AUDIO_FILTER_BLOCK_SIZE, MAX_VM_DELTA_FILTER_BLOCK_SIZE,
-        MAX_VM_FILTER_BLOCK_SIZE, RAR3_AUDIO_FILTER_BYTECODE, TABLE_COUNT,
+        MAX_VM_FILTER_BLOCK_SIZE, PPMD_DICTIONARY_MB, PPMD_ESC, PPMD_ORDER,
+        RAR3_AUDIO_FILTER_BYTECODE, TABLE_COUNT,
     };
+
+    /// The tokens the hybrid encoder emits for `input`, decided against the
+    /// same live model the production path prices against.
+    fn hybrid_tokens(input: &[u8], max_match_distance: usize) -> Vec<PpmdEncodeToken> {
+        let mut encoder =
+            PpmdEncoder::new(PPMD_ORDER, PPMD_ESC, usize::from(PPMD_DICTIONARY_MB)).unwrap();
+        let mut tokens = Vec::new();
+        encode_ppmd_hybrid(input, max_match_distance, &mut encoder, |token| {
+            tokens.push(token)
+        })
+        .unwrap();
+        tokens
+    }
 
     const COMPRESSED_TEXT: &[u8] = &[
         0x09, 0x10, 0x10, 0x93, 0xe4, 0xce, 0x7f, 0xa2, 0xba, 0x80, 0x46, 0x16, 0x82, 0x63, 0xe9,
@@ -3648,7 +3750,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
             .copied()
             .chain(std::iter::repeat_n(b'Z', 512))
             .collect::<Vec<_>>();
-        let tokens = encode_ppmd_tokens(&input, true, MAX_ENCODER_MATCH_OFFSET);
+        let tokens = hybrid_tokens(&input, MAX_ENCODER_MATCH_OFFSET);
         let packed = unpack29_encode_ppmd(&input, MAX_ENCODER_MATCH_OFFSET).unwrap();
 
         assert!(tokens.iter().any(
@@ -3685,7 +3787,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         input.extend_from_slice(&block);
         filler(&mut input, 3 * dictionary);
         input.extend_from_slice(&block);
-        let tokens = encode_ppmd_tokens(&input, true, dictionary);
+        let tokens = hybrid_tokens(&input, dictionary);
 
         let furthest = tokens
             .iter()
@@ -3710,7 +3812,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         input.extend_from_slice(phrase);
         input.extend_from_slice(phrase);
         input.extend_from_slice(b"tail");
-        let tokens = encode_ppmd_tokens(&input, true, MAX_ENCODER_MATCH_OFFSET);
+        let tokens = hybrid_tokens(&input, MAX_ENCODER_MATCH_OFFSET);
         let packed = unpack29_encode_ppmd(&input, MAX_ENCODER_MATCH_OFFSET).unwrap();
 
         assert!(tokens
@@ -3726,7 +3828,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         for _ in 0..200 {
             input.extend_from_slice(phrase);
         }
-        let tokens = encode_ppmd_tokens(&input, true, MAX_ENCODER_MATCH_OFFSET);
+        let tokens = hybrid_tokens(&input, MAX_ENCODER_MATCH_OFFSET);
 
         assert!(tokens.iter().any(
             |token| matches!(token, PpmdEncodeToken::Match { offset, length } if *offset > 1 && *length >= 32)
