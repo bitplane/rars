@@ -7,6 +7,12 @@
 //! in memory. New Rust users should depend on this crate rather than the
 //! lower-level `rars-*` implementation crates, which ended at 0.3.x.
 
+/// Where the unit tests write their files. Shared with the integration tests
+/// by path rather than by API.
+#[cfg(test)]
+#[path = "../tests/support/scratch.rs"]
+mod scratch;
+
 #[doc(hidden)]
 pub mod codec;
 pub mod crc32;

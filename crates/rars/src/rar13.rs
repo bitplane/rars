@@ -2997,9 +2997,7 @@ mod tests {
         }];
         let bytes = write_stored_archive(&input, WriterOptions::default()).unwrap();
 
-        let dir =
-            std::env::temp_dir().join(format!("rars-rar13-packed-data-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::scratch::case("rars-rar13-packed-data");
         let path = dir.join("entry.rar");
         std::fs::write(&path, &bytes).unwrap();
 
@@ -3011,9 +3009,6 @@ mod tests {
                 "RAR 1.3 file-backed packed data requires owned read"
             ))
         );
-
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_dir(&dir).ok();
     }
 
     fn parse_volumes(bytes: &[Vec<u8>]) -> Vec<Archive> {
@@ -3263,9 +3258,7 @@ mod tests {
         )
         .unwrap();
 
-        let dir =
-            std::env::temp_dir().join(format!("rars-rar13-parse-seekable-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::scratch::case("rars-rar13-parse-seekable");
         let path = dir.join("multi.rar");
         std::fs::write(&path, &bytes).unwrap();
 
@@ -3277,24 +3270,16 @@ mod tests {
             archive.archive_comment().unwrap().as_deref(),
             Some(&b"file-backed comment"[..])
         );
-
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_dir(&dir).ok();
     }
 
     #[test]
     fn parse_path_rejects_files_without_rar13_signature() {
-        let dir =
-            std::env::temp_dir().join(format!("rars-rar13-parse-path-bad-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::scratch::case("rars-rar13-parse-path-bad");
         let path = dir.join("not_a_rar.bin");
         std::fs::write(&path, [0u8; 64]).unwrap();
 
         let err = Archive::parse_path(&path).unwrap_err();
         assert_eq!(err, Error::UnsupportedSignature);
-
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_dir(&dir).ok();
     }
 
     #[test]
@@ -3312,18 +3297,13 @@ mod tests {
         }];
         let bytes = write_stored_archive(&input, WriterOptions::default()).unwrap();
 
-        let dir =
-            std::env::temp_dir().join(format!("rars-rar13-decrypt-file-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::scratch::case("rars-rar13-decrypt-file");
         let path = dir.join("encrypted.rar");
         std::fs::write(&path, &bytes).unwrap();
 
         let archive = Archive::parse_path(&path).unwrap();
         let extracted = collect_extract(&archive, Some(b"pw")).unwrap();
         assert_eq!(extracted[0].data, b"file-backed secret payload");
-
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_dir(&dir).ok();
     }
 
     #[test]

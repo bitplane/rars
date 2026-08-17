@@ -8,7 +8,6 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 
@@ -78,7 +77,10 @@ def main() -> int:
     parser.add_argument(
         "--venv",
         type=Path,
-        default=Path(tempfile.gettempdir()) / "rars-python-bindings-venv",
+        # Under target/, not the system temp directory: this is a few hundred
+        # megabytes of maturin and pytest, and /tmp is a tmpfs on most Linux
+        # installs, so the default would spend that much RAM.
+        default=ROOT / "target/python-bindings-venv",
         help="virtualenv path to create/use",
     )
     parser.add_argument(
@@ -114,7 +116,18 @@ def main() -> int:
         env=env,
     )
     if not args.skip_pytest:
-        run([str(python), "-m", "pytest", "python/tests"], env=env)
+        # --basetemp keeps pytest's tmp_path fixtures off /tmp too.
+        run(
+            [
+                str(python),
+                "-m",
+                "pytest",
+                "python/tests",
+                "--basetemp",
+                str(ROOT / "target/pytest-tmp"),
+            ],
+            env=env,
+        )
     run([str(python), "-c", smoke_script()], env=env)
     return 0
 

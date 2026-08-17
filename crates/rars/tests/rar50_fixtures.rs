@@ -1,3 +1,6 @@
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use rars::codec::rar50::{
     decode_lz, encode_lz_member, parse_compressed_block, read_table_lengths, DecodeTables,
 };
@@ -1562,10 +1565,8 @@ fn reference_rar_accepts_rar50_acl_and_stream_file_service_records() {
     )
     .unwrap();
 
-    let path = std::env::temp_dir().join(format!(
-        "rars-rar50-file-services-{}.rar",
-        std::process::id()
-    ));
+    let dir = scratch::case("rars-rar50-file-services");
+    let path = dir.join("archive.rar");
     fs::write(&path, bytes).unwrap();
     let output = match Command::new("rar").arg("t").arg(&path).output() {
         Ok(output) => output,
@@ -1575,8 +1576,9 @@ fn reference_rar_accepts_rar50_acl_and_stream_file_service_records() {
         }
         Err(error) => panic!("failed to run rar: {error}"),
     };
-    if std::env::var_os("RARS_KEEP_REFERENCE_ARCHIVE").is_none() {
-        let _ = fs::remove_file(&path);
+    if std::env::var_os("RARS_KEEP_REFERENCE_ARCHIVE").is_some() {
+        eprintln!("kept reference archive: {}", path.display());
+        std::mem::forget(dir);
     }
 
     assert!(
@@ -4518,8 +4520,8 @@ fn streaming_solid_output_does_not_depend_on_the_memory_budget() {
 /// Tests an archive with whichever reference tool is installed, returning
 /// `None` when neither is.
 fn reference_test_archive(label: &str, archive: &[u8]) -> Option<std::process::Output> {
-    let mut path = std::env::temp_dir();
-    path.push(format!("rars-{label}-{}.rar", std::process::id()));
+    let dir = scratch::case(&format!("rars-{label}"));
+    let path = dir.join("archive.rar");
     fs::write(&path, archive).unwrap();
 
     let mut result = None;
@@ -4533,7 +4535,6 @@ fn reference_test_archive(label: &str, archive: &[u8]) -> Option<std::process::O
             Err(error) => panic!("failed to run {tool}: {error}"),
         }
     }
-    let _ = fs::remove_file(&path);
     result
 }
 
@@ -4645,8 +4646,8 @@ fn reference_test_archive_with_password(
     archive: &[u8],
     password: &str,
 ) -> Option<std::process::Output> {
-    let mut path = std::env::temp_dir();
-    path.push(format!("rars-{label}-{}.rar", std::process::id()));
+    let dir = scratch::case(&format!("rars-{label}"));
+    let path = dir.join("archive.rar");
     fs::write(&path, archive).unwrap();
 
     let mut result = None;
@@ -4665,7 +4666,6 @@ fn reference_test_archive_with_password(
             Err(error) => panic!("failed to run {tool}: {error}"),
         }
     }
-    let _ = fs::remove_file(&path);
     result
 }
 
@@ -4726,7 +4726,8 @@ fn streaming_writer_stays_within_its_memory_budget_on_a_large_archive() {
     let options =
         rar50::WriterOptions::new(ArchiveVersion::Rar70, features).with_compression_level(1);
 
-    let temp = std::env::temp_dir().join(format!("rars-large-{}.rar", std::process::id()));
+    let dir = scratch::case("rars-large");
+    let temp = dir.join("archive.rar");
     let mut output = fs::File::create(&temp).unwrap();
     // 50% recovery over a ~300 MiB archive needs more parity than the budget
     // allows to hold at once, which forces the striped recovery pass.
@@ -4734,14 +4735,13 @@ fn streaming_writer_stays_within_its_memory_budget_on_a_large_archive() {
         std::slice::from_ref(&entry),
         options,
         rar50::ArchiveExtras::default().with_recovery_percent(Some(50)),
-        &rars::WriterResources::new(BUDGET).with_temp_dir(std::env::temp_dir()),
+        &rars::WriterResources::new(BUDGET).with_temp_dir(&*dir),
         &mut output,
     )
     .unwrap();
     drop(output);
 
     let written = fs::metadata(&temp).unwrap().len();
-    let _ = fs::remove_file(&temp);
     assert!(
         written > MEMBER_BYTES,
         "a 50% recovery record should make the archive larger than its input"
@@ -5285,9 +5285,7 @@ fn reference_rar_accepts_a_streaming_volume_set() {
     );
     assert!(volumes.len() > 2);
 
-    let dir = std::env::temp_dir().join(format!("rars-volset-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
+    let dir = scratch::case("rars-volset");
     for (index, volume) in volumes.iter().enumerate() {
         fs::write(dir.join(format!("set.part{:02}.rar", index + 1)), volume).unwrap();
     }
@@ -5304,8 +5302,6 @@ fn reference_rar_accepts_a_streaming_volume_set() {
             Err(error) => panic!("failed to run {tool}: {error}"),
         }
     }
-    let _ = fs::remove_dir_all(&dir);
-
     let Some(output) = result else {
         eprintln!("skipping reference test: no unrar or rar command is installed");
         return;

@@ -1,5 +1,11 @@
 //! Command-line frontend for the `rars` RAR archive toolkit.
 
+/// Where the unit tests write their files. Shared with the integration tests
+/// by path rather than by API.
+#[cfg(test)]
+#[path = "../tests/support/scratch.rs"]
+mod scratch;
+
 mod add_plan;
 mod cli;
 mod error;
@@ -2038,10 +2044,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn open_output_writer_rejects_existing_symlink_components() {
-        let root = std::env::temp_dir().join(format!("rars-symlink-output-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let outside = root.with_extension("outside");
-        let _ = std::fs::remove_dir_all(&outside);
+        let scratch = crate::scratch::case("rars-symlink-output");
+        let root = scratch.join("root");
+        let outside = scratch.join("outside");
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::create_dir_all(&root).unwrap();
         std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
@@ -2050,9 +2055,6 @@ mod tests {
             Err(Error::InvalidHeader("unsafe archive path crosses symlink"))
         ));
         assert!(!outside.join("escape.txt").exists());
-
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[test]

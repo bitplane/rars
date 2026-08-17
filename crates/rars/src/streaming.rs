@@ -348,7 +348,8 @@ mod tests {
 
     #[test]
     fn spool_tracks_length_across_seeks_and_overwrites() {
-        let resources = WriterResources::default().with_temp_dir(std::env::temp_dir());
+        let scratch = crate::scratch::case("rars-spool");
+        let resources = WriterResources::default().with_temp_dir(&*scratch);
         let mut spool = Spool::create(&resources).unwrap();
         spool.write_all(b"0123456789").unwrap();
         assert_eq!(spool.len(), 10);
@@ -370,7 +371,8 @@ mod tests {
 
     #[test]
     fn spool_reads_from_the_seeked_position() {
-        let resources = WriterResources::default().with_temp_dir(std::env::temp_dir());
+        let scratch = crate::scratch::case("rars-spool");
+        let resources = WriterResources::default().with_temp_dir(&*scratch);
         let mut spool = Spool::create(&resources).unwrap();
         spool.write_all(b"abcdefgh").unwrap();
         spool.seek(SeekFrom::Start(3)).unwrap();

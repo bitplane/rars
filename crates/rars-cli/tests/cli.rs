@@ -1,3 +1,6 @@
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use rars::crc32::crc32;
 use rars::rar13::{write_stored_archive, StoredEntry, WriterOptions};
 use rars::rar15_40;
@@ -5,7 +8,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -25,14 +28,8 @@ fn fixture_rar50(name: &str) -> PathBuf {
         .join(name)
 }
 
-fn scratch(name: &str) -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!("rars-cli-{name}-{nonce}"));
-    fs::create_dir_all(&path).unwrap();
-    path
+fn scratch(name: &str) -> scratch::Scratch {
+    scratch::case(&format!("rars-cli-{name}"))
 }
 
 fn deterministic_noise(len: usize) -> Vec<u8> {

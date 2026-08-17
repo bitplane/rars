@@ -20,11 +20,13 @@
 //! archives; without the probe it would fail every compressed cell and read as
 //! a hundred bugs in rars.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::OnceLock;
 
 /// The password every encrypted cell uses. Its only job is to be the same on
 /// both sides of the pipe.
@@ -612,17 +614,8 @@ impl Known {
 // Running a cell
 // ---------------------------------------------------------------------------
 
-fn scratch(label: &str) -> PathBuf {
-    static ROOT: OnceLock<PathBuf> = OnceLock::new();
-    let root = ROOT.get_or_init(|| {
-        let root = std::env::temp_dir().join(format!("rars-matrix-{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
-        root
-    });
-    let path = root.join(label);
-    let _ = fs::remove_dir_all(&path);
-    fs::create_dir_all(&path).unwrap();
-    path
+fn workspace(label: &str) -> scratch::Scratch {
+    scratch::case(&format!("rars-matrix-{label}"))
 }
 
 /// The volume a decoder should be pointed at: the whole archive, or the first
@@ -675,7 +668,7 @@ fn run_matrix(format: &str) {
 
     let mut failures = Vec::new();
     for cell in CELLS.iter().filter(|cell| cell.formats.contains(&format)) {
-        let workspace = scratch(&format!("{format}-{}", cell.name));
+        let workspace = workspace(&format!("{format}-{}", cell.name));
         let files = cell.inputs.files();
         for (name, bytes) in &files {
             fs::write(workspace.join(name), bytes).unwrap();
@@ -732,8 +725,6 @@ fn run_matrix(format: &str) {
                 )),
             }
         }
-
-        let _ = fs::remove_dir_all(&workspace);
     }
 
     assert!(

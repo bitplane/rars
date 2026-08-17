@@ -1,3 +1,6 @@
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use rars::crc32::crc32;
 use rars::rar15_40::{
     extract_volumes_to, repair_rev3_volumes_to, write_compressed_archive,
@@ -633,8 +636,7 @@ fn reference_unrar_accepts_rar29_solid_e8_filter_record() {
         return;
     };
 
-    let dir = std::env::temp_dir().join(format!("rars-rar29-solid-e8-ref-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch::case("rars-rar29-solid-e8-ref");
     let archive_path = dir.join("solid-e8.rar");
     let first = b"\xe8\0\0\0\0rar29 solid e8 first reference payload\n".repeat(12);
     let second = b"\xe8\0\0\0\0rar29 solid e8 second reference payload\n".repeat(12);
@@ -687,11 +689,7 @@ fn reference_unrar_accepts_rar29_segmented_e8_filter_record() {
         return;
     };
 
-    let dir = std::env::temp_dir().join(format!(
-        "rars-rar29-segmented-e8-ref-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch::case("rars-rar29-segmented-e8-ref");
     let archive_path = dir.join("segmented-e8.rar");
     let mut payload = b"unfiltered prefix before x86 segment ".to_vec();
     let filter_start = payload.len();
@@ -732,11 +730,7 @@ fn reference_unrar_accepts_rar29_segmented_e8e9_filter_record() {
         return;
     };
 
-    let dir = std::env::temp_dir().join(format!(
-        "rars-rar29-segmented-e8e9-ref-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch::case("rars-rar29-segmented-e8e9-ref");
     let archive_path = dir.join("segmented-e8e9.rar");
     let mut payload = b"unfiltered prefix before x86 segment ".to_vec();
     let filter_start = payload.len();
@@ -867,11 +861,7 @@ fn reference_unrar_accepts_rar29_segmented_delta_filter_record() {
         return;
     };
 
-    let dir = std::env::temp_dir().join(format!(
-        "rars-rar29-segmented-delta-ref-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch::case("rars-rar29-segmented-delta-ref");
     let archive_path = dir.join("segmented-delta.rar");
     let mut payload = b"unfiltered prefix before delta segment ".to_vec();
     let filter_start = payload.len();
@@ -979,11 +969,7 @@ fn reference_unrar_accepts_rar29_segmented_itanium_filter_record() {
         return;
     };
 
-    let dir = std::env::temp_dir().join(format!(
-        "rars-rar29-segmented-itanium-ref-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch::case("rars-rar29-segmented-itanium-ref");
     let archive_path = dir.join("segmented-itanium.rar");
     let mut payload = b"unfiltered prefix before itanium segment ".to_vec();
     let filter_start = payload.len();
@@ -1090,11 +1076,7 @@ fn reference_unrar_accepts_rar29_segmented_rgb_filter_record() {
         return;
     };
 
-    let dir = std::env::temp_dir().join(format!(
-        "rars-rar29-segmented-rgb-ref-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch::case("rars-rar29-segmented-rgb-ref");
     let archive_path = dir.join("segmented-rgb.rar");
     let width = 12;
     let mut payload = b"unfiltered prefix before rgb segment ".to_vec();
@@ -1257,11 +1239,7 @@ fn reference_unrar300_accepts_rar29_segmented_filter_records() {
         return;
     };
 
-    let dir = std::env::temp_dir().join(format!(
-        "rars-rar29-segmented-unrar300-ref-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch::case("rars-rar29-segmented-unrar300-ref");
 
     let mut e8 = b"unfiltered prefix before x86 segment ".to_vec();
     let e8_start = e8.len();
@@ -1440,11 +1418,7 @@ fn reference_unrar_accepts_rar29_segmented_audio_filter_record() {
         return;
     };
 
-    let dir = std::env::temp_dir().join(format!(
-        "rars-rar29-segmented-audio-ref-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch::case("rars-rar29-segmented-audio-ref");
     let archive_path = dir.join("segmented-audio.rar");
     let mut payload = b"unfiltered prefix before audio segment ".to_vec();
     let filter_start = payload.len();
@@ -6854,8 +6828,7 @@ fn a_stored_member_round_trips_from_a_file_on_disk() {
     use rars::rar15_40::{write_streaming_archive_to, StreamingEntry};
     use rars::{EntrySource, MemberCoding, WriterResources};
 
-    let directory = std::env::temp_dir().join(format!("rars-stream-{}", std::process::id()));
-    std::fs::create_dir_all(&directory).unwrap();
+    let directory = scratch::case("rars-stream");
     let path = directory.join("payload.bin");
     // Larger than the walk chunk, so the checksum really is taken in pieces.
     let payload: Vec<u8> = (0..700_000u32).map(|index| index as u8).collect();
@@ -6882,8 +6855,6 @@ fn a_stored_member_round_trips_from_a_file_on_disk() {
     assert_eq!(extracted.len(), 1);
     assert_eq!(extracted[0].data, payload);
     assert_eq!(crc32(&extracted[0].data), crc32(&payload));
-
-    std::fs::remove_dir_all(&directory).unwrap();
 }
 
 /// A member larger than the whole budget still gets written: the legacy codecs
@@ -6927,8 +6898,8 @@ fn a_member_larger_than_the_budget_is_written_anyway() {
 /// Tests an archive with a locally installed reference tool, returning `None`
 /// when there is not one.
 fn local_reference_test(label: &str, archive: &[u8]) -> Option<std::process::Output> {
-    let mut path = std::env::temp_dir();
-    path.push(format!("rars-{label}-{}.rar", std::process::id()));
+    let dir = scratch::case(&format!("rars-{label}"));
+    let path = dir.join("archive.rar");
     std::fs::write(&path, archive).unwrap();
     let mut result = None;
     for tool in ["unrar", "rar"] {
@@ -6937,7 +6908,6 @@ fn local_reference_test(label: &str, archive: &[u8]) -> Option<std::process::Out
             break;
         }
     }
-    let _ = std::fs::remove_file(&path);
     result
 }
 

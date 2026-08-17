@@ -1837,11 +1837,8 @@ mod tests {
         .unwrap();
         write_end_header(&mut archive, 0).unwrap();
 
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "rars-rar50-literal-only-{}.rar",
-            std::process::id()
-        ));
+        let dir = crate::scratch::case("rars-rar50-literal-only");
+        let path = dir.join("archive.rar");
         fs::write(&path, archive).unwrap();
         let output = match Command::new("rar").arg("t").arg(&path).output() {
             Ok(output) => output,
@@ -1851,8 +1848,9 @@ mod tests {
             }
             Err(error) => panic!("failed to run rar: {error}"),
         };
-        if std::env::var_os("RARS_KEEP_REFERENCE_ARCHIVE").is_none() {
-            let _ = fs::remove_file(&path);
+        if std::env::var_os("RARS_KEEP_REFERENCE_ARCHIVE").is_some() {
+            eprintln!("kept reference archive: {}", path.display());
+            std::mem::forget(dir);
         }
 
         assert!(
@@ -1898,8 +1896,8 @@ mod tests {
         .unwrap();
         write_end_header(&mut archive, 0).unwrap();
 
-        let mut path = std::env::temp_dir();
-        path.push(format!("rars-rar50-match-{}.rar", std::process::id()));
+        let dir = crate::scratch::case("rars-rar50-match");
+        let path = dir.join("archive.rar");
         fs::write(&path, archive).unwrap();
         let output = match Command::new("rar").arg("t").arg(&path).output() {
             Ok(output) => output,
@@ -1909,8 +1907,9 @@ mod tests {
             }
             Err(error) => panic!("failed to run rar: {error}"),
         };
-        if std::env::var_os("RARS_KEEP_REFERENCE_ARCHIVE").is_none() {
-            let _ = fs::remove_file(&path);
+        if std::env::var_os("RARS_KEEP_REFERENCE_ARCHIVE").is_some() {
+            eprintln!("kept reference archive: {}", path.display());
+            std::mem::forget(dir);
         }
 
         assert!(

@@ -234,9 +234,7 @@ mod tests {
 
     #[test]
     fn discover_sibling_volumes_does_not_merge_case_distinct_bases() {
-        let dir = std::env::temp_dir().join(format!("rars-volume-case-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir(&dir).unwrap();
+        let dir = crate::scratch::case("rars-volume-case");
         let lower = dir.join("setup.rar");
         let upper = dir.join("Setup.rar");
         fs::write(&lower, []).unwrap();
@@ -244,15 +242,12 @@ mod tests {
 
         let discovered = discover_sibling_volumes(&lower.to_string_lossy());
 
-        let _ = fs::remove_dir_all(&dir);
         assert_eq!(discovered, vec![lower.to_string_lossy().into_owned()]);
     }
 
     #[test]
     fn discover_sibling_volumes_does_not_merge_part_and_plain_rar_names() {
-        let dir = std::env::temp_dir().join(format!("rars-volume-style-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir(&dir).unwrap();
+        let dir = crate::scratch::case("rars-volume-style");
         let plain = dir.join("setup.rar");
         let part = dir.join("setup.part1.rar");
         fs::write(&plain, []).unwrap();
@@ -260,7 +255,6 @@ mod tests {
 
         let discovered = discover_sibling_volumes(&plain.to_string_lossy());
 
-        let _ = fs::remove_dir_all(&dir);
         assert_eq!(discovered, vec![plain.to_string_lossy().into_owned()]);
     }
 }

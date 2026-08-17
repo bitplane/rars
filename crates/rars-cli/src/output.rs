@@ -342,16 +342,9 @@ mod tests {
     use super::{display_archive_text, restore_output_metadata, ExtractedOutput};
     use rars::{ArchiveFamily, ExtractedEntryMeta};
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn scratch(name: &str) -> std::path::PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("rars-output-{name}-{nonce}"));
-        fs::create_dir_all(&path).unwrap();
-        path
+    fn scratch(name: &str) -> crate::scratch::Scratch {
+        crate::scratch::case(&format!("rars-output-{name}"))
     }
 
     #[test]
@@ -392,6 +385,5 @@ mod tests {
         ];
 
         restore_output_metadata(&outputs).unwrap();
-        fs::remove_dir_all(root).unwrap();
     }
 }
