@@ -456,6 +456,30 @@ impl Archive {
         Ok(taken)
     }
 
+    /// Returns one member's decoded bytes by archive-order index.
+    ///
+    /// Unlike name lookup this remains unambiguous when an archive contains
+    /// duplicate names or names that are not valid UTF-8.
+    pub fn read_member_at(&self, index: usize, password: Option<&[u8]>) -> Result<Option<Vec<u8>>> {
+        let collected = std::sync::Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
+        let current = std::cell::Cell::new(0usize);
+        self.extract_to(password, |meta| {
+            let this = current.get();
+            current.set(this.saturating_add(1));
+            if this != index || meta.is_directory {
+                return Ok(Box::new(std::io::sink()) as Box<dyn Write>);
+            }
+            let sink = SharedBuffer(std::sync::Arc::clone(&collected));
+            *sink.lock() = Some(Vec::new());
+            Ok(Box::new(sink) as Box<dyn Write>)
+        })?;
+        let taken = collected
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        Ok(taken)
+    }
+
     /// Decodes every member and discards the bytes, so a bad checksum or a
     /// wrong password is reported and nothing is written.
     pub fn test(&self, password: Option<&[u8]>) -> Result<()> {
@@ -742,6 +766,68 @@ where
             rar50::extract_volumes_to(&typed, options, |meta| open(&rar50_meta(meta)))
         }
     }
+}
+
+/// Returns the logical members in a volume set in archive order.
+///
+/// Continuation headers are folded into the member that began on an earlier
+/// volume. Packed sizes are accumulated across all fragments.
+pub fn volume_members(archives: &[Archive]) -> Result<Vec<ArchiveMember>> {
+    let Some(first) = archives.first() else {
+        return Err(Error::InvalidHeader("volume set is empty"));
+    };
+    if archives
+        .iter()
+        .any(|archive| archive.family() != first.family())
+    {
+        return Err(Error::InvalidHeader("mixed archive families in volume set"));
+    }
+
+    let mut members: Vec<ArchiveMember> = Vec::new();
+    for archive in archives {
+        for member in archive.members() {
+            if member.meta.is_split_before {
+                let Some(previous) = members.last_mut() else {
+                    return Err(Error::InvalidHeader(
+                        "volume set starts with a continuation",
+                    ));
+                };
+                previous.meta.packed_size = previous
+                    .meta
+                    .packed_size
+                    .saturating_add(member.meta.packed_size);
+                previous.meta.is_split_after = member.meta.is_split_after;
+            } else {
+                members.push(member);
+            }
+        }
+    }
+    Ok(members)
+}
+
+/// Returns one logical member from a volume set by archive-order index.
+pub fn read_volume_member_at(
+    archives: &[Archive],
+    index: usize,
+    password: Option<&[u8]>,
+) -> Result<Option<Vec<u8>>> {
+    let collected = std::sync::Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
+    let current = std::cell::Cell::new(0usize);
+    extract_volumes_to(archives, password, |meta| {
+        let this = current.get();
+        current.set(this.saturating_add(1));
+        if this != index || meta.is_directory {
+            return Ok(Box::new(std::io::sink()) as Box<dyn Write>);
+        }
+        let sink = SharedBuffer(std::sync::Arc::clone(&collected));
+        *sink.lock() = Some(Vec::new());
+        Ok(Box::new(sink) as Box<dyn Write>)
+    })?;
+    let taken = collected
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    Ok(taken)
 }
 
 fn rar13_meta(meta: &rar13::ExtractedEntryMeta) -> ExtractedEntryMeta {
@@ -4435,5 +4521,45 @@ mod tests {
             ArchiveReader::read_path(rar15_40_fixture("rar250_protect_head_rr5.rar")).unwrap();
         assert_eq!(archive.family(), ArchiveFamily::Rar15To40);
         assert!(archive.as_rar15_40().unwrap().main.has_recovery_record());
+    }
+
+    #[test]
+    fn archive_member_can_be_read_by_index() {
+        let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+        builder
+            .add_bytes(b"first.txt".to_vec(), b"first".to_vec(), None, None)
+            .unwrap();
+        builder
+            .add_bytes(b"second.txt".to_vec(), b"second".to_vec(), None, None)
+            .unwrap();
+        let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+
+        assert_eq!(archive.read_member_at(1, None).unwrap().unwrap(), b"second");
+        assert_eq!(archive.read_member_at(2, None).unwrap(), None);
+    }
+
+    #[test]
+    fn volume_members_and_index_reads_fold_split_fragments() {
+        let payload = vec![7; 200_000];
+        let mut builder = Builder::new(ArchiveVersion::Rar50)
+            .store(true)
+            .volume_size(Some(64 * 1024));
+        builder
+            .add_bytes(b"big.bin".to_vec(), payload.clone(), None, None)
+            .unwrap();
+        let archives: Vec<_> = builder
+            .build_volumes(None)
+            .unwrap()
+            .into_iter()
+            .map(|part| ArchiveReader::read_owned(part).unwrap())
+            .collect();
+
+        let members = volume_members(&archives).unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].meta.name, b"big.bin");
+        assert_eq!(
+            read_volume_member_at(&archives, 0, None).unwrap().unwrap(),
+            payload
+        );
     }
 }

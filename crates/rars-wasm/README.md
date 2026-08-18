@@ -1,96 +1,89 @@
 # @bitplane/rars
 
-Read, write and repair RAR archives in the browser or Node using [rars][repo]
-via WebAssembly. `rars` reads and writes every RAR version from 1.3 to 7.0 and
-compresses reasonably well at a sensible speed.
+Read, write and repair RAR archives in browsers and Node.
 
-[repo]: https://github.com/bitplane/rars
-
-```
+```sh
 npm install @bitplane/rars
 ```
 
-## Reading
+## Read
 
 ```js
-import { RarFile } from "@bitplane/rars";
+import { RarArchive } from "@bitplane/rars";
 
-const rar = new RarFile(new Uint8Array(await file.arrayBuffer()));
+const archive = await RarArchive.open(file, { password: "optional" });
 
-for (const entry of rar.entries()) {
+for (const entry of archive.entries) {
   console.log(entry.name, entry.size, entry.isEncrypted);
 }
 
-const bytes = rar.read("docs/readme.txt");
-rar.test();          // throws on the first bad checksum
-rar.free();          // archive stays in memory otherwise
+const bytes = await archive.get("docs/readme.txt").bytes();
+await archive.test();
+archive.close(); // optional; releases retained input eagerly
 ```
 
-Passwords go in as a string or a `Uint8Array`. Encrypted headers blocks listing
-without a password, but many archives just have encrypted members:
+`open()` accepts a `Blob`, `ArrayBuffer` or typed array. Pass an ordered array
+to open a volume set. Entry objects use archive-order indices internally, so
+duplicate names and non-UTF-8 names remain unambiguous; `nameBytes` contains
+the exact header bytes.
+
+Node also accepts paths and file URLs. Passing the first path of a conventional
+volume set discovers its siblings automatically.
+
+## Write
 
 ```js
-const locked = new RarFile(bytes, "hunter2");   // encrypted headers
-const data = rar.read("secret.txt", "hunter2"); // encrypted data
+import { RarWriter } from "@bitplane/rars";
+
+const writer = new RarWriter({ format: "rar50", level: 5 });
+writer
+  .add("hello.txt", "hello")
+  .add("data.bin", payload, { mode: 0o644, modifiedAt: new Date() });
+
+const bytes = await writer.bytes();
+const parts = await writer.volumes(5 * 1024 * 1024);
 ```
 
-## Writing
+`level` runs from 0 (stored) to 5. Other options are `solid`, `password`,
+`encryptHeaders`, `comment` and `recoveryPercent`. Node additionally provides
+`addFile()`, `writeTo()` and `writeVolumesTo()`.
+
+Long operations accept an `AbortSignal` and progress callback:
 
 ```js
-import { RarBuilder } from "@bitplane/rars";
-
-const builder = new RarBuilder({ format: "rar50", compression: 5 });
-builder.addBytes("hello.txt", new TextEncoder().encode("hello"));
-builder.addBytes("data.bin", payload, { mode: 0o100644 });
-
-const archive = builder.toBytes();
+const bytes = await writer.bytes({
+  signal: controller.signal,
+  onProgress: ({ phase, completed, total }) => {
+    console.log(phase, completed, total);
+  },
+});
 ```
 
-`format` takes any of `rar13`, `rar14`, `rar15`, `rar20`, `rar29`, `rar30`,
-`rar40`, `rar50` or `rar70`. The rest of the options are `compression` (0 to
-5), `store`, `solid`, `password`, `encryptHeaders`, `comment`,
-`recoveryPercent` and `volumeSize`.
-
-Volume sets come back as an array:
-
-```js
-const builder = new RarBuilder({ volumeSize: 5 * 1024 * 1024 });
-builder.addBytes("big.iso", payload);
-const parts = builder.toVolumes();
-```
+Errors are `RarError` instances with a stable `code`; cancellation uses the
+standard `AbortError`.
 
 ## Loading
 
-The package ships three builds, auto chosen:
-
-| Importer                     | Gets      | Needs          |
-| ---------------------------- | --------- | -------------- |
-| Vite, webpack, Rollup, Next  | `bundler` | nothing        |
-| Node, `require` or `import`  | `node`    | nothing        |
-| A browser with no build step | `web`     | `await init()` |
-
-Only the browser build has to be initialised, because it fetches the
-`.wasm`:
+ES modules, Node `require`, Vite, webpack, Rollup and direct browser imports use
+the same API and require no explicit Wasm initialisation:
 
 ```html
 <script type="module">
-  import init, { RarFile } from "https://esm.sh/@bitplane/rars/web";
-  await init();
+  import { RarArchive } from "https://esm.sh/@bitplane/rars";
 </script>
 ```
 
-## Caveats
+Direct cross-origin imports use a small blob worker bootstrap. A restrictive
+Content Security Policy must therefore allow `blob:` in `worker-src`, or the
+package assets should be bundled or served from the page's origin.
 
-Compression is synchronous and single-threaded - you'll need to run it in a
-Worker until I sort that out. Progress updates aren't yet included either.
+The current API materialises input and output bytes. True backpressured stream
+input/output will be added separately rather than presenting a stream that
+secretly buffers an entire archive.
 
-There is no filesystem, so read the file yourself and pass the bytes.
-
-## Elsewhere
-
-The same library is a [Rust crate][crate], a [Python package][pypi] and a
-[command-line tool][repo]. Published together from CI so version numbers match
-up.
+The same library is available as a [Rust crate][crate], [Python package][pypi]
+and [command-line tool][repo].
 
 [crate]: https://crates.io/crates/rars
 [pypi]: https://pypi.org/project/rars/
+[repo]: https://github.com/bitplane/rars

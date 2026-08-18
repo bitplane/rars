@@ -1,16 +1,9 @@
-//! WebAssembly bindings for `rars`.
+//! Internal WebAssembly engine for the `@bitplane/rars` worker API.
 //!
-//! These mirror the Python package: [`RarFile`] reads an archive already in
-//! memory, [`RarBuilder`] writes one. Both are thin translations of
-//! [`rars_rs::Archive`] and [`rars_rs::Builder`], so the two packages gain
-//! features together and cannot drift apart.
-//!
-//! There is no filesystem here. Everything crosses the boundary as
-//! `Uint8Array`, which is what a browser has and what Node's `fs` hands back.
-//! The three things the Python package does that this one cannot are adding a
-//! path, extracting to a directory, and reporting progress; the first two need
-//! a filesystem and the third needs a callback that is `Send`, which a
-//! `js_sys::Function` is not.
+//! These exports are deliberately low level and live inside package-managed
+//! workers. The supported JavaScript surface is the asynchronous TypeScript
+//! facade assembled by `scripts/build-npm.sh`; wasm-bindgen classes are not
+//! exposed from the npm package.
 
 use rars_rs::{ArchiveVersion, Builder};
 use wasm_bindgen::prelude::*;
@@ -59,7 +52,7 @@ pub struct RarInfo {
     crc: Option<u32>,
     host_os: Option<f64>,
     file_attr: f64,
-    file_time: u32,
+    file_time: Option<u32>,
     encrypted: bool,
     stored: bool,
     solid: bool,
@@ -116,7 +109,7 @@ impl RarInfo {
 
     /// Modification time as a raw DOS timestamp.
     #[wasm_bindgen(getter, js_name = fileTime)]
-    pub fn file_time(&self) -> u32 {
+    pub fn file_time(&self) -> Option<u32> {
         self.file_time
     }
 
@@ -161,7 +154,7 @@ impl RarInfo {
 /// An archive opened for reading.
 #[wasm_bindgen]
 pub struct RarFile {
-    archive: rars_rs::Archive,
+    archives: Vec<rars_rs::Archive>,
     password: Option<Vec<u8>>,
     infos: Vec<RarInfo>,
 }
@@ -185,7 +178,40 @@ impl RarFile {
             rars_rs::ArchiveReader::read_owned_with_options(data, options).map_err(js_error)?;
         let infos = archive.members().map(info_from_member).collect();
         Ok(Self {
-            archive,
+            archives: vec![archive],
+            password,
+            infos,
+        })
+    }
+
+    /// Parse an ordered set of archive volumes.
+    #[wasm_bindgen(js_name = openVolumes)]
+    pub fn open_volumes(
+        volumes: js_sys::Array,
+        password: Option<Password>,
+    ) -> Result<RarFile, JsValue> {
+        let password = password_bytes(password)?;
+        let mut archives = Vec::with_capacity(volumes.length() as usize);
+        for value in volumes.iter() {
+            if !value.is_instance_of::<js_sys::Uint8Array>() {
+                return Err(js_sys::Error::new("each volume must be a Uint8Array").into());
+            }
+            let data = js_sys::Uint8Array::unchecked_from_js(value).to_vec();
+            let options = match password.as_deref() {
+                Some(password) => rars_rs::ArchiveReadOptions::with_password(password),
+                None => rars_rs::ArchiveReadOptions::new(),
+            };
+            archives.push(
+                rars_rs::ArchiveReader::read_owned_with_options(data, options).map_err(js_error)?,
+            );
+        }
+        let infos = rars_rs::volume_members(&archives)
+            .map_err(js_error)?
+            .into_iter()
+            .map(info_from_member)
+            .collect();
+        Ok(Self {
+            archives,
             password,
             infos,
         })
@@ -219,23 +245,43 @@ impl RarFile {
     /// better served by asking for each member in archive order.
     pub fn read(&self, name: &str, password: Option<Password>) -> Result<Vec<u8>, JsValue> {
         let password = password_bytes(password)?.or_else(|| self.password.clone());
-        self.archive
+        self.archives[0]
             .read_member(name.as_bytes(), password.as_deref())
             .map_err(js_error)?
             .ok_or_else(|| js_sys::Error::new(&format!("no such archive entry: {name}")).into())
+    }
+
+    /// Decode one member by archive-order index.
+    #[wasm_bindgen(js_name = readAt)]
+    pub fn read_at(&self, index: usize, password: Option<Password>) -> Result<Vec<u8>, JsValue> {
+        let password = password_bytes(password)?.or_else(|| self.password.clone());
+        let found = if self.archives.len() == 1 {
+            self.archives[0].read_member_at(index, password.as_deref())
+        } else {
+            rars_rs::read_volume_member_at(&self.archives, index, password.as_deref())
+        };
+        found.map_err(js_error)?.ok_or_else(|| {
+            js_sys::Error::new(&format!("no such archive entry index: {index}")).into()
+        })
     }
 
     /// Decode every member and discard the bytes, throwing on the first
     /// checksum failure or wrong password.
     pub fn test(&self, password: Option<Password>) -> Result<(), JsValue> {
         let password = password_bytes(password)?.or_else(|| self.password.clone());
-        self.archive.test(password.as_deref()).map_err(js_error)
+        if self.archives.len() == 1 {
+            return self.archives[0].test(password.as_deref()).map_err(js_error);
+        }
+        rars_rs::extract_volumes_to(&self.archives, password.as_deref(), |_| {
+            Ok(Box::new(std::io::sink()) as Box<dyn std::io::Write>)
+        })
+        .map_err(js_error)
     }
 
     /// The archive comment, or `undefined` when there is none.
     #[wasm_bindgen(getter)]
     pub fn comment(&self) -> Result<Option<Vec<u8>>, JsValue> {
-        self.archive
+        self.archives[0]
             .comment(self.password.as_deref())
             .map_err(js_error)
     }
@@ -250,14 +296,14 @@ impl RarFile {
     /// archive and zero otherwise.
     #[wasm_bindgen(getter, js_name = sfxOffset)]
     pub fn sfx_offset(&self) -> f64 {
-        self.archive.sfx_offset() as f64
+        self.archives[0].sfx_offset() as f64
     }
 
     /// Which family of the format this archive belongs to: `rar13`,
     /// `rar15_40` or `rar50_plus`.
     #[wasm_bindgen(getter)]
     pub fn family(&self) -> String {
-        family_name(self.archive.family()).to_string()
+        family_name(self.archives[0].family()).to_string()
     }
 }
 
@@ -278,7 +324,7 @@ fn info_from_member(member: rars_rs::ArchiveMember) -> RarInfo {
         crc,
         host_os: member.meta.host_os.map(|os| os as f64),
         file_attr: member.meta.file_attr as f64,
-        file_time: member.meta.file_time.unwrap_or(0),
+        file_time: member.meta.file_time,
         encrypted: member.meta.is_encrypted,
         stored: member.meta.is_stored,
         solid,
@@ -386,6 +432,28 @@ impl RarBuilder {
         self.inner
             .add_bytes(
                 name.as_bytes().to_vec(),
+                data,
+                opt_number(&options, "mtime")?.map(|n| n as u32),
+                opt_number(&options, "mode")?.map(|n| n as u32),
+            )
+            .map_err(js_error)
+    }
+
+    /// Queue `data` under an exact byte name. Internal worker-facing variant.
+    #[wasm_bindgen(js_name = addBytesRaw)]
+    pub fn add_bytes_raw(
+        &mut self,
+        name: Vec<u8>,
+        data: Vec<u8>,
+        options: Option<RarEntryOptions>,
+    ) -> Result<(), JsValue> {
+        let options: JsValue = match options {
+            Some(options) => options.into(),
+            None => JsValue::UNDEFINED,
+        };
+        self.inner
+            .add_bytes(
+                name,
                 data,
                 opt_number(&options, "mtime")?.map(|n| n as u32),
                 opt_number(&options, "mode")?.map(|n| n as u32),

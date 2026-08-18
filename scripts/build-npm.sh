@@ -3,17 +3,8 @@ set -euo pipefail
 
 # Build the npm package from crates/rars-wasm.
 #
-# Three wasm-bindgen targets go into one package because the three ways a
-# JavaScript project loads WebAssembly are genuinely different, and picking one
-# would lock out the other two:
-#
-#   bundler  ESM with a bare `import` of the .wasm, which webpack, Vite and
-#            Rollup resolve themselves. The default.
-#   node     CommonJS that reads the .wasm off disk. Node's `require`.
-#   web      ESM that fetches the .wasm, for a browser with no build step.
-#            The only one where `init()` must be awaited first.
-#
-# The `exports` map in package.json routes each importer to its own build.
+# The public API is handwritten JavaScript plus declarations. wasm-bindgen's
+# generated API lives under each platform's worker and is not exported.
 # Output goes to npm/ at the repo root, which is generated and gitignored.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -34,21 +25,16 @@ rustup target add wasm32-unknown-unknown >/dev/null 2>&1 || true
 cargo build --profile release-wasm --locked -p "$CRATE" --target wasm32-unknown-unknown
 
 rm -rf "$OUT"
-mkdir -p "$OUT"
+mkdir -p "$OUT/browser/wasm" "$OUT/node/wasm"
 
-for pair in "bundler:bundler" "node:nodejs" "web:web"; do
-    dir="${pair%%:*}"
-    target="${pair##*:}"
-    # No --omit-default-module-path: it is what makes `init()` resolve the
-    # .wasm beside the JS, so the browser build works from a CDN with no
-    # arguments.
-    wasm-bindgen "$WASM" --out-dir "$OUT/$dir" --target "$target"
-done
+wasm-bindgen "$WASM" --out-dir "$OUT/browser/wasm" --target web
+wasm-bindgen "$WASM" --out-dir "$OUT/node/wasm" --target nodejs
+rm -f "$OUT/browser/wasm/"*.d.ts "$OUT/node/wasm/"*.d.ts
 
 # wasm-opt is optional: it costs about a third of the module size, and a build
 # without it is correct, just larger. Say which happened rather than failing.
 if command -v wasm-opt >/dev/null 2>&1; then
-    for dir in bundler node web; do
+    for dir in browser/wasm node/wasm; do
         # Exactly the features Rust's wasm32-unknown-unknown target emits.
         # Without them binaryen refuses to validate the module; with `-all`
         # instead it enables the string proposal, and the result imports
@@ -70,6 +56,28 @@ fi
 
 cp "$ROOT/COPYING" "$OUT/COPYING"
 cp "$ROOT/crates/rars-wasm/README.md" "$OUT/README.md"
+
+for file in api.js client.js worker-engine.js; do
+    sed "s/__RARS_VERSION__/$VERSION/g" "$ROOT/npm-src/$file" > "$OUT/browser/$file"
+    sed "s/__RARS_VERSION__/$VERSION/g" "$ROOT/npm-src/$file" > "$OUT/node/$file"
+done
+sed "s/__RARS_VERSION__/$VERSION/g" "$ROOT/npm-src/browser-index.js" > "$OUT/browser/index.js"
+cp "$ROOT/npm-src/browser-worker.js" "$OUT/browser/worker.js"
+sed "s/__RARS_VERSION__/$VERSION/g" "$ROOT/npm-src/node-index.js" > "$OUT/node/index.js"
+sed "s/__RARS_VERSION__/$VERSION/g" "$ROOT/npm-src/node-index.cjs" > "$OUT/node/index.cjs"
+cp "$ROOT/npm-src/node-worker.cjs" "$OUT/node/worker.cjs"
+cp "$ROOT/npm-src/index.d.ts" "$OUT/browser/index.d.ts"
+cp "$ROOT/npm-src/index.d.ts" "$OUT/node/base.d.ts"
+cp "$ROOT/npm-src/node.d.ts" "$OUT/node/index.d.ts"
+
+# These three sources use one named ESM export each. Produce their CommonJS
+# twins without introducing a bundler into the release toolchain.
+sed 's/^export function createApi/function createApi/' "$ROOT/npm-src/api.js" > "$OUT/node/api.cjs"
+echo 'module.exports = { createApi };' >> "$OUT/node/api.cjs"
+sed 's/^export function createClient/function createClient/' "$ROOT/npm-src/client.js" > "$OUT/node/client.cjs"
+echo 'module.exports = { createClient };' >> "$OUT/node/client.cjs"
+sed 's/^export function startWorker/function startWorker/' "$ROOT/npm-src/worker-engine.js" > "$OUT/node/worker-engine.cjs"
+echo 'module.exports = { startWorker };' >> "$OUT/node/worker-engine.cjs"
 
 python3 - "$OUT" "$VERSION" <<'PY'
 import json
@@ -94,29 +102,28 @@ version = sys.argv[2]
             "repository": {"type": "git", "url": "git+https://github.com/bitplane/rars.git"},
             "keywords": ["rar", "archive", "compression", "unrar", "wasm", "webassembly"],
             "type": "module",
-            "types": "./bundler/rars_wasm.d.ts",
-            "main": "./node/rars_wasm.js",
-            "module": "./bundler/rars_wasm.js",
-            "browser": "./web/rars_wasm.js",
+            "types": "./browser/index.d.ts",
+            "main": "./node/index.cjs",
+            "module": "./browser/index.js",
+            "browser": "./browser/index.js",
             "exports": {
                 ".": {
-                    "types": "./bundler/rars_wasm.d.ts",
-                    "node": "./node/rars_wasm.js",
-                    "browser": "./bundler/rars_wasm.js",
-                    "default": "./bundler/rars_wasm.js",
-                },
-                "./web": {
-                    "types": "./web/rars_wasm.d.ts",
-                    "default": "./web/rars_wasm.js",
-                },
-                "./node": {
-                    "types": "./node/rars_wasm.d.ts",
-                    "default": "./node/rars_wasm.js",
+                    "node": {
+                        "types": "./node/index.d.ts",
+                        "import": "./node/index.js",
+                        "require": "./node/index.cjs",
+                    },
+                    "browser": {
+                        "types": "./browser/index.d.ts",
+                        "default": "./browser/index.js",
+                    },
+                    "types": "./browser/index.d.ts",
+                    "default": "./browser/index.js",
                 },
                 "./package.json": "./package.json",
             },
-            "files": ["bundler/", "node/", "web/", "README.md", "COPYING"],
-            "sideEffects": ["./bundler/rars_wasm.js", "./web/rars_wasm.js"],
+            "files": ["browser/", "node/", "README.md", "COPYING"],
+            "sideEffects": False,
             "engines": {"node": ">=18"},
             "publishConfig": {"access": "public"},
         },
@@ -127,12 +134,9 @@ version = sys.argv[2]
 
 # wasm-bindgen writes a package.json into each target directory. They name the
 # same package and would confuse a publish, so drop them.
-for stale in out.glob("*/package.json"):
+for stale in out.glob("*/*/package.json"):
     stale.unlink()
-
-# The node target is CommonJS, and a top-level "type": "module" would make Node
-# refuse to require it. Its own directory says otherwise.
-(out / "node" / "package.json").write_text('{ "type": "commonjs" }\n')
+(out / "node" / "wasm" / "package.json").write_text('{ "type": "commonjs" }\n')
 PY
 
 echo

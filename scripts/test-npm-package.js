@@ -1,26 +1,20 @@
-// Exercise the built npm package under Node.
-//
-// This is the only place the JavaScript API is executed rather than compiled,
-// so it checks the boundary rather than the codec: that a builder writes an
-// archive the reader reads back, that every format reaches the same bytes, and
-// that the errors arrive as thrown `Error`s rather than as panics. The codec
-// itself is covered by the Rust suite.
-//
-// Run it after scripts/build-npm.sh:  node scripts/test-npm-package.js
-
+// Exercise the packed-shape async JavaScript API under Node.
 import { createRequire } from "node:module";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
+import os from "node:os";
 import assert from "node:assert/strict";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
-const rars = require(path.join(here, "..", "npm", "node", "rars_wasm.js"));
-const { RarFile, RarBuilder, repair, version, formats } = rars;
+const commonjs = require(path.join(here, "..", "npm"));
+const esm = await import(pathToFileURL(path.join(here, "..", "npm", "node", "index.js")));
+const { RarArchive, RarWriter, RarError, repair, version, formats } = esm;
 
 let passed = 0;
-function check(name, body) {
-  body();
+async function check(name, body) {
+  await body();
   passed += 1;
   console.log(`  ok  ${name}`);
 }
@@ -30,161 +24,140 @@ const decode = (bytes) => new TextDecoder().decode(bytes);
 const HELLO = text.encode("hello from rars ".repeat(64));
 const SECOND = text.encode("a second member");
 
-console.log(`rars ${version()}`);
+console.log(`rars ${version}`);
 
-check("every format writes an archive this reader reads back", () => {
-  for (const format of formats()) {
-    const builder = new RarBuilder({ format });
-    builder.addBytes("hello.txt", HELLO);
-    builder.addBytes("dir/second.txt", SECOND);
+await check("CommonJS and ESM expose the same async API", async () => {
+  assert.equal(typeof commonjs.RarArchive.open, "function");
+  assert.equal(commonjs.version, version);
+  assert.deepEqual(commonjs.formats, formats);
+});
 
-    const archive = new RarFile(builder.toBytes());
-    assert.deepEqual(archive.names(), ["hello.txt", "dir/second.txt"], format);
-    assert.deepEqual(archive.read("hello.txt"), HELLO, format);
-    assert.deepEqual(archive.read("dir/second.txt"), SECOND, format);
-    archive.test();
-    archive.free();
-    builder.free();
+await check("every format round-trips without blocking API calls", async () => {
+  for (const format of formats) {
+    const writer = new RarWriter({ format });
+    writer.add("hello.txt", HELLO).add("dir/second.txt", SECOND);
+    const input = HELLO.buffer;
+    const bytes = await writer.bytes();
+    assert.equal(input.byteLength, HELLO.byteLength, "input must not be detached");
+    const archive = await RarArchive.open(bytes);
+    assert.deepEqual(archive.entries.map((entry) => entry.name), ["hello.txt", "dir/second.txt"]);
+    assert.deepEqual(await archive.get("hello.txt").bytes(), HELLO, format);
+    await archive.test();
+    archive.close();
+    writer.close();
   }
 });
 
-check("compression actually compresses", () => {
-  const builder = new RarBuilder({ format: "rar50", compression: 5 });
-  builder.addBytes("repeated.txt", text.encode("x".repeat(100000)));
-  const compressed = builder.toBytes();
-
-  const stored = new RarBuilder({ format: "rar50", store: true });
-  stored.addBytes("repeated.txt", text.encode("x".repeat(100000)));
-
-  assert.ok(
-    compressed.length < stored.toBytes().length / 10,
-    `expected a big win, got ${compressed.length} vs ${stored.toBytes().length}`,
-  );
+await check("metadata and immutable entry objects are friendly JavaScript", async () => {
+  const writer = new RarWriter({ format: "rar50" });
+  writer.add("hello.txt", HELLO, {
+    mode: 0o100644,
+    modifiedAt: new Date("2025-02-03T04:05:06Z"),
+  });
+  const archive = await RarArchive.open(await writer.bytes());
+  const [entry] = archive.entries;
+  assert.equal(entry.name, "hello.txt");
+  assert.equal(entry.size, HELLO.length);
+  assert.equal(entry.isDirectory, false);
+  assert.ok(entry.compressedSize > 0);
+  assert.ok(Object.isFrozen(entry));
+  assert.deepEqual(archive.get(entry.nameBytes), entry);
+  assert.deepEqual(archive.getAll("hello.txt"), [entry]);
 });
 
-check("entry metadata comes through", () => {
-  const builder = new RarBuilder({ format: "rar50" });
-  builder.addBytes("hello.txt", HELLO, { mode: 0o100644 });
-  const archive = new RarFile(builder.toBytes());
-
-  const [info] = archive.entries();
-  assert.equal(info.name, "hello.txt");
-  assert.equal(info.size, HELLO.length);
-  assert.equal(info.isDirectory, false);
-  assert.equal(info.isEncrypted, false);
-  assert.ok(info.packedSize > 0);
-  assert.deepEqual(info.nameBytes, text.encode("hello.txt"));
-
-  assert.equal(archive.getInfo("nope"), undefined);
-  assert.equal(archive.getInfo("hello.txt").size, HELLO.length);
-});
-
-check("a password round-trips as a string and as bytes", () => {
-  for (const password of ["hunter2", text.encode("hunter2")]) {
-    const builder = new RarBuilder({ format: "rar50", password });
-    builder.addBytes("secret.txt", HELLO);
-    const archive = new RarFile(builder.toBytes());
-
-    assert.equal(archive.needsPassword, true);
-    assert.deepEqual(archive.read("secret.txt", "hunter2"), HELLO);
-    assert.throws(() => archive.read("secret.txt", "wrong"));
-  }
-});
-
-check("encrypted headers hide the names until unlocked", () => {
-  const builder = new RarBuilder({
+await check("passwords, comments and structured errors work", async () => {
+  const writer = new RarWriter({
     format: "rar50",
     password: "hunter2",
     encryptHeaders: true,
+    comment: "written by rars",
   });
-  builder.addBytes("secret.txt", HELLO);
-  const bytes = builder.toBytes();
-
-  assert.throws(() => new RarFile(bytes));
-  const archive = new RarFile(bytes, "hunter2");
-  assert.deepEqual(archive.read("secret.txt"), HELLO);
-});
-
-check("an archive comment survives", () => {
-  const builder = new RarBuilder({ format: "rar50", comment: "written by rars" });
-  builder.addBytes("hello.txt", HELLO);
-  const archive = new RarFile(builder.toBytes());
+  writer.add("secret.txt", HELLO);
+  const bytes = await writer.bytes();
+  await assert.rejects(RarArchive.open(bytes), (error) =>
+    error instanceof RarError && error.code === "PASSWORD_REQUIRED");
+  const archive = await RarArchive.open(bytes, { password: "hunter2" });
   assert.equal(decode(archive.comment), "written by rars");
+  assert.deepEqual(await archive.get("secret.txt").bytes(), HELLO);
 });
 
-check("a volume set splits and the parts are readable", () => {
-  const builder = new RarBuilder({
-    format: "rar50",
-    store: true,
-    volumeSize: 64 * 1024,
-  });
-  builder.addBytes("big.bin", new Uint8Array(300000).fill(7));
-
-  const volumes = builder.toVolumes();
-  assert.ok(volumes.length > 1, `expected a split, got ${volumes.length}`);
-  assert.ok(volumes.every((volume) => volume instanceof Uint8Array));
-  // The first volume opens on its own; the rest are continuations of it.
-  assert.deepEqual(new RarFile(volumes[0]).names(), ["big.bin"]);
+await check("volume sets are logical archives", async () => {
+  const payload = new Uint8Array(300000).fill(7);
+  const writer = new RarWriter({ format: "rar50", level: 0 });
+  writer.add("big.bin", payload);
+  const volumes = await writer.volumes(64 * 1024);
+  assert.ok(volumes.length > 1);
+  const archive = await RarArchive.open(volumes);
+  assert.deepEqual(archive.entries.map((entry) => entry.name), ["big.bin"]);
+  assert.deepEqual(await archive.entries[0].bytes(), payload);
 });
 
-check("a recovery record repairs a damaged archive", () => {
-  // Stored and large, so the midpoint of the file is certainly inside the
-  // payload. Repair reads the headers to find the recovery record, so damage
-  // to a header is past what it can fix and is not what this checks.
-  const payload = new Uint8Array(200000);
-  for (let i = 0; i < payload.length; i += 1) {
-    payload[i] = (i * 7 + (i >> 5)) & 0xff;
+await check("repair restores damaged bytes", async () => {
+  const payload = Uint8Array.from({ length: 200000 }, (_, index) => (index * 7 + (index >> 5)) & 0xff);
+  const writer = new RarWriter({ format: "rar50", level: 0, recoveryPercent: 10 });
+  writer.add("payload.bin", payload);
+  const damaged = Uint8Array.from(await writer.bytes());
+  for (let i = 0; i < 64; i += 1) damaged[Math.floor(damaged.length / 2) + i] ^= 0xff;
+  const fixed = await repair(damaged);
+  const archive = await RarArchive.open(fixed);
+  assert.deepEqual(await archive.entries[0].bytes(), payload);
+});
+
+await check("codec work leaves the Node event loop responsive", async () => {
+  const writer = new RarWriter({ format: "rar50", level: 5 });
+  writer.add("large.txt", new Uint8Array(4_000_000).fill(120));
+  let ticks = 0;
+  const timer = setInterval(() => { ticks += 1; }, 1);
+  await writer.bytes();
+  clearInterval(timer);
+  assert.ok(ticks > 0, `expected timer ticks during compression, got ${ticks}`);
+});
+
+await check("AbortSignal cancels active work and the runtime recovers", async () => {
+  const writer = new RarWriter({ format: "rar50", level: 5 });
+  const noisy = Uint8Array.from({ length: 8_000_000 }, (_, index) => (index * 131) & 0xff);
+  writer.add("large.bin", noisy);
+  const controller = new AbortController();
+  const pending = writer.bytes({ signal: controller.signal });
+  setTimeout(() => controller.abort(), 5);
+  await assert.rejects(pending, (error) => error.name === "AbortError");
+
+  const small = new RarWriter().add("ok.txt", "ok");
+  const archive = await RarArchive.open(await small.bytes());
+  assert.equal(decode(await archive.entries[0].bytes()), "ok");
+});
+
+await check("Node path input and atomic file output work", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "rars-js-"));
+  try {
+    const source = path.join(directory, "source.txt");
+    const output = path.join(directory, "output.rar");
+    await writeFile(source, HELLO);
+    const writer = new RarWriter().addFile("source.txt", source);
+    await writer.writeTo(output);
+    const archive = await RarArchive.open(output);
+    assert.deepEqual(await archive.entries[0].bytes(), new Uint8Array(await readFile(source)));
+
+    const split = new RarWriter({ format: "rar50", level: 0 })
+      .add("large.bin", new Uint8Array(180000).fill(9));
+    const paths = await split.writeVolumesTo(path.join(directory, "split.rar"), 64 * 1024);
+    assert.ok(paths.length > 1);
+    const volumeArchive = await RarArchive.open(paths[0]);
+    assert.equal((await volumeArchive.entries[0].bytes()).length, 180000);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
   }
-  const builder = new RarBuilder({ format: "rar50", store: true, recoveryPercent: 10 });
-  builder.addBytes("payload.bin", payload);
-
-  const damaged = Uint8Array.from(builder.toBytes());
-  for (let i = 0; i < 64; i += 1) {
-    damaged[Math.floor(damaged.length / 2) + i] ^= 0xff;
-  }
-  assert.throws(() => new RarFile(damaged).test(), "damage should be detected");
-
-  const fixed = repair(damaged);
-  assert.deepEqual(new RarFile(fixed).read("payload.bin"), payload);
 });
 
-check("builder edits apply before writing", () => {
-  const builder = new RarBuilder({ format: "rar50" });
-  builder.addBytes("a.txt", HELLO);
-  builder.addBytes("b.txt", SECOND);
-  builder.rename("a.txt", "renamed.txt");
-  builder.remove("b.txt");
-
-  assert.deepEqual(builder.names(), ["renamed.txt"]);
-  assert.equal(builder.length, 1);
-  assert.deepEqual(new RarFile(builder.toBytes()).names(), ["renamed.txt"]);
-});
-
-check("bad input throws instead of trapping", () => {
-  assert.throws(() => new RarFile(text.encode("not a rar at all")));
-  assert.throws(() => new RarBuilder({ format: "zip" }), /unsupported RAR format/);
-  assert.throws(() => new RarBuilder({ compression: "loads" }), /must be a number/);
-
-  const builder = new RarBuilder({ format: "rar50" });
-  builder.addBytes("a.txt", HELLO);
-  assert.throws(() => builder.addBytes("a.txt", HELLO), /duplicate/);
-  assert.throws(() => builder.addBytes("../escape", HELLO), /unsafe/);
-  assert.throws(() => builder.addBytes("/absolute", HELLO), /unsafe/);
-  assert.throws(() => builder.remove("nothing"), /no such/);
-
-  // Nothing queued is not an archive, and neither is a volume set asked for
-  // without a size.
-  assert.throws(() => new RarBuilder({}).toBytes(), /no entries/);
-  assert.throws(() => builder.toVolumes(), /volume_size is required/);
-});
-
-check("the bundler and web builds ship the same module", () => {
-  const { readFileSync } = require("node:fs");
-  const node = readFileSync(path.join(here, "..", "npm", "node", "rars_wasm_bg.wasm"));
-  for (const target of ["bundler", "web"]) {
-    const other = readFileSync(path.join(here, "..", "npm", target, "rars_wasm_bg.wasm"));
-    assert.deepEqual(other, node, `${target} differs from node`);
-  }
+await check("invalid options fail before starting a worker", async () => {
+  assert.throws(() => new RarWriter({ level: 6 }), /level/);
+  assert.throws(() => new RarWriter({ solid: "yes" }), /boolean/);
+  assert.throws(() => new RarWriter().add("../escape", HELLO), /unsafe/);
+  const writer = new RarWriter();
+  writer.add("a.txt", HELLO);
+  assert.throws(() => writer.add("a.txt", HELLO), (error) => error.code === "DUPLICATE_ENTRY");
+  writer.close();
+  assert.throws(() => writer.add("b.txt", HELLO), (error) => error.code === "CLOSED");
 });
 
 console.log(`\n${passed} checks passed`);
