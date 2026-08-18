@@ -573,8 +573,11 @@ jobs:
             echo "@bitplane/rars@$VERSION is already published; nothing to do"
             exit 0
           fi
-          # npm pack flattens the scope into the filename.
-          npm publish --provenance --access public "dist/bitplane-rars-$VERSION.tgz"
+          # The leading ./ is load-bearing. npm parses a bare `dist/foo.tgz` as
+          # the git shorthand `github:dist/foo.tgz` and refuses it with
+          # EALLOWGIT; only an explicit relative or absolute path is read as a
+          # file. npm pack flattens the scope into the filename.
+          npm publish --provenance --access public "./dist/bitplane-rars-$VERSION.tgz"
 
   # ----------------------------------------------------------------------
   # 7. Publish the packaged binaries to the tagged GitHub Release.
