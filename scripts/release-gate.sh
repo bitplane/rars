@@ -17,3 +17,13 @@ cargo test --workspace --all-targets --locked
 # python/tests against it, which nothing else does: until this line existed the
 # suite had never run anywhere, in CI or out of it.
 python3 scripts/test-python-bindings.py
+
+# The npm package ships from the same tag as the crates, so the gate builds it
+# and runs its checks under Node. This is the only place the JavaScript API is
+# executed rather than compiled: the Rust suite proves the codec, and these
+# prove the boundary the codec is reached through.
+#
+# Needs the wasm32-unknown-unknown target, wasm-bindgen and Node. Missing tools
+# fail here rather than skipping, for the same reason the decoder matrix does.
+./scripts/build-npm.sh
+node scripts/test-npm-package.js

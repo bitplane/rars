@@ -2,6 +2,10 @@ target
 __pycache__/
 .rars-spool*
 
+# Built by scripts/build-npm.sh.
+npm/
+node_modules/
+
 .codex
 .claude
 review.md

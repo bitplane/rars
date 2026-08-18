@@ -97,7 +97,7 @@ pub(super) fn compress_members_reporting(
     }
     let batch_capacity = usize::try_from(max_jobs_by_memory)
         .unwrap_or(usize::MAX)
-        .min(rayon::current_num_threads())
+        .min(crate::parallel::threads())
         .max(1);
 
     // Filters and multi-candidate encoding both need the whole member at once.

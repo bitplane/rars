@@ -18,6 +18,7 @@ on:
         type: choice
         options:
           - pypi
+          - npm
           - all
 
 # Default deny; each job re-grants only what it needs.
@@ -148,6 +149,23 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.10"
+
+      # The gate also builds the npm package and runs its checks, which needs a
+      # wasm target, wasm-bindgen and Node. The wasm-bindgen version has to
+      # match the crate the module was compiled against or the generated glue
+      # will not load it, so it is pinned here and in Cargo.lock together.
+      - name: Install wasm toolchain
+        run: |
+          set -euo pipefail
+          rustup target add wasm32-unknown-unknown
+          cargo install wasm-bindgen-cli --version 0.2.126 --locked
+          npm install --global binaryen@132
+          wasm-bindgen --version
+          wasm-opt --version
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
 
       # The same script `just gate` runs. Spelling the steps out here again is
       # how the Python suite came to run in neither place: it was added to the
@@ -413,6 +431,62 @@ jobs:
           retention-days: 7
 
   # ----------------------------------------------------------------------
+  # 5b. Build the npm package. One WebAssembly module serves every platform,
+  #     so unlike the wheels this is a single job with no matrix.
+  # ----------------------------------------------------------------------
+  build-npm:
+    name: Build npm package
+    needs: [verify-tag, test]
+    if: github.event_name == 'push' || inputs.publish == 'npm' || inputs.publish == 'all'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_REF }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm32
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install wasm tooling
+        run: |
+          set -euo pipefail
+          cargo install wasm-bindgen-cli --version 0.2.126 --locked
+          npm install --global binaryen@132
+
+      - run: ./scripts/build-npm.sh
+
+      # Building and testing in one job so the tarball that gets published is
+      # the one the checks ran against, byte for byte.
+      - run: node scripts/test-npm-package.js
+
+      - name: Pack
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          npm pack --pack-destination dist ./npm
+          ls -la dist/
+
+      - name: Upload npm artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: npm-${{ needs.verify-tag.outputs.version }}
+          path: dist/*.tgz
+          if-no-files-found: error
+          retention-days: 7
+
+  # ----------------------------------------------------------------------
   # 6. Publish Python wheels and sdist to PyPI using Trusted Publishing.
   #    Configure the `release` environment as a PyPI trusted publisher.
   # ----------------------------------------------------------------------
@@ -447,11 +521,66 @@ jobs:
           skip-existing: true
 
   # ----------------------------------------------------------------------
+  # 6b. Publish the npm package.
+  #
+  #     npm trusted publishing needs the package to already exist and to have
+  #     this repository registered as its publisher, so the very first version
+  #     goes up by hand with `npm publish` and every later one comes from here.
+  #     `id-token: write` is what mints the provenance attestation.
+  # ----------------------------------------------------------------------
+  publish-npm:
+    name: Publish npm package
+    needs: [verify-tag, build-npm]
+    if: github.event_name == 'push' || inputs.publish == 'npm' || inputs.publish == 'all'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      # Trusted publishing needs npm 11.5.1 or newer to mint the OIDC token.
+      # Node 22 ships npm 10.
+      - name: Update npm
+        run: npm install --global npm@latest
+
+      - name: Download npm artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: npm-${{ needs.verify-tag.outputs.version }}
+          path: dist
+
+      # No token: npm trusted publishing exchanges the workflow's OIDC identity
+      # for a short-lived credential, and attaches a provenance attestation
+      # saying which commit and workflow built the tarball. Set that up once, in
+      # the package's settings on npmjs.com, pointing at this repository and
+      # this workflow file. NPM_TOKEN is the fallback for when that is not
+      # configured yet.
+      #
+      # Republishing a version npm already has is an error, and a re-run of a
+      # release should not fail on it, so ask first.
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ needs.verify-tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          if npm view "rars@$VERSION" version >/dev/null 2>&1; then
+            echo "rars@$VERSION is already published; nothing to do"
+            exit 0
+          fi
+          npm publish --provenance --access public "dist/rars-$VERSION.tgz"
+
+  # ----------------------------------------------------------------------
   # 7. Publish the packaged binaries to the tagged GitHub Release.
   # ----------------------------------------------------------------------
   publish-github-release:
     name: Publish GitHub Release
-    needs: [verify-tag, build, publish-crates, publish-pypi]
+    needs: [verify-tag, build, publish-crates, publish-pypi, publish-npm]
     if: github.event_name == 'push' || inputs.publish == 'all'
     runs-on: ubuntu-latest
     permissions:
@@ -474,3 +603,4 @@ jobs:
             dist/*.tar.gz
             dist/*.zip
             dist/*.whl
+            dist/*.tgz

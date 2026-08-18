@@ -199,14 +199,28 @@ pub(crate) struct MemoryPermit {
 
 static SPOOL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Where a spool keeps its bytes.
+///
+/// A file on every real platform, which is the point: the RAR 5 writer spools
+/// so that a member larger than the memory budget still gets written. Bare
+/// WebAssembly has no filesystem, so there it is a buffer, and the budget stops
+/// being a promise the writer can keep. Nothing else changes, because both
+/// types are `Read + Write + Seek`.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+type SpoolStore = File;
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+type SpoolStore = Cursor<Vec<u8>>;
+
 pub(crate) struct Spool {
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     path: PathBuf,
-    file: File,
+    file: SpoolStore,
     len: u64,
     pos: u64,
 }
 
 impl Spool {
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub(crate) fn create(resources: &WriterResources) -> Result<Self> {
         let directory = resources.temp_dir().unwrap_or_else(|| Path::new("."));
         for _ in 0..128 {
@@ -238,6 +252,16 @@ impl Spool {
             "could not allocate a unique rars spool file",
         )
         .into())
+    }
+
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    pub(crate) fn create(_resources: &WriterResources) -> Result<Self> {
+        SPOOL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        Ok(Self {
+            file: Cursor::new(Vec::new()),
+            len: 0,
+            pos: 0,
+        })
     }
 
     pub(crate) fn len(&self) -> u64 {
@@ -311,6 +335,7 @@ impl Seek for Spool {
     }
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 impl Drop for Spool {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);

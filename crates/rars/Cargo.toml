@@ -23,10 +23,21 @@ aes.workspace = true
 aho-corasick.workspace = true
 getrandom.workspace = true
 hmac.workspace = true
-rayon.workspace = true
 sha1.workspace = true
 sha2.workspace = true
 zeroize.workspace = true
+
+# Bare WebAssembly cannot start a thread, so rayon's pool panics rather than
+# running sequentially. `parallel.rs` has a single-threaded path for that target
+# and rayon is left out of the build entirely.
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
+rayon.workspace = true
+
+# `getrandom` has no default entropy source on bare WebAssembly. RAR 5 header
+# encryption needs one, so point it at the host's `crypto.getRandomValues`. The
+# matching `--cfg getrandom_backend="wasm_js"` lives in `.cargo/config.toml`.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { workspace = true, features = ["wasm_js"] }
 
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }

@@ -3,6 +3,7 @@ members = [
     "crates/rars",
     "crates/rars-cli",
     "crates/rars-python",
+    "crates/rars-wasm",
 ]
 resolver = "2"
 
@@ -24,6 +25,7 @@ clap = { version = "4.6", features = ["derive", "wrap_help"] }
 getrandom = "0.4"
 hmac = "0.13"
 indicatif = "0.18.6"
+js-sys = "0.3"
 libc = "0.2"
 pyo3 = "0.29.0"
 rayon = "1.12.0"
@@ -31,6 +33,7 @@ rars = { version = "0.7.2", path = "crates/rars" }
 rpassword = "7"
 sha1 = "0.11"
 sha2 = "0.11"
+wasm-bindgen = "0.2"
 zeroize = { version = "1.8", default-features = false, features = ["alloc", "zeroize_derive"] }
 
 [workspace.lints.rust]
@@ -46,3 +49,15 @@ unimplemented = "warn"
 # Keep symbols and line tables so crash reports from users are readable.
 debug = "line-tables-only"
 strip = "none"
+
+# The npm package. `release` keeps line tables so a user's crash report is
+# readable, which is right for a binary they run and wrong for a module they
+# download: it was two thirds of the wasm. Speed stays at opt-level 3 because
+# this profile builds a compressor, and `wasm-opt -Oz` in scripts/build-npm.sh
+# takes the size back afterwards.
+[profile.release-wasm]
+inherits = "release"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

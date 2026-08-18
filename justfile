@@ -22,6 +22,13 @@ speed *ARGS:
 python:
     python3 scripts/test-python-bindings.py
 
+# Build the npm package from crates/rars-wasm into npm/ and run its checks
+# under Node. Separate from `check` because it needs the wasm32 target,
+# wasm-bindgen and Node; `gate` runs it.
+npm:
+    ./scripts/build-npm.sh
+    node scripts/test-npm-package.js
+
 # What CI runs before a release, including the external decoders and the Python
 # bindings. Fails rather than skips when the decoders are missing.
 gate:

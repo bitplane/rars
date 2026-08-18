@@ -1,0 +1,5 @@
+# `getrandom` refuses to guess an entropy source on bare WebAssembly, so the
+# backend has to be named at build time. `crypto.getRandomValues` is the one
+# every host has, and RAR 5 header encryption is what needs it.
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

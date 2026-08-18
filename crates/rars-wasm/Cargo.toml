@@ -1,0 +1,40 @@
+[package]
+name = "rars-wasm"
+version = "0.7.2"
+description = "WebAssembly bindings for the rars RAR archive toolkit."
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# The workspace forbids unsafe, and `forbid` cannot be lifted from inside a
+# module, so this crate cannot inherit it: every `#[wasm_bindgen]` export
+# expands to an `extern "C"` shim that the macro writes for us. The rest of the
+# workspace lints are repeated here so the difference stays visible and stays
+# down to that one line.
+[lints.rust]
+unused_must_use = "deny"
+
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+
+[dependencies]
+js-sys.workspace = true
+rars_rs = { package = "rars", version = "0.7.2", path = "../rars" }
+wasm-bindgen.workspace = true
+
+# `getrandom` has no default source on `wasm32-unknown-unknown`, because a bare
+# Wasm module has no entropy of its own. This points it at the host's
+# `crypto.getRandomValues`, which is what encrypts RAR 5 headers. The matching
+# `--cfg getrandom_backend="wasm_js"` lives in `.cargo/config.toml`.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { workspace = true, features = ["wasm_js"] }
