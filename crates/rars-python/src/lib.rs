@@ -4,7 +4,7 @@ use pyo3::types::{PyBytes, PyList, PyModule};
 use pyo3::{create_exception, PyErr};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, Cursor, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,9 +15,6 @@ create_exception!(rars, BadPassword, BadRarFile);
 create_exception!(rars, PasswordRequired, BadRarFile);
 create_exception!(rars, UnsupportedRarFeature, Error);
 create_exception!(rars, UnsafeArchivePath, Error);
-
-const DOS_ARCHIVE_ATTR: u8 = 0x20;
-const DEFAULT_HOST_OS_UNIX: u64 = 3;
 
 #[pyclass(frozen, module = "rars", skip_from_py_object)]
 #[derive(Debug, Clone)]
@@ -291,7 +288,7 @@ impl RarFile {
     ) -> PyResult<Vec<u8>> {
         let target = member_name_bytes(name)?;
         let password = py_password(pwd)?.or_else(|| self.password.clone());
-        py.detach(|| read_member(&self.archive, &target, password.as_deref()))
+        py.detach(|| self.archive.read_member(&target, password.as_deref()))
             .map_err(map_error)?
             .ok_or_else(|| PyKeyError::new_err(String::from_utf8_lossy(&target).into_owned()))
     }
@@ -368,14 +365,14 @@ impl RarFile {
     #[pyo3(signature = (pwd = None))]
     fn testrar(&self, py: Python<'_>, pwd: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
         let password = py_password(pwd)?.or_else(|| self.password.clone());
-        py.detach(|| test_archive(&self.archive, password.as_deref()))
+        py.detach(|| self.archive.test(password.as_deref()))
             .map_err(map_error)
     }
 
     #[getter]
     fn comment(&self, py: Python<'_>) -> PyResult<Option<Vec<u8>>> {
         let password = self.password.clone();
-        py.detach(|| archive_comment(&self.archive, password.as_deref()))
+        py.detach(|| self.archive.comment(password.as_deref()))
             .map_err(map_error)
     }
 
@@ -434,28 +431,15 @@ impl RarFile {
     }
 }
 
+/// The Python face of [`rars_rs::Builder`]. Everything about choosing a writer,
+/// mapping members onto entry types and splitting volumes lives in the core
+/// crate; what is left here is argument conversion and the exception types
+/// Python callers catch.
 #[pyclass(module = "rars", skip_from_py_object)]
 #[derive(Debug, Clone)]
 struct RarBuilder {
+    inner: rars_rs::Builder,
     format: rars_rs::ArchiveVersion,
-    compression: Option<u8>,
-    store: bool,
-    solid: bool,
-    password: Option<Vec<u8>>,
-    encrypt_headers: bool,
-    comment: Option<Vec<u8>>,
-    recovery_percent: Option<u64>,
-    volume_size: Option<usize>,
-    entries: Vec<BuilderEntry>,
-}
-
-#[derive(Debug, Clone)]
-struct BuilderEntry {
-    name: Vec<u8>,
-    data: Vec<u8>,
-    source: Option<rars_rs::EntrySource>,
-    mtime: Option<u32>,
-    mode: Option<u32>,
 }
 
 fn python_progress(callback: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Arc<PythonProgress>>> {
@@ -469,14 +453,52 @@ fn python_progress(callback: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Arc<P
         .transpose()
 }
 
-fn rar50_writer<'a>(
-    options: rars_rs::rar50::WriterOptions,
-    progress: Option<&'a PythonProgress>,
-) -> rars_rs::rar50::Rar50Writer<'a> {
-    let writer = rars_rs::rar50::Rar50Writer::new(options);
-    match progress {
-        Some(progress) => writer.progress(progress),
-        None => writer,
+/// Which Python exception a builder refusal becomes. The general mapping turns
+/// every `rars_rs::Error` into `BadRarFile`, but these three are argument
+/// mistakes rather than archive problems, and Python callers have always caught
+/// them as such.
+#[derive(Debug, PartialEq, Eq)]
+enum BuilderRefusal {
+    NoSuchEntry,
+    DuplicateName,
+    Symlink,
+    Other,
+}
+
+fn classify_builder_error(error: &rars_rs::Error) -> BuilderRefusal {
+    let rars_rs::Error::AtEntry { source, .. } = error else {
+        return BuilderRefusal::Other;
+    };
+    match **source {
+        rars_rs::Error::InvalidHeader("no such archive entry") => BuilderRefusal::NoSuchEntry,
+        rars_rs::Error::InvalidHeader("duplicate archive entry name") => {
+            BuilderRefusal::DuplicateName
+        }
+        rars_rs::Error::InvalidHeader("input is a symlink; refusing to follow it") => {
+            BuilderRefusal::Symlink
+        }
+        _ => BuilderRefusal::Other,
+    }
+}
+
+fn map_builder_error(error: rars_rs::Error) -> PyErr {
+    let refusal = classify_builder_error(&error);
+    if refusal == BuilderRefusal::Other {
+        return map_error(error);
+    }
+    let rars_rs::Error::AtEntry { ref name, .. } = error else {
+        return map_error(error);
+    };
+    let name = String::from_utf8_lossy(name).into_owned();
+    match refusal {
+        BuilderRefusal::NoSuchEntry => PyKeyError::new_err(name),
+        BuilderRefusal::DuplicateName => {
+            PyValueError::new_err(format!("duplicate archive entry name: {name}"))
+        }
+        BuilderRefusal::Symlink => PyValueError::new_err(format!(
+            "input '{name}' is a symlink; refusing to follow it"
+        )),
+        BuilderRefusal::Other => map_error(error),
     }
 }
 
@@ -513,17 +535,18 @@ impl RarBuilder {
                 "filter selection is not exposed yet; use the default writer filter policy",
             ));
         }
+        let format = parse_version(format)?;
         Ok(Self {
-            format: parse_version(format)?,
-            compression: Some(compression),
-            store,
-            solid,
-            password: py_password(password)?,
-            encrypt_headers,
-            comment: py_optional_bytes(comment)?,
-            recovery_percent,
-            volume_size,
-            entries: Vec::new(),
+            inner: rars_rs::Builder::new(format)
+                .compression_level(Some(compression))
+                .store(store)
+                .solid(solid)
+                .password(py_password(password)?)
+                .header_encryption(encrypt_headers)
+                .comment(py_optional_bytes(comment)?)
+                .recovery_percent(recovery_percent)
+                .volume_size(volume_size),
+            format,
         })
     }
 
@@ -543,17 +566,12 @@ impl RarBuilder {
             Err(_) => RarFile::new(py, source, "r", password)?,
         };
         let password = archive.password.clone();
+        let format = rars_rs::ArchiveVersion::Rar50;
         let mut builder = Self {
-            format: rars_rs::ArchiveVersion::Rar50,
-            compression: Some(3),
-            store: false,
-            solid: false,
-            password: None,
-            encrypt_headers: false,
-            comment: archive.comment(py)?,
-            recovery_percent: None,
-            volume_size: None,
-            entries: Vec::new(),
+            inner: rars_rs::Builder::new(format)
+                .compression_level(Some(3))
+                .comment(archive.comment(py)?),
+            format,
         };
         for info in &archive.infos {
             if info.is_directory {
@@ -563,19 +581,22 @@ impl RarBuilder {
             let member_name = info.orig_filename_bytes.clone();
             let member_password = password.clone();
             let source = rars_rs::EntrySource::from_opener(info.file_size, move || {
-                let data = read_member(&member_archive, &member_name, member_password.as_deref())?
+                let data = member_archive
+                    .read_member(&member_name, member_password.as_deref())?
                     .ok_or(rars_rs::Error::InvalidHeader(
                         "archive member disappeared while rewriting",
                     ))?;
                 Ok(Box::new(Cursor::new(data)))
             });
-            builder.entries.push(BuilderEntry {
-                name: info.orig_filename_bytes.clone(),
-                data: Vec::new(),
-                source: Some(source),
-                mtime: None,
-                mode: Some((info.file_attr & 0o777) as u32),
-            });
+            builder
+                .inner
+                .add_source(
+                    info.orig_filename_bytes.clone(),
+                    source,
+                    None,
+                    Some((info.file_attr & 0o777) as u32),
+                )
+                .map_err(map_builder_error)?;
         }
         Ok(builder)
     }
@@ -589,12 +610,10 @@ impl RarBuilder {
     ) -> PyResult<()> {
         let path = py_path_buf(py, path)?;
         let base = match arcname {
-            Some(name) => safe_input_name(member_name_bytes(name)?)?,
+            Some(name) => member_name_bytes(name)?,
             None => archive_base_name(&path)?,
         };
-        collect_builder_input(&path, &base, &mut self.entries)?;
-        reject_duplicate_names(&self.entries)?;
-        Ok(())
+        self.inner.add_path(&path, &base).map_err(map_builder_error)
     }
 
     #[pyo3(signature = (data, arcname, mtime = None, mode = None))]
@@ -605,45 +624,28 @@ impl RarBuilder {
         mtime: Option<u32>,
         mode: Option<u32>,
     ) -> PyResult<()> {
-        self.entries.push(BuilderEntry {
-            name: safe_input_name(member_name_bytes(arcname)?)?,
-            data,
-            source: None,
-            mtime,
-            mode,
-        });
-        reject_duplicate_names(&self.entries)?;
-        Ok(())
+        self.inner
+            .add_bytes(member_name_bytes(arcname)?, data, mtime, mode)
+            .map_err(map_builder_error)
     }
 
     fn remove(&mut self, name: &Bound<'_, PyAny>) -> PyResult<()> {
-        let name = member_name_bytes(name)?;
-        let old_len = self.entries.len();
-        self.entries.retain(|entry| entry.name != name);
-        if self.entries.len() == old_len {
-            return Err(PyKeyError::new_err(
-                String::from_utf8_lossy(&name).into_owned(),
-            ));
-        }
-        Ok(())
+        self.inner
+            .remove(&member_name_bytes(name)?)
+            .map_err(map_builder_error)
     }
 
     fn rename(&mut self, old: &Bound<'_, PyAny>, new: &Bound<'_, PyAny>) -> PyResult<()> {
-        let old = member_name_bytes(old)?;
-        let new = safe_input_name(member_name_bytes(new)?)?;
-        let entry = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.name == old)
-            .ok_or_else(|| PyKeyError::new_err(String::from_utf8_lossy(&old).into_owned()))?;
-        entry.name = new;
-        reject_duplicate_names(&self.entries)?;
-        Ok(())
+        self.inner
+            .rename(&member_name_bytes(old)?, member_name_bytes(new)?)
+            .map_err(map_builder_error)
     }
 
     #[pyo3(signature = (*, progress = None))]
     fn to_bytes(&self, py: Python<'_>, progress: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<u8>> {
-        self.to_bytes_with_progress(py, progress)
+        self.detached(py, progress, |builder, progress| {
+            builder.to_bytes_with_progress(progress)
+        })
     }
 
     #[pyo3(signature = (path, *, progress = None))]
@@ -654,17 +656,9 @@ impl RarBuilder {
         progress: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         let path = py_path_buf(py, path)?;
-        if self.streaming_rar50_supported() {
-            let progress = python_progress(progress)?;
-            let this = self.clone();
-            let result = py.detach(move || this.write_streaming_rar50_path(&path));
-            if let Some(error) = progress.as_ref().and_then(|progress| progress.take_error()) {
-                return Err(error);
-            }
-            return result.map_err(map_error);
-        }
-        let data = self.to_bytes_with_progress(py, progress)?;
-        py.detach(|| fs::write(&path, data)).map_err(map_io_error)
+        self.detached(py, progress, move |builder, progress| {
+            builder.write_to_path(&path, progress)
+        })
     }
 
     #[pyo3(signature = (first_path, *, progress = None))]
@@ -674,15 +668,10 @@ impl RarBuilder {
         first_path: &Bound<'_, PyAny>,
         progress: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<PathBuf>> {
-        let progress = python_progress(progress)?;
-        let this = self.clone();
         let first_path = py_path_buf(py, first_path)?;
-        let worker_progress = progress.clone();
-        let result = py.detach(move || this.build_volumes(worker_progress.as_deref()));
-        if let Some(error) = progress.as_ref().and_then(|progress| progress.take_error()) {
-            return Err(error);
-        }
-        let parts = result.map_err(map_error)?;
+        let parts = self.detached(py, progress, |builder, progress| {
+            builder.build_volumes(progress)
+        })?;
         let mut paths = Vec::with_capacity(parts.len());
         for (index, part) in parts.iter().enumerate() {
             let path = if matches!(
@@ -701,432 +690,36 @@ impl RarBuilder {
 }
 
 impl RarBuilder {
-    /// Everything the streaming writer serves, which for RAR 5 and RAR 7 is
-    /// now everything the builder can ask for except volume sets, which have
-    /// their own entry point.
-    fn streaming_rar50_supported(&self) -> bool {
-        matches!(
-            self.format,
-            rars_rs::ArchiveVersion::Rar50 | rars_rs::ArchiveVersion::Rar70
-        ) && self.volume_size.is_none()
-            && (!self.encrypt_headers || self.password.is_some())
-    }
-
-    fn streaming_archive_entries(&self) -> Vec<rars_rs::rar50::ArchiveEntry> {
-        self.entries
-            .iter()
-            .map(|entry| {
-                let source = entry.source.clone().unwrap_or_else(|| {
-                    rars_rs::EntrySource::from_bytes(std::sync::Arc::<[u8]>::from(
-                        entry.data.as_slice(),
-                    ))
-                });
-                let built = rars_rs::rar50::ArchiveEntry::new(entry.name.clone(), source)
-                    .with_mtime(entry.mtime)
-                    .with_attributes(u64::from(entry.mode.unwrap_or(0)));
-                match self.password.as_deref() {
-                    Some(password) => built.with_password(password.to_vec()),
-                    None => built,
-                }
-            })
-            .collect()
-    }
-
-    fn streaming_options(&self) -> rars_rs::rar50::WriterOptions {
-        let mut features = rars_rs::FeatureSet::store_only();
-        features.header_encryption = self.encrypt_headers;
-        features.solid = self.solid;
-        let mut options = rars_rs::rar50::WriterOptions::new(self.format, features);
-        if let Some(level) = self.compression {
-            options = options.with_compression_level(if self.store { 0 } else { level });
-        } else if self.store {
-            options = options.with_compression_level(0);
-        }
-        options
-    }
-
-    fn write_streaming_rar50_to(
-        &self,
-        output: &mut dyn io::Write,
-        resources: &rars_rs::WriterResources,
-    ) -> rars_rs::Result<()> {
-        let mut extras = rars_rs::rar50::ArchiveExtras::default()
-            .with_recovery_percent(self.recovery_percent)
-            .with_filter_policy(self.rar50_filter_policy());
-        if let Some(comment) = self.comment.as_deref() {
-            extras = extras.with_comment(comment);
-        }
-        rars_rs::rar50::write_streaming_archive_to(
-            &self.streaming_archive_entries(),
-            self.streaming_options(),
-            extras,
-            resources,
-            output,
-        )
-    }
-
-    fn write_streaming_rar50_path(&self, path: &Path) -> rars_rs::Result<()> {
-        let mut output = fs::File::create(path)?;
-        let resources = match path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            Some(parent) => rars_rs::WriterResources::default().with_temp_dir(parent),
-            None => rars_rs::WriterResources::default(),
-        };
-        self.write_streaming_rar50_to(&mut output, &resources)?;
-        output.sync_all()?;
-        Ok(())
-    }
-
-    fn to_bytes_with_progress(
+    /// Run a core-builder call with the GIL released, wiring a Python callback
+    /// to it as a progress sink. A callback that raises cancels the write, and
+    /// its exception is re-raised here rather than the cancellation the core
+    /// crate reports.
+    fn detached<T, F>(
         &self,
         py: Python<'_>,
         callback: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<Vec<u8>> {
+        run: F,
+    ) -> PyResult<T>
+    where
+        T: Send,
+        F: FnOnce(&rars_rs::Builder, Option<&dyn rars_rs::WriteProgress>) -> rars_rs::Result<T>
+            + Send,
+    {
         let progress = python_progress(callback)?;
-        let worker_progress = progress.clone();
-        let this = self.clone();
-        let result = py.detach(move || this.build_single_archive(worker_progress.as_deref()));
+        let builder = self.inner.clone();
+        let worker = progress.clone();
+        let result = py.detach(move || {
+            run(
+                &builder,
+                worker
+                    .as_deref()
+                    .map(|progress| progress as &dyn rars_rs::WriteProgress),
+            )
+        });
         if let Some(error) = progress.as_ref().and_then(|progress| progress.take_error()) {
             return Err(error);
         }
         result.map_err(map_error)
-    }
-
-    fn features(&self) -> rars_rs::FeatureSet {
-        let mut features = rars_rs::FeatureSet::store_only();
-        features.solid = self.solid;
-        features.header_encryption = self.encrypt_headers;
-        features
-    }
-
-    fn build_single_archive(&self, progress: Option<&PythonProgress>) -> rars_rs::Result<Vec<u8>> {
-        if self.entries.is_empty() {
-            return Err(rars_rs::Error::InvalidHeader(
-                "archive builder has no entries",
-            ));
-        }
-        if self.volume_size.is_some() {
-            return Err(rars_rs::Error::InvalidHeader(
-                "use write_volumes for multivolume archives",
-            ));
-        }
-        if self.entries.iter().any(|entry| entry.source.is_some()) {
-            if self.streaming_rar50_supported() {
-                let mut output = Vec::new();
-                self.write_streaming_rar50_to(&mut output, &rars_rs::WriterResources::default())?;
-                return Ok(output);
-            }
-            let mut materialized = self.clone();
-            for entry in &mut materialized.entries {
-                if let Some(source) = entry.source.take() {
-                    let mut reader = source.open()?;
-                    reader.read_to_end(&mut entry.data)?;
-                }
-            }
-            return materialized.build_single_archive(progress);
-        }
-        match self.format.family() {
-            rars_rs::ArchiveFamily::Rar50Plus => self.build_rar50_single(progress),
-            rars_rs::ArchiveFamily::Rar15To40 => self.build_rar15_single(progress),
-            rars_rs::ArchiveFamily::Rar13 => self.build_rar13_single(progress),
-            _ => Err(rars_rs::Error::UnsupportedSignature),
-        }
-    }
-
-    fn build_volumes(&self, progress: Option<&PythonProgress>) -> rars_rs::Result<Vec<Vec<u8>>> {
-        let volume_size = self
-            .volume_size
-            .ok_or(rars_rs::Error::InvalidHeader("volume_size is required"))?;
-        if self.entries.is_empty() {
-            return Err(rars_rs::Error::InvalidHeader(
-                "archive builder has no entries",
-            ));
-        }
-        if self.entries.iter().any(|entry| entry.source.is_some()) {
-            let mut materialized = self.clone();
-            for entry in &mut materialized.entries {
-                if let Some(source) = entry.source.take() {
-                    let mut reader = source.open()?;
-                    reader.read_to_end(&mut entry.data)?;
-                }
-            }
-            return materialized.build_volumes(progress);
-        }
-        match self.format.family() {
-            rars_rs::ArchiveFamily::Rar50Plus => self.build_rar50_volumes(volume_size, progress),
-            rars_rs::ArchiveFamily::Rar15To40 => self.build_rar15_volumes(volume_size, progress),
-            rars_rs::ArchiveFamily::Rar13 => self.build_rar13_volumes(volume_size, progress),
-            _ => Err(rars_rs::Error::UnsupportedSignature),
-        }
-    }
-
-    /// Storing is a compression level, not a kind of member, so `store` wins
-    /// over any level the caller asked for.
-    fn rar50_options(&self) -> rars_rs::rar50::WriterOptions {
-        let mut options = rars_rs::rar50::WriterOptions::new(self.format, self.features());
-        if let Some(level) = self.compression {
-            options = options.with_compression_level(level);
-        }
-        if self.store {
-            options = options.with_compression_level(0);
-        }
-        options
-    }
-
-    fn rar50_entries(&self) -> Vec<rars_rs::rar50::ArchiveEntry> {
-        self.entries
-            .iter()
-            .map(|entry| {
-                let built = rars_rs::rar50::ArchiveEntry::new(
-                    entry.name.clone(),
-                    // From the slice, not the Vec: `From<Vec<u8>>` cannot reuse
-                    // the buffer, so cloning first copied every member twice.
-                    rars_rs::EntrySource::from_bytes(Arc::<[u8]>::from(entry.data.as_slice())),
-                )
-                .with_mtime(entry.mtime)
-                .with_attributes(rar50_attr(entry))
-                .with_host_os(DEFAULT_HOST_OS_UNIX);
-                match self.password.as_deref() {
-                    Some(password) => built.with_password(password.to_vec()),
-                    None => built,
-                }
-            })
-            .collect()
-    }
-
-    /// Whether to look for a data filter, which the archive has to be able to
-    /// carry. One answer for every RAR 5 path: the streaming one worked this
-    /// out for itself, so an archive built from `add_bytes` came out unfiltered
-    /// and larger than the same archive built from `add_path`.
-    fn rar50_filter_policy(&self) -> rars_rs::rar50::FilterPolicy {
-        if self.solid || self.store {
-            rars_rs::rar50::FilterPolicy::None
-        } else {
-            rars_rs::rar50::FilterPolicy::Auto
-        }
-    }
-
-    fn build_rar50_single(&self, progress: Option<&PythonProgress>) -> rars_rs::Result<Vec<u8>> {
-        let writer = rar50_writer(self.rar50_options(), progress)
-            .entries(self.rar50_entries())
-            .filter_policy(self.rar50_filter_policy())
-            .recovery_percent(self.recovery_percent);
-        let writer = match (self.comment.as_deref(), self.password.as_deref()) {
-            (Some(comment), Some(password)) => writer.encrypted_archive_comment(comment, password),
-            (comment, _) => writer.archive_comment(comment),
-        };
-        writer.finish()
-    }
-
-    fn build_rar15_single(&self, progress: Option<&PythonProgress>) -> rars_rs::Result<Vec<u8>> {
-        let mut options = rars_rs::rar15_40::WriterOptions::new(self.format, self.features());
-        if let Some(level) = self.compression {
-            options = options.with_compression_level(level);
-        }
-        if self.store {
-            let entries: Vec<_> = self
-                .entries
-                .iter()
-                .map(|entry| rars_rs::rar15_40::StoredEntry {
-                    name: &entry.name,
-                    data: &entry.data,
-                    file_time: entry.mtime.unwrap_or(0),
-                    file_attr: rar15_attr(entry),
-                    host_os: DEFAULT_HOST_OS_UNIX as u8,
-                    password: self.password.as_deref(),
-                    file_comment: None,
-                })
-                .collect();
-            rars_rs::rar15_40::write_stored_archive_with_comment(
-                &entries,
-                options,
-                self.comment.as_deref(),
-            )
-        } else {
-            let entries: Vec<_> = self
-                .entries
-                .iter()
-                .map(|entry| rars_rs::rar15_40::FileEntry {
-                    name: &entry.name,
-                    data: &entry.data,
-                    file_time: entry.mtime.unwrap_or(0),
-                    file_attr: rar15_attr(entry),
-                    host_os: DEFAULT_HOST_OS_UNIX as u8,
-                    password: self.password.as_deref(),
-                    file_comment: None,
-                })
-                .collect();
-            rars_rs::rar15_40::write_compressed_archive_with_comment_and_progress(
-                &entries,
-                options,
-                self.comment.as_deref(),
-                progress.map(|progress| progress as &dyn rars_rs::WriteProgress),
-            )
-        }
-    }
-
-    fn build_rar13_single(&self, progress: Option<&PythonProgress>) -> rars_rs::Result<Vec<u8>> {
-        let mut options = rars_rs::rar13::WriterOptions::new(self.format, self.features());
-        if let Some(level) = self.compression {
-            options = options.with_compression_level(level);
-        }
-        if self.store {
-            let entries: Vec<_> = self
-                .entries
-                .iter()
-                .map(|entry| rars_rs::rar13::StoredEntry {
-                    name: &entry.name,
-                    data: &entry.data,
-                    file_time: entry.mtime.unwrap_or(0),
-                    file_attr: DOS_ARCHIVE_ATTR,
-                    password: self.password.as_deref(),
-                    file_comment: None,
-                })
-                .collect();
-            rars_rs::rar13::write_stored_archive_with_comment(
-                &entries,
-                options,
-                self.comment.as_deref(),
-            )
-        } else {
-            let entries: Vec<_> = self
-                .entries
-                .iter()
-                .map(|entry| rars_rs::rar13::FileEntry {
-                    name: &entry.name,
-                    data: &entry.data,
-                    file_time: entry.mtime.unwrap_or(0),
-                    file_attr: DOS_ARCHIVE_ATTR,
-                    password: self.password.as_deref(),
-                    file_comment: None,
-                })
-                .collect();
-            rars_rs::rar13::write_compressed_archive_with_comment_and_progress(
-                &entries,
-                options,
-                self.comment.as_deref(),
-                progress.map(|progress| progress as &dyn rars_rs::WriteProgress),
-            )
-        }
-    }
-
-    fn build_rar50_volumes(
-        &self,
-        volume_size: usize,
-        progress: Option<&PythonProgress>,
-    ) -> rars_rs::Result<Vec<Vec<u8>>> {
-        if self.comment.is_some() {
-            return Err(rars_rs::Error::InvalidHeader(
-                "RAR 5 volume comments are not supported",
-            ));
-        }
-        let mut sink = rars_rs::rar50::CollectedVolumes::new();
-        rars_rs::rar50::write_streaming_volumes_with_progress(
-            &self.rar50_entries(),
-            self.rar50_options(),
-            rars_rs::rar50::ArchiveExtras::default()
-                .with_recovery_percent(self.recovery_percent)
-                .with_filter_policy(self.rar50_filter_policy()),
-            volume_size as u64,
-            &mut sink,
-            &rars_rs::WriterResources::default(),
-            progress.map(|progress| progress as &dyn rars_rs::WriteProgress),
-        )?;
-        Ok(sink.take())
-    }
-
-    fn build_rar15_volumes(
-        &self,
-        volume_size: usize,
-        progress: Option<&PythonProgress>,
-    ) -> rars_rs::Result<Vec<Vec<u8>>> {
-        if self.entries.len() != 1 {
-            return Err(rars_rs::Error::InvalidHeader(
-                "legacy volumes support one input",
-            ));
-        }
-        let entry = &self.entries[0];
-        let mut options = rars_rs::rar15_40::WriterOptions::new(self.format, self.features());
-        if let Some(level) = self.compression {
-            options = options.with_compression_level(level);
-        }
-        if self.store {
-            rars_rs::rar15_40::write_stored_volumes(
-                rars_rs::rar15_40::StoredEntry {
-                    name: &entry.name,
-                    data: &entry.data,
-                    file_time: entry.mtime.unwrap_or(0),
-                    file_attr: rar15_attr(entry),
-                    host_os: DEFAULT_HOST_OS_UNIX as u8,
-                    password: self.password.as_deref(),
-                    file_comment: None,
-                },
-                options,
-                volume_size,
-            )
-        } else {
-            rars_rs::rar15_40::write_compressed_volumes_with_progress(
-                rars_rs::rar15_40::FileEntry {
-                    name: &entry.name,
-                    data: &entry.data,
-                    file_time: entry.mtime.unwrap_or(0),
-                    file_attr: rar15_attr(entry),
-                    host_os: DEFAULT_HOST_OS_UNIX as u8,
-                    password: self.password.as_deref(),
-                    file_comment: None,
-                },
-                options,
-                volume_size,
-                progress.map(|progress| progress as &dyn rars_rs::WriteProgress),
-            )
-        }
-    }
-
-    fn build_rar13_volumes(
-        &self,
-        volume_size: usize,
-        progress: Option<&PythonProgress>,
-    ) -> rars_rs::Result<Vec<Vec<u8>>> {
-        if self.entries.len() != 1 {
-            return Err(rars_rs::Error::InvalidHeader(
-                "legacy volumes support one input",
-            ));
-        }
-        let entry = &self.entries[0];
-        let mut options = rars_rs::rar13::WriterOptions::new(self.format, self.features());
-        if let Some(level) = self.compression {
-            options = options.with_compression_level(level);
-        }
-        if self.store {
-            rars_rs::rar13::write_stored_volumes(
-                rars_rs::rar13::StoredEntry {
-                    name: &entry.name,
-                    data: &entry.data,
-                    file_time: entry.mtime.unwrap_or(0),
-                    file_attr: DOS_ARCHIVE_ATTR,
-                    password: self.password.as_deref(),
-                    file_comment: None,
-                },
-                options,
-                volume_size,
-            )
-        } else {
-            rars_rs::rar13::write_compressed_volumes_with_progress(
-                rars_rs::rar13::FileEntry {
-                    name: &entry.name,
-                    data: &entry.data,
-                    file_time: entry.mtime.unwrap_or(0),
-                    file_attr: DOS_ARCHIVE_ATTR,
-                    password: self.password.as_deref(),
-                    file_comment: None,
-                },
-                options,
-                volume_size,
-                progress.map(|progress| progress as &dyn rars_rs::WriteProgress),
-            )
-        }
     }
 }
 
@@ -1314,38 +907,6 @@ impl Selection for HashSet<Vec<u8>> {
     }
 }
 
-fn read_member(
-    archive: &rars_rs::Archive,
-    target: &[u8],
-    password: Option<&[u8]>,
-) -> rars_rs::Result<Option<Vec<u8>>> {
-    let output = Arc::new(Mutex::new(Vec::new()));
-    let seen = Arc::new(Mutex::new(false));
-    extract_to_best(archive, password, {
-        let output = Arc::clone(&output);
-        let seen = Arc::clone(&seen);
-        move |meta| {
-            if meta.name == target && !meta.is_directory {
-                *seen.lock().expect("seen lock poisoned") = true;
-                Ok(Box::new(SharedVecWriter(Arc::clone(&output))) as Box<dyn Write>)
-            } else {
-                Ok(Box::new(io::sink()) as Box<dyn Write>)
-            }
-        }
-    })?;
-    if *seen.lock().expect("seen lock poisoned") {
-        Ok(Some(output.lock().expect("output lock poisoned").clone()))
-    } else {
-        Ok(None)
-    }
-}
-
-fn test_archive(archive: &rars_rs::Archive, password: Option<&[u8]>) -> rars_rs::Result<()> {
-    extract_to_best(archive, password, |_| {
-        Ok(Box::new(io::sink()) as Box<dyn Write>)
-    })
-}
-
 fn extract_archive<S: Selection>(
     archive: &rars_rs::Archive,
     selected: Option<&S>,
@@ -1449,34 +1010,6 @@ where
     archive.extract_to_parallel_buffered(password, open)
 }
 
-struct SharedVecWriter(Arc<Mutex<Vec<u8>>>);
-
-impl Write for SharedVecWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0
-            .lock()
-            .expect("output lock poisoned")
-            .extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-fn archive_comment(
-    archive: &rars_rs::Archive,
-    password: Option<&[u8]>,
-) -> rars_rs::Result<Option<Vec<u8>>> {
-    match archive {
-        rars_rs::Archive::Rar13(archive) => archive.archive_comment(),
-        rars_rs::Archive::Rar15To40(archive) => archive.archive_comment(),
-        rars_rs::Archive::Rar50Plus(archive) => archive.archive_comment_with_password(password),
-        _ => Err(rars_rs::Error::UnsupportedSignature),
-    }
-}
-
 fn info_from_member(member: rars_rs::ArchiveMember) -> RarInfo {
     let mut detail = HashMap::new();
     let mut crc = None;
@@ -1575,24 +1108,8 @@ fn family_name(family: rars_rs::ArchiveFamily) -> &'static str {
 }
 
 fn parse_version(value: &str) -> PyResult<rars_rs::ArchiveVersion> {
-    match value
-        .to_ascii_lowercase()
-        .replace(['_', '-', '.'], "")
-        .as_str()
-    {
-        "rar13" => Ok(rars_rs::ArchiveVersion::Rar13),
-        "rar14" => Ok(rars_rs::ArchiveVersion::Rar14),
-        "rar15" => Ok(rars_rs::ArchiveVersion::Rar15),
-        "rar20" => Ok(rars_rs::ArchiveVersion::Rar20),
-        "rar29" => Ok(rars_rs::ArchiveVersion::Rar29),
-        "rar30" => Ok(rars_rs::ArchiveVersion::Rar30),
-        "rar40" | "rar4" => Ok(rars_rs::ArchiveVersion::Rar40),
-        "rar50" | "rar5" => Ok(rars_rs::ArchiveVersion::Rar50),
-        "rar70" | "rar7" => Ok(rars_rs::ArchiveVersion::Rar70),
-        _ => Err(PyValueError::new_err(format!(
-            "unsupported RAR format: {value}"
-        ))),
-    }
+    rars_rs::ArchiveVersion::from_name(value)
+        .ok_or_else(|| PyValueError::new_err(format!("unsupported RAR format: {value}")))
 }
 
 fn checked_output_path(out_dir: &Path, name: &[u8]) -> rars_rs::Result<PathBuf> {
@@ -1643,85 +1160,11 @@ fn output_relative_path(name: &[u8]) -> rars_rs::Result<PathBuf> {
     Ok(out)
 }
 
-fn safe_input_name(name: Vec<u8>) -> PyResult<Vec<u8>> {
-    output_relative_path(&name).map_err(map_error)?;
-    Ok(name)
-}
-
 fn archive_base_name(path: &Path) -> PyResult<Vec<u8>> {
     let file_name = path
         .file_name()
         .ok_or_else(|| PyValueError::new_err("input path has no file name"))?;
     Ok(file_name.to_string_lossy().into_owned().into_bytes())
-}
-
-fn collect_builder_input(
-    path: &Path,
-    archive_name: &[u8],
-    out: &mut Vec<BuilderEntry>,
-) -> PyResult<()> {
-    let link_meta = fs::symlink_metadata(path).map_err(map_io_error)?;
-    if link_meta.file_type().is_symlink() {
-        return Err(PyValueError::new_err(format!(
-            "input '{}' is a symlink; refusing to follow it",
-            path.display()
-        )));
-    }
-    let meta = fs::metadata(path).map_err(map_io_error)?;
-    if meta.is_dir() {
-        let mut children = fs::read_dir(path)
-            .map_err(map_io_error)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(map_io_error)?;
-        children.sort_by_key(|entry| entry.file_name());
-        for child in children {
-            let mut child_name = archive_name.to_vec();
-            child_name.push(b'/');
-            child_name.extend_from_slice(child.file_name().to_string_lossy().as_bytes());
-            collect_builder_input(&child.path(), &child_name, out)?;
-        }
-    } else if meta.is_file() {
-        out.push(BuilderEntry {
-            name: safe_input_name(archive_name.to_vec())?,
-            data: Vec::new(),
-            source: Some(rars_rs::EntrySource::from_path(path)),
-            mtime: None,
-            mode: source_unix_mode(&meta),
-        });
-    }
-    Ok(())
-}
-
-fn reject_duplicate_names(entries: &[BuilderEntry]) -> PyResult<()> {
-    let mut seen = HashSet::new();
-    for entry in entries {
-        if !seen.insert(entry.name.clone()) {
-            return Err(PyValueError::new_err(format!(
-                "duplicate archive entry name: {}",
-                String::from_utf8_lossy(&entry.name)
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn rar50_attr(entry: &BuilderEntry) -> u64 {
-    u64::from(entry.mode.unwrap_or(u32::from(DOS_ARCHIVE_ATTR)))
-}
-
-fn rar15_attr(entry: &BuilderEntry) -> u32 {
-    entry.mode.unwrap_or(u32::from(DOS_ARCHIVE_ATTR))
-}
-
-#[cfg(unix)]
-fn source_unix_mode(metadata: &fs::Metadata) -> Option<u32> {
-    use std::os::unix::fs::PermissionsExt;
-    Some(metadata.permissions().mode())
-}
-
-#[cfg(not(unix))]
-fn source_unix_mode(_metadata: &fs::Metadata) -> Option<u32> {
-    None
 }
 
 #[cfg(unix)]
@@ -1846,37 +1289,59 @@ mod tests {
 
     #[test]
     fn rejects_unsafe_archive_names() {
-        assert!(safe_input_name(b"dir/file.txt".to_vec()).is_ok());
-        assert!(safe_input_name(b"../file.txt".to_vec()).is_err());
-        assert!(safe_input_name(b"/tmp/file.txt".to_vec()).is_err());
-        assert!(safe_input_name(b"C:/file.txt".to_vec()).is_err());
+        assert!(rars_rs::validate_entry_name(b"dir/file.txt".to_vec()).is_ok());
+        assert!(rars_rs::validate_entry_name(b"../file.txt".to_vec()).is_err());
+        assert!(rars_rs::validate_entry_name(b"/tmp/file.txt".to_vec()).is_err());
+        assert!(rars_rs::validate_entry_name(b"C:/file.txt".to_vec()).is_err());
     }
 
     #[test]
     fn builder_creates_readable_rar50_bytes() {
-        let mut builder = RarBuilder {
-            format: rars_rs::ArchiveVersion::Rar50,
-            compression: Some(0),
-            store: true,
-            solid: false,
-            password: None,
-            encrypt_headers: false,
-            comment: Some(b"comment".to_vec()),
-            recovery_percent: None,
-            volume_size: None,
-            entries: Vec::new(),
-        };
-        builder.entries.push(BuilderEntry {
-            name: b"hello.txt".to_vec(),
-            data: b"hello".to_vec(),
-            source: None,
-            mtime: None,
-            mode: None,
-        });
+        let mut builder = rars_rs::Builder::new(rars_rs::ArchiveVersion::Rar50)
+            .compression_level(Some(0))
+            .store(true)
+            .comment(Some(b"comment".to_vec()));
+        builder
+            .add_bytes(b"hello.txt".to_vec(), b"hello".to_vec(), None, None)
+            .unwrap();
 
-        let bytes = builder.build_single_archive(None).unwrap();
+        let bytes = builder.to_bytes().unwrap();
         let archive = rars_rs::ArchiveReader::read_owned(bytes).unwrap();
         let names: Vec<_> = archive.members().map(|member| member.meta.name).collect();
         assert_eq!(names, vec![b"hello.txt".to_vec()]);
+    }
+
+    #[test]
+    fn classifies_the_builder_refusals_python_reports_as_argument_errors() {
+        let mut builder = rars_rs::Builder::new(rars_rs::ArchiveVersion::Rar50);
+        builder
+            .add_bytes(b"a".to_vec(), vec![], None, None)
+            .unwrap();
+        assert_eq!(
+            classify_builder_error(
+                &builder
+                    .add_bytes(b"a".to_vec(), vec![], None, None)
+                    .unwrap_err()
+            ),
+            BuilderRefusal::DuplicateName
+        );
+        assert_eq!(
+            classify_builder_error(&builder.remove(b"gone").unwrap_err()),
+            BuilderRefusal::NoSuchEntry
+        );
+        assert_eq!(
+            classify_builder_error(&builder.rename(b"gone", b"x".to_vec()).unwrap_err()),
+            BuilderRefusal::NoSuchEntry
+        );
+        // An unsafe name is not one of the three; it keeps reaching
+        // `UnsafeArchivePath` through the general mapping.
+        assert_eq!(
+            classify_builder_error(
+                &builder
+                    .add_bytes(b"../escape".to_vec(), vec![], None, None)
+                    .unwrap_err()
+            ),
+            BuilderRefusal::Other
+        );
     }
 }

@@ -13,6 +13,7 @@
 #[path = "../tests/support/scratch.rs"]
 mod scratch;
 
+pub mod builder;
 #[doc(hidden)]
 pub mod codec;
 pub mod crc32;
@@ -40,6 +41,7 @@ mod write_progress;
 mod write_stream;
 mod x86_filter_scan;
 
+pub use builder::{entry_relative_path, validate_entry_name, Builder};
 pub use detect::{detect_archive_family, find_archive_start, ArchiveSignature, SFX_SCAN_LIMIT};
 pub use error::{Error, Result};
 pub use features::{Feature, FeatureSet};
@@ -303,6 +305,31 @@ impl Iterator for ArchiveMembers<'_> {
     }
 }
 
+/// A `Write` that appends into a buffer someone else holds, for the extraction
+/// callbacks that hand their writer away and need the bytes back.
+struct SharedBuffer(std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>);
+
+impl SharedBuffer {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Vec<u8>>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl Write for SharedBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.lock()
+            .get_or_insert_with(Vec::new)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 impl Archive {
     /// Returns the detected archive family.
     pub fn family(&self) -> ArchiveFamily {
@@ -399,6 +426,51 @@ impl Archive {
             Self::Rar50Plus(archive) => {
                 archive.extract_to_parallel_buffered(options, |meta| open(&rar50_meta(meta)))
             }
+        }
+    }
+
+    /// Returns one member's decoded bytes, or `None` when the archive has no
+    /// file of that name.
+    ///
+    /// Extraction runs over the whole archive either way, because a solid
+    /// member is only decodable after the ones before it. Reading several
+    /// members from a solid archive one call at a time therefore costs as many
+    /// full passes; use [`extract_to`](Self::extract_to) to take them all in
+    /// one.
+    pub fn read_member(&self, name: &[u8], password: Option<&[u8]>) -> Result<Option<Vec<u8>>> {
+        // The closure gives the writer away rather than returning bytes, so the
+        // member arrives through a buffer shared with it.
+        let collected = std::sync::Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
+        self.extract_to_parallel_buffered(password, |meta| {
+            if meta.name != name || meta.is_directory {
+                return Ok(Box::new(std::io::sink()) as Box<dyn Write>);
+            }
+            let sink = SharedBuffer(std::sync::Arc::clone(&collected));
+            *sink.lock() = Some(Vec::new());
+            Ok(Box::new(sink) as Box<dyn Write>)
+        })?;
+        let taken = collected
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        Ok(taken)
+    }
+
+    /// Decodes every member and discards the bytes, so a bad checksum or a
+    /// wrong password is reported and nothing is written.
+    pub fn test(&self, password: Option<&[u8]>) -> Result<()> {
+        self.extract_to_parallel_buffered(password, |_| {
+            Ok(Box::new(std::io::sink()) as Box<dyn Write>)
+        })
+    }
+
+    /// The archive comment, decrypting it when the archive is RAR 5 or later
+    /// and its headers are encrypted.
+    pub fn comment(&self, password: Option<&[u8]>) -> Result<Option<Vec<u8>>> {
+        match self {
+            Self::Rar13(archive) => archive.archive_comment(),
+            Self::Rar15To40(archive) => archive.archive_comment(),
+            Self::Rar50Plus(archive) => archive.archive_comment_with_password(password),
         }
     }
 

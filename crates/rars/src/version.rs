@@ -49,6 +49,29 @@ impl ArchiveVersion {
         Self::Rar70,
     ];
 
+    /// The inverse of [`as_str`](Self::as_str), for callers that take a format
+    /// name from outside the process. Separators and case are ignored, and the
+    /// short spellings `rar4`, `rar5` and `rar7` name the newest version in
+    /// their family, so `rar-5.0` and `RAR5` both reach [`Self::Rar50`].
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name
+            .to_ascii_lowercase()
+            .replace(['_', '-', '.', ' '], "")
+            .as_str()
+        {
+            "rar13" => Some(Self::Rar13),
+            "rar14" => Some(Self::Rar14),
+            "rar15" => Some(Self::Rar15),
+            "rar20" => Some(Self::Rar20),
+            "rar29" => Some(Self::Rar29),
+            "rar30" => Some(Self::Rar30),
+            "rar40" | "rar4" => Some(Self::Rar40),
+            "rar50" | "rar5" => Some(Self::Rar50),
+            "rar70" | "rar7" => Some(Self::Rar70),
+            _ => None,
+        }
+    }
+
     /// The spelling used by the `--format` argument, and by every message a
     /// user reads. It is the only spelling they can type back into the tool.
     pub const fn as_str(self) -> &'static str {

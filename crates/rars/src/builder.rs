@@ -1,0 +1,865 @@
+//! One archive builder for every format.
+//!
+//! The writers underneath are per-family and take different entry types, and
+//! choosing between them is the same twenty decisions in every binding. This
+//! module makes that choice once: name the format, add members, ask for bytes
+//! or a file or a volume set. The Python extension and the WebAssembly package
+//! are thin translations of the type below, which is the point of it living
+//! here rather than in one of them.
+
+use crate::{
+    rar13, rar15_40, rar50, ArchiveFamily, ArchiveVersion, EntrySource, Error, FeatureSet, Result,
+    WriteProgress, WriterResources,
+};
+use std::collections::HashSet;
+use std::fs;
+use std::io::{Read, Write};
+use std::path::Path;
+use std::sync::Arc;
+
+/// The DOS archive bit, which is what a member gets when the caller offers no
+/// mode of its own. Zero would be legal and would read as "no attributes",
+/// which no real RAR writer emits.
+const DOS_ARCHIVE_ATTR: u32 = 0x20;
+
+/// Host OS 3 is Unix in every RAR header that carries the field.
+const DEFAULT_HOST_OS_UNIX: u64 = 3;
+
+/// A member queued for writing.
+///
+/// The bytes are either held directly or fetched from an [`EntrySource`] when
+/// the writer reaches the member. Sources are what keep a large archive off the
+/// heap; the legacy families cannot stream, so they read each source into
+/// `data` first.
+#[derive(Debug, Clone)]
+struct BuilderEntry {
+    name: Vec<u8>,
+    data: Vec<u8>,
+    source: Option<EntrySource>,
+    mtime: Option<u32>,
+    mode: Option<u32>,
+}
+
+impl BuilderEntry {
+    fn rar50_attr(&self) -> u64 {
+        u64::from(self.mode.unwrap_or(DOS_ARCHIVE_ATTR))
+    }
+
+    fn rar15_attr(&self) -> u32 {
+        self.mode.unwrap_or(DOS_ARCHIVE_ATTR)
+    }
+}
+
+/// Assembles an archive from members added one at a time.
+///
+/// Nothing is encoded until [`to_bytes`](Self::to_bytes),
+/// [`write_to_path`](Self::write_to_path) or
+/// [`build_volumes`](Self::build_volumes) is called, so the same builder can be
+/// written more than once and to more than one format.
+///
+/// ```no_run
+/// # fn main() -> rars::Result<()> {
+/// let mut builder = rars::Builder::new(rars::ArchiveVersion::Rar50);
+/// builder.add_bytes(b"hello.txt".to_vec(), b"hello".to_vec(), None, None)?;
+/// let archive = builder.to_bytes()?;
+/// # let _ = archive;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone)]
+pub struct Builder {
+    format: ArchiveVersion,
+    compression: Option<u8>,
+    store: bool,
+    solid: bool,
+    password: Option<Vec<u8>>,
+    encrypt_headers: bool,
+    comment: Option<Vec<u8>>,
+    recovery_percent: Option<u64>,
+    volume_size: Option<usize>,
+    entries: Vec<BuilderEntry>,
+}
+
+impl Builder {
+    /// A builder for `format`, with the writer's own default compression level.
+    pub fn new(format: ArchiveVersion) -> Self {
+        Self {
+            format,
+            compression: None,
+            store: false,
+            solid: false,
+            password: None,
+            encrypt_headers: false,
+            comment: None,
+            recovery_percent: None,
+            volume_size: None,
+            entries: Vec::new(),
+        }
+    }
+
+    /// The format this builder writes.
+    pub fn format(&self) -> ArchiveVersion {
+        self.format
+    }
+
+    /// Compression level, 0 to 5. `None` leaves the writer's default in place.
+    pub fn compression_level(mut self, level: Option<u8>) -> Self {
+        self.compression = level;
+        self
+    }
+
+    /// Store members without compressing them. Storing is a compression level,
+    /// not a kind of member, so this wins over any level set above.
+    pub fn store(mut self, store: bool) -> Self {
+        self.store = store;
+        self
+    }
+
+    /// Compress members against each other rather than independently.
+    pub fn solid(mut self, solid: bool) -> Self {
+        self.solid = solid;
+        self
+    }
+
+    /// Encrypt member data with `password`.
+    pub fn password(mut self, password: Option<Vec<u8>>) -> Self {
+        self.password = password;
+        self
+    }
+
+    /// Encrypt the headers as well as the data, hiding the member names. Needs
+    /// a password.
+    pub fn header_encryption(mut self, encrypt: bool) -> Self {
+        self.encrypt_headers = encrypt;
+        self
+    }
+
+    /// An archive comment.
+    pub fn comment(mut self, comment: Option<Vec<u8>>) -> Self {
+        self.comment = comment;
+        self
+    }
+
+    /// Add a recovery record covering this percentage of the archive.
+    pub fn recovery_percent(mut self, percent: Option<u64>) -> Self {
+        self.recovery_percent = percent;
+        self
+    }
+
+    /// Split the output into volumes of at most this many bytes.
+    /// [`build_volumes`](Self::build_volumes) requires it; the single-archive
+    /// entry points refuse to run while it is set.
+    pub fn volume_size(mut self, size: Option<usize>) -> Self {
+        self.volume_size = size;
+        self
+    }
+
+    /// How many members are queued.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether no members are queued.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The queued member names, in the order they will be written.
+    pub fn names(&self) -> impl Iterator<Item = &[u8]> {
+        self.entries.iter().map(|entry| entry.name.as_slice())
+    }
+
+    /// Queue `data` under `name`.
+    pub fn add_bytes(
+        &mut self,
+        name: Vec<u8>,
+        data: Vec<u8>,
+        mtime: Option<u32>,
+        mode: Option<u32>,
+    ) -> Result<()> {
+        self.push(BuilderEntry {
+            name: validate_entry_name(name)?,
+            data,
+            source: None,
+            mtime,
+            mode,
+        })
+    }
+
+    /// Queue a member whose bytes are fetched from `source` when the writer
+    /// reaches it.
+    pub fn add_source(
+        &mut self,
+        name: Vec<u8>,
+        source: EntrySource,
+        mtime: Option<u32>,
+        mode: Option<u32>,
+    ) -> Result<()> {
+        self.push(BuilderEntry {
+            name: validate_entry_name(name)?,
+            data: Vec::new(),
+            source: Some(source),
+            mtime,
+            mode,
+        })
+    }
+
+    /// Queue a file, or every file under a directory, named `archive_name` in
+    /// the archive. Children are added in sorted order so the same tree gives
+    /// the same archive twice.
+    ///
+    /// Symlinks are refused rather than followed, at the root and at every
+    /// level below it: a link is a name for someone else's file, and copying
+    /// what it points at is not what the caller asked for.
+    pub fn add_path(&mut self, path: &Path, archive_name: &[u8]) -> Result<()> {
+        let link_meta = fs::symlink_metadata(path)?;
+        if link_meta.file_type().is_symlink() {
+            return Err(Error::AtEntry {
+                name: archive_name.to_vec(),
+                operation: "adding",
+                source: Box::new(Error::InvalidHeader(
+                    "input is a symlink; refusing to follow it",
+                )),
+            });
+        }
+        let meta = fs::metadata(path)?;
+        if meta.is_dir() {
+            let mut children = fs::read_dir(path)?.collect::<std::result::Result<Vec<_>, _>>()?;
+            children.sort_by_key(|entry| entry.file_name());
+            for child in children {
+                let mut child_name = archive_name.to_vec();
+                child_name.push(b'/');
+                child_name.extend_from_slice(child.file_name().to_string_lossy().as_bytes());
+                self.add_path(&child.path(), &child_name)?;
+            }
+        } else if meta.is_file() {
+            self.add_source(
+                archive_name.to_vec(),
+                EntrySource::from_path(path),
+                None,
+                unix_mode(&meta),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Drop the member called `name`. Errors if no member has that name.
+    pub fn remove(&mut self, name: &[u8]) -> Result<()> {
+        let before = self.entries.len();
+        self.entries.retain(|entry| entry.name != name);
+        if self.entries.len() == before {
+            return Err(Error::AtEntry {
+                name: name.to_vec(),
+                operation: "removing",
+                source: Box::new(Error::InvalidHeader("no such archive entry")),
+            });
+        }
+        Ok(())
+    }
+
+    /// Rename the member called `old` to `new`.
+    pub fn rename(&mut self, old: &[u8], new: Vec<u8>) -> Result<()> {
+        let new = validate_entry_name(new)?;
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.name == old)
+            .ok_or_else(|| Error::AtEntry {
+                name: old.to_vec(),
+                operation: "renaming",
+                source: Box::new(Error::InvalidHeader("no such archive entry")),
+            })?;
+        entry.name = new;
+        self.reject_duplicate_names()
+    }
+
+    fn push(&mut self, entry: BuilderEntry) -> Result<()> {
+        self.entries.push(entry);
+        self.reject_duplicate_names()
+    }
+
+    fn reject_duplicate_names(&self) -> Result<()> {
+        let mut seen = HashSet::with_capacity(self.entries.len());
+        for entry in &self.entries {
+            if !seen.insert(entry.name.as_slice()) {
+                return Err(Error::AtEntry {
+                    name: entry.name.clone(),
+                    operation: "adding",
+                    source: Box::new(Error::InvalidHeader("duplicate archive entry name")),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Encode the whole archive into memory.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        self.to_bytes_with_progress(None)
+    }
+
+    /// As [`to_bytes`](Self::to_bytes), reporting progress as it goes.
+    pub fn to_bytes_with_progress(&self, progress: Option<&dyn WriteProgress>) -> Result<Vec<u8>> {
+        self.check_single()?;
+        if self.streams_rar50() {
+            let mut output = Vec::new();
+            self.write_streaming_rar50(&mut output, &WriterResources::default(), progress)?;
+            return Ok(output);
+        }
+        self.materialized()?.build_single(progress)
+    }
+
+    /// Write the archive to `output`.
+    ///
+    /// RAR 5 and RAR 7 stream: peak memory is one member plus the dictionary,
+    /// whatever the archive weighs. The legacy families have no streaming
+    /// writer, so they encode into memory first and this is
+    /// [`to_bytes`](Self::to_bytes) followed by a write.
+    pub fn write_to(
+        &self,
+        output: &mut dyn Write,
+        resources: &WriterResources,
+        progress: Option<&dyn WriteProgress>,
+    ) -> Result<()> {
+        self.check_single()?;
+        if self.streams_rar50() {
+            return self.write_streaming_rar50(output, resources, progress);
+        }
+        let data = self.materialized()?.build_single(progress)?;
+        output.write_all(&data)?;
+        Ok(())
+    }
+
+    /// Write the archive to `path`, streaming where the format allows it.
+    ///
+    /// Any spooling the writer needs goes beside the output rather than in the
+    /// system temporary directory, which is often a memory-backed filesystem
+    /// too small for the archive being written.
+    pub fn write_to_path(&self, path: &Path, progress: Option<&dyn WriteProgress>) -> Result<()> {
+        let resources = match path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            Some(parent) => WriterResources::default().with_temp_dir(parent),
+            None => WriterResources::default(),
+        };
+        let mut output = fs::File::create(path)?;
+        self.write_to(&mut output, &resources, progress)?;
+        output.sync_all()?;
+        Ok(())
+    }
+
+    /// Encode the archive as a volume set, one `Vec` per volume.
+    ///
+    /// Requires [`volume_size`](Self::volume_size). Naming the parts on disk is
+    /// the caller's job, because the two families number them differently.
+    pub fn build_volumes(&self, progress: Option<&dyn WriteProgress>) -> Result<Vec<Vec<u8>>> {
+        let volume_size = self
+            .volume_size
+            .ok_or(Error::InvalidHeader("volume_size is required"))?;
+        if self.entries.is_empty() {
+            return Err(Error::InvalidHeader("archive builder has no entries"));
+        }
+        let this = self.materialized()?;
+        match self.format.family() {
+            ArchiveFamily::Rar50Plus => this.build_rar50_volumes(volume_size, progress),
+            ArchiveFamily::Rar15To40 => this.build_rar15_volumes(volume_size, progress),
+            ArchiveFamily::Rar13 => this.build_rar13_volumes(volume_size, progress),
+        }
+    }
+
+    /// Whether writing goes through the streaming RAR 5 writer, which serves
+    /// everything this builder can ask for except volume sets. Header
+    /// encryption without a password is not one of the things it can do, so
+    /// that combination falls back and is rejected by the writer proper.
+    pub fn streams_rar50(&self) -> bool {
+        matches!(self.format, ArchiveVersion::Rar50 | ArchiveVersion::Rar70)
+            && self.volume_size.is_none()
+            && (!self.encrypt_headers || self.password.is_some())
+    }
+
+    fn check_single(&self) -> Result<()> {
+        if self.entries.is_empty() {
+            return Err(Error::InvalidHeader("archive builder has no entries"));
+        }
+        if self.volume_size.is_some() {
+            return Err(Error::InvalidHeader(
+                "use build_volumes for multivolume archives",
+            ));
+        }
+        Ok(())
+    }
+
+    /// A copy with every source read into memory, for the writers that cannot
+    /// take one. Returns a borrow when there is nothing to read, so the common
+    /// case does not copy the members twice.
+    fn materialized(&self) -> Result<std::borrow::Cow<'_, Self>> {
+        if self.streams_rar50() || !self.entries.iter().any(|entry| entry.source.is_some()) {
+            return Ok(std::borrow::Cow::Borrowed(self));
+        }
+        let mut owned = self.clone();
+        for entry in &mut owned.entries {
+            if let Some(source) = entry.source.take() {
+                source.open()?.read_to_end(&mut entry.data)?;
+            }
+        }
+        Ok(std::borrow::Cow::Owned(owned))
+    }
+
+    fn build_single(&self, progress: Option<&dyn WriteProgress>) -> Result<Vec<u8>> {
+        match self.format.family() {
+            ArchiveFamily::Rar50Plus => self.build_rar50_single(progress),
+            ArchiveFamily::Rar15To40 => self.build_rar15_single(progress),
+            ArchiveFamily::Rar13 => self.build_rar13_single(progress),
+        }
+    }
+
+    fn features(&self) -> FeatureSet {
+        let mut features = FeatureSet::store_only();
+        features.solid = self.solid;
+        features.header_encryption = self.encrypt_headers;
+        features
+    }
+
+    /// Storing is a compression level, not a kind of member, so `store` wins
+    /// over any level the caller asked for.
+    fn rar50_options(&self) -> rar50::WriterOptions {
+        let mut options = rar50::WriterOptions::new(self.format, self.features());
+        if let Some(level) = self.compression {
+            options = options.with_compression_level(level);
+        }
+        if self.store {
+            options = options.with_compression_level(0);
+        }
+        options
+    }
+
+    /// Whether to look for a data filter, which the archive has to be able to
+    /// carry. One answer for every RAR 5 path: when the streaming writer worked
+    /// this out for itself, an archive built from bytes came out unfiltered and
+    /// larger than the same archive built from files.
+    fn rar50_filter_policy(&self) -> rar50::FilterPolicy {
+        if self.solid || self.store {
+            rar50::FilterPolicy::None
+        } else {
+            rar50::FilterPolicy::Auto
+        }
+    }
+
+    fn rar50_entries(&self) -> Vec<rar50::ArchiveEntry> {
+        self.entries
+            .iter()
+            .map(|entry| {
+                let source = entry.source.clone().unwrap_or_else(|| {
+                    // From the slice, not the Vec: `From<Vec<u8>>` cannot reuse
+                    // the buffer, so cloning first copied every member twice.
+                    EntrySource::from_bytes(Arc::<[u8]>::from(entry.data.as_slice()))
+                });
+                let built = rar50::ArchiveEntry::new(entry.name.clone(), source)
+                    .with_mtime(entry.mtime)
+                    .with_attributes(entry.rar50_attr())
+                    .with_host_os(DEFAULT_HOST_OS_UNIX);
+                match self.password.as_deref() {
+                    Some(password) => built.with_password(password.to_vec()),
+                    None => built,
+                }
+            })
+            .collect()
+    }
+
+    fn write_streaming_rar50(
+        &self,
+        output: &mut dyn Write,
+        resources: &WriterResources,
+        progress: Option<&dyn WriteProgress>,
+    ) -> Result<()> {
+        let mut extras = rar50::ArchiveExtras::default()
+            .with_recovery_percent(self.recovery_percent)
+            .with_filter_policy(self.rar50_filter_policy());
+        if let Some(comment) = self.comment.as_deref() {
+            extras = extras.with_comment(comment);
+        }
+        rar50::write_streaming_archive_with_progress(
+            &self.rar50_entries(),
+            self.rar50_options(),
+            extras,
+            resources,
+            progress,
+            output,
+        )
+    }
+
+    fn build_rar50_single(&self, progress: Option<&dyn WriteProgress>) -> Result<Vec<u8>> {
+        let writer = rar50::Rar50Writer::new(self.rar50_options());
+        let writer = match progress {
+            Some(progress) => writer.progress(progress),
+            None => writer,
+        };
+        let writer = writer
+            .entries(self.rar50_entries())
+            .filter_policy(self.rar50_filter_policy())
+            .recovery_percent(self.recovery_percent);
+        let writer = match (self.comment.as_deref(), self.password.as_deref()) {
+            (Some(comment), Some(password)) => writer.encrypted_archive_comment(comment, password),
+            (comment, _) => writer.archive_comment(comment),
+        };
+        writer.finish()
+    }
+
+    fn rar15_options(&self) -> rar15_40::WriterOptions {
+        let mut options = rar15_40::WriterOptions::new(self.format, self.features());
+        if let Some(level) = self.compression {
+            options = options.with_compression_level(level);
+        }
+        options
+    }
+
+    fn build_rar15_single(&self, progress: Option<&dyn WriteProgress>) -> Result<Vec<u8>> {
+        let options = self.rar15_options();
+        if self.store {
+            let entries: Vec<_> = self
+                .entries
+                .iter()
+                .map(|entry| rar15_40::StoredEntry {
+                    name: &entry.name,
+                    data: &entry.data,
+                    file_time: entry.mtime.unwrap_or(0),
+                    file_attr: entry.rar15_attr(),
+                    host_os: DEFAULT_HOST_OS_UNIX as u8,
+                    password: self.password.as_deref(),
+                    file_comment: None,
+                })
+                .collect();
+            rar15_40::write_stored_archive_with_comment(&entries, options, self.comment.as_deref())
+        } else {
+            let entries: Vec<_> = self
+                .entries
+                .iter()
+                .map(|entry| rar15_40::FileEntry {
+                    name: &entry.name,
+                    data: &entry.data,
+                    file_time: entry.mtime.unwrap_or(0),
+                    file_attr: entry.rar15_attr(),
+                    host_os: DEFAULT_HOST_OS_UNIX as u8,
+                    password: self.password.as_deref(),
+                    file_comment: None,
+                })
+                .collect();
+            rar15_40::write_compressed_archive_with_comment_and_progress(
+                &entries,
+                options,
+                self.comment.as_deref(),
+                progress,
+            )
+        }
+    }
+
+    fn rar13_options(&self) -> rar13::WriterOptions {
+        let mut options = rar13::WriterOptions::new(self.format, self.features());
+        if let Some(level) = self.compression {
+            options = options.with_compression_level(level);
+        }
+        options
+    }
+
+    fn build_rar13_single(&self, progress: Option<&dyn WriteProgress>) -> Result<Vec<u8>> {
+        let options = self.rar13_options();
+        if self.store {
+            let entries: Vec<_> = self
+                .entries
+                .iter()
+                .map(|entry| rar13::StoredEntry {
+                    name: &entry.name,
+                    data: &entry.data,
+                    file_time: entry.mtime.unwrap_or(0),
+                    file_attr: DOS_ARCHIVE_ATTR as u8,
+                    password: self.password.as_deref(),
+                    file_comment: None,
+                })
+                .collect();
+            rar13::write_stored_archive_with_comment(&entries, options, self.comment.as_deref())
+        } else {
+            let entries: Vec<_> = self
+                .entries
+                .iter()
+                .map(|entry| rar13::FileEntry {
+                    name: &entry.name,
+                    data: &entry.data,
+                    file_time: entry.mtime.unwrap_or(0),
+                    file_attr: DOS_ARCHIVE_ATTR as u8,
+                    password: self.password.as_deref(),
+                    file_comment: None,
+                })
+                .collect();
+            rar13::write_compressed_archive_with_comment_and_progress(
+                &entries,
+                options,
+                self.comment.as_deref(),
+                progress,
+            )
+        }
+    }
+
+    fn build_rar50_volumes(
+        &self,
+        volume_size: usize,
+        progress: Option<&dyn WriteProgress>,
+    ) -> Result<Vec<Vec<u8>>> {
+        if self.comment.is_some() {
+            return Err(Error::InvalidHeader(
+                "RAR 5 volume comments are not supported",
+            ));
+        }
+        let mut sink = rar50::CollectedVolumes::new();
+        rar50::write_streaming_volumes_with_progress(
+            &self.rar50_entries(),
+            self.rar50_options(),
+            rar50::ArchiveExtras::default()
+                .with_recovery_percent(self.recovery_percent)
+                .with_filter_policy(self.rar50_filter_policy()),
+            volume_size as u64,
+            &mut sink,
+            &WriterResources::default(),
+            progress,
+        )?;
+        Ok(sink.take())
+    }
+
+    fn single_volume_entry(&self) -> Result<&BuilderEntry> {
+        match self.entries.as_slice() {
+            [entry] => Ok(entry),
+            _ => Err(Error::InvalidHeader("legacy volumes support one input")),
+        }
+    }
+
+    fn build_rar15_volumes(
+        &self,
+        volume_size: usize,
+        progress: Option<&dyn WriteProgress>,
+    ) -> Result<Vec<Vec<u8>>> {
+        let entry = self.single_volume_entry()?;
+        let options = self.rar15_options();
+        if self.store {
+            rar15_40::write_stored_volumes(
+                rar15_40::StoredEntry {
+                    name: &entry.name,
+                    data: &entry.data,
+                    file_time: entry.mtime.unwrap_or(0),
+                    file_attr: entry.rar15_attr(),
+                    host_os: DEFAULT_HOST_OS_UNIX as u8,
+                    password: self.password.as_deref(),
+                    file_comment: None,
+                },
+                options,
+                volume_size,
+            )
+        } else {
+            rar15_40::write_compressed_volumes_with_progress(
+                rar15_40::FileEntry {
+                    name: &entry.name,
+                    data: &entry.data,
+                    file_time: entry.mtime.unwrap_or(0),
+                    file_attr: entry.rar15_attr(),
+                    host_os: DEFAULT_HOST_OS_UNIX as u8,
+                    password: self.password.as_deref(),
+                    file_comment: None,
+                },
+                options,
+                volume_size,
+                progress,
+            )
+        }
+    }
+
+    fn build_rar13_volumes(
+        &self,
+        volume_size: usize,
+        progress: Option<&dyn WriteProgress>,
+    ) -> Result<Vec<Vec<u8>>> {
+        let entry = self.single_volume_entry()?;
+        let options = self.rar13_options();
+        if self.store {
+            rar13::write_stored_volumes(
+                rar13::StoredEntry {
+                    name: &entry.name,
+                    data: &entry.data,
+                    file_time: entry.mtime.unwrap_or(0),
+                    file_attr: DOS_ARCHIVE_ATTR as u8,
+                    password: self.password.as_deref(),
+                    file_comment: None,
+                },
+                options,
+                volume_size,
+            )
+        } else {
+            rar13::write_compressed_volumes_with_progress(
+                rar13::FileEntry {
+                    name: &entry.name,
+                    data: &entry.data,
+                    file_time: entry.mtime.unwrap_or(0),
+                    file_attr: DOS_ARCHIVE_ATTR as u8,
+                    password: self.password.as_deref(),
+                    file_comment: None,
+                },
+                options,
+                volume_size,
+                progress,
+            )
+        }
+    }
+}
+
+/// Reject a member name that would not survive extraction: absolute paths,
+/// `..`, drive letters and NUL bytes. Checking on the way in means an archive
+/// this crate writes is one this crate will extract, rather than one that trips
+/// the extractor's own guard later.
+pub fn validate_entry_name(name: Vec<u8>) -> Result<Vec<u8>> {
+    entry_relative_path(&name)?;
+    Ok(name)
+}
+
+/// The path a member name denotes below an output directory, or an error if it
+/// denotes anywhere else. Backslashes are separators, because that is what a
+/// DOS-era writer put in the header.
+pub fn entry_relative_path(name: &[u8]) -> Result<std::path::PathBuf> {
+    use std::path::{Component, PathBuf};
+
+    if name.contains(&0) {
+        return Err(Error::InvalidHeader(
+            "unsafe archive path contains NUL byte",
+        ));
+    }
+    let text = std::str::from_utf8(name)
+        .map_err(|_| Error::InvalidHeader("archive entry name is not UTF-8"))?
+        .replace('\\', "/");
+    let bytes = text.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return Err(Error::InvalidHeader("unsafe archive path"));
+    }
+    let mut out = PathBuf::new();
+    for component in Path::new(&text).components() {
+        match component {
+            Component::Normal(part) => out.push(part),
+            Component::CurDir => {}
+            _ => return Err(Error::InvalidHeader("unsafe archive path")),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        return Err(Error::InvalidHeader("empty archive path"));
+    }
+    Ok(out)
+}
+
+#[cfg(unix)]
+fn unix_mode(metadata: &fs::Metadata) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    Some(metadata.permissions().mode())
+}
+
+#[cfg(not(unix))]
+fn unix_mode(_metadata: &fs::Metadata) -> Option<u32> {
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn builder_with(format: ArchiveVersion) -> Builder {
+        let mut builder = Builder::new(format);
+        builder
+            .add_bytes(b"a.txt".to_vec(), b"hello world".repeat(64), None, None)
+            .unwrap();
+        builder
+            .add_bytes(b"dir/b.txt".to_vec(), b"second member".to_vec(), None, None)
+            .unwrap();
+        builder
+    }
+
+    /// Every version this crate can write, which is all of them. The loop is
+    /// over `ArchiveVersion::ALL` so a tenth version is a failing test rather
+    /// than a gap.
+    #[test]
+    fn writes_every_family() {
+        for format in ArchiveVersion::ALL {
+            let archive = builder_with(format).to_bytes().unwrap();
+            let read = crate::ArchiveReader::read_owned(archive).unwrap();
+            let names: Vec<_> = read
+                .members()
+                .map(|member| member.meta.name_bytes().to_vec())
+                .collect();
+            assert_eq!(
+                names,
+                vec![b"a.txt".to_vec(), b"dir/b.txt".to_vec()],
+                "{format}"
+            );
+        }
+    }
+
+    #[test]
+    fn stored_and_compressed_round_trip_to_the_same_bytes() {
+        for store in [false, true] {
+            let archive = builder_with(ArchiveVersion::Rar50)
+                .store(store)
+                .to_bytes()
+                .unwrap();
+            let read = crate::ArchiveReader::read_owned(archive).unwrap();
+            let data = read.read_member(b"a.txt", None).unwrap().unwrap();
+            assert_eq!(data, b"hello world".repeat(64));
+        }
+    }
+
+    #[test]
+    fn rejects_a_duplicate_name() {
+        let mut builder = Builder::new(ArchiveVersion::Rar50);
+        builder
+            .add_bytes(b"a".to_vec(), vec![], None, None)
+            .unwrap();
+        let error = builder
+            .add_bytes(b"a".to_vec(), vec![], None, None)
+            .unwrap_err();
+        assert!(error.to_string().contains("duplicate archive entry name"));
+    }
+
+    #[test]
+    fn rejects_an_escaping_name() {
+        let mut builder = Builder::new(ArchiveVersion::Rar50);
+        for name in [&b"../escape"[..], b"/absolute", b"C:\\drive"] {
+            assert!(builder
+                .add_bytes(name.to_vec(), vec![], None, None)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn renames_and_removes() {
+        let mut builder = builder_with(ArchiveVersion::Rar50);
+        builder.rename(b"a.txt", b"c.txt".to_vec()).unwrap();
+        builder.remove(b"dir/b.txt").unwrap();
+        assert_eq!(builder.names().collect::<Vec<_>>(), vec![&b"c.txt"[..]]);
+        assert!(builder.remove(b"gone").is_err());
+        assert!(builder.rename(b"gone", b"x".to_vec()).is_err());
+    }
+
+    #[test]
+    fn refuses_a_single_archive_when_a_volume_size_is_set() {
+        let error = builder_with(ArchiveVersion::Rar50)
+            .volume_size(Some(4096))
+            .to_bytes()
+            .unwrap_err();
+        assert!(error.to_string().contains("build_volumes"));
+    }
+
+    #[test]
+    fn splits_into_volumes() {
+        let mut builder = Builder::new(ArchiveVersion::Rar50);
+        builder
+            .add_bytes(b"big.bin".to_vec(), vec![7u8; 300_000], None, None)
+            .unwrap();
+        let volumes = builder
+            .store(true)
+            .volume_size(Some(64 * 1024))
+            .build_volumes(None)
+            .unwrap();
+        assert!(volumes.len() > 1, "expected a split, got {}", volumes.len());
+    }
+}
