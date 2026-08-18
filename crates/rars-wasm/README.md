@@ -1,9 +1,8 @@
 # @bitplane/rars
 
-Read, write and repair RAR archives in the browser and in Node. No native
-module, no `unrar` binary, no download step. It is the [rars][repo] Rust
-toolkit compiled to WebAssembly, and it writes every RAR version from 1.3 to
-7.0 as well as reading them.
+Read, write and repair RAR archives in the browser or Node using [rars][repo]
+via WebAssembly. `rars` reads and writes every RAR version from 1.3 to 7.0 and
+compresses reasonably well at a sensible speed.
 
 [repo]: https://github.com/bitplane/rars
 
@@ -24,12 +23,11 @@ for (const entry of rar.entries()) {
 
 const bytes = rar.read("docs/readme.txt");
 rar.test();          // throws on the first bad checksum
-rar.free();          // the archive stays in wasm memory until you say so
+rar.free();          // archive stays in memory otherwise
 ```
 
-Passwords go in as a string or a `Uint8Array`. An archive with encrypted
-headers needs one to open at all; an archive with encrypted data in plain
-headers needs one only to read:
+Passwords go in as a string or a `Uint8Array`. Encrypted headers blocks listing
+without a password, but many archives just have encrypted members:
 
 ```js
 const locked = new RarFile(bytes, "hunter2");   // encrypted headers
@@ -53,8 +51,7 @@ const archive = builder.toBytes();
 5), `store`, `solid`, `password`, `encryptHeaders`, `comment`,
 `recoveryPercent` and `volumeSize`.
 
-Volume sets come back as an array, and naming the parts is yours to do because
-the two families number them differently:
+Volume sets come back as an array:
 
 ```js
 const builder = new RarBuilder({ volumeSize: 5 * 1024 * 1024 });
@@ -64,16 +61,16 @@ const parts = builder.toVolumes();
 
 ## Loading
 
-The package ships three builds and the right one is picked for you.
+The package ships three builds, auto chosen:
 
-| Importer | Gets | Needs |
-| --- | --- | --- |
-| Vite, webpack, Rollup, Next | `bundler` | nothing |
-| Node, `require` or `import` | `node` | nothing |
-| A browser with no build step | `web` | `await init()` |
+| Importer                     | Gets      | Needs          |
+| ---------------------------- | --------- | -------------- |
+| Vite, webpack, Rollup, Next  | `bundler` | nothing        |
+| Node, `require` or `import`  | `node`    | nothing        |
+| A browser with no build step | `web`     | `await init()` |
 
-Only the browser-direct build has to be initialised, because it fetches the
-`.wasm` itself:
+Only the browser build has to be initialised, because it fetches the
+`.wasm`:
 
 ```html
 <script type="module">
@@ -82,24 +79,18 @@ Only the browser-direct build has to be initialised, because it fetches the
 </script>
 ```
 
-## What is not here
+## Caveats
 
-Compression is synchronous and single-threaded. A large input at level 5 is
-seconds of work with nothing yielding, so run it in a Worker if the page has to
-stay responsive. There are no progress callbacks yet for the same reason: the
-writer reports progress from inside that call, and a JavaScript function cannot
-be handed across it.
+Compression is synchronous and single-threaded - you'll need to run it in a
+Worker until I sort that out. Progress updates aren't yet included either.
 
-There is no filesystem, so nothing takes or returns a path. Read the file
-yourself and pass the bytes.
+There is no filesystem, so read the file yourself and pass the bytes.
 
 ## Elsewhere
 
 The same library is a [Rust crate][crate], a [Python package][pypi] and a
-[command-line tool][repo]. All four are built from one tag and share a version
-number, so `@bitplane/rars@0.7.2` on npm is the same encoder as `rars==0.7.2`
-on PyPI. The npm name is scoped only because npm's typo-squat filter refuses
-the bare one.
+[command-line tool][repo]. Published together from CI so version numbers match
+up.
 
 [crate]: https://crates.io/crates/rars
 [pypi]: https://pypi.org/project/rars/

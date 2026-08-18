@@ -13,8 +13,8 @@ A Rust implementation of RAR.
 
 ## Status
 
-`rars` covers the RAR compression and decompression from early `RE~^` archives
-through to RAR 7. It's getting faster, and kinda works.
+`rars` covers RAR compression and decompression from early `RE~^` archives
+through to RAR 7. It comes with Python and TypeScript bindings
 
 ## Usage
 
@@ -50,5 +50,4 @@ can `pip install rars`. To build locally, it's `maturin develop`.
 For JS it's WebAssembly, published to
 [npm](https://www.npmjs.com/package/@bitplane/rars), so
 `npm install @bitplane/rars`. It reads and writes in the browser and in Node,
-with no native module. The name is scoped because npm's typo-squat filter
-refuses the bare `rars`. To build locally, `just npm`.
+with no native module. To build locally, `just npm`.
