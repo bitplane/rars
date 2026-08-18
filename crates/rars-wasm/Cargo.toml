@@ -1,6 +1,6 @@
 [package]
 name = "rars-wasm"
-version = "0.7.2"
+version = "0.7.3"
 description = "WebAssembly bindings for the rars RAR archive toolkit."
 publish = false
 edition.workspace = true
@@ -29,7 +29,7 @@ unimplemented = "warn"
 
 [dependencies]
 js-sys.workspace = true
-rars_rs = { package = "rars", version = "0.7.2", path = "../rars" }
+rars_rs = { package = "rars", version = "0.7.3", path = "../rars" }
 wasm-bindgen.workspace = true
 
 # `getrandom` has no default source on `wasm32-unknown-unknown`, because a bare
