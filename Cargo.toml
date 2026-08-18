@@ -29,7 +29,7 @@ js-sys = "0.3"
 libc = "0.2"
 pyo3 = "0.29.0"
 rayon = "1.12.0"
-rars = { version = "0.7.3", path = "crates/rars" }
+rars = { version = "0.7.4", path = "crates/rars" }
 rpassword = "7"
 sha1 = "0.11"
 sha2 = "0.11"
