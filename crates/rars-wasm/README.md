@@ -1,4 +1,4 @@
-# rars
+# @bitplane/rars
 
 Read, write and repair RAR archives in the browser and in Node. No native
 module, no `unrar` binary, no download step. It is the [rars][repo] Rust
@@ -8,13 +8,13 @@ toolkit compiled to WebAssembly, and it writes every RAR version from 1.3 to
 [repo]: https://github.com/bitplane/rars
 
 ```
-npm install rars
+npm install @bitplane/rars
 ```
 
 ## Reading
 
 ```js
-import { RarFile } from "rars";
+import { RarFile } from "@bitplane/rars";
 
 const rar = new RarFile(new Uint8Array(await file.arrayBuffer()));
 
@@ -39,7 +39,7 @@ const data = rar.read("secret.txt", "hunter2"); // encrypted data
 ## Writing
 
 ```js
-import { RarBuilder } from "rars";
+import { RarBuilder } from "@bitplane/rars";
 
 const builder = new RarBuilder({ format: "rar50", compression: 5 });
 builder.addBytes("hello.txt", new TextEncoder().encode("hello"));
@@ -77,7 +77,7 @@ Only the browser-direct build has to be initialised, because it fetches the
 
 ```html
 <script type="module">
-  import init, { RarFile } from "https://esm.sh/rars/web";
+  import init, { RarFile } from "https://esm.sh/@bitplane/rars/web";
   await init();
 </script>
 ```
@@ -97,7 +97,9 @@ yourself and pass the bytes.
 
 The same library is a [Rust crate][crate], a [Python package][pypi] and a
 [command-line tool][repo]. All four are built from one tag and share a version
-number, so `rars@0.7.2` on npm is the same encoder as `rars==0.7.2` on PyPI.
+number, so `@bitplane/rars@0.7.2` on npm is the same encoder as `rars==0.7.2`
+on PyPI. The npm name is scoped only because npm's typo-squat filter refuses
+the bare one.
 
 [crate]: https://crates.io/crates/rars
 [pypi]: https://pypi.org/project/rars/

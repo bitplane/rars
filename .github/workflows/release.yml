@@ -569,11 +569,12 @@ jobs:
           VERSION: ${{ needs.verify-tag.outputs.version }}
         run: |
           set -euo pipefail
-          if npm view "rars@$VERSION" version >/dev/null 2>&1; then
-            echo "rars@$VERSION is already published; nothing to do"
+          if npm view "@bitplane/rars@$VERSION" version >/dev/null 2>&1; then
+            echo "@bitplane/rars@$VERSION is already published; nothing to do"
             exit 0
           fi
-          npm publish --provenance --access public "dist/rars-$VERSION.tgz"
+          # npm pack flattens the scope into the filename.
+          npm publish --provenance --access public "dist/bitplane-rars-$VERSION.tgz"
 
   # ----------------------------------------------------------------------
   # 7. Publish the packaged binaries to the tagged GitHub Release.

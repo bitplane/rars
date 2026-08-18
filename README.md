@@ -7,7 +7,7 @@ A Rust implementation of RAR.
 * 📦 [downloads](https://github.com/bitplane/rars/releases)
   * 🦀 [crates](https://crates.io/crates/rars)
   * 🐍 [pypi](https://pypi.org/project/rars)
-  * 📜 [npm](https://www.npmjs.com/package/rars)
+  * 📜 [npm](https://www.npmjs.com/package/@bitplane/rars)
 * 🐱 [source](https://github.com/bitplane/rars)
   * 📃 [spec](https://github.com/bitplane/rar-research)
 
@@ -47,6 +47,8 @@ records, and supported recovery records. There are a lot of args, run
 Python bindings are published to [pypi](https://pypi.org/project/rars/), so you
 can `pip install rars`. To build locally, it's `maturin develop`.
 
-For JS it's WebAssembly, published to [npm](https://www.npmjs.com/package/rars),
-so `npm install rars`. It reads and writes in the browser and in Node, with no
-native module. To build locally, `just npm`.
+For JS it's WebAssembly, published to
+[npm](https://www.npmjs.com/package/@bitplane/rars), so
+`npm install @bitplane/rars`. It reads and writes in the browser and in Node,
+with no native module. The name is scoped because npm's typo-squat filter
+refuses the bare `rars`. To build locally, `just npm`.

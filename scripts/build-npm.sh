@@ -22,7 +22,7 @@ CRATE="rars-wasm"
 WASM="$ROOT/target/wasm32-unknown-unknown/release-wasm/rars_wasm.wasm"
 
 VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$ROOT/crates/rars-wasm/Cargo.toml" | head -1)"
-echo "building rars@$VERSION for npm"
+echo "building @bitplane/rars@$VERSION for npm"
 
 if ! command -v wasm-bindgen >/dev/null 2>&1; then
     echo "wasm-bindgen not found. Install it with:" >&2
@@ -82,7 +82,11 @@ version = sys.argv[2]
 (out / "package.json").write_text(
     json.dumps(
         {
-            "name": "rars",
+            # Scoped, because npm's typo-squat filter refuses the bare name:
+            # "rars" is within an edit of raf, rax, tar and arg. A scoped name
+            # skips that check. `publishConfig` is what stops a scoped package
+            # defaulting to private on publish.
+            "name": "@bitplane/rars",
             "version": version,
             "description": "Read, write and repair RAR archives in the browser and in Node, with no native dependency.",
             "license": "MIT OR Apache-2.0",
@@ -114,6 +118,7 @@ version = sys.argv[2]
             "files": ["bundler/", "node/", "web/", "README.md", "COPYING"],
             "sideEffects": ["./bundler/rars_wasm.js", "./web/rars_wasm.js"],
             "engines": {"node": ">=18"},
+            "publishConfig": {"access": "public"},
         },
         indent=2,
     )
