@@ -132,7 +132,7 @@ impl Inputs {
 // Decoders
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Flavour {
     /// Roshal's reference decoder, and `rar` itself, which take the same flags.
     Unrar,
@@ -185,6 +185,29 @@ impl Decoder {
         command.output().unwrap()
     }
 
+    /// The first line the tool prints about itself, which is where every one of
+    /// these puts its version.
+    fn banner(&self) -> String {
+        let output = Command::new(self.program)
+            .stdin(Stdio::null())
+            .output()
+            .map(|output| {
+                let text = String::from_utf8_lossy(&output.stdout).into_owned();
+                if text.trim().is_empty() {
+                    String::from_utf8_lossy(&output.stderr).into_owned()
+                } else {
+                    text
+                }
+            })
+            .unwrap_or_default();
+        output
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("version unknown")
+            .to_string()
+    }
+
     fn is_installed(&self) -> bool {
         match Command::new(self.program)
             .arg("--help")
@@ -199,9 +222,20 @@ impl Decoder {
 }
 
 /// `rar` is listed after `unrar` because it is the same decoder with a licence
-/// attached; whichever is installed will do. `7zz` is the official build and
-/// `7z` is usually the distribution one, which is worth trying and usually
-/// fails calibration.
+/// attached; whichever is installed will do.
+///
+/// `7z` is deliberately absent. It is not one program: on Debian and Ubuntu it
+/// is the `+dfsg` build with the RAR decompressor removed, on older images it
+/// is p7zip 16.02 from 2016, and elsewhere it is an alias for a current 7-Zip.
+/// The first fails calibration and drops out, but the second reads plain RAR 3
+/// well enough to pass calibration and then rejects every RARVM filter and
+/// every RAR 1.5 password as an unsupported method. That is a fact about a
+/// nine-year-old binary, not about our archives, and it failed the release gate
+/// on v0.7.0 through v0.7.2 while `7zz` on the same runner accepted all of it.
+///
+/// So the matrix asks the decoders it pins: `unrar` built from source and the
+/// official `7zz`, both installed with a checked hash by
+/// `.github/workflows/release.yml`.
 const DECODERS: &[Decoder] = &[
     Decoder {
         program: "unrar",
@@ -213,10 +247,6 @@ const DECODERS: &[Decoder] = &[
     },
     Decoder {
         program: "7zz",
-        flavour: Flavour::SevenZip,
-    },
-    Decoder {
-        program: "7z",
         flavour: Flavour::SevenZip,
     },
 ];
@@ -256,6 +286,17 @@ fn calibrated(format: &str) -> Vec<&'static Decoder> {
                 );
             }
             output.status.success()
+        })
+        .inspect(|decoder| {
+            // Which decoders actually judged this format, and which build of
+            // each. Diagnosing v0.7.0's gate failure took an afternoon because
+            // the log named the program and not its version, and the answer was
+            // that two different 7-Zips were installed under two names.
+            eprintln!(
+                "{format}: judged by {} — {}",
+                decoder.program,
+                decoder.banner()
+            );
         })
         .collect()
 }
@@ -568,7 +609,9 @@ fn password_of(cell: &Cell) -> Option<&'static str> {
 /// it fails the same way. Calibration only shows a decoder can read the format
 /// at all; a feature inside it is a separate question.
 struct Limitation {
-    decoder: &'static str,
+    /// Keyed on the flavour rather than the program name: this is a thing
+    /// 7-Zip cannot do, and it stays true whichever of its names is installed.
+    decoder: Flavour,
     formats: &'static [&'static str],
     cells: &'static [&'static str],
     /// The WinRAR archive the decoder also refuses. Without one of these, a
@@ -577,7 +620,7 @@ struct Limitation {
 }
 
 const LIMITATIONS: &[Limitation] = &[Limitation {
-    decoder: "7zz",
+    decoder: Flavour::SevenZip,
     formats: &["rar15", "rar20"],
     cells: &[
         "store-encrypted",
@@ -700,7 +743,7 @@ fn run_matrix(format: &str) {
 
         for decoder in &decoders {
             if LIMITATIONS.iter().any(|limit| {
-                limit.decoder == decoder.program
+                limit.decoder == decoder.flavour
                     && limit.formats.contains(&format)
                     && limit.cells.contains(&cell.name)
             }) {
@@ -817,7 +860,7 @@ fn every_claimed_decoder_limitation_still_holds() {
     for limit in LIMITATIONS {
         let Some(decoder) = DECODERS
             .iter()
-            .find(|decoder| decoder.program == limit.decoder && decoder.is_installed())
+            .find(|decoder| decoder.flavour == limit.decoder && decoder.is_installed())
         else {
             continue;
         };
@@ -826,7 +869,7 @@ fn every_claimed_decoder_limitation_still_holds() {
         assert!(
             !output.status.success(),
             "{} reads {} now, so it can judge {:?} on {:?} after all",
-            limit.decoder,
+            decoder.program,
             limit.proof,
             limit.cells,
             limit.formats
