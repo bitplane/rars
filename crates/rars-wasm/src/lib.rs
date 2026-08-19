@@ -530,7 +530,7 @@ fn repair_core(
         None => rars_rs::ArchiveReadOptions::new(),
     };
     match rars_rs::ArchiveReader::read_with_options(data, options()) {
-        Ok(archive) => archive.repair_recovery_with_report(),
+        Ok(archive) => archive.repair_recovery_with_report(password),
         Err(_) => rars_rs::rar50::repair_inline_recovery_bytes_with_options(data, options()),
     }
 }

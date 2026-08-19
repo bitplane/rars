@@ -1265,21 +1265,30 @@ impl Archive {
     }
 
     pub fn repair_protect_head(&self) -> Result<Vec<u8>> {
-        if let Some(recovery) = self
+        Ok(self.repair_protect_head_with_report()?.data)
+    }
+
+    /// Repaired archive bytes plus whether any protected sector was rebuilt.
+    pub fn repair_protect_head_with_report(&self) -> Result<crate::RecoveryRepairResult> {
+        let (data, data_repaired) = if let Some(recovery) = self
             .new_subs()
             .find(|sub| sub.kind == NewSubKind::RecoveryRecord)
         {
-            return repair_newsub_recovery_bytes(
-                &self.source_bytes()?,
-                self.sfx_offset,
-                self,
-                recovery,
-            );
-        }
-        let protect = self.protect_records().next().ok_or(Error::InvalidHeader(
-            "RAR 2.x archive does not contain a PROTECT_HEAD recovery record",
-        ))?;
-        repair_protect_head_bytes(&self.source_bytes()?, self.sfx_offset, protect)
+            repair_newsub_recovery_bytes(&self.source_bytes()?, self.sfx_offset, self, recovery)?
+        } else {
+            let protect = self.protect_records().next().ok_or(Error::InvalidHeader(
+                "RAR 2.x archive does not contain a PROTECT_HEAD recovery record",
+            ))?;
+            repair_protect_head_bytes(&self.source_bytes()?, self.sfx_offset, protect)?
+        };
+        Ok(crate::RecoveryRepairResult {
+            data,
+            report: crate::RecoveryRepairReport {
+                changed: data_repaired,
+                data_repaired,
+                ..Default::default()
+            },
+        })
     }
 
     /// Streams extracted entries to caller-provided writers.
@@ -1555,11 +1564,12 @@ fn parse_protect_header(
     })
 }
 
+/// Repaired bytes plus whether any sector was actually rebuilt.
 fn repair_protect_head_bytes(
     source: &[u8],
     sfx_offset: usize,
     protect: &ProtectHeader,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, bool)> {
     if protect.rec_sectors == 0 {
         return Err(Error::InvalidHeader(
             "RAR 2.x recovery record has no parity sectors",
@@ -1623,7 +1633,7 @@ fn repair_protect_head_bytes(
         }
     }
     if damaged.is_empty() {
-        return Ok(source.to_vec());
+        return Ok((source.to_vec(), false));
     }
     if damaged.len() > usize::from(protect.rec_sectors) {
         return Err(Error::InvalidHeader(
@@ -1670,15 +1680,16 @@ fn repair_protect_head_bytes(
             return Err(Error::CrcMismatch { expected, actual });
         }
     }
-    Ok(repaired)
+    Ok((repaired, true))
 }
 
+/// Repaired bytes plus whether any sector was actually rebuilt.
 fn repair_newsub_recovery_bytes(
     source: &[u8],
     sfx_offset: usize,
     archive: &Archive,
     recovery: &NewSubHeader,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, bool)> {
     let recovery_data = newsub_recovery_data(archive, recovery)?;
     let expected_unpacked = usize::try_from(recovery.file.unp_size)
         .map_err(|_| Error::InvalidHeader("RAR 3.x recovery unpacked size overflows usize"))?;
@@ -1733,7 +1744,7 @@ fn repair_newsub_recovery_bytes(
         }
     }
     if damaged.is_empty() {
-        return Ok(source.to_vec());
+        return Ok((source.to_vec(), false));
     }
     if damaged.len() > parity_sectors {
         return Err(Error::InvalidHeader(
@@ -1779,7 +1790,7 @@ fn repair_newsub_recovery_bytes(
         repaired[sector_start..sector_start + write_len].copy_from_slice(&sector[..write_len]);
     }
 
-    Ok(repaired)
+    Ok((repaired, true))
 }
 
 fn newsub_recovery_data(archive: &Archive, recovery: &NewSubHeader) -> Result<Vec<u8>> {

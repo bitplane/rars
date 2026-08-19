@@ -501,23 +501,20 @@ impl Archive {
     /// Returns full repaired archive bytes using the archive's embedded
     /// recovery records.
     pub fn repair_recovery(&self) -> Result<Vec<u8>> {
-        Ok(self.repair_recovery_with_report()?.data)
+        Ok(self.repair_recovery_with_report(None)?.data)
     }
 
-    pub fn repair_recovery_with_report(&self) -> Result<RecoveryRepairResult> {
+    /// Repaired archive bytes together with what the repair had to change.
+    ///
+    /// `password` unlocks the recovery record of a header-encrypted RAR 5
+    /// archive, and frames its replacement end-of-archive header.
+    pub fn repair_recovery_with_report(
+        &self,
+        password: Option<&[u8]>,
+    ) -> Result<RecoveryRepairResult> {
         match self {
-            Self::Rar15To40(archive) => {
-                let data = archive.repair_protect_head()?;
-                Ok(RecoveryRepairResult {
-                    report: RecoveryRepairReport {
-                        changed: true,
-                        data_repaired: true,
-                        ..Default::default()
-                    },
-                    data,
-                })
-            }
-            Self::Rar50Plus(archive) => archive.repair_recovery_with_report(),
+            Self::Rar15To40(archive) => archive.repair_protect_head_with_report(),
+            Self::Rar50Plus(archive) => archive.repair_recovery_with_report(password),
             Self::Rar13(_) => Err(Error::UnsupportedFamilyFeature {
                 family: ArchiveFamily::Rar13,
                 feature: "recovery repair for RAR 1.3/1.4 archives",
@@ -528,23 +525,22 @@ impl Archive {
     /// Streams full repaired archive bytes to `writer` using embedded recovery
     /// records.
     pub fn repair_recovery_to(&self, writer: &mut dyn Write) -> Result<()> {
-        self.repair_recovery_to_with_report(writer).map(|_| ())
+        self.repair_recovery_to_with_report(writer, None)
+            .map(|_| ())
     }
 
     pub fn repair_recovery_to_with_report(
         &self,
         writer: &mut dyn Write,
+        password: Option<&[u8]>,
     ) -> Result<RecoveryRepairReport> {
         match self {
             Self::Rar15To40(archive) => {
-                writer.write_all(&archive.repair_protect_head()?)?;
-                Ok(RecoveryRepairReport {
-                    changed: true,
-                    data_repaired: true,
-                    ..Default::default()
-                })
+                let repaired = archive.repair_protect_head_with_report()?;
+                writer.write_all(&repaired.data)?;
+                Ok(repaired.report)
             }
-            Self::Rar50Plus(archive) => archive.repair_recovery_to_with_report(writer),
+            Self::Rar50Plus(archive) => archive.repair_recovery_to_with_report(writer, password),
             Self::Rar13(_) => Err(Error::UnsupportedFamilyFeature {
                 family: ArchiveFamily::Rar13,
                 feature: "recovery repair for RAR 1.3/1.4 archives",

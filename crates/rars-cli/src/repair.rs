@@ -23,7 +23,10 @@ pub(crate) fn cmd_repair(args: RepairArgs) -> CliResult<()> {
         Ok(archive) => {
             let mut output = fs::File::create(&paths[1])?;
             let report = archive
-                .repair_recovery_to_with_report(&mut output)
+                .repair_recovery_to_with_report(
+                    &mut output,
+                    crate::password::password_bytes(&password),
+                )
                 .map_err(|err| format!("failed to repair archive '{}': {err}", paths[0]))?;
             print_repair_report(&paths[1], report);
         }

@@ -770,24 +770,24 @@ fn repair(
 ) -> PyResult<Vec<u8>> {
     let password = py_password(password)?;
     let bytes = py_input_bytes(py, source)?;
-    py.detach(|| {
-        let options = match password.as_deref() {
-            Some(password) => rars_rs::ArchiveReadOptions::with_password(password),
-            None => rars_rs::ArchiveReadOptions::new(),
-        };
-        match rars_rs::ArchiveReader::read_with_options(&bytes, options) {
-            Ok(archive) => archive.repair_recovery(),
-            Err(_) => {
-                let options = match password.as_deref() {
-                    Some(password) => rars_rs::ArchiveReadOptions::with_password(password),
-                    None => rars_rs::ArchiveReadOptions::new(),
-                };
-                rars_rs::rar50::repair_inline_recovery_bytes_with_options(&bytes, options)
-                    .map(|result| result.data)
-            }
-        }
-    })
-    .map_err(map_error)
+    py.detach(|| repair_core(&bytes, password.as_deref()).map(|result| result.data))
+        .map_err(map_error)
+}
+
+/// Repairs from the archive's own recovery record, falling back to a raw
+/// inline-recovery pass when the headers are too damaged to parse.
+fn repair_core(
+    bytes: &[u8],
+    password: Option<&[u8]>,
+) -> rars_rs::Result<rars_rs::RecoveryRepairResult> {
+    let options = || match password {
+        Some(password) => rars_rs::ArchiveReadOptions::with_password(password),
+        None => rars_rs::ArchiveReadOptions::new(),
+    };
+    match rars_rs::ArchiveReader::read_with_options(bytes, options()) {
+        Ok(archive) => archive.repair_recovery_with_report(password),
+        Err(_) => rars_rs::rar50::repair_inline_recovery_bytes_with_options(bytes, options()),
+    }
 }
 
 #[pyfunction]
@@ -800,20 +800,7 @@ fn repair_detailed(
     let password = py_password(password)?;
     let bytes = py_input_bytes(py, source)?;
     py.detach(|| {
-        let options = match password.as_deref() {
-            Some(password) => rars_rs::ArchiveReadOptions::with_password(password),
-            None => rars_rs::ArchiveReadOptions::new(),
-        };
-        let result = match rars_rs::ArchiveReader::read_with_options(&bytes, options) {
-            Ok(archive) => archive.repair_recovery_with_report()?,
-            Err(_) => {
-                let options = match password.as_deref() {
-                    Some(password) => rars_rs::ArchiveReadOptions::with_password(password),
-                    None => rars_rs::ArchiveReadOptions::new(),
-                };
-                rars_rs::rar50::repair_inline_recovery_bytes_with_options(&bytes, options)?
-            }
-        };
+        let result = repair_core(&bytes, password.as_deref())?;
         Ok(RepairResult {
             data: result.data,
             report: result.report.into(),

@@ -1770,7 +1770,7 @@ fn repairs_rar50_inline_recovery_with_damaged_recovery_chunk() {
     let damaged_archive = Archive::parse(&damaged).unwrap();
     assert!(collect_extract(&damaged_archive).is_err());
 
-    let repaired = damaged_archive.repair_recovery_with_report().unwrap();
+    let repaired = damaged_archive.repair_recovery_with_report(None).unwrap();
 
     assert!(repaired.report.data_repaired);
     assert!(repaired.report.recovery_record_rebuilt);
@@ -1804,7 +1804,7 @@ fn rebuilds_damaged_recovery_chunk_without_claiming_data_repair() {
 
     let result = Archive::parse(&damaged)
         .unwrap()
-        .repair_recovery_with_report()
+        .repair_recovery_with_report(None)
         .unwrap();
 
     assert!(!result.report.data_repaired);
@@ -1832,6 +1832,81 @@ fn rebuilds_truncated_rar50_inline_recovery_tail() {
     assert_eq!(repaired, bytes);
     let archive = Archive::parse(&repaired).unwrap();
     assert_eq!(collect_extract(&archive).unwrap()[0].data, payload);
+}
+
+#[test]
+fn rebuilds_a_damaged_chunk_in_an_archive_storing_a_recovery_archive() {
+    // The stored inner archive carries its own {RB} chunks, which sit earlier
+    // in the file than the outer record's.
+    let inner = write_stored_archive_with_recovery(
+        &[entry(
+            b"inner-payload.txt",
+            &b"nested archive payload\n".repeat(2048),
+        )],
+        rar50::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only()),
+        20,
+    )
+    .unwrap();
+    let bytes = write_stored_archive_with_recovery(
+        &[entry(b"inner.rar", &inner)],
+        rar50::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only()),
+        20,
+    )
+    .unwrap();
+    let archive = Archive::parse(&bytes).unwrap();
+    let recovery_range = archive.services().next().unwrap().block.data_range.clone();
+    let mut damaged = bytes.clone();
+    damaged[recovery_range.start + 0x48] ^= 0xff;
+
+    let repaired = Archive::parse(&damaged)
+        .unwrap()
+        .repair_recovery_with_report(None)
+        .unwrap();
+
+    assert!(repaired.report.recovery_record_rebuilt);
+    assert_eq!(repaired.data, bytes);
+}
+
+#[test]
+fn rebuilds_a_header_encrypted_archive_end_from_a_parsed_archive() {
+    // Framing a replacement end-of-archive header for a header-encrypted
+    // archive needs the key, so the repair has to be given the password even
+    // though the archive itself parsed.
+    let payload = b"header encrypted, damaged row, missing tail\n".repeat(2048);
+    let entries = [entry(b"secret-recovery.txt", &payload).with_password(b"password".to_vec())];
+    let mut features = FeatureSet::store_only();
+    features.header_encryption = true;
+    let bytes = write_stored_archive_with_recovery(
+        &entries,
+        rar50::WriterOptions::new(ArchiveVersion::Rar50, features),
+        20,
+    )
+    .unwrap();
+    let archive = Archive::parse_with_password(&bytes, Some(b"password")).unwrap();
+    let recovery_range = archive.services().next().unwrap().block.data_range.clone();
+    let mut damaged = bytes.clone();
+    damaged.truncate(recovery_range.end);
+    damaged[recovery_range.start + 0x48] ^= 0xff;
+
+    let repaired = Archive::parse_with_password(&damaged, Some(b"password"))
+        .unwrap()
+        .repair_recovery_with_report(Some(b"password"))
+        .unwrap();
+
+    assert!(repaired.report.recovery_record_rebuilt);
+    assert!(repaired.report.end_record_rebuilt);
+    // Everything up to the end of the record comes back byte for byte. The
+    // replacement end header cannot, since each encrypted block is framed with
+    // a fresh initialisation vector.
+    assert_eq!(
+        repaired.data[..recovery_range.end],
+        bytes[..recovery_range.end]
+    );
+    let archive = Archive::parse_with_password(&repaired.data, Some(b"password")).unwrap();
+    assert_eq!(
+        collect_extract_with_password(&archive, Some(b"password")).unwrap()[0].data,
+        payload
+    );
 }
 
 #[test]

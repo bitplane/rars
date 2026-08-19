@@ -7,6 +7,9 @@ const ZERO_LOG_SENTINEL: u32 = (FIELD_SIZE * 2) as u32;
 const MAX_WINRAR602_DATA_SHARDS: u64 = 200;
 const KIB: u64 = 1024;
 const RAR5_RECOVERY_CHUNK_FIXED_HEADER_SIZE: u64 = 0x48;
+/// Resident parity a record rebuild may allocate. The archive itself is
+/// already in memory by the time a rebuild starts, so this bounds the extra.
+const MAX_REBUILD_PARITY_BYTES: u64 = crate::DEFAULT_WRITER_MEMORY_LIMIT;
 
 use crate::write_progress::ProgressReporter;
 use crate::{WriteOperation, WriteProgressEvent};
@@ -27,6 +30,7 @@ pub enum Error {
     ShardSizeMismatch,
     TooManyShards,
     SingularElement,
+    RebuildTooLarge,
     Io(std::io::ErrorKind),
 }
 
@@ -45,6 +49,9 @@ impl std::fmt::Display for Error {
             Self::ShardSizeMismatch => f.write_str("RAR 5 recovery shard sizes differ"),
             Self::TooManyShards => f.write_str("RAR 5 recovery shard count is invalid"),
             Self::SingularElement => f.write_str("RAR 5 recovery matrix is singular"),
+            Self::RebuildTooLarge => {
+                f.write_str("RAR 5 recovery record is too large to rebuild in memory")
+            }
             Self::Io(kind) => write!(f, "RAR 5 recovery I/O failed: {kind}"),
         }
     }
@@ -247,6 +254,26 @@ pub(crate) fn build_structural_inline_recovery_data_with_progress(
     Ok(out)
 }
 
+/// Builds recovery payload bytes with the geometry of `plan`, so a record
+/// rebuilt during repair keeps the shape the archive was written with.
+pub(crate) fn build_inline_recovery_data_for_plan(
+    archive_prefix: &[u8],
+    plan: InlineRecoveryPlan,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    build_streamed_inline_recovery_for_plan(
+        &mut std::io::Cursor::new(archive_prefix),
+        archive_prefix.len() as u64,
+        plan,
+        RecoveryMemoryMode::Resident,
+        None,
+        &mut out,
+        None,
+        1,
+    )?;
+    Ok(out)
+}
+
 /// Read buffer size for streaming recovery passes. Even, so words never
 /// straddle a chunk boundary.
 pub(crate) const RECOVERY_IO_BLOCK: usize = 256 * 1024;
@@ -337,6 +364,35 @@ pub(crate) fn build_streamed_inline_recovery(
     pass: usize,
 ) -> Result<StreamedRecoveryOutput> {
     let plan = plan_inline_recovery(body_len, recovery_percent)?;
+    build_streamed_inline_recovery_for_plan(
+        body,
+        body_len,
+        plan,
+        mode,
+        parity_scratch,
+        sink,
+        progress,
+        pass,
+    )
+}
+
+/// Same as [`build_streamed_inline_recovery`] with the geometry supplied
+/// rather than derived from a percentage.
+///
+/// Repair needs this: WinRAR accepts recovery percentages up to 1000%, which
+/// [`plan_inline_recovery`] never produces, so a record rebuilt from surviving
+/// chunks has to take its geometry from those chunks.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_streamed_inline_recovery_for_plan(
+    body: &mut dyn ReadSeek,
+    body_len: u64,
+    plan: InlineRecoveryPlan,
+    mode: RecoveryMemoryMode,
+    parity_scratch: Option<&mut dyn ReadWriteSeek>,
+    sink: &mut dyn std::io::Write,
+    progress: Option<ProgressReporter<'_>>,
+    pass: usize,
+) -> Result<StreamedRecoveryOutput> {
     let payload_len = plan.payload_size()?;
 
     // Fail on unrepresentable geometry before doing any work.
@@ -945,16 +1001,31 @@ where
     Ok(shard)
 }
 
+/// What a raw inline-recovery repair knows beyond the archive bytes.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct InlineRepairOptions<'a> {
+    /// Password for header-encrypted archives, needed to frame a replacement
+    /// end-of-archive header.
+    pub password: Option<&'a [u8]>,
+    /// Byte range holding this archive's recovery record, when a parsed
+    /// archive already said where it lives.
+    pub record_range: Option<std::ops::Range<usize>>,
+}
+
 pub fn repair_inline_recovery_archive(input: &[u8]) -> Result<Vec<u8>> {
-    Ok(repair_inline_recovery_archive_with_report(input, None)?.0)
+    Ok(repair_inline_recovery_archive_with_report(input, &InlineRepairOptions::default())?.0)
 }
 
 pub(crate) fn repair_inline_recovery_archive_with_report(
     input: &[u8],
-    password: Option<&[u8]>,
+    options: &InlineRepairOptions<'_>,
 ) -> Result<(Vec<u8>, crate::RecoveryRepairReport)> {
-    let chunks = find_inline_recovery_chunks(input)?;
+    let chunks = select_record_chunks(
+        find_inline_recovery_chunks(input)?,
+        options.record_range.clone(),
+    )?;
     let first = chunks.first().ok_or(Error::BadRecoveryChunk)?;
+    let plan = first.chunk.plan;
     let protected_size =
         usize::try_from(first.chunk.protected_size).map_err(|_| Error::PlanOverflow)?;
     if protected_size > input.len() {
@@ -972,7 +1043,6 @@ pub(crate) fn repair_inline_recovery_archive_with_report(
     let original_prefix = &input[..protected_size];
     let repaired_prefix = repair_inline_recovery_prefix(original_prefix, &recovery_data)?;
     let data_repaired = repaired_prefix != original_prefix;
-    let plan = first.chunk.plan;
     let mut indices = chunks
         .iter()
         .map(|found| found.chunk.shard_index)
@@ -999,32 +1069,38 @@ pub(crate) fn repair_inline_recovery_archive_with_report(
     let record_end = record_start
         .checked_add(payload_len)
         .ok_or(Error::PlanOverflow)?;
-    let recovery_record_rebuilt = available != expected || record_end > input.len();
-    let mut repaired = if recovery_record_rebuilt {
-        let percent = (1..=100)
-            .find(|&percent| plan_inline_recovery(protected_size as u64, percent) == Ok(plan))
-            .ok_or(Error::BadRecoveryChunk)?;
-        let rebuilt = build_structural_inline_recovery_data(&repaired_prefix, percent)?;
-        let mut out = Vec::with_capacity(input.len().max(record_end));
-        out.extend_from_slice(&repaired_prefix);
-        out.extend_from_slice(
-            input
-                .get(protected_size..record_start)
-                .ok_or(Error::BadRecoveryChunk)?,
-        );
-        out.extend_from_slice(&rebuilt);
-        if record_end < input.len() {
-            out.extend_from_slice(&input[record_end..]);
-        }
-        out
-    } else {
+
+    // Splicing the repaired prefix back in is the floor. Whatever happens to
+    // the record itself, the caller still gets the data repair.
+    let prefix_only = || {
         let mut out = input.to_vec();
         out[..protected_size].copy_from_slice(&repaired_prefix);
         out
     };
+    let record_complete = available == expected && record_end <= input.len();
+    let mut recovery_record_rebuilt = false;
+    let mut repaired = if record_complete {
+        prefix_only()
+    } else {
+        match rebuild_inline_recovery_record(
+            input,
+            &repaired_prefix,
+            record_start..record_end,
+            plan,
+        ) {
+            Ok(rebuilt) => {
+                recovery_record_rebuilt = true;
+                rebuilt
+            }
+            Err(_) => prefix_only(),
+        }
+    };
+
+    // An archive that stops where its recovery record does lost its
+    // end-of-archive header along with whatever followed.
     let mut end_record_rebuilt = false;
-    if record_end >= input.len() {
-        let end = crate::rar50::recovery_end_header(input, password)
+    if (record_complete || recovery_record_rebuilt) && repaired.len() <= record_end {
+        let end = crate::rar50::recovery_end_header(&repaired, options.password)
             .map_err(|_| Error::BadRecoveryChunk)?;
         repaired.extend_from_slice(&end);
         end_record_rebuilt = true;
@@ -1038,6 +1114,72 @@ pub(crate) fn repair_inline_recovery_archive_with_report(
         expected_recovery_shards: Some(expected),
     };
     Ok((repaired, report))
+}
+
+/// Rebuilds the whole recovery record from the repaired prefix, replacing
+/// `record` in the archive.
+///
+/// Parity is built resident, so a record declaring far more shards than it has
+/// bytes to protect could ask for an allocation nothing can serve. Refusing
+/// past [`MAX_REBUILD_PARITY_BYTES`] costs the caller the rebuild and keeps
+/// the data repair.
+fn rebuild_inline_recovery_record(
+    input: &[u8],
+    repaired_prefix: &[u8],
+    record: std::ops::Range<usize>,
+    plan: InlineRecoveryPlan,
+) -> Result<Vec<u8>> {
+    let parity_bytes = plan
+        .recovery_shards
+        .checked_mul(plan.group_count)
+        .ok_or(Error::PlanOverflow)?;
+    if parity_bytes > MAX_REBUILD_PARITY_BYTES {
+        return Err(Error::RebuildTooLarge);
+    }
+    let rebuilt = build_inline_recovery_data_for_plan(repaired_prefix, plan)?;
+    if rebuilt.len() != record.len() {
+        return Err(Error::BadRecoveryChunk);
+    }
+    let gap = input
+        .get(repaired_prefix.len()..record.start)
+        .ok_or(Error::BadRecoveryChunk)?;
+    let mut out = Vec::with_capacity(input.len().max(record.end));
+    out.extend_from_slice(repaired_prefix);
+    out.extend_from_slice(gap);
+    out.extend_from_slice(&rebuilt);
+    if let Some(tail) = input.get(record.end..) {
+        out.extend_from_slice(tail);
+    }
+    Ok(out)
+}
+
+/// Narrows found chunks down to the ones belonging to this archive's own
+/// recovery record.
+///
+/// A stored archive nested inside this one carries `{RB}` chunks that parse
+/// just as cleanly as ours, and taking the first one found picks the nested
+/// record whenever it sits earlier in the file. This archive's record always
+/// protects more bytes than anything stored inside it, so the largest
+/// protected size wins. `record_range` settles it outright when a parsed
+/// archive already said where the record is.
+fn select_record_chunks(
+    chunks: Vec<FoundInlineRecoveryChunk>,
+    record_range: Option<std::ops::Range<usize>>,
+) -> Result<Vec<FoundInlineRecoveryChunk>> {
+    let mut chunks = match record_range {
+        Some(range) => chunks
+            .into_iter()
+            .filter(|found| range.contains(&found.offset))
+            .collect(),
+        None => chunks,
+    };
+    let protected_size = chunks
+        .iter()
+        .map(|found| found.chunk.protected_size)
+        .max()
+        .ok_or(Error::BadRecoveryChunk)?;
+    chunks.retain(|found| found.chunk.protected_size == protected_size);
+    Ok(chunks)
 }
 
 fn find_inline_recovery_chunks(input: &[u8]) -> Result<Vec<FoundInlineRecoveryChunk>> {
@@ -1574,7 +1716,8 @@ mod legacy_reference {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_inverse_matrix, build_structural_inline_recovery_data, crc64_rar_state, crc64_xz,
+        apply_inverse_matrix, build_inline_recovery_data_for_plan,
+        build_structural_inline_recovery_data, crc64_rar_state, crc64_xz,
         encode_inline_recovery_parity, encode_parity_shards, invert_linear_system_matrix,
         make_encoder_matrix, plan_inline_recovery, reconstruct_data_shards,
         repair_inline_recovery_archive, repair_inline_recovery_prefix,
@@ -2144,6 +2287,55 @@ mod tests {
         archive.extend_from_slice(b"end bytes");
         let mut damaged = archive.clone();
         damaged[256..320].fill(0x5a);
+
+        let repaired = repair_inline_recovery_archive(&damaged).unwrap();
+
+        assert_eq!(repaired, archive);
+    }
+
+    #[test]
+    fn rar5_inline_recovery_rebuilds_a_record_above_one_hundred_percent() {
+        // WinRAR takes -rr up to 1000%, so a record can hold more recovery
+        // shards than data shards. plan_inline_recovery never produces one,
+        // and a rebuild that works back from a percentage cannot match it.
+        let prefix: Vec<u8> = (0..32_000).map(|index| (index * 13) as u8).collect();
+        let mut plan = plan_inline_recovery(prefix.len() as u64, 100).unwrap();
+        plan.recovery_shards = plan.data_shards * 3;
+        let recovery_data = build_inline_recovery_data_for_plan(&prefix, plan).unwrap();
+        let mut archive = prefix.clone();
+        archive.extend_from_slice(b"service header bytes before chunks");
+        let record_start = archive.len();
+        archive.extend_from_slice(&recovery_data);
+        archive.extend_from_slice(b"end bytes");
+
+        let mut damaged = archive.clone();
+        damaged[256..320].fill(0x5a);
+        damaged[record_start + 0x48] ^= 0xff;
+
+        let repaired = repair_inline_recovery_archive(&damaged).unwrap();
+
+        assert_eq!(repaired, archive);
+    }
+
+    #[test]
+    fn rar5_inline_recovery_picks_the_outermost_record() {
+        // A stored archive nested inside this one has its own {RB} chunks, and
+        // they sit earlier in the file than ours.
+        let inner_prefix: Vec<u8> = (0..16_000).map(|index| (index * 7) as u8).collect();
+        let mut inner = inner_prefix.clone();
+        inner.extend_from_slice(&build_structural_inline_recovery_data(&inner_prefix, 20).unwrap());
+
+        let mut prefix = b"outer archive header bytes".to_vec();
+        prefix.extend_from_slice(&inner);
+        prefix.extend_from_slice(&recovery_test_bytes(9_000, 5));
+        let mut archive = prefix.clone();
+        archive.extend_from_slice(b"service header bytes before chunks");
+        let record_start = archive.len();
+        archive.extend_from_slice(&build_structural_inline_recovery_data(&prefix, 20).unwrap());
+        archive.extend_from_slice(b"end bytes");
+
+        let mut damaged = archive.clone();
+        damaged[record_start + 0x48] ^= 0xff;
 
         let repaired = repair_inline_recovery_archive(&damaged).unwrap();
 

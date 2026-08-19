@@ -665,56 +665,62 @@ impl Archive {
     }
 
     pub fn repair_recovery(&self) -> Result<Vec<u8>> {
-        Ok(self.repair_recovery_with_report()?.data)
+        Ok(self.repair_recovery_with_report(None)?.data)
     }
 
-    pub fn repair_recovery_with_report(&self) -> Result<crate::RecoveryRepairResult> {
+    pub fn repair_recovery_with_report(
+        &self,
+        password: Option<&[u8]>,
+    ) -> Result<crate::RecoveryRepairResult> {
         let mut data = Vec::new();
-        let report = self.repair_recovery_to_with_report(&mut data)?;
+        let report = self.repair_recovery_to_with_report(&mut data, password)?;
         Ok(crate::RecoveryRepairResult { data, report })
     }
 
     pub fn repair_recovery_to(&self, writer: &mut dyn Write) -> Result<()> {
-        let repaired = self.repair_recovery_with_report()?;
-        writer.write_all(&repaired.data)?;
-        Ok(())
+        self.repair_recovery_to_with_report(writer, None)
+            .map(|_| ())
     }
 
     pub fn repair_recovery_to_with_report(
         &self,
         writer: &mut dyn Write,
+        password: Option<&[u8]>,
     ) -> Result<crate::RecoveryRepairReport> {
-        let recovery = self
-            .services()
-            .find(|service| matches!(service.recovery_record(), Ok(Some(_))))
-            .ok_or(Error::InvalidHeader(
-                "RAR 5 archive does not contain an inline recovery record",
-            ))?;
-        let recovery_data = recovery.decoded_data_unverified(self, None)?;
+        let recovery = self.recovery_service()?;
+        let recovery_data = recovery.decoded_data_unverified(self, password)?;
         let (available, expected) =
             crate::recovery::rar5::inline_recovery_chunk_counts(&recovery_data)?;
         if available == expected || self.sfx_offset != 0 {
-            return self.repair_recovery_to_legacy(writer, available, expected);
+            return self.repair_recovery_to_legacy(writer, password, available, expected);
         }
         let bytes = self.read_range(0..self.source_len()?)?;
+        let options = crate::recovery::rar5::InlineRepairOptions {
+            password,
+            record_range: Some(recovery.block.data_range.clone()),
+        };
         let (data, report) =
-            crate::recovery::rar5::repair_inline_recovery_archive_with_report(&bytes, None)?;
+            crate::recovery::rar5::repair_inline_recovery_archive_with_report(&bytes, &options)?;
         writer.write_all(&data)?;
         Ok(report)
+    }
+
+    fn recovery_service(&self) -> Result<&FileHeader> {
+        self.services()
+            .find(|service| matches!(service.recovery_record(), Ok(Some(_))))
+            .ok_or(Error::InvalidHeader(
+                "RAR 5 archive does not contain an inline recovery record",
+            ))
     }
 
     fn repair_recovery_to_legacy(
         &self,
         writer: &mut dyn Write,
+        password: Option<&[u8]>,
         available: u64,
         expected: u64,
     ) -> Result<crate::RecoveryRepairReport> {
-        let recovery = self
-            .services()
-            .find(|service| matches!(service.recovery_record(), Ok(Some(_))))
-            .ok_or(Error::InvalidHeader(
-                "RAR 5 archive does not contain an inline recovery record",
-            ))?;
+        let recovery = self.recovery_service()?;
         let prefix_start = self.sfx_offset;
         let prefix_end = recovery
             .block
@@ -731,7 +737,7 @@ impl Archive {
             ));
         }
         let recovery_data = recovery
-            .decoded_data_unverified(self, None)
+            .decoded_data_unverified(self, password)
             .map_err(|error| error.at_entry(recovery.name.clone(), "reading recovery data"))?;
         let prefix_len = prefix_end
             .checked_sub(prefix_start)
@@ -1027,8 +1033,12 @@ pub fn repair_inline_recovery_bytes_with_options(
     if !input.starts_with(RAR50_SIGNATURE) {
         return Err(Error::UnsupportedSignature);
     }
+    let repair_options = crate::recovery::rar5::InlineRepairOptions {
+        password: options.password,
+        ..Default::default()
+    };
     let (repaired, report) =
-        crate::recovery::rar5::repair_inline_recovery_archive_with_report(input, options.password)
+        crate::recovery::rar5::repair_inline_recovery_archive_with_report(input, &repair_options)
             .map_err(Error::from)?;
     let parse_target = if repaired == input { input } else { &repaired };
     let _ = Archive::parse_with_options(parse_target, options)?;
@@ -1038,11 +1048,31 @@ pub fn repair_inline_recovery_bytes_with_options(
     })
 }
 
+/// Frames a replacement end-of-archive header for an archive that lost its
+/// own.
+///
+/// A volume whose last entry runs into the next part has to keep saying so,
+/// and only the parsed blocks show that, so `input` is read back here. It is
+/// the repaired archive rather than the damaged one, so the blocks it walks
+/// are the ones the caller is about to write. A volume that splits cleanly on
+/// an entry boundary is indistinguishable from a final one and loses the flag;
+/// unrar and WinRAR both walk such a set from the main header anyway.
 pub(crate) fn recovery_end_header(input: &[u8], password: Option<&[u8]>) -> Result<Vec<u8>> {
+    let end_flags = match Archive::parse_with_password(input, password) {
+        Ok(archive)
+            if archive
+                .files()
+                .last()
+                .is_some_and(|file| file.is_split_after()) =>
+        {
+            EFL_NEXT_VOLUME
+        }
+        _ => 0,
+    };
     let first = parse_block_header_bytes(input, RAR50_SIGNATURE.len(), input.len(), 0)?;
     if first.block.header_type != HEAD_CRYPT {
         let mut end = Vec::new();
-        write::headers::write_end_header(&mut end, 0)?;
+        write::headers::write_end_header(&mut end, end_flags)?;
         return Ok(end);
     }
     let keys = parse_archive_encryption_header(&first, password)?;
@@ -1051,7 +1081,7 @@ pub(crate) fn recovery_end_header(input: &[u8], password: Option<&[u8]>) -> Resu
         HEAD_END,
         0,
         None,
-        &write::end_header_specific(0),
+        &write::end_header_specific(end_flags),
         &[],
         &[],
     )
