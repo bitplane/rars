@@ -1655,11 +1655,7 @@ fn validate_volume_writer_inputs(
 
 fn rar15_encode_options_for_level(level: Option<u8>) -> Result<Rar15EncodeOptions> {
     let level = level.unwrap_or(5);
-    // DOS RAR 1.402 rejects some streams produced with the old-distance
-    // short-LZ codes, even though the rars decoder can read them. Keep the
-    // writer on the older compatible subset until that encoding is pinned
-    // against a real oracle.
-    let compatible = Rar15EncodeOptions::new().with_old_distance_tokens(false);
+    let compatible = Rar15EncodeOptions::new();
     match level {
         0 => Ok(compatible
             .with_lazy_matching(false)
@@ -2476,12 +2472,12 @@ mod tests {
     }
 
     #[test]
-    fn rar14_writer_uses_dos_compatible_old_distance_policy() {
+    fn rar14_writer_uses_old_distance_tokens() {
         for level in 0..=5 {
             let options = rar15_encode_options_for_level(Some(level)).unwrap();
             assert!(
-                !options.old_distance_tokens_enabled(),
-                "RAR 1.4 level {level} must not emit old-distance tokens"
+                options.old_distance_tokens_enabled(),
+                "RAR 1.4 level {level} should consider old-distance tokens"
             );
         }
     }
@@ -2538,7 +2534,7 @@ mod tests {
         assert_eq!(
             find_long_lz(&data, 300, 0x8000),
             Some(LongLz {
-                distance: 300,
+                distance: 44,
                 length: 32
             })
         );

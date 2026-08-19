@@ -1328,11 +1328,15 @@ fn old_dist_lz_length_code(
     length: u32,
     distance: u32,
     max_dist3: u32,
-    short_code: u32,
+    _short_code: u32,
 ) -> Option<u32> {
     let decoded_bonus = u32::from(distance > 256) + u32::from(distance >= max_dist3);
     let length_code = length.checked_sub(2 + decoded_bonus)?;
-    if short_code == 10 && length_code == 0xff {
+    // DOS RAR 1.402 does not reliably decode an old-distance match whose
+    // length symbol reaches the all-ones value.  Code 10 also reserves that
+    // value for the Buf60 toggle, but the compatibility limit applies to all
+    // four old-distance codes.
+    if length_code == 0xff {
         return None;
     }
     Some(length_code)
@@ -1340,26 +1344,29 @@ fn old_dist_lz_length_code(
 
 fn long_lz_length_code_for_distance(long_lz: LongLz, max_dist3: u32) -> Option<u32> {
     let decoded_bonus =
-        u32::from(long_lz.distance >= max_dist3) + u32::from(long_lz.distance <= 256);
+        u32::from(long_lz.distance >= max_dist3) + if long_lz.distance <= 256 { 8 } else { 0 };
     long_lz.length.checked_sub(3 + decoded_bonus)
 }
 
 pub fn find_long_lz(input: &[u8], pos: usize, max_match_distance: usize) -> Option<LongLz> {
-    if pos < 257 {
+    if pos == 0 {
         return None;
     }
 
     let max_distance = pos.min(MAX_LONG_LZ_DISTANCE).min(max_match_distance);
-    if max_distance < 257 {
+    if max_distance == 0 {
         return None;
     }
     let mut best = LongLz {
         distance: 0,
         length: 0,
     };
-    for distance in 257..=max_distance {
+    for distance in 1..=max_distance {
         let length = super::fast::match_length(input, pos, distance, 258);
-        if length >= 3 && length > best.length as usize {
+        // LongLZ adds eight to the decoded length for distances up to 256,
+        // so its shortest encodable near-distance match is eleven bytes.
+        let min_length = if distance <= 256 { 11 } else { 3 };
+        if length >= min_length && length > best.length as usize {
             best = LongLz {
                 distance: distance as u32,
                 length: length as u32,
@@ -1377,12 +1384,12 @@ fn find_long_lz_with_buckets(
     buckets: &Rar13MatchFinder,
     max_candidates: usize,
 ) -> Option<LongLz> {
-    if pos < 257 || pos + 2 >= input.len() || max_candidates == 0 {
+    if pos == 0 || pos + 2 >= input.len() {
         return None;
     }
 
     let max_distance = pos.min(MAX_LONG_LZ_DISTANCE).min(max_match_distance);
-    if max_distance < 257 {
+    if max_distance == 0 {
         return None;
     }
     let max_length = (input.len() - pos).min(258);
@@ -1396,10 +1403,14 @@ fn find_long_lz_with_buckets(
         if distance > max_distance {
             break;
         }
-        if distance < 257 {
-            continue;
+        // Near-distance candidates are a separate, bounded set and must not
+        // consume the established search budget for older matches.
+        if distance > 256 {
+            if checked >= max_candidates {
+                break;
+            }
+            checked += 1;
         }
-        checked += 1;
         // A candidate can only improve on the current best when it matches at
         // least one byte past the best length, so probe that byte first. The
         // loop breaks once best reaches `max_length`, so the probe index stays
@@ -1408,7 +1419,8 @@ fn find_long_lz_with_buckets(
             || input[candidate + best.length as usize] == input[pos + best.length as usize]
         {
             let length = super::fast::match_length(input, pos, distance, max_length);
-            if length >= 3
+            let min_length = if distance <= 256 { 11 } else { 3 };
+            if length >= min_length
                 && (length > best.length as usize
                     || (length == best.length as usize && distance < best.distance as usize))
             {
@@ -1420,9 +1432,6 @@ fn find_long_lz_with_buckets(
                     break;
                 }
             }
-        }
-        if checked >= max_candidates {
-            break;
         }
     }
 
@@ -1548,6 +1557,42 @@ pub struct Unpack15 {
     old_dist_ptr: usize,
     last_dist: u32,
     last_length: u32,
+    #[cfg(test)]
+    token_stats: DecodeTokenStats,
+    #[cfg(test)]
+    old_distance_events: Vec<OldDistanceEvent>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+struct DecodeTokenStats {
+    literals: u64,
+    st_literals: u64,
+    st_matches: u64,
+    st_match_bytes: u64,
+    short_matches: u64,
+    short_match_bytes: u64,
+    repeat_matches: u64,
+    repeat_match_bytes: u64,
+    old_distance_matches: u64,
+    old_distance_match_bytes: u64,
+    old_distance_codes: [u64; 4],
+    old_distance_near: u64,
+    old_distance_far: u64,
+    long_near_matches: u64,
+    long_near_match_bytes: u64,
+    long_far_matches: u64,
+    long_far_match_bytes: u64,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+struct OldDistanceEvent {
+    output_position: usize,
+    short_code: u32,
+    distance: u32,
+    length: u32,
+    max_dist3: u32,
 }
 
 impl Unpack15 {
@@ -1593,6 +1638,10 @@ impl Unpack15 {
             old_dist_ptr: 0,
             last_dist: 0,
             last_length: 0,
+            #[cfg(test)]
+            token_stats: DecodeTokenStats::default(),
+            #[cfg(test)]
+            old_distance_events: Vec::new(),
         };
         decoder.reset_non_solid();
         decoder
@@ -1759,6 +1808,11 @@ impl Unpack15 {
         if self.l_count == 2 {
             self.bits.add_bits(1);
             if bit_field >= 0x8000 {
+                #[cfg(test)]
+                {
+                    self.token_stats.repeat_matches += 1;
+                    self.token_stats.repeat_match_bytes += u64::from(self.last_length);
+                }
                 self.copy_string(self.last_dist, self.last_length, out)?;
                 return Ok(());
             }
@@ -1794,6 +1848,11 @@ impl Unpack15 {
         if length >= 9 {
             if length == 9 {
                 self.l_count += 1;
+                #[cfg(test)]
+                {
+                    self.token_stats.repeat_matches += 1;
+                    self.token_stats.repeat_match_bytes += u64::from(self.last_length);
+                }
                 self.copy_string(self.last_dist, self.last_length, out)?;
                 return Ok(());
             }
@@ -1804,6 +1863,11 @@ impl Unpack15 {
                 self.bits.add_bits(15);
                 self.last_length = length;
                 self.last_dist = distance;
+                #[cfg(test)]
+                {
+                    self.token_stats.short_matches += 1;
+                    self.token_stats.short_match_bytes += u64::from(length);
+                }
                 self.copy_string(distance, length, out)?;
                 return Ok(());
             }
@@ -1825,6 +1889,24 @@ impl Unpack15 {
             }
 
             self.remember_match(distance, length);
+            #[cfg(test)]
+            {
+                self.old_distance_events.push(OldDistanceEvent {
+                    output_position: self.output_written,
+                    short_code: save_length,
+                    distance,
+                    length,
+                    max_dist3: self.max_dist3,
+                });
+                self.token_stats.old_distance_matches += 1;
+                self.token_stats.old_distance_match_bytes += u64::from(length);
+                self.token_stats.old_distance_codes[(save_length - 10) as usize] += 1;
+                if distance <= 256 {
+                    self.token_stats.old_distance_near += 1;
+                } else {
+                    self.token_stats.old_distance_far += 1;
+                }
+            }
             self.copy_string(distance, length, out)?;
             return Ok(());
         }
@@ -1844,6 +1926,11 @@ impl Unpack15 {
         length += 2;
         distance += 1;
         self.remember_match(distance, length);
+        #[cfg(test)]
+        {
+            self.token_stats.short_matches += 1;
+            self.token_stats.short_match_bytes += u64::from(length);
+        }
         self.copy_string(distance, length, out)
     }
 
@@ -1933,6 +2020,14 @@ impl Unpack15 {
         }
 
         self.remember_match(distance, length);
+        #[cfg(test)]
+        if distance <= 256 {
+            self.token_stats.long_near_matches += 1;
+            self.token_stats.long_near_match_bytes += u64::from(length);
+        } else {
+            self.token_stats.long_far_matches += 1;
+            self.token_stats.long_far_match_bytes += u64::from(length);
+        }
         self.copy_string(distance, length, out)
     }
 
@@ -1969,6 +2064,11 @@ impl Unpack15 {
                 let mut distance = self.decode_num(self.bits.get_bits()?, 5, DEC_HF2, POS_HF2);
                 distance = (distance << 5) | (self.bits.get_bits()? >> 11);
                 self.bits.add_bits(5);
+                #[cfg(test)]
+                {
+                    self.token_stats.st_matches += 1;
+                    self.token_stats.st_match_bytes += u64::from(length);
+                }
                 self.copy_string(distance, length, out)?;
                 return Ok(());
             }
@@ -1989,6 +2089,12 @@ impl Unpack15 {
         }
 
         let byte = (self.ch_set[byte_place as usize] >> 8) as u8;
+        #[cfg(test)]
+        if self.st_mode {
+            self.token_stats.st_literals += 1;
+        } else {
+            self.token_stats.literals += 1;
+        }
         self.put_byte(byte, out)?;
 
         let idx = byte_place as usize;
@@ -2150,11 +2256,12 @@ fn corr_huff(char_set: &mut [u16; 256], num_to_place: &mut [u8; 256]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_num_bit_cost, find_long_lz, find_lz_token, find_old_dist_lz, long_lz_buckets,
-        should_lazy_emit_literal, unpack15_decode, unpack15_encode, unpack15_encode_with_options,
-        EncodeOptions, EncodedToken, LongLz, LzPlanState, OldDistLz, ShortLz, Unpack15,
-        Unpack15Encoder, DEC_HF0, DEC_HF1, DEC_HF2, DEC_HF3, DEC_HF4, DEC_L1, DEC_L2, POS_HF0,
-        POS_HF1, POS_HF2, POS_HF3, POS_HF4, POS_L1, POS_L2,
+        decode_num_bit_cost, find_long_lz, find_long_lz_with_buckets, find_lz_token,
+        find_old_dist_lz, long_lz_buckets, should_lazy_emit_literal, unpack15_decode,
+        unpack15_encode, unpack15_encode_with_options, EncodeOptions, EncodedToken, LongLz,
+        LzPlanState, OldDistLz, Rar13MatchFinder, ShortLz, Unpack15, Unpack15Encoder, DEC_HF0,
+        DEC_HF1, DEC_HF2, DEC_HF3, DEC_HF4, DEC_L1, DEC_L2, POS_HF0, POS_HF1, POS_HF2, POS_HF3,
+        POS_HF4, POS_L1, POS_L2,
     };
 
     fn decode_num_prefix_is_stable(
@@ -2318,6 +2425,176 @@ mod tests {
     }
 
     #[test]
+    fn long_lz_search_accepts_near_distance_boundaries() {
+        let distance_one = vec![b'A'; 64];
+        assert_eq!(
+            find_long_lz(&distance_one, 1, 0x8000),
+            Some(LongLz {
+                distance: 1,
+                length: 63,
+            })
+        );
+
+        let distance_sixteen = b"abcdefghijklmnop".repeat(4);
+        assert_eq!(
+            find_long_lz(&distance_sixteen, 16, 0x8000),
+            Some(LongLz {
+                distance: 16,
+                length: 48,
+            })
+        );
+
+        let distance_256: Vec<_> = (0u8..=255).cycle().take(512).collect();
+        assert_eq!(
+            find_long_lz(&distance_256, 256, 0x8000),
+            Some(LongLz {
+                distance: 256,
+                length: 256,
+            })
+        );
+    }
+
+    #[test]
+    fn near_long_lz_requires_the_eleven_byte_wire_minimum() {
+        let input = b"abcdefghijXabcdefghijY";
+
+        assert_eq!(find_long_lz(input, 11, 0x8000), None);
+    }
+
+    #[test]
+    fn distance_257_remains_a_far_long_lz_match() {
+        let mut state = 0x1234_5678u32;
+        let mut input: Vec<_> = (0..257)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect();
+        let repeated = input[..32].to_vec();
+        input.extend_from_slice(&repeated);
+
+        assert_eq!(
+            find_long_lz(&input, 257, 0x8000),
+            Some(LongLz {
+                distance: 257,
+                length: 32,
+            })
+        );
+    }
+
+    #[test]
+    fn near_candidates_do_not_spend_the_far_match_budget() {
+        let pos = 2048;
+        let mut state = 0x9e37_79b9u32;
+        let mut input: Vec<_> = (0..pos + 32)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect();
+        let pattern = b"ABCDEFGHIJKLMNOPQRST";
+        input[128..128 + pattern.len()].copy_from_slice(pattern);
+        input[pos..pos + pattern.len()].copy_from_slice(pattern);
+
+        let far_distractors: Vec<_> = (0..63).map(|index| 512 + index * 4).collect();
+        let near_distractors: Vec<_> = (0..64).map(|index| pos - 256 + index * 4).collect();
+        for &candidate in far_distractors.iter().chain(&near_distractors) {
+            input[candidate..candidate + 4].copy_from_slice(b"ABC!");
+        }
+
+        let mut positions = vec![128];
+        positions.extend(far_distractors);
+        positions.extend(near_distractors);
+        let mut buckets = vec![Vec::new(); 1 << super::LONG_LZ_HASH_BITS];
+        buckets[Rar13MatchFinder::hash(&input, pos)] = positions;
+        let finder = Rar13MatchFinder { buckets };
+
+        assert_eq!(
+            find_long_lz_with_buckets(&input, pos, 0x8000, &finder, 64),
+            Some(LongLz {
+                distance: (pos - 128) as u32,
+                length: pattern.len() as u32,
+            })
+        );
+    }
+
+    #[test]
+    fn encoder_selects_and_round_trips_a_near_long_lz_match() {
+        let input = b"abcdefghijklmnop".repeat(64);
+        let buckets = long_lz_buckets(&input);
+        let encoder = Unpack15Encoder::new();
+
+        assert!(matches!(
+            encoder.choose_lz_token(&input, 16, &buckets, encoder.lz_plan_state(), 0),
+            Some(EncodedToken::LongLz(LongLz {
+                distance: 16,
+                length: 258,
+            }))
+        ));
+
+        let packed = unpack15_encode(&input).unwrap();
+        assert_eq!(unpack15_decode(&packed, input.len()).unwrap(), input);
+    }
+
+    /// Ad-hoc token census for comparing equivalent RAR 1.4 archives.
+    ///
+    /// Run with a platform-path-separated list of archive paths in
+    /// `RARS_RAR14_TOKEN_ARCHIVES` and `--ignored --nocapture`.
+    #[test]
+    #[ignore = "requires RARS_RAR14_TOKEN_ARCHIVES"]
+    fn report_rar14_token_census() {
+        let paths =
+            std::env::var_os("RARS_RAR14_TOKEN_ARCHIVES").expect("set RARS_RAR14_TOKEN_ARCHIVES");
+        for path in std::env::split_paths(&paths) {
+            let bytes = std::fs::read(&path).unwrap();
+            let archive = crate::rar13::Archive::parse(&bytes).unwrap();
+            let mut decoder = Unpack15::new();
+            println!("{}", path.display());
+            for entry in &archive.entries {
+                if entry.is_stored() || entry.is_directory() {
+                    continue;
+                }
+                decoder.token_stats = super::DecodeTokenStats::default();
+                decoder.old_distance_events.clear();
+                decoder
+                    .decode_member(
+                        entry.packed_data(&archive).unwrap(),
+                        entry.header.unp_size as usize,
+                        entry.header.flags & 0x10 != 0,
+                    )
+                    .unwrap();
+                if decoder.token_stats.old_distance_matches != 0 {
+                    println!(
+                        "  {}: {:?}",
+                        String::from_utf8_lossy(&entry.name),
+                        decoder.token_stats
+                    );
+                    if let Ok(from) = std::env::var("RARS_RAR14_EVENT_FROM") {
+                        let from: usize = from.parse().unwrap();
+                        for event in decoder.old_distance_events.iter().filter(|event| {
+                            event.output_position >= from
+                                && event.output_position < from.saturating_add(500)
+                        }) {
+                            println!(
+                                "    pos={} code={} distance={} length={} max_dist3={}",
+                                event.output_position,
+                                event.short_code,
+                                event.distance,
+                                event.length,
+                                event.max_dist3
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn encoder_adjusts_rar15_long_lz_length_for_far_distance_bonus() {
         let mut input: Vec<_> = (0..9000).map(|index| (index * 73 + 19) as u8).collect();
         input.extend_from_within(..10);
@@ -2357,7 +2634,7 @@ mod tests {
     }
 
     #[test]
-    fn old_distance_finder_rejects_buf60_toggle_encoding() {
+    fn old_distance_finder_rejects_dos_incompatible_maximum_length() {
         let mut input = b"abcd".repeat(128);
         let pos = input.len();
         input.extend((0..257).map(|index| b"abcd"[index % 4]));
@@ -2365,8 +2642,32 @@ mod tests {
         assert_eq!(
             find_old_dist_lz(&input, pos, [u32::MAX, 4, u32::MAX, u32::MAX], 2, 0x2001),
             None,
-            "short-code 10 with decoded base length 0x101 is the Buf60 toggle, not a match"
+            "the unsafe old-distance candidate should fall back to another token kind"
         );
+    }
+
+    #[test]
+    fn old_distance_length_rejects_all_ones_symbol_for_every_short_code() {
+        for short_code in 10..=13 {
+            assert_eq!(
+                super::old_dist_lz_length_code(257, 4, 0x2001, short_code),
+                None,
+                "near old-distance code {short_code}"
+            );
+            assert_eq!(
+                super::old_dist_lz_length_code(258, 330, 0x2001, short_code),
+                None,
+                "far old-distance code {short_code}"
+            );
+            assert_eq!(
+                super::old_dist_lz_length_code(256, 4, 0x2001, short_code),
+                Some(254)
+            );
+            assert_eq!(
+                super::old_dist_lz_length_code(257, 330, 0x2001, short_code),
+                Some(254)
+            );
+        }
     }
 
     #[test]
@@ -2443,7 +2744,13 @@ mod tests {
         let mut input: Vec<_> = (0u8..=255).cycle().take(300).collect();
         input.extend_from_within(..64);
 
-        assert_eq!(find_long_lz(&input, 300, 256), None);
+        assert_eq!(
+            find_long_lz(&input, 300, 256),
+            Some(LongLz {
+                distance: 44,
+                length: 44,
+            })
+        );
         assert_eq!(
             find_long_lz(&input, 300, 0x8000),
             Some(LongLz {

@@ -39,6 +39,8 @@ root = Path(sys.argv[1])
     b"RAR14 oracle text alpha beta gamma repeated line.\r\n" * 512
 )
 (root / "REPEAT.BIN").write_bytes(b"abcdefghijklmnop" * 1024)
+(root / "NEAR1.BIN").write_bytes(b"A" * 16 * 1024)
+(root / "NEAR256.BIN").write_bytes(bytes(range(256)) * 64)
 (root / "OLDDIST.BIN").write_bytes(b"abcdabcdXYZXYZwxyzwxyz" * 128)
 
 state = 0x13579BDF
@@ -57,6 +59,8 @@ run_rars_add() {
 
 run_rars_add --format rar14 --level 5 "$tmpdir/T.RAR" "$tmpdir/TEXT.TXT"
 run_rars_add --format rar14 --level 5 "$tmpdir/R.RAR" "$tmpdir/REPEAT.BIN"
+run_rars_add --format rar14 --level 5 "$tmpdir/N1.RAR" "$tmpdir/NEAR1.BIN"
+run_rars_add --format rar14 --level 5 "$tmpdir/N256.RAR" "$tmpdir/NEAR256.BIN"
 run_rars_add --format rar14 --level 5 "$tmpdir/O.RAR" "$tmpdir/OLDDIST.BIN"
 run_rars_add --format rar14 --level 5 "$tmpdir/B.RAR" "$tmpdir/BINARY.BIN"
 
@@ -74,6 +78,8 @@ extract_with_dos_rar() {
 
 extract_with_dos_rar T.RAR OT
 extract_with_dos_rar R.RAR OR
+extract_with_dos_rar N1.RAR ON1
+extract_with_dos_rar N256.RAR ON256
 extract_with_dos_rar O.RAR OO
 extract_with_dos_rar B.RAR OB
 
@@ -85,6 +91,8 @@ root = Path(sys.argv[1])
 checks = [
     ("TEXT.TXT", "OT/TEXT.TXT"),
     ("REPEAT.BIN", "OR/REPEAT.BIN"),
+    ("NEAR1.BIN", "ON1/NEAR1.BIN"),
+    ("NEAR256.BIN", "ON256/NEAR256.BIN"),
     ("OLDDIST.BIN", "OO/OLDDIST.BIN"),
     ("BINARY.BIN", "OB/BINARY.BIN"),
 ]
