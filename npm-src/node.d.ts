@@ -35,3 +35,4 @@ export class RarWriter {
 }
 
 export function repair(input: NodeRarInput, options?: OperationOptions): Promise<Uint8Array>;
+export function repairDetailed(input: NodeRarInput, options?: OperationOptions): Promise<import("./base.js").RepairResult>;

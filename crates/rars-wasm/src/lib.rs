@@ -516,13 +516,88 @@ impl RarBuilder {
 #[wasm_bindgen(js_name = repair)]
 pub fn repair(data: Vec<u8>, password: Option<Password>) -> Result<Vec<u8>, JsValue> {
     let password = password_bytes(password)?;
-    let options = match password.as_deref() {
+    repair_core(&data, password.as_deref())
+        .map(|result| result.data)
+        .map_err(js_error)
+}
+
+fn repair_core(
+    data: &[u8],
+    password: Option<&[u8]>,
+) -> rars_rs::Result<rars_rs::RecoveryRepairResult> {
+    let options = || match password {
         Some(password) => rars_rs::ArchiveReadOptions::with_password(password),
         None => rars_rs::ArchiveReadOptions::new(),
     };
-    rars_rs::ArchiveReader::read_owned_with_options(data, options)
-        .and_then(|archive| archive.repair_recovery())
-        .map_err(js_error)
+    match rars_rs::ArchiveReader::read_with_options(data, options()) {
+        Ok(archive) => archive.repair_recovery_with_report(),
+        Err(_) => rars_rs::rar50::repair_inline_recovery_bytes_with_options(data, options()),
+    }
+}
+
+#[wasm_bindgen]
+pub struct RepairReport {
+    inner: rars_rs::RecoveryRepairReport,
+}
+
+#[wasm_bindgen]
+impl RepairReport {
+    #[wasm_bindgen(getter)]
+    pub fn changed(&self) -> bool {
+        self.inner.changed
+    }
+    #[wasm_bindgen(getter, js_name = dataRepaired)]
+    pub fn data_repaired(&self) -> bool {
+        self.inner.data_repaired
+    }
+    #[wasm_bindgen(getter, js_name = recoveryRecordRebuilt)]
+    pub fn recovery_record_rebuilt(&self) -> bool {
+        self.inner.recovery_record_rebuilt
+    }
+    #[wasm_bindgen(getter, js_name = endRecordRebuilt)]
+    pub fn end_record_rebuilt(&self) -> bool {
+        self.inner.end_record_rebuilt
+    }
+    #[wasm_bindgen(getter, js_name = availableRecoveryShards)]
+    pub fn available_recovery_shards(&self) -> Option<f64> {
+        self.inner.available_recovery_shards.map(|v| v as f64)
+    }
+    #[wasm_bindgen(getter, js_name = expectedRecoveryShards)]
+    pub fn expected_recovery_shards(&self) -> Option<f64> {
+        self.inner.expected_recovery_shards.map(|v| v as f64)
+    }
+}
+
+#[wasm_bindgen]
+pub struct RepairResult {
+    data: Vec<u8>,
+    report: RepairReport,
+}
+
+#[wasm_bindgen]
+impl RepairResult {
+    #[wasm_bindgen(getter)]
+    pub fn data(&self) -> Vec<u8> {
+        self.data.clone()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn report(&self) -> RepairReport {
+        RepairReport {
+            inner: self.report.inner,
+        }
+    }
+}
+
+#[wasm_bindgen(js_name = repairDetailed)]
+pub fn repair_detailed(data: Vec<u8>, password: Option<Password>) -> Result<RepairResult, JsValue> {
+    let password = password_bytes(password)?;
+    let result = repair_core(&data, password.as_deref()).map_err(js_error)?;
+    Ok(RepairResult {
+        data: result.data,
+        report: RepairReport {
+            inner: result.report,
+        },
+    })
 }
 
 /// A password is either a string, encoded as UTF-8, or the raw bytes. RAR 5

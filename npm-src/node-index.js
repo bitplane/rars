@@ -86,5 +86,5 @@ const runtime = Object.assign(createClient(spawnWorker), {
 });
 
 export const {
-  RarArchive, RarEntry, RarError, RarWriter, repair, formats, version,
+  RarArchive, RarEntry, RarError, RarWriter, repair, repairDetailed, formats, version,
 } = createApi(runtime);

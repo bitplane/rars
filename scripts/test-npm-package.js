@@ -10,7 +10,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 const commonjs = require(path.join(here, "..", "npm"));
 const esm = await import(pathToFileURL(path.join(here, "..", "npm", "node", "index.js")));
-const { RarArchive, RarWriter, RarError, repair, version, formats } = esm;
+const { RarArchive, RarWriter, RarError, repair, repairDetailed, version, formats } = esm;
 
 let passed = 0;
 async function check(name, body) {
@@ -101,6 +101,13 @@ await check("repair restores damaged bytes", async () => {
   const fixed = await repair(damaged);
   const archive = await RarArchive.open(fixed);
   assert.deepEqual(await archive.entries[0].bytes(), payload);
+
+  const detailed = await repairDetailed(damaged);
+  assert.equal(detailed.report.changed, true);
+  assert.equal(detailed.report.dataRepaired, true);
+  assert.ok(detailed.report.expectedRecoveryShards >= 1);
+  const detailedArchive = await RarArchive.open(detailed.data);
+  assert.deepEqual(await detailedArchive.entries[0].bytes(), payload);
 });
 
 await check("codec work leaves the Node event loop responsive", async () => {

@@ -501,20 +501,50 @@ impl Archive {
     /// Returns full repaired archive bytes using the archive's embedded
     /// recovery records.
     pub fn repair_recovery(&self) -> Result<Vec<u8>> {
-        let mut repaired = Vec::new();
-        self.repair_recovery_to(&mut repaired)?;
-        Ok(repaired)
+        Ok(self.repair_recovery_with_report()?.data)
+    }
+
+    pub fn repair_recovery_with_report(&self) -> Result<RecoveryRepairResult> {
+        match self {
+            Self::Rar15To40(archive) => {
+                let data = archive.repair_protect_head()?;
+                Ok(RecoveryRepairResult {
+                    report: RecoveryRepairReport {
+                        changed: true,
+                        data_repaired: true,
+                        ..Default::default()
+                    },
+                    data,
+                })
+            }
+            Self::Rar50Plus(archive) => archive.repair_recovery_with_report(),
+            Self::Rar13(_) => Err(Error::UnsupportedFamilyFeature {
+                family: ArchiveFamily::Rar13,
+                feature: "recovery repair for RAR 1.3/1.4 archives",
+            }),
+        }
     }
 
     /// Streams full repaired archive bytes to `writer` using embedded recovery
     /// records.
     pub fn repair_recovery_to(&self, writer: &mut dyn Write) -> Result<()> {
+        self.repair_recovery_to_with_report(writer).map(|_| ())
+    }
+
+    pub fn repair_recovery_to_with_report(
+        &self,
+        writer: &mut dyn Write,
+    ) -> Result<RecoveryRepairReport> {
         match self {
             Self::Rar15To40(archive) => {
                 writer.write_all(&archive.repair_protect_head()?)?;
-                Ok(())
+                Ok(RecoveryRepairReport {
+                    changed: true,
+                    data_repaired: true,
+                    ..Default::default()
+                })
             }
-            Self::Rar50Plus(archive) => archive.repair_recovery_to(writer),
+            Self::Rar50Plus(archive) => archive.repair_recovery_to_with_report(writer),
             Self::Rar13(_) => Err(Error::UnsupportedFamilyFeature {
                 family: ArchiveFamily::Rar13,
                 feature: "recovery repair for RAR 1.3/1.4 archives",
@@ -643,6 +673,24 @@ fn rar50_member_hash(hash: &rar50::FileHash) -> ArchiveMemberHash {
 #[non_exhaustive]
 /// Archive reader facade with signature-based dispatch.
 pub struct ArchiveReader;
+
+/// Describes what an embedded recovery repair changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RecoveryRepairReport {
+    pub changed: bool,
+    pub data_repaired: bool,
+    pub recovery_record_rebuilt: bool,
+    pub end_record_rebuilt: bool,
+    pub available_recovery_shards: Option<u64>,
+    pub expected_recovery_shards: Option<u64>,
+}
+
+/// Repaired archive bytes together with a precise repair report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryRepairResult {
+    pub data: Vec<u8>,
+    pub report: RecoveryRepairReport,
+}
 
 impl ArchiveReader {
     /// Detects the archive signature in a byte slice.

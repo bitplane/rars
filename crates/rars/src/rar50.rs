@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 mod blake2sp;
 mod extract;
-mod write;
+pub(crate) mod write;
 
 pub use extract::{extract_volumes_to, extract_volumes_to_with_redirections};
 pub use write::{
@@ -665,12 +665,50 @@ impl Archive {
     }
 
     pub fn repair_recovery(&self) -> Result<Vec<u8>> {
-        let mut repaired = Vec::new();
-        self.repair_recovery_to(&mut repaired)?;
-        Ok(repaired)
+        Ok(self.repair_recovery_with_report()?.data)
+    }
+
+    pub fn repair_recovery_with_report(&self) -> Result<crate::RecoveryRepairResult> {
+        let mut data = Vec::new();
+        let report = self.repair_recovery_to_with_report(&mut data)?;
+        Ok(crate::RecoveryRepairResult { data, report })
     }
 
     pub fn repair_recovery_to(&self, writer: &mut dyn Write) -> Result<()> {
+        let repaired = self.repair_recovery_with_report()?;
+        writer.write_all(&repaired.data)?;
+        Ok(())
+    }
+
+    pub fn repair_recovery_to_with_report(
+        &self,
+        writer: &mut dyn Write,
+    ) -> Result<crate::RecoveryRepairReport> {
+        let recovery = self
+            .services()
+            .find(|service| matches!(service.recovery_record(), Ok(Some(_))))
+            .ok_or(Error::InvalidHeader(
+                "RAR 5 archive does not contain an inline recovery record",
+            ))?;
+        let recovery_data = recovery.decoded_data_unverified(self, None)?;
+        let (available, expected) =
+            crate::recovery::rar5::inline_recovery_chunk_counts(&recovery_data)?;
+        if available == expected || self.sfx_offset != 0 {
+            return self.repair_recovery_to_legacy(writer, available, expected);
+        }
+        let bytes = self.read_range(0..self.source_len()?)?;
+        let (data, report) =
+            crate::recovery::rar5::repair_inline_recovery_archive_with_report(&bytes, None)?;
+        writer.write_all(&data)?;
+        Ok(report)
+    }
+
+    fn repair_recovery_to_legacy(
+        &self,
+        writer: &mut dyn Write,
+        available: u64,
+        expected: u64,
+    ) -> Result<crate::RecoveryRepairReport> {
         let recovery = self
             .services()
             .find(|service| matches!(service.recovery_record(), Ok(Some(_))))
@@ -717,6 +755,7 @@ impl Archive {
 
         self.copy_range_to(0..prefix_start, writer)?;
         let mut cursor = 0usize;
+        let data_repaired = !repaired_shards.is_empty();
         for (range, data) in repaired_shards {
             if range.start < cursor || range.end > prefix_len || range.len() != data.len() {
                 return Err(Error::InvalidHeader(
@@ -729,7 +768,14 @@ impl Archive {
         }
         self.copy_range_to(prefix_start + cursor..prefix_end, writer)?;
         self.copy_range_to(prefix_end..source_len, writer)?;
-        Ok(())
+        Ok(crate::RecoveryRepairReport {
+            changed: data_repaired,
+            data_repaired,
+            recovery_record_rebuilt: false,
+            end_record_rebuilt: false,
+            available_recovery_shards: Some(available),
+            expected_recovery_shards: Some(expected),
+        })
     }
 }
 
@@ -965,14 +1011,50 @@ where
 }
 
 pub fn repair_inline_recovery_bytes(input: &[u8]) -> Result<Vec<u8>> {
+    Ok(repair_inline_recovery_bytes_with_report(input)?.data)
+}
+
+pub fn repair_inline_recovery_bytes_with_report(
+    input: &[u8],
+) -> Result<crate::RecoveryRepairResult> {
+    repair_inline_recovery_bytes_with_options(input, crate::ArchiveReadOptions::new())
+}
+
+pub fn repair_inline_recovery_bytes_with_options(
+    input: &[u8],
+    options: crate::ArchiveReadOptions<'_>,
+) -> Result<crate::RecoveryRepairResult> {
     if !input.starts_with(RAR50_SIGNATURE) {
         return Err(Error::UnsupportedSignature);
     }
-    let repaired =
-        crate::recovery::rar5::repair_inline_recovery_archive(input).map_err(Error::from)?;
+    let (repaired, report) =
+        crate::recovery::rar5::repair_inline_recovery_archive_with_report(input, options.password)
+            .map_err(Error::from)?;
     let parse_target = if repaired == input { input } else { &repaired };
-    let _ = Archive::parse(parse_target)?;
-    Ok(repaired)
+    let _ = Archive::parse_with_options(parse_target, options)?;
+    Ok(crate::RecoveryRepairResult {
+        data: repaired,
+        report,
+    })
+}
+
+pub(crate) fn recovery_end_header(input: &[u8], password: Option<&[u8]>) -> Result<Vec<u8>> {
+    let first = parse_block_header_bytes(input, RAR50_SIGNATURE.len(), input.len(), 0)?;
+    if first.block.header_type != HEAD_CRYPT {
+        let mut end = Vec::new();
+        write::headers::write_end_header(&mut end, 0)?;
+        return Ok(end);
+    }
+    let keys = parse_archive_encryption_header(&first, password)?;
+    write::headers::encrypted_header_block(
+        &keys,
+        HEAD_END,
+        0,
+        None,
+        &write::end_header_specific(0),
+        &[],
+        &[],
+    )
 }
 
 fn parse_main_header_bytes(parsed: &ParsedBlockHeader) -> Result<MainHeader> {

@@ -104,7 +104,7 @@ pub(super) fn write_block(
 ///
 /// Each block gets its own IV and its own CBC chain, so headers can be built
 /// and emitted one at a time without any cross-block state.
-pub(super) fn encrypted_header_block(
+pub(crate) fn encrypted_header_block(
     keys: &Rar50Keys,
     header_type: u64,
     flags: u64,

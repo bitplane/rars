@@ -35,6 +35,44 @@ struct ProgressEvent {
     total_entries: Option<usize>,
 }
 
+#[pyclass(frozen, module = "rars", skip_from_py_object)]
+#[derive(Debug, Clone)]
+struct RepairReport {
+    #[pyo3(get)]
+    changed: bool,
+    #[pyo3(get)]
+    data_repaired: bool,
+    #[pyo3(get)]
+    recovery_record_rebuilt: bool,
+    #[pyo3(get)]
+    end_record_rebuilt: bool,
+    #[pyo3(get)]
+    available_recovery_shards: Option<u64>,
+    #[pyo3(get)]
+    expected_recovery_shards: Option<u64>,
+}
+
+impl From<rars_rs::RecoveryRepairReport> for RepairReport {
+    fn from(value: rars_rs::RecoveryRepairReport) -> Self {
+        Self {
+            changed: value.changed,
+            data_repaired: value.data_repaired,
+            recovery_record_rebuilt: value.recovery_record_rebuilt,
+            end_record_rebuilt: value.end_record_rebuilt,
+            available_recovery_shards: value.available_recovery_shards,
+            expected_recovery_shards: value.expected_recovery_shards,
+        }
+    }
+}
+
+#[pyclass(frozen, module = "rars", skip_from_py_object)]
+struct RepairResult {
+    #[pyo3(get)]
+    data: Vec<u8>,
+    #[pyo3(get)]
+    report: RepairReport,
+}
+
 #[pymethods]
 impl ProgressEvent {
     #[getter]
@@ -737,8 +775,49 @@ fn repair(
             Some(password) => rars_rs::ArchiveReadOptions::with_password(password),
             None => rars_rs::ArchiveReadOptions::new(),
         };
-        let archive = rars_rs::ArchiveReader::read_owned_with_options(bytes, options)?;
-        archive.repair_recovery()
+        match rars_rs::ArchiveReader::read_with_options(&bytes, options) {
+            Ok(archive) => archive.repair_recovery(),
+            Err(_) => {
+                let options = match password.as_deref() {
+                    Some(password) => rars_rs::ArchiveReadOptions::with_password(password),
+                    None => rars_rs::ArchiveReadOptions::new(),
+                };
+                rars_rs::rar50::repair_inline_recovery_bytes_with_options(&bytes, options)
+                    .map(|result| result.data)
+            }
+        }
+    })
+    .map_err(map_error)
+}
+
+#[pyfunction]
+#[pyo3(signature = (source, password = None))]
+fn repair_detailed(
+    py: Python<'_>,
+    source: &Bound<'_, PyAny>,
+    password: Option<&Bound<'_, PyAny>>,
+) -> PyResult<RepairResult> {
+    let password = py_password(password)?;
+    let bytes = py_input_bytes(py, source)?;
+    py.detach(|| {
+        let options = match password.as_deref() {
+            Some(password) => rars_rs::ArchiveReadOptions::with_password(password),
+            None => rars_rs::ArchiveReadOptions::new(),
+        };
+        let result = match rars_rs::ArchiveReader::read_with_options(&bytes, options) {
+            Ok(archive) => archive.repair_recovery_with_report()?,
+            Err(_) => {
+                let options = match password.as_deref() {
+                    Some(password) => rars_rs::ArchiveReadOptions::with_password(password),
+                    None => rars_rs::ArchiveReadOptions::new(),
+                };
+                rars_rs::rar50::repair_inline_recovery_bytes_with_options(&bytes, options)?
+            }
+        };
+        Ok(RepairResult {
+            data: result.data,
+            report: result.report.into(),
+        })
     })
     .map_err(map_error)
 }
@@ -799,7 +878,10 @@ fn rars(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RarInfo>()?;
     m.add_class::<RarBuilder>()?;
     m.add_class::<ProgressEvent>()?;
+    m.add_class::<RepairReport>()?;
+    m.add_class::<RepairResult>()?;
     m.add_function(wrap_pyfunction!(repair, m)?)?;
+    m.add_function(wrap_pyfunction!(repair_detailed, m)?)?;
     m.add_function(wrap_pyfunction!(repair_to_path, m)?)?;
     m.add_function(wrap_pyfunction!(extract_volumes, m)?)?;
     m.add_function(wrap_pyfunction!(test_volumes, m)?)?;

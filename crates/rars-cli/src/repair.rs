@@ -22,27 +22,50 @@ pub(crate) fn cmd_repair(args: RepairArgs) -> CliResult<()> {
     match archive {
         Ok(archive) => {
             let mut output = fs::File::create(&paths[1])?;
-            archive
-                .repair_recovery_to(&mut output)
+            let report = archive
+                .repair_recovery_to_with_report(&mut output)
                 .map_err(|err| format!("failed to repair archive '{}': {err}", paths[0]))?;
+            print_repair_report(&paths[1], report);
         }
         Err(parse_error) => {
             if !path_starts_with(&paths[0], RAR50_SIGNATURE)? {
                 return Err(parse_error);
             }
             let bytes = fs::read(&paths[0])?;
-            let repaired =
-                rars::rar50::repair_inline_recovery_bytes(&bytes).map_err(|repair_error| {
+            let options = match crate::password::password_bytes(&password) {
+                Some(password) => rars::ArchiveReadOptions::with_password(password),
+                None => rars::ArchiveReadOptions::new(),
+            };
+            let repaired = rars::rar50::repair_inline_recovery_bytes_with_options(&bytes, options)
+                .map_err(|repair_error| {
                     format!(
                         "failed to parse archive '{}': {}; raw inline recovery repair also failed: {}",
                         paths[0], parse_error, repair_error
                     )
                 })?;
-            fs::write(&paths[1], repaired)?;
+            fs::write(&paths[1], &repaired.data)?;
+            print_repair_report(&paths[1], repaired.report);
         }
     }
-    println!("repaired {}", paths[1]);
     Ok(())
+}
+
+fn print_repair_report(path: &str, report: rars::RecoveryRepairReport) {
+    let mut actions = Vec::new();
+    if report.data_repaired {
+        actions.push("repaired protected data");
+    }
+    if report.recovery_record_rebuilt {
+        actions.push("rebuilt recovery record");
+    }
+    if report.end_record_rebuilt {
+        actions.push("rebuilt archive end");
+    }
+    if actions.is_empty() {
+        println!("no repair needed; wrote {path}");
+    } else {
+        println!("{}; wrote {path}", actions.join(", "));
+    }
 }
 
 fn path_starts_with(path: &str, prefix: &[u8]) -> CliResult<bool> {

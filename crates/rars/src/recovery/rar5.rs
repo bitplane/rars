@@ -946,6 +946,13 @@ where
 }
 
 pub fn repair_inline_recovery_archive(input: &[u8]) -> Result<Vec<u8>> {
+    Ok(repair_inline_recovery_archive_with_report(input, None)?.0)
+}
+
+pub(crate) fn repair_inline_recovery_archive_with_report(
+    input: &[u8],
+    password: Option<&[u8]>,
+) -> Result<(Vec<u8>, crate::RecoveryRepairReport)> {
     let chunks = find_inline_recovery_chunks(input)?;
     let first = chunks.first().ok_or(Error::BadRecoveryChunk)?;
     let protected_size =
@@ -962,13 +969,75 @@ pub fn repair_inline_recovery_archive(input: &[u8]) -> Result<Vec<u8>> {
     for found in &chunks {
         append_inline_recovery_chunk(input, found, &mut recovery_data)?;
     }
-    let repaired_prefix = repair_inline_recovery_prefix(&input[..protected_size], &recovery_data)?;
-    if repaired_prefix == input[..protected_size] {
-        return Ok(input.to_vec());
+    let original_prefix = &input[..protected_size];
+    let repaired_prefix = repair_inline_recovery_prefix(original_prefix, &recovery_data)?;
+    let data_repaired = repaired_prefix != original_prefix;
+    let plan = first.chunk.plan;
+    let mut indices = chunks
+        .iter()
+        .map(|found| found.chunk.shard_index)
+        .collect::<Vec<_>>();
+    indices.sort_unstable();
+    indices.dedup();
+    let available = indices.len() as u64;
+    let expected = plan.recovery_shards;
+    let record_start = chunks
+        .iter()
+        .filter_map(|found| {
+            let distance = found
+                .chunk
+                .shard_index
+                .checked_mul(plan.shard_size as usize)?;
+            found.offset.checked_sub(distance)
+        })
+        .min()
+        .ok_or(Error::BadRecoveryChunk)?;
+    if record_start < protected_size {
+        return Err(Error::BadRecoveryChunk);
     }
-    let mut repaired = input.to_vec();
-    repaired[..protected_size].copy_from_slice(&repaired_prefix);
-    Ok(repaired)
+    let payload_len = usize::try_from(plan.payload_size()?).map_err(|_| Error::PlanOverflow)?;
+    let record_end = record_start
+        .checked_add(payload_len)
+        .ok_or(Error::PlanOverflow)?;
+    let recovery_record_rebuilt = available != expected || record_end > input.len();
+    let mut repaired = if recovery_record_rebuilt {
+        let percent = (1..=100)
+            .find(|&percent| plan_inline_recovery(protected_size as u64, percent) == Ok(plan))
+            .ok_or(Error::BadRecoveryChunk)?;
+        let rebuilt = build_structural_inline_recovery_data(&repaired_prefix, percent)?;
+        let mut out = Vec::with_capacity(input.len().max(record_end));
+        out.extend_from_slice(&repaired_prefix);
+        out.extend_from_slice(
+            input
+                .get(protected_size..record_start)
+                .ok_or(Error::BadRecoveryChunk)?,
+        );
+        out.extend_from_slice(&rebuilt);
+        if record_end < input.len() {
+            out.extend_from_slice(&input[record_end..]);
+        }
+        out
+    } else {
+        let mut out = input.to_vec();
+        out[..protected_size].copy_from_slice(&repaired_prefix);
+        out
+    };
+    let mut end_record_rebuilt = false;
+    if record_end >= input.len() {
+        let end = crate::rar50::recovery_end_header(input, password)
+            .map_err(|_| Error::BadRecoveryChunk)?;
+        repaired.extend_from_slice(&end);
+        end_record_rebuilt = true;
+    }
+    let report = crate::RecoveryRepairReport {
+        changed: repaired != input,
+        data_repaired,
+        recovery_record_rebuilt,
+        end_record_rebuilt,
+        available_recovery_shards: Some(available),
+        expected_recovery_shards: Some(expected),
+    };
+    Ok((repaired, report))
 }
 
 fn find_inline_recovery_chunks(input: &[u8]) -> Result<Vec<FoundInlineRecoveryChunk>> {
@@ -1075,6 +1144,19 @@ fn parse_available_inline_recovery_chunks(
         .into_iter()
         .map(|found| found.chunk)
         .collect())
+}
+
+pub(crate) fn inline_recovery_chunk_counts(recovery_data: &[u8]) -> Result<(u64, u64)> {
+    let chunks = parse_available_inline_recovery_chunks(recovery_data)?;
+    let first = chunks.first().ok_or(Error::BadRecoveryChunk)?;
+    let expected = first.plan.recovery_shards;
+    let mut indices = chunks
+        .iter()
+        .map(|chunk| chunk.shard_index)
+        .collect::<Vec<_>>();
+    indices.sort_unstable();
+    indices.dedup();
+    Ok((indices.len() as u64, expected))
 }
 
 fn parse_inline_recovery_chunk(input: &[u8]) -> Result<InlineRecoveryChunk> {

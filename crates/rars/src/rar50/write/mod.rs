@@ -10,7 +10,7 @@ use std::io::{Read, Write};
 mod compress;
 mod engine;
 mod filter_policy;
-mod headers;
+pub(crate) mod headers;
 mod layout;
 use filter_policy::{
     compression_method_for_level, dictionary_size_for_options, encode_option_candidates_for_level,

@@ -112,6 +112,25 @@ def test_password_errors_are_typed():
     archive.testrar()
 
 
+def test_repair_detailed_reports_repaired_data(tmp_path):
+    payload = bytes((index * 7 + (index >> 5)) & 0xFF for index in range(200_000))
+    builder = rars.RarBuilder(format="rar50", store=True, recovery_percent=10)
+    builder.add_bytes(payload, "payload.bin")
+    archive_path = tmp_path / "recovery.rar"
+    builder.write(archive_path)
+    damaged = bytearray(archive_path.read_bytes())
+    midpoint = len(damaged) // 2
+    for index in range(midpoint, midpoint + 64):
+        damaged[index] ^= 0xFF
+
+    result = rars.repair_detailed(damaged)
+
+    assert result.report.changed
+    assert result.report.data_repaired
+    assert result.report.expected_recovery_shards >= 1
+    assert rars.RarFile(result.data).read("payload.bin") == payload
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [

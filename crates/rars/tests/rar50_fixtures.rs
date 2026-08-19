@@ -1770,15 +1770,99 @@ fn repairs_rar50_inline_recovery_with_damaged_recovery_chunk() {
     let damaged_archive = Archive::parse(&damaged).unwrap();
     assert!(collect_extract(&damaged_archive).is_err());
 
-    let repaired = damaged_archive.repair_recovery().unwrap();
+    let repaired = damaged_archive.repair_recovery_with_report().unwrap();
 
+    assert!(repaired.report.data_repaired);
+    assert!(repaired.report.recovery_record_rebuilt);
     assert_eq!(
-        repaired[..recovery_range.start],
-        bytes[..recovery_range.start]
+        repaired.report.available_recovery_shards,
+        repaired
+            .report
+            .expected_recovery_shards
+            .map(|count| count - 1)
     );
-    let repaired_archive = Archive::parse(&repaired).unwrap();
+    assert_eq!(repaired.data, bytes);
+    let repaired_archive = Archive::parse(&repaired.data).unwrap();
     let extracted = collect_extract(&repaired_archive).unwrap();
     assert_eq!(extracted[0].data, payload);
+}
+
+#[test]
+fn rebuilds_damaged_recovery_chunk_without_claiming_data_repair() {
+    let payload = b"healthy data with one damaged recovery row\n".repeat(1024);
+    let entries = [entry(b"healthy-data.txt", &payload)];
+    let bytes = write_stored_archive_with_recovery(
+        &entries,
+        rar50::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only()),
+        20,
+    )
+    .unwrap();
+    let archive = Archive::parse(&bytes).unwrap();
+    let recovery_range = archive.services().next().unwrap().block.data_range.clone();
+    let mut damaged = bytes.clone();
+    damaged[recovery_range.start + 0x48] ^= 0xff;
+
+    let result = Archive::parse(&damaged)
+        .unwrap()
+        .repair_recovery_with_report()
+        .unwrap();
+
+    assert!(!result.report.data_repaired);
+    assert!(result.report.recovery_record_rebuilt);
+    assert!(result.report.changed);
+    assert_eq!(result.data, bytes);
+}
+
+#[test]
+fn rebuilds_truncated_rar50_inline_recovery_tail() {
+    let payload = b"payload protected when the recovery tail is truncated\n".repeat(4096);
+    let entries = [entry(b"truncated-recovery.txt", &payload)];
+    let bytes = write_stored_archive_with_recovery(
+        &entries,
+        rar50::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only()),
+        20,
+    )
+    .unwrap();
+    let mut damaged = bytes.clone();
+    damaged.truncate(damaged.len() - 4096);
+
+    assert!(Archive::parse(&damaged).is_err());
+    let repaired = repair_inline_recovery_bytes(&damaged).unwrap();
+
+    assert_eq!(repaired, bytes);
+    let archive = Archive::parse(&repaired).unwrap();
+    assert_eq!(collect_extract(&archive).unwrap()[0].data, payload);
+}
+
+#[test]
+fn rebuilds_truncated_header_encrypted_rar50_recovery_tail() {
+    let payload = b"encrypted headers with a truncated recovery tail\n".repeat(4096);
+    let entries =
+        [entry(b"secret-truncated-recovery.txt", &payload).with_password(b"password".to_vec())];
+    let mut features = FeatureSet::store_only();
+    features.header_encryption = true;
+    let bytes = write_stored_archive_with_recovery(
+        &entries,
+        rar50::WriterOptions::new(ArchiveVersion::Rar50, features),
+        20,
+    )
+    .unwrap();
+    let mut damaged = bytes.clone();
+    damaged.truncate(damaged.len() - 4096);
+
+    let repaired = rars::rar50::repair_inline_recovery_bytes_with_options(
+        &damaged,
+        rars::ArchiveReadOptions::with_password(b"password"),
+    )
+    .unwrap();
+
+    assert!(repaired.report.recovery_record_rebuilt);
+    assert!(repaired.report.end_record_rebuilt);
+    let archive = Archive::parse_with_password(&repaired.data, Some(b"password")).unwrap();
+    assert_eq!(
+        collect_extract_with_password(&archive, Some(b"password")).unwrap()[0].data,
+        payload
+    );
 }
 
 #[test]

@@ -7,7 +7,7 @@ export type RarData = string | RarInput;
 export type RarName = string | Uint8Array;
 
 export interface RarProgress {
-  operation: "open" | "read" | "test" | "build" | "buildVolumes" | "writeTo" | "writeVolumesTo" | "repair";
+  operation: "open" | "read" | "test" | "build" | "buildVolumes" | "writeTo" | "writeVolumesTo" | "repair" | "repairDetailed";
   phase: string;
   completed: number;
   total?: number;
@@ -17,6 +17,20 @@ export interface OperationOptions {
   password?: string | Uint8Array;
   signal?: AbortSignal;
   onProgress?: (progress: RarProgress) => void;
+}
+
+export interface RepairReport {
+  changed: boolean;
+  dataRepaired: boolean;
+  recoveryRecordRebuilt: boolean;
+  endRecordRebuilt: boolean;
+  availableRecoveryShards?: number;
+  expectedRecoveryShards?: number;
+}
+
+export interface RepairResult {
+  data: Uint8Array;
+  report: RepairReport;
 }
 
 export interface RarWriterOptions {
@@ -89,5 +103,6 @@ export class RarWriter {
 }
 
 export function repair(input: RarInput, options?: OperationOptions): Promise<Uint8Array>;
+export function repairDetailed(input: RarInput, options?: OperationOptions): Promise<RepairResult>;
 export const version: string;
 export const formats: readonly RarFormat[];

@@ -143,6 +143,23 @@ export function startWorker(port, wasm, platform) {
       } else if (operation === "repair") {
         const bytes = await sourceBytes(payload.sources[0], platform);
         result = wasm.repair(bytes, payload.password);
+      } else if (operation === "repairDetailed") {
+        const bytes = await sourceBytes(payload.sources[0], platform);
+        const detailed = wasm.repairDetailed(bytes, payload.password);
+        const report = detailed.report;
+        try {
+          result = { data: detailed.data, report: {
+            changed: report.changed,
+            dataRepaired: report.dataRepaired,
+            recoveryRecordRebuilt: report.recoveryRecordRebuilt,
+            endRecordRebuilt: report.endRecordRebuilt,
+            availableRecoveryShards: report.availableRecoveryShards,
+            expectedRecoveryShards: report.expectedRecoveryShards,
+          } };
+        } finally {
+          report.free();
+          detailed.free();
+        }
       } else if (operation === "build") {
         result = await build(wasm, payload, platform, false);
       } else if (operation === "buildVolumes") {

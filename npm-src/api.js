@@ -289,6 +289,15 @@ export function createApi(runtime) {
     }, operation);
   }
 
+  async function repairDetailed(input, options) {
+    const operation = operationOptions(options);
+    const sources = await runtime.prepareArchiveSources(input);
+    if (sources.length !== 1) {
+      throw new RarError("UNSUPPORTED_FEATURE", "repair currently accepts one archive volume");
+    }
+    return runtime.request("repairDetailed", { sources, password: operation.password }, operation);
+  }
+
   runtime.setErrorFactory((error) => {
     if (error?.name === "AbortError") return error;
     return new RarError(error?.code ?? "INTERNAL", error?.message ?? String(error), error?.details);
@@ -299,7 +308,7 @@ export function createApi(runtime) {
     RarEntry,
     RarError,
     RarWriter,
-    repair,
+    repair, repairDetailed,
     formats: FORMATS,
     version: runtime.version,
   };
