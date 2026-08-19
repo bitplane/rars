@@ -178,6 +178,11 @@ impl EncodeOptions {
     pub const fn old_distance_tokens_enabled(self) -> bool {
         self.old_distance_tokens
     }
+
+    #[cfg(test)]
+    pub(crate) const fn lazy_matching_enabled(self) -> bool {
+        self.lazy_matching
+    }
 }
 
 impl Default for EncodeOptions {
@@ -336,7 +341,7 @@ impl Unpack15Encoder {
             while flag_bits < 8 && pos < input.len() {
                 let state = plan_encoder.lz_plan_state();
                 if let Some(token) = plan_encoder
-                    .choose_lz_token(input, pos, &buckets, state, flag_bits)
+                    .choose_lz_token(input, pos, &buckets, state)
                     .filter(|token| {
                         !self.options.lazy_matching
                             || !should_lazy_emit_literal(
@@ -351,9 +356,7 @@ impl Unpack15Encoder {
                 {
                     let flag = token.flag_bits(state.nlzb, state.nhfb);
                     let next_pos = pos + token.length() as usize;
-                    let leaves_unfillable_flag_bit =
-                        flag_bits + flag.len() == 7 && next_pos < input.len();
-                    if flag_bits + flag.len() <= 8 && !leaves_unfillable_flag_bit {
+                    if flag_fits(flag_bits, flag) {
                         write_planned_flag_bits(&mut flags, flag_bits, flag);
                         flag_bits += flag.len();
                         pos = next_pos;
@@ -455,18 +458,10 @@ impl Unpack15Encoder {
         pos: usize,
         buckets: &Rar13MatchFinder,
         state: LzPlanState,
-        flag_bits: usize,
     ) -> Option<EncodedToken> {
         let candidates = find_lz_tokens(input, pos, buckets, state, self.options);
         candidates
             .into_iter()
-            .filter(|token| {
-                let flag_len = token.flag_bits(state.nlzb, state.nhfb).len();
-                let next_pos = pos + token.length() as usize;
-                next_pos == input.len()
-                    || (flag_bits + flag_len != 7
-                        && !(flag_len == 1 && flag_bits.is_multiple_of(2)))
-            })
             .filter_map(|token| self.token_bit_cost(token, state).map(|cost| (token, cost)))
             .min_by(|(left, left_cost), (right, right_cost)| {
                 let left_score = left_cost * 256 / left.length() as usize;
@@ -1122,6 +1117,10 @@ fn write_planned_flag_bits(flags: &mut u8, start: usize, bits: &[bool]) {
     }
 }
 
+fn flag_fits(used: usize, flag: &[bool]) -> bool {
+    used + flag.len() <= 8
+}
+
 fn plan_huff_effect(nhfb: &mut u32, nlzb: &mut u32) {
     *nhfb += 16;
     if *nhfb > 0xff {
@@ -1222,7 +1221,7 @@ fn should_lazy_emit_literal(
 }
 
 fn find_short_lz(input: &[u8], pos: usize) -> Option<ShortLz> {
-    if pos < 2 {
+    if pos == 0 {
         return None;
     }
 
@@ -1239,7 +1238,7 @@ fn find_short_lz(input: &[u8], pos: usize) -> Option<ShortLz> {
         {
             length += 1;
         }
-        if length >= 3
+        if length >= 2
             && (length > best.length as usize
                 || (length == best.length as usize && distance < best.distance as usize))
         {
@@ -1250,7 +1249,7 @@ fn find_short_lz(input: &[u8], pos: usize) -> Option<ShortLz> {
         }
     }
 
-    (best.length >= 3).then_some(best)
+    (best.length >= 2).then_some(best)
 }
 
 fn find_repeat_last_lz(
@@ -2257,11 +2256,11 @@ fn corr_huff(char_set: &mut [u16; 256], num_to_place: &mut [u8; 256]) {
 mod tests {
     use super::{
         decode_num_bit_cost, find_long_lz, find_long_lz_with_buckets, find_lz_token,
-        find_old_dist_lz, long_lz_buckets, should_lazy_emit_literal, unpack15_decode,
-        unpack15_encode, unpack15_encode_with_options, EncodeOptions, EncodedToken, LongLz,
-        LzPlanState, OldDistLz, Rar13MatchFinder, ShortLz, Unpack15, Unpack15Encoder, DEC_HF0,
-        DEC_HF1, DEC_HF2, DEC_HF3, DEC_HF4, DEC_L1, DEC_L2, POS_HF0, POS_HF1, POS_HF2, POS_HF3,
-        POS_HF4, POS_L1, POS_L2,
+        find_old_dist_lz, find_short_lz, flag_fits, long_lz_buckets, should_lazy_emit_literal,
+        unpack15_decode, unpack15_encode, unpack15_encode_with_options, EncodeOptions,
+        EncodedToken, LongLz, LzPlanState, OldDistLz, Rar13MatchFinder, ShortLz, Unpack15,
+        Unpack15Encoder, DEC_HF0, DEC_HF1, DEC_HF2, DEC_HF3, DEC_HF4, DEC_L1, DEC_L2, POS_HF0,
+        POS_HF1, POS_HF2, POS_HF3, POS_HF4, POS_L1, POS_L2,
     };
 
     fn decode_num_prefix_is_stable(
@@ -2425,6 +2424,29 @@ mod tests {
     }
 
     #[test]
+    fn short_lz_accepts_the_two_byte_wire_minimum() {
+        let input = b"abXabY";
+
+        assert_eq!(
+            find_short_lz(input, 3),
+            Some(ShortLz {
+                distance: 3,
+                length: 2,
+            })
+        );
+        let packed = unpack15_encode(input).unwrap();
+        assert_eq!(unpack15_decode(&packed, input.len()).unwrap(), input);
+    }
+
+    #[test]
+    fn one_bit_match_flags_fit_at_every_open_position() {
+        for used in 0..8 {
+            assert!(flag_fits(used, &[true]), "flag bit {used}");
+        }
+        assert!(!flag_fits(8, &[true]));
+    }
+
+    #[test]
     fn long_lz_search_accepts_near_distance_boundaries() {
         let distance_one = vec![b'A'; 64];
         assert_eq!(
@@ -2529,7 +2551,7 @@ mod tests {
         let encoder = Unpack15Encoder::new();
 
         assert!(matches!(
-            encoder.choose_lz_token(&input, 16, &buckets, encoder.lz_plan_state(), 0),
+            encoder.choose_lz_token(&input, 16, &buckets, encoder.lz_plan_state()),
             Some(EncodedToken::LongLz(LongLz {
                 distance: 16,
                 length: 258,
@@ -2693,7 +2715,6 @@ mod tests {
                     nhfb: encoder.nhfb,
                     l_count: encoder.l_count,
                 },
-                0,
             )
             .expect("old-distance candidate should be selected");
 
@@ -2844,7 +2865,6 @@ mod tests {
                     nhfb: encoder.nhfb,
                     l_count: encoder.l_count,
                 },
-                0,
             )
             .unwrap();
 
@@ -2889,7 +2909,6 @@ mod tests {
                 nhfb: encoder.nhfb,
                 l_count: encoder.l_count,
             },
-            0,
         );
 
         assert_eq!(token, None);

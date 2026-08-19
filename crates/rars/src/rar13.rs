@@ -1675,7 +1675,7 @@ fn rar15_encode_options_for_level(level: Option<u8>) -> Result<Rar15EncodeOption
         4 => Ok(compatible
             .with_lazy_matching(false)
             .with_max_long_match_distance(24 * 1024)),
-        5 => Ok(compatible.with_lazy_matching(false)),
+        5 => Ok(compatible),
         _ => Err(Error::InvalidHeader(
             "RAR compression level must be in the range 0..5",
         )),
@@ -2480,6 +2480,18 @@ mod tests {
                 "RAR 1.4 level {level} should consider old-distance tokens"
             );
         }
+    }
+
+    #[test]
+    fn rar14_level_five_uses_lazy_matching() {
+        for level in 0..5 {
+            assert!(!rar15_encode_options_for_level(Some(level))
+                .unwrap()
+                .lazy_matching_enabled());
+        }
+        assert!(rar15_encode_options_for_level(Some(5))
+            .unwrap()
+            .lazy_matching_enabled());
     }
 
     #[test]
