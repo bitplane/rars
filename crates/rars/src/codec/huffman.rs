@@ -119,9 +119,65 @@ pub(crate) fn lengths_for_frequencies(frequencies: &[usize], max_bits: u8) -> Ve
     }
 
     if lengths.iter().any(|&length| length > max_bits) {
-        uniform_lengths_for_frequencies(frequencies)
-    } else {
-        lengths
+        limit_code_lengths(&mut lengths, frequencies, max_bits);
+    }
+    lengths
+}
+
+/// Bring every code length down to `max_bits`, keeping the code complete.
+///
+/// A code deeper than the format allows used to be replaced by a uniform one
+/// over the same symbols. That is a far worse code: on a skewed 289 symbol main
+/// table a flat code spends nine bits on every token where the Huffman code it
+/// replaced averaged closer to six, and the codes that trip the limit overflow
+/// it by a bit or two, not by enough to justify giving up.
+///
+/// Clamping the over-long lengths breaks Kraft equality, so this pays the
+/// difference back by lengthening the symbols that cost least per bit, then
+/// spends whatever is left over on the most frequent ones so the code comes out
+/// complete. Package-merge would be optimal; this is within a fraction of a
+/// percent of it and much shorter.
+fn limit_code_lengths(lengths: &mut [u8], frequencies: &[usize], max_bits: u8) {
+    // No prefix code over this many symbols fits in this many bits however it
+    // is arranged, so there is nothing to repair towards.
+    let used = lengths.iter().filter(|&&length| length != 0).count();
+    if max_bits == 0 || max_bits >= usize::BITS as u8 || used > (1usize << max_bits) {
+        lengths.copy_from_slice(&uniform_lengths_for_frequencies(frequencies));
+        return;
+    }
+
+    for length in lengths.iter_mut() {
+        if *length > max_bits {
+            *length = max_bits;
+        }
+    }
+
+    // Kraft sum in units of 2^-max_bits, so it stays exact in integers.
+    let target: u64 = 1 << max_bits;
+    let mut sum: u64 = lengths
+        .iter()
+        .filter(|&&length| length != 0)
+        .map(|&length| 1u64 << (max_bits - length))
+        .sum();
+
+    while sum > target {
+        let Some(symbol) = (0..lengths.len())
+            .filter(|&symbol| lengths[symbol] != 0 && lengths[symbol] < max_bits)
+            .min_by_key(|&symbol| (frequencies[symbol], std::cmp::Reverse(lengths[symbol])))
+        else {
+            break;
+        };
+        sum -= 1u64 << (max_bits - lengths[symbol] - 1);
+        lengths[symbol] += 1;
+    }
+
+    while let Some(symbol) = (0..lengths.len())
+        .filter(|&symbol| lengths[symbol] > 1)
+        .filter(|&symbol| sum + (1u64 << (max_bits - lengths[symbol])) <= target)
+        .max_by_key(|&symbol| (frequencies[symbol], lengths[symbol]))
+    {
+        sum += 1u64 << (max_bits - lengths[symbol]);
+        lengths[symbol] -= 1;
     }
 }
 
@@ -167,11 +223,82 @@ mod tests {
     }
 
     #[test]
-    fn excessive_lengths_fall_back_to_uniform_lengths() {
+    fn lengths_too_deep_to_limit_fall_back_to_uniform_lengths() {
+        // 1024 symbols cannot be spelled in one bit however they are arranged,
+        // so there is no length-limited code to find.
         let frequencies = (1..=1024).collect::<Vec<_>>();
         let lengths = lengths_for_frequencies(&frequencies, 1);
 
         assert!(lengths.iter().all(|&length| length == 10));
+    }
+
+    #[test]
+    fn deep_codes_are_limited_rather_than_flattened() {
+        // Fibonacci frequencies are the worst case for Huffman depth, and this
+        // alphabet wants codes far deeper than fifteen bits.
+        let mut frequencies = vec![1usize, 1];
+        while frequencies.len() < 40 {
+            let next = frequencies[frequencies.len() - 1] + frequencies[frequencies.len() - 2];
+            frequencies.push(next);
+        }
+        let lengths = lengths_for_frequencies(&frequencies, 15);
+
+        assert!(lengths.iter().all(|&length| length <= 15), "{lengths:?}");
+        assert!(is_complete_code(&lengths), "{lengths:?}");
+        // A flat code over forty symbols is six bits each, and on frequencies
+        // this skewed the limited code has to beat that.
+        let flat: usize = frequencies.iter().sum::<usize>() * 6;
+        let limited: usize = frequencies
+            .iter()
+            .zip(&lengths)
+            .map(|(&frequency, &length)| frequency * usize::from(length))
+            .sum();
+        assert!(limited < flat, "limited {limited} flat {flat}");
+    }
+
+    #[test]
+    fn limited_codes_stay_decodable_for_every_shape_of_input() {
+        // rar29 feeds this straight into a table it writes, with no validation
+        // pass behind it, so the one thing that must always hold is that the
+        // result is a usable prefix code inside the format's bit limit.
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for symbols in [2usize, 3, 17, 64, 255, 299] {
+            for skew in 0..8 {
+                let frequencies: Vec<usize> = (0..symbols)
+                    .map(|_| match skew {
+                        // Increasingly lopsided distributions, which is what
+                        // drives a Huffman code past the depth limit.
+                        0 => 1,
+                        s => 1 + (next() % (1u64 << (s * 8).min(60))) as usize,
+                    })
+                    .collect();
+                let lengths = lengths_for_frequencies(&frequencies, 15);
+
+                assert_eq!(lengths.len(), symbols);
+                assert!(
+                    lengths.iter().all(|&length| length <= 15),
+                    "over the limit: {symbols} symbols, skew {skew}"
+                );
+                let deepest = lengths.iter().copied().max().unwrap_or(0);
+                if deepest > 0 {
+                    let kraft: u64 = lengths
+                        .iter()
+                        .filter(|&&length| length != 0)
+                        .map(|&length| 1u64 << (deepest - length))
+                        .sum();
+                    assert!(
+                        kraft <= 1u64 << deepest,
+                        "not a prefix code: {symbols} symbols, skew {skew}"
+                    );
+                }
+            }
+        }
     }
 
     fn kraft_sum_is_one(lengths: &[u8]) -> bool {

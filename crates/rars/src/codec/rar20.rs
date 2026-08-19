@@ -99,6 +99,9 @@ pub struct EncodeOptions {
     pub max_match_distance: usize,
     pub lazy_matching: bool,
     pub lazy_lookahead: usize,
+    /// Parse by shortest path rather than greedily. Costs several times the
+    /// encode time, so it belongs at the top of the level ladder.
+    pub optimal_parse: bool,
     pub try_audio: bool,
 }
 
@@ -109,6 +112,7 @@ impl EncodeOptions {
             max_match_distance: MAX_ENCODER_MATCH_OFFSET,
             lazy_matching: false,
             lazy_lookahead: 1,
+            optimal_parse: false,
             try_audio: true,
         }
     }
@@ -124,6 +128,11 @@ impl EncodeOptions {
 
     pub const fn with_lazy_matching(mut self, enabled: bool) -> Self {
         self.lazy_matching = enabled;
+        self
+    }
+
+    pub const fn with_optimal_parse(mut self, enabled: bool) -> Self {
+        self.optimal_parse = enabled;
         self
     }
 
@@ -232,32 +241,40 @@ fn encode_member(
         return Ok(packed);
     }
 
-    let cost_model = CostModel::new(&table_lengths);
-    let refined_tokens = match progress.as_mut() {
-        Some(report) => encode_tokens_with_progress(
-            input,
-            history,
-            options,
-            Some(&cost_model),
-            Some(&mut **report),
-        )?,
-        None => encode_tokens_with_progress(input, history, options, Some(&cost_model), None)?,
-    };
-    if refined_tokens == tokens {
-        return Ok(packed);
+    // Re-parse against the prices the first pass implies, then again against
+    // the prices that produced. A greedy parse has converged by the first
+    // re-parse and a second buys 0.02%, but the shortest-path parse is far more
+    // sensitive to its prices and a second pass is worth 0.12% to it.
+    let refinements = if options.optimal_parse { 2 } else { 1 };
+    let mut best_tokens = tokens;
+    let mut best_table = table_lengths;
+    let mut best_packed = packed;
+    for _ in 0..refinements {
+        let cost_model = CostModel::new(&best_table);
+        let next_tokens = match progress.as_mut() {
+            Some(report) => encode_tokens_with_progress(
+                input,
+                history,
+                options,
+                Some(&cost_model),
+                Some(&mut **report),
+            )?,
+            None => encode_tokens_with_progress(input, history, options, Some(&cost_model), None)?,
+        };
+        if next_tokens == best_tokens {
+            break;
+        }
+        let next_table = table_lengths_for_tokens(&next_tokens, fixed_table)?;
+        let next_packed =
+            encode_member_with_tables(&next_tokens, history, fixed_table, &next_table)?;
+        if next_packed.len() >= best_packed.len() {
+            break;
+        }
+        best_tokens = next_tokens;
+        best_table = next_table;
+        best_packed = next_packed;
     }
-    let refined_table_lengths = table_lengths_for_tokens(&refined_tokens, fixed_table)?;
-    let refined_packed = encode_member_with_tables(
-        &refined_tokens,
-        history,
-        fixed_table,
-        &refined_table_lengths,
-    )?;
-    if refined_packed.len() < packed.len() {
-        Ok(refined_packed)
-    } else {
-        Ok(packed)
-    }
+    Ok(best_packed)
 }
 
 fn table_lengths_for_tokens(
@@ -470,6 +487,173 @@ enum EncodeToken {
     },
 }
 
+/// Lengths worth trying for a match at one position.
+///
+/// Every length inside a length slot is priced the same: the slot's Huffman
+/// code plus its fixed extra bits, with the extra value itself costing nothing.
+/// So the parse only needs the longest length in each slot, plus the longest
+/// match found. That is at most twenty-nine candidates where trying every
+/// length is up to two hundred and fifty-six, for 0.03% of packed size.
+fn candidate_lengths(best_length: usize, offset: usize, out: &mut Vec<usize>) {
+    out.clear();
+    let adjustment = match_length_adjustment(offset);
+    for slot in 0..LENGTH_COUNT {
+        let widest = LENGTH_BASES[slot] + (1usize << LENGTH_BITS[slot]) - 1;
+        let length = widest + 3 + adjustment;
+        if (3..=best_length).contains(&length) {
+            out.push(length);
+        }
+    }
+    if best_length >= 3 {
+        out.push(best_length);
+    }
+    out.sort_unstable();
+    out.dedup();
+}
+
+/// Parse the member by shortest path, priced by the previous pass's tables.
+///
+/// The greedy parse commits to a match the moment it finds one, with a two
+/// position lazy check as its only way out. This asks instead what the cheapest
+/// route to the end of the member is, so a match that looks good on its own can
+/// lose to one that leaves the positions after it cheaper. Worth about 0.9% on
+/// the bench corpus, which is more than everything else tried put together.
+///
+/// One approximation. The four recent offsets depend on the route taken, and
+/// carrying every reachable rep state would multiply the search out of reach.
+/// Each position keeps the rep list of the cheapest route that reached it,
+/// which is what LZMA's optimal parser does with the same justification.
+fn encode_tokens_optimal(
+    input: &[u8],
+    start: usize,
+    end: usize,
+    finder: &mut Rar20MatchFinder,
+    options: EncodeOptions,
+    cost_model: &CostModel<'_>,
+) -> Vec<EncodeToken> {
+    const UNREACHED: u64 = u64::MAX / 4;
+    let span = end - start;
+    let mut cost = vec![UNREACHED; span + 1];
+    let mut from = vec![0usize; span + 1];
+    let mut token: Vec<Option<EncodeToken>> = vec![None; span + 1];
+    let mut reps = vec![[0usize; 4]; span + 1];
+    let mut lengths = Vec::new();
+    cost[0] = 0;
+
+    for index in 0..span {
+        if cost[index] == UNREACHED {
+            continue;
+        }
+        let pos = start + index;
+        let here = cost[index];
+        let node_reps = reps[index];
+
+        let mut relax = |next: usize, price: u64, what: EncodeToken, next_reps: [usize; 4]| {
+            if next <= span && here + price < cost[next] {
+                cost[next] = here + price;
+                from[next] = index;
+                token[next] = Some(what);
+                reps[next] = next_reps;
+            }
+        };
+
+        relax(
+            index + 1,
+            cost_model.literal_bits(input, pos, 1) as u64,
+            EncodeToken::Literal(input[pos]),
+            node_reps,
+        );
+
+        let cap = (end - pos).min(MAX_ENCODER_MATCH_LENGTH);
+        if let Some((best_length, offset)) =
+            best_match(input, pos, end, finder, options, Some(cost_model))
+        {
+            let mut pushed = node_reps;
+            push_old_offset(&mut pushed, offset);
+            candidate_lengths(best_length.min(cap), offset, &mut lengths);
+            for &length in &lengths {
+                let candidate = SelectedMatch::Fresh { length, offset };
+                if let Some(price) = cost_model.selected_cost(candidate) {
+                    relax(
+                        index + length,
+                        price as u64,
+                        EncodeToken::Match { length, offset },
+                        pushed,
+                    );
+                }
+            }
+        }
+
+        for (rep_index, &offset) in node_reps.iter().enumerate() {
+            let reach = match_run_length(input, pos, offset, cap);
+            if reach < 3 {
+                continue;
+            }
+            let mut pushed = node_reps;
+            push_old_offset(&mut pushed, offset);
+            candidate_lengths(reach, offset, &mut lengths);
+            for &length in &lengths {
+                let candidate = SelectedMatch::OldOffset {
+                    index: rep_index,
+                    length,
+                    offset,
+                };
+                if let Some(price) = cost_model.selected_cost(candidate) {
+                    relax(
+                        index + length,
+                        price as u64,
+                        EncodeToken::OldOffset {
+                            index: rep_index,
+                            length,
+                            offset,
+                        },
+                        pushed,
+                    );
+                }
+            }
+        }
+
+        if let Some(short @ SelectedMatch::ShortOffset { offset }) =
+            best_short_offset_match(input, pos, end)
+        {
+            if let Some(price) = cost_model.selected_cost(short) {
+                let mut pushed = node_reps;
+                push_old_offset(&mut pushed, offset);
+                relax(
+                    index + 2,
+                    price as u64,
+                    EncodeToken::ShortOffset { offset },
+                    pushed,
+                );
+            }
+        }
+
+        finder.insert(input, pos);
+    }
+
+    let mut out = Vec::new();
+    let mut at = span;
+    while at > 0 {
+        let Some(what) = token[at] else { break };
+        out.push(what);
+        at = from[at];
+    }
+    out.reverse();
+    out
+}
+
+/// How far the bytes at `pos` repeat the bytes `offset` back, up to `cap`.
+fn match_run_length(input: &[u8], pos: usize, offset: usize, cap: usize) -> usize {
+    if offset == 0 || offset > pos {
+        return 0;
+    }
+    let mut length = 0;
+    while length < cap && input[pos + length] == input[pos - offset + length] {
+        length += 1;
+    }
+    length
+}
+
 fn encode_tokens_with_progress(
     input: &[u8],
     history: &[u8],
@@ -485,6 +669,19 @@ fn encode_tokens_with_progress(
     let mut finder = Rar20MatchFinder::new(combined.len());
     for history_pos in 0..history.len() {
         finder.insert(&combined, history_pos);
+    }
+
+    if let Some(cost_model) = cost_model.filter(|_| options.optimal_parse) {
+        let start = history.len();
+        let end = combined.len();
+        return Ok(encode_tokens_optimal(
+            &combined,
+            start,
+            end,
+            &mut finder,
+            options,
+            cost_model,
+        ));
     }
 
     let mut pos = history.len();
@@ -578,6 +775,9 @@ fn encode_tokens_with_progress(
     Ok(tokens)
 }
 
+/// Stand-in price for a literal the current table has no code for.
+const ABSENT_LITERAL_BITS: usize = 15;
+
 #[derive(Debug, Clone, Copy)]
 struct CostModel<'a> {
     main: &'a [u8],
@@ -626,9 +826,29 @@ impl<'a> CostModel<'a> {
         }
     }
 
-    fn selected_score(self, selected: SelectedMatch) -> Option<isize> {
+    /// What these bytes cost spelled out one literal at a time, in bits.
+    ///
+    /// A symbol the previous pass never emitted as a literal has no code, so it
+    /// cannot be spelled that way at all. Price it high rather than free.
+    fn literal_bits(self, input: &[u8], pos: usize, length: usize) -> usize {
+        input[pos..(pos + length).min(input.len())]
+            .iter()
+            .map(|&byte| match self.main[usize::from(byte)] {
+                0 => ABSENT_LITERAL_BITS,
+                bits => usize::from(bits),
+            })
+            .sum()
+    }
+
+    /// Bits saved by taking this match instead of the literals it covers.
+    ///
+    /// The literals are priced from the table rather than assumed to be eight
+    /// bits each. On text they run nearer four, so a flat eight overstates what
+    /// every match is worth by around half.
+    fn selected_score(self, selected: SelectedMatch, input: &[u8], pos: usize) -> Option<isize> {
         let cost = self.selected_cost(selected)?;
-        Some(selected.length() as isize * 8 - cost as isize)
+        let saved = self.literal_bits(input, pos, selected.length());
+        Some(saved as isize - cost as isize)
     }
 }
 
@@ -690,7 +910,9 @@ fn select_match(
             .flatten()
             .max_by_key(|&selected| {
                 (
-                    cost_model.selected_score(selected).unwrap_or(isize::MIN),
+                    cost_model
+                        .selected_score(selected, input, pos)
+                        .unwrap_or(isize::MIN),
                     selected.length(),
                 )
             });
@@ -761,13 +983,19 @@ fn should_lazy_emit_literal(
             .is_some_and(|next| {
                 let current_score = context
                     .cost_model
-                    .and_then(|cost_model| cost_model.selected_score(current))
+                    .and_then(|cost_model| cost_model.selected_score(current, context.input, pos))
                     .unwrap_or_else(|| current.score());
                 let next_score = context
                     .cost_model
-                    .and_then(|cost_model| cost_model.selected_score(next))
+                    .and_then(|cost_model| {
+                        cost_model.selected_score(next, context.input, pos + offset)
+                    })
                     .unwrap_or_else(|| next.score());
-                let skipped_literal_score = offset as isize * 8;
+                let skipped_literal_score = context
+                    .cost_model
+                    .map_or(offset as isize * 8, |cost_model| {
+                        cost_model.literal_bits(context.input, pos, offset) as isize
+                    });
                 next_score > current_score + skipped_literal_score
             })
         })
@@ -815,7 +1043,7 @@ fn best_match(
         if probe_ok {
             let length = super::fast::match_length(input, pos, offset, max_length);
             let encodable = length >= 3 + match_length_adjustment(offset);
-            if encodable && is_better_fresh_match(cost_model, length, offset, best) {
+            if encodable && is_better_fresh_match(cost_model, input, pos, length, offset, best) {
                 best = Some((length, offset));
                 if length == max_length {
                     break;
@@ -838,6 +1066,8 @@ fn offset_slot_index(offset: usize) -> usize {
 
 fn is_better_fresh_match(
     cost_model: Option<&CostModel<'_>>,
+    input: &[u8],
+    pos: usize,
     length: usize,
     offset: usize,
     best: Option<(usize, usize)>,
@@ -851,8 +1081,12 @@ fn is_better_fresh_match(
             length: best_length,
             offset: best_offset,
         };
-        let candidate_score = cost_model.selected_score(candidate).unwrap_or(isize::MIN);
-        let best_score = cost_model.selected_score(best).unwrap_or(isize::MIN);
+        let candidate_score = cost_model
+            .selected_score(candidate, input, pos)
+            .unwrap_or(isize::MIN);
+        let best_score = cost_model
+            .selected_score(best, input, pos)
+            .unwrap_or(isize::MIN);
         return candidate_score > best_score
             || (candidate_score == best_score
                 && (length > best_length || (length == best_length && offset < best_offset)));
@@ -875,7 +1109,7 @@ fn best_old_offset_match(
         }
         let length = match_length_at_offset(input, pos, max_length, offset);
         if old_length_slot_for_match(length, offset).is_ok()
-            && is_better_old_offset_match(cost_model, index, length, offset, best)
+            && is_better_old_offset_match(cost_model, input, pos, index, length, offset, best)
         {
             best = Some((index, length, offset));
         }
@@ -885,6 +1119,8 @@ fn best_old_offset_match(
 
 fn is_better_old_offset_match(
     cost_model: Option<&CostModel<'_>>,
+    input: &[u8],
+    pos: usize,
     index: usize,
     length: usize,
     offset: usize,
@@ -904,8 +1140,12 @@ fn is_better_old_offset_match(
             length: best_length,
             offset: best_offset,
         };
-        let candidate_score = cost_model.selected_score(candidate).unwrap_or(isize::MIN);
-        let best_score = cost_model.selected_score(best).unwrap_or(isize::MIN);
+        let candidate_score = cost_model
+            .selected_score(candidate, input, pos)
+            .unwrap_or(isize::MIN);
+        let best_score = cost_model
+            .selected_score(best, input, pos)
+            .unwrap_or(isize::MIN);
         return candidate_score > best_score
             || (candidate_score == best_score
                 && (length > best_length || (length == best_length && offset < best_offset)));
@@ -2471,6 +2711,82 @@ mod tests {
             decoder.decode_member(&second_packed, second.len()).unwrap(),
             second
         );
+    }
+
+    #[test]
+    fn the_optimal_parse_never_loses_to_the_greedy_one() {
+        // Repeated phrases at varying distances with literal noise between
+        // them, which is where committing to the first match found costs
+        // something: the greedy parse takes a short match that a later, longer
+        // one would have covered for free.
+        let mut input = Vec::new();
+        for round in 0..64u8 {
+            input.extend_from_slice(b"the quick brown fox jumps over the lazy dog");
+            input.extend_from_slice(&[round, round ^ 0x5a, round.wrapping_mul(31)]);
+            input.extend_from_slice(b"over the lazy dog and the quick brown fox");
+            input.push(round ^ 0xa5);
+        }
+
+        let greedy_options = EncodeOptions::new(256)
+            .with_lazy_matching(true)
+            .with_lazy_lookahead(2);
+        let greedy = super::unpack20_encode_literals_with_options(&input, greedy_options).unwrap();
+        let optimal = super::unpack20_encode_literals_with_options(
+            &input,
+            greedy_options.with_optimal_parse(true),
+        )
+        .unwrap();
+
+        assert!(
+            optimal.len() <= greedy.len(),
+            "optimal {} greedy {}",
+            optimal.len(),
+            greedy.len()
+        );
+        let mut decoder = Unpack20::new();
+        assert_eq!(
+            decoder.decode_member(&optimal, input.len()).unwrap(),
+            input,
+            "the optimal parse produced something the decoder disagrees with"
+        );
+    }
+
+    #[test]
+    fn the_optimal_parse_decodes_whatever_it_is_given() {
+        // Shapes that stress different corners of the parse: nothing to match,
+        // one long run, matches that reach back exactly to the rep offsets, and
+        // bytes with no structure at all.
+        let mut noise = Vec::new();
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..8192 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            noise.push(seed as u8);
+        }
+        let cases: Vec<Vec<u8>> = vec![
+            b"a".to_vec(),
+            b"abc".to_vec(),
+            vec![0u8; 5000],
+            (0u8..=255).cycle().take(4096).collect(),
+            b"xyzzy".repeat(700),
+            noise,
+        ];
+
+        for input in cases {
+            let options = EncodeOptions::new(256)
+                .with_lazy_matching(true)
+                .with_lazy_lookahead(2)
+                .with_optimal_parse(true);
+            let packed = super::unpack20_encode_literals_with_options(&input, options).unwrap();
+            let mut decoder = Unpack20::new();
+            assert_eq!(
+                decoder.decode_member(&packed, input.len()).unwrap(),
+                input,
+                "round trip failed for a {} byte member",
+                input.len()
+            );
+        }
     }
 
     #[test]

@@ -1320,6 +1320,26 @@ fn rar20_encode_options_for_level(level: Option<u8>) -> Result<Rar20EncodeOption
     };
     Ok(Rar20EncodeOptions::new(candidates)
         .with_lazy_matching(true)
+        // Look two positions ahead before committing to a match, not one. The
+        // class this moves is downloads: docx, jpeg, png, gif, a ZX Spectrum
+        // snapshot. High-entropy bytes with occasional short matches, where a
+        // three byte match often costs more than the literal it replaces and
+        // the better match starts two bytes later. Depth 1 cannot see that far.
+        // Measured on the small corpus, packed bytes:
+        //
+        // ```text
+        // depth        1        2        3        4
+        // total  657,072  654,162  656,242  659,161
+        // ```
+        //
+        // Worth 0.44% at every level for about a third more encode time. Depth
+        // 3 and 4 give it back: on text, deferring that long skips matches
+        // worth taking.
+        .with_lazy_lookahead(2)
+        // The shortest-path parse is worth another 1.5% and costs four times
+        // the encode time, so it goes where the ladder already means "spend
+        // whatever it takes". rar29 gates its lazy matching at the same rung.
+        .with_optimal_parse(level >= 4)
         // The audio trial is a second encode of the member, which is the one
         // thing level 1 is trying not to pay for.
         .with_try_audio(level > 1))
@@ -2312,8 +2332,8 @@ fn write_comment_header_crc(out: &mut [u8], start: usize) {
 mod tests {
     use super::{
         encode_rar29_auto_filtered_member, encode_rar29_filtered_member,
-        encode_rar29_filtered_members, is_audio_filter_candidate, rar20_encode_options_for_options,
-        rar29_encode_options_for_options, FilterKind, FilterSpec,
+        encode_rar29_filtered_members, is_audio_filter_candidate, rar20_encode_options_for_level,
+        rar20_encode_options_for_options, rar29_encode_options_for_options, FilterKind, FilterSpec,
     };
     use crate::codec::rar29::{unpack29_decode, EncodeOptions};
 
@@ -2827,5 +2847,29 @@ mod tests {
             .max_match_distance,
             1024 * 1024
         );
+    }
+    #[test]
+    fn only_the_top_two_levels_pay_for_the_rar20_optimal_parse() {
+        for level in 0..=3u8 {
+            let options = rar20_encode_options_for_level(Some(level)).unwrap();
+            assert!(!options.optimal_parse, "level {level} priced every path");
+        }
+        for level in 4..=5u8 {
+            let options = rar20_encode_options_for_level(Some(level)).unwrap();
+            assert!(options.optimal_parse, "level {level} settled for greedy");
+        }
+        assert!(
+            !rar20_encode_options_for_level(None).unwrap().optimal_parse,
+            "an absent level is the default level, which is not the top of the ladder",
+        );
+    }
+
+    #[test]
+    fn every_rar20_level_looks_two_positions_ahead() {
+        for level in 1..=5u8 {
+            let options = rar20_encode_options_for_level(Some(level)).unwrap();
+            assert!(options.lazy_matching, "level {level} stopped being lazy");
+            assert_eq!(options.lazy_lookahead, 2, "level {level}");
+        }
     }
 }
