@@ -17,7 +17,7 @@ use super::filter_policy::{
     should_store_compressed_payload,
 };
 use super::FilterPolicy;
-use crate::codec::rar50::{encode_lz_streaming_block, EncodeOptions};
+use crate::codec::rar50::{encode_lz_streaming_block, BlockSplitter, EncodeOptions};
 use crate::streaming::Spool;
 use crate::{EntrySource, Error, Result, WriterResources};
 use std::io::{Read, Write};
@@ -66,6 +66,15 @@ struct MemberStream {
     reader: Box<dyn crate::EntryReader>,
     remaining: u64,
     packed: Spool,
+    /// A chunk read to decide a block boundary and not used by that block.
+    pushback: Vec<u8>,
+}
+
+impl MemberStream {
+    /// Whether this member has anything left, read or unread.
+    fn has_more(&self) -> bool {
+        self.remaining != 0 || !self.pushback.is_empty()
+    }
 }
 
 /// `advance` is called with each newly completed chunk of work and returns
@@ -88,8 +97,13 @@ pub(super) fn compress_members_reporting(
     // finally writes with.
     let optimal_parse = plan.encode_options.optimal_parse
         || plan.candidates.iter().any(|options| options.optimal_parse);
-    let required =
-        super::streaming_lz_workspace(plan.dictionary_size, plan.block_size, optimal_parse);
+    // A block grows past the read size when the data it covers is not moving,
+    // so the charge covers the largest one the parse could end up holding.
+    let required = super::streaming_lz_workspace(
+        plan.dictionary_size,
+        crate::codec::rar50::MAX_LZ_BLOCK_SIZE,
+        optimal_parse,
+    );
     let max_jobs_by_memory = resources.memory_limit() / required;
     if max_jobs_by_memory == 0 {
         resources.acquire(required, plan.dictionary_size)?;
@@ -314,13 +328,14 @@ fn compress_independent_members(
                     reader: source.open()?,
                     remaining: integrity[group_start + offset].0,
                     packed: Spool::create(resources)?,
+                    pushback: Vec::new(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
 
         let mut histories = vec![Vec::new(); streams.len()];
         let mut cursor = 0usize;
-        while streams.iter().any(|stream| stream.remaining != 0) {
+        while streams.iter().any(MemberStream::has_more) {
             let reserved = required.saturating_mul(batch_capacity as u64);
             let _permit = resources.acquire(reserved, plan.dictionary_size)?;
 
@@ -330,7 +345,7 @@ fn compress_independent_members(
                 let stream_count = streams.len();
                 let stream = &mut streams[cursor];
                 cursor = (cursor + 1) % stream_count;
-                if stream.remaining == 0 {
+                if !stream.has_more() {
                     misses += 1;
                     continue;
                 }
@@ -338,7 +353,7 @@ fn compress_independent_members(
 
                 let member = stream.member;
                 let data = read_block(stream, plan.block_size)?;
-                let is_last = stream.remaining == 0;
+                let is_last = !stream.has_more();
                 jobs.push(BlockJob {
                     member,
                     history: histories[member].clone(),
@@ -380,6 +395,7 @@ fn compress_solid_chain(
                 reader: source.open()?,
                 remaining: integrity[member].0,
                 packed: Spool::create(resources)?,
+                pushback: Vec::new(),
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -395,7 +411,7 @@ fn compress_solid_chain(
         // reading; the compression it feeds runs in parallel.
         let mut jobs = Vec::with_capacity(batch_capacity);
         while jobs.len() < batch_capacity {
-            while next < streams.len() && streams[next].remaining == 0 {
+            while next < streams.len() && !streams[next].has_more() {
                 next += 1;
             }
             let Some(stream) = streams.get_mut(next) else {
@@ -404,7 +420,7 @@ fn compress_solid_chain(
 
             let member = stream.member;
             let data = read_block(stream, plan.block_size)?;
-            let is_last = stream.remaining == 0;
+            let is_last = !stream.has_more();
             jobs.push(BlockJob {
                 member,
                 history: history.clone(),
@@ -428,7 +444,34 @@ fn compress_solid_chain(
 }
 
 /// Reads the next block from `stream`, checking the source has not grown.
+///
+/// One chunk, then further chunks while the data is not moving, which is the
+/// same question [`BlockSplitter`] answers for the buffered writer. Both have
+/// to reach the same answer or the same input packs to two different archives.
 fn read_block(stream: &mut MemberStream, block_size: usize) -> Result<Vec<u8>> {
+    let mut data = read_chunk(stream, block_size)?;
+    let mut splitter = BlockSplitter::new();
+    splitter.accept(&data);
+    while stream.has_more() {
+        let next = read_chunk(stream, block_size)?;
+        if !splitter.extends(&next) {
+            // Deciding needs the chunk in hand, so this reads one further than
+            // it keeps. Hand it back for the next block rather than seeking
+            // backwards, which an `EntryReader` cannot always do.
+            stream.pushback = next;
+            break;
+        }
+        splitter.accept(&next);
+        data.extend_from_slice(&next);
+    }
+    Ok(data)
+}
+
+/// Reads one chunk, preferring anything a previous read put back.
+fn read_chunk(stream: &mut MemberStream, block_size: usize) -> Result<Vec<u8>> {
+    if !stream.pushback.is_empty() {
+        return Ok(std::mem::take(&mut stream.pushback));
+    }
     let wanted = usize::try_from(stream.remaining.min(block_size as u64))
         .map_err(|_| Error::InvalidHeader("RAR 5 block size overflows usize"))?;
     let mut data = vec![0u8; wanted];

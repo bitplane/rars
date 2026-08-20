@@ -30,6 +30,117 @@ const MAX_COMPRESSED_BLOCK_OUTPUT: usize = 4 * 1024 * 1024;
 /// paths produce the same blocks for the same input.
 pub(crate) const LZ_BLOCK_SIZE: usize = 64 * 1024;
 const _: () = assert!(LZ_BLOCK_SIZE <= MAX_COMPRESSED_BLOCK_OUTPUT);
+
+/// The most input one block may cover once blocks are being extended.
+///
+/// A block only grows over data whose byte distribution is not moving, so the
+/// bytes it covers compress to very little and the output stays far inside
+/// [`MAX_COMPRESSED_BLOCK_OUTPUT`]. The cap is what the writer charges its
+/// workspace for, so it is a memory decision as much as a size one: the
+/// optimal parse prices every position in a block and its arrays scale with
+/// the block, so a mebibyte is the point where the extra table sets saved stop
+/// being worth the pages.
+pub(crate) const MAX_LZ_BLOCK_SIZE: usize = 1024 * 1024;
+const _: () = assert!(MAX_LZ_BLOCK_SIZE <= MAX_COMPRESSED_BLOCK_OUTPUT);
+
+/// How far a chunk's byte distribution may sit from the open block's before
+/// the block is closed, as a fraction of the chunk.
+///
+/// The statistic is how many of the chunk's bytes the open block's model puts
+/// in the wrong place, so the limit reads as "extend while under one in a
+/// hundred and twenty-eight of the next chunk's bytes are distributed
+/// differently". Measured over the bench corpus, per 64 KiB chunk:
+///
+/// ```text
+/// class                       min   median      max
+/// large-compressible            0        0        0
+/// large-incompressible      3,243    3,751    5,133
+/// large-source-tree         6,274   16,972   54,003
+/// large-text                2,319   30,598   90,929
+/// large-bin-unstripped     18,298   38,875  110,933
+/// large-bin-stripped       13,982   60,996  113,086
+/// ```
+///
+/// Only data that does not move at all falls under 512, and the nearest class
+/// that does move sits four and a half times above it. That gap is the whole
+/// design: a block grows over data a fresh table set could not describe any
+/// better, and over nothing else.
+const BLOCK_DRIFT_DIVISOR: u64 = 128;
+
+/// Decides where one block ends, from the raw bytes alone.
+///
+/// Both writers have to cut a member the same way or the same input packs to
+/// different archives, and they see it differently: the buffered path holds
+/// the whole member while the streaming path reads it a chunk at a time and
+/// compresses a wave of blocks in parallel. So the rule reads only the bytes
+/// already folded into the open block plus the chunk being considered, which
+/// both of them have at the moment they have to decide.
+///
+/// Every block still carries its own tables. Extending a block is what WinRAR
+/// does on data like this; the format's table-reuse flag would say the same
+/// thing more directly, but no archive WinRAR writes sets it, so no third
+/// party decoder is known to have been tested against one that does.
+#[derive(Debug, Clone)]
+pub(crate) struct BlockSplitter {
+    counts: [u32; 256],
+    total: u64,
+}
+
+impl Default for BlockSplitter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BlockSplitter {
+    pub(crate) const fn new() -> Self {
+        Self {
+            counts: [0; 256],
+            total: 0,
+        }
+    }
+
+    /// Folds a chunk into the open block.
+    pub(crate) fn accept(&mut self, chunk: &[u8]) {
+        for &byte in chunk {
+            self.counts[usize::from(byte)] += 1;
+        }
+        self.total += chunk.len() as u64;
+    }
+
+    /// Starts a new block.
+    pub(crate) fn reset(&mut self) {
+        self.counts = [0; 256];
+        self.total = 0;
+    }
+
+    /// Whether the open block should swallow `chunk` rather than end before it.
+    ///
+    /// Integer arithmetic throughout, because a block boundary decided by
+    /// floating point would let the same input pack to different archives on
+    /// two platforms whose `log2` disagree in the last bit.
+    pub(crate) fn extends(&self, chunk: &[u8]) -> bool {
+        let open = self.total;
+        if open == 0 || chunk.is_empty() {
+            return false;
+        }
+        if open + chunk.len() as u64 > MAX_LZ_BLOCK_SIZE as u64 {
+            return false;
+        }
+        let mut counts = [0u32; 256];
+        for &byte in chunk {
+            counts[usize::from(byte)] += 1;
+        }
+        let chunk_len = chunk.len() as u64;
+        // How many of the chunk's bytes the open block's distribution places
+        // wrongly. Both sides are scaled by `open` so neither divides early.
+        let mut misplaced = 0u64;
+        for (theirs, ours) in counts.iter().zip(&self.counts) {
+            misplaced += (u64::from(*theirs) * open).abs_diff(u64::from(*ours) * chunk_len);
+        }
+        misplaced / open <= chunk_len / BLOCK_DRIFT_DIVISOR
+    }
+}
 const MAX_FILTER_BLOCK_LENGTH: usize = 0x3ffff;
 /// The most channels a RAR 5 delta filter record can name. The count is written
 /// as five bits biased by one, so this is what the format can say, not a policy.
@@ -612,30 +723,56 @@ pub(crate) fn encode_lz_reader_to(
     }
     let block_size = block_size.min(MAX_COMPRESSED_BLOCK_OUTPUT);
     let mut history = Vec::new();
-    let mut buffer = vec![0; block_size];
+    let mut chunk = vec![0; block_size];
+    let mut block = Vec::new();
     let mut remaining = input_size;
     let mut completed = 0u64;
-    while remaining != 0 {
-        let wanted = usize::try_from(remaining.min(block_size as u64))
-            .map_err(|_| crate::Error::InvalidHeader("RAR 5 block size overflows usize"))?;
-        reader.read_exact(&mut buffer[..wanted])?;
-        remaining -= wanted as u64;
+    let mut held: Option<Vec<u8>> = None;
+    while remaining != 0 || held.is_some() {
+        // One chunk, then further chunks while the data is not moving, which is
+        // the cut [`BlockSplitter`] makes for the other two writers. Deciding
+        // needs the chunk in hand, so the one that ends a block is held over.
+        let mut splitter = BlockSplitter::new();
+        block.clear();
+        match held.take() {
+            Some(first) => block.extend_from_slice(&first),
+            None => {
+                let wanted = usize::try_from(remaining.min(block_size as u64))
+                    .map_err(|_| crate::Error::InvalidHeader("RAR 5 block size overflows usize"))?;
+                reader.read_exact(&mut chunk[..wanted])?;
+                remaining -= wanted as u64;
+                block.extend_from_slice(&chunk[..wanted]);
+            }
+        }
+        splitter.accept(&block);
+        while remaining != 0 {
+            let wanted = usize::try_from(remaining.min(block_size as u64))
+                .map_err(|_| crate::Error::InvalidHeader("RAR 5 block size overflows usize"))?;
+            reader.read_exact(&mut chunk[..wanted])?;
+            remaining -= wanted as u64;
+            if !splitter.extends(&chunk[..wanted]) {
+                held = Some(chunk[..wanted].to_vec());
+                break;
+            }
+            splitter.accept(&chunk[..wanted]);
+            block.extend_from_slice(&chunk[..wanted]);
+        }
         let packed = encode_lz_block(
-            &buffer[..wanted],
+            &block,
             &history,
             algorithm_version,
             &[],
             options,
-            remaining == 0,
+            remaining == 0 && held.is_none(),
             None,
         )?;
         output.write_all(&packed)?;
-        history.extend_from_slice(&buffer[..wanted]);
+        history.extend_from_slice(&block);
         let keep_from = history.len().saturating_sub(options.max_match_distance);
         if keep_from != 0 {
             history.drain(..keep_from);
         }
-        completed += wanted as u64;
+        completed += block.len() as u64;
         if progress
             .as_deref_mut()
             .is_some_and(|report| !report(completed))
@@ -887,8 +1024,22 @@ fn encode_lz_member_inner(
         let mut out = Vec::new();
         let mut completed = 0usize;
         let mut block_start = start;
+        let mut splitter = BlockSplitter::new();
         while block_start < combined.len() {
-            let block_end = (block_start + LZ_BLOCK_SIZE).min(combined.len());
+            // Take one chunk, then keep taking them while the data is not
+            // moving. See [`BlockSplitter`].
+            splitter.reset();
+            let mut block_end = (block_start + LZ_BLOCK_SIZE).min(combined.len());
+            splitter.accept(&combined[block_start..block_end]);
+            while block_end < combined.len() {
+                let next_end = (block_end + LZ_BLOCK_SIZE).min(combined.len());
+                let next = &combined[block_end..next_end];
+                if !splitter.extends(next) {
+                    break;
+                }
+                splitter.accept(next);
+                block_end = next_end;
+            }
             let is_last = block_end == combined.len();
             let mut chunk_progress = |position: usize| {
                 progress
@@ -4339,7 +4490,10 @@ mod tests {
 
     #[test]
     fn large_lz_members_are_split_into_multiple_compressed_blocks() {
-        let data = vec![0u8; LZ_BLOCK_SIZE + 1];
+        // Two halves that do not look alike, so the second cannot be spelled
+        // with the first's tables and gets its own block.
+        let mut data = wordy_text(LZ_BLOCK_SIZE);
+        data.extend((0..LZ_BLOCK_SIZE).map(|index| (index as u8).wrapping_mul(37)));
         let encoded = encode_lz_member_with_options(&data, 0, EncodeOptions::new(16)).unwrap();
         let mut cursor = std::io::Cursor::new(encoded.as_slice());
         let first = read_compressed_block(&mut cursor).unwrap();
@@ -4354,6 +4508,64 @@ mod tests {
                 .unwrap(),
             data
         );
+    }
+
+    #[test]
+    fn a_member_that_does_not_move_is_left_in_one_block() {
+        // Every chunk of this has the same byte distribution, so a fresh table
+        // set per chunk would describe nothing the first one did not.
+        let data = vec![0u8; LZ_BLOCK_SIZE * 4];
+        let encoded = encode_lz_member_with_options(&data, 0, EncodeOptions::new(16)).unwrap();
+        let mut cursor = std::io::Cursor::new(encoded.as_slice());
+        let only = read_compressed_block(&mut cursor).unwrap();
+        let mut decoder = Unpack50Decoder::new();
+
+        assert!(only.header.is_last, "a still member was cut up anyway");
+        assert_eq!(
+            decoder
+                .decode_member(&encoded, 0, data.len(), false, DecodeMode::Lz)
+                .unwrap(),
+            data
+        );
+    }
+
+    #[test]
+    fn a_block_never_grows_past_the_cap() {
+        let data = vec![0u8; MAX_LZ_BLOCK_SIZE * 2 + LZ_BLOCK_SIZE];
+        let encoded = encode_lz_member_with_options(&data, 0, EncodeOptions::new(16)).unwrap();
+        let mut cursor = std::io::Cursor::new(encoded.as_slice());
+        let mut blocks = 0;
+        loop {
+            let block = read_compressed_block(&mut cursor).unwrap();
+            blocks += 1;
+            if block.header.is_last {
+                break;
+            }
+        }
+
+        // Uniform to the last byte, so only the cap can be ending these.
+        assert_eq!(blocks, 3, "the cap stopped ending blocks");
+    }
+
+    #[test]
+    fn the_splitter_reads_only_what_both_writers_can_see() {
+        // The streaming writer decides with the open block's bytes and the next
+        // chunk, and nothing else. Same bytes in, same answer, however the
+        // chunks were handed over.
+        let mut whole = BlockSplitter::new();
+        whole.accept(&vec![7u8; 4096]);
+        let mut piecemeal = BlockSplitter::new();
+        for _ in 0..4 {
+            piecemeal.accept(&vec![7u8; 1024]);
+        }
+
+        let next = vec![7u8; 4096];
+        assert!(whole.extends(&next));
+        assert_eq!(whole.extends(&next), piecemeal.extends(&next));
+
+        let moved: Vec<u8> = (0..4096u32).map(|index| index as u8).collect();
+        assert!(!whole.extends(&moved), "a block swallowed unlike data");
+        assert_eq!(whole.extends(&moved), piecemeal.extends(&moved));
     }
 
     /// Words drawn from a small vocabulary in a repeating-but-not-periodic

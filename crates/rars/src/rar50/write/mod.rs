@@ -606,6 +606,11 @@ fn source_integrity(
 /// 16 MiB window: the pages behind the untouched slots never become resident.
 /// The charge covers the allocation anyway, since data that does fill the
 /// window will touch them.
+///
+/// `block_size` is the largest block the parse can be holding, not the size the
+/// reader asks for: a block grows past that when the data it covers is not
+/// moving, and the parse's arrays grow with it. See
+/// [`crate::codec::rar50::MAX_LZ_BLOCK_SIZE`].
 fn streaming_lz_workspace(dictionary_size: u64, block_size: usize, optimal_parse: bool) -> u64 {
     let per_window_byte = if optimal_parse { 9 } else { 5 };
     dictionary_size
@@ -970,7 +975,7 @@ mod tests {
         };
 
         assert_eq!(capped(1), 1024 * 1024);
-        assert_eq!(capped(2), 1024 * 1024);
+        assert_eq!(capped(2), 4 * 1024 * 1024);
         assert_eq!(capped(3), 4 * 1024 * 1024);
         assert_eq!(capped(4), 8 * 1024 * 1024);
         assert_eq!(capped(5), 16 * 1024 * 1024);
@@ -1072,8 +1077,15 @@ mod tests {
     fn a_fitted_dictionary_shrinks_to_the_workspace_budget() {
         let options = WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
             .with_compression_level(3);
-        let block = crate::codec::rar50::LZ_BLOCK_SIZE;
-        let room_for_256k = streaming_lz_workspace(256 * 1024, block, false);
+        // Derived exactly as the writer derives it, so the budget below is the
+        // one that admits a 256 KiB window and nothing larger. Spelling the
+        // parameters out here instead would make this test pass or fail on
+        // whether the ladder had moved since.
+        let block = crate::codec::rar50::MAX_LZ_BLOCK_SIZE;
+        let parse = encode_options_for_level(Some(3), DEFAULT_RAR50_DICTIONARY_SIZE)
+            .unwrap()
+            .optimal_parse;
+        let room_for_256k = streaming_lz_workspace(256 * 1024, block, parse);
 
         // A budget that cannot hold the fitted window takes the largest one it
         // can, rather than failing a write the old 128 KiB default would have
@@ -1081,7 +1093,7 @@ mod tests {
         let fitted = dictionary_size_for_options(options, 8 * 1024 * 1024, room_for_256k).unwrap();
 
         assert_eq!(fitted, 256 * 1024);
-        assert!(streaming_lz_workspace(fitted, block, false) <= room_for_256k);
+        assert!(streaming_lz_workspace(fitted, block, parse) <= room_for_256k);
         // A dictionary the caller named is used as asked, so the write fails
         // later saying what it needed instead of quietly writing something else.
         assert_eq!(
@@ -1108,29 +1120,6 @@ mod tests {
             options,
             None,
         )
-    }
-
-    /// Encodes with each candidate and keeps the smallest, which is what the
-    /// writer does across a level's options.
-    fn encode_member_with_filter_policy_candidates(
-        data: &[u8],
-        algorithm_version: u8,
-        policy: &FilterPolicy,
-        candidates: &[EncodeOptions],
-    ) -> Result<Vec<u8>> {
-        let mut candidates = candidates.iter().copied();
-        let first = candidates.next().ok_or(Error::InvalidHeader(
-            "RAR 5 compression level has no encoder options",
-        ))?;
-        let mut best = encode_member_with_filter_policy(data, algorithm_version, policy, first)?;
-        for options in candidates {
-            let packed =
-                encode_member_with_filter_policy(data, algorithm_version, policy, options)?;
-            if packed.len() < best.len() {
-                best = packed;
-            }
-        }
-        Ok(best)
     }
 
     fn encode_member_with_auto_size_filter(
@@ -1367,13 +1356,17 @@ mod tests {
             data.extend_from_slice(b"parallel block identity payload ");
             data.extend_from_slice(&index.to_le_bytes());
         }
+        // A stretch that does not move, so the two loops have to agree about
+        // growing a block and not only about cutting one every block_size.
+        data.extend(std::iter::repeat_n(0u8, 3 * 1024 * 1024));
+        data.extend((0..400_000u32).map(|index| (index as u8).wrapping_mul(37)));
         let options = WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only());
         let dictionary_size =
             dictionary_size_for_options(options, data.len() as u64, u64::MAX).unwrap();
         let algorithm_version = rar50_algorithm_version(options, dictionary_size).unwrap();
         let encode_options =
             encode_options_for_level(options.compression_level, dictionary_size).unwrap();
-        let block_size = 1024 * 1024;
+        let block_size = crate::codec::rar50::LZ_BLOCK_SIZE;
         let mut serial = Vec::new();
         crate::codec::rar50::encode_lz_reader_to(
             &mut Cursor::new(&data),
@@ -1387,8 +1380,11 @@ mod tests {
         .unwrap();
 
         let source = EntrySource::from_bytes(Arc::<[u8]>::from(data));
-        let required =
-            streaming_lz_workspace(dictionary_size, block_size, encode_options.optimal_parse);
+        let required = streaming_lz_workspace(
+            dictionary_size,
+            crate::codec::rar50::MAX_LZ_BLOCK_SIZE,
+            encode_options.optimal_parse,
+        );
         let mut prepared = compress::compress_members_reporting(
             &[source],
             compress::CompressPlan {
@@ -1653,33 +1649,40 @@ mod tests {
     }
 
     #[test]
-    fn only_the_top_level_pays_for_the_optimal_parse() {
-        for level in 0..=4u8 {
+    fn only_the_bottom_of_the_ladder_settles_for_a_greedy_parse() {
+        // Level 1 is the rung that exists to be quick. Everything above it
+        // parses by shortest path, because on this corpus nothing else closes
+        // the distance to WinRAR at any rung: the parse is worth several
+        // percent and the search depth around it is worth tenths.
+        for level in 0..=1u8 {
             let options =
                 encode_options_for_level(Some(level), DEFAULT_RAR50_DICTIONARY_SIZE).unwrap();
             assert!(!options.optimal_parse, "level {level} priced every path");
         }
-        let five = encode_options_for_level(Some(5), DEFAULT_RAR50_DICTIONARY_SIZE).unwrap();
-        assert!(five.optimal_parse);
+        for level in 2..=5u8 {
+            let options =
+                encode_options_for_level(Some(level), DEFAULT_RAR50_DICTIONARY_SIZE).unwrap();
+            assert!(options.optimal_parse, "level {level} settled for greedy");
+        }
         assert!(
-            !encode_options_for_level(None, DEFAULT_RAR50_DICTIONARY_SIZE)
+            encode_options_for_level(None, DEFAULT_RAR50_DICTIONARY_SIZE)
                 .unwrap()
                 .optimal_parse,
-            "an absent level is the default level, which is not the top of the ladder",
+            "an absent level is the default level, which parses by shortest path",
         );
+    }
 
-        // The fallbacks exist to catch a member that packs smaller with less
-        // search. They are levels one to four, so none of them pays for the
-        // parse a second time.
-        let candidates =
-            encode_option_candidates_for_level(Some(5), DEFAULT_RAR50_DICTIONARY_SIZE).unwrap();
-        assert_eq!(
-            candidates
-                .iter()
-                .filter(|options| options.optimal_parse)
-                .count(),
-            1,
-        );
+    #[test]
+    fn every_level_encodes_the_member_once() {
+        // Level 5 used to try levels four down to one as well and keep the
+        // smallest. Over the whole bench corpus that caught one byte, on one
+        // member, for four extra whole-member encodes.
+        for level in 0..=5u8 {
+            let candidates =
+                encode_option_candidates_for_level(Some(level), DEFAULT_RAR50_DICTIONARY_SIZE)
+                    .unwrap();
+            assert_eq!(candidates.len(), 1, "level {level} encodes more than once");
+        }
     }
 
     #[test]
@@ -1698,7 +1701,10 @@ mod tests {
     }
 
     #[test]
-    fn non_solid_level_five_considers_lower_level_parse_fallbacks() {
+    fn the_ladder_never_packs_larger_as_it_climbs() {
+        // A rung that costs more time and returns more bytes is a bug, and it
+        // was one: level 4 used to return level 3's output for half again the
+        // time, because the shortest-path parse only started at level 5.
         let long_tail = b"stable long match payload for RAR5 best-level search ".repeat(10);
         let mut data = Vec::new();
         data.extend_from_slice(b"abc");
@@ -1712,39 +1718,34 @@ mod tests {
         data.extend_from_slice(b"abc");
         data.extend_from_slice(&long_tail);
 
-        let level_five = encode_options_for_level(Some(5), DEFAULT_RAR50_DICTIONARY_SIZE).unwrap();
-        let fallback_candidates =
-            encode_option_candidates_for_level(Some(5), DEFAULT_RAR50_DICTIONARY_SIZE).unwrap();
-        assert!(fallback_candidates.len() > 1);
+        let mut previous: Option<(u8, usize)> = None;
+        for level in 1..=5u8 {
+            let options =
+                encode_options_for_level(Some(level), DEFAULT_RAR50_DICTIONARY_SIZE).unwrap();
+            let packed =
+                encode_member_with_filter_policy(&data, 0, &FilterPolicy::None, options).unwrap();
 
-        let level_five_only =
-            encode_member_with_filter_policy(&data, 0, &FilterPolicy::None, level_five).unwrap();
-        let chosen = encode_member_with_filter_policy_candidates(
-            &data,
-            0,
-            &FilterPolicy::None,
-            &fallback_candidates,
-        )
-        .unwrap();
+            if let Some((lower, size)) = previous {
+                assert!(
+                    packed.len() <= size,
+                    "level {level} packed larger than level {lower}: {} against {size}",
+                    packed.len(),
+                );
+            }
+            previous = Some((level, packed.len()));
 
-        assert!(
-            chosen.len() <= level_five_only.len(),
-            "candidate fallback should not choose a larger parse: level5={} chosen={}",
-            level_five_only.len(),
-            chosen.len()
-        );
-
-        let mut decoder = crate::codec::rar50::Unpack50Decoder::new();
-        let output = decoder
-            .decode_member(
-                &chosen,
-                0,
-                data.len(),
-                false,
-                crate::codec::rar50::DecodeMode::Lz,
-            )
-            .unwrap();
-        assert_eq!(output, data);
+            let mut decoder = crate::codec::rar50::Unpack50Decoder::new();
+            let output = decoder
+                .decode_member(
+                    &packed,
+                    0,
+                    data.len(),
+                    false,
+                    crate::codec::rar50::DecodeMode::Lz,
+                )
+                .unwrap();
+            assert_eq!(output, data, "level {level} did not round trip");
+        }
     }
 
     #[test]

@@ -193,30 +193,51 @@ pub(super) fn encode_options_for_level(
         // bytes off that member and half a second off the encode, because a
         // longer match covers ground the finder then does not have to search.
         // Four is worse than one, which is its own question (#83).
-        .with_lazy_matching(level >= 3)
+        .with_lazy_matching(level >= 2)
         .with_lazy_lookahead(2)
-        // Pricing the whole block and keeping the cheapest path takes 2.4% off
-        // a stripped ELF and 4.3% off manpage text against lazy matching at the
-        // same search depth, and costs six times the time. That trade belongs
-        // at the top of the ladder and nowhere else: level 3 is the default.
-        .with_optimal_parse(level >= 5)
+        // Everything above level 1 parses by shortest path.
+        //
+        // This used to start at level 5, which left three rungs in the middle
+        // doing something that could not close the distance to WinRAR whatever
+        // it was tuned to. Measured over the bench corpus against each level's
+        // own WinRAR, byte weighted, as the parse moved down the ladder:
+        //
+        // ```text
+        // parse from   m2       m3       m4       m5
+        // level 5   +7.27%   +4.13%   +4.16%   -0.38%
+        // level 4   +7.27%   +4.13%   -0.39%   -0.38%
+        // level 3   +3.36%   -0.62%   -0.39%   -0.38%
+        // level 2   -2.07%   -0.65%   -0.42%   -0.41%
+        // ```
+        //
+        // Search depth is worth tenths of a percent across that whole range and
+        // the parse is worth several, so there is no setting of the other knobs
+        // that makes a greedy rung competitive. What the depth still buys is
+        // the ordering: at 32, 128, 256 and 512 candidates the parse packs
+        // steadily smaller for steadily more time, which is what a level is.
+        //
+        // Level 1 keeps the greedy parse. It is the rung that exists to be
+        // quick, it already beats WinRAR's own level 1 by 2.71%, and it is the
+        // only place left to go when the parse is too slow for the job.
+        .with_optimal_parse(level >= 2)
         .with_max_match_distance(max_match_distance))
 }
 
+/// The encoder settings to try for a level, smallest output kept.
+///
+/// One, now. Level 5 used to try levels 4 down to 1 as well, to catch a member
+/// that packs smaller with less search. Over the whole bench corpus it caught
+/// one byte, on one member, for four extra whole-member encodes; dropping it
+/// took 28% off level 5's time and nothing off its output.
+///
+/// The shape stays because the caller still asks a list, and because a future
+/// setting that genuinely competes rather than merely searches less would go
+/// here.
 pub(super) fn encode_option_candidates_for_level(
     level: Option<u8>,
     dictionary_size: u64,
 ) -> Result<Vec<EncodeOptions>> {
-    let mut candidates = vec![encode_options_for_level(level, dictionary_size)?];
-    if resolved_level(level) == 5 {
-        for fallback_level in (1..5).rev() {
-            candidates.push(encode_options_for_level(
-                Some(fallback_level),
-                dictionary_size,
-            )?);
-        }
-    }
-    Ok(candidates)
+    Ok(vec![encode_options_for_level(level, dictionary_size)?])
 }
 
 pub(super) fn rar50_algorithm_version(options: WriterOptions, dictionary_size: u64) -> Result<u8> {
@@ -265,9 +286,14 @@ pub(super) fn compression_method_for_level(level: Option<u8>) -> Result<u8> {
 /// number cannot serve both, so the level picks, which is what a level is for.
 /// Text keeps paying up to about 8 MiB; binaries stop at 4 and are slightly
 /// worse by 16.
+///
+/// Level 2 was raised off the 1 MiB floor when it gained the shortest-path
+/// parse: on 4 MiB of manpage text it took 24,315 bytes off for a tenth of a
+/// second, which is the same trade level 3 was already making.
 fn fitted_dictionary_cap(level: u8) -> u64 {
     let megabytes = match level {
-        0..=2 => 1,
+        0..=1 => 1,
+        2 => 4,
         3 => 4,
         4 => 8,
         _ => 16,
@@ -316,7 +342,7 @@ pub(super) fn dictionary_size_for_options(
             while fitted > DEFAULT_RAR50_DICTIONARY_SIZE
                 && super::streaming_lz_workspace(
                     fitted,
-                    crate::codec::rar50::LZ_BLOCK_SIZE,
+                    crate::codec::rar50::MAX_LZ_BLOCK_SIZE,
                     optimal_parse,
                 ) > memory_limit
             {
