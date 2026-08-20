@@ -917,6 +917,22 @@ fn encode_filter_data(
     }
 }
 
+/// Transforms the member and cuts it into the blocks a filter record can
+/// describe, then compresses those blocks against one search state.
+///
+/// The transform runs first and over the whole member, because the search has
+/// to read final bytes: a block reaches back into the ones before it, and a
+/// match must point at what the decoder will really have. Each block still
+/// gets its own records covering only its own bytes, so a filtered range
+/// spanning several blocks converts exactly as it did when each block was
+/// transformed alone: the transform reads an absolute file offset, which the
+/// cut does not change.
+///
+/// Blocks used to be compressed one at a time, each against a fresh copy of
+/// the history behind it and a finder rebuilt from that copy. That is the
+/// cost [`encode_lz_member_inner`] took off the unfiltered path and left
+/// here: at 64 KiB a block, a four-megabyte member re-copied and re-inserted
+/// 126 MiB of history, thirty-one times what it holds.
 fn filtered_lz_blocks(
     data: &[u8],
     filters: &[crate::FilterSpec],
@@ -926,53 +942,66 @@ fn filtered_lz_blocks(
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<u8>> {
     let filters = normalized_filter_specs(data.len(), filters)?;
-    let mut out = Vec::new();
-    let mut block_history =
-        history[history.len().saturating_sub(options.max_match_distance)..].to_vec();
+    let history = &history[history.len().saturating_sub(options.max_match_distance)..];
+    let start = history.len();
+    let mut combined = Vec::with_capacity(start + data.len());
+    combined.extend_from_slice(history);
+    combined.extend_from_slice(data);
+
+    let mut blocks: Vec<(Range<usize>, Vec<EncodeFilter>)> = Vec::new();
     let mut chunk_start = 0usize;
     while chunk_start < data.len() {
         let chunk_end = (chunk_start + FILTERED_LZ_BLOCK_SIZE).min(data.len());
-        let mut chunk = data[chunk_start..chunk_end].to_vec();
         let mut records = Vec::new();
         for filter in &filters {
-            let start = filter.range.start.max(chunk_start);
-            let end = filter.range.end.min(chunk_end);
-            if start >= end {
+            let filter_start = filter.range.start.max(chunk_start);
+            let filter_end = filter.range.end.min(chunk_end);
+            if filter_start >= filter_end {
                 continue;
             }
-            let local_start = start - chunk_start;
-            let local_end = end - chunk_start;
-            let (filter_type, channels) =
-                encode_filter_data(filter.kind, &mut chunk[local_start..local_end], start)?;
+            let (filter_type, channels) = encode_filter_data(
+                filter.kind,
+                &mut combined[start + filter_start..start + filter_end],
+                filter_start,
+            )?;
             records.push(EncodeFilter {
-                offset: local_start,
-                length: local_end - local_start,
+                offset: filter_start - chunk_start,
+                length: filter_end - filter_start,
                 filter_type,
                 channels,
             });
         }
+        blocks.push((chunk_start..chunk_end, records));
+        chunk_start = chunk_end;
+    }
+
+    // One search state for the whole member, as the unfiltered path has.
+    let mut lazy = (!options.optimal_parse).then(|| member_finder(&combined, start, options));
+    let mut collector = options
+        .optimal_parse
+        .then(|| OptimalCollector::new(&combined, start, options));
+
+    let mut out = Vec::new();
+    for (block, records) in blocks {
         let mut chunk_progress = |position: usize| {
             progress
                 .as_deref_mut()
-                .is_none_or(|report| report(chunk_start.saturating_add(position)))
+                .is_none_or(|report| report(block.start.saturating_add(position)))
         };
-        out.extend(encode_lz_block(
-            &chunk,
-            &block_history,
+        out.extend(encode_lz_block_in_window(
+            &combined,
+            start + block.start..start + block.end,
+            match (&mut lazy, &mut collector) {
+                (Some(finder), _) => MemberSearch::Lazy(finder),
+                (_, Some(collector)) => MemberSearch::Optimal(collector),
+                _ => MemberSearch::Fresh,
+            },
             algorithm_version,
             &records,
             options,
-            chunk_end == data.len(),
+            block.end == data.len(),
             Some(&mut chunk_progress),
         )?);
-        block_history.extend_from_slice(&chunk);
-        let keep_from = block_history
-            .len()
-            .saturating_sub(options.max_match_distance);
-        if keep_from != 0 {
-            block_history.drain(..keep_from);
-        }
-        chunk_start = chunk_end;
     }
     Ok(out)
 }
@@ -4839,6 +4868,47 @@ mod tests {
                 .decode_member(&encoded, 0, data.len(), false, DecodeMode::Lz)
                 .unwrap(),
             data
+        );
+    }
+
+    /// The window a filtered member is parsed in reaches back into the
+    /// history the solid stream carries, and keeps reaching for every block
+    /// of it rather than only the first. Each block used to be handed its own
+    /// copy of that history and its own finder rebuilt from it, which cost
+    /// the member a re-insert per block and reached exactly this far.
+    #[test]
+    fn a_solid_filtered_member_matches_history_from_every_block() {
+        // Bytes that do not compress on their own, so matching the history is
+        // the only way this member gets small.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut earlier = Vec::with_capacity(FILTERED_LZ_BLOCK_SIZE * 3);
+        while earlier.len() < FILTERED_LZ_BLOCK_SIZE * 3 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            earlier.extend_from_slice(&state.to_le_bytes());
+        }
+        earlier[512] = 0xe8;
+        earlier[513..517].copy_from_slice(&0x30u32.to_le_bytes());
+        // Repeating what came before means every block of this member, not
+        // just its first, has something to match against the history.
+        let data = earlier.clone();
+        let filter = crate::FilterSpec::range(crate::FilterKind::E8, 0..data.len());
+
+        let mut solid = Unpack50Encoder::with_options(EncodeOptions::new(16));
+        solid.remember(&earlier);
+        let against_history = solid
+            .encode_member_with_filter(&data, 0, filter.clone())
+            .unwrap();
+        let alone = Unpack50Encoder::with_options(EncodeOptions::new(16))
+            .encode_member_with_filter(&data, 0, filter)
+            .unwrap();
+
+        assert!(
+            against_history.len() * 20 < alone.len(),
+            "a member repeating its history packed to {} against {alone} on its own",
+            against_history.len(),
+            alone = alone.len(),
         );
     }
 
