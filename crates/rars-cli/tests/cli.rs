@@ -5,7 +5,7 @@ use rars::crc32::crc32;
 use rars::rar13::{write_stored_archive, StoredEntry, WriterOptions};
 use rars::rar15_40;
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, UNIX_EPOCH};
@@ -508,7 +508,13 @@ fn rejects_output_path_that_is_existing_symlink() {
     fs::create_dir_all(&out_dir).unwrap();
     fs::write(&target, b"do not overwrite\n").unwrap();
     std::os::unix::fs::symlink(&target, out_dir.join("link.txt")).unwrap();
-    std::os::unix::fs::symlink(&target, out_dir.join("LINK.TXT")).unwrap();
+    // Same path on a case insensitive filesystem, so EEXIST is fine here:
+    // the entry still extracts onto a symlink.
+    match std::os::unix::fs::symlink(&target, out_dir.join("LINK.TXT")) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(err) => panic!("failed to create upper case symlink: {err}"),
+    }
     let bytes = write_stored_archive(
         &[StoredEntry {
             name: b"link.txt",
