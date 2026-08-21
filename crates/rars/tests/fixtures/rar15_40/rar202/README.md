@@ -11,13 +11,16 @@ These archives pin three RAR 2.x behaviors:
 - RAR 2.0 `CRYPT_RAR20` encrypted compressed members (`comment_psw.rar`,
   password `password`).
 
-unrar 7.20 counts one silent error per comment-bearing header in these files
-and exits 3, because its second header CRC check (`arcread.cpp`, the
-`GetCRC15(false)` one after the block switch) has no exemption for the comment
-the first check skips. Members still test and extract correctly. Any archive
-written this way, by us or by WinRAR, gets the same treatment, so a non-zero
-unrar exit code on a file-comment archive is expected and not a sign the writer
-has broken.
+unrar 7.20 counts one silent error per comment-bearing header in these files.
+Both archives hold three such headers, the main-header comment and one per
+file, and both report `Total errors: 3` and exit 3 while every member still
+tests OK. So unrar checks the header CRC a second time somewhere past the
+point that skips the comment bytes, and that second check has no matching
+exemption.
+
+These are WinRAR 2.02's own archives, so a non-zero unrar exit code on a
+comment-bearing RAR 2.x file is expected and not a sign our writer has
+broken.
 
 Payloads:
 
