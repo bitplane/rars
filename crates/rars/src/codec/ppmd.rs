@@ -1469,6 +1469,28 @@ impl PpmdEncoder {
         })
     }
 
+    /// Carries a model from one block into the next.
+    ///
+    /// A block that clears the reset bit in its header leaves the reader's
+    /// model alone and only re-reads the range coder, so a solid chain can keep
+    /// one model across every member in it. Each block still gets a fresh range
+    /// coder, which is what lets a member's packed bytes start on a byte
+    /// boundary of their own.
+    pub fn continuing(model: PpmdDecoder, esc_char: u8) -> Self {
+        Self {
+            model,
+            range: RangeEncoder::new(),
+            esc_char,
+        }
+    }
+
+    /// Ends the block and hands the model back for the next one to continue.
+    pub fn finish_keeping_model(mut self) -> Result<(Vec<u8>, PpmdDecoder)> {
+        self.model.encode_symbol(self.esc_char, &mut self.range)?;
+        self.model.encode_symbol(2, &mut self.range)?;
+        Ok((self.range.finish(), self.model))
+    }
+
     pub fn encode_literal(&mut self, symbol: u8) -> Result<()> {
         self.model.encode_symbol(symbol, &mut self.range)?;
         if symbol == self.esc_char {
@@ -1526,11 +1548,6 @@ impl PpmdEncoder {
         8.0 * self.range.out.len() as f64 - f64::from(self.range.range.max(1)).log2()
     }
 
-    pub fn finish(mut self) -> Result<Vec<u8>> {
-        self.model.encode_symbol(self.esc_char, &mut self.range)?;
-        self.model.encode_symbol(2, &mut self.range)?;
-        Ok(self.range.finish())
-    }
 }
 
 #[derive(Debug, Clone, Copy)]

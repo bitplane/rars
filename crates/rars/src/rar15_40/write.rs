@@ -9,7 +9,7 @@ use crate::codec::rar20::{
 use crate::codec::rar29::{
     unpack29_encode_literals, unpack29_encode_literals_with_options,
     unpack29_encode_literals_with_options_and_progress, unpack29_encode_ppmd,
-    unpack29_encode_ppmd_literals, unpack29_encode_ppmd_with_filter,
+    unpack29_encode_ppmd_literals, unpack29_encode_ppmd_with_filter, ChainEngine,
     EncodeOptions as Rar29EncodeOptions, Unpack29Encoder,
 };
 use crate::crc32::Crc32;
@@ -1669,9 +1669,26 @@ fn encode_compressed_payload(
         (
             ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40,
             Some(SolidEncoder::Rar29(encoder)),
-        ) => encoder
-            .encode_member_with_progress(data, &mut advance)
-            .map_err(map_codec_cancel),
+        ) => {
+            // A chain used to be LZ and nothing else, so a solid archive got no
+            // PPMd at all and an explicit --method ppmd was quietly ignored. It
+            // is the same content question here as in a non-solid archive, so
+            // it gets the same answer and the same gate: a level willing to
+            // encode the member twice, and content that looks like PPMd will
+            // win on it.
+            let level = compression_method_for_level(options)?.saturating_sub(0x30);
+            let engine = match options.method {
+                Rar29Method::Lz => ChainEngine::Lz,
+                Rar29Method::Ppmd => ChainEngine::Ppmd,
+                Rar29Method::Auto if ppmd_trial_pays(level) && is_text_ppmd_candidate(data) => {
+                    ChainEngine::Smaller
+                }
+                Rar29Method::Auto => ChainEngine::Lz,
+            };
+            encoder
+                .encode_member_with_engine(data, engine, &mut advance)
+                .map_err(map_codec_cancel)
+        }
         _ => Err(Error::UnsupportedVersion(target)),
     }
 }

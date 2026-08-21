@@ -317,10 +317,39 @@ fn encode_ppmd_block(
     initial_filters: &[Vec<u8>],
     max_match_distance: usize,
 ) -> Result<Vec<u8>> {
+    encode_ppmd_block_with_model(input, lz_escapes, initial_filters, max_match_distance, None)
+        .map(|(packed, _)| packed)
+}
+
+/// Codes one PPMd block, either starting a model or carrying one on.
+///
+/// The header byte's 0x20 bit tells the reader to throw its model away and
+/// build a new one from the order and dictionary size that follow. Clearing it
+/// leaves the reader's model where it is, which is how a solid chain gets a
+/// model that has already read every member before this one. WinRAR does this
+/// on 67 of the 68 PPMd blocks in a solid archive of 70 small files, and the
+/// difference is most of why that archive is 18% smaller than ours was.
+///
+/// The model comes back out so the next block can continue it in turn.
+fn encode_ppmd_block_with_model(
+    input: &[u8],
+    lz_escapes: bool,
+    initial_filters: &[Vec<u8>],
+    max_match_distance: usize,
+    model: Option<PpmdDecoder>,
+) -> Result<(Vec<u8>, PpmdDecoder)> {
     let mut out = Vec::new();
-    out.push(0x80 | 0x20 | ((PPMD_ORDER as u8) - 1));
-    out.push(PPMD_DICTIONARY_MB - 1);
-    let mut encoder = PpmdEncoder::new(PPMD_ORDER, PPMD_ESC, usize::from(PPMD_DICTIONARY_MB))?;
+    let mut encoder = match model {
+        Some(model) => {
+            out.push(0x80 | ((PPMD_ORDER as u8) - 1));
+            PpmdEncoder::continuing(model, PPMD_ESC)
+        }
+        None => {
+            out.push(0x80 | 0x20 | ((PPMD_ORDER as u8) - 1));
+            out.push(PPMD_DICTIONARY_MB - 1);
+            PpmdEncoder::new(PPMD_ORDER, PPMD_ESC, usize::from(PPMD_DICTIONARY_MB))?
+        }
+    };
     for record in initial_filters {
         encoder.encode_vm_filter_record(record)?;
     }
@@ -331,8 +360,9 @@ fn encode_ppmd_block(
             encoder.encode_literal(byte)?;
         }
     }
-    out.extend_from_slice(&encoder.finish()?);
-    Ok(out)
+    let (packed, model) = encoder.finish_keeping_model()?;
+    out.extend_from_slice(&packed);
+    Ok((out, model))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -512,6 +542,21 @@ impl Default for EncodeOptions {
     }
 }
 
+/// Which engine a member of a solid chain is coded with.
+///
+/// A chain used to be LZ and nothing else. Both engines keep state that carries
+/// from member to member, so this is a per-member choice inside one chain
+/// rather than a property of the archive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainEngine {
+    Lz,
+    Ppmd,
+    /// Code it both ways and keep whichever is smaller. Worth asking for when
+    /// the content might go either way, and not otherwise: it doubles the work
+    /// and copying the model to try costs more the longer the chain has run.
+    Smaller,
+}
+
 #[derive(Debug, Clone)]
 pub struct Unpack29Encoder {
     history: Vec<u8>,
@@ -522,6 +567,11 @@ pub struct Unpack29Encoder {
     /// out. A reader clears it on a member that does not continue a chain, and
     /// so does a fresh encoder.
     levels: [u8; TABLE_COUNT],
+    /// The PPMd model a reader holds, once some member in the chain has built
+    /// one. A reader keeps it across every block that does not ask for a reset,
+    /// LZ blocks included, so a member can go PPMd against everything the chain
+    /// has read even when the member before it went LZ.
+    ppmd: Option<PpmdDecoder>,
 }
 
 impl Default for Unpack29Encoder {
@@ -540,6 +590,7 @@ impl Unpack29Encoder {
             history: Vec::new(),
             options,
             levels: [0; TABLE_COUNT],
+            ppmd: None,
         }
     }
 
@@ -555,20 +606,64 @@ impl Unpack29Encoder {
         Ok(packed)
     }
 
-    pub(crate) fn encode_member_with_progress(
+    /// Codes one member of a solid chain with the engine the caller asked for.
+    ///
+    /// Both engines carry state across the chain and only one of them can be
+    /// right for a given member, so the loser's state is thrown away: an LZ
+    /// member must not advance the reader's PPMd model, and a PPMd member must
+    /// not advance its code-length table. What both advance is the window,
+    /// since the reader's window is fed by whichever engine wrote the bytes.
+    pub(crate) fn encode_member_with_engine(
         &mut self,
         input: &[u8],
+        engine: ChainEngine,
         progress: &mut dyn FnMut(usize) -> bool,
     ) -> Result<Vec<u8>> {
-        let packed = encode_member_with_options_and_progress(
+        if engine == ChainEngine::Ppmd {
+            let (packed, model) = self.encode_ppmd_member(input)?;
+            self.ppmd = Some(model);
+            self.remember(input);
+            return Ok(packed);
+        }
+
+        let mut levels = self.levels;
+        let lz = encode_member_with_options_and_progress(
             input,
             &self.history,
             self.options,
-            &mut self.levels,
+            &mut levels,
             progress,
         )?;
+
+        let ppmd = match engine {
+            ChainEngine::Smaller => Some(self.encode_ppmd_member(input)?),
+            _ => None,
+        };
+
+        let packed = match ppmd.filter(|(packed, _)| packed.len() < lz.len()) {
+            Some((packed, model)) => {
+                self.ppmd = Some(model);
+                packed
+            }
+            None => {
+                self.levels = levels;
+                lz
+            }
+        };
         self.remember(input);
         Ok(packed)
+    }
+
+    /// Codes the member against a copy of the chain's model, so a trial that
+    /// loses leaves the reader's model where the winning member expects it.
+    fn encode_ppmd_member(&self, input: &[u8]) -> Result<(Vec<u8>, PpmdDecoder)> {
+        encode_ppmd_block_with_model(
+            input,
+            true,
+            &[],
+            self.options.max_match_distance,
+            self.ppmd.clone(),
+        )
     }
 
     pub fn encode_member_with_filter(
@@ -3471,8 +3566,8 @@ mod tests {
         encoded_filter_records_at, itanium_decode, itanium_encode, lazy_match_decision,
         level_code_lengths, split_large_filter, unpack29_decode, unpack29_encode_literals,
         unpack29_encode_ppmd, unpack29_encode_ppmd_literals, unpack29_encode_ppmd_with_filter,
-        BitReader, BitWriter, EncodeOptions, EncodeToken, EncoderMatchState, Error, Huffman,
-        LevelToken, MatchCandidate, OwnedVmFilterRecord, PpmdEncodeToken, PpmdEncoder,
+        BitReader, BitWriter, ChainEngine, EncodeOptions, EncodeToken, EncoderMatchState, Error,
+        Huffman, LevelToken, MatchCandidate, OwnedVmFilterRecord, PpmdEncodeToken, PpmdEncoder,
         Rar29MatchFinder, Result, StandardFilter, Unpack29, Unpack29Encoder, VmFilter, VmProgram,
         VmProgramKind, MAIN_COUNT, MAX_ENCODER_MATCH_OFFSET, MAX_MATCH_CANDIDATES,
         MAX_VM_AUDIO_FILTER_BLOCK_SIZE, MAX_VM_DELTA_FILTER_BLOCK_SIZE, MAX_VM_FILTER_BLOCK_SIZE,
@@ -3520,6 +3615,133 @@ mod tests {
             outright.iter().any(|token| (1..16).contains(&token.symbol)),
             "the same table coded outright has to name its lengths"
         );
+    }
+
+    /// Members that share a shape and a vocabulary without repeating each
+    /// other. Every line carries a number that appears nowhere else, so there
+    /// is little for the chain to match and the PPMd model is what carries
+    /// between one member and the next.
+    fn related_text_member(seed: u64, lines: usize) -> Vec<u8> {
+        const WORDS: [&str; 12] = [
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+            "juliet", "kilo", "lima",
+        ];
+        let mut state = seed | 1;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut out = Vec::new();
+        for line in 0..lines {
+            for _ in 0..3 {
+                out.extend_from_slice(WORDS[(next() % 12) as usize].as_bytes());
+                out.push(b'.');
+            }
+            out.extend_from_slice(
+                format!(
+                    "{} = {}\n",
+                    line + seed as usize * lines,
+                    next() % 1_000_000_007
+                )
+                .as_bytes(),
+            );
+        }
+        out
+    }
+
+    /// WinRAR asks for a PPMd reset on 1 of the 68 PPMd blocks in a solid
+    /// archive of 70 small files and carries the model through the other 67.
+    /// Building a model per member instead is most of why that archive used to
+    /// be 18% smaller than ours.
+    #[test]
+    fn a_solid_chain_carries_one_ppmd_model_across_its_members() {
+        // Members small enough that a model built for one alone never warms up,
+        // which is the shape the win is really about: 70 manpages, not one book.
+        let members: Vec<Vec<u8>> = (0..12).map(|i| related_text_member(i + 1, 40)).collect();
+        let mut chain = Unpack29Encoder::with_options(EncodeOptions::default());
+        let packed: Vec<Vec<u8>> = members
+            .iter()
+            .map(|member| {
+                chain
+                    .encode_member_with_engine(member, ChainEngine::Smaller, &mut |_| true)
+                    .unwrap()
+            })
+            .collect();
+
+        // Which engine wins a given member is a size question and not the
+        // point here. The point is that once one member has built a model, no
+        // later member throws it away.
+        let ppmd: Vec<&Vec<u8>> = packed.iter().filter(|block| block[0] & 0x80 != 0).collect();
+        assert!(
+            ppmd.len() > 2,
+            "this chain was meant to go PPMd more than twice"
+        );
+        assert_eq!(
+            ppmd[0][0] & 0x20,
+            0x20,
+            "the first PPMd member builds a model"
+        );
+        assert!(
+            ppmd[1..].iter().all(|block| block[0] & 0x20 == 0),
+            "no member after the first should throw the model away"
+        );
+
+        // The same member, coded by a chain that has read nothing.
+        let alone = Unpack29Encoder::with_options(EncodeOptions::default())
+            .encode_member_with_engine(members.last().unwrap(), ChainEngine::Smaller, &mut |_| true)
+            .unwrap();
+        let last = ppmd.last().unwrap();
+        assert!(
+            last.len() * 6 < alone.len() * 5,
+            "a member coded against the chain's model cost {} bytes against {} on its own",
+            last.len(),
+            alone.len()
+        );
+    }
+
+    /// Both engines carry state and only the winner's may advance, or the
+    /// reader is left holding something the writer never wrote.
+    #[test]
+    fn a_solid_chain_mixing_engines_round_trips() {
+        let mut members: Vec<Vec<u8>> = Vec::new();
+        for index in 0..3u64 {
+            members.push(related_text_member(index + 1, 200));
+            // Bytes PPMd loses on, so the chain has to switch engines and back.
+            let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ index;
+            let mut noise = Vec::new();
+            while noise.len() < 20_000 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                noise.extend_from_slice(&state.to_le_bytes());
+            }
+            members.push(noise);
+        }
+
+        let mut chain = Unpack29Encoder::with_options(EncodeOptions::default());
+        let mut stream = Vec::new();
+        let mut engines = Vec::new();
+        for member in &members {
+            let packed = chain
+                .encode_member_with_engine(member, ChainEngine::Smaller, &mut |_| true)
+                .unwrap();
+            engines.push(packed[0] & 0x80 != 0);
+            stream.push(packed);
+        }
+        assert!(
+            engines.contains(&true) && engines.contains(&false),
+            "this chain was meant to use both engines, got {engines:?}"
+        );
+
+        let mut decoder = Unpack29::new();
+        for (packed, member) in stream.iter().zip(&members) {
+            assert_eq!(
+                decoder.decode_member(packed, member.len()).unwrap(),
+                *member
+            );
+        }
     }
 
     /// The reader carries its table across the members of a solid chain, so
