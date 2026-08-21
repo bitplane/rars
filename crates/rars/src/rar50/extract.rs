@@ -87,8 +87,28 @@ impl FileHeader {
         Ok((Box::new(reader), Some(keys)))
     }
 
+    /// True when the header carries a BLAKE2sp record this build can check.
+    ///
+    /// That record is the authoritative check, and the header's CRC32 is not
+    /// evaluated beside it. Measured on RAR 7.12 and unrar 7.20 with a file
+    /// header carrying both: a deliberately wrong CRC32 next to a correct
+    /// BLAKE2sp tests clean in both readers, while a correct CRC32 next to a
+    /// corrupted BLAKE2sp is rejected by both. rars used to check both fields
+    /// and so rejected the first archive.
+    ///
+    /// WinRAR writes one or the other, never both, so this only shows up on
+    /// archives from somewhere else.
+    fn blake2sp_supersedes_crc32(&self) -> bool {
+        self.hash
+            .as_ref()
+            .is_some_and(|hash| hash.hash_type == 0 && hash.data.len() == 32)
+    }
+
     fn verify_integrity_with_keys(&self, data: &[u8], keys: Option<&Rar50Keys>) -> Result<()> {
-        if let Some(expected) = self.data_crc32 {
+        if let Some(expected) = self
+            .data_crc32
+            .filter(|_| !self.blake2sp_supersedes_crc32())
+        {
             let actual = crc32(data);
             let actual = if self.uses_hash_mac() {
                 let keys = keys.ok_or(Error::InvalidHeader(
@@ -136,7 +156,10 @@ impl FileHeader {
         hash: Option<([u8; 32], blake2sp::Hasher)>,
         keys: Option<&Rar50Keys>,
     ) -> Result<()> {
-        if let Some(expected) = self.data_crc32 {
+        if let Some(expected) = self
+            .data_crc32
+            .filter(|_| !self.blake2sp_supersedes_crc32())
+        {
             let actual = if self.uses_hash_mac() {
                 let keys = keys.ok_or(Error::InvalidHeader(
                     "RAR 5 encrypted hash MAC needs encryption keys",
@@ -943,7 +966,10 @@ impl PendingSplitRefs {
                 "RAR 5 stored split file has mismatched packed and unpacked sizes",
             ));
         }
-        if let Some(expected) = final_file.data_crc32 {
+        if let Some(expected) = final_file
+            .data_crc32
+            .filter(|_| !final_file.blake2sp_supersedes_crc32())
+        {
             let actual = if final_file.encrypted {
                 let decryptor = decryptor.ok_or(Error::InvalidHeader(
                     "RAR 5 encrypted split CRC needs encryption keys",
@@ -1644,11 +1670,19 @@ mod tests {
         let (crc, hash) = make_state();
         file.verify_streaming_integrity(crc, hash, None).unwrap();
 
+        // A wrong CRC32 alongside a valid BLAKE2sp is ignored, because the
+        // reference readers never evaluate it there. Drop the hash record and
+        // the same wrong CRC32 has to be caught.
         let (crc, hash) = make_state();
         let mut bad = file.clone();
         bad.data_crc32 = Some(crc_value ^ 0x1);
+        bad.verify_streaming_integrity(crc, hash, None).unwrap();
+
+        let (crc, _) = make_state();
+        let mut crc_only = bad.clone();
+        crc_only.hash = None;
         assert!(matches!(
-            bad.verify_streaming_integrity(crc, hash, None),
+            crc_only.verify_streaming_integrity(crc, None, None),
             Err(Error::Crc32Mismatch { .. })
         ));
 
