@@ -390,6 +390,7 @@ struct PendingSplitRefs {
     name: Vec<u8>,
     fragments: Vec<(usize, usize)>,
     file_time: u32,
+    mtime_refinement: Option<crate::TimeRefinement>,
     attr: u32,
     host_os: u8,
     method: u8,
@@ -404,6 +405,7 @@ impl PendingSplitRefs {
             name: file.name.clone(),
             fragments: vec![(volume_index, file_index)],
             file_time: file.file_time,
+            mtime_refinement: file.mtime_refinement(),
             attr: file.attr,
             host_os: file.host_os,
             method: file.method,
@@ -431,6 +433,7 @@ impl PendingSplitRefs {
         let meta = ExtractedEntryMeta {
             name: self.name.clone(),
             file_time: self.file_time,
+            mtime_refinement: self.mtime_refinement,
             attr: self.attr,
             host_os: self.host_os,
             is_directory: false,

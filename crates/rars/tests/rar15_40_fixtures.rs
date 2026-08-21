@@ -88,6 +88,43 @@ impl Write for CollectWriter {
     }
 }
 
+/// A DOS timestamp steps in two seconds and holds nothing smaller, so the
+/// extended time field carries the odd second and up to three bytes of
+/// 100-nanosecond ticks. Ignoring it costs up to a second on every RAR 1.5-4.x
+/// archive that has one.
+///
+/// The RAR 4.20 fixture exercises the whole path: present, odd second, and the
+/// full three sub-second bytes. RAR 7.12 restores it as
+/// 2026-04-27 06:54:43.704088300 UTC, which is the DOS 06:54:42 plus both
+/// parts, and rars now agrees to the nanosecond.
+#[test]
+fn decodes_the_extended_modification_time() {
+    let bytes = std::fs::read(fixture("rar420/ext_time_rar420.rar")).unwrap();
+    let archive = Archive::parse(&bytes).unwrap();
+    let file = archive.files().next().unwrap();
+
+    let refinement = file.mtime_refinement().expect("fixture carries an mtime");
+    assert!(refinement.add_second);
+    assert_eq!(refinement.nanoseconds, 704_088_300);
+
+    // The DOS field itself is unchanged: it is the base the refinement adds to.
+    assert_eq!(file.file_time & 0x1f, 42 / 2);
+    assert_eq!(file.metadata().mtime_refinement, Some(refinement));
+}
+
+/// A header without the extended field has nothing to add, and one whose mtime
+/// nibble is absent must not be read as a zero refinement either.
+#[test]
+fn reports_no_refinement_without_an_extended_time() {
+    let bytes = std::fs::read(fixture("rar300/with_comment_rar300.rar")).unwrap();
+    let archive = Archive::parse(&bytes).unwrap();
+    for file in archive.files() {
+        if file.ext_time.is_empty() {
+            assert_eq!(file.mtime_refinement(), None);
+        }
+    }
+}
+
 /// A block whose declared extent is zero leaves the next position equal to the
 /// current one, and a walk that just seeks and repeats spins there forever.
 ///

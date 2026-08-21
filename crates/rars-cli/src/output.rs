@@ -222,7 +222,11 @@ pub(crate) fn restore_output_metadata(outputs: &[ExtractedOutput]) -> std::io::R
         .iter()
         .filter(|output| output.restore_metadata && !output.meta.is_directory)
     {
-        if let Some(time) = extracted_system_time(output.family, output.meta.file_time) {
+        if let Some(time) = extracted_system_time(
+            output.family,
+            output.meta.file_time,
+            output.meta.mtime_refinement,
+        ) {
             set_modified_time(&output.path, time)?;
         }
         set_extracted_permissions(
@@ -242,7 +246,11 @@ pub(crate) fn restore_output_metadata(outputs: &[ExtractedOutput]) -> std::io::R
             output.meta.attr_source,
             true,
         )?;
-        if let Some(time) = extracted_system_time(output.family, output.meta.file_time) {
+        if let Some(time) = extracted_system_time(
+            output.family,
+            output.meta.file_time,
+            output.meta.mtime_refinement,
+        ) {
             set_modified_time(&output.path, time)?;
         }
     }

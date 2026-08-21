@@ -124,6 +124,8 @@ pub struct ExtractedEntryMeta {
     pub file_attr: u64,
     /// How to read `file_attr`, from the host OS the entry records.
     pub attr_source: AttrSource,
+    /// Detail `file_time` is too coarse to hold, when the archive carries it.
+    pub mtime_refinement: Option<TimeRefinement>,
     /// Whether the entry is a directory.
     pub is_directory: bool,
 }
@@ -136,6 +138,7 @@ impl ExtractedEntryMeta {
             file_time,
             file_attr,
             attr_source: AttrSource::Unknown,
+            mtime_refinement: None,
             is_directory,
         }
     }
@@ -144,6 +147,13 @@ impl ExtractedEntryMeta {
     #[must_use]
     pub fn with_attr_source(mut self, attr_source: AttrSource) -> Self {
         self.attr_source = attr_source;
+        self
+    }
+
+    /// Records detail `file_time` is too coarse to hold.
+    #[must_use]
+    pub fn with_mtime_refinement(mut self, refinement: Option<TimeRefinement>) -> Self {
+        self.mtime_refinement = refinement;
         self
     }
 
@@ -884,6 +894,24 @@ pub fn read_volume_member_at(
     Ok(taken)
 }
 
+/// Detail a coarse timestamp cannot hold, carried alongside it.
+///
+/// A DOS timestamp counts in two-second steps, so RAR 1.5-4.x archives put the
+/// odd second and any sub-second precision in a separate extended field. This
+/// is that field decoded: add [`add_second`](Self::add_second) whole seconds
+/// and then [`nanoseconds`](Self::nanoseconds) to the base time.
+///
+/// Kept apart from the timestamp rather than folded into it because
+/// [`ExtractedEntryMeta::file_time`] is the DOS value as stored, which has
+/// nowhere to put either part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TimeRefinement {
+    /// Whether the true time is one second later than the DOS value.
+    pub add_second: bool,
+    /// Sub-second remainder, below 1_000_000_000.
+    pub nanoseconds: u32,
+}
+
 /// How to read [`ExtractedEntryMeta::file_attr`], which depends on the host
 /// that wrote the entry.
 ///
@@ -937,6 +965,8 @@ fn rar13_meta(meta: &rar13::ExtractedEntryMeta) -> ExtractedEntryMeta {
         file_attr: u64::from(meta.file_attr),
         // RAR 1.3/1.4 is MS-DOS only.
         attr_source: AttrSource::Dos,
+        // RAR 1.3/1.4 predates the extended time field.
+        mtime_refinement: None,
         is_directory: meta.is_directory,
     }
 }
@@ -947,6 +977,7 @@ fn rar15_40_meta(meta: &rar15_40::ExtractedEntryMeta) -> ExtractedEntryMeta {
         file_time: meta.file_time,
         file_attr: u64::from(meta.attr),
         attr_source: AttrSource::rar15_40(meta.host_os),
+        mtime_refinement: meta.mtime_refinement,
         is_directory: meta.is_directory,
     }
 }
@@ -963,6 +994,8 @@ pub fn rar50_meta(meta: &rar50::ExtractedEntryMeta) -> ExtractedEntryMeta {
         file_time: meta.file_time,
         file_attr: meta.attr,
         attr_source: AttrSource::rar50(meta.host_os),
+        // RAR 5.0 resolves FHEXTRA_HTIME into file_time directly.
+        mtime_refinement: None,
         is_directory: meta.is_directory,
     }
 }
@@ -1079,6 +1112,7 @@ mod tests {
             file_time: 0,
             file_attr: 0,
             attr_source: AttrSource::Unknown,
+            mtime_refinement: None,
             is_directory: false,
         };
 

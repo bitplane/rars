@@ -1,4 +1,4 @@
-use rars::ArchiveFamily;
+use rars::{ArchiveFamily, TimeRefinement};
 use std::fs;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -39,12 +39,24 @@ pub(crate) fn source_dos_mtime(metadata: &fs::Metadata) -> u32 {
         .unwrap_or(0)
 }
 
-pub(crate) fn extracted_system_time(family: ArchiveFamily, file_time: u32) -> Option<SystemTime> {
-    match family {
+pub(crate) fn extracted_system_time(
+    family: ArchiveFamily,
+    file_time: u32,
+    refinement: Option<TimeRefinement>,
+) -> Option<SystemTime> {
+    let base = match family {
         ArchiveFamily::Rar13 | ArchiveFamily::Rar15To40 => dos_time_to_system_time(file_time),
         ArchiveFamily::Rar50Plus => unix_seconds_to_system_time(file_time),
         _ => None,
-    }
+    }?;
+    // A DOS timestamp counts in two-second steps, so an odd second and any
+    // sub-second detail arrive separately and have to be added back on.
+    let Some(refinement) = refinement else {
+        return Some(base);
+    };
+    let extra = Duration::from_secs(u64::from(refinement.add_second))
+        + Duration::from_nanos(u64::from(refinement.nanoseconds));
+    base.checked_add(extra).or(Some(base))
 }
 
 fn system_time_to_dos_time(time: SystemTime) -> Option<u32> {

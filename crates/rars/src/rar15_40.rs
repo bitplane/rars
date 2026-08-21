@@ -347,6 +347,9 @@ impl StreamingEntry {
 pub struct ExtractedEntryMeta {
     pub name: Vec<u8>,
     pub file_time: u32,
+    /// Sub-second detail the DOS `file_time` cannot express, from the extended
+    /// time field. See [`FileHeader::mtime_refinement`].
+    pub mtime_refinement: Option<crate::TimeRefinement>,
     pub attr: u32,
     pub host_os: u8,
     pub is_directory: bool,
@@ -588,10 +591,50 @@ impl FileHeader {
         }
     }
 
+    /// Decodes the modification time's extended-time detail, if the header
+    /// carries any.
+    ///
+    /// A DOS timestamp counts in two-second steps and holds nothing smaller,
+    /// so the extended field adds an odd-second flag and up to three bytes of
+    /// 100-nanosecond ticks. Ignoring it costs up to a second of accuracy on
+    /// every RAR 1.5-4.x archive that has one.
+    ///
+    /// The flags word splits into four nibbles, mtime first at bits 15-12,
+    /// then ctime, atime and arctime. Within a nibble, `0x8` marks the
+    /// timestamp present, `0x4` adds one second, and the low two bits count
+    /// the sub-second bytes. Only mtime is decoded here, and it is the first
+    /// entry, so nothing after it has to be walked. mtime alone reuses the
+    /// header's DOS time rather than carrying its own copy.
+    ///
+    /// Sub-second bytes arrive high end first: each shifts into the top of a
+    /// 24-bit accumulator while what is there shifts down. Fewer bytes mean a
+    /// coarser tick, not a smaller number, so one byte resolves to 6.55 ms and
+    /// three to the full 100 ns.
+    pub fn mtime_refinement(&self) -> Option<crate::TimeRefinement> {
+        const PRESENT: u8 = 0x8;
+        const ADD_SECOND: u8 = 0x4;
+        const TICK_NANOSECONDS: u32 = 100;
+
+        let flags = u16::from_le_bytes(self.ext_time.get(..2)?.try_into().ok()?);
+        let rmode = ((flags >> 12) & 0xf) as u8;
+        if rmode & PRESENT == 0 {
+            return None;
+        }
+        let mut ticks = 0u32;
+        for &byte in self.ext_time.get(2..2 + usize::from(rmode & 0x3))? {
+            ticks = (u32::from(byte) << 16) | (ticks >> 8);
+        }
+        Some(crate::TimeRefinement {
+            add_second: rmode & ADD_SECOND != 0,
+            nanoseconds: ticks * TICK_NANOSECONDS,
+        })
+    }
+
     pub fn metadata(&self) -> ExtractedEntryMeta {
         ExtractedEntryMeta {
             name: self.name.clone(),
             file_time: self.file_time,
+            mtime_refinement: self.mtime_refinement(),
             attr: self.attr,
             host_os: self.host_os,
             is_directory: self.is_directory(),
