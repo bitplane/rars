@@ -3600,17 +3600,74 @@ fn emit_zero_level_run(tokens: &mut Vec<LevelToken>, mut run: usize) {
     }
 }
 
+/// Prices the level alphabet by how often each symbol is used, where a flat
+/// code charged the same for every symbol in play.
+///
+/// A block's table is mostly runs and short lengths, so its tokens are far from
+/// evenly spread and a flat code overpays for the common ones. Both codings are
+/// costed here and the cheaper is written, because weighting can lose: a code
+/// this deep spends eight bits rather than four to declare a length of fifteen,
+/// and over twenty symbols that occasionally outweighs what the tokens save.
+///
+/// Either way the code must be *complete*. Strict decoders rebuild the
+/// pre-table (7-Zip's `k_BuildMode_Full`) and reject an under-full one. Huffman
+/// gives Kraft equality by construction once two symbols are in play, and the
+/// flat assignment is only valid when the used-symbol count is a power of two,
+/// which is what `assign_flat_complete_code` arranges.
 fn level_code_lengths_for_tokens(tokens: &[LevelToken]) -> [u8; LEVEL_TABLE_SIZE] {
-    // Mark used level symbols, then normalise to a *complete* canonical code.
-    // The pre-table is rebuilt by strict decoders (7-Zip's `k_BuildMode_Full`),
-    // which reject an under-full table, so a uniform length assignment is only
-    // valid when the used-symbol count is a power of two.
-    let mut lengths = [0u8; LEVEL_TABLE_SIZE];
+    let mut frequencies = [0usize; LEVEL_TABLE_SIZE];
     for token in tokens {
-        lengths[token.symbol] = 1;
+        frequencies[token.symbol] += 1;
     }
-    huffman::assign_flat_complete_code(&mut lengths);
-    lengths
+
+    let mut flat = [0u8; LEVEL_TABLE_SIZE];
+    for (symbol, &count) in frequencies.iter().enumerate() {
+        flat[symbol] = u8::from(count != 0);
+    }
+    huffman::assign_flat_complete_code(&mut flat);
+    // One symbol in play leaves an empty branch beside it, and the flat
+    // assignment is the only one that pads it into a complete code.
+    if frequencies.iter().filter(|&&count| count != 0).count() <= 1 {
+        return flat;
+    }
+
+    let weighted = huffman::lengths_for_frequency_array(&frequencies, 15);
+    match level_code_cost(&weighted, &frequencies) < level_code_cost(&flat, &frequencies) {
+        true => weighted,
+        false => flat,
+    }
+}
+
+/// What a level code costs in bits: the lengths at the head of the table as
+/// [`write_level_lengths`] will write them, plus the tokens they code.
+///
+/// The tokens' own extra bits are the same under either code and are left out.
+fn level_code_cost(
+    lengths: &[u8; LEVEL_TABLE_SIZE],
+    frequencies: &[usize; LEVEL_TABLE_SIZE],
+) -> usize {
+    let mut bits = 0usize;
+    let mut pos = 0usize;
+    while pos < LEVEL_TABLE_SIZE {
+        if lengths[pos] != 0 {
+            bits += if lengths[pos] == 15 { 8 } else { 4 };
+            pos += 1;
+            continue;
+        }
+        let mut run = 1usize;
+        while pos + run < LEVEL_TABLE_SIZE && lengths[pos + run] == 0 {
+            run += 1;
+        }
+        pos += run;
+        while run >= 3 {
+            bits += 8;
+            run -= run.min(17);
+        }
+        bits += run * 4;
+    }
+    bits + (0..LEVEL_TABLE_SIZE)
+        .map(|symbol| usize::from(lengths[symbol]) * frequencies[symbol])
+        .sum::<usize>()
 }
 
 fn write_level_lengths(writer: &mut BitWriter, lengths: &[u8; LEVEL_TABLE_SIZE]) {
@@ -3646,6 +3703,91 @@ fn write_level_lengths(writer: &mut BitWriter, lengths: &[u8; LEVEL_TABLE_SIZE])
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The flat code charged four bits for a symbol used once and four for one
+    /// used two hundred times, over an alphabet that is nothing like even.
+    #[test]
+    fn the_level_code_spends_fewer_bits_on_the_common_symbol() {
+        let mut tokens = vec![LevelToken::plain(0); 200];
+        for symbol in [4, 7, 9, 11] {
+            tokens.push(LevelToken::plain(symbol));
+        }
+        let lengths = level_code_lengths_for_tokens(&tokens);
+        assert!(
+            lengths[0] < lengths[7],
+            "the symbol used 200 times costs {} bits and one used once costs {}",
+            lengths[0],
+            lengths[7]
+        );
+    }
+
+    /// Strict decoders rebuild the pre-table and reject one that does not fill
+    /// its code space, so whichever coding wins has to satisfy Kraft equality.
+    #[test]
+    fn every_level_code_fills_its_code_space() {
+        let shapes: Vec<Vec<LevelToken>> = vec![
+            vec![LevelToken::plain(3); 8],
+            (0..20).map(LevelToken::plain).collect(),
+            {
+                let mut skewed = vec![LevelToken::plain(0); 900];
+                skewed.extend((1..20).map(LevelToken::plain));
+                skewed
+            },
+            (0..20)
+                .flat_map(|symbol| {
+                    std::iter::repeat_n(LevelToken::plain(symbol), 1 << symbol.min(9))
+                })
+                .collect(),
+        ];
+        for tokens in shapes {
+            let lengths = level_code_lengths_for_tokens(&tokens);
+            let used: Vec<u8> = lengths.iter().copied().filter(|&len| len != 0).collect();
+            let kraft: f64 = used.iter().map(|&len| 0.5f64.powi(i32::from(len))).sum();
+            assert!(
+                (kraft - 1.0).abs() < 1e-9,
+                "code over {} symbols fills {kraft} of its space: {lengths:?}",
+                used.len()
+            );
+            assert!(
+                used.iter().all(|&len| len <= 15),
+                "{lengths:?} exceeds four bits"
+            );
+            assert!(HuffmanTable::from_lengths(&lengths).is_ok());
+        }
+    }
+
+    /// The cost model has to agree with the writer, or it picks the wrong
+    /// coding whenever the two disagree about the table header.
+    #[test]
+    fn the_level_code_cost_matches_what_the_writer_emits() {
+        let cases: Vec<[u8; LEVEL_TABLE_SIZE]> = vec![
+            [4; LEVEL_TABLE_SIZE],
+            {
+                let mut lengths = [0u8; LEVEL_TABLE_SIZE];
+                lengths[0] = 1;
+                lengths[1] = 2;
+                lengths[19] = 15;
+                lengths
+            },
+            {
+                let mut lengths = [0u8; LEVEL_TABLE_SIZE];
+                lengths[2] = 15;
+                lengths[3] = 15;
+                lengths[9] = 3;
+                lengths
+            },
+        ];
+        for lengths in cases {
+            let mut writer = BitWriter::new();
+            write_level_lengths(&mut writer, &lengths);
+            let header = level_code_cost(&lengths, &[0; LEVEL_TABLE_SIZE]);
+            assert_eq!(
+                header, writer.bit_pos,
+                "header cost {header} against {} bits written for {lengths:?}",
+                writer.bit_pos
+            );
+        }
+    }
 
     fn encode_tokens(
         input: &[u8],
