@@ -8,6 +8,7 @@ pub struct Rar15Cipher {
 
 impl Rar15Cipher {
     pub fn new(password: &[u8]) -> Self {
+        let password = crate::crypto::clamp_password(password);
         let password = password.split(|&byte| byte == 0).next().unwrap_or(password);
         let password_crc = crc32_raw(password);
         let mut key = [

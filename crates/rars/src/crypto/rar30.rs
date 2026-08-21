@@ -81,6 +81,7 @@ impl Rar30Cipher {
 }
 
 fn derive_key_iv(password: &[u8], salt: Option<[u8; 8]>) -> Result<([u8; 16], [u8; 16])> {
+    let password = crate::crypto::clamp_password(password);
     let mut raw = Zeroizing::new(Vec::with_capacity(password.len() * 2 + 8));
     let password = str::from_utf8(password).map_err(|_| Error::NonUtf8Password)?;
     for code_unit in password.encode_utf16() {

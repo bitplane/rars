@@ -74,6 +74,7 @@ impl Rar20Cipher {
     }
 
     fn set_key(&mut self, password: &[u8]) {
+        let password = crate::crypto::clamp_password(password);
         for j in 0..=255u32 {
             for i in (0..password.len()).step_by(2) {
                 let n1_index = password[i].wrapping_sub(j as u8);

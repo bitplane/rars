@@ -68,6 +68,7 @@ impl Rar50Keys {
         if kdf_count_log > MAX_KDF_COUNT_LOG {
             return Err(Error::KdfCountTooLarge);
         }
+        let password = crate::crypto::clamp_password(password);
 
         let mut first_input = Vec::with_capacity(salt.len() + 4);
         first_input.extend_from_slice(&salt);

@@ -1564,6 +1564,79 @@ fn writes_rar50_file_comment_service_record() {
     assert_eq!(extracted[0].data, b"payload with attached file comment\n");
 }
 
+/// When a file header carries both a `Data CRC32` and a BLAKE2sp record, the
+/// hash is the authoritative check and the CRC32 is not evaluated beside it.
+///
+/// Measured on RAR 7.12 and UnRAR 7.20: the fixture's CRC32 is wrong by one bit
+/// while its BLAKE2sp is correct, and both readers test it clean. Corrupt the
+/// digest instead and both reject it, which is what the second half pins.
+#[test]
+fn rar50_blake2sp_supersedes_a_wrong_crc32() {
+    let data = fs::read(fixture("crc32_wrong_beside_blake2sp.rar")).unwrap();
+    let archive = Archive::parse(&data).unwrap();
+
+    let file = archive.files().next().unwrap();
+    assert_eq!(file.data_crc32, Some(0x83b2_7226));
+    assert!(file.hash.is_some());
+
+    let extracted = collect_extract(&archive).unwrap();
+    assert_eq!(extracted.len(), 1);
+    assert_eq!(extracted[0].data, b"Hello, RAR 5.0 fixture world.\n");
+
+    // The digest still has to be right. Flip a byte of it and the archive must
+    // fail, otherwise the fix would have turned off checking altogether.
+    const HEAD_CRC: usize = 0x17;
+    const HEAD_SIZE: usize = 0x1b;
+    const BODY: usize = 0x1c;
+    const DIGEST: usize = 0x39;
+
+    let mut corrupted = data.clone();
+    corrupted[DIGEST] ^= 0xff;
+    let header_end = BODY + corrupted[HEAD_SIZE] as usize;
+    let header_crc = crc32(&corrupted[HEAD_SIZE..header_end]);
+    corrupted[HEAD_CRC..HEAD_CRC + 4].copy_from_slice(&header_crc.to_le_bytes());
+    let archive = Archive::parse(&corrupted).unwrap();
+    assert!(matches!(
+        collect_extract(&archive),
+        Err(Error::AtEntry { source, .. }) if matches!(*source, Error::HashMismatch { .. })
+    ));
+}
+
+/// Reference builds keep 127 characters of the password and drop the rest, so
+/// rars has to as well: measured against RAR 7.12, an archive rars wrote with a
+/// 128-character password could not be opened with that password or with any
+/// prefix of it, and rars could not open WinRAR's when handed the same long one.
+///
+/// The archive here is written with a 200-character password and opened with
+/// its first 127 characters. Both must derive the same key, and 126 must not.
+#[test]
+fn rar50_password_is_clamped_to_127_characters() {
+    let long = "A".repeat(197) + "ZZZ";
+    let kept = &long[..127];
+    let short = &long[..126];
+
+    let entries = [entry(b"secret.txt", b"clamped password payload\n")
+        .with_attributes(0x20)
+        .with_host_os(3)
+        .with_password(long.as_bytes().to_vec())];
+    let bytes = write_stored_archive(
+        &entries,
+        rar50::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only()),
+    )
+    .unwrap();
+
+    for password in [long.as_str(), kept] {
+        let archive = Archive::parse_with_password(&bytes, Some(password.as_bytes())).unwrap();
+        let extracted = collect_extract(&archive).unwrap();
+        assert_eq!(extracted[0].data, b"clamped password payload\n");
+    }
+
+    assert!(
+        Archive::parse_with_password(&bytes, Some(short.as_bytes())).is_err(),
+        "126 characters must not open an archive written with 127 or more"
+    );
+}
+
 #[test]
 fn writes_encrypted_rar50_file_comment_service_record() {
     let entries = [entry(

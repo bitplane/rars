@@ -12,6 +12,7 @@ pub struct Rar13DecryptReader<R> {
 
 impl Rar13Cipher {
     pub fn new(password: &[u8]) -> Self {
+        let password = crate::crypto::clamp_password(password);
         let mut key = [0u8; 3];
         for &byte in password {
             key[0] = key[0].wrapping_add(byte);
