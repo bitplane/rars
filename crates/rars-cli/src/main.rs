@@ -23,7 +23,8 @@ use input::{collect_inputs, rar15_file_attr, read_inputs_with_progress};
 use output::{
     create_rar50_redirection as create_rar50_redirection_output, open_output_writer,
     output_path_for_entry, output_path_for_rar50_entry, output_relative_path, print_ok_entry,
-    restore_output_metadata, warn_rar50_redirections, ExtractedOutput, OverwritePolicy,
+    rar50_entry_name, restore_output_metadata, warn_rar50_redirections, Backslash, ExtractedOutput,
+    OverwritePolicy,
 };
 use password::{
     classify_rars_error, ensure_password_for_archives_extract, ensure_password_for_extract,
@@ -731,7 +732,8 @@ impl<'a> ExtractOutputState<'a> {
     fn open_entry(&mut self, meta: &rars::ExtractedEntryMeta) -> rars::Result<Box<dyn Write>> {
         let planned = output_path_for_entry(self.out_dir, meta)?;
         self.reserve_output_path(planned)?;
-        let (path, writer) = open_output_writer(self.out_dir, meta, self.overwrite)?;
+        let (path, writer) =
+            open_output_writer(self.out_dir, meta, self.overwrite, Backslash::Separator)?;
         self.record_created_path(&meta.name, path.clone())?;
         self.outputs.push(ExtractedOutput {
             name: meta.name.clone(),
@@ -750,7 +752,8 @@ impl<'a> ExtractOutputState<'a> {
         let common = rar50_extracted_meta(meta);
         let planned = output_path_for_rar50_entry(self.out_dir, meta)?;
         self.reserve_output_path(planned)?;
-        let (path, writer) = open_output_writer(self.out_dir, &common, self.overwrite)?;
+        let (path, writer) =
+            open_output_writer(self.out_dir, &common, self.overwrite, Backslash::Literal)?;
         self.record_created_path(&meta.name, path.clone())?;
         self.outputs.push(ExtractedOutput {
             name: meta.name.clone(),
@@ -806,7 +809,7 @@ impl<'a> ExtractOutputState<'a> {
 
 fn rar50_extracted_meta(meta: &rars::rar50::ExtractedEntryMeta) -> rars::ExtractedEntryMeta {
     rars::ExtractedEntryMeta::new(
-        meta.name.clone(),
+        rar50_entry_name(&meta.name, meta.host_os),
         meta.file_time,
         meta.attr,
         meta.is_directory,

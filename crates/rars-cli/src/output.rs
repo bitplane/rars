@@ -28,12 +28,34 @@ const FSREDIR_FILE_COPY: u64 = 0x05;
 #[cfg(windows)]
 const FHEXTRA_REDIR_DIR: u64 = 0x01;
 
+/// Whether a backslash in an entry name separates path components.
+///
+/// RAR 1.5-4.x uses it as the wire separator, so there it does. RAR 5.0 uses
+/// `/` for every host and a backslash is an ordinary character; see
+/// [`rar50_entry_name`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Backslash {
+    Separator,
+    Literal,
+}
+
+impl Backslash {
+    fn is_separator(self) -> bool {
+        self == Self::Separator
+    }
+}
+
 pub(crate) fn open_output_writer(
     out_dir: &Path,
     entry: &ExtractedEntryMeta,
     overwrite: OverwritePolicy,
+    backslash: Backslash,
 ) -> rars::Result<(PathBuf, Box<dyn std::io::Write>)> {
-    let mut out_path = output_path_for_entry(out_dir, entry)?;
+    let resolve = |name: &[u8]| {
+        relative_path(name, backslash.is_separator())
+            .map_err(|_| Error::InvalidHeader("unsafe archive path"))
+    };
+    let mut out_path = checked_output_path(out_dir, &resolve(&entry.name)?)?;
     if entry.is_directory {
         fs::create_dir_all(&out_path)?;
         return Ok((out_path, Box::new(std::io::sink())));
@@ -41,8 +63,7 @@ pub(crate) fn open_output_writer(
     if let Some(parent) = out_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let rel = output_relative_path(&entry.name)
-        .map_err(|_| Error::InvalidHeader("unsafe archive path"))?;
+    let rel = resolve(&entry.name)?;
     out_path = checked_output_path(out_dir, &rel)?;
     Ok((
         out_path.clone(),
@@ -59,13 +80,42 @@ pub(crate) fn output_path_for_entry(
     checked_output_path(out_dir, &rel)
 }
 
+/// RAR 5.0 uses `/` as the separator for every host, so a backslash that
+/// survives into a stored name is a literal character and not a delimiter.
+/// Splitting on it would invent directory levels the archive never declared,
+/// turning one entry into a tree.
+///
+/// Windows cannot hold a backslash in a filename, so it becomes `_` there
+/// whatever the archive says. On Unix it is an ordinary character: the
+/// reference keeps it verbatim for a Unix-host entry, and flattens it to `_`
+/// for a Windows-host one, where the byte came from a platform that meant it
+/// as a separator. Measured on RAR 7.12 and WinRAR 7.21's Rar.exe.
+///
+/// This is the opposite of RAR 1.5-4.x, where a backslash **is** the wire
+/// separator, which is why [`output_relative_path`] still splits on it.
+pub(crate) fn rar50_entry_name(name: &[u8], host_os: u64) -> Vec<u8> {
+    const HOST5_UNIX: u64 = 1;
+    if cfg!(unix) && host_os == HOST5_UNIX {
+        return name.to_vec();
+    }
+    name.iter()
+        .map(|&byte| if byte == b'\\' { b'_' } else { byte })
+        .collect()
+}
+
 pub(crate) fn output_path_for_rar50_entry(
     out_dir: &Path,
     entry: &rars::rar50::ExtractedEntryMeta,
 ) -> rars::Result<PathBuf> {
-    let rel = output_relative_path(&entry.name)
+    let rel = rar50_output_relative_path(&entry.name, entry.host_os)
         .map_err(|_| Error::InvalidHeader("unsafe archive path"))?;
     checked_output_path(out_dir, &rel)
+}
+
+/// [`output_relative_path`] for a RAR 5.0 entry, which does not treat a
+/// backslash as a separator. See [`rar50_entry_name`].
+pub(crate) fn rar50_output_relative_path(name: &[u8], host_os: u64) -> CliResult<PathBuf> {
+    relative_path(&rar50_entry_name(name, host_os), false)
 }
 
 pub(crate) fn create_rar50_redirection(
@@ -284,12 +334,19 @@ fn display_archive_bytes(bytes: &[u8]) -> String {
 }
 
 pub(crate) fn output_relative_path(name: &[u8]) -> CliResult<PathBuf> {
+    relative_path(name, true)
+}
+
+fn relative_path(name: &[u8], backslash_is_separator: bool) -> CliResult<PathBuf> {
     if name.contains(&0) {
         return Err("unsafe archive path contains NUL byte".into());
     }
-    let text = String::from_utf8(name.to_vec())
-        .map_err(|_| CliError::general("archive entry name is not UTF-8"))?
-        .replace('\\', "/");
+    let mut text = String::from_utf8(name.to_vec())
+        .map_err(|_| CliError::general("archive entry name is not UTF-8"))?;
+    if backslash_is_separator {
+        text = text.replace('\\', "/");
+    }
+    let text = text;
     let bytes = text.as_bytes();
     if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
         return Err(format!("unsafe archive path: {text}").into());
@@ -339,12 +396,69 @@ fn set_no_follow(_options: &mut OpenOptions) {
 
 #[cfg(test)]
 mod tests {
-    use super::{display_archive_text, restore_output_metadata, ExtractedOutput};
+    use super::{
+        display_archive_text, output_relative_path, rar50_entry_name, rar50_output_relative_path,
+        restore_output_metadata, ExtractedOutput,
+    };
     use rars::{ArchiveFamily, ExtractedEntryMeta};
     use std::fs;
 
     fn scratch(name: &str) -> crate::scratch::Scratch {
         crate::scratch::case(&format!("rars-output-{name}"))
+    }
+
+    /// RAR 5.0 separates with `/` on every host, so a backslash in a name is a
+    /// character. Splitting on it invents a directory the archive never
+    /// declared. RAR 1.5-4.x is the opposite and must keep splitting.
+    ///
+    /// Matches RAR 7.12 on Unix: kept verbatim for a Unix-host entry, replaced
+    /// with `_` for a Windows-host one.
+    #[test]
+    fn rar50_backslash_is_a_character_and_legacy_backslash_is_a_separator() {
+        const UNIX: u64 = 1;
+        const WINDOWS: u64 = 0;
+
+        assert_eq!(
+            rar50_entry_name(br"sub\nam.t", UNIX),
+            br"sub\nam.t".to_vec()
+        );
+        assert_eq!(
+            rar50_entry_name(br"sub\nam.t", WINDOWS),
+            b"sub_nam.t".to_vec()
+        );
+
+        assert_eq!(
+            rar50_output_relative_path(br"sub\nam.t", UNIX).unwrap(),
+            std::path::Path::new(r"sub\nam.t")
+        );
+        assert_eq!(
+            rar50_output_relative_path(br"sub\nam.t", WINDOWS).unwrap(),
+            std::path::Path::new("sub_nam.t")
+        );
+        // Forward slashes still separate, whatever the host.
+        assert_eq!(
+            rar50_output_relative_path(b"dir/nam.t", UNIX).unwrap(),
+            std::path::Path::new("dir/nam.t")
+        );
+        // RAR 1.5-4.x keeps the old meaning.
+        assert_eq!(
+            output_relative_path(br"sub\nam.t").unwrap(),
+            std::path::Path::new("sub/nam.t")
+        );
+    }
+
+    /// Keeping the backslash must not open a traversal: it stays inside one
+    /// path component, so the `..` check never sees a parent directory.
+    #[test]
+    fn rar50_backslash_traversal_is_still_refused() {
+        const UNIX: u64 = 1;
+        assert!(rar50_output_relative_path(br"..\..\pwn", UNIX).is_ok());
+        assert_eq!(
+            rar50_output_relative_path(br"..\..\pwn", UNIX).unwrap(),
+            std::path::Path::new(r"..\..\pwn")
+        );
+        assert!(rar50_output_relative_path(b"../../pwn", UNIX).is_err());
+        assert!(output_relative_path(br"..\..\pwn").is_err());
     }
 
     #[test]
