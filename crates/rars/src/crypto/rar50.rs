@@ -106,7 +106,24 @@ impl Rar50Keys {
         Ok(result)
     }
 
+    /// Verifies the password against a stored check record, unless the record
+    /// is the all-zero one WinRAR 5.21 and earlier wrote.
+    ///
+    /// Those versions set the check-present flag and then left the eight bytes
+    /// zero, so verifying rejects the correct password and the archive cannot
+    /// be opened at all. Treat all-zero as "no check available" and let the
+    /// data checksum decide instead.
+    ///
+    /// The reference readers do the same. Zeroing the field in a WinRAR 7.12
+    /// archive leaves the right password working, and changes what a wrong one
+    /// reports from "Incorrect password" to a checksum error, which is the
+    /// explicit check dropping out and detection falling through. Zeroing the
+    /// record's own trailing checksum or leaving it stale makes no difference
+    /// to that, so the all-zero test comes first here too.
     pub fn check_password(&self, stored: &[u8; 12]) -> Result<()> {
+        if stored[..8] == [0u8; 8] {
+            return Ok(());
+        }
         let checksum = sha256(&stored[..8]);
         let checksum_matches = constant_time_eq(&checksum[..4], &stored[8..12]);
         let password_matches = constant_time_eq(&self.password_check, &stored[..8]);

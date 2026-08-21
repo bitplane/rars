@@ -4165,6 +4165,30 @@ fn extracts_rar50_solid_multivolume_archive() {
     assert_eq!(crc32(&extracted[1].data), 0xddc9_5682);
 }
 
+/// WinRAR 5.21 and earlier set the password-check flag and then wrote eight
+/// zero bytes into the field, so a reader that verifies it rejects the correct
+/// password and the archive cannot be opened at all. RAR 7.12 treats an
+/// all-zero field as no check available and lets the data checksum decide.
+///
+/// A wrong password must still be refused, just later and by a different
+/// mechanism, which is the second half of this test.
+#[test]
+fn opens_rar50_archive_whose_password_check_is_all_zeroes() {
+    let data = fs::read(fixture("zeroed_password_check.rar")).unwrap();
+
+    let archive = Archive::parse_with_password(&data, Some(b"secret")).unwrap();
+    let extracted = collect_extract_with_password(&archive, Some(b"secret")).unwrap();
+    assert_eq!(extracted.len(), 1);
+    assert_eq!(extracted[0].name, b"s.txt");
+
+    assert!(
+        Archive::parse_with_password(&data, Some(b"wrongpw"))
+            .and_then(|archive| collect_extract_with_password(&archive, Some(b"wrongpw")))
+            .is_err(),
+        "a wrong password must still be refused, via the data checksum"
+    );
+}
+
 /// A stored, header-encrypted, split member reaches a verification path of its
 /// own, and that path used to apply the encrypted-checksum transform to any
 /// encrypted file rather than only to one whose crypt record sets the tweaked
