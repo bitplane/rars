@@ -211,7 +211,7 @@ fn write_archive_to(
         has_file_comment,
     )?;
     if let MemberCoding::Filtered(policy) = &coding {
-        validate_rar29_filter_policy(policy, options.method, options.features.solid)?;
+        validate_rar29_filter_policy(policy, options.method)?;
     }
     let header_password = if options.features.header_encryption {
         validate_header_encrypted_archive_options(
@@ -455,24 +455,12 @@ fn ppmd_trial_pays(level: u8) -> bool {
     level >= 3
 }
 
-fn validate_rar29_filter_policy(
-    policy: &FilterPolicy,
-    method: Rar29Method,
-    solid: bool,
-) -> Result<()> {
+fn validate_rar29_filter_policy(policy: &FilterPolicy, method: Rar29Method) -> Result<()> {
     // Searching for a filter means measuring candidates against each other,
     // and the search only knows how to measure them through LZ.
     if matches!(policy, FilterPolicy::Auto) && method == Rar29Method::Ppmd {
         return Err(Error::InvalidHeader(
             "RAR 2.9 cannot search for a filter while PPMd is forced",
-        ));
-    }
-    // Every candidate would have to be measured against the history so far,
-    // which means encoding each one against the live chain. Naming the filter
-    // costs nothing extra and is what the search would settle on anyway.
-    if matches!(policy, FilterPolicy::Auto) && solid {
-        return Err(Error::InvalidHeader(
-            "RAR 2.9 cannot search for a filter in a solid archive; name one instead",
         ));
     }
     let filter = match policy {
@@ -1526,9 +1514,12 @@ fn encode_filtered_payload(
 ) -> Result<EncodedPayload> {
     let lz_method = compression_method_for_level(options)?;
     let codes_through_the_chain = lz_method != 0x30
-        && options.method != Rar29Method::Ppmd
-        && !matches!(policy, FilterPolicy::Auto)
-        && matches!(solid_encoder, Some(SolidEncoder::Rar29(_)));
+        && matches!(solid_encoder, Some(SolidEncoder::Rar29(_)))
+        // A named filter under forced PPMd is the one request the chain cannot
+        // take: its PPMd side codes no filters, and coding the member LZ
+        // instead would quietly overrule a flag the caller set. It codes on its
+        // own inside the solid archive, as it always has.
+        && !(options.method == Rar29Method::Ppmd && matches!(policy, FilterPolicy::Explicit(_)));
     if !codes_through_the_chain {
         return encode_rar29_policy_filtered_payload(
             data,
@@ -1548,11 +1539,21 @@ fn encode_filtered_payload(
     // Coding either one on its own would leave the encoder's history in place
     // while the headers said the chain had ended, so the member after it would
     // be coded against a dictionary its own flags told the decoder to discard.
+    let mut advance = |_position: usize| true;
     let packed = match policy {
         FilterPolicy::Explicit(filter) if !data.is_empty() => {
             encoder.encode_member_with_filters(data, std::slice::from_ref(filter))?
         }
-        _ => encoder.encode_member(data)?,
+        // Naming a filter, or none, says nothing about which engine should code
+        // the member. `--no-filter` used to answer that question too, and answer
+        // it LZ, so asking a solid archive not to filter its binaries also took
+        // PPMd away from its text.
+        FilterPolicy::Explicit(_) | FilterPolicy::None => {
+            encode_rar29_chain_member(data, options, encoder, false, &mut advance)?
+        }
+        FilterPolicy::Auto => {
+            encode_rar29_chain_member(data, options, encoder, true, &mut advance)?
+        }
     };
 
     // A member the encoder could not shrink is stored, exactly as an unfiltered
@@ -1623,6 +1624,54 @@ fn encode_or_store_payload(
     })
 }
 
+/// Codes one member into a RAR 2.9 solid chain, choosing both the engine and,
+/// on the LZ side, the filter.
+///
+/// The engine question and the filter question meet here because they are
+/// asked of the same member and only one answer gets written. In practice they
+/// barely overlap: the filter search declines text and the PPMd trial only
+/// wants text, so a member that reaches one usually walks past the other. That
+/// is a fact about the two screens rather than a rule, so the trials are
+/// measured against each other rather than sequenced on the assumption.
+///
+/// `search` is off for a caller who named a filter or asked for none, and for
+/// PPMd, which leaves nothing for a filter to be measured through.
+fn encode_rar29_chain_member(
+    data: &[u8],
+    options: WriterOptions,
+    encoder: &mut Unpack29Encoder,
+    search: bool,
+    progress: &mut dyn FnMut(usize) -> bool,
+) -> Result<Vec<u8>> {
+    // A chain used to be LZ and nothing else, so a solid archive got no PPMd at
+    // all and an explicit --method ppmd was quietly ignored. It is the same
+    // content question here as in a non-solid archive, so it gets the same
+    // answer and the same gate: a level willing to encode the member twice, and
+    // content that looks like PPMd will win on it.
+    let level = compression_method_for_level(options)?.saturating_sub(0x30);
+    let engine = match options.method {
+        Rar29Method::Lz => ChainEngine::Lz,
+        Rar29Method::Ppmd => ChainEngine::Ppmd,
+        Rar29Method::Auto if ppmd_trial_pays(level) && is_text_ppmd_candidate(data) => {
+            ChainEngine::Smaller
+        }
+        Rar29Method::Auto => ChainEngine::Lz,
+    };
+    let candidates =
+        if search && engine != ChainEngine::Ppmd && crate::filter_search::search_applies(data) {
+            crate::filter_search::filter_candidates(
+                &Rar29Search,
+                data,
+                rar29_encode_options_for_options(options)?,
+            )?
+        } else {
+            Vec::new()
+        };
+    encoder
+        .encode_member_with_engine(data, engine, &candidates, progress)
+        .map_err(map_codec_cancel)
+}
+
 fn encode_compressed_payload(
     data: &[u8],
     options: WriterOptions,
@@ -1669,26 +1718,7 @@ fn encode_compressed_payload(
         (
             ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40,
             Some(SolidEncoder::Rar29(encoder)),
-        ) => {
-            // A chain used to be LZ and nothing else, so a solid archive got no
-            // PPMd at all and an explicit --method ppmd was quietly ignored. It
-            // is the same content question here as in a non-solid archive, so
-            // it gets the same answer and the same gate: a level willing to
-            // encode the member twice, and content that looks like PPMd will
-            // win on it.
-            let level = compression_method_for_level(options)?.saturating_sub(0x30);
-            let engine = match options.method {
-                Rar29Method::Lz => ChainEngine::Lz,
-                Rar29Method::Ppmd => ChainEngine::Ppmd,
-                Rar29Method::Auto if ppmd_trial_pays(level) && is_text_ppmd_candidate(data) => {
-                    ChainEngine::Smaller
-                }
-                Rar29Method::Auto => ChainEngine::Lz,
-            };
-            encoder
-                .encode_member_with_engine(data, engine, &mut advance)
-                .map_err(map_codec_cancel)
-        }
+        ) => encode_rar29_chain_member(data, options, encoder, true, &mut advance),
         _ => Err(Error::UnsupportedVersion(target)),
     }
 }

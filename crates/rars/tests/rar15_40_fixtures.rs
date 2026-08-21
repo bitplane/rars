@@ -2923,28 +2923,125 @@ fn a_solid_rar29_chain_survives_a_filter_and_stays_solid() {
     assert_eq!(extracted[1].data, second);
 }
 
+/// Calls to a handful of fixed addresses, which is what the x86 filters are
+/// for. An x86 call operand is relative to the instruction after it, so the
+/// same target reads differently at every call site; converting to absolute
+/// leaves three values the match finder eats. Filler in between keeps the
+/// member from being one long repeat and differs per seed, so the second
+/// member of the chain is not simply a copy of the first.
+fn call_heavy_x86(seed: u32, calls: usize) -> Vec<u8> {
+    const TARGETS: [u32; 3] = [0x1000, 0x2400, 0x3800];
+    let mut data = Vec::with_capacity(calls * 16);
+    let mut state = seed | 1;
+    for index in 0..calls {
+        let target = TARGETS[index % TARGETS.len()];
+        let relative = target.wrapping_sub(data.len() as u32 + 5);
+        data.push(0xe8);
+        data.extend_from_slice(&relative.to_le_bytes());
+        for _ in 0..11 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            data.push((state >> 24) as u8 | 0x40);
+        }
+    }
+    data
+}
+
+fn solid_rar29_entries<'a>(first: &'a [u8], second: &'a [u8]) -> [FileEntry<'a>; 2] {
+    [
+        FileEntry {
+            name: b"searched-first.bin",
+            data: first,
+            file_time: 0x5a21_0000,
+            file_attr: 0x20,
+            host_os: 3,
+            password: None,
+            file_comment: None,
+        },
+        FileEntry {
+            name: b"searched-second.bin",
+            data: second,
+            file_time: 0x5a21_0000,
+            file_attr: 0x20,
+            host_os: 3,
+            password: None,
+            file_comment: None,
+        },
+    ]
+}
+
+/// A solid archive used to refuse the search outright, on the grounds that a
+/// candidate can only be measured against the history behind it. It can be:
+/// the chain codes each one for real and keeps the smallest.
 #[test]
-fn a_filter_search_is_refused_inside_a_solid_rar29_archive() {
-    let entries = [FileEntry {
-        name: b"searched.bin",
-        data: b"solid filter search payload",
-        file_time: 0x5a21_0000,
-        file_attr: 0x20,
-        host_os: 3,
-        password: None,
-        file_comment: None,
-    }];
+fn a_solid_rar29_chain_searches_for_a_filter() {
+    let first = call_heavy_x86(0x1234_5678, 400);
+    let second = call_heavy_x86(0x2bad_c0de, 400);
+    let entries = solid_rar29_entries(&first, &second);
     let mut features = FeatureSet::store_only();
     features.solid = true;
+    let options = WriterOptions::new(ArchiveVersion::Rar29, features);
 
-    assert!(matches!(
-        write_rar29_compressed_archive_with_filter_policy(
-            &entries,
-            WriterOptions::new(ArchiveVersion::Rar29, features),
-            FilterPolicy::Auto,
-        ),
-        Err(Error::InvalidHeader(_))
-    ));
+    let searched =
+        write_rar29_compressed_archive_with_filter_policy(&entries, options, FilterPolicy::Auto)
+            .unwrap();
+    let plain =
+        write_rar29_compressed_archive_with_filter_policy(&entries, options, FilterPolicy::None)
+            .unwrap();
+
+    assert!(
+        searched.len() < plain.len(),
+        "the search should have found the x86 filter, got {} bytes against {} unfiltered",
+        searched.len(),
+        plain.len()
+    );
+
+    let archive = Archive::parse(&searched).unwrap();
+    assert!(archive.main.is_solid());
+    let files: Vec<_> = archive.files().collect();
+    assert!(!files[0].is_solid());
+    assert!(files[1].is_solid());
+    let extracted = collect_extract(&archive).unwrap();
+    assert_eq!(extracted[0].data, first);
+    assert_eq!(extracted[1].data, second);
+}
+
+/// The unfiltered member is one of the candidates, so the search cannot make a
+/// member larger however unpromising its bytes are.
+#[test]
+fn a_solid_rar29_search_never_loses_to_leaving_the_bytes_alone() {
+    let mut state = 0x8765_4321u32;
+    let noise: Vec<u8> = (0..40_000)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state >> 24) as u8
+        })
+        .collect();
+    let entries = solid_rar29_entries(&noise, &noise);
+    let mut features = FeatureSet::store_only();
+    features.solid = true;
+    let options = WriterOptions::new(ArchiveVersion::Rar29, features);
+
+    let searched =
+        write_rar29_compressed_archive_with_filter_policy(&entries, options, FilterPolicy::Auto)
+            .unwrap();
+    let plain =
+        write_rar29_compressed_archive_with_filter_policy(&entries, options, FilterPolicy::None)
+            .unwrap();
+
+    assert!(
+        searched.len() <= plain.len(),
+        "the search wrote {} bytes where leaving the data alone wrote {}",
+        searched.len(),
+        plain.len()
+    );
+    let archive = Archive::parse(&searched).unwrap();
+    let extracted = collect_extract(&archive).unwrap();
+    assert_eq!(extracted[0].data, noise);
+    assert_eq!(extracted[1].data, noise);
 }
 
 #[test]

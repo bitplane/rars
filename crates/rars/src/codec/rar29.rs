@@ -557,6 +557,20 @@ pub enum ChainEngine {
     Smaller,
 }
 
+/// One way of coding a member into the chain, and the state it would leave.
+///
+/// The state is carried rather than committed because a candidate that loses
+/// must not move the chain: the reader rebuilds its code-length table from the
+/// bytes it actually reads, so committing a table the winner never wrote leaves
+/// every later member coded against a table no decoder holds.
+struct LzCandidate {
+    packed: Vec<u8>,
+    /// The bytes the LZ layer coded, when a filter rewrote them. `None` when
+    /// the candidate took no filter and coded the input as it came.
+    coded: Option<Vec<u8>>,
+    levels: [u8; TABLE_COUNT],
+}
+
 #[derive(Debug, Clone)]
 pub struct Unpack29Encoder {
     history: Vec<u8>,
@@ -613,10 +627,15 @@ impl Unpack29Encoder {
     /// member must not advance the reader's PPMd model, and a PPMd member must
     /// not advance its code-length table. What both advance is the window,
     /// since the reader's window is fed by whichever engine wrote the bytes.
+    ///
+    /// `candidates` is the filter lists to choose between, each measured
+    /// against the chain as it stands. An empty slice means code it plainly,
+    /// which is what a caller with no search to offer passes.
     pub(crate) fn encode_member_with_engine(
         &mut self,
         input: &[u8],
         engine: ChainEngine,
+        candidates: &[Vec<crate::FilterSpec>],
         progress: &mut dyn FnMut(usize) -> bool,
     ) -> Result<Vec<u8>> {
         if engine == ChainEngine::Ppmd {
@@ -626,32 +645,116 @@ impl Unpack29Encoder {
             return Ok(packed);
         }
 
-        let mut levels = self.levels;
-        let lz = encode_member_with_options_and_progress(
-            input,
-            &self.history,
-            self.options,
-            &mut levels,
-            progress,
-        )?;
+        let lz = self.best_lz_candidate(input, candidates, progress)?;
 
         let ppmd = match engine {
             ChainEngine::Smaller => Some(self.encode_ppmd_member(input)?),
             _ => None,
         };
 
-        let packed = match ppmd.filter(|(packed, _)| packed.len() < lz.len()) {
+        match ppmd.filter(|(packed, _)| packed.len() < lz.packed.len()) {
             Some((packed, model)) => {
                 self.ppmd = Some(model);
-                packed
+                self.remember(input);
+                Ok(packed)
             }
             None => {
-                self.levels = levels;
-                lz
+                self.levels = lz.levels;
+                // The LZ layer coded the filtered bytes, so those are what a
+                // decoder's window holds and what the next member can match
+                // against. A member that took no filter coded its input.
+                self.remember(lz.coded.as_deref().unwrap_or(input));
+                Ok(lz.packed)
             }
+        }
+    }
+
+    /// Codes the member under every candidate filter list and keeps the
+    /// smallest, along with the chain state that candidate would leave behind.
+    ///
+    /// This is the whole reason a chain can search for a filter at all. Which
+    /// filter suits a member is decided elsewhere, on the member's own bytes;
+    /// what cannot be decided there is whether the winner still pays once the
+    /// history behind it is doing some of the same work, and that is what the
+    /// encodes here measure. They are the real thing, against the real history,
+    /// at the caller's real settings.
+    ///
+    /// Only the first candidate reports progress. Every candidate walks the
+    /// whole member, and the bar counts bytes coded rather than work done, so
+    /// reporting each one over again would run it past the end of the member
+    /// and back. The plain candidate comes first, so what the bar shows is one
+    /// member's worth of the pass that always happens.
+    fn best_lz_candidate(
+        &self,
+        input: &[u8],
+        candidates: &[Vec<crate::FilterSpec>],
+        progress: &mut dyn FnMut(usize) -> bool,
+    ) -> Result<LzCandidate> {
+        let plain_only = [Vec::new()];
+        let candidates = if candidates.is_empty() {
+            &plain_only[..]
+        } else {
+            candidates
         };
-        self.remember(input);
-        Ok(packed)
+        let mut best: Option<LzCandidate> = None;
+        for (index, filters) in candidates.iter().enumerate() {
+            let mut reported = index == 0;
+            let mut report = |position: usize| {
+                if !reported {
+                    return true;
+                }
+                let carry_on = progress(position);
+                reported = carry_on;
+                carry_on
+            };
+            let mut levels = self.levels;
+            let candidate = if filters.is_empty() {
+                LzCandidate {
+                    packed: encode_member_with_options_and_progress(
+                        input,
+                        &self.history,
+                        self.options,
+                        &mut levels,
+                        &mut report,
+                    )?,
+                    coded: None,
+                    levels,
+                }
+            } else {
+                let mut split = Vec::new();
+                for filter in filters {
+                    split.extend(split_large_filter(input.len(), filter.clone())?);
+                }
+                let filtered = filtered_members(input, &split)?;
+                let packed = encode_filtered_member_blocks(
+                    &filtered.data,
+                    &self.history,
+                    &filtered.records,
+                    self.options,
+                    &mut levels,
+                    Some(&mut report),
+                )?;
+                LzCandidate {
+                    packed,
+                    coded: Some(filtered.data),
+                    levels,
+                }
+            };
+            if best
+                .as_ref()
+                .is_none_or(|best| candidate.packed.len() < best.packed.len())
+            {
+                best = Some(candidate);
+            }
+            // A later candidate reports nothing, so a cancel raised while one
+            // is running would otherwise wait for the next member. Reporting
+            // the position the member has already reached moves the bar by
+            // nothing and answers the only question left: carry on or not.
+            if index > 0 && !progress(input.len()) {
+                return Err(Error::Cancelled);
+            }
+        }
+        Ok(best.expect("a chain always has at least the plain candidate"))
     }
 
     /// Codes the member against a copy of the chain's model, so a trial that
@@ -679,6 +782,7 @@ impl Unpack29Encoder {
             &filtered.records,
             self.options,
             &mut self.levels,
+            None,
         )?;
         // The LZ layer coded the filtered bytes, so that is what a decoder's
         // window holds and what the next member in a solid chain can match
@@ -704,6 +808,7 @@ impl Unpack29Encoder {
             &filtered.records,
             self.options,
             &mut self.levels,
+            None,
         )?;
         // The LZ layer coded the filtered bytes, so that is what a decoder's
         // window holds and what the next member in a solid chain can match
@@ -1090,6 +1195,7 @@ fn encode_filtered_member_blocks(
     filters: &[OwnedVmFilterRecord],
     options: EncodeOptions,
     levels: &mut [u8; TABLE_COUNT],
+    mut progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<u8>> {
     // A record's offset is relative to the head of its own block, so a block no
     // larger than the window keeps every offset inside it.
@@ -1114,6 +1220,11 @@ fn encode_filtered_member_blocks(
             .filter(|record| record.block_start >= base && record.block_start < end.max(base + 1))
             .collect();
         let records = encoded_filter_records_at(&in_block, base, window, &mut programs)?;
+        let mut chunk_progress = |position: usize| {
+            progress
+                .as_deref_mut()
+                .is_none_or(|report| report(base.saturating_add(position)))
+        };
         out.extend_from_slice(&encode_member_inner(
             chunk,
             &local_history,
@@ -1121,7 +1232,7 @@ fn encode_filtered_member_blocks(
             inner,
             end < data.len(),
             levels,
-            None,
+            Some(&mut chunk_progress),
         )?);
         local_history.extend_from_slice(chunk);
         let keep_from = local_history.len().saturating_sub(MAX_HISTORY);
@@ -3665,7 +3776,7 @@ mod tests {
             .iter()
             .map(|member| {
                 chain
-                    .encode_member_with_engine(member, ChainEngine::Smaller, &mut |_| true)
+                    .encode_member_with_engine(member, ChainEngine::Smaller, &[], &mut |_| true)
                     .unwrap()
             })
             .collect();
@@ -3690,7 +3801,12 @@ mod tests {
 
         // The same member, coded by a chain that has read nothing.
         let alone = Unpack29Encoder::with_options(EncodeOptions::default())
-            .encode_member_with_engine(members.last().unwrap(), ChainEngine::Smaller, &mut |_| true)
+            .encode_member_with_engine(
+                members.last().unwrap(),
+                ChainEngine::Smaller,
+                &[],
+                &mut |_| true,
+            )
             .unwrap();
         let last = ppmd.last().unwrap();
         assert!(
@@ -3725,7 +3841,7 @@ mod tests {
         let mut engines = Vec::new();
         for member in &members {
             let packed = chain
-                .encode_member_with_engine(member, ChainEngine::Smaller, &mut |_| true)
+                .encode_member_with_engine(member, ChainEngine::Smaller, &[], &mut |_| true)
                 .unwrap();
             engines.push(packed[0] & 0x80 != 0);
             stream.push(packed);
@@ -3740,6 +3856,130 @@ mod tests {
             assert_eq!(
                 decoder.decode_member(packed, member.len()).unwrap(),
                 *member
+            );
+        }
+    }
+
+    /// Calls to fixed addresses, which the x86 filter flattens into three
+    /// repeated values. See the writer's own copy of this for why the operand
+    /// is relative.
+    fn call_heavy_x86(seed: u32, calls: usize) -> Vec<u8> {
+        const TARGETS: [u32; 3] = [0x1000, 0x2400, 0x3800];
+        let mut data = Vec::with_capacity(calls * 16);
+        let mut state = seed | 1;
+        for index in 0..calls {
+            let target = TARGETS[index % TARGETS.len()];
+            let relative = target.wrapping_sub(data.len() as u32 + 5);
+            data.push(0xe8);
+            data.extend_from_slice(&relative.to_le_bytes());
+            for _ in 0..11 {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                data.push((state >> 24) as u8 | 0x40);
+            }
+        }
+        data
+    }
+
+    /// Only the winning candidate may move the chain.
+    ///
+    /// Every candidate codes the member for real, and each one leaves a
+    /// code-length table and a window behind it. A reader rebuilds both from
+    /// the bytes it actually reads, so committing a loser's leaves the next
+    /// member coded against a table and a history no decoder holds. That does
+    /// not show up as an error: the member after it decodes to plausible
+    /// rubbish, which is why this decodes the whole chain rather than checking
+    /// sizes.
+    #[test]
+    fn a_solid_chain_keeps_only_the_winning_candidates_state() {
+        // One member per outcome. The x86 member takes the x86 filter, the
+        // counters take the delta, and the text takes neither, so every
+        // candidate both wins somewhere and loses somewhere. Text is the
+        // member that matters: delta rewrites it into something with a very
+        // different table, and that table is exactly what must not survive
+        // losing.
+        let x86 = call_heavy_x86(0x1234_5678, 400);
+        let counters: Vec<u8> = (0..1600u32).flat_map(|n| (n * 7).to_le_bytes()).collect();
+        let mut text = Vec::new();
+        for index in 0..400u32 {
+            text.extend_from_slice(format!("field_{index:04} = value {index:04}\n").as_bytes());
+        }
+        let members = [x86, counters, text];
+
+        let candidates = vec![
+            Vec::new(),
+            vec![crate::FilterSpec::whole(crate::FilterKind::E8)],
+            vec![crate::FilterSpec::whole(crate::FilterKind::Delta {
+                channels: 4,
+            })],
+        ];
+        let mut chain = Unpack29Encoder::with_options(EncodeOptions::default());
+        let stream: Vec<Vec<u8>> = members
+            .iter()
+            .map(|member| {
+                chain
+                    .encode_member_with_engine(member, ChainEngine::Lz, &candidates, &mut |_| true)
+                    .unwrap()
+            })
+            .collect();
+
+        // A chain offered no candidates at all, to prove the filter was
+        // chosen rather than never reached. Only the first member is
+        // comparable member-for-member: once the chains disagree about what
+        // they coded, they disagree about their histories too.
+        let unfiltered_only = {
+            let mut chain = Unpack29Encoder::with_options(EncodeOptions::default());
+            members
+                .iter()
+                .map(|member| {
+                    chain
+                        .encode_member_with_engine(member, ChainEngine::Lz, &[], &mut |_| true)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            stream[0].len() < unfiltered_only[0].len(),
+            "the x86 member should have taken the filter, got {} bytes against {}",
+            stream[0].len(),
+            unfiltered_only[0].len()
+        );
+        let chosen: usize = stream.iter().map(Vec::len).sum();
+        let never: usize = unfiltered_only.iter().map(Vec::len).sum();
+        assert!(
+            chosen < never,
+            "the chain that could choose wrote {chosen} bytes against {never}"
+        );
+
+        // Coding each member again for every candidate is only safe if the
+        // losers leave nothing behind, so the chain is decoded a member at a
+        // time and its table compared with the reader's after each one. The
+        // bytes alone would not catch a wrong table: a member whose deltas are
+        // applied to the wrong base still decodes, to rubbish, and only the
+        // member after it notices.
+        let mut decoder = Unpack29::new();
+        let mut chain = Unpack29Encoder::with_options(EncodeOptions::default());
+        for (index, member) in members.iter().enumerate() {
+            let packed = chain
+                .encode_member_with_engine(member, ChainEngine::Lz, &candidates, &mut |_| true)
+                .unwrap();
+            assert_eq!(packed, stream[index]);
+            assert_eq!(
+                decoder.decode_member(&packed, member.len()).unwrap(),
+                *member
+            );
+            assert_eq!(
+                chain.levels, decoder.levels,
+                "member {index} left the writer holding a table the reader does not"
+            );
+            // The reader's window holds what the LZ layer coded, filters not
+            // yet applied, which is the same thing the writer remembers.
+            let common = chain.history.len().min(decoder.output.len());
+            assert_eq!(
+                chain.history[chain.history.len() - common..],
+                decoder.output[decoder.output.len() - common..],
+                "member {index} left the writer remembering bytes the reader never held"
             );
         }
     }

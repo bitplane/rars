@@ -665,6 +665,28 @@ fn finalists<S: FilterSearch>(
     Ok(finalists)
 }
 
+/// The candidate filter lists, screened but not ranked.
+///
+/// The screens still run: whether a filter has any chance on this member is a
+/// property of the member's own bytes, and a sample answers it the same way
+/// whoever is going to measure the survivors. What this hands back is the
+/// ranking, for a caller whose real encoder is not the one
+/// [`FilterSearch::encode_filtered`] describes.
+///
+/// A solid chain is that caller. Its members code against everything before
+/// them, so a candidate encoded on its own has not been measured at all, and
+/// the bytes [`choose_filter`] returns are bytes the chain would never write.
+pub(crate) fn filter_candidates<S: FilterSearch>(
+    search: &S,
+    data: &[u8],
+    options: S::Options,
+) -> Result<Vec<Vec<FilterSpec>>> {
+    Ok(finalists(search, data, options)?
+        .into_iter()
+        .map(|(specs, _measured)| specs)
+        .collect())
+}
+
 /// Picks the filter for a member, returning the winning specs together with the
 /// bytes they produced so the caller does not have to encode the winner again.
 ///
