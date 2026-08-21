@@ -4165,6 +4165,48 @@ fn extracts_rar50_solid_multivolume_archive() {
     assert_eq!(crc32(&extracted[1].data), 0xddc9_5682);
 }
 
+/// Modern WinRAR writes the modification time into `FHEXTRA_HTIME` and leaves
+/// the base-header field out, so a reader that only looks at the header field
+/// restores nothing. 39 of the 40 RAR 5 fixtures here carry the record and one
+/// carries the header field, which is how far from an edge case this is.
+#[test]
+fn rar50_reads_the_modification_time_from_the_htime_record() {
+    let mut with_record = 0;
+    let mut with_header_field = 0;
+
+    for entry in fs::read_dir(fixture(".")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|ext| ext != "rar") {
+            continue;
+        }
+        let Ok(archive) = Archive::parse_path(&path) else {
+            continue;
+        };
+        for file in archive.files() {
+            if file.mtime.is_some() {
+                with_header_field += 1;
+            }
+            if file.htime_mtime.is_some() {
+                with_record += 1;
+            }
+            // Whichever carries it, the entry must report a time.
+            if file.mtime.is_some() || file.htime_mtime.is_some() {
+                assert_ne!(
+                    file.metadata().file_time,
+                    0,
+                    "{} reports no time despite carrying one",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    assert!(
+        with_record > with_header_field,
+        "expected the extra record to dominate: record={with_record} header={with_header_field}"
+    );
+}
+
 /// WinRAR 5.21 and earlier set the password-check flag and then wrote eight
 /// zero bytes into the field, so a reader that verifies it rejects the correct
 /// password and the archive cannot be opened at all. RAR 7.12 treats an

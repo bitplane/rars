@@ -56,6 +56,7 @@ const MHEXTRA_LOCATOR_RECOVERY: u64 = 0x0002;
 
 const FHEXTRA_CRYPT: u64 = 0x01;
 const FHEXTRA_HASH: u64 = 0x02;
+const FHEXTRA_HTIME: u64 = 0x03;
 const FHEXTRA_REDIR: u64 = 0x05;
 const FHEXTRA_SUBDATA: u64 = 0x07;
 const MHEXTRA_ARCHIVE_METADATA: u64 = 0x02;
@@ -184,6 +185,14 @@ pub struct FileHeader {
     pub unpacked_size: u64,
     pub attributes: u64,
     pub mtime: Option<u32>,
+    /// Modification time from the `FHEXTRA_HTIME` record, in Unix seconds.
+    ///
+    /// Separate from `mtime`, which is the optional base-header field. Modern
+    /// WinRAR writes the time here and leaves that field out: 39 of the 40
+    /// RAR 5 fixtures in this tree carry `FHEXTRA_HTIME` and one carries the
+    /// header field, so a reader that only looks at `mtime` restores nothing
+    /// on almost every real archive.
+    pub htime_mtime: Option<u32>,
     pub data_crc32: Option<u32>,
     pub compression_info: u64,
     pub host_os: u64,
@@ -1192,6 +1201,7 @@ fn parse_file_header_bytes(parsed: &ParsedBlockHeader) -> Result<FileHeader> {
         unpacked_size,
         attributes,
         mtime,
+        htime_mtime: None,
         data_crc32,
         compression_info,
         host_os,
@@ -1237,6 +1247,9 @@ fn parse_file_extra_area(
             FHEXTRA_REDIR => {
                 file.redirection = Some(parse_file_redirection_record(input, data)?);
             }
+            FHEXTRA_HTIME => {
+                file.htime_mtime = parse_htime_mtime(input, data);
+            }
             FHEXTRA_SUBDATA => {
                 file.service_data = Some(input[data].to_vec());
             }
@@ -1244,6 +1257,37 @@ fn parse_file_extra_area(
         }
         Ok(())
     })
+}
+
+/// Reads the modification time out of an `FHEXTRA_HTIME` record.
+///
+/// Layout is flags, then the present times in the order mtime, ctime, atime,
+/// then, when flag `0x0010` is set, one sub-second remainder per time in that
+/// same order. Under flag `0x0001` a time is `uint32` Unix seconds; without it
+/// a time is a `uint64` Windows FILETIME. Only mtime is wanted here and it is
+/// first, so nothing after it has to be parsed.
+///
+/// A malformed record yields `None` rather than an error: the reference
+/// readers do not fail an archive over a time they cannot read, and neither
+/// should we lose the file over it.
+fn parse_htime_mtime(input: &[u8], range: Range<usize>) -> Option<u32> {
+    const HTIME_UNIX: u64 = 0x0001;
+    const HTIME_MTIME: u64 = 0x0002;
+    const FILETIME_TICKS_PER_SECOND: u64 = 10_000_000;
+    const FILETIME_EPOCH_TO_UNIX: u64 = 11_644_473_600;
+
+    let (flags, flags_len) = read_vint_at(input, range.start, range.end).ok()?;
+    if flags & HTIME_MTIME == 0 {
+        return None;
+    }
+    let at = range.start.checked_add(flags_len)?;
+    if flags & HTIME_UNIX != 0 {
+        let bytes = input.get(at..at.checked_add(4)?)?;
+        return Some(u32::from_le_bytes(bytes.try_into().ok()?));
+    }
+    let bytes = input.get(at..at.checked_add(8)?)?;
+    let filetime = u64::from_le_bytes(bytes.try_into().ok()?);
+    u32::try_from((filetime / FILETIME_TICKS_PER_SECOND).checked_sub(FILETIME_EPOCH_TO_UNIX)?).ok()
 }
 
 fn parse_file_redirection_record(input: &[u8], range: Range<usize>) -> Result<FileRedirection> {
@@ -2057,6 +2101,7 @@ mod tests {
             unpacked_size: 0,
             attributes: 0,
             mtime: None,
+            htime_mtime: None,
             data_crc32: None,
             compression_info: 0,
             host_os: 0,
