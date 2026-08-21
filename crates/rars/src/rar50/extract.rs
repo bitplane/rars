@@ -970,7 +970,10 @@ impl PendingSplitRefs {
             .data_crc32
             .filter(|_| !final_file.blake2sp_supersedes_crc32())
         {
-            let actual = if final_file.encrypted {
+            // Gate on the tweaked-checksum flag, not on "is encrypted".
+            // An encrypted file whose crypt record leaves flag 0x0002 clear
+            // stores a plain CRC32, and MACing ours fails a sound archive.
+            let actual = if final_file.uses_hash_mac() {
                 let decryptor = decryptor.ok_or(Error::InvalidHeader(
                     "RAR 5 encrypted split CRC needs encryption keys",
                 ))?;
@@ -983,7 +986,7 @@ impl PendingSplitRefs {
             }
         }
         if let Some((expected, hasher)) = hash {
-            let actual = if final_file.encrypted {
+            let actual = if final_file.uses_hash_mac() {
                 let decryptor = decryptor.ok_or(Error::InvalidHeader(
                     "RAR 5 encrypted split hash needs encryption keys",
                 ))?;

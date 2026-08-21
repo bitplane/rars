@@ -4165,6 +4165,35 @@ fn extracts_rar50_solid_multivolume_archive() {
     assert_eq!(crc32(&extracted[1].data), 0xddc9_5682);
 }
 
+/// A stored, header-encrypted, split member reaches a verification path of its
+/// own, and that path used to apply the encrypted-checksum transform to any
+/// encrypted file rather than only to one whose crypt record sets the tweaked
+/// checksum flag. The archive extracted the right bytes and then failed on a
+/// checksum that had been transformed when the stored one had not been.
+///
+/// Compressed volume sets verify elsewhere, which is why the sibling
+/// `encrypted_multivol` fixtures never caught this.
+#[test]
+fn extracts_rar50_header_encrypted_stored_multivolume_archive() {
+    let volumes: Vec<_> = (1..=3)
+        .map(|part| {
+            Archive::parse_path_with_password(
+                fixture(&format!("header_encrypted_stored_multivol.part{part}.rar")),
+                Some(b"password"),
+            )
+            .unwrap()
+        })
+        .collect();
+
+    assert!(volumes.iter().all(|archive| archive.main.is_volume()));
+
+    let extracted = collect_extract_volumes(&volumes).unwrap();
+    assert_eq!(extracted.len(), 1);
+    assert_eq!(extracted[0].name, b"stored_4k.bin");
+    assert_eq!(extracted[0].data.len(), 4096);
+    assert_eq!(crc32(&extracted[0].data), 0xa087_a9af);
+}
+
 #[test]
 fn extracts_rar50_encrypted_compressed_multivolume_archive() {
     let volumes = [
