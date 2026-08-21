@@ -1,6 +1,6 @@
 use super::*;
 use crate::crc32::Crc32;
-use crate::crypto::rar50::{Rar50Cipher, Rar50Keys};
+use crate::crypto::rar50::{Rar50Cipher, Rar50Keys, WRITE_KDF_COUNT_LOG};
 pub use crate::filter::{FilterKind, FilterPolicy, FilterSpec};
 use crate::write_plan::{PlanShape, WriterOption};
 use crate::write_progress::ProgressReporter;
@@ -831,7 +831,8 @@ fn encrypted_payload(
         .map_err(|_| Error::InvalidHeader("RAR 5 writer could not generate encryption salt"))?;
     getrandom::fill(&mut iv)
         .map_err(|_| Error::InvalidHeader("RAR 5 writer could not generate encryption IV"))?;
-    let keys = Rar50Keys::derive(password, salt, 0).map_err(super::map_rar50_crypto_error)?;
+    let keys = Rar50Keys::derive(password, salt, WRITE_KDF_COUNT_LOG)
+        .map_err(super::map_rar50_crypto_error)?;
 
     let mut encrypted_data = packed_data.to_vec();
     let padded_len = encrypted_data

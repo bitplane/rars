@@ -5,6 +5,15 @@ use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 const MAX_KDF_COUNT_LOG: u8 = 24;
+
+/// The PBKDF2 iteration exponent this writer stores in new archives, giving
+/// `2^15` = 32768 iterations.
+///
+/// WinRAR writes 15 and a reader honours whatever the archive declares, so the
+/// only thing a smaller exponent buys is a faster offline password guess
+/// against the archives we produce. It costs about 15 ms per encrypted member
+/// on the write side, which is what WinRAR pays too.
+pub const WRITE_KDF_COUNT_LOG: u8 = 15;
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

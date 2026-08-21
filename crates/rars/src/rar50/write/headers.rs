@@ -6,7 +6,7 @@
 //! are emitted.
 
 use super::ArchiveMetadataEntry;
-use crate::crypto::rar50::{Rar50Cipher, Rar50Keys};
+use crate::crypto::rar50::{Rar50Cipher, Rar50Keys, WRITE_KDF_COUNT_LOG};
 use crate::rar50::{
     map_rar50_crypto_error, FHEXTRA_CRYPT, FHEXTRA_HASH, FHFL_CRC32, FHFL_MTIME, HEAD_CRYPT,
     HEAD_END, HEAD_MAIN, HFL_EXTRA, MHEXTRA_ARCHIVE_METADATA, MHEXTRA_ARCHIVE_METADATA_NAME,
@@ -47,7 +47,7 @@ pub(super) fn write_file_encryption_record(
     let mut record = Vec::new();
     write_vint(&mut record, 0);
     write_vint(&mut record, 0x0003);
-    record.push(0);
+    record.push(WRITE_KDF_COUNT_LOG);
     record.extend_from_slice(&salt);
     record.extend_from_slice(&iv);
     record.extend_from_slice(&check_value);
@@ -315,7 +315,8 @@ pub(super) fn header_encryption_keys(password: &[u8]) -> Result<HeaderEncryption
     let mut salt = [0u8; 16];
     getrandom::fill(&mut salt)
         .map_err(|_| Error::InvalidHeader("RAR 5 writer could not generate encryption salt"))?;
-    let keys = Rar50Keys::derive(password, salt, 0).map_err(map_rar50_crypto_error)?;
+    let keys =
+        Rar50Keys::derive(password, salt, WRITE_KDF_COUNT_LOG).map_err(map_rar50_crypto_error)?;
     Ok(HeaderEncryptionKeys { keys, salt })
 }
 
@@ -342,7 +343,7 @@ pub(super) fn write_head_crypt(
     let mut specific = Vec::new();
     write_vint(&mut specific, 0);
     write_vint(&mut specific, 0x0001);
-    specific.push(0);
+    specific.push(WRITE_KDF_COUNT_LOG);
     specific.extend_from_slice(&header_keys.salt);
     specific.extend_from_slice(&header_keys.keys.password_check_record());
     write_block(out, HEAD_CRYPT, 0, None, &specific, &[], &[])

@@ -18,7 +18,7 @@ use super::headers::{
 };
 use super::layout::{resolve_layout, LayoutInputs};
 use super::{encrypt_reader_to, ArchiveEntry};
-use crate::crypto::rar50::Rar50Keys;
+use crate::crypto::rar50::{Rar50Keys, WRITE_KDF_COUNT_LOG};
 use crate::detect::RAR50_SIGNATURE;
 use crate::rar50::{
     FHEXTRA_SUBDATA, HEAD_END, HEAD_FILE, HEAD_SERVICE, HFL_DATA, HFL_EXTRA, MHFL_RECOVERY,
@@ -463,7 +463,7 @@ fn prepare_member(
             getrandom::fill(&mut iv).map_err(|_| {
                 Error::InvalidHeader("RAR 5 writer could not generate encryption IV")
             })?;
-            let keys = Rar50Keys::derive(password, salt, 0)
+            let keys = Rar50Keys::derive(password, salt, WRITE_KDF_COUNT_LOG)
                 .map_err(crate::rar50::map_rar50_crypto_error)?;
             write_file_encryption_record(&mut extra, salt, iv, keys.password_check_record());
             let crc32 = keys.mac_crc32(member.crc32);
@@ -825,7 +825,7 @@ fn prepare_volume_member(
             getrandom::fill(&mut iv).map_err(|_| {
                 Error::InvalidHeader("RAR 5 writer could not generate encryption IV")
             })?;
-            let keys = Rar50Keys::derive(password, salt, 0)
+            let keys = Rar50Keys::derive(password, salt, WRITE_KDF_COUNT_LOG)
                 .map_err(crate::rar50::map_rar50_crypto_error)?;
 
             // A volume boundary can fall anywhere, and the cipher runs as one

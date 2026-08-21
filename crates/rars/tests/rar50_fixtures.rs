@@ -1530,6 +1530,9 @@ fn writes_header_encrypted_rar50_file_comment_service_record() {
     .unwrap();
 
     assert!(matches!(Archive::parse(&bytes), Err(Error::NeedPassword)));
+    // The HEAD_CRYPT block is in the clear and carries its own KDF count,
+    // which has to be the same 2^15 as the per-file records below.
+    assert_eq!(head_crypt_kdf_count(&bytes), 15);
     let archive = Archive::parse_with_password(&bytes, Some(b"secret")).unwrap();
     let services: Vec<_> = archive.services().collect();
     assert_eq!(service_names(&archive), ["CMT"]);
@@ -2247,6 +2250,9 @@ fn writes_encrypted_stored_rar50_archive_that_reader_extracts_with_password() {
     let encryption = file.encryption.as_ref().unwrap();
     let second_encryption = second_file.encryption.as_ref().unwrap();
     assert!(encryption.check_value.is_some());
+    // 2^15 PBKDF2 iterations, the count WinRAR writes. Anything smaller is a
+    // free speedup for an offline password guess against our archives.
+    assert_eq!(encryption.kdf_count, 15);
     assert_ne!(encryption.salt, second_encryption.salt);
     assert_ne!(encryption.iv, second_encryption.iv);
     assert_eq!(file.packed_size() % 16, 0);
@@ -5516,4 +5522,30 @@ fn streams_rar50_match_that_reaches_past_the_start_of_the_window() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].0, b"zerofill.bin");
     assert_eq!(*entries[0].1.borrow(), zero_fill_payload());
+}
+
+/// The KDF count byte from the archive encryption header, which sits in the
+/// clear right after the marker: CRC32, then vints for header size, type 4,
+/// header flags, encryption version and encryption flags, then the byte.
+fn head_crypt_kdf_count(bytes: &[u8]) -> u8 {
+    let mut pos = 8 + 4;
+    let read_vint = |pos: &mut usize| {
+        let mut value = 0u64;
+        let mut shift = 0;
+        loop {
+            let byte = bytes[*pos];
+            *pos += 1;
+            value |= u64::from(byte & 0x7f) << shift;
+            shift += 7;
+            if byte & 0x80 == 0 {
+                return value;
+            }
+        }
+    };
+    read_vint(&mut pos); // header size
+    assert_eq!(read_vint(&mut pos), 4, "first block is not HEAD_CRYPT");
+    read_vint(&mut pos); // header flags
+    assert_eq!(read_vint(&mut pos), 0, "unexpected encryption version");
+    read_vint(&mut pos); // encryption flags
+    bytes[pos]
 }
