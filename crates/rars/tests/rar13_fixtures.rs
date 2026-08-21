@@ -19,6 +19,7 @@ const CMULTI_EXPECTED: &[u8] = include_bytes!("fixtures/rar13/CMULTI.TXT");
 const STOREPWD: &[u8] = include_bytes!("fixtures/rar13/STOREPWD.RAR");
 const SFXSRC: &[u8] = include_bytes!("fixtures/rar13/SFXSRC.EXE");
 const SOLID: &[u8] = include_bytes!("fixtures/rar13/SOLID.RAR");
+const SOLID_FLAG_CLEARED: &[u8] = include_bytes!("fixtures/rar13/solid_flag_cleared.rar");
 const MULTIVOL_RAR: &[u8] = include_bytes!("fixtures/rar13/MULTIVOL.RAR");
 const MULTIVOL_R00: &[u8] = include_bytes!("fixtures/rar13/MULTIVOL.R00");
 const MULTIVOL_R01: &[u8] = include_bytes!("fixtures/rar13/MULTIVOL.R01");
@@ -56,6 +57,24 @@ impl Write for CollectWriter {
     fn flush(&mut self) -> IoResult<()> {
         Ok(())
     }
+}
+
+/// RAR 1.4 stores `LHD_SOLID` at +17 bit 4 and never reads it back: solid
+/// continuation follows the archive-level `MHD_SOLID` flag and position.
+///
+/// The fixture has that bit cleared on the second member, which RAR 7.12 and
+/// UnRAR 7.20 both extract regardless. The member is 44 packed bytes standing
+/// for 2700 unpacked, so a byte-exact result is only reachable with the window
+/// carried over, which is what makes this a test of the flag being ignored
+/// rather than of the archive merely parsing.
+#[test]
+fn ignores_a_cleared_solid_flag() {
+    let archive = Archive::parse(SOLID_FLAG_CLEARED).unwrap();
+    let extracted = collect_extract(&archive, None).unwrap();
+
+    assert_eq!(extracted.len(), 2);
+    assert_eq!(extracted[0].data.len(), 2700);
+    assert_eq!(extracted[1].data, extracted[0].data);
 }
 
 fn collect_extract(

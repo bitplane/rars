@@ -4165,6 +4165,75 @@ fn extracts_rar50_solid_multivolume_archive() {
     assert_eq!(crc32(&extracted[1].data), 0xddc9_5682);
 }
 
+/// A volume set must agree on header encryption throughout. Splicing a
+/// plaintext volume into an encrypted set is a substitution attack: header
+/// encryption is what hides the file names, so an attacker who can replace one
+/// volume otherwise injects entries into an extraction the user believes is
+/// protected end to end.
+///
+/// RAR 7.12 and UnRAR 7.20 both abort with a bad-archive error rather than
+/// extract. rars refuses too, and must write nothing while doing so.
+#[test]
+fn rar50_refuses_a_volume_set_that_changes_encryption_partway() {
+    let volumes: Vec<_> = [
+        "header_encrypted_stored_multivol.part1.rar",
+        "plaintext_stored_multivol.part2.rar",
+        "header_encrypted_stored_multivol.part3.rar",
+    ]
+    .iter()
+    .filter_map(|name| Archive::parse_path_with_password(fixture(name), Some(b"password")).ok())
+    .collect();
+
+    assert_eq!(
+        volumes.len(),
+        3,
+        "every volume should still parse on its own"
+    );
+    assert!(matches!(
+        collect_extract_volumes_with_password(&volumes, Some(b"password")),
+        Err(Error::InvalidHeader(
+            "RAR 5 split entry encryption flag changed"
+        ))
+    ));
+}
+
+/// Bits 0-5 of CompInfo hold six bits and only two values are assigned, so a
+/// decoder must refuse the rest rather than falling through to Unpack50 and
+/// misreading a stream it cannot decode. RAR 7.12 and UnRAR 7.20 answer
+/// `Unknown method` for version 2 on a compressed member.
+///
+/// A stored member is the exception and extracts on both, because nothing is
+/// decompressed and the version never comes up. So the refusal belongs on the
+/// decompressor, not at header parse time, and that is the half worth pinning:
+/// a reader that rejects too early breaks archives the reference reads.
+#[test]
+fn rar50_refuses_an_unknown_algorithm_version_only_when_it_must_decompress() {
+    let compressed = Archive::parse_path(fixture("algorithm_version_2.rar")).unwrap();
+    assert!(matches!(
+        collect_extract(&compressed),
+        Err(Error::AtEntry { source, .. })
+            if matches!(*source, Error::UnsupportedFeature { .. })
+    ));
+
+    let stored = Archive::parse_path(fixture("algorithm_version_2_stored.rar")).unwrap();
+    let extracted = collect_extract(&stored).unwrap();
+    assert_eq!(extracted.len(), 1);
+    assert_eq!(extracted[0].data, b"Hello, RAR 5.0 fixture world.\n");
+}
+
+/// A non-solid stream starts with no Huffman tables loaded, so a first block
+/// that clears `table_present` has nothing to reuse.
+///
+/// RAR 7.12 and UnRAR 7.20 fail the member too, but by a different route: they
+/// appear to decode against whatever their table memory holds and emit wrong
+/// bytes until the checksum catches it. Refusing the block outright reaches the
+/// same verdict without decoding anything.
+#[test]
+fn rar50_refuses_a_first_block_that_reuses_absent_tables() {
+    let archive = Archive::parse_path(fixture("first_block_without_tables.rar")).unwrap();
+    assert!(collect_extract(&archive).is_err());
+}
+
 /// Modern WinRAR writes the modification time into `FHEXTRA_HTIME` and leaves
 /// the base-header field out, so a reader that only looks at the header field
 /// restores nothing. 39 of the 40 RAR 5 fixtures here carry the record and one

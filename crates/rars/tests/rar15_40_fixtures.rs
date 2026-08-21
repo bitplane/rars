@@ -88,6 +88,39 @@ impl Write for CollectWriter {
     }
 }
 
+/// A block whose declared extent is zero leaves the next position equal to the
+/// current one, and a walk that just seeks and repeats spins there forever.
+///
+/// RAR 7.12 and UnRAR 7.20 both reject this archive and neither hangs. rars
+/// gets there by refusing any header below the 7-byte minimum, which keeps the
+/// block extent positive; a direct next > current comparison would do as well.
+#[test]
+fn rejects_a_block_header_that_does_not_advance() {
+    let data = std::fs::read(fixture("zero_head_size.rar")).unwrap();
+    assert!(Archive::parse(&data)
+        .and_then(|archive| collect_extract(&archive))
+        .is_err());
+}
+
+/// Below `UnpVer` 20 the per-file solid flag is written but never read: solid
+/// continuation follows the archive-level flag and position instead.
+///
+/// The fixture is a solid RAR 1.5 pair with `FHD_SOLID` cleared on the second
+/// member and the header CRC recomputed. Extraction can only succeed by
+/// carrying the window across, since that member is 46 packed bytes standing
+/// for 2700 unpacked, so a byte-exact result proves the flag was ignored.
+#[test]
+fn rar15_ignores_a_cleared_solid_flag_below_unpack20() {
+    let data = std::fs::read(fixture("solid_flag_cleared_rar15.rar")).unwrap();
+    let archive = Archive::parse(&data).unwrap();
+    let extracted = collect_extract(&archive).unwrap();
+
+    assert_eq!(extracted.len(), 2);
+    assert_eq!(extracted[0].data.len(), 2700);
+    assert_eq!(extracted[1].data.len(), 2700);
+    assert_eq!(extracted[0].data, extracted[1].data);
+}
+
 fn collect_extract(archive: &Archive) -> Result<Vec<CollectedEntry>, Error> {
     collect_extract_with_password(archive, None)
 }
