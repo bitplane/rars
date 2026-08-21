@@ -120,8 +120,10 @@ pub struct ExtractedEntryMeta {
     pub name: Vec<u8>,
     /// DOS/FAT timestamp when the archive family exposes one.
     pub file_time: u32,
-    /// File attributes widened to a common integer type.
+    /// File attributes widened to a common integer type, exactly as stored.
     pub file_attr: u64,
+    /// How to read `file_attr`, from the host OS the entry records.
+    pub attr_source: AttrSource,
     /// Whether the entry is a directory.
     pub is_directory: bool,
 }
@@ -133,8 +135,16 @@ impl ExtractedEntryMeta {
             name,
             file_time,
             file_attr,
+            attr_source: AttrSource::Unknown,
             is_directory,
         }
+    }
+
+    /// Records how `file_attr` should be read.
+    #[must_use]
+    pub fn with_attr_source(mut self, attr_source: AttrSource) -> Self {
+        self.attr_source = attr_source;
+        self
     }
 
     /// Raw entry name bytes as stored by the archive family.
@@ -874,11 +884,59 @@ pub fn read_volume_member_at(
     Ok(taken)
 }
 
+/// How to read [`ExtractedEntryMeta::file_attr`], which depends on the host
+/// that wrote the entry.
+///
+/// The grouping is measured, not assumed, because it is not the obvious one.
+/// Against RAR 7.12 on Linux at umask 022, extracting one file with only
+/// `HOST_OS` and `ATTR` changed:
+///
+/// | RAR 1.5-4.x `HOST_OS` | attr `0x21` | reading |
+/// |---|---|---|
+/// | 0 MS-DOS, 1 OS/2, 2 Win32, 4 Mac OS | 444 | DOS attributes |
+/// | 3 Unix, 5 BeOS | 041 | raw `st_mode` |
+/// | 6 WinCE, 7+ | 644 | ignored |
+///
+/// Mac OS sits with the DOS hosts and BeOS with the Unix ones, the reverse of
+/// how the two are usually grouped. RAR 5.0 numbers its hosts separately: 0 is
+/// Windows, 1 is Unix, and RAR 7.12 ignores the attributes of anything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum AttrSource {
+    /// Windows `FILE_ATTRIBUTE_*` bits.
+    Dos,
+    /// POSIX `st_mode`.
+    Unix,
+    /// A host this build does not know; attributes carry no meaning.
+    #[default]
+    Unknown,
+}
+
+impl AttrSource {
+    fn rar15_40(host_os: u8) -> Self {
+        match host_os {
+            0 | 1 | 2 | 4 => Self::Dos,
+            3 | 5 => Self::Unix,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn rar50(host_os: u64) -> Self {
+        match host_os {
+            0 => Self::Dos,
+            1 => Self::Unix,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 fn rar13_meta(meta: &rar13::ExtractedEntryMeta) -> ExtractedEntryMeta {
     ExtractedEntryMeta {
         name: meta.name.clone(),
         file_time: meta.file_time,
         file_attr: u64::from(meta.file_attr),
+        // RAR 1.3/1.4 is MS-DOS only.
+        attr_source: AttrSource::Dos,
         is_directory: meta.is_directory,
     }
 }
@@ -888,15 +946,23 @@ fn rar15_40_meta(meta: &rar15_40::ExtractedEntryMeta) -> ExtractedEntryMeta {
         name: meta.name.clone(),
         file_time: meta.file_time,
         file_attr: u64::from(meta.attr),
+        attr_source: AttrSource::rar15_40(meta.host_os),
         is_directory: meta.is_directory,
     }
 }
 
-fn rar50_meta(meta: &rar50::ExtractedEntryMeta) -> ExtractedEntryMeta {
+/// Converts RAR 5.0 entry metadata into the common form, resolving the
+/// attributes against the host OS as extraction needs them.
+///
+/// Public so a caller doing its own extraction gets the same resolution the
+/// built-in paths do; getting it wrong loses the read-only bit or applies a
+/// Windows attribute word as a Unix mode.
+pub fn rar50_meta(meta: &rar50::ExtractedEntryMeta) -> ExtractedEntryMeta {
     ExtractedEntryMeta {
         name: meta.name.clone(),
         file_time: meta.file_time,
         file_attr: meta.attr,
+        attr_source: AttrSource::rar50(meta.host_os),
         is_directory: meta.is_directory,
     }
 }
@@ -973,12 +1039,46 @@ mod tests {
             .join(name)
     }
 
+    /// Which hosts store DOS attributes and which store `st_mode` is measured
+    /// against RAR 7.12, and the grouping is not the obvious one: Mac OS reads
+    /// as a DOS host and BeOS as a Unix one.
+    #[test]
+    fn attr_source_follows_the_measured_host_grouping() {
+        for host in [0u8, 1, 2, 4] {
+            assert_eq!(AttrSource::rar15_40(host), AttrSource::Dos, "host {host}");
+        }
+        for host in [3u8, 5] {
+            assert_eq!(AttrSource::rar15_40(host), AttrSource::Unix, "host {host}");
+        }
+        for host in [6u8, 7, 255] {
+            assert_eq!(
+                AttrSource::rar15_40(host),
+                AttrSource::Unknown,
+                "host {host}"
+            );
+        }
+
+        assert_eq!(AttrSource::rar50(0), AttrSource::Dos);
+        assert_eq!(AttrSource::rar50(1), AttrSource::Unix);
+        for host in [2u64, 5, 99] {
+            assert_eq!(AttrSource::rar50(host), AttrSource::Unknown, "host {host}");
+        }
+
+        // A caller building metadata by hand gets no host, and no host means
+        // no attribute is applied rather than one guessed at.
+        assert_eq!(
+            ExtractedEntryMeta::new(b"x".to_vec(), 0, 0x21, false).attr_source,
+            AttrSource::Unknown
+        );
+    }
+
     #[test]
     fn extracted_entry_meta_exposes_raw_and_lossy_names() {
         let meta = ExtractedEntryMeta {
             name: vec![0xff, b'.', b't', b'x', b't'],
             file_time: 0,
             file_attr: 0,
+            attr_source: AttrSource::Unknown,
             is_directory: false,
         };
 

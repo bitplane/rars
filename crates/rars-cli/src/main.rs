@@ -808,12 +808,11 @@ impl<'a> ExtractOutputState<'a> {
 }
 
 fn rar50_extracted_meta(meta: &rars::rar50::ExtractedEntryMeta) -> rars::ExtractedEntryMeta {
-    rars::ExtractedEntryMeta::new(
-        rar50_entry_name(&meta.name, meta.host_os),
-        meta.file_time,
-        meta.attr,
-        meta.is_directory,
-    )
+    // The library resolves attributes against the host OS; only the name needs
+    // the RAR 5 backslash rule applied on top.
+    let mut common = rars::rar50_meta(meta);
+    common.name = rar50_entry_name(&meta.name, meta.host_os);
+    common
 }
 
 fn extract_single_archive(

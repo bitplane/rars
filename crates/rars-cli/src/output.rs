@@ -1,6 +1,9 @@
 use crate::time::extracted_system_time;
 use crate::{CliError, CliResult};
-use rars::{Archive as DetectedArchive, ArchiveFamily, ArchiveVersion, Error, ExtractedEntryMeta};
+use rars::{
+    Archive as DetectedArchive, ArchiveFamily, ArchiveVersion, AttrSource, Error,
+    ExtractedEntryMeta,
+};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Component, Path, PathBuf};
@@ -222,13 +225,23 @@ pub(crate) fn restore_output_metadata(outputs: &[ExtractedOutput]) -> std::io::R
         if let Some(time) = extracted_system_time(output.family, output.meta.file_time) {
             set_modified_time(&output.path, time)?;
         }
-        set_extracted_permissions(&output.path, output.meta.file_attr)?;
+        set_extracted_permissions(
+            &output.path,
+            output.meta.file_attr,
+            output.meta.attr_source,
+            false,
+        )?;
     }
     for output in outputs
         .iter()
         .filter(|output| output.restore_metadata && output.meta.is_directory)
     {
-        set_extracted_permissions(&output.path, output.meta.file_attr)?;
+        set_extracted_permissions(
+            &output.path,
+            output.meta.file_attr,
+            output.meta.attr_source,
+            true,
+        )?;
         if let Some(time) = extracted_system_time(output.family, output.meta.file_time) {
             set_modified_time(&output.path, time)?;
         }
@@ -256,20 +269,48 @@ fn set_modified_time(path: &Path, time: SystemTime) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
-fn set_extracted_permissions(path: &Path, file_attr: u64) -> std::io::Result<()> {
+fn set_extracted_permissions(
+    path: &Path,
+    file_attr: u64,
+    attr_source: AttrSource,
+    is_directory: bool,
+) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    if file_attr & 0o170000 != 0 {
-        fs::set_permissions(
-            path,
-            fs::Permissions::from_mode(u32::try_from(file_attr & 0o777).unwrap_or(0o644)),
-        )?;
+    const FILE_ATTRIBUTE_READONLY: u64 = 0x01;
+
+    let mode = match attr_source {
+        // A DOS attribute word says nothing about permissions except whether
+        // the entry is read-only. Everything else is already right: the file
+        // was created 0666 & ~umask and the directory 0777 & ~umask, which is
+        // what the reference leaves behind, so only read-only needs acting on
+        // and only on files.
+        AttrSource::Dos => {
+            (!is_directory && file_attr & FILE_ATTRIBUTE_READONLY != 0).then_some(0o444)
+        }
+        // A st_mode is applied verbatim, but only when it carries file-type
+        // bits. Without them the value is not a mode, and stripping a file to
+        // whatever the low bits happen to say is worse than leaving it.
+        AttrSource::Unix if file_attr & 0o170000 != 0 => {
+            Some(u32::try_from(file_attr & 0o777).unwrap_or(0o644))
+        }
+        AttrSource::Unix | AttrSource::Unknown => None,
+        _ => None,
+    };
+
+    if let Some(mode) = mode {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
     }
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn set_extracted_permissions(_path: &Path, _file_attr: u64) -> std::io::Result<()> {
+fn set_extracted_permissions(
+    _path: &Path,
+    _file_attr: u64,
+    _attr_source: AttrSource,
+    _is_directory: bool,
+) -> std::io::Result<()> {
     Ok(())
 }
 
