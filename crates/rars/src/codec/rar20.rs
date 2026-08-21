@@ -1999,19 +1999,26 @@ impl Unpack20 {
 
     fn copy_match(&mut self, length: usize, offset: usize, output_size: usize) -> Result<()> {
         let offset = if offset == 0 { 1 } else { offset };
-        let current = self.current_pos();
-        if offset > current {
-            return Err(Error::InvalidData("RAR 2.0 match distance is out of range"));
-        }
+        // A match reaching past the start of the stream writes zeroes rather
+        // than failing. WinRAR never clears its window and guards the copy
+        // with a first-wrap flag instead, so those bytes read as zero there,
+        // and an archive that leans on it stays readable here. The decision
+        // is taken once for the whole match, as it is there: a copy does not
+        // start on zeroes and cross into real bytes partway.
+        let before_window = offset > self.current_pos();
         for index in 0..length {
             if self.current_pos() >= output_size {
                 self.pending_match = Some((length - index, offset));
                 break;
             }
-            let src = self.current_pos() - offset;
-            let byte = *self
-                .raw_byte(src)
-                .ok_or(Error::InvalidData("RAR 2.0 match distance is out of range"))?;
+            let byte = if before_window {
+                0
+            } else {
+                let src = self.current_pos() - offset;
+                *self
+                    .raw_byte(src)
+                    .ok_or(Error::InvalidData("RAR 2.0 match distance is out of range"))?
+            };
             self.output.push(byte);
         }
         Ok(())
@@ -2410,6 +2417,16 @@ mod tests {
             .unwrap();
 
         assert_eq!(output, expected_text());
+    }
+
+    #[test]
+    fn copy_match_zero_fills_an_offset_that_reaches_past_the_stream() {
+        let mut decoder = Unpack20::new();
+        decoder.output.extend_from_slice(b"AB");
+
+        decoder.copy_match(4, 9, 6).unwrap();
+
+        assert_eq!(decoder.output, b"AB\0\0\0\0");
     }
 
     #[test]

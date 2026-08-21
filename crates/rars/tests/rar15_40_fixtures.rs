@@ -7019,3 +7019,22 @@ fn an_empty_member_does_not_restart_a_broken_solid_chain() {
         }
     }
 }
+
+#[test]
+fn extracts_legacy_matches_that_reach_past_the_start_of_the_window() {
+    let mut expected = vec![0u8; 8];
+    for _ in 0..8 {
+        expected.extend_from_slice(b"zero-fill regression payload ");
+    }
+
+    for name in ["zero_fill/rar20.rar", "zero_fill/rar29.rar"] {
+        let bytes = std::fs::read(fixture(name)).unwrap();
+        let archive = Archive::parse(&bytes).unwrap();
+        let file = archive.files().next().unwrap();
+
+        let entry = collect_file(&archive, file).unwrap();
+
+        assert_eq!(entry.name, b"zerofill.bin", "{name}");
+        assert_eq!(entry.data, expected, "{name}");
+    }
+}

@@ -2725,20 +2725,25 @@ impl Unpack50Decoder {
         output_limit: usize,
         dictionary_size: usize,
     ) -> Result<()> {
-        if distance > dictionary_size {
-            return Err(Error::InvalidData(
-                "RAR 5 match distance exceeds dictionary",
-            ));
-        }
-        if distance == 0 || distance > self.history.len() + output.len() {
-            return Err(Error::InvalidData("RAR 5 match distance exceeds window"));
-        }
         if output
             .len()
             .checked_add(length)
             .is_none_or(|end| end > output_limit)
         {
             return Err(Error::InvalidData("RAR 5 match exceeds output limit"));
+        }
+        // A match reaching past the start of the window writes zeroes rather
+        // than failing. WinRAR never clears its window and guards the copy
+        // with a first-wrap flag instead, so those bytes read as zero there,
+        // and an archive that leans on it stays readable here. Nothing is
+        // swallowed: a stream that is damaged rather than merely odd still
+        // fails its file hash.
+        if distance == 0
+            || distance > dictionary_size
+            || distance > self.history.len() + output.len()
+        {
+            output.resize(output.len() + length, 0);
+            return Ok(());
         }
         let mut remaining = length;
         while remaining > 0 {
@@ -2880,14 +2885,15 @@ impl StreamingOutput {
         length: usize,
         sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), StreamDecodeError<E>> {
-        if distance > self.dictionary_size {
-            return Err(Error::InvalidData("RAR 5 match distance exceeds dictionary").into());
-        }
         if self.all_zero && distance <= self.written + self.history.len() {
             return self.push_zeroes(length, sink);
         }
-        if distance == 0 || distance > self.history.len() + self.pending.len() {
-            return Err(Error::InvalidData("RAR 5 match distance exceeds window").into());
+        // Zero-fill out-of-window matches, as the buffered decoder does.
+        if distance == 0
+            || distance > self.dictionary_size
+            || distance > self.history.len() + self.pending.len()
+        {
+            return self.push_repeated(0, length, sink);
         }
         if self
             .written
@@ -5097,31 +5103,37 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_match_copy() {
+    fn zero_fills_a_match_that_reaches_past_the_window() {
+        let decoder = Unpack50Decoder::new();
+        let mut output = b"AB".to_vec();
+
+        decoder
+            .copy_match(&mut output, 3, 1, 3, DEFAULT_DICTIONARY_SIZE)
+            .unwrap();
+
+        assert_eq!(output, b"AB\0");
+    }
+
+    #[test]
+    fn rejects_a_match_that_runs_past_the_output_limit() {
         let decoder = Unpack50Decoder::new();
         let mut output = b"AB".to_vec();
 
         assert_eq!(
-            decoder.copy_match(&mut output, 3, 1, 3, DEFAULT_DICTIONARY_SIZE),
-            Err(Error::InvalidData("RAR 5 match distance exceeds window"))
-        );
-        assert_eq!(
             decoder.copy_match(&mut output, 1, 2, 3, DEFAULT_DICTIONARY_SIZE),
             Err(Error::InvalidData("RAR 5 match exceeds output limit"))
         );
+        assert_eq!(output, b"AB");
     }
 
     #[test]
-    fn rejects_match_distance_beyond_dictionary() {
+    fn zero_fills_a_match_distance_beyond_the_dictionary() {
         let decoder = Unpack50Decoder::new();
         let mut output = b"ABCD".to_vec();
 
-        assert_eq!(
-            decoder.copy_match(&mut output, 4, 1, 5, 3),
-            Err(Error::InvalidData(
-                "RAR 5 match distance exceeds dictionary"
-            ))
-        );
+        decoder.copy_match(&mut output, 4, 1, 5, 3).unwrap();
+
+        assert_eq!(output, b"ABCD\0");
     }
 
     #[test]
@@ -5241,15 +5253,34 @@ mod tests {
     }
 
     #[test]
-    fn streaming_window_rejects_match_beyond_declared_dictionary() {
+    fn streaming_window_zero_fills_match_beyond_declared_dictionary() {
         let mut output = StreamingOutput::new(vec![b'A'; 8], 1, 7, 8);
+        let mut decoded = Vec::new();
 
-        assert!(matches!(
-            output.copy_match(8, 1, &mut |_| Ok::<(), std::io::Error>(())),
-            Err(StreamDecodeError::Decode(Error::InvalidData(
-                "RAR 5 match distance exceeds dictionary"
-            )))
-        ));
+        output
+            .copy_match(8, 1, &mut |chunk| {
+                match chunk {
+                    DecodedChunk::Bytes(bytes) => decoded.extend_from_slice(bytes),
+                    DecodedChunk::Repeated { byte, len } => {
+                        decoded.extend(std::iter::repeat_n(byte, len));
+                    }
+                }
+                Ok::<(), std::io::Error>(())
+            })
+            .unwrap();
+        output
+            .flush(&mut |chunk| {
+                match chunk {
+                    DecodedChunk::Bytes(bytes) => decoded.extend_from_slice(bytes),
+                    DecodedChunk::Repeated { byte, len } => {
+                        decoded.extend(std::iter::repeat_n(byte, len));
+                    }
+                }
+                Ok::<(), std::io::Error>(())
+            })
+            .unwrap();
+
+        assert_eq!(decoded, b"\0");
     }
 
     fn literal_only_payload(data: &[u8]) -> Vec<u8> {

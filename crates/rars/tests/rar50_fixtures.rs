@@ -5472,3 +5472,48 @@ fn reference_rar_accepts_a_streaming_volume_set() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+fn zero_fill_payload() -> Vec<u8> {
+    let mut expected = vec![0u8; 8];
+    for _ in 0..8 {
+        expected.extend_from_slice(b"zero-fill regression payload ");
+    }
+    expected
+}
+
+#[test]
+fn extracts_rar50_match_that_reaches_past_the_start_of_the_window() {
+    let bytes = std::fs::read(fixture("zero_fill_out_of_window.rar")).unwrap();
+    let archive = Archive::parse(&bytes).unwrap();
+    let file = archive.files().next().unwrap();
+
+    let entry = collect_file(&archive, file).unwrap();
+
+    assert_eq!(entry.name, b"zerofill.bin");
+    assert_eq!(entry.data, zero_fill_payload());
+}
+
+#[test]
+fn streams_rar50_match_that_reaches_past_the_start_of_the_window() {
+    let bytes = std::fs::read(fixture("zero_fill_out_of_window.rar")).unwrap();
+    let archive = Archive::parse(&bytes).unwrap();
+    let entries = RefCell::new(Vec::new());
+
+    extract_volumes_to(
+        std::slice::from_ref(&archive),
+        ArchiveReadOptions::default().with_rar50_buffered_decode_limit(0),
+        |meta| {
+            let data = Rc::new(RefCell::new(Vec::new()));
+            entries
+                .borrow_mut()
+                .push((meta.name.clone(), Rc::clone(&data)));
+            Ok(Box::new(CollectWriter { data }))
+        },
+    )
+    .unwrap();
+
+    let entries = entries.into_inner();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].0, b"zerofill.bin");
+    assert_eq!(*entries[0].1.borrow(), zero_fill_payload());
+}
