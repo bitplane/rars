@@ -4228,6 +4228,82 @@ fn parses_rar50_recovery_service_archive() {
     assert_eq!(recovery.payload_size, 210);
 }
 
+/// Rewrites the `RR` service header's extra area in `with_recovery.rar` and
+/// fixes up the two sizes and the header CRC32 that describe it.
+///
+/// The header's `ExtraSize`, `HeadSize` and every extra record here fit in a
+/// one-byte vint, so splicing is a byte-for-byte substitution.
+fn with_recovery_extra_area(extra: &[u8]) -> Vec<u8> {
+    const CRC_POS: usize = 0x81;
+    const BODY: usize = 0x86;
+    const HEAD_SIZE_POS: usize = 0x85;
+    const EXTRA_SIZE_POS: usize = 0x88;
+    const EXTRA_START: usize = 0x95;
+    const EXTRA_END: usize = 0x98;
+
+    let mut data = fs::read(fixture("with_recovery.rar")).unwrap();
+    assert_eq!(&data[EXTRA_START..EXTRA_END], b"\x02\x07\x0a");
+    assert!(extra.len() < 0x80);
+
+    data.splice(EXTRA_START..EXTRA_END, extra.iter().copied());
+    data[EXTRA_SIZE_POS] = extra.len() as u8;
+    data[HEAD_SIZE_POS] =
+        (data[HEAD_SIZE_POS] as usize + extra.len() - (EXTRA_END - EXTRA_START)) as u8;
+    let header_end = BODY + data[HEAD_SIZE_POS] as usize;
+    let header_crc = crc32(&data[CRC_POS + 4..header_end]);
+    data[CRC_POS..CRC_POS + 4].copy_from_slice(&header_crc.to_le_bytes());
+    data
+}
+
+/// WinRAR 5.21 and earlier stored the `FHEXTRA_SUBDATA` size one less than the
+/// payload they wrote. `SUBDATA` is the last record in a service header, so the
+/// shortfall leaves exactly one byte dangling, and a reader that drops it loses
+/// the recovery percent.
+#[test]
+fn reads_rar50_service_subdata_whose_size_underflows_by_one() {
+    let archive = Archive::parse_path(fixture("subdata_size_underflow.rar")).unwrap();
+
+    assert_eq!(service_names(&archive), ["RR"]);
+    let recovery = archive.services().next().unwrap();
+    assert_eq!(recovery.service_data, Some(vec![0x0a]));
+    let recovery = recovery.recovery_record().unwrap().unwrap();
+    assert_eq!(recovery.percent, 10);
+    assert_eq!(recovery.payload_size, 210);
+}
+
+/// The fold is deliberately narrow: it fires only for `SUBDATA` on a service
+/// header, since that is the record WinRAR undersized. A stray byte after any
+/// other record just ends the walk.
+#[test]
+fn rar50_one_byte_fold_is_limited_to_service_subdata() {
+    // 0x03 is FHEXTRA_HTIME: same shape, wrong record type, so no fold.
+    let archive = Archive::parse(&with_recovery_extra_area(b"\x01\x03\x0a")).unwrap();
+    let service = archive.services().next().unwrap();
+    assert_eq!(service.service_data, None);
+    assert!(service.recovery_record().is_err());
+}
+
+/// A record that does not fit its extra area ends the walk. RAR 7.12 and UnRAR
+/// 7.20 extract from all four of these shapes, so failing the archive over one
+/// would discard file data that is intact.
+#[test]
+fn rar50_stops_on_a_malformed_extra_record_instead_of_failing_the_archive() {
+    let cases: [(&str, &[u8]); 4] = [
+        ("two bytes dangle after the record", b"\x01\x07\x0a\x0b"),
+        ("size vint runs past the extra area", b"\x02\x07\x0a\xff"),
+        ("first record claims 127 bytes", b"\x7f\x07\x0a\x0b"),
+        ("record too small for its type vint", b"\x00\x07\x0a\x0b"),
+    ];
+
+    for (name, extra) in cases {
+        let data = with_recovery_extra_area(extra);
+        let archive = Archive::parse(&data).unwrap_or_else(|error| panic!("{name}: {error}"));
+        let extracted = collect_extract(&archive).unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert_eq!(extracted.len(), 1, "{name}");
+        assert_eq!(extracted[0].name, b"hello.txt", "{name}");
+    }
+}
+
 #[test]
 fn parses_rar50_mixed_service_archive() {
     let archive = Archive::parse_path(fixture("with_all_services.rar")).unwrap();

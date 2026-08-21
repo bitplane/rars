@@ -1106,7 +1106,7 @@ fn parse_main_header_bytes(parsed: &ParsedBlockHeader) -> Result<MainHeader> {
 
 fn parse_main_extra_area(input: &[u8], range: Range<usize>) -> Result<Vec<MainExtraRecord>> {
     let mut records = Vec::new();
-    parse_extra_records(input, range, |record_type, data| match record_type {
+    parse_extra_records(input, range, false, |record_type, data| match record_type {
         MHEXTRA_LOCATOR => {
             let mut reader = SliceReader::new(input, data.start, data.end);
             let flags = reader.read_vint()?;
@@ -1203,15 +1203,25 @@ fn parse_file_header_bytes(parsed: &ParsedBlockHeader) -> Result<FileHeader> {
         encryption: None,
         crypto: None,
     };
-    parse_file_extra_area(&parsed.header, parsed.extra_range.clone(), &mut file)?;
+    parse_file_extra_area(
+        &parsed.header,
+        parsed.extra_range.clone(),
+        parsed.block.header_type == HEAD_SERVICE,
+        &mut file,
+    )?;
     Ok(file)
 }
 
-fn parse_file_extra_area(input: &[u8], range: Range<usize>, file: &mut FileHeader) -> Result<()> {
+fn parse_file_extra_area(
+    input: &[u8],
+    range: Range<usize>,
+    is_service: bool,
+    file: &mut FileHeader,
+) -> Result<()> {
     if file.block.extra_area_size.is_none() {
         return Ok(());
     }
-    parse_extra_records(input, range, |record_type, data| {
+    parse_extra_records(input, range, is_service, |record_type, data| {
         match record_type {
             FHEXTRA_CRYPT => {
                 file.encrypted = true;
@@ -1481,31 +1491,53 @@ where
     Ok((main, blocks))
 }
 
-fn parse_extra_records<F>(input: &[u8], range: Range<usize>, mut handle: F) -> Result<()>
+/// Walks the records of a RAR 5 extra area, handing each one to `handle`.
+///
+/// A record that does not fit the area ends the walk instead of failing the
+/// archive. RAR 7.12 and unrar 7.20 both extract normally from headers whose
+/// extra area ends in a record claiming more bytes than are left, a size vint
+/// cut off by the end of the area, or a record too small to hold its own type
+/// vint. Rejecting the archive would throw away file data that is intact.
+///
+/// On a service header, a single byte left over after a `SUBDATA` record is
+/// folded into that record. WinRAR 5.21 and earlier stored the `SUBDATA` size
+/// one less than the payload they wrote, and `SUBDATA` is the last record in
+/// those headers, so the shortfall surfaces as exactly one dangling byte.
+/// Without this, `RR` loses its recovery percent and `STM` loses the last
+/// character of the stream name. Note that the reference readers give no way
+/// to see the recovered byte from the outside: they accept the short shape,
+/// but neither prints the recovery percent, so the byte itself is unverified.
+fn parse_extra_records<F>(
+    input: &[u8],
+    range: Range<usize>,
+    is_service: bool,
+    mut handle: F,
+) -> Result<()>
 where
     F: FnMut(u64, Range<usize>) -> Result<()>,
 {
     let mut pos = range.start;
     while pos < range.end {
-        let record_start = pos;
-        let (record_size, size_len) = read_vint_at(input, pos, range.end)?;
-        pos += size_len;
-        let record_payload_len =
-            usize_from_u64(record_size, "RAR 5 extra record size overflows usize")?;
-        let record_end = pos
-            .checked_add(record_payload_len)
-            .ok_or(Error::InvalidHeader(
-                "RAR 5 extra record size overflows usize",
-            ))?;
-        if record_end > range.end {
-            return Err(Error::TooShort);
+        let Ok((record_size, size_len)) = read_vint_at(input, pos, range.end) else {
+            break;
+        };
+        let payload_start = pos + size_len;
+        let Ok(record_payload_len) = usize::try_from(record_size) else {
+            break;
+        };
+        let Some(mut record_end) = payload_start.checked_add(record_payload_len) else {
+            break;
+        };
+        if record_end > range.end || record_end <= payload_start {
+            break;
         }
-        let (record_type, type_len) = read_vint_at(input, pos, record_end)?;
-        let data_start = pos + type_len;
-        handle(record_type, data_start..record_end)?;
-        if record_end <= record_start {
-            return Err(Error::InvalidHeader("RAR 5 extra record does not advance"));
+        let Ok((record_type, type_len)) = read_vint_at(input, payload_start, record_end) else {
+            break;
+        };
+        if is_service && record_type == FHEXTRA_SUBDATA && range.end - record_end == 1 {
+            record_end = range.end;
         }
+        handle(record_type, payload_start + type_len..record_end)?;
         pos = record_end;
     }
     Ok(())
