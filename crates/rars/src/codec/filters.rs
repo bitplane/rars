@@ -31,6 +31,16 @@ pub(crate) fn encode_in_place(
     Ok(())
 }
 
+/// Channel ceiling on the decode side.
+///
+/// RAR 5 cannot exceed 32: its filter record stores `channels - 1` in five
+/// bits. The RAR 2.9 VM takes the count from register R[0] instead, and the
+/// reference decoder accepts up to 1024 there, so a decoder that stops at 32
+/// refuses archives the official tools extract. The bound still has to exist,
+/// because R[0] is a full 32-bit value from the archive and the deinterleave
+/// loop runs once per channel whether or not the channel has any bytes.
+pub(crate) const MAX_DELTA_CHANNELS: usize = 1024;
+
 pub(crate) fn decode_in_place(
     op: FilterOp,
     data: &mut Vec<u8>,
@@ -114,7 +124,7 @@ pub(crate) fn delta_decode(
     if channels == 0 {
         return Err(Error::InvalidData(messages.zero_channels));
     }
-    if channels > 32 {
+    if channels > MAX_DELTA_CHANNELS {
         return Err(Error::InvalidData(messages.invalid_channels));
     }
     let mut out = vec![0u8; data.len()];
@@ -317,12 +327,31 @@ mod tests {
     }
 
     #[test]
-    fn delta_decode_rejects_channel_counts_above_writer_limit() {
+    fn delta_decode_accepts_channel_counts_the_rar29_vm_can_ask_for() {
+        // 33 is past what RAR 5 can encode and well inside what the RAR 2.9
+        // VM can put in R[0]. Refusing it here refused whole archives.
         let mut filtered = vec![0; 64];
 
         assert_eq!(
             decode_in_place(
                 FilterOp::Delta { channels: 33 },
+                &mut filtered,
+                0,
+                generic_messages(),
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn delta_decode_rejects_channel_counts_above_the_vm_limit() {
+        let mut filtered = vec![0; 64];
+
+        assert_eq!(
+            decode_in_place(
+                FilterOp::Delta {
+                    channels: MAX_DELTA_CHANNELS + 1,
+                },
                 &mut filtered,
                 0,
                 generic_messages(),

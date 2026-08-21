@@ -133,3 +133,20 @@ fn real_executable_filter_archive_decodes() {
     assert_eq!(extracted[0].name, b"bsdcat.exe");
     assert_eq!(crc32(&extracted[0].data), 0x4db1_0349);
 }
+
+#[test]
+fn vm_delta_filter_accepts_more_than_thirty_two_channels() {
+    let mut expected = Vec::with_capacity(400 * 64);
+    for row in 0..400u32 {
+        for channel in 0..64u32 {
+            expected.push((channel * 7 + row * 3) as u8);
+        }
+    }
+    let archive = Archive::parse_path(fixture("delta_64_channels.rar")).unwrap();
+
+    let extracted = collect_extract(&archive).unwrap();
+
+    assert_eq!(extracted.len(), 1);
+    assert_eq!(extracted[0].name, b"delta64.bin");
+    assert_eq!(extracted[0].data, expected);
+}

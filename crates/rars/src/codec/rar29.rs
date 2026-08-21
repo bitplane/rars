@@ -1,4 +1,4 @@
-use super::filters::{self, DeltaErrorMessages, FilterOp};
+use super::filters::{self, DeltaErrorMessages, FilterOp, MAX_DELTA_CHANNELS};
 use super::huffman;
 use super::ppmd::{PpmdByteReader, PpmdDecoder, PpmdEncoder};
 use super::rarvm;
@@ -3163,8 +3163,10 @@ fn apply_standard_filter(
         StandardFilter::Itanium => itanium_decode(data, file_offset),
         StandardFilter::Delta => {
             let channels = regs[0] as usize;
-            if channels == 0 {
-                return Err(Error::InvalidData("RAR 2.9 DELTA filter has zero channels"));
+            if channels == 0 || channels > MAX_DELTA_CHANNELS {
+                return Err(Error::InvalidData(
+                    "RAR 2.9 DELTA filter channel count is invalid",
+                ));
             }
             filters::decode_in_place(
                 FilterOp::Delta { channels },
@@ -3185,8 +3187,10 @@ fn apply_standard_filter(
         }
         StandardFilter::Audio => {
             let channels = regs[0] as usize;
-            if channels == 0 {
-                return Err(Error::InvalidData("RAR 2.9 AUDIO filter has zero channels"));
+            if channels == 0 || channels > MAX_DELTA_CHANNELS {
+                return Err(Error::InvalidData(
+                    "RAR 2.9 AUDIO filter channel count is invalid",
+                ));
             }
             *data = audio_decode(data, channels)?;
         }
@@ -4412,7 +4416,21 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     fn standard_filters_reject_malformed_delta_and_rgb_registers() {
         let mut delta = vec![0; 32];
         let mut delta_regs = [0; 7];
+        // 33 channels is legal here: the count comes from R[0], not from a
+        // five-bit field, and the reference decoder allows up to 1024.
         delta_regs[0] = 33;
+        assert_eq!(
+            apply_standard_filter(StandardFilter::Delta, &mut delta, 0, &delta_regs),
+            Ok(())
+        );
+        delta_regs[0] = super::MAX_DELTA_CHANNELS as u32 + 1;
+        assert_eq!(
+            apply_standard_filter(StandardFilter::Delta, &mut delta, 0, &delta_regs),
+            Err(Error::InvalidData(
+                "RAR 2.9 DELTA filter channel count is invalid"
+            ))
+        );
+        delta_regs[0] = 0;
         assert_eq!(
             apply_standard_filter(StandardFilter::Delta, &mut delta, 0, &delta_regs),
             Err(Error::InvalidData(
