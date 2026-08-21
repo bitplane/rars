@@ -675,6 +675,21 @@ enum FragmentSource {
 }
 
 impl FragmentSource {
+    /// Checksums of the bytes a fragment will store, read ahead of writing them.
+    ///
+    /// The fragment's header carries these and the header goes out before the
+    /// payload, so the range is read twice: once here and once to copy it. The
+    /// alternative is patching the fields after the copy, which an encrypted
+    /// header will not allow.
+    fn checksums_range(&mut self, start: u64, len: u64) -> Result<FragmentChecksums> {
+        let mut sink = ChecksumSink::default();
+        self.copy_range(start, len, &mut sink)?;
+        Ok(FragmentChecksums {
+            crc32: sink.crc.finish(),
+            hash: sink.hash.finalize(),
+        })
+    }
+
     fn copy_range(&mut self, start: u64, len: u64, output: &mut dyn Write) -> Result<()> {
         match self {
             Self::Packed(spool) => {
@@ -691,6 +706,40 @@ impl FragmentSource {
                 }
             }
         }
+        Ok(())
+    }
+}
+
+/// What a fragment that is not the last one reports about its own bytes.
+#[derive(Clone, Copy)]
+struct FragmentChecksums {
+    crc32: u32,
+    hash: [u8; 32],
+}
+
+/// Discards what it is given and keeps the running checksums.
+struct ChecksumSink {
+    crc: crate::crc32::Crc32,
+    hash: crate::rar50::blake2sp::Hasher,
+}
+
+impl Default for ChecksumSink {
+    fn default() -> Self {
+        Self {
+            crc: crate::crc32::Crc32::new(),
+            hash: crate::rar50::blake2sp::Hasher::new(),
+        }
+    }
+}
+
+impl Write for ChecksumSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.crc.update(buf);
+        self.hash.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
 }
@@ -925,12 +974,20 @@ impl VolumeWriter<'_> {
             let remaining = member.payload_len - start;
             let fragment_len = room.min(remaining);
             let split_after = start + fragment_len < member.payload_len;
+            // A fragment that is not the last one has no whole-member checksum
+            // to report, so the field carries the CRC32 of the bytes this
+            // volume stores. That is what WinRAR puts there, and it lets a
+            // single volume be checked on its own.
+            let fragment_checksums = match split_after {
+                true => Some(member.source.checksums_range(start, fragment_len)?),
+                false => None,
+            };
 
             let header = fragment_header(
                 member,
                 fragment_len,
                 split_before,
-                split_after,
+                fragment_checksums,
                 self.header_keys,
             )?;
             let body = self.body.as_mut().expect("volume started");
@@ -1083,26 +1140,34 @@ impl VolumeWriter<'_> {
 
 /// Builds the file header for one fragment of a member.
 ///
-/// Every fragment repeats the member's metadata, but only the last one carries
-/// the checksum and hash, since those cover the whole member.
+/// Every fragment repeats the member's metadata. The last one carries the
+/// member's own checksum and hash; the rest carry `fragment` over the bytes
+/// they store, which is what WinRAR puts there and lets one volume be checked
+/// on its own. Encrypted fragments checksum the ciphertext, so that check needs
+/// no password.
+///
+/// Both a CRC32 and a hash record go on every fragment. A reader takes the hash
+/// record as the member's checksum type when it has one, and unrar picks that
+/// type from the first fragment and compares it against the last, so a fragment
+/// that offered only a CRC32 while the last offered a hash would fail a member
+/// that is perfectly intact.
 fn fragment_header(
     member: &VolumeMember,
     fragment_len: u64,
     split_before: bool,
-    split_after: bool,
+    fragment: Option<FragmentChecksums>,
     header_keys: Option<&HeaderEncryptionKeys>,
 ) -> Result<Vec<u8>> {
+    let split_after = fragment.is_some();
     let mut extra = Vec::new();
     if let Some((salt, iv, check_value)) = member.encryption {
         write_file_encryption_record(&mut extra, salt, iv, check_value);
     }
-    if !split_after {
-        write_hash_record_with_value(&mut extra, member.hash);
-    }
+    write_hash_record_with_value(&mut extra, fragment.map_or(member.hash, |f| f.hash));
     let specific = file_specific(
         &member.name,
         member.unpacked_size,
-        (!split_after).then_some(member.crc32),
+        Some(fragment.map_or(member.crc32, |f| f.crc32)),
         member.attributes,
         member.mtime,
         member.compression_info,

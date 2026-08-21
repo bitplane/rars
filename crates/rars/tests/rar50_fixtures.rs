@@ -1059,6 +1059,111 @@ fn writes_compressed_rar50_volume_set_that_reader_reassembles() {
     assert_eq!(extracted[0].file_time, 0x5a21_0002);
 }
 
+/// A fragment that is not the last one has no whole-member checksum to report,
+/// so it reports the bytes it stores instead, the way WinRAR does. Both a CRC32
+/// and a hash record go on every fragment: a reader takes the hash record as
+/// the member's checksum type, and unrar reads that type from the first
+/// fragment and compares it against the last, so a first fragment offering only
+/// a CRC32 fails a member that is perfectly intact.
+#[test]
+fn every_rar50_volume_fragment_checksums_the_bytes_it_stores() {
+    let payload = deterministic_noise(4096);
+    let entry = entry(b"fragment-checksums.bin", &payload).with_mtime(Some(0x5a21_0031));
+    let parts = write_volumes(
+        std::slice::from_ref(&entry),
+        rar50::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only()),
+        1024,
+        None,
+    )
+    .unwrap();
+    assert!(parts.len() >= 3);
+
+    let archives: Vec<_> = parts
+        .iter()
+        .map(|part| Archive::parse(part).unwrap())
+        .collect();
+    let member_crc = crc32(&payload);
+    for (index, archive) in archives.iter().enumerate() {
+        let file = archive.files().next().unwrap();
+        assert!(
+            file.hash.is_some(),
+            "volume {} has no hash record",
+            index + 1
+        );
+        let stored = &parts[index][file.block.data_range.clone()];
+        match file.is_split_after() {
+            true => {
+                assert_eq!(
+                    file.data_crc32,
+                    Some(crc32(stored)),
+                    "volume {} does not checksum its own bytes",
+                    index + 1
+                );
+                assert_ne!(file.data_crc32, Some(member_crc));
+            }
+            false => assert_eq!(file.data_crc32, Some(member_crc)),
+        }
+    }
+}
+
+/// unrar and RAR 7.12 both read a set with a damaged middle volume to the end
+/// and then report one checksum error for the member, which says nothing about
+/// where the damage is. The fragment checksums are enough to say, so say it.
+#[test]
+fn a_damaged_rar50_volume_is_reported_by_its_number() {
+    // Compressible enough that the member is packed rather than stored, and
+    // large enough that the packed bytes still need several volumes.
+    let payload = deterministic_noise(2048).repeat(8);
+    let entry = entry(b"damaged-volume.bin", &payload).with_mtime(Some(0x5a21_0032));
+    let mut parts = write_volumes(
+        std::slice::from_ref(&entry),
+        rar50::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only()),
+        512,
+        None,
+    )
+    .unwrap();
+    assert!(parts.len() >= 3);
+    let last = Archive::parse(parts.last().unwrap()).unwrap();
+    assert_eq!(
+        last.files()
+            .next()
+            .unwrap()
+            .decoded_compression_info()
+            .unwrap()
+            .method,
+        3
+    );
+
+    let damaged = 1;
+    let range = Archive::parse(&parts[damaged])
+        .unwrap()
+        .files()
+        .next()
+        .unwrap()
+        .block
+        .data_range
+        .clone();
+    parts[damaged][range.start] ^= 0xff;
+
+    let archives: Vec<_> = parts
+        .iter()
+        .map(|part| Archive::parse(part).unwrap())
+        .collect();
+    let error = collect_extract_volumes(&archives).unwrap_err();
+    let mut source = &error;
+    while let Error::AtEntry { source: inner, .. } | Error::AtArchiveOffset { source: inner, .. } =
+        source
+    {
+        source = inner;
+    }
+    assert!(
+        matches!(source, Error::InVolume { number, source }
+            if *number == damaged + 1 && matches!(**source, Error::Crc32Mismatch { .. })),
+        "expected volume {} to be named, got {error}",
+        damaged + 1
+    );
+}
+
 #[test]
 fn compressed_rar50_volume_writer_stores_member_when_lz_payload_would_grow() {
     let data = deterministic_noise(8192);
@@ -2103,7 +2208,14 @@ fn writes_stored_rar50_volume_set_that_reader_reassembles() {
     assert_eq!(archives[0].main.volume_number, Some(0));
     assert_eq!(archives[1].main.volume_number, Some(1));
     assert!(archives[0].files().next().unwrap().is_split_after());
-    assert_eq!(archives[0].files().next().unwrap().data_crc32, None);
+    // A fragment that is not the last one checksums the bytes it stores rather
+    // than the member, which it has no way to checksum yet.
+    assert_eq!(
+        archives[0].files().next().unwrap().data_crc32,
+        Some(crc32(
+            &parts[0][archives[0].files().next().unwrap().block.data_range.clone()]
+        ))
+    );
     assert!(archives[1].files().next().unwrap().is_split_before());
     assert!(!archives
         .last()

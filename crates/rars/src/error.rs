@@ -39,6 +39,11 @@ pub enum Error {
         operation: &'static str,
         source: Box<Error>,
     },
+    /// A fault traced to one volume of a set, numbered from one.
+    InVolume {
+        number: usize,
+        source: Box<Error>,
+    },
     UnsupportedVersion(ArchiveVersion),
     UnsupportedFeature {
         version: ArchiveVersion,
@@ -108,6 +113,7 @@ impl std::fmt::Display for Error {
             Self::AtArchiveOffset { offset, source } => {
                 write!(f, "at archive offset {offset:#x}: {source}")
             }
+            Self::InVolume { number, source } => write!(f, "in volume {number}: {source}"),
             Self::AtEntry {
                 name,
                 operation,
@@ -196,6 +202,13 @@ impl std::fmt::Display for Error {
 
 impl From<std::io::Error> for Error {
     fn from(error: std::io::Error) -> Self {
+        // A reader buried inside a decoder has only `io::Error` to report
+        // through, so it wraps the real error. Unwrap it again here, otherwise
+        // a checksum mismatch surfaces as an I/O failure.
+        let error = match error.downcast::<Self>() {
+            Ok(inner) => return inner,
+            Err(error) => error,
+        };
         Self::Io(IoError {
             kind: error.kind(),
             message: error.to_string(),
@@ -207,7 +220,9 @@ impl From<std::io::Error> for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::AtArchiveOffset { source, .. } | Self::AtEntry { source, .. } => Some(source),
+            Self::AtArchiveOffset { source, .. }
+            | Self::AtEntry { source, .. }
+            | Self::InVolume { source, .. } => Some(source),
             Self::Codec(source) => Some(source),
             Self::Rar3Recovery(source) => Some(source),
             Self::Rar5Recovery(source) => Some(source),

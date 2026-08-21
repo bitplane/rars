@@ -873,9 +873,13 @@ impl PendingSplitRefs {
             is_directory: false,
         };
         let mut writer = open(&meta)?;
+        // Whatever goes wrong with a member split across volumes, the fragment
+        // checksums may know which volume to blame. Ask them before giving the
+        // caller an error that names no part of the set.
         if final_file.is_stored() {
             return self
                 .write_stored_to(volumes, final_file, decryptor.as_ref(), &mut writer)
+                .map_err(|error| self.checksum_error(volumes).unwrap_or(error))
                 .map_err(|error| final_file.entry_error("extracting", error));
         }
 
@@ -884,6 +888,7 @@ impl PendingSplitRefs {
             .map_err(|error| final_file.entry_error("decoding", error))?;
         final_file
             .verify_integrity_with_keys(&data, decryptor.as_ref().map(|decryptor| &decryptor.keys))
+            .map_err(|error| self.checksum_error(volumes).unwrap_or(error))
             .map_err(|error| final_file.entry_error("verifying", error))?;
         writer
             .write_all(&data)
@@ -994,6 +999,48 @@ impl PendingSplitRefs {
         }))
     }
 
+    /// Re-reads every fragment that carries a checksum over its own stored
+    /// bytes and reports the first that disagrees.
+    ///
+    /// Only consulted once a member has already failed. Checking as the
+    /// fragments are read would reject an archive whose fragment checksums say
+    /// something other than what rars and WinRAR put there, and unrar and RAR
+    /// 7.12 both extract those. Reading the set a second time to explain a
+    /// failure is worth it; refusing a member that would have come out intact
+    /// is not.
+    fn checksum_error(&self, volumes: &[Archive]) -> Option<Error> {
+        let last = self.fragments.len().saturating_sub(1);
+        for (index, &(volume_index, file_index)) in self.fragments.iter().enumerate() {
+            if index == last {
+                break;
+            }
+            let Some(archive) = volumes.get(volume_index) else {
+                continue;
+            };
+            let Some(file) = archive.files().nth(file_index) else {
+                continue;
+            };
+            let Some(expected) = file.data_crc32 else {
+                continue;
+            };
+            let mut crc = Crc32::new();
+            if archive
+                .copy_range_to(file.block.data_range.clone(), &mut CrcSink(&mut crc))
+                .is_err()
+            {
+                continue;
+            }
+            let actual = crc.finish();
+            if actual != expected {
+                return Some(Error::InVolume {
+                    number: volume_index + 1,
+                    source: Box::new(Error::Crc32Mismatch { expected, actual }),
+                });
+            }
+        }
+        None
+    }
+
     fn fragment_reader<'a>(
         &self,
         volumes: &'a [Archive],
@@ -1087,7 +1134,7 @@ impl FileHeader {
         })?;
         let mut reader = split.fragment_reader(volumes, decryptor)?;
         let output_size = checked_unpacked_size(self.unpacked_size)?;
-        decoder
+        let decoded = decoder
             .decode_member_from_reader_with_dictionary(
                 &mut reader,
                 info.algorithm_version,
@@ -1096,7 +1143,29 @@ impl FileHeader {
                 info.solid,
                 DecodeMode::Lz,
             )
-            .map_err(Error::from)
+            .map_err(Error::from);
+        // A damaged volume usually derails the decoder before the fragment it
+        // sits in is read to its end, so the reader's own check never fires and
+        // the member fails as "truncated" instead. Checking the fragments here
+        // turns that into the checksum mismatch it is.
+        match decoded {
+            Err(error) => Err(split.checksum_error(volumes).unwrap_or(error)),
+            decoded => decoded,
+        }
+    }
+}
+
+/// Feeds what it is given to a running CRC32 and keeps none of it.
+struct CrcSink<'a>(&'a mut Crc32);
+
+impl Write for CrcSink<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 

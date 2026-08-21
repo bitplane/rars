@@ -678,6 +678,7 @@ impl FileHeader {
             | Error::Io(_)
             | Error::AtArchiveOffset { .. }
             | Error::AtEntry { .. }
+            | Error::InVolume { .. }
             | Error::Cancelled => error,
             Error::InvalidHeader(_)
             | Error::Codec(_)
