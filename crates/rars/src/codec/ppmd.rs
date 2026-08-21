@@ -1547,7 +1547,6 @@ impl PpmdEncoder {
     pub(crate) fn spent_bits(&self) -> f64 {
         8.0 * self.range.out.len() as f64 - f64::from(self.range.range.max(1)).log2()
     }
-
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -491,9 +491,11 @@ fn count_verified_quick_open_wrappers(data: &[u8]) -> usize {
     while offset < data.len() {
         let expected = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
         offset += 4;
+        let framed_start = offset;
         let body_size = read_test_vint(data, &mut offset) as usize;
         let body = &data[offset..offset + body_size];
-        assert_eq!(crc32(body), expected);
+        // The checksum spans the BlockSize vint as well as the body.
+        assert_eq!(crc32(&data[framed_start..offset + body_size]), expected);
         let mut body_offset = 0;
         assert_eq!(read_test_vint(body, &mut body_offset), 0);
         assert_ne!(read_test_vint(body, &mut body_offset), 0);

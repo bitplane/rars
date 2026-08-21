@@ -292,6 +292,13 @@ pub(super) fn write_archive(
 
 /// Appends one quick-open record: how far back the header sits, then the
 /// header itself.
+///
+/// The wrapper is `CRC32 || BlockSize || body`, and the checksum covers
+/// `BlockSize` as well as the body. That is easy to get backwards, because the
+/// length is written after the checksum it is part of. Checksumming the body
+/// alone costs nothing visible: readers reject the wrapper, fall back to
+/// walking the block chain, and report the archive as fine while the index
+/// they were handed goes unused.
 fn append_quick_open_entry(payload: &mut Vec<u8>, distance: u64, header: &[u8]) -> Result<()> {
     let mut body = Vec::new();
     write_vint(&mut body, 0);
@@ -299,9 +306,12 @@ fn append_quick_open_entry(payload: &mut Vec<u8>, distance: u64, header: &[u8]) 
     write_vint(&mut body, header.len() as u64);
     body.extend_from_slice(header);
 
-    payload.extend_from_slice(&crate::crc32::crc32(&body).to_le_bytes());
-    write_vint(payload, body.len() as u64);
-    payload.extend_from_slice(&body);
+    let mut framed = Vec::new();
+    write_vint(&mut framed, body.len() as u64);
+    framed.extend_from_slice(&body);
+
+    payload.extend_from_slice(&crate::crc32::crc32(&framed).to_le_bytes());
+    payload.extend_from_slice(&framed);
     Ok(())
 }
 

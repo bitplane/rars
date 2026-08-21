@@ -3085,6 +3085,72 @@ mod tests {
     }
 
     #[test]
+    fn rar50_quick_open_wrapper_checksums_the_block_size_vint() {
+        // The wrapper is CRC32 || BlockSize || body and the checksum covers
+        // BlockSize too, which is easy to miss because the length is written
+        // after the checksum it belongs to. Checksumming the body alone is
+        // invisible from inside rars: nothing here reads a quick-open index
+        // back, and a reference reader that rejects the wrapper just walks the
+        // block chain instead and calls the archive fine.
+        let mut features = FeatureSet::store_only();
+        features.quick_open = true;
+        let bytes = rar50::Rar50Writer::new(
+            rar50_options_with_features(ArchiveVersion::Rar50, features).with_compression_level(0),
+        )
+        .entries(
+            [
+                rar50_entry(b"a.txt", b"one\n").with_host_os(3),
+                rar50_entry(b"b.txt", b"two\n").with_host_os(3),
+            ]
+            .to_vec(),
+        )
+        .finish()
+        .unwrap();
+
+        let archive = ArchiveReader::read(&bytes).unwrap();
+        let raw = archive.as_rar50().unwrap();
+        let service = raw.services().next().unwrap();
+        assert_eq!(service.name, b"QO");
+        let payload = collect_rar50_file(raw, service).unwrap().data;
+
+        let mut pos = 0usize;
+        let mut wrappers = 0usize;
+        while pos + 4 < payload.len() {
+            let stored = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap());
+            let (block_size, size_len) = {
+                let (mut value, mut shift, mut len) = (0u64, 0u32, 0usize);
+                loop {
+                    let byte = payload[pos + 4 + len];
+                    value |= u64::from(byte & 0x7f) << shift;
+                    shift += 7;
+                    len += 1;
+                    if byte & 0x80 == 0 {
+                        break (value, len);
+                    }
+                }
+            };
+            let framed_start = pos + 4;
+            let framed_end = framed_start + size_len + block_size as usize;
+            let framed = &payload[framed_start..framed_end];
+
+            assert_eq!(
+                crate::crc32::crc32(framed),
+                stored,
+                "wrapper {wrappers}: checksum must span the BlockSize vint and the body"
+            );
+            assert_ne!(
+                crate::crc32::crc32(&framed[size_len..]),
+                stored,
+                "wrapper {wrappers}: checksum must not be over the body alone"
+            );
+
+            pos = framed_end;
+            wrappers += 1;
+        }
+        assert_eq!(wrappers, 2);
+    }
+
+    #[test]
     fn direct_writer_creates_rar50_stored_archive_with_file_services() {
         let bytes =
             rar50::Rar50Writer::new(rar50_options(ArchiveVersion::Rar50).with_compression_level(0))
