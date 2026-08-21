@@ -156,7 +156,7 @@ pub(crate) fn unpack29_encode_literals_with_options_and_progress(
     options: EncodeOptions,
     progress: &mut dyn FnMut(usize) -> bool,
 ) -> Result<Vec<u8>> {
-    encode_member_with_options_and_progress(input, &[], options, progress)
+    encode_member_with_options_and_progress(input, &[], options, &mut [0; TABLE_COUNT], progress)
 }
 
 pub fn unpack29_encode_ppmd_literals(input: &[u8]) -> Result<Vec<u8>> {
@@ -512,10 +512,22 @@ impl Default for EncodeOptions {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Unpack29Encoder {
     history: Vec<u8>,
     options: EncodeOptions,
+    /// The code-length table a reader holds once everything coded so far has
+    /// been read. A solid chain carries it from one member to the next, which
+    /// is what lets a member say "same table as before" instead of spelling one
+    /// out. A reader clears it on a member that does not continue a chain, and
+    /// so does a fresh encoder.
+    levels: [u8; TABLE_COUNT],
+}
+
+impl Default for Unpack29Encoder {
+    fn default() -> Self {
+        Self::with_options(EncodeOptions::default())
+    }
 }
 
 impl Unpack29Encoder {
@@ -527,11 +539,18 @@ impl Unpack29Encoder {
         Self {
             history: Vec::new(),
             options,
+            levels: [0; TABLE_COUNT],
         }
     }
 
     pub fn encode_member(&mut self, input: &[u8]) -> Result<Vec<u8>> {
-        let packed = encode_member_with_options(input, &self.history, self.options)?;
+        let packed = encode_member_with_options_impl(
+            input,
+            &self.history,
+            self.options,
+            &mut self.levels,
+            None,
+        )?;
         self.remember(input);
         Ok(packed)
     }
@@ -541,8 +560,13 @@ impl Unpack29Encoder {
         input: &[u8],
         progress: &mut dyn FnMut(usize) -> bool,
     ) -> Result<Vec<u8>> {
-        let packed =
-            encode_member_with_options_and_progress(input, &self.history, self.options, progress)?;
+        let packed = encode_member_with_options_and_progress(
+            input,
+            &self.history,
+            self.options,
+            &mut self.levels,
+            progress,
+        )?;
         self.remember(input);
         Ok(packed)
     }
@@ -559,6 +583,7 @@ impl Unpack29Encoder {
             &self.history,
             &filtered.records,
             self.options,
+            &mut self.levels,
         )?;
         // The LZ layer coded the filtered bytes, so that is what a decoder's
         // window holds and what the next member in a solid chain can match
@@ -583,6 +608,7 @@ impl Unpack29Encoder {
             &self.history,
             &filtered.records,
             self.options,
+            &mut self.levels,
         )?;
         // The LZ layer coded the filtered bytes, so that is what a decoder's
         // window holds and what the next member in a solid chain can match
@@ -610,30 +636,32 @@ fn encode_member_with_options(
     history: &[u8],
     options: EncodeOptions,
 ) -> Result<Vec<u8>> {
-    encode_member_with_options_impl(input, history, options, None)
+    encode_member_with_options_impl(input, history, options, &mut [0; TABLE_COUNT], None)
 }
 
 fn encode_member_with_options_and_progress(
     input: &[u8],
     history: &[u8],
     options: EncodeOptions,
+    levels: &mut [u8; TABLE_COUNT],
     progress: &mut dyn FnMut(usize) -> bool,
 ) -> Result<Vec<u8>> {
-    encode_member_with_options_impl(input, history, options, Some(progress))
+    encode_member_with_options_impl(input, history, options, levels, Some(progress))
 }
 
 fn encode_member_with_options_impl(
     input: &[u8],
     history: &[u8],
     options: EncodeOptions,
+    levels: &mut [u8; TABLE_COUNT],
     progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<u8>> {
     if let Some(block_size) = options.block_size.filter(|&size| size != 0) {
         if input.len() > block_size {
-            return encode_member_blocks(input, history, options, block_size, progress);
+            return encode_member_blocks(input, history, options, block_size, levels, progress);
         }
     }
-    encode_member_inner(input, history, &[], options, false, progress)
+    encode_member_inner(input, history, &[], options, false, levels, progress)
 }
 
 fn encode_member_blocks(
@@ -641,6 +669,7 @@ fn encode_member_blocks(
     history: &[u8],
     mut options: EncodeOptions,
     block_size: usize,
+    levels: &mut [u8; TABLE_COUNT],
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<u8>> {
     options.block_size = None;
@@ -660,6 +689,7 @@ fn encode_member_blocks(
             &[],
             options,
             index + 1 < block_count,
+            levels,
             Some(&mut chunk_progress),
         )?);
         completed = completed.saturating_add(chunk.len());
@@ -678,12 +708,19 @@ fn encode_member_blocks(
 /// next". A member split across blocks needs that bit set on every block but
 /// the last, and clear on the last so the member ends. Getting either one
 /// wrong leaves a reader parsing whatever comes after as the wrong thing.
+///
+/// `previous_levels` is the code-length table the reader holds when this block
+/// starts, and is left holding this block's. A reader clears it between members
+/// unless the archive is solid, so a caller that is not chaining members hands
+/// over a table of zeroes and gets one block's worth of state back it can throw
+/// away.
 fn encode_member_inner(
     input: &[u8],
     history: &[u8],
     initial_filters: &[Vec<u8>],
     options: EncodeOptions,
     more_blocks_follow: bool,
+    previous_levels: &mut [u8; TABLE_COUNT],
     progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<u8>> {
     let tokens = encode_tokens_with_progress(input, history, options, progress)?;
@@ -745,14 +782,27 @@ fn encode_member_inner(
         .copy_from_slice(&low_offset_lengths);
     table_lengths[MAIN_COUNT + OFFSET_COUNT + LOW_OFFSET_COUNT..].copy_from_slice(&length_lengths);
 
-    let level_tokens = encode_table_level_tokens(&table_lengths);
+    // Two ways to say the same table: outright, or as a delta against the one
+    // the reader already holds. Neither wins everywhere, so code both and take
+    // the shorter. Coding a table costs nothing next to parsing the block it
+    // describes, and picking by size means the keep-tables bit can only help.
+    let outright = encode_table_level_tokens(&table_lengths);
+    let against_previous = encode_level_tokens_against(&table_lengths, previous_levels);
+    let keep_previous_tables =
+        level_tokens_bit_cost(&against_previous) < level_tokens_bit_cost(&outright);
+    let level_tokens = match keep_previous_tables {
+        true => against_previous,
+        false => outright,
+    };
+    *previous_levels = table_lengths;
+
     let level_lengths = level_code_lengths(&level_tokens);
     let level_codes = canonical_codes(&level_lengths)?;
     let main_codes = canonical_codes(&table_lengths[..MAIN_COUNT])?;
 
     let mut bits = BitWriter::default();
     bits.write_bit(false); // LZ block.
-    bits.write_bit(false); // do not keep previous tables.
+    bits.write_bit(keep_previous_tables);
     for &len in &level_lengths {
         bits.write_bits(len as u32, 4);
     }
@@ -944,6 +994,7 @@ fn encode_filtered_member_blocks(
     history: &[u8],
     filters: &[OwnedVmFilterRecord],
     options: EncodeOptions,
+    levels: &mut [u8; TABLE_COUNT],
 ) -> Result<Vec<u8>> {
     // A record's offset is relative to the head of its own block, so a block no
     // larger than the window keeps every offset inside it.
@@ -974,6 +1025,7 @@ fn encode_filtered_member_blocks(
             &records,
             inner,
             end < data.len(),
+            levels,
             None,
         )?);
         local_history.extend_from_slice(chunk);
@@ -1786,10 +1838,23 @@ impl LevelToken {
 }
 
 fn encode_table_level_tokens(lengths: &[u8; TABLE_COUNT]) -> Vec<LevelToken> {
-    encode_level_tokens(lengths)
+    encode_level_tokens_against(lengths, &[0; TABLE_COUNT])
 }
 
-fn encode_level_tokens(lengths: &[u8]) -> Vec<LevelToken> {
+/// Codes one code-length table as level tokens, against the table the reader
+/// already holds.
+///
+/// Symbols 0 to 15 are read as a delta: the reader adds one to what it has at
+/// that position, modulo 16. So a table close to the previous one spends the
+/// cheap end of the alphabet, which is what the block header's keep-tables bit
+/// buys. Pass a table of zeroes to code the lengths outright, which is the same
+/// arithmetic with nothing to add to.
+///
+/// The run symbols do not take part. 16 and 17 repeat the length just decoded
+/// and 18 and 19 write zeroes, both regardless of `base`, so runs are found in
+/// the lengths themselves either way.
+fn encode_level_tokens_against(lengths: &[u8], base: &[u8]) -> Vec<LevelToken> {
+    let delta = |pos: usize, value: u8| (value.wrapping_sub(base[pos]) & 0x0f) as usize;
     let mut tokens = Vec::new();
     let mut pos = 0usize;
     let mut previous = None;
@@ -1801,7 +1866,7 @@ fn encode_level_tokens(lengths: &[u8]) -> Vec<LevelToken> {
         }
 
         if value == 0 {
-            emit_zero_level_run(&mut tokens, run);
+            emit_zero_level_run(&mut tokens, pos, run, &delta);
             previous = Some(0);
             pos += run;
             continue;
@@ -1813,11 +1878,23 @@ fn encode_level_tokens(lengths: &[u8]) -> Vec<LevelToken> {
             continue;
         }
 
-        tokens.push(LevelToken::plain(value as usize));
+        tokens.push(LevelToken::plain(delta(pos, value)));
         previous = Some(value);
         pos += 1;
     }
     tokens
+}
+
+/// What the level tokens cost, so two codings of a table can be compared.
+///
+/// The 20 four-bit code lengths at the head of the table are the same either
+/// way and are left out.
+fn level_tokens_bit_cost(tokens: &[LevelToken]) -> usize {
+    let lengths = level_code_lengths(tokens);
+    tokens
+        .iter()
+        .map(|token| usize::from(lengths[token.symbol]) + usize::from(token.extra_bits))
+        .sum()
 }
 
 fn emit_repeat_level_run(tokens: &mut Vec<LevelToken>, mut run: usize) {
@@ -1839,7 +1916,13 @@ fn emit_repeat_level_run(tokens: &mut Vec<LevelToken>, mut run: usize) {
     }
 }
 
-fn emit_zero_level_run(tokens: &mut Vec<LevelToken>, mut run: usize) {
+fn emit_zero_level_run(
+    tokens: &mut Vec<LevelToken>,
+    start: usize,
+    mut run: usize,
+    delta: &dyn Fn(usize, u8) -> usize,
+) {
+    let mut pos = start;
     while run != 0 {
         if run >= 11 {
             let mut chunk = run.min(138);
@@ -1848,24 +1931,46 @@ fn emit_zero_level_run(tokens: &mut Vec<LevelToken>, mut run: usize) {
             }
             tokens.push(LevelToken::zero_run_long(chunk));
             run -= chunk;
+            pos += chunk;
         } else if run >= 3 {
             let chunk = run.min(10);
             tokens.push(LevelToken::zero_run_short(chunk));
             run -= chunk;
+            pos += chunk;
         } else {
-            tokens.extend(std::iter::repeat_n(LevelToken::plain(0), run));
+            // A run too short for its own symbol is written out position by
+            // position, and each of those is a delta like any other.
+            tokens.extend((pos..pos + run).map(|pos| LevelToken::plain(delta(pos, 0))));
             break;
         }
     }
 }
 
+/// Codes the level alphabet by how often each symbol is used, not by how many
+/// of them appear.
+///
+/// A flat code charges the same for every symbol in play, so a table whose
+/// tokens are mostly one symbol pays as if they were spread evenly. That is
+/// what the keep-tables bit produces, and against a flat code it saved almost
+/// nothing. Weighting by frequency is what makes it pay.
+///
+/// The 20 lengths are written four bits each, hence the cap of 15.
 fn level_code_lengths(tokens: &[LevelToken]) -> [u8; LEVEL_COUNT] {
-    let mut lengths = [0u8; LEVEL_COUNT];
+    let mut frequencies = [0usize; LEVEL_COUNT];
     for token in tokens {
-        lengths[token.symbol] = 1;
+        frequencies[token.symbol] += 1;
     }
-    huffman::assign_flat_complete_code(&mut lengths);
-    lengths
+    // One symbol in play gives a code with one branch and an empty slot beside
+    // it, which a strict reader rejects. Only the flat assignment pads it.
+    if frequencies.iter().filter(|&&count| count != 0).count() <= 1 {
+        let mut lengths = [0u8; LEVEL_COUNT];
+        for (symbol, &count) in frequencies.iter().enumerate() {
+            lengths[symbol] = u8::from(count != 0);
+        }
+        huffman::assign_flat_complete_code(&mut lengths);
+        return lengths;
+    }
+    huffman::lengths_for_frequency_array(&frequencies, 15)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3361,18 +3466,89 @@ mod tests {
     }
 
     use super::{
-        apply_standard_filter, audio_encode, best_match, encode_ppmd_hybrid,
-        encode_table_level_tokens, encode_tokens_with_progress, encoded_filter_records_at,
-        itanium_decode, itanium_encode, lazy_match_decision, split_large_filter, unpack29_decode,
-        unpack29_encode_literals, unpack29_encode_ppmd, unpack29_encode_ppmd_literals,
-        unpack29_encode_ppmd_with_filter, BitReader, BitWriter, EncodeOptions, EncodeToken,
-        EncoderMatchState, Error, Huffman, LevelToken, MatchCandidate, OwnedVmFilterRecord,
-        PpmdEncodeToken, PpmdEncoder, Rar29MatchFinder, Result, StandardFilter, Unpack29,
-        Unpack29Encoder, VmFilter, VmProgram, VmProgramKind, MAIN_COUNT, MAX_ENCODER_MATCH_OFFSET,
-        MAX_MATCH_CANDIDATES, MAX_VM_AUDIO_FILTER_BLOCK_SIZE, MAX_VM_DELTA_FILTER_BLOCK_SIZE,
-        MAX_VM_FILTER_BLOCK_SIZE, PPMD_DICTIONARY_MB, PPMD_ESC, PPMD_ORDER,
-        RAR3_AUDIO_FILTER_BYTECODE, TABLE_COUNT,
+        apply_standard_filter, audio_encode, best_match, encode_level_tokens_against,
+        encode_ppmd_hybrid, encode_table_level_tokens, encode_tokens_with_progress,
+        encoded_filter_records_at, itanium_decode, itanium_encode, lazy_match_decision,
+        level_code_lengths, split_large_filter, unpack29_decode, unpack29_encode_literals,
+        unpack29_encode_ppmd, unpack29_encode_ppmd_literals, unpack29_encode_ppmd_with_filter,
+        BitReader, BitWriter, EncodeOptions, EncodeToken, EncoderMatchState, Error, Huffman,
+        LevelToken, MatchCandidate, OwnedVmFilterRecord, PpmdEncodeToken, PpmdEncoder,
+        Rar29MatchFinder, Result, StandardFilter, Unpack29, Unpack29Encoder, VmFilter, VmProgram,
+        VmProgramKind, MAIN_COUNT, MAX_ENCODER_MATCH_OFFSET, MAX_MATCH_CANDIDATES,
+        MAX_VM_AUDIO_FILTER_BLOCK_SIZE, MAX_VM_DELTA_FILTER_BLOCK_SIZE, MAX_VM_FILTER_BLOCK_SIZE,
+        PPMD_DICTIONARY_MB, PPMD_ESC, PPMD_ORDER, RAR3_AUDIO_FILTER_BYTECODE, TABLE_COUNT,
     };
+
+    /// A flat code charges the same for every symbol in play. The keep-tables
+    /// bit works by pushing the tokens onto one symbol, which buys nothing
+    /// unless the level code notices.
+    #[test]
+    fn the_level_code_spends_fewer_bits_on_the_common_symbol() {
+        let mut tokens = vec![LevelToken::plain(0); 200];
+        tokens.push(LevelToken::plain(7));
+        tokens.push(LevelToken::plain(9));
+        tokens.push(LevelToken::plain(11));
+        let lengths = level_code_lengths(&tokens);
+        assert!(
+            lengths[0] < lengths[7],
+            "the symbol used 200 times costs {} bits and the one used once costs {}",
+            lengths[0],
+            lengths[7]
+        );
+    }
+
+    /// Symbols 0 to 15 are read as a delta against the table the reader holds,
+    /// so a table that has not changed is a run of zeroes. Runs of zero-length
+    /// codes and repeats stay as they are, since the reader takes those without
+    /// reference to what it holds.
+    #[test]
+    fn a_table_matching_the_previous_one_codes_as_deltas_of_zero() {
+        let mut lengths = [0u8; TABLE_COUNT];
+        for (position, slot) in lengths.iter_mut().enumerate().take(120) {
+            *slot = (position % 13 + 1) as u8;
+        }
+        let against_itself = encode_level_tokens_against(&lengths, &lengths);
+        assert!(
+            against_itself
+                .iter()
+                .all(|token| token.symbol == 0 || token.symbol >= 16),
+            "a table coded against itself should spend only zero deltas and runs"
+        );
+
+        let outright = encode_table_level_tokens(&lengths);
+        assert!(
+            outright.iter().any(|token| (1..16).contains(&token.symbol)),
+            "the same table coded outright has to name its lengths"
+        );
+    }
+
+    /// The reader carries its table across the members of a solid chain, so
+    /// members that look alike stop paying to describe the same table again.
+    #[test]
+    fn a_solid_chain_stops_repaying_for_the_same_table() {
+        let mut member = Vec::new();
+        for index in 0..400u32 {
+            member.extend_from_slice(format!("field_{index:04} = value {index:04}\n").as_bytes());
+        }
+
+        let mut chained = Unpack29Encoder::with_options(EncodeOptions::default());
+        let first = chained.encode_member(&member).unwrap();
+        let second = chained.encode_member(&member).unwrap();
+
+        let mut alone = Unpack29Encoder::with_options(EncodeOptions::default());
+        alone.encode_member(&member).unwrap();
+        let restated = Unpack29Encoder::with_options(EncodeOptions::default())
+            .encode_member(&member)
+            .unwrap();
+
+        assert_eq!(first.len(), restated.len());
+        assert!(
+            second.len() < restated.len(),
+            "the second member of the chain cost {} bytes against {} on its own",
+            second.len(),
+            restated.len()
+        );
+    }
 
     /// The tokens the hybrid encoder emits for `input`, decided against the
     /// same live model the production path prices against.

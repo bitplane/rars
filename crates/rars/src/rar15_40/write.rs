@@ -1481,7 +1481,7 @@ fn compression_method_for_level(options: WriterOptions) -> Result<u8> {
 enum SolidEncoder {
     Rar15(Box<Unpack15Encoder>),
     Rar20(Unpack20Encoder),
-    Rar29(Unpack29Encoder),
+    Rar29(Box<Unpack29Encoder>),
 }
 
 impl SolidEncoder {
@@ -1496,9 +1496,11 @@ impl SolidEncoder {
             ArchiveVersion::Rar20 => Self::Rar20(Unpack20Encoder::with_options(
                 rar20_encode_options_for_options(options)?,
             )),
-            ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40 => Self::Rar29(
-                Unpack29Encoder::with_options(rar29_encode_options_for_options(options)?),
-            ),
+            ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40 => {
+                Self::Rar29(Box::new(Unpack29Encoder::with_options(
+                    rar29_encode_options_for_options(options)?,
+                )))
+            }
             _ => return Ok(None),
         };
         Ok(Some(encoder))
