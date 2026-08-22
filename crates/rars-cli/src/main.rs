@@ -15,6 +15,7 @@ mod password;
 mod progress;
 mod repair;
 mod time;
+mod tzif;
 mod volumes;
 
 use cli::{AddArgs, Command, ExtractArgs, InfoArgs, PasswordArgs, TestArgs};

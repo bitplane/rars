@@ -1,3 +1,4 @@
+use crate::tzif::TimeZone;
 use rars::{ArchiveFamily, TimeRefinement};
 use std::fs;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -59,8 +60,13 @@ pub(crate) fn extracted_system_time(
     base.checked_add(extra).or(Some(base))
 }
 
+/// A DOS timestamp is a wall-clock reading with no zone, so both directions go
+/// through the local zone rather than UTC. See [`crate::tzif`] for why, and for
+/// what that costs.
 fn system_time_to_dos_time(time: SystemTime) -> Option<u32> {
-    let seconds = time.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let instant = i64::try_from(time.duration_since(UNIX_EPOCH).ok()?.as_secs()).ok()?;
+    let local = instant.checked_add(i64::from(TimeZone::local().offset_at(instant)))?;
+    let seconds = u64::try_from(local).ok()?;
     let days = i64::try_from(seconds / 86_400).ok()?;
     let seconds_of_day = seconds % 86_400;
     let (year, month, day) = civil_from_days(days);
@@ -94,11 +100,12 @@ fn dos_time_to_system_time(time: u32) -> Option<SystemTime> {
         return None;
     }
     let days = days_from_civil(year, month, day);
-    let seconds = u64::try_from(days)
-        .ok()?
+    let local = days
         .checked_mul(86_400)?
-        .checked_add(u64::from(hour) * 3_600 + u64::from(minute) * 60 + u64::from(second))?;
-    Some(UNIX_EPOCH + Duration::from_secs(seconds))
+        .checked_add(i64::from(hour) * 3_600 + i64::from(minute) * 60 + i64::from(second))?;
+    let zone = TimeZone::local();
+    let instant = local.checked_sub(i64::from(zone.offset_for_local(local)))?;
+    Some(UNIX_EPOCH + Duration::from_secs(u64::try_from(instant).ok()?))
 }
 
 fn unix_seconds_to_system_time(seconds: u32) -> Option<SystemTime> {

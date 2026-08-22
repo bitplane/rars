@@ -649,6 +649,63 @@ fn create_and_extract_preserve_mtime_and_permissions() {
 }
 
 #[cfg(unix)]
+/// A DOS timestamp is a wall-clock reading with no zone, and every RAR reader
+/// resolves it against the extracting machine's local zone. Reading it as UTC
+/// instead puts the file an offset away from where every other tool puts it.
+///
+/// The zone comes from the shipped fixtures rather than the machine, so this
+/// asserts a fixed answer wherever it runs. `Asia/Kolkata` is chosen because
+/// its +05:30 makes a half-hour error as visible as a whole-hour one.
+#[test]
+fn extract_reads_dos_timestamps_in_the_local_zone() {
+    let dir = scratch("dos-timestamp-zone");
+    let archive = dir.join("stamped.rar");
+    let tzdir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tz");
+
+    let bytes = write_stored_archive(
+        &[StoredEntry {
+            name: b"stamped.txt",
+            data: b"stamped\n",
+            file_time: dos_time(2026, 7, 15, 15, 0, 0),
+            file_attr: 0x20,
+            password: None,
+            file_comment: None,
+        }],
+        WriterOptions::default(),
+    )
+    .unwrap();
+    fs::write(&archive, bytes).unwrap();
+
+    // The reading is 15:00. In Kolkata that names 09:30 UTC; read as UTC it
+    // would name 15:00 UTC, five and a half hours adrift.
+    for (zone, expected) in [
+        ("Asia_Kolkata", 1_784_107_800),
+        ("Etc_GMT_5", 1_784_145_600),
+    ] {
+        let out_dir = dir.join(format!("out-{zone}"));
+        let extract = rars()
+            .env("TZDIR", &tzdir)
+            .env("TZ", zone)
+            .arg("x")
+            .arg(&archive)
+            .arg(&out_dir)
+            .output()
+            .unwrap();
+        assert!(extract.status.success(), "stderr: {}", stderr(&extract));
+        assert_eq!(
+            fs::metadata(out_dir.join("stamped.txt"))
+                .unwrap()
+                .modified()
+                .unwrap()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            expected,
+            "zone {zone}"
+        );
+    }
+}
+
 #[test]
 fn extract_restores_directory_mtime_after_child_files() {
     let dir = scratch("directory-metadata");
@@ -680,7 +737,10 @@ fn extract_restores_directory_mtime_after_child_files() {
     .unwrap();
     fs::write(&archive, bytes).unwrap();
 
+    // A DOS timestamp is a wall-clock reading, so what instant it names
+    // depends on the zone. Pin the zone or these constants only hold in UTC.
     let extract = rars()
+        .env("TZ", "UTC")
         .arg("x")
         .arg(&archive)
         .arg(&out_dir)
