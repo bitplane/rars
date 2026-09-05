@@ -612,7 +612,9 @@ fn source_integrity(
 /// moving, and the parse's arrays grow with it. See
 /// [`crate::codec::rar50::MAX_LZ_BLOCK_SIZE`].
 fn streaming_lz_workspace(dictionary_size: u64, block_size: usize, optimal_parse: bool) -> u64 {
-    let per_window_byte = if optimal_parse { 9 } else { 5 };
+    // Runs retain up to a dictionary of new input as well as history and
+    // combined search bytes. Charge those buffers alongside finder links.
+    let per_window_byte = if optimal_parse { 17 } else { 13 };
     dictionary_size
         .checked_next_power_of_two()
         .unwrap_or(dictionary_size)
@@ -1009,10 +1011,10 @@ mod tests {
                 charged >= peak,
                 "a {dictionary}-byte dictionary measured {peak} against a charge of {charged}",
             );
-            // Headroom is for the allocator and the packed output, not for a
-            // multiple nobody has checked since.
+            // Streaming runs also retain input/history buffers not present in
+            // these single-member measurements.
             assert!(
-                charged < peak * 3,
+                charged < peak * 4,
                 "a {dictionary}-byte dictionary is charged {charged} for a measured {peak}",
             );
         }

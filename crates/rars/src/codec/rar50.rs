@@ -789,6 +789,7 @@ pub(crate) fn encode_lz_reader_to(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn encode_lz_streaming_block(
     data: &[u8],
     history: &[u8],
@@ -805,6 +806,68 @@ pub(crate) fn encode_lz_streaming_block(
         is_last,
         None,
     )
+}
+
+/// Encode adjacent streaming blocks with one seeded chain finder. The first
+/// block without history keeps its existing tree parse; subsequent blocks use
+/// chains just as separately seeded streaming blocks do.
+pub(crate) fn encode_lz_streaming_blocks(
+    data: &[u8],
+    history: &[u8],
+    blocks: &[(usize, bool)],
+    algorithm_version: u8,
+    options: EncodeOptions,
+) -> Result<Vec<Vec<u8>>> {
+    let (combined, start) = member_window(data, history, options);
+    let mut at = start;
+    let mut output = Vec::with_capacity(blocks.len());
+    let mut first = 0;
+    if start == 0 && options.optimal_parse && !blocks.is_empty() {
+        let (end, is_last) = blocks[0];
+        output.push(encode_lz_block(
+            &combined[..end],
+            &[],
+            algorithm_version,
+            &[],
+            options,
+            is_last,
+            None,
+        )?);
+        at = end;
+        first = 1;
+    }
+    if first == blocks.len() {
+        return Ok(output);
+    }
+    let finder = member_finder(&combined, at, options);
+    let mut lazy = None;
+    let mut collector = None;
+    if options.optimal_parse {
+        collector = Some(OptimalCollector {
+            finder: CollectorFinder::Chains(finder),
+        });
+    } else {
+        lazy = Some(finder);
+    }
+    for &(end, is_last) in &blocks[first..] {
+        let end = start + end;
+        output.push(encode_lz_block_in_window(
+            &combined,
+            at..end,
+            match (&mut lazy, &mut collector) {
+                (Some(finder), _) => MemberSearch::Lazy(finder),
+                (_, Some(collector)) => MemberSearch::Optimal(collector),
+                _ => unreachable!(),
+            },
+            algorithm_version,
+            &[],
+            options,
+            is_last,
+            None,
+        )?);
+        at = end;
+    }
+    Ok(output)
 }
 
 pub fn encode_lz_member_with_history_and_options(
@@ -3702,6 +3765,27 @@ fn write_level_lengths(writer: &mut BitWriter, lengths: &[u8; LEVEL_TABLE_SIZE])
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn shared_streaming_finder_preserves_separate_block_bytes() {
+        // Short blocks exercise seam hashes and wrap the dictionary repeatedly.
+        let data: Vec<u8> = (0..8192).map(|i| ((i * 17 + i / 31) % 251) as u8).collect();
+        for optimal in [false, true] {
+            let options = EncodeOptions::new(32)
+                .with_optimal_parse(optimal)
+                .with_max_match_distance(128);
+            let blocks: Vec<_> = (1..=32).map(|i| (i * 256, i % 4 == 0)).collect();
+            let grouped = encode_lz_streaming_blocks(&data, &[], &blocks, 0, options).unwrap();
+            let mut start = 0;
+            for ((end, last), bytes) in blocks.into_iter().zip(grouped) {
+                let reference =
+                    encode_lz_streaming_block(&data[start..end], &data[..start], 0, options, last)
+                        .unwrap();
+                assert_eq!(bytes, reference, "optimal={optimal}, start={start}");
+                start = end;
+            }
+        }
+    }
     use super::*;
 
     /// The flat code charged four bits for a symbol used once and four for one

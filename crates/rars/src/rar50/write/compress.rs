@@ -17,7 +17,7 @@ use super::filter_policy::{
     should_store_compressed_payload,
 };
 use super::FilterPolicy;
-use crate::codec::rar50::{encode_lz_streaming_block, BlockSplitter, EncodeOptions};
+use crate::codec::rar50::{encode_lz_streaming_blocks, BlockSplitter, EncodeOptions};
 use crate::streaming::Spool;
 use crate::{EntrySource, Error, Result, WriterResources};
 use std::io::{Read, Write};
@@ -51,13 +51,18 @@ pub(super) struct CompressPlan {
     pub(super) candidates: Vec<EncodeOptions>,
 }
 
-/// One block of input waiting to be compressed.
+/// A bounded run of adjacent blocks, sharing one copy of the preceding input.
 struct BlockJob {
-    member: usize,
     data: Vec<u8>,
     history: Vec<u8>,
-    /// Marks the final block of a member's compressed stream.
-    is_last: bool,
+    /// Member index, end within `data`, and final-block flag.
+    blocks: Vec<(usize, usize, bool)>,
+}
+
+fn run_size(plan: &CompressPlan) -> usize {
+    plan.encode_options
+        .max_match_distance
+        .max(crate::codec::rar50::MAX_LZ_BLOCK_SIZE)
 }
 
 /// A member being read, and the packed bytes it has produced so far.
@@ -414,19 +419,22 @@ fn compress_independent_members(
                 misses = 0;
 
                 let member = stream.member;
-                let data = read_block(stream, plan.block_size)?;
-                let is_last = !stream.has_more();
-                jobs.push(BlockJob {
-                    member,
+                let mut job = BlockJob {
+                    data: Vec::new(),
                     history: histories[member].clone(),
-                    is_last,
-                    data,
-                });
+                    blocks: Vec::new(),
+                };
+                while stream.has_more() && job.data.len() < run_size(plan) {
+                    job.data.extend(read_block(stream, plan.block_size)?);
+                    job.blocks
+                        .push((member, job.data.len(), !stream.has_more()));
+                }
                 advance_history(
                     &mut histories[member],
-                    &jobs.last().expect("just pushed").data,
+                    &job.data,
                     plan.encode_options.max_match_distance,
                 );
+                jobs.push(job);
             }
 
             compress_wave(jobs, plan, &mut streams, advance)?;
@@ -468,32 +476,35 @@ fn compress_solid_chain(
         let reserved = required.saturating_mul(batch_capacity as u64);
         let _permit = resources.acquire(reserved, plan.dictionary_size)?;
 
-        // Read ahead far enough to fill a wave. Reading is sequential because
-        // each block's history is the raw input before it, but it is only
-        // reading; the compression it feeds runs in parallel.
+        // Run boundaries depend on input and dictionary size, never on the
+        // worker count. Adjacent blocks amortize history copies and seeding.
         let mut jobs = Vec::with_capacity(batch_capacity);
         while jobs.len() < batch_capacity {
-            while next < streams.len() && !streams[next].has_more() {
-                next += 1;
-            }
-            let Some(stream) = streams.get_mut(next) else {
-                break;
-            };
-
-            let member = stream.member;
-            let data = read_block(stream, plan.block_size)?;
-            let is_last = !stream.has_more();
-            jobs.push(BlockJob {
-                member,
+            let mut job = BlockJob {
+                data: Vec::new(),
                 history: history.clone(),
-                is_last,
-                data,
-            });
+                blocks: Vec::new(),
+            };
+            while job.data.len() < run_size(plan) {
+                while next < streams.len() && !streams[next].has_more() {
+                    next += 1;
+                }
+                let Some(stream) = streams.get_mut(next) else {
+                    break;
+                };
+                job.data.extend(read_block(stream, plan.block_size)?);
+                job.blocks
+                    .push((stream.member, job.data.len(), !stream.has_more()));
+            }
+            if job.blocks.is_empty() {
+                break;
+            }
             advance_history(
                 &mut history,
-                &jobs.last().expect("just pushed").data,
+                &job.data,
                 plan.encode_options.max_match_distance,
             );
+            jobs.push(job);
         }
 
         if jobs.is_empty() {
@@ -553,6 +564,11 @@ fn read_chunk(stream: &mut MemberStream, block_size: usize) -> Result<Vec<u8>> {
 /// Extends the rolling window with `data`, dropping what has fallen out of
 /// dictionary range.
 fn advance_history(history: &mut Vec<u8>, data: &[u8], max_match_distance: usize) {
+    if data.len() >= max_match_distance {
+        history.clear();
+        history.extend_from_slice(&data[data.len() - max_match_distance..]);
+        return;
+    }
     history.extend_from_slice(data);
     let keep_from = history.len().saturating_sub(max_match_distance);
     if keep_from != 0 {
@@ -569,17 +585,28 @@ fn compress_wave(
     advance: &(dyn Fn(u64) -> bool + Sync),
 ) -> Result<()> {
     let wave_bytes: u64 = jobs.iter().map(|job| job.data.len() as u64).sum();
-    let packed_blocks = crate::parallel::map_collect(jobs, |job| {
-        let packed = encode_lz_streaming_block(
+    let packed_runs = crate::parallel::map_collect(jobs, |job| {
+        let boundaries: Vec<_> = job
+            .blocks
+            .iter()
+            .map(|&(_, end, last)| (end, last))
+            .collect();
+        let packed = encode_lz_streaming_blocks(
             &job.data,
             &job.history,
+            &boundaries,
             plan.algorithm_version,
             plan.encode_options,
-            job.is_last,
         )?;
-        Ok::<_, crate::codec::Error>((job.member, packed))
+        Ok::<_, crate::codec::Error>(
+            job.blocks
+                .into_iter()
+                .zip(packed)
+                .map(|((member, _, _), packed)| (member, packed))
+                .collect::<Vec<_>>(),
+        )
     })?;
-    for (member, packed) in packed_blocks {
+    for (member, packed) in packed_runs.into_iter().flatten() {
         streams[member].packed.write_all(&packed)?;
     }
     if !advance(wave_bytes) {
