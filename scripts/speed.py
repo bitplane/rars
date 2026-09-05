@@ -14,11 +14,6 @@ source text, the release binary's own bytes, and a block that repeats, which
 is where a match finder is at its worst. Sizes are in the table because a
 level that costs time and saves nothing is the thing worth catching.
 
-`--decompose` adds a line for level 5 specifically. Level 5 encodes the member
-once per level on the ladder below it and keeps the smallest result, so its
-wall time is the sum of every cheaper level plus its own optimal parse. The
-line prints that arithmetic: how much of level 5 is the parse, and how much is
-the re-encoding.
 """
 from __future__ import annotations
 
@@ -93,8 +88,6 @@ def main() -> int:
     parser.add_argument("--levels", default="1,2,3,4,5")
     parser.add_argument("--work", type=Path, default=ROOT / "target/speed",
                         help="where samples and archives go; never /tmp")
-    parser.add_argument("--decompose", action="store_true",
-                        help="split level 5 into its parse and its re-encodes")
     args = parser.parse_args()
 
     if not args.rars_bin.is_file():
@@ -111,22 +104,14 @@ def main() -> int:
     print("-" * len(header))
 
     for source in inputs:
-        timings = {}
         cells = []
         for level in levels:
             seconds, packed = encode(args.rars_bin, args.format, level, source,
                                      args.work / "speed.rar")
-            timings[level] = seconds
             megabytes = source.stat().st_size / (1 << 20)
             cells.append(f"{seconds:7.2f}s {packed / megabytes / 1024:6.0f}K/MB")
         print(f"{source.name:18}{source.stat().st_size:10,}" + "".join(f"{c:>18}" for c in cells))
 
-        if args.decompose and 5 in timings:
-            below = sum(timings[l] for l in timings if l < 5)
-            parse = timings[5] - below
-            print(f"{'':18}{'':10}  level 5 = {parse:.2f}s parse"
-                  f" + {below:.2f}s re-encoding levels 1-4"
-                  f"  ({parse / timings[5] * 100:.0f}% / {below / timings[5] * 100:.0f}%)")
 
     return 0
 

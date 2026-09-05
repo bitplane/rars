@@ -10,8 +10,7 @@ check:
 
 # A minute of timings over three kinds of data, before and after anything that
 # touches the encoder. A ratio sweep takes an hour and says nothing about speed;
-# this says how long a megabyte costs at each level. Add --decompose to split
-# level 5 into its parse and its re-encodes.
+# this says how long a megabyte costs at each level.
 speed *ARGS:
     cargo build --release
     python3 scripts/speed.py {{ ARGS }}
