@@ -542,8 +542,9 @@ fn source_integrity(
     let mut reader = source.open()?;
     let mut buffer = vec![0u8; block_size];
     let mut observed = 0u64;
+    let mut limited = reader.by_ref().take(expected_size);
     loop {
-        let read = reader.read(&mut buffer)?;
+        let read = limited.read(&mut buffer)?;
         if read == 0 {
             break;
         }
@@ -551,11 +552,12 @@ fn source_integrity(
         crc.update(&buffer[..read]);
         hash.update(&buffer[..read]);
     }
-    if observed != expected_size {
-        return Err(Error::InvalidHeader(
-            "entry source size changed while reading",
-        ));
-    }
+    crate::write_stream::check_source_length(
+        &mut *reader,
+        observed,
+        expected_size,
+        "entry source size changed while reading",
+    )?;
     Ok((crc.finish(), hash.finalize()))
 }
 

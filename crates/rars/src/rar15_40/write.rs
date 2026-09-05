@@ -1011,7 +1011,24 @@ fn write_member(
         Some(password) => write_encrypted_header(output, &header, password)?,
         None => output.write_all(&header)?,
     }
-    payload.write_to(output, packed_size as u64)
+    if matches!(payload, MemberPayload::Copied(_)) {
+        let mut checksum = Crc32::new();
+        payload.write_to(
+            &mut CrcWriter {
+                inner: output,
+                crc: &mut checksum,
+            },
+            packed_size as u64,
+        )?;
+        if checksum.finish() != encoded.file_crc {
+            return Err(Error::InvalidHeader(
+                "entry source contents changed while writing",
+            ));
+        }
+        Ok(())
+    } else {
+        payload.write_to(output, packed_size as u64)
+    }
 }
 
 pub fn write_stored_volumes(

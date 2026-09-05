@@ -72,7 +72,7 @@ enum Payload {
     /// Small enough to have been built in memory: comments and services.
     Inline(Vec<u8>),
     /// Copied straight from the source, which is re-read at write time.
-    Stored(crate::EntrySource),
+    Stored(PreparedSource),
     Packed(Spool),
     /// Encrypted on the way out, so the ciphertext is never stored anywhere.
     Encrypted {
@@ -80,6 +80,67 @@ enum Payload {
         keys: Rar50Keys,
         iv: [u8; 16],
     },
+}
+
+// A reopenable source is not a snapshot. Keep the size and integrity used by
+// the header, and verify the actual emission read before reporting success.
+struct PreparedSource {
+    source: crate::EntrySource,
+    len: u64,
+    crc32: u32,
+    hash: [u8; 32],
+}
+
+impl PreparedSource {
+    fn new(source: &crate::EntrySource, member: &CompressedMember) -> Self {
+        Self {
+            source: source.clone(),
+            len: member.input_size,
+            crc32: member.crc32,
+            hash: member.hash,
+        }
+    }
+
+    fn open(&self) -> Result<CheckedReader> {
+        Ok(CheckedReader {
+            reader: self.source.open()?,
+            integrity: ChecksumSink::default(),
+        })
+    }
+
+    fn verify(&self, integrity: ChecksumSink) -> Result<()> {
+        if integrity.crc.finish() != self.crc32 || integrity.hash.finalize() != self.hash {
+            return Err(Error::InvalidHeader(
+                "entry source contents changed while writing",
+            ));
+        }
+        Ok(())
+    }
+}
+
+struct CheckedReader {
+    reader: Box<dyn crate::EntryReader>,
+    integrity: ChecksumSink,
+}
+
+impl Read for CheckedReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.reader.read(buffer)?;
+        self.integrity.write_all(&buffer[..read])?;
+        Ok(read)
+    }
+}
+
+impl CheckedReader {
+    fn finish(mut self, source: &PreparedSource, observed: u64) -> Result<()> {
+        crate::write_stream::check_source_length(
+            &mut *self.reader,
+            observed,
+            source.len,
+            "entry source size changed while writing",
+        )?;
+        source.verify(self.integrity)
+    }
 }
 
 pub(super) fn write_archive(
@@ -241,13 +302,13 @@ pub(super) fn write_archive(
 
         for block in blocks {
             sink.write_all(&block.header)?;
-            write_payload(block.payload, block.payload_len, &mut sink, resources)?;
+            write_payload(block.payload, &mut sink, resources)?;
         }
 
         if let Some(payload) = &quick_open_payload {
             let block = stored_service_block(b"QO", payload, &[], header_keys.as_ref())?;
             sink.write_all(&block.header)?;
-            write_payload(block.payload, block.payload_len, &mut sink, resources)?;
+            write_payload(block.payload, &mut sink, resources)?;
         }
     }
 
@@ -457,7 +518,7 @@ fn prepare_member(
         member.packed.len()
     };
     let plain = if member.store {
-        Payload::Stored(entry.source.clone())
+        Payload::Stored(PreparedSource::new(&entry.source, &member))
     } else {
         Payload::Packed(member.packed)
     };
@@ -532,7 +593,6 @@ fn prepare_member(
 
 fn write_payload(
     payload: Payload,
-    payload_len: u64,
     output: &mut dyn Write,
     resources: &WriterResources,
 ) -> Result<()> {
@@ -543,19 +603,8 @@ fn write_payload(
         }
         Payload::Stored(source) => {
             let mut reader = source.open()?;
-            let copied = std::io::copy(&mut reader.by_ref().take(payload_len), output)?;
-            if copied != payload_len {
-                return Err(Error::InvalidHeader(
-                    "entry source size changed while writing",
-                ));
-            }
-            let mut trailing = [0u8; 1];
-            if reader.read(&mut trailing)? != 0 {
-                return Err(Error::InvalidHeader(
-                    "entry source size changed while writing",
-                ));
-            }
-            Ok(())
+            let copied = std::io::copy(&mut reader.by_ref().take(source.len), output)?;
+            reader.finish(&source, copied)
         }
         Payload::Packed(mut packed) => {
             packed.copy_to(output)?;
@@ -567,8 +616,8 @@ fn write_payload(
             match *plain {
                 Payload::Stored(source) => {
                     let mut reader = source.open()?;
-                    let len = source.len()?;
-                    encrypt_reader_to(&mut *reader, len, output, &keys, iv, ENCRYPT_CHUNK)
+                    encrypt_reader_to(&mut reader, source.len, output, &keys, iv, ENCRYPT_CHUNK)?;
+                    reader.finish(&source, source.len)
                 }
                 Payload::Packed(mut packed) => {
                     let len = packed.len();
@@ -681,7 +730,10 @@ impl Write for Tee<'_> {
 /// Where a member's payload bytes come from when a volume set slices them up.
 enum FragmentSource {
     Packed(Spool),
-    Stored(crate::EntrySource),
+    Stored {
+        prepared: PreparedSource,
+        emitted: Box<ChecksumSink>,
+    },
 }
 
 impl FragmentSource {
@@ -693,20 +745,70 @@ impl FragmentSource {
     /// header will not allow.
     fn checksums_range(&mut self, start: u64, len: u64) -> Result<FragmentChecksums> {
         let mut sink = ChecksumSink::default();
-        self.copy_range(start, len, &mut sink)?;
+        self.copy_range_unverified(start, len, &mut sink)?;
         Ok(FragmentChecksums {
             crc32: sink.crc.finish(),
             hash: sink.hash.finalize(),
         })
     }
 
-    fn copy_range(&mut self, start: u64, len: u64, output: &mut dyn Write) -> Result<()> {
+    fn emit_range(
+        &mut self,
+        start: u64,
+        len: u64,
+        output: &mut dyn Write,
+        expected_fragment: Option<FragmentChecksums>,
+    ) -> Result<()> {
+        let Self::Stored { prepared, emitted } = self else {
+            return self.copy_range_unverified(start, len, output);
+        };
+        let mut reader = prepared.source.open()?;
+        reader.seek(std::io::SeekFrom::Start(start))?;
+        let mut fragment = ChecksumSink::default();
+        let mut remaining = len;
+        let mut buffer = vec![0; 64 * 1024];
+        while remaining != 0 {
+            let want = remaining.min(buffer.len() as u64) as usize;
+            reader.read_exact(&mut buffer[..want])?;
+            output.write_all(&buffer[..want])?;
+            emitted.write_all(&buffer[..want])?;
+            if expected_fragment.is_some() {
+                fragment.write_all(&buffer[..want])?;
+            }
+            remaining -= want as u64;
+        }
+        if let Some(expected) = expected_fragment {
+            if fragment.crc.finish() != expected.crc32 || fragment.hash.finalize() != expected.hash
+            {
+                return Err(Error::InvalidHeader(
+                    "entry source contents changed while writing",
+                ));
+            }
+        }
+        if start + len == prepared.len {
+            crate::write_stream::check_source_length(
+                &mut *reader,
+                start + len,
+                prepared.len,
+                "entry source size changed while writing",
+            )?;
+            prepared.verify(std::mem::take(&mut **emitted))?;
+        }
+        Ok(())
+    }
+
+    fn copy_range_unverified(
+        &mut self,
+        start: u64,
+        len: u64,
+        output: &mut dyn Write,
+    ) -> Result<()> {
         match self {
             Self::Packed(spool) => {
                 spool.copy_range_to(start, len, output)?;
             }
-            Self::Stored(source) => {
-                let mut reader = source.open()?;
+            Self::Stored { prepared, .. } => {
+                let mut reader = prepared.source.open()?;
                 reader.seek(std::io::SeekFrom::Start(start))?;
                 let copied = std::io::copy(&mut reader.by_ref().take(len), output)?;
                 if copied != len {
@@ -894,15 +996,17 @@ fn prepare_volume_member(
             const ENCRYPT_CHUNK: usize = 64 * 1024;
             let _permit = resources.acquire(ENCRYPT_CHUNK as u64, 0)?;
             if member.store {
-                let mut reader = entry.source.open()?;
+                let source = PreparedSource::new(&entry.source, &member);
+                let mut reader = source.open()?;
                 encrypt_reader_to(
-                    &mut *reader,
+                    &mut reader,
                     plain_len,
                     &mut encrypted,
                     &keys,
                     iv,
                     ENCRYPT_CHUNK,
                 )?;
+                reader.finish(&source, source.len)?;
             } else {
                 let mut packed = member.packed;
                 packed.rewind()?;
@@ -941,7 +1045,10 @@ fn prepare_volume_member(
             compression_info,
             payload_len: plain_len,
             source: if member.store {
-                FragmentSource::Stored(entry.source.clone())
+                FragmentSource::Stored {
+                    prepared: PreparedSource::new(&entry.source, &member),
+                    emitted: Box::default(),
+                }
             } else {
                 FragmentSource::Packed(member.packed)
             },
@@ -1002,9 +1109,9 @@ impl VolumeWriter<'_> {
             )?;
             let body = self.body.as_mut().expect("volume started");
             body.write_all(&header)?;
-            if fragment_len != 0 {
-                member.source.copy_range(start, fragment_len, body)?;
-            }
+            member
+                .source
+                .emit_range(start, fragment_len, body, fragment_checksums)?;
 
             self.payload_in_volume += fragment_len;
             start += fragment_len;

@@ -20,6 +20,11 @@ trait SourceFactory: Send + Sync {
 
 #[derive(Clone)]
 /// A reopenable byte source for an archive member.
+///
+/// Reopening is not a snapshot: callers must keep the source stable for the
+/// duration of a write. Writers check emitted stored data against the prepared
+/// size and archive checksums. A mismatch fails the write, but a caller-provided
+/// output stream can already contain partial data when the error is returned.
 pub struct EntrySource(Arc<dyn SourceFactory>);
 
 impl fmt::Debug for EntrySource {

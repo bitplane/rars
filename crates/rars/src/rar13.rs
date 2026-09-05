@@ -1446,7 +1446,24 @@ fn write_member(
         },
     )?;
     output.write_all(&header)?;
-    payload.write_to(output, u64::from(packed_size))
+    if matches!(payload, MemberPayload::Copied(_)) {
+        let mut checksum = Rar13Checksum::new();
+        payload.write_to(
+            &mut Rar13ChecksumWriter {
+                inner: output,
+                checksum: &mut checksum,
+            },
+            u64::from(packed_size),
+        )?;
+        if checksum.finish() != encoded.file_crc {
+            return Err(Error::InvalidHeader(
+                "entry source contents changed while writing",
+            ));
+        }
+        Ok(())
+    } else {
+        payload.write_to(output, u64::from(packed_size))
+    }
 }
 
 pub fn write_stored_volumes(

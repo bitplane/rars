@@ -133,7 +133,7 @@ impl MemberPayload<'_> {
 
 // Consume at most the advertised length plus one probe byte, including for a
 // source that keeps growing. The extra byte is never passed to a codec or sink.
-fn check_source_length(
+pub(crate) fn check_source_length(
     reader: &mut dyn Read,
     observed: u64,
     expected: u64,
