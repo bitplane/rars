@@ -11,7 +11,6 @@ use crate::{
     rar13, rar15_40, rar50, ArchiveFamily, ArchiveVersion, EntrySource, Error, FeatureSet, Result,
     WriteProgress, WriterResources,
 };
-use std::collections::HashSet;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -260,34 +259,35 @@ impl Builder {
     /// Rename the member called `old` to `new`.
     pub fn rename(&mut self, old: &[u8], new: Vec<u8>) -> Result<()> {
         let new = validate_entry_name(new)?;
-        let entry = self
+        let index = self
             .entries
-            .iter_mut()
-            .find(|entry| entry.name == old)
+            .iter()
+            .position(|entry| entry.name == old)
             .ok_or_else(|| Error::AtEntry {
                 name: old.to_vec(),
                 operation: "renaming",
                 source: Box::new(Error::InvalidHeader("no such archive entry")),
             })?;
-        entry.name = new;
-        self.reject_duplicate_names()
+        if old != new {
+            self.reject_duplicate_name(&new)?;
+        }
+        self.entries[index].name = new;
+        Ok(())
     }
 
     fn push(&mut self, entry: BuilderEntry) -> Result<()> {
+        self.reject_duplicate_name(&entry.name)?;
         self.entries.push(entry);
-        self.reject_duplicate_names()
+        Ok(())
     }
 
-    fn reject_duplicate_names(&self) -> Result<()> {
-        let mut seen = HashSet::with_capacity(self.entries.len());
-        for entry in &self.entries {
-            if !seen.insert(entry.name.as_slice()) {
-                return Err(Error::AtEntry {
-                    name: entry.name.clone(),
-                    operation: "adding",
-                    source: Box::new(Error::InvalidHeader("duplicate archive entry name")),
-                });
-            }
+    fn reject_duplicate_name(&self, name: &[u8]) -> Result<()> {
+        if self.entries.iter().any(|entry| entry.name == name) {
+            return Err(Error::AtEntry {
+                name: name.to_vec(),
+                operation: "adding",
+                source: Box::new(Error::InvalidHeader("duplicate archive entry name")),
+            });
         }
         Ok(())
     }
@@ -818,6 +818,28 @@ mod tests {
             .add_bytes(b"a".to_vec(), vec![], None, None)
             .unwrap_err();
         assert!(error.to_string().contains("duplicate archive entry name"));
+        assert_eq!(builder.names().collect::<Vec<_>>(), vec![&b"a"[..]]);
+    }
+
+    #[test]
+    fn rejected_edits_preserve_a_usable_archive() {
+        let mut builder = builder_with(ArchiveVersion::Rar50).store(true);
+        let before = builder.to_bytes().unwrap();
+        assert!(builder.rename(b"a.txt", b"dir/b.txt".to_vec()).is_err());
+        assert_eq!(builder.to_bytes().unwrap(), before);
+        assert!(builder
+            .add_bytes(b"a.txt".to_vec(), b"replacement".to_vec(), None, None)
+            .is_err());
+        assert_eq!(builder.to_bytes().unwrap(), before);
+
+        builder.rename(b"a.txt", b"a.txt".to_vec()).unwrap();
+        assert_eq!(builder.to_bytes().unwrap(), before);
+        builder.rename(b"a.txt", b"renamed.txt".to_vec()).unwrap();
+        let archive = crate::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        assert_eq!(
+            archive.read_member(b"renamed.txt", None).unwrap().unwrap(),
+            b"hello world".repeat(64)
+        );
     }
 
     #[test]
