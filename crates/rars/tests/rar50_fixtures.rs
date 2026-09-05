@@ -4251,6 +4251,10 @@ fn rar50_reads_the_modification_time_from_the_htime_record() {
         let Ok(archive) = Archive::parse_path(&path) else {
             continue;
         };
+        let common = rars::Archive::Rar50Plus(archive.clone());
+        for (member, file) in common.members().zip(archive.files()) {
+            assert_eq!(member.meta.file_time, file.mtime.or(file.htime_mtime));
+        }
         for file in archive.files() {
             if file.mtime.is_some() {
                 with_header_field += 1;

@@ -591,7 +591,8 @@ impl RarBuilder {
     /// Create a RAR5 level-3 conversion builder from an archive.
     ///
     /// This currently copies file contents, names, order and the archive comment,
-    /// but does not preserve directories, timestamps, encryption, solid settings
+    /// and RAR5 whole-second modification times. It does not preserve directories,
+    /// legacy timestamps, subsecond precision, encryption, solid settings
     /// or volume layout. Unix permission bits are retained; other attributes
     /// use the builder's DOS defaults. The password
     /// unlocks the input; output is unencrypted. For an existing RarFile, its
@@ -634,6 +635,13 @@ impl RarBuilder {
             // and cannot faithfully reproduce links or other special entries.
             let mode = (info.attr_source() == rars_rs::AttrSource::Unix)
                 .then_some((info.file_attr & 0o7777) as u32);
+            // Output is RAR5: these fields already contain Unix seconds, including
+            // an explicit epoch. Legacy DOS fields need the established local-zone
+            // conversion and must never be copied as if they were Unix seconds.
+            let mtime = match info.family {
+                rars_rs::ArchiveFamily::Rar50Plus => info.file_time,
+                _ => None,
+            };
             let member_archive = archive.archive.clone();
             let member_name = info.name.clone();
             let member_password = password.clone();
@@ -647,7 +655,7 @@ impl RarBuilder {
             });
             builder
                 .inner
-                .add_source(info.name, source, None, mode)
+                .add_source(info.name, source, mtime, mode)
                 .map_err(map_builder_error)?;
         }
         Ok(builder)

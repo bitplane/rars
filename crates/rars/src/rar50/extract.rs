@@ -189,10 +189,17 @@ impl FileHeader {
         Ok(())
     }
 
+    /// Modification time in Unix seconds, using extraction's established
+    /// base-header precedence and falling back to the extended time record.
+    /// Unlike filesystem extraction metadata, this retains absent versus epoch.
+    pub fn modification_time(&self) -> Option<u32> {
+        self.mtime.or(self.htime_mtime)
+    }
+
     pub fn metadata(&self) -> ExtractedEntryMeta {
         ExtractedEntryMeta {
             name: self.name.clone(),
-            file_time: self.mtime.or(self.htime_mtime).unwrap_or(0),
+            file_time: self.modification_time().unwrap_or(0),
             attr: self.attributes,
             host_os: self.host_os,
             is_directory: self.is_directory(),

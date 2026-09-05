@@ -192,7 +192,9 @@ pub struct ArchiveMemberMeta {
     pub packed_size: u64,
     /// Unpacked file size in bytes.
     pub unpacked_size: u64,
-    /// DOS/FAT timestamp when present.
+    /// DOS local wall-clock fields for RAR 1.3-4.x, or Unix seconds for RAR5.
+    /// RAR5 includes the extended modification-time fallback; `None` is distinct
+    /// from an explicitly stored Unix epoch (`Some(0)`).
     pub file_time: Option<u32>,
     /// File attributes widened to a common integer type.
     pub file_attr: u64,
@@ -668,7 +670,7 @@ fn rar50_member(file: &rar50::FileHeader) -> ArchiveMember {
             name: file.name.clone(),
             packed_size: file.packed_size(),
             unpacked_size: file.unpacked_size,
-            file_time: file.mtime,
+            file_time: file.modification_time(),
             file_attr: file.attributes,
             host_os: Some(file.host_os),
             is_directory: file.is_directory(),
@@ -1056,6 +1058,29 @@ mod tests {
     use std::cell::RefCell;
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
+
+    #[test]
+    fn member_mtime_matches_rar50_extraction_without_losing_absence() {
+        let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+        builder
+            .add_bytes(b"time".to_vec(), vec![], None, None)
+            .unwrap();
+        let archive = rar50::Archive::parse(&builder.to_bytes().unwrap()).unwrap();
+        let mut file = archive.files().next().unwrap().clone();
+        for (base, extended, expected) in [
+            (None, None, None),
+            (Some(0), None, Some(0)),
+            (None, Some(0), Some(0)),
+            (None, Some(1_700_000_002), Some(1_700_000_002)),
+            (Some(123), Some(456), Some(123)),
+            (Some(0), Some(456), Some(0)),
+        ] {
+            file.mtime = base;
+            file.htime_mtime = extended;
+            assert_eq!(rar50_member(&file).meta.file_time, expected);
+            assert_eq!(file.metadata().file_time, expected.unwrap_or(0));
+        }
+    }
 
     struct CollectWriter {
         data: Rc<RefCell<Vec<u8>>>,
