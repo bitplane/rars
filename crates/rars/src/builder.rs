@@ -12,7 +12,7 @@ use crate::{
     WriteProgress, WriterResources,
 };
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -437,7 +437,9 @@ impl Builder {
         let mut owned = self.clone();
         for entry in &mut owned.entries {
             if let Some(source) = entry.source.take() {
-                source.open()?.read_to_end(&mut entry.data)?;
+                entry.data = crate::write_stream::MemberBytes::Source(&source)
+                    .load()?
+                    .into_owned();
             }
         }
         Ok(std::borrow::Cow::Owned(owned))

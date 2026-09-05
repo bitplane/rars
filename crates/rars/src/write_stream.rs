@@ -42,12 +42,14 @@ impl<'a> MemberBytes<'a> {
                     Error::InvalidHeader("member is larger than this host can hold")
                 })?;
                 let mut data = Vec::with_capacity(capacity);
-                source.open()?.read_to_end(&mut data)?;
-                if data.len() as u64 != expected {
-                    return Err(Error::InvalidHeader(
-                        "entry source size changed while compressing",
-                    ));
-                }
+                let mut reader = source.open()?;
+                reader.by_ref().take(expected).read_to_end(&mut data)?;
+                check_source_length(
+                    &mut *reader,
+                    data.len() as u64,
+                    expected,
+                    "entry source size changed while compressing",
+                )?;
                 Ok(Cow::Owned(data))
             }
         }
@@ -59,15 +61,25 @@ impl<'a> MemberBytes<'a> {
         match self {
             Self::Borrowed(data) => visit(data),
             Self::Source(source) => {
+                let expected = source.len()?;
                 let mut reader = source.open()?;
+                let mut limited = reader.by_ref().take(expected);
+                let mut observed = 0;
                 let mut buffer = vec![0u8; WALK_CHUNK];
                 loop {
-                    let read = reader.read(&mut buffer)?;
+                    let read = limited.read(&mut buffer)?;
                     if read == 0 {
                         break;
                     }
+                    observed += read as u64;
                     visit(&buffer[..read]);
                 }
+                check_source_length(
+                    &mut *reader,
+                    observed,
+                    expected,
+                    "entry source size changed while reading",
+                )?;
             }
         }
         Ok(())
@@ -105,21 +117,103 @@ impl MemberPayload<'_> {
         match self {
             Self::Packed(packed) => output.write_all(packed)?,
             Self::Copied(source) => {
-                let copied = std::io::copy(&mut source.open()?, output)?;
-                if copied != expected {
-                    return Err(Error::InvalidHeader(
-                        "entry source size changed while writing",
-                    ));
-                }
+                let mut reader = source.open()?;
+                let copied = std::io::copy(&mut reader.by_ref().take(expected), output)?;
+                check_source_length(
+                    &mut *reader,
+                    copied,
+                    expected,
+                    "entry source size changed while writing",
+                )?;
             }
         }
         Ok(())
     }
 }
 
+// Consume at most the advertised length plus one probe byte, including for a
+// source that keeps growing. The extra byte is never passed to a codec or sink.
+fn check_source_length(
+    reader: &mut dyn Read,
+    observed: u64,
+    expected: u64,
+    message: &'static str,
+) -> Result<()> {
+    if observed != expected {
+        return Err(Error::InvalidHeader(message));
+    }
+    let mut probe = [0];
+    loop {
+        match reader.read(&mut probe) {
+            Ok(0) => return Ok(()),
+            Ok(_) => return Err(Error::InvalidHeader(message)),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changed_sources_are_bounded_and_rejected() {
+        use std::io::{Cursor, Seek, SeekFrom};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        struct Counted {
+            data: Cursor<Vec<u8>>,
+            read: Arc<AtomicUsize>,
+        }
+        impl Read for Counted {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let count = self.data.read(buffer)?;
+                self.read.fetch_add(count, Ordering::Relaxed);
+                Ok(count)
+            }
+        }
+        impl Seek for Counted {
+            fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+                self.data.seek(position)
+            }
+        }
+
+        for expected in [0, 8] {
+            for actual in [0, 3, 8, 1024 * 1024] {
+                let read = Arc::new(AtomicUsize::new(0));
+                let source = EntrySource::from_opener(expected, {
+                    let read = Arc::clone(&read);
+                    move || {
+                        Ok(Box::new(Counted {
+                            data: Cursor::new(vec![42; actual]),
+                            read: Arc::clone(&read),
+                        }))
+                    }
+                });
+                let bytes = MemberBytes::Source(&source);
+                let valid = actual as u64 == expected;
+                assert_eq!(bytes.load().is_ok(), valid);
+                assert!(read.swap(0, Ordering::Relaxed) as u64 <= expected + 1);
+                let mut visited = 0;
+                assert_eq!(bytes.walk(|chunk| visited += chunk.len()).is_ok(), valid);
+                assert!(visited as u64 <= expected);
+                assert!(read.swap(0, Ordering::Relaxed) as u64 <= expected + 1);
+                let mut output = Vec::new();
+                assert_eq!(
+                    MemberPayload::Copied(&source)
+                        .write_to(&mut output, expected)
+                        .is_ok(),
+                    valid
+                );
+                assert!(output.len() as u64 <= expected);
+                assert!(read.load(Ordering::Relaxed) as u64 <= expected + 1);
+            }
+        }
+    }
 
     #[test]
     fn a_source_walks_in_chunks_and_loads_whole() {
