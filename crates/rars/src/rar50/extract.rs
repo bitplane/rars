@@ -509,6 +509,9 @@ impl Archive {
         Ok(())
     }
 
+    /// Decodes independent members in bounded batches, emitting in archive order.
+    /// Completed batches can have been emitted when a later batch fails. The
+    /// buffering limit bounds retained payload bytes, not aggregate decoder state.
     pub fn extract_to_parallel_buffered<F>(
         &self,
         options: crate::ArchiveReadOptions<'_>,
@@ -521,6 +524,7 @@ impl Archive {
             || self.files().any(|file| {
                 file.is_split_before()
                     || file.is_split_after()
+                    || file.unpacked_size > rar50_buffered_decode_limit(options)
                     || file.should_stream_decode(rar50_buffered_decode_limit(options))
                     || file.decoded_compression_info().is_ok_and(|info| info.solid)
             })
@@ -530,12 +534,25 @@ impl Archive {
 
         let password = options.password;
         let buffered_decode_limit = rar50_buffered_decode_limit(options);
-        let files: Vec<_> = self.files().collect();
-        let entries = crate::parallel::map_collect(files, |file| {
-            decode_parallel_entry(self, file, password, buffered_decode_limit)
-        })?;
-        for entry in entries {
-            write_parallel_entry(entry, &mut open, &mut |_, _| Ok(()))?;
+        let mut files = self.files().peekable();
+        let window = crate::parallel::default_window().max(1);
+        while files.peek().is_some() {
+            let mut batch = Vec::new();
+            let mut remaining = buffered_decode_limit;
+            while batch.len() < window {
+                let Some(file) = files.peek() else { break };
+                if file.unpacked_size > remaining {
+                    break;
+                }
+                remaining -= file.unpacked_size;
+                batch.push(files.next().expect("peeked file"));
+            }
+            let entries = crate::parallel::map_collect(batch, |file| {
+                decode_parallel_entry(self, file, password, buffered_decode_limit)
+            })?;
+            for entry in entries {
+                write_parallel_entry(entry, &mut open, &mut |_, _| Ok(()))?;
+            }
         }
         Ok(())
     }
@@ -1267,6 +1284,7 @@ mod tests {
         HFL_SPLIT_BEFORE,
     };
     use super::*;
+    use crate::{ArchiveVersion, FeatureSet};
     use std::cell::RefCell;
     use std::io::Cursor;
     use std::rc::Rc;
@@ -1278,6 +1296,64 @@ mod tests {
             name.to_vec(),
             crate::EntrySource::from_bytes(Arc::<[u8]>::from(data.to_vec())),
         )
+    }
+
+    #[test]
+    fn parallel_extraction_emits_a_bounded_batch_before_decoding_the_next() {
+        let bytes = Rar50Writer::new(
+            WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
+                .with_compression_level(0),
+        )
+        .entries([entry(b"first", &[1; 64]), entry(b"second", &[2; 64])])
+        .finish()
+        .unwrap();
+        let mut archive = Archive::parse_owned(bytes).unwrap();
+        for block in &mut archive.blocks {
+            if let super::super::Block::File(file) = block {
+                if file.name == b"second" {
+                    file.hash = None;
+                    file.data_crc32 = Some(0);
+                }
+            }
+        }
+        let mut opened = Vec::new();
+        let error = archive
+            .extract_to_parallel_buffered(
+                crate::ArchiveReadOptions::default().with_rar50_buffered_decode_limit(64),
+                |meta| {
+                    opened.push(meta.name.clone());
+                    Ok(Box::new(std::io::sink()))
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, Error::AtEntry { source, .. }
+            if matches!(*source, Error::Crc32Mismatch { .. })));
+        assert_eq!(opened, vec![b"first".to_vec()]);
+    }
+
+    #[test]
+    fn parallel_extraction_handles_empty_entries_and_small_limits() {
+        let bytes = Rar50Writer::new(
+            WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
+                .with_compression_level(0),
+        )
+        .entries([entry(b"empty", &[]), entry(b"data", &[1; 64])])
+        .finish()
+        .unwrap();
+        let archive = Archive::parse_owned(bytes).unwrap();
+        for limit in [0, 32, 64, 128] {
+            let mut opened = Vec::new();
+            archive
+                .extract_to_parallel_buffered(
+                    crate::ArchiveReadOptions::default().with_rar50_buffered_decode_limit(limit),
+                    |meta| {
+                        opened.push(meta.name.clone());
+                        Ok(Box::new(std::io::sink()))
+                    },
+                )
+                .unwrap();
+            assert_eq!(opened, vec![b"empty".to_vec(), b"data".to_vec()]);
+        }
     }
 
     fn plain_file(name: &[u8], data: &[u8], hash: Option<FileHash>) -> FileHeader {
