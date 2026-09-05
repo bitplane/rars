@@ -53,6 +53,10 @@ for more details.
 Python bindings are published to [pypi](https://pypi.org/project/rars/), so you
 can `pip install rars`. To build locally, it's `just python`.
 
+`RarBuilder.from_archive` currently converts to unencrypted RAR5 and does not
+preserve all metadata. See the [rewrite contract](python/REWRITING.md) before
+using it to edit existing archives.
+
 For JS it's built to WebAssembly and published to
 [npm](https://www.npmjs.com/package/@bitplane/rars);
 `npm install @bitplane/rars`. It reads and writes in the browser and in Node,

@@ -47,6 +47,32 @@ def test_builder_creates_archive_and_rewrite_model():
     assert output.read("renamed.txt") == b"two"
 
 
+@pytest.mark.parametrize("encrypted", [False, True])
+def test_from_archive_current_conversion_contract(encrypted):
+    # Characterize the existing conversion API before introducing preservation.
+    # In particular, an input password currently does not encrypt the output.
+    password = "rewrite secret" if encrypted else None
+    builder = rars.RarBuilder(
+        format="rar29", store=True, password=password, comment=b"keep this comment"
+    )
+    members = [("second.txt", b"second payload"), ("first.txt", b"first payload")]
+    for name, data in members:
+        builder.add_bytes(data, name)
+    source = rars.RarFile.from_bytes(builder.to_bytes(), password=password)
+    assert source.family == "rar15_40"
+    assert source.needs_password == encrypted
+
+    output = rars.RarFile.from_bytes(rars.RarBuilder.from_archive(source).to_bytes())
+
+    assert output.family == "rar50_plus"
+    assert not output.needs_password
+    assert output.comment == b"keep this comment"
+    assert output.namelist() == [name for name, _ in members]
+    for name, data in members:
+        assert output.read(name) == data
+    output.testrar()
+
+
 def test_builder_reports_compression_progress():
     builder = rars.RarBuilder(format="rar70", compression=3, solid=True)
     builder.add_bytes(b"progress payload " * 8192, "payload.txt")

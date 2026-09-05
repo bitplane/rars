@@ -588,6 +588,16 @@ impl RarBuilder {
         })
     }
 
+    /// Create a RAR5 level-3 conversion builder from an archive.
+    ///
+    /// This currently copies file contents, names, order and the archive comment,
+    /// but does not preserve directories, timestamps, encryption, solid settings
+    /// or volume layout. Attributes are not faithfully preserved. The password
+    /// unlocks the input; output is unencrypted. For an existing RarFile, its
+    /// configured password is used.
+    ///
+    /// This is not yet a metadata-preserving archive editor. See
+    /// python/REWRITING.md for current limitations and the planned contract.
     #[staticmethod]
     #[pyo3(signature = (source, password = None))]
     fn from_archive(
