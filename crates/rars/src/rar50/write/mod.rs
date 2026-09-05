@@ -1462,19 +1462,8 @@ mod tests {
     }
 
     #[test]
-    fn streaming_writer_rejects_a_source_that_grows_between_passes() {
-        let opens = Arc::new(AtomicUsize::new(0));
-        let source = EntrySource::from_opener(4, {
-            let opens = Arc::clone(&opens);
-            move || {
-                let data = if opens.fetch_add(1, Ordering::SeqCst) == 0 {
-                    b"data".to_vec()
-                } else {
-                    b"data!".to_vec()
-                };
-                Ok(Box::new(Cursor::new(data)))
-            }
-        });
+    fn streaming_writer_rejects_a_source_larger_than_its_declared_size() {
+        let source = EntrySource::from_opener(4, || Ok(Box::new(Cursor::new(b"data!".to_vec()))));
         let entry = ArchiveEntry::new(b"changing.bin".to_vec(), source)
             .with_attributes(0x20)
             .with_host_os(1);

@@ -18,6 +18,8 @@ use super::filter_policy::{
 };
 use super::FilterPolicy;
 use crate::codec::rar50::{encode_lz_streaming_blocks, BlockSplitter, EncodeOptions};
+use crate::crc32::Crc32;
+use crate::rar50::blake2sp;
 use crate::streaming::Spool;
 use crate::{EntrySource, Error, Result, WriterResources};
 use std::io::{Read, Write};
@@ -73,9 +75,32 @@ struct MemberStream {
     packed: Spool,
     /// A chunk read to decide a block boundary and not used by that block.
     pushback: Vec<u8>,
+    crc: Crc32,
+    hash: blake2sp::Hasher,
 }
 
 impl MemberStream {
+    fn new(
+        member: usize,
+        source: &EntrySource,
+        size: u64,
+        resources: &WriterResources,
+    ) -> Result<Self> {
+        let mut reader = source.open()?;
+        if size == 0 {
+            check_source_end(&mut *reader)?;
+        }
+        Ok(Self {
+            member,
+            reader,
+            remaining: size,
+            packed: Spool::create(resources)?,
+            pushback: Vec::new(),
+            crc: Crc32::new(),
+            hash: blake2sp::Hasher::new(),
+        })
+    }
+
     /// Whether this member has anything left, read or unread.
     fn has_more(&self) -> bool {
         self.remaining != 0 || !self.pushback.is_empty()
@@ -93,8 +118,8 @@ pub(super) fn compress_members_reporting(
     let mut integrity = Vec::with_capacity(sources.len());
     for source in sources {
         let input_size = source.len()?;
-        let (crc32, hash) = super::source_integrity(source, input_size, plan.block_size)?;
-        integrity.push((input_size, crc32, hash));
+        // Compression fills these checksums while consuming the source.
+        integrity.push((input_size, 0, [0; 32]));
     }
 
     // Filters and multi-candidate encoding both need the whole member at once.
@@ -131,7 +156,8 @@ pub(super) fn compress_members_reporting(
     // Storing is not "compress and hope it does not help": the header records
     // method zero, so the payload must be the source bytes.
     let packed = if plan.method == 0 {
-        for (input_size, _, _) in &integrity {
+        for (source, (input_size, crc, hash)) in sources.iter().zip(&mut integrity) {
+            (*crc, *hash) = super::source_integrity(source, *input_size, plan.block_size)?;
             if !advance(*input_size) {
                 return Err(Error::Cancelled);
             }
@@ -143,7 +169,7 @@ pub(super) fn compress_members_reporting(
     } else if plan.solid {
         compress_solid_chain(
             sources,
-            &integrity,
+            &mut integrity,
             &plan,
             batch_capacity,
             required,
@@ -153,7 +179,7 @@ pub(super) fn compress_members_reporting(
     } else {
         compress_independent_members(
             sources,
-            &integrity,
+            &mut integrity,
             &plan,
             batch_capacity,
             required,
@@ -277,7 +303,9 @@ fn compress_whole_member(
     resources: &WriterResources,
     advance: &(dyn Fn(u64) -> bool + Sync),
 ) -> Result<CompressedMember> {
-    let (input_size, crc32, hash) = integrity;
+    let (input_size, _, _) = integrity;
+    let mut crc = Crc32::new();
+    let mut hasher = blake2sp::Hasher::new();
     let required = whole_member_workspace(input_size, plan);
 
     let mut packed_spool = Spool::create(resources)?;
@@ -285,13 +313,16 @@ fn compress_whole_member(
     if !stored {
         match resources.acquire(required, plan.dictionary_size) {
             Ok(_permit) => {
-                let mut data = Vec::with_capacity(input_size as usize);
-                source.open()?.read_to_end(&mut data)?;
-                if data.len() as u64 != input_size {
-                    return Err(Error::InvalidHeader(
-                        "entry source size changed while compressing",
-                    ));
+                let size = usize::try_from(input_size)
+                    .map_err(|_| Error::InvalidHeader("entry size overflows usize"))?;
+                let mut data = vec![0; size];
+                let mut reader = source.open()?;
+                for chunk in data.chunks_mut(plan.block_size.max(1)) {
+                    reader.read_exact(chunk)?;
+                    crc.update(chunk);
+                    hasher.update(chunk);
                 }
+                check_source_end(&mut *reader)?;
                 // The filter search walks the member many times over, so
                 // encoder positions are scaled down to the member's share
                 // of that total: many passes, one member's worth of
@@ -361,10 +392,13 @@ fn compress_whole_member(
         }
     }
 
+    if input_size == 0 {
+        check_source_end(&mut *source.open()?)?;
+    }
     Ok(CompressedMember {
         input_size,
-        crc32,
-        hash,
+        crc32: crc.finish(),
+        hash: hasher.finalize(),
         store: stored,
         packed: packed_spool,
         solid_continuation: false,
@@ -376,7 +410,7 @@ fn compress_whole_member(
 #[allow(clippy::too_many_arguments)]
 fn compress_independent_members(
     sources: &[EntrySource],
-    integrity: &[(u64, u32, [u8; 32])],
+    integrity: &mut [(u64, u32, [u8; 32])],
     plan: &CompressPlan,
     batch_capacity: usize,
     required: u64,
@@ -390,13 +424,7 @@ fn compress_independent_members(
             .iter()
             .enumerate()
             .map(|(offset, source)| {
-                Ok(MemberStream {
-                    member: offset,
-                    reader: source.open()?,
-                    remaining: integrity[group_start + offset].0,
-                    packed: Spool::create(resources)?,
-                    pushback: Vec::new(),
-                })
+                MemberStream::new(offset, source, integrity[group_start + offset].0, resources)
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -440,7 +468,12 @@ fn compress_independent_members(
             compress_wave(jobs, plan, &mut streams, advance)?;
         }
 
-        packed.extend(streams.into_iter().map(|stream| stream.packed));
+        for stream in streams {
+            let slot = &mut integrity[group_start + stream.member];
+            slot.1 = stream.crc.finish();
+            slot.2 = stream.hash.finalize();
+            packed.push(stream.packed);
+        }
     }
     Ok(packed)
 }
@@ -449,7 +482,7 @@ fn compress_independent_members(
 #[allow(clippy::too_many_arguments)]
 fn compress_solid_chain(
     sources: &[EntrySource],
-    integrity: &[(u64, u32, [u8; 32])],
+    integrity: &mut [(u64, u32, [u8; 32])],
     plan: &CompressPlan,
     batch_capacity: usize,
     required: u64,
@@ -459,15 +492,7 @@ fn compress_solid_chain(
     let mut streams = sources
         .iter()
         .enumerate()
-        .map(|(member, source)| {
-            Ok(MemberStream {
-                member,
-                reader: source.open()?,
-                remaining: integrity[member].0,
-                packed: Spool::create(resources)?,
-                pushback: Vec::new(),
-            })
-        })
+        .map(|(member, source)| MemberStream::new(member, source, integrity[member].0, resources))
         .collect::<Result<Vec<_>>>()?;
 
     let mut history: Vec<u8> = Vec::new();
@@ -513,7 +538,15 @@ fn compress_solid_chain(
         compress_wave(jobs, plan, &mut streams, advance)?;
     }
 
-    Ok(streams.into_iter().map(|stream| stream.packed).collect())
+    Ok(streams
+        .into_iter()
+        .map(|stream| {
+            let slot = &mut integrity[stream.member];
+            slot.1 = stream.crc.finish();
+            slot.2 = stream.hash.finalize();
+            stream.packed
+        })
+        .collect())
 }
 
 /// Reads the next block from `stream`, checking the source has not grown.
@@ -549,16 +582,23 @@ fn read_chunk(stream: &mut MemberStream, block_size: usize) -> Result<Vec<u8>> {
         .map_err(|_| Error::InvalidHeader("RAR 5 block size overflows usize"))?;
     let mut data = vec![0u8; wanted];
     stream.reader.read_exact(&mut data)?;
+    stream.crc.update(&data);
+    stream.hash.update(&data);
     stream.remaining -= wanted as u64;
     if stream.remaining == 0 {
-        let mut trailing = [0u8; 1];
-        if stream.reader.read(&mut trailing)? != 0 {
-            return Err(Error::InvalidHeader(
-                "entry source size changed while compressing",
-            ));
-        }
+        check_source_end(&mut *stream.reader)?;
     }
     Ok(data)
+}
+
+fn check_source_end(reader: &mut dyn Read) -> Result<()> {
+    let mut trailing = [0u8; 1];
+    if reader.read(&mut trailing)? != 0 {
+        return Err(Error::InvalidHeader(
+            "entry source size changed while compressing",
+        ));
+    }
+    Ok(())
 }
 
 /// Extends the rolling window with `data`, dropping what has fallen out of
@@ -722,5 +762,59 @@ mod tests {
             whole_member_workspace(sources[0].len().unwrap(), &plan) * 2,
         );
         assert_eq!(serial, limited);
+    }
+    #[test]
+    fn checksums_follow_the_compression_read_including_pushback_and_empty_members() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let mut data = vec![0; 65536];
+        data.extend(std::iter::repeat_n(1, 65536));
+        data.extend(std::iter::repeat_n(2, 65536));
+        for policy in [FilterPolicy::None, FilterPolicy::Auto] {
+            for solid in [false, true] {
+                let opens = Arc::new(AtomicUsize::new(0));
+                let sources: Vec<_> = [data.clone(), Vec::new()]
+                    .into_iter()
+                    .map(|data| {
+                        let opens = Arc::clone(&opens);
+                        EntrySource::from_opener(data.len() as u64, move || {
+                            opens.fetch_add(1, Ordering::SeqCst);
+                            Ok(Box::new(std::io::Cursor::new(data.clone())))
+                        })
+                    })
+                    .collect();
+                let options = EncodeOptions::new(8).with_max_match_distance(131072);
+                let plan = CompressPlan {
+                    algorithm_version: 0,
+                    encode_options: options,
+                    dictionary_size: 131072,
+                    block_size: 65536,
+                    solid,
+                    method: 1,
+                    filter_policy: policy.clone(),
+                    candidates: vec![options],
+                };
+                let members = compress_members_reporting(
+                    &sources,
+                    plan,
+                    &WriterResources::default(),
+                    &|_| true,
+                )
+                .unwrap();
+                assert_eq!(
+                    opens.load(Ordering::SeqCst),
+                    2,
+                    "policy={policy:?}, solid={solid}"
+                );
+                for (member, input) in members.iter().zip([data.as_slice(), &[]]) {
+                    let mut crc = Crc32::new();
+                    crc.update(input);
+                    assert_eq!(member.crc32, crc.finish());
+                    assert_eq!(member.hash, blake2sp::hash(input));
+                }
+            }
+        }
     }
 }
