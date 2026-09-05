@@ -21,8 +21,12 @@ use std::sync::Arc;
 /// which no real RAR writer emits.
 const DOS_ARCHIVE_ATTR: u32 = 0x20;
 
-/// Host OS 3 is Unix in every RAR header that carries the field.
-const DEFAULT_HOST_OS_UNIX: u64 = 3;
+// Host IDs are format-specific: legacy RAR uses 3 for Unix, RAR 5 uses 1.
+// Keep the host paired with its attributes. Merely correcting the RAR 5 ID
+// while retaining DOS_ARCHIVE_ATTR would make reference extractors interpret
+// 0x20 as Unix permissions, producing an unexpectedly restricted file.
+const RAR15_HOST_UNIX: u8 = 3;
+const RAR50_HOST_UNIX: u64 = 1;
 
 /// A member queued for writing.
 ///
@@ -40,12 +44,41 @@ struct BuilderEntry {
 }
 
 impl BuilderEntry {
+    fn attributes(&self) -> u32 {
+        match self.mode {
+            // add_bytes/add_source can receive permission bits alone, whereas
+            // add_path supplies a complete st_mode. Supply regular-file type
+            // bits only when absent so both forms describe Unix metadata.
+            Some(mode) if mode & 0o170000 == 0 => mode | 0o100000,
+            Some(mode) => mode,
+            None => DOS_ARCHIVE_ATTR,
+        }
+    }
+
     fn rar50_attr(&self) -> u64 {
-        u64::from(self.mode.unwrap_or(DOS_ARCHIVE_ATTR))
+        u64::from(self.attributes())
     }
 
     fn rar15_attr(&self) -> u32 {
-        self.mode.unwrap_or(DOS_ARCHIVE_ATTR)
+        self.attributes()
+    }
+
+    fn rar50_host_os(&self) -> u64 {
+        if self.mode.is_some() {
+            RAR50_HOST_UNIX
+        } else {
+            0 // Windows host, DOS attributes.
+        }
+    }
+
+    fn rar15_host_os(&self) -> u8 {
+        // The RAR 1.5 writer still downgrades Unix metadata to DOS for old
+        // extractor compatibility; RAR 2.x-4.x retain the Unix host and mode.
+        if self.mode.is_some() {
+            RAR15_HOST_UNIX
+        } else {
+            0 // MS-DOS host, DOS attributes.
+        }
     }
 }
 
@@ -169,6 +202,10 @@ impl Builder {
     }
 
     /// Queue `data` under `name`.
+    ///
+    /// `mode` is a Unix mode, with optional file-type bits. Without a mode,
+    /// the member uses DOS archive attributes and the extractor's default permissions.
+    /// RAR 1.3-1.5 output uses DOS metadata even when a Unix mode is supplied.
     pub fn add_bytes(
         &mut self,
         name: Vec<u8>,
@@ -187,6 +224,7 @@ impl Builder {
 
     /// Queue a member whose bytes are fetched from `source` when the writer
     /// reaches it.
+    /// `mode` has the same meaning as in [`add_bytes`](Self::add_bytes).
     pub fn add_source(
         &mut self,
         name: Vec<u8>,
@@ -457,7 +495,7 @@ impl Builder {
                 let built = rar50::ArchiveEntry::new(entry.name.clone(), source)
                     .with_mtime(entry.mtime)
                     .with_attributes(entry.rar50_attr())
-                    .with_host_os(DEFAULT_HOST_OS_UNIX);
+                    .with_host_os(entry.rar50_host_os());
                 match self.password.as_deref() {
                     Some(password) => built.with_password(password.to_vec()),
                     None => built,
@@ -524,7 +562,7 @@ impl Builder {
                     data: &entry.data,
                     file_time: entry.mtime.unwrap_or(0),
                     file_attr: entry.rar15_attr(),
-                    host_os: DEFAULT_HOST_OS_UNIX as u8,
+                    host_os: entry.rar15_host_os(),
                     password: self.password.as_deref(),
                     file_comment: None,
                 })
@@ -539,7 +577,7 @@ impl Builder {
                     data: &entry.data,
                     file_time: entry.mtime.unwrap_or(0),
                     file_attr: entry.rar15_attr(),
-                    host_os: DEFAULT_HOST_OS_UNIX as u8,
+                    host_os: entry.rar15_host_os(),
                     password: self.password.as_deref(),
                     file_comment: None,
                 })
@@ -645,7 +683,7 @@ impl Builder {
                     data: &entry.data,
                     file_time: entry.mtime.unwrap_or(0),
                     file_attr: entry.rar15_attr(),
-                    host_os: DEFAULT_HOST_OS_UNIX as u8,
+                    host_os: entry.rar15_host_os(),
                     password: self.password.as_deref(),
                     file_comment: None,
                 },
@@ -659,7 +697,7 @@ impl Builder {
                     data: &entry.data,
                     file_time: entry.mtime.unwrap_or(0),
                     file_attr: entry.rar15_attr(),
-                    host_os: DEFAULT_HOST_OS_UNIX as u8,
+                    host_os: entry.rar15_host_os(),
                     password: self.password.as_deref(),
                     file_comment: None,
                 },
