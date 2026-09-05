@@ -128,29 +128,36 @@ pub(crate) fn create_rar50_redirection(
     overwrite: OverwritePolicy,
     created_paths: &HashMap<PathBuf, PathBuf>,
 ) -> rars::Result<(PathBuf, bool)> {
-    let mut out_path = output_path_for_rar50_entry(out_dir, entry)?;
-    if let Some(parent) = out_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let rel = output_relative_path(&entry.name)
-        .map_err(|_| Error::InvalidHeader("unsafe archive path"))?;
-    out_path = checked_output_path(out_dir, &rel)?;
-    prepare_redirection_destination(&out_path, overwrite)?;
+    // Validate the operation and its target before removing an existing output.
+    let prepare_destination = || -> rars::Result<PathBuf> {
+        let mut out_path = output_path_for_rar50_entry(out_dir, entry)?;
+        if let Some(parent) = out_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let rel = output_relative_path(&entry.name)
+            .map_err(|_| Error::InvalidHeader("unsafe archive path"))?;
+        out_path = checked_output_path(out_dir, &rel)?;
+        prepare_redirection_destination(&out_path, overwrite)?;
+        Ok(out_path)
+    };
 
     match redirection.redirection_type {
         FSREDIR_UNIX_SYMLINK | FSREDIR_WINDOWS_SYMLINK | FSREDIR_WINDOWS_JUNCTION => {
             let target_rel = output_relative_path(&redirection.target_name)
                 .map_err(|_| Error::InvalidHeader("unsafe archive redirection target"))?;
+            let out_path = prepare_destination()?;
             create_symlink_redirection(&target_rel, &out_path, redirection.flags)?;
             Ok((out_path, false))
         }
         FSREDIR_HARDLINK => {
             let source = redirection_source_path(redirection, created_paths)?;
+            let out_path = prepare_destination()?;
             fs::hard_link(source, &out_path)?;
             Ok((out_path, true))
         }
         FSREDIR_FILE_COPY => {
             let source = redirection_source_path(redirection, created_paths)?;
+            let out_path = prepare_destination()?;
             fs::copy(source, &out_path)?;
             Ok((out_path, true))
         }
@@ -454,6 +461,76 @@ mod tests {
 
     fn scratch(name: &str) -> crate::scratch::Scratch {
         crate::scratch::case(&format!("rars-output-{name}"))
+    }
+
+    fn redirection_fixture() -> (
+        rars::rar50::ExtractedEntryMeta,
+        rars::rar50::FileRedirection,
+    ) {
+        let archive = rars::rar50::Archive::parse(include_bytes!(
+            "../../rars/tests/fixtures/rar50/wild/hardlink.rar"
+        ))
+        .unwrap();
+        let file = archive
+            .files()
+            .find(|file| file.redirection.is_some())
+            .unwrap();
+        (file.metadata(), file.redirection.clone().unwrap())
+    }
+
+    #[test]
+    fn invalid_redirections_preserve_existing_destinations() {
+        use super::*;
+        let dir = scratch("invalid-redirections");
+        let (mut meta, mut redirection) = redirection_fixture();
+        meta.name = b"destination".to_vec();
+        let destination = dir.join("destination");
+        for (kind, target) in [
+            (99, &b"source"[..]),
+            (FSREDIR_UNIX_SYMLINK, b"../escape"),
+            (FSREDIR_HARDLINK, b"missing"),
+            (FSREDIR_FILE_COPY, b"missing"),
+        ] {
+            fs::write(&destination, b"keep me").unwrap();
+            redirection.redirection_type = kind;
+            redirection.target_name = target.to_vec();
+            assert!(create_rar50_redirection(
+                &dir,
+                &meta,
+                &redirection,
+                OverwritePolicy::Always,
+                &HashMap::new(),
+            )
+            .is_err());
+            assert_eq!(fs::read(&destination).unwrap(), b"keep me", "type {kind}");
+        }
+    }
+
+    #[test]
+    fn valid_copy_redirection_obeys_overwrite_policy() {
+        use super::*;
+        let dir = scratch("copy-redirection");
+        let (mut meta, mut redirection) = redirection_fixture();
+        meta.name = b"destination".to_vec();
+        redirection.redirection_type = FSREDIR_FILE_COPY;
+        redirection.target_name = b"source".to_vec();
+        let destination = dir.join("destination");
+        let source = dir.join("source");
+        fs::write(&destination, b"old").unwrap();
+        fs::write(&source, b"new").unwrap();
+        let created = HashMap::from([(PathBuf::from("source"), source)]);
+        assert!(create_rar50_redirection(
+            &dir,
+            &meta,
+            &redirection,
+            OverwritePolicy::Never,
+            &created,
+        )
+        .is_err());
+        assert_eq!(fs::read(&destination).unwrap(), b"old");
+        create_rar50_redirection(&dir, &meta, &redirection, OverwritePolicy::Always, &created)
+            .unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"new");
     }
 
     /// RAR 5.0 separates with `/` on every host, so a backslash in a name is a
