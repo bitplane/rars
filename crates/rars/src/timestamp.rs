@@ -1,9 +1,12 @@
+//! Timestamp conversions shared by archive consumers.
+//! Legacy DOS values follow the established extracting-machine local-zone policy.
+
 use crate::tzif::TimeZone;
-use rars::{ArchiveFamily, TimeRefinement};
+use crate::{ArchiveFamily, TimeRefinement};
 use std::fs;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub(crate) fn current_filetime() -> u64 {
+pub fn current_filetime() -> u64 {
     const FILETIME_UNIX_EPOCH_SECONDS: u64 = 11_644_473_600;
     const FILETIME_TICKS_PER_SECOND: u64 = 10_000_000;
 
@@ -17,13 +20,13 @@ pub(crate) fn current_filetime() -> u64 {
     seconds.saturating_add(u64::from(duration.subsec_nanos() / 100))
 }
 
-pub(crate) fn format_filetime_utc(filetime: u64) -> String {
+pub fn format_filetime_utc(filetime: u64) -> String {
     filetime_to_system_time(filetime)
         .and_then(format_system_time_utc)
         .unwrap_or_else(|| format!("{filetime:#018x}"))
 }
 
-pub(crate) fn source_unix_mtime(metadata: &fs::Metadata) -> Option<u32> {
+pub fn source_unix_mtime(metadata: &fs::Metadata) -> Option<u32> {
     metadata
         .modified()
         .ok()?
@@ -32,7 +35,7 @@ pub(crate) fn source_unix_mtime(metadata: &fs::Metadata) -> Option<u32> {
         .and_then(|duration| u32::try_from(duration.as_secs()).ok())
 }
 
-pub(crate) fn source_dos_mtime(metadata: &fs::Metadata) -> u32 {
+pub fn source_dos_mtime(metadata: &fs::Metadata) -> u32 {
     metadata
         .modified()
         .ok()
@@ -40,7 +43,7 @@ pub(crate) fn source_dos_mtime(metadata: &fs::Metadata) -> u32 {
         .unwrap_or(0)
 }
 
-pub(crate) fn extracted_system_time(
+pub fn extracted_system_time(
     family: ArchiveFamily,
     file_time: u32,
     refinement: Option<TimeRefinement>,
@@ -48,7 +51,6 @@ pub(crate) fn extracted_system_time(
     let base = match family {
         ArchiveFamily::Rar13 | ArchiveFamily::Rar15To40 => dos_time_to_system_time(file_time),
         ArchiveFamily::Rar50Plus => unix_seconds_to_system_time(file_time),
-        _ => None,
     }?;
     // A DOS timestamp counts in two-second steps, so an odd second and any
     // sub-second detail arrive separately and have to be added back on.

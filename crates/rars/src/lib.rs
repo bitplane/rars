@@ -34,6 +34,8 @@ pub mod rar50;
 pub mod recovery;
 mod source;
 mod streaming;
+pub mod timestamp;
+mod tzif;
 pub mod version;
 mod volume_extract;
 pub mod write_plan;
@@ -196,6 +198,8 @@ pub struct ArchiveMemberMeta {
     /// RAR5 includes the extended modification-time fallback; `None` is distinct
     /// from an explicitly stored Unix epoch (`Some(0)`).
     pub file_time: Option<u32>,
+    /// Legacy odd-second and subsecond detail, kept separate from raw DOS fields.
+    pub mtime_refinement: Option<TimeRefinement>,
     /// File attributes widened to a common integer type.
     pub file_attr: u64,
     /// Host OS discriminator when present in the archive format.
@@ -213,6 +217,17 @@ pub struct ArchiveMemberMeta {
 }
 
 impl ArchiveMemberMeta {
+    /// Modification time as an instant. Legacy DOS values use the same local
+    /// zone and refinement policy as CLI extraction; RAR5 values are absolute.
+    pub fn modification_time(&self) -> Option<std::time::SystemTime> {
+        let raw = self.file_time?;
+        if self.family == ArchiveFamily::Rar50Plus {
+            return std::time::UNIX_EPOCH
+                .checked_add(std::time::Duration::from_secs(u64::from(raw)));
+        }
+        timestamp::extracted_system_time(self.family, raw, self.mtime_refinement)
+    }
+
     /// How to interpret this member's attributes, using the archive family's
     /// host numbering and the same compatibility rules as extraction.
     pub fn attr_source(&self) -> AttrSource {
@@ -619,6 +634,7 @@ fn rar13_member(entry: &rar13::Entry) -> ArchiveMember {
             packed_size: u64::from(entry.header.pack_size),
             unpacked_size: u64::from(entry.header.unp_size),
             file_time: Some(entry.header.file_time),
+            mtime_refinement: None,
             file_attr: u64::from(entry.header.file_attr),
             host_os: None,
             is_directory: entry.is_directory(),
@@ -644,6 +660,7 @@ fn rar15_40_member(file: &rar15_40::FileHeader) -> ArchiveMember {
             packed_size: file.pack_size,
             unpacked_size: file.unp_size,
             file_time: Some(file.file_time),
+            mtime_refinement: file.mtime_refinement(),
             file_attr: u64::from(file.attr),
             host_os: Some(u64::from(file.host_os)),
             is_directory: file.is_directory(),
@@ -671,6 +688,7 @@ fn rar50_member(file: &rar50::FileHeader) -> ArchiveMember {
             packed_size: file.packed_size(),
             unpacked_size: file.unpacked_size,
             file_time: file.modification_time(),
+            mtime_refinement: None,
             file_attr: file.attributes,
             host_os: Some(file.host_os),
             is_directory: file.is_directory(),

@@ -660,7 +660,7 @@ fn create_and_extract_preserve_mtime_and_permissions() {
 fn extract_reads_dos_timestamps_in_the_local_zone() {
     let dir = scratch("dos-timestamp-zone");
     let archive = dir.join("stamped.rar");
-    let tzdir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tz");
+    let tzdir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../rars/tests/fixtures/tz");
 
     let bytes = write_stored_archive(
         &[StoredEntry {

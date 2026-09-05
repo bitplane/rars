@@ -3,12 +3,39 @@
 import os
 import shutil
 import subprocess
+import sys
 import zlib
+from pathlib import Path
 
 import pytest
 import rars
 
 from test_extract_guards import _headers, _read_vint
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.mark.skipif(os.name != "posix" or not shutil.which("unrar"), reason="requires POSIX and unrar")
+@pytest.mark.parametrize("zone", ["Asia_Kolkata", "Europe_London", "Etc_GMT_5"])
+def test_legacy_rewrite_uses_extractions_local_zone_and_odd_second(tmp_path, zone):
+    source = ROOT / "crates/rars/tests/fixtures/rar15_40/rar420/ext_time_rar420.rar"
+    rewritten = tmp_path / "rewritten.rar"
+    env = dict(os.environ, TZDIR=str(ROOT / "crates/rars/tests/fixtures/tz"), TZ=zone)
+    # Zone state is cached once per process, just as in CLI extraction.
+    subprocess.run(
+        [sys.executable, "-c", "import rars,sys; rars.RarBuilder.from_archive(sys.argv[1]).write(sys.argv[2])",
+         str(source), str(rewritten)], env=env, check=True, capture_output=True,
+    )
+    times = []
+    for index, archive in enumerate((source, rewritten)):
+        output = tmp_path / str(index)
+        output.mkdir()
+        subprocess.run(
+            ["unrar", "x", "-idq", "-o+", str(archive), str(output) + "/"],
+            env=env, check=True, capture_output=True,
+        )
+        times.append((output / "hello.txt").stat().st_mtime_ns // 1_000_000_000)
+    assert times[0] == times[1]
 
 
 def archive_with_dos_flags(flags):

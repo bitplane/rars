@@ -591,8 +591,8 @@ impl RarBuilder {
     /// Create a RAR5 level-3 conversion builder from an archive.
     ///
     /// This currently copies file contents, names, order and the archive comment,
-    /// and RAR5 whole-second modification times. It does not preserve directories,
-    /// legacy timestamps, subsecond precision, encryption, solid settings
+    /// and whole-second modification times. It does not preserve directories,
+    /// subsecond precision, encryption, solid settings
     /// or volume layout. Unix permission bits and DOS file flags are retained;
     /// unknown hosts use the builder's DOS defaults. The password
     /// unlocks the input; output is unencrypted. For an existing RarFile, its
@@ -636,13 +636,16 @@ impl RarBuilder {
             let attr_source = info.attr_source();
             let mode = (attr_source == rars_rs::AttrSource::Unix)
                 .then_some((info.file_attr & 0o7777) as u32);
-            // Output is RAR5: these fields already contain Unix seconds, including
-            // an explicit epoch. Legacy DOS fields need the established local-zone
-            // conversion and must never be copied as if they were Unix seconds.
-            let mtime = match info.family {
-                rars_rs::ArchiveFamily::Rar50Plus => info.file_time,
-                _ => None,
-            };
+            // Reuse CLI extraction's local-zone policy for legacy DOS times,
+            // including the extended odd second, before writing RAR5 Unix time.
+            let mtime = info
+                .modification_time()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| u32::try_from(duration.as_secs()))
+                .transpose()
+                .map_err(|_| {
+                    PyValueError::new_err("modification time exceeds the RAR5 timestamp range")
+                })?;
             let member_archive = archive.archive.clone();
             let member_name = info.name.clone();
             let member_password = password.clone();
