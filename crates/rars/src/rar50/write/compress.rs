@@ -131,28 +131,6 @@ pub(super) fn compress_members_reporting(
         return compress_members_whole(sources, &integrity, &plan, resources, advance);
     }
 
-    // Any candidate that parses optimally searches a tree, so the charge has to
-    // cover the widest finder the member could build, not the one the level
-    // finally writes with.
-    let optimal_parse = plan.encode_options.optimal_parse
-        || plan.candidates.iter().any(|options| options.optimal_parse);
-    // A block grows past the read size when the data it covers is not moving,
-    // so the charge covers the largest one the parse could end up holding.
-    let required = super::streaming_lz_workspace(
-        plan.dictionary_size,
-        crate::codec::rar50::MAX_LZ_BLOCK_SIZE,
-        optimal_parse,
-    );
-    let max_jobs_by_memory = resources.memory_limit() / required;
-    if max_jobs_by_memory == 0 {
-        resources.acquire(required, plan.dictionary_size)?;
-        unreachable!("oversized workspace acquisition must fail");
-    }
-    let batch_capacity = usize::try_from(max_jobs_by_memory)
-        .unwrap_or(usize::MAX)
-        .min(crate::parallel::threads())
-        .max(1);
-
     // Storing is not "compress and hope it does not help": the header records
     // method zero, so the payload must be the source bytes.
     let packed = if plan.method == 0 {
@@ -166,26 +144,51 @@ pub(super) fn compress_members_reporting(
             .iter()
             .map(|_| Spool::create(resources))
             .collect::<Result<Vec<_>>>()?
-    } else if plan.solid {
-        compress_solid_chain(
-            sources,
-            &mut integrity,
-            &plan,
-            batch_capacity,
-            required,
-            resources,
-            advance,
-        )?
     } else {
-        compress_independent_members(
-            sources,
-            &mut integrity,
-            &plan,
-            batch_capacity,
-            required,
-            resources,
-            advance,
-        )?
+        // Only compression jobs need a finder and parse workspace.
+        // Any candidate that parses optimally searches a tree, so the charge has to
+        // cover the widest finder the member could build, not the one the level
+        // finally writes with.
+        let optimal_parse = plan.encode_options.optimal_parse
+            || plan.candidates.iter().any(|options| options.optimal_parse);
+        // A block grows past the read size when the data it covers is not moving,
+        // so the charge covers the largest one the parse could end up holding.
+        let required = super::streaming_lz_workspace(
+            plan.dictionary_size,
+            crate::codec::rar50::MAX_LZ_BLOCK_SIZE,
+            optimal_parse,
+        );
+        let max_jobs_by_memory = resources.memory_limit() / required;
+        if max_jobs_by_memory == 0 {
+            resources.acquire(required, plan.dictionary_size)?;
+            unreachable!("oversized workspace acquisition must fail");
+        }
+        let batch_capacity = usize::try_from(max_jobs_by_memory)
+            .unwrap_or(usize::MAX)
+            .min(crate::parallel::threads())
+            .max(1);
+
+        if plan.solid {
+            compress_solid_chain(
+                sources,
+                &mut integrity,
+                &plan,
+                batch_capacity,
+                required,
+                resources,
+                advance,
+            )?
+        } else {
+            compress_independent_members(
+                sources,
+                &mut integrity,
+                &plan,
+                batch_capacity,
+                required,
+                resources,
+                advance,
+            )?
+        }
     };
 
     Ok(packed

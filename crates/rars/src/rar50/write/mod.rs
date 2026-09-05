@@ -947,6 +947,28 @@ mod tests {
     struct CollectWriter(Rc<RefCell<Vec<u8>>>);
 
     #[test]
+    fn stored_writer_does_not_require_lz_workspace() {
+        let data = b"stored payload".repeat(1024);
+        let write = |limit| -> Result<Vec<u8>> {
+            let mut out = Vec::new();
+            Rar50Writer::new(
+                WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
+                    .with_compression_level(0),
+            )
+            .entries(vec![entry(b"payload", &data)])
+            .write_to(&mut out, &WriterResources::new(limit))?;
+            Ok(out)
+        };
+        let bytes = write(1024 * 1024).unwrap();
+        assert_eq!(bytes, write(256 * 1024 * 1024).unwrap());
+        let archive = crate::ArchiveReader::read_owned(bytes).unwrap();
+        assert_eq!(
+            archive.read_member(b"payload", None).unwrap().unwrap(),
+            data
+        );
+    }
+
+    #[test]
     fn the_writer_fits_the_dictionary_to_what_one_window_has_to_reach() {
         let options = WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
             .with_compression_level(3);
