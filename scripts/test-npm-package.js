@@ -1,4 +1,5 @@
 // Exercise the packed-shape async JavaScript API under Node.
+import "./test-npm-api.mjs";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";

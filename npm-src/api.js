@@ -219,11 +219,11 @@ export function createApi(runtime) {
       assertOpen(this);
       const oldName = validateName(from);
       const newName = validateName(to);
-      if (this._entries.some((entry) => sameName(entry.name, newName))) {
-        throw new RarError("DUPLICATE_ENTRY", "duplicate archive entry name");
-      }
       const entry = this._entries.find((candidate) => sameName(candidate.name, oldName));
       if (!entry) throw new RarError("ENTRY_NOT_FOUND", "no such queued entry");
+      if (this._entries.some((candidate) => candidate !== entry && sameName(candidate.name, newName))) {
+        throw new RarError("DUPLICATE_ENTRY", "duplicate archive entry name");
+      }
       entry.name = newName;
       return this;
     }
