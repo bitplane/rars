@@ -66,11 +66,12 @@ pub use write_progress::{WriteOperation, WriteProgress, WriteProgressEvent};
 pub struct ArchiveReadOptions<'a> {
     /// Password bytes used for encrypted headers or payloads.
     pub password: Option<&'a [u8]>,
-    /// Optional RAR 5 whole-member buffered decode limit.
+    /// Optional RAR 5 whole-member buffered decode limit, including logical
+    /// members split across volumes. This does not bound decoder dictionaries.
     ///
     /// Filtered RAR 5 members need whole-member transforms. Compressed members
     /// above this limit use the streaming path and reject filtered streams
-    /// with an unsupported-feature error instead of buffering the full member.
+    /// with a typed buffered-decode-limit error instead of buffering the full member.
     pub rar50_buffered_decode_limit: Option<u64>,
 }
 

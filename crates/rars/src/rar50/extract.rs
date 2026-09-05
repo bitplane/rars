@@ -741,6 +741,36 @@ impl<'a> DecoderSession<'a> {
     ) -> Result<Vec<u8>> {
         final_file.decode_split_with_decoder(volumes, split, &mut self.decoder, decryptor)
     }
+
+    fn stream_split_to(
+        &mut self,
+        volumes: &[Archive],
+        split: &PendingSplitRefs,
+        final_file: &FileHeader,
+        decryptor: Option<&SplitDecryptor>,
+        writer: &mut dyn Write,
+    ) -> Result<()> {
+        // Keep solid state only after successful emission and integrity checks,
+        // just as for a non-split streaming member.
+        let mut decoder = self.decoder.clone();
+        let mut packed = split.fragment_reader(volumes, decryptor)?;
+        final_file
+            .stream_packed_with_decoder(
+                &mut packed,
+                decryptor.map(|decryptor| &decryptor.keys),
+                &mut decoder,
+                self.buffered_decode_limit,
+                writer,
+            )
+            .map_err(|error| match error {
+                // Sink/reader I/O and the intentional filter limit must retain their
+                // own meaning. Fragment diagnostics are for decode/integrity failure.
+                Error::Io(_) | Error::Rar50BufferedDecodeLimitExceeded { .. } => error,
+                error => split.checksum_error(volumes).unwrap_or(error),
+            })?;
+        self.decoder = decoder;
+        Ok(())
+    }
 }
 
 impl FileHeader {
@@ -756,6 +786,10 @@ fn rar50_buffered_decode_limit(options: crate::ArchiveReadOptions<'_>) -> u64 {
 }
 
 /// Streams a RAR 5 multivolume archive set to caller-provided writers.
+/// Compressed logical members obey the same buffered-decode threshold as ordinary
+/// members. Above it, filtered members return a typed limit error. Direct sinks
+/// can receive data before an integrity or decoding failure; callers requiring
+/// verified publication must stage output until extraction succeeds.
 pub fn extract_volumes_to<F>(
     volumes: &[Archive],
     options: crate::ArchiveReadOptions<'_>,
@@ -941,6 +975,12 @@ impl PendingSplitRefs {
                 .write_stored_to(volumes, final_file, decryptor.as_ref(), &mut writer)
                 .map_err(|error| self.checksum_error(volumes).unwrap_or(error))
                 .map_err(|error| final_file.entry_error("extracting", error));
+        }
+
+        if final_file.should_stream_decode(session.buffered_decode_limit) {
+            return session
+                .stream_split_to(volumes, &self, final_file, decryptor.as_ref(), &mut writer)
+                .map_err(|error| final_file.entry_error("decoding", error));
         }
 
         let data = session
