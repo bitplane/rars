@@ -188,8 +188,26 @@ pub(super) fn compress_members_reporting(
 
 /// Working memory a member needs to be filtered as a whole: the member, the
 /// filtered copy, and the candidate packed outputs being compared.
-fn whole_member_workspace(input_size: u64) -> u64 {
-    input_size.saturating_mul(4).saturating_add(2 * 1024 * 1024)
+fn whole_member_workspace(input_size: u64, plan: &CompressPlan) -> u64 {
+    let optimal = plan.encode_options.optimal_parse
+        || plan.candidates.iter().any(|options| options.optimal_parse);
+    let reach = plan
+        .candidates
+        .iter()
+        .map(|options| options.max_match_distance as u64)
+        .chain(std::iter::once(
+            plan.encode_options.max_match_distance as u64,
+        ))
+        .max()
+        .unwrap_or(0)
+        .min(input_size)
+        .max(crate::codec::rar50::LZ_BLOCK_SIZE as u64);
+    let block = input_size.min(crate::codec::rar50::MAX_LZ_BLOCK_SIZE as u64) as usize;
+    // Input, transformed input and competing packed outputs stay live alongside
+    // the finder and the per-block token/parse workspace, not instead of them.
+    input_size
+        .saturating_mul(4)
+        .saturating_add(super::streaming_lz_workspace(reach, block, optimal))
 }
 
 /// Compresses members one at a time with the whole member resident, which is
@@ -208,7 +226,7 @@ fn compress_members_whole(
     let mut members = Vec::with_capacity(sources.len());
     for (index, source) in sources.iter().enumerate() {
         let (input_size, crc32, hash) = integrity[index];
-        let required = whole_member_workspace(input_size);
+        let required = whole_member_workspace(input_size, plan);
 
         let mut packed_spool = Spool::create(resources)?;
         let mut stored = input_size == 0;
@@ -538,4 +556,38 @@ pub(super) fn member_compression_info(
         plan.dictionary_size,
         member.solid_continuation,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn whole_member_budget_includes_tree_and_parse_workspace() {
+        let size = 16 * 1024 * 1024;
+        let options = EncodeOptions::new(32)
+            .with_max_match_distance(size)
+            .with_optimal_parse(true);
+        let plan = CompressPlan {
+            algorithm_version: 0,
+            encode_options: options,
+            dictionary_size: size as u64,
+            block_size: crate::codec::rar50::LZ_BLOCK_SIZE,
+            solid: false,
+            method: 3,
+            filter_policy: FilterPolicy::Auto,
+            candidates: vec![options],
+        };
+        let required = whole_member_workspace(size as u64, &plan);
+        assert!(required >= (size * 12) as u64);
+        assert!(matches!(
+            WriterResources::new((size * 4 + 2 * 1024 * 1024) as u64)
+                .acquire(required, size as u64),
+            Err(Error::MemoryLimitExceeded { .. })
+        ));
+        // A large configured dictionary must not charge unreachable links.
+        let mut larger = plan.clone();
+        larger.encode_options.max_match_distance *= 2;
+        assert_eq!(whole_member_workspace(size as u64, &larger), required);
+    }
 }
