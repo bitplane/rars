@@ -2001,15 +2001,24 @@ fn optimal_tokens(
             }
         }
 
-        // Matches that share a distance and a length slot cost the same, so
-        // only the longest of each run is worth pricing. Stepping slot to
-        // slot turns a four-thousand-step loop into a few dozen on data that
-        // matches long.
+        // Equal token prices do not make shorter matches redundant: their
+        // endpoints can expose a better continuation. Price every endpoint
+        // unless the explicit long-match heuristic commits past all of them.
+        let committed_reach = reaches
+            .iter()
+            .map(|&(_, end, _)| end)
+            .max()
+            .filter(|&length| length >= NICE_MATCH_LENGTH);
         for &(run_start, run_end, distance) in reaches.iter() {
             let mut length = run_start.max(4);
+            if let Some(committed) = committed_reach {
+                if run_end < committed {
+                    continue;
+                }
+                length = committed;
+            }
             while length <= run_end {
-                let reach =
-                    same_price_run_end(&state, length, distance, distance_size).min(run_end);
+                let reach = length;
                 let cost = match prices {
                     Some(prices) => prices.match_cost(&state, reach, distance, distance_size),
                     None => estimated_match_cost(&state, reach, distance, distance_size),
@@ -2062,48 +2071,6 @@ fn optimal_tokens(
     }
     reversed.reverse();
     Ok(reversed)
-}
-
-/// The longest match at `distance` that costs exactly what a match of
-/// `length` costs. Only the length slot varies with length, and a slot covers
-/// a run of consecutive lengths, so the end of that run is the last length
-/// worth pricing.
-fn same_price_run_end(
-    state: &EncoderMatchState,
-    length: usize,
-    distance: usize,
-    distance_size: usize,
-) -> usize {
-    // Repeating the last distance at the last length codes in two bits, so
-    // that one length must be priced on its own rather than folded into the
-    // run around it.
-    let repeat_length = (distance == state.reps[0] && state.last_length != 0)
-        .then_some(state.last_length)
-        .filter(|&repeat_length| repeat_length >= length);
-    if repeat_length == Some(length) {
-        return length;
-    }
-    let repeated = state
-        .reps
-        .iter()
-        .any(|&repeat_distance| repeat_distance == distance && repeat_distance != 0);
-    let bonus = if repeated { 0 } else { length_bonus(distance) };
-    let Some(value) = length.checked_sub(2 + bonus) else {
-        return length;
-    };
-    if value < 8 {
-        return length;
-    }
-    let bit_count = value.ilog2() as usize - 2;
-    let last_value = (((value >> bit_count) + 1) << bit_count) - 1;
-    let mut end = (last_value + 2 + bonus).max(length);
-    if let Some(repeat_length) = repeat_length {
-        end = end.min(repeat_length - 1);
-    }
-    // A distance whose extra bits change with length would break the run, but
-    // the distance is fixed here, so only the length slot moves.
-    let _ = distance_size;
-    end.max(length).min(MAX_ENCODER_MATCH_LENGTH)
 }
 
 fn encode_tokens_with_progress(
@@ -3765,6 +3732,40 @@ fn write_level_lengths(writer: &mut BitWriter, lengths: &[u8; LEVEL_TABLE_SIZE])
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn shorter_equal_price_match_can_expose_a_better_continuation() {
+        let history = b"abcdefghijklm!mnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let data = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let mut combined = history.to_vec();
+        combined.extend_from_slice(data);
+        let mut matches = BlockMatches {
+            runs: Vec::new(),
+            starts: Vec::new(),
+        };
+        for pos in 0..data.len() {
+            matches.starts.push(matches.runs.len() as u32);
+            if pos == 0 {
+                matches.runs.push((13, history.len() as u32));
+            }
+            if pos == 12 {
+                matches.runs.push((40, (history.len() + 12 - 14) as u32));
+            }
+        }
+        matches.starts.push(matches.runs.len() as u32);
+        let tokens = optimal_tokens(
+            &combined,
+            history.len()..combined.len(),
+            EncodeOptions::new(32),
+            DISTANCE_TABLE_SIZE_50,
+            None,
+            &matches,
+        )
+        .unwrap();
+        assert_eq!(tokens.len(), 2);
+        assert!(matches!(tokens[0], EncodeToken::Match { length: 12, .. }));
+        assert!(matches!(tokens[1], EncodeToken::Match { length: 40, .. }));
+    }
 
     #[test]
     fn shared_streaming_finder_preserves_separate_block_bytes() {
