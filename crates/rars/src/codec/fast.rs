@@ -1,3 +1,40 @@
+/// Append the low `count` bits most-significant first. Complete bytes are
+/// extracted from a word; only the two edge bytes need masking. The final
+/// partial byte stays zero-padded so callers can inspect or resume the buffer.
+#[inline]
+pub(crate) fn write_msb_bits(
+    bytes: &mut Vec<u8>,
+    bit_pos: &mut usize,
+    value: u64,
+    mut count: usize,
+) {
+    debug_assert!(count <= 64);
+    debug_assert_eq!(bytes.len(), (*bit_pos).div_ceil(8));
+    if count == 0 {
+        return;
+    }
+    let used = *bit_pos % 8;
+    *bit_pos += count;
+    if used != 0 {
+        let take = count.min(8 - used);
+        count -= take;
+        let mask = ((1u16 << take) - 1) as u8;
+        *bytes.last_mut().unwrap() |= (((value >> count) as u8) & mask) << (8 - used - take);
+    }
+    if count == 0 {
+        return;
+    }
+    let whole = count / 8;
+    if whole != 0 {
+        let aligned = (value << (64 - count)).to_be_bytes();
+        bytes.extend_from_slice(&aligned[..whole]);
+    }
+    let tail = count % 8;
+    if tail != 0 {
+        bytes.push((value as u8) << (8 - tail));
+    }
+}
+
 pub(crate) fn match_length(input: &[u8], pos: usize, distance: usize, max_length: usize) -> usize {
     if distance == 0 || distance > pos {
         return 0;
@@ -145,6 +182,38 @@ mod tests {
                 .filter_map(|(pos, &byte)| (byte & cmp_mask == 0xe8).then_some(pos))
                 .collect();
             assert_eq!(found, expected);
+        }
+    }
+}
+
+#[cfg(test)]
+mod bit_output_tests {
+    use super::write_msb_bits;
+
+    #[test]
+    fn word_output_matches_bit_reference_at_every_alignment_and_width() {
+        for offset in 0..8 {
+            for width in 0..=64 {
+                for value in [0, u64::MAX, 0x0123456789abcdef, 0xfedcba9876543210] {
+                    let mut actual = Vec::new();
+                    let mut at = 0;
+                    let mut expected = Vec::new();
+                    let mut bits = 0usize;
+                    for (value, count) in [(0x55, offset), (value, width), (0x1234, 13)] {
+                        write_msb_bits(&mut actual, &mut at, value, count);
+                        for bit in (0..count).rev() {
+                            if bits.is_multiple_of(8) {
+                                expected.push(0);
+                            }
+                            *expected.last_mut().unwrap() |=
+                                (((value >> bit) & 1) as u8) << (7 - bits % 8);
+                            bits += 1;
+                        }
+                        assert_eq!(actual, expected, "offset={offset} width={width}");
+                        assert_eq!(at, bits);
+                    }
+                }
+            }
         }
     }
 }

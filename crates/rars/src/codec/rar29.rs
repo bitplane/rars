@@ -3405,9 +3405,12 @@ struct BitWriter {
 
 impl BitWriter {
     fn write_bits(&mut self, value: u32, count: u8) {
-        for shift in (0..count).rev() {
-            self.write_bit(((value >> shift) & 1) != 0);
-        }
+        super::fast::write_msb_bits(
+            &mut self.bytes,
+            &mut self.bit_pos,
+            u64::from(value),
+            usize::from(count),
+        );
     }
 
     fn write_encoded_u32(&mut self, value: u32) {

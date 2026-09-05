@@ -3582,16 +3582,7 @@ impl BitWriter {
     }
 
     fn write_bits(&mut self, value: usize, count: usize) {
-        for bit in (0..count).rev() {
-            if self.bit_pos.is_multiple_of(8) {
-                self.bytes.push(0);
-            }
-            if (value >> bit) & 1 != 0 {
-                let byte = self.bytes.last_mut().unwrap();
-                *byte |= 1 << (7 - (self.bit_pos % 8));
-            }
-            self.bit_pos += 1;
-        }
+        super::fast::write_msb_bits(&mut self.bytes, &mut self.bit_pos, value as u64, count);
     }
 
     fn finish(self) -> Vec<u8> {

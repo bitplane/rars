@@ -2298,20 +2298,17 @@ struct BitWriter {
 
 impl BitWriter {
     fn write_bits(&mut self, value: u32, count: u8) {
-        for shift in (0..count).rev() {
-            self.write_bit(((value >> shift) & 1) != 0);
-        }
+        super::fast::write_msb_bits(
+            &mut self.bytes,
+            &mut self.bit_pos,
+            u64::from(value),
+            usize::from(count),
+        );
     }
 
+    #[cfg(test)]
     fn write_bit(&mut self, bit: bool) {
-        if self.bit_pos.is_multiple_of(8) {
-            self.bytes.push(0);
-        }
-        if bit {
-            let shift = 7 - (self.bit_pos % 8);
-            *self.bytes.last_mut().unwrap() |= 1 << shift;
-        }
-        self.bit_pos += 1;
+        self.write_bits(u32::from(bit), 1);
     }
 
     fn finish(self) -> Vec<u8> {
