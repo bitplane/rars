@@ -5,6 +5,36 @@ use rars::{ArchiveFamily, ArchiveReader, ArchiveVersion, Builder};
 
 const MODES: [Option<u32>; 4] = [None, Some(0o640), Some(0o100750), Some(0)];
 
+#[test]
+fn member_attribute_source_uses_family_specific_host_rules() {
+    use rars::AttrSource::{Dos, Unix, Unknown};
+
+    let archive =
+        ArchiveReader::read_owned(builder(ArchiveVersion::Rar50, true).to_bytes().unwrap())
+            .unwrap();
+    let mut meta = archive.members().next().unwrap().meta;
+    for (family, host, expected) in [
+        (ArchiveFamily::Rar13, None, Dos),
+        (ArchiveFamily::Rar15To40, Some(0), Dos),
+        (ArchiveFamily::Rar15To40, Some(1), Dos),
+        (ArchiveFamily::Rar15To40, Some(2), Dos),
+        (ArchiveFamily::Rar15To40, Some(3), Unix),
+        (ArchiveFamily::Rar15To40, Some(4), Dos),
+        (ArchiveFamily::Rar15To40, Some(5), Unix),
+        (ArchiveFamily::Rar15To40, Some(6), Unknown),
+        (ArchiveFamily::Rar15To40, Some(259), Unknown),
+        (ArchiveFamily::Rar15To40, None, Unknown),
+        (ArchiveFamily::Rar50Plus, Some(0), Dos),
+        (ArchiveFamily::Rar50Plus, Some(1), Unix),
+        (ArchiveFamily::Rar50Plus, Some(2), Unknown),
+        (ArchiveFamily::Rar50Plus, None, Unknown),
+    ] {
+        meta.family = family;
+        meta.host_os = host;
+        assert_eq!(meta.attr_source(), expected, "{family:?}, {host:?}");
+    }
+}
+
 fn builder(format: ArchiveVersion, store: bool) -> Builder {
     let mut builder = Builder::new(format).store(store);
     for (index, mode) in MODES.into_iter().enumerate() {

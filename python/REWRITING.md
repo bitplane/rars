@@ -18,7 +18,7 @@ the separate password argument.
 | Duplicate names | Rejected by the builder | Reject explicitly until editing by member identity is supported |
 | Directories | Skipped, including empty directories | Preserve explicit directory entries |
 | Timestamps | Dropped | Preserve supported timestamp fields and precision |
-| Attributes and host OS | Low nine attribute bits treated as Unix permissions, even for DOS entries | Interpret attributes with their source host; preserve their meaning |
+| Attributes and host OS | Unix permission and special bits retained using source host rules; DOS/unknown hosts use default DOS archive attributes | Preserve supported attributes with their source meaning, including DOS flags |
 | Archive comment | Copied as decoded comment bytes | Preserve comment content |
 | File comments, links and other metadata | No faithful preservation contract | Preserve supported records; reject unsupported preservation |
 | Archive format | Always writes RAR5 | Preserve supported format semantics; exact creating release may be unknowable |
@@ -43,8 +43,8 @@ archive. Failed preflight must leave existing destinations intact.
 Conversion will be explicit. It must let callers deliberately select a target
 format and remove encryption or metadata, and retain a documented route to the
 current RAR5 conversion settings. These options are planned, not available in
-the current `from_archive` signature. The incorrect DOS-to-Unix conversion is a
-bug to fix, not a compatibility guarantee to retain.
+the current `from_archive` signature. The former DOS-to-Unix permission
+reinterpretation was a bug; conversion no longer performs it.
 
 Preservation means preserving supported archive semantics, not identical bytes,
 compression ratio, encoder version, dictionary choices or volume boundaries.

@@ -1,4 +1,7 @@
 from pathlib import Path
+import os
+import shutil
+import subprocess
 
 import pytest
 import rars
@@ -71,6 +74,50 @@ def test_from_archive_current_conversion_contract(encrypted):
     for name, data in members:
         assert output.read(name) == data
     output.testrar()
+
+
+@pytest.mark.parametrize("format", ["rar14", "rar15", "rar29", "rar50", "rar70"])
+@pytest.mark.parametrize("mode", [None, 0, 0o640, 0o755, 0o6750])
+def test_from_archive_interprets_permissions_using_source_host(format, mode):
+    builder = rars.RarBuilder(format=format, store=True)
+    builder.add_bytes(b"permissions payload", "file.txt", mode=mode)
+    source = rars.RarFile.from_bytes(builder.to_bytes())
+    output = rars.RarFile.from_bytes(rars.RarBuilder.from_archive(source).to_bytes())
+    info = output.getinfo("file.txt")
+
+    # RAR 1.4/1.5 writers deliberately emit DOS metadata even for Unix input.
+    if mode is None or format in ("rar14", "rar15"):
+        assert info.host_os == 0
+        assert info.file_attr == 0x20
+    else:
+        assert info.host_os == 1
+        assert info.file_attr == 0o100000 | mode
+    assert output.read("file.txt") == b"permissions payload"
+
+
+@pytest.mark.skipif(os.name != "posix" or not shutil.which("unrar"), reason="requires POSIX and unrar")
+@pytest.mark.parametrize("format", ["rar29", "rar50"])
+@pytest.mark.parametrize("mode", [None, 0o640])
+def test_from_archive_permissions_match_reference_extraction(tmp_path, format, mode):
+    control = tmp_path / "control"
+    control.write_bytes(b"control")
+    expected_mode = control.stat().st_mode & 0o777 if mode is None else mode
+    builder = rars.RarBuilder(format=format, store=True)
+    builder.add_bytes(b"permissions payload", "file.txt", mode=mode)
+    source = rars.RarFile.from_bytes(builder.to_bytes())
+    archive_path = tmp_path / "rewritten.rar"
+    rars.RarBuilder.from_archive(source).write(archive_path)
+    output = tmp_path / "output"
+    output.mkdir()
+
+    subprocess.run(
+        ["unrar", "x", "-idq", "-o+", str(archive_path), str(output) + "/"],
+        check=True, capture_output=True,
+    )
+
+    extracted = output / "file.txt"
+    assert extracted.stat().st_mode & 0o777 == expected_mode
+    assert extracted.read_bytes() == b"permissions payload"
 
 
 def test_builder_reports_compression_progress():

@@ -211,6 +211,20 @@ pub struct ArchiveMemberMeta {
 }
 
 impl ArchiveMemberMeta {
+    /// How to interpret this member's attributes, using the archive family's
+    /// host numbering and the same compatibility rules as extraction.
+    pub fn attr_source(&self) -> AttrSource {
+        match self.family {
+            ArchiveFamily::Rar13 => AttrSource::Dos,
+            ArchiveFamily::Rar15To40 => self
+                .host_os
+                .and_then(|host| u8::try_from(host).ok())
+                .map(AttrSource::rar15_40)
+                .unwrap_or_default(),
+            ArchiveFamily::Rar50Plus => self.host_os.map(AttrSource::rar50).unwrap_or_default(),
+        }
+    }
+
     /// Raw member name bytes as stored by the archive family.
     pub fn name_bytes(&self) -> &[u8] {
         &self.name

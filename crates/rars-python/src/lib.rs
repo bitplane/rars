@@ -592,7 +592,8 @@ impl RarBuilder {
     ///
     /// This currently copies file contents, names, order and the archive comment,
     /// but does not preserve directories, timestamps, encryption, solid settings
-    /// or volume layout. Attributes are not faithfully preserved. The password
+    /// or volume layout. Unix permission bits are retained; other attributes
+    /// use the builder's DOS defaults. The password
     /// unlocks the input; output is unencrypted. For an existing RarFile, its
     /// configured password is used.
     ///
@@ -621,14 +622,22 @@ impl RarBuilder {
                 .comment(archive.comment(py)?),
             format,
         };
-        for info in &archive.infos {
+        for member in archive.archive.members() {
+            let info = member.meta;
             if info.is_directory {
                 continue;
             }
+            // A builder mode is Unix metadata, not generic archive attributes.
+            // Reuse extraction's host rules: e.g. legacy host 1 is DOS, but
+            // RAR5 host 1 is Unix. DOS 0x20 must not become Unix mode 0040.
+            // Retain permission/special bits only: this conversion emits files,
+            // and cannot faithfully reproduce links or other special entries.
+            let mode = (info.attr_source() == rars_rs::AttrSource::Unix)
+                .then_some((info.file_attr & 0o7777) as u32);
             let member_archive = archive.archive.clone();
-            let member_name = info.orig_filename_bytes.clone();
+            let member_name = info.name.clone();
             let member_password = password.clone();
-            let source = rars_rs::EntrySource::from_opener(info.file_size, move || {
+            let source = rars_rs::EntrySource::from_opener(info.unpacked_size, move || {
                 let data = member_archive
                     .read_member(&member_name, member_password.as_deref())?
                     .ok_or(rars_rs::Error::InvalidHeader(
@@ -638,12 +647,7 @@ impl RarBuilder {
             });
             builder
                 .inner
-                .add_source(
-                    info.orig_filename_bytes.clone(),
-                    source,
-                    None,
-                    Some((info.file_attr & 0o777) as u32),
-                )
+                .add_source(info.name, source, None, mode)
                 .map_err(map_builder_error)?;
         }
         Ok(builder)
