@@ -1,6 +1,6 @@
 [package]
 name = "rars-cli"
-version = "0.9.3"
+version = "0.9.4"
 description = "Command-line interface for the rars RAR archive toolkit."
 edition.workspace = true
 rust-version.workspace = true
