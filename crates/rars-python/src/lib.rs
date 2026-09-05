@@ -1322,9 +1322,9 @@ fn map_error(error: rars_rs::Error) -> PyErr {
 fn error_is_need_password(error: &rars_rs::Error) -> bool {
     match error {
         rars_rs::Error::NeedPassword => true,
-        rars_rs::Error::AtArchiveOffset { source, .. } | rars_rs::Error::AtEntry { source, .. } => {
-            error_is_need_password(source)
-        }
+        rars_rs::Error::AtArchiveOffset { source, .. }
+        | rars_rs::Error::AtEntry { source, .. }
+        | rars_rs::Error::InVolume { source, .. } => error_is_need_password(source),
         _ => false,
     }
 }
@@ -1332,9 +1332,9 @@ fn error_is_need_password(error: &rars_rs::Error) -> bool {
 fn error_is_bad_password(error: &rars_rs::Error) -> bool {
     match error {
         rars_rs::Error::WrongPasswordOrCorruptData => true,
-        rars_rs::Error::AtArchiveOffset { source, .. } | rars_rs::Error::AtEntry { source, .. } => {
-            error_is_bad_password(source)
-        }
+        rars_rs::Error::AtArchiveOffset { source, .. }
+        | rars_rs::Error::AtEntry { source, .. }
+        | rars_rs::Error::InVolume { source, .. } => error_is_bad_password(source),
         _ => false,
     }
 }
@@ -1342,6 +1342,33 @@ fn error_is_bad_password(error: &rars_rs::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn password_classification_survives_volume_context() {
+        use rars_rs::Error;
+        for (cause, needs_password, bad_password) in [
+            (Error::NeedPassword, true, false),
+            (Error::WrongPasswordOrCorruptData, false, true),
+            (Error::InvalidHeader("broken header"), false, false),
+        ] {
+            let volume = Error::InVolume {
+                number: 2,
+                source: Box::new(cause.clone()),
+            };
+            let nested = Error::AtEntry {
+                name: b"file".to_vec(),
+                operation: "extracting",
+                source: Box::new(Error::AtArchiveOffset {
+                    offset: 123,
+                    source: Box::new(volume.clone()),
+                }),
+            };
+            for error in [cause, volume, nested] {
+                assert_eq!(error_is_need_password(&error), needs_password, "{error}");
+                assert_eq!(error_is_bad_password(&error), bad_password, "{error}");
+            }
+        }
+    }
 
     #[test]
     fn parses_python_version_names() {

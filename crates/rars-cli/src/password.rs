@@ -115,9 +115,9 @@ pub(crate) fn should_prompt_password(stdin_is_terminal: bool) -> bool {
 pub(crate) fn error_needs_password(error: &Error) -> bool {
     match error {
         Error::NeedPassword => true,
-        Error::AtArchiveOffset { source, .. } | Error::AtEntry { source, .. } => {
-            error_needs_password(source)
-        }
+        Error::AtArchiveOffset { source, .. }
+        | Error::AtEntry { source, .. }
+        | Error::InVolume { source, .. } => error_needs_password(source),
         _ => false,
     }
 }
@@ -125,9 +125,9 @@ pub(crate) fn error_needs_password(error: &Error) -> bool {
 pub(crate) fn error_is_password_class(error: &Error) -> bool {
     match error {
         Error::NeedPassword | Error::WrongPasswordOrCorruptData => true,
-        Error::AtArchiveOffset { source, .. } | Error::AtEntry { source, .. } => {
-            error_is_password_class(source)
-        }
+        Error::AtArchiveOffset { source, .. }
+        | Error::AtEntry { source, .. }
+        | Error::InVolume { source, .. } => error_is_password_class(source),
         _ => false,
     }
 }
@@ -162,5 +162,36 @@ pub(crate) fn classify_rars_error(
         CliError::password(message(&error))
     } else {
         CliError::general(message(&error))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn password_classification_survives_volume_context() {
+        for (cause, needs_password, password_class) in [
+            (Error::NeedPassword, true, true),
+            (Error::WrongPasswordOrCorruptData, false, true),
+            (Error::InvalidHeader("broken header"), false, false),
+        ] {
+            let volume = Error::InVolume {
+                number: 2,
+                source: Box::new(cause.clone()),
+            };
+            let nested = Error::AtEntry {
+                name: b"file".to_vec(),
+                operation: "extracting",
+                source: Box::new(Error::AtArchiveOffset {
+                    offset: 123,
+                    source: Box::new(volume.clone()),
+                }),
+            };
+            for error in [cause, volume, nested] {
+                assert_eq!(error_needs_password(&error), needs_password, "{error}");
+                assert_eq!(error_is_password_class(&error), password_class, "{error}");
+            }
+        }
     }
 }
