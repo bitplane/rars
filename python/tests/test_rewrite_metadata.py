@@ -10,9 +10,36 @@ from pathlib import Path
 import pytest
 import rars
 
-from test_extract_guards import _headers, _read_vint
+from test_extract_guards import _headers, _read_vint, _rewrite_name
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_rewrite_rejects_duplicate_source_names_explicitly():
+    source = rars.RarBuilder(store=True)
+    source.add_bytes(b"first", "one.txt")
+    source.add_bytes(b"second", "two.txt")
+    archive = rars.RarFile.from_bytes(_rewrite_name(source.to_bytes(), b"two.txt", b"one.txt"))
+    assert archive.namelist() == ["one.txt", "one.txt"]
+    with pytest.raises(ValueError, match="duplicate member name.*one.txt"):
+        rars.RarBuilder.from_archive(archive)
+
+
+def test_rewrite_source_indices_survive_directory_and_file_edits():
+    source = rars.RarBuilder(solid=True)
+    source.add_directory("empty")
+    source.add_bytes(b"first payload", "first")
+    source.add_directory("other")
+    source.add_bytes(b"last payload", "last")
+    rewritten = rars.RarBuilder.from_archive(rars.RarFile.from_bytes(source.to_bytes()))
+    rewritten.remove("empty")
+    rewritten.remove("first")
+    rewritten.rename("last", "first")
+    rewritten.add_bytes(b"new payload", "last")
+    output = rars.RarFile.from_bytes(rewritten.to_bytes())
+    assert output.namelist() == ["other", "first", "last"]
+    assert output.read("first") == b"last payload"
+    assert output.read("last") == b"new payload"
 
 
 @pytest.mark.parametrize("format", ["rar50", "rar70"])

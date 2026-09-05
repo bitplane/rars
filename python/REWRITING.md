@@ -15,7 +15,7 @@ the separate password argument.
 | Property | Current behaviour | Intended preservation behaviour |
 | --- | --- | --- |
 | File contents, raw names, order | Copied; builder name validation applies | Preserve retained members and order |
-| Duplicate names | Rejected by the builder | Reject explicitly until editing by member identity is supported |
+| Duplicate names | Rejected explicitly before constructing the rewrite builder | Reject until editing duplicate names by identity is supported |
 | Directories | Explicit entries retained, including empty directories and supported modification time/attributes | Preserve explicit directory entries |
 | Timestamps | Modification time retained, including legacy odd seconds/fractions and RAR5 HTIME Unix/FILETIME fractions and explicit epoch | Preserve additional timestamp kinds using the established local-zone interpretation for legacy DOS times |
 | Attributes and host OS | Unix permission/special bits and DOS file flags retained using source host rules; unknown hosts use default DOS archive attributes | Preserve supported attributes with their source meaning; reject unsupported host semantics |
@@ -32,6 +32,8 @@ the separate password argument.
 File contents are read lazily during output. Keep a file-backed source available
 and unchanged until writing completes. Each retained member currently invokes
 an archive read separately; rewriting large or solid archives can be expensive.
+Lazy reads use original member indices, including directory positions, so edits
+to the queued names and order do not change source identity.
 
 `RarBuilder.add_directory(arcname, mtime=None, mode=None)` adds an explicit
 directory to RAR5/7 output. It also allows empty directories without an input

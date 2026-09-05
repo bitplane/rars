@@ -619,6 +619,15 @@ impl RarBuilder {
             Err(_) => RarFile::new(py, source, "r", password)?,
         };
         let password = archive.password.clone();
+        let mut names = HashSet::new();
+        for member in archive.archive.members() {
+            if !names.insert(member.meta.name.clone()) {
+                return Err(PyValueError::new_err(format!(
+                    "cannot rewrite duplicate member name {:?}: the editing API requires unique names",
+                    String::from_utf8_lossy(&member.meta.name)
+                )));
+            }
+        }
         let format = rars_rs::ArchiveVersion::Rar50;
         let mut builder = Self {
             inner: rars_rs::Builder::new(format)
@@ -626,7 +635,7 @@ impl RarBuilder {
                 .comment(archive.comment(py)?),
             format,
         };
-        for member in archive.archive.members() {
+        for (member_index, member) in archive.archive.members().enumerate() {
             let info = member.meta;
             // A builder mode is Unix metadata, not generic archive attributes.
             // Reuse extraction's host rules: e.g. legacy host 1 is DOS, but
@@ -668,11 +677,12 @@ impl RarBuilder {
                     .map_err(map_builder_error)?;
             } else {
                 let member_archive = archive.archive.clone();
-                let member_name = info.name.clone();
                 let member_password = password.clone();
                 let source = rars_rs::EntrySource::from_opener(info.unpacked_size, move || {
                     let data = member_archive
-                        .read_member(&member_name, member_password.as_deref())?
+                        // Source identity stays in original archive order, including
+                        // directories, regardless of later removes/adds/renames.
+                        .read_member_at(member_index, member_password.as_deref())?
                         .ok_or(rars_rs::Error::InvalidHeader(
                             "archive member disappeared while rewriting",
                         ))?;
