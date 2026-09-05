@@ -64,6 +64,12 @@ impl Drop for PendingArchive {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum EntryAttributes {
+    Dos(u64),
+    Unix(u32),
+}
+
 /// A member queued for writing.
 ///
 /// The bytes are either held directly or fetched from an [`EntrySource`] when
@@ -76,31 +82,39 @@ struct BuilderEntry {
     data: Vec<u8>,
     source: Option<EntrySource>,
     mtime: Option<u32>,
-    mode: Option<u32>,
+    attributes: EntryAttributes,
 }
 
 impl BuilderEntry {
-    fn attributes(&self) -> u32 {
-        match self.mode {
+    fn attributes(&self) -> u64 {
+        match self.attributes {
             // add_bytes/add_source can receive permission bits alone, whereas
             // add_path supplies a complete st_mode. Supply regular-file type
             // bits only when absent so both forms describe Unix metadata.
-            Some(mode) if mode & 0o170000 == 0 => mode | 0o100000,
-            Some(mode) => mode,
-            None => DOS_ARCHIVE_ATTR,
+            EntryAttributes::Unix(mode) if mode & 0o170000 == 0 => u64::from(mode | 0o100000),
+            EntryAttributes::Unix(mode) => u64::from(mode),
+            EntryAttributes::Dos(attributes) => attributes,
         }
     }
 
     fn rar50_attr(&self) -> u64 {
-        u64::from(self.attributes())
-    }
-
-    fn rar15_attr(&self) -> u32 {
         self.attributes()
     }
 
+    fn rar15_attr(&self) -> u32 {
+        // set_dos_attributes validates the target family's field width.
+        self.attributes() as u32
+    }
+
+    fn rar13_attr(&self) -> u8 {
+        match self.attributes {
+            EntryAttributes::Dos(attributes) => attributes as u8,
+            EntryAttributes::Unix(_) => DOS_ARCHIVE_ATTR as u8,
+        }
+    }
+
     fn rar50_host_os(&self) -> u64 {
-        if self.mode.is_some() {
+        if matches!(self.attributes, EntryAttributes::Unix(_)) {
             RAR50_HOST_UNIX
         } else {
             0 // Windows host, DOS attributes.
@@ -110,7 +124,7 @@ impl BuilderEntry {
     fn rar15_host_os(&self) -> u8 {
         // The RAR 1.5 writer still downgrades Unix metadata to DOS for old
         // extractor compatibility; RAR 2.x-4.x retain the Unix host and mode.
-        if self.mode.is_some() {
+        if matches!(self.attributes, EntryAttributes::Unix(_)) {
             RAR15_HOST_UNIX
         } else {
             0 // MS-DOS host, DOS attributes.
@@ -254,7 +268,10 @@ impl Builder {
             data,
             source: None,
             mtime,
-            mode,
+            attributes: mode.map_or(
+                EntryAttributes::Dos(u64::from(DOS_ARCHIVE_ATTR)),
+                EntryAttributes::Unix,
+            ),
         })
     }
 
@@ -273,8 +290,47 @@ impl Builder {
             data: Vec::new(),
             source: Some(source),
             mtime,
-            mode,
+            attributes: mode.map_or(
+                EntryAttributes::Dos(u64::from(DOS_ARCHIVE_ATTR)),
+                EntryAttributes::Unix,
+            ),
         })
+    }
+
+    /// Set DOS/Windows attributes for a queued file, replacing any Unix mode.
+    ///
+    /// The output host is paired with these flags. Attribute width is checked
+    /// against the target format (8 bits for RAR 1.3/1.4, 32 for RAR 1.5-4.x).
+    /// Directory attributes are rejected: setting flags cannot turn a queued
+    /// file into a directory entry. Errors leave the queued metadata unchanged.
+    pub fn set_dos_attributes(&mut self, name: &[u8], attributes: u64) -> Result<()> {
+        use crate::ArchiveFamily;
+        let max = match self.format.family() {
+            ArchiveFamily::Rar13 => u64::from(u8::MAX),
+            ArchiveFamily::Rar15To40 => u64::from(u32::MAX),
+            ArchiveFamily::Rar50Plus => u64::MAX,
+        };
+        if attributes > max {
+            return Err(Error::InvalidHeader(
+                "DOS attributes exceed the target format's field width",
+            ));
+        }
+        if attributes & 0x10 != 0 {
+            return Err(Error::InvalidHeader(
+                "DOS directory attributes require a directory entry",
+            ));
+        }
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.name == name)
+            .ok_or_else(|| Error::AtEntry {
+                name: name.to_vec(),
+                operation: "setting DOS attributes",
+                source: Box::new(Error::InvalidHeader("no such archive entry")),
+            })?;
+        entry.attributes = EntryAttributes::Dos(attributes);
+        Ok(())
     }
 
     /// Queue a file, or every file under a directory, named `archive_name` in
@@ -655,7 +711,7 @@ impl Builder {
                     name: &entry.name,
                     data: &entry.data,
                     file_time: entry.mtime.unwrap_or(0),
-                    file_attr: DOS_ARCHIVE_ATTR as u8,
+                    file_attr: entry.rar13_attr(),
                     password: self.password.as_deref(),
                     file_comment: None,
                 })
@@ -669,7 +725,7 @@ impl Builder {
                     name: &entry.name,
                     data: &entry.data,
                     file_time: entry.mtime.unwrap_or(0),
-                    file_attr: DOS_ARCHIVE_ATTR as u8,
+                    file_attr: entry.rar13_attr(),
                     password: self.password.as_deref(),
                     file_comment: None,
                 })
@@ -767,7 +823,7 @@ impl Builder {
                     name: &entry.name,
                     data: &entry.data,
                     file_time: entry.mtime.unwrap_or(0),
-                    file_attr: DOS_ARCHIVE_ATTR as u8,
+                    file_attr: entry.rar13_attr(),
                     password: self.password.as_deref(),
                     file_comment: None,
                 },
@@ -780,7 +836,7 @@ impl Builder {
                     name: &entry.name,
                     data: &entry.data,
                     file_time: entry.mtime.unwrap_or(0),
-                    file_attr: DOS_ARCHIVE_ATTR as u8,
+                    file_attr: entry.rar13_attr(),
                     password: self.password.as_deref(),
                     file_comment: None,
                 },

@@ -593,8 +593,8 @@ impl RarBuilder {
     /// This currently copies file contents, names, order and the archive comment,
     /// and RAR5 whole-second modification times. It does not preserve directories,
     /// legacy timestamps, subsecond precision, encryption, solid settings
-    /// or volume layout. Unix permission bits are retained; other attributes
-    /// use the builder's DOS defaults. The password
+    /// or volume layout. Unix permission bits and DOS file flags are retained;
+    /// unknown hosts use the builder's DOS defaults. The password
     /// unlocks the input; output is unencrypted. For an existing RarFile, its
     /// configured password is used.
     ///
@@ -633,7 +633,8 @@ impl RarBuilder {
             // RAR5 host 1 is Unix. DOS 0x20 must not become Unix mode 0040.
             // Retain permission/special bits only: this conversion emits files,
             // and cannot faithfully reproduce links or other special entries.
-            let mode = (info.attr_source() == rars_rs::AttrSource::Unix)
+            let attr_source = info.attr_source();
+            let mode = (attr_source == rars_rs::AttrSource::Unix)
                 .then_some((info.file_attr & 0o7777) as u32);
             // Output is RAR5: these fields already contain Unix seconds, including
             // an explicit epoch. Legacy DOS fields need the established local-zone
@@ -655,8 +656,14 @@ impl RarBuilder {
             });
             builder
                 .inner
-                .add_source(info.name, source, mtime, mode)
+                .add_source(info.name.clone(), source, mtime, mode)
                 .map_err(map_builder_error)?;
+            if attr_source == rars_rs::AttrSource::Dos {
+                builder
+                    .inner
+                    .set_dos_attributes(&info.name, info.file_attr)
+                    .map_err(map_builder_error)?;
+            }
         }
         Ok(builder)
     }

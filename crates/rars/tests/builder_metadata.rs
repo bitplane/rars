@@ -6,6 +6,84 @@ use rars::{ArchiveFamily, ArchiveReader, ArchiveVersion, Builder};
 const MODES: [Option<u32>; 4] = [None, Some(0o640), Some(0o100750), Some(0)];
 
 #[test]
+fn builder_preserves_explicit_dos_attributes_in_all_writer_paths() {
+    let flags = [0, 1, 2, 4, 0x20, 0x27, 0x80];
+    let root = scratch::case("builder-dos-attributes");
+    for format in ArchiveVersion::ALL {
+        for store in [false, true] {
+            let mut builder = Builder::new(format).store(store);
+            for (index, attr) in flags.iter().enumerate() {
+                let name = format!("file{index}").into_bytes();
+                builder
+                    .add_source(
+                        name.clone(),
+                        rars::EntrySource::from_bytes(b"DOS payload".to_vec()),
+                        None,
+                        Some(0o640),
+                    )
+                    .unwrap();
+                builder.set_dos_attributes(&name, *attr).unwrap();
+            }
+            let path = root.join(format!("{format}-{store}.rar"));
+            builder.write_to_path(&path, None).unwrap();
+            let mut outputs = vec![builder.to_bytes().unwrap(), std::fs::read(path).unwrap()];
+            if format.family() == ArchiveFamily::Rar50Plus {
+                outputs.extend(builder.volume_size(Some(4096)).build_volumes(None).unwrap());
+            }
+            for bytes in outputs {
+                let archive = ArchiveReader::read_owned(bytes).unwrap();
+                let members: Vec<_> = archive.members().collect();
+                assert_eq!(members.len(), flags.len());
+                for (member, attr) in members.iter().zip(flags) {
+                    assert_eq!(member.meta.attr_source(), rars::AttrSource::Dos);
+                    assert_eq!(member.meta.file_attr, attr, "{format}, store={store}");
+                    assert!(!member.meta.is_directory);
+                    assert_eq!(
+                        archive
+                            .read_member(&member.meta.name, None)
+                            .unwrap()
+                            .unwrap(),
+                        b"DOS payload"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn invalid_dos_attributes_leave_builder_metadata_unchanged() {
+    for (format, oversized) in [
+        (ArchiveVersion::Rar14, Some(256)),
+        (ArchiveVersion::Rar29, Some(u64::from(u32::MAX) + 1)),
+        (ArchiveVersion::Rar50, None),
+    ] {
+        let mut builder = builder(format, true);
+        let before = builder.to_bytes().unwrap();
+        assert!(builder.set_dos_attributes(b"missing", 0x20).is_err());
+        assert!(builder.set_dos_attributes(b"file1", 0x10).is_err());
+        if let Some(oversized) = oversized {
+            assert!(builder.set_dos_attributes(b"file1", oversized).is_err());
+        }
+        assert_eq!(builder.to_bytes().unwrap(), before);
+    }
+}
+
+#[test]
+fn dos_attribute_field_width_is_not_truncated() {
+    for (format, attr) in [
+        (ArchiveVersion::Rar14, 0xef),
+        (ArchiveVersion::Rar29, u64::from(u32::MAX) & !0x10),
+        (ArchiveVersion::Rar50, u64::MAX & !0x10),
+    ] {
+        let mut builder = builder(format, true);
+        builder.set_dos_attributes(b"file1", attr).unwrap();
+        let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        assert_eq!(archive.members().nth(1).unwrap().meta.file_attr, attr);
+    }
+}
+
+#[test]
 fn member_attribute_source_uses_family_specific_host_rules() {
     use rars::AttrSource::{Dos, Unix, Unknown};
 

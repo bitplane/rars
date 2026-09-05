@@ -18,7 +18,7 @@ the separate password argument.
 | Duplicate names | Rejected by the builder | Reject explicitly until editing by member identity is supported |
 | Directories | Skipped, including empty directories | Preserve explicit directory entries |
 | Timestamps | RAR5 whole-second modification time retained (base header or HTIME, including explicit epoch); legacy times and subsecond precision still dropped | Preserve supported timestamp fields and precision using the established local-zone interpretation for legacy DOS times |
-| Attributes and host OS | Unix permission and special bits retained using source host rules; DOS/unknown hosts use default DOS archive attributes | Preserve supported attributes with their source meaning, including DOS flags |
+| Attributes and host OS | Unix permission/special bits and DOS file flags retained using source host rules; unknown hosts use default DOS archive attributes | Preserve supported attributes with their source meaning; reject unsupported host semantics |
 | Archive comment | Copied as decoded comment bytes | Preserve comment content |
 | File comments, links and other metadata | No faithful preservation contract | Preserve supported records; reject unsupported preservation |
 | Archive format | Always writes RAR5 | Preserve supported format semantics; exact creating release may be unknowable |
