@@ -130,8 +130,8 @@ def test_from_archive_retains_rar5_modification_time(format, mtime):
 
     expected = rars.RarBuilder()
     expected.add_bytes(b"timestamp payload", "renamed.txt", mtime=mtime, mode=0o640)
-    # Compare headers too: absent time and an explicit epoch both currently
-    # display as None in RarInfo, but must remain distinct in the written archive.
+    # Compare headers too: absence and an explicit epoch must remain distinct
+    # in the written archive, including after a rename.
     assert rewritten.to_bytes() == expected.to_bytes()
 
 

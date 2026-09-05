@@ -218,6 +218,8 @@ struct RarInfo {
     #[pyo3(get)]
     compress_size: u64,
     #[pyo3(get)]
+    /// Whole-second calendar tuple: UTC for RAR5, stored wall-clock fields for
+    /// legacy DOS timestamps. None means no usable timestamp was recorded.
     date_time: Option<(u16, u8, u8, u8, u8, u8)>,
     #[pyo3(get)]
     crc: Option<u32>,
@@ -1203,7 +1205,12 @@ fn info_from_member(member: rars_rs::ArchiveMember) -> RarInfo {
         orig_filename_bytes: member.meta.name,
         file_size: member.meta.unpacked_size,
         compress_size: member.meta.packed_size,
-        date_time: member.meta.file_time.and_then(dos_datetime),
+        date_time: match member.meta.family {
+            rars_rs::ArchiveFamily::Rar50Plus => {
+                member.meta.file_time.map(rars_rs::timestamp::unix_datetime)
+            }
+            _ => member.meta.file_time.and_then(dos_datetime),
+        },
         crc,
         host_os: member.meta.host_os,
         is_encrypted: member.meta.is_encrypted,

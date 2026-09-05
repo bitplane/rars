@@ -35,6 +35,20 @@ pub fn source_unix_mtime(metadata: &fs::Metadata) -> Option<u32> {
         .and_then(|duration| u32::try_from(duration.as_secs()).ok())
 }
 
+/// UTC calendar fields for a RAR5 whole-second timestamp, including Unix epoch.
+pub fn unix_datetime(seconds: u32) -> (u16, u8, u8, u8, u8, u8) {
+    let (year, month, day) = civil_from_days(i64::from(seconds / 86_400));
+    let within_day = seconds % 86_400;
+    (
+        year as u16,
+        month as u8,
+        day as u8,
+        (within_day / 3600) as u8,
+        ((within_day % 3600) / 60) as u8,
+        (within_day % 60) as u8,
+    )
+}
+
 pub fn source_dos_mtime(metadata: &fs::Metadata) -> u32 {
     metadata
         .modified()
