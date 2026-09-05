@@ -13,7 +13,7 @@ use crate::{
 };
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// The DOS archive bit, which is what a member gets when the caller offers no
@@ -27,6 +27,42 @@ const DOS_ARCHIVE_ATTR: u32 = 0x20;
 // 0x20 as Unix permissions, producing an unexpectedly restricted file.
 const RAR15_HOST_UNIX: u8 = 3;
 const RAR50_HOST_UNIX: u64 = 1;
+
+struct PendingArchive {
+    path: Option<PathBuf>,
+}
+
+impl PendingArchive {
+    fn create(destination: &Path) -> Result<(Self, fs::File)> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        for _ in 0..128 {
+            let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = destination.with_file_name(format!(
+                ".rars-writing-{}-{sequence:016x}",
+                std::process::id()
+            ));
+            match fs::File::options().write(true).create_new(true).open(&path) {
+                Ok(file) => return Ok((Self { path: Some(path) }, file)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate a unique archive temporary file",
+        )
+        .into())
+    }
+}
+
+impl Drop for PendingArchive {
+    fn drop(&mut self) {
+        if let Some(path) = &self.path {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
 
 /// A member queued for writing.
 ///
@@ -368,6 +404,7 @@ impl Builder {
     }
 
     /// Write the archive to `path`, streaming where the format allows it.
+    /// The completed archive replaces the destination only after writing and syncing succeed.
     ///
     /// Any spooling the writer needs goes beside the output rather than in the
     /// system temporary directory, which is often a memory-backed filesystem
@@ -380,9 +417,16 @@ impl Builder {
             Some(parent) => WriterResources::default().with_temp_dir(parent),
             None => WriterResources::default(),
         };
-        let mut output = fs::File::create(path)?;
-        self.write_to(&mut output, &resources, progress)?;
-        output.sync_all()?;
+        let (mut pending, mut output) = PendingArchive::create(path)?;
+        let result = self
+            .write_to(&mut output, &resources, progress)
+            .and_then(|()| output.sync_all().map_err(Error::from));
+        // Close before rename or cleanup on platforms that disallow removing
+        // open files. Declaration order also closes it first during unwinding.
+        drop(output);
+        result?;
+        fs::rename(pending.path.as_ref().unwrap(), path)?;
+        pending.path = None;
         Ok(())
     }
 

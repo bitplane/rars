@@ -1686,31 +1686,120 @@ struct CliVolumeSink<'a> {
 }
 
 impl CliVolumeSink<'_> {
-    /// Renames the finished set, or clears it up if the write failed.
     fn finish(self, result: rars::Result<()>) -> CliResult<Vec<PathBuf>> {
-        if result.is_err() {
-            for temporary in &self.temporaries {
-                let _ = fs::remove_file(temporary);
+        self.finish_with_rename(result, |source, destination| {
+            fs::rename(source, destination)
+        })
+    }
+
+    fn finish_with_rename(
+        self,
+        result: rars::Result<()>,
+        mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+    ) -> CliResult<Vec<PathBuf>> {
+        result?;
+        let paths = (0..self.temporaries.len())
+            .map(|index| rar50_volume_part_path(self.first_path, index, self.temporaries.len()))
+            .collect::<CliResult<Vec<_>>>()?;
+        // Check every destination before moving any existing archive out of the way.
+        for path in &paths {
+            match fs::symlink_metadata(path) {
+                Ok(meta) if meta.is_dir() => {
+                    return Err(
+                        format!("volume destination '{}' is a directory", path.display()).into(),
+                    )
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
             }
         }
-        result?;
-
-        let total = self.temporaries.len();
-        let mut paths = Vec::with_capacity(total);
-        for (index, temporary) in self.temporaries.iter().enumerate() {
-            let path = rar50_volume_part_path(self.first_path, index, total)?;
-            fs::rename(temporary, &path)?;
-            paths.push(path);
+        let mut backups = Vec::new();
+        let mut published = 0;
+        let publication = (|| -> CliResult<()> {
+            for path in &paths {
+                match fs::symlink_metadata(path) {
+                    Ok(_) => {
+                        let (backup, file) = create_streaming_archive_temp(path)?;
+                        drop(file);
+                        if let Err(error) = fs::rename(path, &backup) {
+                            let _ = fs::remove_file(&backup);
+                            return Err(error.into());
+                        }
+                        backups.push((path.clone(), backup));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            for (temporary, path) in self.temporaries.iter().zip(&paths) {
+                rename(temporary, path)?;
+                published += 1;
+            }
+            Ok(())
+        })();
+        if let Err(error) = publication {
+            // A volume set cannot be published atomically. Recover from ordinary
+            // rename failures; if recovery itself fails, retain backups and report
+            // their locations instead of deleting the user's previous archives.
+            let mut failures = Vec::new();
+            for path in paths[..published].iter().rev() {
+                if let Err(error) = fs::remove_file(path) {
+                    failures.push(format!("cannot remove '{}': {error}", path.display()));
+                }
+            }
+            for (path, backup) in backups.iter().rev() {
+                if let Err(error) = fs::rename(backup, path) {
+                    failures.push(format!(
+                        "cannot restore '{}': {error}; backup retained at '{}'",
+                        path.display(),
+                        backup.display()
+                    ));
+                }
+            }
+            if failures.is_empty() {
+                return Err(error);
+            }
+            return Err(format!(
+                "{error}; volume rollback incomplete: {}",
+                failures.join("; ")
+            )
+            .into());
+        }
+        let mut cleanup_errors = Vec::new();
+        for (_, backup) in backups {
+            if let Err(error) = fs::remove_file(&backup) {
+                cleanup_errors.push(format!("'{}': {error}", backup.display()));
+            }
+        }
+        if !cleanup_errors.is_empty() {
+            return Err(format!(
+                "volumes published, but cannot remove backups: {}",
+                cleanup_errors.join("; ")
+            )
+            .into());
         }
         Ok(paths)
     }
 }
 
+impl Drop for CliVolumeSink<'_> {
+    fn drop(&mut self) {
+        for temporary in &self.temporaries {
+            let _ = fs::remove_file(temporary);
+        }
+    }
+}
+
 impl rars::rar50::VolumeSink for CliVolumeSink<'_> {
     fn start_volume(&mut self, index: u64) -> rars::Result<Box<dyn std::io::Write + Send>> {
-        let parent = self.first_path.parent().unwrap_or_else(|| Path::new(""));
-        let temporary = parent.join(format!(".rars-volume-{}-{index:06}", std::process::id()));
-        let file = fs::File::create(&temporary)?;
+        let base = self
+            .first_path
+            .with_file_name(format!("rars-volume-{index:06}"));
+        // Exclusive creation prevents concurrent writers from sharing or
+        // truncating each other's staging files, even within one process.
+        let (temporary, file) = create_streaming_archive_temp(&base)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
         self.temporaries.push(temporary);
         Ok(Box::new(file))
     }
@@ -1934,6 +2023,133 @@ pub(crate) fn resolve_password_args(args: &PasswordArgs) -> CliResult<Option<Pas
 
 #[cfg(test)]
 mod tests {
+    fn stage_two_volumes(first_path: &std::path::Path) -> super::CliVolumeSink<'_> {
+        use rars::rar50::VolumeSink;
+        use std::io::Write;
+        let mut sink = super::CliVolumeSink {
+            first_path,
+            temporaries: Vec::new(),
+        };
+        for index in 0..2 {
+            sink.start_volume(index)
+                .unwrap()
+                .write_all(format!("new {index}").as_bytes())
+                .unwrap();
+        }
+        sink
+    }
+
+    #[test]
+    fn volume_publication_rolls_back_after_a_later_rename_fails() {
+        use std::fs;
+        for second_exists in [false, true] {
+            let root = crate::scratch::case("volume-rollback");
+            let first = root.join("archive.rar");
+            let paths: Vec<_> = (0..2)
+                .map(|i| rar50_volume_part_path(&first, i, 2).unwrap())
+                .collect();
+            fs::write(&paths[0], b"old 0").unwrap();
+            if second_exists {
+                fs::write(&paths[1], b"old 1").unwrap();
+            }
+            let result =
+                stage_two_volumes(&first).finish_with_rename(Ok(()), |source, destination| {
+                    if destination == paths[1] {
+                        return Err(std::io::Error::other("injected publication failure"));
+                    }
+                    fs::rename(source, destination)
+                });
+            assert!(result.is_err());
+            assert_eq!(fs::read(&paths[0]).unwrap(), b"old 0");
+            if second_exists {
+                assert_eq!(fs::read(&paths[1]).unwrap(), b"old 1");
+            } else {
+                assert!(!paths[1].exists());
+            }
+            assert_eq!(
+                fs::read_dir(&root).unwrap().count(),
+                1 + usize::from(second_exists)
+            );
+        }
+    }
+
+    #[test]
+    fn volume_publication_checks_destinations_before_replacing_any() {
+        use std::fs;
+        let root = crate::scratch::case("volume-preflight");
+        let first = root.join("archive.rar");
+        let paths: Vec<_> = (0..2)
+            .map(|i| rar50_volume_part_path(&first, i, 2).unwrap())
+            .collect();
+        fs::write(&paths[0], b"old").unwrap();
+        fs::create_dir(&paths[1]).unwrap();
+        assert!(stage_two_volumes(&first).finish(Ok(())).is_err());
+        assert_eq!(fs::read(&paths[0]).unwrap(), b"old");
+        assert!(paths[1].is_dir());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn failed_volume_rollback_retains_and_reports_the_old_archive_backup() {
+        use std::fs;
+        let root = crate::scratch::case("volume-rollback-failure");
+        let first = root.join("archive.rar");
+        let paths: Vec<_> = (0..2)
+            .map(|i| rar50_volume_part_path(&first, i, 2).unwrap())
+            .collect();
+        fs::write(&paths[0], b"old archive").unwrap();
+        let error = stage_two_volumes(&first)
+            .finish_with_rename(Ok(()), |source, destination| {
+                if destination == paths[1] {
+                    // Simulate an external change that prevents rollback too.
+                    fs::remove_file(&paths[0])?;
+                    fs::create_dir(&paths[0])?;
+                    return Err(std::io::Error::other("injected publication failure"));
+                }
+                fs::rename(source, destination)
+            })
+            .unwrap_err();
+        let remaining: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(remaining.len(), 2);
+        let backup = remaining.iter().find(|path| path.is_file()).unwrap();
+        assert_eq!(fs::read(backup).unwrap(), b"old archive");
+        assert!(error.to_string().contains("rollback incomplete"));
+        assert!(error.to_string().contains(&backup.display().to_string()));
+    }
+
+    #[test]
+    fn volume_staging_is_exclusive_and_cleaned_on_failure_or_drop() {
+        let root = crate::scratch::case("volume-cleanup");
+        let first = root.join("archive.rar");
+        let one = stage_two_volumes(&first);
+        let two = stage_two_volumes(&first);
+        assert!(one
+            .temporaries
+            .iter()
+            .all(|path| !two.temporaries.contains(path)));
+        assert!(one.finish(Err(Error::Cancelled)).is_err());
+        drop(two);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn volume_publication_replaces_existing_set_and_removes_backups() {
+        use std::fs;
+        let root = crate::scratch::case("volume-success");
+        let first = root.join("archive.rar");
+        for index in 0..2 {
+            fs::write(rar50_volume_part_path(&first, index, 2).unwrap(), b"old").unwrap();
+        }
+        let paths = stage_two_volumes(&first).finish(Ok(())).unwrap();
+        for (index, path) in paths.iter().enumerate() {
+            assert_eq!(fs::read(path).unwrap(), format!("new {index}").as_bytes());
+        }
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
+    }
+
     use super::{display_text, parse_size, rar50_buffered_decode_limit_hint};
     use crate::output::{checked_output_path, output_relative_path, redirection_warning};
     use crate::password::{error_needs_password, should_prompt_password};
