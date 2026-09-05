@@ -193,6 +193,8 @@ pub struct FileHeader {
     /// header field, so a reader that only looks at `mtime` restores nothing
     /// on almost every real archive.
     pub htime_mtime: Option<u32>,
+    /// Fractional detail belonging to the extended modification time.
+    pub htime_mtime_refinement: Option<crate::TimeRefinement>,
     pub data_crc32: Option<u32>,
     pub compression_info: u64,
     pub host_os: u64,
@@ -293,6 +295,7 @@ pub struct CompressionInfo {
 pub struct ExtractedEntryMeta {
     pub name: Vec<u8>,
     pub file_time: u32,
+    pub mtime_refinement: Option<crate::TimeRefinement>,
     pub attr: u64,
     pub host_os: u64,
     pub is_directory: bool,
@@ -1202,6 +1205,7 @@ fn parse_file_header_bytes(parsed: &ParsedBlockHeader) -> Result<FileHeader> {
         attributes,
         mtime,
         htime_mtime: None,
+        htime_mtime_refinement: None,
         data_crc32,
         compression_info,
         host_os,
@@ -1248,7 +1252,9 @@ fn parse_file_extra_area(
                 file.redirection = Some(parse_file_redirection_record(input, data)?);
             }
             FHEXTRA_HTIME => {
-                file.htime_mtime = parse_htime_mtime(input, data);
+                let parsed = parse_htime_mtime(input, data);
+                file.htime_mtime = parsed.map(|(seconds, _)| seconds);
+                file.htime_mtime_refinement = parsed.and_then(|(_, detail)| detail);
             }
             FHEXTRA_SUBDATA => {
                 file.service_data = Some(input[data].to_vec());
@@ -1264,30 +1270,50 @@ fn parse_file_extra_area(
 /// Layout is flags, then the present times in the order mtime, ctime, atime,
 /// then, when flag `0x0010` is set, one sub-second remainder per time in that
 /// same order. Under flag `0x0001` a time is `uint32` Unix seconds; without it
-/// a time is a `uint64` Windows FILETIME. Only mtime is wanted here and it is
-/// first, so nothing after it has to be parsed.
+/// a time is a `uint64` Windows FILETIME. Unix modification-time fractions follow
+/// all the present whole-second values; FILETIME embeds its fraction in the ticks.
 ///
-/// A malformed record yields `None` rather than an error: the reference
+/// A malformed whole-second value yields `None`; malformed fractional detail is
+/// ignored while retaining valid seconds. The reference
 /// readers do not fail an archive over a time they cannot read, and neither
 /// should we lose the file over it.
-fn parse_htime_mtime(input: &[u8], range: Range<usize>) -> Option<u32> {
-    const HTIME_UNIX: u64 = 0x0001;
-    const HTIME_MTIME: u64 = 0x0002;
-    const FILETIME_TICKS_PER_SECOND: u64 = 10_000_000;
-    const FILETIME_EPOCH_TO_UNIX: u64 = 11_644_473_600;
-
-    let (flags, flags_len) = read_vint_at(input, range.start, range.end).ok()?;
-    if flags & HTIME_MTIME == 0 {
+fn parse_htime_mtime(
+    input: &[u8],
+    range: Range<usize>,
+) -> Option<(u32, Option<crate::TimeRefinement>)> {
+    // Slice to the record first: malformed time fields must not borrow bytes
+    // from a following extra record or the file payload.
+    let data = input.get(range)?;
+    let (flags, at) = read_vint_at(data, 0, data.len()).ok()?;
+    if flags & 2 == 0 {
         return None;
     }
-    let at = range.start.checked_add(flags_len)?;
-    if flags & HTIME_UNIX != 0 {
-        let bytes = input.get(at..at.checked_add(4)?)?;
-        return Some(u32::from_le_bytes(bytes.try_into().ok()?));
-    }
-    let bytes = input.get(at..at.checked_add(8)?)?;
-    let filetime = u64::from_le_bytes(bytes.try_into().ok()?);
-    u32::try_from((filetime / FILETIME_TICKS_PER_SECOND).checked_sub(FILETIME_EPOCH_TO_UNIX)?).ok()
+    let (seconds, nanos) = if flags & 1 != 0 {
+        let seconds = u32::from_le_bytes(data.get(at..at.checked_add(4)?)?.try_into().ok()?);
+        // Unix fractions follow ALL present whole-second values, not each value.
+        let count = (flags & 0x0e).count_ones() as usize;
+        let fraction_at = at.checked_add(count.checked_mul(4)?)?;
+        let nanos = if flags & 0x10 != 0 {
+            data.get(fraction_at..fraction_at.checked_add(4)?)
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(u32::from_le_bytes)
+                .filter(|nanos| *nanos < 1_000_000_000)
+        } else {
+            None
+        };
+        (seconds, nanos)
+    } else {
+        let ticks = u64::from_le_bytes(data.get(at..at.checked_add(8)?)?.try_into().ok()?);
+        let seconds = u32::try_from((ticks / 10_000_000).checked_sub(11_644_473_600)?).ok()?;
+        (seconds, Some(((ticks % 10_000_000) * 100) as u32))
+    };
+    Some((
+        seconds,
+        nanos.map(|nanoseconds| crate::TimeRefinement {
+            add_second: false,
+            nanoseconds,
+        }),
+    ))
 }
 
 fn parse_file_redirection_record(input: &[u8], range: Range<usize>) -> Result<FileRedirection> {
@@ -2084,6 +2110,29 @@ mod tests {
     }
 
     #[test]
+    fn htime_precision_respects_record_bounds_and_time_layout() {
+        let mut unix = vec![0x1f]; // mtime, ctime, atime, then their fractions
+        for value in [123u32, 456, 789, 987_654_321, 111, 222] {
+            unix.extend_from_slice(&value.to_le_bytes());
+        }
+        let (seconds, detail) = parse_htime_mtime(&unix, 0..unix.len()).unwrap();
+        assert_eq!(seconds, 123);
+        assert_eq!(detail.unwrap().nanoseconds, 987_654_321);
+        assert_eq!(parse_htime_mtime(&unix, 0..2), None);
+        assert_eq!(parse_htime_mtime(&unix, 0..14), Some((123, None)));
+        unix[13..17].copy_from_slice(&1_000_000_000u32.to_le_bytes());
+        assert_eq!(parse_htime_mtime(&unix, 0..unix.len()), Some((123, None)));
+
+        let mut filetime = vec![2];
+        let ticks = (11_644_473_600u64 + 123) * 10_000_000 + 7_040_883;
+        filetime.extend_from_slice(&ticks.to_le_bytes());
+        let (seconds, detail) = parse_htime_mtime(&filetime, 0..filetime.len()).unwrap();
+        assert_eq!(seconds, 123);
+        assert_eq!(detail.unwrap().nanoseconds, 704_088_300);
+        assert_eq!(parse_htime_mtime(&filetime, 0..8), None);
+    }
+
+    #[test]
     fn file_header_name_bytes_preserve_non_utf8_names() {
         let file = FileHeader {
             block: BlockHeader {
@@ -2102,6 +2151,7 @@ mod tests {
             attributes: 0,
             mtime: None,
             htime_mtime: None,
+            htime_mtime_refinement: None,
             data_crc32: None,
             compression_info: 0,
             host_os: 0,

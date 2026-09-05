@@ -554,13 +554,14 @@ fn prepare_member(
         None => (plain, plain_len, member.crc32, member.hash),
     };
     write_hash_record_with_value(&mut extra, hash);
+    super::headers::write_mtime_record(&mut extra, entry.mtime, entry.mtime_nanoseconds);
 
     let specific = file_specific(
         &entry.name,
         member.input_size,
         Some(data_crc32),
         entry.attributes,
-        entry.mtime,
+        entry.mtime.filter(|_| entry.mtime_nanoseconds.is_none()),
         compression_info,
         entry.host_os,
     )?;
@@ -860,6 +861,7 @@ impl Write for ChecksumSink {
 struct VolumeMember {
     name: Vec<u8>,
     mtime: Option<u32>,
+    mtime_nanoseconds: Option<u32>,
     attributes: u64,
     host_os: u64,
     unpacked_size: u64,
@@ -1023,6 +1025,7 @@ fn prepare_volume_member(
             Ok(VolumeMember {
                 name: entry.name.clone(),
                 mtime: entry.mtime,
+                mtime_nanoseconds: entry.mtime_nanoseconds,
                 attributes: entry.attributes,
                 host_os: entry.host_os,
                 unpacked_size: member.input_size,
@@ -1037,6 +1040,7 @@ fn prepare_volume_member(
         None => Ok(VolumeMember {
             name: entry.name.clone(),
             mtime: entry.mtime,
+            mtime_nanoseconds: entry.mtime_nanoseconds,
             attributes: entry.attributes,
             host_os: entry.host_os,
             unpacked_size: member.input_size,
@@ -1281,12 +1285,13 @@ fn fragment_header(
         write_file_encryption_record(&mut extra, salt, iv, check_value);
     }
     write_hash_record_with_value(&mut extra, fragment.map_or(member.hash, |f| f.hash));
+    super::headers::write_mtime_record(&mut extra, member.mtime, member.mtime_nanoseconds);
     let specific = file_specific(
         &member.name,
         member.unpacked_size,
         Some(fragment.map_or(member.crc32, |f| f.crc32)),
         member.attributes,
-        member.mtime,
+        member.mtime.filter(|_| member.mtime_nanoseconds.is_none()),
         member.compression_info,
         member.host_os,
     )?;

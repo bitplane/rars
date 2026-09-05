@@ -198,7 +198,7 @@ pub struct ArchiveMemberMeta {
     /// RAR5 includes the extended modification-time fallback; `None` is distinct
     /// from an explicitly stored Unix epoch (`Some(0)`).
     pub file_time: Option<u32>,
-    /// Legacy odd-second and subsecond detail, kept separate from raw DOS fields.
+    /// Odd-second and subsecond detail, kept separate from the raw time field.
     pub mtime_refinement: Option<TimeRefinement>,
     /// File attributes widened to a common integer type.
     pub file_attr: u64,
@@ -222,8 +222,9 @@ impl ArchiveMemberMeta {
     pub fn modification_time(&self) -> Option<std::time::SystemTime> {
         let raw = self.file_time?;
         if self.family == ArchiveFamily::Rar50Plus {
+            let nanos = self.mtime_refinement.map_or(0, |detail| detail.nanoseconds);
             return std::time::UNIX_EPOCH
-                .checked_add(std::time::Duration::from_secs(u64::from(raw)));
+                .checked_add(std::time::Duration::new(u64::from(raw), nanos));
         }
         timestamp::extracted_system_time(self.family, raw, self.mtime_refinement)
     }
@@ -688,7 +689,7 @@ fn rar50_member(file: &rar50::FileHeader) -> ArchiveMember {
             packed_size: file.packed_size(),
             unpacked_size: file.unpacked_size,
             file_time: file.modification_time(),
-            mtime_refinement: None,
+            mtime_refinement: file.modification_time_refinement(),
             file_attr: file.attributes,
             host_os: Some(file.host_os),
             is_directory: file.is_directory(),
@@ -934,6 +935,7 @@ pub fn read_volume_member_at(
 /// odd second and any sub-second precision in a separate extended field. This
 /// is that field decoded: add [`add_second`](Self::add_second) whole seconds
 /// and then [`nanoseconds`](Self::nanoseconds) to the base time.
+/// RAR5 extended times also use this detail, with `add_second` always false.
 ///
 /// Kept apart from the timestamp rather than folded into it because
 /// [`ExtractedEntryMeta::file_time`] is the DOS value as stored, which has
@@ -1028,8 +1030,7 @@ pub fn rar50_meta(meta: &rar50::ExtractedEntryMeta) -> ExtractedEntryMeta {
         file_time: meta.file_time,
         file_attr: meta.attr,
         attr_source: AttrSource::rar50(meta.host_os),
-        // RAR 5.0 resolves FHEXTRA_HTIME into file_time directly.
-        mtime_refinement: None,
+        mtime_refinement: meta.mtime_refinement,
         is_directory: meta.is_directory,
     }
 }

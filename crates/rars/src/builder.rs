@@ -82,6 +82,7 @@ struct BuilderEntry {
     data: Vec<u8>,
     source: Option<EntrySource>,
     mtime: Option<u32>,
+    mtime_nanoseconds: Option<u32>,
     attributes: EntryAttributes,
 }
 
@@ -268,6 +269,7 @@ impl Builder {
             data,
             source: None,
             mtime,
+            mtime_nanoseconds: None,
             attributes: mode.map_or(
                 EntryAttributes::Dos(u64::from(DOS_ARCHIVE_ATTR)),
                 EntryAttributes::Unix,
@@ -290,11 +292,38 @@ impl Builder {
             data: Vec::new(),
             source: Some(source),
             mtime,
+            mtime_nanoseconds: None,
             attributes: mode.map_or(
                 EntryAttributes::Dos(u64::from(DOS_ARCHIVE_ATTR)),
                 EntryAttributes::Unix,
             ),
         })
+    }
+
+    /// Add nanosecond precision to a queued RAR5/7 modification time.
+    /// The member must already have whole seconds; legacy output is unsupported.
+    pub fn set_mtime_nanoseconds(&mut self, name: &[u8], nanoseconds: u32) -> Result<()> {
+        if self.format.family() != crate::ArchiveFamily::Rar50Plus || nanoseconds >= 1_000_000_000 {
+            return Err(Error::InvalidHeader(
+                "nanosecond modification times require RAR5/7 and a fraction below one second",
+            ));
+        }
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.name == name)
+            .ok_or_else(|| Error::AtEntry {
+                name: name.to_vec(),
+                operation: "setting modification time precision",
+                source: Box::new(Error::InvalidHeader("no such archive entry")),
+            })?;
+        if entry.mtime.is_none() {
+            return Err(Error::InvalidHeader(
+                "fractional modification time requires whole seconds",
+            ));
+        }
+        entry.mtime_nanoseconds = Some(nanoseconds);
+        Ok(())
     }
 
     /// Set DOS/Windows attributes for a queued file, replacing any Unix mode.
@@ -596,6 +625,7 @@ impl Builder {
                 });
                 let built = rar50::ArchiveEntry::new(entry.name.clone(), source)
                     .with_mtime(entry.mtime)
+                    .with_mtime_nanoseconds(entry.mtime_nanoseconds)
                     .with_attributes(entry.rar50_attr())
                     .with_host_os(entry.rar50_host_os());
                 match self.password.as_deref() {

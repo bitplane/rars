@@ -50,7 +50,10 @@ pub fn extracted_system_time(
 ) -> Option<SystemTime> {
     let base = match family {
         ArchiveFamily::Rar13 | ArchiveFamily::Rar15To40 => dos_time_to_system_time(file_time),
-        ArchiveFamily::Rar50Plus => unix_seconds_to_system_time(file_time),
+        ArchiveFamily::Rar50Plus => unix_seconds_to_system_time(file_time)
+            // Fractional detail establishes that zero is an actual timestamp,
+            // not the extraction metadata's historical missing-time sentinel.
+            .or_else(|| refinement.map(|_| UNIX_EPOCH)),
     }?;
     // A DOS timestamp counts in two-second steps, so an odd second and any
     // sub-second detail arrive separately and have to be added back on.

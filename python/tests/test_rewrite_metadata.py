@@ -34,7 +34,7 @@ def test_legacy_rewrite_uses_extractions_local_zone_and_odd_second(tmp_path, zon
             ["unrar", "x", "-idq", "-o+", str(archive), str(output) + "/"],
             env=env, check=True, capture_output=True,
         )
-        times.append((output / "hello.txt").stat().st_mtime_ns // 1_000_000_000)
+        times.append((output / "hello.txt").stat().st_mtime_ns)
     assert times[0] == times[1]
 
 

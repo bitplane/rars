@@ -68,6 +68,8 @@ pub struct ArchiveEntry {
     pub name: Vec<u8>,
     pub source: EntrySource,
     pub mtime: Option<u32>,
+    /// Optional nanosecond fraction; requires mtime and a value below one second.
+    pub mtime_nanoseconds: Option<u32>,
     pub attributes: u64,
     pub host_os: u64,
     /// Encrypts this member's payload. With header encryption every member
@@ -108,6 +110,7 @@ impl ArchiveEntry {
             name: name.into(),
             source,
             mtime: None,
+            mtime_nanoseconds: None,
             attributes: 0,
             host_os: 0,
             password: None,
@@ -122,6 +125,11 @@ impl ArchiveEntry {
 
     pub fn with_mtime(mut self, mtime: Option<u32>) -> Self {
         self.mtime = mtime;
+        self
+    }
+
+    pub fn with_mtime_nanoseconds(mut self, nanoseconds: Option<u32>) -> Self {
+        self.mtime_nanoseconds = nanoseconds;
         self
     }
 
@@ -893,6 +901,13 @@ fn validate_file_entry(name: &[u8]) -> Result<()> {
 /// them beyond the name.
 fn validate_entry(entry: &ArchiveEntry) -> Result<()> {
     validate_file_entry(&entry.name)?;
+    if let Some(nanos) = entry.mtime_nanoseconds {
+        if entry.mtime.is_none() || nanos >= 1_000_000_000 {
+            return Err(Error::InvalidHeader(
+                "fractional modification time requires seconds and nanoseconds below one second",
+            ));
+        }
+    }
     if let Some(password) = &entry.password {
         validate_nonempty_password(password)?;
     }

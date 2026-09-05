@@ -185,6 +185,17 @@ pub(super) fn file_specific(
     Ok(specific)
 }
 
+pub(super) fn write_mtime_record(extra: &mut Vec<u8>, seconds: Option<u32>, nanos: Option<u32>) {
+    if let (Some(seconds), Some(nanos)) = (seconds, nanos) {
+        // Unix time + mtime + nanoseconds. Emit the complete timestamp here,
+        // with no base-header time competing with the higher precision record.
+        let mut record = vec![0x13];
+        record.extend_from_slice(&seconds.to_le_bytes());
+        record.extend_from_slice(&nanos.to_le_bytes());
+        write_extra_record(extra, super::super::FHEXTRA_HTIME, &record);
+    }
+}
+
 pub(super) fn archive_metadata_record(metadata: ArchiveMetadataEntry<'_>) -> Result<Vec<u8>> {
     if metadata.name.is_none() && metadata.creation_time.is_none() {
         return Err(Error::InvalidHeader(

@@ -591,8 +591,8 @@ impl RarBuilder {
     /// Create a RAR5 level-3 conversion builder from an archive.
     ///
     /// This currently copies file contents, names, order and the archive comment,
-    /// and whole-second modification times. It does not preserve directories,
-    /// subsecond precision, encryption, solid settings
+    /// and modification times including supported subsecond precision.
+    /// It does not preserve directories, encryption, solid settings
     /// or volume layout. Unix permission bits and DOS file flags are retained;
     /// unknown hosts use the builder's DOS defaults. The password
     /// unlocks the input; output is unencrypted. For an existing RarFile, its
@@ -638,9 +638,10 @@ impl RarBuilder {
                 .then_some((info.file_attr & 0o7777) as u32);
             // Reuse CLI extraction's local-zone policy for legacy DOS times,
             // including the extended odd second, before writing RAR5 Unix time.
-            let mtime = info
+            let modified = info
                 .modification_time()
-                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok());
+            let mtime = modified
                 .map(|duration| u32::try_from(duration.as_secs()))
                 .transpose()
                 .map_err(|_| {
@@ -661,6 +662,12 @@ impl RarBuilder {
                 .inner
                 .add_source(info.name.clone(), source, mtime, mode)
                 .map_err(map_builder_error)?;
+            if let Some(time) = modified.filter(|time| time.subsec_nanos() != 0) {
+                builder
+                    .inner
+                    .set_mtime_nanoseconds(&info.name, time.subsec_nanos())
+                    .map_err(map_builder_error)?;
+            }
             if attr_source == rars_rs::AttrSource::Dos {
                 builder
                     .inner

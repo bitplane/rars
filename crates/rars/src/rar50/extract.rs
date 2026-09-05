@@ -196,10 +196,20 @@ impl FileHeader {
         self.mtime.or(self.htime_mtime)
     }
 
+    pub fn modification_time_refinement(&self) -> Option<crate::TimeRefinement> {
+        // Do not attach a fraction from the lower-priority extended timestamp
+        // to a different base-header timestamp.
+        self.mtime
+            .is_none()
+            .then_some(self.htime_mtime_refinement)
+            .flatten()
+    }
+
     pub fn metadata(&self) -> ExtractedEntryMeta {
         ExtractedEntryMeta {
             name: self.name.clone(),
             file_time: self.modification_time().unwrap_or(0),
+            mtime_refinement: self.modification_time_refinement(),
             attr: self.attributes,
             host_os: self.host_os,
             is_directory: self.is_directory(),
@@ -878,6 +888,7 @@ struct PendingSplitRefs {
     name: Vec<u8>,
     fragments: Vec<(usize, usize)>,
     file_time: u32,
+    mtime_refinement: Option<crate::TimeRefinement>,
     attr: u64,
     host_os: u64,
     compression_info: u64,
@@ -889,7 +900,8 @@ impl PendingSplitRefs {
         Self {
             name: file.name.clone(),
             fragments: vec![(volume_index, file_index)],
-            file_time: file.mtime.unwrap_or(0),
+            file_time: file.modification_time().unwrap_or(0),
+            mtime_refinement: file.modification_time_refinement(),
             attr: file.attributes,
             host_os: file.host_os,
             compression_info: file.compression_info,
@@ -915,6 +927,7 @@ impl PendingSplitRefs {
         let meta = ExtractedEntryMeta {
             name: self.name.clone(),
             file_time: self.file_time,
+            mtime_refinement: self.mtime_refinement,
             attr: self.attr,
             host_os: self.host_os,
             is_directory: false,
@@ -1371,6 +1384,7 @@ mod tests {
             attributes: 0x20,
             mtime: None,
             htime_mtime: None,
+            htime_mtime_refinement: None,
             data_crc32: None,
             compression_info: 0,
             host_os: 2,
@@ -1589,6 +1603,7 @@ mod tests {
             attributes: 0x20,
             mtime: None,
             htime_mtime: None,
+            htime_mtime_refinement: None,
             data_crc32: None,
             compression_info: 0,
             host_os: 2,
@@ -1848,6 +1863,7 @@ mod tests {
                 attributes: 0x20,
                 mtime: None,
                 htime_mtime: None,
+                htime_mtime_refinement: None,
                 data_crc32: Some(crc),
                 compression_info: 0,
                 host_os: 2,
@@ -1892,6 +1908,7 @@ mod tests {
             attributes: 0x20,
             mtime: None,
             htime_mtime: None,
+            htime_mtime_refinement: None,
             data_crc32: None,
             compression_info: 0,
             host_os: 2,

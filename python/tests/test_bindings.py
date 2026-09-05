@@ -148,7 +148,7 @@ def test_from_archive_retains_fixture_htime_with_reference_extractor(tmp_path):
             check=True, capture_output=True,
         )
         extracted = output / "hello.txt"
-        times.append(extracted.stat().st_mtime_ns // 1_000_000_000)
+        times.append(extracted.stat().st_mtime_ns)
         assert extracted.read_bytes() == rars.RarFile(RAR50_STORED).read("hello.txt")
     assert times[0] == times[1]
 
