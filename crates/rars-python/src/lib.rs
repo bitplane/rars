@@ -421,6 +421,12 @@ impl RarFile {
         self.infos.iter().any(|info| info.is_encrypted)
     }
 
+    /// Metadata/settings the current rewrite implementation cannot preserve.
+    /// This is a conservative metadata check, not a payload integrity test.
+    fn rewrite_preservation_issues(&self) -> Vec<String> {
+        self.archive.rewrite_preservation_issues()
+    }
+
     #[getter]
     fn sfx_offset(&self) -> usize {
         self.archive.sfx_offset()
@@ -600,15 +606,18 @@ impl RarBuilder {
     /// unknown hosts use the builder's DOS defaults. The password
     /// unlocks the input; output is unencrypted. For an existing RarFile, its
     /// configured password is used.
+    /// Set preserve=True to reject unsupported metadata or setting changes
+    /// before writing. RarFile.rewrite_preservation_issues() lists those gaps.
     ///
     /// This is not yet a metadata-preserving archive editor. See
     /// python/REWRITING.md for current limitations and the planned contract.
     #[staticmethod]
-    #[pyo3(signature = (source, password = None))]
+    #[pyo3(signature = (source, password = None, *, preserve = false))]
     fn from_archive(
         py: Python<'_>,
         source: &Bound<'_, PyAny>,
         password: Option<&Bound<'_, PyAny>>,
+        preserve: bool,
     ) -> PyResult<Self> {
         let archive = match source.extract::<PyRef<'_, RarFile>>() {
             Ok(archive) => RarFile {
@@ -619,6 +628,15 @@ impl RarBuilder {
             Err(_) => RarFile::new(py, source, "r", password)?,
         };
         let password = archive.password.clone();
+        if preserve {
+            let issues = archive.archive.rewrite_preservation_issues();
+            if !issues.is_empty() {
+                return Err(UnsupportedRarFeature::new_err(format!(
+                    "cannot preserve archive: {}",
+                    issues.join("; ")
+                )));
+            }
+        }
         let mut names = HashSet::new();
         for member in archive.archive.members() {
             if !names.insert(member.meta.name.clone()) {

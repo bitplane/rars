@@ -1380,6 +1380,7 @@ mod tests {
         FileHeader {
             block: empty_block(HEAD_FILE, 0, 0..0),
             file_flags: 0,
+            rewrite_metadata_complete: true,
             unpacked_size: data.len() as u64,
             attributes: 0x20,
             mtime: None,
@@ -1599,6 +1600,7 @@ mod tests {
         let file = FileHeader {
             block: empty_block(HEAD_FILE, 0, 0..0),
             file_flags: 0,
+            rewrite_metadata_complete: true,
             unpacked_size: data.len() as u64,
             attributes: 0x20,
             mtime: None,
@@ -1855,10 +1857,13 @@ mod tests {
                 archive_flags: 0,
                 volume_number: None,
                 extras: Vec::new(),
+                encrypted_headers: false,
+                rewrite_metadata_complete: true,
             },
             blocks: vec![Block::File(FileHeader {
                 block: empty_block(HEAD_FILE, flags, 0..data.len()),
                 file_flags: 0,
+                rewrite_metadata_complete: true,
                 unpacked_size: full.len() as u64,
                 attributes: 0x20,
                 mtime: None,
@@ -1904,6 +1909,7 @@ mod tests {
         FileHeader {
             block: empty_block(HEAD_FILE, hfl_flags, 0..0),
             file_flags: 0,
+            rewrite_metadata_complete: true,
             unpacked_size: 0,
             attributes: 0x20,
             mtime: None,
@@ -1931,6 +1937,8 @@ mod tests {
                 archive_flags: 0,
                 volume_number: None,
                 extras: Vec::new(),
+                encrypted_headers: false,
+                rewrite_metadata_complete: true,
             },
             blocks,
             source: ArchiveSource::Memory(bytes),

@@ -32,6 +32,7 @@ pub mod rar15_40;
 pub mod rar50;
 #[doc(hidden)]
 pub mod recovery;
+mod rewrite;
 mod source;
 mod streaming;
 pub mod timestamp;

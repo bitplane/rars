@@ -2,10 +2,22 @@
 
 ## Current API
 
-`RarBuilder.from_archive(source, password=None)` creates a **conversion builder**:
+`RarBuilder.from_archive(source, password=None, *, preserve=False)` creates a **conversion builder**:
 RAR5, compression level 3, non-solid, unencrypted, with no recovery or volume
 configuration. It is not yet a metadata-preserving editor. Even a rename rebuilds
 the archive with these settings.
+
+Use `RarFile.rewrite_preservation_issues()` to inspect settings and metadata the
+current builder cannot preserve. `from_archive(..., preserve=True)` rejects those
+issues before creating an output builder. This opt-in currently accepts a
+conservative subset of unencrypted, non-solid RAR5 archives. Legacy/RAR7 format
+conversion, encryption, solid/volume/recovery settings, main-header extras,
+unsupported services, and unknown, duplicate or incomplete file extras fail
+preflight. Unknown metadata remains tolerated during ordinary reading.
+
+This check is about supported metadata semantics. It does not verify payload
+integrity, promise identical compressed bytes, or replace staged publication.
+Its diagnostic strings are explanatory text, not stable machine-readable codes.
 
 `source` accepts the same inputs as `RarFile`, or an existing `RarFile`. The
 password unlocks the input; it never enables output encryption. When given an
@@ -51,8 +63,9 @@ archive. Failed preflight must leave existing destinations intact.
 
 Conversion will be explicit. It must let callers deliberately select a target
 format and remove encryption or metadata, and retain a documented route to the
-current RAR5 conversion settings. These options are planned, not available in
-the current `from_archive` signature. The former DOS-to-Unix permission
+current RAR5 conversion settings. The `preserve` opt-in and existing conversion
+are available; configurable target-format/encryption preservation is still planned.
+The former DOS-to-Unix permission
 reinterpretation was a bug; conversion no longer performs it.
 
 Preservation means preserving supported archive semantics, not identical bytes,
@@ -66,7 +79,7 @@ Implement this in small steps:
 1. Add format-aware metadata adapters and tests for timestamps and attributes.
 2. Represent directories and archive settings, including separate data/header
    encryption, and detect unsupported records and features before emission.
-3. Add explicit preservation/conversion policy and round-trip tests, then switch
+3. Extend the opt-in preservation preflight and round-trip tests, then switch
    the default in the minor release. Cover encrypted, solid, legacy and empty
    archives, rejection paths and external extraction of emitted metadata.
 4. Replace repeated name-based extraction with stable member indices and a

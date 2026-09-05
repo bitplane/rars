@@ -79,6 +79,9 @@ pub struct MainHeader {
     pub archive_flags: u64,
     pub volume_number: Option<u64>,
     pub extras: Vec<MainExtraRecord>,
+    /// Whether the archive uses encrypted headers.
+    pub encrypted_headers: bool,
+    pub(crate) rewrite_metadata_complete: bool,
 }
 
 impl MainHeader {
@@ -182,6 +185,7 @@ pub struct BlockHeader {
 pub struct FileHeader {
     pub block: BlockHeader,
     pub file_flags: u64,
+    pub(crate) rewrite_metadata_complete: bool,
     pub unpacked_size: u64,
     pub attributes: u64,
     pub mtime: Option<u32>,
@@ -1113,6 +1117,8 @@ fn parse_main_header_bytes(parsed: &ParsedBlockHeader) -> Result<MainHeader> {
         archive_flags,
         volume_number,
         extras,
+        encrypted_headers: false,
+        rewrite_metadata_complete: parsed.extra_range.is_empty() && reader.pos == reader.range.end,
     })
 }
 
@@ -1201,6 +1207,7 @@ fn parse_file_header_bytes(parsed: &ParsedBlockHeader) -> Result<FileHeader> {
     let mut file = FileHeader {
         block: parsed.block.clone(),
         file_flags,
+        rewrite_metadata_complete: reader.pos == reader.range.end,
         unpacked_size,
         attributes,
         mtime,
@@ -1235,34 +1242,63 @@ fn parse_file_extra_area(
     if file.block.extra_area_size.is_none() {
         return Ok(());
     }
-    parse_extra_records(input, range, is_service, |record_type, data| {
+    let mut seen = 0u64;
+    let complete = parse_extra_records(input, range, is_service, |record_type, data| {
+        let bit = 1u64
+            .checked_shl(record_type as u32)
+            .filter(|_| record_type < 64)
+            .unwrap_or(0);
+        if bit == 0 || seen & bit != 0 {
+            file.rewrite_metadata_complete = false;
+        }
+        seen |= bit;
         match record_type {
             FHEXTRA_CRYPT => {
+                file.rewrite_metadata_complete = false;
                 file.encrypted = true;
                 file.encryption = Some(parse_file_encryption_record(input, data)?);
             }
             FHEXTRA_HASH => {
                 let (hash_type, hash_type_len) = read_vint_at(input, data.start, data.end)?;
+                file.rewrite_metadata_complete &=
+                    hash_type == 0 && data.len() == hash_type_len + 32;
                 file.hash = Some(FileHash {
                     hash_type,
                     data: input[data.start + hash_type_len..data.end].to_vec(),
                 });
             }
             FHEXTRA_REDIR => {
+                file.rewrite_metadata_complete = false;
                 file.redirection = Some(parse_file_redirection_record(input, data)?);
             }
             FHEXTRA_HTIME => {
+                let flags = read_vint_at(input, data.start, data.end).ok();
+                let exact_mtime = flags.is_some_and(|(flags, len)| match flags {
+                    2 => data.len() == len + 8,
+                    3 => data.len() == len + 4,
+                    0x13 => data.len() == len + 8,
+                    _ => false,
+                });
                 let parsed = parse_htime_mtime(input, data);
+                file.rewrite_metadata_complete &= exact_mtime
+                    && file.mtime.is_none()
+                    && parsed.is_some()
+                    && (flags.map(|f| f.0) != Some(0x13) || parsed.and_then(|p| p.1).is_some());
                 file.htime_mtime = parsed.map(|(seconds, _)| seconds);
                 file.htime_mtime_refinement = parsed.and_then(|(_, detail)| detail);
             }
             FHEXTRA_SUBDATA => {
+                file.rewrite_metadata_complete &= is_service && data.is_empty();
                 file.service_data = Some(input[data].to_vec());
             }
-            _ => {}
+            _ => {
+                file.rewrite_metadata_complete = false;
+            }
         }
         Ok(())
-    })
+    })?;
+    file.rewrite_metadata_complete &= complete;
+    Ok(())
 }
 
 /// Reads the modification time out of an `FHEXTRA_HTIME` record.
@@ -1503,7 +1539,9 @@ where
     if first.block.header_type != HEAD_MAIN {
         return Err(Error::InvalidHeader("RAR 5 main header is missing"));
     }
-    let main = parse_main_header_bytes(first).map_err(|error| error.at_archive_offset(main_pos))?;
+    let mut main =
+        parse_main_header_bytes(first).map_err(|error| error.at_archive_offset(main_pos))?;
+    main.encrypted_headers = header_keys.is_some();
     pos = first.next_offset;
 
     let mut blocks = Vec::new();
@@ -1536,6 +1574,7 @@ where
                 });
             }
             HEAD_END => {
+                main.rewrite_metadata_complete &= next == archive_len;
                 // A block with no room for the vint reads as no flags rather
                 // than as a broken archive. Hand-built and truncated archives
                 // do turn up with an empty end block, and the field only says
@@ -1558,6 +1597,7 @@ where
         pos = next;
     }
 
+    main.rewrite_metadata_complete &= matches!(blocks.last(), Some(Block::End(_)));
     Ok((main, blocks))
 }
 
@@ -1582,7 +1622,7 @@ fn parse_extra_records<F>(
     range: Range<usize>,
     is_service: bool,
     mut handle: F,
-) -> Result<()>
+) -> Result<bool>
 where
     F: FnMut(u64, Range<usize>) -> Result<()>,
 {
@@ -1610,7 +1650,7 @@ where
         handle(record_type, payload_start + type_len..record_end)?;
         pos = record_end;
     }
-    Ok(())
+    Ok(pos == range.end)
 }
 
 struct ParsedBlockHeader {
@@ -2147,6 +2187,7 @@ mod tests {
                 data_range: 0..0,
             },
             file_flags: 0,
+            rewrite_metadata_complete: true,
             unpacked_size: 0,
             attributes: 0,
             mtime: None,
