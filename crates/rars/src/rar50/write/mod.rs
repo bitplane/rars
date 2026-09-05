@@ -1399,7 +1399,7 @@ mod tests {
                 candidates: vec![encode_options],
             },
             &WriterResources::new(required.saturating_mul(4)),
-            &mut |_| true,
+            &|_| true,
         )
         .unwrap();
         let mut parallel = Vec::new();

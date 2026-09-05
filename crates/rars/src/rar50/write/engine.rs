@@ -124,7 +124,7 @@ pub(super) fn write_archive(
         &sources,
         plan.compress.clone(),
         resources,
-        &mut |done| work.advance(done),
+        &|done| work.advance(done),
     )?;
 
     // Everything between the main header and the quick-open block, in order.
@@ -818,7 +818,7 @@ pub(super) fn write_volumes(
         &sources,
         plan.compress.clone(),
         resources,
-        &mut |done| work.advance(done),
+        &|done| work.advance(done),
     )?;
 
     let mut members = Vec::with_capacity(entries.len());

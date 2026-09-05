@@ -83,13 +83,22 @@ pub(super) fn compress_members_reporting(
     sources: &[EntrySource],
     plan: CompressPlan,
     resources: &WriterResources,
-    advance: &mut dyn FnMut(u64) -> bool,
+    advance: &(dyn Fn(u64) -> bool + Sync),
 ) -> Result<Vec<CompressedMember>> {
     let mut integrity = Vec::with_capacity(sources.len());
     for source in sources {
         let input_size = source.len()?;
         let (crc32, hash) = super::source_integrity(source, input_size, plan.block_size)?;
         integrity.push((input_size, crc32, hash));
+    }
+
+    // Filters and multi-candidate encoding both need the whole member at once.
+    // Members that fit the budget take that path; the rest stream, losing the
+    // filter but staying within memory.
+    let wants_whole_member =
+        plan.method != 0 && (plan.filter_policy != FilterPolicy::None || plan.candidates.len() > 1);
+    if wants_whole_member && !plan.solid {
+        return compress_members_whole(sources, &integrity, &plan, resources, advance);
     }
 
     // Any candidate that parses optimally searches a tree, so the charge has to
@@ -113,15 +122,6 @@ pub(super) fn compress_members_reporting(
         .unwrap_or(usize::MAX)
         .min(crate::parallel::threads())
         .max(1);
-
-    // Filters and multi-candidate encoding both need the whole member at once.
-    // Members that fit the budget take that path; the rest stream, losing the
-    // filter but staying within memory.
-    let wants_whole_member =
-        plan.method != 0 && (plan.filter_policy != FilterPolicy::None || plan.candidates.len() > 1);
-    if wants_whole_member && !plan.solid {
-        return compress_members_whole(sources, &integrity, &plan, resources, advance);
-    }
 
     // Storing is not "compress and hope it does not help": the header records
     // method zero, so the payload must be the source bytes.
@@ -210,8 +210,8 @@ fn whole_member_workspace(input_size: u64, plan: &CompressPlan) -> u64 {
         .saturating_add(super::streaming_lz_workspace(reach, block, optimal))
 }
 
-/// Compresses members one at a time with the whole member resident, which is
-/// what filter selection and candidate comparison need.
+/// Compresses independent whole members concurrently, with each workspace
+/// admitted against the shared budget before its input is loaded.
 ///
 /// A member too large for the budget falls back to streaming: an automatic
 /// filter is a best-effort size win, so dropping it beats refusing the job.
@@ -221,105 +221,149 @@ fn compress_members_whole(
     integrity: &[(u64, u32, [u8; 32])],
     plan: &CompressPlan,
     resources: &WriterResources,
-    advance: &mut dyn FnMut(u64) -> bool,
+    advance: &(dyn Fn(u64) -> bool + Sync),
 ) -> Result<Vec<CompressedMember>> {
+    // Each worker acquires its complete workspace before loading the source.
+    // Results are disk spools, so retaining them in source order is cheap.
     let mut members = Vec::with_capacity(sources.len());
-    for (index, source) in sources.iter().enumerate() {
-        let (input_size, crc32, hash) = integrity[index];
-        let required = whole_member_workspace(input_size, plan);
-
-        let mut packed_spool = Spool::create(resources)?;
-        let mut stored = input_size == 0;
-        if !stored {
-            match resources.acquire(required, plan.dictionary_size) {
-                Ok(_permit) => {
-                    let mut data = Vec::with_capacity(input_size as usize);
-                    source.open()?.read_to_end(&mut data)?;
-                    if data.len() as u64 != input_size {
-                        return Err(Error::InvalidHeader(
-                            "entry source size changed while compressing",
-                        ));
-                    }
-                    // The filter search walks the member many times over, so
-                    // encoder positions are scaled down to the member's share
-                    // of that total: many passes, one member's worth of
-                    // progress.
-                    let walk = super::filter_policy_walk_bytes(
-                        &data,
-                        &plan.filter_policy,
-                        plan.algorithm_version,
-                        plan.candidates.len(),
-                    )
-                    .max(input_size)
-                    .max(1);
-                    let share = |bytes: u64| {
-                        (u128::from(bytes) * u128::from(input_size) / u128::from(walk)) as u64
-                    };
-                    let mut reported = 0u64;
-                    let mut charged = 0u64;
-                    let mut report = |position: usize| {
-                        let position = position as u64;
-                        if position < reported {
-                            // A new pass restarted at the beginning.
-                            reported = 0;
-                        }
-                        let delta = position - reported;
-                        reported = position;
-                        let target = (charged + delta).min(walk);
-                        let scaled = share(target) - share(charged);
-                        charged = target;
-                        advance(scaled)
-                    };
-                    let packed = encode_member_with_filter_policy_candidates_and_progress(
-                        &data,
-                        plan.algorithm_version,
-                        &plan.filter_policy,
-                        &plan.candidates,
-                        Some(&mut report),
-                    )?;
-                    // An explicitly requested filter is not discarded just
-                    // because the result did not shrink.
-                    stored = should_store_compressed_payload(
-                        data.len() as u64,
-                        packed.len() as u64,
-                        plan.solid,
-                        &plan.filter_policy,
-                    );
-                    if !stored {
-                        packed_spool.write_all(&packed)?;
-                    }
-                }
-                Err(error) => {
-                    if plan.filter_policy != FilterPolicy::Auto {
-                        return Err(error);
-                    }
-                    // Too big to filter; compress it as a stream instead.
-                    let streamed = compress_members_reporting(
-                        std::slice::from_ref(source),
-                        CompressPlan {
-                            filter_policy: FilterPolicy::None,
-                            candidates: vec![plan.encode_options],
-                            ..plan.clone()
-                        },
+    let mut start = 0;
+    while start < sources.len() {
+        let end = (start..sources.len())
+            .take(crate::parallel::threads())
+            .take_while(|&index| {
+                whole_member_workspace(integrity[index].0, plan) <= resources.memory_limit()
+            })
+            .last()
+            .map_or(start, |index| index + 1);
+        if end == start {
+            // A streaming fallback can itself use rayon. Run it outside the
+            // worker batch so a nested job cannot wait behind budget waiters.
+            members.push(compress_whole_member(
+                &sources[start],
+                integrity[start],
+                plan,
+                resources,
+                advance,
+            )?);
+            start += 1;
+        } else {
+            members.extend(crate::parallel::map_collect(
+                (start..end).collect(),
+                |index| {
+                    compress_whole_member(
+                        &sources[index],
+                        integrity[index],
+                        plan,
                         resources,
                         advance,
-                    )?;
-                    members.extend(streamed);
-                    continue;
-                }
-            }
+                    )
+                },
+            )?);
+            start = end;
         }
-
-        members.push(CompressedMember {
-            input_size,
-            crc32,
-            hash,
-            store: stored,
-            packed: packed_spool,
-            solid_continuation: false,
-        });
     }
     Ok(members)
+}
+
+fn compress_whole_member(
+    source: &EntrySource,
+    integrity: (u64, u32, [u8; 32]),
+    plan: &CompressPlan,
+    resources: &WriterResources,
+    advance: &(dyn Fn(u64) -> bool + Sync),
+) -> Result<CompressedMember> {
+    let (input_size, crc32, hash) = integrity;
+    let required = whole_member_workspace(input_size, plan);
+
+    let mut packed_spool = Spool::create(resources)?;
+    let mut stored = input_size == 0;
+    if !stored {
+        match resources.acquire(required, plan.dictionary_size) {
+            Ok(_permit) => {
+                let mut data = Vec::with_capacity(input_size as usize);
+                source.open()?.read_to_end(&mut data)?;
+                if data.len() as u64 != input_size {
+                    return Err(Error::InvalidHeader(
+                        "entry source size changed while compressing",
+                    ));
+                }
+                // The filter search walks the member many times over, so
+                // encoder positions are scaled down to the member's share
+                // of that total: many passes, one member's worth of
+                // progress.
+                let walk = super::filter_policy_walk_bytes(
+                    &data,
+                    &plan.filter_policy,
+                    plan.algorithm_version,
+                    plan.candidates.len(),
+                )
+                .max(input_size)
+                .max(1);
+                let share = |bytes: u64| {
+                    (u128::from(bytes) * u128::from(input_size) / u128::from(walk)) as u64
+                };
+                let mut reported = 0u64;
+                let mut charged = 0u64;
+                let mut report = |position: usize| {
+                    let position = position as u64;
+                    if position < reported {
+                        // A new pass restarted at the beginning.
+                        reported = 0;
+                    }
+                    let delta = position - reported;
+                    reported = position;
+                    let target = (charged + delta).min(walk);
+                    let scaled = share(target) - share(charged);
+                    charged = target;
+                    advance(scaled)
+                };
+                let packed = encode_member_with_filter_policy_candidates_and_progress(
+                    &data,
+                    plan.algorithm_version,
+                    &plan.filter_policy,
+                    &plan.candidates,
+                    Some(&mut report),
+                )?;
+                // An explicitly requested filter is not discarded just
+                // because the result did not shrink.
+                stored = should_store_compressed_payload(
+                    data.len() as u64,
+                    packed.len() as u64,
+                    plan.solid,
+                    &plan.filter_policy,
+                );
+                if !stored {
+                    packed_spool.write_all(&packed)?;
+                }
+            }
+            Err(error) => {
+                if plan.filter_policy != FilterPolicy::Auto {
+                    return Err(error);
+                }
+                // Too big to filter; compress it as a stream instead.
+                let mut streamed = compress_members_reporting(
+                    std::slice::from_ref(source),
+                    CompressPlan {
+                        filter_policy: FilterPolicy::None,
+                        candidates: vec![plan.encode_options],
+                        ..plan.clone()
+                    },
+                    resources,
+                    advance,
+                )?;
+                return Ok(streamed.remove(0));
+            }
+        }
+    }
+
+    Ok(CompressedMember {
+        input_size,
+        crc32,
+        hash,
+        store: stored,
+        packed: packed_spool,
+        solid_continuation: false,
+    })
 }
 
 /// Members with independent dictionaries, interleaved so a batch of small
@@ -332,7 +376,7 @@ fn compress_independent_members(
     batch_capacity: usize,
     required: u64,
     resources: &WriterResources,
-    advance: &mut dyn FnMut(u64) -> bool,
+    advance: &(dyn Fn(u64) -> bool + Sync),
 ) -> Result<Vec<Spool>> {
     let mut packed = Vec::with_capacity(sources.len());
     for (group_index, group) in sources.chunks(batch_capacity).enumerate() {
@@ -402,7 +446,7 @@ fn compress_solid_chain(
     batch_capacity: usize,
     required: u64,
     resources: &WriterResources,
-    advance: &mut dyn FnMut(u64) -> bool,
+    advance: &(dyn Fn(u64) -> bool + Sync),
 ) -> Result<Vec<Spool>> {
     let mut streams = sources
         .iter()
@@ -522,7 +566,7 @@ fn compress_wave(
     jobs: Vec<BlockJob>,
     plan: &CompressPlan,
     streams: &mut [MemberStream],
-    advance: &mut dyn FnMut(u64) -> bool,
+    advance: &(dyn Fn(u64) -> bool + Sync),
 ) -> Result<()> {
     let wave_bytes: u64 = jobs.iter().map(|job| job.data.len() as u64).sum();
     let packed_blocks = crate::parallel::map_collect(jobs, |job| {
@@ -589,5 +633,67 @@ mod tests {
         let mut larger = plan.clone();
         larger.encode_options.max_match_distance *= 2;
         assert_eq!(whole_member_workspace(size as u64, &larger), required);
+    }
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[test]
+    fn whole_members_use_multiple_workers_without_changing_bytes() {
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+        let sources: Vec<_> = (0..8)
+            .map(|n| {
+                EntrySource::from_bytes(
+                    format!("member {n}: independent text compression\n")
+                        .repeat(1024)
+                        .into_bytes(),
+                )
+            })
+            .collect();
+        let options = EncodeOptions::new(8);
+        let plan = CompressPlan {
+            algorithm_version: 0,
+            encode_options: options,
+            dictionary_size: 65536,
+            block_size: 65536,
+            solid: false,
+            method: 1,
+            filter_policy: FilterPolicy::Auto,
+            candidates: vec![options],
+        };
+        let run = |threads, budget| {
+            let workers = Mutex::new(HashSet::new());
+            let result = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    compress_members_reporting(
+                        &sources,
+                        plan.clone(),
+                        &WriterResources::new(budget),
+                        &|_| {
+                            workers.lock().unwrap().insert(std::thread::current().id());
+                            true
+                        },
+                    )
+                    .unwrap()
+                    .into_iter()
+                    .map(|mut member| {
+                        let mut bytes = Vec::new();
+                        member.packed.copy_to(&mut bytes).unwrap();
+                        bytes
+                    })
+                    .collect::<Vec<_>>()
+                });
+            (result, workers.into_inner().unwrap().len())
+        };
+        let (serial, _) = run(1, 256 * 1024 * 1024);
+        let (parallel, workers) = run(4, 256 * 1024 * 1024);
+        assert_eq!(serial, parallel);
+        assert!(workers > 1);
+        let (limited, _) = run(
+            4,
+            whole_member_workspace(sources[0].len().unwrap(), &plan) * 2,
+        );
+        assert_eq!(serial, limited);
     }
 }
