@@ -624,19 +624,24 @@ fn compress_wave(
     streams: &mut [MemberStream],
     advance: &(dyn Fn(u64) -> bool + Sync),
 ) -> Result<()> {
-    let wave_bytes: u64 = jobs.iter().map(|job| job.data.len() as u64).sum();
     let packed_runs = crate::parallel::map_collect(jobs, |job| {
         let boundaries: Vec<_> = job
             .blocks
             .iter()
             .map(|&(_, end, last)| (end, last))
             .collect();
+        // Report each block from the worker that finished it. A run holds a
+        // dictionary's worth of blocks and a wave holds one run per thread, so
+        // reporting once the wave is appended is a single jump across the whole
+        // member whenever the member fits one wave.
+        let mut block_done = |bytes: usize| advance(bytes as u64);
         let packed = encode_lz_streaming_blocks(
             &job.data,
             &job.history,
             &boundaries,
             plan.algorithm_version,
             plan.encode_options,
+            Some(&mut block_done),
         )?;
         Ok::<_, crate::codec::Error>(
             job.blocks
@@ -648,9 +653,6 @@ fn compress_wave(
     })?;
     for (member, packed) in packed_runs.into_iter().flatten() {
         streams[member].packed.write_all(&packed)?;
-    }
-    if !advance(wave_bytes) {
-        return Err(Error::Cancelled);
     }
     Ok(())
 }

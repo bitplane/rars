@@ -817,11 +817,25 @@ pub(crate) fn encode_lz_streaming_blocks(
     blocks: &[(usize, bool)],
     algorithm_version: u8,
     options: EncodeOptions,
+    mut block_done: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<Vec<u8>>> {
     let (combined, start) = member_window(data, history, options);
     let mut at = start;
     let mut output = Vec::with_capacity(blocks.len());
     let mut first = 0;
+    // Block ends are offsets into `data`, so the bytes a block covers are the
+    // step from the end before it. Reporting them as they land is what keeps a
+    // progress bar moving: a whole member can be one run, and a run that
+    // reports only when it finishes reports nothing until it is done.
+    let mut reported = 0usize;
+    let mut report = |end: usize, block_done: &mut Option<&mut dyn FnMut(usize) -> bool>| {
+        let delta = end - reported;
+        reported = end;
+        match block_done {
+            Some(report) => report(delta),
+            None => true,
+        }
+    };
     if start == 0 && options.optimal_parse && !blocks.is_empty() {
         let (end, is_last) = blocks[0];
         output.push(encode_lz_block(
@@ -835,6 +849,9 @@ pub(crate) fn encode_lz_streaming_blocks(
         )?);
         at = end;
         first = 1;
+        if !report(end, &mut block_done) {
+            return Err(Error::Cancelled);
+        }
     }
     if first == blocks.len() {
         return Ok(output);
@@ -866,6 +883,9 @@ pub(crate) fn encode_lz_streaming_blocks(
             None,
         )?);
         at = end;
+        if !report(end - start, &mut block_done) {
+            return Err(Error::Cancelled);
+        }
     }
     Ok(output)
 }
@@ -3927,7 +3947,8 @@ mod tests {
                 .with_optimal_parse(optimal)
                 .with_max_match_distance(128);
             let blocks: Vec<_> = (1..=32).map(|i| (i * 256, i % 4 == 0)).collect();
-            let grouped = encode_lz_streaming_blocks(&data, &[], &blocks, 0, options).unwrap();
+            let grouped =
+                encode_lz_streaming_blocks(&data, &[], &blocks, 0, options, None).unwrap();
             let mut start = 0;
             for ((end, last), bytes) in blocks.into_iter().zip(grouped) {
                 let reference =
