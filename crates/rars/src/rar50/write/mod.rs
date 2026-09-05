@@ -619,7 +619,9 @@ fn streaming_lz_workspace(dictionary_size: u64, block_size: usize, optimal_parse
         .checked_next_power_of_two()
         .unwrap_or(dictionary_size)
         .saturating_mul(per_window_byte)
-        .saturating_add((block_size as u64).saturating_mul(64))
+        // Repricing can retain an earlier winner beside the current and next
+        // token streams, in addition to the reused DP arrays and match cache.
+        .saturating_add((block_size as u64).saturating_mul(if optimal_parse { 160 } else { 64 }))
         .saturating_add(3 * 1024 * 1024)
 }
 

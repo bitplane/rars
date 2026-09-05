@@ -1466,17 +1466,31 @@ fn encode_lz_block_in_window(
             ))
         }
     };
-    let mut tokens = Vec::new();
-    tokens.extend(initial_filters.iter().copied().map(EncodeToken::Filter));
-    tokens.extend(encode_tokens_with_progress(
+    let mut tokens = encode_tokens_with_progress(
         combined,
         block,
         search,
         options,
         distance_size,
+        initial_filters,
         progress,
-    )?);
-    let lengths = table_lengths_for_tokens(&tokens, distance_size)?;
+    )?;
+    if !initial_filters.is_empty() {
+        tokens.splice(
+            0..0,
+            initial_filters.iter().copied().map(EncodeToken::Filter),
+        );
+    }
+    encode_token_block(&tokens, algorithm_version, distance_size, is_last)
+}
+
+fn encode_token_block(
+    tokens: &[EncodeToken],
+    algorithm_version: u8,
+    distance_size: usize,
+    is_last: bool,
+) -> Result<Vec<u8>> {
+    let lengths = table_lengths_for_tokens(tokens, distance_size)?;
 
     let main_table = HuffmanTable::from_lengths(&lengths.main)?;
     let distance_table = HuffmanTable::from_lengths(&lengths.distance)?;
@@ -1489,7 +1503,7 @@ fn encode_lz_block_in_window(
         bit_pos: table_bits,
     };
     let mut state = EncoderMatchState::default();
-    for token in tokens {
+    for &token in tokens {
         match token {
             EncodeToken::Filter(filter) => {
                 let (code, len) = main_table.code_for_symbol(256)?;
@@ -1672,14 +1686,14 @@ impl Unpack50Encoder {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EncodeToken {
     Filter(EncodeFilter),
     Literal(u8),
     Match { length: usize, distance: usize },
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EncodeFilter {
     offset: usize,
     length: usize,
@@ -1770,7 +1784,16 @@ impl EncoderMatchState {
 /// these to emit the tables; the optimal parse needs them to know what each
 /// token it is considering will actually cost.
 fn table_lengths_for_tokens(tokens: &[EncodeToken], distance_size: usize) -> Result<TableLengths> {
+    table_lengths_with_filters(tokens, &[], distance_size)
+}
+
+fn table_lengths_with_filters(
+    tokens: &[EncodeToken],
+    filters: &[EncodeFilter],
+    distance_size: usize,
+) -> Result<TableLengths> {
     let mut main_frequencies = vec![0usize; MAIN_TABLE_SIZE];
+    main_frequencies[256] = filters.len();
     let mut distance_frequencies = vec![0usize; distance_size];
     let mut align_frequencies = vec![0usize; ALIGN_TABLE_SIZE];
     let mut length_frequencies = vec![0usize; LENGTH_TABLE_SIZE];
@@ -1813,6 +1836,53 @@ fn table_lengths_for_tokens(tokens: &[EncodeToken], distance_size: usize) -> Res
         align: huffman::complete_lengths_for_frequencies(&align_frequencies, 15),
         length: huffman::complete_lengths_for_frequencies(&length_frequencies, 15),
     })
+}
+
+/// Actual payload size, including the transmitted tables and filter records.
+/// Padding and block-header size are monotonic in this bit count.
+fn token_stream_bits(
+    tokens: &[EncodeToken],
+    filters: &[EncodeFilter],
+    lengths: &TableLengths,
+    distance_size: usize,
+) -> Result<usize> {
+    let version = if distance_size == DISTANCE_TABLE_SIZE_70 {
+        1
+    } else {
+        0
+    };
+    let (_, mut bits) = encode_table_lengths_with_bit_count(lengths, version)?;
+    let prices = TokenPrices { lengths };
+    let mut state = EncoderMatchState::default();
+    for token in filters
+        .iter()
+        .copied()
+        .map(EncodeToken::Filter)
+        .chain(tokens.iter().copied())
+    {
+        match token {
+            EncodeToken::Literal(byte) => bits += prices.literal(byte),
+            EncodeToken::Match { length, distance } => {
+                bits += prices.match_cost(&state, length, distance, distance_size)?;
+                state.remember(length, distance);
+            }
+            EncodeToken::Filter(filter) => {
+                let mut writer = BitWriter::new();
+                write_filter(&mut writer, filter)?;
+                bits += usize::from(lengths.main[256]) + writer.bit_pos;
+            }
+        }
+    }
+    Ok(bits)
+}
+
+#[derive(Default)]
+struct OptimalWorkspace {
+    price: Vec<u32>,
+    arrive_length: Vec<u32>,
+    arrive_distance: Vec<u32>,
+    arrive_reps: Vec<[u32; 4]>,
+    arrive_last_length: Vec<u32>,
 }
 
 /// What a literal is assumed to cost before any block has been coded, in the
@@ -1906,27 +1976,36 @@ impl TokenPrices<'_> {
 /// Does no searching of its own: `matches` holds what an [`OptimalCollector`]
 /// found at each position of this block, and prices never change what a
 /// search would find, so every pass prices the same collection.
-fn optimal_tokens(
+fn optimal_tokens_in_workspace(
     combined: &[u8],
     block: std::ops::Range<usize>,
     options: EncodeOptions,
     distance_size: usize,
     prices: Option<&TokenPrices<'_>>,
     matches: &BlockMatches,
+    workspace: &mut OptimalWorkspace,
 ) -> Result<Vec<EncodeToken>> {
     let start = block.start;
     let end = block.end;
     let span = end - start;
 
-    let mut price = vec![u32::MAX; span + 1];
-    let mut arrive_length = vec![0u32; span + 1];
-    let mut arrive_distance = vec![0u32; span + 1];
-    // The encoder state the cheapest path leaves behind at each node, which is
-    // what the next hop is priced against. Carrying only the arriving match
-    // meant a literal wiped the remembered distances, so a stream that
-    // alternates literals and matches could never price a repeat at all.
-    let mut arrive_reps = vec![[0u32; 4]; span + 1];
-    let mut arrive_last_length = vec![0u32; span + 1];
+    let OptimalWorkspace {
+        price,
+        arrive_length,
+        arrive_distance,
+        arrive_reps,
+        arrive_last_length,
+    } = workspace;
+    price.resize(span + 1, u32::MAX);
+    price.fill(u32::MAX);
+    arrive_length.resize(span + 1, 0);
+    arrive_length.fill(0);
+    arrive_distance.resize(span + 1, 0);
+    arrive_distance.fill(0);
+    arrive_reps.resize(span + 1, [0; 4]);
+    arrive_reps.fill([0; 4]);
+    arrive_last_length.resize(span + 1, 0);
+    arrive_last_length.fill(0);
     price[0] = 0;
 
     // Runs of `(shortest, longest, distance)` from the position being priced,
@@ -2079,6 +2158,7 @@ fn encode_tokens_with_progress(
     search: MemberSearch<'_>,
     options: EncodeOptions,
     distance_size: usize,
+    initial_filters: &[EncodeFilter],
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<EncodeToken>> {
     let start = block.start;
@@ -2096,26 +2176,45 @@ fn encode_tokens_with_progress(
         // The prices come from the Huffman tables, and the tables come from
         // the parse, so the first pass has to guess. Each pass after it prices
         // against what the pass before actually produced.
-        let mut tokens = optimal_tokens(
+        let mut workspace = OptimalWorkspace::default();
+        let mut tokens = optimal_tokens_in_workspace(
             combined,
             block.clone(),
             options,
             distance_size,
             None,
             &matches,
+            &mut workspace,
         )?;
+        let mut lengths = table_lengths_with_filters(&tokens, initial_filters, distance_size)?;
+        let mut best_bits = token_stream_bits(&tokens, initial_filters, &lengths, distance_size)?;
+        let mut best = None;
         for _ in 1..OPTIMAL_PARSE_PASSES {
-            let lengths = table_lengths_for_tokens(&tokens, distance_size)?;
             let prices = TokenPrices { lengths: &lengths };
-            tokens = optimal_tokens(
+            let next = optimal_tokens_in_workspace(
                 combined,
                 block.clone(),
                 options,
                 distance_size,
                 Some(&prices),
                 &matches,
+                &mut workspace,
             )?;
+            if next == tokens {
+                break;
+            }
+            lengths = table_lengths_with_filters(&next, initial_filters, distance_size)?;
+            let bits = token_stream_bits(&next, initial_filters, &lengths, distance_size)?;
+            if bits < best_bits {
+                best_bits = bits;
+                best = None;
+            } else if best.is_none() {
+                // Keep an earlier winner only when repricing actually loses.
+                best = Some(std::mem::take(&mut tokens));
+            }
+            tokens = next;
         }
+        let tokens = best.unwrap_or(tokens);
         if progress.is_some_and(|report| !report(end - start)) {
             return Err(Error::Cancelled);
         }
@@ -3734,6 +3833,67 @@ fn write_level_lengths(writer: &mut BitWriter, lengths: &[u8; LEVEL_TABLE_SIZE])
 mod tests {
 
     #[test]
+    fn repricing_keeps_the_smallest_actual_block_including_filters() {
+        for filtered in [false, true] {
+            let data = wordy_text(4096);
+            let filters = if filtered {
+                vec![EncodeFilter {
+                    offset: 0,
+                    length: data.len(),
+                    filter_type: FilterType::E8,
+                    channels: 0,
+                }]
+            } else {
+                vec![]
+            };
+            let options = EncodeOptions::new(32).with_optimal_parse(true);
+            let distances = DISTANCE_TABLE_SIZE_50;
+            let selected = encode_tokens_with_progress(
+                &data,
+                0..data.len(),
+                MemberSearch::Fresh,
+                options,
+                distances,
+                &filters,
+                None,
+            )
+            .unwrap();
+            let lengths = table_lengths_with_filters(&selected, &filters, distances).unwrap();
+            let selected_bits =
+                token_stream_bits(&selected, &filters, &lengths, distances).unwrap();
+            let all: Vec<_> = filters
+                .iter()
+                .copied()
+                .map(EncodeToken::Filter)
+                .chain(selected.iter().copied())
+                .collect();
+            let packed = encode_token_block(&all, 0, distances, true).unwrap();
+            let parsed = parse_compressed_block(&packed).unwrap();
+            assert_eq!(selected_bits, parsed.header.payload_bits);
+            let mut collector = OptimalCollector::new(&data, 0, options);
+            let matches = collector.collect(&data, 0..data.len(), options);
+            let mut pass =
+                optimal_tokens(&data, 0..data.len(), options, distances, None, &matches).unwrap();
+            for _ in 0..OPTIMAL_PARSE_PASSES {
+                let lengths = table_lengths_with_filters(&pass, &filters, distances).unwrap();
+                assert!(
+                    selected_bits
+                        <= token_stream_bits(&pass, &filters, &lengths, distances).unwrap()
+                );
+                pass = optimal_tokens(
+                    &data,
+                    0..data.len(),
+                    options,
+                    distances,
+                    Some(&TokenPrices { lengths: &lengths }),
+                    &matches,
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn shorter_equal_price_match_can_expose_a_better_continuation() {
         let history = b"abcdefghijklm!mnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
         let data = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -3887,9 +4047,29 @@ mod tests {
             MemberSearch::Fresh,
             options,
             distance_size,
+            &[],
             None,
         )
         .expect("encoding without cancellation cannot be cancelled")
+    }
+
+    fn optimal_tokens(
+        combined: &[u8],
+        block: std::ops::Range<usize>,
+        options: EncodeOptions,
+        distance_size: usize,
+        prices: Option<&TokenPrices<'_>>,
+        matches: &BlockMatches,
+    ) -> Result<Vec<EncodeToken>> {
+        optimal_tokens_in_workspace(
+            combined,
+            block,
+            options,
+            distance_size,
+            prices,
+            matches,
+            &mut OptimalWorkspace::default(),
+        )
     }
 
     /// One block through the optimal parse, collecting its matches first the
