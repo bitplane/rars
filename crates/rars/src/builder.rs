@@ -81,6 +81,7 @@ struct BuilderEntry {
     name: Vec<u8>,
     data: Vec<u8>,
     source: Option<EntrySource>,
+    is_directory: bool,
     mtime: Option<u32>,
     mtime_nanoseconds: Option<u32>,
     attributes: EntryAttributes,
@@ -268,6 +269,7 @@ impl Builder {
             name: validate_entry_name(name)?,
             data,
             source: None,
+            is_directory: false,
             mtime,
             mtime_nanoseconds: None,
             attributes: mode.map_or(
@@ -291,12 +293,40 @@ impl Builder {
             name: validate_entry_name(name)?,
             data: Vec::new(),
             source: Some(source),
+            is_directory: false,
             mtime,
             mtime_nanoseconds: None,
             attributes: mode.map_or(
                 EntryAttributes::Dos(u64::from(DOS_ARCHIVE_ATTR)),
                 EntryAttributes::Unix,
             ),
+        })
+    }
+
+    /// Queue an explicit RAR5/7 directory, including an empty one.
+    /// `mode` supplies Unix permission bits; otherwise DOS directory flags are used.
+    /// Legacy directory output is not yet supported by this builder.
+    pub fn add_directory(
+        &mut self,
+        name: Vec<u8>,
+        mtime: Option<u32>,
+        mode: Option<u32>,
+    ) -> Result<()> {
+        if self.format.family() != crate::ArchiveFamily::Rar50Plus {
+            return Err(Error::InvalidHeader(
+                "explicit directory entries require RAR5/7 output",
+            ));
+        }
+        self.push(BuilderEntry {
+            name: validate_entry_name(name)?,
+            data: Vec::new(),
+            source: None,
+            is_directory: true,
+            mtime,
+            mtime_nanoseconds: None,
+            attributes: mode.map_or(EntryAttributes::Dos(0x10), |mode| {
+                EntryAttributes::Unix((mode & 0o7777) | 0o040000)
+            }),
         })
     }
 
@@ -326,12 +356,12 @@ impl Builder {
         Ok(())
     }
 
-    /// Set DOS/Windows attributes for a queued file, replacing any Unix mode.
+    /// Set DOS/Windows attributes for a queued entry, replacing any Unix mode.
     ///
     /// The output host is paired with these flags. Attribute width is checked
     /// against the target format (8 bits for RAR 1.3/1.4, 32 for RAR 1.5-4.x).
-    /// Directory attributes are rejected: setting flags cannot turn a queued
-    /// file into a directory entry. Errors leave the queued metadata unchanged.
+    /// The directory bit must agree with the entry kind: changing attributes
+    /// cannot change a file into a directory. Errors leave metadata unchanged.
     pub fn set_dos_attributes(&mut self, name: &[u8], attributes: u64) -> Result<()> {
         use crate::ArchiveFamily;
         let max = match self.format.family() {
@@ -344,11 +374,6 @@ impl Builder {
                 "DOS attributes exceed the target format's field width",
             ));
         }
-        if attributes & 0x10 != 0 {
-            return Err(Error::InvalidHeader(
-                "DOS directory attributes require a directory entry",
-            ));
-        }
         let entry = self
             .entries
             .iter_mut()
@@ -358,6 +383,11 @@ impl Builder {
                 operation: "setting DOS attributes",
                 source: Box::new(Error::InvalidHeader("no such archive entry")),
             })?;
+        if (attributes & 0x10 != 0) != entry.is_directory {
+            return Err(Error::InvalidHeader(
+                "DOS directory attributes must match the entry kind",
+            ));
+        }
         entry.attributes = EntryAttributes::Dos(attributes);
         Ok(())
     }
@@ -624,6 +654,7 @@ impl Builder {
                     EntrySource::from_bytes(Arc::<[u8]>::from(entry.data.as_slice()))
                 });
                 let built = rar50::ArchiveEntry::new(entry.name.clone(), source)
+                    .with_directory(entry.is_directory)
                     .with_mtime(entry.mtime)
                     .with_mtime_nanoseconds(entry.mtime_nanoseconds)
                     .with_attributes(entry.rar50_attr())

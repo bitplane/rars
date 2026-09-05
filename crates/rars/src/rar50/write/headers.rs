@@ -8,10 +8,10 @@
 use super::ArchiveMetadataEntry;
 use crate::crypto::rar50::{Rar50Cipher, Rar50Keys, WRITE_KDF_COUNT_LOG};
 use crate::rar50::{
-    map_rar50_crypto_error, FHEXTRA_CRYPT, FHEXTRA_HASH, FHFL_CRC32, FHFL_MTIME, HEAD_CRYPT,
-    HEAD_END, HEAD_MAIN, HFL_EXTRA, MHEXTRA_ARCHIVE_METADATA, MHEXTRA_ARCHIVE_METADATA_NAME,
-    MHEXTRA_ARCHIVE_METADATA_TIME, MHEXTRA_LOCATOR, MHEXTRA_LOCATOR_QUICK_OPEN,
-    MHEXTRA_LOCATOR_RECOVERY,
+    map_rar50_crypto_error, FHEXTRA_CRYPT, FHEXTRA_HASH, FHFL_CRC32, FHFL_DIRECTORY, FHFL_MTIME,
+    HEAD_CRYPT, HEAD_END, HEAD_MAIN, HFL_EXTRA, MHEXTRA_ARCHIVE_METADATA,
+    MHEXTRA_ARCHIVE_METADATA_NAME, MHEXTRA_ARCHIVE_METADATA_TIME, MHEXTRA_LOCATOR,
+    MHEXTRA_LOCATOR_QUICK_OPEN, MHEXTRA_LOCATOR_RECOVERY,
 };
 use crate::{crc32::crc32, Error, Result};
 
@@ -148,6 +148,7 @@ pub(super) fn stored_file_specific(
         mtime,
         0,
         host_os,
+        false,
     )
 }
 
@@ -159,11 +160,15 @@ pub(super) fn file_specific(
     mtime: Option<u32>,
     compression_info: u64,
     host_os: u64,
+    is_directory: bool,
 ) -> Result<Vec<u8>> {
     if name.is_empty() {
         return Err(Error::InvalidHeader("RAR 5 file name is empty"));
     }
     let mut file_flags = if data_crc32.is_some() { FHFL_CRC32 } else { 0 };
+    if is_directory {
+        file_flags |= FHFL_DIRECTORY;
+    }
     if mtime.is_some() {
         file_flags |= FHFL_MTIME;
     }

@@ -67,6 +67,8 @@ impl Default for WriterOptions {
 pub struct ArchiveEntry {
     pub name: Vec<u8>,
     pub source: EntrySource,
+    /// Explicit directory entry; its source must be empty.
+    pub is_directory: bool,
     pub mtime: Option<u32>,
     /// Optional nanosecond fraction; requires mtime and a value below one second.
     pub mtime_nanoseconds: Option<u32>,
@@ -109,6 +111,7 @@ impl ArchiveEntry {
         Self {
             name: name.into(),
             source,
+            is_directory: false,
             mtime: None,
             mtime_nanoseconds: None,
             attributes: 0,
@@ -116,6 +119,11 @@ impl ArchiveEntry {
             password: None,
             services: Vec::new(),
         }
+    }
+
+    pub fn with_directory(mut self, is_directory: bool) -> Self {
+        self.is_directory = is_directory;
+        self
     }
 
     pub fn with_service(mut self, service: ServiceEntry) -> Self {
@@ -901,6 +909,11 @@ fn validate_file_entry(name: &[u8]) -> Result<()> {
 /// them beyond the name.
 fn validate_entry(entry: &ArchiveEntry) -> Result<()> {
     validate_file_entry(&entry.name)?;
+    if entry.is_directory && entry.source.len()? != 0 {
+        return Err(Error::InvalidHeader(
+            "directory entries cannot carry file contents",
+        ));
+    }
     if let Some(nanos) = entry.mtime_nanoseconds {
         if entry.mtime.is_none() || nanos >= 1_000_000_000 {
             return Err(Error::InvalidHeader(
@@ -1583,6 +1596,7 @@ mod tests {
             None,
             compression_info,
             0,
+            false,
         )
         .unwrap();
         write_block(
@@ -1926,6 +1940,7 @@ mod tests {
             None,
             1 << 7,
             0,
+            false,
         )
         .unwrap();
         write_block(
@@ -1985,6 +2000,7 @@ mod tests {
             None,
             1 << 7,
             0,
+            false,
         )
         .unwrap();
         write_block(

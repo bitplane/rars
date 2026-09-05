@@ -206,6 +206,8 @@ pub struct ArchiveMemberMeta {
     pub host_os: Option<u64>,
     /// Whether the member is a directory.
     pub is_directory: bool,
+    /// Whether the member carries a RAR5 link or other redirection record.
+    pub is_redirection: bool,
     /// Whether the member payload is encrypted.
     pub is_encrypted: bool,
     /// Whether the member payload is stored without compression.
@@ -639,6 +641,7 @@ fn rar13_member(entry: &rar13::Entry) -> ArchiveMember {
             file_attr: u64::from(entry.header.file_attr),
             host_os: None,
             is_directory: entry.is_directory(),
+            is_redirection: false,
             is_encrypted: entry.is_encrypted(),
             is_stored: entry.is_stored(),
             is_split_before: entry.is_split_before(),
@@ -665,6 +668,7 @@ fn rar15_40_member(file: &rar15_40::FileHeader) -> ArchiveMember {
             file_attr: u64::from(file.attr),
             host_os: Some(u64::from(file.host_os)),
             is_directory: file.is_directory(),
+            is_redirection: false,
             is_encrypted: file.is_encrypted(),
             is_stored: file.is_stored(),
             is_split_before: file.is_split_before(),
@@ -693,6 +697,7 @@ fn rar50_member(file: &rar50::FileHeader) -> ArchiveMember {
             file_attr: file.attributes,
             host_os: Some(file.host_os),
             is_directory: file.is_directory(),
+            is_redirection: file.is_redirection(),
             is_encrypted: file.encrypted,
             is_stored: file.is_stored(),
             is_split_before: file.is_split_before(),

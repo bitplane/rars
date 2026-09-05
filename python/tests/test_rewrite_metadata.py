@@ -15,6 +15,60 @@ from test_extract_guards import _headers, _read_vint
 ROOT = Path(__file__).resolve().parents[2]
 
 
+@pytest.mark.parametrize("format", ["rar50", "rar70"])
+@pytest.mark.parametrize("mode", [None, 0o750])
+def test_rewrite_retains_empty_directories_and_metadata(format, mode):
+    source = rars.RarBuilder(format=format, solid=True)
+    source.add_directory("empty", mtime=1_700_000_002, mode=mode)
+    source.add_directory("nested", mode=mode)
+    source.add_bytes(b"payload", "nested/file")
+    rewritten = rars.RarBuilder.from_archive(rars.RarFile.from_bytes(source.to_bytes()))
+    rewritten.rename("empty", "renamed")
+    result = rars.RarFile.from_bytes(rewritten.to_bytes())
+    assert result.namelist() == ["renamed", "nested", "nested/file"]
+    for name in ("renamed", "nested"):
+        info = result.getinfo(name)
+        assert info.is_dir()
+        assert info.file_attr == (0x10 if mode is None else 0o040000 | mode)
+    assert result.read("nested/file") == b"payload"
+
+
+@pytest.mark.skipif(os.name != "posix" or not shutil.which("unrar"), reason="requires POSIX and unrar")
+def test_rewritten_directories_extract_with_unrar(tmp_path):
+    source = rars.RarBuilder(solid=True)
+    source.add_directory("empty", mtime=1_700_000_002, mode=0o750)
+    source.add_directory("nested", mode=0o750)
+    source.add_bytes(b"payload", "nested/file")
+    rewritten = tmp_path / "rewritten.rar"
+    rars.RarBuilder.from_archive(rars.RarFile.from_bytes(source.to_bytes())).write(rewritten)
+    output = tmp_path / "out"
+    output.mkdir()
+    subprocess.run(["unrar", "x", "-idq", "-o+", str(rewritten), str(output) + "/"],
+                   check=True, capture_output=True)
+    assert (output / "empty").is_dir()
+    assert list((output / "empty").iterdir()) == []
+    assert (output / "empty").stat().st_mode & 0o777 == 0o750
+    assert (output / "empty").stat().st_mtime_ns == 1_700_000_002_000_000_000
+    assert (output / "nested/file").read_bytes() == b"payload"
+
+
+@pytest.mark.parametrize("fixture", ["symlink.rar", "hardlink.rar", "rarfile_hlink.rar"])
+def test_rewrite_rejects_redirections_before_writing(fixture):
+    source = ROOT / "crates/rars/tests/fixtures/rar50/wild" / fixture
+    with pytest.raises(rars.UnsupportedRarFeature, match="cannot rewrite special entry"):
+        rars.RarBuilder.from_archive(source)
+
+
+@pytest.mark.parametrize("kind", [0o010000, 0o020000, 0o060000, 0o120000, 0o140000])
+def test_rewrite_rejects_unix_special_file_modes(kind):
+    source = rars.RarBuilder(format="rar29", store=True)
+    source.add_bytes(b"special payload", "special", mode=kind | 0o644)
+    archive = rars.RarFile.from_bytes(source.to_bytes())
+    assert archive.read("special") == b"special payload"
+    with pytest.raises(rars.UnsupportedRarFeature, match="special"):
+        rars.RarBuilder.from_archive(archive)
+
+
 @pytest.mark.skipif(os.name != "posix" or not shutil.which("unrar"), reason="requires POSIX and unrar")
 @pytest.mark.parametrize("zone", ["Asia_Kolkata", "Europe_London", "Etc_GMT_5"])
 def test_legacy_rewrite_uses_extractions_local_zone_and_odd_second(tmp_path, zone):

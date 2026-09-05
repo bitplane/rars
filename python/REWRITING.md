@@ -16,11 +16,12 @@ the separate password argument.
 | --- | --- | --- |
 | File contents, raw names, order | Copied; builder name validation applies | Preserve retained members and order |
 | Duplicate names | Rejected by the builder | Reject explicitly until editing by member identity is supported |
-| Directories | Skipped, including empty directories | Preserve explicit directory entries |
+| Directories | Explicit entries retained, including empty directories and supported modification time/attributes | Preserve explicit directory entries |
 | Timestamps | Modification time retained, including legacy odd seconds/fractions and RAR5 HTIME Unix/FILETIME fractions and explicit epoch | Preserve additional timestamp kinds using the established local-zone interpretation for legacy DOS times |
 | Attributes and host OS | Unix permission/special bits and DOS file flags retained using source host rules; unknown hosts use default DOS archive attributes | Preserve supported attributes with their source meaning; reject unsupported host semantics |
 | Archive comment | Copied as decoded comment bytes | Preserve comment content |
-| File comments, links and other metadata | No faithful preservation contract | Preserve supported records; reject unsupported preservation |
+| Links and special entries | RAR5 redirections, Unix special-file types, DOS reparse points and directories with file contents rejected before writing | Preserve supported types; reject unsupported preservation |
+| File comments and other metadata | No faithful preservation contract | Preserve supported records; reject unsupported preservation |
 | Archive format | Always writes RAR5 | Preserve supported format semantics; exact creating release may be unknowable |
 | Data/header encryption | Removed | Preserve both, using an available input password unless explicitly changed |
 | Solid layout and compression | Fresh non-solid level-3 compression | Preserve supported solid semantics; compressed bytes and original encoder tuning are not guaranteed |
@@ -31,6 +32,12 @@ the separate password argument.
 File contents are read lazily during output. Keep a file-backed source available
 and unchanged until writing completes. Each retained member currently invokes
 an archive read separately; rewriting large or solid archives can be expensive.
+
+`RarBuilder.add_directory(arcname, mtime=None, mode=None)` adds an explicit
+directory to RAR5/7 output. It also allows empty directories without an input
+archive. `mode` supplies Unix permissions; the default uses DOS directory flags.
+Recursive `add(path)` still only queues files; explicit directory creation does
+not change that existing traversal policy.
 
 ## Agreed direction for the next minor release
 

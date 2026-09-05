@@ -592,7 +592,8 @@ impl RarBuilder {
     ///
     /// This currently copies file contents, names, order and the archive comment,
     /// and modification times including supported subsecond precision.
-    /// It does not preserve directories, encryption, solid settings
+    /// Explicit directories are retained; links and other special entries are
+    /// rejected before writing. It does not preserve encryption, solid settings
     /// or volume layout. Unix permission bits and DOS file flags are retained;
     /// unknown hosts use the builder's DOS defaults. The password
     /// unlocks the input; output is unencrypted. For an existing RarFile, its
@@ -625,15 +626,26 @@ impl RarBuilder {
         };
         for member in archive.archive.members() {
             let info = member.meta;
-            if info.is_directory {
-                continue;
-            }
             // A builder mode is Unix metadata, not generic archive attributes.
             // Reuse extraction's host rules: e.g. legacy host 1 is DOS, but
             // RAR5 host 1 is Unix. DOS 0x20 must not become Unix mode 0040.
-            // Retain permission/special bits only: this conversion emits files,
-            // and cannot faithfully reproduce links or other special entries.
             let attr_source = info.attr_source();
+            let unix_type = info.file_attr & 0o170000;
+            let unsupported_type = attr_source == rars_rs::AttrSource::Unix
+                && !matches!(unix_type, 0 | 0o100000)
+                && !(info.is_directory && unix_type == 0o040000);
+            let reparse_point =
+                attr_source == rars_rs::AttrSource::Dos && info.file_attr & 0x400 != 0;
+            if info.is_redirection
+                || unsupported_type
+                || reparse_point
+                || (info.is_directory && info.unpacked_size != 0)
+            {
+                return Err(UnsupportedRarFeature::new_err(format!(
+                    "cannot rewrite special entry {:?}: its type or contents cannot be preserved",
+                    String::from_utf8_lossy(&info.name)
+                )));
+            }
             let mode = (attr_source == rars_rs::AttrSource::Unix)
                 .then_some((info.file_attr & 0o7777) as u32);
             // Reuse CLI extraction's local-zone policy for legacy DOS times,
@@ -647,21 +659,28 @@ impl RarBuilder {
                 .map_err(|_| {
                     PyValueError::new_err("modification time exceeds the RAR5 timestamp range")
                 })?;
-            let member_archive = archive.archive.clone();
-            let member_name = info.name.clone();
-            let member_password = password.clone();
-            let source = rars_rs::EntrySource::from_opener(info.unpacked_size, move || {
-                let data = member_archive
-                    .read_member(&member_name, member_password.as_deref())?
-                    .ok_or(rars_rs::Error::InvalidHeader(
-                        "archive member disappeared while rewriting",
-                    ))?;
-                Ok(Box::new(Cursor::new(data)))
-            });
-            builder
-                .inner
-                .add_source(info.name.clone(), source, mtime, mode)
-                .map_err(map_builder_error)?;
+            if info.is_directory {
+                builder
+                    .inner
+                    .add_directory(info.name.clone(), mtime, mode)
+                    .map_err(map_builder_error)?;
+            } else {
+                let member_archive = archive.archive.clone();
+                let member_name = info.name.clone();
+                let member_password = password.clone();
+                let source = rars_rs::EntrySource::from_opener(info.unpacked_size, move || {
+                    let data = member_archive
+                        .read_member(&member_name, member_password.as_deref())?
+                        .ok_or(rars_rs::Error::InvalidHeader(
+                            "archive member disappeared while rewriting",
+                        ))?;
+                    Ok(Box::new(Cursor::new(data)))
+                });
+                builder
+                    .inner
+                    .add_source(info.name.clone(), source, mtime, mode)
+                    .map_err(map_builder_error)?;
+            }
             if let Some(time) = modified.filter(|time| time.subsec_nanos() != 0) {
                 builder
                     .inner
@@ -691,6 +710,19 @@ impl RarBuilder {
             None => archive_base_name(&path)?,
         };
         self.inner.add_path(&path, &base).map_err(map_builder_error)
+    }
+
+    /// Add an explicit, possibly empty directory to RAR5/7 output.
+    #[pyo3(signature = (arcname, mtime = None, mode = None))]
+    fn add_directory(
+        &mut self,
+        arcname: &Bound<'_, PyAny>,
+        mtime: Option<u32>,
+        mode: Option<u32>,
+    ) -> PyResult<()> {
+        self.inner
+            .add_directory(member_name_bytes(arcname)?, mtime, mode)
+            .map_err(map_builder_error)
     }
 
     #[pyo3(signature = (data, arcname, mtime = None, mode = None))]

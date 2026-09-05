@@ -564,6 +564,7 @@ fn prepare_member(
         entry.mtime.filter(|_| entry.mtime_nanoseconds.is_none()),
         compression_info,
         entry.host_os,
+        entry.is_directory,
     )?;
     let header = match header_keys {
         Some(keys) => encrypted_header_block(
@@ -860,6 +861,7 @@ impl Write for ChecksumSink {
 /// A member ready to be sliced across volumes.
 struct VolumeMember {
     name: Vec<u8>,
+    is_directory: bool,
     mtime: Option<u32>,
     mtime_nanoseconds: Option<u32>,
     attributes: u64,
@@ -1024,6 +1026,7 @@ fn prepare_volume_member(
             let payload_len = encrypted.len();
             Ok(VolumeMember {
                 name: entry.name.clone(),
+                is_directory: entry.is_directory,
                 mtime: entry.mtime,
                 mtime_nanoseconds: entry.mtime_nanoseconds,
                 attributes: entry.attributes,
@@ -1039,6 +1042,7 @@ fn prepare_volume_member(
         }
         None => Ok(VolumeMember {
             name: entry.name.clone(),
+            is_directory: entry.is_directory,
             mtime: entry.mtime,
             mtime_nanoseconds: entry.mtime_nanoseconds,
             attributes: entry.attributes,
@@ -1294,6 +1298,7 @@ fn fragment_header(
         member.mtime.filter(|_| member.mtime_nanoseconds.is_none()),
         member.compression_info,
         member.host_os,
+        member.is_directory,
     )?;
 
     let mut flags = HFL_DATA;
