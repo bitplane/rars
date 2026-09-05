@@ -244,16 +244,13 @@ pub(crate) fn restore_output_metadata(outputs: &[ExtractedOutput]) -> std::io::R
             false,
         )?;
     }
-    for output in outputs
+    let mut directories: Vec<_> = outputs
         .iter()
         .filter(|output| output.restore_metadata && output.meta.is_directory)
-    {
-        set_extracted_permissions(
-            &output.path,
-            output.meta.file_attr,
-            output.meta.attr_source,
-            true,
-        )?;
+        .collect();
+    // Finish descendants before a parent's mode can deny access to them.
+    directories.sort_by_cached_key(|output| std::cmp::Reverse(output.path.components().count()));
+    for output in directories {
         if let Some(time) = extracted_system_time(
             output.family,
             output.meta.file_time,
@@ -261,6 +258,12 @@ pub(crate) fn restore_output_metadata(outputs: &[ExtractedOutput]) -> std::io::R
         ) {
             set_modified_time(&output.path, time)?;
         }
+        set_extracted_permissions(
+            &output.path,
+            output.meta.file_attr,
+            output.meta.attr_source,
+            true,
+        )?;
     }
     Ok(())
 }
@@ -726,5 +729,64 @@ mod tests {
         ];
 
         restore_output_metadata(&outputs).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_directory_metadata_handles_restrictive_modes_in_any_entry_order() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let root = scratch("restrictive-directory-metadata");
+        let paths = [
+            root.join("parent"),
+            root.join("parent/child"),
+            root.join("parent/child/leaf"),
+        ];
+        for path in &paths {
+            fs::create_dir(path).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        // Neither archive order nor its reverse is a safe finalization order.
+        let outputs: Vec<_> = [0, 2, 1]
+            .into_iter()
+            .map(|index| {
+                let name = paths[index]
+                    .file_name()
+                    .unwrap()
+                    .as_encoded_bytes()
+                    .to_vec();
+                ExtractedOutput {
+                    name: name.clone(),
+                    path: paths[index].clone(),
+                    meta: ExtractedEntryMeta::new(
+                        name,
+                        1_704_067_200 + index as u32,
+                        0o040000,
+                        true,
+                    )
+                    .with_attr_source(rars::AttrSource::Unix),
+                    family: ArchiveFamily::Rar50Plus,
+                    restore_metadata: true,
+                }
+            })
+            .collect();
+
+        let result = restore_output_metadata(&outputs);
+        // Reopen parents before inspecting children, also allowing scratch cleanup
+        // if metadata restoration failed halfway through.
+        let mut metadata = Vec::new();
+        for path in &paths {
+            metadata.push(fs::metadata(path).unwrap());
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        result.unwrap();
+        for (index, meta) in metadata.iter().enumerate() {
+            assert_eq!(meta.permissions().mode() & 0o777, 0);
+            assert_eq!(
+                meta.modified().unwrap(),
+                UNIX_EPOCH + Duration::from_secs(1_704_067_200 + index as u64)
+            );
+        }
     }
 }
