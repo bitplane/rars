@@ -23,9 +23,9 @@ use error::{CliError, CliResult};
 use input::{collect_inputs, rar15_file_attr, read_inputs_with_progress};
 use output::{
     create_rar50_redirection as create_rar50_redirection_output, open_output_writer,
-    output_path_for_entry, output_path_for_rar50_entry, output_relative_path, print_ok_entry,
-    rar50_entry_name, restore_output_metadata, warn_rar50_redirections, Backslash, ExtractedOutput,
-    OverwritePolicy,
+    output_path_for_entry, output_path_for_rar50_entry, print_ok_entry, rar50_entry_name,
+    rar50_output_relative_path, restore_output_metadata, warn_rar50_redirections, Backslash,
+    ExtractedOutput, OverwritePolicy,
 };
 use password::{
     classify_rars_error, ensure_password_for_archives_extract, ensure_password_for_extract,
@@ -735,7 +735,6 @@ impl<'a> ExtractOutputState<'a> {
         self.reserve_output_path(planned)?;
         let (path, writer) =
             open_output_writer(self.out_dir, meta, self.overwrite, Backslash::Separator)?;
-        self.record_created_path(&meta.name, path.clone())?;
         self.outputs.push(ExtractedOutput {
             name: meta.name.clone(),
             path,
@@ -755,7 +754,7 @@ impl<'a> ExtractOutputState<'a> {
         self.reserve_output_path(planned)?;
         let (path, writer) =
             open_output_writer(self.out_dir, &common, self.overwrite, Backslash::Literal)?;
-        self.record_created_path(&meta.name, path.clone())?;
+        self.record_rar50_created_path(meta, path.clone())?;
         self.outputs.push(ExtractedOutput {
             name: meta.name.clone(),
             path,
@@ -780,7 +779,7 @@ impl<'a> ExtractOutputState<'a> {
             self.overwrite,
             &self.created_paths,
         )?;
-        self.record_created_path(&meta.name, path.clone())?;
+        self.record_rar50_created_path(meta, path.clone())?;
         self.outputs.push(ExtractedOutput {
             name: meta.name.clone(),
             path,
@@ -800,8 +799,12 @@ impl<'a> ExtractOutputState<'a> {
         Ok(())
     }
 
-    fn record_created_path(&mut self, name: &[u8], path: PathBuf) -> rars::Result<()> {
-        let key = output_relative_path(name)
+    fn record_rar50_created_path(
+        &mut self,
+        meta: &rars::rar50::ExtractedEntryMeta,
+        path: PathBuf,
+    ) -> rars::Result<()> {
+        let key = rar50_output_relative_path(&meta.name, meta.host_os)
             .map_err(|_| rars::Error::InvalidHeader("unsafe archive path"))?;
         self.created_paths.insert(key, path);
         Ok(())
