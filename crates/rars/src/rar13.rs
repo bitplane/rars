@@ -725,6 +725,44 @@ impl Archive {
         Ok(crate::ExtractionOutcome::Complete)
     }
 
+    pub(crate) fn rewrite_preservation_issues(&self) -> Vec<String> {
+        let mut issues = Vec::new();
+        let exact_comment = |extra: &[u8], present: bool| {
+            if present {
+                read_u16(extra, 0).is_ok_and(|size| usize::from(size) + 2 == extra.len())
+            } else {
+                extra.is_empty()
+            }
+        };
+        if self.main.flags & !(MHD_COMMENT | MHD_SOLID | MHD_PACK_COMMENT | MHD_ALWAYS_SET) != 0
+            || (self.main.has_packed_comment() && !self.main.has_archive_comment())
+            || !exact_comment(&self.main.extra, self.main.has_archive_comment())
+        {
+            issues.push(
+                "RAR1.3/1.4 main metadata, volumes or authenticity records are unsupported".into(),
+            );
+        }
+        if self.entries.is_empty() {
+            issues.push("empty legacy archive (source format cannot be inferred)".into());
+        }
+        for (index, entry) in self.entries.iter().enumerate() {
+            if entry.header.unp_ver != DEFAULT_UNP_VER
+                || entry.header.method > METHOD_BEST
+                || entry.header.flags & !(LHD_PASSWORD | LHD_COMMENT | LHD_SOLID) != 0
+                || (!self.main.is_solid() && entry.header.flags & LHD_SOLID != 0)
+                || !exact_comment(&entry.extra, entry.has_file_comment())
+                || (entry.is_directory()
+                    && (entry.header.pack_size != 0 || entry.header.unp_size != 0))
+            {
+                issues.push(format!("RAR1.3/1.4 member {index}: unsupported version, flags, comments or directory payload"));
+            }
+        }
+        if self.entries.last().map(|entry| entry.packed_range.end) != self.source.len().ok() {
+            issues.push("RAR1.3/1.4 trailing bytes or incomplete archive".into());
+        }
+        issues
+    }
+
     pub fn archive_comment(&self) -> Result<Option<Vec<u8>>> {
         if !self.main.has_archive_comment() {
             return Ok(None);
@@ -1587,6 +1625,19 @@ fn encode_member<'a>(
 ) -> Result<EncodedMember<'a>> {
     let unpacked_size = member.unpacked_size()?;
     validate_member(member.name, unpacked_size)?;
+    if member.file_attr & 0x10 != 0 {
+        if unpacked_size != 0 {
+            return Err(Error::InvalidArgument(
+                "RAR1.3/1.4 directories must have no payload",
+            ));
+        }
+        return Ok(EncodedMember {
+            payload: MemberPayload::Packed(Vec::new()),
+            method: METHOD_STORE,
+            unpacked_size: 0,
+            file_crc: file_checksum(&[]),
+        });
+    }
     let _permit =
         resources.acquire_serialising(member_workspace(unpacked_size as u64, coding.compresses()));
 

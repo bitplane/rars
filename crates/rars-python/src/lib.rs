@@ -724,7 +724,7 @@ impl RarBuilder {
             rars_rs::Builder::new(rars_rs::ArchiveVersion::Rar50).compression_level(Some(3))
         };
         let format = inner.format();
-        let legacy_preservation = preserve && format.family() == rars_rs::ArchiveFamily::Rar15To40;
+        let legacy_preservation = preserve && format.family() != rars_rs::ArchiveFamily::Rar50Plus;
         let mut builder = Self {
             inner: inner.comment(archive.comment(py)?),
             format,

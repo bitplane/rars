@@ -62,12 +62,12 @@ def test_trailing_bytes_or_missing_end_cannot_pass_preflight(suffix):
         rars.RarBuilder.from_archive(source)
 
 
-def test_older_legacy_preservation_is_explicitly_unimplemented():
+def test_legacy_trailing_data_is_rejected():
     builder = rars.RarBuilder(format="rar13", store=True)
     builder.add_bytes(b"payload", "file")
-    source = rars.RarFile.from_bytes(builder.to_bytes())
-    assert any("legacy source format" in issue for issue in source.rewrite_preservation_issues())
-    with pytest.raises(rars.UnsupportedRarFeature, match="legacy source format"):
+    source = rars.RarFile.from_bytes(builder.to_bytes() + b"extra")
+    assert any("trailing bytes" in issue for issue in source.rewrite_preservation_issues())
+    with pytest.raises(rars.UnsupportedRarFeature, match="trailing bytes"):
         rars.RarBuilder.from_archive(source)
 
 
@@ -314,7 +314,7 @@ def test_rewrite_can_replace_its_source_after_reading(tmp_path):
 def test_legacy_default_rejection_explains_explicit_conversion(tmp_path):
     builder = rars.RarBuilder(format="rar13", store=True)
     builder.add_bytes(b"payload", "file")
-    source = rars.RarFile.from_bytes(builder.to_bytes())
+    source = rars.RarFile.from_bytes(builder.to_bytes() + b"extra")
     destination = tmp_path / "existing.rar"
     destination.write_bytes(b"keep")
     with pytest.raises(rars.UnsupportedRarFeature, match="preserve=False"):

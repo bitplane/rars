@@ -104,7 +104,7 @@ existing policy for creating filesystem links.
 
 ## Native legacy preservation
 
-The supported subset includes single-volume RAR 1.5–4.x archives containing ordinary
+The supported subset includes single-volume RAR 1.3–4.x archives containing ordinary
 files, including solid archives, RAR1.5/RAR2 data encryption and RAR2.9–4.x salted AES
 data encryption. RAR3/4 header encryption
 is retained separately; mixed encrypted/plain members keep their individual status.
@@ -137,7 +137,7 @@ malformed extended timestamps, unsupported comment forms, unsupported special en
 Unicode filename records,
 unsupported host metadata, recovery and other service records. Unknown header
 flags, extra header bytes, unsupported end headers and trailing bytes are also
-rejected. RAR1.3/1.4 preservation and empty legacy output remain unsupported;
+rejected. Empty legacy output remains unsupported;
 removing the final member fails writing without replacing the destination.
 Use explicit `preserve=False` conversion when these properties need conversion
 rather than retention. Legacy writers materialize retained payloads in memory.
@@ -172,7 +172,10 @@ output. Duplicate archive comments, unknown comment metadata and ambiguous servi
 locations fail preflight. Comments combined with encrypted headers, encrypted CMT
 payloads, and embedded file comments combined with a RAR3/4 archive CMT record are
 still unsupported writer combinations. File data encryption with visible comments
-is supported. RAR1.3/1.4 preservation remains separate.
+is supported. RAR1.3/1.4 comments are retained as decoded bytes; compressed archive comments
+may be emitted uncompressed. Unknown extra metadata and authenticity records
+are rejected. The compatible RAR1.4 writer retains the shared unpacker-2 format,
+raw DOS names, timestamps, attributes, solid mode and per-member encryption.
 
 Native rewriting preserves archival time even though `gettimes()` and RAR5
 conversion cannot represent it. Those conversion APIs retain their existing

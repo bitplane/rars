@@ -367,9 +367,20 @@ impl Builder {
         mtime: Option<u32>,
         mode: Option<u32>,
     ) -> Result<()> {
+        if matches!(
+            self.format,
+            ArchiveVersion::Rar13 | ArchiveVersion::Rar14 | ArchiveVersion::Rar15
+        ) && mode.is_some()
+        {
+            return Err(Error::InvalidArgument(
+                "RAR1.x directory output requires DOS attributes",
+            ));
+        }
         let legacy = matches!(
             self.format,
-            ArchiveVersion::Rar15
+            ArchiveVersion::Rar13
+                | ArchiveVersion::Rar14
+                | ArchiveVersion::Rar15
                 | ArchiveVersion::Rar20
                 | ArchiveVersion::Rar29
                 | ArchiveVersion::Rar30
@@ -539,7 +550,9 @@ impl Builder {
     ) -> Result<()> {
         let legacy = matches!(
             self.format,
-            ArchiveVersion::Rar15
+            ArchiveVersion::Rar13
+                | ArchiveVersion::Rar14
+                | ArchiveVersion::Rar15
                 | ArchiveVersion::Rar20
                 | ArchiveVersion::Rar29
                 | ArchiveVersion::Rar30
@@ -944,7 +957,7 @@ impl Builder {
             ));
         }
 
-        if self.format.family() == ArchiveFamily::Rar15To40
+        if self.format.family() != ArchiveFamily::Rar50Plus
             && self.entries.iter().any(|entry| entry.encryption.is_some())
         {
             return Err(Error::InvalidArgument(
@@ -1248,7 +1261,12 @@ impl Builder {
                     data: &entry.data,
                     file_time: entry.mtime.unwrap_or(0),
                     file_attr: entry.rar13_attr(),
-                    password: self.password.as_deref(),
+                    password: entry
+                        .encryption
+                        .as_ref()
+                        .map_or(self.password.as_deref(), |encryption| {
+                            encryption.data_password.as_deref()
+                        }),
                     file_comment: entry.file_comment.as_deref(),
                 })
                 .collect();
@@ -1262,7 +1280,12 @@ impl Builder {
                     data: &entry.data,
                     file_time: entry.mtime.unwrap_or(0),
                     file_attr: entry.rar13_attr(),
-                    password: self.password.as_deref(),
+                    password: entry
+                        .encryption
+                        .as_ref()
+                        .map_or(self.password.as_deref(), |encryption| {
+                            encryption.data_password.as_deref()
+                        }),
                     file_comment: entry.file_comment.as_deref(),
                 })
                 .collect();

@@ -140,6 +140,22 @@ impl Archive {
                 "archive has unsupported preservation settings",
             ));
         }
+        if let Archive::Rar13(archive) = self {
+            let password = if archive.entries.iter().any(|entry| entry.is_encrypted()) {
+                Some(
+                    password
+                        .filter(|value| !value.is_empty())
+                        .ok_or(crate::Error::NeedPassword)?
+                        .to_vec(),
+                )
+            } else {
+                None
+            };
+            return Ok(crate::Builder::new(crate::ArchiveVersion::Rar14)
+                .compression_level(Some(3))
+                .solid(archive.main.is_solid())
+                .password(password));
+        }
         if let Archive::Rar15To40(archive) = self {
             let encrypted = archive.main.has_encrypted_headers()
                 || archive.files().any(|file| file.is_encrypted());
@@ -330,14 +346,7 @@ impl Archive {
         }
         match self {
             Archive::Rar13(archive) => {
-                issues
-                    .push("legacy source format and metadata require preservation adapters".into());
-                if archive.main.is_solid() {
-                    issues.push("solid archive".into());
-                }
-                if archive.main.is_volume() {
-                    issues.push("volume layout".into());
-                }
+                issues.extend(archive.rewrite_preservation_issues());
             }
             Archive::Rar15To40(archive) => {
                 issues.extend(archive.rewrite_preservation_issues());
