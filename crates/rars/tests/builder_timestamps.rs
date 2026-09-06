@@ -5,6 +5,35 @@ use std::time::{Duration, UNIX_EPOCH};
 mod scratch;
 
 #[test]
+fn stored_timestamp_view_retains_family_presence_and_refinements() {
+    use rars::{ArchiveFamily, StoredTimestamp, TimeRefinement};
+    for format in ArchiveVersion::ALL {
+        let mut builder = Builder::new(format).store(true);
+        builder
+            .add_bytes(b"time".to_vec(), vec![], Some(0), None)
+            .unwrap();
+        let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        let mut meta = archive.members().next().unwrap().meta;
+        for raw in [0, 0x5022_1882] {
+            meta.file_time = Some(raw);
+            meta.mtime_refinement = Some(TimeRefinement {
+                add_second: true,
+                nanoseconds: 123,
+            });
+            let before = meta.clone();
+            let expected = match archive.family() {
+                ArchiveFamily::Rar50Plus => StoredTimestamp::UnixSeconds(raw),
+                _ => StoredTimestamp::DosLocal(raw),
+            };
+            assert_eq!(meta.stored_modification_time(), Some(expected), "{format}");
+            assert_eq!(meta, before);
+        }
+        meta.file_time = None;
+        assert_eq!(meta.stored_modification_time(), None);
+    }
+}
+
+#[test]
 fn fractional_mtime_survives_all_rar5_output_paths() {
     let root = scratch::case("fractional-mtime");
     for (format, encrypted) in [

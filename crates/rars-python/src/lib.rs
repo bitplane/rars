@@ -1219,18 +1219,17 @@ fn info_from_member(member: rars_rs::ArchiveMember) -> RarInfo {
             detail.insert("kind".to_string(), "unknown".to_string());
         }
     }
+    let date_time = member
+        .meta
+        .stored_modification_time()
+        .and_then(rars_rs::StoredTimestamp::calendar_fields);
     let filename = String::from_utf8_lossy(&member.meta.name).into_owned();
     RarInfo {
         filename,
         orig_filename_bytes: member.meta.name,
         file_size: member.meta.unpacked_size,
         compress_size: member.meta.packed_size,
-        date_time: match member.meta.family {
-            rars_rs::ArchiveFamily::Rar50Plus => {
-                member.meta.file_time.map(rars_rs::timestamp::unix_datetime)
-            }
-            _ => member.meta.file_time.and_then(dos_datetime),
-        },
+        date_time,
         crc,
         host_os: member.meta.host_os,
         is_encrypted: member.meta.is_encrypted,
@@ -1251,18 +1250,6 @@ fn hash_label(hash: Option<rars_rs::ArchiveMemberHash>) -> String {
         Some(_) => "unknown".to_string(),
         None => "none".to_string(),
     }
-}
-
-fn dos_datetime(raw: u32) -> Option<(u16, u8, u8, u8, u8, u8)> {
-    let date = (raw >> 16) as u16;
-    let time = raw as u16;
-    let year = 1980 + ((date >> 9) & 0x7f);
-    let month = ((date >> 5) & 0x0f) as u8;
-    let day = (date & 0x1f) as u8;
-    let hour = ((time >> 11) & 0x1f) as u8;
-    let minute = ((time >> 5) & 0x3f) as u8;
-    let second = ((time & 0x1f) * 2) as u8;
-    (month != 0 && day != 0).then_some((year, month, day, hour, minute, second))
 }
 
 fn family_name(family: rars_rs::ArchiveFamily) -> &'static str {

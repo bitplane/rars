@@ -61,6 +61,7 @@ use std::path::Path;
 pub use streaming::{
     EntryReader, EntrySource, WriteCancellation, WriterResources, DEFAULT_WRITER_MEMORY_LIMIT,
 };
+pub use timestamp::StoredTimestamp;
 pub use version::{ArchiveFamily, ArchiveVersion};
 pub use write_plan::{
     formats_supporting, supported_features, supports, MemberCoding, PlanShape, WriterOption,
@@ -342,6 +343,17 @@ pub struct ArchiveMemberMeta {
 }
 
 impl ArchiveMemberMeta {
+    /// Stored modification time with its encoding attached, before refinements.
+    ///
+    /// Legacy DOS values remain local wall-clock fields; RAR5 values are Unix
+    /// seconds, including the existing extended-time fallback. This accessor
+    /// does not validate or reinterpret the raw value. Absence stays `None`,
+    /// and odd-second/subsecond detail remains in `mtime_refinement`.
+    pub fn stored_modification_time(&self) -> Option<StoredTimestamp> {
+        self.file_time
+            .map(|raw| StoredTimestamp::from_family(self.family, raw))
+    }
+
     /// Modification time as an instant. Legacy DOS values use the same local
     /// zone and refinement policy as CLI extraction; RAR5 values are absolute.
     pub fn modification_time(&self) -> Option<std::time::SystemTime> {
@@ -1237,6 +1249,10 @@ mod tests {
             file.mtime = base;
             file.htime_mtime = extended;
             assert_eq!(rar50_member(&file).meta.file_time, expected);
+            assert_eq!(
+                rar50_member(&file).meta.stored_modification_time(),
+                expected.map(StoredTimestamp::UnixSeconds)
+            );
             assert_eq!(file.metadata().file_time, expected);
         }
     }

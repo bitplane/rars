@@ -6,6 +6,54 @@ use crate::{ArchiveFamily, TimeRefinement};
 use std::fs;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// A stored timestamp with its interpretation attached, before refinements.
+///
+/// This is a view of archive metadata, not necessarily a valid instant.
+/// Presence is represented separately by `Option<StoredTimestamp>`:
+/// `DosLocal(0)` is an invalid stored date, while `UnixSeconds(0)` is the Unix
+/// epoch. Odd-second and subsecond refinements remain separate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StoredTimestamp {
+    /// Packed DOS date/time fields with no stored timezone and two-second
+    /// resolution. Obtaining an instant requires a timezone policy.
+    DosLocal(u32),
+    /// Absolute whole seconds since the Unix epoch.
+    UnixSeconds(u32),
+}
+
+impl StoredTimestamp {
+    pub(crate) fn from_family(family: ArchiveFamily, raw: u32) -> Self {
+        match family {
+            ArchiveFamily::Rar13 | ArchiveFamily::Rar15To40 => Self::DosLocal(raw),
+            ArchiveFamily::Rar50Plus => Self::UnixSeconds(raw),
+        }
+    }
+
+    /// Calendar fields `(year, month, day, hour, minute, second)` for display.
+    ///
+    /// DOS values expose the stored wall-clock fields without timezone
+    /// conversion; Unix values use UTC. Refinements are not applied. For
+    /// compatibility with Python date tuples, a zero DOS month or day returns
+    /// `None`; other field values are exposed without validation.
+    /// Use [`crate::ArchiveMemberMeta::modification_time`] to obtain an instant
+    /// under the existing local-zone and refinement policy instead.
+    pub fn calendar_fields(self) -> Option<(u16, u8, u8, u8, u8, u8)> {
+        match self {
+            Self::UnixSeconds(seconds) => Some(unix_datetime(seconds)),
+            Self::DosLocal(raw) => {
+                let year = 1980 + ((raw >> 25) & 0x7f) as u16;
+                let month = ((raw >> 21) & 0x0f) as u8;
+                let day = ((raw >> 16) & 0x1f) as u8;
+                let hour = ((raw >> 11) & 0x1f) as u8;
+                let minute = ((raw >> 5) & 0x3f) as u8;
+                let second = ((raw & 0x1f) * 2) as u8;
+                (month != 0 && day != 0).then_some((year, month, day, hour, minute, second))
+            }
+        }
+    }
+}
+
 pub fn current_filetime() -> u64 {
     const FILETIME_UNIX_EPOCH_SECONDS: u64 = 11_644_473_600;
     const FILETIME_TICKS_PER_SECOND: u64 = 10_000_000;
@@ -173,4 +221,32 @@ fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
     let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146_097 + doe - 719_468
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StoredTimestamp;
+
+    #[test]
+    fn stored_calendar_fields_keep_wall_clock_separate_from_utc() {
+        assert_eq!(StoredTimestamp::DosLocal(0).calendar_fields(), None);
+        assert_eq!(
+            StoredTimestamp::UnixSeconds(0).calendar_fields(),
+            Some((1970, 1, 1, 0, 0, 0))
+        );
+        assert_eq!(
+            StoredTimestamp::DosLocal(0x5022_1882).calendar_fields(),
+            Some((2020, 1, 2, 3, 4, 4))
+        );
+        assert_eq!(
+            StoredTimestamp::UnixSeconds(1_582_934_400).calendar_fields(),
+            Some((2020, 2, 29, 0, 0, 0))
+        );
+        // The display accessor retains historically exposed raw DOS fields,
+        // rather than silently normalizing malformed dates into another date.
+        assert_eq!(
+            StoredTimestamp::DosLocal(u32::MAX).calendar_fields(),
+            Some((2107, 15, 31, 31, 63, 62))
+        );
+    }
 }
