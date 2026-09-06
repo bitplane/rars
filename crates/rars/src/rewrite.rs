@@ -105,7 +105,99 @@ impl Archive {
         }
     }
 
-    /// Properties the current RAR5 conversion builder cannot promise to preserve.
+    /// Configure a builder with supported source format, solid and encryption settings.
+    /// Member data/comment passwords are retained separately when entries are copied.
+    pub fn preserving_builder(&self, password: Option<&[u8]>) -> crate::Result<crate::Builder> {
+        let issues = self.rewrite_preservation_issues();
+        if !issues.is_empty() {
+            return Err(crate::Error::InvalidArgument(
+                "archive has unsupported preservation settings",
+            ));
+        }
+        let Archive::Rar50Plus(archive) = self else {
+            return Err(crate::Error::InvalidArgument(
+                "legacy preservation is unsupported",
+            ));
+        };
+        let version = if archive
+            .files()
+            .any(|file| file.compression_info & 0x3f == 1)
+        {
+            crate::ArchiveVersion::Rar70
+        } else {
+            crate::ArchiveVersion::Rar50
+        };
+        let encrypted = archive.main.encrypted_headers
+            || archive.blocks.iter().any(|block| match block {
+                crate::rar50::Block::File(file) | crate::rar50::Block::Service(file) => {
+                    file.encrypted
+                }
+                _ => false,
+            });
+        let password = if encrypted {
+            Some(
+                password
+                    .filter(|password| !password.is_empty())
+                    .ok_or(crate::Error::NeedPassword)?
+                    .to_vec(),
+            )
+        } else {
+            None
+        };
+        let archive_comment_encrypted = archive.blocks.iter().take_while(|block| !matches!(block, crate::rar50::Block::File(_)))
+            .any(|block| matches!(block, crate::rar50::Block::Service(service) if service.name == b"CMT" && service.encrypted));
+        let mut quick_open = false;
+        let mut recovery_percent = None;
+        for block in &archive.blocks {
+            if let crate::rar50::Block::Service(service) = block {
+                if service.name == b"QO" || service.name == b"RR" {
+                    service.write_to(archive, password.as_deref(), &mut std::io::sink())?;
+                    quick_open |= service.name == b"QO";
+                    if service.name == b"RR" {
+                        recovery_percent = service.recovery_record()?.map(|record| record.percent);
+                    }
+                }
+            }
+        }
+        let metadata = archive.main.extras.iter().find_map(|extra| match extra {
+            crate::rar50::MainExtraRecord::ArchiveMetadata(metadata) => Some(metadata.clone()),
+            _ => None,
+        });
+        crate::Builder::new(version)
+            .compression_level(Some(3))
+            .solid(archive.main.is_solid())
+            .password(password.clone())
+            .header_encryption(archive.main.encrypted_headers)
+            .archive_comment_password(if archive_comment_encrypted {
+                password
+            } else {
+                None
+            })
+            .recovery_percent(recovery_percent)
+            .archive_metadata(metadata, archive.main.is_locked(), quick_open)
+    }
+
+    /// Whether each member's comment payload is encrypted, in archive member order.
+    pub fn member_comment_encryption(&self) -> Vec<bool> {
+        let Archive::Rar50Plus(archive) = self else {
+            return self.members().map(|_| false).collect();
+        };
+        let mut encrypted = Vec::new();
+        for block in &archive.blocks {
+            match block {
+                crate::rar50::Block::File(_) => encrypted.push(false),
+                crate::rar50::Block::Service(service) if service.name == b"CMT" => {
+                    if let Some(last) = encrypted.last_mut() {
+                        *last = service.encrypted;
+                    }
+                }
+                _ => {}
+            }
+        }
+        encrypted
+    }
+
+    /// Properties the current rewrite adapters cannot promise to preserve.
     ///
     /// An empty list certifies only the supported metadata subset, not payload
     /// integrity or byte-identical output. Legacy formats are conservatively
@@ -141,9 +233,7 @@ impl Archive {
             if crate::builder::validate_entry_name(meta.name.clone()).is_err() {
                 issues.push(format!("{label}: unsupported output name"));
             }
-            if meta.is_encrypted {
-                issues.push(format!("{label}: data encryption"));
-            }
+
             if meta.is_split_before || meta.is_split_after {
                 issues.push(format!("{label}: split-volume layout"));
             }
@@ -192,27 +282,30 @@ impl Archive {
             Archive::Rar50Plus(archive) => {
                 use crate::rar50::Block;
                 let main = &archive.main;
-                if main.encrypted_headers {
-                    issues.push("header encryption".into());
-                }
-                if main.is_solid() {
-                    issues.push("solid archive".into());
-                }
+
                 if main.is_volume() || main.volume_number.is_some() {
                     issues.push("volume layout".into());
                 }
-                if main.has_recovery_record() {
-                    issues.push("recovery records".into());
-                }
-                if main.is_locked() {
-                    issues.push("archive lock flag".into());
-                }
+
                 if !main.rewrite_metadata_complete
                     || main.archive_flags & !0x1f != 0
                     || main.block.flags & !1 != 0
                     || main.block.data_size.unwrap_or(0) != 0
                 {
                     issues.push("main header metadata, extra records or unknown flags".into());
+                }
+                if main.encrypted_headers && !archive.files().any(|file| file.encrypted) {
+                    issues.push("header encryption without encrypted members".into());
+                }
+                let mut derived_services = HashSet::new();
+                for extra in &main.extras {
+                    if let crate::rar50::MainExtraRecord::ArchiveMetadata(metadata) = extra {
+                        if crate::rar50::write::headers::retained_archive_metadata(metadata)
+                            .is_err()
+                        {
+                            issues.push("unsupported archive metadata".into());
+                        }
+                    }
                 }
                 let mut index = 0;
                 let mut comment_seen = false;
@@ -223,28 +316,58 @@ impl Archive {
                             if !file.rewrite_metadata_complete
                                 || file.file_flags & !7 != 0
                                 || file.block.flags & !0x1b != 0
-                                || file.compression_info & !0x7fff != 0
+                                || file.compression_info
+                                    & if file.compression_info & 0x3f == 0 {
+                                        !0x7fff
+                                    } else {
+                                        !0x1fffff
+                                    }
+                                    != 0
                             {
                                 issues.push(format!(
                                     "member {index}: unsupported, duplicate or incomplete metadata"
                                 ));
                             }
-                            if file.compression_info & 0x3f != 0 {
+                            if file.compression_info & 0x3f > 1 {
                                 issues.push(format!(
-                                    "member {index}: source format requires conversion to RAR5"
+                                    "member {index}: source format requires an unsupported compression algorithm"
                                 ));
                             }
-                            if file.compression_info & 0x40 != 0 {
-                                issues.push(format!("member {index}: solid dependency"));
+                            if file.compression_info & 0x40 != 0 && !main.is_solid() {
+                                issues.push(format!(
+                                    "member {index}: solid dependency without a solid archive"
+                                ));
                             }
                             index += 1;
                         }
                         Block::Service(service) => {
+                            if service.name == b"QO" || service.name == b"RR" {
+                                if !derived_services.insert(service.name.clone())
+                                    || !service.rewrite_metadata_complete
+                                    || service.encrypted
+                                    || service.modification_time().is_some()
+                                    || service.file_times.is_some()
+                                    || service.file_flags & !4 != 0
+                                    || service.block.flags & !3 != 0
+                                    || service.attributes != 0
+                                    || service.host_os != 0
+                                    || service.compression_info != 0
+                                    || (service.name == b"RR"
+                                        && !service.recovery_record().ok().flatten().is_some_and(
+                                            |record| (1..=100).contains(&record.percent),
+                                        ))
+                                {
+                                    issues.push(format!(
+                                        "unsupported derived service {:?}",
+                                        String::from_utf8_lossy(&service.name)
+                                    ));
+                                }
+                                continue;
+                            }
                             // One CMT per owner (archive or preceding member).
                             // Other services and ambiguous duplicates remain rejected.
                             if comment_seen
                                 || service.name != b"CMT"
-                                || service.encrypted
                                 || !service.rewrite_metadata_complete
                                 || service.modification_time().is_some()
                                 || service.file_times.is_some()
@@ -275,6 +398,25 @@ impl Archive {
                             }
                         }
                         Block::Unknown(_) => issues.push("unknown archive block".into()),
+                    }
+                }
+                if main.has_recovery_record() != derived_services.contains(b"RR".as_slice()) {
+                    issues.push("recovery flag and service disagree".into());
+                }
+                if main.encrypted_headers && derived_services.contains(b"QO".as_slice()) {
+                    issues.push("quick-open index with encrypted headers".into());
+                }
+                for extra in &main.extras {
+                    if let crate::rar50::MainExtraRecord::Locator(locator) = extra {
+                        if locator.quick_open_offset.is_some_and(|offset| offset != 0)
+                            && !derived_services.contains(b"QO".as_slice())
+                            || locator
+                                .recovery_record_offset
+                                .is_some_and(|offset| offset != 0)
+                                && !derived_services.contains(b"RR".as_slice())
+                        {
+                            issues.push("locator refers to a missing service".into());
+                        }
                     }
                 }
             }

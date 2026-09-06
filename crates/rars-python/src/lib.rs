@@ -655,21 +655,16 @@ impl RarBuilder {
         })
     }
 
-    /// Create a RAR5 level-3 conversion builder from an archive.
-    ///
-    /// This currently copies file contents, names, order, archive and file comments,
-    /// and modification times including supported subsecond precision.
-    /// Explicit directories and supported Unix symbolic links are retained; other special entries are
-    /// rejected before writing. It does not preserve encryption, solid settings
-    /// or volume layout. Unix permission bits and DOS file flags are retained;
-    /// unknown hosts use the builder's DOS defaults. The password
-    /// unlocks the input; output is unencrypted. For an existing RarFile, its
-    /// configured password is used.
-    /// Set preserve=True to reject unsupported metadata or setting changes
-    /// before writing. RarFile.rewrite_preservation_issues() lists those gaps.
-    ///
-    /// This is not yet a metadata-preserving archive editor. See
-    /// python/REWRITING.md for current limitations and the planned contract.
+    /// Create a rewrite builder. The default converts to RAR5 level 3,
+    /// non-solid and unencrypted. With preserve=True, supported RAR5/7 format,
+    /// solid, data/header/comment encryption and archive metadata settings are
+    /// retained; unknown or unsupported preservation fails before output.
+    /// File contents, raw names, order, comments, directories, supported links
+    /// and modification/creation/access times are copied in both modes.
+    /// For an existing RarFile, its configured password is used. Preservation
+    /// reuses it for encrypted output; conversion removes encryption.
+    /// Input files must remain available and unchanged until writing completes.
+    /// See python/REWRITING.md for the supported subset and output guarantees.
     #[staticmethod]
     #[pyo3(signature = (source, password = None, *, preserve = false))]
     fn from_archive(
@@ -709,13 +704,20 @@ impl RarBuilder {
             .archive
             .member_comments(password.as_deref())
             .map_err(map_error)?;
-        let format = rars_rs::ArchiveVersion::Rar50;
+        let inner = if preserve {
+            archive
+                .archive
+                .preserving_builder(password.as_deref())
+                .map_err(map_error)?
+        } else {
+            rars_rs::Builder::new(rars_rs::ArchiveVersion::Rar50).compression_level(Some(3))
+        };
+        let format = inner.format();
         let mut builder = Self {
-            inner: rars_rs::Builder::new(format)
-                .compression_level(Some(3))
-                .comment(archive.comment(py)?),
+            inner: inner.comment(archive.comment(py)?),
             format,
         };
+        let comment_encryption = archive.archive.member_comment_encryption();
         for ((member_index, member), comment) in archive.archive.members().enumerate().zip(comments)
         {
             let file_times = member.file_times().map_err(map_error)?;
@@ -792,6 +794,24 @@ impl RarBuilder {
                 builder
                     .inner
                     .set_mtime_nanoseconds(&info.name, time.subsec_nanos())
+                    .map_err(map_builder_error)?;
+            }
+            if preserve {
+                builder
+                    .inner
+                    .set_entry_encryption(
+                        &info.name,
+                        if info.is_encrypted {
+                            password.clone()
+                        } else {
+                            None
+                        },
+                        if comment_encryption[member_index] {
+                            password.clone()
+                        } else {
+                            None
+                        },
+                    )
                     .map_err(map_builder_error)?;
             }
             if file_times.is_some() {

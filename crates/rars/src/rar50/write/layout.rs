@@ -36,6 +36,7 @@ pub(super) struct LayoutInputs<'a> {
     pub(super) main_flags: u64,
     pub(super) volume_number: Option<u64>,
     pub(super) archive_metadata: Option<ArchiveMetadataEntry<'a>>,
+    pub(super) metadata_record: Option<&'a crate::rar50::ArchiveMetadataRecord>,
     /// Everything between the main header and the quick-open block: comments,
     /// members and their services.
     pub(super) body_len: u64,
@@ -69,8 +70,11 @@ pub(super) fn resolve_layout(inputs: &LayoutInputs<'_>) -> Result<ResolvedLayout
     let mut recovery_offset = inputs.recovery_percent.map(|_| 0);
 
     for _ in 0..MAX_LAYOUT_PASSES {
-        let main_extra =
+        let mut main_extra =
             resolved_main_extra(inputs.archive_metadata, quick_open_offset, recovery_offset)?;
+        if let Some(metadata) = inputs.metadata_record {
+            main_extra.extend(super::headers::retained_archive_metadata(metadata)?);
+        }
         let main_header_len = main_header_len(inputs, &main_extra)?;
 
         let quick_open_position = signature_len
@@ -167,6 +171,7 @@ mod tests {
             main_flags: 0,
             volume_number: None,
             archive_metadata: None,
+            metadata_record: None,
             body_len,
             quick_open_payload_len: None,
             recovery_percent: Some(5),

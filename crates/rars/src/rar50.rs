@@ -1210,7 +1210,7 @@ fn parse_main_header_bytes(parsed: &ParsedBlockHeader) -> Result<MainHeader> {
     } else {
         None
     };
-    let extras =
+    let (extras, complete) =
         parse_main_extra_area(&parsed.header, parsed.extra_range.clone(), &parsed.control)?;
     Ok(MainHeader {
         block: parsed.block.clone(),
@@ -1218,7 +1218,7 @@ fn parse_main_header_bytes(parsed: &ParsedBlockHeader) -> Result<MainHeader> {
         volume_number,
         extras,
         encrypted_headers: false,
-        rewrite_metadata_complete: parsed.extra_range.is_empty() && reader.pos == reader.range.end,
+        rewrite_metadata_complete: complete && reader.pos == reader.range.end,
     })
 }
 
@@ -1226,70 +1226,79 @@ fn parse_main_extra_area(
     input: &[u8],
     range: Range<usize>,
     control: &crate::read_control::ReadControl,
-) -> Result<Vec<MainExtraRecord>> {
+) -> Result<(Vec<MainExtraRecord>, bool)> {
     let mut records = Vec::new();
-    parse_extra_records(
-        input,
-        range,
-        false,
-        control,
-        |record_type, data| match record_type {
-            MHEXTRA_LOCATOR => {
-                let mut reader = SliceReader::new(input, data.start, data.end);
-                let flags = reader.read_vint()?;
-                let quick_open_offset = if flags & MHEXTRA_LOCATOR_QUICK_OPEN != 0 {
-                    Some(reader.read_vint()?)
-                } else {
-                    None
-                };
-                let recovery_record_offset = if flags & MHEXTRA_LOCATOR_RECOVERY != 0 {
-                    Some(reader.read_vint()?)
-                } else {
-                    None
-                };
-                // LOCATOR records are intentionally forward-compatible: known
-                // offsets are parsed and any trailing bytes remain reserved for
-                // future flags.
-                records.push(MainExtraRecord::Locator(LocatorRecord {
-                    flags,
-                    quick_open_offset,
-                    recovery_record_offset,
-                }));
-                Ok(())
-            }
-            MHEXTRA_ARCHIVE_METADATA => {
-                let mut reader = SliceReader::new(input, data.start, data.end);
-                let flags = reader.read_vint()?;
-                let name = if flags & MHEXTRA_ARCHIVE_METADATA_NAME != 0 {
-                    let name_len = usize_from_u64(
-                        reader.read_vint()?,
-                        "RAR 5 archive metadata name length overflows usize",
-                    )?;
-                    Some(reader.read_bytes(name_len)?.to_vec())
-                } else {
-                    None
-                };
-                let creation_time = if flags & MHEXTRA_ARCHIVE_METADATA_TIME != 0 {
-                    Some(reader.read_u64()?)
-                } else {
-                    None
-                };
-                if reader.pos != reader.end {
-                    return Err(Error::InvalidHeader(
-                        "RAR 5 archive metadata record has trailing bytes",
-                    ));
+    let mut complete = true;
+    let mut seen = std::collections::HashSet::new();
+    let parsed_complete =
+        parse_extra_records(input, range, false, control, |record_type, data| {
+            complete &= seen.insert(record_type);
+            match record_type {
+                MHEXTRA_LOCATOR => {
+                    let mut reader = SliceReader::new(input, data.start, data.end);
+                    let flags = reader.read_vint()?;
+                    let quick_open_offset = if flags & MHEXTRA_LOCATOR_QUICK_OPEN != 0 {
+                        Some(reader.read_vint()?)
+                    } else {
+                        None
+                    };
+                    let recovery_record_offset = if flags & MHEXTRA_LOCATOR_RECOVERY != 0 {
+                        Some(reader.read_vint()?)
+                    } else {
+                        None
+                    };
+                    complete &= flags & !3 == 0 && reader.pos == reader.end;
+                    // LOCATOR records are intentionally forward-compatible: known
+                    // offsets are parsed and any trailing bytes remain reserved for
+                    // future flags.
+                    records.push(MainExtraRecord::Locator(LocatorRecord {
+                        flags,
+                        quick_open_offset,
+                        recovery_record_offset,
+                    }));
+                    Ok(())
                 }
-                records.push(MainExtraRecord::ArchiveMetadata(ArchiveMetadataRecord {
-                    flags,
-                    name,
-                    creation_time,
-                }));
-                Ok(())
+                MHEXTRA_ARCHIVE_METADATA => {
+                    let mut reader = SliceReader::new(input, data.start, data.end);
+                    let flags = reader.read_vint()?;
+                    let name = if flags & MHEXTRA_ARCHIVE_METADATA_NAME != 0 {
+                        let name_len = usize_from_u64(
+                            reader.read_vint()?,
+                            "RAR 5 archive metadata name length overflows usize",
+                        )?;
+                        Some(reader.read_bytes(name_len)?.to_vec())
+                    } else {
+                        None
+                    };
+                    let creation_time = if flags & MHEXTRA_ARCHIVE_METADATA_TIME != 0 {
+                        Some(if flags & 4 != 0 && flags & 8 == 0 {
+                            u64::from(reader.read_u32()?)
+                        } else {
+                            reader.read_u64()?
+                        })
+                    } else {
+                        None
+                    };
+                    if reader.pos != reader.end {
+                        return Err(Error::InvalidHeader(
+                            "RAR 5 archive metadata record has trailing bytes",
+                        ));
+                    }
+                    complete &= flags & !15 == 0 && (flags & 8 == 0 || flags & 4 != 0);
+                    records.push(MainExtraRecord::ArchiveMetadata(ArchiveMetadataRecord {
+                        flags,
+                        name,
+                        creation_time,
+                    }));
+                    Ok(())
+                }
+                _ => {
+                    complete = false;
+                    Ok(())
+                }
             }
-            _ => Ok(()),
-        },
-    )?;
-    Ok(records)
+        })?;
+    Ok((records, complete && parsed_complete))
 }
 
 fn parse_file_header_bytes(parsed: &ParsedBlockHeader) -> Result<FileHeader> {
@@ -1367,9 +1376,11 @@ fn parse_file_extra_area(
         seen |= bit;
         match record_type {
             FHEXTRA_CRYPT => {
-                file.rewrite_metadata_complete = false;
+                let encryption = parse_file_encryption_record(input, data)?;
+                file.rewrite_metadata_complete &=
+                    encryption.version == 0 && encryption.flags & !3 == 0;
                 file.encrypted = true;
-                file.encryption = Some(parse_file_encryption_record(input, data)?);
+                file.encryption = Some(encryption);
             }
             FHEXTRA_HASH => {
                 let (hash_type, hash_type_len) = read_vint_at(input, data.start, data.end)?;
@@ -1399,7 +1410,8 @@ fn parse_file_extra_area(
                 file.htime_mtime_refinement = parsed.and_then(|(_, detail)| detail);
             }
             FHEXTRA_SUBDATA => {
-                file.rewrite_metadata_complete &= is_service && data.is_empty();
+                file.rewrite_metadata_complete &=
+                    is_service && (data.is_empty() || file.name == b"RR");
                 file.service_data = Some(input[data].to_vec());
             }
             _ => {
@@ -1639,6 +1651,13 @@ where
     let mut budget = crate::parse_budget::ParseBudget::new(options);
     let mut pos = RAR50_SIGNATURE.len();
     let first = read_block(pos, &mut budget).map_err(|error| at_offset(error, pos))?;
+    let header_metadata_complete = if first.block.header_type == HEAD_CRYPT {
+        let mut reader = HeaderReader::new(&first.header, first.type_specific_range.clone())?;
+        reader.read_vint()?;
+        reader.read_vint()? & !1 == 0
+    } else {
+        true
+    };
     let header_keys = if first.block.header_type == HEAD_CRYPT {
         pos = first.next_offset;
         Some(parse_archive_encryption_header(&first, password)?)
@@ -1660,6 +1679,7 @@ where
     }
     let mut main = parse_main_header_bytes(first).map_err(|error| at_offset(error, main_pos))?;
     main.encrypted_headers = header_keys.is_some();
+    main.rewrite_metadata_complete &= header_metadata_complete;
     pos = first.next_offset;
 
     let mut blocks = Vec::new();

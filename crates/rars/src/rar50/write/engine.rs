@@ -40,6 +40,8 @@ pub(super) struct EnginePlan<'a> {
     pub(super) header_encrypted: bool,
     pub(super) archive_comment: Option<ArchiveCommentPlan<'a>>,
     pub(super) archive_metadata: Option<crate::rar50::ArchiveMetadataEntry<'a>>,
+    pub(super) metadata_record: Option<&'a crate::rar50::ArchiveMetadataRecord>,
+    pub(super) locked: bool,
     pub(super) quick_open: bool,
     pub(super) progress: Option<ProgressReporter<'a>>,
 }
@@ -266,7 +268,11 @@ pub(super) fn write_archive(
         None => Vec::new(),
     };
 
-    let mut main_flags = 0;
+    let mut main_flags = if plan.locked {
+        crate::rar50::MHFL_LOCKED
+    } else {
+        0
+    };
     if plan.compress.solid {
         main_flags |= MHFL_SOLID;
     }
@@ -280,6 +286,7 @@ pub(super) fn write_archive(
         main_flags,
         volume_number: None,
         archive_metadata: plan.archive_metadata,
+        metadata_record: plan.metadata_record,
         body_len,
         quick_open_payload_len: quick_open_payload
             .as_ref()
@@ -1325,6 +1332,7 @@ impl VolumeWriter<'_> {
             main_flags,
             volume_number: Some(volume_number),
             archive_metadata: None,
+            metadata_record: None,
             body_len: body.len(),
             quick_open_payload_len: None,
             recovery_percent: self.recovery_percent,

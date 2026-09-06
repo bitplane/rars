@@ -86,9 +86,16 @@ struct BuilderEntry {
     mtime_nanoseconds: Option<u32>,
     file_times: Option<crate::FileTimes>,
     file_comment: Option<Vec<u8>>,
+    encryption: Option<EntryEncryption>,
     redirection: Option<rar50::FileRedirection>,
     redirection_size: Option<u64>,
     attributes: EntryAttributes,
+}
+
+#[derive(Debug, Clone)]
+struct EntryEncryption {
+    data_password: Option<Vec<u8>>,
+    comment_password: Option<Vec<u8>>,
 }
 
 impl BuilderEntry {
@@ -163,7 +170,11 @@ pub struct Builder {
     password: Option<Vec<u8>>,
     encrypt_headers: bool,
     comment: Option<Vec<u8>>,
+    comment_password: Option<Vec<u8>>,
     recovery_percent: Option<u64>,
+    locked: bool,
+    quick_open: bool,
+    archive_metadata: Option<rar50::ArchiveMetadataRecord>,
     volume_size: Option<usize>,
     entries: Vec<BuilderEntry>,
 }
@@ -179,7 +190,11 @@ impl Builder {
             password: None,
             encrypt_headers: false,
             comment: None,
+            comment_password: None,
             recovery_percent: None,
+            locked: false,
+            quick_open: false,
+            archive_metadata: None,
             volume_size: None,
             entries: Vec::new(),
         }
@@ -284,6 +299,7 @@ impl Builder {
             mtime_nanoseconds: None,
             file_times: None,
             file_comment: None,
+            encryption: None,
             redirection: None,
             redirection_size: None,
             attributes: mode.map_or(
@@ -312,6 +328,7 @@ impl Builder {
             mtime_nanoseconds: None,
             file_times: None,
             file_comment: None,
+            encryption: None,
             redirection: None,
             redirection_size: None,
             attributes: mode.map_or(
@@ -344,6 +361,7 @@ impl Builder {
             mtime_nanoseconds: None,
             file_times: None,
             file_comment: None,
+            encryption: None,
             redirection: None,
             redirection_size: None,
             attributes: mode.map_or(EntryAttributes::Dos(0x10), |mode| {
@@ -383,6 +401,7 @@ impl Builder {
             mtime_nanoseconds: None,
             file_times: None,
             file_comment: None,
+            encryption: None,
             redirection: Some(link),
             redirection_size: None,
             attributes: EntryAttributes::Unix(0o120000 | (mode.unwrap_or(0o777) & 0o7777)),
@@ -410,6 +429,7 @@ impl Builder {
             mtime_nanoseconds: meta.mtime_refinement.map(|time| time.nanoseconds),
             file_times: None,
             file_comment: None,
+            encryption: None,
             redirection: Some(link.clone()),
             redirection_size: Some(meta.unpacked_size),
             attributes: if meta.host_os == Some(1) {
@@ -451,6 +471,61 @@ impl Builder {
             }
         }
         Ok(())
+    }
+
+    /// Set data and file-comment encryption independently for a queued RAR5/7 member.
+    /// Explicit None passwords retain plaintext even when the builder has a default password.
+    pub fn set_entry_encryption(
+        &mut self,
+        name: &[u8],
+        data_password: Option<Vec<u8>>,
+        comment_password: Option<Vec<u8>>,
+    ) -> Result<()> {
+        if self.format.family() != ArchiveFamily::Rar50Plus
+            || data_password.as_ref().is_some_and(Vec::is_empty)
+            || comment_password.as_ref().is_some_and(Vec::is_empty)
+        {
+            return Err(Error::InvalidArgument(
+                "per-entry encryption requires RAR5/7 and nonempty passwords",
+            ));
+        }
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.name == name)
+            .ok_or(Error::EntryNotFound)?;
+        entry.encryption = Some(EntryEncryption {
+            data_password,
+            comment_password,
+        });
+        Ok(())
+    }
+
+    /// Retain RAR5/7 archive-level metadata and advisory lock/index settings.
+    pub fn archive_metadata(
+        mut self,
+        metadata: Option<rar50::ArchiveMetadataRecord>,
+        locked: bool,
+        quick_open: bool,
+    ) -> Result<Self> {
+        if self.format.family() != ArchiveFamily::Rar50Plus {
+            return Err(Error::InvalidArgument(
+                "archive metadata settings require RAR5/7",
+            ));
+        }
+        if let Some(metadata) = &metadata {
+            rar50::write::headers::retained_archive_metadata(metadata)?;
+        }
+        self.archive_metadata = metadata;
+        self.locked = locked;
+        self.quick_open = quick_open;
+        Ok(self)
+    }
+
+    /// Encrypt only the archive comment with this password.
+    pub fn archive_comment_password(mut self, password: Option<Vec<u8>>) -> Self {
+        self.comment_password = password;
+        self
     }
 
     /// Set complete RAR5/7 timestamps without narrowing FILETIME or discarding fractions.
@@ -779,6 +854,11 @@ impl Builder {
         if self.entries.is_empty() {
             return Err(Error::InvalidArgument("archive builder has no entries"));
         }
+        if self.archive_metadata.is_some() || self.locked || self.quick_open {
+            return Err(Error::InvalidArgument(
+                "archive metadata settings are not supported in volume output",
+            ));
+        }
         if self.entries.iter().any(|entry| entry.redirection.is_some()) {
             return Err(Error::InvalidArgument(
                 "symbolic links are not supported in volume output",
@@ -804,6 +884,13 @@ impl Builder {
 
     fn check_single(&self) -> Result<()> {
         self.check_redirection_targets()?;
+        if !self.streams_rar50()
+            && (self.archive_metadata.is_some() || self.locked || self.quick_open)
+        {
+            return Err(Error::InvalidArgument(
+                "archive metadata settings require the RAR5/7 streaming writer",
+            ));
+        }
         if self.entries.is_empty() {
             return Err(Error::InvalidArgument("archive builder has no entries"));
         }
@@ -845,6 +932,7 @@ impl Builder {
         let mut features = FeatureSet::store_only();
         features.solid = self.solid;
         features.header_encryption = self.encrypt_headers;
+        features.quick_open = self.quick_open;
         features
     }
 
@@ -891,10 +979,22 @@ impl Builder {
                     .with_file_times(entry.file_times)
                     .with_attributes(entry.rar50_attr())
                     .with_host_os(entry.rar50_host_os());
+                let data_password = entry
+                    .encryption
+                    .as_ref()
+                    .map_or(self.password.as_deref(), |encryption| {
+                        encryption.data_password.as_deref()
+                    });
+                let comment_password = entry
+                    .encryption
+                    .as_ref()
+                    .map_or(self.password.as_deref(), |encryption| {
+                        encryption.comment_password.as_deref()
+                    });
                 let built = match &entry.file_comment {
                     Some(comment) => {
                         let service = rar50::ServiceEntry::new(b"CMT".to_vec(), comment.clone());
-                        let service = match self.password.as_deref() {
+                        let service = match comment_password {
                             Some(password) => service.with_password(password.to_vec()),
                             None => service,
                         };
@@ -902,7 +1002,7 @@ impl Builder {
                     }
                     None => built,
                 };
-                match self.password.as_deref() {
+                match data_password {
                     Some(password) => built.with_password(password.to_vec()),
                     None => built,
                 }
@@ -919,8 +1019,13 @@ impl Builder {
         let mut extras = rar50::ArchiveExtras::default()
             .with_recovery_percent(self.recovery_percent)
             .with_filter_policy(self.rar50_filter_policy());
+        extras.metadata_record = self.archive_metadata.as_ref();
+        extras.locked = self.locked;
         if let Some(comment) = self.comment.as_deref() {
-            extras = extras.with_comment(comment);
+            extras = match self.comment_password.as_deref() {
+                Some(password) => extras.with_encrypted_comment(comment, password),
+                None => extras.with_comment(comment),
+            };
         }
         rar50::write_streaming_archive_with_progress(
             &self.rar50_entries(),
@@ -942,7 +1047,7 @@ impl Builder {
             .entries(self.rar50_entries())
             .filter_policy(self.rar50_filter_policy())
             .recovery_percent(self.recovery_percent);
-        let writer = match (self.comment.as_deref(), self.password.as_deref()) {
+        let writer = match (self.comment.as_deref(), self.comment_password.as_deref()) {
             (Some(comment), Some(password)) => writer.encrypted_archive_comment(comment, password),
             (comment, _) => writer.archive_comment(comment),
         };

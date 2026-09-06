@@ -384,3 +384,42 @@ pub(crate) fn end_header_specific(end_flags: u64) -> Vec<u8> {
     write_vint(&mut specific, end_flags);
     specific
 }
+
+pub(crate) fn retained_archive_metadata(
+    metadata: &crate::rar50::ArchiveMetadataRecord,
+) -> Result<Vec<u8>> {
+    if metadata.flags & !15 != 0
+        || (metadata.flags & 8 != 0 && metadata.flags & 4 == 0)
+        || (metadata.flags & 1 != 0) != metadata.name.is_some()
+        || (metadata.flags & 2 != 0) != metadata.creation_time.is_some()
+        || metadata.flags & 3 == 0
+        || metadata
+            .name
+            .as_ref()
+            .is_some_and(|name| name.is_empty() || std::str::from_utf8(name).is_err())
+    {
+        return Err(Error::InvalidArgument(
+            "unsupported archive metadata record",
+        ));
+    }
+    let mut record = Vec::new();
+    write_vint(&mut record, metadata.flags);
+    if let Some(name) = &metadata.name {
+        write_vint(&mut record, name.len() as u64);
+        record.extend(name);
+    }
+    if let Some(time) = metadata.creation_time {
+        if metadata.flags & 4 != 0 && metadata.flags & 8 == 0 {
+            record.extend(
+                u32::try_from(time)
+                    .map_err(|_| Error::InvalidArgument("archive Unix timestamp exceeds 32 bits"))?
+                    .to_le_bytes(),
+            );
+        } else {
+            record.extend(time.to_le_bytes());
+        }
+    }
+    let mut extra = Vec::new();
+    write_extra_record(&mut extra, MHEXTRA_ARCHIVE_METADATA, &record);
+    Ok(extra)
+}

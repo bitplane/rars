@@ -7,20 +7,26 @@ RAR5, compression level 3, non-solid, unencrypted, with no recovery or volume
 configuration. It is not yet a metadata-preserving editor. Even a rename rebuilds
 the archive with these settings.
 
-Use `RarFile.rewrite_preservation_issues()` to inspect settings and metadata the
-current builder cannot preserve. `from_archive(..., preserve=True)` rejects those
-issues before creating an output builder. This opt-in currently accepts a
-conservative subset of unencrypted, non-solid RAR5 archives. Legacy/RAR7 format
-conversion, encryption, solid/volume/recovery settings, main-header extras,
-unsupported services, and unknown, duplicate or incomplete file extras fail
-preflight. Unknown metadata remains tolerated during ordinary reading.
+Use `RarFile.rewrite_preservation_issues()` to inspect unsupported source
+properties. `from_archive(..., preserve=True)` retains supported RAR5/7 format
+requirements, solid mode, per-member data and comment encryption, header
+and archive-comment encryption, lock flags, archive name/creation metadata,
+and regenerated quick-open/recovery services. Member passwords come from the
+input password; plaintext members and comments remain plaintext.
+
+Preservation rejects legacy formats, volume layouts, SFX prefixes, unknown
+compression algorithms, unsupported services and unknown, duplicate or incomplete
+metadata. Header encryption without any encrypted member, and quick-open indexes
+combined with header encryption, remain unsupported writer combinations. Unknown
+metadata remains tolerated during ordinary reading.
 
 This check is about supported metadata semantics. It does not verify payload
 integrity, promise identical compressed bytes, or replace staged publication.
 Its diagnostic strings are explanatory text, not stable machine-readable codes.
 
 `source` accepts the same inputs as `RarFile`, or an existing `RarFile`. The
-password unlocks the input; it never enables output encryption. When given an
+password unlocks the input. Preservation reuses it for encrypted output;
+conversion does not enable output encryption. When given an
 existing `RarFile`, the method uses that object's configured password, ignoring
 the separate password argument.
 
@@ -31,14 +37,14 @@ the separate password argument.
 | Directories | Explicit entries retained, including empty directories and supported modification time/attributes | Preserve explicit directory entries |
 | Timestamps | Modification, creation and access times retained, including legacy odd seconds/fractions and complete RAR5 Unix/FILETIME values | Preserve supported timestamp kinds using the established local-zone interpretation for legacy DOS times |
 | Attributes and host OS | Unix permission/special bits and DOS file flags retained using source host rules; unknown hosts use default DOS archive attributes | Preserve supported attributes with their source meaning; reject unsupported host semantics |
-| Archive comment | Copied as decoded comment bytes | Preserve comment content |
+| Archive comment | Copied as decoded bytes; preservation retains its encryption | Preserve comment content |
 | Links and special entries | RAR5 Unix/Windows symbolic links, junctions, hard links and file-copy records retained; legacy links and other special entries rejected before writing | Preserve supported types; reject unsupported preservation |
 | File comments | Decoded comments copied, including explicit empty comments; supported RAR5 CMT records pass preflight | Preserve supported comment content |
-| Other metadata | No faithful preservation contract | Preserve supported records; reject unsupported preservation |
-| Archive format | Always writes RAR5 | Preserve supported format semantics; exact creating release may be unknowable |
-| Data/header encryption | Removed | Preserve both, using an available input password unless explicitly changed |
-| Solid layout and compression | Fresh non-solid level-3 compression | Preserve supported solid semantics; compressed bytes and original encoder tuning are not guaranteed |
-| Volumes and recovery | Configuration not copied | Detect these features; preserve supported semantics or reject; volume boundaries are not guaranteed |
+| Other metadata | Supported archive name/creation time and lock flag retained in preservation; indexes regenerated | Preserve supported records; reject unsupported preservation |
+| Archive format | Conversion writes RAR5; preservation selects the RAR5/7 writer required by the source | Preserve supported format semantics; exact creating release may be unknowable |
+| Data/header encryption | Removed in conversion; retained separately in preservation, including mixed plaintext/encrypted members and comments | Preserve both, using an available input password unless explicitly changed |
+| Solid layout and compression | Fresh level-3 compression; preservation retains solid mode | Preserve supported solid semantics; compressed bytes and original encoder tuning are not guaranteed |
+| Volumes and recovery | Conversion removes configuration; preservation regenerates recognized recovery records at the retained percentage and rejects volumes | Detect these features; preserve supported semantics or reject; volume boundaries are not guaranteed |
 | SFX executable prefix | Not copied | Reject preservation unless explicitly supported |
 | Unknown records | No preservation guarantee | Reject when their preservation cannot be established |
 
@@ -98,8 +104,9 @@ archive. Failed preflight must leave existing destinations intact.
 
 Conversion will be explicit. It must let callers deliberately select a target
 format and remove encryption or metadata, and retain a documented route to the
-current RAR5 conversion settings. The `preserve` opt-in and existing conversion
-are available; configurable target-format/encryption preservation is still planned.
+current RAR5 conversion settings. The `preserve` opt-in and existing conversion are available. Explicit conversion
+target/settings overrides, legacy preservation, volume-set rewriting and the
+remaining writer combinations are still separate work.
 The former DOS-to-Unix permission
 reinterpretation was a bug; conversion no longer performs it.
 

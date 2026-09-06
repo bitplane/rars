@@ -323,10 +323,15 @@ pub fn write_streaming_volumes_with_progress(
     // naming every option it covered whichever one the caller had set. Quick
     // open rides on the feature set, so `validate_plan` catches that one.
     validate_plan(options, shape)?;
+    if extras.locked {
+        return Err(Error::InvalidArgument(
+            "archive lock flag is not supported in volume output",
+        ));
+    }
     if extras.comment.is_some() {
         crate::write_plan::validate_option(options.target, WriterOption::ArchiveComment, shape)?;
     }
-    if extras.metadata.is_some() {
+    if extras.metadata.is_some() || extras.metadata_record.is_some() {
         crate::write_plan::validate_option(options.target, WriterOption::ArchiveMetadata, shape)?;
     }
     // The volume preparation path does not carry redirection metadata.
@@ -376,6 +381,8 @@ pub fn write_streaming_volumes_with_progress(
             header_encrypted: options.features.header_encryption,
             archive_comment: None,
             archive_metadata: None,
+            metadata_record: None,
+            locked: extras.locked,
             // No volume writer emits the index, and `validate_plan` refuses a
             // set that asks for one, so this is the only value that can get
             // here rather than a decision taken quietly on the caller's behalf.
@@ -397,6 +404,10 @@ pub struct ArchiveExtras<'a> {
     /// Encrypts the comment. Without it the comment is stored in the clear.
     pub comment_password: Option<&'a [u8]>,
     pub metadata: Option<ArchiveMetadataEntry<'a>>,
+    /// Complete retained metadata, mutually exclusive with `metadata`.
+    pub metadata_record: Option<&'a super::ArchiveMetadataRecord>,
+    /// Retains the advisory archive lock flag.
+    pub locked: bool,
     /// Whether to look for a data filter that makes members compress better.
     pub filter_policy: FilterPolicy,
     /// Percentage of the archive to spend on a recovery record.
@@ -479,11 +490,10 @@ pub(crate) fn write_streaming_archive_reporting(
         (progress.is_some() || resources.has_cancellation()).then_some(ProgressReporter(&control));
     crate::write_progress::check_cancelled(progress)?;
     let encrypted = entries.iter().any(|entry| entry.password.is_some());
-    if encrypted && !entries.iter().all(|entry| entry.password.is_some()) {
-        return Err(Error::UnsupportedFeature {
-            version: options.target,
-            feature: "RAR 5 writer mixing encrypted and plain members",
-        });
+    if extras.metadata.is_some() && extras.metadata_record.is_some() {
+        return Err(Error::InvalidArgument(
+            "duplicate archive metadata settings",
+        ));
     }
     let recovery_percent = extras.recovery_percent;
     validate_plan(
@@ -532,6 +542,8 @@ pub(crate) fn write_streaming_archive_reporting(
                 (None, _) => None,
             },
             archive_metadata: extras.metadata,
+            metadata_record: extras.metadata_record,
+            locked: extras.locked,
             quick_open: options.features.quick_open,
             progress,
         },
