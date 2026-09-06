@@ -302,7 +302,10 @@ impl Archive {
             if meta.attr_source() == AttrSource::Unknown {
                 issues.push(format!("{label}: unknown host attributes"));
             }
-            if special_entry(meta) && member.supported_redirection().is_none() {
+            if special_entry(meta)
+                && member.supported_redirection().is_none()
+                && !member.is_legacy_unix_symlink()
+            {
                 issues.push(format!("{label}: special entry type or directory contents"));
             }
             if (meta.attr_source() == AttrSource::Unix

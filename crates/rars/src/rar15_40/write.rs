@@ -88,25 +88,31 @@ pub fn write_stored_archive_with_comment(
     )
 }
 
-/// Builder path for losslessly retained native timestamp records. Existing
-/// direct entry structs keep their API and emit no extended-time record.
-pub(crate) fn write_archive_with_extended_times(
+pub(crate) struct RetainedMemberMetadata<'a> {
+    pub(crate) extended_times: Option<&'a [u8]>,
+    pub(crate) is_directory: bool,
+    pub(crate) is_symlink: bool,
+}
+
+/// Builder path for retained native metadata and entry kinds. Existing direct
+/// entry structs keep their API.
+pub(crate) fn write_archive_with_retained_metadata(
     entries: &[FileEntry<'_>],
-    extended_times: &[Option<&[u8]>],
+    metadata: &[RetainedMemberMetadata<'_>],
     options: WriterOptions,
     coding: MemberCoding,
     archive_comment: Option<&[u8]>,
     progress: Option<&dyn WriteProgress>,
     header_password: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
-    if entries.len() != extended_times.len() {
+    if entries.len() != metadata.len() {
         return Err(Error::InvalidArgument(
-            "extended timestamp count does not match members",
+            "retained metadata count does not match members",
         ));
     }
     let mut members: Vec<_> = entries.iter().map(Member::from_file).collect();
-    for (member, raw) in members.iter_mut().zip(extended_times) {
-        if let Some(raw) = raw {
+    for (member, metadata) in members.iter_mut().zip(metadata) {
+        if let Some(raw) = metadata.extended_times {
             if !matches!(
                 options.target,
                 ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
@@ -117,7 +123,20 @@ pub(crate) fn write_archive_with_extended_times(
             }
             crate::file_times::validate_legacy_extended_times(raw)?;
         }
-        member.extended_times = *raw;
+        member.extended_times = metadata.extended_times;
+        member.is_directory = metadata.is_directory;
+        member.is_symlink = metadata.is_symlink;
+        if member.is_directory
+            && (member.unpacked_size()? != 0
+                || !matches!(
+                    options.target,
+                    ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
+                ))
+        {
+            return Err(Error::InvalidArgument(
+                "legacy directories require empty RAR2.9–4.x entries",
+            ));
+        }
     }
     let mut out = Vec::new();
     write_archive_to(
@@ -386,7 +405,9 @@ fn write_members_to(
             // payload without advancing their decoder. Counting one as a
             // member left the next one flagged as continuing a chain that had
             // been broken by a stored member two places back.
-            if encoded.method == 0x30 {
+            if member.is_directory {
+                // Directory headers do not participate in the solid stream.
+            } else if encoded.method == 0x30 {
                 solid_run_has_member = false;
             } else if encoded.unpacked_size != 0 {
                 solid_run_has_member = true;
@@ -890,6 +911,8 @@ struct Member<'a> {
     password: Option<&'a [u8]>,
     file_comment: Option<&'a [u8]>,
     extended_times: Option<&'a [u8]>,
+    is_directory: bool,
+    is_symlink: bool,
 }
 
 impl<'a> Member<'a> {
@@ -903,6 +926,8 @@ impl<'a> Member<'a> {
             password: entry.password,
             file_comment: entry.file_comment,
             extended_times: None,
+            is_directory: false,
+            is_symlink: false,
         }
     }
 
@@ -916,6 +941,8 @@ impl<'a> Member<'a> {
             password: entry.password,
             file_comment: entry.file_comment,
             extended_times: None,
+            is_directory: false,
+            is_symlink: false,
         }
     }
 
@@ -929,6 +956,8 @@ impl<'a> Member<'a> {
             password: entry.password.as_deref(),
             file_comment: entry.file_comment.as_deref(),
             extended_times: None,
+            is_directory: false,
+            is_symlink: false,
         }
     }
 
@@ -981,11 +1010,30 @@ fn encode_member<'a>(
 ) -> Result<EncodedMember<'a>> {
     let unpacked_size = member.unpacked_size()?;
     validate_member(member.name, unpacked_size)?;
+    if member.is_directory {
+        return Ok(EncodedMember {
+            payload: MemberPayload::Packed(Vec::new()),
+            method: 0x30,
+            unpacked_size: 0,
+            file_crc: 0,
+        });
+    }
     let _permit = resources.acquire_serialising(member_workspace(
         options,
         unpacked_size as u64,
         coding.compresses(),
     ));
+
+    // Legacy link targets must not become dependencies of later solid data:
+    // reference readers handle links separately from the solid unpacker.
+    let coding = if member.is_symlink {
+        if options.features.solid && coding.compresses() {
+            *solid_encoder = SolidEncoder::for_target(options, true)?;
+        }
+        &MemberCoding::Stored
+    } else {
+        coding
+    };
 
     // A stored member never needs to be resident: checksum it from its source
     // and let the writer copy it straight through.
@@ -1068,7 +1116,11 @@ fn write_member(
             host_os: member.host_os,
             target,
             method: encoded.method,
-            dictionary_flags: dictionary_flags_for_options(options)?,
+            dictionary_flags: if member.is_directory {
+                FHD_DIRECTORY_MASK
+            } else {
+                dictionary_flags_for_options(options)?
+            },
             flags,
             salt,
             extra: &extra,

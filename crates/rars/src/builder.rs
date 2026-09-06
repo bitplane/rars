@@ -351,18 +351,24 @@ impl Builder {
         })
     }
 
-    /// Queue an explicit RAR5/7 directory, including an empty one.
+    /// Queue an explicit RAR2.9–4.x or RAR5/7 directory, including an empty one.
     /// `mode` supplies Unix permission bits; otherwise DOS directory flags are used.
-    /// Legacy directory output is not yet supported by this builder.
+    /// Legacy timestamps use raw DOS values; legacy volume output is unsupported.
     pub fn add_directory(
         &mut self,
         name: Vec<u8>,
         mtime: Option<u32>,
         mode: Option<u32>,
     ) -> Result<()> {
-        if self.format.family() != crate::ArchiveFamily::Rar50Plus {
+        let legacy = matches!(
+            self.format,
+            ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
+        );
+        if (!legacy && self.format.family() != ArchiveFamily::Rar50Plus)
+            || (legacy && self.volume_size.is_some())
+        {
             return Err(Error::InvalidArgument(
-                "explicit directory entries require RAR5/7 output",
+                "explicit directories require RAR5/7 or single-archive RAR2.9–4.x output",
             ));
         }
         self.push(BuilderEntry {
@@ -384,9 +390,10 @@ impl Builder {
         })
     }
 
-    /// Queue a RAR5/7 Unix symbolic link without following its target.
+    /// Queue a RAR2.9–4.x or RAR5/7 Unix symbolic link without following its target.
     /// Name and target use archive wire bytes. Relative targets remain unchanged
     /// through renames; the directory flag describes the target, not this entry.
+    /// Legacy targets use native bytes and cannot carry a target-directory flag.
     pub fn add_unix_symlink(
         &mut self,
         name: Vec<u8>,
@@ -395,6 +402,24 @@ impl Builder {
         mtime: Option<u32>,
         mode: Option<u32>,
     ) -> Result<()> {
+        if matches!(
+            self.format,
+            ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
+        ) {
+            if self.volume_size.is_some()
+                || target_is_directory
+                || target.is_empty()
+                || target.contains(&0)
+            {
+                return Err(Error::InvalidArgument("legacy symbolic links require single-archive output, a nonempty native target without NUL and no target-directory flag"));
+            }
+            return self.add_bytes(
+                name,
+                target,
+                mtime,
+                Some(0o120000 | (mode.unwrap_or(0o777) & 0o7777)),
+            );
+        }
         let link = rar50::FileRedirection {
             redirection_type: 1,
             flags: u64::from(target_is_directory),
@@ -903,6 +928,9 @@ impl Builder {
                 "legacy per-entry encryption is unsupported in volume output",
             ));
         }
+        if self.format.family() == ArchiveFamily::Rar15To40 && self.entries.iter().any(|entry| entry.is_directory || matches!(entry.attributes, EntryAttributes::Unix(mode) if mode & 0o170000 == 0o120000)) {
+            return Err(Error::InvalidArgument("legacy directories and symbolic links are unsupported in volume output"));
+        }
         let volume_size = self
             .volume_size
             .ok_or(Error::InvalidArgument("volume_size is required"))?;
@@ -1151,14 +1179,18 @@ impl Builder {
                 file_comment: entry.file_comment.as_deref(),
             })
             .collect();
-        let extended_times: Vec<_> = self
+        let metadata: Vec<_> = self
             .entries
             .iter()
-            .map(|entry| entry.legacy_extended_times.as_deref())
+            .map(|entry| rar15_40::RetainedMemberMetadata {
+                extended_times: entry.legacy_extended_times.as_deref(),
+                is_directory: entry.is_directory,
+                is_symlink: matches!(entry.attributes, EntryAttributes::Unix(mode) if mode & 0o170000 == 0o120000),
+            })
             .collect();
-        rar15_40::write_archive_with_extended_times(
+        rar15_40::write_archive_with_retained_metadata(
             &entries,
-            &extended_times,
+            &metadata,
             self.rar15_options(),
             if self.store {
                 crate::write_plan::MemberCoding::Stored
@@ -1377,6 +1409,50 @@ fn unix_mode(_metadata: &fs::Metadata) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_directory_metadata_and_link_payloads_survive_solid_output() {
+        let mut builder = Builder::new(ArchiveVersion::Rar29).solid(true);
+        builder
+            .add_bytes(b"file".to_vec(), b"payload".repeat(100), Some(0), None)
+            .unwrap();
+        builder
+            .add_directory(b"directory".to_vec(), Some(0), Some(0o2750))
+            .unwrap();
+        builder
+            .set_file_comment(b"directory", Some(b"comment".to_vec()))
+            .unwrap();
+        builder
+            .set_legacy_extended_times(b"directory", Some(vec![0, 0xb0, 1, 2, 3]))
+            .unwrap();
+        builder
+            .add_unix_symlink(b"link".to_vec(), b"file".to_vec(), false, Some(0), None)
+            .unwrap();
+        builder
+            .add_bytes(b"last".to_vec(), b"payload".repeat(100), Some(0), None)
+            .unwrap();
+        let archive = crate::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        assert!(archive.rewrite_preservation_issues().is_empty());
+        let files: Vec<_> = archive.as_rar15_40().unwrap().files().collect();
+        assert!(files[1].is_directory());
+        assert_eq!(files[1].attr, 0o042750);
+        assert_eq!(files[1].pack_size, 0);
+        assert_eq!(files[1].ext_time, [0, 0xb0, 1, 2, 3]);
+        assert_eq!(
+            archive.member_comment_at(1, None).unwrap(),
+            Some(b"comment".to_vec())
+        );
+        assert!(files[2].is_stored());
+        assert_eq!(
+            archive.legacy_symlink_target_at(2, None).unwrap(),
+            Some(b"file".to_vec())
+        );
+        assert_eq!(
+            archive.read_member(b"last", None).unwrap().unwrap(),
+            b"payload".repeat(100)
+        );
+        assert!(builder.volume_size(Some(128)).build_volumes(None).is_err());
+    }
 
     #[test]
     fn legacy_comments_coexist_with_salt_and_extended_times() {

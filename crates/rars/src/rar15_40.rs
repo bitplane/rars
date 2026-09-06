@@ -24,7 +24,7 @@ pub use crate::streaming::{EntrySource, WriterResources};
 pub use crate::write_plan::MemberCoding;
 pub use extract::extract_volumes_to;
 use extract::{DecoderSession, DecryptingReader};
-pub(crate) use write::write_archive_with_extended_times;
+pub(crate) use write::{write_archive_with_retained_metadata, RetainedMemberMetadata};
 pub use write::{
     write_compressed_archive, write_compressed_archive_with_comment,
     write_compressed_archive_with_comment_and_progress, write_compressed_volumes,
@@ -1396,8 +1396,15 @@ impl Archive {
                     issues.push(format!("{label}: embedded file comments with RAR3 archive comments or encrypted headers are unsupported"));
                 }
             }
-            if file.is_directory() {
-                issues.push(format!("{label}: legacy directory metadata"));
+            if file.is_directory()
+                && (file.pack_size != 0
+                    || file.unp_size != 0
+                    || file.method != 0x30
+                    || file.is_solid())
+            {
+                issues.push(format!(
+                    "{label}: unsupported legacy directory payload or compression"
+                ));
             }
             if file.block.flags & FHD_UNICODE != 0 {
                 issues.push(format!("{label}: legacy Unicode filename encoding"));

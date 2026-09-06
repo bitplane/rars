@@ -40,7 +40,7 @@ the separate password argument.
 | Timestamps | Modification, creation and access times retained, including legacy odd seconds/fractions and complete RAR5 Unix/FILETIME values | Preserve supported timestamp kinds using the established local-zone interpretation for legacy DOS times |
 | Attributes and host OS | Unix permission/special bits and DOS file flags retained using source host rules; unknown hosts use default DOS archive attributes | Preserve supported attributes with their source meaning; reject unsupported host semantics |
 | Archive comment | Copied as decoded bytes; preservation retains its encryption | Preserve comment content |
-| Links and special entries | RAR5 Unix/Windows symbolic links, junctions, hard links and file-copy records retained; legacy Unix links converted to RAR5; other special entries rejected | Preserve supported types; reject unsupported preservation |
+| Links and special entries | RAR5 Unix/Windows symbolic links, junctions, hard links and file-copy records retained; legacy Unix links retained natively or converted to RAR5; other special entries rejected | Preserve supported types; reject unsupported preservation |
 | File comments | Decoded comments copied, including explicit empty comments; supported RAR5 CMT records pass preflight | Preserve supported comment content |
 | Other metadata | Supported archive name/creation time and lock flag retained in preservation; indexes regenerated | Preserve supported records; reject unsupported preservation |
 | Archive format | Conversion writes RAR5; preservation selects a compatible supported legacy or RAR5/7 writer | Preserve supported format semantics; exact creating release may be unknowable |
@@ -78,22 +78,23 @@ time. Malformed legacy extended records and legacy archival time (which has no
 supported RAR5 counterpart) are rejected during conversion.
 
 `RarBuilder.add_directory(arcname, mtime=None, mode=None)` adds an explicit
-directory to RAR5/7 output. It also allows empty directories without an input
-archive. `mode` supplies Unix permissions; the default uses DOS directory flags.
+directory to single-archive RAR2.9–4.x or RAR5/7 output. It also allows empty
+directories without an input archive. `mode` supplies Unix permissions; the default uses DOS directory flags.
 Recursive `add(path)` still only queues files; explicit directory creation does
 not change that existing traversal policy.
 
 `RarBuilder.add_unix_symlink(arcname, target, *, target_is_directory=False,
-mtime=None, mode=None)` queues a RAR5/7 Unix symbolic link. The target is stored
-as metadata without being followed, so dangling links are supported. `mode`
+mtime=None, mode=None)` queues a Unix symbolic link for RAR2.9–4.x or RAR5/7.
+The target is retained without being followed, so dangling links are supported. `mode`
 defaults to `0o777`; link type bits are retained separately from permissions.
 `RarFile.readlink(member)` returns the raw target bytes of a supported RAR5
 redirection or legacy Unix symbolic link. Legacy link payloads are decoded and
 integrity-checked without following the target. Conversion maps legacy Unix
 member names and targets into the RAR5 Unix byte encoding without replacement;
-it does not guess a DOS code page. Legacy link preservation remains unsupported.
-Targets use the [RAR5 wire encoding](https://www.rarlab.com/technote.htm), including
-its Unix byte mapping, and must be nonempty and contain no NUL. Relative targets
+it does not guess a DOS code page. Native preservation keeps the original legacy
+target bytes. RAR5/7 targets use the [RAR5 wire encoding](https://www.rarlab.com/technote.htm),
+including its Unix byte mapping; legacy targets use native bytes. Targets must be
+nonempty and contain no NUL. Relative targets
 are retained verbatim: renaming a link or its target does not retarget the link.
 Hard-link and file-copy targets follow member renames. Writing rejects missing,
 forward or size-inconsistent archive targets, including targets removed by edits.
@@ -120,7 +121,7 @@ header encryption is required, without claiming to reproduce the creating releas
 File data is recompressed.
 
 Specific preflight errors currently reject unsupported encryption settings,
-malformed extended timestamps, unsupported comment forms, directories, links, legacy
+malformed extended timestamps, unsupported comment forms, unsupported special entries, legacy
 Unicode filename records,
 unsupported host metadata, recovery and other service records. Unknown header
 flags, extra header bytes, unsupported end headers and trailing bytes are also
@@ -128,6 +129,18 @@ rejected. RAR1.x/2.0 preservation and empty legacy output remain unsupported;
 removing the final member fails writing without replacing the destination.
 Use explicit `preserve=False` conversion when these properties need conversion
 rather than retention. Legacy writers materialize retained payloads in memory.
+
+Native directories retain explicit entries, attributes and base/extended timestamps,
+including empty directories. Their headers do not advance or reset solid compression.
+Unix symbolic links retain their native target bytes, attributes, comments and times
+without following the target; dangling links remain valid. Targets must be nonempty
+and contain no NUL. Renaming a link or another member leaves symbolic targets unchanged.
+Legacy link payloads are stored, restarting the solid stream before later file data
+for reference-reader compatibility. Legacy link/directory volume output is rejected,
+as are directories with payload data, unsupported compression or solid dependencies.
+The legacy format has no separate symbolic-link target-directory flag; requesting
+that flag through `add_unix_symlink` is rejected for legacy output. Other special
+entry types and legacy Unicode filename records remain unsupported.
 
 The input password is required for retained data or header encryption and is reused
 for encrypted output. Plaintext members stay plaintext. Removing encrypted members

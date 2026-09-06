@@ -824,7 +824,11 @@ impl RarBuilder {
                     .inner
                     .add_unix_symlink(
                         output_name.clone(),
-                        rars_rs::filename::encode_rar50(&target).into_owned(),
+                        if legacy_preservation {
+                            target
+                        } else {
+                            rars_rs::filename::encode_rar50(&target).into_owned()
+                        },
                         false,
                         mtime,
                         mode,
