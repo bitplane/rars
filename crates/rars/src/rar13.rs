@@ -256,6 +256,47 @@ impl MainHeader {
     }
 }
 
+// Inspect only the fixed prefix before any name/extra allocation or full read.
+fn admit_header(
+    prefix: &[u8],
+    remaining: u64,
+    main: bool,
+    budget: &mut crate::parse_budget::ParseBudget,
+    offset: usize,
+) -> Result<()> {
+    if !budget.is_limited() {
+        return Ok(());
+    }
+    let base = if main {
+        MAIN_HEAD_SIZE as usize
+    } else {
+        FILE_HEAD_BASE_SIZE
+    };
+    if prefix.len() < base {
+        return Err(Error::TooShort);
+    }
+    if main && !prefix.starts_with(RAR13_SIGNATURE) {
+        return Err(Error::UnsupportedSignature);
+    }
+    let size = read_u16(prefix, if main { 4 } else { 10 })? as usize;
+    let minimum = if main {
+        base
+    } else {
+        base + prefix[19] as usize
+    };
+    if size < minimum {
+        return Err(Error::InvalidHeader(if main {
+            "RAR 1.3 main header is shorter than 7 bytes"
+        } else {
+            "RAR 1.3 file header is shorter than its name"
+        }));
+    }
+    if size as u64 > remaining {
+        return Err(Error::TooShort);
+    }
+    budget.admit(size, offset)
+}
+
 impl FileHeader {
     fn parse(input: &[u8]) -> Result<(Self, Vec<u8>, Vec<u8>, usize)> {
         if input.len() < FILE_HEAD_BASE_SIZE {
@@ -306,15 +347,36 @@ impl FileHeader {
 
 impl Archive {
     pub fn parse(input: &[u8]) -> Result<Self> {
+        Self::parse_with_options(input, crate::ArchiveReadOptions::default())
+    }
+
+    pub fn parse_with_options(
+        input: &[u8],
+        options: crate::ArchiveReadOptions<'_>,
+    ) -> Result<Self> {
         let data: Arc<[u8]> = Arc::from(input.to_vec().into_boxed_slice());
-        Self::parse_shared(data)
+        Self::parse_shared(data, options)
     }
 
     pub fn parse_owned(input: Vec<u8>) -> Result<Self> {
-        Self::parse_shared(Arc::from(input.into_boxed_slice()))
+        Self::parse_owned_with_options(input, crate::ArchiveReadOptions::default())
+    }
+
+    pub fn parse_owned_with_options(
+        input: Vec<u8>,
+        options: crate::ArchiveReadOptions<'_>,
+    ) -> Result<Self> {
+        Self::parse_shared(Arc::from(input.into_boxed_slice()), options)
     }
 
     pub fn parse_path(path: impl AsRef<Path>) -> Result<Self> {
+        Self::parse_path_with_options(path, crate::ArchiveReadOptions::default())
+    }
+
+    pub fn parse_path_with_options(
+        path: impl AsRef<Path>,
+        options: crate::ArchiveReadOptions<'_>,
+    ) -> Result<Self> {
         let path = Arc::new(path.as_ref().to_path_buf());
         let mut file = File::open(path.as_ref())?;
         let len = file.metadata()?.len();
@@ -325,12 +387,24 @@ impl Archive {
         if sig.family != ArchiveFamily::Rar13 {
             return Err(Error::UnsupportedSignature);
         }
-        Self::parse_seekable(file, len, sig.offset, ArchiveSource::File(path))
+        Self::parse_seekable(file, len, sig.offset, ArchiveSource::File(path), options)
     }
 
     pub fn parse_path_with_signature(
         path: impl AsRef<Path>,
         signature: ArchiveSignature,
+    ) -> Result<Self> {
+        Self::parse_path_with_signature_and_options(
+            path,
+            signature,
+            crate::ArchiveReadOptions::default(),
+        )
+    }
+
+    pub fn parse_path_with_signature_and_options(
+        path: impl AsRef<Path>,
+        signature: ArchiveSignature,
+        options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Self> {
         if signature.family != ArchiveFamily::Rar13 {
             return Err(Error::UnsupportedSignature);
@@ -338,16 +412,24 @@ impl Archive {
         let path = Arc::new(path.as_ref().to_path_buf());
         let file = File::open(path.as_ref())?;
         let len = file.metadata()?.len();
-        Self::parse_seekable(file, len, signature.offset, ArchiveSource::File(path))
+        Self::parse_seekable(
+            file,
+            len,
+            signature.offset,
+            ArchiveSource::File(path),
+            options,
+        )
     }
 
-    fn parse_shared(input: Arc<[u8]>) -> Result<Self> {
+    fn parse_shared(input: Arc<[u8]>, options: crate::ArchiveReadOptions<'_>) -> Result<Self> {
         let sig = find_archive_start(&input, SFX_SCAN_LIMIT).ok_or(Error::UnsupportedSignature)?;
         if sig.family != ArchiveFamily::Rar13 {
             return Err(Error::UnsupportedSignature);
         }
 
         let archive = &input[sig.offset..];
+        let mut budget = crate::parse_budget::ParseBudget::new(options);
+        admit_header(archive, archive.len() as u64, true, &mut budget, 0)?;
         let main = MainHeader::parse(archive)?;
         let mut pos = main.head_size as usize;
         let mut entries = Vec::new();
@@ -357,6 +439,13 @@ impl Archive {
                 break;
             }
 
+            admit_header(
+                &archive[pos..],
+                (archive.len() - pos) as u64,
+                false,
+                &mut budget,
+                pos,
+            )?;
             let (header, name, extra, consumed) = FileHeader::parse(&archive[pos..])?;
             let data_start = pos + consumed;
             let data_end =
@@ -387,13 +476,24 @@ impl Archive {
     }
 
     fn parse_seekable(
-        mut file: File,
+        mut file: impl Read + std::io::Seek,
         file_len: u64,
         sfx_offset: usize,
         source: ArchiveSource,
+        options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Self> {
+        let mut budget = crate::parse_budget::ParseBudget::new(options);
         let main_prefix = read_exact_at(&mut file, sfx_offset, MAIN_HEAD_SIZE as usize)?;
         let head_size = read_u16(&main_prefix, 4)? as usize;
+        admit_header(
+            &main_prefix,
+            file_len
+                .checked_sub(sfx_offset as u64)
+                .ok_or(Error::TooShort)?,
+            true,
+            &mut budget,
+            0,
+        )?;
         let main_bytes = read_exact_at(&mut file, sfx_offset, head_size)?;
         let main = MainHeader::parse(&main_bytes)?;
         let mut pos = main.head_size as usize;
@@ -402,6 +502,15 @@ impl Archive {
         while (sfx_offset + pos) as u64 + FILE_HEAD_BASE_SIZE as u64 <= file_len {
             let header_prefix = read_exact_at(&mut file, sfx_offset + pos, FILE_HEAD_BASE_SIZE)?;
             let head_size = read_u16(&header_prefix, 10)? as usize;
+            admit_header(
+                &header_prefix,
+                file_len
+                    .checked_sub((sfx_offset + pos) as u64)
+                    .ok_or(Error::TooShort)?,
+                false,
+                &mut budget,
+                pos,
+            )?;
             let header_bytes = read_exact_at(&mut file, sfx_offset + pos, head_size)?;
             let (header, name, extra, consumed) = FileHeader::parse(&header_bytes)?;
             let data_start = pos + consumed;
@@ -2016,6 +2125,26 @@ pub fn file_checksum(input: &[u8]) -> u16 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn header_budget_refuses_full_main_read_after_prefix() {
+        let mut prefix = super::RAR13_SIGNATURE.to_vec();
+        prefix.extend_from_slice(&64u16.to_le_bytes());
+        prefix.push(0);
+        let mut reader = crate::parse_budget::PrefixReader::new(prefix);
+        let e = super::Archive::parse_seekable(
+            &mut reader,
+            128,
+            0,
+            super::ArchiveSource::Memory(std::sync::Arc::new([])),
+            crate::ArchiveReadOptions::new().with_max_header_bytes(63),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            e.root_cause(),
+            crate::Error::HeaderBytesLimitExceeded { required: 64, .. }
+        ));
+        assert_eq!(reader.reads, [7]);
+    }
     use super::*;
     use crate::codec::rar13::{find_long_lz, LongLz};
     use std::cell::RefCell;

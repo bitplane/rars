@@ -1,8 +1,11 @@
 use crate::{Error, Result};
-use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 
-pub(crate) fn read_exact_at(file: &mut File, offset: usize, len: usize) -> Result<Vec<u8>> {
+pub(crate) fn read_exact_at(
+    file: &mut (impl Read + Seek),
+    offset: usize,
+    len: usize,
+) -> Result<Vec<u8>> {
     file.seek(SeekFrom::Start(offset as u64))?;
     let mut data = vec![0; len];
     file.read_exact(&mut data)?;

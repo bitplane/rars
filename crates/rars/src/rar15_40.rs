@@ -713,6 +713,8 @@ impl FileHeader {
             | Error::UnsupportedFeature { .. }
             | Error::UnsupportedWriterOption { .. }
             | Error::MemberOutputLimitExceeded { .. }
+            | Error::HeaderCountLimitExceeded { .. }
+            | Error::HeaderBytesLimitExceeded { .. }
             | Error::TotalOutputLimitExceeded { .. }
             | Error::Rar50DictionaryLimitExceeded { .. }
             | Error::Rar50BufferedDecodeLimitExceeded { .. }
@@ -978,14 +980,14 @@ impl Archive {
         options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Self> {
         let data: Arc<[u8]> = Arc::from(input.to_vec().into_boxed_slice());
-        Self::parse_shared(data, options.password)
+        Self::parse_shared(data, options)
     }
 
     pub fn parse_owned_with_options(
         input: Vec<u8>,
         options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Self> {
-        Self::parse_shared(Arc::from(input.into_boxed_slice()), options.password)
+        Self::parse_shared(Arc::from(input.into_boxed_slice()), options)
     }
 
     pub fn parse_with_password(input: &[u8], password: Option<&[u8]>) -> Result<Self> {
@@ -1006,16 +1008,19 @@ impl Archive {
         Self::parse_path_with_options(path, crate::ArchiveReadOptions::default())
     }
 
-    pub fn parse_path_with_options(
-        path: impl AsRef<Path>,
-        options: crate::ArchiveReadOptions<'_>,
-    ) -> Result<Self> {
-        Self::parse_path_with_password(path, options.password)
-    }
-
     pub fn parse_path_with_password(
         path: impl AsRef<Path>,
         password: Option<&[u8]>,
+    ) -> Result<Self> {
+        Self::parse_path_with_options(
+            path,
+            crate::ArchiveReadOptions::with_optional_password(password),
+        )
+    }
+
+    pub fn parse_path_with_options(
+        path: impl AsRef<Path>,
+        options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Self> {
         let path = Arc::new(path.as_ref().to_path_buf());
         let mut file = File::open(path.as_ref())?;
@@ -1027,21 +1032,25 @@ impl Archive {
         if sig.family != ArchiveFamily::Rar15To40 {
             return Err(Error::UnsupportedSignature);
         }
-        Self::parse_seekable(file, len, sig.offset, ArchiveSource::File(path), password)
-    }
-
-    pub fn parse_path_with_signature(
-        path: impl AsRef<Path>,
-        signature: ArchiveSignature,
-        options: crate::ArchiveReadOptions<'_>,
-    ) -> Result<Self> {
-        Self::parse_path_with_signature_and_password(path, signature, options.password)
+        Self::parse_seekable(file, len, sig.offset, ArchiveSource::File(path), options)
     }
 
     pub fn parse_path_with_signature_and_password(
         path: impl AsRef<Path>,
         signature: ArchiveSignature,
         password: Option<&[u8]>,
+    ) -> Result<Self> {
+        Self::parse_path_with_signature(
+            path,
+            signature,
+            crate::ArchiveReadOptions::with_optional_password(password),
+        )
+    }
+
+    pub fn parse_path_with_signature(
+        path: impl AsRef<Path>,
+        signature: ArchiveSignature,
+        options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Self> {
         if signature.family != ArchiveFamily::Rar15To40 {
             return Err(Error::UnsupportedSignature);
@@ -1054,16 +1063,18 @@ impl Archive {
             len,
             signature.offset,
             ArchiveSource::File(path),
-            password,
+            options,
         )
     }
 
-    fn parse_shared(input: Arc<[u8]>, password: Option<&[u8]>) -> Result<Self> {
+    fn parse_shared(input: Arc<[u8]>, options: crate::ArchiveReadOptions<'_>) -> Result<Self> {
         let sig = find_archive_start(&input, SFX_SCAN_LIMIT).ok_or(Error::UnsupportedSignature)?;
         if sig.family != ArchiveFamily::Rar15To40 {
             return Err(Error::UnsupportedSignature);
         }
 
+        let password = options.password;
+        let mut budget = crate::parse_budget::ParseBudget::new(options);
         let archive = &input[sig.offset..];
         if !archive.starts_with(RAR15_SIGNATURE) {
             return Err(Error::UnsupportedSignature);
@@ -1074,6 +1085,7 @@ impl Archive {
             return Err(Error::InvalidHeader("RAR 1.5 marker block is invalid"));
         }
 
+        admit_plain_header(archive, marker.head_size as usize, &mut budget)?;
         let main_block = parse_block_header(archive, marker.head_size as usize)?;
         if main_block.head_type != MAIN_HEAD {
             return Err(Error::InvalidHeader("RAR 1.5 main header is missing"));
@@ -1101,9 +1113,11 @@ impl Archive {
                     pos,
                     password,
                     &mut encrypted_header_ciphers,
+                    &mut budget,
                 )?;
                 (encrypted.block, encrypted.header, encrypted.total_size)
             } else {
+                admit_plain_header(archive, pos, &mut budget)?;
                 let block = parse_block_header(archive, pos)?;
                 let total = block_total_size(&block)?;
                 let header = archive[pos..pos + block.head_size as usize].to_vec();
@@ -1172,15 +1186,22 @@ impl Archive {
         file_len: u64,
         sfx_offset: usize,
         source: ArchiveSource,
-        password: Option<&[u8]>,
+        options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Self> {
-        let marker = read_block_header_at(&mut file, file_len, sfx_offset, 0)?;
+        let password = options.password;
+        let mut budget = crate::parse_budget::ParseBudget::new(options);
+        let marker = read_block_header_at(&mut file, file_len, sfx_offset, 0, &mut budget)?;
         if marker.head_type != MARK_HEAD || marker.head_size != RAR15_SIGNATURE.len() as u16 {
             return Err(Error::InvalidHeader("RAR 1.5 marker block is invalid"));
         }
 
-        let main_block =
-            read_block_header_at(&mut file, file_len, sfx_offset, marker.head_size as usize)?;
+        let main_block = read_block_header_at(
+            &mut file,
+            file_len,
+            sfx_offset,
+            marker.head_size as usize,
+            &mut budget,
+        )?;
         if main_block.head_type != MAIN_HEAD {
             return Err(Error::InvalidHeader("RAR 1.5 main header is missing"));
         }
@@ -1209,10 +1230,12 @@ impl Archive {
                     pos,
                     password,
                     &mut encrypted_header_ciphers,
+                    &mut budget,
                 )?;
                 (encrypted.block, encrypted.header, encrypted.total_size)
             } else {
-                let block = read_block_header_at(&mut file, file_len, sfx_offset, pos)?;
+                let block =
+                    read_block_header_at(&mut file, file_len, sfx_offset, pos, &mut budget)?;
                 let total = block_total_size(&block)?;
                 let header = read_exact_at(&mut file, sfx_offset + pos, block.head_size as usize)?;
                 (block, header, total)
@@ -1990,11 +2013,13 @@ fn decrypt_encrypted_header_at(
     offset: usize,
     password: &[u8],
     cipher_cache: &mut EncryptedHeaderCipherCache,
+    budget: &mut crate::parse_budget::ParseBudget,
 ) -> Result<EncryptedHeader> {
     let salt = read_header_salt(archive, offset)?;
     let first_ciphertext = archive
         .get(offset + 8..offset + 24)
         .ok_or(Error::TooShort)?;
+    budget.check_count(offset)?;
     let mut cipher = cipher_cache.cipher(password, salt)?;
     let mut first_block = [0u8; 16];
     first_block.copy_from_slice(first_ciphertext);
@@ -2012,6 +2037,10 @@ fn decrypt_encrypted_header_at(
     let encrypted_end = encrypted_start
         .checked_add(encrypted_header_size)
         .ok_or(Error::InvalidHeader("RAR 1.5 block size overflows usize"))?;
+    if encrypted_end > archive.len() {
+        return Err(Error::TooShort);
+    }
+    budget.admit(head_size, offset)?;
     let encrypted_rest = archive
         .get(offset + 24..encrypted_end)
         .ok_or(Error::TooShort)?;
@@ -2039,12 +2068,13 @@ fn decrypt_encrypted_header_at(
 }
 
 fn read_encrypted_header_at(
-    file: &mut File,
+    file: &mut (impl Read + std::io::Seek),
     file_len: u64,
     archive_offset: usize,
     offset: usize,
     password: &[u8],
     cipher_cache: &mut EncryptedHeaderCipherCache,
+    budget: &mut crate::parse_budget::ParseBudget,
 ) -> Result<EncryptedHeader> {
     let absolute = archive_offset
         .checked_add(offset)
@@ -2054,6 +2084,7 @@ fn read_encrypted_header_at(
     }
     let first = read_exact_at(file, absolute, 24)?;
     let salt = read_header_salt(&first, 0)?;
+    budget.check_count(offset)?;
     let mut cipher = cipher_cache.cipher(password, salt)?;
     let mut first_block = [0u8; 16];
     first_block.copy_from_slice(&first[8..24]);
@@ -2071,6 +2102,7 @@ fn read_encrypted_header_at(
     if encrypted_start as u64 + encrypted_header_size as u64 > file_len {
         return Err(Error::TooShort);
     }
+    budget.admit(head_size, offset)?;
     let encrypted_rest = read_exact_at(file, encrypted_start + 16, encrypted_header_size - 16)?;
     let mut header = Vec::with_capacity(encrypted_header_size);
     header.extend_from_slice(&first_block);
@@ -2307,11 +2339,34 @@ fn decode_file_name(raw: &[u8], flags: u16) -> Vec<u8> {
         .into_bytes()
 }
 
+fn admit_plain_header(
+    input: &[u8],
+    offset: usize,
+    budget: &mut crate::parse_budget::ParseBudget,
+) -> Result<()> {
+    if !budget.is_limited() {
+        return Ok(());
+    }
+    let prefix = input.get(offset..).ok_or(Error::TooShort)?;
+    if prefix.len() < 7 {
+        return Err(Error::TooShort);
+    }
+    let size = read_u16(prefix, 5)? as usize;
+    if size < 7 {
+        return Err(Error::InvalidHeader("RAR 1.5 block header is too short"));
+    }
+    if size > prefix.len() {
+        return Err(Error::TooShort);
+    }
+    budget.admit(size, offset)
+}
+
 fn read_block_header_at(
-    file: &mut File,
+    file: &mut (impl Read + std::io::Seek),
     file_len: u64,
     archive_offset: usize,
     offset: usize,
+    budget: &mut crate::parse_budget::ParseBudget,
 ) -> Result<BlockHeader> {
     let absolute = archive_offset
         .checked_add(offset)
@@ -2326,6 +2381,9 @@ fn read_block_header_at(
     }
     if absolute as u64 + head_size as u64 > file_len {
         return Err(Error::TooShort);
+    }
+    if offset != 0 {
+        budget.admit(head_size, offset)?;
     }
     let header = if head_size == 7 {
         base
@@ -2533,6 +2591,46 @@ fn packed_range(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn header_budget_refuses_full_reads_after_plain_and_encrypted_prefixes() {
+        use crate::parse_budget::{ParseBudget, PrefixReader};
+        let options = crate::ArchiveReadOptions::new().with_max_header_bytes(63);
+        let mut plain = vec![0u8; 16];
+        plain[5] = 64;
+        let mut prefix = vec![0; 7]; // skipped marker bytes
+        prefix.extend_from_slice(&plain[..7]);
+        let mut reader = PrefixReader::new(prefix);
+        let e = super::read_block_header_at(&mut reader, 128, 0, 7, &mut ParseBudget::new(options))
+            .map(|_| ())
+            .expect_err("header budget must refuse");
+        assert!(matches!(
+            e.root_cause(),
+            crate::Error::HeaderBytesLimitExceeded { required: 64, .. }
+        ));
+        assert_eq!(reader.reads, [7]);
+
+        let mut cipher = crate::crypto::rar30::Rar30Cipher::new(b"secret", Some([0; 8])).unwrap();
+        cipher.encrypt_in_place(&mut plain).unwrap();
+        let mut prefix = vec![0; 8];
+        prefix.extend_from_slice(&plain);
+        let mut reader = PrefixReader::new(prefix);
+        let e = super::read_encrypted_header_at(
+            &mut reader,
+            128,
+            0,
+            0,
+            b"secret",
+            &mut super::EncryptedHeaderCipherCache::default(),
+            &mut ParseBudget::new(options),
+        )
+        .map(|_| ())
+        .expect_err("header budget must refuse");
+        assert!(matches!(
+            e.root_cause(),
+            crate::Error::HeaderBytesLimitExceeded { required: 64, .. }
+        ));
+        assert_eq!(reader.reads, [24]);
+    }
     use super::*;
 
     fn test_write_main_header(out: &mut Vec<u8>, flags: u16) {

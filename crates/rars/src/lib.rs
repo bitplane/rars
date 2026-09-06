@@ -28,6 +28,7 @@ mod filter_search;
 mod io_util;
 mod output_limit;
 mod parallel;
+mod parse_budget;
 pub mod rar13;
 pub mod rar15_40;
 pub mod rar50;
@@ -69,6 +70,26 @@ pub use write_progress::{WriteOperation, WriteProgress, WriteProgressEvent};
 pub struct ArchiveReadOptions<'a> {
     /// Password bytes used for encrypted headers or payloads.
     pub password: Option<&'a [u8]>,
+    /// Inclusive top-level header count for one physical archive parse.
+    /// Counts main, encryption, file/directory, service, unknown and end headers;
+    /// standalone signatures/markers and nested records are not separate headers.
+    /// None preserves defaults; zero refuses even an empty archive's main header.
+    /// Each parsing call (including each independently parsed volume) starts fresh.
+    /// Extraction does not apply this policy retroactively.
+    pub max_header_count: Option<u64>,
+    /// Inclusive cumulative plaintext header bytes for one physical archive parse.
+    /// Includes CRC/size fields, names and extras; nested records count once in
+    /// their enclosing header. Excludes payloads, SFX and standalone signatures,
+    /// and encryption salt/IV/padding. RAR1.3's embedded signature counts as part
+    /// of its main header. Encrypted sizes require first-block decryption.
+    ///
+    /// Admission precedes full-header allocation; bounded prefixes and encryption
+    /// framing can consume additional space. This is not a total RAM/CPU limit:
+    /// source copies, metadata overhead and key derivation are outside the quota.
+    /// None preserves defaults; zero refuses the main header. Resets per parse,
+    /// not across a caller's separately parsed volume set. No partial Archive is
+    /// returned on refusal. Existing end-record and tolerant-tail handling stays.
+    pub max_header_bytes: Option<u64>,
     /// Optional RAR 5 whole-member buffered decode limit, including logical
     /// members split across volumes. This does not bound decoder dictionaries.
     ///
@@ -119,6 +140,18 @@ impl<'a> ArchiveReadOptions<'a> {
     /// Creates read options without a password.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Sets the top-level header ceiling for each physical archive parse.
+    pub fn with_max_header_count(mut self, limit: u64) -> Self {
+        self.max_header_count = Some(limit);
+        self
+    }
+
+    /// Sets the cumulative plaintext-header byte ceiling for each parse.
+    pub fn with_max_header_bytes(mut self, limit: u64) -> Self {
+        self.max_header_bytes = Some(limit);
+        self
     }
 
     /// Creates read options with a password.
@@ -837,7 +870,9 @@ impl ArchiveReader {
         let signature =
             find_archive_start(input, SFX_SCAN_LIMIT).ok_or(Error::UnsupportedSignature)?;
         match signature.family {
-            ArchiveFamily::Rar13 => Ok(Archive::Rar13(rar13::Archive::parse(input)?)),
+            ArchiveFamily::Rar13 => Ok(Archive::Rar13(rar13::Archive::parse_with_options(
+                input, options,
+            )?)),
             ArchiveFamily::Rar15To40 => Ok(Archive::Rar15To40(
                 rar15_40::Archive::parse_with_options(input, options)?,
             )),
@@ -855,7 +890,9 @@ impl ArchiveReader {
         let signature =
             find_archive_start(&input, SFX_SCAN_LIMIT).ok_or(Error::UnsupportedSignature)?;
         match signature.family {
-            ArchiveFamily::Rar13 => Ok(Archive::Rar13(rar13::Archive::parse_owned(input)?)),
+            ArchiveFamily::Rar13 => Ok(Archive::Rar13(rar13::Archive::parse_owned_with_options(
+                input, options,
+            )?)),
             ArchiveFamily::Rar15To40 => Ok(Archive::Rar15To40(
                 rar15_40::Archive::parse_owned_with_options(input, options)?,
             )),
@@ -883,9 +920,9 @@ impl ArchiveReader {
         let signature =
             find_archive_start(&scan, SFX_SCAN_LIMIT).ok_or(Error::UnsupportedSignature)?;
         match signature.family {
-            ArchiveFamily::Rar13 => Ok(Archive::Rar13(rar13::Archive::parse_path_with_signature(
-                path, signature,
-            )?)),
+            ArchiveFamily::Rar13 => Ok(Archive::Rar13(
+                rar13::Archive::parse_path_with_signature_and_options(path, signature, options)?,
+            )),
             ArchiveFamily::Rar15To40 => Ok(Archive::Rar15To40(
                 rar15_40::Archive::parse_path_with_signature(path, signature, options)?,
             )),

@@ -112,6 +112,16 @@ pub enum Error {
         limit: u64,
         required: u64,
     },
+    /// Cumulative top-level headers required; diagnostic sums saturate at u64::MAX.
+    HeaderCountLimitExceeded {
+        limit: u64,
+        required: u64,
+    },
+    /// Cumulative plaintext header bytes required, saturated at u64::MAX.
+    HeaderBytesLimitExceeded {
+        limit: u64,
+        required: u64,
+    },
     /// Total logical output refusal. `used` is accepted output before refusal;
     /// `required` is used plus the declared size or offered chunk, saturated at
     /// u64::MAX (a lower bound if the attempted sum cannot be represented).
@@ -212,6 +222,10 @@ impl std::fmt::Display for Error {
             },
             Self::MemberOutputLimitExceeded { limit, required } => write!(f,
                 "member requires {required} output bytes, above the configured limit of {limit} bytes"),
+            Self::HeaderCountLimitExceeded { limit, required } => write!(f,
+                "parsing requires at least {required} headers, above the configured limit of {limit} headers"),
+            Self::HeaderBytesLimitExceeded { limit, required } => write!(f,
+                "parsing requires at least {required} header bytes, above the configured limit of {limit} bytes"),
             Self::TotalOutputLimitExceeded { limit, required, used } => write!(f,
                 "extraction requires at least {required} total output bytes, above the configured limit of {limit} bytes ({used} bytes already accepted)"),
             Self::Rar50DictionaryLimitExceeded { limit, required } => write!(
@@ -367,6 +381,8 @@ impl Error {
             Self::Io(_) | Self::Rar5Recovery(crate::recovery::rar5::Error::Io(_)) => ErrorKind::Io,
             Self::MemoryLimitExceeded { .. }
             | Self::MemberOutputLimitExceeded { .. }
+            | Self::HeaderCountLimitExceeded { .. }
+            | Self::HeaderBytesLimitExceeded { .. }
             | Self::TotalOutputLimitExceeded { .. }
             | Self::Rar50DictionaryLimitExceeded { .. }
             | Self::Rar50BufferedDecodeLimitExceeded { .. }
@@ -498,6 +514,20 @@ mod tests {
             (
                 Error::Codec(crate::codec::Error::Cancelled),
                 ErrorKind::Cancelled,
+            ),
+            (
+                Error::HeaderCountLimitExceeded {
+                    limit: 1,
+                    required: 2,
+                },
+                ErrorKind::ResourceLimit,
+            ),
+            (
+                Error::HeaderBytesLimitExceeded {
+                    limit: 1,
+                    required: 2,
+                },
+                ErrorKind::ResourceLimit,
             ),
             (Error::Cancelled, ErrorKind::Cancelled),
             (Error::EntryNotFound, ErrorKind::EntryNotFound),

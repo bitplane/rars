@@ -44,8 +44,25 @@ fn total_output_error_details(limit: u64, required: u64, used: u64) -> [(&'stati
     ]
 }
 
+fn header_count_error_details(limit: u64, required: u64) -> [(&'static str, String); 2] {
+    [
+        ("limitHeaders", limit.to_string()),
+        ("requiredHeaders", required.to_string()),
+    ]
+}
+
 #[cfg(test)]
 mod error_detail_tests {
+    #[test]
+    fn header_count_details_keep_header_units_and_exact_integer_counts() {
+        assert_eq!(
+            super::header_count_error_details(9_007_199_254_740_993, u64::MAX),
+            [
+                ("limitHeaders", "9007199254740993".to_owned()),
+                ("requiredHeaders", "18446744073709551615".to_owned()),
+            ]
+        );
+    }
     #[test]
     fn total_output_details_preserve_counts_above_javascript_integer_precision() {
         assert_eq!(
@@ -124,10 +141,16 @@ fn js_error(error: rars_rs::Error) -> JsValue {
             }
         }
         rars_rs::Error::MemberOutputLimitExceeded { limit, required }
+        | rars_rs::Error::HeaderBytesLimitExceeded { limit, required }
         | rars_rs::Error::Rar50DictionaryLimitExceeded { limit, required }
         | rars_rs::Error::Rar50BufferedDecodeLimitExceeded { limit, required } => {
             set_error_field(&details, "limitBytes", &limit.to_string().into());
             set_error_field(&details, "requiredBytes", &required.to_string().into());
+        }
+        rars_rs::Error::HeaderCountLimitExceeded { limit, required } => {
+            for (name, value) in header_count_error_details(*limit, *required) {
+                set_error_field(&details, name, &value.into());
+            }
         }
         rars_rs::Error::Io(error) => {
             set_error_field(&details, "ioKind", &format!("{:?}", error.kind).into())
