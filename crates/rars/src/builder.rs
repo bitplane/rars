@@ -499,9 +499,9 @@ impl Builder {
 
     /// Write the archive to `output`.
     ///
-    /// RAR 5 and RAR 7 stream: peak memory is one member plus the dictionary,
-    /// whatever the archive weighs. The legacy families have no streaming
-    /// writer, so they encode into memory first and this is
+    /// RAR 5 and RAR 7 stream using the supplied workspace and spool policy;
+    /// see [`WriterResources`] for its scope and bare-WASM memory limits.
+    /// The legacy families encode into memory first, so this is
     /// [`to_bytes`](Self::to_bytes) followed by a write.
     pub fn write_to(
         &self,

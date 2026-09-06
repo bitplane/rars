@@ -107,7 +107,13 @@ impl SourceFactory for PathSource {
 }
 
 #[derive(Clone, Debug)]
-/// Shared memory and temporary-file policy for streaming writers.
+/// Shared compression-workspace and temporary-file policy for streaming writers.
+///
+/// Native RAR5 writers retain packed payloads on disk and bound active input and
+/// spool handles by compression concurrency, rather than the archive entry count.
+/// The workspace limit is not a total process-RAM or temporary-disk quota. On bare
+/// WebAssembly (`wasm32-unknown-unknown`), spools stay in memory and their retained
+/// payloads are additional to this limit.
 pub struct WriterResources {
     memory_limit: u64,
     temp_dir: Option<PathBuf>,
@@ -129,6 +135,16 @@ impl WriterResources {
         }
     }
 
+    /// Place temporary spools in this existing directory (default: the current
+    /// directory). Use a directory whose contents untrusted users cannot replace:
+    /// idle spools are closed and later reopened by path.
+    ///
+    /// Spools may contain unencrypted compressed data even for encrypted output.
+    /// Files are created exclusively, with owner-only access on Unix (0600 before
+    /// applying the umask); other platforms use inherited directory permissions.
+    /// Dropping a spool closes its handle before attempting removal, including on
+    /// errors and unwind. Removal is best-effort, not secure erasure, and process
+    /// termination can leave files behind. Bare WASM ignores this setting.
     pub fn with_temp_dir(mut self, path: impl Into<PathBuf>) -> Self {
         self.temp_dir = Some(path.into());
         self
@@ -216,6 +232,9 @@ type SpoolStore = File;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 type SpoolStore = Cursor<Vec<u8>>;
 
+/// Owns a temporary payload until drop; parking releases only its handle.
+/// Writes are unbuffered, so parking requires no flush and preserves the cursor.
+/// The file must live until assembly finishes, even when no handle is open.
 pub(crate) struct Spool {
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     path: PathBuf,
@@ -234,12 +253,16 @@ impl Spool {
                 ".rars-spool-{}-{sequence:016x}",
                 std::process::id()
             ));
-            match File::options()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(&path)
+            let mut options = File::options();
+            options.read(true).write(true).create_new(true);
+            #[cfg(unix)]
             {
+                use std::os::unix::fs::OpenOptionsExt;
+                // Encryption happens after compression; the temporary payload
+                // must not inherit the usual world-readable creation mode.
+                options.mode(0o600);
+            }
+            match options.open(&path) {
                 Ok(file) => {
                     return Ok(Self {
                         path,
@@ -374,6 +397,7 @@ impl Seek for Spool {
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 impl Drop for Spool {
     fn drop(&mut self) {
+        self.file = None;
         let _ = std::fs::remove_file(&self.path);
     }
 }
@@ -478,6 +502,39 @@ mod tests {
         spool.copy_to(&mut bytes).unwrap();
         assert_eq!(bytes, b"abXYZf");
         drop(spool);
+        assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[test]
+    fn spool_cleanup_owns_both_active_and_parked_files() {
+        let scratch = crate::scratch::case("spool-cleanup");
+        let resources = WriterResources::default().with_temp_dir(&*scratch);
+        for parked in [false, true] {
+            let mut spool = Spool::create(&resources).unwrap();
+            spool.write_all(b"private compressed payload").unwrap();
+            let path = spool.path.clone();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(&path).unwrap().permissions().mode() & 0o077,
+                    0
+                );
+            }
+            if parked {
+                spool.park();
+            }
+            assert!(path.exists());
+            drop(spool);
+            assert!(!path.exists());
+        }
+        let unwind = std::panic::catch_unwind(|| {
+            let mut spool = Spool::create(&resources).unwrap();
+            spool.write_all(b"unfinished").unwrap();
+            panic!("injected failure");
+        });
+        assert!(unwind.is_err());
         assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
     }
 
