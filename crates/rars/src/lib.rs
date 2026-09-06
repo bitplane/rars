@@ -1981,12 +1981,7 @@ mod tests {
         assert!(!members[0].meta.is_encrypted);
         assert!(matches!(
             members[0].detail,
-            ArchiveMemberDetail::Rar50Plus {
-                compression_info: _,
-                crc32: _,
-                hash: _,
-                ..
-            }
+            ArchiveMemberDetail::Rar50Plus { .. }
         ));
     }
 
