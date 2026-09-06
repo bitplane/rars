@@ -476,10 +476,26 @@ impl Archive {
     }
 
     /// Streams extracted entries to caller-provided writers.
-    pub fn extract_to<F>(&self, password: Option<&[u8]>, mut open: F) -> Result<()>
+    pub fn extract_to<F>(&self, password: Option<&[u8]>, open: F) -> Result<()>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
+        self.extract_to_with_options(
+            crate::ArchiveReadOptions::with_optional_password(password),
+            open,
+        )
+    }
+
+    /// Extracts members with explicit output policy; default wrappers retain their behavior.
+    pub fn extract_to_with_options<F>(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+        mut open: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    {
+        let password = options.password;
         let mut unpack15 = Unpack15::new();
         let mut extracted_count = 0usize;
         for entry in &self.entries {
@@ -494,22 +510,35 @@ impl Archive {
                 extracted_count += 1;
                 continue;
             }
+            crate::output_limit::check(
+                options.max_member_output_bytes,
+                u64::from(entry.header.unp_size),
+                &meta.name,
+            )?;
             let mut writer = open(&meta)?;
-            if entry.is_stored() && !entry.is_encrypted() {
-                entry
-                    .write_stored_to(self, password, &mut writer)
-                    .map_err(|error| entry.entry_error("extracting", error))?;
-            } else {
-                entry
-                    .write_compressed_to(
-                        self,
-                        password,
-                        &mut unpack15,
-                        self.main.is_solid() && extracted_count != 0,
-                        &mut writer,
-                    )
-                    .map_err(|error| entry.entry_error("extracting", error))?;
-            }
+            crate::output_limit::run(
+                options.max_member_output_bytes,
+                &meta.name,
+                &mut writer,
+                |mut writer| {
+                    if entry.is_stored() && !entry.is_encrypted() {
+                        entry
+                            .write_stored_to(self, password, &mut writer)
+                            .map_err(|error| entry.entry_error("extracting", error))?;
+                    } else {
+                        entry
+                            .write_compressed_to(
+                                self,
+                                password,
+                                &mut unpack15,
+                                self.main.is_solid() && extracted_count != 0,
+                                &mut writer,
+                            )
+                            .map_err(|error| entry.entry_error("extracting", error))?;
+                    }
+                    Ok(())
+                },
+            )?;
             extracted_count += 1;
         }
         Ok(())
@@ -811,14 +840,27 @@ impl Entry {
 }
 
 /// Streams a multivolume archive set to caller-provided writers.
-pub fn extract_volumes_to<F>(
+pub fn extract_volumes_to<F>(volumes: &[Archive], password: Option<&[u8]>, open: F) -> Result<()>
+where
+    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+{
+    extract_volumes_to_with_options(
+        volumes,
+        crate::ArchiveReadOptions::with_optional_password(password),
+        open,
+    )
+}
+
+/// Extracts logical volume members with explicit output policy.
+pub fn extract_volumes_to_with_options<F>(
     volumes: &[Archive],
-    password: Option<&[u8]>,
+    options: crate::ArchiveReadOptions<'_>,
     mut open: F,
 ) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
 {
+    let password = options.password;
     let mut pending: Option<PendingSplitRefs> = None;
     let mut unpack15 = Unpack15::new();
     let mut extracted_count = 0usize;
@@ -837,16 +879,29 @@ where
                     extracted_count += 1;
                     continue;
                 }
+                crate::output_limit::check(
+                    options.max_member_output_bytes,
+                    u64::from(entry.header.unp_size),
+                    &meta.name,
+                )?;
                 let mut writer = open(&meta)?;
-                entry
-                    .write_compressed_to(
-                        archive,
-                        password,
-                        &mut unpack15,
-                        archive.main.is_solid() && extracted_count != 0,
-                        &mut writer,
-                    )
-                    .map_err(|error| entry.entry_error("extracting", error))?;
+                crate::output_limit::run(
+                    options.max_member_output_bytes,
+                    &meta.name,
+                    &mut writer,
+                    |mut writer| {
+                        entry
+                            .write_compressed_to(
+                                archive,
+                                password,
+                                &mut unpack15,
+                                archive.main.is_solid() && extracted_count != 0,
+                                &mut writer,
+                            )
+                            .map_err(|error| entry.entry_error("extracting", error))?;
+                        Ok(())
+                    },
+                )?;
                 extracted_count += 1;
                 continue;
             }
@@ -867,7 +922,7 @@ where
                     let completed = pending.take().expect("pending split");
                     let solid = archive.main.is_solid() && extracted_count != 0;
                     completed
-                        .write_to(volumes, entry, password, &mut unpack15, solid, &mut open)
+                        .write_to(volumes, entry, options, &mut unpack15, solid, &mut open)
                         .map_err(|error| entry.entry_error("extracting", error))?;
                     extracted_count += 1;
                 }
@@ -974,7 +1029,7 @@ impl PendingSplitRefs {
         self,
         volumes: &[Archive],
         final_entry: &Entry,
-        password: Option<&[u8]>,
+        options: crate::ArchiveReadOptions<'_>,
         unpack15: &mut Unpack15,
         solid: bool,
         open: &mut F,
@@ -982,6 +1037,13 @@ impl PendingSplitRefs {
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
+        let password = options.password;
+        let output_limit = options.max_member_output_bytes;
+        crate::output_limit::check(
+            output_limit,
+            u64::from(final_entry.header.unp_size),
+            &self.name,
+        )?;
         let mut reader = self.fragment_reader(volumes, password)?;
         let meta = ExtractedEntryMeta {
             name: self.name,
@@ -990,30 +1052,32 @@ impl PendingSplitRefs {
             is_directory: false,
         };
         let mut writer = open(&meta)?;
-        let mut checksum = Rar13Checksum::new();
-        let mut checksum_writer = Rar13ChecksumWriter {
-            inner: &mut writer,
-            checksum: &mut checksum,
-        };
-        if self.method == METHOD_STORE {
-            std::io::copy(&mut reader, &mut checksum_writer)?;
-        } else {
-            unpack15.decode_member_from_reader(
-                &mut reader,
-                final_entry.header.unp_size as usize,
-                solid,
-                &mut checksum_writer,
-            )?;
-        }
-        let actual = checksum.finish();
-        if actual == final_entry.header.file_crc {
-            Ok(())
-        } else {
-            Err(Error::CrcMismatch {
-                expected: final_entry.header.file_crc,
-                actual,
-            })
-        }
+        crate::output_limit::run(output_limit, &meta.name, &mut writer, |mut writer| {
+            let mut checksum = Rar13Checksum::new();
+            let mut checksum_writer = Rar13ChecksumWriter {
+                inner: &mut writer,
+                checksum: &mut checksum,
+            };
+            if self.method == METHOD_STORE {
+                std::io::copy(&mut reader, &mut checksum_writer)?;
+            } else {
+                unpack15.decode_member_from_reader(
+                    &mut reader,
+                    final_entry.header.unp_size as usize,
+                    solid,
+                    &mut checksum_writer,
+                )?;
+            }
+            let actual = checksum.finish();
+            if actual == final_entry.header.file_crc {
+                Ok(())
+            } else {
+                Err(Error::CrcMismatch {
+                    expected: final_entry.header.file_crc,
+                    actual,
+                })
+            }
+        })
     }
 
     fn fragment_reader<'a>(

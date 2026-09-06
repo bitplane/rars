@@ -545,12 +545,12 @@ impl Archive {
                     "RAR 5 split entry requires multivolume extraction",
                 ));
             }
-            file.check_output_limit(options.rar50_max_member_output_bytes)?;
+            file.check_output_limit(options.max_member_output_bytes)?;
             let meta = file.metadata();
             let mut writer = open(&meta)?;
             if !meta.is_directory {
                 crate::output_limit::run(
-                    options.rar50_max_member_output_bytes,
+                    options.max_member_output_bytes,
                     &file.name,
                     &mut writer,
                     |writer| session.write_file_to(self, file, writer),
@@ -600,13 +600,13 @@ impl Archive {
             }
             let entries = crate::parallel::map_collect(batch, |file| {
                 file.check_dictionary_limit(options.rar50_dictionary_size_limit)?;
-                file.check_output_limit(options.rar50_max_member_output_bytes)?;
+                file.check_output_limit(options.max_member_output_bytes)?;
                 decode_parallel_entry(
                     self,
                     file,
                     password,
                     buffered_decode_limit,
-                    options.rar50_max_member_output_bytes,
+                    options.max_member_output_bytes,
                 )
             })?;
             for entry in entries {
@@ -892,12 +892,12 @@ where
                         }
                         continue;
                     }
-                    file.check_output_limit(options.rar50_max_member_output_bytes)?;
+                    file.check_output_limit(options.max_member_output_bytes)?;
                     let meta = file.metadata();
                     let mut writer = open(&meta)?;
                     if !meta.is_directory {
                         crate::output_limit::run(
-                            options.rar50_max_member_output_bytes,
+                            options.max_member_output_bytes,
                             &file.name,
                             &mut writer,
                             |writer| session.write_file_to(archive, file, writer),
@@ -915,12 +915,12 @@ where
                 SplitVolumeStep::Finish(mut completed) => {
                     validate_split_continuation_refs(&completed, file, password)?;
                     completed.append(volume_index, file_index);
-                    file.check_output_limit(options.rar50_max_member_output_bytes)?;
+                    file.check_output_limit(options.max_member_output_bytes)?;
                     completed.write_to(
                         volumes,
                         file,
                         &mut session,
-                        options.rar50_max_member_output_bytes,
+                        options.max_member_output_bytes,
                         &mut *open,
                     )?;
                 }
@@ -1030,13 +1030,18 @@ impl PendingSplitRefs {
         };
         let mut writer = open(&meta)?;
         crate::output_limit::run(output_limit, &final_file.name, &mut writer, |mut writer| {
-            // Whatever goes wrong with a member split across volumes, the fragment
-            // checksums may know which volume to blame. Ask them before giving the
-            // caller an error that names no part of the set.
+            // Decode/integrity failures can gain fragment context. I/O failures
+            // (including the output guard sentinel) must retain their meaning.
             if final_file.is_stored() {
                 return self
                     .write_stored_to(volumes, final_file, decryptor.as_ref(), &mut writer)
-                    .map_err(|error| self.checksum_error(volumes).unwrap_or(error))
+                    .map_err(|error| {
+                        if error.kind() == crate::ErrorKind::Io {
+                            error
+                        } else {
+                            self.checksum_error(volumes).unwrap_or(error)
+                        }
+                    })
                     .map_err(|error| final_file.entry_error("extracting", error));
             }
 

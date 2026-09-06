@@ -1361,15 +1361,24 @@ impl Archive {
                 let _ = open(&meta)?;
                 continue;
             }
+            crate::output_limit::check(options.max_member_output_bytes, file.unp_size, &file.name)?;
             let mut writer = open(&meta)?;
-            if file.is_stored() {
-                file.write_stored_to(self, password, &mut writer)
-                    .map_err(|error| file.entry_error("extracting", error))?;
-            } else {
-                session
-                    .write_file_to(self, file, &mut writer)
-                    .map_err(|error| file.entry_error("extracting", error))?;
-            }
+            crate::output_limit::run(
+                options.max_member_output_bytes,
+                &file.name,
+                &mut writer,
+                |mut writer| {
+                    if file.is_stored() {
+                        file.write_stored_to(self, password, &mut writer)
+                            .map_err(|error| file.entry_error("extracting", error))?;
+                    } else {
+                        session
+                            .write_file_to(self, file, &mut writer)
+                            .map_err(|error| file.entry_error("extracting", error))?;
+                    }
+                    Ok(())
+                },
+            )?;
         }
         Ok(())
     }
@@ -1393,7 +1402,7 @@ impl Archive {
         let password = options.password;
         let files: Vec<_> = self.files().collect();
         let entries = crate::parallel::map_collect(files, |file| {
-            decode_parallel_entry(self, file, password)
+            decode_parallel_entry(self, file, password, options.max_member_output_bytes)
         })?;
         for entry in entries {
             write_parallel_entry(entry, &mut open)?;
@@ -1433,6 +1442,7 @@ fn decode_parallel_entry(
     archive: &Archive,
     file: &FileHeader,
     password: Option<&[u8]>,
+    output_limit: Option<u64>,
 ) -> Result<ParallelExtractedEntry> {
     if file.is_split_before() || file.is_split_after() {
         return Err(Error::InvalidHeader(
@@ -1443,16 +1453,20 @@ fn decode_parallel_entry(
     if meta.is_directory {
         return Ok(ParallelExtractedEntry::Directory(meta));
     }
+    crate::output_limit::check(output_limit, file.unp_size, &file.name)?;
     let mut data = Vec::new();
-    if file.is_stored() {
-        file.write_stored_to(archive, password, &mut data)
-            .map_err(|error| file.entry_error("extracting", error))?;
-    } else {
-        let mut session = DecoderSession::new_with_password(false, password);
-        session
-            .write_file_to(archive, file, &mut data)
-            .map_err(|error| file.entry_error("extracting", error))?;
-    }
+    crate::output_limit::run(output_limit, &file.name, &mut data, |mut data| {
+        if file.is_stored() {
+            file.write_stored_to(archive, password, &mut data)
+                .map_err(|error| file.entry_error("extracting", error))?;
+        } else {
+            let mut session = DecoderSession::new_with_password(false, password);
+            session
+                .write_file_to(archive, file, &mut data)
+                .map_err(|error| file.entry_error("extracting", error))?;
+        }
+        Ok(())
+    })?;
     Ok(ParallelExtractedEntry::File { meta, data })
 }
 

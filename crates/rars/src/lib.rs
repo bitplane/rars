@@ -87,12 +87,15 @@ pub struct ArchiveReadOptions<'a> {
     /// codec calls are outside its scope. Earlier members may already be emitted
     /// when a later member exceeds the limit; its output callback is not opened.
     pub rar50_dictionary_size_limit: Option<u64>,
-    /// Inclusive RAR5/7 logical member output ceiling, independent of RAM usage.
+    /// Inclusive logical member output ceiling for every archive family, independent of RAM usage.
     /// None preserves defaults; zero permits empty output. Apply to extraction,
     /// not parsing. Known oversized members and unsupported unknown-size members
     /// are refused before opening output. Runtime failures can leave partial output.
-    /// Direct codecs and comment/recovery helpers are outside this policy.
-    pub rar50_max_member_output_bytes: Option<u64>,
+    /// The ceiling resets per logical member, not per volume fragment. Discarding
+    /// a solid member's bytes does not exempt it; retries and history copies are
+    /// not counted twice. Direct codecs, password-only default wrappers and
+    /// comment/recovery helpers are outside this explicit policy.
+    pub max_member_output_bytes: Option<u64>,
 }
 
 impl<'a> ArchiveReadOptions<'a> {
@@ -117,9 +120,9 @@ impl<'a> ArchiveReadOptions<'a> {
         }
     }
 
-    /// Sets the RAR5/7 logical member output ceiling.
-    pub fn with_rar50_max_member_output_bytes(mut self, limit: u64) -> Self {
-        self.rar50_max_member_output_bytes = Some(limit);
+    /// Sets the logical member output ceiling.
+    pub fn with_max_member_output_bytes(mut self, limit: u64) -> Self {
+        self.max_member_output_bytes = Some(limit);
         self
     }
 
@@ -481,7 +484,7 @@ impl Archive {
     {
         match self {
             Self::Rar13(archive) => {
-                archive.extract_to(options.password, |meta| open(&rar13_meta(meta)))
+                archive.extract_to_with_options(options, |meta| open(&rar13_meta(meta)))
             }
             Self::Rar15To40(archive) => {
                 archive.extract_to(options, |meta| open(&rar15_40_meta(meta)))
@@ -513,7 +516,7 @@ impl Archive {
     {
         match self {
             Self::Rar13(archive) => {
-                archive.extract_to(options.password, |meta| open(&rar13_meta(meta)))
+                archive.extract_to_with_options(options, |meta| open(&rar13_meta(meta)))
             }
             Self::Rar15To40(archive) => {
                 archive.extract_to_parallel_buffered(options, |meta| open(&rar15_40_meta(meta)))
@@ -900,7 +903,7 @@ where
     match first.family() {
         ArchiveFamily::Rar13 => {
             let typed = rar13_volumes(archives)?;
-            rar13::extract_volumes_to(&typed, options.password, |meta| open(&rar13_meta(meta)))
+            rar13::extract_volumes_to_with_options(&typed, options, |meta| open(&rar13_meta(meta)))
         }
         ArchiveFamily::Rar15To40 => {
             let typed = rar15_40_volumes(archives)?;
