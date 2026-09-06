@@ -979,6 +979,7 @@ impl Archive {
         input: &[u8],
         options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Self> {
+        options.check_cancelled()?;
         let data: Arc<[u8]> = Arc::from(input.to_vec().into_boxed_slice());
         Self::parse_shared(data, options)
     }
@@ -987,6 +988,7 @@ impl Archive {
         input: Vec<u8>,
         options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Self> {
+        options.check_cancelled()?;
         Self::parse_shared(Arc::from(input.into_boxed_slice()), options)
     }
 
@@ -1022,12 +1024,14 @@ impl Archive {
         path: impl AsRef<Path>,
         options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Self> {
+        options.check_cancelled()?;
         let path = Arc::new(path.as_ref().to_path_buf());
         let mut file = File::open(path.as_ref())?;
         let len = file.metadata()?.len();
         let scan_len = len.min(SFX_SCAN_LIMIT as u64) as usize;
         let mut scan = vec![0; scan_len];
         file.read_exact(&mut scan)?;
+        options.check_cancelled()?;
         let sig = find_archive_start(&scan, SFX_SCAN_LIMIT).ok_or(Error::UnsupportedSignature)?;
         if sig.family != ArchiveFamily::Rar15To40 {
             return Err(Error::UnsupportedSignature);
@@ -1052,6 +1056,7 @@ impl Archive {
         signature: ArchiveSignature,
         options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Self> {
+        options.check_cancelled()?;
         if signature.family != ArchiveFamily::Rar15To40 {
             return Err(Error::UnsupportedSignature);
         }
@@ -1068,6 +1073,7 @@ impl Archive {
     }
 
     fn parse_shared(input: Arc<[u8]>, options: crate::ArchiveReadOptions<'_>) -> Result<Self> {
+        options.check_cancelled()?;
         let sig = find_archive_start(&input, SFX_SCAN_LIMIT).ok_or(Error::UnsupportedSignature)?;
         if sig.family != ArchiveFamily::Rar15To40 {
             return Err(Error::UnsupportedSignature);
@@ -1173,6 +1179,7 @@ impl Archive {
             }
         }
 
+        options.check_cancelled()?;
         Ok(Self {
             sfx_offset: sig.offset,
             main,
@@ -1182,14 +1189,16 @@ impl Archive {
     }
 
     fn parse_seekable(
-        mut file: File,
+        file: File,
         file_len: u64,
         sfx_offset: usize,
         source: ArchiveSource,
         options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Self> {
+        options.check_cancelled()?;
         let password = options.password;
         let mut budget = crate::parse_budget::ParseBudget::new(options);
+        let mut file = budget.control.reader(file);
         let marker = read_block_header_at(&mut file, file_len, sfx_offset, 0, &mut budget)?;
         if marker.head_type != MARK_HEAD || marker.head_size != RAR15_SIGNATURE.len() as u16 {
             return Err(Error::InvalidHeader("RAR 1.5 marker block is invalid"));
@@ -1295,6 +1304,7 @@ impl Archive {
             }
         }
 
+        options.check_cancelled()?;
         Ok(Self {
             sfx_offset,
             main,
@@ -1372,10 +1382,13 @@ impl Archive {
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
+        options.check_cancelled()?;
         let password = options.password;
         let mut budget = crate::output_limit::OutputBudget::new(options);
         let mut session = DecoderSession::new_with_password(self.main.is_solid(), password);
+        session.read_control = budget.control.clone();
         for file in self.files() {
+            options.check_cancelled()?;
             if file.is_split_before() || file.is_split_after() {
                 return Err(Error::InvalidHeader(
                     "RAR 1.5 split entry requires multivolume extraction",
@@ -1383,11 +1396,15 @@ impl Archive {
             }
             let meta = file.metadata();
             if meta.is_directory {
+                options.check_cancelled()?;
                 let _ = open(&meta)?;
+                options.check_cancelled()?;
                 continue;
             }
             budget.check(file.unp_size, &file.name)?;
+            options.check_cancelled()?;
             let mut writer = open(&meta)?;
+            options.check_cancelled()?;
             budget.run(&file.name, &mut writer, |mut writer| {
                 if file.is_stored() {
                     file.write_stored_to(self, password, &mut writer)
@@ -1400,6 +1417,7 @@ impl Archive {
                 Ok(())
             })?;
         }
+        options.check_cancelled()?;
         Ok(())
     }
 
@@ -1412,6 +1430,7 @@ impl Archive {
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
+        options.check_cancelled()?;
         // Total accounting belongs to the operation, before any worker dispatch.
         if options.max_total_output_bytes.is_some()
             || self.main.is_solid()
@@ -1422,14 +1441,14 @@ impl Archive {
             return self.extract_to(options, open);
         }
 
-        let password = options.password;
         let files: Vec<_> = self.files().collect();
-        let entries = crate::parallel::map_collect(files, |file| {
-            decode_parallel_entry(self, file, password, options.max_member_output_bytes)
-        })?;
+        let entries =
+            crate::parallel::map_collect(files, |file| decode_parallel_entry(self, file, options))?;
+        let publication = crate::read_control::ReadControl::new(options.cancellation);
         for entry in entries {
-            write_parallel_entry(entry, &mut open)?;
+            write_parallel_entry(entry, &mut open, &publication)?;
         }
+        options.check_cancelled()?;
         Ok(())
     }
 
@@ -1464,9 +1483,11 @@ enum ParallelExtractedEntry {
 fn decode_parallel_entry(
     archive: &Archive,
     file: &FileHeader,
-    password: Option<&[u8]>,
-    output_limit: Option<u64>,
+    options: crate::ArchiveReadOptions<'_>,
 ) -> Result<ParallelExtractedEntry> {
+    options.check_cancelled()?;
+    let password = options.password;
+    let mut budget = crate::output_limit::OutputBudget::new(options);
     if file.is_split_before() || file.is_split_after() {
         return Err(Error::InvalidHeader(
             "RAR 1.5 split entry requires multivolume extraction",
@@ -1476,36 +1497,46 @@ fn decode_parallel_entry(
     if meta.is_directory {
         return Ok(ParallelExtractedEntry::Directory(meta));
     }
-    crate::output_limit::check(output_limit, file.unp_size, &file.name)?;
+    budget.check(file.unp_size, &file.name)?;
     let mut data = Vec::new();
-    crate::output_limit::run(output_limit, &file.name, &mut data, |mut data| {
+    let control = budget.control.clone();
+    budget.run(&file.name, &mut data, |mut data| {
         if file.is_stored() {
             file.write_stored_to(archive, password, &mut data)
                 .map_err(|error| file.entry_error("extracting", error))?;
         } else {
             let mut session = DecoderSession::new_with_password(false, password);
+            session.read_control = control.clone();
             session
                 .write_file_to(archive, file, &mut data)
                 .map_err(|error| file.entry_error("extracting", error))?;
         }
+        options.check_cancelled()?;
         Ok(())
     })?;
     Ok(ParallelExtractedEntry::File { meta, data })
 }
 
-fn write_parallel_entry<F>(entry: ParallelExtractedEntry, open: &mut F) -> Result<()>
+fn write_parallel_entry<F>(
+    entry: ParallelExtractedEntry,
+    open: &mut F,
+    control: &crate::read_control::ReadControl,
+) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
 {
+    control.check()?;
     match entry {
         ParallelExtractedEntry::Directory(meta) => {
             let _ = open(&meta)?;
         }
         ParallelExtractedEntry::File { meta, data } => {
             let mut writer = open(&meta)?;
-            writer.write_all(&data)?;
+            control.check()?;
+            control.write_all(&mut writer, &data)?;
         }
     }
+    control.check()?;
     Ok(())
 }
 
@@ -2344,6 +2375,7 @@ fn admit_plain_header(
     offset: usize,
     budget: &mut crate::parse_budget::ParseBudget,
 ) -> Result<()> {
+    budget.control.check()?;
     if !budget.is_limited() {
         return Ok(());
     }

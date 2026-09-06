@@ -1619,6 +1619,7 @@ fn canonical_codes(lengths: &[u8]) -> Result<Vec<Option<HuffmanCode>>> {
 
 #[derive(Debug, Clone)]
 pub struct Unpack20 {
+    pub(crate) read_control: crate::read_control::ReadControl,
     bits: BitReader,
     levels: [u8; OLD_LEVEL_COUNT],
     main: Huffman,
@@ -1642,6 +1643,7 @@ pub struct Unpack20 {
 impl Unpack20 {
     pub fn new() -> Self {
         Self {
+            read_control: crate::read_control::ReadControl::default(),
             bits: BitReader::new(),
             levels: [0; OLD_LEVEL_COUNT],
             main: Huffman::empty(),
@@ -1664,6 +1666,7 @@ impl Unpack20 {
     }
 
     pub fn decode_member(&mut self, input: &[u8], output_size: usize) -> Result<Vec<u8>> {
+        self.read_control.check_codec()?;
         let start = self.current_pos();
         let target = start
             .checked_add(output_size)
@@ -1688,6 +1691,7 @@ impl Unpack20 {
         output_size: usize,
         out: &mut impl Write,
     ) -> Result<()> {
+        self.read_control.check_codec()?;
         let decoded = self.decode_member(input, output_size)?;
         out.write_all(&decoded)
             .map_err(|_| Error::InvalidData("RAR 2.0 output write failed"))
@@ -1699,6 +1703,9 @@ impl Unpack20 {
         output_size: usize,
         out: &mut impl Write,
     ) -> Result<()> {
+        self.read_control.check_codec()?;
+        let control = self.read_control.clone();
+        let input = &mut control.reader(input);
         let start = self.current_pos();
         let target = start
             .checked_add(output_size)
@@ -1730,7 +1737,9 @@ impl Unpack20 {
     }
 
     fn decode_until(&mut self, target: usize) -> Result<()> {
+        let mut poller = self.read_control.poller();
         while self.current_pos() < target {
+            poller.check_codec(self.current_pos())?;
             self.drain_pending_match(target)?;
             if self.current_pos() >= target {
                 break;
@@ -1821,7 +1830,9 @@ impl Unpack20 {
     }
 
     fn decode_lz(&mut self, output_size: usize) -> Result<()> {
+        let mut poller = self.read_control.poller();
         while self.current_pos() < output_size {
+            poller.check_codec(self.current_pos())?;
             if self.audio_block {
                 self.decode_audio_byte()?;
                 if !self.in_block {
@@ -2318,6 +2329,21 @@ impl BitWriter {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn cancellation_interrupts_buffered_symbol_work() {
+        let data = b"cancellable legacy symbols ".repeat(16384);
+        let packed = unpack20_encode_literals(&data).unwrap();
+        let token = crate::ReadCancellation::new();
+        let mut decoder = Unpack20::new();
+        decoder.read_control = crate::read_control::ReadControl::new(Some(&token));
+        decoder.read_control.cancel_after_checks(3);
+        assert_eq!(
+            decoder.decode_member(&packed, data.len()).unwrap_err(),
+            Error::Cancelled
+        );
+        assert!(decoder.current_pos() > 0 && decoder.current_pos() < data.len());
+    }
     use super::{
         encode_tokens_with_progress, level_code_lengths_for_used_symbols, unpack20_decode,
         unpack20_encode_literals, BitWriter, CostModel, EncodeOptions, EncodeToken, Error, Huffman,

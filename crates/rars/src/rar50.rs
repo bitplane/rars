@@ -449,6 +449,7 @@ impl Archive {
         input: &[u8],
         options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Self> {
+        options.check_cancelled()?;
         let data: Arc<[u8]> = Arc::from(input.to_vec().into_boxed_slice());
         Self::parse_shared(data, options)
     }
@@ -457,6 +458,7 @@ impl Archive {
         input: Vec<u8>,
         options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Self> {
+        options.check_cancelled()?;
         Self::parse_shared(Arc::from(input.into_boxed_slice()), options)
     }
 
@@ -492,12 +494,14 @@ impl Archive {
         path: impl AsRef<Path>,
         options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Self> {
+        options.check_cancelled()?;
         let path = Arc::new(path.as_ref().to_path_buf());
         let mut file = File::open(path.as_ref())?;
         let len = file.metadata()?.len();
         let scan_len = len.min(SFX_SCAN_LIMIT as u64) as usize;
         let mut scan = vec![0; scan_len];
         file.read_exact(&mut scan)?;
+        options.check_cancelled()?;
         let sig = find_archive_start(&scan, SFX_SCAN_LIMIT).ok_or(Error::UnsupportedSignature)?;
         if sig.family != ArchiveFamily::Rar50Plus {
             return Err(Error::UnsupportedSignature);
@@ -532,6 +536,7 @@ impl Archive {
         signature: ArchiveSignature,
         options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Self> {
+        options.check_cancelled()?;
         if signature.family != ArchiveFamily::Rar50Plus {
             return Err(Error::UnsupportedSignature);
         }
@@ -552,6 +557,7 @@ impl Archive {
     }
 
     fn parse_shared(input: Arc<[u8]>, options: crate::ArchiveReadOptions<'_>) -> Result<Self> {
+        options.check_cancelled()?;
         let sig = find_archive_start(&input, SFX_SCAN_LIMIT).ok_or(Error::UnsupportedSignature)?;
         if sig.family != ArchiveFamily::Rar50Plus {
             return Err(Error::UnsupportedSignature);
@@ -573,6 +579,7 @@ impl Archive {
         source: ArchiveSource,
         options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Self> {
+        options.check_cancelled()?;
         if !input.starts_with(RAR50_SIGNATURE) {
             return Err(Error::UnsupportedSignature);
         }
@@ -596,6 +603,7 @@ impl Archive {
             },
         )?;
 
+        options.check_cancelled()?;
         Ok(Self {
             sfx_offset,
             main,
@@ -611,12 +619,14 @@ impl Archive {
         source: ArchiveSource,
         options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Self> {
+        options.check_cancelled()?;
         let signature = read_exact_at(file, sfx_offset, RAR50_SIGNATURE.len())?;
         if signature != RAR50_SIGNATURE {
             return Err(Error::UnsupportedSignature);
         }
 
-        let file_cell = std::cell::RefCell::new(file);
+        let control = crate::read_control::ReadControl::new(options.cancellation);
+        let file_cell = std::cell::RefCell::new(control.reader(file));
         let (main, blocks) = parse_archive_blocks(
             archive_len,
             options,
@@ -641,6 +651,7 @@ impl Archive {
             },
         )?;
 
+        options.check_cancelled()?;
         Ok(Self {
             sfx_offset,
             main,
@@ -1078,6 +1089,7 @@ pub fn repair_inline_recovery_bytes_with_options(
     input: &[u8],
     options: crate::ArchiveReadOptions<'_>,
 ) -> Result<crate::RecoveryRepairResult> {
+    options.check_cancelled()?;
     if !input.starts_with(RAR50_SIGNATURE) {
         return Err(Error::UnsupportedSignature);
     }
@@ -1149,7 +1161,8 @@ fn parse_main_header_bytes(parsed: &ParsedBlockHeader) -> Result<MainHeader> {
     } else {
         None
     };
-    let extras = parse_main_extra_area(&parsed.header, parsed.extra_range.clone())?;
+    let extras =
+        parse_main_extra_area(&parsed.header, parsed.extra_range.clone(), &parsed.control)?;
     Ok(MainHeader {
         block: parsed.block.clone(),
         archive_flags,
@@ -1160,63 +1173,73 @@ fn parse_main_header_bytes(parsed: &ParsedBlockHeader) -> Result<MainHeader> {
     })
 }
 
-fn parse_main_extra_area(input: &[u8], range: Range<usize>) -> Result<Vec<MainExtraRecord>> {
+fn parse_main_extra_area(
+    input: &[u8],
+    range: Range<usize>,
+    control: &crate::read_control::ReadControl,
+) -> Result<Vec<MainExtraRecord>> {
     let mut records = Vec::new();
-    parse_extra_records(input, range, false, |record_type, data| match record_type {
-        MHEXTRA_LOCATOR => {
-            let mut reader = SliceReader::new(input, data.start, data.end);
-            let flags = reader.read_vint()?;
-            let quick_open_offset = if flags & MHEXTRA_LOCATOR_QUICK_OPEN != 0 {
-                Some(reader.read_vint()?)
-            } else {
-                None
-            };
-            let recovery_record_offset = if flags & MHEXTRA_LOCATOR_RECOVERY != 0 {
-                Some(reader.read_vint()?)
-            } else {
-                None
-            };
-            // LOCATOR records are intentionally forward-compatible: known
-            // offsets are parsed and any trailing bytes remain reserved for
-            // future flags.
-            records.push(MainExtraRecord::Locator(LocatorRecord {
-                flags,
-                quick_open_offset,
-                recovery_record_offset,
-            }));
-            Ok(())
-        }
-        MHEXTRA_ARCHIVE_METADATA => {
-            let mut reader = SliceReader::new(input, data.start, data.end);
-            let flags = reader.read_vint()?;
-            let name = if flags & MHEXTRA_ARCHIVE_METADATA_NAME != 0 {
-                let name_len = usize_from_u64(
-                    reader.read_vint()?,
-                    "RAR 5 archive metadata name length overflows usize",
-                )?;
-                Some(reader.read_bytes(name_len)?.to_vec())
-            } else {
-                None
-            };
-            let creation_time = if flags & MHEXTRA_ARCHIVE_METADATA_TIME != 0 {
-                Some(reader.read_u64()?)
-            } else {
-                None
-            };
-            if reader.pos != reader.end {
-                return Err(Error::InvalidHeader(
-                    "RAR 5 archive metadata record has trailing bytes",
-                ));
+    parse_extra_records(
+        input,
+        range,
+        false,
+        control,
+        |record_type, data| match record_type {
+            MHEXTRA_LOCATOR => {
+                let mut reader = SliceReader::new(input, data.start, data.end);
+                let flags = reader.read_vint()?;
+                let quick_open_offset = if flags & MHEXTRA_LOCATOR_QUICK_OPEN != 0 {
+                    Some(reader.read_vint()?)
+                } else {
+                    None
+                };
+                let recovery_record_offset = if flags & MHEXTRA_LOCATOR_RECOVERY != 0 {
+                    Some(reader.read_vint()?)
+                } else {
+                    None
+                };
+                // LOCATOR records are intentionally forward-compatible: known
+                // offsets are parsed and any trailing bytes remain reserved for
+                // future flags.
+                records.push(MainExtraRecord::Locator(LocatorRecord {
+                    flags,
+                    quick_open_offset,
+                    recovery_record_offset,
+                }));
+                Ok(())
             }
-            records.push(MainExtraRecord::ArchiveMetadata(ArchiveMetadataRecord {
-                flags,
-                name,
-                creation_time,
-            }));
-            Ok(())
-        }
-        _ => Ok(()),
-    })?;
+            MHEXTRA_ARCHIVE_METADATA => {
+                let mut reader = SliceReader::new(input, data.start, data.end);
+                let flags = reader.read_vint()?;
+                let name = if flags & MHEXTRA_ARCHIVE_METADATA_NAME != 0 {
+                    let name_len = usize_from_u64(
+                        reader.read_vint()?,
+                        "RAR 5 archive metadata name length overflows usize",
+                    )?;
+                    Some(reader.read_bytes(name_len)?.to_vec())
+                } else {
+                    None
+                };
+                let creation_time = if flags & MHEXTRA_ARCHIVE_METADATA_TIME != 0 {
+                    Some(reader.read_u64()?)
+                } else {
+                    None
+                };
+                if reader.pos != reader.end {
+                    return Err(Error::InvalidHeader(
+                        "RAR 5 archive metadata record has trailing bytes",
+                    ));
+                }
+                records.push(MainExtraRecord::ArchiveMetadata(ArchiveMetadataRecord {
+                    flags,
+                    name,
+                    creation_time,
+                }));
+                Ok(())
+            }
+            _ => Ok(()),
+        },
+    )?;
     Ok(records)
 }
 
@@ -1267,6 +1290,7 @@ fn parse_file_header_bytes(parsed: &ParsedBlockHeader) -> Result<FileHeader> {
         parsed.extra_range.clone(),
         parsed.block.header_type == HEAD_SERVICE,
         &mut file,
+        &parsed.control,
     )?;
     Ok(file)
 }
@@ -1276,12 +1300,13 @@ fn parse_file_extra_area(
     range: Range<usize>,
     is_service: bool,
     file: &mut FileHeader,
+    control: &crate::read_control::ReadControl,
 ) -> Result<()> {
     if file.block.extra_area_size.is_none() {
         return Ok(());
     }
     let mut seen = 0u64;
-    let complete = parse_extra_records(input, range, is_service, |record_type, data| {
+    let complete = parse_extra_records(input, range, is_service, control, |record_type, data| {
         let bit = 1u64
             .checked_shl(record_type as u32)
             .filter(|_| record_type < 64)
@@ -1556,6 +1581,7 @@ where
     F: FnMut(usize, &mut crate::parse_budget::ParseBudget) -> Result<ParsedBlockHeader>,
     G: FnMut(usize, &Rar50Keys, &mut crate::parse_budget::ParseBudget) -> Result<ParsedBlockHeader>,
 {
+    options.check_cancelled()?;
     // Budget refusals already identify the header; do not duplicate its context.
     let at_offset = |error: Error, offset| match error {
         Error::AtArchiveOffset { .. } => error,
@@ -1664,13 +1690,16 @@ fn parse_extra_records<F>(
     input: &[u8],
     range: Range<usize>,
     is_service: bool,
+    control: &crate::read_control::ReadControl,
     mut handle: F,
 ) -> Result<bool>
 where
     F: FnMut(u64, Range<usize>) -> Result<()>,
 {
     let mut pos = range.start;
+    let mut poller = control.poller();
     while pos < range.end {
+        poller.check(pos)?;
         let Ok((record_size, size_len)) = read_vint_at(input, pos, range.end) else {
             break;
         };
@@ -1697,6 +1726,7 @@ where
 }
 
 struct ParsedBlockHeader {
+    control: crate::read_control::ReadControl,
     block: BlockHeader,
     header: Vec<u8>,
     type_specific_range: Range<usize>,
@@ -1743,6 +1773,7 @@ fn parse_block_header_bytes(
         sfx_offset,
         header_crc,
         header_total,
+        &budget.control,
     )
 }
 
@@ -1799,6 +1830,7 @@ fn parse_encrypted_block_header_bytes(
         sfx_offset,
         header_crc,
         disk_header_len,
+        &budget.control,
     )
 }
 
@@ -1835,6 +1867,7 @@ fn read_block_header_at(
         sfx_offset,
         header_crc,
         header_total,
+        &budget.control,
     )
 }
 
@@ -1889,6 +1922,7 @@ fn read_encrypted_block_header_at(
         sfx_offset,
         header_crc,
         disk_header_len,
+        &budget.control,
     )
 }
 
@@ -1899,7 +1933,9 @@ fn parse_block_header_image(
     sfx_offset: usize,
     header_crc: u32,
     disk_header_len: usize,
+    control: &crate::read_control::ReadControl,
 ) -> Result<ParsedBlockHeader> {
+    control.check()?;
     let header_total = header.len();
     let (decoded_header_size, header_size_len) = read_vint_at(&header, 4, header_total)?;
     validate_block_header_crc(&header, header_crc)?;
@@ -1946,6 +1982,7 @@ fn parse_block_header_image(
         .ok_or(Error::InvalidHeader("RAR 5 data size overflows usize"))?;
 
     Ok(ParsedBlockHeader {
+        control: control.clone(),
         block: BlockHeader {
             header_crc,
             header_size: decoded_header_size,
@@ -2159,6 +2196,21 @@ fn decode_compression_info(raw: u64) -> Result<CompressionInfo> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cancellation_interrupts_metadata_record_iteration() {
+        let input = [2, 127, 0].repeat(10000);
+        let token = crate::ReadCancellation::new();
+        let control = crate::read_control::ReadControl::new(Some(&token));
+        control.cancel_after_checks(1);
+        let mut handled = 0;
+        let err = super::parse_extra_records(&input, 0..input.len(), false, &control, |_, _| {
+            handled += 1;
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), crate::ErrorKind::Cancelled);
+        assert!(handled > 0 && handled < 10000);
+    }
     #[test]
     fn header_budget_refuses_full_reads_after_plain_and_encrypted_prefixes() {
         use crate::parse_budget::{ParseBudget, PrefixReader};

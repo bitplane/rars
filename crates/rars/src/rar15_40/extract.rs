@@ -173,6 +173,7 @@ impl CodecState {
 }
 
 pub(super) struct DecoderSession<'a> {
+    pub(super) read_control: crate::read_control::ReadControl,
     codec: Option<CodecState>,
     solid: bool,
     decoded_files: usize,
@@ -186,6 +187,7 @@ impl<'a> DecoderSession<'a> {
 
     pub(super) fn new_with_password(solid: bool, password: Option<&'a [u8]>) -> Self {
         Self {
+            read_control: crate::read_control::ReadControl::default(),
             codec: None,
             solid,
             decoded_files: 0,
@@ -250,6 +252,7 @@ impl<'a> DecoderSession<'a> {
     }
 
     fn codec_for(&mut self, file: &FileHeader) -> Result<&mut CodecState> {
+        self.read_control.check()?;
         let reset = !self.file_is_solid(file)
             || self
                 .codec
@@ -257,6 +260,13 @@ impl<'a> DecoderSession<'a> {
                 .is_none_or(|codec| !codec.supports(file));
         if reset {
             self.codec = Some(CodecState::new_for(file)?);
+        }
+        if let Some(codec) = &mut self.codec {
+            match codec {
+                CodecState::Unpack15(d) => d.read_control = self.read_control.clone(),
+                CodecState::Unpack20(d) => d.read_control = self.read_control.clone(),
+                CodecState::Unpack29(d) => d.read_control = self.read_control.clone(),
+            }
         }
         self.codec
             .as_mut()
@@ -279,6 +289,7 @@ pub fn extract_volumes_to<F>(
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
 {
+    options.check_cancelled()?;
     if volumes.is_empty() {
         return Err(Error::InvalidHeader("RAR 1.5 volume set is empty"));
     }
@@ -292,16 +303,22 @@ where
             .is_some_and(|archive| archive.main.is_solid()),
         password,
     );
+    session.read_control = budget.control.clone();
     for (volume_index, archive) in volumes.iter().enumerate() {
         for (file_index, file) in archive.files().enumerate() {
+            options.check_cancelled()?;
             match split.advance(file.is_split_before(), file.is_split_after()) {
                 SplitVolumeStep::Regular => {
                     let meta = file.metadata();
                     if meta.is_directory {
+                        options.check_cancelled()?;
                         let _ = open(&meta)?;
+                        options.check_cancelled()?;
                     } else {
                         budget.check(file.unp_size, &file.name)?;
+                        options.check_cancelled()?;
                         let mut writer = open(&meta)?;
+                        options.check_cancelled()?;
                         budget.run(&file.name, &mut writer, |mut writer| {
                             if file.is_stored() {
                                 file.write_stored_to(archive, password, &mut writer)
@@ -311,6 +328,7 @@ where
                                     .write_file_to(archive, file, &mut writer)
                                     .map_err(|error| file.entry_error("extracting", error))?;
                             }
+                            options.check_cancelled()?;
                             Ok(())
                         })?;
                     }
@@ -353,6 +371,7 @@ where
         return Err(Error::InvalidHeader("RAR 1.5 split entry is incomplete"));
     }
 
+    options.check_cancelled()?;
     Ok(())
 }
 

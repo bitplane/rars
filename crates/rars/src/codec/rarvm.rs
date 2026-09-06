@@ -146,8 +146,17 @@ impl Program {
     }
 
     pub fn execute(&self, invocation: Invocation<'_>) -> Result<ExecutionResult> {
+        self.execute_with_control(invocation, &crate::read_control::ReadControl::default())
+    }
+
+    pub(crate) fn execute_with_control(
+        &self,
+        invocation: Invocation<'_>,
+        control: &crate::read_control::ReadControl,
+    ) -> Result<ExecutionResult> {
+        control.check_codec()?;
         let mut vm = Vm::new(self, invocation)?;
-        vm.run(self)
+        vm.run(self, control)
     }
 }
 
@@ -407,10 +416,16 @@ impl Vm {
         })
     }
 
-    fn run(&mut self, program: &Program) -> Result<ExecutionResult> {
+    fn run(
+        &mut self,
+        program: &Program,
+        control: &crate::read_control::ReadControl,
+    ) -> Result<ExecutionResult> {
+        let mut poller = control.poller();
         let mut ip = 0usize;
         let mut terminated = false;
         for _ in 0..MAX_INSTRUCTIONS {
+            poller.check_codec(0)?;
             let Some(instruction) = program.instructions.get(ip) else {
                 terminated = true;
                 break;
@@ -887,6 +902,30 @@ impl<'a> BitReader<'a> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn cancellation_interrupts_vm_work_without_output() {
+        let program = Program {
+            static_data: vec![],
+            instructions: vec![instr(Opcode::Jmp, false, vec![Operand::Immediate(0)])],
+        };
+        let token = crate::ReadCancellation::new();
+        let control = crate::read_control::ReadControl::new(Some(&token));
+        control.cancel_after_checks(2);
+        let err = program
+            .execute_with_control(
+                Invocation {
+                    input: &[],
+                    regs: [0; 7],
+                    global_data: &[],
+                    file_offset: 0,
+                    exec_count: 0,
+                },
+                &control,
+            )
+            .unwrap_err();
+        assert_eq!(err, Error::Cancelled);
+    }
     use super::*;
 
     #[test]

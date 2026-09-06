@@ -93,8 +93,11 @@ impl FileHeader {
         &self,
         archive: &Archive,
         password: Option<&[u8]>,
+        control: &crate::read_control::ReadControl,
     ) -> Result<(Vec<u8>, Option<Rar50Keys>)> {
-        let (mut reader, keys) = self.packed_reader_with_password(archive, password)?;
+        control.check()?;
+        let (reader, keys) = self.packed_reader_with_password(archive, password)?;
+        let mut reader = control.reader(reader);
         let mut packed = Vec::new();
         reader.read_to_end(&mut packed)?;
         Ok((packed, keys))
@@ -279,7 +282,8 @@ impl FileHeader {
         decoder: &mut Unpack50Decoder,
         password: Option<&[u8]>,
     ) -> Result<DecodedData> {
-        let (packed, keys) = self.packed_data_with_password(archive, password)?;
+        let (packed, keys) =
+            self.packed_data_with_password(archive, password, &decoder.read_control)?;
         let data = self.decode_packed_with_decoder(&packed, decoder)?;
         Ok(DecodedData { data, keys })
     }
@@ -291,7 +295,8 @@ impl FileHeader {
         password: Option<&[u8]>,
         mode: DecodeMode,
     ) -> Result<DecodedData> {
-        let (packed, keys) = self.packed_data_with_password(archive, password)?;
+        let (packed, keys) =
+            self.packed_data_with_password(archive, password, &decoder.read_control)?;
         let data = self.decode_packed_with_decoder_mode(&packed, decoder, mode)?;
         Ok(DecodedData { data, keys })
     }
@@ -502,6 +507,7 @@ impl Archive {
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
+        options.check_cancelled()?;
         self.extract_to_impl(options, &mut open, &mut |_, _| Ok(()), false)
     }
 
@@ -515,6 +521,7 @@ impl Archive {
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
         R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
     {
+        options.check_cancelled()?;
         self.extract_to_impl(options, &mut open, &mut redirect, true)
     }
 
@@ -529,15 +536,20 @@ impl Archive {
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
         R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
     {
+        options.check_cancelled()?;
         let mut budget = crate::output_limit::OutputBudget::new(options);
         let buffered_decode_limit = rar50_buffered_decode_limit(options);
         let mut session =
             DecoderSession::new_with_password(options.password, buffered_decode_limit);
+        session.decoder.read_control = budget.control.clone();
         for file in self.files() {
+            options.check_cancelled()?;
             file.check_dictionary_limit(options.rar50_dictionary_size_limit)?;
             if let Some(redirection) = &file.redirection {
                 if emit_redirections {
+                    options.check_cancelled()?;
                     redirect(&file.metadata(), redirection)?;
+                    options.check_cancelled()?;
                 }
                 continue;
             }
@@ -548,13 +560,16 @@ impl Archive {
             }
             file.check_output_limit(&budget)?;
             let meta = file.metadata();
+            options.check_cancelled()?;
             let mut writer = open(&meta)?;
+            options.check_cancelled()?;
             if !meta.is_directory {
                 budget.run(&file.name, &mut writer, |writer| {
                     session.write_file_to(self, file, writer)
                 })?;
             }
         }
+        options.check_cancelled()?;
         Ok(())
     }
 
@@ -570,6 +585,7 @@ impl Archive {
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
+        options.check_cancelled()?;
         // Admit and charge total-limited work in archive order before dispatch.
         if options.max_total_output_bytes.is_some()
             || self.main.is_solid()
@@ -588,7 +604,9 @@ impl Archive {
         let buffered_decode_limit = rar50_buffered_decode_limit(options);
         let mut files = self.files().peekable();
         let window = crate::parallel::default_window().max(1);
+        let publication = crate::read_control::ReadControl::new(options.cancellation);
         while files.peek().is_some() {
+            options.check_cancelled()?;
             let mut batch = Vec::new();
             let mut remaining = buffered_decode_limit;
             while batch.len() < window {
@@ -600,20 +618,13 @@ impl Archive {
                 batch.push(files.next().expect("peeked file"));
             }
             let entries = crate::parallel::map_collect(batch, |file| {
-                file.check_dictionary_limit(options.rar50_dictionary_size_limit)?;
-                file.check_output_limit(&crate::output_limit::OutputBudget::new(options))?;
-                decode_parallel_entry(
-                    self,
-                    file,
-                    password,
-                    buffered_decode_limit,
-                    options.max_member_output_bytes,
-                )
+                decode_parallel_entry(self, file, password, buffered_decode_limit, options)
             })?;
             for entry in entries {
-                write_parallel_entry(entry, &mut open, &mut |_, _| Ok(()))?;
+                write_parallel_entry(entry, &mut open, &mut |_, _| Ok(()), &publication)?;
             }
         }
+        options.check_cancelled()?;
         Ok(())
     }
 }
@@ -635,8 +646,12 @@ fn decode_parallel_entry(
     file: &FileHeader,
     password: Option<&[u8]>,
     buffered_decode_limit: u64,
-    output_limit: Option<u64>,
+    options: crate::ArchiveReadOptions<'_>,
 ) -> Result<ParallelExtractedEntry> {
+    options.check_cancelled()?;
+    let mut budget = crate::output_limit::OutputBudget::new(options);
+    file.check_dictionary_limit(options.rar50_dictionary_size_limit)?;
+    file.check_output_limit(&budget)?;
     if let Some(redirection) = &file.redirection {
         return Ok(ParallelExtractedEntry::Redirection {
             meta: file.metadata(),
@@ -654,7 +669,8 @@ fn decode_parallel_entry(
     }
     let mut data = Vec::new();
     let mut session = DecoderSession::new_with_password(password, buffered_decode_limit);
-    crate::output_limit::run(output_limit, &file.name, &mut data, |writer| {
+    session.decoder.read_control = budget.control.clone();
+    budget.run(&file.name, &mut data, |writer| {
         session.write_file_to(archive, file, writer)
     })?;
     Ok(ParallelExtractedEntry::File { meta, data })
@@ -664,23 +680,27 @@ fn write_parallel_entry<F, R>(
     entry: ParallelExtractedEntry,
     open: &mut F,
     redirect: &mut R,
+    control: &crate::read_control::ReadControl,
 ) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
 {
+    control.check()?;
     match entry {
         ParallelExtractedEntry::Directory(meta) => {
             let _ = open(&meta)?;
         }
         ParallelExtractedEntry::File { meta, data } => {
             let mut writer = open(&meta)?;
-            writer.write_all(&data)?;
+            control.check()?;
+            control.write_all(&mut writer, &data)?;
         }
         ParallelExtractedEntry::Redirection { meta, redirection } => {
             redirect(&meta, &redirection)?;
         }
     }
+    control.check()?;
     Ok(())
 }
 
@@ -798,19 +818,22 @@ impl<'a> DecoderSession<'a> {
     ) -> Result<()> {
         // Keep solid state only after successful emission and integrity checks,
         // just as for a non-split streaming member.
+        self.decoder.read_control.check()?;
         let mut decoder = self.decoder.clone();
+        let control = decoder.read_control.clone();
         let mut packed = split.fragment_reader(volumes, decryptor)?;
-        final_file
-            .stream_packed_with_decoder(
+        control
+            .finish(final_file.stream_packed_with_decoder(
                 &mut packed,
                 decryptor.map(|decryptor| &decryptor.keys),
                 &mut decoder,
                 self.buffered_decode_limit,
                 writer,
-            )
+            ))
             .map_err(|error| match error {
                 // Sink/reader I/O and the intentional filter limit must retain their
                 // own meaning. Fragment diagnostics are for decode/integrity failure.
+                error if error.kind() == crate::ErrorKind::Cancelled => error,
                 Error::Io(_) | Error::Rar50BufferedDecodeLimitExceeded { .. } => error,
                 error => split.checksum_error(volumes).unwrap_or(error),
             })?;
@@ -844,6 +867,7 @@ pub fn extract_volumes_to<F>(
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
 {
+    options.check_cancelled()?;
     extract_volumes_to_impl(volumes, options, &mut open, &mut |_, _| Ok(()), false)
 }
 
@@ -857,6 +881,7 @@ where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
 {
+    options.check_cancelled()?;
     extract_volumes_to_impl(volumes, options, &mut open, &mut redirect, true)
 }
 
@@ -871,6 +896,7 @@ where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
 {
+    options.check_cancelled()?;
     if volumes.is_empty() {
         return Err(Error::InvalidHeader("RAR 5 volume set is empty"));
     }
@@ -880,9 +906,11 @@ where
     let mut split = SplitVolumeState::new();
     let buffered_decode_limit = rar50_buffered_decode_limit(options);
     let mut session = DecoderSession::new_with_password(password, buffered_decode_limit);
+    session.decoder.read_control = budget.control.clone();
 
     for (volume_index, archive) in volumes.iter().enumerate() {
         for (file_index, file) in archive.files().enumerate() {
+            options.check_cancelled()?;
             // Admission precedes split decryption and checksum-error preference:
             // a resource refusal must not read payloads or become a checksum error.
             file.check_dictionary_limit(options.rar50_dictionary_size_limit)?;
@@ -890,13 +918,17 @@ where
                 SplitVolumeStep::Regular => {
                     if let Some(redirection) = &file.redirection {
                         if emit_redirections {
+                            options.check_cancelled()?;
                             redirect(&file.metadata(), redirection)?;
+                            options.check_cancelled()?;
                         }
                         continue;
                     }
                     file.check_output_limit(&budget)?;
                     let meta = file.metadata();
+                    options.check_cancelled()?;
                     let mut writer = open(&meta)?;
+                    options.check_cancelled()?;
                     if !meta.is_directory {
                         budget.run(&file.name, &mut writer, |writer| {
                             session.write_file_to(archive, file, writer)
@@ -935,6 +967,7 @@ where
         return Err(Error::InvalidHeader("RAR 5 split entry is incomplete"));
     }
 
+    options.check_cancelled()?;
     Ok(())
 }
 
@@ -1012,7 +1045,9 @@ impl PendingSplitRefs {
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
+        budget.control.check()?;
         let decryptor = session.split_decryptor(&self, volumes)?;
+        budget.control.check()?;
         let meta = ExtractedEntryMeta {
             name: self.name.clone(),
             file_time: self.file_time,
@@ -1289,7 +1324,9 @@ impl FileHeader {
     ) -> Result<Vec<u8>> {
         if self.is_stored() {
             let mut data = Vec::new();
-            let mut reader = split.fragment_reader(volumes, decryptor)?;
+            let mut reader = decoder
+                .read_control
+                .reader(split.fragment_reader(volumes, decryptor)?);
             reader.read_to_end(&mut data)?;
             if data.len() as u64 != self.unpacked_size {
                 return Err(Error::InvalidHeader(

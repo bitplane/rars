@@ -29,6 +29,8 @@ mod io_util;
 mod output_limit;
 mod parallel;
 mod parse_budget;
+mod read_control;
+pub use read_control::ReadCancellation;
 pub mod rar13;
 pub mod rar15_40;
 pub mod rar50;
@@ -70,6 +72,11 @@ pub use write_progress::{WriteOperation, WriteProgress, WriteProgressEvent};
 pub struct ArchiveReadOptions<'a> {
     /// Password bytes used for encrypted headers or payloads.
     pub password: Option<&'a [u8]>,
+    /// Cooperative cancellation for this parsing or extraction call. Parsing
+    /// does not retain the token for later extraction. A cancelled token stays
+    /// cancelled; use a new token for a new operation. Partial output may remain.
+    /// Blocked caller I/O and indivisible library work cannot be preempted.
+    pub cancellation: Option<&'a ReadCancellation>,
     /// Inclusive top-level header count for one physical archive parse.
     /// Counts main, encryption, file/directory, service, unknown and end headers;
     /// standalone signatures/markers and nested records are not separate headers.
@@ -137,6 +144,21 @@ pub struct ArchiveReadOptions<'a> {
 }
 
 impl<'a> ArchiveReadOptions<'a> {
+    /// Uses a shared cancellation signal without retaining policy in the archive.
+    pub fn with_cancellation(mut self, token: &'a ReadCancellation) -> Self {
+        self.cancellation = Some(token);
+        self
+    }
+
+    pub(crate) fn check_cancelled(&self) -> Result<()> {
+        if self
+            .cancellation
+            .is_some_and(ReadCancellation::is_cancelled)
+        {
+            return Err(Error::Cancelled);
+        }
+        Ok(())
+    }
     /// Creates read options without a password.
     pub fn new() -> Self {
         Self::default()
@@ -538,6 +560,7 @@ impl Archive {
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
+        options.check_cancelled()?;
         match self {
             Self::Rar13(archive) => {
                 archive.extract_to_with_options(options, |meta| open(&rar13_meta(meta)))
@@ -571,6 +594,7 @@ impl Archive {
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
+        options.check_cancelled()?;
         match self {
             Self::Rar13(archive) => {
                 archive.extract_to_with_options(options, |meta| open(&rar13_meta(meta)))
@@ -867,6 +891,7 @@ impl ArchiveReader {
 
     /// Parses an archive from memory using explicit read options.
     pub fn read_with_options(input: &[u8], options: ArchiveReadOptions<'_>) -> Result<Archive> {
+        options.check_cancelled()?;
         let signature =
             find_archive_start(input, SFX_SCAN_LIMIT).ok_or(Error::UnsupportedSignature)?;
         match signature.family {
@@ -887,6 +912,7 @@ impl ArchiveReader {
         input: Vec<u8>,
         options: ArchiveReadOptions<'_>,
     ) -> Result<Archive> {
+        options.check_cancelled()?;
         let signature =
             find_archive_start(&input, SFX_SCAN_LIMIT).ok_or(Error::UnsupportedSignature)?;
         match signature.family {
@@ -912,11 +938,13 @@ impl ArchiveReader {
         path: impl AsRef<Path>,
         options: ArchiveReadOptions<'_>,
     ) -> Result<Archive> {
+        options.check_cancelled()?;
         let path = path.as_ref();
         let mut file = std::fs::File::open(path)?;
         let len = file.metadata()?.len();
         let mut scan = vec![0; len.min(SFX_SCAN_LIMIT as u64) as usize];
         file.read_exact(&mut scan)?;
+        options.check_cancelled()?;
         let signature =
             find_archive_start(&scan, SFX_SCAN_LIMIT).ok_or(Error::UnsupportedSignature)?;
         match signature.family {
@@ -957,6 +985,7 @@ pub fn extract_volumes_to_with_options<F>(
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
 {
+    options.check_cancelled()?;
     let Some(first) = archives.first() else {
         return Err(Error::InvalidHeader("volume set is empty"));
     };

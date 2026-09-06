@@ -264,6 +264,7 @@ fn admit_header(
     budget: &mut crate::parse_budget::ParseBudget,
     offset: usize,
 ) -> Result<()> {
+    budget.control.check()?;
     if !budget.is_limited() {
         return Ok(());
     }
@@ -354,6 +355,7 @@ impl Archive {
         input: &[u8],
         options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Self> {
+        options.check_cancelled()?;
         let data: Arc<[u8]> = Arc::from(input.to_vec().into_boxed_slice());
         Self::parse_shared(data, options)
     }
@@ -366,6 +368,7 @@ impl Archive {
         input: Vec<u8>,
         options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Self> {
+        options.check_cancelled()?;
         Self::parse_shared(Arc::from(input.into_boxed_slice()), options)
     }
 
@@ -377,12 +380,14 @@ impl Archive {
         path: impl AsRef<Path>,
         options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Self> {
+        options.check_cancelled()?;
         let path = Arc::new(path.as_ref().to_path_buf());
         let mut file = File::open(path.as_ref())?;
         let len = file.metadata()?.len();
         let scan_len = len.min(SFX_SCAN_LIMIT as u64) as usize;
         let mut scan = vec![0; scan_len];
         file.read_exact(&mut scan)?;
+        options.check_cancelled()?;
         let sig = find_archive_start(&scan, SFX_SCAN_LIMIT).ok_or(Error::UnsupportedSignature)?;
         if sig.family != ArchiveFamily::Rar13 {
             return Err(Error::UnsupportedSignature);
@@ -406,6 +411,7 @@ impl Archive {
         signature: ArchiveSignature,
         options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Self> {
+        options.check_cancelled()?;
         if signature.family != ArchiveFamily::Rar13 {
             return Err(Error::UnsupportedSignature);
         }
@@ -422,6 +428,7 @@ impl Archive {
     }
 
     fn parse_shared(input: Arc<[u8]>, options: crate::ArchiveReadOptions<'_>) -> Result<Self> {
+        options.check_cancelled()?;
         let sig = find_archive_start(&input, SFX_SCAN_LIMIT).ok_or(Error::UnsupportedSignature)?;
         if sig.family != ArchiveFamily::Rar13 {
             return Err(Error::UnsupportedSignature);
@@ -467,6 +474,7 @@ impl Archive {
             pos = data_end;
         }
 
+        options.check_cancelled()?;
         Ok(Self {
             sfx_offset: sig.offset,
             main,
@@ -476,13 +484,15 @@ impl Archive {
     }
 
     fn parse_seekable(
-        mut file: impl Read + std::io::Seek,
+        file: impl Read + std::io::Seek,
         file_len: u64,
         sfx_offset: usize,
         source: ArchiveSource,
         options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Self> {
+        options.check_cancelled()?;
         let mut budget = crate::parse_budget::ParseBudget::new(options);
+        let mut file = budget.control.reader(file);
         let main_prefix = read_exact_at(&mut file, sfx_offset, MAIN_HEAD_SIZE as usize)?;
         let head_size = read_u16(&main_prefix, 4)? as usize;
         admit_header(
@@ -532,6 +542,7 @@ impl Archive {
             pos = data_end;
         }
 
+        options.check_cancelled()?;
         Ok(Self {
             sfx_offset,
             main,
@@ -604,11 +615,14 @@ impl Archive {
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
+        options.check_cancelled()?;
         let password = options.password;
         let mut budget = crate::output_limit::OutputBudget::new(options);
         let mut unpack15 = Unpack15::new();
+        unpack15.read_control = budget.control.clone();
         let mut extracted_count = 0usize;
         for entry in &self.entries {
+            options.check_cancelled()?;
             if entry.is_split_before() || entry.is_split_after() {
                 return Err(Error::InvalidHeader(
                     "RAR 1.3 split entry requires multivolume extraction",
@@ -616,12 +630,16 @@ impl Archive {
             }
             let meta = entry.metadata();
             if meta.is_directory {
+                options.check_cancelled()?;
                 let _ = open(&meta)?;
+                options.check_cancelled()?;
                 extracted_count += 1;
                 continue;
             }
             budget.check(u64::from(entry.header.unp_size), &meta.name)?;
+            options.check_cancelled()?;
             let mut writer = open(&meta)?;
+            options.check_cancelled()?;
             budget.run(&meta.name, &mut writer, |mut writer| {
                 if entry.is_stored() && !entry.is_encrypted() {
                     entry
@@ -642,6 +660,7 @@ impl Archive {
             })?;
             extracted_count += 1;
         }
+        options.check_cancelled()?;
         Ok(())
     }
 
@@ -961,14 +980,17 @@ pub fn extract_volumes_to_with_options<F>(
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
 {
+    options.check_cancelled()?;
     let password = options.password;
     let mut budget = crate::output_limit::OutputBudget::new(options);
     let mut pending: Option<PendingSplitRefs> = None;
     let mut unpack15 = Unpack15::new();
+    unpack15.read_control = budget.control.clone();
     let mut extracted_count = 0usize;
 
     for (volume_index, archive) in volumes.iter().enumerate() {
         for (entry_index, entry) in archive.entries.iter().enumerate() {
+            options.check_cancelled()?;
             if !entry.is_split_before() && !entry.is_split_after() {
                 if pending.is_some() {
                     return Err(Error::InvalidHeader(
@@ -977,12 +999,16 @@ where
                 }
                 let meta = entry.metadata();
                 if meta.is_directory {
+                    options.check_cancelled()?;
                     let _ = open(&meta)?;
+                    options.check_cancelled()?;
                     extracted_count += 1;
                     continue;
                 }
                 budget.check(u64::from(entry.header.unp_size), &meta.name)?;
+                options.check_cancelled()?;
                 let mut writer = open(&meta)?;
+                options.check_cancelled()?;
                 budget.run(&meta.name, &mut writer, |mut writer| {
                     entry
                         .write_compressed_to(
@@ -993,6 +1019,7 @@ where
                             &mut writer,
                         )
                         .map_err(|error| entry.entry_error("extracting", error))?;
+                    options.check_cancelled()?;
                     Ok(())
                 })?;
                 extracted_count += 1;
@@ -1040,6 +1067,7 @@ where
         return Err(Error::InvalidHeader("RAR 1.3 split entry is incomplete"));
     }
 
+    options.check_cancelled()?;
     Ok(())
 }
 
@@ -1141,6 +1169,7 @@ impl PendingSplitRefs {
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
+        options.check_cancelled()?;
         let password = options.password;
         budget.check(u64::from(final_entry.header.unp_size), &self.name)?;
         let mut reader = self.fragment_reader(volumes, password)?;
@@ -1150,7 +1179,9 @@ impl PendingSplitRefs {
             file_attr: self.file_attr,
             is_directory: false,
         };
+        options.check_cancelled()?;
         let mut writer = open(&meta)?;
+        options.check_cancelled()?;
         budget.run(&meta.name, &mut writer, |mut writer| {
             let mut checksum = Rar13Checksum::new();
             let mut checksum_writer = Rar13ChecksumWriter {
@@ -1169,6 +1200,7 @@ impl PendingSplitRefs {
             }
             let actual = checksum.finish();
             if actual == final_entry.header.file_crc {
+                options.check_cancelled()?;
                 Ok(())
             } else {
                 Err(Error::CrcMismatch {

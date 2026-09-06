@@ -2,6 +2,7 @@
 use crate::{ArchiveReadOptions, Error, Result};
 
 pub(crate) struct ParseBudget {
+    pub(crate) control: crate::read_control::ReadControl,
     count_limit: Option<u64>,
     byte_limit: Option<u64>,
     count: u64,
@@ -11,6 +12,7 @@ pub(crate) struct ParseBudget {
 impl ParseBudget {
     pub(crate) fn new(options: ArchiveReadOptions<'_>) -> Self {
         Self {
+            control: crate::read_control::ReadControl::new(options.cancellation),
             count_limit: options.max_header_count,
             byte_limit: options.max_header_bytes,
             count: 0,
@@ -24,6 +26,7 @@ impl ParseBudget {
 
     // Encrypted readers can check count before deriving keys/decrypting a prefix.
     pub(crate) fn check_count(&self, offset: usize) -> Result<()> {
+        self.control.check()?;
         if let Some(limit) = self.count_limit {
             if self.count == limit {
                 return Err(Error::HeaderCountLimitExceeded {

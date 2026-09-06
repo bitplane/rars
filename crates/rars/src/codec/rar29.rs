@@ -2218,6 +2218,7 @@ fn canonical_codes(lengths: &[u8]) -> Result<Vec<Option<HuffmanCode>>> {
 
 #[derive(Debug, Clone)]
 pub struct Unpack29 {
+    pub(crate) read_control: crate::read_control::ReadControl,
     bits: BitReader,
     levels: [u8; TABLE_COUNT],
     main: Huffman,
@@ -2294,6 +2295,7 @@ enum StandardFilter {
 impl Unpack29 {
     pub fn new() -> Self {
         Self {
+            read_control: crate::read_control::ReadControl::default(),
             bits: BitReader::new(),
             levels: [0; TABLE_COUNT],
             main: Huffman::empty(),
@@ -2322,10 +2324,13 @@ impl Unpack29 {
     }
 
     pub fn reset_non_solid(&mut self) {
+        let control = self.read_control.clone();
         *self = Self::new();
+        self.read_control = control;
     }
 
     pub fn decode_non_solid_member(&mut self, input: &[u8], output_size: usize) -> Result<Vec<u8>> {
+        self.read_control.check_codec()?;
         self.reset_non_solid();
         self.decode_member(input, output_size)
     }
@@ -2336,6 +2341,7 @@ impl Unpack29 {
         output_size: usize,
         out: &mut impl Write,
     ) -> Result<()> {
+        self.read_control.check_codec()?;
         self.reset_non_solid();
         self.decode_member_to(input, output_size, out)
     }
@@ -2346,11 +2352,15 @@ impl Unpack29 {
         output_size: usize,
         out: &mut impl Write,
     ) -> Result<()> {
+        self.read_control.check_codec()?;
+        let control = self.read_control.clone();
+        let input = &mut control.reader(input);
         self.reset_non_solid();
         self.decode_member_from_reader(input, output_size, out)
     }
 
     pub fn decode_member(&mut self, input: &[u8], output_size: usize) -> Result<Vec<u8>> {
+        self.read_control.check_codec()?;
         let start = self.current_pos();
         let target = start
             .checked_add(output_size)
@@ -2378,6 +2388,7 @@ impl Unpack29 {
         output_size: usize,
         out: &mut impl Write,
     ) -> Result<()> {
+        self.read_control.check_codec()?;
         let start = self.current_pos();
         let final_target = start
             .checked_add(output_size)
@@ -2425,6 +2436,9 @@ impl Unpack29 {
         output_size: usize,
         out: &mut impl Write,
     ) -> Result<()> {
+        self.read_control.check_codec()?;
+        let control = self.read_control.clone();
+        let input = &mut control.reader(input);
         self.bits = BitReader::new();
         let start = self.current_pos();
         let final_target = start
@@ -2488,7 +2502,9 @@ impl Unpack29 {
     }
 
     fn decode_until(&mut self, target: usize) -> Result<()> {
+        let mut poller = self.read_control.poller();
         while self.current_pos() < target {
+            poller.check_codec(self.current_pos())?;
             self.drain_pending_match(target)?;
             if self.current_pos() >= target {
                 break;
@@ -2519,6 +2535,7 @@ impl Unpack29 {
         self.bits.align_byte();
         if self.bits.peek_bit()? != 0 {
             let first_byte = self.bits.read_bits(8)? as u8;
+            self.ppmd.set_read_control(self.read_control.clone());
             self.ppmd
                 .decode_init(first_byte, &mut self.bits, &mut self.ppmd_esc)?;
             self.block_mode = BlockMode::Ppmd;
@@ -2605,7 +2622,9 @@ impl Unpack29 {
     }
 
     fn decode_lz(&mut self, output_size: usize) -> Result<()> {
+        let mut poller = self.read_control.poller();
         while self.current_pos() < output_size {
+            poller.check_codec(self.current_pos())?;
             let symbol = self.main.decode(&mut self.bits)?;
             match symbol {
                 0..=255 => self.output.push(symbol as u8),
@@ -2673,7 +2692,9 @@ impl Unpack29 {
     }
 
     fn decode_ppmd(&mut self, output_size: usize) -> Result<()> {
+        let mut poller = self.read_control.poller();
         while self.current_pos() < output_size {
+            poller.check_codec(self.current_pos())?;
             let Some(symbol) = self.ppmd.decode_symbol(&mut self.bits)? else {
                 return Ok(());
             };
@@ -2841,6 +2862,7 @@ impl Unpack29 {
     }
 
     fn read_vm_code(&mut self) -> Result<()> {
+        let mut poller = self.read_control.poller();
         let first_byte = self.bits.read_bits(8)?;
         let mut len = (first_byte & 7) + 1;
         if len == 7 {
@@ -2850,6 +2872,7 @@ impl Unpack29 {
         }
         let mut data = Vec::with_capacity(len as usize);
         for _ in 0..len {
+            poller.check_codec(data.len())?;
             data.push(self.bits.read_bits(8)? as u8);
         }
 
@@ -2857,6 +2880,7 @@ impl Unpack29 {
     }
 
     fn read_vm_code_ppmd(&mut self) -> Result<()> {
+        let mut poller = self.read_control.poller();
         let first_byte = u32::from(self.read_ppmd_required_byte()?);
         let mut len = (first_byte & 7) + 1;
         if len == 7 {
@@ -2867,6 +2891,7 @@ impl Unpack29 {
         }
         let mut data = Vec::with_capacity(len as usize);
         for _ in 0..len {
+            poller.check_codec(data.len())?;
             data.push(self.read_ppmd_required_byte()?);
         }
 
@@ -3025,22 +3050,29 @@ impl Unpack29 {
                 .get_mut(program_index)
                 .ok_or(Error::InvalidData("RAR 2.9 VM program is missing"))?;
             match &program.kind {
-                VmProgramKind::Standard(standard) => {
-                    apply_standard_filter(*standard, &mut block, file_offset, &regs)?
-                }
+                VmProgramKind::Standard(standard) => apply_standard_filter_with_control(
+                    *standard,
+                    &mut block,
+                    file_offset,
+                    &regs,
+                    &self.read_control,
+                )?,
                 VmProgramKind::Generic(generic) => {
                     let globals = if global_data.is_empty() {
                         program.globals.as_slice()
                     } else {
                         global_data.as_slice()
                     };
-                    let result = generic.execute(rarvm::Invocation {
-                        input: &block,
-                        regs,
-                        global_data: globals,
-                        file_offset: file_offset as u64,
-                        exec_count: program.exec_count,
-                    })?;
+                    let result = generic.execute_with_control(
+                        rarvm::Invocation {
+                            input: &block,
+                            regs,
+                            global_data: globals,
+                            file_offset: file_offset as u64,
+                            exec_count: program.exec_count,
+                        },
+                        &self.read_control,
+                    )?;
                     program.globals = result.globals;
                     block = result.output;
                 }
@@ -3461,20 +3493,47 @@ fn identify_standard_filter(code: &[u8]) -> Option<StandardFilter> {
     }
 }
 
+#[cfg(test)]
 fn apply_standard_filter(
     filter: StandardFilter,
     data: &mut Vec<u8>,
     file_offset: u32,
     regs: &[u32; 7],
 ) -> Result<()> {
+    apply_standard_filter_with_control(
+        filter,
+        data,
+        file_offset,
+        regs,
+        &crate::read_control::ReadControl::default(),
+    )
+}
+
+fn apply_standard_filter_with_control(
+    filter: StandardFilter,
+    data: &mut Vec<u8>,
+    file_offset: u32,
+    regs: &[u32; 7],
+    control: &crate::read_control::ReadControl,
+) -> Result<()> {
+    control.check_codec()?;
+
     match filter {
-        StandardFilter::E8 => {
-            filters::decode_in_place(FilterOp::E8, data, file_offset, rar29_delta_messages())?
-        }
-        StandardFilter::E8E9 => {
-            filters::decode_in_place(FilterOp::E8E9, data, file_offset, rar29_delta_messages())?
-        }
-        StandardFilter::Itanium => itanium_decode(data, file_offset),
+        StandardFilter::E8 => filters::decode_in_place_with_control(
+            FilterOp::E8,
+            data,
+            file_offset,
+            rar29_delta_messages(),
+            control,
+        )?,
+        StandardFilter::E8E9 => filters::decode_in_place_with_control(
+            FilterOp::E8E9,
+            data,
+            file_offset,
+            rar29_delta_messages(),
+            control,
+        )?,
+        StandardFilter::Itanium => itanium_decode_with_control(data, file_offset, control)?,
         StandardFilter::Delta => {
             let channels = regs[0] as usize;
             if channels == 0 || channels > MAX_DELTA_CHANNELS {
@@ -3482,11 +3541,12 @@ fn apply_standard_filter(
                     "RAR 2.9 DELTA filter channel count is invalid",
                 ));
             }
-            filters::decode_in_place(
+            filters::decode_in_place_with_control(
                 FilterOp::Delta { channels },
                 data,
                 0,
                 rar29_delta_messages(),
+                control,
             )?;
         }
         StandardFilter::Rgb => {
@@ -3497,7 +3557,7 @@ fn apply_standard_filter(
             }
             let width = regs[0] as usize - 3;
             let pos_r = regs[1] as usize;
-            *data = rgb_decode(data, width, pos_r)?;
+            *data = rgb_decode_with_control(data, width, pos_r, control)?;
         }
         StandardFilter::Audio => {
             let channels = regs[0] as usize;
@@ -3506,15 +3566,31 @@ fn apply_standard_filter(
                     "RAR 2.9 AUDIO filter channel count is invalid",
                 ));
             }
-            *data = audio_decode(data, channels)?;
+            *data = audio_decode_with_control(data, channels, control)?;
         }
     }
     Ok(())
 }
 
+#[cfg(test)]
 fn itanium_decode(data: &mut [u8], file_offset: u32) {
+    itanium_decode_with_control(
+        data,
+        file_offset,
+        &crate::read_control::ReadControl::default(),
+    )
+    .expect("uncancelled filter");
+}
+
+fn itanium_decode_with_control(
+    data: &mut [u8],
+    file_offset: u32,
+    control: &crate::read_control::ReadControl,
+) -> Result<()> {
+    control.check_codec()?;
+    let mut poller = control.poller();
     if data.len() <= 21 {
-        return;
+        return Ok(());
     }
     let base_offset = file_offset >> 4;
     // Each 16-byte Itanium bundle can inspect a 4-byte instruction field that
@@ -3523,6 +3599,7 @@ fn itanium_decode(data: &mut [u8], file_offset: u32) {
     let block_count = (data.len() - 21).div_ceil(16);
     for block in 0..block_count {
         let pos = block * 16;
+        poller.check_codec(pos)?;
         let file_offset = base_offset.wrapping_add(block as u32);
         let mut mask = (0x334b_0000u32 >> (data[pos] & 0x1e)) & 3;
         if mask != 0 {
@@ -3540,9 +3617,18 @@ fn itanium_decode(data: &mut [u8], file_offset: u32) {
             }
         }
     }
+
+    Ok(())
 }
 
-fn rgb_decode(data: &[u8], width: usize, pos_r: usize) -> Result<Vec<u8>> {
+fn rgb_decode_with_control(
+    data: &[u8],
+    width: usize,
+    pos_r: usize,
+    control: &crate::read_control::ReadControl,
+) -> Result<Vec<u8>> {
+    control.check_codec()?;
+    let mut poller = control.poller();
     if data.len() < 3 || width == 0 || !width.is_multiple_of(3) || width > data.len() || pos_r > 2 {
         return Err(Error::InvalidData(
             "RAR 2.9 RGB filter parameters are invalid",
@@ -3554,6 +3640,7 @@ fn rgb_decode(data: &[u8], width: usize, pos_r: usize) -> Result<Vec<u8>> {
         let mut prev = 0u8;
         let mut i = channel;
         while i < data.len() {
+            poller.check_codec(src)?;
             let predicted = if i >= width + 3 {
                 rgb_predict(prev, out[i - width], out[i - width - 3])
             } else {
@@ -3569,6 +3656,7 @@ fn rgb_decode(data: &[u8], width: usize, pos_r: usize) -> Result<Vec<u8>> {
         }
     }
     for i in (pos_r..data.len().saturating_sub(2)).step_by(3) {
+        poller.check_codec(i)?;
         let green = out[i + 1];
         out[i] = out[i].wrapping_add(green);
         out[i + 2] = out[i + 2].wrapping_add(green);
@@ -3590,7 +3678,13 @@ fn rgb_predict(prev: u8, upper: u8, upper_left: u8) -> u8 {
     }
 }
 
-fn audio_decode(data: &[u8], channels: usize) -> Result<Vec<u8>> {
+fn audio_decode_with_control(
+    data: &[u8],
+    channels: usize,
+    control: &crate::read_control::ReadControl,
+) -> Result<Vec<u8>> {
+    control.check_codec()?;
+    let mut poller = control.poller();
     let mut out = vec![0u8; data.len()];
     let mut src = 0usize;
     for channel in 0..channels {
@@ -3605,6 +3699,7 @@ fn audio_decode(data: &[u8], channels: usize) -> Result<Vec<u8>> {
         let mut byte_count = 0usize;
         let mut i = channel;
         while i < data.len() {
+            poller.check_codec(src)?;
             let d3 = d2;
             d2 = prev_delta - d1;
             d1 = prev_delta;
@@ -3655,6 +3750,44 @@ fn audio_decode(data: &[u8], channels: usize) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use super::{audio_decode_with_control, itanium_decode_with_control, rgb_decode_with_control};
+
+    #[test]
+    fn cancellation_interrupts_lz_and_ppmd_after_non_solid_reset() {
+        let data = b"cancellable legacy symbols ".repeat(16384);
+        for packed in [
+            unpack29_encode_literals(&data).unwrap(),
+            unpack29_encode_ppmd_literals(&data).unwrap(),
+        ] {
+            let token = crate::ReadCancellation::new();
+            let mut decoder = Unpack29::new();
+            decoder.read_control = crate::read_control::ReadControl::new(Some(&token));
+            decoder.read_control.cancel_after_checks(4);
+            assert_eq!(
+                decoder
+                    .decode_non_solid_member(&packed, data.len())
+                    .unwrap_err(),
+                Error::Cancelled
+            );
+            assert!(decoder.current_pos() > 0 && decoder.current_pos() < data.len());
+        }
+    }
+
+    #[test]
+    fn cancellation_interrupts_standard_filter_passes() {
+        for kind in 0..3 {
+            let token = crate::ReadCancellation::new();
+            let control = crate::read_control::ReadControl::new(Some(&token));
+            control.cancel_after_checks(2);
+            let mut data = vec![0; 384 * 1024];
+            let result = match kind {
+                0 => itanium_decode_with_control(&mut data, 0, &control),
+                1 => rgb_decode_with_control(&data, 96, 0, &control).map(|_| ()),
+                _ => audio_decode_with_control(&data, 2, &control).map(|_| ()),
+            };
+            assert_eq!(result.unwrap_err(), Error::Cancelled);
+        }
+    }
     use super::rarvm::{Instruction, Opcode, Operand, Program};
     use std::ops::Range;
 

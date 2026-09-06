@@ -61,6 +61,8 @@ enum AllocSide {
 
 #[derive(Debug, Clone)]
 struct Suballocator {
+    read_control: crate::read_control::ReadControl,
+    interrupted: bool,
     // Original pool size in bytes (C's p->Size). Preserved across restarts so
     // the text/units split — which depends on the exact byte size, not the
     // unit-truncated one — stays identical to the reference each restart.
@@ -95,6 +97,8 @@ impl Default for Suballocator {
     fn default() -> Self {
         const EMPTY: Vec<u32> = Vec::new();
         Self {
+            read_control: crate::read_control::ReadControl::default(),
+            interrupted: false,
             size_bytes: 0,
             pool_units: 0,
             rem: 0,
@@ -185,6 +189,9 @@ impl Suballocator {
         //   3. Otherwise shrink units_start (consume text-reservation).
         if self.glue_count == 0 {
             self.glue();
+            if self.interrupted {
+                return None;
+            }
             self.glue_count = GLUE_RESET;
             if let Some(offset) = self.free_lists[bucket].pop() {
                 return Some(offset);
@@ -288,7 +295,11 @@ impl Suballocator {
     }
 
     fn glue(&mut self) {
-        self.glue_inner()
+        if self.glue_inner().is_err() {
+            // Allocation failure normally restarts the model. Keep cancellation
+            // distinct and let decode_symbol return it instead of resuming.
+            self.interrupted = true;
+        }
     }
 
     // Faithful port of Ppmd7_GlueFreeBlocks (§4.4). The earlier
@@ -303,8 +314,9 @@ impl Suballocator {
     //   3. Fill split: runs are emitted as repeated 128-unit blocks, then the
     //      <=128 remainder via Ppmd7_SplitBlock's exact-or-two-piece rule —
     //      not "largest bucket fitting" greedily.
-    fn glue_inner(&mut self) {
+    fn glue_inner(&mut self) -> Result<()> {
         use std::collections::HashMap;
+        let mut poller = self.read_control.poller();
         // Step 1: thread free blocks into the reference's list order.
         // list[k] = (offset, nu). Reference prepends; we emulate with a
         // front-growing build then it is naturally bucket-37-first.
@@ -316,12 +328,13 @@ impl Suballocator {
             // prepending reproduces that; doing it per-bucket with the whole
             // bucket prepended keeps later buckets in front.
             for &off in self.free_lists[bucket].iter().rev() {
+                poller.check_codec(0)?;
                 list.insert(0, (off, nu));
             }
             self.free_lists[bucket].clear();
         }
         if list.is_empty() {
-            return;
+            return Ok(());
         }
 
         // Step 2: glue pass. Absorb the physically-next free block while the
@@ -329,14 +342,17 @@ impl Suballocator {
         // to its current size; absorbed blocks are set to 0.
         let mut nu_at: HashMap<u32, u32> = HashMap::with_capacity(list.len() * 2);
         for &(off, nu) in &list {
+            poller.check_codec(0)?;
             nu_at.insert(off, nu);
         }
         for &(off, _) in &list {
+            poller.check_codec(0)?;
             let mut cur = match nu_at.get(&off) {
                 Some(&n) if n != 0 => n,
                 _ => continue,
             };
             loop {
+                poller.check_codec(0)?;
                 let next_off = off + cur;
                 match nu_at.get(&next_off) {
                     Some(&n2) => {
@@ -355,12 +371,14 @@ impl Suballocator {
 
         // Step 3: fill pass in list order.
         for &(off, _) in &list {
+            poller.check_codec(0)?;
             let nu = match nu_at.get(&off) {
                 Some(&n) if n != 0 => n,
                 _ => continue,
             };
             self.emit_run(off, nu);
         }
+        Ok(())
     }
 
     // Re-bucket a single merged run exactly as Ppmd7_GlueFreeBlocks' fill /
@@ -493,6 +511,9 @@ struct RangeDecoder {
 }
 
 impl PpmdDecoder {
+    pub(crate) fn set_read_control(&mut self, control: crate::read_control::ReadControl) {
+        self.suballoc.read_control = control;
+    }
     pub fn new() -> Self {
         let mut ns2bs_indx = [0u8; 256];
         ns2bs_indx[0] = 0;
@@ -599,7 +620,15 @@ impl PpmdDecoder {
     }
 
     pub fn decode_symbol(&mut self, input: &mut impl PpmdByteReader) -> Result<Option<u8>> {
-        self.decode_symbol_inner(input)
+        // Ordinary symbol/context work is bounded by the model order and the
+        // 256-symbol alphabet; the enclosing decoder polls between symbols.
+        // Free-list maintenance can traverse the whole model and polls itself.
+        let result = self.decode_symbol_inner(input);
+        if self.suballoc.interrupted {
+            Err(Error::Cancelled)
+        } else {
+            result
+        }
     }
 
     fn decode_symbol_inner(&mut self, input: &mut impl PpmdByteReader) -> Result<Option<u8>> {
@@ -845,6 +874,9 @@ impl PpmdDecoder {
     }
 
     fn init_model(&mut self, max_order: usize) {
+        if self.suballoc.interrupted {
+            return;
+        }
         self.contexts.clear();
         self.text.clear();
         // Spec §5.2 RestartModel: clear free lists, reserve root context
@@ -1695,6 +1727,21 @@ fn model_context_limit(dictionary_mb: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn cancellation_interrupts_suballocator_maintenance() {
+        let token = crate::ReadCancellation::new();
+        let control = crate::read_control::ReadControl::new(Some(&token));
+        control.cancel_after_checks(1);
+        let mut allocator = Suballocator {
+            read_control: control,
+            ..Suballocator::default()
+        };
+        allocator.free_lists[0] = (0..5000).collect();
+        allocator.glue();
+        assert!(allocator.interrupted);
+        assert!(token.is_cancelled());
+    }
     use super::*;
 
     #[test]

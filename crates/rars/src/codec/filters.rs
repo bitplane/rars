@@ -41,30 +41,77 @@ pub(crate) fn encode_in_place(
 /// loop runs once per channel whether or not the channel has any bytes.
 pub(crate) const MAX_DELTA_CHANNELS: usize = 1024;
 
+#[cfg(test)]
 pub(crate) fn decode_in_place(
     op: FilterOp,
     data: &mut Vec<u8>,
     file_offset: u32,
     messages: DeltaErrorMessages,
 ) -> Result<()> {
+    decode_in_place_with_control(
+        op,
+        data,
+        file_offset,
+        messages,
+        &crate::read_control::ReadControl::default(),
+    )
+}
+
+pub(crate) fn decode_in_place_with_control(
+    op: FilterOp,
+    data: &mut Vec<u8>,
+    file_offset: u32,
+    messages: DeltaErrorMessages,
+    control: &crate::read_control::ReadControl,
+) -> Result<()> {
+    control.check_codec()?;
+
     match op {
-        FilterOp::E8 => e8e9_decode(data, file_offset, false),
-        FilterOp::E8E9 => e8e9_decode(data, file_offset, true),
+        FilterOp::E8 => e8e9_decode_with_control(data, file_offset, false, control)?,
+        FilterOp::E8E9 => e8e9_decode_with_control(data, file_offset, true, control)?,
         FilterOp::Delta { channels } => {
-            *data = delta_decode(data, channels, messages)?;
+            *data = delta_decode_with_control(data, channels, messages, control)?;
         }
     }
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn e8e9_decode(data: &mut [u8], file_offset: u32, include_e9: bool) {
+    e8e9_decode_with_control(
+        data,
+        file_offset,
+        include_e9,
+        &crate::read_control::ReadControl::default(),
+    )
+    .expect("uncancelled filter");
+}
+
+pub(crate) fn e8e9_decode_with_control(
+    data: &mut [u8],
+    file_offset: u32,
+    include_e9: bool,
+    control: &crate::read_control::ReadControl,
+) -> Result<()> {
+    control.check_codec()?;
+    let mut poller = control.poller();
     if data.len() <= 4 {
-        return;
+        return Ok(());
     }
     let cmp_mask = if include_e9 { 0xfe } else { 0xff };
     let opcode_limit = data.len() - 4;
     let mut opcode_pos = 0usize;
-    while let Some(pos) = super::fast::next_x86_opcode(data, opcode_pos, opcode_limit, cmp_mask) {
+    while opcode_pos < opcode_limit {
+        poller.check_codec(opcode_pos)?;
+        let scan_end = if control.is_enabled() {
+            opcode_limit.min(opcode_pos.saturating_add(64 * 1024))
+        } else {
+            opcode_limit
+        };
+        let Some(pos) = super::fast::next_x86_opcode(data, opcode_pos, scan_end, cmp_mask) else {
+            opcode_pos = scan_end;
+            continue;
+        };
         let cur_pos = pos + 1;
         let offset = file_offset.wrapping_add(cur_pos as u32);
         let addr = u32::from_le_bytes([
@@ -85,6 +132,8 @@ pub(crate) fn e8e9_decode(data: &mut [u8], file_offset: u32, include_e9: bool) {
         }
         opcode_pos = pos + 5;
     }
+
+    Ok(())
 }
 
 pub(crate) fn e8e9_encode(data: &mut [u8], file_offset: u32, include_e9: bool) {
@@ -116,11 +165,14 @@ pub(crate) fn e8e9_encode(data: &mut [u8], file_offset: u32, include_e9: bool) {
     }
 }
 
-pub(crate) fn delta_decode(
+pub(crate) fn delta_decode_with_control(
     data: &[u8],
     channels: usize,
     messages: DeltaErrorMessages,
+    control: &crate::read_control::ReadControl,
 ) -> Result<Vec<u8>> {
+    control.check_codec()?;
+    let mut poller = control.poller();
     if channels == 0 {
         return Err(Error::InvalidData(messages.zero_channels));
     }
@@ -133,6 +185,7 @@ pub(crate) fn delta_decode(
         let mut prev = 0u8;
         let mut dest = channel;
         while dest < out.len() {
+            poller.check_codec(src)?;
             let byte = *data
                 .get(src)
                 .ok_or(Error::InvalidData(messages.truncated_source))?;
@@ -169,6 +222,36 @@ pub(crate) fn delta_encode(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn configured_x86_scanning_matches_default_across_poll_boundaries() {
+        let mut input = vec![0; 192 * 1024];
+        for pos in [65530, 65535, 65541, 131070, 131080] {
+            input[pos] = 0xe8;
+            input[pos + 1..pos + 5].copy_from_slice(&123456u32.to_le_bytes());
+        }
+        let token = crate::ReadCancellation::new();
+        let control = crate::read_control::ReadControl::new(Some(&token));
+        let mut expected = input.clone();
+        e8e9_decode(&mut expected, 4096, true);
+        e8e9_decode_with_control(&mut input, 4096, true, &control).unwrap();
+        assert_eq!(input, expected);
+    }
+
+    #[test]
+    fn cancellation_interrupts_delta_and_opcode_free_x86_scans() {
+        for x86 in [false, true] {
+            let token = crate::ReadCancellation::new();
+            let control = crate::read_control::ReadControl::new(Some(&token));
+            control.cancel_after_checks(2);
+            let mut bytes = vec![0; 384 * 1024];
+            let result = if x86 {
+                e8e9_decode_with_control(&mut bytes, 0, true, &control)
+            } else {
+                delta_decode_with_control(&bytes, 2, generic_messages(), &control).map(|_| ())
+            };
+            assert_eq!(result.unwrap_err(), Error::Cancelled);
+        }
+    }
     use super::*;
 
     fn generic_messages() -> DeltaErrorMessages {

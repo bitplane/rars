@@ -1522,6 +1522,7 @@ fn encode_decode_num_prefix(
 
 #[derive(Clone)]
 pub struct Unpack15 {
+    pub(crate) read_control: crate::read_control::ReadControl,
     bits: BitReader,
     target: usize,
     output_written: usize,
@@ -1605,6 +1606,7 @@ impl Unpack15 {
     /// decoded against zeroes.
     pub fn new() -> Self {
         let mut decoder = Self {
+            read_control: crate::read_control::ReadControl::default(),
             bits: BitReader::new(&[]),
             target: 0,
             output_written: 0,
@@ -1647,6 +1649,7 @@ impl Unpack15 {
     }
 
     pub fn decode_member(&mut self, input: &[u8], target: usize, solid: bool) -> Result<Vec<u8>> {
+        self.read_control.check_codec()?;
         let mut output = Vec::with_capacity(target);
         self.decode_member_to(input, target, solid, &mut output)?;
         Ok(output)
@@ -1659,6 +1662,7 @@ impl Unpack15 {
         solid: bool,
         out: &mut impl Write,
     ) -> Result<()> {
+        self.read_control.check_codec()?;
         self.init_member(target, solid);
         self.bits = BitReader::new_final(input);
         self.decode_loop(out).map_err(|error| match error {
@@ -1674,6 +1678,9 @@ impl Unpack15 {
         solid: bool,
         out: &mut impl Write,
     ) -> Result<()> {
+        self.read_control.check_codec()?;
+        let control = self.read_control.clone();
+        let input = &mut control.reader(input);
         const OUTPUT_CHUNK: usize = 64 * 1024;
 
         self.init_member(target, solid);
@@ -1724,7 +1731,9 @@ impl Unpack15 {
     }
 
     fn decode_loop_until(&mut self, target: usize, out: &mut impl Write) -> Result<()> {
+        let mut poller = self.read_control.poller();
         while self.output_written < target {
+            poller.check_codec(self.output_written)?;
             self.decode_step(out)?;
         }
 
@@ -2254,6 +2263,24 @@ fn corr_huff(char_set: &mut [u16; 256], num_to_place: &mut [u8; 256]) {
 
 #[cfg(test)]
 mod tests {
+    use crate::codec::Error;
+
+    #[test]
+    fn cancellation_interrupts_buffered_symbol_work() {
+        let data = b"cancellable legacy symbols ".repeat(16384);
+        let packed = unpack15_encode(&data).unwrap();
+        let token = crate::ReadCancellation::new();
+        let mut decoder = Unpack15::new();
+        decoder.read_control = crate::read_control::ReadControl::new(Some(&token));
+        decoder.read_control.cancel_after_checks(3);
+        assert_eq!(
+            decoder
+                .decode_member(&packed, data.len(), false)
+                .unwrap_err(),
+            Error::Cancelled
+        );
+        assert!(decoder.output_written > 0 && decoder.output_written < data.len());
+    }
     use super::{
         decode_num_bit_cost, find_long_lz, find_long_lz_with_buckets, find_lz_token,
         find_old_dist_lz, find_short_lz, flag_fits, long_lz_buckets, should_lazy_emit_literal,

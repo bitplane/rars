@@ -2531,6 +2531,7 @@ fn literal_presence(data: &[u8]) -> [bool; 256] {
 
 #[derive(Debug, Clone)]
 pub struct Unpack50Decoder {
+    pub(crate) read_control: crate::read_control::ReadControl,
     tables: Option<DecodeTables>,
     reps: [usize; 4],
     last_length: usize,
@@ -2540,6 +2541,7 @@ pub struct Unpack50Decoder {
 impl Unpack50Decoder {
     pub fn new() -> Self {
         Self {
+            read_control: crate::read_control::ReadControl::default(),
             tables: None,
             reps: [0; 4],
             last_length: 0,
@@ -2555,6 +2557,7 @@ impl Unpack50Decoder {
         solid: bool,
         mode: DecodeMode,
     ) -> Result<Vec<u8>> {
+        self.read_control.check_codec()?;
         self.decode_member_with_dictionary(
             input,
             algorithm_version,
@@ -2574,6 +2577,7 @@ impl Unpack50Decoder {
         solid: bool,
         mode: DecodeMode,
     ) -> Result<Vec<u8>> {
+        self.read_control.check_codec()?;
         let mut input = std::io::Cursor::new(input);
         self.decode_member_from_reader_with_dictionary(
             &mut input,
@@ -2593,6 +2597,9 @@ impl Unpack50Decoder {
         solid: bool,
         mode: DecodeMode,
     ) -> Result<Vec<u8>> {
+        self.read_control.check_codec()?;
+        let control = self.read_control.clone();
+        let input = &mut control.reader(input);
         self.decode_member_from_reader_with_dictionary(
             input,
             algorithm_version,
@@ -2612,6 +2619,9 @@ impl Unpack50Decoder {
         solid: bool,
         mode: DecodeMode,
     ) -> Result<Vec<u8>> {
+        self.read_control.check_codec()?;
+        let control = self.read_control.clone();
+        let input = &mut control.reader(input);
         if dictionary_size == 0 {
             return Err(Error::InvalidData("RAR 5 dictionary size is zero"));
         }
@@ -2638,7 +2648,9 @@ impl Unpack50Decoder {
             let mut bits = BitReader::new(payload);
             bits.bit_pos = payload_bit_pos;
 
+            let mut poller = self.read_control.poller();
             while bits.bit_pos < block.header.payload_bits && output.len() < output_size {
+                poller.check_codec(output.len())?;
                 let symbol = tables.main.decode(&mut bits)?;
                 match symbol {
                     0..=255 => output.push(symbol as u8),
@@ -2730,7 +2742,8 @@ impl Unpack50Decoder {
                 None
             };
             if mode.applies_filters() {
-                apply_filters(&mut output, &filters)?;
+                self.read_control.check_codec()?;
+                apply_filters_with_control(&mut output, &filters, &self.read_control)?;
             }
             self.history
                 .extend_from_slice(history_output.as_deref().unwrap_or(&output));
@@ -2753,6 +2766,9 @@ impl Unpack50Decoder {
         solid: bool,
         mut sink: impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), StreamDecodeError<E>> {
+        self.read_control.check_codec()?;
+        let control = self.read_control.clone();
+        let input = &mut control.reader(input);
         if dictionary_size == 0 {
             return Err(Error::InvalidData("RAR 5 dictionary size is zero").into());
         }
@@ -2792,7 +2808,9 @@ impl Unpack50Decoder {
             let mut bits = BitReader::new(payload);
             bits.bit_pos = payload_bit_pos;
 
+            let mut poller = self.read_control.poller();
             while bits.bit_pos < block.header.payload_bits && output.written() < output_size {
+                poller.check_codec(output.written())?;
                 let symbol = tables.main.decode(&mut bits)?;
                 match symbol {
                     0..=255 => output.push(symbol as u8, &mut sink)?,
@@ -3258,8 +3276,14 @@ fn write_filter_data(writer: &mut BitWriter, value: u32) {
     }
 }
 
-fn apply_filters(output: &mut [u8], filters: &[PendingFilter]) -> Result<()> {
+fn apply_filters_with_control(
+    output: &mut [u8],
+    filters: &[PendingFilter],
+    control: &crate::read_control::ReadControl,
+) -> Result<()> {
+    control.check_codec()?;
     for filter in filters {
+        control.check_codec()?;
         let end = filter
             .start
             .checked_add(filter.length)
@@ -3269,12 +3293,17 @@ fn apply_filters(output: &mut [u8], filters: &[PendingFilter]) -> Result<()> {
             .ok_or(Error::InvalidData("RAR 5 filter range exceeds output"))?;
         match filter.filter_type {
             FilterType::Delta => {
-                let decoded = filters::delta_decode(data, filter.channels, rar50_delta_messages())?;
+                let decoded = filters::delta_decode_with_control(
+                    data,
+                    filter.channels,
+                    rar50_delta_messages(),
+                    control,
+                )?;
                 data.copy_from_slice(&decoded);
             }
-            FilterType::E8 => e8e9_decode(data, filter.start as u32, false),
-            FilterType::E8E9 => e8e9_decode(data, filter.start as u32, true),
-            FilterType::Arm => arm_decode(data, filter.start as u32),
+            FilterType::E8 => e8e9_decode_with_control(data, filter.start as u32, false, control)?,
+            FilterType::E8E9 => e8e9_decode_with_control(data, filter.start as u32, true, control)?,
+            FilterType::Arm => arm_decode_with_control(data, filter.start as u32, control)?,
         }
     }
     Ok(())
@@ -3288,14 +3317,42 @@ fn rar50_delta_messages() -> DeltaErrorMessages {
     }
 }
 
+#[cfg(test)]
 fn e8e9_decode(data: &mut [u8], file_offset: u32, include_e9: bool) {
+    e8e9_decode_with_control(
+        data,
+        file_offset,
+        include_e9,
+        &crate::read_control::ReadControl::default(),
+    )
+    .expect("uncancelled filter");
+}
+
+fn e8e9_decode_with_control(
+    data: &mut [u8],
+    file_offset: u32,
+    include_e9: bool,
+    control: &crate::read_control::ReadControl,
+) -> Result<()> {
+    control.check_codec()?;
+    let mut poller = control.poller();
     if data.len() <= 4 {
-        return;
+        return Ok(());
     }
     let cmp_mask = if include_e9 { 0xfe } else { 0xff };
     let opcode_limit = data.len() - 4;
     let mut opcode_pos = 0usize;
-    while let Some(pos) = super::fast::next_x86_opcode(data, opcode_pos, opcode_limit, cmp_mask) {
+    while opcode_pos < opcode_limit {
+        poller.check_codec(opcode_pos)?;
+        let scan_end = if control.is_enabled() {
+            opcode_limit.min(opcode_pos.saturating_add(64 * 1024))
+        } else {
+            opcode_limit
+        };
+        let Some(pos) = super::fast::next_x86_opcode(data, opcode_pos, scan_end, cmp_mask) else {
+            opcode_pos = scan_end;
+            continue;
+        };
         let cur_pos = pos + 1;
         let offset = file_offset.wrapping_add(cur_pos as u32) % X86_FILTER_FILE_SIZE;
         let addr = u32::from_le_bytes([
@@ -3316,6 +3373,8 @@ fn e8e9_decode(data: &mut [u8], file_offset: u32, include_e9: bool) {
         }
         opcode_pos = pos + 5;
     }
+
+    Ok(())
 }
 
 fn e8e9_encode(data: &mut [u8], file_offset: u32, include_e9: bool) {
@@ -3351,9 +3410,26 @@ fn e8e9_encode(data: &mut [u8], file_offset: u32, include_e9: bool) {
 
 const X86_FILTER_FILE_SIZE: u32 = 0x0100_0000;
 
+#[cfg(test)]
 fn arm_decode(data: &mut [u8], file_offset: u32) {
+    arm_decode_with_control(
+        data,
+        file_offset,
+        &crate::read_control::ReadControl::default(),
+    )
+    .expect("uncancelled filter");
+}
+
+fn arm_decode_with_control(
+    data: &mut [u8],
+    file_offset: u32,
+    control: &crate::read_control::ReadControl,
+) -> Result<()> {
+    control.check_codec()?;
+    let mut poller = control.poller();
     let mut pos = 0usize;
     while pos + 3 < data.len() {
+        poller.check_codec(pos)?;
         if data[pos + 3] == 0xeb {
             let mut offset = u32::from(data[pos])
                 | (u32::from(data[pos + 1]) << 8)
@@ -3365,6 +3441,8 @@ fn arm_decode(data: &mut [u8], file_offset: u32) {
         }
         pos += 4;
     }
+
+    Ok(())
 }
 
 fn arm_encode(data: &mut [u8], file_offset: u32) {
@@ -3842,6 +3920,48 @@ fn write_level_lengths(writer: &mut BitWriter, lengths: &[u8; LEVEL_TABLE_SIZE])
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn configured_x86_scanning_matches_default_across_poll_boundaries() {
+        let mut input = vec![0; 192 * 1024];
+        for pos in [65530, 65535, 65541, 131070, 131080] {
+            input[pos] = 0xe9;
+            input[pos + 1..pos + 5].copy_from_slice(&123456u32.to_le_bytes());
+        }
+        let token = crate::ReadCancellation::new();
+        let control = crate::read_control::ReadControl::new(Some(&token));
+        let mut expected = input.clone();
+        e8e9_decode(&mut expected, 4096, true);
+        e8e9_decode_with_control(&mut input, 4096, true, &control).unwrap();
+        assert_eq!(input, expected);
+    }
+
+    #[test]
+    fn cancellation_interrupts_buffered_decode_and_filters() {
+        let data = b"cancellable RAR5 symbols ".repeat(16384);
+        let packed = encode_literal_only(&data, 0).unwrap();
+        let token = crate::ReadCancellation::new();
+        let mut decoder = Unpack50Decoder::new();
+        decoder.read_control = crate::read_control::ReadControl::new(Some(&token));
+        decoder.read_control.cancel_after_checks(16);
+        assert_eq!(
+            decoder
+                .decode_member(&packed, 0, data.len(), false, DecodeMode::Lz)
+                .unwrap_err(),
+            Error::Cancelled
+        );
+        for arm in [false, true] {
+            let token = crate::ReadCancellation::new();
+            let control = crate::read_control::ReadControl::new(Some(&token));
+            control.cancel_after_checks(2);
+            let mut bytes = vec![0; 384 * 1024];
+            let result = if arm {
+                arm_decode_with_control(&mut bytes, 0, &control)
+            } else {
+                e8e9_decode_with_control(&mut bytes, 0, true, &control)
+            };
+            assert_eq!(result.unwrap_err(), Error::Cancelled);
+        }
+    }
 
     #[test]
     fn repricing_keeps_the_smallest_actual_block_including_filters() {

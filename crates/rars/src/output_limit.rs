@@ -1,5 +1,7 @@
 //! Output admission and a writer guard whose error survives I/O adapters.
-use crate::{ArchiveReadOptions, Error, Result};
+#[cfg(test)]
+use crate::ArchiveReadOptions;
+use crate::{Error, Result};
 use std::io::{self, Write};
 
 pub(crate) fn check(limit: Option<u64>, required: u64, name: &[u8]) -> Result<()> {
@@ -16,6 +18,7 @@ fn error(limit: u64, required: u64, name: &[u8]) -> Error {
 /// Owned by one sequential extraction operation, including all its volumes.
 /// Declarations admit work; only bytes accepted by the logical output sink charge it.
 pub(crate) struct OutputBudget {
+    pub(crate) control: crate::read_control::ReadControl,
     member_limit: Option<u64>,
     total_limit: Option<u64>,
     used: u64,
@@ -24,6 +27,7 @@ pub(crate) struct OutputBudget {
 impl OutputBudget {
     pub(crate) fn new(options: crate::ArchiveReadOptions<'_>) -> Self {
         Self {
+            control: crate::read_control::ReadControl::new(options.cancellation),
             member_limit: options.max_member_output_bytes,
             total_limit: options.max_total_output_bytes,
             used: 0,
@@ -35,6 +39,7 @@ impl OutputBudget {
     }
 
     pub(crate) fn check(&self, required: u64, name: &[u8]) -> Result<()> {
+        self.control.check()?;
         check(self.member_limit, required, name)?;
         if let Some(limit) = self.total_limit {
             if required > limit - self.used {
@@ -60,6 +65,7 @@ impl OutputBudget {
         writer: W,
         work: impl FnOnce(&mut LimitedWriter<'_, W>) -> Result<T>,
     ) -> Result<T> {
+        self.control.check()?;
         let mut guarded = LimitedWriter {
             writer,
             budget: self,
@@ -71,13 +77,25 @@ impl OutputBudget {
         // the refusal out of band so it cannot become bad-password/checksum/I/O.
         match guarded.exceeded {
             Some(error) => Err(error.at_entry(name.to_vec(), "limiting output")),
-            None => result,
+            None => guarded
+                .budget
+                .control
+                .finish(result)
+                .and_then(|value| guarded.budget.control.check().map(|()| value))
+                .map_err(|error| {
+                    if error.kind() == crate::ErrorKind::Cancelled
+                        && error.entry_context().is_none()
+                    {
+                        error.at_entry(name.to_vec(), "extracting")
+                    } else {
+                        error
+                    }
+                }),
         }
     }
 }
 
-// Independent parallel workers use only the per-member ceiling. Total-limited
-// calls take the sequential route before dispatch, sharing one operation budget.
+#[cfg(test)]
 pub(crate) fn run<W: Write, T>(
     limit: Option<u64>,
     name: &[u8],
@@ -98,8 +116,14 @@ pub(crate) struct LimitedWriter<'a, W> {
 
 impl<W: Write> Write for LimitedWriter<'_, W> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.budget.control.check().map_err(io::Error::other)?;
         if !self.budget.is_limited() {
-            return self.writer.write(bytes);
+            let len = if self.budget.control.is_enabled() {
+                bytes.len().min(64 * 1024)
+            } else {
+                bytes.len()
+            };
+            return self.writer.write(&bytes[..len]);
         }
         if self.exceeded.is_none() {
             let count = bytes.len() as u64;
@@ -122,7 +146,12 @@ impl<W: Write> Write for LimitedWriter<'_, W> {
         if self.exceeded.is_some() {
             return Err(io::Error::other("output limit exceeded"));
         }
-        let n = self.writer.write(bytes)?;
+        let len = if self.budget.control.is_enabled() {
+            bytes.len().min(64 * 1024)
+        } else {
+            bytes.len()
+        };
+        let n = self.writer.write(&bytes[..len])?;
         if self.budget.member_limit.is_some() {
             self.written += n as u64;
         }
@@ -132,6 +161,7 @@ impl<W: Write> Write for LimitedWriter<'_, W> {
         Ok(n)
     }
     fn flush(&mut self) -> io::Result<()> {
+        self.budget.control.check().map_err(io::Error::other)?;
         self.writer.flush()
     }
 }
@@ -139,6 +169,43 @@ impl<W: Write> Write for LimitedWriter<'_, W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cancellation_survives_adapters_without_refunding_or_hiding_quota_refusal() {
+        let token = crate::ReadCancellation::new();
+        let mut budget = OutputBudget::new(
+            ArchiveReadOptions::new()
+                .with_cancellation(&token)
+                .with_max_total_output_bytes(4),
+        );
+        let err = budget
+            .run(b"member", io::sink(), |w| {
+                w.write_all(b"ab")?;
+                token.cancel();
+                assert!(w.write_all(b"c").is_err());
+                Err::<(), _>(Error::WrongPasswordOrCorruptData)
+            })
+            .unwrap_err();
+        assert_eq!(err.kind(), crate::ErrorKind::Cancelled);
+        assert_eq!(err.entry_context().unwrap().0, b"member");
+        assert_eq!(budget.used, 2);
+
+        let token = crate::ReadCancellation::new();
+        let mut budget = OutputBudget::new(
+            ArchiveReadOptions::new()
+                .with_cancellation(&token)
+                .with_max_total_output_bytes(0),
+        );
+        let err = budget
+            .run(b"member", io::sink(), |w| {
+                assert!(w.write_all(b"a").is_err());
+                token.cancel();
+                assert!(w.write_all(b"b").is_err());
+                Err::<(), _>(Error::WrongPasswordOrCorruptData)
+            })
+            .unwrap_err();
+        assert_eq!(err.kind(), crate::ErrorKind::ResourceLimit);
+        assert_eq!(budget.used, 0);
+    }
     #[test]
     fn total_accounting_survives_short_writes_and_later_errors() {
         struct Short;
