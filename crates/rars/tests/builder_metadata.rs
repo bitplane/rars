@@ -74,7 +74,7 @@ fn dos_attribute_field_width_is_not_truncated() {
     for (format, attr) in [
         (ArchiveVersion::Rar14, 0xef),
         (ArchiveVersion::Rar29, u64::from(u32::MAX) & !0x10),
-        (ArchiveVersion::Rar50, u64::MAX & !0x10),
+        (ArchiveVersion::Rar50, !0x10u64),
     ] {
         let mut builder = builder(format, true);
         builder.set_dos_attributes(b"file1", attr).unwrap();

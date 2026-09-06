@@ -152,6 +152,8 @@ pub(super) fn stored_file_specific(
     )
 }
 
+// Keep the on-disk file header fields explicit at this serialization boundary.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn file_specific(
     name: &[u8],
     unpacked_size: u64,
