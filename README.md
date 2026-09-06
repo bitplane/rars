@@ -61,3 +61,5 @@ For JS it's built to WebAssembly and published to
 [npm](https://www.npmjs.com/package/@bitplane/rars);
 `npm install @bitplane/rars`. It reads and writes in the browser and in Node,
 with no native module. To build locally, type `just npm`.
+
+Licensed under the [Apache License, Version 2.0](COPYING).

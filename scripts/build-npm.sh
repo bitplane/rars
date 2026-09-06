@@ -97,7 +97,7 @@ version = sys.argv[2]
             "name": "@bitplane/rars",
             "version": version,
             "description": "Read, write and repair RAR archives in the browser and in Node, with no native dependency.",
-            "license": "MIT OR Apache-2.0",
+            "license": "Apache-2.0",
             "homepage": "https://github.com/bitplane/rars",
             "repository": {"type": "git", "url": "git+https://github.com/bitplane/rars.git"},
             "keywords": ["rar", "archive", "compression", "unrar", "wasm", "webassembly"],
