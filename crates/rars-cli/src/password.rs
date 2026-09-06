@@ -113,35 +113,25 @@ pub(crate) fn should_prompt_password(stdin_is_terminal: bool) -> bool {
 }
 
 pub(crate) fn error_needs_password(error: &Error) -> bool {
-    match error {
-        Error::NeedPassword => true,
-        Error::AtArchiveOffset { source, .. }
-        | Error::AtEntry { source, .. }
-        | Error::InVolume { source, .. } => error_needs_password(source),
-        _ => false,
-    }
+    error.kind() == rars::ErrorKind::PasswordRequired
 }
 
 pub(crate) fn error_is_password_class(error: &Error) -> bool {
-    match error {
-        Error::NeedPassword | Error::WrongPasswordOrCorruptData => true,
-        Error::AtArchiveOffset { source, .. }
-        | Error::AtEntry { source, .. }
-        | Error::InVolume { source, .. } => error_is_password_class(source),
-        _ => false,
-    }
+    matches!(
+        error.kind(),
+        rars::ErrorKind::PasswordRequired | rars::ErrorKind::BadPassword
+    )
 }
 
 fn read_archive_error(path: &str, err: Error) -> String {
-    match err {
-        Error::Io(error) => format!("failed to read archive '{path}': {}", error.message),
-        Error::UnsupportedSignature => {
-            format!(
-                "failed to identify archive '{path}': {}",
-                Error::UnsupportedSignature
-            )
+    match err.kind() {
+        rars::ErrorKind::Io => format!("failed to read archive '{path}': {err}"),
+        rars::ErrorKind::UnsupportedFormat
+            if matches!(err.root_cause(), Error::UnsupportedSignature) =>
+        {
+            format!("failed to identify archive '{path}': {err}")
         }
-        other => format!("failed to parse archive '{path}': {other}"),
+        _ => format!("failed to parse archive '{path}': {err}"),
     }
 }
 

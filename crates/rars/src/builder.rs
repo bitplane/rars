@@ -313,7 +313,7 @@ impl Builder {
         mode: Option<u32>,
     ) -> Result<()> {
         if self.format.family() != crate::ArchiveFamily::Rar50Plus {
-            return Err(Error::InvalidHeader(
+            return Err(Error::InvalidArgument(
                 "explicit directory entries require RAR5/7 output",
             ));
         }
@@ -334,7 +334,7 @@ impl Builder {
     /// The member must already have whole seconds; legacy output is unsupported.
     pub fn set_mtime_nanoseconds(&mut self, name: &[u8], nanoseconds: u32) -> Result<()> {
         if self.format.family() != crate::ArchiveFamily::Rar50Plus || nanoseconds >= 1_000_000_000 {
-            return Err(Error::InvalidHeader(
+            return Err(Error::InvalidArgument(
                 "nanosecond modification times require RAR5/7 and a fraction below one second",
             ));
         }
@@ -345,10 +345,10 @@ impl Builder {
             .ok_or_else(|| Error::AtEntry {
                 name: name.to_vec(),
                 operation: "setting modification time precision",
-                source: Box::new(Error::InvalidHeader("no such archive entry")),
+                source: Box::new(Error::EntryNotFound),
             })?;
         if entry.mtime.is_none() {
-            return Err(Error::InvalidHeader(
+            return Err(Error::InvalidArgument(
                 "fractional modification time requires whole seconds",
             ));
         }
@@ -370,7 +370,7 @@ impl Builder {
             ArchiveFamily::Rar50Plus => u64::MAX,
         };
         if attributes > max {
-            return Err(Error::InvalidHeader(
+            return Err(Error::InvalidArgument(
                 "DOS attributes exceed the target format's field width",
             ));
         }
@@ -381,10 +381,10 @@ impl Builder {
             .ok_or_else(|| Error::AtEntry {
                 name: name.to_vec(),
                 operation: "setting DOS attributes",
-                source: Box::new(Error::InvalidHeader("no such archive entry")),
+                source: Box::new(Error::EntryNotFound),
             })?;
         if (attributes & 0x10 != 0) != entry.is_directory {
-            return Err(Error::InvalidHeader(
+            return Err(Error::InvalidArgument(
                 "DOS directory attributes must match the entry kind",
             ));
         }
@@ -405,9 +405,7 @@ impl Builder {
             return Err(Error::AtEntry {
                 name: archive_name.to_vec(),
                 operation: "adding",
-                source: Box::new(Error::InvalidHeader(
-                    "input is a symlink; refusing to follow it",
-                )),
+                source: Box::new(Error::InputSymlink),
             });
         }
         let meta = fs::metadata(path)?;
@@ -439,7 +437,7 @@ impl Builder {
             return Err(Error::AtEntry {
                 name: name.to_vec(),
                 operation: "removing",
-                source: Box::new(Error::InvalidHeader("no such archive entry")),
+                source: Box::new(Error::EntryNotFound),
             });
         }
         Ok(())
@@ -455,7 +453,7 @@ impl Builder {
             .ok_or_else(|| Error::AtEntry {
                 name: old.to_vec(),
                 operation: "renaming",
-                source: Box::new(Error::InvalidHeader("no such archive entry")),
+                source: Box::new(Error::EntryNotFound),
             })?;
         if old != new {
             self.reject_duplicate_name(&new)?;
@@ -475,7 +473,7 @@ impl Builder {
             return Err(Error::AtEntry {
                 name: name.to_vec(),
                 operation: "adding",
-                source: Box::new(Error::InvalidHeader("duplicate archive entry name")),
+                source: Box::new(Error::DuplicateEntry),
             });
         }
         Ok(())
@@ -552,9 +550,9 @@ impl Builder {
     pub fn build_volumes(&self, progress: Option<&dyn WriteProgress>) -> Result<Vec<Vec<u8>>> {
         let volume_size = self
             .volume_size
-            .ok_or(Error::InvalidHeader("volume_size is required"))?;
+            .ok_or(Error::InvalidArgument("volume_size is required"))?;
         if self.entries.is_empty() {
-            return Err(Error::InvalidHeader("archive builder has no entries"));
+            return Err(Error::InvalidArgument("archive builder has no entries"));
         }
         let this = self.materialized()?;
         match self.format.family() {
@@ -576,10 +574,10 @@ impl Builder {
 
     fn check_single(&self) -> Result<()> {
         if self.entries.is_empty() {
-            return Err(Error::InvalidHeader("archive builder has no entries"));
+            return Err(Error::InvalidArgument("archive builder has no entries"));
         }
         if self.volume_size.is_some() {
-            return Err(Error::InvalidHeader(
+            return Err(Error::InvalidArgument(
                 "use build_volumes for multivolume archives",
             ));
         }
@@ -806,7 +804,7 @@ impl Builder {
         progress: Option<&dyn WriteProgress>,
     ) -> Result<Vec<Vec<u8>>> {
         if self.comment.is_some() {
-            return Err(Error::InvalidHeader(
+            return Err(Error::InvalidArgument(
                 "RAR 5 volume comments are not supported",
             ));
         }
@@ -828,7 +826,7 @@ impl Builder {
     fn single_volume_entry(&self) -> Result<&BuilderEntry> {
         match self.entries.as_slice() {
             [entry] => Ok(entry),
-            _ => Err(Error::InvalidHeader("legacy volumes support one input")),
+            _ => Err(Error::InvalidArgument("legacy volumes support one input")),
         }
     }
 
@@ -925,27 +923,25 @@ pub fn entry_relative_path(name: &[u8]) -> Result<std::path::PathBuf> {
     use std::path::{Component, PathBuf};
 
     if name.contains(&0) {
-        return Err(Error::InvalidHeader(
-            "unsafe archive path contains NUL byte",
-        ));
+        return Err(Error::UnsafePath("unsafe archive path contains NUL byte"));
     }
     let text = std::str::from_utf8(name)
-        .map_err(|_| Error::InvalidHeader("archive entry name is not UTF-8"))?
+        .map_err(|_| Error::InvalidArgument("archive entry name is not UTF-8"))?
         .replace('\\', "/");
     let bytes = text.as_bytes();
     if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-        return Err(Error::InvalidHeader("unsafe archive path"));
+        return Err(Error::UnsafePath("unsafe archive path"));
     }
     let mut out = PathBuf::new();
     for component in Path::new(&text).components() {
         match component {
             Component::Normal(part) => out.push(part),
             Component::CurDir => {}
-            _ => return Err(Error::InvalidHeader("unsafe archive path")),
+            _ => return Err(Error::UnsafePath("unsafe archive path")),
         }
     }
     if out.as_os_str().is_empty() {
-        return Err(Error::InvalidHeader("empty archive path"));
+        return Err(Error::InvalidArgument("empty archive path"));
     }
     Ok(out)
 }

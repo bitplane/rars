@@ -1,4 +1,6 @@
-use pyo3::exceptions::{PyKeyError, PyNotImplementedError, PyOSError, PyValueError};
+use pyo3::exceptions::{
+    PyInterruptedError, PyKeyError, PyMemoryError, PyNotImplementedError, PyOSError, PyValueError,
+};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList, PyModule};
 use pyo3::{create_exception, PyErr};
@@ -499,10 +501,7 @@ fn python_progress(callback: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Arc<P
         .transpose()
 }
 
-/// Which Python exception a builder refusal becomes. The general mapping turns
-/// every `rars_rs::Error` into `BadRarFile`, but these three are argument
-/// mistakes rather than archive problems, and Python callers have always caught
-/// them as such.
+/// Preserve the established Python argument exceptions for builder refusals.
 #[derive(Debug, PartialEq, Eq)]
 enum BuilderRefusal {
     NoSuchEntry,
@@ -512,17 +511,10 @@ enum BuilderRefusal {
 }
 
 fn classify_builder_error(error: &rars_rs::Error) -> BuilderRefusal {
-    let rars_rs::Error::AtEntry { source, .. } = error else {
-        return BuilderRefusal::Other;
-    };
-    match **source {
-        rars_rs::Error::InvalidHeader("no such archive entry") => BuilderRefusal::NoSuchEntry,
-        rars_rs::Error::InvalidHeader("duplicate archive entry name") => {
-            BuilderRefusal::DuplicateName
-        }
-        rars_rs::Error::InvalidHeader("input is a symlink; refusing to follow it") => {
-            BuilderRefusal::Symlink
-        }
+    match error.root_cause() {
+        rars_rs::Error::EntryNotFound => BuilderRefusal::NoSuchEntry,
+        rars_rs::Error::DuplicateEntry => BuilderRefusal::DuplicateName,
+        rars_rs::Error::InputSymlink => BuilderRefusal::Symlink,
         _ => BuilderRefusal::Other,
     }
 }
@@ -532,7 +524,7 @@ fn map_builder_error(error: rars_rs::Error) -> PyErr {
     if refusal == BuilderRefusal::Other {
         return map_error(error);
     }
-    let rars_rs::Error::AtEntry { ref name, .. } = error else {
+    let Some((name, _)) = error.entry_context() else {
         return map_error(error);
     };
     let name = String::from_utf8_lossy(name).into_owned();
@@ -1292,14 +1284,14 @@ fn checked_output_path(out_dir: &Path, name: &[u8]) -> rars_rs::Result<PathBuf> 
     let mut out_path = out_dir.to_path_buf();
     for component in rel.components() {
         let Component::Normal(part) = component else {
-            return Err(rars_rs::Error::InvalidHeader("unsafe archive path"));
+            return Err(rars_rs::Error::UnsafePath("unsafe archive path"));
         };
         out_path.push(part);
         if fs::symlink_metadata(&out_path)
             .map(|metadata| metadata.file_type().is_symlink())
             .unwrap_or(false)
         {
-            return Err(rars_rs::Error::InvalidHeader(
+            return Err(rars_rs::Error::UnsafePath(
                 "unsafe archive path crosses symlink",
             ));
         }
@@ -1309,7 +1301,7 @@ fn checked_output_path(out_dir: &Path, name: &[u8]) -> rars_rs::Result<PathBuf> 
 
 fn output_relative_path(name: &[u8]) -> rars_rs::Result<PathBuf> {
     if name.contains(&0) {
-        return Err(rars_rs::Error::InvalidHeader(
+        return Err(rars_rs::Error::UnsafePath(
             "unsafe archive path contains NUL byte",
         ));
     }
@@ -1318,7 +1310,7 @@ fn output_relative_path(name: &[u8]) -> rars_rs::Result<PathBuf> {
         .replace('\\', "/");
     let bytes = text.as_bytes();
     if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-        return Err(rars_rs::Error::InvalidHeader("unsafe archive path"));
+        return Err(rars_rs::Error::UnsafePath("unsafe archive path"));
     }
     let path = Path::new(&text);
     let mut out = PathBuf::new();
@@ -1326,7 +1318,7 @@ fn output_relative_path(name: &[u8]) -> rars_rs::Result<PathBuf> {
         match component {
             Component::Normal(part) => out.push(part),
             Component::CurDir => {}
-            _ => return Err(rars_rs::Error::InvalidHeader("unsafe archive path")),
+            _ => return Err(rars_rs::Error::UnsafePath("unsafe archive path")),
         }
     }
     if out.as_os_str().is_empty() {
@@ -1407,47 +1399,102 @@ fn map_error(error: rars_rs::Error) -> PyErr {
     if error_is_bad_password(&error) {
         return BadPassword::new_err(message);
     }
-    match error {
-        rars_rs::Error::UnsupportedSignature
-        | rars_rs::Error::UnsupportedVersion(_)
-        | rars_rs::Error::UnsupportedFeature { .. }
-        | rars_rs::Error::UnsupportedFamilyFeature { .. }
-        | rars_rs::Error::UnsupportedCompression { .. }
-        | rars_rs::Error::UnsupportedEncryption { .. } => UnsupportedRarFeature::new_err(message),
-        rars_rs::Error::InvalidHeader(message) if message.contains("unsafe") => {
-            UnsafeArchivePath::new_err(error.to_string())
+    use rars_rs::ErrorKind;
+    match error.kind() {
+        ErrorKind::UnsupportedFormat | ErrorKind::UnsupportedFeature => {
+            UnsupportedRarFeature::new_err(message)
         }
-        rars_rs::Error::Io(io_error) => PyOSError::new_err(io_error.message),
-        rars_rs::Error::CrcMismatch { .. }
-        | rars_rs::Error::Crc32Mismatch { .. }
-        | rars_rs::Error::HashMismatch { .. } => BadRarFile::new_err(message),
-        _ => BadRarFile::new_err(error.to_string()),
+        ErrorKind::UnsafePath => UnsafeArchivePath::new_err(message),
+        ErrorKind::Io | ErrorKind::SourceChanged => PyOSError::new_err(message),
+        ErrorKind::InvalidArgument | ErrorKind::DuplicateEntry => PyValueError::new_err(message),
+        ErrorKind::EntryNotFound => PyKeyError::new_err(message),
+        ErrorKind::ResourceLimit => PyMemoryError::new_err(message),
+        ErrorKind::Cancelled => PyInterruptedError::new_err(message),
+        _ => BadRarFile::new_err(message),
     }
 }
 
 fn error_is_need_password(error: &rars_rs::Error) -> bool {
-    match error {
-        rars_rs::Error::NeedPassword => true,
-        rars_rs::Error::AtArchiveOffset { source, .. }
-        | rars_rs::Error::AtEntry { source, .. }
-        | rars_rs::Error::InVolume { source, .. } => error_is_need_password(source),
-        _ => false,
-    }
+    error.kind() == rars_rs::ErrorKind::PasswordRequired
 }
 
 fn error_is_bad_password(error: &rars_rs::Error) -> bool {
-    match error {
-        rars_rs::Error::WrongPasswordOrCorruptData => true,
-        rars_rs::Error::AtArchiveOffset { source, .. }
-        | rars_rs::Error::AtEntry { source, .. }
-        | rars_rs::Error::InVolume { source, .. } => error_is_bad_password(source),
-        _ => false,
-    }
+    error.kind() == rars_rs::ErrorKind::BadPassword
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn python_exception_types_and_messages_survive_nested_context() {
+        use rars_rs::Error as CoreError;
+        Python::initialize();
+        Python::attach(|py| {
+            let cases = [
+                CoreError::from(io::Error::from(io::ErrorKind::PermissionDenied)),
+                CoreError::UnsupportedCompression {
+                    family: "RAR",
+                    unpack_version: 99,
+                    method: 1,
+                },
+                CoreError::MemoryLimitExceeded {
+                    limit: 1,
+                    required: 2,
+                    dictionary_size: 1,
+                },
+                CoreError::Cancelled,
+                CoreError::UnsafePath("refused path"),
+                CoreError::InvalidArgument("bad option"),
+                CoreError::InvalidHeader("unsafe; a password is required; I/O error"),
+                CoreError::NeedPassword,
+                CoreError::Rar50Crypto(rars_rs::crypto::rar50::Error::BadPassword),
+            ];
+            for cause in cases {
+                let kind = cause.kind();
+                let wrapped = CoreError::InVolume {
+                    number: 2,
+                    source: Box::new(
+                        cause
+                            .at_entry(b"member".to_vec(), "reading")
+                            .at_archive_offset(7),
+                    ),
+                };
+                let exception = map_error(wrapped);
+                let matches = match kind {
+                    rars_rs::ErrorKind::Io => exception.is_instance_of::<PyOSError>(py),
+                    rars_rs::ErrorKind::UnsupportedFeature => {
+                        exception.is_instance_of::<UnsupportedRarFeature>(py)
+                    }
+                    rars_rs::ErrorKind::ResourceLimit => {
+                        exception.is_instance_of::<PyMemoryError>(py)
+                    }
+                    rars_rs::ErrorKind::Cancelled => {
+                        exception.is_instance_of::<PyInterruptedError>(py)
+                    }
+                    rars_rs::ErrorKind::UnsafePath => {
+                        exception.is_instance_of::<UnsafeArchivePath>(py)
+                    }
+                    rars_rs::ErrorKind::InvalidArgument => {
+                        exception.is_instance_of::<PyValueError>(py)
+                    }
+                    rars_rs::ErrorKind::PasswordRequired => {
+                        exception.is_instance_of::<PasswordRequired>(py)
+                    }
+                    rars_rs::ErrorKind::BadPassword => exception.is_instance_of::<BadPassword>(py),
+                    _ => exception.is_instance_of::<BadRarFile>(py),
+                };
+                assert!(matches, "{kind:?}: {exception}");
+                assert!(exception.to_string().contains("in volume 2"));
+                assert!(exception.to_string().contains("member"));
+            }
+            let missing = CoreError::InVolume {
+                number: 2,
+                source: Box::new(CoreError::EntryNotFound.at_entry(b"gone".to_vec(), "removing")),
+            };
+            assert!(map_builder_error(missing).is_instance_of::<PyKeyError>(py));
+        });
+    }
 
     #[test]
     fn password_classification_survives_volume_context() {
