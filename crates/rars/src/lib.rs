@@ -557,6 +557,17 @@ impl Archive {
     }
 
     /// Streams extracted entries to caller-provided writers.
+    ///
+    /// Output is not transactional: integrity checks can fail after all bytes of
+    /// a member have been written, and decode/filter or sink failures can leave
+    /// a partial member. Earlier entries and callback side effects are not rolled
+    /// back. The amount written before an error depends on the decoding path;
+    /// even a complete payload must not be treated as verified on failure.
+    ///
+    /// For verified publication, write to caller-owned staging storage and
+    /// publish it only after extraction succeeds. Output quotas do not provide
+    /// staging or rollback. This method does not flush or sync returned writers;
+    /// callers must check any required flush/sync before publishing staged output.
     pub fn extract_to<F>(&self, password: Option<&[u8]>, open: F) -> Result<()>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -565,6 +576,7 @@ impl Archive {
     }
 
     /// Streams extracted entries to caller-provided writers with read options.
+    /// Has the failure and staging semantics of [`Self::extract_to`].
     pub fn extract_to_with_options<F>(
         &self,
         options: ArchiveReadOptions<'_>,
@@ -986,6 +998,8 @@ fn read_options(password: Option<&[u8]>) -> ArchiveReadOptions<'_> {
 }
 
 /// Streams a multivolume archive set to caller-provided writers.
+/// Has the failure and staging semantics of [`Archive::extract_to`], including
+/// partial output from a split member when a later volume fails.
 pub fn extract_volumes_to<F>(archives: &[Archive], password: Option<&[u8]>, open: F) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -994,6 +1008,7 @@ where
 }
 
 /// Streams a multivolume archive set to caller-provided writers with read options.
+/// Has the failure and staging semantics of [`Archive::extract_to`].
 pub fn extract_volumes_to_with_options<F>(
     archives: &[Archive],
     options: ArchiveReadOptions<'_>,

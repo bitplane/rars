@@ -71,13 +71,17 @@ impl OutputBudget {
             budget: self,
             written: 0,
             exceeded: None,
+            sink_error: None,
         };
         let result = work(&mut guarded);
         // Older decoders/error adapters may wrap or replace the sentinel. Keep
         // the refusal out of band so it cannot become bad-password/checksum/I/O.
-        match guarded.exceeded {
-            Some(error) => Err(error.at_entry(name.to_vec(), "limiting output")),
-            None => guarded
+        // Also preserve destination failures that legacy codecs turn into
+        // generic decode errors, including the original I/O source.
+        match (guarded.exceeded, guarded.sink_error) {
+            (Some(error), _) => Err(error.at_entry(name.to_vec(), "limiting output")),
+            (None, Some(error)) => Err(error.at_entry(name.to_vec(), "extracting")),
+            (None, None) => guarded
                 .budget
                 .control
                 .finish(result)
@@ -112,6 +116,30 @@ pub(crate) struct LimitedWriter<'a, W> {
     budget: &'a mut OutputBudget,
     written: u64,
     exceeded: Option<Error>,
+    sink_error: Option<Error>,
+}
+
+impl<W: Write> LimitedWriter<'_, W> {
+    fn remember_sink_result<T>(&mut self, result: io::Result<T>) -> io::Result<T> {
+        result.map_err(|error| {
+            // write_all retries Interrupted; it is not a terminal sink failure.
+            if error.kind() == io::ErrorKind::Interrupted {
+                return error;
+            }
+            let kind = error.kind();
+            let error = Error::from(error);
+            self.sink_error.get_or_insert_with(|| error.clone());
+            io::Error::new(kind, error)
+        })
+    }
+
+    fn write_sink(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let result = match self.writer.write(bytes) {
+            Ok(0) if !bytes.is_empty() => Err(io::ErrorKind::WriteZero.into()),
+            result => result,
+        };
+        self.remember_sink_result(result)
+    }
 }
 
 impl<W: Write> Write for LimitedWriter<'_, W> {
@@ -123,7 +151,7 @@ impl<W: Write> Write for LimitedWriter<'_, W> {
             } else {
                 bytes.len()
             };
-            return self.writer.write(&bytes[..len]);
+            return self.write_sink(&bytes[..len]);
         }
         if self.exceeded.is_none() {
             let count = bytes.len() as u64;
@@ -151,7 +179,7 @@ impl<W: Write> Write for LimitedWriter<'_, W> {
         } else {
             bytes.len()
         };
-        let n = self.writer.write(&bytes[..len])?;
+        let n = self.write_sink(&bytes[..len])?;
         if self.budget.member_limit.is_some() {
             self.written += n as u64;
         }
@@ -162,13 +190,74 @@ impl<W: Write> Write for LimitedWriter<'_, W> {
     }
     fn flush(&mut self) -> io::Result<()> {
         self.budget.control.check().map_err(io::Error::other)?;
-        self.writer.flush()
+        let result = self.writer.flush();
+        self.remember_sink_result(result)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupted_sink_writes_retry_without_latching_a_failure() {
+        struct InterruptedOnce(bool);
+        impl Write for InterruptedOnce {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if std::mem::replace(&mut self.0, false) {
+                    Err(io::ErrorKind::Interrupted.into())
+                } else {
+                    Ok(bytes.len())
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut budget =
+            OutputBudget::new(ArchiveReadOptions::new().with_max_total_output_bytes(3));
+        budget
+            .run(b"member", InterruptedOnce(true), |w| {
+                w.write_all(b"abc").map_err(Error::from)
+            })
+            .unwrap();
+        assert_eq!(budget.used, 3);
+    }
+
+    #[test]
+    fn zero_writes_and_flush_errors_survive_lossy_codec_adapters() {
+        struct Broken;
+        impl Write for Broken {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Ok(0)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::ErrorKind::PermissionDenied.into())
+            }
+        }
+        for flush in [false, true] {
+            let mut budget = OutputBudget::new(ArchiveReadOptions::new());
+            let error = budget
+                .run(b"member", Broken, |w| {
+                    assert_eq!(w.write(b"").unwrap(), 0);
+                    if flush {
+                        assert!(w.flush().is_err());
+                    } else {
+                        assert!(w.write_all(b"a").is_err());
+                    }
+                    Err::<(), _>(Error::InvalidHeader("lossy adapter"))
+                })
+                .unwrap_err();
+            let expected = if flush {
+                io::ErrorKind::PermissionDenied
+            } else {
+                io::ErrorKind::WriteZero
+            };
+            assert!(matches!(error.root_cause(), Error::Io(e) if e.kind == expected));
+            assert_eq!(error.entry_context().unwrap().0, b"member");
+        }
+    }
+
     #[test]
     fn cancellation_survives_adapters_without_refunding_or_hiding_quota_refusal() {
         let token = crate::ReadCancellation::new();
@@ -379,7 +468,9 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(out.0, b"abc");
-        assert!(matches!(err, Error::Io(e) if e.kind == io::ErrorKind::PermissionDenied));
+        assert!(
+            matches!(err.root_cause(), Error::Io(e) if e.kind == io::ErrorKind::PermissionDenied)
+        );
         let mut out = Vec::new();
         run(Some(3), b"member", &mut out, |w| {
             w.write_all(b"abc")?;

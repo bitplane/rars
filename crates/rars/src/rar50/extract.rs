@@ -1636,41 +1636,68 @@ mod tests {
 
     #[test]
     fn streaming_filtered_members_return_typed_error_without_preflight_decode() {
-        let mut data = Vec::new();
-        while data.len() as u64 <= BUFFERED_DECODE_LIMIT {
-            data.extend_from_slice(b"\xe8\0\0\0\0filtered payload block\n");
+        for prefix_len in [0, 64 * 1024] {
+            let mut data = vec![b'P'; prefix_len];
+            while (data.len() - prefix_len) as u64 <= BUFFERED_DECODE_LIMIT {
+                data.extend_from_slice(b"\xe8\0\0\0\0filtered payload block\n");
+            }
+
+            let archive = Rar50Writer::new(WriterOptions {
+                target: crate::ArchiveVersion::Rar50,
+                features: crate::FeatureSet::store_only(),
+                compression_level: None,
+                dictionary_size: None,
+            })
+            .entries(
+                [entry(b"filtered.bin", &data)
+                    .with_attributes(0x20)
+                    .with_host_os(3)]
+                .to_vec(),
+            )
+            .filter_policy(FilterPolicy::Explicit(crate::FilterSpec::range(
+                FilterKind::E8,
+                prefix_len..data.len(),
+            )))
+            .finish()
+            .unwrap();
+            let archive = Archive::parse(&archive).unwrap();
+            let file = archive.files().next().unwrap();
+            assert!(file.should_stream_decode(BUFFERED_DECODE_LIMIT));
+
+            // The member is valid and extracts in full when buffering is allowed.
+            let captured = Rc::new(RefCell::new(Vec::new()));
+            struct Capture(Rc<RefCell<Vec<u8>>>);
+            impl Write for Capture {
+                fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                    self.0.borrow_mut().extend_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            archive
+                .extract_to(
+                    crate::ArchiveReadOptions::new()
+                        .with_rar50_buffered_decode_limit(data.len() as u64),
+                    |_| Ok(Box::new(Capture(captured.clone()))),
+                )
+                .unwrap();
+            assert_eq!(*captured.borrow(), data);
+
+            let mut out = Vec::new();
+            let error = file.write_to(&archive, None, &mut out).unwrap_err();
+
+            assert!(matches!(
+                error,
+                Error::AtEntry {
+                    operation: "decoding",
+                    source,
+                    ..
+                } if matches!(*source, Error::Rar50BufferedDecodeLimitExceeded { .. })
+            ));
+            assert_eq!(out, data[..prefix_len]);
         }
-
-        let archive = Rar50Writer::new(WriterOptions {
-            target: crate::ArchiveVersion::Rar50,
-            features: crate::FeatureSet::store_only(),
-            compression_level: None,
-            dictionary_size: None,
-        })
-        .entries(
-            [entry(b"filtered.bin", &data)
-                .with_attributes(0x20)
-                .with_host_os(3)]
-            .to_vec(),
-        )
-        .filter_policy(FilterPolicy::explicit(FilterKind::E8))
-        .finish()
-        .unwrap();
-        let archive = Archive::parse(&archive).unwrap();
-        let file = archive.files().next().unwrap();
-        assert!(file.should_stream_decode(BUFFERED_DECODE_LIMIT));
-
-        let mut out = Vec::new();
-        let error = file.write_to(&archive, None, &mut out).unwrap_err();
-
-        assert!(matches!(
-            error,
-            Error::AtEntry {
-                operation: "decoding",
-                source,
-                ..
-            } if matches!(*source, Error::Rar50BufferedDecodeLimitExceeded { .. })
-        ));
     }
 
     #[test]
