@@ -49,6 +49,7 @@ const MHFL_LOCKED: u64 = 0x0010;
 const FHFL_DIRECTORY: u64 = 0x0001;
 const FHFL_MTIME: u64 = 0x0002;
 const FHFL_CRC32: u64 = 0x0004;
+const FHFL_UNP_SIZE_UNKNOWN: u64 = 0x0008;
 
 const MHEXTRA_LOCATOR: u64 = 0x01;
 const MHEXTRA_LOCATOR_QUICK_OPEN: u64 = 0x0001;
@@ -307,6 +308,13 @@ pub struct ExtractedEntryMeta {
 }
 
 impl FileHeader {
+    /// Declared logical output size, unless the format marks it unknown.
+    /// Early split fragments can have unknown sizes while the final one is known.
+    /// This does not imply that the decoder supports unknown-size streams.
+    pub fn known_unpacked_size(&self) -> Option<u64> {
+        (self.file_flags & FHFL_UNP_SIZE_UNKNOWN == 0).then_some(self.unpacked_size)
+    }
+
     pub fn name_bytes(&self) -> &[u8] {
         &self.name
     }
