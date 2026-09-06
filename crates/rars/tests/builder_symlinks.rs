@@ -200,3 +200,38 @@ fn retains_windows_links_and_file_copy_records() {
         }
     }
 }
+
+#[test]
+fn legacy_link_payloads_are_decoded_with_integrity_and_password_checks() {
+    for format in [ArchiveVersion::Rar29, ArchiveVersion::Rar40] {
+        let mut builder = Builder::new(format).password(Some(b"secret".to_vec()));
+        builder
+            .add_bytes(
+                b"link".to_vec(),
+                b"missing-\xff".to_vec(),
+                None,
+                Some(0o120750),
+            )
+            .unwrap();
+        builder
+            .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, Some(0o100644))
+            .unwrap();
+        let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        assert!(archive.legacy_symlink_target_at(0, None).is_err());
+        assert_eq!(
+            archive
+                .legacy_symlink_target_at(0, Some(b"secret"))
+                .unwrap(),
+            Some(b"missing-\xff".to_vec())
+        );
+        assert_eq!(
+            archive
+                .legacy_symlink_target_at(1, Some(b"secret"))
+                .unwrap(),
+            None
+        );
+        assert!(archive
+            .legacy_symlink_target_at(2, Some(b"secret"))
+            .is_err());
+    }
+}

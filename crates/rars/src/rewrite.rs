@@ -105,6 +105,32 @@ impl Archive {
         }
     }
 
+    /// Decode the native target bytes carried as a legacy Unix symlink payload.
+    /// This never follows a filesystem link. Payload integrity is checked.
+    pub fn legacy_symlink_target_at(
+        &self,
+        index: usize,
+        password: Option<&[u8]>,
+    ) -> crate::Result<Option<Vec<u8>>> {
+        let member = self
+            .members()
+            .nth(index)
+            .ok_or(crate::Error::EntryNotFound)?;
+        if !member.is_legacy_unix_symlink() {
+            return Ok(None);
+        }
+        let target = self
+            .read_member_at(index, password)?
+            .ok_or(crate::Error::EntryNotFound)?;
+        if target.is_empty() || target.contains(&0) {
+            return Err(crate::Error::InvalidArgument(
+                "legacy symbolic link target is empty or contains NUL",
+            )
+            .at_entry(member.meta.name, "reading link target"));
+        }
+        Ok(Some(target))
+    }
+
     /// Configure a builder with supported source format, solid and encryption settings.
     /// Member data/comment passwords are retained separately when entries are copied.
     pub fn preserving_builder(&self, password: Option<&[u8]>) -> crate::Result<crate::Builder> {
@@ -436,6 +462,14 @@ pub(crate) fn special_entry(meta: &ArchiveMemberMeta) -> bool {
 }
 
 impl crate::ArchiveMember {
+    /// Legacy Unix links store the native target as ordinary member data.
+    pub fn is_legacy_unix_symlink(&self) -> bool {
+        self.meta.family == crate::ArchiveFamily::Rar15To40
+            && self.meta.attr_source() == AttrSource::Unix
+            && self.meta.file_attr & !0o7777 == 0o120000
+            && !self.meta.is_directory
+    }
+
     /// Complete supported file times. Legacy DOS fields use the established local-zone policy.
     pub fn file_times(&self) -> crate::Result<Option<crate::FileTimes>> {
         match &self.detail {

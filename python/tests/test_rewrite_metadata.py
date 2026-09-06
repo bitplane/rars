@@ -106,7 +106,7 @@ def test_rewrite_converts_reference_unix_symlink_archive():
     assert rewritten.read("file.txt") == source.read("file.txt")
 
 
-@pytest.mark.parametrize("kind", [0o010000, 0o020000, 0o060000, 0o120000, 0o140000])
+@pytest.mark.parametrize("kind", [0o010000, 0o020000, 0o060000, 0o140000])
 def test_rewrite_rejects_unix_special_file_modes(kind):
     source = rars.RarBuilder(format="rar29", store=True)
     source.add_bytes(b"special payload", "special", mode=kind | 0o644)
@@ -232,3 +232,26 @@ def test_reference_reader_recognizes_emitted_unix_symlink(tmp_path):
     result = subprocess.run(["unrar", "lt", str(path)], capture_output=True, text=True, check=True)
     assert "Unix symbolic link" in result.stdout
     assert "target" in result.stdout
+
+
+@pytest.mark.parametrize("format", ["rar20", "rar29", "rar30", "rar40"])
+def test_legacy_unix_link_targets_are_converted_without_utf8_loss(format):
+    source = rars.RarBuilder(format=format, store=True)
+    source.add_bytes(b"missing-\xff", b"link-\xff", mode=0o120750)
+    source.add_bytes(b"payload", b"file-\xff", mode=0o100640)
+    archive = rars.RarFile.from_bytes(source.to_bytes())
+    assert archive.readlink(b"link-\xff") == b"missing-\xff"
+    output = rars.RarFile.from_bytes(rars.RarBuilder.from_archive(archive).to_bytes())
+    link_name = "\ufffelink-\ue0ff".encode()
+    file_name = "\ufffefile-\ue0ff".encode()
+    assert output.readlink(link_name) == "\ufffemissing-\ue0ff".encode()
+    assert output.getinfo(link_name).file_attr == 0o120750
+    assert output.read(file_name) == b"payload"
+
+
+@pytest.mark.parametrize("target", [b"", b"invalid\0target"])
+def test_invalid_legacy_link_targets_are_rejected(target):
+    source = rars.RarBuilder(format="rar29", store=True)
+    source.add_bytes(target, "link", mode=0o120777)
+    with pytest.raises(ValueError, match="link target"):
+        rars.RarBuilder.from_archive(rars.RarFile.from_bytes(source.to_bytes()))

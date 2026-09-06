@@ -442,15 +442,23 @@ impl RarFile {
             .map_err(map_error)
     }
 
-    /// Returns the raw RAR5 target of a supported redirection.
+    /// Returns raw target bytes for a supported RAR5 or legacy Unix link.
     /// This reads archive metadata and never follows the link.
     fn readlink(&self, member: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
         let name = member_name_bytes(member)?;
-        let member = self
+        let (index, member) = self
             .archive
             .members()
-            .find(|member| member.meta.name == name)
+            .enumerate()
+            .find(|(_, member)| member.meta.name == name)
             .ok_or_else(|| PyKeyError::new_err("member not found"))?;
+        if member.is_legacy_unix_symlink() {
+            return self
+                .archive
+                .legacy_symlink_target_at(index, self.password.as_deref())
+                .map_err(map_error)?
+                .ok_or_else(|| PyKeyError::new_err("member not found"));
+        }
         member
             .supported_redirection()
             .map(|link| link.target_name.clone())
@@ -721,6 +729,14 @@ impl RarBuilder {
         for ((member_index, member), comment) in archive.archive.members().enumerate().zip(comments)
         {
             let file_times = member.file_times().map_err(map_error)?;
+            let legacy_link = if member.is_legacy_unix_symlink() {
+                archive
+                    .archive
+                    .legacy_symlink_target_at(member_index, password.as_deref())
+                    .map_err(map_error)?
+            } else {
+                None
+            };
             let link = member.supported_redirection().cloned();
             let retained_link = link.as_ref().map(|_| member.clone());
             let info = member.meta;
@@ -728,6 +744,15 @@ impl RarBuilder {
             // Reuse extraction's host rules: e.g. legacy host 1 is DOS, but
             // RAR5 host 1 is Unix. DOS 0x20 must not become Unix mode 0040.
             let attr_source = info.attr_source();
+            let output_name = if info.family != rars_rs::ArchiveFamily::Rar50Plus
+                && attr_source == rars_rs::AttrSource::Unix
+            {
+                rars_rs::builder::validate_entry_name(info.name.clone())
+                    .map_err(map_builder_error)?;
+                rars_rs::filename::encode_rar50(&info.name).into_owned()
+            } else {
+                info.name.clone()
+            };
             let unix_type = info.file_attr & 0o170000;
             let unsupported_type = attr_source == rars_rs::AttrSource::Unix
                 && !matches!(unix_type, 0 | 0o100000)
@@ -735,6 +760,7 @@ impl RarBuilder {
             let reparse_point =
                 attr_source == rars_rs::AttrSource::Dos && info.file_attr & 0x400 != 0;
             if link.is_none()
+                && legacy_link.is_none()
                 && (info.is_redirection
                     || unsupported_type
                     || reparse_point
@@ -763,10 +789,21 @@ impl RarBuilder {
                     .inner
                     .add_archive_redirection(&member)
                     .map_err(map_builder_error)?;
+            } else if let Some(target) = legacy_link {
+                builder
+                    .inner
+                    .add_unix_symlink(
+                        output_name.clone(),
+                        rars_rs::filename::encode_rar50(&target).into_owned(),
+                        false,
+                        mtime,
+                        mode,
+                    )
+                    .map_err(map_builder_error)?;
             } else if info.is_directory {
                 builder
                     .inner
-                    .add_directory(info.name.clone(), mtime, mode)
+                    .add_directory(output_name.clone(), mtime, mode)
                     .map_err(map_builder_error)?;
             } else {
                 let member_archive = archive.archive.clone();
@@ -783,24 +820,24 @@ impl RarBuilder {
                 });
                 builder
                     .inner
-                    .add_source(info.name.clone(), source, mtime, mode)
+                    .add_source(output_name.clone(), source, mtime, mode)
                     .map_err(map_builder_error)?;
             }
             builder
                 .inner
-                .set_file_comment(&info.name, comment)
+                .set_file_comment(&output_name, comment)
                 .map_err(map_builder_error)?;
             if let Some(time) = modified.filter(|time| time.subsec_nanos() != 0) {
                 builder
                     .inner
-                    .set_mtime_nanoseconds(&info.name, time.subsec_nanos())
+                    .set_mtime_nanoseconds(&output_name, time.subsec_nanos())
                     .map_err(map_builder_error)?;
             }
             if preserve {
                 builder
                     .inner
                     .set_entry_encryption(
-                        &info.name,
+                        &output_name,
                         if info.is_encrypted {
                             password.clone()
                         } else {
@@ -817,13 +854,13 @@ impl RarBuilder {
             if file_times.is_some() {
                 builder
                     .inner
-                    .set_file_times(&info.name, file_times)
+                    .set_file_times(&output_name, file_times)
                     .map_err(map_builder_error)?;
             }
             if attr_source == rars_rs::AttrSource::Dos {
                 builder
                     .inner
-                    .set_dos_attributes(&info.name, info.file_attr)
+                    .set_dos_attributes(&output_name, info.file_attr)
                     .map_err(map_builder_error)?;
             }
         }

@@ -38,7 +38,7 @@ the separate password argument.
 | Timestamps | Modification, creation and access times retained, including legacy odd seconds/fractions and complete RAR5 Unix/FILETIME values | Preserve supported timestamp kinds using the established local-zone interpretation for legacy DOS times |
 | Attributes and host OS | Unix permission/special bits and DOS file flags retained using source host rules; unknown hosts use default DOS archive attributes | Preserve supported attributes with their source meaning; reject unsupported host semantics |
 | Archive comment | Copied as decoded bytes; preservation retains its encryption | Preserve comment content |
-| Links and special entries | RAR5 Unix/Windows symbolic links, junctions, hard links and file-copy records retained; legacy links and other special entries rejected before writing | Preserve supported types; reject unsupported preservation |
+| Links and special entries | RAR5 Unix/Windows symbolic links, junctions, hard links and file-copy records retained; legacy Unix links converted to RAR5; other special entries rejected | Preserve supported types; reject unsupported preservation |
 | File comments | Decoded comments copied, including explicit empty comments; supported RAR5 CMT records pass preflight | Preserve supported comment content |
 | Other metadata | Supported archive name/creation time and lock flag retained in preservation; indexes regenerated | Preserve supported records; reject unsupported preservation |
 | Archive format | Conversion writes RAR5; preservation selects the RAR5/7 writer required by the source | Preserve supported format semantics; exact creating release may be unknowable |
@@ -84,7 +84,11 @@ not change that existing traversal policy.
 mtime=None, mode=None)` queues a RAR5/7 Unix symbolic link. The target is stored
 as metadata without being followed, so dangling links are supported. `mode`
 defaults to `0o777`; link type bits are retained separately from permissions.
-`RarFile.readlink(member)` returns the raw target bytes of a supported RAR5 redirection.
+`RarFile.readlink(member)` returns the raw target bytes of a supported RAR5
+redirection or legacy Unix symbolic link. Legacy link payloads are decoded and
+integrity-checked without following the target. Conversion maps legacy Unix
+member names and targets into the RAR5 Unix byte encoding without replacement;
+it does not guess a DOS code page. Legacy-format preservation remains unsupported.
 Targets use the [RAR5 wire encoding](https://www.rarlab.com/technote.htm), including
 its Unix byte mapping, and must be nonempty and contain no NUL. Relative targets
 are retained verbatim: renaming a link or its target does not retarget the link.
