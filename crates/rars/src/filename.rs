@@ -67,6 +67,32 @@ pub fn encode_rar50(name: &[u8]) -> Cow<'_, [u8]> {
     Cow::Owned(out.into_bytes())
 }
 
+/// Encode a renamed legacy Unicode entry without relying on a code page.
+/// Full UTF-16 units make the Unicode stream independent of the ASCII fallback.
+pub(crate) fn encode_legacy_unicode(name: &[u8]) -> Result<Vec<u8>> {
+    validate_relative(name)?;
+    let text = std::str::from_utf8(name)
+        .map_err(|_| Error::InvalidArgument("renaming a Unicode entry requires a UTF-8 name"))?;
+    let mut raw: Vec<u8> = text
+        .chars()
+        .map(|ch| if ch.is_ascii() { ch as u8 } else { b'_' })
+        .collect();
+    raw.extend_from_slice(&[0, 0]);
+    let units: Vec<u16> = text.encode_utf16().collect();
+    for group in units.chunks(4) {
+        raw.push(0xaa); // Four full UTF-16 commands; unused low bits are ignored.
+        for unit in group {
+            raw.extend_from_slice(&unit.to_le_bytes());
+        }
+    }
+    if raw.len() > usize::from(u16::MAX) - 32 {
+        return Err(Error::InvalidArgument(
+            "legacy Unicode filename is too long",
+        ));
+    }
+    Ok(raw)
+}
+
 /// Restore a RAR5 Unix mapped name to filename bytes. Call only for Unix-host
 /// names when writing to a Unix filesystem. Unmarked names, including malformed
 /// UTF-8 from tolerant archive readers, retain their exact bytes.

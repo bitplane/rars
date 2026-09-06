@@ -86,6 +86,7 @@ struct BuilderEntry {
     mtime_nanoseconds: Option<u32>,
     file_times: Option<crate::FileTimes>,
     legacy_extended_times: Option<Vec<u8>>,
+    legacy_unicode_name: Option<Vec<u8>>,
     file_comment: Option<Vec<u8>>,
     encryption: Option<EntryEncryption>,
     redirection: Option<rar50::FileRedirection>,
@@ -317,6 +318,7 @@ impl Builder {
             mtime_nanoseconds: None,
             file_times: None,
             legacy_extended_times: None,
+            legacy_unicode_name: None,
             file_comment: None,
             encryption: None,
             redirection: None,
@@ -347,6 +349,7 @@ impl Builder {
             mtime_nanoseconds: None,
             file_times: None,
             legacy_extended_times: None,
+            legacy_unicode_name: None,
             file_comment: None,
             encryption: None,
             redirection: None,
@@ -402,6 +405,7 @@ impl Builder {
             mtime_nanoseconds: None,
             file_times: None,
             legacy_extended_times: None,
+            legacy_unicode_name: None,
             file_comment: None,
             encryption: None,
             redirection: None,
@@ -465,6 +469,7 @@ impl Builder {
             mtime_nanoseconds: None,
             file_times: None,
             legacy_extended_times: None,
+            legacy_unicode_name: None,
             file_comment: None,
             encryption: None,
             redirection: Some(link),
@@ -494,6 +499,7 @@ impl Builder {
             mtime_nanoseconds: meta.mtime_refinement.map(|time| time.nanoseconds),
             file_times: None,
             legacy_extended_times: None,
+            legacy_unicode_name: None,
             file_comment: None,
             encryption: None,
             redirection: Some(link.clone()),
@@ -604,6 +610,31 @@ impl Builder {
     pub fn archive_comment_password(mut self, password: Option<Vec<u8>>) -> Self {
         self.comment_password = password;
         self
+    }
+
+    /// Retain a validated native Unicode name record for a queued legacy entry.
+    /// Renaming re-encodes Unicode; unchanged names retain their original bytes.
+    pub fn set_legacy_unicode_name(&mut self, name: &[u8], raw: Vec<u8>) -> Result<()> {
+        if !matches!(
+            self.format,
+            ArchiveVersion::Rar20
+                | ArchiveVersion::Rar29
+                | ArchiveVersion::Rar30
+                | ArchiveVersion::Rar40
+        ) || self.volume_size.is_some()
+        {
+            return Err(Error::InvalidArgument(
+                "legacy Unicode names require single-archive RAR2–4 output",
+            ));
+        }
+        rar15_40::validate_unicode_name(&raw, name)?;
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.name == name)
+            .ok_or(Error::EntryNotFound)?;
+        entry.legacy_unicode_name = Some(raw);
+        Ok(())
     }
 
     /// Retain a native RAR2.9–4.x extended-time record, including archival time.
@@ -835,6 +866,11 @@ impl Builder {
         if old != new {
             self.reject_duplicate_name(&new)?;
         }
+        let unicode_name = if old != new && self.entries[index].legacy_unicode_name.is_some() {
+            Some(crate::filename::encode_legacy_unicode(&new)?)
+        } else {
+            self.entries[index].legacy_unicode_name.clone()
+        };
         for entry in &mut self.entries {
             if let Some(link) = &mut entry.redirection {
                 if link.redirection_type >= 4 && link.target_name == old {
@@ -842,6 +878,7 @@ impl Builder {
                 }
             }
         }
+        self.entries[index].legacy_unicode_name = unicode_name;
         self.entries[index].name = new;
         Ok(())
     }
@@ -947,13 +984,11 @@ impl Builder {
                 "retained legacy unpacker version requires single-archive output",
             ));
         }
-        if self
-            .entries
-            .iter()
-            .any(|entry| entry.legacy_extended_times.is_some())
-        {
+        if self.entries.iter().any(|entry| {
+            entry.legacy_extended_times.is_some() || entry.legacy_unicode_name.is_some()
+        }) {
             return Err(Error::InvalidArgument(
-                "legacy extended timestamps are unsupported in volume output",
+                "legacy extended timestamps and Unicode names are unsupported in volume output",
             ));
         }
 
@@ -1219,6 +1254,7 @@ impl Builder {
             .entries
             .iter()
             .map(|entry| rar15_40::RetainedMemberMetadata {
+                unicode_name: entry.legacy_unicode_name.as_deref(),
                 unpack_version: self.legacy_unpack_version,
                 extended_times: entry.legacy_extended_times.as_deref(),
                 is_directory: entry.is_directory,

@@ -89,6 +89,7 @@ pub fn write_stored_archive_with_comment(
 }
 
 pub(crate) struct RetainedMemberMetadata<'a> {
+    pub(crate) unicode_name: Option<&'a [u8]>,
     pub(crate) unpack_version: Option<u8>,
     pub(crate) extended_times: Option<&'a [u8]>,
     pub(crate) is_directory: bool,
@@ -131,6 +132,10 @@ pub(crate) fn write_archive_with_retained_metadata(
                 "unsupported retained legacy unpacker version",
             ));
         }
+        if let Some(raw) = metadata.unicode_name {
+            super::validate_unicode_name(raw, member.name)?;
+        }
+        member.unicode_name = metadata.unicode_name;
         member.unpack_version = metadata.unpack_version;
         member.extended_times = metadata.extended_times;
         member.is_directory = metadata.is_directory;
@@ -916,6 +921,7 @@ fn is_audio_filter_candidate(data: &[u8], channels: usize) -> bool {
 
 /// One member, however the caller supplied it.
 struct Member<'a> {
+    unicode_name: Option<&'a [u8]>,
     unpack_version: Option<u8>,
     name: &'a [u8],
     bytes: MemberBytes<'a>,
@@ -939,6 +945,7 @@ impl<'a> Member<'a> {
             host_os: entry.host_os,
             password: entry.password,
             file_comment: entry.file_comment,
+            unicode_name: None,
             unpack_version: None,
             extended_times: None,
             is_directory: false,
@@ -955,6 +962,7 @@ impl<'a> Member<'a> {
             host_os: entry.host_os,
             password: entry.password,
             file_comment: entry.file_comment,
+            unicode_name: None,
             unpack_version: None,
             extended_times: None,
             is_directory: false,
@@ -971,6 +979,7 @@ impl<'a> Member<'a> {
             host_os: entry.host_os,
             password: entry.password.as_deref(),
             file_comment: entry.file_comment.as_deref(),
+            unicode_name: None,
             unpack_version: None,
             extended_times: None,
             is_directory: false,
@@ -1114,6 +1123,10 @@ fn write_member(
     if salt.is_some() {
         flags |= FHD_SALT;
     }
+    let wire_name = member.unicode_name.unwrap_or(member.name);
+    if member.unicode_name.is_some() {
+        flags |= super::FHD_UNICODE;
+    }
     let mut extra = encode_file_comment(member.file_comment)?;
     if let Some(raw) = member.extended_times {
         flags |= FHD_EXTTIME;
@@ -1124,7 +1137,7 @@ fn write_member(
         &mut header,
         &FileRecord {
             head_type: FILE_HEAD,
-            name: member.name,
+            name: wire_name,
             unpacked_size: encoded.unpacked_size,
             file_crc: encoded.file_crc,
             packed_size,
@@ -1145,7 +1158,7 @@ fn write_member(
     )?;
     if let Some(version) = member.unpack_version {
         header[24] = version;
-        write_file_header_crc(&mut header, 0, member.name.len(), flags);
+        write_file_header_crc(&mut header, 0, wire_name.len(), flags);
     }
     match header_password {
         Some(password) => write_encrypted_header(output, &header, password)?,

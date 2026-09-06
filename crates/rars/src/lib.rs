@@ -438,6 +438,8 @@ pub enum ArchiveMemberDetail {
         crc32: u32,
         /// Whether this member participates in a solid stream.
         solid: bool,
+        /// Original Unicode wire name, including the legacy fallback.
+        unicode_name: Option<Vec<u8>>,
         /// Raw legacy extended timestamp record.
         extended_times: Vec<u8>,
         /// Per-file salt when file encryption is used.
@@ -953,6 +955,7 @@ fn rar15_40_member(file: &rar15_40::FileHeader) -> ArchiveMember {
             crc32: file.file_crc,
             solid: file.is_solid(),
             salt: file.salt,
+            unicode_name: file.unicode_name.clone(),
             extended_times: file.ext_time.clone(),
             has_file_comment: file.has_file_comment(),
         },
@@ -1937,7 +1940,6 @@ mod tests {
             ArchiveMemberDetail::Rar15To40 {
                 method: 0x33 | 0x35,
                 unpack_version: 29,
-                crc32: _,
                 solid: false,
                 salt: None,
                 has_file_comment: true,

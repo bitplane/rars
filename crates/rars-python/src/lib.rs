@@ -732,6 +732,16 @@ impl RarBuilder {
         let comment_encryption = archive.archive.member_comment_encryption();
         for ((member_index, member), comment) in archive.archive.members().enumerate().zip(comments)
         {
+            let legacy_unicode_name = if legacy_preservation {
+                match &member.detail {
+                    rars_rs::ArchiveMemberDetail::Rar15To40 { unicode_name, .. } => {
+                        unicode_name.clone()
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
             let legacy_extended_times = if legacy_preservation {
                 match &member.detail {
                     rars_rs::ArchiveMemberDetail::Rar15To40 { extended_times, .. }
@@ -883,6 +893,12 @@ impl RarBuilder {
                             None
                         },
                     )
+                    .map_err(map_builder_error)?;
+            }
+            if let Some(raw) = legacy_unicode_name {
+                builder
+                    .inner
+                    .set_legacy_unicode_name(&output_name, raw)
                     .map_err(map_builder_error)?;
             }
             if legacy_extended_times.is_some() {

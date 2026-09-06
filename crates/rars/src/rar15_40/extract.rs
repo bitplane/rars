@@ -738,6 +738,7 @@ mod tests {
             unp_ver: 29,
             method: 0x30,
             name: name.to_vec(),
+            unicode_name: None,
             attr: 0x20,
             salt: None,
             file_comment: Vec::new(),

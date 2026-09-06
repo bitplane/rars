@@ -152,6 +152,8 @@ pub struct FileHeader {
     pub unp_ver: u8,
     pub method: u8,
     pub name: Vec<u8>,
+    /// Original Unicode wire name, including its legacy fallback when present.
+    pub unicode_name: Option<Vec<u8>>,
     pub attr: u32,
     pub salt: Option<[u8; 8]>,
     pub file_comment: Vec<u8>,
@@ -1429,8 +1431,12 @@ impl Archive {
                     "{label}: unsupported legacy directory payload or compression"
                 ));
             }
-            if file.block.flags & FHD_UNICODE != 0 {
-                issues.push(format!("{label}: legacy Unicode filename encoding"));
+            if let Some(raw) = &file.unicode_name {
+                if file.unp_ver < 20 || validate_unicode_name(raw, &file.name).is_err() {
+                    issues.push(format!(
+                        "{label}: malformed or unsupported legacy Unicode name"
+                    ));
+                }
             }
             if !matches!(file.host_os, 0..=3) {
                 issues.push(format!("{label}: legacy host metadata"));
@@ -1449,11 +1455,12 @@ impl Archive {
                     | FHD_EXTTIME
                     | FHD_PASSWORD
                     | FHD_SALT
-                    | FHD_COMMENT)
+                    | FHD_COMMENT
+                    | FHD_UNICODE)
                 != 0
                 || usize::from(file.block.head_size)
                     != 32
-                        + file.name.len()
+                        + file.unicode_name.as_ref().map_or(file.name.len(), Vec::len)
                         + file.ext_time.len()
                         + file.file_comment.len()
                         + if file.salt.is_some() { 8 } else { 0 }
@@ -2508,6 +2515,7 @@ fn parse_file_like_header(
             "RAR 1.5 file name extends beyond header",
         ));
     }
+    let unicode_name = (block.flags & FHD_UNICODE != 0).then(|| input[pos..name_end].to_vec());
     let name = decode_file_name(&input[pos..name_end], block.flags);
     pos = name_end;
 
@@ -2567,6 +2575,7 @@ fn parse_file_like_header(
         unp_ver,
         method,
         name,
+        unicode_name,
         attr,
         salt,
         file_comment,
@@ -2575,7 +2584,18 @@ fn parse_file_like_header(
     })
 }
 
-fn decode_file_name(raw: &[u8], flags: u16) -> Vec<u8> {
+pub(crate) fn validate_unicode_name(raw: &[u8], decoded: &[u8]) -> Result<()> {
+    if decode_file_name(raw, FHD_UNICODE) != decoded || std::str::from_utf8(decoded).is_err() {
+        return Err(Error::InvalidArgument("invalid legacy Unicode filename"));
+    }
+    crate::filename::validate_relative(decoded)?;
+    if let Some(zero) = raw.iter().position(|byte| *byte == 0) {
+        crate::filename::validate_relative(&raw[..zero])?;
+    }
+    Ok(())
+}
+
+pub(crate) fn decode_file_name(raw: &[u8], flags: u16) -> Vec<u8> {
     if flags & FHD_UNICODE == 0 {
         return raw.to_vec();
     }
@@ -3108,6 +3128,7 @@ mod tests {
             unp_ver: 29,
             method: 0x30,
             name: b"entry".to_vec(),
+            unicode_name: None,
             attr: 0,
             salt: None,
             file_comment: Vec::new(),

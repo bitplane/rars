@@ -133,7 +133,7 @@ header encryption or a NewSub archive comment is required, without claiming to r
 File data is recompressed.
 
 Specific preflight errors currently reject unsupported encryption settings,
-malformed extended timestamps, unsupported comment forms, unsupported special entries, legacy
+malformed extended timestamps, unsupported comment forms, unsupported special entries, malformed legacy
 Unicode filename records,
 unsupported host metadata, recovery and other service records. Unknown header
 flags, extra header bytes, unsupported end headers and trailing bytes are also
@@ -152,7 +152,15 @@ for reference-reader compatibility. Legacy link/directory volume output is rejec
 as are directories with payload data, unsupported compression or solid dependencies.
 The legacy format has no separate symbolic-link target-directory flag; requesting
 that flag through `add_unix_symlink` is rejected for legacy output. Other special
-entry types and legacy Unicode filename records remain unsupported.
+entry types remain unsupported.
+
+Legacy Unicode entries retain their original wire name, including the fallback
+bytes, when unchanged. Renames encode UTF-16 commands with an ASCII fallback;
+renaming such an entry requires valid UTF-8, while ordinary legacy byte names
+keep accepting arbitrary bytes. Invalid names fail before modifying builder state.
+Non-BMP names round-trip through the library. Linux UnRAR currently mishandles
+surrogate pairs in the legacy compact encoding, so its filename extraction checks
+cover BMP names; this does not change the retained Unicode data.
 
 The input password is required for retained data or header encryption and is reused
 for encrypted output. Plaintext members stay plaintext. Removing encrypted members
