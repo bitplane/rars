@@ -130,7 +130,10 @@ pub(crate) fn write_archive_with_retained_metadata(
             && (member.unpacked_size()? != 0
                 || !matches!(
                     options.target,
-                    ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
+                    ArchiveVersion::Rar20
+                        | ArchiveVersion::Rar29
+                        | ArchiveVersion::Rar30
+                        | ArchiveVersion::Rar40
                 ))
         {
             return Err(Error::InvalidArgument(

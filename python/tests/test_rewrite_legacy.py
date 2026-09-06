@@ -39,7 +39,7 @@ def source_bytes(format="rar40", **options):
     return builder.to_bytes()
 
 
-@pytest.mark.parametrize("format", ["rar29", "rar30", "rar40"])
+@pytest.mark.parametrize("format", ["rar20", "rar29", "rar30", "rar40"])
 @pytest.mark.parametrize("options", [{"store": True}, {}, {"solid": True}])
 @pytest.mark.parametrize("on_disk", [False, True])
 def test_native_legacy_preservation_keeps_names_times_attributes_and_format(tmp_path, format, options, on_disk):
@@ -258,10 +258,11 @@ def test_legacy_encryption_survives_edits(tmp_path, header_encryption, solid):
         subprocess.run(["unrar", "t", "-psecret", "-idq", str(path)], check=True, capture_output=True)
 
 
-def test_mixed_legacy_encryption_keeps_plaintext_members_plain(tmp_path):
-    plain = rars.RarBuilder(format="rar40", store=True)
+@pytest.mark.parametrize("format", ["rar20", "rar40"])
+def test_mixed_legacy_encryption_keeps_plaintext_members_plain(tmp_path, format):
+    plain = rars.RarBuilder(format=format, store=True)
     plain.add_bytes(b"public", "plain")
-    encrypted = rars.RarBuilder(format="rar40", password="secret")
+    encrypted = rars.RarBuilder(format=format, password="secret")
     encrypted.add_bytes(b"private", "encrypted")
     secret_bytes = encrypted.to_bytes()
     member_offset = next(offset for offset, kind, _, _ in headers(secret_bytes) if kind == 0x74)

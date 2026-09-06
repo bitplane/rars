@@ -78,13 +78,13 @@ time. Malformed legacy extended records and legacy archival time (which has no
 supported RAR5 counterpart) are rejected during conversion.
 
 `RarBuilder.add_directory(arcname, mtime=None, mode=None)` adds an explicit
-directory to single-archive RAR2.9–4.x or RAR5/7 output. It also allows empty
+directory to single-archive RAR2.0–4.x or RAR5/7 output. It also allows empty
 directories without an input archive. `mode` supplies Unix permissions; the default uses DOS directory flags.
 Recursive `add(path)` still only queues files; explicit directory creation does
 not change that existing traversal policy.
 
 `RarBuilder.add_unix_symlink(arcname, target, *, target_is_directory=False,
-mtime=None, mode=None)` queues a Unix symbolic link for RAR2.9–4.x or RAR5/7.
+mtime=None, mode=None)` queues a Unix symbolic link for RAR2.0–4.x or RAR5/7.
 The target is retained without being followed, so dangling links are supported. `mode`
 defaults to `0o777`; link type bits are retained separately from permissions.
 `RarFile.readlink(member)` returns the raw target bytes of a supported RAR5
@@ -104,8 +104,9 @@ existing policy for creating filesystem links.
 
 ## Native legacy preservation
 
-The supported subset includes single-volume RAR 2.9–4.x archives containing ordinary
-files, including solid archives and salted AES data encryption. Header encryption
+The supported subset includes single-volume RAR 2.0–4.x archives containing ordinary
+files, including solid archives, RAR2 data encryption and RAR2.9–4.x salted AES
+data encryption. RAR3/4 header encryption
 is retained separately; mixed encrypted/plain members keep their individual status.
 Names retain their original bytes;
 base DOS timestamps and validated extended records retain their raw values without
@@ -115,9 +116,18 @@ permissions/type bits and DOS attributes retain their source meaning. DOS, OS/2
 and Windows host IDs are normalised to the DOS host with the same attributes.
 Renames and removals retain original member identity and order.
 
-The source must use unpacker version 29 for every member. RAR 2.9, 3.x and 4.x
+Sources using unpacker version 20 for every member retain RAR2 output, including
+old-style archive/file comments, directories and Unix links. Mixed unpacker
+versions, RAR3 comment records, encrypted headers and extended timestamps in
+RAR2 sources are rejected. Sources requiring unpacker 26 remain unsupported.
+
+Modern UnRAR reports three comment-header errors on the original WinRAR 2.02
+comment fixtures and their rewrites, while validating both members successfully.
+Comment contents are checked independently through the library.
+
+Other supported sources use unpacker version 29 for every member. RAR 2.9, 3.x and 4.x
 share this version; preservation uses the compatible RAR29 writer, or RAR30 when
-header encryption is required, without claiming to reproduce the creating release.
+header encryption or a NewSub archive comment is required, without claiming to reproduce the creating release.
 File data is recompressed.
 
 Specific preflight errors currently reject unsupported encryption settings,
@@ -125,7 +135,7 @@ malformed extended timestamps, unsupported comment forms, unsupported special en
 Unicode filename records,
 unsupported host metadata, recovery and other service records. Unknown header
 flags, extra header bytes, unsupported end headers and trailing bytes are also
-rejected. RAR1.x/2.0 preservation and empty legacy output remain unsupported;
+rejected. RAR1.x preservation and empty legacy output remain unsupported;
 removing the final member fails writing without replacing the destination.
 Use explicit `preserve=False` conversion when these properties need conversion
 rather than retention. Legacy writers materialize retained payloads in memory.
@@ -160,7 +170,7 @@ output. Duplicate archive comments, unknown comment metadata and ambiguous servi
 locations fail preflight. Comments combined with encrypted headers, encrypted CMT
 payloads, and embedded file comments combined with a RAR3/4 archive CMT record are
 still unsupported writer combinations. File data encryption with visible comments
-is supported. These checks do not enable RAR1.x/2.0 preservation.
+is supported. These checks do not enable RAR1.x preservation.
 
 Native rewriting preserves archival time even though `gettimes()` and RAR5
 conversion cannot represent it. Those conversion APIs retain their existing

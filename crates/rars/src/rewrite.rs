@@ -161,6 +161,8 @@ impl Archive {
                     .any(|sub| sub.kind == crate::rar15_40::NewSubKind::ArchiveComment)
             {
                 crate::ArchiveVersion::Rar30
+            } else if archive.files().all(|file| file.unp_ver == 20) {
+                crate::ArchiveVersion::Rar20
             } else {
                 crate::ArchiveVersion::Rar29
             };

@@ -56,8 +56,9 @@ def test_native_legacy_links_keep_target_bytes_through_edits(target, options):
 @pytest.mark.skipif(os.name != "posix" or not shutil.which("unrar"), reason="requires Unix and unrar")
 @pytest.mark.parametrize("solid", [False, True])
 @pytest.mark.parametrize("links", [False, True])
-def test_unrar_extracts_rewritten_legacy_directories_and_links(tmp_path, solid, links):
-    source = rars.RarBuilder(format="rar40", solid=solid)
+@pytest.mark.parametrize("format", ["rar20", "rar40"])
+def test_unrar_extracts_rewritten_legacy_directories_and_links(tmp_path, solid, links, format):
+    source = rars.RarBuilder(format=format, solid=solid)
     source.add_bytes(b"payload" * 300, "file", mtime=DOS_TIME)
     source.add_directory("empty", mtime=DOS_TIME, mode=0o750)
     if links:

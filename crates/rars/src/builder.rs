@@ -351,7 +351,7 @@ impl Builder {
         })
     }
 
-    /// Queue an explicit RAR2.9–4.x or RAR5/7 directory, including an empty one.
+    /// Queue an explicit RAR2.0–4.x or RAR5/7 directory, including an empty one.
     /// `mode` supplies Unix permission bits; otherwise DOS directory flags are used.
     /// Legacy timestamps use raw DOS values; legacy volume output is unsupported.
     pub fn add_directory(
@@ -362,13 +362,16 @@ impl Builder {
     ) -> Result<()> {
         let legacy = matches!(
             self.format,
-            ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
+            ArchiveVersion::Rar20
+                | ArchiveVersion::Rar29
+                | ArchiveVersion::Rar30
+                | ArchiveVersion::Rar40
         );
         if (!legacy && self.format.family() != ArchiveFamily::Rar50Plus)
             || (legacy && self.volume_size.is_some())
         {
             return Err(Error::InvalidArgument(
-                "explicit directories require RAR5/7 or single-archive RAR2.9–4.x output",
+                "explicit directories require RAR5/7 or single-archive RAR2.0–4.x output",
             ));
         }
         self.push(BuilderEntry {
@@ -390,7 +393,7 @@ impl Builder {
         })
     }
 
-    /// Queue a RAR2.9–4.x or RAR5/7 Unix symbolic link without following its target.
+    /// Queue a RAR2.0–4.x or RAR5/7 Unix symbolic link without following its target.
     /// Name and target use archive wire bytes. Relative targets remain unchanged
     /// through renames; the directory flag describes the target, not this entry.
     /// Legacy targets use native bytes and cannot carry a target-directory flag.
@@ -404,7 +407,10 @@ impl Builder {
     ) -> Result<()> {
         if matches!(
             self.format,
-            ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
+            ArchiveVersion::Rar20
+                | ArchiveVersion::Rar29
+                | ArchiveVersion::Rar30
+                | ArchiveVersion::Rar40
         ) {
             if self.volume_size.is_some()
                 || target_is_directory
@@ -514,7 +520,7 @@ impl Builder {
         Ok(())
     }
 
-    /// Set per-member encryption for RAR2.9–4.x or RAR5/7 output.
+    /// Set per-member encryption for RAR2.0–4.x or RAR5/7 output.
     /// Legacy output supports data passwords only, for single archives.
     /// Explicit None passwords retain plaintext even when the builder has a default password.
     pub fn set_entry_encryption(
@@ -525,7 +531,10 @@ impl Builder {
     ) -> Result<()> {
         let legacy = matches!(
             self.format,
-            ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
+            ArchiveVersion::Rar20
+                | ArchiveVersion::Rar29
+                | ArchiveVersion::Rar30
+                | ArchiveVersion::Rar40
         );
         if (!legacy && self.format.family() != ArchiveFamily::Rar50Plus)
             || (legacy && (comment_password.is_some() || self.volume_size.is_some()))

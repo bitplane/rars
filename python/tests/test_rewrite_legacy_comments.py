@@ -9,7 +9,7 @@ import rars
 from test_rewrite_legacy import ROOT, headers
 
 
-@pytest.mark.parametrize("format", ["rar29", "rar30", "rar40"])
+@pytest.mark.parametrize("format", ["rar20", "rar29", "rar30", "rar40"])
 @pytest.mark.parametrize("comment", [b"", b"archive comment\xff"])
 @pytest.mark.parametrize("password", [None, "secret"])
 def test_native_archive_comments_survive_rewrites(format, comment, password):
@@ -29,8 +29,9 @@ def test_native_archive_comments_survive_rewrites(format, comment, password):
 
 
 @pytest.mark.parametrize("password", [None, "secret"])
-def test_embedded_file_comments_follow_edits_and_keep_empty_distinct(password):
-    builder = rars.RarBuilder(format="rar29", comment=b"archive", password=password)
+@pytest.mark.parametrize("format", ["rar20", "rar29"])
+def test_embedded_file_comments_follow_edits_and_keep_empty_distinct(password, format):
+    builder = rars.RarBuilder(format=format, comment=b"archive", password=password)
     for name in ["file", "empty", "absent", "remove"]:
         builder.add_bytes(name.encode(), name)
     builder.set_file_comment("file", b"comment\xff")

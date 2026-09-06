@@ -1331,7 +1331,7 @@ impl Archive {
         })
     }
 
-    /// Native metadata checks for the initial RAR 2.9–4.x rewrite subset.
+    /// Native metadata checks for the supported RAR 2.0–4.x rewrite subsets.
     pub(crate) fn rewrite_preservation_issues(&self) -> Vec<String> {
         let mut issues = Vec::new();
         if self.main.is_volume() {
@@ -1363,15 +1363,28 @@ impl Archive {
         if self.files().next().is_none() {
             issues.push("empty legacy archive (source format cannot be inferred)".into());
         }
+        let rar20 = self.files().any(|file| file.unp_ver == 20);
+        if rar20
+            && (self.files().any(|file| file.unp_ver != 20)
+                || self.main.has_encrypted_headers()
+                || new_comment)
+        {
+            issues.push("RAR2 preservation with mixed unpacker versions, encrypted headers or RAR3 archive comments is unsupported".into());
+        }
         for (index, file) in self.files().enumerate() {
             let label = format!("legacy member {index} ({:?})", file.name_lossy());
-            if file.unp_ver != 29 {
-                issues.push(format!("{label}: legacy source format requires unpacker {} (only 29 is supported for preservation)", file.unp_ver));
+            if !matches!(file.unp_ver, 20 | 29) {
+                issues.push(format!("{label}: legacy source format requires unpacker {} (only 20 and 29 are supported for preservation)", file.unp_ver));
             }
-            if file.is_encrypted() != file.salt.is_some() {
+            if (file.unp_ver == 20 && file.salt.is_some())
+                || (file.unp_ver != 20 && file.is_encrypted() != file.salt.is_some())
+            {
                 issues.push(format!(
                     "{label}: unsupported legacy encryption salt settings"
                 ));
+            }
+            if file.unp_ver == 20 && file.has_ext_time() {
+                issues.push(format!("{label}: RAR2 extended timestamps are unsupported"));
             }
             if file.has_ext_time()
                 && crate::file_times::validate_legacy_extended_times(&file.ext_time).is_err()
