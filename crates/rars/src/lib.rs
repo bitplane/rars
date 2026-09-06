@@ -102,6 +102,10 @@ pub struct ArchiveReadOptions<'a> {
     /// None preserves defaults; zero permits empty output. Known sizes are
     /// admitted before opening output; unknown-size logical members are refused.
     /// Errors can leave earlier output and a failing member's prefix.
+    /// Short writes charge only accepted bytes; refused chunks need not fill
+    /// the remaining allowance. A per-member refusal takes precedence when both
+    /// output ceilings reject the same admission or write. Separate extraction
+    /// calls, including calls for nested archives, do not share this budget.
     ///
     /// Configuring this option makes parallel entry points extract sequentially
     /// for deterministic admission and accounting. This can reduce throughput.
