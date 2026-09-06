@@ -712,6 +712,7 @@ impl FileHeader {
             | Error::UnsupportedVersion(_)
             | Error::UnsupportedFeature { .. }
             | Error::UnsupportedWriterOption { .. }
+            | Error::CannotSkipSolidMember
             | Error::MemberOutputLimitExceeded { .. }
             | Error::HeaderCountLimitExceeded { .. }
             | Error::HeaderBytesLimitExceeded { .. }
@@ -1382,43 +1383,106 @@ impl Archive {
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
+        self.extract_impl(options, &mut open, None, None)
+            .map(|_| ())
+    }
+
+    pub(crate) fn extract_controlled(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+        selector: &mut crate::extraction_control::Selector<'_>,
+        on_error: Option<&mut crate::extraction_control::ErrorHandler<'_>>,
+    ) -> Result<crate::ExtractionOutcome> {
+        self.extract_impl(
+            options,
+            &mut |_| unreachable!("controlled selection supplies writer"),
+            Some(selector),
+            on_error,
+        )
+    }
+
+    fn extract_impl<F>(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+        open: &mut F,
+        mut selector: Option<&mut crate::extraction_control::Selector<'_>>,
+        mut on_error: Option<&mut crate::extraction_control::ErrorHandler<'_>>,
+    ) -> Result<crate::ExtractionOutcome>
+    where
+        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    {
         options.check_cancelled()?;
         let password = options.password;
         let mut budget = crate::output_limit::OutputBudget::new(options);
         let mut session = DecoderSession::new_with_password(self.main.is_solid(), password);
         session.read_control = budget.control.clone();
+        let solid = selector.is_some()
+            && (self.main.is_solid() || self.files().any(|file| file.is_solid()));
         for file in self.files() {
-            options.check_cancelled()?;
-            if file.is_split_before() || file.is_split_after() {
-                return Err(Error::InvalidHeader(
-                    "RAR 1.5 split entry requires multivolume extraction",
-                ));
-            }
-            let meta = file.metadata();
-            if meta.is_directory {
-                options.check_cancelled()?;
-                let _ = open(&meta)?;
-                options.check_cancelled()?;
-                continue;
-            }
-            budget.check(file.unp_size, &file.name)?;
-            options.check_cancelled()?;
-            let mut writer = open(&meta)?;
-            options.check_cancelled()?;
-            budget.run(&file.name, &mut writer, |mut writer| {
-                if file.is_stored() {
-                    file.write_stored_to(self, password, &mut writer)
-                        .map_err(|error| file.entry_error("extracting", error))?;
-                } else {
-                    session
-                        .write_file_to(self, file, &mut writer)
-                        .map_err(|error| file.entry_error("extracting", error))?;
+            let selected = crate::extraction_control::select(
+                &mut selector,
+                options,
+                || crate::rar15_40_member(file),
+                solid,
+            )?;
+            let mut selected_writer = match selected {
+                Some(crate::ExtractionDecision::Skip) => continue,
+                Some(crate::ExtractionDecision::Stop) => {
+                    return Ok(crate::ExtractionOutcome::Stopped)
                 }
+                Some(crate::ExtractionDecision::Extract(writer)) => Some(writer),
+                None => None,
+            };
+            let result = (|| {
+                options.check_cancelled()?;
+                if file.is_split_before() || file.is_split_after() {
+                    return Err(Error::InvalidHeader(
+                        "RAR 1.5 split entry requires multivolume extraction",
+                    ));
+                }
+                let meta = file.metadata();
+                if meta.is_directory {
+                    options.check_cancelled()?;
+                    let _ = match selected_writer.take() {
+                        Some(writer) => writer,
+                        None => open(&meta)?,
+                    };
+                    options.check_cancelled()?;
+                    return Ok(());
+                }
+                budget.check(file.unp_size, &file.name)?;
+                options.check_cancelled()?;
+                let mut writer = match selected_writer.take() {
+                    Some(writer) => writer,
+                    None => open(&meta)?,
+                };
+                options.check_cancelled()?;
+                budget.run(&file.name, &mut writer, |mut writer| {
+                    if file.is_stored() {
+                        file.write_stored_to(self, password, &mut writer)
+                            .map_err(|error| file.entry_error("extracting", error))?;
+                    } else {
+                        session
+                            .write_file_to(self, file, &mut writer)
+                            .map_err(|error| file.entry_error("extracting", error))?;
+                    }
+                    Ok(())
+                })?;
                 Ok(())
-            })?;
+            })();
+            if crate::extraction_control::finish_member(
+                &mut on_error,
+                options,
+                || crate::rar15_40_member(file),
+                solid,
+                result,
+            )? {
+                session = DecoderSession::new_with_password(false, password);
+                session.read_control = budget.control.clone();
+            }
         }
         options.check_cancelled()?;
-        Ok(())
+        Ok(crate::ExtractionOutcome::Complete)
     }
 
     /// Decodes independent members in batches of at most the worker count,

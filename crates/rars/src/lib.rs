@@ -32,6 +32,7 @@ mod parallel;
 mod parse_budget;
 mod read_control;
 pub use read_control::ReadCancellation;
+mod extraction_control;
 pub mod rar13;
 pub mod rar15_40;
 pub mod rar50;
@@ -52,6 +53,7 @@ mod x86_filter_scan;
 pub use builder::{entry_relative_path, validate_entry_name, Builder};
 pub use detect::{detect_archive_family, find_archive_start, ArchiveSignature, SFX_SCAN_LIMIT};
 pub use error::{Error, ErrorKind, Result};
+pub use extraction_control::{ExtractionDecision, ExtractionErrorAction, ExtractionOutcome};
 pub use features::{Feature, FeatureSet};
 pub use filter::{
     formats_supporting_filter, FilterKind, FilterPolicy, FilterSpec, UnsupportedFilterKind,
@@ -594,6 +596,90 @@ impl Archive {
                 archive.extract_to(options, |meta| open(&rar15_40_meta(meta)))
             }
             Self::Rar50Plus(archive) => archive.extract_to(options, |meta| open(&rar50_meta(meta))),
+        }
+    }
+
+    /// Visits members in archive order, choosing whether to extract, skip or stop.
+    ///
+    /// The callback receives full metadata before payload limits, dictionary
+    /// admission, password checks or decoding. It can skip an oversized or
+    /// encrypted independent member without reading its payload. Skipped output
+    /// does not consume output quotas and is not verified. Parsing limits and
+    /// passwords needed to read encrypted headers still apply before this call.
+    ///
+    /// `Extract` uses the same decoding and output accounting as [`Self::extract_to`].
+    /// Its writer can already have been opened when admission fails. Callback,
+    /// source, decoding, integrity and sink errors stop extraction immediately;
+    /// partial output has the failure semantics documented on that method.
+    /// `Stop` returns [`ExtractionOutcome::Stopped`], distinct from reaching the end.
+    /// Cancellation takes precedence over a successful callback decision.
+    ///
+    /// Skipping file data is conservatively refused in any solid archive with
+    /// [`Error::CannotSkipSolidMember`]. To discard solid output while retaining
+    /// history, return `Extract(Box::new(std::io::sink()))`; this still decodes,
+    /// verifies, requires passwords and counts against output quotas.
+    /// Directories can be skipped. RAR5 redirections can be skipped or stop the
+    /// scan but cannot be extracted through this writer-only callback.
+    /// This sequential API handles a single physical archive; extracting split
+    /// members still requires the existing multivolume extraction API.
+    ///
+    /// ```
+    /// # fn scan(archive: &rars::Archive) -> rars::Result<()> {
+    /// use rars::{ArchiveReadOptions, ExtractionDecision};
+    /// archive.extract_with_control(ArchiveReadOptions::new(), |member| {
+    ///     if member.meta.is_encrypted || member.meta.unpacked_size > 1024 * 1024 {
+    ///         Ok(ExtractionDecision::Skip)
+    ///     } else {
+    ///         Ok(ExtractionDecision::Extract(Box::new(std::io::sink())))
+    ///     }
+    /// })?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn extract_with_control<F>(
+        &self,
+        options: ArchiveReadOptions<'_>,
+        mut decide: F,
+    ) -> Result<ExtractionOutcome>
+    where
+        F: FnMut(&ArchiveMember) -> Result<ExtractionDecision>,
+    {
+        match self {
+            Self::Rar13(archive) => archive.extract_controlled(options, &mut decide, None),
+            Self::Rar15To40(archive) => archive.extract_controlled(options, &mut decide, None),
+            Self::Rar50Plus(archive) => archive.extract_controlled(options, &mut decide, None),
+        }
+    }
+
+    /// Like [`Self::extract_with_control`], with explicit recovery after independent
+    /// member failures. `on_error` can return [`ExtractionErrorAction::Continue`]
+    /// to attempt the next member with fresh decoder state. Partial output is not
+    /// removed, and bytes already accepted remain charged to the total quota.
+    /// `Complete` means the traversal ended, not that every member was verified.
+    ///
+    /// Solid or split-member failures, resource-limit failures, cancellation and
+    /// errors returned by either callback are fatal and cannot be continued.
+    /// Parsing errors occur before this API and cannot be recovered here.
+    pub fn extract_with_control_and_errors<F, E>(
+        &self,
+        options: ArchiveReadOptions<'_>,
+        mut decide: F,
+        mut on_error: E,
+    ) -> Result<ExtractionOutcome>
+    where
+        F: FnMut(&ArchiveMember) -> Result<ExtractionDecision>,
+        E: FnMut(&ArchiveMember, &Error) -> Result<ExtractionErrorAction>,
+    {
+        match self {
+            Self::Rar13(archive) => {
+                archive.extract_controlled(options, &mut decide, Some(&mut on_error))
+            }
+            Self::Rar15To40(archive) => {
+                archive.extract_controlled(options, &mut decide, Some(&mut on_error))
+            }
+            Self::Rar50Plus(archive) => {
+                archive.extract_controlled(options, &mut decide, Some(&mut on_error))
+            }
         }
     }
 

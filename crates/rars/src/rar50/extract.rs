@@ -508,7 +508,8 @@ impl Archive {
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
         options.check_cancelled()?;
-        self.extract_to_impl(options, &mut open, &mut |_, _| Ok(()), false)
+        self.extract_to_impl(options, &mut open, &mut |_, _| Ok(()), false, None, None)
+            .map(|_| ())
     }
 
     pub fn extract_to_with_redirections<F, R>(
@@ -522,7 +523,24 @@ impl Archive {
         R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
     {
         options.check_cancelled()?;
-        self.extract_to_impl(options, &mut open, &mut redirect, true)
+        self.extract_to_impl(options, &mut open, &mut redirect, true, None, None)
+            .map(|_| ())
+    }
+
+    pub(crate) fn extract_controlled(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+        selector: &mut crate::extraction_control::Selector<'_>,
+        on_error: Option<&mut crate::extraction_control::ErrorHandler<'_>>,
+    ) -> Result<crate::ExtractionOutcome> {
+        self.extract_to_impl(
+            options,
+            &mut |_| unreachable!("controlled selection supplies writer"),
+            &mut |_, _| Ok(()),
+            false,
+            Some(selector),
+            on_error,
+        )
     }
 
     fn extract_to_impl<F, R>(
@@ -531,7 +549,9 @@ impl Archive {
         open: &mut F,
         redirect: &mut R,
         emit_redirections: bool,
-    ) -> Result<()>
+        mut selector: Option<&mut crate::extraction_control::Selector<'_>>,
+        mut on_error: Option<&mut crate::extraction_control::ErrorHandler<'_>>,
+    ) -> Result<crate::ExtractionOutcome>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
         R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
@@ -542,35 +562,77 @@ impl Archive {
         let mut session =
             DecoderSession::new_with_password(options.password, buffered_decode_limit);
         session.decoder.read_control = budget.control.clone();
+        let solid = selector.is_some()
+            && (self.main.is_solid() || self.files().any(|file| file.compression_info & 0x40 != 0));
         for file in self.files() {
-            options.check_cancelled()?;
-            file.check_dictionary_limit(options.rar50_dictionary_size_limit)?;
-            if let Some(redirection) = &file.redirection {
-                if emit_redirections {
-                    options.check_cancelled()?;
-                    redirect(&file.metadata(), redirection)?;
-                    options.check_cancelled()?;
+            let selected = crate::extraction_control::select(
+                &mut selector,
+                options,
+                || crate::rar50_member(file),
+                solid,
+            )?;
+            let selected_writer = match selected {
+                Some(crate::ExtractionDecision::Skip) => continue,
+                Some(crate::ExtractionDecision::Stop) => {
+                    return Ok(crate::ExtractionOutcome::Stopped)
                 }
-                continue;
-            }
-            if file.is_split_before() || file.is_split_after() {
-                return Err(Error::InvalidHeader(
-                    "RAR 5 split entry requires multivolume extraction",
-                ));
-            }
-            file.check_output_limit(&budget)?;
-            let meta = file.metadata();
-            options.check_cancelled()?;
-            let mut writer = open(&meta)?;
-            options.check_cancelled()?;
-            if !meta.is_directory {
-                budget.run(&file.name, &mut writer, |writer| {
-                    session.write_file_to(self, file, writer)
-                })?;
+                Some(crate::ExtractionDecision::Extract(writer)) => Some(writer),
+                None => None,
+            };
+            let result = (|| {
+                options.check_cancelled()?;
+                file.check_dictionary_limit(options.rar50_dictionary_size_limit)?;
+                if let Some(redirection) = &file.redirection {
+                    if selected_writer.is_some() {
+                        return Err(file.entry_error(
+                            "selecting",
+                            Error::UnsupportedFeature {
+                                version: crate::ArchiveVersion::Rar50,
+                                feature: "extracting redirections through extraction control",
+                            },
+                        ));
+                    }
+                    if emit_redirections {
+                        options.check_cancelled()?;
+                        redirect(&file.metadata(), redirection)?;
+                        options.check_cancelled()?;
+                    }
+                    return Ok(());
+                }
+                if file.is_split_before() || file.is_split_after() {
+                    return Err(Error::InvalidHeader(
+                        "RAR 5 split entry requires multivolume extraction",
+                    ));
+                }
+                file.check_output_limit(&budget)?;
+                let meta = file.metadata();
+                options.check_cancelled()?;
+                let mut writer = match selected_writer {
+                    Some(writer) => writer,
+                    None => open(&meta)?,
+                };
+                options.check_cancelled()?;
+                if !meta.is_directory {
+                    budget.run(&file.name, &mut writer, |writer| {
+                        session.write_file_to(self, file, writer)
+                    })?;
+                }
+                Ok(())
+            })();
+            if crate::extraction_control::finish_member(
+                &mut on_error,
+                options,
+                || crate::rar50_member(file),
+                solid,
+                result,
+            )? {
+                session =
+                    DecoderSession::new_with_password(options.password, buffered_decode_limit);
+                session.decoder.read_control = budget.control.clone();
             }
         }
         options.check_cancelled()?;
-        Ok(())
+        Ok(crate::ExtractionOutcome::Complete)
     }
 
     /// Decodes independent members in bounded batches, emitting in archive order.

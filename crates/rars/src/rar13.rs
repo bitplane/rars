@@ -614,53 +614,115 @@ impl Archive {
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
+        self.extract_impl(options, &mut open, None, None)
+            .map(|_| ())
+    }
+
+    pub(crate) fn extract_controlled(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+        selector: &mut crate::extraction_control::Selector<'_>,
+        on_error: Option<&mut crate::extraction_control::ErrorHandler<'_>>,
+    ) -> Result<crate::ExtractionOutcome> {
+        self.extract_impl(
+            options,
+            &mut |_| unreachable!("controlled selection supplies writer"),
+            Some(selector),
+            on_error,
+        )
+    }
+
+    fn extract_impl<F>(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+        open: &mut F,
+        mut selector: Option<&mut crate::extraction_control::Selector<'_>>,
+        mut on_error: Option<&mut crate::extraction_control::ErrorHandler<'_>>,
+    ) -> Result<crate::ExtractionOutcome>
+    where
+        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    {
         options.check_cancelled()?;
         let password = options.password;
         let mut budget = crate::output_limit::OutputBudget::new(options);
         let mut unpack15 = Unpack15::new();
         unpack15.read_control = budget.control.clone();
         let mut extracted_count = 0usize;
+        let solid = self.main.is_solid();
         for entry in &self.entries {
-            options.check_cancelled()?;
-            if entry.is_split_before() || entry.is_split_after() {
-                return Err(Error::InvalidHeader(
-                    "RAR 1.3 split entry requires multivolume extraction",
-                ));
-            }
-            let meta = entry.metadata();
-            if meta.is_directory {
-                options.check_cancelled()?;
-                let _ = open(&meta)?;
-                options.check_cancelled()?;
-                extracted_count += 1;
-                continue;
-            }
-            budget.check(u64::from(entry.header.unp_size), &meta.name)?;
-            options.check_cancelled()?;
-            let mut writer = open(&meta)?;
-            options.check_cancelled()?;
-            budget.run(&meta.name, &mut writer, |mut writer| {
-                if entry.is_stored() && !entry.is_encrypted() {
-                    entry
-                        .write_stored_to(self, password, &mut writer)
-                        .map_err(|error| entry.entry_error("extracting", error))?;
-                } else {
-                    entry
-                        .write_compressed_to(
-                            self,
-                            password,
-                            &mut unpack15,
-                            self.main.is_solid() && extracted_count != 0,
-                            &mut writer,
-                        )
-                        .map_err(|error| entry.entry_error("extracting", error))?;
+            let selected = crate::extraction_control::select(
+                &mut selector,
+                options,
+                || crate::rar13_member(entry),
+                solid,
+            )?;
+            let mut selected_writer = match selected {
+                Some(crate::ExtractionDecision::Skip) => continue,
+                Some(crate::ExtractionDecision::Stop) => {
+                    return Ok(crate::ExtractionOutcome::Stopped)
                 }
+                Some(crate::ExtractionDecision::Extract(writer)) => Some(writer),
+                None => None,
+            };
+            let result = (|| {
+                options.check_cancelled()?;
+                if entry.is_split_before() || entry.is_split_after() {
+                    return Err(Error::InvalidHeader(
+                        "RAR 1.3 split entry requires multivolume extraction",
+                    ));
+                }
+                let meta = entry.metadata();
+                if meta.is_directory {
+                    options.check_cancelled()?;
+                    let _ = match selected_writer.take() {
+                        Some(writer) => writer,
+                        None => open(&meta)?,
+                    };
+                    options.check_cancelled()?;
+                    extracted_count += 1;
+                    return Ok(());
+                }
+                budget.check(u64::from(entry.header.unp_size), &meta.name)?;
+                options.check_cancelled()?;
+                let mut writer = match selected_writer.take() {
+                    Some(writer) => writer,
+                    None => open(&meta)?,
+                };
+                options.check_cancelled()?;
+                budget.run(&meta.name, &mut writer, |mut writer| {
+                    if entry.is_stored() && !entry.is_encrypted() {
+                        entry
+                            .write_stored_to(self, password, &mut writer)
+                            .map_err(|error| entry.entry_error("extracting", error))?;
+                    } else {
+                        entry
+                            .write_compressed_to(
+                                self,
+                                password,
+                                &mut unpack15,
+                                self.main.is_solid() && extracted_count != 0,
+                                &mut writer,
+                            )
+                            .map_err(|error| entry.entry_error("extracting", error))?;
+                    }
+                    Ok(())
+                })?;
+                extracted_count += 1;
                 Ok(())
-            })?;
-            extracted_count += 1;
+            })();
+            if crate::extraction_control::finish_member(
+                &mut on_error,
+                options,
+                || crate::rar13_member(entry),
+                solid,
+                result,
+            )? {
+                unpack15 = Unpack15::new();
+                unpack15.read_control = budget.control.clone();
+            }
         }
         options.check_cancelled()?;
-        Ok(())
+        Ok(crate::ExtractionOutcome::Complete)
     }
 
     pub fn archive_comment(&self) -> Result<Option<Vec<u8>>> {
