@@ -84,6 +84,7 @@ struct BuilderEntry {
     is_directory: bool,
     mtime: Option<u32>,
     mtime_nanoseconds: Option<u32>,
+    file_comment: Option<Vec<u8>>,
     attributes: EntryAttributes,
 }
 
@@ -278,6 +279,7 @@ impl Builder {
             is_directory: false,
             mtime,
             mtime_nanoseconds: None,
+            file_comment: None,
             attributes: mode.map_or(
                 EntryAttributes::Dos(u64::from(DOS_ARCHIVE_ATTR)),
                 EntryAttributes::Unix,
@@ -302,6 +304,7 @@ impl Builder {
             is_directory: false,
             mtime,
             mtime_nanoseconds: None,
+            file_comment: None,
             attributes: mode.map_or(
                 EntryAttributes::Dos(u64::from(DOS_ARCHIVE_ATTR)),
                 EntryAttributes::Unix,
@@ -330,6 +333,7 @@ impl Builder {
             is_directory: true,
             mtime,
             mtime_nanoseconds: None,
+            file_comment: None,
             attributes: mode.map_or(EntryAttributes::Dos(0x10), |mode| {
                 EntryAttributes::Unix((mode & 0o7777) | 0o040000)
             }),
@@ -359,6 +363,26 @@ impl Builder {
             ));
         }
         entry.mtime_nanoseconds = Some(nanoseconds);
+        Ok(())
+    }
+
+    /// Sets or removes a queued member's comment. Comments follow the entry
+    /// through renames and reordering; `Some(Vec::new())` is an explicit empty comment.
+    /// RAR3/4 and volume output do not support comments. Errors leave the entry unchanged.
+    pub fn set_file_comment(&mut self, name: &[u8], comment: Option<Vec<u8>>) -> Result<()> {
+        if comment.is_some() {
+            crate::write_plan::validate_option(
+                self.format,
+                crate::write_plan::WriterOption::FileComment,
+                crate::write_plan::PlanShape::new().volumes(self.volume_size.is_some()),
+            )?;
+        }
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.name == name)
+            .ok_or_else(|| Error::EntryNotFound.at_entry(name.to_vec(), "setting file comment"))?;
+        entry.file_comment = comment;
         Ok(())
     }
 
@@ -575,6 +599,17 @@ impl Builder {
         let volume_size = self
             .volume_size
             .ok_or(Error::InvalidArgument("volume_size is required"))?;
+        if self
+            .entries
+            .iter()
+            .any(|entry| entry.file_comment.is_some())
+        {
+            crate::write_plan::validate_option(
+                self.format,
+                crate::write_plan::WriterOption::FileComment,
+                crate::write_plan::PlanShape::new().volumes(true),
+            )?;
+        }
         if self.entries.is_empty() {
             return Err(Error::InvalidArgument("archive builder has no entries"));
         }
@@ -681,6 +716,17 @@ impl Builder {
                     .with_mtime_nanoseconds(entry.mtime_nanoseconds)
                     .with_attributes(entry.rar50_attr())
                     .with_host_os(entry.rar50_host_os());
+                let built = match &entry.file_comment {
+                    Some(comment) => {
+                        let service = rar50::ServiceEntry::new(b"CMT".to_vec(), comment.clone());
+                        let service = match self.password.as_deref() {
+                            Some(password) => service.with_password(password.to_vec()),
+                            None => service,
+                        };
+                        built.with_service(service)
+                    }
+                    None => built,
+                };
                 match self.password.as_deref() {
                     Some(password) => built.with_password(password.to_vec()),
                     None => built,
@@ -749,7 +795,7 @@ impl Builder {
                     file_attr: entry.rar15_attr(),
                     host_os: entry.rar15_host_os(),
                     password: self.password.as_deref(),
-                    file_comment: None,
+                    file_comment: entry.file_comment.as_deref(),
                 })
                 .collect();
             rar15_40::write_stored_archive_with_comment(&entries, options, self.comment.as_deref())
@@ -764,7 +810,7 @@ impl Builder {
                     file_attr: entry.rar15_attr(),
                     host_os: entry.rar15_host_os(),
                     password: self.password.as_deref(),
-                    file_comment: None,
+                    file_comment: entry.file_comment.as_deref(),
                 })
                 .collect();
             rar15_40::write_compressed_archive_with_comment_and_progress(
@@ -796,7 +842,7 @@ impl Builder {
                     file_time: entry.mtime.unwrap_or(0),
                     file_attr: entry.rar13_attr(),
                     password: self.password.as_deref(),
-                    file_comment: None,
+                    file_comment: entry.file_comment.as_deref(),
                 })
                 .collect();
             rar13::write_stored_archive_with_comment(&entries, options, self.comment.as_deref())
@@ -810,7 +856,7 @@ impl Builder {
                     file_time: entry.mtime.unwrap_or(0),
                     file_attr: entry.rar13_attr(),
                     password: self.password.as_deref(),
-                    file_comment: None,
+                    file_comment: entry.file_comment.as_deref(),
                 })
                 .collect();
             rar13::write_compressed_archive_with_comment_and_progress(
@@ -870,7 +916,7 @@ impl Builder {
                     file_attr: entry.rar15_attr(),
                     host_os: entry.rar15_host_os(),
                     password: self.password.as_deref(),
-                    file_comment: None,
+                    file_comment: entry.file_comment.as_deref(),
                 },
                 options,
                 volume_size,
@@ -884,7 +930,7 @@ impl Builder {
                     file_attr: entry.rar15_attr(),
                     host_os: entry.rar15_host_os(),
                     password: self.password.as_deref(),
-                    file_comment: None,
+                    file_comment: entry.file_comment.as_deref(),
                 },
                 options,
                 volume_size,
@@ -908,7 +954,7 @@ impl Builder {
                     file_time: entry.mtime.unwrap_or(0),
                     file_attr: entry.rar13_attr(),
                     password: self.password.as_deref(),
-                    file_comment: None,
+                    file_comment: entry.file_comment.as_deref(),
                 },
                 options,
                 volume_size,
@@ -921,7 +967,7 @@ impl Builder {
                     file_time: entry.mtime.unwrap_or(0),
                     file_attr: entry.rar13_attr(),
                     password: self.password.as_deref(),
-                    file_comment: None,
+                    file_comment: entry.file_comment.as_deref(),
                 },
                 options,
                 volume_size,

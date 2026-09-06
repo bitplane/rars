@@ -960,7 +960,8 @@ fn validate_service(service: &ServiceEntry) -> Result<()> {
             feature: "RAR 5 file service name",
         });
     }
-    if service.data.is_empty() {
+    // An explicit empty comment is distinct from having no comment record.
+    if service.data.is_empty() && service.name != b"CMT" {
         return Err(Error::InvalidHeader("RAR 5 file service data is empty"));
     }
     match &service.password {

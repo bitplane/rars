@@ -4,6 +4,107 @@ use crate::{Archive, ArchiveMemberMeta, AttrSource};
 use std::collections::HashSet;
 
 impl Archive {
+    /// Decodes comments in member order with one metadata traversal. Like
+    /// `member_comment_at`, this does not retain resource limits from parsing.
+    pub fn member_comments(&self, password: Option<&[u8]>) -> crate::Result<Vec<Option<Vec<u8>>>> {
+        match self {
+            Archive::Rar13(a) => a.entries.iter().map(|entry| entry.file_comment()).collect(),
+            Archive::Rar15To40(a) => a.files().map(|file| file.file_comment()).collect(),
+            Archive::Rar50Plus(a) => {
+                let mut comments: Vec<Option<&crate::rar50::FileHeader>> = Vec::new();
+                for block in &a.blocks {
+                    match block {
+                        crate::rar50::Block::File(_) => comments.push(None),
+                        crate::rar50::Block::Service(service) if service.name == b"CMT" => {
+                            if let Some(comment) = comments.last_mut() {
+                                if comment.replace(service).is_some() {
+                                    return Err(crate::Error::InvalidHeader(
+                                        "duplicate member comment records",
+                                    ));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                comments
+                    .into_iter()
+                    .map(|comment| {
+                        comment
+                            .map(|service| {
+                                let mut data = Vec::new();
+                                service.write_to(a, password, &mut data)?;
+                                Ok(data)
+                            })
+                            .transpose()
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    /// Decodes a member comment by original archive index, including directories.
+    /// Missing comments return `None`; an invalid index returns `EntryNotFound`.
+    /// Duplicate RAR5 CMT records are refused rather than silently dropping one.
+    /// This helper does not retain parsing/extraction resource policies.
+    pub fn member_comment_at(
+        &self,
+        index: usize,
+        password: Option<&[u8]>,
+    ) -> crate::Result<Option<Vec<u8>>> {
+        match self {
+            Archive::Rar13(a) => a
+                .entries
+                .get(index)
+                .ok_or(crate::Error::EntryNotFound)?
+                .file_comment(),
+            Archive::Rar15To40(a) => a
+                .files()
+                .nth(index)
+                .ok_or(crate::Error::EntryNotFound)?
+                .file_comment(),
+            Archive::Rar50Plus(a) => {
+                let mut current = None;
+                let mut next = 0;
+                let mut found = false;
+                let mut comment = None;
+                for block in &a.blocks {
+                    match block {
+                        crate::rar50::Block::File(_) => {
+                            if found {
+                                break;
+                            }
+                            current = Some(next);
+                            next += 1;
+                            found = current == Some(index);
+                        }
+                        crate::rar50::Block::Service(service)
+                            if current == Some(index) && service.name == b"CMT" =>
+                        {
+                            if comment.is_some() {
+                                return Err(crate::Error::InvalidHeader(
+                                    "duplicate member comment records",
+                                ));
+                            }
+                            comment = Some(service);
+                        }
+                        _ => {}
+                    }
+                }
+                if !found {
+                    return Err(crate::Error::EntryNotFound);
+                }
+                comment
+                    .map(|service| {
+                        let mut data = Vec::new();
+                        service.write_to(a, password, &mut data)?;
+                        Ok(data)
+                    })
+                    .transpose()
+            }
+        }
+    }
+
     /// Properties the current RAR5 conversion builder cannot promise to preserve.
     ///
     /// An empty list certifies only the supported metadata subset, not payload
@@ -104,6 +205,7 @@ impl Archive {
                 for block in &archive.blocks {
                     match block {
                         Block::File(file) => {
+                            comment_seen = false;
                             if !file.rewrite_metadata_complete
                                 || file.file_flags & !7 != 0
                                 || file.block.flags & !0x1b != 0
@@ -124,11 +226,9 @@ impl Archive {
                             index += 1;
                         }
                         Block::Service(service) => {
-                            // Only the single archive comment's content is carried
-                            // forward. Attached comments, streams, ACLs and recovery
-                            // services need their own preservation adapters.
-                            if index != 0
-                                || comment_seen
+                            // One CMT per owner (archive or preceding member).
+                            // Other services and ambiguous duplicates remain rejected.
+                            if comment_seen
                                 || service.name != b"CMT"
                                 || service.encrypted
                                 || !service.rewrite_metadata_complete
@@ -137,6 +237,8 @@ impl Archive {
                                 || service.block.flags & !3 != 0
                                 || service.attributes != 0
                                 || service.host_os != 0
+                                || service.compression_info & !0x7fff != 0
+                                || service.compression_info & 0x7f != 0
                             {
                                 issues.push(format!(
                                     "service record {:?}",

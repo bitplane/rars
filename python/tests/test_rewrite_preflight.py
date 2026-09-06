@@ -119,3 +119,77 @@ def test_preflight_detects_volume_settings(tmp_path):
     assert any("volume" in issue for issue in source.rewrite_preservation_issues())
     with pytest.raises(rars.UnsupportedRarFeature, match="volume"):
         rars.RarBuilder.from_archive(source, preserve=True)
+
+
+def test_file_comments_survive_edits_and_distinguish_empty_from_absent():
+    builder = rars.RarBuilder(comment=b"archive comment")
+    builder.add_directory("directory")
+    builder.set_file_comment("directory", b"directory comment")
+    for name in ["rename", "empty", "absent", "remove"]:
+        builder.add_bytes(b"payload", name)
+    builder.set_file_comment("rename", b"legacy bytes\xff")
+    builder.set_file_comment("empty", b"")
+    builder.set_file_comment("remove", b"discard")
+    source = rars.RarFile.from_bytes(builder.to_bytes())
+    assert source.rewrite_preservation_issues() == []
+    rewritten = rars.RarBuilder.from_archive(source, preserve=True)
+    rewritten.rename("rename", "renamed")
+    rewritten.remove("remove")
+    rewritten.add_bytes(b"new", "new")
+    output = rars.RarFile.from_bytes(rewritten.to_bytes())
+    assert output.comment == b"archive comment"
+    assert output.getcomment("directory") == b"directory comment"
+    assert output.getcomment("renamed") == b"legacy bytes\xff"
+    assert output.getcomment("empty") == b""
+    assert output.getcomment("absent") is None
+    assert output.getcomment("new") is None
+    assert output.read("renamed") == b"payload"
+    with pytest.raises(KeyError):
+        output.getcomment("remove")
+    rewritten.set_file_comment("renamed")
+    assert rars.RarFile.from_bytes(rewritten.to_bytes()).getcomment("renamed") is None
+
+
+@pytest.mark.parametrize("format", ["rar14", "rar15", "rar20", "rar29"])
+def test_conversion_retains_legacy_file_comments(format):
+    builder = rars.RarBuilder(format=format)
+    builder.add_bytes(b"payload", "file")
+    builder.set_file_comment("file", b"comment\xff")
+    source = rars.RarFile.from_bytes(builder.to_bytes())
+    assert source.getcomment("file") == b"comment\xff"
+    rewritten = rars.RarBuilder.from_archive(source, preserve=False)
+    output = rars.RarFile.from_bytes(rewritten.to_bytes())
+    assert output.getcomment("file") == b"comment\xff"
+    assert output.read("file") == b"payload"
+
+
+def test_conversion_decodes_encrypted_file_comments():
+    builder = rars.RarBuilder(password="secret")
+    builder.add_bytes(b"payload", "file")
+    builder.set_file_comment("file", b"private comment")
+    source = rars.RarFile.from_bytes(builder.to_bytes(), password="secret")
+    assert source.getcomment("file") == b"private comment"
+    output = rars.RarFile.from_bytes(rars.RarBuilder.from_archive(source).to_bytes())
+    assert output.getcomment("file") == b"private comment"
+    assert output.read("file") == b"payload"
+
+
+def test_invalid_file_comment_fails_before_destination_is_touched(tmp_path):
+    builder = rars.RarBuilder(store=True)
+    builder.add_bytes(b"payload", "file")
+    builder.set_file_comment("file", b"comment")
+    data = bytearray(builder.to_bytes())
+    for _, body_at, body_end in _headers(data):
+        _, cursor = _read_vint(data, body_at)
+        kind, _ = _read_vint(data, cursor)
+        if kind == 3:
+            data[body_end] ^= 1
+            break
+    else:
+        pytest.fail("missing comment service")
+    source = rars.RarFile.from_bytes(bytes(data))
+    destination = tmp_path / "existing.rar"
+    destination.write_bytes(b"keep existing archive")
+    with pytest.raises(rars.BadRarFile):
+        rars.RarBuilder.from_archive(source, preserve=True).write(destination)
+    assert destination.read_bytes() == b"keep existing archive"

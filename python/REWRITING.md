@@ -33,7 +33,8 @@ the separate password argument.
 | Attributes and host OS | Unix permission/special bits and DOS file flags retained using source host rules; unknown hosts use default DOS archive attributes | Preserve supported attributes with their source meaning; reject unsupported host semantics |
 | Archive comment | Copied as decoded comment bytes | Preserve comment content |
 | Links and special entries | RAR5 redirections, Unix special-file types, DOS reparse points and directories with file contents rejected before writing | Preserve supported types; reject unsupported preservation |
-| File comments and other metadata | No faithful preservation contract | Preserve supported records; reject unsupported preservation |
+| File comments | Decoded comments copied, including explicit empty comments; supported RAR5 CMT records pass preflight | Preserve supported comment content |
+| Other metadata | No faithful preservation contract | Preserve supported records; reject unsupported preservation |
 | Archive format | Always writes RAR5 | Preserve supported format semantics; exact creating release may be unknowable |
 | Data/header encryption | Removed | Preserve both, using an available input password unless explicitly changed |
 | Solid layout and compression | Fresh non-solid level-3 compression | Preserve supported solid semantics; compressed bytes and original encoder tuning are not guaranteed |
@@ -46,6 +47,15 @@ and unchanged until writing completes. Each retained member currently invokes
 an archive read separately; rewriting large or solid archives can be expensive.
 Lazy reads use original member indices, including directory positions, so edits
 to the queued names and order do not change source identity.
+
+File comments are decoded eagerly in one metadata pass when creating the rewrite
+builder. RAR5 comment payloads are integrity-checked; duplicate member comment
+records are rejected. Comments remain attached through renames and removals.
+`RarFile.getcomment(member, pwd=None)` returns decoded bytes or `None` when absent.
+`RarBuilder.set_file_comment(member, comment=None)` sets or removes a queued
+comment; `b""` retains an explicit empty comment. RAR3/4 and volume output do not
+support setting file comments. Legacy comments exposed by the reader are retained
+when converting to RAR5; legacy format preservation still fails preflight.
 
 `RarBuilder.add_directory(arcname, mtime=None, mode=None)` adds an explicit
 directory to RAR5/7 output. It also allows empty directories without an input

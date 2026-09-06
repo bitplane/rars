@@ -423,6 +423,25 @@ impl RarFile {
         self.infos.iter().any(|info| info.is_encrypted)
     }
 
+    /// Returns the decoded comment attached to a member, or None if absent.
+    #[pyo3(signature = (member, pwd = None))]
+    fn getcomment(
+        &self,
+        py: Python<'_>,
+        member: &Bound<'_, PyAny>,
+        pwd: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Option<Vec<u8>>> {
+        let name = member_name_bytes(member)?;
+        let index = self
+            .archive
+            .members()
+            .position(|member| member.meta.name == name)
+            .ok_or_else(|| PyKeyError::new_err("member not found"))?;
+        let password = py_password(pwd)?.or_else(|| self.password.clone());
+        py.detach(|| self.archive.member_comment_at(index, password.as_deref()))
+            .map_err(map_error)
+    }
+
     /// Metadata/settings the current rewrite implementation cannot preserve.
     /// This is a conservative metadata check, not a payload integrity test.
     fn rewrite_preservation_issues(&self) -> Vec<String> {
@@ -590,7 +609,7 @@ impl RarBuilder {
 
     /// Create a RAR5 level-3 conversion builder from an archive.
     ///
-    /// This currently copies file contents, names, order and the archive comment,
+    /// This currently copies file contents, names, order, archive and file comments,
     /// and modification times including supported subsecond precision.
     /// Explicit directories are retained; links and other special entries are
     /// rejected before writing. It does not preserve encryption, solid settings
@@ -638,6 +657,10 @@ impl RarBuilder {
                 )));
             }
         }
+        let comments = archive
+            .archive
+            .member_comments(password.as_deref())
+            .map_err(map_error)?;
         let format = rars_rs::ArchiveVersion::Rar50;
         let mut builder = Self {
             inner: rars_rs::Builder::new(format)
@@ -645,7 +668,8 @@ impl RarBuilder {
                 .comment(archive.comment(py)?),
             format,
         };
-        for (member_index, member) in archive.archive.members().enumerate() {
+        for ((member_index, member), comment) in archive.archive.members().enumerate().zip(comments)
+        {
             let info = member.meta;
             // A builder mode is Unix metadata, not generic archive attributes.
             // Reuse extraction's host rules: e.g. legacy host 1 is DOS, but
@@ -703,6 +727,10 @@ impl RarBuilder {
                     .add_source(info.name.clone(), source, mtime, mode)
                     .map_err(map_builder_error)?;
             }
+            builder
+                .inner
+                .set_file_comment(&info.name, comment)
+                .map_err(map_builder_error)?;
             if let Some(time) = modified.filter(|time| time.subsec_nanos() != 0) {
                 builder
                     .inner
@@ -769,6 +797,18 @@ impl RarBuilder {
     fn rename(&mut self, old: &Bound<'_, PyAny>, new: &Bound<'_, PyAny>) -> PyResult<()> {
         self.inner
             .rename(&member_name_bytes(old)?, member_name_bytes(new)?)
+            .map_err(map_builder_error)
+    }
+
+    /// Sets or removes the comment attached to a queued member.
+    #[pyo3(signature = (member, comment = None))]
+    fn set_file_comment(
+        &mut self,
+        member: &Bound<'_, PyAny>,
+        comment: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        self.inner
+            .set_file_comment(&member_name_bytes(member)?, py_optional_bytes(comment)?)
             .map_err(map_builder_error)
     }
 
