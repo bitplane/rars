@@ -31,6 +31,7 @@ pub(crate) struct CliProgress {
     plain: Arc<(Mutex<PlainState>, Condvar)>,
     heartbeat: Mutex<Option<JoinHandle<()>>>,
     determinate: AtomicBool,
+    emitting: AtomicBool,
 }
 
 impl CliProgress {
@@ -60,6 +61,7 @@ impl CliProgress {
             plain,
             heartbeat: Mutex::new(heartbeat),
             determinate: AtomicBool::new(false),
+            emitting: AtomicBool::new(false),
         }
     }
 
@@ -213,14 +215,25 @@ impl WriteProgress for CliProgress {
                 total_entries,
                 pass,
             } => {
+                if operation == WriteOperation::Emission {
+                    self.emitting.store(true, Ordering::Relaxed);
+                }
                 let label = operation_label(operation, pass);
                 let _ = (total_bytes, total_entries);
                 self.spinner(label);
             }
-            WriteProgressEvent::EntryStarted { name, .. } => {
-                self.set_message(format!("Compressing {}", display_bytes(name)));
+            WriteProgressEvent::EntryStarted {
+                operation, name, ..
+            } => {
+                self.set_message(format!(
+                    "{}: {}",
+                    operation_label(operation, 1),
+                    display_bytes(name)
+                ));
             }
-            WriteProgressEvent::EntryFinished { input_bytes, .. } => self.advance(input_bytes),
+            // Advanced is the authoritative byte count; entry completion is
+            // lifecycle information, not another increment of the same work.
+            WriteProgressEvent::EntryFinished { .. } => {}
             WriteProgressEvent::Advanced {
                 operation,
                 completed_bytes,
@@ -247,6 +260,13 @@ impl WriteProgress for CliProgress {
                 operation, pass, ..
             } => {
                 self.finish(format!("{} complete", operation_label(operation, pass)));
+                if operation == WriteOperation::Emission {
+                    self.emitting.store(false, Ordering::Relaxed);
+                } else if operation == WriteOperation::Recovery
+                    && self.emitting.load(Ordering::Relaxed)
+                {
+                    self.spinner(operation_label(WriteOperation::Emission, 1));
+                }
             }
             _ => {}
         }
@@ -291,6 +311,7 @@ fn heartbeat_loop(shared: Arc<(Mutex<PlainState>, Condvar)>) {
 
 fn operation_label(operation: WriteOperation, pass: usize) -> String {
     match operation {
+        WriteOperation::Emission => "Writing archive".to_string(),
         WriteOperation::Compression => "Compressing archive".to_string(),
         WriteOperation::Recovery if pass > 1 => format!("Building recovery record (pass {pass})"),
         WriteOperation::Recovery => "Building recovery record".to_string(),
@@ -308,4 +329,59 @@ fn display_bytes(bytes: &[u8]) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entry_completion_does_not_add_to_absolute_progress() {
+        let mut progress = CliProgress::new(ProgressMode::Never);
+        // Exercise terminal accounting against a hidden draw target.
+        progress.mode = RenderMode::Terminal;
+        progress.report(WriteProgressEvent::Advanced {
+            operation: WriteOperation::Compression,
+            completed_bytes: 40,
+            total_bytes: 100,
+            pass: 1,
+        });
+        progress.report(WriteProgressEvent::EntryFinished {
+            operation: WriteOperation::Compression,
+            index: 0,
+            total_entries: 2,
+            name: b"first",
+            input_bytes: 40,
+        });
+        assert_eq!(progress.bar.position(), 40);
+        progress.report(WriteProgressEvent::Advanced {
+            operation: WriteOperation::Compression,
+            completed_bytes: 60,
+            total_bytes: 100,
+            pass: 1,
+        });
+        assert_eq!(progress.bar.position(), 60);
+    }
+
+    #[test]
+    fn recovery_completion_resumes_the_emission_phase() {
+        let progress = CliProgress::new(ProgressMode::Never);
+        for operation in [WriteOperation::Emission, WriteOperation::Recovery] {
+            progress.report(WriteProgressEvent::OperationStarted {
+                operation,
+                total_bytes: None,
+                total_entries: None,
+                pass: 1,
+            });
+        }
+        progress.report(WriteProgressEvent::OperationFinished {
+            operation: WriteOperation::Recovery,
+            total_bytes: None,
+            total_entries: None,
+            pass: 1,
+        });
+        let state = progress.plain.0.lock().unwrap();
+        assert!(state.active);
+        assert_eq!(state.message, "Writing archive");
+    }
 }

@@ -24,6 +24,18 @@ use crate::streaming::Spool;
 use crate::{EntrySource, Error, Result, WriterResources};
 use std::io::{Read, Write};
 
+/// Compression work and member lifecycle, independent of presentation.
+pub(super) trait CompressionProgress: Sync {
+    fn advance(&self, bytes: u64) -> bool;
+    fn started(&self, _member: usize, _size: u64) {}
+    fn finished(&self, _member: usize, _size: u64) {}
+}
+impl<F: Fn(u64) -> bool + Sync> CompressionProgress for F {
+    fn advance(&self, bytes: u64) -> bool {
+        self(bytes)
+    }
+}
+
 /// A member that has been compressed and is waiting to be framed.
 pub(super) struct CompressedMember {
     pub(super) input_size: u64,
@@ -70,6 +82,8 @@ fn run_size(plan: &CompressPlan) -> usize {
 /// A member being read, and the packed bytes it has produced so far.
 struct MemberStream {
     member: usize,
+    input_size: u64,
+    started: bool,
     source: EntrySource,
     reader: Option<Box<dyn crate::EntryReader>>,
     remaining: u64,
@@ -86,12 +100,17 @@ impl MemberStream {
         source: &EntrySource,
         size: u64,
         resources: &WriterResources,
+        progress: &dyn CompressionProgress,
     ) -> Result<Self> {
         if size == 0 {
+            progress.started(member, size);
             check_source_end(&mut *source.open()?)?;
+            progress.finished(member, size);
         }
         Ok(Self {
             member,
+            input_size: size,
+            started: size == 0,
             source: source.clone(),
             reader: None,
             remaining: size,
@@ -114,7 +133,7 @@ pub(super) fn compress_members_reporting(
     sources: &[EntrySource],
     plan: CompressPlan,
     resources: &WriterResources,
-    advance: &(dyn Fn(u64) -> bool + Sync),
+    advance: &dyn CompressionProgress,
 ) -> Result<Vec<CompressedMember>> {
     let mut integrity = Vec::with_capacity(sources.len());
     for source in sources {
@@ -135,11 +154,15 @@ pub(super) fn compress_members_reporting(
     // Storing is not "compress and hope it does not help": the header records
     // method zero, so the payload must be the source bytes.
     let packed = if plan.method == 0 {
-        for (source, (input_size, crc, hash)) in sources.iter().zip(&mut integrity) {
+        for (index, (source, (input_size, crc, hash))) in
+            sources.iter().zip(&mut integrity).enumerate()
+        {
+            advance.started(index, *input_size);
             (*crc, *hash) = super::source_integrity(source, *input_size, plan.block_size)?;
-            if !advance(*input_size) {
+            if !advance.advance(*input_size) {
                 return Err(Error::Cancelled);
             }
+            advance.finished(index, *input_size);
         }
         integrity
             .iter()
@@ -256,7 +279,7 @@ fn compress_members_whole(
     integrity: &[(u64, u32, [u8; 32])],
     plan: &CompressPlan,
     resources: &WriterResources,
-    advance: &(dyn Fn(u64) -> bool + Sync),
+    advance: &dyn CompressionProgress,
 ) -> Result<Vec<CompressedMember>> {
     // Each worker acquires its complete workspace before loading the source.
     // Results are disk spools, so retaining them in source order is cheap.
@@ -274,6 +297,7 @@ fn compress_members_whole(
             // A streaming fallback can itself use rayon. Run it outside the
             // worker batch so a nested job cannot wait behind budget waiters.
             members.push(compress_whole_member(
+                start,
                 &sources[start],
                 integrity[start],
                 plan,
@@ -286,6 +310,7 @@ fn compress_members_whole(
                 (start..end).collect(),
                 |index| {
                     compress_whole_member(
+                        index,
                         &sources[index],
                         integrity[index],
                         plan,
@@ -301,11 +326,12 @@ fn compress_members_whole(
 }
 
 fn compress_whole_member(
+    index: usize,
     source: &EntrySource,
     integrity: (u64, u32, [u8; 32]),
     plan: &CompressPlan,
     resources: &WriterResources,
-    advance: &(dyn Fn(u64) -> bool + Sync),
+    advance: &dyn CompressionProgress,
 ) -> Result<CompressedMember> {
     let (input_size, _, _) = integrity;
     let mut crc = Crc32::new();
@@ -317,6 +343,7 @@ fn compress_whole_member(
     if !stored {
         match resources.acquire(required, plan.dictionary_size) {
             Ok(_permit) => {
+                advance.started(index, input_size);
                 let size = usize::try_from(input_size)
                     .map_err(|_| Error::InvalidHeader("entry size overflows usize"))?;
                 let mut data = vec![0; size];
@@ -355,7 +382,7 @@ fn compress_whole_member(
                     let target = (charged + delta).min(walk);
                     let scaled = share(target) - share(charged);
                     charged = target;
-                    advance(scaled)
+                    advance.advance(scaled)
                 };
                 let packed = encode_member_with_filter_policy_candidates_and_progress(
                     &data,
@@ -381,6 +408,21 @@ fn compress_whole_member(
                     return Err(error);
                 }
                 // Too big to filter; compress it as a stream instead.
+                struct Remapped<'a> {
+                    index: usize,
+                    progress: &'a dyn CompressionProgress,
+                }
+                impl CompressionProgress for Remapped<'_> {
+                    fn advance(&self, bytes: u64) -> bool {
+                        self.progress.advance(bytes)
+                    }
+                    fn started(&self, _: usize, size: u64) {
+                        self.progress.started(self.index, size);
+                    }
+                    fn finished(&self, _: usize, size: u64) {
+                        self.progress.finished(self.index, size);
+                    }
+                }
                 let mut streamed = compress_members_reporting(
                     std::slice::from_ref(source),
                     CompressPlan {
@@ -389,7 +431,10 @@ fn compress_whole_member(
                         ..plan.clone()
                     },
                     resources,
-                    advance,
+                    &Remapped {
+                        index,
+                        progress: advance,
+                    },
                 )?;
                 return Ok(streamed.remove(0));
             }
@@ -397,9 +442,11 @@ fn compress_whole_member(
     }
 
     if input_size == 0 {
+        advance.started(index, input_size);
         check_source_end(&mut *source.open()?)?;
     }
     packed_spool.park();
+    advance.finished(index, input_size);
     Ok(CompressedMember {
         input_size,
         crc32: crc.finish(),
@@ -420,7 +467,7 @@ fn compress_independent_members(
     batch_capacity: usize,
     required: u64,
     resources: &WriterResources,
-    advance: &(dyn Fn(u64) -> bool + Sync),
+    advance: &dyn CompressionProgress,
 ) -> Result<Vec<Spool>> {
     let mut packed = Vec::with_capacity(sources.len());
     for (group_index, group) in sources.chunks(batch_capacity).enumerate() {
@@ -429,7 +476,13 @@ fn compress_independent_members(
             .iter()
             .enumerate()
             .map(|(offset, source)| {
-                MemberStream::new(offset, source, integrity[group_start + offset].0, resources)
+                MemberStream::new(
+                    group_start + offset,
+                    source,
+                    integrity[group_start + offset].0,
+                    resources,
+                    advance,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -443,7 +496,8 @@ fn compress_independent_members(
             let mut misses = 0usize;
             while jobs.len() < batch_capacity && misses < streams.len() {
                 let stream_count = streams.len();
-                let stream = &mut streams[cursor];
+                let member = cursor;
+                let stream = &mut streams[member];
                 cursor = (cursor + 1) % stream_count;
                 if !stream.has_more() {
                     misses += 1;
@@ -451,14 +505,14 @@ fn compress_independent_members(
                 }
                 misses = 0;
 
-                let member = stream.member;
                 let mut job = BlockJob {
                     data: Vec::new(),
                     history: histories[member].clone(),
                     blocks: Vec::new(),
                 };
                 while stream.has_more() && job.data.len() < run_size(plan) {
-                    job.data.extend(read_block(stream, plan.block_size)?);
+                    job.data
+                        .extend(read_block(stream, plan.block_size, advance)?);
                     job.blocks
                         .push((member, job.data.len(), !stream.has_more()));
                 }
@@ -474,7 +528,7 @@ fn compress_independent_members(
         }
 
         for stream in streams {
-            let slot = &mut integrity[group_start + stream.member];
+            let slot = &mut integrity[stream.member];
             slot.1 = stream.crc.finish();
             slot.2 = stream.hash.finalize();
             packed.push(stream.packed);
@@ -492,12 +546,14 @@ fn compress_solid_chain(
     batch_capacity: usize,
     required: u64,
     resources: &WriterResources,
-    advance: &(dyn Fn(u64) -> bool + Sync),
+    advance: &dyn CompressionProgress,
 ) -> Result<Vec<Spool>> {
     let mut streams = sources
         .iter()
         .enumerate()
-        .map(|(member, source)| MemberStream::new(member, source, integrity[member].0, resources))
+        .map(|(member, source)| {
+            MemberStream::new(member, source, integrity[member].0, resources, advance)
+        })
         .collect::<Result<Vec<_>>>()?;
 
     let mut history: Vec<u8> = Vec::new();
@@ -522,7 +578,8 @@ fn compress_solid_chain(
                 let Some(stream) = streams.get_mut(next) else {
                     break;
                 };
-                job.data.extend(read_block(stream, plan.block_size)?);
+                job.data
+                    .extend(read_block(stream, plan.block_size, advance)?);
                 job.blocks
                     .push((stream.member, job.data.len(), !stream.has_more()));
             }
@@ -559,7 +616,15 @@ fn compress_solid_chain(
 /// One chunk, then further chunks while the data is not moving, which is the
 /// same question [`BlockSplitter`] answers for the buffered writer. Both have
 /// to reach the same answer or the same input packs to two different archives.
-fn read_block(stream: &mut MemberStream, block_size: usize) -> Result<Vec<u8>> {
+fn read_block(
+    stream: &mut MemberStream,
+    block_size: usize,
+    progress: &dyn CompressionProgress,
+) -> Result<Vec<u8>> {
+    if !stream.started {
+        progress.started(stream.member, stream.input_size);
+        stream.started = true;
+    }
     let mut data = read_chunk(stream, block_size)?;
     let mut splitter = BlockSplitter::new();
     splitter.accept(&data);
@@ -634,7 +699,7 @@ fn compress_wave(
     jobs: Vec<BlockJob>,
     plan: &CompressPlan,
     streams: &mut [MemberStream],
-    advance: &(dyn Fn(u64) -> bool + Sync),
+    advance: &dyn CompressionProgress,
 ) -> Result<()> {
     let packed_runs = crate::parallel::map_collect(jobs, |job| {
         let boundaries: Vec<_> = job
@@ -646,7 +711,7 @@ fn compress_wave(
         // dictionary's worth of blocks and a wave holds one run per thread, so
         // reporting once the wave is appended is a single jump across the whole
         // member whenever the member fits one wave.
-        let mut block_done = |bytes: usize| advance(bytes as u64);
+        let mut block_done = |bytes: usize| advance.advance(bytes as u64);
         let packed = encode_lz_streaming_blocks(
             &job.data,
             &job.history,
@@ -659,14 +724,14 @@ fn compress_wave(
             job.blocks
                 .into_iter()
                 .zip(packed)
-                .map(|((member, _, _), packed)| (member, packed))
+                .map(|((member, _, last), packed)| (member, packed, last))
                 .collect::<Vec<_>>(),
         )
     })?;
     // A solid wave can cover thousands of tiny members. Keep only the spool
     // currently being appended open, rather than one descriptor per member.
     let mut previous: Option<usize> = None;
-    for (member, packed) in packed_runs.into_iter().flatten() {
+    for (member, packed, last) in packed_runs.into_iter().flatten() {
         if previous != Some(member) {
             if let Some(previous) = previous {
                 streams[previous].packed.park();
@@ -674,6 +739,10 @@ fn compress_wave(
             previous = Some(member);
         }
         streams[member].packed.write_all(&packed)?;
+        if last {
+            let stream = &streams[member];
+            advance.finished(stream.member, stream.input_size);
+        }
     }
     if let Some(previous) = previous {
         streams[previous].packed.park();

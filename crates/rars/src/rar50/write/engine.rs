@@ -185,7 +185,10 @@ pub(super) fn write_archive(
         &sources,
         plan.compress.clone(),
         resources,
-        &|done| work.advance(done),
+        &MemberProgress {
+            entries,
+            work: &work,
+        },
     )?;
 
     // Everything between the main header and the quick-open block, in order.
@@ -193,14 +196,11 @@ pub(super) fn write_archive(
     if let Some(comment) = &plan.archive_comment {
         blocks.push(prepare_comment(comment, header_keys.as_ref())?);
     }
-    for (index, (entry, member)) in entries.iter().zip(compressed).enumerate() {
-        work.entry_started(index, total_entries, &entry.name, member.input_size);
-        let input_size = member.input_size;
+    for (entry, member) in entries.iter().zip(compressed) {
         blocks.push(prepare_member(entry, member, &plan, header_keys.as_ref())?);
         for service in &entry.services {
             blocks.push(prepare_service(service, header_keys.as_ref())?);
         }
-        work.entry_finished(index, total_entries, &entry.name, input_size);
     }
     if !work.finish() {
         return Err(Error::Cancelled);
@@ -267,6 +267,7 @@ pub(super) fn write_archive(
         recovery_percent: plan.recovery_percent,
     })?;
 
+    report_emission(plan.progress, true);
     // Only mirror the archive when a recovery record has to read it back.
     let mut mirror = match plan.recovery_percent {
         Some(_) => Some(Spool::create(resources)?),
@@ -348,6 +349,7 @@ pub(super) fn write_archive(
             output.write_all(&end)?;
         }
     }
+    report_emission(plan.progress, false);
     Ok(())
 }
 
@@ -876,6 +878,24 @@ struct VolumeMember {
     encryption: Option<([u8; 16], [u8; 16], [u8; 12])>,
 }
 
+struct MemberProgress<'a, 'p> {
+    entries: &'a [ArchiveEntry],
+    work: &'a crate::write_progress::WorkTracker<'p>,
+}
+impl compress::CompressionProgress for MemberProgress<'_, '_> {
+    fn advance(&self, bytes: u64) -> bool {
+        self.work.advance(bytes)
+    }
+    fn started(&self, index: usize, size: u64) {
+        self.work
+            .entry_started(index, self.entries.len(), &self.entries[index].name, size);
+    }
+    fn finished(&self, index: usize, size: u64) {
+        self.work
+            .entry_finished(index, self.entries.len(), &self.entries[index].name, size);
+    }
+}
+
 /// Writes a multi-volume archive, handing each volume to `sink` as it is
 /// finished rather than keeping the set in memory.
 pub(super) fn write_volumes(
@@ -924,15 +944,15 @@ pub(super) fn write_volumes(
         &sources,
         plan.compress.clone(),
         resources,
-        &|done| work.advance(done),
+        &MemberProgress {
+            entries,
+            work: &work,
+        },
     )?;
 
     let mut members = Vec::with_capacity(entries.len());
-    for (index, (entry, member)) in entries.iter().zip(compressed).enumerate() {
-        work.entry_started(index, total_entries, &entry.name, member.input_size);
-        let input_size = member.input_size;
+    for (entry, member) in entries.iter().zip(compressed) {
         members.push(prepare_volume_member(entry, member, &plan, resources)?);
-        work.entry_finished(index, total_entries, &entry.name, input_size);
     }
     if !work.finish() {
         return Err(Error::Cancelled);
@@ -946,6 +966,7 @@ pub(super) fn write_volumes(
         });
     }
 
+    report_emission(plan.progress, true);
     let mut writer = VolumeWriter {
         max_payload_per_volume,
         solid: plan.compress.solid,
@@ -962,7 +983,9 @@ pub(super) fn write_volumes(
     for mut member in members {
         writer.write_member(&mut member)?;
     }
-    writer.finish()
+    writer.finish()?;
+    report_emission(plan.progress, false);
+    Ok(())
 }
 
 /// Compresses and, if needed, encrypts one member into a form that can be cut
@@ -1323,5 +1346,26 @@ fn fragment_header(
             &[],
         ),
         None => block_header_image(HEAD_FILE, flags, Some(fragment_len), &specific, &extra),
+    }
+}
+
+fn report_emission(progress: Option<ProgressReporter<'_>>, started: bool) {
+    use crate::{WriteOperation, WriteProgressEvent};
+    if let Some(progress) = progress {
+        progress.report(if started {
+            WriteProgressEvent::OperationStarted {
+                operation: WriteOperation::Emission,
+                total_bytes: None,
+                total_entries: None,
+                pass: 1,
+            }
+        } else {
+            WriteProgressEvent::OperationFinished {
+                operation: WriteOperation::Emission,
+                total_bytes: None,
+                total_entries: None,
+                pass: 1,
+            }
+        });
     }
 }

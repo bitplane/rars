@@ -13,6 +13,10 @@ pub enum WriteOperation {
 /// Progress reported by archive writers.
 ///
 /// Callbacks can be invoked concurrently when parallel compression is enabled.
+/// Each member starts before its source is consumed and finishes after its packed
+/// payload is prepared. Different members may overlap. `Advanced` is the absolute
+/// byte counter; entry events must not be added to it. A failed operation does not
+/// report `OperationFinished`. Emission can contain recovery sub-operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WriteProgressEvent<'a> {

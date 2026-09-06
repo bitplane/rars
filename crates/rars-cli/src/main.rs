@@ -1642,8 +1642,6 @@ fn write_plain_rar50_streaming(
         )?;
         Ok(())
     })?;
-    progress.finish("100%");
-    progress.spinner("Writing archive");
     progress.finish("Archive written");
     eprintln!("created {}", archive_path.display());
     Ok(())
