@@ -85,6 +85,7 @@ struct BuilderEntry {
     mtime: Option<u32>,
     mtime_nanoseconds: Option<u32>,
     file_times: Option<crate::FileTimes>,
+    legacy_extended_times: Option<Vec<u8>>,
     file_comment: Option<Vec<u8>>,
     encryption: Option<EntryEncryption>,
     redirection: Option<rar50::FileRedirection>,
@@ -298,6 +299,7 @@ impl Builder {
             mtime,
             mtime_nanoseconds: None,
             file_times: None,
+            legacy_extended_times: None,
             file_comment: None,
             encryption: None,
             redirection: None,
@@ -327,6 +329,7 @@ impl Builder {
             mtime,
             mtime_nanoseconds: None,
             file_times: None,
+            legacy_extended_times: None,
             file_comment: None,
             encryption: None,
             redirection: None,
@@ -360,6 +363,7 @@ impl Builder {
             mtime,
             mtime_nanoseconds: None,
             file_times: None,
+            legacy_extended_times: None,
             file_comment: None,
             encryption: None,
             redirection: None,
@@ -400,6 +404,7 @@ impl Builder {
             mtime,
             mtime_nanoseconds: None,
             file_times: None,
+            legacy_extended_times: None,
             file_comment: None,
             encryption: None,
             redirection: Some(link),
@@ -428,6 +433,7 @@ impl Builder {
             mtime: meta.file_time,
             mtime_nanoseconds: meta.mtime_refinement.map(|time| time.nanoseconds),
             file_times: None,
+            legacy_extended_times: None,
             file_comment: None,
             encryption: None,
             redirection: Some(link.clone()),
@@ -526,6 +532,33 @@ impl Builder {
     pub fn archive_comment_password(mut self, password: Option<Vec<u8>>) -> Self {
         self.comment_password = password;
         self
+    }
+
+    /// Retain a native RAR2.9–4.x extended-time record, including archival time.
+    /// DOS values and fractional precision are copied without timezone conversion.
+    /// Unsupported output or invalid records leave the entry unchanged.
+    pub fn set_legacy_extended_times(&mut self, name: &[u8], raw: Option<Vec<u8>>) -> Result<()> {
+        if !matches!(
+            self.format,
+            ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
+        ) || self.volume_size.is_some()
+        {
+            return Err(Error::InvalidArgument(
+                "legacy extended timestamps require single-archive RAR2.9–4.x output",
+            ));
+        }
+        if let Some(raw) = &raw {
+            crate::file_times::validate_legacy_extended_times(raw)?;
+        }
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.name == name)
+            .ok_or_else(|| {
+                Error::EntryNotFound.at_entry(name.to_vec(), "setting legacy extended timestamps")
+            })?;
+        entry.legacy_extended_times = raw;
+        Ok(())
     }
 
     /// Set complete RAR5/7 timestamps without narrowing FILETIME or discarding fractions.
@@ -837,6 +870,16 @@ impl Builder {
     /// Requires [`volume_size`](Self::volume_size). Naming the parts on disk is
     /// the caller's job, because the two families number them differently.
     pub fn build_volumes(&self, progress: Option<&dyn WriteProgress>) -> Result<Vec<Vec<u8>>> {
+        if self
+            .entries
+            .iter()
+            .any(|entry| entry.legacy_extended_times.is_some())
+        {
+            return Err(Error::InvalidArgument(
+                "legacy extended timestamps are unsupported in volume output",
+            ));
+        }
+
         let volume_size = self
             .volume_size
             .ok_or(Error::InvalidArgument("volume_size is required"))?;
@@ -1066,43 +1109,36 @@ impl Builder {
     }
 
     fn build_rar15_single(&self, progress: Option<&dyn WriteProgress>) -> Result<Vec<u8>> {
-        let options = self.rar15_options();
-        if self.store {
-            let entries: Vec<_> = self
-                .entries
-                .iter()
-                .map(|entry| rar15_40::StoredEntry {
-                    name: &entry.name,
-                    data: &entry.data,
-                    file_time: entry.mtime.unwrap_or(0),
-                    file_attr: entry.rar15_attr(),
-                    host_os: entry.rar15_host_os(),
-                    password: self.password.as_deref(),
-                    file_comment: entry.file_comment.as_deref(),
-                })
-                .collect();
-            rar15_40::write_stored_archive_with_comment(&entries, options, self.comment.as_deref())
-        } else {
-            let entries: Vec<_> = self
-                .entries
-                .iter()
-                .map(|entry| rar15_40::FileEntry {
-                    name: &entry.name,
-                    data: &entry.data,
-                    file_time: entry.mtime.unwrap_or(0),
-                    file_attr: entry.rar15_attr(),
-                    host_os: entry.rar15_host_os(),
-                    password: self.password.as_deref(),
-                    file_comment: entry.file_comment.as_deref(),
-                })
-                .collect();
-            rar15_40::write_compressed_archive_with_comment_and_progress(
-                &entries,
-                options,
-                self.comment.as_deref(),
-                progress,
-            )
-        }
+        let entries: Vec<_> = self
+            .entries
+            .iter()
+            .map(|entry| rar15_40::FileEntry {
+                name: &entry.name,
+                data: &entry.data,
+                file_time: entry.mtime.unwrap_or(0),
+                file_attr: entry.rar15_attr(),
+                host_os: entry.rar15_host_os(),
+                password: self.password.as_deref(),
+                file_comment: entry.file_comment.as_deref(),
+            })
+            .collect();
+        let extended_times: Vec<_> = self
+            .entries
+            .iter()
+            .map(|entry| entry.legacy_extended_times.as_deref())
+            .collect();
+        rar15_40::write_archive_with_extended_times(
+            &entries,
+            &extended_times,
+            self.rar15_options(),
+            if self.store {
+                crate::write_plan::MemberCoding::Stored
+            } else {
+                crate::write_plan::MemberCoding::Compressed
+            },
+            self.comment.as_deref(),
+            progress,
+        )
     }
 
     fn rar13_options(&self) -> rar13::WriterOptions {
@@ -1309,6 +1345,52 @@ fn unix_mode(_metadata: &fs::Metadata) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_legacy_times_survive_writes_and_rejected_changes() {
+        // Fractional odd-second mtime and an archival DOS timestamp.
+        let raw = vec![0x08, 0xf0, 1, 2, 3, 0, 0, 0, 0];
+        for store in [true, false] {
+            let mut builder = Builder::new(ArchiveVersion::Rar40).store(store);
+            builder
+                .add_bytes(b"file".to_vec(), b"payload".to_vec(), Some(0), None)
+                .unwrap();
+            builder
+                .set_legacy_extended_times(b"file", Some(raw.clone()))
+                .unwrap();
+            let before = builder.to_bytes().unwrap();
+            assert!(builder
+                .set_legacy_extended_times(b"file", Some(vec![0, 0xf0]))
+                .is_err());
+            assert_eq!(builder.to_bytes().unwrap(), before);
+            let archive = crate::ArchiveReader::read_owned(before).unwrap();
+            assert_eq!(
+                archive
+                    .as_rar15_40()
+                    .unwrap()
+                    .files()
+                    .next()
+                    .unwrap()
+                    .ext_time,
+                raw
+            );
+            assert!(archive.rewrite_preservation_issues().is_empty());
+            assert!(builder
+                .clone()
+                .volume_size(Some(128))
+                .build_volumes(None)
+                .is_err());
+            builder.set_legacy_extended_times(b"file", None).unwrap();
+            let archive = crate::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+            assert!(!archive
+                .as_rar15_40()
+                .unwrap()
+                .files()
+                .next()
+                .unwrap()
+                .has_ext_time());
+        }
+    }
 
     #[test]
     fn empty_rewrites_retain_archive_settings() {

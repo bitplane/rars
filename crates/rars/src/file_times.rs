@@ -1,4 +1,4 @@
-//! Lossless RAR5 file timestamps and conversion of legacy extended times.
+//! Lossless RAR5 timestamps and validation/conversion of legacy extended times.
 
 use crate::{Error, Result};
 
@@ -219,6 +219,39 @@ impl FileTimes {
         };
         Ok((times != Self::default()).then_some(times))
     }
+}
+
+/// Validate a native legacy record without interpreting DOS wall-clock times.
+/// Includes the fourth (archival) timestamp, which RAR5 cannot represent.
+pub(crate) fn validate_legacy_extended_times(raw: &[u8]) -> Result<()> {
+    let invalid = || Error::InvalidArgument("legacy extended timestamps are incomplete or invalid");
+    let flags = u16::from_le_bytes(raw.get(..2).ok_or_else(invalid)?.try_into().unwrap());
+    let mut at = 2;
+    for index in 0..4 {
+        let mode = (flags >> (12 - index * 4)) & 15;
+        if mode & 8 == 0 {
+            if mode != 0 {
+                return Err(invalid());
+            }
+            continue;
+        }
+        if index != 0 {
+            raw.get(at..at + 4).ok_or_else(invalid)?;
+            at += 4;
+        }
+        let mut ticks = 0u32;
+        for _ in 0..mode & 3 {
+            ticks = (u32::from(*raw.get(at).ok_or_else(invalid)?) << 16) | (ticks >> 8);
+            at += 1;
+        }
+        if ticks >= 10_000_000 {
+            return Err(invalid());
+        }
+    }
+    if at != raw.len() {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

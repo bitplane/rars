@@ -104,7 +104,9 @@ existing policy for creating filesystem links.
 
 The initial subset supports single-volume RAR 2.9–4.x archives containing ordinary
 unencrypted files, including solid archives. Names retain their original bytes;
-base DOS timestamps retain their raw values without a timezone conversion. Unix
+base DOS timestamps and validated extended records retain their raw values without
+a timezone conversion. This includes modification, creation, access and archival
+time, odd seconds and each record’s original fractional precision. Unix
 permissions/type bits and DOS attributes retain their source meaning. DOS, OS/2
 and Windows host IDs are normalised to the DOS host with the same attributes.
 Renames and removals retain original member identity and order.
@@ -113,7 +115,7 @@ The source must use unpacker version 29 for every member. RAR 2.9, 3.x and 4.x
 share this version; preservation uses the compatible RAR29 writer, without
 claiming to reproduce the creating release. File data is recompressed.
 
-Specific preflight errors currently reject encryption, extended timestamps,
+Specific preflight errors currently reject encryption, malformed extended timestamps,
 archive/file comments, directories, links, legacy Unicode filename records,
 unsupported host metadata, recovery and other service records. Unknown header
 flags, extra header bytes, unsupported end headers and trailing bytes are also
@@ -121,6 +123,12 @@ rejected. RAR1.x/2.0 preservation and empty legacy output remain unsupported;
 removing the final member fails writing without replacing the destination.
 Use explicit `preserve=False` conversion when these properties need conversion
 rather than retention. Legacy writers materialize retained payloads in memory.
+
+Native rewriting preserves archival time even though `gettimes()` and RAR5
+conversion cannot represent it. Those conversion APIs retain their existing
+explicit rejection. `Builder::set_legacy_extended_times` in Rust accepts or removes
+a validated raw record for single-archive RAR2.9–4.x output; invalid changes leave
+the queued record unchanged. Volume output with retained records is rejected.
 
 ## Compatibility change for the next minor release
 

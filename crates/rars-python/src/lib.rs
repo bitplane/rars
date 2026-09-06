@@ -664,7 +664,8 @@ impl RarBuilder {
     }
 
     /// Create a rewrite builder. Ordinary unencrypted RAR2.9–4.x files retain
-    /// native names, DOS timestamps, attributes and solid mode. For RAR5/7, format,
+    /// native names, base/extended DOS timestamps, attributes and solid mode.
+    /// For RAR5/7, format,
     /// solid, data/header/comment encryption and archive metadata settings are
     /// retained; unknown or unsupported preservation fails before output.
     /// Explicit preserve=False converts to RAR5 level 3, non-solid and unencrypted.
@@ -730,6 +731,18 @@ impl RarBuilder {
         let comment_encryption = archive.archive.member_comment_encryption();
         for ((member_index, member), comment) in archive.archive.members().enumerate().zip(comments)
         {
+            let legacy_extended_times = if legacy_preservation {
+                match &member.detail {
+                    rars_rs::ArchiveMemberDetail::Rar15To40 { extended_times, .. }
+                        if !extended_times.is_empty() =>
+                    {
+                        Some(extended_times.clone())
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
             let file_times = if legacy_preservation {
                 None
             } else {
@@ -865,6 +878,12 @@ impl RarBuilder {
                             None
                         },
                     )
+                    .map_err(map_builder_error)?;
+            }
+            if legacy_extended_times.is_some() {
+                builder
+                    .inner
+                    .set_legacy_extended_times(&output_name, legacy_extended_times)
                     .map_err(map_builder_error)?;
             }
             if file_times.is_some() {

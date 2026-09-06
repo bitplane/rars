@@ -234,7 +234,7 @@ impl Archive {
     ///
     /// An empty list certifies only the supported metadata subset, not payload
     /// integrity or byte-identical output. Legacy preservation accepts only
-    /// ordinary unencrypted unpacker-29 files with base metadata.
+    /// ordinary unencrypted unpacker-29 files with supported native metadata.
     /// Parsed unknown/incomplete RAR5 extras remain visible to this check even
     /// though ordinary extraction tolerates them. Source files must stay stable.
     pub fn rewrite_preservation_issues(&self) -> Vec<String> {

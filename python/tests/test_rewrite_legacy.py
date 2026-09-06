@@ -154,3 +154,84 @@ def test_native_legacy_rewrite_can_replace_its_source(tmp_path):
     assert output.read(b"renamed-\xff") == b"payload" * 50
     assert output.read("second") == b"second"
     assert file_metadata(path.read_bytes())[1][2] == 0
+
+
+# Insert a native time record into otherwise ordinary legacy file headers.
+def with_extended_times(data, raw):
+    data = bytearray(data)
+    offset, _, flags, size = next(h for h in headers(data) if h[1] == 0x74)
+    data[offset + size:offset + size] = raw
+    struct.pack_into("<H", data, offset + 3, flags | 0x1000)
+    struct.pack_into("<H", data, offset + 5, size + len(raw))
+    struct.pack_into("<H", data, offset, zlib.crc32(data[offset + 2:offset + size + len(raw)]) & 0xffff)
+    return bytes(data)
+
+
+def extended_time_records(data):
+    result = []
+    for offset, kind, flags, size in headers(data):
+        if kind == 0x74:
+            name_size = struct.unpack_from("<H", data, offset + 26)[0]
+            result.append(data[offset + 32 + name_size:offset + size] if flags & 0x1000 else None)
+    return result
+
+
+@pytest.mark.parametrize("width", range(4))
+@pytest.mark.parametrize("solid", [False, True])
+def test_native_extended_times_retain_all_four_slots_and_precision(width, solid):
+    mode = 12 | width  # Present, plus the odd-second bit.
+    raw = struct.pack("<H", mode * 0x1111)
+    for index in range(4):
+        if index:
+            raw += struct.pack("<I", DOS_TIME + index)
+        raw += b"\x01" * width
+    source = rars.RarFile.from_bytes(with_extended_times(source_bytes(solid=solid), raw))
+    assert source.rewrite_preservation_issues() == []
+    builder = rars.RarBuilder.from_archive(source)
+    builder.rename(b"raw-\xff", "renamed")
+    builder.remove("second")
+    output = builder.to_bytes()
+    assert extended_time_records(output) == [raw]
+    assert rars.RarFile.from_bytes(output).read("renamed") == b"payload" * 50
+    assert extended_time_records(rars.RarBuilder.from_archive(rars.RarFile.from_bytes(output)).to_bytes()) == [raw]
+
+
+@pytest.mark.parametrize("raw", [b"\0\0", b"\0\x80"])
+def test_explicit_empty_or_whole_second_time_records_remain_present(raw):
+    source = rars.RarFile.from_bytes(with_extended_times(source_bytes(), raw))
+    output = rars.RarBuilder.from_archive(source).to_bytes()
+    assert extended_time_records(output) == [raw, None]
+
+
+@pytest.mark.parametrize("raw", [b"", b"\x00", b"\0\xb0", b"\0\x08", b"\0\0extra", b"\0\xb0\xff\xff\xff", b"\0\x10"])
+def test_malformed_extended_times_fail_before_destination_write(tmp_path, raw):
+    source = rars.RarFile.from_bytes(with_extended_times(source_bytes(), raw))
+    destination = tmp_path / "existing.rar"
+    destination.write_bytes(b"keep")
+    with pytest.raises(rars.UnsupportedRarFeature, match="extended timestamps"):
+        rars.RarBuilder.from_archive(source).write(destination)
+    assert destination.read_bytes() == b"keep"
+
+
+def test_reference_rar420_extended_times_survive_native_rewrite(tmp_path):
+    path = ROOT / "crates/rars/tests/fixtures/rar15_40/rar420/ext_time_rar420.rar"
+    source = rars.RarFile(path)
+    builder = rars.RarBuilder.from_archive(source)
+    output_bytes = builder.to_bytes()
+    assert extended_time_records(output_bytes) == extended_time_records(path.read_bytes())
+    output = rars.RarFile.from_bytes(output_bytes)
+    assert output.family == "rar15_40"
+    for name in source.namelist():
+        assert output.gettimes(name) == source.gettimes(name)
+        assert output.read(name) == source.read(name)
+    if shutil.which("unrar"):
+        rewritten = tmp_path / "rewritten.rar"
+        rewritten.write_bytes(output_bytes)
+        extracted_times = []
+        for index, archive in enumerate([path, rewritten]):
+            directory = tmp_path / str(index)
+            directory.mkdir()
+            subprocess.run(["unrar", "x", "-idq", str(archive), str(directory) + "/"], check=True, capture_output=True)
+            extracted_times.append({file.relative_to(directory): file.stat().st_mtime_ns
+                                    for file in directory.rglob("*") if file.is_file()})
+        assert extracted_times[0] == extracted_times[1]

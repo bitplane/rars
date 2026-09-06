@@ -88,6 +88,39 @@ pub fn write_stored_archive_with_comment(
     )
 }
 
+/// Builder path for losslessly retained native timestamp records. Existing
+/// direct entry structs keep their API and emit no extended-time record.
+pub(crate) fn write_archive_with_extended_times(
+    entries: &[FileEntry<'_>],
+    extended_times: &[Option<&[u8]>],
+    options: WriterOptions,
+    coding: MemberCoding,
+    archive_comment: Option<&[u8]>,
+    progress: Option<&dyn WriteProgress>,
+) -> Result<Vec<u8>> {
+    if entries.len() != extended_times.len() {
+        return Err(Error::InvalidArgument(
+            "extended timestamp count does not match members",
+        ));
+    }
+    let mut members: Vec<_> = entries.iter().map(Member::from_file).collect();
+    for (member, raw) in members.iter_mut().zip(extended_times) {
+        if let Some(raw) = raw {
+            if !matches!(
+                options.target,
+                ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
+            ) {
+                return Err(Error::InvalidArgument(
+                    "legacy extended timestamps require RAR2.9–4.x output",
+                ));
+            }
+            crate::file_times::validate_legacy_extended_times(raw)?;
+        }
+        member.extended_times = *raw;
+    }
+    collect_archive(&members, options, coding, archive_comment, progress)
+}
+
 pub fn write_compressed_archive(
     entries: &[FileEntry<'_>],
     options: WriterOptions,
@@ -830,6 +863,7 @@ struct Member<'a> {
     host_os: u8,
     password: Option<&'a [u8]>,
     file_comment: Option<&'a [u8]>,
+    extended_times: Option<&'a [u8]>,
 }
 
 impl<'a> Member<'a> {
@@ -842,6 +876,7 @@ impl<'a> Member<'a> {
             host_os: entry.host_os,
             password: entry.password,
             file_comment: entry.file_comment,
+            extended_times: None,
         }
     }
 
@@ -854,6 +889,7 @@ impl<'a> Member<'a> {
             host_os: entry.host_os,
             password: entry.password,
             file_comment: entry.file_comment,
+            extended_times: None,
         }
     }
 
@@ -866,6 +902,7 @@ impl<'a> Member<'a> {
             host_os: entry.host_os,
             password: entry.password.as_deref(),
             file_comment: entry.file_comment.as_deref(),
+            extended_times: None,
         }
     }
 
@@ -986,7 +1023,11 @@ fn write_member(
     if salt.is_some() {
         flags |= FHD_SALT;
     }
-    let file_comment = encode_file_comment(member.file_comment)?;
+    let mut extra = encode_file_comment(member.file_comment)?;
+    if let Some(raw) = member.extended_times {
+        flags |= FHD_EXTTIME;
+        extra.extend_from_slice(raw);
+    }
     let mut header = Vec::new();
     write_file_header(
         &mut header,
@@ -1004,7 +1045,7 @@ fn write_member(
             dictionary_flags: dictionary_flags_for_options(options)?,
             flags,
             salt,
-            extra: &file_comment,
+            extra: &extra,
         },
     )?;
     match header_password {

@@ -24,6 +24,7 @@ pub use crate::streaming::{EntrySource, WriterResources};
 pub use crate::write_plan::MemberCoding;
 pub use extract::extract_volumes_to;
 use extract::{DecoderSession, DecryptingReader};
+pub(crate) use write::write_archive_with_extended_times;
 pub use write::{
     write_compressed_archive, write_compressed_archive_with_comment,
     write_compressed_archive_with_comment_and_progress, write_compressed_volumes,
@@ -1346,8 +1347,12 @@ impl Archive {
             if file.is_encrypted() {
                 issues.push(format!("{label}: legacy data encryption"));
             }
-            if file.has_ext_time() {
-                issues.push(format!("{label}: legacy extended timestamps"));
+            if file.has_ext_time()
+                && crate::file_times::validate_legacy_extended_times(&file.ext_time).is_err()
+            {
+                issues.push(format!(
+                    "{label}: legacy extended timestamps are incomplete or invalid"
+                ));
             }
             if file.block.flags & FHD_COMMENT != 0 {
                 issues.push(format!("{label}: legacy file comments"));
@@ -1366,10 +1371,10 @@ impl Archive {
                     "{label}: solid dependency without archive solid flag"
                 ));
             }
-            // No optional file-header fields are emitted by this subset. Check
+            // Only native extended times are retained among optional fields. Check
             // the declared length too: the reader tolerates unflagged extras.
-            if file.block.flags & !(LONG_BLOCK | FHD_SOLID | FHD_DIRECTORY_MASK) != 0
-                || usize::from(file.block.head_size) != 32 + file.name.len()
+            if file.block.flags & !(LONG_BLOCK | FHD_SOLID | FHD_DIRECTORY_MASK | FHD_EXTTIME) != 0
+                || usize::from(file.block.head_size) != 32 + file.name.len() + file.ext_time.len()
             {
                 issues.push(format!("{label}: legacy file flags or extra metadata"));
             }
