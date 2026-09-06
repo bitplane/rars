@@ -3,6 +3,49 @@ use std::sync::Arc;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Stable error categories for callers and language bindings. Context wrappers
+/// do not change the category; display text remains a diagnostic, not a protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ErrorKind {
+    InvalidArchive,
+    InvalidArgument,
+    UnsupportedFormat,
+    UnsupportedFeature,
+    PasswordRequired,
+    BadPassword,
+    ChecksumMismatch,
+    EntryNotFound,
+    DuplicateEntry,
+    UnsafePath,
+    Io,
+    ResourceLimit,
+    Cancelled,
+    SourceChanged,
+}
+
+impl ErrorKind {
+    /// Stable machine-readable code, independent of diagnostic wording.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::InvalidArchive => "INVALID_ARCHIVE",
+            Self::InvalidArgument => "INVALID_OPTION",
+            Self::UnsupportedFormat => "UNSUPPORTED_FORMAT",
+            Self::UnsupportedFeature => "UNSUPPORTED_FEATURE",
+            Self::PasswordRequired => "PASSWORD_REQUIRED",
+            Self::BadPassword => "BAD_PASSWORD",
+            Self::ChecksumMismatch => "CHECKSUM_MISMATCH",
+            Self::EntryNotFound => "ENTRY_NOT_FOUND",
+            Self::DuplicateEntry => "DUPLICATE_ENTRY",
+            Self::UnsafePath => "UNSAFE_ENTRY_NAME",
+            Self::Io => "IO",
+            Self::ResourceLimit => "RESOURCE_LIMIT",
+            Self::Cancelled => "CANCELLED",
+            Self::SourceChanged => "SOURCE_CHANGED",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct IoError {
     pub kind: std::io::ErrorKind,
@@ -30,6 +73,12 @@ pub enum Error {
     TooShort,
     UnsupportedSignature,
     InvalidHeader(&'static str),
+    InvalidArgument(&'static str),
+    EntryNotFound,
+    DuplicateEntry,
+    InputSymlink,
+    UnsafePath(&'static str),
+    SourceChanged(&'static str),
     AtArchiveOffset {
         offset: usize,
         source: Box<Error>,
@@ -110,6 +159,11 @@ impl std::fmt::Display for Error {
             Self::TooShort => write!(f, "input is too short"),
             Self::UnsupportedSignature => write!(f, "unsupported archive signature"),
             Self::InvalidHeader(msg) => write!(f, "invalid header: {msg}"),
+            Self::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
+            Self::EntryNotFound => f.write_str("no such archive entry"),
+            Self::DuplicateEntry => f.write_str("duplicate archive entry name"),
+            Self::InputSymlink => f.write_str("input is a symlink; refusing to follow it"),
+            Self::UnsafePath(msg) | Self::SourceChanged(msg) => f.write_str(msg),
             Self::AtArchiveOffset { offset, source } => {
                 write!(f, "at archive offset {offset:#x}: {source}")
             }
@@ -236,6 +290,78 @@ impl std::error::Error for Error {
 }
 
 impl Error {
+    /// The underlying library error, with archive/entry/volume context removed.
+    /// The original error still owns and displays every context wrapper.
+    pub fn root_cause(&self) -> &Self {
+        let mut error = self;
+        while let Self::AtArchiveOffset { source, .. }
+        | Self::AtEntry { source, .. }
+        | Self::InVolume { source, .. } = error
+        {
+            error = source;
+        }
+        error
+    }
+
+    /// The outermost member context, if this error identifies a member.
+    pub fn entry_context(&self) -> Option<(&[u8], &'static str)> {
+        let mut error = self;
+        loop {
+            match error {
+                Self::AtEntry {
+                    name, operation, ..
+                } => return Some((name, operation)),
+                Self::AtArchiveOffset { source, .. } | Self::InVolume { source, .. } => {
+                    error = source
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// Classify the cause without discarding its diagnostic context.
+    pub fn kind(&self) -> ErrorKind {
+        match self.root_cause() {
+            Self::AtArchiveOffset { .. } | Self::AtEntry { .. } | Self::InVolume { .. } => {
+                unreachable!("root cause has no context wrapper")
+            }
+            Self::UnsupportedSignature | Self::UnsupportedVersion(_) => {
+                ErrorKind::UnsupportedFormat
+            }
+            Self::UnsupportedFeature { .. }
+            | Self::UnsupportedFamilyFeature { .. }
+            | Self::UnsupportedCompression { .. }
+            | Self::UnsupportedEncryption { .. }
+            | Self::UnsupportedWriterOption { .. } => ErrorKind::UnsupportedFeature,
+            Self::NeedPassword => ErrorKind::PasswordRequired,
+            Self::WrongPasswordOrCorruptData
+            | Self::Rar50Crypto(crate::crypto::rar50::Error::BadPassword) => ErrorKind::BadPassword,
+            Self::CrcMismatch { .. } | Self::Crc32Mismatch { .. } | Self::HashMismatch { .. } => {
+                ErrorKind::ChecksumMismatch
+            }
+            Self::Io(_) | Self::Rar5Recovery(crate::recovery::rar5::Error::Io(_)) => ErrorKind::Io,
+            Self::MemoryLimitExceeded { .. }
+            | Self::Rar50BufferedDecodeLimitExceeded { .. }
+            | Self::Rar5Recovery(crate::recovery::rar5::Error::RebuildTooLarge) => {
+                ErrorKind::ResourceLimit
+            }
+            Self::Cancelled | Self::Codec(crate::codec::Error::Cancelled) => ErrorKind::Cancelled,
+            Self::EntryNotFound => ErrorKind::EntryNotFound,
+            Self::DuplicateEntry => ErrorKind::DuplicateEntry,
+            Self::InputSymlink | Self::InvalidArgument(_) => ErrorKind::InvalidArgument,
+            Self::UnsafePath(_) => ErrorKind::UnsafePath,
+            Self::SourceChanged(_) => ErrorKind::SourceChanged,
+            Self::TooShort
+            | Self::InvalidHeader(_)
+            | Self::Codec(_)
+            | Self::Rar3Recovery(_)
+            | Self::Rar5Recovery(_)
+            | Self::Rar20Crypto(_)
+            | Self::Rar30Crypto(_)
+            | Self::Rar50Crypto(_) => ErrorKind::InvalidArchive,
+        }
+    }
+
     pub fn at_archive_offset(self, offset: usize) -> Self {
         Self::AtArchiveOffset {
             offset,
@@ -294,6 +420,99 @@ impl From<crate::crypto::rar50::Error> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classification_survives_every_context_order_without_losing_details() {
+        let cases = [
+            (Error::NeedPassword, ErrorKind::PasswordRequired),
+            (
+                Error::Rar50Crypto(crate::crypto::rar50::Error::BadPassword),
+                ErrorKind::BadPassword,
+            ),
+            (
+                Error::UnsupportedCompression {
+                    family: "RAR",
+                    unpack_version: 99,
+                    method: 9,
+                },
+                ErrorKind::UnsupportedFeature,
+            ),
+            (
+                Error::UnsupportedVersion(ArchiveVersion::Rar50),
+                ErrorKind::UnsupportedFormat,
+            ),
+            (
+                Error::from(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                ErrorKind::Io,
+            ),
+            (
+                Error::Rar5Recovery(crate::recovery::rar5::Error::Io(
+                    std::io::ErrorKind::WriteZero,
+                )),
+                ErrorKind::Io,
+            ),
+            (
+                Error::MemoryLimitExceeded {
+                    limit: 1,
+                    required: 2,
+                    dictionary_size: 1,
+                },
+                ErrorKind::ResourceLimit,
+            ),
+            (
+                Error::Codec(crate::codec::Error::Cancelled),
+                ErrorKind::Cancelled,
+            ),
+            (Error::Cancelled, ErrorKind::Cancelled),
+            (Error::EntryNotFound, ErrorKind::EntryNotFound),
+            (Error::DuplicateEntry, ErrorKind::DuplicateEntry),
+            (Error::InputSymlink, ErrorKind::InvalidArgument),
+            (Error::UnsafePath("path refusal"), ErrorKind::UnsafePath),
+            (
+                Error::SourceChanged("changed source"),
+                ErrorKind::SourceChanged,
+            ),
+            (
+                Error::InvalidHeader("password is required; unsafe; I/O error"),
+                ErrorKind::InvalidArchive,
+            ),
+            (
+                Error::HashMismatch { hash_type: 0 },
+                ErrorKind::ChecksumMismatch,
+            ),
+        ];
+        for (cause, expected) in cases {
+            assert_eq!(cause.kind(), expected);
+            for order in [
+                [0, 1, 2],
+                [0, 2, 1],
+                [1, 0, 2],
+                [1, 2, 0],
+                [2, 0, 1],
+                [2, 1, 0],
+            ] {
+                let mut wrapped = cause.clone();
+                for wrapper in order {
+                    wrapped = match wrapper {
+                        0 => wrapped.at_archive_offset(42),
+                        1 => wrapped.at_entry(b"member".to_vec(), "reading"),
+                        _ => Error::InVolume {
+                            number: 3,
+                            source: Box::new(wrapped),
+                        },
+                    };
+                }
+                assert_eq!(wrapped.kind(), expected);
+                assert_eq!(wrapped.root_cause(), &cause);
+                assert_eq!(
+                    wrapped.entry_context(),
+                    Some((b"member".as_slice(), "reading"))
+                );
+                assert!(wrapped.to_string().contains("in volume 3"));
+                assert!(wrapped.to_string().contains("member"));
+            }
+        }
+    }
 
     #[test]
     fn archive_offset_context_exposes_source_error() {

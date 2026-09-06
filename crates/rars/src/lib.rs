@@ -46,7 +46,7 @@ mod x86_filter_scan;
 
 pub use builder::{entry_relative_path, validate_entry_name, Builder};
 pub use detect::{detect_archive_family, find_archive_start, ArchiveSignature, SFX_SCAN_LIMIT};
-pub use error::{Error, Result};
+pub use error::{Error, ErrorKind, Result};
 pub use features::{Feature, FeatureSet};
 pub use filter::{
     formats_supporting_filter, FilterKind, FilterPolicy, FilterSpec, UnsupportedFilterKind,

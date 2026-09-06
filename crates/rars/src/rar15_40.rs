@@ -722,7 +722,13 @@ impl FileHeader {
             | Error::AtArchiveOffset { .. }
             | Error::AtEntry { .. }
             | Error::InVolume { .. }
-            | Error::Cancelled => error,
+            | Error::Cancelled
+            | Error::InvalidArgument(_)
+            | Error::EntryNotFound
+            | Error::DuplicateEntry
+            | Error::InputSymlink
+            | Error::UnsafePath(_)
+            | Error::SourceChanged(_) => error,
             Error::InvalidHeader(_)
             | Error::Codec(_)
             | Error::Rar3Recovery(_)
