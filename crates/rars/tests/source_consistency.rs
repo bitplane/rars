@@ -72,6 +72,8 @@ fn rar50_fragment_checksums_are_verified_against_the_emission_read() {
     // fragment's header. Mutation on the third open changes its emitted bytes.
     let error = write_rar50(changing_source(4096, 2, 4096), false, true, 0).unwrap_err();
     assert!(error.to_string().contains("contents changed"));
+    assert_eq!(error.kind(), rars::ErrorKind::SourceChanged);
+    assert_eq!(error.entry_context().unwrap().0, b"file");
 }
 
 #[test]
@@ -151,5 +153,73 @@ fn legacy_stored_emission_rejects_same_size_content_changes() {
         )
         .unwrap_err();
         assert!(error.to_string().contains("contents changed"));
+    }
+}
+
+#[test]
+fn member_io_failures_keep_identity_through_compression_routes() {
+    for (level, solid, filter) in [
+        (0, false, rar50::FilterPolicy::None),
+        (1, false, rar50::FilterPolicy::None),
+        (1, true, rar50::FilterPolicy::None),
+        (1, false, rar50::FilterPolicy::Auto),
+    ] {
+        for fail_in_read in [false, true] {
+            struct Broken;
+            impl std::io::Read for Broken {
+                fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "injected read failure",
+                    ))
+                }
+            }
+            impl std::io::Seek for Broken {
+                fn seek(&mut self, _: std::io::SeekFrom) -> std::io::Result<u64> {
+                    Ok(0)
+                }
+            }
+            let mut entries: Vec<_> = (0..8)
+                .map(|index| {
+                    rar50::ArchiveEntry::new(
+                        format!("member-{index}").into_bytes(),
+                        EntrySource::from_bytes(vec![b'a'; 128]),
+                    )
+                })
+                .collect();
+            entries.push(rar50::ArchiveEntry::new(
+                b"failed-member".to_vec(),
+                EntrySource::from_opener(128, move || {
+                    if fail_in_read {
+                        Ok(Box::new(Broken))
+                    } else {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "injected open failure",
+                        )
+                        .into())
+                    }
+                }),
+            ));
+            let mut features = FeatureSet::default();
+            features.solid = solid;
+            let result = rar50::write_streaming_archive_to(
+                &entries,
+                rar50::WriterOptions::new(ArchiveVersion::Rar50, features)
+                    .with_compression_level(level),
+                rar50::ArchiveExtras::default().with_filter_policy(filter.clone()),
+                &WriterResources::default(),
+                &mut Vec::new(),
+            );
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), rars::ErrorKind::Io);
+            assert_eq!(
+                error.entry_context(),
+                Some((b"failed-member".as_slice(), "compressing"))
+            );
+            assert!(
+                matches!(error.root_cause(), rars::Error::Io(source) if source.kind == std::io::ErrorKind::PermissionDenied)
+            );
+        }
     }
 }

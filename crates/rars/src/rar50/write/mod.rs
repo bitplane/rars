@@ -1546,12 +1546,12 @@ mod tests {
             &WriterResources::default(),
             &mut Vec::new(),
         );
-        assert!(matches!(
-            result,
-            Err(Error::InvalidHeader(
-                "entry source size changed while compressing"
-            ))
-        ));
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::SourceChanged);
+        assert_eq!(
+            error.entry_context(),
+            Some((b"changing.bin".as_slice(), "compressing"))
+        );
     }
 
     #[test]

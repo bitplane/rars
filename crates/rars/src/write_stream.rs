@@ -140,13 +140,13 @@ pub(crate) fn check_source_length(
     message: &'static str,
 ) -> Result<()> {
     if observed != expected {
-        return Err(Error::InvalidHeader(message));
+        return Err(Error::SourceChanged(message));
     }
     let mut probe = [0];
     loop {
         match reader.read(&mut probe) {
             Ok(0) => return Ok(()),
-            Ok(_) => return Err(Error::InvalidHeader(message)),
+            Ok(_) => return Err(Error::SourceChanged(message)),
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error.into()),
         }

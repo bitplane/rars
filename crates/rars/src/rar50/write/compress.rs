@@ -135,18 +135,19 @@ impl MemberStream {
 
 /// `advance` is called with each newly completed chunk of work and returns
 /// false when the caller wants to stop.
-pub(super) fn compress_members_reporting(
+pub(super) fn compress_members_with_context(
     sources: &[EntrySource],
     plan: CompressPlan,
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
+    error_context: &(dyn Fn(usize, Error) -> Error + Sync),
 ) -> Result<Vec<CompressedMember>> {
     if advance.is_cancelled() || resources.is_cancelled() {
         return Err(Error::Cancelled);
     }
     let mut integrity = Vec::with_capacity(sources.len());
-    for source in sources {
-        let input_size = source.len()?;
+    for (index, source) in sources.iter().enumerate() {
+        let input_size = source.len().map_err(|error| error_context(index, error))?;
         // Compression fills these checksums while consuming the source.
         integrity.push((input_size, 0, [0; 32]));
     }
@@ -157,7 +158,14 @@ pub(super) fn compress_members_reporting(
     let wants_whole_member =
         plan.method != 0 && (plan.filter_policy != FilterPolicy::None || plan.candidates.len() > 1);
     if wants_whole_member && !plan.solid {
-        return compress_members_whole(sources, &integrity, &plan, resources, advance);
+        return compress_members_whole(
+            sources,
+            &integrity,
+            &plan,
+            resources,
+            advance,
+            error_context,
+        );
     }
 
     // Storing is not "compress and hope it does not help": the header records
@@ -167,7 +175,8 @@ pub(super) fn compress_members_reporting(
             sources.iter().zip(&mut integrity).enumerate()
         {
             advance.started(index, *input_size);
-            (*crc, *hash) = super::source_integrity(source, *input_size, plan.block_size, advance)?;
+            (*crc, *hash) = super::source_integrity(source, *input_size, plan.block_size, advance)
+                .map_err(|error| error_context(index, error))?;
             if !advance.advance(*input_size) {
                 return Err(Error::Cancelled);
             }
@@ -211,6 +220,7 @@ pub(super) fn compress_members_reporting(
                 required,
                 resources,
                 advance,
+                error_context,
             )?
         } else {
             compress_independent_members(
@@ -221,6 +231,7 @@ pub(super) fn compress_members_reporting(
                 required,
                 resources,
                 advance,
+                error_context,
             )?
         }
     };
@@ -290,6 +301,7 @@ fn compress_members_whole(
     plan: &CompressPlan,
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
+    error_context: &(dyn Fn(usize, Error) -> Error + Sync),
 ) -> Result<Vec<CompressedMember>> {
     // Each worker acquires its complete workspace before loading the source.
     // Results are disk spools, so retaining them in source order is cheap.
@@ -306,14 +318,18 @@ fn compress_members_whole(
         if end == start {
             // A streaming fallback can itself use rayon. Run it outside the
             // worker batch so a nested job cannot wait behind budget waiters.
-            members.push(compress_whole_member(
-                start,
-                &sources[start],
-                integrity[start],
-                plan,
-                resources,
-                advance,
-            )?);
+            members.push(
+                compress_whole_member(
+                    start,
+                    &sources[start],
+                    integrity[start],
+                    plan,
+                    resources,
+                    advance,
+                    error_context,
+                )
+                .map_err(|error| error_context(start, error))?,
+            );
             start += 1;
         } else {
             members.extend(crate::parallel::map_collect(
@@ -326,7 +342,9 @@ fn compress_members_whole(
                         plan,
                         resources,
                         advance,
+                        error_context,
                     )
+                    .map_err(|error| error_context(index, error))
                 },
             )?);
             start = end;
@@ -342,6 +360,7 @@ fn compress_whole_member(
     plan: &CompressPlan,
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
+    error_context: &(dyn Fn(usize, Error) -> Error + Sync),
 ) -> Result<CompressedMember> {
     let (input_size, _, _) = integrity;
     let mut crc = Crc32::new();
@@ -446,7 +465,7 @@ fn compress_whole_member(
                         self.progress.finished(self.index, size);
                     }
                 }
-                let mut streamed = compress_members_reporting(
+                let mut streamed = compress_members_with_context(
                     std::slice::from_ref(source),
                     CompressPlan {
                         filter_policy: FilterPolicy::None,
@@ -458,6 +477,7 @@ fn compress_whole_member(
                         index,
                         progress: advance,
                     },
+                    &|_, error| error_context(index, error),
                 )?;
                 return Ok(streamed.remove(0));
             }
@@ -495,6 +515,7 @@ fn compress_independent_members(
     required: u64,
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
+    error_context: &(dyn Fn(usize, Error) -> Error + Sync),
 ) -> Result<Vec<Spool>> {
     let mut packed = Vec::with_capacity(sources.len());
     for (group_index, group) in sources.chunks(batch_capacity).enumerate() {
@@ -510,6 +531,7 @@ fn compress_independent_members(
                     resources,
                     advance,
                 )
+                .map_err(|error| error_context(group_start + offset, error))
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -539,8 +561,10 @@ fn compress_independent_members(
                     blocks: Vec::new(),
                 };
                 while stream.has_more() && job.data.len() < run_size(plan) {
-                    job.data
-                        .extend(read_block(stream, plan.block_size, advance)?);
+                    job.data.extend(
+                        read_block(stream, plan.block_size, advance)
+                            .map_err(|error| error_context(stream.member, error))?,
+                    );
                     job.blocks
                         .push((member, job.data.len(), !stream.has_more()));
                 }
@@ -552,7 +576,7 @@ fn compress_independent_members(
                 jobs.push(job);
             }
 
-            compress_wave(jobs, plan, &mut streams, advance)?;
+            compress_wave(jobs, plan, &mut streams, advance, error_context)?;
         }
 
         for stream in streams {
@@ -575,12 +599,14 @@ fn compress_solid_chain(
     required: u64,
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
+    error_context: &(dyn Fn(usize, Error) -> Error + Sync),
 ) -> Result<Vec<Spool>> {
     let mut streams = sources
         .iter()
         .enumerate()
         .map(|(member, source)| {
             MemberStream::new(member, source, integrity[member].0, resources, advance)
+                .map_err(|error| error_context(member, error))
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -607,8 +633,10 @@ fn compress_solid_chain(
                 let Some(stream) = streams.get_mut(next) else {
                     break;
                 };
-                job.data
-                    .extend(read_block(stream, plan.block_size, advance)?);
+                job.data.extend(
+                    read_block(stream, plan.block_size, advance)
+                        .map_err(|error| error_context(stream.member, error))?,
+                );
                 job.blocks
                     .push((stream.member, job.data.len(), !stream.has_more()));
             }
@@ -626,7 +654,7 @@ fn compress_solid_chain(
         if jobs.is_empty() {
             break;
         }
-        compress_wave(jobs, plan, &mut streams, advance)?;
+        compress_wave(jobs, plan, &mut streams, advance, error_context)?;
     }
 
     Ok(streams
@@ -707,7 +735,7 @@ fn read_chunk(
 fn check_source_end(reader: &mut dyn Read) -> Result<()> {
     let mut trailing = [0u8; 1];
     if reader.read(&mut trailing)? != 0 {
-        return Err(Error::InvalidHeader(
+        return Err(Error::SourceChanged(
             "entry source size changed while compressing",
         ));
     }
@@ -736,6 +764,7 @@ fn compress_wave(
     plan: &CompressPlan,
     streams: &mut [MemberStream],
     advance: &dyn CompressionProgress,
+    error_context: &(dyn Fn(usize, Error) -> Error + Sync),
 ) -> Result<()> {
     let packed_runs = crate::parallel::map_collect(jobs, |job| {
         let boundaries: Vec<_> = job
@@ -774,7 +803,10 @@ fn compress_wave(
             }
             previous = Some(member);
         }
-        streams[member].packed.write_all(&packed)?;
+        streams[member]
+            .packed
+            .write_all(&packed)
+            .map_err(|error| error_context(streams[member].member, error.into()))?;
         if last {
             let stream = &streams[member];
             advance.finished(stream.member, stream.input_size);
@@ -798,6 +830,16 @@ pub(super) fn member_compression_info(
         plan.dictionary_size,
         member.solid_continuation,
     )
+}
+
+#[cfg(test)]
+pub(super) fn compress_members_reporting(
+    sources: &[EntrySource],
+    plan: CompressPlan,
+    resources: &WriterResources,
+    advance: &dyn CompressionProgress,
+) -> Result<Vec<CompressedMember>> {
+    compress_members_with_context(sources, plan, resources, advance, &|_, error| error)
 }
 
 #[cfg(test)]

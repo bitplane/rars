@@ -58,6 +58,8 @@ struct PreparedBlock {
     /// Quick-open repeats the headers of members and plain comments so a
     /// reader can list an archive without walking it.
     quick_open_cached: bool,
+    /// Index into the caller's entries; names are cloned only on error.
+    entry_index: Option<usize>,
 }
 
 impl PreparedBlock {
@@ -110,7 +112,7 @@ impl PreparedSource {
 
     fn verify(&self, integrity: ChecksumSink) -> Result<()> {
         if integrity.crc.finish() != self.crc32 || integrity.hash.finalize() != self.hash {
-            return Err(Error::InvalidHeader(
+            return Err(Error::SourceChanged(
                 "entry source contents changed while writing",
             ));
         }
@@ -168,9 +170,14 @@ pub(super) fn write_archive(
     };
 
     let sources: Vec<_> = entries.iter().map(|entry| entry.source.clone()).collect();
-    let total_input: u64 = sources
+    let total_input: u64 = entries
         .iter()
-        .map(|source| source.len())
+        .map(|entry| {
+            entry
+                .source
+                .len()
+                .map_err(|error| member_error(error, &entry.name, "preparing"))
+        })
         .sum::<Result<u64>>()?;
     let total_entries = entries.len();
     if let Some(progress) = plan.progress {
@@ -186,7 +193,7 @@ pub(super) fn write_archive(
         crate::WriteOperation::Compression,
         total_input,
     );
-    let compressed = compress::compress_members_reporting(
+    let compressed = compress::compress_members_with_context(
         &sources,
         plan.compress.clone(),
         resources,
@@ -194,6 +201,7 @@ pub(super) fn write_archive(
             entries,
             work: &work,
         },
+        &|index, error| member_error(error, &entries[index].name, "compressing"),
     )?;
 
     // Everything between the main header and the quick-open block, in order.
@@ -201,11 +209,17 @@ pub(super) fn write_archive(
     if let Some(comment) = &plan.archive_comment {
         blocks.push(prepare_comment(comment, header_keys.as_ref())?);
     }
-    for (entry, member) in entries.iter().zip(compressed) {
+    for (index, (entry, member)) in entries.iter().zip(compressed).enumerate() {
         check_cancelled(plan.progress)?;
-        blocks.push(prepare_member(entry, member, &plan, header_keys.as_ref())?);
+        let mut block = prepare_member(entry, member, &plan, header_keys.as_ref())
+            .map_err(|error| member_error(error, &entry.name, "preparing"))?;
+        block.entry_index = Some(index);
+        blocks.push(block);
         for service in &entry.services {
-            blocks.push(prepare_service(service, header_keys.as_ref())?);
+            let mut block = prepare_service(service, header_keys.as_ref())
+                .map_err(|error| member_error(error, &entry.name, "preparing service"))?;
+            block.entry_index = Some(index);
+            blocks.push(block);
         }
     }
     if !work.finish() {
@@ -308,8 +322,15 @@ pub(super) fn write_archive(
         sink.write_all(&main)?;
 
         for block in blocks {
-            sink.write_all(&block.header)?;
-            write_payload(block.payload, &mut sink, resources, plan.progress)?;
+            let entry_index = block.entry_index;
+            let result = (|| {
+                sink.write_all(&block.header)?;
+                write_payload(block.payload, &mut sink, resources, plan.progress)
+            })();
+            result.map_err(|error| match entry_index {
+                Some(index) => member_error(error, &entries[index].name, "writing"),
+                None => error,
+            })?;
         }
 
         if let Some(payload) = &quick_open_payload {
@@ -426,6 +447,7 @@ fn stored_service_block(
         payload: Payload::Inline(data.to_vec()),
         payload_len: data.len() as u64,
         quick_open_cached: false,
+        entry_index: None,
     })
 }
 
@@ -510,6 +532,7 @@ fn encrypted_service_block(
         payload: Payload::Inline(encrypted.data),
         payload_len,
         quick_open_cached: false,
+        entry_index: None,
     })
 }
 
@@ -599,6 +622,7 @@ fn prepare_member(
         payload,
         payload_len,
         quick_open_cached: true,
+        entry_index: None,
     })
 }
 
@@ -830,7 +854,7 @@ impl FragmentSource {
         if let Some(expected) = expected_fragment {
             if fragment.crc.finish() != expected.crc32 || fragment.hash.finalize() != expected.hash
             {
-                return Err(Error::InvalidHeader(
+                return Err(Error::SourceChanged(
                     "entry source contents changed while writing",
                 ));
             }
@@ -862,7 +886,7 @@ impl FragmentSource {
                 reader.seek(std::io::SeekFrom::Start(start))?;
                 let copied = std::io::copy(&mut reader.by_ref().take(len), output)?;
                 if copied != len {
-                    return Err(Error::InvalidHeader(
+                    return Err(Error::SourceChanged(
                         "entry source size changed while writing",
                     ));
                 }
@@ -971,9 +995,14 @@ pub(super) fn write_volumes(
     };
 
     let sources: Vec<_> = entries.iter().map(|entry| entry.source.clone()).collect();
-    let total_input: u64 = sources
+    let total_input: u64 = entries
         .iter()
-        .map(|source| source.len())
+        .map(|entry| {
+            entry
+                .source
+                .len()
+                .map_err(|error| member_error(error, &entry.name, "preparing"))
+        })
         .sum::<Result<u64>>()?;
     let total_entries = entries.len();
     if let Some(progress) = plan.progress {
@@ -989,7 +1018,7 @@ pub(super) fn write_volumes(
         crate::WriteOperation::Compression,
         total_input,
     );
-    let compressed = compress::compress_members_reporting(
+    let compressed = compress::compress_members_with_context(
         &sources,
         plan.compress.clone(),
         resources,
@@ -997,12 +1026,16 @@ pub(super) fn write_volumes(
             entries,
             work: &work,
         },
+        &|index, error| member_error(error, &entries[index].name, "compressing"),
     )?;
 
     let mut members = Vec::with_capacity(entries.len());
     for (entry, member) in entries.iter().zip(compressed) {
         check_cancelled(plan.progress)?;
-        members.push(prepare_volume_member(entry, member, &plan, resources)?);
+        members.push(
+            prepare_volume_member(entry, member, &plan, resources)
+                .map_err(|error| member_error(error, &entry.name, "preparing volume payload"))?,
+        );
     }
     if !work.finish() {
         return Err(Error::Cancelled);
@@ -1031,7 +1064,9 @@ pub(super) fn write_volumes(
     };
 
     for mut member in members {
-        writer.write_member(&mut member)?;
+        writer
+            .write_member(&mut member)
+            .map_err(|error| member_error(error, &member.name, "writing volume member"))?;
     }
     writer.finish()?;
     check_cancelled(plan.progress)?;
@@ -1440,5 +1475,19 @@ fn report_emission(progress: Option<ProgressReporter<'_>>, started: bool) {
                 pass: 1,
             }
         });
+    }
+}
+
+fn member_error(error: Error, name: &[u8], operation: &'static str) -> Error {
+    // Cancellation remains an operation-level result. A streaming fallback can
+    // already have supplied the same member context; do not duplicate it.
+    if error.kind() == crate::ErrorKind::Cancelled
+        || error
+            .entry_context()
+            .is_some_and(|(existing, _)| existing == name)
+    {
+        error
+    } else {
+        error.at_entry(name.to_vec(), operation)
     }
 }
