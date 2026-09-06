@@ -1024,6 +1024,7 @@ fn prepare_volume_member(
                 )?;
             }
             let payload_len = encrypted.len();
+            encrypted.park();
             Ok(VolumeMember {
                 name: entry.name.clone(),
                 is_directory: entry.is_directory,

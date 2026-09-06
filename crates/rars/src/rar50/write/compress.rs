@@ -95,7 +95,7 @@ impl MemberStream {
             source: source.clone(),
             reader: None,
             remaining: size,
-            packed: Spool::create(resources)?,
+            packed: Spool::create_parked(resources)?,
             pushback: Vec::new(),
             crc: Crc32::new(),
             hash: blake2sp::Hasher::new(),
@@ -143,7 +143,7 @@ pub(super) fn compress_members_reporting(
         }
         integrity
             .iter()
-            .map(|_| Spool::create(resources))
+            .map(|_| Spool::create_parked(resources))
             .collect::<Result<Vec<_>>>()?
     } else {
         // Only compression jobs need a finder and parse workspace.
@@ -399,6 +399,7 @@ fn compress_whole_member(
     if input_size == 0 {
         check_source_end(&mut *source.open()?)?;
     }
+    packed_spool.park();
     Ok(CompressedMember {
         input_size,
         crc32: crc.finish(),
@@ -662,8 +663,20 @@ fn compress_wave(
                 .collect::<Vec<_>>(),
         )
     })?;
+    // A solid wave can cover thousands of tiny members. Keep only the spool
+    // currently being appended open, rather than one descriptor per member.
+    let mut previous: Option<usize> = None;
     for (member, packed) in packed_runs.into_iter().flatten() {
+        if previous != Some(member) {
+            if let Some(previous) = previous {
+                streams[previous].packed.park();
+            }
+            previous = Some(member);
+        }
         streams[member].packed.write_all(&packed)?;
+    }
+    if let Some(previous) = previous {
+        streams[previous].packed.park();
     }
     Ok(())
 }
@@ -685,6 +698,75 @@ pub(super) fn member_compression_info(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn many_members_fit_a_small_descriptor_limit() {
+        const CHILD: &str = "RARS_TEST_LOW_FD_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new("sh")
+                .args(["-c", "ulimit -n 64 && exec \"$@\"", "sh"])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "rar50::write::compress::tests::many_members_fit_a_small_descriptor_limit",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("RAYON_NUM_THREADS", "2")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let scratch = crate::scratch::case("low-fd-members");
+        let input = scratch.join("input");
+        let data = b"many tiny archive members\n".repeat(8);
+        std::fs::write(&input, &data).unwrap();
+        let sources = vec![EntrySource::from_path(&input); 128];
+        let resources = WriterResources::default().with_temp_dir(&*scratch);
+        let options = EncodeOptions::new(8).with_max_match_distance(65536);
+        for (method, solid, filter_policy) in [
+            (0, false, FilterPolicy::None),
+            (1, false, FilterPolicy::None),
+            (1, true, FilterPolicy::None),
+            (1, false, FilterPolicy::Auto),
+        ] {
+            let plan = CompressPlan {
+                algorithm_version: 0,
+                encode_options: options,
+                dictionary_size: 65536,
+                block_size: 65536,
+                solid,
+                method,
+                filter_policy,
+                candidates: vec![options],
+            };
+            let mut members =
+                compress_members_reporting(&sources, plan, &resources, &|_| true).unwrap();
+            assert_eq!(members.len(), sources.len());
+            for member in &mut members {
+                assert_eq!(member.input_size, data.len() as u64);
+                assert_eq!(member.hash, blake2sp::hash(&data));
+                let mut bytes = Vec::new();
+                assert_eq!(
+                    member.packed.copy_to(&mut bytes).unwrap(),
+                    member.packed.len()
+                );
+                if method != 0 {
+                    assert!(!bytes.is_empty());
+                }
+            }
+            drop(members);
+            assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 1);
+        }
+    }
 
     #[test]
     fn solid_inputs_open_one_at_a_time_and_close_on_failure() {

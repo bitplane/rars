@@ -219,7 +219,7 @@ type SpoolStore = Cursor<Vec<u8>>;
 pub(crate) struct Spool {
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     path: PathBuf,
-    file: SpoolStore,
+    file: Option<SpoolStore>,
     len: u64,
     pos: u64,
 }
@@ -243,7 +243,7 @@ impl Spool {
                 Ok(file) => {
                     return Ok(Self {
                         path,
-                        file,
+                        file: Some(file),
                         len: 0,
                         pos: 0,
                     })
@@ -263,10 +263,36 @@ impl Spool {
     pub(crate) fn create(_resources: &WriterResources) -> Result<Self> {
         SPOOL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
-            file: Cursor::new(Vec::new()),
+            file: Some(Cursor::new(Vec::new())),
             len: 0,
             pos: 0,
         })
+    }
+
+    /// Allocate a spool whose handle is not retained while waiting for work.
+    pub(crate) fn create_parked(resources: &WriterResources) -> Result<Self> {
+        let mut spool = Self::create(resources)?;
+        spool.park();
+        Ok(spool)
+    }
+
+    /// Release the OS handle, retaining ownership of the file and its cursor.
+    /// Bare WASM has no handle to release and must retain the in-memory bytes.
+    pub(crate) fn park(&mut self) {
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        {
+            self.file = None;
+        }
+    }
+
+    fn file(&mut self) -> std::io::Result<&mut SpoolStore> {
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        if self.file.is_none() {
+            let mut file = File::options().read(true).write(true).open(&self.path)?;
+            file.seek(SeekFrom::Start(self.pos))?;
+            self.file = Some(file);
+        }
+        Ok(self.file.as_mut().expect("spool backing store is present"))
     }
 
     pub(crate) fn len(&self) -> u64 {
@@ -279,15 +305,17 @@ impl Spool {
 
     /// Moves the read/write cursor to an absolute offset.
     pub(crate) fn seek_to(&mut self, pos: u64) -> Result<()> {
-        self.pos = self.file.seek(SeekFrom::Start(pos))?;
+        self.seek(SeekFrom::Start(pos))?;
         Ok(())
     }
 
     pub(crate) fn copy_to(&mut self, output: &mut dyn Write) -> Result<u64> {
-        self.rewind()?;
-        let copied = std::io::copy(&mut self.file, output)?;
-        self.pos = self.pos.saturating_add(copied);
-        Ok(copied)
+        let result = (|| {
+            self.rewind()?;
+            Ok(std::io::copy(self, output)?)
+        })();
+        self.park();
+        result
     }
 
     /// Copies `len` bytes starting at `start` to `output`, which is how a
@@ -298,36 +326,39 @@ impl Spool {
         len: u64,
         output: &mut dyn Write,
     ) -> Result<u64> {
-        self.seek_to(start)?;
-        let copied = std::io::copy(&mut (&mut self.file).take(len), output)?;
-        if copied != len {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "spooled range is shorter than expected",
-            )
-            .into());
-        }
-        self.pos = self.pos.saturating_add(copied);
-        Ok(copied)
+        let result = (|| {
+            self.seek_to(start)?;
+            let copied = std::io::copy(&mut self.take(len), output)?;
+            if copied != len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "spooled range is shorter than expected",
+                )
+                .into());
+            }
+            Ok(copied)
+        })();
+        self.park();
+        result
     }
 }
 
 impl Write for Spool {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        let written = self.file.write(buffer)?;
+        let written = self.file()?.write(buffer)?;
         self.pos = self.pos.saturating_add(written as u64);
         self.len = self.len.max(self.pos);
         Ok(written)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.file.flush()
+        self.file()?.flush()
     }
 }
 
 impl Read for Spool {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        let read = self.file.read(buffer)?;
+        let read = self.file()?.read(buffer)?;
         self.pos = self.pos.saturating_add(read as u64);
         Ok(read)
     }
@@ -335,7 +366,7 @@ impl Read for Spool {
 
 impl Seek for Spool {
     fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
-        self.pos = self.file.seek(from)?;
+        self.pos = self.file()?.seek(from)?;
         Ok(self.pos)
     }
 }
@@ -411,6 +442,43 @@ mod tests {
         spool.read_exact(&mut buffer).unwrap();
         assert_eq!(&buffer, b"defg");
         assert_eq!(spool.stream_position().unwrap(), 7);
+    }
+
+    #[test]
+    fn parked_spools_preserve_cursor_and_release_handles_after_copy_errors() {
+        let scratch = crate::scratch::case("parked-spool");
+        let resources = WriterResources::default().with_temp_dir(&*scratch);
+        let mut spool = Spool::create_parked(&resources).unwrap();
+        spool.write_all(b"abcdef").unwrap();
+        spool.seek_to(2).unwrap();
+        spool.park();
+        spool.write_all(b"XY").unwrap();
+        spool.park();
+        spool.write_all(b"Z").unwrap();
+        assert_eq!(spool.len(), 6);
+        let mut bytes = Vec::new();
+        spool.copy_range_to(1, 4, &mut bytes).unwrap();
+        assert_eq!(bytes, b"bXYZ");
+        struct FailingSink;
+        impl Write for FailingSink {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        assert!(spool.copy_to(&mut FailingSink).is_err());
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        assert!(spool.file.is_none());
+        assert!(spool.copy_range_to(0, 7, &mut Vec::new()).is_err());
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        assert!(spool.file.is_none());
+        bytes.clear();
+        spool.copy_to(&mut bytes).unwrap();
+        assert_eq!(bytes, b"abXYZf");
+        drop(spool);
+        assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
     }
 
     #[test]
