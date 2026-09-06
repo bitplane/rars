@@ -606,7 +606,9 @@ fn prepare_member(
             .redirection
             .as_ref()
             .map_or(member.input_size, |link| {
-                crate::filename::decode_rar50(&link.target_name).len() as u64
+                entry.redirection_size.unwrap_or_else(|| {
+                    crate::filename::decode_rar50(&link.target_name).len() as u64
+                })
             }),
         Some(data_crc32),
         entry.attributes,

@@ -135,3 +135,68 @@ fn links_survive_solid_and_encrypted_output_and_unix_byte_mapping() {
         );
     }
 }
+
+#[test]
+fn retains_windows_links_and_file_copy_records() {
+    let mut seed = Builder::new(ArchiveVersion::Rar50).store(true);
+    seed.add_unix_symlink(b"link".to_vec(), b"target".to_vec(), false, None, None)
+        .unwrap();
+    let seed = ArchiveReader::read_owned(seed.to_bytes().unwrap())
+        .unwrap()
+        .members()
+        .next()
+        .unwrap();
+    for kind in [2, 3, 4, 5] {
+        let mut member = seed.clone();
+        member.meta.host_os = Some(0);
+        member.meta.is_directory = kind == 3;
+        member.meta.file_attr = match kind {
+            2 => 0x400,
+            3 => 0x410,
+            _ => 0x20,
+        };
+        member.meta.unpacked_size = if kind >= 4 { 7 } else { 0 };
+        if let rars::ArchiveMemberDetail::Rar50Plus {
+            redirection: Some(link),
+            ..
+        } = &mut member.detail
+        {
+            link.redirection_type = kind;
+            link.flags = u64::from(kind == 3);
+        }
+        let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+        builder
+            .add_bytes(b"target".to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+        builder.add_archive_redirection(&member).unwrap();
+        let output = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        assert!(
+            output.rewrite_preservation_issues().is_empty(),
+            "{kind}: {:?}",
+            output.rewrite_preservation_issues()
+        );
+        let actual = output.members().nth(1).unwrap();
+        assert_eq!(
+            actual.supported_redirection(),
+            member.supported_redirection()
+        );
+        assert_eq!(actual.meta.unpacked_size, member.meta.unpacked_size);
+        assert_eq!(actual.meta.file_attr, member.meta.file_attr);
+        if kind >= 4 {
+            builder.rename(b"target", b"renamed".to_vec()).unwrap();
+            let output = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+            assert_eq!(
+                output
+                    .members()
+                    .nth(1)
+                    .unwrap()
+                    .supported_redirection()
+                    .unwrap()
+                    .target_name,
+                b"renamed"
+            );
+            builder.remove(b"renamed").unwrap();
+            assert!(builder.to_bytes().is_err());
+        }
+    }
+}

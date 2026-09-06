@@ -86,6 +86,7 @@ struct BuilderEntry {
     mtime_nanoseconds: Option<u32>,
     file_comment: Option<Vec<u8>>,
     redirection: Option<rar50::FileRedirection>,
+    redirection_size: Option<u64>,
     attributes: EntryAttributes,
 }
 
@@ -282,6 +283,7 @@ impl Builder {
             mtime_nanoseconds: None,
             file_comment: None,
             redirection: None,
+            redirection_size: None,
             attributes: mode.map_or(
                 EntryAttributes::Dos(u64::from(DOS_ARCHIVE_ATTR)),
                 EntryAttributes::Unix,
@@ -308,6 +310,7 @@ impl Builder {
             mtime_nanoseconds: None,
             file_comment: None,
             redirection: None,
+            redirection_size: None,
             attributes: mode.map_or(
                 EntryAttributes::Dos(u64::from(DOS_ARCHIVE_ATTR)),
                 EntryAttributes::Unix,
@@ -338,6 +341,7 @@ impl Builder {
             mtime_nanoseconds: None,
             file_comment: None,
             redirection: None,
+            redirection_size: None,
             attributes: mode.map_or(EntryAttributes::Dos(0x10), |mode| {
                 EntryAttributes::Unix((mode & 0o7777) | 0o040000)
             }),
@@ -375,8 +379,72 @@ impl Builder {
             mtime_nanoseconds: None,
             file_comment: None,
             redirection: Some(link),
+            redirection_size: None,
             attributes: EntryAttributes::Unix(0o120000 | (mode.unwrap_or(0o777) & 0o7777)),
         })
+    }
+
+    /// Retain a supported RAR5 redirection and its header metadata, without
+    /// reading a target. Archive-internal targets are checked before output.
+    pub fn add_archive_redirection(&mut self, member: &crate::ArchiveMember) -> Result<()> {
+        let link = member
+            .supported_redirection()
+            .ok_or(Error::InvalidArgument("unsupported redirection metadata"))?;
+        if self.format.family() != ArchiveFamily::Rar50Plus || self.volume_size.is_some() {
+            return Err(Error::InvalidArgument(
+                "redirections require single-archive RAR5/7 output",
+            ));
+        }
+        let meta = &member.meta;
+        self.push(BuilderEntry {
+            name: self.validate_name(meta.name.clone())?,
+            data: Vec::new(),
+            source: None,
+            is_directory: meta.is_directory,
+            mtime: meta.file_time,
+            mtime_nanoseconds: meta.mtime_refinement.map(|time| time.nanoseconds),
+            file_comment: None,
+            redirection: Some(link.clone()),
+            redirection_size: Some(meta.unpacked_size),
+            attributes: if meta.host_os == Some(1) {
+                EntryAttributes::Unix(meta.file_attr as u32)
+            } else {
+                EntryAttributes::Dos(meta.file_attr)
+            },
+        })
+    }
+
+    fn check_redirection_targets(&self) -> Result<()> {
+        if !self.entries.iter().any(|entry| {
+            entry
+                .redirection
+                .as_ref()
+                .is_some_and(|link| link.redirection_type >= 4)
+        }) {
+            return Ok(());
+        }
+        let mut preceding = std::collections::HashMap::new();
+        for entry in &self.entries {
+            let size = entry.redirection_size.unwrap_or(match &entry.source {
+                Some(source) => source.len()?,
+                None => entry.data.len() as u64,
+            });
+            if let Some(link) = &entry.redirection {
+                if link.redirection_type >= 4 && preceding.get(&link.target_name) != Some(&size) {
+                    return Err(Error::InvalidArgument("hard-link and file-copy targets must precede the link and have the same size")
+                        .at_entry(entry.name.clone(), "validating redirection target"));
+                }
+            }
+            if !entry.is_directory
+                && entry
+                    .redirection
+                    .as_ref()
+                    .is_none_or(|link| link.redirection_type >= 4)
+            {
+                preceding.insert(entry.name.clone(), size);
+            }
+        }
+        Ok(())
     }
 
     /// Add nanosecond precision to a queued RAR5/7 modification time.
@@ -452,7 +520,11 @@ impl Builder {
                 operation: "setting DOS attributes",
                 source: Box::new(Error::EntryNotFound),
             })?;
-        if entry.redirection.is_some() {
+        if entry
+            .redirection
+            .as_ref()
+            .is_some_and(|link| link.redirection_type == 1)
+        {
             return Err(Error::InvalidArgument(
                 "Unix symbolic links require Unix attributes",
             ));
@@ -539,6 +611,13 @@ impl Builder {
             })?;
         if old != new {
             self.reject_duplicate_name(&new)?;
+        }
+        for entry in &mut self.entries {
+            if let Some(link) = &mut entry.redirection {
+                if link.redirection_type >= 4 && link.target_name == old {
+                    link.target_name = new.clone();
+                }
+            }
         }
         self.entries[index].name = new;
         Ok(())
@@ -681,6 +760,7 @@ impl Builder {
     }
 
     fn check_single(&self) -> Result<()> {
+        self.check_redirection_targets()?;
         if self.entries.is_empty() {
             return Err(Error::InvalidArgument("archive builder has no entries"));
         }
@@ -762,6 +842,7 @@ impl Builder {
                 let built = rar50::ArchiveEntry::new(entry.name.clone(), source)
                     .with_directory(entry.is_directory)
                     .with_redirection(entry.redirection.clone())
+                    .with_redirection_size(entry.redirection_size)
                     .with_mtime(entry.mtime)
                     .with_mtime_nanoseconds(entry.mtime_nanoseconds)
                     .with_attributes(entry.rar50_attr())

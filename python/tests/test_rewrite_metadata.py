@@ -79,11 +79,23 @@ def test_rewritten_directories_extract_with_unrar(tmp_path):
     assert (output / "nested/file").read_bytes() == b"payload"
 
 
-@pytest.mark.parametrize("fixture", ["hardlink.rar", "rarfile_hlink.rar"])
-def test_rewrite_rejects_redirections_before_writing(fixture):
+@pytest.mark.parametrize("fixture, target, link", [
+    ("hardlink.rar", "file.txt", "hardlink.txt"),
+    ("rarfile_hlink.rar", "stest1.txt", "stest2.txt"),
+])
+def test_rewrite_retains_hard_links_and_updates_internal_targets(tmp_path, fixture, target, link):
     source = ROOT / "crates/rars/tests/fixtures/rar50/wild" / fixture
-    with pytest.raises(rars.UnsupportedRarFeature, match="cannot rewrite special entry"):
-        rars.RarBuilder.from_archive(source)
+    rewritten = rars.RarBuilder.from_archive(source)
+    rewritten.rename(target, "renamed")
+    output = rars.RarFile.from_bytes(rewritten.to_bytes())
+    assert output.readlink(link) == b"renamed"
+    assert output.read("renamed") == rars.RarFile(source).read(target)
+    destination = tmp_path / "existing.rar"
+    destination.write_bytes(b"existing archive")
+    rewritten.remove("renamed")
+    with pytest.raises(ValueError, match="targets must precede"):
+        rewritten.write(destination)
+    assert destination.read_bytes() == b"existing archive"
 
 
 def test_rewrite_converts_reference_unix_symlink_archive():

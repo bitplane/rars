@@ -69,8 +69,10 @@ pub struct ArchiveEntry {
     pub source: EntrySource,
     /// Explicit directory entry; its source must be empty.
     pub is_directory: bool,
-    /// Optional Unix symbolic link metadata; the source must be empty.
+    /// Optional redirection metadata; the source must be empty.
     pub redirection: Option<super::FileRedirection>,
+    /// Logical size from a retained redirection header.
+    pub redirection_size: Option<u64>,
     pub mtime: Option<u32>,
     /// Optional nanosecond fraction; requires mtime and a value below one second.
     pub mtime_nanoseconds: Option<u32>,
@@ -115,6 +117,7 @@ impl ArchiveEntry {
             source,
             is_directory: false,
             redirection: None,
+            redirection_size: None,
             mtime: None,
             mtime_nanoseconds: None,
             attributes: 0,
@@ -126,6 +129,11 @@ impl ArchiveEntry {
 
     pub fn with_directory(mut self, is_directory: bool) -> Self {
         self.is_directory = is_directory;
+        self
+    }
+
+    pub fn with_redirection_size(mut self, size: Option<u64>) -> Self {
+        self.redirection_size = size;
         self
     }
 
@@ -944,14 +952,19 @@ fn validate_file_entry(name: &[u8]) -> Result<()> {
 fn validate_entry(entry: &ArchiveEntry) -> Result<()> {
     validate_file_entry(&entry.name)?;
     if let Some(link) = &entry.redirection {
-        if !link.is_supported_unix_symlink()
-            || entry.host_os != 1
-            || entry.attributes & !0o7777 != 0o120000
-            || entry.is_directory
+        if !link.supports_header(entry.host_os, entry.attributes, entry.is_directory)
+            || (link.redirection_type >= 4 && entry.redirection_size.is_none())
             || entry.source.len()? != 0
         {
-            return Err(Error::InvalidArgument("symbolic links require a supported Unix target, link attributes and empty contents"));
+            return Err(Error::InvalidArgument(
+                "redirections require supported target metadata and empty contents",
+            ));
         }
+    }
+    if entry.redirection.is_none() && entry.redirection_size.is_some() {
+        return Err(Error::InvalidArgument(
+            "redirection size requires a redirection record",
+        ));
     }
     if entry.is_directory && entry.source.len()? != 0 {
         return Err(Error::InvalidHeader(

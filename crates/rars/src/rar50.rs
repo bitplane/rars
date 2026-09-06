@@ -221,6 +221,41 @@ pub struct FileRedirection {
 }
 
 impl FileRedirection {
+    /// Validates the redirection kinds whose metadata the writer can retain.
+    pub fn is_supported(&self) -> bool {
+        (1..=5).contains(&self.redirection_type)
+            && self.flags & !1 == 0
+            && (self.redirection_type < 4 || self.flags == 0)
+            && !self.target_name.is_empty()
+            && !self.target_name.contains(&0)
+            && std::str::from_utf8(&self.target_name).is_ok()
+    }
+
+    pub(crate) fn supports_header(&self, host: u64, attr: u64, directory: bool) -> bool {
+        if !self.is_supported() {
+            return false;
+        }
+        match self.redirection_type {
+            1 => host == 1 && attr & !0o7777 == 0o120000 && !directory,
+            2 | 3 => {
+                host == 0
+                    && attr & 0x400 != 0
+                    && (attr & 0x10 != 0) == directory
+                    && (self.redirection_type != 3 || self.flags == 1)
+                    && directory == (self.flags & 1 != 0)
+            }
+            4 | 5 => {
+                !directory
+                    && match host {
+                        0 => attr & (0x400 | 0x10) == 0,
+                        1 => attr & !0o7777 == 0o100000,
+                        _ => false,
+                    }
+            }
+            _ => false,
+        }
+    }
+
     /// Whether this target can be emitted by the Unix symbolic link writer.
     /// Targets use RAR5 wire bytes and are never resolved against the filesystem.
     pub fn is_supported_unix_symlink(&self) -> bool {
@@ -1344,7 +1379,7 @@ fn parse_file_extra_area(
             }
             FHEXTRA_REDIR => {
                 let link = parse_file_redirection_record(input, data)?;
-                file.rewrite_metadata_complete &= !is_service && link.is_supported_unix_symlink();
+                file.rewrite_metadata_complete &= !is_service && link.is_supported();
                 file.redirection = Some(link);
             }
             FHEXTRA_HTIME => {

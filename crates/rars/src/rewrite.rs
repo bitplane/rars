@@ -118,9 +118,23 @@ impl Archive {
             issues.push("SFX executable prefix".into());
         }
         let mut names = HashSet::new();
+        let mut link_targets = std::collections::HashMap::new();
         for (index, member) in self.members().enumerate() {
             let meta = &member.meta;
             let label = format!("member {index} ({:?})", String::from_utf8_lossy(&meta.name));
+            let link = member.supported_redirection();
+            if let Some(link) = link.filter(|link| link.redirection_type >= 4) {
+                if link_targets.get(&link.target_name) != Some(&meta.unpacked_size) {
+                    issues.push(format!(
+                        "{label}: missing, forward or inconsistent redirection target"
+                    ));
+                }
+            }
+            if !meta.is_directory
+                && (!meta.is_redirection || link.is_some_and(|link| link.redirection_type >= 4))
+            {
+                link_targets.insert(meta.name.clone(), meta.unpacked_size);
+            }
             if !names.insert(meta.name.clone()) {
                 issues.push(format!("{label}: duplicate name"));
             }
@@ -136,7 +150,7 @@ impl Archive {
             if meta.attr_source() == AttrSource::Unknown {
                 issues.push(format!("{label}: unknown host attributes"));
             }
-            if special_entry(meta) && member.unix_symlink().is_none() {
+            if special_entry(meta) && member.supported_redirection().is_none() {
                 issues.push(format!("{label}: special entry type or directory contents"));
             }
             if (meta.attr_source() == AttrSource::Unix
@@ -279,6 +293,24 @@ pub(crate) fn special_entry(meta: &ArchiveMemberMeta) -> bool {
 }
 
 impl crate::ArchiveMember {
+    /// A redirection whose known kind and header metadata can be retained.
+    pub fn supported_redirection(&self) -> Option<&crate::rar50::FileRedirection> {
+        let crate::ArchiveMemberDetail::Rar50Plus {
+            redirection: Some(link),
+            ..
+        } = &self.detail
+        else {
+            return None;
+        };
+        (link.supports_header(
+            self.meta.host_os?,
+            self.meta.file_attr,
+            self.meta.is_directory,
+        ) && (link.redirection_type != 1 || self.unix_symlink().is_some())
+            && self.meta.packed_size == 0)
+            .then_some(link)
+    }
+
     /// Supported RAR5 Unix symbolic link metadata. No filesystem lookup occurs.
     pub fn unix_symlink(&self) -> Option<&crate::rar50::FileRedirection> {
         let crate::ArchiveMemberDetail::Rar50Plus {

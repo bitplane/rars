@@ -32,7 +32,7 @@ the separate password argument.
 | Timestamps | Modification time retained, including legacy odd seconds/fractions and RAR5 HTIME Unix/FILETIME fractions and explicit epoch | Preserve additional timestamp kinds using the established local-zone interpretation for legacy DOS times |
 | Attributes and host OS | Unix permission/special bits and DOS file flags retained using source host rules; unknown hosts use default DOS archive attributes | Preserve supported attributes with their source meaning; reject unsupported host semantics |
 | Archive comment | Copied as decoded comment bytes | Preserve comment content |
-| Links and special entries | RAR5 Unix symbolic links retained with target bytes and directory-target flag; other redirections, legacy links and special entries rejected before writing | Preserve supported types; reject unsupported preservation |
+| Links and special entries | RAR5 Unix/Windows symbolic links, junctions, hard links and file-copy records retained; legacy links and other special entries rejected before writing | Preserve supported types; reject unsupported preservation |
 | File comments | Decoded comments copied, including explicit empty comments; supported RAR5 CMT records pass preflight | Preserve supported comment content |
 | Other metadata | No faithful preservation contract | Preserve supported records; reject unsupported preservation |
 | Archive format | Always writes RAR5 | Preserve supported format semantics; exact creating release may be unknowable |
@@ -67,10 +67,13 @@ not change that existing traversal policy.
 mtime=None, mode=None)` queues a RAR5/7 Unix symbolic link. The target is stored
 as metadata without being followed, so dangling links are supported. `mode`
 defaults to `0o777`; link type bits are retained separately from permissions.
-`RarFile.readlink(member)` returns the raw target bytes of a supported Unix link.
+`RarFile.readlink(member)` returns the raw target bytes of a supported RAR5 redirection.
 Targets use the [RAR5 wire encoding](https://www.rarlab.com/technote.htm), including
 its Unix byte mapping, and must be nonempty and contain no NUL. Relative targets
 are retained verbatim: renaming a link or its target does not retarget the link.
+Hard-link and file-copy targets follow member renames. Writing rejects missing,
+forward or size-inconsistent archive targets, including targets removed by edits.
+Windows symbolic links and junctions retain their original target bytes and flags.
 Link volume output is currently rejected. Rewriting does not change extraction's
 existing policy for creating filesystem links.
 

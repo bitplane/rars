@@ -442,7 +442,7 @@ impl RarFile {
             .map_err(map_error)
     }
 
-    /// Returns the raw RAR5 target of a supported Unix symbolic link.
+    /// Returns the raw RAR5 target of a supported redirection.
     /// This reads archive metadata and never follows the link.
     fn readlink(&self, member: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
         let name = member_name_bytes(member)?;
@@ -452,11 +452,9 @@ impl RarFile {
             .find(|member| member.meta.name == name)
             .ok_or_else(|| PyKeyError::new_err("member not found"))?;
         member
-            .unix_symlink()
+            .supported_redirection()
             .map(|link| link.target_name.clone())
-            .ok_or_else(|| {
-                UnsupportedRarFeature::new_err("member is not a supported Unix symbolic link")
-            })
+            .ok_or_else(|| UnsupportedRarFeature::new_err("member is not a supported redirection"))
     }
 
     /// Metadata/settings the current rewrite implementation cannot preserve.
@@ -687,7 +685,8 @@ impl RarBuilder {
         };
         for ((member_index, member), comment) in archive.archive.members().enumerate().zip(comments)
         {
-            let link = member.unix_symlink().cloned();
+            let link = member.supported_redirection().cloned();
+            let retained_link = link.as_ref().map(|_| member.clone());
             let info = member.meta;
             // A builder mode is Unix metadata, not generic archive attributes.
             // Reuse extraction's host rules: e.g. legacy host 1 is DOS, but
@@ -723,16 +722,10 @@ impl RarBuilder {
                 .map_err(|_| {
                     PyValueError::new_err("modification time exceeds the RAR5 timestamp range")
                 })?;
-            if let Some(link) = link {
+            if let Some(member) = retained_link {
                 builder
                     .inner
-                    .add_unix_symlink(
-                        info.name.clone(),
-                        link.target_name,
-                        link.flags & 1 != 0,
-                        mtime,
-                        mode,
-                    )
+                    .add_archive_redirection(&member)
                     .map_err(map_builder_error)?;
             } else if info.is_directory {
                 builder
