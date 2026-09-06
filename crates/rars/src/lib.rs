@@ -36,6 +36,7 @@ mod extraction_control;
 pub mod rar13;
 pub mod rar15_40;
 pub mod rar50;
+mod reader_scratch;
 #[doc(hidden)]
 pub mod recovery;
 mod rewrite;
@@ -58,6 +59,7 @@ pub use features::{Feature, FeatureSet};
 pub use filter::{
     formats_supporting_filter, FilterKind, FilterPolicy, FilterSpec, UnsupportedFilterKind,
 };
+pub use reader_scratch::Rar50Scratch;
 use std::io::{Read, Write};
 use std::path::Path;
 pub use streaming::{
@@ -104,10 +106,16 @@ pub struct ArchiveReadOptions<'a> {
     /// Optional RAR 5 whole-member buffered decode limit, including logical
     /// members split across volumes. This does not bound decoder dictionaries.
     ///
-    /// Filtered RAR 5 members need whole-member transforms. Compressed members
-    /// above this limit use the streaming path and reject filtered streams
-    /// with a typed buffered-decode-limit error instead of buffering the full member.
+    /// Compressed members above this limit use the streaming path. Without
+    /// `rar50_scratch`, filtered streams return a typed buffered-decode-limit
+    /// error. With scratch enabled, member bytes and filter records live on disk
+    /// and each filter uses the scratch policy's separate workspace limit.
     pub rar50_buffered_decode_limit: Option<u64>,
+    /// Optional disk-backed decoding above the whole-member buffering threshold.
+    /// Uses separate scratch-disk and filter-workspace quotas; it does not bound
+    /// dictionaries or aggregate process RAM. Scratch-backed members publish only
+    /// after integrity verification and parallel entry points run sequentially.
+    pub rar50_scratch: Option<&'a Rar50Scratch>,
     /// Inclusive ceiling on a compressed RAR5/7 member's declared dictionary size.
     /// `None` leaves dictionary sizes unrestricted; zero rejects compressed members.
     /// Stored entries, directories and redirections are exempt. This is not a
@@ -217,6 +225,12 @@ impl<'a> ArchiveReadOptions<'a> {
     /// Sets the RAR 5 whole-member buffered decode limit.
     pub fn with_rar50_buffered_decode_limit(mut self, limit: u64) -> Self {
         self.rar50_buffered_decode_limit = Some(limit);
+        self
+    }
+
+    /// Enables caller-configured disk scratch for large RAR5/7 members.
+    pub fn with_rar50_scratch(mut self, scratch: &'a Rar50Scratch) -> Self {
+        self.rar50_scratch = Some(scratch);
         self
     }
 }

@@ -1,3 +1,5 @@
+#[path = "scratch.rs"]
+mod scratch;
 use super::{blake2sp, Archive, ExtractedEntryMeta, FileHeader, FileRedirection};
 use crate::codec::rar50::{DecodeMode, DecodedChunk, StreamDecodeError, Unpack50Decoder};
 use crate::crc32::{crc32, Crc32};
@@ -368,8 +370,12 @@ impl FileHeader {
         keys: Option<&Rar50Keys>,
         decoder: &mut Unpack50Decoder,
         buffered_decode_limit: u64,
+        scratch_policy: Option<&crate::Rar50Scratch>,
         writer: &mut dyn Write,
     ) -> Result<()> {
+        if let Some(policy) = scratch_policy {
+            return scratch::decode(self, packed, keys, decoder, policy, writer);
+        }
         if self.is_stored() {
             return Err(Error::InvalidHeader(
                 "RAR 5 stored file does not use streaming compressed decode",
@@ -562,6 +568,7 @@ impl Archive {
         let mut session =
             DecoderSession::new_with_password(options.password, buffered_decode_limit);
         session.decoder.read_control = budget.control.clone();
+        session.scratch = options.rar50_scratch;
         let solid = selector.is_some()
             && (self.main.is_solid() || self.files().any(|file| file.compression_info & 0x40 != 0));
         for file in self.files() {
@@ -629,6 +636,7 @@ impl Archive {
                 session =
                     DecoderSession::new_with_password(options.password, buffered_decode_limit);
                 session.decoder.read_control = budget.control.clone();
+                session.scratch = options.rar50_scratch;
             }
         }
         options.check_cancelled()?;
@@ -649,7 +657,8 @@ impl Archive {
     {
         options.check_cancelled()?;
         // Admit and charge total-limited work in archive order before dispatch.
-        if options.max_total_output_bytes.is_some()
+        if options.rar50_scratch.is_some()
+            || options.max_total_output_bytes.is_some()
             || self.main.is_solid()
             || self.files().any(|file| {
                 file.is_split_before()
@@ -732,6 +741,7 @@ fn decode_parallel_entry(
     let mut data = Vec::new();
     let mut session = DecoderSession::new_with_password(password, buffered_decode_limit);
     session.decoder.read_control = budget.control.clone();
+    session.scratch = options.rar50_scratch;
     budget.run(&file.name, &mut data, |writer| {
         session.write_file_to(archive, file, writer)
     })?;
@@ -775,6 +785,7 @@ struct DecoderSession<'a> {
     decoder: Unpack50Decoder,
     password: Option<&'a [u8]>,
     buffered_decode_limit: u64,
+    scratch: Option<&'a crate::Rar50Scratch>,
 }
 
 impl<'a> DecoderSession<'a> {
@@ -783,6 +794,7 @@ impl<'a> DecoderSession<'a> {
             decoder: Unpack50Decoder::new(),
             password,
             buffered_decode_limit,
+            scratch: None,
         }
     }
 
@@ -841,6 +853,7 @@ impl<'a> DecoderSession<'a> {
             keys.as_ref(),
             &mut streaming_decoder,
             self.buffered_decode_limit,
+            self.scratch,
             writer,
         )
         .map_err(|error| file.entry_error("decoding", error))?;
@@ -890,13 +903,23 @@ impl<'a> DecoderSession<'a> {
                 decryptor.map(|decryptor| &decryptor.keys),
                 &mut decoder,
                 self.buffered_decode_limit,
+                self.scratch,
                 writer,
             ))
             .map_err(|error| match error {
                 // Sink/reader I/O and the intentional filter limit must retain their
                 // own meaning. Fragment diagnostics are for decode/integrity failure.
-                error if error.kind() == crate::ErrorKind::Cancelled => error,
-                Error::Io(_) | Error::Rar50BufferedDecodeLimitExceeded { .. } => error,
+                error
+                    if matches!(
+                        error.kind(),
+                        crate::ErrorKind::Io
+                            | crate::ErrorKind::ResourceLimit
+                            | crate::ErrorKind::Cancelled
+                            | crate::ErrorKind::UnsupportedFeature
+                    ) =>
+                {
+                    error
+                }
                 error => split.checksum_error(volumes).unwrap_or(error),
             })?;
         self.decoder = decoder;
@@ -969,6 +992,7 @@ where
     let buffered_decode_limit = rar50_buffered_decode_limit(options);
     let mut session = DecoderSession::new_with_password(password, buffered_decode_limit);
     session.decoder.read_control = budget.control.clone();
+    session.scratch = options.rar50_scratch;
 
     for (volume_index, archive) in volumes.iter().enumerate() {
         for (file_index, file) in archive.files().enumerate() {
@@ -2425,6 +2449,7 @@ mod tests {
                 None,
                 &mut decoder,
                 BUFFERED_DECODE_LIMIT,
+                None,
                 &mut out,
             )
             .unwrap_err();

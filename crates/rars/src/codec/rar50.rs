@@ -2764,7 +2764,30 @@ impl Unpack50Decoder {
         output_size: usize,
         dictionary_size: usize,
         solid: bool,
+        sink: impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), StreamDecodeError<E>> {
+        self.decode_to_sink_with_filters(
+            input,
+            algorithm_version,
+            output_size,
+            dictionary_size,
+            solid,
+            sink,
+            None,
+        )
+    }
+
+    // Mirrors the public streaming entry point, adding a filter-record destination.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn decode_to_sink_with_filters<E>(
+        &mut self,
+        input: &mut impl Read,
+        algorithm_version: u8,
+        output_size: usize,
+        dictionary_size: usize,
+        solid: bool,
         mut sink: impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
+        mut filters: Option<&mut dyn FnMut(PendingFilter) -> std::result::Result<(), E>>,
     ) -> std::result::Result<(), StreamDecodeError<E>> {
         self.read_control.check_codec()?;
         let control = self.read_control.clone();
@@ -2815,7 +2838,20 @@ impl Unpack50Decoder {
                 match symbol {
                     0..=255 => output.push(symbol as u8, &mut sink)?,
                     256 => {
-                        return Err(StreamDecodeError::FilteredMember);
+                        let Some(filters) = filters.as_mut() else {
+                            return Err(StreamDecodeError::FilteredMember);
+                        };
+                        let filter = read_filter(&mut bits, output.written())?;
+                        if filter
+                            .start
+                            .checked_add(filter.length)
+                            .is_none_or(|end| end > output_size)
+                        {
+                            return Err(
+                                Error::InvalidData("RAR 5 filter range exceeds output").into()
+                            );
+                        }
+                        filters(filter).map_err(StreamDecodeError::Sink)?;
                     }
                     257 => {
                         if self.last_length != 0 {
@@ -3185,15 +3221,15 @@ impl Default for Unpack50Decoder {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PendingFilter {
-    start: usize,
-    length: usize,
-    filter_type: FilterType,
-    channels: usize,
+pub(crate) struct PendingFilter {
+    pub(crate) start: usize,
+    pub(crate) length: usize,
+    pub(crate) filter_type: FilterType,
+    pub(crate) channels: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FilterType {
+pub(crate) enum FilterType {
     Delta,
     E8,
     E8E9,
@@ -3291,20 +3327,29 @@ fn apply_filters_with_control(
         let data = output
             .get_mut(filter.start..end)
             .ok_or(Error::InvalidData("RAR 5 filter range exceeds output"))?;
-        match filter.filter_type {
-            FilterType::Delta => {
-                let decoded = filters::delta_decode_with_control(
-                    data,
-                    filter.channels,
-                    rar50_delta_messages(),
-                    control,
-                )?;
-                data.copy_from_slice(&decoded);
-            }
-            FilterType::E8 => e8e9_decode_with_control(data, filter.start as u32, false, control)?,
-            FilterType::E8E9 => e8e9_decode_with_control(data, filter.start as u32, true, control)?,
-            FilterType::Arm => arm_decode_with_control(data, filter.start as u32, control)?,
+        apply_filter_data(data, filter, control)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn apply_filter_data(
+    data: &mut [u8],
+    filter: &PendingFilter,
+    control: &crate::read_control::ReadControl,
+) -> Result<()> {
+    match filter.filter_type {
+        FilterType::Delta => {
+            let decoded = filters::delta_decode_with_control(
+                data,
+                filter.channels,
+                rar50_delta_messages(),
+                control,
+            )?;
+            data.copy_from_slice(&decoded);
         }
+        FilterType::E8 => e8e9_decode_with_control(data, filter.start as u32, false, control)?,
+        FilterType::E8E9 => e8e9_decode_with_control(data, filter.start as u32, true, control)?,
+        FilterType::Arm => arm_decode_with_control(data, filter.start as u32, control)?,
     }
     Ok(())
 }

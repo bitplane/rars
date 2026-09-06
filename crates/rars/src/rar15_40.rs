@@ -720,6 +720,8 @@ impl FileHeader {
             | Error::Rar50DictionaryLimitExceeded { .. }
             | Error::Rar50BufferedDecodeLimitExceeded { .. }
             | Error::MemoryLimitExceeded { .. }
+            | Error::Rar50ScratchLimitExceeded { .. }
+            | Error::Rar50FilterMemoryLimitExceeded { .. }
             | Error::UnsupportedFamilyFeature { .. }
             | Error::UnsupportedCompression { .. }
             | Error::UnsupportedEncryption { .. }
