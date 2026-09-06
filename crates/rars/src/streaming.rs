@@ -471,6 +471,40 @@ impl Read for Spool {
     }
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+impl Spool {
+    pub(crate) fn into_source(mut self) -> EntrySource {
+        self.park();
+        let owner = Arc::new(self);
+        EntrySource::from_opener(owner.len(), move || {
+            Ok(Box::new(SpoolReader {
+                file: std::fs::File::open(&owner.path)?,
+                _owner: owner.clone(),
+            }))
+        })
+    }
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+struct SpoolReader {
+    file: std::fs::File,
+    _owner: Arc<Spool>,
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+impl Read for SpoolReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.file.read(buffer)
+    }
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+impl Seek for SpoolReader {
+    fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+        self.file.seek(from)
+    }
+}
+
 impl Seek for Spool {
     fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
         self.pos = self.file()?.seek(from)?;

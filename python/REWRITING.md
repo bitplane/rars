@@ -229,6 +229,10 @@ Caller-owned output streams do not have this rollback guarantee.
 Preservation means supported archive semantics, not identical bytes, compression
 ratio, encoder release, dictionary choices or original solid group boundaries.
 Volume-set rewriting, explicit conversion target settings, unsupported legacy
-metadata/services and header-encrypted quick-open output remain separate work. A bounded
-single-pass rewrite session is also pending; current lazy member reads can repeat
-extraction work for solid archives.
+metadata/services and header-encrypted quick-open output remain separate work.
+Python integration with bounded staging is still pending; current lazy member
+reads can repeat extraction work for solid archives. Rust callers can use
+`Archive::stage_rewrite_sources` with an explicit `RewriteStaging` directory and
+payload byte limit, then pass the verified sources to `Builder::add_source`.
+This stages the selected payloads in one traversal, including necessary solid
+predecessors, before writing; decoder and writer workspace have separate limits.

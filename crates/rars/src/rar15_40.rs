@@ -733,6 +733,7 @@ impl FileHeader {
             | Error::Rar50BufferedDecodeLimitExceeded { .. }
             | Error::MemoryLimitExceeded { .. }
             | Error::Rar50ScratchLimitExceeded { .. }
+            | Error::RewriteStagingLimitExceeded { .. }
             | Error::Rar50FilterMemoryLimitExceeded { .. }
             | Error::UnsupportedFamilyFeature { .. }
             | Error::UnsupportedCompression { .. }

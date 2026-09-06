@@ -144,6 +144,11 @@ pub enum Error {
         limit: u64,
         required: u64,
     },
+    /// Retained rewrite payload bytes, excluding decoder and writer workspace.
+    RewriteStagingLimitExceeded {
+        limit: u64,
+        required: u64,
+    },
     Rar50FilterMemoryLimitExceeded {
         limit: u64,
         required: u64,
@@ -248,6 +253,7 @@ impl std::fmt::Display for Error {
                 "RAR 5 filtered member requires buffered decoding of {required} bytes, above the configured limit of {limit} bytes"
             ),
             Self::Rar50ScratchLimitExceeded { limit, required } => write!(f, "RAR 5 scratch limit {limit} bytes exceeded (requires {required})"),
+            Self::RewriteStagingLimitExceeded { limit, required } => write!(f, "rewrite staging limit {limit} bytes exceeded (requires {required})"),
             Self::Rar50FilterMemoryLimitExceeded { limit, required } => write!(f, "RAR 5 filter workspace limit {limit} bytes exceeded (requires {required})"),
             Self::MemoryLimitExceeded {
                 limit,
@@ -394,6 +400,7 @@ impl Error {
             }
             Self::Io(_) | Self::Rar5Recovery(crate::recovery::rar5::Error::Io(_)) => ErrorKind::Io,
             Self::Rar50ScratchLimitExceeded { .. }
+            | Self::RewriteStagingLimitExceeded { .. }
             | Self::Rar50FilterMemoryLimitExceeded { .. }
             | Self::MemoryLimitExceeded { .. }
             | Self::MemberOutputLimitExceeded { .. }

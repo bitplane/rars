@@ -41,6 +41,8 @@ mod reader_scratch;
 #[doc(hidden)]
 pub mod recovery;
 mod rewrite;
+mod rewrite_staging;
+pub use rewrite_staging::RewriteStaging;
 mod source;
 mod streaming;
 pub mod timestamp;
