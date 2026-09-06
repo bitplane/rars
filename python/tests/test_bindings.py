@@ -51,9 +51,8 @@ def test_builder_creates_archive_and_rewrite_model():
 
 
 @pytest.mark.parametrize("encrypted", [False, True])
-def test_from_archive_current_conversion_contract(encrypted):
-    # Characterize the existing conversion API before introducing preservation.
-    # In particular, an input password currently does not encrypt the output.
+def test_from_archive_explicit_conversion_contract(encrypted):
+    # Explicit conversion retains the old settings, including removing encryption.
     password = "rewrite secret" if encrypted else None
     builder = rars.RarBuilder(
         format="rar29", store=True, password=password, comment=b"keep this comment"
@@ -65,7 +64,7 @@ def test_from_archive_current_conversion_contract(encrypted):
     assert source.family == "rar15_40"
     assert source.needs_password == encrypted
 
-    output = rars.RarFile.from_bytes(rars.RarBuilder.from_archive(source).to_bytes())
+    output = rars.RarFile.from_bytes(rars.RarBuilder.from_archive(source, preserve=False).to_bytes())
 
     assert output.family == "rar50_plus"
     assert not output.needs_password
@@ -82,7 +81,7 @@ def test_from_archive_interprets_permissions_using_source_host(format, mode):
     builder = rars.RarBuilder(format=format, store=True)
     builder.add_bytes(b"permissions payload", "file.txt", mode=mode)
     source = rars.RarFile.from_bytes(builder.to_bytes())
-    output = rars.RarFile.from_bytes(rars.RarBuilder.from_archive(source).to_bytes())
+    output = rars.RarFile.from_bytes(rars.RarBuilder.from_archive(source, preserve=False).to_bytes())
     info = output.getinfo("file.txt")
 
     # RAR 1.4/1.5 writers deliberately emit DOS metadata even for Unix input.
@@ -106,7 +105,7 @@ def test_from_archive_permissions_match_reference_extraction(tmp_path, format, m
     builder.add_bytes(b"permissions payload", "file.txt", mode=mode)
     source = rars.RarFile.from_bytes(builder.to_bytes())
     archive_path = tmp_path / "rewritten.rar"
-    rars.RarBuilder.from_archive(source).write(archive_path)
+    rars.RarBuilder.from_archive(source, preserve=False).write(archive_path)
     output = tmp_path / "output"
     output.mkdir()
 
@@ -138,7 +137,7 @@ def test_from_archive_retains_rar5_modification_time(format, mtime):
 @pytest.mark.skipif(os.name != "posix" or not shutil.which("unrar"), reason="requires POSIX and unrar")
 def test_from_archive_retains_fixture_htime_with_reference_extractor(tmp_path):
     rewritten = tmp_path / "rewritten.rar"
-    rars.RarBuilder.from_archive(RAR50_STORED).write(rewritten)
+    rars.RarBuilder.from_archive(RAR50_STORED, preserve=False).write(rewritten)
     times = []
     for index, archive in enumerate((RAR50_STORED, rewritten)):
         output = tmp_path / str(index)

@@ -22,7 +22,7 @@ def test_rewrite_rejects_duplicate_source_names_explicitly():
     archive = rars.RarFile.from_bytes(_rewrite_name(source.to_bytes(), b"two.txt", b"one.txt"))
     assert archive.namelist() == ["one.txt", "one.txt"]
     with pytest.raises(ValueError, match="duplicate member name.*one.txt"):
-        rars.RarBuilder.from_archive(archive)
+        rars.RarBuilder.from_archive(archive, preserve=False)
 
 
 def test_rewrite_source_indices_survive_directory_and_file_edits():
@@ -85,7 +85,7 @@ def test_rewritten_directories_extract_with_unrar(tmp_path):
 ])
 def test_rewrite_retains_hard_links_and_updates_internal_targets(tmp_path, fixture, target, link):
     source = ROOT / "crates/rars/tests/fixtures/rar50/wild" / fixture
-    rewritten = rars.RarBuilder.from_archive(source)
+    rewritten = rars.RarBuilder.from_archive(source, preserve=False)
     rewritten.rename(target, "renamed")
     output = rars.RarFile.from_bytes(rewritten.to_bytes())
     assert output.readlink(link) == b"renamed"
@@ -100,7 +100,7 @@ def test_rewrite_retains_hard_links_and_updates_internal_targets(tmp_path, fixtu
 
 def test_rewrite_converts_reference_unix_symlink_archive():
     source = rars.RarFile(ROOT / "crates/rars/tests/fixtures/rar50/wild/symlink.rar")
-    rewritten = rars.RarFile.from_bytes(rars.RarBuilder.from_archive(source).to_bytes())
+    rewritten = rars.RarFile.from_bytes(rars.RarBuilder.from_archive(source, preserve=False).to_bytes())
     assert rewritten.readlink("symlink.txt") == source.readlink("symlink.txt") == b"file.txt"
     assert rewritten.readlink("dirlink") == source.readlink("dirlink") == b"dir"
     assert rewritten.read("file.txt") == source.read("file.txt")
@@ -113,7 +113,7 @@ def test_rewrite_rejects_unix_special_file_modes(kind):
     archive = rars.RarFile.from_bytes(source.to_bytes())
     assert archive.read("special") == b"special payload"
     with pytest.raises(rars.UnsupportedRarFeature, match="special"):
-        rars.RarBuilder.from_archive(archive)
+        rars.RarBuilder.from_archive(archive, preserve=False)
 
 
 @pytest.mark.skipif(os.name != "posix" or not shutil.which("unrar"), reason="requires POSIX and unrar")
@@ -124,7 +124,7 @@ def test_legacy_rewrite_uses_extractions_local_zone_and_odd_second(tmp_path, zon
     env = dict(os.environ, TZDIR=str(ROOT / "crates/rars/tests/fixtures/tz"), TZ=zone)
     # Zone state is cached once per process, just as in CLI extraction.
     subprocess.run(
-        [sys.executable, "-c", "import rars,sys; rars.RarBuilder.from_archive(sys.argv[1]).write(sys.argv[2])",
+        [sys.executable, "-c", "import rars,sys; rars.RarBuilder.from_archive(sys.argv[1], preserve=False).write(sys.argv[2])",
          str(source), str(rewritten)], env=env, check=True, capture_output=True,
     )
     times = []
@@ -241,7 +241,7 @@ def test_legacy_unix_link_targets_are_converted_without_utf8_loss(format):
     source.add_bytes(b"payload", b"file-\xff", mode=0o100640)
     archive = rars.RarFile.from_bytes(source.to_bytes())
     assert archive.readlink(b"link-\xff") == b"missing-\xff"
-    output = rars.RarFile.from_bytes(rars.RarBuilder.from_archive(archive).to_bytes())
+    output = rars.RarFile.from_bytes(rars.RarBuilder.from_archive(archive, preserve=False).to_bytes())
     link_name = "\ufffelink-\ue0ff".encode()
     file_name = "\ufffefile-\ue0ff".encode()
     assert output.readlink(link_name) == "\ufffemissing-\ue0ff".encode()
@@ -254,4 +254,4 @@ def test_invalid_legacy_link_targets_are_rejected(target):
     source = rars.RarBuilder(format="rar29", store=True)
     source.add_bytes(target, "link", mode=0o120777)
     with pytest.raises(ValueError, match="link target"):
-        rars.RarBuilder.from_archive(rars.RarFile.from_bytes(source.to_bytes()))
+        rars.RarBuilder.from_archive(rars.RarFile.from_bytes(source.to_bytes()), preserve=False)

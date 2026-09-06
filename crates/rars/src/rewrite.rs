@@ -320,9 +320,6 @@ impl Archive {
                 {
                     issues.push("main header metadata, extra records or unknown flags".into());
                 }
-                if main.encrypted_headers && !archive.files().any(|file| file.encrypted) {
-                    issues.push("header encryption without encrypted members".into());
-                }
                 let mut derived_services = HashSet::new();
                 for extra in &main.extras {
                     if let crate::rar50::MainExtraRecord::ArchiveMetadata(metadata) = extra {

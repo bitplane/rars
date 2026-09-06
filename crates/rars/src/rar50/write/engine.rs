@@ -38,6 +38,7 @@ pub(super) struct EnginePlan<'a> {
     pub(super) method: u8,
     pub(super) recovery_percent: Option<u64>,
     pub(super) header_encrypted: bool,
+    pub(super) header_password: Option<&'a [u8]>,
     pub(super) archive_comment: Option<ArchiveCommentPlan<'a>>,
     pub(super) archive_metadata: Option<crate::rar50::ArchiveMetadataEntry<'a>>,
     pub(super) metadata_record: Option<&'a crate::rar50::ArchiveMetadataRecord>,
@@ -164,7 +165,9 @@ pub(super) fn write_archive(
 
     let header_keys = if plan.header_encrypted {
         let password = header_encryption_password(
-            entries.iter().filter_map(|entry| entry.password.as_deref()),
+            plan.header_password
+                .into_iter()
+                .chain(entries.iter().filter_map(|entry| entry.password.as_deref())),
         )?;
         Some(header_encryption_keys(password)?)
     } else {
@@ -1017,7 +1020,9 @@ pub(super) fn write_volumes(
 
     let header_keys = if plan.header_encrypted {
         let password = header_encryption_password(
-            entries.iter().filter_map(|entry| entry.password.as_deref()),
+            plan.header_password
+                .into_iter()
+                .chain(entries.iter().filter_map(|entry| entry.password.as_deref())),
         )?;
         Some(header_encryption_keys(password)?)
     } else {

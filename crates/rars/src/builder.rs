@@ -891,7 +891,7 @@ impl Builder {
                 "archive metadata settings require the RAR5/7 streaming writer",
             ));
         }
-        if self.entries.is_empty() {
+        if self.entries.is_empty() && !self.streams_rar50() {
             return Err(Error::InvalidArgument("archive builder has no entries"));
         }
         if self.volume_size.is_some() {
@@ -1021,6 +1021,9 @@ impl Builder {
             .with_filter_policy(self.rar50_filter_policy());
         extras.metadata_record = self.archive_metadata.as_ref();
         extras.locked = self.locked;
+        if self.encrypt_headers {
+            extras.header_password = self.password.as_deref();
+        }
         if let Some(comment) = self.comment.as_deref() {
             extras = match self.comment_password.as_deref() {
                 Some(password) => extras.with_encrypted_comment(comment, password),
@@ -1306,6 +1309,69 @@ fn unix_mode(_metadata: &fs::Metadata) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_rewrites_retain_archive_settings() {
+        for format in [ArchiveVersion::Rar50, ArchiveVersion::Rar70] {
+            for encrypted in [false, true] {
+                let password = encrypted.then_some(b"secret".as_slice());
+                let builder = Builder::new(format)
+                    .solid(true)
+                    .password(password.map(<[u8]>::to_vec))
+                    .header_encryption(encrypted)
+                    .recovery_percent(Some(5))
+                    .comment(Some(b"comment".to_vec()));
+                let options = crate::ArchiveReadOptions {
+                    password,
+                    ..Default::default()
+                };
+                let archive = crate::ArchiveReader::read_owned_with_options(
+                    builder.to_bytes().unwrap(),
+                    options,
+                )
+                .unwrap();
+                assert!(archive.rewrite_preservation_issues().is_empty());
+                let rewritten = archive
+                    .preserving_builder(password)
+                    .unwrap()
+                    .comment(Some(b"comment".to_vec()))
+                    .to_bytes()
+                    .unwrap();
+                let output =
+                    crate::ArchiveReader::read_owned_with_options(rewritten, options).unwrap();
+                let raw = output.as_rar50().unwrap();
+                assert!(raw.main.is_solid());
+                assert!(raw.main.has_recovery_record());
+                assert_eq!(raw.main.encrypted_headers, encrypted);
+                assert_eq!(raw.files().count(), 0);
+                assert!(output.rewrite_preservation_issues().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn header_encryption_does_not_require_encrypted_members() {
+        let mut builder = Builder::new(ArchiveVersion::Rar50)
+            .password(Some(b"secret".to_vec()))
+            .header_encryption(true);
+        builder
+            .add_bytes(b"plain".to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+        builder.set_entry_encryption(b"plain", None, None).unwrap();
+        let archive = crate::ArchiveReader::read_owned_with_options(
+            builder.to_bytes().unwrap(),
+            crate::ArchiveReadOptions::with_password(b"secret"),
+        )
+        .unwrap();
+        let raw = archive.as_rar50().unwrap();
+        assert!(raw.main.encrypted_headers);
+        assert!(!raw.files().next().unwrap().encrypted);
+        assert_eq!(
+            archive.read_member(b"plain", None).unwrap().unwrap(),
+            b"payload"
+        );
+        assert!(archive.rewrite_preservation_issues().is_empty());
+    }
 
     #[cfg(unix)]
     #[test]

@@ -63,9 +63,10 @@ non-Unicode legacy byte names there still requires caller-selected decoding.
 Python bindings are published to [pypi](https://pypi.org/project/rars/), so you
 can `pip install rars`. To build locally, it's `just python`.
 
-`RarBuilder.from_archive` currently converts to unencrypted RAR5 and does not
-preserve all metadata. See the [rewrite contract](python/REWRITING.md) before
-using it to edit existing archives.
+`RarBuilder.from_archive` preserves supported RAR5/7 metadata and archive settings
+by default, rejecting unsupported preservation. Pass `preserve=False` explicitly
+to convert to unencrypted RAR5, including from older archives. This default change
+is intended for the next minor release; see the [rewrite contract](python/REWRITING.md).
 
 For JS it's built to WebAssembly and published to
 [npm](https://www.npmjs.com/package/@bitplane/rars);

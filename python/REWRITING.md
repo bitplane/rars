@@ -2,22 +2,24 @@
 
 ## Current API
 
-`RarBuilder.from_archive(source, password=None, *, preserve=False)` creates a **conversion builder**:
-RAR5, compression level 3, non-solid, unencrypted, with no recovery or volume
-configuration. It is not yet a metadata-preserving editor. Even a rename rebuilds
-the archive with these settings.
+`RarBuilder.from_archive(source, password=None, *, preserve=True)` creates a
+**preserving rewrite builder**. It retains supported RAR5/7 format requirements,
+solid mode, per-member data and comment encryption, header and archive-comment
+encryption, lock flags, archive name/creation metadata, and regenerated
+quick-open/recovery services. Plaintext members and comments remain plaintext.
+Unsupported preservation raises `UnsupportedRarFeature`; there is no automatic
+fallback to conversion. `RarFile.rewrite_preservation_issues()` lists the gaps.
 
-Use `RarFile.rewrite_preservation_issues()` to inspect unsupported source
-properties. `from_archive(..., preserve=True)` retains supported RAR5/7 format
-requirements, solid mode, per-member data and comment encryption, header
-and archive-comment encryption, lock flags, archive name/creation metadata,
-and regenerated quick-open/recovery services. Member passwords come from the
-input password; plaintext members and comments remain plaintext.
+Use `from_archive(..., preserve=False)` to explicitly convert to RAR5,
+compression level 3, non-solid and unencrypted, without recovery or volume
+configuration. This also remains the route for editing older archives: their
+contents and supported member metadata are converted to RAR5. Legacy RAR format
+preservation is not implemented.
 
 Preservation rejects legacy formats, volume layouts, SFX prefixes, unknown
 compression algorithms, unsupported services and unknown, duplicate or incomplete
-metadata. Header encryption without any encrypted member, and quick-open indexes
-combined with header encryption, remain unsupported writer combinations. Unknown
+metadata. Quick-open indexes combined with header encryption remain an
+unsupported writer combination. Unknown
 metadata remains tolerated during ordinary reading.
 
 This check is about supported metadata semantics. It does not verify payload
@@ -30,7 +32,7 @@ conversion does not enable output encryption. When given an
 existing `RarFile`, the method uses that object's configured password, ignoring
 the separate password argument.
 
-| Property | Current behaviour | Intended preservation behaviour |
+| Property | Rewrite behaviour | Preservation contract |
 | --- | --- | --- |
 | File contents, raw names, order | Copied; builder name validation applies | Preserve retained members and order |
 | Duplicate names | Rejected explicitly before constructing the rewrite builder | Reject until editing duplicate names by identity is supported |
@@ -98,36 +100,40 @@ Windows symbolic links and junctions retain their original target bytes and flag
 Link volume output is currently rejected. Rewriting does not change extraction's
 existing policy for creating filesystem links.
 
-## Agreed direction for the next minor release
+## Compatibility change for the next minor release
 
-Preservation will become the default **after it is implemented and tested**.
-Unsupported preservation must produce an actionable error identifying the
-property before output is written. That includes metadata the reader currently
-discards: absence from the public member model is not evidence of absence in the
-archive. Failed preflight must leave existing destinations intact.
+The default changes from `preserve=False` to `preserve=True`. Callers that need
+the previous conversion behaviour must pass `preserve=False` explicitly:
 
-Conversion will be explicit. It must let callers deliberately select a target
-format and remove encryption or metadata, and retain a documented route to the
-current RAR5 conversion settings. The `preserve` opt-in and existing conversion are available. Explicit conversion
-target/settings overrides, legacy preservation, volume-set rewriting and the
-remaining writer combinations are still separate work.
-The former DOS-to-Unix permission
-reinterpretation was a bug; conversion no longer performs it.
+```python
+# Preserve supported source settings, or raise before emitting output.
+editor = RarBuilder.from_archive(source, password="secret")
 
-Preservation means preserving supported archive semantics, not identical bytes,
-compression ratio, encoder version, dictionary choices or volume boundaries.
-If a format cannot represent retained metadata, preservation must fail instead
-of silently degrading it. Reading and recompression can still fail after a
-successful metadata preflight; preflight is not a substitute for staged output.
+# Explicitly convert, including older archives, to unencrypted RAR5.
+converter = RarBuilder.from_archive(source, password="secret", preserve=False)
+```
 
-Implement this in small steps:
+Existing calls can now require a password for retained encryption or reject
+unsupported source properties. Successful rewrites retain encryption, solid mode
+and supported recovery settings instead of resetting them. This is a minor
+release compatibility change, not a patch release change.
 
-1. Add format-aware metadata adapters and tests for timestamps and attributes.
-2. Represent directories and archive settings, including separate data/header
-   encryption, and detect unsupported records and features before emission.
-3. Extend the opt-in preservation preflight and round-trip tests, then switch
-   the default in the minor release. Cover encrypted, solid, legacy and empty
-   archives, rejection paths and external extraction of emitted metadata.
-4. Replace repeated name-based extraction with stable member indices and a
-   single-pass rewrite session, with bounded temporary storage. Compressed-data
-   reuse can follow once solid dependencies and encryption are handled.
+Empty single-file RAR5/7 archives are supported, including removing the last
+member and retaining archive comments and encrypted headers. An empty archive
+has no member compression algorithm from which to infer a RAR7 requirement;
+the output uses the compatible RAR5 container. Empty legacy/volume output remains
+unsupported.
+
+Preflight checks metadata support; payload reads, password verification and
+recompression can still fail during writing. `write(path)` stages the complete
+archive beside the destination and replaces it only after successful writing.
+An existing destination survives preflight, decoding and write failures. The
+source path can be the destination when it remains unchanged until publication.
+Caller-owned output streams do not have this rollback guarantee.
+
+Preservation means supported archive semantics, not identical bytes, compression
+ratio, encoder release, dictionary choices or original solid group boundaries.
+Legacy format preservation, volume-set rewriting, explicit conversion target
+settings and header-encrypted quick-open output remain separate work. A bounded
+single-pass rewrite session is also pending; current lazy member reads can repeat
+extraction work for solid archives.

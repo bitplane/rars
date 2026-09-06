@@ -356,7 +356,7 @@ pub fn write_streaming_volumes_with_progress(
     if let Some(percent) = extras.recovery_percent {
         validate_recovery_percent(percent)?;
     }
-    if options.features.header_encryption && !encrypted {
+    if options.features.header_encryption && !encrypted && extras.header_password.is_none() {
         return Err(Error::NeedPassword);
     }
 
@@ -379,6 +379,7 @@ pub fn write_streaming_volumes_with_progress(
             method: compression_method_for_level(options.compression_level)?,
             recovery_percent: extras.recovery_percent,
             header_encrypted: options.features.header_encryption,
+            header_password: extras.header_password,
             archive_comment: None,
             archive_metadata: None,
             metadata_record: None,
@@ -403,6 +404,10 @@ pub struct ArchiveExtras<'a> {
     pub comment: Option<&'a [u8]>,
     /// Encrypts the comment. Without it the comment is stored in the clear.
     pub comment_password: Option<&'a [u8]>,
+    /// Password for encrypted headers, including archives without members.
+    /// When omitted, uses the shared member password. When supplied, must
+    /// agree with any member passwords; ignored unless header encryption is set.
+    pub header_password: Option<&'a [u8]>,
     pub metadata: Option<ArchiveMetadataEntry<'a>>,
     /// Complete retained metadata, mutually exclusive with `metadata`.
     pub metadata_record: Option<&'a super::ArchiveMetadataRecord>,
@@ -505,7 +510,7 @@ pub(crate) fn write_streaming_archive_reporting(
     if let Some(percent) = recovery_percent {
         validate_recovery_percent(percent)?;
     }
-    if options.features.header_encryption && !encrypted {
+    if options.features.header_encryption && !encrypted && extras.header_password.is_none() {
         return Err(Error::NeedPassword);
     }
     if options.features.quick_open && options.features.header_encryption {
@@ -534,6 +539,7 @@ pub(crate) fn write_streaming_archive_reporting(
             method: compression_method_for_level(options.compression_level)?,
             recovery_percent,
             header_encrypted: options.features.header_encryption,
+            header_password: extras.header_password,
             archive_comment: match (extras.comment, extras.comment_password) {
                 (Some(data), Some(password)) => {
                     Some(engine::ArchiveCommentPlan::Encrypted { data, password })

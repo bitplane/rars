@@ -663,10 +663,10 @@ impl RarBuilder {
         })
     }
 
-    /// Create a rewrite builder. The default converts to RAR5 level 3,
-    /// non-solid and unencrypted. With preserve=True, supported RAR5/7 format,
+    /// Create a rewrite builder. By default, supported RAR5/7 format,
     /// solid, data/header/comment encryption and archive metadata settings are
     /// retained; unknown or unsupported preservation fails before output.
+    /// Explicit preserve=False converts to RAR5 level 3, non-solid and unencrypted.
     /// File contents, raw names, order, comments, directories, supported links
     /// and modification/creation/access times are copied in both modes.
     /// For an existing RarFile, its configured password is used. Preservation
@@ -674,7 +674,7 @@ impl RarBuilder {
     /// Input files must remain available and unchanged until writing completes.
     /// See python/REWRITING.md for the supported subset and output guarantees.
     #[staticmethod]
-    #[pyo3(signature = (source, password = None, *, preserve = false))]
+    #[pyo3(signature = (source, password = None, *, preserve = true))]
     fn from_archive(
         py: Python<'_>,
         source: &Bound<'_, PyAny>,
@@ -694,7 +694,7 @@ impl RarBuilder {
             let issues = archive.archive.rewrite_preservation_issues();
             if !issues.is_empty() {
                 return Err(UnsupportedRarFeature::new_err(format!(
-                    "cannot preserve archive: {}",
+                    "cannot preserve archive: {}; use preserve=False for explicit RAR5 conversion (archive settings may be lost)",
                     issues.join("; ")
                 )));
             }
