@@ -15,6 +15,26 @@ const BUFFERED_DECODE_LIMIT: u64 = 512 * 1024 * 1024;
 const BUFFERED_DECODE_LIMIT: u64 = 1024;
 
 impl FileHeader {
+    fn check_dictionary_limit(&self, limit: Option<u64>) -> Result<()> {
+        let Some(limit) = limit else {
+            return Ok(());
+        };
+        if self.is_stored() || self.is_directory() || self.redirection.is_some() {
+            return Ok(());
+        }
+        let required = self
+            .decoded_compression_info()
+            .map_err(|error| self.entry_error("checking dictionary limit", error))?
+            .dictionary_size;
+        if required > limit {
+            return Err(self.entry_error(
+                "checking dictionary limit",
+                Error::Rar50DictionaryLimitExceeded { limit, required },
+            ));
+        }
+        Ok(())
+    }
+
     fn crypto_with_password(&self, password: Option<&[u8]>) -> Result<Option<Rar50Keys>> {
         if !self.encrypted {
             return Ok(None);
@@ -497,6 +517,7 @@ impl Archive {
         let mut session =
             DecoderSession::new_with_password(options.password, buffered_decode_limit);
         for file in self.files() {
+            file.check_dictionary_limit(options.rar50_dictionary_size_limit)?;
             if let Some(redirection) = &file.redirection {
                 if emit_redirections {
                     redirect(&file.metadata(), redirection)?;
@@ -556,6 +577,7 @@ impl Archive {
                 batch.push(files.next().expect("peeked file"));
             }
             let entries = crate::parallel::map_collect(batch, |file| {
+                file.check_dictionary_limit(options.rar50_dictionary_size_limit)?;
                 decode_parallel_entry(self, file, password, buffered_decode_limit)
             })?;
             for entry in entries {
@@ -827,6 +849,9 @@ where
 
     for (volume_index, archive) in volumes.iter().enumerate() {
         for (file_index, file) in archive.files().enumerate() {
+            // Admission precedes split decryption and checksum-error preference:
+            // a resource refusal must not read payloads or become a checksum error.
+            file.check_dictionary_limit(options.rar50_dictionary_size_limit)?;
             match split.advance(file.is_split_before(), file.is_split_after()) {
                 SplitVolumeStep::Regular => {
                     if let Some(redirection) = &file.redirection {
@@ -2104,7 +2129,10 @@ mod tests {
         });
         let archive = archive_with_blocks(vec![Block::File(redirect)], Vec::new());
         archive
-            .extract_to(crate::ArchiveReadOptions::default(), never_open)
+            .extract_to(
+                crate::ArchiveReadOptions::default().with_rar50_dictionary_size_limit(0),
+                never_open,
+            )
             .unwrap();
     }
 
@@ -2141,7 +2169,12 @@ mod tests {
             target_name: b"target".to_vec(),
         });
         let volumes = vec![archive_with_blocks(vec![Block::File(redirect)], Vec::new())];
-        extract_volumes_to(&volumes, crate::ArchiveReadOptions::default(), never_open).unwrap();
+        extract_volumes_to(
+            &volumes,
+            crate::ArchiveReadOptions::default().with_rar50_dictionary_size_limit(0),
+            never_open,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2328,6 +2361,51 @@ mod tests {
                     archive.extract_to(crate::ArchiveReadOptions::default(), open)
                 };
                 result.unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn dictionary_limit_checks_declared_sizes_before_opening_output() {
+        for info in [5 << 7, (5 << 7) | 1 | (3 << 15), (5 << 7) | (15 << 10)] {
+            let mut file = plain_file(b"limited", b"", None);
+            file.compression_info = info;
+            let required = file.decoded_compression_info().unwrap().dictionary_size;
+            for solid in [false, true] {
+                file.compression_info = info | if solid { 0x40 } else { 0 };
+                let archive = archive_with_blocks(vec![Block::File(file.clone())], Vec::new());
+                for limit in [None, Some(required), Some(required - 1), Some(0)] {
+                    for parallel in [false, true] {
+                        let options = crate::ArchiveReadOptions {
+                            rar50_dictionary_size_limit: limit,
+                            ..Default::default()
+                        };
+                        let mut opened = false;
+                        let open = |_: &ExtractedEntryMeta| {
+                            opened = true;
+                            Ok(Box::new(std::io::sink()) as Box<dyn Write>)
+                        };
+                        let result = if parallel {
+                            archive.extract_to_parallel_buffered(options, open)
+                        } else {
+                            archive.extract_to(options, open)
+                        };
+                        if let Some(limit) = limit.filter(|limit| *limit < required) {
+                            let error = result.unwrap_err();
+                            assert!(!opened);
+                            assert_eq!(error.kind(), crate::ErrorKind::ResourceLimit);
+                            assert!(
+                                matches!(error.root_cause(), Error::Rar50DictionaryLimitExceeded {
+                                limit: actual, required: size
+                            } if *actual == limit && *size == required)
+                            );
+                            assert_eq!(error.entry_context().unwrap().0, b"limited");
+                        } else {
+                            result.unwrap();
+                            assert!(opened);
+                        }
+                    }
+                }
             }
         }
     }

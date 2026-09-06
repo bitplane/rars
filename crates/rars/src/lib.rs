@@ -75,6 +75,17 @@ pub struct ArchiveReadOptions<'a> {
     /// above this limit use the streaming path and reject filtered streams
     /// with a typed buffered-decode-limit error instead of buffering the full member.
     pub rar50_buffered_decode_limit: Option<u64>,
+    /// Inclusive ceiling on a compressed RAR5/7 member's declared dictionary size.
+    /// `None` leaves dictionary sizes unrestricted; zero rejects compressed members.
+    /// Stored entries, directories and redirections are exempt. This is not a
+    /// total-memory budget: history copies, buffered output and parallel jobs
+    /// consume additional memory.
+    ///
+    /// Supply this option to extraction, including volume extraction. Parsing
+    /// does not retain it. Legacy formats, comment/recovery helpers and direct
+    /// codec calls are outside its scope. Earlier members may already be emitted
+    /// when a later member exceeds the limit; its output callback is not opened.
+    pub rar50_dictionary_size_limit: Option<u64>,
 }
 
 impl<'a> ArchiveReadOptions<'a> {
@@ -97,6 +108,12 @@ impl<'a> ArchiveReadOptions<'a> {
             password,
             ..Self::default()
         }
+    }
+
+    /// Sets the RAR5/7 declared dictionary-size ceiling for member extraction.
+    pub fn with_rar50_dictionary_size_limit(mut self, limit: u64) -> Self {
+        self.rar50_dictionary_size_limit = Some(limit);
+        self
     }
 
     /// Sets the RAR 5 whole-member buffered decode limit.
