@@ -161,13 +161,22 @@ impl Archive {
                     .any(|sub| sub.kind == crate::rar15_40::NewSubKind::ArchiveComment)
             {
                 crate::ArchiveVersion::Rar30
-            } else if archive.files().all(|file| file.unp_ver == 20) {
+            } else if archive.files().all(|file| file.unp_ver == 15) {
+                crate::ArchiveVersion::Rar15
+            } else if archive.files().all(|file| matches!(file.unp_ver, 20 | 26)) {
                 crate::ArchiveVersion::Rar20
             } else {
                 crate::ArchiveVersion::Rar29
             };
             return Ok(crate::Builder::new(version)
                 .compression_level(Some(3))
+                .legacy_unpack_version(
+                    archive
+                        .files()
+                        .next()
+                        .filter(|file| file.unp_ver == 26)
+                        .map(|file| file.unp_ver),
+                )
                 .solid(archive.main.is_solid())
                 .password(password)
                 .header_encryption(archive.main.has_encrypted_headers())

@@ -104,8 +104,8 @@ existing policy for creating filesystem links.
 
 ## Native legacy preservation
 
-The supported subset includes single-volume RAR 2.0–4.x archives containing ordinary
-files, including solid archives, RAR2 data encryption and RAR2.9–4.x salted AES
+The supported subset includes single-volume RAR 1.5–4.x archives containing ordinary
+files, including solid archives, RAR1.5/RAR2 data encryption and RAR2.9–4.x salted AES
 data encryption. RAR3/4 header encryption
 is retained separately; mixed encrypted/plain members keep their individual status.
 Names retain their original bytes;
@@ -116,10 +116,12 @@ permissions/type bits and DOS attributes retain their source meaning. DOS, OS/2
 and Windows host IDs are normalised to the DOS host with the same attributes.
 Renames and removals retain original member identity and order.
 
-Sources using unpacker version 20 for every member retain RAR2 output, including
+Sources using unpacker version 15, 20 or 26 for every member retain that unpacker
+requirement (26 uses the RAR2 codec), including
 old-style archive/file comments, directories and Unix links. Mixed unpacker
 versions, RAR3 comment records, encrypted headers and extended timestamps in
-RAR2 sources are rejected. Sources requiring unpacker 26 remain unsupported.
+pre-RAR2.9 sources are rejected. RAR1.5 supports DOS attributes; Unix metadata
+that its compatible writer would normalise is rejected.
 
 Modern UnRAR reports three comment-header errors on the original WinRAR 2.02
 comment fixtures and their rewrites, while validating both members successfully.
@@ -135,7 +137,7 @@ malformed extended timestamps, unsupported comment forms, unsupported special en
 Unicode filename records,
 unsupported host metadata, recovery and other service records. Unknown header
 flags, extra header bytes, unsupported end headers and trailing bytes are also
-rejected. RAR1.x preservation and empty legacy output remain unsupported;
+rejected. RAR1.3/1.4 preservation and empty legacy output remain unsupported;
 removing the final member fails writing without replacing the destination.
 Use explicit `preserve=False` conversion when these properties need conversion
 rather than retention. Legacy writers materialize retained payloads in memory.
@@ -155,8 +157,8 @@ entry types and legacy Unicode filename records remain unsupported.
 The input password is required for retained data or header encryption and is reused
 for encrypted output. Plaintext members stay plaintext. Removing encrypted members
 does not disable retained header encryption. Missing/wrong passwords and decode
-failures leave an existing destination intact. Unsalted legacy encryption and
-explicit encryption-version records still fail preflight. Per-member encryption
+failures leave an existing destination intact. Unexpected salt settings and explicit encryption-version records still fail
+preflight. Per-member encryption
 overrides are not supported for volume output. The legacy reader can currently
 require the password even when selecting a plaintext member of a mixed archive;
 this does not mean its payload is encrypted.
@@ -170,7 +172,7 @@ output. Duplicate archive comments, unknown comment metadata and ambiguous servi
 locations fail preflight. Comments combined with encrypted headers, encrypted CMT
 payloads, and embedded file comments combined with a RAR3/4 archive CMT record are
 still unsupported writer combinations. File data encryption with visible comments
-is supported. These checks do not enable RAR1.x preservation.
+is supported. RAR1.3/1.4 preservation remains separate.
 
 Native rewriting preserves archival time even though `gettimes()` and RAR5
 conversion cannot represent it. Those conversion APIs retain their existing

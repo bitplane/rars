@@ -1363,34 +1363,44 @@ impl Archive {
         if self.files().next().is_none() {
             issues.push("empty legacy archive (source format cannot be inferred)".into());
         }
-        let rar20 = self.files().any(|file| file.unp_ver == 20);
-        if rar20
-            && (self.files().any(|file| file.unp_ver != 20)
+        let older = self
+            .files()
+            .find(|file| file.unp_ver < 29)
+            .map(|file| file.unp_ver);
+        if older.is_some_and(|version| {
+            self.files().any(|file| file.unp_ver != version)
                 || self.main.has_encrypted_headers()
-                || new_comment)
-        {
-            issues.push("RAR2 preservation with mixed unpacker versions, encrypted headers or RAR3 archive comments is unsupported".into());
+                || new_comment
+        }) {
+            issues.push("Older RAR preservation with mixed unpacker versions, encrypted headers or RAR3 archive comments is unsupported".into());
         }
         for (index, file) in self.files().enumerate() {
             let label = format!("legacy member {index} ({:?})", file.name_lossy());
-            if !matches!(file.unp_ver, 20 | 29) {
-                issues.push(format!("{label}: legacy source format requires unpacker {} (only 20 and 29 are supported for preservation)", file.unp_ver));
+            if !matches!(file.unp_ver, 15 | 20 | 26 | 29) {
+                issues.push(format!("{label}: legacy source format requires unpacker {} (only 15, 20, 26 and 29 are supported for preservation)", file.unp_ver));
             }
-            if (file.unp_ver == 20 && file.salt.is_some())
-                || (file.unp_ver != 20 && file.is_encrypted() != file.salt.is_some())
+            if (file.unp_ver < 29 && file.salt.is_some())
+                || (file.unp_ver >= 29 && file.is_encrypted() != file.salt.is_some())
             {
                 issues.push(format!(
                     "{label}: unsupported legacy encryption salt settings"
                 ));
             }
-            if file.unp_ver == 20 && file.has_ext_time() {
-                issues.push(format!("{label}: RAR2 extended timestamps are unsupported"));
+            if file.unp_ver < 29 && file.has_ext_time() {
+                issues.push(format!(
+                    "{label}: Pre-RAR2.9 extended timestamps are unsupported"
+                ));
             }
             if file.has_ext_time()
                 && crate::file_times::validate_legacy_extended_times(&file.ext_time).is_err()
             {
                 issues.push(format!(
                     "{label}: legacy extended timestamps are incomplete or invalid"
+                ));
+            }
+            if file.unp_ver == 15 && file.host_os == 3 {
+                issues.push(format!(
+                    "{label}: RAR1.5 Unix metadata cannot be represented by the compatible writer"
                 ));
             }
             if file.block.flags & FHD_COMMENT != 0 {

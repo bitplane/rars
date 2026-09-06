@@ -89,6 +89,7 @@ pub fn write_stored_archive_with_comment(
 }
 
 pub(crate) struct RetainedMemberMetadata<'a> {
+    pub(crate) unpack_version: Option<u8>,
     pub(crate) extended_times: Option<&'a [u8]>,
     pub(crate) is_directory: bool,
     pub(crate) is_symlink: bool,
@@ -123,6 +124,14 @@ pub(crate) fn write_archive_with_retained_metadata(
             }
             crate::file_times::validate_legacy_extended_times(raw)?;
         }
+        if metadata.unpack_version.is_some()
+            && !(options.target == ArchiveVersion::Rar20 && metadata.unpack_version == Some(26))
+        {
+            return Err(Error::InvalidArgument(
+                "unsupported retained legacy unpacker version",
+            ));
+        }
+        member.unpack_version = metadata.unpack_version;
         member.extended_times = metadata.extended_times;
         member.is_directory = metadata.is_directory;
         member.is_symlink = metadata.is_symlink;
@@ -130,14 +139,15 @@ pub(crate) fn write_archive_with_retained_metadata(
             && (member.unpacked_size()? != 0
                 || !matches!(
                     options.target,
-                    ArchiveVersion::Rar20
+                    ArchiveVersion::Rar15
+                        | ArchiveVersion::Rar20
                         | ArchiveVersion::Rar29
                         | ArchiveVersion::Rar30
                         | ArchiveVersion::Rar40
                 ))
         {
             return Err(Error::InvalidArgument(
-                "legacy directories require empty RAR2.9–4.x entries",
+                "legacy directories require empty RAR1.5–4.x entries",
             ));
         }
     }
@@ -906,6 +916,7 @@ fn is_audio_filter_candidate(data: &[u8], channels: usize) -> bool {
 
 /// One member, however the caller supplied it.
 struct Member<'a> {
+    unpack_version: Option<u8>,
     name: &'a [u8],
     bytes: MemberBytes<'a>,
     file_time: u32,
@@ -928,6 +939,7 @@ impl<'a> Member<'a> {
             host_os: entry.host_os,
             password: entry.password,
             file_comment: entry.file_comment,
+            unpack_version: None,
             extended_times: None,
             is_directory: false,
             is_symlink: false,
@@ -943,6 +955,7 @@ impl<'a> Member<'a> {
             host_os: entry.host_os,
             password: entry.password,
             file_comment: entry.file_comment,
+            unpack_version: None,
             extended_times: None,
             is_directory: false,
             is_symlink: false,
@@ -958,6 +971,7 @@ impl<'a> Member<'a> {
             host_os: entry.host_os,
             password: entry.password.as_deref(),
             file_comment: entry.file_comment.as_deref(),
+            unpack_version: None,
             extended_times: None,
             is_directory: false,
             is_symlink: false,
@@ -1129,6 +1143,10 @@ fn write_member(
             extra: &extra,
         },
     )?;
+    if let Some(version) = member.unpack_version {
+        header[24] = version;
+        write_file_header_crc(&mut header, 0, member.name.len(), flags);
+    }
     match header_password {
         Some(password) => write_encrypted_header(output, &header, password)?,
         None => output.write_all(&header)?,

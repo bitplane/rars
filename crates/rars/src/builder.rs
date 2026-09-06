@@ -177,6 +177,7 @@ pub struct Builder {
     quick_open: bool,
     archive_metadata: Option<rar50::ArchiveMetadataRecord>,
     legacy_archive_comment_metadata: Option<(u32, u8)>,
+    legacy_unpack_version: Option<u8>,
     volume_size: Option<usize>,
     entries: Vec<BuilderEntry>,
 }
@@ -198,6 +199,7 @@ impl Builder {
             quick_open: false,
             archive_metadata: None,
             legacy_archive_comment_metadata: None,
+            legacy_unpack_version: None,
             volume_size: None,
             entries: Vec::new(),
         }
@@ -246,6 +248,11 @@ impl Builder {
             self.legacy_archive_comment_metadata = None;
         }
         self.comment = comment;
+        self
+    }
+
+    pub(crate) fn legacy_unpack_version(mut self, version: Option<u8>) -> Self {
+        self.legacy_unpack_version = version;
         self
     }
 
@@ -362,7 +369,8 @@ impl Builder {
     ) -> Result<()> {
         let legacy = matches!(
             self.format,
-            ArchiveVersion::Rar20
+            ArchiveVersion::Rar15
+                | ArchiveVersion::Rar20
                 | ArchiveVersion::Rar29
                 | ArchiveVersion::Rar30
                 | ArchiveVersion::Rar40
@@ -531,7 +539,8 @@ impl Builder {
     ) -> Result<()> {
         let legacy = matches!(
             self.format,
-            ArchiveVersion::Rar20
+            ArchiveVersion::Rar15
+                | ArchiveVersion::Rar20
                 | ArchiveVersion::Rar29
                 | ArchiveVersion::Rar30
                 | ArchiveVersion::Rar40
@@ -920,6 +929,11 @@ impl Builder {
     /// Requires [`volume_size`](Self::volume_size). Naming the parts on disk is
     /// the caller's job, because the two families number them differently.
     pub fn build_volumes(&self, progress: Option<&dyn WriteProgress>) -> Result<Vec<Vec<u8>>> {
+        if self.legacy_unpack_version.is_some() {
+            return Err(Error::InvalidArgument(
+                "retained legacy unpacker version requires single-archive output",
+            ));
+        }
         if self
             .entries
             .iter()
@@ -1192,6 +1206,7 @@ impl Builder {
             .entries
             .iter()
             .map(|entry| rar15_40::RetainedMemberMetadata {
+                unpack_version: self.legacy_unpack_version,
                 extended_times: entry.legacy_extended_times.as_deref(),
                 is_directory: entry.is_directory,
                 is_symlink: matches!(entry.attributes, EntryAttributes::Unix(mode) if mode & 0o170000 == 0o120000),
