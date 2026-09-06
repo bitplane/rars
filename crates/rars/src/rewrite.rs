@@ -140,6 +140,13 @@ impl Archive {
                 "archive has unsupported preservation settings",
             ));
         }
+        if let Archive::Rar15To40(archive) = self {
+            // RAR 2.9, 3.x and 4.x share unpacker version 29. The original
+            // creating release cannot be recovered from this field.
+            return Ok(crate::Builder::new(crate::ArchiveVersion::Rar29)
+                .compression_level(Some(3))
+                .solid(archive.main.is_solid()));
+        }
         let Archive::Rar50Plus(archive) = self else {
             return Err(crate::Error::InvalidArgument(
                 "legacy preservation is unsupported",
@@ -226,8 +233,8 @@ impl Archive {
     /// Properties the current rewrite adapters cannot promise to preserve.
     ///
     /// An empty list certifies only the supported metadata subset, not payload
-    /// integrity or byte-identical output. Legacy formats are conservatively
-    /// rejected until their settings and metadata have preservation adapters.
+    /// integrity or byte-identical output. Legacy preservation accepts only
+    /// ordinary unencrypted unpacker-29 files with base metadata.
     /// Parsed unknown/incomplete RAR5 extras remain visible to this check even
     /// though ordinary extraction tolerates them. Source files must stay stable.
     pub fn rewrite_preservation_issues(&self) -> Vec<String> {
@@ -290,20 +297,7 @@ impl Archive {
                 }
             }
             Archive::Rar15To40(archive) => {
-                issues
-                    .push("legacy source format and metadata require preservation adapters".into());
-                if archive.main.is_solid() {
-                    issues.push("solid archive".into());
-                }
-                if archive.main.is_volume() {
-                    issues.push("volume layout".into());
-                }
-                if archive.main.has_encrypted_headers() {
-                    issues.push("header encryption".into());
-                }
-                if archive.main.has_recovery_record() {
-                    issues.push("recovery records".into());
-                }
+                issues.extend(archive.rewrite_preservation_issues());
             }
             Archive::Rar50Plus(archive) => {
                 use crate::rar50::Block;

@@ -13,10 +13,10 @@ fallback to conversion. `RarFile.rewrite_preservation_issues()` lists the gaps.
 Use `from_archive(..., preserve=False)` to explicitly convert to RAR5,
 compression level 3, non-solid and unencrypted, without recovery or volume
 configuration. This also remains the route for editing older archives: their
-contents and supported member metadata are converted to RAR5. Legacy RAR format
-preservation is not implemented.
+contents and supported member metadata are converted to RAR5. Native legacy
+preservation supports the limited subset described below.
 
-Preservation rejects legacy formats, volume layouts, SFX prefixes, unknown
+Preservation rejects unsupported legacy properties, volume layouts, SFX prefixes, unknown
 compression algorithms, unsupported services and unknown, duplicate or incomplete
 metadata. Quick-open indexes combined with header encryption remain an
 unsupported writer combination. Unknown
@@ -43,7 +43,7 @@ the separate password argument.
 | Links and special entries | RAR5 Unix/Windows symbolic links, junctions, hard links and file-copy records retained; legacy Unix links converted to RAR5; other special entries rejected | Preserve supported types; reject unsupported preservation |
 | File comments | Decoded comments copied, including explicit empty comments; supported RAR5 CMT records pass preflight | Preserve supported comment content |
 | Other metadata | Supported archive name/creation time and lock flag retained in preservation; indexes regenerated | Preserve supported records; reject unsupported preservation |
-| Archive format | Conversion writes RAR5; preservation selects the RAR5/7 writer required by the source | Preserve supported format semantics; exact creating release may be unknowable |
+| Archive format | Conversion writes RAR5; preservation selects a compatible supported legacy or RAR5/7 writer | Preserve supported format semantics; exact creating release may be unknowable |
 | Data/header encryption | Removed in conversion; retained separately in preservation, including mixed plaintext/encrypted members and comments | Preserve both, using an available input password unless explicitly changed |
 | Solid layout and compression | Fresh level-3 compression; preservation retains solid mode | Preserve supported solid semantics; compressed bytes and original encoder tuning are not guaranteed |
 | Volumes and recovery | Conversion removes configuration; preservation regenerates recognized recovery records at the retained percentage and rejects volumes | Detect these features; preserve supported semantics or reject; volume boundaries are not guaranteed |
@@ -63,7 +63,7 @@ records are rejected. Comments remain attached through renames and removals.
 `RarBuilder.set_file_comment(member, comment=None)` sets or removes a queued
 comment; `b""` retains an explicit empty comment. RAR3/4 and volume output do not
 support setting file comments. Legacy comments exposed by the reader are retained
-when converting to RAR5; legacy format preservation still fails preflight.
+when converting to RAR5; legacy comments still fail preservation preflight.
 
 `RarFile.gettimes(member)` returns present `modified`, `created` and `accessed`
 times as exact integer Unix nanoseconds. `RarBuilder.set_times(member, *,
@@ -90,7 +90,7 @@ defaults to `0o777`; link type bits are retained separately from permissions.
 redirection or legacy Unix symbolic link. Legacy link payloads are decoded and
 integrity-checked without following the target. Conversion maps legacy Unix
 member names and targets into the RAR5 Unix byte encoding without replacement;
-it does not guess a DOS code page. Legacy-format preservation remains unsupported.
+it does not guess a DOS code page. Legacy link preservation remains unsupported.
 Targets use the [RAR5 wire encoding](https://www.rarlab.com/technote.htm), including
 its Unix byte mapping, and must be nonempty and contain no NUL. Relative targets
 are retained verbatim: renaming a link or its target does not retarget the link.
@@ -99,6 +99,28 @@ forward or size-inconsistent archive targets, including targets removed by edits
 Windows symbolic links and junctions retain their original target bytes and flags.
 Link volume output is currently rejected. Rewriting does not change extraction's
 existing policy for creating filesystem links.
+
+## Native legacy preservation
+
+The initial subset supports single-volume RAR 2.9–4.x archives containing ordinary
+unencrypted files, including solid archives. Names retain their original bytes;
+base DOS timestamps retain their raw values without a timezone conversion. Unix
+permissions/type bits and DOS attributes retain their source meaning. DOS, OS/2
+and Windows host IDs are normalised to the DOS host with the same attributes.
+Renames and removals retain original member identity and order.
+
+The source must use unpacker version 29 for every member. RAR 2.9, 3.x and 4.x
+share this version; preservation uses the compatible RAR29 writer, without
+claiming to reproduce the creating release. File data is recompressed.
+
+Specific preflight errors currently reject encryption, extended timestamps,
+archive/file comments, directories, links, legacy Unicode filename records,
+unsupported host metadata, recovery and other service records. Unknown header
+flags, extra header bytes, unsupported end headers and trailing bytes are also
+rejected. RAR1.x/2.0 preservation and empty legacy output remain unsupported;
+removing the final member fails writing without replacing the destination.
+Use explicit `preserve=False` conversion when these properties need conversion
+rather than retention. Legacy writers materialize retained payloads in memory.
 
 ## Compatibility change for the next minor release
 
@@ -133,7 +155,7 @@ Caller-owned output streams do not have this rollback guarantee.
 
 Preservation means supported archive semantics, not identical bytes, compression
 ratio, encoder release, dictionary choices or original solid group boundaries.
-Legacy format preservation, volume-set rewriting, explicit conversion target
+Broader legacy preservation, volume-set rewriting, explicit conversion target
 settings and header-encrypted quick-open output remain separate work. A bounded
 single-pass rewrite session is also pending; current lazy member reads can repeat
 extraction work for solid archives.

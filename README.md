@@ -64,7 +64,8 @@ Python bindings are published to [pypi](https://pypi.org/project/rars/), so you
 can `pip install rars`. To build locally, it's `just python`.
 
 `RarBuilder.from_archive` preserves supported RAR5/7 metadata and archive settings
-by default, rejecting unsupported preservation. Pass `preserve=False` explicitly
+by default, plus a limited subset of ordinary RAR2.9–4.x archives. Unsupported
+preservation is rejected. Pass `preserve=False` explicitly
 to convert to unencrypted RAR5, including from older archives. This default change
 is intended for the next minor release; see the [rewrite contract](python/REWRITING.md).
 

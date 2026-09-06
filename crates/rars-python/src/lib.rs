@@ -663,7 +663,8 @@ impl RarBuilder {
         })
     }
 
-    /// Create a rewrite builder. By default, supported RAR5/7 format,
+    /// Create a rewrite builder. Ordinary unencrypted RAR2.9–4.x files retain
+    /// native names, DOS timestamps, attributes and solid mode. For RAR5/7, format,
     /// solid, data/header/comment encryption and archive metadata settings are
     /// retained; unknown or unsupported preservation fails before output.
     /// Explicit preserve=False converts to RAR5 level 3, non-solid and unencrypted.
@@ -721,6 +722,7 @@ impl RarBuilder {
             rars_rs::Builder::new(rars_rs::ArchiveVersion::Rar50).compression_level(Some(3))
         };
         let format = inner.format();
+        let legacy_preservation = preserve && format.family() == rars_rs::ArchiveFamily::Rar15To40;
         let mut builder = Self {
             inner: inner.comment(archive.comment(py)?),
             format,
@@ -728,7 +730,11 @@ impl RarBuilder {
         let comment_encryption = archive.archive.member_comment_encryption();
         for ((member_index, member), comment) in archive.archive.members().enumerate().zip(comments)
         {
-            let file_times = member.file_times().map_err(map_error)?;
+            let file_times = if legacy_preservation {
+                None
+            } else {
+                member.file_times().map_err(map_error)?
+            };
             let legacy_link = if member.is_legacy_unix_symlink() {
                 archive
                     .archive
@@ -744,7 +750,8 @@ impl RarBuilder {
             // Reuse extraction's host rules: e.g. legacy host 1 is DOS, but
             // RAR5 host 1 is Unix. DOS 0x20 must not become Unix mode 0040.
             let attr_source = info.attr_source();
-            let output_name = if info.family != rars_rs::ArchiveFamily::Rar50Plus
+            let output_name = if !legacy_preservation
+                && info.family != rars_rs::ArchiveFamily::Rar50Plus
                 && attr_source == rars_rs::AttrSource::Unix
             {
                 rars_rs::builder::validate_entry_name(info.name.clone())
@@ -771,19 +778,28 @@ impl RarBuilder {
                     String::from_utf8_lossy(&info.name)
                 )));
             }
-            let mode = (attr_source == rars_rs::AttrSource::Unix)
-                .then_some((info.file_attr & 0o7777) as u32);
+            let mode =
+                (attr_source == rars_rs::AttrSource::Unix).then_some(if legacy_preservation {
+                    info.file_attr as u32
+                } else {
+                    (info.file_attr & 0o7777) as u32
+                });
             // Reuse CLI extraction's local-zone policy for legacy DOS times,
             // including the extended odd second, before writing RAR5 Unix time.
-            let modified = info
-                .modification_time()
+            let modified = (!legacy_preservation)
+                .then(|| info.modification_time())
+                .flatten()
                 .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok());
-            let mtime = modified
-                .map(|duration| u32::try_from(duration.as_secs()))
-                .transpose()
-                .map_err(|_| {
-                    PyValueError::new_err("modification time exceeds the RAR5 timestamp range")
-                })?;
+            let mtime = if legacy_preservation {
+                info.file_time
+            } else {
+                modified
+                    .map(|duration| u32::try_from(duration.as_secs()))
+                    .transpose()
+                    .map_err(|_| {
+                        PyValueError::new_err("modification time exceeds the RAR5 timestamp range")
+                    })?
+            };
             if let Some(member) = retained_link {
                 builder
                     .inner
@@ -833,7 +849,7 @@ impl RarBuilder {
                     .set_mtime_nanoseconds(&output_name, time.subsec_nanos())
                     .map_err(map_builder_error)?;
             }
-            if preserve {
+            if preserve && !legacy_preservation {
                 builder
                     .inner
                     .set_entry_encryption(

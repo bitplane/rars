@@ -62,8 +62,8 @@ def test_trailing_bytes_or_missing_end_cannot_pass_preflight(suffix):
         rars.RarBuilder.from_archive(source)
 
 
-def test_legacy_preservation_is_explicitly_unimplemented():
-    builder = rars.RarBuilder(format="rar29", store=True)
+def test_older_legacy_preservation_is_explicitly_unimplemented():
+    builder = rars.RarBuilder(format="rar20", store=True)
     builder.add_bytes(b"payload", "file")
     source = rars.RarFile.from_bytes(builder.to_bytes())
     assert any("legacy source format" in issue for issue in source.rewrite_preservation_issues())
@@ -312,7 +312,7 @@ def test_rewrite_can_replace_its_source_after_reading(tmp_path):
 
 
 def test_legacy_default_rejection_explains_explicit_conversion(tmp_path):
-    builder = rars.RarBuilder(format="rar29", store=True)
+    builder = rars.RarBuilder(format="rar20", store=True)
     builder.add_bytes(b"payload", "file")
     source = rars.RarFile.from_bytes(builder.to_bytes())
     destination = tmp_path / "existing.rar"

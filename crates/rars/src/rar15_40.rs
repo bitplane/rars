@@ -1316,6 +1316,93 @@ impl Archive {
         })
     }
 
+    /// Native metadata checks for the initial RAR 2.9–4.x rewrite subset.
+    pub(crate) fn rewrite_preservation_issues(&self) -> Vec<String> {
+        let mut issues = Vec::new();
+        if self.main.is_volume() {
+            issues.push("legacy volume layout".into());
+        }
+        if self.main.has_encrypted_headers() {
+            issues.push("legacy header encryption".into());
+        }
+        if self.main.has_recovery_record() {
+            issues.push("legacy recovery records".into());
+        }
+        if self.main.flags & !MHD_SOLID != 0
+            || self.main.head_size != MAIN_HEADER_SIZE as u16
+            || self.main.reserved1 != 0
+            || self.main.reserved2 != 0
+        {
+            issues.push("legacy main header settings, comments or extra metadata".into());
+        }
+        if self.files().next().is_none() {
+            issues.push("empty legacy archive (source format cannot be inferred)".into());
+        }
+        for (index, file) in self.files().enumerate() {
+            let label = format!("legacy member {index} ({:?})", file.name_lossy());
+            if file.unp_ver != 29 {
+                issues.push(format!("{label}: legacy source format requires unpacker {} (only 29 is supported for preservation)", file.unp_ver));
+            }
+            if file.is_encrypted() {
+                issues.push(format!("{label}: legacy data encryption"));
+            }
+            if file.has_ext_time() {
+                issues.push(format!("{label}: legacy extended timestamps"));
+            }
+            if file.block.flags & FHD_COMMENT != 0 {
+                issues.push(format!("{label}: legacy file comments"));
+            }
+            if file.is_directory() {
+                issues.push(format!("{label}: legacy directory metadata"));
+            }
+            if file.block.flags & FHD_UNICODE != 0 {
+                issues.push(format!("{label}: legacy Unicode filename encoding"));
+            }
+            if !matches!(file.host_os, 0..=3) {
+                issues.push(format!("{label}: legacy host metadata"));
+            }
+            if file.is_solid() && !self.main.is_solid() {
+                issues.push(format!(
+                    "{label}: solid dependency without archive solid flag"
+                ));
+            }
+            // No optional file-header fields are emitted by this subset. Check
+            // the declared length too: the reader tolerates unflagged extras.
+            if file.block.flags & !(LONG_BLOCK | FHD_SOLID | FHD_DIRECTORY_MASK) != 0
+                || usize::from(file.block.head_size) != 32 + file.name.len()
+            {
+                issues.push(format!("{label}: legacy file flags or extra metadata"));
+            }
+            if !(0x30..=0x35).contains(&file.method) || file.unp_size > u64::from(u32::MAX) {
+                issues.push(format!("{label}: unsupported legacy method or size"));
+            }
+        }
+        for block in &self.blocks {
+            if !matches!(block, Block::File(_) | Block::End(_)) {
+                issues.push("legacy comments, recovery or other service records".into());
+            }
+        }
+        let complete_end = match self.blocks.last() {
+            Some(Block::End(end)) => {
+                end.flags & !0x4000 == 0
+                    && end.head_size == 7
+                    && end.add_size.is_none()
+                    && end
+                        .offset
+                        .checked_add(7)
+                        .and_then(|end| end.checked_add(self.sfx_offset))
+                        .is_some_and(|end| Some(end) == self.source.len().ok())
+            }
+            // Legacy archives may terminate immediately after the last file.
+            Some(Block::File(file)) => Some(file.packed_range.end) == self.source.len().ok(),
+            _ => false,
+        };
+        if !complete_end {
+            issues.push("legacy end header metadata or trailing bytes".into());
+        }
+        issues
+    }
+
     fn read_range(&self, range: Range<usize>) -> Result<Vec<u8>> {
         self.source.read_range(range)
     }
