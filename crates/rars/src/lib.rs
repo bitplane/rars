@@ -817,12 +817,11 @@ impl Archive {
         })
     }
 
-    /// The archive comment, decrypting it when the archive is RAR 5 or later
-    /// and its headers are encrypted.
+    /// The archive comment, decrypting its payload with the supplied password.
     pub fn comment(&self, password: Option<&[u8]>) -> Result<Option<Vec<u8>>> {
         match self {
             Self::Rar13(archive) => archive.archive_comment(),
-            Self::Rar15To40(archive) => archive.archive_comment(),
+            Self::Rar15To40(archive) => archive.archive_comment_with_password(password),
             Self::Rar50Plus(archive) => archive.archive_comment_with_password(password),
         }
     }

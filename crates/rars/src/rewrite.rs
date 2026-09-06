@@ -158,7 +158,8 @@ impl Archive {
         }
         if let Archive::Rar15To40(archive) = self {
             let encrypted = archive.main.has_encrypted_headers()
-                || archive.files().any(|file| file.is_encrypted());
+                || archive.files().any(|file| file.is_encrypted())
+                || archive.new_subs().any(|sub| sub.file.is_encrypted());
             let password = if encrypted {
                 Some(
                     password
@@ -194,6 +195,16 @@ impl Archive {
                         .map(|file| file.unp_ver),
                 )
                 .solid(archive.main.is_solid())
+                .archive_comment_password(
+                    archive
+                        .new_subs()
+                        .any(|sub| {
+                            sub.kind == crate::rar15_40::NewSubKind::ArchiveComment
+                                && sub.file.is_encrypted()
+                        })
+                        .then(|| password.clone())
+                        .flatten(),
+                )
                 .password(password)
                 .header_encryption(archive.main.has_encrypted_headers())
                 .legacy_archive_comment_metadata(

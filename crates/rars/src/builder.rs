@@ -247,6 +247,7 @@ impl Builder {
     pub fn comment(mut self, comment: Option<Vec<u8>>) -> Self {
         if comment.is_none() {
             self.legacy_archive_comment_metadata = None;
+            self.comment_password = None;
         }
         self.comment = comment;
         self
@@ -1275,6 +1276,7 @@ impl Builder {
             self.encrypt_headers
                 .then_some(self.password.as_deref())
                 .flatten(),
+            self.comment_password.as_deref(),
         )
     }
 

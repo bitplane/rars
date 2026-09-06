@@ -78,8 +78,9 @@ time. Malformed legacy extended records and legacy archival time (which has no
 supported RAR5 counterpart) are rejected during conversion.
 
 `RarBuilder.add_directory(arcname, mtime=None, mode=None)` adds an explicit
-directory to single-archive RAR2.0–4.x or RAR5/7 output. It also allows empty
-directories without an input archive. `mode` supplies Unix permissions; the default uses DOS directory flags.
+directory to single-archive RAR1.3–4.x or RAR5/7 output. It also allows empty
+directories without an input archive. `mode` supplies Unix permissions for RAR2
+and later; RAR1.x requires DOS attributes. The default uses DOS directory flags.
 Recursive `add(path)` still only queues files; explicit directory creation does
 not change that existing traversal policy.
 
@@ -177,10 +178,14 @@ comment records retain their DOS timestamp and host ID as well as decoded conten
 Embedded file comments follow renames/removals; explicit empty comments remain
 distinct from absent comments. Comments are decoded and integrity-checked before
 output. Duplicate archive comments, unknown comment metadata and ambiguous service
-locations fail preflight. Comments combined with encrypted headers, encrypted CMT
-payloads, and embedded file comments combined with a RAR3/4 archive CMT record are
-still unsupported writer combinations. File data encryption with visible comments
-is supported. RAR1.3/1.4 comments are retained as decoded bytes; compressed archive comments
+locations fail preflight. Archive comments can accompany encrypted headers and
+retain independently encrypted CMT payloads, even when every file is plaintext.
+Embedded file comments can accompany a RAR3/4 archive CMT record with visible
+headers. Modern UnRAR reports old-comment header diagnostics on these embedded
+records, while the library retains and verifies their contents. Embedded file
+comments with encrypted headers remain explicitly rejected: reference UnRAR
+refuses the whole archive for that combination. File data encryption with visible
+comments is supported. RAR1.3/1.4 comments are retained as decoded bytes; compressed archive comments
 may be emitted uncompressed. Unknown extra metadata and authenticity records
 are rejected. The compatible RAR1.4 writer retains the shared unpacker-2 format,
 raw DOS names, timestamps, attributes, solid mode and per-member encryption.

@@ -464,11 +464,15 @@ impl FileHeader {
         Ok(data)
     }
 
-    pub(crate) fn unpacked_data(&self, archive: &Archive) -> Result<Vec<u8>> {
+    pub(crate) fn unpacked_data_with_password(
+        &self,
+        archive: &Archive,
+        password: Option<&[u8]>,
+    ) -> Result<Vec<u8>> {
         if self.is_stored() {
-            return self.stored_data(archive);
+            return self.stored_data_with_password(archive, password);
         }
-        let mut session = DecoderSession::new(false);
+        let mut session = DecoderSession::new_with_password(false, password);
         session.decode_file_data(archive, self)
     }
 
@@ -1406,6 +1410,9 @@ impl Archive {
                 ));
             }
             if file.block.flags & FHD_COMMENT != 0 {
+                if self.main.has_encrypted_headers() {
+                    issues.push(format!("{label}: embedded legacy file comments with encrypted headers are incompatible with reference readers"));
+                }
                 let supported = parse_block_header(&file.file_comment, 0)
                     .and_then(|block| parse_comment_header(&file.file_comment, block))
                     .is_ok_and(|comment| {
@@ -1416,9 +1423,6 @@ impl Archive {
                     issues.push(format!(
                         "{label}: legacy file comments have unsupported or incomplete metadata"
                     ));
-                }
-                if self.main.has_encrypted_headers() || new_comment {
-                    issues.push(format!("{label}: embedded file comments with RAR3 archive comments or encrypted headers are unsupported"));
                 }
             }
             if file.is_directory()
@@ -1490,9 +1494,11 @@ impl Archive {
                     let file = &sub.file;
                     if seen_file
                         || file.is_directory()
-                        || file.is_encrypted()
-                        || file.block.flags & !(LONG_BLOCK | FHD_DIRECTORY_MASK | 0x4000) != 0
-                        || file.block.head_size != 35
+                        || file.is_encrypted() != file.salt.is_some()
+                        || file.block.flags
+                            & !(LONG_BLOCK | FHD_DIRECTORY_MASK | 0x4000 | FHD_PASSWORD | FHD_SALT)
+                            != 0
+                        || file.block.head_size != 35 + if file.salt.is_some() { 8 } else { 0 }
                         || file.unp_ver != 29
                         || !(0x30..=0x35).contains(&file.method)
                         || file.attr != 0
@@ -1512,9 +1518,6 @@ impl Archive {
         }
         if self.main.has_archive_comment() && archive_comments == 0 {
             issues.push("missing or malformed legacy archive comment".into());
-        }
-        if self.main.has_encrypted_headers() && archive_comments != 0 {
-            issues.push("legacy archive comments with encrypted headers are unsupported".into());
         }
         let complete_end = match self.blocks.last() {
             Some(Block::End(end)) => {
@@ -1755,6 +1758,13 @@ impl Archive {
     }
 
     pub fn archive_comment(&self) -> Result<Option<Vec<u8>>> {
+        self.archive_comment_with_password(None)
+    }
+
+    pub fn archive_comment_with_password(
+        &self,
+        password: Option<&[u8]>,
+    ) -> Result<Option<Vec<u8>>> {
         if let Some(comment) = self.blocks.iter().find_map(|block| match block {
             Block::Comment(comment) => Some(comment),
             _ => None,
@@ -1768,7 +1778,7 @@ impl Archive {
         else {
             return Ok(None);
         };
-        let data = comment.file.unpacked_data(self)?;
+        let data = comment.file.unpacked_data_with_password(self, password)?;
         comment.file.verify_crc32(&data)?;
         Ok(Some(data))
     }

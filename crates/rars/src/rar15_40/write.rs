@@ -98,6 +98,7 @@ pub(crate) struct RetainedMemberMetadata<'a> {
 
 /// Builder path for retained native metadata and entry kinds. Existing direct
 /// entry structs keep their API.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn write_archive_with_retained_metadata(
     entries: &[FileEntry<'_>],
     metadata: &[RetainedMemberMetadata<'_>],
@@ -106,6 +107,7 @@ pub(crate) fn write_archive_with_retained_metadata(
     archive_comment: Option<&[u8]>,
     progress: Option<&dyn WriteProgress>,
     header_password: Option<&[u8]>,
+    archive_comment_password: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
     if entries.len() != metadata.len() {
         return Err(Error::InvalidArgument(
@@ -166,6 +168,7 @@ pub(crate) fn write_archive_with_retained_metadata(
         progress,
         &mut out,
         header_password,
+        archive_comment_password,
     )?;
     Ok(out)
 }
@@ -251,6 +254,7 @@ pub fn write_streaming_archive_to(
         progress,
         output,
         None,
+        None,
     )
 }
 
@@ -274,6 +278,7 @@ fn collect_archive(
         progress,
         &mut out,
         None,
+        None,
     )?;
     Ok(out)
 }
@@ -288,8 +293,29 @@ fn write_archive_to(
     progress: Option<&dyn WriteProgress>,
     output: &mut dyn Write,
     explicit_header_password: Option<&[u8]>,
+    archive_comment_password: Option<&[u8]>,
 ) -> Result<()> {
+    if let Some(password) = archive_comment_password {
+        if password.is_empty()
+            || archive_comment.is_none()
+            || !matches!(
+                options.target,
+                ArchiveVersion::Rar30 | ArchiveVersion::Rar40
+            )
+        {
+            return Err(Error::InvalidArgument(
+                "encrypted legacy archive comments require a password and RAR3/4 CMT output",
+            ));
+        }
+    }
     let has_file_comment = members.iter().any(|member| member.file_comment.is_some());
+    if has_file_comment && options.features.header_encryption {
+        return Err(Error::UnsupportedWriterOption {
+            target: options.target,
+            option: WriterOption::FileComment,
+            because: Some("embedded legacy file comments with header encryption are incompatible with reference readers"),
+        });
+    }
     validate_plan(
         options,
         coding.shape(),
@@ -302,7 +328,6 @@ fn write_archive_to(
     let header_password = if options.features.header_encryption {
         validate_header_encrypted_archive_options(
             options.target,
-            archive_comment.is_some(),
             explicit_header_password.is_some()
                 || members.iter().any(|member| member.password.is_some()),
         )?;
@@ -364,6 +389,7 @@ fn write_archive_to(
         &coding,
         archive_comment,
         header_password,
+        archive_comment_password,
         resources,
         Some(&work),
         output,
@@ -382,6 +408,7 @@ fn write_members_to(
     coding: &MemberCoding,
     archive_comment: Option<&[u8]>,
     header_password: Option<&[u8]>,
+    archive_comment_password: Option<&[u8]>,
     resources: &WriterResources,
     progress: Option<&WorkTracker<'_>>,
     output: &mut dyn Write,
@@ -399,8 +426,14 @@ fn write_members_to(
     }
     let mut head = Vec::new();
     write_main_header(&mut head, main_flags);
-    write_archive_comment(&mut head, archive_comment, options)?;
     output.write_all(&head)?;
+    write_archive_comment(
+        output,
+        archive_comment,
+        options,
+        header_password,
+        archive_comment_password,
+    )?;
 
     // Solid members share one encoder, so they are coded in order. Independent
     // ones are coded a window at a time and written as each window lands.
@@ -1405,16 +1438,8 @@ fn validate_plan(
 /// capability, so they are checked after the capability table has had its say.
 fn validate_header_encrypted_archive_options(
     target: ArchiveVersion,
-    has_archive_comment: bool,
     has_password: bool,
 ) -> Result<()> {
-    if has_archive_comment {
-        return Err(Error::UnsupportedWriterOption {
-            target,
-            option: WriterOption::ArchiveComment,
-            because: Some("with header encryption"),
-        });
-    }
     if !has_password {
         return Err(Error::UnsupportedWriterOption {
             target,
@@ -2161,33 +2186,28 @@ fn uses_old_style_archive_comment(target: ArchiveVersion) -> bool {
 }
 
 fn write_archive_comment(
-    out: &mut Vec<u8>,
+    out: &mut dyn Write,
     comment: Option<&[u8]>,
     options: WriterOptions,
-) -> Result<()> {
-    if uses_old_style_archive_comment(options.target) {
-        return write_comment_header(out, comment);
-    }
-    match options.target {
-        ArchiveVersion::Rar30 | ArchiveVersion::Rar40 => {
-            write_newsub_archive_comment(out, comment, options.archive_comment_metadata)
-        }
-        _ => Err(Error::UnsupportedVersion(options.target)),
-    }
-}
-
-fn write_newsub_archive_comment(
-    out: &mut Vec<u8>,
-    comment: Option<&[u8]>,
-    metadata: Option<(u32, u8)>,
+    header_password: Option<&[u8]>,
+    password: Option<&[u8]>,
 ) -> Result<()> {
     let Some(comment) = comment else {
         return Ok(());
     };
-    let packed = unpack29_encode_literals(comment)?;
-    write_file_header_and_data(
-        out,
-        FileRecord {
+    if uses_old_style_archive_comment(options.target) {
+        let mut block = Vec::new();
+        write_comment_header(&mut block, Some(comment))?;
+        out.write_all(&block)?;
+        return Ok(());
+    }
+    let mut packed = unpack29_encode_literals(comment)?;
+    let salt = encrypt_packed_data_for_writer(&mut packed, options.target, password)?;
+    let metadata = options.archive_comment_metadata;
+    let mut header = Vec::new();
+    write_file_header(
+        &mut header,
+        &FileRecord {
             head_type: NEWSUB_HEAD,
             name: b"CMT",
             unpacked_size: comment.len(),
@@ -2199,12 +2219,22 @@ fn write_newsub_archive_comment(
             target: ArchiveVersion::Rar30,
             method: 0x33,
             dictionary_flags: dictionary_flags_for_target(ArchiveVersion::Rar30),
-            flags: 0,
-            salt: None,
+            flags: if password.is_some() {
+                FHD_PASSWORD | FHD_SALT
+            } else {
+                0
+            },
+            salt,
             extra: &[],
         },
-        &packed,
-    )
+    )?;
+    if let Some(password) = header_password {
+        write_encrypted_header(out, &header, password)?;
+    } else {
+        out.write_all(&header)?;
+    }
+    out.write_all(&packed)?;
+    Ok(())
 }
 
 /// Closes a header-encrypted archive with an end-of-archive block in a group of
@@ -2462,7 +2492,7 @@ fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
 }
 
 fn write_header_encrypted_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
-    validate_header_encrypted_archive_options(entry.target, false, entry.password.is_some())?;
+    validate_header_encrypted_archive_options(entry.target, entry.password.is_some())?;
     let password = entry.password.ok_or(Error::NeedPassword)?;
     if entry.max_packed_per_volume == 0 {
         return Err(Error::InvalidHeader(

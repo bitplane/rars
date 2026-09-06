@@ -60,7 +60,9 @@ fn directory_validation_does_not_change_entry_kind_or_queued_names() {
         .add_directory(b"empty".to_vec(), None, None)
         .is_err());
     assert_eq!(builder.to_bytes().unwrap(), before);
-    let mut legacy = Builder::new(ArchiveVersion::Rar29);
-    assert!(legacy.add_directory(b"empty".to_vec(), None, None).is_err());
+    let mut legacy = Builder::new(ArchiveVersion::Rar15);
+    assert!(legacy
+        .add_directory(b"empty".to_vec(), None, Some(0o750))
+        .is_err());
     assert!(legacy.is_empty());
 }
