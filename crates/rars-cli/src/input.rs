@@ -138,7 +138,11 @@ fn archive_path_bytes(path: &Path) -> CliResult<Vec<u8>> {
         let Component::Normal(part) = component else {
             return Err(format!("unsafe input archive path: {}", path.display()).into());
         };
-        parts.push(part.to_string_lossy().into_owned());
+        // Display replacement characters must never become archive identity.
+        parts.push(
+            part.to_str()
+                .ok_or_else(|| format!("input archive path is not UTF-8: {}", path.display()))?,
+        );
     }
     if parts.is_empty() {
         return Err("input path has no file name".into());
@@ -198,4 +202,44 @@ fn source_unix_mode(_metadata: &fs::Metadata) -> Option<u32> {
 /// where there is one.
 pub(crate) fn rar15_file_attr(unix_mode: Option<u32>, file_attr: u8) -> u32 {
     unix_mode.unwrap_or_else(|| u32::from(file_attr))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_inputs_rejects_non_utf8_child_names_without_replacement() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = crate::scratch::case("cli-non-utf8-name");
+        let input = root.join("input");
+        fs::create_dir(&input).unwrap();
+        fs::write(input.join(OsStr::from_bytes(b"bad-\xff")), b"payload").unwrap();
+        let error = collect_inputs(&[input.to_str().unwrap().to_owned()])
+            .err()
+            .expect("non-UTF-8 filename must be rejected");
+        assert!(error.to_string().contains("not UTF-8"));
+    }
+
+    #[test]
+    fn collect_inputs_preserves_unicode_names_and_source_paths() {
+        let root = crate::scratch::case("cli-unicode-names");
+        let input = root.join("input");
+        fs::create_dir_all(input.join("日本語")).unwrap();
+        let mut names = ["日本語", "кириллица", "replacement-\u{fffd}"];
+        for name in names {
+            fs::write(input.join("日本語").join(name), name.as_bytes()).unwrap();
+        }
+        names.sort();
+        let entries = collect_inputs(&[input.to_str().unwrap().to_owned()]).unwrap();
+        assert_eq!(entries.len(), names.len());
+        for (entry, name) in entries.iter().zip(names) {
+            assert_eq!(entry.name, format!("input/日本語/{name}").as_bytes());
+            assert_eq!(entry.path, input.join("日本語").join(name));
+            assert_eq!(fs::read(&entry.path).unwrap(), name.as_bytes());
+        }
+    }
 }

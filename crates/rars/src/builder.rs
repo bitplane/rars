@@ -395,6 +395,9 @@ impl Builder {
     /// Queue a file, or every file under a directory, named `archive_name` in
     /// the archive. Children are added in sorted order so the same tree gives
     /// the same archive twice.
+    /// Child filenames must be representable as UTF-8; unrepresentable names
+    /// are rejected, never replaced. A file's source path need not be UTF-8
+    /// when the caller supplies its archive name explicitly.
     ///
     /// Symlinks are refused rather than followed, at the root and at every
     /// level below it: a link is a name for someone else's file, and copying
@@ -413,9 +416,13 @@ impl Builder {
             let mut children = fs::read_dir(path)?.collect::<std::result::Result<Vec<_>, _>>()?;
             children.sort_by_key(|entry| entry.file_name());
             for child in children {
+                let file_name = child.file_name();
+                let file_name = file_name.to_str().ok_or(Error::InvalidArgument(
+                    "input filename is not UTF-8; add the file with an explicit archive name",
+                ))?;
                 let mut child_name = archive_name.to_vec();
                 child_name.push(b'/');
-                child_name.extend_from_slice(child.file_name().to_string_lossy().as_bytes());
+                child_name.extend_from_slice(file_name.as_bytes());
                 self.add_path(&child.path(), &child_name)?;
             }
         } else if meta.is_file() {
@@ -960,6 +967,49 @@ fn unix_mode(_metadata: &fs::Metadata) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn add_path_rejects_non_utf8_child_names_without_replacement() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = crate::scratch::case("builder-non-utf8-name");
+        fs::write(root.join(OsStr::from_bytes(b"bad-\xff")), b"payload").unwrap();
+        for format in ArchiveVersion::ALL {
+            let mut builder = Builder::new(format);
+            let error = builder.add_path(&root, b"root").unwrap_err();
+            assert!(matches!(error.root_cause(), Error::InvalidArgument(_)));
+            assert!(builder.is_empty());
+            // A caller can still give a non-Unicode source an explicit name.
+            builder
+                .add_path(&root.join(OsStr::from_bytes(b"bad-\xff")), b"explicit")
+                .unwrap();
+            assert_eq!(builder.names().collect::<Vec<_>>(), vec![&b"explicit"[..]]);
+        }
+    }
+
+    #[test]
+    fn add_path_preserves_unicode_child_names_and_contents() {
+        let root = crate::scratch::case("builder-unicode-names");
+        fs::create_dir(root.join("日本語")).unwrap();
+        for name in ["日本語", "кириллица", "replacement-\u{fffd}"] {
+            fs::write(root.join("日本語").join(name), name.as_bytes()).unwrap();
+        }
+        let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+        builder.add_path(&root, b"root").unwrap();
+        let archive = crate::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        for name in ["日本語", "кириллица", "replacement-\u{fffd}"] {
+            let member_name = format!("root/日本語/{name}");
+            assert_eq!(
+                archive
+                    .read_member(member_name.as_bytes(), None)
+                    .unwrap()
+                    .unwrap(),
+                name.as_bytes()
+            );
+        }
+    }
 
     fn builder_with(format: ArchiveVersion) -> Builder {
         let mut builder = Builder::new(format);
