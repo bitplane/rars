@@ -206,6 +206,8 @@ pub struct WriterOptions {
     /// Which engine compresses a member. Only the RAR 2.9 family has more than
     /// one, so the other targets ignore anything but the default.
     pub method: Rar29Method,
+    /// Retained NewSub comment DOS timestamp and host ID.
+    pub(crate) archive_comment_metadata: Option<(u32, u8)>,
 }
 
 /// Which compression engine the RAR 2.9 family writer uses for a member.
@@ -234,6 +236,7 @@ impl WriterOptions {
             compression_level: None,
             dictionary_size: None,
             method: Rar29Method::Auto,
+            archive_comment_metadata: None,
         }
     }
 
@@ -261,6 +264,7 @@ impl Default for WriterOptions {
             compression_level: None,
             dictionary_size: None,
             method: Rar29Method::Auto,
+            archive_comment_metadata: None,
         }
     }
 }
@@ -927,6 +931,16 @@ impl NewSubHeader {
 }
 
 impl CommentHeader {
+    fn supports_rewrite(&self) -> bool {
+        self.block.head_type == COMM_HEAD
+            && self.block.flags == 0
+            && self.block.add_size.is_none()
+            && self.block.head_size >= COMMENT_HEADER_SIZE as u16
+            && usize::from(self.unp_size) <= usize::from(u16::MAX) - COMMENT_HEADER_SIZE
+            && (self.method == 0x30
+                || ((0x31..=0x35).contains(&self.method) && matches!(self.unp_ver, 15 | 20 | 26)))
+    }
+
     fn packed_data(&self, archive: &Archive) -> Result<Vec<u8>> {
         archive.read_range(self.packed_range.clone())
     }
@@ -1326,8 +1340,21 @@ impl Archive {
         if self.main.has_recovery_record() {
             issues.push("legacy recovery records".into());
         }
-        if self.main.flags & !(MHD_SOLID | MHD_PASSWORD) != 0
-            || self.main.head_size != MAIN_HEADER_SIZE as u16
+        let nested_comment_size = match self.blocks.first() {
+            Some(Block::Comment(comment))
+                if self.main.has_archive_comment()
+                    && self.main.head_size > MAIN_HEADER_SIZE as u16
+                    && comment.block.offset == RAR15_SIGNATURE.len() + MAIN_HEADER_SIZE =>
+            {
+                usize::from(comment.block.head_size)
+            }
+            _ => 0,
+        };
+        let new_comment = self
+            .new_subs()
+            .any(|sub| sub.kind == NewSubKind::ArchiveComment);
+        if self.main.flags & !(MHD_SOLID | MHD_PASSWORD | MHD_COMMENT) != 0
+            || usize::from(self.main.head_size) != MAIN_HEADER_SIZE + nested_comment_size
             || self.main.reserved1 != 0
             || self.main.reserved2 != 0
         {
@@ -1354,7 +1381,20 @@ impl Archive {
                 ));
             }
             if file.block.flags & FHD_COMMENT != 0 {
-                issues.push(format!("{label}: legacy file comments"));
+                let supported = parse_block_header(&file.file_comment, 0)
+                    .and_then(|block| parse_comment_header(&file.file_comment, block))
+                    .is_ok_and(|comment| {
+                        comment.supports_rewrite()
+                            && usize::from(comment.block.head_size) == file.file_comment.len()
+                    });
+                if !supported {
+                    issues.push(format!(
+                        "{label}: legacy file comments have unsupported or incomplete metadata"
+                    ));
+                }
+                if self.main.has_encrypted_headers() || new_comment {
+                    issues.push(format!("{label}: embedded file comments with RAR3 archive comments or encrypted headers are unsupported"));
+                }
             }
             if file.is_directory() {
                 issues.push(format!("{label}: legacy directory metadata"));
@@ -1370,7 +1410,7 @@ impl Archive {
                     "{label}: solid dependency without archive solid flag"
                 ));
             }
-            // Only native extended times are retained among optional fields. Check
+            // Only native times, salt and embedded comments are retained. Check
             // the declared length too: the reader tolerates unflagged extras.
             if file.block.flags
                 & !(LONG_BLOCK
@@ -1378,12 +1418,14 @@ impl Archive {
                     | FHD_DIRECTORY_MASK
                     | FHD_EXTTIME
                     | FHD_PASSWORD
-                    | FHD_SALT)
+                    | FHD_SALT
+                    | FHD_COMMENT)
                 != 0
                 || usize::from(file.block.head_size)
                     != 32
                         + file.name.len()
                         + file.ext_time.len()
+                        + file.file_comment.len()
                         + if file.salt.is_some() { 8 } else { 0 }
             {
                 issues.push(format!("{label}: legacy file flags or extra metadata"));
@@ -1392,10 +1434,50 @@ impl Archive {
                 issues.push(format!("{label}: unsupported legacy method or size"));
             }
         }
+        let mut archive_comments = 0;
+        let mut seen_file = false;
         for block in &self.blocks {
-            if !matches!(block, Block::File(_) | Block::End(_)) {
-                issues.push("legacy comments, recovery or other service records".into());
+            match block {
+                Block::File(_) => seen_file = true,
+                Block::End(_) => {}
+                Block::Comment(comment) => {
+                    archive_comments += 1;
+                    if seen_file || !comment.supports_rewrite() {
+                        issues.push(
+                            "legacy archive comment location or metadata is unsupported".into(),
+                        );
+                    }
+                }
+                Block::NewSub(sub) if sub.kind == NewSubKind::ArchiveComment => {
+                    archive_comments += 1;
+                    let file = &sub.file;
+                    if seen_file
+                        || file.is_directory()
+                        || file.is_encrypted()
+                        || file.block.flags & !(LONG_BLOCK | FHD_DIRECTORY_MASK | 0x4000) != 0
+                        || file.block.head_size != 35
+                        || file.unp_ver != 29
+                        || !(0x30..=0x35).contains(&file.method)
+                        || file.attr != 0
+                        || !matches!(file.host_os, 0..=3)
+                        || file.unp_size > u64::from(u32::MAX)
+                    {
+                        issues.push(
+                            "legacy CMT service metadata or encryption is unsupported".into(),
+                        );
+                    }
+                }
+                _ => issues.push("legacy recovery or other service records".into()),
             }
+        }
+        if archive_comments > 1 {
+            issues.push("duplicate legacy archive comments".into());
+        }
+        if self.main.has_archive_comment() && archive_comments == 0 {
+            issues.push("missing or malformed legacy archive comment".into());
+        }
+        if self.main.has_encrypted_headers() && archive_comments != 0 {
+            issues.push("legacy archive comments with encrypted headers are unsupported".into());
         }
         let complete_end = match self.blocks.last() {
             Some(Block::End(end)) => {
@@ -3236,6 +3318,7 @@ mod tests {
                 compression_level: None,
                 dictionary_size: None,
                 method: Rar29Method::Auto,
+                archive_comment_metadata: None,
             },
         )
         .unwrap();

@@ -362,7 +362,7 @@ fn write_members_to(
     }
     let mut head = Vec::new();
     write_main_header(&mut head, main_flags);
-    write_archive_comment(&mut head, archive_comment, options.target)?;
+    write_archive_comment(&mut head, archive_comment, options)?;
     output.write_all(&head)?;
 
     // Solid members share one encoder, so they are coded in order. Independent
@@ -1279,6 +1279,17 @@ fn validate_plan(
     has_archive_comment: bool,
     has_file_comment: bool,
 ) -> Result<()> {
+    if options.archive_comment_metadata.is_some()
+        && (!has_archive_comment
+            || !matches!(
+                options.target,
+                ArchiveVersion::Rar30 | ArchiveVersion::Rar40
+            ))
+    {
+        return Err(Error::InvalidArgument(
+            "retained archive comment metadata requires a RAR3/4 archive comment",
+        ));
+    }
     if options.target.family() != crate::version::ArchiveFamily::Rar15To40 {
         return Err(Error::UnsupportedVersion(options.target));
     }
@@ -2066,18 +2077,24 @@ fn uses_old_style_archive_comment(target: ArchiveVersion) -> bool {
 fn write_archive_comment(
     out: &mut Vec<u8>,
     comment: Option<&[u8]>,
-    target: ArchiveVersion,
+    options: WriterOptions,
 ) -> Result<()> {
-    if uses_old_style_archive_comment(target) {
+    if uses_old_style_archive_comment(options.target) {
         return write_comment_header(out, comment);
     }
-    match target {
-        ArchiveVersion::Rar30 | ArchiveVersion::Rar40 => write_newsub_archive_comment(out, comment),
-        _ => Err(Error::UnsupportedVersion(target)),
+    match options.target {
+        ArchiveVersion::Rar30 | ArchiveVersion::Rar40 => {
+            write_newsub_archive_comment(out, comment, options.archive_comment_metadata)
+        }
+        _ => Err(Error::UnsupportedVersion(options.target)),
     }
 }
 
-fn write_newsub_archive_comment(out: &mut Vec<u8>, comment: Option<&[u8]>) -> Result<()> {
+fn write_newsub_archive_comment(
+    out: &mut Vec<u8>,
+    comment: Option<&[u8]>,
+    metadata: Option<(u32, u8)>,
+) -> Result<()> {
     let Some(comment) = comment else {
         return Ok(());
     };
@@ -2090,9 +2107,9 @@ fn write_newsub_archive_comment(out: &mut Vec<u8>, comment: Option<&[u8]>) -> Re
             unpacked_size: comment.len(),
             file_crc: crc32(comment),
             packed_size: packed.len(),
-            file_time: 0,
+            file_time: metadata.map_or(0, |metadata| metadata.0),
             file_attr: 0,
-            host_os: 3,
+            host_os: metadata.map_or(3, |metadata| metadata.1),
             target: ArchiveVersion::Rar30,
             method: 0x33,
             dictionary_flags: dictionary_flags_for_target(ArchiveVersion::Rar30),

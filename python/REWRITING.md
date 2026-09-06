@@ -63,7 +63,8 @@ records are rejected. Comments remain attached through renames and removals.
 `RarBuilder.set_file_comment(member, comment=None)` sets or removes a queued
 comment; `b""` retains an explicit empty comment. RAR3/4 and volume output do not
 support setting file comments. Legacy comments exposed by the reader are retained
-when converting to RAR5; legacy comments still fail preservation preflight.
+when converting to RAR5. Native preservation also retains supported legacy
+archive comments and embedded file comments, as described below.
 
 `RarFile.gettimes(member)` returns present `modified`, `created` and `accessed`
 times as exact integer Unix nanoseconds. `RarBuilder.set_times(member, *,
@@ -119,7 +120,7 @@ header encryption is required, without claiming to reproduce the creating releas
 File data is recompressed.
 
 Specific preflight errors currently reject unsupported encryption settings,
-malformed extended timestamps, archive/file comments, directories, links, legacy
+malformed extended timestamps, unsupported comment forms, directories, links, legacy
 Unicode filename records,
 unsupported host metadata, recovery and other service records. Unknown header
 flags, extra header bytes, unsupported end headers and trailing bytes are also
@@ -136,6 +137,17 @@ explicit encryption-version records still fail preflight. Per-member encryption
 overrides are not supported for volume output. The legacy reader can currently
 require the password even when selecting a plaintext member of a mixed archive;
 this does not mean its payload is encrypted.
+
+Archive comments are retained in their old-style or RAR3/4 `CMT` form. Nested
+old-style comments may be emitted as standalone archive-comment blocks. RAR3/4
+comment records retain their DOS timestamp and host ID as well as decoded content.
+Embedded file comments follow renames/removals; explicit empty comments remain
+distinct from absent comments. Comments are decoded and integrity-checked before
+output. Duplicate archive comments, unknown comment metadata and ambiguous service
+locations fail preflight. Comments combined with encrypted headers, encrypted CMT
+payloads, and embedded file comments combined with a RAR3/4 archive CMT record are
+still unsupported writer combinations. File data encryption with visible comments
+is supported. These checks do not enable RAR1.x/2.0 preservation.
 
 Native rewriting preserves archival time even though `gettimes()` and RAR5
 conversion cannot represent it. Those conversion APIs retain their existing

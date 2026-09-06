@@ -153,9 +153,13 @@ impl Archive {
             } else {
                 None
             };
-            // Header encryption requires the RAR3 writer option; all these
-            // targets share unpacker version 29 for member data.
-            let version = if archive.main.has_encrypted_headers() {
+            // Header encryption and NewSub archive comments need the RAR3
+            // writer; these targets share unpacker version 29 for member data.
+            let version = if archive.main.has_encrypted_headers()
+                || archive
+                    .new_subs()
+                    .any(|sub| sub.kind == crate::rar15_40::NewSubKind::ArchiveComment)
+            {
                 crate::ArchiveVersion::Rar30
             } else {
                 crate::ArchiveVersion::Rar29
@@ -164,7 +168,13 @@ impl Archive {
                 .compression_level(Some(3))
                 .solid(archive.main.is_solid())
                 .password(password)
-                .header_encryption(archive.main.has_encrypted_headers()));
+                .header_encryption(archive.main.has_encrypted_headers())
+                .legacy_archive_comment_metadata(
+                    archive
+                        .new_subs()
+                        .find(|sub| sub.kind == crate::rar15_40::NewSubKind::ArchiveComment)
+                        .map(|sub| (sub.file.file_time, sub.file.host_os)),
+                ));
         }
         let Archive::Rar50Plus(archive) = self else {
             return Err(crate::Error::InvalidArgument(

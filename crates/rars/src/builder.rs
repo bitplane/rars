@@ -176,6 +176,7 @@ pub struct Builder {
     locked: bool,
     quick_open: bool,
     archive_metadata: Option<rar50::ArchiveMetadataRecord>,
+    legacy_archive_comment_metadata: Option<(u32, u8)>,
     volume_size: Option<usize>,
     entries: Vec<BuilderEntry>,
 }
@@ -196,6 +197,7 @@ impl Builder {
             locked: false,
             quick_open: false,
             archive_metadata: None,
+            legacy_archive_comment_metadata: None,
             volume_size: None,
             entries: Vec::new(),
         }
@@ -240,7 +242,15 @@ impl Builder {
 
     /// An archive comment.
     pub fn comment(mut self, comment: Option<Vec<u8>>) -> Self {
+        if comment.is_none() {
+            self.legacy_archive_comment_metadata = None;
+        }
         self.comment = comment;
+        self
+    }
+
+    pub(crate) fn legacy_archive_comment_metadata(mut self, metadata: Option<(u32, u8)>) -> Self {
+        self.legacy_archive_comment_metadata = metadata;
         self
     }
 
@@ -1115,6 +1125,7 @@ impl Builder {
 
     fn rar15_options(&self) -> rar15_40::WriterOptions {
         let mut options = rar15_40::WriterOptions::new(self.format, self.features());
+        options.archive_comment_metadata = self.legacy_archive_comment_metadata;
         if let Some(level) = self.compression {
             options = options.with_compression_level(level);
         }
@@ -1366,6 +1377,45 @@ fn unix_mode(_metadata: &fs::Metadata) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_comments_coexist_with_salt_and_extended_times() {
+        let mut builder = Builder::new(ArchiveVersion::Rar29)
+            .password(Some(b"secret".to_vec()))
+            .comment(Some(b"archive".to_vec()));
+        builder
+            .add_bytes(b"file".to_vec(), b"payload".to_vec(), Some(0), None)
+            .unwrap();
+        builder
+            .set_file_comment(b"file", Some(b"comment".to_vec()))
+            .unwrap();
+        builder
+            .set_legacy_extended_times(b"file", Some(vec![0, 0xb0, 1, 2, 3]))
+            .unwrap();
+        let archive = crate::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        assert!(archive.rewrite_preservation_issues().is_empty());
+        assert_eq!(
+            archive.member_comment_at(0, Some(b"secret")).unwrap(),
+            Some(b"comment".to_vec())
+        );
+        assert_eq!(
+            archive
+                .read_member(b"file", Some(b"secret"))
+                .unwrap()
+                .unwrap(),
+            b"payload"
+        );
+        assert_eq!(
+            archive
+                .as_rar15_40()
+                .unwrap()
+                .files()
+                .next()
+                .unwrap()
+                .ext_time,
+            [0, 0xb0, 1, 2, 3]
+        );
+    }
 
     #[test]
     fn legacy_header_encryption_survives_removing_encrypted_member() {
