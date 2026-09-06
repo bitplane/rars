@@ -1179,7 +1179,7 @@ fn write_member(
             host_os: member.host_os,
             target,
             method: encoded.method,
-            dictionary_flags: if member.is_directory {
+            dictionary_flags: if member.is_directory && target != ArchiveVersion::Rar15 {
                 FHD_DIRECTORY_MASK
             } else {
                 dictionary_flags_for_options(options)?

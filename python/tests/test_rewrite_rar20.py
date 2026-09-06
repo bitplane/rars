@@ -52,7 +52,7 @@ def test_vintage_rar20_preserves_metadata_comments_and_payloads(tmp_path, fixtur
             assert result.returncode == 0, result.stdout + result.stderr
 
 
-@pytest.mark.parametrize("damage", ["mixed", "salt", "extended"])
+@pytest.mark.parametrize("damage", ["unsupported_version", "salt", "extended"])
 def test_unsupported_rar20_combinations_leave_destination_untouched(tmp_path, damage):
     data = source_bytes("rar20", store=True)
     if damage == "extended":
@@ -60,8 +60,8 @@ def test_unsupported_rar20_combinations_leave_destination_untouched(tmp_path, da
     else:
         data = bytearray(data)
         offset, _, flags, size = next(h for h in headers(data) if h[1] == 0x74)
-        if damage in ("mixed"):
-            data[offset + 24] = 29
+        if damage in ("unsupported_version"):
+            data[offset + 24] = 42
         else:
             data[offset + size:offset + size] = b"salt1234"
             struct.pack_into("<H", data, offset + 3, flags | 0x400)

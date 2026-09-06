@@ -362,7 +362,7 @@ impl Builder {
         })
     }
 
-    /// Queue an explicit RAR2.0–4.x or RAR5/7 directory, including an empty one.
+    /// Queue an explicit RAR1.3–4.x or RAR5/7 directory, including an empty one.
     /// `mode` supplies Unix permission bits; otherwise DOS directory flags are used.
     /// Legacy timestamps use raw DOS values; legacy volume output is unsupported.
     pub fn add_directory(
@@ -394,7 +394,7 @@ impl Builder {
             || (legacy && self.volume_size.is_some())
         {
             return Err(Error::InvalidArgument(
-                "explicit directories require RAR5/7 or single-archive RAR2.0–4.x output",
+                "explicit directories require RAR5/7 or single-archive RAR1.3–4.x output",
             ));
         }
         self.push(BuilderEntry {
@@ -546,7 +546,7 @@ impl Builder {
         Ok(())
     }
 
-    /// Set per-member encryption for RAR2.0–4.x or RAR5/7 output.
+    /// Set per-member encryption for RAR1.3–4.x or RAR5/7 output.
     /// Legacy output supports data passwords only, for single archives.
     /// Explicit None passwords retain plaintext even when the builder has a default password.
     pub fn set_entry_encryption(
@@ -1000,7 +1000,7 @@ impl Builder {
                 "legacy per-entry encryption is unsupported in volume output",
             ));
         }
-        if self.format.family() == ArchiveFamily::Rar15To40 && self.entries.iter().any(|entry| entry.is_directory || matches!(entry.attributes, EntryAttributes::Unix(mode) if mode & 0o170000 == 0o120000)) {
+        if self.format.family() != ArchiveFamily::Rar50Plus && self.entries.iter().any(|entry| entry.is_directory || matches!(entry.attributes, EntryAttributes::Unix(mode) if mode & 0o170000 == 0o120000)) {
             return Err(Error::InvalidArgument("legacy directories and symbolic links are unsupported in volume output"));
         }
         let volume_size = self

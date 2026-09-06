@@ -170,29 +170,13 @@ impl Archive {
             } else {
                 None
             };
-            // Header encryption and NewSub archive comments need the RAR3
-            // writer; these targets share unpacker version 29 for member data.
-            let version = if archive.main.has_encrypted_headers()
-                || archive
-                    .new_subs()
-                    .any(|sub| sub.kind == crate::rar15_40::NewSubKind::ArchiveComment)
-            {
-                crate::ArchiveVersion::Rar30
-            } else if archive.files().all(|file| file.unp_ver == 15) {
-                crate::ArchiveVersion::Rar15
-            } else if archive.files().all(|file| matches!(file.unp_ver, 20 | 26)) {
-                crate::ArchiveVersion::Rar20
-            } else {
-                crate::ArchiveVersion::Rar29
-            };
+            let version = archive.preservation_version();
             return Ok(crate::Builder::new(version)
                 .compression_level(Some(3))
                 .legacy_unpack_version(
-                    archive
-                        .files()
-                        .next()
-                        .filter(|file| file.unp_ver == 26)
-                        .map(|file| file.unp_ver),
+                    (version == crate::ArchiveVersion::Rar20
+                        && archive.files().any(|file| file.unp_ver == 26))
+                    .then_some(26),
                 )
                 .solid(archive.main.is_solid())
                 .archive_comment_password(

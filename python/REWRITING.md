@@ -106,40 +106,39 @@ existing policy for creating filesystem links.
 ## Native legacy preservation
 
 The supported subset includes single-volume RAR 1.3–4.x archives containing ordinary
-files, including solid archives, RAR1.5/RAR2 data encryption and RAR2.9–4.x salted AES
-data encryption. RAR3/4 header encryption
-is retained separately; mixed encrypted/plain members keep their individual status.
-Names retain their original bytes;
-base DOS timestamps and validated extended records retain their raw values without
+files, including solid archives, RAR1.x/RAR2 data encryption and RAR2.9–4.x salted AES
+data encryption. RAR3/4 header encryption is retained separately; mixed encrypted/plain members keep their individual status.
+Names retain their original bytes; base DOS timestamps and validated extended records retain their raw values without
 a timezone conversion. This includes modification, creation, access and archival
 time, odd seconds and each record’s original fractional precision. Unix
 permissions/type bits and DOS attributes retain their source meaning. DOS, OS/2
 and Windows host IDs are normalised to the DOS host with the same attributes.
 Renames and removals retain original member identity and order.
 
-Sources using unpacker version 15, 20 or 26 for every member retain that unpacker
-requirement (26 uses the RAR2 codec), including
-old-style archive/file comments, directories and Unix links. Mixed unpacker
-versions, RAR3 comment records, encrypted headers and extended timestamps in
-pre-RAR2.9 sources are rejected. RAR1.5 supports DOS attributes; Unix metadata
-that its compatible writer would normalise is rejected.
+Legacy sources can mix supported unpacker versions. The output retains the
+highest format requirement present before editing, even if that member is later
+removed. Unpacker 15 uses RAR1.5, 20/26 use the RAR2 codec, and 29 uses RAR2.9;
+header encryption or NewSub archive comments require the compatible RAR3 writer.
+Recompression can increase an individual older member's unpacker requirement
+within that retained archive format, including its corresponding encryption
+cipher; passwords and each member's encryption status are retained.
+RAR1.5 output supports DOS attributes; Unix metadata that its compatible writer
+would normalise is rejected. Extended timestamps require RAR2.9 or later output.
 
 Modern UnRAR reports three comment-header errors on the original WinRAR 2.02
 comment fixtures and their rewrites, while validating both members successfully.
 Comment contents are checked independently through the library.
 
-Other supported sources use unpacker version 29 for every member. RAR 2.9, 3.x and 4.x
-share this version; preservation uses the compatible RAR29 writer, or RAR30 when
-header encryption or a NewSub archive comment is required, without claiming to reproduce the creating release.
-File data is recompressed.
+RAR2.9, 3.x and 4.x share unpacker version 29. Preservation retains the compatible
+format requirement without claiming to reproduce the creating release. File data
+is recompressed.
 
 Specific preflight errors currently reject unsupported encryption settings,
-malformed extended timestamps, unsupported comment forms, unsupported special entries, malformed legacy
-Unicode filename records,
-unsupported host metadata, recovery and other service records. Unknown header
+malformed extended timestamps, unsupported comment forms and special entries,
+malformed legacy Unicode filename records, unsupported host metadata, recovery
+and other service records. Unknown header
 flags, extra header bytes, unsupported end headers and trailing bytes are also
-rejected. Empty legacy output remains unsupported;
-removing the final member fails writing without replacing the destination.
+rejected. Empty legacy output remains unsupported; removing the final member fails writing without replacing the destination.
 Use explicit `preserve=False` conversion when these properties need conversion
 rather than retention. Legacy writers materialize retained payloads in memory.
 
@@ -163,11 +162,11 @@ Non-BMP names round-trip through the library. Linux UnRAR currently mishandles
 surrogate pairs in the legacy compact encoding, so its filename extraction checks
 cover BMP names; this does not change the retained Unicode data.
 
-The input password is required for retained data or header encryption and is reused
-for encrypted output. Plaintext members stay plaintext. Removing encrypted members
+The input password is required for retained data, header or archive-comment
+encryption and is reused for encrypted output. Plaintext members stay plaintext. Removing encrypted members
 does not disable retained header encryption. Missing/wrong passwords and decode
-failures leave an existing destination intact. Unexpected salt settings and explicit encryption-version records still fail
-preflight. Per-member encryption
+failures leave an existing destination intact. Unexpected salt settings and
+explicit encryption-version records still fail preflight. Per-member encryption
 overrides are not supported for volume output. The legacy reader can currently
 require the password even when selecting a plaintext member of a mixed archive;
 this does not mean its payload is encrypted.
@@ -185,8 +184,8 @@ headers. Modern UnRAR reports old-comment header diagnostics on these embedded
 records, while the library retains and verifies their contents. Embedded file
 comments with encrypted headers remain explicitly rejected: reference UnRAR
 refuses the whole archive for that combination. File data encryption with visible
-comments is supported. RAR1.3/1.4 comments are retained as decoded bytes; compressed archive comments
-may be emitted uncompressed. Unknown extra metadata and authenticity records
+comments is supported. RAR1.3/1.4 comments are retained as decoded bytes;
+compressed archive comments may be emitted uncompressed. Unknown extra metadata and authenticity records
 are rejected. The compatible RAR1.4 writer retains the shared unpacker-2 format,
 raw DOS names, timestamps, attributes, solid mode and per-member encryption.
 
@@ -229,7 +228,7 @@ Caller-owned output streams do not have this rollback guarantee.
 
 Preservation means supported archive semantics, not identical bytes, compression
 ratio, encoder release, dictionary choices or original solid group boundaries.
-Broader legacy preservation, volume-set rewriting, explicit conversion target
-settings and header-encrypted quick-open output remain separate work. A bounded
+Volume-set rewriting, explicit conversion target settings, unsupported legacy
+metadata/services and header-encrypted quick-open output remain separate work. A bounded
 single-pass rewrite session is also pending; current lazy member reads can repeat
 extraction work for solid archives.

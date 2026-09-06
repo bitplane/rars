@@ -392,6 +392,7 @@ impl FileHeader {
 
     pub fn is_directory(&self) -> bool {
         self.block.flags & FHD_DIRECTORY_MASK == FHD_DIRECTORY_MASK
+            || (self.unp_ver < 20 && self.attr & 0x10 != 0)
     }
 
     pub fn has_ext_time(&self) -> bool {
@@ -1337,7 +1338,24 @@ impl Archive {
         })
     }
 
-    /// Native metadata checks for the supported RAR 2.0–4.x rewrite subsets.
+    /// The highest format requirement present in this container, not its creator release.
+    pub(crate) fn preservation_version(&self) -> ArchiveVersion {
+        if self.main.has_encrypted_headers()
+            || self
+                .new_subs()
+                .any(|sub| sub.kind == NewSubKind::ArchiveComment)
+        {
+            ArchiveVersion::Rar30
+        } else {
+            match self.files().map(|file| file.unp_ver).max().unwrap_or(15) {
+                29.. => ArchiveVersion::Rar29,
+                20..=28 => ArchiveVersion::Rar20,
+                _ => ArchiveVersion::Rar15,
+            }
+        }
+    }
+
+    /// Native metadata checks for the supported RAR 1.5–4.x rewrite subsets.
     pub(crate) fn rewrite_preservation_issues(&self) -> Vec<String> {
         let mut issues = Vec::new();
         if self.main.is_volume() {
@@ -1356,9 +1374,6 @@ impl Archive {
             }
             _ => 0,
         };
-        let new_comment = self
-            .new_subs()
-            .any(|sub| sub.kind == NewSubKind::ArchiveComment);
         if self.main.flags & !(MHD_SOLID | MHD_PASSWORD | MHD_COMMENT) != 0
             || usize::from(self.main.head_size) != MAIN_HEADER_SIZE + nested_comment_size
             || self.main.reserved1 != 0
@@ -1369,17 +1384,11 @@ impl Archive {
         if self.files().next().is_none() {
             issues.push("empty legacy archive (source format cannot be inferred)".into());
         }
-        let older = self
-            .files()
-            .find(|file| file.unp_ver < 29)
-            .map(|file| file.unp_ver);
-        if older.is_some_and(|version| {
-            self.files().any(|file| file.unp_ver != version)
-                || self.main.has_encrypted_headers()
-                || new_comment
-        }) {
-            issues.push("Older RAR preservation with mixed unpacker versions, encrypted headers or RAR3 archive comments is unsupported".into());
-        }
+        let version = self.preservation_version();
+        let supports_extended_times = matches!(
+            version,
+            ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
+        );
         for (index, file) in self.files().enumerate() {
             let label = format!("legacy member {index} ({:?})", file.name_lossy());
             if !matches!(file.unp_ver, 15 | 20 | 26 | 29) {
@@ -1392,7 +1401,7 @@ impl Archive {
                     "{label}: unsupported legacy encryption salt settings"
                 ));
             }
-            if file.unp_ver < 29 && file.has_ext_time() {
+            if !supports_extended_times && file.has_ext_time() {
                 issues.push(format!(
                     "{label}: Pre-RAR2.9 extended timestamps are unsupported"
                 ));
@@ -1404,7 +1413,7 @@ impl Archive {
                     "{label}: legacy extended timestamps are incomplete or invalid"
                 ));
             }
-            if file.unp_ver == 15 && file.host_os == 3 {
+            if version == ArchiveVersion::Rar15 && file.host_os == 3 {
                 issues.push(format!(
                     "{label}: RAR1.5 Unix metadata cannot be represented by the compatible writer"
                 ));
@@ -1425,18 +1434,16 @@ impl Archive {
                     ));
                 }
             }
-            if file.is_directory()
-                && (file.pack_size != 0
-                    || file.unp_size != 0
-                    || file.method != 0x30
-                    || file.is_solid())
+            if file.is_directory() && (file.pack_size != 0 || file.unp_size != 0 || file.is_solid())
             {
                 issues.push(format!(
                     "{label}: unsupported legacy directory payload or compression"
                 ));
             }
             if let Some(raw) = &file.unicode_name {
-                if file.unp_ver < 20 || validate_unicode_name(raw, &file.name).is_err() {
+                if version == ArchiveVersion::Rar15
+                    || validate_unicode_name(raw, &file.name).is_err()
+                {
                     issues.push(format!(
                         "{label}: malformed or unsupported legacy Unicode name"
                     ));
