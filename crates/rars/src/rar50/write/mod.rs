@@ -69,6 +69,8 @@ pub struct ArchiveEntry {
     pub source: EntrySource,
     /// Explicit directory entry; its source must be empty.
     pub is_directory: bool,
+    /// Optional Unix symbolic link metadata; the source must be empty.
+    pub redirection: Option<super::FileRedirection>,
     pub mtime: Option<u32>,
     /// Optional nanosecond fraction; requires mtime and a value below one second.
     pub mtime_nanoseconds: Option<u32>,
@@ -112,6 +114,7 @@ impl ArchiveEntry {
             name: name.into(),
             source,
             is_directory: false,
+            redirection: None,
             mtime: None,
             mtime_nanoseconds: None,
             attributes: 0,
@@ -123,6 +126,11 @@ impl ArchiveEntry {
 
     pub fn with_directory(mut self, is_directory: bool) -> Self {
         self.is_directory = is_directory;
+        self
+    }
+
+    pub fn with_redirection(mut self, redirection: Option<super::FileRedirection>) -> Self {
+        self.redirection = redirection;
         self
     }
 
@@ -305,6 +313,12 @@ pub fn write_streaming_volumes_with_progress(
     }
     if extras.metadata.is_some() {
         crate::write_plan::validate_option(options.target, WriterOption::ArchiveMetadata, shape)?;
+    }
+    // The volume preparation path does not carry redirection metadata.
+    if entries.iter().any(|entry| entry.redirection.is_some()) {
+        return Err(Error::InvalidArgument(
+            "symbolic links are not supported in volume output",
+        ));
     }
     // A member's services are validated with it and then had nowhere to go:
     // `prepare_volume_member` never reads them, so a file comment asked for on
@@ -929,6 +943,16 @@ fn validate_file_entry(name: &[u8]) -> Result<()> {
 /// them beyond the name.
 fn validate_entry(entry: &ArchiveEntry) -> Result<()> {
     validate_file_entry(&entry.name)?;
+    if let Some(link) = &entry.redirection {
+        if !link.is_supported_unix_symlink()
+            || entry.host_os != 1
+            || entry.attributes & !0o7777 != 0o120000
+            || entry.is_directory
+            || entry.source.len()? != 0
+        {
+            return Err(Error::InvalidArgument("symbolic links require a supported Unix target, link attributes and empty contents"));
+        }
+    }
     if entry.is_directory && entry.source.len()? != 0 {
         return Err(Error::InvalidHeader(
             "directory entries cannot carry file contents",

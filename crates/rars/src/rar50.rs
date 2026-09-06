@@ -220,6 +220,18 @@ pub struct FileRedirection {
     pub target_name: Vec<u8>,
 }
 
+impl FileRedirection {
+    /// Whether this target can be emitted by the Unix symbolic link writer.
+    /// Targets use RAR5 wire bytes and are never resolved against the filesystem.
+    pub fn is_supported_unix_symlink(&self) -> bool {
+        self.redirection_type == 1
+            && self.flags & !1 == 0
+            && !self.target_name.is_empty()
+            && !self.target_name.contains(&0)
+            && std::str::from_utf8(&self.target_name).is_ok()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct FileHash {
@@ -1331,8 +1343,9 @@ fn parse_file_extra_area(
                 });
             }
             FHEXTRA_REDIR => {
-                file.rewrite_metadata_complete = false;
-                file.redirection = Some(parse_file_redirection_record(input, data)?);
+                let link = parse_file_redirection_record(input, data)?;
+                file.rewrite_metadata_complete &= !is_service && link.is_supported_unix_symlink();
+                file.redirection = Some(link);
             }
             FHEXTRA_HTIME => {
                 let flags = read_vint_at(input, data.start, data.end).ok();

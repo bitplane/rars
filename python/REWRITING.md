@@ -32,7 +32,7 @@ the separate password argument.
 | Timestamps | Modification time retained, including legacy odd seconds/fractions and RAR5 HTIME Unix/FILETIME fractions and explicit epoch | Preserve additional timestamp kinds using the established local-zone interpretation for legacy DOS times |
 | Attributes and host OS | Unix permission/special bits and DOS file flags retained using source host rules; unknown hosts use default DOS archive attributes | Preserve supported attributes with their source meaning; reject unsupported host semantics |
 | Archive comment | Copied as decoded comment bytes | Preserve comment content |
-| Links and special entries | RAR5 redirections, Unix special-file types, DOS reparse points and directories with file contents rejected before writing | Preserve supported types; reject unsupported preservation |
+| Links and special entries | RAR5 Unix symbolic links retained with target bytes and directory-target flag; other redirections, legacy links and special entries rejected before writing | Preserve supported types; reject unsupported preservation |
 | File comments | Decoded comments copied, including explicit empty comments; supported RAR5 CMT records pass preflight | Preserve supported comment content |
 | Other metadata | No faithful preservation contract | Preserve supported records; reject unsupported preservation |
 | Archive format | Always writes RAR5 | Preserve supported format semantics; exact creating release may be unknowable |
@@ -62,6 +62,17 @@ directory to RAR5/7 output. It also allows empty directories without an input
 archive. `mode` supplies Unix permissions; the default uses DOS directory flags.
 Recursive `add(path)` still only queues files; explicit directory creation does
 not change that existing traversal policy.
+
+`RarBuilder.add_unix_symlink(arcname, target, *, target_is_directory=False,
+mtime=None, mode=None)` queues a RAR5/7 Unix symbolic link. The target is stored
+as metadata without being followed, so dangling links are supported. `mode`
+defaults to `0o777`; link type bits are retained separately from permissions.
+`RarFile.readlink(member)` returns the raw target bytes of a supported Unix link.
+Targets use the [RAR5 wire encoding](https://www.rarlab.com/technote.htm), including
+its Unix byte mapping, and must be nonempty and contain no NUL. Relative targets
+are retained verbatim: renaming a link or its target does not retarget the link.
+Link volume output is currently rejected. Rewriting does not change extraction's
+existing policy for creating filesystem links.
 
 ## Agreed direction for the next minor release
 

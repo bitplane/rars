@@ -585,12 +585,29 @@ fn prepare_member(
         }
         None => (plain, plain_len, member.crc32, member.hash),
     };
-    write_hash_record_with_value(&mut extra, hash);
+    // A link has no file payload to hash; its target is protected by the header CRC.
+    if entry.redirection.is_none() {
+        write_hash_record_with_value(&mut extra, hash);
+    }
     super::headers::write_mtime_record(&mut extra, entry.mtime, entry.mtime_nanoseconds);
+    if let Some(link) = &entry.redirection {
+        let mut record = Vec::new();
+        write_vint(&mut record, link.redirection_type);
+        write_vint(&mut record, link.flags);
+        write_vint(&mut record, link.target_name.len() as u64);
+        record.extend_from_slice(&link.target_name);
+        write_extra_record(&mut extra, super::super::FHEXTRA_REDIR, &record);
+    }
 
     let specific = file_specific(
         &entry.name,
-        member.input_size,
+        // Match Unix link stat size, while the packed payload remains empty.
+        entry
+            .redirection
+            .as_ref()
+            .map_or(member.input_size, |link| {
+                crate::filename::decode_rar50(&link.target_name).len() as u64
+            }),
         Some(data_crc32),
         entry.attributes,
         entry.mtime.filter(|_| entry.mtime_nanoseconds.is_none()),

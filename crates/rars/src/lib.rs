@@ -448,6 +448,8 @@ pub enum ArchiveMemberDetail {
         compression_info: u64,
         /// Stored CRC-32 when present.
         crc32: Option<u32>,
+        /// Redirection metadata, including the raw target name.
+        redirection: Option<rar50::FileRedirection>,
         /// Strong file hash when present.
         hash: Option<ArchiveMemberHash>,
     },
@@ -768,7 +770,18 @@ impl Archive {
     ///
     /// Unlike name lookup this remains unambiguous when an archive contains
     /// duplicate names or names that are not valid UTF-8.
+    /// Indices include directories and redirections, which return no file bytes.
     pub fn read_member_at(&self, index: usize, password: Option<&[u8]>) -> Result<Option<Vec<u8>>> {
+        // The writer callback omits redirections, but public member indices do
+        // not. Translate once so links cannot shift the selected file's identity.
+        let Some(index) = self
+            .members()
+            .enumerate()
+            .filter(|(_, member)| !member.meta.is_redirection)
+            .position(|(original, _)| original == index)
+        else {
+            return Ok(None);
+        };
         let collected = std::sync::Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
         let current = std::cell::Cell::new(0usize);
         self.extract_to(password, |meta| {
@@ -961,6 +974,7 @@ fn rar50_member(file: &rar50::FileHeader) -> ArchiveMember {
             compression_info: file.compression_info,
             crc32: file.data_crc32,
             hash: file.hash.as_ref().map(rar50_member_hash),
+            redirection: file.redirection.clone(),
         },
     }
 }
@@ -1961,6 +1975,7 @@ mod tests {
                 compression_info: _,
                 crc32: _,
                 hash: _,
+                ..
             }
         ));
     }

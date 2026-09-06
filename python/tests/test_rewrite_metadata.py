@@ -79,11 +79,19 @@ def test_rewritten_directories_extract_with_unrar(tmp_path):
     assert (output / "nested/file").read_bytes() == b"payload"
 
 
-@pytest.mark.parametrize("fixture", ["symlink.rar", "hardlink.rar", "rarfile_hlink.rar"])
+@pytest.mark.parametrize("fixture", ["hardlink.rar", "rarfile_hlink.rar"])
 def test_rewrite_rejects_redirections_before_writing(fixture):
     source = ROOT / "crates/rars/tests/fixtures/rar50/wild" / fixture
     with pytest.raises(rars.UnsupportedRarFeature, match="cannot rewrite special entry"):
         rars.RarBuilder.from_archive(source)
+
+
+def test_rewrite_converts_reference_unix_symlink_archive():
+    source = rars.RarFile(ROOT / "crates/rars/tests/fixtures/rar50/wild/symlink.rar")
+    rewritten = rars.RarFile.from_bytes(rars.RarBuilder.from_archive(source).to_bytes())
+    assert rewritten.readlink("symlink.txt") == source.readlink("symlink.txt") == b"file.txt"
+    assert rewritten.readlink("dirlink") == source.readlink("dirlink") == b"dir"
+    assert rewritten.read("file.txt") == source.read("file.txt")
 
 
 @pytest.mark.parametrize("kind", [0o010000, 0o020000, 0o060000, 0o120000, 0o140000])
@@ -176,3 +184,39 @@ def test_rewrite_readonly_flag_matches_unrar(tmp_path):
         assert file.read_bytes() == b"DOS payload"
     assert modes[0] & 0o222 == 0
     assert modes[0] == modes[1]
+
+
+def test_rewrite_preserves_unix_symlinks_through_edits(tmp_path):
+    builder = rars.RarBuilder(store=True)
+    builder.add_unix_symlink("link", "../missing", mtime=123, mode=0o750)
+    builder.set_file_comment("link", b"link comment")
+    builder.add_unix_symlink("directory-link", "missing-dir", target_is_directory=True)
+    builder.add_bytes(b"payload", "file")
+    source = rars.RarFile.from_bytes(builder.to_bytes())
+    assert source.rewrite_preservation_issues() == []
+    rewritten = rars.RarBuilder.from_archive(source, preserve=True)
+    rewritten.rename("link", "renamed")
+    destination = tmp_path / "rewritten.rar"
+    rewritten.write(destination)
+    output = rars.RarFile(destination)
+    assert output.readlink("renamed") == b"../missing"
+    assert output.readlink("directory-link") == b"missing-dir"
+    assert output.getcomment("renamed") == b"link comment"
+    assert output.read("file") == b"payload"
+    assert output.rewrite_preservation_issues() == []
+    assert not (tmp_path / "missing-dir").exists()
+    rewritten.remove("renamed")
+    assert "renamed" not in rars.RarFile.from_bytes(rewritten.to_bytes()).namelist()
+
+
+@pytest.mark.skipif(not shutil.which("unrar"), reason="requires unrar")
+def test_reference_reader_recognizes_emitted_unix_symlink(tmp_path):
+    builder = rars.RarBuilder(store=True)
+    builder.add_unix_symlink("link", "target")
+    builder.add_bytes(b"payload", "target")
+    path = tmp_path / "links.rar"
+    builder.write(path)
+    # Listing validates the emitted metadata without creating filesystem links.
+    result = subprocess.run(["unrar", "lt", str(path)], capture_output=True, text=True, check=True)
+    assert "Unix symbolic link" in result.stdout
+    assert "target" in result.stdout

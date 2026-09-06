@@ -85,6 +85,7 @@ struct BuilderEntry {
     mtime: Option<u32>,
     mtime_nanoseconds: Option<u32>,
     file_comment: Option<Vec<u8>>,
+    redirection: Option<rar50::FileRedirection>,
     attributes: EntryAttributes,
 }
 
@@ -280,6 +281,7 @@ impl Builder {
             mtime,
             mtime_nanoseconds: None,
             file_comment: None,
+            redirection: None,
             attributes: mode.map_or(
                 EntryAttributes::Dos(u64::from(DOS_ARCHIVE_ATTR)),
                 EntryAttributes::Unix,
@@ -305,6 +307,7 @@ impl Builder {
             mtime,
             mtime_nanoseconds: None,
             file_comment: None,
+            redirection: None,
             attributes: mode.map_or(
                 EntryAttributes::Dos(u64::from(DOS_ARCHIVE_ATTR)),
                 EntryAttributes::Unix,
@@ -334,9 +337,45 @@ impl Builder {
             mtime,
             mtime_nanoseconds: None,
             file_comment: None,
+            redirection: None,
             attributes: mode.map_or(EntryAttributes::Dos(0x10), |mode| {
                 EntryAttributes::Unix((mode & 0o7777) | 0o040000)
             }),
+        })
+    }
+
+    /// Queue a RAR5/7 Unix symbolic link without following its target.
+    /// Name and target use archive wire bytes. Relative targets remain unchanged
+    /// through renames; the directory flag describes the target, not this entry.
+    pub fn add_unix_symlink(
+        &mut self,
+        name: Vec<u8>,
+        target: Vec<u8>,
+        target_is_directory: bool,
+        mtime: Option<u32>,
+        mode: Option<u32>,
+    ) -> Result<()> {
+        let link = rar50::FileRedirection {
+            redirection_type: 1,
+            flags: u64::from(target_is_directory),
+            target_name: target,
+        };
+        if self.format.family() != ArchiveFamily::Rar50Plus
+            || self.volume_size.is_some()
+            || !link.is_supported_unix_symlink()
+        {
+            return Err(Error::InvalidArgument("symbolic links require single-archive RAR5/7 output and a nonempty UTF-8 wire target without NUL"));
+        }
+        self.push(BuilderEntry {
+            name: self.validate_name(name)?,
+            data: Vec::new(),
+            source: None,
+            is_directory: false,
+            mtime,
+            mtime_nanoseconds: None,
+            file_comment: None,
+            redirection: Some(link),
+            attributes: EntryAttributes::Unix(0o120000 | (mode.unwrap_or(0o777) & 0o7777)),
         })
     }
 
@@ -413,6 +452,11 @@ impl Builder {
                 operation: "setting DOS attributes",
                 source: Box::new(Error::EntryNotFound),
             })?;
+        if entry.redirection.is_some() {
+            return Err(Error::InvalidArgument(
+                "Unix symbolic links require Unix attributes",
+            ));
+        }
         if (attributes & 0x10 != 0) != entry.is_directory {
             return Err(Error::InvalidArgument(
                 "DOS directory attributes must match the entry kind",
@@ -613,6 +657,11 @@ impl Builder {
         if self.entries.is_empty() {
             return Err(Error::InvalidArgument("archive builder has no entries"));
         }
+        if self.entries.iter().any(|entry| entry.redirection.is_some()) {
+            return Err(Error::InvalidArgument(
+                "symbolic links are not supported in volume output",
+            ));
+        }
         let this = self.materialized()?;
         match self.format.family() {
             ArchiveFamily::Rar50Plus => this.build_rar50_volumes(volume_size, progress),
@@ -712,6 +761,7 @@ impl Builder {
                 });
                 let built = rar50::ArchiveEntry::new(entry.name.clone(), source)
                     .with_directory(entry.is_directory)
+                    .with_redirection(entry.redirection.clone())
                     .with_mtime(entry.mtime)
                     .with_mtime_nanoseconds(entry.mtime_nanoseconds)
                     .with_attributes(entry.rar50_attr())

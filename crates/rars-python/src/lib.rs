@@ -442,6 +442,23 @@ impl RarFile {
             .map_err(map_error)
     }
 
+    /// Returns the raw RAR5 target of a supported Unix symbolic link.
+    /// This reads archive metadata and never follows the link.
+    fn readlink(&self, member: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+        let name = member_name_bytes(member)?;
+        let member = self
+            .archive
+            .members()
+            .find(|member| member.meta.name == name)
+            .ok_or_else(|| PyKeyError::new_err("member not found"))?;
+        member
+            .unix_symlink()
+            .map(|link| link.target_name.clone())
+            .ok_or_else(|| {
+                UnsupportedRarFeature::new_err("member is not a supported Unix symbolic link")
+            })
+    }
+
     /// Metadata/settings the current rewrite implementation cannot preserve.
     /// This is a conservative metadata check, not a payload integrity test.
     fn rewrite_preservation_issues(&self) -> Vec<String> {
@@ -611,7 +628,7 @@ impl RarBuilder {
     ///
     /// This currently copies file contents, names, order, archive and file comments,
     /// and modification times including supported subsecond precision.
-    /// Explicit directories are retained; links and other special entries are
+    /// Explicit directories and supported Unix symbolic links are retained; other special entries are
     /// rejected before writing. It does not preserve encryption, solid settings
     /// or volume layout. Unix permission bits and DOS file flags are retained;
     /// unknown hosts use the builder's DOS defaults. The password
@@ -670,6 +687,7 @@ impl RarBuilder {
         };
         for ((member_index, member), comment) in archive.archive.members().enumerate().zip(comments)
         {
+            let link = member.unix_symlink().cloned();
             let info = member.meta;
             // A builder mode is Unix metadata, not generic archive attributes.
             // Reuse extraction's host rules: e.g. legacy host 1 is DOS, but
@@ -681,10 +699,11 @@ impl RarBuilder {
                 && !(info.is_directory && unix_type == 0o040000);
             let reparse_point =
                 attr_source == rars_rs::AttrSource::Dos && info.file_attr & 0x400 != 0;
-            if info.is_redirection
-                || unsupported_type
-                || reparse_point
-                || (info.is_directory && info.unpacked_size != 0)
+            if link.is_none()
+                && (info.is_redirection
+                    || unsupported_type
+                    || reparse_point
+                    || (info.is_directory && info.unpacked_size != 0))
             {
                 return Err(UnsupportedRarFeature::new_err(format!(
                     "cannot rewrite special entry {:?}: its type or contents cannot be preserved",
@@ -704,7 +723,18 @@ impl RarBuilder {
                 .map_err(|_| {
                     PyValueError::new_err("modification time exceeds the RAR5 timestamp range")
                 })?;
-            if info.is_directory {
+            if let Some(link) = link {
+                builder
+                    .inner
+                    .add_unix_symlink(
+                        info.name.clone(),
+                        link.target_name,
+                        link.flags & 1 != 0,
+                        mtime,
+                        mode,
+                    )
+                    .map_err(map_builder_error)?;
+            } else if info.is_directory {
                 builder
                     .inner
                     .add_directory(info.name.clone(), mtime, mode)
@@ -797,6 +827,28 @@ impl RarBuilder {
     fn rename(&mut self, old: &Bound<'_, PyAny>, new: &Bound<'_, PyAny>) -> PyResult<()> {
         self.inner
             .rename(&member_name_bytes(old)?, member_name_bytes(new)?)
+            .map_err(map_builder_error)
+    }
+
+    /// Queues a Unix symbolic link without reading or following the target.
+    /// Target bytes use the RAR5 wire encoding and remain unchanged by renames.
+    #[pyo3(signature = (arcname, target, *, target_is_directory=false, mtime=None, mode=None))]
+    fn add_unix_symlink(
+        &mut self,
+        arcname: &Bound<'_, PyAny>,
+        target: &Bound<'_, PyAny>,
+        target_is_directory: bool,
+        mtime: Option<u32>,
+        mode: Option<u32>,
+    ) -> PyResult<()> {
+        self.inner
+            .add_unix_symlink(
+                member_name_bytes(arcname)?,
+                member_name_bytes(target)?,
+                target_is_directory,
+                mtime,
+                mode,
+            )
             .map_err(map_builder_error)
     }
 

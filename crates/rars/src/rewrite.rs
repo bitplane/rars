@@ -119,7 +119,7 @@ impl Archive {
         }
         let mut names = HashSet::new();
         for (index, member) in self.members().enumerate() {
-            let meta = member.meta;
+            let meta = &member.meta;
             let label = format!("member {index} ({:?})", String::from_utf8_lossy(&meta.name));
             if !names.insert(meta.name.clone()) {
                 issues.push(format!("{label}: duplicate name"));
@@ -136,7 +136,7 @@ impl Archive {
             if meta.attr_source() == AttrSource::Unknown {
                 issues.push(format!("{label}: unknown host attributes"));
             }
-            if special_entry(&meta) {
+            if special_entry(meta) && member.unix_symlink().is_none() {
                 issues.push(format!("{label}: special entry type or directory contents"));
             }
             if (meta.attr_source() == AttrSource::Unix
@@ -276,4 +276,26 @@ pub(crate) fn special_entry(meta: &ArchiveMemberMeta) -> bool {
             && !matches!(kind, 0 | 0o100000)
             && !(meta.is_directory && kind == 0o040000))
         || (meta.attr_source() == AttrSource::Dos && meta.file_attr & 0x400 != 0)
+}
+
+impl crate::ArchiveMember {
+    /// Supported RAR5 Unix symbolic link metadata. No filesystem lookup occurs.
+    pub fn unix_symlink(&self) -> Option<&crate::rar50::FileRedirection> {
+        let crate::ArchiveMemberDetail::Rar50Plus {
+            redirection: Some(link),
+            ..
+        } = &self.detail
+        else {
+            return None;
+        };
+        (link.is_supported_unix_symlink()
+            && self.meta.host_os == Some(1)
+            && self.meta.file_attr & !0o7777 == 0o120000
+            && !self.meta.is_directory
+            && (self.meta.unpacked_size == 0
+                || self.meta.unpacked_size
+                    == crate::filename::decode_rar50(&link.target_name).len() as u64)
+            && self.meta.packed_size == 0)
+            .then_some(link)
+    }
 }
