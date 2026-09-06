@@ -83,7 +83,7 @@ pub enum Error {
     Io(IoError),
     NeedPassword,
     WrongPasswordOrCorruptData,
-    /// Archive writing was cancelled by a progress callback.
+    /// Archive writing was cancelled by a token or progress callback.
     Cancelled,
     CrcMismatch {
         expected: u16,
@@ -254,7 +254,10 @@ impl Error {
 
 impl From<crate::codec::Error> for Error {
     fn from(error: crate::codec::Error) -> Self {
-        Self::Codec(error)
+        match error {
+            crate::codec::Error::Cancelled => Self::Cancelled,
+            error => Self::Codec(error),
+        }
     }
 }
 

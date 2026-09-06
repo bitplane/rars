@@ -70,6 +70,7 @@ pub trait WriteProgress: Send + Sync {
     fn report(&self, event: WriteProgressEvent<'_>);
 
     /// Returns true when the caller wants the active write operation to stop.
+    /// RAR5/7 streaming writes retain an observed request for the rest of the write.
     fn is_cancelled(&self) -> bool {
         false
     }
@@ -127,6 +128,10 @@ impl<'a> WorkTracker<'a> {
             total,
             state: Mutex::new(WorkState::default()),
         }
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.progress.is_some_and(ProgressReporter::is_cancelled)
     }
 
     pub(crate) fn advance(&self, amount: u64) -> bool {
@@ -193,3 +198,93 @@ impl<'a> WorkTracker<'a> {
     }
 }
 use std::sync::Mutex;
+
+/// Combine cancellation policy with optional presentation for one write.
+pub(crate) struct ResourceProgress<'a> {
+    resources: &'a crate::WriterResources,
+    inner: Option<ProgressReporter<'a>>,
+    cancelled: std::sync::atomic::AtomicBool,
+}
+impl<'a> ResourceProgress<'a> {
+    pub(crate) fn new(
+        resources: &'a crate::WriterResources,
+        inner: Option<ProgressReporter<'a>>,
+    ) -> Self {
+        Self {
+            resources,
+            inner,
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+impl WriteProgress for ResourceProgress<'_> {
+    fn report(&self, event: WriteProgressEvent<'_>) {
+        if let Some(inner) = self.inner {
+            inner.report(event);
+        }
+    }
+    fn is_cancelled(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.cancelled.load(Ordering::Relaxed)
+            || self.resources.is_cancelled()
+            || self.inner.is_some_and(ProgressReporter::is_cancelled)
+        {
+            self.cancelled.store(true, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+pub(crate) fn check_cancelled(progress: Option<ProgressReporter<'_>>) -> crate::Result<()> {
+    if progress.is_some_and(ProgressReporter::is_cancelled) {
+        Err(crate::Error::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+/// Preserve typed cancellation through APIs which can only return I/O errors.
+/// Never use ErrorKind::Interrupted: write_all/read_exact would retry forever.
+pub(crate) struct CancellableIo<'a, T> {
+    pub(crate) inner: T,
+    pub(crate) progress: Option<ProgressReporter<'a>>,
+}
+impl<T> CancellableIo<'_, T> {
+    fn check(&self) -> std::io::Result<()> {
+        check_cancelled(self.progress).map_err(std::io::Error::other)
+    }
+}
+impl<T: std::io::Read> std::io::Read for CancellableIo<'_, T> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.check()?;
+        let len = if self.progress.is_some() {
+            buffer.len().min(64 * 1024)
+        } else {
+            buffer.len()
+        };
+        self.inner.read(&mut buffer[..len])
+    }
+}
+impl<T: std::io::Write> std::io::Write for CancellableIo<'_, T> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.check()?;
+        let len = if self.progress.is_some() {
+            buffer.len().min(64 * 1024)
+        } else {
+            buffer.len()
+        };
+        self.inner.write(&buffer[..len])
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.check()?;
+        self.inner.flush()
+    }
+}
+impl<T: std::io::Seek> std::io::Seek for CancellableIo<'_, T> {
+    fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.check()?;
+        self.inner.seek(from)
+    }
+}

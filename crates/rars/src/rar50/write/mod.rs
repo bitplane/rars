@@ -279,6 +279,11 @@ pub fn write_streaming_volumes_with_progress(
     resources: &WriterResources,
     progress: Option<&dyn WriteProgress>,
 ) -> Result<()> {
+    let control =
+        crate::write_progress::ResourceProgress::new(resources, progress.map(ProgressReporter));
+    let progress: Option<&dyn WriteProgress> =
+        (progress.is_some() || resources.has_cancellation()).then_some(&control);
+    crate::write_progress::check_cancelled(progress.map(ProgressReporter))?;
     let encrypted = entries.iter().any(|entry| entry.password.is_some());
     if encrypted && !entries.iter().all(|entry| entry.password.is_some()) {
         return Err(Error::UnsupportedFeature {
@@ -440,6 +445,10 @@ pub(crate) fn write_streaming_archive_reporting(
     progress: Option<ProgressReporter<'_>>,
     output: &mut dyn Write,
 ) -> Result<()> {
+    let control = crate::write_progress::ResourceProgress::new(resources, progress);
+    let progress =
+        (progress.is_some() || resources.has_cancellation()).then_some(ProgressReporter(&control));
+    crate::write_progress::check_cancelled(progress)?;
     let encrypted = entries.iter().any(|entry| entry.password.is_some());
     if encrypted && !entries.iter().all(|entry| entry.password.is_some()) {
         return Err(Error::UnsupportedFeature {
@@ -552,7 +561,11 @@ fn source_integrity(
     source: &EntrySource,
     expected_size: u64,
     block_size: usize,
+    progress: &dyn compress::CompressionProgress,
 ) -> Result<(u32, [u8; 32])> {
+    if progress.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
     let mut crc = Crc32::new();
     let mut hash = blake2sp::Hasher::new();
     let mut reader = source.open()?;
@@ -560,6 +573,9 @@ fn source_integrity(
     let mut observed = 0u64;
     let mut limited = reader.by_ref().take(expected_size);
     loop {
+        if progress.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
         let read = limited.read(&mut buffer)?;
         if read == 0 {
             break;
@@ -650,12 +666,15 @@ fn encrypt_reader_to(
     keys: &Rar50Keys,
     iv: [u8; 16],
     block_size: usize,
+    progress: Option<ProgressReporter<'_>>,
 ) -> Result<()> {
+    crate::write_progress::check_cancelled(progress)?;
     let mut cipher = Rar50Cipher::new(keys.key, iv);
     let chunk_size = block_size.max(16) & !15;
     let mut buffer = vec![0u8; chunk_size];
     let mut remaining = input_size;
     while remaining >= chunk_size as u64 {
+        crate::write_progress::check_cancelled(progress)?;
         reader.read_exact(&mut buffer)?;
         cipher
             .encrypt_in_place(&mut buffer)
@@ -670,6 +689,7 @@ fn encrypt_reader_to(
         .ok_or(Error::InvalidHeader("RAR 5 encrypted data size overflows"))?
         & !15;
     if final_padded != 0 {
+        crate::write_progress::check_cancelled(progress)?;
         buffer[..final_padded].fill(0);
         reader.read_exact(&mut buffer[..final_plain])?;
         cipher

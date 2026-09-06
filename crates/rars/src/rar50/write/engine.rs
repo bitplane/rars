@@ -29,7 +29,7 @@ use crate::recovery::rar5::{
     ReadWriteSeek,
 };
 use crate::streaming::Spool;
-use crate::write_progress::ProgressReporter;
+use crate::write_progress::{check_cancelled, CancellableIo, ProgressReporter};
 use crate::{Error, Result, WriterResources};
 use std::io::{Read, Write};
 
@@ -149,6 +149,11 @@ pub(super) fn write_archive(
     resources: &WriterResources,
     output: &mut dyn Write,
 ) -> Result<()> {
+    let mut controlled_output = CancellableIo {
+        inner: output,
+        progress: plan.progress,
+    };
+    let output: &mut dyn Write = &mut controlled_output;
     for entry in entries {
         super::validate_entry(entry)?;
     }
@@ -197,6 +202,7 @@ pub(super) fn write_archive(
         blocks.push(prepare_comment(comment, header_keys.as_ref())?);
     }
     for (entry, member) in entries.iter().zip(compressed) {
+        check_cancelled(plan.progress)?;
         blocks.push(prepare_member(entry, member, &plan, header_keys.as_ref())?);
         for service in &entry.services {
             blocks.push(prepare_service(service, header_keys.as_ref())?);
@@ -303,13 +309,13 @@ pub(super) fn write_archive(
 
         for block in blocks {
             sink.write_all(&block.header)?;
-            write_payload(block.payload, &mut sink, resources)?;
+            write_payload(block.payload, &mut sink, resources, plan.progress)?;
         }
 
         if let Some(payload) = &quick_open_payload {
             let block = stored_service_block(b"QO", payload, &[], header_keys.as_ref())?;
             sink.write_all(&block.header)?;
-            write_payload(block.payload, &mut sink, resources)?;
+            write_payload(block.payload, &mut sink, resources, plan.progress)?;
         }
     }
 
@@ -349,6 +355,7 @@ pub(super) fn write_archive(
             output.write_all(&end)?;
         }
     }
+    check_cancelled(plan.progress)?;
     report_emission(plan.progress, false);
     Ok(())
 }
@@ -599,7 +606,9 @@ fn write_payload(
     payload: Payload,
     output: &mut dyn Write,
     resources: &WriterResources,
+    progress: Option<ProgressReporter<'_>>,
 ) -> Result<()> {
+    check_cancelled(progress)?;
     match payload {
         Payload::Inline(data) => {
             output.write_all(&data)?;
@@ -616,17 +625,27 @@ fn write_payload(
         }
         Payload::Encrypted { plain, keys, iv } => {
             const ENCRYPT_CHUNK: usize = 64 * 1024;
-            let _permit = resources.acquire(ENCRYPT_CHUNK as u64, 0)?;
+            let _permit = resources.acquire_cancellable(ENCRYPT_CHUNK as u64, 0, &|| {
+                progress.is_some_and(ProgressReporter::is_cancelled)
+            })?;
             match *plain {
                 Payload::Stored(source) => {
                     let mut reader = source.open()?;
-                    encrypt_reader_to(&mut reader, source.len, output, &keys, iv, ENCRYPT_CHUNK)?;
+                    encrypt_reader_to(
+                        &mut reader,
+                        source.len,
+                        output,
+                        &keys,
+                        iv,
+                        ENCRYPT_CHUNK,
+                        progress,
+                    )?;
                     reader.finish(&source, source.len)
                 }
                 Payload::Packed(mut packed) => {
                     let len = packed.len();
                     packed.rewind()?;
-                    encrypt_reader_to(&mut packed, len, output, &keys, iv, ENCRYPT_CHUNK)
+                    encrypt_reader_to(&mut packed, len, output, &keys, iv, ENCRYPT_CHUNK, progress)
                 }
                 // Inline payloads are encrypted where they are built, and
                 // nothing is encrypted twice.
@@ -650,7 +669,9 @@ fn write_recovery_service(
     let prefix_len = prefix.len();
     let plan = plan_inline_recovery(prefix_len, recovery_percent)?;
     let (mode, required) = choose_recovery_memory_mode(plan, resources.memory_limit())?;
-    let _permit = resources.acquire(required, 0)?;
+    let _permit = resources.acquire_cancellable(required, 0, &|| {
+        progress.is_some_and(ProgressReporter::is_cancelled)
+    })?;
 
     let mut scratch = match mode {
         crate::recovery::rar5::RecoveryMemoryMode::Striped { .. } => {
@@ -661,17 +682,30 @@ fn write_recovery_service(
     let mut payload = Spool::create(resources)?;
     prefix.rewind()?;
     let built = build_streamed_inline_recovery(
-        prefix,
+        &mut CancellableIo {
+            inner: prefix,
+            progress,
+        },
         prefix_len,
         recovery_percent,
         mode,
         scratch
             .as_mut()
             .map(|scratch| scratch as &mut dyn ReadWriteSeek),
-        &mut payload,
+        &mut CancellableIo {
+            inner: &mut payload,
+            progress,
+        },
         progress,
         1,
-    )?;
+    )
+    .map_err(|error| {
+        if check_cancelled(progress).is_err() {
+            Error::Cancelled
+        } else {
+            error.into()
+        }
+    })?;
 
     debug_assert_eq!(built.plan.payload_size(), Ok(built.payload_len));
 
@@ -747,9 +781,21 @@ impl FragmentSource {
     /// payload, so the range is read twice: once here and once to copy it. The
     /// alternative is patching the fields after the copy, which an encrypted
     /// header will not allow.
-    fn checksums_range(&mut self, start: u64, len: u64) -> Result<FragmentChecksums> {
+    fn checksums_range(
+        &mut self,
+        start: u64,
+        len: u64,
+        progress: Option<ProgressReporter<'_>>,
+    ) -> Result<FragmentChecksums> {
         let mut sink = ChecksumSink::default();
-        self.copy_range_unverified(start, len, &mut sink)?;
+        self.copy_range_unverified(
+            start,
+            len,
+            &mut CancellableIo {
+                inner: &mut sink,
+                progress,
+            },
+        )?;
         Ok(FragmentChecksums {
             crc32: sink.crc.finish(),
             hash: sink.hash.finalize(),
@@ -883,6 +929,9 @@ struct MemberProgress<'a, 'p> {
     work: &'a crate::write_progress::WorkTracker<'p>,
 }
 impl compress::CompressionProgress for MemberProgress<'_, '_> {
+    fn is_cancelled(&self) -> bool {
+        self.work.is_cancelled()
+    }
     fn advance(&self, bytes: u64) -> bool {
         self.work.advance(bytes)
     }
@@ -952,6 +1001,7 @@ pub(super) fn write_volumes(
 
     let mut members = Vec::with_capacity(entries.len());
     for (entry, member) in entries.iter().zip(compressed) {
+        check_cancelled(plan.progress)?;
         members.push(prepare_volume_member(entry, member, &plan, resources)?);
     }
     if !work.finish() {
@@ -984,6 +1034,7 @@ pub(super) fn write_volumes(
         writer.write_member(&mut member)?;
     }
     writer.finish()?;
+    check_cancelled(plan.progress)?;
     report_emission(plan.progress, false);
     Ok(())
 }
@@ -996,6 +1047,8 @@ fn prepare_volume_member(
     plan: &EnginePlan<'_>,
     resources: &WriterResources,
 ) -> Result<VolumeMember> {
+    let progress = plan.progress;
+    check_cancelled(progress)?;
     let compression_info = compress::member_compression_info(&plan.compress, &member, plan.method)?;
     let plain_len = if member.store {
         member.input_size
@@ -1021,7 +1074,9 @@ fn prepare_volume_member(
             // storage and slice the ciphertext.
             let mut encrypted = Spool::create(resources)?;
             const ENCRYPT_CHUNK: usize = 64 * 1024;
-            let _permit = resources.acquire(ENCRYPT_CHUNK as u64, 0)?;
+            let _permit = resources.acquire_cancellable(ENCRYPT_CHUNK as u64, 0, &|| {
+                progress.is_some_and(ProgressReporter::is_cancelled)
+            })?;
             if member.store {
                 let source = PreparedSource::new(&entry.source, &member);
                 let mut reader = source.open()?;
@@ -1032,6 +1087,7 @@ fn prepare_volume_member(
                     &keys,
                     iv,
                     ENCRYPT_CHUNK,
+                    progress,
                 )?;
                 reader.finish(&source, source.len)?;
             } else {
@@ -1044,6 +1100,7 @@ fn prepare_volume_member(
                     &keys,
                     iv,
                     ENCRYPT_CHUNK,
+                    progress,
                 )?;
             }
             let payload_len = encrypted.len();
@@ -1106,6 +1163,7 @@ struct VolumeWriter<'a> {
 impl VolumeWriter<'_> {
     /// Cuts one member across as many volumes as it takes.
     fn write_member(&mut self, member: &mut VolumeMember) -> Result<()> {
+        check_cancelled(self.progress)?;
         let mut start = 0u64;
         let mut split_before = false;
         // Zero-length members still need a header of their own.
@@ -1128,7 +1186,11 @@ impl VolumeWriter<'_> {
             // volume stores. That is what WinRAR puts there, and it lets a
             // single volume be checked on its own.
             let fragment_checksums = match split_after {
-                true => Some(member.source.checksums_range(start, fragment_len)?),
+                true => Some(
+                    member
+                        .source
+                        .checksums_range(start, fragment_len, self.progress)?,
+                ),
                 false => None,
             };
 
@@ -1141,9 +1203,15 @@ impl VolumeWriter<'_> {
             )?;
             let body = self.body.as_mut().expect("volume started");
             body.write_all(&header)?;
-            member
-                .source
-                .emit_range(start, fragment_len, body, fragment_checksums)?;
+            member.source.emit_range(
+                start,
+                fragment_len,
+                &mut CancellableIo {
+                    inner: body,
+                    progress: self.progress,
+                },
+                fragment_checksums,
+            )?;
 
             self.payload_in_volume += fragment_len;
             start += fragment_len;
@@ -1202,7 +1270,12 @@ impl VolumeWriter<'_> {
             recovery_percent: self.recovery_percent,
         })?;
 
-        let mut output = self.sink.start_volume(volume_number)?;
+        check_cancelled(self.progress)?;
+        let raw_output = self.sink.start_volume(volume_number)?;
+        let mut output = CancellableIo {
+            inner: raw_output,
+            progress: self.progress,
+        };
         let mut mirror = match self.recovery_percent {
             Some(_) => Some(Spool::create(self.resources)?),
             None => None,
@@ -1210,7 +1283,7 @@ impl VolumeWriter<'_> {
         let mut written;
         {
             let mut tee = Tee {
-                output: &mut *output,
+                output: &mut output,
                 mirror: mirror.as_mut(),
             };
             let main = match self.header_keys {
@@ -1253,7 +1326,7 @@ impl VolumeWriter<'_> {
                 self.header_keys,
                 self.resources,
                 self.progress,
-                &mut *output,
+                &mut output,
             )?;
         }
 

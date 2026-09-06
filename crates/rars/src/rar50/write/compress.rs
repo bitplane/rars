@@ -27,6 +27,9 @@ use std::io::{Read, Write};
 /// Compression work and member lifecycle, independent of presentation.
 pub(super) trait CompressionProgress: Sync {
     fn advance(&self, bytes: u64) -> bool;
+    fn is_cancelled(&self) -> bool {
+        false
+    }
     fn started(&self, _member: usize, _size: u64) {}
     fn finished(&self, _member: usize, _size: u64) {}
 }
@@ -104,6 +107,9 @@ impl MemberStream {
     ) -> Result<Self> {
         if size == 0 {
             progress.started(member, size);
+            if progress.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
             check_source_end(&mut *source.open()?)?;
             progress.finished(member, size);
         }
@@ -135,6 +141,9 @@ pub(super) fn compress_members_reporting(
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
 ) -> Result<Vec<CompressedMember>> {
+    if advance.is_cancelled() || resources.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
     let mut integrity = Vec::with_capacity(sources.len());
     for source in sources {
         let input_size = source.len()?;
@@ -158,7 +167,7 @@ pub(super) fn compress_members_reporting(
             sources.iter().zip(&mut integrity).enumerate()
         {
             advance.started(index, *input_size);
-            (*crc, *hash) = super::source_integrity(source, *input_size, plan.block_size)?;
+            (*crc, *hash) = super::source_integrity(source, *input_size, plan.block_size, advance)?;
             if !advance.advance(*input_size) {
                 return Err(Error::Cancelled);
             }
@@ -184,7 +193,8 @@ pub(super) fn compress_members_reporting(
         );
         let max_jobs_by_memory = resources.memory_limit() / required;
         if max_jobs_by_memory == 0 {
-            resources.acquire(required, plan.dictionary_size)?;
+            resources
+                .acquire_cancellable(required, plan.dictionary_size, &|| advance.is_cancelled())?;
             unreachable!("oversized workspace acquisition must fail");
         }
         let batch_capacity = usize::try_from(max_jobs_by_memory)
@@ -341,14 +351,22 @@ fn compress_whole_member(
     let mut packed_spool = Spool::create(resources)?;
     let mut stored = input_size == 0;
     if !stored {
-        match resources.acquire(required, plan.dictionary_size) {
+        match resources
+            .acquire_cancellable(required, plan.dictionary_size, &|| advance.is_cancelled())
+        {
             Ok(_permit) => {
                 advance.started(index, input_size);
+                if advance.is_cancelled() {
+                    return Err(Error::Cancelled);
+                }
                 let size = usize::try_from(input_size)
                     .map_err(|_| Error::InvalidHeader("entry size overflows usize"))?;
                 let mut data = vec![0; size];
                 let mut reader = source.open()?;
                 for chunk in data.chunks_mut(plan.block_size.max(1)) {
+                    if advance.is_cancelled() {
+                        return Err(Error::Cancelled);
+                    }
                     reader.read_exact(chunk)?;
                     crc.update(chunk);
                     hasher.update(chunk);
@@ -403,7 +421,7 @@ fn compress_whole_member(
                     packed_spool.write_all(&packed)?;
                 }
             }
-            Err(error) => {
+            Err(error @ Error::MemoryLimitExceeded { .. }) => {
                 if plan.filter_policy != FilterPolicy::Auto {
                     return Err(error);
                 }
@@ -413,6 +431,9 @@ fn compress_whole_member(
                     progress: &'a dyn CompressionProgress,
                 }
                 impl CompressionProgress for Remapped<'_> {
+                    fn is_cancelled(&self) -> bool {
+                        self.progress.is_cancelled()
+                    }
                     fn advance(&self, bytes: u64) -> bool {
                         self.progress.advance(bytes)
                     }
@@ -438,11 +459,15 @@ fn compress_whole_member(
                 )?;
                 return Ok(streamed.remove(0));
             }
+            Err(error) => return Err(error),
         }
     }
 
     if input_size == 0 {
         advance.started(index, input_size);
+        if advance.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
         check_source_end(&mut *source.open()?)?;
     }
     packed_spool.park();
@@ -490,7 +515,8 @@ fn compress_independent_members(
         let mut cursor = 0usize;
         while streams.iter().any(MemberStream::has_more) {
             let reserved = required.saturating_mul(batch_capacity as u64);
-            let _permit = resources.acquire(reserved, plan.dictionary_size)?;
+            let _permit = resources
+                .acquire_cancellable(reserved, plan.dictionary_size, &|| advance.is_cancelled())?;
 
             let mut jobs = Vec::with_capacity(batch_capacity);
             let mut misses = 0usize;
@@ -560,7 +586,8 @@ fn compress_solid_chain(
     let mut next = 0usize;
     loop {
         let reserved = required.saturating_mul(batch_capacity as u64);
-        let _permit = resources.acquire(reserved, plan.dictionary_size)?;
+        let _permit = resources
+            .acquire_cancellable(reserved, plan.dictionary_size, &|| advance.is_cancelled())?;
 
         // Run boundaries depend on input and dictionary size, never on the
         // worker count. Adjacent blocks amortize history copies and seeding.
@@ -625,11 +652,11 @@ fn read_block(
         progress.started(stream.member, stream.input_size);
         stream.started = true;
     }
-    let mut data = read_chunk(stream, block_size)?;
+    let mut data = read_chunk(stream, block_size, progress)?;
     let mut splitter = BlockSplitter::new();
     splitter.accept(&data);
     while stream.has_more() {
-        let next = read_chunk(stream, block_size)?;
+        let next = read_chunk(stream, block_size, progress)?;
         if !splitter.extends(&next) {
             // Deciding needs the chunk in hand, so this reads one further than
             // it keeps. Hand it back for the next block rather than seeking
@@ -644,7 +671,14 @@ fn read_block(
 }
 
 /// Reads one chunk, preferring anything a previous read put back.
-fn read_chunk(stream: &mut MemberStream, block_size: usize) -> Result<Vec<u8>> {
+fn read_chunk(
+    stream: &mut MemberStream,
+    block_size: usize,
+    progress: &dyn CompressionProgress,
+) -> Result<Vec<u8>> {
+    if progress.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
     if !stream.pushback.is_empty() {
         return Ok(std::mem::take(&mut stream.pushback));
     }

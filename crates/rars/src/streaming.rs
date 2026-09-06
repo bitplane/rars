@@ -3,7 +3,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 /// Default aggregate compression workspace budget (256 MiB).
@@ -106,6 +106,26 @@ impl SourceFactory for PathSource {
     }
 }
 
+/// A shared, one-way cancellation signal for RAR5/7 streaming writes.
+///
+/// Clone the token for another thread, or cancel it from an input/output callback.
+/// Cancellation is cooperative: it is checked between chunks and during resource
+/// waits; it cannot interrupt a caller's blocked I/O or an individual codec step.
+#[derive(Clone, Debug, Default)]
+pub struct WriteCancellation(Arc<AtomicBool>);
+
+impl WriteCancellation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
 #[derive(Clone, Debug)]
 /// Shared compression-workspace and temporary-file policy for streaming writers.
 ///
@@ -118,6 +138,7 @@ pub struct WriterResources {
     memory_limit: u64,
     temp_dir: Option<PathBuf>,
     budget: Arc<MemoryBudget>,
+    cancellation: Option<WriteCancellation>,
 }
 
 impl Default for WriterResources {
@@ -132,6 +153,7 @@ impl WriterResources {
             memory_limit,
             temp_dir: None,
             budget: Arc::new(MemoryBudget::new(memory_limit)),
+            cancellation: None,
         }
     }
 
@@ -150,6 +172,25 @@ impl WriterResources {
         self
     }
 
+    /// Attach a cancellation token to RAR5/7 streaming writes using this policy.
+    /// The token works without a progress callback. Cancellation returns
+    /// [`Error::Cancelled`]; a direct output sink may already contain partial data.
+    /// Legacy buffered writers do not use this token.
+    pub fn with_cancellation(mut self, cancellation: WriteCancellation) -> Self {
+        self.cancellation = Some(cancellation);
+        self
+    }
+
+    pub(crate) fn has_cancellation(&self) -> bool {
+        self.cancellation.is_some()
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancellation
+            .as_ref()
+            .is_some_and(WriteCancellation::is_cancelled)
+    }
+
     pub fn memory_limit(&self) -> u64 {
         self.memory_limit
     }
@@ -158,7 +199,21 @@ impl WriterResources {
         self.temp_dir.as_deref()
     }
 
+    #[cfg(test)]
     pub(crate) fn acquire(&self, required: u64, dictionary_size: u64) -> Result<MemoryPermit> {
+        self.acquire_cancellable(required, dictionary_size, &|| false)
+    }
+
+    pub(crate) fn acquire_cancellable(
+        &self,
+        required: u64,
+        dictionary_size: u64,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<MemoryPermit> {
+        let cancelled = || self.is_cancelled() || cancelled();
+        if cancelled() {
+            return Err(Error::Cancelled);
+        }
         if required > self.memory_limit {
             return Err(Error::MemoryLimitExceeded {
                 limit: self.memory_limit,
@@ -166,7 +221,7 @@ impl WriterResources {
                 dictionary_size,
             });
         }
-        Ok(self.budget.acquire(required))
+        self.budget.acquire_cancellable(required, &cancelled)
     }
 
     /// Reserves what a member needs, or the whole budget if one member needs
@@ -209,6 +264,35 @@ impl MemoryBudget {
         MemoryPermit {
             budget: Arc::clone(self),
             bytes,
+        }
+    }
+
+    fn acquire_cancellable(
+        self: &Arc<Self>,
+        bytes: u64,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<MemoryPermit> {
+        // Call user cancellation code outside the budget mutex: a callback can
+        // release a permit, and must not deadlock with its own admission wait.
+        loop {
+            if cancelled() {
+                return Err(Error::Cancelled);
+            }
+            let mut used = self.used.lock().expect("memory budget lock poisoned");
+            if self.limit.saturating_sub(*used) >= bytes {
+                *used += bytes;
+                return Ok(MemoryPermit {
+                    budget: Arc::clone(self),
+                    bytes,
+                });
+            }
+            // Tokens and progress callbacks need not notify this condition
+            // variable, so wake periodically even while all permits are held.
+            drop(
+                self.changed
+                    .wait_timeout(used, std::time::Duration::from_millis(25))
+                    .expect("memory budget lock poisoned while waiting"),
+            );
         }
     }
 }
@@ -536,6 +620,49 @@ mod tests {
         });
         assert!(unwind.is_err());
         assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[test]
+    fn admission_waits_can_be_cancelled_without_releasing_the_held_permit() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        for via_callback in [false, true] {
+            let cancel = WriteCancellation::new();
+            let resources = WriterResources::new(100).with_cancellation(if via_callback {
+                WriteCancellation::new()
+            } else {
+                cancel.clone()
+            });
+            let held = resources.acquire(100, 0).unwrap();
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let callback_cancel = cancel.clone();
+            let worker = std::thread::spawn(move || {
+                let polls = AtomicU64::new(0);
+                let result = resources.acquire_cancellable(1, 0, &|| {
+                    // Admission checks once before entering the budget and
+                    // again before locking. The third poll proves a timed
+                    // wait occurred while the permit was still held.
+                    if polls.fetch_add(1, Ordering::Relaxed) >= 2 {
+                        let _ = entered_tx.send(());
+                    }
+                    via_callback && callback_cancel.is_cancelled()
+                });
+                done_tx.send(result.map(|_| ())).unwrap();
+                resources
+            });
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            cancel.cancel();
+            assert_eq!(
+                done_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                Err(Error::Cancelled)
+            );
+            let resources = worker.join().unwrap();
+            assert_eq!(*resources.budget.used.lock().unwrap(), 100);
+            drop(held);
+            assert_eq!(*resources.budget.used.lock().unwrap(), 0);
+        }
     }
 
     #[test]

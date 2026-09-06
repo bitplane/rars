@@ -53,7 +53,9 @@ pub use filter::{
 };
 use std::io::{Read, Write};
 use std::path::Path;
-pub use streaming::{EntryReader, EntrySource, WriterResources, DEFAULT_WRITER_MEMORY_LIMIT};
+pub use streaming::{
+    EntryReader, EntrySource, WriteCancellation, WriterResources, DEFAULT_WRITER_MEMORY_LIMIT,
+};
 pub use version::{ArchiveFamily, ArchiveVersion};
 pub use write_plan::{
     formats_supporting, supported_features, supports, MemberCoding, PlanShape, WriterOption,
