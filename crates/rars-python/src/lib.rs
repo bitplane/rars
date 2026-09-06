@@ -457,6 +457,39 @@ impl RarFile {
             .ok_or_else(|| UnsupportedRarFeature::new_err("member is not a supported redirection"))
     }
 
+    /// Stored file timestamps as exact integer Unix nanoseconds. Missing kinds are absent.
+    fn gettimes(&self, member: &Bound<'_, PyAny>) -> PyResult<HashMap<String, i128>> {
+        let name = member_name_bytes(member)?;
+        let member = self
+            .archive
+            .members()
+            .find(|member| member.meta.name == name)
+            .ok_or_else(|| PyKeyError::new_err("member not found"))?;
+        let mut times = member.file_times().map_err(map_error)?.unwrap_or_default();
+        if times.modified.is_none() {
+            times.modified = member
+                .meta
+                .modification_time()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|time| {
+                    u32::try_from(time.as_secs())
+                        .ok()
+                        .map(|seconds| rars_rs::FileTimestamp::Unix {
+                            seconds,
+                            nanoseconds: time.subsec_nanos(),
+                        })
+                });
+        }
+        Ok([
+            ("modified", times.modified),
+            ("created", times.created),
+            ("accessed", times.accessed),
+        ]
+        .into_iter()
+        .filter_map(|(name, time)| time.map(|time| (name.to_string(), time.unix_nanoseconds())))
+        .collect())
+    }
+
     /// Metadata/settings the current rewrite implementation cannot preserve.
     /// This is a conservative metadata check, not a payload integrity test.
     fn rewrite_preservation_issues(&self) -> Vec<String> {
@@ -685,6 +718,7 @@ impl RarBuilder {
         };
         for ((member_index, member), comment) in archive.archive.members().enumerate().zip(comments)
         {
+            let file_times = member.file_times().map_err(map_error)?;
             let link = member.supported_redirection().cloned();
             let retained_link = link.as_ref().map(|_| member.clone());
             let info = member.meta;
@@ -758,6 +792,12 @@ impl RarBuilder {
                 builder
                     .inner
                     .set_mtime_nanoseconds(&info.name, time.subsec_nanos())
+                    .map_err(map_builder_error)?;
+            }
+            if file_times.is_some() {
+                builder
+                    .inner
+                    .set_file_times(&info.name, file_times)
                     .map_err(map_builder_error)?;
             }
             if attr_source == rars_rs::AttrSource::Dos {
@@ -841,6 +881,25 @@ impl RarBuilder {
                 target_is_directory,
                 mtime,
                 mode,
+            )
+            .map_err(map_builder_error)
+    }
+
+    /// Sets complete timestamps from exact Unix nanoseconds.
+    #[pyo3(signature = (member, *, modified_ns=None, created_ns=None, accessed_ns=None))]
+    fn set_times(
+        &mut self,
+        member: &Bound<'_, PyAny>,
+        modified_ns: Option<i128>,
+        created_ns: Option<i128>,
+        accessed_ns: Option<i128>,
+    ) -> PyResult<()> {
+        let times = rars_rs::FileTimes::from_unix_nanoseconds(modified_ns, created_ns, accessed_ns)
+            .map_err(map_builder_error)?;
+        self.inner
+            .set_file_times(
+                &member_name_bytes(member)?,
+                (times != rars_rs::FileTimes::default()).then_some(times),
             )
             .map_err(map_builder_error)
     }

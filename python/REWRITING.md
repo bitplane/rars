@@ -29,7 +29,7 @@ the separate password argument.
 | File contents, raw names, order | Copied; builder name validation applies | Preserve retained members and order |
 | Duplicate names | Rejected explicitly before constructing the rewrite builder | Reject until editing duplicate names by identity is supported |
 | Directories | Explicit entries retained, including empty directories and supported modification time/attributes | Preserve explicit directory entries |
-| Timestamps | Modification time retained, including legacy odd seconds/fractions and RAR5 HTIME Unix/FILETIME fractions and explicit epoch | Preserve additional timestamp kinds using the established local-zone interpretation for legacy DOS times |
+| Timestamps | Modification, creation and access times retained, including legacy odd seconds/fractions and complete RAR5 Unix/FILETIME values | Preserve supported timestamp kinds using the established local-zone interpretation for legacy DOS times |
 | Attributes and host OS | Unix permission/special bits and DOS file flags retained using source host rules; unknown hosts use default DOS archive attributes | Preserve supported attributes with their source meaning; reject unsupported host semantics |
 | Archive comment | Copied as decoded comment bytes | Preserve comment content |
 | Links and special entries | RAR5 Unix/Windows symbolic links, junctions, hard links and file-copy records retained; legacy links and other special entries rejected before writing | Preserve supported types; reject unsupported preservation |
@@ -56,6 +56,17 @@ records are rejected. Comments remain attached through renames and removals.
 comment; `b""` retains an explicit empty comment. RAR3/4 and volume output do not
 support setting file comments. Legacy comments exposed by the reader are retained
 when converting to RAR5; legacy format preservation still fails preflight.
+
+`RarFile.gettimes(member)` returns present `modified`, `created` and `accessed`
+times as exact integer Unix nanoseconds. `RarBuilder.set_times(member, *,
+modified_ns=None, created_ns=None, accessed_ns=None)` sets the extended record.
+An omitted modification time retains the base-header modification time, if any.
+RAR5 FILETIME values retain their full range, including dates before 1970.
+Combining such dates with Unix nanosecond timestamps requires every value to fit
+FILETIME's 100-nanosecond precision; otherwise the setter fails without changes.
+Legacy creation/access fields use the same local-zone policy as modification
+time. Malformed legacy extended records and legacy archival time (which has no
+supported RAR5 counterpart) are rejected during conversion.
 
 `RarBuilder.add_directory(arcname, mtime=None, mode=None)` adds an explicit
 directory to RAR5/7 output. It also allows empty directories without an input

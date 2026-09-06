@@ -76,6 +76,7 @@ pub struct ArchiveEntry {
     pub mtime: Option<u32>,
     /// Optional nanosecond fraction; requires mtime and a value below one second.
     pub mtime_nanoseconds: Option<u32>,
+    pub file_times: Option<crate::FileTimes>,
     pub attributes: u64,
     pub host_os: u64,
     /// Encrypts this member's payload. With header encryption every member
@@ -120,6 +121,7 @@ impl ArchiveEntry {
             redirection_size: None,
             mtime: None,
             mtime_nanoseconds: None,
+            file_times: None,
             attributes: 0,
             host_os: 0,
             password: None,
@@ -144,6 +146,11 @@ impl ArchiveEntry {
 
     pub fn with_service(mut self, service: ServiceEntry) -> Self {
         self.services.push(service);
+        self
+    }
+
+    pub fn with_file_times(mut self, times: Option<crate::FileTimes>) -> Self {
+        self.file_times = times;
         self
     }
 
@@ -970,6 +977,15 @@ fn validate_entry(entry: &ArchiveEntry) -> Result<()> {
         return Err(Error::InvalidHeader(
             "directory entries cannot carry file contents",
         ));
+    }
+    if let Some(times) = entry.file_times {
+        times.encode()?;
+        if entry.mtime_nanoseconds.is_some() || (entry.mtime.is_some() && times.modified.is_some())
+        {
+            return Err(Error::InvalidArgument(
+                "conflicting file modification timestamps",
+            ));
+        }
     }
     if let Some(nanos) = entry.mtime_nanoseconds {
         if entry.mtime.is_none() || nanos >= 1_000_000_000 {

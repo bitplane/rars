@@ -247,6 +247,7 @@ impl Archive {
                                 || service.encrypted
                                 || !service.rewrite_metadata_complete
                                 || service.modification_time().is_some()
+                                || service.file_times.is_some()
                                 || service.file_flags & !4 != 0
                                 || service.block.flags & !3 != 0
                                 || service.attributes != 0
@@ -293,6 +294,17 @@ pub(crate) fn special_entry(meta: &ArchiveMemberMeta) -> bool {
 }
 
 impl crate::ArchiveMember {
+    /// Complete supported file times. Legacy DOS fields use the established local-zone policy.
+    pub fn file_times(&self) -> crate::Result<Option<crate::FileTimes>> {
+        match &self.detail {
+            crate::ArchiveMemberDetail::Rar50Plus { file_times, .. } => Ok(*file_times),
+            crate::ArchiveMemberDetail::Rar15To40 { extended_times, .. } => {
+                crate::FileTimes::legacy(extended_times, self.meta.file_time)
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// A redirection whose known kind and header metadata can be retained.
     pub fn supported_redirection(&self) -> Option<&crate::rar50::FileRedirection> {
         let crate::ArchiveMemberDetail::Rar50Plus {

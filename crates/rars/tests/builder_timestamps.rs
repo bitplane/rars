@@ -201,3 +201,45 @@ fn extraction_retains_missing_and_epoch_times_in_single_and_split_archives() {
         }
     }
 }
+
+#[test]
+fn complete_file_times_survive_streaming_and_volume_paths() {
+    use rars::{FileTimes, FileTimestamp};
+    for times in [
+        FileTimes {
+            modified: Some(FileTimestamp::WindowsFiletime(0)),
+            created: Some(FileTimestamp::WindowsFiletime(u64::MAX)),
+            accessed: Some(FileTimestamp::WindowsFiletime(116_444_736_000_000_001)),
+        },
+        FileTimes {
+            modified: None,
+            created: Some(FileTimestamp::Unix {
+                seconds: 0,
+                nanoseconds: 123,
+            }),
+            accessed: Some(FileTimestamp::Unix {
+                seconds: u32::MAX,
+                nanoseconds: 999_999_999,
+            }),
+        },
+    ] {
+        let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+        builder
+            .add_bytes(b"file".to_vec(), b"payload".to_vec(), Some(123), None)
+            .unwrap();
+        builder.set_file_times(b"file", Some(times)).unwrap();
+        let mut outputs = vec![builder.to_bytes().unwrap()];
+        outputs.extend(builder.volume_size(Some(4096)).build_volumes(None).unwrap());
+        for bytes in outputs {
+            let archive = ArchiveReader::read_owned(bytes).unwrap();
+            assert_eq!(
+                archive.members().next().unwrap().file_times().unwrap(),
+                Some(times)
+            );
+            assert_eq!(
+                archive.read_member(b"file", None).unwrap().unwrap(),
+                b"payload"
+            );
+        }
+    }
+}

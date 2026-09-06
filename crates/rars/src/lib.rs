@@ -33,6 +33,7 @@ mod parse_budget;
 mod read_control;
 pub use read_control::ReadCancellation;
 mod extraction_control;
+mod file_times;
 pub mod rar13;
 pub mod rar15_40;
 pub mod rar50;
@@ -43,6 +44,7 @@ mod rewrite;
 mod source;
 mod streaming;
 pub mod timestamp;
+pub use file_times::{FileTimes, FileTimestamp};
 mod tzif;
 pub mod version;
 mod volume_extract;
@@ -436,6 +438,8 @@ pub enum ArchiveMemberDetail {
         crc32: u32,
         /// Whether this member participates in a solid stream.
         solid: bool,
+        /// Raw legacy extended timestamp record.
+        extended_times: Vec<u8>,
         /// Per-file salt when file encryption is used.
         salt: Option<[u8; 8]>,
         /// Whether the member carries a file-comment extension.
@@ -448,6 +452,8 @@ pub enum ArchiveMemberDetail {
         compression_info: u64,
         /// Stored CRC-32 when present.
         crc32: Option<u32>,
+        /// Complete supported RAR5 high-precision file times.
+        file_times: Option<FileTimes>,
         /// Redirection metadata, including the raw target name.
         redirection: Option<rar50::FileRedirection>,
         /// Strong file hash when present.
@@ -947,6 +953,7 @@ fn rar15_40_member(file: &rar15_40::FileHeader) -> ArchiveMember {
             crc32: file.file_crc,
             solid: file.is_solid(),
             salt: file.salt,
+            extended_times: file.ext_time.clone(),
             has_file_comment: file.has_file_comment(),
         },
     }
@@ -975,6 +982,7 @@ fn rar50_member(file: &rar50::FileHeader) -> ArchiveMember {
             crc32: file.data_crc32,
             hash: file.hash.as_ref().map(rar50_member_hash),
             redirection: file.redirection.clone(),
+            file_times: file.file_times,
         },
     }
 }
@@ -1889,6 +1897,7 @@ mod tests {
                 unpack_version: _,
                 file_checksum: _,
                 has_file_comment: true,
+                ..
             }
         ));
     }
@@ -1932,6 +1941,7 @@ mod tests {
                 solid: false,
                 salt: None,
                 has_file_comment: true,
+                ..
             }
         ));
     }

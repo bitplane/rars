@@ -200,6 +200,8 @@ pub struct FileHeader {
     pub htime_mtime: Option<u32>,
     /// Fractional detail belonging to the extended modification time.
     pub htime_mtime_refinement: Option<crate::TimeRefinement>,
+    /// Complete supported time record, retaining FILETIME ticks without narrowing.
+    pub file_times: Option<crate::FileTimes>,
     pub data_crc32: Option<u32>,
     pub compression_info: u64,
     pub host_os: u64,
@@ -1321,6 +1323,7 @@ fn parse_file_header_bytes(parsed: &ParsedBlockHeader) -> Result<FileHeader> {
         mtime,
         htime_mtime: None,
         htime_mtime_refinement: None,
+        file_times: None,
         data_crc32,
         compression_info,
         host_os,
@@ -1384,17 +1387,14 @@ fn parse_file_extra_area(
             }
             FHEXTRA_HTIME => {
                 let flags = read_vint_at(input, data.start, data.end).ok();
-                let exact_mtime = flags.is_some_and(|(flags, len)| match flags {
-                    2 => data.len() == len + 8,
-                    3 => data.len() == len + 4,
-                    0x13 => data.len() == len + 8,
-                    _ => false,
+                let times = flags.and_then(|(flags, len)| {
+                    crate::FileTimes::parse(flags, &input[data.start + len..data.end])
                 });
                 let parsed = parse_htime_mtime(input, data);
-                file.rewrite_metadata_complete &= exact_mtime
-                    && file.mtime.is_none()
-                    && parsed.is_some()
-                    && (flags.map(|f| f.0) != Some(0x13) || parsed.and_then(|p| p.1).is_some());
+                file.rewrite_metadata_complete &= times.is_some()
+                    && !(file.mtime.is_some()
+                        && times.is_some_and(|times| times.modified.is_some()));
+                file.file_times = times;
                 file.htime_mtime = parsed.map(|(seconds, _)| seconds);
                 file.htime_mtime_refinement = parsed.and_then(|(_, detail)| detail);
             }
@@ -2385,6 +2385,7 @@ mod tests {
             mtime: None,
             htime_mtime: None,
             htime_mtime_refinement: None,
+            file_times: None,
             data_crc32: None,
             compression_info: 0,
             host_os: 0,

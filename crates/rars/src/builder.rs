@@ -84,6 +84,7 @@ struct BuilderEntry {
     is_directory: bool,
     mtime: Option<u32>,
     mtime_nanoseconds: Option<u32>,
+    file_times: Option<crate::FileTimes>,
     file_comment: Option<Vec<u8>>,
     redirection: Option<rar50::FileRedirection>,
     redirection_size: Option<u64>,
@@ -281,6 +282,7 @@ impl Builder {
             is_directory: false,
             mtime,
             mtime_nanoseconds: None,
+            file_times: None,
             file_comment: None,
             redirection: None,
             redirection_size: None,
@@ -308,6 +310,7 @@ impl Builder {
             is_directory: false,
             mtime,
             mtime_nanoseconds: None,
+            file_times: None,
             file_comment: None,
             redirection: None,
             redirection_size: None,
@@ -339,6 +342,7 @@ impl Builder {
             is_directory: true,
             mtime,
             mtime_nanoseconds: None,
+            file_times: None,
             file_comment: None,
             redirection: None,
             redirection_size: None,
@@ -377,6 +381,7 @@ impl Builder {
             is_directory: false,
             mtime,
             mtime_nanoseconds: None,
+            file_times: None,
             file_comment: None,
             redirection: Some(link),
             redirection_size: None,
@@ -403,6 +408,7 @@ impl Builder {
             is_directory: meta.is_directory,
             mtime: meta.file_time,
             mtime_nanoseconds: meta.mtime_refinement.map(|time| time.nanoseconds),
+            file_times: None,
             file_comment: None,
             redirection: Some(link.clone()),
             redirection_size: Some(meta.unpacked_size),
@@ -444,6 +450,43 @@ impl Builder {
                 preceding.insert(entry.name.clone(), size);
             }
         }
+        Ok(())
+    }
+
+    /// Set complete RAR5/7 timestamps without narrowing FILETIME or discarding fractions.
+    pub fn set_file_times(&mut self, name: &[u8], times: Option<crate::FileTimes>) -> Result<()> {
+        if self.format.family() != ArchiveFamily::Rar50Plus {
+            return Err(Error::InvalidArgument(
+                "complete file times require RAR5/7 output",
+            ));
+        }
+        if let Some(times) = times {
+            times.encode()?;
+        }
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.name == name)
+            .ok_or_else(|| Error::EntryNotFound.at_entry(name.to_vec(), "setting file times"))?;
+        if times.is_some_and(|times| times.modified.is_some()) {
+            entry.mtime = None;
+        }
+        // Preserve an existing fractional mtime when adding only ctime/atime.
+        let times = if let (Some(mut times), Some(seconds), Some(nanoseconds)) =
+            (times, entry.mtime, entry.mtime_nanoseconds)
+        {
+            times.modified = Some(crate::FileTimestamp::Unix {
+                seconds,
+                nanoseconds,
+            });
+            times.encode()?;
+            entry.mtime = None;
+            Some(times)
+        } else {
+            times
+        };
+        entry.mtime_nanoseconds = None;
+        entry.file_times = times;
         Ok(())
     }
 
@@ -845,6 +888,7 @@ impl Builder {
                     .with_redirection_size(entry.redirection_size)
                     .with_mtime(entry.mtime)
                     .with_mtime_nanoseconds(entry.mtime_nanoseconds)
+                    .with_file_times(entry.file_times)
                     .with_attributes(entry.rar50_attr())
                     .with_host_os(entry.rar50_host_os());
                 let built = match &entry.file_comment {

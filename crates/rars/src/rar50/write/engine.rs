@@ -590,6 +590,9 @@ fn prepare_member(
         write_hash_record_with_value(&mut extra, hash);
     }
     super::headers::write_mtime_record(&mut extra, entry.mtime, entry.mtime_nanoseconds);
+    if let Some(times) = entry.file_times {
+        write_extra_record(&mut extra, super::super::FHEXTRA_HTIME, &times.encode()?);
+    }
     if let Some(link) = &entry.redirection {
         let mut record = Vec::new();
         write_vint(&mut record, link.redirection_type);
@@ -955,6 +958,7 @@ struct VolumeMember {
     is_directory: bool,
     mtime: Option<u32>,
     mtime_nanoseconds: Option<u32>,
+    file_times: Option<crate::FileTimes>,
     attributes: u64,
     host_os: u64,
     unpacked_size: u64,
@@ -1164,6 +1168,7 @@ fn prepare_volume_member(
                 is_directory: entry.is_directory,
                 mtime: entry.mtime,
                 mtime_nanoseconds: entry.mtime_nanoseconds,
+                file_times: entry.file_times,
                 attributes: entry.attributes,
                 host_os: entry.host_os,
                 unpacked_size: member.input_size,
@@ -1180,6 +1185,7 @@ fn prepare_volume_member(
             is_directory: entry.is_directory,
             mtime: entry.mtime,
             mtime_nanoseconds: entry.mtime_nanoseconds,
+            file_times: entry.file_times,
             attributes: entry.attributes,
             host_os: entry.host_os,
             unpacked_size: member.input_size,
@@ -1441,6 +1447,9 @@ fn fragment_header(
     }
     write_hash_record_with_value(&mut extra, fragment.map_or(member.hash, |f| f.hash));
     super::headers::write_mtime_record(&mut extra, member.mtime, member.mtime_nanoseconds);
+    if let Some(times) = member.file_times {
+        write_extra_record(&mut extra, super::super::FHEXTRA_HTIME, &times.encode()?);
+    }
     let specific = file_specific(
         &member.name,
         member.unpacked_size,
