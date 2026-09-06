@@ -298,6 +298,8 @@ impl FileHeader {
             }
             return Ok(packed.to_vec());
         }
+        // Empty compressed members can legitimately omit the packed stream.
+        // Any other member must decode successfully, even without CRC/hash.
         if self.unpacked_size == 0 && packed.is_empty() {
             return Ok(Vec::new());
         }
@@ -307,27 +309,16 @@ impl FileHeader {
             Error::InvalidHeader("RAR 5 dictionary size overflows host address size")
         })?;
         let output_size = checked_unpacked_size(self.unpacked_size)?;
-        match decoder.decode_member_with_dictionary(
-            packed,
-            info.algorithm_version,
-            output_size,
-            dictionary_size,
-            info.solid,
-            mode,
-        ) {
-            Ok(data) => Ok(data),
-            Err(error) => self.map_truncated_unverified_payload(error),
-        }
-    }
-
-    fn map_truncated_unverified_payload(&self, error: crate::codec::Error) -> Result<Vec<u8>> {
-        if matches!(error, crate::codec::Error::NeedMoreInput)
-            && self.data_crc32.is_none()
-            && self.hash.is_none()
-        {
-            return Ok(Vec::new());
-        }
-        Err(Error::from(error))
+        decoder
+            .decode_member_with_dictionary(
+                packed,
+                info.algorithm_version,
+                output_size,
+                dictionary_size,
+                info.solid,
+                mode,
+            )
+            .map_err(Error::from)
     }
 
     fn stream_packed_with_decoder<R: Read>(
@@ -2320,30 +2311,55 @@ mod tests {
 
     #[test]
     fn decoded_data_unverified_accepts_empty_compressed_member() {
-        let mut file = plain_file(b"empty.txt", b"", None);
-        file.compression_info = 5 << 7;
-        file.data_crc32 = Some(0);
-
-        let archive = archive_with_blocks(vec![Block::File(file.clone())], Vec::new());
-        let decoded = file.decoded_data_unverified(&archive, None).unwrap();
-
-        assert!(decoded.is_empty());
+        for crc in [None, Some(0)] {
+            let mut file = plain_file(b"empty.txt", b"", None);
+            file.compression_info = 5 << 7;
+            file.data_crc32 = crc;
+            let archive = archive_with_blocks(vec![Block::File(file.clone())], Vec::new());
+            assert!(file
+                .decoded_data_unverified(&archive, None)
+                .unwrap()
+                .is_empty());
+            for parallel in [false, true] {
+                let open = |_: &ExtractedEntryMeta| Ok(Box::new(std::io::sink()) as Box<dyn Write>);
+                let result = if parallel {
+                    archive.extract_to_parallel_buffered(crate::ArchiveReadOptions::default(), open)
+                } else {
+                    archive.extract_to(crate::ArchiveReadOptions::default(), open)
+                };
+                result.unwrap();
+            }
+        }
     }
 
     #[test]
-    fn map_truncated_unverified_payload_swallows_need_more_input_when_no_integrity_record() {
-        let mut file = plain_file(b"a.txt", b"", None);
+    fn truncated_checksumless_members_fail_in_buffered_and_streaming_extraction() {
+        // A compressed member advertises output, but its packed stream is
+        // truncated to nothing. Without integrity records, decoding itself
+        // must still establish success; an empty result is not a substitute.
+        let mut file = plain_file(b"truncated", b"", None);
+        file.compression_info = 5 << 7;
+        file.unpacked_size = 16;
         file.data_crc32 = None;
         file.hash = None;
-        assert!(file
-            .map_truncated_unverified_payload(crate::codec::Error::NeedMoreInput)
-            .unwrap()
-            .is_empty());
-
-        file.data_crc32 = Some(0);
-        assert!(file
-            .map_truncated_unverified_payload(crate::codec::Error::NeedMoreInput)
-            .is_err());
+        let archive = archive_with_blocks(vec![Block::File(file)], Vec::new());
+        for limit in [0, 1024] {
+            let options =
+                crate::ArchiveReadOptions::default().with_rar50_buffered_decode_limit(limit);
+            for parallel in [false, true] {
+                let open = |_: &ExtractedEntryMeta| Ok(Box::new(std::io::sink()) as Box<dyn Write>);
+                let result = if parallel {
+                    archive.extract_to_parallel_buffered(options, open)
+                } else {
+                    archive.extract_to(options, open)
+                };
+                let error = result.expect_err("truncated member must not succeed");
+                assert!(matches!(
+                    error.root_cause(),
+                    Error::Codec(crate::codec::Error::NeedMoreInput)
+                ));
+            }
+        }
     }
 
     #[test]

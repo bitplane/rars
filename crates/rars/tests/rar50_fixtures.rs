@@ -4013,15 +4013,27 @@ fn extracts_wild_rar50_solid_archives_with_redundant_filter_records() {
 }
 
 #[test]
-fn extracts_wild_rar50_loop_fixture_as_empty_file() {
+fn rejects_truncated_wild_rar50_loop_fixture_without_integrity_records() {
     let bytes = std::fs::read(fixture("wild/libarchive_loop_bug.rar")).unwrap();
     let archive = Archive::parse(&bytes).unwrap();
+    let file = archive.files().next().unwrap();
+    assert_eq!(file.unpacked_size, 196_608);
+    assert!(file.data_crc32.is_none());
+    assert!(file.hash.is_none());
 
-    let extracted = collect_extract(&archive).unwrap();
-
-    assert_eq!(extracted.len(), 1);
-    assert_eq!(extracted[0].name, b"a");
-    assert!(extracted[0].data.is_empty());
+    // UnRAR 7.20 accepts this fixture but emits zero bytes. We deliberately
+    // report incomplete decoding instead of presenting a declared non-empty
+    // member as an empty success just because it has no checksum (#44).
+    let error = archive
+        .extract_to(rars::ArchiveReadOptions::default(), |_| {
+            Ok(Box::new(std::io::sink()))
+        })
+        .unwrap_err();
+    assert!(matches!(
+        error.root_cause(),
+        Error::Codec(rars::codec::Error::NeedMoreInput)
+    ));
+    assert_eq!(error.entry_context().unwrap().0, b"a");
 }
 
 #[test]
