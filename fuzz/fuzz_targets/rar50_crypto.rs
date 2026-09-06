@@ -12,7 +12,9 @@ fuzz_target!(|data: &[u8]| {
 
     let mut salt = [0u8; 16];
     salt.copy_from_slice(&data[..16]);
-    let kdf_count_log = data[16] % 26;
+    // Exercise derivation without spending up to 2^25 rounds on one input.
+    // The accepted wire-format KDF ceiling belongs in deterministic tests.
+    let kdf_count_log = data[16] % 11;
     let password_len = usize::from(data[17]) % 32;
     if data.len() < 50 + password_len {
         return;

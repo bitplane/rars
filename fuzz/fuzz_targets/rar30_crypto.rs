@@ -46,7 +46,7 @@ fuzz_target!(|data: &[u8]| {
     let _ = decrypt_cipher.decrypt_in_place(&mut decrypted);
 
     let mut maybe_unaligned = payload[..payload.len().min(MAX_DATA_SIZE)].to_vec();
-    if maybe_unaligned.len() % 16 != 0 {
+    if !maybe_unaligned.len().is_multiple_of(16) {
         let _ = encrypt_cipher.encrypt_in_place(&mut maybe_unaligned);
     }
 });

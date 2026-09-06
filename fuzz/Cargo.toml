@@ -21,6 +21,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "archive_extract"
+path = "fuzz_targets/archive_extract.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "unpack29_decode"
 path = "fuzz_targets/unpack29_decode.rs"
 test = false
