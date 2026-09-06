@@ -16,7 +16,7 @@ use crate::write_progress::{ProgressReporter, WorkTracker};
 use crate::write_stream::{MemberBytes, MemberPayload};
 use crate::{WriteOperation, WriteProgress, WriteProgressEvent};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
@@ -483,7 +483,7 @@ impl Archive {
         })
     }
 
-    fn parse_seekable(
+    pub(crate) fn parse_seekable(
         file: impl Read + std::io::Seek,
         file_len: u64,
         sfx_offset: usize,
@@ -577,9 +577,8 @@ impl Archive {
                     out.write_all(&buffer[..chunk.len()])?;
                 }
             }
-            ArchiveSource::File(path) => {
-                let mut file = File::open(path.as_ref())?;
-                file.seek(SeekFrom::Start(range.start as u64))?;
+            ArchiveSource::File(_) | ArchiveSource::Reader(_) => {
+                let mut file = self.source.range_reader(range.clone())?;
                 let mut remaining = range.len();
                 while remaining > 0 {
                     let to_read = remaining.min(buffer.len());
@@ -802,7 +801,7 @@ impl Entry {
             ArchiveSource::Memory(data) => {
                 data.get(self.packed_range.clone()).ok_or(Error::TooShort)
             }
-            ArchiveSource::File(_) => Err(Error::InvalidHeader(
+            ArchiveSource::File(_) | ArchiveSource::Reader(_) => Err(Error::InvalidHeader(
                 "RAR 1.3 file-backed packed data requires owned read",
             )),
         }

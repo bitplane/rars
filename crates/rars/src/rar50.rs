@@ -612,8 +612,8 @@ impl Archive {
         })
     }
 
-    fn parse_file_backed(
-        file: &mut File,
+    pub(crate) fn parse_file_backed(
+        file: &mut (impl Read + std::io::Seek),
         archive_len: usize,
         sfx_offset: usize,
         source: ArchiveSource,

@@ -958,8 +958,78 @@ impl ArchiveReader {
     }
 
     /// Parses an archive from a path with default read options.
+    ///
+    /// See [`Self::read_reader`] to retain an already-open file handle instead.
     pub fn read_path(path: impl AsRef<Path>) -> Result<Archive> {
         Self::read_path_with_options(path, ArchiveReadOptions::default())
+    }
+
+    /// Parses an owned seekable source without copying the complete archive.
+    ///
+    /// Reads from offset zero regardless of the source's initial position. The
+    /// archive and its clones retain the source until they are dropped. Its
+    /// contents and length must remain unchanged throughout that lifetime.
+    /// Sources borrowed from a shorter-lived owner are not supported; an owned
+    /// file, memory-map wrapper, or shared virtual-file handle can be supplied.
+    ///
+    /// Source I/O is serialized, with a separate position per reader; parallel
+    /// decoding still runs concurrently. Parsing reads the signature scan and
+    /// headers, while extraction reads payloads on demand. Individual codecs
+    /// may buffer payloads. Cancellation cannot interrupt a blocked source call.
+    ///
+    /// ```no_run
+    /// # fn example() -> rars::Result<()> {
+    /// let file = std::fs::File::open("archive.rar")?;
+    /// let archive = rars::ArchiveReader::read_reader(file)?;
+    /// archive.extract_to(None, |_| Ok(Box::new(std::io::sink())))?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn read_reader<R: Read + std::io::Seek + Send + 'static>(reader: R) -> Result<Archive> {
+        Self::read_reader_with_options(reader, ArchiveReadOptions::default())
+    }
+
+    /// Parses an owned seekable source with the same policies as [`Self::read_with_options`].
+    /// Ownership, positioning and concurrency follow [`Self::read_reader`].
+    pub fn read_reader_with_options<R: Read + std::io::Seek + Send + 'static>(
+        reader: R,
+        options: ArchiveReadOptions<'_>,
+    ) -> Result<Archive> {
+        options.check_cancelled()?;
+        let reader = crate::source::ReaderSource::new(reader)?;
+        let source = crate::source::ArchiveSource::Reader(reader.clone());
+        let len = source.len()?;
+        let mut cursor = reader.cursor();
+        let mut scan = vec![0; len.min(SFX_SCAN_LIMIT)];
+        crate::read_control::ReadControl::new(options.cancellation)
+            .reader(&mut cursor)
+            .read_exact(&mut scan)?;
+        options.check_cancelled()?;
+        let signature =
+            find_archive_start(&scan, SFX_SCAN_LIMIT).ok_or(Error::UnsupportedSignature)?;
+        match signature.family {
+            ArchiveFamily::Rar13 => Ok(Archive::Rar13(rar13::Archive::parse_seekable(
+                cursor,
+                len as u64,
+                signature.offset,
+                source,
+                options,
+            )?)),
+            ArchiveFamily::Rar15To40 => Ok(Archive::Rar15To40(rar15_40::Archive::parse_seekable(
+                cursor,
+                len as u64,
+                signature.offset,
+                source,
+                options,
+            )?)),
+            ArchiveFamily::Rar50Plus => Ok(Archive::Rar50Plus(rar50::Archive::parse_file_backed(
+                &mut cursor,
+                len,
+                signature.offset,
+                source,
+                options,
+            )?)),
+        }
     }
 
     /// Parses an archive from a path using explicit read options.

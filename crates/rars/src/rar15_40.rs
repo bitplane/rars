@@ -1188,8 +1188,8 @@ impl Archive {
         })
     }
 
-    fn parse_seekable(
-        file: File,
+    pub(crate) fn parse_seekable(
+        file: impl Read + std::io::Seek,
         file_len: u64,
         sfx_offset: usize,
         source: ArchiveSource,
