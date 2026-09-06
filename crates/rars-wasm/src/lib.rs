@@ -24,13 +24,95 @@ pub fn formats() -> Vec<String> {
         .collect()
 }
 
+fn set_error_field(object: &JsValue, name: &str, value: &JsValue) {
+    js_sys::Reflect::set(object, &JsValue::from_str(name), value)
+        .expect("new error records are extensible");
+}
+
+fn binding_error(code: &str, message: &str) -> JsValue {
+    let error: JsValue = js_sys::Error::new(message).into();
+    set_error_field(&error, "code", &JsValue::from_str(code));
+    error
+}
+
 fn js_error(error: rars_rs::Error) -> JsValue {
-    js_sys::Error::new(&error.to_string()).into()
+    let record = binding_error(error.kind().code(), &error.to_string());
+    let details = js_sys::Object::new();
+    let contexts = js_sys::Array::new();
+    let mut cause = &error;
+    loop {
+        let context = js_sys::Object::new();
+        match cause {
+            rars_rs::Error::AtEntry {
+                name,
+                operation,
+                source,
+            } => {
+                set_error_field(&context, "kind", &"entry".into());
+                // Ordinary arrays survive worker messaging without transferring
+                // or detaching any WASM-owned memory. Keep the raw name bytes.
+                let bytes = js_sys::Array::new();
+                for &byte in name {
+                    bytes.push(&JsValue::from(byte));
+                }
+                set_error_field(&context, "nameBytes", &bytes);
+                set_error_field(&context, "operation", &(*operation).into());
+                cause = source;
+            }
+            rars_rs::Error::AtArchiveOffset { offset, source } => {
+                set_error_field(&context, "kind", &"archiveOffset".into());
+                set_error_field(&context, "offset", &offset.to_string().into());
+                cause = source;
+            }
+            rars_rs::Error::InVolume { number, source } => {
+                set_error_field(&context, "kind", &"volume".into());
+                set_error_field(&context, "number", &(*number as f64).into());
+                cause = source;
+            }
+            _ => break,
+        }
+        contexts.push(&context);
+    }
+    if contexts.length() != 0 {
+        set_error_field(&details, "contexts", &contexts);
+    }
+    match cause {
+        rars_rs::Error::MemoryLimitExceeded {
+            limit,
+            required,
+            dictionary_size,
+        } => {
+            set_error_field(&details, "limitBytes", &limit.to_string().into());
+            set_error_field(&details, "requiredBytes", &required.to_string().into());
+            set_error_field(
+                &details,
+                "dictionaryBytes",
+                &dictionary_size.to_string().into(),
+            );
+        }
+        rars_rs::Error::Rar50BufferedDecodeLimitExceeded { limit, required } => {
+            set_error_field(&details, "limitBytes", &limit.to_string().into());
+            set_error_field(&details, "requiredBytes", &required.to_string().into());
+        }
+        rars_rs::Error::Io(error) => {
+            set_error_field(&details, "ioKind", &format!("{:?}", error.kind).into())
+        }
+        rars_rs::Error::Rar5Recovery(rars_rs::recovery::rar5::Error::Io(kind)) => {
+            set_error_field(&details, "ioKind", &format!("{kind:?}").into())
+        }
+        _ => {}
+    }
+    set_error_field(&record, "details", &details);
+    record
 }
 
 fn parse_format(name: &str) -> Result<ArchiveVersion, JsValue> {
-    ArchiveVersion::from_name(name)
-        .ok_or_else(|| js_sys::Error::new(&format!("unsupported RAR format: {name}")).into())
+    ArchiveVersion::from_name(name).ok_or_else(|| {
+        binding_error(
+            "UNSUPPORTED_FORMAT",
+            &format!("unsupported RAR format: {name}"),
+        )
+    })
 }
 
 fn family_name(family: rars_rs::ArchiveFamily) -> &'static str {
@@ -194,7 +276,10 @@ impl RarFile {
         let mut archives = Vec::with_capacity(volumes.length() as usize);
         for value in volumes.iter() {
             if !value.is_instance_of::<js_sys::Uint8Array>() {
-                return Err(js_sys::Error::new("each volume must be a Uint8Array").into());
+                return Err(binding_error(
+                    "INVALID_OPTION",
+                    "each volume must be a Uint8Array",
+                ));
             }
             let data = js_sys::Uint8Array::unchecked_from_js(value).to_vec();
             let options = match password.as_deref() {
@@ -248,7 +333,11 @@ impl RarFile {
         self.archives[0]
             .read_member(name.as_bytes(), password.as_deref())
             .map_err(js_error)?
-            .ok_or_else(|| js_sys::Error::new(&format!("no such archive entry: {name}")).into())
+            .ok_or_else(|| {
+                js_error(
+                    rars_rs::Error::EntryNotFound.at_entry(name.as_bytes().to_vec(), "reading"),
+                )
+            })
     }
 
     /// Decode one member by archive-order index.
@@ -261,7 +350,10 @@ impl RarFile {
             rars_rs::read_volume_member_at(&self.archives, index, password.as_deref())
         };
         found.map_err(js_error)?.ok_or_else(|| {
-            js_sys::Error::new(&format!("no such archive entry index: {index}")).into()
+            binding_error(
+                "ENTRY_NOT_FOUND",
+                &format!("no such archive entry index: {index}"),
+            )
         })
     }
 
@@ -618,7 +710,10 @@ fn password_bytes(password: Option<Password>) -> Result<Option<Vec<u8>>, JsValue
     if value.is_instance_of::<js_sys::Uint8Array>() {
         return Ok(Some(js_sys::Uint8Array::unchecked_from_js(value).to_vec()));
     }
-    Err(js_sys::Error::new("password must be a string or Uint8Array").into())
+    Err(binding_error(
+        "INVALID_OPTION",
+        "password must be a string or Uint8Array",
+    ))
 }
 
 /// Read `key` off a plain JS object, treating a missing object and a missing
@@ -643,7 +738,7 @@ fn opt_number(options: &JsValue, key: &str) -> Result<Option<f64>, JsValue> {
     value
         .as_f64()
         .map(Some)
-        .ok_or_else(|| js_sys::Error::new(&format!("{key} must be a number")).into())
+        .ok_or_else(|| binding_error("INVALID_OPTION", &format!("{key} must be a number")))
 }
 
 fn opt_string(options: &JsValue, key: &str) -> Result<Option<String>, JsValue> {
@@ -654,7 +749,7 @@ fn opt_string(options: &JsValue, key: &str) -> Result<Option<String>, JsValue> {
     value
         .as_string()
         .map(Some)
-        .ok_or_else(|| js_sys::Error::new(&format!("{key} must be a string")).into())
+        .ok_or_else(|| binding_error("INVALID_OPTION", &format!("{key} must be a string")))
 }
 
 /// Passwords and comments take either a string or raw bytes. A string is
@@ -673,5 +768,8 @@ fn opt_bytes(options: &JsValue, key: &str) -> Result<Option<Vec<u8>>, JsValue> {
         let array = js_sys::Uint8Array::unchecked_from_js(value);
         return Ok(Some(array.to_vec()));
     }
-    Err(js_sys::Error::new(&format!("{key} must be a string or Uint8Array")).into())
+    Err(binding_error(
+        "INVALID_OPTION",
+        &format!("{key} must be a string or Uint8Array"),
+    ))
 }

@@ -1,16 +1,24 @@
+function codedError(code, message) {
+  return Object.assign(new Error(message), { code });
+}
+
 function errorRecord(error) {
   const message = error?.message ?? String(error);
-  let code = "INTERNAL";
-  if (/password is required/i.test(message)) code = "PASSWORD_REQUIRED";
-  else if (/wrong password|corrupt encrypted/i.test(message)) code = "BAD_PASSWORD";
-  else if (/checksum mismatch|hash mismatch/i.test(message)) code = "CHECKSUM_MISMATCH";
-  else if (/no such archive entry/i.test(message)) code = "ENTRY_NOT_FOUND";
-  else if (/unsupported.*format|unsupported version/i.test(message)) code = "UNSUPPORTED_FORMAT";
-  else if (/not supported/i.test(message)) code = "UNSUPPORTED_FEATURE";
-  else if (/unsafe archive path/i.test(message)) code = "UNSAFE_ENTRY_NAME";
-  else if (/I\/O error/i.test(message)) code = "IO";
-  else if (/invalid|too short|signature|header/i.test(message)) code = "INVALID_ARCHIVE";
-  return { code, message };
+  // Native Node filesystem errors carry errno/syscall. Keep the public category
+  // consistent with WASM I/O errors and retain the platform-specific cause.
+  if (typeof error?.errno === "number" && typeof error?.syscall === "string") {
+    return { code: "IO", message, details: {
+      systemCode: error.code, errno: error.errno, syscall: error.syscall,
+      ...(error.path === undefined ? {} : { path: error.path }),
+    } };
+  }
+  if (typeof error?.code === "string") {
+    return { code: error.code, message, ...(error.details === undefined ? {} : { details: error.details }) };
+  }
+  if (error instanceof TypeError || error instanceof RangeError) {
+    return { code: "INVALID_OPTION", message };
+  }
+  return { code: "INTERNAL", message };
 }
 
 async function sourceBytes(source, platform) {
@@ -55,7 +63,7 @@ function toDosDate(milliseconds) {
 function metadata(archive) {
   const entries = archive.entries().map((info, index) => {
     if (!Number.isSafeInteger(info.size) || !Number.isSafeInteger(info.packedSize)) {
-      throw new Error(`entry ${index} is too large for exact JavaScript number metadata`);
+      throw codedError("RESOURCE_LIMIT", `entry ${index} is too large for exact JavaScript number metadata`);
     }
     const entry = {
       index,

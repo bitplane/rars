@@ -53,10 +53,13 @@ export type RarErrorCode =
   | "UNSUPPORTED_FEATURE" | "PASSWORD_REQUIRED" | "BAD_PASSWORD"
   | "CHECKSUM_MISMATCH" | "ENTRY_NOT_FOUND" | "ENTRY_IS_DIRECTORY"
   | "DUPLICATE_ENTRY" | "UNSAFE_ENTRY_NAME" | "IO" | "CLOSED"
+  | "RESOURCE_LIMIT" | "CANCELLED" | "SOURCE_CHANGED"
   | "WORKER_FAILED" | "INTERNAL";
 
 export class RarError extends Error {
   readonly code: RarErrorCode;
+  /** Core context records retain raw entry-name bytes; byte counts and offsets
+   * are decimal strings so values beyond Number.MAX_SAFE_INTEGER remain exact. */
   readonly details?: unknown;
 }
 
