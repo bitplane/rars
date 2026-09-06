@@ -23,6 +23,7 @@ pub mod detect;
 pub mod error;
 mod fast;
 pub mod features;
+pub mod filename;
 pub mod filter;
 mod filter_search;
 mod io_util;

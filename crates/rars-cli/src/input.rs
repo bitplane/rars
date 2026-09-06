@@ -28,7 +28,7 @@ pub(crate) struct LazyInput {
     pub(crate) dos_mtime: u32,
 }
 
-pub(crate) fn collect_inputs(paths: &[String]) -> CliResult<Vec<LazyInput>> {
+pub(crate) fn collect_inputs(paths: &[PathBuf]) -> CliResult<Vec<LazyInput>> {
     let mut pending = Vec::new();
     for path in paths {
         let path = Path::new(path);
@@ -43,7 +43,7 @@ pub(crate) fn collect_inputs(paths: &[String]) -> CliResult<Vec<LazyInput>> {
 }
 
 pub(crate) fn read_inputs_with_progress<F, G>(
-    paths: &[String],
+    paths: &[PathBuf],
     password: Option<&[u8]>,
     discovered: F,
     mut advanced: G,
@@ -138,16 +138,12 @@ fn archive_path_bytes(path: &Path) -> CliResult<Vec<u8>> {
         let Component::Normal(part) = component else {
             return Err(format!("unsafe input archive path: {}", path.display()).into());
         };
-        // Display replacement characters must never become archive identity.
-        parts.push(
-            part.to_str()
-                .ok_or_else(|| format!("input archive path is not UTF-8: {}", path.display()))?,
-        );
+        parts.push(rars::filename::native_bytes(part)?);
     }
     if parts.is_empty() {
         return Err("input path has no file name".into());
     }
-    Ok(parts.join("/").into_bytes())
+    Ok(parts.join(&b'/'))
 }
 
 fn reject_duplicate_input_names<'a>(entries: impl IntoIterator<Item = &'a [u8]>) -> CliResult<()> {
@@ -210,7 +206,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn collect_inputs_rejects_non_utf8_child_names_without_replacement() {
+    fn collect_inputs_preserves_non_utf8_child_names() {
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
 
@@ -218,10 +214,9 @@ mod tests {
         let input = root.join("input");
         fs::create_dir(&input).unwrap();
         fs::write(input.join(OsStr::from_bytes(b"bad-\xff")), b"payload").unwrap();
-        let error = collect_inputs(&[input.to_str().unwrap().to_owned()])
-            .err()
-            .expect("non-UTF-8 filename must be rejected");
-        assert!(error.to_string().contains("not UTF-8"));
+        let entries = collect_inputs(&[input]).unwrap();
+        assert_eq!(entries[0].name, b"input/bad-\xff");
+        assert_eq!(fs::read(&entries[0].path).unwrap(), b"payload");
     }
 
     #[test]
@@ -234,7 +229,7 @@ mod tests {
             fs::write(input.join("日本語").join(name), name.as_bytes()).unwrap();
         }
         names.sort();
-        let entries = collect_inputs(&[input.to_str().unwrap().to_owned()]).unwrap();
+        let entries = collect_inputs(std::slice::from_ref(&input)).unwrap();
         assert_eq!(entries.len(), names.len());
         for (entry, name) in entries.iter().zip(names) {
             assert_eq!(entry.name, format!("input/日本語/{name}").as_bytes());

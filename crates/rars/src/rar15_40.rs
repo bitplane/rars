@@ -2351,11 +2351,10 @@ fn decode_file_name(raw: &[u8], flags: u16) -> Vec<u8> {
                     (length_byte as usize + 2, 0, 0)
                 };
                 for _ in 0..count {
-                    let low = fallback
-                        .get(dst_pos)
-                        .copied()
-                        .unwrap_or(b'?')
-                        .wrapping_add(correction);
+                    let Some(&low) = fallback.get(dst_pos) else {
+                        return raw.to_vec();
+                    };
+                    let low = low.wrapping_add(correction);
                     units.push((u16::from(high) << 8) | u16::from(low));
                     dst_pos += 1;
                 }
@@ -2364,10 +2363,12 @@ fn decode_file_name(raw: &[u8], flags: u16) -> Vec<u8> {
         }
     }
 
-    char::decode_utf16(units)
-        .map(|unit| unit.unwrap_or(char::REPLACEMENT_CHARACTER))
-        .collect::<String>()
-        .into_bytes()
+    // An invalid Unicode field must not collapse distinct archive identities
+    // to the same replacement-character name. Keep the undecodable field, as
+    // for malformed encoding commands above; filesystem extraction can refuse it.
+    String::from_utf16(&units)
+        .map(String::into_bytes)
+        .unwrap_or_else(|_| raw.to_vec())
 }
 
 fn admit_plain_header(
@@ -3182,6 +3183,16 @@ mod tests {
         };
         let main = parse_main_header(&input, &block).unwrap();
         assert_eq!(main.encrypt_version, Some(0x29));
+    }
+
+    #[test]
+    fn malformed_unicode_filename_keeps_its_identity() {
+        let first = b"fallback\0\0\x80\0\xd8";
+        let second = b"fallback\0\0\x80\x01\xd8";
+        assert_eq!(decode_file_name(first, FHD_UNICODE), first);
+        assert_eq!(decode_file_name(second, FHD_UNICODE), second);
+        let invalid_copy = b"fallback\0\0\xc0\x7f";
+        assert_eq!(decode_file_name(invalid_copy, FHD_UNICODE), invalid_copy);
     }
 
     #[test]

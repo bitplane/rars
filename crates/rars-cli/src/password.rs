@@ -2,6 +2,7 @@ use crate::{CliError, CliResult};
 use rars::{Archive as DetectedArchive, ArchiveReadOptions, ArchiveReader, Error};
 use std::fs;
 use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
 pub(crate) type Password = Zeroizing<Vec<u8>>;
@@ -19,7 +20,7 @@ fn read_options(password: Option<&[u8]>) -> ArchiveReadOptions<'_> {
 
 pub(crate) fn resolve_password(
     inline: Option<&str>,
-    path: Option<&str>,
+    path: Option<&Path>,
 ) -> CliResult<Option<Password>> {
     if let Some(value) = inline {
         return Ok(Some(read_password_value(value)?));
@@ -48,7 +49,7 @@ fn trim_password_line(mut bytes: Password) -> Password {
 }
 
 pub(crate) fn read_archive_path_prompting(
-    path: &str,
+    path: &Path,
     password: &mut Option<Password>,
 ) -> CliResult<DetectedArchive> {
     match ArchiveReader::read_path_with_options(path, read_options(password_bytes(password))) {
@@ -67,7 +68,7 @@ pub(crate) fn read_archive_path_prompting(
 }
 
 pub(crate) fn parse_archives_prompting(
-    paths: &[String],
+    paths: &[PathBuf],
     password: &mut Option<Password>,
 ) -> CliResult<Vec<DetectedArchive>> {
     let mut archives = Vec::new();
@@ -123,7 +124,8 @@ pub(crate) fn error_is_password_class(error: &Error) -> bool {
     )
 }
 
-fn read_archive_error(path: &str, err: Error) -> String {
+fn read_archive_error(path: &Path, err: Error) -> String {
+    let path = path.display();
     match err.kind() {
         rars::ErrorKind::Io => format!("failed to read archive '{path}': {err}"),
         rars::ErrorKind::UnsupportedFormat
@@ -135,7 +137,7 @@ fn read_archive_error(path: &str, err: Error) -> String {
     }
 }
 
-fn read_archive_cli_error(path: &str, err: Error) -> CliError {
+fn read_archive_cli_error(path: &Path, err: Error) -> CliError {
     let message = read_archive_error(path, err.clone());
     if error_is_password_class(&err) {
         CliError::password(message)

@@ -255,6 +255,12 @@ impl Builder {
 
     /// Queue `data` under `name`.
     ///
+    /// `name` is archive identity, not display text: legacy byte names are
+    /// accepted unchanged. RAR5 names use its wire UTF-8 encoding; use
+    /// [`crate::filename::encode_rar50`] for native Unix bytes and Unix `mode`
+    /// for those nonportable mapped names. [`Self::add_path`] handles this
+    /// conversion automatically for filesystem inputs.
+    ///
     /// `mode` is a Unix mode, with optional file-type bits. Without a mode,
     /// the member uses DOS archive attributes and the extractor's default permissions.
     /// RAR 1.3-1.5 output uses DOS metadata even when a Unix mode is supplied.
@@ -266,7 +272,7 @@ impl Builder {
         mode: Option<u32>,
     ) -> Result<()> {
         self.push(BuilderEntry {
-            name: validate_entry_name(name)?,
+            name: self.validate_name(name)?,
             data,
             source: None,
             is_directory: false,
@@ -290,7 +296,7 @@ impl Builder {
         mode: Option<u32>,
     ) -> Result<()> {
         self.push(BuilderEntry {
-            name: validate_entry_name(name)?,
+            name: self.validate_name(name)?,
             data: Vec::new(),
             source: Some(source),
             is_directory: false,
@@ -318,7 +324,7 @@ impl Builder {
             ));
         }
         self.push(BuilderEntry {
-            name: validate_entry_name(name)?,
+            name: self.validate_name(name)?,
             data: Vec::new(),
             source: None,
             is_directory: true,
@@ -395,9 +401,9 @@ impl Builder {
     /// Queue a file, or every file under a directory, named `archive_name` in
     /// the archive. Children are added in sorted order so the same tree gives
     /// the same archive twice.
-    /// Child filenames must be representable as UTF-8; unrepresentable names
-    /// are rejected, never replaced. A file's source path need not be UTF-8
-    /// when the caller supplies its archive name explicitly.
+    /// `archive_name` and child names use native filename bytes on Unix and
+    /// UTF-8 elsewhere. Legacy output preserves these bytes; RAR5/7 applies
+    /// the reversible Unix byte mapping. Member lookup uses the encoded name.
     ///
     /// Symlinks are refused rather than followed, at the root and at every
     /// level below it: a link is a name for someone else's file, and copying
@@ -417,21 +423,22 @@ impl Builder {
             children.sort_by_key(|entry| entry.file_name());
             for child in children {
                 let file_name = child.file_name();
-                let file_name = file_name.to_str().ok_or(Error::InvalidArgument(
-                    "input filename is not UTF-8; add the file with an explicit archive name",
-                ))?;
+                let file_name = crate::filename::native_bytes(&file_name)?;
                 let mut child_name = archive_name.to_vec();
                 child_name.push(b'/');
-                child_name.extend_from_slice(file_name.as_bytes());
+                child_name.extend_from_slice(file_name);
                 self.add_path(&child.path(), &child_name)?;
             }
         } else if meta.is_file() {
-            self.add_source(
-                archive_name.to_vec(),
-                EntrySource::from_path(path),
-                None,
-                unix_mode(&meta),
-            )?;
+            // Validate native path syntax before a RAR5 mapping marker can
+            // precede the first component of the encoded archive name.
+            crate::filename::validate_relative(archive_name)?;
+            let name = if cfg!(unix) && self.format.family() == ArchiveFamily::Rar50Plus {
+                crate::filename::encode_rar50(archive_name).into_owned()
+            } else {
+                archive_name.to_vec()
+            };
+            self.add_source(name, EntrySource::from_path(path), None, unix_mode(&meta))?;
         }
         Ok(())
     }
@@ -452,7 +459,7 @@ impl Builder {
 
     /// Rename the member called `old` to `new`.
     pub fn rename(&mut self, old: &[u8], new: Vec<u8>) -> Result<()> {
-        let new = validate_entry_name(new)?;
+        let new = self.validate_name(new)?;
         let index = self
             .entries
             .iter()
@@ -467,6 +474,16 @@ impl Builder {
         }
         self.entries[index].name = new;
         Ok(())
+    }
+
+    fn validate_name(&self, name: Vec<u8>) -> Result<Vec<u8>> {
+        let name = validate_entry_name(name)?;
+        if self.format.family() == ArchiveFamily::Rar50Plus && std::str::from_utf8(&name).is_err() {
+            return Err(Error::InvalidArgument(
+                "RAR5 archive names require wire UTF-8; use filename::encode_rar50 for native Unix bytes",
+            ));
+        }
+        Ok(name)
     }
 
     fn push(&mut self, entry: BuilderEntry) -> Result<()> {
@@ -914,31 +931,27 @@ impl Builder {
     }
 }
 
-/// Reject a member name that would not survive extraction: absolute paths,
-/// `..`, drive letters and NUL bytes. Checking on the way in means an archive
-/// this crate writes is one this crate will extract, rather than one that trips
-/// the extractor's own guard later.
+/// Reject absolute paths, `..`, drive prefixes and NUL bytes without assuming
+/// a filename encoding. Destination filesystem representability and RAR5 Unix
+/// byte mapping are separate from archive member identity validation.
 pub fn validate_entry_name(name: Vec<u8>) -> Result<Vec<u8>> {
-    entry_relative_path(&name)?;
+    crate::filename::validate_relative(&name)?;
     Ok(name)
 }
 
 /// The path a member name denotes below an output directory, or an error if it
 /// denotes anywhere else. Backslashes are separators, because that is what a
-/// DOS-era writer put in the header.
+/// DOS-era writer put in the header. On Unix non-UTF-8 bytes are preserved.
+/// This is the legacy path convention, not a RAR5 wire-name decoder.
 pub fn entry_relative_path(name: &[u8]) -> Result<std::path::PathBuf> {
     use std::path::{Component, PathBuf};
 
-    if name.contains(&0) {
-        return Err(Error::UnsafePath("unsafe archive path contains NUL byte"));
-    }
-    let text = std::str::from_utf8(name)
-        .map_err(|_| Error::InvalidArgument("archive entry name is not UTF-8"))?
-        .replace('\\', "/");
-    let bytes = text.as_bytes();
-    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-        return Err(Error::UnsafePath("unsafe archive path"));
-    }
+    crate::filename::validate_relative(name)?;
+    let bytes: Vec<_> = name
+        .iter()
+        .map(|&b| if b == b'\\' { b'/' } else { b })
+        .collect();
+    let text = crate::filename::native_string(&bytes)?;
     let mut out = PathBuf::new();
     for component in Path::new(&text).components() {
         match component {
@@ -970,7 +983,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn add_path_rejects_non_utf8_child_names_without_replacement() {
+    fn add_path_preserves_non_utf8_child_names() {
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
 
@@ -978,14 +991,31 @@ mod tests {
         fs::write(root.join(OsStr::from_bytes(b"bad-\xff")), b"payload").unwrap();
         for format in ArchiveVersion::ALL {
             let mut builder = Builder::new(format);
-            let error = builder.add_path(&root, b"root").unwrap_err();
-            assert!(matches!(error.root_cause(), Error::InvalidArgument(_)));
-            assert!(builder.is_empty());
+            for unsafe_name in [b"../bad-\xff".as_slice(), b"/bad-\xff"] {
+                assert!(builder
+                    .add_path(&root.join(OsStr::from_bytes(b"bad-\xff")), unsafe_name)
+                    .is_err());
+                assert!(builder.is_empty());
+            }
+            builder.add_path(&root, b"root").unwrap();
+            let name = if format.family() == ArchiveFamily::Rar50Plus {
+                crate::filename::encode_rar50(b"root/bad-\xff").into_owned()
+            } else {
+                b"root/bad-\xff".to_vec()
+            };
+            let archive = crate::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+            assert_eq!(
+                archive.read_member(&name, None).unwrap().unwrap(),
+                b"payload"
+            );
             // A caller can still give a non-Unicode source an explicit name.
             builder
                 .add_path(&root.join(OsStr::from_bytes(b"bad-\xff")), b"explicit")
                 .unwrap();
-            assert_eq!(builder.names().collect::<Vec<_>>(), vec![&b"explicit"[..]]);
+            assert_eq!(
+                builder.names().collect::<Vec<_>>(),
+                vec![name.as_slice(), &b"explicit"[..]]
+            );
         }
     }
 
@@ -1087,6 +1117,31 @@ mod tests {
             archive.read_member(b"renamed.txt", None).unwrap().unwrap(),
             b"hello world".repeat(64)
         );
+    }
+
+    #[test]
+    fn legacy_byte_identity_survives_edits_without_unicode_validation() {
+        for format in ArchiveVersion::ALL {
+            if format.family() == ArchiveFamily::Rar50Plus {
+                continue;
+            }
+            let mut builder = Builder::new(format).store(true);
+            builder
+                .add_bytes(b"old-\xff".to_vec(), b"payload".to_vec(), None, None)
+                .unwrap();
+            builder.rename(b"old-\xff", b"new-\xfe".to_vec()).unwrap();
+            let archive = crate::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+            assert_eq!(
+                archive.read_member(b"new-\xfe", None).unwrap().unwrap(),
+                b"payload"
+            );
+            builder.remove(b"new-\xfe").unwrap();
+            assert!(builder.is_empty());
+        }
+        let mut modern = Builder::new(ArchiveVersion::Rar50);
+        assert!(modern
+            .add_bytes(b"old-\xff".to_vec(), vec![], None, None)
+            .is_err());
     }
 
     #[test]

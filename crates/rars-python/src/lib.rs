@@ -1083,7 +1083,7 @@ fn extract_archive<S: Selection>(
             if selected.is_some_and(|set| !set.contains_member(&meta.name)) {
                 return Ok(Box::new(io::sink()) as Box<dyn Write>);
             }
-            let path = checked_output_path(out_dir, &meta.name)?;
+            let path = checked_output_path(out_dir, meta, archive.family())?;
             if meta.is_directory {
                 fs::create_dir_all(&path)?;
                 written.lock().expect("written lock poisoned").push(path);
@@ -1119,7 +1119,7 @@ fn extract_volumes_archive(
     rars_rs::extract_volumes_to(archives, password, {
         let written = Arc::clone(&written);
         move |meta| {
-            let path = checked_output_path(out_dir, &meta.name)?;
+            let path = checked_output_path(out_dir, meta, archives[0].family())?;
             if meta.is_directory {
                 fs::create_dir_all(&path)?;
                 written.lock().expect("written lock poisoned").push(path);
@@ -1279,8 +1279,26 @@ fn parse_version(value: &str) -> PyResult<rars_rs::ArchiveVersion> {
         .ok_or_else(|| PyValueError::new_err(format!("unsupported RAR format: {value}")))
 }
 
-fn checked_output_path(out_dir: &Path, name: &[u8]) -> rars_rs::Result<PathBuf> {
-    let rel = output_relative_path(name)?;
+fn checked_output_path(
+    out_dir: &Path,
+    meta: &rars_rs::ExtractedEntryMeta,
+    family: rars_rs::ArchiveFamily,
+) -> rars_rs::Result<PathBuf> {
+    // Retain the binding's conservative name preflight (including legacy
+    // backslash traversal) before applying host-aware destination conversion.
+    rars_rs::validate_entry_name(meta.name.clone())?;
+    let rar50 = family == rars_rs::ArchiveFamily::Rar50Plus;
+    let name = if rar50 && cfg!(unix) && meta.attr_source == rars_rs::AttrSource::Unix {
+        rars_rs::filename::decode_rar50(&meta.name).into_owned()
+    } else if rar50 {
+        meta.name
+            .iter()
+            .map(|&b| if b == b'\\' { b'_' } else { b })
+            .collect()
+    } else {
+        meta.name.clone()
+    };
+    let rel = output_relative_path(&name, !rar50)?;
     let mut out_path = out_dir.to_path_buf();
     for component in rel.components() {
         let Component::Normal(part) = component else {
@@ -1299,16 +1317,23 @@ fn checked_output_path(out_dir: &Path, name: &[u8]) -> rars_rs::Result<PathBuf> 
     Ok(out_path)
 }
 
-fn output_relative_path(name: &[u8]) -> rars_rs::Result<PathBuf> {
+fn output_relative_path(name: &[u8], backslash_separator: bool) -> rars_rs::Result<PathBuf> {
     if name.contains(&0) {
         return Err(rars_rs::Error::UnsafePath(
             "unsafe archive path contains NUL byte",
         ));
     }
-    let text = String::from_utf8(name.to_vec())
-        .map_err(|_| rars_rs::Error::InvalidHeader("archive entry name is not UTF-8"))?
-        .replace('\\', "/");
-    let bytes = text.as_bytes();
+    let bytes: Vec<_> = name
+        .iter()
+        .map(|&b| {
+            if backslash_separator && b == b'\\' {
+                b'/'
+            } else {
+                b
+            }
+        })
+        .collect();
+    let text = rars_rs::filename::native_string(&bytes)?;
     if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
         return Err(rars_rs::Error::UnsafePath("unsafe archive path"));
     }
@@ -1331,7 +1356,9 @@ fn archive_base_name(path: &Path) -> PyResult<Vec<u8>> {
     let file_name = path
         .file_name()
         .ok_or_else(|| PyValueError::new_err("input path has no file name"))?;
-    Ok(file_name.to_string_lossy().into_owned().into_bytes())
+    rars_rs::filename::native_bytes(file_name)
+        .map(<[u8]>::to_vec)
+        .map_err(map_error)
 }
 
 #[cfg(unix)]

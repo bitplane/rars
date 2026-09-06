@@ -174,6 +174,8 @@ fn cmd_info(args: InfoArgs) -> CliResult<()> {
     let mut password = resolve_password_args(&args.password)?;
     for path in &args.paths {
         let archive = read_archive_path_prompting(path, &mut password)?;
+        let path_display = path.to_string_lossy();
+        let path = path_display.as_ref();
         let family = archive.family();
         if args.verbose {
             println!("{path}: {family:?} at offset {}", archive.sfx_offset());
@@ -589,7 +591,7 @@ fn cmd_test(args: TestArgs) -> CliResult<()> {
             classify_rars_error(err, |err| {
                 format!(
                     "failed to test archive '{}': {err}{}",
-                    paths[0],
+                    paths[0].display(),
                     rar50_buffered_decode_limit_hint(err)
                 )
             })
@@ -616,7 +618,11 @@ fn cmd_test(args: TestArgs) -> CliResult<()> {
             classify_rars_error(err, |err| {
                 format!(
                     "failed to test volume set '{}': {err}{}",
-                    paths.join(", "),
+                    paths
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
                     rar50_buffered_decode_limit_hint(err)
                 )
             })
@@ -634,7 +640,7 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
     let mut paths = args.paths;
     reject_ambiguous_extract_target(&paths)?;
     // Invariant: clap enforces at least two positional paths (archive + outdir).
-    let out_dir = PathBuf::from(paths.pop().expect("outdir"));
+    let out_dir = paths.pop().expect("outdir");
     validate_extract_destination(&out_dir)?;
     if paths.len() == 1 {
         let discovered = discover_sibling_volumes(&paths[0]);
@@ -689,7 +695,11 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
             classify_rars_error(err, |err| {
                 format!(
                     "failed to extract volume set '{}': {err}{}",
-                    paths.join(", "),
+                    paths
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
                     rar50_buffered_decode_limit_hint(err)
                 )
             })
@@ -811,8 +821,8 @@ impl<'a> ExtractOutputState<'a> {
 }
 
 fn rar50_extracted_meta(meta: &rars::rar50::ExtractedEntryMeta) -> rars::ExtractedEntryMeta {
-    // The library resolves attributes against the host OS; only the name needs
-    // the RAR 5 backslash rule applied on top.
+    // The library resolves attributes against the host OS. Convert the name
+    // only for this destination adapter; outputs retain the original identity.
     let mut common = rars::rar50_meta(meta);
     common.name = rar50_entry_name(&meta.name, meta.host_os);
     common
@@ -882,7 +892,7 @@ fn validate_extract_destination(out_dir: &Path) -> CliResult<()> {
     Ok(())
 }
 
-fn reject_ambiguous_extract_target(paths: &[String]) -> CliResult<()> {
+fn reject_ambiguous_extract_target(paths: &[PathBuf]) -> CliResult<()> {
     let Some(out_path) = paths.last() else {
         return Ok(());
     };
@@ -892,7 +902,7 @@ fn reject_ambiguous_extract_target(paths: &[String]) -> CliResult<()> {
     Ok(())
 }
 
-fn looks_like_archive_path(path: &str) -> CliResult<bool> {
+fn looks_like_archive_path(path: &Path) -> CliResult<bool> {
     const ARCHIVE_SNIFF_LIMIT: u64 = 128 * 1024;
 
     let metadata = match fs::metadata(path) {
@@ -900,7 +910,8 @@ fn looks_like_archive_path(path: &str) -> CliResult<bool> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => {
             return Err(CliError::general(format!(
-                "failed to inspect extract output path '{path}': {error}"
+                "failed to inspect extract output path '{}': {error}",
+                path.display()
             )))
         }
     };
@@ -909,7 +920,8 @@ fn looks_like_archive_path(path: &str) -> CliResult<bool> {
     }
     if !metadata.is_file() {
         return Err(CliError::general(format!(
-            "extract destination '{path}' is not a regular file or directory"
+            "extract destination '{}' is not a regular file or directory",
+            path.display()
         )));
     }
 
@@ -917,7 +929,8 @@ fn looks_like_archive_path(path: &str) -> CliResult<bool> {
         Ok(file) => file,
         Err(error) => {
             return Err(CliError::general(format!(
-                "failed to inspect extract output path '{path}': {error}"
+                "failed to inspect extract output path '{}': {error}",
+                path.display()
             )))
         }
     };
@@ -927,7 +940,8 @@ fn looks_like_archive_path(path: &str) -> CliResult<bool> {
         .read_to_end(&mut bytes)
         .map_err(|error| {
             CliError::general(format!(
-                "failed to inspect extract output path '{path}': {error}"
+                "failed to inspect extract output path '{}': {error}",
+                path.display()
             ))
         })?;
     Ok(ArchiveReader::detect(&bytes).is_ok())
@@ -981,7 +995,7 @@ struct AddCommand {
     no_filter: bool,
     ppmd: bool,
     archive_path: PathBuf,
-    input_paths: Vec<String>,
+    input_paths: Vec<PathBuf>,
 }
 
 fn build_add_command(args: AddArgs) -> CliResult<AddCommand> {
@@ -1021,7 +1035,7 @@ fn build_add_command(args: AddArgs) -> CliResult<AddCommand> {
         compression_level,
         dictionary_size: args.dict_size,
         memory_limit: args.memory_limit,
-        temp_dir: args.temp_dir.map(PathBuf::from),
+        temp_dir: args.temp_dir,
         solid: args.solid,
         header_encryption: args.encrypt_headers,
         quick_open: args.quick_open,
@@ -1039,7 +1053,7 @@ fn build_add_command(args: AddArgs) -> CliResult<AddCommand> {
         auto_filter: args.auto_filter,
         no_filter: args.no_filter,
         ppmd: args.ppmd,
-        archive_path: PathBuf::from(args.archive),
+        archive_path: args.archive,
         input_paths: args.files,
     })
 }
@@ -1398,7 +1412,7 @@ fn legacy_filter_policy(
 /// What a legacy volume set needs, which is still every input in memory.
 struct LegacyVolumeWrite<'a> {
     write_plan: AddWritePlan,
-    input_paths: &'a [String],
+    input_paths: &'a [PathBuf],
     archive_path: &'a Path,
     target: ArchiveVersion,
     compression_level: Option<u8>,
@@ -1525,7 +1539,7 @@ fn write_legacy_volumes(plan: LegacyVolumeWrite<'_>, progress: &CliProgress) -> 
 
 #[allow(clippy::too_many_arguments)]
 fn write_plain_rar50_streaming(
-    input_paths: &[String],
+    input_paths: &[PathBuf],
     archive_path: &Path,
     target: ArchiveVersion,
     compression_level: Option<u8>,
@@ -1555,17 +1569,20 @@ fn write_plain_rar50_streaming(
     let entries: Vec<_> = inputs
         .into_iter()
         .map(|entry| {
-            let entry = rars::rar50::ArchiveEntry::new(
-                entry.name,
-                rars::EntrySource::from_path(entry.path),
-            )
-            .with_mtime(entry.unix_mtime)
-            .with_attributes(u64::from(
-                entry
-                    .unix_mode
-                    .unwrap_or_else(|| u32::from(entry.file_attr)),
-            ))
-            .with_host_os(RAR50_HOST_NATIVE);
+            let name = if cfg!(unix) {
+                rars::filename::encode_rar50(&entry.name).into_owned()
+            } else {
+                entry.name
+            };
+            let entry =
+                rars::rar50::ArchiveEntry::new(name, rars::EntrySource::from_path(entry.path))
+                    .with_mtime(entry.unix_mtime)
+                    .with_attributes(u64::from(
+                        entry
+                            .unix_mode
+                            .unwrap_or_else(|| u32::from(entry.file_attr)),
+                    ))
+                    .with_host_os(RAR50_HOST_NATIVE);
             let entry = match file_comment {
                 Some(comment) => entry.with_service(rars::rar50::ServiceEntry::new(
                     b"CMT".to_vec(),
@@ -1654,7 +1671,7 @@ fn write_plain_rar50_streaming(
 /// decide where the parts break, so the input, the packed member and every part
 /// are all resident at once. RAR 5 and RAR 7 split as they go, so this never
 /// applies to them. Saying so up front beats an allocation failure an hour in.
-fn warn_if_buffered_write_is_large(input_paths: &[String], target: ArchiveVersion) {
+fn warn_if_buffered_write_is_large(input_paths: &[PathBuf], target: ArchiveVersion) {
     const WARN_THRESHOLD: u64 = 256 * 1024 * 1024;
 
     if target.family() == rars::version::ArchiveFamily::Rar50Plus {
@@ -1883,13 +1900,15 @@ fn write_archive_streaming(
 fn create_streaming_archive_temp(archive_path: &Path) -> CliResult<(PathBuf, fs::File)> {
     let file_name = archive_path
         .file_name()
-        .ok_or("archive output path has no file name")?
-        .to_string_lossy();
+        .ok_or("archive output path has no file name")?;
     for sequence in 0..128u8 {
-        let temporary = archive_path.with_file_name(format!(
-            ".{file_name}.rars-writing-{}-{sequence:02x}",
+        let mut name = std::ffi::OsString::from(".");
+        name.push(file_name);
+        name.push(format!(
+            ".rars-writing-{}-{sequence:02x}",
             std::process::id()
         ));
+        let temporary = archive_path.with_file_name(name);
         match fs::File::options()
             .write(true)
             .create_new(true)
@@ -2253,11 +2272,12 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
-    fn output_relative_path_reports_non_utf8_archive_names() {
-        let err = output_relative_path(b"legacy-\xff-name.txt").unwrap_err();
-
-        assert_eq!(err.to_string(), "archive entry name is not UTF-8");
+    fn output_relative_path_preserves_non_utf8_archive_names() {
+        use std::os::unix::ffi::OsStrExt;
+        let path = output_relative_path(b"legacy-\xff-name.txt").unwrap();
+        assert_eq!(path.as_os_str().as_bytes(), b"legacy-\xff-name.txt");
     }
 
     #[cfg(unix)]

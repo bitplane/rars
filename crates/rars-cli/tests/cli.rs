@@ -469,7 +469,7 @@ fn rejects_unsafe_output_path() {
 }
 
 #[test]
-fn rejects_non_utf8_output_path() {
+fn extracts_non_utf8_output_path_where_native_names_support_bytes() {
     let dir = scratch("non-utf8-extract");
     let archive = dir.join("non-utf8.rar");
     let out_dir = dir.join("out");
@@ -494,8 +494,18 @@ fn rejects_non_utf8_output_path() {
         .output()
         .unwrap();
 
+    #[cfg(unix)]
+    {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        assert!(extract.status.success(), "{}", stderr(&extract));
+        assert_eq!(
+            fs::read(out_dir.join(OsStr::from_bytes(b"\xff.txt"))).unwrap(),
+            b"non utf8 path fixture\n"
+        );
+    }
+    #[cfg(not(unix))]
     assert!(!extract.status.success());
-    assert!(stderr(&extract).contains("unsafe archive path"));
 }
 
 #[cfg(unix)]
@@ -5752,4 +5762,152 @@ fn extract_distinguishes_missing_mtime_from_epoch_for_files_and_directories() {
             .unwrap()
             > retained
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn native_filename_round_trip_across_archive_generations() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let dir = scratch("native-filenames");
+    let input = dir.join(OsStr::from_bytes(b"tree-\xfe"));
+    fs::create_dir(&input).unwrap();
+    let names: &[&[u8]] = &[
+        b"file-\xff",
+        b"file-\xfe",
+        "file-\u{fffd}".as_bytes(),
+        "private-\u{e0ff}".as_bytes(),
+        "marker-\u{fffe}".as_bytes(),
+    ];
+    for name in names {
+        fs::write(input.join(OsStr::from_bytes(name)), name).unwrap();
+    }
+    let direct = dir.join(OsStr::from_bytes(b"direct-\xfd"));
+    fs::write(&direct, b"direct").unwrap();
+    for format in [
+        "rar14", "rar15", "rar20", "rar29", "rar30", "rar40", "rar50", "rar70",
+    ] {
+        let archive = dir
+            .join(OsStr::from_bytes(format!("{format}-").as_bytes()))
+            .with_extension(OsStr::from_bytes(b"\xff.rar"));
+        let out = dir
+            .join(OsStr::from_bytes(format!("out-{format}-").as_bytes()))
+            .with_extension(OsStr::from_bytes(b"\xfe"));
+        let add = rars()
+            .args(["a", "--store", "--format", format])
+            .arg(&archive)
+            .arg(&input)
+            .arg(&direct)
+            .output()
+            .unwrap();
+        assert!(add.status.success(), "{format}: {}", stderr(&add));
+        for command in ["info", "test"] {
+            let result = rars().arg(command).arg(&archive).output().unwrap();
+            assert!(
+                result.status.success(),
+                "{format} {command}: {}",
+                stderr(&result)
+            );
+        }
+        let extract = rars().arg("x").arg(&archive).arg(&out).output().unwrap();
+        assert!(extract.status.success(), "{format}: {}", stderr(&extract));
+        for name in names {
+            assert_eq!(
+                fs::read(
+                    out.join(input.file_name().unwrap())
+                        .join(OsStr::from_bytes(name))
+                )
+                .unwrap(),
+                *name,
+                "{format}"
+            );
+        }
+        assert_eq!(
+            fs::read(out.join(direct.file_name().unwrap())).unwrap(),
+            b"direct"
+        );
+        if ["rar50", "rar70"].contains(&format) {
+            let reference_out = dir.join(format!("unrar-{format}"));
+            fs::create_dir(&reference_out).unwrap();
+            match Command::new("unrar")
+                .env("LC_ALL", "C.UTF-8")
+                .args(["x", "-idq", "-o+"])
+                .arg(&archive)
+                .current_dir(&reference_out)
+                .output()
+            {
+                Ok(result) => {
+                    assert!(result.status.success(), "{}", stderr(&result));
+                    for name in names {
+                        assert_eq!(
+                            fs::read(
+                                reference_out
+                                    .join(input.file_name().unwrap())
+                                    .join(OsStr::from_bytes(name))
+                            )
+                            .unwrap(),
+                            *name
+                        );
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    eprintln!("unrar unavailable; reference check skipped")
+                }
+                Err(error) => panic!("unrar: {error}"),
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn native_filename_encrypted_volume_round_trip() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let dir = scratch("native-encrypted-volumes");
+    let source = dir.join(OsStr::from_bytes(b"member-\xff"));
+    let password = dir.join(OsStr::from_bytes(b"password-\xfe"));
+    let payload = deterministic_noise(4096);
+    fs::write(&source, &payload).unwrap();
+    fs::write(&password, b"password").unwrap();
+    for format in ["rar30", "rar50"] {
+        let root = dir.join(format);
+        fs::create_dir(&root).unwrap();
+        let archive = root.join(OsStr::from_bytes(b"archive-\xff.rar"));
+        let add = rars()
+            .args([
+                "a",
+                "--format",
+                format,
+                "--encrypt-headers",
+                "--volume-size",
+                "1k",
+                "--password-file",
+            ])
+            .arg(&password)
+            .arg(&archive)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(add.status.success(), "{format}: {}", stderr(&add));
+        let first = if format == "rar50" {
+            root.join(OsStr::from_bytes(b"archive-\xff.part01.rar"))
+        } else {
+            archive
+        };
+        let out = root.join(OsStr::from_bytes(b"out-\xfe"));
+        let extract = rars()
+            .args(["x", "--password-file"])
+            .arg(&password)
+            .arg(first.file_name().unwrap())
+            .arg(&out)
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(extract.status.success(), "{format}: {}", stderr(&extract));
+        assert_eq!(
+            fs::read(out.join(source.file_name().unwrap())).unwrap(),
+            payload
+        );
+    }
 }

@@ -57,7 +57,7 @@ pub(crate) struct PasswordArgs {
     pub password: Option<String>,
     /// Read password from file ("-" for stdin); trailing newlines are stripped
     #[arg(long, value_name = "PATH", conflicts_with = "password")]
-    pub password_file: Option<String>,
+    pub password_file: Option<std::path::PathBuf>,
 }
 
 #[derive(Args)]
@@ -76,7 +76,7 @@ pub(crate) struct InfoArgs {
     pub verbose: bool,
     /// One or more archive paths
     #[arg(value_name = "ARCHIVE", required = true)]
-    pub paths: Vec<String>,
+    pub paths: Vec<std::path::PathBuf>,
 }
 
 #[derive(Args)]
@@ -87,7 +87,7 @@ pub(crate) struct TestArgs {
     pub read_options: ReadOptionsArgs,
     /// Archive path (first volume of a multi-part set), optionally followed by sibling parts
     #[arg(value_name = "ARCHIVE", required = true)]
-    pub paths: Vec<String>,
+    pub paths: Vec<std::path::PathBuf>,
 }
 
 #[derive(Args)]
@@ -101,7 +101,7 @@ pub(crate) struct ExtractArgs {
     pub overwrite: OverwriteCli,
     /// Archive (and optional sibling parts) followed by an output directory
     #[arg(value_name = "PATH", required = true, num_args = 2..)]
-    pub paths: Vec<String>,
+    pub paths: Vec<std::path::PathBuf>,
 }
 
 #[derive(Args)]
@@ -110,7 +110,7 @@ pub(crate) struct RepairArgs {
     pub password: PasswordArgs,
     /// Either <archive> <repaired-archive>, or <rar-parts-and-rev-files...> <outdir>
     #[arg(value_name = "PATH", required = true, num_args = 2..)]
-    pub paths: Vec<String>,
+    pub paths: Vec<std::path::PathBuf>,
 }
 
 #[derive(Args)]
@@ -143,7 +143,7 @@ pub(crate) struct AddArgs {
     pub memory_limit: Option<usize>,
     /// Directory for temporary compressed payloads (RAR 5+)
     #[arg(long, value_name = "PATH")]
-    pub temp_dir: Option<String>,
+    pub temp_dir: Option<std::path::PathBuf>,
     /// Use solid compression (treats inputs as one continuous stream)
     #[arg(long)]
     pub solid: bool,
@@ -204,10 +204,10 @@ pub(crate) struct AddArgs {
     pub ppmd: bool,
     /// Output archive path
     #[arg(value_name = "ARCHIVE")]
-    pub archive: String,
+    pub archive: std::path::PathBuf,
     /// Files (and directories) to add to the archive
     #[arg(value_name = "FILE", required = true)]
-    pub files: Vec<String>,
+    pub files: Vec<std::path::PathBuf>,
 }
 
 #[derive(Copy, Clone, ValueEnum)]

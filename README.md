@@ -49,6 +49,15 @@ comments, RARVM filters, RAR5 quick-open records, recovery records and header
 encryption. There are a lot of things I won't list here, so run `rars --help`
 for more details.
 
+On Unix, native filenames and legacy archive names can contain non-UTF-8 bytes.
+The CLI, Python extraction and Rust path adapters preserve those bytes. RAR5/7
+filesystem inputs use the format's reversible Unix byte mapping; member metadata
+and lookup keys retain the encoded archive identity. Use byte names (or Python
+`RarInfo` objects) for exact lookup, rather than lossy display names.
+
+Legacy code pages are not guessed. Windows supports Unicode names; extracting
+non-Unicode legacy byte names there still requires caller-selected decoding.
+
 ## Bindings
 
 Python bindings are published to [pypi](https://pypi.org/project/rars/), so you

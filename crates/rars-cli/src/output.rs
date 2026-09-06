@@ -1,5 +1,5 @@
 use crate::time::extracted_system_time;
-use crate::{CliError, CliResult};
+use crate::CliResult;
 use rars::{
     Archive as DetectedArchive, ArchiveFamily, ArchiveVersion, AttrSource, Error,
     ExtractedEntryMeta,
@@ -99,7 +99,7 @@ pub(crate) fn output_path_for_entry(
 pub(crate) fn rar50_entry_name(name: &[u8], host_os: u64) -> Vec<u8> {
     const HOST5_UNIX: u64 = 1;
     if cfg!(unix) && host_os == HOST5_UNIX {
-        return name.to_vec();
+        return rars::filename::decode_rar50(name).into_owned();
     }
     name.iter()
         .map(|&byte| if byte == b'\\' { b'_' } else { byte })
@@ -401,15 +401,19 @@ fn relative_path(name: &[u8], backslash_is_separator: bool) -> CliResult<PathBuf
     if name.contains(&0) {
         return Err("unsafe archive path contains NUL byte".into());
     }
-    let mut text = String::from_utf8(name.to_vec())
-        .map_err(|_| CliError::general("archive entry name is not UTF-8"))?;
-    if backslash_is_separator {
-        text = text.replace('\\', "/");
-    }
-    let text = text;
-    let bytes = text.as_bytes();
+    let bytes: Vec<_> = name
+        .iter()
+        .map(|&b| {
+            if backslash_is_separator && b == b'\\' {
+                b'/'
+            } else {
+                b
+            }
+        })
+        .collect();
+    let text = rars::filename::native_string(&bytes)?;
     if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-        return Err(format!("unsafe archive path: {text}").into());
+        return Err(format!("unsafe archive path: {}", Path::new(&text).display()).into());
     }
     let path = Path::new(&text);
     let mut out = PathBuf::new();
@@ -417,7 +421,7 @@ fn relative_path(name: &[u8], backslash_is_separator: bool) -> CliResult<PathBuf
         match component {
             Component::Normal(part) => out.push(part),
             Component::CurDir => {}
-            _ => return Err(format!("unsafe archive path: {text}").into()),
+            _ => return Err(format!("unsafe archive path: {}", Path::new(&text).display()).into()),
         }
     }
     if out.as_os_str().is_empty() {
@@ -480,6 +484,46 @@ mod tests {
             .find(|file| file.redirection.is_some())
             .unwrap();
         (file.metadata(), file.redirection.clone().unwrap())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rar50_mapped_names_are_resolved_once_for_files_and_redirections() {
+        use super::*;
+        use std::ffi::OsStr;
+        use std::io::Write;
+        use std::os::unix::ffi::OsStrExt;
+        for kind in [FSREDIR_HARDLINK, FSREDIR_FILE_COPY, FSREDIR_UNIX_SYMLINK] {
+            let dir = scratch("mapped-redirections");
+            let mut state = crate::ExtractOutputState::new(
+                &dir,
+                OverwritePolicy::Always,
+                ArchiveFamily::Rar50Plus,
+            );
+            let (mut meta, mut redirection) = redirection_fixture();
+            meta.host_os = 1;
+            // A literal marker and a private-use character must survive decoding once.
+            let native = "source-\u{fffe}\u{e0ff}".as_bytes();
+            meta.name = rars::filename::encode_rar50(native).into_owned();
+            state
+                .open_rar50_entry(&meta)
+                .unwrap()
+                .write_all(b"payload")
+                .unwrap();
+            assert_eq!(state.outputs[0].name, meta.name);
+            redirection.target_name = meta.name.clone();
+            redirection.redirection_type = kind;
+            meta.name = rars::filename::encode_rar50(b"link-\xff").into_owned();
+            state.create_rar50_redirection(&meta, &redirection).unwrap();
+            assert_eq!(
+                fs::read(dir.join(OsStr::from_bytes(b"link-\xff"))).unwrap(),
+                b"payload"
+            );
+            assert_eq!(
+                fs::read(dir.join(OsStr::from_bytes(native))).unwrap(),
+                b"payload"
+            );
+        }
     }
 
     #[test]

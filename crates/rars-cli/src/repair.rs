@@ -27,7 +27,9 @@ pub(crate) fn cmd_repair(args: RepairArgs) -> CliResult<()> {
                     &mut output,
                     crate::password::password_bytes(&password),
                 )
-                .map_err(|err| format!("failed to repair archive '{}': {err}", paths[0]))?;
+                .map_err(|err| {
+                    format!("failed to repair archive '{}': {err}", paths[0].display())
+                })?;
             print_repair_report(&paths[1], report);
         }
         Err(parse_error) => {
@@ -43,7 +45,7 @@ pub(crate) fn cmd_repair(args: RepairArgs) -> CliResult<()> {
                 .map_err(|repair_error| {
                     format!(
                         "failed to parse archive '{}': {}; raw inline recovery repair also failed: {}",
-                        paths[0], parse_error, repair_error
+                        paths[0].display(), parse_error, repair_error
                     )
                 })?;
             fs::write(&paths[1], &repaired.data)?;
@@ -53,7 +55,8 @@ pub(crate) fn cmd_repair(args: RepairArgs) -> CliResult<()> {
     Ok(())
 }
 
-fn print_repair_report(path: &str, report: rars::RecoveryRepairReport) {
+fn print_repair_report(path: &Path, report: rars::RecoveryRepairReport) {
+    let path = path.display();
     let mut actions = Vec::new();
     if report.data_repaired {
         actions.push("repaired protected data");
@@ -71,14 +74,14 @@ fn print_repair_report(path: &str, report: rars::RecoveryRepairReport) {
     }
 }
 
-fn path_starts_with(path: &str, prefix: &[u8]) -> CliResult<bool> {
+fn path_starts_with(path: &Path, prefix: &[u8]) -> CliResult<bool> {
     let mut file = fs::File::open(path)?;
     let mut buf = vec![0; prefix.len()];
     let read = std::io::Read::read(&mut file, &mut buf)?;
     Ok(read == prefix.len() && buf == prefix)
 }
 
-fn cmd_repair_volumes(paths: &[String]) -> CliResult<()> {
+fn cmd_repair_volumes(paths: &[PathBuf]) -> CliResult<()> {
     let input_paths = &paths[..paths.len() - 1];
     for path in input_paths {
         if path_has_extension(path, "rev") {
@@ -91,7 +94,7 @@ fn cmd_repair_volumes(paths: &[String]) -> CliResult<()> {
     cmd_repair_rev3(paths)
 }
 
-fn cmd_repair_rev5(paths: &[String]) -> CliResult<()> {
+fn cmd_repair_rev5(paths: &[PathBuf]) -> CliResult<()> {
     // Invariant: cmd_repair dispatches here only after checking at least two paths.
     let out_dir = PathBuf::from(paths.last().expect("outdir"));
     fs::create_dir_all(&out_dir)?;
@@ -105,7 +108,8 @@ fn cmd_repair_rev5(paths: &[String]) -> CliResult<()> {
             Err(Error::UnsupportedSignature) => data_inputs.push((PathBuf::from(path), bytes)),
             Err(error) => {
                 return Err(CliError::general(format!(
-                    "failed to parse REV volume '{path}': {error}"
+                    "failed to parse REV volume '{}': {error}",
+                    path.display()
                 )))
             }
         }
@@ -139,7 +143,7 @@ fn cmd_repair_rev5(paths: &[String]) -> CliResult<()> {
     Ok(())
 }
 
-fn cmd_repair_rev3(paths: &[String]) -> CliResult<()> {
+fn cmd_repair_rev3(paths: &[PathBuf]) -> CliResult<()> {
     // Invariant: cmd_repair dispatches here only after checking at least two paths.
     let out_dir = PathBuf::from(paths.last().expect("outdir"));
     fs::create_dir_all(&out_dir)?;
@@ -154,7 +158,10 @@ fn cmd_repair_rev3(paths: &[String]) -> CliResult<()> {
         if path_has_extension(path, "rev") {
             let (recovery_index, rec_count, dat_count, payload) =
                 parse_rar3_rev_volume(Path::new(path), &bytes).ok_or_else(|| {
-                    CliError::general(format!("failed to parse RAR 3 REV volume name '{path}'"))
+                    CliError::general(format!(
+                        "failed to parse RAR 3 REV volume name '{}'",
+                        path.display()
+                    ))
                 })?;
             if recovery_count
                 .replace(rec_count)

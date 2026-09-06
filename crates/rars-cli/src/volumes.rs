@@ -21,33 +21,38 @@ pub(crate) fn rar50_volume_part_path(
     total_parts: usize,
 ) -> CliResult<PathBuf> {
     let parent = first_path.parent().unwrap_or_else(|| Path::new(""));
-    let file_name = first_path
-        .file_name()
-        .ok_or("RAR 5 volume path needs a file name")?
-        .to_string_lossy();
-    let stem = rar50_volume_stem(&file_name);
+    let file_name = rars::filename::native_bytes(
+        first_path
+            .file_name()
+            .ok_or("RAR 5 volume path needs a file name")?,
+    )?;
+    let stem = rar50_volume_stem(file_name);
     let width = total_parts.to_string().len().max(2);
-    Ok(parent.join(format!(
-        "{stem}.part{:0width$}.rar",
-        index + 1,
-        width = width
-    )))
+    let mut name = rars::filename::native_string(stem)?;
+    name.push(format!(".part{:0width$}.rar", index + 1));
+    Ok(parent.join(name))
 }
 
-fn rar50_volume_stem(file_name: &str) -> &str {
-    let without_rar = file_name
-        .strip_suffix(".rar")
-        .or_else(|| file_name.strip_suffix(".RAR"))
-        .unwrap_or(file_name);
-    if let Some((base, digits)) = without_rar.rsplit_once(".part") {
-        if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) {
-            return base;
+fn rar50_volume_stem(file_name: &[u8]) -> &[u8] {
+    let without_rar =
+        if file_name.len() >= 4 && file_name[file_name.len() - 4..].eq_ignore_ascii_case(b".rar") {
+            &file_name[..file_name.len() - 4]
+        } else {
+            file_name
+        };
+    if let Some(pos) = without_rar
+        .windows(5)
+        .rposition(|s| s.eq_ignore_ascii_case(b".part"))
+    {
+        let digits = &without_rar[pos + 5..];
+        if !digits.is_empty() && digits.iter().all(u8::is_ascii_digit) {
+            return &without_rar[..pos];
         }
     }
     without_rar
 }
 
-pub(crate) fn sort_volume_paths(paths: &mut [String]) {
+pub(crate) fn sort_volume_paths(paths: &mut [PathBuf]) {
     paths.sort_by(|a, b| {
         volume_sort_key(Path::new(a))
             .cmp(&volume_sort_key(Path::new(b)))
@@ -55,64 +60,66 @@ pub(crate) fn sort_volume_paths(paths: &mut [String]) {
     });
 }
 
-pub(crate) fn discover_sibling_volumes(first_path: &str) -> Vec<String> {
+pub(crate) fn discover_sibling_volumes(first_path: &Path) -> Vec<PathBuf> {
     let first = Path::new(first_path);
-    let parent = first.parent().unwrap_or_else(|| Path::new("."));
+    let parent = first
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let Some(first_key) = volume_name_key(first) else {
-        return vec![first_path.to_string()];
+        return vec![first_path.to_path_buf()];
     };
     let Ok(entries) = fs::read_dir(parent) else {
-        return vec![first_path.to_string()];
+        return vec![first_path.to_path_buf()];
     };
     let mut paths = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if volume_name_key(&path).as_ref() == Some(&first_key) && volume_sort_key(&path).is_some() {
-            paths.push(path.to_string_lossy().into_owned());
+            paths.push(path);
         }
     }
     if paths.is_empty() {
-        paths.push(first_path.to_string());
+        paths.push(first_path.to_path_buf());
     }
     sort_volume_paths(&mut paths);
     paths
 }
 
-fn volume_name_key(path: &Path) -> Option<String> {
-    let name = path.file_name()?.to_string_lossy();
+fn volume_name_key(path: &Path) -> Option<Vec<u8>> {
+    let name = rars::filename::native_bytes(path.file_name()?).ok()?;
     let lower = name.to_ascii_lowercase();
-    if let Some((base, suffix)) = lower.rsplit_once(".part") {
-        if suffix.ends_with(".rar")
-            && suffix[..suffix.len() - 4]
-                .bytes()
-                .all(|b| b.is_ascii_digit())
-        {
-            return Some(format!("part:{}", &name[..base.len()]));
+    if let Some(pos) = lower.windows(5).rposition(|s| s == b".part") {
+        let suffix = &lower[pos + 5..];
+        if let Some(digits) = suffix.strip_suffix(b".rar") {
+            if !digits.is_empty() && digits.iter().all(u8::is_ascii_digit) {
+                return Some([b"part:".as_slice(), &name[..pos]].concat());
+            }
         }
     }
-    if lower.ends_with(".rar") {
-        return Some(format!("old:{}", &name[..name.len() - 4]));
-    }
-    if let Some((base, ext)) = lower.rsplit_once('.') {
-        if ext.len() == 3 && ext.starts_with('r') && ext[1..].bytes().all(|b| b.is_ascii_digit()) {
-            return Some(format!("old:{}", &name[..base.len()]));
-        }
+    if lower.ends_with(b".rar")
+        || (lower.len() >= 4
+            && lower[lower.len() - 4..lower.len() - 2] == *b".r"
+            && lower[lower.len() - 2..].iter().all(u8::is_ascii_digit))
+    {
+        return Some([b"old:".as_slice(), &name[..name.len() - 4]].concat());
     }
     None
 }
 
 fn volume_sort_key(path: &Path) -> Option<usize> {
-    let name = path.file_name()?.to_string_lossy();
+    let name = rars::filename::native_bytes(path.file_name()?).ok()?;
     let lower = name.to_ascii_lowercase();
-    if let Some(part_pos) = lower.rfind(".part") {
-        let suffix = &lower[part_pos + ".part".len()..];
-        if let Some(digits) = suffix.strip_suffix(".rar") {
-            if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
-                return digits.parse::<usize>().ok()?.checked_sub(1);
-            }
+    if let Some(pos) = lower.windows(5).rposition(|s| s == b".part") {
+        if let Some(digits) = lower[pos + 5..].strip_suffix(b".rar") {
+            return std::str::from_utf8(digits)
+                .ok()?
+                .parse::<usize>()
+                .ok()?
+                .checked_sub(1);
         }
     }
-    if lower.ends_with(".rar") {
+    if lower.ends_with(b".rar") {
         return Some(0);
     }
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
@@ -122,7 +129,7 @@ fn volume_sort_key(path: &Path) -> Option<usize> {
     None
 }
 
-pub(crate) fn path_has_extension(path: &str, extension: &str) -> bool {
+pub(crate) fn path_has_extension(path: &Path, extension: &str) -> bool {
     Path::new(path)
         .extension()
         .and_then(|ext| ext.to_str())
@@ -158,8 +165,7 @@ fn parse_rar3_new_style_rev(bytes: &[u8]) -> Option<(usize, usize, usize)> {
 }
 
 fn parse_rar3_old_style_rev_name(path: &Path) -> Option<(usize, usize, usize)> {
-    let stem = path.file_stem()?.to_string_lossy();
-    let bytes = stem.as_bytes();
+    let bytes = rars::filename::native_bytes(path.file_stem()?).ok()?;
     let mut cursor = bytes.len();
     let mut numbers = Vec::new();
     while cursor > 0 && numbers.len() < 3 {
@@ -173,7 +179,10 @@ fn parse_rar3_old_style_rev_name(path: &Path) -> Option<(usize, usize, usize)> {
         while cursor > 0 && bytes[cursor - 1].is_ascii_digit() {
             cursor -= 1;
         }
-        let number = stem[cursor..end].parse::<usize>().ok()?;
+        let number = std::str::from_utf8(&bytes[cursor..end])
+            .ok()?
+            .parse::<usize>()
+            .ok()?;
         numbers.push(number);
     }
     if numbers.len() != 3 || numbers.iter().any(|&number| number == 0 || number > 255) {
@@ -183,28 +192,7 @@ fn parse_rar3_old_style_rev_name(path: &Path) -> Option<(usize, usize, usize)> {
 }
 
 pub(crate) fn infer_part_index(path: &Path, data_count: u16) -> Option<usize> {
-    let name = path.file_name()?.to_string_lossy();
-    let index = if let Some(part_pos) = name.find(".part") {
-        let suffix = &name[part_pos + ".part".len()..];
-        if suffix.len() <= 4 || !suffix[suffix.len() - 4..].eq_ignore_ascii_case(".rar") {
-            return None;
-        }
-        let digits = &suffix[..suffix.len() - 4];
-        if digits.is_empty() || !digits.chars().all(|ch| ch.is_ascii_digit()) {
-            return None;
-        }
-        digits.parse::<usize>().ok()?.checked_sub(1)?
-    } else {
-        let ext = path.extension()?.to_str()?;
-        if ext.eq_ignore_ascii_case("rar") {
-            0
-        } else if ext.len() == 3 && ext.starts_with(['r', 'R']) {
-            let number = ext[1..].parse::<usize>().ok()?;
-            number + 1
-        } else {
-            return None;
-        }
-    };
+    let index = volume_sort_key(path)?;
     (index < usize::from(data_count)).then_some(index)
 }
 
@@ -212,23 +200,43 @@ pub(crate) fn infer_part_index(path: &Path, data_count: u16) -> Option<usize> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn native_volume_names_remain_distinct() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let dir = crate::scratch::case("native-volume-names");
+        let first = dir.join(OsStr::from_bytes(b"set-\xff.part01.rar"));
+        let second = dir.join(OsStr::from_bytes(b"set-\xff.part02.rar"));
+        let other = dir.join(OsStr::from_bytes(b"set-\xfe.part01.rar"));
+        for path in [&first, &second, &other] {
+            fs::write(path, []).unwrap();
+        }
+        assert_eq!(
+            discover_sibling_volumes(&first),
+            vec![first.clone(), second.clone()]
+        );
+        assert_eq!(rar50_volume_part_path(&first, 1, 2).unwrap(), second);
+        assert_eq!(discover_sibling_volumes(&other), vec![other]);
+    }
+
     #[test]
     fn volume_name_key_preserves_base_case() {
         assert_eq!(
             volume_name_key(Path::new("setup.rar")).as_deref(),
-            Some("old:setup")
+            Some(b"old:setup".as_slice())
         );
         assert_eq!(
             volume_name_key(Path::new("Setup.rar")).as_deref(),
-            Some("old:Setup")
+            Some(b"old:Setup".as_slice())
         );
         assert_eq!(
             volume_name_key(Path::new("setup.R00")).as_deref(),
-            Some("old:setup")
+            Some(b"old:setup".as_slice())
         );
         assert_eq!(
             volume_name_key(Path::new("setup.part1.rar")).as_deref(),
-            Some("part:setup")
+            Some(b"part:setup".as_slice())
         );
     }
 
@@ -240,9 +248,9 @@ mod tests {
         fs::write(&lower, []).unwrap();
         fs::write(&upper, []).unwrap();
 
-        let discovered = discover_sibling_volumes(&lower.to_string_lossy());
+        let discovered = discover_sibling_volumes(&lower);
 
-        assert_eq!(discovered, vec![lower.to_string_lossy().into_owned()]);
+        assert_eq!(discovered, vec![lower]);
     }
 
     #[test]
@@ -253,8 +261,8 @@ mod tests {
         fs::write(&plain, []).unwrap();
         fs::write(&part, []).unwrap();
 
-        let discovered = discover_sibling_volumes(&plain.to_string_lossy());
+        let discovered = discover_sibling_volumes(&plain);
 
-        assert_eq!(discovered, vec![plain.to_string_lossy().into_owned()]);
+        assert_eq!(discovered, vec![plain]);
     }
 }
