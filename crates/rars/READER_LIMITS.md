@@ -1,14 +1,14 @@
-# Total logical output quota: proposed design
+# Total logical output quota
 
-Status: design only, checked against `73e30f5`. The total quota is not implemented.
-Declared RAR5 dictionary admission and the all-family per-member output ceiling
-are already implemented. This is the next increment for #42, not completion of
-the whole reader-resource issue.
+Status: implemented alongside declared RAR5 dictionary admission and the all-family
+per-member output ceiling. This documents the contract and its regression coverage.
+Parallel reservation scheduling remains future work. These features are partial
+progress on #42, not completion of the whole reader-resource issue.
 
 ## Public contract
 
-Add `ArchiveReadOptions::max_total_output_bytes: Option<u64>` and
-`with_max_total_output_bytes(u64)`. The inclusive ceiling covers logical member
+`ArchiveReadOptions::max_total_output_bytes: Option<u64>` and
+`with_max_total_output_bytes(u64)` configure an inclusive ceiling on logical member
 output across **one extraction invocation**, including the entire volume set
 passed to that invocation. Reusing options for another extraction starts a fresh
 counter. A caller extracting nested archives in separate calls must manage its
@@ -162,9 +162,9 @@ core/error-adapter matches, including legacy encrypted error preservation. WASM
 details carry `limitBytes`, `requiredBytes` and `usedBytes` as decimal strings,
 following existing byte-count transport. This does not expose a new binding knob.
 
-## Acceptance tests for the implementation commit
+## Regression coverage and validation
 
-Reuse [the member-limit tests](tests/reader_output_limit.rs) and real archive
+Use [the output-limit tests](tests/reader_output_limit.rs) and real archive
 builders/fixtures; keep accounting arithmetic and short-write cases as small
 guard unit tests. Cover:
 
@@ -198,4 +198,4 @@ Run focused core/integration tests, workspace formatting and strict Clippy, and
 bare-WASM compilation. Broaden regression checks when results warrant it. Reader
 cancellation tests belong to its later implementation, not an acceptance gate for
 a capability that does not yet exist. No compression-format or writer change is
-part of this proposal.
+part of this implementation.

@@ -284,6 +284,7 @@ where
     }
 
     let password = options.password;
+    let mut budget = crate::output_limit::OutputBudget::new(options);
     let mut split = SplitVolumeState::new();
     let mut session = DecoderSession::new_with_password(
         volumes
@@ -299,28 +300,19 @@ where
                     if meta.is_directory {
                         let _ = open(&meta)?;
                     } else {
-                        crate::output_limit::check(
-                            options.max_member_output_bytes,
-                            file.unp_size,
-                            &file.name,
-                        )?;
+                        budget.check(file.unp_size, &file.name)?;
                         let mut writer = open(&meta)?;
-                        crate::output_limit::run(
-                            options.max_member_output_bytes,
-                            &file.name,
-                            &mut writer,
-                            |mut writer| {
-                                if file.is_stored() {
-                                    file.write_stored_to(archive, password, &mut writer)
-                                        .map_err(|error| file.entry_error("extracting", error))?;
-                                } else {
-                                    session
-                                        .write_file_to(archive, file, &mut writer)
-                                        .map_err(|error| file.entry_error("extracting", error))?;
-                                }
-                                Ok(())
-                            },
-                        )?;
+                        budget.run(&file.name, &mut writer, |mut writer| {
+                            if file.is_stored() {
+                                file.write_stored_to(archive, password, &mut writer)
+                                    .map_err(|error| file.entry_error("extracting", error))?;
+                            } else {
+                                session
+                                    .write_file_to(archive, file, &mut writer)
+                                    .map_err(|error| file.entry_error("extracting", error))?;
+                            }
+                            Ok(())
+                        })?;
                     }
                 }
                 SplitVolumeStep::Start => {
@@ -339,7 +331,7 @@ where
                         file,
                         password,
                         &mut session,
-                        options.max_member_output_bytes,
+                        &mut budget,
                         &mut open,
                     )?;
                 }
@@ -445,13 +437,13 @@ impl PendingSplitRefs {
         final_file: &FileHeader,
         password: Option<&[u8]>,
         session: &mut DecoderSession,
-        output_limit: Option<u64>,
+        budget: &mut crate::output_limit::OutputBudget,
         open: &mut F,
     ) -> Result<()>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
-        crate::output_limit::check(output_limit, final_file.unp_size, &final_file.name)?;
+        budget.check(final_file.unp_size, &final_file.name)?;
         let meta = ExtractedEntryMeta {
             name: self.name.clone(),
             file_time: self.file_time,
@@ -461,7 +453,7 @@ impl PendingSplitRefs {
             is_directory: false,
         };
         let mut writer = open(&meta)?;
-        crate::output_limit::run(output_limit, &final_file.name, &mut writer, |mut writer| {
+        budget.run(&final_file.name, &mut writer, |mut writer| {
             let mut reader = self.fragment_reader(volumes, password)?;
 
             if final_file.is_stored() {

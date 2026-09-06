@@ -496,6 +496,7 @@ impl Archive {
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
         let password = options.password;
+        let mut budget = crate::output_limit::OutputBudget::new(options);
         let mut unpack15 = Unpack15::new();
         let mut extracted_count = 0usize;
         for entry in &self.entries {
@@ -510,35 +511,26 @@ impl Archive {
                 extracted_count += 1;
                 continue;
             }
-            crate::output_limit::check(
-                options.max_member_output_bytes,
-                u64::from(entry.header.unp_size),
-                &meta.name,
-            )?;
+            budget.check(u64::from(entry.header.unp_size), &meta.name)?;
             let mut writer = open(&meta)?;
-            crate::output_limit::run(
-                options.max_member_output_bytes,
-                &meta.name,
-                &mut writer,
-                |mut writer| {
-                    if entry.is_stored() && !entry.is_encrypted() {
-                        entry
-                            .write_stored_to(self, password, &mut writer)
-                            .map_err(|error| entry.entry_error("extracting", error))?;
-                    } else {
-                        entry
-                            .write_compressed_to(
-                                self,
-                                password,
-                                &mut unpack15,
-                                self.main.is_solid() && extracted_count != 0,
-                                &mut writer,
-                            )
-                            .map_err(|error| entry.entry_error("extracting", error))?;
-                    }
-                    Ok(())
-                },
-            )?;
+            budget.run(&meta.name, &mut writer, |mut writer| {
+                if entry.is_stored() && !entry.is_encrypted() {
+                    entry
+                        .write_stored_to(self, password, &mut writer)
+                        .map_err(|error| entry.entry_error("extracting", error))?;
+                } else {
+                    entry
+                        .write_compressed_to(
+                            self,
+                            password,
+                            &mut unpack15,
+                            self.main.is_solid() && extracted_count != 0,
+                            &mut writer,
+                        )
+                        .map_err(|error| entry.entry_error("extracting", error))?;
+                }
+                Ok(())
+            })?;
             extracted_count += 1;
         }
         Ok(())
@@ -861,6 +853,7 @@ where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
 {
     let password = options.password;
+    let mut budget = crate::output_limit::OutputBudget::new(options);
     let mut pending: Option<PendingSplitRefs> = None;
     let mut unpack15 = Unpack15::new();
     let mut extracted_count = 0usize;
@@ -879,29 +872,20 @@ where
                     extracted_count += 1;
                     continue;
                 }
-                crate::output_limit::check(
-                    options.max_member_output_bytes,
-                    u64::from(entry.header.unp_size),
-                    &meta.name,
-                )?;
+                budget.check(u64::from(entry.header.unp_size), &meta.name)?;
                 let mut writer = open(&meta)?;
-                crate::output_limit::run(
-                    options.max_member_output_bytes,
-                    &meta.name,
-                    &mut writer,
-                    |mut writer| {
-                        entry
-                            .write_compressed_to(
-                                archive,
-                                password,
-                                &mut unpack15,
-                                archive.main.is_solid() && extracted_count != 0,
-                                &mut writer,
-                            )
-                            .map_err(|error| entry.entry_error("extracting", error))?;
-                        Ok(())
-                    },
-                )?;
+                budget.run(&meta.name, &mut writer, |mut writer| {
+                    entry
+                        .write_compressed_to(
+                            archive,
+                            password,
+                            &mut unpack15,
+                            archive.main.is_solid() && extracted_count != 0,
+                            &mut writer,
+                        )
+                        .map_err(|error| entry.entry_error("extracting", error))?;
+                    Ok(())
+                })?;
                 extracted_count += 1;
                 continue;
             }
@@ -922,7 +906,15 @@ where
                     let completed = pending.take().expect("pending split");
                     let solid = archive.main.is_solid() && extracted_count != 0;
                     completed
-                        .write_to(volumes, entry, options, &mut unpack15, solid, &mut open)
+                        .write_to(
+                            volumes,
+                            entry,
+                            options,
+                            &mut budget,
+                            &mut unpack15,
+                            solid,
+                            &mut open,
+                        )
                         .map_err(|error| entry.entry_error("extracting", error))?;
                     extracted_count += 1;
                 }
@@ -1025,11 +1017,14 @@ impl PendingSplitRefs {
         Ok(())
     }
 
+    // Split decoding needs format state, policy accounting and the output callback.
+    #[allow(clippy::too_many_arguments)]
     fn write_to<F>(
         self,
         volumes: &[Archive],
         final_entry: &Entry,
         options: crate::ArchiveReadOptions<'_>,
+        budget: &mut crate::output_limit::OutputBudget,
         unpack15: &mut Unpack15,
         solid: bool,
         open: &mut F,
@@ -1038,12 +1033,7 @@ impl PendingSplitRefs {
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
         let password = options.password;
-        let output_limit = options.max_member_output_bytes;
-        crate::output_limit::check(
-            output_limit,
-            u64::from(final_entry.header.unp_size),
-            &self.name,
-        )?;
+        budget.check(u64::from(final_entry.header.unp_size), &self.name)?;
         let mut reader = self.fragment_reader(volumes, password)?;
         let meta = ExtractedEntryMeta {
             name: self.name,
@@ -1052,7 +1042,7 @@ impl PendingSplitRefs {
             is_directory: false,
         };
         let mut writer = open(&meta)?;
-        crate::output_limit::run(output_limit, &meta.name, &mut writer, |mut writer| {
+        budget.run(&meta.name, &mut writer, |mut writer| {
             let mut checksum = Rar13Checksum::new();
             let mut checksum_writer = Rar13ChecksumWriter {
                 inner: &mut writer,

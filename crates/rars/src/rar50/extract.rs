@@ -15,8 +15,8 @@ const BUFFERED_DECODE_LIMIT: u64 = 512 * 1024 * 1024;
 const BUFFERED_DECODE_LIMIT: u64 = 1024;
 
 impl FileHeader {
-    fn check_output_limit(&self, limit: Option<u64>) -> Result<()> {
-        if limit.is_none() || self.is_directory() || self.redirection.is_some() {
+    fn check_output_limit(&self, budget: &crate::output_limit::OutputBudget) -> Result<()> {
+        if !budget.is_limited() || self.is_directory() || self.redirection.is_some() {
             return Ok(());
         }
         let size = self.known_unpacked_size().ok_or_else(|| {
@@ -28,7 +28,7 @@ impl FileHeader {
                 },
             )
         })?;
-        crate::output_limit::check(limit, size, &self.name)
+        budget.check(size, &self.name)
     }
 
     fn check_dictionary_limit(&self, limit: Option<u64>) -> Result<()> {
@@ -529,6 +529,7 @@ impl Archive {
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
         R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
     {
+        let mut budget = crate::output_limit::OutputBudget::new(options);
         let buffered_decode_limit = rar50_buffered_decode_limit(options);
         let mut session =
             DecoderSession::new_with_password(options.password, buffered_decode_limit);
@@ -545,16 +546,13 @@ impl Archive {
                     "RAR 5 split entry requires multivolume extraction",
                 ));
             }
-            file.check_output_limit(options.max_member_output_bytes)?;
+            file.check_output_limit(&budget)?;
             let meta = file.metadata();
             let mut writer = open(&meta)?;
             if !meta.is_directory {
-                crate::output_limit::run(
-                    options.max_member_output_bytes,
-                    &file.name,
-                    &mut writer,
-                    |writer| session.write_file_to(self, file, writer),
-                )?;
+                budget.run(&file.name, &mut writer, |writer| {
+                    session.write_file_to(self, file, writer)
+                })?;
             }
         }
         Ok(())
@@ -563,6 +561,7 @@ impl Archive {
     /// Decodes independent members in bounded batches, emitting in archive order.
     /// Completed batches can have been emitted when a later batch fails. The
     /// buffering limit bounds retained payload bytes, not aggregate decoder state.
+    /// A configured total output ceiling selects sequential extraction.
     pub fn extract_to_parallel_buffered<F>(
         &self,
         options: crate::ArchiveReadOptions<'_>,
@@ -571,7 +570,9 @@ impl Archive {
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
-        if self.main.is_solid()
+        // Admit and charge total-limited work in archive order before dispatch.
+        if options.max_total_output_bytes.is_some()
+            || self.main.is_solid()
             || self.files().any(|file| {
                 file.is_split_before()
                     || file.is_split_after()
@@ -600,7 +601,7 @@ impl Archive {
             }
             let entries = crate::parallel::map_collect(batch, |file| {
                 file.check_dictionary_limit(options.rar50_dictionary_size_limit)?;
-                file.check_output_limit(options.max_member_output_bytes)?;
+                file.check_output_limit(&crate::output_limit::OutputBudget::new(options))?;
                 decode_parallel_entry(
                     self,
                     file,
@@ -875,6 +876,7 @@ where
     }
 
     let password = options.password;
+    let mut budget = crate::output_limit::OutputBudget::new(options);
     let mut split = SplitVolumeState::new();
     let buffered_decode_limit = rar50_buffered_decode_limit(options);
     let mut session = DecoderSession::new_with_password(password, buffered_decode_limit);
@@ -892,16 +894,13 @@ where
                         }
                         continue;
                     }
-                    file.check_output_limit(options.max_member_output_bytes)?;
+                    file.check_output_limit(&budget)?;
                     let meta = file.metadata();
                     let mut writer = open(&meta)?;
                     if !meta.is_directory {
-                        crate::output_limit::run(
-                            options.max_member_output_bytes,
-                            &file.name,
-                            &mut writer,
-                            |writer| session.write_file_to(archive, file, writer),
-                        )?;
+                        budget.run(&file.name, &mut writer, |writer| {
+                            session.write_file_to(archive, file, writer)
+                        })?;
                     }
                 }
                 SplitVolumeStep::Start => {
@@ -915,14 +914,8 @@ where
                 SplitVolumeStep::Finish(mut completed) => {
                     validate_split_continuation_refs(&completed, file, password)?;
                     completed.append(volume_index, file_index);
-                    file.check_output_limit(options.max_member_output_bytes)?;
-                    completed.write_to(
-                        volumes,
-                        file,
-                        &mut session,
-                        options.max_member_output_bytes,
-                        &mut *open,
-                    )?;
+                    file.check_output_limit(&budget)?;
+                    completed.write_to(volumes, file, &mut session, &mut budget, &mut *open)?;
                 }
                 SplitVolumeStep::MissingFirst => {
                     return Err(Error::InvalidHeader(
@@ -1013,7 +1006,7 @@ impl PendingSplitRefs {
         volumes: &[Archive],
         final_file: &FileHeader,
         session: &mut DecoderSession<'_>,
-        output_limit: Option<u64>,
+        budget: &mut crate::output_limit::OutputBudget,
         open: &mut F,
     ) -> Result<()>
     where
@@ -1029,7 +1022,7 @@ impl PendingSplitRefs {
             is_directory: false,
         };
         let mut writer = open(&meta)?;
-        crate::output_limit::run(output_limit, &final_file.name, &mut writer, |mut writer| {
+        budget.run(&final_file.name, &mut writer, |mut writer| {
             // Decode/integrity failures can gain fragment context. I/O failures
             // (including the output guard sentinel) must retain their meaning.
             if final_file.is_stored() {
@@ -2214,6 +2207,43 @@ mod tests {
             .unwrap();
 
         assert_eq!(seen, vec![(b"link".to_vec(), b"target".to_vec())]);
+    }
+
+    #[test]
+    fn zero_total_allows_redirection_callbacks_in_regular_and_volume_extraction() {
+        let mut redirect = plain_file(b"link", b"", None);
+        // A metadata-only redirection's size placeholder must not consume quota
+        // or trigger the unknown logical file-size policy.
+        redirect.unpacked_size = u64::MAX;
+        redirect.file_flags |= 0x8;
+        redirect.redirection = Some(super::super::FileRedirection {
+            redirection_type: 1,
+            flags: 0,
+            target_name: b"target".to_vec(),
+        });
+        let archive = archive_with_blocks(vec![Block::File(redirect)], Vec::new());
+        let options = crate::ArchiveReadOptions::new().with_max_total_output_bytes(0);
+        for volumes in [false, true] {
+            let mut seen = 0;
+            let mut redirect = |_: &ExtractedEntryMeta, _: &FileRedirection| {
+                seen += 1;
+                Ok(())
+            };
+            if volumes {
+                extract_volumes_to_with_redirections(
+                    std::slice::from_ref(&archive),
+                    options,
+                    never_open,
+                    &mut redirect,
+                )
+                .unwrap();
+            } else {
+                archive
+                    .extract_to_with_redirections(options, never_open, &mut redirect)
+                    .unwrap();
+            }
+            assert_eq!(seen, 1);
+        }
     }
 
     #[test]

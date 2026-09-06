@@ -713,6 +713,7 @@ impl FileHeader {
             | Error::UnsupportedFeature { .. }
             | Error::UnsupportedWriterOption { .. }
             | Error::MemberOutputLimitExceeded { .. }
+            | Error::TotalOutputLimitExceeded { .. }
             | Error::Rar50DictionaryLimitExceeded { .. }
             | Error::Rar50BufferedDecodeLimitExceeded { .. }
             | Error::MemoryLimitExceeded { .. }
@@ -1349,6 +1350,7 @@ impl Archive {
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
         let password = options.password;
+        let mut budget = crate::output_limit::OutputBudget::new(options);
         let mut session = DecoderSession::new_with_password(self.main.is_solid(), password);
         for file in self.files() {
             if file.is_split_before() || file.is_split_after() {
@@ -1361,28 +1363,24 @@ impl Archive {
                 let _ = open(&meta)?;
                 continue;
             }
-            crate::output_limit::check(options.max_member_output_bytes, file.unp_size, &file.name)?;
+            budget.check(file.unp_size, &file.name)?;
             let mut writer = open(&meta)?;
-            crate::output_limit::run(
-                options.max_member_output_bytes,
-                &file.name,
-                &mut writer,
-                |mut writer| {
-                    if file.is_stored() {
-                        file.write_stored_to(self, password, &mut writer)
-                            .map_err(|error| file.entry_error("extracting", error))?;
-                    } else {
-                        session
-                            .write_file_to(self, file, &mut writer)
-                            .map_err(|error| file.entry_error("extracting", error))?;
-                    }
-                    Ok(())
-                },
-            )?;
+            budget.run(&file.name, &mut writer, |mut writer| {
+                if file.is_stored() {
+                    file.write_stored_to(self, password, &mut writer)
+                        .map_err(|error| file.entry_error("extracting", error))?;
+                } else {
+                    session
+                        .write_file_to(self, file, &mut writer)
+                        .map_err(|error| file.entry_error("extracting", error))?;
+                }
+                Ok(())
+            })?;
         }
         Ok(())
     }
 
+    /// A configured total output ceiling selects sequential extraction.
     pub fn extract_to_parallel_buffered<F>(
         &self,
         options: crate::ArchiveReadOptions<'_>,
@@ -1391,7 +1389,9 @@ impl Archive {
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
-        if self.main.is_solid()
+        // Total accounting belongs to the operation, before any worker dispatch.
+        if options.max_total_output_bytes.is_some()
+            || self.main.is_solid()
             || self
                 .files()
                 .any(|file| file.is_solid() || file.is_split_before() || file.is_split_after())

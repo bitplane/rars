@@ -112,6 +112,14 @@ pub enum Error {
         limit: u64,
         required: u64,
     },
+    /// Total logical output refusal. `used` is accepted output before refusal;
+    /// `required` is used plus the declared size or offered chunk, saturated at
+    /// u64::MAX (a lower bound if the attempted sum cannot be represented).
+    TotalOutputLimitExceeded {
+        limit: u64,
+        required: u64,
+        used: u64,
+    },
     Rar50DictionaryLimitExceeded {
         limit: u64,
         required: u64,
@@ -204,6 +212,8 @@ impl std::fmt::Display for Error {
             },
             Self::MemberOutputLimitExceeded { limit, required } => write!(f,
                 "member requires {required} output bytes, above the configured limit of {limit} bytes"),
+            Self::TotalOutputLimitExceeded { limit, required, used } => write!(f,
+                "extraction requires at least {required} total output bytes, above the configured limit of {limit} bytes ({used} bytes already accepted)"),
             Self::Rar50DictionaryLimitExceeded { limit, required } => write!(
                 f,
                 "RAR 5 member declares a {required}-byte dictionary, above the configured limit of {limit} bytes"
@@ -357,6 +367,7 @@ impl Error {
             Self::Io(_) | Self::Rar5Recovery(crate::recovery::rar5::Error::Io(_)) => ErrorKind::Io,
             Self::MemoryLimitExceeded { .. }
             | Self::MemberOutputLimitExceeded { .. }
+            | Self::TotalOutputLimitExceeded { .. }
             | Self::Rar50DictionaryLimitExceeded { .. }
             | Self::Rar50BufferedDecodeLimitExceeded { .. }
             | Self::Rar5Recovery(crate::recovery::rar5::Error::RebuildTooLarge) => {
@@ -473,6 +484,14 @@ mod tests {
                     limit: 1,
                     required: 2,
                     dictionary_size: 1,
+                },
+                ErrorKind::ResourceLimit,
+            ),
+            (
+                Error::TotalOutputLimitExceeded {
+                    limit: 100,
+                    required: 110,
+                    used: 60,
                 },
                 ErrorKind::ResourceLimit,
             ),

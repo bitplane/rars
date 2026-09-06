@@ -35,6 +35,30 @@ fn binding_error(code: &str, message: &str) -> JsValue {
     error
 }
 
+// Keep the wire names and exact byte counts testable without a JavaScript host.
+fn total_output_error_details(limit: u64, required: u64, used: u64) -> [(&'static str, String); 3] {
+    [
+        ("limitBytes", limit.to_string()),
+        ("requiredBytes", required.to_string()),
+        ("usedBytes", used.to_string()),
+    ]
+}
+
+#[cfg(test)]
+mod error_detail_tests {
+    #[test]
+    fn total_output_details_preserve_counts_above_javascript_integer_precision() {
+        assert_eq!(
+            super::total_output_error_details(u64::MAX - 1, u64::MAX, 9_007_199_254_740_993),
+            [
+                ("limitBytes", "18446744073709551614".to_owned()),
+                ("requiredBytes", "18446744073709551615".to_owned()),
+                ("usedBytes", "9007199254740993".to_owned()),
+            ]
+        );
+    }
+}
+
 fn js_error(error: rars_rs::Error) -> JsValue {
     let record = binding_error(error.kind().code(), &error.to_string());
     let details = js_sys::Object::new();
@@ -89,6 +113,15 @@ fn js_error(error: rars_rs::Error) -> JsValue {
                 "dictionaryBytes",
                 &dictionary_size.to_string().into(),
             );
+        }
+        rars_rs::Error::TotalOutputLimitExceeded {
+            limit,
+            required,
+            used,
+        } => {
+            for (name, value) in total_output_error_details(*limit, *required, *used) {
+                set_error_field(&details, name, &value.into());
+            }
         }
         rars_rs::Error::MemberOutputLimitExceeded { limit, required }
         | rars_rs::Error::Rar50DictionaryLimitExceeded { limit, required }

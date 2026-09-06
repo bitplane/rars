@@ -96,6 +96,19 @@ pub struct ArchiveReadOptions<'a> {
     /// not counted twice. Direct codecs, password-only default wrappers and
     /// comment/recovery helpers are outside this explicit policy.
     pub max_member_output_bytes: Option<u64>,
+    /// Inclusive total logical output ceiling for one extraction call, across
+    /// all members and volumes. Counts bytes accepted by output writers, including
+    /// discarded solid contents; retries and history copies do not count twice.
+    /// None preserves defaults; zero permits empty output. Known sizes are
+    /// admitted before opening output; unknown-size logical members are refused.
+    /// Errors can leave earlier output and a failing member's prefix.
+    ///
+    /// Configuring this option makes parallel entry points extract sequentially
+    /// for deterministic admission and accounting. This can reduce throughput.
+    /// It is not a CPU/RAM budget: buffered decoding can precede the output guard.
+    /// Parsing does not retain policy; password-only wrappers, direct codecs and
+    /// comment/recovery helpers keep defaults. Each extraction starts a new budget.
+    pub max_total_output_bytes: Option<u64>,
 }
 
 impl<'a> ArchiveReadOptions<'a> {
@@ -123,6 +136,12 @@ impl<'a> ArchiveReadOptions<'a> {
     /// Sets the logical member output ceiling.
     pub fn with_max_member_output_bytes(mut self, limit: u64) -> Self {
         self.max_member_output_bytes = Some(limit);
+        self
+    }
+
+    /// Sets the total logical output ceiling and selects sequential extraction.
+    pub fn with_max_total_output_bytes(mut self, limit: u64) -> Self {
+        self.max_total_output_bytes = Some(limit);
         self
     }
 
@@ -506,6 +525,7 @@ impl Archive {
     }
 
     /// Extracts independent non-solid members in parallel with read options.
+    /// A configured total output ceiling selects sequential extraction.
     pub fn extract_to_parallel_buffered_with_options<F>(
         &self,
         options: ArchiveReadOptions<'_>,
