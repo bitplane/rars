@@ -90,7 +90,8 @@ fn js_error(error: rars_rs::Error) -> JsValue {
                 &dictionary_size.to_string().into(),
             );
         }
-        rars_rs::Error::Rar50DictionaryLimitExceeded { limit, required }
+        rars_rs::Error::MemberOutputLimitExceeded { limit, required }
+        | rars_rs::Error::Rar50DictionaryLimitExceeded { limit, required }
         | rars_rs::Error::Rar50BufferedDecodeLimitExceeded { limit, required } => {
             set_error_field(&details, "limitBytes", &limit.to_string().into());
             set_error_field(&details, "requiredBytes", &required.to_string().into());

@@ -26,6 +26,7 @@ pub mod features;
 pub mod filter;
 mod filter_search;
 mod io_util;
+mod output_limit;
 mod parallel;
 pub mod rar13;
 pub mod rar15_40;
@@ -86,6 +87,12 @@ pub struct ArchiveReadOptions<'a> {
     /// codec calls are outside its scope. Earlier members may already be emitted
     /// when a later member exceeds the limit; its output callback is not opened.
     pub rar50_dictionary_size_limit: Option<u64>,
+    /// Inclusive RAR5/7 logical member output ceiling, independent of RAM usage.
+    /// None preserves defaults; zero permits empty output. Apply to extraction,
+    /// not parsing. Known oversized members and unsupported unknown-size members
+    /// are refused before opening output. Runtime failures can leave partial output.
+    /// Direct codecs and comment/recovery helpers are outside this policy.
+    pub rar50_max_member_output_bytes: Option<u64>,
 }
 
 impl<'a> ArchiveReadOptions<'a> {
@@ -108,6 +115,12 @@ impl<'a> ArchiveReadOptions<'a> {
             password,
             ..Self::default()
         }
+    }
+
+    /// Sets the RAR5/7 logical member output ceiling.
+    pub fn with_rar50_max_member_output_bytes(mut self, limit: u64) -> Self {
+        self.rar50_max_member_output_bytes = Some(limit);
+        self
     }
 
     /// Sets the RAR5/7 declared dictionary-size ceiling for member extraction.

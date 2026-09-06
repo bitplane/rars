@@ -107,6 +107,11 @@ pub enum Error {
         /// archive", "levels run from 0 to 5". Rendered after the format.
         because: Option<&'static str>,
     },
+    /// `required` is the declared size or the minimum attempted output size.
+    MemberOutputLimitExceeded {
+        limit: u64,
+        required: u64,
+    },
     Rar50DictionaryLimitExceeded {
         limit: u64,
         required: u64,
@@ -197,6 +202,8 @@ impl std::fmt::Display for Error {
                 }
                 None => write!(f, "{} is not supported by {target}", option.name()),
             },
+            Self::MemberOutputLimitExceeded { limit, required } => write!(f,
+                "member requires {required} output bytes, above the configured limit of {limit} bytes"),
             Self::Rar50DictionaryLimitExceeded { limit, required } => write!(
                 f,
                 "RAR 5 member declares a {required}-byte dictionary, above the configured limit of {limit} bytes"
@@ -349,6 +356,7 @@ impl Error {
             }
             Self::Io(_) | Self::Rar5Recovery(crate::recovery::rar5::Error::Io(_)) => ErrorKind::Io,
             Self::MemoryLimitExceeded { .. }
+            | Self::MemberOutputLimitExceeded { .. }
             | Self::Rar50DictionaryLimitExceeded { .. }
             | Self::Rar50BufferedDecodeLimitExceeded { .. }
             | Self::Rar5Recovery(crate::recovery::rar5::Error::RebuildTooLarge) => {

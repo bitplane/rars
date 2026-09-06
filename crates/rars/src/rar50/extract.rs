@@ -15,6 +15,22 @@ const BUFFERED_DECODE_LIMIT: u64 = 512 * 1024 * 1024;
 const BUFFERED_DECODE_LIMIT: u64 = 1024;
 
 impl FileHeader {
+    fn check_output_limit(&self, limit: Option<u64>) -> Result<()> {
+        if limit.is_none() || self.is_directory() || self.redirection.is_some() {
+            return Ok(());
+        }
+        let size = self.known_unpacked_size().ok_or_else(|| {
+            self.entry_error(
+                "limiting output",
+                Error::UnsupportedFeature {
+                    version: crate::ArchiveVersion::Rar50,
+                    feature: "output-limited extraction of an unknown-size member",
+                },
+            )
+        })?;
+        crate::output_limit::check(limit, size, &self.name)
+    }
+
     fn check_dictionary_limit(&self, limit: Option<u64>) -> Result<()> {
         let Some(limit) = limit else {
             return Ok(());
@@ -529,10 +545,16 @@ impl Archive {
                     "RAR 5 split entry requires multivolume extraction",
                 ));
             }
+            file.check_output_limit(options.rar50_max_member_output_bytes)?;
             let meta = file.metadata();
             let mut writer = open(&meta)?;
             if !meta.is_directory {
-                session.write_file_to(self, file, &mut writer)?;
+                crate::output_limit::run(
+                    options.rar50_max_member_output_bytes,
+                    &file.name,
+                    &mut writer,
+                    |writer| session.write_file_to(self, file, writer),
+                )?;
             }
         }
         Ok(())
@@ -578,7 +600,14 @@ impl Archive {
             }
             let entries = crate::parallel::map_collect(batch, |file| {
                 file.check_dictionary_limit(options.rar50_dictionary_size_limit)?;
-                decode_parallel_entry(self, file, password, buffered_decode_limit)
+                file.check_output_limit(options.rar50_max_member_output_bytes)?;
+                decode_parallel_entry(
+                    self,
+                    file,
+                    password,
+                    buffered_decode_limit,
+                    options.rar50_max_member_output_bytes,
+                )
             })?;
             for entry in entries {
                 write_parallel_entry(entry, &mut open, &mut |_, _| Ok(()))?;
@@ -605,6 +634,7 @@ fn decode_parallel_entry(
     file: &FileHeader,
     password: Option<&[u8]>,
     buffered_decode_limit: u64,
+    output_limit: Option<u64>,
 ) -> Result<ParallelExtractedEntry> {
     if let Some(redirection) = &file.redirection {
         return Ok(ParallelExtractedEntry::Redirection {
@@ -623,7 +653,9 @@ fn decode_parallel_entry(
     }
     let mut data = Vec::new();
     let mut session = DecoderSession::new_with_password(password, buffered_decode_limit);
-    session.write_file_to(archive, file, &mut data)?;
+    crate::output_limit::run(output_limit, &file.name, &mut data, |writer| {
+        session.write_file_to(archive, file, writer)
+    })?;
     Ok(ParallelExtractedEntry::File { meta, data })
 }
 
@@ -860,10 +892,16 @@ where
                         }
                         continue;
                     }
+                    file.check_output_limit(options.rar50_max_member_output_bytes)?;
                     let meta = file.metadata();
                     let mut writer = open(&meta)?;
                     if !meta.is_directory {
-                        session.write_file_to(archive, file, &mut writer)?;
+                        crate::output_limit::run(
+                            options.rar50_max_member_output_bytes,
+                            &file.name,
+                            &mut writer,
+                            |writer| session.write_file_to(archive, file, writer),
+                        )?;
                     }
                 }
                 SplitVolumeStep::Start => {
@@ -877,7 +915,14 @@ where
                 SplitVolumeStep::Finish(mut completed) => {
                     validate_split_continuation_refs(&completed, file, password)?;
                     completed.append(volume_index, file_index);
-                    completed.write_to(volumes, file, &mut session, &mut *open)?;
+                    file.check_output_limit(options.rar50_max_member_output_bytes)?;
+                    completed.write_to(
+                        volumes,
+                        file,
+                        &mut session,
+                        options.rar50_max_member_output_bytes,
+                        &mut *open,
+                    )?;
                 }
                 SplitVolumeStep::MissingFirst => {
                     return Err(Error::InvalidHeader(
@@ -968,6 +1013,7 @@ impl PendingSplitRefs {
         volumes: &[Archive],
         final_file: &FileHeader,
         session: &mut DecoderSession<'_>,
+        output_limit: Option<u64>,
         open: &mut F,
     ) -> Result<()>
     where
@@ -983,34 +1029,39 @@ impl PendingSplitRefs {
             is_directory: false,
         };
         let mut writer = open(&meta)?;
-        // Whatever goes wrong with a member split across volumes, the fragment
-        // checksums may know which volume to blame. Ask them before giving the
-        // caller an error that names no part of the set.
-        if final_file.is_stored() {
-            return self
-                .write_stored_to(volumes, final_file, decryptor.as_ref(), &mut writer)
+        crate::output_limit::run(output_limit, &final_file.name, &mut writer, |mut writer| {
+            // Whatever goes wrong with a member split across volumes, the fragment
+            // checksums may know which volume to blame. Ask them before giving the
+            // caller an error that names no part of the set.
+            if final_file.is_stored() {
+                return self
+                    .write_stored_to(volumes, final_file, decryptor.as_ref(), &mut writer)
+                    .map_err(|error| self.checksum_error(volumes).unwrap_or(error))
+                    .map_err(|error| final_file.entry_error("extracting", error));
+            }
+
+            if final_file.should_stream_decode(session.buffered_decode_limit) {
+                return session
+                    .stream_split_to(volumes, &self, final_file, decryptor.as_ref(), &mut writer)
+                    .map_err(|error| final_file.entry_error("decoding", error));
+            }
+
+            let data = session
+                .decode_split(volumes, &self, final_file, decryptor.as_ref())
+                .map_err(|error| final_file.entry_error("decoding", error))?;
+            final_file
+                .verify_integrity_with_keys(
+                    &data,
+                    decryptor.as_ref().map(|decryptor| &decryptor.keys),
+                )
                 .map_err(|error| self.checksum_error(volumes).unwrap_or(error))
-                .map_err(|error| final_file.entry_error("extracting", error));
-        }
-
-        if final_file.should_stream_decode(session.buffered_decode_limit) {
-            return session
-                .stream_split_to(volumes, &self, final_file, decryptor.as_ref(), &mut writer)
-                .map_err(|error| final_file.entry_error("decoding", error));
-        }
-
-        let data = session
-            .decode_split(volumes, &self, final_file, decryptor.as_ref())
-            .map_err(|error| final_file.entry_error("decoding", error))?;
-        final_file
-            .verify_integrity_with_keys(&data, decryptor.as_ref().map(|decryptor| &decryptor.keys))
-            .map_err(|error| self.checksum_error(volumes).unwrap_or(error))
-            .map_err(|error| final_file.entry_error("verifying", error))?;
-        writer
-            .write_all(&data)
-            .map_err(Error::from)
-            .map_err(|error| final_file.entry_error("writing", error))?;
-        Ok(())
+                .map_err(|error| final_file.entry_error("verifying", error))?;
+            writer
+                .write_all(&data)
+                .map_err(Error::from)
+                .map_err(|error| final_file.entry_error("writing", error))?;
+            Ok(())
+        })
     }
 
     fn write_stored_to(
