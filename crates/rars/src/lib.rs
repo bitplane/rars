@@ -587,6 +587,9 @@ impl Archive {
 
     /// Extracts independent non-solid members in parallel, buffering decoded
     /// file bytes before replaying writes in archive order.
+    /// Batches are published before decoding the next batch, so a later failure
+    /// can leave earlier output published. Legacy RAR 1.5–4.0 batches retain at
+    /// most one result per worker; this is not a byte or total-memory ceiling.
     ///
     /// Solid archives, split members, multivolume sets, and RAR 1.3/1.4
     /// archives use the regular streaming extractor.
@@ -598,6 +601,7 @@ impl Archive {
     }
 
     /// Extracts independent non-solid members in parallel with read options.
+    /// Uses the batch publication semantics of [`Self::extract_to_parallel_buffered`].
     /// A configured total output ceiling selects sequential extraction.
     pub fn extract_to_parallel_buffered_with_options<F>(
         &self,

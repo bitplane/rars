@@ -1421,6 +1421,10 @@ impl Archive {
         Ok(())
     }
 
+    /// Decodes independent members in batches of at most the worker count,
+    /// emitting each batch in archive order before decoding the next.
+    /// Completed batches can have been emitted when a later batch fails.
+    /// This bounds retained result count, not payload bytes or decoder memory.
     /// A configured total output ceiling selects sequential extraction.
     pub fn extract_to_parallel_buffered<F>(
         &self,
@@ -1441,12 +1445,18 @@ impl Archive {
             return self.extract_to(options, open);
         }
 
-        let files: Vec<_> = self.files().collect();
-        let entries =
-            crate::parallel::map_collect(files, |file| decode_parallel_entry(self, file, options))?;
+        let mut files = self.files().peekable();
+        let window = crate::parallel::default_window().max(1);
         let publication = crate::read_control::ReadControl::new(options.cancellation);
-        for entry in entries {
-            write_parallel_entry(entry, &mut open, &publication)?;
+        while files.peek().is_some() {
+            options.check_cancelled()?;
+            let batch = files.by_ref().take(window).collect();
+            let entries = crate::parallel::map_collect(batch, |file| {
+                decode_parallel_entry(self, file, options)
+            })?;
+            for entry in entries {
+                write_parallel_entry(entry, &mut open, &publication)?;
+            }
         }
         options.check_cancelled()?;
         Ok(())
