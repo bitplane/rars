@@ -298,7 +298,8 @@ pub struct CompressionInfo {
 #[non_exhaustive]
 pub struct ExtractedEntryMeta {
     pub name: Vec<u8>,
-    pub file_time: u32,
+    /// Unix modification time in seconds; absence is distinct from epoch.
+    pub file_time: Option<u32>,
     pub mtime_refinement: Option<crate::TimeRefinement>,
     pub attr: u64,
     pub host_os: u64,

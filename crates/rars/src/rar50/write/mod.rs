@@ -1351,6 +1351,7 @@ mod tests {
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
+    // Historical numeric snapshots; timestamp presence has dedicated regression tests.
     struct CollectedEntry {
         name: Vec<u8>,
         data: Vec<u8>,
@@ -1373,7 +1374,7 @@ mod tests {
             .map(|(meta, data)| CollectedEntry {
                 name: meta.name,
                 data: data.borrow().clone(),
-                file_time: meta.file_time,
+                file_time: meta.file_time.unwrap_or(0),
                 attr: meta.attr,
                 host_os: meta.host_os,
                 is_directory: meta.is_directory,

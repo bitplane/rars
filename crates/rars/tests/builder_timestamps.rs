@@ -71,7 +71,7 @@ fn split_volume_extraction_retains_fractional_mtime() {
     let mut opened = 0;
     rars::extract_volumes_to(&volumes, None, |meta| {
         opened += 1;
-        assert_eq!(meta.file_time, 123);
+        assert_eq!(meta.file_time, Some(123));
         assert_eq!(meta.mtime_refinement.unwrap().nanoseconds, 987_654_321);
         Ok(Box::new(std::io::sink()))
     })
@@ -86,11 +86,19 @@ fn an_epoch_fraction_is_not_treated_as_missing_time() {
         nanoseconds: 123,
     };
     assert_eq!(
-        rars::timestamp::extracted_system_time(rars::ArchiveFamily::Rar50Plus, 0, Some(detail)),
+        rars::timestamp::extracted_system_time(
+            rars::ArchiveFamily::Rar50Plus,
+            Some(0),
+            Some(detail)
+        ),
         Some(UNIX_EPOCH + Duration::from_nanos(123))
     );
     assert_eq!(
-        rars::timestamp::extracted_system_time(rars::ArchiveFamily::Rar50Plus, 0, None),
+        rars::timestamp::extracted_system_time(rars::ArchiveFamily::Rar50Plus, Some(0), None),
+        Some(UNIX_EPOCH)
+    );
+    assert_eq!(
+        rars::timestamp::extracted_system_time(rars::ArchiveFamily::Rar50Plus, None, Some(detail)),
         None
     );
 }
@@ -115,5 +123,52 @@ fn invalid_fractional_mtime_leaves_queued_metadata_unchanged() {
             assert!(builder.set_mtime_nanoseconds(b"file", 100).is_err());
         }
         assert_eq!(builder.to_bytes().unwrap(), before);
+    }
+}
+
+#[test]
+fn extraction_retains_missing_and_epoch_times_in_single_and_split_archives() {
+    for format in [ArchiveVersion::Rar50, ArchiveVersion::Rar70] {
+        for time in [None, Some(0)] {
+            let mut builder = Builder::new(format).store(true);
+            builder
+                .add_bytes(b"file".to_vec(), vec![42; 2048], time, None)
+                .unwrap();
+            let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+            let check = |meta: &rars::ExtractedEntryMeta| {
+                assert_eq!(meta.file_time, time);
+                assert_eq!(meta.mtime_refinement, None);
+                assert_eq!(
+                    rars::timestamp::extracted_system_time(
+                        rars::ArchiveFamily::Rar50Plus,
+                        meta.file_time,
+                        meta.mtime_refinement,
+                    ),
+                    time.map(|_| UNIX_EPOCH),
+                );
+            };
+            archive
+                .extract_to(None, |meta| {
+                    check(meta);
+                    Ok(Box::new(std::io::sink()))
+                })
+                .unwrap();
+            let volumes: Vec<_> = builder
+                .volume_size(Some(512))
+                .build_volumes(None)
+                .unwrap()
+                .into_iter()
+                .map(|bytes| ArchiveReader::read_owned(bytes).unwrap())
+                .collect();
+            assert!(volumes.len() > 1);
+            let mut opened = 0;
+            rars::extract_volumes_to(&volumes, None, |meta| {
+                opened += 1;
+                check(meta);
+                Ok(Box::new(std::io::sink()))
+            })
+            .unwrap();
+            assert_eq!(opened, 1);
+        }
     }
 }

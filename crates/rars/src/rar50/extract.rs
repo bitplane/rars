@@ -208,7 +208,7 @@ impl FileHeader {
     pub fn metadata(&self) -> ExtractedEntryMeta {
         ExtractedEntryMeta {
             name: self.name.clone(),
-            file_time: self.modification_time().unwrap_or(0),
+            file_time: self.modification_time(),
             mtime_refinement: self.modification_time_refinement(),
             attr: self.attributes,
             host_os: self.host_os,
@@ -921,7 +921,7 @@ fn validate_split_continuation_refs(
 struct PendingSplitRefs {
     name: Vec<u8>,
     fragments: Vec<(usize, usize)>,
-    file_time: u32,
+    file_time: Option<u32>,
     mtime_refinement: Option<crate::TimeRefinement>,
     attr: u64,
     host_os: u64,
@@ -934,7 +934,7 @@ impl PendingSplitRefs {
         Self {
             name: file.name.clone(),
             fragments: vec![(volume_index, file_index)],
-            file_time: file.modification_time().unwrap_or(0),
+            file_time: file.modification_time(),
             mtime_refinement: file.modification_time_refinement(),
             attr: file.attributes,
             host_os: file.host_os,

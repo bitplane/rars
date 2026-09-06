@@ -124,8 +124,9 @@ pub enum Archive {
 pub struct ExtractedEntryMeta {
     /// Raw entry name bytes as stored by the archive family.
     pub name: Vec<u8>,
-    /// DOS/FAT timestamp when the archive family exposes one.
-    pub file_time: u32,
+    /// Stored modification time: DOS/FAT for legacy RAR, Unix seconds for RAR5.
+    /// `None` means absent; `Some(0)` is a valid RAR5 Unix epoch timestamp.
+    pub file_time: Option<u32>,
     /// File attributes widened to a common integer type, exactly as stored.
     pub file_attr: u64,
     /// How to read `file_attr`, from the host OS the entry records.
@@ -138,10 +139,16 @@ pub struct ExtractedEntryMeta {
 
 impl ExtractedEntryMeta {
     /// Creates common metadata for extraction callbacks.
-    pub fn new(name: Vec<u8>, file_time: u32, file_attr: u64, is_directory: bool) -> Self {
+    /// Pass `None` for an absent timestamp; a numeric value means it is present.
+    pub fn new(
+        name: Vec<u8>,
+        file_time: impl Into<Option<u32>>,
+        file_attr: u64,
+        is_directory: bool,
+    ) -> Self {
         Self {
             name,
-            file_time,
+            file_time: file_time.into(),
             file_attr,
             attr_source: AttrSource::Unknown,
             mtime_refinement: None,
@@ -232,7 +239,7 @@ impl ArchiveMemberMeta {
             return std::time::UNIX_EPOCH
                 .checked_add(std::time::Duration::new(u64::from(raw), nanos));
         }
-        timestamp::extracted_system_time(self.family, raw, self.mtime_refinement)
+        timestamp::extracted_system_time(self.family, Some(raw), self.mtime_refinement)
     }
 
     /// How to interpret this member's attributes, using the archive family's
@@ -1006,7 +1013,7 @@ impl AttrSource {
 fn rar13_meta(meta: &rar13::ExtractedEntryMeta) -> ExtractedEntryMeta {
     ExtractedEntryMeta {
         name: meta.name.clone(),
-        file_time: meta.file_time,
+        file_time: Some(meta.file_time),
         file_attr: u64::from(meta.file_attr),
         // RAR 1.3/1.4 is MS-DOS only.
         attr_source: AttrSource::Dos,
@@ -1019,7 +1026,7 @@ fn rar13_meta(meta: &rar13::ExtractedEntryMeta) -> ExtractedEntryMeta {
 fn rar15_40_meta(meta: &rar15_40::ExtractedEntryMeta) -> ExtractedEntryMeta {
     ExtractedEntryMeta {
         name: meta.name.clone(),
-        file_time: meta.file_time,
+        file_time: Some(meta.file_time),
         file_attr: u64::from(meta.attr),
         attr_source: AttrSource::rar15_40(meta.host_os),
         mtime_refinement: meta.mtime_refinement,
@@ -1106,7 +1113,7 @@ mod tests {
             file.mtime = base;
             file.htime_mtime = extended;
             assert_eq!(rar50_member(&file).meta.file_time, expected);
-            assert_eq!(file.metadata().file_time, expected.unwrap_or(0));
+            assert_eq!(file.metadata().file_time, expected);
         }
     }
 
@@ -1115,6 +1122,7 @@ mod tests {
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
+    // Historical numeric snapshots; timestamp presence has dedicated regression tests.
     struct CollectedEntry {
         name: Vec<u8>,
         data: Vec<u8>,
@@ -1176,7 +1184,7 @@ mod tests {
     fn extracted_entry_meta_exposes_raw_and_lossy_names() {
         let meta = ExtractedEntryMeta {
             name: vec![0xff, b'.', b't', b'x', b't'],
-            file_time: 0,
+            file_time: None,
             file_attr: 0,
             attr_source: AttrSource::Unknown,
             mtime_refinement: None,
@@ -1211,7 +1219,7 @@ mod tests {
             .map(|(meta, data)| CollectedEntry {
                 name: meta.name,
                 data: data.borrow().clone(),
-                file_time: meta.file_time,
+                file_time: meta.file_time.unwrap_or(0),
                 file_attr: meta.file_attr,
                 is_directory: meta.is_directory,
             })
@@ -1277,7 +1285,7 @@ mod tests {
             .map(|(meta, data)| CollectedEntry {
                 name: meta.name,
                 data: data.borrow().clone(),
-                file_time: meta.file_time,
+                file_time: meta.file_time.unwrap_or(0),
                 file_attr: meta.attr,
                 is_directory: meta.is_directory,
             })
@@ -1301,7 +1309,7 @@ mod tests {
         Ok(CollectedEntry {
             name: meta.name,
             data,
-            file_time: meta.file_time,
+            file_time: meta.file_time.unwrap_or(0),
             file_attr: meta.attr,
             is_directory: meta.is_directory,
         })

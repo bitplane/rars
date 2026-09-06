@@ -41,6 +41,7 @@ struct CollectWriter {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+// Historical numeric snapshots; timestamp presence has dedicated regression tests.
 struct CollectedEntry {
     name: Vec<u8>,
     data: Vec<u8>,
@@ -129,7 +130,7 @@ fn collect_extract_with_password(
         .map(|(meta, data)| CollectedEntry {
             name: meta.name,
             data: data.borrow().clone(),
-            file_time: meta.file_time,
+            file_time: meta.file_time.unwrap_or(0),
             attr: meta.attr,
             host_os: meta.host_os,
             is_directory: meta.is_directory,
@@ -151,7 +152,7 @@ fn collect_file(archive: &Archive, file: &rar50::FileHeader) -> Result<Collected
     Ok(CollectedEntry {
         name: meta.name,
         data,
-        file_time: meta.file_time,
+        file_time: meta.file_time.unwrap_or(0),
         attr: meta.attr,
         host_os: meta.host_os,
         is_directory: meta.is_directory,
@@ -178,7 +179,7 @@ fn collect_extract_volumes_with_password(
         .map(|(meta, data)| CollectedEntry {
             name: meta.name,
             data: data.borrow().clone(),
-            file_time: meta.file_time,
+            file_time: meta.file_time.unwrap_or(0),
             attr: meta.attr,
             host_os: meta.host_os,
             is_directory: meta.is_directory,
@@ -4266,7 +4267,7 @@ fn rar50_reads_the_modification_time_from_the_htime_record() {
             if file.mtime.is_some() || file.htime_mtime.is_some() {
                 assert_ne!(
                     file.metadata().file_time,
-                    0,
+                    None,
                     "{} reports no time despite carrying one",
                     path.display()
                 );

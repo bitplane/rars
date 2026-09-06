@@ -5693,3 +5693,63 @@ fn no_filter_turns_off_the_rar29_search() {
         sizes[1]
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn extract_distinguishes_missing_mtime_from_epoch_for_files_and_directories() {
+    let dir = scratch("missing-and-epoch-mtime");
+    let archive = dir.join("times.rar");
+    let out = dir.join("out");
+    let mut builder = rars::Builder::new(rars::ArchiveVersion::Rar50).store(true);
+    for (name, time) in [("missing", None), ("epoch", Some(0))] {
+        builder
+            .add_directory(name.as_bytes().to_vec(), time, None)
+            .unwrap();
+        builder
+            .add_bytes(
+                format!("{name}/file").into_bytes(),
+                b"payload".to_vec(),
+                time,
+                None,
+            )
+            .unwrap();
+    }
+    builder.write_to_path(&archive, None).unwrap();
+    // Pre-existing destinations give missing timestamps a deterministic value:
+    // directory creation leaves it alone, and file writes set a current time.
+    let retained = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    fs::create_dir_all(out.join("missing")).unwrap();
+    fs::write(out.join("missing/file"), b"old").unwrap();
+    fs::File::open(out.join("missing"))
+        .unwrap()
+        .set_modified(retained)
+        .unwrap();
+    let result = rars()
+        .arg("x")
+        .arg("--overwrite=always")
+        .arg(&archive)
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "stderr: {}", stderr(&result));
+    for path in ["epoch", "epoch/file"] {
+        assert_eq!(
+            fs::metadata(out.join(path)).unwrap().modified().unwrap(),
+            UNIX_EPOCH
+        );
+    }
+    assert_eq!(
+        fs::metadata(out.join("missing"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        retained
+    );
+    assert!(
+        fs::metadata(out.join("missing/file"))
+            .unwrap()
+            .modified()
+            .unwrap()
+            > retained
+    );
+}

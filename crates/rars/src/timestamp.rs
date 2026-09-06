@@ -57,17 +57,17 @@ pub fn source_dos_mtime(metadata: &fs::Metadata) -> u32 {
         .unwrap_or(0)
 }
 
+/// Converts a present stored timestamp without treating Unix epoch as missing.
+/// Legacy DOS zero remains invalid under the existing local-zone conversion.
 pub fn extracted_system_time(
     family: ArchiveFamily,
-    file_time: u32,
+    file_time: Option<u32>,
     refinement: Option<TimeRefinement>,
 ) -> Option<SystemTime> {
+    let file_time = file_time?;
     let base = match family {
         ArchiveFamily::Rar13 | ArchiveFamily::Rar15To40 => dos_time_to_system_time(file_time),
-        ArchiveFamily::Rar50Plus => unix_seconds_to_system_time(file_time)
-            // Fractional detail establishes that zero is an actual timestamp,
-            // not the extraction metadata's historical missing-time sentinel.
-            .or_else(|| refinement.map(|_| UNIX_EPOCH)),
+        ArchiveFamily::Rar50Plus => Some(UNIX_EPOCH + Duration::from_secs(u64::from(file_time))),
     }?;
     // A DOS timestamp counts in two-second steps, so an odd second and any
     // sub-second detail arrive separately and have to be added back on.
@@ -125,10 +125,6 @@ fn dos_time_to_system_time(time: u32) -> Option<SystemTime> {
     let zone = TimeZone::local();
     let instant = local.checked_sub(i64::from(zone.offset_for_local(local)))?;
     Some(UNIX_EPOCH + Duration::from_secs(u64::try_from(instant).ok()?))
-}
-
-fn unix_seconds_to_system_time(seconds: u32) -> Option<SystemTime> {
-    (seconds != 0).then_some(UNIX_EPOCH + Duration::from_secs(u64::from(seconds)))
 }
 
 fn filetime_to_system_time(filetime: u64) -> Option<SystemTime> {
