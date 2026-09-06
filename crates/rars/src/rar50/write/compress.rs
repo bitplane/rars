@@ -389,13 +389,15 @@ fn compress_whole_member(
                 };
                 let mut reported = 0u64;
                 let mut charged = 0u64;
-                let mut report = |position: usize| {
-                    let position = position as u64;
-                    if position < reported {
-                        // A new pass restarted at the beginning.
-                        reported = 0;
-                    }
-                    let delta = position - reported;
+                let mut report = |event| {
+                    let position = match event {
+                        crate::filter_search::EncodeProgress::PassStarted => {
+                            reported = 0;
+                            return !advance.is_cancelled();
+                        }
+                        crate::filter_search::EncodeProgress::Advanced(position) => position as u64,
+                    };
+                    let delta = position.saturating_sub(reported);
                     reported = position;
                     let target = (charged + delta).min(walk);
                     let scaled = share(target) - share(charged);
@@ -800,6 +802,42 @@ pub(super) fn member_compression_info(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn explicit_filter_pass_events_do_not_change_packed_bytes() {
+        use crate::filter_search::EncodeProgress;
+        let data: Vec<_> = (0..8192u32).flat_map(u32::to_le_bytes).collect();
+        let options = EncodeOptions::new(8).with_max_match_distance(65536);
+        let plain = encode_member_with_filter_policy_candidates_and_progress(
+            &data,
+            0,
+            &FilterPolicy::Auto,
+            &[options, options],
+            None,
+        )
+        .unwrap();
+        let mut events = Vec::new();
+        let reported = encode_member_with_filter_policy_candidates_and_progress(
+            &data,
+            0,
+            &FilterPolicy::Auto,
+            &[options, options],
+            Some(&mut |event| {
+                events.push(event);
+                true
+            }),
+        )
+        .unwrap();
+        assert_eq!(plain, reported);
+        assert!(
+            events
+                .iter()
+                .filter(|&&event| event == EncodeProgress::PassStarted)
+                .count()
+                > 2
+        );
+        assert_eq!(events.first(), Some(&EncodeProgress::PassStarted));
+    }
+
     use super::*;
 
     #[cfg(target_os = "linux")]

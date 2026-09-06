@@ -183,12 +183,76 @@ pub(crate) trait FilterSearch {
     ) -> Result<Vec<u8>>;
 }
 
-fn borrow_progress<'a>(
-    progress: &'a mut Option<&mut dyn FnMut(usize) -> bool>,
-) -> Option<&'a mut dyn FnMut(usize) -> bool> {
+/// Internal events: codec positions are absolute only within one encode pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EncodeProgress {
+    PassStarted,
+    Advanced(usize),
+}
+
+/// Adapt a single codec pass without inferring restarts from byte positions.
+pub(crate) fn encode_pass<T>(
+    progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
+    encode: impl FnOnce(Option<&mut dyn FnMut(usize) -> bool>) -> Result<T>,
+) -> Result<T> {
     match progress {
-        Some(report) => Some(&mut **report),
-        None => None,
+        Some(progress) => {
+            if !progress(EncodeProgress::PassStarted) {
+                return Err(crate::Error::Cancelled);
+            }
+            encode(Some(&mut |position| {
+                progress(EncodeProgress::Advanced(position))
+            }))
+        }
+        None => encode(None),
+    }
+}
+
+/// Observe every encode in a search, including sample screens which previously
+/// discarded the caller's progress/cancellation callback. The codec adapter and
+/// search decisions remain unchanged.
+struct ReportingSearch<'a, S> {
+    search: &'a S,
+    progress: std::cell::RefCell<&'a mut dyn FnMut(EncodeProgress) -> bool>,
+}
+impl<S: FilterSearch> FilterSearch for ReportingSearch<'_, S> {
+    type Options = S::Options;
+    fn screened_kinds(&self, data: &[u8]) -> Vec<FilterKind> {
+        self.search.screened_kinds(data)
+    }
+    fn detects_x86(&self) -> bool {
+        self.search.detects_x86()
+    }
+    fn max_delta_channels(&self) -> usize {
+        self.search.max_delta_channels()
+    }
+    fn screen_options(&self, options: Self::Options) -> Self::Options {
+        self.search.screen_options(options)
+    }
+    fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Vec<u8>> {
+        self.search.filtered_bytes(data, filters)
+    }
+    fn encode_plain(
+        &self,
+        data: &[u8],
+        options: Self::Options,
+        _: Option<&mut dyn FnMut(usize) -> bool>,
+    ) -> Result<Vec<u8>> {
+        encode_pass(Some(&mut **self.progress.borrow_mut()), |progress| {
+            self.search.encode_plain(data, options, progress)
+        })
+    }
+    fn encode_filtered(
+        &self,
+        data: &[u8],
+        filters: &[FilterSpec],
+        options: Self::Options,
+        _: Option<&mut dyn FnMut(usize) -> bool>,
+    ) -> Result<Vec<u8>> {
+        encode_pass(Some(&mut **self.progress.borrow_mut()), |progress| {
+            self.search
+                .encode_filtered(data, filters, options, progress)
+        })
     }
 }
 
@@ -697,18 +761,32 @@ pub(crate) fn choose_filter<S: FilterSearch>(
     search: &S,
     data: &[u8],
     options: S::Options,
-    mut progress: Option<&mut dyn FnMut(usize) -> bool>,
+    progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
+) -> Result<(Vec<FilterSpec>, Vec<u8>)> {
+    match progress {
+        Some(progress) => choose_filter_inner(
+            &ReportingSearch {
+                search,
+                progress: std::cell::RefCell::new(progress),
+            },
+            data,
+            options,
+        ),
+        None => choose_filter_inner(search, data, options),
+    }
+}
+
+fn choose_filter_inner<S: FilterSearch>(
+    search: &S,
+    data: &[u8],
+    options: S::Options,
 ) -> Result<(Vec<FilterSpec>, Vec<u8>)> {
     let mut best: Option<(Vec<FilterSpec>, Vec<u8>)> = None;
     for (specs, measured) in finalists(search, data, options)? {
         let packed = match measured {
             Some(packed) => packed,
-            None if specs.is_empty() => {
-                search.encode_plain(data, options, borrow_progress(&mut progress))?
-            }
-            None => {
-                search.encode_filtered(data, &specs, options, borrow_progress(&mut progress))?
-            }
+            None if specs.is_empty() => search.encode_plain(data, options, None)?,
+            None => search.encode_filtered(data, &specs, options, None)?,
         };
         if best
             .as_ref()
@@ -807,6 +885,87 @@ pub(crate) fn disjoint_filter_ranges(mut ranges: Vec<Range<usize>>) -> Vec<Range
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn search_reports_each_sample_pass_and_can_cancel_during_screening() {
+        use std::cell::RefCell;
+        struct CountingSearch(RefCell<Vec<usize>>);
+        impl FilterSearch for CountingSearch {
+            type Options = ();
+            fn screened_kinds(&self, _: &[u8]) -> Vec<FilterKind> {
+                vec![FilterKind::Delta { channels: 1 }]
+            }
+            fn detects_x86(&self) -> bool {
+                false
+            }
+            fn max_delta_channels(&self) -> usize {
+                1
+            }
+            fn filtered_bytes(&self, data: &[u8], _: &[FilterSpec]) -> Result<Vec<u8>> {
+                Ok(data.to_vec())
+            }
+            fn encode_plain(
+                &self,
+                data: &[u8],
+                _: (),
+                progress: Option<&mut dyn FnMut(usize) -> bool>,
+            ) -> Result<Vec<u8>> {
+                self.0.borrow_mut().push(data.len());
+                // Short codec passes may report only their final position.
+                if progress.is_some_and(|report| !report(data.len())) {
+                    return Err(crate::Error::Cancelled);
+                }
+                Ok(vec![0; 10])
+            }
+            fn encode_filtered(
+                &self,
+                data: &[u8],
+                _: &[FilterSpec],
+                options: (),
+                progress: Option<&mut dyn FnMut(usize) -> bool>,
+            ) -> Result<Vec<u8>> {
+                self.encode_plain(data, options, progress)
+            }
+        }
+        let data = vec![0; SCREEN_SAMPLE_LEN * 2];
+        let search = CountingSearch(RefCell::new(Vec::new()));
+        let mut events = Vec::new();
+        let observed = choose_filter(
+            &search,
+            &data,
+            (),
+            Some(&mut |event| {
+                events.push(event);
+                true
+            }),
+        )
+        .unwrap();
+        let calls = search.0.borrow().clone();
+        assert!(calls.len() >= 3);
+        assert!(calls[..calls.len() - 1]
+            .iter()
+            .all(|&len| len == SCREEN_SAMPLE_LEN));
+        assert_eq!(calls.last(), Some(&data.len()));
+        assert_eq!(
+            events,
+            calls
+                .iter()
+                .flat_map(|&len| [EncodeProgress::PassStarted, EncodeProgress::Advanced(len)])
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(observed, choose_filter(&search, &data, (), None).unwrap());
+        search.0.borrow_mut().clear();
+        assert_eq!(
+            choose_filter(
+                &search,
+                &data,
+                (),
+                Some(&mut |event| matches!(event, EncodeProgress::PassStarted))
+            ),
+            Err(crate::Error::Cancelled)
+        );
+        assert_eq!(*search.0.borrow(), [SCREEN_SAMPLE_LEN]);
+    }
+
     use super::*;
     use crate::codec::rar50::{
         encode_lz_member_with_options, encode_lz_member_with_options_and_progress, EncodeOptions,

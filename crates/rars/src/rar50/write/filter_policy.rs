@@ -3,10 +3,11 @@ use crate::codec::rar50::{
     encode_lz_member_with_options, encode_lz_member_with_options_and_progress, EncodeOptions,
     Unpack50Encoder,
 };
+use crate::filter_search::{encode_pass, EncodeProgress};
 
 fn borrow_progress<'a>(
-    progress: &'a mut Option<&mut dyn FnMut(usize) -> bool>,
-) -> Option<&'a mut dyn FnMut(usize) -> bool> {
+    progress: &'a mut Option<&mut dyn FnMut(EncodeProgress) -> bool>,
+) -> Option<&'a mut dyn FnMut(EncodeProgress) -> bool> {
     match progress {
         Some(report) => Some(&mut **report),
         None => None,
@@ -18,7 +19,7 @@ pub(super) fn encode_member_with_filter_policy_and_progress(
     algorithm_version: u8,
     policy: &FilterPolicy,
     options: EncodeOptions,
-    progress: Option<&mut dyn FnMut(usize) -> bool>,
+    progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
 ) -> Result<Vec<u8>> {
     match policy {
         FilterPolicy::None => match progress {
@@ -33,8 +34,7 @@ pub(super) fn encode_member_with_filter_policy_and_progress(
             std::slice::from_ref(filter),
             options,
             progress,
-        )
-        .map_err(Error::from),
+        ),
         FilterPolicy::Auto => {
             encode_member_with_auto_size_filter_progress(data, algorithm_version, options, progress)
         }
@@ -46,7 +46,7 @@ pub(super) fn encode_member_with_filter_policy_candidates_and_progress(
     algorithm_version: u8,
     policy: &FilterPolicy,
     candidates: &[EncodeOptions],
-    mut progress: Option<&mut dyn FnMut(usize) -> bool>,
+    mut progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
 ) -> Result<Vec<u8>> {
     let mut remaining = candidates.iter().copied();
     let first = remaining.next().ok_or(Error::InvalidHeader(
@@ -72,8 +72,7 @@ pub(super) fn encode_member_with_filter_policy_candidates_and_progress(
                 &specs,
                 options,
                 borrow_progress(&mut progress),
-            )
-            .map_err(Error::from)?;
+            )?;
             if packed.len() < best.len() {
                 best = packed;
             }
@@ -454,10 +453,17 @@ pub(super) fn encode_safe_lz_member_with_progress(
     data: &[u8],
     algorithm_version: u8,
     options: EncodeOptions,
-    progress: &mut dyn FnMut(usize) -> bool,
+    progress: &mut dyn FnMut(EncodeProgress) -> bool,
 ) -> Result<Vec<u8>> {
-    encode_lz_member_with_options_and_progress(data, algorithm_version, options, progress)
+    encode_pass(Some(progress), |progress| {
+        encode_lz_member_with_options_and_progress(
+            data,
+            algorithm_version,
+            options,
+            progress.expect("provided above"),
+        )
         .map_err(Error::from)
+    })
 }
 
 /// How RAR 5 measures a filter candidate, for the shared search.
@@ -540,7 +546,7 @@ fn choose_auto_size_filter(
     data: &[u8],
     algorithm_version: u8,
     options: EncodeOptions,
-    progress: Option<&mut dyn FnMut(usize) -> bool>,
+    progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
 ) -> Result<(Vec<FilterSpec>, Vec<u8>)> {
     crate::filter_search::choose_filter(&Rar50Search { algorithm_version }, data, options, progress)
 }
@@ -549,7 +555,7 @@ pub(super) fn encode_member_with_auto_size_filter_progress(
     data: &[u8],
     algorithm_version: u8,
     options: EncodeOptions,
-    progress: Option<&mut dyn FnMut(usize) -> bool>,
+    progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
 ) -> Result<Vec<u8>> {
     if !auto_size_filter_search_applies(data) {
         return encode_member_with_filter_policy_and_progress(
@@ -569,33 +575,35 @@ fn encode_member_with_filter_specs_progress(
     algorithm_version: u8,
     filters: &[FilterSpec],
     options: EncodeOptions,
-    progress: Option<&mut dyn FnMut(usize) -> bool>,
-) -> crate::codec::Result<Vec<u8>> {
-    // Carrying filters forces shorter blocks, so encoding no filters through
-    // the filter path would not produce what asking for no filter produces.
-    // The search compares candidates against leaving the data alone, and that
-    // has to mean the bytes it would really emit.
-    if filters.is_empty() {
-        return match progress {
-            Some(progress) => encode_lz_member_with_options_and_progress(
+    progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
+) -> Result<Vec<u8>> {
+    // Encoding an empty filter list through the filtered route changes block
+    // boundaries. Preserve the original plain/filtered routing exactly.
+    encode_pass(progress, |progress| {
+        if filters.is_empty() {
+            return match progress {
+                Some(progress) => encode_lz_member_with_options_and_progress(
+                    data,
+                    algorithm_version,
+                    options,
+                    progress,
+                ),
+                None => encode_lz_member_with_options(data, algorithm_version, options),
+            }
+            .map_err(Error::from);
+        }
+        let mut encoder = Unpack50Encoder::with_options(options);
+        match progress {
+            Some(progress) => encoder.encode_member_with_filters_and_progress(
                 data,
                 algorithm_version,
-                options,
+                filters,
                 progress,
             ),
-            None => encode_lz_member_with_options(data, algorithm_version, options),
-        };
-    }
-    let mut encoder = Unpack50Encoder::with_options(options);
-    match progress {
-        Some(progress) => encoder.encode_member_with_filters_and_progress(
-            data,
-            algorithm_version,
-            filters,
-            progress,
-        ),
-        None => encoder.encode_member_with_filters(data, algorithm_version, filters),
-    }
+            None => encoder.encode_member_with_filters(data, algorithm_version, filters),
+        }
+        .map_err(Error::from)
+    })
 }
 
 pub(super) fn solid_compression_flag(solid_continuation: bool) -> u64 {
