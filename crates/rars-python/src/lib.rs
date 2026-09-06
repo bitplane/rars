@@ -663,8 +663,9 @@ impl RarBuilder {
         })
     }
 
-    /// Create a rewrite builder. Ordinary unencrypted RAR2.9–4.x files retain
-    /// native names, base/extended DOS timestamps, attributes and solid mode.
+    /// Create a rewrite builder. Ordinary RAR2.9–4.x files retain
+    /// native names, base/extended DOS timestamps, attributes, solid mode and
+    /// supported data/header encryption.
     /// For RAR5/7, format,
     /// solid, data/header/comment encryption and archive metadata settings are
     /// retained; unknown or unsupported preservation fails before output.
@@ -862,7 +863,7 @@ impl RarBuilder {
                     .set_mtime_nanoseconds(&output_name, time.subsec_nanos())
                     .map_err(map_builder_error)?;
             }
-            if preserve && !legacy_preservation {
+            if preserve {
                 builder
                     .inner
                     .set_entry_encryption(

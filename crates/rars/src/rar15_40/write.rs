@@ -97,6 +97,7 @@ pub(crate) fn write_archive_with_extended_times(
     coding: MemberCoding,
     archive_comment: Option<&[u8]>,
     progress: Option<&dyn WriteProgress>,
+    header_password: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
     if entries.len() != extended_times.len() {
         return Err(Error::InvalidArgument(
@@ -118,7 +119,18 @@ pub(crate) fn write_archive_with_extended_times(
         }
         member.extended_times = *raw;
     }
-    collect_archive(&members, options, coding, archive_comment, progress)
+    let mut out = Vec::new();
+    write_archive_to(
+        &members,
+        options,
+        coding,
+        archive_comment,
+        &WriterResources::default(),
+        progress,
+        &mut out,
+        header_password,
+    )?;
+    Ok(out)
 }
 
 pub fn write_compressed_archive(
@@ -201,6 +213,7 @@ pub fn write_streaming_archive_to(
         resources,
         progress,
         output,
+        None,
     )
 }
 
@@ -223,10 +236,12 @@ fn collect_archive(
         &WriterResources::default(),
         progress,
         &mut out,
+        None,
     )?;
     Ok(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_archive_to(
     members: &[Member<'_>],
     mut options: WriterOptions,
@@ -235,6 +250,7 @@ fn write_archive_to(
     resources: &WriterResources,
     progress: Option<&dyn WriteProgress>,
     output: &mut dyn Write,
+    explicit_header_password: Option<&[u8]>,
 ) -> Result<()> {
     let has_file_comment = members.iter().any(|member| member.file_comment.is_some());
     validate_plan(
@@ -250,11 +266,21 @@ fn write_archive_to(
         validate_header_encrypted_archive_options(
             options.target,
             archive_comment.is_some(),
-            members.iter().any(|member| member.password.is_some()),
+            explicit_header_password.is_some()
+                || members.iter().any(|member| member.password.is_some()),
         )?;
-        Some(header_encryption_password(
-            members.iter().map(|member| member.password),
-        )?)
+        Some(if let Some(password) = explicit_header_password {
+            header_encryption_password(
+                std::iter::once(Some(password)).chain(
+                    members
+                        .iter()
+                        .filter_map(|member| member.password)
+                        .map(Some),
+                ),
+            )?
+        } else {
+            header_encryption_password(members.iter().map(|member| member.password))?
+        })
     } else {
         None
     };

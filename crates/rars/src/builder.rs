@@ -479,7 +479,8 @@ impl Builder {
         Ok(())
     }
 
-    /// Set data and file-comment encryption independently for a queued RAR5/7 member.
+    /// Set per-member encryption for RAR2.9–4.x or RAR5/7 output.
+    /// Legacy output supports data passwords only, for single archives.
     /// Explicit None passwords retain plaintext even when the builder has a default password.
     pub fn set_entry_encryption(
         &mut self,
@@ -487,12 +488,17 @@ impl Builder {
         data_password: Option<Vec<u8>>,
         comment_password: Option<Vec<u8>>,
     ) -> Result<()> {
-        if self.format.family() != ArchiveFamily::Rar50Plus
+        let legacy = matches!(
+            self.format,
+            ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
+        );
+        if (!legacy && self.format.family() != ArchiveFamily::Rar50Plus)
+            || (legacy && (comment_password.is_some() || self.volume_size.is_some()))
             || data_password.as_ref().is_some_and(Vec::is_empty)
             || comment_password.as_ref().is_some_and(Vec::is_empty)
         {
             return Err(Error::InvalidArgument(
-                "per-entry encryption requires RAR5/7 and nonempty passwords",
+                "per-entry encryption requires supported output and nonempty passwords; legacy output supports data encryption in single archives only",
             ));
         }
         let entry = self
@@ -880,6 +886,13 @@ impl Builder {
             ));
         }
 
+        if self.format.family() == ArchiveFamily::Rar15To40
+            && self.entries.iter().any(|entry| entry.encryption.is_some())
+        {
+            return Err(Error::InvalidArgument(
+                "legacy per-entry encryption is unsupported in volume output",
+            ));
+        }
         let volume_size = self
             .volume_size
             .ok_or(Error::InvalidArgument("volume_size is required"))?;
@@ -1118,7 +1131,12 @@ impl Builder {
                 file_time: entry.mtime.unwrap_or(0),
                 file_attr: entry.rar15_attr(),
                 host_os: entry.rar15_host_os(),
-                password: self.password.as_deref(),
+                password: entry
+                    .encryption
+                    .as_ref()
+                    .map_or(self.password.as_deref(), |encryption| {
+                        encryption.data_password.as_deref()
+                    }),
                 file_comment: entry.file_comment.as_deref(),
             })
             .collect();
@@ -1138,6 +1156,9 @@ impl Builder {
             },
             self.comment.as_deref(),
             progress,
+            self.encrypt_headers
+                .then_some(self.password.as_deref())
+                .flatten(),
         )
     }
 
@@ -1345,6 +1366,83 @@ fn unix_mode(_metadata: &fs::Metadata) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_header_encryption_survives_removing_encrypted_member() {
+        let mut builder = Builder::new(ArchiveVersion::Rar30)
+            .password(Some(b"secret".to_vec()))
+            .header_encryption(true);
+        builder
+            .add_bytes(b"plain".to_vec(), b"public".to_vec(), Some(0), None)
+            .unwrap();
+        builder.set_entry_encryption(b"plain", None, None).unwrap();
+        builder
+            .add_bytes(b"encrypted".to_vec(), b"private".to_vec(), Some(0), None)
+            .unwrap();
+        // Salt and native extended times must coexist in encrypted file headers.
+        builder
+            .set_legacy_extended_times(b"encrypted", Some(vec![0, 0xb0, 1, 2, 3]))
+            .unwrap();
+        for remove in [false, true] {
+            if remove {
+                builder.remove(b"encrypted").unwrap();
+            }
+            let data = builder.to_bytes().unwrap();
+            assert!(matches!(
+                crate::ArchiveReader::read(&data),
+                Err(Error::NeedPassword)
+            ));
+            let archive = crate::ArchiveReader::read_owned_with_options(
+                data,
+                crate::ArchiveReadOptions::with_password(b"secret"),
+            )
+            .unwrap();
+            assert!(archive.rewrite_preservation_issues().is_empty());
+            assert!(archive.as_rar15_40().unwrap().main.has_encrypted_headers());
+            assert!(!archive
+                .as_rar15_40()
+                .unwrap()
+                .files()
+                .next()
+                .unwrap()
+                .is_encrypted());
+            assert_eq!(
+                archive
+                    .read_member(b"plain", if remove { None } else { Some(b"secret") })
+                    .unwrap()
+                    .unwrap(),
+                b"public"
+            );
+            if !remove {
+                assert_eq!(
+                    archive
+                        .read_member(b"encrypted", Some(b"secret"))
+                        .unwrap()
+                        .unwrap(),
+                    b"private"
+                );
+                assert_eq!(
+                    archive
+                        .as_rar15_40()
+                        .unwrap()
+                        .files()
+                        .nth(1)
+                        .unwrap()
+                        .ext_time,
+                    [0, 0xb0, 1, 2, 3]
+                );
+            }
+        }
+        assert!(builder
+            .clone()
+            .volume_size(Some(128))
+            .build_volumes(None)
+            .is_err());
+        builder
+            .set_entry_encryption(b"plain", Some(b"different".to_vec()), None)
+            .unwrap();
+        assert!(builder.to_bytes().is_err());
+    }
 
     #[test]
     fn native_legacy_times_survive_writes_and_rejected_changes() {

@@ -1323,13 +1323,10 @@ impl Archive {
         if self.main.is_volume() {
             issues.push("legacy volume layout".into());
         }
-        if self.main.has_encrypted_headers() {
-            issues.push("legacy header encryption".into());
-        }
         if self.main.has_recovery_record() {
             issues.push("legacy recovery records".into());
         }
-        if self.main.flags & !MHD_SOLID != 0
+        if self.main.flags & !(MHD_SOLID | MHD_PASSWORD) != 0
             || self.main.head_size != MAIN_HEADER_SIZE as u16
             || self.main.reserved1 != 0
             || self.main.reserved2 != 0
@@ -1344,8 +1341,10 @@ impl Archive {
             if file.unp_ver != 29 {
                 issues.push(format!("{label}: legacy source format requires unpacker {} (only 29 is supported for preservation)", file.unp_ver));
             }
-            if file.is_encrypted() {
-                issues.push(format!("{label}: legacy data encryption"));
+            if file.is_encrypted() != file.salt.is_some() {
+                issues.push(format!(
+                    "{label}: unsupported legacy encryption salt settings"
+                ));
             }
             if file.has_ext_time()
                 && crate::file_times::validate_legacy_extended_times(&file.ext_time).is_err()
@@ -1373,8 +1372,19 @@ impl Archive {
             }
             // Only native extended times are retained among optional fields. Check
             // the declared length too: the reader tolerates unflagged extras.
-            if file.block.flags & !(LONG_BLOCK | FHD_SOLID | FHD_DIRECTORY_MASK | FHD_EXTTIME) != 0
-                || usize::from(file.block.head_size) != 32 + file.name.len() + file.ext_time.len()
+            if file.block.flags
+                & !(LONG_BLOCK
+                    | FHD_SOLID
+                    | FHD_DIRECTORY_MASK
+                    | FHD_EXTTIME
+                    | FHD_PASSWORD
+                    | FHD_SALT)
+                != 0
+                || usize::from(file.block.head_size)
+                    != 32
+                        + file.name.len()
+                        + file.ext_time.len()
+                        + if file.salt.is_some() { 8 } else { 0 }
             {
                 issues.push(format!("{label}: legacy file flags or extra metadata"));
             }
@@ -1394,7 +1404,12 @@ impl Archive {
                     && end.add_size.is_none()
                     && end
                         .offset
-                        .checked_add(7)
+                        .checked_add(if self.main.has_encrypted_headers() {
+                            // Eight-byte salt plus one AES block for this header.
+                            24
+                        } else {
+                            7
+                        })
                         .and_then(|end| end.checked_add(self.sfx_offset))
                         .is_some_and(|end| Some(end) == self.source.len().ok())
             }

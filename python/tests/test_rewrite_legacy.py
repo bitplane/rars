@@ -91,10 +91,6 @@ def test_unsupported_legacy_metadata_is_rejected_before_destination_write(tmp_pa
     assert destination.read_bytes() == b"keep"
 
 
-def test_legacy_encryption_is_still_rejected_with_a_specific_reason():
-    source = rars.RarFile.from_bytes(source_bytes(password="secret"), password="secret")
-    with pytest.raises(rars.UnsupportedRarFeature, match="legacy data encryption"):
-        rars.RarBuilder.from_archive(source)
 
 
 @pytest.mark.skipif(not shutil.which("unrar"), reason="requires unrar")
@@ -235,3 +231,81 @@ def test_reference_rar420_extended_times_survive_native_rewrite(tmp_path):
             extracted_times.append({file.relative_to(directory): file.stat().st_mtime_ns
                                     for file in directory.rglob("*") if file.is_file()})
         assert extracted_times[0] == extracted_times[1]
+
+
+@pytest.mark.parametrize("header_encryption", [False, True])
+@pytest.mark.parametrize("solid", [False, True])
+def test_legacy_encryption_survives_edits(tmp_path, header_encryption, solid):
+    original = source_bytes(password="secret", encrypt_headers=header_encryption, solid=solid)
+    source = rars.RarFile.from_bytes(original, password="secret")
+    assert source.rewrite_preservation_issues() == []
+    builder = rars.RarBuilder.from_archive(source)
+    builder.rename(b"raw-\xff", "renamed")
+    output_bytes = builder.to_bytes()
+    if header_encryption:
+        with pytest.raises(rars.PasswordRequired):
+            rars.RarFile.from_bytes(output_bytes)
+    output = rars.RarFile.from_bytes(output_bytes, password="secret")
+    assert output.rewrite_preservation_issues() == []
+    for name in output.namelist():
+        assert output.getinfo(name).is_encrypted
+    assert output.read("renamed") == b"payload" * 50
+    assert output.read("second") == b"second"
+    assert rars.RarBuilder.from_archive(output).to_bytes()
+    if shutil.which("unrar"):
+        path = tmp_path / "encrypted.rar"
+        path.write_bytes(output_bytes)
+        subprocess.run(["unrar", "t", "-psecret", "-idq", str(path)], check=True, capture_output=True)
+
+
+def test_mixed_legacy_encryption_keeps_plaintext_members_plain(tmp_path):
+    plain = rars.RarBuilder(format="rar40", store=True)
+    plain.add_bytes(b"public", "plain")
+    encrypted = rars.RarBuilder(format="rar40", password="secret")
+    encrypted.add_bytes(b"private", "encrypted")
+    secret_bytes = encrypted.to_bytes()
+    member_offset = next(offset for offset, kind, _, _ in headers(secret_bytes) if kind == 0x74)
+    source = rars.RarFile.from_bytes(plain.to_bytes() + secret_bytes[member_offset:], password="secret")
+    rewritten = rars.RarBuilder.from_archive(source).to_bytes()
+    output = rars.RarFile.from_bytes(rewritten)
+    assert not output.getinfo("plain").is_encrypted
+    # The legacy reader currently prepares encryption for all members.
+    assert rars.RarFile.from_bytes(rewritten, password="secret").read("plain") == b"public"
+    assert output.getinfo("encrypted").is_encrypted
+    with pytest.raises(rars.PasswordRequired):
+        output.read("encrypted")
+    assert rars.RarFile.from_bytes(rewritten, password="secret").read("encrypted") == b"private"
+    if shutil.which("unrar"):
+        path = tmp_path / "mixed.rar"
+        path.write_bytes(rewritten)
+        result = subprocess.run(["unrar", "p", "-p-", "-inul", str(path), "plain"], check=True, capture_output=True)
+        assert result.stdout == b"public"
+    builder = rars.RarBuilder.from_archive(source)
+    builder.remove("encrypted")
+    assert rars.RarFile.from_bytes(builder.to_bytes()).read("plain") == b"public"
+
+
+
+@pytest.mark.parametrize("password", [None, "wrong"])
+@pytest.mark.parametrize("header_encryption", [False, True])
+def test_legacy_password_failure_keeps_destination(tmp_path, password, header_encryption):
+    data = source_bytes(password="secret", encrypt_headers=header_encryption)
+    destination = tmp_path / "existing.rar"
+    destination.write_bytes(b"keep")
+    with pytest.raises((rars.PasswordRequired, rars.BadPassword, rars.BadRarFile)):
+        source = rars.RarFile.from_bytes(data, password=password)
+        rars.RarBuilder.from_archive(source).write(destination)
+    assert destination.read_bytes() == b"keep"
+    assert list(tmp_path.iterdir()) == [destination]
+
+
+@pytest.mark.parametrize("fixture", ["per_file_rar300_password.rar", "header_rar300_password.rar", "header_rar420_password.rar"])
+def test_reference_legacy_encryption_is_preserved(fixture):
+    source = rars.RarFile(ROOT / "crates/rars/tests/fixtures/rar15_40/encrypted" / fixture, password="password")
+    builder = rars.RarBuilder.from_archive(source)
+    output = rars.RarFile.from_bytes(builder.to_bytes(), password="password")
+    assert output.family == source.family
+    for name in source.namelist():
+        assert output.getinfo(name).is_encrypted == source.getinfo(name).is_encrypted
+        assert output.read(name) == source.read(name)
+        assert output.gettimes(name) == source.gettimes(name)
