@@ -70,7 +70,8 @@ fn run_size(plan: &CompressPlan) -> usize {
 /// A member being read, and the packed bytes it has produced so far.
 struct MemberStream {
     member: usize,
-    reader: Box<dyn crate::EntryReader>,
+    source: EntrySource,
+    reader: Option<Box<dyn crate::EntryReader>>,
     remaining: u64,
     packed: Spool,
     /// A chunk read to decide a block boundary and not used by that block.
@@ -86,13 +87,13 @@ impl MemberStream {
         size: u64,
         resources: &WriterResources,
     ) -> Result<Self> {
-        let mut reader = source.open()?;
         if size == 0 {
-            check_source_end(&mut *reader)?;
+            check_source_end(&mut *source.open()?)?;
         }
         Ok(Self {
             member,
-            reader,
+            source: source.clone(),
+            reader: None,
             remaining: size,
             packed: Spool::create(resources)?,
             pushback: Vec::new(),
@@ -584,12 +585,19 @@ fn read_chunk(stream: &mut MemberStream, block_size: usize) -> Result<Vec<u8>> {
     let wanted = usize::try_from(stream.remaining.min(block_size as u64))
         .map_err(|_| Error::InvalidHeader("RAR 5 block size overflows usize"))?;
     let mut data = vec![0u8; wanted];
-    stream.reader.read_exact(&mut data)?;
+    // Solid planning can retain every member, but only the current input
+    // needs a reader. Release it at EOF, even when a block has pushback.
+    if stream.reader.is_none() {
+        stream.reader = Some(stream.source.open()?);
+    }
+    let reader = stream.reader.as_mut().expect("opened above");
+    reader.read_exact(&mut data)?;
     stream.crc.update(&data);
     stream.hash.update(&data);
     stream.remaining -= wanted as u64;
     if stream.remaining == 0 {
-        check_source_end(&mut *stream.reader)?;
+        check_source_end(&mut **reader)?;
+        stream.reader = None;
     }
     Ok(data)
 }
@@ -677,6 +685,68 @@ pub(super) fn member_compression_info(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn solid_inputs_open_one_at_a_time_and_close_on_failure() {
+        use std::io::{Cursor, Seek, SeekFrom};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        struct Tracked {
+            data: Cursor<Vec<u8>>,
+            live: Arc<AtomicUsize>,
+        }
+        impl Read for Tracked {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                self.data.read(bytes)
+            }
+        }
+        impl Seek for Tracked {
+            fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+                self.data.seek(pos)
+            }
+        }
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                self.live.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let live = Arc::new(AtomicUsize::new(0));
+        let sources: Vec<_> = (0..128)
+            .map(|n| {
+                let live = live.clone();
+                EntrySource::from_opener(32, move || {
+                    assert_eq!(live.fetch_add(1, Ordering::SeqCst), 0);
+                    Ok(Box::new(Tracked {
+                        data: Cursor::new(vec![n; 32]),
+                        live: live.clone(),
+                    }))
+                })
+            })
+            .collect();
+        let options = EncodeOptions::new(8).with_max_match_distance(65536);
+        let plan = CompressPlan {
+            algorithm_version: 0,
+            encode_options: options,
+            dictionary_size: 65536,
+            block_size: 65536,
+            solid: true,
+            method: 1,
+            filter_policy: FilterPolicy::None,
+            candidates: vec![options],
+        };
+        let scratch = crate::scratch::case("lazy-solid-inputs");
+        let resources = WriterResources::default().with_temp_dir(&*scratch);
+        let result =
+            compress_members_reporting(&sources, plan.clone(), &resources, &|_| true).unwrap();
+        assert_eq!(result.len(), sources.len());
+        assert_eq!(live.load(Ordering::SeqCst), 0);
+        drop(result);
+        assert!(compress_members_reporting(&sources, plan, &resources, &|_| false).is_err());
+        assert_eq!(live.load(Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
+    }
 
     #[test]
     fn whole_member_budget_includes_tree_and_parse_workspace() {
