@@ -793,8 +793,18 @@ impl Archive {
         &self,
         password: Option<&[u8]>,
     ) -> Result<crate::RecoveryRepairResult> {
+        self.repair_recovery_with_options(crate::ArchiveReadOptions::with_optional_password(
+            password,
+        ))
+    }
+
+    /// Repairs embedded recovery data using password and cancellation only.
+    pub fn repair_recovery_with_options(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+    ) -> Result<crate::RecoveryRepairResult> {
         let mut data = Vec::new();
-        let report = self.repair_recovery_to_with_report(&mut data, password)?;
+        let report = self.repair_recovery_to_with_options(&mut data, options)?;
         Ok(crate::RecoveryRepairResult { data, report })
     }
 
@@ -808,21 +818,42 @@ impl Archive {
         writer: &mut dyn Write,
         password: Option<&[u8]>,
     ) -> Result<crate::RecoveryRepairReport> {
+        self.repair_recovery_to_with_options(
+            writer,
+            crate::ArchiveReadOptions::with_optional_password(password),
+        )
+    }
+
+    /// Streams repaired bytes with cooperative cancellation; partial output can remain.
+    /// Only password and cancellation apply from the read options.
+    pub fn repair_recovery_to_with_options(
+        &self,
+        writer: &mut dyn Write,
+        options: crate::ArchiveReadOptions<'_>,
+    ) -> Result<crate::RecoveryRepairReport> {
+        options.check_cancelled()?;
+        let password = options.password;
+        let control = crate::read_control::ReadControl::new(options.cancellation);
         let recovery = self.recovery_service()?;
-        let recovery_data = recovery.decoded_data_unverified(self, password)?;
+        let recovery_data = recovery.decoded_recovery_data(self, password, &control)?;
         let (available, expected) =
-            crate::recovery::rar5::inline_recovery_chunk_counts(&recovery_data)?;
+            crate::recovery::rar5::inline_recovery_chunk_counts_with_control(
+                &recovery_data,
+                &control,
+            )?;
         if available == expected || self.sfx_offset != 0 {
-            return self.repair_recovery_to_legacy(writer, password, available, expected);
+            return self.repair_recovery_to_legacy(writer, password, available, expected, &control);
         }
         let bytes = self.read_range(0..self.source_len()?)?;
         let options = crate::recovery::rar5::InlineRepairOptions {
             password,
+            control: control.clone(),
             record_range: Some(recovery.block.data_range.clone()),
         };
         let (data, report) =
             crate::recovery::rar5::repair_inline_recovery_archive_with_report(&bytes, &options)?;
-        writer.write_all(&data)?;
+        control.finish(control.write_all(writer, &data).map_err(Error::from))?;
+        control.check()?;
         Ok(report)
     }
 
@@ -840,6 +871,7 @@ impl Archive {
         password: Option<&[u8]>,
         available: u64,
         expected: u64,
+        control: &crate::read_control::ReadControl,
     ) -> Result<crate::RecoveryRepairReport> {
         let recovery = self.recovery_service()?;
         let prefix_start = self.sfx_offset;
@@ -858,43 +890,51 @@ impl Archive {
             ));
         }
         let recovery_data = recovery
-            .decoded_data_unverified(self, password)
+            .decoded_recovery_data(self, password, control)
             .map_err(|error| error.at_entry(recovery.name.clone(), "reading recovery data"))?;
         let prefix_len = prefix_end
             .checked_sub(prefix_start)
             .ok_or(Error::InvalidHeader(
                 "RAR 5 recovery prefix range overflows archive bounds",
             ))?;
-        let repaired_shards = crate::recovery::rar5::repair_inline_recovery_prefix_shards(
-            prefix_len,
-            &recovery_data,
-            |range| {
-                let start = prefix_start
-                    .checked_add(range.start)
-                    .ok_or(crate::recovery::rar5::Error::PlanOverflow)?;
-                let end = prefix_start
-                    .checked_add(range.end)
-                    .ok_or(crate::recovery::rar5::Error::PlanOverflow)?;
-                self.read_range(start..end)
-                    .map_err(|_| crate::recovery::rar5::Error::BadRecoveryChunk)
-            },
-        )?;
+        let repaired_shards =
+            crate::recovery::rar5::repair_inline_recovery_prefix_shards_with_control(
+                prefix_len,
+                &recovery_data,
+                |range| {
+                    let start = prefix_start
+                        .checked_add(range.start)
+                        .ok_or(crate::recovery::rar5::Error::PlanOverflow)?;
+                    let end = prefix_start
+                        .checked_add(range.end)
+                        .ok_or(crate::recovery::rar5::Error::PlanOverflow)?;
+                    self.read_range(start..end)
+                        .map_err(|_| crate::recovery::rar5::Error::BadRecoveryChunk)
+                },
+                control,
+            )?;
 
-        self.copy_range_to(0..prefix_start, writer)?;
+        self.copy_repair_range(0..prefix_start, writer, control)?;
         let mut cursor = 0usize;
         let data_repaired = !repaired_shards.is_empty();
         for (range, data) in repaired_shards {
+            control.check()?;
             if range.start < cursor || range.end > prefix_len || range.len() != data.len() {
                 return Err(Error::InvalidHeader(
                     "RAR 5 recovery shard range is invalid",
                 ));
             }
-            self.copy_range_to(prefix_start + cursor..prefix_start + range.start, writer)?;
-            writer.write_all(&data)?;
+            self.copy_repair_range(
+                prefix_start + cursor..prefix_start + range.start,
+                writer,
+                control,
+            )?;
+            control.finish(control.write_all(writer, &data).map_err(Error::from))?;
             cursor = range.end;
         }
-        self.copy_range_to(prefix_start + cursor..prefix_end, writer)?;
-        self.copy_range_to(prefix_end..source_len, writer)?;
+        self.copy_repair_range(prefix_start + cursor..prefix_end, writer, control)?;
+        self.copy_repair_range(prefix_end..source_len, writer, control)?;
+        control.check()?;
         Ok(crate::RecoveryRepairReport {
             changed: data_repaired,
             data_repaired,
@@ -903,6 +943,19 @@ impl Archive {
             available_recovery_shards: Some(available),
             expected_recovery_shards: Some(expected),
         })
+    }
+    fn copy_repair_range(
+        &self,
+        range: Range<usize>,
+        writer: &mut dyn Write,
+        control: &crate::read_control::ReadControl,
+    ) -> Result<()> {
+        for start in (range.start..range.end).step_by(64 * 1024) {
+            control.check()?;
+            let data = self.read_range(start..(start.saturating_add(64 * 1024)).min(range.end))?;
+            control.finish(control.write_all(writer, &data).map_err(Error::from))?;
+        }
+        control.check()
     }
 }
 
@@ -1157,6 +1210,7 @@ pub fn repair_inline_recovery_bytes_with_options(
     }
     let repair_options = crate::recovery::rar5::InlineRepairOptions {
         password: options.password,
+        control: crate::read_control::ReadControl::new(options.cancellation),
         ..Default::default()
     };
     let (repaired, report) =
@@ -1179,8 +1233,13 @@ pub fn repair_inline_recovery_bytes_with_options(
 /// are the ones the caller is about to write. A volume that splits cleanly on
 /// an entry boundary is indistinguishable from a final one and loses the flag;
 /// unrar and WinRAR both walk such a set from the main header anyway.
-pub(crate) fn recovery_end_header(input: &[u8], password: Option<&[u8]>) -> Result<Vec<u8>> {
-    let end_flags = match Archive::parse_with_password(input, password) {
+pub(crate) fn recovery_end_header(
+    input: &[u8],
+    options: crate::ArchiveReadOptions<'_>,
+) -> Result<Vec<u8>> {
+    options.check_cancelled()?;
+    let password = options.password;
+    let end_flags = match Archive::parse_with_options(input, options) {
         Ok(archive)
             if archive
                 .files()
@@ -1189,6 +1248,7 @@ pub(crate) fn recovery_end_header(input: &[u8], password: Option<&[u8]>) -> Resu
         {
             EFL_NEXT_VOLUME
         }
+        Err(error) if error.kind() == crate::ErrorKind::Cancelled => return Err(error),
         _ => 0,
     };
     let first = parse_block_header_bytes(
@@ -1196,7 +1256,7 @@ pub(crate) fn recovery_end_header(input: &[u8], password: Option<&[u8]>) -> Resu
         RAR50_SIGNATURE.len(),
         input.len(),
         0,
-        &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::default()),
+        &mut crate::parse_budget::ParseBudget::new(options),
     )?;
     if first.block.header_type != HEAD_CRYPT {
         let mut end = Vec::new();

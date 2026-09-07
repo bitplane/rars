@@ -91,7 +91,7 @@ impl ProgressEvent {
     }
 }
 
-/// A thread-safe, one-way cancellation signal for builder writes and rewrites.
+/// A thread-safe, one-way cancellation signal for reading, writing and repair.
 #[pyclass(frozen, module = "rars", skip_from_py_object)]
 #[derive(Debug, Clone, Default)]
 struct CancellationToken {
@@ -1400,46 +1400,89 @@ fn output_directory(path: &Path) -> &Path {
         .unwrap_or(Path::new("."))
 }
 
+fn check_repair_cancellation(cancellation: Option<&CancellationToken>) -> PyResult<()> {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return Err(PyInterruptedError::new_err("repair cancelled"));
+    }
+    Ok(())
+}
+
+fn repair_input(
+    py: Python<'_>,
+    source: &Bound<'_, PyAny>,
+    cancellation: Option<&CancellationToken>,
+) -> PyResult<Vec<u8>> {
+    check_repair_cancellation(cancellation)?;
+    if let Ok(bytes) = source.extract::<Vec<u8>>() {
+        check_repair_cancellation(cancellation)?;
+        return Ok(bytes);
+    }
+    let path = py_path_buf(py, source)?;
+    py.detach(|| {
+        use std::io::Read;
+        check_repair_cancellation(cancellation)?;
+        let mut file = fs::File::open(path).map_err(map_io_error)?;
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            check_repair_cancellation(cancellation)?;
+            let count = match file.read(&mut buffer) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                result => result.map_err(map_io_error)?,
+            };
+            if count == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..count]);
+        }
+        check_repair_cancellation(cancellation)?;
+        Ok(bytes)
+    })
+}
+
 #[pyfunction]
-#[pyo3(signature = (source, password = None))]
+#[pyo3(signature = (source, password = None, *, cancellation = None))]
 fn repair(
     py: Python<'_>,
     source: &Bound<'_, PyAny>,
     password: Option<&Bound<'_, PyAny>>,
+    cancellation: Option<&CancellationToken>,
 ) -> PyResult<Vec<u8>> {
+    check_repair_cancellation(cancellation)?;
     let password = py_password(password)?;
-    let bytes = py_input_bytes(py, source)?;
-    py.detach(|| repair_core(&bytes, password.as_deref()).map(|result| result.data))
+    let bytes = repair_input(py, source, cancellation)?;
+    py.detach(|| repair_core(&bytes, password.as_deref(), cancellation).map(|result| result.data))
         .map_err(map_error)
 }
 
-/// Repairs from the archive's own recovery record, falling back to a raw
-/// inline-recovery pass when the headers are too damaged to parse.
+/// A parsing cancellation must not start the damaged-header fallback.
 fn repair_core(
     bytes: &[u8],
     password: Option<&[u8]>,
+    cancellation: Option<&CancellationToken>,
 ) -> rars_rs::Result<rars_rs::RecoveryRepairResult> {
-    let options = || match password {
-        Some(password) => rars_rs::ArchiveReadOptions::with_password(password),
-        None => rars_rs::ArchiveReadOptions::new(),
-    };
-    match rars_rs::ArchiveReader::read_with_options(bytes, options()) {
-        Ok(archive) => archive.repair_recovery_with_report(password),
-        Err(_) => rars_rs::rar50::repair_inline_recovery_bytes_with_options(bytes, options()),
+    let mut options = rars_rs::ArchiveReadOptions::with_optional_password(password);
+    options.cancellation = cancellation.map(|token| &token.inner);
+    match rars_rs::ArchiveReader::read_with_options(bytes, options) {
+        Ok(archive) => archive.repair_recovery_with_options(options),
+        Err(error) if error.kind() == rars_rs::ErrorKind::Cancelled => Err(error),
+        Err(_) => rars_rs::rar50::repair_inline_recovery_bytes_with_options(bytes, options),
     }
 }
 
 #[pyfunction]
-#[pyo3(signature = (source, password = None))]
+#[pyo3(signature = (source, password = None, *, cancellation = None))]
 fn repair_detailed(
     py: Python<'_>,
     source: &Bound<'_, PyAny>,
     password: Option<&Bound<'_, PyAny>>,
+    cancellation: Option<&CancellationToken>,
 ) -> PyResult<RepairResult> {
+    check_repair_cancellation(cancellation)?;
     let password = py_password(password)?;
-    let bytes = py_input_bytes(py, source)?;
+    let bytes = repair_input(py, source, cancellation)?;
     py.detach(|| {
-        let result = repair_core(&bytes, password.as_deref())?;
+        let result = repair_core(&bytes, password.as_deref(), cancellation)?;
         Ok(RepairResult {
             data: result.data,
             report: result.report.into(),
@@ -1449,16 +1492,23 @@ fn repair_detailed(
 }
 
 #[pyfunction]
-#[pyo3(signature = (input, output, password = None))]
+#[pyo3(signature = (input, output, password = None, *, cancellation = None))]
 fn repair_to_path(
     py: Python<'_>,
     input: &Bound<'_, PyAny>,
     output: &Bound<'_, PyAny>,
     password: Option<&Bound<'_, PyAny>>,
+    cancellation: Option<&CancellationToken>,
 ) -> PyResult<()> {
+    check_repair_cancellation(cancellation)?;
     let output = py_path_buf(py, output)?;
-    let data = repair(py, input, password)?;
-    py.detach(|| fs::write(output, data)).map_err(map_io_error)
+    let password = py_password(password)?;
+    let bytes = repair_input(py, input, cancellation)?;
+    py.detach(|| {
+        let result = repair_core(&bytes, password.as_deref(), cancellation)?;
+        result.write_to_path(&output, cancellation.map(|token| &token.inner))
+    })
+    .map_err(map_error)
 }
 
 #[pyfunction]

@@ -22,6 +22,7 @@ fn shared_gf16() -> &'static Gf16 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
+    Cancelled,
     BadRecoveryChunk,
     OddShardSize,
     PlanOverflow,
@@ -37,6 +38,7 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Cancelled => f.write_str("RAR 5 recovery cancelled"),
             Self::BadRecoveryChunk => f.write_str("RAR 5 recovery chunk is invalid"),
             Self::OddShardSize => f.write_str("RAR 5 recovery shard size is odd"),
             Self::PlanOverflow => f.write_str("RAR 5 recovery plan overflows"),
@@ -256,13 +258,27 @@ pub(crate) fn build_structural_inline_recovery_data_with_progress(
 
 /// Builds recovery payload bytes with the geometry of `plan`, so a record
 /// rebuilt during repair keeps the shape the archive was written with.
+#[cfg(test)]
 pub(crate) fn build_inline_recovery_data_for_plan(
     archive_prefix: &[u8],
     plan: InlineRecoveryPlan,
 ) -> Result<Vec<u8>> {
+    build_inline_recovery_data_for_plan_with_control(
+        archive_prefix,
+        plan,
+        &crate::read_control::ReadControl::default(),
+    )
+}
+
+pub(crate) fn build_inline_recovery_data_for_plan_with_control(
+    archive_prefix: &[u8],
+    plan: InlineRecoveryPlan,
+    control: &crate::read_control::ReadControl,
+) -> Result<Vec<u8>> {
+    check_repair(control)?;
     let mut out = Vec::new();
     build_streamed_inline_recovery_for_plan(
-        &mut std::io::Cursor::new(archive_prefix),
+        &mut control.reader(std::io::Cursor::new(archive_prefix)),
         archive_prefix.len() as u64,
         plan,
         RecoveryMemoryMode::Resident,
@@ -270,7 +286,18 @@ pub(crate) fn build_inline_recovery_data_for_plan(
         &mut out,
         None,
         1,
-    )?;
+    )
+    .map_err(|error| {
+        if matches!(
+            control.finish::<()>(Err(error.clone().into())),
+            Err(crate::Error::Cancelled)
+        ) {
+            Error::Cancelled
+        } else {
+            error
+        }
+    })?;
+    check_repair(control)?;
     Ok(out)
 }
 
@@ -804,7 +831,20 @@ pub fn repair_inline_recovery_prefix(
     archive_prefix: &[u8],
     recovery_data: &[u8],
 ) -> Result<Vec<u8>> {
-    let chunks = parse_available_inline_recovery_chunks(recovery_data)?;
+    repair_inline_recovery_prefix_with_control(
+        archive_prefix,
+        recovery_data,
+        &crate::read_control::ReadControl::default(),
+    )
+}
+
+pub(crate) fn repair_inline_recovery_prefix_with_control(
+    archive_prefix: &[u8],
+    recovery_data: &[u8],
+    control: &crate::read_control::ReadControl,
+) -> Result<Vec<u8>> {
+    check_repair(control)?;
+    let chunks = parse_available_inline_recovery_chunks_with_control(recovery_data, control)?;
     let first = chunks.first().ok_or(Error::BadRecoveryChunk)?;
     let plan = first.plan;
     if first.protected_size != archive_prefix.len() as u64 {
@@ -820,14 +860,13 @@ pub fn repair_inline_recovery_prefix(
 
     let mut data_shards = split_prefix_shards(archive_prefix, plan)?;
     let shard_ranges = split_prefix_shard_ranges(archive_prefix.len(), plan)?;
-    let damaged: Vec<usize> = shard_ranges
-        .iter()
-        .enumerate()
-        .filter_map(|(index, range)| {
-            (crc64_rar_state(&archive_prefix[range.clone()]) != first.data_shard_states[index])
-                .then_some(index)
-        })
-        .collect();
+    let mut damaged = Vec::new();
+    for (index, range) in shard_ranges.iter().enumerate() {
+        if repair_crc(&archive_prefix[range.clone()], 0, control)? != first.data_shard_states[index]
+        {
+            damaged.push(index);
+        }
+    }
     if damaged.is_empty() {
         return Ok(archive_prefix.to_vec());
     }
@@ -839,10 +878,11 @@ pub fn repair_inline_recovery_prefix(
         .iter()
         .map(|chunk| (chunk.shard_index, chunk.parity.as_slice()))
         .collect();
-    recover_damaged_shards(&mut data_shards, &damaged, &recovery_rows)?;
+    recover_damaged_shards_with_control(&mut data_shards, &damaged, &recovery_rows, control)?;
 
     let mut repaired = Vec::with_capacity(archive_prefix.len());
     for (shard, range) in data_shards.iter().zip(shard_ranges) {
+        check_repair(control)?;
         repaired.extend_from_slice(&shard[..range.len()]);
     }
     debug_assert_eq!(repaired.len(), archive_prefix.len());
@@ -858,12 +898,31 @@ pub fn repair_inline_recovery_prefix(
 pub fn repair_inline_recovery_prefix_shards<F>(
     protected_size: usize,
     recovery_data: &[u8],
-    mut read_range: F,
+    read_range: F,
 ) -> Result<Vec<(std::ops::Range<usize>, Vec<u8>)>>
 where
     F: FnMut(std::ops::Range<usize>) -> Result<Vec<u8>>,
 {
-    let chunks = parse_available_inline_recovery_chunks(recovery_data)?;
+    repair_inline_recovery_prefix_shards_with_control(
+        protected_size,
+        recovery_data,
+        read_range,
+        &crate::read_control::ReadControl::default(),
+    )
+}
+
+pub(crate) fn repair_inline_recovery_prefix_shards_with_control<F>(
+    protected_size: usize,
+    recovery_data: &[u8],
+    mut read_range: F,
+    control: &crate::read_control::ReadControl,
+) -> Result<Vec<(std::ops::Range<usize>, Vec<u8>)>>
+where
+    F: FnMut(std::ops::Range<usize>) -> Result<Vec<u8>>,
+{
+    let mut poller = control.poller();
+    check_repair(control)?;
+    let chunks = parse_available_inline_recovery_chunks_with_control(recovery_data, control)?;
     let first = chunks.first().ok_or(Error::BadRecoveryChunk)?;
     if first.protected_size != protected_size as u64 {
         return Err(Error::BadRecoveryChunk);
@@ -883,8 +942,9 @@ where
     let shard_ranges = split_prefix_shard_ranges(protected_size, plan)?;
     let mut damaged = Vec::new();
     for (index, range) in shard_ranges.iter().enumerate() {
+        poller.check(0).map_err(|_| Error::Cancelled)?;
         let shard = read_range(range.clone())?;
-        if crc64_rar_state(&shard) != first.data_shard_states[index] {
+        if repair_crc(&shard, 0, control)? != first.data_shard_states[index] {
             damaged.push(index);
         }
     }
@@ -916,7 +976,7 @@ where
         })
         .collect();
     let gf = shared_gf16();
-    let inverse = invert_linear_system_matrix(gf, &equations)?;
+    let inverse = invert_linear_system_matrix_with_control(gf, &equations, control)?;
     let word_count = shard_len / 2;
     let mut rhs_by_row = recovery_rows
         .iter()
@@ -930,16 +990,19 @@ where
     let damaged_lookup = damaged_lookup(shard_ranges.len(), &damaged)?;
 
     for (data_index, range) in shard_ranges.iter().enumerate() {
+        poller.check(0).map_err(|_| Error::Cancelled)?;
         if damaged_lookup[data_index] {
             continue;
         }
         let shard = read_padded_prefix_shard(range.clone(), shard_len, &mut read_range)?;
         for (row_index, rhs) in rhs_by_row.iter_mut().enumerate() {
+            poller.check(0).map_err(|_| Error::Cancelled)?;
             let coeff = matrix[recovery_rows[row_index].0][data_index];
             if coeff == 0 {
                 continue;
             }
             for (word_index, word) in shard.chunks_exact(2).enumerate() {
+                poller.check(0).map_err(|_| Error::Cancelled)?;
                 let data_symbol = u16::from_le_bytes([word[0], word[1]]);
                 rhs[word_index] ^= gf.mul(coeff, data_symbol);
             }
@@ -951,12 +1014,14 @@ where
         .map(|&index| vec![0; shard_ranges[index].len()])
         .collect::<Vec<_>>();
     for word_index in 0..word_count {
+        poller.check(0).map_err(|_| Error::Cancelled)?;
         let rhs = rhs_by_row
             .iter()
             .map(|row| row[word_index])
             .collect::<Vec<_>>();
         let solved = apply_inverse_matrix(gf, &inverse, &rhs)?;
         for (output, &symbol) in repaired.iter_mut().zip(&solved) {
+            poller.check(0).map_err(|_| Error::Cancelled)?;
             let byte_offset = word_index * 2;
             if byte_offset < output.len() {
                 let bytes = symbol.to_le_bytes();
@@ -1004,6 +1069,7 @@ where
 /// What a raw inline-recovery repair knows beyond the archive bytes.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct InlineRepairOptions<'a> {
+    pub control: crate::read_control::ReadControl,
     /// Password for header-encrypted archives, needed to frame a replacement
     /// end-of-archive header.
     pub password: Option<&'a [u8]>,
@@ -1020,8 +1086,10 @@ pub(crate) fn repair_inline_recovery_archive_with_report(
     input: &[u8],
     options: &InlineRepairOptions<'_>,
 ) -> Result<(Vec<u8>, crate::RecoveryRepairReport)> {
+    let control = &options.control;
+    check_repair(control)?;
     let chunks = select_record_chunks(
-        find_inline_recovery_chunks(input)?,
+        find_inline_recovery_chunks_with_control(input, control)?,
         options.record_range.clone(),
     )?;
     let first = chunks.first().ok_or(Error::BadRecoveryChunk)?;
@@ -1038,10 +1106,12 @@ pub(crate) fn repair_inline_recovery_archive_with_report(
             .sum(),
     );
     for found in &chunks {
+        check_repair(control)?;
         append_inline_recovery_chunk(input, found, &mut recovery_data)?;
     }
     let original_prefix = &input[..protected_size];
-    let repaired_prefix = repair_inline_recovery_prefix(original_prefix, &recovery_data)?;
+    let repaired_prefix =
+        repair_inline_recovery_prefix_with_control(original_prefix, &recovery_data, control)?;
     let data_repaired = repaired_prefix != original_prefix;
     let mut indices = chunks
         .iter()
@@ -1082,16 +1152,18 @@ pub(crate) fn repair_inline_recovery_archive_with_report(
     let mut repaired = if record_complete {
         prefix_only()
     } else {
-        match rebuild_inline_recovery_record(
+        match rebuild_inline_recovery_record_with_control(
             input,
             &repaired_prefix,
             record_start..record_end,
             plan,
+            control,
         ) {
             Ok(rebuilt) => {
                 recovery_record_rebuilt = true;
                 rebuilt
             }
+            Err(Error::Cancelled) => return Err(Error::Cancelled),
             Err(_) => prefix_only(),
         }
     };
@@ -1100,8 +1172,15 @@ pub(crate) fn repair_inline_recovery_archive_with_report(
     // end-of-archive header along with whatever followed.
     let mut end_record_rebuilt = false;
     if (record_complete || recovery_record_rebuilt) && repaired.len() <= record_end {
-        let end = crate::rar50::recovery_end_header(&repaired, options.password)
-            .map_err(|_| Error::BadRecoveryChunk)?;
+        let mut read_options = crate::ArchiveReadOptions::with_optional_password(options.password);
+        read_options.cancellation = control.cancellation();
+        let end = crate::rar50::recovery_end_header(&repaired, read_options).map_err(|error| {
+            if error.kind() == crate::ErrorKind::Cancelled {
+                Error::Cancelled
+            } else {
+                Error::BadRecoveryChunk
+            }
+        })?;
         repaired.extend_from_slice(&end);
         end_record_rebuilt = true;
     }
@@ -1113,6 +1192,7 @@ pub(crate) fn repair_inline_recovery_archive_with_report(
         available_recovery_shards: Some(available),
         expected_recovery_shards: Some(expected),
     };
+    check_repair(control)?;
     Ok((repaired, report))
 }
 
@@ -1123,12 +1203,14 @@ pub(crate) fn repair_inline_recovery_archive_with_report(
 /// bytes to protect could ask for an allocation nothing can serve. Refusing
 /// past [`MAX_REBUILD_PARITY_BYTES`] costs the caller the rebuild and keeps
 /// the data repair.
-fn rebuild_inline_recovery_record(
+fn rebuild_inline_recovery_record_with_control(
     input: &[u8],
     repaired_prefix: &[u8],
     record: std::ops::Range<usize>,
     plan: InlineRecoveryPlan,
+    control: &crate::read_control::ReadControl,
 ) -> Result<Vec<u8>> {
+    check_repair(control)?;
     let parity_bytes = plan
         .recovery_shards
         .checked_mul(plan.group_count)
@@ -1136,7 +1218,7 @@ fn rebuild_inline_recovery_record(
     if parity_bytes > MAX_REBUILD_PARITY_BYTES {
         return Err(Error::RebuildTooLarge);
     }
-    let rebuilt = build_inline_recovery_data_for_plan(repaired_prefix, plan)?;
+    let rebuilt = build_inline_recovery_data_for_plan_with_control(repaired_prefix, plan, control)?;
     if rebuilt.len() != record.len() {
         return Err(Error::BadRecoveryChunk);
     }
@@ -1182,12 +1264,16 @@ fn select_record_chunks(
     Ok(chunks)
 }
 
-fn find_inline_recovery_chunks(input: &[u8]) -> Result<Vec<FoundInlineRecoveryChunk>> {
+fn find_inline_recovery_chunks_with_control(
+    input: &[u8],
+    control: &crate::read_control::ReadControl,
+) -> Result<Vec<FoundInlineRecoveryChunk>> {
+    check_repair(control)?;
     let mut chunks = Vec::new();
     let mut offset = 0usize;
-    while let Some(relative) = find_recovery_marker(&input[offset..]) {
+    while let Some(relative) = repair_marker(&input[offset..], control)? {
         let start = offset + relative;
-        if let Ok(chunk) = parse_inline_recovery_chunk(&input[start..]) {
+        if let Ok(chunk) = parse_inline_recovery_chunk_with_control(&input[start..], control) {
             let shard_size =
                 usize::try_from(chunk.plan.shard_size).map_err(|_| Error::PlanOverflow)?;
             if input.len().saturating_sub(start) >= shard_size {
@@ -1199,6 +1285,7 @@ fn find_inline_recovery_chunks(input: &[u8]) -> Result<Vec<FoundInlineRecoveryCh
                 continue;
             }
         }
+        check_repair(control)?;
         offset = start + 1;
     }
     if chunks.is_empty() {
@@ -1279,17 +1366,25 @@ pub fn reconstruct_data_shards(
     Ok(out)
 }
 
-fn parse_available_inline_recovery_chunks(
+fn parse_available_inline_recovery_chunks_with_control(
     recovery_data: &[u8],
+    control: &crate::read_control::ReadControl,
 ) -> Result<Vec<InlineRecoveryChunk>> {
-    Ok(find_inline_recovery_chunks(recovery_data)?
-        .into_iter()
-        .map(|found| found.chunk)
-        .collect())
+    check_repair(control)?;
+    Ok(
+        find_inline_recovery_chunks_with_control(recovery_data, control)?
+            .into_iter()
+            .map(|found| found.chunk)
+            .collect(),
+    )
 }
 
-pub(crate) fn inline_recovery_chunk_counts(recovery_data: &[u8]) -> Result<(u64, u64)> {
-    let chunks = parse_available_inline_recovery_chunks(recovery_data)?;
+pub(crate) fn inline_recovery_chunk_counts_with_control(
+    recovery_data: &[u8],
+    control: &crate::read_control::ReadControl,
+) -> Result<(u64, u64)> {
+    check_repair(control)?;
+    let chunks = parse_available_inline_recovery_chunks_with_control(recovery_data, control)?;
     let first = chunks.first().ok_or(Error::BadRecoveryChunk)?;
     let expected = first.plan.recovery_shards;
     let mut indices = chunks
@@ -1301,7 +1396,11 @@ pub(crate) fn inline_recovery_chunk_counts(recovery_data: &[u8]) -> Result<(u64,
     Ok((indices.len() as u64, expected))
 }
 
-fn parse_inline_recovery_chunk(input: &[u8]) -> Result<InlineRecoveryChunk> {
+fn parse_inline_recovery_chunk_with_control(
+    input: &[u8],
+    control: &crate::read_control::ReadControl,
+) -> Result<InlineRecoveryChunk> {
+    check_repair(control)?;
     if input.len() < 0x48 || &input[..4] != b"{RB}" {
         return Err(Error::BadRecoveryChunk);
     }
@@ -1316,7 +1415,7 @@ fn parse_inline_recovery_chunk(input: &[u8]) -> Result<InlineRecoveryChunk> {
         return Err(Error::BadRecoveryChunk);
     }
     let expected_crc = read_u64(input, 0x04)?;
-    let actual_crc = crc64_xz(&input[0x0c..total_size_usize]);
+    let actual_crc = !repair_crc(&input[0x0c..total_size_usize], CRC64_XZ_INIT, control)?;
     if actual_crc != expected_crc {
         return Err(Error::BadRecoveryChunk);
     }
@@ -1352,6 +1451,7 @@ fn parse_inline_recovery_chunk(input: &[u8]) -> Result<InlineRecoveryChunk> {
     let mut data_shard_states = Vec::with_capacity(data_shards as usize);
     let mut pos = 0x40;
     for _ in 0..data_shards {
+        check_repair(control)?;
         data_shard_states.push(read_u64(input, pos)?);
         pos += 8;
     }
@@ -1374,9 +1474,26 @@ fn recover_damaged_shards(
     damaged: &[usize],
     recovery_shards: &[(usize, &[u8])],
 ) -> Result<()> {
+    recover_damaged_shards_with_control(
+        data_shards,
+        damaged,
+        recovery_shards,
+        &crate::read_control::ReadControl::default(),
+    )
+}
+
+fn recover_damaged_shards_with_control(
+    data_shards: &mut [Vec<u8>],
+    damaged: &[usize],
+    recovery_shards: &[(usize, &[u8])],
+    control: &crate::read_control::ReadControl,
+) -> Result<()> {
+    let mut poller = control.poller();
+    check_repair(control)?;
     let data_count = data_shards.len();
     let mut damaged_lookup = vec![false; data_count];
     for &data_index in damaged {
+        poller.check(0).map_err(|_| Error::Cancelled)?;
         if data_index >= data_count {
             return Err(Error::TooManyDamagedShards);
         }
@@ -1399,14 +1516,17 @@ fn recover_damaged_shards(
                 .collect()
         })
         .collect();
-    let inverse = invert_linear_system_matrix(gf, &equations)?;
+    let inverse = invert_linear_system_matrix_with_control(gf, &equations, control)?;
 
     let shard_len = data_shards.first().ok_or(Error::TooManyShards)?.len();
     for word_offset in (0..shard_len).step_by(2) {
+        poller.check(0).map_err(|_| Error::Cancelled)?;
         let mut rhs = Vec::with_capacity(recovery_shards.len());
         for &(row_index, parity) in recovery_shards {
+            poller.check(0).map_err(|_| Error::Cancelled)?;
             let mut value = u16::from_le_bytes([parity[word_offset], parity[word_offset + 1]]);
             for (data_index, shard) in data_shards.iter().enumerate() {
+                poller.check(0).map_err(|_| Error::Cancelled)?;
                 if damaged_lookup[data_index] {
                     continue;
                 }
@@ -1417,6 +1537,7 @@ fn recover_damaged_shards(
         }
         let solved = apply_inverse_matrix(gf, &inverse, &rhs)?;
         for (&data_index, &symbol) in damaged.iter().zip(&solved) {
+            poller.check(0).map_err(|_| Error::Cancelled)?;
             data_shards[data_index][word_offset..word_offset + 2]
                 .copy_from_slice(&symbol.to_le_bytes());
         }
@@ -1424,7 +1545,22 @@ fn recover_damaged_shards(
     Ok(())
 }
 
+#[cfg(test)]
 fn invert_linear_system_matrix(gf: &Gf16, matrix: &[Vec<u16>]) -> Result<Vec<Vec<u16>>> {
+    invert_linear_system_matrix_with_control(
+        gf,
+        matrix,
+        &crate::read_control::ReadControl::default(),
+    )
+}
+
+fn invert_linear_system_matrix_with_control(
+    gf: &Gf16,
+    matrix: &[Vec<u16>],
+    control: &crate::read_control::ReadControl,
+) -> Result<Vec<Vec<u16>>> {
+    let mut poller = control.poller();
+    check_repair(control)?;
     let n = matrix.len();
     if matrix.len() != n || matrix.iter().any(|row| row.len() != n) {
         return Err(Error::BadRecoveryChunk);
@@ -1432,10 +1568,12 @@ fn invert_linear_system_matrix(gf: &Gf16, matrix: &[Vec<u16>]) -> Result<Vec<Vec
     let mut matrix = matrix.to_vec();
     let mut inverse = vec![vec![0u16; n]; n];
     for (row, inverse_row) in inverse.iter_mut().enumerate() {
+        poller.check(0).map_err(|_| Error::Cancelled)?;
         inverse_row[row] = 1;
     }
 
     for col in 0..n {
+        poller.check(0).map_err(|_| Error::Cancelled)?;
         let pivot = (col..n)
             .find(|&row| matrix[row][col] != 0)
             .ok_or(Error::SingularElement)?;
@@ -1443,15 +1581,18 @@ fn invert_linear_system_matrix(gf: &Gf16, matrix: &[Vec<u16>]) -> Result<Vec<Vec
         inverse.swap(col, pivot);
         let inv = gf.inv(matrix[col][col])?;
         for value in &mut matrix[col] {
+            poller.check(0).map_err(|_| Error::Cancelled)?;
             *value = gf.mul(*value, inv);
         }
         for value in &mut inverse[col] {
+            poller.check(0).map_err(|_| Error::Cancelled)?;
             *value = gf.mul(*value, inv);
         }
 
         let pivot_matrix_row = matrix[col].clone();
         let pivot_inverse_row = inverse[col].clone();
         for row in 0..n {
+            poller.check(0).map_err(|_| Error::Cancelled)?;
             if row == col {
                 continue;
             }
@@ -2406,5 +2547,134 @@ mod tests {
         assert_eq!(reconstructed[0], first);
         assert_eq!(reconstructed[1], second);
         assert_eq!(reconstructed[2], third);
+    }
+}
+
+fn check_repair(control: &crate::read_control::ReadControl) -> Result<()> {
+    control.check().map_err(|_| Error::Cancelled)
+}
+fn repair_crc(
+    data: &[u8],
+    initial: u64,
+    control: &crate::read_control::ReadControl,
+) -> Result<u64> {
+    let mut state = initial;
+    for chunk in data.chunks(64 * 1024) {
+        check_repair(control)?;
+        state = crc64_update(chunk, state);
+    }
+    Ok(state)
+}
+fn repair_marker(
+    input: &[u8],
+    control: &crate::read_control::ReadControl,
+) -> Result<Option<usize>> {
+    for start in (0..input.len()).step_by(64 * 1024) {
+        check_repair(control)?;
+        let end = (start + 64 * 1024 + 3).min(input.len());
+        if let Some(offset) = find_recovery_marker(&input[start..end]) {
+            return Ok(Some(start + offset));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    fn scheduled(checks: usize) -> crate::read_control::ReadControl {
+        let token = crate::ReadCancellation::new();
+        let control = crate::read_control::ReadControl::new(Some(&token));
+        control.cancel_after_checks(checks);
+        control
+    }
+
+    #[test]
+    fn cancellation_stops_marker_search_and_chunk_checksums() {
+        let noise = vec![0; 256 * 1024];
+        assert_eq!(
+            find_inline_recovery_chunks_with_control(&noise, &scheduled(2)).unwrap_err(),
+            Error::Cancelled
+        );
+        let prefix = vec![42; 256 * 1024];
+        let data = build_structural_inline_recovery_data(&prefix, 10).unwrap();
+        assert_eq!(
+            parse_inline_recovery_chunk_with_control(&data, &scheduled(1)).unwrap_err(),
+            Error::Cancelled
+        );
+    }
+
+    #[test]
+    fn cancellation_stops_reconstruction_and_record_rebuilding() {
+        let prefix = vec![42; 128 * 1024];
+        let plan = plan_inline_recovery(prefix.len() as u64, 10).unwrap();
+        let mut shards = split_prefix_shards(&prefix, plan).unwrap();
+        let refs: Vec<_> = shards.iter().map(Vec::as_slice).collect();
+        let parity = encode_parity_shards(&refs, plan.recovery_shards as usize).unwrap();
+        shards[0].fill(0);
+        assert_eq!(
+            recover_damaged_shards_with_control(
+                &mut shards,
+                &[0],
+                &[(0, &parity[0])],
+                &scheduled(2)
+            )
+            .unwrap_err(),
+            Error::Cancelled
+        );
+        assert_eq!(
+            build_inline_recovery_data_for_plan_with_control(&prefix, plan, &scheduled(2))
+                .unwrap_err(),
+            Error::Cancelled
+        );
+    }
+
+    #[test]
+    fn raw_repair_never_tolerates_cancellation_as_a_failed_record_rebuild() {
+        let prefix = vec![42; 20_000];
+        let recovery = build_structural_inline_recovery_data(&prefix, 20).unwrap();
+        let mut archive = prefix;
+        let record_start = archive.len();
+        archive.extend_from_slice(&recovery);
+        archive.extend_from_slice(b"end bytes");
+        let expected = archive.clone();
+        // Damage one recovery chunk; surviving chunks can rebuild the record.
+        archive[record_start + 0x48] ^= 1;
+        let mut cancelled = 0;
+        let mut completed = 0;
+        for checks in (0..256).chain([usize::MAX]) {
+            let token = crate::ReadCancellation::new();
+            let control = crate::read_control::ReadControl::new(Some(&token));
+            control.cancel_after_checks(checks);
+            let options = InlineRepairOptions {
+                control: control.clone(),
+                ..Default::default()
+            };
+            let result = repair_inline_recovery_archive_with_report(&archive, &options);
+            match result {
+                Err(Error::Cancelled) => cancelled += 1,
+                Ok((data, report)) => {
+                    assert!(!token.is_cancelled());
+                    assert_eq!(data, expected);
+                    assert!(report.recovery_record_rebuilt);
+                    completed += 1;
+                }
+                other => panic!("unexpected repair result: {other:?}"),
+            }
+        }
+        assert!(cancelled > 0 && completed > 0);
+    }
+
+    #[test]
+    fn recovery_cancellation_has_the_public_cancelled_error_kind() {
+        assert_eq!(
+            crate::Error::from(Error::Cancelled),
+            crate::Error::Cancelled
+        );
+        assert_eq!(
+            crate::Error::Rar5Recovery(Error::Cancelled).kind(),
+            crate::ErrorKind::Cancelled
+        );
     }
 }

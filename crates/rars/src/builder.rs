@@ -29,12 +29,12 @@ const DOS_ARCHIVE_ATTR: u32 = 0x20;
 const RAR15_HOST_UNIX: u8 = 3;
 const RAR50_HOST_UNIX: u64 = 1;
 
-struct PendingArchive {
-    path: Option<PathBuf>,
+pub(crate) struct PendingArchive {
+    pub(crate) path: Option<PathBuf>,
 }
 
 impl PendingArchive {
-    fn create(destination: &Path) -> Result<(Self, fs::File)> {
+    pub(crate) fn create(destination: &Path) -> Result<(Self, fs::File)> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
         for _ in 0..128 {

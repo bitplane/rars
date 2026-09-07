@@ -65,6 +65,9 @@ struct Observation {
 }
 
 impl ReadControl {
+    pub(crate) fn cancellation(&self) -> Option<&ReadCancellation> {
+        self.0.as_ref().map(|state| &state.token)
+    }
     pub(crate) fn is_enabled(&self) -> bool {
         self.0.is_some()
     }
@@ -131,7 +134,11 @@ impl ReadControl {
             control: self.clone(),
         }
     }
-    pub(crate) fn write_all(&self, writer: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
+    pub(crate) fn write_all(
+        &self,
+        writer: &mut (impl Write + ?Sized),
+        bytes: &[u8],
+    ) -> io::Result<()> {
         if !self.is_enabled() {
             return writer.write_all(bytes);
         }

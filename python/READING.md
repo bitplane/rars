@@ -68,6 +68,7 @@ comment is returned on failure. The `comment` property keeps its default policy;
 `getcomment(member)` reads a member comment and does not accept these options.
 
 These options do not apply to initial archive parsing, member-comment or link
-helpers, repair, or the module-level volume helpers. Passwords remain supplied
+helpers or the module-level volume helpers. Repair uses a separate
+`cancellation=` argument; see [repair cancellation](REPAIRING.md). Passwords remain supplied
 through `pwd=` or the archive's configured password. A per-call password does not
 change the archive's configured password.

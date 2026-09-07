@@ -79,6 +79,7 @@ cooperative cancellation from another Python thread, with or without progress
 callbacks. Reader operations accept `options=rars.ReadOptions(...)` for
 cancellation, output ceilings and RAR5/7 decoder limits. See the
 [reader controls](python/READING.md) and [rewrite contract](python/REWRITING.md).
+Repair operations also accept `cancellation=`; see [repair cancellation](python/REPAIRING.md).
 
 For JS it's built to WebAssembly and published to
 [npm](https://www.npmjs.com/package/@bitplane/rars);

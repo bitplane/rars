@@ -267,6 +267,7 @@ impl FileHeader {
         session.write_file_to(archive, self, out)
     }
 
+    #[cfg(test)]
     pub(crate) fn decoded_data_unverified(
         &self,
         archive: &Archive,
@@ -276,6 +277,20 @@ impl FileHeader {
         Ok(self
             .decoded_data_with_decoder(archive, &mut decoder, password)?
             .data)
+    }
+
+    pub(super) fn decoded_recovery_data(
+        &self,
+        archive: &Archive,
+        password: Option<&[u8]>,
+        control: &crate::read_control::ReadControl,
+    ) -> Result<Vec<u8>> {
+        let mut decoder = Unpack50Decoder::new();
+        decoder.read_control = control.clone();
+        let decoded =
+            control.finish(self.decoded_data_with_decoder(archive, &mut decoder, password))?;
+        control.check()?;
+        Ok(decoded.data)
     }
 
     pub(super) fn decoded_comment_with_options(

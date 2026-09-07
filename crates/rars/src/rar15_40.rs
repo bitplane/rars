@@ -1602,17 +1602,34 @@ impl Archive {
 
     /// Repaired archive bytes plus whether any protected sector was rebuilt.
     pub fn repair_protect_head_with_report(&self) -> Result<crate::RecoveryRepairResult> {
+        self.repair_protect_head_with_options(crate::ArchiveReadOptions::new())
+    }
+
+    /// Repairs protected sectors with cooperative cancellation; other read limits do not apply.
+    pub fn repair_protect_head_with_options(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+    ) -> Result<crate::RecoveryRepairResult> {
+        options.check_cancelled()?;
+        let control = crate::read_control::ReadControl::new(options.cancellation);
         let (data, data_repaired) = if let Some(recovery) = self
             .new_subs()
             .find(|sub| sub.kind == NewSubKind::RecoveryRecord)
         {
-            repair_newsub_recovery_bytes(&self.source_bytes()?, self.sfx_offset, self, recovery)?
+            repair_newsub_recovery_bytes(
+                &self.source_bytes()?,
+                self.sfx_offset,
+                self,
+                recovery,
+                &control,
+            )?
         } else {
             let protect = self.protect_records().next().ok_or(Error::InvalidHeader(
                 "RAR 2.x archive does not contain a PROTECT_HEAD recovery record",
             ))?;
-            repair_protect_head_bytes(&self.source_bytes()?, self.sfx_offset, protect)?
+            repair_protect_head_bytes(&self.source_bytes()?, self.sfx_offset, protect, &control)?
         };
+        control.check()?;
         Ok(crate::RecoveryRepairResult {
             data,
             report: crate::RecoveryRepairReport {
@@ -2039,7 +2056,9 @@ fn repair_protect_head_bytes(
     source: &[u8],
     sfx_offset: usize,
     protect: &ProtectHeader,
+    control: &crate::read_control::ReadControl,
 ) -> Result<(Vec<u8>, bool)> {
+    control.check()?;
     if protect.rec_sectors == 0 {
         return Err(Error::InvalidHeader(
             "RAR 2.x recovery record has no parity sectors",
@@ -2094,6 +2113,7 @@ fn repair_protect_head_bytes(
 
     let mut damaged = Vec::new();
     for index in 0..repairable_blocks {
+        control.check()?;
         let sector_start = protected_start + index * 512;
         let sector = &source[sector_start..sector_start + 512];
         let actual = (!crc32(sector) & 0xffff) as u16;
@@ -2113,6 +2133,7 @@ fn repair_protect_head_bytes(
 
     let mut used_slots = vec![false; usize::from(protect.rec_sectors)];
     for &index in &damaged {
+        control.check()?;
         let slot = index % usize::from(protect.rec_sectors);
         if used_slots[slot] {
             return Err(Error::InvalidHeader(
@@ -2124,9 +2145,11 @@ fn repair_protect_head_bytes(
 
     let mut repaired = source.to_vec();
     for &missing_index in &damaged {
+        control.check()?;
         let slot = missing_index % usize::from(protect.rec_sectors);
         let mut sector = parity[slot * 512..slot * 512 + 512].to_vec();
         for index in (slot..repairable_blocks).step_by(usize::from(protect.rec_sectors)) {
+            control.check()?;
             if index == missing_index {
                 continue;
             }
@@ -2159,8 +2182,10 @@ fn repair_newsub_recovery_bytes(
     sfx_offset: usize,
     archive: &Archive,
     recovery: &NewSubHeader,
+    control: &crate::read_control::ReadControl,
 ) -> Result<(Vec<u8>, bool)> {
-    let recovery_data = newsub_recovery_data(archive, recovery)?;
+    control.check()?;
+    let recovery_data = newsub_recovery_data(archive, recovery, control)?;
     let expected_unpacked = usize::try_from(recovery.file.unp_size)
         .map_err(|_| Error::InvalidHeader("RAR 3.x recovery unpacked size overflows usize"))?;
     if recovery_data.len() != expected_unpacked {
@@ -2206,6 +2231,7 @@ fn repair_newsub_recovery_bytes(
 
     let mut damaged = Vec::new();
     for index in 0..protected_sectors {
+        control.check()?;
         let sector = protected_sector(source, protected_start, protected_len, index)?;
         let actual = (!crc32(&sector) & 0xffff) as u16;
         let expected = read_u16(tags, index * 2)?;
@@ -2224,6 +2250,7 @@ fn repair_newsub_recovery_bytes(
 
     let mut used_slots = vec![false; parity_sectors];
     for &index in &damaged {
+        control.check()?;
         let slot = index % parity_sectors;
         if used_slots[slot] {
             return Err(Error::InvalidHeader(
@@ -2235,14 +2262,17 @@ fn repair_newsub_recovery_bytes(
 
     let mut repaired = source.to_vec();
     for &missing_index in &damaged {
+        control.check()?;
         let slot = missing_index % parity_sectors;
         let mut sector = parity[slot * 512..slot * 512 + 512].to_vec();
         for index in (slot..protected_sectors).step_by(parity_sectors) {
+            control.check()?;
             if index == missing_index {
                 continue;
             }
             let other = protected_sector(&repaired, protected_start, protected_len, index)?;
             for (out, byte) in sector.iter_mut().zip(other) {
+                control.check()?;
                 *out ^= byte;
             }
         }
@@ -2263,7 +2293,11 @@ fn repair_newsub_recovery_bytes(
     Ok((repaired, true))
 }
 
-fn newsub_recovery_data(archive: &Archive, recovery: &NewSubHeader) -> Result<Vec<u8>> {
+fn newsub_recovery_data(
+    archive: &Archive,
+    recovery: &NewSubHeader,
+    control: &crate::read_control::ReadControl,
+) -> Result<Vec<u8>> {
     if recovery.file.is_encrypted() {
         return Err(Error::UnsupportedFeature {
             version: ArchiveVersion::Rar30,
@@ -2279,7 +2313,8 @@ fn newsub_recovery_data(archive: &Archive, recovery: &NewSubHeader) -> Result<Ve
         return recovery.file.stored_data(archive);
     }
     let mut session = DecoderSession::new(false);
-    session.decode_file_data(archive, &recovery.file)
+    session.read_control = control.clone();
+    control.finish(session.decode_file_data(archive, &recovery.file))
 }
 
 fn protected_sector(

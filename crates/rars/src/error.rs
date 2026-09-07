@@ -402,6 +402,7 @@ impl Error {
             Self::CrcMismatch { .. } | Self::Crc32Mismatch { .. } | Self::HashMismatch { .. } => {
                 ErrorKind::ChecksumMismatch
             }
+            Self::Rar5Recovery(crate::recovery::rar5::Error::Cancelled) => ErrorKind::Cancelled,
             Self::Io(_) | Self::Rar5Recovery(crate::recovery::rar5::Error::Io(_)) => ErrorKind::Io,
             Self::Rar50ScratchLimitExceeded { .. }
             | Self::RewriteStagingLimitExceeded { .. }
@@ -461,7 +462,11 @@ impl From<crate::codec::Error> for Error {
 
 impl From<crate::recovery::rar5::Error> for Error {
     fn from(error: crate::recovery::rar5::Error) -> Self {
-        Self::Rar5Recovery(error)
+        if error == crate::recovery::rar5::Error::Cancelled {
+            Self::Cancelled
+        } else {
+            Self::Rar5Recovery(error)
+        }
     }
 }
 

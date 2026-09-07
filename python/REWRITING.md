@@ -320,7 +320,8 @@ exceptions do not cancel the caller's token; callbacks still re-raise their
 original exception. The token applies to per-write staging and writer work,
 not the eager metadata reads in `from_archive()`. Reader methods use
 `ReadOptions(cancellation=token)` instead; see [reader controls](READING.md).
-Repair methods do not yet accept cancellation. Writes release the GIL, including
+Repair methods also accept `cancellation=`; see [repair cancellation](REPAIRING.md).
+Writes release the GIL, including
 volume-file publication. Volume cancellation may leave already published parts; a single
 path write retains its existing staged-publication guarantee.
 

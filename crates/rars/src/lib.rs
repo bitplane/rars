@@ -78,11 +78,11 @@ pub use write_progress::{WriteOperation, WriteProgress, WriteProgressEvent};
 
 #[derive(Debug, Clone, Copy, Default)]
 #[non_exhaustive]
-/// Options used while parsing archives, extracting members or decoding comments.
+/// Options used while parsing archives, extracting members, decoding comments or repairing.
 pub struct ArchiveReadOptions<'a> {
     /// Password bytes used for encrypted headers or payloads.
     pub password: Option<&'a [u8]>,
-    /// Cooperative cancellation for this parsing or extraction call. Parsing
+    /// Cooperative cancellation for this parsing, extraction or repair call. Parsing
     /// does not retain the token for later extraction. A cancelled token stays
     /// cancelled; use a new token for a new operation. Partial output may remain.
     /// Blocked caller I/O and indivisible library work cannot be preempted.
@@ -922,9 +922,20 @@ impl Archive {
         &self,
         password: Option<&[u8]>,
     ) -> Result<RecoveryRepairResult> {
+        self.repair_recovery_with_options(ArchiveReadOptions::with_optional_password(password))
+    }
+
+    /// Repairs embedded recovery data with a password and cooperative cancellation.
+    /// Only password and cancellation apply; parsing and member-output limits do
+    /// not describe repair workspace or the complete repaired archive.
+    pub fn repair_recovery_with_options(
+        &self,
+        options: ArchiveReadOptions<'_>,
+    ) -> Result<RecoveryRepairResult> {
+        options.check_cancelled()?;
         match self {
-            Self::Rar15To40(archive) => archive.repair_protect_head_with_report(),
-            Self::Rar50Plus(archive) => archive.repair_recovery_with_report(password),
+            Self::Rar15To40(archive) => archive.repair_protect_head_with_options(options),
+            Self::Rar50Plus(archive) => archive.repair_recovery_with_options(options),
             Self::Rar13(_) => Err(Error::UnsupportedFamilyFeature {
                 family: ArchiveFamily::Rar13,
                 feature: "recovery repair for RAR 1.3/1.4 archives",
@@ -1106,6 +1117,35 @@ pub struct RecoveryRepairReport {
 pub struct RecoveryRepairResult {
     pub data: Vec<u8>,
     pub report: RecoveryRepairReport,
+}
+
+impl RecoveryRepairResult {
+    /// Publishes repaired bytes beside the destination, replacing it only after
+    /// writing, syncing and a final cancellation check succeed. Cancellation
+    /// after the final check cannot interrupt the rename. Temporary output is
+    /// removed on failure; the destination is untouched until publication.
+    pub fn write_to_path(
+        &self,
+        path: &std::path::Path,
+        cancellation: Option<&ReadCancellation>,
+    ) -> Result<()> {
+        let control = crate::read_control::ReadControl::new(cancellation);
+        control.check()?;
+        let (mut pending, mut output) = crate::builder::PendingArchive::create(path)?;
+        let result = control
+            .finish(
+                control
+                    .write_all(&mut output, &self.data)
+                    .map_err(Error::from),
+            )
+            .and_then(|()| output.sync_all().map_err(Error::from));
+        drop(output);
+        result?;
+        control.check()?;
+        std::fs::rename(pending.path.as_ref().unwrap(), path)?;
+        pending.path = None;
+        Ok(())
+    }
 }
 
 impl ArchiveReader {
