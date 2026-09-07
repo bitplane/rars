@@ -69,7 +69,7 @@ impl PreparedBlock {
     fn len(&self) -> Result<u64> {
         (self.header.len() as u64)
             .checked_add(self.payload_len)
-            .ok_or(Error::InvalidHeader("RAR 5 archive block size overflows"))
+            .ok_or(Error::InvalidArgument("RAR 5 archive block size overflows"))
     }
 }
 
@@ -242,7 +242,7 @@ pub(super) fn write_archive(
     let body_len = blocks.iter().try_fold(0u64, |total, block| {
         total
             .checked_add(block.len()?)
-            .ok_or(Error::InvalidHeader("RAR 5 archive body size overflows"))
+            .ok_or(Error::InvalidArgument("RAR 5 archive body size overflows"))
     })?;
 
     // Quick-open stores how far back each cached header sits from the
@@ -711,7 +711,7 @@ fn write_payload(
                 }
                 // Inline payloads are encrypted where they are built, and
                 // nothing is encrypted twice.
-                Payload::Inline(_) | Payload::Encrypted { .. } => Err(Error::InvalidHeader(
+                Payload::Inline(_) | Payload::Encrypted { .. } => Err(Error::WriterFailure(
                     "RAR 5 payload cannot be encrypted here",
                 )),
             }
@@ -1018,7 +1018,7 @@ pub(super) fn write_volumes(
     resources: &WriterResources,
 ) -> Result<()> {
     if max_payload_per_volume == 0 {
-        return Err(Error::InvalidHeader("RAR 5 volume payload size is zero"));
+        return Err(Error::InvalidArgument("RAR 5 volume payload size is zero"));
     }
     for entry in entries {
         super::validate_entry(entry)?;

@@ -22,6 +22,8 @@ pub enum ErrorKind {
     ResourceLimit,
     Cancelled,
     SourceChanged,
+    /// Archive construction failed because the writer reached an invalid state.
+    WriterFailure,
 }
 
 impl ErrorKind {
@@ -42,6 +44,7 @@ impl ErrorKind {
             Self::ResourceLimit => "RESOURCE_LIMIT",
             Self::Cancelled => "CANCELLED",
             Self::SourceChanged => "SOURCE_CHANGED",
+            Self::WriterFailure => "WRITE_FAILED",
         }
     }
 }
@@ -79,6 +82,7 @@ pub enum Error {
     InputSymlink,
     UnsafePath(&'static str),
     SourceChanged(&'static str),
+    WriterFailure(&'static str),
     AtArchiveOffset {
         offset: usize,
         source: Box<Error>,
@@ -205,7 +209,7 @@ impl std::fmt::Display for Error {
             Self::EntryNotFound => f.write_str("no such archive entry"),
             Self::DuplicateEntry => f.write_str("duplicate archive entry name"),
             Self::InputSymlink => f.write_str("input is a symlink; refusing to follow it"),
-            Self::UnsafePath(msg) | Self::SourceChanged(msg) => f.write_str(msg),
+            Self::UnsafePath(msg) | Self::SourceChanged(msg) | Self::WriterFailure(msg) => f.write_str(msg),
             Self::AtArchiveOffset { offset, source } => {
                 write!(f, "at archive offset {offset:#x}: {source}")
             }
@@ -418,6 +422,7 @@ impl Error {
             Self::InputSymlink | Self::InvalidArgument(_) => ErrorKind::InvalidArgument,
             Self::UnsafePath(_) => ErrorKind::UnsafePath,
             Self::SourceChanged(_) => ErrorKind::SourceChanged,
+            Self::WriterFailure(_) => ErrorKind::WriterFailure,
             Self::TooShort
             | Self::InvalidHeader(_)
             | Self::Codec(_)
@@ -553,6 +558,10 @@ mod tests {
                 ErrorKind::ResourceLimit,
             ),
             (Error::Cancelled, ErrorKind::Cancelled),
+            (
+                Error::WriterFailure("layout failure"),
+                ErrorKind::WriterFailure,
+            ),
             (Error::EntryNotFound, ErrorKind::EntryNotFound),
             (Error::DuplicateEntry, ErrorKind::DuplicateEntry),
             (Error::InputSymlink, ErrorKind::InvalidArgument),

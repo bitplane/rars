@@ -1844,6 +1844,7 @@ fn map_error(error: rars_rs::Error) -> PyErr {
         ErrorKind::EntryNotFound => PyKeyError::new_err(message),
         ErrorKind::ResourceLimit => PyMemoryError::new_err(message),
         ErrorKind::Cancelled => PyInterruptedError::new_err(message),
+        ErrorKind::WriterFailure => pyo3::exceptions::PyRuntimeError::new_err(message),
         _ => BadRarFile::new_err(message),
     }
 }
@@ -2039,6 +2040,7 @@ mod tests {
                     dictionary_size: 1,
                 },
                 CoreError::Cancelled,
+                CoreError::WriterFailure("layout failure"),
                 CoreError::UnsafePath("refused path"),
                 CoreError::InvalidArgument("bad option"),
                 CoreError::InvalidHeader("unsafe; a password is required; I/O error"),
@@ -2066,6 +2068,9 @@ mod tests {
                     }
                     rars_rs::ErrorKind::Cancelled => {
                         exception.is_instance_of::<PyInterruptedError>(py)
+                    }
+                    rars_rs::ErrorKind::WriterFailure => {
+                        exception.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py)
                     }
                     rars_rs::ErrorKind::UnsafePath => {
                         exception.is_instance_of::<UnsafeArchivePath>(py)

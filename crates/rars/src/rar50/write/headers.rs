@@ -118,7 +118,7 @@ pub(crate) fn encrypted_header_block(
     getrandom::fill(&mut iv).map_err(|error| {
         crate::write_stream::entropy_error(error, "RAR 5 writer could not generate encryption IV")
     })?;
-    let padded_len = header.len().checked_add(15).ok_or(Error::InvalidHeader(
+    let padded_len = header.len().checked_add(15).ok_or(Error::InvalidArgument(
         "RAR 5 encrypted header size overflows",
     ))? & !15;
     let mut encrypted_header = header;
@@ -166,7 +166,7 @@ pub(super) fn file_specific(
     is_directory: bool,
 ) -> Result<Vec<u8>> {
     if name.is_empty() {
-        return Err(Error::InvalidHeader("RAR 5 file name is empty"));
+        return Err(Error::InvalidArgument("RAR 5 file name is empty"));
     }
     let mut file_flags = if data_crc32.is_some() { FHFL_CRC32 } else { 0 };
     if is_directory {
@@ -206,12 +206,12 @@ pub(super) fn write_mtime_record(extra: &mut Vec<u8>, seconds: Option<u32>, nano
 
 pub(super) fn archive_metadata_record(metadata: ArchiveMetadataEntry<'_>) -> Result<Vec<u8>> {
     if metadata.name.is_none() && metadata.creation_time.is_none() {
-        return Err(Error::InvalidHeader(
+        return Err(Error::InvalidArgument(
             "RAR 5 archive metadata writer needs a name or creation time",
         ));
     }
     if metadata.name.is_some() && metadata.creation_time.is_none() {
-        return Err(Error::InvalidHeader(
+        return Err(Error::InvalidArgument(
             "RAR 5 archive metadata name needs a creation time",
         ));
     }
@@ -227,7 +227,9 @@ pub(super) fn archive_metadata_record(metadata: ArchiveMetadataEntry<'_>) -> Res
     write_vint(&mut record, flags);
     if let Some(name) = metadata.name {
         if name.is_empty() {
-            return Err(Error::InvalidHeader("RAR 5 archive metadata name is empty"));
+            return Err(Error::InvalidArgument(
+                "RAR 5 archive metadata name is empty",
+            ));
         }
         write_vint(&mut record, name.len() as u64);
         record.extend_from_slice(name);
@@ -348,7 +350,7 @@ pub(super) fn header_encryption_password<'a>(
     let first = passwords.next().ok_or(Error::NeedPassword)?;
     for password in passwords {
         if password != first {
-            return Err(Error::InvalidHeader(
+            return Err(Error::InvalidArgument(
                 "RAR 5 header-encrypted writer needs one shared password",
             ));
         }

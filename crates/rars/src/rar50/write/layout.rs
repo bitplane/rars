@@ -81,10 +81,10 @@ pub(super) fn resolve_layout(inputs: &LayoutInputs<'_>) -> Result<ResolvedLayout
             .checked_add(inputs.head_crypt_len)
             .and_then(|value| value.checked_add(main_header_len))
             .and_then(|value| value.checked_add(inputs.body_len))
-            .ok_or(Error::InvalidHeader("RAR 5 archive layout overflows"))?;
+            .ok_or(Error::InvalidArgument("RAR 5 archive layout overflows"))?;
         let recovery_position = quick_open_position
             .checked_add(quick_open_block_len)
-            .ok_or(Error::InvalidHeader("RAR 5 archive layout overflows"))?;
+            .ok_or(Error::InvalidArgument("RAR 5 archive layout overflows"))?;
 
         let next_quick_open = quick_open_offset.map(|_| quick_open_position - signature_len);
         let next_recovery = recovery_offset.map(|_| recovery_position - signature_len);
@@ -102,7 +102,7 @@ pub(super) fn resolve_layout(inputs: &LayoutInputs<'_>) -> Result<ResolvedLayout
         recovery_offset = next_recovery;
     }
 
-    Err(Error::InvalidHeader(
+    Err(Error::WriterFailure(
         "RAR 5 writer could not resolve archive layout offsets",
     ))
 }
@@ -147,7 +147,7 @@ pub(super) fn stored_service_block_len(
     )?;
     emitted_header_len(header.len() as u64, header_encrypted)
         .checked_add(data_len)
-        .ok_or(Error::InvalidHeader("RAR 5 service block size overflows"))
+        .ok_or(Error::InvalidArgument("RAR 5 service block size overflows"))
 }
 
 /// An encrypted header is a 16-byte IV followed by the plaintext padded up to

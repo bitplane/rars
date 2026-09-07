@@ -746,6 +746,7 @@ impl FileHeader {
             | Error::InVolume { .. }
             | Error::Cancelled
             | Error::InvalidArgument(_)
+            | Error::WriterFailure(_)
             | Error::EntryNotFound
             | Error::DuplicateEntry
             | Error::InputSymlink

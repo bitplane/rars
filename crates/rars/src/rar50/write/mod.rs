@@ -246,7 +246,7 @@ impl VolumeSink for CollectedVolumes {
             .lock()
             .expect("volume collector is not poisoned");
         if volumes.len() as u64 != index {
-            return Err(Error::InvalidHeader("RAR 5 volumes arrived out of order"));
+            return Err(Error::WriterFailure("RAR 5 volumes arrived out of order"));
         }
         volumes.push(Vec::new());
         drop(volumes);
@@ -262,7 +262,7 @@ impl VolumeSink for CollectedVolumes {
             .lock()
             .expect("volume collector is not poisoned");
         if volumes[index as usize].len() as u64 != len {
-            return Err(Error::InvalidHeader(
+            return Err(Error::WriterFailure(
                 "RAR 5 volume length does not match what was written",
             ));
         }
@@ -349,7 +349,7 @@ pub fn write_streaming_volumes_with_progress(
     // A set with no members produces no volumes at all: the writer would
     // return success having never asked the sink for a single one.
     if entries.is_empty() {
-        return Err(Error::InvalidHeader(
+        return Err(Error::InvalidArgument(
             "RAR 5 volume writer needs at least one member",
         ));
     }
@@ -730,11 +730,10 @@ fn encrypt_reader_to(
         remaining -= chunk_size as u64;
     }
     let final_plain = usize::try_from(remaining)
-        .map_err(|_| Error::InvalidHeader("RAR 5 encrypted data size overflows"))?;
-    let final_padded = final_plain
-        .checked_add(15)
-        .ok_or(Error::InvalidHeader("RAR 5 encrypted data size overflows"))?
-        & !15;
+        .map_err(|_| Error::InvalidArgument("RAR 5 encrypted data size overflows"))?;
+    let final_padded = final_plain.checked_add(15).ok_or(Error::InvalidArgument(
+        "RAR 5 encrypted data size overflows",
+    ))? & !15;
     if final_padded != 0 {
         crate::write_progress::check_cancelled(progress)?;
         buffer[..final_padded].fill(0);
@@ -929,7 +928,9 @@ fn encrypted_payload(
     let padded_len = encrypted_data
         .len()
         .checked_add(15)
-        .ok_or(Error::InvalidHeader("RAR 5 encrypted data size overflows"))?
+        .ok_or(Error::InvalidArgument(
+            "RAR 5 encrypted data size overflows",
+        ))?
         & !15;
     encrypted_data.resize(padded_len, 0);
     Rar50Cipher::new(keys.key, iv)
@@ -948,7 +949,7 @@ fn encrypted_payload(
 
 fn validate_recovery_percent(percent: u64) -> Result<()> {
     if !(1..=100).contains(&percent) {
-        return Err(Error::InvalidHeader(
+        return Err(Error::InvalidArgument(
             "RAR 5 recovery percent must be in 1..=100",
         ));
     }
@@ -957,7 +958,7 @@ fn validate_recovery_percent(percent: u64) -> Result<()> {
 
 fn validate_nonempty_password(password: &[u8]) -> Result<()> {
     if password.is_empty() {
-        return Err(Error::InvalidHeader(
+        return Err(Error::InvalidArgument(
             "RAR 5 encrypted writer needs a non-empty password",
         ));
     }
@@ -966,7 +967,7 @@ fn validate_nonempty_password(password: &[u8]) -> Result<()> {
 
 fn validate_file_entry(name: &[u8]) -> Result<()> {
     if name.is_empty() {
-        return Err(Error::InvalidHeader("RAR 5 file name is empty"));
+        return Err(Error::InvalidArgument("RAR 5 file name is empty"));
     }
     Ok(())
 }
@@ -994,7 +995,7 @@ fn validate_entry(entry: &ArchiveEntry) -> Result<()> {
         ));
     }
     if entry.is_directory && entry.source.len()? != 0 {
-        return Err(Error::InvalidHeader(
+        return Err(Error::InvalidArgument(
             "directory entries cannot carry file contents",
         ));
     }
@@ -1009,7 +1010,7 @@ fn validate_entry(entry: &ArchiveEntry) -> Result<()> {
     }
     if let Some(nanos) = entry.mtime_nanoseconds {
         if entry.mtime.is_none() || nanos >= 1_000_000_000 {
-            return Err(Error::InvalidHeader(
+            return Err(Error::InvalidArgument(
                 "fractional modification time requires seconds and nanoseconds below one second",
             ));
         }
@@ -1035,7 +1036,7 @@ fn validate_service(service: &ServiceEntry) -> Result<()> {
     }
     // An explicit empty comment is distinct from having no comment record.
     if service.data.is_empty() && service.name != b"CMT" {
-        return Err(Error::InvalidHeader("RAR 5 file service data is empty"));
+        return Err(Error::InvalidArgument("RAR 5 file service data is empty"));
     }
     match &service.password {
         Some(password) => validate_nonempty_password(password),
@@ -1045,6 +1046,27 @@ fn validate_service(service: &ServiceEntry) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn invalid_writer_inputs_and_internal_failures_have_distinct_categories() {
+        for error in [
+            super::validate_file_entry(b"").unwrap_err(),
+            super::validate_nonempty_password(b"").unwrap_err(),
+            super::validate_recovery_percent(101).unwrap_err(),
+            super::filter_policy::dictionary_size_fields(0, 0).unwrap_err(),
+            super::filter_policy::dictionary_size_fields(1, 131073).unwrap_err(),
+            super::headers::header_encryption_password([&b"one"[..], &b"two"[..]].into_iter())
+                .unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), crate::ErrorKind::InvalidArgument, "{error}");
+        }
+        let mut volumes = super::CollectedVolumes::default();
+        let error = super::VolumeSink::start_volume(&mut volumes, 1)
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), crate::ErrorKind::WriterFailure);
+        assert_eq!(error.kind().code(), "WRITE_FAILED");
+    }
+
     use super::filter_policy::{
         encode_member_with_auto_size_filter_progress, encode_member_with_filter_policy_and_progress,
     };
@@ -1784,7 +1806,7 @@ mod tests {
 
         assert!(matches!(
             Rar50Writer::new(options).entries(entries.to_vec()).finish(),
-            Err(Error::InvalidHeader(
+            Err(Error::InvalidArgument(
                 "RAR 5 v0 dictionary size must be a power-of-two multiple of 128 KiB"
             ))
         ));

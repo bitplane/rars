@@ -49,7 +49,7 @@ pub(super) fn encode_member_with_filter_policy_candidates_and_progress(
     mut progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
 ) -> Result<Vec<u8>> {
     let mut remaining = candidates.iter().copied();
-    let first = remaining.next().ok_or(Error::InvalidHeader(
+    let first = remaining.next().ok_or(Error::WriterFailure(
         "RAR 5 compression level has no encoder options",
     ))?;
 
@@ -163,7 +163,7 @@ fn match_candidates_for_level(level: u8) -> Result<usize> {
         3 => Ok(128),
         4 => Ok(256),
         5 => Ok(512),
-        _ => Err(Error::InvalidHeader(
+        _ => Err(Error::InvalidArgument(
             "RAR 5 compression level must be in the range 0..5",
         )),
     }
@@ -184,7 +184,7 @@ pub(super) fn encode_options_for_level(
     let level = resolved_level(level);
     let candidates = match_candidates_for_level(level)?;
     let max_match_distance = usize::try_from(dictionary_size).map_err(|_| {
-        Error::InvalidHeader("RAR 5 dictionary size exceeds this platform's address space")
+        Error::InvalidArgument("RAR 5 dictionary size exceeds this platform's address space")
     })?;
     Ok(EncodeOptions::new(candidates)
         // Looking one byte further ahead before settling for the match at hand
@@ -366,31 +366,31 @@ pub(super) fn validate_dictionary_size(target: crate::ArchiveVersion, size: u64)
 
 pub(super) fn dictionary_size_fields(algorithm_version: u8, size: u64) -> Result<(u8, u8)> {
     if size == 0 {
-        return Err(Error::InvalidHeader(
+        return Err(Error::InvalidArgument(
             "RAR 5 dictionary size must be non-zero",
         ));
     }
     match algorithm_version {
         0 => {
             if size < DEFAULT_RAR50_DICTIONARY_SIZE {
-                return Err(Error::InvalidHeader(
+                return Err(Error::InvalidArgument(
                     "RAR 5 v0 dictionary size must be at least 128 KiB",
                 ));
             }
             if !size.is_multiple_of(DEFAULT_RAR50_DICTIONARY_SIZE) {
-                return Err(Error::InvalidHeader(
+                return Err(Error::InvalidArgument(
                     "RAR 5 v0 dictionary size must be a power-of-two multiple of 128 KiB",
                 ));
             }
             let multiple = size / DEFAULT_RAR50_DICTIONARY_SIZE;
             if !multiple.is_power_of_two() {
-                return Err(Error::InvalidHeader(
+                return Err(Error::InvalidArgument(
                     "RAR 5 v0 dictionary size must be a power-of-two multiple of 128 KiB",
                 ));
             }
             let power = multiple.trailing_zeros();
             if power > 15 {
-                return Err(Error::InvalidHeader(
+                return Err(Error::InvalidArgument(
                     "RAR 5 v0 dictionary size exceeds 4 GiB",
                 ));
             }
@@ -398,7 +398,7 @@ pub(super) fn dictionary_size_fields(algorithm_version: u8, size: u64) -> Result
         }
         1 => {
             if !size.is_multiple_of(4096) {
-                return Err(Error::InvalidHeader(
+                return Err(Error::InvalidArgument(
                     "RAR 7 dictionary size must be a multiple of 4 KiB",
                 ));
             }
@@ -406,7 +406,7 @@ pub(super) fn dictionary_size_fields(algorithm_version: u8, size: u64) -> Result
             let mut power = 0u8;
             while units > 63 {
                 if !units.is_multiple_of(2) || power == 31 {
-                    return Err(Error::InvalidHeader(
+                    return Err(Error::InvalidArgument(
                         "RAR 7 dictionary size is not encodable",
                     ));
                 }
@@ -414,13 +414,13 @@ pub(super) fn dictionary_size_fields(algorithm_version: u8, size: u64) -> Result
                 power += 1;
             }
             if units < 32 {
-                return Err(Error::InvalidHeader(
+                return Err(Error::InvalidArgument(
                     "RAR 7 dictionary size must be at least 128 KiB",
                 ));
             }
             Ok((power, (units - 32) as u8))
         }
-        _ => Err(Error::InvalidHeader(
+        _ => Err(Error::InvalidArgument(
             "RAR 5 unknown compression algorithm version",
         )),
     }

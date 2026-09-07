@@ -379,7 +379,7 @@ fn compress_whole_member(
                     return Err(Error::Cancelled);
                 }
                 let size = usize::try_from(input_size)
-                    .map_err(|_| Error::InvalidHeader("entry size overflows usize"))?;
+                    .map_err(|_| Error::InvalidArgument("entry size overflows usize"))?;
                 let mut data = vec![0; size];
                 let mut reader = source.open()?;
                 for chunk in data.chunks_mut(plan.block_size.max(1)) {
@@ -713,7 +713,7 @@ fn read_chunk(
         return Ok(std::mem::take(&mut stream.pushback));
     }
     let wanted = usize::try_from(stream.remaining.min(block_size as u64))
-        .map_err(|_| Error::InvalidHeader("RAR 5 block size overflows usize"))?;
+        .map_err(|_| Error::InvalidArgument("RAR 5 block size overflows usize"))?;
     let mut data = vec![0u8; wanted];
     // Solid planning can retain every member, but only the current input
     // needs a reader. Release it at EOF, even when a block has pushback.
