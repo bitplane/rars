@@ -122,13 +122,76 @@ impl Archive {
         let target = self
             .read_member_at(index, password)?
             .ok_or(crate::Error::EntryNotFound)?;
-        if target.is_empty() || target.contains(&0) {
-            return Err(crate::Error::InvalidArgument(
-                "legacy symbolic link target is empty or contains NUL",
-            )
-            .at_entry(member.meta.name, "reading link target"));
-        }
+        validate_legacy_link_target(&target, &member.meta.name)?;
         Ok(Some(target))
+    }
+
+    /// Decode all legacy Unix link targets with one controlled traversal.
+    /// Results follow original member order, including `None` for directories,
+    /// ordinary files and modern redirections. No payloads are read when there
+    /// are no legacy links. This never follows filesystem links.
+    ///
+    /// Independent non-link payloads are skipped. Solid predecessors through the
+    /// last link are decoded and verified, but discarded. All collected targets
+    /// must pass integrity and target validation before any are returned. Targets
+    /// are retained in memory; this password-only helper uses default extraction
+    /// policies and does not retain limits supplied during parsing.
+    pub fn legacy_symlink_targets(
+        &self,
+        password: Option<&[u8]>,
+    ) -> crate::Result<Vec<Option<Vec<u8>>>> {
+        use crate::{ArchiveReadOptions, Error, ExtractionDecision, SharedBuffer};
+        use std::sync::{Arc, Mutex};
+
+        let members: Vec<_> = self.members().collect();
+        let Some(last) = members
+            .iter()
+            .rposition(|member| member.is_legacy_unix_symlink())
+        else {
+            return Ok((0..members.len()).map(|_| None).collect());
+        };
+        let mut targets: Vec<Option<SharedBuffer>> = (0..members.len()).map(|_| None).collect();
+        let solid = match self {
+            Archive::Rar15To40(archive) => archive.main.is_solid(),
+            _ => false,
+        };
+        let mut index = 0;
+        self.extract_with_control(
+            ArchiveReadOptions::with_optional_password(password),
+            |member| {
+                let current = index;
+                index += 1;
+                if current > last {
+                    return Ok(ExtractionDecision::Stop);
+                }
+                if member.is_legacy_unix_symlink() {
+                    let bytes = Arc::new(Mutex::new(Some(Vec::new())));
+                    targets[current] = Some(SharedBuffer(bytes.clone()));
+                    Ok(ExtractionDecision::Extract(Box::new(SharedBuffer(bytes))))
+                } else if solid && !member.meta.is_directory && !member.meta.is_redirection {
+                    Ok(ExtractionDecision::Extract(Box::new(std::io::sink())))
+                } else {
+                    Ok(ExtractionDecision::Skip)
+                }
+            },
+        )?;
+        targets
+            .into_iter()
+            .zip(members)
+            .map(|(target, member)| {
+                if !member.is_legacy_unix_symlink() {
+                    return Ok(None);
+                }
+                let target =
+                    target
+                        .and_then(|target| target.lock().take())
+                        .ok_or(Error::InvalidHeader(
+                            "legacy link target disappeared while reading",
+                        ))?;
+                validate_legacy_link_target(&target, &member.meta.name)?;
+                Ok(Some(target))
+            })
+            .collect()
     }
 
     /// Configure a builder with supported source format, solid and encryption settings.
@@ -497,6 +560,16 @@ pub(crate) fn special_entry(meta: &ArchiveMemberMeta) -> bool {
             && !matches!(kind, 0 | 0o100000)
             && !(meta.is_directory && kind == 0o040000))
         || (meta.attr_source() == AttrSource::Dos && meta.file_attr & 0x400 != 0)
+}
+
+fn validate_legacy_link_target(target: &[u8], name: &[u8]) -> crate::Result<()> {
+    if target.is_empty() || target.contains(&0) {
+        return Err(crate::Error::InvalidArgument(
+            "legacy symbolic link target is empty or contains NUL",
+        )
+        .at_entry(name.to_vec(), "reading link target"));
+    }
+    Ok(())
 }
 
 impl crate::ArchiveMember {

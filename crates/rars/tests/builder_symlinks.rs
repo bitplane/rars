@@ -217,6 +217,11 @@ fn legacy_link_payloads_are_decoded_with_integrity_and_password_checks() {
             .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, Some(0o100644))
             .unwrap();
         let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        assert!(archive.legacy_symlink_targets(None).is_err());
+        assert_eq!(
+            archive.legacy_symlink_targets(Some(b"secret")).unwrap(),
+            vec![Some(b"missing-\xff".to_vec()), None]
+        );
         assert!(archive.legacy_symlink_target_at(0, None).is_err());
         assert_eq!(
             archive
@@ -233,5 +238,108 @@ fn legacy_link_payloads_are_decoded_with_integrity_and_password_checks() {
         assert!(archive
             .legacy_symlink_target_at(2, Some(b"secret"))
             .is_err());
+    }
+}
+
+#[test]
+fn batch_link_targets_keep_member_order_and_raw_bytes() {
+    for format in [
+        ArchiveVersion::Rar20,
+        ArchiveVersion::Rar29,
+        ArchiveVersion::Rar40,
+    ] {
+        for solid in [false, true] {
+            let mut builder = Builder::new(format).solid(solid);
+            builder
+                .add_directory(b"directory".to_vec(), None, None)
+                .unwrap();
+            builder
+                .add_unix_symlink(
+                    b"link1".to_vec(),
+                    b"../raw-\xff".to_vec(),
+                    false,
+                    None,
+                    None,
+                )
+                .unwrap();
+            builder
+                .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+                .unwrap();
+            builder
+                .add_unix_symlink(b"link2".to_vec(), b"/absolute".to_vec(), false, None, None)
+                .unwrap();
+            let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+            assert_eq!(
+                archive.legacy_symlink_targets(None).unwrap(),
+                vec![
+                    None,
+                    Some(b"../raw-\xff".to_vec()),
+                    None,
+                    Some(b"/absolute".to_vec())
+                ]
+            );
+        }
+    }
+}
+
+#[test]
+fn batch_link_targets_reject_invalid_targets_and_corrupt_dependencies() {
+    use rars::ErrorKind;
+    for target in [b"".as_slice(), b"bad\0target"] {
+        let mut builder = Builder::new(ArchiveVersion::Rar29).store(true);
+        builder
+            .add_bytes(b"link".to_vec(), target.to_vec(), None, Some(0o120777))
+            .unwrap();
+        let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        let error = archive.legacy_symlink_targets(None).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidArgument);
+        assert_eq!(error.entry_context().unwrap().0, b"link");
+    }
+    // These ordinary data entries intentionally carry native Unix link modes,
+    // exercising compressed solid links from existing archives too.
+    for solid in [false, true] {
+        let mut builder = Builder::new(ArchiveVersion::Rar29).solid(solid);
+        builder
+            .add_bytes(b"first".to_vec(), b"prefix".repeat(100), None, None)
+            .unwrap();
+        builder
+            .add_bytes(
+                b"link1".to_vec(),
+                b"target one".to_vec(),
+                None,
+                Some(0o120777),
+            )
+            .unwrap();
+        builder
+            .add_bytes(
+                b"link2".to_vec(),
+                b"target two".to_vec(),
+                None,
+                Some(0o120777),
+            )
+            .unwrap();
+        let data = builder.to_bytes().unwrap();
+        let mut archive = ArchiveReader::read_owned(data).unwrap();
+        // Alter the parsed expected CRC to isolate integrity failure from decoding.
+        if let rars::Archive::Rar15To40(legacy) = &mut archive {
+            if let rars::rar15_40::Block::File(file) = &mut legacy.blocks[0] {
+                file.file_crc ^= 1;
+            } else {
+                panic!("expected first file");
+            }
+        }
+        let result = archive.legacy_symlink_targets(None);
+        if solid {
+            assert_eq!(result.unwrap_err().kind(), ErrorKind::ChecksumMismatch);
+        } else {
+            assert_eq!(
+                result.unwrap(),
+                vec![
+                    None,
+                    Some(b"target one".to_vec()),
+                    Some(b"target two".to_vec())
+                ]
+            );
+        }
     }
 }

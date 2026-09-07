@@ -811,7 +811,16 @@ impl RarBuilder {
             }),
         };
         let comment_encryption = archive.archive.member_comment_encryption();
-        for ((member_index, member), comment) in archive.archive.members().enumerate().zip(comments)
+        let legacy_links = archive
+            .archive
+            .legacy_symlink_targets(password.as_deref())
+            .map_err(map_error)?;
+        for (((member_index, member), comment), legacy_link) in archive
+            .archive
+            .members()
+            .enumerate()
+            .zip(comments)
+            .zip(legacy_links)
         {
             let legacy_unicode_name = if legacy_preservation {
                 match &member.detail {
@@ -839,14 +848,6 @@ impl RarBuilder {
                 None
             } else {
                 member.file_times().map_err(map_error)?
-            };
-            let legacy_link = if member.is_legacy_unix_symlink() {
-                archive
-                    .archive
-                    .legacy_symlink_target_at(member_index, password.as_deref())
-                    .map_err(map_error)?
-            } else {
-                None
             };
             let link = member.supported_redirection().cloned();
             let retained_link = link.as_ref().map(|_| member.clone());
@@ -1807,7 +1808,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn python_rewrite_stages_one_pass_per_write_without_eager_payload_reads() {
+    fn python_rewrite_batches_link_metadata_and_stages_one_pass_per_write() {
         use std::io::{Cursor, Read, Seek, SeekFrom};
         use std::sync::atomic::AtomicU64;
 
@@ -1831,55 +1832,102 @@ mod tests {
         let root = scratch::case("python-rewrite-once");
         Python::initialize();
         Python::attach(|py| {
-            for format in rars_rs::ArchiveVersion::ALL {
-                let mut input = rars_rs::Builder::new(format).solid(true);
-                for name in [b"first", b"other", b"final"] {
-                    input
-                        .add_bytes(name.to_vec(), name.repeat(100), None, None)
-                        .unwrap();
-                }
-                let bytes = Arc::new(AtomicU64::new(0));
-                let archive = rars_rs::ArchiveReader::read_reader(Counted {
-                    input: Cursor::new(input.to_bytes().unwrap()),
-                    bytes: bytes.clone(),
-                })
-                .unwrap();
-                bytes.store(0, Ordering::Relaxed);
-                archive
-                    .extract_with_control(rars_rs::ArchiveReadOptions::default(), |_| {
-                        Ok(rars_rs::ExtractionDecision::Extract(Box::new(io::sink())))
+            for with_links in [false, true] {
+                for format in rars_rs::ArchiveVersion::ALL {
+                    if with_links
+                        && !matches!(
+                            format,
+                            rars_rs::ArchiveVersion::Rar20
+                                | rars_rs::ArchiveVersion::Rar29
+                                | rars_rs::ArchiveVersion::Rar30
+                                | rars_rs::ArchiveVersion::Rar40
+                        )
+                    {
+                        continue;
+                    }
+                    let mut input = rars_rs::Builder::new(format).solid(true);
+                    for name in [b"first", b"other", b"final"] {
+                        input
+                            .add_bytes(name.to_vec(), name.repeat(100), None, None)
+                            .unwrap();
+                        if with_links && name != b"final" {
+                            input
+                                .add_unix_symlink(
+                                    [name.as_slice(), b"-link"].concat(),
+                                    b"../missing-\xff".to_vec(),
+                                    false,
+                                    None,
+                                    None,
+                                )
+                                .unwrap();
+                        }
+                    }
+                    let bytes = Arc::new(AtomicU64::new(0));
+                    let archive = rars_rs::ArchiveReader::read_reader(Counted {
+                        input: Cursor::new(input.to_bytes().unwrap()),
+                        bytes: bytes.clone(),
                     })
                     .unwrap();
-                let one_pass = bytes.swap(0, Ordering::Relaxed);
-                let source = Py::new(
-                    py,
-                    RarFile {
-                        archive,
-                        password: None,
-                        infos: Vec::new(),
-                    },
-                )
-                .unwrap();
-                let directory = pyo3::types::PyString::new(py, root.to_str().unwrap());
-                let builder = RarBuilder::from_archive(
-                    py,
-                    source.bind(py).as_any(),
-                    None,
-                    true,
-                    Some(directory.as_any()),
-                    None,
-                )
-                .unwrap();
-                assert_eq!(bytes.load(Ordering::Relaxed), 0, "{format} must stay lazy");
-                for _ in 0..2 {
-                    let output = builder.to_bytes(py, None).unwrap();
-                    assert_eq!(bytes.swap(0, Ordering::Relaxed), one_pass, "{format}");
-                    let output = rars_rs::ArchiveReader::read_owned(output).unwrap();
+                    bytes.store(0, Ordering::Relaxed);
+                    archive
+                        .extract_with_control(rars_rs::ArchiveReadOptions::default(), |_| {
+                            Ok(rars_rs::ExtractionDecision::Extract(Box::new(io::sink())))
+                        })
+                        .unwrap();
+                    let one_pass = bytes.swap(0, Ordering::Relaxed);
+                    let metadata_pass = if with_links {
+                        archive
+                            .extract_with_control(
+                                rars_rs::ArchiveReadOptions::default(),
+                                |member| {
+                                    if member.meta.name == b"final" {
+                                        Ok(rars_rs::ExtractionDecision::Stop)
+                                    } else {
+                                        Ok(rars_rs::ExtractionDecision::Extract(Box::new(
+                                            io::sink(),
+                                        )))
+                                    }
+                                },
+                            )
+                            .unwrap();
+                        bytes.swap(0, Ordering::Relaxed)
+                    } else {
+                        0
+                    };
+                    let source = Py::new(
+                        py,
+                        RarFile {
+                            archive,
+                            password: None,
+                            infos: Vec::new(),
+                        },
+                    )
+                    .unwrap();
+                    let directory = pyo3::types::PyString::new(py, root.to_str().unwrap());
+                    let builder = RarBuilder::from_archive(
+                        py,
+                        source.bind(py).as_any(),
+                        None,
+                        true,
+                        Some(directory.as_any()),
+                        None,
+                    )
+                    .unwrap();
                     assert_eq!(
-                        output.read_member(b"final", None).unwrap().unwrap(),
-                        b"final".repeat(100)
+                        bytes.swap(0, Ordering::Relaxed),
+                        metadata_pass,
+                        "{format}: only one link metadata pass is allowed"
                     );
-                    assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+                    for _ in 0..2 {
+                        let output = builder.to_bytes(py, None).unwrap();
+                        assert_eq!(bytes.swap(0, Ordering::Relaxed), one_pass, "{format}");
+                        let output = rars_rs::ArchiveReader::read_owned(output).unwrap();
+                        assert_eq!(
+                            output.read_member(b"final", None).unwrap().unwrap(),
+                            b"final".repeat(100)
+                        );
+                        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+                    }
                 }
             }
         });

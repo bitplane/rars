@@ -8,6 +8,44 @@ import rars
 from test_rewrite_legacy import DOS_TIME
 
 
+@pytest.mark.parametrize("solid", [False, True])
+@pytest.mark.parametrize("preserve", [False, True])
+def test_batch_link_metadata_leaves_unrelated_corrupt_payload_for_writing(tmp_path, solid, preserve):
+    source = rars.RarBuilder(format="rar29", solid=solid)
+    source.add_unix_symlink("link1", b"first-target-\xff")
+    source.add_directory("empty")
+    source.add_unix_symlink("link2", b"../second-target")
+    source.add_bytes(b"ordinary payload" * 50, "file")
+    data = bytearray(source.to_bytes())
+    # Change only the ordinary suffix's expected data checksum, retaining a
+    # valid header checksum so metadata parsing itself still succeeds.
+    import struct
+    import zlib
+    from test_rewrite_legacy import headers
+    offset, _, _, size = [header for header in headers(data) if header[1] == 0x74][-1]
+    checksum = struct.unpack_from("<I", data, offset + 16)[0]
+    struct.pack_into("<I", data, offset + 16, checksum ^ 1)
+    struct.pack_into("<H", data, offset, zlib.crc32(data[offset + 2:offset + size]) & 0xffff)
+    archive = rars.RarFile.from_bytes(bytes(data))
+    editor = rars.RarBuilder.from_archive(archive, preserve=preserve, staging_dir=tmp_path)
+    destination = tmp_path / "existing.rar"
+    destination.write_bytes(b"keep")
+    with pytest.raises(rars.BadRarFile):
+        editor.write(destination)
+    assert destination.read_bytes() == b"keep"
+    assert list(tmp_path.iterdir()) == [destination]
+    editor.remove("file")
+    editor.rename("link2", "renamed")
+    editor.write(destination)
+    output = rars.RarFile(destination)
+    assert output.readlink("renamed") == b"../second-target"
+    # readlink exposes wire bytes; explicit RAR5 conversion uses its Unix mapping.
+    expected = b"first-target-\xff" if preserve else "\ufffefirst-target-\ue0ff".encode()
+    assert output.readlink("link1") == expected
+    assert output.getinfo("empty").is_dir()
+    assert list(tmp_path.iterdir()) == [destination]
+
+
 @pytest.mark.parametrize("options", [{}, {"solid": True}, {"password": "secret"}, {"password": "secret", "encrypt_headers": True, "solid": True}])
 @pytest.mark.parametrize("mode", [None, 0o2750])
 def test_legacy_directories_survive_edits_without_breaking_solid_data(options, mode):

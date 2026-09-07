@@ -234,8 +234,12 @@ stages retained file payloads in one archive-order extraction pass before
 encoding output. Renames retain original source identity; removed independent
 files are skipped. Solid predecessors are decoded and verified when needed,
 even if removed. Payloads after the last retained source file are not decoded.
-Comments and legacy symbolic-link targets still use the eager metadata path in
-`from_archive()`.
+Comments and legacy symbolic-link targets use the eager metadata path in
+`from_archive()`. Legacy link targets are collected and verified in one traversal,
+including required solid predecessors. Independent ordinary files and the suffix
+after the last link are not decoded by that metadata traversal. Archives without
+legacy links require no link-payload traversal. This metadata pass is separate
+from the per-write payload staging pass.
 
 Staging files are private plaintext files, including when the archive is
 encrypted. `staging_dir` selects an existing trusted directory; it defaults to
