@@ -115,7 +115,7 @@ impl CancellationToken {
     }
 }
 
-/// Per-call limits for member and archive-comment reading, extraction and payload testing.
+/// Per-call parsing, decoding and extraction policies.
 #[pyclass(frozen, module = "rars", skip_from_py_object)]
 #[derive(Debug, Clone, Default)]
 struct ReadOptions {
@@ -125,6 +125,10 @@ struct ReadOptions {
     #[pyo3(get)]
     max_total_output_bytes: Option<u64>,
     #[pyo3(get)]
+    max_header_count: Option<u64>,
+    #[pyo3(get)]
+    max_header_bytes: Option<u64>,
+    #[pyo3(get)]
     rar50_dictionary_size_limit: Option<u64>,
     #[pyo3(get)]
     rar50_buffered_decode_limit: Option<u64>,
@@ -133,13 +137,15 @@ struct ReadOptions {
 #[pymethods]
 impl ReadOptions {
     #[new]
-    #[pyo3(signature = (*, cancellation=None, max_member_output_bytes=None, max_total_output_bytes=None, rar50_dictionary_size_limit=None, rar50_buffered_decode_limit=None))]
+    #[pyo3(signature = (*, cancellation=None, max_member_output_bytes=None, max_total_output_bytes=None, rar50_dictionary_size_limit=None, rar50_buffered_decode_limit=None, max_header_count=None, max_header_bytes=None))]
     fn new(
         cancellation: Option<&CancellationToken>,
         max_member_output_bytes: Option<u64>,
         max_total_output_bytes: Option<u64>,
         rar50_dictionary_size_limit: Option<u64>,
         rar50_buffered_decode_limit: Option<u64>,
+        max_header_count: Option<u64>,
+        max_header_bytes: Option<u64>,
     ) -> Self {
         Self {
             cancellation: cancellation.map(|token| token.inner.clone()),
@@ -147,6 +153,8 @@ impl ReadOptions {
             max_total_output_bytes,
             rar50_dictionary_size_limit,
             rar50_buffered_decode_limit,
+            max_header_count,
+            max_header_bytes,
         }
     }
 
@@ -165,6 +173,8 @@ fn python_read_options<'a>(
     let mut options = rars_rs::ArchiveReadOptions::with_optional_password(password);
     if let Some(settings) = settings {
         options.cancellation = settings.cancellation.as_ref();
+        options.max_header_count = settings.max_header_count;
+        options.max_header_bytes = settings.max_header_bytes;
         options.max_member_output_bytes = settings.max_member_output_bytes;
         options.max_total_output_bytes = settings.max_total_output_bytes;
         options.rar50_dictionary_size_limit = settings.rar50_dictionary_size_limit;
@@ -382,12 +392,13 @@ struct RarFile {
 #[pymethods]
 impl RarFile {
     #[new]
-    #[pyo3(signature = (source, mode = "r", password = None))]
+    #[pyo3(signature = (source, mode = "r", password = None, *, options = None))]
     fn new(
         py: Python<'_>,
         source: &Bound<'_, PyAny>,
         mode: &str,
         password: Option<&Bound<'_, PyAny>>,
+        options: Option<&ReadOptions>,
     ) -> PyResult<Self> {
         if mode != "r" {
             return Err(PyNotImplementedError::new_err(
@@ -395,19 +406,21 @@ impl RarFile {
             ));
         }
         let password = py_password(password)?;
-        let bytes = py_input_bytes(py, source)?;
-        Self::from_bytes(py, bytes, password)
+        let token = options.and_then(ReadOptions::cancellation);
+        let bytes = py_input_bytes_with_cancellation(py, source, token.as_ref())?;
+        Self::from_bytes(py, bytes, password, options)
     }
 
     #[staticmethod]
     #[pyo3(name = "from_bytes")]
-    #[pyo3(signature = (data, password = None))]
+    #[pyo3(signature = (data, password = None, *, options = None))]
     fn from_bytes_py(
         py: Python<'_>,
         data: Vec<u8>,
         password: Option<&Bound<'_, PyAny>>,
+        options: Option<&ReadOptions>,
     ) -> PyResult<Self> {
-        Self::from_bytes(py, data, py_password(password)?)
+        Self::from_bytes(py, data, py_password(password)?, options)
     }
 
     fn namelist(&self) -> Vec<String> {
@@ -674,14 +687,16 @@ impl RarFile {
 }
 
 impl RarFile {
-    fn from_bytes(py: Python<'_>, bytes: Vec<u8>, password: Option<Vec<u8>>) -> PyResult<Self> {
+    fn from_bytes(
+        py: Python<'_>,
+        bytes: Vec<u8>,
+        password: Option<Vec<u8>>,
+        options: Option<&ReadOptions>,
+    ) -> PyResult<Self> {
         let parse_password = password.clone();
         let archive = py
             .detach(|| {
-                let options = match parse_password.as_deref() {
-                    Some(password) => rars_rs::ArchiveReadOptions::with_password(password),
-                    None => rars_rs::ArchiveReadOptions::new(),
-                };
+                let options = python_read_options(options, parse_password.as_deref());
                 rars_rs::ArchiveReader::read_owned_with_options(bytes, options)
             })
             .map_err(map_error)?;
@@ -906,7 +921,7 @@ impl RarBuilder {
                 password: archive.password.clone(),
                 infos: archive.infos.clone(),
             },
-            Err(_) => RarFile::new(py, source, "r", password)?,
+            Err(_) => RarFile::new(py, source, "r", password, None)?,
         };
         let password = archive.password.clone();
         if preserve {
@@ -1400,32 +1415,32 @@ fn output_directory(path: &Path) -> &Path {
         .unwrap_or(Path::new("."))
 }
 
-fn check_repair_cancellation(cancellation: Option<&CancellationToken>) -> PyResult<()> {
+fn check_python_cancellation(cancellation: Option<&CancellationToken>) -> PyResult<()> {
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return Err(PyInterruptedError::new_err("repair cancelled"));
+        return Err(PyInterruptedError::new_err("operation cancelled"));
     }
     Ok(())
 }
 
-fn repair_input(
+fn py_input_bytes_with_cancellation(
     py: Python<'_>,
     source: &Bound<'_, PyAny>,
     cancellation: Option<&CancellationToken>,
 ) -> PyResult<Vec<u8>> {
-    check_repair_cancellation(cancellation)?;
+    check_python_cancellation(cancellation)?;
     if let Ok(bytes) = source.extract::<Vec<u8>>() {
-        check_repair_cancellation(cancellation)?;
+        check_python_cancellation(cancellation)?;
         return Ok(bytes);
     }
     let path = py_path_buf(py, source)?;
     py.detach(|| {
         use std::io::Read;
-        check_repair_cancellation(cancellation)?;
+        check_python_cancellation(cancellation)?;
         let mut file = fs::File::open(path).map_err(map_io_error)?;
         let mut bytes = Vec::new();
         let mut buffer = [0u8; 64 * 1024];
         loop {
-            check_repair_cancellation(cancellation)?;
+            check_python_cancellation(cancellation)?;
             let count = match file.read(&mut buffer) {
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 result => result.map_err(map_io_error)?,
@@ -1435,7 +1450,7 @@ fn repair_input(
             }
             bytes.extend_from_slice(&buffer[..count]);
         }
-        check_repair_cancellation(cancellation)?;
+        check_python_cancellation(cancellation)?;
         Ok(bytes)
     })
 }
@@ -1448,9 +1463,9 @@ fn repair(
     password: Option<&Bound<'_, PyAny>>,
     cancellation: Option<&CancellationToken>,
 ) -> PyResult<Vec<u8>> {
-    check_repair_cancellation(cancellation)?;
+    check_python_cancellation(cancellation)?;
     let password = py_password(password)?;
-    let bytes = repair_input(py, source, cancellation)?;
+    let bytes = py_input_bytes_with_cancellation(py, source, cancellation)?;
     py.detach(|| repair_core(&bytes, password.as_deref(), cancellation).map(|result| result.data))
         .map_err(map_error)
 }
@@ -1478,9 +1493,9 @@ fn repair_detailed(
     password: Option<&Bound<'_, PyAny>>,
     cancellation: Option<&CancellationToken>,
 ) -> PyResult<RepairResult> {
-    check_repair_cancellation(cancellation)?;
+    check_python_cancellation(cancellation)?;
     let password = py_password(password)?;
-    let bytes = repair_input(py, source, cancellation)?;
+    let bytes = py_input_bytes_with_cancellation(py, source, cancellation)?;
     py.detach(|| {
         let result = repair_core(&bytes, password.as_deref(), cancellation)?;
         Ok(RepairResult {
@@ -1500,10 +1515,10 @@ fn repair_to_path(
     password: Option<&Bound<'_, PyAny>>,
     cancellation: Option<&CancellationToken>,
 ) -> PyResult<()> {
-    check_repair_cancellation(cancellation)?;
+    check_python_cancellation(cancellation)?;
     let output = py_path_buf(py, output)?;
     let password = py_password(password)?;
-    let bytes = repair_input(py, input, cancellation)?;
+    let bytes = py_input_bytes_with_cancellation(py, input, cancellation)?;
     py.detach(|| {
         let result = repair_core(&bytes, password.as_deref(), cancellation)?;
         result.write_to_path(&output, cancellation.map(|token| &token.inner))
@@ -1512,36 +1527,40 @@ fn repair_to_path(
 }
 
 #[pyfunction]
-#[pyo3(signature = (paths, path = None, password = None, overwrite = false))]
+#[pyo3(signature = (paths, path = None, password = None, overwrite = false, *, options = None))]
 fn extract_volumes(
     py: Python<'_>,
     paths: &Bound<'_, PyAny>,
     path: Option<PathBuf>,
     password: Option<&Bound<'_, PyAny>>,
     overwrite: bool,
+    options: Option<&ReadOptions>,
 ) -> PyResult<Vec<PathBuf>> {
     let archive_paths = py_paths(paths)?;
     let out_dir = path.unwrap_or_else(|| PathBuf::from("."));
     let password = py_password(password)?;
     py.detach(|| {
-        let archives = read_archives_from_paths(&archive_paths, password.as_deref())?;
-        extract_volumes_archive(&archives, &out_dir, password.as_deref(), overwrite)
+        let options = python_read_options(options, password.as_deref());
+        let archives = read_archives_from_paths(&archive_paths, options)?;
+        extract_volumes_archive(&archives, &out_dir, options, overwrite)
     })
     .map_err(map_error)
 }
 
 #[pyfunction]
-#[pyo3(signature = (paths, password = None))]
+#[pyo3(signature = (paths, password = None, *, options = None))]
 fn test_volumes(
     py: Python<'_>,
     paths: &Bound<'_, PyAny>,
     password: Option<&Bound<'_, PyAny>>,
+    options: Option<&ReadOptions>,
 ) -> PyResult<()> {
     let archive_paths = py_paths(paths)?;
     let password = py_password(password)?;
     py.detach(|| {
-        let archives = read_archives_from_paths(&archive_paths, password.as_deref())?;
-        rars_rs::extract_volumes_to(&archives, password.as_deref(), |_| {
+        let options = python_read_options(options, password.as_deref());
+        let archives = read_archives_from_paths(&archive_paths, options)?;
+        rars_rs::extract_volumes_to_with_options(&archives, options, |_| {
             Ok(Box::new(io::sink()) as Box<dyn Write>)
         })
     })
@@ -1578,14 +1597,6 @@ fn rars(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add(version.to_ascii_uppercase(), version)?;
     }
     Ok(())
-}
-
-fn py_input_bytes(py: Python<'_>, source: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
-    if let Ok(bytes) = source.extract::<Vec<u8>>() {
-        return Ok(bytes);
-    }
-    let path = py_path_buf(py, source)?;
-    py.detach(|| fs::read(path)).map_err(map_io_error)
 }
 
 fn py_path_buf(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<PathBuf> {
@@ -1825,11 +1836,11 @@ fn extract_archive<S: Selection>(
 fn extract_volumes_archive(
     archives: &[rars_rs::Archive],
     out_dir: &Path,
-    password: Option<&[u8]>,
+    options: rars_rs::ArchiveReadOptions<'_>,
     overwrite: bool,
 ) -> rars_rs::Result<Vec<PathBuf>> {
     let written = Arc::new(Mutex::new(Vec::new()));
-    rars_rs::extract_volumes_to(archives, password, {
+    rars_rs::extract_volumes_to_with_options(archives, options, {
         let written = Arc::clone(&written);
         move |meta| {
             let path = checked_output_path(out_dir, meta, archives[0].family())?;
@@ -1860,17 +1871,11 @@ fn extract_volumes_archive(
 
 fn read_archives_from_paths(
     paths: &[PathBuf],
-    password: Option<&[u8]>,
+    options: rars_rs::ArchiveReadOptions<'_>,
 ) -> rars_rs::Result<Vec<rars_rs::Archive>> {
     paths
         .iter()
-        .map(|path| {
-            let options = match password {
-                Some(password) => rars_rs::ArchiveReadOptions::with_password(password),
-                None => rars_rs::ArchiveReadOptions::new(),
-            };
-            rars_rs::ArchiveReader::read_path_with_options(path, options)
-        })
+        .map(|path| rars_rs::ArchiveReader::read_path_with_options(path, options))
         .collect()
 }
 
@@ -2198,7 +2203,7 @@ mod tests {
                     password: None,
                 };
                 let token = CancellationToken::new();
-                let options = ReadOptions::new(Some(&token), None, None, None, None);
+                let options = ReadOptions::new(Some(&token), None, None, None, None, None, None);
                 let cancel_object = Py::new(py, token).unwrap();
                 armed.store(true, Ordering::Relaxed);
                 let worker = std::thread::spawn(move || {

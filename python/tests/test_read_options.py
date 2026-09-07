@@ -133,3 +133,58 @@ def test_selected_extraction_keeps_empty_files_and_completed_prefixes(tmp_path, 
                            options=rars.ReadOptions(max_total_output_bytes=5))
     assert (tmp_path / "first").read_bytes() == b"first"
     assert not (tmp_path / "second").exists()
+
+
+@pytest.mark.parametrize("format", FORMATS)
+@pytest.mark.parametrize("from_path", [False, True])
+def test_parsing_limits_are_per_call_and_do_not_become_payload_defaults(tmp_path, format, from_path):
+    builder = rars.RarBuilder(format=format, store=True)
+    builder.add_bytes(b"payload", "file")
+    data = builder.to_bytes()
+    path = tmp_path / "archive.rar"
+    path.write_bytes(data)
+    def open_archive(options):
+        return rars.RarFile(path, options=options) if from_path else rars.RarFile.from_bytes(data, options=options)
+    for options in [rars.ReadOptions(max_header_count=0), rars.ReadOptions(max_header_bytes=0)]:
+        with pytest.raises(MemoryError):
+            open_archive(options)
+    token = rars.CancellationToken()
+    token.cancel()
+    with pytest.raises(InterruptedError):
+        open_archive(rars.ReadOptions(cancellation=token))
+    options = rars.ReadOptions(max_header_count=100, max_header_bytes=10000, max_member_output_bytes=0)
+    assert options.max_header_count == 100
+    assert open_archive(options).read("file") == b"payload"
+    with pytest.raises(AttributeError):
+        options.max_header_bytes = 100
+
+
+@pytest.mark.parametrize("format", ["rar14", "rar29", "rar50", "rar70"])
+def test_volume_policies_cover_parsing_and_logical_member_limits(tmp_path, format):
+    payload = b"split payload " * 1000
+    builder = rars.RarBuilder(format=format, store=True, volume_size=1024)
+    builder.add_bytes(payload, "file")
+    paths = builder.write_volumes(tmp_path / "archive.rar")
+    assert len(paths) > 1
+    output = tmp_path / "output"
+    output.mkdir()
+    target = output / "file"
+    target.write_bytes(b"keep")
+    for options in [rars.ReadOptions(max_header_count=0),
+                    rars.ReadOptions(max_header_bytes=0),
+                    rars.ReadOptions(max_member_output_bytes=len(payload) - 1),
+                    rars.ReadOptions(max_total_output_bytes=len(payload) - 1)]:
+        with pytest.raises(MemoryError):
+            rars.test_volumes(paths, options=options)
+        with pytest.raises(MemoryError):
+            rars.extract_volumes(paths, output, overwrite=True, options=options)
+        assert target.read_bytes() == b"keep"
+    options = rars.ReadOptions(max_member_output_bytes=len(payload), max_total_output_bytes=len(payload))
+    rars.test_volumes(paths, options=options)
+    rars.extract_volumes(paths, output, overwrite=True, options=options)
+    assert target.read_bytes() == payload
+    token = rars.CancellationToken()
+    token.cancel()
+    for method in [rars.test_volumes, rars.extract_volumes]:
+        with pytest.raises(InterruptedError):
+            method([tmp_path / "missing.rar"], options=rars.ReadOptions(cancellation=token))

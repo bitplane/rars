@@ -1,6 +1,7 @@
 # Reader cancellation and resource limits
 
-`RarFile.read`, `open`, `extract`, `extractall`, `testrar` and `read_comment` accept a keyword-only
+`RarFile`, `RarFile.from_bytes`, member-reading methods, `read_comment`,
+`extract_volumes` and `test_volumes` accept a keyword-only
 `options=rars.ReadOptions(...)` argument. Options apply to that call, not to the
 archive object. Omitting them retains the existing defaults and password handling.
 
@@ -28,6 +29,8 @@ through `2**64 - 1`; `None` retains the default policy.
 
 | Option | Meaning |
 | --- | --- |
+| `max_header_count` | Inclusive top-level header count per physical archive parse; zero refuses even the main header. |
+| `max_header_bytes` | Inclusive cumulative plaintext header bytes per parse, admitted before full-header allocation. This excludes payloads and retained input. |
 | `cancellation` | A `CancellationToken` shared with the caller. Another Python thread may call `cancel()` while decoding runs with the GIL released. |
 | `max_member_output_bytes` | Inclusive logical output ceiling per decoded member, across all archive families. Zero permits empty output. |
 | `max_total_output_bytes` | Inclusive logical output ceiling for the call. Counts all decoded members, including discarded solid predecessors. Configuring it selects sequential extraction. |
@@ -67,8 +70,11 @@ raise `MemoryError` because Python does not yet expose scratch policy. No partia
 comment is returned on failure. The `comment` property keeps its default policy;
 `getcomment(member)` reads a member comment and does not accept these options.
 
-These options do not apply to initial archive parsing, member-comment or link
-helpers or the module-level volume helpers. Repair uses a separate
+Constructor options apply while parsing and are not retained for later reads.
+Volume helpers apply header limits separately to each physical volume, and output
+limits to logical members and the entire extraction/test call across all volumes.
+
+These options do not apply to member-comment or link helpers. Repair uses a separate
 `cancellation=` argument; see [repair cancellation](REPAIRING.md). Passwords remain supplied
 through `pwd=` or the archive's configured password. A per-call password does not
 change the archive's configured password.
