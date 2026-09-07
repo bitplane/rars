@@ -91,8 +91,32 @@ impl ProgressEvent {
     }
 }
 
+/// A thread-safe, one-way cancellation signal for builder writes and rewrites.
+#[pyclass(frozen, module = "rars", skip_from_py_object)]
+#[derive(Debug, Clone, Default)]
+struct CancellationToken {
+    inner: rars_rs::ReadCancellation,
+}
+
+#[pymethods]
+impl CancellationToken {
+    #[new]
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request cancellation. A cancelled token cannot be reset.
+    fn cancel(&self) {
+        self.inner.cancel();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.inner.is_cancelled()
+    }
+}
+
 struct PythonProgress {
-    callback: Py<PyAny>,
+    callback: Option<Py<PyAny>>,
     state: Mutex<HashMap<&'static str, ProgressEvent>>,
     error: Mutex<Option<PyErr>>,
     cancelled: AtomicBool,
@@ -100,13 +124,14 @@ struct PythonProgress {
 }
 
 impl PythonProgress {
-    fn new(callback: Py<PyAny>) -> Self {
+    fn new(callback: Option<Py<PyAny>>, cancellation: Option<&CancellationToken>) -> Self {
         Self {
             callback,
             state: Mutex::new(HashMap::new()),
             error: Mutex::new(None),
             cancelled: AtomicBool::new(false),
-            read_cancellation: rars_rs::ReadCancellation::new(),
+            read_cancellation: cancellation
+                .map_or_else(rars_rs::ReadCancellation::new, |token| token.inner.child()),
         }
     }
 
@@ -120,9 +145,12 @@ impl PythonProgress {
 
 impl rars_rs::WriteProgress for PythonProgress {
     fn report(&self, event: rars_rs::WriteProgressEvent<'_>) {
-        if self.cancelled.load(Ordering::Relaxed) {
+        if self.cancelled.load(Ordering::Relaxed) || self.read_cancellation.is_cancelled() {
             return;
         }
+        let Some(callback) = &self.callback else {
+            return;
+        };
         let snapshot = {
             let operation = match event {
                 rars_rs::WriteProgressEvent::OperationStarted { operation, .. }
@@ -205,7 +233,7 @@ impl rars_rs::WriteProgress for PythonProgress {
         };
         let result = Python::attach(|py| {
             let event = Py::new(py, snapshot)?;
-            self.callback.call1(py, (event,)).map(|_| ())
+            callback.call1(py, (event,)).map(|_| ())
         });
         if let Err(error) = result {
             self.cancelled.store(true, Ordering::Relaxed);
@@ -218,7 +246,7 @@ impl rars_rs::WriteProgress for PythonProgress {
     }
 
     fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Relaxed)
+        self.cancelled.load(Ordering::Relaxed) || self.read_cancellation.is_cancelled()
     }
 }
 
@@ -651,15 +679,22 @@ impl RewriteInput {
     }
 }
 
-fn python_progress(callback: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Arc<PythonProgress>>> {
-    callback
+fn python_progress(
+    callback: Option<&Bound<'_, PyAny>>,
+    cancellation: Option<&CancellationToken>,
+) -> PyResult<Option<Arc<PythonProgress>>> {
+    let callback = callback
         .map(|callback| {
             if !callback.is_callable() {
                 return Err(PyValueError::new_err("progress must be callable"));
             }
-            Ok(Arc::new(PythonProgress::new(callback.clone().unbind())))
+            Ok(callback.clone().unbind())
         })
-        .transpose()
+        .transpose()?;
+    if callback.is_none() && cancellation.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(Arc::new(PythonProgress::new(callback, cancellation))))
 }
 
 /// Preserve the established Python argument exceptions for builder refusals.
@@ -1137,55 +1172,76 @@ impl RarBuilder {
             .map_err(map_builder_error)
     }
 
-    #[pyo3(signature = (*, progress = None))]
-    fn to_bytes(&self, py: Python<'_>, progress: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<u8>> {
-        self.detached(py, progress, Path::new("."), |builder, progress| {
-            builder.to_bytes_with_progress(progress)
-        })
+    #[pyo3(signature = (*, progress = None, cancellation = None))]
+    fn to_bytes(
+        &self,
+        py: Python<'_>,
+        progress: Option<&Bound<'_, PyAny>>,
+        cancellation: Option<&CancellationToken>,
+    ) -> PyResult<Vec<u8>> {
+        self.detached(
+            py,
+            progress,
+            cancellation,
+            Path::new("."),
+            |builder, progress| builder.to_bytes_with_progress(progress),
+        )
     }
 
-    #[pyo3(signature = (path, *, progress = None))]
+    #[pyo3(signature = (path, *, progress = None, cancellation = None))]
     fn write(
         &self,
         py: Python<'_>,
         path: &Bound<'_, PyAny>,
         progress: Option<&Bound<'_, PyAny>>,
+        cancellation: Option<&CancellationToken>,
     ) -> PyResult<()> {
         let path = py_path_buf(py, path)?;
         let directory = output_directory(&path);
-        self.detached(py, progress, directory, |builder, progress| {
-            builder.write_to_path(&path, progress)
-        })
+        self.detached(
+            py,
+            progress,
+            cancellation,
+            directory,
+            |builder, progress| builder.write_to_path(&path, progress),
+        )
     }
 
-    #[pyo3(signature = (first_path, *, progress = None))]
+    #[pyo3(signature = (first_path, *, progress = None, cancellation = None))]
     fn write_volumes(
         &self,
         py: Python<'_>,
         first_path: &Bound<'_, PyAny>,
         progress: Option<&Bound<'_, PyAny>>,
+        cancellation: Option<&CancellationToken>,
     ) -> PyResult<Vec<PathBuf>> {
         let first_path = py_path_buf(py, first_path)?;
         let parts = self.detached(
             py,
             progress,
+            cancellation,
             output_directory(&first_path),
             |builder, progress| builder.build_volumes(progress),
         )?;
-        let mut paths = Vec::with_capacity(parts.len());
-        for (index, part) in parts.iter().enumerate() {
-            let path = if matches!(
-                self.format,
-                rars_rs::ArchiveVersion::Rar50 | rars_rs::ArchiveVersion::Rar70
-            ) {
-                rar50_volume_part_path(&first_path, index, parts.len())?
-            } else {
-                legacy_volume_part_path(&first_path, index)?
-            };
-            fs::write(&path, part).map_err(map_io_error)?;
-            paths.push(path);
-        }
-        Ok(paths)
+        py.detach(|| {
+            let mut paths = Vec::with_capacity(parts.len());
+            for (index, part) in parts.iter().enumerate() {
+                if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                    return Err(map_error(rars_rs::Error::Cancelled));
+                }
+                let path = if matches!(
+                    self.format,
+                    rars_rs::ArchiveVersion::Rar50 | rars_rs::ArchiveVersion::Rar70
+                ) {
+                    rar50_volume_part_path(&first_path, index, parts.len())?
+                } else {
+                    legacy_volume_part_path(&first_path, index)?
+                };
+                fs::write(&path, part).map_err(map_io_error)?;
+                paths.push(path);
+            }
+            Ok(paths)
+        })
     }
 }
 
@@ -1214,6 +1270,7 @@ impl RarBuilder {
         &self,
         py: Python<'_>,
         callback: Option<&Bound<'_, PyAny>>,
+        cancellation: Option<&CancellationToken>,
         directory: &Path,
         run: F,
     ) -> PyResult<T>
@@ -1222,7 +1279,7 @@ impl RarBuilder {
         F: FnOnce(&rars_rs::Builder, Option<&dyn rars_rs::WriteProgress>) -> rars_rs::Result<T>
             + Send,
     {
-        let progress = python_progress(callback)?;
+        let progress = python_progress(callback, cancellation)?;
         let mut builder = self.inner.clone();
         let rewrite = self.rewrite.clone();
         let worker = progress.clone();
@@ -1358,6 +1415,7 @@ fn rars(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RarInfo>()?;
     m.add_class::<RarBuilder>()?;
     m.add_class::<ProgressEvent>()?;
+    m.add_class::<CancellationToken>()?;
     m.add_class::<RepairReport>()?;
     m.add_class::<RepairResult>()?;
     m.add_function(wrap_pyfunction!(repair, m)?)?;
@@ -2041,7 +2099,7 @@ mod tests {
                         "{format}: only one link metadata pass is allowed"
                     );
                     for _ in 0..2 {
-                        let output = builder.to_bytes(py, None).unwrap();
+                        let output = builder.to_bytes(py, None, None).unwrap();
                         assert_eq!(bytes.swap(0, Ordering::Relaxed), one_pass, "{format}");
                         let output = rars_rs::ArchiveReader::read_owned(output).unwrap();
                         assert_eq!(

@@ -33,8 +33,10 @@ impl ReadCancellation {
     pub fn new() -> Self {
         Self::default()
     }
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    pub(crate) fn child(&self) -> Self {
+    /// Create a signal which observes this token as well as its own cancellation.
+    /// Cancelling the child never cancels its parent or siblings. This lets a
+    /// scoped operation stop its workers without poisoning a caller-owned token.
+    pub fn child(&self) -> Self {
         Self(
             Arc::new(AtomicBool::new(false)),
             Some(Arc::new(self.clone())),
@@ -203,6 +205,22 @@ impl Poller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn child_cancellation_is_local_but_parent_cancellation_propagates() {
+        let parent = ReadCancellation::new();
+        let first = parent.child();
+        let second = parent.child();
+        let nested = second.child();
+        first.cancel();
+        assert!(!parent.is_cancelled());
+        assert!(!second.is_cancelled());
+        assert!(!nested.is_cancelled());
+        parent.cancel();
+        assert!(second.is_cancelled());
+        assert!(nested.is_cancelled());
+        assert!(parent.child().is_cancelled());
+    }
 
     #[test]
     fn cancellation_observation_is_local_and_survives_error_adapters() {

@@ -297,6 +297,32 @@ signal. Raising from the callback cooperatively cancels staging, cleans up its
 files and re-raises the original exception. Decoder work checks the cancellation
 token too; blocked I/O and indivisible library work cannot be preempted.
 
+`rars.CancellationToken()` lets another Python thread cancel a builder write
+without raising from a progress callback. Pass `cancellation=token` to
+`to_bytes()`, `write(path)` or `write_volumes(first_path)`, including rewrites:
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+from rars import CancellationToken
+
+token = CancellationToken()
+with ThreadPoolExecutor(max_workers=1) as pool:
+    future = pool.submit(editor.write, "edited.rar", cancellation=token)
+    # In response to a user's cancel action:
+    token.cancel()
+    # Raises InterruptedError if cancellation was observed before completion.
+    future.result()
+```
+
+`token.is_cancelled()` reports whether cancellation was requested. Cancellation
+is sticky: use a new token after cancelling. Successful writes and callback
+exceptions do not cancel the caller's token; callbacks still re-raise their
+original exception. The token applies to per-write staging and writer work,
+not the eager metadata reads in `from_archive()`. Reader and repair methods do
+not yet accept this argument. Writes release the GIL, including volume-file
+publication. Volume cancellation may leave already published parts; a single
+path write retains its existing staged-publication guarantee.
+
 Legacy writers also honour cancellation while loading sources, preparing stored
 payloads, compressing, encrypting payloads and copying the finished archive.
 Stored payload preparation reports `compression` progress too. Raising from a

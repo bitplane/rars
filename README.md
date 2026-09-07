@@ -74,6 +74,10 @@ preservation is rejected. Pass `preserve=False` explicitly
 to convert to unencrypted RAR5, including from older archives. This default change
 is intended for the next minor release; see the [rewrite contract](python/REWRITING.md).
 
+`RarBuilder` writes accept `cancellation=rars.CancellationToken()` for
+cooperative cancellation from another Python thread, with or without progress
+callbacks. See the [cancellation contract](python/REWRITING.md).
+
 For JS it's built to WebAssembly and published to
 [npm](https://www.npmjs.com/package/@bitplane/rars);
 `npm install @bitplane/rars`. It reads and writes in the browser and in Node,
