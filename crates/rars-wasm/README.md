@@ -94,6 +94,12 @@ Resource-limit details use decimal strings for byte counts, preserving values
 beyond JavaScript’s exact integer range. Node filesystem errors use `IO` with
 the original system code, errno and syscall in `details`.
 
+Aborting queued work rejects it immediately without interrupting the active
+operation. Aborting active work terminates its worker; later operations start
+a fresh worker. This is worker termination, so it does not run cooperative Rust
+cleanup or undo completed filesystem writes. Interrupted Node writes may leave
+staged temporary files. No separate cancellation-token object is needed in JS.
+
 ## Loading
 
 ES modules, Node `require`, Vite, webpack, Rollup and direct browser imports use

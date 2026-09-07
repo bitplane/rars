@@ -6,34 +6,44 @@ export function createClient(spawnWorker) {
   const queue = [];
   let errorFactory = (error) => error;
 
+  function stopWorker() {
+    const stopped = worker;
+    worker = undefined;
+    stopped?.terminate();
+  }
+
+  function detach(task) {
+    if (task.signal && task.abort) task.signal.removeEventListener("abort", task.abort);
+  }
+
   function ensureWorker() {
     if (idleTimer !== undefined) {
       clearTimeout(idleTimer);
       idleTimer = undefined;
     }
     if (worker) return worker;
-    worker = spawnWorker();
-    worker.onMessage(handleMessage);
-    worker.onError((error) => {
+    const current = spawnWorker();
+    worker = current;
+    current.onMessage((message) => {
+      if (worker === current) handleMessage(message);
+    });
+    current.onError((error) => {
+      if (worker !== current) return;
       const failed = active;
-      active = undefined;
-      worker?.terminate();
-      worker = undefined;
-      if (failed) failed.reject(errorFactory({ code: "WORKER_FAILED", message: error.message }));
-      runNext();
+      stopWorker();
+      if (failed) finish(failed, () => failed.reject(errorFactory({ code: "WORKER_FAILED", message: error.message })));
     });
     return worker;
   }
 
   function finish(task, callback) {
-    if (task.signal && task.abort) task.signal.removeEventListener("abort", task.abort);
+    detach(task);
     active = undefined;
     callback();
     runNext();
     if (!active && queue.length === 0 && worker) {
       idleTimer = setTimeout(() => {
-        worker?.terminate();
-        worker = undefined;
+        stopWorker();
         idleTimer = undefined;
       }, 30_000);
       idleTimer.unref?.();
@@ -42,18 +52,18 @@ export function createClient(spawnWorker) {
 
   function handleMessage(message) {
     if (!active || message.id !== active.id) return;
+    const task = active;
     if (message.progress) {
       try {
-        active.onProgress?.(message.progress);
+        task.onProgress?.(message.progress);
       } catch (error) {
-        const task = active;
-        worker.terminate();
-        worker = undefined;
-        finish(task, () => task.reject(error));
+        if (active === task) {
+          stopWorker();
+          finish(task, () => task.reject(error));
+        }
       }
       return;
     }
-    const task = active;
     if (message.error) {
       finish(task, () => task.reject(errorFactory(message.error)));
     } else {
@@ -64,36 +74,37 @@ export function createClient(spawnWorker) {
   function abortTask(task) {
     const abortError = new DOMException("The operation was aborted", "AbortError");
     if (active === task) {
-      worker.terminate();
-      worker = undefined;
+      stopWorker();
       finish(task, () => task.reject(abortError));
       return;
     }
     const index = queue.indexOf(task);
     if (index >= 0) queue.splice(index, 1);
+    detach(task);
     task.reject(abortError);
   }
 
   function runNext() {
-    if (active || queue.length === 0) return;
-    active = queue.shift();
-    if (active.signal?.aborted) {
-      const task = active;
-      active = undefined;
-      task.reject(new DOMException("The operation was aborted", "AbortError"));
-      runNext();
-      return;
+    while (!active && queue.length > 0) {
+      const task = queue.shift();
+      active = task;
+      try {
+        ensureWorker().post({ id: task.id, operation: task.operation, payload: task.payload });
+      } catch (error) {
+        if (active !== task) continue;
+        stopWorker();
+        detach(task);
+        active = undefined;
+        task.reject(errorFactory({ code: "WORKER_FAILED", message: error.message }));
+      }
     }
-    active.abort = () => abortTask(active);
-    active.signal?.addEventListener("abort", active.abort, { once: true });
-    ensureWorker().post({ id: active.id, operation: active.operation, payload: active.payload });
   }
 
   return {
     setErrorFactory(factory) { errorFactory = factory; },
     request(operation, payload, options = {}) {
       return new Promise((resolve, reject) => {
-        queue.push({
+        const task = {
           id: ++sequence,
           operation,
           payload,
@@ -101,7 +112,14 @@ export function createClient(spawnWorker) {
           reject,
           signal: options.signal,
           onProgress: options.onProgress,
-        });
+        };
+        if (task.signal?.aborted) {
+          reject(new DOMException("The operation was aborted", "AbortError"));
+          return;
+        }
+        task.abort = () => abortTask(task);
+        task.signal?.addEventListener("abort", task.abort, { once: true });
+        queue.push(task);
         runNext();
       });
     },
