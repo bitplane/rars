@@ -13,13 +13,19 @@ use crate::codec::rar29::{
 };
 use crate::crc32::Crc32;
 pub use crate::filter::{FilterKind, FilterPolicy, FilterSpec};
-use crate::io_util::align16 as checked_align16;
 use crate::streaming::WriterResources;
 use crate::write_plan::{MemberCoding, PlanShape, WriterOption};
 use crate::write_progress::{ProgressReporter, WorkTracker};
 use crate::write_stream::{MemberBytes, MemberPayload};
 use crate::{WriteOperation, WriteProgress, WriteProgressEvent};
 use std::io::Write;
+
+fn checked_align16(value: usize, message: &'static str) -> Result<usize> {
+    value
+        .checked_add(15)
+        .map(|size| size & !15)
+        .ok_or(Error::InvalidArgument(message))
+}
 
 const AUTO_RGB_WIDTHS: [usize; 4] = [24, 48, 96, 192];
 const MIN_STORE_FALLBACK_SIZE: usize = 1024;
@@ -574,7 +580,7 @@ fn encode_rar29_policy_filtered_payload(
             method: lz_method,
         }),
         // Rejected by validate_rar29_filter_policy before any encoding starts.
-        (Rar29Method::Ppmd, FilterPolicy::Auto) => Err(Error::InvalidHeader(
+        (Rar29Method::Ppmd, FilterPolicy::Auto) => Err(Error::InvalidArgument(
             "RAR 2.9 cannot search for a filter while PPMd is forced",
         )),
         (Rar29Method::Lz, FilterPolicy::None) => {
@@ -644,7 +650,7 @@ fn validate_rar29_filter_policy(policy: &FilterPolicy, method: Rar29Method) -> R
     // Searching for a filter means measuring candidates against each other,
     // and the search only knows how to measure them through LZ.
     if matches!(policy, FilterPolicy::Auto) && method == Rar29Method::Ppmd {
-        return Err(Error::InvalidHeader(
+        return Err(Error::InvalidArgument(
             "RAR 2.9 cannot search for a filter while PPMd is forced",
         ));
     }
@@ -655,21 +661,21 @@ fn validate_rar29_filter_policy(policy: &FilterPolicy, method: Rar29Method) -> R
     match filter.kind {
         FilterKind::Delta { channels } => {
             if channels == 0 || channels > 32 {
-                return Err(Error::InvalidHeader(
+                return Err(Error::InvalidArgument(
                     "RAR 2.9 DELTA filter channel count is invalid",
                 ));
             }
         }
         FilterKind::Audio { channels } => {
             if channels == 0 || channels > 32 {
-                return Err(Error::InvalidHeader(
+                return Err(Error::InvalidArgument(
                     "RAR 2.9 AUDIO filter channel count is invalid",
                 ));
             }
         }
         FilterKind::Rgb { width, pos_r } => {
             if width == 0 || !width.is_multiple_of(3) || pos_r > 2 {
-                return Err(Error::InvalidHeader(
+                return Err(Error::InvalidArgument(
                     "RAR 2.9 RGB filter parameters are invalid",
                 ));
             }
@@ -678,9 +684,10 @@ fn validate_rar29_filter_policy(policy: &FilterPolicy, method: Rar29Method) -> R
         // Refused here rather than in the codec, so nothing is compressed
         // before the caller is told the filter cannot be written.
         FilterKind::Arm => {
-            return Err(Error::InvalidHeader(
-                "the ARM filter is only available for RAR 5 and RAR 7 writers",
-            ))
+            return Err(Error::UnsupportedFeature {
+                version: ArchiveVersion::Rar29,
+                feature: "ARM filter",
+            })
         }
     }
     Ok(())
@@ -1131,7 +1138,7 @@ impl<'a> Member<'a> {
 
     fn unpacked_size(&self) -> Result<usize> {
         usize::try_from(self.bytes.len()?)
-            .map_err(|_| Error::InvalidHeader("RAR 1.5 writer does not support large files"))
+            .map_err(|_| Error::InvalidArgument("RAR 1.5 writer does not support large files"))
     }
 }
 
@@ -1286,7 +1293,7 @@ fn write_member(
     };
     let packed_size = payload.size(encoded.unpacked_size as u64);
     let packed_size = usize::try_from(packed_size)
-        .map_err(|_| Error::InvalidHeader("RAR 1.5 packed size overflows u32"))?;
+        .map_err(|_| Error::InvalidArgument("RAR 1.5 packed size overflows u32"))?;
     let mut flags = writer_file_flags(member.password, member.file_comment, solid_continuation);
     if salt.is_some() {
         flags |= FHD_SALT;
@@ -1620,7 +1627,7 @@ fn rar29_encode_options_for_level(level: Option<u8>) -> Result<Rar29EncodeOption
         4 => 96,
         5 => 128,
         _ => {
-            return Err(Error::InvalidHeader(
+            return Err(Error::InvalidArgument(
                 "RAR compression level must be in the range 0..5",
             ))
         }
@@ -1667,7 +1674,7 @@ fn rar20_encode_options_for_level(level: Option<u8>) -> Result<Rar20EncodeOption
         4 => 512,
         5 => 1024,
         _ => {
-            return Err(Error::InvalidHeader(
+            return Err(Error::InvalidArgument(
                 "RAR compression level must be in the range 0..5",
             ))
         }
@@ -1728,7 +1735,7 @@ fn rar15_encode_options_for_level(level: Option<u8>) -> Result<Rar15EncodeOption
             .with_lazy_matching(false)
             .with_max_long_match_distance(24 * 1024)),
         5 => Ok(Rar15EncodeOptions::new().with_lazy_matching(false)),
-        _ => Err(Error::InvalidHeader(
+        _ => Err(Error::InvalidArgument(
             "RAR compression level must be in the range 0..5",
         )),
     }
@@ -1800,7 +1807,7 @@ fn dictionary_flags_for_size(size: usize) -> Result<u16> {
             0x10_0000 => 4,
             0x20_0000 => 5,
             0x40_0000 => 6,
-            _ => return Err(Error::InvalidHeader(
+            _ => return Err(Error::InvalidArgument(
                 "RAR 1.5-4.x dictionary size must be one of 64K, 128K, 256K, 512K, 1M, 2M, or 4M",
             )),
         };
@@ -1812,7 +1819,7 @@ fn compression_method_for_level(options: WriterOptions) -> Result<u8> {
         return Ok(0x33);
     };
     if level > 5 {
-        return Err(Error::InvalidHeader(
+        return Err(Error::InvalidArgument(
             "RAR compression level must be in the range 0..5",
         ));
     }
@@ -2274,7 +2281,7 @@ fn header_encryption_password<'a>(
     let first = passwords.next().flatten().ok_or(Error::NeedPassword)?;
     for password in passwords {
         if password != Some(first) {
-            return Err(Error::InvalidHeader(
+            return Err(Error::InvalidArgument(
                 "RAR 3.x header-encrypted writer needs one shared password",
             ));
         }
@@ -2326,7 +2333,7 @@ fn encrypt_packed_data_with_progress(
                 data.len()
                     .checked_add(15)
                     .map(|len| len & !15)
-                    .ok_or(Error::InvalidHeader(
+                    .ok_or(Error::InvalidArgument(
                         "RAR 3.x encrypted data size overflows",
                     ))?;
             data.resize(padded_len, 0);
@@ -2349,8 +2356,12 @@ fn encrypt_packed_data_with_progress(
 
 fn random_rar30_salt() -> Result<[u8; 8]> {
     let mut salt = [0; 8];
-    getrandom::fill(&mut salt)
-        .map_err(|_| Error::InvalidHeader("RAR 3.x writer could not generate encryption salt"))?;
+    getrandom::fill(&mut salt).map_err(|error| {
+        crate::write_stream::entropy_error(
+            error,
+            "RAR 3.x writer could not generate encryption salt",
+        )
+    })?;
     Ok(salt)
 }
 
@@ -2375,14 +2386,14 @@ fn write_comment_header(out: &mut Vec<u8>, comment: Option<&[u8]>) -> Result<()>
         return Ok(());
     };
     let unp_size = u16::try_from(comment.len())
-        .map_err(|_| Error::InvalidHeader("RAR 1.5 comment is longer than 65535 bytes"))?;
+        .map_err(|_| Error::InvalidArgument("RAR 1.5 comment is longer than 65535 bytes"))?;
     let head_size = 13usize
         .checked_add(comment.len())
-        .ok_or(Error::InvalidHeader(
+        .ok_or(Error::InvalidArgument(
             "RAR 1.5 comment header size overflows",
         ))?;
     let head_size = u16::try_from(head_size)
-        .map_err(|_| Error::InvalidHeader("RAR 1.5 comment header size overflows"))?;
+        .map_err(|_| Error::InvalidArgument("RAR 1.5 comment header size overflows"))?;
 
     let start = out.len();
     out.extend_from_slice(&0u16.to_le_bytes());
@@ -2505,13 +2516,13 @@ fn validate_writer_password(target: ArchiveVersion, password: Option<&[u8]>) -> 
 
 fn validate_member(name: &[u8], unpacked_size: usize) -> Result<()> {
     if name.is_empty() {
-        return Err(Error::InvalidHeader("RAR 1.5 file name is empty"));
+        return Err(Error::InvalidArgument("RAR 1.5 file name is empty"));
     }
     if name.len() > u16::MAX as usize {
-        return Err(Error::InvalidHeader("RAR 1.5 file name is too long"));
+        return Err(Error::InvalidArgument("RAR 1.5 file name is too long"));
     }
     if unpacked_size > u32::MAX as usize {
-        return Err(Error::InvalidHeader(
+        return Err(Error::InvalidArgument(
             "RAR 1.5 writer does not support large files",
         ));
     }
@@ -2555,16 +2566,16 @@ fn write_file_header(out: &mut Vec<u8>, record: &FileRecord<'_>) -> Result<()> {
     let (host_os, file_attr) =
         rar15_compatible_metadata(record.target, record.host_os, record.file_attr);
     let packed_size = u32::try_from(record.packed_size)
-        .map_err(|_| Error::InvalidHeader("RAR 1.5 packed size overflows u32"))?;
+        .map_err(|_| Error::InvalidArgument("RAR 1.5 packed size overflows u32"))?;
     let unpacked_size = u32::try_from(record.unpacked_size)
-        .map_err(|_| Error::InvalidHeader("RAR 1.5 unpacked size overflows u32"))?;
+        .map_err(|_| Error::InvalidArgument("RAR 1.5 unpacked size overflows u32"))?;
     let head_size = 32usize
         .checked_add(record.name.len())
         .and_then(|size| size.checked_add(if record.salt.is_some() { 8 } else { 0 }))
         .and_then(|size| size.checked_add(record.extra.len()))
-        .ok_or(Error::InvalidHeader("RAR 1.5 file header size overflows"))?;
+        .ok_or(Error::InvalidArgument("RAR 1.5 file header size overflows"))?;
     let head_size = u16::try_from(head_size)
-        .map_err(|_| Error::InvalidHeader("RAR 1.5 file header size overflows"))?;
+        .map_err(|_| Error::InvalidArgument("RAR 1.5 file header size overflows"))?;
     let unp_ver = match record.target {
         ArchiveVersion::Rar15 => 15,
         ArchiveVersion::Rar20 => 20,
@@ -2652,12 +2663,12 @@ fn report_volume(
 fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
     crate::write_progress::check_cancelled(entry.progress)?;
     if entry.max_packed_per_volume == 0 {
-        return Err(Error::InvalidHeader(
+        return Err(Error::InvalidArgument(
             "RAR 1.5 volume payload size must be non-zero",
         ));
     }
     if entry.packed.is_empty() {
-        return Err(Error::InvalidHeader(
+        return Err(Error::InvalidArgument(
             "RAR 1.5 volume writer needs a non-empty packed payload",
         ));
     }
@@ -2736,12 +2747,12 @@ fn write_header_encrypted_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<
     validate_header_encrypted_archive_options(entry.target, entry.password.is_some())?;
     let password = entry.password.ok_or(Error::NeedPassword)?;
     if entry.max_packed_per_volume == 0 {
-        return Err(Error::InvalidHeader(
+        return Err(Error::InvalidArgument(
             "RAR 1.5 volume payload size must be non-zero",
         ));
     }
     if entry.packed.is_empty() {
-        return Err(Error::InvalidHeader(
+        return Err(Error::InvalidArgument(
             "RAR 1.5 volume writer needs a non-empty packed payload",
         ));
     }
@@ -2839,6 +2850,34 @@ fn write_comment_header_crc(out: &mut [u8], start: usize) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn writer_limits_and_invalid_options_are_not_archive_corruption() {
+        for error in [
+            super::validate_member(b"", 0).unwrap_err(),
+            super::validate_member(&vec![b'a'; 65536], 0).unwrap_err(),
+            super::checked_align16(usize::MAX, "padding overflow").unwrap_err(),
+            super::write_comment_header(&mut Vec::new(), Some(&vec![0; 65536])).unwrap_err(),
+            super::header_encryption_password([Some(&b"one"[..]), Some(&b"two"[..])].into_iter())
+                .unwrap_err(),
+            super::validate_rar29_filter_policy(
+                &super::FilterPolicy::Auto,
+                super::Rar29Method::Ppmd,
+            )
+            .unwrap_err(),
+            super::rar29_encode_options_for_level(Some(6)).unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), crate::ErrorKind::InvalidArgument, "{error}");
+        }
+        assert_eq!(super::checked_align16(17, "padding overflow").unwrap(), 32);
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(
+            super::validate_member(b"large", u32::MAX as usize + 1)
+                .unwrap_err()
+                .kind(),
+            crate::ErrorKind::InvalidArgument
+        );
+    }
+
     use super::{
         encode_rar29_auto_filtered_member, encode_rar29_filtered_member,
         encode_rar29_filtered_members, is_audio_filter_candidate, rar20_encode_options_for_level,

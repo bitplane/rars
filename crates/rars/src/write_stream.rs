@@ -11,6 +11,10 @@ use crate::streaming::EntrySource;
 use std::borrow::Cow;
 use std::io::{Read, Write};
 
+pub(crate) fn entropy_error(error: getrandom::Error, context: &'static str) -> Error {
+    std::io::Error::other(format!("{context}: {error}")).into()
+}
+
 /// Attribute a writer failure without blaming a member for cancellation.
 pub(crate) fn member_error(error: Error, name: &[u8], operation: &'static str) -> Error {
     if error.kind() == crate::ErrorKind::Cancelled || error.entry_context().is_some() {
@@ -57,7 +61,7 @@ impl<'a> MemberBytes<'a> {
             Self::Source(source) => {
                 let expected = source.len()?;
                 let capacity = usize::try_from(expected).map_err(|_| {
-                    Error::InvalidHeader("member is larger than this host can hold")
+                    Error::InvalidArgument("member is larger than this host can hold")
                 })?;
                 let mut data = Vec::with_capacity(capacity);
                 crate::write_progress::check_cancelled(progress)?;
@@ -200,6 +204,16 @@ pub(crate) fn check_source_length(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn entropy_failure_is_io_and_keeps_the_backend_diagnostic() {
+        let error = super::entropy_error(getrandom::Error::UNSUPPORTED, "encryption salt");
+        assert_eq!(error.kind(), crate::ErrorKind::Io);
+        assert!(error.to_string().contains("encryption salt"));
+        assert!(error
+            .to_string()
+            .contains(&getrandom::Error::UNSUPPORTED.to_string()));
+    }
+
     use super::*;
 
     #[test]

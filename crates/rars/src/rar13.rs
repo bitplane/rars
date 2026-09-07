@@ -1491,7 +1491,7 @@ impl<'a> Member<'a> {
 
     fn unpacked_size(&self) -> Result<usize> {
         usize::try_from(self.bytes.len()?)
-            .map_err(|_| Error::InvalidHeader("RAR 1.3 file is larger than 32-bit size fields"))
+            .map_err(|_| Error::InvalidArgument("RAR 1.3 file is larger than 32-bit size fields"))
     }
 }
 
@@ -1769,7 +1769,7 @@ fn write_member(
     };
     let packed_size = payload.size(encoded.unpacked_size as u64);
     let packed_size = u32::try_from(packed_size)
-        .map_err(|_| Error::InvalidHeader("RAR 1.3 file is larger than 32-bit size fields"))?;
+        .map_err(|_| Error::InvalidArgument("RAR 1.3 file is larger than 32-bit size fields"))?;
 
     let mut flags = 0u8;
     if options.features.solid {
@@ -2069,7 +2069,7 @@ fn rar15_encode_options_for_level(level: Option<u8>) -> Result<Rar15EncodeOption
             .with_lazy_matching(false)
             .with_max_long_match_distance(24 * 1024)),
         5 => Ok(compatible),
-        _ => Err(Error::InvalidHeader(
+        _ => Err(Error::InvalidArgument(
             "RAR compression level must be in the range 0..5",
         )),
     }
@@ -2153,7 +2153,7 @@ fn write_main_header_with_flags(
     out.extend_from_slice(RAR13_SIGNATURE);
     let head_size = MAIN_HEAD_SIZE as usize + comment_extra.len();
     if head_size > u16::MAX as usize {
-        return Err(Error::InvalidHeader(
+        return Err(Error::InvalidArgument(
             "RAR 1.3 main header comment extension is too large",
         ));
     }
@@ -2215,12 +2215,12 @@ struct SplitVolumeRecord<'a> {
 fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
     crate::write_progress::check_cancelled(entry.progress)?;
     if entry.max_packed_per_volume == 0 {
-        return Err(Error::InvalidHeader(
+        return Err(Error::InvalidArgument(
             "RAR 1.3 volume payload size must be non-zero",
         ));
     }
     if entry.packed.is_empty() {
-        return Err(Error::InvalidHeader(
+        return Err(Error::InvalidArgument(
             "RAR 1.3 volume writer needs a non-empty packed payload",
         ));
     }
@@ -2283,17 +2283,17 @@ fn encode_archive_comment(comment: Option<&[u8]>) -> Result<Vec<u8>> {
         return Ok(Vec::new());
     };
     if comment.len() > u16::MAX as usize {
-        return Err(Error::InvalidHeader(
+        return Err(Error::InvalidArgument(
             "RAR 1.3 archive comment is longer than 65535 bytes",
         ));
     }
     let mut packed = unpack15_encode(comment)?;
     Rar13Cipher::new_comment().encrypt_in_place(&mut packed);
-    let packed_field_len = packed.len().checked_add(2).ok_or(Error::InvalidHeader(
+    let packed_field_len = packed.len().checked_add(2).ok_or(Error::InvalidArgument(
         "RAR 1.3 archive comment size overflows",
     ))?;
     if packed_field_len > u16::MAX as usize {
-        return Err(Error::InvalidHeader(
+        return Err(Error::InvalidArgument(
             "RAR 1.3 packed archive comment is longer than 65535 bytes",
         ));
     }
@@ -2310,7 +2310,7 @@ fn encode_file_comment(comment: Option<&[u8]>) -> Result<Vec<u8>> {
         return Ok(Vec::new());
     };
     if comment.len() > u16::MAX as usize {
-        return Err(Error::InvalidHeader(
+        return Err(Error::InvalidArgument(
             "RAR 1.3 file comment is longer than 65535 bytes",
         ));
     }
@@ -2326,15 +2326,15 @@ fn validate_file_entry(name: &[u8], data: &[u8]) -> Result<()> {
 
 fn validate_member(name: &[u8], unpacked_size: usize) -> Result<()> {
     if name.is_empty() {
-        return Err(Error::InvalidHeader("RAR 1.3 file name is empty"));
+        return Err(Error::InvalidArgument("RAR 1.3 file name is empty"));
     }
     if name.len() > u8::MAX as usize {
-        return Err(Error::InvalidHeader(
+        return Err(Error::InvalidArgument(
             "RAR 1.3 file name is longer than 255 bytes",
         ));
     }
     if unpacked_size > u32::MAX as usize {
-        return Err(Error::InvalidHeader(
+        return Err(Error::InvalidArgument(
             "RAR 1.3 file is larger than 32-bit size fields",
         ));
     }
@@ -2349,6 +2349,25 @@ pub fn file_checksum(input: &[u8]) -> u16 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn writer_limits_are_invalid_arguments() {
+        for error in [
+            super::validate_member(b"", 0).unwrap_err(),
+            super::validate_member(&[b'a'; 256], 0).unwrap_err(),
+            super::encode_file_comment(Some(&vec![0; 65536])).unwrap_err(),
+            super::encode_archive_comment(Some(&vec![0; 65536])).unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), crate::ErrorKind::InvalidArgument, "{error}");
+        }
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(
+            super::validate_member(b"large", u32::MAX as usize + 1)
+                .unwrap_err()
+                .kind(),
+            crate::ErrorKind::InvalidArgument
+        );
+    }
+
     #[test]
     fn header_budget_refuses_full_main_read_after_prefix() {
         let mut prefix = super::RAR13_SIGNATURE.to_vec();

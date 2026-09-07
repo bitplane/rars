@@ -916,10 +916,12 @@ fn encrypted_payload(
 ) -> Result<EncryptedStoredPayload> {
     let mut salt = [0u8; 16];
     let mut iv = [0u8; 16];
-    getrandom::fill(&mut salt)
-        .map_err(|_| Error::InvalidHeader("RAR 5 writer could not generate encryption salt"))?;
-    getrandom::fill(&mut iv)
-        .map_err(|_| Error::InvalidHeader("RAR 5 writer could not generate encryption IV"))?;
+    getrandom::fill(&mut salt).map_err(|error| {
+        crate::write_stream::entropy_error(error, "RAR 5 writer could not generate encryption salt")
+    })?;
+    getrandom::fill(&mut iv).map_err(|error| {
+        crate::write_stream::entropy_error(error, "RAR 5 writer could not generate encryption IV")
+    })?;
     let keys = Rar50Keys::derive(password, salt, WRITE_KDF_COUNT_LOG)
         .map_err(super::map_rar50_crypto_error)?;
 

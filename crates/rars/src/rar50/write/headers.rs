@@ -115,8 +115,9 @@ pub(crate) fn encrypted_header_block(
 ) -> Result<Vec<u8>> {
     let header = block_header_image(header_type, flags, data_size, type_specific, extra)?;
     let mut iv = [0u8; 16];
-    getrandom::fill(&mut iv)
-        .map_err(|_| Error::InvalidHeader("RAR 5 writer could not generate encryption IV"))?;
+    getrandom::fill(&mut iv).map_err(|error| {
+        crate::write_stream::entropy_error(error, "RAR 5 writer could not generate encryption IV")
+    })?;
     let padded_len = header.len().checked_add(15).ok_or(Error::InvalidHeader(
         "RAR 5 encrypted header size overflows",
     ))? & !15;
@@ -331,8 +332,9 @@ pub(crate) struct HeaderEncryptionKeys {
 
 pub(super) fn header_encryption_keys(password: &[u8]) -> Result<HeaderEncryptionKeys> {
     let mut salt = [0u8; 16];
-    getrandom::fill(&mut salt)
-        .map_err(|_| Error::InvalidHeader("RAR 5 writer could not generate encryption salt"))?;
+    getrandom::fill(&mut salt).map_err(|error| {
+        crate::write_stream::entropy_error(error, "RAR 5 writer could not generate encryption salt")
+    })?;
     let keys =
         Rar50Keys::derive(password, salt, WRITE_KDF_COUNT_LOG).map_err(map_rar50_crypto_error)?;
     Ok(HeaderEncryptionKeys { keys, salt })
