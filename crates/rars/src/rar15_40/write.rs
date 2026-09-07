@@ -1492,7 +1492,10 @@ fn write_compressed_volumes_impl(
     }
 
     let mut solid_encoder = None;
-    let payload = encode_or_store_payload(entry.data, options, &mut solid_encoder, progress)?;
+    let payload = encode_or_store_payload(entry.data, options, &mut solid_encoder, progress)
+        .map_err(|error| {
+            crate::write_stream::member_error(error, entry.name, "compressing volume member")
+        })?;
     if options.features.header_encryption {
         return write_header_encrypted_split_volumes(SplitVolumeRecord {
             progress: progress.and_then(WorkTracker::reporter),
@@ -2180,7 +2183,9 @@ fn validate_volume_writer_inputs(
     file_comment: Option<&[u8]>,
     options: WriterOptions,
 ) -> Result<()> {
-    validate_file_entry(name, data)?;
+    validate_file_entry(name, data).map_err(|error| {
+        crate::write_stream::member_error(error, name, "preparing volume member")
+    })?;
     if password.is_some()
         && !matches!(
             options.target,
@@ -2670,12 +2675,15 @@ fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
     if entry.packed.is_empty() {
         return Err(Error::InvalidArgument(
             "RAR 1.5 volume writer needs a non-empty packed payload",
-        ));
+        )
+        .at_entry(entry.name.to_vec(), "preparing volume member"));
     }
 
     let mut packed = entry.packed.to_vec();
     let split_salt = if let Some(password) = entry.password {
-        encrypt_split_packed_data(&mut packed, entry.target, password)?
+        encrypt_split_packed_data(&mut packed, entry.target, password).map_err(|error| {
+            crate::write_stream::member_error(error, entry.name, "encrypting volume member")
+        })?
     } else {
         None
     };
@@ -2734,7 +2742,10 @@ fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
                 extra: &[],
             },
             chunk,
-        )?;
+        )
+        .map_err(|error| {
+            crate::write_stream::member_error(error, entry.name, "writing volume member")
+        })?;
         report_volume(entry.progress, index, chunks.len(), out.len())?;
         volumes.push(out);
     }
@@ -2754,11 +2765,15 @@ fn write_header_encrypted_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<
     if entry.packed.is_empty() {
         return Err(Error::InvalidArgument(
             "RAR 1.5 volume writer needs a non-empty packed payload",
-        ));
+        )
+        .at_entry(entry.name.to_vec(), "preparing volume member"));
     }
 
     let mut packed = entry.packed.to_vec();
-    let split_salt = encrypt_split_packed_data(&mut packed, entry.target, password)?;
+    let split_salt =
+        encrypt_split_packed_data(&mut packed, entry.target, password).map_err(|error| {
+            crate::write_stream::member_error(error, entry.name, "encrypting volume member")
+        })?;
     let base_flags = entry.base_flags | FHD_SALT;
     // Packing well enough to need only one volume is not an error. The loop
     // below already writes that set correctly: with one chunk neither split
@@ -2813,8 +2828,13 @@ fn write_header_encrypted_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<
                 salt: split_salt,
                 extra: &[],
             },
-        )?;
-        write_encrypted_header(&mut out, &header, password)?;
+        )
+        .map_err(|error| {
+            crate::write_stream::member_error(error, entry.name, "writing volume member")
+        })?;
+        write_encrypted_header(&mut out, &header, password).map_err(|error| {
+            crate::write_stream::member_error(error, entry.name, "writing volume member")
+        })?;
         out.extend_from_slice(chunk);
         report_volume(entry.progress, index, chunks.len(), out.len())?;
         volumes.push(out);

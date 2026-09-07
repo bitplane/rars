@@ -20,6 +20,57 @@ const FORMATS: [ArchiveVersion; 7] = [
     ArchiveVersion::Rar40,
 ];
 
+#[test]
+fn volume_validation_identifies_members_but_not_global_options() {
+    for format in FORMATS {
+        for store in [false, true] {
+            let mut builder = Builder::new(format).store(store).volume_size(Some(64));
+            let name = vec![b'a'; 65536];
+            builder
+                .add_bytes(name.clone(), b"payload".to_vec(), None, None)
+                .unwrap();
+            let error = builder.build_volumes(None).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::InvalidArgument);
+            assert_eq!(
+                error.entry_context(),
+                Some((name.as_slice(), "preparing volume member"))
+            );
+
+            let mut builder = Builder::new(format).store(store).volume_size(Some(0));
+            builder
+                .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+                .unwrap();
+            let error = builder.build_volumes(None).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::InvalidArgument);
+            assert!(error.entry_context().is_none());
+        }
+    }
+}
+
+#[test]
+fn encrypted_and_plain_volume_framing_failures_identify_the_member() {
+    for encrypted in [false, true] {
+        let name = vec![b'a'; 65535];
+        let mut builder = Builder::new(ArchiveVersion::Rar30)
+            .store(true)
+            .volume_size(Some(64));
+        if encrypted {
+            builder = builder
+                .password(Some(b"secret".to_vec()))
+                .header_encryption(true);
+        }
+        builder
+            .add_bytes(name.clone(), b"payload".to_vec(), None, None)
+            .unwrap();
+        let error = builder.build_volumes(None).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidArgument);
+        assert_eq!(
+            error.entry_context(),
+            Some((name.as_slice(), "writing volume member"))
+        );
+    }
+}
+
 fn write(
     format: ArchiveVersion,
     source: EntrySource,

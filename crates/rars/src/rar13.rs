@@ -1923,7 +1923,10 @@ pub fn write_compressed_volumes_with_progress(
         work.advance(delta as u64)
     };
     let mut packed =
-        encode_verified_rar15_payload_with_progress(entry.data, encode_options, &mut advance)?
+        encode_verified_rar15_payload_with_progress(entry.data, encode_options, &mut advance)
+            .map_err(|error| {
+                crate::write_stream::member_error(error, entry.name, "compressing volume member")
+            })?
             .unwrap_or_else(|| entry.data.to_vec());
     let method =
         if crate::write_plan::StoreFallback::new().applies(false, entry.data.len(), packed.len()) {
@@ -2028,7 +2031,9 @@ fn validate_volume_writer_inputs(
     file_comment: Option<&[u8]>,
     options: WriterOptions,
 ) -> Result<()> {
-    validate_file_entry(name, data)?;
+    validate_file_entry(name, data).map_err(|error| {
+        crate::write_stream::member_error(error, name, "preparing volume member")
+    })?;
     if password.is_some() {
         return Err(Error::UnsupportedWriterOption {
             target: options.target,
@@ -2222,7 +2227,8 @@ fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
     if entry.packed.is_empty() {
         return Err(Error::InvalidArgument(
             "RAR 1.3 volume writer needs a non-empty packed payload",
-        ));
+        )
+        .at_entry(entry.name.to_vec(), "preparing volume member"));
     }
 
     // One volume is a legitimate answer when the payload fits; see the note in
@@ -2263,7 +2269,10 @@ fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
                 extra: &[],
             },
             chunk,
-        )?;
+        )
+        .map_err(|error| {
+            crate::write_stream::member_error(error, entry.name, "writing volume member")
+        })?;
         if let Some(progress) = entry.progress {
             progress.report(WriteProgressEvent::VolumeFinished {
                 volume_number: index + 1,
