@@ -8,8 +8,7 @@ use crate::codec::rar20::{
 };
 use crate::codec::rar29::{
     unpack29_encode_literals, unpack29_encode_literals_with_options,
-    unpack29_encode_literals_with_options_and_progress, unpack29_encode_ppmd,
-    unpack29_encode_ppmd_literals, unpack29_encode_ppmd_with_filter, ChainEngine,
+    unpack29_encode_literals_with_options_and_progress, ChainEngine,
     EncodeOptions as Rar29EncodeOptions, Unpack29Encoder,
 };
 use crate::crc32::Crc32;
@@ -308,6 +307,15 @@ fn write_archive_to(
             ));
         }
     }
+    let control =
+        crate::write_progress::ResourceProgress::new(resources, progress.map(ProgressReporter));
+    let progress = Some(&control as &dyn WriteProgress);
+    crate::write_progress::check_cancelled(progress.map(ProgressReporter))?;
+    let mut output = crate::write_progress::CancellableIo {
+        inner: output,
+        progress: progress.map(ProgressReporter),
+    };
+    let output = &mut output as &mut dyn Write;
     let has_file_comment = members.iter().any(|member| member.file_comment.is_some());
     if has_file_comment && options.features.header_encryption {
         return Err(Error::UnsupportedWriterOption {
@@ -375,7 +383,7 @@ fn write_archive_to(
     } else {
         total_bytes
     };
-    let reporting = coding.compresses().then_some(progress).flatten();
+    let reporting = progress;
     report_compression_operation(reporting, true, total_work, members.len());
     let work = WorkTracker::new(
         reporting.map(ProgressReporter),
@@ -394,11 +402,12 @@ fn write_archive_to(
         Some(&work),
         output,
     );
-    if result.is_ok() && !work.finish() {
+    result?;
+    if !work.finish() {
         return Err(Error::Cancelled);
     }
     report_compression_operation(reporting, false, total_work, members.len());
-    result
+    work.check()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -470,6 +479,7 @@ fn write_members_to(
                 options,
                 solid_continuation,
                 header_password,
+                progress.and_then(WorkTracker::reporter),
             )?;
         }
     } else {
@@ -478,7 +488,15 @@ fn write_members_to(
             crate::parallel::default_window(),
             |member| encode_member(member, options, coding, &mut None, resources, progress),
             |member, encoded| {
-                write_member(output, member, encoded, options, false, header_password)
+                write_member(
+                    output,
+                    member,
+                    encoded,
+                    options,
+                    false,
+                    header_password,
+                    progress.and_then(WorkTracker::reporter),
+                )
             },
         )?;
     }
@@ -500,6 +518,7 @@ fn encode_rar29_policy_filtered_payload(
     options: Rar29EncodeOptions,
     lz_method: u8,
     ppmd_trial: bool,
+    progress: Option<&WorkTracker<'_>>,
 ) -> Result<EncodedPayload> {
     // An empty member is stored whatever was asked for. A filter over it is a
     // 0..0 range, which the codec refuses, so an archive holding one empty file
@@ -519,43 +538,69 @@ fn encode_rar29_policy_filtered_payload(
     // level 5 one as soon as it ran anywhere else.
     let ppmd = |data: &[u8]| -> Result<EncodedPayload> {
         Ok(EncodedPayload {
-            data: unpack29_encode_ppmd(data, options.max_match_distance).map_err(Error::from)?,
+            data: with_codec_progress(progress, |report| {
+                crate::codec::rar29::unpack29_encode_ppmd_with_progress(
+                    data,
+                    true,
+                    None,
+                    options.max_match_distance,
+                    report,
+                )
+            })?,
             method: lz_method,
         })
     };
     match (method, policy) {
         (Rar29Method::Ppmd, FilterPolicy::None) => ppmd(data),
         (Rar29Method::Ppmd, FilterPolicy::Explicit(filter)) => Ok(EncodedPayload {
-            data: unpack29_encode_ppmd_with_filter(
-                data,
-                filter.clone(),
-                options.max_match_distance,
-            )
-            .map_err(Error::from)?,
+            data: with_codec_progress(progress, |report| {
+                crate::codec::rar29::unpack29_encode_ppmd_with_progress(
+                    data,
+                    true,
+                    Some(filter.clone()),
+                    options.max_match_distance,
+                    report,
+                )
+            })?,
             method: lz_method,
         }),
         // Rejected by validate_rar29_filter_policy before any encoding starts.
         (Rar29Method::Ppmd, FilterPolicy::Auto) => Err(Error::InvalidHeader(
             "RAR 2.9 cannot search for a filter while PPMd is forced",
         )),
-        (Rar29Method::Lz, FilterPolicy::None) => encode_rar29_lz_member(data, options, lz_method),
-        (Rar29Method::Lz, FilterPolicy::Auto) => {
-            encode_rar29_auto_filtered_member(data, options, lz_method, false)
+        (Rar29Method::Lz, FilterPolicy::None) => {
+            encode_rar29_lz_member(data, options, lz_method, progress)
         }
+        (Rar29Method::Lz, FilterPolicy::Auto) => encode_rar29_auto_filtered_member_with_progress(
+            data, options, lz_method, false, progress,
+        ),
         (Rar29Method::Lz, FilterPolicy::Explicit(filter)) => Ok(EncodedPayload {
-            data: encode_rar29_filtered_member(data, filter.clone(), options)?,
+            data: with_codec_progress(progress, |report| {
+                Unpack29Encoder::with_options(options).encode_member_with_filters_and_progress(
+                    data,
+                    std::slice::from_ref(filter),
+                    Some(report),
+                )
+            })?,
             method: lz_method,
         }),
-        (Rar29Method::Auto, FilterPolicy::Auto) => {
-            encode_rar29_auto_filtered_member(data, options, lz_method, ppmd_trial)
-        }
+        (Rar29Method::Auto, FilterPolicy::Auto) => encode_rar29_auto_filtered_member_with_progress(
+            data, options, lz_method, ppmd_trial, progress,
+        ),
         (Rar29Method::Auto, policy) => {
             let mut best = match policy {
                 FilterPolicy::Explicit(filter) => EncodedPayload {
-                    data: encode_rar29_filtered_member(data, filter.clone(), options)?,
+                    data: with_codec_progress(progress, |report| {
+                        Unpack29Encoder::with_options(options)
+                            .encode_member_with_filters_and_progress(
+                                data,
+                                std::slice::from_ref(filter),
+                                Some(report),
+                            )
+                    })?,
                     method: lz_method,
                 },
-                _ => encode_rar29_lz_member(data, options, lz_method)?,
+                _ => encode_rar29_lz_member(data, options, lz_method, progress)?,
             };
             // Gated on the content, so a binary member never pays for a PPMd
             // encode it was always going to lose.
@@ -636,8 +681,11 @@ fn encode_rar29_lz_member(
     data: &[u8],
     options: Rar29EncodeOptions,
     method: u8,
+    progress: Option<&WorkTracker<'_>>,
 ) -> Result<EncodedPayload> {
-    let compressed = unpack29_encode_literals_with_options(data, options).map_err(Error::from)?;
+    let compressed = with_codec_progress(progress, |report| {
+        unpack29_encode_literals_with_options_and_progress(data, options, report)
+    })?;
     if compressed.len() >= data.len() {
         return Ok(EncodedPayload {
             data: data.to_vec(),
@@ -650,6 +698,7 @@ fn encode_rar29_lz_member(
     })
 }
 
+#[cfg(test)]
 fn encode_rar29_filtered_member(
     data: &[u8],
     filter: FilterSpec,
@@ -660,6 +709,7 @@ fn encode_rar29_filtered_member(
         .map_err(Error::from)
 }
 
+#[cfg(test)]
 fn encode_rar29_filtered_members(
     data: &[u8],
     filters: &[FilterSpec],
@@ -726,9 +776,15 @@ impl crate::filter_search::FilterSearch for Rar29Search {
         &self,
         data: &[u8],
         options: Rar29EncodeOptions,
-        _progress: Option<&mut dyn FnMut(usize) -> bool>,
+        progress: Option<&mut dyn FnMut(usize) -> bool>,
     ) -> Result<Vec<u8>> {
-        unpack29_encode_literals_with_options(data, options).map_err(Error::from)
+        match progress {
+            Some(progress) => {
+                unpack29_encode_literals_with_options_and_progress(data, options, progress)
+                    .map_err(map_codec_cancel)
+            }
+            None => unpack29_encode_literals_with_options(data, options).map_err(Error::from),
+        }
     }
 
     fn encode_filtered(
@@ -736,17 +792,30 @@ impl crate::filter_search::FilterSearch for Rar29Search {
         data: &[u8],
         filters: &[FilterSpec],
         options: Rar29EncodeOptions,
-        _progress: Option<&mut dyn FnMut(usize) -> bool>,
+        progress: Option<&mut dyn FnMut(usize) -> bool>,
     ) -> Result<Vec<u8>> {
-        encode_rar29_filtered_members(data, filters, options)
+        Unpack29Encoder::with_options(options)
+            .encode_member_with_filters_and_progress(data, filters, progress)
+            .map_err(map_codec_cancel)
     }
 }
 
+#[cfg(test)]
 fn encode_rar29_auto_filtered_member(
     data: &[u8],
     options: Rar29EncodeOptions,
     lz_method: u8,
     include_ppmd: bool,
+) -> Result<EncodedPayload> {
+    encode_rar29_auto_filtered_member_with_progress(data, options, lz_method, include_ppmd, None)
+}
+
+fn encode_rar29_auto_filtered_member_with_progress(
+    data: &[u8],
+    options: Rar29EncodeOptions,
+    lz_method: u8,
+    include_ppmd: bool,
+    progress: Option<&WorkTracker<'_>>,
 ) -> Result<EncodedPayload> {
     if data.is_empty() {
         return Ok(EncodedPayload {
@@ -762,9 +831,28 @@ fn encode_rar29_auto_filtered_member(
     let searching = !text && crate::filter_search::search_applies(data);
     let mut best = EncodedPayload {
         data: if searching {
-            crate::filter_search::choose_filter(&Rar29Search, data, options, None)?.1
+            let mut last = 0usize;
+            crate::filter_search::choose_filter(
+                &Rar29Search,
+                data,
+                options,
+                Some(&mut |event| match event {
+                    crate::filter_search::EncodeProgress::PassStarted => {
+                        last = 0;
+                        !progress.is_some_and(WorkTracker::is_cancelled)
+                    }
+                    crate::filter_search::EncodeProgress::Advanced(position) => {
+                        let delta = position.saturating_sub(last);
+                        last = position;
+                        progress.is_none_or(|work| work.advance(delta as u64))
+                    }
+                }),
+            )?
+            .1
         } else {
-            unpack29_encode_literals_with_options(data, options).map_err(Error::from)?
+            with_codec_progress(progress, |report| {
+                unpack29_encode_literals_with_options_and_progress(data, options, report)
+            })?
         },
         method: lz_method,
     };
@@ -787,7 +875,15 @@ fn encode_rar29_auto_filtered_member(
     // both engines. Levels 1 to 4 skip the trial as they always have.
     if include_ppmd && text {
         let ppmd = EncodedPayload {
-            data: unpack29_encode_ppmd(data, options.max_match_distance).map_err(Error::from)?,
+            data: with_codec_progress(progress, |report| {
+                crate::codec::rar29::unpack29_encode_ppmd_with_progress(
+                    data,
+                    true,
+                    None,
+                    options.max_match_distance,
+                    report,
+                )
+            })?,
             method: lz_method,
         };
         if ppmd.data.len() < best.data.len() {
@@ -800,7 +896,11 @@ fn encode_rar29_auto_filtered_member(
         // member, paid only where PPMd is already being tried: text at the
         // top two levels.
         let ppmd_literals = EncodedPayload {
-            data: unpack29_encode_ppmd_literals(data).map_err(Error::from)?,
+            data: with_codec_progress(progress, |report| {
+                crate::codec::rar29::unpack29_encode_ppmd_with_progress(
+                    data, false, None, 0, report,
+                )
+            })?,
             method: lz_method,
         };
         if ppmd_literals.data.len() < best.data.len() {
@@ -1024,14 +1124,6 @@ impl<'a> Member<'a> {
         usize::try_from(self.bytes.len()?)
             .map_err(|_| Error::InvalidHeader("RAR 1.5 writer does not support large files"))
     }
-
-    /// Checksums a member without holding it, which is how a stored one is
-    /// written straight from its source.
-    fn checksum(&self) -> Result<u32> {
-        let mut crc = Crc32::new();
-        self.bytes.walk(|chunk| crc.update(chunk))?;
-        Ok(crc.finish())
-    }
 }
 
 struct EncodedMember<'a> {
@@ -1067,6 +1159,9 @@ fn encode_member<'a>(
     resources: &WriterResources,
     progress: Option<&WorkTracker<'_>>,
 ) -> Result<EncodedMember<'a>> {
+    if let Some(progress) = progress {
+        progress.check()?;
+    }
     let unpacked_size = member.unpacked_size()?;
     validate_member(member.name, unpacked_size)?;
     if member.is_directory {
@@ -1077,11 +1172,10 @@ fn encode_member<'a>(
             file_crc: 0,
         });
     }
-    let _permit = resources.acquire_serialising(member_workspace(
-        options,
-        unpacked_size as u64,
-        coding.compresses(),
-    ));
+    let _permit = resources.acquire_serialising_cancellable(
+        member_workspace(options, unpacked_size as u64, coding.compresses()),
+        &|| progress.is_some_and(WorkTracker::is_cancelled),
+    )?;
 
     // Legacy link targets must not become dependencies of later solid data:
     // reference readers handle links separately from the solid unpacker.
@@ -1103,12 +1197,41 @@ fn encode_member<'a>(
             payload: MemberPayload::Copied(source),
             method: 0x30,
             unpacked_size,
-            file_crc: member.checksum()?,
+            file_crc: {
+                let mut crc = Crc32::new();
+                member.bytes.walk_with_progress(
+                    progress.and_then(WorkTracker::reporter),
+                    |chunk| {
+                        crc.update(chunk);
+                        if let Some(progress) = progress {
+                            progress.advance(chunk.len() as u64);
+                        }
+                    },
+                )?;
+                crc.finish()
+            },
         });
     }
 
-    let data = member.bytes.load()?;
-    let file_crc = crc32(&data);
+    let data = member
+        .bytes
+        .load_with_progress(progress.and_then(WorkTracker::reporter))?;
+    let mut crc = Crc32::new();
+    for chunk in data.chunks(64 * 1024) {
+        if let Some(progress) = progress {
+            progress.check()?;
+        }
+        crc.update(chunk);
+        if !coding.compresses() {
+            if let Some(progress) = progress {
+                progress.advance(chunk.len() as u64);
+            }
+        }
+    }
+    let file_crc = crc.finish();
+    if let Some(progress) = progress {
+        progress.check()?;
+    }
     let payload = match coding {
         MemberCoding::Stored => EncodedPayload {
             data: data.into_owned(),
@@ -1118,7 +1241,7 @@ fn encode_member<'a>(
             encode_or_store_payload(&data, options, solid_encoder, progress)?
         }
         MemberCoding::Filtered(policy) => {
-            encode_filtered_payload(&data, policy, options, solid_encoder)?
+            encode_filtered_payload(&data, policy, options, solid_encoder, progress)?
         }
     };
     Ok(EncodedMember {
@@ -1137,12 +1260,15 @@ fn write_member(
     options: WriterOptions,
     solid_continuation: bool,
     header_password: Option<&[u8]>,
+    progress: Option<ProgressReporter<'_>>,
 ) -> Result<()> {
     let target = options.target;
+    crate::write_progress::check_cancelled(progress)?;
     validate_writer_password(target, member.password)?;
     let (payload, salt) = match encoded.payload {
         MemberPayload::Packed(mut packed) => {
-            let salt = encrypt_packed_data_for_writer(&mut packed, target, member.password)?;
+            let salt =
+                encrypt_packed_data_with_progress(&mut packed, target, member.password, progress)?;
             (MemberPayload::Packed(packed), salt)
         }
         // Unencrypted by construction, so the stored bytes are their own
@@ -1222,6 +1348,20 @@ pub fn write_stored_volumes(
     options: WriterOptions,
     max_packed_per_volume: usize,
 ) -> Result<Vec<Vec<u8>>> {
+    write_stored_volumes_with_progress(entry, options, max_packed_per_volume, None)
+}
+
+pub(crate) fn write_stored_volumes_with_progress(
+    entry: StoredEntry<'_>,
+    options: WriterOptions,
+    max_packed_per_volume: usize,
+    progress: Option<&dyn WriteProgress>,
+) -> Result<Vec<Vec<u8>>> {
+    let resources = WriterResources::default();
+    let control =
+        crate::write_progress::ResourceProgress::new(&resources, progress.map(ProgressReporter));
+    let progress = Some(&control as &dyn WriteProgress);
+    crate::write_progress::check_cancelled(progress.map(ProgressReporter))?;
     validate_plan(options, PlanShape::new().volumes(true), false, false)?;
     validate_volume_writer_inputs(
         entry.name,
@@ -1232,6 +1372,7 @@ pub fn write_stored_volumes(
     )?;
     if options.features.header_encryption {
         return write_header_encrypted_split_volumes(SplitVolumeRecord {
+            progress: progress.map(ProgressReporter),
             name: entry.name,
             unpacked: entry.data,
             packed: entry.data,
@@ -1249,6 +1390,7 @@ pub fn write_stored_volumes(
     }
 
     write_split_volumes(SplitVolumeRecord {
+        progress: progress.map(ProgressReporter),
         name: entry.name,
         unpacked: entry.data,
         packed: entry.data,
@@ -1279,6 +1421,11 @@ pub fn write_compressed_volumes_with_progress(
     max_packed_per_volume: usize,
     progress: Option<&dyn WriteProgress>,
 ) -> Result<Vec<Vec<u8>>> {
+    let resources = WriterResources::default();
+    let control =
+        crate::write_progress::ResourceProgress::new(&resources, progress.map(ProgressReporter));
+    let progress = Some(&control as &dyn WriteProgress);
+    crate::write_progress::check_cancelled(progress.map(ProgressReporter))?;
     let total_work = if options.target == ArchiveVersion::Rar20 && !options.features.solid {
         (entry.data.len() as u64).saturating_mul(2)
     } else {
@@ -1291,11 +1438,13 @@ pub fn write_compressed_volumes_with_progress(
         total_work,
     );
     let result = write_compressed_volumes_impl(entry, options, max_packed_per_volume, Some(&work));
-    if result.is_ok() && !work.finish() {
+    let result = result?;
+    if !work.finish() {
         return Err(Error::Cancelled);
     }
     report_compression_operation(progress, false, total_work, 1);
-    result
+    work.check()?;
+    Ok(result)
 }
 
 fn write_compressed_volumes_impl(
@@ -1330,6 +1479,7 @@ fn write_compressed_volumes_impl(
     let payload = encode_or_store_payload(entry.data, options, &mut solid_encoder, progress)?;
     if options.features.header_encryption {
         return write_header_encrypted_split_volumes(SplitVolumeRecord {
+            progress: progress.and_then(WorkTracker::reporter),
             name: entry.name,
             unpacked: entry.data,
             packed: &payload.data,
@@ -1347,6 +1497,7 @@ fn write_compressed_volumes_impl(
     }
 
     write_split_volumes(SplitVolumeRecord {
+        progress: progress.and_then(WorkTracker::reporter),
         name: entry.name,
         unpacked: entry.data,
         packed: &payload.data,
@@ -1717,6 +1868,7 @@ fn encode_filtered_payload(
     policy: &FilterPolicy,
     options: WriterOptions,
     solid_encoder: &mut Option<SolidEncoder>,
+    progress: Option<&WorkTracker<'_>>,
 ) -> Result<EncodedPayload> {
     let lz_method = compression_method_for_level(options)?;
     let codes_through_the_chain = lz_method != 0x30
@@ -1734,6 +1886,7 @@ fn encode_filtered_payload(
             rar29_encode_options_for_options(options)?,
             lz_method,
             ppmd_trial_pays(lz_method.saturating_sub(0x30)),
+            progress,
         );
     }
 
@@ -1745,11 +1898,23 @@ fn encode_filtered_payload(
     // Coding either one on its own would leave the encoder's history in place
     // while the headers said the chain had ended, so the member after it would
     // be coded against a dictionary its own flags told the decoder to discard.
-    let mut advance = |_position: usize| true;
-    let packed = match policy {
-        FilterPolicy::Explicit(filter) if !data.is_empty() => {
-            encoder.encode_member_with_filters(data, std::slice::from_ref(filter))?
+    let mut last = 0usize;
+    let mut advance = |position: usize| {
+        if position < last {
+            last = 0;
         }
+        let delta = position.saturating_sub(last);
+        last = position;
+        progress.is_none_or(|work| work.advance(delta as u64))
+    };
+    let packed = match policy {
+        FilterPolicy::Explicit(filter) if !data.is_empty() => encoder
+            .encode_member_with_filters_and_progress(
+                data,
+                std::slice::from_ref(filter),
+                Some(&mut advance),
+            )
+            .map_err(map_codec_cancel)?,
         // Naming a filter, or none, says nothing about which engine should code
         // the member. `--no-filter` used to answer that question too, and answer
         // it LZ, so asking a solid archive not to filter its binaries also took
@@ -1812,6 +1977,7 @@ fn encode_or_store_payload(
             encode_options,
             lz_method,
             ppmd_trial_pays(lz_method.saturating_sub(0x30)),
+            progress,
         );
     }
     let compressed = encode_compressed_payload(data, options, solid_encoder.as_mut(), progress)?;
@@ -1935,6 +2101,29 @@ fn map_codec_cancel(error: crate::codec::Error) -> Error {
     } else {
         Error::from(error)
     }
+}
+
+fn with_codec_progress(
+    progress: Option<&WorkTracker<'_>>,
+    encode: impl FnOnce(&mut dyn FnMut(usize) -> bool) -> crate::codec::Result<Vec<u8>>,
+) -> Result<Vec<u8>> {
+    if let Some(work) = progress {
+        work.check()?;
+    }
+    let mut last = 0usize;
+    let result = encode(&mut |position| {
+        if position < last {
+            last = 0;
+        }
+        let delta = position.saturating_sub(last);
+        last = position;
+        progress.is_none_or(|work| work.advance(delta as u64))
+    })
+    .map_err(map_codec_cancel)?;
+    if let Some(work) = progress {
+        work.check()?;
+    }
+    Ok(result)
 }
 
 fn should_store_fallback(
@@ -2089,19 +2278,37 @@ fn encrypt_packed_data_for_writer(
     target: ArchiveVersion,
     password: Option<&[u8]>,
 ) -> Result<Option<[u8; 8]>> {
+    encrypt_packed_data_with_progress(data, target, password, None)
+}
+
+fn encrypt_packed_data_with_progress(
+    data: &mut Vec<u8>,
+    target: ArchiveVersion,
+    password: Option<&[u8]>,
+    progress: Option<ProgressReporter<'_>>,
+) -> Result<Option<[u8; 8]>> {
+    crate::write_progress::check_cancelled(progress)?;
     let Some(password) = password else {
         return Ok(None);
     };
     validate_writer_password(target, Some(password))?;
     match target {
         ArchiveVersion::Rar15 => {
-            Rar15Cipher::new(password).crypt_in_place(data);
+            let mut cipher = Rar15Cipher::new(password);
+            for chunk in data.chunks_mut(64 * 1024) {
+                crate::write_progress::check_cancelled(progress)?;
+                cipher.crypt_in_place(chunk);
+            }
             Ok(None)
         }
         ArchiveVersion::Rar20 => {
             let padded_len = checked_align16(data.len(), RAR15_ALIGN_OVERFLOW)?;
             data.resize(padded_len, 0);
-            Rar20Cipher::new(password).encrypt_in_place(data)?;
+            let mut cipher = Rar20Cipher::new(password);
+            for chunk in data.chunks_mut(64 * 1024) {
+                crate::write_progress::check_cancelled(progress)?;
+                cipher.encrypt_in_place(chunk)?;
+            }
             Ok(None)
         }
         ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40 => {
@@ -2114,10 +2321,14 @@ fn encrypt_packed_data_for_writer(
                         "RAR 3.x encrypted data size overflows",
                     ))?;
             data.resize(padded_len, 0);
-            Rar30Cipher::new(password, Some(salt))
-                .map_err(super::map_rar30_crypto_error)?
-                .encrypt_in_place(data)
-                .map_err(super::map_rar30_crypto_error)?;
+            let mut cipher =
+                Rar30Cipher::new(password, Some(salt)).map_err(super::map_rar30_crypto_error)?;
+            for chunk in data.chunks_mut(64 * 1024) {
+                crate::write_progress::check_cancelled(progress)?;
+                cipher
+                    .encrypt_in_place(chunk)
+                    .map_err(super::map_rar30_crypto_error)?;
+            }
             Ok(Some(salt))
         }
         _ => Err(Error::UnsupportedFeature {
@@ -2397,6 +2608,7 @@ fn dictionary_flags_for_target(target: ArchiveVersion) -> u16 {
 }
 
 struct SplitVolumeRecord<'a> {
+    progress: Option<ProgressReporter<'a>>,
     name: &'a [u8],
     unpacked: &'a [u8],
     packed: &'a [u8],
@@ -2412,7 +2624,24 @@ struct SplitVolumeRecord<'a> {
     max_packed_per_volume: usize,
 }
 
+fn report_volume(
+    progress: Option<ProgressReporter<'_>>,
+    index: usize,
+    total: usize,
+    bytes: usize,
+) -> Result<()> {
+    if let Some(progress) = progress {
+        progress.report(WriteProgressEvent::VolumeFinished {
+            volume_number: index + 1,
+            total_volumes: Some(total),
+            bytes: bytes as u64,
+        });
+    }
+    crate::write_progress::check_cancelled(progress)
+}
+
 fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
+    crate::write_progress::check_cancelled(entry.progress)?;
     if entry.max_packed_per_volume == 0 {
         return Err(Error::InvalidHeader(
             "RAR 1.5 volume payload size must be non-zero",
@@ -2443,6 +2672,7 @@ fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
     let mut volumes = Vec::with_capacity(chunks.len());
     let unpacked_crc = crc32(entry.unpacked);
     for (index, chunk) in chunks.iter().enumerate() {
+        crate::write_progress::check_cancelled(entry.progress)?;
         let split_before = index > 0;
         let split_after = index + 1 < chunks.len();
         let mut file_flags = base_flags;
@@ -2485,6 +2715,7 @@ fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
             },
             chunk,
         )?;
+        report_volume(entry.progress, index, chunks.len(), out.len())?;
         volumes.push(out);
     }
 
@@ -2492,6 +2723,7 @@ fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
 }
 
 fn write_header_encrypted_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
+    crate::write_progress::check_cancelled(entry.progress)?;
     validate_header_encrypted_archive_options(entry.target, entry.password.is_some())?;
     let password = entry.password.ok_or(Error::NeedPassword)?;
     if entry.max_packed_per_volume == 0 {
@@ -2519,6 +2751,7 @@ fn write_header_encrypted_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<
     let mut volumes = Vec::with_capacity(chunks.len());
     let unpacked_crc = crc32(entry.unpacked);
     for (index, chunk) in chunks.iter().enumerate() {
+        crate::write_progress::check_cancelled(entry.progress)?;
         let split_before = index > 0;
         let split_after = index + 1 < chunks.len();
         let mut file_flags = base_flags;
@@ -2563,6 +2796,7 @@ fn write_header_encrypted_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<
         )?;
         write_encrypted_header(&mut out, &header, password)?;
         out.extend_from_slice(chunk);
+        report_volume(entry.progress, index, chunks.len(), out.len())?;
         volumes.push(out);
     }
 

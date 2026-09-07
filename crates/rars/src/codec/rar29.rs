@@ -163,6 +163,39 @@ pub fn unpack29_encode_ppmd_literals(input: &[u8]) -> Result<Vec<u8>> {
     encode_ppmd_member(input, false, &[], 0)
 }
 
+pub(crate) fn unpack29_encode_ppmd_with_progress(
+    input: &[u8],
+    lz_escapes: bool,
+    filter: Option<crate::FilterSpec>,
+    max_match_distance: usize,
+    progress: &mut dyn FnMut(usize) -> bool,
+) -> Result<Vec<u8>> {
+    if !progress(0) {
+        return Err(Error::Cancelled);
+    }
+    let filtered = filter
+        .map(|filter| {
+            let filters = split_large_filter(input.len(), filter)?;
+            filtered_members(input, &filters)
+        })
+        .transpose()?;
+    let records = if let Some(filtered) = &filtered {
+        let refs: Vec<_> = filtered.records.iter().collect();
+        encoded_filter_records_at(&refs, 0, usize::MAX, &mut Vec::new())?
+    } else {
+        Vec::new()
+    };
+    encode_ppmd_block_with_model(
+        filtered.as_ref().map_or(input, |filtered| &filtered.data),
+        lz_escapes,
+        &records,
+        max_match_distance,
+        None,
+        Some(progress),
+    )
+    .map(|(packed, _)| packed)
+}
+
 /// `max_match_distance` is the dictionary the file header declares. PPMd's
 /// escape-4 matches copy out of the same window the LZ decoder uses, so a match
 /// that reaches further back than the header promises lands on whatever the
@@ -317,8 +350,15 @@ fn encode_ppmd_block(
     initial_filters: &[Vec<u8>],
     max_match_distance: usize,
 ) -> Result<Vec<u8>> {
-    encode_ppmd_block_with_model(input, lz_escapes, initial_filters, max_match_distance, None)
-        .map(|(packed, _)| packed)
+    encode_ppmd_block_with_model(
+        input,
+        lz_escapes,
+        initial_filters,
+        max_match_distance,
+        None,
+        None,
+    )
+    .map(|(packed, _)| packed)
 }
 
 /// Codes one PPMd block, either starting a model or carrying one on.
@@ -337,7 +377,11 @@ fn encode_ppmd_block_with_model(
     initial_filters: &[Vec<u8>],
     max_match_distance: usize,
     model: Option<PpmdDecoder>,
+    mut progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<(Vec<u8>, PpmdDecoder)> {
+    if progress.as_mut().is_some_and(|report| !report(0)) {
+        return Err(Error::Cancelled);
+    }
     let mut out = Vec::new();
     let mut encoder = match model {
         Some(model) => {
@@ -354,14 +398,29 @@ fn encode_ppmd_block_with_model(
         encoder.encode_vm_filter_record(record)?;
     }
     if lz_escapes {
-        encode_ppmd_hybrid(input, max_match_distance, &mut encoder, |_| ())?;
+        let mut report = |position| progress.as_mut().is_none_or(|report| report(position));
+        encode_ppmd_hybrid_with_progress(
+            input,
+            max_match_distance,
+            &mut encoder,
+            |_| (),
+            Some(&mut report),
+        )?;
     } else {
-        for &byte in input {
+        for (position, &byte) in input.iter().enumerate() {
+            if position.is_multiple_of(4096)
+                && progress.as_mut().is_some_and(|report| !report(position))
+            {
+                return Err(Error::Cancelled);
+            }
             encoder.encode_literal(byte)?;
         }
     }
     let (packed, model) = encoder.finish_keeping_model()?;
     out.extend_from_slice(&packed);
+    if progress.as_mut().is_some_and(|report| !report(input.len())) {
+        return Err(Error::Cancelled);
+    }
     Ok((out, model))
 }
 
@@ -639,7 +698,7 @@ impl Unpack29Encoder {
         progress: &mut dyn FnMut(usize) -> bool,
     ) -> Result<Vec<u8>> {
         if engine == ChainEngine::Ppmd {
-            let (packed, model) = self.encode_ppmd_member(input)?;
+            let (packed, model) = self.encode_ppmd_member(input, progress)?;
             self.ppmd = Some(model);
             self.remember(input);
             return Ok(packed);
@@ -648,7 +707,9 @@ impl Unpack29Encoder {
         let lz = self.best_lz_candidate(input, candidates, progress)?;
 
         let ppmd = match engine {
-            ChainEngine::Smaller => Some(self.encode_ppmd_member(input)?),
+            ChainEngine::Smaller => {
+                Some(self.encode_ppmd_member(input, &mut |_| progress(input.len()))?)
+            }
             _ => None,
         };
 
@@ -679,7 +740,8 @@ impl Unpack29Encoder {
     /// encodes here measure. They are the real thing, against the real history,
     /// at the caller's real settings.
     ///
-    /// Only the first candidate reports progress. Every candidate walks the
+    /// Only the first candidate advances progress; later candidates poll at
+    /// the completed byte count for cancellation. Every candidate walks the
     /// whole member, and the bar counts bytes coded rather than work done, so
     /// reporting each one over again would run it past the end of the member
     /// and back. The plain candidate comes first, so what the bar shows is one
@@ -698,15 +760,8 @@ impl Unpack29Encoder {
         };
         let mut best: Option<LzCandidate> = None;
         for (index, filters) in candidates.iter().enumerate() {
-            let mut reported = index == 0;
-            let mut report = |position: usize| {
-                if !reported {
-                    return true;
-                }
-                let carry_on = progress(position);
-                reported = carry_on;
-                carry_on
-            };
+            let mut report =
+                |position: usize| progress(if index == 0 { position } else { input.len() });
             let mut levels = self.levels;
             let candidate = if filters.is_empty() {
                 LzCandidate {
@@ -746,10 +801,8 @@ impl Unpack29Encoder {
             {
                 best = Some(candidate);
             }
-            // A later candidate reports nothing, so a cancel raised while one
-            // is running would otherwise wait for the next member. Reporting
-            // the position the member has already reached moves the bar by
-            // nothing and answers the only question left: carry on or not.
+            // Check again after committing the candidate, without moving the
+            // byte count backwards for repeated work on the same member.
             if index > 0 && !progress(input.len()) {
                 return Err(Error::Cancelled);
             }
@@ -759,13 +812,18 @@ impl Unpack29Encoder {
 
     /// Codes the member against a copy of the chain's model, so a trial that
     /// loses leaves the reader's model where the winning member expects it.
-    fn encode_ppmd_member(&self, input: &[u8]) -> Result<(Vec<u8>, PpmdDecoder)> {
+    fn encode_ppmd_member(
+        &self,
+        input: &[u8],
+        progress: &mut dyn FnMut(usize) -> bool,
+    ) -> Result<(Vec<u8>, PpmdDecoder)> {
         encode_ppmd_block_with_model(
             input,
             true,
             &[],
             self.options.max_match_distance,
             self.ppmd.clone(),
+            Some(progress),
         )
     }
 
@@ -797,6 +855,18 @@ impl Unpack29Encoder {
         input: &[u8],
         filters: &[crate::FilterSpec],
     ) -> Result<Vec<u8>> {
+        self.encode_member_with_filters_and_progress(input, filters, None)
+    }
+
+    pub(crate) fn encode_member_with_filters_and_progress(
+        &mut self,
+        input: &[u8],
+        filters: &[crate::FilterSpec],
+        mut progress: Option<&mut dyn FnMut(usize) -> bool>,
+    ) -> Result<Vec<u8>> {
+        if progress.as_mut().is_some_and(|report| !report(0)) {
+            return Err(Error::Cancelled);
+        }
         let mut split_filters = Vec::new();
         for filter in filters {
             split_filters.extend(split_large_filter(input.len(), filter.clone())?);
@@ -808,7 +878,7 @@ impl Unpack29Encoder {
             &filtered.records,
             self.options,
             &mut self.levels,
-            None,
+            progress,
         )?;
         // The LZ layer coded the filtered bytes, so that is what a decoder's
         // window holds and what the next member in a solid chain can match
@@ -1698,17 +1768,35 @@ fn ema(slot: &mut f64, sample: f64, weight: f64) {
 ///
 /// `on_token` sees every emitted token, in order. Production passes a no-op;
 /// the tests collect them.
+#[cfg(test)]
 fn encode_ppmd_hybrid(
     input: &[u8],
     max_match_distance: usize,
     encoder: &mut PpmdEncoder,
+    on_token: impl FnMut(PpmdEncodeToken),
+) -> Result<()> {
+    encode_ppmd_hybrid_with_progress(input, max_match_distance, encoder, on_token, None)
+}
+
+fn encode_ppmd_hybrid_with_progress(
+    input: &[u8],
+    max_match_distance: usize,
+    encoder: &mut PpmdEncoder,
     mut on_token: impl FnMut(PpmdEncodeToken),
+    mut progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<()> {
     let mut costs = PpmdTokenCosts::new();
     let mut finder = Rar29MatchFinder::new(input.len());
     let mut pos = 0usize;
     let mut search_from = 0usize;
+    let mut next_check = 0usize;
     while pos < input.len() {
+        if pos >= next_check {
+            if progress.as_mut().is_some_and(|report| !report(pos)) {
+                return Err(Error::Cancelled);
+            }
+            next_check = pos.saturating_add(4096);
+        }
         if let Some(length) = ppmd_offset_one_repeat(input, pos) {
             if costs.repeat_pays(length) {
                 let before = encoder.spent_bits();
@@ -3750,6 +3838,40 @@ fn audio_decode_with_control(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ppmd_progress_preserves_bytes_and_interrupts_both_engines() {
+        let input = b"PPMd cooperative cancellation payload\n".repeat(400);
+        for escapes in [false, true] {
+            let expected = if escapes {
+                super::unpack29_encode_ppmd(&input, 1 << 20).unwrap()
+            } else {
+                super::unpack29_encode_ppmd_literals(&input).unwrap()
+            };
+            let actual = super::unpack29_encode_ppmd_with_progress(
+                &input,
+                escapes,
+                None,
+                1 << 20,
+                &mut |_| true,
+            )
+            .unwrap();
+            assert_eq!(actual, expected);
+            let mut stopped_at = 0;
+            let result = super::unpack29_encode_ppmd_with_progress(
+                &input,
+                escapes,
+                None,
+                1 << 20,
+                &mut |position| {
+                    stopped_at = position;
+                    position < 4096
+                },
+            );
+            assert!(matches!(result, Err(super::Error::Cancelled)));
+            assert!(stopped_at >= 4096 && stopped_at < input.len());
+        }
+    }
+
     use super::{audio_decode_with_control, itanium_decode_with_control, rgb_decode_with_control};
 
     #[test]

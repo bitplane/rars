@@ -7,6 +7,7 @@
 //! are thin translations of the type below, which is the point of it living
 //! here rather than in one of them.
 
+use crate::write_progress::{check_cancelled, CancellableIo, ProgressReporter, ResourceProgress};
 use crate::{
     rar13, rar15_40, rar50, ArchiveFamily, ArchiveVersion, EntrySource, Error, FeatureSet, Result,
     WriteProgress, WriterResources,
@@ -944,7 +945,15 @@ impl Builder {
             self.write_streaming_rar50(&mut output, &WriterResources::default(), progress)?;
             return Ok(output);
         }
-        self.materialized()?.build_single(progress)
+        let resources = WriterResources::default();
+        let progress = ResourceProgress::new(&resources, progress.map(ProgressReporter));
+        let reporting = Some(ProgressReporter(&progress));
+        check_cancelled(reporting)?;
+        let data = self
+            .materialized(reporting)?
+            .build_single(Some(&progress))?;
+        check_cancelled(reporting)?;
+        Ok(data)
     }
 
     /// Write the archive to `output`.
@@ -963,8 +972,41 @@ impl Builder {
         if self.streams_rar50() {
             return self.write_streaming_rar50(output, resources, progress);
         }
-        let data = self.materialized()?.build_single(progress)?;
-        output.write_all(&data)?;
+        let progress = ResourceProgress::new(resources, progress.map(ProgressReporter));
+        let reporting = Some(ProgressReporter(&progress));
+        check_cancelled(reporting)?;
+        let data = self
+            .materialized(reporting)?
+            .build_single(Some(&progress))?;
+        check_cancelled(reporting)?;
+        progress.report(crate::WriteProgressEvent::OperationStarted {
+            operation: crate::WriteOperation::Emission,
+            total_bytes: Some(data.len() as u64),
+            total_entries: None,
+            pass: 1,
+        });
+        let mut output = CancellableIo {
+            inner: output,
+            progress: reporting,
+        };
+        for (index, chunk) in data.chunks(64 * 1024).enumerate() {
+            output.write_all(chunk)?;
+            progress.report(crate::WriteProgressEvent::Advanced {
+                operation: crate::WriteOperation::Emission,
+                completed_bytes: ((index + 1) * 64 * 1024).min(data.len()) as u64,
+                total_bytes: data.len() as u64,
+                pass: 1,
+            });
+            check_cancelled(reporting)?;
+        }
+        check_cancelled(reporting)?;
+        progress.report(crate::WriteProgressEvent::OperationFinished {
+            operation: crate::WriteOperation::Emission,
+            total_bytes: Some(data.len() as u64),
+            total_entries: None,
+            pass: 1,
+        });
+        check_cancelled(reporting)?;
         Ok(())
     }
 
@@ -990,6 +1032,7 @@ impl Builder {
         // open files. Declaration order also closes it first during unwinding.
         drop(output);
         result?;
+        check_cancelled(progress.map(ProgressReporter))?;
         fs::rename(pending.path.as_ref().unwrap(), path)?;
         pending.path = None;
         Ok(())
@@ -1000,6 +1043,10 @@ impl Builder {
     /// Requires [`volume_size`](Self::volume_size). Naming the parts on disk is
     /// the caller's job, because the two families number them differently.
     pub fn build_volumes(&self, progress: Option<&dyn WriteProgress>) -> Result<Vec<Vec<u8>>> {
+        let resources = WriterResources::default();
+        let control = ResourceProgress::new(&resources, progress.map(ProgressReporter));
+        let progress = Some(&control as &dyn WriteProgress);
+        check_cancelled(progress.map(ProgressReporter))?;
         if self.legacy_unpack_version.is_some() {
             return Err(Error::InvalidArgument(
                 "retained legacy unpacker version requires single-archive output",
@@ -1050,12 +1097,14 @@ impl Builder {
                 "symbolic links are not supported in volume output",
             ));
         }
-        let this = self.materialized()?;
-        match self.format.family() {
+        let this = self.materialized(progress.map(ProgressReporter))?;
+        let result = match self.format.family() {
             ArchiveFamily::Rar50Plus => this.build_rar50_volumes(volume_size, progress),
             ArchiveFamily::Rar15To40 => this.build_rar15_volumes(volume_size, progress),
             ArchiveFamily::Rar13 => this.build_rar13_volumes(volume_size, progress),
-        }
+        }?;
+        check_cancelled(progress.map(ProgressReporter))?;
+        Ok(result)
     }
 
     /// Whether writing goes through the streaming RAR 5 writer, which serves
@@ -1091,7 +1140,11 @@ impl Builder {
     /// A copy with every source read into memory, for the writers that cannot
     /// take one. Returns a borrow when there is nothing to read, so the common
     /// case does not copy the members twice.
-    fn materialized(&self) -> Result<std::borrow::Cow<'_, Self>> {
+    fn materialized(
+        &self,
+        progress: Option<ProgressReporter<'_>>,
+    ) -> Result<std::borrow::Cow<'_, Self>> {
+        check_cancelled(progress)?;
         if self.streams_rar50() || !self.entries.iter().any(|entry| entry.source.is_some()) {
             return Ok(std::borrow::Cow::Borrowed(self));
         }
@@ -1099,7 +1152,7 @@ impl Builder {
         for entry in &mut owned.entries {
             if let Some(source) = entry.source.take() {
                 entry.data = crate::write_stream::MemberBytes::Source(&source)
-                    .load()?
+                    .load_with_progress(progress)?
                     .into_owned();
             }
         }
@@ -1328,7 +1381,12 @@ impl Builder {
                     file_comment: entry.file_comment.as_deref(),
                 })
                 .collect();
-            rar13::write_stored_archive_with_comment(&entries, options, self.comment.as_deref())
+            rar13::write_stored_archive_with_comment_and_progress(
+                &entries,
+                options,
+                self.comment.as_deref(),
+                progress,
+            )
         } else {
             let entries: Vec<_> = self
                 .entries
@@ -1396,7 +1454,7 @@ impl Builder {
         let entry = self.single_volume_entry()?;
         let options = self.rar15_options();
         if self.store {
-            rar15_40::write_stored_volumes(
+            rar15_40::write_stored_volumes_with_progress(
                 rar15_40::StoredEntry {
                     name: &entry.name,
                     data: &entry.data,
@@ -1408,6 +1466,7 @@ impl Builder {
                 },
                 options,
                 volume_size,
+                progress,
             )
         } else {
             rar15_40::write_compressed_volumes_with_progress(
@@ -1435,7 +1494,7 @@ impl Builder {
         let entry = self.single_volume_entry()?;
         let options = self.rar13_options();
         if self.store {
-            rar13::write_stored_volumes(
+            rar13::write_stored_volumes_with_progress(
                 rar13::StoredEntry {
                     name: &entry.name,
                     data: &entry.data,
@@ -1446,6 +1505,7 @@ impl Builder {
                 },
                 options,
                 volume_size,
+                progress,
             )
         } else {
             rar13::write_compressed_volumes_with_progress(

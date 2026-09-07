@@ -33,7 +33,16 @@ impl<'a> MemberBytes<'a> {
     }
 
     /// The whole member, borrowed when the caller already had it.
+    #[cfg(test)]
     pub(crate) fn load(&self) -> Result<Cow<'_, [u8]>> {
+        self.load_with_progress(None)
+    }
+
+    pub(crate) fn load_with_progress(
+        &self,
+        progress: Option<crate::write_progress::ProgressReporter<'_>>,
+    ) -> Result<Cow<'_, [u8]>> {
+        crate::write_progress::check_cancelled(progress)?;
         match self {
             Self::Borrowed(data) => Ok(Cow::Borrowed(data)),
             Self::Source(source) => {
@@ -42,14 +51,20 @@ impl<'a> MemberBytes<'a> {
                     Error::InvalidHeader("member is larger than this host can hold")
                 })?;
                 let mut data = Vec::with_capacity(capacity);
-                let mut reader = source.open()?;
+                crate::write_progress::check_cancelled(progress)?;
+                let mut reader = crate::write_progress::CancellableIo {
+                    inner: source.open()?,
+                    progress,
+                };
                 reader.by_ref().take(expected).read_to_end(&mut data)?;
+                crate::write_progress::check_cancelled(progress)?;
                 check_source_length(
-                    &mut *reader,
+                    &mut reader,
                     data.len() as u64,
                     expected,
                     "entry source size changed while compressing",
                 )?;
+                crate::write_progress::check_cancelled(progress)?;
                 Ok(Cow::Owned(data))
             }
         }
@@ -57,12 +72,31 @@ impl<'a> MemberBytes<'a> {
 
     /// Walks the member in chunks without holding it, which is how a stored
     /// one is checksummed on its way through.
-    pub(crate) fn walk(&self, mut visit: impl FnMut(&[u8])) -> Result<()> {
+    #[cfg(test)]
+    pub(crate) fn walk(&self, visit: impl FnMut(&[u8])) -> Result<()> {
+        self.walk_with_progress(None, visit)
+    }
+
+    pub(crate) fn walk_with_progress(
+        &self,
+        progress: Option<crate::write_progress::ProgressReporter<'_>>,
+        mut visit: impl FnMut(&[u8]),
+    ) -> Result<()> {
+        crate::write_progress::check_cancelled(progress)?;
         match self {
-            Self::Borrowed(data) => visit(data),
+            Self::Borrowed(data) => {
+                for chunk in data.chunks(WALK_CHUNK) {
+                    crate::write_progress::check_cancelled(progress)?;
+                    visit(chunk);
+                }
+            }
             Self::Source(source) => {
                 let expected = source.len()?;
-                let mut reader = source.open()?;
+                crate::write_progress::check_cancelled(progress)?;
+                let mut reader = crate::write_progress::CancellableIo {
+                    inner: source.open()?,
+                    progress,
+                };
                 let mut limited = reader.by_ref().take(expected);
                 let mut observed = 0;
                 let mut buffer = vec![0u8; WALK_CHUNK];
@@ -74,14 +108,16 @@ impl<'a> MemberBytes<'a> {
                     observed += read as u64;
                     visit(&buffer[..read]);
                 }
+                crate::write_progress::check_cancelled(progress)?;
                 check_source_length(
-                    &mut *reader,
+                    &mut reader,
                     observed,
                     expected,
                     "entry source size changed while reading",
                 )?;
             }
         }
+        crate::write_progress::check_cancelled(progress)?;
         Ok(())
     }
 

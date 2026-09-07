@@ -1369,13 +1369,22 @@ pub fn write_stored_archive_with_comment(
     options: WriterOptions,
     archive_comment: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
+    write_stored_archive_with_comment_and_progress(entries, options, archive_comment, None)
+}
+
+pub(crate) fn write_stored_archive_with_comment_and_progress(
+    entries: &[StoredEntry<'_>],
+    options: WriterOptions,
+    archive_comment: Option<&[u8]>,
+    progress: Option<&dyn WriteProgress>,
+) -> Result<Vec<u8>> {
     let members: Vec<_> = entries.iter().map(Member::from_stored).collect();
     collect_archive(
         &members,
         options,
         MemberCoding::Stored,
         archive_comment,
-        None,
+        progress,
     )
 }
 
@@ -1484,14 +1493,6 @@ impl<'a> Member<'a> {
         usize::try_from(self.bytes.len()?)
             .map_err(|_| Error::InvalidHeader("RAR 1.3 file is larger than 32-bit size fields"))
     }
-
-    /// Checksums a member without holding it, which is how a stored one is
-    /// written straight from its source.
-    fn checksum(&self) -> Result<u16> {
-        let mut checksum = Rar13Checksum::new();
-        self.bytes.walk(|chunk| checksum.update(chunk))?;
-        Ok(checksum.finish())
-    }
 }
 
 /// Runs the streaming writer into a buffer, for the callers that want the
@@ -1525,6 +1526,15 @@ fn write_archive_to(
     progress: Option<&dyn WriteProgress>,
     output: &mut dyn Write,
 ) -> Result<()> {
+    let control =
+        crate::write_progress::ResourceProgress::new(resources, progress.map(ProgressReporter));
+    let progress = Some(&control as &dyn WriteProgress);
+    crate::write_progress::check_cancelled(progress.map(ProgressReporter))?;
+    let mut output = crate::write_progress::CancellableIo {
+        inner: output,
+        progress: progress.map(ProgressReporter),
+    };
+    let output = &mut output as &mut dyn Write;
     if !options.target.is_rar13_family() {
         return Err(Error::UnsupportedVersion(options.target));
     }
@@ -1558,7 +1568,7 @@ fn write_archive_to(
             rar15_encode_fallback_options(encode_options).len() as u64
         };
     let total_work = total_bytes.saturating_mul(attempts);
-    let reporting = coding.compresses().then_some(progress).flatten();
+    let reporting = progress;
     report_compression_operation(reporting, true, total_work, members.len());
     let work = WorkTracker::new(
         reporting.map(ProgressReporter),
@@ -1567,8 +1577,10 @@ fn write_archive_to(
     );
 
     for (index, member) in members.iter().enumerate() {
+        work.check()?;
         let unpacked_size = member.unpacked_size()?;
         report_compression_entry(reporting, true, index, members.len(), member, unpacked_size);
+        work.check()?;
         let encoded = encode_member(
             member,
             options,
@@ -1578,7 +1590,7 @@ fn write_archive_to(
             resources,
             &work,
         )?;
-        write_member(output, member, encoded, options)?;
+        write_member(output, member, encoded, options, work.reporter())?;
         report_compression_entry(
             reporting,
             false,
@@ -1593,6 +1605,7 @@ fn write_archive_to(
         return Err(Error::Cancelled);
     }
     report_compression_operation(reporting, false, total_work, members.len());
+    work.check()?;
     Ok(())
 }
 
@@ -1623,6 +1636,7 @@ fn encode_member<'a>(
     resources: &WriterResources,
     work: &WorkTracker<'_>,
 ) -> Result<EncodedMember<'a>> {
+    work.check()?;
     let unpacked_size = member.unpacked_size()?;
     validate_member(member.name, unpacked_size)?;
     if member.file_attr & 0x10 != 0 {
@@ -1638,8 +1652,10 @@ fn encode_member<'a>(
             file_crc: file_checksum(&[]),
         });
     }
-    let _permit =
-        resources.acquire_serialising(member_workspace(unpacked_size as u64, coding.compresses()));
+    let _permit = resources.acquire_serialising_cancellable(
+        member_workspace(unpacked_size as u64, coding.compresses()),
+        &|| work.is_cancelled(),
+    )?;
 
     // A stored member never needs to be resident: checksum it from its source
     // and let the writer copy it straight through.
@@ -1650,12 +1666,28 @@ fn encode_member<'a>(
             payload: MemberPayload::Copied(source),
             method: METHOD_STORE,
             unpacked_size,
-            file_crc: member.checksum()?,
+            file_crc: {
+                let mut checksum = Rar13Checksum::new();
+                member.bytes.walk_with_progress(work.reporter(), |chunk| {
+                    checksum.update(chunk);
+                    work.advance(chunk.len() as u64);
+                })?;
+                checksum.finish()
+            },
         });
     }
 
-    let data = member.bytes.load()?;
-    let file_crc = file_checksum(&data);
+    let data = member.bytes.load_with_progress(work.reporter())?;
+    let mut checksum = Rar13Checksum::new();
+    for chunk in data.chunks(64 * 1024) {
+        work.check()?;
+        checksum.update(chunk);
+        if !coding.compresses() {
+            work.advance(chunk.len() as u64);
+        }
+    }
+    let file_crc = checksum.finish();
+    work.check()?;
     if !coding.compresses() {
         return Ok(EncodedMember {
             payload: MemberPayload::Packed(data.into_owned()),
@@ -1709,11 +1741,19 @@ fn write_member(
     member: &Member<'_>,
     encoded: EncodedMember<'_>,
     options: WriterOptions,
+    progress: Option<ProgressReporter<'_>>,
 ) -> Result<()> {
+    crate::write_progress::check_cancelled(progress)?;
     let payload = match encoded.payload {
         MemberPayload::Packed(mut packed) => {
             if let Some(password) = member.password {
-                Rar13Cipher::new(password).encrypt_in_place(&mut packed);
+                let mut cipher = Rar13Cipher::new(password);
+                for chunk in packed.chunks_mut(64 * 1024) {
+                    crate::write_progress::check_cancelled(progress)?;
+                    for byte in chunk {
+                        *byte = cipher.encrypt_byte(*byte);
+                    }
+                }
             }
             MemberPayload::Packed(packed)
         }
@@ -1778,6 +1818,20 @@ pub fn write_stored_volumes(
     options: WriterOptions,
     max_packed_per_volume: usize,
 ) -> Result<Vec<Vec<u8>>> {
+    write_stored_volumes_with_progress(entry, options, max_packed_per_volume, None)
+}
+
+pub(crate) fn write_stored_volumes_with_progress(
+    entry: StoredEntry<'_>,
+    options: WriterOptions,
+    max_packed_per_volume: usize,
+    progress: Option<&dyn WriteProgress>,
+) -> Result<Vec<Vec<u8>>> {
+    let resources = WriterResources::default();
+    let control =
+        crate::write_progress::ResourceProgress::new(&resources, progress.map(ProgressReporter));
+    let progress = Some(&control as &dyn WriteProgress);
+    crate::write_progress::check_cancelled(progress.map(ProgressReporter))?;
     if !options.target.is_rar13_family() {
         return Err(Error::UnsupportedVersion(options.target));
     }
@@ -1795,6 +1849,7 @@ pub fn write_stored_volumes(
         name: entry.name,
         unpacked: entry.data,
         packed: &body,
+        progress: progress.map(ProgressReporter),
         file_time: entry.file_time,
         file_attr: entry.file_attr,
         method: METHOD_STORE,
@@ -1818,6 +1873,11 @@ pub fn write_compressed_volumes_with_progress(
     max_packed_per_volume: usize,
     progress: Option<&dyn WriteProgress>,
 ) -> Result<Vec<Vec<u8>>> {
+    let resources = WriterResources::default();
+    let control =
+        crate::write_progress::ResourceProgress::new(&resources, progress.map(ProgressReporter));
+    let progress = Some(&control as &dyn WriteProgress);
+    crate::write_progress::check_cancelled(progress.map(ProgressReporter))?;
     if !options.target.is_rar13_family() {
         return Err(Error::UnsupportedVersion(options.target));
     }
@@ -1870,6 +1930,7 @@ pub fn write_compressed_volumes_with_progress(
         name: entry.name,
         unpacked: entry.data,
         packed: &packed,
+        progress: work.reporter(),
         file_time: entry.file_time,
         file_attr: entry.file_attr,
         method,
@@ -1885,11 +1946,13 @@ pub fn write_compressed_volumes_with_progress(
         &Member::from_file(&entry),
         entry.data.len(),
     );
-    if result.is_ok() && !work.finish() {
+    let result = result?;
+    if !work.finish() {
         return Err(Error::Cancelled);
     }
     report_compression_operation(progress, false, total_work, 1);
-    result
+    work.check()?;
+    Ok(result)
 }
 
 fn report_compression_operation(
@@ -2131,6 +2194,7 @@ fn write_file_header(out: &mut Vec<u8>, entry: FileEntryRecord<'_>) -> Result<()
 }
 
 struct SplitVolumeRecord<'a> {
+    progress: Option<ProgressReporter<'a>>,
     name: &'a [u8],
     unpacked: &'a [u8],
     packed: &'a [u8],
@@ -2143,6 +2207,7 @@ struct SplitVolumeRecord<'a> {
 }
 
 fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
+    crate::write_progress::check_cancelled(entry.progress)?;
     if entry.max_packed_per_volume == 0 {
         return Err(Error::InvalidHeader(
             "RAR 1.3 volume payload size must be non-zero",
@@ -2160,6 +2225,7 @@ fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
 
     let mut volumes = Vec::with_capacity(chunks.len());
     for (index, chunk) in chunks.iter().enumerate() {
+        crate::write_progress::check_cancelled(entry.progress)?;
         let split_before = index > 0;
         let split_after = index + 1 < chunks.len();
         let mut flags = entry.base_flags;
@@ -2192,6 +2258,14 @@ fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
             },
             chunk,
         )?;
+        if let Some(progress) = entry.progress {
+            progress.report(WriteProgressEvent::VolumeFinished {
+                volume_number: index + 1,
+                total_volumes: Some(chunks.len()),
+                bytes: out.len() as u64,
+            });
+        }
+        crate::write_progress::check_cancelled(entry.progress)?;
         volumes.push(out);
     }
 

@@ -277,6 +277,15 @@ signal. Raising from the callback cooperatively cancels staging, cleans up its
 files and re-raises the original exception. Decoder work checks the cancellation
 token too; blocked I/O and indivisible library work cannot be preempted.
 
+Legacy writers also honour cancellation while loading sources, preparing stored
+payloads, compressing, encrypting payloads and copying the finished archive.
+Stored payload preparation reports `compression` progress too. Raising from a
+writer callback preserves an existing single-file destination and re-raises the
+original exception; a retry starts a fresh write. Volume assembly checks between
+parts and returns no set when cancelled. Cancellation remains cooperative:
+allocations, filter transforms, cryptographic setup and blocked caller I/O cannot
+be interrupted midway. Legacy output still buffers payloads and archive bytes.
+
 The complete retained payload set is staged before encoding. Incremental
 consumption and reuse of original compressed payloads remain future work.
 

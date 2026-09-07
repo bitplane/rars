@@ -72,7 +72,9 @@ pub trait WriteProgress: Send + Sync {
     fn report(&self, event: WriteProgressEvent<'_>);
 
     /// Returns true when the caller wants the active write operation to stop.
-    /// RAR5/7 streaming writes retain an observed request for the rest of the write.
+    /// Writers retain an observed request for the rest of the write.
+    /// Cancellation is cooperative: it cannot interrupt a blocked caller I/O
+    /// operation or an indivisible allocation or cryptographic setup call.
     fn is_cancelled(&self) -> bool {
         false
     }
@@ -119,6 +121,13 @@ struct WorkState {
 }
 
 impl<'a> WorkTracker<'a> {
+    pub(crate) fn reporter(&self) -> Option<ProgressReporter<'a>> {
+        self.progress
+    }
+
+    pub(crate) fn check(&self) -> crate::Result<()> {
+        check_cancelled(self.progress)
+    }
     pub(crate) fn new(
         progress: Option<ProgressReporter<'a>>,
         operation: WriteOperation,

@@ -24,6 +24,7 @@ pub use crate::streaming::{EntrySource, WriterResources};
 pub use crate::write_plan::MemberCoding;
 pub use extract::extract_volumes_to;
 use extract::{DecoderSession, DecryptingReader};
+pub(crate) use write::write_stored_volumes_with_progress;
 pub(crate) use write::{write_archive_with_retained_metadata, RetainedMemberMetadata};
 pub use write::{
     write_compressed_archive, write_compressed_archive_with_comment,

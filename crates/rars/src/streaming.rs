@@ -106,7 +106,7 @@ impl SourceFactory for PathSource {
     }
 }
 
-/// A shared, one-way cancellation signal for RAR5/7 streaming writes.
+/// A shared, one-way cancellation signal for archive writes.
 ///
 /// Clone the token for another thread, or cancel it from an input/output callback.
 /// Cancellation is cooperative: it is checked between chunks and during resource
@@ -172,10 +172,9 @@ impl WriterResources {
         self
     }
 
-    /// Attach a cancellation token to RAR5/7 streaming writes using this policy.
+    /// Attach a cancellation token to archive writes using this policy.
     /// The token works without a progress callback. Cancellation returns
     /// [`Error::Cancelled`]; a direct output sink may already contain partial data.
-    /// Legacy buffered writers do not use this token.
     pub fn with_cancellation(mut self, cancellation: WriteCancellation) -> Self {
         self.cancellation = Some(cancellation);
         self
@@ -231,8 +230,15 @@ impl WriterResources {
     /// smaller piece to fall back to when one does not fit. Here the budget
     /// decides how many members are compressed at once rather than whether the
     /// job can run at all, and a member larger than the budget runs alone.
-    pub(crate) fn acquire_serialising(&self, required: u64) -> MemoryPermit {
-        self.budget.acquire(required.min(self.memory_limit))
+    pub(crate) fn acquire_serialising_cancellable(
+        &self,
+        required: u64,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<MemoryPermit> {
+        self.budget
+            .acquire_cancellable(required.min(self.memory_limit), &|| {
+                self.is_cancelled() || cancelled()
+            })
     }
 }
 
@@ -249,21 +255,6 @@ impl MemoryBudget {
             limit,
             used: Mutex::new(0),
             changed: Condvar::new(),
-        }
-    }
-
-    fn acquire(self: &Arc<Self>, bytes: u64) -> MemoryPermit {
-        let mut used = self.used.lock().expect("memory budget lock poisoned");
-        while self.limit.saturating_sub(*used) < bytes {
-            used = self
-                .changed
-                .wait(used)
-                .expect("memory budget lock poisoned while waiting");
-        }
-        *used += bytes;
-        MemoryPermit {
-            budget: Arc::clone(self),
-            bytes,
         }
     }
 
