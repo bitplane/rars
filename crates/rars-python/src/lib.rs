@@ -115,6 +115,64 @@ impl CancellationToken {
     }
 }
 
+/// Per-call limits for member reading, extraction and payload testing.
+#[pyclass(frozen, module = "rars", skip_from_py_object)]
+#[derive(Debug, Clone, Default)]
+struct ReadOptions {
+    cancellation: Option<rars_rs::ReadCancellation>,
+    #[pyo3(get)]
+    max_member_output_bytes: Option<u64>,
+    #[pyo3(get)]
+    max_total_output_bytes: Option<u64>,
+    #[pyo3(get)]
+    rar50_dictionary_size_limit: Option<u64>,
+    #[pyo3(get)]
+    rar50_buffered_decode_limit: Option<u64>,
+}
+
+#[pymethods]
+impl ReadOptions {
+    #[new]
+    #[pyo3(signature = (*, cancellation=None, max_member_output_bytes=None, max_total_output_bytes=None, rar50_dictionary_size_limit=None, rar50_buffered_decode_limit=None))]
+    fn new(
+        cancellation: Option<&CancellationToken>,
+        max_member_output_bytes: Option<u64>,
+        max_total_output_bytes: Option<u64>,
+        rar50_dictionary_size_limit: Option<u64>,
+        rar50_buffered_decode_limit: Option<u64>,
+    ) -> Self {
+        Self {
+            cancellation: cancellation.map(|token| token.inner.clone()),
+            max_member_output_bytes,
+            max_total_output_bytes,
+            rar50_dictionary_size_limit,
+            rar50_buffered_decode_limit,
+        }
+    }
+
+    #[getter]
+    fn cancellation(&self) -> Option<CancellationToken> {
+        self.cancellation.as_ref().map(|inner| CancellationToken {
+            inner: inner.clone(),
+        })
+    }
+}
+
+fn python_read_options<'a>(
+    settings: Option<&'a ReadOptions>,
+    password: Option<&'a [u8]>,
+) -> rars_rs::ArchiveReadOptions<'a> {
+    let mut options = rars_rs::ArchiveReadOptions::with_optional_password(password);
+    if let Some(settings) = settings {
+        options.cancellation = settings.cancellation.as_ref();
+        options.max_member_output_bytes = settings.max_member_output_bytes;
+        options.max_total_output_bytes = settings.max_total_output_bytes;
+        options.rar50_dictionary_size_limit = settings.rar50_dictionary_size_limit;
+        options.rar50_buffered_decode_limit = settings.rar50_buffered_decode_limit;
+    }
+    options
+}
+
 struct PythonProgress {
     callback: Option<Py<PyAny>>,
     state: Mutex<HashMap<&'static str, ProgressEvent>>,
@@ -372,34 +430,41 @@ impl RarFile {
             .ok_or_else(|| PyKeyError::new_err(String::from_utf8_lossy(&target).into_owned()))
     }
 
-    #[pyo3(signature = (name, pwd = None))]
+    #[pyo3(signature = (name, pwd = None, *, options = None))]
     fn read(
         &self,
         py: Python<'_>,
         name: &Bound<'_, PyAny>,
         pwd: Option<&Bound<'_, PyAny>>,
+        options: Option<&ReadOptions>,
     ) -> PyResult<Vec<u8>> {
         let target = member_name_bytes(name)?;
         let password = py_password(pwd)?.or_else(|| self.password.clone());
-        py.detach(|| self.archive.read_member(&target, password.as_deref()))
-            .map_err(map_error)?
-            .ok_or_else(|| PyKeyError::new_err(String::from_utf8_lossy(&target).into_owned()))
+        py.detach(|| {
+            self.archive.read_member_with_options(
+                &target,
+                python_read_options(options, password.as_deref()),
+            )
+        })
+        .map_err(map_error)?
+        .ok_or_else(|| PyKeyError::new_err(String::from_utf8_lossy(&target).into_owned()))
     }
 
-    #[pyo3(signature = (name, pwd = None))]
+    #[pyo3(signature = (name, pwd = None, *, options = None))]
     fn open(
         &self,
         py: Python<'_>,
         name: &Bound<'_, PyAny>,
         pwd: Option<&Bound<'_, PyAny>>,
+        options: Option<&ReadOptions>,
     ) -> PyResult<Py<PyAny>> {
-        let data = self.read(py, name, pwd)?;
+        let data = self.read(py, name, pwd, options)?;
         let io = py.import("io")?;
         let bytes = PyBytes::new(py, &data);
         Ok(io.getattr("BytesIO")?.call1((bytes,))?.unbind())
     }
 
-    #[pyo3(signature = (member, path = None, pwd = None, overwrite = false))]
+    #[pyo3(signature = (member, path = None, pwd = None, overwrite = false, *, options = None))]
     fn extract(
         &self,
         py: Python<'_>,
@@ -407,6 +472,7 @@ impl RarFile {
         path: Option<PathBuf>,
         pwd: Option<&Bound<'_, PyAny>>,
         overwrite: bool,
+        options: Option<&ReadOptions>,
     ) -> PyResult<PathBuf> {
         let target = member_name_bytes(member)?;
         let out_dir = path.unwrap_or_else(|| PathBuf::from("."));
@@ -417,7 +483,7 @@ impl RarFile {
                     &self.archive,
                     Some(&target),
                     &out_dir,
-                    password.as_deref(),
+                    python_read_options(options, password.as_deref()),
                     overwrite,
                 )
             })
@@ -428,7 +494,7 @@ impl RarFile {
             .ok_or_else(|| PyKeyError::new_err(String::from_utf8_lossy(&target).into_owned()))
     }
 
-    #[pyo3(signature = (path = None, members = None, pwd = None, overwrite = false))]
+    #[pyo3(signature = (path = None, members = None, pwd = None, overwrite = false, *, options = None))]
     fn extractall(
         &self,
         py: Python<'_>,
@@ -436,6 +502,7 @@ impl RarFile {
         members: Option<&Bound<'_, PyAny>>,
         pwd: Option<&Bound<'_, PyAny>>,
         overwrite: bool,
+        options: Option<&ReadOptions>,
     ) -> PyResult<Vec<PathBuf>> {
         let out_dir = path.unwrap_or_else(|| PathBuf::from("."));
         let selected = match members {
@@ -448,18 +515,26 @@ impl RarFile {
                 &self.archive,
                 selected.as_ref(),
                 &out_dir,
-                password.as_deref(),
+                python_read_options(options, password.as_deref()),
                 overwrite,
             )
         })
         .map_err(map_error)
     }
 
-    #[pyo3(signature = (pwd = None))]
-    fn testrar(&self, py: Python<'_>, pwd: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+    #[pyo3(signature = (pwd = None, *, options = None))]
+    fn testrar(
+        &self,
+        py: Python<'_>,
+        pwd: Option<&Bound<'_, PyAny>>,
+        options: Option<&ReadOptions>,
+    ) -> PyResult<()> {
         let password = py_password(pwd)?.or_else(|| self.password.clone());
-        py.detach(|| self.archive.test(password.as_deref()))
-            .map_err(map_error)
+        py.detach(|| {
+            self.archive
+                .test_with_options(python_read_options(options, password.as_deref()))
+        })
+        .map_err(map_error)
     }
 
     #[getter]
@@ -1416,6 +1491,7 @@ fn rars(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RarBuilder>()?;
     m.add_class::<ProgressEvent>()?;
     m.add_class::<CancellationToken>()?;
+    m.add_class::<ReadOptions>()?;
     m.add_class::<RepairReport>()?;
     m.add_class::<RepairResult>()?;
     m.add_function(wrap_pyfunction!(repair, m)?)?;
@@ -1527,13 +1603,57 @@ impl Selection for HashSet<Vec<u8>> {
     }
 }
 
+// Controlled extraction chooses a sink before core admission. Defer opening a
+// selected file so a declared-size refusal cannot truncate an existing target.
+struct DeferredExtractedFile {
+    path: PathBuf,
+    overwrite: bool,
+    file: Option<fs::File>,
+    written: Arc<Mutex<Vec<PathBuf>>>,
+}
+impl DeferredExtractedFile {
+    fn open(&mut self) -> io::Result<&mut fs::File> {
+        if self.file.is_none() {
+            if let Some(parent) = self.path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut options = fs::OpenOptions::new();
+            options.write(true);
+            if self.overwrite {
+                options.create(true).truncate(true);
+            } else {
+                options.create_new(true);
+            }
+            set_no_follow(&mut options);
+            self.file = Some(options.open(&self.path)?);
+            self.written.lock().unwrap().push(self.path.clone());
+        }
+        Ok(self.file.as_mut().expect("opened above"))
+    }
+}
+struct DeferredExtractedSink(std::rc::Rc<std::cell::RefCell<DeferredExtractedFile>>);
+impl Write for DeferredExtractedSink {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.borrow_mut().open()?.write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.borrow_mut().open()?.flush()
+    }
+}
+
 fn extract_archive<S: Selection>(
     archive: &rars_rs::Archive,
     selected: Option<&S>,
     out_dir: &Path,
-    password: Option<&[u8]>,
+    options: rars_rs::ArchiveReadOptions<'_>,
     overwrite: bool,
 ) -> rars_rs::Result<Vec<PathBuf>> {
+    if options
+        .cancellation
+        .is_some_and(rars_rs::ReadCancellation::is_cancelled)
+    {
+        return Err(rars_rs::Error::Cancelled);
+    }
     let written = Arc::new(Mutex::new(Vec::new()));
     let open = {
         let written = Arc::clone(&written);
@@ -1582,39 +1702,57 @@ fn extract_archive<S: Selection>(
                 _ => true,
             };
             let mut index = 0;
-            archive.extract_with_control(
-                rars_rs::ArchiveReadOptions::with_optional_password(password),
-                |member| {
-                    let current = index;
-                    index += 1;
-                    if current > last {
-                        return Ok(rars_rs::ExtractionDecision::Stop);
-                    }
-                    let meta = &member.meta;
-                    if meta.is_redirection {
-                        return Ok(rars_rs::ExtractionDecision::Skip);
-                    }
-                    if !selected.contains_member(&meta.name) {
-                        return Ok(if solid && !meta.is_directory {
-                            rars_rs::ExtractionDecision::Extract(Box::new(io::sink()))
-                        } else {
-                            rars_rs::ExtractionDecision::Skip
-                        });
-                    }
-                    let meta = rars_rs::ExtractedEntryMeta::new(
-                        meta.name.clone(),
-                        meta.file_time,
-                        meta.file_attr,
-                        meta.is_directory,
-                    )
-                    .with_attr_source(meta.attr_source())
-                    .with_mtime_refinement(meta.mtime_refinement);
-                    Ok(rars_rs::ExtractionDecision::Extract(open(&meta)?))
-                },
-            )?;
+            let mut pending: Option<std::rc::Rc<std::cell::RefCell<DeferredExtractedFile>>> = None;
+            archive.extract_with_control(options, |member| {
+                // The previous payload has passed decoding and integrity checks.
+                // Materialize a successful empty file even if no writes occurred.
+                if let Some(file) = pending.take() {
+                    file.borrow_mut().open()?;
+                }
+                let current = index;
+                index += 1;
+                if current > last {
+                    return Ok(rars_rs::ExtractionDecision::Stop);
+                }
+                let meta = &member.meta;
+                if meta.is_redirection {
+                    return Ok(rars_rs::ExtractionDecision::Skip);
+                }
+                if !selected.contains_member(&meta.name) {
+                    return Ok(if solid && !meta.is_directory {
+                        rars_rs::ExtractionDecision::Extract(Box::new(io::sink()))
+                    } else {
+                        rars_rs::ExtractionDecision::Skip
+                    });
+                }
+                let meta = rars_rs::ExtractedEntryMeta::new(
+                    meta.name.clone(),
+                    meta.file_time,
+                    meta.file_attr,
+                    meta.is_directory,
+                )
+                .with_attr_source(meta.attr_source())
+                .with_mtime_refinement(meta.mtime_refinement);
+                if meta.is_directory {
+                    return Ok(rars_rs::ExtractionDecision::Extract(open(&meta)?));
+                }
+                let file = std::rc::Rc::new(std::cell::RefCell::new(DeferredExtractedFile {
+                    path: checked_output_path(out_dir, &meta, archive.family())?,
+                    overwrite,
+                    file: None,
+                    written: written.clone(),
+                }));
+                pending = Some(file.clone());
+                Ok(rars_rs::ExtractionDecision::Extract(Box::new(
+                    DeferredExtractedSink(file),
+                )))
+            })?;
+            if let Some(file) = pending.take() {
+                file.borrow_mut().open()?;
+            }
         }
     } else {
-        extract_to_best(archive, password, open)?;
+        archive.extract_to_parallel_buffered_with_options(options, open)?;
     }
     let out = written.lock().expect("written lock poisoned").clone();
     Ok(out)
@@ -1670,17 +1808,6 @@ fn read_archives_from_paths(
             rars_rs::ArchiveReader::read_path_with_options(path, options)
         })
         .collect()
-}
-
-fn extract_to_best<F>(
-    archive: &rars_rs::Archive,
-    password: Option<&[u8]>,
-    open: F,
-) -> rars_rs::Result<()>
-where
-    F: FnMut(&rars_rs::ExtractedEntryMeta) -> rars_rs::Result<Box<dyn Write>>,
-{
-    archive.extract_to_parallel_buffered(password, open)
 }
 
 fn info_from_member(member: rars_rs::ArchiveMember) -> RarInfo {
@@ -1953,6 +2080,88 @@ mod tests {
     use super::*;
 
     #[test]
+    fn python_thread_cancels_an_in_progress_read_without_a_callback() {
+        use std::io::{Cursor, Read, Seek, SeekFrom};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        struct Paused {
+            input: Cursor<Vec<u8>>,
+            armed: Arc<AtomicBool>,
+            started: mpsc::Sender<()>,
+            resume: mpsc::Receiver<()>,
+        }
+        impl Read for Paused {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                if self.armed.swap(false, Ordering::Relaxed) {
+                    self.started.send(()).map_err(io::Error::other)?;
+                    self.resume
+                        .recv_timeout(Duration::from_secs(10))
+                        .map_err(io::Error::other)?;
+                }
+                self.input.read(buffer)
+            }
+        }
+        impl Seek for Paused {
+            fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+                self.input.seek(from)
+            }
+        }
+        Python::initialize();
+        Python::attach(|py| {
+            for format in [
+                rars_rs::ArchiveVersion::Rar14,
+                rars_rs::ArchiveVersion::Rar29,
+                rars_rs::ArchiveVersion::Rar50,
+            ] {
+                let mut builder = rars_rs::Builder::new(format).store(true);
+                builder
+                    .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+                    .unwrap();
+                let armed = Arc::new(AtomicBool::new(false));
+                let (started, waiting) = mpsc::channel();
+                let (resume, resumed) = mpsc::channel();
+                let archive = rars_rs::ArchiveReader::read_reader(Paused {
+                    input: Cursor::new(builder.to_bytes().unwrap()),
+                    armed: armed.clone(),
+                    started,
+                    resume: resumed,
+                })
+                .unwrap();
+                let file = RarFile {
+                    infos: archive.members().map(info_from_member).collect(),
+                    archive,
+                    password: None,
+                };
+                let token = CancellationToken::new();
+                let options = ReadOptions::new(Some(&token), None, None, None, None);
+                let cancel_object = Py::new(py, token).unwrap();
+                armed.store(true, Ordering::Relaxed);
+                let worker = std::thread::spawn(move || {
+                    waiting.recv_timeout(Duration::from_secs(10)).unwrap();
+                    Python::attach(|py| {
+                        cancel_object.bind(py).call_method0("cancel").unwrap();
+                    });
+                    resume.send(()).unwrap();
+                });
+                let name = PyBytes::new(py, b"file");
+                let error = file
+                    .read(py, name.as_any(), None, Some(&options))
+                    .unwrap_err();
+                py.detach(|| worker.join().unwrap());
+                assert!(
+                    error.is_instance_of::<PyInterruptedError>(py),
+                    "{format}: {error}"
+                );
+                assert_eq!(
+                    file.read(py, name.as_any(), None, None).unwrap(),
+                    b"payload"
+                );
+            }
+        });
+    }
+
+    #[test]
     fn selected_extraction_preserves_solid_password_dependencies() {
         let root = scratch::case("selected-solid-extraction");
         for format in [
@@ -1972,16 +2181,34 @@ mod tests {
             let directory = root.join(format.to_string());
             let first = b"first".to_vec();
             let last = b"last".to_vec();
-            let paths = extract_archive(&archive, Some(&first), &directory, None, false).unwrap();
+            let paths = extract_archive(
+                &archive,
+                Some(&first),
+                &directory,
+                rars_rs::ArchiveReadOptions::new(),
+                false,
+            )
+            .unwrap();
             assert_eq!(paths, vec![directory.join("first")]);
             assert_eq!(fs::read(&paths[0]).unwrap(), first.repeat(100));
-            let error =
-                extract_archive(&archive, Some(&last), &directory, None, false).unwrap_err();
+            let error = extract_archive(
+                &archive,
+                Some(&last),
+                &directory,
+                rars_rs::ArchiveReadOptions::new(),
+                false,
+            )
+            .unwrap_err();
             assert_eq!(error.kind(), rars_rs::ErrorKind::PasswordRequired);
             assert!(!directory.join("last").exists());
-            let paths =
-                extract_archive(&archive, Some(&last), &directory, Some(b"password"), false)
-                    .unwrap();
+            let paths = extract_archive(
+                &archive,
+                Some(&last),
+                &directory,
+                rars_rs::ArchiveReadOptions::with_password(b"password"),
+                false,
+            )
+            .unwrap();
             assert_eq!(paths, vec![directory.join("last")]);
             assert_eq!(fs::read(&paths[0]).unwrap(), last.repeat(100));
         }

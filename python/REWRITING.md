@@ -318,9 +318,10 @@ with ThreadPoolExecutor(max_workers=1) as pool:
 is sticky: use a new token after cancelling. Successful writes and callback
 exceptions do not cancel the caller's token; callbacks still re-raise their
 original exception. The token applies to per-write staging and writer work,
-not the eager metadata reads in `from_archive()`. Reader and repair methods do
-not yet accept this argument. Writes release the GIL, including volume-file
-publication. Volume cancellation may leave already published parts; a single
+not the eager metadata reads in `from_archive()`. Reader methods use
+`ReadOptions(cancellation=token)` instead; see [reader controls](READING.md).
+Repair methods do not yet accept cancellation. Writes release the GIL, including
+volume-file publication. Volume cancellation may leave already published parts; a single
 path write retains its existing staged-publication guarantee.
 
 Legacy writers also honour cancellation while loading sources, preparing stored

@@ -76,7 +76,9 @@ is intended for the next minor release; see the [rewrite contract](python/REWRIT
 
 `RarBuilder` writes accept `cancellation=rars.CancellationToken()` for
 cooperative cancellation from another Python thread, with or without progress
-callbacks. See the [cancellation contract](python/REWRITING.md).
+callbacks. Reader operations accept `options=rars.ReadOptions(...)` for
+cancellation, output ceilings and RAR5/7 decoder limits. See the
+[reader controls](python/READING.md) and [rewrite contract](python/REWRITING.md).
 
 For JS it's built to WebAssembly and published to
 [npm](https://www.npmjs.com/package/@bitplane/rars);
