@@ -2,7 +2,8 @@
 
 ## Current API
 
-`RarBuilder.from_archive(source, password=None, *, preserve=True)` creates a
+`RarBuilder.from_archive(source, password=None, *, preserve=True,
+staging_dir=None, max_staged_bytes=None)` creates a
 **preserving rewrite builder**. It retains supported RAR5/7 format requirements,
 solid mode, per-member data and comment encryption, header and archive-comment
 encryption, lock flags, archive name/creation metadata, and regenerated
@@ -226,12 +227,51 @@ An existing destination survives preflight, decoding and write failures. The
 source path can be the destination when it remains unchanged until publication.
 Caller-owned output streams do not have this rollback guarantee.
 
+## Rewrite execution and staging
+
+Each `to_bytes()`, `write(path)` or `write_volumes(first_path)` call verifies and
+stages retained file payloads in one archive-order extraction pass before
+encoding output. Renames retain original source identity; removed independent
+files are skipped. Solid predecessors are decoded and verified when needed,
+even if removed. Payloads after the last retained source file are not decoded.
+Comments and legacy symbolic-link targets still use the eager metadata path in
+`from_archive()`.
+
+Staging files are private plaintext files, including when the archive is
+encrypted. `staging_dir` selects an existing trusted directory; it defaults to
+the output directory for path writes and the current directory for `to_bytes()`.
+The system temporary directory is not used by default. Files are reopened by
+path, so other users must not be able to replace entries in that directory.
+
+`max_staged_bytes` limits the combined uncompressed payload bytes retained on
+disk. Its default is the sum of the retained source files' declared sizes,
+recomputed after edits on each write. Both admission and actual writes enforce
+the limit. A refusal raises `MemoryError`, the binding's resource-limit exception;
+filesystem failures raise `OSError`. For example:
+
+```python
+editor = RarBuilder.from_archive(
+    source, staging_dir="/path/to/private/staging", max_staged_bytes=2 * 1024**3
+)
+editor.write("edited.rar")
+```
+
+Staging lasts only for one write and is removed on success or failure; a retry
+stages afresh. Cleanup is best effort, not secure erasure, and process termination
+may leave plaintext files. The limit excludes filesystem overhead, discarded
+solid dependencies, archive input, comments, link targets, decoder workspace,
+added files and writer output spools. Legacy encoding still materializes payloads
+in memory; this is not an aggregate RAM limit. Writer progress callbacks begin
+after staging and do not report or cancel the staging traversal.
+
+The complete retained payload set is staged before encoding. Incremental
+consumption and reuse of original compressed payloads remain future work.
+
 Preservation means supported archive semantics, not identical bytes, compression
 ratio, encoder release, dictionary choices or original solid group boundaries.
 Volume-set rewriting, explicit conversion target settings, unsupported legacy
 metadata/services and header-encrypted quick-open output remain separate work.
-Python integration with bounded staging is still pending; current lazy member
-reads can repeat extraction work for solid archives. Rust callers can use
+Rust callers can use
 `Archive::stage_rewrite_sources` with an explicit `RewriteStaging` directory and
 payload byte limit, then pass the verified sources to `Builder::add_source`.
 This stages the selected payloads in one traversal, including necessary solid

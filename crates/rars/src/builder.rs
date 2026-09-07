@@ -362,6 +362,26 @@ impl Builder {
         })
     }
 
+    /// Replace a queued file's payload while retaining its position and metadata.
+    /// Directories and redirections cannot be changed into payload entries.
+    /// The source is opened only when writing. Errors leave the entry unchanged.
+    pub fn set_source(&mut self, name: &[u8], source: EntrySource) -> Result<()> {
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.name == name)
+            .ok_or_else(|| Error::EntryNotFound.at_entry(name.to_vec(), "replacing payload"))?;
+        if entry.is_directory || entry.redirection.is_some() {
+            return Err(
+                Error::InvalidArgument("payload source requires a regular entry")
+                    .at_entry(name.to_vec(), "replacing payload"),
+            );
+        }
+        entry.data = Vec::new();
+        entry.source = Some(source);
+        Ok(())
+    }
+
     /// Queue an explicit RAR1.3–4.x or RAR5/7 directory, including an empty one.
     /// `mode` supplies Unix permission bits; otherwise DOS directory flags are used.
     /// Legacy timestamps use raw DOS values; legacy volume output is unsupported.
@@ -1493,6 +1513,56 @@ fn unix_mode(_metadata: &fs::Metadata) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn replacing_source_keeps_metadata_and_refuses_entry_kind_changes() {
+        use crate::{ArchiveReader, ArchiveVersion, Builder, EntrySource, ErrorKind};
+        let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+        builder
+            .add_bytes(b"file".to_vec(), b"old".to_vec(), Some(123), Some(0o640))
+            .unwrap();
+        builder
+            .set_file_comment(b"file", Some(b"comment".to_vec()))
+            .unwrap();
+        builder.add_directory(b"dir".to_vec(), None, None).unwrap();
+        builder
+            .add_unix_symlink(b"link".to_vec(), b"file".to_vec(), false, None, None)
+            .unwrap();
+        for name in [b"dir".as_slice(), b"link"] {
+            assert_eq!(
+                builder
+                    .set_source(name, EntrySource::from_bytes(b"bad".as_slice()))
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::InvalidArgument
+            );
+        }
+        assert_eq!(
+            builder
+                .set_source(b"missing", EntrySource::from_bytes(b"bad".as_slice()))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::EntryNotFound
+        );
+        builder
+            .set_source(b"file", EntrySource::from_bytes(b"replacement".as_slice()))
+            .unwrap();
+        let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        let members: Vec<_> = archive.members().collect();
+        assert_eq!(members[0].meta.name, b"file");
+        assert_eq!(members[0].meta.file_time, Some(123));
+        assert_eq!(members[0].meta.file_attr & 0o7777, 0o640);
+        assert_eq!(
+            archive.member_comment_at(0, None).unwrap(),
+            Some(b"comment".to_vec())
+        );
+        assert_eq!(
+            archive.read_member(b"file", None).unwrap().unwrap(),
+            b"replacement"
+        );
+        assert!(members[1].meta.is_directory);
+        assert!(members[2].meta.is_redirection);
+    }
+
     use super::*;
 
     #[test]

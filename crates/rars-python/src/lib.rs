@@ -6,10 +6,14 @@ use pyo3::types::{PyBytes, PyList, PyModule};
 use pyo3::{create_exception, PyErr};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, Cursor, Write};
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+#[cfg(test)]
+#[path = "../../rars/tests/support/scratch.rs"]
+mod scratch;
 
 create_exception!(rars, Error, pyo3::exceptions::PyException);
 create_exception!(rars, BadRarFile, Error);
@@ -563,6 +567,53 @@ impl RarFile {
 struct RarBuilder {
     inner: rars_rs::Builder,
     format: rars_rs::ArchiveVersion,
+    rewrite: Option<RewriteInput>,
+}
+
+/// Original identity follows edits; verified payload sources belong to one write.
+#[derive(Debug, Clone)]
+struct RewriteInput {
+    archive: rars_rs::Archive,
+    password: Option<Vec<u8>>,
+    members: HashMap<Vec<u8>, RewriteMember>,
+    directory: Option<PathBuf>,
+    max_staged_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RewriteMember {
+    index: usize,
+    size: u64,
+}
+
+impl RewriteInput {
+    fn prepare(&self, builder: &mut rars_rs::Builder, directory: &Path) -> rars_rs::Result<()> {
+        let mut members: Vec<_> = self.members.iter().collect();
+        members.sort_unstable_by_key(|(_, member)| member.index);
+        let limit = match self.max_staged_bytes {
+            Some(limit) => limit,
+            None => members.iter().try_fold(0u64, |sum, (_, member)| {
+                sum.checked_add(member.size)
+                    .ok_or(rars_rs::Error::RewriteStagingLimitExceeded {
+                        limit: u64::MAX,
+                        required: u64::MAX,
+                    })
+            })?,
+        };
+        let indices: Vec<_> = members.iter().map(|(_, member)| member.index).collect();
+        let sources = self.archive.stage_rewrite_sources(
+            &indices,
+            rars_rs::ArchiveReadOptions::with_optional_password(self.password.as_deref()),
+            &rars_rs::RewriteStaging {
+                directory: self.directory.as_deref().unwrap_or(directory).to_path_buf(),
+                max_staged_bytes: limit,
+            },
+        )?;
+        for ((name, _), source) in members.into_iter().zip(sources) {
+            builder.set_source(name, source)?;
+        }
+        Ok(())
+    }
 }
 
 fn python_progress(callback: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Arc<PythonProgress>>> {
@@ -660,11 +711,12 @@ impl RarBuilder {
                 .recovery_percent(recovery_percent)
                 .volume_size(volume_size),
             format,
+            rewrite: None,
         })
     }
 
-    /// Create a rewrite builder. Ordinary RAR2.9–4.x files retain
-    /// native names, base/extended DOS timestamps, attributes, solid mode and
+    /// Create a rewrite builder. Supported RAR1.3–4.x files retain
+    /// native names, supported DOS timestamps, attributes, solid mode and
     /// supported data/header encryption.
     /// For RAR5/7, format,
     /// solid, data/header/comment encryption and archive metadata settings are
@@ -677,12 +729,17 @@ impl RarBuilder {
     /// Input files must remain available and unchanged until writing completes.
     /// See python/REWRITING.md for the supported subset and output guarantees.
     #[staticmethod]
-    #[pyo3(signature = (source, password = None, *, preserve = true))]
+    /// Payload staging happens afresh during each write. staging_dir defaults
+    /// to the output directory (current directory for to_bytes); max_staged_bytes
+    /// defaults to the retained payloads' combined declared uncompressed size.
+    #[pyo3(signature = (source, password = None, *, preserve = true, staging_dir = None, max_staged_bytes = None))]
     fn from_archive(
         py: Python<'_>,
         source: &Bound<'_, PyAny>,
         password: Option<&Bound<'_, PyAny>>,
         preserve: bool,
+        staging_dir: Option<&Bound<'_, PyAny>>,
+        max_staged_bytes: Option<u64>,
     ) -> PyResult<Self> {
         let archive = match source.extract::<PyRef<'_, RarFile>>() {
             Ok(archive) => RarFile {
@@ -728,6 +785,13 @@ impl RarBuilder {
         let mut builder = Self {
             inner: inner.comment(archive.comment(py)?),
             format,
+            rewrite: Some(RewriteInput {
+                archive: archive.archive.clone(),
+                password: password.clone(),
+                members: HashMap::new(),
+                directory: staging_dir.map(|path| py_path_buf(py, path)).transpose()?,
+                max_staged_bytes,
+            }),
         };
         let comment_encryption = archive.archive.member_comment_encryption();
         for ((member_index, member), comment) in archive.archive.members().enumerate().zip(comments)
@@ -850,22 +914,24 @@ impl RarBuilder {
                     .add_directory(output_name.clone(), mtime, mode)
                     .map_err(map_builder_error)?;
             } else {
-                let member_archive = archive.archive.clone();
-                let member_password = password.clone();
-                let source = rars_rs::EntrySource::from_opener(info.unpacked_size, move || {
-                    let data = member_archive
-                        // Source identity stays in original archive order, including
-                        // directories, regardless of later removes/adds/renames.
-                        .read_member_at(member_index, member_password.as_deref())?
-                        .ok_or(rars_rs::Error::InvalidHeader(
-                            "archive member disappeared while rewriting",
-                        ))?;
-                    Ok(Box::new(Cursor::new(data)))
+                // The per-write builder replaces this placeholder after a single
+                // verified traversal. Never decode individual members on reopen.
+                let source = rars_rs::EntrySource::from_opener(info.unpacked_size, || {
+                    Err(rars_rs::Error::InvalidArgument(
+                        "rewrite payload was not staged",
+                    ))
                 });
                 builder
                     .inner
                     .add_source(output_name.clone(), source, mtime, mode)
                     .map_err(map_builder_error)?;
+                builder.rewrite.as_mut().unwrap().members.insert(
+                    output_name.clone(),
+                    RewriteMember {
+                        index: member_index,
+                        size: info.unpacked_size,
+                    },
+                );
             }
             builder
                 .inner
@@ -965,15 +1031,26 @@ impl RarBuilder {
     }
 
     fn remove(&mut self, name: &Bound<'_, PyAny>) -> PyResult<()> {
-        self.inner
-            .remove(&member_name_bytes(name)?)
-            .map_err(map_builder_error)
+        let name = member_name_bytes(name)?;
+        self.inner.remove(&name).map_err(map_builder_error)?;
+        if let Some(rewrite) = &mut self.rewrite {
+            rewrite.members.remove(&name);
+        }
+        Ok(())
     }
 
     fn rename(&mut self, old: &Bound<'_, PyAny>, new: &Bound<'_, PyAny>) -> PyResult<()> {
+        let old = member_name_bytes(old)?;
+        let new = member_name_bytes(new)?;
         self.inner
-            .rename(&member_name_bytes(old)?, member_name_bytes(new)?)
-            .map_err(map_builder_error)
+            .rename(&old, new.clone())
+            .map_err(map_builder_error)?;
+        if let Some(rewrite) = &mut self.rewrite {
+            if let Some(member) = rewrite.members.remove(&old) {
+                rewrite.members.insert(new, member);
+            }
+        }
+        Ok(())
     }
 
     /// Queues a Unix symbolic link without reading or following the target.
@@ -1031,7 +1108,7 @@ impl RarBuilder {
 
     #[pyo3(signature = (*, progress = None))]
     fn to_bytes(&self, py: Python<'_>, progress: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<u8>> {
-        self.detached(py, progress, |builder, progress| {
+        self.detached(py, progress, Path::new("."), |builder, progress| {
             builder.to_bytes_with_progress(progress)
         })
     }
@@ -1044,7 +1121,8 @@ impl RarBuilder {
         progress: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         let path = py_path_buf(py, path)?;
-        self.detached(py, progress, move |builder, progress| {
+        let directory = output_directory(&path);
+        self.detached(py, progress, directory, |builder, progress| {
             builder.write_to_path(&path, progress)
         })
     }
@@ -1057,9 +1135,12 @@ impl RarBuilder {
         progress: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<PathBuf>> {
         let first_path = py_path_buf(py, first_path)?;
-        let parts = self.detached(py, progress, |builder, progress| {
-            builder.build_volumes(progress)
-        })?;
+        let parts = self.detached(
+            py,
+            progress,
+            output_directory(&first_path),
+            |builder, progress| builder.build_volumes(progress),
+        )?;
         let mut paths = Vec::with_capacity(parts.len());
         for (index, part) in parts.iter().enumerate() {
             let path = if matches!(
@@ -1086,6 +1167,7 @@ impl RarBuilder {
         &self,
         py: Python<'_>,
         callback: Option<&Bound<'_, PyAny>>,
+        directory: &Path,
         run: F,
     ) -> PyResult<T>
     where
@@ -1094,9 +1176,13 @@ impl RarBuilder {
             + Send,
     {
         let progress = python_progress(callback)?;
-        let builder = self.inner.clone();
+        let mut builder = self.inner.clone();
+        let rewrite = self.rewrite.clone();
         let worker = progress.clone();
         let result = py.detach(move || {
+            if let Some(rewrite) = rewrite {
+                rewrite.prepare(&mut builder, directory)?;
+            }
             run(
                 &builder,
                 worker
@@ -1109,6 +1195,12 @@ impl RarBuilder {
         }
         result.map_err(map_error)
     }
+}
+
+fn output_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
 }
 
 #[pyfunction]
@@ -1696,6 +1788,85 @@ fn error_is_bad_password(error: &rars_rs::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn python_rewrite_stages_one_pass_per_write_without_eager_payload_reads() {
+        use std::io::{Cursor, Read, Seek, SeekFrom};
+        use std::sync::atomic::AtomicU64;
+
+        struct Counted {
+            input: Cursor<Vec<u8>>,
+            bytes: Arc<AtomicU64>,
+        }
+        impl Read for Counted {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                let read = self.input.read(buffer)?;
+                self.bytes.fetch_add(read as u64, Ordering::Relaxed);
+                Ok(read)
+            }
+        }
+        impl Seek for Counted {
+            fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+                self.input.seek(from)
+            }
+        }
+
+        let root = scratch::case("python-rewrite-once");
+        Python::initialize();
+        Python::attach(|py| {
+            for format in rars_rs::ArchiveVersion::ALL {
+                let mut input = rars_rs::Builder::new(format).solid(true);
+                for name in [b"first", b"other", b"final"] {
+                    input
+                        .add_bytes(name.to_vec(), name.repeat(100), None, None)
+                        .unwrap();
+                }
+                let bytes = Arc::new(AtomicU64::new(0));
+                let archive = rars_rs::ArchiveReader::read_reader(Counted {
+                    input: Cursor::new(input.to_bytes().unwrap()),
+                    bytes: bytes.clone(),
+                })
+                .unwrap();
+                bytes.store(0, Ordering::Relaxed);
+                archive
+                    .extract_with_control(rars_rs::ArchiveReadOptions::default(), |_| {
+                        Ok(rars_rs::ExtractionDecision::Extract(Box::new(io::sink())))
+                    })
+                    .unwrap();
+                let one_pass = bytes.swap(0, Ordering::Relaxed);
+                let source = Py::new(
+                    py,
+                    RarFile {
+                        archive,
+                        password: None,
+                        infos: Vec::new(),
+                    },
+                )
+                .unwrap();
+                let directory = pyo3::types::PyString::new(py, root.to_str().unwrap());
+                let builder = RarBuilder::from_archive(
+                    py,
+                    source.bind(py).as_any(),
+                    None,
+                    true,
+                    Some(directory.as_any()),
+                    None,
+                )
+                .unwrap();
+                assert_eq!(bytes.load(Ordering::Relaxed), 0, "{format} must stay lazy");
+                for _ in 0..2 {
+                    let output = builder.to_bytes(py, None).unwrap();
+                    assert_eq!(bytes.swap(0, Ordering::Relaxed), one_pass, "{format}");
+                    let output = rars_rs::ArchiveReader::read_owned(output).unwrap();
+                    assert_eq!(
+                        output.read_member(b"final", None).unwrap().unwrap(),
+                        b"final".repeat(100)
+                    );
+                    assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+                }
+            }
+        });
+    }
 
     #[test]
     fn python_exception_types_and_messages_survive_nested_context() {
