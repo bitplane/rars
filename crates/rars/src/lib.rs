@@ -1397,9 +1397,23 @@ pub fn read_volume_member_at(
     index: usize,
     password: Option<&[u8]>,
 ) -> Result<Option<Vec<u8>>> {
+    read_volume_member_at_with_options(
+        archives,
+        index,
+        ArchiveReadOptions::with_optional_password(password),
+    )
+}
+
+/// Reads one logical volume member with per-call policies. The current volume
+/// traversal decodes the whole set; discarded output also counts against quotas.
+pub fn read_volume_member_at_with_options(
+    archives: &[Archive],
+    index: usize,
+    options: ArchiveReadOptions<'_>,
+) -> Result<Option<Vec<u8>>> {
     let collected = std::sync::Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
     let current = std::cell::Cell::new(0usize);
-    extract_volumes_to(archives, password, |meta| {
+    extract_volumes_to_with_options(archives, options, |meta| {
         let this = current.get();
         current.set(this.saturating_add(1));
         if this != index || meta.is_directory {

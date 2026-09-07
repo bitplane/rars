@@ -1,6 +1,6 @@
 export * from "./base.js";
 import type {
-  OperationOptions, RarData, RarEntryOptions, RarInput, RarName,
+  OperationOptions, ReadOptions, RarData, RarEntryOptions, RarInput, RarName,
   RarWriterOptions,
 } from "./base.js";
 
@@ -8,7 +8,7 @@ export type NodeRarInput = RarInput | string | URL;
 export type NodePath = string | URL;
 
 export class RarArchive {
-  static open(input: NodeRarInput | readonly NodeRarInput[], options?: OperationOptions): Promise<RarArchive>;
+  static open(input: NodeRarInput | readonly NodeRarInput[], options?: ReadOptions): Promise<RarArchive>;
   readonly entries: readonly import("./base.js").RarEntry[];
   readonly family: import("./base.js").RarFamily;
   readonly sfxOffset: number;
@@ -16,7 +16,8 @@ export class RarArchive {
   readonly comment?: Uint8Array;
   get(name: RarName): import("./base.js").RarEntry | undefined;
   getAll(name: RarName): readonly import("./base.js").RarEntry[];
-  test(options?: OperationOptions): Promise<void>;
+  readComment(options?: ReadOptions): Promise<Uint8Array | undefined>;
+  test(options?: ReadOptions): Promise<void>;
   close(): void;
 }
 

@@ -30,6 +30,33 @@ the exact header bytes.
 Node also accepts paths and file URLs. Passing the first path of a conventional
 volume set discovers its siblings automatically.
 
+`open()`, `entry.bytes()`, `test()` and `readComment()` accept `ReadOptions`:
+
+```js
+const limits = { maxHeaderCount: 10000, maxMemberOutputBytes: 256 * 1024 * 1024 };
+const archive = await RarArchive.open(file, limits);
+const bytes = await archive.entries[0].bytes(limits);
+const comment = await archive.readComment(limits); // undefined if absent
+```
+
+The optional fields are `maxHeaderCount`, `maxHeaderBytes`,
+`maxMemberOutputBytes`, `maxTotalOutputBytes`, `rar50DictionarySizeLimit` and
+`rar50BufferedDecodeLimit`. Values must be nonnegative safe integer numbers or
+`bigint` values through `2n ** 64n - 1n`. Zero is a real limit. Omission retains
+the library default. Options apply to one call and are not retained by `open()`.
+Each operation reparses its input; header limits apply per archive/volume.
+The cached `archive.comment` is decoded under the options passed to `open()`;
+`readComment()` decodes it again with fresh options and an optional password.
+
+Output limits count logical decoded bytes, including discarded solid-prefix
+output. Reading a volume entry currently decodes the whole volume set, so its
+total-output limit includes other members. Limits are not an aggregate RAM
+ceiling: inputs and returned outputs are materialised, and decoder workspace
+has separate costs. RAR5/7 dictionary and buffered-decoding limits affect those
+formats only. Filesystem scratch decoding is unavailable in the WASM backend.
+Unknown-size RAR5 members are refused under a member-output limit; decode-to-end
+support remains separate work.
+
 ## Write
 
 ```js

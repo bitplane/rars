@@ -308,12 +308,13 @@ impl RarFile {
     /// encrypted; for encrypted data in plain headers, pass it to `read`
     /// instead.
     #[wasm_bindgen(constructor)]
-    pub fn new(data: Vec<u8>, password: Option<Password>) -> Result<RarFile, JsValue> {
+    pub fn new(
+        data: Vec<u8>,
+        password: Option<Password>,
+        settings: JsValue,
+    ) -> Result<RarFile, JsValue> {
         let password = password_bytes(password)?;
-        let options = match password.as_deref() {
-            Some(password) => rars_rs::ArchiveReadOptions::with_password(password),
-            None => rars_rs::ArchiveReadOptions::new(),
-        };
+        let options = read_options(password.as_deref(), &settings)?;
         let archive =
             rars_rs::ArchiveReader::read_owned_with_options(data, options).map_err(js_error)?;
         let infos = archive.members().map(info_from_member).collect();
@@ -329,6 +330,7 @@ impl RarFile {
     pub fn open_volumes(
         volumes: js_sys::Array,
         password: Option<Password>,
+        settings: JsValue,
     ) -> Result<RarFile, JsValue> {
         let password = password_bytes(password)?;
         let mut archives = Vec::with_capacity(volumes.length() as usize);
@@ -340,10 +342,7 @@ impl RarFile {
                 ));
             }
             let data = js_sys::Uint8Array::unchecked_from_js(value).to_vec();
-            let options = match password.as_deref() {
-                Some(password) => rars_rs::ArchiveReadOptions::with_password(password),
-                None => rars_rs::ArchiveReadOptions::new(),
-            };
+            let options = read_options(password.as_deref(), &settings)?;
             archives.push(
                 rars_rs::ArchiveReader::read_owned_with_options(data, options).map_err(js_error)?,
             );
@@ -386,10 +385,18 @@ impl RarFile {
     /// Solid archives decode from the start every time, so pulling several
     /// members out of one costs a pass each. Reading a whole solid archive is
     /// better served by asking for each member in archive order.
-    pub fn read(&self, name: &str, password: Option<Password>) -> Result<Vec<u8>, JsValue> {
+    pub fn read(
+        &self,
+        name: &str,
+        password: Option<Password>,
+        settings: JsValue,
+    ) -> Result<Vec<u8>, JsValue> {
         let password = password_bytes(password)?.or_else(|| self.password.clone());
         self.archives[0]
-            .read_member(name.as_bytes(), password.as_deref())
+            .read_member_with_options(
+                name.as_bytes(),
+                read_options(password.as_deref(), &settings)?,
+            )
             .map_err(js_error)?
             .ok_or_else(|| {
                 js_error(
@@ -400,12 +407,22 @@ impl RarFile {
 
     /// Decode one member by archive-order index.
     #[wasm_bindgen(js_name = readAt)]
-    pub fn read_at(&self, index: usize, password: Option<Password>) -> Result<Vec<u8>, JsValue> {
+    pub fn read_at(
+        &self,
+        index: usize,
+        password: Option<Password>,
+        settings: JsValue,
+    ) -> Result<Vec<u8>, JsValue> {
         let password = password_bytes(password)?.or_else(|| self.password.clone());
         let found = if self.archives.len() == 1 {
-            self.archives[0].read_member_at(index, password.as_deref())
+            self.archives[0]
+                .read_member_at_with_options(index, read_options(password.as_deref(), &settings)?)
         } else {
-            rars_rs::read_volume_member_at(&self.archives, index, password.as_deref())
+            rars_rs::read_volume_member_at_with_options(
+                &self.archives,
+                index,
+                read_options(password.as_deref(), &settings)?,
+            )
         };
         found.map_err(js_error)?.ok_or_else(|| {
             binding_error(
@@ -417,22 +434,37 @@ impl RarFile {
 
     /// Decode every member and discard the bytes, throwing on the first
     /// checksum failure or wrong password.
-    pub fn test(&self, password: Option<Password>) -> Result<(), JsValue> {
+    pub fn test(&self, password: Option<Password>, settings: JsValue) -> Result<(), JsValue> {
         let password = password_bytes(password)?.or_else(|| self.password.clone());
         if self.archives.len() == 1 {
-            return self.archives[0].test(password.as_deref()).map_err(js_error);
+            return self.archives[0]
+                .test_with_options(read_options(password.as_deref(), &settings)?)
+                .map_err(js_error);
         }
-        rars_rs::extract_volumes_to(&self.archives, password.as_deref(), |_| {
-            Ok(Box::new(std::io::sink()) as Box<dyn std::io::Write>)
-        })
+        rars_rs::extract_volumes_to_with_options(
+            &self.archives,
+            read_options(password.as_deref(), &settings)?,
+            |_| Ok(Box::new(std::io::sink()) as Box<dyn std::io::Write>),
+        )
         .map_err(js_error)
     }
 
     /// The archive comment, or `undefined` when there is none.
     #[wasm_bindgen(getter)]
     pub fn comment(&self) -> Result<Option<Vec<u8>>, JsValue> {
+        self.read_comment(None, JsValue::UNDEFINED)
+    }
+
+    /// Decode the archive comment under the supplied read policies.
+    #[wasm_bindgen(js_name = readComment)]
+    pub fn read_comment(
+        &self,
+        password: Option<Password>,
+        settings: JsValue,
+    ) -> Result<Option<Vec<u8>>, JsValue> {
+        let password = password_bytes(password)?.or_else(|| self.password.clone());
         self.archives[0]
-            .comment(self.password.as_deref())
+            .comment_with_options(read_options(password.as_deref(), &settings)?)
             .map_err(js_error)
     }
 
@@ -830,4 +862,42 @@ fn opt_bytes(options: &JsValue, key: &str) -> Result<Option<Vec<u8>>, JsValue> {
         "INVALID_OPTION",
         &format!("{key} must be a string or Uint8Array"),
     ))
+}
+
+fn read_limit(settings: &JsValue, key: &str) -> Result<Option<u64>, JsValue> {
+    let value = opt_value(settings, key)?;
+    if value.is_undefined() || value.is_null() {
+        return Ok(None);
+    }
+    let invalid = || {
+        binding_error(
+            "INVALID_OPTION",
+            &format!("{key} must be a nonnegative safe integer or a bigint through 2**64 - 1"),
+        )
+    };
+    if let Some(number) = value.as_f64() {
+        if number.is_finite()
+            && number.fract() == 0.0
+            && (0.0..=9_007_199_254_740_991.0).contains(&number)
+        {
+            return Ok(Some(number as u64));
+        }
+        return Err(invalid());
+    }
+    let bigint = value.dyn_into::<js_sys::BigInt>().map_err(|_| invalid())?;
+    u64::try_from(bigint).map(Some).map_err(|_| invalid())
+}
+
+fn read_options<'a>(
+    password: Option<&'a [u8]>,
+    settings: &JsValue,
+) -> Result<rars_rs::ArchiveReadOptions<'a>, JsValue> {
+    let mut options = rars_rs::ArchiveReadOptions::with_optional_password(password);
+    options.max_header_count = read_limit(settings, "maxHeaderCount")?;
+    options.max_header_bytes = read_limit(settings, "maxHeaderBytes")?;
+    options.max_member_output_bytes = read_limit(settings, "maxMemberOutputBytes")?;
+    options.max_total_output_bytes = read_limit(settings, "maxTotalOutputBytes")?;
+    options.rar50_dictionary_size_limit = read_limit(settings, "rar50DictionarySizeLimit")?;
+    options.rar50_buffered_decode_limit = read_limit(settings, "rar50BufferedDecodeLimit")?;
+    Ok(options)
 }

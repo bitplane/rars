@@ -25,6 +25,20 @@ export function createApi(runtime) {
     return options;
   }
 
+  function readOptions(options) {
+    const limits = {};
+    for (const key of ["maxHeaderCount", "maxHeaderBytes", "maxMemberOutputBytes", "maxTotalOutputBytes", "rar50DictionarySizeLimit", "rar50BufferedDecodeLimit"]) {
+      const value = options[key];
+      if (value == null) continue;
+      if (!(typeof value === "number" && Number.isSafeInteger(value) && value >= 0) &&
+          !(typeof value === "bigint" && value >= 0n && value <= (1n << 64n) - 1n)) {
+        throw new RarError("INVALID_OPTION", `${key} must be a nonnegative safe integer or a bigint through 2**64 - 1`);
+      }
+      limits[key] = value;
+    }
+    return limits;
+  }
+
   function sameName(left, right) {
     if (typeof left === "string" || typeof right === "string") return left === right;
     if (left.length !== right.length) return false;
@@ -46,6 +60,7 @@ export function createApi(runtime) {
       const operation = operationOptions(options);
       return this._archive._request("read", {
         index: this.index,
+        readOptions: readOptions(operation),
         password: operation.password ?? this._archive._password,
       }, operation);
     }
@@ -57,6 +72,7 @@ export function createApi(runtime) {
       const sources = await runtime.prepareArchiveSources(input);
       const result = await runtime.request("open", {
         sources,
+        readOptions: readOptions(operation),
         password: operation.password,
       }, operation);
       return new RarArchive(sources, operation.password, result);
@@ -96,9 +112,18 @@ export function createApi(runtime) {
       ));
     }
 
+    async readComment(options) {
+      const operation = operationOptions(options);
+      return this._request("readComment", {
+        password: operation.password ?? this._password,
+        readOptions: readOptions(operation),
+      }, operation);
+    }
+
     async test(options) {
       const operation = operationOptions(options);
       await this._request("test", {
+        readOptions: readOptions(operation),
         password: operation.password ?? this._password,
       }, operation);
     }

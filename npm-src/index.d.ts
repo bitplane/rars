@@ -7,7 +7,7 @@ export type RarData = string | RarInput;
 export type RarName = string | Uint8Array;
 
 export interface RarProgress {
-  operation: "open" | "read" | "test" | "build" | "buildVolumes" | "writeTo" | "writeVolumesTo" | "repair" | "repairDetailed";
+  operation: "open" | "read" | "readComment" | "test" | "build" | "buildVolumes" | "writeTo" | "writeVolumesTo" | "repair" | "repairDetailed";
   phase: string;
   completed: number;
   total?: number;
@@ -17,6 +17,16 @@ export interface OperationOptions {
   password?: string | Uint8Array;
   signal?: AbortSignal;
   onProgress?: (progress: RarProgress) => void;
+}
+
+/** Limits reset per call. Numbers must be safe integers; bigint supports all u64 values. */
+export interface ReadOptions extends OperationOptions {
+  maxHeaderCount?: number | bigint;
+  maxHeaderBytes?: number | bigint;
+  maxMemberOutputBytes?: number | bigint;
+  maxTotalOutputBytes?: number | bigint;
+  rar50DictionarySizeLimit?: number | bigint;
+  rar50BufferedDecodeLimit?: number | bigint;
 }
 
 export interface RepairReport {
@@ -78,11 +88,11 @@ export class RarEntry {
   readonly isSolid: boolean;
   readonly isSplitBefore: boolean;
   readonly isSplitAfter: boolean;
-  bytes(options?: OperationOptions): Promise<Uint8Array>;
+  bytes(options?: ReadOptions): Promise<Uint8Array>;
 }
 
 export class RarArchive {
-  static open(input: RarInput | readonly RarInput[], options?: OperationOptions): Promise<RarArchive>;
+  static open(input: RarInput | readonly RarInput[], options?: ReadOptions): Promise<RarArchive>;
   readonly entries: readonly RarEntry[];
   readonly family: RarFamily;
   readonly sfxOffset: number;
@@ -90,7 +100,8 @@ export class RarArchive {
   readonly comment?: Uint8Array;
   get(name: RarName): RarEntry | undefined;
   getAll(name: RarName): readonly RarEntry[];
-  test(options?: OperationOptions): Promise<void>;
+  readComment(options?: ReadOptions): Promise<Uint8Array | undefined>;
+  test(options?: ReadOptions): Promise<void>;
   close(): void;
 }
 

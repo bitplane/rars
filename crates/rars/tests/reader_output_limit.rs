@@ -698,6 +698,24 @@ fn total_quota_persists_across_regular_split_and_following_volume_members() {
             volumes.insert(0, ordinary(b"first"));
             volumes.push(ordinary(b"last"));
         }
+        let selected = rars::read_volume_member_at_with_options(
+            &volumes,
+            0,
+            ArchiveReadOptions::with_password(b"secret").with_max_total_output_bytes(2112),
+        )
+        .unwrap();
+        assert_eq!(selected, Some(vec![42; 32]));
+        // Selecting the first member still charges later discarded members.
+        let err = rars::read_volume_member_at_with_options(
+            &volumes,
+            0,
+            ArchiveReadOptions::with_password(b"secret").with_max_total_output_bytes(2111),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err.root_cause(),
+            Error::TotalOutputLimitExceeded { .. }
+        ));
         for (limit, used, required, count) in [
             (2079, 32, 2080, 1),
             (2111, 2080, 2112, 2),

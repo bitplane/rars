@@ -60,7 +60,7 @@ function toDosDate(milliseconds) {
   return ((day << 16) | time) >>> 0;
 }
 
-function metadata(archive) {
+function metadata(archive, password, options) {
   const entries = archive.entries().map((info, index) => {
     if (!Number.isSafeInteger(info.size) || !Number.isSafeInteger(info.packedSize)) {
       throw codedError("RESOURCE_LIMIT", `entry ${index} is too large for exact JavaScript number metadata`);
@@ -88,16 +88,16 @@ function metadata(archive) {
     family: archive.family,
     sfxOffset: archive.sfxOffset,
     needsPassword: archive.needsPassword,
-    comment: archive.comment,
+    comment: archive.readComment(password, options),
   };
 }
 
-async function openArchive(wasm, sources, password, platform) {
+async function openArchive(wasm, sources, password, platform, options) {
   const volumes = [];
   for (const source of sources) volumes.push(await sourceBytes(source, platform));
   return volumes.length === 1
-    ? new wasm.RarFile(volumes[0], password)
-    : wasm.RarFile.openVolumes(volumes, password);
+    ? new wasm.RarFile(volumes[0], password, options)
+    : wasm.RarFile.openVolumes(volumes, password, options);
 }
 
 async function build(wasm, payload, platform, volumes) {
@@ -140,14 +140,17 @@ export function startWorker(port, wasm, platform) {
       port.post({ id, progress: { operation, phase: "working", completed: 0 } });
       let result;
       if (operation === "open") {
-        const archive = await openArchive(wasm, payload.sources, payload.password, platform);
-        try { result = metadata(archive); } finally { archive.free(); }
+        const archive = await openArchive(wasm, payload.sources, payload.password, platform, payload.readOptions);
+        try { result = metadata(archive, payload.password, payload.readOptions); } finally { archive.free(); }
       } else if (operation === "read") {
-        const archive = await openArchive(wasm, payload.sources, payload.password, platform);
-        try { result = archive.readAt(payload.index, payload.password); } finally { archive.free(); }
+        const archive = await openArchive(wasm, payload.sources, payload.password, platform, payload.readOptions);
+        try { result = archive.readAt(payload.index, payload.password, payload.readOptions); } finally { archive.free(); }
       } else if (operation === "test") {
-        const archive = await openArchive(wasm, payload.sources, payload.password, platform);
-        try { archive.test(payload.password); result = undefined; } finally { archive.free(); }
+        const archive = await openArchive(wasm, payload.sources, payload.password, platform, payload.readOptions);
+        try { archive.test(payload.password, payload.readOptions); result = undefined; } finally { archive.free(); }
+      } else if (operation === "readComment") {
+        const archive = await openArchive(wasm, payload.sources, payload.password, platform, payload.readOptions);
+        try { result = archive.readComment(payload.password, payload.readOptions); } finally { archive.free(); }
       } else if (operation === "repair") {
         const bytes = await sourceBytes(payload.sources[0], platform);
         result = wasm.repair(bytes, payload.password);
