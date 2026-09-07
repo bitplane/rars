@@ -35,7 +35,6 @@ use std::io::{Read, Write};
 
 pub(super) struct EnginePlan<'a> {
     pub(super) compress: CompressPlan,
-    pub(super) method: u8,
     pub(super) recovery_percent: Option<u64>,
     pub(super) header_encrypted: bool,
     pub(super) header_password: Option<&'a [u8]>,
@@ -200,7 +199,7 @@ pub(super) fn write_archive(
     );
     let compressed = compress::compress_members_with_context(
         &sources,
-        plan.compress.clone(),
+        &plan.compress,
         resources,
         &MemberProgress {
             entries,
@@ -553,7 +552,7 @@ fn prepare_member(
     plan: &EnginePlan<'_>,
     header_keys: Option<&HeaderEncryptionKeys>,
 ) -> Result<PreparedBlock> {
-    let compression_info = compress::member_compression_info(&plan.compress, &member, plan.method)?;
+    let compression_info = compress::member_compression_info(&plan.compress, &member)?;
     let plain_len = if member.store {
         member.input_size
     } else {
@@ -1061,7 +1060,7 @@ pub(super) fn write_volumes(
     );
     let compressed = compress::compress_members_with_context(
         &sources,
-        plan.compress.clone(),
+        &plan.compress,
         resources,
         &MemberProgress {
             entries,
@@ -1125,7 +1124,7 @@ fn prepare_volume_member(
 ) -> Result<VolumeMember> {
     let progress = plan.progress;
     check_cancelled(progress)?;
-    let compression_info = compress::member_compression_info(&plan.compress, &member, plan.method)?;
+    let compression_info = compress::member_compression_info(&plan.compress, &member)?;
     let plain_len = if member.store {
         member.input_size
     } else {

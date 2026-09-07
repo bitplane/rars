@@ -12,9 +12,12 @@ mod engine;
 mod filter_policy;
 pub(crate) mod headers;
 mod layout;
+mod plan;
+#[cfg(test)]
+use filter_policy::encode_options_for_level;
 use filter_policy::{
     compression_method_for_level, dictionary_size_for_options, encode_option_candidates_for_level,
-    encode_options_for_level, filter_policy_walk_bytes, rar50_algorithm_version,
+    filter_policy_walk_bytes, rar50_algorithm_version,
 };
 pub(super) use headers::end_header_specific;
 
@@ -363,20 +366,12 @@ pub fn write_streaming_volumes_with_progress(
     engine::write_volumes(
         entries,
         engine::EnginePlan {
-            compress: {
-                let mut compress = streaming_compress_plan(
-                    options,
-                    dictionary_reach(entries, options.features.solid),
-                    resources.memory_limit(),
-                )?;
-                compress.filter_policy = extras.filter_policy;
-                compress.candidates = encode_option_candidates_for_level(
-                    options.compression_level,
-                    compress.dictionary_size,
-                )?;
-                compress
-            },
-            method: compression_method_for_level(options.compression_level)?,
+            compress: compression_plan(
+                options,
+                extras.filter_policy,
+                dictionary_reach(entries, options.features.solid),
+                resources.memory_limit(),
+            )?,
             recovery_percent: extras.recovery_percent,
             header_encrypted: options.features.header_encryption,
             header_password: extras.header_password,
@@ -525,20 +520,12 @@ pub(crate) fn write_streaming_archive_reporting(
     engine::write_archive(
         entries,
         engine::EnginePlan {
-            compress: {
-                let mut compress = streaming_compress_plan(
-                    options,
-                    dictionary_reach(entries, options.features.solid),
-                    resources.memory_limit(),
-                )?;
-                compress.filter_policy = extras.filter_policy;
-                compress.candidates = encode_option_candidates_for_level(
-                    options.compression_level,
-                    compress.dictionary_size,
-                )?;
-                compress
-            },
-            method: compression_method_for_level(options.compression_level)?,
+            compress: compression_plan(
+                options,
+                extras.filter_policy,
+                dictionary_reach(entries, options.features.solid),
+                resources.memory_limit(),
+            )?,
             recovery_percent,
             header_encrypted: options.features.header_encryption,
             header_password: extras.header_password,
@@ -578,8 +565,9 @@ fn dictionary_reach(entries: &[ArchiveEntry], solid: bool) -> u64 {
     }
 }
 
-fn streaming_compress_plan(
+fn compression_plan(
     options: WriterOptions,
+    filter_policy: FilterPolicy,
     content: u64,
     memory_limit: u64,
 ) -> Result<compress::CompressPlan> {
@@ -589,18 +577,20 @@ fn streaming_compress_plan(
     // claims.
     let reach = if method == 0 { 0 } else { content };
     let dictionary_size = dictionary_size_for_options(options, reach, memory_limit)?;
+    let candidates =
+        encode_option_candidates_for_level(options.compression_level, dictionary_size)?;
+    let encode_options = *candidates.first().ok_or(Error::WriterFailure(
+        "RAR 5 compression level has no encoder options",
+    ))?;
     Ok(compress::CompressPlan {
         algorithm_version: rar50_algorithm_version(options, dictionary_size)?,
-        encode_options: encode_options_for_level(options.compression_level, dictionary_size)?,
+        encode_options,
         dictionary_size,
         block_size: crate::codec::rar50::LZ_BLOCK_SIZE,
         solid: options.features.solid,
         method,
-        filter_policy: FilterPolicy::None,
-        candidates: vec![encode_options_for_level(
-            options.compression_level,
-            dictionary_size,
-        )?],
+        filter_policy,
+        candidates,
     })
 }
 
