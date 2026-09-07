@@ -3804,14 +3804,17 @@ fn extract_to_reports_rar50_entry_context_on_write_failure() {
     let bytes = std::fs::read(fixture("stored.rar")).unwrap();
     let archive = Archive::parse(&bytes).unwrap();
 
-    assert!(matches!(
-        archive.extract_to(ArchiveReadOptions::default(), |_| Ok(Box::new(FailingWriter))),
-        Err(Error::AtEntry {
-            name,
-            operation: "writing",
-            source
-        }) if name == b"hello.txt" && matches!(*source, Error::Io(_))
-    ));
+    let error = archive
+        .extract_to(ArchiveReadOptions::default(), |_| {
+            Ok(Box::new(FailingWriter))
+        })
+        .unwrap_err();
+    assert_eq!(error.kind(), rars::ErrorKind::Io);
+    assert_eq!(
+        error.entry_context(),
+        Some((&b"hello.txt"[..], "extracting"))
+    );
+    assert!(matches!(error.root_cause(), Error::Io(source) if source.message == "sink failed"));
 }
 
 #[test]

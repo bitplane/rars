@@ -1966,33 +1966,29 @@ fn creates_rar15_archive_comment() {
 }
 
 #[test]
-fn creates_rar15_file_comment() {
-    let dir = scratch("create-rar15-file-comment");
+fn creates_legacy_file_comment() {
+    let dir = scratch("create-legacy-file-comment");
     let source = dir.join("commented.txt");
-    let archive = dir.join("file-comment.rar");
-    fs::write(&source, b"rar15 file commented payload\n").unwrap();
+    fs::write(&source, b"file commented payload\n").unwrap();
 
-    let create = rars()
-        .args([
-            "a",
-            "--format",
-            "rar15",
-            "--file-comment",
-            "rar15 file note",
-        ])
-        .arg(&archive)
-        .arg(&source)
-        .output()
-        .unwrap();
-    assert!(create.status.success(), "stderr: {}", stderr(&create));
+    for format in ["rar15", "rar30", "rar40"] {
+        let archive = dir.join(format!("file-comment-{format}.rar"));
+        let create = rars()
+            .args(["a", "--format", format, "--file-comment", "file note"])
+            .arg(&archive)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(create.status.success(), "stderr: {}", stderr(&create));
 
-    let info = rars().args(["info", "-v"]).arg(&archive).output().unwrap();
-    assert!(info.status.success(), "stderr: {}", stderr(&info));
-    assert!(stdout(&info).contains("comment: rar15 file note"));
+        let info = rars().args(["info", "-v"]).arg(&archive).output().unwrap();
+        assert!(info.status.success(), "stderr: {}", stderr(&info));
+        assert!(stdout(&info).contains("comment: file note"));
 
-    let test = rars().arg("test").arg(&archive).output().unwrap();
-    assert!(test.status.success(), "stderr: {}", stderr(&test));
-    assert!(stdout(&test).contains("OK commented.txt"));
+        let test = rars().arg("test").arg(&archive).output().unwrap();
+        assert!(test.status.success(), "stderr: {}", stderr(&test));
+        assert!(stdout(&test).contains("OK commented.txt"));
+    }
 }
 
 #[test]
@@ -5559,11 +5555,6 @@ const REJECTED_COMBINATIONS: &[(&[&str], &str)] = &[
         &["--format", "rar29", "--temp-dir", "."],
         "error: --temp-dir is not supported by --format rar29; use --format rar50 \
          or --format rar70",
-    ),
-    (
-        &["--format", "rar30", "--file-comment", "note"],
-        "error: --file-comment is not supported by --format rar30; use --format rar14, \
-         --format rar15, --format rar20, --format rar29, --format rar50 or --format rar70",
     ),
     // Two filters have to be reported as the conflict they are. Asking which
     // one the format supports has no answer, and the two checks rank the flags

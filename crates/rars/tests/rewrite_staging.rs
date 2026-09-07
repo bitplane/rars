@@ -125,7 +125,7 @@ fn solid_staging_reads_once_and_reopens_without_touching_archive() {
             .unwrap();
         assert_eq!(count.load(Ordering::Relaxed), one_pass, "{format}");
         for _ in 0..2 {
-            for (source, expected) in sources.iter().zip([b'c', b'a']) {
+            for (source, expected) in sources.iter().zip(*b"ca") {
                 let mut data = Vec::new();
                 source.open().unwrap().read_to_end(&mut data).unwrap();
                 assert_eq!(data, vec![expected; 2048]);
