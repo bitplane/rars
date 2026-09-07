@@ -311,6 +311,7 @@ fn heartbeat_loop(shared: Arc<(Mutex<PlainState>, Condvar)>) {
 
 fn operation_label(operation: WriteOperation, pass: usize) -> String {
     match operation {
+        WriteOperation::Staging => "Staging archive".to_string(),
         WriteOperation::Emission => "Writing archive".to_string(),
         WriteOperation::Compression => "Compressing archive".to_string(),
         WriteOperation::Recovery if pass > 1 => format!("Building recovery record (pass {pass})"),

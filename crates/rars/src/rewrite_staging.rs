@@ -2,6 +2,7 @@
 
 use crate::{Archive, ArchiveReadOptions, EntrySource, Result};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Disk policy for [`Archive::stage_rewrite_sources`].
 ///
@@ -40,13 +41,32 @@ impl Archive {
         options: ArchiveReadOptions<'_>,
         staging: &RewriteStaging,
     ) -> Result<Vec<EntrySource>> {
+        self.stage_rewrite_sources_with_progress(indices, options, staging, None)
+    }
+
+    /// Staging with a separate [`crate::WriteOperation::Staging`] progress phase.
+    /// Counts decoded bytes, including discarded solid predecessors. Entry indices
+    /// count decoded payloads in traversal order, not original archive indices.
+    /// Byte progress precedes integrity verification; finished events follow it.
+    /// Declared progress totals saturate at `u64::MAX`.
+    ///
+    /// Callback cancellation is checked around reports, between members and at
+    /// bounded output writes. Supply `options.cancellation` to also interrupt
+    /// decoder work that has not produced output. Blocked I/O cannot be preempted.
+    pub fn stage_rewrite_sources_with_progress(
+        &self,
+        indices: &[usize],
+        options: ArchiveReadOptions<'_>,
+        staging: &RewriteStaging,
+        progress: Option<Arc<dyn crate::WriteProgress>>,
+    ) -> Result<Vec<EntrySource>> {
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         {
-            native::stage(self, indices, options, staging)
+            native::stage(self, indices, options, staging, progress)
         }
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         {
-            let _ = (indices, options, staging);
+            let _ = (indices, options, staging, progress);
             Err(crate::Error::InvalidArgument(
                 "rewrite staging requires disk storage",
             ))
@@ -57,7 +77,10 @@ impl Archive {
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod native {
     use super::*;
-    use crate::{streaming::Spool, Error, ExtractionDecision, WriterResources};
+    use crate::{
+        streaming::Spool, Error, ExtractionDecision, WriteOperation, WriteProgress,
+        WriteProgressEvent, WriterResources,
+    };
     use std::{
         cell::{Cell, RefCell},
         collections::BTreeMap,
@@ -96,13 +119,80 @@ mod native {
         }
     }
 
+    struct Progress {
+        callback: Arc<dyn WriteProgress>,
+        completed: Cell<u64>,
+        total: u64,
+        entries: usize,
+    }
+
+    impl Progress {
+        fn check(&self) -> Result<()> {
+            if self.callback.is_cancelled() {
+                Err(Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn report(&self, event: WriteProgressEvent<'_>) -> Result<()> {
+            self.check()?;
+            self.callback.report(event);
+            self.check()
+        }
+
+        fn finish_entry(&self, entry: &(usize, Vec<u8>, u64)) -> Result<()> {
+            self.report(WriteProgressEvent::EntryFinished {
+                operation: WriteOperation::Staging,
+                index: entry.0,
+                total_entries: self.entries,
+                name: &entry.1,
+                input_bytes: entry.2,
+            })
+        }
+    }
+
+    struct ProgressSink {
+        inner: Box<dyn Write>,
+        progress: Rc<Progress>,
+    }
+
+    impl Write for ProgressSink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.progress.check().map_err(std::io::Error::other)?;
+            let written = self.inner.write(&bytes[..bytes.len().min(64 * 1024)])?;
+            let completed = self.progress.completed.get().saturating_add(written as u64);
+            self.progress.completed.set(completed);
+            self.progress
+                .report(WriteProgressEvent::Advanced {
+                    operation: WriteOperation::Staging,
+                    completed_bytes: completed,
+                    total_bytes: self.progress.total,
+                    pass: 1,
+                })
+                .map_err(std::io::Error::other)?;
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
     pub(super) fn stage(
         archive: &Archive,
         indices: &[usize],
         options: ArchiveReadOptions<'_>,
         staging: &RewriteStaging,
+        progress: Option<Arc<dyn WriteProgress>>,
     ) -> Result<Vec<EntrySource>> {
         options.check_cancelled()?;
+        if progress
+            .as_ref()
+            .is_some_and(|progress| progress.is_cancelled())
+        {
+            return Err(Error::Cancelled);
+        }
         let mut selected = BTreeMap::new();
         for &index in indices {
             if selected.insert(index, None).is_some() {
@@ -114,7 +204,23 @@ mod native {
         };
         let mut required = 0u64;
         let mut found = 0;
+        let solid = match archive {
+            Archive::Rar13(a) => a.main.is_solid(),
+            Archive::Rar15To40(a) => a.main.is_solid(),
+            Archive::Rar50Plus(a) => a.main.is_solid(),
+        };
+        let mut total = 0u64;
+        let mut entries = 0;
         for (index, member) in archive.members().enumerate() {
+            options.check_cancelled()?;
+            if index <= last
+                && (selected.contains_key(&index) || solid)
+                && !member.meta.is_directory
+                && !member.meta.is_redirection
+            {
+                total = total.saturating_add(member.meta.unpacked_size);
+                entries += 1;
+            }
             if !selected.contains_key(&index) {
                 continue;
             }
@@ -141,34 +247,87 @@ mod native {
         if found != selected.len() {
             return Err(Error::EntryNotFound);
         }
-        let solid = match archive {
-            Archive::Rar13(a) => a.main.is_solid(),
-            Archive::Rar15To40(a) => a.main.is_solid(),
-            Archive::Rar50Plus(a) => a.main.is_solid(),
-        };
+        let progress = progress.map(|callback| {
+            Rc::new(Progress {
+                callback,
+                completed: Cell::new(0),
+                total,
+                entries,
+            })
+        });
+        if let Some(progress) = &progress {
+            progress.report(WriteProgressEvent::OperationStarted {
+                operation: WriteOperation::Staging,
+                total_bytes: Some(total),
+                total_entries: Some(entries),
+                pass: 1,
+            })?;
+        }
         let resources = WriterResources::new(0).with_temp_dir(&staging.directory);
         let used = Rc::new(Cell::new(0));
         let mut index = 0;
+        let mut pending = None;
+        let mut decoded = 0;
         archive.extract_with_control(options, |member| {
+            if let Some(progress) = &progress {
+                if let Some(entry) = pending.take() {
+                    progress.finish_entry(&entry)?;
+                }
+            }
             let current = index;
             index += 1;
             if current > last {
                 return Ok(ExtractionDecision::Stop);
             }
-            if let Some(slot) = selected.get_mut(&current) {
+            let wanted = selected.contains_key(&current);
+            let dependency = solid && !member.meta.is_directory && !member.meta.is_redirection;
+            if !wanted && !dependency {
+                return Ok(ExtractionDecision::Skip);
+            }
+            if let Some(progress) = &progress {
+                progress.report(WriteProgressEvent::EntryStarted {
+                    operation: WriteOperation::Staging,
+                    index: decoded,
+                    total_entries: entries,
+                    name: &member.meta.name,
+                    input_bytes: member.meta.unpacked_size,
+                })?;
+                pending = Some((decoded, member.meta.name.clone(), member.meta.unpacked_size));
+            }
+            decoded += 1;
+            let sink: Box<dyn Write> = if let Some(slot) = selected.get_mut(&current) {
                 let spool = Rc::new(RefCell::new(Spool::create(&resources)?));
                 *slot = Some(spool.clone());
-                Ok(ExtractionDecision::Extract(Box::new(Sink {
+                Box::new(Sink {
                     spool,
                     used: used.clone(),
                     limit: staging.max_staged_bytes,
-                })))
-            } else if solid && !member.meta.is_directory && !member.meta.is_redirection {
-                Ok(ExtractionDecision::Extract(Box::new(std::io::sink())))
+                })
             } else {
-                Ok(ExtractionDecision::Skip)
-            }
+                Box::new(std::io::sink())
+            };
+            Ok(ExtractionDecision::Extract(
+                if let Some(progress) = &progress {
+                    Box::new(ProgressSink {
+                        inner: sink,
+                        progress: progress.clone(),
+                    })
+                } else {
+                    sink
+                },
+            ))
         })?;
+        if let Some(progress) = &progress {
+            if let Some(entry) = pending.take() {
+                progress.finish_entry(&entry)?;
+            }
+            progress.report(WriteProgressEvent::OperationFinished {
+                operation: WriteOperation::Staging,
+                total_bytes: Some(total),
+                total_entries: Some(entries),
+                pass: 1,
+            })?;
+        }
         indices
             .iter()
             .map(|index| {

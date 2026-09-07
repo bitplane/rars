@@ -2,6 +2,8 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WriteOperation {
+    /// Decoding and verifying source payloads before a rewrite.
+    Staging,
     /// Compressing or otherwise preparing member payloads.
     Compression,
     /// Building a RAR 5 recovery record.

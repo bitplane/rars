@@ -96,6 +96,7 @@ struct PythonProgress {
     state: Mutex<ProgressEvent>,
     error: Mutex<Option<PyErr>>,
     cancelled: AtomicBool,
+    read_cancellation: rars_rs::ReadCancellation,
 }
 
 impl PythonProgress {
@@ -113,6 +114,7 @@ impl PythonProgress {
             }),
             error: Mutex::new(None),
             cancelled: AtomicBool::new(false),
+            read_cancellation: rars_rs::ReadCancellation::new(),
         }
     }
 
@@ -192,6 +194,7 @@ impl rars_rs::WriteProgress for PythonProgress {
         });
         if let Err(error) = result {
             self.cancelled.store(true, Ordering::Relaxed);
+            self.read_cancellation.cancel();
             *self
                 .error
                 .lock()
@@ -206,6 +209,7 @@ impl rars_rs::WriteProgress for PythonProgress {
 
 fn progress_phase(operation: rars_rs::WriteOperation) -> &'static str {
     match operation {
+        rars_rs::WriteOperation::Staging => "staging",
         rars_rs::WriteOperation::Compression => "compression",
         rars_rs::WriteOperation::Recovery => "recovery",
         _ => "writing",
@@ -587,7 +591,12 @@ struct RewriteMember {
 }
 
 impl RewriteInput {
-    fn prepare(&self, builder: &mut rars_rs::Builder, directory: &Path) -> rars_rs::Result<()> {
+    fn prepare(
+        &self,
+        builder: &mut rars_rs::Builder,
+        directory: &Path,
+        progress: Option<Arc<PythonProgress>>,
+    ) -> rars_rs::Result<()> {
         let mut members: Vec<_> = self.members.iter().collect();
         members.sort_unstable_by_key(|(_, member)| member.index);
         let limit = match self.max_staged_bytes {
@@ -601,13 +610,21 @@ impl RewriteInput {
             })?,
         };
         let indices: Vec<_> = members.iter().map(|(_, member)| member.index).collect();
-        let sources = self.archive.stage_rewrite_sources(
+        let mut options =
+            rars_rs::ArchiveReadOptions::with_optional_password(self.password.as_deref());
+        if let Some(progress) = &progress {
+            options = options.with_cancellation(&progress.read_cancellation);
+        }
+        let sources = self.archive.stage_rewrite_sources_with_progress(
             &indices,
-            rars_rs::ArchiveReadOptions::with_optional_password(self.password.as_deref()),
+            options,
             &rars_rs::RewriteStaging {
                 directory: self.directory.as_deref().unwrap_or(directory).to_path_buf(),
                 max_staged_bytes: limit,
             },
+            progress
+                .clone()
+                .map(|progress| progress as Arc<dyn rars_rs::WriteProgress>),
         )?;
         for ((name, _), source) in members.into_iter().zip(sources) {
             builder.set_source(name, source)?;
@@ -1181,7 +1198,7 @@ impl RarBuilder {
         let worker = progress.clone();
         let result = py.detach(move || {
             if let Some(rewrite) = rewrite {
-                rewrite.prepare(&mut builder, directory)?;
+                rewrite.prepare(&mut builder, directory, worker.clone())?;
             }
             run(
                 &builder,

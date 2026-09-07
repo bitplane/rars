@@ -261,8 +261,16 @@ stages afresh. Cleanup is best effort, not secure erasure, and process terminati
 may leave plaintext files. The limit excludes filesystem overhead, discarded
 solid dependencies, archive input, comments, link targets, decoder workspace,
 added files and writer output spools. Legacy encoding still materializes payloads
-in memory; this is not an aggregate RAM limit. Writer progress callbacks begin
-after staging and do not report or cancel the staging traversal.
+in memory; this is not an aggregate RAM limit.
+
+The existing `progress` callback reports a `staging` phase before compression.
+Its byte total includes decoded solid predecessors, including removed files;
+it is therefore distinct from the retained-byte quota. Entry indices count
+decoded payloads in traversal order and names refer to the source archive.
+Byte progress counts output before checksum verification and is not a success
+signal. Raising from the callback cooperatively cancels staging, cleans up its
+files and re-raises the original exception. Decoder work checks the cancellation
+token too; blocked I/O and indivisible library work cannot be preempted.
 
 The complete retained payload set is staged before encoding. Incremental
 consumption and reuse of original compressed payloads remain future work.

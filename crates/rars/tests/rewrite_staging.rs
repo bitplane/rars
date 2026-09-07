@@ -13,6 +13,59 @@ use std::sync::{
 #[path = "support/scratch.rs"]
 mod scratch;
 
+#[test]
+fn staging_finished_events_require_verified_payloads() {
+    use rars::{WriteOperation, WriteProgressEvent};
+    use std::sync::Mutex;
+    let root = scratch::case("rewrite-progress-integrity");
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    builder
+        .add_bytes(b"first".to_vec(), b"first payload".to_vec(), None, None)
+        .unwrap();
+    builder
+        .add_bytes(b"fault".to_vec(), b"fault payload".to_vec(), None, None)
+        .unwrap();
+    let mut bytes = builder.to_bytes().unwrap();
+    let offset = bytes
+        .windows(13)
+        .position(|bytes| bytes == b"fault payload")
+        .unwrap();
+    bytes[offset] ^= 1;
+    let archive = ArchiveReader::read_owned(bytes).unwrap();
+    let finished = Arc::new(Mutex::new(Vec::new()));
+    let recorded = finished.clone();
+    let progress = Arc::new(move |event: WriteProgressEvent<'_>| match event {
+        WriteProgressEvent::EntryFinished {
+            operation: WriteOperation::Staging,
+            name,
+            ..
+        } => {
+            recorded.lock().unwrap().push(name.to_vec());
+        }
+        WriteProgressEvent::OperationFinished {
+            operation: WriteOperation::Staging,
+            ..
+        } => {
+            panic!("failed staging must not finish");
+        }
+        _ => {}
+    });
+    let error = archive
+        .stage_rewrite_sources_with_progress(
+            &[0, 1],
+            ArchiveReadOptions::default(),
+            &RewriteStaging {
+                directory: root.to_path_buf(),
+                max_staged_bytes: 26,
+            },
+            Some(progress),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::ChecksumMismatch);
+    assert_eq!(*finished.lock().unwrap(), vec![b"first".to_vec()]);
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+}
+
 struct Counted {
     data: Cursor<Vec<u8>>,
     count: Arc<AtomicU64>,

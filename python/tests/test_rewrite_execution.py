@@ -72,6 +72,8 @@ def test_default_directory_and_cleanup_after_writer_callback_failure(tmp_path, m
     expected = cwd if method == "to_bytes" else output_dir
 
     def stop(event):
+        if event.phase == "staging":
+            return
         # Writer callbacks run with verified sources alive for this write.
         assert len(list(expected.glob(".rars-spool-*"))) >= 2
         raise RuntimeError("stop after staging")
@@ -128,3 +130,78 @@ def test_staging_directory_error_does_not_publish(tmp_path):
         builder.write(destination)
     assert destination.read_bytes() == b"keep"
     assert list(tmp_path.iterdir()) == [destination]
+
+
+@pytest.mark.parametrize("solid", [False, True])
+def test_staging_progress_counts_decoded_dependencies_before_compression(tmp_path, solid):
+    builder = rars.RarBuilder.from_archive(
+        rars.RarFile.from_bytes(source_archive(solid=solid)), staging_dir=tmp_path,
+    )
+    builder.remove("first")
+    events = []
+    builder.to_bytes(progress=events.append)
+    staging = [event for event in events if event.phase == "staging"]
+    assert staging
+    assert events[0].phase == "staging"
+    assert staging[0].completed == 0
+    expected = 27 if solid else 14
+    assert all(event.total == expected for event in staging)
+    assert all(event.total_entries == (2 if solid else 1) for event in staging)
+    assert staging[-1].completed == expected
+    assert [event.completed for event in staging] == sorted(event.completed for event in staging)
+    names = {event.entry_name for event in staging if event.entry_name is not None}
+    assert names == ({b"first", b"second"} if solid else {b"second"})
+    first_encoding = next(index for index, event in enumerate(events) if event.phase != "staging")
+    assert all(event.phase != "staging" for event in events[first_encoding:])
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("format", ["rar13", "rar14", "rar15", "rar20", "rar29", "rar30", "rar40", "rar50", "rar70"])
+@pytest.mark.parametrize("when", ["start", "bytes"])
+def test_staging_callback_cancels_and_preserves_destination(tmp_path, format, when):
+    original = rars.RarBuilder(format=format, store=True)
+    original.add_bytes(b"payload" * 20000, "file")
+    builder = rars.RarBuilder.from_archive(rars.RarFile.from_bytes(original.to_bytes()))
+    destination = tmp_path / "archive.rar"
+    destination.write_bytes(b"keep")
+    failure = RuntimeError("cancel staging")
+    seen = []
+
+    def stop(event):
+        seen.append(event)
+        assert event.phase == "staging"
+        if when == "start" or event.completed > 0:
+            if when == "start":
+                assert list(tmp_path.iterdir()) == [destination]
+            else:
+                assert event.completed <= 64 * 1024
+                assert list(tmp_path.glob(".rars-spool-*"))
+            raise failure
+
+    with pytest.raises(RuntimeError) as caught:
+        builder.write(destination, progress=stop)
+    assert caught.value is failure
+    assert seen
+    assert destination.read_bytes() == b"keep"
+    assert list(tmp_path.iterdir()) == [destination]
+    builder.write(destination)
+    assert rars.RarFile(destination).read("file") == b"payload" * 20000
+    assert list(tmp_path.iterdir()) == [destination]
+
+
+def test_staging_can_cancel_while_discarding_solid_predecessor(tmp_path):
+    builder = rars.RarBuilder.from_archive(
+        rars.RarFile.from_bytes(source_archive(solid=True)), staging_dir=tmp_path,
+    )
+    builder.remove("first")
+
+    def stop(event):
+        if event.phase == "staging" and event.completed:
+            assert event.entry_name == b"first"
+            # The selected payload has not started, so there is no staged file yet.
+            assert list(tmp_path.iterdir()) == []
+            raise RuntimeError("cancel dependency")
+
+    with pytest.raises(RuntimeError, match="cancel dependency"):
+        builder.to_bytes(progress=stop)
+    assert list(tmp_path.iterdir()) == []
