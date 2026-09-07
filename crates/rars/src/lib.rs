@@ -1131,16 +1131,16 @@ impl RecoveryRepairResult {
     ) -> Result<()> {
         let control = crate::read_control::ReadControl::new(cancellation);
         control.check()?;
-        let (mut pending, mut output) = crate::builder::PendingArchive::create(path)?;
-        let result = control
-            .finish(
+        let (mut pending, output) = crate::builder::PendingArchive::create(path)?;
+        {
+            let mut output = output;
+            control.finish(
                 control
                     .write_all(&mut output, &self.data)
                     .map_err(Error::from),
-            )
-            .and_then(|()| output.sync_all().map_err(Error::from));
-        drop(output);
-        result?;
+            )?;
+            output.sync_all()?;
+        }
         control.check()?;
         std::fs::rename(pending.path.as_ref().unwrap(), path)?;
         pending.path = None;

@@ -1143,14 +1143,14 @@ impl Builder {
             Some(parent) => WriterResources::default().with_temp_dir(parent),
             None => WriterResources::default(),
         };
-        let (mut pending, mut output) = PendingArchive::create(path)?;
-        let result = self
-            .write_to(&mut output, &resources, progress)
-            .and_then(|()| output.sync_all().map_err(Error::from));
+        let (mut pending, output) = PendingArchive::create(path)?;
         // Close before rename or cleanup on platforms that disallow removing
         // open files. Declaration order also closes it first during unwinding.
-        drop(output);
-        result?;
+        {
+            let mut output = output;
+            self.write_to(&mut output, &resources, progress)?;
+            output.sync_all()?;
+        }
         check_cancelled(progress.map(ProgressReporter))?;
         fs::rename(pending.path.as_ref().unwrap(), path)?;
         pending.path = None;
