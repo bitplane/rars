@@ -1557,7 +1557,9 @@ fn write_archive_to(
 
     let mut total_bytes = 0u64;
     for member in members {
-        total_bytes = total_bytes.saturating_add(member.unpacked_size()? as u64);
+        total_bytes = total_bytes.saturating_add(member.unpacked_size().map_err(|error| {
+            crate::write_stream::member_error(error, member.name, "reading source")
+        })? as u64);
     }
     // Without a solid chain the writer tries each fallback setting in turn, so
     // its progress total counts every byte once per attempt.
@@ -1578,7 +1580,9 @@ fn write_archive_to(
 
     for (index, member) in members.iter().enumerate() {
         work.check()?;
-        let unpacked_size = member.unpacked_size()?;
+        let unpacked_size = member.unpacked_size().map_err(|error| {
+            crate::write_stream::member_error(error, member.name, "reading source")
+        })?;
         report_compression_entry(reporting, true, index, members.len(), member, unpacked_size);
         work.check()?;
         let encoded = encode_member(
@@ -1589,8 +1593,10 @@ fn write_archive_to(
             solid_encoder.as_mut(),
             resources,
             &work,
-        )?;
-        write_member(output, member, encoded, options, work.reporter())?;
+        )
+        .map_err(|error| crate::write_stream::member_error(error, member.name, "preparing"))?;
+        write_member(output, member, encoded, options, work.reporter())
+            .map_err(|error| crate::write_stream::member_error(error, member.name, "writing"))?;
         report_compression_entry(
             reporting,
             false,
@@ -1803,7 +1809,7 @@ fn write_member(
             u64::from(packed_size),
         )?;
         if checksum.finish() != encoded.file_crc {
-            return Err(Error::InvalidHeader(
+            return Err(Error::SourceChanged(
                 "entry source contents changed while writing",
             ));
         }

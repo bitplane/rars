@@ -358,7 +358,9 @@ fn write_archive_to(
     let mut total_bytes = 0u64;
     let mut largest_member = 0u64;
     for member in members {
-        let unpacked = member.unpacked_size()? as u64;
+        let unpacked = member.unpacked_size().map_err(|error| {
+            crate::write_stream::member_error(error, member.name, "reading source")
+        })? as u64;
         total_bytes = total_bytes.saturating_add(unpacked);
         largest_member = largest_member.max(unpacked);
     }
@@ -457,7 +459,8 @@ fn write_members_to(
                 &mut solid_encoder,
                 resources,
                 progress,
-            )?;
+            )
+            .map_err(|error| crate::write_stream::member_error(error, member.name, "preparing"))?;
             let solid_continuation = encoded.method != 0x30 && solid_run_has_member;
             // Storing a member rebuilds the encoder, so the chain ends there.
             // An empty compressed member leaves the chain exactly as it was:
@@ -480,13 +483,18 @@ fn write_members_to(
                 solid_continuation,
                 header_password,
                 progress.and_then(WorkTracker::reporter),
-            )?;
+            )
+            .map_err(|error| crate::write_stream::member_error(error, member.name, "writing"))?;
         }
     } else {
         crate::parallel::map_slice_windowed(
             members,
             crate::parallel::default_window(),
-            |member| encode_member(member, options, coding, &mut None, resources, progress),
+            |member| {
+                encode_member(member, options, coding, &mut None, resources, progress).map_err(
+                    |error| crate::write_stream::member_error(error, member.name, "preparing"),
+                )
+            },
             |member, encoded| {
                 write_member(
                     output,
@@ -497,6 +505,7 @@ fn write_members_to(
                     header_password,
                     progress.and_then(WorkTracker::reporter),
                 )
+                .map_err(|error| crate::write_stream::member_error(error, member.name, "writing"))
             },
         )?;
     }
@@ -1333,7 +1342,7 @@ fn write_member(
             packed_size as u64,
         )?;
         if checksum.finish() != encoded.file_crc {
-            return Err(Error::InvalidHeader(
+            return Err(Error::SourceChanged(
                 "entry source contents changed while writing",
             ));
         }

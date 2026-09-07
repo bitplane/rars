@@ -1152,7 +1152,10 @@ impl Builder {
         for entry in &mut owned.entries {
             if let Some(source) = entry.source.take() {
                 entry.data = crate::write_stream::MemberBytes::Source(&source)
-                    .load_with_progress(progress)?
+                    .load_with_progress(progress)
+                    .map_err(|error| {
+                        crate::write_stream::member_error(error, &entry.name, "reading source")
+                    })?
                     .into_owned();
             }
         }

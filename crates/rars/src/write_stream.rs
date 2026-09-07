@@ -11,6 +11,15 @@ use crate::streaming::EntrySource;
 use std::borrow::Cow;
 use std::io::{Read, Write};
 
+/// Attribute a writer failure without blaming a member for cancellation.
+pub(crate) fn member_error(error: Error, name: &[u8], operation: &'static str) -> Error {
+    if error.kind() == crate::ErrorKind::Cancelled || error.entry_context().is_some() {
+        error
+    } else {
+        error.at_entry(name.to_vec(), operation)
+    }
+}
+
 /// How much of a member is read at a time when it is walked rather than held.
 const WALK_CHUNK: usize = 256 * 1024;
 
