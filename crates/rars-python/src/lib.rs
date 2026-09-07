@@ -115,7 +115,7 @@ impl CancellationToken {
     }
 }
 
-/// Per-call limits for member reading, extraction and payload testing.
+/// Per-call limits for member and archive-comment reading, extraction and payload testing.
 #[pyclass(frozen, module = "rars", skip_from_py_object)]
 #[derive(Debug, Clone, Default)]
 struct ReadOptions {
@@ -539,9 +539,23 @@ impl RarFile {
 
     #[getter]
     fn comment(&self, py: Python<'_>) -> PyResult<Option<Vec<u8>>> {
-        let password = self.password.clone();
-        py.detach(|| self.archive.comment(password.as_deref()))
-            .map_err(map_error)
+        self.read_comment(py, None, None)
+    }
+
+    /// Returns the complete archive comment, or None if absent, under per-call read policies.
+    #[pyo3(signature = (pwd = None, *, options = None))]
+    fn read_comment(
+        &self,
+        py: Python<'_>,
+        pwd: Option<&Bound<'_, PyAny>>,
+        options: Option<&ReadOptions>,
+    ) -> PyResult<Option<Vec<u8>>> {
+        let password = py_password(pwd)?.or_else(|| self.password.clone());
+        py.detach(|| {
+            self.archive
+                .comment_with_options(python_read_options(options, password.as_deref()))
+        })
+        .map_err(map_error)
     }
 
     #[getter]

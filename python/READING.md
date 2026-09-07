@@ -1,6 +1,6 @@
 # Reader cancellation and resource limits
 
-`RarFile.read`, `open`, `extract`, `extractall` and `testrar` accept a keyword-only
+`RarFile.read`, `open`, `extract`, `extractall`, `testrar` and `read_comment` accept a keyword-only
 `options=rars.ReadOptions(...)` argument. Options apply to that call, not to the
 archive object. Omitting them retains the existing defaults and password handling.
 
@@ -18,6 +18,7 @@ options = rars.ReadOptions(
 payload = archive.read("document.txt", options=options)
 archive.extractall("output", options=options)
 archive.testrar(options=options)
+comment = archive.read_comment(options=options)
 ```
 
 `ReadOptions` is immutable and reusable. Its limits and cancellation token are
@@ -56,7 +57,17 @@ I/O and indivisible codec work cannot be interrupted midway. Cancelled tokens
 cannot be reset; use a new token for later work. Resource refusals raise
 `MemoryError`; unsupported decoding modes retain their feature exception.
 
-These options do not apply to initial archive parsing, comment or link helpers,
-repair, or the module-level volume helpers. Passwords remain supplied through
-`pwd=` or the archive's configured password. Rust exposes archive comment limits
-through `Archive::comment_with_options`; Python comment controls remain a follow-up.
+`read_comment(pwd=None, *, options=None)` returns the complete archive comment as
+bytes, or `None` if absent; an empty comment is `b""`. Both output ceilings apply
+to the single comment, with fresh budgets and admission before payload decoding.
+Cancellation is checked even when no comment exists. RAR5/7 dictionary and
+buffering policies apply to compressed comments; the default comment path stays
+buffered unless a threshold is supplied. Filtered comments above that threshold
+raise `MemoryError` because Python does not yet expose scratch policy. No partial
+comment is returned on failure. The `comment` property keeps its default policy;
+`getcomment(member)` reads a member comment and does not accept these options.
+
+These options do not apply to initial archive parsing, member-comment or link
+helpers, repair, or the module-level volume helpers. Passwords remain supplied
+through `pwd=` or the archive's configured password. A per-call password does not
+change the archive's configured password.
