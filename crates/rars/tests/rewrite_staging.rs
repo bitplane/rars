@@ -324,3 +324,266 @@ fn corrupt_dependencies_fail_cleanly_but_independent_omissions_are_skipped() {
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
     }
 }
+
+#[test]
+fn incremental_legacy_materialization_releases_each_verified_payload() {
+    let root = scratch::case("rewrite-incremental-legacy");
+    let mut original = Builder::new(ArchiveVersion::Rar50).store(true);
+    for index in 0..3 {
+        original
+            .add_bytes(
+                format!("f{index}").into_bytes(),
+                vec![b'a' + index; 2048],
+                None,
+                None,
+            )
+            .unwrap();
+    }
+    let archive = ArchiveReader::read_owned(original.to_bytes().unwrap()).unwrap();
+    let bytes = archive
+        .with_rewrite_sources(
+            &[0, 1, 2],
+            ArchiveReadOptions::default(),
+            &RewriteStaging {
+                directory: root.to_path_buf(),
+                max_staged_bytes: 2048,
+            },
+            None,
+            |sources| {
+                let mut output = Builder::new(ArchiveVersion::Rar29).store(true);
+                for (index, source) in sources.into_iter().enumerate() {
+                    output.add_source(format!("f{index}").into_bytes(), source, None, None)?;
+                }
+                output.to_bytes()
+            },
+        )
+        .unwrap();
+    let output = ArchiveReader::read_owned(bytes).unwrap();
+    for index in 0..3 {
+        assert_eq!(
+            output.read_member_at(index, None).unwrap().unwrap(),
+            vec![b'a' + index as u8; 2048]
+        );
+    }
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+}
+
+#[test]
+fn incremental_streaming_fallback_fits_one_payload_of_staging() {
+    let root = scratch::case("rewrite-incremental-stream");
+    let size = 2 * 1024 * 1024;
+    let mut original = Builder::new(ArchiveVersion::Rar50).store(true);
+    for index in 0..3 {
+        original
+            .add_bytes(
+                format!("f{index}").into_bytes(),
+                vec![b'a' + index; size],
+                None,
+                None,
+            )
+            .unwrap();
+    }
+    let archive = ArchiveReader::read_owned(original.to_bytes().unwrap()).unwrap();
+    let bytes = archive
+        .with_rewrite_sources(
+            &[0, 1, 2],
+            ArchiveReadOptions::default(),
+            &RewriteStaging {
+                directory: root.to_path_buf(),
+                max_staged_bytes: size as u64,
+            },
+            None,
+            |sources| {
+                let mut output = Builder::new(ArchiveVersion::Rar50).compression_level(Some(1));
+                for (index, source) in sources.into_iter().enumerate() {
+                    output.add_source(format!("f{index}").into_bytes(), source, None, None)?;
+                }
+                let mut bytes = Vec::new();
+                output.write_to(
+                    &mut bytes,
+                    &rars::WriterResources::new(70 * 1024 * 1024).with_temp_dir(&*root),
+                    None,
+                )?;
+                Ok(bytes)
+            },
+        )
+        .unwrap();
+    let output = ArchiveReader::read_owned(bytes).unwrap();
+    for index in 0..3 {
+        assert_eq!(
+            output.read_member_at(index, None).unwrap().unwrap(),
+            vec![b'a' + index as u8; size]
+        );
+    }
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+}
+
+#[test]
+fn incremental_sources_decode_once_and_join_on_early_failure_or_panic() {
+    let root = scratch::case("rewrite-incremental-once");
+    let mut builder = Builder::new(ArchiveVersion::Rar50).solid(true);
+    for index in 0..3 {
+        builder
+            .add_bytes(
+                format!("f{index}").into_bytes(),
+                vec![b'a' + index; 2048],
+                None,
+                None,
+            )
+            .unwrap();
+    }
+    let count = Arc::new(AtomicU64::new(0));
+    let archive = ArchiveReader::read_reader(Counted {
+        data: Cursor::new(builder.to_bytes().unwrap()),
+        count: count.clone(),
+    })
+    .unwrap();
+    count.store(0, Ordering::Relaxed);
+    archive
+        .extract_with_control(ArchiveReadOptions::default(), |_| {
+            Ok(ExtractionDecision::Extract(Box::new(std::io::sink())))
+        })
+        .unwrap();
+    let one_pass = count.swap(0, Ordering::Relaxed);
+    let staging = RewriteStaging {
+        directory: root.to_path_buf(),
+        max_staged_bytes: 4096,
+    };
+    archive
+        .with_rewrite_sources(
+            &[2, 0],
+            ArchiveReadOptions::default(),
+            &staging,
+            None,
+            |sources| {
+                // Out-of-order requests retain required earlier payloads without replaying decoding.
+                for _ in 0..2 {
+                    for (source, byte) in sources.iter().zip([b'c', b'a']) {
+                        let mut bytes = Vec::new();
+                        source.open()?.read_to_end(&mut bytes)?;
+                        assert_eq!(bytes, vec![byte; 2048]);
+                    }
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(count.load(Ordering::Relaxed), one_pass);
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    let token = rars::ReadCancellation::new();
+    let result: rars::Result<()> = archive.with_rewrite_sources(
+        &[0, 2],
+        ArchiveReadOptions::default().with_cancellation(&token),
+        &staging,
+        None,
+        |sources| {
+            let _reader = sources[0].open()?;
+            Err(Error::InvalidArgument("writer stopped"))
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(Error::InvalidArgument("writer stopped"))
+    ));
+    assert!(!token.is_cancelled());
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _: rars::Result<()> = archive.with_rewrite_sources(
+            &[0, 2],
+            ArchiveReadOptions::default(),
+            &staging,
+            None,
+            |sources| {
+                let _reader = sources[0].open()?;
+                panic!("writer panic");
+            },
+        );
+    }));
+    assert!(panic.is_err());
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+}
+
+#[test]
+fn incremental_decoder_callback_panic_wakes_the_consumer() {
+    let root = scratch::case("rewrite-decoder-panic");
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    builder
+        .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+        .unwrap();
+    let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    let error = archive
+        .with_rewrite_sources(
+            &[0],
+            ArchiveReadOptions::default(),
+            &RewriteStaging {
+                directory: root.to_path_buf(),
+                max_staged_bytes: 7,
+            },
+            Some(Arc::new(|_: rars::WriteProgressEvent<'_>| {
+                panic!("decoder callback")
+            })),
+            |sources| {
+                sources[0].open()?;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+    assert_eq!(
+        error,
+        Error::WriterFailure("rewrite decoder thread panicked")
+    );
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+}
+
+#[test]
+fn incremental_rewrites_match_eager_staging_bytes() {
+    let root = scratch::case("rewrite-incremental-bytes");
+    let mut input = Builder::new(ArchiveVersion::Rar50).store(true);
+    input
+        .add_bytes(
+            b"a".to_vec(),
+            b"compressible text\n".repeat(1000),
+            None,
+            None,
+        )
+        .unwrap();
+    input
+        .add_bytes(b"b".to_vec(), b"small".to_vec(), None, None)
+        .unwrap();
+    let archive = ArchiveReader::read_owned(input.to_bytes().unwrap()).unwrap();
+    let staging = RewriteStaging {
+        directory: root.to_path_buf(),
+        max_staged_bytes: 20000,
+    };
+    for format in [
+        ArchiveVersion::Rar29,
+        ArchiveVersion::Rar50,
+        ArchiveVersion::Rar70,
+    ] {
+        for solid in [false, true] {
+            let encode = |sources: Vec<rars::EntrySource>| {
+                let mut builder = Builder::new(format).solid(solid).compression_level(Some(1));
+                for (index, source) in sources.into_iter().enumerate() {
+                    builder.add_source(format!("f{index}").into_bytes(), source, None, None)?;
+                }
+                builder.to_bytes()
+            };
+            let eager = encode(
+                archive
+                    .stage_rewrite_sources(&[0, 1], ArchiveReadOptions::default(), &staging)
+                    .unwrap(),
+            )
+            .unwrap();
+            let incremental = archive
+                .with_rewrite_sources(
+                    &[0, 1],
+                    ArchiveReadOptions::default(),
+                    &staging,
+                    None,
+                    encode,
+                )
+                .unwrap();
+            assert_eq!(incremental, eager, "{format:?}, solid={solid}");
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        }
+    }
+}

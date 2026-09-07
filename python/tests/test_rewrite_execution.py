@@ -72,10 +72,9 @@ def test_default_directory_and_cleanup_after_writer_callback_failure(tmp_path, m
     expected = cwd if method == "to_bytes" else output_dir
 
     def stop(event):
-        if event.phase == "staging":
+        if event.phase != "compression" or not list(expected.glob(".rars-spool-*")):
             return
-        # Writer callbacks run with verified sources alive for this write.
-        assert len(list(expected.glob(".rars-spool-*"))) >= 2
+        # Abort while the writer owns staged payloads, before publication.
         raise RuntimeError("stop after staging")
 
     with pytest.raises(RuntimeError, match="stop after staging"):
@@ -133,7 +132,7 @@ def test_staging_directory_error_does_not_publish(tmp_path):
 
 
 @pytest.mark.parametrize("solid", [False, True])
-def test_staging_progress_counts_decoded_dependencies_before_compression(tmp_path, solid):
+def test_staging_progress_counts_decoded_dependencies_during_compression(tmp_path, solid):
     builder = rars.RarBuilder.from_archive(
         rars.RarFile.from_bytes(source_archive(solid=solid)), staging_dir=tmp_path,
     )
@@ -142,7 +141,6 @@ def test_staging_progress_counts_decoded_dependencies_before_compression(tmp_pat
     builder.to_bytes(progress=events.append)
     staging = [event for event in events if event.phase == "staging"]
     assert staging
-    assert events[0].phase == "staging"
     assert staging[0].completed == 0
     expected = 27 if solid else 14
     assert all(event.total == expected for event in staging)
@@ -151,8 +149,7 @@ def test_staging_progress_counts_decoded_dependencies_before_compression(tmp_pat
     assert [event.completed for event in staging] == sorted(event.completed for event in staging)
     names = {event.entry_name for event in staging if event.entry_name is not None}
     assert names == ({b"first", b"second"} if solid else {b"second"})
-    first_encoding = next(index for index, event in enumerate(events) if event.phase != "staging")
-    assert all(event.phase != "staging" for event in events[first_encoding:])
+    assert any(event.phase == "compression" for event in events)
     assert list(tmp_path.iterdir()) == []
 
 
@@ -168,11 +165,12 @@ def test_staging_callback_cancels_and_preserves_destination(tmp_path, format, wh
     seen = []
 
     def stop(event):
+        if event.phase != "staging":
+            return
         seen.append(event)
-        assert event.phase == "staging"
         if when == "start" or event.completed > 0:
             if when == "start":
-                assert list(tmp_path.iterdir()) == [destination]
+                assert destination.read_bytes() == b"keep"
             else:
                 assert event.completed <= 64 * 1024
                 assert list(tmp_path.glob(".rars-spool-*"))

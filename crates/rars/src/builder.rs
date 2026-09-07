@@ -1276,6 +1276,7 @@ impl Builder {
                         crate::write_stream::member_error(error, &entry.name, "reading source")
                     })?
                     .into_owned();
+                source.release();
             }
         }
         Ok(std::borrow::Cow::Owned(owned))

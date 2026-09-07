@@ -13,7 +13,8 @@ pub const DEFAULT_WRITER_MEMORY_LIMIT: u64 = 256 * 1024 * 1024;
 pub trait EntryReader: Read + Seek + Send {}
 impl<T: Read + Seek + Send> EntryReader for T {}
 
-trait SourceFactory: Send + Sync {
+pub(crate) trait SourceFactory: Send + Sync {
+    fn release(&self) {}
     fn len(&self) -> Result<u64>;
     fn open(&self) -> Result<Box<dyn EntryReader>>;
 }
@@ -36,22 +37,31 @@ impl fmt::Debug for EntrySource {
 }
 
 impl EntrySource {
+    pub(crate) fn from_factory(factory: impl SourceFactory + 'static) -> Self {
+        Self(Arc::new(factory))
+    }
+
+    /// Release a session-owned payload once this write will never reopen it.
+    pub(crate) fn release(&self) {
+        self.0.release();
+    }
+
     pub fn from_bytes(data: impl Into<Arc<[u8]>>) -> Self {
-        Self(Arc::new(MemorySource(data.into())))
+        Self::from_factory(MemorySource(data.into()))
     }
 
     pub fn from_path(path: impl Into<PathBuf>) -> Self {
-        Self(Arc::new(PathSource(path.into())))
+        Self::from_factory(PathSource(path.into()))
     }
 
     pub fn from_opener<F>(len: u64, open: F) -> Self
     where
         F: Fn() -> Result<Box<dyn EntryReader>> + Send + Sync + 'static,
     {
-        Self(Arc::new(OpenerSource {
+        Self::from_factory(OpenerSource {
             len,
             open: Arc::new(open),
-        }))
+        })
     }
 
     pub fn len(&self) -> Result<u64> {

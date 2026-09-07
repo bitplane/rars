@@ -243,9 +243,10 @@ Caller-owned output streams do not have this rollback guarantee.
 
 ## Rewrite execution and staging
 
-Each `to_bytes()`, `write(path)` or `write_volumes(first_path)` call verifies and
-stages retained file payloads in one archive-order extraction pass before
-encoding output. Renames retain original source identity; removed independent
+Each `to_bytes()`, `write(path)` or `write_volumes(first_path)` call uses one
+archive-order extraction pass to supply verified payloads on demand while
+encoding output. A scoped decoder starts work when the writer requests a source;
+that source becomes readable only after its payload passes integrity checks. Renames retain original source identity; removed independent
 files are skipped. Solid predecessors are decoded and verified when needed,
 even if removed. Payloads after the last retained source file are not decoded.
 Comments and legacy symbolic-link targets use the eager metadata path in
@@ -261,10 +262,14 @@ the output directory for path writes and the current directory for `to_bytes()`.
 The system temporary directory is not used by default. Files are reopened by
 path, so other users must not be able to replace entries in that directory.
 
-`max_staged_bytes` limits the combined uncompressed payload bytes retained on
+`max_staged_bytes` limits simultaneously retained uncompressed payload bytes on
 disk. Its default is the sum of the retained source files' declared sizes,
-recomputed after edits on each write. Both admission and actual writes enforce
-the limit. A refusal raises `MemoryError`, the binding's resource-limit exception;
+recomputed after edits on each write. Admission checks each selected member;
+actual writes enforce the shared live-byte limit. Parallel or out-of-order
+requests can retain several payloads at once. Compressed payload sources are
+released once compression no longer needs them. Stored members (including
+compression falling back to storage) remain available for the emission reread,
+so some archives still require enough staging space for all retained contents. A refusal raises `MemoryError`, the binding's resource-limit exception;
 filesystem failures raise `OSError`. For example:
 
 ```python
@@ -281,7 +286,9 @@ solid dependencies, archive input, comments, link targets, decoder workspace,
 added files and writer output spools. Legacy encoding still materializes payloads
 in memory; this is not an aggregate RAM limit.
 
-The existing `progress` callback reports a `staging` phase before compression.
+The existing `progress` callback reports a `staging` phase which can interleave
+with compression and emission. Each phase has separate counters; a phase change
+is not a restart or a promise that another phase has finished.
 Its byte total includes decoded solid predecessors, including removed files;
 it is therefore distinct from the retained-byte quota. Entry indices count
 decoded payloads in traversal order and names refer to the source archive.
@@ -299,15 +306,20 @@ parts and returns no set when cancelled. Cancellation remains cooperative:
 allocations, filter transforms, cryptographic setup and blocked caller I/O cannot
 be interrupted midway. Legacy output still buffers payloads and archive bytes.
 
-The complete retained payload set is staged before encoding. Incremental
-consumption and reuse of original compressed payloads remain future work.
+Legacy writers release staged files as they load each verified payload, but
+still materialize those payloads in memory before encoding. RAR5/7 releases
+compressed sources as members complete and stored sources after emission.
+Temporary staging and writer output spools have separate lifetimes and limits.
+Original compressed-payload reuse remains future work.
 
 Preservation means supported archive semantics, not identical bytes, compression
 ratio, encoder release, dictionary choices or original solid group boundaries.
 Volume-set rewriting, explicit conversion target settings, unsupported legacy
 metadata/services and header-encrypted quick-open output remain separate work.
-Rust callers can use
-`Archive::stage_rewrite_sources` with an explicit `RewriteStaging` directory and
-payload byte limit, then pass the verified sources to `Builder::add_source`.
-This stages the selected payloads in one traversal, including necessary solid
-predecessors, before writing; decoder and writer workspace have separate limits.
+Rust callers can use `Archive::with_rewrite_sources` with an explicit
+`RewriteStaging` directory and byte limit, then pass the session sources to
+`Builder::add_source` and write once inside its closure. Assign each source to
+one output member; these sources must not escape the closure. Writer failure or panic cancels and joins the decoder; retries
+start a fresh traversal. `Archive::stage_rewrite_sources` remains available for
+callers needing the complete verified selection before writing and independently
+reopenable sources afterward. Decoder and writer workspace have separate limits.

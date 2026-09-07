@@ -26,12 +26,19 @@ use std::sync::{
 /// Partial output and earlier extracted members can remain. The call aborts;
 /// it does not resume solid state, roll back sinks or refund output budgets.
 #[derive(Clone, Debug, Default)]
-pub struct ReadCancellation(Arc<AtomicBool>);
+pub struct ReadCancellation(Arc<AtomicBool>, Option<Arc<ReadCancellation>>);
 
 impl ReadCancellation {
     /// Creates an uncancelled signal.
     pub fn new() -> Self {
         Self::default()
+    }
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    pub(crate) fn child(&self) -> Self {
+        Self(
+            Arc::new(AtomicBool::new(false)),
+            Some(Arc::new(self.clone())),
+        )
     }
     /// Signals cancellation to every clone. Calling this repeatedly is harmless.
     pub fn cancel(&self) {
@@ -40,6 +47,7 @@ impl ReadCancellation {
     /// Returns whether any clone has signalled cancellation.
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Relaxed)
+            || self.1.as_ref().is_some_and(|parent| parent.is_cancelled())
     }
 }
 

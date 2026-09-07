@@ -19,7 +19,39 @@ pub struct RewriteStaging {
     pub max_staged_bytes: u64,
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+mod pipeline;
+
 impl Archive {
+    /// Supply verified payloads on demand during one writer call. Decoding uses
+    /// one archive-order traversal, including required solid predecessors.
+    /// Sources belong to one write in this call only: assign each source to one
+    /// output member, and do not retain it after the call returns.
+    /// The staging limit covers simultaneously retained plaintext payloads.
+    /// Writers release compressed payload sources when no reread is needed;
+    /// stored fallback can retain sources through emission. Output streams may
+    /// contain a prefix on failure; use staged path publication for rollback.
+    pub fn with_rewrite_sources<T>(
+        &self,
+        indices: &[usize],
+        options: ArchiveReadOptions<'_>,
+        staging: &RewriteStaging,
+        progress: Option<Arc<dyn crate::WriteProgress>>,
+        consume: impl FnOnce(Vec<EntrySource>) -> Result<T>,
+    ) -> Result<T> {
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        {
+            pipeline::run(self, indices, options, staging, progress, consume)
+        }
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            let _ = (indices, options, staging, progress, consume);
+            Err(crate::Error::InvalidArgument(
+                "rewrite staging requires disk storage",
+            ))
+        }
+    }
+
     /// Verify and stage selected payloads in one archive-order extraction pass.
     ///
     /// Indices count all members, including directories and redirections, but
@@ -62,7 +94,7 @@ impl Archive {
     ) -> Result<Vec<EntrySource>> {
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         {
-            native::stage(self, indices, options, staging, progress)
+            native::stage(self, indices, options, staging, progress, None)
         }
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         {
@@ -81,6 +113,7 @@ mod native {
         streaming::Spool, Error, ExtractionDecision, WriteOperation, WriteProgress,
         WriteProgressEvent, WriterResources,
     };
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::{
         cell::{Cell, RefCell},
         collections::BTreeMap,
@@ -90,21 +123,33 @@ mod native {
 
     struct Sink {
         spool: Rc<RefCell<Spool>>,
-        used: Rc<Cell<u64>>,
+        used: Arc<AtomicU64>,
         limit: u64,
     }
 
     impl Write for Sink {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            let required = self.used.get().checked_add(bytes.len() as u64);
-            if required.is_none_or(|required| required > self.limit) {
-                return Err(std::io::Error::other(Error::RewriteStagingLimitExceeded {
-                    limit: self.limit,
-                    required: required.unwrap_or(u64::MAX),
-                }));
-            }
-            let written = self.spool.borrow_mut().write(bytes)?;
-            self.used.set(self.used.get() + written as u64);
+            let count = bytes.len() as u64;
+            self.used
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                    used.checked_add(count)
+                        .filter(|required| *required <= self.limit)
+                })
+                .map_err(|used| {
+                    std::io::Error::other(Error::RewriteStagingLimitExceeded {
+                        limit: self.limit,
+                        required: used.saturating_add(count),
+                    })
+                })?;
+            let written = match self.spool.borrow_mut().write(bytes) {
+                Ok(written) => written,
+                Err(error) => {
+                    self.used.fetch_sub(count, Ordering::AcqRel);
+                    return Err(error);
+                }
+            };
+            self.used
+                .fetch_sub(count - written as u64, Ordering::AcqRel);
             Ok(written)
         }
 
@@ -185,6 +230,7 @@ mod native {
         options: ArchiveReadOptions<'_>,
         staging: &RewriteStaging,
         progress: Option<Arc<dyn WriteProgress>>,
+        delivery: Option<&super::pipeline::Delivery>,
     ) -> Result<Vec<EntrySource>> {
         options.check_cancelled()?;
         if progress
@@ -234,7 +280,11 @@ mod native {
                     "rewrite staging requires unsplit payload members",
                 ));
             }
-            let sum = required.checked_add(meta.unpacked_size);
+            let sum = if delivery.is_some() {
+                Some(required.max(meta.unpacked_size))
+            } else {
+                required.checked_add(meta.unpacked_size)
+            };
             if sum.is_none_or(|sum| sum > staging.max_staged_bytes) {
                 return Err(Error::RewriteStagingLimitExceeded {
                     limit: staging.max_staged_bytes,
@@ -264,11 +314,16 @@ mod native {
             })?;
         }
         let resources = WriterResources::new(0).with_temp_dir(&staging.directory);
-        let used = Rc::new(Cell::new(0));
+        let used = delivery.map_or_else(
+            || Arc::new(AtomicU64::new(0)),
+            |delivery| delivery.used.clone(),
+        );
         let mut index = 0;
         let mut pending = None;
         let mut decoded = 0;
+        let mut staged_pending = None;
         archive.extract_with_control(options, |member| {
+            publish_pending(&mut staged_pending, &mut selected, delivery)?;
             if let Some(progress) = &progress {
                 if let Some(entry) = pending.take() {
                     progress.finish_entry(&entry)?;
@@ -284,6 +339,15 @@ mod native {
             if !wanted && !dependency {
                 return Ok(ExtractionDecision::Skip);
             }
+            if let Some(delivery) = delivery {
+                // Dependencies are decoded only on demand for the next retained member.
+                let next = selected
+                    .range(current..)
+                    .next()
+                    .map(|(&index, _)| index)
+                    .unwrap_or(last);
+                delivery.wait_for(next)?;
+            }
             if let Some(progress) = &progress {
                 progress.report(WriteProgressEvent::EntryStarted {
                     operation: WriteOperation::Staging,
@@ -298,6 +362,7 @@ mod native {
             let sink: Box<dyn Write> = if let Some(slot) = selected.get_mut(&current) {
                 let spool = Rc::new(RefCell::new(Spool::create(&resources)?));
                 *slot = Some(spool.clone());
+                staged_pending = Some(current);
                 Box::new(Sink {
                     spool,
                     used: used.clone(),
@@ -328,6 +393,10 @@ mod native {
                 pass: 1,
             })?;
         }
+        publish_pending(&mut staged_pending, &mut selected, delivery)?;
+        if delivery.is_some() {
+            return Ok(Vec::new());
+        }
         indices
             .iter()
             .map(|index| {
@@ -343,6 +412,24 @@ mod native {
             .collect()
     }
 
+    fn publish_pending(
+        pending: &mut Option<usize>,
+        selected: &mut BTreeMap<usize, Option<Rc<RefCell<Spool>>>>,
+        delivery: Option<&super::pipeline::Delivery>,
+    ) -> Result<()> {
+        if let (Some(index), Some(delivery)) = (pending.take(), delivery) {
+            let spool = selected
+                .remove(&index)
+                .flatten()
+                .ok_or(Error::WriterFailure("rewrite spool disappeared"))?;
+            let spool = Rc::try_unwrap(spool)
+                .map_err(|_| Error::WriterFailure("rewrite sink still active"))?
+                .into_inner();
+            delivery.publish(index, spool.into_source())?;
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -351,7 +438,7 @@ mod native {
         fn runtime_limit_counts_all_sinks_and_refuses_before_writing() {
             let root = crate::scratch::case("rewrite-runtime-limit");
             let resources = WriterResources::new(0).with_temp_dir(&*root);
-            let used = Rc::new(Cell::new(0));
+            let used = Arc::new(AtomicU64::new(0));
             let make_sink = || Sink {
                 spool: Rc::new(RefCell::new(Spool::create(&resources).unwrap())),
                 used: used.clone(),
@@ -369,7 +456,7 @@ mod native {
                     required: 6
                 }
             );
-            assert_eq!(used.get(), 5);
+            assert_eq!(used.load(Ordering::Acquire), 5);
             assert_eq!(second.spool.borrow().len(), 2);
         }
     }

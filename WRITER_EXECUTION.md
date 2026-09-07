@@ -73,6 +73,14 @@ budget and runs alone. Neither policy constitutes a total RAM quota.
 
 ## Allocation lifetimes outside active compression
 
+Rewrite session sources are decoded on demand in one archive-order traversal.
+Only verified payloads become readable. Compression releases a session source
+when its packed result will be emitted; stored fallback retains it for the
+checked emission reread. Legacy materialization releases each staged source after
+loading it but retains the resulting payload in RAM. The staging disk quota
+counts live plaintext payloads separately from these writer allocations.
+
+
 | Allocation | Lifetime and accounting |
 | --- | --- |
 | Caller input buffers and queued source descriptors | Owned by the caller or builder; not charged as compression workspace. |

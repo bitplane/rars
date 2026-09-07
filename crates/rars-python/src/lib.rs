@@ -93,7 +93,7 @@ impl ProgressEvent {
 
 struct PythonProgress {
     callback: Py<PyAny>,
-    state: Mutex<ProgressEvent>,
+    state: Mutex<HashMap<&'static str, ProgressEvent>>,
     error: Mutex<Option<PyErr>>,
     cancelled: AtomicBool,
     read_cancellation: rars_rs::ReadCancellation,
@@ -103,15 +103,7 @@ impl PythonProgress {
     fn new(callback: Py<PyAny>) -> Self {
         Self {
             callback,
-            state: Mutex::new(ProgressEvent {
-                phase: "compression".to_string(),
-                completed: 0,
-                total: 0,
-                pass_number: 1,
-                entry_name: None,
-                entry_index: None,
-                total_entries: None,
-            }),
+            state: Mutex::new(HashMap::new()),
             error: Mutex::new(None),
             cancelled: AtomicBool::new(false),
             read_cancellation: rars_rs::ReadCancellation::new(),
@@ -132,10 +124,28 @@ impl rars_rs::WriteProgress for PythonProgress {
             return;
         }
         let snapshot = {
-            let mut state = self
+            let operation = match event {
+                rars_rs::WriteProgressEvent::OperationStarted { operation, .. }
+                | rars_rs::WriteProgressEvent::EntryStarted { operation, .. }
+                | rars_rs::WriteProgressEvent::EntryFinished { operation, .. }
+                | rars_rs::WriteProgressEvent::Advanced { operation, .. }
+                | rars_rs::WriteProgressEvent::OperationFinished { operation, .. } => operation,
+                _ => rars_rs::WriteOperation::Emission,
+            };
+            let phase = progress_phase(operation);
+            let mut states = self
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let state = states.entry(phase).or_insert_with(|| ProgressEvent {
+                phase: phase.to_string(),
+                completed: 0,
+                total: 0,
+                pass_number: 1,
+                entry_name: None,
+                entry_index: None,
+                total_entries: None,
+            });
             match event {
                 rars_rs::WriteProgressEvent::OperationStarted {
                     operation,
@@ -156,12 +166,17 @@ impl rars_rs::WriteProgress for PythonProgress {
                     total_entries,
                     name,
                     ..
+                }
+                | rars_rs::WriteProgressEvent::EntryFinished {
+                    index,
+                    total_entries,
+                    name,
+                    ..
                 } => {
                     state.entry_name = Some(name.to_vec());
                     state.entry_index = Some(index);
                     state.total_entries = Some(total_entries);
                 }
-                rars_rs::WriteProgressEvent::EntryFinished { .. } => {}
                 rars_rs::WriteProgressEvent::Advanced {
                     operation,
                     completed_bytes,
@@ -591,12 +606,13 @@ struct RewriteMember {
 }
 
 impl RewriteInput {
-    fn prepare(
+    fn prepare<T>(
         &self,
         builder: &mut rars_rs::Builder,
         directory: &Path,
         progress: Option<Arc<PythonProgress>>,
-    ) -> rars_rs::Result<()> {
+        consume: impl FnOnce(&rars_rs::Builder) -> rars_rs::Result<T>,
+    ) -> rars_rs::Result<T> {
         let mut members: Vec<_> = self.members.iter().collect();
         members.sort_unstable_by_key(|(_, member)| member.index);
         let limit = match self.max_staged_bytes {
@@ -615,7 +631,7 @@ impl RewriteInput {
         if let Some(progress) = &progress {
             options = options.with_cancellation(&progress.read_cancellation);
         }
-        let sources = self.archive.stage_rewrite_sources_with_progress(
+        self.archive.with_rewrite_sources(
             &indices,
             options,
             &rars_rs::RewriteStaging {
@@ -625,11 +641,13 @@ impl RewriteInput {
             progress
                 .clone()
                 .map(|progress| progress as Arc<dyn rars_rs::WriteProgress>),
-        )?;
-        for ((id, _), source) in members.into_iter().zip(sources) {
-            builder.set_source_by_id(*id, source)?;
-        }
-        Ok(())
+            |sources| {
+                for ((id, _), source) in members.into_iter().zip(sources) {
+                    builder.set_source_by_id(*id, source)?;
+                }
+                consume(builder)
+            },
+        )
     }
 }
 
@@ -1209,15 +1227,19 @@ impl RarBuilder {
         let rewrite = self.rewrite.clone();
         let worker = progress.clone();
         let result = py.detach(move || {
+            let consume = |builder: &rars_rs::Builder| {
+                run(
+                    builder,
+                    worker
+                        .as_deref()
+                        .map(|progress| progress as &dyn rars_rs::WriteProgress),
+                )
+            };
             if let Some(rewrite) = rewrite {
-                rewrite.prepare(&mut builder, directory, worker.clone())?;
+                rewrite.prepare(&mut builder, directory, worker.clone(), consume)
+            } else {
+                consume(&builder)
             }
-            run(
-                &builder,
-                worker
-                    .as_deref()
-                    .map(|progress| progress as &dyn rars_rs::WriteProgress),
-            )
         });
         if let Some(error) = progress.as_ref().and_then(|progress| progress.take_error()) {
             return Err(error);

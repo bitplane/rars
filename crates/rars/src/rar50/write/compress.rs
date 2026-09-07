@@ -441,6 +441,9 @@ fn compress_whole_member(
         check_source_end(&mut *source.open()?)?;
     }
     packed_spool.park();
+    if !stored {
+        source.release();
+    }
     advance.finished(index, input_size);
     Ok(CompressedMember {
         input_size,
@@ -824,6 +827,16 @@ fn compress_wave(
             .map_err(|error| error_context(streams[member].member, error.into()))?;
         if last {
             let stream = &streams[member];
+            if stream.input_size != 0
+                && !should_store_compressed_payload(
+                    stream.input_size,
+                    stream.packed.len(),
+                    plan.solid,
+                    &plan.filter_policy,
+                )
+            {
+                stream.source.release();
+            }
             advance.finished(stream.member, stream.input_size);
         }
     }

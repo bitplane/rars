@@ -2,7 +2,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WriteOperation {
-    /// Decoding and verifying source payloads before a rewrite.
+    /// Decoding and verifying source payloads for a rewrite; may overlap encoding.
     Staging,
     /// Compressing or otherwise preparing member payloads.
     Compression,

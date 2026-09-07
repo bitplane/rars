@@ -678,7 +678,9 @@ fn write_payload(
         Payload::Stored(source) => {
             let mut reader = source.open()?;
             let copied = std::io::copy(&mut reader.by_ref().take(source.len), output)?;
-            reader.finish(&source, copied)
+            reader.finish(&source, copied)?;
+            source.source.release();
+            Ok(())
         }
         Payload::Packed(mut packed) => {
             packed.copy_to(output)?;
@@ -701,7 +703,9 @@ fn write_payload(
                         ENCRYPT_CHUNK,
                         progress,
                     )?;
-                    reader.finish(&source, source.len)
+                    reader.finish(&source, source.len)?;
+                    source.source.release();
+                    Ok(())
                 }
                 Payload::Packed(mut packed) => {
                     let len = packed.len();
