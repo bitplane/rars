@@ -759,6 +759,20 @@ impl Archive {
     /// Reading several solid members separately repeats predecessor decoding;
     /// use [`extract_to`](Self::extract_to) to take them all in one pass.
     pub fn read_member(&self, name: &[u8], password: Option<&[u8]>) -> Result<Option<Vec<u8>>> {
+        self.read_member_with_options(name, read_options(password))
+    }
+
+    /// Read one named payload with cancellation and extraction resource policies.
+    /// Selection matches [`read_member`](Self::read_member): the last payload with
+    /// this name, plus required solid predecessors. Output budgets include those
+    /// predecessors even though their bytes are discarded. Parsing-only limits
+    /// are not reapplied. No partial byte buffer is returned on failure.
+    pub fn read_member_with_options(
+        &self,
+        name: &[u8],
+        options: ArchiveReadOptions<'_>,
+    ) -> Result<Option<Vec<u8>>> {
+        options.check_cancelled()?;
         let index = self
             .members()
             .enumerate()
@@ -768,7 +782,7 @@ impl Archive {
             .map(|(index, _)| index)
             .last();
         match index {
-            Some(index) => self.read_member_at(index, password),
+            Some(index) => self.read_member_at_with_options(index, options),
             None => Ok(None),
         }
     }
@@ -781,6 +795,19 @@ impl Archive {
     /// Missing indices also return `None` without decoding. Only the selected
     /// payload and solid predecessors are verified; later payloads are not read.
     pub fn read_member_at(&self, index: usize, password: Option<&[u8]>) -> Result<Option<Vec<u8>>> {
+        self.read_member_at_with_options(index, read_options(password))
+    }
+
+    /// Identity-based counterpart to [`read_member_with_options`](Self::read_member_with_options).
+    /// Indices include directories and redirections, which return `None`.
+    /// Cancellation is checked even for a missing or non-payload selection.
+    /// A failed call returns no buffer; each call starts fresh output budgets.
+    pub fn read_member_at_with_options(
+        &self,
+        index: usize,
+        options: ArchiveReadOptions<'_>,
+    ) -> Result<Option<Vec<u8>>> {
+        options.check_cancelled()?;
         let Some(member) = self.members().nth(index) else {
             return Ok(None);
         };
@@ -803,28 +830,25 @@ impl Archive {
         };
         let collected = std::sync::Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
         let mut current = 0usize;
-        self.extract_with_control(
-            ArchiveReadOptions::with_optional_password(password),
-            |member| {
-                let this = current;
-                current += 1;
-                if this > index {
-                    return Ok(ExtractionDecision::Stop);
-                }
-                if this != index {
-                    return Ok(
-                        if solid && !member.meta.is_directory && !member.meta.is_redirection {
-                            ExtractionDecision::Extract(Box::new(std::io::sink()))
-                        } else {
-                            ExtractionDecision::Skip
-                        },
-                    );
-                }
-                let sink = SharedBuffer(std::sync::Arc::clone(&collected));
-                *sink.lock() = Some(Vec::new());
-                Ok(ExtractionDecision::Extract(Box::new(sink)))
-            },
-        )?;
+        self.extract_with_control(options, |member| {
+            let this = current;
+            current += 1;
+            if this > index {
+                return Ok(ExtractionDecision::Stop);
+            }
+            if this != index {
+                return Ok(
+                    if solid && !member.meta.is_directory && !member.meta.is_redirection {
+                        ExtractionDecision::Extract(Box::new(std::io::sink()))
+                    } else {
+                        ExtractionDecision::Skip
+                    },
+                );
+            }
+            let sink = SharedBuffer(std::sync::Arc::clone(&collected));
+            *sink.lock() = Some(Vec::new());
+            Ok(ExtractionDecision::Extract(Box::new(sink)))
+        })?;
         let taken = collected
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -835,7 +859,16 @@ impl Archive {
     /// Decodes every member and discards the bytes, so a bad checksum or a
     /// wrong password is reported and nothing is written.
     pub fn test(&self, password: Option<&[u8]>) -> Result<()> {
-        self.extract_to_parallel_buffered(password, |_| {
+        self.test_with_options(read_options(password))
+    }
+
+    /// Verify all member payloads with cancellation and extraction resource policies.
+    /// Discarding output does not exempt it from member or total output limits.
+    /// Parsing-only limits are not reapplied; comments and recovery are outside
+    /// this payload test. Each call starts fresh output budgets.
+    pub fn test_with_options(&self, options: ArchiveReadOptions<'_>) -> Result<()> {
+        options.check_cancelled()?;
+        self.extract_to_parallel_buffered_with_options(options, |_| {
             Ok(Box::new(std::io::sink()) as Box<dyn Write>)
         })
     }
