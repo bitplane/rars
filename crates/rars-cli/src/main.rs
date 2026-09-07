@@ -28,8 +28,8 @@ use output::{
 };
 use password::{
     classify_rars_error, ensure_password_for_archives_extract, ensure_password_for_extract,
-    error_is_password_class, parse_archives_prompting, password_bytes, read_archive_path_prompting,
-    resolve_password, Password,
+    error_is_password_class, parse_archives_prompting, password_bytes,
+    read_archive_path_prompting_with_options, resolve_password, Password,
 };
 use progress::CliProgress;
 use rars::rar13::{
@@ -116,20 +116,6 @@ where
     archive.extract_to_parallel_buffered_with_options(options, open)
 }
 
-fn extract_options(
-    password: Option<&[u8]>,
-    rar50_buffered_decode_limit: Option<usize>,
-) -> ArchiveReadOptions<'_> {
-    let options = match password {
-        Some(password) => ArchiveReadOptions::with_password(password),
-        None => ArchiveReadOptions::new(),
-    };
-    match rar50_buffered_decode_limit {
-        Some(limit) => options.with_rar50_buffered_decode_limit(limit as u64),
-        None => options,
-    }
-}
-
 fn rar50_buffered_decode_limit_hint(error: &rars::Error) -> String {
     let Some((_, required)) = find_rar50_buffered_decode_limit_error(error) else {
         return String::new();
@@ -171,9 +157,11 @@ fn display_bytes_lossy(bytes: &[u8]) -> String {
 }
 
 fn cmd_info(args: InfoArgs) -> CliResult<()> {
+    let scratch = args.read_options.scratch();
     let mut password = resolve_password_args(&args.password)?;
     for path in &args.paths {
-        let archive = read_archive_path_prompting(path, &mut password)?;
+        let archive =
+            read_archive_path_prompting_with_options(path, &mut password, &args.read_options)?;
         let path_display = path.to_string_lossy();
         let path = path_display.as_ref();
         let family = archive.family();
@@ -182,26 +170,29 @@ fn cmd_info(args: InfoArgs) -> CliResult<()> {
         } else {
             print_terse_header(path, &archive);
         }
+        let options = args
+            .read_options
+            .options(password_bytes(&password), scratch.as_ref());
         match archive {
             DetectedArchive::Rar13(archive) => {
                 if args.verbose {
-                    info_rar13_verbose(path, &archive)?;
+                    info_rar13_verbose(path, &archive, options)?;
                 } else {
-                    info_rar13_terse(path, &archive)?;
+                    info_rar13_terse(path, &archive, options)?;
                 }
             }
             DetectedArchive::Rar15To40(archive) => {
                 if args.verbose {
-                    info_rar15_40_verbose(path, &archive)?;
+                    info_rar15_40_verbose(path, &archive, options)?;
                 } else {
-                    info_rar15_40_terse(path, &archive)?;
+                    info_rar15_40_terse(path, &archive, options)?;
                 }
             }
             DetectedArchive::Rar50Plus(archive) => {
                 if args.verbose {
-                    info_rar50_verbose(path, &archive, password_bytes(&password))?;
+                    info_rar50_verbose(path, &archive, options)?;
                 } else {
-                    info_rar50_terse(path, &archive, password_bytes(&password))?;
+                    info_rar50_terse(path, &archive, options)?;
                 }
             }
             _ => {
@@ -289,9 +280,13 @@ where
     }
 }
 
-fn info_rar13_terse(path: &str, archive: &rars::rar13::Archive) -> CliResult<()> {
+fn info_rar13_terse(
+    path: &str,
+    archive: &rars::rar13::Archive,
+    options: ArchiveReadOptions<'_>,
+) -> CliResult<()> {
     if let Some(comment) = archive
-        .archive_comment()
+        .archive_comment_with_options(options)
         .map_err(|err| format!("failed to decode archive comment '{path}': {err}"))?
     {
         print_comment("  ", &comment);
@@ -306,7 +301,11 @@ fn info_rar13_terse(path: &str, archive: &rars::rar13::Archive) -> CliResult<()>
     Ok(())
 }
 
-fn info_rar13_verbose(path: &str, archive: &rars::rar13::Archive) -> CliResult<()> {
+fn info_rar13_verbose(
+    path: &str,
+    archive: &rars::rar13::Archive,
+    options: ArchiveReadOptions<'_>,
+) -> CliResult<()> {
     println!(
         "  rar13 main: flags={:#04x} head_size={} sfx_offset={}",
         archive.main.flags, archive.main.head_size, archive.sfx_offset
@@ -322,7 +321,7 @@ fn info_rar13_verbose(path: &str, archive: &rars::rar13::Archive) -> CliResult<(
             }
         );
         if let Some(comment) = archive
-            .archive_comment()
+            .archive_comment_with_options(options)
             .map_err(|err| format!("failed to decode archive comment '{path}': {err}"))?
         {
             println!("  comment: {}", display_bytes_lossy(&comment));
@@ -361,9 +360,13 @@ fn info_rar13_verbose(path: &str, archive: &rars::rar13::Archive) -> CliResult<(
     Ok(())
 }
 
-fn info_rar15_40_terse(path: &str, archive: &rars::rar15_40::Archive) -> CliResult<()> {
+fn info_rar15_40_terse(
+    path: &str,
+    archive: &rars::rar15_40::Archive,
+    options: ArchiveReadOptions<'_>,
+) -> CliResult<()> {
     if let Some(comment) = archive
-        .archive_comment()
+        .archive_comment_with_options(options)
         .map_err(|err| format!("failed to decode archive comment '{path}': {err}"))?
     {
         print_comment("  ", &comment);
@@ -386,13 +389,17 @@ fn info_rar15_40_terse(path: &str, archive: &rars::rar15_40::Archive) -> CliResu
     Ok(())
 }
 
-fn info_rar15_40_verbose(path: &str, archive: &rars::rar15_40::Archive) -> CliResult<()> {
+fn info_rar15_40_verbose(
+    path: &str,
+    archive: &rars::rar15_40::Archive,
+    options: ArchiveReadOptions<'_>,
+) -> CliResult<()> {
     println!(
         "  rar15-40 main: flags={:#06x} head_size={} sfx_offset={}",
         archive.main.flags, archive.main.head_size, archive.sfx_offset
     );
     if let Some(comment) = archive
-        .archive_comment()
+        .archive_comment_with_options(options)
         .map_err(|err| format!("failed to decode archive comment '{path}': {err}"))?
     {
         println!("  comment: {}", display_bytes_lossy(&comment));
@@ -435,7 +442,7 @@ fn info_rar15_40_verbose(path: &str, archive: &rars::rar15_40::Archive) -> CliRe
 fn info_rar50_terse(
     path: &str,
     archive: &rars::rar50::Archive,
-    password: Option<&[u8]>,
+    options: ArchiveReadOptions<'_>,
 ) -> CliResult<()> {
     if let Some(metadata) = archive.main.archive_metadata() {
         if let Some(name) = &metadata.name {
@@ -446,7 +453,7 @@ fn info_rar50_terse(
         }
     }
     let archive_comment = archive
-        .archive_comment_with_password(password)
+        .archive_comment_with_options(options)
         .map_err(|err| format!("failed to decode archive comment '{path}': {err}"))?;
     if let Some(comment) = &archive_comment {
         print_comment("  ", comment);
@@ -491,7 +498,7 @@ fn service_label(name: &[u8]) -> String {
 fn info_rar50_verbose(
     path: &str,
     archive: &rars::rar50::Archive,
-    password: Option<&[u8]>,
+    options: ArchiveReadOptions<'_>,
 ) -> CliResult<()> {
     println!(
         "  rar50 main: flags={:#06x} header_size={} sfx_offset={}",
@@ -509,7 +516,7 @@ fn info_rar50_verbose(
         }
     }
     let archive_comment = archive
-        .archive_comment_with_password(password)
+        .archive_comment_with_options(options)
         .map_err(|err| format!("failed to decode archive comment '{path}': {err}"))?;
     if let Some(ref comment) = archive_comment {
         println!("  comment: {}", display_bytes_lossy(comment));
@@ -563,6 +570,7 @@ fn info_rar50_verbose(
 }
 
 fn cmd_test(args: TestArgs) -> CliResult<()> {
+    let scratch = args.read_options.scratch();
     let mut password = resolve_password_args(&args.password)?;
     let mut paths = args.paths;
     if paths.len() == 1 {
@@ -575,14 +583,14 @@ fn cmd_test(args: TestArgs) -> CliResult<()> {
     }
 
     if paths.len() == 1 {
-        let archive = read_archive_path_prompting(&paths[0], &mut password)?;
+        let archive =
+            read_archive_path_prompting_with_options(&paths[0], &mut password, &args.read_options)?;
         ensure_password_for_extract(&archive, &mut password)?;
         warn_rar50_redirections(&archive);
         let mut entries = Vec::new();
-        let options = extract_options(
-            password_bytes(&password),
-            args.read_options.rar50_buffered_decode_limit,
-        );
+        let options = args
+            .read_options
+            .options(password_bytes(&password), scratch.as_ref());
         extract_archive_to_with_options(&archive, options, |meta| {
             entries.push(meta.clone());
             Ok(Box::new(std::io::sink()))
@@ -600,16 +608,15 @@ fn cmd_test(args: TestArgs) -> CliResult<()> {
             print_ok_entry(entry);
         }
     } else {
-        let archives = parse_archives_prompting(&paths, &mut password)?;
+        let archives = parse_archives_prompting(&paths, &mut password, &args.read_options)?;
         ensure_password_for_archives_extract(&archives, &mut password)?;
         for archive in &archives {
             warn_rar50_redirections(archive);
         }
         let mut entries = Vec::new();
-        let options = extract_options(
-            password_bytes(&password),
-            args.read_options.rar50_buffered_decode_limit,
-        );
+        let options = args
+            .read_options
+            .options(password_bytes(&password), scratch.as_ref());
         extract_volumes_to_with_options(&archives, options, |meta| {
             entries.push(meta.clone());
             Ok(Box::new(std::io::sink()))
@@ -635,6 +642,7 @@ fn cmd_test(args: TestArgs) -> CliResult<()> {
 }
 
 fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
+    let scratch = args.read_options.scratch();
     let mut password = resolve_password_args(&args.password)?;
     let overwrite: OverwritePolicy = args.overwrite.into();
     let mut paths = args.paths;
@@ -652,14 +660,14 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
     }
 
     if paths.len() == 1 {
-        let archive = read_archive_path_prompting(&paths[0], &mut password)?;
+        let archive =
+            read_archive_path_prompting_with_options(&paths[0], &mut password, &args.read_options)?;
         ensure_password_for_extract(&archive, &mut password)?;
         let family = archive.family();
         let state = RefCell::new(ExtractOutputState::new(&out_dir, overwrite, family));
-        let options = extract_options(
-            password_bytes(&password),
-            args.read_options.rar50_buffered_decode_limit,
-        );
+        let options = args
+            .read_options
+            .options(password_bytes(&password), scratch.as_ref());
         extract_single_archive(&archive, options, &state).map_err(|err| {
             classify_rars_error(err, |err| {
                 format!(
@@ -680,17 +688,16 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
             println!("x {}", display_bytes_lossy(&output.name));
         }
     } else {
-        let archives = parse_archives_prompting(&paths, &mut password)?;
+        let archives = parse_archives_prompting(&paths, &mut password, &args.read_options)?;
         ensure_password_for_archives_extract(&archives, &mut password)?;
         let family = archives
             .first()
             .map(DetectedArchive::family)
             .ok_or("no archive parts provided")?;
         let state = RefCell::new(ExtractOutputState::new(&out_dir, overwrite, family));
-        let options = extract_options(
-            password_bytes(&password),
-            args.read_options.rar50_buffered_decode_limit,
-        );
+        let options = args
+            .read_options
+            .options(password_bytes(&password), scratch.as_ref());
         extract_volume_archives(&archives, options, &state).map_err(|err| {
             classify_rars_error(err, |err| {
                 format!(

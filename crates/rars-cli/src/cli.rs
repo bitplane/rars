@@ -60,15 +60,73 @@ pub(crate) struct PasswordArgs {
     pub password_file: Option<std::path::PathBuf>,
 }
 
-#[derive(Args)]
+#[derive(Args, Default)]
 pub(crate) struct ReadOptionsArgs {
     /// Maximum RAR 5 filtered member size to buffer while decoding (e.g. 512m, 1g)
     #[arg(long, value_name = "SIZE", value_parser = crate::parse_size_string)]
     pub rar50_buffered_decode_limit: Option<usize>,
+    /// Maximum declared RAR5/7 dictionary size (not total memory)
+    #[arg(long, value_name = "SIZE", value_parser = crate::parse_size_string)]
+    pub rar50_dictionary_size_limit: Option<usize>,
+    /// Maximum decoded output per logical member or archive comment
+    #[arg(long, value_name = "SIZE", value_parser = crate::parse_size_string)]
+    pub max_member_output_bytes: Option<usize>,
+    /// Maximum decoded output per extraction/test call, or per archive comment
+    #[arg(long, value_name = "SIZE", value_parser = crate::parse_size_string)]
+    pub max_total_output_bytes: Option<usize>,
+    /// Maximum top-level headers per physical archive parse
+    #[arg(long, value_name = "COUNT")]
+    pub max_header_count: Option<u64>,
+    /// Maximum plaintext header bytes per physical archive parse
+    #[arg(long, value_name = "SIZE", value_parser = crate::parse_size_string)]
+    pub max_header_bytes: Option<usize>,
+    /// Directory for RAR5 filtered decoding above the buffering threshold
+    #[arg(long, value_name = "PATH", requires = "rar50_scratch_bytes")]
+    pub rar50_scratch_dir: Option<std::path::PathBuf>,
+    /// Maximum temporary bytes for RAR5 scratch decoding
+    #[arg(long, value_name = "SIZE", value_parser = crate::parse_size_string, requires = "rar50_scratch_dir")]
+    pub rar50_scratch_bytes: Option<usize>,
+    /// Maximum workspace per RAR5 scratch filter
+    #[arg(long, value_name = "SIZE", value_parser = crate::parse_size_string, requires = "rar50_scratch_dir")]
+    pub rar50_filter_memory_limit: Option<usize>,
+}
+
+impl ReadOptionsArgs {
+    pub fn scratch(&self) -> Option<rars::Rar50Scratch> {
+        self.rar50_scratch_dir
+            .as_ref()
+            .zip(self.rar50_scratch_bytes)
+            .map(|(dir, bytes)| {
+                let policy = rars::Rar50Scratch::new(dir, bytes as u64);
+                match self.rar50_filter_memory_limit {
+                    Some(limit) => policy.with_filter_memory_limit(limit as u64),
+                    None => policy,
+                }
+            })
+    }
+    pub fn options<'a>(
+        &self,
+        password: Option<&'a [u8]>,
+        scratch: Option<&'a rars::Rar50Scratch>,
+    ) -> rars::ArchiveReadOptions<'a> {
+        let mut options = rars::ArchiveReadOptions::with_optional_password(password);
+        options.max_header_count = self.max_header_count;
+        options.max_header_bytes = self.max_header_bytes.map(|value| value as u64);
+        options.max_member_output_bytes = self.max_member_output_bytes.map(|value| value as u64);
+        options.max_total_output_bytes = self.max_total_output_bytes.map(|value| value as u64);
+        options.rar50_dictionary_size_limit =
+            self.rar50_dictionary_size_limit.map(|value| value as u64);
+        options.rar50_buffered_decode_limit =
+            self.rar50_buffered_decode_limit.map(|value| value as u64);
+        options.rar50_scratch = scratch;
+        options
+    }
 }
 
 #[derive(Args)]
 pub(crate) struct InfoArgs {
+    #[command(flatten)]
+    pub read_options: ReadOptionsArgs,
     #[command(flatten)]
     pub password: PasswordArgs,
     /// Show all raw block/header fields (the developer-style dump)

@@ -1,5 +1,5 @@
 use crate::{CliError, CliResult};
-use rars::{Archive as DetectedArchive, ArchiveReadOptions, ArchiveReader, Error};
+use rars::{Archive as DetectedArchive, ArchiveReader, Error};
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -9,13 +9,6 @@ pub(crate) type Password = Zeroizing<Vec<u8>>;
 
 pub(crate) fn password_bytes(password: &Option<Password>) -> Option<&[u8]> {
     password.as_deref().map(Vec::as_slice)
-}
-
-fn read_options(password: Option<&[u8]>) -> ArchiveReadOptions<'_> {
-    match password {
-        Some(password) => ArchiveReadOptions::with_password(password),
-        None => ArchiveReadOptions::new(),
-    }
 }
 
 pub(crate) fn resolve_password(
@@ -52,13 +45,31 @@ pub(crate) fn read_archive_path_prompting(
     path: &Path,
     password: &mut Option<Password>,
 ) -> CliResult<DetectedArchive> {
-    match ArchiveReader::read_path_with_options(path, read_options(password_bytes(password))) {
+    read_archive_path_prompting_with_options(
+        path,
+        password,
+        &crate::cli::ReadOptionsArgs::default(),
+    )
+}
+
+pub(crate) fn read_archive_path_prompting_with_options(
+    path: &Path,
+    password: &mut Option<Password>,
+    settings: &crate::cli::ReadOptionsArgs,
+) -> CliResult<DetectedArchive> {
+    match ArchiveReader::read_path_with_options(
+        path,
+        settings.options(password_bytes(password), None),
+    ) {
         Ok(archive) => Ok(archive),
         Err(error) if password.is_none() && error_needs_password(&error) => {
             if let Some(prompted) = prompt_password_if_tty()? {
                 *password = Some(prompted);
-                ArchiveReader::read_path_with_options(path, read_options(password_bytes(password)))
-                    .map_err(|err| read_archive_cli_error(path, err))
+                ArchiveReader::read_path_with_options(
+                    path,
+                    settings.options(password_bytes(password), None),
+                )
+                .map_err(|err| read_archive_cli_error(path, err))
             } else {
                 Err(read_archive_cli_error(path, error))
             }
@@ -70,10 +81,13 @@ pub(crate) fn read_archive_path_prompting(
 pub(crate) fn parse_archives_prompting(
     paths: &[PathBuf],
     password: &mut Option<Password>,
+    settings: &crate::cli::ReadOptionsArgs,
 ) -> CliResult<Vec<DetectedArchive>> {
     let mut archives = Vec::new();
     for path in paths {
-        archives.push(read_archive_path_prompting(path, password)?);
+        archives.push(read_archive_path_prompting_with_options(
+            path, password, settings,
+        )?);
     }
     Ok(archives)
 }

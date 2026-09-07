@@ -36,6 +36,9 @@ rars test archive.rar
 rars x archive.rar out/
 ```
 
+These commands accept parsing and decoding limits; see
+[CLI reader controls](CLI_READING.md).
+
 To create archives with a specific RAR generation:
 
 ```sh

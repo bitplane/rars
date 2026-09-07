@@ -5902,3 +5902,96 @@ fn native_filename_encrypted_volume_round_trip() {
         );
     }
 }
+
+#[test]
+fn reader_policy_flags_apply_to_parsing_comments_and_extraction() {
+    let dir = scratch::case("cli-reader-policies");
+    for format in [
+        rars::ArchiveVersion::Rar14,
+        rars::ArchiveVersion::Rar29,
+        rars::ArchiveVersion::Rar50,
+    ] {
+        let mut builder = rars::Builder::new(format)
+            .store(true)
+            .comment(Some(b"comment".to_vec()));
+        builder
+            .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+        let archive = dir.join(format!("{format}.rar"));
+        fs::write(&archive, builder.to_bytes().unwrap()).unwrap();
+        let output = dir.join(format!("{format}-out"));
+        fs::create_dir(&output).unwrap();
+        fs::write(output.join("file"), b"keep").unwrap();
+        for flag in [
+            "--max-header-count",
+            "--max-header-bytes",
+            "--max-member-output-bytes",
+            "--max-total-output-bytes",
+        ] {
+            for command in ["info", "test", "extract"] {
+                let mut child = rars();
+                child.args([command, flag, "0"]).arg(&archive);
+                if command == "extract" {
+                    child.arg(&output);
+                }
+                let result = child.output().unwrap();
+                assert!(!result.status.success(), "{format} {command} {flag}");
+                assert!(stderr(&result).contains("limit"), "{}", stderr(&result));
+                assert_eq!(fs::read(output.join("file")).unwrap(), b"keep");
+            }
+        }
+        assert!(rars()
+            .arg("test")
+            .arg(&archive)
+            .output()
+            .unwrap()
+            .status
+            .success());
+    }
+}
+
+#[test]
+fn cli_scratch_policy_decodes_filtered_members_and_cleans_up() {
+    use rars::rar50::{ArchiveEntry, Rar50Writer, WriterOptions};
+    use rars::{ArchiveVersion, EntrySource, FeatureSet, FilterKind, FilterPolicy};
+    let dir = scratch::case("cli-reader-scratch");
+    let payload = [0xe8, 1, 0, 0, 0, 0xe9, 3, 0, 0, 0].repeat(1000);
+    let data = Rar50Writer::new(WriterOptions::new(
+        ArchiveVersion::Rar50,
+        FeatureSet::store_only(),
+    ))
+    .entries([ArchiveEntry::new(
+        b"file".to_vec(),
+        EntrySource::from_bytes(std::sync::Arc::<[u8]>::from(payload)),
+    )])
+    .filter_policy(FilterPolicy::explicit(FilterKind::E8E9))
+    .finish()
+    .unwrap();
+    let archive = dir.join("archive.rar");
+    fs::write(&archive, data).unwrap();
+    let scratch_dir = dir.join("scratch");
+    fs::create_dir(&scratch_dir).unwrap();
+    let rejected = rars()
+        .args(["test", "--rar50-dictionary-size-limit", "0"])
+        .arg(&archive)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    let result = rars()
+        .args([
+            "test",
+            "--rar50-buffered-decode-limit",
+            "0",
+            "--rar50-scratch-bytes",
+            "100k",
+            "--rar50-filter-memory-limit",
+            "64k",
+            "--rar50-scratch-dir",
+        ])
+        .arg(&scratch_dir)
+        .arg(&archive)
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{}", stderr(&result));
+    assert_eq!(fs::read_dir(&scratch_dir).unwrap().count(), 0);
+}
