@@ -579,7 +579,7 @@ struct RarBuilder {
 struct RewriteInput {
     archive: rars_rs::Archive,
     password: Option<Vec<u8>>,
-    members: HashMap<Vec<u8>, RewriteMember>,
+    members: HashMap<usize, RewriteMember>,
     directory: Option<PathBuf>,
     max_staged_bytes: Option<u64>,
 }
@@ -626,8 +626,8 @@ impl RewriteInput {
                 .clone()
                 .map(|progress| progress as Arc<dyn rars_rs::WriteProgress>),
         )?;
-        for ((name, _), source) in members.into_iter().zip(sources) {
-            builder.set_source(name, source)?;
+        for ((id, _), source) in members.into_iter().zip(sources) {
+            builder.set_source_by_id(*id, source)?;
         }
         Ok(())
     }
@@ -776,15 +776,6 @@ impl RarBuilder {
                 )));
             }
         }
-        let mut names = HashSet::new();
-        for member in archive.archive.members() {
-            if !names.insert(member.meta.name.clone()) {
-                return Err(PyValueError::new_err(format!(
-                    "cannot rewrite duplicate member name {:?}: the editing API requires unique names",
-                    String::from_utf8_lossy(&member.meta.name)
-                )));
-            }
-        }
         let comments = archive
             .archive
             .member_comments(password.as_deref())
@@ -800,7 +791,9 @@ impl RarBuilder {
         let format = inner.format();
         let legacy_preservation = preserve && format.family() != rars_rs::ArchiveFamily::Rar50Plus;
         let mut builder = Self {
-            inner: inner.comment(archive.comment(py)?),
+            inner: inner
+                .comment(archive.comment(py)?)
+                .allow_duplicate_names(true),
             format,
             rewrite: Some(RewriteInput {
                 archive: archive.archive.clone(),
@@ -944,28 +937,29 @@ impl RarBuilder {
                     .add_source(output_name.clone(), source, mtime, mode)
                     .map_err(map_builder_error)?;
                 builder.rewrite.as_mut().unwrap().members.insert(
-                    output_name.clone(),
+                    builder.inner.member_ids().last().unwrap(),
                     RewriteMember {
                         index: member_index,
                         size: info.unpacked_size,
                     },
                 );
             }
+            let id = builder.inner.member_ids().last().unwrap();
             builder
                 .inner
-                .set_file_comment(&output_name, comment)
+                .set_file_comment_by_id(id, comment)
                 .map_err(map_builder_error)?;
             if let Some(time) = modified.filter(|time| time.subsec_nanos() != 0) {
                 builder
                     .inner
-                    .set_mtime_nanoseconds(&output_name, time.subsec_nanos())
+                    .set_mtime_nanoseconds_by_id(id, time.subsec_nanos())
                     .map_err(map_builder_error)?;
             }
             if preserve {
                 builder
                     .inner
-                    .set_entry_encryption(
-                        &output_name,
+                    .set_entry_encryption_by_id(
+                        id,
                         if info.is_encrypted {
                             password.clone()
                         } else {
@@ -982,28 +976,29 @@ impl RarBuilder {
             if let Some(raw) = legacy_unicode_name {
                 builder
                     .inner
-                    .set_legacy_unicode_name(&output_name, raw)
+                    .set_legacy_unicode_name_by_id(id, raw)
                     .map_err(map_builder_error)?;
             }
             if legacy_extended_times.is_some() {
                 builder
                     .inner
-                    .set_legacy_extended_times(&output_name, legacy_extended_times)
+                    .set_legacy_extended_times_by_id(id, legacy_extended_times)
                     .map_err(map_builder_error)?;
             }
             if file_times.is_some() {
                 builder
                     .inner
-                    .set_file_times(&output_name, file_times)
+                    .set_file_times_by_id(id, file_times)
                     .map_err(map_builder_error)?;
             }
             if attr_source == rars_rs::AttrSource::Dos {
                 builder
                     .inner
-                    .set_dos_attributes(&output_name, info.file_attr)
+                    .set_dos_attributes_by_id(id, info.file_attr)
                     .map_err(map_builder_error)?;
             }
         }
+        builder.inner = builder.inner.allow_duplicate_names(false);
         Ok(builder)
     }
 
@@ -1048,27 +1043,25 @@ impl RarBuilder {
             .map_err(map_builder_error)
     }
 
+    /// Stable IDs in output order. Integer edit arguments select these IDs.
+    fn member_ids(&self) -> Vec<usize> {
+        self.inner.member_ids().collect()
+    }
+
     fn remove(&mut self, name: &Bound<'_, PyAny>) -> PyResult<()> {
-        let name = member_name_bytes(name)?;
-        self.inner.remove(&name).map_err(map_builder_error)?;
+        let id = self.edit_member_id(name)?;
+        self.inner.remove_by_id(id).map_err(map_builder_error)?;
         if let Some(rewrite) = &mut self.rewrite {
-            rewrite.members.remove(&name);
+            rewrite.members.remove(&id);
         }
         Ok(())
     }
 
     fn rename(&mut self, old: &Bound<'_, PyAny>, new: &Bound<'_, PyAny>) -> PyResult<()> {
-        let old = member_name_bytes(old)?;
-        let new = member_name_bytes(new)?;
+        let id = self.edit_member_id(old)?;
         self.inner
-            .rename(&old, new.clone())
-            .map_err(map_builder_error)?;
-        if let Some(rewrite) = &mut self.rewrite {
-            if let Some(member) = rewrite.members.remove(&old) {
-                rewrite.members.insert(new, member);
-            }
-        }
-        Ok(())
+            .rename_by_id(id, member_name_bytes(new)?)
+            .map_err(map_builder_error)
     }
 
     /// Queues a Unix symbolic link without reading or following the target.
@@ -1104,9 +1097,10 @@ impl RarBuilder {
     ) -> PyResult<()> {
         let times = rars_rs::FileTimes::from_unix_nanoseconds(modified_ns, created_ns, accessed_ns)
             .map_err(map_builder_error)?;
+        let id = self.edit_member_id(member)?;
         self.inner
-            .set_file_times(
-                &member_name_bytes(member)?,
+            .set_file_times_by_id(
+                id,
                 (times != rars_rs::FileTimes::default()).then_some(times),
             )
             .map_err(map_builder_error)
@@ -1119,8 +1113,9 @@ impl RarBuilder {
         member: &Bound<'_, PyAny>,
         comment: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
+        let id = self.edit_member_id(member)?;
         self.inner
-            .set_file_comment(&member_name_bytes(member)?, py_optional_bytes(comment)?)
+            .set_file_comment_by_id(id, py_optional_bytes(comment)?)
             .map_err(map_builder_error)
     }
 
@@ -1177,6 +1172,22 @@ impl RarBuilder {
 }
 
 impl RarBuilder {
+    fn edit_member_id(&self, member: &Bound<'_, PyAny>) -> PyResult<usize> {
+        if member.is_instance_of::<pyo3::types::PyInt>() {
+            let id: usize = member
+                .extract()
+                .map_err(|_| PyKeyError::new_err("invalid member ID"))?;
+            if !self.inner.member_ids().any(|candidate| candidate == id) {
+                return Err(PyKeyError::new_err(id));
+            }
+            Ok(id)
+        } else {
+            self.inner
+                .entry_id(&member_name_bytes(member)?)
+                .map_err(map_builder_error)
+        }
+    }
+
     /// Run a core-builder call with the GIL released, wiring a Python callback
     /// to it as a progress sink. A callback that raises cancels the write, and
     /// its exception is re-raised here rather than the cancellation the core

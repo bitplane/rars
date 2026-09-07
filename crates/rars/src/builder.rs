@@ -79,6 +79,7 @@ enum EntryAttributes {
 /// `data` first.
 #[derive(Debug, Clone)]
 struct BuilderEntry {
+    id: usize,
     name: Vec<u8>,
     data: Vec<u8>,
     source: Option<EntrySource>,
@@ -182,6 +183,8 @@ pub struct Builder {
     legacy_unpack_version: Option<u8>,
     volume_size: Option<usize>,
     entries: Vec<BuilderEntry>,
+    next_entry_id: usize,
+    allow_duplicate_names: bool,
 }
 
 impl Builder {
@@ -204,6 +207,8 @@ impl Builder {
             legacy_unpack_version: None,
             volume_size: None,
             entries: Vec::new(),
+            next_entry_id: 0,
+            allow_duplicate_names: false,
         }
     }
 
@@ -312,6 +317,7 @@ impl Builder {
         mode: Option<u32>,
     ) -> Result<()> {
         self.push(BuilderEntry {
+            id: 0,
             name: self.validate_name(name)?,
             data,
             source: None,
@@ -343,6 +349,7 @@ impl Builder {
         mode: Option<u32>,
     ) -> Result<()> {
         self.push(BuilderEntry {
+            id: 0,
             name: self.validate_name(name)?,
             data: Vec::new(),
             source: Some(source),
@@ -367,11 +374,16 @@ impl Builder {
     /// Directories and redirections cannot be changed into payload entries.
     /// The source is opened only when writing. Errors leave the entry unchanged.
     pub fn set_source(&mut self, name: &[u8], source: EntrySource) -> Result<()> {
-        let entry = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.name == name)
-            .ok_or_else(|| Error::EntryNotFound.at_entry(name.to_vec(), "replacing payload"))?;
+        let id = self.entry_id(name)?;
+        self.set_source_by_id(id, source)
+    }
+
+    /// Identity-based variant of [`set_source`](Self::set_source).
+    pub fn set_source_by_id(&mut self, id: usize, source: EntrySource) -> Result<()> {
+        let index = self.index_by_id(id)?;
+        let name = self.entries[index].name.clone();
+
+        let entry = &mut self.entries[index];
         if entry.is_directory || entry.redirection.is_some() {
             return Err(
                 Error::InvalidArgument("payload source requires a regular entry")
@@ -419,6 +431,7 @@ impl Builder {
             ));
         }
         self.push(BuilderEntry {
+            id: 0,
             name: self.validate_name(name)?,
             data: Vec::new(),
             source: None,
@@ -483,6 +496,7 @@ impl Builder {
             return Err(Error::InvalidArgument("symbolic links require single-archive RAR5/7 output and a nonempty UTF-8 wire target without NUL"));
         }
         self.push(BuilderEntry {
+            id: 0,
             name: self.validate_name(name)?,
             data: Vec::new(),
             source: None,
@@ -513,6 +527,7 @@ impl Builder {
         }
         let meta = &member.meta;
         self.push(BuilderEntry {
+            id: 0,
             name: self.validate_name(meta.name.clone())?,
             data: Vec::new(),
             source: None,
@@ -576,6 +591,19 @@ impl Builder {
         data_password: Option<Vec<u8>>,
         comment_password: Option<Vec<u8>>,
     ) -> Result<()> {
+        let id = self.entry_id(name)?;
+        self.set_entry_encryption_by_id(id, data_password, comment_password)
+    }
+
+    /// Identity-based variant of [`set_entry_encryption`](Self::set_entry_encryption).
+    pub fn set_entry_encryption_by_id(
+        &mut self,
+        id: usize,
+        data_password: Option<Vec<u8>>,
+        comment_password: Option<Vec<u8>>,
+    ) -> Result<()> {
+        let index = self.index_by_id(id)?;
+
         let legacy = matches!(
             self.format,
             ArchiveVersion::Rar13
@@ -595,11 +623,7 @@ impl Builder {
                 "per-entry encryption requires supported output and nonempty passwords; legacy output supports data encryption in single archives only",
             ));
         }
-        let entry = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.name == name)
-            .ok_or(Error::EntryNotFound)?;
+        let entry = &mut self.entries[index];
         entry.encryption = Some(EntryEncryption {
             data_password,
             comment_password,
@@ -637,6 +661,15 @@ impl Builder {
     /// Retain a validated native Unicode name record for a queued legacy entry.
     /// Renaming re-encodes Unicode; unchanged names retain their original bytes.
     pub fn set_legacy_unicode_name(&mut self, name: &[u8], raw: Vec<u8>) -> Result<()> {
+        let id = self.entry_id(name)?;
+        self.set_legacy_unicode_name_by_id(id, raw)
+    }
+
+    /// Identity-based variant of [`set_legacy_unicode_name`](Self::set_legacy_unicode_name).
+    pub fn set_legacy_unicode_name_by_id(&mut self, id: usize, raw: Vec<u8>) -> Result<()> {
+        let index = self.index_by_id(id)?;
+        let name = self.entries[index].name.clone();
+
         if !matches!(
             self.format,
             ArchiveVersion::Rar20
@@ -649,12 +682,8 @@ impl Builder {
                 "legacy Unicode names require single-archive RAR2–4 output",
             ));
         }
-        rar15_40::validate_unicode_name(&raw, name)?;
-        let entry = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.name == name)
-            .ok_or(Error::EntryNotFound)?;
+        rar15_40::validate_unicode_name(&raw, &name)?;
+        let entry = &mut self.entries[index];
         entry.legacy_unicode_name = Some(raw);
         Ok(())
     }
@@ -663,6 +692,18 @@ impl Builder {
     /// DOS values and fractional precision are copied without timezone conversion.
     /// Unsupported output or invalid records leave the entry unchanged.
     pub fn set_legacy_extended_times(&mut self, name: &[u8], raw: Option<Vec<u8>>) -> Result<()> {
+        let id = self.entry_id(name)?;
+        self.set_legacy_extended_times_by_id(id, raw)
+    }
+
+    /// Identity-based variant of [`set_legacy_extended_times`](Self::set_legacy_extended_times).
+    pub fn set_legacy_extended_times_by_id(
+        &mut self,
+        id: usize,
+        raw: Option<Vec<u8>>,
+    ) -> Result<()> {
+        let index = self.index_by_id(id)?;
+
         if !matches!(
             self.format,
             ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
@@ -675,19 +716,25 @@ impl Builder {
         if let Some(raw) = &raw {
             crate::file_times::validate_legacy_extended_times(raw)?;
         }
-        let entry = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.name == name)
-            .ok_or_else(|| {
-                Error::EntryNotFound.at_entry(name.to_vec(), "setting legacy extended timestamps")
-            })?;
+        let entry = &mut self.entries[index];
         entry.legacy_extended_times = raw;
         Ok(())
     }
 
     /// Set complete RAR5/7 timestamps without narrowing FILETIME or discarding fractions.
     pub fn set_file_times(&mut self, name: &[u8], times: Option<crate::FileTimes>) -> Result<()> {
+        let id = self.entry_id(name)?;
+        self.set_file_times_by_id(id, times)
+    }
+
+    /// Identity-based variant of [`set_file_times`](Self::set_file_times).
+    pub fn set_file_times_by_id(
+        &mut self,
+        id: usize,
+        times: Option<crate::FileTimes>,
+    ) -> Result<()> {
+        let index = self.index_by_id(id)?;
+
         if self.format.family() != ArchiveFamily::Rar50Plus {
             return Err(Error::InvalidArgument(
                 "complete file times require RAR5/7 output",
@@ -696,11 +743,7 @@ impl Builder {
         if let Some(times) = times {
             times.encode()?;
         }
-        let entry = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.name == name)
-            .ok_or_else(|| Error::EntryNotFound.at_entry(name.to_vec(), "setting file times"))?;
+        let entry = &mut self.entries[index];
         if times.is_some_and(|times| times.modified.is_some()) {
             entry.mtime = None;
         }
@@ -726,20 +769,20 @@ impl Builder {
     /// Add nanosecond precision to a queued RAR5/7 modification time.
     /// The member must already have whole seconds; legacy output is unsupported.
     pub fn set_mtime_nanoseconds(&mut self, name: &[u8], nanoseconds: u32) -> Result<()> {
+        let id = self.entry_id(name)?;
+        self.set_mtime_nanoseconds_by_id(id, nanoseconds)
+    }
+
+    /// Identity-based variant of [`set_mtime_nanoseconds`](Self::set_mtime_nanoseconds).
+    pub fn set_mtime_nanoseconds_by_id(&mut self, id: usize, nanoseconds: u32) -> Result<()> {
+        let index = self.index_by_id(id)?;
+
         if self.format.family() != crate::ArchiveFamily::Rar50Plus || nanoseconds >= 1_000_000_000 {
             return Err(Error::InvalidArgument(
                 "nanosecond modification times require RAR5/7 and a fraction below one second",
             ));
         }
-        let entry = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.name == name)
-            .ok_or_else(|| Error::AtEntry {
-                name: name.to_vec(),
-                operation: "setting modification time precision",
-                source: Box::new(Error::EntryNotFound),
-            })?;
+        let entry = &mut self.entries[index];
         if entry.mtime.is_none() {
             return Err(Error::InvalidArgument(
                 "fractional modification time requires whole seconds",
@@ -753,6 +796,14 @@ impl Builder {
     /// through renames and reordering; `Some(Vec::new())` is an explicit empty comment.
     /// RAR3/4 and volume output do not support comments. Errors leave the entry unchanged.
     pub fn set_file_comment(&mut self, name: &[u8], comment: Option<Vec<u8>>) -> Result<()> {
+        let id = self.entry_id(name)?;
+        self.set_file_comment_by_id(id, comment)
+    }
+
+    /// Identity-based variant of [`set_file_comment`](Self::set_file_comment).
+    pub fn set_file_comment_by_id(&mut self, id: usize, comment: Option<Vec<u8>>) -> Result<()> {
+        let index = self.index_by_id(id)?;
+
         if comment.is_some() {
             crate::write_plan::validate_option(
                 self.format,
@@ -760,11 +811,7 @@ impl Builder {
                 crate::write_plan::PlanShape::new().volumes(self.volume_size.is_some()),
             )?;
         }
-        let entry = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.name == name)
-            .ok_or_else(|| Error::EntryNotFound.at_entry(name.to_vec(), "setting file comment"))?;
+        let entry = &mut self.entries[index];
         entry.file_comment = comment;
         Ok(())
     }
@@ -776,6 +823,14 @@ impl Builder {
     /// The directory bit must agree with the entry kind: changing attributes
     /// cannot change a file into a directory. Errors leave metadata unchanged.
     pub fn set_dos_attributes(&mut self, name: &[u8], attributes: u64) -> Result<()> {
+        let id = self.entry_id(name)?;
+        self.set_dos_attributes_by_id(id, attributes)
+    }
+
+    /// Identity-based variant of [`set_dos_attributes`](Self::set_dos_attributes).
+    pub fn set_dos_attributes_by_id(&mut self, id: usize, attributes: u64) -> Result<()> {
+        let index = self.index_by_id(id)?;
+
         use crate::ArchiveFamily;
         let max = match self.format.family() {
             ArchiveFamily::Rar13 => u64::from(u8::MAX),
@@ -787,15 +842,7 @@ impl Builder {
                 "DOS attributes exceed the target format's field width",
             ));
         }
-        let entry = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.name == name)
-            .ok_or_else(|| Error::AtEntry {
-                name: name.to_vec(),
-                operation: "setting DOS attributes",
-                source: Box::new(Error::EntryNotFound),
-            })?;
+        let entry = &mut self.entries[index];
         if entry
             .redirection
             .as_ref()
@@ -859,32 +906,85 @@ impl Builder {
         Ok(())
     }
 
-    /// Drop the member called `name`. Errors if no member has that name.
-    pub fn remove(&mut self, name: &[u8]) -> Result<()> {
-        let before = self.entries.len();
-        self.entries.retain(|entry| entry.name != name);
-        if self.entries.len() == before {
-            return Err(Error::AtEntry {
-                name: name.to_vec(),
-                operation: "removing",
-                source: Box::new(Error::EntryNotFound),
-            });
+    /// Stable IDs in current archive order, including directories and links.
+    /// IDs survive renames/removals and are never reused within this builder.
+    pub fn member_ids(&self) -> impl Iterator<Item = usize> + '_ {
+        self.entries.iter().map(|entry| entry.id)
+    }
+
+    /// Permit duplicate names when importing entries. Name-based editing still
+    /// rejects ambiguity; callers must select those members by ID.
+    pub fn allow_duplicate_names(mut self, allow: bool) -> Self {
+        self.allow_duplicate_names = allow;
+        self
+    }
+
+    /// Resolve a unique queued name to its stable ID.
+    pub fn entry_id(&self, name: &[u8]) -> Result<usize> {
+        let mut matches = self.entries.iter().filter(|entry| entry.name == name);
+        let entry = matches
+            .next()
+            .ok_or_else(|| Error::EntryNotFound.at_entry(name.to_vec(), "selecting"))?;
+        if matches.next().is_some() {
+            return Err(
+                Error::InvalidArgument("ambiguous member name; select by member ID")
+                    .at_entry(name.to_vec(), "selecting"),
+            );
         }
+        Ok(entry.id)
+    }
+
+    fn index_by_id(&self, id: usize) -> Result<usize> {
+        self.entries
+            .iter()
+            .position(|entry| entry.id == id)
+            .ok_or(Error::EntryNotFound)
+    }
+
+    /// Drop the uniquely named member. Ambiguous names are rejected.
+    pub fn remove(&mut self, name: &[u8]) -> Result<()> {
+        self.remove_by_id(self.entry_id(name)?)
+    }
+
+    /// Drop exactly one member, identified by its stable ID.
+    pub fn remove_by_id(&mut self, id: usize) -> Result<()> {
+        let index = self.index_by_id(id)?;
+        let name = &self.entries[index].name;
+        if self
+            .entries
+            .iter()
+            .any(|entry| entry.id != id && entry.name == *name)
+        {
+            for entry in &self.entries[index + 1..] {
+                if entry
+                    .redirection
+                    .as_ref()
+                    .is_some_and(|link| link.redirection_type >= 4 && link.target_name == *name)
+                {
+                    return Err(Error::InvalidArgument(
+                        "removing this duplicate would retarget a hard link or file copy",
+                    ));
+                }
+                if entry.name == *name && !entry.is_directory {
+                    break;
+                }
+            }
+        }
+        self.entries.remove(index);
         Ok(())
     }
 
-    /// Rename the member called `old` to `new`.
+    /// Rename the uniquely named member. Ambiguous names are rejected.
     pub fn rename(&mut self, old: &[u8], new: Vec<u8>) -> Result<()> {
+        self.rename_by_id(self.entry_id(old)?, new)
+    }
+
+    /// Rename exactly one member. A new duplicate name is rejected. Name-based
+    /// hard-link/file-copy targets follow the nearest preceding target identity.
+    pub fn rename_by_id(&mut self, id: usize, new: Vec<u8>) -> Result<()> {
         let new = self.validate_name(new)?;
-        let index = self
-            .entries
-            .iter()
-            .position(|entry| entry.name == old)
-            .ok_or_else(|| Error::AtEntry {
-                name: old.to_vec(),
-                operation: "renaming",
-                source: Box::new(Error::EntryNotFound),
-            })?;
+        let index = self.index_by_id(id)?;
+        let old = self.entries[index].name.clone();
         if old != new {
             self.reject_duplicate_name(&new)?;
         }
@@ -893,11 +993,22 @@ impl Builder {
         } else {
             self.entries[index].legacy_unicode_name.clone()
         };
+        // A later member with the same name shadows this target for later links.
+        let mut target = None;
         for entry in &mut self.entries {
             if let Some(link) = &mut entry.redirection {
-                if link.redirection_type >= 4 && link.target_name == old {
+                if link.redirection_type >= 4 && link.target_name == old && target == Some(id) {
                     link.target_name = new.clone();
                 }
+            }
+            if entry.name == old
+                && !entry.is_directory
+                && entry
+                    .redirection
+                    .as_ref()
+                    .is_none_or(|link| link.redirection_type >= 4)
+            {
+                target = Some(entry.id);
             }
         }
         self.entries[index].legacy_unicode_name = unicode_name;
@@ -915,8 +1026,16 @@ impl Builder {
         Ok(name)
     }
 
-    fn push(&mut self, entry: BuilderEntry) -> Result<()> {
-        self.reject_duplicate_name(&entry.name)?;
+    fn push(&mut self, mut entry: BuilderEntry) -> Result<()> {
+        if !self.allow_duplicate_names {
+            self.reject_duplicate_name(&entry.name)?;
+        }
+        let next = self
+            .next_entry_id
+            .checked_add(1)
+            .ok_or(Error::InvalidArgument("member ID overflow"))?;
+        entry.id = self.next_entry_id;
+        self.next_entry_id = next;
         self.entries.push(entry);
         Ok(())
     }

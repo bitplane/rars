@@ -356,7 +356,6 @@ impl Archive {
         if self.sfx_offset() != 0 {
             issues.push("SFX executable prefix".into());
         }
-        let mut names = HashSet::new();
         let mut link_targets = std::collections::HashMap::new();
         for (index, member) in self.members().enumerate() {
             let meta = &member.meta;
@@ -373,9 +372,6 @@ impl Archive {
                 && (!meta.is_redirection || link.is_some_and(|link| link.redirection_type >= 4))
             {
                 link_targets.insert(meta.name.clone(), meta.unpacked_size);
-            }
-            if !names.insert(meta.name.clone()) {
-                issues.push(format!("{label}: duplicate name"));
             }
             if crate::builder::validate_entry_name(meta.name.clone()).is_err() {
                 issues.push(format!("{label}: unsupported output name"));

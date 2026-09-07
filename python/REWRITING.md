@@ -36,7 +36,7 @@ the separate password argument.
 | Property | Rewrite behaviour | Preservation contract |
 | --- | --- | --- |
 | File contents, raw names, order | Copied; builder name validation applies | Preserve retained members and order |
-| Duplicate names | Rejected explicitly before constructing the rewrite builder | Reject until editing duplicate names by identity is supported |
+| Duplicate names | Retained in source order; edit using stable member IDs | Name-based edits reject ambiguous names |
 | Directories | Explicit entries retained, including empty directories and supported modification time/attributes | Preserve explicit directory entries |
 | Timestamps | Modification, creation and access times retained, including legacy odd seconds/fractions and complete RAR5 Unix/FILETIME values | Preserve supported timestamp kinds using the established local-zone interpretation for legacy DOS times |
 | Attributes and host OS | Unix permission/special bits and DOS file flags retained using source host rules; unknown hosts use default DOS archive attributes | Preserve supported attributes with their source meaning; reject unsupported host semantics |
@@ -51,11 +51,24 @@ the separate password argument.
 | SFX executable prefix | Not copied | Reject preservation unless explicitly supported |
 | Unknown records | No preservation guarantee | Reject when their preservation cannot be established |
 
-File contents are read lazily during output. Keep a file-backed source available
-and unchanged until writing completes. Each retained member currently invokes
-an archive read separately; rewriting large or solid archives can be expensive.
-Lazy reads use original member indices, including directory positions, so edits
-to the queued names and order do not change source identity.
+File contents are read during output. Keep a file-backed source available and
+unchanged until writing completes. Payload staging uses original archive indices,
+including directory positions, so edits do not change source identity.
+
+`builder.member_ids()` returns stable integer IDs in current output order.
+For `from_archive`, initial IDs equal original member indices, including
+directories and links. `rename`, `remove`, `set_times` and `set_file_comment`
+accept an ID or a unique name. IDs survive renames and removals; removed IDs
+raise `KeyError` and are never reused by that builder. Duplicate source names
+are retained, but name-based edits raise `ValueError` when ambiguous. Adding a
+new duplicate or renaming to another member's name remains rejected.
+
+```python
+editor = RarBuilder.from_archive(source)
+first, second = editor.member_ids()[:2]
+editor.rename(second, "second-copy.txt")
+editor.remove(first)
+```
 
 File comments are decoded eagerly in one metadata pass when creating the rewrite
 builder. RAR5 comment payloads are integrity-checked; duplicate member comment

@@ -15,14 +15,44 @@ from test_extract_guards import _headers, _read_vint, _rewrite_name
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_rewrite_rejects_duplicate_source_names_explicitly():
+@pytest.mark.parametrize("preserve", [False, True])
+def test_rewrite_duplicate_names_use_stable_ids(tmp_path, preserve):
     source = rars.RarBuilder(store=True)
-    source.add_bytes(b"first", "one.txt")
-    source.add_bytes(b"second", "two.txt")
+    source.add_bytes(b"first", "one.txt", mtime=10)
+    source.add_bytes(b"second", "two.txt", mtime=20)
+    source.set_file_comment("one.txt", b"first comment")
+    source.set_file_comment("two.txt", b"second comment")
     archive = rars.RarFile.from_bytes(_rewrite_name(source.to_bytes(), b"two.txt", b"one.txt"))
-    assert archive.namelist() == ["one.txt", "one.txt"]
-    with pytest.raises(ValueError, match="duplicate member name.*one.txt"):
-        rars.RarBuilder.from_archive(archive, preserve=False)
+    builder = rars.RarBuilder.from_archive(archive, preserve=preserve, staging_dir=tmp_path)
+    assert builder.member_ids() == [0, 1]
+    for edit in [lambda: builder.remove("one.txt"), lambda: builder.rename("one.txt", "new"),
+                 lambda: builder.set_file_comment("one.txt", b"wrong"),
+                 lambda: builder.set_times("one.txt", modified_ns=0)]:
+        with pytest.raises(ValueError, match="ambiguous member name"):
+            edit()
+    # Both copies remain writable before resolving the ambiguity.
+    assert rars.RarFile.from_bytes(builder.to_bytes()).namelist() == ["one.txt", "one.txt"]
+    builder.rename(1, "second")
+    builder.set_file_comment(1, b"changed")
+    builder.set_times(1, modified_ns=123_000_000_000)
+    for _ in range(2):
+        output = rars.RarFile.from_bytes(builder.to_bytes())
+        assert output.read("one.txt") == b"first"
+        assert output.read("second") == b"second"
+        assert output.getcomment("one.txt") == b"first comment"
+        assert output.getcomment("second") == b"changed"
+        assert output.gettimes("second")["modified"] == 123_000_000_000
+    builder.remove(0)
+    assert builder.member_ids() == [1]
+    builder.rename(1, "one.txt")
+    builder.add_bytes(b"third", "third")
+    assert builder.member_ids() == [1, 2]
+    with pytest.raises(KeyError):
+        builder.remove(0)
+    with pytest.raises(ValueError):
+        builder.rename(2, "one.txt")
+    assert rars.RarFile.from_bytes(builder.to_bytes()).read("one.txt") == b"second"
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_rewrite_source_indices_survive_directory_and_file_edits():
