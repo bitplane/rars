@@ -278,6 +278,58 @@ impl FileHeader {
             .data)
     }
 
+    pub(super) fn decoded_comment_with_options(
+        &self,
+        archive: &Archive,
+        options: crate::ArchiveReadOptions<'_>,
+    ) -> Result<Vec<u8>> {
+        let mut budget = crate::output_limit::OutputBudget::new(options);
+        if budget.is_limited() && self.known_unpacked_size().is_none() {
+            return Err(Error::UnsupportedFeature {
+                version: crate::ArchiveVersion::Rar50,
+                feature: "output-limited decoding of an unknown-size comment",
+            });
+        }
+        budget.check(self.unpacked_size, &self.name)?;
+        if !self.is_stored() {
+            if let Some(limit) = options.rar50_dictionary_size_limit {
+                let required = self.decoded_compression_info()?.dictionary_size;
+                if required > limit {
+                    return Err(self.entry_error(
+                        "checking dictionary limit",
+                        Error::Rar50DictionaryLimitExceeded { limit, required },
+                    ));
+                }
+            }
+        }
+        // Comment services historically decode without checking payload hashes.
+        // Reuse bounded member decoding while retaining that checksum contract.
+        let mut payload = self.clone();
+        payload.data_crc32 = None;
+        payload.hash = None;
+        let mut session = DecoderSession::new_with_password(
+            options.password,
+            options.rar50_buffered_decode_limit.unwrap_or(u64::MAX),
+        );
+        session.decoder.read_control = budget.control.clone();
+        session.scratch = options.rar50_scratch;
+        let mut data = Vec::new();
+        budget.run(&self.name, &mut data, |writer| {
+            if payload.is_stored() {
+                let decoded = payload.decoded_data_with_decoder(
+                    archive,
+                    &mut session.decoder,
+                    options.password,
+                )?;
+                writer.write_all(&decoded.data)?;
+                Ok(())
+            } else {
+                session.write_file_to(archive, &payload, writer)
+            }
+        })?;
+        Ok(data)
+    }
+
     fn decoded_data_with_decoder(
         &self,
         archive: &Archive,

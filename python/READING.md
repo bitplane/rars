@@ -58,5 +58,5 @@ cannot be reset; use a new token for later work. Resource refusals raise
 
 These options do not apply to initial archive parsing, comment or link helpers,
 repair, or the module-level volume helpers. Passwords remain supplied through
-`pwd=` or the archive's configured password. Archive comment limits are tracked
-separately in [#48](https://github.com/bitplane/rars/issues/48).
+`pwd=` or the archive's configured password. Rust exposes archive comment limits
+through `Archive::comment_with_options`; Python comment controls remain a follow-up.

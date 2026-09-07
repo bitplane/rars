@@ -764,6 +764,16 @@ impl Archive {
     }
 
     pub fn archive_comment(&self) -> Result<Option<Vec<u8>>> {
+        self.archive_comment_with_options(crate::ArchiveReadOptions::new())
+    }
+
+    /// Decodes the archive comment under the same policy as [`crate::Archive::comment_with_options`].
+    pub fn archive_comment_with_options(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+    ) -> Result<Option<Vec<u8>>> {
+        options.check_cancelled()?;
+        let mut budget = crate::output_limit::OutputBudget::new(options);
         if !self.main.has_archive_comment() {
             return Ok(None);
         }
@@ -787,9 +797,17 @@ impl Archive {
                 return Err(Error::TooShort);
             }
 
+            budget.check(unpacked_len as u64, b"CMT")?;
             let mut packed = self.main.extra[packed_start..packed_end].to_vec();
             Rar13Cipher::new_comment().decrypt_in_place(&mut packed);
-            return Ok(Some(unpack15_decode(&packed, unpacked_len)?));
+            let mut decoder = Unpack15::default();
+            decoder.read_control = budget.control.clone();
+            let mut data = Vec::new();
+            budget.run(b"CMT", &mut data, |writer| {
+                decoder.decode_member_to(&packed, unpacked_len, false, writer)?;
+                Ok(())
+            })?;
+            return Ok(Some(data));
         }
 
         let comment_start = 2usize;
@@ -801,7 +819,13 @@ impl Archive {
         if comment_end > self.main.extra.len() {
             return Err(Error::TooShort);
         }
-        Ok(Some(self.main.extra[comment_start..comment_end].to_vec()))
+        budget.check(length as u64, b"CMT")?;
+        let mut data = Vec::new();
+        budget.run(b"CMT", &mut data, |writer| {
+            writer.write_all(&self.main.extra[comment_start..comment_end])?;
+            Ok(())
+        })?;
+        Ok(Some(data))
     }
 
     pub fn authenticity_verification(&self) -> Result<Option<AuthenticityVerification>> {

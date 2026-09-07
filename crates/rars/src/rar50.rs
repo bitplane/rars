@@ -760,11 +760,24 @@ impl Archive {
         &self,
         password: Option<&[u8]>,
     ) -> Result<Option<Vec<u8>>> {
+        self.archive_comment_with_options(crate::ArchiveReadOptions::with_optional_password(
+            password,
+        ))
+    }
+
+    /// Decodes the archive comment under the same policy as [`crate::Archive::comment_with_options`].
+    pub fn archive_comment_with_options(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+    ) -> Result<Option<Vec<u8>>> {
+        options.check_cancelled()?;
         for block in &self.blocks {
             match block {
                 Block::File(_) => return Ok(None),
                 Block::Service(service) if service.name == b"CMT" => {
-                    return service.decoded_data_unverified(self, password).map(Some);
+                    return service
+                        .decoded_comment_with_options(self, options)
+                        .map(Some);
                 }
                 _ => {}
             }

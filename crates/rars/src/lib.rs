@@ -78,7 +78,7 @@ pub use write_progress::{WriteOperation, WriteProgress, WriteProgressEvent};
 
 #[derive(Debug, Clone, Copy, Default)]
 #[non_exhaustive]
-/// Options used while parsing or extracting archives.
+/// Options used while parsing archives, extracting members or decoding comments.
 pub struct ArchiveReadOptions<'a> {
     /// Password bytes used for encrypted headers or payloads.
     pub password: Option<&'a [u8]>,
@@ -127,7 +127,8 @@ pub struct ArchiveReadOptions<'a> {
     /// consume additional memory.
     ///
     /// Supply this option to extraction, including volume extraction. Parsing
-    /// does not retain it. Legacy formats, comment/recovery helpers and direct
+    /// does not retain it. Options-aware comment decoding also applies it.
+    /// Legacy formats, recovery helpers and direct
     /// codec calls are outside its scope. Earlier members may already be emitted
     /// when a later member exceeds the limit; its output callback is not opened.
     pub rar50_dictionary_size_limit: Option<u64>,
@@ -138,7 +139,8 @@ pub struct ArchiveReadOptions<'a> {
     /// The ceiling resets per logical member, not per volume fragment. Discarding
     /// a solid member's bytes does not exempt it; retries and history copies are
     /// not counted twice. Direct codecs, password-only default wrappers and
-    /// comment/recovery helpers are outside this explicit policy.
+    /// recovery helpers are outside this explicit policy. Options-aware comment
+    /// decoding treats the archive comment as one logical member.
     pub max_member_output_bytes: Option<u64>,
     /// Inclusive total logical output ceiling for one extraction call, across
     /// all members and volumes. Counts bytes accepted by output writers, including
@@ -155,7 +157,8 @@ pub struct ArchiveReadOptions<'a> {
     /// for deterministic admission and accounting. This can reduce throughput.
     /// It is not a CPU/RAM budget: buffered decoding can precede the output guard.
     /// Parsing does not retain policy; password-only wrappers, direct codecs and
-    /// comment/recovery helpers keep defaults. Each extraction starts a new budget.
+    /// recovery helpers keep defaults. Each extraction starts a new budget.
+    /// Options-aware comment decoding starts a separate single-comment budget.
     pub max_total_output_bytes: Option<u64>,
 }
 
@@ -875,10 +878,33 @@ impl Archive {
 
     /// The archive comment, decrypting its payload with the supplied password.
     pub fn comment(&self, password: Option<&[u8]>) -> Result<Option<Vec<u8>>> {
+        self.comment_with_options(ArchiveReadOptions::with_optional_password(password))
+    }
+
+    /// Decodes the archive comment with per-call cancellation and output limits.
+    /// Both output ceilings apply to this single comment, with fresh budgets.
+    /// Admission precedes payload allocation; no partial comment is returned.
+    /// RAR5 dictionary and buffered/scratch policies also apply. Parsing limits
+    /// are not reapplied. Existing format-specific checksum behaviour is retained.
+    /// The default RAR5 comment path remains buffered; set an explicit buffering
+    /// threshold to use streaming/scratch decoding. The returned Vec, packed input
+    /// and decoder workspace are not an aggregate RAM quota. Unknown-size RAR5
+    /// comments are refused when either output ceiling is configured.
+    ///
+    /// ```no_run
+    /// # fn example(archive: &rars::Archive) -> rars::Result<()> {
+    /// let options = rars::ArchiveReadOptions::new()
+    ///     .with_max_member_output_bytes(64 * 1024)
+    ///     .with_rar50_dictionary_size_limit(8 * 1024 * 1024);
+    /// let comment = archive.comment_with_options(options)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn comment_with_options(&self, options: ArchiveReadOptions<'_>) -> Result<Option<Vec<u8>>> {
         match self {
-            Self::Rar13(archive) => archive.archive_comment(),
-            Self::Rar15To40(archive) => archive.archive_comment_with_password(password),
-            Self::Rar50Plus(archive) => archive.archive_comment_with_password(password),
+            Self::Rar13(archive) => archive.archive_comment_with_options(options),
+            Self::Rar15To40(archive) => archive.archive_comment_with_options(options),
+            Self::Rar50Plus(archive) => archive.archive_comment_with_options(options),
         }
     }
 

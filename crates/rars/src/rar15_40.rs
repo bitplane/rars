@@ -466,18 +466,6 @@ impl FileHeader {
         Ok(data)
     }
 
-    pub(crate) fn unpacked_data_with_password(
-        &self,
-        archive: &Archive,
-        password: Option<&[u8]>,
-    ) -> Result<Vec<u8>> {
-        if self.is_stored() {
-            return self.stored_data_with_password(archive, password);
-        }
-        let mut session = DecoderSession::new_with_password(false, password);
-        session.decode_file_data(archive, self)
-    }
-
     pub(crate) fn unpacked_data_with_rar29(
         &self,
         archive: &Archive,
@@ -955,35 +943,51 @@ impl CommentHeader {
         archive.read_range(self.packed_range.clone())
     }
 
-    fn unpacked_data(&self, archive: &Archive) -> Result<Vec<u8>> {
-        self.decode(&self.packed_data(archive)?)
-    }
-
     /// Unpacks comment data and checks it against the header's 16-bit CRC.
     fn decode(&self, packed: &[u8]) -> Result<Vec<u8>> {
+        self.decode_with_budget(
+            packed,
+            &mut crate::output_limit::OutputBudget::new(crate::ArchiveReadOptions::new()),
+        )
+    }
+
+    fn decode_with_budget(
+        &self,
+        packed: &[u8],
+        budget: &mut crate::output_limit::OutputBudget,
+    ) -> Result<Vec<u8>> {
         let target = usize::from(self.unp_size);
-        let data = if self.method == 0x30 {
-            if packed.len() != target {
-                return Err(Error::InvalidHeader(
-                    "RAR 1.5 stored comment has mismatched packed and unpacked sizes",
-                ));
+        budget.check(target as u64, b"CMT")?;
+        let control = budget.control.clone();
+        let mut data = Vec::new();
+        budget.run(b"CMT", &mut data, |writer| {
+            if self.method == 0x30 {
+                if packed.len() != target {
+                    return Err(Error::InvalidHeader(
+                        "RAR 1.5 stored comment has mismatched packed and unpacked sizes",
+                    ));
+                }
+                writer.write_all(packed)?;
+            } else if self.unp_ver == 15 {
+                let mut decoder = Unpack15::default();
+                decoder.read_control = control;
+                decoder.decode_member_to(packed, target, false, writer)?;
+            } else if self.unp_ver == 20 || self.unp_ver == 26 {
+                let mut decoder = Unpack20::new();
+                decoder.read_control = control;
+                decoder.decode_member_from_reader(&mut &packed[..], target, writer)?;
+            } else {
+                return Err(Error::UnsupportedCompression {
+                    family: "RAR 1.5 comment",
+                    unpack_version: self.unp_ver,
+                    method: self.method,
+                });
             }
-            packed.to_vec()
-        } else if self.unp_ver == 15 {
-            Unpack15::default().decode_member(packed, target, false)?
-        } else if self.unp_ver == 20 || self.unp_ver == 26 {
-            let mut data = Vec::new();
-            Unpack20::new().decode_member_from_reader(&mut &packed[..], target, &mut data)?;
-            data
-        } else {
-            return Err(Error::UnsupportedCompression {
-                family: "RAR 1.5 comment",
-                unpack_version: self.unp_ver,
-                method: self.method,
-            });
-        };
+            Ok(())
+        })?;
         let actual = (crc32(&data) & 0xffff) as u16;
         if actual == self.comment_crc {
+            budget.control.check()?;
             Ok(data)
         } else {
             Err(Error::CrcMismatch {
@@ -1775,11 +1779,25 @@ impl Archive {
         &self,
         password: Option<&[u8]>,
     ) -> Result<Option<Vec<u8>>> {
+        self.archive_comment_with_options(crate::ArchiveReadOptions::with_optional_password(
+            password,
+        ))
+    }
+
+    /// Decodes the archive comment under the same policy as [`crate::Archive::comment_with_options`].
+    pub fn archive_comment_with_options(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+    ) -> Result<Option<Vec<u8>>> {
+        options.check_cancelled()?;
+        let mut budget = crate::output_limit::OutputBudget::new(options);
         if let Some(comment) = self.blocks.iter().find_map(|block| match block {
             Block::Comment(comment) => Some(comment),
             _ => None,
         }) {
-            return comment.unpacked_data(self).map(Some);
+            budget.check(u64::from(comment.unp_size), b"CMT")?;
+            let packed = comment.packed_data(self)?;
+            return comment.decode_with_budget(&packed, &mut budget).map(Some);
         }
 
         let Some(comment) = self
@@ -1788,8 +1806,18 @@ impl Archive {
         else {
             return Ok(None);
         };
-        let data = comment.file.unpacked_data_with_password(self, password)?;
-        comment.file.verify_crc32(&data)?;
+        let file = &comment.file;
+        budget.check(file.unp_size, b"CMT")?;
+        let mut data = Vec::new();
+        let mut session = DecoderSession::new_with_password(false, options.password);
+        session.read_control = budget.control.clone();
+        budget.run(b"CMT", &mut data, |mut writer| {
+            if file.is_stored() {
+                file.write_stored_to(self, options.password, &mut writer)
+            } else {
+                session.write_file_to(self, file, &mut writer)
+            }
+        })?;
         Ok(Some(data))
     }
 }
