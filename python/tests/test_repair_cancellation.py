@@ -20,7 +20,7 @@ def test_cancelled_repair_does_not_read_input_or_touch_output(tmp_path, method, 
 
 @pytest.mark.parametrize("format", ["rar20", "rar40", "rar50", "rar70"])
 def test_repair_token_is_reusable_and_path_publication_cleans_up(tmp_path, format):
-    builder = rars.RarBuilder(format=format, store=True, recovery_percent=10)
+    builder = rars.RarBuilder(format=format, store=True, recovery_percent=10 if format in ("rar50", "rar70") else None)
     payload = b"recoverable payload " * 1000
     builder.add_bytes(payload, "file")
     original = builder.to_bytes()

@@ -1162,6 +1162,7 @@ impl Builder {
     /// Requires [`volume_size`](Self::volume_size). Naming the parts on disk is
     /// the caller's job, because the two families number them differently.
     pub fn build_volumes(&self, progress: Option<&dyn WriteProgress>) -> Result<Vec<Vec<u8>>> {
+        self.check_recovery_option()?;
         let resources = WriterResources::default();
         let control = ResourceProgress::new(&resources, progress.map(ProgressReporter));
         let progress = Some(&control as &dyn WriteProgress);
@@ -1236,7 +1237,19 @@ impl Builder {
             && (!self.encrypt_headers || self.password.is_some())
     }
 
+    fn check_recovery_option(&self) -> Result<()> {
+        if self.recovery_percent.is_some() {
+            crate::write_plan::validate_option(
+                self.format,
+                crate::write_plan::WriterOption::RecoveryRecord,
+                crate::write_plan::PlanShape::new().volumes(self.volume_size.is_some()),
+            )?;
+        }
+        Ok(())
+    }
+
     fn check_single(&self) -> Result<()> {
+        self.check_recovery_option()?;
         self.check_redirection_targets()?;
         if !self.streams_rar50()
             && (self.archive_metadata.is_some() || self.locked || self.quick_open)
