@@ -1444,12 +1444,9 @@ fn extract_archive<S: Selection>(
     overwrite: bool,
 ) -> rars_rs::Result<Vec<PathBuf>> {
     let written = Arc::new(Mutex::new(Vec::new()));
-    extract_to_best(archive, password, {
+    let open = {
         let written = Arc::clone(&written);
-        move |meta| {
-            if selected.is_some_and(|set| !set.contains_member(&meta.name)) {
-                return Ok(Box::new(io::sink()) as Box<dyn Write>);
-            }
+        move |meta: &rars_rs::ExtractedEntryMeta| {
             let path = checked_output_path(out_dir, meta, archive.family())?;
             if meta.is_directory {
                 fs::create_dir_all(&path)?;
@@ -1471,7 +1468,63 @@ fn extract_archive<S: Selection>(
             written.lock().expect("written lock poisoned").push(path);
             Ok(Box::new(file) as Box<dyn Write>)
         }
-    })?;
+    };
+    if let Some(selected) = selected {
+        let last = archive
+            .members()
+            .enumerate()
+            .filter(|(_, member)| {
+                !member.meta.is_redirection && selected.contains_member(&member.meta.name)
+            })
+            .map(|(index, _)| index)
+            .last();
+        if let Some(last) = last {
+            let solid = match archive {
+                rars_rs::Archive::Rar13(a) => a.main.is_solid(),
+                rars_rs::Archive::Rar15To40(a) => {
+                    a.main.is_solid() || a.files().any(|file| file.is_solid())
+                }
+                rars_rs::Archive::Rar50Plus(a) => {
+                    a.main.is_solid() || a.files().any(|file| file.compression_info & 0x40 != 0)
+                }
+                // Future families must not skip possible history dependencies.
+                _ => true,
+            };
+            let mut index = 0;
+            archive.extract_with_control(
+                rars_rs::ArchiveReadOptions::with_optional_password(password),
+                |member| {
+                    let current = index;
+                    index += 1;
+                    if current > last {
+                        return Ok(rars_rs::ExtractionDecision::Stop);
+                    }
+                    let meta = &member.meta;
+                    if meta.is_redirection {
+                        return Ok(rars_rs::ExtractionDecision::Skip);
+                    }
+                    if !selected.contains_member(&meta.name) {
+                        return Ok(if solid && !meta.is_directory {
+                            rars_rs::ExtractionDecision::Extract(Box::new(io::sink()))
+                        } else {
+                            rars_rs::ExtractionDecision::Skip
+                        });
+                    }
+                    let meta = rars_rs::ExtractedEntryMeta::new(
+                        meta.name.clone(),
+                        meta.file_time,
+                        meta.file_attr,
+                        meta.is_directory,
+                    )
+                    .with_attr_source(meta.attr_source())
+                    .with_mtime_refinement(meta.mtime_refinement);
+                    Ok(rars_rs::ExtractionDecision::Extract(open(&meta)?))
+                },
+            )?;
+        }
+    } else {
+        extract_to_best(archive, password, open)?;
+    }
     let out = written.lock().expect("written lock poisoned").clone();
     Ok(out)
 }
@@ -1806,6 +1859,41 @@ fn error_is_bad_password(error: &rars_rs::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_extraction_preserves_solid_password_dependencies() {
+        let root = scratch::case("selected-solid-extraction");
+        for format in [
+            rars_rs::ArchiveVersion::Rar29,
+            rars_rs::ArchiveVersion::Rar50,
+        ] {
+            let mut builder = rars_rs::Builder::new(format).solid(true);
+            for name in [b"first".as_slice(), b"secret", b"last"] {
+                builder
+                    .add_bytes(name.to_vec(), name.repeat(100), None, None)
+                    .unwrap();
+            }
+            builder
+                .set_entry_encryption(b"secret", Some(b"password".to_vec()), None)
+                .unwrap();
+            let archive = rars_rs::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+            let directory = root.join(format.to_string());
+            let first = b"first".to_vec();
+            let last = b"last".to_vec();
+            let paths = extract_archive(&archive, Some(&first), &directory, None, false).unwrap();
+            assert_eq!(paths, vec![directory.join("first")]);
+            assert_eq!(fs::read(&paths[0]).unwrap(), first.repeat(100));
+            let error =
+                extract_archive(&archive, Some(&last), &directory, None, false).unwrap_err();
+            assert_eq!(error.kind(), rars_rs::ErrorKind::PasswordRequired);
+            assert!(!directory.join("last").exists());
+            let paths =
+                extract_archive(&archive, Some(&last), &directory, Some(b"password"), false)
+                    .unwrap();
+            assert_eq!(paths, vec![directory.join("last")]);
+            assert_eq!(fs::read(&paths[0]).unwrap(), last.repeat(100));
+        }
+    }
 
     #[test]
     fn python_rewrite_batches_link_metadata_and_stages_one_pass_per_write() {

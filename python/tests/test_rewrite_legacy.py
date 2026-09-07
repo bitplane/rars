@@ -259,22 +259,38 @@ def test_legacy_encryption_survives_edits(tmp_path, header_encryption, solid):
 
 
 @pytest.mark.parametrize("format", ["rar20", "rar40"])
-def test_mixed_legacy_encryption_keeps_plaintext_members_plain(tmp_path, format):
+@pytest.mark.parametrize("encrypted_first", [False, True])
+def test_mixed_legacy_encryption_keeps_plaintext_members_plain(tmp_path, format, encrypted_first):
     plain = rars.RarBuilder(format=format, store=True)
     plain.add_bytes(b"public", "plain")
     encrypted = rars.RarBuilder(format=format, password="secret")
     encrypted.add_bytes(b"private", "encrypted")
-    secret_bytes = encrypted.to_bytes()
-    member_offset = next(offset for offset, kind, _, _ in headers(secret_bytes) if kind == 0x74)
-    source = rars.RarFile.from_bytes(plain.to_bytes() + secret_bytes[member_offset:], password="secret")
+    first, second = (encrypted, plain) if encrypted_first else (plain, encrypted)
+    second_bytes = second.to_bytes()
+    member_offset = next(offset for offset, kind, _, _ in headers(second_bytes) if kind == 0x74)
+    source = rars.RarFile.from_bytes(first.to_bytes() + second_bytes[member_offset:], password="secret")
     rewritten = rars.RarBuilder.from_archive(source).to_bytes()
     output = rars.RarFile.from_bytes(rewritten)
     assert not output.getinfo("plain").is_encrypted
-    # The legacy reader currently prepares encryption for all members.
-    assert rars.RarFile.from_bytes(rewritten, password="secret").read("plain") == b"public"
+    assert output.read("plain") == b"public"
+    assert output.open("plain").read() == b"public"
+    assert output.read("plain", pwd="wrong") == b"public"
+    extracted = output.extract("plain", tmp_path / "single")
+    assert extracted.read_bytes() == b"public"
+    paths = output.extractall(tmp_path / "filtered", members=["plain"], pwd="wrong")
+    assert [path.read_bytes() for path in paths] == [b"public"]
+    with pytest.raises(KeyError):
+        output.extract("missing", tmp_path / "missing")
+    assert output.extractall(tmp_path / "none", members=[]) == []
+    assert not (tmp_path / "missing").exists()
+    assert not (tmp_path / "none").exists()
     assert output.getinfo("encrypted").is_encrypted
     with pytest.raises(rars.PasswordRequired):
         output.read("encrypted")
+    with pytest.raises(rars.PasswordRequired):
+        output.testrar()
+    with pytest.raises(rars.PasswordRequired):
+        output.extractall(tmp_path / "all")
     assert rars.RarFile.from_bytes(rewritten, password="secret").read("encrypted") == b"private"
     if shutil.which("unrar"):
         path = tmp_path / "mixed.rar"

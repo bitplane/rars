@@ -168,9 +168,10 @@ encryption and is reused for encrypted output. Plaintext members stay plaintext.
 does not disable retained header encryption. Missing/wrong passwords and decode
 failures leave an existing destination intact. Unexpected salt settings and
 explicit encryption-version records still fail preflight. Per-member encryption
-overrides are not supported for volume output. The legacy reader can currently
-require the password even when selecting a plaintext member of a mixed archive;
-this does not mean its payload is encrypted.
+overrides are not supported for volume output. Single-member reads and selected
+extraction skip unrelated encrypted payloads. Encrypted headers or solid predecessors can still
+require a password. Single-member reads verify the selected payload and decoded
+predecessors; use `testrar()` to verify the whole archive.
 
 Archive comments are retained in their old-style or RAR3/4 `CMT` form. Nested
 old-style comments may be emitted as standalone archive-comment blocks. RAR3/4

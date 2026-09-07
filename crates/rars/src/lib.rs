@@ -752,28 +752,25 @@ impl Archive {
     /// Returns one member's decoded bytes, or `None` when the archive has no
     /// file of that name.
     ///
-    /// Extraction runs over the whole archive either way, because a solid
-    /// member is only decodable after the ones before it. Reading several
-    /// members from a solid archive one call at a time therefore costs as many
-    /// full passes; use [`extract_to`](Self::extract_to) to take them all in
-    /// one.
+    /// Only the selected payload and solid predecessors are decoded and verified.
+    /// Unrelated independent files and later payloads are skipped. Use [`test`](Self::test)
+    /// to verify the whole archive. Duplicate names select the last payload member;
+    /// use [`read_member_at`](Self::read_member_at) for unambiguous identity.
+    /// Reading several solid members separately repeats predecessor decoding;
+    /// use [`extract_to`](Self::extract_to) to take them all in one pass.
     pub fn read_member(&self, name: &[u8], password: Option<&[u8]>) -> Result<Option<Vec<u8>>> {
-        // The closure gives the writer away rather than returning bytes, so the
-        // member arrives through a buffer shared with it.
-        let collected = std::sync::Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
-        self.extract_to_parallel_buffered(password, |meta| {
-            if meta.name != name || meta.is_directory {
-                return Ok(Box::new(std::io::sink()) as Box<dyn Write>);
-            }
-            let sink = SharedBuffer(std::sync::Arc::clone(&collected));
-            *sink.lock() = Some(Vec::new());
-            Ok(Box::new(sink) as Box<dyn Write>)
-        })?;
-        let taken = collected
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        Ok(taken)
+        let index = self
+            .members()
+            .enumerate()
+            .filter(|(_, member)| {
+                member.meta.name == name && !member.meta.is_directory && !member.meta.is_redirection
+            })
+            .map(|(index, _)| index)
+            .last();
+        match index {
+            Some(index) => self.read_member_at(index, password),
+            None => Ok(None),
+        }
     }
 
     /// Returns one member's decoded bytes by archive-order index.
@@ -781,29 +778,53 @@ impl Archive {
     /// Unlike name lookup this remains unambiguous when an archive contains
     /// duplicate names or names that are not valid UTF-8.
     /// Indices include directories and redirections, which return no file bytes.
+    /// Missing indices also return `None` without decoding. Only the selected
+    /// payload and solid predecessors are verified; later payloads are not read.
     pub fn read_member_at(&self, index: usize, password: Option<&[u8]>) -> Result<Option<Vec<u8>>> {
-        // The writer callback omits redirections, but public member indices do
-        // not. Translate once so links cannot shift the selected file's identity.
-        let Some(index) = self
-            .members()
-            .enumerate()
-            .filter(|(_, member)| !member.meta.is_redirection)
-            .position(|(original, _)| original == index)
-        else {
+        let Some(member) = self.members().nth(index) else {
             return Ok(None);
         };
-        let collected = std::sync::Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
-        let current = std::cell::Cell::new(0usize);
-        self.extract_to(password, |meta| {
-            let this = current.get();
-            current.set(this.saturating_add(1));
-            if this != index || meta.is_directory {
-                return Ok(Box::new(std::io::sink()) as Box<dyn Write>);
+        if member.meta.is_directory || member.meta.is_redirection {
+            return Ok(None);
+        }
+        // Match controlled extraction's conservative solid admission policy,
+        // including member flags in archives without a main solid flag.
+        let solid = match self {
+            Self::Rar13(archive) => archive.main.is_solid(),
+            Self::Rar15To40(archive) => {
+                archive.main.is_solid() || archive.files().any(|file| file.is_solid())
             }
-            let sink = SharedBuffer(std::sync::Arc::clone(&collected));
-            *sink.lock() = Some(Vec::new());
-            Ok(Box::new(sink) as Box<dyn Write>)
-        })?;
+            Self::Rar50Plus(archive) => {
+                archive.main.is_solid()
+                    || archive
+                        .files()
+                        .any(|file| file.compression_info & 0x40 != 0)
+            }
+        };
+        let collected = std::sync::Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
+        let mut current = 0usize;
+        self.extract_with_control(
+            ArchiveReadOptions::with_optional_password(password),
+            |member| {
+                let this = current;
+                current += 1;
+                if this > index {
+                    return Ok(ExtractionDecision::Stop);
+                }
+                if this != index {
+                    return Ok(
+                        if solid && !member.meta.is_directory && !member.meta.is_redirection {
+                            ExtractionDecision::Extract(Box::new(std::io::sink()))
+                        } else {
+                            ExtractionDecision::Skip
+                        },
+                    );
+                }
+                let sink = SharedBuffer(std::sync::Arc::clone(&collected));
+                *sink.lock() = Some(Vec::new());
+                Ok(ExtractionDecision::Extract(Box::new(sink)))
+            },
+        )?;
         let taken = collected
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
