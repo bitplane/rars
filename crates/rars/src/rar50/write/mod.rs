@@ -447,8 +447,10 @@ impl<'a> ArchiveExtras<'a> {
     }
 }
 
-/// Writes a RAR 5 or RAR 7 archive straight to `output`, keeping memory within
-/// `resources` however large the members are.
+/// Writes a RAR 5 or RAR 7 archive to `output`, admitting estimated compression
+/// workspace through `resources`. Packed payloads are retained in spools before
+/// emission. This is not a total RAM or temporary-disk limit; bare-WASM spools
+/// remain in memory.
 ///
 /// Supports solid compression, per-member and header encryption, and recovery
 /// records, in any combination.
@@ -558,8 +560,6 @@ pub(crate) fn write_streaming_archive_reporting(
     )
 }
 
-/// Writes a RAR 5 or RAR 7 archive without retaining member payloads.
-/// Compression settings shared by the streaming writers.
 /// How far one dictionary has to reach for these members.
 ///
 /// Solid members are coded as one chain through a single window, so a match can

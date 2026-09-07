@@ -1,4 +1,4 @@
-//! Turning member sources into packed payloads, in bounded memory.
+//! Turning member sources into packed payloads with workspace admission.
 //!
 //! RAR 5 compresses in independent blocks: a block depends only on its own
 //! bytes and on up to a dictionary's worth of the raw input that precedes it.
@@ -153,8 +153,9 @@ pub(super) fn compress_members_with_context(
     }
 
     // Filters and multi-candidate encoding both need the whole member at once.
-    // Members that fit the budget take that path; the rest stream, losing the
-    // filter but staying within memory.
+    // Members that fit the estimate take that path. Only automatic filtering
+    // permits fallback to one streaming candidate; other oversized requests
+    // fail admission. Retained spools are outside this workspace estimate.
     let wants_whole_member =
         plan.method != 0 && (plan.filter_policy != FilterPolicy::None || plan.candidates.len() > 1);
     if wants_whole_member && !plan.solid {

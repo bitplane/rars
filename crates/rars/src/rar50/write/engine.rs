@@ -1,13 +1,13 @@
-//! Assembling a RAR 5 archive in bounded memory.
+//! Assembling a RAR 5 archive from prepared payloads.
 //!
-//! Nothing here holds a member, or the archive, in memory. Members compress
-//! into temporary files, and every block size is known before a byte is
-//! written, so the archive streams out in one pass.
+//! Native member spools use temporary files; bare-WASM spools retain bytes in
+//! memory. Compression may load whole members, and headers, inline services
+//! and quick-open data also allocate memory. Once block lengths are known,
+//! final archive output streams in one pass. The workspace admission budget
+//! is not an aggregate RAM or disk quota; see WRITER_EXECUTION.md in the repo.
 //!
-//! The one thing that has to be read back is the recovery record, which is
-//! parity over everything that precedes it. When one is requested the bytes
-//! being written are mirrored into a temporary file, and the parity pass reads
-//! that instead of the archive it just produced.
+//! Stored payloads are reread and verified during emission. Recovery requires
+//! a further pass over the preceding archive bytes, mirrored into a spool.
 
 use super::compress::{self, CompressPlan, CompressedMember};
 use super::headers::{

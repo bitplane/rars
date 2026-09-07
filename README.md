@@ -58,6 +58,11 @@ and lookup keys retain the encoded archive identity. Use byte names (or Python
 Legacy code pages are not guessed. Windows supports Unicode names; extracting
 non-Unicode legacy byte names there still requires caller-selected decoding.
 
+## Writer execution
+
+For writer execution modes, workspace estimates and retained storage, see
+[WRITER_EXECUTION.md](WRITER_EXECUTION.md).
+
 ## Bindings
 
 Python bindings are published to [pypi](https://pypi.org/project/rars/), so you
