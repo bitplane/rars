@@ -33,6 +33,8 @@ pub enum Error {
     SingularElement,
     RebuildTooLarge,
     Io(std::io::ErrorKind),
+    /// Preserve a structured archive error tunneled through a reader or sink.
+    TypedIo(Box<crate::Error>),
 }
 
 impl std::fmt::Display for Error {
@@ -55,15 +57,26 @@ impl std::fmt::Display for Error {
                 f.write_str("RAR 5 recovery record is too large to rebuild in memory")
             }
             Self::Io(kind) => write!(f, "RAR 5 recovery I/O failed: {kind}"),
+            Self::TypedIo(error) => std::fmt::Display::fmt(error, f),
         }
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::TypedIo(error) => Some(error.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 impl From<std::io::Error> for Error {
     fn from(error: std::io::Error) -> Self {
-        Self::Io(error.kind())
+        match error.downcast::<crate::Error>() {
+            Ok(error) => Self::TypedIo(Box::new(error)),
+            Err(error) => Self::Io(error.kind()),
+        }
     }
 }
 

@@ -157,6 +157,13 @@ pub enum Error {
         limit: u64,
         required: u64,
     },
+    /// Aggregate logical spool storage, including in-flight growth reservations.
+    /// Diagnostic `required` saturates at u64::MAX on accounting overflow.
+    WriterSpoolLimitExceeded {
+        limit: u64,
+        required: u64,
+        used: u64,
+    },
     MemoryLimitExceeded {
         limit: u64,
         required: u64,
@@ -259,6 +266,8 @@ impl std::fmt::Display for Error {
             Self::Rar50ScratchLimitExceeded { limit, required } => write!(f, "RAR 5 scratch limit {limit} bytes exceeded (requires {required})"),
             Self::RewriteStagingLimitExceeded { limit, required } => write!(f, "rewrite staging limit {limit} bytes exceeded (requires {required})"),
             Self::Rar50FilterMemoryLimitExceeded { limit, required } => write!(f, "RAR 5 filter workspace limit {limit} bytes exceeded (requires {required})"),
+            Self::WriterSpoolLimitExceeded { limit, required, used } => write!(f,
+                "writer spool limit {limit} bytes exceeded (requires {required}; {used} bytes already retained or reserved)"),
             Self::MemoryLimitExceeded {
                 limit,
                 required,
@@ -408,6 +417,7 @@ impl Error {
             | Self::RewriteStagingLimitExceeded { .. }
             | Self::Rar50FilterMemoryLimitExceeded { .. }
             | Self::MemoryLimitExceeded { .. }
+            | Self::WriterSpoolLimitExceeded { .. }
             | Self::MemberOutputLimitExceeded { .. }
             | Self::HeaderCountLimitExceeded { .. }
             | Self::HeaderBytesLimitExceeded { .. }
@@ -462,10 +472,10 @@ impl From<crate::codec::Error> for Error {
 
 impl From<crate::recovery::rar5::Error> for Error {
     fn from(error: crate::recovery::rar5::Error) -> Self {
-        if error == crate::recovery::rar5::Error::Cancelled {
-            Self::Cancelled
-        } else {
-            Self::Rar5Recovery(error)
+        match error {
+            crate::recovery::rar5::Error::Cancelled => Self::Cancelled,
+            crate::recovery::rar5::Error::TypedIo(error) => *error,
+            error => Self::Rar5Recovery(error),
         }
     }
 }

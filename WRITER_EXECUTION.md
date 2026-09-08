@@ -3,6 +3,9 @@
 This describes the current RAR5/7 planning and execution model.
 `WriterResources::memory_limit` admits estimated active workspace. It is not a
 hard ceiling on process RAM, retained archive data or temporary disk use.
+`WriterResources::with_max_spool_bytes` separately limits live logical spool
+contents. Its scope and the next accounting steps are defined in the
+[resource contract](WRITER_RESOURCE_CONTRACT.md).
 
 ## Entry points and planning
 
@@ -84,8 +87,8 @@ counts live plaintext payloads separately from these writer allocations.
 | Allocation | Lifetime and accounting |
 | --- | --- |
 | Caller input buffers and queued source descriptors | Owned by the caller or builder; not charged as compression workspace. |
-| Packed member spools | Retained through preparation and emission. Native builds use temporary files; parked spools release file handles. Disk usage has no aggregate quota here. |
-| Bare-WASM spools | In-memory cursors retain packed bytes beyond active-job permits. This can grow with the archive. |
+| Packed member spools | Retained through preparation and emission. Native builds use temporary files; parked spools release file handles. An optional shared spool quota counts live logical file lengths. |
+| Bare-WASM spools | In-memory cursors retain packed bytes beyond active-job permits. The spool quota bounds their logical lengths, but not spare capacity or total RAM. |
 | Prepared headers, member/service records and inline payloads | Retained for archive construction. Comment and service data can be allocated in memory. |
 | Quick-open payload | Built in a `Vec` from cached headers, separately from codec workspace. Its size grows with the indexed headers. |
 | Encryption | Single-archive member data is encrypted during emission in chunks. Volume preparation writes ciphertext into an additional spool before splitting. Keys, cipher state, padded headers and inline encrypted services also allocate storage. |
@@ -109,9 +112,10 @@ volume files do not have a collective atomic-publication guarantee.
 
 ## Limits and future accounting
 
-Any hard quota proposal must separately account for active workspace, retained
-payloads, caller buffers, headers/services, recovery scratch, output collectors
-and disk. Renaming the current workspace limit would not supply that accounting.
+An aggregate managed-memory ceiling still needs accounting for active workspace,
+retained payload capacity, headers/services, recovery scratch and output
+collectors, with explicit boundaries for caller buffers and disk. Renaming the
+current workspace limit would not supply that accounting.
 The planning model does not change native spool or bare-WASM retention lifetimes.
 
 Planning changes must preserve output bytes and external-decoder compatibility,

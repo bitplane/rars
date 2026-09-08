@@ -143,11 +143,13 @@ impl WriteCancellation {
 /// spool handles by compression concurrency, rather than the archive entry count.
 /// The workspace limit is not a total process-RAM or temporary-disk quota. On bare
 /// WebAssembly (`wasm32-unknown-unknown`), spools stay in memory and their retained
-/// payloads are additional to this limit.
+/// payloads are additional to this limit. `with_max_spool_bytes` separately caps
+/// logical spool contents on both backends.
 pub struct WriterResources {
     memory_limit: u64,
     temp_dir: Option<PathBuf>,
     budget: Arc<MemoryBudget>,
+    spool_budget: Option<Arc<SpoolBudget>>,
     cancellation: Option<WriteCancellation>,
 }
 
@@ -163,8 +165,31 @@ impl WriterResources {
             memory_limit,
             temp_dir: None,
             budget: Arc::new(MemoryBudget::new(memory_limit)),
+            spool_budget: None,
             cancellation: None,
         }
+    }
+
+    /// Cap the sum of live logical spool lengths, including reserved growth.
+    /// Native spools use files; bare-WASM spools use memory. This does not cap
+    /// filesystem allocation, Vec capacity, codec workspace or final output.
+    /// Zero allows empty spools only. Growth fails immediately rather than waiting.
+    ///
+    /// Configuring this creates a fresh quota group; subsequent clones share it.
+    /// Configure before dispatching work. Parking a spool or returning from a
+    /// write does not release storage still owned by an EntrySource or reader.
+    /// Failed native cleanup retains its charge conservatively in this group.
+    pub fn with_max_spool_bytes(mut self, limit: u64) -> Self {
+        self.spool_budget = Some(Arc::new(SpoolBudget {
+            limit,
+            used: Mutex::new(0),
+        }));
+        self
+    }
+
+    /// The optional logical spool quota, independent of `memory_limit()`.
+    pub fn max_spool_bytes(&self) -> Option<u64> {
+        self.spool_budget.as_ref().map(|budget| budget.limit)
     }
 
     /// Place temporary spools in this existing directory (default: the current
@@ -252,6 +277,62 @@ impl WriterResources {
     }
 }
 
+/// Live storage and reservations share one ledger across resource clones.
+/// No waiter can make progress by waiting for spools it must itself retain.
+#[derive(Debug)]
+struct SpoolBudget {
+    limit: u64,
+    used: Mutex<u64>,
+}
+
+struct SpoolCharge {
+    budget: Arc<SpoolBudget>,
+    bytes: u64,
+}
+
+impl SpoolCharge {
+    fn new(resources: &WriterResources) -> Option<Self> {
+        resources.spool_budget.as_ref().map(|budget| Self {
+            budget: budget.clone(),
+            bytes: 0,
+        })
+    }
+
+    fn grow_to(&mut self, bytes: u64) -> Result<()> {
+        let growth = bytes.saturating_sub(self.bytes);
+        if growth == 0 {
+            return Ok(());
+        }
+        let mut used = self.budget.used.lock().expect("spool budget lock poisoned");
+        let required = used.checked_add(growth);
+        if required.is_none_or(|required| required > self.budget.limit) {
+            return Err(Error::WriterSpoolLimitExceeded {
+                limit: self.budget.limit,
+                required: required.unwrap_or(u64::MAX),
+                used: *used,
+            });
+        }
+        *used = required.unwrap();
+        self.bytes = bytes;
+        Ok(())
+    }
+
+    fn shrink_to(&mut self, bytes: u64) {
+        let released = self.bytes - bytes;
+        if released != 0 {
+            let mut used = self.budget.used.lock().expect("spool budget lock poisoned");
+            *used -= released;
+            self.bytes = bytes;
+        }
+    }
+}
+
+impl Drop for SpoolCharge {
+    fn drop(&mut self) {
+        self.shrink_to(0);
+    }
+}
+
 #[derive(Debug)]
 struct MemoryBudget {
     limit: u64,
@@ -310,8 +391,8 @@ static SPOOL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// A file on every real platform, which is the point: the RAR 5 writer spools
 /// so that a member larger than the memory budget still gets written. Bare
 /// WebAssembly has no filesystem, so there it is a buffer, and the budget stops
-/// being a promise the writer can keep. Nothing else changes, because both
-/// types are `Read + Write + Seek`.
+/// covering their retained storage. The optional logical spool quota applies
+/// to both backends, independently of Vec capacity. Both are `Read + Write + Seek`.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 type SpoolStore = File;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -326,6 +407,7 @@ pub(crate) struct Spool {
     file: Option<SpoolStore>,
     len: u64,
     pos: u64,
+    charge: Option<SpoolCharge>,
 }
 
 impl Spool {
@@ -354,6 +436,7 @@ impl Spool {
                         file: Some(file),
                         len: 0,
                         pos: 0,
+                        charge: SpoolCharge::new(resources),
                     })
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -368,12 +451,13 @@ impl Spool {
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-    pub(crate) fn create(_resources: &WriterResources) -> Result<Self> {
+    pub(crate) fn create(resources: &WriterResources) -> Result<Self> {
         SPOOL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             file: Some(Cursor::new(Vec::new())),
             len: 0,
             pos: 0,
+            charge: SpoolCharge::new(resources),
         })
     }
 
@@ -451,12 +535,45 @@ impl Spool {
     }
 }
 
+impl Spool {
+    // Keep reservation/reconciliation identical for native and memory stores.
+    // The operation also permits deterministic short-write regression tests.
+    fn write_with(
+        &mut self,
+        buffer: &[u8],
+        write: impl FnOnce(&mut SpoolStore, &[u8]) -> std::io::Result<usize>,
+    ) -> std::io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        let end = self.pos.checked_add(buffer.len() as u64).ok_or_else(|| {
+            std::io::Error::other(Error::InvalidArgument("spool length overflows u64"))
+        })?;
+        if let Some(charge) = &mut self.charge {
+            charge
+                .grow_to(self.len.max(end))
+                .map_err(std::io::Error::other)?;
+        }
+        // Keep the reservation while the backing store grows. Release only the
+        // unwritten allowance on errors or short writes; overwrites cost nothing.
+        let result = self.file().and_then(|file| write(file, buffer));
+        match result {
+            Ok(written) if written != 0 => {
+                self.pos += written as u64;
+                self.len = self.len.max(self.pos);
+            }
+            _ => {}
+        }
+        if let Some(charge) = &mut self.charge {
+            charge.shrink_to(self.len);
+        }
+        result
+    }
+}
+
 impl Write for Spool {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        let written = self.file()?.write(buffer)?;
-        self.pos = self.pos.saturating_add(written as u64);
-        self.len = self.len.max(self.pos);
-        Ok(written)
+        self.write_with(buffer, |file, bytes| file.write(bytes))
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -513,11 +630,19 @@ impl Seek for Spool {
     }
 }
 
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 impl Drop for Spool {
     fn drop(&mut self) {
         self.file = None;
-        let _ = std::fs::remove_file(&self.path);
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        if let Err(error) = std::fs::remove_file(&self.path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                // The backing file may still occupy storage. Keep that debt in
+                // the shared quota group instead of admitting replacement bytes.
+                if let Some(charge) = &mut self.charge {
+                    charge.bytes = 0;
+                }
+            }
+        }
     }
 }
 
@@ -536,6 +661,242 @@ impl Drop for MemoryPermit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn spool_used(resources: &WriterResources) -> u64 {
+        *resources
+            .spool_budget
+            .as_ref()
+            .unwrap()
+            .used
+            .lock()
+            .unwrap()
+    }
+
+    #[test]
+    fn spool_reservations_refuse_arithmetic_overflow() {
+        let resources = WriterResources::default().with_max_spool_bytes(u64::MAX);
+        let mut first = SpoolCharge::new(&resources).unwrap();
+        let mut second = SpoolCharge::new(&resources).unwrap();
+        first.grow_to(u64::MAX).unwrap();
+        assert_eq!(
+            second.grow_to(1).unwrap_err(),
+            Error::WriterSpoolLimitExceeded {
+                limit: u64::MAX,
+                required: u64::MAX,
+                used: u64::MAX,
+            }
+        );
+        drop(first);
+        second.grow_to(1).unwrap();
+        assert_eq!(spool_used(&resources), 1);
+    }
+
+    #[test]
+    fn spool_quota_counts_live_extents_across_parking_and_overwrites() {
+        let root = crate::scratch::case("spool-quota-extents");
+        let resources = WriterResources::default()
+            .with_temp_dir(&*root)
+            .with_max_spool_bytes(10);
+        let mut first = Spool::create(&resources).unwrap();
+        first.write_all(b"abcdef").unwrap();
+        first.park();
+        let mut second = Spool::create(&resources.clone()).unwrap();
+        second.write_all(b"1234").unwrap();
+        assert_eq!(spool_used(&resources), 10);
+        let error = Error::from(second.write(b"x").unwrap_err());
+        assert_eq!(
+            error,
+            Error::WriterSpoolLimitExceeded {
+                limit: 10,
+                required: 11,
+                used: 10
+            }
+        );
+        assert_eq!(second.len(), 4);
+        first.seek_to(1).unwrap();
+        first.write_all(b"XY").unwrap();
+        assert_eq!(spool_used(&resources), 10);
+        drop(second);
+        assert_eq!(spool_used(&resources), 6);
+        first.seek_to(9).unwrap();
+        assert_eq!(spool_used(&resources), 6);
+        first.write_all(b"Z").unwrap(); // charge the hole as well
+        assert_eq!(spool_used(&resources), 10);
+        let mut bytes = Vec::new();
+        first.copy_to(&mut bytes).unwrap();
+        assert_eq!(bytes, b"aXYdef\0\0\0Z");
+        drop(first);
+        assert_eq!(spool_used(&resources), 0);
+    }
+
+    #[test]
+    fn spool_short_writes_hold_then_reconcile_the_growth_reservation() {
+        let root = crate::scratch::case("spool-quota-short-write");
+        let resources = WriterResources::default()
+            .with_temp_dir(&*root)
+            .with_max_spool_bytes(10);
+        let mut spool = Spool::create(&resources).unwrap();
+        let written = spool
+            .write_with(b"0123456789", |file, bytes| {
+                assert_eq!(spool_used(&resources), 10);
+                file.write(&bytes[..3])
+            })
+            .unwrap();
+        assert_eq!(written, 3);
+        assert_eq!(spool.len(), 3);
+        assert_eq!(spool_used(&resources), 3);
+        spool.seek_to(9).unwrap();
+        assert_eq!(
+            spool
+                .write_with(b"x", |_, _| {
+                    assert_eq!(spool_used(&resources), 10);
+                    Ok(0)
+                })
+                .unwrap(),
+            0
+        );
+        assert_eq!(spool.len(), 3);
+        assert_eq!(spool_used(&resources), 3);
+        assert!(spool
+            .write_with(b"xx", |_, _| panic!("refusal must precede backing I/O"))
+            .is_err());
+        assert_eq!(spool_used(&resources), 3);
+    }
+
+    #[test]
+    fn spool_zero_limit_allows_empty_writes_but_no_growth() {
+        let root = crate::scratch::case("spool-quota-zero");
+        let resources = WriterResources::default()
+            .with_temp_dir(&*root)
+            .with_max_spool_bytes(0);
+        let mut spool = Spool::create(&resources).unwrap();
+        spool.seek_to(100).unwrap();
+        assert_eq!(spool.write(b"").unwrap(), 0);
+        assert_eq!(spool.len(), 0);
+        assert_eq!(spool_used(&resources), 0);
+        assert!(matches!(
+            Error::from(spool.write(b"x").unwrap_err()),
+            Error::WriterSpoolLimitExceeded {
+                limit: 0,
+                required: 101,
+                used: 0
+            }
+        ));
+        assert_eq!(spool.len(), 0);
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[test]
+    fn failed_backing_write_releases_only_its_reservation() {
+        let root = crate::scratch::case("spool-quota-io");
+        let resources = WriterResources::default()
+            .with_temp_dir(&*root)
+            .with_max_spool_bytes(10);
+        let mut spool = Spool::create(&resources).unwrap();
+        spool.write_all(b"abc").unwrap();
+        spool.park();
+        let mut read_only = File::open(&spool.path).unwrap();
+        read_only.seek(SeekFrom::Start(3)).unwrap();
+        spool.file = Some(read_only);
+        assert!(spool.write_all(b"1234567").is_err());
+        assert_eq!(spool_used(&resources), 3);
+        assert_eq!(spool.len(), 3);
+        spool.park();
+        spool.write_all(b"1234567").unwrap();
+        assert_eq!(spool_used(&resources), 10);
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[test]
+    fn spool_sources_and_readers_retain_their_charge() {
+        let root = crate::scratch::case("spool-quota-source");
+        let resources = WriterResources::default()
+            .with_temp_dir(&*root)
+            .with_max_spool_bytes(3);
+        let mut spool = Spool::create(&resources).unwrap();
+        spool.write_all(b"abc").unwrap();
+        let source = spool.into_source();
+        let mut reader = source.open().unwrap();
+        drop(source);
+        assert_eq!(spool_used(&resources), 3);
+        let mut another = Spool::create(&resources).unwrap();
+        assert!(another.write(b"x").is_err());
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"abc");
+        drop(reader);
+        another.write_all(b"xyz").unwrap();
+        assert_eq!(spool_used(&resources), 3);
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[test]
+    fn concurrent_spool_growth_cannot_overbook_shared_resources() {
+        let root = crate::scratch::case("spool-quota-concurrent");
+        let resources = WriterResources::default()
+            .with_temp_dir(&*root)
+            .with_max_spool_bytes(10);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let tx = tx.clone();
+                let resources = resources.clone();
+                scope.spawn(move || {
+                    let mut spool = Spool::create(&resources).unwrap();
+                    let result = spool.write_all(b"1234567").map_err(Error::from);
+                    tx.send((spool, result)).unwrap();
+                });
+            }
+        });
+        drop(tx);
+        let outcomes: Vec<_> = rx.into_iter().collect();
+        assert_eq!(
+            outcomes.iter().filter(|(_, result)| result.is_ok()).count(),
+            1
+        );
+        assert_eq!(spool_used(&resources), 7);
+        for (_, result) in &outcomes {
+            if let Err(error) = result {
+                assert_eq!(error.kind(), crate::ErrorKind::ResourceLimit);
+            }
+        }
+        drop(outcomes);
+        assert_eq!(spool_used(&resources), 0);
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[test]
+    fn spool_cleanup_failure_retains_debt_in_the_quota_group() {
+        let root = crate::scratch::case("spool-quota-cleanup");
+        let resources = WriterResources::default()
+            .with_temp_dir(&*root)
+            .with_max_spool_bytes(3);
+        let mut spool = Spool::create(&resources).unwrap();
+        spool.write_all(b"abc").unwrap();
+        spool.park();
+        let original = spool.path.clone();
+        // Force removal to fail without relying on root/Windows permissions.
+        std::fs::rename(&original, root.join("orphan")).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        drop(spool);
+        assert_eq!(spool_used(&resources), 3);
+        let mut another = Spool::create(&resources).unwrap();
+        assert!(another.write_all(b"x").is_err());
+    }
+
+    #[test]
+    fn spool_quota_is_released_on_unwind() {
+        let root = crate::scratch::case("spool-quota-unwind");
+        let resources = WriterResources::default()
+            .with_temp_dir(&*root)
+            .with_max_spool_bytes(3);
+        let result = std::panic::catch_unwind(|| {
+            let mut spool = Spool::create(&resources).unwrap();
+            spool.write_all(b"abc").unwrap();
+            panic!("injected unwind");
+        });
+        assert!(result.is_err());
+        assert_eq!(spool_used(&resources), 0);
+    }
 
     #[test]
     fn byte_sources_are_rewindable_without_copying() {

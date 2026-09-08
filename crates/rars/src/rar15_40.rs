@@ -723,6 +723,7 @@ impl FileHeader {
             | Error::Rar50DictionaryLimitExceeded { .. }
             | Error::Rar50BufferedDecodeLimitExceeded { .. }
             | Error::MemoryLimitExceeded { .. }
+            | Error::WriterSpoolLimitExceeded { .. }
             | Error::Rar50ScratchLimitExceeded { .. }
             | Error::RewriteStagingLimitExceeded { .. }
             | Error::Rar50FilterMemoryLimitExceeded { .. }
