@@ -92,7 +92,7 @@ counts live plaintext payloads separately from these writer allocations.
 | Packed member spools | Retained through preparation and emission. Native builds use temporary files; parked spools release file handles. An optional shared spool quota counts live logical file lengths. |
 | Bare-WASM spools | Default cursors retain packed bytes beyond active-job permits. The logical spool quota bounds lengths. An optional memory quota selects fixed blocks and charges payload and index capacity, including padding and index replacement peaks; other RAM remains separate. |
 | Prepared headers, member/service records and inline payloads | Retained for archive construction. Comment and service data can be allocated in memory. |
-| Quick-open payload | Built in a `Vec` from cached headers, separately from codec workspace. Its size grows with the indexed headers. |
+| Quick-open payload | Built in a spool from borrowed cached headers, with stack framing and incremental checksums. Logical spool limits cover it on all targets; the memory spool quota also covers its payload and index capacity on bare WASM. |
 | Encryption | Single-archive member data is encrypted during emission in chunks. Volume preparation writes ciphertext into an additional spool before splitting. Keys, cipher state, padded headers and inline encrypted services also allocate storage. |
 | Recovery | Emitted prefix bytes are mirrored to a spool. Recovery chooses resident or striped workspace and acquires a permit; striped mode adds scratch storage, and the recovery payload has its own spool. |
 | Output collectors | `to_bytes` retains the final archive. `CollectedVolumes` retains all volume buffers; a caller-provided `VolumeSink` can release parts independently. |

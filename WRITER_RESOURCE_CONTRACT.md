@@ -16,8 +16,8 @@ builder.write_to(&mut output, &resources, None)?;
 `max_spool_bytes` caps the sum of logical lengths of spools created using this
 resource group, plus reserved growth that has not yet completed. It covers
 packed-member spools, volume bodies, encryption copies, recovery prefix mirrors,
-recovery payloads and striped recovery scratch using that group. All coexistence
-counts: preparing a ciphertext spool does not release the plaintext spool's
+recovery payloads, quick-open indexes and striped recovery scratch using that
+group. All coexistence counts: preparing a ciphertext spool does not release the plaintext spool's
 charge until the plaintext storage is dropped.
 
 On native targets these are file lengths, including holes. On bare WASM they
@@ -100,6 +100,9 @@ Logical length and payload capacity remain independent limits. If logical
 growth is admitted but capacity growth is refused, the outer spool releases
 the unwritten logical reservation. Neither limit changes compression settings.
 The block representation is selected only when a memory quota is configured.
+Quick-open indexes are prepared in spools without whole-index or per-header
+payload copies. Their preparation can refuse a storage quota before emission;
+native output with quick-open enabled now needs temporary spool storage.
 
 ## Contract for a future managed-memory ceiling
 

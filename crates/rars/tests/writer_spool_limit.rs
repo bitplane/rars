@@ -264,3 +264,67 @@ fn native_file_spools_do_not_consume_the_memory_payload_quota() {
     );
     assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
 }
+
+#[test]
+fn quick_open_payload_obeys_exact_spool_limit_and_cleans_up() {
+    let root = scratch::case("writer-spool-quick-open");
+    for target in [ArchiveVersion::Rar50, ArchiveVersion::Rar70] {
+        let mut builder = Builder::new(target)
+            .store(true)
+            .comment(Some(b"indexed comment".to_vec()))
+            .archive_metadata(None, false, true)
+            .unwrap();
+        for index in 0..32 {
+            builder
+                .add_bytes(
+                    format!("member-{index}").into_bytes(),
+                    vec![42; 16],
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        let resources = WriterResources::default().with_temp_dir(&*root);
+        let mut expected = Vec::new();
+        builder.write_to(&mut expected, &resources, None).unwrap();
+        let archive = ArchiveReader::read(&expected).unwrap();
+        let size = archive
+            .as_rar50()
+            .unwrap()
+            .services()
+            .find(|service| service.name == b"QO")
+            .unwrap()
+            .packed_size();
+        assert!(size > 0);
+        let limited = resources.clone().with_max_spool_bytes(size - 1);
+        let mut output = Vec::new();
+        let error = builder.write_to(&mut output, &limited, None).unwrap_err();
+        assert!(matches!(
+            error.root_cause(),
+            Error::WriterSpoolLimitExceeded { .. }
+        ));
+        assert!(output.is_empty(), "quick-open is prepared before emission");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        let exact = resources.with_max_spool_bytes(size);
+        for _ in 0..2 {
+            output.clear();
+            builder.write_to(&mut output, &exact, None).unwrap();
+            assert_eq!(output, expected);
+            ArchiveReader::read(&output).unwrap().test(None).unwrap();
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        }
+        let recovery = builder.recovery_percent(Some(10));
+        let mut recovered = Vec::new();
+        recovery
+            .write_to(
+                &mut recovered,
+                &WriterResources::default()
+                    .with_temp_dir(&*root)
+                    .with_max_spool_bytes(1 << 20),
+                None,
+            )
+            .unwrap();
+        ArchiveReader::read(&recovered).unwrap().test(None).unwrap();
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    }
+}

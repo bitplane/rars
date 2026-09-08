@@ -1,10 +1,11 @@
 //! Assembling a RAR 5 archive from prepared payloads.
 //!
 //! Native member spools use temporary files; bare-WASM spools retain bytes in
-//! memory. Compression may load whole members, and headers, inline services
-//! and quick-open data also allocate memory. Once block lengths are known,
-//! final archive output streams in one pass. The workspace admission budget
-//! is not an aggregate RAM or disk quota; see WRITER_EXECUTION.md in the repo.
+//! memory. Compression may load whole members; headers and inline services
+//! also allocate memory. Quick-open data uses a quota-controlled spool. Once
+//! block lengths are known, final archive output streams in one pass. The
+//! workspace admission budget is not an aggregate RAM or disk quota; see
+//! WRITER_EXECUTION.md in the repo.
 //!
 //! Stored payloads are reread and verified during emission. Recovery requires
 //! a further pass over the preceding archive bytes, mirrored into a spool.
@@ -248,15 +249,37 @@ pub(super) fn write_archive(
     // quick-open block itself. Both move together when the prefix grows, so
     // the distances only need positions within the body.
     let quick_open_payload = if plan.quick_open {
-        let mut payload = Vec::new();
+        let mut payload = Spool::create(resources)?;
+        let mut checksum = crate::crc32::Crc32::new();
         let mut offset = 0u64;
         for block in &blocks {
+            check_cancelled(plan.progress)?;
             if block.quick_open_cached {
-                append_quick_open_entry(&mut payload, body_len - offset, &block.header)?;
+                append_quick_open_entry(
+                    &mut payload,
+                    &mut checksum,
+                    body_len - offset,
+                    &block.header,
+                )?;
             }
             offset += block.len()?;
         }
-        Some(payload)
+        let payload_len = payload.len();
+        let header = stored_service_header(
+            b"QO",
+            payload_len,
+            checksum.finish(),
+            &[],
+            header_keys.as_ref(),
+        )?;
+        payload.park();
+        Some(PreparedBlock {
+            header,
+            payload: Payload::Packed(payload),
+            payload_len,
+            quick_open_cached: false,
+            entry_index: None,
+        })
     } else {
         None
     };
@@ -290,9 +313,7 @@ pub(super) fn write_archive(
         archive_metadata: plan.archive_metadata,
         metadata_record: plan.metadata_record,
         body_len,
-        quick_open_payload_len: quick_open_payload
-            .as_ref()
-            .map(|payload| payload.len() as u64),
+        quick_open_payload_len: quick_open_payload.as_ref().map(|block| block.payload_len),
         recovery_percent: plan.recovery_percent,
     })?;
 
@@ -342,8 +363,7 @@ pub(super) fn write_archive(
             })?;
         }
 
-        if let Some(payload) = &quick_open_payload {
-            let block = stored_service_block(b"QO", payload, &[], header_keys.as_ref())?;
+        if let Some(block) = quick_open_payload {
             sink.write_all(&block.header)?;
             write_payload(block.payload, &mut sink, resources, plan.progress)?;
         }
@@ -399,19 +419,51 @@ pub(super) fn write_archive(
 /// alone costs nothing visible: readers reject the wrapper, fall back to
 /// walking the block chain, and report the archive as fine while the index
 /// they were handed goes unused.
-fn append_quick_open_entry(payload: &mut Vec<u8>, distance: u64, header: &[u8]) -> Result<()> {
-    let mut body = Vec::new();
-    write_vint(&mut body, 0);
-    write_vint(&mut body, distance);
-    write_vint(&mut body, header.len() as u64);
-    body.extend_from_slice(header);
-
-    let mut framed = Vec::new();
-    write_vint(&mut framed, body.len() as u64);
-    framed.extend_from_slice(&body);
-
-    payload.extend_from_slice(&crate::crc32::crc32(&framed).to_le_bytes());
-    payload.extend_from_slice(&framed);
+fn append_quick_open_entry(
+    payload: &mut dyn Write,
+    payload_crc: &mut crate::crc32::Crc32,
+    distance: u64,
+    header: &[u8],
+) -> Result<()> {
+    // At most three u64 vints. Keep framing on the stack and borrow the header
+    // instead of cloning it into body and wrapper buffers.
+    fn vint(out: &mut [u8], mut value: u64) -> usize {
+        let mut len = 0;
+        loop {
+            out[len] = (value as u8 & 0x7f) | if value >= 0x80 { 0x80 } else { 0 };
+            len += 1;
+            value >>= 7;
+            if value == 0 {
+                return len;
+            }
+        }
+    }
+    let mut body_prefix = [0; 21];
+    let mut len = 1; // Flags = 0.
+    len += vint(&mut body_prefix[len..], distance);
+    len += vint(&mut body_prefix[len..], header.len() as u64);
+    let body_len = (header.len() as u64)
+        .checked_add(len as u64)
+        .ok_or(Error::InvalidArgument(
+            "RAR 5 quick-open record size overflows",
+        ))?;
+    let mut size = [0; 10];
+    let size_len = vint(&mut size, body_len);
+    let parts = [&size[..size_len], &body_prefix[..len], header];
+    let mut crc = crate::crc32::Crc32::new();
+    for part in parts {
+        crc.update(part);
+    }
+    // Combine the small framing fields into one write to the native spool.
+    let mut framing = [0; 35];
+    framing[..4].copy_from_slice(&crc.finish().to_le_bytes());
+    framing[4..4 + size_len].copy_from_slice(&size[..size_len]);
+    let framing_len = 4 + size_len + len;
+    framing[4 + size_len..framing_len].copy_from_slice(&body_prefix[..len]);
+    for part in [&framing[..framing_len], header] {
+        payload.write_all(part)?;
+        payload_crc.update(part);
+    }
     Ok(())
 }
 
@@ -423,41 +475,49 @@ fn stored_service_block(
     service_data: &[u8],
     header_keys: Option<&HeaderEncryptionKeys>,
 ) -> Result<PreparedBlock> {
-    let mut extra = Vec::new();
-    write_extra_record(&mut extra, FHEXTRA_SUBDATA, service_data);
-    let specific = stored_file_specific(
-        name,
-        data.len() as u64,
-        Some(crate::crc32::crc32(data)),
-        0,
-        None,
-        0,
-    )?;
-    let header = match header_keys {
-        Some(keys) => encrypted_header_block(
-            &keys.keys,
-            HEAD_SERVICE,
-            HFL_EXTRA | HFL_DATA,
-            Some(data.len() as u64),
-            &specific,
-            &extra,
-            &[],
-        )?,
-        None => block_header_image(
-            HEAD_SERVICE,
-            HFL_EXTRA | HFL_DATA,
-            Some(data.len() as u64),
-            &specific,
-            &extra,
-        )?,
-    };
     Ok(PreparedBlock {
-        header,
+        header: stored_service_header(
+            name,
+            data.len() as u64,
+            crate::crc32::crc32(data),
+            service_data,
+            header_keys,
+        )?,
         payload: Payload::Inline(data.to_vec()),
         payload_len: data.len() as u64,
         quick_open_cached: false,
         entry_index: None,
     })
+}
+
+fn stored_service_header(
+    name: &[u8],
+    data_len: u64,
+    crc32: u32,
+    service_data: &[u8],
+    header_keys: Option<&HeaderEncryptionKeys>,
+) -> Result<Vec<u8>> {
+    let mut extra = Vec::new();
+    write_extra_record(&mut extra, FHEXTRA_SUBDATA, service_data);
+    let specific = stored_file_specific(name, data_len, Some(crc32), 0, None, 0)?;
+    match header_keys {
+        Some(keys) => encrypted_header_block(
+            &keys.keys,
+            HEAD_SERVICE,
+            HFL_EXTRA | HFL_DATA,
+            Some(data_len),
+            &specific,
+            &extra,
+            &[],
+        ),
+        None => block_header_image(
+            HEAD_SERVICE,
+            HFL_EXTRA | HFL_DATA,
+            Some(data_len),
+            &specific,
+            &extra,
+        ),
+    }
 }
 
 fn prepare_comment(
@@ -1545,5 +1605,34 @@ fn member_error(error: Error, name: &[u8], operation: &'static str) -> Error {
         error
     } else {
         error.at_entry(name.to_vec(), operation)
+    }
+}
+
+#[cfg(test)]
+mod quick_open_tests {
+    use super::*;
+
+    #[test]
+    fn streamed_records_match_buffered_encoding_at_vint_boundaries() {
+        for distance in [0, 127, 128, 16383, 16384, u64::MAX] {
+            for size in [0, 1, 123, 127, 128, 16383, 16384] {
+                let header = vec![0xa5; size];
+                let mut body = Vec::new();
+                write_vint(&mut body, 0);
+                write_vint(&mut body, distance);
+                write_vint(&mut body, size as u64);
+                body.extend_from_slice(&header);
+                let mut framed = Vec::new();
+                write_vint(&mut framed, body.len() as u64);
+                framed.extend_from_slice(&body);
+                let mut expected = crate::crc32::crc32(&framed).to_le_bytes().to_vec();
+                expected.extend_from_slice(&framed);
+                let mut actual = Vec::new();
+                let mut crc = crate::crc32::Crc32::new();
+                append_quick_open_entry(&mut actual, &mut crc, distance, &header).unwrap();
+                assert_eq!(actual, expected);
+                assert_eq!(crc.finish(), crate::crc32::crc32(&actual));
+            }
+        }
     }
 }
