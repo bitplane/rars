@@ -60,11 +60,39 @@ Failure may leave a prefix in a caller-provided output sink. The quota does not
 change publication guarantees. Empty-file counts and filesystem metadata are
 not bounded by a byte quota.
 
-This first control is available through Rust `WriterResources` entry points.
+These controls are available through Rust `WriterResources` entry points.
 CLI, Python and npm writer-resource options remain separate integration work;
 their default writer entry points do not acquire a spool limit automatically.
 Rewrite staging and reader scratch created with their own resource policies
 remain outside this group.
+
+## Available quota: memory-spool payload capacity
+
+`WriterResources::with_max_spool_memory_bytes(limit)` separately caps the shared
+payload allocation capacity of bare-WASM spools. Native file-backed spools have
+no charge against this memory quota. Its default is unlimited and retains the
+existing `Cursor<Vec<u8>>` backend.
+
+When configured, a memory spool uses fixed 4096-byte boxed blocks. It reserves
+the complete required capacity before allocating blocks, including padding in
+the last block and zero-filled seek holes. A one-byte payload therefore consumes
+4096 bytes of allowance. The block index may grow without moving or duplicating
+the payload allocations. Its own storage and allocator overhead are outside
+this quota; so are codec workspace, services, headers and output collectors.
+This is a spool **payload-capacity** ceiling, not a complete spool-memory,
+managed-memory or process-RAM ceiling.
+
+Resource clones share the capacity ledger. Parking, rewinding and overwriting
+do not free blocks or their charge. Payload blocks are freed before their charge
+is released on drop. A failed capacity admission leaves existing contents and
+capacity unchanged. Zero allows empty memory spools only. An insufficient limit
+returns `WriterSpoolMemoryLimitExceeded` with `RESOURCE_LIMIT` and the same
+`limit`, `required` and `used` fields as the logical-storage error.
+
+Logical length and payload capacity remain independent limits. If logical
+growth is admitted but capacity growth is refused, the outer spool releases
+the unwritten logical reservation. Neither limit changes compression settings.
+The block representation is selected only when a memory quota is configured.
 
 ## Contract for a future managed-memory ceiling
 
@@ -105,10 +133,11 @@ archive version, dictionary, filters, encryption or preservation semantics.
 
 ## Remaining implementation boundaries
 
-Next, account retained memory by capacity and connect workspace allocation
-allowances to coordinator admission. Then integrate output collectors and expose
-the enforceable policies consistently through the high-level entry points and
-bindings. Reader resource accounting is a separate follow-up.
+Next, extend capacity accounting to spool indexes and other retained allocations,
+and connect workspace allocation allowances to coordinator admission. Then
+integrate output collectors and expose the enforceable policies consistently
+through the high-level entry points and bindings. Reader resource accounting is
+a separate follow-up.
 
 For changes to planning or execution selection, check byte output, compression
 ratio, CPU and peak RAM across stored, compressed, solid, filtered, encrypted and

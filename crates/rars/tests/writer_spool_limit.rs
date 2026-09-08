@@ -237,3 +237,30 @@ fn cancellation_after_preparation_releases_retained_spools() {
     assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
     builder.write_to(&mut Vec::new(), &resources, None).unwrap();
 }
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[test]
+fn native_file_spools_do_not_consume_the_memory_payload_quota() {
+    let root = scratch::case("writer-spool-native-memory");
+    let resources = WriterResources::default()
+        .with_temp_dir(&*root)
+        .with_max_spool_memory_bytes(0)
+        .with_max_spool_bytes(1 << 20);
+    assert_eq!(resources.max_spool_memory_bytes(), Some(0));
+    assert_eq!(resources.max_spool_bytes(), Some(1 << 20));
+    let mut builder = Builder::new(ArchiveVersion::Rar50);
+    builder
+        .add_bytes(b"member".to_vec(), vec![42; 16384], None, None)
+        .unwrap();
+    let mut output = Vec::new();
+    builder.write_to(&mut output, &resources, None).unwrap();
+    assert_eq!(
+        ArchiveReader::read_owned(output)
+            .unwrap()
+            .read_member(b"member", None)
+            .unwrap()
+            .unwrap(),
+        vec![42; 16384]
+    );
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+}

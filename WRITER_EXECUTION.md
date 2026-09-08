@@ -6,6 +6,8 @@ hard ceiling on process RAM, retained archive data or temporary disk use.
 `WriterResources::with_max_spool_bytes` separately limits live logical spool
 contents. Its scope and the next accounting steps are defined in the
 [resource contract](WRITER_RESOURCE_CONTRACT.md).
+`with_max_spool_memory_bytes` additionally bounds bare-WASM spool payload
+capacity using fixed blocks; it does not include block indexes or other memory.
 
 ## Entry points and planning
 
@@ -88,7 +90,7 @@ counts live plaintext payloads separately from these writer allocations.
 | --- | --- |
 | Caller input buffers and queued source descriptors | Owned by the caller or builder; not charged as compression workspace. |
 | Packed member spools | Retained through preparation and emission. Native builds use temporary files; parked spools release file handles. An optional shared spool quota counts live logical file lengths. |
-| Bare-WASM spools | In-memory cursors retain packed bytes beyond active-job permits. The spool quota bounds their logical lengths, but not spare capacity or total RAM. |
+| Bare-WASM spools | Default cursors retain packed bytes beyond active-job permits. The logical spool quota bounds lengths. An optional memory quota selects fixed blocks and charges payload capacity, including padding; block indexes and other RAM remain separate. |
 | Prepared headers, member/service records and inline payloads | Retained for archive construction. Comment and service data can be allocated in memory. |
 | Quick-open payload | Built in a `Vec` from cached headers, separately from codec workspace. Its size grows with the indexed headers. |
 | Encryption | Single-archive member data is encrypted during emission in chunks. Volume preparation writes ciphertext into an additional spool before splitting. Keys, cipher state, padded headers and inline encrypted services also allocate storage. |

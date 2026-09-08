@@ -131,7 +131,12 @@ fn js_error(error: rars_rs::Error) -> JsValue {
                 &dictionary_size.to_string().into(),
             );
         }
-        rars_rs::Error::WriterSpoolLimitExceeded {
+        rars_rs::Error::WriterSpoolMemoryLimitExceeded {
+            limit,
+            required,
+            used,
+        }
+        | rars_rs::Error::WriterSpoolLimitExceeded {
             limit,
             required,
             used,

@@ -1,4 +1,6 @@
 use crate::{Error, Result};
+#[cfg(any(test, all(target_arch = "wasm32", target_os = "unknown")))]
+mod memory_spool;
 use std::fmt;
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
@@ -144,12 +146,14 @@ impl WriteCancellation {
 /// The workspace limit is not a total process-RAM or temporary-disk quota. On bare
 /// WebAssembly (`wasm32-unknown-unknown`), spools stay in memory and their retained
 /// payloads are additional to this limit. `with_max_spool_bytes` separately caps
-/// logical spool contents on both backends.
+/// logical spool contents on both backends. `with_max_spool_memory_bytes` caps
+/// bare-WASM spool payload capacity, excluding index storage and other memory.
 pub struct WriterResources {
     memory_limit: u64,
     temp_dir: Option<PathBuf>,
     budget: Arc<MemoryBudget>,
     spool_budget: Option<Arc<SpoolBudget>>,
+    spool_memory_budget: Option<Arc<SpoolBudget>>,
     cancellation: Option<WriteCancellation>,
 }
 
@@ -166,6 +170,7 @@ impl WriterResources {
             temp_dir: None,
             budget: Arc::new(MemoryBudget::new(memory_limit)),
             spool_budget: None,
+            spool_memory_budget: None,
             cancellation: None,
         }
     }
@@ -181,6 +186,7 @@ impl WriterResources {
     /// Failed native cleanup retains its charge conservatively in this group.
     pub fn with_max_spool_bytes(mut self, limit: u64) -> Self {
         self.spool_budget = Some(Arc::new(SpoolBudget {
+            resource: SpoolResource::LogicalBytes,
             limit,
             used: Mutex::new(0),
         }));
@@ -190,6 +196,29 @@ impl WriterResources {
     /// The optional logical spool quota, independent of `memory_limit()`.
     pub fn max_spool_bytes(&self) -> Option<u64> {
         self.spool_budget.as_ref().map(|budget| budget.limit)
+    }
+
+    /// Cap shared in-memory spool payload capacity on bare WASM. Bounded spools
+    /// allocate zeroed 4096-byte blocks, charged before allocation. Directory
+    /// storage, allocator overhead, codec workspace and output are not included.
+    /// This is not an aggregate managed-memory or process-RAM ceiling.
+    ///
+    /// Native file spools have no in-memory payload charge. The default remains
+    /// an unbounded Vec backend on WASM; zero permits only empty memory spools.
+    /// Configuring creates a fresh group, shared by subsequent resource clones.
+    /// Logical spool lengths remain independently limited by `max_spool_bytes`.
+    pub fn with_max_spool_memory_bytes(mut self, limit: u64) -> Self {
+        self.spool_memory_budget = Some(Arc::new(SpoolBudget {
+            resource: SpoolResource::PayloadMemory,
+            limit,
+            used: Mutex::new(0),
+        }));
+        self
+    }
+
+    /// The optional memory-spool payload-capacity quota.
+    pub fn max_spool_memory_bytes(&self) -> Option<u64> {
+        self.spool_memory_budget.as_ref().map(|budget| budget.limit)
     }
 
     /// Place temporary spools in this existing directory (default: the current
@@ -279,8 +308,15 @@ impl WriterResources {
 
 /// Live storage and reservations share one ledger across resource clones.
 /// No waiter can make progress by waiting for spools it must itself retain.
+#[derive(Debug, Clone, Copy)]
+enum SpoolResource {
+    LogicalBytes,
+    PayloadMemory,
+}
+
 #[derive(Debug)]
 struct SpoolBudget {
+    resource: SpoolResource,
     limit: u64,
     used: Mutex<u64>,
 }
@@ -306,10 +342,18 @@ impl SpoolCharge {
         let mut used = self.budget.used.lock().expect("spool budget lock poisoned");
         let required = used.checked_add(growth);
         if required.is_none_or(|required| required > self.budget.limit) {
-            return Err(Error::WriterSpoolLimitExceeded {
-                limit: self.budget.limit,
-                required: required.unwrap_or(u64::MAX),
-                used: *used,
+            let required = required.unwrap_or(u64::MAX);
+            return Err(match self.budget.resource {
+                SpoolResource::LogicalBytes => Error::WriterSpoolLimitExceeded {
+                    limit: self.budget.limit,
+                    required,
+                    used: *used,
+                },
+                SpoolResource::PayloadMemory => Error::WriterSpoolMemoryLimitExceeded {
+                    limit: self.budget.limit,
+                    required,
+                    used: *used,
+                },
             });
         }
         *used = required.unwrap();
@@ -396,7 +440,7 @@ static SPOOL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 type SpoolStore = File;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-type SpoolStore = Cursor<Vec<u8>>;
+type SpoolStore = memory_spool::MemorySpool;
 
 /// Owns a temporary payload until drop; parking releases only its handle.
 /// Writes are unbuffered, so parking requires no flush and preserves the cursor.
@@ -454,7 +498,7 @@ impl Spool {
     pub(crate) fn create(resources: &WriterResources) -> Result<Self> {
         SPOOL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
-            file: Some(Cursor::new(Vec::new())),
+            file: Some(memory_spool::MemorySpool::new(resources)),
             len: 0,
             pos: 0,
             charge: SpoolCharge::new(resources),
