@@ -353,6 +353,7 @@ impl StreamingEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ExtractedEntryMeta {
+    pub name_is_unicode: bool,
     pub name: Vec<u8>,
     pub file_time: u32,
     /// Sub-second detail the DOS `file_time` cannot express, from the extended
@@ -633,6 +634,7 @@ impl FileHeader {
 
     pub fn metadata(&self) -> ExtractedEntryMeta {
         ExtractedEntryMeta {
+            name_is_unicode: self.unicode_name.is_some(),
             name: self.name.clone(),
             file_time: self.file_time,
             mtime_refinement: self.mtime_refinement(),

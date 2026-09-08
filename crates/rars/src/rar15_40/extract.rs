@@ -464,6 +464,7 @@ impl PendingSplitRefs {
     {
         budget.check(final_file.unp_size, &final_file.name)?;
         let meta = ExtractedEntryMeta {
+            name_is_unicode: final_file.unicode_name.is_some(),
             name: self.name.clone(),
             file_time: self.file_time,
             mtime_refinement: self.mtime_refinement,

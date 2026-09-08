@@ -2,8 +2,9 @@
 
 `RarFile`, `RarFile.from_bytes`, member-reading methods, `read_comment`,
 `extract_volumes` and `test_volumes` accept a keyword-only
-`options=rars.ReadOptions(...)` argument. Options apply to that call, not to the
-archive object. Omitting them retains the existing defaults and password handling.
+`options=rars.ReadOptions(...)` argument. Resource and cancellation options apply
+to that call, not to the archive object. Omitting them retains the existing defaults
+and password handling. Filename interpretation is described below.
 
 ```python
 import rars
@@ -78,3 +79,11 @@ These options do not apply to member-comment or link helpers. Repair uses a sepa
 `cancellation=` argument; see [repair cancellation](REPAIRING.md). Passwords remain supplied
 through `pwd=` or the archive's configured password. A per-call password does not
 change the archive's configured password.
+
+## Legacy filename interpretation
+
+`ReadOptions(legacy_name_encoding="cp850")` selects a strict, locale-independent
+name decoder. When supplied to `RarFile`, this name policy is retained for
+listing, string lookup and extraction. Resource limits remain per-call.
+See [filename decoding](../FILENAME_ENCODINGS.md) for encoding choices,
+Unicode precedence, collision handling and preservation semantics.

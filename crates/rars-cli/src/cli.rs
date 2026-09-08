@@ -62,6 +62,9 @@ pub(crate) struct PasswordArgs {
 
 #[derive(Args, Default)]
 pub(crate) struct ReadOptionsArgs {
+    /// Source encoding for legacy names without Unicode (e.g. cp850)
+    #[arg(long, value_name = "ENCODING")]
+    pub legacy_name_encoding: Option<rars::filename::LegacyNameEncoding>,
     /// Maximum RAR 5 filtered member size to buffer while decoding (e.g. 512m, 1g)
     #[arg(long, value_name = "SIZE", value_parser = crate::parse_size_string)]
     pub rar50_buffered_decode_limit: Option<usize>,
@@ -110,6 +113,7 @@ impl ReadOptionsArgs {
         scratch: Option<&'a rars::Rar50Scratch>,
     ) -> rars::ArchiveReadOptions<'a> {
         let mut options = rars::ArchiveReadOptions::with_optional_password(password);
+        options.legacy_name_encoding = self.legacy_name_encoding;
         options.max_header_count = self.max_header_count;
         options.max_header_bytes = self.max_header_bytes.map(|value| value as u64);
         options.max_member_output_bytes = self.max_member_output_bytes.map(|value| value as u64);

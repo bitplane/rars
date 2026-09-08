@@ -1,5 +1,8 @@
 # CLI reader controls
 
+For explicit legacy filename interpretation, use `--legacy-name-encoding`;
+see [filename decoding](FILENAME_ENCODINGS.md).
+
 `info`, `test` and `extract` (`x`) accept the same optional limits:
 
 | Flag | Scope |

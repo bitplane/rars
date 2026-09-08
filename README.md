@@ -60,6 +60,9 @@ and lookup keys retain the encoded archive identity. Use byte names (or Python
 
 Legacy code pages are not guessed. Windows supports Unicode names; extracting
 non-Unicode legacy byte names there still requires caller-selected decoding.
+Use `--legacy-name-encoding cp850` or the corresponding binding option; see
+[legacy filename decoding](FILENAME_ENCODINGS.md) for supported encodings and
+preservation semantics.
 
 ## Writer execution
 

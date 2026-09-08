@@ -30,6 +30,16 @@ the exact header bytes.
 Node also accepts paths and file URLs. Passing the first path of a conventional
 volume set discovers its siblings automatically.
 
+For legacy byte names, pass `legacyNameEncoding: "cp850"` to `open()`.
+Supported encodings are `cp437`, `cp850`, `cp852`, `cp866`, `windows-1251`,
+`windows-1252` and `utf-8` (`cp1251`, `cp1252` and `utf8` are aliases).
+Names are case insensitive. Unicode names take precedence; unspecified legacy
+encodings are never guessed. Invalid or undefined input fails conversion.
+`entry.name` is the selected view and `entry.nameBytes` retains its original
+identity. Reopen to select another encoding. `get()` refuses ambiguous decoded
+names with `AMBIGUOUS_ENTRY`; use `getAll()` or archive-order entry indices.
+This setting does not affect comments, passwords, payloads or writer names.
+
 `open()`, `entry.bytes()`, `test()` and `readComment()` accept `ReadOptions`:
 
 ```js
@@ -43,7 +53,7 @@ The optional fields are `maxHeaderCount`, `maxHeaderBytes`,
 `maxMemberOutputBytes`, `maxTotalOutputBytes`, `rar50DictionarySizeLimit` and
 `rar50BufferedDecodeLimit`. Values must be nonnegative safe integer numbers or
 `bigint` values through `2n ** 64n - 1n`. Zero is a real limit. Omission retains
-the library default. Options apply to one call and are not retained by `open()`.
+the library default. Resource options apply to one call and are not retained by `open()`.
 Each operation reparses its input; header limits apply per archive/volume.
 The cached `archive.comment` is decoded under the options passed to `open()`;
 `readComment()` decodes it again with fresh options and an optional password.

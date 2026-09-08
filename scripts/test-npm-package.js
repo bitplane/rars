@@ -224,4 +224,29 @@ await check("RAR5 decoder and volume budgets reach WASM", async () => {
   }
 });
 
+await check("legacy filename views preserve bytes and Unicode names", async () => {
+  const raw = new Uint8Array([99, 97, 102, 130, 46, 116, 120, 116]);
+  for (const format of formats) {
+    const modern = format === "rar50" || format === "rar70";
+    const name = modern ? "café.txt" : raw;
+    const bytes = await new RarWriter({ format, level: 0 }).add(name, HELLO).bytes();
+    const archive = await RarArchive.open(bytes, { legacyNameEncoding: "cp850" });
+    assert.equal(archive.entries[0].name, "café.txt");
+    assert.deepEqual(archive.entries[0].nameBytes, modern ? text.encode(name) : raw);
+    assert.deepEqual(await archive.get("café.txt").bytes(), HELLO);
+    assert.deepEqual(await archive.get(archive.entries[0].nameBytes).bytes(), HELLO);
+  }
+  const bytes = await new RarWriter({ format: "rar29", level: 0 })
+    .add(new Uint8Array([129]), HELLO).bytes();
+  await assert.rejects(RarArchive.open(bytes, { legacyNameEncoding: "windows-1252" }),
+    (error) => error.code === "INVALID_OPTION");
+  await assert.rejects(RarArchive.open(bytes, { legacyNameEncoding: "auto" }),
+    (error) => error.code === "INVALID_OPTION");
+  const parts = await new RarWriter({ format: "rar29", level: 0 })
+    .add(raw, new Uint8Array(180000).fill(9)).volumes(64000);
+  const archive = await RarArchive.open(parts, { legacyNameEncoding: "cp850" });
+  assert.equal(archive.entries[0].name, "café.txt");
+  assert.equal((await archive.get("café.txt").bytes()).length, 180000);
+});
+
 console.log(`\n${passed} checks passed`);

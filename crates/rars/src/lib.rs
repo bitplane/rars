@@ -80,6 +80,9 @@ pub use write_progress::{WriteOperation, WriteProgress, WriteProgressEvent};
 #[non_exhaustive]
 /// Options used while parsing archives, extracting members, decoding comments or repairing.
 pub struct ArchiveReadOptions<'a> {
+    /// Filename interpretation for application display/path adapters. Parsing and
+    /// core extraction callbacks retain original names; use `filename::decoded_name`.
+    pub legacy_name_encoding: Option<filename::LegacyNameEncoding>,
     /// Password bytes used for encrypted headers or payloads.
     pub password: Option<&'a [u8]>,
     /// Cooperative cancellation for this parsing, extraction or repair call. Parsing
@@ -258,6 +261,8 @@ pub enum Archive {
 #[non_exhaustive]
 /// Metadata supplied to streaming extraction callbacks.
 pub struct ExtractedEntryMeta {
+    /// The format supplied Unicode; legacy encoding overrides must not apply.
+    pub name_is_unicode: bool,
     /// Raw entry name bytes as stored by the archive family.
     pub name: Vec<u8>,
     /// Stored modification time: DOS/FAT for legacy RAR, Unix seconds for RAR5.
@@ -283,6 +288,7 @@ impl ExtractedEntryMeta {
         is_directory: bool,
     ) -> Self {
         Self {
+            name_is_unicode: false,
             name,
             file_time: file_time.into(),
             file_attr,
@@ -327,6 +333,26 @@ pub struct ArchiveMember {
     pub meta: ArchiveMemberMeta,
     /// Extra metadata that is meaningful only for one archive family.
     pub detail: ArchiveMemberDetail,
+}
+
+impl ArchiveMember {
+    /// Name interpretation for display or destination adapters. Stored bytes and
+    /// rewrite identity remain unchanged; Unicode metadata takes precedence.
+    pub fn decoded_name(
+        &self,
+        encoding: Option<filename::LegacyNameEncoding>,
+    ) -> Result<std::borrow::Cow<'_, [u8]>> {
+        filename::decoded_name(&self.meta.name, self.name_is_unicode(), encoding)
+    }
+
+    /// Whether the format supplied Unicode rather than unspecified legacy bytes.
+    pub fn name_is_unicode(&self) -> bool {
+        match &self.detail {
+            ArchiveMemberDetail::Rar13 { .. } => false,
+            ArchiveMemberDetail::Rar15To40 { unicode_name, .. } => unicode_name.is_some(),
+            _ => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1497,6 +1523,7 @@ impl AttrSource {
 
 fn rar13_meta(meta: &rar13::ExtractedEntryMeta) -> ExtractedEntryMeta {
     ExtractedEntryMeta {
+        name_is_unicode: false,
         name: meta.name.clone(),
         file_time: Some(meta.file_time),
         file_attr: u64::from(meta.file_attr),
@@ -1510,6 +1537,7 @@ fn rar13_meta(meta: &rar13::ExtractedEntryMeta) -> ExtractedEntryMeta {
 
 fn rar15_40_meta(meta: &rar15_40::ExtractedEntryMeta) -> ExtractedEntryMeta {
     ExtractedEntryMeta {
+        name_is_unicode: meta.name_is_unicode,
         name: meta.name.clone(),
         file_time: Some(meta.file_time),
         file_attr: u64::from(meta.attr),
@@ -1527,6 +1555,7 @@ fn rar15_40_meta(meta: &rar15_40::ExtractedEntryMeta) -> ExtractedEntryMeta {
 /// Windows attribute word as a Unix mode.
 pub fn rar50_meta(meta: &rar50::ExtractedEntryMeta) -> ExtractedEntryMeta {
     ExtractedEntryMeta {
+        name_is_unicode: true,
         name: meta.name.clone(),
         file_time: meta.file_time,
         file_attr: meta.attr,
@@ -1672,6 +1701,7 @@ mod tests {
     #[test]
     fn extracted_entry_meta_exposes_raw_and_lossy_names() {
         let meta = ExtractedEntryMeta {
+            name_is_unicode: false,
             name: vec![0xff, b'.', b't', b'x', b't'],
             file_time: None,
             file_attr: 0,

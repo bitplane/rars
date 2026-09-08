@@ -23,3 +23,21 @@ for (const name of [(value) => value, (value) => new TextEncoder().encode(value)
   assert.deepEqual(writer.names, [name("c"), name("b")]);
 }
 console.log("npm source API rename checks passed");
+
+// Decoding can make a Unicode name and a legacy byte name look identical.
+const { RarArchive } = createApi({
+  prepareArchiveSources: async (input) => [input],
+  setErrorFactory() {},
+  request: async () => ({
+    entries: [
+      { index: 0, name: "café", nameBytes: new TextEncoder().encode("café") },
+      { index: 1, name: "café", nameBytes: new Uint8Array([99, 97, 102, 130]) },
+    ],
+  }),
+});
+const decoded = await RarArchive.open(new Uint8Array(), { legacyNameEncoding: "cp850" });
+assert.throws(() => decoded.get("café"), (error) => error.code === "AMBIGUOUS_ENTRY");
+assert.equal(decoded.getAll("café").length, 2);
+assert.equal(decoded.get(new Uint8Array([99, 97, 102, 130])).index, 1);
+assert.equal(decoded.get("missing"), undefined);
+console.log("npm decoded-name ambiguity checks passed");

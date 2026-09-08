@@ -21,6 +21,8 @@ export interface OperationOptions {
 
 /** Limits reset per call. Numbers must be safe integers; bigint supports all u64 values. */
 export interface ReadOptions extends OperationOptions {
+  /** Source encoding for names without Unicode; open() retains the decoded entry view. */
+  legacyNameEncoding?: "cp437" | "cp850" | "cp852" | "cp866" | "cp1251" | "cp1252" | "windows-1251" | "windows-1252" | "utf8" | "utf-8";
   maxHeaderCount?: number | bigint;
   maxHeaderBytes?: number | bigint;
   maxMemberOutputBytes?: number | bigint;

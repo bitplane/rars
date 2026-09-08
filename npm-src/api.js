@@ -27,6 +27,13 @@ export function createApi(runtime) {
 
   function readOptions(options) {
     const limits = {};
+    if (options.legacyNameEncoding != null) {
+      const encoding = options.legacyNameEncoding;
+      if (typeof encoding !== "string" || !["cp437", "cp850", "cp852", "cp866", "cp1251", "cp1252", "windows-1251", "windows-1252", "utf8", "utf-8"].includes(encoding.toLowerCase())) {
+        throw new RarError("INVALID_OPTION", "unsupported legacyNameEncoding");
+      }
+      limits.legacyNameEncoding = encoding;
+    }
     for (const key of ["maxHeaderCount", "maxHeaderBytes", "maxMemberOutputBytes", "maxTotalOutputBytes", "rar50DictionarySizeLimit", "rar50BufferedDecodeLimit"]) {
       const value = options[key];
       if (value == null) continue;
@@ -75,10 +82,11 @@ export function createApi(runtime) {
         readOptions: readOptions(operation),
         password: operation.password,
       }, operation);
-      return new RarArchive(sources, operation.password, result);
+      return new RarArchive(sources, operation.password, result, operation.legacyNameEncoding);
     }
 
-    constructor(sources, password, metadata) {
+    constructor(sources, password, metadata, legacyNameEncoding) {
+      this._legacyNameEncoding = legacyNameEncoding;
       this._sources = sources;
       this._password = password;
       this._closed = false;
@@ -97,11 +105,11 @@ export function createApi(runtime) {
     }
 
     get(name) {
-      assertOpen(this);
-      return this.entries.find((entry) => sameName(
-        typeof name === "string" ? entry.name : entry.nameBytes,
-        name,
-      ));
+      const matches = this.getAll(name);
+      if (this._legacyNameEncoding != null && typeof name === "string" && matches.length > 1) {
+        throw new RarError("AMBIGUOUS_ENTRY", "decoded name is ambiguous; use getAll() or an entry index");
+      }
+      return matches[0];
     }
 
     getAll(name) {

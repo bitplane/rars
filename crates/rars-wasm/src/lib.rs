@@ -186,6 +186,7 @@ fn family_name(family: rars_rs::ArchiveFamily) -> &'static str {
 #[wasm_bindgen]
 #[derive(Clone)]
 pub struct RarInfo {
+    display_name: String,
     name: Vec<u8>,
     size: f64,
     packed_size: f64,
@@ -208,7 +209,7 @@ impl RarInfo {
     /// when the exact bytes matter.
     #[wasm_bindgen(getter)]
     pub fn name(&self) -> String {
-        String::from_utf8_lossy(&self.name).into_owned()
+        self.display_name.clone()
     }
 
     /// The member name exactly as the header spells it.
@@ -317,7 +318,11 @@ impl RarFile {
         let options = read_options(password.as_deref(), &settings)?;
         let archive =
             rars_rs::ArchiveReader::read_owned_with_options(data, options).map_err(js_error)?;
-        let infos = archive.members().map(info_from_member).collect();
+        let infos = archive
+            .members()
+            .map(|member| info_with_encoding(member, options.legacy_name_encoding))
+            .collect::<rars_rs::Result<Vec<_>>>()
+            .map_err(js_error)?;
         Ok(Self {
             archives: vec![archive],
             password,
@@ -333,6 +338,7 @@ impl RarFile {
         settings: JsValue,
     ) -> Result<RarFile, JsValue> {
         let password = password_bytes(password)?;
+        let options = read_options(password.as_deref(), &settings)?;
         let mut archives = Vec::with_capacity(volumes.length() as usize);
         for value in volumes.iter() {
             if !value.is_instance_of::<js_sys::Uint8Array>() {
@@ -342,7 +348,6 @@ impl RarFile {
                 ));
             }
             let data = js_sys::Uint8Array::unchecked_from_js(value).to_vec();
-            let options = read_options(password.as_deref(), &settings)?;
             archives.push(
                 rars_rs::ArchiveReader::read_owned_with_options(data, options).map_err(js_error)?,
             );
@@ -350,8 +355,9 @@ impl RarFile {
         let infos = rars_rs::volume_members(&archives)
             .map_err(js_error)?
             .into_iter()
-            .map(info_from_member)
-            .collect();
+            .map(|member| info_with_encoding(member, options.legacy_name_encoding))
+            .collect::<rars_rs::Result<Vec<_>>>()
+            .map_err(js_error)?;
         Ok(Self {
             archives,
             password,
@@ -489,6 +495,16 @@ impl RarFile {
     }
 }
 
+fn info_with_encoding(
+    member: rars_rs::ArchiveMember,
+    encoding: Option<rars_rs::filename::LegacyNameEncoding>,
+) -> rars_rs::Result<RarInfo> {
+    let display_name = String::from_utf8_lossy(&member.decoded_name(encoding)?).into_owned();
+    let mut info = info_from_member(member);
+    info.display_name = display_name;
+    Ok(info)
+}
+
 fn info_from_member(member: rars_rs::ArchiveMember) -> RarInfo {
     // RAR 1.3 checksums are 16 bit and RAR 5 may carry a BLAKE2sp hash instead
     // of a CRC, so the one field JavaScript sees is the CRC-32 where the format
@@ -500,6 +516,7 @@ fn info_from_member(member: rars_rs::ArchiveMember) -> RarInfo {
         _ => (None, false),
     };
     RarInfo {
+        display_name: String::from_utf8_lossy(&member.meta.name).into_owned(),
         name: member.meta.name,
         size: member.meta.unpacked_size as f64,
         packed_size: member.meta.packed_size as f64,
@@ -893,6 +910,18 @@ fn read_options<'a>(
     settings: &JsValue,
 ) -> Result<rars_rs::ArchiveReadOptions<'a>, JsValue> {
     let mut options = rars_rs::ArchiveReadOptions::with_optional_password(password);
+    let encoding = opt_value(settings, "legacyNameEncoding")?;
+    if !encoding.is_null() && !encoding.is_undefined() {
+        options.legacy_name_encoding = Some(
+            encoding
+                .as_string()
+                .ok_or_else(|| {
+                    binding_error("INVALID_OPTION", "legacyNameEncoding must be a string")
+                })?
+                .parse()
+                .map_err(js_error)?,
+        );
+    }
     options.max_header_count = read_limit(settings, "maxHeaderCount")?;
     options.max_header_bytes = read_limit(settings, "maxHeaderBytes")?;
     options.max_member_output_bytes = read_limit(settings, "maxMemberOutputBytes")?;

@@ -5995,3 +5995,81 @@ fn cli_scratch_policy_decodes_filtered_members_and_cleans_up() {
     assert!(result.status.success(), "{}", stderr(&result));
     assert_eq!(fs::read_dir(&scratch_dir).unwrap().count(), 0);
 }
+
+#[test]
+fn legacy_name_encoding_controls_listing_and_extraction() {
+    for format in [
+        rars::ArchiveVersion::Rar14,
+        rars::ArchiveVersion::Rar29,
+        rars::ArchiveVersion::Rar40,
+    ] {
+        let work = scratch("legacy-name-encoding");
+        let archive = work.join("input.rar");
+        let mut builder = rars::Builder::new(format).store(true);
+        builder
+            .add_bytes(b"caf\x82.txt".to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+        fs::write(&archive, builder.to_bytes().unwrap()).unwrap();
+        for verbose in [false, true] {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_rars"));
+            command.args(["info", "--legacy-name-encoding", "cp850"]);
+            if verbose {
+                command.arg("--verbose");
+            }
+            let result = command.arg(&archive).output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert!(String::from_utf8_lossy(&result.stdout).contains("café.txt"));
+        }
+        let out = work.join("out");
+        let result = Command::new(env!("CARGO_BIN_EXE_rars"))
+            .args(["x", "--legacy-name-encoding", "cp850"])
+            .arg(&archive)
+            .arg(&out)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(fs::read(out.join("café.txt")).unwrap(), b"payload");
+    }
+}
+
+#[test]
+fn legacy_name_encoding_rejects_undefined_bytes_and_preserves_unicode() {
+    let work = scratch("name-encoding-refusal");
+    for (format, name, success) in [
+        (rars::ArchiveVersion::Rar29, b"bad-\x81".as_slice(), false),
+        (rars::ArchiveVersion::Rar50, "café.txt".as_bytes(), true),
+    ] {
+        let mut builder = rars::Builder::new(format).store(true);
+        builder
+            .add_bytes(name.to_vec(), b"data".to_vec(), None, None)
+            .unwrap();
+        let archive = work.join("input.rar");
+        fs::write(&archive, builder.to_bytes().unwrap()).unwrap();
+        let out = work.join("out");
+        let result = Command::new(env!("CARGO_BIN_EXE_rars"))
+            .args(["x", "--legacy-name-encoding", "windows-1252"])
+            .arg(&archive)
+            .arg(&out)
+            .output()
+            .unwrap();
+        assert_eq!(
+            result.status.success(),
+            success,
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        if success {
+            assert_eq!(fs::read(out.join("café.txt")).unwrap(), b"data");
+        } else {
+            assert!(!out.exists() || fs::read_dir(&out).unwrap().next().is_none());
+        }
+    }
+}

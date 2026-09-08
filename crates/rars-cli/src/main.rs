@@ -280,6 +280,16 @@ where
     }
 }
 
+fn display_legacy_name(
+    name: &[u8],
+    unicode: bool,
+    encoding: Option<rars::filename::LegacyNameEncoding>,
+) -> rars::Result<String> {
+    Ok(display_bytes_lossy(&rars::filename::decoded_name(
+        name, unicode, encoding,
+    )?))
+}
+
 fn info_rar13_terse(
     path: &str,
     archive: &rars::rar13::Archive,
@@ -291,13 +301,19 @@ fn info_rar13_terse(
     {
         print_comment("  ", &comment);
     }
-    print_entry_table(archive.entries.iter().map(|entry| {
-        (
-            u64::from(entry.header.unp_size),
-            u64::from(entry.header.pack_size),
-            display_text(entry.name_lossy()),
-        )
-    }));
+    print_entry_table(
+        archive
+            .entries
+            .iter()
+            .map(|entry| {
+                Ok((
+                    u64::from(entry.header.unp_size),
+                    u64::from(entry.header.pack_size),
+                    display_legacy_name(&entry.name, false, options.legacy_name_encoding)?,
+                ))
+            })
+            .collect::<rars::Result<Vec<_>>>()?,
+    );
     Ok(())
 }
 
@@ -340,7 +356,7 @@ fn info_rar13_verbose(
     for (index, entry) in archive.entries.iter().enumerate() {
         println!(
             "  #{index}: {} pack={} unp={} method={} flags={:#04x} attr={:#04x} checksum={:#06x}",
-            display_text(entry.name_lossy()),
+            display_legacy_name(&entry.name, false, options.legacy_name_encoding)?,
             entry.header.pack_size,
             entry.header.unp_size,
             entry.header.method,
@@ -371,13 +387,22 @@ fn info_rar15_40_terse(
     {
         print_comment("  ", &comment);
     }
-    print_entry_table(archive.files().map(|file| {
-        (
-            file.unp_size,
-            file.pack_size,
-            display_text(file.name_lossy()),
-        )
-    }));
+    print_entry_table(
+        archive
+            .files()
+            .map(|file| {
+                Ok((
+                    file.unp_size,
+                    file.pack_size,
+                    display_legacy_name(
+                        &file.name,
+                        file.unicode_name.is_some(),
+                        options.legacy_name_encoding,
+                    )?,
+                ))
+            })
+            .collect::<rars::Result<Vec<_>>>()?,
+    );
     let sub_count = archive.new_subs().count();
     if sub_count > 0 {
         let kinds: Vec<String> = archive
@@ -407,7 +432,7 @@ fn info_rar15_40_verbose(
     for (index, file) in archive.files().enumerate() {
         println!(
             "  #{index}: {} pack={} unp={} method={:#04x} flags={:#06x} attr={:#010x} crc={:#010x} ver={}",
-            display_text(file.name_lossy()),
+            display_legacy_name(&file.name, file.unicode_name.is_some(), options.legacy_name_encoding)?,
             file.pack_size,
             file.unp_size,
             file.method,
@@ -851,7 +876,17 @@ fn extract_single_archive(
             },
         ),
         _ => extract_archive_to_with_options(archive, options, |meta| {
-            state.borrow_mut().open_entry(meta)
+            if options.legacy_name_encoding.is_none() || meta.name_is_unicode {
+                return state.borrow_mut().open_entry(meta);
+            }
+            let mut decoded = meta.clone();
+            decoded.name = rars::filename::decoded_name(
+                &meta.name,
+                meta.name_is_unicode,
+                options.legacy_name_encoding,
+            )?
+            .into_owned();
+            state.borrow_mut().open_entry(&decoded)
         }),
     }
 }
@@ -885,7 +920,17 @@ fn extract_volume_archives(
     }
 
     extract_volumes_to_with_options(archives, options, |meta| {
-        state.borrow_mut().open_entry(meta)
+        if options.legacy_name_encoding.is_none() || meta.name_is_unicode {
+            return state.borrow_mut().open_entry(meta);
+        }
+        let mut decoded = meta.clone();
+        decoded.name = rars::filename::decoded_name(
+            &meta.name,
+            meta.name_is_unicode,
+            options.legacy_name_encoding,
+        )?
+        .into_owned();
+        state.borrow_mut().open_entry(&decoded)
     })
 }
 

@@ -119,6 +119,9 @@ impl CancellationToken {
 #[pyclass(frozen, module = "rars", skip_from_py_object)]
 #[derive(Debug, Clone, Default)]
 struct ReadOptions {
+    #[pyo3(get)]
+    legacy_name_encoding: Option<String>,
+    encoding: Option<rars_rs::filename::LegacyNameEncoding>,
     cancellation: Option<rars_rs::ReadCancellation>,
     #[pyo3(get)]
     max_member_output_bytes: Option<u64>,
@@ -137,7 +140,8 @@ struct ReadOptions {
 #[pymethods]
 impl ReadOptions {
     #[new]
-    #[pyo3(signature = (*, cancellation=None, max_member_output_bytes=None, max_total_output_bytes=None, rar50_dictionary_size_limit=None, rar50_buffered_decode_limit=None, max_header_count=None, max_header_bytes=None))]
+    #[allow(clippy::too_many_arguments)] // Python keyword-only policy fields.
+    #[pyo3(signature = (*, cancellation=None, max_member_output_bytes=None, max_total_output_bytes=None, rar50_dictionary_size_limit=None, rar50_buffered_decode_limit=None, max_header_count=None, max_header_bytes=None, legacy_name_encoding=None))]
     fn new(
         cancellation: Option<&CancellationToken>,
         max_member_output_bytes: Option<u64>,
@@ -146,8 +150,16 @@ impl ReadOptions {
         rar50_buffered_decode_limit: Option<u64>,
         max_header_count: Option<u64>,
         max_header_bytes: Option<u64>,
-    ) -> Self {
-        Self {
+        legacy_name_encoding: Option<String>,
+    ) -> PyResult<Self> {
+        let encoding = legacy_name_encoding
+            .as_deref()
+            .map(str::parse)
+            .transpose()
+            .map_err(map_error)?;
+        Ok(Self {
+            legacy_name_encoding,
+            encoding,
             cancellation: cancellation.map(|token| token.inner.clone()),
             max_member_output_bytes,
             max_total_output_bytes,
@@ -155,7 +167,7 @@ impl ReadOptions {
             rar50_buffered_decode_limit,
             max_header_count,
             max_header_bytes,
-        }
+        })
     }
 
     #[getter]
@@ -173,6 +185,7 @@ fn python_read_options<'a>(
     let mut options = rars_rs::ArchiveReadOptions::with_optional_password(password);
     if let Some(settings) = settings {
         options.cancellation = settings.cancellation.as_ref();
+        options.legacy_name_encoding = settings.encoding;
         options.max_header_count = settings.max_header_count;
         options.max_header_bytes = settings.max_header_bytes;
         options.max_member_output_bytes = settings.max_member_output_bytes;
@@ -384,6 +397,7 @@ impl RarInfo {
 
 #[pyclass(module = "rars", skip_from_py_object)]
 struct RarFile {
+    encoding: Option<rars_rs::filename::LegacyNameEncoding>,
     archive: rars_rs::Archive,
     password: Option<Vec<u8>>,
     infos: Vec<RarInfo>,
@@ -435,7 +449,7 @@ impl RarFile {
     }
 
     fn getinfo(&self, name: &Bound<'_, PyAny>) -> PyResult<RarInfo> {
-        let target = member_name_bytes(name)?;
+        let target = self.resolve_name(name)?;
         self.infos
             .iter()
             .find(|info| info.orig_filename_bytes == target)
@@ -451,12 +465,12 @@ impl RarFile {
         pwd: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
     ) -> PyResult<Vec<u8>> {
-        let target = member_name_bytes(name)?;
+        let target = self.resolve_name(name)?;
         let password = py_password(pwd)?.or_else(|| self.password.clone());
         py.detach(|| {
             self.archive.read_member_with_options(
                 &target,
-                python_read_options(options, password.as_deref()),
+                self.extraction_options(options, password.as_deref()),
             )
         })
         .map_err(map_error)?
@@ -487,7 +501,7 @@ impl RarFile {
         overwrite: bool,
         options: Option<&ReadOptions>,
     ) -> PyResult<PathBuf> {
-        let target = member_name_bytes(member)?;
+        let target = self.resolve_name(member)?;
         let out_dir = path.unwrap_or_else(|| PathBuf::from("."));
         let password = py_password(pwd)?.or_else(|| self.password.clone());
         let written = py
@@ -496,7 +510,7 @@ impl RarFile {
                     &self.archive,
                     Some(&target),
                     &out_dir,
-                    python_read_options(options, password.as_deref()),
+                    self.extraction_options(options, password.as_deref()),
                     overwrite,
                 )
             })
@@ -519,7 +533,12 @@ impl RarFile {
     ) -> PyResult<Vec<PathBuf>> {
         let out_dir = path.unwrap_or_else(|| PathBuf::from("."));
         let selected = match members {
-            Some(members) => Some(member_name_set(members)?),
+            Some(members) => Some(
+                members
+                    .try_iter()?
+                    .map(|member| self.resolve_name(&member?))
+                    .collect::<PyResult<HashSet<Vec<u8>>>>()?,
+            ),
             None => None,
         };
         let password = py_password(pwd)?.or_else(|| self.password.clone());
@@ -528,7 +547,7 @@ impl RarFile {
                 &self.archive,
                 selected.as_ref(),
                 &out_dir,
-                python_read_options(options, password.as_deref()),
+                self.extraction_options(options, password.as_deref()),
                 overwrite,
             )
         })
@@ -545,7 +564,7 @@ impl RarFile {
         let password = py_password(pwd)?.or_else(|| self.password.clone());
         py.detach(|| {
             self.archive
-                .test_with_options(python_read_options(options, password.as_deref()))
+                .test_with_options(self.extraction_options(options, password.as_deref()))
         })
         .map_err(map_error)
     }
@@ -566,7 +585,7 @@ impl RarFile {
         let password = py_password(pwd)?.or_else(|| self.password.clone());
         py.detach(|| {
             self.archive
-                .comment_with_options(python_read_options(options, password.as_deref()))
+                .comment_with_options(self.extraction_options(options, password.as_deref()))
         })
         .map_err(map_error)
     }
@@ -584,7 +603,7 @@ impl RarFile {
         member: &Bound<'_, PyAny>,
         pwd: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Option<Vec<u8>>> {
-        let name = member_name_bytes(member)?;
+        let name = self.resolve_name(member)?;
         let index = self
             .archive
             .members()
@@ -598,7 +617,7 @@ impl RarFile {
     /// Returns raw target bytes for a supported RAR5 or legacy Unix link.
     /// This reads archive metadata and never follows the link.
     fn readlink(&self, member: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
-        let name = member_name_bytes(member)?;
+        let name = self.resolve_name(member)?;
         let (index, member) = self
             .archive
             .members()
@@ -620,7 +639,7 @@ impl RarFile {
 
     /// Stored file timestamps as exact integer Unix nanoseconds. Missing kinds are absent.
     fn gettimes(&self, member: &Bound<'_, PyAny>) -> PyResult<HashMap<String, i128>> {
-        let name = member_name_bytes(member)?;
+        let name = self.resolve_name(member)?;
         let member = self
             .archive
             .members()
@@ -687,6 +706,34 @@ impl RarFile {
 }
 
 impl RarFile {
+    fn extraction_options<'a>(
+        &self,
+        settings: Option<&'a ReadOptions>,
+        password: Option<&'a [u8]>,
+    ) -> rars_rs::ArchiveReadOptions<'a> {
+        let mut options = python_read_options(settings, password);
+        options.legacy_name_encoding = options.legacy_name_encoding.or(self.encoding);
+        options
+    }
+
+    fn resolve_name(&self, name: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+        if self.encoding.is_some() {
+            if let Ok(text) = name.extract::<String>() {
+                let mut matches = self.infos.iter().filter(|info| info.filename == text);
+                if let Some(found) = matches.next() {
+                    if matches.next().is_some() {
+                        return Err(PyValueError::new_err(
+                            "ambiguous decoded name; select an entry by its original bytes",
+                        ));
+                    }
+                    return Ok(found.orig_filename_bytes.clone());
+                }
+                return Err(PyKeyError::new_err(text));
+            }
+        }
+        member_name_bytes(name)
+    }
+
     fn from_bytes(
         py: Python<'_>,
         bytes: Vec<u8>,
@@ -700,8 +747,19 @@ impl RarFile {
                 rars_rs::ArchiveReader::read_owned_with_options(bytes, options)
             })
             .map_err(map_error)?;
-        let infos = archive.members().map(info_from_member).collect();
+        let encoding = options.and_then(|settings| settings.encoding);
+        let infos = archive
+            .members()
+            .map(|member| {
+                let name = member.decoded_name(encoding)?.into_owned();
+                let mut info = info_from_member(member);
+                info.filename = String::from_utf8_lossy(&name).into_owned();
+                Ok(info)
+            })
+            .collect::<rars_rs::Result<Vec<_>>>()
+            .map_err(map_error)?;
         Ok(Self {
+            encoding,
             archive,
             password,
             infos,
@@ -917,6 +975,7 @@ impl RarBuilder {
     ) -> PyResult<Self> {
         let archive = match source.extract::<PyRef<'_, RarFile>>() {
             Ok(archive) => RarFile {
+                encoding: None,
                 archive: archive.archive.clone(),
                 password: archive.password.clone(),
                 infos: archive.infos.clone(),
@@ -1654,14 +1713,6 @@ fn member_name_bytes(value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
     Ok(value.extract::<String>()?.into_bytes())
 }
 
-fn member_name_set(value: &Bound<'_, PyAny>) -> PyResult<HashSet<Vec<u8>>> {
-    let mut out = HashSet::new();
-    for item in value.try_iter()? {
-        out.insert(member_name_bytes(&item?)?);
-    }
-    Ok(out)
-}
-
 trait Selection {
     fn contains_member(&self, name: &[u8]) -> bool;
 }
@@ -1733,7 +1784,22 @@ fn extract_archive<S: Selection>(
     let open = {
         let written = Arc::clone(&written);
         move |meta: &rars_rs::ExtractedEntryMeta| {
-            let path = checked_output_path(out_dir, meta, archive.family())?;
+            let path = checked_output_path(
+                out_dir,
+                meta,
+                archive.family(),
+                options.legacy_name_encoding,
+            )?;
+            if options.legacy_name_encoding.is_some()
+                && written
+                    .lock()
+                    .expect("written lock poisoned")
+                    .contains(&path)
+            {
+                return Err(rars_rs::Error::InvalidArgument(
+                    "multiple entries map to the same decoded output path",
+                ));
+            }
             if meta.is_directory {
                 fs::create_dir_all(&path)?;
                 written.lock().expect("written lock poisoned").push(path);
@@ -1800,7 +1866,8 @@ fn extract_archive<S: Selection>(
                         rars_rs::ExtractionDecision::Skip
                     });
                 }
-                let meta = rars_rs::ExtractedEntryMeta::new(
+                let unicode = member.name_is_unicode();
+                let mut meta = rars_rs::ExtractedEntryMeta::new(
                     meta.name.clone(),
                     meta.file_time,
                     meta.file_attr,
@@ -1808,11 +1875,28 @@ fn extract_archive<S: Selection>(
                 )
                 .with_attr_source(meta.attr_source())
                 .with_mtime_refinement(meta.mtime_refinement);
+                meta.name_is_unicode = unicode;
                 if meta.is_directory {
                     return Ok(rars_rs::ExtractionDecision::Extract(open(&meta)?));
                 }
+                let path = checked_output_path(
+                    out_dir,
+                    &meta,
+                    archive.family(),
+                    options.legacy_name_encoding,
+                )?;
+                if options.legacy_name_encoding.is_some()
+                    && written
+                        .lock()
+                        .expect("written lock poisoned")
+                        .contains(&path)
+                {
+                    return Err(rars_rs::Error::InvalidArgument(
+                        "multiple entries map to the same decoded output path",
+                    ));
+                }
                 let file = std::rc::Rc::new(std::cell::RefCell::new(DeferredExtractedFile {
-                    path: checked_output_path(out_dir, &meta, archive.family())?,
+                    path,
                     overwrite,
                     file: None,
                     written: written.clone(),
@@ -1843,7 +1927,22 @@ fn extract_volumes_archive(
     rars_rs::extract_volumes_to_with_options(archives, options, {
         let written = Arc::clone(&written);
         move |meta| {
-            let path = checked_output_path(out_dir, meta, archives[0].family())?;
+            let path = checked_output_path(
+                out_dir,
+                meta,
+                archives[0].family(),
+                options.legacy_name_encoding,
+            )?;
+            if options.legacy_name_encoding.is_some()
+                && written
+                    .lock()
+                    .expect("written lock poisoned")
+                    .contains(&path)
+            {
+                return Err(rars_rs::Error::InvalidArgument(
+                    "multiple entries map to the same decoded output path",
+                ));
+            }
             if meta.is_directory {
                 fs::create_dir_all(&path)?;
                 written.lock().expect("written lock poisoned").push(path);
@@ -1977,6 +2076,7 @@ fn checked_output_path(
     out_dir: &Path,
     meta: &rars_rs::ExtractedEntryMeta,
     family: rars_rs::ArchiveFamily,
+    encoding: Option<rars_rs::filename::LegacyNameEncoding>,
 ) -> rars_rs::Result<PathBuf> {
     // Retain the binding's conservative name preflight (including legacy
     // backslash traversal) before applying host-aware destination conversion.
@@ -1990,7 +2090,7 @@ fn checked_output_path(
             .map(|&b| if b == b'\\' { b'_' } else { b })
             .collect()
     } else {
-        meta.name.clone()
+        rars_rs::filename::decoded_name(&meta.name, meta.name_is_unicode, encoding)?.into_owned()
     };
     let rel = output_relative_path(&name, !rar50)?;
     let mut out_path = out_dir.to_path_buf();
@@ -2198,12 +2298,15 @@ mod tests {
                 })
                 .unwrap();
                 let file = RarFile {
+                    encoding: None,
                     infos: archive.members().map(info_from_member).collect(),
                     archive,
                     password: None,
                 };
                 let token = CancellationToken::new();
-                let options = ReadOptions::new(Some(&token), None, None, None, None, None, None);
+                let options =
+                    ReadOptions::new(Some(&token), None, None, None, None, None, None, None)
+                        .unwrap();
                 let cancel_object = Py::new(py, token).unwrap();
                 armed.store(true, Ordering::Relaxed);
                 let worker = std::thread::spawn(move || {
@@ -2373,6 +2476,7 @@ mod tests {
                     let source = Py::new(
                         py,
                         RarFile {
+                            encoding: None,
                             archive,
                             password: None,
                             infos: Vec::new(),
