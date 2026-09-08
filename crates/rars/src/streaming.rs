@@ -147,7 +147,7 @@ impl WriteCancellation {
 /// WebAssembly (`wasm32-unknown-unknown`), spools stay in memory and their retained
 /// payloads are additional to this limit. `with_max_spool_bytes` separately caps
 /// logical spool contents on both backends. `with_max_spool_memory_bytes` caps
-/// bare-WASM spool payload capacity, excluding index storage and other memory.
+/// bare-WASM spool payload and index capacity, excluding other writer memory.
 pub struct WriterResources {
     memory_limit: u64,
     temp_dir: Option<PathBuf>,
@@ -198,9 +198,10 @@ impl WriterResources {
         self.spool_budget.as_ref().map(|budget| budget.limit)
     }
 
-    /// Cap shared in-memory spool payload capacity on bare WASM. Bounded spools
-    /// allocate zeroed 4096-byte blocks, charged before allocation. Directory
-    /// storage, allocator overhead, codec workspace and output are not included.
+    /// Cap shared in-memory spool payload and index capacity on bare WASM.
+    /// Bounded spools allocate zeroed 4096-byte blocks and a boxed index. Growth
+    /// reserves both old and replacement indexes before allocation. Allocator
+    /// overhead, codec workspace and output are not included.
     /// This is not an aggregate managed-memory or process-RAM ceiling.
     ///
     /// Native file spools have no in-memory payload charge. The default remains
@@ -216,7 +217,7 @@ impl WriterResources {
         self
     }
 
-    /// The optional memory-spool payload-capacity quota.
+    /// The optional memory-spool payload and index capacity quota.
     pub fn max_spool_memory_bytes(&self) -> Option<u64> {
         self.spool_memory_budget.as_ref().map(|budget| budget.limit)
     }

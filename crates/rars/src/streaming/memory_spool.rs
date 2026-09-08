@@ -1,9 +1,11 @@
-//! Optional bounded payload storage for bare-WASM spools.
-//! Fixed boxes give each payload allocation a known size before allocation.
+//! Optional bounded storage for bare-WASM spools.
+//! Payload blocks and index replacements have known sizes before allocation.
 use super::{SpoolCharge, WriterResources};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 
 const BLOCK_BYTES: usize = 4096;
+type Block = Box<[u8; BLOCK_BYTES]>;
+const INDEX_ENTRY_BYTES: usize = std::mem::size_of::<Option<Block>>();
 
 pub(super) struct MemorySpool {
     store: Store,
@@ -15,13 +17,12 @@ enum Store {
 }
 
 struct BoundedSpool {
-    // Payloads must not relocate or coexist with replacement payload buffers
-    // when the directory grows. Directory capacity is outside this quota.
-    #[allow(clippy::vec_box)]
-    blocks: Vec<Box<[u8; BLOCK_BYTES]>>,
+    // Only index slots move during growth; payload allocations stay in place.
+    blocks: Box<[Option<Block>]>,
+    block_count: usize,
     len: usize,
     pos: u64,
-    // Drop payload allocations before releasing their shared charge.
+    // Drop payload and index allocations before releasing their shared charge.
     charge: SpoolCharge,
 }
 
@@ -29,7 +30,8 @@ impl MemorySpool {
     pub(super) fn new(resources: &WriterResources) -> Self {
         let store = match &resources.spool_memory_budget {
             Some(budget) => Store::Bounded(BoundedSpool {
-                blocks: Vec::new(),
+                blocks: Box::default(),
+                block_count: 0,
                 len: 0,
                 pos: 0,
                 charge: SpoolCharge {
@@ -46,26 +48,46 @@ impl MemorySpool {
 impl BoundedSpool {
     fn grow(&mut self, end: usize) -> io::Result<()> {
         let count = end.div_ceil(BLOCK_BYTES);
-        if count <= self.blocks.len() {
+        if count <= self.block_count {
             return Ok(());
         }
-        let required = count.checked_mul(BLOCK_BYTES).ok_or_else(|| {
+        let overflow = || {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "memory spool capacity overflow",
             )
-        })?;
-        let previous = self.blocks.len() * BLOCK_BYTES;
-        self.charge
-            .grow_to(required as u64)
-            .map_err(io::Error::other)?;
-        if let Err(error) = self.blocks.try_reserve(count - self.blocks.len()) {
-            self.charge.shrink_to(previous as u64);
-            return Err(io::Error::new(io::ErrorKind::OutOfMemory, error));
+        };
+        let slots = if count > self.blocks.len() {
+            count.checked_next_power_of_two().ok_or_else(overflow)?
+        } else {
+            self.blocks.len()
+        };
+        let payload_bytes = count.checked_mul(BLOCK_BYTES).ok_or_else(overflow)?;
+        let index_bytes = slots.checked_mul(INDEX_ENTRY_BYTES).ok_or_else(overflow)?;
+        let retained = payload_bytes
+            .checked_add(index_bytes)
+            .ok_or_else(overflow)?;
+        let old_index_bytes = if slots != self.blocks.len() {
+            self.blocks.len() * INDEX_ENTRY_BYTES
+        } else {
+            0
+        };
+        let peak = retained.checked_add(old_index_bytes).ok_or_else(overflow)?;
+        self.charge.grow_to(peak as u64).map_err(io::Error::other)?;
+        if slots != self.blocks.len() {
+            // vec![value; n] requests exactly n elements. The boxed slice keeps
+            // that layout; no unspecified Vec growth capacity enters the quota.
+            let mut replacement = vec![None; slots].into_boxed_slice();
+            for (target, source) in replacement.iter_mut().zip(self.blocks.iter_mut()) {
+                *target = source.take();
+            }
+            self.blocks = replacement;
+            // Assignment freed the old index before its allowance is released.
+            self.charge.shrink_to(retained as u64);
         }
-        while self.blocks.len() < count {
-            // The allocation layout is exactly BLOCK_BYTES, unlike Vec growth.
-            self.blocks.push(Box::new([0; BLOCK_BYTES]));
+        while self.block_count < count {
+            self.blocks[self.block_count] = Some(Box::new([0; BLOCK_BYTES]));
+            self.block_count += 1;
         }
         Ok(())
     }
@@ -89,7 +111,7 @@ impl BoundedSpool {
             let offset = pos + copied;
             let within = offset % BLOCK_BYTES;
             let count = (BLOCK_BYTES - within).min(bytes.len() - copied);
-            self.blocks[offset / BLOCK_BYTES][within..within + count]
+            self.blocks[offset / BLOCK_BYTES].as_mut().unwrap()[within..within + count]
                 .copy_from_slice(&bytes[copied..copied + count]);
             copied += count;
         }
@@ -109,8 +131,9 @@ impl BoundedSpool {
             let offset = pos + copied;
             let within = offset % BLOCK_BYTES;
             let count = (BLOCK_BYTES - within).min(size - copied);
-            bytes[copied..copied + count]
-                .copy_from_slice(&self.blocks[offset / BLOCK_BYTES][within..within + count]);
+            bytes[copied..copied + count].copy_from_slice(
+                &self.blocks[offset / BLOCK_BYTES].as_ref().unwrap()[within..within + count],
+            );
             copied += count;
         }
         self.pos += size as u64;
@@ -162,6 +185,10 @@ mod tests {
     use super::*;
     use crate::{Error, ErrorKind};
 
+    fn capacity(blocks: usize) -> u64 {
+        (blocks * BLOCK_BYTES + blocks.next_power_of_two() * INDEX_ENTRY_BYTES) as u64
+    }
+
     fn used(resources: &WriterResources) -> u64 {
         *resources
             .spool_memory_budget
@@ -174,7 +201,7 @@ mod tests {
 
     #[test]
     fn quota_admits_payload_capacity_before_allocating_any_blocks() {
-        for limit in [0, BLOCK_BYTES as u64 - 1] {
+        for limit in [0, BLOCK_BYTES as u64, capacity(1) - 1] {
             let resources = WriterResources::default().with_max_spool_memory_bytes(limit);
             let mut spool = MemorySpool::new(&resources);
             let error = Error::from(spool.write(b"x").unwrap_err());
@@ -182,7 +209,7 @@ mod tests {
                 error,
                 Error::WriterSpoolMemoryLimitExceeded {
                     limit,
-                    required: BLOCK_BYTES as u64,
+                    required: capacity(1),
                     used: 0,
                 }
             );
@@ -199,26 +226,77 @@ mod tests {
 
     #[test]
     fn spare_payload_capacity_is_shared_and_stays_charged_until_drop() {
-        let resources = WriterResources::default().with_max_spool_memory_bytes(BLOCK_BYTES as u64);
+        let resources = WriterResources::default().with_max_spool_memory_bytes(capacity(1));
         let mut first = MemorySpool::new(&resources);
         first.write_all(b"x").unwrap();
-        assert_eq!(used(&resources), BLOCK_BYTES as u64);
+        assert_eq!(used(&resources), capacity(1));
         let mut second = MemorySpool::new(&resources.clone());
         assert!(second.write(b"y").is_err());
         first.rewind().unwrap();
         first.write_all(b"replacement").unwrap();
-        assert_eq!(used(&resources), BLOCK_BYTES as u64);
+        assert_eq!(used(&resources), capacity(1));
         first.seek(SeekFrom::Start(BLOCK_BYTES as u64 - 1)).unwrap();
         assert!(first.write_all(b"ab").is_err());
-        assert_eq!(used(&resources), BLOCK_BYTES as u64);
+        assert_eq!(used(&resources), capacity(1));
         let mut bytes = Vec::new();
         first.rewind().unwrap();
         first.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, b"replacement");
         drop(first);
         second.write_all(b"y").unwrap();
-        assert_eq!(used(&resources), BLOCK_BYTES as u64);
+        assert_eq!(used(&resources), capacity(1));
         drop(second);
+        assert_eq!(used(&resources), 0);
+    }
+
+    #[test]
+    fn index_replacement_requires_both_indexes_before_growth() {
+        let peak = capacity(2) + INDEX_ENTRY_BYTES as u64;
+        for limit in [peak - 1, peak] {
+            let resources = WriterResources::default().with_max_spool_memory_bytes(limit);
+            let mut spool = MemorySpool::new(&resources);
+            spool.write_all(b"original").unwrap();
+            spool.seek(SeekFrom::Start(BLOCK_BYTES as u64)).unwrap();
+            let result = spool.write(b"next");
+            if limit < peak {
+                assert_eq!(
+                    Error::from(result.unwrap_err()),
+                    Error::WriterSpoolMemoryLimitExceeded {
+                        limit,
+                        required: peak,
+                        used: capacity(1),
+                    }
+                );
+                assert_eq!(used(&resources), capacity(1));
+                assert_eq!(spool.stream_position().unwrap(), BLOCK_BYTES as u64);
+                assert_eq!(spool.seek(SeekFrom::End(0)).unwrap(), 8);
+            } else {
+                assert_eq!(result.unwrap(), 4);
+                // The replaced index is no longer charged after growth.
+                assert_eq!(used(&resources), capacity(2));
+            }
+            spool.rewind().unwrap();
+            let mut original = [0; 8];
+            spool.read_exact(&mut original).unwrap();
+            assert_eq!(&original, b"original");
+            drop(spool);
+            assert_eq!(used(&resources), 0);
+        }
+    }
+
+    #[test]
+    fn unused_index_slots_remain_charged_and_reused() {
+        let resources = WriterResources::default().with_max_spool_memory_bytes(capacity(4));
+        let mut spool = MemorySpool::new(&resources);
+        // Three payload blocks allocate four index slots.
+        spool.write_all(&vec![7; BLOCK_BYTES * 3]).unwrap();
+        assert_eq!(used(&resources), capacity(3));
+        spool.write_all(b"fourth").unwrap();
+        assert_eq!(used(&resources), capacity(4));
+        // A second spool cannot use the retained capacity.
+        assert!(MemorySpool::new(&resources).write(b"x").is_err());
+        assert_eq!(used(&resources), capacity(4));
+        drop(spool);
         assert_eq!(used(&resources), 0);
     }
 
@@ -242,7 +320,7 @@ mod tests {
             actual.write_all(data).unwrap();
             expected.write_all(data).unwrap();
         }
-        assert_eq!(used(&resources), (BLOCK_BYTES * 4) as u64);
+        assert_eq!(used(&resources), capacity(4));
         assert_eq!(
             actual.seek(SeekFrom::End(-5)).unwrap(),
             expected.seek(SeekFrom::End(-5)).unwrap()
@@ -279,7 +357,7 @@ mod tests {
 
     #[test]
     fn unwinding_releases_payload_blocks_and_their_charge() {
-        let resources = WriterResources::default().with_max_spool_memory_bytes(BLOCK_BYTES as u64);
+        let resources = WriterResources::default().with_max_spool_memory_bytes(capacity(1));
         let failure = std::panic::catch_unwind(|| {
             let mut spool = MemorySpool::new(&resources);
             spool.write_all(b"payload").unwrap();

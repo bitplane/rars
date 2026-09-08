@@ -164,7 +164,7 @@ pub enum Error {
         required: u64,
         used: u64,
     },
-    /// Shared capacity of in-memory spool payload blocks, including reservations.
+    /// Shared capacity of in-memory spool payloads and indexes, including reservations.
     WriterSpoolMemoryLimitExceeded {
         limit: u64,
         required: u64,
@@ -275,7 +275,7 @@ impl std::fmt::Display for Error {
             Self::WriterSpoolLimitExceeded { limit, required, used } => write!(f,
                 "writer spool limit {limit} bytes exceeded (requires {required}; {used} bytes already retained or reserved)"),
             Self::WriterSpoolMemoryLimitExceeded { limit, required, used } => write!(f,
-                "writer spool payload memory limit {limit} bytes exceeded (requires {required}; {used} bytes already retained or reserved)"),
+                "writer spool memory limit {limit} bytes exceeded (requires {required}; {used} bytes already retained or reserved)"),
             Self::MemoryLimitExceeded {
                 limit,
                 required,

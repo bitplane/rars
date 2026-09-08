@@ -66,26 +66,33 @@ their default writer entry points do not acquire a spool limit automatically.
 Rewrite staging and reader scratch created with their own resource policies
 remain outside this group.
 
-## Available quota: memory-spool payload capacity
+## Available quota: memory-spool allocation capacity
 
 `WriterResources::with_max_spool_memory_bytes(limit)` separately caps the shared
-payload allocation capacity of bare-WASM spools. Native file-backed spools have
-no charge against this memory quota. Its default is unlimited and retains the
-existing `Cursor<Vec<u8>>` backend.
+payload and index allocation capacity of bare-WASM spools. Native file-backed
+spools have no charge against this memory quota. Its default is unlimited and
+retains the existing `Cursor<Vec<u8>>` backend.
 
-When configured, a memory spool uses fixed 4096-byte boxed blocks. It reserves
-the complete required capacity before allocating blocks, including padding in
-the last block and zero-filled seek holes. A one-byte payload therefore consumes
-4096 bytes of allowance. The block index may grow without moving or duplicating
-the payload allocations. Its own storage and allocator overhead are outside
-this quota; so are codec workspace, services, headers and output collectors.
-This is a spool **payload-capacity** ceiling, not a complete spool-memory,
-managed-memory or process-RAM ceiling.
+When configured, a memory spool uses fixed 4096-byte boxed payload blocks and
+an index with a power-of-two slot count. The index charges every slot, including
+unused ones, at `size_of::<Option<Box<[u8; 4096]>>>()` bytes per slot (4 on bare
+WASM). A one-byte spool therefore consumes 4100 bytes on bare WASM. Padding in
+payload blocks and zero-filled seek holes also count.
+
+Before growth, admission reserves the resulting payload capacity and index,
+plus the old index if it needs replacement. The old index is freed before its
+charge is released. Payloads stay in place during index replacement. This
+conservative growth reservation can exceed the final retained capacity, so a
+limit that fits the result alone can still refuse growth.
+
+Allocator overhead, inline spool state, codec workspace, services, headers and
+output collectors are outside this quota. It bounds spool heap allocation
+capacity, not aggregate managed memory or process RAM.
 
 Resource clones share the capacity ledger. Parking, rewinding and overwriting
-do not free blocks or their charge. Payload blocks are freed before their charge
-is released on drop. A failed capacity admission leaves existing contents and
-capacity unchanged. Zero allows empty memory spools only. An insufficient limit
+do not free blocks or their charge. Payload blocks and indexes are freed before
+their charge is released on drop. A failed capacity admission leaves existing
+contents and capacity unchanged. Zero allows empty memory spools only. An insufficient limit
 returns `WriterSpoolMemoryLimitExceeded` with `RESOURCE_LIMIT` and the same
 `limit`, `required` and `used` fields as the logical-storage error.
 
@@ -133,8 +140,8 @@ archive version, dictionary, filters, encryption or preservation semantics.
 
 ## Remaining implementation boundaries
 
-Next, extend capacity accounting to spool indexes and other retained allocations,
-and connect workspace allocation allowances to coordinator admission. Then
+Next, extend capacity accounting to other retained allocations and connect
+workspace allocation allowances to coordinator admission. Then
 integrate output collectors and expose the enforceable policies consistently
 through the high-level entry points and bindings. Reader resource accounting is
 a separate follow-up.
