@@ -1,6 +1,6 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rars::rar50::{Archive, ArchiveEntry, Rar50Writer, WriterOptions};
-use rars::{ArchiveReadOptions, ArchiveVersion, EntrySource, FeatureSet};
+use rars::{ArchiveReadOptions, ArchiveVersion, Builder, EntrySource, FeatureSet, WriterResources};
 use std::hint::black_box;
 
 const MEMBER_COUNT: usize = 8;
@@ -155,9 +155,48 @@ fn bench_parallel_extraction(c: &mut Criterion) {
     group.finish();
 }
 
+// Filter search makes several optimal parses of these numeric samples. Unlike
+// the repeated-text fixture, it spends substantial time pricing short matches
+// and exposes overhead in the parser's per-candidate helpers.
+fn bench_candidate_pricing(c: &mut Criterion) {
+    let data: Vec<_> = (0..32768u32)
+        .flat_map(|n| ((n * 71) % 32749).to_le_bytes())
+        .collect();
+    let mut builder = Builder::new(ArchiveVersion::Rar50)
+        .store(false)
+        .compression_level(Some(3));
+    for index in 0..4 {
+        builder
+            .add_bytes(
+                format!("samples-{index}.bin").into_bytes(),
+                data.clone(),
+                None,
+                None,
+            )
+            .expect("benchmark member should be accepted");
+    }
+    let resources = WriterResources::new(256 * 1024 * 1024);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .expect("benchmark Rayon pool should build");
+    let mut group = c.benchmark_group("rar50_candidate_pricing");
+    group.throughput(Throughput::Bytes(4 * data.len() as u64));
+    group.bench_function("numeric_samples", |b| {
+        b.iter(|| {
+            pool.install(|| {
+                builder
+                    .write_to(&mut std::io::sink(), &resources, None)
+                    .expect("benchmark archive writing should succeed");
+            });
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     name = benches;
     config = Criterion::default().sample_size(10);
-    targets = bench_parallel_compression, bench_parallel_extraction
+    targets = bench_parallel_compression, bench_parallel_extraction, bench_candidate_pricing
 );
 criterion_main!(benches);

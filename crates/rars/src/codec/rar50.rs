@@ -1989,6 +1989,10 @@ impl TokenPrices<'_> {
         Self::code(self.lengths.main[byte as usize])
     }
 
+    // This is the inner optimal-parse loop's pricing operation. Keep it in
+    // that loop rather than returning a codec Result through a stack slot for
+    // every candidate length, including across generic codegen units.
+    #[inline(always)]
     fn match_cost(
         &self,
         state: &EncoderMatchState,
@@ -2077,13 +2081,6 @@ fn optimal_tokens_in_workspace<B: Budget>(
     arrive_last_length.resize(span + 1, 0)?;
     arrive_last_length.fill(0);
     price[0] = 0;
-    // Resizing is complete. Keep exclusive slices for the parse so allocation
-    // owners and allowance bookkeeping stay outside the per-position loop.
-    let price = &mut **price;
-    let arrive_length = &mut **arrive_length;
-    let arrive_distance = &mut **arrive_distance;
-    let arrive_reps = &mut **arrive_reps;
-    let arrive_last_length = &mut **arrive_last_length;
 
     // Runs of `(shortest, longest, distance)` from the position being priced,
     // in the order the collector found them. Reused to keep one allocation.
@@ -2558,6 +2555,9 @@ fn consider_match_candidate(
     }
 }
 
+// Generic parsers can be instantiated in a different codegen unit. Keep the
+// estimate available for inlining into their per-length pricing loop.
+#[inline]
 fn estimated_match_cost(
     state: &EncoderMatchState,
     length: usize,

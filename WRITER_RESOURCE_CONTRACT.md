@@ -216,9 +216,12 @@ recovery workspace still need migration. Only after those paths are covered
 can the coordinator supply reserved allowances and connect them to preparation
 and spool memory. There is no public worker allowance or extension API yet.
 The workspace/admission pass remains open until those guarantees are enforceable.
-The allocation migration also has an unresolved compression-time regression in
-the synthetic compressed-member comparison (roughly 7–10% in the latest samples, with unchanged bytes and similar RSS). Resolve that
-before closing the pass or releasing the policy.
+
+The optimal parser keeps match-pricing helpers available for inlining across
+generic codegen units. The numeric-sample workload in
+`cargo bench -p rars --bench parallel -- rar50_candidate_pricing` exercises
+the per-candidate pricing cost during filter search; keep it in performance
+comparisons when changing allocation owners or parser boundaries.
 
 ## Contract for a future managed-memory ceiling
 
