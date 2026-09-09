@@ -1,5 +1,5 @@
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use super::workspace::{Allowance, Budget, Buffer};
+use super::Result;
 
 /// Like [`lengths_for_frequencies`], but guarantees the returned code lengths
 /// form a *complete* canonical prefix code (Kraft equality) whenever at least
@@ -14,12 +14,11 @@ use std::collections::BinaryHeap;
 /// already complete, so this only adjusts the degenerate single-symbol case (and
 /// the rare uniform-length fallback), padding with phantom codes that are never
 /// emitted.
+#[cfg(test)]
 pub(crate) fn complete_lengths_for_frequencies(frequencies: &[usize], max_bits: u8) -> Vec<u8> {
-    let mut lengths = lengths_for_frequencies(frequencies, max_bits);
-    if !is_complete_code(&lengths) {
-        assign_flat_complete_code(&mut lengths);
-    }
-    lengths
+    complete_lengths_with_allowance(frequencies, max_bits, &Allowance::default())
+        .expect("unlimited Huffman allocation")
+        .into_vec()
 }
 
 /// Returns true if the non-zero code lengths form a complete prefix code
@@ -48,80 +47,154 @@ fn is_complete_code(lengths: &[u8]) -> bool {
 /// with `Full`/`Full_or_Empty`) can mark used symbols with any non-zero length
 /// and call this to normalise them.
 pub(crate) fn assign_flat_complete_code(lengths: &mut [u8]) {
-    let used: Vec<usize> = lengths
-        .iter()
-        .enumerate()
-        .filter(|(_, &len)| len != 0)
-        .map(|(symbol, _)| symbol)
-        .collect();
-    let n = used.len();
+    let n = lengths.iter().filter(|&&length| length != 0).count();
     if n == 0 {
         return;
     }
-    for len in lengths.iter_mut() {
-        *len = 0;
-    }
     if n == 1 {
-        lengths[used[0]] = 1;
-        // Pad with one phantom length-1 code so the two codes fill the space.
-        let phantom = if used[0] == 0 { 1 } else { 0 };
+        let symbol = lengths.iter().position(|&length| length != 0).unwrap();
+        lengths[symbol] = 1;
+        let phantom = usize::from(symbol == 0);
         if phantom < lengths.len() {
             lengths[phantom] = 1;
         }
         return;
     }
-    // Complete "flat" code: with k = ceil(log2 n), assign `2^k - n` symbols
-    // length k-1 and the remaining `2n - 2^k` symbols length k. This satisfies
-    // Kraft equality exactly.
-    let k = (usize::BITS - (n - 1).leading_zeros()) as u8; // ceil(log2 n)
-    let cap = 1usize << k;
-    let short_count = cap - n; // symbols at length k-1
-    for (i, &symbol) in used.iter().enumerate() {
-        lengths[symbol] = if i < short_count { k - 1 } else { k };
+    let k = (usize::BITS - (n - 1).leading_zeros()) as u8;
+    let short_count = (1usize << k) - n;
+    for (index, length) in lengths
+        .iter_mut()
+        .filter(|length| **length != 0)
+        .enumerate()
+    {
+        *length = if index < short_count { k - 1 } else { k };
     }
 }
 
 pub(crate) fn lengths_for_frequencies(frequencies: &[usize], max_bits: u8) -> Vec<u8> {
+    lengths_with_allowance(frequencies, max_bits, &Allowance::default())
+        .expect("unlimited Huffman allocation")
+        .into_vec()
+}
+
+pub(crate) fn complete_lengths_with_allowance<B: Budget>(
+    frequencies: &[usize],
+    max_bits: u8,
+    allowance: &B,
+) -> Result<Buffer<u8, B>> {
+    let mut lengths = lengths_with_allowance(frequencies, max_bits, allowance)?;
+    if !is_complete_code(&lengths) {
+        assign_flat_complete_code(&mut lengths);
+    }
+    Ok(lengths)
+}
+
+pub(crate) fn lengths_with_allowance<B: Budget>(
+    frequencies: &[usize],
+    max_bits: u8,
+    allowance: &B,
+) -> Result<Buffer<u8, B>> {
     let used_count = frequencies
         .iter()
         .filter(|&&frequency| frequency != 0)
         .count();
+    let mut lengths = Buffer::filled(frequencies.len(), 0u8, allowance)?;
     if used_count <= 1 {
-        return uniform_lengths_for_frequencies(frequencies);
+        uniform_lengths_into(&mut lengths, frequencies);
+        return Ok(lengths);
     }
 
-    let mut lengths = vec![0u8; frequencies.len()];
-    let mut heap = BinaryHeap::new();
-    let mut order = 0usize;
+    // Parents replace the old per-node symbol vectors. Node order breaks ties
+    // exactly as the original heap did; every parent is created after its children.
+    let capacity = frequencies
+        .len()
+        .checked_add(used_count - 1)
+        .ok_or(super::Error::InvalidData("Huffman node count overflows"))?;
+    let mut parents = Buffer::filled(capacity, usize::MAX, allowance)?;
+    let mut heap = Buffer::with_capacity(used_count, allowance)?;
+    let mut order = 0;
     for (symbol, &frequency) in frequencies.iter().enumerate() {
-        if frequency == 0 {
-            continue;
+        if frequency != 0 {
+            heap.push((frequency, order, symbol)).map_err(Into::into)?;
+            order += 1;
         }
-        heap.push(Reverse((frequency, order, vec![symbol])));
-        order += 1;
     }
-
+    // Sorting once constructs a valid min-heap without auxiliary allocation.
+    heap.sort_unstable();
+    let mut next = frequencies.len();
     while heap.len() > 1 {
-        let Reverse((left_frequency, _, mut left_symbols)) =
-            heap.pop().expect("frequency heap has a left node");
-        let Reverse((right_frequency, _, mut right_symbols)) =
-            heap.pop().expect("frequency heap has a right node");
-        for &symbol in left_symbols.iter().chain(right_symbols.iter()) {
-            lengths[symbol] += 1;
+        let (left_frequency, _, left) = pop_min(&mut heap);
+        let (right_frequency, _, right) = pop_min(&mut heap);
+        parents[left] = next;
+        parents[right] = next;
+        heap.push((left_frequency.saturating_add(right_frequency), order, next))
+            .map_err(Into::into)?;
+        let mut child = heap.len() - 1;
+        while child != 0 {
+            let parent = (child - 1) / 2;
+            if heap[parent] <= heap[child] {
+                break;
+            }
+            heap.swap(parent, child);
+            child = parent;
         }
-        left_symbols.append(&mut right_symbols);
-        heap.push(Reverse((
-            left_frequency.saturating_add(right_frequency),
-            order,
-            left_symbols,
-        )));
+        next += 1;
         order += 1;
     }
-
+    // Replace parent indices with depths in reverse creation order.
+    for node in (0..next).rev() {
+        parents[node] = if parents[node] == usize::MAX {
+            0
+        } else {
+            parents[parents[node]] + 1
+        };
+    }
+    for (length, &depth) in lengths.iter_mut().zip(parents.iter()) {
+        *length = depth as u8;
+    }
     if lengths.iter().any(|&length| length > max_bits) {
         limit_code_lengths(&mut lengths, frequencies, max_bits);
     }
-    lengths
+    Ok(lengths)
+}
+
+fn pop_min<B: Budget>(heap: &mut Buffer<(usize, usize, usize), B>) -> (usize, usize, usize) {
+    let last = heap.pop().expect("frequency heap has a node");
+    if heap.is_empty() {
+        return last;
+    }
+    let first = std::mem::replace(&mut heap[0], last);
+    let mut parent = 0;
+    loop {
+        let left = parent * 2 + 1;
+        if left >= heap.len() {
+            break;
+        }
+        let right = left + 1;
+        let child = if right < heap.len() && heap[right] < heap[left] {
+            right
+        } else {
+            left
+        };
+        if heap[parent] <= heap[child] {
+            break;
+        }
+        heap.swap(parent, child);
+        parent = child;
+    }
+    first
+}
+
+fn uniform_lengths_into(lengths: &mut [u8], frequencies: &[usize]) {
+    let bits = bits_for_symbol_count(
+        frequencies
+            .iter()
+            .filter(|&&frequency| frequency != 0)
+            .count(),
+    );
+    for (length, &frequency) in lengths.iter_mut().zip(frequencies) {
+        *length = if frequency == 0 { 0 } else { bits };
+    }
 }
 
 /// Bring every code length down to `max_bits`, keeping the code complete.
@@ -142,7 +215,7 @@ fn limit_code_lengths(lengths: &mut [u8], frequencies: &[usize], max_bits: u8) {
     // is arranged, so there is nothing to repair towards.
     let used = lengths.iter().filter(|&&length| length != 0).count();
     if max_bits == 0 || max_bits >= usize::BITS as u8 || used > (1usize << max_bits) {
-        lengths.copy_from_slice(&uniform_lengths_for_frequencies(frequencies));
+        uniform_lengths_into(lengths, frequencies);
         return;
     }
 
@@ -212,6 +285,85 @@ pub(crate) fn bits_for_symbol_count(count: usize) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn charged_tree_preserves_heap_ties_and_saturating_frequencies() {
+        // Independent reference for the replaced per-node symbol-list tree.
+        fn reference(frequencies: &[usize]) -> Vec<u8> {
+            use std::{cmp::Reverse, collections::BinaryHeap};
+            let mut lengths = vec![0u8; frequencies.len()];
+            let mut heap = BinaryHeap::new();
+            let mut order = 0;
+            for (symbol, &frequency) in frequencies.iter().enumerate() {
+                if frequency != 0 {
+                    heap.push(Reverse((frequency, order, vec![symbol])));
+                    order += 1;
+                }
+            }
+            if heap.len() <= 1 {
+                uniform_lengths_into(&mut lengths, frequencies);
+                return lengths;
+            }
+            while heap.len() > 1 {
+                let Reverse((left, _, mut symbols)) = heap.pop().unwrap();
+                let Reverse((right, _, mut other)) = heap.pop().unwrap();
+                for &symbol in symbols.iter().chain(&other) {
+                    lengths[symbol] += 1;
+                }
+                symbols.append(&mut other);
+                heap.push(Reverse((left.saturating_add(right), order, symbols)));
+                order += 1;
+            }
+            if lengths.iter().any(|&length| length > 15) {
+                limit_code_lengths(&mut lengths, frequencies, 15);
+            }
+            lengths
+        }
+        let allowance = Allowance::limited(1024 * 1024);
+        let mut state = 71u64;
+        for count in [0, 1, 2, 20, 64, 306, 1024] {
+            for shape in 0..8 {
+                let frequencies: Vec<_> = (0..count)
+                    .map(|_| {
+                        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        match shape {
+                            0 => 0,
+                            1 => 1,
+                            2 => usize::MAX,
+                            3 => (state % 3) as usize,
+                            _ => (state >> (shape * 7)) as usize,
+                        }
+                    })
+                    .collect();
+                let actual = lengths_with_allowance(&frequencies, 15, &allowance).unwrap();
+                assert_eq!(&*actual, reference(&frequencies));
+                assert_eq!(allowance.used(), count as u64);
+                drop(actual);
+                assert_eq!(allowance.used(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn tree_refusal_releases_scratch_and_success_retains_only_lengths() {
+        let frequencies = [1, 3, 7, 11];
+        let peak = 4
+            + 7 * std::mem::size_of::<usize>() as u64
+            + 4 * std::mem::size_of::<(usize, usize, usize)>() as u64;
+        for limit in [0, 4, peak - 1] {
+            let allowance = Allowance::limited(limit);
+            assert!(matches!(
+                lengths_with_allowance(&frequencies, 15, &allowance),
+                Err(super::super::Error::WorkspaceLimitExceeded(_))
+            ));
+            assert_eq!(allowance.used(), 0);
+        }
+        let allowance = Allowance::limited(peak);
+        let lengths = complete_lengths_with_allowance(&frequencies, 15, &allowance).unwrap();
+        assert_eq!(allowance.used(), 4);
+        drop(lengths);
+        assert_eq!(allowance.used(), 0);
+    }
 
     #[test]
     fn weighted_lengths_favour_common_symbols() {

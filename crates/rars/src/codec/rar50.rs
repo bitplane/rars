@@ -234,6 +234,31 @@ pub struct TableLengths {
     pub length: Vec<u8>,
 }
 
+struct EncoderLengths<B: Budget = Allowance> {
+    main: Buffer<u8, B>,
+    distance: Buffer<u8, B>,
+    align: Buffer<u8, B>,
+    length: Buffer<u8, B>,
+}
+
+#[derive(Clone, Copy)]
+struct LengthSlices<'a> {
+    main: &'a [u8],
+    distance: &'a [u8],
+    align: &'a [u8],
+    length: &'a [u8],
+}
+impl<B: Budget> EncoderLengths<B> {
+    fn slices(&self) -> LengthSlices<'_> {
+        LengthSlices {
+            main: &self.main,
+            distance: &self.distance,
+            align: &self.align,
+            length: &self.length,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DecodeTables {
     pub main: HuffmanTable,
@@ -451,6 +476,24 @@ pub fn encode_table_lengths_with_bit_count(
     lengths: &TableLengths,
     algorithm_version: u8,
 ) -> Result<(Vec<u8>, usize)> {
+    encode_table_slices(
+        LengthSlices {
+            main: &lengths.main,
+            distance: &lengths.distance,
+            align: &lengths.align,
+            length: &lengths.length,
+        },
+        algorithm_version,
+        &Allowance::default(),
+    )
+    .map(|(bytes, bits)| (bytes.into_vec(), bits))
+}
+
+fn encode_table_slices<B: Budget>(
+    lengths: LengthSlices<'_>,
+    algorithm_version: u8,
+    allowance: &B,
+) -> Result<(Buffer<u8, B>, usize)> {
     let distance_size = match algorithm_version {
         0 => DISTANCE_TABLE_SIZE_50,
         1 => DISTANCE_TABLE_SIZE_70,
@@ -468,37 +511,43 @@ pub fn encode_table_lengths_with_bit_count(
         return Err(Error::InvalidData("RAR 5 table length count mismatch"));
     }
 
-    let flattened = lengths
+    let mut flattened = Buffer::with_capacity(table_length_count(algorithm_version)?, allowance)?;
+    for &length in lengths
         .main
         .iter()
-        .chain(lengths.distance.iter())
-        .chain(lengths.align.iter())
-        .chain(lengths.length.iter())
-        .copied()
-        .collect::<Vec<_>>();
-    for &length in &flattened {
+        .chain(lengths.distance)
+        .chain(lengths.align)
+        .chain(lengths.length)
+    {
+        flattened.push(length).map_err(Into::into)?;
+    }
+    for &length in flattened.iter() {
         if length > 15 {
             return Err(Error::InvalidData("RAR 5 Huffman length is too large"));
         }
     }
 
-    let level_tokens = encode_table_level_tokens(&flattened);
-    let level_lengths = level_code_lengths_for_tokens(&level_tokens);
-    let level_table = HuffmanTable::from_lengths(&level_lengths)?;
-    let mut writer = BitWriter::new();
-    write_level_lengths(&mut writer, &level_lengths);
-    for token in level_tokens {
+    let level_tokens = encode_table_level_tokens_with_allowance(&flattened, allowance)?;
+    let level_lengths = level_code_lengths_with_allowance(&level_tokens, allowance)?;
+    let level_table = EncoderCodeTable::from_lengths(&level_lengths, allowance)?;
+    let mut writer = BitWriter::with_allowance(allowance);
+    try_write_level_lengths(&mut writer, &level_lengths)?;
+    for token in level_tokens.iter() {
         let (code, len) = level_table.code_for_symbol(token.symbol)?;
-        writer.write_bits(usize::from(code), usize::from(len));
+        writer
+            .try_write_bits(usize::from(code), usize::from(len))
+            .map_err(Into::into)?;
         if token.extra_bits != 0 {
-            writer.write_bits(
-                usize::from(token.extra_value),
-                usize::from(token.extra_bits),
-            );
+            writer
+                .try_write_bits(
+                    usize::from(token.extra_value),
+                    usize::from(token.extra_bits),
+                )
+                .map_err(Into::into)?;
         }
     }
     let bit_count = writer.bit_pos;
-    Ok((writer.finish(), bit_count))
+    Ok((writer.bytes, bit_count))
 }
 
 pub fn encode_compressed_block(
@@ -507,6 +556,22 @@ pub fn encode_compressed_block(
     has_tables: bool,
     is_last: bool,
 ) -> Result<Vec<u8>> {
+    encode_compressed_block_with_allowance(
+        payload,
+        payload_bits,
+        has_tables,
+        is_last,
+        &Allowance::default(),
+    )
+    .map(Buffer::into_vec)
+}
+fn encode_compressed_block_with_allowance<B: Budget>(
+    payload: &[u8],
+    payload_bits: usize,
+    has_tables: bool,
+    is_last: bool,
+    allowance: &B,
+) -> Result<Buffer<u8, B>> {
     if payload_bits > payload.len() * 8 {
         return Err(Error::InvalidData("RAR 5 block bit count exceeds payload"));
     }
@@ -555,11 +620,12 @@ pub fn encode_compressed_block(
     let checksum = size_bytes[..size_len]
         .iter()
         .fold(0x5a ^ flags, |acc, &byte| acc ^ byte);
-    let mut out = Vec::with_capacity(2 + size_len + payload.len());
-    out.push(flags);
-    out.push(checksum);
-    out.extend_from_slice(&size_bytes[..size_len]);
-    out.extend_from_slice(payload);
+    let mut out = Buffer::with_capacity(2 + size_len + payload.len(), allowance)?;
+    out.push(flags).map_err(Into::into)?;
+    out.push(checksum).map_err(Into::into)?;
+    out.extend_from_slice(&size_bytes[..size_len])
+        .map_err(Into::into)?;
+    out.extend_from_slice(payload).map_err(Into::into)?;
     Ok(out)
 }
 
@@ -612,7 +678,7 @@ pub fn encode_literal_only(data: &[u8], algorithm_version: u8) -> Result<Vec<u8>
     let (table_data, table_bits) =
         encode_table_lengths_with_bit_count(&lengths, algorithm_version)?;
     let mut writer = BitWriter {
-        bytes: table_data,
+        bytes: Buffer::from_vec(table_data),
         bit_pos: table_bits,
     };
     for &byte in data {
@@ -1120,21 +1186,66 @@ fn encode_lz_member_inner(
     algorithm_version: u8,
     initial_filters: &[EncodeFilter],
     options: EncodeOptions,
-    mut progress: Option<&mut dyn FnMut(usize) -> bool>,
+    progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<u8>> {
+    encode_member_with_allowance(
+        data,
+        history,
+        algorithm_version,
+        initial_filters,
+        options,
+        progress,
+        &Allowance::default(),
+    )
+    .map(Buffer::into_vec)
+}
+
+fn encode_member_with_allowance<B: Budget>(
+    data: &[u8],
+    history: &[u8],
+    algorithm_version: u8,
+    initial_filters: &[EncodeFilter],
+    options: EncodeOptions,
+    mut progress: Option<&mut dyn FnMut(usize) -> bool>,
+    allowance: &B,
+) -> Result<Buffer<u8, B>> {
+    let history = &history[history.len().saturating_sub(options.max_match_distance)..];
+    let mut window;
+    let combined = if history.is_empty() {
+        data
+    } else {
+        let capacity = history
+            .len()
+            .checked_add(data.len())
+            .ok_or(Error::InvalidData("RAR 5 input window size overflows"))?;
+        window = Buffer::with_capacity(capacity, allowance)?;
+        window.extend_from_slice(history).map_err(Into::into)?;
+        window.extend_from_slice(data).map_err(Into::into)?;
+        &window
+    };
+    let start = history.len();
     if data.len() > LZ_BLOCK_SIZE && initial_filters.is_empty() {
         // One search state for the whole member. It used to be built per
         // block, which meant rehashing a window of history every 64 KiB: on a
         // 16 MiB member that was half the encode. The optimal parse used to be
         // worse still, rebuilding per pass; its collector searches each block
         // once and lets the passes replay the answers.
-        let (combined, start) = member_window(data, history, options);
-        let mut lazy = (!options.optimal_parse).then(|| member_finder(&combined, start, options));
-        let mut collector = options
-            .optimal_parse
-            .then(|| OptimalCollector::new(&combined, start, options));
+        let mut lazy = if options.optimal_parse {
+            None
+        } else {
+            Some(member_finder_with_allowance(
+                combined, start, options, allowance,
+            )?)
+        };
+        let mut collector = if options.optimal_parse {
+            Some(OptimalCollector::with_allowance(
+                combined, start, options, allowance,
+            )?)
+        } else {
+            None
+        };
 
-        let mut out = Vec::new();
+        let mut out = Buffer::new(allowance);
         let mut completed = 0usize;
         let mut block_start = start;
         let mut splitter = BlockSplitter::new();
@@ -1159,8 +1270,8 @@ fn encode_lz_member_inner(
                     .as_deref_mut()
                     .is_none_or(|report| report(completed.saturating_add(position)))
             };
-            out.extend(encode_lz_block_in_window(
-                &combined,
+            let packed = encode_lz_block_with_allowance(
+                combined,
                 block_start..block_end,
                 match (&mut lazy, &mut collector) {
                     (Some(finder), _) => MemberSearch::Lazy(finder),
@@ -1172,20 +1283,24 @@ fn encode_lz_member_inner(
                 options,
                 is_last,
                 Some(&mut chunk_progress),
-            )?);
+                allowance,
+            )?;
+            out.extend_from_slice(&packed).map_err(Into::into)?;
             completed = completed.saturating_add(block_end - block_start);
             block_start = block_end;
         }
         return Ok(out);
     }
-    encode_lz_block(
-        data,
-        history,
+    encode_lz_block_with_allowance(
+        combined,
+        start..combined.len(),
+        MemberSearch::Fresh,
         algorithm_version,
         initial_filters,
         options,
         true,
         progress,
+        allowance,
     )
 }
 
@@ -1519,6 +1634,40 @@ fn encode_lz_block_in_window(
     is_last: bool,
     progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<u8>> {
+    let allowance = match &search {
+        MemberSearch::Fresh => Allowance::default(),
+        MemberSearch::Lazy(finder) => finder.allowance(),
+        MemberSearch::Optimal(collector) => match &collector.finder {
+            CollectorFinder::Tree(finder) => finder.allowance(),
+            CollectorFinder::Chains(finder) => finder.allowance(),
+        },
+    };
+    encode_lz_block_with_allowance(
+        combined,
+        block,
+        search,
+        algorithm_version,
+        initial_filters,
+        options,
+        is_last,
+        progress,
+        &allowance,
+    )
+    .map(Buffer::into_vec)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_lz_block_with_allowance<B: Budget>(
+    combined: &[u8],
+    block: std::ops::Range<usize>,
+    search: MemberSearch<'_, B>,
+    algorithm_version: u8,
+    initial_filters: &[EncodeFilter],
+    options: EncodeOptions,
+    is_last: bool,
+    progress: Option<&mut dyn FnMut(usize) -> bool>,
+    allowance: &B,
+) -> Result<Buffer<u8, B>> {
     let distance_size = match algorithm_version {
         0 => DISTANCE_TABLE_SIZE_50,
         1 => DISTANCE_TABLE_SIZE_70,
@@ -1528,7 +1677,7 @@ fn encode_lz_block_in_window(
             ))
         }
     };
-    let mut tokens = encode_tokens_with_progress(
+    let mut tokens = encode_tokens_with_allowance(
         combined,
         block,
         search,
@@ -1536,27 +1685,51 @@ fn encode_lz_block_in_window(
         distance_size,
         initial_filters,
         progress,
+        allowance,
     )?;
     if !initial_filters.is_empty() {
         tokens.prepend(initial_filters.iter().copied().map(EncodeToken::Filter))?;
     }
-    encode_token_block(&tokens, algorithm_version, distance_size, is_last)
+    encode_token_block_with_allowance(
+        &tokens,
+        algorithm_version,
+        distance_size,
+        is_last,
+        allowance,
+    )
 }
 
+#[cfg(test)]
 fn encode_token_block(
     tokens: &[EncodeToken],
     algorithm_version: u8,
     distance_size: usize,
     is_last: bool,
 ) -> Result<Vec<u8>> {
-    let lengths = table_lengths_for_tokens(tokens, distance_size)?;
+    encode_token_block_with_allowance(
+        tokens,
+        algorithm_version,
+        distance_size,
+        is_last,
+        &Allowance::default(),
+    )
+    .map(Buffer::into_vec)
+}
+fn encode_token_block_with_allowance<B: Budget>(
+    tokens: &[EncodeToken],
+    algorithm_version: u8,
+    distance_size: usize,
+    is_last: bool,
+    allowance: &B,
+) -> Result<Buffer<u8, B>> {
+    let lengths = table_lengths_with_allowance(tokens, &[], distance_size, allowance)?;
 
-    let main_table = HuffmanTable::from_lengths(&lengths.main)?;
-    let distance_table = HuffmanTable::from_lengths(&lengths.distance)?;
-    let align_table = HuffmanTable::from_lengths(&lengths.align)?;
-    let length_table = HuffmanTable::from_lengths(&lengths.length)?;
+    let main_table = EncoderCodeTable::from_lengths(&lengths.main, allowance)?;
+    let distance_table = EncoderCodeTable::from_lengths(&lengths.distance, allowance)?;
+    let align_table = EncoderCodeTable::from_lengths(&lengths.align, allowance)?;
+    let length_table = EncoderCodeTable::from_lengths(&lengths.length, allowance)?;
     let (table_data, table_bits) =
-        encode_table_lengths_with_bit_count(&lengths, algorithm_version)?;
+        encode_table_slices(lengths.slices(), algorithm_version, allowance)?;
     let mut writer = BitWriter {
         bytes: table_data,
         bit_pos: table_bits,
@@ -1566,18 +1739,24 @@ fn encode_token_block(
         match token {
             EncodeToken::Filter(filter) => {
                 let (code, len) = main_table.code_for_symbol(256)?;
-                writer.write_bits(usize::from(code), usize::from(len));
-                write_filter(&mut writer, filter)?;
+                writer
+                    .try_write_bits(usize::from(code), usize::from(len))
+                    .map_err(Into::into)?;
+                try_write_filter(&mut writer, filter)?;
             }
             EncodeToken::Literal(byte) => {
                 let (code, len) = main_table.code_for_symbol(byte as usize)?;
-                writer.write_bits(usize::from(code), usize::from(len));
+                writer
+                    .try_write_bits(usize::from(code), usize::from(len))
+                    .map_err(Into::into)?;
             }
             EncodeToken::Match { length, distance } => {
                 match state.encode_match(length, distance, distance_size)? {
                     EncodedMatch::LastLengthRepeat => {
                         let (code, len) = main_table.code_for_symbol(257)?;
-                        writer.write_bits(usize::from(code), usize::from(len));
+                        writer
+                            .try_write_bits(usize::from(code), usize::from(len))
+                            .map_err(Into::into)?;
                     }
                     EncodedMatch::RepeatDistance {
                         index,
@@ -1585,12 +1764,18 @@ fn encode_token_block(
                         length_extra,
                     } => {
                         let (code, len) = main_table.code_for_symbol(258 + index)?;
-                        writer.write_bits(usize::from(code), usize::from(len));
+                        writer
+                            .try_write_bits(usize::from(code), usize::from(len))
+                            .map_err(Into::into)?;
                         let (code, len) = length_table.code_for_symbol(length_slot)?;
-                        writer.write_bits(usize::from(code), usize::from(len));
+                        writer
+                            .try_write_bits(usize::from(code), usize::from(len))
+                            .map_err(Into::into)?;
                         let length_extra_bits = length_slot_extra_bits(length_slot)?;
                         if length_extra_bits != 0 {
-                            writer.write_bits(length_extra, usize::from(length_extra_bits));
+                            writer
+                                .try_write_bits(length_extra, usize::from(length_extra_bits))
+                                .map_err(Into::into)?;
                         }
                     }
                     EncodedMatch::New {
@@ -1601,21 +1786,33 @@ fn encode_token_block(
                         distance_bit_count,
                     } => {
                         let (code, len) = main_table.code_for_symbol(262 + length_slot)?;
-                        writer.write_bits(usize::from(code), usize::from(len));
+                        writer
+                            .try_write_bits(usize::from(code), usize::from(len))
+                            .map_err(Into::into)?;
                         let length_extra_bits = length_slot_extra_bits(length_slot)?;
                         if length_extra_bits != 0 {
-                            writer.write_bits(length_extra, usize::from(length_extra_bits));
+                            writer
+                                .try_write_bits(length_extra, usize::from(length_extra_bits))
+                                .map_err(Into::into)?;
                         }
                         let (code, len) = distance_table.code_for_symbol(distance_slot)?;
-                        writer.write_bits(usize::from(code), usize::from(len));
+                        writer
+                            .try_write_bits(usize::from(code), usize::from(len))
+                            .map_err(Into::into)?;
                         if distance_bit_count >= 4 {
                             if distance_bit_count > 4 {
-                                writer.write_bits(distance_extra >> 4, distance_bit_count - 4);
+                                writer
+                                    .try_write_bits(distance_extra >> 4, distance_bit_count - 4)
+                                    .map_err(Into::into)?;
                             }
                             let (code, len) = align_table.code_for_symbol(distance_extra & 0x0f)?;
-                            writer.write_bits(usize::from(code), usize::from(len));
+                            writer
+                                .try_write_bits(usize::from(code), usize::from(len))
+                                .map_err(Into::into)?;
                         } else if distance_bit_count != 0 {
-                            writer.write_bits(distance_extra, distance_bit_count);
+                            writer
+                                .try_write_bits(distance_extra, distance_bit_count)
+                                .map_err(Into::into)?;
                         }
                     }
                 }
@@ -1625,7 +1822,7 @@ fn encode_token_block(
     }
 
     let payload_bits = writer.bit_pos;
-    encode_compressed_block(&writer.finish(), payload_bits, true, is_last)
+    encode_compressed_block_with_allowance(&writer.bytes, payload_bits, true, is_last, allowance)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1842,20 +2039,34 @@ impl EncoderMatchState {
 /// The Huffman code lengths a block of tokens produces. The block writer needs
 /// these to emit the tables; the optimal parse needs them to know what each
 /// token it is considering will actually cost.
-fn table_lengths_for_tokens(tokens: &[EncodeToken], distance_size: usize) -> Result<TableLengths> {
+#[cfg(test)]
+fn table_lengths_for_tokens(
+    tokens: &[EncodeToken],
+    distance_size: usize,
+) -> Result<EncoderLengths> {
     table_lengths_with_filters(tokens, &[], distance_size)
 }
 
+#[cfg(test)]
 fn table_lengths_with_filters(
     tokens: &[EncodeToken],
     filters: &[EncodeFilter],
     distance_size: usize,
-) -> Result<TableLengths> {
-    let mut main_frequencies = vec![0usize; MAIN_TABLE_SIZE];
+) -> Result<EncoderLengths> {
+    table_lengths_with_allowance(tokens, filters, distance_size, &Allowance::default())
+}
+
+fn table_lengths_with_allowance<B: Budget>(
+    tokens: &[EncodeToken],
+    filters: &[EncodeFilter],
+    distance_size: usize,
+    allowance: &B,
+) -> Result<EncoderLengths<B>> {
+    let mut main_frequencies = Buffer::filled(MAIN_TABLE_SIZE, 0usize, allowance)?;
     main_frequencies[256] = filters.len();
-    let mut distance_frequencies = vec![0usize; distance_size];
-    let mut align_frequencies = vec![0usize; ALIGN_TABLE_SIZE];
-    let mut length_frequencies = vec![0usize; LENGTH_TABLE_SIZE];
+    let mut distance_frequencies = Buffer::filled(distance_size, 0usize, allowance)?;
+    let mut align_frequencies = Buffer::filled(ALIGN_TABLE_SIZE, 0usize, allowance)?;
+    let mut length_frequencies = Buffer::filled(LENGTH_TABLE_SIZE, 0usize, allowance)?;
     let mut state = EncoderMatchState::default();
     for token in tokens {
         match *token {
@@ -1889,20 +2100,20 @@ fn table_lengths_with_filters(
         }
     }
 
-    Ok(TableLengths {
-        main: huffman::complete_lengths_for_frequencies(&main_frequencies, 15),
-        distance: huffman::complete_lengths_for_frequencies(&distance_frequencies, 15),
-        align: huffman::complete_lengths_for_frequencies(&align_frequencies, 15),
-        length: huffman::complete_lengths_for_frequencies(&length_frequencies, 15),
+    Ok(EncoderLengths {
+        main: huffman::complete_lengths_with_allowance(&main_frequencies, 15, allowance)?,
+        distance: huffman::complete_lengths_with_allowance(&distance_frequencies, 15, allowance)?,
+        align: huffman::complete_lengths_with_allowance(&align_frequencies, 15, allowance)?,
+        length: huffman::complete_lengths_with_allowance(&length_frequencies, 15, allowance)?,
     })
 }
 
 /// Actual payload size, including the transmitted tables and filter records.
 /// Padding and block-header size are monotonic in this bit count.
-fn token_stream_bits(
+fn token_stream_bits<B: Budget>(
     tokens: &[EncodeToken],
     filters: &[EncodeFilter],
-    lengths: &TableLengths,
+    lengths: &EncoderLengths<B>,
     distance_size: usize,
 ) -> Result<usize> {
     let version = if distance_size == DISTANCE_TABLE_SIZE_70 {
@@ -1910,7 +2121,8 @@ fn token_stream_bits(
     } else {
         0
     };
-    let (_, mut bits) = encode_table_lengths_with_bit_count(lengths, version)?;
+    let allowance = lengths.main.allowance();
+    let (_, mut bits) = encode_table_slices(lengths.slices(), version, &allowance)?;
     let prices = TokenPrices { lengths };
     let mut state = EncoderMatchState::default();
     for token in filters
@@ -1926,8 +2138,8 @@ fn token_stream_bits(
                 state.remember(length, distance);
             }
             EncodeToken::Filter(filter) => {
-                let mut writer = BitWriter::new();
-                write_filter(&mut writer, filter)?;
+                let mut writer = BitWriter::with_allowance(&allowance);
+                try_write_filter(&mut writer, filter)?;
                 bits += usize::from(lengths.main[256]) + writer.bit_pos;
             }
         }
@@ -1972,11 +2184,11 @@ const UNUSED_SYMBOL_COST: usize = 15;
 /// Prices a token against the code lengths a previous pass produced, which is
 /// what the block will really spend, rather than against the flat guess in
 /// [`estimated_match_cost`].
-struct TokenPrices<'a> {
-    lengths: &'a TableLengths,
+struct TokenPrices<'a, B: Budget = Allowance> {
+    lengths: &'a EncoderLengths<B>,
 }
 
-impl TokenPrices<'_> {
+impl<B: Budget> TokenPrices<'_, B> {
     fn code(bits: u8) -> usize {
         if bits == 0 {
             UNUSED_SYMBOL_COST
@@ -2054,7 +2266,7 @@ fn optimal_tokens_in_workspace<B: Budget>(
     block: std::ops::Range<usize>,
     options: EncodeOptions,
     distance_size: usize,
-    prices: Option<&TokenPrices<'_>>,
+    prices: Option<&TokenPrices<'_, B>>,
     matches: &BlockMatches<B>,
     workspace: &mut OptimalWorkspace<B>,
 ) -> Result<Buffer<EncodeToken, B>> {
@@ -2232,6 +2444,7 @@ fn optimal_tokens_in_workspace<B: Budget>(
     Ok(reversed)
 }
 
+#[cfg(test)]
 fn encode_tokens_with_progress(
     combined: &[u8],
     block: std::ops::Range<usize>,
@@ -2297,7 +2510,8 @@ fn encode_tokens_with_allowance<B: Budget>(
             &matches,
             &mut workspace,
         )?;
-        let mut lengths = table_lengths_with_filters(&tokens, initial_filters, distance_size)?;
+        let mut lengths =
+            table_lengths_with_allowance(&tokens, initial_filters, distance_size, allowance)?;
         let mut best_bits = token_stream_bits(&tokens, initial_filters, &lengths, distance_size)?;
         let mut best = None;
         for _ in 1..OPTIMAL_PARSE_PASSES {
@@ -2314,7 +2528,8 @@ fn encode_tokens_with_allowance<B: Budget>(
             if next == tokens {
                 break;
             }
-            lengths = table_lengths_with_filters(&next, initial_filters, distance_size)?;
+            lengths =
+                table_lengths_with_allowance(&next, initial_filters, distance_size, allowance)?;
             let bits = token_stream_bits(&next, initial_filters, &lengths, distance_size)?;
             if bits < best_bits {
                 best_bits = bits;
@@ -3370,15 +3585,15 @@ fn read_filter_data(bits: &mut BitReader<'_>) -> Result<u32> {
     Ok(data)
 }
 
-fn write_filter(writer: &mut BitWriter, filter: EncodeFilter) -> Result<()> {
+fn try_write_filter<B: Budget>(writer: &mut BitWriter<B>, filter: EncodeFilter) -> Result<()> {
     if filter.offset > u32::MAX as usize {
         return Err(Error::InvalidData("RAR 5 filter offset is too large"));
     }
     if filter.length > u32::MAX as usize {
         return Err(Error::InvalidData("RAR 5 filter length is too large"));
     }
-    write_filter_data(writer, filter.offset as u32);
-    write_filter_data(writer, filter.length as u32);
+    try_write_filter_data(writer, filter.offset as u32)?;
+    try_write_filter_data(writer, filter.length as u32)?;
     match filter.filter_type {
         FilterType::Delta => {
             if filter.channels == 0 || filter.channels > MAX_DELTA_CHANNELS {
@@ -3386,17 +3601,19 @@ fn write_filter(writer: &mut BitWriter, filter: EncodeFilter) -> Result<()> {
                     "RAR 5 DELTA filter channel count is invalid",
                 ));
             }
-            writer.write_bits(0, 3);
-            writer.write_bits(filter.channels - 1, 5);
+            writer.try_write_bits(0, 3).map_err(Into::into)?;
+            writer
+                .try_write_bits(filter.channels - 1, 5)
+                .map_err(Into::into)?;
         }
-        FilterType::E8 => writer.write_bits(1, 3),
-        FilterType::E8E9 => writer.write_bits(2, 3),
-        FilterType::Arm => writer.write_bits(3, 3),
+        FilterType::E8 => writer.try_write_bits(1, 3).map_err(Into::into)?,
+        FilterType::E8E9 => writer.try_write_bits(2, 3).map_err(Into::into)?,
+        FilterType::Arm => writer.try_write_bits(3, 3).map_err(Into::into)?,
     }
     Ok(())
 }
 
-fn write_filter_data(writer: &mut BitWriter, value: u32) {
+fn try_write_filter_data<B: Budget>(writer: &mut BitWriter<B>, value: u32) -> Result<()> {
     let byte_count = if value <= 0xff {
         1
     } else if value <= 0xffff {
@@ -3406,10 +3623,15 @@ fn write_filter_data(writer: &mut BitWriter, value: u32) {
     } else {
         4
     };
-    writer.write_bits(byte_count - 1, 2);
+    writer
+        .try_write_bits(byte_count - 1, 2)
+        .map_err(Into::into)?;
     for index in 0..byte_count {
-        writer.write_bits(((value >> (index * 8)) & 0xff) as usize, 8);
+        writer
+            .try_write_bits(((value >> (index * 8)) & 0xff) as usize, 8)
+            .map_err(Into::into)?;
     }
+    Ok(())
 }
 
 fn apply_filters_with_control(
@@ -3770,6 +3992,45 @@ impl HuffmanTable {
     }
 }
 
+struct EncoderCodeTable<B: Budget> {
+    symbols: Buffer<(u16, u8), B>,
+}
+impl<B: Budget> EncoderCodeTable<B> {
+    fn from_lengths(lengths: &[u8], allowance: &B) -> Result<Self> {
+        let mut counts = [0u16; 16];
+        for &length in lengths {
+            if length > 15 {
+                return Err(Error::InvalidData("RAR 5 Huffman length is too large"));
+            }
+            if length != 0 {
+                counts[length as usize] += 1;
+            }
+        }
+        validate_huffman_counts(&counts)?;
+        let mut next = [0u16; 16];
+        let mut code = 0;
+        for length in 1..16 {
+            code = (code + counts[length - 1]) << 1;
+            next[length] = code;
+        }
+        let mut symbols = Buffer::filled(lengths.len(), (0u16, 0u8), allowance)?;
+        for (symbol, &length) in lengths.iter().enumerate() {
+            if length != 0 {
+                symbols[symbol] = (next[length as usize], length);
+                next[length as usize] += 1;
+            }
+        }
+        Ok(Self { symbols })
+    }
+    fn code_for_symbol(&self, symbol: usize) -> Result<(u16, u8)> {
+        self.symbols
+            .get(symbol)
+            .copied()
+            .filter(|&(_, length)| length != 0)
+            .ok_or(Error::InvalidData("RAR 5 missing Huffman symbol"))
+    }
+}
+
 struct BitReader<'a> {
     input: &'a [u8],
     bit_pos: usize,
@@ -3811,25 +4072,38 @@ impl<'a> BitReader<'a> {
     }
 }
 
-struct BitWriter {
-    bytes: Vec<u8>,
+struct BitWriter<B: Budget = Allowance> {
+    bytes: Buffer<u8, B>,
     bit_pos: usize,
 }
 
 impl BitWriter {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_allowance(&Allowance::default())
+    }
+    fn write_bits(&mut self, value: usize, count: usize) {
+        self.try_write_bits(value, count).unwrap();
+    }
+    fn finish(self) -> Vec<u8> {
+        self.bytes.into_vec()
+    }
+}
+impl<B: Budget> BitWriter<B> {
+    fn with_allowance(allowance: &B) -> Self {
         Self {
-            bytes: Vec::new(),
+            bytes: Buffer::new(allowance),
             bit_pos: 0,
         }
     }
-
-    fn write_bits(&mut self, value: usize, count: usize) {
-        super::fast::write_msb_bits(&mut self.bytes, &mut self.bit_pos, value as u64, count);
-    }
-
-    fn finish(self) -> Vec<u8> {
+    #[inline]
+    fn try_write_bits(
+        &mut self,
+        value: usize,
+        count: usize,
+    ) -> std::result::Result<(), B::Failure> {
         self.bytes
+            .write_msb_bits(&mut self.bit_pos, value as u64, count)
     }
 }
 
@@ -3893,8 +4167,17 @@ impl LevelToken {
     }
 }
 
+#[cfg(test)]
 fn encode_table_level_tokens(lengths: &[u8]) -> Vec<LevelToken> {
-    let mut tokens = Vec::new();
+    encode_table_level_tokens_with_allowance(lengths, &Allowance::default())
+        .unwrap()
+        .into_vec()
+}
+fn encode_table_level_tokens_with_allowance<B: Budget>(
+    lengths: &[u8],
+    allowance: &B,
+) -> Result<Buffer<LevelToken, B>> {
+    let mut tokens = Buffer::new(allowance);
     let mut pos = 0usize;
     let mut previous = None;
     while pos < lengths.len() {
@@ -3905,62 +4188,82 @@ fn encode_table_level_tokens(lengths: &[u8]) -> Vec<LevelToken> {
         }
 
         if value == 0 {
-            emit_zero_level_run(&mut tokens, run);
+            emit_zero_level_run(&mut tokens, run)?;
             previous = Some(0);
             pos += run;
             continue;
         }
 
         if previous == Some(value) && run >= 3 {
-            emit_repeat_level_run(&mut tokens, run);
+            emit_repeat_level_run(&mut tokens, run)?;
             pos += run;
             continue;
         }
 
-        tokens.push(LevelToken::plain(value as usize));
+        tokens
+            .push(LevelToken::plain(value as usize))
+            .map_err(Into::into)?;
         previous = Some(value);
         pos += 1;
     }
-    tokens
+    Ok(tokens)
 }
 
-fn emit_repeat_level_run(tokens: &mut Vec<LevelToken>, mut run: usize) {
+fn emit_repeat_level_run<B: Budget>(
+    tokens: &mut Buffer<LevelToken, B>,
+    mut run: usize,
+) -> Result<()> {
     while run != 0 {
         if run >= 11 {
             let mut chunk = run.min(138);
             if matches!(run - chunk, 1 | 2) && chunk >= 14 {
                 chunk -= 3;
             }
-            tokens.push(LevelToken::repeat_previous_long(chunk));
+            tokens
+                .push(LevelToken::repeat_previous_long(chunk))
+                .map_err(Into::into)?;
             run -= chunk;
         } else if run >= 3 {
             let chunk = run.min(10);
-            tokens.push(LevelToken::repeat_previous_short(chunk));
+            tokens
+                .push(LevelToken::repeat_previous_short(chunk))
+                .map_err(Into::into)?;
             run -= chunk;
         } else {
             break;
         }
     }
+    Ok(())
 }
 
-fn emit_zero_level_run(tokens: &mut Vec<LevelToken>, mut run: usize) {
+fn emit_zero_level_run<B: Budget>(
+    tokens: &mut Buffer<LevelToken, B>,
+    mut run: usize,
+) -> Result<()> {
     while run != 0 {
         if run >= 11 {
             let mut chunk = run.min(138);
             if matches!(run - chunk, 1 | 2) && chunk >= 14 {
                 chunk -= 3;
             }
-            tokens.push(LevelToken::zero_run_long(chunk));
+            tokens
+                .push(LevelToken::zero_run_long(chunk))
+                .map_err(Into::into)?;
             run -= chunk;
         } else if run >= 3 {
             let chunk = run.min(10);
-            tokens.push(LevelToken::zero_run_short(chunk));
+            tokens
+                .push(LevelToken::zero_run_short(chunk))
+                .map_err(Into::into)?;
             run -= chunk;
         } else {
-            tokens.extend(std::iter::repeat_n(LevelToken::plain(0), run));
+            for _ in 0..run {
+                tokens.push(LevelToken::plain(0)).map_err(Into::into)?;
+            }
             break;
         }
     }
+    Ok(())
 }
 
 /// Prices the level alphabet by how often each symbol is used, where a flat
@@ -3977,7 +4280,14 @@ fn emit_zero_level_run(tokens: &mut Vec<LevelToken>, mut run: usize) {
 /// gives Kraft equality by construction once two symbols are in play, and the
 /// flat assignment is only valid when the used-symbol count is a power of two,
 /// which is what `assign_flat_complete_code` arranges.
+#[cfg(test)]
 fn level_code_lengths_for_tokens(tokens: &[LevelToken]) -> [u8; LEVEL_TABLE_SIZE] {
+    level_code_lengths_with_allowance(tokens, &Allowance::default()).unwrap()
+}
+fn level_code_lengths_with_allowance<B: Budget>(
+    tokens: &[LevelToken],
+    allowance: &B,
+) -> Result<[u8; LEVEL_TABLE_SIZE]> {
     let mut frequencies = [0usize; LEVEL_TABLE_SIZE];
     for token in tokens {
         frequencies[token.symbol] += 1;
@@ -3991,14 +4301,18 @@ fn level_code_lengths_for_tokens(tokens: &[LevelToken]) -> [u8; LEVEL_TABLE_SIZE
     // One symbol in play leaves an empty branch beside it, and the flat
     // assignment is the only one that pads it into a complete code.
     if frequencies.iter().filter(|&&count| count != 0).count() <= 1 {
-        return flat;
+        return Ok(flat);
     }
 
-    let weighted = huffman::lengths_for_frequency_array(&frequencies, 15);
-    match level_code_cost(&weighted, &frequencies) < level_code_cost(&flat, &frequencies) {
-        true => weighted,
-        false => flat,
-    }
+    let owned = huffman::lengths_with_allowance(&frequencies, 15, allowance)?;
+    let mut weighted = [0; LEVEL_TABLE_SIZE];
+    weighted.copy_from_slice(&owned);
+    Ok(
+        match level_code_cost(&weighted, &frequencies) < level_code_cost(&flat, &frequencies) {
+            true => weighted,
+            false => flat,
+        },
+    )
 }
 
 /// What a level code costs in bits: the lengths at the head of the table as
@@ -4033,7 +4347,14 @@ fn level_code_cost(
         .sum::<usize>()
 }
 
+#[cfg(test)]
 fn write_level_lengths(writer: &mut BitWriter, lengths: &[u8; LEVEL_TABLE_SIZE]) {
+    try_write_level_lengths(writer, lengths).unwrap();
+}
+fn try_write_level_lengths<B: Budget>(
+    writer: &mut BitWriter<B>,
+    lengths: &[u8; LEVEL_TABLE_SIZE],
+) -> Result<()> {
     let mut pos = 0usize;
     while pos < LEVEL_TABLE_SIZE {
         let length = lengths[pos];
@@ -4044,27 +4365,151 @@ fn write_level_lengths(writer: &mut BitWriter, lengths: &[u8; LEVEL_TABLE_SIZE])
             }
             while count >= 3 {
                 let chunk = count.min(17);
-                writer.write_bits(15, 4);
-                writer.write_bits(chunk - 2, 4);
+                writer.try_write_bits(15, 4).map_err(Into::into)?;
+                writer.try_write_bits(chunk - 2, 4).map_err(Into::into)?;
                 pos += chunk;
                 count -= chunk;
             }
             for _ in 0..count {
-                writer.write_bits(0, 4);
+                writer.try_write_bits(0, 4).map_err(Into::into)?;
                 pos += 1;
             }
         } else {
-            writer.write_bits(usize::from(length), 4);
+            writer
+                .try_write_bits(usize::from(length), 4)
+                .map_err(Into::into)?;
             if length == 15 {
-                writer.write_bits(0, 4);
+                writer.try_write_bits(0, 4).map_err(Into::into)?;
             }
             pos += 1;
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn member_allowance_covers_history_tables_and_retained_block_output() {
+        let data = b"bounded member with repeated words and short matches\n".repeat(3000);
+        let history = b"short matches and remembered history\n".repeat(1000);
+        for version in [0, 1] {
+            for optimal in [false, true] {
+                let options = EncodeOptions::new(16)
+                    .with_optimal_parse(optimal)
+                    .with_max_match_distance(65536);
+                for history in [&[][..], &history[..]] {
+                    let expected =
+                        encode_lz_member_inner(&data, history, version, &[], options, None)
+                            .unwrap();
+                    let allowance = Allowance::limited(32 * 1024 * 1024);
+                    let output = encode_member_with_allowance(
+                        &data,
+                        history,
+                        version,
+                        &[],
+                        options,
+                        None,
+                        &allowance,
+                    )
+                    .unwrap();
+                    assert_eq!(&*output, expected);
+                    assert!(allowance.used() >= output.len() as u64);
+                    let retained = allowance.used();
+                    let second = encode_member_with_allowance(
+                        b"another member",
+                        &[],
+                        version,
+                        &[],
+                        options,
+                        None,
+                        &allowance,
+                    )
+                    .unwrap();
+                    assert!(allowance.used() >= retained + second.len() as u64);
+                    drop(second);
+                    assert_eq!(allowance.used(), retained);
+                    drop(output);
+                    assert_eq!(allowance.used(), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn member_refusal_cancellation_and_unwind_release_the_whole_pipeline() {
+        let data = b"member cancellation and refusal\n".repeat(100);
+        let history = b"history".repeat(100);
+        let options = EncodeOptions::new(16).with_optimal_parse(true);
+        for limit in [0, 4096, 65536, 512 * 1024] {
+            let allowance = Allowance::limited(limit);
+            assert!(matches!(
+                encode_member_with_allowance(&data, &history, 0, &[], options, None, &allowance),
+                Err(Error::WorkspaceLimitExceeded(_))
+            ));
+            assert_eq!(allowance.used(), 0);
+        }
+        let allowance = Allowance::limited(16 * 1024 * 1024);
+        assert!(matches!(
+            encode_member_with_allowance(
+                &data,
+                &history,
+                0,
+                &[],
+                options,
+                Some(&mut |_| false),
+                &allowance
+            ),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(allowance.used(), 0);
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = encode_member_with_allowance(
+                &data,
+                &history,
+                0,
+                &[],
+                options,
+                Some(&mut |_| panic!("progress callback panic")),
+                &allowance,
+            );
+        }));
+        assert!(unwind.is_err());
+        assert_eq!(allowance.used(), 0);
+    }
+
+    #[test]
+    fn bit_growth_and_frame_copy_reserve_before_mutation() {
+        let allowance = Allowance::limited(8);
+        let mut writer = BitWriter::with_allowance(&allowance);
+        writer.try_write_bits(0, 64).unwrap();
+        let filled = writer.bytes.to_vec();
+        let filled_bits = writer.bit_pos;
+        assert!(writer.try_write_bits(1, 1).is_err());
+        assert_eq!(&*writer.bytes, filled);
+        assert_eq!(writer.bit_pos, filled_bits);
+        drop(writer);
+        assert_eq!(allowance.used(), 0);
+
+        for limit in [18, 19] {
+            let allowance = Allowance::limited(limit);
+            let payload = Buffer::filled(8, 0u8, &allowance).unwrap();
+            let frame =
+                encode_compressed_block_with_allowance(&payload, 64, true, true, &allowance);
+            if limit == 18 {
+                assert!(matches!(frame, Err(Error::WorkspaceLimitExceeded(_))));
+                assert_eq!(allowance.used(), 8);
+            } else {
+                let frame = frame.unwrap();
+                assert_eq!(allowance.used(), 19);
+                drop(payload);
+                assert_eq!(allowance.used(), 11);
+                drop(frame);
+                assert_eq!(allowance.used(), 0);
+            }
+        }
+    }
+
     #[test]
     fn parser_allowance_preserves_tokens_and_retains_the_returned_owner() {
         let data: Vec<_> = (0..8192u32)
@@ -6083,7 +6528,10 @@ mod tests {
         lengths.main[b'A' as usize] = 1;
         lengths.main[b'B' as usize] = 1;
         let (bytes, bit_pos) = encode_table_lengths_with_bit_count(&lengths, 0).unwrap();
-        let mut writer = BitWriter { bytes, bit_pos };
+        let mut writer = BitWriter {
+            bytes: Buffer::from_vec(bytes),
+            bit_pos,
+        };
         for &byte in data {
             match byte {
                 b'A' => writer.write_bits(0, 1),
@@ -6106,7 +6554,10 @@ mod tests {
         lengths.main[262] = 2;
         lengths.distance[1] = 1;
         let (bytes, bit_pos) = encode_table_lengths_with_bit_count(&lengths, 0).unwrap();
-        let mut writer = BitWriter { bytes, bit_pos };
+        let mut writer = BitWriter {
+            bytes: Buffer::from_vec(bytes),
+            bit_pos,
+        };
 
         writer.write_bits(0b00, 2); // 'A'
         writer.write_bits(0b01, 2); // 'B'
@@ -6129,7 +6580,10 @@ mod tests {
         lengths.distance[1] = 1;
         lengths.length[0] = 1;
         let (bytes, bit_pos) = encode_table_lengths_with_bit_count(&lengths, 0).unwrap();
-        let mut writer = BitWriter { bytes, bit_pos };
+        let mut writer = BitWriter {
+            bytes: Buffer::from_vec(bytes),
+            bit_pos,
+        };
 
         writer.write_bits(0b00, 2); // 'A'
         writer.write_bits(0b01, 2); // 'B'

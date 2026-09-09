@@ -200,6 +200,19 @@ impl<T, B: Budget> Buffer<T, B> {
     pub(crate) fn clear(&mut self) {
         self.values.clear();
     }
+    pub(crate) fn pop(&mut self) -> Option<T> {
+        self.values.pop()
+    }
+    pub(crate) fn extend_from_slice(&mut self, values: &[T]) -> std::result::Result<(), B::Failure>
+    where
+        T: Copy,
+    {
+        if B::LIMITED && values.len() > self.values.capacity() - self.values.len() {
+            B::grow(&mut self.values, &mut self.charge, values.len())?;
+        }
+        self.values.extend_from_slice(values);
+        Ok(())
+    }
     pub(crate) fn prepend(&mut self, prefix: impl ExactSizeIterator<Item = T>) -> Result<()> {
         self.reserve(prefix.len())?;
         let old_len = self.values.len();
@@ -210,11 +223,30 @@ impl<T, B: Budget> Buffer<T, B> {
         self.values.rotate_right(inserted);
         Ok(())
     }
-    /// Transfer to an unaccounted caller. Use only at an existing Vec API boundary,
-    /// never between helpers executing under an allowance.
-    #[cfg(test)]
+}
+impl<T> Buffer<T> {
+    pub(crate) fn from_vec(values: Vec<T>) -> Self {
+        Self { values, charge: () }
+    }
+    /// Only unlimited buffers can cross an existing unaccounted Vec boundary.
     pub(crate) fn into_vec(self) -> Vec<T> {
         self.values
+    }
+}
+impl<B: Budget> Buffer<u8, B> {
+    pub(crate) fn write_msb_bits(
+        &mut self,
+        bit_pos: &mut usize,
+        value: u64,
+        count: usize,
+    ) -> std::result::Result<(), B::Failure> {
+        let used = *bit_pos % 8;
+        let additional = (used + count).div_ceil(8) - usize::from(used != 0);
+        if B::LIMITED && additional > self.values.capacity() - self.values.len() {
+            B::grow(&mut self.values, &mut self.charge, additional)?;
+        }
+        super::fast::write_msb_bits(&mut self.values, bit_pos, value, count);
+        Ok(())
     }
 }
 fn allocation_size<T>(capacity: usize) -> Result<u64> {

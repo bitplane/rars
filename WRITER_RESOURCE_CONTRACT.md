@@ -198,9 +198,11 @@ cancellation. Error selection prefers a source/codec failure over the resulting
 cancellation. Returning joins admitted callbacks before releasing their owners;
 reusing the resources after an ordinary failure does not inherit cancellation.
 
-These reservations still use workspace estimates. The codec has an internal
-fallible allowance path for chain/tree match-finder tables, collected match
-runs and offsets, parse arrays, candidate reaches and competing token buffers.
+These reservations still use workspace estimates. The raw-member codec has an
+internal fallible allowance path covering history-window copies, chain/tree
+match-finder tables, collected match runs and offsets, parse arrays, candidate
+reaches, competing token buffers, Huffman construction and code tables, table
+serialization, bit output, block framing and the retained member output.
 Covered owners reserve before growth, include replacement peaks and retain
 charges through moves and token selection. Unlimited and bounded buffers use
 separate compile-time policies; the unlimited owner retains Vec's layout.
@@ -210,9 +212,10 @@ extra bytes. An allowance cannot borrow capacity from another worker.
 
 This is migration infrastructure, not an available writer limit. Production
 codec entry points currently use unlimited handles; bounded construction is
-internal test coverage, including its refusal diagnostics. Input/history copies,
-Huffman tables and bit/framing buffers, filter-search candidates and payload ownership, encryption/KDF and
-recovery workspace still need migration. Only after those paths are covered
+internal test coverage, including its refusal diagnostics. Source loading,
+streaming input/history buffers, filter transformation/search candidates and
+their payload ownership, stateful encoder history, encryption/KDF and recovery
+workspace still need migration. Only after those paths are covered
 can the coordinator supply reserved allowances and connect them to preparation
 and spool memory. There is no public worker allowance or extension API yet.
 The workspace/admission pass remains open until those guarantees are enforceable.
