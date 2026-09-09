@@ -21,7 +21,7 @@
 //! The unfiltered member is always one of the finalists, so the result can never
 //! be larger than leaving the data alone.
 
-use crate::x86_filter_scan::auto_x86_filter_ranges;
+use crate::codec::workspace::{Allowance, Budget, Buffer};
 use crate::{FilterKind, FilterSpec, Result};
 use std::ops::Range;
 
@@ -183,6 +183,83 @@ pub(crate) trait FilterSearch {
     ) -> Result<Vec<u8>>;
 }
 
+pub(crate) type FilterChoice<B> = (Buffer<FilterSpec, B>, Buffer<u8, B>);
+type Finalist<B> = (Buffer<FilterSpec, B>, Option<Buffer<u8, B>>);
+type TableRegions<B> = Buffer<(Range<usize>, usize), B>;
+
+/// Search owners cannot detach bounded byte storage while candidates compete.
+pub(crate) trait OwnedSearch {
+    type Options: Copy + PartialEq;
+    type Memory: Budget;
+    fn allowance(&self) -> &Self::Memory;
+    fn screened_kinds(&self, data: &[u8]) -> Result<Buffer<FilterKind, Self::Memory>>;
+    fn detects_x86(&self) -> bool;
+    fn max_delta_channels(&self) -> usize;
+    fn screen_options(&self, options: Self::Options) -> Self::Options;
+    fn filtered_bytes(
+        &self,
+        data: &[u8],
+        filters: &[FilterSpec],
+    ) -> Result<Buffer<u8, Self::Memory>>;
+    fn encode_plain(
+        &self,
+        data: &[u8],
+        options: Self::Options,
+        progress: Option<&mut dyn FnMut(usize) -> bool>,
+    ) -> Result<Buffer<u8, Self::Memory>>;
+    fn encode_filtered(
+        &self,
+        data: &[u8],
+        filters: &[FilterSpec],
+        options: Self::Options,
+        progress: Option<&mut dyn FnMut(usize) -> bool>,
+    ) -> Result<Buffer<u8, Self::Memory>>;
+}
+struct UnlimitedSearch<'a, S>(&'a S, Allowance);
+impl<S: FilterSearch> OwnedSearch for UnlimitedSearch<'_, S> {
+    type Options = S::Options;
+    type Memory = Allowance;
+    fn allowance(&self) -> &Allowance {
+        &self.1
+    }
+    fn screened_kinds(&self, data: &[u8]) -> Result<Buffer<FilterKind>> {
+        Ok(Buffer::from_vec(self.0.screened_kinds(data)))
+    }
+    fn detects_x86(&self) -> bool {
+        self.0.detects_x86()
+    }
+    fn max_delta_channels(&self) -> usize {
+        self.0.max_delta_channels()
+    }
+    fn screen_options(&self, options: Self::Options) -> Self::Options {
+        self.0.screen_options(options)
+    }
+    fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Buffer<u8>> {
+        self.0.filtered_bytes(data, filters).map(Buffer::from_vec)
+    }
+    fn encode_plain(
+        &self,
+        data: &[u8],
+        options: Self::Options,
+        progress: Option<&mut dyn FnMut(usize) -> bool>,
+    ) -> Result<Buffer<u8>> {
+        self.0
+            .encode_plain(data, options, progress)
+            .map(Buffer::from_vec)
+    }
+    fn encode_filtered(
+        &self,
+        data: &[u8],
+        filters: &[FilterSpec],
+        options: Self::Options,
+        progress: Option<&mut dyn FnMut(usize) -> bool>,
+    ) -> Result<Buffer<u8>> {
+        self.0
+            .encode_filtered(data, filters, options, progress)
+            .map(Buffer::from_vec)
+    }
+}
+
 /// Internal events: codec positions are absolute only within one encode pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EncodeProgress {
@@ -215,9 +292,13 @@ struct ReportingSearch<'a, S> {
     search: &'a S,
     progress: std::cell::RefCell<&'a mut dyn FnMut(EncodeProgress) -> bool>,
 }
-impl<S: FilterSearch> FilterSearch for ReportingSearch<'_, S> {
+impl<S: OwnedSearch> OwnedSearch for ReportingSearch<'_, S> {
     type Options = S::Options;
-    fn screened_kinds(&self, data: &[u8]) -> Vec<FilterKind> {
+    type Memory = S::Memory;
+    fn allowance(&self) -> &Self::Memory {
+        self.search.allowance()
+    }
+    fn screened_kinds(&self, data: &[u8]) -> Result<Buffer<FilterKind, S::Memory>> {
         self.search.screened_kinds(data)
     }
     fn detects_x86(&self) -> bool {
@@ -229,7 +310,7 @@ impl<S: FilterSearch> FilterSearch for ReportingSearch<'_, S> {
     fn screen_options(&self, options: Self::Options) -> Self::Options {
         self.search.screen_options(options)
     }
-    fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Vec<u8>> {
+    fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Buffer<u8, S::Memory>> {
         self.search.filtered_bytes(data, filters)
     }
     fn encode_plain(
@@ -237,7 +318,7 @@ impl<S: FilterSearch> FilterSearch for ReportingSearch<'_, S> {
         data: &[u8],
         options: Self::Options,
         _: Option<&mut dyn FnMut(usize) -> bool>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Buffer<u8, S::Memory>> {
         encode_pass(Some(&mut **self.progress.borrow_mut()), |progress| {
             self.search.encode_plain(data, options, progress)
         })
@@ -248,7 +329,7 @@ impl<S: FilterSearch> FilterSearch for ReportingSearch<'_, S> {
         filters: &[FilterSpec],
         options: Self::Options,
         _: Option<&mut dyn FnMut(usize) -> bool>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Buffer<u8, S::Memory>> {
         encode_pass(Some(&mut **self.progress.borrow_mut()), |progress| {
             self.search
                 .encode_filtered(data, filters, options, progress)
@@ -293,21 +374,20 @@ fn screen_sample(data: &[u8]) -> &[u8] {
 }
 
 /// What the screen made of one filter kind.
-struct ScreenedKind {
+struct ScreenedKind<B: Budget> {
     kind: FilterKind,
     /// The bytes, when the screen encoded the whole member the way the writer
     /// would write it, so the search can take this as its measurement.
-    measured: Option<Vec<u8>>,
+    measured: Option<Buffer<u8, B>>,
     /// Whether it beat leaving the data alone by enough to be worth spending
     /// another encode on a narrower range of the same filter.
     worth_a_range: bool,
 }
 
 /// What the screen learned, along with any encodes the search can reuse.
-#[derive(Default)]
-struct ScreenOutcome {
-    kinds: Vec<ScreenedKind>,
-    plain: Option<Vec<u8>>,
+struct ScreenOutcome<B: Budget> {
+    kinds: Buffer<ScreenedKind<B>, B>,
+    plain: Option<Buffer<u8, B>>,
 }
 
 /// Which of the detectorless filters shrink a sample of the member.
@@ -326,13 +406,16 @@ struct ScreenOutcome {
 /// spend an encode on anyway. That skips a second encode per surviving kind, and
 /// it lets kinds that win by too little to be worth chasing stay in the running,
 /// because keeping a candidate the screen has already paid for costs nothing.
-fn screen_kinds<S: FilterSearch>(
+fn screen_kinds<S: OwnedSearch>(
     search: &S,
     data: &[u8],
     options: S::Options,
-) -> Result<ScreenOutcome> {
+) -> Result<ScreenOutcome<S::Memory>> {
     let sample = screen_sample(data);
-    let mut outcome = ScreenOutcome::default();
+    let mut outcome = ScreenOutcome {
+        kinds: Buffer::new(search.allowance()),
+        plain: None,
+    };
     if sample.len() < SCREEN_SAMPLE_ALIGNMENT {
         return Ok(outcome);
     }
@@ -342,7 +425,7 @@ fn screen_kinds<S: FilterSearch>(
     // something else and keeps the two-encode path.
     let measures_the_member = sample.len() == data.len() && screen_options == options;
     let baseline = search.encode_plain(sample, screen_options, None)?;
-    for kind in search.screened_kinds(data) {
+    for kind in search.screened_kinds(data)? {
         let filters = [FilterSpec::whole(kind)];
         let packed = if measures_the_member {
             search.encode_filtered(data, &filters, options, None)?
@@ -352,20 +435,20 @@ fn screen_kinds<S: FilterSearch>(
         };
         let worth_a_range = screen_wins(packed.len(), baseline.len());
         if measures_the_member {
-            outcome.kinds.push(ScreenedKind {
+            outcome.kinds.try_push(ScreenedKind {
                 kind,
                 measured: Some(packed),
                 worth_a_range,
-            });
+            })?;
         } else if worth_a_range {
             // The screen measured the transform, not the encode the writer
             // would emit, so this is evidence for a finalist rather than a
             // measurement the search can reuse.
-            outcome.kinds.push(ScreenedKind {
+            outcome.kinds.try_push(ScreenedKind {
                 kind,
                 measured: None,
                 worth_a_range,
-            });
+            })?;
         }
     }
     if measures_the_member {
@@ -375,8 +458,10 @@ fn screen_kinds<S: FilterSearch>(
 }
 
 /// Where the scanner thinks x86 code lives, merged into disjoint regions.
-fn x86_code_regions(data: &[u8]) -> Vec<Range<usize>> {
-    disjoint_filter_ranges(auto_x86_filter_ranges(data, true))
+fn x86_code_regions<B: Budget>(data: &[u8], allowance: &B) -> Result<Buffer<Range<usize>, B>> {
+    disjoint_ranges(crate::x86_filter_scan::ranges_with_allowance(
+        data, true, allowance,
+    )?)
 }
 
 /// Which of the scanner's regions the x86 filter should cover, empty when none
@@ -406,18 +491,18 @@ fn x86_code_regions(data: &[u8]) -> Vec<Range<usize>> {
 /// no. Over twenty-four members it won seven times and never by more than
 /// 0.21%, while carrying the pair cost a third of the search; screening it here
 /// keeps the wins and spends the encode only where a sample gives a reason to.
-fn x86_screened_regions<S: FilterSearch>(
+fn x86_screened_regions<S: OwnedSearch>(
     search: &S,
     data: &[u8],
     regions: &[Range<usize>],
     options: S::Options,
-) -> Result<X86Screen> {
-    let mut kept = Vec::new();
+) -> Result<X86Screen<S::Memory>> {
+    let mut kept = Buffer::new(search.allowance());
     let mut helped = false;
     for region in regions {
         let sample = screen_sample(&data[region.clone()]);
         if sample.len() < SCREEN_SAMPLE_ALIGNMENT {
-            kept.push((region.clone(), None));
+            kept.try_push((region.clone(), None))?;
             continue;
         }
         // Measured at the caller's real settings, not the cheaper screen ones.
@@ -435,11 +520,15 @@ fn x86_screened_regions<S: FilterSearch>(
         // already ruled on where code is, so a small win on this sample is
         // evidence rather than noise.
         helped |= filtered.len() < baseline.len();
-        kept.push((region.clone(), Some(filtered.len())));
+        kept.try_push((region.clone(), Some(filtered.len())))?;
     }
     let rejected_a_region = kept.len() < regions.len();
     if !helped {
-        return Ok(X86Screen::default());
+        return Ok(X86Screen {
+            kept: Buffer::new(search.allowance()),
+            rejected_a_region: false,
+            jumps_cost_more: false,
+        });
     }
 
     // Held back until the regions are known to be worth filtering at all. Asking
@@ -447,7 +536,7 @@ fn x86_screened_regions<S: FilterSearch>(
     // then declined every filter, which is a sample encode each for an answer
     // nothing reads.
     let mut jumps_cost_more = false;
-    for (region, e8e9) in &kept {
+    for (region, e8e9) in kept.iter() {
         let Some(e8e9) = *e8e9 else { continue };
         let sample = screen_sample(&data[region.clone()]);
         let e8_only = search.filtered_bytes(sample, &[FilterSpec::whole(FilterKind::E8)])?;
@@ -457,16 +546,18 @@ fn x86_screened_regions<S: FilterSearch>(
 
     Ok(X86Screen {
         rejected_a_region,
-        kept: kept.into_iter().map(|(region, _)| region).collect(),
+        kept: Buffer::collect(
+            kept.into_iter().map(|(region, _)| region),
+            search.allowance(),
+        )?,
         jumps_cost_more,
     })
 }
 
 /// What the x86 screen made of the regions the scanner proposed.
-#[derive(Default)]
-struct X86Screen {
+struct X86Screen<B: Budget> {
     /// The regions worth filtering, empty when none of them is.
-    kept: Vec<Range<usize>>,
+    kept: Buffer<Range<usize>, B>,
     /// Whether any region came out bigger under the filter, which rules out
     /// filtering the member end to end.
     rejected_a_region: bool,
@@ -498,33 +589,33 @@ struct X86Screen {
 /// And usually one kind rather than two, because the screen has already asked
 /// whether the jump opcodes are worth converting. That takes an unstripped
 /// binary from five whole-member encodes to two.
-fn x86_finalists(data: &[u8], screen: &X86Screen) -> Vec<Vec<FilterSpec>> {
+fn x86_finalists<B: Budget>(
+    data: &[u8],
+    screen: &X86Screen<B>,
+) -> Result<Buffer<Buffer<FilterSpec, B>, B>> {
+    let allowance = screen.kept.allowance();
     let regions = &screen.kept;
     let covered: usize = regions.iter().map(|range| range.len()).sum();
     let (numerator, denominator) = X86_CODE_COVERAGE_RATIO;
     let sparse = covered * denominator < data.len() * numerator;
-    let rejected_a_region = screen.rejected_a_region;
-
-    let mut kinds = vec![FilterKind::E8E9];
-    if screen.jumps_cost_more {
-        kinds.push(FilterKind::E8);
-    }
-
-    let mut finalists = Vec::new();
-    for kind in kinds {
-        if rejected_a_region || sparse {
-            finalists.push(
+    let mut finalists = Buffer::new(&allowance);
+    for kind in [FilterKind::E8E9, FilterKind::E8]
+        .into_iter()
+        .take(if screen.jumps_cost_more { 2 } else { 1 })
+    {
+        if screen.rejected_a_region || sparse {
+            finalists.try_push(Buffer::collect(
                 regions
                     .iter()
-                    .map(|range| FilterSpec::range(kind, range.clone()))
-                    .collect(),
-            );
+                    .map(|range| FilterSpec::range(kind, range.clone())),
+                &allowance,
+            )?)?;
         }
-        if !rejected_a_region {
-            finalists.push(vec![FilterSpec::whole(kind)]);
+        if !screen.rejected_a_region {
+            finalists.try_push(Buffer::collect([FilterSpec::whole(kind)], &allowance)?)?;
         }
     }
-    finalists
+    Ok(finalists)
 }
 
 /// The record stride this window repeats at, when it looks like an array of
@@ -568,9 +659,13 @@ fn table_stride(window: &[u8], max_stride: usize) -> Option<usize> {
 /// is a disaster. On a 3.6 MB shared object the table packed to 32,767 bytes
 /// against 59,512 unfiltered; delta 24 over the whole member came out 85%
 /// *bigger* than no filter at all. The filter has to cover the table and stop.
-fn delta_table_regions(data: &[u8], max_stride: usize) -> Vec<(Range<usize>, usize)> {
+fn table_regions<B: Budget>(
+    data: &[u8],
+    max_stride: usize,
+    allowance: &B,
+) -> Result<Buffer<(Range<usize>, usize), B>> {
     let max_stride = max_stride.min(MAX_TABLE_STRIDE);
-    let mut regions: Vec<(Range<usize>, usize)> = Vec::new();
+    let mut regions: Buffer<(Range<usize>, usize), B> = Buffer::new(allowance);
     for start in (0..).map(|window| window * TABLE_SCAN_WINDOW) {
         let Some(window) = data.get(start..start + TABLE_SCAN_WINDOW) else {
             break;
@@ -582,11 +677,11 @@ fn delta_table_regions(data: &[u8], max_stride: usize) -> Vec<(Range<usize>, usi
             Some((last, last_stride)) if *last_stride == stride && last.end == start => {
                 last.end = start + TABLE_SCAN_WINDOW;
             }
-            _ => regions.push((start..start + TABLE_SCAN_WINDOW, stride)),
+            _ => regions.try_push((start..start + TABLE_SCAN_WINDOW, stride))?,
         }
     }
     regions.retain(|(range, _)| range.len() >= MIN_TABLE_REGION);
-    regions
+    Ok(regions)
 }
 
 /// Which of the scanner's table regions the delta filter actually shrinks.
@@ -597,14 +692,14 @@ fn delta_table_regions(data: &[u8], max_stride: usize) -> Vec<(Range<usize>, usi
 /// all. A sample encode inside the region separates the tables delta helps
 /// from the ones LZ was already handling, the same way the x86 screen checks
 /// its scanner.
-fn table_screened_regions<S: FilterSearch>(
+fn table_screened_regions<S: OwnedSearch>(
     search: &S,
     data: &[u8],
     regions: &[(Range<usize>, usize)],
     options: S::Options,
-) -> Result<Vec<(Range<usize>, usize)>> {
+) -> Result<TableRegions<S::Memory>> {
     let screen_options = search.screen_options(options);
-    let mut kept = Vec::new();
+    let mut kept = Buffer::new(search.allowance());
     for (region, stride) in regions {
         let sample = screen_sample(&data[region.clone()]);
         if sample.len() < SCREEN_SAMPLE_ALIGNMENT {
@@ -615,7 +710,7 @@ fn table_screened_regions<S: FilterSearch>(
         let transformed = search.filtered_bytes(sample, &filters)?;
         let filtered = search.encode_plain(&transformed, screen_options, None)?;
         if screen_wins(filtered.len(), baseline.len()) {
-            kept.push((region.clone(), *stride));
+            kept.try_push((region.clone(), *stride))?;
         }
     }
     Ok(kept)
@@ -623,8 +718,12 @@ fn table_screened_regions<S: FilterSearch>(
 
 /// `range` with the `removed` ranges cut out of it. `removed` must be sorted
 /// and disjoint.
-fn subtract_ranges(range: Range<usize>, removed: &[Range<usize>]) -> Vec<Range<usize>> {
-    let mut kept = Vec::new();
+fn subtract_owned<B: Budget>(
+    range: Range<usize>,
+    removed: &[Range<usize>],
+    allowance: &B,
+) -> Result<Buffer<Range<usize>, B>> {
+    let mut kept = Buffer::new(allowance);
     let mut start = range.start;
     for cut in removed {
         if cut.end <= start {
@@ -634,14 +733,14 @@ fn subtract_ranges(range: Range<usize>, removed: &[Range<usize>]) -> Vec<Range<u
             break;
         }
         if cut.start > start {
-            kept.push(start..cut.start);
+            kept.try_push(start..cut.start)?;
         }
         start = start.max(cut.end);
     }
     if start < range.end {
-        kept.push(start..range.end);
+        kept.try_push(start..range.end)?;
     }
-    kept
+    Ok(kept)
 }
 
 /// A finalist with the screened tables riding along: the table ranges are cut
@@ -654,29 +753,37 @@ fn subtract_ranges(range: Range<usize>, removed: &[Range<usize>]) -> Vec<Range<u
 /// instead, and on an unstripped binary the x86-only finalist won, taking the
 /// tables down with the debug data they were bundled against. Grafting the
 /// tables into every finalist lets them ride with whichever x86 variant wins.
-fn graft_tables(
-    specs: Vec<FilterSpec>,
+fn graft_owned<B: Budget>(
+    specs: Buffer<FilterSpec, B>,
     tables: &[(Range<usize>, usize)],
     member: usize,
-) -> Vec<FilterSpec> {
+) -> Result<Buffer<FilterSpec, B>> {
     if tables.is_empty() {
-        return specs;
+        return Ok(specs);
     }
-    let table_ranges: Vec<Range<usize>> = tables.iter().map(|(range, _)| range.clone()).collect();
-    let mut grafted: Vec<FilterSpec> = specs
-        .into_iter()
-        .flat_map(|spec| {
-            let covered = spec.range.clone().unwrap_or(0..member);
-            subtract_ranges(covered, &table_ranges)
-                .into_iter()
-                .map(move |range| FilterSpec::range(spec.kind, range))
-        })
-        .collect();
-    grafted.extend(tables.iter().map(|(range, stride)| {
-        FilterSpec::range(FilterKind::Delta { channels: *stride }, range.clone())
-    }));
-    grafted.sort_by_key(|spec| spec.range.as_ref().map_or(0, |range| range.start));
-    grafted
+    let allowance = specs.allowance();
+    let table_ranges = Buffer::collect(tables.iter().map(|(range, _)| range.clone()), &allowance)?;
+    let mut grafted = Buffer::new(&allowance);
+    for spec in specs {
+        let covered = spec.range.clone().unwrap_or(0..member);
+        for range in subtract_owned(covered, &table_ranges, &allowance)? {
+            grafted.try_push((grafted.len(), FilterSpec::range(spec.kind, range)))?;
+        }
+    }
+    for (range, stride) in tables {
+        grafted.try_push((
+            grafted.len(),
+            FilterSpec::range(FilterKind::Delta { channels: *stride }, range.clone()),
+        ))?;
+    }
+    // Explicit original order preserves stable ties without an unaccounted sort allocation.
+    grafted.sort_unstable_by_key(|(order, spec)| {
+        (spec.range.as_ref().map_or(0, |range| range.start), *order)
+    });
+    Ok(Buffer::collect(
+        grafted.into_iter().map(|(_, spec)| spec),
+        &allowance,
+    )?)
 }
 
 /// The filter specs worth measuring against the whole member, paired with the
@@ -685,16 +792,16 @@ fn graft_tables(
 /// Everything expensive happens downstream of this, one whole-member encode per
 /// unmeasured finalist, so the job here is to hand back a handful rather than the
 /// several dozen the scanner and the delta widths can between them suggest.
-#[allow(clippy::type_complexity)]
-fn finalists<S: FilterSearch>(
+fn finalists<S: OwnedSearch>(
     search: &S,
     data: &[u8],
     options: S::Options,
-) -> Result<Vec<(Vec<FilterSpec>, Option<Vec<u8>>)>> {
+) -> Result<Buffer<Finalist<S::Memory>, S::Memory>> {
     let screen = screen_kinds(search, data, options)?;
-    let mut finalists = vec![(Vec::new(), screen.plain)];
+    let allowance = search.allowance();
+    let mut finalists = Buffer::collect([(Buffer::new(allowance), screen.plain)], allowance)?;
 
-    let table_regions = delta_table_regions(data, search.max_delta_channels());
+    let table_regions = table_regions(data, search.max_delta_channels(), allowance)?;
     let tables = table_screened_regions(search, data, &table_regions, options)?;
 
     // The tables graft into every x86 finalist rather than competing against
@@ -703,25 +810,33 @@ fn finalists<S: FilterSearch>(
     // candidate.
     let mut tables_carried = false;
     if search.detects_x86() {
-        let screen = x86_screened_regions(search, data, &x86_code_regions(data), options)?;
+        let screen =
+            x86_screened_regions(search, data, &x86_code_regions(data, allowance)?, options)?;
         if !screen.kept.is_empty() {
             tables_carried = !tables.is_empty();
-            finalists.extend(
-                x86_finalists(data, &screen)
-                    .into_iter()
-                    .map(|specs| (graft_tables(specs, &tables, data.len()), None)),
-            );
+            for specs in x86_finalists(data, &screen)? {
+                finalists.try_push((graft_owned(specs, &tables, data.len())?, None))?;
+            }
         }
     }
     if !tables.is_empty() && !tables_carried {
-        finalists.push((graft_tables(Vec::new(), &tables, data.len()), None));
+        finalists.try_push((
+            graft_owned(Buffer::new(allowance), &tables, data.len())?,
+            None,
+        ))?;
     }
 
     for screened in screen.kinds {
-        finalists.push((vec![FilterSpec::whole(screened.kind)], screened.measured));
+        finalists.try_push((
+            Buffer::collect([FilterSpec::whole(screened.kind)], allowance)?,
+            screened.measured,
+        ))?;
         if let (true, FilterKind::Delta { channels }) = (screened.worth_a_range, screened.kind) {
             if let Some(range) = auto_delta_filter_range(data, channels) {
-                finalists.push((vec![FilterSpec::range(screened.kind, range)], None));
+                finalists.try_push((
+                    Buffer::collect([FilterSpec::range(screened.kind, range)], allowance)?,
+                    None,
+                ))?;
             }
         }
     }
@@ -745,10 +860,14 @@ pub(crate) fn filter_candidates<S: FilterSearch>(
     data: &[u8],
     options: S::Options,
 ) -> Result<Vec<Vec<FilterSpec>>> {
-    Ok(finalists(search, data, options)?
-        .into_iter()
-        .map(|(specs, _measured)| specs)
-        .collect())
+    Ok(finalists(
+        &UnlimitedSearch(search, Allowance::default()),
+        data,
+        options,
+    )?
+    .into_iter()
+    .map(|(specs, _measured)| specs.into_vec())
+    .collect())
 }
 
 /// Picks the filter for a member, returning the winning specs together with the
@@ -763,6 +882,21 @@ pub(crate) fn choose_filter<S: FilterSearch>(
     options: S::Options,
     progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
 ) -> Result<(Vec<FilterSpec>, Vec<u8>)> {
+    choose_owned(
+        &UnlimitedSearch(search, Allowance::default()),
+        data,
+        options,
+        progress,
+    )
+    .map(|(specs, bytes)| (specs.into_vec(), bytes.into_vec()))
+}
+
+pub(crate) fn choose_owned<S: OwnedSearch>(
+    search: &S,
+    data: &[u8],
+    options: S::Options,
+    progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
+) -> Result<FilterChoice<S::Memory>> {
     match progress {
         Some(progress) => choose_filter_inner(
             &ReportingSearch {
@@ -776,12 +910,12 @@ pub(crate) fn choose_filter<S: FilterSearch>(
     }
 }
 
-fn choose_filter_inner<S: FilterSearch>(
+fn choose_filter_inner<S: OwnedSearch>(
     search: &S,
     data: &[u8],
     options: S::Options,
-) -> Result<(Vec<FilterSpec>, Vec<u8>)> {
-    let mut best: Option<(Vec<FilterSpec>, Vec<u8>)> = None;
+) -> Result<FilterChoice<S::Memory>> {
+    let mut best: Option<FilterChoice<S::Memory>> = None;
     for (specs, measured) in finalists(search, data, options)? {
         let packed = match measured {
             Some(packed) => packed,
@@ -790,7 +924,7 @@ fn choose_filter_inner<S: FilterSearch>(
         };
         if best
             .as_ref()
-            .is_none_or(|(_, best): &(_, Vec<u8>)| packed.len() < best.len())
+            .is_none_or(|(_, best)| packed.len() < best.len())
         {
             best = Some((specs, packed));
         }
@@ -811,21 +945,21 @@ fn choose_filter_inner<S: FilterSearch>(
 /// inside the search cost a second pass over the member to sharpen a percentage.
 /// A progress bar that finishes a little early or a little late is not worth
 /// that.
-pub(crate) fn walk_bytes<S: FilterSearch>(
-    search: &S,
+pub(crate) fn walk_bytes_for_kinds(
     data: &[u8],
+    screened: u64,
+    detects_x86: bool,
     encoder_candidates: usize,
 ) -> u64 {
     let member = data.len() as u64;
     let encoder_candidates = encoder_candidates.max(1) as u64;
     let sample = screen_sample(data).len() as u64;
-    let screened = search.screened_kinds(data).len() as u64;
     // Two sample encodes per region for the x86 screen, and the two specs it
     // proposes when the detector does find code. How many regions there are is
     // not knowable without scanning, so this assumes [`X86_ASSUMED_REGIONS`],
     // bounded by the member: the regions are disjoint, so however many the
     // scanner finds, their samples together cannot come to more than that.
-    let (x86_screen, x86_finalists) = if search.detects_x86() {
+    let (x86_screen, x86_finalists) = if detects_x86 {
         ((sample * X86_ASSUMED_REGIONS).min(member) * 2, 2)
     } else {
         (0, 0)
@@ -868,9 +1002,17 @@ pub(crate) fn auto_delta_filter_range(data: &[u8], channels: usize) -> Option<Ra
 ///
 /// Merging rather than dropping: two ranges that overlap describe one region,
 /// and keeping only the first loses coverage of the rest of it.
-pub(crate) fn disjoint_filter_ranges(mut ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
-    ranges.sort_by_key(|range| (range.start, range.end));
-    let mut disjoint: Vec<Range<usize>> = Vec::new();
+#[cfg(test)]
+pub(crate) fn disjoint_filter_ranges(ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
+    disjoint_ranges(Buffer::from_vec(ranges))
+        .expect("unlimited ranges")
+        .into_vec()
+}
+fn disjoint_ranges<B: Budget>(
+    mut ranges: Buffer<Range<usize>, B>,
+) -> Result<Buffer<Range<usize>, B>> {
+    ranges.sort_unstable_by_key(|range| (range.start, range.end));
+    let mut disjoint: Buffer<Range<usize>, B> = Buffer::new(&ranges.allowance());
     for range in ranges {
         if let Some(last) = disjoint.last_mut() {
             if range.start <= last.end {
@@ -878,13 +1020,82 @@ pub(crate) fn disjoint_filter_ranges(mut ranges: Vec<Range<usize>>) -> Vec<Range
                 continue;
             }
         }
-        disjoint.push(range);
+        disjoint.try_push(range)?;
     }
-    disjoint
+    Ok(disjoint)
 }
 
 #[cfg(test)]
 mod tests {
+    fn screen_kinds<S: FilterSearch>(
+        search: &S,
+        data: &[u8],
+        options: S::Options,
+    ) -> Result<ScreenOutcome<Allowance>> {
+        super::screen_kinds(
+            &UnlimitedSearch(search, Allowance::default()),
+            data,
+            options,
+        )
+    }
+    fn x86_code_regions(data: &[u8]) -> Vec<Range<usize>> {
+        super::x86_code_regions(data, &Allowance::default())
+            .unwrap()
+            .into_vec()
+    }
+    fn x86_screened_regions<S: FilterSearch>(
+        search: &S,
+        data: &[u8],
+        regions: &[Range<usize>],
+        options: S::Options,
+    ) -> Result<X86Screen<Allowance>> {
+        super::x86_screened_regions(
+            &UnlimitedSearch(search, Allowance::default()),
+            data,
+            regions,
+            options,
+        )
+    }
+    fn x86_finalists(data: &[u8], screen: &X86Screen<Allowance>) -> Vec<Vec<FilterSpec>> {
+        super::x86_finalists(data, screen)
+            .unwrap()
+            .into_iter()
+            .map(Buffer::into_vec)
+            .collect()
+    }
+    fn delta_table_regions(data: &[u8], max_stride: usize) -> Vec<(Range<usize>, usize)> {
+        table_regions(data, max_stride, &Allowance::default())
+            .unwrap()
+            .into_vec()
+    }
+    fn table_screened_regions<S: FilterSearch>(
+        search: &S,
+        data: &[u8],
+        regions: &[(Range<usize>, usize)],
+        options: S::Options,
+    ) -> Result<Buffer<(Range<usize>, usize)>> {
+        super::table_screened_regions(
+            &UnlimitedSearch(search, Allowance::default()),
+            data,
+            regions,
+            options,
+        )
+    }
+    fn subtract_ranges(range: Range<usize>, removed: &[Range<usize>]) -> Vec<Range<usize>> {
+        subtract_owned(range, removed, &Allowance::default())
+            .unwrap()
+            .into_vec()
+    }
+    fn graft_tables(
+        specs: Vec<FilterSpec>,
+        tables: &[(Range<usize>, usize)],
+        member: usize,
+    ) -> Vec<FilterSpec> {
+        graft_owned(Buffer::from_vec(specs), tables, member)
+            .unwrap()
+            .into_vec()
+    }
+
     #[test]
     fn search_reports_each_sample_pass_and_can_cancel_during_screening() {
         use std::cell::RefCell;
@@ -1112,7 +1323,7 @@ mod tests {
             "a kind the screen has already encoded is worth keeping whether or \
              not it won by the margin"
         );
-        for screened in &screen.kinds {
+        for screened in screen.kinds.iter() {
             let measured = screened
                 .measured
                 .as_ref()

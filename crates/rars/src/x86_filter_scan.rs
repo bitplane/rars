@@ -1,3 +1,7 @@
+#[cfg(test)]
+use crate::codec::workspace::Allowance;
+use crate::codec::workspace::{Budget, Buffer};
+use crate::codec::Result;
 use std::ops::Range;
 
 const AUTO_X86_CLUSTER_GAP: usize = 4096;
@@ -8,30 +12,45 @@ const AUTO_X86_MAX_RANGES: usize = 8;
 const AUTO_X86_MAX_SPAN_RANGES: usize = 4;
 const AUTO_X86_MIN_SPAN_OPCODES: usize = 4;
 
+#[cfg(test)]
 pub(crate) fn auto_x86_filter_ranges(data: &[u8], include_e9: bool) -> Vec<Range<usize>> {
-    let mut ranges =
-        auto_x86_filter_ranges_with_cluster_gap(data, include_e9, AUTO_X86_CLUSTER_GAP);
-    for range in
-        auto_x86_filter_ranges_with_cluster_gap(data, include_e9, AUTO_X86_TIGHT_CLUSTER_GAP)
-    {
-        if !ranges.contains(&range) {
-            ranges.push(range);
-        }
-    }
-    ranges
+    ranges_with_allowance(data, include_e9, &Allowance::default())
+        .expect("unlimited scanner")
+        .into_vec()
 }
 
-fn auto_x86_filter_ranges_with_cluster_gap(
+pub(crate) fn ranges_with_allowance<B: Budget>(
+    data: &[u8],
+    include_e9: bool,
+    allowance: &B,
+) -> Result<Buffer<Range<usize>, B>> {
+    let mut ranges =
+        auto_x86_filter_ranges_with_cluster_gap(data, include_e9, AUTO_X86_CLUSTER_GAP, allowance)?;
+    for range in auto_x86_filter_ranges_with_cluster_gap(
+        data,
+        include_e9,
+        AUTO_X86_TIGHT_CLUSTER_GAP,
+        allowance,
+    )? {
+        if !ranges.contains(&range) {
+            ranges.try_push(range)?;
+        }
+    }
+    Ok(ranges)
+}
+
+fn auto_x86_filter_ranges_with_cluster_gap<B: Budget>(
     data: &[u8],
     include_e9: bool,
     cluster_gap: usize,
-) -> Vec<Range<usize>> {
+    allowance: &B,
+) -> Result<Buffer<Range<usize>, B>> {
     if data.len() <= 5 {
-        return Vec::new();
+        return Ok(Buffer::new(allowance));
     }
 
     let cmp_mask = if include_e9 { 0xfe } else { 0xff };
-    let mut clusters = Vec::new();
+    let mut clusters = Buffer::new(allowance);
     let mut current: Option<(usize, usize, usize)> = None;
     let mut scan_pos = 0usize;
     while let Some(pos) = crate::fast::next_x86_opcode(data, scan_pos, data.len() - 4, cmp_mask) {
@@ -40,7 +59,7 @@ fn auto_x86_filter_ranges_with_cluster_gap(
                 current = Some((start, pos, count + 1));
             }
             Some(cluster) => {
-                clusters.push(cluster);
+                clusters.try_push(cluster)?;
                 current = Some((pos, pos, 1));
             }
             None => current = Some((pos, pos, 1)),
@@ -48,14 +67,14 @@ fn auto_x86_filter_ranges_with_cluster_gap(
         scan_pos = pos + 1;
     }
     if let Some(cluster) = current {
-        clusters.push(cluster);
+        clusters.try_push(cluster)?;
     }
 
     clusters.retain(|&(_, _, count)| count >= 2);
-    let mut ranges = Vec::new();
+    let mut ranges = Buffer::new(allowance);
     let mut span_count = 0;
     let mut span: Option<(usize, usize, usize)> = None;
-    for &(start, last, count) in &clusters {
+    for &(start, last, count) in clusters.iter() {
         match span {
             Some((span_start, span_last, span_opcodes))
                 if start.saturating_sub(span_last) <= AUTO_X86_SPAN_CLUSTER_GAP =>
@@ -66,7 +85,7 @@ fn auto_x86_filter_ranges_with_cluster_gap(
                 if span_opcodes >= AUTO_X86_MIN_SPAN_OPCODES
                     && span_count < AUTO_X86_MAX_SPAN_RANGES
                 {
-                    push_x86_filter_range(&mut ranges, data.len(), span_start, span_last);
+                    push_range(&mut ranges, data.len(), span_start, span_last)?;
                     span_count += 1;
                 }
                 span = Some((start, last, count));
@@ -76,37 +95,53 @@ fn auto_x86_filter_ranges_with_cluster_gap(
     }
     if let Some((span_start, span_last, span_opcodes)) = span {
         if span_opcodes >= AUTO_X86_MIN_SPAN_OPCODES && span_count < AUTO_X86_MAX_SPAN_RANGES {
-            push_x86_filter_range(&mut ranges, data.len(), span_start, span_last);
+            push_range(&mut ranges, data.len(), span_start, span_last)?;
         }
     }
 
-    clusters.sort_by(|a, b| {
+    clusters.sort_unstable_by(|a, b| {
         let a_len = a.1 - a.0 + 5;
         let b_len = b.1 - b.0 + 5;
-        b.2.cmp(&a.2).then_with(|| a_len.cmp(&b_len))
+        b.2.cmp(&a.2)
+            .then_with(|| a_len.cmp(&b_len))
+            .then_with(|| a.0.cmp(&b.0))
     });
     clusters.truncate(AUTO_X86_MAX_RANGES);
 
     for (start, last, _) in clusters {
-        push_x86_filter_range(&mut ranges, data.len(), start, last);
+        push_range(&mut ranges, data.len(), start, last)?;
     }
-    ranges
+    Ok(ranges)
 }
 
+fn push_range<B: Budget>(
+    ranges: &mut Buffer<Range<usize>, B>,
+    data_len: usize,
+    start: usize,
+    last: usize,
+) -> Result<()> {
+    let range_start = start.saturating_sub(AUTO_X86_RANGE_PADDING);
+    let range_end = (last + 5 + AUTO_X86_RANGE_PADDING).min(data_len);
+    let range = range_start..range_end;
+    if range.start < range.end && !ranges.contains(&range) {
+        ranges.try_push(range)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn push_x86_filter_range(
     ranges: &mut Vec<Range<usize>>,
     data_len: usize,
     start: usize,
     last: usize,
 ) {
-    let range_start = start.saturating_sub(AUTO_X86_RANGE_PADDING);
-    let range_end = (last + 5 + AUTO_X86_RANGE_PADDING).min(data_len);
-    let range = range_start..range_end;
+    let range = start.saturating_sub(AUTO_X86_RANGE_PADDING)
+        ..(last + 5 + AUTO_X86_RANGE_PADDING).min(data_len);
     if range.start < range.end && !ranges.contains(&range) {
         ranges.push(range);
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,6 +233,38 @@ mod tests {
             push_x86_filter_range(&mut ranges, data.len(), start, last);
         }
         ranges
+    }
+
+    #[test]
+    fn bounded_scanner_preserves_tied_clusters_and_releases_refused_growth() {
+        let mut data = vec![0x41; 500_000];
+        for section in 0..40 {
+            let start = 1024 + section * 10_000;
+            for offset in [0, 32, 64, 96] {
+                data[start + offset] = 0xe8;
+            }
+        }
+        let expected = scalar_auto_x86_filter_ranges(&data, true);
+        let mut successes = 0;
+        let mut refusals = 0;
+        for limit in [0, 95, 128, 256, 512, 1024, 2048, 8192] {
+            let allowance = Allowance::limited(limit);
+            match ranges_with_allowance(&data, true, &allowance) {
+                Ok(ranges) => {
+                    successes += 1;
+                    assert_eq!(&*ranges, expected);
+                    assert!(
+                        allowance.used()
+                            >= (ranges.len() * std::mem::size_of::<Range<usize>>()) as u64
+                    );
+                    drop(ranges);
+                }
+                Err(crate::codec::Error::WorkspaceLimitExceeded(_)) => refusals += 1,
+                Err(error) => panic!("{error}"),
+            }
+            assert_eq!(allowance.used(), 0);
+        }
+        assert!(successes > 0 && refusals >= 3);
     }
 
     #[test]

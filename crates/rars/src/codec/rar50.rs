@@ -764,6 +764,7 @@ pub fn encode_lz_member_with_options(
     encode_lz_member_with_history_and_options(data, &[], algorithm_version, options)
 }
 
+#[cfg(test)]
 pub(crate) fn encode_lz_member_with_options_and_progress(
     data: &[u8],
     algorithm_version: u8,
@@ -1076,6 +1077,7 @@ impl TryFrom<crate::FilterKind> for Rar50Filter {
 
 /// Applies `filters` to a copy of `data`, returning the transformed bytes and
 /// the records that describe them.
+#[cfg(test)]
 pub(crate) fn filtered_lz_member(
     data: &[u8],
     filters: &[crate::FilterSpec],
@@ -1310,6 +1312,29 @@ fn encode_lz_member_inner(
         &Allowance::default(),
     )
     .map(Buffer::into_vec)
+}
+
+pub(crate) fn encode_owned_member<B: Budget>(
+    data: &[u8],
+    version: u8,
+    options: EncodeOptions,
+    filters: Option<&[crate::FilterSpec]>,
+    progress: Option<&mut dyn FnMut(usize) -> bool>,
+    allowance: &B,
+) -> Result<Buffer<u8, B>> {
+    match filters {
+        None => encode_member_with_allowance(data, &[], version, &[], options, progress, allowance),
+        Some(filters) => {
+            EncoderState::new(options, allowance).encode(data, version, Some(filters), progress)
+        }
+    }
+}
+pub(crate) fn filtered_owned_member<B: Budget>(
+    data: &[u8],
+    filters: &[crate::FilterSpec],
+    allowance: &B,
+) -> Result<Buffer<u8, B>> {
+    filtered_member_with_allowance(data, filters, allowance).map(|(bytes, _)| bytes)
 }
 
 fn encode_member_with_allowance<B: Budget>(
@@ -2053,6 +2078,7 @@ impl Unpack50Encoder {
             .encode(input, algorithm_version, Some(filters), None)
             .map(Buffer::into_vec)
     }
+    #[cfg(test)]
     pub(crate) fn encode_member_with_filters_and_progress(
         &mut self,
         input: &[u8],

@@ -1,9 +1,13 @@
 use super::*;
+use crate::codec::rar50::EncodeOptions;
+#[cfg(test)]
 use crate::codec::rar50::{
-    encode_lz_member_with_options, encode_lz_member_with_options_and_progress, EncodeOptions,
-    Unpack50Encoder,
+    encode_lz_member_with_options, encode_lz_member_with_options_and_progress, Unpack50Encoder,
 };
-use crate::filter_search::{encode_pass, EncodeProgress};
+#[cfg(test)]
+use crate::codec::workspace::Allowance;
+use crate::codec::workspace::{Budget, Buffer};
+use crate::filter_search::{encode_pass, EncodeProgress, OwnedSearch};
 
 fn borrow_progress<'a>(
     progress: &'a mut Option<&mut dyn FnMut(EncodeProgress) -> bool>,
@@ -14,6 +18,7 @@ fn borrow_progress<'a>(
     }
 }
 
+#[cfg(test)]
 pub(super) fn encode_member_with_filter_policy_and_progress(
     data: &[u8],
     algorithm_version: u8,
@@ -21,33 +26,42 @@ pub(super) fn encode_member_with_filter_policy_and_progress(
     options: EncodeOptions,
     progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
 ) -> Result<Vec<u8>> {
-    match policy {
-        FilterPolicy::None => match progress {
-            Some(progress) => {
-                encode_safe_lz_member_with_progress(data, algorithm_version, options, progress)
-            }
-            None => encode_safe_lz_member(data, algorithm_version, options),
-        },
-        FilterPolicy::Explicit(filter) => encode_member_with_filter_specs_progress(
-            data,
-            algorithm_version,
-            std::slice::from_ref(filter),
-            options,
-            progress,
-        ),
-        FilterPolicy::Auto => {
-            encode_member_with_auto_size_filter_progress(data, algorithm_version, options, progress)
-        }
-    }
+    policy_with_allowance(
+        data,
+        algorithm_version,
+        policy,
+        options,
+        progress,
+        &Allowance::default(),
+    )
+    .map(Buffer::into_vec)
 }
-
+#[cfg(test)]
 pub(super) fn encode_member_with_filter_policy_candidates_and_progress(
     data: &[u8],
     algorithm_version: u8,
     policy: &FilterPolicy,
     candidates: &[EncodeOptions],
-    mut progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
+    progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
 ) -> Result<Vec<u8>> {
+    candidates_with_allowance(
+        data,
+        algorithm_version,
+        policy,
+        candidates,
+        progress,
+        &Allowance::default(),
+    )
+    .map(Buffer::into_vec)
+}
+pub(super) fn candidates_with_allowance<B: Budget>(
+    data: &[u8],
+    algorithm_version: u8,
+    policy: &FilterPolicy,
+    candidates: &[EncodeOptions],
+    mut progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
+    allowance: &B,
+) -> Result<Buffer<u8, B>> {
     let mut remaining = candidates.iter().copied();
     let first = remaining.next().ok_or(Error::WriterFailure(
         "RAR 5 compression level has no encoder options",
@@ -57,21 +71,23 @@ pub(super) fn encode_member_with_filter_policy_candidates_and_progress(
     // it is the difference between a handful of passes over the member and one
     // whole search per setting.
     if *policy == FilterPolicy::Auto && auto_size_filter_search_applies(data) {
-        let (specs, mut best) = choose_auto_size_filter(
+        let (specs, mut best) = choose_owned_filter(
             data,
             algorithm_version,
             first,
             borrow_progress(&mut progress),
+            allowance,
         )?;
         // The search already encoded the winner at the first setting, so only
         // the remaining settings are left to try.
         for options in remaining {
-            let packed = encode_member_with_filter_specs_progress(
+            let packed = specs_with_allowance(
                 data,
                 algorithm_version,
                 &specs,
                 options,
                 borrow_progress(&mut progress),
+                allowance,
             )?;
             if packed.len() < best.len() {
                 best = packed;
@@ -80,20 +96,22 @@ pub(super) fn encode_member_with_filter_policy_candidates_and_progress(
         return Ok(best);
     }
 
-    let mut best = encode_member_with_filter_policy_and_progress(
+    let mut best = policy_with_allowance(
         data,
         algorithm_version,
         policy,
         first,
         borrow_progress(&mut progress),
+        allowance,
     )?;
     for options in remaining {
-        let packed = encode_member_with_filter_policy_and_progress(
+        let packed = policy_with_allowance(
             data,
             algorithm_version,
             policy,
             options,
             borrow_progress(&mut progress),
+            allowance,
         )?;
         if packed.len() < best.len() {
             best = packed;
@@ -109,14 +127,19 @@ use crate::filter_search::search_applies as auto_size_filter_search_applies;
 pub(super) fn filter_policy_walk_bytes(
     data: &[u8],
     policy: &FilterPolicy,
-    algorithm_version: u8,
+    _algorithm_version: u8,
     encoder_candidates: usize,
 ) -> u64 {
     let member = data.len() as u64;
     if *policy != FilterPolicy::Auto || !auto_size_filter_search_applies(data) {
         return member * encoder_candidates.max(1) as u64;
     }
-    crate::filter_search::walk_bytes(&Rar50Search { algorithm_version }, data, encoder_candidates)
+    crate::filter_search::walk_bytes_for_kinds(
+        data,
+        SCREENED_KINDS.len() as u64,
+        true,
+        encoder_candidates,
+    )
 }
 
 /// Whether a member compression did not help is better off stored.
@@ -441,48 +464,149 @@ pub(super) fn compression_info(
         | solid_compression_flag(solid_continuation))
 }
 
-pub(super) fn encode_safe_lz_member(
-    data: &[u8],
-    algorithm_version: u8,
-    options: EncodeOptions,
-) -> Result<Vec<u8>> {
-    encode_lz_member_with_options(data, algorithm_version, options).map_err(Error::from)
-}
+const SCREENED_KINDS: [FilterKind; 5] = [
+    FilterKind::Arm,
+    FilterKind::Delta { channels: 1 },
+    FilterKind::Delta { channels: 2 },
+    FilterKind::Delta { channels: 3 },
+    FilterKind::Delta { channels: 4 },
+];
 
-pub(super) fn encode_safe_lz_member_with_progress(
+struct Rar50OwnedSearch<B: Budget> {
+    algorithm_version: u8,
+    allowance: B,
+}
+impl<B: Budget> OwnedSearch for Rar50OwnedSearch<B> {
+    type Options = EncodeOptions;
+    type Memory = B;
+    fn allowance(&self) -> &B {
+        &self.allowance
+    }
+    fn screened_kinds(&self, _: &[u8]) -> Result<Buffer<FilterKind, B>> {
+        Ok(Buffer::collect(SCREENED_KINDS, &self.allowance)?)
+    }
+    fn detects_x86(&self) -> bool {
+        true
+    }
+    fn max_delta_channels(&self) -> usize {
+        crate::codec::rar50::MAX_DELTA_CHANNELS
+    }
+    fn screen_options(&self, options: EncodeOptions) -> EncodeOptions {
+        options.with_optimal_parse(false)
+    }
+    fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Buffer<u8, B>> {
+        Ok(crate::codec::rar50::filtered_owned_member(
+            data,
+            filters,
+            &self.allowance,
+        )?)
+    }
+    fn encode_plain(
+        &self,
+        data: &[u8],
+        options: EncodeOptions,
+        progress: Option<&mut dyn FnMut(usize) -> bool>,
+    ) -> Result<Buffer<u8, B>> {
+        Ok(crate::codec::rar50::encode_owned_member(
+            data,
+            self.algorithm_version,
+            options,
+            None,
+            progress,
+            &self.allowance,
+        )?)
+    }
+    fn encode_filtered(
+        &self,
+        data: &[u8],
+        filters: &[FilterSpec],
+        options: EncodeOptions,
+        progress: Option<&mut dyn FnMut(usize) -> bool>,
+    ) -> Result<Buffer<u8, B>> {
+        Ok(crate::codec::rar50::encode_owned_member(
+            data,
+            self.algorithm_version,
+            options,
+            Some(filters),
+            progress,
+            &self.allowance,
+        )?)
+    }
+}
+fn choose_owned_filter<B: Budget>(
     data: &[u8],
     algorithm_version: u8,
     options: EncodeOptions,
-    progress: &mut dyn FnMut(EncodeProgress) -> bool,
-) -> Result<Vec<u8>> {
-    encode_pass(Some(progress), |progress| {
-        encode_lz_member_with_options_and_progress(
+    progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
+    allowance: &B,
+) -> Result<crate::filter_search::FilterChoice<B>> {
+    crate::filter_search::choose_owned(
+        &Rar50OwnedSearch {
+            algorithm_version,
+            allowance: allowance.clone(),
+        },
+        data,
+        options,
+        progress,
+    )
+}
+fn specs_with_allowance<B: Budget>(
+    data: &[u8],
+    algorithm_version: u8,
+    filters: &[FilterSpec],
+    options: EncodeOptions,
+    progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
+    allowance: &B,
+) -> Result<Buffer<u8, B>> {
+    encode_pass(progress, |progress| {
+        Ok(crate::codec::rar50::encode_owned_member(
             data,
             algorithm_version,
             options,
-            progress.expect("provided above"),
-        )
-        .map_err(Error::from)
+            (!filters.is_empty()).then_some(filters),
+            progress,
+            allowance,
+        )?)
     })
+}
+fn policy_with_allowance<B: Budget>(
+    data: &[u8],
+    algorithm_version: u8,
+    policy: &FilterPolicy,
+    options: EncodeOptions,
+    progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
+    allowance: &B,
+) -> Result<Buffer<u8, B>> {
+    match policy {
+        FilterPolicy::Auto if auto_size_filter_search_applies(data) => {
+            choose_owned_filter(data, algorithm_version, options, progress, allowance)
+                .map(|(_, bytes)| bytes)
+        }
+        FilterPolicy::Explicit(filter) => specs_with_allowance(
+            data,
+            algorithm_version,
+            std::slice::from_ref(filter),
+            options,
+            progress,
+            allowance,
+        ),
+        _ => specs_with_allowance(data, algorithm_version, &[], options, progress, allowance),
+    }
 }
 
 /// How RAR 5 measures a filter candidate, for the shared search.
+#[cfg(test)]
 #[derive(Clone, Copy)]
 pub(crate) struct Rar50Search {
     pub(crate) algorithm_version: u8,
 }
 
+#[cfg(test)]
 impl crate::filter_search::FilterSearch for Rar50Search {
     type Options = EncodeOptions;
 
     fn screened_kinds(&self, _data: &[u8]) -> Vec<FilterKind> {
-        vec![
-            FilterKind::Arm,
-            FilterKind::Delta { channels: 1 },
-            FilterKind::Delta { channels: 2 },
-            FilterKind::Delta { channels: 3 },
-            FilterKind::Delta { channels: 4 },
-        ]
+        SCREENED_KINDS.to_vec()
     }
 
     fn max_delta_channels(&self) -> usize {
@@ -542,68 +666,22 @@ impl crate::filter_search::FilterSearch for Rar50Search {
     }
 }
 
-fn choose_auto_size_filter(
-    data: &[u8],
-    algorithm_version: u8,
-    options: EncodeOptions,
-    progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
-) -> Result<(Vec<FilterSpec>, Vec<u8>)> {
-    crate::filter_search::choose_filter(&Rar50Search { algorithm_version }, data, options, progress)
-}
-
+#[cfg(test)]
 pub(super) fn encode_member_with_auto_size_filter_progress(
     data: &[u8],
     algorithm_version: u8,
     options: EncodeOptions,
     progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
 ) -> Result<Vec<u8>> {
-    if !auto_size_filter_search_applies(data) {
-        return encode_member_with_filter_policy_and_progress(
-            data,
-            algorithm_version,
-            &FilterPolicy::None,
-            options,
-            progress,
-        );
-    }
-    let (_, packed) = choose_auto_size_filter(data, algorithm_version, options, progress)?;
-    Ok(packed)
-}
-
-fn encode_member_with_filter_specs_progress(
-    data: &[u8],
-    algorithm_version: u8,
-    filters: &[FilterSpec],
-    options: EncodeOptions,
-    progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
-) -> Result<Vec<u8>> {
-    // Encoding an empty filter list through the filtered route changes block
-    // boundaries. Preserve the original plain/filtered routing exactly.
-    encode_pass(progress, |progress| {
-        if filters.is_empty() {
-            return match progress {
-                Some(progress) => encode_lz_member_with_options_and_progress(
-                    data,
-                    algorithm_version,
-                    options,
-                    progress,
-                ),
-                None => encode_lz_member_with_options(data, algorithm_version, options),
-            }
-            .map_err(Error::from);
-        }
-        let mut encoder = Unpack50Encoder::with_options(options);
-        match progress {
-            Some(progress) => encoder.encode_member_with_filters_and_progress(
-                data,
-                algorithm_version,
-                filters,
-                progress,
-            ),
-            None => encoder.encode_member_with_filters(data, algorithm_version, filters),
-        }
-        .map_err(Error::from)
-    })
+    policy_with_allowance(
+        data,
+        algorithm_version,
+        &FilterPolicy::Auto,
+        options,
+        progress,
+        &Allowance::default(),
+    )
+    .map(Buffer::into_vec)
 }
 
 pub(super) fn solid_compression_flag(solid_continuation: bool) -> u64 {
@@ -611,5 +689,143 @@ pub(super) fn solid_compression_flag(solid_continuation: bool) -> u64 {
         0x40
     } else {
         0
+    }
+}
+
+#[cfg(test)]
+mod allowance_tests {
+    use super::*;
+
+    #[test]
+    fn candidate_search_keeps_the_winner_charged_and_releases_refused_trials() {
+        let data: Vec<u8> = (0..1024u32)
+            .flat_map(|n| ((n * 71) % 32749).to_le_bytes())
+            .collect();
+        let candidates = [
+            EncodeOptions::new(8).with_max_match_distance(65536),
+            EncodeOptions::new(16).with_max_match_distance(65536),
+        ];
+        for version in [0, 1] {
+            for policy in [
+                FilterPolicy::None,
+                FilterPolicy::Auto,
+                FilterPolicy::Explicit(FilterSpec::whole(FilterKind::Delta { channels: 4 })),
+            ] {
+                let expected = candidates_with_allowance(
+                    &data,
+                    version,
+                    &policy,
+                    &candidates,
+                    None,
+                    &Allowance::default(),
+                )
+                .unwrap();
+                let mut successes = 0;
+                let mut refusals = 0;
+                for limit in [0, 4096, 16384, 65536, 262144, 1048576, 8 * 1048576] {
+                    let allowance = Allowance::limited(limit);
+                    match candidates_with_allowance(
+                        &data,
+                        version,
+                        &policy,
+                        &candidates,
+                        None,
+                        &allowance,
+                    ) {
+                        Ok(packed) => {
+                            successes += 1;
+                            assert_eq!(&*packed, &*expected);
+                            assert!(allowance.used() >= packed.len() as u64);
+                            assert!(allowance.used() > 0);
+                            drop(packed);
+                        }
+                        Err(error) => {
+                            refusals += 1;
+                            assert_eq!(error.kind(), crate::ErrorKind::ResourceLimit, "{error}");
+                        }
+                    }
+                    assert_eq!(allowance.used(), 0);
+                }
+                assert!(successes > 0 && refusals >= 3);
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_sampled_search_preserves_code_and_table_candidates() {
+        let mut data = vec![0x90u8; 65536];
+        for pos in (0..65000).step_by(32) {
+            data[pos] = 0xe8;
+            data[pos + 1..pos + 5].copy_from_slice(&(1024i32 - pos as i32).to_le_bytes());
+        }
+        for index in 0..8192u64 {
+            data.extend_from_slice(&(0x7f80_1234_0000 + index * 24).to_le_bytes());
+            data.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+            data.extend_from_slice(&(0x4455_6677_0000 | ((index * 7) & 0xffff)).to_le_bytes());
+        }
+        let options = EncodeOptions::new(8).with_max_match_distance(65536);
+        let expected = choose_owned_filter(&data, 0, options, None, &Allowance::default()).unwrap();
+        assert!(!expected.0.is_empty());
+        assert!(expected
+            .0
+            .iter()
+            .any(|spec| matches!(spec.kind, FilterKind::Delta { channels: 24 })));
+        let allowance = Allowance::limited(32 * 1048576);
+        let (specs, packed) = choose_owned_filter(&data, 0, options, None, &allowance).unwrap();
+        assert_eq!(&*specs, &*expected.0);
+        assert_eq!(&*packed, &*expected.1);
+        let retained = allowance.used();
+        assert!(retained > packed.len() as u64);
+        drop(specs);
+        assert!(allowance.used() < retained);
+        assert!(allowance.used() >= packed.len() as u64);
+        drop(packed);
+        assert_eq!(allowance.used(), 0);
+    }
+
+    #[test]
+    fn cancellation_drops_retained_screens_and_previous_encoder_candidates() {
+        let data: Vec<u8> = (0..1024u32).flat_map(|n| n.to_le_bytes()).collect();
+        let options = EncodeOptions::new(8).with_max_match_distance(65536);
+        let candidates = [options, options.with_optimal_parse(true)];
+        for policy in [FilterPolicy::None, FilterPolicy::Auto] {
+            let mut passes = 0;
+            let expected = candidates_with_allowance(
+                &data,
+                0,
+                &policy,
+                &candidates,
+                Some(&mut |event| {
+                    passes += usize::from(event == EncodeProgress::PassStarted);
+                    true
+                }),
+                &Allowance::default(),
+            )
+            .unwrap();
+            assert!(passes >= 2);
+            for stop in 1..=passes {
+                let allowance = Allowance::limited(16 * 1048576);
+                let mut pass = 0;
+                let result = candidates_with_allowance(
+                    &data,
+                    0,
+                    &policy,
+                    &candidates,
+                    Some(&mut |event| {
+                        pass += usize::from(event == EncodeProgress::PassStarted);
+                        pass < stop
+                    }),
+                    &allowance,
+                );
+                assert!(matches!(result, Err(Error::Cancelled)));
+                assert_eq!(allowance.used(), 0, "pass {stop}");
+                let retried =
+                    candidates_with_allowance(&data, 0, &policy, &candidates, None, &allowance)
+                        .unwrap();
+                assert_eq!(&*retried, &*expected);
+                drop(retried);
+                assert_eq!(allowance.used(), 0);
+            }
+        }
     }
 }

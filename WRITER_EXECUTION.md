@@ -82,9 +82,10 @@ The RAR5 codec's raw/filtered members, adjacent streaming blocks and persistent
 history support fallible internal allocation allowances, but production entry
 points still use unlimited handles. Streaming source reads, lookahead, job
 assembly, rolling dictionaries and packed results now retain those owners
-through spool writes. Whole-member source loading, automatic filter search,
-encryption/recovery workspace and coordinator integration must be covered before
-an enforceable writer policy is available.
+through spool writes. Whole-member source loading and automatic filter search
+also retain owned samples, scanner scratch, candidate descriptors, trial encodes
+and the winning payload. Encryption/recovery workspace and coordinator
+integration must be covered before an enforceable writer policy is available.
 `whole_member_workspace` adds four times the input size and a codec workspace
 estimate with reach and block size fitted to that input.
 

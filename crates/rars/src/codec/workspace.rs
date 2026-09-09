@@ -187,6 +187,23 @@ impl<T, B: Budget> Buffer<T, B> {
         self.values.push(value);
         Ok(())
     }
+    pub(crate) fn try_push(&mut self, value: T) -> Result<()> {
+        self.push(value).map_err(Into::into)
+    }
+    pub(crate) fn collect(values: impl IntoIterator<Item = T>, allowance: &B) -> Result<Self> {
+        let values = values.into_iter();
+        let mut out = Self::with_capacity(values.size_hint().0, allowance)?;
+        for value in values {
+            out.try_push(value)?;
+        }
+        Ok(out)
+    }
+    pub(crate) fn retain(&mut self, keep: impl FnMut(&T) -> bool) {
+        self.values.retain(keep);
+    }
+    pub(crate) fn truncate(&mut self, len: usize) {
+        self.values.truncate(len);
+    }
     pub(crate) fn resize(&mut self, len: usize, value: T) -> Result<()>
     where
         T: Clone,

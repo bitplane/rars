@@ -214,6 +214,14 @@ chunks, block lookahead, assembled jobs and rolling dictionaries for both
 independent and solid members. A job takes ownership of its first block instead
 of copying it. Packed block owners remain charged through parallel result slots
 and ordered spool writes; source failures and cancellation release the wave.
+Whole-member source loading and automatic filter search use the same internal
+allowance through the winning payload's spool write. Screen baselines, retained
+measurements, transformed samples, scanner clusters and ranges, table grafts,
+finalist descriptors and competing encoder settings keep their allocation owners.
+Scanner ranking and table ordering use explicit tie-breaks to preserve stable
+selection without hidden sorting workspace. The progress estimate counts filter
+kinds without allocating a candidate list. Legacy search uses an unlimited
+adapter; this does not add a hard policy to older-format encoding.
 Coordinator descriptors still use preparation accounting and spools retain their
 separate storage policy. This does not yet combine those ledgers.
 Covered owners reserve before growth, include replacement peaks and retain
@@ -227,11 +235,9 @@ This is migration infrastructure, not an available writer limit. Production
 codec entry points currently use unlimited handles; bounded construction is
 internal test coverage, including its refusal diagnostics. The codec reader
 adapter also has bounded read-ahead and input-buffer tests; it is not the
-production writer's source-loading path. Whole-member source loading,
-automatic filter-search candidates and their retained payloads,
-encryption/KDF and recovery workspace still need migration. Only after those
-paths are covered can the coordinator supply reserved allowances and connect them to preparation
-and spool memory. There is no public worker allowance or extension API yet.
+production writer's source-loading path. Encryption/KDF and recovery workspace
+still need migration. Only after those paths are covered can the coordinator
+supply reserved allowances and connect them to preparation and spool memory. There is no public worker allowance or extension API yet.
 The workspace/admission pass remains open until those guarantees are enforceable.
 
 The optimal parser keeps match-pricing helpers available for inlining across

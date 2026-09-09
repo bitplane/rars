@@ -12,9 +12,10 @@
 //! single walk through the members in order — the walk is just reading, which
 //! is cheap, so waves of blocks still compress in parallel.
 
+#[cfg(test)]
+use super::filter_policy::encode_member_with_filter_policy_candidates_and_progress;
 use super::filter_policy::{
-    compression_info, encode_member_with_filter_policy_candidates_and_progress,
-    should_store_compressed_payload,
+    candidates_with_allowance, compression_info, should_store_compressed_payload,
 };
 use super::FilterPolicy;
 #[cfg(test)]
@@ -427,6 +428,7 @@ fn compress_members_whole(
                 plan,
                 resources,
                 progress,
+                &Allowance::default(),
             )
             .map_err(|error| error_context(index, error))
         })?;
@@ -464,13 +466,14 @@ fn whole_member_wave(
     (end, reserved)
 }
 
-fn compress_whole_member(
+fn compress_whole_member<B: Budget>(
     index: usize,
     source: &EntrySource,
     integrity: (u64, u32, [u8; 32]),
     plan: &CompressPlan,
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
+    allowance: &B,
 ) -> Result<CompressedMember> {
     let (input_size, _, _) = integrity;
     let mut crc = Crc32::new();
@@ -485,7 +488,7 @@ fn compress_whole_member(
         }
         let size = usize::try_from(input_size)
             .map_err(|_| Error::InvalidArgument("entry size overflows usize"))?;
-        let mut data = vec![0; size];
+        let mut data = Buffer::filled(size, 0, allowance)?;
         let mut reader = source.open()?;
         for chunk in data.chunks_mut(plan.block_size.max(1)) {
             if advance.is_cancelled() {
@@ -527,12 +530,13 @@ fn compress_whole_member(
             charged = target;
             advance.advance(scaled)
         };
-        let packed = encode_member_with_filter_policy_candidates_and_progress(
+        let packed = candidates_with_allowance(
             &data,
             plan.algorithm_version,
             &plan.filter_policy,
             &plan.candidates,
             Some(&mut report),
+            allowance,
         )?;
         // An explicitly requested filter is not discarded just
         // because the result did not shrink.
@@ -1394,6 +1398,128 @@ mod tests {
         ));
         assert_eq!(joined.load(Ordering::Relaxed), 1);
         drop(Records::<u8>::new(65536, &resources).unwrap());
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[test]
+    fn whole_member_allowance_precedes_source_open_and_survives_until_spooling() {
+        use std::sync::{atomic::AtomicUsize, Arc};
+        let scratch = crate::scratch::case("whole-member-allowance");
+        let resources = WriterResources::default().with_temp_dir(&*scratch);
+        let options = EncodeOptions::new(8).with_max_match_distance(65536);
+        let plan = CompressPlan {
+            algorithm_version: 0,
+            encode_options: options,
+            dictionary_size: 65536,
+            block_size: 1024,
+            solid: false,
+            method: 1,
+            filter_policy: FilterPolicy::Auto,
+            candidates: vec![options, options.with_optimal_parse(true)],
+        };
+        let data: Vec<u8> = (0..1024u32).flat_map(|n| n.to_le_bytes()).collect();
+        let opens = Arc::new(AtomicUsize::new(0));
+        let source = EntrySource::from_opener(data.len() as u64, {
+            let data = data.clone();
+            let opens = opens.clone();
+            move || {
+                opens.fetch_add(1, Ordering::Relaxed);
+                Ok(Box::new(std::io::Cursor::new(data.clone())))
+            }
+        });
+        let integrity = (data.len() as u64, 0, [0; 32]);
+        let allowance = Allowance::limited(data.len() as u64 - 1);
+        let error = compress_whole_member(
+            0,
+            &source,
+            integrity,
+            &plan,
+            &resources,
+            &|_| true,
+            &allowance,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), crate::ErrorKind::ResourceLimit);
+        assert_eq!(opens.load(Ordering::Relaxed), 0);
+        assert_eq!(allowance.used(), 0);
+
+        let allowance = Allowance::limited(16 * 1048576);
+        let mut packed = compress_whole_member(
+            0,
+            &source,
+            integrity,
+            &plan,
+            &resources,
+            &|_| {
+                assert!(allowance.used() >= data.len() as u64);
+                true
+            },
+            &allowance,
+        )
+        .unwrap();
+        assert!(!packed.store);
+        assert_eq!(packed.crc32, crate::crc32::crc32(&data));
+        assert_eq!(packed.hash, blake2sp::hash(&data));
+        assert_eq!(allowance.used(), 0);
+        let expected = candidates_with_allowance(
+            &data,
+            0,
+            &plan.filter_policy,
+            &plan.candidates,
+            None,
+            &Allowance::default(),
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        packed.packed.copy_to(&mut bytes).unwrap();
+        assert_eq!(&*expected, bytes);
+        drop(packed);
+
+        let refused_spool = resources.clone().with_max_spool_bytes(0);
+        let error = compress_whole_member(
+            0,
+            &source,
+            integrity,
+            &plan,
+            &refused_spool,
+            &|_| true,
+            &allowance,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), crate::ErrorKind::ResourceLimit);
+        assert_eq!(allowance.used(), 0);
+        let cancelled = compress_whole_member(
+            0,
+            &source,
+            integrity,
+            &plan,
+            &resources,
+            &|_| false,
+            &allowance,
+        );
+        assert!(matches!(cancelled, Err(Error::Cancelled)));
+        assert_eq!(allowance.used(), 0);
+        for actual in [b"short".as_slice(), b"longer than declared"] {
+            let changed =
+                EntrySource::from_opener(8, move || Ok(Box::new(std::io::Cursor::new(actual))));
+            let result = compress_whole_member(
+                0,
+                &changed,
+                (8, 0, [0; 32]),
+                &plan,
+                &resources,
+                &|_| true,
+                &allowance,
+            );
+            assert!(matches!(
+                result,
+                Err(Error::Io(_) | Error::SourceChanged(_))
+            ));
+            assert_eq!(allowance.used(), 0);
+        }
+        assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
     }
 
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
