@@ -135,8 +135,12 @@ on those other paths. It is independent of spool and estimated workspace quotas.
 Fixed-size framing and common hash, encryption, timestamp and locator records
 use bounded stack scratch. Extra-record payloads append directly to the output
 without an intermediate body copy; plain header framing likewise fills its
-final image directly. Variable-length record assembly and encrypted-header
-staging outside prepared images still need separate accounting.
+final image directly. Filename and archive-metadata records allocate their exact
+final size without intermediate payload copies. Plain, encrypted and prepared
+headers share framing logic; encrypted headers compute their final layout and
+encrypt in place without a separate plaintext or padded ciphertext buffer.
+Only prepared images currently carry a quota charge. Variable-length record
+allocations and the other output images still need separate accounting.
 
 ## Contract for a future managed-memory ceiling
 

@@ -89,6 +89,122 @@ pub(super) fn write_file_encryption_record(
     write_extra_record(out, FHEXTRA_CRYPT, record.as_slice());
 }
 
+fn image_size_error() -> Error {
+    Error::InvalidArgument("RAR 5 header size overflows")
+}
+
+fn checked_image_len(parts: &[usize]) -> Result<usize> {
+    let len = parts
+        .iter()
+        .try_fold(0usize, |total, &size| total.checked_add(size))
+        .ok_or_else(image_size_error)?;
+    if len > isize::MAX as usize {
+        return Err(image_size_error());
+    }
+    Ok(len)
+}
+
+fn join_record(parts: &[&[u8]]) -> Result<Vec<u8>> {
+    let len = parts
+        .iter()
+        .try_fold(0usize, |total, part| total.checked_add(part.len()))
+        .ok_or_else(image_size_error)?;
+    let mut out = vec![0; checked_image_len(&[len])?];
+    let mut offset = 0;
+    for part in parts {
+        out[offset..offset + part.len()].copy_from_slice(part);
+        offset += part.len();
+    }
+    Ok(out)
+}
+
+/// Computes framing without copying variable-length fields. All header paths
+/// render into their final allocation, including IV, padding and trailing data.
+struct HeaderImage<'a> {
+    prefix: HeaderScratch<40>,
+    size: HeaderScratch<10>,
+    specific: &'a [u8],
+    extra: &'a [u8],
+    plain_len: usize,
+}
+
+impl<'a> HeaderImage<'a> {
+    fn new(
+        kind: u64,
+        flags: u64,
+        data_size: Option<u64>,
+        specific: &'a [u8],
+        extra: &'a [u8],
+    ) -> Result<Self> {
+        let mut prefix = HeaderScratch::new();
+        prefix.vint(kind);
+        prefix.vint(flags);
+        if flags & HFL_EXTRA != 0 {
+            prefix.vint(extra.len() as u64);
+        }
+        if let Some(data_size) = data_size {
+            prefix.vint(data_size);
+        }
+        let body_len = checked_image_len(&[prefix.len(), specific.len(), extra.len()])?;
+        let mut size = HeaderScratch::new();
+        size.vint(body_len as u64);
+        let plain_len = checked_image_len(&[4, size.len(), body_len])?;
+        Ok(Self {
+            prefix,
+            size,
+            specific,
+            extra,
+            plain_len,
+        })
+    }
+
+    fn header_len(&self, encrypted: bool) -> Result<usize> {
+        if encrypted {
+            let padded = self
+                .plain_len
+                .checked_add(15)
+                .ok_or_else(image_size_error)?
+                & !15;
+            checked_image_len(&[16, padded])
+        } else {
+            Ok(self.plain_len)
+        }
+    }
+
+    fn render(&self, keys: Option<&Rar50Keys>, data: &[u8]) -> Result<Vec<u8>> {
+        let header_len = self.header_len(keys.is_some())?;
+        let mut out = vec![0; checked_image_len(&[header_len, data.len()])?];
+        let start = if keys.is_some() { 16 } else { 0 };
+        let mut offset = start + 4;
+        for part in [
+            self.size.as_slice(),
+            self.prefix.as_slice(),
+            self.specific,
+            self.extra,
+        ] {
+            out[offset..offset + part.len()].copy_from_slice(part);
+            offset += part.len();
+        }
+        let crc = crc32(&out[start + 4..start + self.plain_len]);
+        out[start..start + 4].copy_from_slice(&crc.to_le_bytes());
+        if let Some(keys) = keys {
+            let mut iv = [0; 16];
+            getrandom::fill(&mut iv).map_err(|error| {
+                crate::write_stream::entropy_error(
+                    error,
+                    "RAR 5 writer could not generate encryption IV",
+                )
+            })?;
+            out[..16].copy_from_slice(&iv);
+            Rar50Cipher::new(keys.key, iv)
+                .encrypt_in_place(&mut out[16..header_len])
+                .map_err(map_rar50_crypto_error)?;
+        }
+        out[header_len..].copy_from_slice(data);
+        Ok(out)
+    }
+}
+
 pub(super) fn block_header_image(
     header_type: u64,
     flags: u64,
@@ -96,44 +212,7 @@ pub(super) fn block_header_image(
     type_specific: &[u8],
     extra: &[u8],
 ) -> Result<Vec<u8>> {
-    let mut prefix = HeaderScratch::<40>::new();
-    prefix.vint(header_type);
-    prefix.vint(flags);
-    if flags & HFL_EXTRA != 0 {
-        prefix.vint(extra.len() as u64);
-    }
-    if let Some(data_size) = data_size {
-        prefix.vint(data_size);
-    }
-    let overflow = || Error::InvalidArgument("RAR 5 header size overflows");
-    let body_len = prefix
-        .len()
-        .checked_add(type_specific.len())
-        .and_then(|len| len.checked_add(extra.len()))
-        .ok_or_else(overflow)?;
-    let mut header_size = HeaderScratch::<10>::new();
-    header_size.vint(body_len as u64);
-    let length = 4usize
-        .checked_add(header_size.len())
-        .and_then(|len| len.checked_add(body_len))
-        .ok_or_else(overflow)?;
-    if length > isize::MAX as usize {
-        return Err(overflow());
-    }
-    let mut header = vec![0; length];
-    let mut offset = 4;
-    for part in [
-        header_size.as_slice(),
-        prefix.as_slice(),
-        type_specific,
-        extra,
-    ] {
-        header[offset..offset + part.len()].copy_from_slice(part);
-        offset += part.len();
-    }
-    let header_crc = crc32(&header[4..]);
-    header[..4].copy_from_slice(&header_crc.to_le_bytes());
-    Ok(header)
+    HeaderImage::new(header_type, flags, data_size, type_specific, extra)?.render(None, &[])
 }
 
 pub(super) fn write_block(
@@ -164,24 +243,7 @@ pub(crate) fn encrypted_header_block(
     extra: &[u8],
     data: &[u8],
 ) -> Result<Vec<u8>> {
-    let header = block_header_image(header_type, flags, data_size, type_specific, extra)?;
-    let mut iv = [0u8; 16];
-    getrandom::fill(&mut iv).map_err(|error| {
-        crate::write_stream::entropy_error(error, "RAR 5 writer could not generate encryption IV")
-    })?;
-    let padded_len = header.len().checked_add(15).ok_or(Error::InvalidArgument(
-        "RAR 5 encrypted header size overflows",
-    ))? & !15;
-    let mut encrypted_header = header;
-    encrypted_header.resize(padded_len, 0);
-    Rar50Cipher::new(keys.key, iv)
-        .encrypt_in_place(&mut encrypted_header)
-        .map_err(map_rar50_crypto_error)?;
-    let mut out = Vec::with_capacity(16 + encrypted_header.len() + data.len());
-    out.extend_from_slice(&iv);
-    out.extend_from_slice(&encrypted_header);
-    out.extend_from_slice(data);
-    Ok(out)
+    HeaderImage::new(header_type, flags, data_size, type_specific, extra)?.render(Some(keys), data)
 }
 
 pub(super) fn stored_file_specific(
@@ -227,21 +289,20 @@ pub(super) fn file_specific(
         file_flags |= FHFL_MTIME;
     }
 
-    let mut specific = Vec::new();
-    write_vint(&mut specific, file_flags);
-    write_vint(&mut specific, unpacked_size);
-    write_vint(&mut specific, attributes);
+    let mut specific = HeaderScratch::<68>::new();
+    specific.vint(file_flags);
+    specific.vint(unpacked_size);
+    specific.vint(attributes);
     if let Some(mtime) = mtime {
         specific.extend_from_slice(&mtime.to_le_bytes());
     }
     if let Some(data_crc32) = data_crc32 {
         specific.extend_from_slice(&data_crc32.to_le_bytes());
     }
-    write_vint(&mut specific, compression_info);
-    write_vint(&mut specific, host_os);
-    write_vint(&mut specific, name.len() as u64);
-    specific.extend_from_slice(name);
-    Ok(specific)
+    specific.vint(compression_info);
+    specific.vint(host_os);
+    specific.vint(name.len() as u64);
+    join_record(&[specific.as_slice(), name])
 }
 
 pub(super) fn write_mtime_record(extra: &mut Vec<u8>, seconds: Option<u32>, nanos: Option<u32>) {
@@ -254,6 +315,27 @@ pub(super) fn write_mtime_record(extra: &mut Vec<u8>, seconds: Option<u32>, nano
         record.extend_from_slice(&nanos.to_le_bytes());
         write_extra_record(extra, super::super::FHEXTRA_HTIME, record.as_slice());
     }
+}
+
+fn metadata_image(flags: u64, name: Option<&[u8]>, time: &[u8]) -> Result<Vec<u8>> {
+    let mut fields = HeaderScratch::<20>::new();
+    fields.vint(flags);
+    if let Some(name) = name {
+        fields.vint(name.len() as u64);
+    }
+    let name = name.unwrap_or_default();
+    let mut kind = HeaderScratch::<10>::new();
+    kind.vint(MHEXTRA_ARCHIVE_METADATA);
+    let body_len = checked_image_len(&[kind.len(), fields.len(), name.len(), time.len()])?;
+    let mut size = HeaderScratch::<10>::new();
+    size.vint(body_len as u64);
+    join_record(&[
+        size.as_slice(),
+        kind.as_slice(),
+        fields.as_slice(),
+        name,
+        time,
+    ])
 }
 
 pub(super) fn archive_metadata_record(metadata: ArchiveMetadataEntry<'_>) -> Result<Vec<u8>> {
@@ -275,24 +357,17 @@ pub(super) fn archive_metadata_record(metadata: ArchiveMetadataEntry<'_>) -> Res
         flags |= MHEXTRA_ARCHIVE_METADATA_TIME;
     }
 
-    let mut record = Vec::new();
-    write_vint(&mut record, flags);
-    if let Some(name) = metadata.name {
-        if name.is_empty() {
-            return Err(Error::InvalidArgument(
-                "RAR 5 archive metadata name is empty",
-            ));
-        }
-        write_vint(&mut record, name.len() as u64);
-        record.extend_from_slice(name);
+    if metadata.name.is_some_and(|name| name.is_empty()) {
+        return Err(Error::InvalidArgument(
+            "RAR 5 archive metadata name is empty",
+        ));
     }
-    if let Some(creation_time) = metadata.creation_time {
-        record.extend_from_slice(&creation_time.to_le_bytes());
-    }
-
-    let mut extra = Vec::new();
-    write_extra_record(&mut extra, MHEXTRA_ARCHIVE_METADATA, &record);
-    Ok(extra)
+    let time = metadata.creation_time.map(u64::to_le_bytes);
+    metadata_image(
+        flags,
+        metadata.name,
+        time.as_ref().map_or(&[], |bytes| bytes.as_slice()),
+    )
 }
 
 pub(super) fn write_locator_record(
@@ -458,26 +533,23 @@ pub(crate) fn retained_archive_metadata(
             "unsupported archive metadata record",
         ));
     }
-    let mut record = Vec::new();
-    write_vint(&mut record, metadata.flags);
-    if let Some(name) = &metadata.name {
-        write_vint(&mut record, name.len() as u64);
-        record.extend(name);
-    }
+    let mut time_bytes = HeaderScratch::<8>::new();
     if let Some(time) = metadata.creation_time {
         if metadata.flags & 4 != 0 && metadata.flags & 8 == 0 {
-            record.extend(
-                u32::try_from(time)
+            time_bytes.extend_from_slice(
+                &u32::try_from(time)
                     .map_err(|_| Error::InvalidArgument("archive Unix timestamp exceeds 32 bits"))?
                     .to_le_bytes(),
             );
         } else {
-            record.extend(time.to_le_bytes());
+            time_bytes.extend_from_slice(&time.to_le_bytes());
         }
     }
-    let mut extra = Vec::new();
-    write_extra_record(&mut extra, MHEXTRA_ARCHIVE_METADATA, &record);
-    Ok(extra)
+    metadata_image(
+        metadata.flags,
+        metadata.name.as_deref(),
+        time_bytes.as_slice(),
+    )
 }
 
 /// An immutable final header image. Free bytes before releasing admission.
@@ -502,61 +574,10 @@ pub(super) fn prepared_header_image(
     keys: Option<&HeaderEncryptionKeys>,
     resources: &crate::WriterResources,
 ) -> Result<PreparedHeader> {
-    // Prefixes contain only vints. Variable-size inputs stay borrowed until
-    // the final allocation has been admitted; no intermediate body copy.
-    let mut prefix = HeaderScratch::<40>::new();
-    prefix.vint(header_type);
-    prefix.vint(flags);
-    if flags & HFL_EXTRA != 0 {
-        prefix.vint(extra.len() as u64);
-    }
-    if let Some(size) = data_size {
-        prefix.vint(size);
-    }
-    let overflow = || Error::InvalidArgument("RAR 5 prepared header size overflows");
-    let body_len = prefix
-        .len()
-        .checked_add(type_specific.len())
-        .and_then(|len| len.checked_add(extra.len()))
-        .ok_or_else(overflow)?;
-    let mut size = HeaderScratch::<10>::new();
-    size.vint(body_len as u64);
-    let plain_len = 4usize
-        .checked_add(size.len())
-        .and_then(|len| len.checked_add(body_len))
-        .ok_or_else(overflow)?;
-    let (start, length) = if keys.is_some() {
-        let padded = plain_len.checked_add(15).ok_or_else(overflow)? & !15;
-        (16, padded.checked_add(16).ok_or_else(overflow)?)
-    } else {
-        (0, plain_len)
-    };
-    if length > isize::MAX as usize {
-        return Err(overflow());
-    }
+    let image = HeaderImage::new(header_type, flags, data_size, type_specific, extra)?;
+    let length = image.header_len(keys.is_some())?;
     let charge = resources.reserve_prepared_header(length as u64)?;
-    // vec![value; n] requests exactly n elements; padding is zero from the start.
-    let mut bytes = vec![0; length];
-    let mut offset = start + 4;
-    for part in [size.as_slice(), prefix.as_slice(), type_specific, extra] {
-        bytes[offset..offset + part.len()].copy_from_slice(part);
-        offset += part.len();
-    }
-    let crc = crc32(&bytes[start + 4..start + plain_len]);
-    bytes[start..start + 4].copy_from_slice(&crc.to_le_bytes());
-    if let Some(keys) = keys {
-        let mut iv = [0; 16];
-        getrandom::fill(&mut iv).map_err(|error| {
-            crate::write_stream::entropy_error(
-                error,
-                "RAR 5 writer could not generate encryption IV",
-            )
-        })?;
-        bytes[..16].copy_from_slice(&iv);
-        Rar50Cipher::new(keys.keys.key, iv)
-            .encrypt_in_place(&mut bytes[16..])
-            .map_err(map_rar50_crypto_error)?;
-    }
+    let bytes = image.render(keys.map(|keys| &keys.keys), &[])?;
     Ok(PreparedHeader {
         bytes,
         _charge: charge,
@@ -733,5 +754,119 @@ mod scratch_tests {
         write_vint(&mut body, u64::MAX);
         write_vint(&mut body, u64::MAX);
         assert_eq!(actual, buffered_record(MHEXTRA_LOCATOR, &body));
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    #[test]
+    fn encrypted_images_match_buffered_ciphertext_and_leave_trailing_data_plain() {
+        let keys = header_encryption_keys(b"secret").unwrap();
+        for size in [0, 1, 15, 16, 17, 127, 128, 16384] {
+            let specific = vec![0x35; size];
+            let data = b"unencrypted trailing payload";
+            let actual = encrypted_header_block(
+                &keys.keys,
+                u64::MAX,
+                HFL_EXTRA,
+                Some(data.len() as u64),
+                &specific,
+                b"extra",
+                data,
+            )
+            .unwrap();
+            let iv = actual[..16].try_into().unwrap();
+            let mut expected = block_header_image(
+                u64::MAX,
+                HFL_EXTRA,
+                Some(data.len() as u64),
+                &specific,
+                b"extra",
+            )
+            .unwrap();
+            expected.resize(expected.len().div_ceil(16) * 16, 0);
+            Rar50Cipher::new(keys.keys.key, iv)
+                .encrypt_in_place(&mut expected)
+                .unwrap();
+            assert_eq!(&actual[16..16 + expected.len()], expected);
+            assert_eq!(&actual[16 + expected.len()..], data);
+            assert_eq!(actual.capacity(), actual.len());
+        }
+    }
+
+    #[test]
+    fn metadata_images_keep_all_supported_time_encodings_and_name_lengths() {
+        for length in [1, 127, 128, 16384] {
+            let name = vec![b'n'; length];
+            for flags in [1, 2, 3, 6, 7, 14, 15] {
+                let time = if flags & 4 != 0 && flags & 8 == 0 {
+                    u32::MAX as u64
+                } else {
+                    u64::MAX
+                };
+                let record = crate::rar50::ArchiveMetadataRecord {
+                    flags,
+                    name: (flags & 1 != 0).then(|| name.clone()),
+                    creation_time: (flags & 2 != 0).then_some(time),
+                };
+                let mut body = Vec::new();
+                write_vint(&mut body, flags);
+                if let Some(name) = &record.name {
+                    write_vint(&mut body, name.len() as u64);
+                    body.extend_from_slice(name);
+                }
+                if record.creation_time.is_some() {
+                    if flags & 4 != 0 && flags & 8 == 0 {
+                        body.extend_from_slice(&(time as u32).to_le_bytes());
+                    } else {
+                        body.extend_from_slice(&time.to_le_bytes());
+                    }
+                }
+                let mut expected = Vec::new();
+                write_extra_record(&mut expected, MHEXTRA_ARCHIVE_METADATA, &body);
+                let actual = retained_archive_metadata(&record).unwrap();
+                assert_eq!(actual, expected);
+                assert_eq!(actual.capacity(), actual.len());
+                if flags == 2 || flags == 3 {
+                    assert_eq!(
+                        archive_metadata_record(ArchiveMetadataEntry {
+                            name: record.name.as_deref(),
+                            creation_time: record.creation_time,
+                        })
+                        .unwrap(),
+                        expected
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn file_specific_fields_keep_maximum_widths_without_growing_the_record() {
+        let name = vec![b'n'; 16384];
+        let actual = file_specific(
+            &name,
+            u64::MAX,
+            Some(u32::MAX),
+            u64::MAX,
+            Some(u32::MAX),
+            u64::MAX,
+            u64::MAX,
+            true,
+        )
+        .unwrap();
+        let mut expected = Vec::new();
+        for value in [FHFL_CRC32 | FHFL_DIRECTORY | FHFL_MTIME, u64::MAX, u64::MAX] {
+            write_vint(&mut expected, value);
+        }
+        expected.extend_from_slice(&[0xff; 8]);
+        for value in [u64::MAX, u64::MAX, name.len() as u64] {
+            write_vint(&mut expected, value);
+        }
+        expected.extend_from_slice(&name);
+        assert_eq!(actual, expected);
+        assert_eq!(actual.capacity(), actual.len());
     }
 }
