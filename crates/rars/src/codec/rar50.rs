@@ -1,4 +1,5 @@
 use super::filters::{self, DeltaErrorMessages, FilterOp};
+use super::workspace::{Allowance, Budget, Buffer};
 use super::{huffman, match_finder, Error, Result};
 use std::collections::VecDeque;
 use std::io::Read;
@@ -179,7 +180,7 @@ const NICE_MATCH_LENGTH: usize = 512;
 
 /// Matches shorter than 4 bytes are never emitted, so candidate positions are
 /// chained by a hash of their first 4 bytes.
-type Rar50MatchFinder = match_finder::MatchFinder<4>;
+type Rar50MatchFinder<B = Allowance> = match_finder::MatchFinder<4, B>;
 const MAX_MATCH_CANDIDATES: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1204,40 +1205,53 @@ fn finder_window(options: EncodeOptions, reach: usize) -> usize {
 /// keeps growing as the blocks are parsed, so it is sized to the widest window
 /// the member could ever want rather than to any one block.
 fn member_finder(combined: &[u8], start: usize, options: EncodeOptions) -> Rar50MatchFinder {
-    let mut finder = Rar50MatchFinder::new(finder_window(options, combined.len()));
+    member_finder_with_allowance(combined, start, options, &Allowance::default())
+        .expect("unlimited finder allocation")
+}
+
+fn member_finder_with_allowance<B: Budget>(
+    combined: &[u8],
+    start: usize,
+    options: EncodeOptions,
+    allowance: &B,
+) -> Result<Rar50MatchFinder<B>> {
+    let mut finder =
+        Rar50MatchFinder::with_allowance(finder_window(options, combined.len()), allowance)?;
     for pos in 0..start {
         finder.insert(combined, pos);
     }
-    finder
+    Ok(finder)
 }
 
 /// A finder holding everything a parse of `block` may reach back to, and
 /// nothing older.
-fn seeded_finder(
+fn seeded_finder<B: Budget>(
     combined: &[u8],
     block: std::ops::Range<usize>,
     options: EncodeOptions,
-) -> Rar50MatchFinder {
+    allowance: &B,
+) -> Result<Rar50MatchFinder<B>> {
     // Sized to what this block can actually reach, not to the maximum distance,
     // so the first blocks of a member do not clear a window the data is not yet
     // long enough to fill.
     let behind = block.start.min(options.max_match_distance);
-    let mut finder = Rar50MatchFinder::new(behind + (block.end - block.start));
+    let mut finder =
+        Rar50MatchFinder::with_allowance(behind + (block.end - block.start), allowance)?;
     for pos in block.start - behind..block.start {
         finder.insert(combined, pos);
     }
-    finder
+    Ok(finder)
 }
 
 /// The search state a member shares across its blocks, when it has any.
-enum MemberSearch<'a> {
+enum MemberSearch<'a, B: Budget = Allowance> {
     /// Nothing shared: the block builds what it needs and drops it.
     Fresh,
     /// The member's chain finder, which the lazy path feeds block by block.
-    Lazy(&'a mut Rar50MatchFinder),
+    Lazy(&'a mut Rar50MatchFinder<B>),
     /// The member's match collector, which the optimal parse feeds block by
     /// block.
-    Optimal(&'a mut OptimalCollector),
+    Optimal(&'a mut OptimalCollector<B>),
 }
 
 /// The matches at every position of one block, found once and priced by every
@@ -1250,15 +1264,15 @@ enum MemberSearch<'a> {
 /// approaches that: the worst measured is about six runs per position, on a
 /// mebibyte of two-symbol noise, where every position has many candidates whose
 /// lengths creep up one byte at a time. That block cost three megabytes.
-struct BlockMatches {
+struct BlockMatches<B: Budget = Allowance> {
     /// Every position's runs, one position after another.
-    runs: Vec<(u32, u32)>,
+    runs: Buffer<(u32, u32), B>,
     /// Where each position's runs start in `runs`, with one extra entry to
     /// close the last position.
-    starts: Vec<u32>,
+    starts: Buffer<u32, B>,
 }
 
-impl BlockMatches {
+impl<B: Budget> BlockMatches<B> {
     fn at(&self, index: usize) -> &[(u32, u32)] {
         &self.runs[self.starts[index] as usize..self.starts[index + 1] as usize]
     }
@@ -1280,26 +1294,40 @@ impl BlockMatches {
 /// history keeps the chains, because the only way into a tree is a descent per
 /// position, and paying that across a dictionary of history would cost more
 /// than the chains ever did.
-struct OptimalCollector {
-    finder: CollectorFinder,
+struct OptimalCollector<B: Budget = Allowance> {
+    finder: CollectorFinder<B>,
 }
 
-enum CollectorFinder {
-    Tree(match_finder::TreeMatchFinder),
-    Chains(Rar50MatchFinder),
+enum CollectorFinder<B: Budget = Allowance> {
+    Tree(match_finder::TreeMatchFinder<B>),
+    Chains(Rar50MatchFinder<B>),
 }
 
 impl OptimalCollector {
     fn new(combined: &[u8], start: usize, options: EncodeOptions) -> Self {
+        Self::with_allowance(combined, start, options, &Allowance::default())
+            .expect("unlimited collector allocation")
+    }
+}
+
+impl<B: Budget> OptimalCollector<B> {
+    fn with_allowance(
+        combined: &[u8],
+        start: usize,
+        options: EncodeOptions,
+        allowance: &B,
+    ) -> Result<Self> {
         let finder = if start == 0 {
-            CollectorFinder::Tree(match_finder::TreeMatchFinder::new(finder_window(
-                options,
-                combined.len(),
-            )))
+            CollectorFinder::Tree(match_finder::TreeMatchFinder::with_allowance(
+                finder_window(options, combined.len()),
+                allowance,
+            )?)
         } else {
-            CollectorFinder::Chains(member_finder(combined, start, options))
+            CollectorFinder::Chains(member_finder_with_allowance(
+                combined, start, options, allowance,
+            )?)
         };
-        Self { finder }
+        Ok(Self { finder })
     }
 
     /// Finds the matches the parse will price at each position of `block`,
@@ -1317,20 +1345,27 @@ impl OptimalCollector {
         combined: &[u8],
         block: std::ops::Range<usize>,
         options: EncodeOptions,
-    ) -> BlockMatches {
+    ) -> Result<BlockMatches<B>> {
+        let allowance = match &self.finder {
+            CollectorFinder::Tree(finder) => finder.allowance(),
+            CollectorFinder::Chains(finder) => finder.allowance(),
+        };
         let span = block.end - block.start;
         let mut matches = BlockMatches {
             // One run per position to start with, which is where data that
             // matches at all lands, so the common case grows this once.
-            runs: Vec::with_capacity(span),
-            starts: Vec::with_capacity(span + 1),
+            runs: Buffer::with_capacity(span, &allowance)?,
+            starts: Buffer::with_capacity(span + 1, &allowance)?,
         };
         // The first position past a match the parse will commit to. The parse
         // reaches the same decision from the same lengths, so the two agree on
         // which positions matter without having to be told.
         let mut committed_through = block.start;
         for pos in block.clone() {
-            matches.starts.push(matches.runs.len() as u32);
+            matches
+                .starts
+                .push(matches.runs.len() as u32)
+                .map_err(Into::into)?;
             let searching = pos >= committed_through && options.max_match_candidates != 0;
             let max_distance = pos.min(options.max_match_distance);
             let before = matches.runs.len();
@@ -1357,7 +1392,8 @@ impl OptimalCollector {
                         max_distance,
                         options.max_match_candidates,
                         &mut matches.runs,
-                    );
+                    )
+                    .map_err(Into::into)?;
                     if let Some(last) = matches.runs[before..].last_mut() {
                         let limit = avail.min(MAX_ENCODER_MATCH_LENGTH);
                         if last.0 as usize == len_limit && len_limit < limit {
@@ -1395,7 +1431,10 @@ impl OptimalCollector {
                         if combined[candidate + longest] == combined[pos + longest] {
                             let length = match_length(combined, pos, distance, max_length);
                             if length > longest {
-                                matches.runs.push((length as u32, distance as u32));
+                                matches
+                                    .runs
+                                    .push((length as u32, distance as u32))
+                                    .map_err(Into::into)?;
                                 longest = length;
                             }
                         }
@@ -1417,8 +1456,11 @@ impl OptimalCollector {
                 }
             }
         }
-        matches.starts.push(matches.runs.len() as u32);
         matches
+            .starts
+            .push(matches.runs.len() as u32)
+            .map_err(Into::into)?;
+        Ok(matches)
     }
 }
 
@@ -1496,10 +1538,7 @@ fn encode_lz_block_in_window(
         progress,
     )?;
     if !initial_filters.is_empty() {
-        tokens.splice(
-            0..0,
-            initial_filters.iter().copied().map(EncodeToken::Filter),
-        );
+        tokens.prepend(initial_filters.iter().copied().map(EncodeToken::Filter))?;
     }
     encode_token_block(&tokens, algorithm_version, distance_size, is_last)
 }
@@ -1896,13 +1935,23 @@ fn token_stream_bits(
     Ok(bits)
 }
 
-#[derive(Default)]
-struct OptimalWorkspace {
-    price: Vec<u32>,
-    arrive_length: Vec<u32>,
-    arrive_distance: Vec<u32>,
-    arrive_reps: Vec<[u32; 4]>,
-    arrive_last_length: Vec<u32>,
+struct OptimalWorkspace<B: Budget = Allowance> {
+    price: Buffer<u32, B>,
+    arrive_length: Buffer<u32, B>,
+    arrive_distance: Buffer<u32, B>,
+    arrive_reps: Buffer<[u32; 4], B>,
+    arrive_last_length: Buffer<u32, B>,
+}
+impl<B: Budget> OptimalWorkspace<B> {
+    fn new(allowance: &B) -> Self {
+        Self {
+            price: Buffer::new(allowance),
+            arrive_length: Buffer::new(allowance),
+            arrive_distance: Buffer::new(allowance),
+            arrive_reps: Buffer::new(allowance),
+            arrive_last_length: Buffer::new(allowance),
+        }
+    }
 }
 
 /// What a literal is assumed to cost before any block has been coded, in the
@@ -1996,19 +2045,20 @@ impl TokenPrices<'_> {
 /// Does no searching of its own: `matches` holds what an [`OptimalCollector`]
 /// found at each position of this block, and prices never change what a
 /// search would find, so every pass prices the same collection.
-fn optimal_tokens_in_workspace(
+fn optimal_tokens_in_workspace<B: Budget>(
     combined: &[u8],
     block: std::ops::Range<usize>,
     options: EncodeOptions,
     distance_size: usize,
     prices: Option<&TokenPrices<'_>>,
-    matches: &BlockMatches,
-    workspace: &mut OptimalWorkspace,
-) -> Result<Vec<EncodeToken>> {
+    matches: &BlockMatches<B>,
+    workspace: &mut OptimalWorkspace<B>,
+) -> Result<Buffer<EncodeToken, B>> {
     let start = block.start;
     let end = block.end;
     let span = end - start;
 
+    let allowance = workspace.price.allowance().clone();
     let OptimalWorkspace {
         price,
         arrive_length,
@@ -2016,21 +2066,28 @@ fn optimal_tokens_in_workspace(
         arrive_reps,
         arrive_last_length,
     } = workspace;
-    price.resize(span + 1, u32::MAX);
+    price.resize(span + 1, u32::MAX)?;
     price.fill(u32::MAX);
-    arrive_length.resize(span + 1, 0);
+    arrive_length.resize(span + 1, 0)?;
     arrive_length.fill(0);
-    arrive_distance.resize(span + 1, 0);
+    arrive_distance.resize(span + 1, 0)?;
     arrive_distance.fill(0);
-    arrive_reps.resize(span + 1, [0; 4]);
+    arrive_reps.resize(span + 1, [0; 4])?;
     arrive_reps.fill([0; 4]);
-    arrive_last_length.resize(span + 1, 0);
+    arrive_last_length.resize(span + 1, 0)?;
     arrive_last_length.fill(0);
     price[0] = 0;
+    // Resizing is complete. Keep exclusive slices for the parse so allocation
+    // owners and allowance bookkeeping stay outside the per-position loop.
+    let price = &mut **price;
+    let arrive_length = &mut **arrive_length;
+    let arrive_distance = &mut **arrive_distance;
+    let arrive_reps = &mut **arrive_reps;
+    let arrive_last_length = &mut **arrive_last_length;
 
     // Runs of `(shortest, longest, distance)` from the position being priced,
     // in the order the collector found them. Reused to keep one allocation.
-    let mut reaches: Vec<(usize, usize, usize)> = Vec::new();
+    let mut reaches = Buffer::new(&allowance);
     // The first position past a match the parse committed to. Nothing is
     // priced from the positions before it. See [`NICE_MATCH_LENGTH`].
     let mut committed_through = 0usize;
@@ -2083,7 +2140,7 @@ fn optimal_tokens_in_workspace(
             }
             let length = match_length(combined, pos, repeat, max_length);
             if length >= 4 {
-                reaches.push((4, length, repeat));
+                reaches.push((4, length, repeat)).map_err(Into::into)?;
             }
         }
 
@@ -2095,7 +2152,9 @@ fn optimal_tokens_in_workspace(
         for &(length, distance) in matches.at(index) {
             let length = (length as usize).min(max_length);
             if length > longest {
-                reaches.push((longest + 1, length, distance as usize));
+                reaches
+                    .push((longest + 1, length, distance as usize))
+                    .map_err(Into::into)?;
                 longest = length;
             }
         }
@@ -2153,18 +2212,22 @@ fn optimal_tokens_in_workspace(
         }
     }
 
-    let mut reversed = Vec::new();
+    let mut reversed = Buffer::new(&allowance);
     let mut index = span;
     while index > 0 {
         let length = arrive_length[index] as usize;
         if length == 0 {
-            reversed.push(EncodeToken::Literal(combined[start + index - 1]));
+            reversed
+                .push(EncodeToken::Literal(combined[start + index - 1]))
+                .map_err(Into::into)?;
             index -= 1;
         } else {
-            reversed.push(EncodeToken::Match {
-                length,
-                distance: arrive_distance[index] as usize,
-            });
+            reversed
+                .push(EncodeToken::Match {
+                    length,
+                    distance: arrive_distance[index] as usize,
+                })
+                .map_err(Into::into)?;
             index -= length;
         }
     }
@@ -2179,8 +2242,39 @@ fn encode_tokens_with_progress(
     options: EncodeOptions,
     distance_size: usize,
     initial_filters: &[EncodeFilter],
+    progress: Option<&mut dyn FnMut(usize) -> bool>,
+) -> Result<Buffer<EncodeToken>> {
+    let allowance = match &search {
+        MemberSearch::Fresh => Allowance::default(),
+        MemberSearch::Lazy(finder) => finder.allowance().clone(),
+        MemberSearch::Optimal(collector) => match &collector.finder {
+            CollectorFinder::Tree(finder) => finder.allowance().clone(),
+            CollectorFinder::Chains(finder) => finder.allowance().clone(),
+        },
+    };
+    encode_tokens_with_allowance(
+        combined,
+        block,
+        search,
+        options,
+        distance_size,
+        initial_filters,
+        progress,
+        &allowance,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_tokens_with_allowance<B: Budget>(
+    combined: &[u8],
+    block: std::ops::Range<usize>,
+    search: MemberSearch<'_, B>,
+    options: EncodeOptions,
+    distance_size: usize,
+    initial_filters: &[EncodeFilter],
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
-) -> Result<Vec<EncodeToken>> {
+    allowance: &B,
+) -> Result<Buffer<EncodeToken, B>> {
     let start = block.start;
     let end = block.end;
     if options.optimal_parse {
@@ -2188,15 +2282,15 @@ fn encode_tokens_with_progress(
         let collector = match search {
             MemberSearch::Optimal(collector) => collector,
             _ => {
-                own = OptimalCollector::new(combined, start, options);
+                own = OptimalCollector::with_allowance(combined, start, options, allowance)?;
                 &mut own
             }
         };
-        let matches = collector.collect(combined, block.clone(), options);
+        let matches = collector.collect(combined, block.clone(), options)?;
         // The prices come from the Huffman tables, and the tables come from
         // the parse, so the first pass has to guess. Each pass after it prices
         // against what the pass before actually produced.
-        let mut workspace = OptimalWorkspace::default();
+        let mut workspace = OptimalWorkspace::new(allowance);
         let mut tokens = optimal_tokens_in_workspace(
             combined,
             block.clone(),
@@ -2230,7 +2324,7 @@ fn encode_tokens_with_progress(
                 best = None;
             } else if best.is_none() {
                 // Keep an earlier winner only when repricing actually loses.
-                best = Some(std::mem::take(&mut tokens));
+                best = Some(std::mem::replace(&mut tokens, Buffer::new(allowance)));
             }
             tokens = next;
         }
@@ -2245,11 +2339,11 @@ fn encode_tokens_with_progress(
     let finder = match search {
         MemberSearch::Lazy(finder) => finder,
         _ => {
-            own = seeded_finder(combined, start..end, options);
+            own = seeded_finder(combined, start..end, options, allowance)?;
             &mut own
         }
     };
-    let mut tokens = Vec::new();
+    let mut tokens = Buffer::new(allowance);
     let mut pos = start;
     let mut state = EncoderMatchState::default();
     let mut next_report = 0usize;
@@ -2270,7 +2364,9 @@ fn encode_tokens_with_progress(
                 candidate,
             );
             if emit_literal {
-                tokens.push(EncodeToken::Literal(combined[pos]));
+                tokens
+                    .push(EncodeToken::Literal(combined[pos]))
+                    .map_err(Into::into)?;
                 finder.insert(combined, pos);
                 pos += 1;
                 pending_match = cached_next;
@@ -2279,14 +2375,18 @@ fn encode_tokens_with_progress(
             let MatchCandidate {
                 length, distance, ..
             } = candidate;
-            tokens.push(EncodeToken::Match { length, distance });
+            tokens
+                .push(EncodeToken::Match { length, distance })
+                .map_err(Into::into)?;
             state.remember(length, distance);
             for history_pos in pos..pos + length {
                 finder.insert(combined, history_pos);
             }
             pos += length;
         } else {
-            tokens.push(EncodeToken::Literal(combined[pos]));
+            tokens
+                .push(EncodeToken::Literal(combined[pos]))
+                .map_err(Into::into)?;
             finder.insert(combined, pos);
             pos += 1;
         }
@@ -2312,11 +2412,11 @@ fn encode_tokens_with_progress(
 /// match found one byte ahead (when computed) so the caller can reuse it for
 /// the next position instead of searching again.
 #[allow(clippy::too_many_arguments)]
-fn lazy_match_decision(
+fn lazy_match_decision<B: Budget>(
     input: &[u8],
     pos: usize,
     end: usize,
-    finder: &Rar50MatchFinder,
+    finder: &Rar50MatchFinder<B>,
     options: EncodeOptions,
     state: &EncoderMatchState,
     distance_size: usize,
@@ -2359,11 +2459,11 @@ struct MatchCandidate {
     cost: usize,
 }
 
-fn best_match(
+fn best_match<B: Budget>(
     input: &[u8],
     pos: usize,
     end: usize,
-    finder: &Rar50MatchFinder,
+    finder: &Rar50MatchFinder<B>,
     options: EncodeOptions,
     state: &EncoderMatchState,
     distance_size: usize,
@@ -3966,6 +4066,107 @@ fn write_level_lengths(writer: &mut BitWriter, lengths: &[u8; LEVEL_TABLE_SIZE])
 #[cfg(test)]
 mod tests {
     #[test]
+    fn parser_allowance_preserves_tokens_and_retains_the_returned_owner() {
+        let data: Vec<_> = (0..8192u32)
+            .map(|n| (n.wrapping_mul(71) ^ (n >> 4)) as u8)
+            .collect();
+        for optimal in [false, true] {
+            let options = EncodeOptions::new(32)
+                .with_max_match_distance(65536)
+                .with_optimal_parse(optimal);
+            let expected = encode_tokens_with_progress(
+                &data,
+                0..data.len(),
+                MemberSearch::Fresh,
+                options,
+                DISTANCE_TABLE_SIZE_50,
+                &[],
+                None,
+            )
+            .unwrap();
+            let allowance = Allowance::limited(16 * 1024 * 1024);
+            for _ in 0..3 {
+                let tokens = encode_tokens_with_allowance(
+                    &data,
+                    0..data.len(),
+                    MemberSearch::Fresh,
+                    options,
+                    DISTANCE_TABLE_SIZE_50,
+                    &[],
+                    None,
+                    &allowance,
+                )
+                .unwrap();
+                assert_eq!(tokens, expected);
+                let retained = allowance.used();
+                assert!(retained >= (tokens.len() * std::mem::size_of::<EncodeToken>()) as u64);
+                assert!(retained > 0);
+                assert!(matches!(
+                    Buffer::<u8, _>::with_capacity(
+                        (16 * 1024 * 1024 - retained + 1) as usize,
+                        &allowance
+                    ),
+                    Err(Error::WorkspaceLimitExceeded(_))
+                ));
+                drop(tokens);
+                assert_eq!(allowance.used(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn parser_refusal_and_cancellation_release_finders_matches_and_parse_arrays() {
+        let data: Vec<_> = (0..16384u32)
+            .map(|n| (n.wrapping_mul(73) ^ (n >> 3)) as u8)
+            .collect();
+        for optimal in [false, true] {
+            let options = EncodeOptions::new(32)
+                .with_max_match_distance(65536)
+                .with_optimal_parse(optimal);
+            for limit in [0, 524288] {
+                let allowance = Allowance::limited(limit);
+                let result = encode_tokens_with_allowance(
+                    &data,
+                    0..data.len(),
+                    MemberSearch::Fresh,
+                    options,
+                    DISTANCE_TABLE_SIZE_50,
+                    &[],
+                    None,
+                    &allowance,
+                );
+                assert!(matches!(result, Err(Error::WorkspaceLimitExceeded(_))));
+                assert_eq!(allowance.used(), 0);
+            }
+            if optimal {
+                // Admit the tree itself, then refuse match/parse workspace.
+                let allowance = Allowance::limited(1_200_000);
+                assert!(
+                    matches!(encode_tokens_with_allowance(&data, 0..data.len(), MemberSearch::Fresh,
+                    options, DISTANCE_TABLE_SIZE_50, &[], None, &allowance),
+                    Err(Error::WorkspaceLimitExceeded(details)) if details.used > 1_000_000)
+                );
+                assert_eq!(allowance.used(), 0);
+            }
+            let allowance = Allowance::limited(16 * 1024 * 1024);
+            assert!(matches!(
+                encode_tokens_with_allowance(
+                    &data,
+                    0..data.len(),
+                    MemberSearch::Fresh,
+                    options,
+                    DISTANCE_TABLE_SIZE_50,
+                    &[],
+                    Some(&mut |_| false),
+                    &allowance
+                ),
+                Err(Error::Cancelled)
+            ));
+            assert_eq!(allowance.used(), 0);
+        }
+    }
+
+    #[test]
     fn configured_x86_scanning_matches_default_across_poll_boundaries() {
         let mut input = vec![0; 192 * 1024];
         for pos in [65530, 65535, 65541, 131070, 131080] {
@@ -4047,7 +4248,7 @@ mod tests {
             let parsed = parse_compressed_block(&packed).unwrap();
             assert_eq!(selected_bits, parsed.header.payload_bits);
             let mut collector = OptimalCollector::new(&data, 0, options);
-            let matches = collector.collect(&data, 0..data.len(), options);
+            let matches = collector.collect(&data, 0..data.len(), options).unwrap();
             let mut pass =
                 optimal_tokens(&data, 0..data.len(), options, distances, None, &matches).unwrap();
             for _ in 0..OPTIMAL_PARSE_PASSES {
@@ -4076,19 +4277,22 @@ mod tests {
         let mut combined = history.to_vec();
         combined.extend_from_slice(data);
         let mut matches = BlockMatches {
-            runs: Vec::new(),
-            starts: Vec::new(),
+            runs: Buffer::new(&Allowance::default()),
+            starts: Buffer::new(&Allowance::default()),
         };
         for pos in 0..data.len() {
-            matches.starts.push(matches.runs.len() as u32);
+            matches.starts.push(matches.runs.len() as u32).unwrap();
             if pos == 0 {
-                matches.runs.push((13, history.len() as u32));
+                matches.runs.push((13, history.len() as u32)).unwrap();
             }
             if pos == 12 {
-                matches.runs.push((40, (history.len() + 12 - 14) as u32));
+                matches
+                    .runs
+                    .push((40, (history.len() + 12 - 14) as u32))
+                    .unwrap();
             }
         }
-        matches.starts.push(matches.runs.len() as u32);
+        matches.starts.push(matches.runs.len() as u32).unwrap();
         let tokens = optimal_tokens(
             &combined,
             history.len()..combined.len(),
@@ -4228,6 +4432,7 @@ mod tests {
             None,
         )
         .expect("encoding without cancellation cannot be cancelled")
+        .into_vec()
     }
 
     fn optimal_tokens(
@@ -4245,8 +4450,9 @@ mod tests {
             distance_size,
             prices,
             matches,
-            &mut OptimalWorkspace::default(),
+            &mut OptimalWorkspace::new(&Allowance::default()),
         )
+        .map(Buffer::into_vec)
     }
 
     /// One block through the optimal parse, collecting its matches first the
@@ -4258,7 +4464,7 @@ mod tests {
         prices: Option<&TokenPrices<'_>>,
     ) -> Vec<EncodeToken> {
         let mut collector = OptimalCollector::new(data, 0, options);
-        let matches = collector.collect(data, 0..data.len(), options);
+        let matches = collector.collect(data, 0..data.len(), options).unwrap();
         optimal_tokens(
             data,
             0..data.len(),

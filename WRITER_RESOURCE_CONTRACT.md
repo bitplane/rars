@@ -198,11 +198,27 @@ cancellation. Error selection prefers a source/codec failure over the resulting
 cancellation. Returning joins admitted callbacks before releasing their owners;
 reusing the resources after an ordinary failure does not inherit cancellation.
 
-These reservations still use workspace estimates. There is no hard worker
-allowance or allowance-extension API yet: introducing one requires instrumenting
-the codec/filter allocations and retained payload owners, then joining that
-accounting to preparation and spool memory. The workspace/admission pass remains
-open until those guarantees are enforceable.
+These reservations still use workspace estimates. The codec has an internal
+fallible allowance path for chain/tree match-finder tables, collected match
+runs and offsets, parse arrays, candidate reaches and competing token buffers.
+Covered owners reserve before growth, include replacement peaks and retain
+charges through moves and token selection. Unlimited and bounded buffers use
+separate compile-time policies; the unlimited owner retains Vec's layout.
+Allocation-failure details are boxed to keep successful codec Results compact.
+A refused parse is abandoned; its partially updated finder is not resumed with
+extra bytes. An allowance cannot borrow capacity from another worker.
+
+This is migration infrastructure, not an available writer limit. Production
+codec entry points currently use unlimited handles; bounded construction is
+internal test coverage, including its refusal diagnostics. Input/history copies,
+Huffman tables and bit/framing buffers, filter-search candidates and payload ownership, encryption/KDF and
+recovery workspace still need migration. Only after those paths are covered
+can the coordinator supply reserved allowances and connect them to preparation
+and spool memory. There is no public worker allowance or extension API yet.
+The workspace/admission pass remains open until those guarantees are enforceable.
+The allocation migration also has an unresolved compression-time regression in
+the synthetic compressed-member comparison (roughly 7–10% in the latest samples, with unchanged bytes and similar RSS). Resolve that
+before closing the pass or releasing the policy.
 
 ## Contract for a future managed-memory ceiling
 

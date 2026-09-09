@@ -33,6 +33,9 @@
 //! gigabytes keep only their low half; `resolve` measures back from the newest
 //! position inserted to recover the rest.
 
+use super::workspace::{Allowance, Budget, Buffer};
+use super::Result;
+
 /// Sentinel for "no position" in `head`/`prev` chains.
 pub(crate) const NO_POSITION: usize = usize::MAX;
 
@@ -63,10 +66,10 @@ fn mix(value: u32, bits: u32) -> usize {
     (value.wrapping_mul(0x9E37_79B1) >> (32 - bits)) as usize
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct MatchFinder<const MIN_MATCH: usize> {
-    head: Vec<u32>,
-    prev: Vec<u32>,
+#[derive(Debug)]
+pub(crate) struct MatchFinder<const MIN_MATCH: usize, B: Budget = Allowance> {
+    head: Buffer<u32, B>,
+    prev: Buffer<u32, B>,
     mask: usize,
     /// The highest position inserted so far, and so at least as high as any
     /// position a link can name. Truncated links are read back against it.
@@ -74,6 +77,12 @@ pub(crate) struct MatchFinder<const MIN_MATCH: usize> {
 }
 
 impl<const MIN_MATCH: usize> MatchFinder<MIN_MATCH> {
+    pub(crate) fn new(window: usize) -> Self {
+        Self::with_allowance(window, &Allowance::default()).expect("unlimited finder allocation")
+    }
+}
+
+impl<const MIN_MATCH: usize, B: Budget> MatchFinder<MIN_MATCH, B> {
     const HASH_BITS: u32 = match MIN_MATCH {
         3 => 16,
         4 => 17,
@@ -87,19 +96,26 @@ impl<const MIN_MATCH: usize> MatchFinder<MIN_MATCH> {
     /// position that has fallen out of the window is still readable, and still
     /// names the position it named, so that check rejects it the same way it
     /// rejects a match that is merely too far away.
-    pub(crate) fn new(window: usize) -> Self {
-        let window = window.max(1).next_power_of_two();
-        Self {
-            head: vec![NO_LINK; 1 << Self::HASH_BITS],
+    pub(crate) fn with_allowance(window: usize, allowance: &B) -> Result<Self> {
+        let window = window
+            .max(1)
+            .checked_next_power_of_two()
+            .ok_or(super::Error::InvalidData("finder window overflows"))?;
+        Ok(Self {
+            head: Buffer::filled(1 << Self::HASH_BITS, NO_LINK, allowance)?,
             // Zero rather than the sentinel, and nothing reads it either way: a
             // link is only ever followed from a position that has been
             // inserted, and inserting a position writes its slot first. Zero
             // lets the allocator hand back pages it has not had to touch, so a
             // window wider than the data has reached costs nothing yet.
-            prev: vec![0; window],
+            prev: Buffer::filled(window, 0, allowance)?,
             mask: window - 1,
             newest: 0,
-        }
+        })
+    }
+
+    pub(crate) fn allowance(&self) -> B {
+        self.head.allowance()
     }
 
     fn hash(input: &[u8], pos: usize) -> usize {
@@ -156,31 +172,51 @@ impl<const MIN_MATCH: usize> MatchFinder<MIN_MATCH> {
 /// window from ever overlapping. Truncated links are read back with the
 /// position being searched for as the reference, which is always the newest.
 #[derive(Debug)]
-pub(crate) struct TreeMatchFinder {
-    head: Vec<u32>,
+pub(crate) struct TreeMatchFinder<B: Budget = Allowance> {
+    head: Buffer<u32, B>,
     /// Two links per window slot: the child whose bytes compare lesser first,
     /// then the greater-or-equal one, in LZMA's layout.
-    son: Vec<u32>,
+    son: Buffer<u32, B>,
     mask: usize,
 }
 
 impl TreeMatchFinder {
+    #[cfg(test)]
+    pub(crate) fn new(window: usize) -> Self {
+        Self::with_allowance(window, &Allowance::default()).expect("unlimited finder allocation")
+    }
+}
+
+impl<B: Budget> TreeMatchFinder<B> {
     const HASH_BITS: u32 = 17;
     const MIN_MATCH: usize = 4;
 
     /// Builds a finder that remembers the last `window` positions, at eight
     /// bytes of links per byte of window.
-    pub(crate) fn new(window: usize) -> Self {
-        let window = window.max(1).next_power_of_two();
-        Self {
-            head: vec![NO_LINK; 1 << Self::HASH_BITS],
+    pub(crate) fn with_allowance(window: usize, allowance: &B) -> Result<Self> {
+        let window = window
+            .max(1)
+            .checked_next_power_of_two()
+            .ok_or(super::Error::InvalidData("finder window overflows"))?;
+        Ok(Self {
+            head: Buffer::filled(1 << Self::HASH_BITS, NO_LINK, allowance)?,
             // Zero rather than the sentinel for the same reason as the chain
             // finder's `prev`: a slot is always written during its position's
             // own insertion before any link can lead to it, and untouched
             // zeroes let the allocator defer the pages.
-            son: vec![0; window * 2],
+            son: Buffer::filled(
+                window
+                    .checked_mul(2)
+                    .ok_or(super::Error::InvalidData("finder window overflows"))?,
+                0,
+                allowance,
+            )?,
             mask: window - 1,
-        }
+        })
+    }
+
+    pub(crate) fn allowance(&self) -> B {
+        self.head.allowance()
     }
 
     /// Finds the matches at `pos` and inserts `pos`, in one descent.
@@ -196,7 +232,8 @@ impl TreeMatchFinder {
     /// everything to come. `cut` bounds the nodes visited,
     /// and whatever hangs below the last one is cut off rather than left
     /// dangling. Positions with fewer than four bytes left are not inserted,
-    /// as with the chain finder.
+    /// as with the chain finder. On allocation refusal, discard the finder:
+    /// the insertion may have been partially applied before output growth failed.
     pub(crate) fn matches(
         &mut self,
         input: &[u8],
@@ -204,10 +241,10 @@ impl TreeMatchFinder {
         len_limit: usize,
         max_distance: usize,
         cut: usize,
-        out: &mut Vec<(u32, u32)>,
-    ) {
+        out: &mut Buffer<(u32, u32), B>,
+    ) -> std::result::Result<(), B::Failure> {
         if pos + Self::MIN_MATCH > input.len() {
-            return;
+            return Ok(());
         }
         debug_assert!(len_limit >= Self::MIN_MATCH && pos + len_limit <= input.len());
         let hash = mix(
@@ -240,7 +277,7 @@ impl TreeMatchFinder {
             if current >= floor || pos - current > self.mask || budget == 0 {
                 self.son[ptr0] = NO_LINK;
                 self.son[ptr1] = NO_LINK;
-                return;
+                return Ok(());
             }
             budget -= 1;
             floor = current;
@@ -253,7 +290,7 @@ impl TreeMatchFinder {
                 }
                 if len > longest {
                     if pos - current <= max_distance {
-                        out.push((len as u32, (pos - current) as u32));
+                        out.push((len as u32, (pos - current) as u32))?;
                     }
                     longest = len;
                     if len == len_limit {
@@ -263,7 +300,7 @@ impl TreeMatchFinder {
                         // two interchangeable candidates.
                         self.son[ptr1] = self.son[pair];
                         self.son[ptr0] = self.son[pair + 1];
-                        return;
+                        return Ok(());
                     }
                 }
             }
@@ -334,12 +371,14 @@ mod tests {
         let mut finder = TreeMatchFinder::new(input.len());
         let mut all = Vec::new();
         for pos in 0..input.len() {
-            let mut out = Vec::new();
+            let mut out = super::Buffer::new(&super::Allowance::default());
             if pos + 4 <= input.len() {
                 let len_limit = input.len() - pos;
-                finder.matches(input, pos, len_limit, pos, cut, &mut out);
+                finder
+                    .matches(input, pos, len_limit, pos, cut, &mut out)
+                    .unwrap();
             }
-            all.push(out);
+            all.push(out.into_vec());
         }
         all
     }

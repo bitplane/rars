@@ -453,6 +453,8 @@ impl Error {
             | Self::Rar5Recovery(crate::recovery::rar5::Error::RebuildTooLarge) => {
                 ErrorKind::ResourceLimit
             }
+            #[cfg(test)]
+            Self::Codec(crate::codec::Error::WorkspaceLimitExceeded(_)) => ErrorKind::ResourceLimit,
             Self::Cancelled | Self::Codec(crate::codec::Error::Cancelled) => ErrorKind::Cancelled,
             Self::EntryNotFound => ErrorKind::EntryNotFound,
             Self::DuplicateEntry => ErrorKind::DuplicateEntry,
@@ -532,6 +534,21 @@ impl From<crate::crypto::rar50::Error> for Error {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn codec_workspace_refusal_keeps_its_resource_classification_and_details() {
+        let cause = crate::codec::Error::WorkspaceLimitExceeded(Box::new(
+            crate::codec::WorkspaceLimitError {
+                limit: 12,
+                required: 16,
+                used: 8,
+            },
+        ));
+        let error = Error::from(cause.clone()).at_archive_offset(42);
+        assert_eq!(error.kind(), ErrorKind::ResourceLimit);
+        assert!(matches!(error.root_cause(), Error::Codec(actual) if actual == &cause));
+        assert!(error.to_string().contains("codec workspace limit 12"));
+    }
+
     use super::*;
 
     #[test]
