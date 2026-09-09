@@ -1,9 +1,10 @@
 //! Assembling a RAR 5 archive from prepared payloads.
 //!
 //! Native member spools use temporary files; bare-WASM spools retain bytes in
-//! memory. Compression may load whole members; headers and inline services
-//! also allocate memory. Quick-open data uses a quota-controlled spool. Once
-//! block lengths are known, final archive output streams in one pass. The
+//! memory. Compression may load whole members; headers also allocate memory.
+//! Service payloads borrow input and are encrypted in chunks during emission.
+//! Quick-open data uses a quota-controlled spool. Once block lengths are known,
+//! final archive output streams in one pass. The
 //! workspace admission budget is not an aggregate RAM or disk quota; see
 //! WRITER_EXECUTION.md in the repo.
 //!
@@ -54,9 +55,9 @@ pub(super) enum ArchiveCommentPlan<'a> {
 
 /// A block with its framing settled: the header bytes are final and the
 /// payload only has to be copied.
-struct PreparedBlock {
+struct PreparedBlock<'a> {
     header: Vec<u8>,
-    payload: Payload,
+    payload: Payload<'a>,
     payload_len: u64,
     /// Quick-open repeats the headers of members and plain comments so a
     /// reader can list an archive without walking it.
@@ -65,7 +66,7 @@ struct PreparedBlock {
     entry_index: Option<usize>,
 }
 
-impl PreparedBlock {
+impl PreparedBlock<'_> {
     fn len(&self) -> Result<u64> {
         (self.header.len() as u64)
             .checked_add(self.payload_len)
@@ -73,15 +74,15 @@ impl PreparedBlock {
     }
 }
 
-enum Payload {
-    /// Small enough to have been built in memory: comments and services.
-    Inline(Vec<u8>),
+enum Payload<'a> {
+    /// Comments and services remain owned by the caller or builder.
+    Borrowed(&'a [u8]),
     /// Copied straight from the source, which is re-read at write time.
     Stored(PreparedSource),
     Packed(Spool),
     /// Encrypted on the way out, so the ciphertext is never stored anywhere.
     Encrypted {
-        plain: Box<Payload>,
+        plain: Box<Payload<'a>>,
         keys: Rar50Keys,
         iv: [u8; 16],
     },
@@ -467,14 +468,13 @@ fn append_quick_open_entry(
     Ok(())
 }
 
-/// A stored service block: a small named payload such as a comment or the
-/// quick-open index.
-fn stored_service_block(
+/// A stored service block borrowing a named payload such as a comment.
+fn stored_service_block<'a>(
     name: &[u8],
-    data: &[u8],
+    data: &'a [u8],
     service_data: &[u8],
     header_keys: Option<&HeaderEncryptionKeys>,
-) -> Result<PreparedBlock> {
+) -> Result<PreparedBlock<'a>> {
     Ok(PreparedBlock {
         header: stored_service_header(
             name,
@@ -483,7 +483,7 @@ fn stored_service_block(
             service_data,
             header_keys,
         )?,
-        payload: Payload::Inline(data.to_vec()),
+        payload: Payload::Borrowed(data),
         payload_len: data.len() as u64,
         quick_open_cached: false,
         entry_index: None,
@@ -520,10 +520,10 @@ fn stored_service_header(
     }
 }
 
-fn prepare_comment(
-    comment: &ArchiveCommentPlan<'_>,
+fn prepare_comment<'a>(
+    comment: &ArchiveCommentPlan<'a>,
     header_keys: Option<&HeaderEncryptionKeys>,
-) -> Result<PreparedBlock> {
+) -> Result<PreparedBlock<'a>> {
     match comment {
         ArchiveCommentPlan::Plain(data) => {
             let mut block = stored_service_block(b"CMT", data, &[], header_keys)?;
@@ -537,10 +537,10 @@ fn prepare_comment(
     }
 }
 
-fn prepare_service(
-    service: &super::ServiceEntry,
+fn prepare_service<'a>(
+    service: &'a super::ServiceEntry,
     header_keys: Option<&HeaderEncryptionKeys>,
-) -> Result<PreparedBlock> {
+) -> Result<PreparedBlock<'a>> {
     match service.password.as_deref() {
         Some(password) => {
             encrypted_service_block(&service.name, &service.data, &[], password, header_keys)
@@ -549,35 +549,47 @@ fn prepare_service(
     }
 }
 
-/// A service block whose payload is encrypted with its own password.
-fn encrypted_service_block(
+/// A service block whose borrowed payload is encrypted during emission.
+fn encrypted_service_block<'a>(
     name: &[u8],
-    data: &[u8],
+    data: &'a [u8],
     service_data: &[u8],
     password: &[u8],
     header_keys: Option<&HeaderEncryptionKeys>,
-) -> Result<PreparedBlock> {
+) -> Result<PreparedBlock<'a>> {
     super::validate_nonempty_password(password)?;
-    let encrypted = super::encrypted_stored_payload(data, password)?;
+    let mut salt = [0u8; 16];
+    let mut iv = [0u8; 16];
+    getrandom::fill(&mut salt).map_err(|error| {
+        crate::write_stream::entropy_error(error, "RAR 5 writer could not generate encryption salt")
+    })?;
+    getrandom::fill(&mut iv).map_err(|error| {
+        crate::write_stream::entropy_error(error, "RAR 5 writer could not generate encryption IV")
+    })?;
+    let keys = Rar50Keys::derive(password, salt, WRITE_KDF_COUNT_LOG)
+        .map_err(crate::rar50::map_rar50_crypto_error)?;
 
     let mut extra = Vec::new();
     write_extra_record(&mut extra, FHEXTRA_SUBDATA, service_data);
-    write_file_encryption_record(
+    write_file_encryption_record(&mut extra, salt, iv, keys.password_check_record());
+    write_hash_record_with_value(
         &mut extra,
-        encrypted.salt,
-        encrypted.iv,
-        encrypted.check_value,
+        keys.mac_hash32(crate::rar50::blake2sp::hash(data)),
     );
-    write_hash_record_with_value(&mut extra, encrypted.blake2sp_mac);
     let specific = stored_file_specific(
         name,
         data.len() as u64,
-        Some(encrypted.crc32_mac),
+        Some(keys.mac_crc32(crate::crc32::crc32(data))),
         0,
         None,
         0,
     )?;
-    let payload_len = encrypted.data.len() as u64;
+    let payload_len = (data.len() as u64)
+        .checked_add(15)
+        .ok_or(Error::InvalidArgument(
+            "RAR 5 encrypted data size overflows",
+        ))?
+        & !15;
     let header = match header_keys {
         Some(keys) => encrypted_header_block(
             &keys.keys,
@@ -598,7 +610,11 @@ fn encrypted_service_block(
     };
     Ok(PreparedBlock {
         header,
-        payload: Payload::Inline(encrypted.data),
+        payload: Payload::Encrypted {
+            plain: Box::new(Payload::Borrowed(data)),
+            keys,
+            iv,
+        },
         payload_len,
         quick_open_cached: false,
         entry_index: None,
@@ -611,7 +627,7 @@ fn prepare_member(
     member: CompressedMember,
     plan: &EnginePlan<'_>,
     header_keys: Option<&HeaderEncryptionKeys>,
-) -> Result<PreparedBlock> {
+) -> Result<PreparedBlock<'static>> {
     let compression_info = compress::member_compression_info(&plan.compress, &member)?;
     let plain_len = if member.store {
         member.input_size
@@ -724,15 +740,15 @@ fn prepare_member(
 }
 
 fn write_payload(
-    payload: Payload,
+    payload: Payload<'_>,
     output: &mut dyn Write,
     resources: &WriterResources,
     progress: Option<ProgressReporter<'_>>,
 ) -> Result<()> {
     check_cancelled(progress)?;
     match payload {
-        Payload::Inline(data) => {
-            output.write_all(&data)?;
+        Payload::Borrowed(data) => {
+            output.write_all(data)?;
             Ok(())
         }
         Payload::Stored(source) => {
@@ -748,7 +764,11 @@ fn write_payload(
         }
         Payload::Encrypted { plain, keys, iv } => {
             const ENCRYPT_CHUNK: usize = 64 * 1024;
-            let _permit = resources.acquire_cancellable(ENCRYPT_CHUNK as u64, 0, &|| {
+            let chunk_size = match plain.as_ref() {
+                Payload::Borrowed(data) => data.len().clamp(1, ENCRYPT_CHUNK).div_ceil(16) * 16,
+                _ => ENCRYPT_CHUNK,
+            };
+            let _permit = resources.acquire_cancellable(chunk_size as u64, 0, &|| {
                 progress.is_some_and(ProgressReporter::is_cancelled)
             })?;
             match *plain {
@@ -772,9 +792,11 @@ fn write_payload(
                     packed.rewind()?;
                     encrypt_reader_to(&mut packed, len, output, &keys, iv, ENCRYPT_CHUNK, progress)
                 }
-                // Inline payloads are encrypted where they are built, and
-                // nothing is encrypted twice.
-                Payload::Inline(_) | Payload::Encrypted { .. } => Err(Error::WriterFailure(
+                Payload::Borrowed(mut data) => {
+                    let len = data.len() as u64;
+                    encrypt_reader_to(&mut data, len, output, &keys, iv, chunk_size, progress)
+                }
+                Payload::Encrypted { .. } => Err(Error::WriterFailure(
                     "RAR 5 payload cannot be encrypted here",
                 )),
             }
@@ -1633,6 +1655,47 @@ mod quick_open_tests {
                 assert_eq!(actual, expected);
                 assert_eq!(crc.finish(), crate::crc32::crc32(&actual));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod service_payload_tests {
+    use super::*;
+
+    #[test]
+    fn prepared_services_borrow_input_and_stream_identical_ciphertext() {
+        for size in [0usize, 1, 15, 16, 65535, 65536, 65537, 131089] {
+            let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            let plain = stored_service_block(b"CMT", &data, &[], None).unwrap();
+            let Payload::Borrowed(borrowed) = plain.payload else {
+                panic!("expected borrowed service")
+            };
+            assert_eq!(borrowed.as_ptr(), data.as_ptr());
+            assert_eq!(borrowed.len(), data.len());
+            let encrypted = encrypted_service_block(b"CMT", &data, &[], b"secret", None).unwrap();
+            let Payload::Encrypted { plain, keys, iv } = &encrypted.payload else {
+                panic!("expected streaming encryption")
+            };
+            let Payload::Borrowed(borrowed) = plain.as_ref() else {
+                panic!("expected borrowed plaintext")
+            };
+            assert_eq!(borrowed.as_ptr(), data.as_ptr());
+            let mut expected = data.clone();
+            expected.resize(size.div_ceil(16) * 16, 0);
+            crate::crypto::rar50::Rar50Cipher::new(keys.key, *iv)
+                .encrypt_in_place(&mut expected)
+                .unwrap();
+            assert_eq!(encrypted.payload_len, expected.len() as u64);
+            let mut actual = Vec::new();
+            write_payload(
+                encrypted.payload,
+                &mut actual,
+                &WriterResources::default(),
+                None,
+            )
+            .unwrap();
+            assert_eq!(actual, expected, "service size {size}");
         }
     }
 }

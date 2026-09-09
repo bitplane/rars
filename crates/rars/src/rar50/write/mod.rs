@@ -1,6 +1,6 @@
 use super::*;
 use crate::crc32::Crc32;
-use crate::crypto::rar50::{Rar50Cipher, Rar50Keys, WRITE_KDF_COUNT_LOG};
+use crate::crypto::rar50::{Rar50Cipher, Rar50Keys};
 pub use crate::filter::{FilterKind, FilterPolicy, FilterSpec};
 use crate::write_plan::{PlanShape, WriterOption};
 use crate::write_progress::ProgressReporter;
@@ -883,58 +883,6 @@ fn validate_plan(options: WriterOptions, shape: PlanShape) -> Result<()> {
         });
     }
     Ok(())
-}
-
-struct EncryptedStoredPayload {
-    data: Vec<u8>,
-    salt: [u8; 16],
-    iv: [u8; 16],
-    check_value: [u8; 12],
-    crc32_mac: u32,
-    blake2sp_mac: [u8; 32],
-}
-
-fn encrypted_stored_payload(data: &[u8], password: &[u8]) -> Result<EncryptedStoredPayload> {
-    encrypted_payload(data, data, password)
-}
-
-fn encrypted_payload(
-    packed_data: &[u8],
-    integrity_data: &[u8],
-    password: &[u8],
-) -> Result<EncryptedStoredPayload> {
-    let mut salt = [0u8; 16];
-    let mut iv = [0u8; 16];
-    getrandom::fill(&mut salt).map_err(|error| {
-        crate::write_stream::entropy_error(error, "RAR 5 writer could not generate encryption salt")
-    })?;
-    getrandom::fill(&mut iv).map_err(|error| {
-        crate::write_stream::entropy_error(error, "RAR 5 writer could not generate encryption IV")
-    })?;
-    let keys = Rar50Keys::derive(password, salt, WRITE_KDF_COUNT_LOG)
-        .map_err(super::map_rar50_crypto_error)?;
-
-    let mut encrypted_data = packed_data.to_vec();
-    let padded_len = encrypted_data
-        .len()
-        .checked_add(15)
-        .ok_or(Error::InvalidArgument(
-            "RAR 5 encrypted data size overflows",
-        ))?
-        & !15;
-    encrypted_data.resize(padded_len, 0);
-    Rar50Cipher::new(keys.key, iv)
-        .encrypt_in_place(&mut encrypted_data)
-        .map_err(super::map_rar50_crypto_error)?;
-
-    Ok(EncryptedStoredPayload {
-        data: encrypted_data,
-        salt,
-        iv,
-        check_value: keys.password_check_record(),
-        crc32_mac: keys.mac_crc32(crc32(integrity_data)),
-        blake2sp_mac: keys.mac_hash32(blake2sp::hash(integrity_data)),
-    })
 }
 
 fn validate_recovery_percent(percent: u64) -> Result<()> {

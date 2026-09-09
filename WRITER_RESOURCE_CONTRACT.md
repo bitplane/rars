@@ -104,6 +104,11 @@ Quick-open indexes are prepared in spools without whole-index or per-header
 payload copies. Their preparation can refuse a storage quota before emission;
 native output with quick-open enabled now needs temporary spool storage.
 
+RAR5/7 prepared services borrow input payloads instead of retaining additional
+plaintext or ciphertext copies. Encryption uses the existing chunked emission
+workspace. This removes a retained allocation class; it does not bound upstream
+input construction, prepared headers, key state or aggregate execution memory.
+
 ## Contract for a future managed-memory ceiling
 
 A memory ceiling must cover the sum of active workspace and retained execution
