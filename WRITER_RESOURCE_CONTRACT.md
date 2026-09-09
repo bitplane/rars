@@ -158,13 +158,15 @@ not a separate user setting for each internal buffer type.
 | Boxed preparation state | Nested payload owners and volume integrity state carry their own charges. Inline state in descriptor arrays is included in the array allocation. |
 | Borrowed payload and names | Plain service payloads and volume filenames borrow engine input. Source handles clone existing shared ownership rather than cloning payloads. Mapped link lengths are measured without allocating decoded names. |
 | Legacy writers | RAR1.3–4.0 header/comment construction remains intertwined with unaccounted legacy materialization. Supplying this hard policy is explicitly refused, including the high-level builder fallback, before emission. Calls without this policy retain existing legacy support. |
-| Compression coordination and workspace | Compression plans, job arrays, worker/result containers, codec/filter history, KDF/encryption/recovery workspace and source-reader internals remain with the workspace/admission pass. The preparation quota is not a bound on these allocations. |
+| Compression coordinator descriptors | Integrity arrays, per-member execution plans, stream/history descriptors, block/job boundaries, worker slots and retained result arrays use the preparation ledger. Boundary growth reserves old plus replacement capacity. Worker slots, boundary images and coordinator result arrays are admitted before dispatch. The arrays retain their charges through joining and consumption. |
+| Active workspace and payload buffers | Input/history and pushback bytes, codec/filter allocations (including codec-owned packed arrays), candidate settings, KDF/encryption/recovery workspace and source-reader internals remain outside the preparation quota. Coordinator descriptor admission does not bound the buffers those descriptors point to. |
 | Adapters, sinks and diagnostics | Caller/adapter-created `ArchiveEntry` inputs, high-level input conversion, external source/sink callbacks, output collectors, error/context allocations and allocator overhead are outside this engine quota. High-level policy integration and output ownership remain later passes. Recovery repair APIs without `WriterResources` are a separate workflow. |
 
 Growing a charged byte buffer reserves the old allocation plus the replacement
 before allocating or copying. Spare capacity remains charged. Refused growth
 leaves existing contents and capacity unchanged. Fixed-capacity descriptor
-arrays cannot silently grow beyond their admitted count. Each owner frees its
+arrays cannot silently grow beyond their admitted count. Dynamic block-boundary
+arrays use explicit growth with replacement-peak admission. Each owner frees its
 storage before releasing its charge, including error, cancellation and unwind
 paths. Charges follow the owner through preparation and emission. There is no
 waiting for retained storage that the writer itself needs to finish.
@@ -179,6 +181,28 @@ This scope covers the header/preparation pass for the RAR5/7 engine, including
 its supported volume and recovery paths. It is not yet an aggregate managed
 writer-memory ceiling. The inventory above names the exclusions and explicit
 legacy refusal rather than treating them as covered by this quota.
+
+## Current coordinator admission
+
+RAR5/7 whole-member waves reserve the sum of their estimated workspaces on the
+coordinator before dispatch. Waves stop at the worker count, the configured
+workspace limit or a streaming-fallback boundary. An oversized first member
+fails admission before its source is opened. Block waves also reserve their
+workspace before constructing and dispatching jobs. The reservation remains
+live while workers join and their outputs are appended to spools or transferred
+to the retained member array.
+
+Preallocated worker slots retain successful siblings until the wave joins.
+A failure stops queued callbacks and running codecs observe batch-local
+cancellation. Error selection prefers a source/codec failure over the resulting
+cancellation. Returning joins admitted callbacks before releasing their owners;
+reusing the resources after an ordinary failure does not inherit cancellation.
+
+These reservations still use workspace estimates. There is no hard worker
+allowance or allowance-extension API yet: introducing one requires instrumenting
+the codec/filter allocations and retained payload owners, then joining that
+accounting to preparation and spool memory. The workspace/admission pass remains
+open until those guarantees are enforceable.
 
 ## Contract for a future managed-memory ceiling
 
@@ -225,14 +249,13 @@ The existing per-class quotas are building blocks for the aggregate policy.
 
 | Pass | Scope | Completion evidence |
 | --- | --- | --- |
-| 2. Workspace and coordinator admission | Compression plans, job records, active codec/filter/encryption/recovery workspace and retained worker results. | Coordinator admission reserves peak workspace and retained-result allowances before dispatch. Workers have enforceable allowances and an extension policy. No race for shared spare bytes determines success. Oversized jobs, sibling failure, cancellation and retained results are tested. |
+| 2. Workspace and coordinator admission | Enforceable codec/filter/encryption/recovery workspace and retained payload allowances, joined to coordinator admission. | Coordinator admission reserves peak workspace and retained-result allowances before dispatch. Workers have enforceable allowances and an extension policy. No race for shared spare bytes determines success. Oversized jobs, sibling failure, cancellation and retained results are tested. |
 | 3. Output ownership | Writer-owned archive/volume collectors, staging, transfers and copies. | Capacity remains charged until ownership transfers or storage is freed; copies and replacement peaks count simultaneously. Active and retained allocations compose under one managed-memory ledger. Caller-owned input and external sink exclusions are explicit. |
 | 4. Public integration and validation | High-level Rust, CLI, Python and npm controls, errors and documentation. | One coherent hard-policy contract across entry points, with explicit refusal of unsupported modes; byte compatibility, ratio, CPU and peak-memory checks cover the writer matrix. Existing estimated-workspace behaviour remains available separately. |
 
 The preparation policy and its inventory are defined above. Compression
 coordinator records belong in pass 2 because their capacity and lifetime depend
-on job admission. Avoid
-creating a public setting for every internal buffer class; consolidate the
+on job admission. Avoid creating a public setting for every internal buffer class; consolidate the
 policy as the common accounting and ownership model becomes enforceable.
 
 Reader resource accounting and reader API extensions remain separate follow-ups.

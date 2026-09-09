@@ -102,6 +102,7 @@ impl std::ops::DerefMut for Bytes {
 
 /// Fixed-capacity descriptor array, admitted before allocating. Consuming its
 /// elements keeps the backing allocation charged until the iterator is dropped.
+#[derive(Debug)]
 pub(crate) struct Records<T> {
     values: Vec<T>,
     limit: usize,
@@ -126,6 +127,54 @@ impl<T> Records<T> {
             charge,
         })
     }
+    pub(crate) fn collect<I>(values: I, resources: &WriterResources) -> Result<Self>
+    where
+        I: ExactSizeIterator<Item = Result<T>>,
+    {
+        let mut out = Self::new(values.len(), resources)?;
+        for value in values {
+            out.push(value?)?;
+        }
+        Ok(out)
+    }
+
+    /// Grow only on explicit request, reserving the old and replacement arrays
+    /// together before moving elements. Fixed-admission callers use `push`.
+    pub(crate) fn push_growing(&mut self, value: T) -> Result<()> {
+        if self.values.len() == self.limit {
+            let limit = self
+                .limit
+                .max(1)
+                .checked_mul(2)
+                .ok_or(Error::InvalidArgument(
+                    "preparation records capacity overflows",
+                ))?;
+            let bytes = limit
+                .checked_mul(std::mem::size_of::<T>())
+                .filter(|bytes| *bytes <= isize::MAX as usize)
+                .ok_or(Error::InvalidArgument(
+                    "preparation records capacity overflows",
+                ))?;
+            if let Some(charge) = &mut self.charge {
+                charge.grow_to((bytes as u64).checked_add(charge.bytes).ok_or(
+                    Error::InvalidArgument("preparation records capacity overflows"),
+                )?)?;
+            }
+            let mut replacement = Vec::with_capacity(limit);
+            replacement.append(&mut self.values);
+            self.values = replacement;
+            self.limit = limit;
+            if let Some(charge) = &mut self.charge {
+                charge.shrink_to(bytes as u64);
+            }
+        }
+        self.push(value)
+    }
+
+    pub(crate) fn pop(&mut self) -> Option<T> {
+        self.values.pop()
+    }
+
     pub(crate) fn push(&mut self, value: T) -> Result<()> {
         if self.values.len() == self.limit {
             return Err(Error::WriterFailure(
@@ -160,6 +209,8 @@ impl<T> Iterator for RecordIter<T> {
         self.iter.size_hint()
     }
 }
+impl<T> ExactSizeIterator for RecordIter<T> {}
+
 impl<T> IntoIterator for Records<T> {
     type Item = T;
     type IntoIter = RecordIter<T>;
@@ -239,6 +290,29 @@ impl PartialEq<Bytes> for Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn descriptor_growth_counts_replacement_peak_and_preserves_refused_input() {
+        let resources = WriterResources::default().with_max_preparation_bytes(23);
+        let mut records = Records::new(1, &resources).unwrap();
+        records.push(7u64).unwrap();
+        assert!(matches!(
+            records.push_growing(9),
+            Err(Error::WriterPreparationLimitExceeded { required: 24, .. })
+        ));
+        assert_eq!(&*records, &[7]);
+        assert_eq!(used(&resources), 8);
+        drop(records);
+        assert_eq!(used(&resources), 0);
+        let resources = resources.with_max_preparation_bytes(24);
+        let mut records = Records::new(1, &resources).unwrap();
+        records.push(7u64).unwrap();
+        records.push_growing(9).unwrap();
+        assert_eq!(&*records, &[7, 9]);
+        assert_eq!(used(&resources), 16);
+        drop(records);
+        assert_eq!(used(&resources), 0);
+    }
+
     use super::*;
     fn used(resources: &WriterResources) -> u64 {
         *resources

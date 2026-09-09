@@ -268,8 +268,9 @@ impl WriterResources {
     /// Configuring creates a new ledger shared by resource clones; default is
     /// unlimited. Legacy writers explicitly refuse this policy.
     ///
-    /// Compression job/result containers, codec/KDF/recovery workspace, input
-    /// conversion, source/sink callbacks, collectors, diagnostics and allocator
+    /// Coordinator plan/job/result descriptor arrays also count; their pointed-to
+    /// input/history and codec payload buffers do not. Codec/KDF/recovery workspace,
+    /// input conversion, source/sink callbacks, collectors, diagnostics and allocator
     /// overhead are outside this quota. This is not a total writer-memory cap.
     pub fn with_max_preparation_bytes(mut self, limit: u64) -> Self {
         self.preparation_budget = Some(Arc::new(StorageBudget {
@@ -333,6 +334,11 @@ impl WriterResources {
 
     pub fn temp_dir(&self) -> Option<&Path> {
         self.temp_dir.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn workspace_in_use(&self) -> u64 {
+        *self.budget.used.lock().unwrap()
     }
 
     #[cfg(test)]

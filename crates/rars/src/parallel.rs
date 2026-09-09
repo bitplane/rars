@@ -15,6 +15,19 @@ pub(crate) use wasm::*;
 mod threaded {
     use rayon::prelude::*;
 
+    /// Process preallocated slots without allocating a separate result vector.
+    /// Returns only after every admitted callback has finished.
+    pub(crate) fn for_each_mut<T, F>(items: &mut [T], apply: F)
+    where
+        T: Send,
+        F: Fn(usize, &mut T) + Sync + Send,
+    {
+        items
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(index, item)| apply(index, item));
+    }
+
     pub(crate) fn map_collect<T, O, E, F>(items: Vec<T>, map: F) -> Result<Vec<O>, E>
     where
         T: Send,
@@ -67,6 +80,19 @@ mod threaded {
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 mod wasm {
+    /// Process preallocated slots without allocating a separate result vector.
+    /// Returns only after every admitted callback has finished.
+    pub(crate) fn for_each_mut<T, F>(items: &mut [T], apply: F)
+    where
+        T: Send,
+        F: Fn(usize, &mut T) + Sync + Send,
+    {
+        items
+            .iter_mut()
+            .enumerate()
+            .for_each(|(index, item)| apply(index, item));
+    }
+
     pub(crate) fn map_collect<T, O, E, F>(items: Vec<T>, map: F) -> Result<Vec<O>, E>
     where
         T: Send,

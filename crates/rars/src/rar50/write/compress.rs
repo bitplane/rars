@@ -22,9 +22,11 @@ use crate::codec::rar50::EncodeOptions;
 use crate::codec::rar50::{encode_lz_streaming_blocks, BlockSplitter};
 use crate::crc32::Crc32;
 use crate::rar50::blake2sp;
+use crate::streaming::preparation::Records;
 use crate::streaming::Spool;
 use crate::{EntrySource, Error, Result, WriterResources};
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Compression work and member lifecycle, independent of presentation.
 pub(super) trait CompressionProgress: Sync {
@@ -39,6 +41,90 @@ impl<F: Fn(u64) -> bool + Sync> CompressionProgress for F {
     fn advance(&self, bytes: u64) -> bool {
         self(bytes)
     }
+}
+
+/// Batch-local cancellation joins already admitted workers and prevents queued
+/// work from opening a source after a sibling has failed. The caller's token is
+/// never changed, so the same resources can be reused after an ordinary error.
+struct BatchProgress<'a> {
+    progress: &'a dyn CompressionProgress,
+    resources: &'a WriterResources,
+    stopped: AtomicBool,
+}
+impl CompressionProgress for BatchProgress<'_> {
+    fn advance(&self, bytes: u64) -> bool {
+        if self.is_cancelled() {
+            return false;
+        }
+        if !self.progress.advance(bytes) {
+            self.stopped.store(true, Ordering::Release);
+            return false;
+        }
+        !self.is_cancelled()
+    }
+    fn is_cancelled(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+            || self.resources.is_cancelled()
+            || self.progress.is_cancelled()
+    }
+    fn started(&self, member: usize, size: u64) {
+        self.progress.started(member, size);
+    }
+    fn finished(&self, member: usize, size: u64) {
+        self.progress.finished(member, size);
+    }
+}
+
+/// Slots are admitted before dispatch. Both input and result descriptor storage
+/// stay owned until all callbacks join, even if one callback fails. The caller
+/// retains its workspace reservation through consumption of returned results.
+fn run_jobs<T: Send, O: Send>(
+    jobs: Records<T>,
+    resources: &WriterResources,
+    progress: &dyn CompressionProgress,
+    map: impl Fn(T, &dyn CompressionProgress) -> Result<O> + Sync + Send,
+) -> Result<Records<O>> {
+    let mut output = Records::new(jobs.len(), resources)?;
+    let mut slots = Records::collect(jobs.into_iter().map(|job| Ok((Some(job), None))), resources)?;
+    let batch = BatchProgress {
+        progress,
+        resources,
+        stopped: AtomicBool::new(false),
+    };
+    crate::parallel::for_each_mut(&mut slots, |_, (job, result)| {
+        if batch.is_cancelled() {
+            return;
+        }
+        let mapped = map(job.take().expect("one callback per slot"), &batch);
+        if mapped.is_err() {
+            batch.stopped.store(true, Ordering::Release);
+        }
+        *result = Some(mapped);
+    });
+    // Prefer the source/codec failure over cancellation caused by that failure.
+    // Scan in job order, so scheduling does not choose which error we report.
+    let mut failure = None;
+    for (_, result) in slots.iter_mut() {
+        if result.as_ref().is_some_and(Result::is_err) {
+            let error = result.take().unwrap().err().unwrap();
+            if failure
+                .as_ref()
+                .is_none_or(|error: &Error| error.kind() == crate::ErrorKind::Cancelled)
+            {
+                failure = Some(error);
+            }
+        }
+    }
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    if batch.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
+    for (_, result) in slots {
+        output.push(result.expect("all jobs completed")?)?;
+    }
+    Ok(output)
 }
 
 /// A member that has been compressed and is waiting to be framed.
@@ -64,7 +150,7 @@ struct BlockJob {
     data: Vec<u8>,
     history: Vec<u8>,
     /// Member index, end within `data`, and final-block flag.
-    blocks: Vec<(usize, usize, bool)>,
+    blocks: Records<(usize, usize, bool)>,
 }
 
 fn run_size(plan: &CompressPlan) -> usize {
@@ -132,22 +218,19 @@ pub(super) fn compress_members_with_context(
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
     error_context: &(dyn Fn(usize, Error) -> Error + Sync),
-) -> Result<Vec<CompressedMember>> {
+) -> Result<Records<CompressedMember>> {
     if advance.is_cancelled() || resources.is_cancelled() {
         return Err(Error::Cancelled);
     }
-    let mut integrity = Vec::with_capacity(sources.len());
+    let mut integrity = Records::new(sources.len(), resources)?;
     for (index, source) in sources.iter().enumerate() {
         let input_size = source.len().map_err(|error| error_context(index, error))?;
         // Compression fills these checksums while consuming the source.
-        integrity.push((input_size, 0, [0; 32]));
+        integrity.push((input_size, 0, [0; 32]))?;
     }
 
-    let execution = ExecutionPlan::new(
-        plan,
-        integrity.iter().map(|entry| entry.0),
-        resources.memory_limit(),
-    );
+    let execution =
+        ExecutionPlan::with_resources(plan, integrity.iter().map(|entry| entry.0), resources)?;
     if let ExecutionPlan::IndependentMembers(ref members) = execution {
         return compress_members_whole(
             sources,
@@ -174,10 +257,10 @@ pub(super) fn compress_members_with_context(
             }
             advance.finished(index, *input_size);
         }
-        integrity
-            .iter()
-            .map(|_| Spool::create_parked(resources))
-            .collect::<Result<Vec<_>>>()?
+        Records::collect(
+            integrity.iter().map(|_| Spool::create_parked(resources)),
+            resources,
+        )?
     } else {
         compress_streaming_members(
             sources,
@@ -193,33 +276,33 @@ pub(super) fn compress_members_with_context(
         )?
     };
 
-    Ok(packed
-        .into_iter()
-        .zip(&integrity)
-        .enumerate()
-        .map(
-            |(member, (packed, &(input_size, crc32, hash)))| CompressedMember {
-                input_size,
-                crc32,
-                hash,
-                // One rule, shared with the whole-member path and the legacy
-                // writers, plus the two cases that are not really fallbacks:
-                // storing was asked for, and an empty member has nothing to
-                // pack. `StoreFallback` refuses to store a solid member, whose
-                // successors decode against the dictionary it fills.
-                store: plan.method == 0
-                    || input_size == 0
-                    || should_store_compressed_payload(
-                        input_size,
-                        packed.len(),
-                        plan.solid,
-                        &plan.filter_policy,
-                    ),
-                packed,
-                solid_continuation: plan.solid && member > 0,
+    Records::collect(
+        packed.into_iter().zip(&integrity).enumerate().map(
+            |(member, (packed, &(input_size, crc32, hash)))| {
+                Ok(CompressedMember {
+                    input_size,
+                    crc32,
+                    hash,
+                    // One rule, shared with the whole-member path and the legacy
+                    // writers, plus the two cases that are not really fallbacks:
+                    // storing was asked for, and an empty member has nothing to
+                    // pack. `StoreFallback` refuses to store a solid member, whose
+                    // successors decode against the dictionary it fills.
+                    store: plan.method == 0
+                        || input_size == 0
+                        || should_store_compressed_payload(
+                            input_size,
+                            packed.len(),
+                            plan.solid,
+                            &plan.filter_policy,
+                        ),
+                    packed,
+                    solid_continuation: plan.solid && member > 0,
+                })
             },
-        )
-        .collect())
+        ),
+        resources,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -231,7 +314,7 @@ fn compress_streaming_members(
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
     error_context: &(dyn Fn(usize, Error) -> Error + Sync),
-) -> Result<Vec<Spool>> {
+) -> Result<Records<Spool>> {
     let max_jobs_by_memory = resources.memory_limit() / required;
     if max_jobs_by_memory == 0 {
         resources
@@ -283,68 +366,85 @@ fn compress_members_whole(
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
     error_context: &(dyn Fn(usize, Error) -> Error + Sync),
-) -> Result<Vec<CompressedMember>> {
-    // Each worker acquires its complete workspace before loading the source.
-    // Results are disk spools, so retaining them in source order is cheap.
-    let mut results = Vec::with_capacity(sources.len());
+) -> Result<Records<CompressedMember>> {
+    let mut results = Records::new(sources.len(), resources)?;
     let mut start = 0;
     while start < sources.len() {
-        let end = (start..sources.len())
-            .take(crate::parallel::threads())
-            .take_while(|&index| {
-                members[index].execution == Execution::WholeMember
-                    && members[index].workspace <= resources.memory_limit()
-            })
-            .last()
-            .map_or(start, |index| index + 1);
-        if end == start {
-            // A streaming fallback can itself use rayon. Run it outside the
-            // worker batch so a nested job cannot wait behind budget waiters.
-            results.push(
-                match members[start].execution {
-                    Execution::Blocks { .. } => compress_fallback_member(
-                        start,
-                        &sources[start],
-                        integrity[start],
-                        plan,
-                        members[start].workspace,
-                        resources,
-                        advance,
-                        error_context,
-                    ),
-                    Execution::WholeMember => compress_whole_member(
-                        start,
-                        &sources[start],
-                        integrity[start],
-                        plan,
-                        members[start].workspace,
-                        resources,
-                        advance,
-                    ),
-                }
-                .map_err(|error| error_context(start, error))?,
-            );
-            start += 1;
-        } else {
-            results.extend(crate::parallel::map_collect(
-                (start..end).collect(),
-                |index| {
-                    compress_whole_member(
-                        index,
-                        &sources[index],
-                        integrity[index],
-                        plan,
-                        members[index].workspace,
-                        resources,
-                        advance,
-                    )
-                    .map_err(|error| error_context(index, error))
-                },
-            )?);
-            start = end;
+        if advance.is_cancelled() || resources.is_cancelled() {
+            return Err(Error::Cancelled);
         }
+        if members[start].execution != Execution::WholeMember {
+            results.push(
+                compress_fallback_member(
+                    start,
+                    &sources[start],
+                    integrity[start],
+                    plan,
+                    members[start].workspace,
+                    resources,
+                    advance,
+                    error_context,
+                )
+                .map_err(|error| error_context(start, error))?,
+            )?;
+            start += 1;
+            continue;
+        }
+        let (end, reserved) = whole_member_wave(
+            members,
+            start,
+            crate::parallel::threads(),
+            resources.memory_limit(),
+        );
+        // Acquire the entire wave on the coordinator. No dispatched worker
+        // waits for workspace held by another worker in the same pool.
+        let _permit = resources
+            .acquire_cancellable(reserved, plan.dictionary_size, &|| advance.is_cancelled())
+            .map_err(|error| error_context(start, error))?;
+        let jobs = Records::collect((start..end).map(Ok), resources)?;
+        let completed = run_jobs(jobs, resources, advance, |index, progress| {
+            compress_whole_member(
+                index,
+                &sources[index],
+                integrity[index],
+                plan,
+                resources,
+                progress,
+            )
+            .map_err(|error| error_context(index, error))
+        })?;
+        for member in completed {
+            results.push(member)?;
+        }
+        start = end;
     }
     Ok(results)
+}
+
+/// A contiguous wave fitting both the configured estimate and the worker count.
+/// Include an oversized first job so admission reports its real requirement.
+fn whole_member_wave(
+    members: &[MemberPlan],
+    start: usize,
+    threads: usize,
+    limit: u64,
+) -> (usize, u64) {
+    let mut reserved = members[start].workspace;
+    let mut end = start + 1;
+    while end < members.len() && end - start < threads.max(1) {
+        if members[end].execution != Execution::WholeMember {
+            break;
+        }
+        let Some(total) = reserved.checked_add(members[end].workspace) else {
+            break;
+        };
+        if total > limit {
+            break;
+        }
+        reserved = total;
+        end += 1;
+    }
+    (end, reserved)
 }
 
 fn compress_whole_member(
@@ -352,7 +452,6 @@ fn compress_whole_member(
     source: &EntrySource,
     integrity: (u64, u32, [u8; 32]),
     plan: &CompressPlan,
-    required: u64,
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
 ) -> Result<CompressedMember> {
@@ -363,8 +462,6 @@ fn compress_whole_member(
     let mut packed_spool = Spool::create(resources)?;
     let mut stored = input_size == 0;
     if !stored {
-        let _permit = resources
-            .acquire_cancellable(required, plan.dictionary_size, &|| advance.is_cancelled())?;
         advance.started(index, input_size);
         if advance.is_cancelled() {
             return Err(Error::Cancelled);
@@ -504,7 +601,7 @@ fn compress_fallback_member(
         },
         &|_, error| error_context(index, error),
     )?;
-    let packed = packed.remove(0);
+    let packed = packed.pop().expect("one fallback member");
     let (input_size, crc32, hash) = integrity[0];
     Ok(CompressedMember {
         input_size,
@@ -534,14 +631,12 @@ fn compress_independent_members(
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
     error_context: &(dyn Fn(usize, Error) -> Error + Sync),
-) -> Result<Vec<Spool>> {
-    let mut packed = Vec::with_capacity(sources.len());
+) -> Result<Records<Spool>> {
+    let mut packed = Records::new(sources.len(), resources)?;
     for (group_index, group) in sources.chunks(batch_capacity).enumerate() {
         let group_start = group_index * batch_capacity;
-        let mut streams = group
-            .iter()
-            .enumerate()
-            .map(|(offset, source)| {
+        let mut streams = Records::collect(
+            group.iter().enumerate().map(|(offset, source)| {
                 MemberStream::new(
                     group_start + offset,
                     source,
@@ -550,17 +645,19 @@ fn compress_independent_members(
                     advance,
                 )
                 .map_err(|error| error_context(group_start + offset, error))
-            })
-            .collect::<Result<Vec<_>>>()?;
+            }),
+            resources,
+        )?;
 
-        let mut histories = vec![Vec::new(); streams.len()];
+        let mut histories =
+            Records::collect((0..streams.len()).map(|_| Ok(Vec::new())), resources)?;
         let mut cursor = 0usize;
         while streams.iter().any(MemberStream::has_more) {
             let reserved = required.saturating_mul(batch_capacity as u64);
             let _permit = resources
                 .acquire_cancellable(reserved, plan.dictionary_size, &|| advance.is_cancelled())?;
 
-            let mut jobs = Vec::with_capacity(batch_capacity);
+            let mut jobs = Records::new(batch_capacity, resources)?;
             let mut misses = 0usize;
             while jobs.len() < batch_capacity && misses < streams.len() {
                 let stream_count = streams.len();
@@ -576,7 +673,7 @@ fn compress_independent_members(
                 let mut job = BlockJob {
                     data: Vec::new(),
                     history: histories[member].clone(),
-                    blocks: Vec::new(),
+                    blocks: Records::new(0, resources)?,
                 };
                 while stream.has_more() && job.data.len() < run_size(plan) {
                     job.data.extend(
@@ -584,24 +681,24 @@ fn compress_independent_members(
                             .map_err(|error| error_context(stream.member, error))?,
                     );
                     job.blocks
-                        .push((member, job.data.len(), !stream.has_more()));
+                        .push_growing((member, job.data.len(), !stream.has_more()))?;
                 }
                 advance_history(
                     &mut histories[member],
                     &job.data,
                     plan.encode_options.max_match_distance,
                 );
-                jobs.push(job);
+                jobs.push(job)?;
             }
 
-            compress_wave(jobs, plan, &mut streams, advance, error_context)?;
+            compress_wave(jobs, plan, &mut streams, resources, advance, error_context)?;
         }
 
         for stream in streams {
             let slot = &mut integrity[stream.member];
             slot.1 = stream.crc.finish();
             slot.2 = stream.hash.finalize();
-            packed.push(stream.packed);
+            packed.push(stream.packed)?;
         }
     }
     Ok(packed)
@@ -618,15 +715,14 @@ fn compress_solid_chain(
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
     error_context: &(dyn Fn(usize, Error) -> Error + Sync),
-) -> Result<Vec<Spool>> {
-    let mut streams = sources
-        .iter()
-        .enumerate()
-        .map(|(member, source)| {
+) -> Result<Records<Spool>> {
+    let mut streams = Records::collect(
+        sources.iter().enumerate().map(|(member, source)| {
             MemberStream::new(member, source, integrity[member].0, resources, advance)
                 .map_err(|error| error_context(member, error))
-        })
-        .collect::<Result<Vec<_>>>()?;
+        }),
+        resources,
+    )?;
 
     let mut history: Vec<u8> = Vec::new();
     let mut next = 0usize;
@@ -637,12 +733,12 @@ fn compress_solid_chain(
 
         // Run boundaries depend on input and dictionary size, never on the
         // worker count. Adjacent blocks amortize history copies and seeding.
-        let mut jobs = Vec::with_capacity(batch_capacity);
+        let mut jobs = Records::new(batch_capacity, resources)?;
         while jobs.len() < batch_capacity {
             let mut job = BlockJob {
                 data: Vec::new(),
                 history: history.clone(),
-                blocks: Vec::new(),
+                blocks: Records::new(0, resources)?,
             };
             while job.data.len() < run_size(plan) {
                 while next < streams.len() && !streams[next].has_more() {
@@ -656,7 +752,7 @@ fn compress_solid_chain(
                         .map_err(|error| error_context(stream.member, error))?,
                 );
                 job.blocks
-                    .push((stream.member, job.data.len(), !stream.has_more()));
+                    .push_growing((stream.member, job.data.len(), !stream.has_more()))?;
             }
             if job.blocks.is_empty() {
                 break;
@@ -666,24 +762,24 @@ fn compress_solid_chain(
                 &job.data,
                 plan.encode_options.max_match_distance,
             );
-            jobs.push(job);
+            jobs.push(job)?;
         }
 
         if jobs.is_empty() {
             break;
         }
-        compress_wave(jobs, plan, &mut streams, advance, error_context)?;
+        compress_wave(jobs, plan, &mut streams, resources, advance, error_context)?;
     }
 
-    Ok(streams
-        .into_iter()
-        .map(|stream| {
+    Records::collect(
+        streams.into_iter().map(|stream| {
             let slot = &mut integrity[stream.member];
             slot.1 = stream.crc.finish();
             slot.2 = stream.hash.finalize();
-            stream.packed
-        })
-        .collect())
+            Ok(stream.packed)
+        }),
+        resources,
+    )
 }
 
 /// Reads the next block from `stream`, checking the source has not grown.
@@ -778,39 +874,50 @@ fn advance_history(history: &mut Vec<u8>, data: &[u8], max_match_distance: usize
 /// Compresses a wave of blocks in parallel, then appends the results to their
 /// members in job order so output does not depend on scheduling.
 fn compress_wave(
-    jobs: Vec<BlockJob>,
+    jobs: Records<BlockJob>,
     plan: &CompressPlan,
     streams: &mut [MemberStream],
+    resources: &WriterResources,
     advance: &dyn CompressionProgress,
     error_context: &(dyn Fn(usize, Error) -> Error + Sync),
 ) -> Result<()> {
-    let packed_runs = crate::parallel::map_collect(jobs, |job| {
-        let boundaries: Vec<_> = job
-            .blocks
-            .iter()
-            .map(|&(_, end, last)| (end, last))
-            .collect();
-        // Report each block from the worker that finished it. A run holds a
-        // dictionary's worth of blocks and a wave holds one run per thread, so
-        // reporting once the wave is appended is a single jump across the whole
-        // member whenever the member fits one wave.
-        let mut block_done = |bytes: usize| advance.advance(bytes as u64);
-        let packed = encode_lz_streaming_blocks(
-            &job.data,
-            &job.history,
-            &boundaries,
-            plan.algorithm_version,
-            plan.encode_options,
-            Some(&mut block_done),
-        )?;
-        Ok::<_, crate::codec::Error>(
-            job.blocks
-                .into_iter()
-                .zip(packed)
-                .map(|((member, _, last), packed)| (member, packed, last))
-                .collect::<Vec<_>>(),
-        )
-    })?;
+    // All coordinator-owned boundary and result arrays are reserved before
+    // dispatch, rather than letting workers compete for preparation capacity.
+    let jobs = Records::collect(
+        jobs.into_iter().map(|job| {
+            let boundaries = Records::collect(
+                job.blocks.iter().map(|&(_, end, last)| Ok((end, last))),
+                resources,
+            )?;
+            let output = Records::new(job.blocks.len(), resources)?;
+            Ok((job, boundaries, output))
+        }),
+        resources,
+    )?;
+    let packed_runs = run_jobs(
+        jobs,
+        resources,
+        advance,
+        |(job, boundaries, mut output), progress| {
+            // Report each block from the worker that finished it. A run holds a
+            // dictionary's worth of blocks and a wave holds one run per thread, so
+            // reporting once the wave is appended is a single jump across the whole
+            // member whenever the member fits one wave.
+            let mut block_done = |bytes: usize| progress.advance(bytes as u64);
+            let packed = encode_lz_streaming_blocks(
+                &job.data,
+                &job.history,
+                &boundaries,
+                plan.algorithm_version,
+                plan.encode_options,
+                Some(&mut block_done),
+            )?;
+            for ((member, _, last), packed) in job.blocks.into_iter().zip(packed) {
+                output.push((member, packed, last))?;
+            }
+            Ok(output)
+        },
+    )?;
     // A solid wave can cover thousands of tiny members. Keep only the spool
     // currently being appended open, rather than one descriptor per member.
     let mut previous: Option<usize> = None;
@@ -867,10 +974,195 @@ pub(super) fn compress_members_reporting(
     advance: &dyn CompressionProgress,
 ) -> Result<Vec<CompressedMember>> {
     compress_members_with_context(sources, &plan, resources, advance, &|_, error| error)
+        .map(|members| members.into_iter().collect())
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn whole_waves_admit_the_sum_without_crossing_fallbacks_or_overflowing() {
+        let whole = |workspace| MemberPlan {
+            execution: Execution::WholeMember,
+            workspace,
+        };
+        let members = [whole(60), whole(40), whole(1), whole(u64::MAX)];
+        assert_eq!(whole_member_wave(&members, 0, 4, 100), (2, 100));
+        assert_eq!(whole_member_wave(&members, 0, 1, 100), (1, 60));
+        assert_eq!(whole_member_wave(&members, 0, 4, 59), (1, 60));
+        assert_eq!(whole_member_wave(&members, 2, 4, u64::MAX), (3, 1));
+        let fallback = MemberPlan {
+            execution: Execution::Blocks {
+                fallback: super::super::plan::FallbackReason::AutomaticFilterWorkspace {
+                    required: 100,
+                    limit: 99,
+                },
+            },
+            workspace: 10,
+        };
+        assert_eq!(
+            whole_member_wave(&[whole(0), fallback, whole(0)], 0, 4, 0),
+            (1, 0)
+        );
+    }
+
+    #[test]
+    fn coordinator_slots_are_admitted_before_callbacks_and_results_stay_charged() {
+        use std::sync::atomic::AtomicUsize;
+        let calls = AtomicUsize::new(0);
+        let limited = WriterResources::default().with_max_preparation_bytes(16);
+        let jobs = Records::collect([Ok(1u64), Ok(2)].into_iter(), &limited).unwrap();
+        assert!(matches!(
+            run_jobs(jobs, &limited, &|_| true, |job, _| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok(job)
+            }),
+            Err(Error::WriterPreparationLimitExceeded { .. })
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        drop(Records::<u8>::new(16, &limited).unwrap());
+
+        let resources = WriterResources::default().with_max_preparation_bytes(65536);
+        for _ in 0..8 {
+            let jobs = Records::collect([Ok(1u64), Ok(2)].into_iter(), &resources).unwrap();
+            let output = run_jobs(jobs, &resources, &|_| true, |job, _| Ok(job * 2)).unwrap();
+            assert_eq!(&*output, &[2, 4]);
+            assert!(matches!(
+                Records::<u8>::new(65536, &resources),
+                Err(Error::WriterPreparationLimitExceeded { used: 16, .. })
+            ));
+            drop(output);
+            drop(Records::<u8>::new(65536, &resources).unwrap());
+        }
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[test]
+    fn failed_wave_skips_queued_sources_and_releases_successful_siblings() {
+        use std::sync::atomic::AtomicUsize;
+        struct Retained<'a>(&'a AtomicUsize);
+        impl Drop for Retained<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let scratch = crate::scratch::case("coordinator-failure");
+        let resources = WriterResources::new(100)
+            .with_temp_dir(&*scratch)
+            .with_max_preparation_bytes(65536);
+        let calls = AtomicUsize::new(0);
+        let drops = AtomicUsize::new(0);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let permit = resources.acquire(100, 0).unwrap();
+        let jobs = Records::collect((0..3).map(Ok), &resources).unwrap();
+        let result = pool.install(|| {
+            run_jobs(jobs, &resources, &|_| true, |job, _| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(resources.workspace_in_use(), 100);
+                if job == 1 {
+                    return Err(Error::SourceChanged("test sibling failure"));
+                }
+                Ok((Retained(&drops), Spool::create(&resources)?))
+            })
+        });
+        assert!(matches!(
+            result,
+            Err(Error::SourceChanged("test sibling failure"))
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert_eq!(resources.workspace_in_use(), 100);
+        drop(permit);
+        assert_eq!(resources.workspace_in_use(), 0);
+        assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
+        drop(Records::<u8>::new(65536, &resources).unwrap());
+        let jobs = Records::collect((0..3).map(Ok), &resources).unwrap();
+        assert_eq!(
+            pool.install(|| run_jobs(jobs, &resources, &|_| true, |job, _| Ok(job)))
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[test]
+    fn sibling_failure_joins_running_work_and_keeps_the_original_error() {
+        use std::sync::{atomic::AtomicUsize, Barrier};
+        let resources = WriterResources::default().with_max_preparation_bytes(65536);
+        let barrier = Barrier::new(2);
+        let joined = AtomicUsize::new(0);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let jobs = Records::collect((0..2).map(Ok), &resources).unwrap();
+        let result: Result<Records<()>> = pool.install(|| {
+            run_jobs(jobs, &resources, &|_| true, |job, progress| {
+                barrier.wait();
+                if job == 1 {
+                    return Err(Error::SourceChanged("original failure"));
+                }
+                while !progress.is_cancelled() {
+                    std::thread::yield_now();
+                }
+                joined.fetch_add(1, Ordering::Relaxed);
+                Err(Error::Cancelled)
+            })
+        });
+        assert!(matches!(
+            result,
+            Err(Error::SourceChanged("original failure"))
+        ));
+        assert_eq!(joined.load(Ordering::Relaxed), 1);
+        drop(Records::<u8>::new(65536, &resources).unwrap());
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[test]
+    fn whole_member_sources_open_only_after_combined_admission() {
+        use std::sync::{atomic::AtomicUsize, Arc};
+        let encode_options = EncodeOptions::new(8).with_max_match_distance(65536);
+        let plan = CompressPlan {
+            algorithm_version: 0,
+            encode_options,
+            dictionary_size: 65536,
+            block_size: 65536,
+            solid: false,
+            method: 1,
+            filter_policy: FilterPolicy::Auto,
+            candidates: vec![encode_options],
+        };
+        let required = whole_member_workspace(32, &plan);
+        let scratch = crate::scratch::case("coordinator-admission");
+        let resources = WriterResources::new(required * 2).with_temp_dir(&*scratch);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sources: Vec<_> = (0..4)
+            .map(|_| {
+                let resources = resources.clone();
+                let calls = calls.clone();
+                EntrySource::from_opener(32, move || {
+                    assert_eq!(resources.workspace_in_use(), required * 2);
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(Box::new(std::io::Cursor::new([42u8; 32])))
+                })
+            })
+            .collect();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        drop(
+            pool.install(|| compress_members_reporting(&sources, plan, &resources, &|_| true))
+                .unwrap(),
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 4);
+        assert_eq!(resources.workspace_in_use(), 0);
+        assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
+    }
+
     #[test]
     fn mixed_whole_and_fallback_members_keep_order_progress_and_cleanup() {
         use std::sync::{

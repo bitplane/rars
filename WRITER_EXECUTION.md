@@ -45,12 +45,21 @@ distinct from the actual buffers and match-finder workspace used during coding.
 | Other non-solid compression | Interleave independent members in batches of block jobs | Each job retains input and history; packed results are appended to member spools in order. |
 | Solid compression | Read one history chain across members and encode batches of block jobs | Whole-member filter search is not selected. Source order and solid continuation state govern the chain. |
 
-Whole-member batches contain at most the worker count. Workers acquire their
-workspace permits before loading input. Members requiring streaming fallback
+Whole-member batches contain at most the worker count and fit the sum of their
+workspace estimates. The coordinator acquires one permit for the complete wave
+before dispatch; workers do not wait for workspace. That permit remains live
+until the wave joins and its results have been consumed. Members requiring streaming fallback
 run outside those worker batches because fallback can itself schedule parallel
 work. Streaming batch capacity is the smaller of the worker count and the
 budget divided by the per-job estimate. A job that cannot fit is refused. Empty
 whole members have no codec workspace charge.
+
+Both whole-member and block waves allocate charged coordinator slots before
+worker dispatch. A sibling failure stops queued jobs, signals running codecs
+through progress cancellation, joins admitted work and then drops retained
+results. The reported error prefers the original failure over consequential
+cancellation. Batch cancellation does not mutate the caller's reusable token.
+These are scheduling guarantees; codec allocations still use workspace estimates.
 
 Store fallback is a separate decision from execution fallback: an independent
 member may use its original bytes when compression does not pay. An explicit

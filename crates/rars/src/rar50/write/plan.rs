@@ -2,6 +2,8 @@
 
 use super::FilterPolicy;
 use crate::codec::rar50::EncodeOptions;
+use crate::streaming::preparation::Records;
+use crate::{Result, WriterResources};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FallbackReason {
@@ -24,34 +26,44 @@ pub(super) struct MemberPlan {
 pub(super) enum ExecutionPlan {
     Stored,
     Blocks { workspace: u64 },
-    IndependentMembers(Vec<MemberPlan>),
+    IndependentMembers(Records<MemberPlan>),
 }
 
 impl ExecutionPlan {
+    #[cfg(test)]
     pub(super) fn new(
         settings: &CompressPlan,
-        sizes: impl Iterator<Item = u64>,
+        sizes: impl ExactSizeIterator<Item = u64>,
         limit: u64,
     ) -> Self {
+        Self::with_resources(settings, sizes, &WriterResources::new(limit)).unwrap()
+    }
+
+    pub(super) fn with_resources(
+        settings: &CompressPlan,
+        sizes: impl ExactSizeIterator<Item = u64>,
+        resources: &WriterResources,
+    ) -> Result<Self> {
+        let limit = resources.memory_limit();
         // Select the requested mode before estimating its active workspace.
         if settings.method == 0 {
-            return Self::Stored;
+            return Ok(Self::Stored);
         }
         let whole_members = !settings.solid
             && (settings.filter_policy != FilterPolicy::None || settings.candidates.len() > 1);
         if !whole_members {
-            return Self::Blocks {
+            return Ok(Self::Blocks {
                 workspace: streaming_workspace(settings, true),
-            };
+            });
         }
-        Self::IndependentMembers(
-            sizes
-                .map(|size| {
-                    let required = if size == 0 {
-                        0
-                    } else {
-                        whole_member_workspace(size, settings)
-                    };
+        Ok(Self::IndependentMembers(Records::collect(
+            sizes.map(|size| {
+                let required = if size == 0 {
+                    0
+                } else {
+                    whole_member_workspace(size, settings)
+                };
+                Ok(
                     if required <= limit || settings.filter_policy != FilterPolicy::Auto {
                         MemberPlan {
                             execution: Execution::WholeMember,
@@ -68,10 +80,11 @@ impl ExecutionPlan {
                             // Automatic fallback uses only the base encoder candidate.
                             workspace: streaming_workspace(settings, false),
                         }
-                    }
-                })
-                .collect(),
-        )
+                    },
+                )
+            }),
+            resources,
+        )?))
     }
 
     #[cfg(test)]
