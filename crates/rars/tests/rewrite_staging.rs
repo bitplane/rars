@@ -458,7 +458,7 @@ fn incremental_sources_decode_once_and_join_on_early_failure_or_panic() {
             |sources| {
                 // Out-of-order requests retain required earlier payloads without replaying decoding.
                 for _ in 0..2 {
-                    for (source, byte) in sources.iter().zip([b'c', b'a']) {
+                    for (source, byte) in sources.iter().zip(*b"ca") {
                         let mut bytes = Vec::new();
                         source.open()?.read_to_end(&mut bytes)?;
                         assert_eq!(bytes, vec![byte; 2048]);
