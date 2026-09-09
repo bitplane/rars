@@ -1,6 +1,7 @@
 use crate::{Error, Result};
 #[cfg(any(test, all(target_arch = "wasm32", target_os = "unknown")))]
 mod memory_spool;
+pub(crate) mod preparation;
 use std::fmt;
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
@@ -155,6 +156,7 @@ pub struct WriterResources {
     spool_budget: Option<Arc<StorageBudget>>,
     spool_memory_budget: Option<Arc<StorageBudget>>,
     prepared_header_budget: Option<Arc<StorageBudget>>,
+    preparation_budget: Option<Arc<StorageBudget>>,
     cancellation: Option<WriteCancellation>,
 }
 
@@ -173,6 +175,7 @@ impl WriterResources {
             spool_budget: None,
             spool_memory_budget: None,
             prepared_header_budget: None,
+            preparation_budget: None,
             cancellation: None,
         }
     }
@@ -257,6 +260,38 @@ impl WriterResources {
                 Ok(charge)
             })
             .transpose()
+    }
+
+    /// Bound RAR5/7 engine header scratch, images, descriptor arrays and boxed
+    /// preparation state, including volume and recovery headers. Capacity is
+    /// reserved before allocation, including old/replacement overlap on growth.
+    /// Configuring creates a new ledger shared by resource clones; default is
+    /// unlimited. Legacy writers explicitly refuse this policy.
+    ///
+    /// Compression job/result containers, codec/KDF/recovery workspace, input
+    /// conversion, source/sink callbacks, collectors, diagnostics and allocator
+    /// overhead are outside this quota. This is not a total writer-memory cap.
+    pub fn with_max_preparation_bytes(mut self, limit: u64) -> Self {
+        self.preparation_budget = Some(Arc::new(StorageBudget {
+            resource: StorageResource::Preparation,
+            limit,
+            used: Mutex::new(0),
+        }));
+        self
+    }
+
+    /// The optional shared RAR5/7 engine preparation capacity limit.
+    pub fn max_preparation_bytes(&self) -> Option<u64> {
+        self.preparation_budget.as_ref().map(|budget| budget.limit)
+    }
+
+    pub(crate) fn preparation_charge(&self) -> Option<StorageCharge> {
+        self.preparation_budget
+            .as_ref()
+            .map(|budget| StorageCharge {
+                budget: budget.clone(),
+                bytes: 0,
+            })
     }
 
     /// Place temporary spools in this existing directory (default: the current
@@ -351,6 +386,7 @@ enum StorageResource {
     LogicalBytes,
     PayloadMemory,
     PreparedHeaders,
+    Preparation,
 }
 
 #[derive(Debug)]
@@ -360,6 +396,7 @@ struct StorageBudget {
     used: Mutex<u64>,
 }
 
+#[derive(Debug)]
 pub(crate) struct StorageCharge {
     budget: Arc<StorageBudget>,
     bytes: u64,
@@ -384,6 +421,11 @@ impl StorageCharge {
             let required = required.unwrap_or(u64::MAX);
             return Err(match self.budget.resource {
                 StorageResource::LogicalBytes => Error::WriterSpoolLimitExceeded {
+                    limit: self.budget.limit,
+                    required,
+                    used: *used,
+                },
+                StorageResource::Preparation => Error::WriterPreparationLimitExceeded {
                     limit: self.budget.limit,
                     required,
                     used: *used,

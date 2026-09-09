@@ -15,11 +15,12 @@
 //! and leaves its length alone. That makes the fixed point cheap to solve here,
 //! over a few dozen bytes, instead of over the whole archive.
 
-use super::headers::{block_header_image, resolved_main_extra, stored_file_specific, write_vint};
+use super::headers::{block_header_image, resolved_main_extra, stored_file_specific};
 use super::ArchiveMetadataEntry;
 use crate::detect::RAR50_SIGNATURE;
 use crate::rar50::{FHEXTRA_SUBDATA, HEAD_MAIN, HEAD_SERVICE, HFL_DATA, HFL_EXTRA};
-use crate::{Error, Result};
+use crate::streaming::preparation::Bytes;
+use crate::{Error, Result, WriterResources};
 
 /// Offsets only ever grow as the header grows, and a vint is at most 10 bytes
 /// wide, so this is far more headroom than the fixed point can need.
@@ -44,10 +45,10 @@ pub(super) struct LayoutInputs<'a> {
     pub(super) recovery_percent: Option<u64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(super) struct ResolvedLayout {
     /// The extra area to put in the main header, with settled offsets.
-    pub(super) main_extra: Vec<u8>,
+    pub(super) main_extra: Bytes,
     pub(super) main_header_len: u64,
     /// Value stored in the locator: the block's position measured from the end
     /// of the signature. The quick-open offset is settled the same way but is
@@ -57,11 +58,14 @@ pub(super) struct ResolvedLayout {
     pub(super) recovery_prefix_len: Option<u64>,
 }
 
-pub(super) fn resolve_layout(inputs: &LayoutInputs<'_>) -> Result<ResolvedLayout> {
+pub(super) fn resolve_layout(
+    inputs: &LayoutInputs<'_>,
+    resources: &WriterResources,
+) -> Result<ResolvedLayout> {
     let signature_len = RAR50_SIGNATURE.len() as u64;
     let quick_open_block_len = match inputs.quick_open_payload_len {
         Some(payload_len) => {
-            stored_service_block_len(b"QO", payload_len, &[], inputs.header_encrypted)?
+            stored_service_block_len(b"QO", payload_len, &[], inputs.header_encrypted, resources)?
         }
         None => 0,
     };
@@ -70,12 +74,18 @@ pub(super) fn resolve_layout(inputs: &LayoutInputs<'_>) -> Result<ResolvedLayout
     let mut recovery_offset = inputs.recovery_percent.map(|_| 0);
 
     for _ in 0..MAX_LAYOUT_PASSES {
-        let mut main_extra =
-            resolved_main_extra(inputs.archive_metadata, quick_open_offset, recovery_offset)?;
+        let mut main_extra = resolved_main_extra(
+            inputs.archive_metadata,
+            quick_open_offset,
+            recovery_offset,
+            resources,
+        )?;
         if let Some(metadata) = inputs.metadata_record {
-            main_extra.extend(super::headers::retained_archive_metadata(metadata)?);
+            main_extra.extend_from_slice(&super::headers::retained_archive_metadata(
+                metadata, resources,
+            )?)?;
         }
-        let main_header_len = main_header_len(inputs, &main_extra)?;
+        let main_header_len = main_header_len(inputs, &main_extra, resources)?;
 
         let quick_open_position = signature_len
             .checked_add(inputs.head_crypt_len)
@@ -108,11 +118,15 @@ pub(super) fn resolve_layout(inputs: &LayoutInputs<'_>) -> Result<ResolvedLayout
 }
 
 /// Size of a main header carrying `extra`, as it will appear in the archive.
-fn main_header_len(inputs: &LayoutInputs<'_>, extra: &[u8]) -> Result<u64> {
-    let mut specific = Vec::new();
-    write_vint(&mut specific, inputs.main_flags);
+fn main_header_len(
+    inputs: &LayoutInputs<'_>,
+    extra: &[u8],
+    resources: &WriterResources,
+) -> Result<u64> {
+    let mut specific = Bytes::new(resources);
+    specific.vint(inputs.main_flags)?;
     if let Some(volume_number) = inputs.volume_number {
-        write_vint(&mut specific, volume_number);
+        specific.vint(volume_number)?;
     }
     let header = block_header_image(
         HEAD_MAIN,
@@ -120,6 +134,7 @@ fn main_header_len(inputs: &LayoutInputs<'_>, extra: &[u8]) -> Result<u64> {
         None,
         &specific,
         extra,
+        resources,
     )?;
     Ok(emitted_header_len(
         header.len() as u64,
@@ -133,17 +148,19 @@ pub(super) fn stored_service_block_len(
     data_len: u64,
     service_data: &[u8],
     header_encrypted: bool,
+    resources: &WriterResources,
 ) -> Result<u64> {
-    let mut extra = Vec::new();
-    super::headers::write_extra_record(&mut extra, FHEXTRA_SUBDATA, service_data);
+    let mut extra = Bytes::new(resources);
+    super::headers::write_extra_record(&mut extra, FHEXTRA_SUBDATA, service_data)?;
     // The CRC is a fixed-width field, so any value gives the right size.
-    let specific = stored_file_specific(name, data_len, Some(0), 0, None, 0)?;
+    let specific = stored_file_specific(name, data_len, Some(0), 0, None, 0, resources)?;
     let header = block_header_image(
         HEAD_SERVICE,
         HFL_EXTRA | HFL_DATA,
         Some(data_len),
         &specific,
         &extra,
+        resources,
     )?;
     emitted_header_len(header.len() as u64, header_encrypted)
         .checked_add(data_len)
@@ -186,14 +203,24 @@ mod tests {
             signature_len + inputs.head_crypt_len + layout.main_header_len + inputs.body_len;
 
         // Rebuilding the header with the settled offsets must not resize it.
-        let rebuilt = super::main_header_len(inputs, &layout.main_extra).unwrap();
+        let rebuilt = super::main_header_len(
+            inputs,
+            &layout.main_extra,
+            &crate::WriterResources::default(),
+        )
+        .unwrap();
         assert_eq!(rebuilt, layout.main_header_len, "main header size moved");
 
         if let Some(offset) = layout.recovery_offset {
             let quick_open_block_len = match inputs.quick_open_payload_len {
-                Some(len) => {
-                    stored_service_block_len(b"QO", len, &[], inputs.header_encrypted).unwrap()
-                }
+                Some(len) => stored_service_block_len(
+                    b"QO",
+                    len,
+                    &[],
+                    inputs.header_encrypted,
+                    &crate::WriterResources::default(),
+                )
+                .unwrap(),
                 None => 0,
             };
             assert_eq!(
@@ -216,7 +243,7 @@ mod tests {
             for delta in [-3i64, -2, -1, 0, 1, 2, 3] {
                 let body_len = (boundary as i64 + delta).max(0) as u64;
                 let inputs = inputs(body_len);
-                let layout = resolve_layout(&inputs).unwrap();
+                let layout = resolve_layout(&inputs, &crate::WriterResources::default()).unwrap();
                 assert_self_consistent(&inputs, &layout);
             }
         }
@@ -227,7 +254,7 @@ mod tests {
         for body_len in [0u64, 100, 0x3ffe, 0x4001, 1 << 20] {
             let mut inputs = inputs(body_len);
             inputs.quick_open_payload_len = Some(4096);
-            let layout = resolve_layout(&inputs).unwrap();
+            let layout = resolve_layout(&inputs, &crate::WriterResources::default()).unwrap();
 
             // assert_self_consistent checks that the recovery offset leaves
             // room for the whole quick-open block ahead of it.
@@ -241,7 +268,7 @@ mod tests {
         let mut inputs = inputs(1024);
         inputs.header_encrypted = true;
         inputs.head_crypt_len = 60;
-        let layout = resolve_layout(&inputs).unwrap();
+        let layout = resolve_layout(&inputs, &crate::WriterResources::default()).unwrap();
 
         assert_eq!(
             layout.main_header_len % 16,
@@ -255,7 +282,7 @@ mod tests {
     fn layout_without_locator_features_has_no_offsets() {
         let mut inputs = inputs(4096);
         inputs.recovery_percent = None;
-        let layout = resolve_layout(&inputs).unwrap();
+        let layout = resolve_layout(&inputs, &crate::WriterResources::default()).unwrap();
 
         assert_eq!(layout.recovery_offset, None);
         assert_eq!(layout.recovery_prefix_len, None);

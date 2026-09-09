@@ -423,8 +423,11 @@ impl Archive {
                 let mut derived_services = HashSet::new();
                 for extra in &main.extras {
                     if let crate::rar50::MainExtraRecord::ArchiveMetadata(metadata) = extra {
-                        if crate::rar50::write::headers::retained_archive_metadata(metadata)
-                            .is_err()
+                        if crate::rar50::write::headers::retained_archive_metadata(
+                            metadata,
+                            &crate::WriterResources::default(),
+                        )
+                        .is_err()
                         {
                             issues.push("unsupported archive metadata".into());
                         }

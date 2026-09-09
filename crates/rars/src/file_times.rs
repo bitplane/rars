@@ -27,6 +27,17 @@ pub struct FileTimes {
     pub accessed: Option<FileTimestamp>,
 }
 
+pub(crate) struct EncodedTimes {
+    bytes: [u8; 25],
+    len: usize,
+}
+impl std::ops::Deref for EncodedTimes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
 impl FileTimes {
     /// Build a record from exact Unix nanoseconds, using FILETIME when needed.
     /// FILETIME requires 100-nanosecond precision for every present timestamp.
@@ -69,7 +80,7 @@ impl FileTimes {
         })
     }
 
-    pub(crate) fn encode(self) -> Result<Vec<u8>> {
+    pub(crate) fn encode(self) -> Result<EncodedTimes> {
         let times = [self.modified, self.created, self.accessed];
         let first = times
             .iter()
@@ -78,8 +89,10 @@ impl FileTimes {
             .ok_or(Error::InvalidArgument("file time record is empty"))?;
         let unix = matches!(first, FileTimestamp::Unix { .. });
         let mut flags = u8::from(unix);
-        let mut seconds = Vec::new();
-        let mut fractions = Vec::new();
+        let mut seconds = [0; 24];
+        let mut seconds_len = 0;
+        let mut fractions = [0; 12];
+        let mut fractions_len = 0;
         for (index, time) in times.into_iter().enumerate() {
             if let Some(time) = time {
                 flags |= 2 << index;
@@ -89,11 +102,15 @@ impl FileTimes {
                         nanoseconds,
                     } if unix && nanoseconds < 1_000_000_000 => {
                         flags |= 0x10;
-                        seconds.extend_from_slice(&value.to_le_bytes());
-                        fractions.extend_from_slice(&nanoseconds.to_le_bytes());
+                        seconds[seconds_len..seconds_len + 4].copy_from_slice(&value.to_le_bytes());
+                        seconds_len += 4;
+                        fractions[fractions_len..fractions_len + 4]
+                            .copy_from_slice(&nanoseconds.to_le_bytes());
+                        fractions_len += 4;
                     }
                     FileTimestamp::WindowsFiletime(ticks) if !unix => {
-                        seconds.extend_from_slice(&ticks.to_le_bytes())
+                        seconds[seconds_len..seconds_len + 8].copy_from_slice(&ticks.to_le_bytes());
+                        seconds_len += 8;
                     }
                     _ => {
                         return Err(Error::InvalidArgument(
@@ -103,10 +120,15 @@ impl FileTimes {
                 }
             }
         }
-        let mut record = vec![flags];
-        record.extend(seconds);
-        record.extend(fractions);
-        Ok(record)
+        let mut bytes = [0; 25];
+        bytes[0] = flags;
+        bytes[1..1 + seconds_len].copy_from_slice(&seconds[..seconds_len]);
+        bytes[1 + seconds_len..1 + seconds_len + fractions_len]
+            .copy_from_slice(&fractions[..fractions_len]);
+        Ok(EncodedTimes {
+            bytes,
+            len: 1 + seconds_len + fractions_len,
+        })
     }
 
     pub(crate) fn parse(flags: u64, data: &[u8]) -> Option<Self> {

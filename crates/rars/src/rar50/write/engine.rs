@@ -12,12 +12,14 @@
 //! a further pass over the preceding archive bytes, mirrored into a spool.
 
 use super::compress::{self, CompressPlan, CompressedMember};
+#[cfg(test)]
+use super::headers::write_vint;
 use super::headers::{
     block_header_image, encrypted_header_block, encrypted_main_header_block, file_specific,
     header_encryption_keys, header_encryption_password, prepared_header_image,
     stored_file_specific, write_end_header, write_extra_record, write_file_encryption_record,
-    write_hash_record_with_value, write_head_crypt, write_main_header, write_vint,
-    HeaderEncryptionKeys, PreparedHeader,
+    write_hash_record_with_value, write_head_crypt, write_main_header, HeaderEncryptionKeys,
+    PreparedHeader,
 };
 use super::layout::{resolve_layout, LayoutInputs};
 use super::{encrypt_reader_to, ArchiveEntry};
@@ -31,6 +33,7 @@ use crate::recovery::rar5::{
     build_streamed_inline_recovery, choose_recovery_memory_mode, plan_inline_recovery,
     ReadWriteSeek,
 };
+use crate::streaming::preparation::{Bytes, Owned, Records};
 use crate::streaming::Spool;
 use crate::write_progress::{check_cancelled, CancellableIo, ProgressReporter};
 use crate::{Error, Result, WriterResources};
@@ -83,7 +86,7 @@ enum Payload<'a> {
     Packed(Spool),
     /// Encrypted on the way out, so the ciphertext is never stored anywhere.
     Encrypted {
-        plain: Box<Payload<'a>>,
+        plain: Owned<Payload<'a>>,
         keys: Rar50Keys,
         iv: [u8; 16],
     },
@@ -176,7 +179,10 @@ pub(super) fn write_archive(
         None
     };
 
-    let sources: Vec<_> = entries.iter().map(|entry| entry.source.clone()).collect();
+    let mut sources = Records::new(entries.len(), resources)?;
+    for entry in entries {
+        sources.push(entry.source.clone())?;
+    }
     let total_input: u64 = entries
         .iter()
         .map(|entry| {
@@ -212,21 +218,30 @@ pub(super) fn write_archive(
     )?;
 
     // Everything between the main header and the quick-open block, in order.
-    let mut blocks: Vec<PreparedBlock> = Vec::with_capacity(entries.len() + 1);
+    let block_count = entries.iter().try_fold(
+        usize::from(plan.archive_comment.is_some()),
+        |total, entry| {
+            total
+                .checked_add(1)
+                .and_then(|total| total.checked_add(entry.services.len()))
+                .ok_or(Error::InvalidArgument("preparation record count overflows"))
+        },
+    )?;
+    let mut blocks = Records::<PreparedBlock>::new(block_count, resources)?;
     if let Some(comment) = &plan.archive_comment {
-        blocks.push(prepare_comment(comment, header_keys.as_ref(), resources)?);
+        blocks.push(prepare_comment(comment, header_keys.as_ref(), resources)?)?;
     }
     for (index, (entry, member)) in entries.iter().zip(compressed).enumerate() {
         check_cancelled(plan.progress)?;
         let mut block = prepare_member(entry, member, &plan, header_keys.as_ref(), resources)
             .map_err(|error| member_error(error, &entry.name, "preparing"))?;
         block.entry_index = Some(index);
-        blocks.push(block);
+        blocks.push(block)?;
         for service in &entry.services {
             let mut block = prepare_service(service, header_keys.as_ref(), resources)
                 .map_err(|error| member_error(error, &entry.name, "preparing service"))?;
             block.entry_index = Some(index);
-            blocks.push(block);
+            blocks.push(block)?;
         }
     }
     if !work.finish() {
@@ -289,11 +304,11 @@ pub(super) fn write_archive(
 
     let head_crypt = match &header_keys {
         Some(keys) => {
-            let mut block = Vec::new();
-            write_head_crypt(&mut block, keys)?;
+            let mut block = Bytes::new(resources);
+            write_head_crypt(&mut block, keys, resources)?;
             block
         }
-        None => Vec::new(),
+        None => Bytes::new(resources),
     };
 
     let mut main_flags = if plan.locked {
@@ -308,17 +323,20 @@ pub(super) fn write_archive(
         main_flags |= MHFL_RECOVERY;
     }
 
-    let layout = resolve_layout(&LayoutInputs {
-        header_encrypted: plan.header_encrypted,
-        head_crypt_len: head_crypt.len() as u64,
-        main_flags,
-        volume_number: None,
-        archive_metadata: plan.archive_metadata,
-        metadata_record: plan.metadata_record,
-        body_len,
-        quick_open_payload_len: quick_open_payload.as_ref().map(|block| block.payload_len),
-        recovery_percent: plan.recovery_percent,
-    })?;
+    let layout = resolve_layout(
+        &LayoutInputs {
+            header_encrypted: plan.header_encrypted,
+            head_crypt_len: head_crypt.len() as u64,
+            main_flags,
+            volume_number: None,
+            archive_metadata: plan.archive_metadata,
+            metadata_record: plan.metadata_record,
+            body_len,
+            quick_open_payload_len: quick_open_payload.as_ref().map(|block| block.payload_len),
+            recovery_percent: plan.recovery_percent,
+        },
+        resources,
+    )?;
 
     report_emission(plan.progress, true);
     // Only mirror the archive when a recovery record has to read it back.
@@ -333,12 +351,16 @@ pub(super) fn write_archive(
         };
 
         let main = match &header_keys {
-            Some(keys) => {
-                encrypted_main_header_block(&keys.keys, main_flags, None, &layout.main_extra)?
-            }
+            Some(keys) => encrypted_main_header_block(
+                &keys.keys,
+                main_flags,
+                None,
+                &layout.main_extra,
+                resources,
+            )?,
             None => {
-                let mut main = Vec::new();
-                write_main_header(&mut main, main_flags, None, &layout.main_extra)?;
+                let mut main = Bytes::new(resources);
+                write_main_header(&mut main, main_flags, None, &layout.main_extra, resources)?;
                 main
             }
         };
@@ -401,10 +423,11 @@ pub(super) fn write_archive(
             &super::end_header_specific(0),
             &[],
             &[],
+            resources,
         )?)?,
         None => {
-            let mut end = Vec::new();
-            write_end_header(&mut end, 0)?;
+            let mut end = Bytes::new(resources);
+            write_end_header(&mut end, 0, resources)?;
             output.write_all(&end)?;
         }
     }
@@ -502,9 +525,9 @@ fn stored_service_header(
     header_keys: Option<&HeaderEncryptionKeys>,
     resources: &WriterResources,
 ) -> Result<PreparedHeader> {
-    let mut extra = Vec::new();
-    write_extra_record(&mut extra, FHEXTRA_SUBDATA, service_data);
-    let specific = stored_file_specific(name, data_len, Some(crc32), 0, None, 0)?;
+    let mut extra = Bytes::new(resources);
+    write_extra_record(&mut extra, FHEXTRA_SUBDATA, service_data)?;
+    let specific = stored_file_specific(name, data_len, Some(crc32), 0, None, 0, resources)?;
     prepared_header_image(
         HEAD_SERVICE,
         HFL_EXTRA | HFL_DATA,
@@ -573,13 +596,13 @@ fn encrypted_service_block<'a>(
     let keys = Rar50Keys::derive(password, salt, WRITE_KDF_COUNT_LOG)
         .map_err(crate::rar50::map_rar50_crypto_error)?;
 
-    let mut extra = Vec::new();
-    write_extra_record(&mut extra, FHEXTRA_SUBDATA, service_data);
-    write_file_encryption_record(&mut extra, salt, iv, keys.password_check_record());
+    let mut extra = Bytes::new(resources);
+    write_extra_record(&mut extra, FHEXTRA_SUBDATA, service_data)?;
+    write_file_encryption_record(&mut extra, salt, iv, keys.password_check_record())?;
     write_hash_record_with_value(
         &mut extra,
         keys.mac_hash32(crate::rar50::blake2sp::hash(data)),
-    );
+    )?;
     let specific = stored_file_specific(
         name,
         data.len() as u64,
@@ -587,6 +610,7 @@ fn encrypted_service_block<'a>(
         0,
         None,
         0,
+        resources,
     )?;
     let payload_len = (data.len() as u64)
         .checked_add(15)
@@ -606,7 +630,7 @@ fn encrypted_service_block<'a>(
     Ok(PreparedBlock {
         header,
         payload: Payload::Encrypted {
-            plain: Box::new(Payload::Borrowed(data)),
+            plain: Owned::new(Payload::Borrowed(data), resources)?,
             keys,
             iv,
         },
@@ -614,6 +638,22 @@ fn encrypted_service_block<'a>(
         quick_open_cached: false,
         entry_index: None,
     })
+}
+
+fn decoded_rar50_name_len(bytes: &[u8]) -> usize {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return bytes.len();
+    };
+    if !text.contains('\u{fffe}') {
+        return bytes.len();
+    }
+    text.chars()
+        .map(|ch| match ch {
+            '\u{fffe}' => 0,
+            '\u{e080}'..='\u{e0ff}' => 1,
+            _ => ch.len_utf8(),
+        })
+        .sum()
 }
 
 /// Builds a member's final header and decides how its payload will be written.
@@ -636,7 +676,7 @@ fn prepare_member(
         Payload::Packed(member.packed)
     };
 
-    let mut extra = Vec::new();
+    let mut extra = Bytes::new(resources);
     let (payload, payload_len, data_crc32, hash) = match entry.password.as_deref() {
         Some(password) => {
             let mut salt = [0u8; 16];
@@ -655,12 +695,12 @@ fn prepare_member(
             })?;
             let keys = Rar50Keys::derive(password, salt, WRITE_KDF_COUNT_LOG)
                 .map_err(crate::rar50::map_rar50_crypto_error)?;
-            write_file_encryption_record(&mut extra, salt, iv, keys.password_check_record());
+            write_file_encryption_record(&mut extra, salt, iv, keys.password_check_record())?;
             let crc32 = keys.mac_crc32(member.crc32);
             let hash = keys.mac_hash32(member.hash);
             (
                 Payload::Encrypted {
-                    plain: Box::new(plain),
+                    plain: Owned::new(plain, resources)?,
                     keys,
                     iv,
                 },
@@ -674,19 +714,19 @@ fn prepare_member(
     };
     // A link has no file payload to hash; its target is protected by the header CRC.
     if entry.redirection.is_none() {
-        write_hash_record_with_value(&mut extra, hash);
+        write_hash_record_with_value(&mut extra, hash)?;
     }
-    super::headers::write_mtime_record(&mut extra, entry.mtime, entry.mtime_nanoseconds);
+    super::headers::write_mtime_record(&mut extra, entry.mtime, entry.mtime_nanoseconds)?;
     if let Some(times) = entry.file_times {
-        write_extra_record(&mut extra, super::super::FHEXTRA_HTIME, &times.encode()?);
+        write_extra_record(&mut extra, super::super::FHEXTRA_HTIME, &times.encode()?)?;
     }
     if let Some(link) = &entry.redirection {
-        let mut record = Vec::new();
-        write_vint(&mut record, link.redirection_type);
-        write_vint(&mut record, link.flags);
-        write_vint(&mut record, link.target_name.len() as u64);
-        record.extend_from_slice(&link.target_name);
-        write_extra_record(&mut extra, super::super::FHEXTRA_REDIR, &record);
+        let mut record = Bytes::new(resources);
+        record.vint(link.redirection_type)?;
+        record.vint(link.flags)?;
+        record.vint(link.target_name.len() as u64)?;
+        record.extend_from_slice(&link.target_name)?;
+        write_extra_record(&mut extra, super::super::FHEXTRA_REDIR, &record)?;
     }
 
     let specific = file_specific(
@@ -696,9 +736,9 @@ fn prepare_member(
             .redirection
             .as_ref()
             .map_or(member.input_size, |link| {
-                entry.redirection_size.unwrap_or_else(|| {
-                    crate::filename::decode_rar50(&link.target_name).len() as u64
-                })
+                entry
+                    .redirection_size
+                    .unwrap_or_else(|| decoded_rar50_name_len(&link.target_name) as u64)
             }),
         Some(data_crc32),
         entry.attributes,
@@ -706,6 +746,7 @@ fn prepare_member(
         compression_info,
         entry.host_os,
         entry.is_directory,
+        resources,
     )?;
     let header = prepared_header_image(
         HEAD_FILE,
@@ -751,14 +792,14 @@ fn write_payload(
         }
         Payload::Encrypted { plain, keys, iv } => {
             const ENCRYPT_CHUNK: usize = 64 * 1024;
-            let chunk_size = match plain.as_ref() {
+            let chunk_size = match &*plain {
                 Payload::Borrowed(data) => data.len().clamp(1, ENCRYPT_CHUNK).div_ceil(16) * 16,
                 _ => ENCRYPT_CHUNK,
             };
             let _permit = resources.acquire_cancellable(chunk_size as u64, 0, &|| {
                 progress.is_some_and(ProgressReporter::is_cancelled)
             })?;
-            match *plain {
+            match plain.into_inner() {
                 Payload::Stored(source) => {
                     let mut reader = source.open()?;
                     encrypt_reader_to(
@@ -843,10 +884,10 @@ fn write_recovery_service(
 
     debug_assert_eq!(built.plan.payload_size(), Ok(built.payload_len));
 
-    let mut service_data = Vec::new();
-    write_vint(&mut service_data, recovery_percent);
-    let mut extra = Vec::new();
-    write_extra_record(&mut extra, FHEXTRA_SUBDATA, &service_data);
+    let mut service_data = Bytes::new(resources);
+    service_data.vint(recovery_percent)?;
+    let mut extra = Bytes::new(resources);
+    write_extra_record(&mut extra, FHEXTRA_SUBDATA, &service_data)?;
     let specific = stored_file_specific(
         b"RR",
         built.payload_len,
@@ -854,6 +895,7 @@ fn write_recovery_service(
         0,
         None,
         0,
+        resources,
     )?;
     let header = match header_keys {
         Some(keys) => encrypted_header_block(
@@ -864,6 +906,7 @@ fn write_recovery_service(
             &specific,
             &extra,
             &[],
+            resources,
         )?,
         None => block_header_image(
             HEAD_SERVICE,
@@ -871,6 +914,7 @@ fn write_recovery_service(
             Some(built.payload_len),
             &specific,
             &extra,
+            resources,
         )?,
     };
     output.write_all(&header)?;
@@ -904,7 +948,7 @@ enum FragmentSource {
     Packed(Spool),
     Stored {
         prepared: PreparedSource,
-        emitted: Box<ChecksumSink>,
+        emitted: Owned<ChecksumSink>,
     },
 }
 
@@ -1041,8 +1085,8 @@ impl Write for ChecksumSink {
 }
 
 /// A member ready to be sliced across volumes.
-struct VolumeMember {
-    name: Vec<u8>,
+struct VolumeMember<'a> {
+    name: &'a [u8],
     is_directory: bool,
     mtime: Option<u32>,
     mtime_nanoseconds: Option<u32>,
@@ -1107,7 +1151,10 @@ pub(super) fn write_volumes(
         None
     };
 
-    let sources: Vec<_> = entries.iter().map(|entry| entry.source.clone()).collect();
+    let mut sources = Records::new(entries.len(), resources)?;
+    for entry in entries {
+        sources.push(entry.source.clone())?;
+    }
     let total_input: u64 = entries
         .iter()
         .map(|entry| {
@@ -1142,13 +1189,13 @@ pub(super) fn write_volumes(
         &|index, error| member_error(error, &entries[index].name, "compressing"),
     )?;
 
-    let mut members = Vec::with_capacity(entries.len());
+    let mut members = Records::new(entries.len(), resources)?;
     for (entry, member) in entries.iter().zip(compressed) {
         check_cancelled(plan.progress)?;
         members.push(
             prepare_volume_member(entry, member, &plan, resources)
                 .map_err(|error| member_error(error, &entry.name, "preparing volume payload"))?,
-        );
+        )?;
     }
     if !work.finish() {
         return Err(Error::Cancelled);
@@ -1179,7 +1226,7 @@ pub(super) fn write_volumes(
     for mut member in members {
         writer
             .write_member(&mut member)
-            .map_err(|error| member_error(error, &member.name, "writing volume member"))?;
+            .map_err(|error| member_error(error, member.name, "writing volume member"))?;
     }
     writer.finish()?;
     check_cancelled(plan.progress)?;
@@ -1189,12 +1236,12 @@ pub(super) fn write_volumes(
 
 /// Compresses and, if needed, encrypts one member into a form that can be cut
 /// at any byte boundary.
-fn prepare_volume_member(
-    entry: &ArchiveEntry,
+fn prepare_volume_member<'a>(
+    entry: &'a ArchiveEntry,
     member: CompressedMember,
     plan: &EnginePlan<'_>,
     resources: &WriterResources,
-) -> Result<VolumeMember> {
+) -> Result<VolumeMember<'a>> {
     let progress = plan.progress;
     check_cancelled(progress)?;
     let compression_info = compress::member_compression_info(&plan.compress, &member)?;
@@ -1260,7 +1307,7 @@ fn prepare_volume_member(
             let payload_len = encrypted.len();
             encrypted.park();
             Ok(VolumeMember {
-                name: entry.name.clone(),
+                name: &entry.name,
                 is_directory: entry.is_directory,
                 mtime: entry.mtime,
                 mtime_nanoseconds: entry.mtime_nanoseconds,
@@ -1277,7 +1324,7 @@ fn prepare_volume_member(
             })
         }
         None => Ok(VolumeMember {
-            name: entry.name.clone(),
+            name: &entry.name,
             is_directory: entry.is_directory,
             mtime: entry.mtime,
             mtime_nanoseconds: entry.mtime_nanoseconds,
@@ -1292,7 +1339,7 @@ fn prepare_volume_member(
             source: if member.store {
                 FragmentSource::Stored {
                     prepared: PreparedSource::new(&entry.source, &member),
-                    emitted: Box::default(),
+                    emitted: Owned::new(ChecksumSink::default(), resources)?,
                 }
             } else {
                 FragmentSource::Packed(member.packed)
@@ -1356,6 +1403,7 @@ impl VolumeWriter<'_> {
                 split_before,
                 fragment_checksums,
                 self.header_keys,
+                self.resources,
             )?;
             let body = self.body.as_mut().expect("volume started");
             body.write_all(&header)?;
@@ -1400,11 +1448,11 @@ impl VolumeWriter<'_> {
 
         let head_crypt = match self.header_keys {
             Some(keys) => {
-                let mut block = Vec::new();
-                write_head_crypt(&mut block, keys)?;
+                let mut block = Bytes::new(self.resources);
+                write_head_crypt(&mut block, keys, self.resources)?;
                 block
             }
-            None => Vec::new(),
+            None => Bytes::new(self.resources),
         };
 
         let mut main_flags = crate::rar50::MHFL_VOLUME | crate::rar50::MHFL_VOLUME_NUMBER;
@@ -1415,17 +1463,20 @@ impl VolumeWriter<'_> {
             main_flags |= MHFL_RECOVERY;
         }
 
-        let layout = resolve_layout(&LayoutInputs {
-            header_encrypted: self.header_keys.is_some(),
-            head_crypt_len: head_crypt.len() as u64,
-            main_flags,
-            volume_number: Some(volume_number),
-            archive_metadata: None,
-            metadata_record: None,
-            body_len: body.len(),
-            quick_open_payload_len: None,
-            recovery_percent: self.recovery_percent,
-        })?;
+        let layout = resolve_layout(
+            &LayoutInputs {
+                header_encrypted: self.header_keys.is_some(),
+                head_crypt_len: head_crypt.len() as u64,
+                main_flags,
+                volume_number: Some(volume_number),
+                archive_metadata: None,
+                metadata_record: None,
+                body_len: body.len(),
+                quick_open_payload_len: None,
+                recovery_percent: self.recovery_percent,
+            },
+            self.resources,
+        )?;
 
         check_cancelled(self.progress)?;
         let raw_output = self.sink.start_volume(volume_number)?;
@@ -1449,14 +1500,16 @@ impl VolumeWriter<'_> {
                     main_flags,
                     Some(volume_number),
                     &layout.main_extra,
+                    self.resources,
                 )?,
                 None => {
-                    let mut main = Vec::new();
+                    let mut main = Bytes::new(self.resources);
                     write_main_header(
                         &mut main,
                         main_flags,
                         Some(volume_number),
                         &layout.main_extra,
+                        self.resources,
                     )?;
                     main
                 }
@@ -1501,10 +1554,11 @@ impl VolumeWriter<'_> {
                 &super::end_header_specific(end_flags),
                 &[],
                 &[],
+                self.resources,
             )?,
             None => {
-                let mut end = Vec::new();
-                write_end_header(&mut end, end_flags)?;
+                let mut end = Bytes::new(self.resources);
+                write_end_header(&mut end, end_flags, self.resources)?;
                 end
             }
         };
@@ -1536,19 +1590,20 @@ fn fragment_header(
     split_before: bool,
     fragment: Option<FragmentChecksums>,
     header_keys: Option<&HeaderEncryptionKeys>,
-) -> Result<Vec<u8>> {
+    resources: &WriterResources,
+) -> Result<Bytes> {
     let split_after = fragment.is_some();
-    let mut extra = Vec::new();
+    let mut extra = Bytes::new(resources);
     if let Some((salt, iv, check_value)) = member.encryption {
-        write_file_encryption_record(&mut extra, salt, iv, check_value);
+        write_file_encryption_record(&mut extra, salt, iv, check_value)?;
     }
-    write_hash_record_with_value(&mut extra, fragment.map_or(member.hash, |f| f.hash));
-    super::headers::write_mtime_record(&mut extra, member.mtime, member.mtime_nanoseconds);
+    write_hash_record_with_value(&mut extra, fragment.map_or(member.hash, |f| f.hash))?;
+    super::headers::write_mtime_record(&mut extra, member.mtime, member.mtime_nanoseconds)?;
     if let Some(times) = member.file_times {
-        write_extra_record(&mut extra, super::super::FHEXTRA_HTIME, &times.encode()?);
+        write_extra_record(&mut extra, super::super::FHEXTRA_HTIME, &times.encode()?)?;
     }
     let specific = file_specific(
-        &member.name,
+        member.name,
         member.unpacked_size,
         Some(fragment.map_or(member.crc32, |f| f.crc32)),
         member.attributes,
@@ -1556,6 +1611,7 @@ fn fragment_header(
         member.compression_info,
         member.host_os,
         member.is_directory,
+        resources,
     )?;
 
     let mut flags = HFL_DATA;
@@ -1577,8 +1633,16 @@ fn fragment_header(
             &specific,
             &extra,
             &[],
+            resources,
         ),
-        None => block_header_image(HEAD_FILE, flags, Some(fragment_len), &specific, &extra),
+        None => block_header_image(
+            HEAD_FILE,
+            flags,
+            Some(fragment_len),
+            &specific,
+            &extra,
+            resources,
+        ),
     }
 }
 
@@ -1692,6 +1756,27 @@ mod service_payload_tests {
             )
             .unwrap();
             assert_eq!(actual, expected, "service size {size}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod preparation_name_tests {
+    use super::*;
+    #[test]
+    fn allocation_free_target_length_preserves_rar50_mapping_rules() {
+        for bytes in [
+            b"plain".as_slice(),
+            b"\xffinvalid",
+            "é/名字".as_bytes(),
+            "\u{e080}".as_bytes(),
+            "\u{fffe}a\u{e080}\u{e0ff}é".as_bytes(),
+            "\u{fffe}\u{fffe}".as_bytes(),
+        ] {
+            assert_eq!(
+                decoded_rar50_name_len(bytes),
+                crate::filename::decode_rar50(bytes).len()
+            );
         }
     }
 }

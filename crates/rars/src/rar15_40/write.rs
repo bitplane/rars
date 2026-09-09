@@ -249,6 +249,13 @@ pub fn write_streaming_archive_to(
     progress: Option<&dyn WriteProgress>,
     output: &mut dyn Write,
 ) -> Result<()> {
+    if resources.max_preparation_bytes().is_some() {
+        return Err(Error::UnsupportedFamilyFeature {
+            family: options.target.family(),
+            feature: "preparation memory quota",
+        });
+    }
+
     let members: Vec<_> = entries.iter().map(Member::from_streaming).collect();
     write_archive_to(
         &members,
@@ -300,6 +307,13 @@ fn write_archive_to(
     explicit_header_password: Option<&[u8]>,
     archive_comment_password: Option<&[u8]>,
 ) -> Result<()> {
+    if resources.max_preparation_bytes().is_some() {
+        return Err(Error::UnsupportedFamilyFeature {
+            family: options.target.family(),
+            feature: "preparation memory quota",
+        });
+    }
+
     if let Some(password) = archive_comment_password {
         if password.is_empty()
             || archive_comment.is_none()

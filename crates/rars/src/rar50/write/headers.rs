@@ -13,10 +13,12 @@ use crate::rar50::{
     MHEXTRA_ARCHIVE_METADATA_NAME, MHEXTRA_ARCHIVE_METADATA_TIME, MHEXTRA_LOCATOR,
     MHEXTRA_LOCATOR_QUICK_OPEN, MHEXTRA_LOCATOR_RECOVERY,
 };
+use crate::streaming::preparation::Bytes;
+use crate::WriterResources;
 use crate::{crc32::crc32, Error, Result};
 
 /// Bounded framing scratch; callers choose capacities from the on-disk fields.
-struct HeaderScratch<const N: usize> {
+pub(crate) struct HeaderScratch<const N: usize> {
     bytes: [u8; N],
     len: usize,
 }
@@ -49,6 +51,38 @@ impl<const N: usize> HeaderScratch<N> {
     }
 }
 
+impl<const N: usize> std::ops::Deref for HeaderScratch<N> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+pub(crate) trait HeaderOutput {
+    fn append(&mut self, bytes: &[u8]) -> Result<()>;
+    fn vint(&mut self, value: u64) -> Result<()>;
+}
+impl HeaderOutput for Bytes {
+    fn append(&mut self, bytes: &[u8]) -> Result<()> {
+        self.extend_from_slice(bytes)
+    }
+    fn vint(&mut self, value: u64) -> Result<()> {
+        self.vint(value)
+    }
+}
+#[cfg(test)]
+impl HeaderOutput for Vec<u8> {
+    fn append(&mut self, bytes: &[u8]) -> Result<()> {
+        self.extend_from_slice(bytes);
+        Ok(())
+    }
+    fn vint(&mut self, value: u64) -> Result<()> {
+        write_vint(self, value);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 pub(super) fn write_vint(out: &mut Vec<u8>, mut value: u64) {
     while value >= 0x80 {
         out.push((value as u8) | 0x80);
@@ -57,28 +91,39 @@ pub(super) fn write_vint(out: &mut Vec<u8>, mut value: u64) {
     out.push(value as u8);
 }
 
-pub(super) fn write_extra_record(out: &mut Vec<u8>, record_type: u64, data: &[u8]) {
+pub(super) fn write_extra_record(
+    out: &mut impl HeaderOutput,
+    record_type: u64,
+    data: &[u8],
+) -> Result<()> {
     let mut kind = HeaderScratch::<10>::new();
     kind.vint(record_type);
     // A slice length is at most isize::MAX, so adding a ten-byte vint fits u64.
-    write_vint(out, data.len() as u64 + kind.len() as u64);
-    out.extend_from_slice(kind.as_slice());
-    out.extend_from_slice(data);
+    out.vint(data.len() as u64 + kind.len() as u64)?;
+    out.append(kind.as_slice())?;
+    out.append(data)?;
+
+    Ok(())
 }
 
-pub(super) fn write_hash_record_with_value(out: &mut Vec<u8>, hash: [u8; 32]) {
+pub(super) fn write_hash_record_with_value(
+    out: &mut impl HeaderOutput,
+    hash: [u8; 32],
+) -> Result<()> {
     let mut record = HeaderScratch::<33>::new();
     record.vint(0);
     record.extend_from_slice(&hash);
-    write_extra_record(out, FHEXTRA_HASH, record.as_slice());
+    write_extra_record(out, FHEXTRA_HASH, record.as_slice())?;
+
+    Ok(())
 }
 
 pub(super) fn write_file_encryption_record(
-    out: &mut Vec<u8>,
+    out: &mut impl HeaderOutput,
     salt: [u8; 16],
     iv: [u8; 16],
     check_value: [u8; 12],
-) {
+) -> Result<()> {
     let mut record = HeaderScratch::<47>::new();
     record.vint(0);
     record.vint(0x0003);
@@ -86,7 +131,9 @@ pub(super) fn write_file_encryption_record(
     record.extend_from_slice(&salt);
     record.extend_from_slice(&iv);
     record.extend_from_slice(&check_value);
-    write_extra_record(out, FHEXTRA_CRYPT, record.as_slice());
+    write_extra_record(out, FHEXTRA_CRYPT, record.as_slice())?;
+
+    Ok(())
 }
 
 fn image_size_error() -> Error {
@@ -104,12 +151,12 @@ fn checked_image_len(parts: &[usize]) -> Result<usize> {
     Ok(len)
 }
 
-fn join_record(parts: &[&[u8]]) -> Result<Vec<u8>> {
+fn join_record(parts: &[&[u8]], resources: &WriterResources) -> Result<Bytes> {
     let len = parts
         .iter()
         .try_fold(0usize, |total, part| total.checked_add(part.len()))
         .ok_or_else(image_size_error)?;
-    let mut out = vec![0; checked_image_len(&[len])?];
+    let mut out = Bytes::zeroed(checked_image_len(&[len])?, resources)?;
     let mut offset = 0;
     for part in parts {
         out[offset..offset + part.len()].copy_from_slice(part);
@@ -171,9 +218,14 @@ impl<'a> HeaderImage<'a> {
         }
     }
 
-    fn render(&self, keys: Option<&Rar50Keys>, data: &[u8]) -> Result<Vec<u8>> {
+    fn render(
+        &self,
+        keys: Option<&Rar50Keys>,
+        data: &[u8],
+        resources: &WriterResources,
+    ) -> Result<Bytes> {
         let header_len = self.header_len(keys.is_some())?;
-        let mut out = vec![0; checked_image_len(&[header_len, data.len()])?];
+        let mut out = Bytes::zeroed(checked_image_len(&[header_len, data.len()])?, resources)?;
         let start = if keys.is_some() { 16 } else { 0 };
         let mut offset = start + 4;
         for part in [
@@ -211,22 +263,36 @@ pub(super) fn block_header_image(
     data_size: Option<u64>,
     type_specific: &[u8],
     extra: &[u8],
-) -> Result<Vec<u8>> {
-    HeaderImage::new(header_type, flags, data_size, type_specific, extra)?.render(None, &[])
+    resources: &WriterResources,
+) -> Result<Bytes> {
+    HeaderImage::new(header_type, flags, data_size, type_specific, extra)?.render(
+        None,
+        &[],
+        resources,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn write_block(
-    out: &mut Vec<u8>,
+    out: &mut impl HeaderOutput,
     header_type: u64,
     flags: u64,
     data_size: Option<u64>,
     type_specific: &[u8],
     extra: &[u8],
     data: &[u8],
+    resources: &WriterResources,
 ) -> Result<()> {
-    let header = block_header_image(header_type, flags, data_size, type_specific, extra)?;
-    out.extend_from_slice(&header);
-    out.extend_from_slice(data);
+    let header = block_header_image(
+        header_type,
+        flags,
+        data_size,
+        type_specific,
+        extra,
+        resources,
+    )?;
+    out.append(&header)?;
+    out.append(data)?;
     Ok(())
 }
 
@@ -234,6 +300,7 @@ pub(super) fn write_block(
 ///
 /// Each block gets its own IV and its own CBC chain, so headers can be built
 /// and emitted one at a time without any cross-block state.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encrypted_header_block(
     keys: &Rar50Keys,
     header_type: u64,
@@ -242,8 +309,13 @@ pub(crate) fn encrypted_header_block(
     type_specific: &[u8],
     extra: &[u8],
     data: &[u8],
-) -> Result<Vec<u8>> {
-    HeaderImage::new(header_type, flags, data_size, type_specific, extra)?.render(Some(keys), data)
+    resources: &WriterResources,
+) -> Result<Bytes> {
+    HeaderImage::new(header_type, flags, data_size, type_specific, extra)?.render(
+        Some(keys),
+        data,
+        resources,
+    )
 }
 
 pub(super) fn stored_file_specific(
@@ -253,7 +325,8 @@ pub(super) fn stored_file_specific(
     attributes: u64,
     mtime: Option<u32>,
     host_os: u64,
-) -> Result<Vec<u8>> {
+    resources: &WriterResources,
+) -> Result<Bytes> {
     file_specific(
         name,
         unpacked_size,
@@ -263,6 +336,7 @@ pub(super) fn stored_file_specific(
         0,
         host_os,
         false,
+        resources,
     )
 }
 
@@ -277,7 +351,8 @@ pub(super) fn file_specific(
     compression_info: u64,
     host_os: u64,
     is_directory: bool,
-) -> Result<Vec<u8>> {
+    resources: &WriterResources,
+) -> Result<Bytes> {
     if name.is_empty() {
         return Err(Error::InvalidArgument("RAR 5 file name is empty"));
     }
@@ -302,10 +377,14 @@ pub(super) fn file_specific(
     specific.vint(compression_info);
     specific.vint(host_os);
     specific.vint(name.len() as u64);
-    join_record(&[specific.as_slice(), name])
+    join_record(&[specific.as_slice(), name], resources)
 }
 
-pub(super) fn write_mtime_record(extra: &mut Vec<u8>, seconds: Option<u32>, nanos: Option<u32>) {
+pub(super) fn write_mtime_record(
+    extra: &mut impl HeaderOutput,
+    seconds: Option<u32>,
+    nanos: Option<u32>,
+) -> Result<()> {
     if let (Some(seconds), Some(nanos)) = (seconds, nanos) {
         // Unix time + mtime + nanoseconds. Emit the complete timestamp here,
         // with no base-header time competing with the higher precision record.
@@ -313,11 +392,18 @@ pub(super) fn write_mtime_record(extra: &mut Vec<u8>, seconds: Option<u32>, nano
         record.extend_from_slice(&[0x13]);
         record.extend_from_slice(&seconds.to_le_bytes());
         record.extend_from_slice(&nanos.to_le_bytes());
-        write_extra_record(extra, super::super::FHEXTRA_HTIME, record.as_slice());
+        write_extra_record(extra, super::super::FHEXTRA_HTIME, record.as_slice())?;
     }
+
+    Ok(())
 }
 
-fn metadata_image(flags: u64, name: Option<&[u8]>, time: &[u8]) -> Result<Vec<u8>> {
+fn metadata_image(
+    flags: u64,
+    name: Option<&[u8]>,
+    time: &[u8],
+    resources: &WriterResources,
+) -> Result<Bytes> {
     let mut fields = HeaderScratch::<20>::new();
     fields.vint(flags);
     if let Some(name) = name {
@@ -329,16 +415,22 @@ fn metadata_image(flags: u64, name: Option<&[u8]>, time: &[u8]) -> Result<Vec<u8
     let body_len = checked_image_len(&[kind.len(), fields.len(), name.len(), time.len()])?;
     let mut size = HeaderScratch::<10>::new();
     size.vint(body_len as u64);
-    join_record(&[
-        size.as_slice(),
-        kind.as_slice(),
-        fields.as_slice(),
-        name,
-        time,
-    ])
+    join_record(
+        &[
+            size.as_slice(),
+            kind.as_slice(),
+            fields.as_slice(),
+            name,
+            time,
+        ],
+        resources,
+    )
 }
 
-pub(super) fn archive_metadata_record(metadata: ArchiveMetadataEntry<'_>) -> Result<Vec<u8>> {
+pub(super) fn archive_metadata_record(
+    metadata: ArchiveMetadataEntry<'_>,
+    resources: &WriterResources,
+) -> Result<Bytes> {
     if metadata.name.is_none() && metadata.creation_time.is_none() {
         return Err(Error::InvalidArgument(
             "RAR 5 archive metadata writer needs a name or creation time",
@@ -367,14 +459,15 @@ pub(super) fn archive_metadata_record(metadata: ArchiveMetadataEntry<'_>) -> Res
         flags,
         metadata.name,
         time.as_ref().map_or(&[], |bytes| bytes.as_slice()),
+        resources,
     )
 }
 
 pub(super) fn write_locator_record(
-    out: &mut Vec<u8>,
+    out: &mut impl HeaderOutput,
     quick_open_offset: Option<u64>,
     recovery_record_offset: Option<u64>,
-) {
+) -> Result<()> {
     let mut flags = 0;
     if quick_open_offset.is_some() {
         flags |= MHEXTRA_LOCATOR_QUICK_OPEN;
@@ -391,30 +484,34 @@ pub(super) fn write_locator_record(
     if let Some(recovery_record_offset) = recovery_record_offset {
         record.vint(recovery_record_offset);
     }
-    write_extra_record(out, MHEXTRA_LOCATOR, record.as_slice());
+    write_extra_record(out, MHEXTRA_LOCATOR, record.as_slice())?;
+
+    Ok(())
 }
 
 pub(super) fn resolved_main_extra(
     archive_metadata: Option<ArchiveMetadataEntry<'_>>,
     quick_open_offset: Option<u64>,
     recovery_offset: Option<u64>,
-) -> Result<Vec<u8>> {
-    let mut main_extra = Vec::new();
+    resources: &WriterResources,
+) -> Result<Bytes> {
+    let mut main_extra = Bytes::new(resources);
     let locator_quick_open_offset = quick_open_offset.or_else(|| archive_metadata.map(|_| 0));
     if locator_quick_open_offset.is_some() || recovery_offset.is_some() {
-        write_locator_record(&mut main_extra, locator_quick_open_offset, recovery_offset);
+        write_locator_record(&mut main_extra, locator_quick_open_offset, recovery_offset)?;
     }
     if let Some(archive_metadata) = archive_metadata {
-        main_extra.extend_from_slice(&archive_metadata_record(archive_metadata)?);
+        main_extra.extend_from_slice(&archive_metadata_record(archive_metadata, resources)?)?;
     }
     Ok(main_extra)
 }
 
 pub(super) fn write_main_header(
-    out: &mut Vec<u8>,
+    out: &mut impl HeaderOutput,
     archive_flags: u64,
     volume_number: Option<u64>,
     extra: &[u8],
+    resources: &WriterResources,
 ) -> Result<()> {
     let mut specific = HeaderScratch::<20>::new();
     specific.vint(archive_flags);
@@ -429,6 +526,7 @@ pub(super) fn write_main_header(
         specific.as_slice(),
         extra,
         &[],
+        resources,
     )
 }
 
@@ -437,7 +535,8 @@ pub(super) fn encrypted_main_header_block(
     archive_flags: u64,
     volume_number: Option<u64>,
     extra: &[u8],
-) -> Result<Vec<u8>> {
+    resources: &WriterResources,
+) -> Result<Bytes> {
     let mut specific = HeaderScratch::<20>::new();
     specific.vint(archive_flags);
     if let Some(volume_number) = volume_number {
@@ -451,6 +550,7 @@ pub(super) fn encrypted_main_header_block(
         specific.as_slice(),
         extra,
         &[],
+        resources,
     )
 }
 
@@ -486,8 +586,9 @@ pub(super) fn header_encryption_password<'a>(
 }
 
 pub(super) fn write_head_crypt(
-    out: &mut Vec<u8>,
+    out: &mut impl HeaderOutput,
     header_keys: &HeaderEncryptionKeys,
+    resources: &WriterResources,
 ) -> Result<()> {
     let mut specific = HeaderScratch::<31>::new();
     specific.vint(0);
@@ -495,10 +596,23 @@ pub(super) fn write_head_crypt(
     specific.extend_from_slice(&[WRITE_KDF_COUNT_LOG]);
     specific.extend_from_slice(&header_keys.salt);
     specific.extend_from_slice(&header_keys.keys.password_check_record());
-    write_block(out, HEAD_CRYPT, 0, None, specific.as_slice(), &[], &[])
+    write_block(
+        out,
+        HEAD_CRYPT,
+        0,
+        None,
+        specific.as_slice(),
+        &[],
+        &[],
+        resources,
+    )
 }
 
-pub(crate) fn write_end_header(out: &mut Vec<u8>, end_flags: u64) -> Result<()> {
+pub(crate) fn write_end_header(
+    out: &mut impl HeaderOutput,
+    end_flags: u64,
+    resources: &WriterResources,
+) -> Result<()> {
     write_block(
         out,
         HEAD_END,
@@ -507,18 +621,20 @@ pub(crate) fn write_end_header(out: &mut Vec<u8>, end_flags: u64) -> Result<()> 
         &end_header_specific(end_flags),
         &[],
         &[],
+        resources,
     )
 }
 
-pub(crate) fn end_header_specific(end_flags: u64) -> Vec<u8> {
-    let mut specific = Vec::new();
-    write_vint(&mut specific, end_flags);
+pub(crate) fn end_header_specific(end_flags: u64) -> HeaderScratch<10> {
+    let mut specific = HeaderScratch::new();
+    specific.vint(end_flags);
     specific
 }
 
 pub(crate) fn retained_archive_metadata(
     metadata: &crate::rar50::ArchiveMetadataRecord,
-) -> Result<Vec<u8>> {
+    resources: &WriterResources,
+) -> Result<Bytes> {
     if metadata.flags & !15 != 0
         || (metadata.flags & 8 != 0 && metadata.flags & 4 == 0)
         || (metadata.flags & 1 != 0) != metadata.name.is_some()
@@ -549,12 +665,13 @@ pub(crate) fn retained_archive_metadata(
         metadata.flags,
         metadata.name.as_deref(),
         time_bytes.as_slice(),
+        resources,
     )
 }
 
 /// An immutable final header image. Free bytes before releasing admission.
 pub(super) struct PreparedHeader {
-    bytes: Vec<u8>,
+    bytes: Bytes,
     _charge: Option<crate::streaming::StorageCharge>,
 }
 
@@ -577,7 +694,7 @@ pub(super) fn prepared_header_image(
     let image = HeaderImage::new(header_type, flags, data_size, type_specific, extra)?;
     let length = image.header_len(keys.is_some())?;
     let charge = resources.reserve_prepared_header(length as u64)?;
-    let bytes = image.render(keys.map(|keys| &keys.keys), &[])?;
+    let bytes = image.render(keys.map(|keys| &keys.keys), &[], resources)?;
     Ok(PreparedHeader {
         bytes,
         _charge: charge,
@@ -596,8 +713,15 @@ mod prepared_header_tests {
             let specific = vec![0x51; len];
             for encrypted in [false, true] {
                 let key = encrypted.then_some(&keys);
-                let expected =
-                    block_header_image(2, HFL_EXTRA, Some(u64::MAX), &specific, b"extra").unwrap();
+                let expected = block_header_image(
+                    2,
+                    HFL_EXTRA,
+                    Some(u64::MAX),
+                    &specific,
+                    b"extra",
+                    &crate::WriterResources::default(),
+                )
+                .unwrap();
                 let size = if encrypted {
                     16 + expected.len().div_ceil(16) * 16
                 } else {
@@ -645,10 +769,10 @@ mod prepared_header_tests {
                     Rar50Cipher::new(keys.keys.key, iv)
                         .decrypt_in_place(&mut plain)
                         .unwrap();
-                    assert_eq!(&plain[..expected.len()], expected);
+                    assert_eq!(&plain[..expected.len()], expected.as_slice());
                     assert!(plain[expected.len()..].iter().all(|byte| *byte == 0));
                 } else {
-                    assert_eq!(&*header, expected);
+                    assert_eq!(&*header, expected.as_slice());
                 }
                 drop(header);
                 assert!(resources.reserve_prepared_header(size as u64).is_ok());
@@ -690,7 +814,7 @@ mod scratch_tests {
             let data = vec![0xa5; len];
             for kind in [0, 127, 128, u64::MAX] {
                 let mut record = vec![0x5a];
-                write_extra_record(&mut record, kind, &data);
+                write_extra_record(&mut record, kind, &data).unwrap();
                 let mut expected = vec![0x5a];
                 expected.extend(buffered_record(kind, &data));
                 assert_eq!(record, expected);
@@ -713,7 +837,15 @@ mod scratch_tests {
                         let crc = crc32(&expected[4..]);
                         expected[..4].copy_from_slice(&crc.to_le_bytes());
                         assert_eq!(
-                            block_header_image(kind, flags, size, b"specific", &data).unwrap(),
+                            block_header_image(
+                                kind,
+                                flags,
+                                size,
+                                b"specific",
+                                &data,
+                                &crate::WriterResources::default()
+                            )
+                            .unwrap(),
                             expected
                         );
                     }
@@ -725,19 +857,19 @@ mod scratch_tests {
     #[test]
     fn fixed_records_fit_their_stack_capacity_and_keep_wire_bytes() {
         let mut actual = Vec::new();
-        write_file_encryption_record(&mut actual, [1; 16], [2; 16], [3; 12]);
+        write_file_encryption_record(&mut actual, [1; 16], [2; 16], [3; 12]).unwrap();
         let mut body = vec![0, 3, WRITE_KDF_COUNT_LOG];
         body.extend_from_slice(&[1; 16]);
         body.extend_from_slice(&[2; 16]);
         body.extend_from_slice(&[3; 12]);
         assert_eq!(actual, buffered_record(FHEXTRA_CRYPT, &body));
         actual.clear();
-        write_hash_record_with_value(&mut actual, [7; 32]);
+        write_hash_record_with_value(&mut actual, [7; 32]).unwrap();
         let mut body = vec![0];
         body.extend_from_slice(&[7; 32]);
         assert_eq!(actual, buffered_record(FHEXTRA_HASH, &body));
         actual.clear();
-        write_mtime_record(&mut actual, Some(u32::MAX), Some(u32::MAX));
+        write_mtime_record(&mut actual, Some(u32::MAX), Some(u32::MAX)).unwrap();
         let mut body = vec![0x13];
         body.extend_from_slice(&[0xff; 8]);
         assert_eq!(
@@ -745,7 +877,7 @@ mod scratch_tests {
             buffered_record(super::super::super::FHEXTRA_HTIME, &body)
         );
         actual.clear();
-        write_locator_record(&mut actual, Some(u64::MAX), Some(u64::MAX));
+        write_locator_record(&mut actual, Some(u64::MAX), Some(u64::MAX)).unwrap();
         let mut body = Vec::new();
         write_vint(
             &mut body,
@@ -775,22 +907,25 @@ mod image_tests {
                 &specific,
                 b"extra",
                 data,
+                &crate::WriterResources::default(),
             )
             .unwrap();
             let iv = actual[..16].try_into().unwrap();
-            let mut expected = block_header_image(
+            let expected = block_header_image(
                 u64::MAX,
                 HFL_EXTRA,
                 Some(data.len() as u64),
                 &specific,
                 b"extra",
+                &crate::WriterResources::default(),
             )
             .unwrap();
+            let mut expected = expected.to_vec();
             expected.resize(expected.len().div_ceil(16) * 16, 0);
             Rar50Cipher::new(keys.keys.key, iv)
                 .encrypt_in_place(&mut expected)
                 .unwrap();
-            assert_eq!(&actual[16..16 + expected.len()], expected);
+            assert_eq!(&actual[16..16 + expected.len()], expected.as_slice());
             assert_eq!(&actual[16 + expected.len()..], data);
             assert_eq!(actual.capacity(), actual.len());
         }
@@ -825,16 +960,20 @@ mod image_tests {
                     }
                 }
                 let mut expected = Vec::new();
-                write_extra_record(&mut expected, MHEXTRA_ARCHIVE_METADATA, &body);
-                let actual = retained_archive_metadata(&record).unwrap();
+                write_extra_record(&mut expected, MHEXTRA_ARCHIVE_METADATA, &body).unwrap();
+                let actual =
+                    retained_archive_metadata(&record, &crate::WriterResources::default()).unwrap();
                 assert_eq!(actual, expected);
                 assert_eq!(actual.capacity(), actual.len());
                 if flags == 2 || flags == 3 {
                     assert_eq!(
-                        archive_metadata_record(ArchiveMetadataEntry {
-                            name: record.name.as_deref(),
-                            creation_time: record.creation_time,
-                        })
+                        archive_metadata_record(
+                            ArchiveMetadataEntry {
+                                name: record.name.as_deref(),
+                                creation_time: record.creation_time,
+                            },
+                            &crate::WriterResources::default()
+                        )
                         .unwrap(),
                         expected
                     );
@@ -855,6 +994,7 @@ mod image_tests {
             u64::MAX,
             u64::MAX,
             true,
+            &crate::WriterResources::default(),
         )
         .unwrap();
         let mut expected = Vec::new();

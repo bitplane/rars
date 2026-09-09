@@ -644,7 +644,10 @@ impl Builder {
             ));
         }
         if let Some(metadata) = &metadata {
-            rar50::write::headers::retained_archive_metadata(metadata)?;
+            rar50::write::headers::retained_archive_metadata(
+                metadata,
+                &WriterResources::default(),
+            )?;
         }
         self.archive_metadata = metadata;
         self.locked = locked;
@@ -1090,6 +1093,12 @@ impl Builder {
         self.check_single()?;
         if self.streams_rar50() {
             return self.write_streaming_rar50(output, resources, progress);
+        }
+        if resources.max_preparation_bytes().is_some() {
+            return Err(Error::UnsupportedFamilyFeature {
+                family: self.format.family(),
+                feature: "preparation memory quota",
+            });
         }
         let progress = ResourceProgress::new(resources, progress.map(ProgressReporter));
         let reporting = Some(ProgressReporter(&progress));

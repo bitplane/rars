@@ -139,8 +139,46 @@ final image directly. Filename and archive-metadata records allocate their exact
 final size without intermediate payload copies. Plain, encrypted and prepared
 headers share framing logic; encrypted headers compute their final layout and
 encrypt in place without a separate plaintext or padded ciphertext buffer.
-Only prepared images currently carry a quota charge. Variable-length record
-allocations and the other output images still need separate accounting.
+The image-only quota remains independently available. The broader preparation
+policy below also accounts for scratch records and transient header images.
+
+## Available quota: RAR5/7 engine preparation memory
+
+`WriterResources::with_max_preparation_bytes(limit)` bounds the live allocation
+capacity of the RAR5/7 engine's header and preparation owners. Clones share one
+ledger; configuring the option creates a fresh group. The default is unlimited.
+This is one preparation policy covering both retained and temporary owners,
+not a separate user setting for each internal buffer type.
+
+| Allocation or path | Treatment |
+| --- | --- |
+| Header scratch | Filename/type-specific fields, extras, mapped link records, archive metadata, layout iterations and recovery subdata use charged byte buffers. Fixed framing and extended timestamp records use stack storage. |
+| Final header images | Member/service/comment/quick-open images, main/end/encryption headers, recovery headers and volume fragment images reserve capacity before allocation. IV and cipher padding count. The image-only quota can also apply independently. |
+| Retained descriptors | Source arrays, prepared block arrays and volume-member arrays reserve their complete backing allocation before filling. Service counts are included in block admission. A consuming iterator retains the array's charge until its backing allocation is freed. |
+| Boxed preparation state | Nested payload owners and volume integrity state carry their own charges. Inline state in descriptor arrays is included in the array allocation. |
+| Borrowed payload and names | Plain service payloads and volume filenames borrow engine input. Source handles clone existing shared ownership rather than cloning payloads. Mapped link lengths are measured without allocating decoded names. |
+| Legacy writers | RAR1.3–4.0 header/comment construction remains intertwined with unaccounted legacy materialization. Supplying this hard policy is explicitly refused, including the high-level builder fallback, before emission. Calls without this policy retain existing legacy support. |
+| Compression coordination and workspace | Compression plans, job arrays, worker/result containers, codec/filter history, KDF/encryption/recovery workspace and source-reader internals remain with the workspace/admission pass. The preparation quota is not a bound on these allocations. |
+| Adapters, sinks and diagnostics | Caller/adapter-created `ArchiveEntry` inputs, high-level input conversion, external source/sink callbacks, output collectors, error/context allocations and allocator overhead are outside this engine quota. High-level policy integration and output ownership remain later passes. Recovery repair APIs without `WriterResources` are a separate workflow. |
+
+Growing a charged byte buffer reserves the old allocation plus the replacement
+before allocating or copying. Spare capacity remains charged. Refused growth
+leaves existing contents and capacity unchanged. Fixed-capacity descriptor
+arrays cannot silently grow beyond their admitted count. Each owner frees its
+storage before releasing its charge, including error, cancellation and unwind
+paths. Charges follow the owner through preparation and emission. There is no
+waiting for retained storage that the writer itself needs to finish.
+
+Failures return `WriterPreparationLimitExceeded` in the `RESOURCE_LIMIT`
+category with `limit`, `required` and `used` counts. A refusal before emission
+leaves the sink untouched; a later refusal in main, recovery or volume framing
+can leave a prefix. This does not introduce transactional publication. Zero
+allows empty containers but refuses the first nonempty covered allocation.
+
+This scope covers the header/preparation pass for the RAR5/7 engine, including
+its supported volume and recovery paths. It is not yet an aggregate managed
+writer-memory ceiling. The inventory above names the exclusions and explicit
+legacy refusal rather than treating them as covered by this quota.
 
 ## Contract for a future managed-memory ceiling
 
@@ -187,13 +225,13 @@ The existing per-class quotas are building blocks for the aggregate policy.
 
 | Pass | Scope | Completion evidence |
 | --- | --- | --- |
-| 1. Header and preparation memory | Variable-length serializer buffers, prepared and transient header images, and retained preparation descriptors. Review single-archive, volume, recovery and legacy paths. | Covered allocations reserve capacity before allocation; simultaneous scratch and retained images and replacement peaks count; failures and cancellation release only discarded ownership. An allocation inventory identifies every remaining exclusion or unsupported mode. |
 | 2. Workspace and coordinator admission | Compression plans, job records, active codec/filter/encryption/recovery workspace and retained worker results. | Coordinator admission reserves peak workspace and retained-result allowances before dispatch. Workers have enforceable allowances and an extension policy. No race for shared spare bytes determines success. Oversized jobs, sibling failure, cancellation and retained results are tested. |
 | 3. Output ownership | Writer-owned archive/volume collectors, staging, transfers and copies. | Capacity remains charged until ownership transfers or storage is freed; copies and replacement peaks count simultaneously. Active and retained allocations compose under one managed-memory ledger. Caller-owned input and external sink exclusions are explicit. |
 | 4. Public integration and validation | High-level Rust, CLI, Python and npm controls, errors and documentation. | One coherent hard-policy contract across entry points, with explicit refusal of unsupported modes; byte compatibility, ratio, CPU and peak-memory checks cover the writer matrix. Existing estimated-workspace behaviour remains available separately. |
 
-Preparation descriptors belong in pass 1. Compression coordinator records belong
-in pass 2 because their capacity and lifetime depend on job admission. Avoid
+The preparation policy and its inventory are defined above. Compression
+coordinator records belong in pass 2 because their capacity and lifetime depend
+on job admission. Avoid
 creating a public setting for every internal buffer class; consolidate the
 policy as the common accounting and ownership model becomes enforceable.
 

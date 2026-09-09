@@ -1259,9 +1259,10 @@ pub(crate) fn recovery_end_header(
         &mut crate::parse_budget::ParseBudget::new(options),
     )?;
     if first.block.header_type != HEAD_CRYPT {
-        let mut end = Vec::new();
-        write::headers::write_end_header(&mut end, end_flags)?;
-        return Ok(end);
+        let resources = crate::WriterResources::default();
+        let mut end = crate::streaming::preparation::Bytes::new(&resources);
+        write::headers::write_end_header(&mut end, end_flags, &crate::WriterResources::default())?;
+        return Ok(end.to_vec());
     }
     let keys = parse_archive_encryption_header(&first, password)?;
     write::headers::encrypted_header_block(
@@ -1272,7 +1273,9 @@ pub(crate) fn recovery_end_header(
         &write::end_header_specific(end_flags),
         &[],
         &[],
+        &crate::WriterResources::default(),
     )
+    .map(|bytes| bytes.to_vec())
 }
 
 fn parse_main_header_bytes(parsed: &ParsedBlockHeader) -> Result<MainHeader> {

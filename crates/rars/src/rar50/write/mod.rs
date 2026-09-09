@@ -1638,10 +1638,17 @@ mod tests {
 
         let mut archive = Vec::new();
         archive.extend_from_slice(RAR50_SIGNATURE);
-        write_main_header(&mut archive, 0, None, &[]).unwrap();
+        write_main_header(
+            &mut archive,
+            0,
+            None,
+            &[],
+            &crate::WriterResources::default(),
+        )
+        .unwrap();
 
         let mut extra = Vec::new();
-        write_hash_record_with_value(&mut extra, blake2sp::hash(data));
+        write_hash_record_with_value(&mut extra, blake2sp::hash(data)).unwrap();
         let compression_info = 1 << 7; // RAR5 v0, non-solid, method m1, 128 KiB dictionary.
         let specific = file_specific(
             name,
@@ -1652,6 +1659,7 @@ mod tests {
             compression_info,
             0,
             false,
+            &crate::WriterResources::default(),
         )
         .unwrap();
         write_block(
@@ -1662,9 +1670,10 @@ mod tests {
             &specific,
             &extra,
             &packed,
+            &crate::WriterResources::default(),
         )
         .unwrap();
-        write_end_header(&mut archive, 0).unwrap();
+        write_end_header(&mut archive, 0, &crate::WriterResources::default()).unwrap();
 
         let parsed = Archive::parse(&archive).unwrap();
         let file = parsed.files().next().unwrap();
@@ -1983,10 +1992,17 @@ mod tests {
 
         let mut archive = Vec::new();
         archive.extend_from_slice(RAR50_SIGNATURE);
-        write_main_header(&mut archive, 0, None, &[]).unwrap();
+        write_main_header(
+            &mut archive,
+            0,
+            None,
+            &[],
+            &crate::WriterResources::default(),
+        )
+        .unwrap();
 
         let mut extra = Vec::new();
-        write_hash_record_with_value(&mut extra, blake2sp::hash(data));
+        write_hash_record_with_value(&mut extra, blake2sp::hash(data)).unwrap();
         let specific = file_specific(
             name,
             data.len() as u64,
@@ -1996,6 +2012,7 @@ mod tests {
             1 << 7,
             0,
             false,
+            &crate::WriterResources::default(),
         )
         .unwrap();
         write_block(
@@ -2006,9 +2023,10 @@ mod tests {
             &specific,
             &extra,
             &packed,
+            &crate::WriterResources::default(),
         )
         .unwrap();
-        write_end_header(&mut archive, 0).unwrap();
+        write_end_header(&mut archive, 0, &crate::WriterResources::default()).unwrap();
 
         let dir = crate::scratch::case("rars-rar50-literal-only");
         let path = dir.join("archive.rar");
@@ -2043,10 +2061,17 @@ mod tests {
 
         let mut archive = Vec::new();
         archive.extend_from_slice(RAR50_SIGNATURE);
-        write_main_header(&mut archive, 0, None, &[]).unwrap();
+        write_main_header(
+            &mut archive,
+            0,
+            None,
+            &[],
+            &crate::WriterResources::default(),
+        )
+        .unwrap();
 
         let mut extra = Vec::new();
-        write_hash_record_with_value(&mut extra, blake2sp::hash(&data));
+        write_hash_record_with_value(&mut extra, blake2sp::hash(&data)).unwrap();
         let specific = file_specific(
             name,
             data.len() as u64,
@@ -2056,6 +2081,7 @@ mod tests {
             1 << 7,
             0,
             false,
+            &crate::WriterResources::default(),
         )
         .unwrap();
         write_block(
@@ -2066,9 +2092,10 @@ mod tests {
             &specific,
             &extra,
             &packed,
+            &crate::WriterResources::default(),
         )
         .unwrap();
-        write_end_header(&mut archive, 0).unwrap();
+        write_end_header(&mut archive, 0, &crate::WriterResources::default()).unwrap();
 
         let dir = crate::scratch::case("rars-rar50-match");
         let path = dir.join("archive.rar");
