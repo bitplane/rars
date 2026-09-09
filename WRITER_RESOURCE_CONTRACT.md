@@ -127,10 +127,16 @@ same ownership rule. Admission fails immediately with
 and `used` byte counts).
 
 This is a quota for a specific retained allocation class, not all header memory.
-Serializer scratch (including type-specific and extra records), main/end and
-recovery headers, volume fragment headers, legacy headers, block descriptors,
+Variable-length serializer scratch (including type-specific and extra records),
+main/end and recovery headers, volume fragment headers, legacy headers, block descriptors,
 key state and allocator overhead remain outside it. The option imposes no limit
 on those other paths. It is independent of spool and estimated workspace quotas.
+
+Fixed-size framing and common hash, encryption, timestamp and locator records
+use bounded stack scratch. Extra-record payloads append directly to the output
+without an intermediate body copy; plain header framing likewise fills its
+final image directly. Variable-length record assembly and encrypted-header
+staging outside prepared images still need separate accounting.
 
 ## Contract for a future managed-memory ceiling
 

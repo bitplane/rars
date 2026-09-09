@@ -15,6 +15,40 @@ use crate::rar50::{
 };
 use crate::{crc32::crc32, Error, Result};
 
+/// Bounded framing scratch; callers choose capacities from the on-disk fields.
+struct HeaderScratch<const N: usize> {
+    bytes: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> HeaderScratch<N> {
+    fn new() -> Self {
+        Self {
+            bytes: [0; N],
+            len: 0,
+        }
+    }
+    fn extend_from_slice(&mut self, bytes: &[u8]) {
+        self.bytes[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+        self.len += bytes.len();
+    }
+    fn vint(&mut self, mut value: u64) {
+        loop {
+            self.extend_from_slice(&[(value as u8 & 0x7f) | if value >= 0x80 { 0x80 } else { 0 }]);
+            value >>= 7;
+            if value == 0 {
+                break;
+            }
+        }
+    }
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
 pub(super) fn write_vint(out: &mut Vec<u8>, mut value: u64) {
     while value >= 0x80 {
         out.push((value as u8) | 0x80);
@@ -24,18 +58,19 @@ pub(super) fn write_vint(out: &mut Vec<u8>, mut value: u64) {
 }
 
 pub(super) fn write_extra_record(out: &mut Vec<u8>, record_type: u64, data: &[u8]) {
-    let mut body = Vec::new();
-    write_vint(&mut body, record_type);
-    body.extend_from_slice(data);
-    write_vint(out, body.len() as u64);
-    out.extend_from_slice(&body);
+    let mut kind = HeaderScratch::<10>::new();
+    kind.vint(record_type);
+    // A slice length is at most isize::MAX, so adding a ten-byte vint fits u64.
+    write_vint(out, data.len() as u64 + kind.len() as u64);
+    out.extend_from_slice(kind.as_slice());
+    out.extend_from_slice(data);
 }
 
 pub(super) fn write_hash_record_with_value(out: &mut Vec<u8>, hash: [u8; 32]) {
-    let mut record = Vec::new();
-    write_vint(&mut record, 0);
+    let mut record = HeaderScratch::<33>::new();
+    record.vint(0);
     record.extend_from_slice(&hash);
-    write_extra_record(out, FHEXTRA_HASH, &record);
+    write_extra_record(out, FHEXTRA_HASH, record.as_slice());
 }
 
 pub(super) fn write_file_encryption_record(
@@ -44,14 +79,14 @@ pub(super) fn write_file_encryption_record(
     iv: [u8; 16],
     check_value: [u8; 12],
 ) {
-    let mut record = Vec::new();
-    write_vint(&mut record, 0);
-    write_vint(&mut record, 0x0003);
-    record.push(WRITE_KDF_COUNT_LOG);
+    let mut record = HeaderScratch::<47>::new();
+    record.vint(0);
+    record.vint(0x0003);
+    record.extend_from_slice(&[WRITE_KDF_COUNT_LOG]);
     record.extend_from_slice(&salt);
     record.extend_from_slice(&iv);
     record.extend_from_slice(&check_value);
-    write_extra_record(out, FHEXTRA_CRYPT, &record);
+    write_extra_record(out, FHEXTRA_CRYPT, record.as_slice());
 }
 
 pub(super) fn block_header_image(
@@ -61,25 +96,41 @@ pub(super) fn block_header_image(
     type_specific: &[u8],
     extra: &[u8],
 ) -> Result<Vec<u8>> {
-    let mut body = Vec::new();
-    write_vint(&mut body, header_type);
-    write_vint(&mut body, flags);
+    let mut prefix = HeaderScratch::<40>::new();
+    prefix.vint(header_type);
+    prefix.vint(flags);
     if flags & HFL_EXTRA != 0 {
-        write_vint(&mut body, extra.len() as u64);
+        prefix.vint(extra.len() as u64);
     }
     if let Some(data_size) = data_size {
-        write_vint(&mut body, data_size);
+        prefix.vint(data_size);
     }
-    body.extend_from_slice(type_specific);
-    body.extend_from_slice(extra);
-
-    let mut header_size = Vec::new();
-    write_vint(&mut header_size, body.len() as u64);
-
-    let mut header = Vec::with_capacity(4 + header_size.len() + body.len());
-    header.extend_from_slice(&0u32.to_le_bytes());
-    header.extend_from_slice(&header_size);
-    header.extend_from_slice(&body);
+    let overflow = || Error::InvalidArgument("RAR 5 header size overflows");
+    let body_len = prefix
+        .len()
+        .checked_add(type_specific.len())
+        .and_then(|len| len.checked_add(extra.len()))
+        .ok_or_else(overflow)?;
+    let mut header_size = HeaderScratch::<10>::new();
+    header_size.vint(body_len as u64);
+    let length = 4usize
+        .checked_add(header_size.len())
+        .and_then(|len| len.checked_add(body_len))
+        .ok_or_else(overflow)?;
+    if length > isize::MAX as usize {
+        return Err(overflow());
+    }
+    let mut header = vec![0; length];
+    let mut offset = 4;
+    for part in [
+        header_size.as_slice(),
+        prefix.as_slice(),
+        type_specific,
+        extra,
+    ] {
+        header[offset..offset + part.len()].copy_from_slice(part);
+        offset += part.len();
+    }
     let header_crc = crc32(&header[4..]);
     header[..4].copy_from_slice(&header_crc.to_le_bytes());
     Ok(header)
@@ -197,10 +248,11 @@ pub(super) fn write_mtime_record(extra: &mut Vec<u8>, seconds: Option<u32>, nano
     if let (Some(seconds), Some(nanos)) = (seconds, nanos) {
         // Unix time + mtime + nanoseconds. Emit the complete timestamp here,
         // with no base-header time competing with the higher precision record.
-        let mut record = vec![0x13];
+        let mut record = HeaderScratch::<9>::new();
+        record.extend_from_slice(&[0x13]);
         record.extend_from_slice(&seconds.to_le_bytes());
         record.extend_from_slice(&nanos.to_le_bytes());
-        write_extra_record(extra, super::super::FHEXTRA_HTIME, &record);
+        write_extra_record(extra, super::super::FHEXTRA_HTIME, record.as_slice());
     }
 }
 
@@ -256,15 +308,15 @@ pub(super) fn write_locator_record(
         flags |= MHEXTRA_LOCATOR_RECOVERY;
     }
 
-    let mut record = Vec::new();
-    write_vint(&mut record, flags);
+    let mut record = HeaderScratch::<21>::new();
+    record.vint(flags);
     if let Some(quick_open_offset) = quick_open_offset {
-        write_vint(&mut record, quick_open_offset);
+        record.vint(quick_open_offset);
     }
     if let Some(recovery_record_offset) = recovery_record_offset {
-        write_vint(&mut record, recovery_record_offset);
+        record.vint(recovery_record_offset);
     }
-    write_extra_record(out, MHEXTRA_LOCATOR, &record);
+    write_extra_record(out, MHEXTRA_LOCATOR, record.as_slice());
 }
 
 pub(super) fn resolved_main_extra(
@@ -289,17 +341,17 @@ pub(super) fn write_main_header(
     volume_number: Option<u64>,
     extra: &[u8],
 ) -> Result<()> {
-    let mut specific = Vec::new();
-    write_vint(&mut specific, archive_flags);
+    let mut specific = HeaderScratch::<20>::new();
+    specific.vint(archive_flags);
     if let Some(volume_number) = volume_number {
-        write_vint(&mut specific, volume_number);
+        specific.vint(volume_number);
     }
     write_block(
         out,
         HEAD_MAIN,
         if extra.is_empty() { 0 } else { HFL_EXTRA },
         None,
-        &specific,
+        specific.as_slice(),
         extra,
         &[],
     )
@@ -311,17 +363,17 @@ pub(super) fn encrypted_main_header_block(
     volume_number: Option<u64>,
     extra: &[u8],
 ) -> Result<Vec<u8>> {
-    let mut specific = Vec::new();
-    write_vint(&mut specific, archive_flags);
+    let mut specific = HeaderScratch::<20>::new();
+    specific.vint(archive_flags);
     if let Some(volume_number) = volume_number {
-        write_vint(&mut specific, volume_number);
+        specific.vint(volume_number);
     }
     encrypted_header_block(
         keys,
         HEAD_MAIN,
         if extra.is_empty() { 0 } else { HFL_EXTRA },
         None,
-        &specific,
+        specific.as_slice(),
         extra,
         &[],
     )
@@ -362,13 +414,13 @@ pub(super) fn write_head_crypt(
     out: &mut Vec<u8>,
     header_keys: &HeaderEncryptionKeys,
 ) -> Result<()> {
-    let mut specific = Vec::new();
-    write_vint(&mut specific, 0);
-    write_vint(&mut specific, 0x0001);
-    specific.push(WRITE_KDF_COUNT_LOG);
+    let mut specific = HeaderScratch::<31>::new();
+    specific.vint(0);
+    specific.vint(0x0001);
+    specific.extend_from_slice(&[WRITE_KDF_COUNT_LOG]);
     specific.extend_from_slice(&header_keys.salt);
     specific.extend_from_slice(&header_keys.keys.password_check_record());
-    write_block(out, HEAD_CRYPT, 0, None, &specific, &[], &[])
+    write_block(out, HEAD_CRYPT, 0, None, specific.as_slice(), &[], &[])
 }
 
 pub(crate) fn write_end_header(out: &mut Vec<u8>, end_flags: u64) -> Result<()> {
@@ -452,14 +504,14 @@ pub(super) fn prepared_header_image(
 ) -> Result<PreparedHeader> {
     // Prefixes contain only vints. Variable-size inputs stay borrowed until
     // the final allocation has been admitted; no intermediate body copy.
-    let mut prefix = Vec::with_capacity(40);
-    write_vint(&mut prefix, header_type);
-    write_vint(&mut prefix, flags);
+    let mut prefix = HeaderScratch::<40>::new();
+    prefix.vint(header_type);
+    prefix.vint(flags);
     if flags & HFL_EXTRA != 0 {
-        write_vint(&mut prefix, extra.len() as u64);
+        prefix.vint(extra.len() as u64);
     }
     if let Some(size) = data_size {
-        write_vint(&mut prefix, size);
+        prefix.vint(size);
     }
     let overflow = || Error::InvalidArgument("RAR 5 prepared header size overflows");
     let body_len = prefix
@@ -467,8 +519,8 @@ pub(super) fn prepared_header_image(
         .checked_add(type_specific.len())
         .and_then(|len| len.checked_add(extra.len()))
         .ok_or_else(overflow)?;
-    let mut size = Vec::with_capacity(10);
-    write_vint(&mut size, body_len as u64);
+    let mut size = HeaderScratch::<10>::new();
+    size.vint(body_len as u64);
     let plain_len = 4usize
         .checked_add(size.len())
         .and_then(|len| len.checked_add(body_len))
@@ -594,5 +646,92 @@ mod prepared_header_tests {
         });
         assert!(failure.is_err());
         assert!(resources.reserve_prepared_header(1024).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod scratch_tests {
+    use super::*;
+
+    fn buffered_record(kind: u64, data: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        write_vint(&mut body, kind);
+        body.extend_from_slice(data);
+        let mut out = Vec::new();
+        write_vint(&mut out, body.len() as u64);
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[test]
+    fn stack_framing_matches_buffered_encoding_at_vint_boundaries() {
+        for len in [0, 1, 127, 128, 16384] {
+            let data = vec![0xa5; len];
+            for kind in [0, 127, 128, u64::MAX] {
+                let mut record = vec![0x5a];
+                write_extra_record(&mut record, kind, &data);
+                let mut expected = vec![0x5a];
+                expected.extend(buffered_record(kind, &data));
+                assert_eq!(record, expected);
+                for flags in [0, HFL_EXTRA, u64::MAX] {
+                    for size in [None, Some(u64::MAX)] {
+                        let mut body = Vec::new();
+                        write_vint(&mut body, kind);
+                        write_vint(&mut body, flags);
+                        if flags & HFL_EXTRA != 0 {
+                            write_vint(&mut body, data.len() as u64);
+                        }
+                        if let Some(size) = size {
+                            write_vint(&mut body, size);
+                        }
+                        body.extend_from_slice(b"specific");
+                        body.extend_from_slice(&data);
+                        let mut expected = vec![0; 4];
+                        write_vint(&mut expected, body.len() as u64);
+                        expected.extend_from_slice(&body);
+                        let crc = crc32(&expected[4..]);
+                        expected[..4].copy_from_slice(&crc.to_le_bytes());
+                        assert_eq!(
+                            block_header_image(kind, flags, size, b"specific", &data).unwrap(),
+                            expected
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_records_fit_their_stack_capacity_and_keep_wire_bytes() {
+        let mut actual = Vec::new();
+        write_file_encryption_record(&mut actual, [1; 16], [2; 16], [3; 12]);
+        let mut body = vec![0, 3, WRITE_KDF_COUNT_LOG];
+        body.extend_from_slice(&[1; 16]);
+        body.extend_from_slice(&[2; 16]);
+        body.extend_from_slice(&[3; 12]);
+        assert_eq!(actual, buffered_record(FHEXTRA_CRYPT, &body));
+        actual.clear();
+        write_hash_record_with_value(&mut actual, [7; 32]);
+        let mut body = vec![0];
+        body.extend_from_slice(&[7; 32]);
+        assert_eq!(actual, buffered_record(FHEXTRA_HASH, &body));
+        actual.clear();
+        write_mtime_record(&mut actual, Some(u32::MAX), Some(u32::MAX));
+        let mut body = vec![0x13];
+        body.extend_from_slice(&[0xff; 8]);
+        assert_eq!(
+            actual,
+            buffered_record(super::super::super::FHEXTRA_HTIME, &body)
+        );
+        actual.clear();
+        write_locator_record(&mut actual, Some(u64::MAX), Some(u64::MAX));
+        let mut body = Vec::new();
+        write_vint(
+            &mut body,
+            MHEXTRA_LOCATOR_QUICK_OPEN | MHEXTRA_LOCATOR_RECOVERY,
+        );
+        write_vint(&mut body, u64::MAX);
+        write_vint(&mut body, u64::MAX);
+        assert_eq!(actual, buffered_record(MHEXTRA_LOCATOR, &body));
     }
 }
