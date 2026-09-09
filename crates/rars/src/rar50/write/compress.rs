@@ -19,7 +19,8 @@ use super::filter_policy::{
 use super::FilterPolicy;
 #[cfg(test)]
 use crate::codec::rar50::EncodeOptions;
-use crate::codec::rar50::{encode_lz_streaming_blocks, BlockSplitter};
+use crate::codec::rar50::{streaming_blocks_with_allowance, BlockSplitter};
+use crate::codec::workspace::{Allowance, Budget, Buffer};
 use crate::crc32::Crc32;
 use crate::rar50::blake2sp;
 use crate::streaming::preparation::Records;
@@ -146,11 +147,24 @@ pub(super) use super::plan::CompressPlan;
 use super::plan::{Execution, ExecutionPlan, MemberPlan};
 
 /// A bounded run of adjacent blocks, sharing one copy of the preceding input.
-struct BlockJob {
-    data: Vec<u8>,
-    history: Vec<u8>,
+struct BlockJob<B: Budget> {
+    data: Buffer<u8, B>,
+    history: Buffer<u8, B>,
     /// Member index, end within `data`, and final-block flag.
     blocks: Records<(usize, usize, bool)>,
+}
+
+impl<B: Budget> BlockJob<B> {
+    fn append(&mut self, data: Buffer<u8, B>) -> Result<()> {
+        if self.data.is_empty() {
+            self.data = data;
+        } else {
+            self.data
+                .extend_from_slice(&data)
+                .map_err(Into::<crate::codec::Error>::into)?;
+        }
+        Ok(())
+    }
 }
 
 fn run_size(plan: &CompressPlan) -> usize {
@@ -160,7 +174,7 @@ fn run_size(plan: &CompressPlan) -> usize {
 }
 
 /// A member being read, and the packed bytes it has produced so far.
-struct MemberStream {
+struct MemberStream<B: Budget> {
     member: usize,
     input_size: u64,
     started: bool,
@@ -169,18 +183,19 @@ struct MemberStream {
     remaining: u64,
     packed: Spool,
     /// A chunk read to decide a block boundary and not used by that block.
-    pushback: Vec<u8>,
+    pushback: Buffer<u8, B>,
     crc: Crc32,
     hash: blake2sp::Hasher,
 }
 
-impl MemberStream {
+impl<B: Budget> MemberStream<B> {
     fn new(
         member: usize,
         source: &EntrySource,
         size: u64,
         resources: &WriterResources,
         progress: &dyn CompressionProgress,
+        allowance: &B,
     ) -> Result<Self> {
         if size == 0 {
             progress.started(member, size);
@@ -198,7 +213,7 @@ impl MemberStream {
             reader: None,
             remaining: size,
             packed: Spool::create_parked(resources)?,
-            pushback: Vec::new(),
+            pushback: Buffer::new(allowance),
             crc: Crc32::new(),
             hash: blake2sp::Hasher::new(),
         })
@@ -336,6 +351,7 @@ fn compress_streaming_members(
             resources,
             advance,
             error_context,
+            &Allowance::default(),
         )
     } else {
         compress_independent_members(
@@ -347,6 +363,7 @@ fn compress_streaming_members(
             resources,
             advance,
             error_context,
+            &Allowance::default(),
         )
     }
 }
@@ -622,7 +639,7 @@ fn compress_fallback_member(
 /// Members with independent dictionaries, interleaved so a batch of small
 /// members can still saturate the machine.
 #[allow(clippy::too_many_arguments)]
-fn compress_independent_members(
+fn compress_independent_members<B: Budget + Send + Sync>(
     sources: &[EntrySource],
     integrity: &mut [(u64, u32, [u8; 32])],
     plan: &CompressPlan,
@@ -631,7 +648,11 @@ fn compress_independent_members(
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
     error_context: &(dyn Fn(usize, Error) -> Error + Sync),
-) -> Result<Records<Spool>> {
+    allowance: &B,
+) -> Result<Records<Spool>>
+where
+    B::Charge: Send,
+{
     let mut packed = Records::new(sources.len(), resources)?;
     for (group_index, group) in sources.chunks(batch_capacity).enumerate() {
         let group_start = group_index * batch_capacity;
@@ -643,14 +664,17 @@ fn compress_independent_members(
                     integrity[group_start + offset].0,
                     resources,
                     advance,
+                    allowance,
                 )
                 .map_err(|error| error_context(group_start + offset, error))
             }),
             resources,
         )?;
 
-        let mut histories =
-            Records::collect((0..streams.len()).map(|_| Ok(Vec::new())), resources)?;
+        let mut histories = Records::collect(
+            (0..streams.len()).map(|_| Ok(Buffer::new(allowance))),
+            resources,
+        )?;
         let mut cursor = 0usize;
         while streams.iter().any(MemberStream::has_more) {
             let reserved = required.saturating_mul(batch_capacity as u64);
@@ -671,23 +695,19 @@ fn compress_independent_members(
                 misses = 0;
 
                 let mut job = BlockJob {
-                    data: Vec::new(),
-                    history: histories[member].clone(),
+                    data: Buffer::new(allowance),
+                    history: Buffer::copied(&histories[member], allowance)?,
                     blocks: Records::new(0, resources)?,
                 };
                 while stream.has_more() && job.data.len() < run_size(plan) {
-                    job.data.extend(
+                    job.append(
                         read_block(stream, plan.block_size, advance)
                             .map_err(|error| error_context(stream.member, error))?,
-                    );
+                    )?;
                     job.blocks
                         .push_growing((member, job.data.len(), !stream.has_more()))?;
                 }
-                advance_history(
-                    &mut histories[member],
-                    &job.data,
-                    plan.encode_options.max_match_distance,
-                );
+                histories[member].remember(&job.data, plan.encode_options.max_match_distance)?;
                 jobs.push(job)?;
             }
 
@@ -706,7 +726,7 @@ fn compress_independent_members(
 
 /// One dictionary running through every member in order.
 #[allow(clippy::too_many_arguments)]
-fn compress_solid_chain(
+fn compress_solid_chain<B: Budget + Send + Sync>(
     sources: &[EntrySource],
     integrity: &mut [(u64, u32, [u8; 32])],
     plan: &CompressPlan,
@@ -715,16 +735,27 @@ fn compress_solid_chain(
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
     error_context: &(dyn Fn(usize, Error) -> Error + Sync),
-) -> Result<Records<Spool>> {
+    allowance: &B,
+) -> Result<Records<Spool>>
+where
+    B::Charge: Send,
+{
     let mut streams = Records::collect(
         sources.iter().enumerate().map(|(member, source)| {
-            MemberStream::new(member, source, integrity[member].0, resources, advance)
-                .map_err(|error| error_context(member, error))
+            MemberStream::new(
+                member,
+                source,
+                integrity[member].0,
+                resources,
+                advance,
+                allowance,
+            )
+            .map_err(|error| error_context(member, error))
         }),
         resources,
     )?;
 
-    let mut history: Vec<u8> = Vec::new();
+    let mut history = Buffer::new(allowance);
     let mut next = 0usize;
     loop {
         let reserved = required.saturating_mul(batch_capacity as u64);
@@ -735,9 +766,15 @@ fn compress_solid_chain(
         // worker count. Adjacent blocks amortize history copies and seeding.
         let mut jobs = Records::new(batch_capacity, resources)?;
         while jobs.len() < batch_capacity {
+            while next < streams.len() && !streams[next].has_more() {
+                next += 1;
+            }
+            if next == streams.len() {
+                break;
+            }
             let mut job = BlockJob {
-                data: Vec::new(),
-                history: history.clone(),
+                data: Buffer::new(allowance),
+                history: Buffer::copied(&history, allowance)?,
                 blocks: Records::new(0, resources)?,
             };
             while job.data.len() < run_size(plan) {
@@ -747,21 +784,17 @@ fn compress_solid_chain(
                 let Some(stream) = streams.get_mut(next) else {
                     break;
                 };
-                job.data.extend(
+                job.append(
                     read_block(stream, plan.block_size, advance)
                         .map_err(|error| error_context(stream.member, error))?,
-                );
+                )?;
                 job.blocks
                     .push_growing((stream.member, job.data.len(), !stream.has_more()))?;
             }
             if job.blocks.is_empty() {
                 break;
             }
-            advance_history(
-                &mut history,
-                &job.data,
-                plan.encode_options.max_match_distance,
-            );
+            history.remember(&job.data, plan.encode_options.max_match_distance)?;
             jobs.push(job)?;
         }
 
@@ -787,11 +820,11 @@ fn compress_solid_chain(
 /// One chunk, then further chunks while the data is not moving, which is the
 /// same question [`BlockSplitter`] answers for the buffered writer. Both have
 /// to reach the same answer or the same input packs to two different archives.
-fn read_block(
-    stream: &mut MemberStream,
+fn read_block<B: Budget>(
+    stream: &mut MemberStream<B>,
     block_size: usize,
     progress: &dyn CompressionProgress,
-) -> Result<Vec<u8>> {
+) -> Result<Buffer<u8, B>> {
     if !stream.started {
         progress.started(stream.member, stream.input_size);
         stream.started = true;
@@ -809,26 +842,30 @@ fn read_block(
             break;
         }
         splitter.accept(&next);
-        data.extend_from_slice(&next);
+        data.extend_from_slice(&next)
+            .map_err(Into::<crate::codec::Error>::into)?;
     }
     Ok(data)
 }
 
 /// Reads one chunk, preferring anything a previous read put back.
-fn read_chunk(
-    stream: &mut MemberStream,
+fn read_chunk<B: Budget>(
+    stream: &mut MemberStream<B>,
     block_size: usize,
     progress: &dyn CompressionProgress,
-) -> Result<Vec<u8>> {
+) -> Result<Buffer<u8, B>> {
     if progress.is_cancelled() {
         return Err(Error::Cancelled);
     }
     if !stream.pushback.is_empty() {
-        return Ok(std::mem::take(&mut stream.pushback));
+        return Ok({
+            let empty = Buffer::new(&stream.pushback.allowance());
+            std::mem::replace(&mut stream.pushback, empty)
+        });
     }
     let wanted = usize::try_from(stream.remaining.min(block_size as u64))
         .map_err(|_| Error::InvalidArgument("RAR 5 block size overflows usize"))?;
-    let mut data = vec![0u8; wanted];
+    let mut data = Buffer::filled(wanted, 0u8, &stream.pushback.allowance())?;
     // Solid planning can retain every member, but only the current input
     // needs a reader. Release it at EOF, even when a block has pushback.
     if stream.reader.is_none() {
@@ -856,31 +893,19 @@ fn check_source_end(reader: &mut dyn Read) -> Result<()> {
     Ok(())
 }
 
-/// Extends the rolling window with `data`, dropping what has fallen out of
-/// dictionary range.
-fn advance_history(history: &mut Vec<u8>, data: &[u8], max_match_distance: usize) {
-    if data.len() >= max_match_distance {
-        history.clear();
-        history.extend_from_slice(&data[data.len() - max_match_distance..]);
-        return;
-    }
-    history.extend_from_slice(data);
-    let keep_from = history.len().saturating_sub(max_match_distance);
-    if keep_from != 0 {
-        history.drain(..keep_from);
-    }
-}
-
 /// Compresses a wave of blocks in parallel, then appends the results to their
 /// members in job order so output does not depend on scheduling.
-fn compress_wave(
-    jobs: Records<BlockJob>,
+fn compress_wave<B: Budget + Send + Sync>(
+    jobs: Records<BlockJob<B>>,
     plan: &CompressPlan,
-    streams: &mut [MemberStream],
+    streams: &mut [MemberStream<B>],
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
     error_context: &(dyn Fn(usize, Error) -> Error + Sync),
-) -> Result<()> {
+) -> Result<()>
+where
+    B::Charge: Send,
+{
     // All coordinator-owned boundary and result arrays are reserved before
     // dispatch, rather than letting workers compete for preparation capacity.
     let jobs = Records::collect(
@@ -904,13 +929,14 @@ fn compress_wave(
             // reporting once the wave is appended is a single jump across the whole
             // member whenever the member fits one wave.
             let mut block_done = |bytes: usize| progress.advance(bytes as u64);
-            let packed = encode_lz_streaming_blocks(
+            let packed = streaming_blocks_with_allowance(
                 &job.data,
                 &job.history,
                 &boundaries,
                 plan.algorithm_version,
                 plan.encode_options,
                 Some(&mut block_done),
+                &job.data.allowance(),
             )?;
             for ((member, _, last), packed) in job.blocks.into_iter().zip(packed) {
                 output.push((member, packed, last))?;
@@ -1003,6 +1029,256 @@ mod tests {
             whole_member_wave(&[whole(0), fallback, whole(0)], 0, 4, 0),
             (1, 0)
         );
+    }
+
+    #[test]
+    fn stream_read_admission_precedes_open_and_pushback_keeps_its_charge() {
+        use std::sync::{atomic::AtomicUsize, Arc};
+        let scratch = crate::scratch::case("stream-read-allowance");
+        let resources = WriterResources::default().with_temp_dir(&*scratch);
+        let opens = Arc::new(AtomicUsize::new(0));
+        let source = EntrySource::from_opener(8, {
+            let opens = opens.clone();
+            move || {
+                opens.fetch_add(1, Ordering::Relaxed);
+                Ok(Box::new(std::io::Cursor::new(*b"abcdefgh")))
+            }
+        });
+        let allowance = Allowance::limited(3);
+        let mut stream =
+            MemberStream::new(0, &source, 8, &resources, &|_| true, &allowance).unwrap();
+        assert_eq!(
+            read_chunk(&mut stream, 4, &|_| true).unwrap_err().kind(),
+            crate::ErrorKind::ResourceLimit
+        );
+        assert_eq!(opens.load(Ordering::Relaxed), 0);
+        assert_eq!(stream.remaining, 8);
+        assert_eq!(allowance.used(), 0);
+        drop(stream);
+
+        let allowance = Allowance::limited(8);
+        let mut stream =
+            MemberStream::new(0, &source, 8, &resources, &|_| true, &allowance).unwrap();
+        stream.pushback = read_chunk(&mut stream, 4, &|_| true).unwrap();
+        assert_eq!(allowance.used(), 4);
+        let first = read_chunk(&mut stream, 4, &|_| true).unwrap();
+        assert_eq!(&*first, b"abcd");
+        assert_eq!(allowance.used(), 4);
+        assert_eq!(stream.remaining, 4);
+        let last = read_chunk(&mut stream, 4, &|_| true).unwrap();
+        assert_eq!(&*last, b"efgh");
+        assert_eq!(allowance.used(), 8);
+        assert!(stream.reader.is_none());
+        drop(stream);
+        assert_eq!(allowance.used(), 8);
+        drop((first, last));
+        assert_eq!(allowance.used(), 0);
+    }
+
+    #[test]
+    fn streaming_writer_allowance_covers_assembly_encoding_and_failure_cleanup() {
+        let scratch = crate::scratch::case("stream-writer-allowance");
+        let resources = WriterResources::default().with_temp_dir(&*scratch);
+        let data: Vec<u8> = (0..8192).map(|i| ((i * 71) % 251) as u8).collect();
+        let options = EncodeOptions::new(8).with_max_match_distance(65536);
+        for solid in [false, true] {
+            let plan = CompressPlan {
+                algorithm_version: 0,
+                encode_options: options,
+                dictionary_size: 65536,
+                block_size: 1024,
+                solid,
+                method: 1,
+                filter_policy: FilterPolicy::None,
+                candidates: vec![options],
+            };
+            let sources = [
+                EntrySource::from_bytes(data.clone()),
+                EntrySource::from_bytes(data[..2048].to_vec()),
+                EntrySource::from_bytes(Vec::new()),
+            ];
+            let initial = [(8192, 0, [0; 32]), (2048, 0, [0; 32]), (0, 0, [0; 32])];
+            let mut expected_integrity = initial;
+            let encode = if solid {
+                compress_solid_chain::<Allowance>
+            } else {
+                compress_independent_members::<Allowance>
+            };
+            let expected = encode(
+                &sources,
+                &mut expected_integrity,
+                &plan,
+                2,
+                1,
+                &resources,
+                &|_| true,
+                &|_, error| error,
+                &Allowance::default(),
+            )
+            .unwrap();
+            let payloads = |spools: Records<Spool>| -> Vec<Vec<u8>> {
+                spools
+                    .into_iter()
+                    .map(|mut spool| {
+                        let mut bytes = Vec::new();
+                        spool.copy_to(&mut bytes).unwrap();
+                        bytes
+                    })
+                    .collect()
+            };
+            let expected = payloads(expected);
+            let mut refusals = 0;
+            let mut successes = 0;
+            for limit in [0, 1023, 2048, 8192, 32768, 131072, 524288, 4 * 1024 * 1024] {
+                let allowance = Allowance::limited(limit);
+                let mut integrity = initial;
+                let encode = if solid {
+                    compress_solid_chain::<crate::codec::workspace::Limited>
+                } else {
+                    compress_independent_members::<crate::codec::workspace::Limited>
+                };
+                let result = encode(
+                    &sources,
+                    &mut integrity,
+                    &plan,
+                    2,
+                    1,
+                    &resources,
+                    &|_| {
+                        assert!(allowance.used() > 0);
+                        true
+                    },
+                    &|_, error| error,
+                    &allowance,
+                );
+                match result {
+                    Ok(spools) => {
+                        successes += 1;
+                        assert_eq!(payloads(spools), expected);
+                        assert_eq!(integrity, expected_integrity);
+                    }
+                    Err(error) => {
+                        refusals += 1;
+                        assert_eq!(error.kind(), crate::ErrorKind::ResourceLimit, "{error}");
+                    }
+                }
+                assert_eq!(allowance.used(), 0, "solid={solid}, limit={limit}");
+                assert_eq!(resources.workspace_in_use(), 0);
+                assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
+            }
+            assert!(refusals >= 3 && successes > 0);
+
+            let allowance = Allowance::limited(4 * 1024 * 1024);
+            let encode = if solid {
+                compress_solid_chain::<crate::codec::workspace::Limited>
+            } else {
+                compress_independent_members::<crate::codec::workspace::Limited>
+            };
+            let mut integrity = initial;
+            let result = encode(
+                &sources,
+                &mut integrity,
+                &plan,
+                2,
+                1,
+                &resources,
+                &|_| false,
+                &|_, error| error,
+                &allowance,
+            );
+            assert!(matches!(result, Err(Error::Cancelled)));
+            assert_eq!(allowance.used(), 0);
+            assert_eq!(resources.workspace_in_use(), 0);
+            assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn bounded_streaming_history_survives_multiple_waves_and_member_boundaries() {
+        let scratch = crate::scratch::case("stream-history-allowance");
+        let resources = WriterResources::default().with_temp_dir(&*scratch);
+        let size = crate::codec::rar50::MAX_LZ_BLOCK_SIZE + 4096;
+        let data: Vec<u8> = (0..size).map(|i| ((i * 71) % 251) as u8).collect();
+        let sources = [
+            EntrySource::from_bytes(data.clone()),
+            EntrySource::from_bytes(data),
+        ];
+        let options = EncodeOptions::new(8).with_max_match_distance(65536);
+        for solid in [false, true] {
+            let plan = CompressPlan {
+                algorithm_version: 0,
+                encode_options: options,
+                dictionary_size: 65536,
+                block_size: 65536,
+                solid,
+                method: 1,
+                filter_policy: FilterPolicy::None,
+                candidates: vec![options],
+            };
+            let mut expected_integrity = [(size as u64, 0, [0; 32]); 2];
+            let mut actual_integrity = expected_integrity;
+            let encode = if solid {
+                compress_solid_chain::<Allowance>
+            } else {
+                compress_independent_members::<Allowance>
+            };
+            let expected = encode(
+                &sources,
+                &mut expected_integrity,
+                &plan,
+                1,
+                1,
+                &resources,
+                &|_| true,
+                &|_, error| error,
+                &Allowance::default(),
+            )
+            .unwrap();
+            let allowance = Allowance::limited(64 * 1024 * 1024);
+            let encode = if solid {
+                compress_solid_chain::<crate::codec::workspace::Limited>
+            } else {
+                compress_independent_members::<crate::codec::workspace::Limited>
+            };
+            let actual = encode(
+                &sources,
+                &mut actual_integrity,
+                &plan,
+                2,
+                1,
+                &resources,
+                &|_| true,
+                &|_, error| error,
+                &allowance,
+            )
+            .unwrap();
+            assert_eq!(actual_integrity, expected_integrity);
+            assert_eq!(allowance.used(), 0);
+            for (mut expected, mut actual) in expected.into_iter().zip(actual) {
+                let mut expected_bytes = Vec::new();
+                let mut actual_bytes = Vec::new();
+                expected.copy_to(&mut expected_bytes).unwrap();
+                actual.copy_to(&mut actual_bytes).unwrap();
+                assert_eq!(actual_bytes, expected_bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_source_failure_releases_admitted_buffers() {
+        let scratch = crate::scratch::case("stream-source-failure-allowance");
+        let resources = WriterResources::default().with_temp_dir(&*scratch);
+        for bytes in [b"short".as_slice(), b"too long for declared size"] {
+            let source =
+                EntrySource::from_opener(8, move || Ok(Box::new(std::io::Cursor::new(bytes))));
+            let allowance = Allowance::limited(128);
+            let mut stream =
+                MemberStream::new(0, &source, 8, &resources, &|_| true, &allowance).unwrap();
+            let error = read_block(&mut stream, 4, &|_| true).unwrap_err();
+            assert!(matches!(error, Error::Io(_) | Error::SourceChanged(_)));
+            drop(stream);
+            assert_eq!(allowance.used(), 0);
+        }
     }
 
     #[test]

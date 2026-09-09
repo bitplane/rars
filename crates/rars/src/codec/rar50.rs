@@ -907,6 +907,7 @@ pub(crate) fn encode_lz_streaming_block(
 /// Encode adjacent streaming blocks with one seeded chain finder. The first
 /// block without history keeps its existing tree parse; subsequent blocks use
 /// chains just as separately seeded streaming blocks do.
+#[cfg(test)]
 pub(crate) fn encode_lz_streaming_blocks(
     data: &[u8],
     history: &[u8],
@@ -926,7 +927,7 @@ pub(crate) fn encode_lz_streaming_blocks(
     )
     .map(|outputs| outputs.into_iter().map(Buffer::into_vec).collect())
 }
-fn streaming_blocks_with_allowance<B: Budget>(
+pub(crate) fn streaming_blocks_with_allowance<B: Budget>(
     data: &[u8],
     history: &[u8],
     blocks: &[(usize, bool)],

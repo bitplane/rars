@@ -209,6 +209,13 @@ the same allowance. Consuming a descriptor container keeps its allocation
 charged until the iterator drops; extracted output owners keep their own charges.
 History growth is admitted before mutation and copies only the retained tail.
 An encode refusal or callback failure preserves the previous persistent history.
+The production streaming writer carries these owners through admitted source
+chunks, block lookahead, assembled jobs and rolling dictionaries for both
+independent and solid members. A job takes ownership of its first block instead
+of copying it. Packed block owners remain charged through parallel result slots
+and ordered spool writes; source failures and cancellation release the wave.
+Coordinator descriptors still use preparation accounting and spools retain their
+separate storage policy. This does not yet combine those ledgers.
 Covered owners reserve before growth, include replacement peaks and retain
 charges through moves and token selection. Unlimited and bounded buffers use
 separate compile-time policies; the unlimited owner retains Vec's layout.
@@ -220,8 +227,8 @@ This is migration infrastructure, not an available writer limit. Production
 codec entry points currently use unlimited handles; bounded construction is
 internal test coverage, including its refusal diagnostics. The codec reader
 adapter also has bounded read-ahead and input-buffer tests; it is not the
-production writer's source-loading path. Source loading and streaming job
-assembly, automatic filter-search candidates and their retained payloads,
+production writer's source-loading path. Whole-member source loading,
+automatic filter-search candidates and their retained payloads,
 encryption/KDF and recovery workspace still need migration. Only after those
 paths are covered can the coordinator supply reserved allowances and connect them to preparation
 and spool memory. There is no public worker allowance or extension API yet.
