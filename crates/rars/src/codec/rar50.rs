@@ -1,4 +1,4 @@
-use super::filters::{self, DeltaErrorMessages, FilterOp};
+use super::filters::{self, DeltaErrorMessages};
 use super::workspace::{Allowance, Budget, Buffer};
 use super::{huffman, match_finder, Error, Result};
 use std::collections::VecDeque;
@@ -781,7 +781,30 @@ pub(crate) fn encode_lz_reader_to(
     algorithm_version: u8,
     options: EncodeOptions,
     block_size: usize,
+    progress: Option<&mut dyn FnMut(u64) -> bool>,
+) -> crate::Result<()> {
+    reader_to_with_allowance(
+        reader,
+        input_size,
+        output,
+        algorithm_version,
+        options,
+        block_size,
+        progress,
+        &Allowance::default(),
+    )
+}
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn reader_to_with_allowance<B: Budget>(
+    reader: &mut dyn Read,
+    input_size: u64,
+    output: &mut dyn Write,
+    algorithm_version: u8,
+    options: EncodeOptions,
+    block_size: usize,
     mut progress: Option<&mut dyn FnMut(u64) -> bool>,
+    allowance: &B,
 ) -> crate::Result<()> {
     if block_size == 0 {
         return Err(crate::Error::InvalidHeader(
@@ -789,12 +812,12 @@ pub(crate) fn encode_lz_reader_to(
         ));
     }
     let block_size = block_size.min(MAX_COMPRESSED_BLOCK_OUTPUT);
-    let mut history = Vec::new();
-    let mut chunk = vec![0; block_size];
-    let mut block = Vec::new();
+    let mut history = Buffer::new(allowance);
+    let mut chunk = Buffer::filled(input_size.min(block_size as u64) as usize, 0u8, allowance)?;
+    let mut block = Buffer::new(allowance);
     let mut remaining = input_size;
     let mut completed = 0u64;
-    let mut held: Option<Vec<u8>> = None;
+    let mut held: Option<Buffer<u8, B>> = None;
     while remaining != 0 || held.is_some() {
         // One chunk, then further chunks while the data is not moving, which is
         // the cut [`BlockSplitter`] makes for the other two writers. Deciding
@@ -802,13 +825,17 @@ pub(crate) fn encode_lz_reader_to(
         let mut splitter = BlockSplitter::new();
         block.clear();
         match held.take() {
-            Some(first) => block.extend_from_slice(&first),
+            Some(first) => block
+                .extend_from_slice(&first)
+                .map_err(Into::<Error>::into)?,
             None => {
                 let wanted = usize::try_from(remaining.min(block_size as u64))
                     .map_err(|_| crate::Error::InvalidHeader("RAR 5 block size overflows usize"))?;
                 reader.read_exact(&mut chunk[..wanted])?;
                 remaining -= wanted as u64;
-                block.extend_from_slice(&chunk[..wanted]);
+                block
+                    .extend_from_slice(&chunk[..wanted])
+                    .map_err(Into::<Error>::into)?;
             }
         }
         splitter.accept(&block);
@@ -818,27 +845,29 @@ pub(crate) fn encode_lz_reader_to(
             reader.read_exact(&mut chunk[..wanted])?;
             remaining -= wanted as u64;
             if !splitter.extends(&chunk[..wanted]) {
-                held = Some(chunk[..wanted].to_vec());
+                held = Some(Buffer::copied(&chunk[..wanted], allowance)?);
                 break;
             }
             splitter.accept(&chunk[..wanted]);
-            block.extend_from_slice(&chunk[..wanted]);
+            block
+                .extend_from_slice(&chunk[..wanted])
+                .map_err(Into::<Error>::into)?;
         }
-        let packed = encode_lz_block(
-            &block,
-            &history,
+        let (window, start) = member_window_with_allowance(&block, &history, options, allowance)?;
+        let packed = encode_lz_block_with_allowance(
+            &window,
+            start..window.len(),
+            MemberSearch::Fresh,
             algorithm_version,
             &[],
             options,
             remaining == 0 && held.is_none(),
             None,
+            allowance,
         )?;
+        drop(window);
         output.write_all(&packed)?;
-        history.extend_from_slice(&block);
-        let keep_from = history.len().saturating_sub(options.max_match_distance);
-        if keep_from != 0 {
-            history.drain(..keep_from);
-        }
+        history.remember(&block, options.max_match_distance)?;
         completed += block.len() as u64;
         if progress
             .as_deref_mut()
@@ -884,11 +913,44 @@ pub(crate) fn encode_lz_streaming_blocks(
     blocks: &[(usize, bool)],
     algorithm_version: u8,
     options: EncodeOptions,
-    mut block_done: Option<&mut dyn FnMut(usize) -> bool>,
+    block_done: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<Vec<u8>>> {
-    let (combined, start) = member_window(data, history, options);
+    streaming_blocks_with_allowance(
+        data,
+        history,
+        blocks,
+        algorithm_version,
+        options,
+        block_done,
+        &Allowance::default(),
+    )
+    .map(|outputs| outputs.into_iter().map(Buffer::into_vec).collect())
+}
+fn streaming_blocks_with_allowance<B: Budget>(
+    data: &[u8],
+    history: &[u8],
+    blocks: &[(usize, bool)],
+    algorithm_version: u8,
+    options: EncodeOptions,
+    mut block_done: Option<&mut dyn FnMut(usize) -> bool>,
+    allowance: &B,
+) -> Result<Buffer<Buffer<u8, B>, B>> {
+    let mut previous = 0;
+    for &(end, _) in blocks {
+        if end <= previous || end > data.len() {
+            return Err(Error::InvalidData("RAR 5 streaming block range is invalid"));
+        }
+        previous = end;
+    }
+    if previous != data.len() {
+        return Err(Error::InvalidData(
+            "RAR 5 streaming blocks do not cover input",
+        ));
+    }
+    let (combined, start) = member_window_with_allowance(data, history, options, allowance)?;
+
     let mut at = start;
-    let mut output = Vec::with_capacity(blocks.len());
+    let mut output = Buffer::with_capacity(blocks.len(), allowance)?;
     let mut first = 0;
     // Block ends are offsets into `data`, so the bytes a block covers are the
     // step from the end before it. Reporting them as they land is what keeps a
@@ -905,15 +967,19 @@ pub(crate) fn encode_lz_streaming_blocks(
     };
     if start == 0 && options.optimal_parse && !blocks.is_empty() {
         let (end, is_last) = blocks[0];
-        output.push(encode_lz_block(
-            &combined[..end],
-            &[],
-            algorithm_version,
-            &[],
-            options,
-            is_last,
-            None,
-        )?);
+        output
+            .push(encode_lz_block_with_allowance(
+                &combined[..end],
+                0..end,
+                MemberSearch::Fresh,
+                algorithm_version,
+                &[],
+                options,
+                is_last,
+                None,
+                allowance,
+            )?)
+            .map_err(Into::into)?;
         at = end;
         first = 1;
         if !report(end, &mut block_done) {
@@ -923,7 +989,7 @@ pub(crate) fn encode_lz_streaming_blocks(
     if first == blocks.len() {
         return Ok(output);
     }
-    let finder = member_finder(&combined, at, options);
+    let finder = member_finder_with_allowance(&combined, at, options, allowance)?;
     let mut lazy = None;
     let mut collector = None;
     if options.optimal_parse {
@@ -935,20 +1001,23 @@ pub(crate) fn encode_lz_streaming_blocks(
     }
     for &(end, is_last) in &blocks[first..] {
         let end = start + end;
-        output.push(encode_lz_block_in_window(
-            &combined,
-            at..end,
-            match (&mut lazy, &mut collector) {
-                (Some(finder), _) => MemberSearch::Lazy(finder),
-                (_, Some(collector)) => MemberSearch::Optimal(collector),
-                _ => unreachable!(),
-            },
-            algorithm_version,
-            &[],
-            options,
-            is_last,
-            None,
-        )?);
+        output
+            .push(encode_lz_block_with_allowance(
+                &combined,
+                at..end,
+                match (&mut lazy, &mut collector) {
+                    (Some(finder), _) => MemberSearch::Lazy(finder),
+                    (_, Some(collector)) => MemberSearch::Optimal(collector),
+                    _ => unreachable!(),
+                },
+                algorithm_version,
+                &[],
+                options,
+                is_last,
+                None,
+                allowance,
+            )?)
+            .map_err(Into::into)?;
         at = end;
         if !report(end - start, &mut block_done) {
             return Err(Error::Cancelled);
@@ -1010,8 +1079,16 @@ pub(crate) fn filtered_lz_member(
     data: &[u8],
     filters: &[crate::FilterSpec],
 ) -> Result<(Vec<u8>, Vec<EncodeFilter>)> {
-    let mut filtered = data.to_vec();
-    let mut records = Vec::with_capacity(filters.len());
+    filtered_member_with_allowance(data, filters, &Allowance::default())
+        .map(|(data, records)| (data.into_vec(), records.into_vec()))
+}
+fn filtered_member_with_allowance<B: Budget>(
+    data: &[u8],
+    filters: &[crate::FilterSpec],
+    allowance: &B,
+) -> Result<(Buffer<u8, B>, Buffer<EncodeFilter, B>)> {
+    let mut filtered = Buffer::copied(data, allowance)?;
+    let mut records = Buffer::with_capacity(filters.len(), allowance)?;
     for filter in filters {
         let range = filter.range.clone().unwrap_or(0..data.len());
         if range.start >= range.end || range.end > data.len() {
@@ -1022,34 +1099,42 @@ pub(crate) fn filtered_lz_member(
         }
 
         let filter_data = &mut filtered[range.clone()];
-        let (filter_type, channels) =
-            encode_filter_data(rar50_filter(filter.kind)?, filter_data, range.start)?;
-        records.push(EncodeFilter {
-            offset: range.start,
-            length: range.len(),
-            filter_type,
-            channels,
-        });
+        let (filter_type, channels) = encode_filter_data(
+            rar50_filter(filter.kind)?,
+            filter_data,
+            range.start,
+            allowance,
+        )?;
+        records
+            .push(EncodeFilter {
+                offset: range.start,
+                length: range.len(),
+                filter_type,
+                channels,
+            })
+            .map_err(Into::into)?;
     }
     Ok((filtered, records))
 }
 
-fn encode_filter_data(
+fn encode_filter_data<B: Budget>(
     kind: Rar50Filter,
     data: &mut [u8],
     file_offset: usize,
+    allowance: &B,
 ) -> Result<(FilterType, usize)> {
     if file_offset > u32::MAX as usize {
         return Err(Error::InvalidData("RAR 5 filter offset is too large"));
     }
     match kind {
         Rar50Filter::Delta { channels } => {
-            filters::encode_in_place(
-                FilterOp::Delta { channels },
+            let transformed = filters::delta_encode_with_allowance(
                 data,
-                0,
+                channels,
                 rar50_delta_messages(),
+                allowance,
             )?;
+            data.copy_from_slice(&transformed);
             Ok((FilterType::Delta, channels))
         }
         Rar50Filter::E8 => {
@@ -1083,27 +1168,33 @@ fn encode_filter_data(
 /// cost [`encode_lz_member_inner`] took off the unfiltered path and left
 /// here: at 64 KiB a block, a four-megabyte member re-copied and re-inserted
 /// 126 MiB of history, thirty-one times what it holds.
-fn filtered_lz_blocks(
+fn filtered_lz_blocks<B: Budget>(
     data: &[u8],
     filters: &[crate::FilterSpec],
     history: &[u8],
     algorithm_version: u8,
     options: EncodeOptions,
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
-) -> Result<Vec<u8>> {
-    let filters = normalized_filter_specs(data.len(), filters)?;
+    allowance: &B,
+) -> Result<Buffer<u8, B>> {
+    let filters = normalized_filter_specs(data.len(), filters, allowance)?;
     let history = &history[history.len().saturating_sub(options.max_match_distance)..];
     let start = history.len();
-    let mut combined = Vec::with_capacity(start + data.len());
-    combined.extend_from_slice(history);
-    combined.extend_from_slice(data);
+    let mut combined = Buffer::with_capacity(
+        start
+            .checked_add(data.len())
+            .ok_or(Error::InvalidData("RAR 5 input window size overflows"))?,
+        allowance,
+    )?;
+    combined.extend_from_slice(history).map_err(Into::into)?;
+    combined.extend_from_slice(data).map_err(Into::into)?;
 
-    let mut blocks: Vec<(Range<usize>, Vec<EncodeFilter>)> = Vec::new();
+    let mut blocks = Buffer::new(allowance);
     let mut chunk_start = 0usize;
     while chunk_start < data.len() {
         let chunk_end = (chunk_start + FILTERED_LZ_BLOCK_SIZE).min(data.len());
-        let mut records = Vec::new();
-        for filter in &filters {
+        let mut records = Buffer::new(allowance);
+        for filter in filters.iter() {
             let filter_start = filter.range.start.max(chunk_start);
             let filter_end = filter.range.end.min(chunk_end);
             if filter_start >= filter_end {
@@ -1113,32 +1204,47 @@ fn filtered_lz_blocks(
                 filter.kind,
                 &mut combined[start + filter_start..start + filter_end],
                 filter_start,
+                allowance,
             )?;
-            records.push(EncodeFilter {
-                offset: filter_start - chunk_start,
-                length: filter_end - filter_start,
-                filter_type,
-                channels,
-            });
+            records
+                .push(EncodeFilter {
+                    offset: filter_start - chunk_start,
+                    length: filter_end - filter_start,
+                    filter_type,
+                    channels,
+                })
+                .map_err(Into::into)?;
         }
-        blocks.push((chunk_start..chunk_end, records));
+        blocks
+            .push((chunk_start..chunk_end, records))
+            .map_err(Into::into)?;
         chunk_start = chunk_end;
     }
 
     // One search state for the whole member, as the unfiltered path has.
-    let mut lazy = (!options.optimal_parse).then(|| member_finder(&combined, start, options));
-    let mut collector = options
-        .optimal_parse
-        .then(|| OptimalCollector::new(&combined, start, options));
+    let mut lazy = if options.optimal_parse {
+        None
+    } else {
+        Some(member_finder_with_allowance(
+            &combined, start, options, allowance,
+        )?)
+    };
+    let mut collector = if options.optimal_parse {
+        Some(OptimalCollector::with_allowance(
+            &combined, start, options, allowance,
+        )?)
+    } else {
+        None
+    };
 
-    let mut out = Vec::new();
+    let mut out = Buffer::new(allowance);
     for (block, records) in blocks {
         let mut chunk_progress = |position: usize| {
             progress
                 .as_deref_mut()
                 .is_none_or(|report| report(block.start.saturating_add(position)))
         };
-        out.extend(encode_lz_block_in_window(
+        let packed = encode_lz_block_with_allowance(
             &combined,
             start + block.start..start + block.end,
             match (&mut lazy, &mut collector) {
@@ -1151,7 +1257,9 @@ fn filtered_lz_blocks(
             options,
             block.end == data.len(),
             Some(&mut chunk_progress),
-        )?);
+            allowance,
+        )?;
+        out.extend_from_slice(&packed).map_err(Into::into)?;
     }
     Ok(out)
 }
@@ -1162,20 +1270,23 @@ struct NormalizedFilterSpec {
     range: Range<usize>,
 }
 
-fn normalized_filter_specs(
+fn normalized_filter_specs<B: Budget>(
     data_len: usize,
     filters: &[crate::FilterSpec],
-) -> Result<Vec<NormalizedFilterSpec>> {
-    let mut normalized = Vec::with_capacity(filters.len());
+    allowance: &B,
+) -> Result<Buffer<NormalizedFilterSpec, B>> {
+    let mut normalized = Buffer::with_capacity(filters.len(), allowance)?;
     for filter in filters {
         let range = filter.range.clone().unwrap_or(0..data_len);
         if range.start >= range.end || range.end > data_len {
             return Err(Error::InvalidData("RAR 5 filter range is invalid"));
         }
-        normalized.push(NormalizedFilterSpec {
-            kind: rar50_filter(filter.kind)?,
-            range,
-        });
+        normalized
+            .push(NormalizedFilterSpec {
+                kind: rar50_filter(filter.kind)?,
+                range,
+            })
+            .map_err(Into::into)?;
     }
     Ok(normalized)
 }
@@ -1209,21 +1320,8 @@ fn encode_member_with_allowance<B: Budget>(
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
     allowance: &B,
 ) -> Result<Buffer<u8, B>> {
-    let history = &history[history.len().saturating_sub(options.max_match_distance)..];
-    let mut window;
-    let combined = if history.is_empty() {
-        data
-    } else {
-        let capacity = history
-            .len()
-            .checked_add(data.len())
-            .ok_or(Error::InvalidData("RAR 5 input window size overflows"))?;
-        window = Buffer::with_capacity(capacity, allowance)?;
-        window.extend_from_slice(history).map_err(Into::into)?;
-        window.extend_from_slice(data).map_err(Into::into)?;
-        &window
-    };
-    let start = history.len();
+    let (window, start) = member_window_with_allowance(data, history, options, allowance)?;
+    let combined = &*window;
     if data.len() > LZ_BLOCK_SIZE && initial_filters.is_empty() {
         // One search state for the whole member. It used to be built per
         // block, which meant rehashing a window of history every 64 KiB: on a
@@ -1319,11 +1417,6 @@ fn finder_window(options: EncodeOptions, reach: usize) -> usize {
 /// A finder for the whole member, seeded with the history it carries in. It
 /// keeps growing as the blocks are parsed, so it is sized to the widest window
 /// the member could ever want rather than to any one block.
-fn member_finder(combined: &[u8], start: usize, options: EncodeOptions) -> Rar50MatchFinder {
-    member_finder_with_allowance(combined, start, options, &Allowance::default())
-        .expect("unlimited finder allocation")
-}
-
 fn member_finder_with_allowance<B: Budget>(
     combined: &[u8],
     start: usize,
@@ -1419,6 +1512,7 @@ enum CollectorFinder<B: Budget = Allowance> {
 }
 
 impl OptimalCollector {
+    #[cfg(test)]
     fn new(combined: &[u8], start: usize, options: EncodeOptions) -> Self {
         Self::with_allowance(combined, start, options, &Allowance::default())
             .expect("unlimited collector allocation")
@@ -1583,24 +1677,43 @@ impl<B: Budget> OptimalCollector<B> {
 ///
 /// A member with no history to carry borrows its own data rather than copying
 /// it, which is every member of a non-solid archive.
-fn member_window<'a>(
+enum MemberWindow<'a, B: Budget> {
+    Borrowed(&'a [u8]),
+    Owned(Buffer<u8, B>),
+}
+impl<B: Budget> std::ops::Deref for MemberWindow<'_, B> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(data) => data,
+            Self::Owned(data) => data,
+        }
+    }
+}
+fn member_window_with_allowance<'a, B: Budget>(
     data: &'a [u8],
     history: &[u8],
     options: EncodeOptions,
-) -> (std::borrow::Cow<'a, [u8]>, usize) {
+    allowance: &B,
+) -> Result<(MemberWindow<'a, B>, usize)> {
     let history = &history[history.len().saturating_sub(options.max_match_distance)..];
     if history.is_empty() {
-        return (std::borrow::Cow::Borrowed(data), 0);
+        return Ok((MemberWindow::Borrowed(data), 0));
     }
-    let mut combined = Vec::with_capacity(history.len() + data.len());
-    combined.extend_from_slice(history);
-    combined.extend_from_slice(data);
-    (std::borrow::Cow::Owned(combined), history.len())
+    let size = history
+        .len()
+        .checked_add(data.len())
+        .ok_or(Error::InvalidData("RAR 5 input window size overflows"))?;
+    let mut combined = Buffer::with_capacity(size, allowance)?;
+    combined.extend_from_slice(history).map_err(Into::into)?;
+    combined.extend_from_slice(data).map_err(Into::into)?;
+    Ok((MemberWindow::Owned(combined), history.len()))
 }
 
 /// One block, with its own history and its own finder. The member path shares
 /// a finder across blocks instead; this is for the callers that encode a block
 /// on its own, which are the filtered path and the tests.
+#[cfg(test)]
 fn encode_lz_block(
     data: &[u8],
     history: &[u8],
@@ -1610,7 +1723,8 @@ fn encode_lz_block(
     is_last: bool,
     progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<u8>> {
-    let (combined, start) = member_window(data, history, options);
+    let (combined, start) =
+        member_window_with_allowance(data, history, options, &Allowance::default())?;
     encode_lz_block_in_window(
         &combined,
         start..combined.len(),
@@ -1624,6 +1738,7 @@ fn encode_lz_block(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn encode_lz_block_in_window(
     combined: &[u8],
     block: std::ops::Range<usize>,
@@ -1825,35 +1940,100 @@ fn encode_token_block_with_allowance<B: Budget>(
     encode_compressed_block_with_allowance(&writer.bytes, payload_bits, true, is_last, allowance)
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct Unpack50Encoder {
-    history: Vec<u8>,
+#[derive(Debug)]
+struct EncoderState<B: Budget> {
+    history: Buffer<u8, B>,
     options: EncodeOptions,
 }
+impl<B: Budget> EncoderState<B> {
+    fn new(options: EncodeOptions, allowance: &B) -> Self {
+        Self {
+            history: Buffer::new(allowance),
+            options,
+        }
+    }
+    fn encode(
+        &mut self,
+        input: &[u8],
+        version: u8,
+        filters: Option<&[crate::FilterSpec]>,
+        progress: Option<&mut dyn FnMut(usize) -> bool>,
+    ) -> Result<Buffer<u8, B>> {
+        let allowance = self.history.allowance();
+        let packed = match filters {
+            None => encode_member_with_allowance(
+                input,
+                &self.history,
+                version,
+                &[],
+                self.options,
+                progress,
+                &allowance,
+            )?,
+            Some(filters) if input.len() > FILTERED_LZ_BLOCK_SIZE => filtered_lz_blocks(
+                input,
+                filters,
+                &self.history,
+                version,
+                self.options,
+                progress,
+                &allowance,
+            )?,
+            Some(filters) => {
+                let (filtered, records) =
+                    filtered_member_with_allowance(input, filters, &allowance)?;
+                encode_member_with_allowance(
+                    &filtered,
+                    &self.history,
+                    version,
+                    &records,
+                    self.options,
+                    progress,
+                    &allowance,
+                )?
+            }
+        };
+        // Commit history only after the encode and its callback succeed. The
+        // packed result remains charged while any history growth is admitted.
+        self.history
+            .remember(input, self.options.max_match_distance)?;
+        Ok(packed)
+    }
+}
 
+#[derive(Debug)]
+pub struct Unpack50Encoder {
+    state: EncoderState<Allowance>,
+}
+impl Clone for Unpack50Encoder {
+    fn clone(&self) -> Self {
+        Self {
+            state: EncoderState {
+                history: Buffer::from_vec(self.state.history.to_vec()),
+                options: self.state.options,
+            },
+        }
+    }
+}
+impl Default for Unpack50Encoder {
+    fn default() -> Self {
+        Self::with_options(EncodeOptions::default())
+    }
+}
 impl Unpack50Encoder {
     pub fn new() -> Self {
         Self::default()
     }
-
     pub fn with_options(options: EncodeOptions) -> Self {
         Self {
-            history: Vec::new(),
-            options,
+            state: EncoderState::new(options, &Allowance::default()),
         }
     }
-
     pub fn encode_member(&mut self, input: &[u8], algorithm_version: u8) -> Result<Vec<u8>> {
-        let packed = encode_lz_member_with_history_and_options(
-            input,
-            &self.history,
-            algorithm_version,
-            self.options,
-        )?;
-        self.remember(input);
-        Ok(packed)
+        self.state
+            .encode(input, algorithm_version, None, None)
+            .map(Buffer::into_vec)
     }
-
     pub fn encode_member_with_filter(
         &mut self,
         input: &[u8],
@@ -1862,43 +2042,16 @@ impl Unpack50Encoder {
     ) -> Result<Vec<u8>> {
         self.encode_member_with_filters(input, algorithm_version, &[filter])
     }
-
     pub fn encode_member_with_filters(
         &mut self,
         input: &[u8],
         algorithm_version: u8,
         filters: &[crate::FilterSpec],
     ) -> Result<Vec<u8>> {
-        if input.len() > FILTERED_LZ_BLOCK_SIZE {
-            let packed = filtered_lz_blocks(
-                input,
-                filters,
-                &self.history,
-                algorithm_version,
-                self.options,
-                None,
-            )?;
-            self.remember(input);
-            return Ok(packed);
-        }
-        let (filtered, records) = filtered_lz_member(input, filters)?;
-        let packed = encode_lz_member_inner(
-            &filtered,
-            &self.history,
-            algorithm_version,
-            &records,
-            self.options,
-            None,
-        )?;
-        // Remembering the caller's input rather than the filtered bytes only
-        // matters once history is carried between members, and the RAR 5
-        // writer refuses a filter in a solid archive, so it never is. The RAR
-        // 2.9 encoder had the same shape and did carry history: every member
-        // after a filtered one referred to bytes no decoder had.
-        self.remember(input);
-        Ok(packed)
+        self.state
+            .encode(input, algorithm_version, Some(filters), None)
+            .map(Buffer::into_vec)
     }
-
     pub(crate) fn encode_member_with_filters_and_progress(
         &mut self,
         input: &[u8],
@@ -1906,39 +2059,9 @@ impl Unpack50Encoder {
         filters: &[crate::FilterSpec],
         progress: &mut dyn FnMut(usize) -> bool,
     ) -> Result<Vec<u8>> {
-        let packed = if input.len() > FILTERED_LZ_BLOCK_SIZE {
-            filtered_lz_blocks(
-                input,
-                filters,
-                &self.history,
-                algorithm_version,
-                self.options,
-                Some(progress),
-            )?
-        } else {
-            let (filtered, records) = filtered_lz_member(input, filters)?;
-            encode_lz_member_inner(
-                &filtered,
-                &self.history,
-                algorithm_version,
-                &records,
-                self.options,
-                Some(progress),
-            )?
-        };
-        self.remember(input);
-        Ok(packed)
-    }
-
-    fn remember(&mut self, input: &[u8]) {
-        self.history.extend_from_slice(input);
-        let keep_from = self
-            .history
-            .len()
-            .saturating_sub(self.options.max_match_distance);
-        if keep_from != 0 {
-            self.history.drain(..keep_from);
-        }
+        self.state
+            .encode(input, algorithm_version, Some(filters), Some(progress))
+            .map(Buffer::into_vec)
     }
 }
 
@@ -4390,6 +4513,274 @@ fn try_write_level_lengths<B: Budget>(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn bounded_reader_admits_input_before_reading_and_releases_on_errors() {
+        struct Source<'a> {
+            bytes: std::io::Cursor<&'a [u8]>,
+            reads: usize,
+        }
+        impl Read for Source<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                self.bytes.read(buffer)
+            }
+        }
+        let data: Vec<_> = (0..8192).map(|i| ((i * 71) ^ (i >> 5)) as u8).collect();
+        let options = EncodeOptions::new(16).with_max_match_distance(1024);
+        let denied = Allowance::limited(0);
+        let mut source = Source {
+            bytes: std::io::Cursor::new(&data),
+            reads: 0,
+        };
+        let error = reader_to_with_allowance(
+            &mut source,
+            data.len() as u64,
+            &mut std::io::sink(),
+            0,
+            options,
+            256,
+            None,
+            &denied,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::Error::Codec(Error::WorkspaceLimitExceeded(_))
+        ));
+        assert_eq!(source.reads, 0);
+        assert_eq!(denied.used(), 0);
+
+        let allowance = Allowance::limited(8 * 1024 * 1024);
+        let mut output = Vec::new();
+        reader_to_with_allowance(
+            &mut std::io::Cursor::new(&data),
+            data.len() as u64,
+            &mut output,
+            0,
+            options,
+            256,
+            None,
+            &allowance,
+        )
+        .unwrap();
+        assert_eq!(decode_lz(&output, 0, data.len()).unwrap(), data);
+        assert_eq!(allowance.used(), 0);
+        for declared in [data.len() as u64 - 1, data.len() as u64 + 1] {
+            assert!(reader_to_with_allowance(
+                &mut std::io::Cursor::new(&data),
+                declared,
+                &mut std::io::sink(),
+                0,
+                options,
+                256,
+                None,
+                &allowance
+            )
+            .is_err());
+            assert_eq!(allowance.used(), 0);
+        }
+        let mut prefix = Vec::new();
+        assert!(matches!(
+            reader_to_with_allowance(
+                &mut std::io::Cursor::new(&data),
+                data.len() as u64,
+                &mut prefix,
+                0,
+                options,
+                256,
+                Some(&mut |_| false),
+                &allowance
+            ),
+            Err(crate::Error::Cancelled)
+        ));
+        assert!(
+            !prefix.is_empty(),
+            "streaming refusal can leave an emitted prefix"
+        );
+        assert_eq!(allowance.used(), 0);
+    }
+
+    #[test]
+    fn filtered_state_owns_transform_scratch_history_and_outputs() {
+        let data: Vec<_> = (0..FILTERED_LZ_BLOCK_SIZE + 257)
+            .map(|i| ((i * 17) ^ (i >> 9)) as u8)
+            .collect();
+        for version in [0, 1] {
+            for optimal in [false, true] {
+                let options = EncodeOptions::new(16)
+                    .with_optimal_parse(optimal)
+                    .with_max_match_distance(8192);
+                for size in [4096, data.len()] {
+                    for kind in [
+                        crate::FilterKind::Delta { channels: 3 },
+                        crate::FilterKind::E8E9,
+                        crate::FilterKind::Arm,
+                    ] {
+                        let filters = [crate::FilterSpec::whole(kind)];
+                        let allowance = Allowance::limited(16 * 1024 * 1024);
+                        let mut state = EncoderState::new(options, &allowance);
+                        let mut reference = Unpack50Encoder::with_options(options);
+                        let expected = reference
+                            .encode_member_with_filters(&data[..size], version, &filters)
+                            .unwrap();
+                        let packed = state
+                            .encode(&data[..size], version, Some(&filters), None)
+                            .unwrap();
+                        assert_eq!(&*packed, expected);
+                        assert_eq!(&*state.history, &data[size.saturating_sub(8192)..size]);
+                        drop(packed);
+                        let history_charge = allowance.used();
+                        assert!(history_charge >= state.history.len() as u64);
+                        let following = state.encode(b"next member", version, None, None).unwrap();
+                        assert_eq!(
+                            &*following,
+                            reference.encode_member(b"next member", version).unwrap()
+                        );
+                        drop(state);
+                        assert!(allowance.used() >= following.len() as u64);
+                        drop(following);
+                        assert_eq!(allowance.used(), 0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn delta_scratch_refusal_does_not_modify_caller_input_or_leak_records() {
+        let input = [7u8; 512];
+        let filters = [crate::FilterSpec::whole(crate::FilterKind::Delta {
+            channels: 3,
+        })];
+        let records = std::mem::size_of::<EncodeFilter>() as u64;
+        for limit in [1024 + records - 1, 1024 + records] {
+            let allowance = Allowance::limited(limit);
+            let result = filtered_member_with_allowance(&input, &filters, &allowance);
+            assert_eq!(input, [7; 512]);
+            if limit == 1024 + records - 1 {
+                assert!(matches!(result, Err(Error::WorkspaceLimitExceeded(_))));
+                assert_eq!(allowance.used(), 0);
+            } else {
+                let (data, descriptors) = result.unwrap();
+                assert_eq!(allowance.used(), 512 + records);
+                assert_eq!(descriptors.len(), 1);
+                assert_eq!(
+                    filters::delta_decode_with_control(
+                        &data,
+                        3,
+                        rar50_delta_messages(),
+                        &crate::read_control::ReadControl::default()
+                    )
+                    .unwrap(),
+                    input
+                );
+                drop((data, descriptors));
+                assert_eq!(allowance.used(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn failed_stateful_encodes_preserve_history_and_allow_reuse() {
+        let allowance = Allowance::limited(4 * 1024 * 1024);
+        let options = EncodeOptions::new(16)
+            .with_optimal_parse(true)
+            .with_max_match_distance(128);
+        let mut state = EncoderState::new(options, &allowance);
+        drop(state.encode(b"existing history", 0, None, None).unwrap());
+        let previous = state.history.to_vec();
+        let retained = allowance.used();
+        let blocker =
+            Buffer::filled((4 * 1024 * 1024 - retained - 64) as usize, 0u8, &allowance).unwrap();
+        assert!(matches!(
+            state.encode(b"refused input", 0, None, None),
+            Err(Error::WorkspaceLimitExceeded(_))
+        ));
+        assert_eq!(&*state.history, previous);
+        drop(blocker);
+        assert_eq!(allowance.used(), retained);
+        let filters = [crate::FilterSpec::whole(crate::FilterKind::E8)];
+        assert!(matches!(
+            state.encode(b"cancelled input", 0, Some(&filters), Some(&mut |_| false)),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(&*state.history, previous);
+        assert_eq!(allowance.used(), retained);
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = state.encode(
+                b"callback panic",
+                0,
+                Some(&filters),
+                Some(&mut |_| panic!("callback")),
+            );
+        }));
+        assert!(unwind.is_err());
+        assert_eq!(&*state.history, previous);
+        assert_eq!(allowance.used(), retained);
+        drop(state.encode(b"successful retry", 0, None, None).unwrap());
+        assert!(state.history.ends_with(b"successful retry"));
+        drop(state);
+        assert_eq!(allowance.used(), 0);
+    }
+
+    #[test]
+    fn streaming_results_remain_owned_and_cancelled_runs_release_all_blocks() {
+        let data: Vec<_> = (0..8192).map(|i| (i * 71) as u8).collect();
+        let blocks = [(2048, false), (4096, false), (8192, true)];
+        for optimal in [false, true] {
+            let allowance = Allowance::limited(8 * 1024 * 1024);
+            let options = EncodeOptions::new(16)
+                .with_optimal_parse(optimal)
+                .with_max_match_distance(1024);
+            let expected =
+                encode_lz_streaming_blocks(&data, b"prior history", &blocks, 0, options, None)
+                    .unwrap();
+            let outputs = streaming_blocks_with_allowance(
+                &data,
+                b"prior history",
+                &blocks,
+                0,
+                options,
+                None,
+                &allowance,
+            )
+            .unwrap();
+            for (actual, expected) in outputs.iter().zip(expected) {
+                assert_eq!(&**actual, expected);
+            }
+            let mut outputs = outputs.into_iter();
+            let first = outputs.next().unwrap();
+            drop(outputs);
+            assert!(allowance.used() >= first.len() as u64);
+            drop(first);
+            assert_eq!(allowance.used(), 0);
+            assert!(matches!(
+                streaming_blocks_with_allowance(
+                    &data,
+                    &[],
+                    &blocks,
+                    0,
+                    options,
+                    Some(&mut |_| false),
+                    &allowance
+                ),
+                Err(Error::Cancelled)
+            ));
+            assert_eq!(allowance.used(), 0);
+            assert!(streaming_blocks_with_allowance(
+                &data,
+                &[],
+                &[(9000, true)],
+                0,
+                options,
+                None,
+                &allowance
+            )
+            .is_err());
+            assert_eq!(allowance.used(), 0);
+        }
+    }
+
+    #[test]
     fn member_allowance_covers_history_tables_and_retained_block_output() {
         let data = b"bounded member with repeated words and short matches\n".repeat(3000);
         let history = b"short matches and remembered history\n".repeat(1000);
@@ -4866,7 +5257,8 @@ mod tests {
         options: EncodeOptions,
         distance_size: usize,
     ) -> Vec<EncodeToken> {
-        let (combined, start) = member_window(input, history, options);
+        let (combined, start) =
+            member_window_with_allowance(input, history, options, &Allowance::default()).unwrap();
         encode_tokens_with_progress(
             &combined,
             start..combined.len(),
@@ -6137,7 +6529,11 @@ mod tests {
         let filter = crate::FilterSpec::range(crate::FilterKind::E8, 0..data.len());
 
         let mut solid = Unpack50Encoder::with_options(EncodeOptions::new(16));
-        solid.remember(&earlier);
+        solid
+            .state
+            .history
+            .remember(&earlier, solid.state.options.max_match_distance)
+            .unwrap();
         let against_history = solid
             .encode_member_with_filter(&data, 0, filter.clone())
             .unwrap();
@@ -6185,15 +6581,26 @@ mod tests {
         let mut encoder = Unpack50Encoder::with_options(
             EncodeOptions::new(0).with_max_match_distance(DEFAULT_DICTIONARY_SIZE + 1024),
         );
-        encoder.remember(&vec![0x41; DEFAULT_DICTIONARY_SIZE + 512]);
+        encoder
+            .state
+            .history
+            .remember(
+                &vec![0x41; DEFAULT_DICTIONARY_SIZE + 512],
+                encoder.state.options.max_match_distance,
+            )
+            .unwrap();
 
-        assert_eq!(encoder.history.len(), DEFAULT_DICTIONARY_SIZE + 512);
+        assert_eq!(encoder.state.history.len(), DEFAULT_DICTIONARY_SIZE + 512);
 
         let mut capped =
             Unpack50Encoder::with_options(EncodeOptions::new(0).with_max_match_distance(1024));
-        capped.remember(&vec![0x42; 4096]);
+        capped
+            .state
+            .history
+            .remember(&vec![0x42; 4096], capped.state.options.max_match_distance)
+            .unwrap();
 
-        assert_eq!(capped.history.len(), 1024);
+        assert_eq!(capped.state.history.len(), 1024);
     }
 
     #[test]

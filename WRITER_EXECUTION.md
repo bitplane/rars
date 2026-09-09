@@ -78,10 +78,10 @@ optimal parsing (automatic fallback considers only the base candidate):
 
 These charges cover the anticipated input/history/search buffers, finder links,
 token streams and parse workspace. They are estimates, not allocator tracking.
-The RAR5 raw-member codec's history window, parser, Huffman workspace and output
-owners support fallible internal allocation allowances, but production codec
-entry points still use unlimited handles. Source input, streaming and filter
-buffers, stateful history, encryption/recovery workspace and coordinator
+The RAR5 codec's raw/filtered members, adjacent streaming blocks and persistent
+history support fallible internal allocation allowances, but production entry
+points still use unlimited handles. Source loading, streaming job assembly,
+automatic filter search, encryption/recovery workspace and coordinator
 integration must be covered before an enforceable writer policy is available.
 `whole_member_workspace` adds four times the input size and a codec workspace
 estimate with reach and block size fitted to that input.

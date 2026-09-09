@@ -198,11 +198,17 @@ cancellation. Error selection prefers a source/codec failure over the resulting
 cancellation. Returning joins admitted callbacks before releasing their owners;
 reusing the resources after an ordinary failure does not inherit cancellation.
 
-These reservations still use workspace estimates. The raw-member codec has an
-internal fallible allowance path covering history-window copies, chain/tree
+These reservations still use workspace estimates. Raw and filtered members,
+adjacent streaming blocks and persistent codec history have an internal
+fallible allowance path covering history-window copies, chain/tree
 match-finder tables, collected match runs and offsets, parse arrays, candidate
 reaches, competing token buffers, Huffman construction and code tables, table
-serialization, bit output, block framing and the retained member output.
+serialization, bit output, block framing and retained outputs. Filter copies,
+delta scratch, normalized filter specifications and per-block descriptors use
+the same allowance. Consuming a descriptor container keeps its allocation
+charged until the iterator drops; extracted output owners keep their own charges.
+History growth is admitted before mutation and copies only the retained tail.
+An encode refusal or callback failure preserves the previous persistent history.
 Covered owners reserve before growth, include replacement peaks and retain
 charges through moves and token selection. Unlimited and bounded buffers use
 separate compile-time policies; the unlimited owner retains Vec's layout.
@@ -212,11 +218,12 @@ extra bytes. An allowance cannot borrow capacity from another worker.
 
 This is migration infrastructure, not an available writer limit. Production
 codec entry points currently use unlimited handles; bounded construction is
-internal test coverage, including its refusal diagnostics. Source loading,
-streaming input/history buffers, filter transformation/search candidates and
-their payload ownership, stateful encoder history, encryption/KDF and recovery
-workspace still need migration. Only after those paths are covered
-can the coordinator supply reserved allowances and connect them to preparation
+internal test coverage, including its refusal diagnostics. The codec reader
+adapter also has bounded read-ahead and input-buffer tests; it is not the
+production writer's source-loading path. Source loading and streaming job
+assembly, automatic filter-search candidates and their retained payloads,
+encryption/KDF and recovery workspace still need migration. Only after those
+paths are covered can the coordinator supply reserved allowances and connect them to preparation
 and spool memory. There is no public worker allowance or extension API yet.
 The workspace/admission pass remains open until those guarantees are enforceable.
 

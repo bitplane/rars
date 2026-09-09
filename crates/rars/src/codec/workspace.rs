@@ -203,6 +203,28 @@ impl<T, B: Budget> Buffer<T, B> {
     pub(crate) fn pop(&mut self) -> Option<T> {
         self.values.pop()
     }
+    pub(crate) fn copied(values: &[T], allowance: &B) -> Result<Self>
+    where
+        T: Copy,
+    {
+        let mut out = Self::with_capacity(values.len(), allowance)?;
+        out.extend_from_slice(values).map_err(Into::into)?;
+        Ok(out)
+    }
+    /// Admit the final window before modifying it. A refusal keeps the old
+    /// history intact, and input larger than the window is never copied in full.
+    pub(crate) fn remember(&mut self, input: &[T], limit: usize) -> Result<()>
+    where
+        T: Copy,
+    {
+        let input = &input[input.len().saturating_sub(limit)..];
+        let keep = self.len().min(limit - input.len());
+        self.reserve((keep + input.len()).saturating_sub(self.len()))?;
+        let start = self.len() - keep;
+        self.values.copy_within(start.., 0);
+        self.values.truncate(keep);
+        self.extend_from_slice(input).map_err(Into::into)
+    }
     pub(crate) fn extend_from_slice(&mut self, values: &[T]) -> std::result::Result<(), B::Failure>
     where
         T: Copy,
@@ -224,6 +246,30 @@ impl<T, B: Budget> Buffer<T, B> {
         Ok(())
     }
 }
+pub(crate) struct BufferIter<T, B: Budget> {
+    values: std::vec::IntoIter<T>,
+    _charge: B::Charge,
+}
+impl<T, B: Budget> IntoIterator for Buffer<T, B> {
+    type Item = T;
+    type IntoIter = BufferIter<T, B>;
+    fn into_iter(self) -> Self::IntoIter {
+        BufferIter {
+            values: self.values.into_iter(),
+            _charge: self.charge,
+        }
+    }
+}
+impl<T, B: Budget> Iterator for BufferIter<T, B> {
+    type Item = T;
+    fn next(&mut self) -> Option<T> {
+        self.values.next()
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.values.size_hint()
+    }
+}
+impl<T, B: Budget> ExactSizeIterator for BufferIter<T, B> {}
 impl<T> Buffer<T> {
     pub(crate) fn from_vec(values: Vec<T>) -> Self {
         Self { values, charge: () }
@@ -283,6 +329,58 @@ impl<T: PartialEq, B: Budget> PartialEq<Vec<T>> for Buffer<T, B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_admits_before_mutation_and_only_copies_the_retained_tail() {
+        for limit in [10, 11] {
+            let allowance = Allowance::limited(limit);
+            let mut history = Buffer::copied(b"abc", &allowance).unwrap();
+            let result = history.remember(b"0123456789", 8);
+            if limit == 10 {
+                assert!(matches!(result, Err(Error::WorkspaceLimitExceeded(_))));
+                assert_eq!(&*history, b"abc");
+                assert_eq!(allowance.used(), 3);
+            } else {
+                result.unwrap();
+                assert_eq!(&*history, b"23456789");
+                assert_eq!(allowance.used(), 8);
+            }
+        }
+        let input = vec![42; 1024 * 1024];
+        let allowance = Allowance::limited(8);
+        let mut history = Buffer::new(&allowance);
+        history.remember(&input, 8).unwrap();
+        history.remember(b"abc", 8).unwrap();
+        assert_eq!(&*history, &[42, 42, 42, 42, 42, b'a', b'b', b'c']);
+        assert_eq!(allowance.used(), 8);
+        history.remember(b"discard", 0).unwrap();
+        assert!(history.is_empty());
+        assert_eq!(allowance.used(), 8, "spare capacity remains owned");
+        drop(history);
+        assert_eq!(allowance.used(), 0);
+    }
+
+    #[test]
+    fn consuming_a_container_keeps_its_allocation_and_extracted_children_charged() {
+        let allowance = Allowance::limited(4096);
+        let mut owners = Buffer::with_capacity(2, &allowance).unwrap();
+        owners
+            .push(Buffer::filled(8, 1u8, &allowance).unwrap())
+            .unwrap();
+        owners
+            .push(Buffer::filled(16, 2u8, &allowance).unwrap())
+            .unwrap();
+        let total = allowance.used();
+        let mut iter = owners.into_iter();
+        let first = iter.next().unwrap();
+        assert_eq!(iter.len(), 1);
+        assert_eq!(allowance.used(), total);
+        drop(iter);
+        assert_eq!(allowance.used(), 8);
+        assert_eq!(&*first, &[1; 8]);
+        drop(first);
+        assert_eq!(allowance.used(), 0);
+    }
 
     #[test]
     fn unlimited_buffers_and_success_results_keep_the_existing_layout() {

@@ -203,16 +203,31 @@ pub(crate) fn delta_encode(
     channels: usize,
     messages: DeltaErrorMessages,
 ) -> Result<Vec<u8>> {
+    delta_encode_with_allowance(
+        data,
+        channels,
+        messages,
+        &super::workspace::Allowance::default(),
+    )
+    .map(super::workspace::Buffer::into_vec)
+}
+
+pub(crate) fn delta_encode_with_allowance<B: super::workspace::Budget>(
+    data: &[u8],
+    channels: usize,
+    messages: DeltaErrorMessages,
+    allowance: &B,
+) -> Result<super::workspace::Buffer<u8, B>> {
     if channels == 0 || channels > 32 {
         return Err(Error::InvalidData(messages.invalid_channels));
     }
-    let mut out = Vec::with_capacity(data.len());
+    let mut out = super::workspace::Buffer::with_capacity(data.len(), allowance)?;
     for channel in 0..channels {
         let mut prev = 0u8;
         let mut src = channel;
         while src < data.len() {
             let byte = data[src];
-            out.push(prev.wrapping_sub(byte));
+            out.push(prev.wrapping_sub(byte)).map_err(Into::into)?;
             prev = byte;
             src += channels;
         }
