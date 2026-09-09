@@ -179,13 +179,28 @@ oversized-member-runs-alone behaviour remains an explicitly estimated-workspace
 policy for calls without that hard limit. Neither policy may silently change
 archive version, dictionary, filters, encryption or preservation semantics.
 
-## Remaining implementation boundaries
+## Remaining implementation passes
 
-Next, extend capacity accounting to other retained allocations and connect
-workspace allocation allowances to coordinator admission. Then
-integrate output collectors and expose the enforceable policies consistently
-through the high-level entry points and bindings. Reader resource accounting is
-a separate follow-up.
+Complete these as outcome-based passes, including implementation and validation.
+A pass is not complete merely because one buffer type has been converted.
+The existing per-class quotas are building blocks for the aggregate policy.
+
+| Pass | Scope | Completion evidence |
+| --- | --- | --- |
+| 1. Header and preparation memory | Variable-length serializer buffers, prepared and transient header images, and retained preparation descriptors. Review single-archive, volume, recovery and legacy paths. | Covered allocations reserve capacity before allocation; simultaneous scratch and retained images and replacement peaks count; failures and cancellation release only discarded ownership. An allocation inventory identifies every remaining exclusion or unsupported mode. |
+| 2. Workspace and coordinator admission | Compression plans, job records, active codec/filter/encryption/recovery workspace and retained worker results. | Coordinator admission reserves peak workspace and retained-result allowances before dispatch. Workers have enforceable allowances and an extension policy. No race for shared spare bytes determines success. Oversized jobs, sibling failure, cancellation and retained results are tested. |
+| 3. Output ownership | Writer-owned archive/volume collectors, staging, transfers and copies. | Capacity remains charged until ownership transfers or storage is freed; copies and replacement peaks count simultaneously. Active and retained allocations compose under one managed-memory ledger. Caller-owned input and external sink exclusions are explicit. |
+| 4. Public integration and validation | High-level Rust, CLI, Python and npm controls, errors and documentation. | One coherent hard-policy contract across entry points, with explicit refusal of unsupported modes; byte compatibility, ratio, CPU and peak-memory checks cover the writer matrix. Existing estimated-workspace behaviour remains available separately. |
+
+Preparation descriptors belong in pass 1. Compression coordinator records belong
+in pass 2 because their capacity and lifetime depend on job admission. Avoid
+creating a public setting for every internal buffer class; consolidate the
+policy as the common accounting and ownership model becomes enforceable.
+
+Reader resource accounting and reader API extensions remain separate follow-ups.
+The writer work is complete only when the covered active and retained allocation
+classes compose under the aggregate contract above, not when their independent
+limits merely exist.
 
 For changes to planning or execution selection, check byte output, compression
 ratio, CPU and peak RAM across stored, compressed, solid, filtered, encrypted and
