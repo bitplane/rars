@@ -170,6 +170,12 @@ pub enum Error {
         required: u64,
         used: u64,
     },
+    /// Retained RAR5/7 prepared header image capacity, including reservations.
+    WriterPreparedHeaderLimitExceeded {
+        limit: u64,
+        required: u64,
+        used: u64,
+    },
     MemoryLimitExceeded {
         limit: u64,
         required: u64,
@@ -274,6 +280,8 @@ impl std::fmt::Display for Error {
             Self::Rar50FilterMemoryLimitExceeded { limit, required } => write!(f, "RAR 5 filter workspace limit {limit} bytes exceeded (requires {required})"),
             Self::WriterSpoolLimitExceeded { limit, required, used } => write!(f,
                 "writer spool limit {limit} bytes exceeded (requires {required}; {used} bytes already retained or reserved)"),
+            Self::WriterPreparedHeaderLimitExceeded { limit, required, used } => write!(f,
+                "writer prepared header limit {limit} bytes exceeded (requires {required}; {used} bytes already retained or reserved)"),
             Self::WriterSpoolMemoryLimitExceeded { limit, required, used } => write!(f,
                 "writer spool memory limit {limit} bytes exceeded (requires {required}; {used} bytes already retained or reserved)"),
             Self::MemoryLimitExceeded {
@@ -427,6 +435,7 @@ impl Error {
             | Self::MemoryLimitExceeded { .. }
             | Self::WriterSpoolLimitExceeded { .. }
             | Self::WriterSpoolMemoryLimitExceeded { .. }
+            | Self::WriterPreparedHeaderLimitExceeded { .. }
             | Self::MemberOutputLimitExceeded { .. }
             | Self::HeaderCountLimitExceeded { .. }
             | Self::HeaderBytesLimitExceeded { .. }

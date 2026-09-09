@@ -1,6 +1,6 @@
 //! Optional bounded storage for bare-WASM spools.
 //! Payload blocks and index replacements have known sizes before allocation.
-use super::{SpoolCharge, WriterResources};
+use super::{StorageCharge, WriterResources};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 
 const BLOCK_BYTES: usize = 4096;
@@ -23,7 +23,7 @@ struct BoundedSpool {
     len: usize,
     pos: u64,
     // Drop payload and index allocations before releasing their shared charge.
-    charge: SpoolCharge,
+    charge: StorageCharge,
 }
 
 impl MemorySpool {
@@ -34,7 +34,7 @@ impl MemorySpool {
                 block_count: 0,
                 len: 0,
                 pos: 0,
-                charge: SpoolCharge {
+                charge: StorageCharge {
                     budget: budget.clone(),
                     bytes: 0,
                 },

@@ -109,6 +109,29 @@ plaintext or ciphertext copies. Encryption uses the existing chunked emission
 workspace. This removes a retained allocation class; it does not bound upstream
 input construction, prepared headers, key state or aggregate execution memory.
 
+## Available quota: retained prepared header images
+
+`WriterResources::with_max_prepared_header_bytes(limit)` caps the shared final
+member and service header images retained by RAR5/7 single-archive preparation,
+including comment and quick-open service headers. Both native and bare-WASM
+writers enforce it. The default is unlimited; zero refuses any nonempty image.
+
+Serialization computes the exact image length and reserves it before allocating
+the image. Encrypted headers include the 16-byte IV and cipher padding in this
+charge and encrypt in place. Images are immutable, so their allocation capacity
+cannot grow after admission. Clones share the ledger; configuring a quota makes
+a fresh group. Images retain charges through preparation and emission and free
+their allocation before releasing the charge. Failure and unwinding follow the
+same ownership rule. Admission fails immediately with
+`WriterPreparedHeaderLimitExceeded` (`RESOURCE_LIMIT`, with `limit`, `required`
+and `used` byte counts).
+
+This is a quota for a specific retained allocation class, not all header memory.
+Serializer scratch (including type-specific and extra records), main/end and
+recovery headers, volume fragment headers, legacy headers, block descriptors,
+key state and allocator overhead remain outside it. The option imposes no limit
+on those other paths. It is independent of spool and estimated workspace quotas.
+
 ## Contract for a future managed-memory ceiling
 
 A memory ceiling must cover the sum of active workspace and retained execution

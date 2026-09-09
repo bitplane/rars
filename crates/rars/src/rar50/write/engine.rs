@@ -14,9 +14,10 @@
 use super::compress::{self, CompressPlan, CompressedMember};
 use super::headers::{
     block_header_image, encrypted_header_block, encrypted_main_header_block, file_specific,
-    header_encryption_keys, header_encryption_password, stored_file_specific, write_end_header,
-    write_extra_record, write_file_encryption_record, write_hash_record_with_value,
-    write_head_crypt, write_main_header, write_vint, HeaderEncryptionKeys,
+    header_encryption_keys, header_encryption_password, prepared_header_image,
+    stored_file_specific, write_end_header, write_extra_record, write_file_encryption_record,
+    write_hash_record_with_value, write_head_crypt, write_main_header, write_vint,
+    HeaderEncryptionKeys, PreparedHeader,
 };
 use super::layout::{resolve_layout, LayoutInputs};
 use super::{encrypt_reader_to, ArchiveEntry};
@@ -56,7 +57,7 @@ pub(super) enum ArchiveCommentPlan<'a> {
 /// A block with its framing settled: the header bytes are final and the
 /// payload only has to be copied.
 struct PreparedBlock<'a> {
-    header: Vec<u8>,
+    header: PreparedHeader,
     payload: Payload<'a>,
     payload_len: u64,
     /// Quick-open repeats the headers of members and plain comments so a
@@ -213,16 +214,16 @@ pub(super) fn write_archive(
     // Everything between the main header and the quick-open block, in order.
     let mut blocks: Vec<PreparedBlock> = Vec::with_capacity(entries.len() + 1);
     if let Some(comment) = &plan.archive_comment {
-        blocks.push(prepare_comment(comment, header_keys.as_ref())?);
+        blocks.push(prepare_comment(comment, header_keys.as_ref(), resources)?);
     }
     for (index, (entry, member)) in entries.iter().zip(compressed).enumerate() {
         check_cancelled(plan.progress)?;
-        let mut block = prepare_member(entry, member, &plan, header_keys.as_ref())
+        let mut block = prepare_member(entry, member, &plan, header_keys.as_ref(), resources)
             .map_err(|error| member_error(error, &entry.name, "preparing"))?;
         block.entry_index = Some(index);
         blocks.push(block);
         for service in &entry.services {
-            let mut block = prepare_service(service, header_keys.as_ref())
+            let mut block = prepare_service(service, header_keys.as_ref(), resources)
                 .map_err(|error| member_error(error, &entry.name, "preparing service"))?;
             block.entry_index = Some(index);
             blocks.push(block);
@@ -272,6 +273,7 @@ pub(super) fn write_archive(
             checksum.finish(),
             &[],
             header_keys.as_ref(),
+            resources,
         )?;
         payload.park();
         Some(PreparedBlock {
@@ -474,6 +476,7 @@ fn stored_service_block<'a>(
     data: &'a [u8],
     service_data: &[u8],
     header_keys: Option<&HeaderEncryptionKeys>,
+    resources: &WriterResources,
 ) -> Result<PreparedBlock<'a>> {
     Ok(PreparedBlock {
         header: stored_service_header(
@@ -482,6 +485,7 @@ fn stored_service_block<'a>(
             crate::crc32::crc32(data),
             service_data,
             header_keys,
+            resources,
         )?,
         payload: Payload::Borrowed(data),
         payload_len: data.len() as u64,
@@ -496,43 +500,36 @@ fn stored_service_header(
     crc32: u32,
     service_data: &[u8],
     header_keys: Option<&HeaderEncryptionKeys>,
-) -> Result<Vec<u8>> {
+    resources: &WriterResources,
+) -> Result<PreparedHeader> {
     let mut extra = Vec::new();
     write_extra_record(&mut extra, FHEXTRA_SUBDATA, service_data);
     let specific = stored_file_specific(name, data_len, Some(crc32), 0, None, 0)?;
-    match header_keys {
-        Some(keys) => encrypted_header_block(
-            &keys.keys,
-            HEAD_SERVICE,
-            HFL_EXTRA | HFL_DATA,
-            Some(data_len),
-            &specific,
-            &extra,
-            &[],
-        ),
-        None => block_header_image(
-            HEAD_SERVICE,
-            HFL_EXTRA | HFL_DATA,
-            Some(data_len),
-            &specific,
-            &extra,
-        ),
-    }
+    prepared_header_image(
+        HEAD_SERVICE,
+        HFL_EXTRA | HFL_DATA,
+        Some(data_len),
+        &specific,
+        &extra,
+        header_keys,
+        resources,
+    )
 }
 
 fn prepare_comment<'a>(
     comment: &ArchiveCommentPlan<'a>,
     header_keys: Option<&HeaderEncryptionKeys>,
+    resources: &WriterResources,
 ) -> Result<PreparedBlock<'a>> {
     match comment {
         ArchiveCommentPlan::Plain(data) => {
-            let mut block = stored_service_block(b"CMT", data, &[], header_keys)?;
+            let mut block = stored_service_block(b"CMT", data, &[], header_keys, resources)?;
             // Plain comments are listed by quick-open; encrypted ones are not.
             block.quick_open_cached = header_keys.is_none();
             Ok(block)
         }
         ArchiveCommentPlan::Encrypted { data, password } => {
-            encrypted_service_block(b"CMT", data, &[], password, header_keys)
+            encrypted_service_block(b"CMT", data, &[], password, header_keys, resources)
         }
     }
 }
@@ -540,12 +537,18 @@ fn prepare_comment<'a>(
 fn prepare_service<'a>(
     service: &'a super::ServiceEntry,
     header_keys: Option<&HeaderEncryptionKeys>,
+    resources: &WriterResources,
 ) -> Result<PreparedBlock<'a>> {
     match service.password.as_deref() {
-        Some(password) => {
-            encrypted_service_block(&service.name, &service.data, &[], password, header_keys)
-        }
-        None => stored_service_block(&service.name, &service.data, &[], header_keys),
+        Some(password) => encrypted_service_block(
+            &service.name,
+            &service.data,
+            &[],
+            password,
+            header_keys,
+            resources,
+        ),
+        None => stored_service_block(&service.name, &service.data, &[], header_keys, resources),
     }
 }
 
@@ -556,6 +559,7 @@ fn encrypted_service_block<'a>(
     service_data: &[u8],
     password: &[u8],
     header_keys: Option<&HeaderEncryptionKeys>,
+    resources: &WriterResources,
 ) -> Result<PreparedBlock<'a>> {
     super::validate_nonempty_password(password)?;
     let mut salt = [0u8; 16];
@@ -590,24 +594,15 @@ fn encrypted_service_block<'a>(
             "RAR 5 encrypted data size overflows",
         ))?
         & !15;
-    let header = match header_keys {
-        Some(keys) => encrypted_header_block(
-            &keys.keys,
-            HEAD_SERVICE,
-            HFL_EXTRA | HFL_DATA,
-            Some(payload_len),
-            &specific,
-            &extra,
-            &[],
-        )?,
-        None => block_header_image(
-            HEAD_SERVICE,
-            HFL_EXTRA | HFL_DATA,
-            Some(payload_len),
-            &specific,
-            &extra,
-        )?,
-    };
+    let header = prepared_header_image(
+        HEAD_SERVICE,
+        HFL_EXTRA | HFL_DATA,
+        Some(payload_len),
+        &specific,
+        &extra,
+        header_keys,
+        resources,
+    )?;
     Ok(PreparedBlock {
         header,
         payload: Payload::Encrypted {
@@ -627,6 +622,7 @@ fn prepare_member(
     member: CompressedMember,
     plan: &EnginePlan<'_>,
     header_keys: Option<&HeaderEncryptionKeys>,
+    resources: &WriterResources,
 ) -> Result<PreparedBlock<'static>> {
     let compression_info = compress::member_compression_info(&plan.compress, &member)?;
     let plain_len = if member.store {
@@ -711,24 +707,15 @@ fn prepare_member(
         entry.host_os,
         entry.is_directory,
     )?;
-    let header = match header_keys {
-        Some(keys) => encrypted_header_block(
-            &keys.keys,
-            HEAD_FILE,
-            HFL_EXTRA | HFL_DATA,
-            Some(payload_len),
-            &specific,
-            &extra,
-            &[],
-        )?,
-        None => block_header_image(
-            HEAD_FILE,
-            HFL_EXTRA | HFL_DATA,
-            Some(payload_len),
-            &specific,
-            &extra,
-        )?,
-    };
+    let header = prepared_header_image(
+        HEAD_FILE,
+        HFL_EXTRA | HFL_DATA,
+        Some(payload_len),
+        &specific,
+        &extra,
+        header_keys,
+        resources,
+    )?;
 
     Ok(PreparedBlock {
         header,
@@ -1667,13 +1654,22 @@ mod service_payload_tests {
     fn prepared_services_borrow_input_and_stream_identical_ciphertext() {
         for size in [0usize, 1, 15, 16, 65535, 65536, 65537, 131089] {
             let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
-            let plain = stored_service_block(b"CMT", &data, &[], None).unwrap();
+            let plain = stored_service_block(b"CMT", &data, &[], None, &WriterResources::default())
+                .unwrap();
             let Payload::Borrowed(borrowed) = plain.payload else {
                 panic!("expected borrowed service")
             };
             assert_eq!(borrowed.as_ptr(), data.as_ptr());
             assert_eq!(borrowed.len(), data.len());
-            let encrypted = encrypted_service_block(b"CMT", &data, &[], b"secret", None).unwrap();
+            let encrypted = encrypted_service_block(
+                b"CMT",
+                &data,
+                &[],
+                b"secret",
+                None,
+                &WriterResources::default(),
+            )
+            .unwrap();
             let Payload::Encrypted { plain, keys, iv } = &encrypted.payload else {
                 panic!("expected streaming encryption")
             };

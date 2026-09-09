@@ -152,8 +152,9 @@ pub struct WriterResources {
     memory_limit: u64,
     temp_dir: Option<PathBuf>,
     budget: Arc<MemoryBudget>,
-    spool_budget: Option<Arc<SpoolBudget>>,
-    spool_memory_budget: Option<Arc<SpoolBudget>>,
+    spool_budget: Option<Arc<StorageBudget>>,
+    spool_memory_budget: Option<Arc<StorageBudget>>,
+    prepared_header_budget: Option<Arc<StorageBudget>>,
     cancellation: Option<WriteCancellation>,
 }
 
@@ -171,6 +172,7 @@ impl WriterResources {
             budget: Arc::new(MemoryBudget::new(memory_limit)),
             spool_budget: None,
             spool_memory_budget: None,
+            prepared_header_budget: None,
             cancellation: None,
         }
     }
@@ -185,8 +187,8 @@ impl WriterResources {
     /// write does not release storage still owned by an EntrySource or reader.
     /// Failed native cleanup retains its charge conservatively in this group.
     pub fn with_max_spool_bytes(mut self, limit: u64) -> Self {
-        self.spool_budget = Some(Arc::new(SpoolBudget {
-            resource: SpoolResource::LogicalBytes,
+        self.spool_budget = Some(Arc::new(StorageBudget {
+            resource: StorageResource::LogicalBytes,
             limit,
             used: Mutex::new(0),
         }));
@@ -209,8 +211,8 @@ impl WriterResources {
     /// Configuring creates a fresh group, shared by subsequent resource clones.
     /// Logical spool lengths remain independently limited by `max_spool_bytes`.
     pub fn with_max_spool_memory_bytes(mut self, limit: u64) -> Self {
-        self.spool_memory_budget = Some(Arc::new(SpoolBudget {
-            resource: SpoolResource::PayloadMemory,
+        self.spool_memory_budget = Some(Arc::new(StorageBudget {
+            resource: StorageResource::PayloadMemory,
             limit,
             used: Mutex::new(0),
         }));
@@ -220,6 +222,41 @@ impl WriterResources {
     /// The optional memory-spool payload and index capacity quota.
     pub fn max_spool_memory_bytes(&self) -> Option<u64> {
         self.spool_memory_budget.as_ref().map(|budget| budget.limit)
+    }
+
+    /// Cap final RAR5/7 member and service header images retained by single-archive
+    /// preparation. Counts encryption IVs and padding, with admission before
+    /// allocation. Serializer scratch, main/end headers, volume fragment headers,
+    /// legacy headers and coordinator records are outside this quota.
+    /// Defaults to unlimited. Configuring creates a fresh group shared by clones.
+    pub fn with_max_prepared_header_bytes(mut self, limit: u64) -> Self {
+        self.prepared_header_budget = Some(Arc::new(StorageBudget {
+            resource: StorageResource::PreparedHeaders,
+            limit,
+            used: Mutex::new(0),
+        }));
+        self
+    }
+
+    /// The optional quota for retained RAR5/7 prepared header images.
+    pub fn max_prepared_header_bytes(&self) -> Option<u64> {
+        self.prepared_header_budget
+            .as_ref()
+            .map(|budget| budget.limit)
+    }
+
+    pub(crate) fn reserve_prepared_header(&self, bytes: u64) -> Result<Option<StorageCharge>> {
+        self.prepared_header_budget
+            .as_ref()
+            .map(|budget| {
+                let mut charge = StorageCharge {
+                    budget: budget.clone(),
+                    bytes: 0,
+                };
+                charge.grow_to(bytes)?;
+                Ok(charge)
+            })
+            .transpose()
     }
 
     /// Place temporary spools in this existing directory (default: the current
@@ -310,24 +347,25 @@ impl WriterResources {
 /// Live storage and reservations share one ledger across resource clones.
 /// No waiter can make progress by waiting for spools it must itself retain.
 #[derive(Debug, Clone, Copy)]
-enum SpoolResource {
+enum StorageResource {
     LogicalBytes,
     PayloadMemory,
+    PreparedHeaders,
 }
 
 #[derive(Debug)]
-struct SpoolBudget {
-    resource: SpoolResource,
+struct StorageBudget {
+    resource: StorageResource,
     limit: u64,
     used: Mutex<u64>,
 }
 
-struct SpoolCharge {
-    budget: Arc<SpoolBudget>,
+pub(crate) struct StorageCharge {
+    budget: Arc<StorageBudget>,
     bytes: u64,
 }
 
-impl SpoolCharge {
+impl StorageCharge {
     fn new(resources: &WriterResources) -> Option<Self> {
         resources.spool_budget.as_ref().map(|budget| Self {
             budget: budget.clone(),
@@ -345,12 +383,17 @@ impl SpoolCharge {
         if required.is_none_or(|required| required > self.budget.limit) {
             let required = required.unwrap_or(u64::MAX);
             return Err(match self.budget.resource {
-                SpoolResource::LogicalBytes => Error::WriterSpoolLimitExceeded {
+                StorageResource::LogicalBytes => Error::WriterSpoolLimitExceeded {
                     limit: self.budget.limit,
                     required,
                     used: *used,
                 },
-                SpoolResource::PayloadMemory => Error::WriterSpoolMemoryLimitExceeded {
+                StorageResource::PreparedHeaders => Error::WriterPreparedHeaderLimitExceeded {
+                    limit: self.budget.limit,
+                    required,
+                    used: *used,
+                },
+                StorageResource::PayloadMemory => Error::WriterSpoolMemoryLimitExceeded {
                     limit: self.budget.limit,
                     required,
                     used: *used,
@@ -372,7 +415,7 @@ impl SpoolCharge {
     }
 }
 
-impl Drop for SpoolCharge {
+impl Drop for StorageCharge {
     fn drop(&mut self) {
         self.shrink_to(0);
     }
@@ -452,7 +495,7 @@ pub(crate) struct Spool {
     file: Option<SpoolStore>,
     len: u64,
     pos: u64,
-    charge: Option<SpoolCharge>,
+    charge: Option<StorageCharge>,
 }
 
 impl Spool {
@@ -481,7 +524,7 @@ impl Spool {
                         file: Some(file),
                         len: 0,
                         pos: 0,
-                        charge: SpoolCharge::new(resources),
+                        charge: StorageCharge::new(resources),
                     })
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -502,7 +545,7 @@ impl Spool {
             file: Some(memory_spool::MemorySpool::new(resources)),
             len: 0,
             pos: 0,
-            charge: SpoolCharge::new(resources),
+            charge: StorageCharge::new(resources),
         })
     }
 
@@ -719,8 +762,8 @@ mod tests {
     #[test]
     fn spool_reservations_refuse_arithmetic_overflow() {
         let resources = WriterResources::default().with_max_spool_bytes(u64::MAX);
-        let mut first = SpoolCharge::new(&resources).unwrap();
-        let mut second = SpoolCharge::new(&resources).unwrap();
+        let mut first = StorageCharge::new(&resources).unwrap();
+        let mut second = StorageCharge::new(&resources).unwrap();
         first.grow_to(u64::MAX).unwrap();
         assert_eq!(
             second.grow_to(1).unwrap_err(),

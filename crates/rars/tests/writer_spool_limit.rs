@@ -328,3 +328,69 @@ fn quick_open_payload_obeys_exact_spool_limit_and_cleans_up() {
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
     }
 }
+
+#[test]
+fn prepared_header_quota_covers_retained_members_services_and_quick_open() {
+    let root = scratch::case("writer-prepared-header-quota");
+    for target in [ArchiveVersion::Rar50, ArchiveVersion::Rar70] {
+        let mut builder = Builder::new(target)
+            .store(true)
+            .comment(Some(b"archive comment".to_vec()))
+            .archive_metadata(None, false, true)
+            .unwrap();
+        for index in 0..3 {
+            builder
+                .add_bytes(
+                    format!("member-{index}").into_bytes(),
+                    vec![42; 16],
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        let resources = WriterResources::default().with_temp_dir(&*root);
+        let mut expected = Vec::new();
+        builder.write_to(&mut expected, &resources, None).unwrap();
+        // Discover the exact aggregate admission boundary, including the QO header.
+        let mut limit = 0;
+        loop {
+            let limited = resources.clone().with_max_prepared_header_bytes(limit);
+            let mut output = Vec::new();
+            match builder.write_to(&mut output, &limited, None) {
+                Ok(()) => {
+                    assert_eq!(output, expected);
+                    break;
+                }
+                Err(error) => {
+                    let Error::WriterPreparedHeaderLimitExceeded { required, used, .. } =
+                        error.root_cause()
+                    else {
+                        panic!("{error:?}")
+                    };
+                    assert!(required > &limit);
+                    assert!(used <= &limit);
+                    limit = *required;
+                    assert!(output.is_empty());
+                    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+                }
+            }
+        }
+        assert!(limit > 0);
+        let exact = resources.with_max_prepared_header_bytes(limit);
+        assert_eq!(exact.max_prepared_header_bytes(), Some(limit));
+        let mut unavailable: &mut [u8] = &mut [];
+        assert_eq!(
+            builder
+                .write_to(&mut unavailable, &exact, None)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Io
+        );
+        for _ in 0..2 {
+            let mut output = Vec::new();
+            builder.write_to(&mut output, &exact, None).unwrap();
+            assert_eq!(output, expected);
+        }
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    }
+}

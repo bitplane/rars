@@ -725,6 +725,7 @@ impl FileHeader {
             | Error::MemoryLimitExceeded { .. }
             | Error::WriterSpoolLimitExceeded { .. }
             | Error::WriterSpoolMemoryLimitExceeded { .. }
+            | Error::WriterPreparedHeaderLimitExceeded { .. }
             | Error::Rar50ScratchLimitExceeded { .. }
             | Error::RewriteStagingLimitExceeded { .. }
             | Error::Rar50FilterMemoryLimitExceeded { .. }

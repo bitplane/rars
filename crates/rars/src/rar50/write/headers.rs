@@ -1,9 +1,9 @@
-//! Pure RAR 5 header serialization.
+//! RAR 5 header serialization.
 //!
-//! Everything here is a deterministic function of its arguments: given the
-//! same inputs it produces the same bytes, with no I/O and no writer state.
-//! That is what lets the layout resolver predict block sizes before any bytes
-//! are emitted.
+//! Plain header encodings and lengths depend only on their inputs, letting the
+//! layout resolver predict positions before emission. Encrypted headers obtain
+//! fresh IVs. Prepared images additionally reserve their allocation capacity
+//! against the writer resource policy.
 
 use super::ArchiveMetadataEntry;
 use crate::crypto::rar50::{Rar50Cipher, Rar50Keys, WRITE_KDF_COUNT_LOG};
@@ -426,4 +426,173 @@ pub(crate) fn retained_archive_metadata(
     let mut extra = Vec::new();
     write_extra_record(&mut extra, MHEXTRA_ARCHIVE_METADATA, &record);
     Ok(extra)
+}
+
+/// An immutable final header image. Free bytes before releasing admission.
+pub(super) struct PreparedHeader {
+    bytes: Vec<u8>,
+    _charge: Option<crate::streaming::StorageCharge>,
+}
+
+impl std::ops::Deref for PreparedHeader {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+pub(super) fn prepared_header_image(
+    header_type: u64,
+    flags: u64,
+    data_size: Option<u64>,
+    type_specific: &[u8],
+    extra: &[u8],
+    keys: Option<&HeaderEncryptionKeys>,
+    resources: &crate::WriterResources,
+) -> Result<PreparedHeader> {
+    // Prefixes contain only vints. Variable-size inputs stay borrowed until
+    // the final allocation has been admitted; no intermediate body copy.
+    let mut prefix = Vec::with_capacity(40);
+    write_vint(&mut prefix, header_type);
+    write_vint(&mut prefix, flags);
+    if flags & HFL_EXTRA != 0 {
+        write_vint(&mut prefix, extra.len() as u64);
+    }
+    if let Some(size) = data_size {
+        write_vint(&mut prefix, size);
+    }
+    let overflow = || Error::InvalidArgument("RAR 5 prepared header size overflows");
+    let body_len = prefix
+        .len()
+        .checked_add(type_specific.len())
+        .and_then(|len| len.checked_add(extra.len()))
+        .ok_or_else(overflow)?;
+    let mut size = Vec::with_capacity(10);
+    write_vint(&mut size, body_len as u64);
+    let plain_len = 4usize
+        .checked_add(size.len())
+        .and_then(|len| len.checked_add(body_len))
+        .ok_or_else(overflow)?;
+    let (start, length) = if keys.is_some() {
+        let padded = plain_len.checked_add(15).ok_or_else(overflow)? & !15;
+        (16, padded.checked_add(16).ok_or_else(overflow)?)
+    } else {
+        (0, plain_len)
+    };
+    if length > isize::MAX as usize {
+        return Err(overflow());
+    }
+    let charge = resources.reserve_prepared_header(length as u64)?;
+    // vec![value; n] requests exactly n elements; padding is zero from the start.
+    let mut bytes = vec![0; length];
+    let mut offset = start + 4;
+    for part in [size.as_slice(), prefix.as_slice(), type_specific, extra] {
+        bytes[offset..offset + part.len()].copy_from_slice(part);
+        offset += part.len();
+    }
+    let crc = crc32(&bytes[start + 4..start + plain_len]);
+    bytes[start..start + 4].copy_from_slice(&crc.to_le_bytes());
+    if let Some(keys) = keys {
+        let mut iv = [0; 16];
+        getrandom::fill(&mut iv).map_err(|error| {
+            crate::write_stream::entropy_error(
+                error,
+                "RAR 5 writer could not generate encryption IV",
+            )
+        })?;
+        bytes[..16].copy_from_slice(&iv);
+        Rar50Cipher::new(keys.keys.key, iv)
+            .encrypt_in_place(&mut bytes[16..])
+            .map_err(map_rar50_crypto_error)?;
+    }
+    Ok(PreparedHeader {
+        bytes,
+        _charge: charge,
+    })
+}
+
+#[cfg(test)]
+mod prepared_header_tests {
+    use super::*;
+    use crate::{ErrorKind, WriterResources};
+
+    #[test]
+    fn exact_images_match_existing_serialization_and_include_encryption_padding() {
+        let keys = header_encryption_keys(b"secret").unwrap();
+        for len in [0, 1, 15, 16, 120, 127, 128, 16384] {
+            let specific = vec![0x51; len];
+            for encrypted in [false, true] {
+                let key = encrypted.then_some(&keys);
+                let expected =
+                    block_header_image(2, HFL_EXTRA, Some(u64::MAX), &specific, b"extra").unwrap();
+                let size = if encrypted {
+                    16 + expected.len().div_ceil(16) * 16
+                } else {
+                    expected.len()
+                };
+                let limited =
+                    WriterResources::default().with_max_prepared_header_bytes(size as u64 - 1);
+                let error = prepared_header_image(
+                    2,
+                    HFL_EXTRA,
+                    Some(u64::MAX),
+                    &specific,
+                    b"extra",
+                    key,
+                    &limited,
+                )
+                .err()
+                .unwrap();
+                assert_eq!(error.kind(), ErrorKind::ResourceLimit);
+                assert_eq!(
+                    error,
+                    Error::WriterPreparedHeaderLimitExceeded {
+                        limit: size as u64 - 1,
+                        required: size as u64,
+                        used: 0
+                    }
+                );
+                let resources =
+                    WriterResources::default().with_max_prepared_header_bytes(size as u64);
+                let header = prepared_header_image(
+                    2,
+                    HFL_EXTRA,
+                    Some(u64::MAX),
+                    &specific,
+                    b"extra",
+                    key,
+                    &resources,
+                )
+                .unwrap();
+                assert_eq!(header.bytes.capacity(), size);
+                assert!(resources.clone().reserve_prepared_header(1).is_err());
+                if encrypted {
+                    let iv = header[..16].try_into().unwrap();
+                    let mut plain = header[16..].to_vec();
+                    Rar50Cipher::new(keys.keys.key, iv)
+                        .decrypt_in_place(&mut plain)
+                        .unwrap();
+                    assert_eq!(&plain[..expected.len()], expected);
+                    assert!(plain[expected.len()..].iter().all(|byte| *byte == 0));
+                } else {
+                    assert_eq!(&*header, expected);
+                }
+                drop(header);
+                assert!(resources.reserve_prepared_header(size as u64).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn shared_header_quota_is_released_on_unwind() {
+        let resources = WriterResources::default().with_max_prepared_header_bytes(1024);
+        let failure = std::panic::catch_unwind(|| {
+            let _header =
+                prepared_header_image(2, 0, None, b"data", &[], None, &resources).unwrap();
+            assert!(resources.reserve_prepared_header(1024).is_err());
+            panic!("injected failure");
+        });
+        assert!(failure.is_err());
+        assert!(resources.reserve_prepared_header(1024).is_ok());
+    }
 }
