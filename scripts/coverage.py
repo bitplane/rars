@@ -1,371 +1,305 @@
 #!/usr/bin/env python3
-"""Run workspace coverage and report production-only numbers.
+"""Reproducible native coverage, with raw LLVM data and actionable gap inventories.
 
-Replaces the older coverage.sh. Same workflow (cargo test with
--Cinstrument-coverage, profile merge, llvm-cov for HTML), but the per-crate
-and per-file summary is computed from the JSON export with inline
-`#[cfg(test)] mod tests` blocks excluded — i.e. demangled symbols whose
-path contains `::tests::` are dropped before aggregation.
-
-Region/line/function totals are taken from llvm-cov's per-file summary and
-reduced by the test-mod contribution. Covered counts are aggregated from
-function-level region data, which can drift from llvm-cov's display by
-roughly 1% because the underlying aggregation rules differ; absolute totals
-match exactly.
+Run with --branches --toolchain nightly for branch instrumentation. Native Rust
+and Python boundary coverage share a profile; JS and WASM are separate targets.
 """
 from __future__ import annotations
-
+import argparse
+from collections import defaultdict
+import datetime as dt
+import hashlib
 import json
 import os
-import shutil
+from pathlib import Path
+import platform
 import subprocess
 import sys
-from collections import defaultdict
-from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-CRATES_PREFIX = str(ROOT / "crates") + "/"
-IGNORE_REGEX = "/.cargo/registry|/rustc/|/tests/"
+IGNORE_REGEX = r"/.cargo/registry|/rustc/|/tests/"
 
 
-def die(msg: str, code: int = 1) -> None:
-    print(msg, file=sys.stderr)
-    sys.exit(code)
+def run(command, *, env=None, log=None):
+    print("+", " ".join(map(str, command)), flush=True)
+    with open(log, "w") if log else open(os.devnull, "w") as output:
+        try:
+            return subprocess.call(list(map(str, command)), cwd=ROOT, env=env, stdout=output, stderr=subprocess.STDOUT)
+        except OSError as error:
+            output.write(str(error) + "\n")
+            return 127
 
 
-def require(cmd: str) -> None:
-    if shutil.which(cmd) is None:
-        die(f"missing required command: {cmd}")
+def capture(command, **kwargs):
+    return subprocess.check_output(list(map(str, command)), cwd=ROOT, text=True, **kwargs)
 
 
-def llvm_tool_paths() -> tuple[Path, Path]:
-    host = ""
-    for line in subprocess.check_output(["rustc", "-vV"], text=True).splitlines():
-        if line.startswith("host: "):
-            host = line[len("host: "):].strip()
+def llvm_tools(toolchain):
+    compiler = ["rustc"] + ([f"+{toolchain}"] if toolchain else [])
+    version = capture(compiler + ["-vV"])
+    host = next(line.removeprefix("host: ") for line in version.splitlines() if line.startswith("host: "))
+    tools = Path(capture(compiler + ["--print", "sysroot"]).strip()) / "lib/rustlib" / host / "bin"
+    for name in ["llvm-profdata", "llvm-cov"]:
+        if not (tools / name).is_file():
+            raise RuntimeError(f"Missing {tools / name}; install llvm-tools-preview for this toolchain")
+    return tools, version
+
+
+def source_state():
+    files = sorted(path for crate in (ROOT / "crates").iterdir() for path in (crate / "src").rglob("*.rs"))
+    digest = hashlib.sha256()
+    for path in files:
+        digest.update(str(path.relative_to(ROOT)).encode())
+        digest.update(path.read_bytes())
+    return files, digest.hexdigest()
+
+
+def helper(mode, lines):
+    binary = ROOT / "target/coverage-tools/debug/rars-coverage-tools"
+    return capture([binary, mode], input="\n".join(lines) + "\n").splitlines()
+
+
+def test_symbol(name):
+    # A production generic instantiated with a test callback is still production.
+    return "::tests::" in name.split("::<", 1)[0]
+
+
+def read_lcov(text):
+    files = {}
+    current = None
+    for line in text.splitlines():
+        if line.startswith("SF:"):
+            current = files.setdefault(line[3:], {})
+        elif line.startswith("DA:") and current is not None:
+            number, count, *_ = line[3:].split(",")
+            current[int(number)] = max(current.get(int(number), 0), int(count))
+    return files
+
+
+def classify_external_test_modules(sources):
+    """Carry cfg(test) through out-of-line module files as well as inline ASTs."""
+    marked = set()
+    while True:
+        references = defaultdict(list)
+        for filename, source in sources.items():
+            path = Path(filename)
+            directory = path.parent if path.stem in {"lib", "main", "mod"} else path.parent / path.stem
+            for module in source.get("modules", []):
+                candidates = ([path.parent / module["path"]] if module.get("path") else
+                              [directory / (module["name"] + ".rs"), directory / module["name"] / "mod.rs"])
+                for candidate in candidates:
+                    resolved = str(candidate.resolve())
+                    if resolved in sources:
+                        references[resolved].append(module["test_only"] or filename in marked)
+        added = {filename for filename, flags in references.items() if all(flags)} - marked
+        if not added:
             break
-    if not host:
-        die("could not determine rustc host triple")
-    sysroot = Path(subprocess.check_output(["rustc", "--print", "sysroot"], text=True).strip())
-    bindir = sysroot / "lib" / "rustlib" / host / "bin"
-    profdata = bindir / "llvm-profdata"
-    cov = bindir / "llvm-cov"
-    if not profdata.is_file() or not cov.is_file():
-        die("missing llvm coverage tools\n\nInstall them with:\n  rustup component add llvm-tools-preview")
-    return profdata, cov
+        marked.update(added)
+    for filename in marked:
+        source = sources[filename]
+        source["test_ranges"].append([1, len(Path(filename).read_text().splitlines()) + 1])
+        for decl in source["declarations"]:
+            decl["test_only"] = True
 
 
-def collect_objects(coverage_dir: Path) -> list[Path]:
-    deps = coverage_dir / "debug" / "deps"
-    objects: list[Path] = []
-    if deps.is_dir():
-        for entry in sorted(deps.iterdir()):
-            if not entry.is_file():
+def summarize(data, line_counts, sources, names):
+    """Union generic instantiations; retain zero counters and exclude test source.
+
+    Lines come from LLVM's own LCOV aggregation. Regions/functions are unique
+    source locations, not an approximation formed by subtracting test totals.
+    """
+    stats = {}
+    missing = []
+    unmapped = []
+    for filename, source in sources.items():
+        excluded = {line for start, end in source["test_ranges"] for line in range(start, end + 1)}
+        stats[filename] = {"lines": {n: c for n, c in line_counts.get(filename, {}).items() if n not in excluded},
+                           "regions": {}, "functions": {}, "branches": {}, "excluded": excluded}
+    for fn in data["functions"]:
+        name = names[fn["name"]]
+        if test_symbol(name):
+            continue
+        code = [r for r in fn["regions"] if r[7] == 0 and fn["filenames"][r[5]] in stats]
+        if not code:
+            continue
+        first = code[0]
+        filename = fn["filenames"][first[5]]
+        entry = stats[filename]
+        if first[0] in entry["excluded"]:
+            continue
+        key = tuple(first[:4])
+        previous = entry["functions"].setdefault(key, {"count": 0, "names": set()})
+        previous["count"] = max(previous["count"], fn["count"])
+        previous["names"].add(name)
+        for region in code:
+            entry = stats[fn["filenames"][region[5]]]
+            if region[0] in entry["excluded"]:
                 continue
-            if entry.suffix in (".d", ".rlib", ".rmeta"):
+            key = tuple(region[:4])
+            entry["regions"][key] = max(entry["regions"].get(key, 0), region[4])
+        for branch in fn.get("branches", []):
+            # [start line/column, end line/column, true, false, file, expanded, kind]
+            filename = fn["filenames"][branch[6]]
+            if filename not in stats or branch[0] in stats[filename]["excluded"]:
                 continue
-            if not os.access(entry, os.X_OK):
-                continue
-            objects.append(entry)
-    production = coverage_dir / "debug" / "rars"
-    if production.is_file() and os.access(production, os.X_OK):
-        objects.append(production)
+            key = tuple(branch[:4])
+            previous = stats[filename]["branches"].get(key, (0, 0))
+            stats[filename]["branches"][key] = (max(previous[0], branch[4]), max(previous[1], branch[5]))
+    rows = []
+    for filename, entry in sorted(stats.items()):
+        relative = str(Path(filename).relative_to(ROOT))
+        for location, fn in entry["functions"].items():
+            if fn["count"] == 0:
+                missing.append({"file": relative, "line": location[0], "end_line": location[2], "names": sorted(fn["names"])})
+        for decl in sources[filename]["declarations"]:
+            if not decl["test_only"] and not any(start <= decl["line"] <= end for start, _, end, _ in entry["functions"]):
+                unmapped.append({"file": relative, **decl})
+        row = {"file": relative}
+        for category in ["lines", "regions", "functions", "branches"]:
+            values = list(entry[category].values())
+            if category == "functions":
+                values = [fn["count"] for fn in values]
+            if category == "branches":
+                values = [count for pair in values for count in pair]
+            row[category] = {"covered": sum(count > 0 for count in values), "total": len(values)}
+        row["uncovered_lines"] = [line for line, count in sorted(entry["lines"].items()) if count == 0]
+        row["uncovered_regions"] = [list(location) for location, count in entry["regions"].items() if count == 0]
+        row["uncovered_branches"] = [{"location": list(location), "true": counts[0], "false": counts[1]} for location, counts in entry["branches"].items() if 0 in counts]
+        rows.append(row)
+    return rows, missing, unmapped
+
+
+def artifact_objects(messages):
+    objects = []
+    for line in messages.splitlines():
+        try:
+            artifact = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if artifact.get("reason") == "compiler-artifact" and artifact.get("executable"):
+            objects.append(Path(artifact["executable"]))
     return objects
 
 
-def object_args(objects: list[Path]) -> list[str]:
-    if not objects:
-        return []
-    args = [str(objects[0])]
-    for obj in objects[1:]:
-        args += ["--object", str(obj)]
-    return args
-
-
-def demangle(names: list[str]) -> list[str]:
-    if not names:
-        return []
-    if shutil.which("rustfilt") is None:
-        die("missing required command: rustfilt\n\nInstall it with:\n  cargo install rustfilt")
-    proc = subprocess.run(
-        ["rustfilt"],
-        input="\n".join(names),
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    return proc.stdout.splitlines()
-
-
-def is_test_symbol(demangled: str) -> bool:
-    """True iff the function itself lives in an inline `mod tests` block.
-
-    The path component check has to skip generic substitutions: a production
-    function instantiated for a test caller shows up as
-    `Archive::extract_to::<rars::tests::collect_x::{closure#0}>::{closure#0}`,
-    which contains "::tests::" deep inside the angle-bracket payload but is
-    actually a production function. Strip everything from the first "::<"
-    onward and check the namespace prefix only.
-    """
-    head = demangled.split("::<", 1)[0]
-    return "::tests::" in head or head.endswith("::tests")
-
-
-def relative_to_crates(path: str) -> str:
-    if path.startswith(CRATES_PREFIX):
-        return path[len(CRATES_PREFIX):]
-    return path
-
-
-def aggregate(data: dict, name_map: dict[str, str]) -> dict[str, dict]:
-    """Return per-file stats with both raw and production-only totals.
-
-    Each file entry contains:
-        regions / lines / funcs        — total / covered (raw, from llvm-cov)
-        prod_regions / prod_lines / prod_funcs — test-mod stripped
-
-    A line is considered "test-only" if every region of every function that
-    spans it sits in a test mod. Test-only lines are subtracted from the file
-    totals; lines also touched by production code stay on the production side.
-    """
-    files: dict[str, dict] = {}
-    for f in data["files"]:
-        s = f["summary"]
-        files[f["filename"]] = {
-            "regions_total": s["regions"]["count"],
-            "regions_covered": s["regions"]["covered"],
-            "lines_total": s["lines"]["count"],
-            "lines_covered": s["lines"]["covered"],
-            "funcs_total": s["functions"]["count"],
-            "funcs_covered": s["functions"]["covered"],
-            "test_regions": {},  # (l1, c1, l2, c2) -> max count
-            "test_funcs": {},  # (start_line, start_col) -> covered bool
-            "line_test": defaultdict(int),  # line -> non-test region count
-            "line_prod": defaultdict(int),
-            "line_test_covered": defaultdict(int),  # max count contributed by test regions
-            "line_prod_covered": defaultdict(int),
-        }
-
-    for fn in data["functions"]:
-        if not fn["regions"]:
-            continue
-        is_test = is_test_symbol(name_map[fn["name"]])
-        for r in fn["regions"]:
-            l1, c1, l2, c2, count, file_id, _expanded, _kind = r
-            fname = fn["filenames"][file_id]
-            entry = files.get(fname)
-            if entry is None:
-                continue
-            if is_test:
-                key = (l1, c1, l2, c2)
-                cur = entry["test_regions"].get(key, 0)
-                if count > cur:
-                    entry["test_regions"][key] = count
-            for line in range(l1, l2 + 1):
-                if is_test:
-                    entry["line_test"][line] += 1
-                    if count > entry["line_test_covered"][line]:
-                        entry["line_test_covered"][line] = count
-                else:
-                    entry["line_prod"][line] += 1
-                    if count > entry["line_prod_covered"][line]:
-                        entry["line_prod_covered"][line] = count
-
-        if is_test:
-            first = next((r for r in fn["regions"] if fn["filenames"][r[5]] in files), None)
-            if first is not None:
-                fname = fn["filenames"][first[5]]
-                entry = files[fname]
-                fkey = (first[0], first[1])
-                prev = entry["test_funcs"].get(fkey, False)
-                entry["test_funcs"][fkey] = prev or fn["count"] > 0
-
-    out: dict[str, dict] = {}
-    for fname, e in files.items():
-        test_regions_total = len(e["test_regions"])
-        test_regions_covered = sum(1 for c in e["test_regions"].values() if c > 0)
-        test_funcs_total = len(e["test_funcs"])
-        test_funcs_covered = sum(1 for v in e["test_funcs"].values() if v)
-
-        # Lines exclusive to test mods: touched by test regions but not production.
-        test_only_lines = set(e["line_test"]) - set(e["line_prod"])
-        test_only_covered = sum(
-            1 for line in test_only_lines if e["line_test_covered"][line] > 0
-        )
-
-        out[fname] = {
-            "regions_total": e["regions_total"],
-            "regions_covered": e["regions_covered"],
-            "lines_total": e["lines_total"],
-            "lines_covered": e["lines_covered"],
-            "funcs_total": e["funcs_total"],
-            "funcs_covered": e["funcs_covered"],
-            "prod_regions_total": max(0, e["regions_total"] - test_regions_total),
-            "prod_regions_covered": max(0, e["regions_covered"] - test_regions_covered),
-            "prod_lines_total": max(0, e["lines_total"] - len(test_only_lines)),
-            "prod_lines_covered": max(0, e["lines_covered"] - test_only_covered),
-            "prod_funcs_total": max(0, e["funcs_total"] - test_funcs_total),
-            "prod_funcs_covered": max(0, e["funcs_covered"] - test_funcs_covered),
-        }
-    return out
-
-
-def crate_of(rel_path: str) -> str:
-    return rel_path.split("/", 1)[0]
-
-
-def fmt_ratio(covered: int, total: int) -> tuple[str, str]:
-    pct = f"{covered * 100.0 / total:6.2f}%" if total else "     -"
-    return (f"{covered}/{total}", pct)
-
-
-def render(stats: dict[str, dict], filtered: bool) -> str:
-    rows: list[tuple[str, int, int, int, int, int, int]] = []
-    crate_totals: dict[str, dict] = defaultdict(lambda: {
-        "rt": 0, "rc": 0, "lt": 0, "lc": 0, "ft": 0, "fc": 0,
-    })
-
-    pfx = "prod_" if filtered else ""
-    keys = (
-        f"{pfx}regions_total", f"{pfx}regions_covered",
-        f"{pfx}lines_total", f"{pfx}lines_covered",
-        f"{pfx}funcs_total", f"{pfx}funcs_covered",
-    )
-
-    for fname in sorted(stats):
-        if not fname.startswith(CRATES_PREFIX):
-            continue
-        rel = relative_to_crates(fname)
-        s = stats[fname]
-        rt, rc, lt, lc, ft, fc = (s[k] for k in keys)
-        rows.append((rel, rt, rc, lt, lc, ft, fc))
-        c = crate_totals[crate_of(rel)]
-        c["rt"] += rt; c["rc"] += rc
-        c["lt"] += lt; c["lc"] += lc
-        c["ft"] += ft; c["fc"] += fc
-
-    crate_total = {
-        "rt": sum(c["rt"] for c in crate_totals.values()),
-        "rc": sum(c["rc"] for c in crate_totals.values()),
-        "lt": sum(c["lt"] for c in crate_totals.values()),
-        "lc": sum(c["lc"] for c in crate_totals.values()),
-        "ft": sum(c["ft"] for c in crate_totals.values()),
-        "fc": sum(c["fc"] for c in crate_totals.values()),
-    }
-
-    def line(name: str, name_w: int, rc: int, rt: int, lc: int, lt: int, fc: int, ft: int) -> str:
-        rg, rp = fmt_ratio(rc, rt)
-        lg, lp = fmt_ratio(lc, lt)
-        fg, fp = fmt_ratio(fc, ft)
-        return f"{name:<{name_w}}  {rg:>13} {rp:>8}  {lg:>13} {lp:>8}  {fg:>11} {fp:>8}"
-
-    def header(name: str, name_w: int) -> list[str]:
-        head = (
-            f"{name:<{name_w}}  {'Regions':>13} {'Region%':>8}  "
-            f"{'Lines':>13} {'Line%':>8}  {'Functions':>11} {'Func%':>8}"
-        )
-        return [head, "-" * len(head)]
-
-    label = "production code only" if filtered else "all code, including inline tests"
-    out = [f"Coverage by crate ({label})"]
-    out.extend(header("Crate", 16))
-    for crate in sorted(crate_totals):
-        c = crate_totals[crate]
-        out.append(line(crate, 16, c["rc"], c["rt"], c["lc"], c["lt"], c["fc"], c["ft"]))
-    out.append("-" * len(out[1]))
-    out.append(line("TOTAL", 16, crate_total["rc"], crate_total["rt"],
-                    crate_total["lc"], crate_total["lt"],
-                    crate_total["fc"], crate_total["ft"]))
-    out.append("")
-    out.append("Per-file detail")
-    out.extend(header("File", 48))
-    for rel, rt, rc, lt, lc, ft, fc in rows:
-        out.append(line(rel, 48, rc, rt, lc, lt, fc, ft))
-    out.append("-" * len(out[-1]))
-    out.append(line("TOTAL", 48, crate_total["rc"], crate_total["rt"],
-                    crate_total["lc"], crate_total["lt"],
-                    crate_total["fc"], crate_total["ft"]))
-    return "\n".join(out)
-
-
-def main() -> int:
-    require("cargo")
-    require("rustc")
-
-    profdata_tool, cov_tool = llvm_tool_paths()
-
-    coverage_dir = ROOT / "target" / "coverage"
-    profraw_dir = coverage_dir / "profraw"
-    profdata = coverage_dir / "coverage.profdata"
-
-    if coverage_dir.exists():
-        shutil.rmtree(coverage_dir)
-    profraw_dir.mkdir(parents=True)
-
+def report(output, tools, manifest, source_files):
     env = os.environ.copy()
-    env["CARGO_TARGET_DIR"] = str(coverage_dir)
-    rustflags = env.get("RUSTFLAGS", "")
-    env["RUSTFLAGS"] = f"{rustflags} -Cinstrument-coverage".strip()
-    env["LLVM_PROFILE_FILE"] = str(profraw_dir / "%p-%m.profraw")
-
-    test_status = subprocess.call(
-        ["cargo", "test", "--workspace", "--all-targets", "--no-fail-fast"],
-        cwd=ROOT,
-        env=env,
-    )
-
-    profraw_files = sorted(profraw_dir.glob("*.profraw"))
-    if not profraw_files:
-        die("no coverage profiles were produced", test_status or 1)
-
-    subprocess.run(
-        [str(profdata_tool), "merge", "-sparse", *map(str, profraw_files), "-o", str(profdata)],
-        check=True,
-    )
-
-    objects = collect_objects(coverage_dir)
+    env["CARGO_TARGET_DIR"] = str(ROOT / "target/coverage-tools")
+    if run(["cargo", "build", "--manifest-path", "scripts/coverage-tools/Cargo.toml", "--locked", "--offline"], env=env, log=output / "tools.log"):
+        raise RuntimeError("Coverage source helper failed; see tools.log")
+    profiles = sorted((output / "profraw").glob("*.profraw"))
+    if not profiles:
+        raise RuntimeError("No profiles produced")
+    profile = output / "coverage.profdata"
+    # A response file also works when the suite creates thousands of profiles.
+    response = output / "profiles.txt"
+    response.write_text("\n".join('"' + str(p) + '"' for p in profiles))
+    subprocess.run([str(tools / "llvm-profdata"), "merge", "-sparse", "@" + str(response), "-o", str(profile)], check=True)
+    # Cargo's artifact layout differs between stable and recent nightly builds.
+    # Ask Cargo for its executable manifest instead of guessing a deps directory.
+    build_env = os.environ.copy()
+    build_env.update(CARGO_TARGET_DIR=str(output), CARGO_PROFILE_DEV_OPT_LEVEL="1", CARGO_PROFILE_DEV_DEBUG="1", LLVM_PROFILE_FILE=str(output / "profraw/%p-%m.profraw"))
+    build_env["RUSTFLAGS"] = "-Cinstrument-coverage" + (" -Zcoverage-options=branch" if manifest["branches"] else "")
+    toolchain = manifest.get("toolchain") or ("nightly" if "nightly" in manifest["rustc"] else None)
+    cargo = ["cargo"] + ([f"+{toolchain}"] if toolchain else [])
+    artifact_log = output / "cargo-artifacts.jsonl"
+    if run(cargo + ["test", "--workspace", "--tests", "--no-run", "--locked", "--message-format=json"], env=build_env, log=artifact_log):
+        raise RuntimeError("Cannot collect executable manifest; see cargo-artifacts.jsonl")
+    objects = artifact_objects(artifact_log.read_text())
+    for path in [output / "debug/rars", output / "python/rars.abi3.so"]:
+        if path.is_file():
+            objects.append(path)
     if not objects:
-        die("no coverage objects found")
-    obj_args = object_args(objects)
+        raise RuntimeError("No instrumented executable objects found")
+    objects = list(dict.fromkeys(objects))
+    arguments = [str(objects[0])]
+    for obj in objects[1:]:
+        arguments += ["--object", str(obj)]
+    common = ["--instr-profile", str(profile), "--ignore-filename-regex", IGNORE_REGEX, *arguments]
+    for name, command in [("coverage.json", ["export"]), ("coverage.lcov", ["export", "--format=lcov"]), ("llvm-summary.txt", ["report"])]:
+        with (output / name).open("w") as destination:
+            subprocess.run([str(tools / "llvm-cov"), *command, *common], stdout=destination, check=True)
+    raw = json.loads((output / "coverage.json").read_text())["data"][0]
+    sources = {entry["path"]: entry for entry in map(json.loads, helper("source", [str(p) for p in source_files]))}
+    classify_external_test_modules(sources)
+    names = [fn["name"] for fn in raw["functions"]]
+    names = dict(zip(names, helper("demangle", names)))
+    rows, missing, unmapped = summarize(raw, read_lcov((output / "coverage.lcov").read_text()), sources, names)
+    (output / "production.json").write_text(json.dumps(rows, indent=2))
+    (output / "uncovered-functions.json").write_text(json.dumps(missing, indent=2))
+    (output / "unmapped-declarations.json").write_text(json.dumps(unmapped, indent=2))
+    (output / "source-inventory.json").write_text(json.dumps(sources, indent=2))
+    totals = defaultdict(lambda: defaultdict(lambda: {"covered": 0, "total": 0}))
+    for row in rows:
+        for category in ["lines", "regions", "functions", "branches"]:
+            for key in ["covered", "total"]:
+                totals[row["file"].split("/")[1]][category][key] += row[category][key]
+    def ratio(value):
+        return f"{value['covered']}/{value['total']} ({value['covered']/value['total']:.1%})" if value['total'] else "not mapped"
+    text = ["# Coverage baseline", "", f"Revision: `{manifest['revision']}`", f"Source fingerprint: `{manifest['source_sha256']}`", f"Host: {manifest['host']}",
+            f"Test outcomes: `{manifest['steps']}`", "", "Production code only; test-only source ranges excluded.",
+            "Line counts use LLVM LCOV; regions and functions union source locations across instantiations.",
+            "Unmapped declarations are not counted as covered or dead: inspect cfgs, macros and compiler elimination.",
+            "Native coverage does not measure WASM execution, Windows/macOS paths or JavaScript.",
+            "Branch counts cover instrumented conditions, not every short-circuit decision or path combination.", "",
+            "| Crate | Lines | Code regions | Functions | Branch outcomes |", "| --- | --- | --- | --- | --- |"]
+    for crate, categories in sorted(totals.items()):
+        text.append("| " + crate + " | " + " | ".join(ratio(categories[c]) for c in ["lines", "regions", "functions", "branches"]) + " |")
+    text += ["", f"Uncovered mapped functions: {len(missing)}; declarations requiring mapping/cfg review: {len(unmapped)}.", "",
+             "Raw LLVM: coverage.json, coverage.lcov, llvm-summary.txt; production detail: production.json.",
+             "Gap inventories: uncovered-functions.json, unmapped-declarations.json. HTML includes test code."]
+    (output / "summary.md").write_text("\n".join(text) + "\n")
+    if run([tools / "llvm-cov", "show", "--format=html", "--show-line-counts-or-regions", "--show-branches=count", "--output-dir", output / "html", *common], log=output / "html.log"):
+        raise RuntimeError("HTML generation failed")
+    manifest["reported_utc"] = dt.datetime.now(dt.timezone.utc).isoformat()
+    manifest["objects"] = list(map(str, objects))
+    manifest["profiles"] = len(profiles)
+    (output / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    print("\n".join(text))
+    print(f"HTML: {output / 'html/index.html'}")
 
-    json_blob = subprocess.check_output(
-        [str(cov_tool), "export",
-         "--instr-profile", str(profdata),
-         "--ignore-filename-regex", IGNORE_REGEX,
-         *obj_args],
-    )
-    data = json.loads(json_blob)["data"][0]
 
-    name_map = dict(zip(
-        [fn["name"] for fn in data["functions"]],
-        demangle([fn["name"] for fn in data["functions"]]),
-    ))
-
-    stats = aggregate(data, name_map)
-
-    summary_path = coverage_dir / "summary.txt"
-    filtered = render(stats, filtered=True)
-    raw = render(stats, filtered=False)
-    text = filtered + "\n\n" + raw + "\n"
-    summary_path.write_text(text)
-    print(text)
-
-    # HTML stays unfiltered (matches llvm-cov's view of every counter).
-    subprocess.run(
-        [str(cov_tool), "show",
-         "--format=html",
-         "--ignore-filename-regex", IGNORE_REGEX,
-         "--instr-profile", str(profdata),
-         "--output-dir", str(coverage_dir / "html"),
-         *obj_args],
-        check=True,
-    )
-
-    print()
-    print(f"Text summary: {summary_path}")
-    print(f"HTML report:  {coverage_dir / 'html' / 'index.html'}")
-
-    return test_status
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, default=ROOT / "target/coverage")
+    parser.add_argument("--toolchain")
+    parser.add_argument("--branches", action="store_true")
+    parser.add_argument("--reuse", action="store_true", help="Regenerate reports from existing profiles; source fingerprint must match")
+    parser.add_argument("--python", type=Path, default=ROOT / ".venv/bin/python", help="Python with pytest installed; its native boundary suite is included")
+    args = parser.parse_args()
+    output = args.output.resolve()
+    tools, version = llvm_tools(args.toolchain)
+    if args.branches and "nightly" not in version:
+        raise RuntimeError("Branch instrumentation requires --toolchain nightly")
+    source_files, fingerprint = source_state()
+    if args.reuse:
+        manifest = json.loads((output / "manifest.json").read_text())
+        if manifest["rustc"] != version:
+            raise RuntimeError("Compiler differs from profiling; select the original toolchain or collect fresh profiles")
+        if manifest["source_sha256"] != fingerprint:
+            raise RuntimeError("Source changed since profiling; collect fresh profiles instead of reusing stale coverage")
+    else:
+        if (output / "profraw").exists():
+            raise RuntimeError("Output already contains profiles; use --reuse or a fresh --output directory")
+        (output / "profraw").mkdir(parents=True)
+        manifest = {"revision": capture(["git", "rev-parse", "HEAD"]).strip(), "working_tree": capture(["git", "status", "--porcelain"]),
+                    "source_sha256": fingerprint, "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(), "host": platform.platform(),
+                    "rustc": version, "toolchain": args.toolchain, "branches": args.branches, "steps": {}}
+        env = os.environ.copy()
+        env.update(CARGO_TARGET_DIR=str(output), CARGO_PROFILE_DEV_OPT_LEVEL="1", CARGO_PROFILE_DEV_DEBUG="1", LLVM_PROFILE_FILE=str(output / "profraw/%p-%m.profraw"))
+        env["RUSTFLAGS"] = "-Cinstrument-coverage" + (" -Zcoverage-options=branch" if args.branches else "")
+        manifest["environment"] = {key: env[key] for key in ["CARGO_TARGET_DIR", "CARGO_PROFILE_DEV_OPT_LEVEL", "CARGO_PROFILE_DEV_DEBUG", "LLVM_PROFILE_FILE", "RUSTFLAGS"]}
+        cargo = ["cargo"] + ([f"+{args.toolchain}"] if args.toolchain else [])
+        manifest["steps"]["native_tests"] = run(cargo + ["test", "--workspace", "--tests", "--locked", "--no-fail-fast"], env=env, log=output / "native-tests.log")
+        manifest["steps"]["python_build"] = run(cargo + ["build", "-p", "rars-python", "--features", "extension-module", "--locked"], env=env, log=output / "python-build.log")
+        if manifest["steps"]["python_build"] == 0:
+            import shutil
+            (output / "python").mkdir()
+            shutil.copy2(output / "debug/librars.so", output / "python/rars.abi3.so")
+            env["PYTHONPATH"] = str(output / "python")
+            manifest["steps"]["python_tests"] = run([args.python, "-m", "pytest", "-q", "python/tests", "--basetemp", output / "pytest-tmp"], env=env, log=output / "python-tests.log")
+        (output / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    report(output, tools, manifest, source_files)
+    return int(any(manifest["steps"].values()))
 
 
 if __name__ == "__main__":

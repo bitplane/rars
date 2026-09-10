@@ -39,3 +39,12 @@ gate:
 # Cut and push a versioned release; defaults to a patch bump.
 release level="patch":
     cargo release {{ level }} --execute --no-confirm
+
+# Native Rust and Python coverage, raw counters, production summary and HTML.
+# Use --branches --toolchain nightly for instrumented branch outcomes.
+coverage *ARGS:
+    python3 scripts/coverage.py {{ ARGS }}
+
+# Coverage of the existing npm package and worker tests.
+coverage-js *ARGS:
+    ./scripts/coverage-js.sh {{ ARGS }}

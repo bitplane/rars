@@ -1,0 +1,13 @@
+[package]
+name = "rars-coverage-tools"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+syn = { version = "2", features = ["full", "visit"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+rustc-demangle = "0.1"
+serde_json = "1"
