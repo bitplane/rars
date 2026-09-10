@@ -71,6 +71,20 @@ impl Limited {
             None => self.ledger.limit - self.used(),
         }
     }
+    pub(crate) fn check_capacity(&self, required: u64) -> Result<()> {
+        if let Some(scope) = &self.scope {
+            let usage = scope.lock().unwrap();
+            if required > usage.capacity - usage.used {
+                return Err(refusal(usage.capacity, required, usage.used));
+            }
+        } else {
+            let used = *self.ledger.used.lock().unwrap();
+            if required > self.ledger.limit - used {
+                return Err(refusal(self.ledger.limit, required, used));
+            }
+        }
+        Ok(())
+    }
     fn reserve_global(&self, bytes: u64, required: u64) -> Result<()> {
         let mut used = self.ledger.used.lock().unwrap();
         if bytes > self.ledger.limit - *used {

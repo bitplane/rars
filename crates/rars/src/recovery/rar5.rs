@@ -376,6 +376,49 @@ pub(crate) fn choose_recovery_memory_mode(
     ))
 }
 
+/// Choose geometry using owned workspace and retained aggregate capacity.
+#[cfg(test)]
+pub(crate) fn choose_recovery_capacity_mode(
+    plan: InlineRecoveryPlan,
+    memory_limit: u64,
+    allowance: &crate::codec::workspace::Limited,
+) -> Result<(RecoveryMemoryMode, u64)> {
+    use crate::codec::workspace::Limited;
+    let field = ((FIELD_SIZE * 4 + 1) * 2 + (FIELD_SIZE + 1) * 4) as u64;
+    let rows = plan.recovery_shards;
+    let descriptor = std::mem::size_of::<Buffer<u8, Limited>>() as u64;
+    let fixed = field
+        .saturating_add(rows.saturating_mul(descriptor))
+        .saturating_add(rows.saturating_mul(plan.data_shards).saturating_mul(2))
+        .saturating_add(plan.data_shards.saturating_mul(8));
+    let io = plan.group_count.max(1).min(RECOVERY_IO_BLOCK as u64);
+    let framing = fixed.saturating_add(io).saturating_add(plan.header_size);
+    let parity_descriptors = rows.saturating_mul(descriptor);
+    let resident = framing
+        .saturating_add(parity_descriptors)
+        .saturating_add(rows.saturating_mul(plan.group_count));
+    let (legacy_mode, legacy_required) = choose_recovery_memory_mode(plan, memory_limit)?;
+    if matches!(legacy_mode, RecoveryMemoryMode::Resident) && resident <= allowance.available() {
+        return Ok((RecoveryMemoryMode::Resident, legacy_required));
+    }
+    let stripe_fixed = fixed.saturating_add(parity_descriptors);
+    let minimum =
+        framing.max(stripe_fixed.saturating_add(rows.saturating_add(1).saturating_mul(2)));
+    allowance.check_capacity(minimum)?;
+    let width = allowance
+        .available()
+        .saturating_sub(stripe_fixed)
+        .min(memory_limit.min(STRIPE_BUDGET_CAP))
+        / rows.saturating_add(1);
+    let stripe_len = width.min(plan.group_count).max(2) & !1;
+    Ok((
+        RecoveryMemoryMode::Striped {
+            stripe_len: usize::try_from(stripe_len).map_err(|_| Error::PlanOverflow)?,
+        },
+        rows.saturating_add(1).saturating_mul(stripe_len),
+    ))
+}
+
 /// What a streaming recovery pass produced, so the caller can frame the
 /// service block around the payload it just wrote.
 #[derive(Debug, Clone, Copy)]
@@ -2058,6 +2101,55 @@ mod tests {
         200 * 1024 + 1,
         1024 * 1024 + 7,
     ];
+
+    #[test]
+    fn aggregate_recovery_planning_selects_stripes_beside_retained_capacity() {
+        let data = vec![7; 131072];
+        let plan = super::plan_inline_recovery(data.len() as u64, 100).unwrap();
+        let ledger = super::Allowance::limited(900000);
+        let retained = super::Buffer::filled(4096, 0u8, &ledger).unwrap();
+        let (mode, required) =
+            super::choose_recovery_capacity_mode(plan, 8 * 1024 * 1024, &ledger).unwrap();
+        assert!(matches!(mode, super::RecoveryMemoryMode::Striped { .. }));
+        assert!(required <= 8 * 1024 * 1024);
+        let mut expected = Vec::new();
+        super::build_streamed_inline_recovery(
+            &mut std::io::Cursor::new(&data),
+            data.len() as u64,
+            100,
+            super::RecoveryMemoryMode::Resident,
+            None,
+            &mut expected,
+            None,
+            1,
+        )
+        .unwrap();
+        let mut actual = Vec::new();
+        super::streamed_recovery_with_allowance(
+            &mut std::io::Cursor::new(&data),
+            data.len() as u64,
+            plan,
+            mode,
+            Some(&mut std::io::Cursor::new(Vec::new())),
+            &mut actual,
+            None,
+            1,
+            &ledger,
+        )
+        .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(ledger.used(), 4096);
+        drop(retained);
+        assert_eq!(ledger.used(), 0);
+        let small = super::Allowance::limited(1);
+        let error =
+            super::choose_recovery_capacity_mode(plan, 8 * 1024 * 1024, &small).unwrap_err();
+        assert_eq!(
+            crate::Error::from(error).kind(),
+            crate::ErrorKind::ResourceLimit
+        );
+        assert_eq!(small.used(), 0);
+    }
 
     #[test]
     fn recovery_allowance_covers_tables_parity_and_framing_in_both_modes() {

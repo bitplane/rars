@@ -232,11 +232,15 @@ tables. Stored-volume verification buffers also carry root capacity charges.
 Emission remains sequential: these buffers draw directly from the coordinator's
 ledger, and refusal, cancellation and sink failure release the active owners.
 
-This wiring remains internal test coverage. Recovery mode selection still uses
-the legacy workspace estimate, so aggregate refusal can occur even when another
-stripe geometry could fit. Aggregate-aware phase planning, native spool path
-storage, the remaining copy-scratch audit and final output ownership must be
-completed before enabling the public aggregate policy.
+Recovery mode selection now checks owned field tables, matrix rows, CRC state,
+parity and framing buffers against aggregate headroom alongside the legacy
+workspace policy. Retained capacity can select a smaller stripe geometry without
+changing recovery bytes. If even the minimum phase cannot fit, planning refuses
+before allocating it.
+
+This wiring remains internal test coverage. Native spool path storage, the
+remaining copy-scratch audit and final output ownership must be completed before
+enabling the public aggregate policy.
 
 These reservations still use workspace estimates. Raw and filtered members,
 adjacent streaming blocks and persistent codec history have an internal
