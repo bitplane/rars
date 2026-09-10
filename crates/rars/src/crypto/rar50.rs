@@ -70,9 +70,9 @@ impl Rar50Keys {
         }
         let password = crate::crypto::clamp_password(password);
 
-        let mut first_input = Vec::with_capacity(salt.len() + 4);
-        first_input.extend_from_slice(&salt);
-        first_input.extend_from_slice(&1u32.to_be_bytes());
+        let mut first_input = [0u8; 20];
+        first_input[..16].copy_from_slice(&salt);
+        first_input[16..].copy_from_slice(&1u32.to_be_bytes());
 
         let mut u = hmac_sha256(password, &first_input);
         let mut accumulator = u;

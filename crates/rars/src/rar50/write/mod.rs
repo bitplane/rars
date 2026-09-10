@@ -705,10 +705,36 @@ fn encrypt_reader_to(
     block_size: usize,
     progress: Option<ProgressReporter<'_>>,
 ) -> Result<()> {
+    encrypt_reader_with_allowance(
+        reader,
+        input_size,
+        output,
+        keys,
+        iv,
+        block_size,
+        progress,
+        &crate::codec::workspace::Allowance::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encrypt_reader_with_allowance<B: crate::codec::workspace::Budget>(
+    reader: &mut dyn Read,
+    input_size: u64,
+    output: &mut dyn Write,
+    keys: &Rar50Keys,
+    iv: [u8; 16],
+    block_size: usize,
+    progress: Option<ProgressReporter<'_>>,
+    allowance: &B,
+) -> Result<()> {
     crate::write_progress::check_cancelled(progress)?;
+    if input_size == 0 {
+        return Ok(());
+    }
     let mut cipher = Rar50Cipher::new(keys.key, iv);
     let chunk_size = block_size.max(16) & !15;
-    let mut buffer = vec![0u8; chunk_size];
+    let mut buffer = crate::codec::workspace::Buffer::filled(chunk_size, 0u8, allowance)?;
     let mut remaining = input_size;
     while remaining >= chunk_size as u64 {
         crate::write_progress::check_cancelled(progress)?;
@@ -1003,6 +1029,110 @@ mod tests {
             .unwrap();
         assert_eq!(error.kind(), crate::ErrorKind::WriterFailure);
         assert_eq!(error.kind().code(), "WRITE_FAILED");
+    }
+
+    #[test]
+    fn encryption_allowance_admits_before_reading_and_preserves_cbc_tails() {
+        use crate::codec::workspace::Allowance;
+        let keys = Rar50Keys::derive(b"test password", [7; 16], 0).unwrap();
+        for len in [0usize, 1, 15, 16, 17, 31, 32, 95, 128, 129] {
+            let input: Vec<u8> = (0..len).map(|n| n as u8).collect();
+            let mut expected = input.clone();
+            expected.resize(len.next_multiple_of(16), 0);
+            Rar50Cipher::new(keys.key, [9; 16])
+                .encrypt_in_place(&mut expected)
+                .unwrap();
+            for limit in [0, 31, 32] {
+                let allowance = Allowance::limited(limit);
+                let mut reader = std::io::Cursor::new(&input);
+                let mut output = Vec::new();
+                let result = encrypt_reader_with_allowance(
+                    &mut reader,
+                    len as u64,
+                    &mut output,
+                    &keys,
+                    [9; 16],
+                    32,
+                    None,
+                    &allowance,
+                );
+                if len == 0 || limit == 32 {
+                    result.unwrap();
+                    assert_eq!(output, expected);
+                    assert_eq!(reader.position(), len as u64);
+                } else {
+                    assert_eq!(result.unwrap_err().kind(), crate::ErrorKind::ResourceLimit);
+                    assert_eq!(reader.position(), 0);
+                    assert!(output.is_empty());
+                }
+                assert_eq!(allowance.used(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn encryption_allowance_releases_buffers_on_io_failure_and_cancellation() {
+        use crate::codec::workspace::Allowance;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Progress(AtomicBool);
+        impl crate::WriteProgress for Progress {
+            fn report(&self, _: crate::WriteProgressEvent<'_>) {}
+            fn is_cancelled(&self) -> bool {
+                self.0.load(Ordering::Relaxed)
+            }
+        }
+        struct Sink<'a>(&'a Progress, bool, Vec<u8>);
+        impl Write for Sink<'_> {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                if self.1 {
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+                self.2.extend_from_slice(data);
+                self.0 .0.store(true, Ordering::Relaxed);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let keys = Rar50Keys::derive(b"test password", [7; 16], 0).unwrap();
+        let allowance = Allowance::limited(32);
+        for fail_sink in [false, true] {
+            let progress = Progress(AtomicBool::new(false));
+            let mut sink = Sink(&progress, fail_sink, Vec::new());
+            let mut reader = std::io::Cursor::new([42u8; 96]);
+            let error = encrypt_reader_with_allowance(
+                &mut reader,
+                96,
+                &mut sink,
+                &keys,
+                [9; 16],
+                32,
+                Some(ProgressReporter(&progress)),
+                &allowance,
+            )
+            .unwrap_err();
+            if fail_sink {
+                assert!(matches!(error, Error::Io(_)));
+            } else {
+                assert!(matches!(error, Error::Cancelled));
+                assert_eq!(sink.2.len(), 32);
+            }
+            assert_eq!(reader.position(), 32);
+            assert_eq!(allowance.used(), 0);
+        }
+        let result = encrypt_reader_with_allowance(
+            &mut std::io::Cursor::new([42u8; 7]),
+            96,
+            &mut Vec::new(),
+            &keys,
+            [9; 16],
+            32,
+            None,
+            &allowance,
+        );
+        assert!(matches!(result, Err(Error::Io(_))));
+        assert_eq!(allowance.used(), 0);
     }
 
     use super::filter_policy::{

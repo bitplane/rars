@@ -222,6 +222,15 @@ Scanner ranking and table ordering use explicit tie-breaks to preserve stable
 selection without hidden sorting workspace. The progress estimate counts filter
 kinds without allocating a candidate list. Legacy search uses an unlimited
 adapter; this does not add a hard policy to older-format encoding.
+Payload encryption admits its chunk buffer before reading input and retains it
+through ciphertext writes; empty payloads need no chunk allocation. RAR5 key
+derivation uses fixed-size scratch, with no heap allocation. Key records live
+inline in prepared descriptors and encrypted headers use preparation-owned bytes.
+Resident and striped recovery retain owned matrix coefficients, shard CRC states,
+parity buffers, I/O scratch and chunk headers. Bounded recovery owns its field
+tables until the pass ends, without initializing or borrowing the process-wide
+cache used by unlimited execution. Cancellation and I/O failures drop the pass's
+owners; external sinks and striped scratch can retain a written prefix.
 Coordinator descriptors still use preparation accounting and spools retain their
 separate storage policy. This does not yet combine those ledgers.
 Covered owners reserve before growth, include replacement peaks and retain
@@ -235,9 +244,9 @@ This is migration infrastructure, not an available writer limit. Production
 codec entry points currently use unlimited handles; bounded construction is
 internal test coverage, including its refusal diagnostics. The codec reader
 adapter also has bounded read-ahead and input-buffer tests; it is not the
-production writer's source-loading path. Encryption/KDF and recovery workspace
-still need migration. Only after those paths are covered can the coordinator
-supply reserved allowances and connect them to preparation and spool memory. There is no public worker allowance or extension API yet.
+production writer's source-loading path. The coordinator still needs to supply
+reserved execution allowances and connect them to preparation and spool memory.
+There is no public worker allowance or extension API yet.
 The workspace/admission pass remains open until those guarantees are enforceable.
 
 The optimal parser keeps match-pricing helpers available for inlining across
