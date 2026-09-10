@@ -1,9 +1,11 @@
 //! Fallible ownership of codec allocation capacity. A local allowance never
-//! reaches into a sibling worker's spare bytes. Future coordinator integration
-//! will supply the allowance; unlimited handles preserve existing codec behaviour.
+//! reaches into a sibling worker's spare bytes. Internal admission tests connect
+//! these owners to coordinator reservations; unlimited handles preserve behaviour.
 use super::{Error, Result};
 #[cfg(test)]
-use std::sync::{Arc, Mutex};
+mod ledger;
+#[cfg(test)]
+pub(crate) use ledger::{Charge, Limited, Reservation, RESERVATION_BYTES};
 
 /// A zero-sized policy: its buffers have exactly Vec's layout and no ledger
 /// branch in their hot operations. Limited buffers are a separate instantiation.
@@ -14,10 +16,7 @@ pub(crate) struct Allowance {
 impl Allowance {
     #[cfg(test)]
     pub(crate) fn limited(limit: u64) -> Limited {
-        Limited(Arc::new(State {
-            limit,
-            used: Mutex::new(0),
-        }))
+        Limited::new(limit)
     }
 }
 
@@ -55,29 +54,6 @@ impl Budget for Allowance {
     }
 }
 
-// This constructor remains internal test coverage until all codec allocation
-// paths and coordinator reservations can be connected without scope holes.
-#[cfg(test)]
-#[derive(Clone, Debug)]
-pub(crate) struct Limited(Arc<State>);
-#[cfg(test)]
-#[derive(Debug)]
-struct State {
-    limit: u64,
-    used: Mutex<u64>,
-}
-#[cfg(test)]
-impl Limited {
-    pub(crate) fn used(&self) -> u64 {
-        *self.0.used.lock().unwrap()
-    }
-}
-#[cfg(test)]
-#[derive(Debug)]
-pub(crate) struct Charge {
-    allowance: Limited,
-    bytes: u64,
-}
 #[cfg(test)]
 impl Budget for Limited {
     type Charge = Charge;
@@ -113,31 +89,7 @@ impl Budget for Limited {
         charge.allowance.clone()
     }
     fn resize(charge: &mut Charge, bytes: u64) -> Result<()> {
-        let state = &charge.allowance.0;
-        let mut used = state.used.lock().expect("codec allowance lock poisoned");
-        if bytes > charge.bytes {
-            let extra = bytes - charge.bytes;
-            if extra > state.limit.saturating_sub(*used) {
-                return Err(Error::WorkspaceLimitExceeded(Box::new(
-                    super::WorkspaceLimitError {
-                        limit: state.limit,
-                        required: bytes,
-                        used: *used,
-                    },
-                )));
-            }
-            *used += extra;
-        } else {
-            *used -= charge.bytes - bytes;
-        }
-        charge.bytes = bytes;
-        Ok(())
-    }
-}
-#[cfg(test)]
-impl Drop for Charge {
-    fn drop(&mut self) {
-        Limited::resize(self, 0).expect("releasing codec capacity cannot fail");
+        charge.resize(bytes)
     }
 }
 

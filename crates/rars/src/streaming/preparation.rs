@@ -1,12 +1,12 @@
 //! Ownership of preparation capacity, including temporary replacement peaks.
-use super::{StorageCharge, WriterResources};
+use super::{CapacityCharge, WriterResources};
 use crate::{Error, Result};
 
 #[derive(Debug)]
 pub(crate) struct Bytes {
     bytes: Vec<u8>,
     len: usize,
-    charge: Option<StorageCharge>,
+    charge: Option<CapacityCharge>,
 }
 impl Bytes {
     pub(crate) fn new(resources: &WriterResources) -> Self {
@@ -106,7 +106,7 @@ impl std::ops::DerefMut for Bytes {
 pub(crate) struct Records<T> {
     values: Vec<T>,
     limit: usize,
-    charge: Option<StorageCharge>,
+    charge: Option<CapacityCharge>,
 }
 impl<T> Records<T> {
     pub(crate) fn new(limit: usize, resources: &WriterResources) -> Result<Self> {
@@ -156,7 +156,7 @@ impl<T> Records<T> {
                     "preparation records capacity overflows",
                 ))?;
             if let Some(charge) = &mut self.charge {
-                charge.grow_to((bytes as u64).checked_add(charge.bytes).ok_or(
+                charge.grow_to((bytes as u64).checked_add(charge.bytes()).ok_or(
                     Error::InvalidArgument("preparation records capacity overflows"),
                 )?)?;
             }
@@ -198,7 +198,7 @@ impl<T> std::ops::DerefMut for Records<T> {
 }
 pub(crate) struct RecordIter<T> {
     iter: std::vec::IntoIter<T>,
-    _charge: Option<StorageCharge>,
+    _charge: Option<CapacityCharge>,
 }
 impl<T> Iterator for RecordIter<T> {
     type Item = T;
@@ -238,7 +238,7 @@ impl<'a, T> IntoIterator for &'a mut Records<T> {
 
 pub(crate) struct Owned<T> {
     value: Box<T>,
-    _charge: Option<StorageCharge>,
+    _charge: Option<CapacityCharge>,
 }
 impl<T> Owned<T> {
     pub(crate) fn new(value: T, resources: &WriterResources) -> Result<Self> {
@@ -290,6 +290,28 @@ impl PartialEq<Bytes> for Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn preparation_growth_satisfies_both_ledgers_or_leaves_both_unchanged() {
+        use crate::codec::workspace::Allowance;
+        let ledger = Allowance::limited(1024);
+        let resources = WriterResources::default()
+            .with_max_preparation_bytes(64)
+            .with_execution_allowance(ledger.clone());
+        let mut bytes = Bytes::zeroed(32, &resources).unwrap();
+        assert!(bytes.extend_from_slice(&[1; 40]).is_err());
+        assert_eq!(&*bytes, &[0; 32]);
+        assert_eq!(ledger.used(), 32);
+        drop(bytes);
+        assert_eq!(ledger.used(), 0);
+        drop(Bytes::zeroed(64, &resources).unwrap());
+        let small = Allowance::limited(16);
+        let constrained = resources.clone().with_execution_allowance(small.clone());
+        assert!(Bytes::zeroed(32, &constrained).is_err());
+        assert_eq!(small.used(), 0);
+        drop(Bytes::zeroed(64, &resources).unwrap());
+        assert_eq!(ledger.used(), 0);
+    }
+
     #[test]
     fn descriptor_growth_counts_replacement_peak_and_preserves_refused_input() {
         let resources = WriterResources::default().with_max_preparation_bytes(23);

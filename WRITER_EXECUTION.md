@@ -86,9 +86,11 @@ through spool writes. Whole-member source loading and automatic filter search
 also retain owned samples, scanner scratch, candidate descriptors, trial encodes
 and the winning payload. Encryption chunks and resident/striped recovery buffers
 use the same ownership machinery; bounded recovery owns its field tables, and
-RAR5 key derivation uses fixed-size scratch. Coordinator integration must connect
-these allowances to preparation and spool memory before an enforceable writer
-policy is available.
+RAR5 key derivation uses fixed-size scratch. Internal whole-member admission
+tests connect worker reservations, preparation and memory-spool capacity under
+one ledger; unused reservation space is released only after joining workers,
+and retained owners keep their charges. Stored/block-streaming execution and
+emission still need routing before an enforceable writer policy is available.
 `whole_member_workspace` adds four times the input size and a codec workspace
 estimate with reach and block size fitted to that input.
 

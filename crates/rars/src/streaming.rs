@@ -151,13 +151,15 @@ impl WriteCancellation {
 /// bare-WASM spool payload and index capacity, excluding other writer memory.
 pub struct WriterResources {
     memory_limit: u64,
-    temp_dir: Option<PathBuf>,
+    temp_dir: Option<Arc<PathBuf>>,
     budget: Arc<MemoryBudget>,
     spool_budget: Option<Arc<StorageBudget>>,
     spool_memory_budget: Option<Arc<StorageBudget>>,
     prepared_header_budget: Option<Arc<StorageBudget>>,
     preparation_budget: Option<Arc<StorageBudget>>,
     cancellation: Option<WriteCancellation>,
+    #[cfg(test)]
+    pub(crate) execution: Option<crate::codec::workspace::Limited>,
 }
 
 impl Default for WriterResources {
@@ -177,6 +179,8 @@ impl WriterResources {
             prepared_header_budget: None,
             preparation_budget: None,
             cancellation: None,
+            #[cfg(test)]
+            execution: None,
         }
     }
 
@@ -286,13 +290,24 @@ impl WriterResources {
         self.preparation_budget.as_ref().map(|budget| budget.limit)
     }
 
-    pub(crate) fn preparation_charge(&self) -> Option<StorageCharge> {
-        self.preparation_budget
-            .as_ref()
-            .map(|budget| StorageCharge {
-                budget: budget.clone(),
-                bytes: 0,
-            })
+    pub(crate) fn preparation_charge(&self) -> Option<CapacityCharge> {
+        CapacityCharge::new(self, &self.preparation_budget)
+    }
+
+    #[cfg(any(test, all(target_arch = "wasm32", target_os = "unknown")))]
+    fn spool_capacity_charge(&self) -> Option<CapacityCharge> {
+        CapacityCharge::new(self, &self.spool_memory_budget)
+    }
+
+    // No public aggregate mode until every coordinator path and output owner
+    // participates. Tests exercise production owners against admitted scopes.
+    #[cfg(test)]
+    pub(crate) fn with_execution_allowance(
+        mut self,
+        allowance: crate::codec::workspace::Limited,
+    ) -> Self {
+        self.execution = Some(allowance);
+        self
     }
 
     /// Place temporary spools in this existing directory (default: the current
@@ -306,7 +321,7 @@ impl WriterResources {
     /// errors and unwind. Removal is best-effort, not secure erasure, and process
     /// termination can leave files behind. Bare WASM ignores this setting.
     pub fn with_temp_dir(mut self, path: impl Into<PathBuf>) -> Self {
-        self.temp_dir = Some(path.into());
+        self.temp_dir = Some(Arc::new(path.into()));
         self
     }
 
@@ -333,7 +348,7 @@ impl WriterResources {
     }
 
     pub fn temp_dir(&self) -> Option<&Path> {
-        self.temp_dir.as_deref()
+        self.temp_dir.as_deref().map(PathBuf::as_path)
     }
 
     #[cfg(test)]
@@ -466,6 +481,75 @@ impl StorageCharge {
 impl Drop for StorageCharge {
     fn drop(&mut self) {
         self.shrink_to(0);
+    }
+}
+
+/// A capacity owner can satisfy its existing class quota and an execution
+/// reservation together. Failed admission rolls both ledgers back.
+#[derive(Debug)]
+pub(crate) enum CapacityCharge {
+    Storage(StorageCharge),
+    #[cfg(test)]
+    Execution {
+        storage: Option<StorageCharge>,
+        charge: crate::codec::workspace::Charge,
+    },
+}
+impl CapacityCharge {
+    fn new(_resources: &WriterResources, budget: &Option<Arc<StorageBudget>>) -> Option<Self> {
+        let storage = budget.as_ref().map(|budget| StorageCharge {
+            budget: budget.clone(),
+            bytes: 0,
+        });
+        #[cfg(test)]
+        if let Some(allowance) = &_resources.execution {
+            return Some(Self::Execution {
+                storage,
+                charge: crate::codec::workspace::Budget::charge(allowance),
+            });
+        }
+        storage.map(Self::Storage)
+    }
+    fn bytes(&self) -> u64 {
+        match self {
+            Self::Storage(storage) => storage.bytes,
+            #[cfg(test)]
+            Self::Execution { charge, .. } => charge.bytes(),
+        }
+    }
+    fn grow_to(&mut self, bytes: u64) -> Result<()> {
+        if bytes <= self.bytes() {
+            return Ok(());
+        }
+        match self {
+            Self::Storage(storage) => storage.grow_to(bytes),
+            #[cfg(test)]
+            Self::Execution { storage, charge } => {
+                use crate::codec::workspace::{Budget, Limited};
+                let old = charge.bytes();
+                Limited::resize(charge, bytes)?;
+                if let Some(storage) = storage {
+                    if let Err(error) = storage.grow_to(bytes) {
+                        Limited::resize(charge, old).expect("rolling back capacity cannot fail");
+                        return Err(error);
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+    fn shrink_to(&mut self, bytes: u64) {
+        match self {
+            Self::Storage(storage) => storage.shrink_to(bytes),
+            #[cfg(test)]
+            Self::Execution { storage, charge } => {
+                use crate::codec::workspace::{Budget, Limited};
+                if let Some(storage) = storage {
+                    storage.shrink_to(bytes);
+                }
+                Limited::resize(charge, bytes).expect("releasing capacity cannot fail");
+            }
+        }
     }
 }
 

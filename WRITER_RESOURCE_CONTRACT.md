@@ -198,6 +198,22 @@ cancellation. Error selection prefers a source/codec failure over the resulting
 cancellation. Returning joins admitted callbacks before releasing their owners;
 reusing the resources after an ordinary failure does not inherit cancellation.
 
+Internal whole-member admission tests now connect fixed worker reservations,
+preparation capacity and memory-spool capacity to one ledger. Coordinator slots
+are allocated before reservations are admitted, and wave sizing applies the
+estimated-workspace limit separately from the ledger's remaining capacity.
+Workers receive scoped resources and cannot reserve global space. Class-specific
+quotas still apply; a refusal rolls back the corresponding ledger admission.
+All reservations survive until callbacks join. Retirement releases only unused
+capacity, while escaped payloads and descriptors keep their charges. Retired
+scopes cannot grow; an output needing further growth must receive new admission.
+Per-reservation control storage stays charged until its last scope handle drops.
+Allowance extensions are allowed only before dispatch. An underestimate fails
+inside its fixed scope; running workers never compete for global spare bytes.
+This wiring remains internal test coverage. Stored/block-streaming execution,
+encryption/recovery emission and volume transitions still need coordinator
+routing before the aggregate policy can be enabled.
+
 These reservations still use workspace estimates. Raw and filtered members,
 adjacent streaming blocks and persistent codec history have an internal
 fallible allowance path covering history-window copies, chain/tree
@@ -231,8 +247,9 @@ parity buffers, I/O scratch and chunk headers. Bounded recovery owns its field
 tables until the pass ends, without initializing or borrowing the process-wide
 cache used by unlimited execution. Cancellation and I/O failures drop the pass's
 owners; external sinks and striped scratch can retain a written prefix.
-Coordinator descriptors still use preparation accounting and spools retain their
-separate storage policy. This does not yet combine those ledgers.
+Production coordinator descriptors still use preparation accounting and spools
+retain their separate storage policy. Internal admitted scopes combine their
+capacity charges; logical spool storage remains independent.
 Covered owners reserve before growth, include replacement peaks and retain
 charges through moves and token selection. Unlimited and bounded buffers use
 separate compile-time policies; the unlimited owner retains Vec's layout.
@@ -244,8 +261,8 @@ This is migration infrastructure, not an available writer limit. Production
 codec entry points currently use unlimited handles; bounded construction is
 internal test coverage, including its refusal diagnostics. The codec reader
 adapter also has bounded read-ahead and input-buffer tests; it is not the
-production writer's source-loading path. The coordinator still needs to supply
-reserved execution allowances and connect them to preparation and spool memory.
+production writer's source-loading path. Coordinator routing remains incomplete
+outside the internally admitted whole-member path.
 There is no public worker allowance or extension API yet.
 The workspace/admission pass remains open until those guarantees are enforceable.
 

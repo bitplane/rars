@@ -1,6 +1,6 @@
 //! Optional bounded storage for bare-WASM spools.
 //! Payload blocks and index replacements have known sizes before allocation.
-use super::{StorageCharge, WriterResources};
+use super::{CapacityCharge, WriterResources};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 
 const BLOCK_BYTES: usize = 4096;
@@ -23,21 +23,18 @@ struct BoundedSpool {
     len: usize,
     pos: u64,
     // Drop payload and index allocations before releasing their shared charge.
-    charge: StorageCharge,
+    charge: CapacityCharge,
 }
 
 impl MemorySpool {
     pub(super) fn new(resources: &WriterResources) -> Self {
-        let store = match &resources.spool_memory_budget {
-            Some(budget) => Store::Bounded(BoundedSpool {
+        let store = match resources.spool_capacity_charge() {
+            Some(charge) => Store::Bounded(BoundedSpool {
                 blocks: Box::default(),
                 block_count: 0,
                 len: 0,
                 pos: 0,
-                charge: StorageCharge {
-                    budget: budget.clone(),
-                    bytes: 0,
-                },
+                charge,
             }),
             None => Store::Unbounded(Cursor::new(Vec::new())),
         };
@@ -184,6 +181,63 @@ impl Seek for MemorySpool {
 mod tests {
     use super::*;
     use crate::{Error, ErrorKind};
+
+    #[test]
+    fn admitted_spool_retains_its_capacity_after_worker_retirement() {
+        use crate::codec::workspace::{Allowance, Buffer, RESERVATION_BYTES};
+        use crate::streaming::preparation::Bytes;
+        let ledger = Allowance::limited(20000);
+        let resources = WriterResources::default().with_execution_allowance(ledger.clone());
+        let prepared = Bytes::zeroed(32, &resources).unwrap();
+        let mut reservation = ledger.reserve(capacity(2)).unwrap();
+        let allowance = reservation.allowance();
+        let worker = resources
+            .clone()
+            .with_execution_allowance(allowance.clone());
+        reservation.start();
+        let scratch = Buffer::filled(64, 0u8, &allowance).unwrap();
+        let mut spool = MemorySpool::new(&worker);
+        spool.write_all(b"payload").unwrap();
+        assert_eq!(ledger.used(), 32 + capacity(2) + RESERVATION_BYTES);
+        reservation.retire();
+        assert_eq!(ledger.used(), 32 + 64 + capacity(1) + RESERVATION_BYTES);
+        drop(scratch);
+        drop(prepared);
+        assert_eq!(ledger.used(), capacity(1) + RESERVATION_BYTES);
+        spool.seek(SeekFrom::Start(BLOCK_BYTES as u64)).unwrap();
+        let error = spool.write_all(b"growth after retirement").unwrap_err();
+        assert_eq!(
+            error.downcast::<Error>().unwrap().kind(),
+            ErrorKind::ResourceLimit
+        );
+        assert_eq!(ledger.used(), capacity(1) + RESERVATION_BYTES);
+        spool.seek(SeekFrom::Start(0)).unwrap();
+        let mut bytes = [0; 7];
+        spool.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"payload");
+        drop(spool);
+        assert_eq!(ledger.used(), RESERVATION_BYTES);
+        drop((worker, allowance));
+        assert_eq!(ledger.used(), 0);
+    }
+
+    #[test]
+    fn class_quota_refusal_rolls_back_execution_spool_growth() {
+        use crate::codec::workspace::Allowance;
+        let ledger = Allowance::limited(20000);
+        let resources = WriterResources::default()
+            .with_max_spool_memory_bytes(capacity(1))
+            .with_execution_allowance(ledger.clone());
+        let mut spool = MemorySpool::new(&resources);
+        spool.write_all(b"payload").unwrap();
+        spool.seek(SeekFrom::Start(BLOCK_BYTES as u64)).unwrap();
+        assert!(spool.write_all(b"overflow").is_err());
+        assert_eq!(ledger.used(), capacity(1));
+        drop(spool);
+        assert_eq!(ledger.used(), 0);
+        MemorySpool::new(&resources).write_all(b"retry").unwrap();
+        assert_eq!(ledger.used(), 0);
+    }
 
     fn capacity(blocks: usize) -> u64 {
         (blocks * BLOCK_BYTES + blocks.next_power_of_two() * INDEX_ENTRY_BYTES) as u64

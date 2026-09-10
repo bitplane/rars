@@ -86,18 +86,32 @@ fn run_jobs<T: Send, O: Send>(
     progress: &dyn CompressionProgress,
     map: impl Fn(T, &dyn CompressionProgress) -> Result<O> + Sync + Send,
 ) -> Result<Records<O>> {
-    let mut output = Records::new(jobs.len(), resources)?;
-    let mut slots = Records::collect(jobs.into_iter().map(|job| Ok((Some(job), None))), resources)?;
+    let output = Records::new(jobs.len(), resources)?;
+    let slots = Records::collect(jobs.into_iter().map(|job| Ok((Some(job), None))), resources)?;
+    complete_jobs(slots, output, resources, progress, |_, job, progress| {
+        map(job, progress)
+    })
+}
+
+type JobSlot<T, O> = (Option<T>, Option<Result<O>>);
+
+fn complete_jobs<T: Send, O: Send>(
+    mut slots: Records<JobSlot<T, O>>,
+    mut output: Records<O>,
+    resources: &WriterResources,
+    progress: &dyn CompressionProgress,
+    map: impl Fn(usize, T, &dyn CompressionProgress) -> Result<O> + Sync + Send,
+) -> Result<Records<O>> {
     let batch = BatchProgress {
         progress,
         resources,
         stopped: AtomicBool::new(false),
     };
-    crate::parallel::for_each_mut(&mut slots, |_, (job, result)| {
+    crate::parallel::for_each_mut(&mut slots, |index, (job, result)| {
         if batch.is_cancelled() {
             return;
         }
-        let mapped = map(job.take().expect("one callback per slot"), &batch);
+        let mapped = map(index, job.take().expect("one callback per slot"), &batch);
         if mapped.is_err() {
             batch.stopped.store(true, Ordering::Release);
         }
@@ -127,6 +141,59 @@ fn run_jobs<T: Send, O: Send>(
         output.push(result.expect("all jobs completed")?)?;
     }
     Ok(output)
+}
+
+/// Admit fixed worker scopes only after coordinator slots have capacity. Keep
+/// every reservation until all callbacks join, then retire unused capacity;
+/// output owners remain charged after return. No worker can extend its scope.
+#[cfg(test)]
+fn run_jobs_admitted<T: Send, O: Send>(
+    jobs: Records<T>,
+    resources: &WriterResources,
+    progress: &dyn CompressionProgress,
+    required: impl Fn(&T) -> u64,
+    map: impl Fn(
+            T,
+            &WriterResources,
+            &dyn CompressionProgress,
+            &crate::codec::workspace::Limited,
+        ) -> Result<O>
+        + Sync
+        + Send,
+) -> Result<Records<O>> {
+    let ledger = resources
+        .execution
+        .as_ref()
+        .expect("admitted execution ledger");
+    let output = Records::new(jobs.len(), resources)?;
+    let slots = Records::collect(jobs.into_iter().map(|job| Ok((Some(job), None))), resources)?;
+    let mut reservations = Records::new(slots.len(), resources)?;
+    for (job, _) in slots.iter() {
+        if progress.is_cancelled() || resources.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        reservations.push(ledger.reserve(required(job.as_ref().unwrap()))?)?;
+    }
+    for reservation in reservations.iter_mut() {
+        reservation.start();
+    }
+    let result = complete_jobs(
+        slots,
+        output,
+        resources,
+        progress,
+        |index, job, progress| {
+            let allowance = reservations[index].allowance();
+            let worker = resources
+                .clone()
+                .with_execution_allowance(allowance.clone());
+            map(job, &worker, progress, &allowance)
+        },
+    );
+    for reservation in reservations {
+        reservation.retire();
+    }
+    result
 }
 
 /// A member that has been compressed and is waiting to be framed.
@@ -414,24 +481,68 @@ fn compress_members_whole(
             crate::parallel::threads(),
             resources.memory_limit(),
         );
+        #[cfg(test)]
+        let (end, reserved) = if let Some(ledger) = &resources.execution {
+            let slot_bytes = std::mem::size_of::<usize>()
+                + std::mem::size_of::<CompressedMember>()
+                + std::mem::size_of::<JobSlot<usize, CompressedMember>>()
+                + std::mem::size_of::<crate::codec::workspace::Reservation>();
+            whole_member_wave_with_slots(
+                members,
+                start,
+                crate::parallel::threads(),
+                resources.memory_limit(),
+                slot_bytes as u64 + crate::codec::workspace::RESERVATION_BYTES,
+                ledger.available(),
+            )
+        } else {
+            (end, reserved)
+        };
         // Acquire the entire wave on the coordinator. No dispatched worker
         // waits for workspace held by another worker in the same pool.
         let _permit = resources
             .acquire_cancellable(reserved, plan.dictionary_size, &|| advance.is_cancelled())
             .map_err(|error| error_context(start, error))?;
         let jobs = Records::collect((start..end).map(Ok), resources)?;
-        let completed = run_jobs(jobs, resources, advance, |index, progress| {
-            compress_whole_member(
-                index,
-                &sources[index],
-                integrity[index],
-                plan,
+        let unlimited = |jobs| {
+            run_jobs(jobs, resources, advance, |index, progress| {
+                compress_whole_member(
+                    index,
+                    &sources[index],
+                    integrity[index],
+                    plan,
+                    resources,
+                    progress,
+                    &Allowance::default(),
+                )
+                .map_err(|error| error_context(index, error))
+            })
+        };
+        #[cfg(test)]
+        let completed = if resources.execution.is_some() {
+            run_jobs_admitted(
+                jobs,
                 resources,
-                progress,
-                &Allowance::default(),
-            )
-            .map_err(|error| error_context(index, error))
-        })?;
+                advance,
+                |index| members[*index].workspace,
+                |index, worker, progress, allowance| {
+                    compress_whole_member(
+                        index,
+                        &sources[index],
+                        integrity[index],
+                        plan,
+                        worker,
+                        progress,
+                        allowance,
+                    )
+                    .map_err(|error| error_context(index, error))
+                },
+            )?
+        } else {
+            unlimited(jobs)?
+        };
+        #[cfg(not(test))]
+        let completed = unlimited(jobs)?;
         for member in completed {
             results.push(member)?;
         }
@@ -448,16 +559,29 @@ fn whole_member_wave(
     threads: usize,
     limit: u64,
 ) -> (usize, u64) {
+    whole_member_wave_with_slots(members, start, threads, limit, 0, u64::MAX)
+}
+
+fn whole_member_wave_with_slots(
+    members: &[MemberPlan],
+    start: usize,
+    max_jobs: usize,
+    limit: u64,
+    slot_bytes: u64,
+    capacity: u64,
+) -> (usize, u64) {
     let mut reserved = members[start].workspace;
     let mut end = start + 1;
-    while end < members.len() && end - start < threads.max(1) {
+    while end < members.len() && end - start < max_jobs.max(1) {
         if members[end].execution != Execution::WholeMember {
             break;
         }
         let Some(total) = reserved.checked_add(members[end].workspace) else {
             break;
         };
-        if total > limit {
+        if total > limit
+            || total.saturating_add(slot_bytes.saturating_mul((end - start + 1) as u64)) > capacity
+        {
             break;
         }
         reserved = total;
@@ -1282,6 +1406,151 @@ mod tests {
             assert!(matches!(error, Error::Io(_) | Error::SourceChanged(_)));
             drop(stream);
             assert_eq!(allowance.used(), 0);
+        }
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[test]
+    fn admitted_workers_share_one_ledger_without_racing_for_spare_capacity() {
+        use crate::streaming::preparation::Bytes;
+        use std::sync::{atomic::AtomicU64, Barrier};
+        let ledger = Allowance::limited(65536);
+        let resources = WriterResources::default().with_execution_allowance(ledger.clone());
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        for fail in [false, true] {
+            let barrier = Barrier::new(2);
+            let admitted = AtomicU64::new(0);
+            let jobs = Records::collect((0..2).map(Ok), &resources).unwrap();
+            let result = pool.install(|| {
+                run_jobs_admitted(
+                    jobs,
+                    &resources,
+                    &|_| true,
+                    |_| 128,
+                    |index, worker, _, allowance| {
+                        if index == 0 {
+                            admitted.store(ledger.used(), Ordering::Relaxed);
+                        }
+                        barrier.wait();
+                        let prepared = Bytes::zeroed(32, worker)?;
+                        let bytes = Buffer::filled(64, index as u8, allowance)?;
+                        assert_eq!(ledger.used(), admitted.load(Ordering::Relaxed));
+                        barrier.wait();
+                        if fail && index == 0 {
+                            Buffer::filled(33, 0u8, allowance)?;
+                        }
+                        Ok((prepared, bytes))
+                    },
+                )
+            });
+            if fail {
+                assert_eq!(
+                    result.err().unwrap().kind(),
+                    crate::ErrorKind::ResourceLimit
+                );
+                assert_eq!(ledger.used(), 0);
+            } else {
+                let mut output = result.unwrap();
+                let first = output.pop().unwrap();
+                let second = output.pop().unwrap();
+                drop(output);
+                assert_eq!(
+                    ledger.used(),
+                    192 + 2 * crate::codec::workspace::RESERVATION_BYTES
+                );
+                drop(first);
+                assert_eq!(
+                    ledger.used(),
+                    96 + crate::codec::workspace::RESERVATION_BYTES
+                );
+                drop(second);
+                assert_eq!(ledger.used(), 0);
+            }
+        }
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[test]
+    fn whole_member_ledger_selects_fitting_waves_before_opening_sources() {
+        use std::sync::{atomic::AtomicUsize, Arc, Barrier};
+        let scratch = crate::scratch::case("whole-member-ledger");
+        let options = EncodeOptions::new(8).with_max_match_distance(65536);
+        let plan = CompressPlan {
+            algorithm_version: 0,
+            encode_options: options,
+            dictionary_size: 65536,
+            block_size: 1024,
+            solid: false,
+            method: 1,
+            filter_policy: FilterPolicy::Auto,
+            candidates: vec![options],
+        };
+        let data: Arc<[u8]> = (0..1024u32)
+            .flat_map(|n| n.to_le_bytes())
+            .collect::<Vec<_>>()
+            .into();
+        let required = whole_member_workspace(data.len() as u64, &plan);
+        let expected = candidates_with_allowance(
+            &data,
+            0,
+            &plan.filter_policy,
+            &plan.candidates,
+            None,
+            &Allowance::default(),
+        )
+        .unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        for workers in [1, 2] {
+            let ledger = Allowance::limited(required * workers + 65536);
+            let resources = WriterResources::new(required * 2)
+                .with_temp_dir(&*scratch)
+                .with_execution_allowance(ledger.clone());
+            let opens = Arc::new(AtomicUsize::new(0));
+            let barrier = Arc::new(Barrier::new(workers as usize));
+            let sources: Vec<_> = (0..4)
+                .map(|_| {
+                    let data = data.clone();
+                    let ledger = ledger.clone();
+                    let opens = opens.clone();
+                    let barrier = barrier.clone();
+                    EntrySource::from_opener(data.len() as u64, move || {
+                        assert!(ledger.used() >= required * workers);
+                        opens.fetch_add(1, Ordering::Relaxed);
+                        barrier.wait();
+                        Ok(Box::new(std::io::Cursor::new(data.clone())))
+                    })
+                })
+                .collect();
+            let result = pool
+                .install(|| {
+                    compress_members_with_context(
+                        &sources,
+                        &plan,
+                        &resources,
+                        &|_| true,
+                        &|_, error| error,
+                    )
+                })
+                .unwrap();
+            assert_eq!(opens.load(Ordering::Relaxed), 4);
+            assert_eq!(
+                ledger.used(),
+                (4 * std::mem::size_of::<CompressedMember>()) as u64
+            );
+            for mut member in result {
+                let mut bytes = Vec::new();
+                member.packed.copy_to(&mut bytes).unwrap();
+                assert_eq!(&*expected, bytes);
+            }
+            assert_eq!(ledger.used(), 0);
+            assert_eq!(resources.workspace_in_use(), 0);
+            assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
         }
     }
 
