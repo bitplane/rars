@@ -210,9 +210,23 @@ scopes cannot grow; an output needing further growth must receive new admission.
 Per-reservation control storage stays charged until its last scope handle drops.
 Allowance extensions are allowed only before dispatch. An underestimate fails
 inside its fixed scope; running workers never compete for global spare bytes.
-This wiring remains internal test coverage. Stored/block-streaming execution,
-encryption/recovery emission and volume transitions still need coordinator
-routing before the aggregate policy can be enabled.
+
+Internal block-streaming admission also uses this ledger. Source-read and run
+assembly buffers, pushback, retained histories and coordinator descriptors carry
+root charges. Wave sizing leaves conservative room for assembly beside the
+estimated worker scopes; retained history and memory-spool capacity reduce the
+space available to later waves. Actual allocation owners enforce the ceiling,
+including descriptor growth, before dispatch. Solid chains, independent members
+and automatic whole-member fallback use the same routing. Worker codec buffers
+use fixed child scopes; joining retires these scopes before packed results are
+appended in order. A memory-spool copy counts its destination capacity alongside
+the still-live packed source. Stored-member checksum reads admit their buffer
+before opening the source and release it at the end of the read.
+
+This wiring remains internal test coverage. Encryption/recovery emission,
+stored-payload emission and volume transitions still need coordinator routing
+before the aggregate policy can be enabled. Native spool path storage also
+remains outside this internal accounting.
 
 These reservations still use workspace estimates. Raw and filtered members,
 adjacent streaming blocks and persistent codec history have an internal
@@ -262,7 +276,8 @@ codec entry points currently use unlimited handles; bounded construction is
 internal test coverage, including its refusal diagnostics. The codec reader
 adapter also has bounded read-ahead and input-buffer tests; it is not the
 production writer's source-loading path. Coordinator routing remains incomplete
-outside the internally admitted whole-member path.
+outside the internally admitted whole-member, block-streaming and stored
+checksum-read paths.
 There is no public worker allowance or extension API yet.
 The workspace/admission pass remains open until those guarantees are enforceable.
 

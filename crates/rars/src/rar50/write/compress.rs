@@ -333,8 +333,9 @@ pub(super) fn compress_members_with_context(
             sources.iter().zip(&mut integrity).enumerate()
         {
             advance.started(index, *input_size);
-            (*crc, *hash) = super::source_integrity(source, *input_size, plan.block_size, advance)
-                .map_err(|error| error_context(index, error))?;
+            (*crc, *hash) =
+                super::source_integrity(source, *input_size, plan.block_size, advance, resources)
+                    .map_err(|error| error_context(index, error))?;
             if !advance.advance(*input_size) {
                 return Err(Error::Cancelled);
             }
@@ -409,6 +410,26 @@ fn compress_streaming_members(
         .min(crate::parallel::threads())
         .max(1);
 
+    #[cfg(test)]
+    if let Some(allowance) = &resources.execution {
+        let encode = if plan.solid {
+            compress_solid_chain::<crate::codec::workspace::Limited>
+        } else {
+            compress_independent_members::<crate::codec::workspace::Limited>
+        };
+        return encode(
+            sources,
+            integrity,
+            plan,
+            batch_capacity,
+            required,
+            resources,
+            advance,
+            error_context,
+            allowance,
+        );
+    }
+
     if plan.solid {
         compress_solid_chain(
             sources,
@@ -434,6 +455,32 @@ fn compress_streaming_members(
             &Allowance::default(),
         )
     }
+}
+
+/// Keep estimated codec admission separate from actual coordinator capacity.
+/// Assembly runs on the coordinator; workers receive only their fixed scopes.
+/// Retained history and spool capacity reduce the next wave's available space.
+fn streaming_wave_capacity(
+    maximum: usize,
+    _required: u64,
+    _plan: &CompressPlan,
+    _resources: &WriterResources,
+) -> usize {
+    #[cfg(test)]
+    if let Some(ledger) = &_resources.execution {
+        // Run growth/replacement, block assembly and history copies coexist.
+        // Descriptor capacity is still checked by its owners before dispatch.
+        let assembly = (run_size(_plan) as u64)
+            .saturating_mul(8)
+            .saturating_add((_plan.block_size as u64).saturating_mul(4));
+        let per_job = _required
+            .saturating_add(assembly)
+            .saturating_add(crate::codec::workspace::RESERVATION_BYTES);
+        return maximum
+            .min(usize::try_from(ledger.available() / per_job.max(1)).unwrap_or(usize::MAX))
+            .max(1);
+    }
+    maximum
 }
 
 /// Compresses independent whole members concurrently, with each workspace
@@ -782,8 +829,13 @@ where
     B::Charge: Send,
 {
     let mut packed = Records::new(sources.len(), resources)?;
-    for (group_index, group) in sources.chunks(batch_capacity).enumerate() {
-        let group_start = group_index * batch_capacity;
+    let mut group_start = 0;
+    while group_start < sources.len() {
+        let group_capacity = streaming_wave_capacity(batch_capacity, required, plan, resources);
+        let group_end = group_start
+            .saturating_add(group_capacity)
+            .min(sources.len());
+        let group = &sources[group_start..group_end];
         let mut streams = Records::collect(
             group.iter().enumerate().map(|(offset, source)| {
                 MemberStream::new(
@@ -805,13 +857,14 @@ where
         )?;
         let mut cursor = 0usize;
         while streams.iter().any(MemberStream::has_more) {
-            let reserved = required.saturating_mul(batch_capacity as u64);
+            let wave_capacity = streaming_wave_capacity(batch_capacity, required, plan, resources);
+            let reserved = required.saturating_mul(wave_capacity as u64);
             let _permit = resources
                 .acquire_cancellable(reserved, plan.dictionary_size, &|| advance.is_cancelled())?;
 
-            let mut jobs = Records::new(batch_capacity, resources)?;
+            let mut jobs = Records::new(wave_capacity, resources)?;
             let mut misses = 0usize;
-            while jobs.len() < batch_capacity && misses < streams.len() {
+            while jobs.len() < wave_capacity && misses < streams.len() {
                 let stream_count = streams.len();
                 let member = cursor;
                 let stream = &mut streams[member];
@@ -839,7 +892,15 @@ where
                 jobs.push(job)?;
             }
 
-            compress_wave(jobs, plan, &mut streams, resources, advance, error_context)?;
+            compress_wave(
+                jobs,
+                plan,
+                required,
+                &mut streams,
+                resources,
+                advance,
+                error_context,
+            )?;
         }
 
         for stream in streams {
@@ -848,6 +909,7 @@ where
             slot.2 = stream.hash.finalize();
             packed.push(stream.packed)?;
         }
+        group_start = group_end;
     }
     Ok(packed)
 }
@@ -886,14 +948,15 @@ where
     let mut history = Buffer::new(allowance);
     let mut next = 0usize;
     loop {
-        let reserved = required.saturating_mul(batch_capacity as u64);
+        let wave_capacity = streaming_wave_capacity(batch_capacity, required, plan, resources);
+        let reserved = required.saturating_mul(wave_capacity as u64);
         let _permit = resources
             .acquire_cancellable(reserved, plan.dictionary_size, &|| advance.is_cancelled())?;
 
         // Run boundaries depend on input and dictionary size, never on the
         // worker count. Adjacent blocks amortize history copies and seeding.
-        let mut jobs = Records::new(batch_capacity, resources)?;
-        while jobs.len() < batch_capacity {
+        let mut jobs = Records::new(wave_capacity, resources)?;
+        while jobs.len() < wave_capacity {
             while next < streams.len() && !streams[next].has_more() {
                 next += 1;
             }
@@ -929,7 +992,15 @@ where
         if jobs.is_empty() {
             break;
         }
-        compress_wave(jobs, plan, &mut streams, resources, advance, error_context)?;
+        compress_wave(
+            jobs,
+            plan,
+            required,
+            &mut streams,
+            resources,
+            advance,
+            error_context,
+        )?;
     }
 
     Records::collect(
@@ -1026,6 +1097,7 @@ fn check_source_end(reader: &mut dyn Read) -> Result<()> {
 fn compress_wave<B: Budget + Send + Sync>(
     jobs: Records<BlockJob<B>>,
     plan: &CompressPlan,
+    _required: u64,
     streams: &mut [MemberStream<B>],
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
@@ -1034,9 +1106,36 @@ fn compress_wave<B: Budget + Send + Sync>(
 where
     B::Charge: Send,
 {
-    // All coordinator-owned boundary and result arrays are reserved before
-    // dispatch, rather than letting workers compete for preparation capacity.
-    let jobs = Records::collect(
+    #[cfg(test)]
+    if resources.execution.is_some() {
+        let jobs = prepare_block_jobs::<B, crate::codec::workspace::Limited>(jobs, resources)?;
+        let packed_runs = run_jobs_admitted(
+            jobs,
+            resources,
+            advance,
+            |_| _required,
+            |job, _, progress, allowance| encode_block_job(job, plan, progress, allowance),
+        )?;
+        return append_packed_runs(packed_runs, plan, streams, advance, error_context);
+    }
+    let jobs = prepare_block_jobs::<B, B>(jobs, resources)?;
+    let packed_runs = run_jobs(jobs, resources, advance, |job, progress| {
+        let allowance = job.0.data.allowance();
+        encode_block_job(job, plan, progress, &allowance)
+    })?;
+    append_packed_runs(packed_runs, plan, streams, advance, error_context)
+}
+
+type PackedBlocks<B> = Records<(usize, Buffer<u8, B>, bool)>;
+type PreparedBlockJob<B, C> = (BlockJob<B>, Records<(usize, bool)>, PackedBlocks<C>);
+
+fn prepare_block_jobs<B: Budget, C: Budget>(
+    jobs: Records<BlockJob<B>>,
+    resources: &WriterResources,
+) -> Result<Records<PreparedBlockJob<B, C>>> {
+    // Allocate boundary and result descriptors before dispatch. Worker outputs
+    // carry their scoped codec charge; descriptor arrays keep the root charge.
+    Records::collect(
         jobs.into_iter().map(|job| {
             let boundaries = Records::collect(
                 job.blocks.iter().map(|&(_, end, last)| Ok((end, last))),
@@ -1046,32 +1145,38 @@ where
             Ok((job, boundaries, output))
         }),
         resources,
+    )
+}
+
+fn encode_block_job<B: Budget, C: Budget>(
+    (job, boundaries, mut output): PreparedBlockJob<B, C>,
+    plan: &CompressPlan,
+    progress: &dyn CompressionProgress,
+    allowance: &C,
+) -> Result<PackedBlocks<C>> {
+    let mut block_done = |bytes: usize| progress.advance(bytes as u64);
+    let packed = streaming_blocks_with_allowance(
+        &job.data,
+        &job.history,
+        &boundaries,
+        plan.algorithm_version,
+        plan.encode_options,
+        Some(&mut block_done),
+        allowance,
     )?;
-    let packed_runs = run_jobs(
-        jobs,
-        resources,
-        advance,
-        |(job, boundaries, mut output), progress| {
-            // Report each block from the worker that finished it. A run holds a
-            // dictionary's worth of blocks and a wave holds one run per thread, so
-            // reporting once the wave is appended is a single jump across the whole
-            // member whenever the member fits one wave.
-            let mut block_done = |bytes: usize| progress.advance(bytes as u64);
-            let packed = streaming_blocks_with_allowance(
-                &job.data,
-                &job.history,
-                &boundaries,
-                plan.algorithm_version,
-                plan.encode_options,
-                Some(&mut block_done),
-                &job.data.allowance(),
-            )?;
-            for ((member, _, last), packed) in job.blocks.into_iter().zip(packed) {
-                output.push((member, packed, last))?;
-            }
-            Ok(output)
-        },
-    )?;
+    for ((member, _, last), packed) in job.blocks.into_iter().zip(packed) {
+        output.push((member, packed, last))?;
+    }
+    Ok(output)
+}
+
+fn append_packed_runs<B: Budget, C: Budget>(
+    packed_runs: Records<PackedBlocks<C>>,
+    plan: &CompressPlan,
+    streams: &mut [MemberStream<B>],
+    advance: &dyn CompressionProgress,
+    error_context: &(dyn Fn(usize, Error) -> Error + Sync),
+) -> Result<()> {
     // A solid wave can cover thousands of tiny members. Keep only the spool
     // currently being appended open, rather than one descriptor per member.
     let mut previous: Option<usize> = None;
@@ -1389,6 +1494,234 @@ mod tests {
                 actual.copy_to(&mut actual_bytes).unwrap();
                 assert_eq!(actual_bytes, expected_bytes);
             }
+        }
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[test]
+    fn streaming_ledger_covers_repeated_waves_and_retained_history() {
+        use std::sync::atomic::AtomicU64;
+        let scratch = crate::scratch::case("stream-ledger-waves");
+        let size = crate::codec::rar50::MAX_LZ_BLOCK_SIZE * 2 + 4096;
+        let data: Vec<u8> = (0..size).map(|i| ((i * 71) % 251) as u8).collect();
+        let sources = [
+            EntrySource::from_bytes(data.clone()),
+            EntrySource::from_bytes(data),
+        ];
+        let options = EncodeOptions::new(8).with_max_match_distance(65536);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        for (solid, filter_policy) in [
+            (false, FilterPolicy::None),
+            (true, FilterPolicy::None),
+            (false, FilterPolicy::Auto),
+        ] {
+            let plan = CompressPlan {
+                algorithm_version: 0,
+                encode_options: options,
+                dictionary_size: 65536,
+                block_size: 65536,
+                solid,
+                method: 1,
+                filter_policy,
+                candidates: vec![options],
+            };
+            let required = super::super::streaming_lz_workspace(
+                plan.dictionary_size,
+                crate::codec::rar50::MAX_LZ_BLOCK_SIZE,
+                false,
+            );
+            // Automatic mode is forced through its existing streaming fallback.
+            let max_workers = if plan.filter_policy == FilterPolicy::Auto {
+                1
+            } else {
+                2
+            };
+            let resources = WriterResources::new(required * max_workers).with_temp_dir(&*scratch);
+            let collect = |members: Records<CompressedMember>| -> Vec<_> {
+                members
+                    .into_iter()
+                    .map(|mut member| {
+                        let mut bytes = Vec::new();
+                        member.packed.copy_to(&mut bytes).unwrap();
+                        (
+                            bytes,
+                            member.crc32,
+                            member.hash,
+                            member.store,
+                            member.solid_continuation,
+                        )
+                    })
+                    .collect()
+            };
+            let expected = collect(
+                pool.install(|| {
+                    compress_members_with_context(&sources, &plan, &resources, &|_| true, &|_, e| e)
+                })
+                .unwrap(),
+            );
+            for workers in 1..=max_workers {
+                let limit = required * workers + 32 * 1024 * 1024;
+                let ledger = Allowance::limited(limit);
+                let bounded = resources.clone().with_execution_allowance(ledger.clone());
+                let peak = AtomicU64::new(0);
+                let progress = |_| {
+                    let used = ledger.used();
+                    assert!(used <= limit);
+                    peak.fetch_max(used, Ordering::Relaxed);
+                    true
+                };
+                let actual = pool
+                    .install(|| {
+                        compress_members_with_context(
+                            &sources,
+                            &plan,
+                            &bounded,
+                            &progress,
+                            &|_, e| e,
+                        )
+                    })
+                    .unwrap();
+                assert!(peak.load(Ordering::Relaxed) >= required * workers);
+                // Native spools retain no payload RAM. Only returned descriptors remain.
+                assert_eq!(
+                    ledger.used(),
+                    (sources.len() * std::mem::size_of::<CompressedMember>()) as u64
+                );
+                assert_eq!(collect(actual), expected);
+                assert_eq!(ledger.used(), 0);
+                assert_eq!(bounded.workspace_in_use(), 0);
+                assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_ledger_releases_assembly_workers_and_spools_on_failure() {
+        use std::sync::{atomic::AtomicUsize, Arc};
+        let scratch = crate::scratch::case("stream-ledger-failure");
+        let options = EncodeOptions::new(8).with_max_match_distance(65536);
+        for solid in [false, true] {
+            let plan = CompressPlan {
+                algorithm_version: 0,
+                encode_options: options,
+                dictionary_size: 65536,
+                block_size: 4096,
+                solid,
+                method: 1,
+                filter_policy: FilterPolicy::None,
+                candidates: vec![options],
+            };
+            let ledger = Allowance::limited(256 * 1024 * 1024);
+            let resources = WriterResources::default()
+                .with_temp_dir(&*scratch)
+                .with_execution_allowance(ledger.clone());
+            let opens = Arc::new(AtomicUsize::new(0));
+            let failed_source = EntrySource::from_opener(4096, {
+                let opens = opens.clone();
+                let ledger = ledger.clone();
+                move || {
+                    assert!(ledger.used() >= 4096);
+                    opens.fetch_add(1, Ordering::Relaxed);
+                    Err(std::io::Error::other("injected source failure").into())
+                }
+            });
+            let result = compress_members_with_context(
+                &[failed_source],
+                &plan,
+                &resources,
+                &|_| true,
+                &|_, e| e,
+            );
+            assert!(result.is_err());
+            assert_eq!(opens.load(Ordering::Relaxed), 1);
+            assert_eq!(ledger.used(), 0);
+            let sources = [EntrySource::from_bytes(vec![7; 8192])];
+            let too_small = Allowance::limited(16 * 1024 * 1024);
+            let constrained = resources
+                .clone()
+                .with_execution_allowance(too_small.clone());
+            assert_eq!(
+                compress_members_with_context(&sources, &plan, &constrained, &|_| true, &|_, e| e,)
+                    .err()
+                    .unwrap()
+                    .kind(),
+                crate::ErrorKind::ResourceLimit
+            );
+            assert_eq!(too_small.used(), 0);
+            let result =
+                compress_members_with_context(&sources, &plan, &resources, &|_| false, &|_, e| e);
+            assert!(matches!(result, Err(Error::Cancelled)));
+            assert_eq!(ledger.used(), 0);
+            let constrained = resources.clone().with_max_spool_bytes(1);
+            assert!(compress_members_with_context(
+                &sources,
+                &plan,
+                &constrained,
+                &|_| true,
+                &|_, e| e
+            )
+            .is_err());
+            assert_eq!(ledger.used(), 0);
+            drop(
+                compress_members_with_context(&sources, &plan, &resources, &|_| true, &|_, e| e)
+                    .unwrap(),
+            );
+            assert_eq!(ledger.used(), 0);
+            assert_eq!(resources.workspace_in_use(), 0);
+            assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn stored_ledger_admits_read_buffer_before_opening_and_releases_it() {
+        use std::sync::{atomic::AtomicUsize, Arc};
+        let scratch = crate::scratch::case("stored-ledger");
+        let options = EncodeOptions::new(8);
+        let plan = CompressPlan {
+            algorithm_version: 0,
+            encode_options: options,
+            dictionary_size: 65536,
+            block_size: 65536,
+            solid: false,
+            method: 0,
+            filter_policy: FilterPolicy::None,
+            candidates: vec![options],
+        };
+        let opens = Arc::new(AtomicUsize::new(0));
+        for limit in [32768, 131072] {
+            let ledger = Allowance::limited(limit);
+            let resources = WriterResources::default()
+                .with_temp_dir(&*scratch)
+                .with_execution_allowance(ledger.clone());
+            let source = EntrySource::from_opener(8, {
+                let opens = opens.clone();
+                let ledger = ledger.clone();
+                move || {
+                    assert!(ledger.used() >= 65536);
+                    opens.fetch_add(1, Ordering::Relaxed);
+                    Ok(Box::new(std::io::Cursor::new([7u8; 8])))
+                }
+            });
+            let result =
+                compress_members_with_context(&[source], &plan, &resources, &|_| true, &|_, e| e);
+            if limit < 65536 {
+                assert_eq!(
+                    result.err().unwrap().kind(),
+                    crate::ErrorKind::ResourceLimit
+                );
+                assert_eq!(opens.load(Ordering::Relaxed), 0);
+            } else {
+                let result = result.unwrap();
+                assert!(result[0].store);
+                assert_eq!(result[0].crc32, crate::crc32::crc32(&[7u8; 8]));
+                drop(result);
+                assert_eq!(opens.load(Ordering::Relaxed), 1);
+            }
+            assert_eq!(ledger.used(), 0);
+            assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
         }
     }
 

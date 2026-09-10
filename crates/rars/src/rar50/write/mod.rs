@@ -599,14 +599,41 @@ fn source_integrity(
     expected_size: u64,
     block_size: usize,
     progress: &dyn compress::CompressionProgress,
+    _resources: &WriterResources,
+) -> Result<(u32, [u8; 32])> {
+    #[cfg(test)]
+    if let Some(allowance) = &_resources.execution {
+        return source_integrity_with_allowance(
+            source,
+            expected_size,
+            block_size,
+            progress,
+            allowance,
+        );
+    }
+    source_integrity_with_allowance(
+        source,
+        expected_size,
+        block_size,
+        progress,
+        &crate::codec::workspace::Allowance::default(),
+    )
+}
+
+fn source_integrity_with_allowance<B: crate::codec::workspace::Budget>(
+    source: &EntrySource,
+    expected_size: u64,
+    block_size: usize,
+    progress: &dyn compress::CompressionProgress,
+    allowance: &B,
 ) -> Result<(u32, [u8; 32])> {
     if progress.is_cancelled() {
         return Err(Error::Cancelled);
     }
     let mut crc = Crc32::new();
     let mut hash = blake2sp::Hasher::new();
+    let mut buffer = crate::codec::workspace::Buffer::filled(block_size, 0u8, allowance)?;
     let mut reader = source.open()?;
-    let mut buffer = vec![0u8; block_size];
     let mut observed = 0u64;
     let mut limited = reader.by_ref().take(expected_size);
     loop {

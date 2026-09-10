@@ -222,6 +222,31 @@ mod tests {
     }
 
     #[test]
+    fn copying_retired_worker_output_counts_source_and_spool_together() {
+        use crate::codec::workspace::{Allowance, Buffer, RESERVATION_BYTES};
+        let payload = 32;
+        let ledger = Allowance::limited(capacity(1) + payload + RESERVATION_BYTES);
+        let resources = WriterResources::default().with_execution_allowance(ledger.clone());
+        let mut reservation = ledger.reserve(payload).unwrap();
+        reservation.start();
+        let bytes = Buffer::filled(payload as usize, 7u8, &reservation.allowance()).unwrap();
+        reservation.retire();
+        let mut spool = MemorySpool::new(&resources);
+        spool.write_all(&bytes).unwrap();
+        assert_eq!(ledger.used(), capacity(1) + payload + RESERVATION_BYTES);
+        // A second destination must not borrow the still-live source charge.
+        assert!(MemorySpool::new(&resources).write_all(&bytes).is_err());
+        drop(bytes);
+        assert_eq!(ledger.used(), capacity(1));
+        spool.seek(SeekFrom::Start(0)).unwrap();
+        let mut actual = [0; 32];
+        spool.read_exact(&mut actual).unwrap();
+        assert_eq!(actual, [7; 32]);
+        drop(spool);
+        assert_eq!(ledger.used(), 0);
+    }
+
+    #[test]
     fn class_quota_refusal_rolls_back_execution_spool_growth() {
         use crate::codec::workspace::Allowance;
         let ledger = Allowance::limited(20000);
