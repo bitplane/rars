@@ -162,6 +162,7 @@ impl<T, B: Budget> Buffer<T, B> {
         self.values.resize(len, value);
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) fn clear(&mut self) {
         self.values.clear();
     }

@@ -1506,12 +1506,6 @@ struct BlockMatches<B: Budget = Allowance> {
     starts: Buffer<u32, B>,
 }
 
-impl<B: Budget> BlockMatches<B> {
-    fn at(&self, index: usize) -> &[(u32, u32)] {
-        &self.runs[self.starts[index] as usize..self.starts[index + 1] as usize]
-    }
-}
-
 /// One match finder for a member's whole optimal parse, and the walk that asks
 /// it about each block once.
 ///
@@ -2273,7 +2267,9 @@ fn token_stream_bits<B: Budget>(
     };
     let allowance = lengths.main.allowance();
     let (_, mut bits) = encode_table_slices(lengths.slices(), version, &allowance)?;
-    let prices = TokenPrices { lengths };
+    let prices = TokenPrices {
+        lengths: lengths.slices(),
+    };
     let mut state = EncoderMatchState::default();
     for token in filters
         .iter()
@@ -2334,11 +2330,11 @@ const UNUSED_SYMBOL_COST: usize = 15;
 /// Prices a token against the code lengths a previous pass produced, which is
 /// what the block will really spend, rather than against the flat guess in
 /// [`estimated_match_cost`].
-struct TokenPrices<'a, B: Budget = Allowance> {
-    lengths: &'a EncoderLengths<B>,
+struct TokenPrices<'a> {
+    lengths: LengthSlices<'a>,
 }
 
-impl<B: Budget> TokenPrices<'_, B> {
+impl TokenPrices<'_> {
     fn code(bits: u8) -> usize {
         if bits == 0 {
             UNUSED_SYMBOL_COST
@@ -2392,61 +2388,39 @@ impl<B: Budget> TokenPrices<'_, B> {
     }
 }
 
-/// Prices every path through the block and keeps the cheapest, instead of
-/// taking the longest match at each position and checking one or two bytes
-/// ahead. Prices come from [`estimated_match_cost`], so this is only as good
-/// as that estimate, but it sees the whole block where lazy matching sees two
-/// bytes.
-///
-/// The repeated-distance discount depends on the path taken, which a forward
-/// pass does not know. Each node carries the whole four-slot distance memory
-/// the cheapest path to it leaves behind, so the next hop is priced against
-/// what that path would really have remembered. Two paths reaching one node
-/// with different memories still collapse into whichever was cheaper, so this
-/// stays an approximation, just a far closer one than carrying the arriving
-/// match alone. It is also not quite every path: once a match reaches
-/// [`NICE_MATCH_LENGTH`] the parse takes it and steps over the bytes it covers
-/// rather than pricing each of them.
-///
-/// Does no searching of its own: `matches` holds what an [`OptimalCollector`]
-/// found at each position of this block, and prices never change what a
-/// search would find, so every pass prices the same collection.
-fn optimal_tokens_in_workspace<B: Budget>(
+struct OptimalSlices<'a> {
+    price: &'a mut [u32],
+    arrive_length: &'a mut [u32],
+    arrive_distance: &'a mut [u32],
+    arrive_reps: &'a mut [[u32; 4]],
+    arrive_last_length: &'a mut [u32],
+}
+
+// No growth or ownership changes occur here. Keep one pricing implementation
+// for bounded and unlimited execution instead of specializing this hot loop on
+// their differently sized allocation owners and fallible push operations.
+#[allow(clippy::too_many_arguments)]
+fn price_optimal_paths(
     combined: &[u8],
     block: std::ops::Range<usize>,
     options: EncodeOptions,
     distance_size: usize,
-    prices: Option<&TokenPrices<'_, B>>,
-    matches: &BlockMatches<B>,
-    workspace: &mut OptimalWorkspace<B>,
-) -> Result<Buffer<EncodeToken, B>> {
+    prices: Option<&TokenPrices<'_>>,
+    runs: &[(u32, u32)],
+    starts: &[u32],
+    workspace: OptimalSlices<'_>,
+    reaches: &mut [(usize, usize, usize)],
+) {
     let start = block.start;
     let end = block.end;
     let span = end - start;
-
-    let allowance = workspace.price.allowance().clone();
-    let OptimalWorkspace {
+    let OptimalSlices {
         price,
         arrive_length,
         arrive_distance,
         arrive_reps,
         arrive_last_length,
     } = workspace;
-    price.resize(span + 1, u32::MAX)?;
-    price.fill(u32::MAX);
-    arrive_length.resize(span + 1, 0)?;
-    arrive_length.fill(0);
-    arrive_distance.resize(span + 1, 0)?;
-    arrive_distance.fill(0);
-    arrive_reps.resize(span + 1, [0; 4])?;
-    arrive_reps.fill([0; 4]);
-    arrive_last_length.resize(span + 1, 0)?;
-    arrive_last_length.fill(0);
-    price[0] = 0;
-
-    // Runs of `(shortest, longest, distance)` from the position being priced,
-    // in the order the collector found them. Reused to keep one allocation.
-    let mut reaches = Buffer::new(&allowance);
     // The first position past a match the parse committed to. Nothing is
     // priced from the positions before it. See [`NICE_MATCH_LENGTH`].
     let mut committed_through = 0usize;
@@ -2485,7 +2459,7 @@ fn optimal_tokens_in_workspace<B: Budget>(
             last_length: arrive_last_length[index] as usize,
         };
 
-        reaches.clear();
+        let mut reaches_len = 0;
         let mut longest = 0usize;
 
         // A match at a remembered distance is priced out of the main table
@@ -2499,7 +2473,8 @@ fn optimal_tokens_in_workspace<B: Budget>(
             }
             let length = match_length(combined, pos, repeat, max_length);
             if length >= 4 {
-                reaches.push((4, length, repeat)).map_err(Into::into)?;
+                reaches[reaches_len] = (4, length, repeat);
+                reaches_len += 1;
             }
         }
 
@@ -2508,15 +2483,16 @@ fn optimal_tokens_in_workspace<B: Budget>(
         // the longest so far owns one run of lengths. The tree measures
         // against the whole member where the chains stopped at the block, so
         // a length is capped here to what this block can still hold.
-        for &(length, distance) in matches.at(index) {
+        for &(length, distance) in &runs[starts[index] as usize..starts[index + 1] as usize] {
             let length = (length as usize).min(max_length);
             if length > longest {
-                reaches
-                    .push((longest + 1, length, distance as usize))
-                    .map_err(Into::into)?;
+                reaches[reaches_len] = (longest + 1, length, distance as usize);
+                reaches_len += 1;
                 longest = length;
             }
         }
+
+        let reaches = &reaches[..reaches_len];
 
         // Equal token prices do not make shorter matches redundant: their
         // endpoints can expose a better continuation. Price every endpoint
@@ -2570,6 +2546,89 @@ fn optimal_tokens_in_workspace<B: Budget>(
             }
         }
     }
+}
+
+/// Prices every path through the block and keeps the cheapest, instead of
+/// taking the longest match at each position and checking one or two bytes
+/// ahead. Prices come from [`estimated_match_cost`], so this is only as good
+/// as that estimate, but it sees the whole block where lazy matching sees two
+/// bytes.
+///
+/// The repeated-distance discount depends on the path taken, which a forward
+/// pass does not know. Each node carries the whole four-slot distance memory
+/// the cheapest path to it leaves behind, so the next hop is priced against
+/// what that path would really have remembered. Two paths reaching one node
+/// with different memories still collapse into whichever was cheaper, so this
+/// stays an approximation, just a far closer one than carrying the arriving
+/// match alone. It is also not quite every path: once a match reaches
+/// [`NICE_MATCH_LENGTH`] the parse takes it and steps over the bytes it covers
+/// rather than pricing each of them.
+///
+/// Does no searching of its own: `matches` holds what an [`OptimalCollector`]
+/// found at each position of this block, and prices never change what a
+/// search would find, so every pass prices the same collection.
+fn optimal_tokens_in_workspace<B: Budget>(
+    combined: &[u8],
+    block: std::ops::Range<usize>,
+    options: EncodeOptions,
+    distance_size: usize,
+    prices: Option<&TokenPrices<'_>>,
+    matches: &BlockMatches<B>,
+    workspace: &mut OptimalWorkspace<B>,
+) -> Result<Buffer<EncodeToken, B>> {
+    let start = block.start;
+    let end = block.end;
+    let span = end - start;
+
+    let allowance = workspace.price.allowance().clone();
+    let OptimalWorkspace {
+        price,
+        arrive_length,
+        arrive_distance,
+        arrive_reps,
+        arrive_last_length,
+    } = workspace;
+    price.resize(span + 1, u32::MAX)?;
+    price.fill(u32::MAX);
+    arrive_length.resize(span + 1, 0)?;
+    arrive_length.fill(0);
+    arrive_distance.resize(span + 1, 0)?;
+    arrive_distance.fill(0);
+    arrive_reps.resize(span + 1, [0; 4])?;
+    arrive_reps.fill([0; 4]);
+    arrive_last_length.resize(span + 1, 0)?;
+    arrive_last_length.fill(0);
+    price[0] = 0;
+
+    // Admit the largest candidate list once. Pricing only borrows already
+    // charged arrays, so its inner loop is identical for both budget policies.
+    // Each position contributes at most four remembered-distance candidates.
+    let reach_capacity = matches
+        .starts
+        .windows(2)
+        .map(|pair| (pair[1] - pair[0]) as usize)
+        .max()
+        .unwrap_or(0)
+        .checked_add(4)
+        .ok_or(Error::InvalidData("optimal candidate capacity overflows"))?;
+    let mut reaches = Buffer::filled(reach_capacity, (0usize, 0usize, 0usize), &allowance)?;
+    price_optimal_paths(
+        combined,
+        block.clone(),
+        options,
+        distance_size,
+        prices,
+        &matches.runs,
+        &matches.starts,
+        OptimalSlices {
+            price,
+            arrive_length,
+            arrive_distance,
+            arrive_reps,
+            arrive_last_length,
+        },
+        &mut reaches,
+    );
 
     let mut reversed = Buffer::new(&allowance);
     let mut index = span;
@@ -2665,7 +2724,9 @@ fn encode_tokens_with_allowance<B: Budget>(
         let mut best_bits = token_stream_bits(&tokens, initial_filters, &lengths, distance_size)?;
         let mut best = None;
         for _ in 1..OPTIMAL_PARSE_PASSES {
-            let prices = TokenPrices { lengths: &lengths };
+            let prices = TokenPrices {
+                lengths: lengths.slices(),
+            };
             let next = optimal_tokens_in_workspace(
                 combined,
                 block.clone(),
@@ -5125,7 +5186,9 @@ mod tests {
                     0..data.len(),
                     options,
                     distances,
-                    Some(&TokenPrices { lengths: &lengths }),
+                    Some(&TokenPrices {
+                        lengths: lengths.slices(),
+                    }),
                     &matches,
                 )
                 .unwrap();
@@ -6430,12 +6493,16 @@ mod tests {
         let distance_size = DISTANCE_TABLE_SIZE_50;
         let guessed = collected_optimal_tokens(&data, options, distance_size, None);
         let lengths = table_lengths_for_tokens(&guessed, distance_size).unwrap();
-        let prices = TokenPrices { lengths: &lengths };
+        let prices = TokenPrices {
+            lengths: lengths.slices(),
+        };
         let repriced = collected_optimal_tokens(&data, options, distance_size, Some(&prices));
 
         let bits = |tokens: &[EncodeToken]| -> usize {
             let lengths = table_lengths_for_tokens(tokens, distance_size).unwrap();
-            let prices = TokenPrices { lengths: &lengths };
+            let prices = TokenPrices {
+                lengths: lengths.slices(),
+            };
             let mut state = EncoderMatchState::default();
             let mut total = 0;
             for token in tokens {

@@ -372,31 +372,43 @@ archive/volume handoffs; refused adapter copies; legacy refusal; and preservatio
 of an existing destination on quota failure. CLI, Python and real Node/WASM
 worker tests exercise the public controls and error translation.
 
-The following native release measurements compare the pre-public-policy commit
-`af36a96`, the new unlimited path, and a 512 MiB aggregate policy. Each cell is
-elapsed seconds / peak process RSS in MiB, measured with four workers. Inputs
-are 4096 stored members of 256 bytes or 16 numeric members of 128 KiB; the pricing
-case uses one numeric member. Level 3 exercises automatic filter search; solid,
-header encryption and 10% recovery are separate variants. These are single-run
-observations on one development machine, not stable performance guarantees.
+The initial public policy made allocation-heavy compression about 40–51% slower
+in the first native matrix. Phase timing located almost all of the extra time
+in optimal parsing: a representative sample spent 1.76 seconds there with the
+unlimited policy and 2.52 seconds with bounded owners, while table construction
+and serialization differed by milliseconds.
 
-| Case | Previous unlimited | Current unlimited | Aggregate enabled |
+The pricing loop now uses one implementation over borrowed slices for both
+policies. Its candidate scratch is admitted up front from the largest collected
+candidate list plus the four remembered distances. No allocation or fallible
+buffer growth occurs inside the loop; the original owners retain all charges.
+Candidate ordering, match pricing and token selection are unchanged.
+
+The following native release matrix compares bounded execution before the
+pricing change (`3694d83`), bounded execution after it, and the current unlimited
+path. The hard ceiling is 512 MiB; four workers encode 4096 stored members of
+256 bytes or 16 numeric members of 128 KiB at level 3. Candidate pricing uses
+one numeric member. Automatic filter search, solid mode, header encryption and
+10% recovery are exercised. Cells report elapsed seconds / peak process RSS in
+MiB. These are single-run observations on one machine, not performance guarantees.
+
+| Case | Previous bounded | Current bounded | Current unlimited |
 | --- | --- | --- | --- |
-| Stored | 0.226 / 11.1 | 0.254 / 11.6 | 0.242 / 12.1 |
-| Compressed/filter search | 13.250 / 41.4 | 12.298 / 41.9 | 17.174 / 50.5 |
-| Solid | 0.087 / 23.1 | 0.084 / 23.4 | 0.092 / 23.4 |
-| Encrypted | 12.951 / 43.2 | 15.399 / 43.6 | 21.752 / 50.2 |
-| Recovery | 14.638 / 40.2 | 15.232 / 41.2 | 23.057 / 49.4 |
-| Candidate pricing | 2.603 / 13.1 | 2.441 / 13.0 | 3.615 / 14.8 |
+| Stored | 0.205 / 11.9 | 0.217 / 11.7 | 0.216 / 11.7 |
+| Compressed/filter search | 17.223 / 49.5 | 13.236 / 47.7 | 12.459 / 43.3 |
+| Solid | 0.117 / 23.3 | 0.117 / 23.1 | 0.109 / 23.3 |
+| Encrypted | 18.413 / 48.1 | 12.865 / 49.7 | 12.215 / 40.7 |
+| Recovery | 18.271 / 49.4 | 10.550 / 49.2 | 10.933 / 42.8 |
+| Candidate pricing | 2.527 / 14.8 | 1.774 / 14.9 | 1.723 / 13.1 |
 
-All unencrypted archives matched byte-for-byte across the three paths. Encrypted
+All unencrypted outputs matched byte-for-byte across the three paths. Encrypted
 sizes matched; randomized salts prevent byte equality. Reference UnRAR verified
-all 18 archives. Compression ratios therefore remained unchanged in this matrix.
-Enforcing capacity has a cost: these allocation-heavy bounded cases took about
-40–51% longer than the current unlimited path and retained larger accounting
-owners. A generous ceiling is an admission constraint, not an instruction to
-minimize RSS. The unlimited path remains the default. Timing variation in the
-unlimited runs warrants repeated measurements before making a speed claim.
+all 18 archives. Compression ratios remained unchanged. The optimized bounded
+compressed/filter, encrypted, recovery and candidate-pricing runs retain only
+single-digit percentage CPU overhead in this matrix. Accounting owners and
+conservative growth still cost memory; this change primarily reduces CPU work.
+A generous ceiling is an admission constraint, not an instruction to minimize
+RSS. Unlimited execution remains the default.
 
 Reader workspace accounting, reader API extensions and verified rewrite staging
 remain separate work. Neither the aggregate writer policy nor independent
