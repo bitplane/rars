@@ -30,7 +30,7 @@ use crate::rar50::{
     MHFL_SOLID,
 };
 use crate::recovery::rar5::{
-    build_streamed_inline_recovery, choose_recovery_memory_mode, plan_inline_recovery,
+    choose_recovery_memory_mode, plan_inline_recovery, streamed_recovery_with_allowance,
     ReadWriteSeek,
 };
 use crate::streaming::preparation::{Bytes, Owned, Records};
@@ -810,6 +810,7 @@ fn write_payload(
                         iv,
                         ENCRYPT_CHUNK,
                         progress,
+                        resources,
                     )?;
                     reader.finish(&source, source.len)?;
                     source.source.release();
@@ -818,11 +819,22 @@ fn write_payload(
                 Payload::Packed(mut packed) => {
                     let len = packed.len();
                     packed.rewind()?;
-                    encrypt_reader_to(&mut packed, len, output, &keys, iv, ENCRYPT_CHUNK, progress)
+                    encrypt_reader_to(
+                        &mut packed,
+                        len,
+                        output,
+                        &keys,
+                        iv,
+                        ENCRYPT_CHUNK,
+                        progress,
+                        resources,
+                    )
                 }
                 Payload::Borrowed(mut data) => {
                     let len = data.len() as u64;
-                    encrypt_reader_to(&mut data, len, output, &keys, iv, chunk_size, progress)
+                    encrypt_reader_to(
+                        &mut data, len, output, &keys, iv, chunk_size, progress, resources,
+                    )
                 }
                 Payload::Encrypted { .. } => Err(Error::WriterFailure(
                     "RAR 5 payload cannot be encrypted here",
@@ -841,6 +853,38 @@ fn write_recovery_service(
     progress: Option<ProgressReporter<'_>>,
     output: &mut dyn Write,
 ) -> Result<u64> {
+    #[cfg(test)]
+    if let Some(allowance) = &resources.execution {
+        return recovery_service_with_allowance(
+            recovery_percent,
+            prefix,
+            header_keys,
+            resources,
+            progress,
+            output,
+            allowance,
+        );
+    }
+    recovery_service_with_allowance(
+        recovery_percent,
+        prefix,
+        header_keys,
+        resources,
+        progress,
+        output,
+        &crate::codec::workspace::Allowance::default(),
+    )
+}
+
+fn recovery_service_with_allowance<B: crate::codec::workspace::Budget>(
+    recovery_percent: u64,
+    prefix: &mut Spool,
+    header_keys: Option<&HeaderEncryptionKeys>,
+    resources: &WriterResources,
+    progress: Option<ProgressReporter<'_>>,
+    output: &mut dyn Write,
+    allowance: &B,
+) -> Result<u64> {
     let prefix_len = prefix.len();
     let plan = plan_inline_recovery(prefix_len, recovery_percent)?;
     let (mode, required) = choose_recovery_memory_mode(plan, resources.memory_limit())?;
@@ -856,13 +900,13 @@ fn write_recovery_service(
     };
     let mut payload = Spool::create(resources)?;
     prefix.rewind()?;
-    let built = build_streamed_inline_recovery(
+    let built = streamed_recovery_with_allowance(
         &mut CancellableIo {
             inner: prefix,
             progress,
         },
         prefix_len,
-        recovery_percent,
+        plan,
         mode,
         scratch
             .as_mut()
@@ -873,6 +917,7 @@ fn write_recovery_service(
         },
         progress,
         1,
+        allowance,
     )
     .map_err(|error| {
         if check_cancelled(progress).is_err() {
@@ -986,15 +1031,16 @@ impl FragmentSource {
         len: u64,
         output: &mut dyn Write,
         expected_fragment: Option<FragmentChecksums>,
+        resources: &WriterResources,
     ) -> Result<()> {
         let Self::Stored { prepared, emitted } = self else {
             return self.copy_range_unverified(start, len, output);
         };
+        let mut buffer = Bytes::zeroed(64 * 1024, resources)?;
         let mut reader = prepared.source.open()?;
         reader.seek(std::io::SeekFrom::Start(start))?;
         let mut fragment = ChecksumSink::default();
         let mut remaining = len;
-        let mut buffer = vec![0; 64 * 1024];
         while remaining != 0 {
             let want = remaining.min(buffer.len() as u64) as usize;
             reader.read_exact(&mut buffer[..want])?;
@@ -1289,6 +1335,7 @@ fn prepare_volume_member<'a>(
                     iv,
                     ENCRYPT_CHUNK,
                     progress,
+                    resources,
                 )?;
                 reader.finish(&source, source.len)?;
             } else {
@@ -1302,6 +1349,7 @@ fn prepare_volume_member<'a>(
                     iv,
                     ENCRYPT_CHUNK,
                     progress,
+                    resources,
                 )?;
             }
             let payload_len = encrypted.len();
@@ -1415,6 +1463,7 @@ impl VolumeWriter<'_> {
                     progress: self.progress,
                 },
                 fragment_checksums,
+                self.resources,
             )?;
 
             self.payload_in_volume += fragment_len;
@@ -1777,6 +1826,242 @@ mod preparation_name_tests {
                 decoded_rar50_name_len(bytes),
                 crate::filename::decode_rar50(bytes).len()
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod emission_ledger_tests {
+    use super::*;
+    use crate::codec::workspace::Allowance;
+
+    struct FailingSink;
+    impl Write for FailingSink {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("injected emission failure"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn encryption_emission_counts_retained_preparation_and_releases_chunk() {
+        let data = vec![7; 65537];
+        for limit in [65536, 131072] {
+            let ledger = Allowance::limited(limit);
+            let resources = WriterResources::default().with_execution_allowance(ledger.clone());
+            let retained = Bytes::zeroed(128, &resources).unwrap();
+            for fail_sink in [false, true] {
+                let keys = Rar50Keys::derive(b"secret", [1; 16], WRITE_KDF_COUNT_LOG).unwrap();
+                let mut expected = data.clone();
+                expected.resize(data.len().div_ceil(16) * 16, 0);
+                crate::crypto::rar50::Rar50Cipher::new(keys.key, [2; 16])
+                    .encrypt_in_place(&mut expected)
+                    .unwrap();
+                let payload = Payload::Encrypted {
+                    plain: Owned::new(Payload::Borrowed(&data), &resources).unwrap(),
+                    keys,
+                    iv: [2; 16],
+                };
+                let mut actual = Vec::new();
+                let result = if fail_sink {
+                    write_payload(payload, &mut FailingSink, &resources, None)
+                } else {
+                    write_payload(payload, &mut actual, &resources, None)
+                };
+                if limit == 65536 {
+                    assert_eq!(result.unwrap_err().kind(), crate::ErrorKind::ResourceLimit);
+                    assert!(actual.is_empty());
+                } else if fail_sink {
+                    assert!(result.is_err());
+                } else {
+                    result.unwrap();
+                    assert_eq!(actual, expected);
+                }
+                assert_eq!(ledger.used(), 128);
+                assert_eq!(resources.workspace_in_use(), 0);
+            }
+            drop(retained);
+            assert_eq!(ledger.used(), 0);
+        }
+    }
+
+    #[test]
+    fn recovery_emission_shares_ledger_in_resident_and_striped_modes() {
+        let scratch = crate::scratch::case("recovery-emission-ledger");
+        let data = vec![7; 131072];
+        for estimated_limit in [16384, 8 * 1024 * 1024] {
+            let base = WriterResources::new(estimated_limit).with_temp_dir(&*scratch);
+            let mut prefix = Spool::create(&base).unwrap();
+            prefix.write_all(&data).unwrap();
+            let mut expected = Vec::new();
+            write_recovery_service(10, &mut prefix, None, &base, None, &mut expected).unwrap();
+            for limit in [131072, 8 * 1024 * 1024] {
+                let ledger = Allowance::limited(limit);
+                let resources = base.clone().with_execution_allowance(ledger.clone());
+                let retained = Bytes::zeroed(128, &resources).unwrap();
+                let mut actual = Vec::new();
+                let result =
+                    write_recovery_service(10, &mut prefix, None, &resources, None, &mut actual);
+                if limit == 131072 {
+                    assert_eq!(result.unwrap_err().kind(), crate::ErrorKind::ResourceLimit);
+                    assert!(actual.is_empty());
+                } else {
+                    result.unwrap();
+                    assert_eq!(actual, expected);
+                    let cancel = CancelRecovery {
+                        cancelled: std::sync::atomic::AtomicBool::new(false),
+                    };
+                    let error = write_recovery_service(
+                        10,
+                        &mut prefix,
+                        None,
+                        &resources,
+                        Some(ProgressReporter(&cancel)),
+                        &mut Vec::new(),
+                    )
+                    .unwrap_err();
+                    assert_eq!(error.kind(), crate::ErrorKind::Cancelled);
+                    assert_eq!(ledger.used(), 128);
+
+                    assert!(write_recovery_service(
+                        10,
+                        &mut prefix,
+                        None,
+                        &resources,
+                        None,
+                        &mut FailingSink
+                    )
+                    .is_err());
+                }
+                assert_eq!(ledger.used(), 128);
+                assert_eq!(resources.workspace_in_use(), 0);
+                drop(retained);
+                assert_eq!(ledger.used(), 0);
+                // The caller's prefix survives; temporary parity and payload files do not.
+                assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 1);
+            }
+            drop(prefix);
+            assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
+        }
+    }
+
+    struct CancelRecovery {
+        cancelled: std::sync::atomic::AtomicBool,
+    }
+    impl crate::WriteProgress for CancelRecovery {
+        fn report(&self, event: crate::WriteProgressEvent<'_>) {
+            if matches!(
+                event,
+                crate::WriteProgressEvent::Advanced {
+                    operation: crate::WriteOperation::Recovery,
+                    ..
+                }
+            ) {
+                self.cancelled
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        fn is_cancelled(&self) -> bool {
+            self.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    fn plan(encrypted: bool) -> EnginePlan<'static> {
+        let options = crate::codec::rar50::EncodeOptions::new(8).with_max_match_distance(131072);
+        EnginePlan {
+            compress: CompressPlan {
+                algorithm_version: 0,
+                encode_options: options,
+                dictionary_size: 131072,
+                block_size: 4096,
+                solid: false,
+                method: 0,
+                filter_policy: super::super::FilterPolicy::None,
+                candidates: vec![options],
+            },
+            recovery_percent: Some(10),
+            header_encrypted: encrypted,
+            header_password: encrypted.then_some(b"secret".as_slice()),
+            archive_comment: Some(if encrypted {
+                ArchiveCommentPlan::Encrypted {
+                    data: b"comment",
+                    password: b"secret",
+                }
+            } else {
+                ArchiveCommentPlan::Plain(b"comment")
+            }),
+            archive_metadata: None,
+            metadata_record: None,
+            locked: false,
+            quick_open: false,
+            progress: None,
+        }
+    }
+
+    #[test]
+    fn archive_and_volume_emission_keep_the_ledger_reusable() {
+        let scratch = crate::scratch::case("archive-emission-ledger");
+        for encrypted in [false, true] {
+            let mut entry = ArchiveEntry::new(
+                b"payload".to_vec(),
+                crate::EntrySource::from_bytes(vec![7; 16384]),
+            );
+            if encrypted {
+                entry = entry.with_password(b"secret");
+            }
+            let entries = [entry];
+            let base = WriterResources::default().with_temp_dir(&*scratch);
+            let ledger = Allowance::limited(8 * 1024 * 1024);
+            let resources = base.clone().with_execution_allowance(ledger.clone());
+            let mut expected = Vec::new();
+            write_archive(&entries, plan(encrypted), &base, &mut expected).unwrap();
+            let mut actual = Vec::new();
+            write_archive(&entries, plan(encrypted), &resources, &mut actual).unwrap();
+            if !encrypted {
+                assert_eq!(actual, expected);
+            } else {
+                assert_eq!(actual.len(), expected.len());
+            }
+            assert_eq!(ledger.used(), 0);
+            assert!(
+                write_archive(&entries, plan(encrypted), &resources, &mut FailingSink).is_err()
+            );
+            assert_eq!(ledger.used(), 0);
+            let mut expected = super::super::CollectedVolumes::new();
+            write_volumes(&entries, plan(encrypted), 4096, &mut expected, &base).unwrap();
+            let small = Allowance::limited(32768);
+            let constrained = base.clone().with_execution_allowance(small.clone());
+            assert_eq!(
+                write_volumes(
+                    &entries,
+                    plan(encrypted),
+                    4096,
+                    &mut super::super::CollectedVolumes::new(),
+                    &constrained,
+                )
+                .unwrap_err()
+                .kind(),
+                crate::ErrorKind::ResourceLimit
+            );
+            assert_eq!(small.used(), 0);
+            let mut actual = super::super::CollectedVolumes::new();
+            write_volumes(&entries, plan(encrypted), 4096, &mut actual, &resources).unwrap();
+            let expected = expected.take();
+            let actual = actual.take();
+            assert_eq!(actual.len(), 4);
+            if !encrypted {
+                assert_eq!(actual, expected);
+            } else {
+                assert_eq!(
+                    actual.iter().map(Vec::len).collect::<Vec<_>>(),
+                    expected.iter().map(Vec::len).collect::<Vec<_>>()
+                );
+            }
+            assert_eq!(ledger.used(), 0);
+            assert_eq!(resources.workspace_in_use(), 0);
+            assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
         }
     }
 }

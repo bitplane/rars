@@ -159,6 +159,7 @@ not a separate user setting for each internal buffer type.
 | Borrowed payload and names | Plain service payloads and volume filenames borrow engine input. Source handles clone existing shared ownership rather than cloning payloads. Mapped link lengths are measured without allocating decoded names. |
 | Legacy writers | RAR1.3–4.0 header/comment construction remains intertwined with unaccounted legacy materialization. Supplying this hard policy is explicitly refused, including the high-level builder fallback, before emission. Calls without this policy retain existing legacy support. |
 | Compression coordinator descriptors | Integrity arrays, per-member execution plans, stream/history descriptors, block/job boundaries, worker slots and retained result arrays use the preparation ledger. Boundary growth reserves old plus replacement capacity. Worker slots, boundary images and coordinator result arrays are admitted before dispatch. The arrays retain their charges through joining and consumption. |
+| Stored volume verification | The fragment copy/verification buffer uses preparation capacity, admitted before opening its source and released after the fragment. |
 | Active workspace and payload buffers | Input/history and pushback bytes, codec/filter allocations (including codec-owned packed arrays), candidate settings, KDF/encryption/recovery workspace and source-reader internals remain outside the preparation quota. Coordinator descriptor admission does not bound the buffers those descriptors point to. |
 | Adapters, sinks and diagnostics | Caller/adapter-created `ArchiveEntry` inputs, high-level input conversion, external source/sink callbacks, output collectors, error/context allocations and allocator overhead are outside this engine quota. High-level policy integration and output ownership remain later passes. Recovery repair APIs without `WriterResources` are a separate workflow. |
 
@@ -223,10 +224,19 @@ appended in order. A memory-spool copy counts its destination capacity alongside
 the still-live packed source. Stored-member checksum reads admit their buffer
 before opening the source and release it at the end of the read.
 
-This wiring remains internal test coverage. Encryption/recovery emission,
-stored-payload emission and volume transitions still need coordinator routing
-before the aggregate policy can be enabled. Native spool path storage also
-remains outside this internal accounting.
+Encryption emission uses the root execution allowance alongside retained
+preparation and spool owners, including member/service payloads and ciphertext
+prepared for volume splitting. Recovery emission routes both resident and
+striped workspace through that same allowance; bounded passes own their field
+tables. Stored-volume verification buffers also carry root capacity charges.
+Emission remains sequential: these buffers draw directly from the coordinator's
+ledger, and refusal, cancellation and sink failure release the active owners.
+
+This wiring remains internal test coverage. Recovery mode selection still uses
+the legacy workspace estimate, so aggregate refusal can occur even when another
+stripe geometry could fit. Aggregate-aware phase planning, native spool path
+storage, the remaining copy-scratch audit and final output ownership must be
+completed before enabling the public aggregate policy.
 
 These reservations still use workspace estimates. Raw and filtered members,
 adjacent streaming blocks and persistent codec history have an internal
@@ -276,8 +286,7 @@ codec entry points currently use unlimited handles; bounded construction is
 internal test coverage, including its refusal diagnostics. The codec reader
 adapter also has bounded read-ahead and input-buffer tests; it is not the
 production writer's source-loading path. Coordinator routing remains incomplete
-outside the internally admitted whole-member, block-streaming and stored
-checksum-read paths.
+for aggregate-aware phase planning and the remaining spool/output owners.
 There is no public worker allowance or extension API yet.
 The workspace/admission pass remains open until those guarantees are enforceable.
 

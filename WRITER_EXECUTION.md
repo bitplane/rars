@@ -91,8 +91,9 @@ tests connect worker reservations, preparation and memory-spool capacity under
 one ledger; unused reservation space is released only after joining workers,
 and retained owners keep their charges. Internal streaming admission keeps
 assembly, pushback and history charged across waves while encoding workers use
-fixed scopes. Stored checksum reads also use the ledger. Emission and volume
-routing remain before an enforceable writer policy is available.
+fixed scopes. Stored checksum reads, encryption/recovery emission and stored
+volume verification also use the ledger. Aggregate-aware recovery planning and
+the remaining spool/output ownership audit precede an enforceable writer policy.
 `whole_member_workspace` adds four times the input size and a codec workspace
 estimate with reach and block size fitted to that input.
 

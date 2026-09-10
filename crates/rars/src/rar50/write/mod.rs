@@ -723,6 +723,7 @@ fn streaming_lz_workspace(dictionary_size: u64, block_size: usize, optimal_parse
         .saturating_add(3 * 1024 * 1024)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encrypt_reader_to(
     reader: &mut dyn Read,
     input_size: u64,
@@ -731,7 +732,14 @@ fn encrypt_reader_to(
     iv: [u8; 16],
     block_size: usize,
     progress: Option<ProgressReporter<'_>>,
+    _resources: &WriterResources,
 ) -> Result<()> {
+    #[cfg(test)]
+    if let Some(allowance) = &_resources.execution {
+        return encrypt_reader_with_allowance(
+            reader, input_size, output, keys, iv, block_size, progress, allowance,
+        );
+    }
     encrypt_reader_with_allowance(
         reader,
         input_size,
