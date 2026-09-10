@@ -249,10 +249,14 @@ pub fn write_streaming_archive_to(
     progress: Option<&dyn WriteProgress>,
     output: &mut dyn Write,
 ) -> Result<()> {
-    if resources.max_preparation_bytes().is_some() {
+    if resources.max_preparation_bytes().is_some() || resources.max_memory_bytes().is_some() {
         return Err(Error::UnsupportedFamilyFeature {
             family: options.target.family(),
-            feature: "preparation memory quota",
+            feature: if resources.max_memory_bytes().is_some() {
+                "aggregate managed-memory limit"
+            } else {
+                "preparation memory quota"
+            },
         });
     }
 
@@ -307,10 +311,14 @@ fn write_archive_to(
     explicit_header_password: Option<&[u8]>,
     archive_comment_password: Option<&[u8]>,
 ) -> Result<()> {
-    if resources.max_preparation_bytes().is_some() {
+    if resources.max_preparation_bytes().is_some() || resources.max_memory_bytes().is_some() {
         return Err(Error::UnsupportedFamilyFeature {
             family: options.target.family(),
-            feature: "preparation memory quota",
+            feature: if resources.max_memory_bytes().is_some() {
+                "aggregate managed-memory limit"
+            } else {
+                "preparation memory quota"
+            },
         });
     }
 

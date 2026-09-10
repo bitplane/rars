@@ -16,6 +16,18 @@ impl Bytes {
             charge: resources.preparation_charge(),
         }
     }
+    pub(crate) fn output(resources: &WriterResources) -> Self {
+        Self {
+            bytes: Vec::new(),
+            len: 0,
+            charge: resources.execution_charge(),
+        }
+    }
+    pub(crate) fn take_vec(&mut self) -> Vec<u8> {
+        self.bytes.truncate(self.len);
+        self.len = 0;
+        std::mem::take(&mut self.bytes)
+    }
     pub(crate) fn zeroed(len: usize, resources: &WriterResources) -> Result<Self> {
         let mut out = Self::new(resources);
         out.grow(len)?;
@@ -108,15 +120,37 @@ pub(crate) struct Records<T> {
     limit: usize,
     charge: Option<CapacityCharge>,
 }
+#[cfg(test)]
+impl<T: Clone> Clone for Records<T> {
+    fn clone(&self) -> Self {
+        assert!(
+            self.charge.is_none(),
+            "charged owners require fallible copying"
+        );
+        self.values.clone().into()
+    }
+}
+#[cfg(test)]
+impl<T> From<Vec<T>> for Records<T> {
+    fn from(values: Vec<T>) -> Self {
+        Self {
+            limit: values.capacity(),
+            values,
+            charge: None,
+        }
+    }
+}
 impl<T> Records<T> {
     pub(crate) fn new(limit: usize, resources: &WriterResources) -> Result<Self> {
+        Self::with_charge(limit, resources.preparation_charge())
+    }
+    pub(crate) fn with_charge(limit: usize, mut charge: Option<CapacityCharge>) -> Result<Self> {
         let bytes = limit
             .checked_mul(std::mem::size_of::<T>())
             .filter(|bytes| *bytes <= isize::MAX as usize)
             .ok_or(Error::InvalidArgument(
                 "preparation records capacity overflows",
             ))?;
-        let mut charge = resources.preparation_charge();
         if let Some(charge) = &mut charge {
             charge.grow_to(bytes as u64)?;
         }

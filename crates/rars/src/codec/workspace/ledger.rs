@@ -56,6 +56,9 @@ impl Limited {
             scope: None,
         }
     }
+    pub(crate) fn limit(&self) -> u64 {
+        self.ledger.limit
+    }
     pub(crate) fn used(&self) -> u64 {
         match &self.scope {
             Some(scope) => scope.lock().unwrap().used,
@@ -161,6 +164,7 @@ impl Reservation {
     }
     /// Extensions are a coordinator action before dispatch, never a worker's
     /// attempt to take spare global capacity after an underestimate.
+    #[cfg(test)]
     pub(crate) fn extend(&mut self, additional: u64) -> Result<()> {
         let mut usage = self.allowance.scope.as_ref().unwrap().lock().unwrap();
         if usage.started || usage.retired {

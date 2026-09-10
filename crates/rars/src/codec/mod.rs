@@ -20,13 +20,11 @@ pub enum Error {
     InvalidData(&'static str),
     NeedMoreInput,
     Cancelled,
-    #[cfg(test)]
     WorkspaceLimitExceeded(Box<WorkspaceLimitError>),
 }
 
 /// A refused codec allocation. Boxed by `Error` so successful codec operations
 /// keep the existing compact Result layout. Diagnostic storage is not workspace.
-#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceLimitError {
     pub limit: u64,
@@ -41,7 +39,6 @@ impl std::fmt::Display for Error {
             Self::InvalidData(msg) => write!(f, "{msg}"),
             Self::NeedMoreInput => write!(f, "codec input is truncated"),
             Self::Cancelled => f.write_str("codec operation was cancelled"),
-            #[cfg(test)]
             Self::WorkspaceLimitExceeded(details) => {
                 write!(f,
                 "codec workspace limit {} exceeded: owner requires {} bytes with {} bytes in use",

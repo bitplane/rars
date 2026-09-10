@@ -453,7 +453,6 @@ impl Error {
             | Self::Rar5Recovery(crate::recovery::rar5::Error::RebuildTooLarge) => {
                 ErrorKind::ResourceLimit
             }
-            #[cfg(test)]
             Self::Codec(crate::codec::Error::WorkspaceLimitExceeded(_)) => ErrorKind::ResourceLimit,
             Self::Cancelled | Self::Codec(crate::codec::Error::Cancelled) => ErrorKind::Cancelled,
             Self::EntryNotFound => ErrorKind::EntryNotFound,

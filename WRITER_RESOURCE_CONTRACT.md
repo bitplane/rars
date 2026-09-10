@@ -199,7 +199,7 @@ cancellation. Error selection prefers a source/codec failure over the resulting
 cancellation. Returning joins admitted callbacks before releasing their owners;
 reusing the resources after an ordinary failure does not inherit cancellation.
 
-Internal whole-member admission tests now connect fixed worker reservations,
+Whole-member admission connects fixed worker reservations,
 preparation capacity and memory-spool capacity to one ledger. Coordinator slots
 are allocated before reservations are admitted, and wave sizing applies the
 estimated-workspace limit separately from the ledger's remaining capacity.
@@ -212,7 +212,7 @@ Per-reservation control storage stays charged until its last scope handle drops.
 Allowance extensions are allowed only before dispatch. An underestimate fails
 inside its fixed scope; running workers never compete for global spare bytes.
 
-Internal block-streaming admission also uses this ledger. Source-read and run
+Block-streaming admission also uses this ledger. Source-read and run
 assembly buffers, pushback, retained histories and coordinator descriptors carry
 root charges. Wave sizing leaves conservative room for assembly beside the
 estimated worker scopes; retained history and memory-spool capacity reduce the
@@ -238,9 +238,10 @@ workspace policy. Retained capacity can select a smaller stripe geometry without
 changing recovery bytes. If even the minimum phase cannot fit, planning refuses
 before allocating it.
 
-This wiring remains internal test coverage. Native spool path storage, the
-remaining copy-scratch audit and final output ownership must be completed before
-enabling the public aggregate policy.
+Native spool paths retain their capacity charge while parked and through
+cleanup. Builder conversion charges new input copies, metadata and source-reader
+owners. Archive and volume collectors retain output capacity through handoff;
+adapter copies reserve destination payloads while the sources remain live.
 
 These reservations still use workspace estimates. Raw and filtered members,
 adjacent streaming blocks and persistent codec history have an internal
@@ -285,14 +286,11 @@ Allocation-failure details are boxed to keep successful codec Results compact.
 A refused parse is abandoned; its partially updated finder is not resumed with
 extra bytes. An allowance cannot borrow capacity from another worker.
 
-This is migration infrastructure, not an available writer limit. Production
-codec entry points currently use unlimited handles; bounded construction is
-internal test coverage, including its refusal diagnostics. The codec reader
-adapter also has bounded read-ahead and input-buffer tests; it is not the
-production writer's source-loading path. Coordinator routing remains incomplete
-for aggregate-aware phase planning and the remaining spool/output owners.
-There is no public worker allowance or extension API yet.
-The workspace/admission pass remains open until those guarantees are enforceable.
+The aggregate policy is available for RAR5/7 writer execution. Production codec
+entry points select bounded handles when configured and unlimited handles
+otherwise. Worker allowances remain internal; there is no public extension API.
+The codec reader adapter's bounded read-ahead tests do not establish a reader
+resource policy.
 
 The optimal parser keeps match-pricing helpers available for inlining across
 generic codegen units. The numeric-sample workload in
@@ -300,7 +298,35 @@ generic codegen units. The numeric-sample workload in
 the per-candidate pricing cost during filter search; keep it in performance
 comparisons when changing allocation owners or parser boundaries.
 
-## Contract for a future managed-memory ceiling
+## Available quota: aggregate managed writer memory
+
+```rust
+let resources = rars::WriterResources::default()
+    .with_max_memory_bytes(256 * 1024 * 1024);
+let output = builder.to_output(&resources, None)?;
+assert!(resources.managed_memory_in_use() <= 256 * 1024 * 1024);
+let bytes = output.into_vec(); // caller ownership ends the charge
+```
+
+`with_max_memory_bytes` creates a fresh resource group; subsequent clones share
+it. The default is unlimited. Zero admits no managed allocation. The existing
+`memory_limit` remains a separate estimated compression-workspace policy.
+Insufficient managed capacity returns `RESOURCE_LIMIT` before allocation.
+
+Use `write_to`, `write_to_path_with_resources`, `to_bytes_with_resources`,
+`build_volumes_with_resources` or `write_volumes_to` with the configured group.
+`to_output` and `to_volume_output` retain output charges until drop or explicit
+handoff. Their `copy_with` methods also admit binding destination payloads before
+calling the adapter. Returned caller-owned buffers cease to count at handoff.
+
+This covers RAR5/7 execution on native and bare-WASM targets. Legacy writers
+explicitly refuse a requested aggregate policy. Reader operations and rewrite
+payload staging have separate policies; this limit does not bound those phases.
+Caller-supplied sources and sinks, inputs/configuration already held by the
+builder, allocator/reference-count headers, stacks, runtime objects, diagnostics,
+OS allocations and process-global state are excluded. Fresh execution copies
+of builder data and metadata count. This is not a process-RSS guarantee.
+
 
 A memory ceiling must cover the sum of active workspace and retained execution
 allocations. Adding the current estimates together would not enforce it.

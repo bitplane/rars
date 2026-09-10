@@ -15,7 +15,11 @@ use crate::{
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+
+struct ConvertedEntries {
+    entries: Vec<rar50::ArchiveEntry>,
+    _charge: Option<crate::streaming::CapacityCharge>,
+}
 
 /// The DOS archive bit, which is what a member gets when the caller offers no
 /// mode of its own. Zero would be legal and would read as "no attributes",
@@ -31,20 +35,50 @@ const RAR50_HOST_UNIX: u64 = 1;
 
 pub(crate) struct PendingArchive {
     pub(crate) path: Option<PathBuf>,
+    _charge: Option<crate::streaming::CapacityCharge>,
 }
 
 impl PendingArchive {
     pub(crate) fn create(destination: &Path) -> Result<(Self, fs::File)> {
+        Self::with_resources(destination, &WriterResources::default())
+    }
+    fn with_resources(destination: &Path, resources: &WriterResources) -> Result<(Self, fs::File)> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
         for _ in 0..128 {
             let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
-            let path = destination.with_file_name(format!(
+            let mut name = [0u8; 64];
+            let mut name_writer = std::io::Cursor::new(&mut name[..]);
+            write!(
+                name_writer,
                 ".rars-writing-{}-{sequence:016x}",
                 std::process::id()
-            ));
+            )?;
+            let name_len = name_writer.position() as usize;
+            let name = std::str::from_utf8(&name[..name_len]).expect("ASCII temporary name");
+            let directory = destination.parent().unwrap_or_else(|| Path::new(""));
+            let capacity = directory
+                .as_os_str()
+                .len()
+                .checked_add(1 + name_len)
+                .ok_or(Error::InvalidArgument("temporary path capacity overflows"))?;
+            let mut charge = resources.execution_charge();
+            if let Some(charge) = &mut charge {
+                charge.grow_to(capacity as u64)?;
+            }
+            let mut path = PathBuf::with_capacity(capacity);
+            path.push(directory);
+            path.push(name);
             match fs::File::options().write(true).create_new(true).open(&path) {
-                Ok(file) => return Ok((Self { path: Some(path) }, file)),
+                Ok(file) => {
+                    return Ok((
+                        Self {
+                            path: Some(path),
+                            _charge: charge,
+                        },
+                        file,
+                    ))
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error.into()),
             }
@@ -1078,6 +1112,27 @@ impl Builder {
         Ok(data)
     }
 
+    /// Encode into a collector that remains charged until handoff or drop.
+    pub fn to_output(
+        &self,
+        resources: &WriterResources,
+        progress: Option<&dyn WriteProgress>,
+    ) -> Result<crate::WriterOutput> {
+        let mut output = crate::WriterOutput::new(resources);
+        self.write_to(&mut output, resources, progress)?;
+        Ok(output)
+    }
+
+    /// Encode with an explicit resource policy, transferring output ownership
+    /// to the caller when this method returns.
+    pub fn to_bytes_with_resources(
+        &self,
+        resources: &WriterResources,
+        progress: Option<&dyn WriteProgress>,
+    ) -> Result<Vec<u8>> {
+        Ok(self.to_output(resources, progress)?.into_vec())
+    }
+
     /// Write the archive to `output`.
     ///
     /// RAR 5 and RAR 7 stream using the supplied workspace and spool policy;
@@ -1091,13 +1146,20 @@ impl Builder {
         progress: Option<&dyn WriteProgress>,
     ) -> Result<()> {
         self.check_single()?;
-        if self.streams_rar50() {
+        if self.streams_rar50()
+            || (resources.max_memory_bytes().is_some()
+                && self.format.family() == ArchiveFamily::Rar50Plus)
+        {
             return self.write_streaming_rar50(output, resources, progress);
         }
-        if resources.max_preparation_bytes().is_some() {
+        if resources.max_preparation_bytes().is_some() || resources.max_memory_bytes().is_some() {
             return Err(Error::UnsupportedFamilyFeature {
                 family: self.format.family(),
-                feature: "preparation memory quota",
+                feature: if resources.max_memory_bytes().is_some() {
+                    "aggregate managed-memory limit"
+                } else {
+                    "preparation memory quota"
+                },
             });
         }
         let progress = ResourceProgress::new(resources, progress.map(ProgressReporter));
@@ -1152,12 +1214,30 @@ impl Builder {
             Some(parent) => WriterResources::default().with_temp_dir(parent),
             None => WriterResources::default(),
         };
-        let (mut pending, output) = PendingArchive::create(path)?;
+        self.write_to_path_with_resources(path, &resources, progress)
+    }
+
+    /// Publish atomically using an explicit writer policy and scratch directory.
+    pub fn write_to_path_with_resources(
+        &self,
+        path: &Path,
+        resources: &WriterResources,
+        progress: Option<&dyn WriteProgress>,
+    ) -> Result<()> {
+        if self.format.family() != ArchiveFamily::Rar50Plus
+            && resources.max_memory_bytes().is_some()
+        {
+            return Err(Error::UnsupportedFamilyFeature {
+                family: self.format.family(),
+                feature: "aggregate managed memory quota",
+            });
+        }
+        let (mut pending, output) = PendingArchive::with_resources(path, resources)?;
         // Close before rename or cleanup on platforms that disallow removing
         // open files. Declaration order also closes it first during unwinding.
         {
             let mut output = output;
-            self.write_to(&mut output, &resources, progress)?;
+            self.write_to(&mut output, resources, progress)?;
             output.sync_all()?;
         }
         check_cancelled(progress.map(ProgressReporter))?;
@@ -1171,11 +1251,89 @@ impl Builder {
     /// Requires [`volume_size`](Self::volume_size). Naming the parts on disk is
     /// the caller's job, because the two families number them differently.
     pub fn build_volumes(&self, progress: Option<&dyn WriteProgress>) -> Result<Vec<Vec<u8>>> {
-        self.check_recovery_option()?;
-        let resources = WriterResources::default();
-        let control = ResourceProgress::new(&resources, progress.map(ProgressReporter));
+        self.build_volumes_with_resources(&WriterResources::default(), progress)
+    }
+
+    pub fn build_volumes_with_resources(
+        &self,
+        resources: &WriterResources,
+        progress: Option<&dyn WriteProgress>,
+    ) -> Result<Vec<Vec<u8>>> {
+        if self.format.family() == ArchiveFamily::Rar50Plus {
+            return self.to_volume_output(resources, progress)?.into_vec();
+        }
+        if resources.max_memory_bytes().is_some() || resources.max_preparation_bytes().is_some() {
+            return Err(Error::UnsupportedFamilyFeature {
+                family: self.format.family(),
+                feature: "managed writer memory policy",
+            });
+        }
+        let volume_size = self.volume_payload_size()?;
+        let control = ResourceProgress::new(resources, progress.map(ProgressReporter));
         let progress = Some(&control as &dyn WriteProgress);
         check_cancelled(progress.map(ProgressReporter))?;
+        let this = self.materialized(progress.map(ProgressReporter))?;
+        let result = match self.format.family() {
+            ArchiveFamily::Rar15To40 => this.build_rar15_volumes(volume_size, progress),
+            ArchiveFamily::Rar13 => this.build_rar13_volumes(volume_size, progress),
+            ArchiveFamily::Rar50Plus => unreachable!("modern volume output handled above"),
+        }?;
+        check_cancelled(progress.map(ProgressReporter))?;
+        Ok(result)
+    }
+
+    /// Collect modern volumes, retaining their charges for a binding handoff.
+    pub fn to_volume_output(
+        &self,
+        resources: &WriterResources,
+        progress: Option<&dyn WriteProgress>,
+    ) -> Result<crate::WriterVolumes> {
+        if self.format.family() != ArchiveFamily::Rar50Plus {
+            return Err(Error::UnsupportedFamilyFeature {
+                family: self.format.family(),
+                feature: "streaming managed volume output",
+            });
+        }
+        let mut sink = crate::streaming::output::VolumeCollector::new(resources)?;
+        self.write_volumes_to(&mut sink, resources, progress)?;
+        sink.finish()
+    }
+
+    /// Stream RAR5/7 volumes to a caller-owned sink under the resource policy.
+    pub fn write_volumes_to(
+        &self,
+        sink: &mut dyn rar50::VolumeSink,
+        resources: &WriterResources,
+        progress: Option<&dyn WriteProgress>,
+    ) -> Result<()> {
+        if self.format.family() != ArchiveFamily::Rar50Plus {
+            return Err(Error::UnsupportedFamilyFeature {
+                family: self.format.family(),
+                feature: "streaming managed volume output",
+            });
+        }
+        let volume_size = self.volume_payload_size()?;
+        if self.comment.is_some() {
+            return Err(Error::InvalidArgument(
+                "RAR 5 volume comments are not supported",
+            ));
+        }
+        let converted = self.rar50_entries_with_resources(resources)?;
+        rar50::write_streaming_volumes_with_progress(
+            &converted.entries,
+            self.rar50_options(),
+            rar50::ArchiveExtras::default()
+                .with_recovery_percent(self.recovery_percent)
+                .with_filter_policy(self.rar50_filter_policy()),
+            volume_size as u64,
+            sink,
+            resources,
+            progress,
+        )
+    }
+
+    fn volume_payload_size(&self) -> Result<usize> {
+        self.check_recovery_option()?;
         if self.legacy_unpack_version.is_some() {
             return Err(Error::InvalidArgument(
                 "retained legacy unpacker version requires single-archive output",
@@ -1226,14 +1384,7 @@ impl Builder {
                 "symbolic links are not supported in volume output",
             ));
         }
-        let this = self.materialized(progress.map(ProgressReporter))?;
-        let result = match self.format.family() {
-            ArchiveFamily::Rar50Plus => this.build_rar50_volumes(volume_size, progress),
-            ArchiveFamily::Rar15To40 => this.build_rar15_volumes(volume_size, progress),
-            ArchiveFamily::Rar13 => this.build_rar13_volumes(volume_size, progress),
-        }?;
-        check_cancelled(progress.map(ProgressReporter))?;
-        Ok(result)
+        Ok(volume_size)
     }
 
     /// Whether writing goes through the streaming RAR 5 writer, which serves
@@ -1345,53 +1496,108 @@ impl Builder {
         }
     }
 
-    fn rar50_entries(&self) -> Vec<rar50::ArchiveEntry> {
-        self.entries
-            .iter()
-            .map(|entry| {
-                let source = entry.source.clone().unwrap_or_else(|| {
-                    // From the slice, not the Vec: `From<Vec<u8>>` cannot reuse
-                    // the buffer, so cloning first copied every member twice.
-                    EntrySource::from_bytes(Arc::<[u8]>::from(entry.data.as_slice()))
-                });
-                let built = rar50::ArchiveEntry::new(entry.name.clone(), source)
-                    .with_directory(entry.is_directory)
-                    .with_redirection(entry.redirection.clone())
-                    .with_redirection_size(entry.redirection_size)
-                    .with_mtime(entry.mtime)
-                    .with_mtime_nanoseconds(entry.mtime_nanoseconds)
-                    .with_file_times(entry.file_times)
-                    .with_attributes(entry.rar50_attr())
-                    .with_host_os(entry.rar50_host_os());
+    fn rar50_entries(&self) -> Result<Vec<rar50::ArchiveEntry>> {
+        Ok(self
+            .rar50_entries_with_resources(&WriterResources::default())?
+            .entries)
+    }
+
+    fn rar50_entries_with_resources(
+        &self,
+        resources: &WriterResources,
+    ) -> Result<ConvertedEntries> {
+        let mut charge = resources.execution_charge();
+        if let Some(charge) = &mut charge {
+            let mut capacity = self
+                .entries
+                .len()
+                .checked_mul(std::mem::size_of::<rar50::ArchiveEntry>())
+                .ok_or(Error::InvalidArgument("converted entry capacity overflows"))?;
+            for entry in &self.entries {
                 let data_password = entry
                     .encryption
                     .as_ref()
-                    .map_or(self.password.as_deref(), |encryption| {
-                        encryption.data_password.as_deref()
-                    });
+                    .map_or(self.password.as_deref(), |e| e.data_password.as_deref());
                 let comment_password = entry
                     .encryption
                     .as_ref()
-                    .map_or(self.password.as_deref(), |encryption| {
-                        encryption.comment_password.as_deref()
-                    });
-                let built = match &entry.file_comment {
-                    Some(comment) => {
-                        let service = rar50::ServiceEntry::new(b"CMT".to_vec(), comment.clone());
-                        let service = match comment_password {
-                            Some(password) => service.with_password(password.to_vec()),
-                            None => service,
-                        };
-                        built.with_service(service)
-                    }
-                    None => built,
-                };
-                match data_password {
-                    Some(password) => built.with_password(password.to_vec()),
-                    None => built,
+                    .map_or(self.password.as_deref(), |e| e.comment_password.as_deref());
+                for bytes in [
+                    entry.name.len(),
+                    entry
+                        .redirection
+                        .as_ref()
+                        .map_or(0, |r| r.target_name.len()),
+                    data_password.map_or(0, <[u8]>::len),
+                ] {
+                    capacity = capacity
+                        .checked_add(bytes)
+                        .ok_or(Error::InvalidArgument("converted entry capacity overflows"))?;
                 }
-            })
-            .collect()
+                if let Some(comment) = &entry.file_comment {
+                    for bytes in [
+                        std::mem::size_of::<rar50::ServiceEntry>(),
+                        3,
+                        comment.len(),
+                        comment_password.map_or(0, <[u8]>::len),
+                    ] {
+                        capacity = capacity.checked_add(bytes).ok_or(Error::InvalidArgument(
+                            "converted service capacity overflows",
+                        ))?;
+                    }
+                }
+            }
+            charge.grow_to(capacity as u64)?;
+        }
+        let mut entries = Vec::with_capacity(self.entries.len());
+        for entry in &self.entries {
+            let source = match &entry.source {
+                Some(source) => source.clone(),
+                None => EntrySource::copy_for_writer(&entry.data, resources)?,
+            };
+            let built = rar50::ArchiveEntry::new(entry.name.clone(), source)
+                .with_directory(entry.is_directory)
+                .with_redirection(entry.redirection.clone())
+                .with_redirection_size(entry.redirection_size)
+                .with_mtime(entry.mtime)
+                .with_mtime_nanoseconds(entry.mtime_nanoseconds)
+                .with_file_times(entry.file_times)
+                .with_attributes(entry.rar50_attr())
+                .with_host_os(entry.rar50_host_os());
+            let data_password = entry
+                .encryption
+                .as_ref()
+                .map_or(self.password.as_deref(), |encryption| {
+                    encryption.data_password.as_deref()
+                });
+            let comment_password = entry
+                .encryption
+                .as_ref()
+                .map_or(self.password.as_deref(), |encryption| {
+                    encryption.comment_password.as_deref()
+                });
+            let built = match &entry.file_comment {
+                Some(comment) => {
+                    let service = rar50::ServiceEntry::new(b"CMT".to_vec(), comment.clone());
+                    let service = match comment_password {
+                        Some(password) => service.with_password(password.to_vec()),
+                        None => service,
+                    };
+                    let mut built = built;
+                    built.services = vec![service];
+                    built
+                }
+                None => built,
+            };
+            entries.push(match data_password {
+                Some(password) => built.with_password(password.to_vec()),
+                None => built,
+            });
+        }
+        Ok(ConvertedEntries {
+            entries,
+            _charge: charge,
+        })
     }
 
     fn write_streaming_rar50(
@@ -1414,8 +1620,9 @@ impl Builder {
                 None => extras.with_comment(comment),
             };
         }
+        let converted = self.rar50_entries_with_resources(resources)?;
         rar50::write_streaming_archive_with_progress(
-            &self.rar50_entries(),
+            &converted.entries,
             self.rar50_options(),
             extras,
             resources,
@@ -1431,7 +1638,7 @@ impl Builder {
             None => writer,
         };
         let writer = writer
-            .entries(self.rar50_entries())
+            .entries(self.rar50_entries()?)
             .filter_policy(self.rar50_filter_policy())
             .recovery_percent(self.recovery_percent);
         let writer = match (self.comment.as_deref(), self.comment_password.as_deref()) {
@@ -1557,31 +1764,6 @@ impl Builder {
                 progress,
             )
         }
-    }
-
-    fn build_rar50_volumes(
-        &self,
-        volume_size: usize,
-        progress: Option<&dyn WriteProgress>,
-    ) -> Result<Vec<Vec<u8>>> {
-        if self.comment.is_some() {
-            return Err(Error::InvalidArgument(
-                "RAR 5 volume comments are not supported",
-            ));
-        }
-        let mut sink = rar50::CollectedVolumes::new();
-        rar50::write_streaming_volumes_with_progress(
-            &self.rar50_entries(),
-            self.rar50_options(),
-            rar50::ArchiveExtras::default()
-                .with_recovery_percent(self.recovery_percent)
-                .with_filter_policy(self.rar50_filter_policy()),
-            volume_size as u64,
-            &mut sink,
-            &WriterResources::default(),
-            progress,
-        )?;
-        Ok(sink.take())
     }
 
     fn single_volume_entry(&self) -> Result<&BuilderEntry> {

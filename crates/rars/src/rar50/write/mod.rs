@@ -371,6 +371,7 @@ pub fn write_streaming_volumes_with_progress(
                 extras.filter_policy,
                 dictionary_reach(entries, options.features.solid),
                 resources.memory_limit(),
+                resources,
             )?,
             recovery_percent: extras.recovery_percent,
             header_encrypted: options.features.header_encryption,
@@ -525,6 +526,7 @@ pub(crate) fn write_streaming_archive_reporting(
                 extras.filter_policy,
                 dictionary_reach(entries, options.features.solid),
                 resources.memory_limit(),
+                resources,
             )?,
             recovery_percent,
             header_encrypted: options.features.header_encryption,
@@ -570,6 +572,7 @@ fn compression_plan(
     filter_policy: FilterPolicy,
     content: u64,
     memory_limit: u64,
+    resources: &WriterResources,
 ) -> Result<compress::CompressPlan> {
     let method = compression_method_for_level(options.compression_level)?;
     // A stored member has no window to reach across, and the size still lands in
@@ -590,7 +593,10 @@ fn compression_plan(
         solid: options.features.solid,
         method,
         filter_policy,
-        candidates,
+        candidates: crate::streaming::preparation::Records::collect(
+            candidates.into_iter().map(Ok),
+            resources,
+        )?,
     })
 }
 
@@ -601,7 +607,6 @@ fn source_integrity(
     progress: &dyn compress::CompressionProgress,
     _resources: &WriterResources,
 ) -> Result<(u32, [u8; 32])> {
-    #[cfg(test)]
     if let Some(allowance) = &_resources.execution {
         return source_integrity_with_allowance(
             source,
@@ -734,7 +739,6 @@ fn encrypt_reader_to(
     progress: Option<ProgressReporter<'_>>,
     _resources: &WriterResources,
 ) -> Result<()> {
-    #[cfg(test)]
     if let Some(allowance) = &_resources.execution {
         return encrypt_reader_with_allowance(
             reader, input_size, output, keys, iv, block_size, progress, allowance,
@@ -879,9 +883,13 @@ impl<'a> Rar50Writer<'a> {
     /// Builds the archive in memory. Prefer [`Rar50Writer::write_to`], which
     /// streams it instead.
     pub fn finish(self) -> Result<Vec<u8>> {
-        let mut out = Vec::new();
-        self.write_to(&mut out, &WriterResources::default())?;
-        Ok(out)
+        self.finish_with_resources(&WriterResources::default())
+    }
+
+    pub fn finish_with_resources(self, resources: &WriterResources) -> Result<Vec<u8>> {
+        let mut out = crate::WriterOutput::new(resources);
+        self.write_to(&mut out, resources)?;
+        Ok(out.into_vec())
     }
 
     /// Writes the archive straight to `output` without ever holding it.
@@ -1672,7 +1680,7 @@ mod tests {
                 solid: false,
                 method: 1,
                 filter_policy: FilterPolicy::None,
-                candidates: vec![encode_options],
+                candidates: vec![encode_options].into(),
             },
             &WriterResources::new(required.saturating_mul(4)),
             &|_| true,

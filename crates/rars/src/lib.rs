@@ -66,6 +66,7 @@ pub use filter::{
 pub use reader_scratch::Rar50Scratch;
 use std::io::{Read, Write};
 use std::path::Path;
+pub use streaming::output::{WriterOutput, WriterVolumes};
 pub use streaming::{
     EntryReader, EntrySource, WriteCancellation, WriterResources, DEFAULT_WRITER_MEMORY_LIMIT,
 };

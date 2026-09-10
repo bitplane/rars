@@ -853,7 +853,6 @@ fn write_recovery_service(
     progress: Option<ProgressReporter<'_>>,
     output: &mut dyn Write,
 ) -> Result<u64> {
-    #[cfg(test)]
     if let Some(allowance) = &resources.execution {
         return recovery_service_with_allowance(
             recovery_percent,
@@ -888,7 +887,6 @@ fn recovery_service_with_allowance<B: crate::codec::workspace::Budget>(
     let prefix_len = prefix.len();
     let plan = plan_inline_recovery(prefix_len, recovery_percent)?;
     let (mode, required) = choose_recovery_memory_mode(plan, resources.memory_limit())?;
-    #[cfg(test)]
     let (mode, required) = if let Some(allowance) = &resources.execution {
         crate::recovery::rar5::choose_recovery_capacity_mode(
             plan,
@@ -1989,7 +1987,7 @@ mod emission_ledger_tests {
                 solid: false,
                 method: 0,
                 filter_policy: super::super::FilterPolicy::None,
-                candidates: vec![options],
+                candidates: vec![options].into(),
             },
             recovery_percent: Some(10),
             header_encrypted: encrypted,

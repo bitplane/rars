@@ -376,8 +376,8 @@ pub(crate) fn choose_recovery_memory_mode(
     ))
 }
 
-/// Choose geometry using owned workspace and retained aggregate capacity.
-#[cfg(test)]
+/// Choose a phase geometry from actual managed capacity as well as the legacy
+/// workspace policy. Both parity construction and later chunk framing must fit.
 pub(crate) fn choose_recovery_capacity_mode(
     plan: InlineRecoveryPlan,
     memory_limit: u64,

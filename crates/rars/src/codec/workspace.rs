@@ -2,9 +2,7 @@
 //! reaches into a sibling worker's spare bytes. Internal admission tests connect
 //! these owners to coordinator reservations; unlimited handles preserve behaviour.
 use super::{Error, Result};
-#[cfg(test)]
 mod ledger;
-#[cfg(test)]
 pub(crate) use ledger::{Charge, Limited, Reservation, RESERVATION_BYTES};
 
 /// A zero-sized policy: its buffers have exactly Vec's layout and no ledger
@@ -14,7 +12,6 @@ pub(crate) struct Allowance {
     _unlimited: (),
 }
 impl Allowance {
-    #[cfg(test)]
     pub(crate) fn limited(limit: u64) -> Limited {
         Limited::new(limit)
     }
@@ -54,7 +51,6 @@ impl Budget for Allowance {
     }
 }
 
-#[cfg(test)]
 impl Budget for Limited {
     type Charge = Charge;
     type Failure = Error;

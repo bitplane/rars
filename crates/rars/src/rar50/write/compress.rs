@@ -146,7 +146,6 @@ fn complete_jobs<T: Send, O: Send>(
 /// Admit fixed worker scopes only after coordinator slots have capacity. Keep
 /// every reservation until all callbacks join, then retire unused capacity;
 /// output owners remain charged after return. No worker can extend its scope.
-#[cfg(test)]
 fn run_jobs_admitted<T: Send, O: Send>(
     jobs: Records<T>,
     resources: &WriterResources,
@@ -410,7 +409,6 @@ fn compress_streaming_members(
         .min(crate::parallel::threads())
         .max(1);
 
-    #[cfg(test)]
     if let Some(allowance) = &resources.execution {
         let encode = if plan.solid {
             compress_solid_chain::<crate::codec::workspace::Limited>
@@ -466,7 +464,6 @@ fn streaming_wave_capacity(
     _plan: &CompressPlan,
     _resources: &WriterResources,
 ) -> usize {
-    #[cfg(test)]
     if let Some(ledger) = &_resources.execution {
         // Run growth/replacement, block assembly and history copies coexist.
         // Descriptor capacity is still checked by its owners before dispatch.
@@ -528,7 +525,6 @@ fn compress_members_whole(
             crate::parallel::threads(),
             resources.memory_limit(),
         );
-        #[cfg(test)]
         let (end, reserved) = if let Some(ledger) = &resources.execution {
             let slot_bytes = std::mem::size_of::<usize>()
                 + std::mem::size_of::<CompressedMember>()
@@ -565,7 +561,6 @@ fn compress_members_whole(
                 .map_err(|error| error_context(index, error))
             })
         };
-        #[cfg(test)]
         let completed = if resources.execution.is_some() {
             run_jobs_admitted(
                 jobs,
@@ -588,8 +583,6 @@ fn compress_members_whole(
         } else {
             unlimited(jobs)?
         };
-        #[cfg(not(test))]
-        let completed = unlimited(jobs)?;
         for member in completed {
             results.push(member)?;
         }
@@ -1106,7 +1099,6 @@ fn compress_wave<B: Budget + Send + Sync>(
 where
     B::Charge: Send,
 {
-    #[cfg(test)]
     if resources.execution.is_some() {
         let jobs = prepare_block_jobs::<B, crate::codec::workspace::Limited>(jobs, resources)?;
         let packed_runs = run_jobs_admitted(
@@ -1323,7 +1315,7 @@ mod tests {
                 solid,
                 method: 1,
                 filter_policy: FilterPolicy::None,
-                candidates: vec![options],
+                candidates: vec![options].into(),
             };
             let sources = [
                 EntrySource::from_bytes(data.clone()),
@@ -1446,7 +1438,7 @@ mod tests {
                 solid,
                 method: 1,
                 filter_policy: FilterPolicy::None,
-                candidates: vec![options],
+                candidates: vec![options].into(),
             };
             let mut expected_integrity = [(size as u64, 0, [0; 32]); 2];
             let mut actual_integrity = expected_integrity;
@@ -1526,7 +1518,7 @@ mod tests {
                 solid,
                 method: 1,
                 filter_policy,
-                candidates: vec![options],
+                candidates: vec![options].into(),
             };
             let required = super::super::streaming_lz_workspace(
                 plan.dictionary_size,
@@ -1585,10 +1577,10 @@ mod tests {
                     })
                     .unwrap();
                 assert!(peak.load(Ordering::Relaxed) >= required * workers);
-                // Native spools retain no payload RAM. Only returned descriptors remain.
-                assert_eq!(
-                    ledger.used(),
-                    (sources.len() * std::mem::size_of::<CompressedMember>()) as u64
+                // Native spools retain their path storage alongside result descriptors.
+                assert!(
+                    ledger.used()
+                        > (sources.len() * std::mem::size_of::<CompressedMember>()) as u64
                 );
                 assert_eq!(collect(actual), expected);
                 assert_eq!(ledger.used(), 0);
@@ -1612,7 +1604,7 @@ mod tests {
                 solid,
                 method: 1,
                 filter_policy: FilterPolicy::None,
-                candidates: vec![options],
+                candidates: vec![options].into(),
             };
             let ledger = Allowance::limited(256 * 1024 * 1024);
             let resources = WriterResources::default()
@@ -1688,7 +1680,7 @@ mod tests {
             solid: false,
             method: 0,
             filter_policy: FilterPolicy::None,
-            candidates: vec![options],
+            candidates: vec![options].into(),
         };
         let opens = Arc::new(AtomicUsize::new(0));
         for limit in [32768, 131072] {
@@ -1819,7 +1811,7 @@ mod tests {
             solid: false,
             method: 1,
             filter_policy: FilterPolicy::Auto,
-            candidates: vec![options],
+            candidates: vec![options].into(),
         };
         let data: Arc<[u8]> = (0..1024u32)
             .flat_map(|n| n.to_le_bytes())
@@ -1872,10 +1864,7 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(opens.load(Ordering::Relaxed), 4);
-            assert_eq!(
-                ledger.used(),
-                (4 * std::mem::size_of::<CompressedMember>()) as u64
-            );
+            assert!(ledger.used() > (4 * std::mem::size_of::<CompressedMember>()) as u64);
             for mut member in result {
                 let mut bytes = Vec::new();
                 member.packed.copy_to(&mut bytes).unwrap();
@@ -2017,7 +2006,7 @@ mod tests {
             solid: false,
             method: 1,
             filter_policy: FilterPolicy::Auto,
-            candidates: vec![options, options.with_optimal_parse(true)],
+            candidates: vec![options, options.with_optimal_parse(true)].into(),
         };
         let data: Vec<u8> = (0..1024u32).flat_map(|n| n.to_le_bytes()).collect();
         let opens = Arc::new(AtomicUsize::new(0));
@@ -2137,7 +2126,7 @@ mod tests {
             solid: false,
             method: 1,
             filter_policy: FilterPolicy::Auto,
-            candidates: vec![encode_options],
+            candidates: vec![encode_options].into(),
         };
         let required = whole_member_workspace(32, &plan);
         let scratch = crate::scratch::case("coordinator-admission");
@@ -2211,7 +2200,7 @@ mod tests {
             solid: false,
             method: 1,
             filter_policy: FilterPolicy::Auto,
-            candidates: vec![encode_options],
+            candidates: vec![encode_options].into(),
         };
         let resources = WriterResources::new(70 * 1024 * 1024).with_temp_dir(&*scratch);
         for cancel in [false, true] {
@@ -2350,7 +2339,7 @@ mod tests {
                 solid,
                 method,
                 filter_policy,
-                candidates: vec![options],
+                candidates: vec![options].into(),
             };
             let mut members =
                 compress_members_reporting(&sources, plan, &resources, &|_| true).unwrap();
@@ -2420,7 +2409,7 @@ mod tests {
             solid: true,
             method: 1,
             filter_policy: FilterPolicy::None,
-            candidates: vec![options],
+            candidates: vec![options].into(),
         };
         let scratch = crate::scratch::case("lazy-solid-inputs");
         let resources = WriterResources::default().with_temp_dir(&*scratch);
@@ -2448,7 +2437,7 @@ mod tests {
             solid: false,
             method: 3,
             filter_policy: FilterPolicy::Auto,
-            candidates: vec![options],
+            candidates: vec![options].into(),
         };
         let required = whole_member_workspace(size as u64, &plan);
         assert!(required >= (size * 12) as u64);
@@ -2485,7 +2474,7 @@ mod tests {
             solid: false,
             method: 1,
             filter_policy: FilterPolicy::Auto,
-            candidates: vec![options],
+            candidates: vec![options].into(),
         };
         let run = |threads, budget| {
             let workers = Mutex::new(HashSet::new());
@@ -2555,7 +2544,7 @@ mod tests {
                     solid,
                     method: 1,
                     filter_policy: policy.clone(),
-                    candidates: vec![options],
+                    candidates: vec![options].into(),
                 };
                 let members = compress_members_reporting(
                     &sources,

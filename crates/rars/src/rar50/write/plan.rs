@@ -110,7 +110,8 @@ fn streaming_workspace(settings: &CompressPlan, include_candidates: bool) -> u64
     )
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
+#[cfg_attr(test, derive(Clone))]
 pub(super) struct CompressPlan {
     pub(super) algorithm_version: u8,
     pub(super) encode_options: EncodeOptions,
@@ -123,7 +124,7 @@ pub(super) struct CompressPlan {
     /// Filters and multi-candidate encoding both need the whole member at
     /// once, so they only run for members that fit the memory budget.
     pub(super) filter_policy: FilterPolicy,
-    pub(super) candidates: Vec<EncodeOptions>,
+    pub(super) candidates: Records<EncodeOptions>,
 }
 
 /// Working memory a member needs to be filtered as a whole: the member, the
@@ -164,7 +165,7 @@ mod tests {
             solid: false,
             method: 1,
             filter_policy: FilterPolicy::Auto,
-            candidates: vec![encode_options],
+            candidates: vec![encode_options].into(),
         }
     }
 
@@ -197,7 +198,10 @@ mod tests {
             }));
         for filter in [settings.filter_policy.clone(), FilterPolicy::None] {
             settings.filter_policy = filter;
-            settings.candidates.push(settings.encode_options);
+            settings
+                .candidates
+                .push_growing(settings.encode_options)
+                .unwrap();
             let execution = ExecutionPlan::new(&settings, [16].into_iter(), 1);
             assert_eq!(execution.members()[0].execution, Execution::WholeMember);
             assert!(execution.members()[0].workspace > 1);

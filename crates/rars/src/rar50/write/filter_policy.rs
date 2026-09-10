@@ -258,8 +258,8 @@ pub(super) fn encode_options_for_level(
 pub(super) fn encode_option_candidates_for_level(
     level: Option<u8>,
     dictionary_size: u64,
-) -> Result<Vec<EncodeOptions>> {
-    Ok(vec![encode_options_for_level(level, dictionary_size)?])
+) -> Result<[EncodeOptions; 1]> {
+    Ok([encode_options_for_level(level, dictionary_size)?])
 }
 
 pub(super) fn rar50_algorithm_version(options: WriterOptions, dictionary_size: u64) -> Result<u8> {

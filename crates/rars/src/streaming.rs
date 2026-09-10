@@ -1,6 +1,7 @@
 use crate::{Error, Result};
 #[cfg(any(test, all(target_arch = "wasm32", target_os = "unknown")))]
 mod memory_spool;
+pub(crate) mod output;
 pub(crate) mod preparation;
 use std::fmt;
 use std::fs::File;
@@ -53,6 +54,26 @@ impl EntrySource {
         Self::from_factory(MemorySource(data.into()))
     }
 
+    pub(crate) fn copy_for_writer(data: &[u8], resources: &WriterResources) -> Result<Self> {
+        let Some(mut charge) = resources.execution_charge() else {
+            return Ok(Self::from_bytes(Arc::<[u8]>::from(data)));
+        };
+        let bytes = data
+            .len()
+            .checked_add(std::mem::size_of::<WriterMemoryData>())
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<WriterMemorySource>()))
+            .ok_or(Error::InvalidArgument("writer source capacity overflows"))?;
+        charge.grow_to(bytes as u64)?;
+        let data = Arc::new(WriterMemoryData {
+            bytes: data.to_vec(),
+            _charge: charge,
+        });
+        Ok(Self::from_factory(WriterMemorySource {
+            data,
+            resources: resources.clone(),
+        }))
+    }
+
     pub fn from_path(path: impl Into<PathBuf>) -> Self {
         Self::from_factory(PathSource(path.into()))
     }
@@ -89,6 +110,55 @@ impl SourceFactory for MemorySource {
 
     fn open(&self) -> Result<Box<dyn EntryReader>> {
         Ok(Box::new(Cursor::new(Arc::clone(&self.0))))
+    }
+}
+
+// The shared owner keeps both its bytes and its charge alive if a reader
+// outlives the converted entry. Reader boxes get separate capacity charges.
+struct WriterMemoryData {
+    bytes: Vec<u8>,
+    _charge: CapacityCharge,
+}
+struct WriterMemorySource {
+    data: Arc<WriterMemoryData>,
+    resources: WriterResources,
+}
+struct WriterMemoryReader {
+    data: Arc<WriterMemoryData>,
+    position: u64,
+    _charge: Option<CapacityCharge>,
+}
+impl SourceFactory for WriterMemorySource {
+    fn len(&self) -> Result<u64> {
+        Ok(self.data.bytes.len() as u64)
+    }
+    fn open(&self) -> Result<Box<dyn EntryReader>> {
+        let mut charge = self.resources.execution_charge();
+        if let Some(charge) = &mut charge {
+            charge.grow_to(std::mem::size_of::<WriterMemoryReader>() as u64)?;
+        }
+        Ok(Box::new(WriterMemoryReader {
+            data: self.data.clone(),
+            position: 0,
+            _charge: charge,
+        }))
+    }
+}
+impl Read for WriterMemoryReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let mut cursor = Cursor::new(&self.data.bytes);
+        cursor.set_position(self.position);
+        let count = cursor.read(out)?;
+        self.position = cursor.position();
+        Ok(count)
+    }
+}
+impl Seek for WriterMemoryReader {
+    fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+        let mut cursor = Cursor::new(&self.data.bytes);
+        cursor.set_position(self.position);
+        self.position = cursor.seek(from)?;
+        Ok(self.position)
     }
 }
 
@@ -158,7 +228,6 @@ pub struct WriterResources {
     prepared_header_budget: Option<Arc<StorageBudget>>,
     preparation_budget: Option<Arc<StorageBudget>>,
     cancellation: Option<WriteCancellation>,
-    #[cfg(test)]
     pub(crate) execution: Option<crate::codec::workspace::Limited>,
 }
 
@@ -179,9 +248,36 @@ impl WriterResources {
             prepared_header_budget: None,
             preparation_budget: None,
             cancellation: None,
-            #[cfg(test)]
             execution: None,
         }
+    }
+
+    /// Set a hard ceiling on managed writer allocation capacity for RAR5/7.
+    /// Includes active work, retained spools/headers, conversion and owned output.
+    /// Caller-owned inputs and external sinks, allocator/runtime overhead, stacks
+    /// and OS memory are excluded. This is not a process-RAM limit.
+    /// Legacy writers refuse this policy. The estimated workspace policy remains
+    /// independent. Configure before execution; clones share the new ledger.
+    pub fn with_max_memory_bytes(mut self, limit: u64) -> Self {
+        self.execution = Some(crate::codec::workspace::Allowance::limited(limit));
+        self
+    }
+
+    pub fn max_memory_bytes(&self) -> Option<u64> {
+        self.execution
+            .as_ref()
+            .map(crate::codec::workspace::Limited::limit)
+    }
+
+    /// Live managed capacity plus reservations for admitted workers.
+    pub fn managed_memory_in_use(&self) -> u64 {
+        self.execution
+            .as_ref()
+            .map_or(0, crate::codec::workspace::Limited::used)
+    }
+
+    pub(crate) fn execution_charge(&self) -> Option<CapacityCharge> {
+        CapacityCharge::new(self, &None)
     }
 
     /// Cap the sum of live logical spool lengths, including reserved growth.
@@ -299,9 +395,7 @@ impl WriterResources {
         CapacityCharge::new(self, &self.spool_memory_budget)
     }
 
-    // No public aggregate mode until every coordinator path and output owner
-    // participates. Tests exercise production owners against admitted scopes.
-    #[cfg(test)]
+    // A coordinator supplies a child scope to its admitted workers.
     pub(crate) fn with_execution_allowance(
         mut self,
         allowance: crate::codec::workspace::Limited,
@@ -431,7 +525,7 @@ impl StorageCharge {
         })
     }
 
-    fn grow_to(&mut self, bytes: u64) -> Result<()> {
+    pub(crate) fn grow_to(&mut self, bytes: u64) -> Result<()> {
         let growth = bytes.saturating_sub(self.bytes);
         if growth == 0 {
             return Ok(());
@@ -489,7 +583,6 @@ impl Drop for StorageCharge {
 #[derive(Debug)]
 pub(crate) enum CapacityCharge {
     Storage(StorageCharge),
-    #[cfg(test)]
     Execution {
         storage: Option<StorageCharge>,
         charge: crate::codec::workspace::Charge,
@@ -501,7 +594,6 @@ impl CapacityCharge {
             budget: budget.clone(),
             bytes: 0,
         });
-        #[cfg(test)]
         if let Some(allowance) = &_resources.execution {
             return Some(Self::Execution {
                 storage,
@@ -513,17 +605,15 @@ impl CapacityCharge {
     fn bytes(&self) -> u64 {
         match self {
             Self::Storage(storage) => storage.bytes,
-            #[cfg(test)]
             Self::Execution { charge, .. } => charge.bytes(),
         }
     }
-    fn grow_to(&mut self, bytes: u64) -> Result<()> {
+    pub(crate) fn grow_to(&mut self, bytes: u64) -> Result<()> {
         if bytes <= self.bytes() {
             return Ok(());
         }
         match self {
             Self::Storage(storage) => storage.grow_to(bytes),
-            #[cfg(test)]
             Self::Execution { storage, charge } => {
                 use crate::codec::workspace::{Budget, Limited};
                 let old = charge.bytes();
@@ -541,7 +631,6 @@ impl CapacityCharge {
     fn shrink_to(&mut self, bytes: u64) {
         match self {
             Self::Storage(storage) => storage.shrink_to(bytes),
-            #[cfg(test)]
             Self::Execution { storage, charge } => {
                 use crate::codec::workspace::{Budget, Limited};
                 if let Some(storage) = storage {
@@ -624,6 +713,8 @@ type SpoolStore = memory_spool::MemorySpool;
 pub(crate) struct Spool {
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     path: PathBuf,
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    _path_charge: Option<CapacityCharge>,
     file: Option<SpoolStore>,
     len: u64,
     pos: u64,
@@ -636,10 +727,27 @@ impl Spool {
         let directory = resources.temp_dir().unwrap_or_else(|| Path::new("."));
         for _ in 0..128 {
             let sequence = SPOOL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let path = directory.join(format!(
+            let mut name = [0u8; 64];
+            let mut name_writer = std::io::Cursor::new(&mut name[..]);
+            write!(
+                name_writer,
                 ".rars-spool-{}-{sequence:016x}",
                 std::process::id()
-            ));
+            )?;
+            let name_len = name_writer.position() as usize;
+            let name = std::str::from_utf8(&name[..name_len]).expect("ASCII spool name");
+            let capacity = directory
+                .as_os_str()
+                .len()
+                .checked_add(1 + name_len)
+                .ok_or(Error::InvalidArgument("spool path capacity overflows"))?;
+            let mut path_charge = CapacityCharge::new(resources, &None);
+            if let Some(charge) = &mut path_charge {
+                charge.grow_to(capacity as u64)?;
+            }
+            let mut path = PathBuf::with_capacity(capacity);
+            path.push(directory);
+            path.push(name);
             let mut options = File::options();
             options.read(true).write(true).create_new(true);
             #[cfg(unix)]
@@ -653,6 +761,7 @@ impl Spool {
                 Ok(file) => {
                     return Ok(Self {
                         path,
+                        _path_charge: path_charge,
                         file: Some(file),
                         len: 0,
                         pos: 0,
@@ -880,6 +989,23 @@ impl Drop for MemoryPermit {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn writer_memory_reader_retains_payload_after_source_drop() {
+        use super::*;
+        let resources = WriterResources::default().with_max_memory_bytes(8192);
+        let source = EntrySource::copy_for_writer(&[42; 4096], &resources).unwrap();
+        let retained = resources.managed_memory_in_use();
+        assert!(retained >= 4096);
+        let mut reader = source.open().unwrap();
+        drop(source);
+        assert!(resources.managed_memory_in_use() > retained);
+        let mut bytes = [0; 4096];
+        reader.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes, [42; 4096]);
+        drop(reader);
+        assert_eq!(resources.managed_memory_in_use(), 0);
+    }
+
     use super::*;
     fn spool_used(resources: &WriterResources) -> u64 {
         *resources
@@ -889,6 +1015,37 @@ mod tests {
             .used
             .lock()
             .unwrap()
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[test]
+    fn spool_path_capacity_survives_parking_and_refuses_before_file_creation() {
+        let root = crate::scratch::case("spool-path-capacity");
+        let limited = crate::codec::workspace::Allowance::limited(1);
+        let resources = WriterResources::default()
+            .with_temp_dir(&*root)
+            .with_execution_allowance(limited.clone());
+        assert_eq!(
+            Spool::create(&resources).err().unwrap().kind(),
+            crate::ErrorKind::ResourceLimit
+        );
+        assert_eq!(limited.used(), 0);
+        assert_eq!(std::fs::read_dir(&*root).unwrap().count(), 0);
+        let ledger = crate::codec::workspace::Allowance::limited(4096);
+        let resources = resources.with_execution_allowance(ledger.clone());
+        let mut spool = Spool::create(&resources).unwrap();
+        let capacity = spool.path.capacity() as u64;
+        assert_eq!(ledger.used(), capacity);
+        spool.write_all(b"payload").unwrap();
+        spool.park();
+        assert_eq!(ledger.used(), capacity);
+        let mut copied = Vec::new();
+        spool.copy_to(&mut copied).unwrap();
+        assert_eq!(copied, b"payload");
+        assert_eq!(ledger.used(), capacity);
+        drop(spool);
+        assert_eq!(ledger.used(), 0);
+        assert_eq!(std::fs::read_dir(&*root).unwrap().count(), 0);
     }
 
     #[test]
