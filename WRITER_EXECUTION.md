@@ -79,21 +79,22 @@ optimal parsing (automatic fallback considers only the base candidate):
 These charges cover the anticipated input/history/search buffers, finder links,
 token streams and parse workspace. They are estimates, not allocator tracking.
 The RAR5 codec's raw/filtered members, adjacent streaming blocks and persistent
-history support fallible internal allocation allowances, but production entry
-points still use unlimited handles. Streaming source reads, lookahead, job
+history use fallible allocation allowances when an aggregate policy is supplied;
+unlimited execution keeps a separate compile-time allocation policy. Streaming source reads, lookahead, job
 assembly, rolling dictionaries and packed results now retain those owners
 through spool writes. Whole-member source loading and automatic filter search
 also retain owned samples, scanner scratch, candidate descriptors, trial encodes
 and the winning payload. Encryption chunks and resident/striped recovery buffers
 use the same ownership machinery; bounded recovery owns its field tables, and
-RAR5 key derivation uses fixed-size scratch. Internal whole-member admission
-tests connect worker reservations, preparation and memory-spool capacity under
+RAR5 key derivation uses fixed-size scratch. Whole-member admission
+connects worker reservations, preparation and memory-spool capacity under
 one ledger; unused reservation space is released only after joining workers,
-and retained owners keep their charges. Internal streaming admission keeps
+and retained owners keep their charges. Streaming admission keeps
 assembly, pushback and history charged across waves while encoding workers use
 fixed scopes. Stored checksum reads, encryption/recovery emission and stored
-volume verification also use the ledger. Aggregate-aware recovery planning and
-the remaining spool/output ownership audit precede an enforceable writer policy.
+volume verification also use the ledger. Recovery geometry accounts for retained
+capacity. Native spool paths, execution input copies and final archive/volume
+collectors retain charges through their ownership transfers.
 `whole_member_workspace` adds four times the input size and a codec workspace
 estimate with reach and block size fitted to that input.
 
@@ -137,13 +138,19 @@ Direct output sinks may contain a prefix on failure. `Builder::write_to_path`
 publishes a single archive only after successful writing and syncing. Multiple
 volume files do not have a collective atomic-publication guarantee.
 
-## Limits and future accounting
+## Aggregate managed-memory policy
 
-An aggregate managed-memory ceiling still needs accounting for active workspace,
-retained payload capacity, headers/services, recovery scratch and output
-collectors, with explicit boundaries for caller buffers and disk. Renaming the
-current workspace limit would not supply that accounting.
-The planning model does not change native spool or bare-WASM retention lifetimes.
+`WriterResources::with_max_memory_bytes` combines active workspace and retained
+execution capacity under one enforceable ledger for RAR5/7. The existing
+estimated workspace limit stays separate. Native spool paths count as memory;
+file lengths use a separate storage quota. Bare-WASM spool payloads and indexes
+count toward managed memory. `WriterOutput` and `WriterVolumes` retain their
+charges until drop or handoff, including binding destination-copy admission.
+
+Caller inputs and sources, external sinks, allocator/runtime overhead and
+reader/rewrite staging are outside this execution policy. Legacy writers refuse
+a requested aggregate limit. See [WRITER_RESOURCE_CONTRACT.md](WRITER_RESOURCE_CONTRACT.md)
+for supported entry points, exclusions and failure behaviour.
 
 Planning changes must preserve output bytes and external-decoder compatibility,
 and compare compression ratio, CPU time and peak RAM for stored, independent,

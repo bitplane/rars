@@ -60,9 +60,9 @@ Failure may leave a prefix in a caller-provided output sink. The quota does not
 change publication guarantees. Empty-file counts and filesystem metadata are
 not bounded by a byte quota.
 
-These controls are available through Rust `WriterResources` entry points.
-CLI, Python and npm writer-resource options remain separate integration work;
-their default writer entry points do not acquire a spool limit automatically.
+These class-specific controls are available through Rust `WriterResources`
+entry points. CLI, Python and npm expose the aggregate memory policy below;
+they do not acquire a logical spool limit automatically.
 Rewrite staging and reader scratch created with their own resource policies
 remain outside this group.
 
@@ -276,9 +276,9 @@ parity buffers, I/O scratch and chunk headers. Bounded recovery owns its field
 tables until the pass ends, without initializing or borrowing the process-wide
 cache used by unlimited execution. Cancellation and I/O failures drop the pass's
 owners; external sinks and striped scratch can retain a written prefix.
-Production coordinator descriptors still use preparation accounting and spools
-retain their separate storage policy. Internal admitted scopes combine their
-capacity charges; logical spool storage remains independent.
+Coordinator descriptors retain preparation accounting and spools retain their
+separate storage policy. Admitted scopes also combine their capacity charges
+under the aggregate ledger; logical spool storage remains independent.
 Covered owners reserve before growth, include replacement peaks and retain
 charges through moves and token selection. Unlimited and bounded buffers use
 separate compile-time policies; the unlimited owner retains Vec's layout.
@@ -327,9 +327,8 @@ builder, allocator/reference-count headers, stacks, runtime objects, diagnostics
 OS allocations and process-global state are excluded. Fresh execution copies
 of builder data and metadata count. This is not a process-RSS guarantee.
 
-
-A memory ceiling must cover the sum of active workspace and retained execution
-allocations. Adding the current estimates together would not enforce it.
+The ceiling covers active workspace and retained execution allocations.
+Estimated workspace remains separate from actual capacity admission.
 
 | Storage class | Required accounting |
 | --- | --- |
@@ -346,11 +345,11 @@ before allocation; an allocation path without that accounting cannot silently
 run under the hard policy. A platform or execution mode that cannot enforce the
 requested policy must refuse it explicitly.
 
-Coordinator admission must reserve both a job's peak working allowance and its
+Coordinator admission reserves both a job's peak working allowance and its
 retained-result allowance before dispatch. Workers operate within that allowance.
-Unexpected growth requires coordinator approval; workers must not race for the
-last shared bytes and make progress dependent on scheduling order. A mutex or
-atomic total by itself is not this admission policy.
+Unexpected growth inside a fixed allowance refuses the job; workers cannot
+race for spare global bytes. There is no runtime allowance-extension API. A mutex
+or atomic total by itself is not this admission policy.
 
 When a job finishes, transfer the result's charge to its retained owner before
 releasing unused workspace. Copies remain separately charged until freed. On
@@ -358,34 +357,47 @@ failure, stop dispatching new jobs, join admitted jobs and release charges as
 their owners drop. Keep charging successful siblings whose output is still
 retained. Cancellation must not reset the ledger while work remains alive.
 
-A hard policy must refuse an individually oversized legacy job. The existing
+Legacy encoding refuses the hard policy before materialization. The existing
 oversized-member-runs-alone behaviour remains an explicitly estimated-workspace
 policy for calls without that hard limit. Neither policy may silently change
 archive version, dictionary, filters, encryption or preservation semantics.
 
-## Remaining implementation passes
+## Validation and performance
 
-Complete these as outcome-based passes, including implementation and validation.
-A pass is not complete merely because one buffer type has been converted.
-The existing per-class quotas are building blocks for the aggregate policy.
+Native unit and integration coverage exercises exact admission, replacement
+peaks, fixed worker scopes, sibling failures, cancellation, retained outputs,
+source-reader lifetimes, partial I/O and scratch cleanup. Public tests cover
+RAR5/7 stored, compressed, solid, filtered, encrypted and recovery output;
+archive/volume handoffs; refused adapter copies; legacy refusal; and preservation
+of an existing destination on quota failure. CLI, Python and real Node/WASM
+worker tests exercise the public controls and error translation.
 
-| Pass | Scope | Completion evidence |
-| --- | --- | --- |
-| 2. Workspace and coordinator admission | Enforceable codec/filter/encryption/recovery workspace and retained payload allowances, joined to coordinator admission. | Coordinator admission reserves peak workspace and retained-result allowances before dispatch. Workers have enforceable allowances and an extension policy. No race for shared spare bytes determines success. Oversized jobs, sibling failure, cancellation and retained results are tested. |
-| 3. Output ownership | Writer-owned archive/volume collectors, staging, transfers and copies. | Capacity remains charged until ownership transfers or storage is freed; copies and replacement peaks count simultaneously. Active and retained allocations compose under one managed-memory ledger. Caller-owned input and external sink exclusions are explicit. |
-| 4. Public integration and validation | High-level Rust, CLI, Python and npm controls, errors and documentation. | One coherent hard-policy contract across entry points, with explicit refusal of unsupported modes; byte compatibility, ratio, CPU and peak-memory checks cover the writer matrix. Existing estimated-workspace behaviour remains available separately. |
+The following native release measurements compare the pre-public-policy commit
+`af36a96`, the new unlimited path, and a 512 MiB aggregate policy. Each cell is
+elapsed seconds / peak process RSS in MiB, measured with four workers. Inputs
+are 4096 stored members of 256 bytes or 16 numeric members of 128 KiB; the pricing
+case uses one numeric member. Level 3 exercises automatic filter search; solid,
+header encryption and 10% recovery are separate variants. These are single-run
+observations on one development machine, not stable performance guarantees.
 
-The preparation policy and its inventory are defined above. Compression
-coordinator records belong in pass 2 because their capacity and lifetime depend
-on job admission. Avoid creating a public setting for every internal buffer class; consolidate the
-policy as the common accounting and ownership model becomes enforceable.
+| Case | Previous unlimited | Current unlimited | Aggregate enabled |
+| --- | --- | --- | --- |
+| Stored | 0.226 / 11.1 | 0.254 / 11.6 | 0.242 / 12.1 |
+| Compressed/filter search | 13.250 / 41.4 | 12.298 / 41.9 | 17.174 / 50.5 |
+| Solid | 0.087 / 23.1 | 0.084 / 23.4 | 0.092 / 23.4 |
+| Encrypted | 12.951 / 43.2 | 15.399 / 43.6 | 21.752 / 50.2 |
+| Recovery | 14.638 / 40.2 | 15.232 / 41.2 | 23.057 / 49.4 |
+| Candidate pricing | 2.603 / 13.1 | 2.441 / 13.0 | 3.615 / 14.8 |
 
-Reader resource accounting and reader API extensions remain separate follow-ups.
-The writer work is complete only when the covered active and retained allocation
-classes compose under the aggregate contract above, not when their independent
-limits merely exist.
+All unencrypted archives matched byte-for-byte across the three paths. Encrypted
+sizes matched; randomized salts prevent byte equality. Reference UnRAR verified
+all 18 archives. Compression ratios therefore remained unchanged in this matrix.
+Enforcing capacity has a cost: these allocation-heavy bounded cases took about
+40–51% longer than the current unlimited path and retained larger accounting
+owners. A generous ceiling is an admission constraint, not an instruction to
+minimize RSS. The unlimited path remains the default. Timing variation in the
+unlimited runs warrants repeated measurements before making a speed claim.
 
-For changes to planning or execution selection, check byte output, compression
-ratio, CPU and peak RAM across stored, compressed, solid, filtered, encrypted and
-recovery cases. Storage-ledger changes must additionally test exact limits,
-concurrency, retained ownership, partial I/O, cancellation and cleanup failures.
+Reader workspace accounting, reader API extensions and verified rewrite staging
+remain separate work. Neither the aggregate writer policy nor independent
+logical-output limits establish a reader memory ceiling.

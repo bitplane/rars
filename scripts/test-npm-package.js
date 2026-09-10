@@ -291,4 +291,20 @@ await check("bounded WASM encryption and recovery retain readable output", async
   }
 });
 
+await check("bounded WASM compressed solid and filtered output preserves bytes", async () => {
+  const numeric = new Uint8Array(32768 * 4);
+  const view = new DataView(numeric.buffer);
+  for (let n = 0; n < 32768; n++) view.setUint32(n * 4, (n * 71) % 32749, true);
+  for (const solid of [false, true]) {
+    const options = { format: "rar50", level: 3, solid };
+    const expected = await new RarWriter(options).add("member-0", numeric).bytes();
+    const actual = await new RarWriter({ ...options, maxMemoryBytes: 256 * 1024 * 1024 })
+      .add("member-0", numeric).bytes();
+    assert.deepEqual(actual, expected);
+    const archive = await RarArchive.open(actual);
+    assert.deepEqual(await archive.get("member-0").bytes(), numeric);
+    archive.close();
+  }
+});
+
 console.log(`\n${passed} checks passed`);
