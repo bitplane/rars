@@ -203,6 +203,9 @@ pub(crate) struct AddArgs {
     /// refuse the one it cannot honour.
     #[arg(long, value_name = "SIZE", value_parser = crate::parse_size_string)]
     pub memory_limit: Option<usize>,
+    /// Hard managed-allocation ceiling for RAR5/7, separate from estimated workspace
+    #[arg(long, value_name = "SIZE", value_parser = crate::parse_size_string)]
+    pub max_memory: Option<usize>,
     /// Directory for temporary compressed payloads (RAR 5+)
     #[arg(long, value_name = "PATH")]
     pub temp_dir: Option<std::path::PathBuf>,

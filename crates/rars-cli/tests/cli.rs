@@ -6073,3 +6073,45 @@ fn legacy_name_encoding_rejects_undefined_bytes_and_preserves_unicode() {
         }
     }
 }
+
+#[test]
+fn aggregate_memory_policy_refuses_without_replacing_output() {
+    let root = scratch("aggregate-memory");
+    fs::write(root.join("input"), vec![42; 8192]).unwrap();
+    fs::write(root.join("archive.rar"), b"original").unwrap();
+    for (format, limit, success) in [
+        ("rar50", "0", false),
+        ("rar29", "16m", false),
+        ("rar50", "16m", true),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_rars"))
+            .current_dir(&*root)
+            .args([
+                "a",
+                "archive.rar",
+                "input",
+                "--format",
+                format,
+                "--store",
+                "--max-memory",
+                limit,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if !success {
+            assert_eq!(fs::read(root.join("archive.rar")).unwrap(), b"original");
+            assert_eq!(fs::read_dir(&*root).unwrap().count(), 2);
+        } else {
+            rars::ArchiveReader::read(&fs::read(root.join("archive.rar")).unwrap())
+                .unwrap()
+                .test(None)
+                .unwrap();
+        }
+    }
+}

@@ -777,6 +777,26 @@ struct RarBuilder {
     inner: rars_rs::Builder,
     format: rars_rs::ArchiveVersion,
     rewrite: Option<RewriteInput>,
+    resources: rars_rs::WriterResources,
+}
+
+enum PythonVolumes {
+    Tracked(rars_rs::WriterVolumes),
+    Untracked(Vec<Vec<u8>>),
+}
+impl PythonVolumes {
+    fn len(&self) -> usize {
+        match self {
+            Self::Tracked(v) => v.volumes().len(),
+            Self::Untracked(v) => v.len(),
+        }
+    }
+    fn part(&self, index: usize) -> &[u8] {
+        match self {
+            Self::Tracked(v) => v.volumes()[index].as_bytes(),
+            Self::Untracked(v) => &v[index],
+        }
+    }
 }
 
 /// Original identity follows edits; verified payload sources belong to one write.
@@ -911,7 +931,8 @@ impl RarBuilder {
         comment = None,
         recovery_percent = None,
         volume_size = None,
-        filters = None
+        filters = None,
+        max_memory_bytes = None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -925,6 +946,7 @@ impl RarBuilder {
         recovery_percent: Option<u64>,
         volume_size: Option<usize>,
         filters: Option<&Bound<'_, PyAny>>,
+        max_memory_bytes: Option<u64>,
     ) -> PyResult<Self> {
         if filters.is_some() {
             return Err(PyNotImplementedError::new_err(
@@ -944,6 +966,9 @@ impl RarBuilder {
                 .volume_size(volume_size),
             format,
             rewrite: None,
+            resources: max_memory_bytes.map_or_else(rars_rs::WriterResources::default, |limit| {
+                rars_rs::WriterResources::default().with_max_memory_bytes(limit)
+            }),
         })
     }
 
@@ -1011,6 +1036,7 @@ impl RarBuilder {
                 .comment(archive.comment(py)?)
                 .allow_duplicate_names(true),
             format,
+            resources: rars_rs::WriterResources::default(),
             rewrite: Some(RewriteInput {
                 archive: archive.archive.clone(),
                 password: password.clone(),
@@ -1341,14 +1367,27 @@ impl RarBuilder {
         py: Python<'_>,
         progress: Option<&Bound<'_, PyAny>>,
         cancellation: Option<&CancellationToken>,
-    ) -> PyResult<Vec<u8>> {
-        self.detached(
+    ) -> PyResult<Py<PyBytes>> {
+        if self.resources.max_memory_bytes().is_none() {
+            let bytes = self.detached(
+                py,
+                progress,
+                cancellation,
+                Path::new("."),
+                |builder, progress| builder.to_bytes_with_progress(progress),
+            )?;
+            return Ok(PyBytes::new(py, &bytes).unbind());
+        }
+        let output = self.detached(
             py,
             progress,
             cancellation,
             Path::new("."),
-            |builder, progress| builder.to_bytes_with_progress(progress),
-        )
+            |builder, progress| builder.to_output(&self.resources, progress),
+        )?;
+        output
+            .copy_with(|bytes| PyBytes::new(py, bytes).unbind())
+            .map_err(map_error)
     }
 
     #[pyo3(signature = (path, *, progress = None, cancellation = None))]
@@ -1366,7 +1405,13 @@ impl RarBuilder {
             progress,
             cancellation,
             directory,
-            |builder, progress| builder.write_to_path(&path, progress),
+            |builder, progress| {
+                builder.write_to_path_with_resources(
+                    &path,
+                    &self.resources.clone().with_temp_dir(directory),
+                    progress,
+                )
+            },
         )
     }
 
@@ -1384,11 +1429,28 @@ impl RarBuilder {
             progress,
             cancellation,
             output_directory(&first_path),
-            |builder, progress| builder.build_volumes(progress),
+            |builder, progress| {
+                if self.resources.max_memory_bytes().is_some() {
+                    builder
+                        .to_volume_output(
+                            &self
+                                .resources
+                                .clone()
+                                .with_temp_dir(output_directory(&first_path)),
+                            progress,
+                        )
+                        .map(PythonVolumes::Tracked)
+                } else {
+                    builder
+                        .build_volumes(progress)
+                        .map(PythonVolumes::Untracked)
+                }
+            },
         )?;
         py.detach(|| {
             let mut paths = Vec::with_capacity(parts.len());
-            for (index, part) in parts.iter().enumerate() {
+            for index in 0..parts.len() {
+                let part = parts.part(index);
                 if cancellation.is_some_and(CancellationToken::is_cancelled) {
                     return Err(map_error(rars_rs::Error::Cancelled));
                 }
@@ -1443,7 +1505,11 @@ impl RarBuilder {
             + Send,
     {
         let progress = python_progress(callback, cancellation)?;
-        let mut builder = self.inner.clone();
+        if self.rewrite.is_some() && self.resources.max_memory_bytes().is_some() {
+            return Err(UnsupportedRarFeature::new_err(
+                "aggregate writer memory limits are not supported for rewrite staging",
+            ));
+        }
         let rewrite = self.rewrite.clone();
         let worker = progress.clone();
         let result = py.detach(move || {
@@ -1456,9 +1522,10 @@ impl RarBuilder {
                 )
             };
             if let Some(rewrite) = rewrite {
+                let mut builder = self.inner.clone();
                 rewrite.prepare(&mut builder, directory, worker.clone(), consume)
             } else {
-                consume(&builder)
+                consume(&self.inner)
             }
         });
         if let Some(error) = progress.as_ref().and_then(|progress| progress.take_error()) {
@@ -2501,7 +2568,9 @@ mod tests {
                     for _ in 0..2 {
                         let output = builder.to_bytes(py, None, None).unwrap();
                         assert_eq!(bytes.swap(0, Ordering::Relaxed), one_pass, "{format}");
-                        let output = rars_rs::ArchiveReader::read_owned(output).unwrap();
+                        let output =
+                            rars_rs::ArchiveReader::read_owned(output.bind(py).as_bytes().to_vec())
+                                .unwrap();
                         assert_eq!(
                             output.read_member(b"final", None).unwrap().unwrap(),
                             b"final".repeat(100)

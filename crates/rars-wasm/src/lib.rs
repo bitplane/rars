@@ -118,6 +118,13 @@ fn js_error(error: rars_rs::Error) -> JsValue {
         set_error_field(&details, "contexts", &contexts);
     }
     match cause {
+        rars_rs::Error::Codec(rars_rs::codec::Error::WorkspaceLimitExceeded(detail)) => {
+            for (name, value) in
+                total_output_error_details(detail.limit, detail.required, detail.used)
+            {
+                set_error_field(&details, name, &value.into());
+            }
+        }
         rars_rs::Error::MemoryLimitExceeded {
             limit,
             required,
@@ -575,6 +582,8 @@ export interface RarBuilderOptions {
   recoveryPercent?: number;
   /** Split into volumes of at most this many bytes; use `toVolumes()`. */
   volumeSize?: number;
+  /** Hard managed writer capacity, excluding inputs and runtime/allocator overhead. */
+  maxMemoryBytes?: number | bigint;
 }
 
 export interface RarEntryOptions {
@@ -601,6 +610,7 @@ extern "C" {
 #[wasm_bindgen]
 pub struct RarBuilder {
     inner: Builder,
+    resources: rars_rs::WriterResources,
 }
 
 #[wasm_bindgen]
@@ -620,7 +630,12 @@ impl RarBuilder {
         let compression = opt_number(&options, "compression")?
             .map(|level| level as u8)
             .unwrap_or(3);
+        let mut resources = rars_rs::WriterResources::default();
+        if let Some(limit) = read_limit(&options, "maxMemoryBytes")? {
+            resources = resources.with_max_memory_bytes(limit);
+        }
         Ok(Self {
+            resources,
             inner: Builder::new(format)
                 .compression_level(Some(compression))
                 .store(opt_bool(&options, "store")?)
@@ -713,19 +728,49 @@ impl RarBuilder {
     /// seconds of work with no yielding. Call it from a worker if the page has
     /// to stay responsive.
     #[wasm_bindgen(js_name = toBytes)]
-    pub fn to_bytes(&self) -> Result<Vec<u8>, JsValue> {
-        self.inner.to_bytes().map_err(js_error)
+    pub fn to_bytes(&self) -> Result<js_sys::Uint8Array, JsValue> {
+        if self.resources.max_memory_bytes().is_none()
+            && self.inner.format().family() != rars_rs::ArchiveFamily::Rar50Plus
+        {
+            let bytes = self.inner.to_bytes().map_err(js_error)?;
+            return Ok(js_sys::Uint8Array::from(bytes.as_slice()));
+        }
+        let output = self
+            .inner
+            .to_output(&self.resources, None)
+            .map_err(js_error)?;
+        output
+            .copy_with(|bytes| js_sys::Uint8Array::from(bytes))
+            .map_err(js_error)
     }
 
     /// Encode the archive as a volume set, one `Uint8Array` per volume.
     /// Requires `volumeSize`.
     #[wasm_bindgen(js_name = toVolumes, unchecked_return_type = "Uint8Array[]")]
     pub fn to_volumes(&self) -> Result<js_sys::Array, JsValue> {
-        let volumes = self.inner.build_volumes(None).map_err(js_error)?;
-        Ok(volumes
-            .iter()
-            .map(|volume| js_sys::Uint8Array::from(volume.as_slice()))
-            .collect())
+        if self.resources.max_memory_bytes().is_none()
+            && self.inner.format().family() != rars_rs::ArchiveFamily::Rar50Plus
+        {
+            return Ok(self
+                .inner
+                .build_volumes(None)
+                .map_err(js_error)?
+                .iter()
+                .map(|volume| js_sys::Uint8Array::from(volume.as_slice()))
+                .collect());
+        }
+        let volumes = self
+            .inner
+            .to_volume_output(&self.resources, None)
+            .map_err(js_error)?;
+        volumes
+            .copy_with(|volumes| {
+                volumes
+                    .iter()
+                    .map(|volume| js_sys::Uint8Array::from(volume.as_bytes()))
+                    .collect()
+            })
+            .map_err(js_error)
     }
 }
 

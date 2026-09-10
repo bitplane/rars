@@ -53,6 +53,8 @@ export interface RarWriterOptions {
   encryptHeaders?: boolean;
   comment?: string | Uint8Array;
   recoveryPercent?: number;
+  /** Hard RAR5/7 managed writer capacity; caller inputs and runtime overhead are excluded. */
+  maxMemoryBytes?: number | bigint;
 }
 
 export interface RarEntryOptions {

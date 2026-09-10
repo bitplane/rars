@@ -249,4 +249,46 @@ await check("legacy filename views preserve bytes and Unicode names", async () =
   assert.equal((await archive.get("café.txt").bytes()).length, 180000);
 });
 
+
+await check("aggregate writer memory policy crosses the worker boundary", async () => {
+  for (const format of ["rar50", "rar70"]) {
+    const expected = await new RarWriter({ format, level: 0 }).add("member", HELLO).bytes();
+    const writer = new RarWriter({ format, level: 0, maxMemoryBytes: 16n << 20n }).add("member", HELLO);
+    assert.deepEqual(await writer.bytes(), expected);
+    assert.deepEqual(await writer.bytes(), expected);
+    const denied = new RarWriter({ format, level: 0, maxMemoryBytes: 0 }).add("member", HELLO);
+    for (let i = 0; i < 2; i++) {
+      await assert.rejects(denied.bytes(), (error) => {
+        assert.equal(error.code, "RESOURCE_LIMIT");
+        assert.equal(error.details.limitBytes, "0");
+        assert.ok(BigInt(error.details.requiredBytes) > 0n);
+        return true;
+      });
+    }
+    const volumes = await writer.volumes(512);
+    assert.ok(volumes.length > 1);
+  }
+  for (const format of ["rar13", "rar14", "rar15", "rar20", "rar29", "rar30", "rar40"]) {
+    await assert.rejects(new RarWriter({ format, level: 0, maxMemoryBytes: 0 })
+      .add("member", HELLO).bytes(), (error) => error.code === "UNSUPPORTED_FEATURE");
+  }
+});
+
+await check("bounded WASM encryption and recovery retain readable output", async () => {
+  for (const encryptHeaders of [false, true]) {
+    const writer = new RarWriter({ format: "rar50", level: 0, password: "secret",
+      encryptHeaders, recoveryPercent: 10, maxMemoryBytes: 32 * 1024 * 1024 })
+      .add("member", HELLO);
+    const bytes = await writer.bytes();
+    const archive = await RarArchive.open(bytes, { password: "secret" });
+    assert.deepEqual(await archive.get("member").bytes(), HELLO);
+    archive.close();
+    const volumes = await writer.volumes(512);
+    assert.ok(volumes.length > 1);
+    const set = await RarArchive.open(volumes, { password: "secret" });
+    assert.deepEqual(await set.get("member").bytes(), HELLO);
+    set.close();
+  }
+});
+
 console.log(`\n${passed} checks passed`);

@@ -111,6 +111,7 @@ async function build(wasm, payload, platform, volumes) {
     encryptHeaders: options.encryptHeaders,
     comment: options.comment,
     recoveryPercent: options.recoveryPercent,
+    maxMemoryBytes: options.maxMemoryBytes,
     volumeSize: volumes ? payload.size : undefined,
   });
   try {

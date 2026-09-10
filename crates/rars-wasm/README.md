@@ -110,6 +110,15 @@ a fresh worker. This is worker termination, so it does not run cooperative Rust
 cleanup or undo completed filesystem writes. Interrupted Node writes may leave
 staged temporary files. No separate cancellation-token object is needed in JS.
 
+`RarWriter` accepts `maxMemoryBytes` as a nonnegative safe integer or a `bigint`
+through `2n ** 64n - 1n`. It caps managed RAR5/7 execution allocation capacity,
+including retained WASM spools, archive/volume output and the final JavaScript
+payload copy. The default is unlimited; zero admits no managed allocation.
+A refusal has code `RESOURCE_LIMIT`; legacy formats reject the requested policy
+with `UNSUPPORTED_FEATURE`. Caller inputs, returned caller-owned bytes, JavaScript
+runtime objects, allocator overhead, stacks and OS memory are excluded. This is
+not a process-memory ceiling and does not bound reading or rewrite staging.
+
 ## Loading
 
 ES modules, Node `require`, Vite, webpack, Rollup and direct browser imports use

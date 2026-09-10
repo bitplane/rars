@@ -69,6 +69,16 @@ preservation semantics.
 For writer execution modes, workspace estimates and retained storage, see
 [WRITER_EXECUTION.md](WRITER_EXECUTION.md).
 
+RAR5/7 writers accept an optional aggregate managed-memory ceiling: Rust
+`WriterResources::with_max_memory_bytes`, CLI `rars a --max-memory 256m`,
+Python `RarBuilder(max_memory_bytes=256 << 20)`, and npm
+`new RarWriter({ maxMemoryBytes: 256 * 1024 * 1024 })`.
+The default is unlimited. This counts writer execution allocations and retained
+output, including binding copy peaks; caller inputs, sinks, runtime and allocator
+overhead are excluded. Legacy writers refuse the policy. Reader and rewrite
+staging limits are separate. See [the resource contract](WRITER_RESOURCE_CONTRACT.md)
+for ownership boundaries and the separate estimated-workspace policy.
+
 ## Bindings
 
 Python bindings are published to [pypi](https://pypi.org/project/rars/), so you

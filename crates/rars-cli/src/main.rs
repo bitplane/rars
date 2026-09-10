@@ -1028,6 +1028,7 @@ struct AddCommand {
     compression_level: Option<u8>,
     dictionary_size: Option<usize>,
     memory_limit: Option<usize>,
+    max_memory: Option<usize>,
     temp_dir: Option<PathBuf>,
     solid: bool,
     header_encryption: bool,
@@ -1087,6 +1088,7 @@ fn build_add_command(args: AddArgs) -> CliResult<AddCommand> {
         compression_level,
         dictionary_size: args.dict_size,
         memory_limit: args.memory_limit,
+        max_memory: args.max_memory,
         temp_dir: args.temp_dir,
         solid: args.solid,
         header_encryption: args.encrypt_headers,
@@ -1118,6 +1120,7 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
         compression_level,
         dictionary_size,
         memory_limit,
+        max_memory,
         temp_dir,
         solid,
         header_encryption,
@@ -1139,6 +1142,11 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
         archive_path,
         input_paths,
     } = build_add_command(args)?;
+    if max_memory.is_some() && target.family() != rars::ArchiveFamily::Rar50Plus {
+        return Err(CliError::usage(
+            "--max-memory is supported only for RAR5/7 writers",
+        ));
+    }
     let input_paths = input_paths.as_slice();
     let compress = !store;
 
@@ -1238,6 +1246,7 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
             if store { Some(0) } else { compression_level },
             dictionary_size,
             memory_limit,
+            max_memory,
             temp_dir.as_deref(),
             password_bytes(&password),
             solid,
@@ -1597,6 +1606,7 @@ fn write_plain_rar50_streaming(
     compression_level: Option<u8>,
     dictionary_size: Option<usize>,
     memory_limit: Option<usize>,
+    max_memory: Option<usize>,
     temp_dir: Option<&Path>,
     password: Option<&[u8]>,
     solid: bool,
@@ -1665,6 +1675,9 @@ fn write_plain_rar50_streaming(
     let mut resources = rars::WriterResources::new(
         memory_limit.map_or(rars::DEFAULT_WRITER_MEMORY_LIMIT, |limit| limit as u64),
     );
+    if let Some(limit) = max_memory {
+        resources = resources.with_max_memory_bytes(limit as u64);
+    }
     if let Some(directory) = temp_dir.or(default_temp) {
         resources = resources.with_temp_dir(directory);
     }
