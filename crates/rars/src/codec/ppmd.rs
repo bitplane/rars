@@ -1531,6 +1531,13 @@ impl PpmdEncoder {
         Ok((self.range.finish(), self.model))
     }
 
+    #[cfg(test)]
+    pub(crate) fn finish_with_command(mut self, command: u8) -> Result<Vec<u8>> {
+        self.model.encode_symbol(self.esc_char, &mut self.range)?;
+        self.model.encode_symbol(command, &mut self.range)?;
+        Ok(self.range.finish())
+    }
+
     pub fn encode_literal(&mut self, symbol: u8) -> Result<()> {
         self.model.encode_symbol(symbol, &mut self.range)?;
         if symbol == self.esc_char {

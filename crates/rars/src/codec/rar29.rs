@@ -2344,6 +2344,10 @@ enum LzBlockEnd {
     NewFileNewTables,
 }
 
+fn require_ppmd_symbol(symbol: Option<u8>) -> Result<u8> {
+    symbol.ok_or(Error::InvalidData("RAR 2.9 PPMd model is corrupt"))
+}
+
 #[derive(Debug, Clone)]
 struct VmFilter {
     program: usize,
@@ -2740,25 +2744,19 @@ impl Unpack29 {
         let mut poller = self.read_control.poller();
         while self.current_pos() < output_size {
             poller.check_codec(self.current_pos())?;
-            let symbol = self
-                .ppmd
-                .decode_symbol(&mut self.bits)?
-                .ok_or(Error::InvalidData("RAR 2.9 PPMd model is corrupt"))?;
+            let symbol = require_ppmd_symbol(self.ppmd.decode_symbol(&mut self.bits)?)?;
             if symbol != self.ppmd_esc {
                 self.output.push(symbol);
                 continue;
             }
 
-            let next = self
-                .ppmd
-                .decode_symbol(&mut self.bits)?
-                .ok_or(Error::InvalidData("RAR 2.9 PPMd model is corrupt"))?;
+            let next = require_ppmd_symbol(self.ppmd.decode_symbol(&mut self.bits)?)?;
             match next {
                 0 => {
                     self.in_lz_block = false;
                     return Ok(());
                 }
-                1 | 6..=u8::MAX => self.output.push(self.ppmd_esc),
+                1 => self.output.push(self.ppmd_esc),
                 2 => {
                     return Err(Error::InvalidData(
                         "RAR 2.9 member ended before its declared size",
@@ -2780,6 +2778,9 @@ impl Unpack29 {
                     let length = self.read_ppmd_required_byte()? as usize + 4;
                     self.copy_match(length, 1, output_size)?;
                 }
+                6..=u8::MAX => {
+                    return Err(Error::InvalidData("RAR 2.9 PPMd command is invalid"));
+                }
             }
         }
         Ok(())
@@ -2795,17 +2796,11 @@ impl Unpack29 {
         if self.block_mode != BlockMode::Ppmd {
             return Ok(false);
         }
-        let symbol = self
-            .ppmd
-            .decode_symbol(&mut self.bits)?
-            .ok_or(Error::InvalidData("RAR 2.9 PPMd model is corrupt"))?;
+        let symbol = require_ppmd_symbol(self.ppmd.decode_symbol(&mut self.bits)?)?;
         if symbol != self.ppmd_esc {
             return Err(Error::InvalidData("RAR 2.9 PPMd member has trailing data"));
         }
-        let next = self
-            .ppmd
-            .decode_symbol(&mut self.bits)?
-            .ok_or(Error::InvalidData("RAR 2.9 PPMd model is corrupt"))?;
+        let next = require_ppmd_symbol(self.ppmd.decode_symbol(&mut self.bits)?)?;
         match next {
             2 => {
                 self.in_lz_block = false;
@@ -4704,6 +4699,38 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         assert!(matches!(
             unpack29_decode(&packed, input.len()),
             Err(Error::InvalidData("RAR 2.9 bitstream is truncated"))
+        ));
+    }
+
+    #[test]
+    fn ppmd_model_exhaustion_is_corruption() {
+        assert!(matches!(
+            super::require_ppmd_symbol(None),
+            Err(Error::InvalidData("RAR 2.9 PPMd model is corrupt"))
+        ));
+    }
+
+    #[test]
+    fn rejects_a_reserved_ppmd_command() {
+        let input = b"PPMd stream followed by a reserved command";
+        let mut packed = vec![
+            0x80 | 0x20 | ((PPMD_ORDER as u8) - 1),
+            PPMD_DICTIONARY_MB - 1,
+        ];
+        let mut encoder =
+            PpmdEncoder::new(PPMD_ORDER, PPMD_ESC, usize::from(PPMD_DICTIONARY_MB)).unwrap();
+        for &byte in input {
+            encoder.encode_literal(byte).unwrap();
+        }
+        packed.extend_from_slice(&encoder.finish_with_command(6).unwrap());
+
+        assert!(matches!(
+            unpack29_decode(&packed, input.len()),
+            Err(Error::InvalidData("RAR 2.9 PPMd member has trailing data"))
+        ));
+        assert!(matches!(
+            unpack29_decode(&packed, input.len() + 1),
+            Err(Error::InvalidData("RAR 2.9 PPMd command is invalid"))
         ));
     }
 
