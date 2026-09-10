@@ -2329,8 +2329,6 @@ pub struct Unpack29 {
     base_offset: usize,
     output: Vec<u8>,
     stale_terminator: bool,
-    /// Set when a block claimed the member was over and the member was not.
-    member_ended_early: bool,
     last_block_end: Option<LzBlockEnd>,
 }
 
@@ -2406,7 +2404,6 @@ impl Unpack29 {
             base_offset: 0,
             output: Vec::new(),
             stale_terminator: false,
-            member_ended_early: false,
             last_block_end: None,
         }
     }
@@ -2488,6 +2485,10 @@ impl Unpack29 {
     ) -> Result<()> {
         self.read_control.check_codec()?;
         self.bits = BitReader::from_bytes(packed);
+        // `last_block_end` describes control flow within one member. A solid
+        // follower legitimately starts after the previous member's new-file
+        // marker, so do not mistake that marker for an early end in this one.
+        self.last_block_end = None;
         let start = self.current_pos();
         let final_target = start
             .checked_add(output_size)
@@ -2553,15 +2554,13 @@ impl Unpack29 {
                 break;
             }
             if !self.in_lz_block {
-                // A block that said "new file" while the member still owes
-                // output is an encoder bug, not a format feature. Reading its
-                // tables anyway is the tolerance that let rars ship members
-                // split across blocks that unrar refused.
                 if matches!(
                     self.last_block_end,
                     Some(LzBlockEnd::NewFileKeepTables | LzBlockEnd::NewFileNewTables)
                 ) {
-                    self.member_ended_early = true;
+                    return Err(Error::InvalidData(
+                        "RAR 2.9 member ended before its declared size",
+                    ));
                 }
                 self.read_tables()?;
                 self.in_lz_block = true;
@@ -4294,11 +4293,7 @@ RAR 2.9 terminator check\n";
     }
 
     /// A member split across LZ blocks marks every block but the last as having
-    /// another table after it. Getting that wrong on the intermediate blocks
-    /// tells a reader the member finished early, and unrar and 7-Zip both throw
-    /// the archive out. Our own reader reads the next block's tables regardless,
-    /// so a round trip proves nothing and the tolerance has to be watched
-    /// instead.
+    /// another table after it.
     #[test]
     fn every_block_but_the_last_says_another_table_follows() {
         let input = b"rar29 multi block terminator check with repeated filler text\n".repeat(400);
@@ -4309,12 +4304,43 @@ RAR 2.9 terminator check\n";
         )
         .unwrap();
 
-        let mut decoder = Unpack29::new();
-        assert_eq!(decoder.decode_member(&packed, input.len()).unwrap(), input);
-        assert!(
-            !decoder.member_ended_early,
-            "a block in the middle of the member said the member was over"
+        assert_eq!(unpack29_decode(&packed, input.len()).unwrap(), input);
+    }
+
+    #[test]
+    fn rejects_a_new_file_marker_before_the_declared_member_size() {
+        let first = b"first block ends too soon\n".repeat(64);
+        let second = b"second block must not be decoded as the same member\n".repeat(64);
+        let mut levels = [0; TABLE_COUNT];
+        let mut packed = super::encode_member_inner(
+            &first,
+            &[],
+            &[],
+            EncodeOptions::new(96),
+            false,
+            &mut levels,
+            None,
+        )
+        .unwrap();
+        packed.extend_from_slice(
+            &super::encode_member_inner(
+                &second,
+                &first,
+                &[],
+                EncodeOptions::new(96),
+                false,
+                &mut levels,
+                None,
+            )
+            .unwrap(),
         );
+
+        assert!(matches!(
+            unpack29_decode(&packed, first.len() + second.len()),
+            Err(Error::InvalidData(
+                "RAR 2.9 member ended before its declared size"
+            ))
+        ));
     }
 
     #[test]
