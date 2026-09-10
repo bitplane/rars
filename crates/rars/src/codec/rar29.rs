@@ -2448,25 +2448,8 @@ impl Unpack29 {
     }
 
     pub fn decode_member(&mut self, input: &[u8], output_size: usize) -> Result<Vec<u8>> {
-        self.read_control.check_codec()?;
-        let start = self.current_pos();
-        let target = start
-            .checked_add(output_size)
-            .ok_or(Error::InvalidData("RAR 2.9 output size overflows"))?;
-        if !input.is_empty() {
-            self.bits = BitReader::new();
-        }
-        self.bits.append(input);
-        self.decode_until(target).map_err(|error| match error {
-            Error::NeedMoreInput => Error::InvalidData("RAR 2.9 bitstream is truncated"),
-            error => error,
-        })?;
-        self.finish_member().map_err(|error| match error {
-            Error::NeedMoreInput => Error::InvalidData("RAR 2.9 bitstream is truncated"),
-            error => error,
-        })?;
-        let out = self.filtered_range(start, target, start)?;
-        self.trim_history(target, target);
+        let mut out = Vec::new();
+        self.decode_member_to(input, output_size, &mut out)?;
         Ok(out)
     }
 
@@ -2476,46 +2459,7 @@ impl Unpack29 {
         output_size: usize,
         out: &mut impl Write,
     ) -> Result<()> {
-        self.read_control.check_codec()?;
-        let start = self.current_pos();
-        let final_target = start
-            .checked_add(output_size)
-            .ok_or(Error::InvalidData("RAR 2.9 output size overflows"))?;
-        if !input.is_empty() {
-            self.bits = BitReader::new();
-        }
-        self.bits.append(input);
-
-        let mut flushed = start;
-        let mut target = start.saturating_add(STREAM_CHUNK).min(final_target);
-        while flushed < final_target {
-            self.decode_until(target)?;
-            let safe_end = self.safe_flush_end(flushed, target, final_target)?;
-            if safe_end <= flushed {
-                if target == final_target {
-                    return Err(Error::InvalidData(
-                        "RAR 2.9 VM filter extends beyond output",
-                    ));
-                }
-                target = self
-                    .current_pos()
-                    .saturating_add(STREAM_CHUNK)
-                    .min(final_target);
-                continue;
-            }
-
-            let decoded = self.filtered_range(flushed, safe_end, start)?;
-            out.write_all(&decoded)
-                .map_err(|_| Error::InvalidData("RAR 2.9 output write failed"))?;
-            flushed = safe_end;
-            self.trim_history(flushed, self.current_pos());
-            target = self
-                .current_pos()
-                .saturating_add(STREAM_CHUNK)
-                .min(final_target);
-        }
-        self.finish_member()?;
-        Ok(())
+        self.decode_loaded_member_to(input, output_size, out)
     }
 
     pub fn decode_member_from_reader(
@@ -2527,18 +2471,29 @@ impl Unpack29 {
         self.read_control.check_codec()?;
         let control = self.read_control.clone();
         let input = &mut control.reader(input);
-        self.bits = BitReader::new();
+        let mut packed = Vec::new();
+        input
+            .read_to_end(&mut packed)
+            .map_err(|_| Error::InvalidData("RAR 2.9 input read failed"))?;
+        self.decode_loaded_member_to(&packed, output_size, out)
+    }
+
+    /// Decodes one complete packed member while retaining solid dictionary,
+    /// table, PPMd and VM state for the next member.
+    fn decode_loaded_member_to(
+        &mut self,
+        packed: &[u8],
+        output_size: usize,
+        out: &mut impl Write,
+    ) -> Result<()> {
+        self.read_control.check_codec()?;
+        self.bits = BitReader::from_bytes(packed);
         let start = self.current_pos();
         let final_target = start
             .checked_add(output_size)
             .ok_or(Error::InvalidData("RAR 2.9 output size overflows"))?;
         let mut flushed = start;
         let mut target = start.saturating_add(STREAM_CHUNK).min(final_target);
-        let mut packed = Vec::new();
-        input
-            .read_to_end(&mut packed)
-            .map_err(|_| Error::InvalidData("RAR 2.9 input read failed"))?;
-        self.bits.append(&packed);
         // Empty members in solid mode still carry their own block init bytes
         // (typically the (esc, 0) end-of-block marker + 4-byte range coder
         // flush). When output_size is zero, decode_until skips its loop body
@@ -3429,11 +3384,13 @@ impl BitReader {
         }
     }
 
+    #[cfg(test)]
     fn append(&mut self, input: &[u8]) {
         self.compact();
         self.input.extend_from_slice(input);
     }
 
+    #[cfg(test)]
     fn compact(&mut self) {
         let bytes = self.bit_pos / 8;
         if bytes == 0 {
@@ -5210,6 +5167,111 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
             .unwrap();
 
         assert_eq!(output, expected_text());
+    }
+
+    #[test]
+    fn member_output_entry_points_share_one_decode_contract() {
+        let expected = expected_text();
+
+        let mut decoder = Unpack29::new();
+        let returned = decoder
+            .decode_member(COMPRESSED_TEXT, expected.len())
+            .unwrap();
+
+        let mut decoder = Unpack29::new();
+        let mut written = Vec::new();
+        decoder
+            .decode_member_to(COMPRESSED_TEXT, expected.len(), &mut written)
+            .unwrap();
+
+        let mut decoder = Unpack29::new();
+        let mut reader = COMPRESSED_TEXT;
+        let mut read_then_written = Vec::new();
+        decoder
+            .decode_member_from_reader(&mut reader, expected.len(), &mut read_then_written)
+            .unwrap();
+
+        assert_eq!(returned, expected);
+        assert_eq!(written, expected);
+        assert_eq!(read_then_written, expected);
+    }
+
+    #[test]
+    fn member_output_entry_points_report_the_same_truncation() {
+        let truncated = &COMPRESSED_TEXT[..COMPRESSED_TEXT.len() / 2];
+        let expected = Error::InvalidData("RAR 2.9 bitstream is truncated");
+
+        let returned = Unpack29::new().decode_member(truncated, 2400).unwrap_err();
+
+        let mut decoder = Unpack29::new();
+        let mut written = Vec::new();
+        let write_error = decoder
+            .decode_member_to(truncated, 2400, &mut written)
+            .unwrap_err();
+
+        let mut decoder = Unpack29::new();
+        let mut reader = truncated;
+        let mut read_then_written = Vec::new();
+        let reader_error = decoder
+            .decode_member_from_reader(&mut reader, 2400, &mut read_then_written)
+            .unwrap_err();
+
+        assert_eq!(returned, expected);
+        assert_eq!(write_error, expected);
+        assert_eq!(reader_error, expected);
+    }
+
+    #[test]
+    fn member_output_entry_points_share_empty_member_handling() {
+        let packed = unpack29_encode_literals(b"").unwrap();
+
+        assert!(Unpack29::new()
+            .decode_member(&packed, 0)
+            .unwrap()
+            .is_empty());
+
+        let mut decoder = Unpack29::new();
+        let mut written = Vec::new();
+        decoder.decode_member_to(&packed, 0, &mut written).unwrap();
+        assert!(written.is_empty());
+
+        let mut decoder = Unpack29::new();
+        let mut reader = packed.as_slice();
+        decoder
+            .decode_member_from_reader(&mut reader, 0, &mut written)
+            .unwrap();
+        assert!(written.is_empty());
+    }
+
+    #[test]
+    fn slice_and_reader_entry_points_share_output_failures() {
+        struct FailingWriter;
+        impl std::io::Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("deliberate failure"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let expected = Error::InvalidData("RAR 2.9 output write failed");
+        let mut decoder = Unpack29::new();
+        assert_eq!(
+            decoder
+                .decode_member_to(COMPRESSED_TEXT, 2400, &mut FailingWriter)
+                .unwrap_err(),
+            expected
+        );
+
+        let mut decoder = Unpack29::new();
+        let mut reader = COMPRESSED_TEXT;
+        assert_eq!(
+            decoder
+                .decode_member_from_reader(&mut reader, 2400, &mut FailingWriter)
+                .unwrap_err(),
+            expected
+        );
     }
 
     #[test]
