@@ -6041,7 +6041,7 @@ fn extracts_rar300_ppmd_text_file() {
 }
 
 #[test]
-fn extracts_rar300_ppmd_escape_literal_file() {
+fn extracts_rar300_mct_escape_input_that_selected_lz() {
     let bytes = std::fs::read(fixture("ppmd/ppmd_escape_rar300.rar")).unwrap();
     let expected = std::fs::read(fixture("ppmd/escape_64k.bin")).unwrap();
     let archive = Archive::parse(&bytes).unwrap();

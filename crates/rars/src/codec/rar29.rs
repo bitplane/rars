@@ -2735,17 +2735,19 @@ impl Unpack29 {
         let mut poller = self.read_control.poller();
         while self.current_pos() < output_size {
             poller.check_codec(self.current_pos())?;
-            let Some(symbol) = self.ppmd.decode_symbol(&mut self.bits)? else {
-                return Ok(());
-            };
+            let symbol = self
+                .ppmd
+                .decode_symbol(&mut self.bits)?
+                .ok_or(Error::InvalidData("RAR 2.9 PPMd model is corrupt"))?;
             if symbol != self.ppmd_esc {
                 self.output.push(symbol);
                 continue;
             }
 
-            let Some(next) = self.ppmd.decode_symbol(&mut self.bits)? else {
-                return Ok(());
-            };
+            let next = self
+                .ppmd
+                .decode_symbol(&mut self.bits)?
+                .ok_or(Error::InvalidData("RAR 2.9 PPMd model is corrupt"))?;
             match next {
                 0 => {
                     self.in_lz_block = false;
@@ -2753,8 +2755,9 @@ impl Unpack29 {
                 }
                 1 | 6..=u8::MAX => self.output.push(self.ppmd_esc),
                 2 => {
-                    self.in_lz_block = false;
-                    return Ok(());
+                    return Err(Error::InvalidData(
+                        "RAR 2.9 member ended before its declared size",
+                    ));
                 }
                 3 => {
                     self.read_vm_code_ppmd()?;
@@ -2783,55 +2786,63 @@ impl Unpack29 {
             .ok_or(Error::InvalidData("RAR 2.9 PPMd stream ended early"))
     }
 
-    fn finish_ppmd_member(&mut self) -> Result<()> {
+    fn finish_ppmd_member(&mut self) -> Result<bool> {
         if self.block_mode != BlockMode::Ppmd {
-            return Ok(());
+            return Ok(false);
         }
-        let Some(symbol) = self.ppmd.decode_symbol(&mut self.bits)? else {
-            return Ok(());
-        };
+        let symbol = self
+            .ppmd
+            .decode_symbol(&mut self.bits)?
+            .ok_or(Error::InvalidData("RAR 2.9 PPMd model is corrupt"))?;
         if symbol != self.ppmd_esc {
             return Err(Error::InvalidData("RAR 2.9 PPMd member has trailing data"));
         }
-        let Some(next) = self.ppmd.decode_symbol(&mut self.bits)? else {
-            return Ok(());
-        };
+        let next = self
+            .ppmd
+            .decode_symbol(&mut self.bits)?
+            .ok_or(Error::InvalidData("RAR 2.9 PPMd model is corrupt"))?;
         match next {
             2 => {
                 self.in_lz_block = false;
-                Ok(())
+                Ok(true)
             }
             0 => {
                 self.in_lz_block = false;
-                Ok(())
+                self.read_tables()?;
+                self.in_lz_block = true;
+                Ok(false)
             }
             _ => Err(Error::InvalidData("RAR 2.9 PPMd member has trailing data")),
         }
     }
 
     fn finish_member(&mut self) -> Result<()> {
-        match self.block_mode {
-            BlockMode::Lz => self.finish_lz_member(),
-            BlockMode::Ppmd => self.finish_ppmd_member(),
+        loop {
+            let finished = match self.block_mode {
+                BlockMode::Lz => self.finish_lz_member()?,
+                BlockMode::Ppmd => self.finish_ppmd_member()?,
+            };
+            if finished {
+                return Ok(());
+            }
         }
     }
 
-    fn finish_lz_member(&mut self) -> Result<()> {
-        loop {
-            if !self.in_lz_block {
-                return Ok(());
+    fn finish_lz_member(&mut self) -> Result<bool> {
+        if !self.in_lz_block {
+            return Ok(true);
+        }
+        let symbol = self.main.decode(&mut self.bits)?;
+        if symbol != 256 {
+            return Err(Error::InvalidData("RAR 2.9 LZ member has trailing data"));
+        }
+        match self.read_end_of_block()? {
+            LzBlockEnd::SameFileNewTable => {
+                self.read_tables()?;
+                self.in_lz_block = true;
+                Ok(false)
             }
-            let symbol = self.main.decode(&mut self.bits)?;
-            if symbol != 256 {
-                return Err(Error::InvalidData("RAR 2.9 LZ member has trailing data"));
-            }
-            match self.read_end_of_block()? {
-                LzBlockEnd::SameFileNewTable => {
-                    self.read_tables()?;
-                    self.in_lz_block = true;
-                }
-                LzBlockEnd::NewFileKeepTables | LzBlockEnd::NewFileNewTables => return Ok(()),
-            }
+            LzBlockEnd::NewFileKeepTables | LzBlockEnd::NewFileNewTables => Ok(true),
         }
     }
 
@@ -4601,6 +4612,70 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
 
         assert_eq!(unpack29_decode(&packed, input.len()).unwrap(), input);
         assert_ne!(packed.first().copied(), Some(0));
+    }
+
+    #[test]
+    fn ppmd_end_block_command_reads_the_next_block() {
+        let first = b"first PPMd block ";
+        let second = b"and its continuation";
+        let mut packed = vec![
+            0x80 | 0x20 | ((PPMD_ORDER as u8) - 1),
+            PPMD_DICTIONARY_MB - 1,
+        ];
+        let mut encoder =
+            PpmdEncoder::new(PPMD_ORDER, PPMD_ESC, usize::from(PPMD_DICTIONARY_MB)).unwrap();
+        for &byte in first {
+            encoder.encode_literal(byte).unwrap();
+        }
+        let (block, model) = encoder.finish_block_keeping_model().unwrap();
+        packed.extend_from_slice(&block);
+
+        packed.push(0x80 | ((PPMD_ORDER as u8) - 1));
+        let mut encoder = PpmdEncoder::continuing(model, PPMD_ESC);
+        for &byte in second {
+            encoder.encode_literal(byte).unwrap();
+        }
+        let (block, _) = encoder.finish_keeping_model().unwrap();
+        packed.extend_from_slice(&block);
+
+        let expected = [first.as_slice(), second.as_slice()].concat();
+        assert_eq!(unpack29_decode(&packed, expected.len()).unwrap(), expected);
+    }
+
+    #[test]
+    fn rejects_ppmd_eof_before_the_declared_member_size() {
+        let input = b"PPMd member with an inflated declared size";
+        let packed = unpack29_encode_ppmd_literals(input).unwrap();
+
+        assert!(matches!(
+            unpack29_decode(&packed, input.len() + 1),
+            Err(Error::InvalidData(
+                "RAR 2.9 member ended before its declared size"
+            ))
+        ));
+    }
+
+    #[test]
+    fn rejects_ppmd_output_after_the_declared_member_size() {
+        let input = b"PPMd member with a shortened declared size";
+        let packed = unpack29_encode_ppmd_literals(input).unwrap();
+
+        assert!(matches!(
+            unpack29_decode(&packed, input.len() - 1),
+            Err(Error::InvalidData("RAR 2.9 PPMd member has trailing data"))
+        ));
+    }
+
+    #[test]
+    fn rejects_a_truncated_ppmd_end_marker() {
+        let input = b"PPMd member whose final range-coder byte is missing";
+        let mut packed = unpack29_encode_ppmd_literals(input).unwrap();
+        packed.pop();
+
+        assert!(matches!(
+            unpack29_decode(&packed, input.len()),
+            Err(Error::InvalidData("RAR 2.9 bitstream is truncated"))
+        ));
     }
 
     #[test]

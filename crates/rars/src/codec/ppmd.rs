@@ -1523,6 +1523,14 @@ impl PpmdEncoder {
         Ok((self.range.finish(), self.model))
     }
 
+    /// Ends this PPMd block while keeping the member open for another block.
+    #[cfg(test)]
+    pub(crate) fn finish_block_keeping_model(mut self) -> Result<(Vec<u8>, PpmdDecoder)> {
+        self.model.encode_symbol(self.esc_char, &mut self.range)?;
+        self.model.encode_symbol(0, &mut self.range)?;
+        Ok((self.range.finish(), self.model))
+    }
+
     pub fn encode_literal(&mut self, symbol: u8) -> Result<()> {
         self.model.encode_symbol(symbol, &mut self.range)?;
         if symbol == self.esc_char {
