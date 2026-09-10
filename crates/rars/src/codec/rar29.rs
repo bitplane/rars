@@ -2536,6 +2536,11 @@ impl Unpack29 {
                 .saturating_add(STREAM_CHUNK)
                 .min(final_target);
         }
+        if self.pending_match.is_some() {
+            return Err(Error::InvalidData(
+                "RAR 2.9 member produces more output than its declared size",
+            ));
+        }
         self.finish_member().map_err(|error| match error {
             Error::NeedMoreInput => Error::InvalidData("RAR 2.9 bitstream is truncated"),
             error => error,
@@ -4320,6 +4325,30 @@ RAR 2.9 terminator check\n";
             unpack29_decode(&packed, first.len() + second.len()),
             Err(Error::InvalidData(
                 "RAR 2.9 member ended before its declared size"
+            ))
+        ));
+    }
+
+    #[test]
+    fn rejects_an_lz_literal_after_the_declared_member_size() {
+        let input = b"literal-only RAR 2.9 member";
+        let packed = unpack29_encode_literals(input).unwrap();
+
+        assert!(matches!(
+            unpack29_decode(&packed, input.len() - 1),
+            Err(Error::InvalidData("RAR 2.9 LZ member has trailing data"))
+        ));
+    }
+
+    #[test]
+    fn rejects_an_lz_match_crossing_the_declared_member_size() {
+        let input = b"repeated tail ".repeat(256);
+        let packed = Unpack29Encoder::new().encode_member(&input).unwrap();
+
+        assert!(matches!(
+            unpack29_decode(&packed, input.len() - 1),
+            Err(Error::InvalidData(
+                "RAR 2.9 member produces more output than its declared size"
             ))
         ));
     }
