@@ -4665,6 +4665,44 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     }
 
     #[test]
+    fn ppmd_member_can_end_in_an_empty_following_block() {
+        let input = b"PPMd output ends before its final empty block";
+        let mut packed = vec![
+            0x80 | 0x20 | ((PPMD_ORDER as u8) - 1),
+            PPMD_DICTIONARY_MB - 1,
+        ];
+        let mut encoder =
+            PpmdEncoder::new(PPMD_ORDER, PPMD_ESC, usize::from(PPMD_DICTIONARY_MB)).unwrap();
+        for &byte in input {
+            encoder.encode_literal(byte).unwrap();
+        }
+        let (block, model) = encoder.finish_block_keeping_model().unwrap();
+        packed.extend_from_slice(&block);
+
+        packed.push(0x80 | ((PPMD_ORDER as u8) - 1));
+        let encoder = PpmdEncoder::continuing(model, PPMD_ESC);
+        let (block, _) = encoder.finish_keeping_model().unwrap();
+        packed.extend_from_slice(&block);
+
+        assert_eq!(unpack29_decode(&packed, input.len()).unwrap(), input);
+    }
+
+    #[test]
+    fn lz_member_can_end_in_an_empty_following_block() {
+        let input = b"LZ output ends before its final empty block";
+        let mut levels = [0; TABLE_COUNT];
+        let options = EncodeOptions::default();
+        let mut packed =
+            super::encode_member_inner(input, &[], &[], options, true, &mut levels, None).unwrap();
+        packed.extend_from_slice(
+            &super::encode_member_inner(&[], input, &[], options, false, &mut levels, None)
+                .unwrap(),
+        );
+
+        assert_eq!(unpack29_decode(&packed, input.len()).unwrap(), input);
+    }
+
+    #[test]
     fn rejects_ppmd_eof_before_the_declared_member_size() {
         let input = b"PPMd member with an inflated declared size";
         let packed = unpack29_encode_ppmd_literals(input).unwrap();
