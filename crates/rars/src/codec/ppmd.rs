@@ -1532,9 +1532,21 @@ impl PpmdEncoder {
     }
 
     #[cfg(test)]
-    pub(crate) fn finish_with_command(mut self, command: u8) -> Result<Vec<u8>> {
+    pub(crate) fn finish_with_command(self, command: u8) -> Result<Vec<u8>> {
+        self.finish_with_command_prefix(command, &[])
+    }
+
+    #[cfg(test)]
+    pub(crate) fn finish_with_command_prefix(
+        mut self,
+        command: u8,
+        parameters: &[u8],
+    ) -> Result<Vec<u8>> {
         self.model.encode_symbol(self.esc_char, &mut self.range)?;
         self.model.encode_symbol(command, &mut self.range)?;
+        for &parameter in parameters {
+            self.model.encode_symbol(parameter, &mut self.range)?;
+        }
         Ok(self.range.finish())
     }
 

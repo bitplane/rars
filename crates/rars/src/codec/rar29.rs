@@ -2787,9 +2787,7 @@ impl Unpack29 {
     }
 
     fn read_ppmd_required_byte(&mut self) -> Result<u8> {
-        self.ppmd
-            .decode_symbol(&mut self.bits)?
-            .ok_or(Error::InvalidData("RAR 2.9 PPMd stream ended early"))
+        require_ppmd_symbol(self.ppmd.decode_symbol(&mut self.bits)?)
     }
 
     fn finish_ppmd_member(&mut self) -> Result<bool> {
@@ -4732,6 +4730,67 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
             unpack29_decode(&packed, input.len() + 1),
             Err(Error::InvalidData("RAR 2.9 PPMd command is invalid"))
         ));
+    }
+
+    fn incomplete_ppmd_command(command: u8, parameters: &[u8]) -> Result<Vec<u8>> {
+        let mut packed = vec![
+            0x80 | 0x20 | ((PPMD_ORDER as u8) - 1),
+            PPMD_DICTIONARY_MB - 1,
+        ];
+        let encoder =
+            PpmdEncoder::new(PPMD_ORDER, PPMD_ESC, usize::from(PPMD_DICTIONARY_MB)).unwrap();
+        packed.extend_from_slice(
+            &encoder
+                .finish_with_command_prefix(command, parameters)
+                .unwrap(),
+        );
+        unpack29_decode(&packed, 1)
+    }
+
+    #[test]
+    fn rejects_truncated_ppmd_match_parameters() {
+        let cases = [
+            (&[][..], "first offset byte"),
+            (&[0][..], "second offset byte"),
+            (&[0, 0][..], "third offset byte"),
+            (&[0, 0, 0][..], "length byte"),
+        ];
+        for (parameters, missing) in cases {
+            assert!(
+                incomplete_ppmd_command(4, parameters).is_err(),
+                "accepted a match missing its {missing}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_truncated_ppmd_repeat_parameter() {
+        assert!(matches!(
+            incomplete_ppmd_command(5, &[]),
+            Err(Error::InvalidData("RAR 2.9 bitstream is truncated"))
+        ));
+    }
+
+    #[test]
+    fn rejects_truncated_ppmd_vm_parameters() {
+        let cases = [
+            (&[][..], "first record byte"),
+            (&[6][..], "one-byte extended length"),
+            (&[7][..], "two-byte length high byte"),
+            (&[7, 0][..], "two-byte length low byte"),
+            (&[0][..], "one-byte record body"),
+            (&[6, 0][..], "extended-length record body"),
+            (&[7, 0, 1][..], "two-byte-length record body"),
+        ];
+        for (parameters, missing) in cases {
+            assert!(
+                matches!(
+                    incomplete_ppmd_command(3, parameters),
+                    Err(Error::InvalidData("RAR 2.9 bitstream is truncated"))
+                ),
+                "accepted a VM command missing its {missing}"
+            );
+        }
     }
 
     #[test]
