@@ -5581,7 +5581,7 @@ fn parses_compressed_rar300_newsub_recovery_record_fixture() {
         .unwrap();
     assert_eq!(recovery.file.name, b"RR");
     assert_eq!(recovery.file.method, 0x33);
-    assert_eq!(recovery.file.pack_size, 6443);
+    assert_eq!(recovery.file.pack_size, 6444);
     assert_eq!(recovery.file.unp_size, 5672);
 }
 

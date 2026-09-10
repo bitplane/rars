@@ -15,7 +15,7 @@ cases.
 | `stored_multivol_rar300*`, `compressed_multivol_prng_rar300*`, `encrypted_multivol_rar300*`, `encrypted_newnaming_rar300*` | Streaming stored, compressed, and AES-encrypted split-volume extraction. |
 | `rev_oldstyle.*`, `rev_newstyle.*` | RAR 3.00 old-style and RAR 4.20 new-style `.rev` recovery-volume repair. |
 | `rarvm_*_rar300.rar` | Standard RARVM filters: E8, E8E9, DELTA, ITANIUM, RGB, AUDIO. |
-| `with_compressed_recovery_rar300.rar` | Derived from `with_recovery_rar300.rar` by recompressing the `RR` NewSub recovery payload with the local RAR29 literal encoder, setting method `0x33`, and recomputing the header CRC. |
+| `with_compressed_recovery_rar300.rar` | Derived from `with_recovery_rar300.rar` by recompressing the `RR` NewSub recovery payload with the local RAR29 literal encoder, setting method `0x33`, and recomputing the header CRC. Its packed stream ends with the specified new-file/new-table marker. |
 | `with_compressed_recovery_header_synthetic.rar` | Derived from `with_recovery_rar300.rar` with the `RR` NewSub method byte changed from store (`0x30`) to compressed (`0x33`) and the header CRC recomputed, but with the stored payload left unchanged. It pins corrupt compressed-RR error handling. |
 
 Expected payloads and CRCs are asserted directly in

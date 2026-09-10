@@ -2328,7 +2328,6 @@ pub struct Unpack29 {
     last_filter: usize,
     base_offset: usize,
     output: Vec<u8>,
-    stale_terminator: bool,
     last_block_end: Option<LzBlockEnd>,
 }
 
@@ -2403,7 +2402,6 @@ impl Unpack29 {
             last_filter: 0,
             base_offset: 0,
             output: Vec::new(),
-            stale_terminator: false,
             last_block_end: None,
         }
     }
@@ -2829,19 +2827,7 @@ impl Unpack29 {
             }
             match self.read_end_of_block()? {
                 LzBlockEnd::SameFileNewTable => {
-                    if self.bits.remaining_bits_are_zero() {
-                        // rars wrote this bit set on every member it packed
-                        // until the terminator fix, so what follows is the byte
-                        // padding rather than a table. Kept for those archives.
-                        self.stale_terminator = true;
-                        return Ok(());
-                    }
-                    if let Err(error) = self.read_tables() {
-                        if error == Error::NeedMoreInput {
-                            return Ok(());
-                        }
-                        return Err(error);
-                    }
+                    self.read_tables()?;
                     self.in_lz_block = true;
                 }
                 LzBlockEnd::NewFileKeepTables | LzBlockEnd::NewFileNewTables => return Ok(()),
@@ -3415,25 +3401,6 @@ impl BitReader {
         let value = self.peek_bits(count)?;
         self.bit_pos += count as usize;
         Ok(value)
-    }
-
-    fn remaining_bits_are_zero(&self) -> bool {
-        let full_bytes = self.bit_pos / 8;
-        let bit_offset = self.bit_pos % 8;
-        let Some((&first, rest)) = self
-            .input
-            .get(full_bytes)
-            .zip(self.input.get(full_bytes + 1..))
-        else {
-            return true;
-        };
-        if bit_offset != 0 && first << bit_offset != 0 {
-            return false;
-        }
-        if bit_offset == 0 && first != 0 {
-            return false;
-        }
-        rest.iter().all(|&byte| byte == 0)
     }
 
     fn peek_bits(&self, count: u8) -> Result<u32> {
@@ -4270,26 +4237,29 @@ mod tests {
         assert_eq!(unpack29_decode(&packed, input.len()).unwrap(), input);
     }
 
-    /// The end-of-block symbol is followed by a bit saying whether another
-    /// table comes next, and the encoder used to set it, so every member
-    /// claimed a table that was really the byte padding. unrar and our own
-    /// reader stop on the unpacked size and never reach it, which is why only
-    /// 7-Zip noticed, and it refused every RAR 2.9 LZ archive we had written.
-    ///
-    /// The reader still tolerates the old shape, so a round trip proves
-    /// nothing. What proves it is that the tolerance goes unused.
     #[test]
-    fn an_lz_member_ends_with_a_terminator_and_not_a_promise_of_more_tables() {
+    fn an_lz_member_ends_with_a_new_file_marker() {
         let input = b"RAR 2.9 terminator check, with repeated text to force a match: \
 RAR 2.9 terminator check\n";
         let packed = unpack29_encode_literals(input).unwrap();
 
-        let mut decoder = Unpack29::new();
-        assert_eq!(decoder.decode_member(&packed, input.len()).unwrap(), input);
-        assert!(
-            !decoder.stale_terminator,
-            "the member ended by claiming another table follows"
-        );
+        assert_eq!(unpack29_decode(&packed, input.len()).unwrap(), input);
+    }
+
+    #[test]
+    fn rejects_a_final_lz_marker_that_promises_a_missing_table() {
+        let input = b"RAR 2.9 missing final table check\n".repeat(8);
+        let mut packed = unpack29_encode_literals(&input).unwrap();
+        let last_nonzero = packed.iter().rposition(|&byte| byte != 0).unwrap();
+        let final_one = 1 << packed[last_nonzero].trailing_zeros();
+        let preceding_bit = final_one << 1;
+        assert_eq!(packed[last_nonzero] & preceding_bit, 0);
+        packed[last_nonzero] ^= final_one | preceding_bit;
+
+        assert!(matches!(
+            unpack29_decode(&packed, input.len()),
+            Err(Error::InvalidData("RAR 2.9 bitstream is truncated"))
+        ));
     }
 
     /// A member split across LZ blocks marks every block but the last as having
