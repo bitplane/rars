@@ -242,18 +242,44 @@ pub(crate) fn filtered_members(
     input: &[u8],
     filters: &[crate::FilterSpec],
 ) -> Result<FilteredMembers> {
+    let mut ordered = filters.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|filter| filter.range.as_ref().map_or(0, |range| range.start));
     let mut data = input.to_vec();
     let mut records = Vec::with_capacity(filters.len());
-    for filter in filters {
-        let filtered = filtered_member(input, filter)?;
-        let range = filtered.block_start..filtered.block_start + filtered.block_size;
-        data[range.clone()].copy_from_slice(&filtered.data[range]);
-        records.push(OwnedVmFilterRecord {
-            block_start: filtered.block_start,
-            block_size: filtered.block_size,
-            init_regs: filtered.init_regs,
-            code: filtered.code,
-        });
+    let mut index = 0;
+    let mut previous_end = 0;
+    while index < ordered.len() {
+        let range = ordered[index].range.clone().unwrap_or(0..input.len());
+        if range.start >= range.end || range.end > input.len() {
+            return Err(Error::InvalidData("RAR 2.9 VM filter range is invalid"));
+        }
+        if range.start < previous_end {
+            return Err(Error::InvalidData("RAR 2.9 VM filters partially overlap"));
+        }
+
+        let mut group_end = index + 1;
+        while group_end < ordered.len()
+            && ordered[group_end].range.clone().unwrap_or(0..input.len()) == range
+        {
+            group_end += 1;
+        }
+        let mut group_records = Vec::with_capacity(group_end - index);
+        // Decoding runs records in wire order. Apply their inverses in reverse
+        // so each decoder invocation receives the prior one's output.
+        for filter in ordered[index..group_end].iter().rev() {
+            let filtered = filtered_member(&data, filter)?;
+            data[range.clone()].copy_from_slice(&filtered.data[range.clone()]);
+            group_records.push(OwnedVmFilterRecord {
+                block_start: filtered.block_start,
+                block_size: filtered.block_size,
+                init_regs: filtered.init_regs,
+                code: filtered.code,
+            });
+        }
+        group_records.reverse();
+        records.extend(group_records);
+        previous_end = range.end;
+        index = group_end;
     }
     Ok(FilteredMembers { data, records })
 }
@@ -3061,22 +3087,16 @@ impl Unpack29 {
                 (filter.start >= start && filter.start + filter.size <= end).then_some(index)
             })
             .collect();
-        for filter_index in filters {
-            let (program_index, filter_start, filter_size, regs, global_data) = {
-                let filter = self
-                    .filters
-                    .get(filter_index)
-                    .ok_or(Error::InvalidData("RAR 2.9 VM filter is missing"))?;
-                (
-                    filter.program,
-                    filter.start,
-                    filter.size,
-                    filter.regs,
-                    filter.global_data.clone(),
-                )
-            };
+        let mut index = 0;
+        while index < filters.len() {
+            let first = self
+                .filters
+                .get(filters[index])
+                .ok_or(Error::InvalidData("RAR 2.9 VM filter is missing"))?;
+            let filter_start = first.start;
+            let filter_size = first.size;
             if filter_start < pos {
-                continue;
+                return Err(Error::InvalidData("RAR 2.9 VM filters partially overlap"));
             }
             out.extend_from_slice(self.raw_range(pos, filter_start)?);
             let mut block = self
@@ -3086,36 +3106,52 @@ impl Unpack29 {
                 .checked_sub(member_start)
                 .ok_or(Error::InvalidData("RAR 2.9 VM filter starts before file"))?
                 as u32;
-            let program = self
-                .programs
-                .get_mut(program_index)
-                .ok_or(Error::InvalidData("RAR 2.9 VM program is missing"))?;
-            match &program.kind {
-                VmProgramKind::Standard(standard) => apply_standard_filter_with_control(
-                    *standard,
-                    &mut block,
-                    file_offset,
-                    &regs,
-                    &self.read_control,
-                )?,
-                VmProgramKind::Generic(generic) => {
-                    let globals = if global_data.is_empty() {
-                        program.globals.as_slice()
-                    } else {
-                        global_data.as_slice()
-                    };
-                    let result = generic.execute_with_control(
-                        rarvm::Invocation {
-                            input: &block,
-                            regs,
-                            global_data: globals,
-                            file_offset: file_offset as u64,
-                            exec_count: program.exec_count,
-                        },
+            loop {
+                let (program_index, regs, global_data) = {
+                    let filter = self
+                        .filters
+                        .get(filters[index])
+                        .ok_or(Error::InvalidData("RAR 2.9 VM filter is missing"))?;
+                    (filter.program, filter.regs, filter.global_data.clone())
+                };
+                let program = self
+                    .programs
+                    .get_mut(program_index)
+                    .ok_or(Error::InvalidData("RAR 2.9 VM program is missing"))?;
+                match &program.kind {
+                    VmProgramKind::Standard(standard) => apply_standard_filter_with_control(
+                        *standard,
+                        &mut block,
+                        file_offset,
+                        &regs,
                         &self.read_control,
-                    )?;
-                    program.globals = result.globals;
-                    block = result.output;
+                    )?,
+                    VmProgramKind::Generic(generic) => {
+                        let globals = if global_data.is_empty() {
+                            program.globals.as_slice()
+                        } else {
+                            global_data.as_slice()
+                        };
+                        let result = generic.execute_with_control(
+                            rarvm::Invocation {
+                                input: &block,
+                                regs,
+                                global_data: globals,
+                                file_offset: file_offset as u64,
+                                exec_count: program.exec_count,
+                            },
+                            &self.read_control,
+                        )?;
+                        program.globals = result.globals;
+                        block = result.output;
+                    }
+                }
+                index += 1;
+                let Some(next) = filters.get(index).and_then(|&next| self.filters.get(next)) else {
+                    break;
+                };
+                if next.start != filter_start || next.size != block.len() {
+                    break;
                 }
             }
             out.extend_from_slice(&block);
@@ -5104,6 +5140,77 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
 
         assert!(packed.len() != plain_ppmd.len() || packed.len() != filtered_lz.len());
         assert_eq!(unpack29_decode(&packed, input.len()).unwrap(), input);
+    }
+
+    #[test]
+    fn same_block_filters_chain_in_wire_order() {
+        let mut input = Vec::new();
+        for index in 0..256u32 {
+            input.push(0xe8);
+            input.extend_from_slice(&index.wrapping_mul(97).to_le_bytes());
+            input.extend_from_slice(b"chained-filter-payload");
+        }
+        let filters = [
+            crate::FilterSpec::whole(crate::FilterKind::Delta { channels: 1 }),
+            crate::FilterSpec::whole(crate::FilterKind::E8),
+        ];
+        let packed = Unpack29Encoder::new()
+            .encode_member_with_filters(&input, &filters)
+            .unwrap();
+
+        assert_eq!(unpack29_decode(&packed, input.len()).unwrap(), input);
+    }
+
+    #[test]
+    fn archive_decoder_rejects_partially_overlapping_filters() {
+        let input = vec![b'Z'; 96];
+        let filters = [
+            OwnedVmFilterRecord {
+                block_start: 0,
+                block_size: 64,
+                init_regs: vec![(0, 1)],
+                code: RAR3_DELTA_FILTER_BYTECODE,
+            },
+            OwnedVmFilterRecord {
+                block_start: 32,
+                block_size: 64,
+                init_regs: Vec::new(),
+                code: super::RAR3_E8_FILTER_BYTECODE,
+            },
+        ];
+        let refs = filters.iter().collect::<Vec<_>>();
+        let records = encoded_filter_records_at(&refs, 0, usize::MAX, &mut Vec::new()).unwrap();
+        let packed = super::encode_member_inner(
+            &input,
+            &[],
+            &records,
+            EncodeOptions::default(),
+            false,
+            &mut [0; TABLE_COUNT],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            unpack29_decode(&packed, input.len()).unwrap_err(),
+            Error::InvalidData("RAR 2.9 VM filters partially overlap")
+        );
+    }
+
+    #[test]
+    fn writer_rejects_partially_overlapping_filters() {
+        let input = vec![b'Z'; 96];
+        let filters = [
+            crate::FilterSpec::range(crate::FilterKind::Delta { channels: 1 }, 0..64),
+            crate::FilterSpec::range(crate::FilterKind::E8, 32..96),
+        ];
+
+        assert_eq!(
+            Unpack29Encoder::new()
+                .encode_member_with_filters(&input, &filters)
+                .unwrap_err(),
+            Error::InvalidData("RAR 2.9 VM filters partially overlap")
+        );
     }
 
     fn encode_with_filter(input: &[u8], kind: crate::FilterKind) -> Result<Vec<u8>> {
