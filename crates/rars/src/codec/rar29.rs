@@ -25,6 +25,8 @@ const MAX_VM_AUDIO_FILTER_BLOCK_SIZE: usize = 120_000;
 // 128; keep this distinct from DELTA's 1024-channel ceiling.
 const MAX_AUDIO_CHANNELS: usize = 128;
 const MAX_VM_GLOBAL_DATA: usize = 0x2000;
+const VM_SYSTEM_GLOBAL_SIZE: usize = 64;
+const MAX_VM_USER_GLOBAL_DATA: usize = MAX_VM_GLOBAL_DATA - VM_SYSTEM_GLOBAL_SIZE;
 const MAX_VM_CODE_SIZE: usize = 64 * 1024;
 const MAX_VM_PROGRAMS: usize = 8192;
 const MAX_VM_FILTERS: usize = 8192;
@@ -274,6 +276,7 @@ pub(crate) fn filtered_members(
                 block_size: filtered.block_size,
                 init_regs: filtered.init_regs,
                 code: filtered.code,
+                global_data: Vec::new(),
             });
         }
         group_records.reverse();
@@ -363,6 +366,7 @@ struct OwnedVmFilterRecord {
     block_size: usize,
     init_regs: Vec<(usize, u32)>,
     code: &'static [u8],
+    global_data: Vec<u8>,
 }
 
 fn encode_ppmd_member(
@@ -1278,6 +1282,7 @@ fn encoded_filter_records_at(
                 block_size: filter.block_size,
                 init_regs: &filter.init_regs,
                 code: filter.code,
+                global_data: &filter.global_data,
             },
             program_selector,
             include_code,
@@ -1353,6 +1358,7 @@ struct VmFilterRecord<'a> {
     block_size: usize,
     init_regs: &'a [(usize, u32)],
     code: &'a [u8],
+    global_data: &'a [u8],
 }
 
 fn encode_vm_filter_record_inner(
@@ -1403,12 +1409,24 @@ fn encode_vm_filter_record_inner(
             body.write_bits(u32::from(byte), 8);
         }
     }
+    if !record.global_data.is_empty() {
+        body.write_encoded_u32(
+            u32::try_from(record.global_data.len())
+                .map_err(|_| Error::InvalidData("RAR 2.9 VM global data size overflows"))?,
+        );
+        for &byte in record.global_data {
+            body.write_bits(u32::from(byte), 8);
+        }
+    }
     let body = body.finish();
 
     let mut out = Vec::new();
     let mut first = 0x80 | 0x20;
     if !record.init_regs.is_empty() {
         first |= 0x10;
+    }
+    if !record.global_data.is_empty() {
+        first |= 0x08;
     }
     match body.len() {
         1..=6 => first |= (body.len() as u8) - 1,
@@ -3054,12 +3072,13 @@ impl Unpack29 {
         let mut global_data = Vec::new();
         if first_byte & 0x08 != 0 {
             let data_size = vm.read_encoded_u32()? as usize;
-            global_data.reserve(data_size.min(MAX_VM_GLOBAL_DATA));
+            if data_size > MAX_VM_USER_GLOBAL_DATA {
+                return Err(Error::InvalidData("RAR 2.9 VM global data is too large"));
+            }
+            global_data.resize(VM_SYSTEM_GLOBAL_SIZE, 0);
+            global_data.reserve(data_size);
             for _ in 0..data_size {
-                let byte = vm.read_bits(8)? as u8;
-                if global_data.len() < MAX_VM_GLOBAL_DATA {
-                    global_data.push(byte);
-                }
+                global_data.push(vm.read_bits(8)? as u8);
             }
         }
 
@@ -5171,12 +5190,14 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
                     block_size: 64,
                     init_regs: vec![(0, 1)],
                     code: RAR3_DELTA_FILTER_BYTECODE,
+                    global_data: Vec::new(),
                 },
                 OwnedVmFilterRecord {
                     block_start: second_start,
                     block_size: second_size,
                     init_regs: Vec::new(),
                     code: super::RAR3_E8_FILTER_BYTECODE,
+                    global_data: Vec::new(),
                 },
             ];
             let refs = filters.iter().collect::<Vec<_>>();
@@ -5267,6 +5288,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
             block_size: data.len(),
             init_regs,
             code,
+            global_data: Vec::new(),
         };
         let mut levels = [0; TABLE_COUNT];
         let packed = super::encode_filtered_member_blocks(
@@ -5677,12 +5699,14 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
                 block_size: MAX_VM_AUDIO_FILTER_BLOCK_SIZE,
                 init_regs: vec![(0, 4)],
                 code: RAR3_AUDIO_FILTER_BYTECODE,
+                global_data: Vec::new(),
             },
             OwnedVmFilterRecord {
                 block_start: MAX_VM_AUDIO_FILTER_BLOCK_SIZE,
                 block_size: 4096,
                 init_regs: vec![(0, 4)],
                 code: RAR3_AUDIO_FILTER_BYTECODE,
+                global_data: Vec::new(),
             },
         ];
         let refs: Vec<&OwnedVmFilterRecord> = filters.iter().collect();
@@ -6014,6 +6038,46 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     }
 
     #[test]
+    fn generic_vm_filter_uses_explicit_then_retained_user_globals() {
+        // Copies user-global byte 0 to the output, increments it, records one
+        // retained user byte at global offset 0x30, then returns.
+        const GLOBAL_COUNTER_PROGRAM: &[u8] = &[
+            0x0d, 0x05, 0xc0, 0x7c, 0x00, 0x0f, 0x01, 0x01, 0xaf, 0x80, 0x01, 0xe0, 0x20, 0x01,
+            0xf0, 0x00, 0x3c, 0x03, 0x00, 0x1b, 0x80,
+        ];
+        let filters = [
+            OwnedVmFilterRecord {
+                block_start: 0,
+                block_size: 1,
+                init_regs: Vec::new(),
+                code: GLOBAL_COUNTER_PROGRAM,
+                global_data: vec![b'A'],
+            },
+            OwnedVmFilterRecord {
+                block_start: 1,
+                block_size: 1,
+                init_regs: Vec::new(),
+                code: GLOBAL_COUNTER_PROGRAM,
+                global_data: Vec::new(),
+            },
+        ];
+        let refs = filters.iter().collect::<Vec<_>>();
+        let records = encoded_filter_records_at(&refs, 0, usize::MAX, &mut Vec::new()).unwrap();
+        let packed = super::encode_member_inner(
+            &[0, 0],
+            &[],
+            &records,
+            EncodeOptions::default(),
+            false,
+            &mut [0; TABLE_COUNT],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(unpack29_decode(&packed, 2).unwrap(), b"AB");
+    }
+
+    #[test]
     fn standard_filters_reject_malformed_delta_and_rgb_registers() {
         let mut delta = vec![0; 32];
         let mut delta_regs = [0; 7];
@@ -6150,7 +6214,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     }
 
     #[test]
-    fn vm_global_data_size_does_not_reserve_untrusted_declared_size() {
+    fn vm_global_data_size_is_capped_before_reading_or_allocation() {
         let mut decoder = Unpack29::new();
         decoder.programs.push(VmProgram {
             kind: VmProgramKind::Standard(StandardFilter::E8),
@@ -6166,7 +6230,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
 
         assert_eq!(
             decoder.parse_vm_code(0x80 | 0x08, data.finish()),
-            Err(Error::NeedMoreInput)
+            Err(Error::InvalidData("RAR 2.9 VM global data is too large"))
         );
     }
 
