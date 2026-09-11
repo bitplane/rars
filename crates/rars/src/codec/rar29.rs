@@ -3874,11 +3874,11 @@ mod tests {
         BitReader, BitWriter, ChainEngine, EncodeOptions, EncodeToken, EncoderMatchState, Error,
         Huffman, LevelToken, MatchCandidate, OwnedVmFilterRecord, PpmdEncodeToken, PpmdEncoder,
         Rar29MatchFinder, Result, StandardFilter, Unpack29, Unpack29Encoder, VmFilter, VmProgram,
-        VmProgramKind, MAIN_COUNT, MAX_ENCODER_MATCH_OFFSET, MAX_HISTORY, MAX_MATCH_CANDIDATES,
-        MAX_VM_AUDIO_FILTER_BLOCK_SIZE, MAX_VM_DELTA_FILTER_BLOCK_SIZE, MAX_VM_FILTER_BLOCK_SIZE,
-        PPMD_DICTIONARY_MB, PPMD_ESC, PPMD_ORDER, RAR3_AUDIO_FILTER_BYTECODE,
-        RAR3_DELTA_FILTER_BYTECODE, RAR3_ITANIUM_FILTER_BYTECODE, RAR3_RGB_FILTER_BYTECODE,
-        STREAM_CHUNK, TABLE_COUNT,
+        VmProgramKind, MAIN_COUNT, MAX_ENCODER_MATCH_LENGTH, MAX_ENCODER_MATCH_OFFSET, MAX_HISTORY,
+        MAX_MATCH_CANDIDATES, MAX_VM_AUDIO_FILTER_BLOCK_SIZE, MAX_VM_DELTA_FILTER_BLOCK_SIZE,
+        MAX_VM_FILTER_BLOCK_SIZE, PPMD_DICTIONARY_MB, PPMD_ESC, PPMD_ORDER,
+        RAR3_AUDIO_FILTER_BYTECODE, RAR3_DELTA_FILTER_BYTECODE, RAR3_ITANIUM_FILTER_BYTECODE,
+        RAR3_RGB_FILTER_BYTECODE, STREAM_CHUNK, TABLE_COUNT,
     };
 
     /// A flat code charges the same for every symbol in play. The keep-tables
@@ -4420,6 +4420,50 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         assert_eq!(decoder.base_offset, input.len() - MAX_HISTORY);
         assert_eq!(decoder.output.len(), MAX_HISTORY);
         assert!(decoder.pending_match.is_none());
+    }
+
+    #[test]
+    fn solid_follower_can_match_the_oldest_retained_history() {
+        let mut state = 0x6d2b_79f5u32;
+        let marker: Vec<u8> = (0..MAX_ENCODER_MATCH_LENGTH)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect();
+        let mut first = vec![b'X'; 17];
+        first.extend_from_slice(&marker);
+        first.resize(MAX_HISTORY + 17, b'Z');
+
+        let options = EncodeOptions::default().with_max_match_distance(MAX_HISTORY);
+        let mut encoder = Unpack29Encoder::with_options(options);
+        let first_packed = encoder.encode_member(&first).unwrap();
+        assert_eq!(encoder.history.len(), MAX_HISTORY);
+        assert_eq!(&encoder.history[..marker.len()], marker);
+
+        let follower_tokens = encode_tokens(&marker, &encoder.history, options);
+        assert!(follower_tokens.iter().any(|token| matches!(
+            token,
+            EncodeToken::Match { offset, .. } if *offset == MAX_HISTORY
+        )));
+        let follower_packed = encoder.encode_member(&marker).unwrap();
+
+        let mut decoder = Unpack29::new();
+        assert_eq!(
+            decoder.decode_member(&first_packed, first.len()).unwrap(),
+            first
+        );
+        assert_eq!(decoder.base_offset, 17);
+        assert_eq!(
+            decoder
+                .decode_member(&follower_packed, marker.len())
+                .unwrap(),
+            marker
+        );
+        assert_eq!(decoder.output.len(), MAX_HISTORY);
+        assert_eq!(decoder.base_offset, 17 + marker.len());
     }
 
     #[test]
