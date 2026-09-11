@@ -5271,6 +5271,83 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     }
 
     #[test]
+    fn rgb_filter_matches_the_captured_winrar_bytecode() {
+        let program = Program::parse(RAR3_RGB_FILTER_BYTECODE).unwrap();
+        for (width, pos_r) in [(3, 0), (12, 2), (63, 1)] {
+            let input: Vec<u8> = (0..189)
+                .map(|index| (index * 43 + index / 7 + 19) as u8)
+                .collect();
+            let encoded = super::rgb_encode(&input, width, pos_r).unwrap();
+            let result = program
+                .execute(super::rarvm::Invocation {
+                    input: &encoded,
+                    regs: [width as u32 + 3, pos_r as u32, 0, 0, 0, 0, 0],
+                    global_data: &[],
+                    file_offset: 0,
+                    exec_count: 0,
+                })
+                .unwrap();
+
+            assert_eq!(result.output, input, "width {width}, red position {pos_r}");
+        }
+    }
+
+    #[test]
+    fn itanium_filter_matches_the_captured_winrar_bytecode() {
+        let mut input = vec![0u8; 96];
+        for bundle in 0..5 {
+            input[bundle * 16] = 0x16;
+            input[bundle * 16 + 5] = 0x50;
+            input[bundle * 16 + 8] = (bundle * 29 + 7) as u8;
+        }
+        let file_offset = 0x12340;
+        let mut encoded = input.clone();
+        itanium_encode(&mut encoded, file_offset);
+        let program = Program::parse(RAR3_ITANIUM_FILTER_BYTECODE).unwrap();
+        let result = program
+            .execute(super::rarvm::Invocation {
+                input: &encoded,
+                regs: [0; 7],
+                global_data: &[],
+                file_offset: u64::from(file_offset),
+                exec_count: 0,
+            })
+            .unwrap();
+
+        assert_eq!(result.output, input);
+    }
+
+    #[test]
+    fn audio_predictor_extremes_match_the_captured_winrar_bytecode() {
+        let program = Program::parse(RAR3_AUDIO_FILTER_BYTECODE).unwrap();
+        // These xorshift streams independently drive all six coefficient
+        // choices and both sides of every +/-16 saturation guard.
+        for seed in [2u32, 3, 4, 17] {
+            let mut state = seed;
+            let input: Vec<u8> = (0..16_384)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    state as u8
+                })
+                .collect();
+            let encoded = audio_encode(&input, 1).unwrap();
+            let result = program
+                .execute(super::rarvm::Invocation {
+                    input: &encoded,
+                    regs: [1, 0, 0, 0, 0, 0, 0],
+                    global_data: &[],
+                    file_offset: 0,
+                    exec_count: 0,
+                })
+                .unwrap();
+
+            assert_eq!(result.output, input, "predictor diverged for seed {seed}");
+        }
+    }
+
+    #[test]
     fn large_audio_filters_are_split_into_rarvm_safe_blocks() {
         let filters = split_large_filter(
             MAX_VM_FILTER_BLOCK_SIZE * 2 + 123,
