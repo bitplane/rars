@@ -4467,6 +4467,59 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     }
 
     #[test]
+    fn filter_spanning_a_flush_waits_for_complete_input_and_is_retired() {
+        struct RecordingSink {
+            data: Vec<u8>,
+            writes: Vec<usize>,
+        }
+
+        impl std::io::Write for RecordingSink {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.writes.push(data.len());
+                self.data.extend_from_slice(data);
+                Ok(data.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let filter_range = STREAM_CHUNK - 512..STREAM_CHUNK + 512;
+        let mut input = vec![b'Z'; MAX_HISTORY + STREAM_CHUNK + 513];
+        for position in (filter_range.start..filter_range.end - 4).step_by(16) {
+            input[position] = 0xe8;
+            input[position + 1..position + 5].copy_from_slice(&0x1234u32.to_le_bytes());
+        }
+        let packed =
+            encode_with_filter_range(&input, crate::FilterKind::E8, filter_range.clone()).unwrap();
+
+        let mut decoder = Unpack29::new();
+        let mut sink = RecordingSink {
+            data: Vec::new(),
+            writes: Vec::new(),
+        };
+        decoder
+            .decode_member_to(&packed, input.len(), &mut sink)
+            .unwrap();
+
+        assert_eq!(sink.data, input);
+        assert_eq!(sink.writes[0], filter_range.start);
+        assert_eq!(sink.writes[1], STREAM_CHUNK + 512);
+        assert!(decoder.filters.is_empty());
+
+        let mut decoder = Unpack29::new();
+        let mut prematurely_emitted = Vec::new();
+        assert_eq!(
+            decoder
+                .decode_member_to(&packed, filter_range.end - 1, &mut prematurely_emitted)
+                .unwrap_err(),
+            Error::InvalidData("RAR 2.9 VM filter extends beyond output")
+        );
+        assert!(prematurely_emitted.is_empty());
+    }
+
+    #[test]
     fn table_level_encoder_uses_rar29_run_symbols() {
         let mut lengths = [0u8; TABLE_COUNT];
         lengths[..4].fill(5);
