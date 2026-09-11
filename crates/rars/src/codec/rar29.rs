@@ -5217,6 +5217,21 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         }
     }
 
+    #[test]
+    fn writer_rejects_invalid_filter_ranges() {
+        let input = vec![b'Z'; 96];
+        for range in [32..32, 0..97] {
+            let filter = crate::FilterSpec::range(crate::FilterKind::E8, range);
+
+            assert_eq!(
+                Unpack29Encoder::new()
+                    .encode_member_with_filter(&input, filter)
+                    .unwrap_err(),
+                Error::InvalidData("RAR 2.9 VM filter range is invalid")
+            );
+        }
+    }
+
     fn encode_with_filter(input: &[u8], kind: crate::FilterKind) -> Result<Vec<u8>> {
         Unpack29Encoder::new().encode_member_with_filter(input, crate::FilterSpec::whole(kind))
     }
