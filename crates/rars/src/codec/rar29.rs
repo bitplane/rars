@@ -358,11 +358,6 @@ fn split_large_filter(
     if range.len() <= chunk_size {
         return Ok(vec![filter]);
     }
-    if chunk_size == 0 {
-        return Err(Error::InvalidData(
-            "RAR 2.9 VM filter chunk size is invalid",
-        ));
-    }
 
     let mut filters = Vec::new();
     let mut start = range.start;
