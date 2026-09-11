@@ -20,6 +20,10 @@ const MAX_VM_FILTER_BLOCK_SIZE: usize = 128 * 1024;
 // decoders.
 pub(crate) const MAX_VM_DELTA_FILTER_BLOCK_SIZE: usize = 120_000;
 const MAX_VM_AUDIO_FILTER_BLOCK_SIZE: usize = 120_000;
+// RARVM's standard AUDIO filter reserves an eight-bit-ish compatibility
+// range wider than WinRAR's usual 1..=4 channel choices. UnRAR accepts up to
+// 128; keep this distinct from DELTA's 1024-channel ceiling.
+const MAX_AUDIO_CHANNELS: usize = 128;
 const MAX_VM_GLOBAL_DATA: usize = 0x2000;
 const MAX_VM_CODE_SIZE: usize = 64 * 1024;
 const MAX_VM_PROGRAMS: usize = 8192;
@@ -286,7 +290,7 @@ fn split_large_filter(
             MAX_VM_DELTA_FILTER_BLOCK_SIZE - (MAX_VM_DELTA_FILTER_BLOCK_SIZE % channels)
         }
         Rar29Filter::Audio { channels } => {
-            if channels == 0 || channels > MAX_VM_AUDIO_FILTER_BLOCK_SIZE {
+            if channels == 0 || channels > MAX_AUDIO_CHANNELS {
                 return Err(Error::InvalidData(
                     "RAR 2.9 VM filter channel count is invalid",
                 ));
@@ -1430,7 +1434,7 @@ fn rgb_encode(data: &[u8], width: usize, pos_r: usize) -> Result<Vec<u8>> {
 }
 
 fn audio_encode(data: &[u8], channels: usize) -> Result<Vec<u8>> {
-    if channels == 0 || channels > 32 {
+    if channels == 0 || channels > MAX_AUDIO_CHANNELS {
         return Err(Error::InvalidData(
             "RAR 2.9 AUDIO filter channel count is invalid",
         ));
@@ -3581,7 +3585,7 @@ fn apply_standard_filter_with_control(
         }
         StandardFilter::Audio => {
             let channels = regs[0] as usize;
-            if channels == 0 || channels > MAX_DELTA_CHANNELS {
+            if channels == 0 || channels > MAX_AUDIO_CHANNELS {
                 return Err(Error::InvalidData(
                     "RAR 2.9 AUDIO filter channel count is invalid",
                 ));
@@ -5187,6 +5191,37 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         let decoded = unpack29_decode(&packed, input.len()).unwrap();
 
         assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn rar29_audio_channel_bounds_match_period_decoders() {
+        let input: Vec<u8> = (0..256).map(|index| (index * 37 + 11) as u8).collect();
+        for channels in [1, 32, 33, 128] {
+            let encoded = audio_encode(&input, channels).unwrap();
+            let mut decoded = encoded;
+            let mut regs = [0; 7];
+            regs[0] = channels as u32;
+            apply_standard_filter(StandardFilter::Audio, &mut decoded, 0, &regs).unwrap();
+            assert_eq!(decoded, input, "failed with {channels} channels");
+        }
+
+        for channels in [0, 129] {
+            assert!(matches!(
+                audio_encode(&input, channels),
+                Err(Error::InvalidData(
+                    "RAR 2.9 AUDIO filter channel count is invalid"
+                ))
+            ));
+            let mut data = input.clone();
+            let mut regs = [0; 7];
+            regs[0] = channels as u32;
+            assert!(matches!(
+                apply_standard_filter(StandardFilter::Audio, &mut data, 0, &regs),
+                Err(Error::InvalidData(
+                    "RAR 2.9 AUDIO filter channel count is invalid"
+                ))
+            ));
+        }
     }
 
     #[test]
