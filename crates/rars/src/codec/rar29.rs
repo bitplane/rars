@@ -5164,53 +5164,57 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     #[test]
     fn archive_decoder_rejects_partially_overlapping_filters() {
         let input = vec![b'Z'; 96];
-        let filters = [
-            OwnedVmFilterRecord {
-                block_start: 0,
-                block_size: 64,
-                init_regs: vec![(0, 1)],
-                code: RAR3_DELTA_FILTER_BYTECODE,
-            },
-            OwnedVmFilterRecord {
-                block_start: 32,
-                block_size: 64,
-                init_regs: Vec::new(),
-                code: super::RAR3_E8_FILTER_BYTECODE,
-            },
-        ];
-        let refs = filters.iter().collect::<Vec<_>>();
-        let records = encoded_filter_records_at(&refs, 0, usize::MAX, &mut Vec::new()).unwrap();
-        let packed = super::encode_member_inner(
-            &input,
-            &[],
-            &records,
-            EncodeOptions::default(),
-            false,
-            &mut [0; TABLE_COUNT],
-            None,
-        )
-        .unwrap();
+        for (second_start, second_size) in [(32, 64), (0, 63)] {
+            let filters = [
+                OwnedVmFilterRecord {
+                    block_start: 0,
+                    block_size: 64,
+                    init_regs: vec![(0, 1)],
+                    code: RAR3_DELTA_FILTER_BYTECODE,
+                },
+                OwnedVmFilterRecord {
+                    block_start: second_start,
+                    block_size: second_size,
+                    init_regs: Vec::new(),
+                    code: super::RAR3_E8_FILTER_BYTECODE,
+                },
+            ];
+            let refs = filters.iter().collect::<Vec<_>>();
+            let records = encoded_filter_records_at(&refs, 0, usize::MAX, &mut Vec::new()).unwrap();
+            let packed = super::encode_member_inner(
+                &input,
+                &[],
+                &records,
+                EncodeOptions::default(),
+                false,
+                &mut [0; TABLE_COUNT],
+                None,
+            )
+            .unwrap();
 
-        assert_eq!(
-            unpack29_decode(&packed, input.len()).unwrap_err(),
-            Error::InvalidData("RAR 2.9 VM filters partially overlap")
-        );
+            assert_eq!(
+                unpack29_decode(&packed, input.len()).unwrap_err(),
+                Error::InvalidData("RAR 2.9 VM filters partially overlap")
+            );
+        }
     }
 
     #[test]
     fn writer_rejects_partially_overlapping_filters() {
         let input = vec![b'Z'; 96];
-        let filters = [
-            crate::FilterSpec::range(crate::FilterKind::Delta { channels: 1 }, 0..64),
-            crate::FilterSpec::range(crate::FilterKind::E8, 32..96),
-        ];
+        for second_range in [32..96, 0..63] {
+            let filters = [
+                crate::FilterSpec::range(crate::FilterKind::Delta { channels: 1 }, 0..64),
+                crate::FilterSpec::range(crate::FilterKind::E8, second_range),
+            ];
 
-        assert_eq!(
-            Unpack29Encoder::new()
-                .encode_member_with_filters(&input, &filters)
-                .unwrap_err(),
-            Error::InvalidData("RAR 2.9 VM filters partially overlap")
-        );
+            assert_eq!(
+                Unpack29Encoder::new()
+                    .encode_member_with_filters(&input, &filters)
+                    .unwrap_err(),
+                Error::InvalidData("RAR 2.9 VM filters partially overlap")
+            );
+        }
     }
 
     fn encode_with_filter(input: &[u8], kind: crate::FilterKind) -> Result<Vec<u8>> {
