@@ -6777,6 +6777,186 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     }
 
     #[test]
+    fn vm_filter_record_serializer_uses_every_specified_length_form() {
+        fn declared_payload(record: &[u8]) -> (usize, usize) {
+            match record[0] & 7 {
+                len @ 0..=5 => (1, usize::from(len) + 1),
+                6 => (2, usize::from(record[1]) + 7),
+                _ => (3, usize::from(u16::from_be_bytes([record[1], record[2]]))),
+            }
+        }
+
+        let medium_code = vec![0; 53];
+        let long_code = vec![0; 300];
+        let records = [
+            super::encode_vm_filter_record_inner(
+                super::VmFilterRecord {
+                    block_start: 0,
+                    block_size: 1,
+                    init_regs: &[],
+                    code: &[],
+                    global_data: &[],
+                },
+                1,
+                false,
+            )
+            .unwrap(),
+            super::encode_vm_filter_record_inner(
+                super::VmFilterRecord {
+                    block_start: 0,
+                    block_size: 1,
+                    init_regs: &[],
+                    code: &medium_code,
+                    global_data: &[],
+                },
+                0,
+                true,
+            )
+            .unwrap(),
+            super::encode_vm_filter_record_inner(
+                super::VmFilterRecord {
+                    block_start: 0,
+                    block_size: 1,
+                    init_regs: &[],
+                    code: &long_code,
+                    global_data: &[],
+                },
+                0,
+                true,
+            )
+            .unwrap(),
+        ];
+
+        assert!(matches!(records[0][0] & 7, 0..=5));
+        assert_eq!(records[1][0] & 7, 6);
+        assert_eq!(records[2][0] & 7, 7);
+        for record in records {
+            let (header_len, payload_len) = declared_payload(&record);
+            assert_eq!(record.len(), header_len + payload_len);
+        }
+    }
+
+    #[test]
+    fn vm_filter_record_serializer_rejects_invalid_fields() {
+        assert_eq!(
+            super::encode_vm_filter_record_inner(
+                super::VmFilterRecord {
+                    block_start: 0,
+                    block_size: 0,
+                    init_regs: &[],
+                    code: &[1],
+                    global_data: &[],
+                },
+                0,
+                true,
+            ),
+            Err(Error::InvalidData("RAR 2.9 VM filter block is empty"))
+        );
+        assert_eq!(
+            super::encode_vm_filter_record_inner(
+                super::VmFilterRecord {
+                    block_start: 0,
+                    block_size: 1,
+                    init_regs: &[],
+                    code: &[],
+                    global_data: &[],
+                },
+                0,
+                true,
+            ),
+            Err(Error::InvalidData("RAR 2.9 VM filter bytecode is empty"))
+        );
+        assert_eq!(
+            super::encode_vm_filter_record_inner(
+                super::VmFilterRecord {
+                    block_start: 0,
+                    block_size: 1,
+                    init_regs: &[(7, 0)],
+                    code: &[1],
+                    global_data: &[],
+                },
+                0,
+                true,
+            ),
+            Err(Error::InvalidData(
+                "RAR 2.9 VM init register index is invalid"
+            ))
+        );
+
+        let oversized_global = vec![0; 65_536];
+        assert_eq!(
+            super::encode_vm_filter_record_inner(
+                super::VmFilterRecord {
+                    block_start: 0,
+                    block_size: 1,
+                    init_regs: &[],
+                    code: &[],
+                    global_data: &oversized_global,
+                },
+                1,
+                false,
+            ),
+            Err(Error::InvalidData("RAR 2.9 VM filter record is too large"))
+        );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn vm_filter_record_serializer_rejects_fields_wider_than_the_wire() {
+        for (block_start, block_size, expected) in [
+            (
+                usize::MAX,
+                1,
+                Error::InvalidData("RAR 2.9 VM block start overflows"),
+            ),
+            (
+                0,
+                usize::MAX,
+                Error::InvalidData("RAR 2.9 VM block size overflows"),
+            ),
+        ] {
+            assert_eq!(
+                super::encode_vm_filter_record_inner(
+                    super::VmFilterRecord {
+                        block_start,
+                        block_size,
+                        init_regs: &[],
+                        code: &[],
+                        global_data: &[],
+                    },
+                    1,
+                    false,
+                ),
+                Err(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn vm_filter_records_must_belong_to_their_encoding_block() {
+        let filter = OwnedVmFilterRecord {
+            block_start: 10,
+            block_size: 1,
+            init_regs: Vec::new(),
+            code: super::RAR3_E8_FILTER_BYTECODE,
+            global_data: Vec::new(),
+        };
+
+        assert_eq!(
+            encoded_filter_records_at(&[&filter], 11, 32, &mut Vec::new()),
+            Err(Error::InvalidData(
+                "RAR 2.9 VM filter starts before its block"
+            ))
+        );
+        assert_eq!(
+            encoded_filter_records_at(&[&filter], 0, 10, &mut Vec::new()),
+            Err(Error::InvalidData(
+                "RAR 2.9 VM filter starts further past its block than the window can express"
+            ))
+        );
+    }
+
+    #[test]
     fn archive_decoder_rejects_invalid_vm_program_records() {
         let cases = [
             (
