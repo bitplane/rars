@@ -3876,7 +3876,9 @@ mod tests {
         Rar29MatchFinder, Result, StandardFilter, Unpack29, Unpack29Encoder, VmFilter, VmProgram,
         VmProgramKind, MAIN_COUNT, MAX_ENCODER_MATCH_OFFSET, MAX_MATCH_CANDIDATES,
         MAX_VM_AUDIO_FILTER_BLOCK_SIZE, MAX_VM_DELTA_FILTER_BLOCK_SIZE, MAX_VM_FILTER_BLOCK_SIZE,
-        PPMD_DICTIONARY_MB, PPMD_ESC, PPMD_ORDER, RAR3_AUDIO_FILTER_BYTECODE, TABLE_COUNT,
+        PPMD_DICTIONARY_MB, PPMD_ESC, PPMD_ORDER, RAR3_AUDIO_FILTER_BYTECODE,
+        RAR3_DELTA_FILTER_BYTECODE, RAR3_ITANIUM_FILTER_BYTECODE, RAR3_RGB_FILTER_BYTECODE,
+        TABLE_COUNT,
     };
 
     /// A flat code charges the same for every symbol in play. The keep-tables
@@ -4983,6 +4985,29 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         Unpack29Encoder::new().encode_member_with_filters(input, &filters)
     }
 
+    fn decode_with_raw_standard_filter(
+        data: &[u8],
+        code: &'static [u8],
+        init_regs: Vec<(usize, u32)>,
+    ) -> Result<Vec<u8>> {
+        let filter = OwnedVmFilterRecord {
+            block_start: 0,
+            block_size: data.len(),
+            init_regs,
+            code,
+        };
+        let mut levels = [0; TABLE_COUNT];
+        let packed = super::encode_filtered_member_blocks(
+            data,
+            &[],
+            &[filter],
+            EncodeOptions::default(),
+            &mut levels,
+            None,
+        )?;
+        unpack29_decode(&packed, data.len())
+    }
+
     #[test]
     fn encoder_emits_rar29_offset_one_matches_for_repeated_bytes() {
         let input = b"Z".repeat(1024);
@@ -5672,6 +5697,90 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
                 "RAR 2.9 RGB filter parameters are invalid"
             ))
         );
+    }
+
+    #[test]
+    fn standard_filter_records_enforce_delta_and_audio_channel_bounds() {
+        let input = vec![0; 1024];
+        assert_eq!(
+            decode_with_raw_standard_filter(&input, RAR3_DELTA_FILTER_BYTECODE, vec![(0, 0)]),
+            Err(Error::InvalidData(
+                "RAR 2.9 DELTA filter channel count is invalid"
+            ))
+        );
+        assert_eq!(
+            decode_with_raw_standard_filter(
+                &input,
+                RAR3_DELTA_FILTER_BYTECODE,
+                vec![(0, (super::MAX_DELTA_CHANNELS + 1) as u32)],
+            ),
+            Err(Error::InvalidData(
+                "RAR 2.9 DELTA filter channel count is invalid"
+            ))
+        );
+        assert_eq!(
+            decode_with_raw_standard_filter(
+                &input,
+                RAR3_DELTA_FILTER_BYTECODE,
+                vec![(0, super::MAX_DELTA_CHANNELS as u32)],
+            )
+            .unwrap(),
+            input
+        );
+
+        for channels in [0, super::MAX_AUDIO_CHANNELS + 1] {
+            assert_eq!(
+                decode_with_raw_standard_filter(
+                    &input,
+                    RAR3_AUDIO_FILTER_BYTECODE,
+                    vec![(0, channels as u32)],
+                ),
+                Err(Error::InvalidData(
+                    "RAR 2.9 AUDIO filter channel count is invalid"
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn standard_rgb_filter_records_reject_nonportable_parameters() {
+        let cases = [
+            (vec![0; 2], 3, 0, "short input"),
+            (vec![0; 12], 3, 0, "zero width"),
+            (vec![0; 12], 11, 0, "unaligned width"),
+            (vec![0; 12], 18, 0, "width beyond the block"),
+            (vec![0; 12], 15, 3, "red channel beyond RGB"),
+        ];
+        for (input, encoded_width, pos_r, description) in cases {
+            assert_eq!(
+                decode_with_raw_standard_filter(
+                    &input,
+                    RAR3_RGB_FILTER_BYTECODE,
+                    vec![(0, encoded_width), (1, pos_r)],
+                ),
+                Err(Error::InvalidData(
+                    "RAR 2.9 RGB filter parameters are invalid"
+                )),
+                "accepted {description}"
+            );
+        }
+    }
+
+    #[test]
+    fn short_itanium_filter_records_are_defined_noops() {
+        let mut empty = Vec::new();
+        itanium_decode(&mut empty, 0);
+        assert!(empty.is_empty());
+
+        for len in [1, 20, 21, 22] {
+            let input: Vec<u8> = (0..len).map(|index| (index * 17 + 3) as u8).collect();
+            assert_eq!(
+                decode_with_raw_standard_filter(&input, RAR3_ITANIUM_FILTER_BYTECODE, vec![])
+                    .unwrap(),
+                input,
+                "changed a {len}-byte non-branching block"
+            );
+        }
     }
 
     #[test]
