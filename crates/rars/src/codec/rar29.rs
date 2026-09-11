@@ -223,13 +223,6 @@ pub fn unpack29_encode_ppmd_with_filter(
     encode_ppmd_filtered_member(input, filter, true, max_match_distance)
 }
 
-pub fn unpack29_encode_ppmd_literals_with_filter(
-    input: &[u8],
-    filter: crate::FilterSpec,
-) -> Result<Vec<u8>> {
-    encode_ppmd_filtered_member(input, filter, false, 0)
-}
-
 fn encode_ppmd_filtered_member(
     input: &[u8],
     filter: crate::FilterSpec,
