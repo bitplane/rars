@@ -5051,8 +5051,10 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
             MAX_HISTORY
         );
 
-        let mut options = EncodeOptions::default();
-        options.max_match_distance = usize::MAX;
+        let options = EncodeOptions {
+            max_match_distance: usize::MAX,
+            ..EncodeOptions::default()
+        };
         assert_eq!(
             Unpack29Encoder::with_options(options)
                 .options
