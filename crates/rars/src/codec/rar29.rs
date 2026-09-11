@@ -180,12 +180,16 @@ pub(crate) fn unpack29_encode_ppmd_with_progress(
     if !progress(0) {
         return Err(Error::Cancelled);
     }
-    let filtered = filter
-        .map(|filter| {
-            let filters = split_large_filter(input.len(), filter)?;
-            filtered_members(input, &filters)
-        })
-        .transpose()?;
+    let filtered = if let Some(filter) = filter {
+        let filters = split_large_filter(input.len(), filter)?;
+        Some(filtered_members_with_progress(
+            input,
+            &filters,
+            Some(&mut *progress),
+        )?)
+    } else {
+        None
+    };
     let records = if let Some(filtered) = &filtered {
         let refs: Vec<_> = filtered.records.iter().collect();
         encoded_filter_records_at(&refs, 0, usize::MAX, &mut Vec::new())?
@@ -245,6 +249,14 @@ pub(crate) fn filtered_members(
     input: &[u8],
     filters: &[crate::FilterSpec],
 ) -> Result<FilteredMembers> {
+    filtered_members_with_progress(input, filters, None)
+}
+
+fn filtered_members_with_progress(
+    input: &[u8],
+    filters: &[crate::FilterSpec],
+    mut progress: Option<&mut dyn FnMut(usize) -> bool>,
+) -> Result<FilteredMembers> {
     let mut ordered = filters.iter().collect::<Vec<_>>();
     ordered.sort_by_key(|filter| filter.range.as_ref().map_or(0, |range| range.start));
     let mut data = input.to_vec();
@@ -270,6 +282,12 @@ pub(crate) fn filtered_members(
         // Decoding runs records in wire order. Apply their inverses in reverse
         // so each decoder invocation receives the prior one's output.
         for filter in ordered[index..group_end].iter().rev() {
+            // Large ranges have already been split into bounded records. Poll
+            // between them without advancing encoded-byte progress, so filter
+            // preprocessing cannot hide cancellation for an entire member.
+            if progress.as_mut().is_some_and(|report| !report(0)) {
+                return Err(Error::Cancelled);
+            }
             let filtered = filtered_member(&data, filter)?;
             data[range.clone()].copy_from_slice(&filtered.data[range.clone()]);
             group_records.push(OwnedVmFilterRecord {
@@ -880,18 +898,20 @@ impl Unpack29Encoder {
     ) -> Result<Vec<u8>> {
         let filters = split_large_filter(input.len(), filter)?;
         let filtered = filtered_members(input, &filters)?;
+        let mut levels = self.levels;
         let packed = encode_filtered_member_blocks(
             &filtered.data,
             &self.history,
             &filtered.records,
             self.options,
-            &mut self.levels,
+            &mut levels,
             None,
         )?;
         // The LZ layer coded the filtered bytes, so that is what a decoder's
         // window holds and what the next member in a solid chain can match
         // against. Remembering the caller's input instead leaves every member
         // after this one referring to bytes no decoder ever had.
+        self.levels = levels;
         self.remember(&filtered.data);
         Ok(packed)
     }
@@ -917,19 +937,26 @@ impl Unpack29Encoder {
         for filter in filters {
             split_filters.extend(split_large_filter(input.len(), filter.clone())?);
         }
-        let filtered = filtered_members(input, &split_filters)?;
+        let filtered = match progress.as_mut() {
+            Some(report) => {
+                filtered_members_with_progress(input, &split_filters, Some(&mut **report))?
+            }
+            None => filtered_members(input, &split_filters)?,
+        };
+        let mut levels = self.levels;
         let packed = encode_filtered_member_blocks(
             &filtered.data,
             &self.history,
             &filtered.records,
             self.options,
-            &mut self.levels,
+            &mut levels,
             progress,
         )?;
         // The LZ layer coded the filtered bytes, so that is what a decoder's
         // window holds and what the next member in a solid chain can match
         // against. Remembering the caller's input instead leaves every member
         // after this one referring to bytes no decoder ever had.
+        self.levels = levels;
         self.remember(&filtered.data);
         Ok(packed)
     }
@@ -5557,6 +5584,39 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
                 Error::InvalidData("RAR 2.9 VM filter range is invalid")
             );
         }
+    }
+
+    #[test]
+    fn filtered_progress_polls_preprocessing_and_keeps_cancelled_state_transactional() {
+        let input = vec![b'Z'; MAX_VM_FILTER_BLOCK_SIZE * 2 + 16];
+        let filter = crate::FilterSpec::whole(crate::FilterKind::E8);
+        let mut preprocessing = Unpack29Encoder::new();
+        let mut polls = 0;
+        let result = preprocessing.encode_member_with_filters_and_progress(
+            &input,
+            std::slice::from_ref(&filter),
+            Some(&mut |_| {
+                polls += 1;
+                polls < 3
+            }),
+        );
+        assert_eq!(result.unwrap_err(), Error::Cancelled);
+        assert_eq!(polls, 3);
+        assert!(preprocessing.history.is_empty());
+        assert_eq!(preprocessing.levels, [0; TABLE_COUNT]);
+
+        let options = EncodeOptions::default().with_block_size(4096);
+        let mut between_blocks = Unpack29Encoder::with_options(options);
+        between_blocks.levels[0] = 7;
+        let original_levels = between_blocks.levels;
+        let result = between_blocks.encode_member_with_filters_and_progress(
+            &input[..8192],
+            &[filter],
+            Some(&mut |position| position <= 4096),
+        );
+        assert_eq!(result.unwrap_err(), Error::Cancelled);
+        assert!(between_blocks.history.is_empty());
+        assert_eq!(between_blocks.levels, original_levels);
     }
 
     fn encode_with_filter(input: &[u8], kind: crate::FilterKind) -> Result<Vec<u8>> {
