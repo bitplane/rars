@@ -844,7 +844,7 @@ impl Unpack29Encoder {
                 for filter in filters {
                     split.extend(split_large_filter(input.len(), filter.clone())?);
                 }
-                let filtered = filtered_members(input, &split)?;
+                let filtered = filtered_members_with_progress(input, &split, Some(&mut report))?;
                 let packed = encode_filtered_member_blocks(
                     &filtered.data,
                     &self.history,
@@ -3894,6 +3894,85 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ppmd_progress_covers_entry_filtered_preprocessing_and_completion() {
+        let input = b"PPMd cancellation boundary payload\n".repeat(400);
+        for escapes in [false, true] {
+            let mut calls = Vec::new();
+            assert_eq!(
+                super::unpack29_encode_ppmd_with_progress(
+                    &input,
+                    escapes,
+                    None,
+                    1 << 20,
+                    &mut |position| {
+                        calls.push(position);
+                        false
+                    },
+                ),
+                Err(super::Error::Cancelled)
+            );
+            assert_eq!(calls, [0]);
+
+            let mut completions = 0;
+            assert_eq!(
+                super::unpack29_encode_ppmd_with_progress(
+                    &input,
+                    escapes,
+                    None,
+                    1 << 20,
+                    &mut |position| {
+                        if position == input.len() {
+                            completions += 1;
+                            return false;
+                        }
+                        true
+                    },
+                ),
+                Err(super::Error::Cancelled)
+            );
+            assert_eq!(completions, 1);
+        }
+
+        let mut polls = 0;
+        let filter = crate::FilterSpec::whole(crate::FilterKind::E8);
+        assert_eq!(
+            super::unpack29_encode_ppmd_with_progress(
+                &input,
+                true,
+                Some(filter),
+                1 << 20,
+                &mut |_| {
+                    polls += 1;
+                    polls < 3
+                },
+            ),
+            Err(super::Error::Cancelled)
+        );
+        // Entry, the bounded filter record, then the PPMd block itself.
+        assert_eq!(polls, 3);
+    }
+
+    #[test]
+    fn lz_progress_can_cancel_its_final_report() {
+        let input = b"RAR29 final LZ progress boundary\n".repeat(400);
+        let mut completions = 0;
+        let result = super::unpack29_encode_literals_with_options_and_progress(
+            &input,
+            EncodeOptions::default(),
+            &mut |position| {
+                if position == input.len() {
+                    completions += 1;
+                    return false;
+                }
+                true
+            },
+        );
+
+        assert_eq!(result, Err(super::Error::Cancelled));
+        assert_eq!(completions, 1);
+    }
+
     use super::{audio_decode_with_control, itanium_decode_with_control, rgb_decode_with_control};
 
     #[test]
@@ -5617,6 +5696,52 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         assert_eq!(result.unwrap_err(), Error::Cancelled);
         assert!(between_blocks.history.is_empty());
         assert_eq!(between_blocks.levels, original_levels);
+    }
+
+    #[test]
+    fn solid_candidate_transitions_are_cancellable_without_committing_state() {
+        let seed = b"solid seed history and table state\n".repeat(200);
+        let input = b"candidate transition payload with repeated text\n".repeat(300);
+        let mut encoder = Unpack29Encoder::new();
+        encoder.encode_member(&seed).unwrap();
+        let original_history = encoder.history.clone();
+        let original_levels = encoder.levels;
+        let filter = crate::FilterSpec::whole(crate::FilterKind::E8);
+        let candidates = [Vec::new(), vec![filter]];
+
+        let mut completions = 0;
+        let result = encoder.encode_member_with_engine(
+            &input,
+            ChainEngine::Lz,
+            &candidates,
+            &mut |position| {
+                if position == input.len() {
+                    completions += 1;
+                    return completions < 3;
+                }
+                true
+            },
+        );
+        assert_eq!(result.unwrap_err(), Error::Cancelled);
+        assert_eq!(completions, 3);
+        assert_eq!(encoder.history, original_history);
+        assert_eq!(encoder.levels, original_levels);
+        assert!(encoder.ppmd.is_none());
+
+        completions = 0;
+        let result =
+            encoder.encode_member_with_engine(&input, ChainEngine::Smaller, &[], &mut |position| {
+                if position == input.len() {
+                    completions += 1;
+                    return completions < 3;
+                }
+                true
+            });
+        assert_eq!(result.unwrap_err(), Error::Cancelled);
+        assert_eq!(completions, 3);
+        assert_eq!(encoder.history, original_history);
+        assert_eq!(encoder.levels, original_levels);
+        assert!(encoder.ppmd.is_none());
     }
 
     fn encode_with_filter(input: &[u8], kind: crate::FilterKind) -> Result<Vec<u8>> {
