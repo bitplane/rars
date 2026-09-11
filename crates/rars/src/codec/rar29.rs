@@ -620,12 +620,23 @@ impl EncodeOptions {
     }
 
     pub const fn with_max_match_distance(mut self, distance: usize) -> Self {
-        self.max_match_distance = distance;
+        self.max_match_distance = if distance > MAX_HISTORY {
+            MAX_HISTORY
+        } else {
+            distance
+        };
         self
     }
 
     pub const fn with_block_size(mut self, bytes: usize) -> Self {
         self.block_size = Some(bytes);
+        self
+    }
+
+    const fn constrained(mut self) -> Self {
+        if self.max_match_distance > MAX_HISTORY {
+            self.max_match_distance = MAX_HISTORY;
+        }
         self
     }
 }
@@ -696,7 +707,7 @@ impl Unpack29Encoder {
     pub fn with_options(options: EncodeOptions) -> Self {
         Self {
             history: Vec::new(),
-            options,
+            options: options.constrained(),
             levels: [0; TABLE_COUNT],
             ppmd: None,
         }
@@ -961,6 +972,7 @@ fn encode_member_with_options_impl(
     levels: &mut [u8; TABLE_COUNT],
     progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<u8>> {
+    let options = options.constrained();
     if let Some(block_size) = options.block_size.filter(|&size| size != 0) {
         if input.len() > block_size {
             return encode_member_blocks(input, history, options, block_size, levels, progress);
@@ -1922,10 +1934,8 @@ fn best_ppmd_match(
     let mut checked = 0usize;
     let mut candidate = finder.first(input, pos);
     while candidate != match_finder::NO_POSITION {
-        if candidate >= pos {
-            candidate = finder.previous(candidate);
-            continue;
-        }
+        // MatchFinder chains contain only previously inserted positions and
+        // each link moves strictly backwards.
         let offset = pos - candidate;
         if offset > max_offset {
             break;
@@ -1962,7 +1972,7 @@ fn best_match(
     options: EncodeOptions,
     state: &EncoderMatchState,
 ) -> Option<MatchCandidate> {
-    let max_offset = pos.min(options.max_match_distance);
+    let max_offset = pos.min(options.max_match_distance).min(MAX_HISTORY);
     let max_length = (end - pos).min(MAX_ENCODER_MATCH_LENGTH);
     if options.max_match_candidates == 0
         || max_offset == 0
@@ -1987,10 +1997,8 @@ fn best_match(
     }
     let mut candidate = finder.first(input, pos);
     while candidate != match_finder::NO_POSITION {
-        if candidate >= pos {
-            candidate = finder.previous(candidate);
-            continue;
-        }
+        // MatchFinder chains contain only previously inserted positions and
+        // each link moves strictly backwards.
         let offset = pos - candidate;
         if offset > max_offset {
             break;
@@ -5026,6 +5034,25 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         assert!(unbounded.iter().any(
             |token| matches!(token, EncodeToken::Match { offset, .. } if *offset > 128 * 1024)
         ));
+    }
+
+    #[test]
+    fn encode_options_cap_match_distance_at_the_rar29_window() {
+        assert_eq!(
+            EncodeOptions::default()
+                .with_max_match_distance(usize::MAX)
+                .max_match_distance,
+            MAX_HISTORY
+        );
+
+        let mut options = EncodeOptions::default();
+        options.max_match_distance = usize::MAX;
+        assert_eq!(
+            Unpack29Encoder::with_options(options)
+                .options
+                .max_match_distance,
+            MAX_HISTORY
+        );
     }
 
     #[test]
