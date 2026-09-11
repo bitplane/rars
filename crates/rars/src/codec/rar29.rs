@@ -3045,7 +3045,7 @@ impl Unpack29 {
             if code_size == 0 {
                 return Err(Error::InvalidData("RAR 2.9 VM code is empty"));
             }
-            if code_size > MAX_VM_CODE_SIZE {
+            if code_size >= MAX_VM_CODE_SIZE {
                 return Err(Error::InvalidData("RAR 2.9 VM code is too large"));
             }
             let mut code = Vec::with_capacity(code_size);
@@ -6214,6 +6214,102 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     }
 
     #[test]
+    fn archive_decoder_rejects_invalid_vm_program_records() {
+        let cases = [
+            (
+                super::encode_vm_filter_record_inner(
+                    super::VmFilterRecord {
+                        block_start: 0,
+                        block_size: 1,
+                        init_regs: &[],
+                        code: &[],
+                        global_data: &[],
+                    },
+                    2,
+                    false,
+                )
+                .unwrap(),
+                Error::InvalidData("RAR 2.9 VM program index is invalid"),
+            ),
+            (
+                super::encode_vm_filter_record_inner(
+                    super::VmFilterRecord {
+                        block_start: 0,
+                        block_size: 1,
+                        init_regs: &[],
+                        code: &[],
+                        global_data: &[],
+                    },
+                    0,
+                    false,
+                )
+                .unwrap(),
+                Error::InvalidData("RAR 2.9 VM code is empty"),
+            ),
+            (
+                super::encode_vm_filter_record_inner(
+                    super::VmFilterRecord {
+                        block_start: 0,
+                        block_size: 1,
+                        init_regs: &[],
+                        code: &[1, 0],
+                        global_data: &[],
+                    },
+                    0,
+                    true,
+                )
+                .unwrap(),
+                Error::InvalidData("RARVM program checksum mismatch"),
+            ),
+        ];
+
+        for (record, expected) in cases {
+            let packed = super::encode_member_inner(
+                &[0],
+                &[],
+                &[record],
+                EncodeOptions::default(),
+                false,
+                &mut [0; TABLE_COUNT],
+                None,
+            )
+            .unwrap();
+            assert_eq!(unpack29_decode(&packed, 1), Err(expected));
+        }
+    }
+
+    #[test]
+    fn archive_decoder_rejects_generic_vm_block_larger_than_work_memory() {
+        // A checksum-valid nonstandard program with an implicit RET.
+        const GENERIC_RET: &[u8] = &[0x5c, 0x5c];
+        const TOO_LARGE: usize = 0x3c001;
+        let filter = OwnedVmFilterRecord {
+            block_start: 0,
+            block_size: TOO_LARGE,
+            init_regs: Vec::new(),
+            code: GENERIC_RET,
+            global_data: Vec::new(),
+        };
+        let records =
+            encoded_filter_records_at(&[&filter], 0, usize::MAX, &mut Vec::new()).unwrap();
+        let packed = super::encode_member_inner(
+            &vec![0; TOO_LARGE],
+            &[],
+            &records,
+            EncodeOptions::default(),
+            false,
+            &mut [0; TABLE_COUNT],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            unpack29_decode(&packed, TOO_LARGE),
+            Err(Error::InvalidData("RARVM filter input is too large"))
+        );
+    }
+
+    #[test]
     fn vm_global_data_size_is_capped_before_reading_or_allocation() {
         let mut decoder = Unpack29::new();
         decoder.programs.push(VmProgram {
@@ -6240,7 +6336,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         let mut data = BitWriter::default();
         data.write_encoded_u32(0);
         data.write_encoded_u32(1);
-        data.write_encoded_u32((super::MAX_VM_CODE_SIZE + 1) as u32);
+        data.write_encoded_u32(super::MAX_VM_CODE_SIZE as u32);
 
         assert_eq!(
             decoder.parse_vm_code(0x80, data.finish()),
