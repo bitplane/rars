@@ -4462,6 +4462,47 @@ mod tests {
     }
 
     #[test]
+    fn every_final_table_slice_rejects_oversubscription() {
+        let slices = [
+            MAIN_COUNT..MAIN_COUNT + OFFSET_COUNT,
+            MAIN_COUNT + OFFSET_COUNT..MAIN_COUNT + OFFSET_COUNT + LOW_OFFSET_COUNT,
+            MAIN_COUNT + OFFSET_COUNT + LOW_OFFSET_COUNT..TABLE_COUNT,
+        ];
+        for slice in slices {
+            let mut levels = [0; TABLE_COUNT];
+            levels[b'A' as usize] = 1;
+            levels[256] = 1;
+            levels[slice.start] = 1;
+            levels[slice.start + 1] = 1;
+            levels[slice.start + 2] = 1;
+            let mut decoder = Unpack29::new();
+            decoder.bits = BitReader::from_bytes(&encoded_table_description(&levels));
+
+            assert_eq!(
+                decoder.read_tables(),
+                Err(Error::InvalidData("RAR 2.9 oversubscribed Huffman table"))
+            );
+        }
+    }
+
+    #[test]
+    fn level_length_header_accepts_literal_fifteen_and_clips_zero_runs() {
+        let mut bits = BitWriter::default();
+        bits.write_bits(15, 4);
+        bits.write_bits(0, 4);
+        bits.write_bits(15, 4);
+        bits.write_bits(15, 4);
+        bits.write_bits(15, 4);
+        bits.write_bits(1, 4);
+        let mut bits = BitReader::from_bytes(&bits.finish());
+
+        let lengths = Unpack29::read_level_lengths(&mut bits).unwrap();
+
+        assert_eq!(lengths[0], 15);
+        assert_eq!(lengths[1..], [0; 19]);
+    }
+
+    #[test]
     fn unused_auxiliary_huffman_tables_may_be_empty() {
         let mut levels = [0; TABLE_COUNT];
         levels[b'A' as usize] = 1;
