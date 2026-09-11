@@ -1607,12 +1607,17 @@ impl EncoderMatchState {
             .iter()
             .position(|&old_offset| old_offset == offset && old_offset != 0)
         {
-            let (length_slot, length_extra) = length_slot_for_repeat_match(length)?;
-            return Ok(EncodedMatch::RepeatOffset {
-                index,
-                length_slot,
-                length_extra,
-            });
+            // The repeat-distance table stops at 257 bytes, one byte before
+            // the fresh-match table. A 258-byte match at a remembered
+            // distance is still representable, just not with the shorter
+            // repeat token.
+            if let Ok((length_slot, length_extra)) = length_slot_for_repeat_match(length) {
+                return Ok(EncodedMatch::RepeatOffset {
+                    index,
+                    length_slot,
+                    length_extra,
+                });
+            }
         }
         let encoded_length =
             length
@@ -4948,6 +4953,11 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         assert!(matches!(
             state.encode_match(9, 64).unwrap(),
             super::EncodedMatch::RepeatOffset { index: 0, .. }
+        ));
+
+        assert!(matches!(
+            state.encode_match(MAX_ENCODER_MATCH_LENGTH, 64).unwrap(),
+            super::EncodedMatch::Fresh { .. }
         ));
     }
 
