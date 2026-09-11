@@ -1656,9 +1656,13 @@ impl EncoderMatchState {
             .old_offsets
             .iter()
             .position(|&old_offset| old_offset == offset)
+            .filter(|_| length_slot_for_repeat_match(length).is_ok())
         {
             self.old_offsets[..=index].rotate_right(1);
         } else {
+            // This is a fresh token even when its distance already occurs in
+            // the repeat ring. The decoder shifts it in and keeps the older
+            // occurrence, so the encoder must retain the duplicate too.
             self.old_offsets.rotate_right(1);
             self.old_offsets[0] = offset;
         }
@@ -4964,6 +4968,8 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
             state.encode_match(MAX_ENCODER_MATCH_LENGTH, 64).unwrap(),
             super::EncodedMatch::Fresh { .. }
         ));
+        state.remember(MAX_ENCODER_MATCH_LENGTH, 64);
+        assert_eq!(state.old_offsets, [64, 64, 0, 0]);
     }
 
     #[test]
