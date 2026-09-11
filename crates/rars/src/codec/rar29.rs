@@ -3924,19 +3924,21 @@ mod tests {
     }
 
     use super::{
-        apply_standard_filter, audio_encode, best_match, encode_level_tokens_against,
-        encode_ppmd_hybrid, encode_table_level_tokens, encode_tokens_with_progress,
-        encoded_filter_records_at, itanium_decode, itanium_encode, lazy_match_decision,
-        level_code_lengths, split_large_filter, unpack29_decode, unpack29_encode_literals,
-        unpack29_encode_ppmd, unpack29_encode_ppmd_literals, unpack29_encode_ppmd_with_filter,
-        BitReader, BitWriter, ChainEngine, EncodeOptions, EncodeToken, EncoderMatchState, Error,
-        Huffman, LevelToken, MatchCandidate, OwnedVmFilterRecord, PpmdEncodeToken, PpmdEncoder,
-        Rar29MatchFinder, Result, StandardFilter, Unpack29, Unpack29Encoder, VmFilter, VmProgram,
-        VmProgramKind, MAIN_COUNT, MAX_ENCODER_MATCH_LENGTH, MAX_ENCODER_MATCH_OFFSET, MAX_HISTORY,
-        MAX_MATCH_CANDIDATES, MAX_VM_AUDIO_FILTER_BLOCK_SIZE, MAX_VM_DELTA_FILTER_BLOCK_SIZE,
-        MAX_VM_FILTER_BLOCK_SIZE, PPMD_DICTIONARY_MB, PPMD_ESC, PPMD_ORDER,
-        RAR3_AUDIO_FILTER_BYTECODE, RAR3_DELTA_FILTER_BYTECODE, RAR3_ITANIUM_FILTER_BYTECODE,
-        RAR3_RGB_FILTER_BYTECODE, STREAM_CHUNK, TABLE_COUNT,
+        apply_standard_filter, audio_encode, best_match, canonical_codes,
+        encode_level_tokens_against, encode_ppmd_hybrid, encode_table_level_tokens,
+        encode_tokens_with_progress, encoded_filter_records_at, itanium_decode, itanium_encode,
+        lazy_match_decision, level_code_lengths, split_large_filter, unpack29_decode,
+        unpack29_encode_literals, unpack29_encode_ppmd, unpack29_encode_ppmd_literals,
+        unpack29_encode_ppmd_with_filter, BitReader, BitWriter, ChainEngine, EncodeOptions,
+        EncodeToken, EncoderMatchState, Error, Huffman, LevelToken, MatchCandidate,
+        OwnedVmFilterRecord, PpmdEncodeToken, PpmdEncoder, Rar29MatchFinder, Result,
+        StandardFilter, Unpack29, Unpack29Encoder, VmFilter, VmProgram, VmProgramKind,
+        LENGTH_COUNT, LOW_OFFSET_COUNT, MAIN_COUNT, MAX_ENCODER_MATCH_LENGTH,
+        MAX_ENCODER_MATCH_OFFSET, MAX_HISTORY, MAX_MATCH_CANDIDATES,
+        MAX_VM_AUDIO_FILTER_BLOCK_SIZE, MAX_VM_DELTA_FILTER_BLOCK_SIZE, MAX_VM_FILTER_BLOCK_SIZE,
+        OFFSET_COUNT, PPMD_DICTIONARY_MB, PPMD_ESC, PPMD_ORDER, RAR3_AUDIO_FILTER_BYTECODE,
+        RAR3_DELTA_FILTER_BYTECODE, RAR3_ITANIUM_FILTER_BYTECODE, RAR3_RGB_FILTER_BYTECODE,
+        STREAM_CHUNK, TABLE_COUNT,
     };
 
     /// A flat code charges the same for every symbol in play. The keep-tables
@@ -4300,6 +4302,183 @@ mod tests {
             Huffman::from_lengths(&[1, 1, 1]),
             Err(Error::InvalidData("RAR 2.9 oversubscribed Huffman table"))
         ));
+    }
+
+    fn table_description(level_lengths: &[u8; 20], tokens: &[LevelToken]) -> Vec<u8> {
+        let codes = canonical_codes(level_lengths).unwrap();
+        let mut bits = BitWriter::default();
+        bits.write_bit(false);
+        bits.write_bit(false);
+        for &length in level_lengths {
+            bits.write_bits(u32::from(length), 4);
+        }
+        for token in tokens {
+            let code = codes[token.symbol].unwrap();
+            bits.write_bits(u32::from(code.code), code.len);
+            bits.write_bits(u32::from(token.extra_value), token.extra_bits);
+        }
+        bits.finish()
+    }
+
+    fn encoded_table_description(levels: &[u8; TABLE_COUNT]) -> Vec<u8> {
+        let tokens = encode_table_level_tokens(levels);
+        let level_lengths = level_code_lengths(&tokens);
+        table_description(&level_lengths, &tokens)
+    }
+
+    #[test]
+    fn table_repeats_at_position_zero_are_rejected() {
+        for symbol in [16, 17] {
+            let mut level_lengths = [0; 20];
+            level_lengths[0] = 1;
+            level_lengths[symbol] = 1;
+            let token = if symbol == 16 {
+                LevelToken::repeat_previous_short(3)
+            } else {
+                LevelToken::repeat_previous_long(11)
+            };
+            let mut decoder = Unpack29::new();
+            decoder.bits = BitReader::from_bytes(&table_description(&level_lengths, &[token]));
+
+            let expected = if symbol == 16 {
+                Error::InvalidData("RAR 2.9 table repeat at start")
+            } else {
+                Error::InvalidData("RAR 2.9 long table repeat at start")
+            };
+            assert_eq!(decoder.read_tables(), Err(expected));
+        }
+    }
+
+    #[test]
+    fn table_run_past_the_destination_is_truncated_for_compatibility() {
+        let mut level_lengths = [0; 20];
+        level_lengths[0] = 1;
+        level_lengths[19] = 1;
+        let tokens = [
+            LevelToken::zero_run_long(138),
+            LevelToken::zero_run_long(138),
+            LevelToken::zero_run_long(138),
+        ];
+        let mut decoder = Unpack29::new();
+        decoder.bits = BitReader::from_bytes(&table_description(&level_lengths, &tokens));
+
+        decoder.read_tables().unwrap();
+
+        assert_eq!(decoder.levels, [0; TABLE_COUNT]);
+    }
+
+    #[test]
+    fn empty_level_and_main_tables_fail_when_used() {
+        let mut empty_level_decoder = Unpack29::new();
+        empty_level_decoder.bits = BitReader::from_bytes(&table_description(&[0; 20], &[]));
+        assert_eq!(
+            empty_level_decoder.read_tables(),
+            Err(Error::InvalidData("RAR 2.9 empty Huffman table"))
+        );
+
+        let mut empty_main_decoder = Unpack29::new();
+        empty_main_decoder.bits =
+            BitReader::from_bytes(&encoded_table_description(&[0; TABLE_COUNT]));
+        empty_main_decoder.read_tables().unwrap();
+        assert_eq!(
+            empty_main_decoder.main.decode(&mut empty_main_decoder.bits),
+            Err(Error::InvalidData("RAR 2.9 empty Huffman table"))
+        );
+    }
+
+    #[test]
+    fn incomplete_huffman_table_accepts_assigned_and_rejects_unassigned_prefixes() {
+        let table = Huffman::from_lengths(&[2]).unwrap();
+        let mut assigned = BitReader::from_bytes(&[0]);
+        assert_eq!(table.decode(&mut assigned), Ok(0));
+
+        let mut unassigned = BitReader::from_bytes(&[0x40, 0]);
+        assert_eq!(
+            table.decode(&mut unassigned),
+            Err(Error::InvalidData("RAR 2.9 invalid Huffman code"))
+        );
+    }
+
+    #[test]
+    fn truncated_table_headers_and_descriptions_need_more_input() {
+        let mut truncated_header = BitWriter::default();
+        truncated_header.write_bit(false);
+        truncated_header.write_bit(false);
+        truncated_header.write_bits(1, 4);
+        let mut decoder = Unpack29::new();
+        decoder.bits = BitReader::from_bytes(&truncated_header.finish());
+        assert_eq!(decoder.read_tables(), Err(Error::NeedMoreInput));
+
+        let mut level_lengths = [0; 20];
+        level_lengths[0] = 1;
+        level_lengths[19] = 1;
+        let mut decoder = Unpack29::new();
+        decoder.bits = BitReader::from_bytes(&table_description(
+            &level_lengths,
+            &[LevelToken::zero_run_long(138)],
+        ));
+        assert_eq!(decoder.read_tables(), Err(Error::NeedMoreInput));
+    }
+
+    #[test]
+    fn level_and_final_tables_reject_oversubscription() {
+        let mut oversubscribed_level = BitWriter::default();
+        oversubscribed_level.write_bit(false);
+        oversubscribed_level.write_bit(false);
+        for length in [1, 1, 1].into_iter().chain(std::iter::repeat_n(0, 17)) {
+            oversubscribed_level.write_bits(length, 4);
+        }
+        let mut decoder = Unpack29::new();
+        decoder.bits = BitReader::from_bytes(&oversubscribed_level.finish());
+        assert_eq!(
+            decoder.read_tables(),
+            Err(Error::InvalidData("RAR 2.9 oversubscribed Huffman table"))
+        );
+
+        let mut level_lengths = [0; 20];
+        level_lengths[1] = 1;
+        level_lengths[19] = 1;
+        let tokens = [
+            LevelToken::plain(1),
+            LevelToken::plain(1),
+            LevelToken::plain(1),
+            LevelToken::zero_run_long(138),
+            LevelToken::zero_run_long(138),
+            LevelToken::zero_run_long(125),
+        ];
+        let mut decoder = Unpack29::new();
+        decoder.bits = BitReader::from_bytes(&table_description(&level_lengths, &tokens));
+        assert_eq!(
+            decoder.read_tables(),
+            Err(Error::InvalidData("RAR 2.9 oversubscribed Huffman table"))
+        );
+    }
+
+    #[test]
+    fn unused_auxiliary_huffman_tables_may_be_empty() {
+        let mut levels = [0; TABLE_COUNT];
+        levels[b'A' as usize] = 1;
+        levels[256] = 1;
+        let mut decoder = Unpack29::new();
+        decoder.bits = BitReader::from_bytes(&encoded_table_description(&levels));
+
+        decoder.read_tables().unwrap();
+
+        assert!(!decoder.main.symbols.is_empty());
+        assert!(decoder.offsets.symbols.is_empty());
+        assert!(decoder.low_offsets.symbols.is_empty());
+        assert!(decoder.lengths.symbols.is_empty());
+        assert_eq!(
+            decoder.main.symbols.len()
+                + decoder.offsets.symbols.len()
+                + decoder.low_offsets.symbols.len()
+                + decoder.lengths.symbols.len(),
+            2
+        );
+        assert_eq!(
+            MAIN_COUNT + OFFSET_COUNT + LOW_OFFSET_COUNT + LENGTH_COUNT,
+            TABLE_COUNT
+        );
     }
 
     #[test]
