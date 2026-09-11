@@ -3874,11 +3874,11 @@ mod tests {
         BitReader, BitWriter, ChainEngine, EncodeOptions, EncodeToken, EncoderMatchState, Error,
         Huffman, LevelToken, MatchCandidate, OwnedVmFilterRecord, PpmdEncodeToken, PpmdEncoder,
         Rar29MatchFinder, Result, StandardFilter, Unpack29, Unpack29Encoder, VmFilter, VmProgram,
-        VmProgramKind, MAIN_COUNT, MAX_ENCODER_MATCH_OFFSET, MAX_MATCH_CANDIDATES,
+        VmProgramKind, MAIN_COUNT, MAX_ENCODER_MATCH_OFFSET, MAX_HISTORY, MAX_MATCH_CANDIDATES,
         MAX_VM_AUDIO_FILTER_BLOCK_SIZE, MAX_VM_DELTA_FILTER_BLOCK_SIZE, MAX_VM_FILTER_BLOCK_SIZE,
         PPMD_DICTIONARY_MB, PPMD_ESC, PPMD_ORDER, RAR3_AUDIO_FILTER_BYTECODE,
         RAR3_DELTA_FILTER_BYTECODE, RAR3_ITANIUM_FILTER_BYTECODE, RAR3_RGB_FILTER_BYTECODE,
-        TABLE_COUNT,
+        STREAM_CHUNK, TABLE_COUNT,
     };
 
     /// A flat code charges the same for every symbol in play. The keep-tables
@@ -4371,6 +4371,55 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         assert_eq!(unpack29_decode(&single, input.len()).unwrap(), input);
         assert_eq!(unpack29_decode(&blocked, input.len()).unwrap(), input);
         assert!(blocked.len() < input.len());
+    }
+
+    #[test]
+    fn matched_member_streams_across_flush_and_history_boundaries() {
+        struct RecordingSink {
+            data: Vec<u8>,
+            writes: Vec<usize>,
+        }
+
+        impl std::io::Write for RecordingSink {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.writes.push(data.len());
+                self.data.extend_from_slice(data);
+                Ok(data.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        // After the first literal, runs are encoded as 258-byte matches. The
+        // match starting at 1,048,513 therefore crosses the first 1 MiB flush
+        // boundary and has to be resumed by the next decode batch.
+        let input = vec![b'Z'; MAX_HISTORY + STREAM_CHUNK + 513];
+        let mut encoder = Unpack29Encoder::new();
+        let packed = encoder.encode_member(&input).unwrap();
+        assert_eq!(encoder.history.len(), MAX_HISTORY);
+
+        let mut decoder = Unpack29::new();
+        let mut sink = RecordingSink {
+            data: Vec::new(),
+            writes: Vec::new(),
+        };
+        decoder
+            .decode_member_to(&packed, input.len(), &mut sink)
+            .unwrap();
+
+        assert_eq!(sink.data, input);
+        assert_eq!(
+            sink.writes,
+            [STREAM_CHUNK; 5]
+                .into_iter()
+                .chain([513])
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(decoder.base_offset, input.len() - MAX_HISTORY);
+        assert_eq!(decoder.output.len(), MAX_HISTORY);
+        assert!(decoder.pending_match.is_none());
     }
 
     #[test]
