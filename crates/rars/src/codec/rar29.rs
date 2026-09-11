@@ -3064,7 +3064,10 @@ impl Unpack29 {
                 exec_count: 0,
                 globals: Vec::new(),
             });
-        } else if let Some(program) = self.programs.get_mut(program_index) {
+        } else {
+            // Equality is the new-program case above, and greater indices were
+            // rejected before parsing the record.
+            let program = &mut self.programs[program_index];
             program.exec_count = program.exec_count.wrapping_add(1);
             program.block_size = block_size;
         }
