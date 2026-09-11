@@ -5333,6 +5333,16 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
                 })
                 .collect();
             let encoded = audio_encode(&input, 1).unwrap();
+            assert_eq!(
+                audio_decode_with_control(
+                    &encoded,
+                    1,
+                    &crate::read_control::ReadControl::default(),
+                )
+                .unwrap(),
+                input,
+                "native predictor diverged for seed {seed}"
+            );
             let result = program
                 .execute(super::rarvm::Invocation {
                     input: &encoded,
