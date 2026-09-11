@@ -257,10 +257,7 @@ fn filtered_members_with_progress(
     let mut index = 0;
     let mut previous_end = 0;
     while index < ordered.len() {
-        let range = ordered[index].range.clone().unwrap_or(0..input.len());
-        if range.start >= range.end || range.end > input.len() {
-            return Err(Error::InvalidData("RAR 2.9 VM filter range is invalid"));
-        }
+        let range = checked_filter_range(input.len(), ordered[index])?;
         if range.start < previous_end {
             return Err(Error::InvalidData("RAR 2.9 VM filters partially overlap"));
         }
@@ -308,10 +305,7 @@ fn split_large_filter(
     input_len: usize,
     filter: crate::FilterSpec,
 ) -> Result<Vec<crate::FilterSpec>> {
-    let range = filter.range.clone().unwrap_or(0..input_len);
-    if range.start >= range.end || range.end > input_len {
-        return Err(Error::InvalidData("RAR 2.9 VM filter range is invalid"));
-    }
+    let range = checked_filter_range(input_len, &filter)?;
 
     // The smallest run of bytes each filter can still transform. A trailing
     // chunk shorter than this is left unfiltered rather than handed to a filter
@@ -366,6 +360,17 @@ fn split_large_filter(
         start = end;
     }
     Ok(filters)
+}
+
+fn checked_filter_range(
+    input_len: usize,
+    filter: &crate::FilterSpec,
+) -> Result<std::ops::Range<usize>> {
+    let range = filter.range.clone().unwrap_or(0..input_len);
+    if range.start >= range.end || range.end > input_len {
+        return Err(Error::InvalidData("RAR 2.9 VM filter range is invalid"));
+    }
+    Ok(range)
 }
 
 struct OwnedVmFilterRecord {
@@ -521,10 +526,7 @@ struct FilteredMember {
 }
 
 fn filtered_member(input: &[u8], filter: &crate::FilterSpec) -> Result<FilteredMember> {
-    let range = filter.range.clone().unwrap_or(0..input.len());
-    if range.start >= range.end || range.end > input.len() {
-        return Err(Error::InvalidData("RAR 2.9 VM filter range is invalid"));
-    }
+    let range = checked_filter_range(input.len(), filter)?;
     let mut filtered = input.to_vec();
     let (init_regs, code): (Vec<(usize, u32)>, &'static [u8]) = match rar29_filter(filter.kind)? {
         Rar29Filter::E8 => {
@@ -5639,16 +5641,81 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     }
 
     #[test]
-    fn writer_rejects_invalid_filter_ranges() {
+    fn public_encoders_reject_invalid_filter_ranges() {
         let input = vec![b'Z'; 96];
-        for range in [32..32, 0..97] {
+        for (start, end) in [(32, 32), (64, 32), (0, 97)] {
+            let range = start..end;
             let filter = crate::FilterSpec::range(crate::FilterKind::E8, range);
 
             assert_eq!(
                 Unpack29Encoder::new()
-                    .encode_member_with_filter(&input, filter)
+                    .encode_member_with_filter(&input, filter.clone())
                     .unwrap_err(),
                 Error::InvalidData("RAR 2.9 VM filter range is invalid")
+            );
+            assert_eq!(
+                unpack29_encode_ppmd_with_filter(&input, filter, MAX_ENCODER_MATCH_OFFSET)
+                    .unwrap_err(),
+                Error::InvalidData("RAR 2.9 VM filter range is invalid")
+            );
+        }
+    }
+
+    #[test]
+    fn public_encoder_rejects_invalid_filter_parameters() {
+        let input = vec![b'Z'; 96];
+        let cases = [
+            (
+                crate::FilterKind::Delta { channels: 0 },
+                Error::InvalidData("RAR 2.9 VM filter channel count is invalid"),
+            ),
+            (
+                crate::FilterKind::Delta {
+                    channels: MAX_VM_DELTA_FILTER_BLOCK_SIZE + 1,
+                },
+                Error::InvalidData("RAR 2.9 VM filter channel count is invalid"),
+            ),
+            (
+                crate::FilterKind::Audio { channels: 0 },
+                Error::InvalidData("RAR 2.9 VM filter channel count is invalid"),
+            ),
+            (
+                crate::FilterKind::Audio {
+                    channels: super::MAX_AUDIO_CHANNELS + 1,
+                },
+                Error::InvalidData("RAR 2.9 VM filter channel count is invalid"),
+            ),
+            (
+                crate::FilterKind::Rgb { width: 0, pos_r: 0 },
+                Error::InvalidData("RAR 2.9 RGB filter scanline width is invalid"),
+            ),
+            (
+                crate::FilterKind::Rgb {
+                    width: MAX_VM_FILTER_BLOCK_SIZE + 1,
+                    pos_r: 0,
+                },
+                Error::InvalidData("RAR 2.9 RGB filter scanline width is invalid"),
+            ),
+            (
+                crate::FilterKind::Rgb { width: 8, pos_r: 0 },
+                Error::InvalidData("RAR 2.9 RGB filter parameters are invalid"),
+            ),
+            (
+                crate::FilterKind::Rgb {
+                    width: 12,
+                    pos_r: 3,
+                },
+                Error::InvalidData("RAR 2.9 RGB filter parameters are invalid"),
+            ),
+        ];
+
+        for (kind, expected) in cases {
+            assert_eq!(
+                Unpack29Encoder::new()
+                    .encode_member_with_filter(&input, crate::FilterSpec::whole(kind))
+                    .unwrap_err(),
+                expected,
+                "accepted {kind:?}"
             );
         }
     }
@@ -6418,6 +6485,22 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
                 .unwrap_err(),
             expected
         );
+
+        let mut decoder = Unpack29::new();
+        decoder.filters.push(VmFilter {
+            program: 0,
+            start: 0,
+            size: 1,
+            regs: [0; 7],
+            global_data: vec![1],
+        });
+        assert_eq!(
+            decoder
+                .decode_non_solid_member_to(COMPRESSED_TEXT, 2400, &mut FailingWriter)
+                .unwrap_err(),
+            expected
+        );
+        assert!(decoder.filters.is_empty());
     }
 
     #[test]
@@ -6432,8 +6515,9 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
             global_data: vec![1, 2, 3],
         });
 
-        let output = decoder
-            .decode_non_solid_member(COMPRESSED_TEXT, 2400)
+        let mut output = Vec::new();
+        decoder
+            .decode_non_solid_member_to(COMPRESSED_TEXT, 2400, &mut output)
             .unwrap();
 
         assert_eq!(output, expected_text());
