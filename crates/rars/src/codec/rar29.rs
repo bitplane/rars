@@ -2678,11 +2678,10 @@ impl Unpack29 {
                     let count = 3 + self.bits.read_bits(3)? as usize;
                     fill_levels(&mut new_levels, &mut pos, count, 0)?;
                 }
-                19 => {
+                _ => {
                     let count = 11 + self.bits.read_bits(7)? as usize;
                     fill_levels(&mut new_levels, &mut pos, count, 0)?;
                 }
-                _ => return Err(Error::InvalidData("RAR 2.9 invalid level symbol")),
             }
         }
 
@@ -2741,9 +2740,6 @@ impl Unpack29 {
                     let index = symbol - 259;
                     let offset = self.old_offsets[index];
                     let length_slot = self.lengths.decode(&mut self.bits)?;
-                    if length_slot >= LENGTH_COUNT {
-                        return Err(Error::InvalidData("RAR 2.9 invalid repeat length slot"));
-                    }
                     let mut length = LENGTH_BASES[length_slot] + 2;
                     if LENGTH_BITS[length_slot] != 0 {
                         length += self.bits.read_bits(LENGTH_BITS[length_slot])? as usize;
@@ -2764,7 +2760,7 @@ impl Unpack29 {
                     self.last_length = 2;
                     self.copy_match(2, offset, output_size)?;
                 }
-                271..=298 => {
+                _ => {
                     let length_slot = symbol - 271;
                     let mut length = LENGTH_BASES[length_slot] + 3;
                     if LENGTH_BITS[length_slot] != 0 {
@@ -2782,7 +2778,6 @@ impl Unpack29 {
                     self.last_length = length;
                     self.copy_match(length, offset, output_size)?;
                 }
-                _ => return Err(Error::InvalidData("RAR 2.9 invalid main symbol")),
             }
         }
         Ok(())
@@ -2914,9 +2909,6 @@ impl Unpack29 {
 
     fn read_offset(&mut self) -> Result<usize> {
         let slot = self.offsets.decode(&mut self.bits)?;
-        if slot >= OFFSET_COUNT {
-            return Err(Error::InvalidData("RAR 2.9 invalid offset slot"));
-        }
         let mut offset = OFFSET_BASES[slot] + 1;
         let extra_bits = OFFSET_BITS[slot];
         if extra_bits != 0 {
@@ -2932,11 +2924,9 @@ impl Unpack29 {
                     if low == 16 {
                         self.low_offset_repeats = 15;
                         offset += self.last_low_offset;
-                    } else if low < 16 {
+                    } else {
                         self.last_low_offset = low;
                         offset += low;
-                    } else {
-                        return Err(Error::InvalidData("RAR 2.9 invalid low offset symbol"));
                     }
                 }
             } else {
@@ -3341,9 +3331,6 @@ impl Huffman {
     fn from_lengths(lengths: &[u8]) -> Result<Self> {
         let mut count = [0u16; 16];
         for &len in lengths {
-            if len > 15 {
-                return Err(Error::InvalidData("RAR 2.9 Huffman length is too large"));
-            }
             if len != 0 {
                 count[len as usize] += 1;
             }
@@ -4302,6 +4289,26 @@ mod tests {
             Huffman::from_lengths(&[1, 1, 1]),
             Err(Error::InvalidData("RAR 2.9 oversubscribed Huffman table"))
         ));
+    }
+
+    #[test]
+    fn huffman_decoding_returns_the_index_from_its_constructor_alphabet() {
+        for size in [20, MAIN_COUNT, OFFSET_COUNT, LOW_OFFSET_COUNT, LENGTH_COUNT] {
+            let lengths =
+                crate::codec::huffman::complete_lengths_for_frequencies(&vec![1; size], 15);
+            let codes = canonical_codes(&lengths).unwrap();
+            let table = Huffman::from_lengths(&lengths).unwrap();
+
+            for (expected, code) in codes.iter().enumerate() {
+                let code = code.unwrap();
+                let mut bits = BitWriter::default();
+                bits.write_bits(u32::from(code.code), code.len);
+                let mut bits = BitReader::from_bytes(&bits.finish());
+                let decoded = table.decode(&mut bits).unwrap();
+                assert_eq!(decoded, expected);
+                assert!(decoded < size);
+            }
+        }
     }
 
     fn table_description(level_lengths: &[u8; 20], tokens: &[LevelToken]) -> Vec<u8> {
