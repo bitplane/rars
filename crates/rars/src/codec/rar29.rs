@@ -1912,10 +1912,7 @@ fn best_ppmd_match(
     finder: &Rar29MatchFinder,
     max_match_distance: usize,
 ) -> Option<(usize, usize)> {
-    let max_offset = pos
-        .min(0x1000001)
-        .min(MAX_ENCODER_MATCH_OFFSET)
-        .min(max_match_distance);
+    let max_offset = pos.min(0x1000001).min(MAX_HISTORY).min(max_match_distance);
     let max_length = (input.len() - pos).min(MAX_PPMD_MATCH_LENGTH);
     if max_offset < 2 || max_length < MIN_PPMD_MATCH_LENGTH || pos + 3 >= input.len() {
         return None;
@@ -3916,7 +3913,7 @@ mod tests {
     }
 
     use super::{
-        apply_standard_filter, audio_encode, best_match, canonical_codes,
+        apply_standard_filter, audio_encode, best_match, best_ppmd_match, canonical_codes,
         encode_level_tokens_against, encode_ppmd_hybrid, encode_table_level_tokens,
         encode_tokens_with_progress, encoded_filter_records_at, itanium_decode, itanium_encode,
         lazy_match_decision, level_code_lengths, split_large_filter, unpack29_decode,
@@ -5029,6 +5026,22 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         assert!(unbounded.iter().any(
             |token| matches!(token, EncodeToken::Match { offset, .. } if *offset > 128 * 1024)
         ));
+    }
+
+    #[test]
+    fn ppmd_match_finder_uses_the_declared_dictionary_past_one_megabyte() {
+        let distance = MAX_ENCODER_MATCH_OFFSET + 4096;
+        let phrase = b"RAR29 PPMd match beyond the old one-megabyte ceiling";
+        let mut input = vec![0u8; distance + phrase.len()];
+        input[..phrase.len()].copy_from_slice(phrase);
+        input[distance..].copy_from_slice(phrase);
+        let mut finder = Rar29MatchFinder::new(input.len());
+        finder.insert(&input, 0);
+
+        assert_eq!(
+            best_ppmd_match(&input, distance, &finder, MAX_HISTORY),
+            Some((phrase.len(), distance))
+        );
     }
 
     #[test]
