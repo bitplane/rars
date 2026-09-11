@@ -54,6 +54,7 @@ const SHORT_BASES: [usize; 8] = [0, 4, 8, 16, 32, 64, 128, 192];
 const SHORT_BITS: [u8; 8] = [2, 2, 3, 4, 5, 6, 6, 6];
 const MAX_ENCODER_MATCH_OFFSET: usize = 1024 * 1024;
 const MAX_ENCODER_MATCH_LENGTH: usize = 258;
+const INVALID_MATCH_OFFSET: usize = usize::MAX;
 const MAX_MATCH_CANDIDATES: usize = 256;
 const MAX_PPMD_MATCH_LENGTH: usize = 255;
 const MIN_PPMD_MATCH_LENGTH: usize = 32;
@@ -2441,8 +2442,11 @@ impl Unpack29 {
             offsets: Huffman::empty(),
             low_offsets: Huffman::empty(),
             lengths: Huffman::empty(),
-            old_offsets: [0; 4],
-            last_offset: 0,
+            // UnRAR uses an invalid all-bits-one distance here. If a malformed
+            // stream repeats a distance before defining one, CopyString sees
+            // it as unavailable history and writes deterministic zeroes.
+            old_offsets: [INVALID_MATCH_OFFSET; 4],
+            last_offset: INVALID_MATCH_OFFSET,
             last_length: 0,
             last_low_offset: 0,
             low_offset_repeats: 0,
@@ -3199,16 +3203,12 @@ impl Unpack29 {
     }
 
     fn copy_match(&mut self, length: usize, offset: usize, output_size: usize) -> Result<()> {
-        // The bitstream normally encodes match distances as offset+1, so zero
-        // is not emitted for fresh matches. Keep the legacy decoder boundary
-        // tolerant here: a zero internal offset behaves as distance one.
-        let offset = if offset == 0 { 1 } else { offset };
         // A match reaching past the start of the stream writes zeroes rather
-        // than failing. WinRAR never clears its window and guards the copy
-        // with a first-wrap flag instead, so those bytes read as zero there,
-        // and an archive that leans on it stays readable here. The decision
-        // is taken once for the whole match, as it is there: a copy does not
-        // start on zeroes and cross into real bytes partway.
+        // than failing. Current UnRAR makes the same decision with its
+        // first-window flag, and libarchive reads from a zero-initialized
+        // circular dictionary. The decision is taken once for the whole
+        // match: a copy does not start on zeroes and cross into real bytes
+        // partway.
         let before_window = offset > self.current_pos();
         for index in 0..length {
             if self.current_pos() >= output_size {
@@ -5077,13 +5077,31 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     }
 
     #[test]
-    fn copy_match_treats_zero_offset_as_distance_one() {
+    fn an_undefined_repeat_distance_zero_fills_like_reference_readers() {
         let mut decoder = Unpack29::new();
-        decoder.output.push(b'Z');
+        let mut main_lengths = vec![0; MAIN_COUNT];
+        main_lengths[b'Z' as usize] = 1;
+        main_lengths[259] = 1;
+        decoder.main = Huffman::from_lengths(&main_lengths).unwrap();
+        let mut repeat_lengths = vec![0; LENGTH_COUNT];
+        repeat_lengths[2] = 1;
+        decoder.lengths = Huffman::from_lengths(&repeat_lengths).unwrap();
 
-        decoder.copy_match(4, 0, 5).unwrap();
+        let main_codes = canonical_codes(&main_lengths).unwrap();
+        let repeat_codes = canonical_codes(&repeat_lengths).unwrap();
+        let mut bits = BitWriter::default();
+        for code in [
+            main_codes[b'Z' as usize].unwrap(),
+            main_codes[259].unwrap(),
+            repeat_codes[2].unwrap(),
+        ] {
+            bits.write_bits(u32::from(code.code), code.len);
+        }
+        decoder.bits = BitReader::from_bytes(&bits.finish());
 
-        assert_eq!(decoder.output, b"ZZZZZ");
+        decoder.decode_lz(5).unwrap();
+
+        assert_eq!(decoder.output, b"Z\0\0\0\0");
     }
 
     #[test]
