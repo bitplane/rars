@@ -5817,6 +5817,25 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
                 "accepted {kind:?}"
             );
         }
+
+        assert_eq!(
+            Unpack29Encoder::new()
+                .encode_member_with_filter(
+                    &input,
+                    crate::FilterSpec::whole(crate::FilterKind::Delta { channels: 33 }),
+                )
+                .unwrap_err(),
+            Error::InvalidData("RAR 2.9 DELTA filter channel count is invalid")
+        );
+    }
+
+    #[test]
+    fn filtered_entry_point_accepts_empty_input_without_filters() {
+        let packed = Unpack29Encoder::new()
+            .encode_member_with_filters(b"", &[])
+            .unwrap();
+
+        assert!(unpack29_decode(&packed, 0).unwrap().is_empty());
     }
 
     #[test]
@@ -6164,6 +6183,16 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         let decoded = unpack29_decode(&packed, input.len()).unwrap();
 
         assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn encoder_emits_rar29_rgb_filter_with_nonzero_red_position() {
+        let width = 12;
+        let input: Vec<u8> = (0..96).map(|index| (index * 29 + 11) as u8).collect();
+        let packed =
+            encode_with_filter(&input, crate::FilterKind::Rgb { width, pos_r: 2 }).unwrap();
+
+        assert_eq!(unpack29_decode(&packed, input.len()).unwrap(), input);
     }
 
     #[test]
