@@ -530,21 +530,11 @@ fn filtered_member(input: &[u8], filter: &crate::FilterSpec) -> Result<FilteredM
     let mut filtered = input.to_vec();
     let (init_regs, code): (Vec<(usize, u32)>, &'static [u8]) = match rar29_filter(filter.kind)? {
         Rar29Filter::E8 => {
-            filters::encode_in_place(
-                FilterOp::E8,
-                &mut filtered[range.clone()],
-                range.start as u32,
-                rar29_delta_messages(),
-            )?;
+            filters::e8e9_encode(&mut filtered[range.clone()], range.start as u32, false);
             (Vec::new(), RAR3_E8_FILTER_BYTECODE)
         }
         Rar29Filter::E8E9 => {
-            filters::encode_in_place(
-                FilterOp::E8E9,
-                &mut filtered[range.clone()],
-                range.start as u32,
-                rar29_delta_messages(),
-            )?;
+            filters::e8e9_encode(&mut filtered[range.clone()], range.start as u32, true);
             (Vec::new(), RAR3_E8E9_FILTER_BYTECODE)
         }
         Rar29Filter::Delta { channels } => {
@@ -4996,6 +4986,32 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
             Error::InvalidData("RAR 2.9 VM filter extends beyond output")
         );
         assert!(prematurely_emitted.is_empty());
+    }
+
+    #[test]
+    fn a_future_filter_stays_scheduled_until_its_range_is_published() {
+        let mut decoder = Unpack29::new();
+        decoder.output.resize(128, 0);
+        decoder.programs.push(VmProgram {
+            kind: VmProgramKind::Standard(StandardFilter::E8),
+            block_size: 8,
+            exec_count: 0,
+            globals: Vec::new(),
+        });
+        decoder.filters.push(VmFilter {
+            program: 0,
+            start: 64,
+            size: 8,
+            regs: [0; 7],
+            global_data: Vec::new(),
+        });
+
+        assert_eq!(decoder.safe_flush_end(0, 32, 128).unwrap(), 32);
+        assert_eq!(decoder.filtered_range(0, 32, 0).unwrap(), vec![0; 32]);
+        assert_eq!(decoder.filters.len(), 1);
+
+        assert_eq!(decoder.filtered_range(32, 72, 0).unwrap(), vec![0; 40]);
+        assert!(decoder.filters.is_empty());
     }
 
     #[test]

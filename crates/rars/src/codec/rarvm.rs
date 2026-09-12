@@ -123,8 +123,9 @@ impl Program {
         while bits.remaining_bits() >= 8 {
             match parse_instruction(&mut bits, instructions.len()) {
                 Ok(instruction) => instructions.push(instruction),
-                Err(Error::NeedMoreInput) => break,
-                Err(error) => return Err(error),
+                // Instruction decoding only performs bounded bit reads. An
+                // incomplete final instruction is ignored for compatibility.
+                Err(_) => break,
             }
         }
 
@@ -366,6 +367,13 @@ struct Vm {
     flags: u32,
 }
 
+#[derive(Clone, Copy)]
+enum ShiftKind {
+    Left,
+    Right,
+    ArithmeticRight,
+}
+
 impl Vm {
     fn new(program: &Program, invocation: Invocation<'_>) -> Result<Self> {
         if invocation.input.len() > GLOBAL_BASE {
@@ -533,11 +541,12 @@ impl Vm {
             Opcode::Xor | Opcode::And | Opcode::Or | Opcode::Test => {
                 let a = self.read_operand(op(0)?, byte_mode);
                 let b = self.read_operand(op(1)?, byte_mode);
-                let result = match instruction.opcode {
-                    Opcode::Xor => a ^ b,
-                    Opcode::And | Opcode::Test => a & b,
-                    Opcode::Or => a | b,
-                    _ => unreachable!(),
+                let result = if instruction.opcode == Opcode::Xor {
+                    a ^ b
+                } else if instruction.opcode == Opcode::Or {
+                    a | b
+                } else {
+                    a & b
                 };
                 let result = self.mask_width(result, byte_mode);
                 if instruction.opcode != Opcode::Test {
@@ -574,9 +583,25 @@ impl Vm {
                 let result = self.mask_width(!self.read_operand(op(0)?, byte_mode), byte_mode);
                 self.write_operand(op(0)?, result, byte_mode)?;
             }
-            Opcode::Shl | Opcode::Shr | Opcode::Sar => {
+            Opcode::Shl => {
                 self.shift(
-                    instruction.opcode,
+                    ShiftKind::Left,
+                    op(0)?,
+                    self.read_operand(op(1)?, byte_mode),
+                    byte_mode,
+                )?;
+            }
+            Opcode::Shr => {
+                self.shift(
+                    ShiftKind::Right,
+                    op(0)?,
+                    self.read_operand(op(1)?, byte_mode),
+                    byte_mode,
+                )?;
+            }
+            Opcode::Sar => {
+                self.shift(
+                    ShiftKind::ArithmeticRight,
                     op(0)?,
                     self.read_operand(op(1)?, byte_mode),
                     byte_mode,
@@ -744,29 +769,29 @@ impl Vm {
         value
     }
 
-    fn shift(&mut self, opcode: Opcode, dst: &Operand, count: u32, byte_mode: bool) -> Result<()> {
+    fn shift(&mut self, kind: ShiftKind, dst: &Operand, count: u32, byte_mode: bool) -> Result<()> {
         if count == 0 {
             return Ok(());
         }
         let width = if byte_mode { 8 } else { 32 };
         let count = count.min(width);
         let value = self.read_operand(dst, byte_mode);
-        let result = match opcode {
-            Opcode::Shl => {
+        let result = match kind {
+            ShiftKind::Left => {
                 if count == width {
                     0
                 } else {
                     value.wrapping_shl(count)
                 }
             }
-            Opcode::Shr => {
+            ShiftKind::Right => {
                 if count == width {
                     0
                 } else {
                     value.wrapping_shr(count)
                 }
             }
-            Opcode::Sar => {
+            ShiftKind::ArithmeticRight => {
                 if byte_mode {
                     if count >= 8 {
                         if value & 0x80 != 0 {
@@ -787,12 +812,10 @@ impl Vm {
                     ((value as i32) >> count) as u32
                 }
             }
-            _ => unreachable!(),
         };
-        let carry = match opcode {
-            Opcode::Shl => value & (1 << (width - count)) != 0,
-            Opcode::Shr | Opcode::Sar => value & (1 << (count - 1)) != 0,
-            _ => unreachable!(),
+        let carry = match kind {
+            ShiftKind::Left => value & (1 << (width - count)) != 0,
+            ShiftKind::Right | ShiftKind::ArithmeticRight => value & (1 << (count - 1)) != 0,
         };
         let result = self.mask_width(result, byte_mode);
         self.write_operand(dst, result, byte_mode)?;
@@ -877,9 +900,6 @@ impl<'a> BitReader<'a> {
     }
 
     fn read_bits(&mut self, count: usize) -> Result<u32> {
-        if count > 32 {
-            return Err(Error::InvalidData("RARVM bit read is too wide"));
-        }
         if self.remaining_bits() < count {
             return Err(Error::NeedMoreInput);
         }
