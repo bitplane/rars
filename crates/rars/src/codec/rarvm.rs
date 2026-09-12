@@ -421,10 +421,19 @@ impl Vm {
         program: &Program,
         control: &crate::read_control::ReadControl,
     ) -> Result<ExecutionResult> {
+        self.run_with_limit(program, control, MAX_INSTRUCTIONS)
+    }
+
+    fn run_with_limit(
+        &mut self,
+        program: &Program,
+        control: &crate::read_control::ReadControl,
+        instruction_limit: usize,
+    ) -> Result<ExecutionResult> {
         let mut poller = control.poller();
         let mut ip = 0usize;
         let mut terminated = false;
-        for _ in 0..MAX_INSTRUCTIONS {
+        for _ in 0..instruction_limit {
             poller.check_codec(0)?;
             let Some(instruction) = program.instructions.get(ip) else {
                 terminated = true;
@@ -926,6 +935,27 @@ mod tests {
             .unwrap_err();
         assert_eq!(err, Error::Cancelled);
     }
+
+    #[test]
+    fn rejects_a_program_that_exhausts_its_instruction_allowance() {
+        let program = Program {
+            static_data: vec![],
+            instructions: vec![instr(Opcode::Jmp, false, vec![Operand::Immediate(0)])],
+        };
+        let invocation = Invocation {
+            input: &[],
+            regs: [0; 7],
+            global_data: &[],
+            file_offset: 0,
+            exec_count: 0,
+        };
+        let mut vm = Vm::new(&program, invocation).unwrap();
+
+        assert_eq!(
+            vm.run_with_limit(&program, &crate::read_control::ReadControl::default(), 3),
+            Err(Error::InvalidData("RARVM instruction limit exceeded"))
+        );
+    }
     use super::*;
 
     #[test]
@@ -1001,6 +1031,65 @@ mod tests {
             ]
         );
         assert_eq!(program.instructions[3].opcode, Opcode::Ret);
+    }
+
+    #[test]
+    fn parses_every_long_opcode_used_by_generic_programs() {
+        for opcode in [
+            Opcode::Xor,
+            Opcode::Sar,
+            Opcode::Pushf,
+            Opcode::Popf,
+            Opcode::Div,
+            Opcode::Adc,
+            Opcode::Sbb,
+        ] {
+            let mut bits = BitWriter::new();
+            bits.write_bits(0, 1); // no static data
+            write_opcode(&mut bits, opcode);
+            if opcode.supports_byte_mode() {
+                bits.write_bits(0, 1);
+            }
+            for index in 0..opcode.operand_count() {
+                write_reg(&mut bits, index as u8);
+            }
+            write_opcode(&mut bits, Opcode::Ret);
+
+            let program = Program::parse(&with_xor(bits.finish())).unwrap();
+            assert_eq!(program.instructions[0].opcode, opcode);
+        }
+    }
+
+    #[test]
+    fn parses_runtime_and_absolute_jump_targets() {
+        let mut runtime = BitWriter::new();
+        runtime.write_bits(0, 1); // no static data
+        write_opcode(&mut runtime, Opcode::Jmp);
+        write_reg(&mut runtime, 3);
+        let program = Program::parse(&with_xor(runtime.finish())).unwrap();
+        assert_eq!(program.instructions[0].operands, [Operand::Register(3)]);
+
+        let mut absolute = BitWriter::new();
+        absolute.write_bits(0, 1); // no static data
+        write_opcode(&mut absolute, Opcode::Jmp);
+        write_number_immediate(&mut absolute, 300);
+        let program = Program::parse(&with_xor(absolute.finish())).unwrap();
+        assert_eq!(program.instructions[0].operands, [Operand::Immediate(44)]);
+    }
+
+    #[test]
+    fn ignores_a_trailing_partial_instruction() {
+        let mut bits = BitWriter::new();
+        bits.write_bits(0, 1); // no static data
+        write_opcode(&mut bits, Opcode::Mov);
+        bits.write_bits(0, 1); // word mode
+        write_reg(&mut bits, 0); // second operand is absent
+
+        let program = Program::parse(&with_xor(bits.finish())).unwrap();
+        assert_eq!(
+            program.instructions,
+            [instr(Opcode::Ret, false, Vec::new())]
+        );
     }
 
     #[test]
@@ -1410,6 +1499,79 @@ mod tests {
     }
 
     #[test]
+    fn word_mode_sar_sign_extends_at_ordinary_and_full_width_counts() {
+        let result = execute_instructions(vec![
+            instr(
+                Opcode::Mov,
+                false,
+                vec![Operand::Register(0), Operand::Immediate(0x8000_0000)],
+            ),
+            instr(
+                Opcode::Sar,
+                false,
+                vec![Operand::Register(0), Operand::Immediate(1)],
+            ),
+            instr(
+                Opcode::Mov,
+                false,
+                vec![Operand::Register(1), Operand::Immediate(0x8000_0000)],
+            ),
+            instr(
+                Opcode::Sar,
+                false,
+                vec![Operand::Register(1), Operand::Immediate(32)],
+            ),
+            instr(
+                Opcode::Mov,
+                false,
+                vec![Operand::Register(2), Operand::Immediate(1)],
+            ),
+            instr(
+                Opcode::Sar,
+                false,
+                vec![Operand::Register(2), Operand::Immediate(32)],
+            ),
+            instr(Opcode::Ret, false, Vec::new()),
+        ]);
+
+        assert_eq!(result.regs[0], 0xc000_0000);
+        assert_eq!(result.regs[1], u32::MAX);
+        assert_eq!(result.regs[2], 0);
+    }
+
+    #[test]
+    fn neg_zero_sets_zero_and_divide_by_zero_keeps_the_destination() {
+        let result = execute_instructions(vec![
+            instr(
+                Opcode::Mov,
+                false,
+                vec![Operand::Register(0), Operand::Immediate(0)],
+            ),
+            instr(Opcode::Neg, false, vec![Operand::Register(0)]),
+            instr(Opcode::Jz, false, vec![Operand::Immediate(4)]),
+            instr(
+                Opcode::Mov,
+                false,
+                vec![Operand::Register(1), Operand::Immediate(99)],
+            ),
+            instr(
+                Opcode::Mov,
+                false,
+                vec![Operand::Register(1), Operand::Immediate(42)],
+            ),
+            instr(
+                Opcode::Div,
+                false,
+                vec![Operand::Register(1), Operand::Immediate(0)],
+            ),
+            instr(Opcode::Ret, false, Vec::new()),
+        ]);
+
+        assert_eq!(result.regs[0], 0);
+        assert_eq!(result.regs[1], 42);
+    }
+
+    #[test]
     fn full_width_shl_and_shr_clear_destination() {
         let result = execute_instructions(vec![
             instr(
@@ -1571,6 +1733,69 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.output, [0x5a]);
+    }
+
+    #[test]
+    fn output_range_past_memory_is_discarded() {
+        let program = Program {
+            static_data: Vec::new(),
+            instructions: vec![
+                instr(
+                    Opcode::Mov,
+                    false,
+                    vec![
+                        Operand::Absolute((GLOBAL_BASE + 0x20) as u32),
+                        Operand::Immediate((MEMORY_SIZE - 1) as u32),
+                    ],
+                ),
+                instr(
+                    Opcode::Mov,
+                    false,
+                    vec![
+                        Operand::Absolute((GLOBAL_BASE + 0x1c) as u32),
+                        Operand::Immediate(2),
+                    ],
+                ),
+                instr(Opcode::Ret, false, Vec::new()),
+            ],
+        };
+
+        let result = program
+            .execute(Invocation {
+                input: &[0x5a],
+                regs: [0; 7],
+                global_data: &[],
+                file_offset: 0,
+                exec_count: 0,
+            })
+            .unwrap();
+        assert!(result.output.is_empty());
+    }
+
+    #[test]
+    fn rejects_a_program_that_writes_to_an_immediate() {
+        let program = Program {
+            static_data: Vec::new(),
+            instructions: vec![
+                instr(
+                    Opcode::Mov,
+                    false,
+                    vec![Operand::Immediate(0), Operand::Immediate(1)],
+                ),
+                instr(Opcode::Ret, false, Vec::new()),
+            ],
+        };
+
+        assert_eq!(
+            program.execute(Invocation {
+                input: &[],
+                regs: [0; 7],
+                global_data: &[],
+                file_offset: 0,
+                exec_count: 0,
+            }),
+            Err(Error::InvalidData("RARVM write to immediate operand"))
+        );
     }
 
     #[test]
