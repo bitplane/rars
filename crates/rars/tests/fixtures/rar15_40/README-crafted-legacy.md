@@ -1,7 +1,19 @@
 # Crafted RAR 1.5-4.x headers
 
-Hand-built; no encoder emits these. Both were checked against RAR 7.12 and
-UnRAR 7.20.
+Hand-built edge cases that ordinary encoder operation does not emit.
+Compatibility observations are recorded with each fixture.
+
+## empty_compressed_payload_rar30.rar
+
+A 61-byte RAR 3.0 archive containing `empty.bin`. Its file header declares
+RAR29 compression method `0x33`, zero packed bytes, zero unpacked bytes, and
+the CRC-32 of an empty file. It was made from a stored empty archive emitted by
+rars by changing method `0x30` to `0x33` and recomputing the file-header CRC.
+
+On 2026-09-12, rars, UnRAR 7.20, and bsdtar/libarchive 3.8.5 all accepted it
+and extracted a zero-byte file. 7-Zip 26.00 recognized the archive but reported
+the member as an unsupported method. No historical WinRAR or RAR.EXE result is
+claimed: none was installed in the test environment.
 
 ## zero_head_size.rar
 

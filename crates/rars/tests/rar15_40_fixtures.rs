@@ -139,6 +139,28 @@ fn rejects_a_block_header_that_does_not_advance() {
         .is_err());
 }
 
+/// A compressed file header can legitimately describe an empty member without
+/// carrying a codec bitstream. UnRAR 7.20 and libarchive 3.8.5 both extract
+/// this fixture as an empty file; entering the RAR29 decoder would instead ask
+/// it to manufacture a block header from no input.
+#[test]
+fn extracts_a_compressed_empty_member_without_a_bitstream() {
+    let data = std::fs::read(fixture("empty_compressed_payload_rar30.rar")).unwrap();
+    let archive = Archive::parse(&data).unwrap();
+    let file = archive.files().next().unwrap();
+
+    assert_eq!(file.name, b"empty.bin");
+    assert_eq!(file.unp_ver, 29);
+    assert_eq!(file.method, 0x33);
+    assert_eq!(file.pack_size, 0);
+    assert_eq!(file.unp_size, 0);
+
+    let extracted = collect_extract(&archive).unwrap();
+    assert_eq!(extracted.len(), 1);
+    assert_eq!(extracted[0].name, b"empty.bin");
+    assert!(extracted[0].data.is_empty());
+}
+
 /// Below `UnpVer` 20 the per-file solid flag is written but never read: solid
 /// continuation follows the archive-level flag and position instead.
 ///
