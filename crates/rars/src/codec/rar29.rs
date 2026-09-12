@@ -4402,6 +4402,40 @@ mod tests {
     }
 
     #[test]
+    fn codec_helpers_reject_out_of_contract_reads_and_tables() {
+        assert!(matches!(
+            canonical_codes(&[16]),
+            Err(Error::InvalidData("RAR 2.9 Huffman length is too large"))
+        ));
+        assert_eq!(
+            BitReader::from_bytes(&[0; 4]).peek_bits(25),
+            Err(Error::InvalidData("RAR 2.9 bit read is too wide"))
+        );
+
+        let mut decoder = Unpack29::new();
+        decoder.base_offset = 10;
+        decoder.output.extend_from_slice(b"retained");
+        assert_eq!(
+            decoder.raw_range(9, 10),
+            Err(Error::InvalidData(
+                "RAR 2.9 retained history is unavailable"
+            ))
+        );
+        assert_eq!(
+            decoder.raw_range(12, 11),
+            Err(Error::InvalidData(
+                "RAR 2.9 retained history is unavailable"
+            ))
+        );
+        assert_eq!(
+            decoder.raw_range(10, 19),
+            Err(Error::InvalidData(
+                "RAR 2.9 retained history is unavailable"
+            ))
+        );
+    }
+
+    #[test]
     fn huffman_decoding_returns_the_index_from_its_constructor_alphabet() {
         for size in [20, MAIN_COUNT, OFFSET_COUNT, LOW_OFFSET_COUNT, LENGTH_COUNT] {
             let lengths =
@@ -4886,8 +4920,15 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
             input[position] = 0xe8;
             input[position + 1..position + 5].copy_from_slice(&0x1234u32.to_le_bytes());
         }
-        let packed =
-            encode_with_filter_range(&input, crate::FilterKind::E8, filter_range.clone()).unwrap();
+        // Literal coding stops exactly at the streaming target. Match coding
+        // can legally overshoot it and happen to complete this small filter in
+        // the same decode pass, which would not exercise the wait.
+        let packed = Unpack29Encoder::with_options(EncodeOptions::new(0))
+            .encode_member_with_filter(
+                &input,
+                crate::FilterSpec::range(crate::FilterKind::E8, filter_range.clone()),
+            )
+            .unwrap();
 
         let mut decoder = Unpack29::new();
         let mut sink = RecordingSink {
@@ -5069,6 +5110,41 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     }
 
     #[test]
+    fn match_field_encoders_reject_values_outside_the_wire_ranges() {
+        assert_eq!(
+            super::length_slot_for_match(2),
+            Err(Error::InvalidData("RAR 2.9 match length is too short"))
+        );
+        assert_eq!(
+            super::length_slot_for_match(MAX_ENCODER_MATCH_LENGTH + 1),
+            Err(Error::InvalidData("RAR 2.9 match length is too long"))
+        );
+        assert_eq!(
+            super::length_slot_for_repeat_match(1),
+            Err(Error::InvalidData(
+                "RAR 2.9 repeat match length is too short"
+            ))
+        );
+        assert_eq!(
+            super::length_slot_for_repeat_match(MAX_ENCODER_MATCH_LENGTH),
+            Err(Error::InvalidData(
+                "RAR 2.9 repeat match length is too long"
+            ))
+        );
+        assert_eq!(
+            super::offset_slot_for_match(0),
+            Err(Error::InvalidData("RAR 2.9 match offset is zero"))
+        );
+        let last_slot = OFFSET_COUNT - 1;
+        let largest_offset =
+            super::OFFSET_BASES[last_slot] + (1usize << super::OFFSET_BITS[last_slot]) - 1 + 1;
+        assert_eq!(
+            super::offset_slot_for_match(largest_offset + 1),
+            Err(Error::InvalidData("RAR 2.9 match offset is too large"))
+        );
+    }
+
+    #[test]
     fn cost_aware_match_selection_prefers_repeat_offset_token() {
         let pos = 600usize;
         let mut input: Vec<u8> = (0..pos + 16)
@@ -5233,6 +5309,29 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         decoder.decode_lz(5).unwrap();
 
         assert_eq!(decoder.output, b"Z\0\0\0\0");
+    }
+
+    #[test]
+    fn an_undefined_last_match_repeat_is_a_noop_like_reference_readers() {
+        let mut decoder = Unpack29::new();
+        let mut main_lengths = vec![0; MAIN_COUNT];
+        main_lengths[258] = 1;
+        main_lengths[b'X' as usize] = 2;
+        main_lengths[b'Y' as usize] = 2;
+        decoder.main = Huffman::from_lengths(&main_lengths).unwrap();
+
+        let main_codes = canonical_codes(&main_lengths).unwrap();
+        let mut bits = BitWriter::default();
+        for symbol in [b'X' as usize, 258, b'Y' as usize] {
+            let code = main_codes[symbol].unwrap();
+            bits.write_bits(u32::from(code.code), code.len);
+        }
+        decoder.bits = BitReader::from_bytes(&bits.finish());
+
+        decoder.decode_lz(2).unwrap();
+
+        assert_eq!(decoder.output, b"XY");
+        assert_eq!(decoder.last_length, 0);
     }
 
     #[test]
@@ -5724,6 +5823,18 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     fn filtered_progress_polls_preprocessing_and_keeps_cancelled_state_transactional() {
         let input = vec![b'Z'; MAX_VM_FILTER_BLOCK_SIZE * 2 + 16];
         let filter = crate::FilterSpec::whole(crate::FilterKind::E8);
+        let mut at_entry = Unpack29Encoder::new();
+        assert_eq!(
+            at_entry.encode_member_with_filters_and_progress(
+                &input,
+                std::slice::from_ref(&filter),
+                Some(&mut |_| false),
+            ),
+            Err(Error::Cancelled)
+        );
+        assert!(at_entry.history.is_empty());
+        assert_eq!(at_entry.levels, [0; TABLE_COUNT]);
+
         let mut preprocessing = Unpack29Encoder::new();
         let mut polls = 0;
         let result = preprocessing.encode_member_with_filters_and_progress(
@@ -5782,6 +5893,39 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         assert_eq!(encoder.history, original_history);
         assert_eq!(encoder.levels, original_levels);
         assert!(encoder.ppmd.is_none());
+
+        // Candidate encodes can themselves poll at the completed member byte
+        // count. Measure a successful two-candidate pass, then refuse its last
+        // poll: that last poll is the explicit boundary after the candidate
+        // has been evaluated and before its state can be committed.
+        let candidates = [Vec::new(), Vec::new()];
+        let mut successful_polls = 0;
+        let mut probe = encoder.clone();
+        probe
+            .encode_member_with_engine(&input, ChainEngine::Lz, &candidates, &mut |position| {
+                if position == input.len() {
+                    successful_polls += 1;
+                }
+                true
+            })
+            .unwrap();
+        let mut polls = 0;
+        let result = encoder.encode_member_with_engine(
+            &input,
+            ChainEngine::Lz,
+            &candidates,
+            &mut |position| {
+                if position == input.len() {
+                    polls += 1;
+                    return polls < successful_polls;
+                }
+                true
+            },
+        );
+        assert_eq!(result, Err(Error::Cancelled));
+        assert_eq!(polls, successful_polls);
+        assert_eq!(encoder.history, original_history);
+        assert_eq!(encoder.levels, original_levels);
 
         completions = 0;
         let result =
@@ -6770,10 +6914,34 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     }
 
     #[test]
+    fn short_itanium_filter_encoding_is_a_defined_noop() {
+        for len in 4..=21 {
+            let input: Vec<u8> = (0..len).map(|index| (index * 17 + 3) as u8).collect();
+            let packed = encode_with_filter(&input, crate::FilterKind::Itanium).unwrap();
+            assert_eq!(
+                unpack29_decode(&packed, input.len()).unwrap(),
+                input,
+                "changed a {len}-byte block"
+            );
+        }
+    }
+
+    #[test]
     fn vm_encoded_u32_accepts_32_bit_form() {
         let mut bits = super::BitReader::from_bytes(&[0xff; 5]);
 
         assert_eq!(bits.read_encoded_u32().unwrap(), 0xffff_ffff);
+    }
+
+    #[test]
+    fn vm_encoded_u32_accepts_the_signed_constant_form() {
+        let mut encoded = BitWriter::default();
+        encoded.write_bits(1, 2);
+        encoded.write_bits(0x0a, 8);
+        encoded.write_bits(0x05, 4);
+        let mut bits = BitReader::from_bytes(&encoded.finish());
+
+        assert_eq!(bits.read_encoded_u32().unwrap(), 0xffff_ffa5);
     }
 
     #[test]
@@ -6834,6 +7002,37 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
             let (header_len, payload_len) = declared_payload(&record);
             assert_eq!(record.len(), header_len + payload_len);
         }
+    }
+
+    #[test]
+    fn decoder_reads_a_vm_filter_with_a_16_bit_payload_length() {
+        let globals = vec![0x5a; 300];
+        let record = super::encode_vm_filter_record_inner(
+            super::VmFilterRecord {
+                block_start: 3,
+                block_size: 16,
+                init_regs: &[],
+                code: super::RAR3_E8_FILTER_BYTECODE,
+                global_data: &globals,
+            },
+            0,
+            true,
+        )
+        .unwrap();
+        assert_eq!(record[0] & 7, 7);
+
+        let mut decoder = Unpack29::new();
+        decoder.bits = BitReader::from_bytes(&record);
+        decoder.read_vm_code().unwrap();
+
+        assert_eq!(decoder.programs.len(), 1);
+        assert_eq!(decoder.filters.len(), 1);
+        assert_eq!(decoder.filters[0].start, 3);
+        assert_eq!(decoder.filters[0].size, 16);
+        assert_eq!(
+            &decoder.filters[0].global_data[super::VM_SYSTEM_GLOBAL_SIZE..],
+            globals
+        );
     }
 
     #[test]
