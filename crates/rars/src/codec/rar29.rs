@@ -3119,6 +3119,7 @@ impl Unpack29 {
                 (filter.start >= start && filter.start + filter.size <= end).then_some(index)
             })
             .collect();
+        let mut applied = vec![false; self.filters.len()];
         let mut index = 0;
         while index < filters.len() {
             let first = self
@@ -3178,6 +3179,7 @@ impl Unpack29 {
                         block = result.output;
                     }
                 }
+                applied[filters[index]] = true;
                 index += 1;
                 let Some(next) = filters.get(index).and_then(|&next| self.filters.get(next)) else {
                     break;
@@ -3190,6 +3192,12 @@ impl Unpack29 {
             pos = filter_start + filter_size;
         }
         out.extend_from_slice(self.raw_range(pos, end)?);
+        let mut index = 0;
+        self.filters.retain(|_| {
+            let keep = !applied[index];
+            index += 1;
+            keep
+        });
         Ok(out)
     }
 
@@ -3926,6 +3934,22 @@ mod tests {
         );
         // Entry, the bounded filter record, then the PPMd block itself.
         assert_eq!(polls, 3);
+
+        let mut polls = 0;
+        assert_eq!(
+            super::unpack29_encode_ppmd_with_progress(
+                &input,
+                true,
+                Some(crate::FilterSpec::whole(crate::FilterKind::E8)),
+                1 << 20,
+                &mut |_| {
+                    polls += 1;
+                    polls < 2
+                },
+            ),
+            Err(super::Error::Cancelled)
+        );
+        assert_eq!(polls, 2);
     }
 
     #[test]
@@ -3984,6 +4008,24 @@ mod tests {
                 _ => audio_decode_with_control(&data, 2, &control).map(|_| ()),
             };
             assert_eq!(result.unwrap_err(), Error::Cancelled);
+        }
+    }
+
+    #[test]
+    fn cancellation_propagates_from_shared_standard_filter_decoders() {
+        for (filter, regs) in [
+            (StandardFilter::E8, [0; 7]),
+            (StandardFilter::E8E9, [0; 7]),
+            (StandardFilter::Delta, [1, 0, 0, 0, 0, 0, 0]),
+        ] {
+            let token = crate::ReadCancellation::new();
+            let control = crate::read_control::ReadControl::new(Some(&token));
+            control.cancel_after_checks(2);
+            let mut data = vec![0; 384 * 1024];
+            assert_eq!(
+                super::apply_standard_filter_with_control(filter, &mut data, 0, &regs, &control,),
+                Err(Error::Cancelled)
+            );
         }
     }
     use super::rarvm::{Instruction, Opcode, Operand, Program};
@@ -4881,6 +4923,22 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     }
 
     #[test]
+    fn block_encoder_trims_local_history_at_the_dictionary_boundary() {
+        let history = vec![b'Z'; MAX_HISTORY];
+        let options = EncodeOptions::new(0).with_block_size(1);
+        let mut encoder = Unpack29Encoder::with_options(options);
+        encoder.history.clone_from(&history);
+        let packed = encoder.encode_member(b"AB").unwrap();
+
+        let mut decoder = Unpack29::new();
+        decoder.output = history;
+        assert_eq!(decoder.decode_member(&packed, 2).unwrap(), b"AB");
+        assert_eq!(encoder.history.len(), MAX_HISTORY);
+        assert_eq!(&encoder.history[MAX_HISTORY - 2..], b"AB");
+        assert_eq!(&decoder.output[MAX_HISTORY - 2..], b"AB");
+    }
+
+    #[test]
     fn filter_spanning_a_flush_waits_for_complete_input_and_is_retired() {
         struct RecordingSink {
             data: Vec<u8>,
@@ -5065,6 +5123,23 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
                 .with_lazy_lookahead(2),
             &EncoderMatchState::default(),
             current,
+        ));
+    }
+
+    #[test]
+    fn lazy_lz_parser_stops_lookahead_at_member_end() {
+        let input = b"aaaaaa";
+        let mut finder = Rar29MatchFinder::new(input.len());
+        finder.insert(input, 0);
+        let state = EncoderMatchState::default();
+        let options = EncodeOptions::default()
+            .with_lazy_matching(true)
+            .with_lazy_lookahead(16);
+        let current = best_match(input, 2, input.len(), &finder, options, &state).unwrap();
+
+        assert_eq!((current.length, current.offset), (4, 2));
+        assert!(!should_lazy_emit_literal(
+            input, 2, &finder, options, &state, current,
         ));
     }
 
@@ -5947,6 +6022,17 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         assert!(encoder.ppmd.is_none());
     }
 
+    #[test]
+    fn plain_solid_candidate_propagates_encoder_cancellation() {
+        let mut encoder = Unpack29Encoder::new();
+        let input = b"plain candidate cancellation";
+        let result = encoder.encode_member_with_engine(input, ChainEngine::Lz, &[], &mut |_| false);
+
+        assert_eq!(result, Err(Error::Cancelled));
+        assert!(encoder.history.is_empty());
+        assert_eq!(encoder.levels, [0; TABLE_COUNT]);
+    }
+
     fn encode_with_filter(input: &[u8], kind: crate::FilterKind) -> Result<Vec<u8>> {
         Unpack29Encoder::new().encode_member_with_filter(input, crate::FilterSpec::whole(kind))
     }
@@ -6612,6 +6698,53 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
             .decode_member_from_reader(&mut reader, 0, &mut written)
             .unwrap();
         assert!(written.is_empty());
+    }
+
+    #[test]
+    fn direct_codec_accepts_an_empty_stream_for_an_empty_member() {
+        assert!(Unpack29::new().decode_member(&[], 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn empty_members_still_validate_a_supplied_table_header() {
+        assert_eq!(
+            Unpack29::new().decode_member(&[0], 0),
+            Err(Error::InvalidData("RAR 2.9 bitstream is truncated"))
+        );
+
+        let invalid = table_description(&[0; 20], &[]);
+        assert_eq!(
+            Unpack29::new().decode_member(&invalid, 0),
+            Err(Error::InvalidData("RAR 2.9 empty Huffman table"))
+        );
+    }
+
+    #[test]
+    fn oversized_untrusted_filter_waits_across_a_streaming_batch() {
+        let expected = vec![0; STREAM_CHUNK + 1];
+        let packed = Unpack29Encoder::with_options(EncodeOptions::new(0))
+            .encode_member(&expected)
+            .unwrap();
+        let mut decoder = Unpack29::new();
+        decoder.programs.push(VmProgram {
+            kind: VmProgramKind::Standard(StandardFilter::E8),
+            block_size: expected.len(),
+            exec_count: 0,
+            globals: Vec::new(),
+        });
+        decoder.filters.push(VmFilter {
+            program: 0,
+            start: 0,
+            size: expected.len(),
+            regs: [0; 7],
+            global_data: Vec::new(),
+        });
+
+        assert_eq!(
+            decoder.decode_member(&packed, expected.len()).unwrap(),
+            expected
+        );
+        assert!(decoder.filters.is_empty());
     }
 
     #[test]
