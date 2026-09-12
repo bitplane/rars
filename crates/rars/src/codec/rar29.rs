@@ -2272,21 +2272,16 @@ fn level_tokens_bit_cost(tokens: &[LevelToken]) -> usize {
 }
 
 fn emit_repeat_level_run(tokens: &mut Vec<LevelToken>, mut run: usize) {
-    while run != 0 {
-        if run >= 11 {
-            let mut chunk = run.min(138);
-            if matches!(run - chunk, 1 | 2) && chunk >= 14 {
-                chunk -= 3;
-            }
-            tokens.push(LevelToken::repeat_previous_long(chunk));
-            run -= chunk;
-        } else if run >= 3 {
-            let chunk = run.min(10);
-            tokens.push(LevelToken::repeat_previous_short(chunk));
-            run -= chunk;
-        } else {
-            break;
+    while run >= 11 {
+        let mut chunk = run.min(138);
+        if matches!(run - chunk, 1 | 2) && chunk >= 14 {
+            chunk -= 3;
         }
+        tokens.push(LevelToken::repeat_previous_long(chunk));
+        run -= chunk;
+    }
+    if run >= 3 {
+        tokens.push(LevelToken::repeat_previous_short(run));
     }
 }
 
@@ -2601,11 +2596,6 @@ impl Unpack29 {
 
             let safe_end = self.safe_flush_end(flushed, target, final_target)?;
             if safe_end <= flushed {
-                if target == final_target {
-                    return Err(Error::InvalidData(
-                        "RAR 2.9 VM filter extends beyond output",
-                    ));
-                }
                 target = self
                     .current_pos()
                     .saturating_add(STREAM_CHUNK)
@@ -2787,9 +2777,7 @@ impl Unpack29 {
                 263..=270 => {
                     let index = symbol - 263;
                     let mut offset = SHORT_BASES[index] + 1;
-                    if SHORT_BITS[index] != 0 {
-                        offset += self.bits.read_bits(SHORT_BITS[index])? as usize;
-                    }
+                    offset += self.bits.read_bits(SHORT_BITS[index])? as usize;
                     self.push_old_offset(offset);
                     self.last_offset = offset;
                     self.last_length = 2;
@@ -2869,9 +2857,6 @@ impl Unpack29 {
     }
 
     fn finish_ppmd_member(&mut self) -> Result<bool> {
-        if self.block_mode != BlockMode::Ppmd {
-            return Ok(false);
-        }
         let symbol = require_ppmd_symbol(self.ppmd.decode_symbol(&mut self.bits)?)?;
         if symbol != self.ppmd_esc {
             return Err(Error::InvalidData("RAR 2.9 PPMd member has trailing data"));
