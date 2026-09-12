@@ -161,50 +161,52 @@ impl Program {
 }
 
 impl Opcode {
-    fn from_u8(value: u8) -> Result<Self> {
-        match value {
-            0 => Ok(Self::Mov),
-            1 => Ok(Self::Cmp),
-            2 => Ok(Self::Add),
-            3 => Ok(Self::Sub),
-            4 => Ok(Self::Jz),
-            5 => Ok(Self::Jnz),
-            6 => Ok(Self::Inc),
-            7 => Ok(Self::Dec),
-            8 => Ok(Self::Jmp),
-            9 => Ok(Self::Xor),
-            10 => Ok(Self::And),
-            11 => Ok(Self::Or),
-            12 => Ok(Self::Test),
-            13 => Ok(Self::Js),
-            14 => Ok(Self::Jns),
-            15 => Ok(Self::Jb),
-            16 => Ok(Self::Jbe),
-            17 => Ok(Self::Ja),
-            18 => Ok(Self::Jae),
-            19 => Ok(Self::Push),
-            20 => Ok(Self::Pop),
-            21 => Ok(Self::Call),
-            22 => Ok(Self::Ret),
-            23 => Ok(Self::Not),
-            24 => Ok(Self::Shl),
-            25 => Ok(Self::Shr),
-            26 => Ok(Self::Sar),
-            27 => Ok(Self::Neg),
-            28 => Ok(Self::Pusha),
-            29 => Ok(Self::Popa),
-            30 => Ok(Self::Pushf),
-            31 => Ok(Self::Popf),
-            32 => Ok(Self::Movzx),
-            33 => Ok(Self::Movsx),
-            34 => Ok(Self::Xchg),
-            35 => Ok(Self::Mul),
-            36 => Ok(Self::Div),
-            37 => Ok(Self::Adc),
-            38 => Ok(Self::Sbb),
-            39 => Ok(Self::Print),
-            _ => Err(Error::InvalidData("RARVM opcode is invalid")),
-        }
+    fn from_encoded(value: u8) -> Self {
+        const OPCODES: [Opcode; 40] = [
+            Opcode::Mov,
+            Opcode::Cmp,
+            Opcode::Add,
+            Opcode::Sub,
+            Opcode::Jz,
+            Opcode::Jnz,
+            Opcode::Inc,
+            Opcode::Dec,
+            Opcode::Jmp,
+            Opcode::Xor,
+            Opcode::And,
+            Opcode::Or,
+            Opcode::Test,
+            Opcode::Js,
+            Opcode::Jns,
+            Opcode::Jb,
+            Opcode::Jbe,
+            Opcode::Ja,
+            Opcode::Jae,
+            Opcode::Push,
+            Opcode::Pop,
+            Opcode::Call,
+            Opcode::Ret,
+            Opcode::Not,
+            Opcode::Shl,
+            Opcode::Shr,
+            Opcode::Sar,
+            Opcode::Neg,
+            Opcode::Pusha,
+            Opcode::Popa,
+            Opcode::Pushf,
+            Opcode::Popf,
+            Opcode::Movzx,
+            Opcode::Movsx,
+            Opcode::Xchg,
+            Opcode::Mul,
+            Opcode::Div,
+            Opcode::Adc,
+            Opcode::Sbb,
+            Opcode::Print,
+        ];
+        // The short form is three bits and the long form is five bits plus
+        // eight, so the wire representation can only produce 0..=39.
+        OPCODES[usize::from(value)]
     }
 
     fn operand_count(self) -> usize {
@@ -296,9 +298,9 @@ impl Opcode {
 
 fn parse_instruction(bits: &mut BitReader<'_>, instruction_index: usize) -> Result<Instruction> {
     let opcode = if bits.read_bit()? == 0 {
-        Opcode::from_u8(bits.read_bits(3)? as u8)?
+        Opcode::from_encoded(bits.read_bits(3)? as u8)
     } else {
-        Opcode::from_u8(bits.read_bits(5)? as u8 + 8)?
+        Opcode::from_encoded(bits.read_bits(5)? as u8 + 8)
     };
     let byte_mode = opcode.supports_byte_mode() && bits.read_bit()? != 0;
     let mut operands = Vec::with_capacity(opcode.operand_count());
@@ -903,8 +905,7 @@ impl<'a> BitReader<'a> {
                 }
             }
             2 => self.read_bits(16),
-            3 => self.read_bits(32),
-            _ => unreachable!(),
+            _ => self.read_bits(32),
         }
     }
 }
@@ -964,6 +965,32 @@ mod tests {
             Program::parse(&[0x12, 0x34]),
             Err(Error::InvalidData("RARVM program checksum mismatch"))
         );
+    }
+
+    #[test]
+    fn rejects_an_empty_program_blob() {
+        assert_eq!(
+            Program::parse(&[]),
+            Err(Error::InvalidData("RARVM program blob is empty"))
+        );
+    }
+
+    #[test]
+    fn an_explicitly_empty_program_terminates_without_changing_its_input() {
+        let result = Program {
+            static_data: Vec::new(),
+            instructions: Vec::new(),
+        }
+        .execute(Invocation {
+            input: b"unchanged",
+            regs: [0; 7],
+            global_data: &[],
+            file_offset: 0,
+            exec_count: 0,
+        })
+        .unwrap();
+
+        assert_eq!(result.output, b"unchanged");
     }
 
     #[test]
