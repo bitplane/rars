@@ -3242,14 +3242,9 @@ impl Unpack50Decoder {
                             dictionary_size,
                         )?;
                     }
-                    _ if mode == DecodeMode::LiteralOnly => {
-                        return Err(Error::InvalidData(
-                            "RAR 5 literal-only decoder encountered non-literal symbol",
-                        ));
-                    }
                     _ => {
                         return Err(Error::InvalidData(
-                            "RAR 5 decoder encountered unsupported control symbol",
+                            "RAR 5 literal-only decoder encountered non-literal symbol",
                         ));
                     }
                 }
@@ -7060,6 +7055,60 @@ mod tests {
     }
 
     #[test]
+    fn decoders_handle_uninitialized_match_controls() {
+        for (symbol, buffered_error, streaming_error) in [
+            (257, Error::NeedMoreInput, Error::NeedMoreInput),
+            (
+                258,
+                Error::InvalidData("RAR 5 repeat distance is not initialized"),
+                Error::InvalidData("RAR 5 repeat distance is not initialized"),
+            ),
+        ] {
+            let input = control_only_block(symbol);
+            assert_eq!(
+                Unpack50Decoder::new().decode_member_with_dictionary(
+                    &input,
+                    0,
+                    1,
+                    DEFAULT_DICTIONARY_SIZE,
+                    false,
+                    DecodeMode::Lz,
+                ),
+                Err(buffered_error)
+            );
+            let result = Unpack50Decoder::new().decode_member_from_reader_with_dictionary_to_sink(
+                &mut input.as_slice(),
+                0,
+                1,
+                DEFAULT_DICTIONARY_SIZE,
+                false,
+                |_chunk| Ok::<(), std::convert::Infallible>(()),
+            );
+            assert!(
+                matches!(result, Err(StreamDecodeError::Decode(error)) if error == streaming_error)
+            );
+        }
+    }
+
+    #[test]
+    fn literal_only_decoder_rejects_control_symbol() {
+        let input = control_only_block(257);
+        assert_eq!(
+            Unpack50Decoder::new().decode_member_with_dictionary(
+                &input,
+                0,
+                1,
+                DEFAULT_DICTIONARY_SIZE,
+                false,
+                DecodeMode::LiteralOnly,
+            ),
+            Err(Error::InvalidData(
+                "RAR 5 literal-only decoder encountered non-literal symbol"
+            ))
+        );
+    }
+
+    #[test]
     fn streaming_decoder_rejects_missing_tables_and_invalid_dictionary() {
         let input = encode_compressed_block(&[0], 8, false, true).unwrap();
         let decode = |dictionary_size| {
@@ -7325,5 +7374,24 @@ mod tests {
             writer.write_bits(0, 1); // length slot 0
         }
         writer.finish()
+    }
+
+    fn control_only_block(symbol: usize) -> Vec<u8> {
+        let mut lengths = TableLengths {
+            main: vec![0; MAIN_TABLE_SIZE],
+            distance: vec![0; DISTANCE_TABLE_SIZE_50],
+            align: vec![0; ALIGN_TABLE_SIZE],
+            length: vec![0; LENGTH_TABLE_SIZE],
+        };
+        lengths.main[b'A' as usize] = 1;
+        lengths.main[symbol] = 1;
+        let (bytes, bit_pos) = encode_table_lengths_with_bit_count(&lengths, 0).unwrap();
+        let mut writer = BitWriter {
+            bytes: Buffer::from_vec(bytes),
+            bit_pos,
+        };
+        writer.write_bits(1, 1);
+        let payload_bits = writer.bit_pos;
+        encode_compressed_block(&writer.finish(), payload_bits, true, true).unwrap()
     }
 }
