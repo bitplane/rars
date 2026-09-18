@@ -4841,6 +4841,29 @@ mod tests {
     }
 
     #[test]
+    fn streaming_block_plan_rejects_gaps_and_invalid_ends() {
+        let data = b"ABCD";
+        let options = EncodeOptions::new(0);
+        let allowance = Allowance::default();
+        for blocks in [
+            vec![(0, false)],
+            vec![(5, true)],
+            vec![(2, false), (2, true)],
+        ] {
+            assert!(matches!(
+                streaming_blocks_with_allowance(data, &[], &blocks, 0, options, None, &allowance,),
+                Err(Error::InvalidData("RAR 5 streaming block range is invalid"))
+            ));
+        }
+        assert!(matches!(
+            streaming_blocks_with_allowance(data, &[], &[(2, false)], 0, options, None, &allowance,),
+            Err(Error::InvalidData(
+                "RAR 5 streaming blocks do not cover input"
+            ))
+        ));
+    }
+
+    #[test]
     fn member_allowance_covers_history_tables_and_retained_block_output() {
         let data = b"bounded member with repeated words and short matches\n".repeat(3000);
         let history = b"short matches and remembered history\n".repeat(1000);
