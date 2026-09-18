@@ -5608,6 +5608,45 @@ mod tests {
     }
 
     #[test]
+    fn table_encoder_validates_public_inputs() {
+        let mut lengths = TableLengths {
+            main: vec![0; MAIN_TABLE_SIZE],
+            distance: vec![0; DISTANCE_TABLE_SIZE_50],
+            align: vec![0; ALIGN_TABLE_SIZE],
+            length: vec![0; LENGTH_TABLE_SIZE],
+        };
+        lengths.main[b'A' as usize] = 1;
+        lengths.main[b'B' as usize] = 1;
+        let encoded = encode_table_lengths(&lengths, 0).unwrap();
+        assert_eq!(read_table_lengths(&encoded, 0).unwrap().0, lengths);
+
+        assert_eq!(
+            encode_table_lengths(&lengths, 2),
+            Err(Error::InvalidData(
+                "RAR 5 unknown compression algorithm version"
+            ))
+        );
+        lengths.distance.pop();
+        assert_eq!(
+            encode_table_lengths(&lengths, 0),
+            Err(Error::InvalidData("RAR 5 table length count mismatch"))
+        );
+        lengths.distance.push(0);
+        lengths.main[0] = 16;
+        assert_eq!(
+            encode_table_lengths(&lengths, 0),
+            Err(Error::InvalidData("RAR 5 Huffman length is too large"))
+        );
+    }
+
+    #[test]
+    fn member_encoders_reject_unknown_algorithm_version() {
+        let expected = Error::InvalidData("RAR 5 unknown compression algorithm version");
+        assert_eq!(encode_literal_only(b"AB", 2).unwrap_err(), expected);
+        assert_eq!(encode_lz_member(b"ABABABAB", 2).unwrap_err(), expected);
+    }
+
+    #[test]
     fn table_level_encoder_uses_rar5_run_symbols() {
         let mut lengths =
             vec![
