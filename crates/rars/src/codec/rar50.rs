@@ -985,26 +985,20 @@ pub(crate) fn streaming_blocks_with_allowance<B: Budget>(
         return Ok(output);
     }
     let finder = member_finder_with_allowance(&combined, at, options, allowance)?;
-    let mut lazy = None;
-    let mut collector = None;
-    if options.optimal_parse {
-        collector = Some(OptimalCollector {
+    let mut search = if options.optimal_parse {
+        SharedMemberSearch::Optimal(OptimalCollector {
             finder: CollectorFinder::Chains(finder),
-        });
+        })
     } else {
-        lazy = Some(finder);
-    }
+        SharedMemberSearch::Lazy(finder)
+    };
     for &(end, is_last) in &blocks[first..] {
         let end = start + end;
         output
             .push(encode_lz_block_with_allowance(
                 &combined,
                 at..end,
-                match (&mut lazy, &mut collector) {
-                    (Some(finder), _) => MemberSearch::Lazy(finder),
-                    (_, Some(collector)) => MemberSearch::Optimal(collector),
-                    _ => unreachable!(),
-                },
+                search.borrow(),
                 algorithm_version,
                 &[],
                 options,
@@ -1218,19 +1212,14 @@ fn filtered_lz_blocks<B: Budget>(
     }
 
     // One search state for the whole member, as the unfiltered path has.
-    let mut lazy = if options.optimal_parse {
-        None
-    } else {
-        Some(member_finder_with_allowance(
-            &combined, start, options, allowance,
-        )?)
-    };
-    let mut collector = if options.optimal_parse {
-        Some(OptimalCollector::with_allowance(
+    let mut search = if options.optimal_parse {
+        SharedMemberSearch::Optimal(OptimalCollector::with_allowance(
             &combined, start, options, allowance,
         )?)
     } else {
-        None
+        SharedMemberSearch::Lazy(member_finder_with_allowance(
+            &combined, start, options, allowance,
+        )?)
     };
 
     let mut out = Buffer::new(allowance);
@@ -1243,11 +1232,7 @@ fn filtered_lz_blocks<B: Budget>(
         let packed = encode_lz_block_with_allowance(
             &combined,
             start + block.start..start + block.end,
-            match (&mut lazy, &mut collector) {
-                (Some(finder), _) => MemberSearch::Lazy(finder),
-                (_, Some(collector)) => MemberSearch::Optimal(collector),
-                _ => MemberSearch::Fresh,
-            },
+            search.borrow(),
             algorithm_version,
             &records,
             options,
@@ -1347,19 +1332,14 @@ fn encode_member_with_allowance<B: Budget>(
         // 16 MiB member that was half the encode. The optimal parse used to be
         // worse still, rebuilding per pass; its collector searches each block
         // once and lets the passes replay the answers.
-        let mut lazy = if options.optimal_parse {
-            None
-        } else {
-            Some(member_finder_with_allowance(
-                combined, start, options, allowance,
-            )?)
-        };
-        let mut collector = if options.optimal_parse {
-            Some(OptimalCollector::with_allowance(
+        let mut search = if options.optimal_parse {
+            SharedMemberSearch::Optimal(OptimalCollector::with_allowance(
                 combined, start, options, allowance,
             )?)
         } else {
-            None
+            SharedMemberSearch::Lazy(member_finder_with_allowance(
+                combined, start, options, allowance,
+            )?)
         };
 
         let mut out = Buffer::new(allowance);
@@ -1390,11 +1370,7 @@ fn encode_member_with_allowance<B: Budget>(
             let packed = encode_lz_block_with_allowance(
                 combined,
                 block_start..block_end,
-                match (&mut lazy, &mut collector) {
-                    (Some(finder), _) => MemberSearch::Lazy(finder),
-                    (_, Some(collector)) => MemberSearch::Optimal(collector),
-                    _ => MemberSearch::Fresh,
-                },
+                search.borrow(),
                 algorithm_version,
                 &[],
                 options,
@@ -1479,6 +1455,20 @@ enum MemberSearch<'a, B: Budget = Allowance> {
     /// The member's match collector, which the optimal parse feeds block by
     /// block.
     Optimal(&'a mut OptimalCollector<B>),
+}
+
+enum SharedMemberSearch<B: Budget> {
+    Lazy(Rar50MatchFinder<B>),
+    Optimal(OptimalCollector<B>),
+}
+
+impl<B: Budget> SharedMemberSearch<B> {
+    fn borrow(&mut self) -> MemberSearch<'_, B> {
+        match self {
+            Self::Lazy(finder) => MemberSearch::Lazy(finder),
+            Self::Optimal(collector) => MemberSearch::Optimal(collector),
+        }
+    }
 }
 
 /// The matches at every position of one block, found once and priced by every
