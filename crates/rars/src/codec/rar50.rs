@@ -333,9 +333,9 @@ pub fn parse_compressed_block(input: &[u8]) -> Result<CompressedBlock> {
         .fold(0usize, |acc, (index, &byte)| {
             acc | (usize::from(byte) << (index * 8))
         });
-    let payload_end = header_len
-        .checked_add(payload_size)
-        .ok_or(Error::InvalidData("RAR 5 block size overflows"))?;
+    // The size field is at most three bytes and the header at most five, so
+    // this sum fits even on a 32-bit target.
+    let payload_end = header_len + payload_size;
     if input.len() < payload_end {
         return Err(Error::NeedMoreInput);
     }
@@ -7126,12 +7126,28 @@ mod tests {
             read_compressed_block(&mut bad_checksum.as_slice()),
             Err(Error::InvalidData("RAR 5 block header checksum mismatch"))
         ));
+        assert_eq!(
+            parse_compressed_block(&bad_checksum),
+            Err(Error::InvalidData("RAR 5 block header checksum mismatch"))
+        );
         let mut invalid_size_width = empty;
         invalid_size_width[0] |= 0b11 << 3;
         assert!(matches!(
             read_compressed_block(&mut invalid_size_width.as_slice()),
             Err(Error::InvalidData("RAR 5 block size length is invalid"))
         ));
+        assert_eq!(
+            parse_compressed_block(&invalid_size_width),
+            Err(Error::InvalidData("RAR 5 block size length is invalid"))
+        );
+    }
+
+    #[test]
+    fn parser_handles_largest_declared_block_size_without_overflow() {
+        let flags = 0b10 << 3; // three size bytes
+        let checksum = 0x5a ^ flags ^ 0xff ^ 0xff ^ 0xff;
+        let header = [flags, checksum, 0xff, 0xff, 0xff];
+        assert_eq!(parse_compressed_block(&header), Err(Error::NeedMoreInput));
     }
 
     #[test]
