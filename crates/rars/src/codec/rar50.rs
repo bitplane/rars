@@ -1907,7 +1907,7 @@ fn encode_token_block_with_allowance<B: Budget>(
                         writer
                             .try_write_bits(usize::from(code), usize::from(len))
                             .map_err(Into::into)?;
-                        let length_extra_bits = length_slot_extra_bits(length_slot)?;
+                        let length_extra_bits = length_slot_extra_bits(length_slot);
                         if length_extra_bits != 0 {
                             writer
                                 .try_write_bits(length_extra, usize::from(length_extra_bits))
@@ -1925,7 +1925,7 @@ fn encode_token_block_with_allowance<B: Budget>(
                         writer
                             .try_write_bits(usize::from(code), usize::from(len))
                             .map_err(Into::into)?;
-                        let length_extra_bits = length_slot_extra_bits(length_slot)?;
+                        let length_extra_bits = length_slot_extra_bits(length_slot);
                         if length_extra_bits != 0 {
                             writer
                                 .try_write_bits(length_extra, usize::from(length_extra_bits))
@@ -2366,7 +2366,7 @@ impl TokenPrices<'_> {
             } => {
                 Self::code(self.lengths.main[258 + index])
                     + Self::code(self.lengths.length[length_slot])
-                    + usize::from(length_slot_extra_bits(length_slot)?)
+                    + usize::from(length_slot_extra_bits(length_slot))
             }
             EncodedMatch::New {
                 length_slot,
@@ -2381,7 +2381,7 @@ impl TokenPrices<'_> {
                     distance_bit_count
                 };
                 Self::code(self.lengths.main[262 + length_slot])
-                    + usize::from(length_slot_extra_bits(length_slot)?)
+                    + usize::from(length_slot_extra_bits(length_slot))
                     + Self::code(self.lengths.distance[distance_slot])
                     + align
             }
@@ -3000,7 +3000,7 @@ fn estimated_match_cost(
         .any(|&repeat_distance| repeat_distance == distance && repeat_distance != 0)
     {
         let (length_slot, _) = length_slot_for_match(length)?;
-        return Ok(5 + usize::from(length_slot_extra_bits(length_slot)?));
+        return Ok(5 + usize::from(length_slot_extra_bits(length_slot)));
     }
 
     let (distance_slot, _) = distance_slot_for_match(distance, distance_size)?;
@@ -3009,7 +3009,7 @@ fn estimated_match_cost(
         .ok_or(Error::InvalidData("RAR 5 adjusted match length underflows"))?;
     let (length_slot, _) = length_slot_for_match(encoded_length)?;
     Ok(10
-        + usize::from(length_slot_extra_bits(length_slot)?)
+        + usize::from(length_slot_extra_bits(length_slot))
         + distance_slot_bit_count(distance_slot)?)
 }
 
@@ -3204,7 +3204,7 @@ impl Unpack50Decoder {
                             ));
                         }
                         let length_slot = tables.length.decode(&mut bits)?;
-                        let length_extra = bits.read_bits(length_slot_extra_bits(length_slot)?)?;
+                        let length_extra = bits.read_bits(length_slot_extra_bits(length_slot))?;
                         let length = slot_to_length(length_slot, length_extra)?;
                         self.reps[..=rep_index].rotate_right(1);
                         self.reps[0] = distance;
@@ -3219,7 +3219,7 @@ impl Unpack50Decoder {
                     }
                     262.. if mode.uses_lz() => {
                         let length_slot = symbol - 262;
-                        let length_extra = bits.read_bits(length_slot_extra_bits(length_slot)?)?;
+                        let length_extra = bits.read_bits(length_slot_extra_bits(length_slot))?;
                         let mut length = slot_to_length(length_slot, length_extra)?;
                         let distance_slot = tables.distance.decode(&mut bits)?;
                         let distance_bit_count = distance_slot_bit_count(distance_slot)?;
@@ -3390,7 +3390,7 @@ impl Unpack50Decoder {
                             .into());
                         }
                         let length_slot = tables.length.decode(&mut bits)?;
-                        let length_extra = bits.read_bits(length_slot_extra_bits(length_slot)?)?;
+                        let length_extra = bits.read_bits(length_slot_extra_bits(length_slot))?;
                         let length = slot_to_length(length_slot, length_extra)?;
                         self.reps[..=rep_index].rotate_right(1);
                         self.reps[0] = distance;
@@ -3399,7 +3399,7 @@ impl Unpack50Decoder {
                     }
                     262.. => {
                         let length_slot = symbol - 262;
-                        let length_extra = bits.read_bits(length_slot_extra_bits(length_slot)?)?;
+                        let length_extra = bits.read_bits(length_slot_extra_bits(length_slot))?;
                         let mut length = slot_to_length(length_slot, length_extra)?;
                         let distance_slot = tables.distance.decode(&mut bits)?;
                         let distance_bit_count = distance_slot_bit_count(distance_slot)?;
@@ -4035,16 +4035,11 @@ fn arm_encode(data: &mut [u8], file_offset: u32) {
     }
 }
 
-fn length_slot_extra_bits(slot: usize) -> Result<u8> {
+fn length_slot_extra_bits(slot: usize) -> u8 {
     if slot < 8 {
-        Ok(0)
+        0
     } else {
-        let bit_count = (slot >> 2) - 1;
-        if bit_count > 24 {
-            Err(Error::InvalidData("RAR 5 length slot is too large"))
-        } else {
-            Ok(bit_count as u8)
-        }
+        ((slot >> 2) - 1) as u8
     }
 }
 
@@ -6862,6 +6857,7 @@ mod tests {
         assert_eq!(slot_to_length(8, 1).unwrap(), 11);
         assert_eq!(slot_to_length(11, 1).unwrap(), 17);
         assert_eq!(slot_to_length(12, 3).unwrap(), 21);
+        assert_eq!(length_slot_extra_bits(43), 9);
     }
 
     #[test]
