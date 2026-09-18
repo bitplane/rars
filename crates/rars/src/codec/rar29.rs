@@ -6308,6 +6308,21 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     }
 
     #[test]
+    fn encoder_rejects_rgb_ranges_shorter_than_a_pixel_or_scanline() {
+        for (input, width) in [(b"ab".as_slice(), 3), (b"abc".as_slice(), 6)] {
+            assert_eq!(
+                Unpack29Encoder::new().encode_member_with_filter(
+                    input,
+                    crate::FilterSpec::whole(crate::FilterKind::Rgb { width, pos_r: 0 }),
+                ),
+                Err(Error::InvalidData(
+                    "RAR 2.9 RGB filter parameters are invalid"
+                )),
+            );
+        }
+    }
+
+    #[test]
     fn encoder_emits_rar29_audio_vm_filter_record() {
         let input: Vec<u8> = (0..160)
             .map(|index| (index * 7 + index / 3) as u8)
@@ -6733,6 +6748,43 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
             Unpack29::new().decode_member(&invalid, 0),
             Err(Error::InvalidData("RAR 2.9 empty Huffman table"))
         );
+    }
+
+    #[test]
+    fn empty_solid_member_can_use_the_previous_members_huffman_tables() {
+        let first = b"solid member with a retained Huffman table";
+        let mut encoder = Unpack29Encoder::new();
+        let mut first_packed = encoder.encode_member(first).unwrap();
+
+        // Locate the last bit of the first member's end marker, then change
+        // NewFileNewTables (0, 1) to NewFileKeepTables (0, 0). The latter is
+        // valid legacy wire syntax even though our writer does not emit it.
+        let mut probe = Unpack29::new();
+        assert_eq!(
+            probe.decode_member(&first_packed, first.len()).unwrap(),
+            first
+        );
+        let keep_tables_bit = probe.bits.bit_pos - 1;
+        let mask = 1 << (7 - keep_tables_bit % 8);
+        assert_ne!(first_packed[keep_tables_bit / 8] & mask, 0);
+        first_packed[keep_tables_bit / 8] &= !mask;
+
+        let codes = canonical_codes(&encoder.levels[..MAIN_COUNT]).unwrap();
+        let end = codes[256].unwrap();
+        let mut bits = BitWriter::default();
+        bits.write_bits(u32::from(end.code), end.len);
+        bits.write_bit(false); // new file
+        bits.write_bit(true); // next member reads new tables
+        let empty_packed = bits.finish();
+
+        let mut decoder = Unpack29::new();
+        assert_eq!(
+            decoder.decode_member(&first_packed, first.len()).unwrap(),
+            first
+        );
+        assert!(decoder.in_lz_block);
+        assert!(decoder.decode_member(&empty_packed, 0).unwrap().is_empty());
+        assert!(!decoder.in_lz_block);
     }
 
     #[test]
