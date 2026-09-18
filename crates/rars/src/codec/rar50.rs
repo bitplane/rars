@@ -6986,6 +6986,80 @@ mod tests {
     }
 
     #[test]
+    fn buffered_and_streaming_decoders_reuse_tables_after_table_only_block() {
+        let mut lengths = TableLengths {
+            main: vec![0; MAIN_TABLE_SIZE],
+            distance: vec![0; DISTANCE_TABLE_SIZE_50],
+            align: vec![0; ALIGN_TABLE_SIZE],
+            length: vec![0; LENGTH_TABLE_SIZE],
+        };
+        lengths.main[b'A' as usize] = 1;
+        lengths.main[b'B' as usize] = 1;
+        let (tables, table_bits) = encode_table_lengths_with_bit_count(&lengths, 0).unwrap();
+        let mut input = encode_compressed_block(&tables, table_bits, true, false).unwrap();
+        // A = 0, B = 1 with the two one-bit codes above.
+        input.extend(encode_compressed_block(&[0b0110_0000], 4, false, true).unwrap());
+
+        let buffered = Unpack50Decoder::new()
+            .decode_member_with_dictionary(
+                &input,
+                0,
+                4,
+                DEFAULT_DICTIONARY_SIZE,
+                false,
+                DecodeMode::LiteralOnly,
+            )
+            .unwrap();
+        assert_eq!(buffered, b"ABBA");
+
+        let mut streamed = Vec::new();
+        Unpack50Decoder::new()
+            .decode_member_from_reader_with_dictionary_to_sink(
+                &mut input.as_slice(),
+                0,
+                4,
+                DEFAULT_DICTIONARY_SIZE,
+                false,
+                |chunk| {
+                    match chunk {
+                        DecodedChunk::Bytes(bytes) => streamed.extend_from_slice(bytes),
+                        DecodedChunk::Repeated { byte, len } => {
+                            streamed.extend(std::iter::repeat_n(byte, len));
+                        }
+                    }
+                    Ok::<(), std::convert::Infallible>(())
+                },
+            )
+            .unwrap();
+        assert_eq!(streamed, buffered);
+    }
+
+    #[test]
+    fn compressed_block_reader_accepts_empty_final_marker_and_checks_header() {
+        let empty = encode_compressed_block(&[], 0, false, true).unwrap();
+        let parsed = parse_compressed_block(&empty).unwrap();
+        let streamed = read_compressed_block(&mut empty.as_slice()).unwrap();
+        assert!(parsed.header.is_last);
+        assert_eq!(parsed.header.payload_bits, 0);
+        assert!(streamed.header.is_last);
+        assert_eq!(streamed.header.payload_bits, 0);
+        assert!(streamed.payload.is_empty());
+
+        let mut bad_checksum = empty.clone();
+        bad_checksum[1] ^= 1;
+        assert!(matches!(
+            read_compressed_block(&mut bad_checksum.as_slice()),
+            Err(Error::InvalidData("RAR 5 block header checksum mismatch"))
+        ));
+        let mut invalid_size_width = empty;
+        invalid_size_width[0] |= 0b11 << 3;
+        assert!(matches!(
+            read_compressed_block(&mut invalid_size_width.as_slice()),
+            Err(Error::InvalidData("RAR 5 block size length is invalid"))
+        ));
+    }
+
+    #[test]
     fn streaming_decoder_rejects_missing_tables_and_invalid_dictionary() {
         let input = encode_compressed_block(&[0], 8, false, true).unwrap();
         let decode = |dictionary_size| {
