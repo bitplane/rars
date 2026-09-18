@@ -576,9 +576,6 @@ fn encode_compressed_block_with_allowance<B: Budget>(
     if payload_bits > payload.len() * 8 {
         return Err(Error::InvalidData("RAR 5 block bit count exceeds payload"));
     }
-    if payload.is_empty() && payload_bits != 0 {
-        return Err(Error::InvalidData("RAR 5 empty block has payload bits"));
-    }
     if !payload.is_empty() && payload_bits <= (payload.len() - 1) * 8 {
         return Err(Error::InvalidData("RAR 5 block has unused payload bytes"));
     }
@@ -599,12 +596,7 @@ fn encode_compressed_block_with_allowance<B: Budget>(
         ((payload_bits - 1) % 8) + 1
     };
     let mut flags = (final_byte_bits as u8) - 1;
-    flags |= match size_len {
-        1 => 0,
-        2 => 1 << 3,
-        3 => 2 << 3,
-        _ => unreachable!("size_len is constrained above"),
-    };
+    flags |= ((size_len - 1) as u8) << 3;
     if is_last {
         flags |= 0x40;
     }
@@ -5704,6 +5696,11 @@ mod tests {
             encode_compressed_block(&[], 1, true, true),
             Err(Error::InvalidData("RAR 5 block bit count exceeds payload"))
         );
+        let oversized = vec![0; 0x0100_0000];
+        assert_eq!(
+            encode_compressed_block(&oversized, oversized.len() * 8, false, true),
+            Err(Error::InvalidData("RAR 5 block payload is too large"))
+        );
     }
 
     #[test]
@@ -6376,6 +6373,15 @@ mod tests {
 
         // Uniform to the last byte, so only the cap can be ending these.
         assert_eq!(blocks, 3, "the cap stopped ending blocks");
+    }
+
+    #[test]
+    fn splitter_refuses_to_extend_an_empty_block_or_with_an_empty_chunk() {
+        let mut splitter = BlockSplitter::new();
+        assert!(!splitter.extends(b"AAAA"));
+        splitter.accept(b"AAAA");
+        assert!(!splitter.extends(b""));
+        assert!(splitter.extends(b"AAAA"));
     }
 
     #[test]
@@ -7247,6 +7253,11 @@ mod tests {
 
     #[test]
     fn parser_rejects_truncated_block_header_and_payload() {
+        // A two-byte size field requires a fourth header byte.
+        assert_eq!(
+            parse_compressed_block(&[1 << 3, 0, 0]),
+            Err(Error::NeedMoreInput)
+        );
         let block = encode_compressed_block(&[0xaa, 0xbb], 16, false, true).unwrap();
         for length in 0..block.len() {
             assert_eq!(
