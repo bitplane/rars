@@ -431,7 +431,8 @@ pub fn read_table_lengths(input: &[u8], algorithm_version: u8) -> Result<(TableL
                     lengths.push(previous);
                 }
             }
-            18 | 19 => {
+            _ => {
+                // The level table has exactly 20 symbols, so these are 18/19.
                 let count = if number == 18 {
                     3 + bits.read_bits(3)? as usize
                 } else {
@@ -444,14 +445,14 @@ pub fn read_table_lengths(input: &[u8], algorithm_version: u8) -> Result<(TableL
                     lengths.push(0);
                 }
             }
-            _ => return Err(Error::InvalidData("RAR 5 invalid level-table symbol")),
         }
     }
 
-    let distance_size = match algorithm_version {
-        0 => DISTANCE_TABLE_SIZE_50,
-        1 => DISTANCE_TABLE_SIZE_70,
-        _ => unreachable!("validated by table_length_count"),
+    // table_length_count above rejects every version other than 0 and 1.
+    let distance_size = if algorithm_version == 0 {
+        DISTANCE_TABLE_SIZE_50
+    } else {
+        DISTANCE_TABLE_SIZE_70
     };
     let distance_start = MAIN_TABLE_SIZE;
     let align_start = distance_start + distance_size;
@@ -5580,6 +5581,13 @@ mod tests {
             table_length_count(1).unwrap(),
             MAIN_TABLE_SIZE + DISTANCE_TABLE_SIZE_70 + ALIGN_TABLE_SIZE + LENGTH_TABLE_SIZE
         );
+    }
+
+    #[test]
+    fn table_reader_rejects_unknown_algorithm_before_decoding() {
+        let expected = Error::InvalidData("RAR 5 unknown compression algorithm version");
+        assert_eq!(table_length_count(2).unwrap_err(), expected);
+        assert_eq!(read_table_lengths(&[], 2).unwrap_err(), expected);
     }
 
     #[test]
