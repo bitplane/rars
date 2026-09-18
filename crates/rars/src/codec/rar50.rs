@@ -5727,6 +5727,49 @@ mod tests {
             HuffmanTable::from_lengths(&[1, 1, 1]),
             Err(Error::InvalidData("RAR 5 oversubscribed Huffman table"))
         ));
+        assert!(matches!(
+            HuffmanTable::from_lengths(&[16]),
+            Err(Error::InvalidData("RAR 5 Huffman length is too large"))
+        ));
+    }
+
+    #[test]
+    fn decoders_reject_empty_and_invalid_main_huffman_codes() {
+        for (main_length, code, code_bits, message) in [
+            (0, 1, 1, "RAR 5 empty Huffman table"),
+            (2, 0xffff, 16, "RAR 5 invalid Huffman code"),
+        ] {
+            let mut lengths = TableLengths {
+                main: vec![0; MAIN_TABLE_SIZE],
+                distance: vec![0; DISTANCE_TABLE_SIZE_50],
+                align: vec![0; ALIGN_TABLE_SIZE],
+                length: vec![0; LENGTH_TABLE_SIZE],
+            };
+            lengths.main[b'A' as usize] = main_length;
+            let (bytes, bit_pos) = encode_table_lengths_with_bit_count(&lengths, 0).unwrap();
+            let mut writer = BitWriter {
+                bytes: Buffer::from_vec(bytes),
+                bit_pos,
+            };
+            writer.write_bits(code, code_bits);
+            let payload_bits = writer.bit_pos;
+            let input =
+                encode_compressed_block(&writer.finish(), payload_bits, true, true).unwrap();
+
+            assert_eq!(decode_lz(&input, 0, 1), Err(Error::InvalidData(message)));
+            let result = Unpack50Decoder::new().decode_member_from_reader_with_dictionary_to_sink(
+                &mut input.as_slice(),
+                0,
+                1,
+                DEFAULT_DICTIONARY_SIZE,
+                false,
+                |_chunk| Ok::<(), std::convert::Infallible>(()),
+            );
+            assert!(matches!(
+                result,
+                Err(StreamDecodeError::Decode(Error::InvalidData(error))) if error == message
+            ));
+        }
     }
 
     #[test]
@@ -6142,6 +6185,13 @@ mod tests {
 
         assert_eq!(output, data);
         assert_ne!(lengths.main[256], 0);
+    }
+
+    #[test]
+    fn short_e8_filter_range_round_trips_without_rewriting_bytes() {
+        let data = [0xe8, 0, 0, 0];
+        let packed = encode_lz_member_with_filter(&data, crate::FilterKind::E8).unwrap();
+        assert_eq!(decode_lz(&packed, 0, data.len()).unwrap(), data);
     }
 
     #[test]
