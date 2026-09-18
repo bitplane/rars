@@ -4228,9 +4228,6 @@ impl<'a> BitReader<'a> {
     }
 
     fn read_bits(&mut self, count: u8) -> Result<u32> {
-        if count > 32 {
-            return Err(Error::InvalidData("RAR 5 bit read is too wide"));
-        }
         let end = self
             .bit_pos
             .checked_add(usize::from(count))
