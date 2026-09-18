@@ -4059,11 +4059,7 @@ pub fn slot_to_length(slot: usize, extra_bits: u32) -> Result<usize> {
     if bit_count > 24 {
         return Err(Error::InvalidData("RAR 5 length slot is too large"));
     }
-    let max_extra = if bit_count == 32 {
-        u32::MAX
-    } else {
-        (1u32 << bit_count) - 1
-    };
+    let max_extra = (1u32 << bit_count) - 1;
     if extra_bits > max_extra {
         return Err(Error::InvalidData("RAR 5 length extra bits exceed slot"));
     }
@@ -4088,11 +4084,7 @@ pub fn slot_to_distance(slot: usize, extra_bits: u32) -> Result<usize> {
         return Ok(slot + 1);
     }
     let bit_count = distance_slot_bit_count(slot)?;
-    let max_extra = if bit_count == 32 {
-        u32::MAX
-    } else {
-        (1u32 << bit_count) - 1
-    };
+    let max_extra = (1u32 << bit_count) - 1;
     if extra_bits > max_extra {
         return Err(Error::InvalidData("RAR 5 distance extra bits exceed slot"));
     }
@@ -6857,6 +6849,7 @@ mod tests {
 
     #[test]
     fn rejects_out_of_range_length_slots_and_extras() {
+        assert!(slot_to_length(103, (1 << 24) - 1).is_ok());
         assert_eq!(
             slot_to_length(8, 2),
             Err(Error::InvalidData("RAR 5 length extra bits exceed slot"))
@@ -6880,6 +6873,8 @@ mod tests {
 
     #[test]
     fn rejects_out_of_range_distance_slots_and_extras() {
+        #[cfg(target_pointer_width = "64")]
+        assert!(slot_to_distance(65, (1 << 31) - 1).is_ok());
         assert_eq!(
             slot_to_distance(4, 2),
             Err(Error::InvalidData("RAR 5 distance extra bits exceed slot"))
