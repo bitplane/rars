@@ -1619,7 +1619,7 @@ enum EncodedMatch {
 
 impl EncoderMatchState {
     fn encode_match(&self, length: usize, offset: usize) -> Result<EncodedMatch> {
-        if offset == self.last_offset && length == self.last_length && self.last_length != 0 {
+        if self.last_length != 0 && offset == self.last_offset && length == self.last_length {
             return Ok(EncodedMatch::LastLengthRepeat);
         }
         if let Some(index) = self
@@ -1656,7 +1656,7 @@ impl EncoderMatchState {
     }
 
     fn remember(&mut self, length: usize, offset: usize) {
-        if offset == self.last_offset && length == self.last_length && self.last_length != 0 {
+        if self.last_length != 0 && offset == self.last_offset && length == self.last_length {
             return;
         }
         if let Some(index) = self
@@ -1755,7 +1755,7 @@ fn lazy_match_decision(
     current: MatchCandidate,
 ) -> (bool, Option<MatchCandidate>) {
     let end = input.len();
-    if !options.lazy_matching || pos + 1 >= end {
+    if !options.lazy_matching {
         return (false, None);
     }
     let lookahead = options.lazy_lookahead.max(1);
@@ -1938,7 +1938,7 @@ fn best_ppmd_match(
 ) -> Option<(usize, usize)> {
     let max_offset = pos.min(0x1000001).min(MAX_HISTORY).min(max_match_distance);
     let max_length = (input.len() - pos).min(MAX_PPMD_MATCH_LENGTH);
-    if max_offset < 2 || max_length < MIN_PPMD_MATCH_LENGTH || pos + 3 >= input.len() {
+    if max_offset < 2 || max_length < MIN_PPMD_MATCH_LENGTH {
         return None;
     }
     let mut best = None;
@@ -1985,11 +1985,7 @@ fn best_match(
 ) -> Option<MatchCandidate> {
     let max_offset = pos.min(options.max_match_distance).min(MAX_HISTORY);
     let max_length = (end - pos).min(MAX_ENCODER_MATCH_LENGTH);
-    if options.max_match_candidates == 0
-        || max_offset == 0
-        || max_length < 4
-        || pos + 3 >= input.len()
-    {
+    if options.max_match_candidates == 0 || max_offset == 0 || max_length < 4 {
         return None;
     }
     let mut best = None;
@@ -2101,7 +2097,7 @@ fn length_slot_for_match(length: usize) -> Result<(usize, usize)> {
             } else {
                 (1usize << extra_bits) - 1
             };
-        if adjusted >= base && adjusted <= max {
+        if adjusted <= max {
             return Ok((slot, adjusted - base));
         }
     }
@@ -2123,7 +2119,7 @@ fn length_slot_for_repeat_match(length: usize) -> Result<(usize, usize)> {
             } else {
                 (1usize << extra_bits) - 1
             };
-        if adjusted >= base && adjusted <= max {
+        if adjusted <= max {
             return Ok((slot, adjusted - base));
         }
     }
@@ -2145,7 +2141,7 @@ fn offset_slot_for_match(offset: usize) -> Result<(usize, usize)> {
             } else {
                 (1usize << extra_bits) - 1
             };
-        if adjusted >= base && adjusted <= max {
+        if adjusted <= max {
             return Ok((slot, adjusted - base));
         }
     }
@@ -2264,7 +2260,7 @@ fn level_tokens_bit_cost(tokens: &[LevelToken]) -> usize {
 fn emit_repeat_level_run(tokens: &mut Vec<LevelToken>, mut run: usize) {
     while run >= 11 {
         let mut chunk = run.min(138);
-        if matches!(run - chunk, 1 | 2) && chunk >= 14 {
+        if matches!(run - chunk, 1 | 2) {
             chunk -= 3;
         }
         tokens.push(LevelToken::repeat_previous_long(chunk));
@@ -2285,7 +2281,7 @@ fn emit_zero_level_run(
     while run != 0 {
         if run >= 11 {
             let mut chunk = run.min(138);
-            if matches!(run - chunk, 1 | 2) && chunk >= 14 {
+            if matches!(run - chunk, 1 | 2) {
                 chunk -= 3;
             }
             tokens.push(LevelToken::zero_run_long(chunk));
@@ -5234,6 +5230,18 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
             super::offset_slot_for_match(largest_offset + 1),
             Err(Error::InvalidData("RAR 2.9 match offset is too large"))
         );
+    }
+
+    #[test]
+    fn match_length_and_offset_slots_have_no_gaps() {
+        for (bases, bits) in [
+            (&super::LENGTH_BASES[..], &super::LENGTH_BITS[..]),
+            (&super::OFFSET_BASES[..], &super::OFFSET_BITS[..]),
+        ] {
+            for index in 1..bases.len() {
+                assert_eq!(bases[index], bases[index - 1] + (1usize << bits[index - 1]));
+            }
+        }
     }
 
     #[test]
