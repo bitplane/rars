@@ -6718,6 +6718,38 @@ mod tests {
     }
 
     #[test]
+    fn cloned_encoder_keeps_an_independent_solid_history() {
+        let first = b"prefix repeated across solid members";
+        let second = b"prefix repeated across solid members with a suffix";
+        let mut original = Unpack50Encoder::with_options(EncodeOptions::new(16));
+        let packed_first = original.encode_member(first, 0).unwrap();
+        let mut cloned = original.clone();
+        let packed_original = original.encode_member(second, 0).unwrap();
+        let packed_clone = cloned.encode_member(second, 0).unwrap();
+        assert_eq!(packed_clone, packed_original);
+
+        let mut decoder = Unpack50Decoder::new();
+        assert_eq!(
+            decoder
+                .decode_member(&packed_first, 0, first.len(), false, DecodeMode::Lz)
+                .unwrap(),
+            first
+        );
+        assert_eq!(
+            decoder
+                .decode_member(&packed_clone, 0, second.len(), true, DecodeMode::Lz)
+                .unwrap(),
+            second
+        );
+
+        let clone_history = cloned.state.history.to_vec();
+        original
+            .encode_member(b"a divergent third member", 0)
+            .unwrap();
+        assert_eq!(cloned.state.history.to_vec(), clone_history);
+    }
+
+    #[test]
     fn encodes_lz_member_with_last_length_repeat_symbols() {
         let data = b"abcdXabcdYabcdZabcd";
         let input = encode_lz_member(data, 0).unwrap();
