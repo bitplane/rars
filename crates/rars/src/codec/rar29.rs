@@ -5015,6 +5015,22 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     }
 
     #[test]
+    fn stale_filter_ranges_do_not_change_later_published_bytes() {
+        let mut decoder = Unpack29::new();
+        decoder.output.resize(32, 0x5a);
+        decoder.filters.push(VmFilter {
+            program: usize::MAX,
+            start: 0,
+            size: 8,
+            regs: [0; 7],
+            global_data: Vec::new(),
+        });
+
+        assert_eq!(decoder.safe_flush_end(16, 32, 32).unwrap(), 32);
+        assert_eq!(decoder.filtered_range(16, 32, 0).unwrap(), vec![0x5a; 16]);
+    }
+
+    #[test]
     fn table_level_encoder_uses_rar29_run_symbols() {
         let mut lengths = [0u8; TABLE_COUNT];
         lengths[..4].fill(5);
@@ -5217,6 +5233,20 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         assert_eq!(
             super::offset_slot_for_match(largest_offset + 1),
             Err(Error::InvalidData("RAR 2.9 match offset is too large"))
+        );
+    }
+
+    #[test]
+    fn match_search_ignores_a_remembered_offset_outside_its_window() {
+        let input = b"abcdefghijklmnop";
+        let finder = Rar29MatchFinder::new(input.len());
+        let mut state = EncoderMatchState::default();
+        state.old_offsets[0] = 9;
+        let options = EncodeOptions::default().with_max_match_distance(8);
+
+        assert_eq!(
+            best_match(input, 8, input.len(), &finder, options, &state),
+            None
         );
     }
 
@@ -6320,6 +6350,23 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
                 )),
             );
         }
+    }
+
+    #[test]
+    fn rgb_helpers_reject_invalid_parameters_even_without_caller_prechecks() {
+        let expected = Err(Error::InvalidData(
+            "RAR 2.9 RGB filter parameters are invalid",
+        ));
+        assert_eq!(super::rgb_encode(&[0; 6], 0, 0), expected);
+        assert_eq!(
+            super::rgb_decode_with_control(
+                &[0; 6],
+                3,
+                3,
+                &crate::read_control::ReadControl::default(),
+            ),
+            expected,
+        );
     }
 
     #[test]
