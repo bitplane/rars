@@ -6118,6 +6118,34 @@ mod tests {
     }
 
     #[test]
+    fn filtered_member_paths_reject_ranges_outside_input() {
+        for data in [vec![b'A'; 16], vec![b'A'; FILTERED_LZ_BLOCK_SIZE + 1]] {
+            let invalid =
+                crate::FilterSpec::range(crate::FilterKind::E8, data.len()..data.len() + 1);
+            assert_eq!(
+                Unpack50Encoder::new().encode_member_with_filter(&data, 0, invalid),
+                Err(Error::InvalidData("RAR 5 filter range is invalid"))
+            );
+        }
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn filter_transform_rejects_offset_beyond_record_width() {
+        let mut data = [0xe8, 0, 0, 0, 0];
+        assert_eq!(
+            encode_filter_data(
+                Rar50Filter::E8,
+                &mut data,
+                u32::MAX as usize + 1,
+                &Allowance::default(),
+            ),
+            Err(Error::InvalidData("RAR 5 filter offset is too large"))
+        );
+        assert_eq!(data, [0xe8, 0, 0, 0, 0]);
+    }
+
+    #[test]
     fn encodes_lz_member_with_e8_filter_record() {
         let mut data = b"\xe8\0\0\0\0plain text after call".to_vec();
         data.extend_from_slice(&[0xe8, 3, 0, 0, 0, b'X']);
