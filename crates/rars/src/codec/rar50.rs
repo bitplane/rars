@@ -6955,6 +6955,162 @@ mod tests {
     }
 
     #[test]
+    fn streaming_decoder_handles_each_match_control() {
+        for (payload, expected) in [
+            (new_match_payload(), b"ABAB".as_slice()),
+            (repeat_payload(257), b"ABABAB".as_slice()),
+            (repeat_payload(258), b"ABABAB".as_slice()),
+        ] {
+            let input = encode_compressed_block(&payload, payload.len() * 8, true, true).unwrap();
+            let mut decoded = Vec::new();
+            Unpack50Decoder::new()
+                .decode_member_from_reader_with_dictionary_to_sink(
+                    &mut input.as_slice(),
+                    0,
+                    expected.len(),
+                    DEFAULT_DICTIONARY_SIZE,
+                    false,
+                    |chunk| {
+                        match chunk {
+                            DecodedChunk::Bytes(bytes) => decoded.extend_from_slice(bytes),
+                            DecodedChunk::Repeated { byte, len } => {
+                                decoded.extend(std::iter::repeat_n(byte, len));
+                            }
+                        }
+                        Ok::<(), std::convert::Infallible>(())
+                    },
+                )
+                .unwrap();
+            assert_eq!(decoded, expected);
+        }
+    }
+
+    #[test]
+    fn streaming_decoder_rejects_missing_tables_and_invalid_dictionary() {
+        let input = encode_compressed_block(&[0], 8, false, true).unwrap();
+        let decode = |dictionary_size| {
+            Unpack50Decoder::new().decode_member_from_reader_with_dictionary_to_sink(
+                &mut input.as_slice(),
+                0,
+                1,
+                dictionary_size,
+                false,
+                |_chunk| Ok::<(), std::convert::Infallible>(()),
+            )
+        };
+        assert!(matches!(
+            decode(1),
+            Err(StreamDecodeError::Decode(Error::InvalidData(
+                "RAR 5 block reuses missing tables"
+            )))
+        ));
+        assert!(matches!(
+            decode(0),
+            Err(StreamDecodeError::Decode(Error::InvalidData(
+                "RAR 5 dictionary size is zero"
+            )))
+        ));
+    }
+
+    #[test]
+    fn streaming_decoder_propagates_sink_failure() {
+        let payload = literal_only_payload(b"AB");
+        let input = encode_compressed_block(&payload, payload.len() * 8, true, true).unwrap();
+        let error = Unpack50Decoder::new()
+            .decode_member_from_reader_with_dictionary_to_sink(
+                &mut input.as_slice(),
+                0,
+                2,
+                DEFAULT_DICTIONARY_SIZE,
+                false,
+                |_chunk| Err("sink failed"),
+            )
+            .unwrap_err();
+        assert!(matches!(error, StreamDecodeError::Sink("sink failed")));
+    }
+
+    #[test]
+    fn streaming_decoder_rejects_filter_beyond_declared_output() {
+        let data = b"\xe8\0\0\0\0plain text after call";
+        let input = encode_lz_member_with_filter(data, crate::FilterKind::E8).unwrap();
+        let mut record_count = 0;
+        let error = Unpack50Decoder::new()
+            .decode_to_sink_with_filters(
+                &mut input.as_slice(),
+                0,
+                data.len() - 1,
+                DEFAULT_DICTIONARY_SIZE,
+                false,
+                |_chunk| Ok::<(), std::convert::Infallible>(()),
+                Some(&mut |_filter| {
+                    record_count += 1;
+                    Ok::<(), std::convert::Infallible>(())
+                }),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            StreamDecodeError::Decode(Error::InvalidData("RAR 5 filter range exceeds output"))
+        ));
+        assert_eq!(record_count, 0);
+    }
+
+    #[test]
+    fn streaming_decoder_reports_truncated_block_and_incomplete_output() {
+        let payload = literal_only_payload(b"AB");
+        let input = encode_compressed_block(&payload, payload.len() * 8, true, true).unwrap();
+        for truncated in [&input[..1], &input[..input.len() - 1]] {
+            let mut reader = truncated;
+            let error = Unpack50Decoder::new()
+                .decode_member_from_reader_with_dictionary_to_sink(
+                    &mut reader,
+                    0,
+                    2,
+                    DEFAULT_DICTIONARY_SIZE,
+                    false,
+                    |_chunk| Ok::<(), std::convert::Infallible>(()),
+                )
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                StreamDecodeError::Decode(Error::NeedMoreInput)
+            ));
+        }
+        let error = Unpack50Decoder::new()
+            .decode_member_from_reader_with_dictionary_to_sink(
+                &mut input.as_slice(),
+                0,
+                3,
+                DEFAULT_DICTIONARY_SIZE,
+                false,
+                |_chunk| Ok::<(), std::convert::Infallible>(()),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            StreamDecodeError::Decode(Error::NeedMoreInput)
+        ));
+    }
+
+    #[test]
+    fn streaming_zero_history_emits_large_match_without_materializing_it() {
+        let mut output = StreamingOutput::new(vec![0, 0], 100_000, 2, 2);
+        let mut chunks = Vec::new();
+        output
+            .copy_match(2, 100_000, &mut |chunk| {
+                chunks.push(match chunk {
+                    DecodedChunk::Bytes(bytes) => (bytes[0], bytes.len()),
+                    DecodedChunk::Repeated { byte, len } => (byte, len),
+                });
+                Ok::<(), std::convert::Infallible>(())
+            })
+            .unwrap();
+        assert_eq!(chunks, [(0, 100_000)]);
+        assert_eq!(output.written(), 100_000);
+        assert_eq!(output.into_history(), [0, 0]);
+    }
+
+    #[test]
     fn streaming_window_accepts_match_beyond_old_64_mib_cap() {
         const OLD_STREAM_HISTORY_LIMIT: usize = 64 * 1024 * 1024;
         let distance = OLD_STREAM_HISTORY_LIMIT + 1;
