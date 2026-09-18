@@ -6824,6 +6824,18 @@ mod tests {
     }
 
     #[test]
+    fn rejects_out_of_range_length_slots_and_extras() {
+        assert_eq!(
+            slot_to_length(8, 2),
+            Err(Error::InvalidData("RAR 5 length extra bits exceed slot"))
+        );
+        assert_eq!(
+            slot_to_length(104, 0),
+            Err(Error::InvalidData("RAR 5 length slot is too large"))
+        );
+    }
+
+    #[test]
     fn decodes_distance_slots() {
         assert_eq!(slot_to_distance(0, 0).unwrap(), 1);
         assert_eq!(slot_to_distance(3, 0).unwrap(), 4);
@@ -6832,6 +6844,18 @@ mod tests {
         assert_eq!(slot_to_distance(4, 1).unwrap(), 6);
         assert_eq!(distance_slot_bit_count(10).unwrap(), 4);
         assert_eq!(slot_to_distance(10, 15).unwrap(), 48);
+    }
+
+    #[test]
+    fn rejects_out_of_range_distance_slots_and_extras() {
+        assert_eq!(
+            slot_to_distance(4, 2),
+            Err(Error::InvalidData("RAR 5 distance extra bits exceed slot"))
+        );
+        assert_eq!(
+            slot_to_distance(66, 0),
+            Err(Error::InvalidData("RAR 5 distance slot is too large"))
+        );
     }
 
     #[test]
