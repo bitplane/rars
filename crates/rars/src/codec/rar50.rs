@@ -5549,6 +5549,31 @@ mod tests {
     }
 
     #[test]
+    fn table_length_runs_stop_at_the_table_boundary() {
+        // The reference decoder clips an otherwise valid run to the table
+        // length. Both zero runs and previous-length runs can cross it.
+        for (first_symbol, run_symbol, expected) in [(19, 19, 0), (5, 17, 5)] {
+            let mut writer = BitWriter::new();
+            for _ in 0..LEVEL_TABLE_SIZE {
+                writer.write_bits(5, 4);
+            }
+            if first_symbol != run_symbol {
+                writer.write_bits(first_symbol, 5);
+            }
+            for _ in 0..4 {
+                writer.write_bits(run_symbol, 5);
+                writer.write_bits(127, 7); // a 138-entry run
+            }
+
+            let (lengths, _) = read_table_lengths(&writer.finish(), 0).unwrap();
+            assert!(lengths.main.iter().all(|&length| length == expected));
+            assert!(lengths.distance.iter().all(|&length| length == expected));
+            assert!(lengths.align.iter().all(|&length| length == expected));
+            assert!(lengths.length.iter().all(|&length| length == expected));
+        }
+    }
+
+    #[test]
     fn reads_rar70_table_length_count() {
         assert_eq!(
             table_length_count(1).unwrap(),
