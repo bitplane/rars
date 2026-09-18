@@ -7187,6 +7187,42 @@ mod tests {
     }
 
     #[test]
+    fn decoders_reject_match_that_exceeds_declared_output() {
+        for (payload, declared_size) in [
+            (new_match_payload(), 3), // AB, then a two-byte match.
+            (repeat_payload(257), 5), // ABAB, then the previous match.
+            (repeat_payload(258), 5), // ABAB, then a repeat distance.
+        ] {
+            let input = encode_compressed_block(&payload, payload.len() * 8, true, true).unwrap();
+            assert_eq!(
+                Unpack50Decoder::new().decode_member_with_dictionary(
+                    &input,
+                    0,
+                    declared_size,
+                    DEFAULT_DICTIONARY_SIZE,
+                    false,
+                    DecodeMode::Lz,
+                ),
+                Err(Error::InvalidData("RAR 5 match exceeds output limit"))
+            );
+            let result = Unpack50Decoder::new().decode_member_from_reader_with_dictionary_to_sink(
+                &mut input.as_slice(),
+                0,
+                declared_size,
+                DEFAULT_DICTIONARY_SIZE,
+                false,
+                |_chunk| Ok::<(), std::convert::Infallible>(()),
+            );
+            assert!(matches!(
+                result,
+                Err(StreamDecodeError::Decode(Error::InvalidData(
+                    "RAR 5 match exceeds output limit"
+                )))
+            ));
+        }
+    }
+
+    #[test]
     fn literal_only_decoder_rejects_control_symbol() {
         let input = control_only_block(257);
         assert_eq!(
