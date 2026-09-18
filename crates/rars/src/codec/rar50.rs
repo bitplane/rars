@@ -7645,6 +7645,55 @@ mod tests {
     }
 
     #[test]
+    fn streaming_output_rejects_overruns_without_partial_emission() {
+        let emitted = std::cell::RefCell::new(Vec::new());
+        let mut sink = |chunk: DecodedChunk<'_>| {
+            match chunk {
+                DecodedChunk::Bytes(bytes) => emitted.borrow_mut().extend_from_slice(bytes),
+                DecodedChunk::Repeated { byte, len } => {
+                    emitted.borrow_mut().extend(std::iter::repeat_n(byte, len));
+                }
+            }
+            Ok::<(), std::convert::Infallible>(())
+        };
+
+        let mut literal = StreamingOutput::new(Vec::new(), 1, 1, 1);
+        literal.push(b'A', &mut sink).unwrap();
+        assert!(matches!(
+            literal.push(b'B', &mut sink),
+            Err(StreamDecodeError::Decode(Error::InvalidData(
+                "RAR 5 match exceeds output limit"
+            )))
+        ));
+        literal.finish(&mut sink).unwrap();
+        assert_eq!(&*emitted.borrow(), b"A");
+
+        emitted.borrow_mut().clear();
+        let mut repeated = StreamingOutput::new(Vec::new(), 1, 1, 1);
+        assert!(matches!(
+            repeated.push_repeated(b'B', 2, &mut sink),
+            Err(StreamDecodeError::Decode(Error::InvalidData(
+                "RAR 5 match exceeds output limit"
+            )))
+        ));
+        assert_eq!(repeated.written(), 0);
+        assert!(emitted.borrow().is_empty());
+
+        let mut zeroes = StreamingOutput::new(Vec::new(), 1, 1, 1);
+        assert!(matches!(
+            zeroes.push_zeroes(2, &mut sink),
+            Err(StreamDecodeError::Decode(Error::InvalidData(
+                "RAR 5 match exceeds output limit"
+            )))
+        ));
+        assert_eq!(zeroes.written(), 0);
+        assert!(emitted.borrow().is_empty());
+        zeroes.push_zeroes(1, &mut sink).unwrap();
+        assert_eq!(&*emitted.borrow(), &[0]);
+        assert_eq!(zeroes.into_history(), [0]);
+    }
+
+    #[test]
     fn streaming_zero_history_emits_large_match_without_materializing_it() {
         let mut output = StreamingOutput::new(vec![0, 0], 100_000, 2, 2);
         let mut chunks = Vec::new();
