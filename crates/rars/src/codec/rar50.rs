@@ -6975,6 +6975,37 @@ mod tests {
     }
 
     #[test]
+    fn solid_streaming_decoder_trims_inherited_history_before_member() {
+        let payload = literal_only_payload(b"AB");
+        let input = encode_compressed_block(&payload, payload.len() * 8, true, true).unwrap();
+        let mut decoder = Unpack50Decoder::new();
+        decoder.history.extend_from_slice(b"123456");
+        let mut decoded = Vec::new();
+
+        decoder
+            .decode_member_from_reader_with_dictionary_to_sink(
+                &mut input.as_slice(),
+                0,
+                2,
+                4,
+                true,
+                |chunk| {
+                    match chunk {
+                        DecodedChunk::Bytes(bytes) => decoded.extend_from_slice(bytes),
+                        DecodedChunk::Repeated { byte, len } => {
+                            decoded.extend(std::iter::repeat_n(byte, len));
+                        }
+                    }
+                    Ok::<(), std::convert::Infallible>(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(decoded, b"AB");
+        assert_eq!(decoder.history, b"56AB");
+    }
+
+    #[test]
     fn streaming_decoder_handles_each_match_control() {
         for (payload, expected) in [
             (new_match_payload(), b"ABAB".as_slice()),
@@ -7136,6 +7167,17 @@ mod tests {
     #[test]
     fn streaming_decoder_rejects_missing_tables_and_invalid_dictionary() {
         let input = encode_compressed_block(&[0], 8, false, true).unwrap();
+        assert_eq!(
+            Unpack50Decoder::new().decode_member_with_dictionary(
+                &input,
+                0,
+                1,
+                0,
+                false,
+                DecodeMode::LiteralOnly,
+            ),
+            Err(Error::InvalidData("RAR 5 dictionary size is zero"))
+        );
         let decode = |dictionary_size| {
             Unpack50Decoder::new().decode_member_from_reader_with_dictionary_to_sink(
                 &mut input.as_slice(),
@@ -7201,6 +7243,24 @@ mod tests {
             StreamDecodeError::Decode(Error::InvalidData("RAR 5 filter range exceeds output"))
         ));
         assert_eq!(record_count, 0);
+    }
+
+    #[test]
+    fn streaming_decoder_propagates_filter_record_failure() {
+        let data = b"\xe8\0\0\0\0plain text after call";
+        let input = encode_lz_member_with_filter(data, crate::FilterKind::E8).unwrap();
+        let error = Unpack50Decoder::new()
+            .decode_to_sink_with_filters(
+                &mut input.as_slice(),
+                0,
+                data.len(),
+                DEFAULT_DICTIONARY_SIZE,
+                false,
+                |_chunk| Ok::<(), &str>(()),
+                Some(&mut |_filter| Err("filter failed")),
+            )
+            .unwrap_err();
+        assert!(matches!(error, StreamDecodeError::Sink("filter failed")));
     }
 
     #[test]
