@@ -5504,6 +5504,15 @@ mod tests {
         assert_eq!(bits, (LEVEL_TABLE_SIZE - 3) * 4);
     }
 
+    #[test]
+    fn level_zero_run_stops_at_level_table_boundary() {
+        let mut nibbles = vec![0; LEVEL_TABLE_SIZE - 1];
+        nibbles.extend([15, 15]); // a seventeen-entry zero run at the last slot
+        let (lengths, bits) = read_level_lengths(&pack_nibbles(&nibbles)).unwrap();
+        assert_eq!(lengths, [0; LEVEL_TABLE_SIZE]);
+        assert_eq!(bits, (LEVEL_TABLE_SIZE + 1) * 4);
+    }
+
     fn pack_nibbles(nibbles: &[u8]) -> Vec<u8> {
         nibbles
             .chunks(2)
@@ -7178,6 +7187,22 @@ mod tests {
     }
 
     #[test]
+    fn parser_rejects_truncated_block_header_and_payload() {
+        let block = encode_compressed_block(&[0xaa, 0xbb], 16, false, true).unwrap();
+        for length in 0..block.len() {
+            assert_eq!(
+                parse_compressed_block(&block[..length]),
+                Err(Error::NeedMoreInput),
+                "truncated at byte {length}"
+            );
+        }
+        assert_eq!(
+            parse_compressed_block(&block).unwrap().payload,
+            3..block.len()
+        );
+    }
+
+    #[test]
     fn decoders_handle_uninitialized_match_controls() {
         for (symbol, buffered_error, streaming_error) in [
             (257, Error::NeedMoreInput, Error::NeedMoreInput),
@@ -7265,6 +7290,58 @@ mod tests {
                 "RAR 5 literal-only decoder encountered non-literal symbol"
             ))
         );
+    }
+
+    #[test]
+    fn decoders_reject_unsupported_filter_type() {
+        let mut lengths = TableLengths {
+            main: vec![0; MAIN_TABLE_SIZE],
+            distance: vec![0; DISTANCE_TABLE_SIZE_50],
+            align: vec![0; ALIGN_TABLE_SIZE],
+            length: vec![0; LENGTH_TABLE_SIZE],
+        };
+        lengths.main[b'A' as usize] = 1;
+        lengths.main[256] = 1;
+        let (bytes, bit_pos) = encode_table_lengths_with_bit_count(&lengths, 0).unwrap();
+        let mut writer = BitWriter {
+            bytes: Buffer::from_vec(bytes),
+            bit_pos,
+        };
+        writer.write_bits(1, 1); // filter control symbol
+        writer.write_bits(0, 2); // one-byte offset
+        writer.write_bits(0, 8);
+        writer.write_bits(0, 2); // one-byte length
+        writer.write_bits(1, 8);
+        writer.write_bits(7, 3); // unsupported filter type
+        let payload_bits = writer.bit_pos;
+        let input = encode_compressed_block(&writer.finish(), payload_bits, true, true).unwrap();
+
+        assert_eq!(
+            Unpack50Decoder::new().decode_member_with_dictionary(
+                &input,
+                0,
+                1,
+                DEFAULT_DICTIONARY_SIZE,
+                false,
+                DecodeMode::Lz,
+            ),
+            Err(Error::InvalidData("RAR 5 filter type is unsupported"))
+        );
+        let result = Unpack50Decoder::new().decode_to_sink_with_filters(
+            &mut input.as_slice(),
+            0,
+            1,
+            DEFAULT_DICTIONARY_SIZE,
+            false,
+            |_chunk| Ok::<(), std::convert::Infallible>(()),
+            Some(&mut |_filter| Ok::<(), std::convert::Infallible>(())),
+        );
+        assert!(matches!(
+            result,
+            Err(StreamDecodeError::Decode(Error::InvalidData(
+                "RAR 5 filter type is unsupported"
+            )))
+        ));
     }
 
     #[test]
