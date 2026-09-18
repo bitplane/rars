@@ -2965,7 +2965,6 @@ fn consider_match_candidate(
         candidate.score > best.score
             || (candidate.score == best.score
                 && (candidate.length > best.length
-                    || (candidate.length == best.length && candidate.cost < best.cost)
                     || (candidate.length == best.length
                         && candidate.cost == best.cost
                         && candidate.distance < best.distance)))
@@ -5962,6 +5961,31 @@ mod tests {
             .iter()
             .any(|token| matches!(token, EncodeToken::Match { length, .. } if *length > 8)));
         assert_eq!(decode_lz(&packed, 0, input.len()).unwrap(), input);
+    }
+
+    #[test]
+    fn match_selection_uses_length_then_distance_for_equal_scores() {
+        let state = EncoderMatchState::default();
+        let distance_size = DISTANCE_TABLE_SIZE_50;
+        assert_eq!(
+            estimated_match_cost(&state, 5, 1, distance_size).unwrap(),
+            10
+        );
+        assert_eq!(
+            estimated_match_cost(&state, 6, 262_144, distance_size).unwrap(),
+            26
+        );
+        assert_eq!(
+            estimated_match_cost(&state, 6, 262_143, distance_size).unwrap(),
+            26
+        );
+
+        let mut best = None;
+        consider_match_candidate(&mut best, &state, distance_size, 5, 1);
+        consider_match_candidate(&mut best, &state, distance_size, 6, 262_144);
+        assert_eq!((best.unwrap().length, best.unwrap().distance), (6, 262_144));
+        consider_match_candidate(&mut best, &state, distance_size, 6, 262_143);
+        assert_eq!((best.unwrap().length, best.unwrap().distance), (6, 262_143));
     }
 
     #[test]
