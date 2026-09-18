@@ -6117,18 +6117,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn filtered_member_paths_reject_ranges_outside_input() {
-        for data in [vec![b'A'; 16], vec![b'A'; FILTERED_LZ_BLOCK_SIZE + 1]] {
-            let invalid =
-                crate::FilterSpec::range(crate::FilterKind::E8, data.len()..data.len() + 1);
-            assert_eq!(
-                Unpack50Encoder::new().encode_member_with_filter(&data, 0, invalid),
-                Err(Error::InvalidData("RAR 5 filter range is invalid"))
-            );
-        }
-    }
-
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn filter_transform_rejects_offset_beyond_record_width() {

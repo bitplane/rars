@@ -29,6 +29,19 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+#[test]
+fn rar50_member_encoder_rejects_filter_ranges_outside_input_in_both_size_paths() {
+    for data in [vec![b'A'; 16], vec![b'A'; 0x40000 + 1]] {
+        let invalid = rars::FilterSpec::range(rars::FilterKind::E8, data.len()..data.len() + 1);
+        assert_eq!(
+            rars::codec::rar50::Unpack50Encoder::new().encode_member_with_filter(&data, 0, invalid),
+            Err(rars::codec::Error::InvalidData(
+                "RAR 5 filter range is invalid"
+            ))
+        );
+    }
+}
+
 fn service_names(archive: &Archive) -> Vec<String> {
     archive
         .services()
