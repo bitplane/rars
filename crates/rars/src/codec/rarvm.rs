@@ -1263,6 +1263,34 @@ mod tests {
     }
 
     #[test]
+    fn nested_calls_return_through_each_stack_frame() {
+        let result = execute_instructions(vec![
+            instr(Opcode::Call, false, vec![Operand::Immediate(3)]),
+            instr(Opcode::Ret, false, Vec::new()),
+            instr(
+                Opcode::Mov,
+                false,
+                vec![Operand::Register(0), Operand::Immediate(99)],
+            ),
+            instr(Opcode::Call, false, vec![Operand::Immediate(6)]),
+            instr(
+                Opcode::Add,
+                false,
+                vec![Operand::Register(0), Operand::Immediate(2)],
+            ),
+            instr(Opcode::Ret, false, Vec::new()),
+            instr(
+                Opcode::Add,
+                false,
+                vec![Operand::Register(0), Operand::Immediate(40)],
+            ),
+            instr(Opcode::Ret, false, Vec::new()),
+        ]);
+
+        assert_eq!(result.regs[0], 42);
+    }
+
+    #[test]
     fn executes_unconditional_jumps_and_mutating_unary_ops() {
         let result = execute_instructions(vec![
             instr(
@@ -1843,6 +1871,33 @@ mod tests {
             }),
             Err(Error::InvalidData("RARVM write to immediate operand"))
         );
+    }
+
+    #[test]
+    fn parsed_shifts_reject_an_immediate_destination() {
+        for opcode in [Opcode::Shl, Opcode::Shr, Opcode::Sar] {
+            let mut bits = BitWriter::new();
+            bits.write_bits(0, 1); // no static data
+            write_opcode(&mut bits, opcode);
+            bits.write_bits(0, 1); // word mode
+            write_number_immediate(&mut bits, 1); // destination
+            write_number_immediate(&mut bits, 1); // nonzero shift count
+            write_opcode(&mut bits, Opcode::Ret);
+
+            let program = Program::parse(&with_xor(bits.finish())).unwrap();
+            assert_eq!(program.instructions[0].opcode, opcode);
+            assert_eq!(
+                program.execute(Invocation {
+                    input: &[],
+                    regs: [0; 7],
+                    global_data: &[],
+                    file_offset: 0,
+                    exec_count: 0,
+                }),
+                Err(Error::InvalidData("RARVM write to immediate operand")),
+                "{opcode:?} should reject an immediate destination",
+            );
+        }
     }
 
     #[test]
