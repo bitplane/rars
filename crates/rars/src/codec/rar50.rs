@@ -2862,7 +2862,6 @@ struct MatchCandidate {
     length: usize,
     distance: usize,
     score: isize,
-    cost: usize,
 }
 
 fn best_match<B: Budget>(
@@ -2941,15 +2940,12 @@ fn consider_match_candidate(
         length,
         distance,
         score: (length as isize * 16) - cost as isize,
-        cost,
     };
     if best.is_none_or(|best| {
         candidate.score > best.score
             || (candidate.score == best.score
                 && (candidate.length > best.length
-                    || (candidate.length == best.length
-                        && candidate.cost == best.cost
-                        && candidate.distance < best.distance)))
+                    || (candidate.length == best.length && candidate.distance < best.distance)))
     }) {
         *best = Some(candidate);
     }
@@ -6172,7 +6168,6 @@ mod tests {
             length: 4,
             distance: 1,
             score: 1000,
-            cost: 0,
         };
 
         assert_eq!(
