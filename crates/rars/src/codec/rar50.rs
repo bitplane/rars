@@ -4376,7 +4376,7 @@ fn emit_repeat_level_run<B: Budget>(
     while run >= 3 {
         if run >= 11 {
             let mut chunk = run.min(138);
-            if matches!(run - chunk, 1 | 2) && chunk >= 14 {
+            if matches!(run - chunk, 1 | 2) {
                 chunk -= 3;
             }
             tokens
@@ -4402,7 +4402,7 @@ fn emit_zero_level_run<B: Budget>(
     while run != 0 {
         if run >= 11 {
             let mut chunk = run.min(138);
-            if matches!(run - chunk, 1 | 2) && chunk >= 14 {
+            if matches!(run - chunk, 1 | 2) {
                 chunk -= 3;
             }
             tokens
@@ -5723,6 +5723,24 @@ mod tests {
                 })
                 .sum();
             assert_eq!(emitted, count, "repeat run of {count}");
+        }
+    }
+
+    #[test]
+    fn zero_level_runs_cover_the_whole_requested_length() {
+        for count in 1..=1024 {
+            let mut tokens = Buffer::new(&Allowance::default());
+            emit_zero_level_run(&mut tokens, count).unwrap();
+            let emitted: usize = tokens
+                .iter()
+                .map(|token| match token.symbol {
+                    0 => 1,
+                    18 => usize::from(token.extra_value) + 3,
+                    19 => usize::from(token.extra_value) + 11,
+                    other => panic!("unexpected zero-run symbol {other}"),
+                })
+                .sum();
+            assert_eq!(emitted, count, "zero run of {count}");
         }
     }
 
