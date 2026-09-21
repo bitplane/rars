@@ -6169,6 +6169,37 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn lazy_match_lookahead_stops_at_the_member_boundary() {
+        let input = b"abcdef";
+        let mut finder = Rar50MatchFinder::new(input.len());
+        for pos in 0..4 {
+            finder.insert(input, pos);
+        }
+        let current = MatchCandidate {
+            length: 4,
+            distance: 1,
+            score: 1000,
+            cost: 0,
+        };
+
+        assert_eq!(
+            lazy_match_decision(
+                input,
+                4,
+                input.len(),
+                &finder,
+                EncodeOptions::default()
+                    .with_lazy_matching(true)
+                    .with_lazy_lookahead(4),
+                &EncoderMatchState::default(),
+                DISTANCE_TABLE_SIZE_50,
+                current,
+            ),
+            (false, None)
+        );
+    }
+
     fn encode_lz_member_with_filter(data: &[u8], kind: crate::FilterKind) -> Result<Vec<u8>> {
         Unpack50Encoder::new().encode_member_with_filter(data, 0, crate::FilterSpec::whole(kind))
     }
@@ -7557,21 +7588,38 @@ mod tests {
     }
 
     #[test]
-    fn literal_only_decoder_rejects_control_symbol() {
-        let input = control_only_block(257);
-        assert_eq!(
-            Unpack50Decoder::new().decode_member_with_dictionary(
-                &input,
-                0,
-                1,
-                DEFAULT_DICTIONARY_SIZE,
-                false,
-                DecodeMode::LiteralOnly,
-            ),
-            Err(Error::InvalidData(
-                "RAR 5 literal-only decoder encountered non-literal symbol"
-            ))
-        );
+    fn literal_only_decoder_rejects_every_lz_control_class() {
+        for symbol in [256, 257, 258, 262] {
+            let input = control_only_block(symbol);
+            assert_eq!(
+                Unpack50Decoder::new().decode_member_with_dictionary(
+                    &input,
+                    0,
+                    1,
+                    DEFAULT_DICTIONARY_SIZE,
+                    false,
+                    DecodeMode::LiteralOnly,
+                ),
+                Err(Error::InvalidData(
+                    "RAR 5 literal-only decoder encountered non-literal symbol"
+                )),
+                "control symbol {symbol}"
+            );
+        }
+    }
+
+    #[test]
+    fn decoder_defaults_match_fresh_state() {
+        assert_eq!(BlockSplitter::default().counts, BlockSplitter::new().counts);
+        assert_eq!(BlockSplitter::default().total, BlockSplitter::new().total);
+
+        let default = Unpack50Decoder::default();
+        let fresh = Unpack50Decoder::new();
+        assert!(default.tables.is_none());
+        assert!(fresh.tables.is_none());
+        assert_eq!(default.reps, fresh.reps);
+        assert_eq!(default.last_length, fresh.last_length);
+        assert_eq!(default.history, fresh.history);
     }
 
     #[test]
