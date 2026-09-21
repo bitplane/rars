@@ -7184,6 +7184,38 @@ mod tests {
     }
 
     #[test]
+    fn decoders_stop_at_declared_size_before_a_nonfinal_block() {
+        let payload = literal_only_payload(b"AB");
+        let block = encode_compressed_block(&payload, payload.len() * 8, true, false).unwrap();
+        let mut input = block.clone();
+        input.extend_from_slice(b"not another block");
+
+        assert_eq!(decode_literal_only(&input, 0, 2).unwrap(), b"AB");
+        let mut reader = input.as_slice();
+        let mut streamed = Vec::new();
+        Unpack50Decoder::new()
+            .decode_member_from_reader_with_dictionary_to_sink(
+                &mut reader,
+                0,
+                2,
+                DEFAULT_DICTIONARY_SIZE,
+                false,
+                |chunk| {
+                    match chunk {
+                        DecodedChunk::Bytes(bytes) => streamed.extend_from_slice(bytes),
+                        DecodedChunk::Repeated { byte, len } => {
+                            streamed.extend(std::iter::repeat_n(byte, len));
+                        }
+                    }
+                    Ok::<(), std::convert::Infallible>(())
+                },
+            )
+            .unwrap();
+        assert_eq!(streamed, b"AB");
+        assert_eq!(reader, &input[block.len()..]);
+    }
+
+    #[test]
     fn decodes_synthetic_new_match_block() {
         let payload = new_match_payload();
         let input = encode_compressed_block(&payload, payload.len() * 8, true, true).unwrap();
