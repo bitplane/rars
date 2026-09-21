@@ -4841,6 +4841,30 @@ mod tests {
     }
 
     #[test]
+    fn empty_streaming_member_has_no_blocks_or_progress() {
+        let options = EncodeOptions::new(0).with_optimal_parse(true);
+        let allowance = Allowance::limited(0);
+        let mut called = false;
+        let mut progress = |_: usize| {
+            called = true;
+            true
+        };
+        let output = streaming_blocks_with_allowance(
+            &[],
+            &[],
+            &[],
+            0,
+            options,
+            Some(&mut progress),
+            &allowance,
+        )
+        .unwrap();
+        assert!(output.is_empty());
+        assert!(!called);
+        assert_eq!(allowance.used(), 0);
+    }
+
+    #[test]
     fn member_allowance_covers_history_tables_and_retained_block_output() {
         let data = b"bounded member with repeated words and short matches\n".repeat(3000);
         let history = b"short matches and remembered history\n".repeat(1000);
