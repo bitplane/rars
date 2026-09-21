@@ -2,7 +2,8 @@
 mod scratch;
 
 use rars::codec::rar50::{
-    decode_lz, encode_lz_member, parse_compressed_block, read_table_lengths, DecodeTables,
+    decode_lz, encode_lz_member, encode_table_lengths, parse_compressed_block, read_table_lengths,
+    DecodeTables,
 };
 use rars::crc32::crc32;
 use rars::crypto::rar50::{Rar50Cipher, Rar50Keys};
@@ -27,6 +28,32 @@ fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/rar50")
         .join(name)
+}
+
+#[test]
+fn public_rar50_table_encoder_checks_each_table_shape() {
+    let packed = encode_lz_member(b"ABABABAB", 0).unwrap();
+    let block = parse_compressed_block(&packed).unwrap();
+    let (lengths, _) = read_table_lengths(&packed[block.payload], 0).unwrap();
+    assert!(encode_table_lengths(&lengths, 0).is_ok());
+
+    for field in 0..4 {
+        let mut malformed = lengths.clone();
+        match field {
+            0 => malformed.main.pop(),
+            1 => malformed.distance.pop(),
+            2 => malformed.align.pop(),
+            3 => malformed.length.pop(),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            encode_table_lengths(&malformed, 0),
+            Err(rars::codec::Error::InvalidData(
+                "RAR 5 table length count mismatch"
+            )),
+            "malformed table field {field}"
+        );
+    }
 }
 
 #[test]
