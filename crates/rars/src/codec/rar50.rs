@@ -6692,6 +6692,65 @@ mod tests {
     }
 
     #[test]
+    fn optimal_parse_with_matching_disabled_emits_literals() {
+        let data = b"ABABABAB";
+        let tokens = collected_optimal_tokens(
+            data,
+            EncodeOptions::new(0).with_optimal_parse(true),
+            DISTANCE_TABLE_SIZE_50,
+            None,
+        );
+
+        assert_eq!(
+            tokens,
+            data.iter()
+                .copied()
+                .map(EncodeToken::Literal)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn optimal_long_match_commitment_prunes_shorter_candidate_endpoints() {
+        let history = 2;
+        let span = NICE_MATCH_LENGTH + 8;
+        let combined = vec![0; history + span];
+        let mut price = vec![u32::MAX; span + 1];
+        let mut arrive_length = vec![0; span + 1];
+        let mut arrive_distance = vec![0; span + 1];
+        let mut arrive_reps = vec![[0; 4]; span + 1];
+        let mut arrive_last_length = vec![0; span + 1];
+        price[0] = 0;
+        let runs = [(4, 1), (NICE_MATCH_LENGTH as u32, 2)];
+        let mut starts = vec![2; span + 1];
+        starts[0] = 0;
+        let mut reaches = [(0, 0, 0); 8];
+
+        price_optimal_paths(
+            &combined,
+            history..history + span,
+            EncodeOptions::new(32).with_optimal_parse(true),
+            DISTANCE_TABLE_SIZE_50,
+            None,
+            &runs,
+            &starts,
+            OptimalSlices {
+                price: &mut price,
+                arrive_length: &mut arrive_length,
+                arrive_distance: &mut arrive_distance,
+                arrive_reps: &mut arrive_reps,
+                arrive_last_length: &mut arrive_last_length,
+            },
+            &mut reaches,
+        );
+
+        assert_eq!(price[4], u32::MAX);
+        assert_ne!(price[NICE_MATCH_LENGTH], u32::MAX);
+        assert_eq!(arrive_length[NICE_MATCH_LENGTH], NICE_MATCH_LENGTH as u32);
+        assert_eq!(arrive_distance[NICE_MATCH_LENGTH], 2);
+    }
+
+    #[test]
     fn the_optimal_parse_beats_lazy_matching_at_the_same_depth() {
         let data = wordy_text(256 * 1024);
         let base = EncodeOptions::new(64);
