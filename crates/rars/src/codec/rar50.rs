@@ -5063,6 +5063,29 @@ mod tests {
     }
 
     #[test]
+    fn lazy_parser_honors_cancellation_at_final_progress_report() {
+        let allowance = Allowance::default();
+        let data = b"AB";
+        let mut reports = 0;
+        let result = encode_tokens_with_allowance(
+            data,
+            0..data.len(),
+            MemberSearch::Fresh,
+            EncodeOptions::new(0),
+            DISTANCE_TABLE_SIZE_50,
+            &[],
+            Some(&mut |_| {
+                reports += 1;
+                reports == 1
+            }),
+            &allowance,
+        );
+
+        assert_eq!(result, Err(Error::Cancelled));
+        assert_eq!(reports, 2);
+    }
+
+    #[test]
     fn configured_x86_scanning_matches_default_across_poll_boundaries() {
         let mut input = vec![0; 192 * 1024];
         for pos in [65530, 65535, 65541, 131070, 131080] {
