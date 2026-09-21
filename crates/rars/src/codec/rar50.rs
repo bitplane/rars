@@ -2899,10 +2899,6 @@ fn best_match<B: Budget>(
     }
     let mut candidate = finder.first(input, pos);
     while candidate != match_finder::NO_POSITION {
-        if candidate >= pos {
-            candidate = finder.previous(candidate);
-            continue;
-        }
         let distance = pos - candidate;
         if distance > max_distance {
             break;
