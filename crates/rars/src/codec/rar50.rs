@@ -2876,11 +2876,7 @@ fn best_match<B: Budget>(
 ) -> Option<MatchCandidate> {
     let max_distance = pos.min(options.max_match_distance);
     let max_length = (end - pos).min(MAX_ENCODER_MATCH_LENGTH);
-    if options.max_match_candidates == 0
-        || max_distance == 0
-        || max_length < 4
-        || pos + 3 >= input.len()
-    {
+    if options.max_match_candidates == 0 || max_distance == 0 || max_length < 4 {
         return None;
     }
     let mut best = None;
