@@ -2828,7 +2828,7 @@ fn lazy_match_decision<B: Budget>(
     distance_size: usize,
     current: MatchCandidate,
 ) -> (bool, Option<MatchCandidate>) {
-    if !options.lazy_matching || pos + 1 >= end {
+    if !options.lazy_matching {
         return (false, None);
     }
     let lookahead = options.lazy_lookahead.max(1);
