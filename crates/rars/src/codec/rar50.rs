@@ -6721,6 +6721,7 @@ mod tests {
         let mut arrive_reps = vec![[0; 4]; span + 1];
         let mut arrive_last_length = vec![0; span + 1];
         price[0] = 0;
+        arrive_reps[0] = [0, (history + 1) as u32, 0, 0];
         let runs = [(4, 1), (NICE_MATCH_LENGTH as u32, 2)];
         let mut starts = vec![2; span + 1];
         starts[0] = 0;
