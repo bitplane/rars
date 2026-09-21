@@ -5090,6 +5090,18 @@ mod tests {
     }
 
     #[test]
+    fn e8_decoder_adjusts_wrapped_negative_addresses() {
+        let mut data = [0xe8, 0xff, 0xff, 0xff, 0xff];
+
+        e8e9_decode(&mut data, 0, false);
+
+        assert_eq!(
+            u32::from_le_bytes(data[1..5].try_into().unwrap()),
+            0x00ff_ffff
+        );
+    }
+
+    #[test]
     fn cancellation_interrupts_buffered_decode_and_filters() {
         let data = b"cancellable RAR5 symbols ".repeat(16384);
         let packed = encode_literal_only(&data, 0).unwrap();
@@ -6191,6 +6203,63 @@ mod tests {
         );
     }
 
+    #[test]
+    fn filter_record_integers_round_trip_at_every_encoded_width() {
+        for value in [0, 0xff, 0x100, 0xffff, 0x1_0000, 0xff_ffff, 0x100_0000] {
+            let mut writer = BitWriter::new();
+            try_write_filter_data(&mut writer, value).unwrap();
+            let encoded = writer.finish();
+            assert_eq!(
+                read_filter_data(&mut BitReader::new(&encoded)).unwrap(),
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn filter_record_writer_rejects_invalid_delta_channels() {
+        for channels in [0, MAX_DELTA_CHANNELS + 1] {
+            let mut writer = BitWriter::new();
+            assert_eq!(
+                try_write_filter(
+                    &mut writer,
+                    EncodeFilter {
+                        offset: 0,
+                        length: 1,
+                        filter_type: FilterType::Delta,
+                        channels,
+                    },
+                ),
+                Err(Error::InvalidData(
+                    "RAR 5 DELTA filter channel count is invalid"
+                ))
+            );
+        }
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn filter_record_writer_rejects_fields_beyond_u32() {
+        for (offset, length, message) in [
+            (u32::MAX as usize + 1, 1, "RAR 5 filter offset is too large"),
+            (0, u32::MAX as usize + 1, "RAR 5 filter length is too large"),
+        ] {
+            let mut writer = BitWriter::new();
+            assert_eq!(
+                try_write_filter(
+                    &mut writer,
+                    EncodeFilter {
+                        offset,
+                        length,
+                        filter_type: FilterType::E8,
+                        channels: 0,
+                    },
+                ),
+                Err(Error::InvalidData(message))
+            );
+        }
+    }
+
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn filter_transform_rejects_offset_beyond_record_width() {
@@ -6261,6 +6330,65 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, StreamDecodeError::FilteredMember));
+    }
+
+    #[test]
+    fn streaming_filter_records_reconstruct_buffered_output() {
+        let cases = [
+            (
+                (0..96).map(|index| (index * 7 + index / 3) as u8).collect(),
+                crate::FilterKind::Delta { channels: 3 },
+            ),
+            (
+                b"\xe8\0\0\0\0plain text after call".to_vec(),
+                crate::FilterKind::E8,
+            ),
+            (
+                b"\xe9\0\0\0\0jump target through e9".to_vec(),
+                crate::FilterKind::E8E9,
+            ),
+            (
+                vec![0x04, 0x00, 0x00, 0xeb, b'A', b'R', b'M', b'!'],
+                crate::FilterKind::Arm,
+            ),
+        ];
+
+        for (expected, kind) in cases {
+            let packed = encode_lz_member_with_filter(&expected, kind).unwrap();
+            let mut raw = Vec::new();
+            let mut filters = Vec::new();
+            Unpack50Decoder::new()
+                .decode_to_sink_with_filters(
+                    &mut packed.as_slice(),
+                    0,
+                    expected.len(),
+                    DEFAULT_DICTIONARY_SIZE,
+                    false,
+                    |chunk| {
+                        match chunk {
+                            DecodedChunk::Bytes(bytes) => raw.extend_from_slice(bytes),
+                            DecodedChunk::Repeated { byte, len } => {
+                                raw.extend(std::iter::repeat_n(byte, len));
+                            }
+                        }
+                        Ok::<(), std::convert::Infallible>(())
+                    },
+                    Some(&mut |filter| {
+                        filters.push(filter);
+                        Ok::<(), std::convert::Infallible>(())
+                    }),
+                )
+                .unwrap();
+
+            assert_eq!(filters.len(), 1);
+            apply_filters_with_control(
+                &mut raw,
+                &filters,
+                &crate::read_control::ReadControl::default(),
+            )
+            .unwrap();
+            assert_eq!(raw, expected);
+        }
     }
 
     #[test]
