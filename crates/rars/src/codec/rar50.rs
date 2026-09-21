@@ -4373,7 +4373,7 @@ fn emit_repeat_level_run<B: Budget>(
     tokens: &mut Buffer<LevelToken, B>,
     mut run: usize,
 ) -> Result<()> {
-    while run != 0 {
+    while run >= 3 {
         if run >= 11 {
             let mut chunk = run.min(138);
             if matches!(run - chunk, 1 | 2) && chunk >= 14 {
@@ -4383,16 +4383,15 @@ fn emit_repeat_level_run<B: Budget>(
                 .push(LevelToken::repeat_previous_long(chunk))
                 .map_err(Into::into)?;
             run -= chunk;
-        } else if run >= 3 {
+        } else {
             let chunk = run.min(10);
             tokens
                 .push(LevelToken::repeat_previous_short(chunk))
                 .map_err(Into::into)?;
             run -= chunk;
-        } else {
-            break;
         }
     }
+    debug_assert_eq!(run, 0);
     Ok(())
 }
 
@@ -5708,6 +5707,23 @@ mod tests {
 
         assert!(tokens.contains(&LevelToken::repeat_previous_short(3)));
         assert!(tokens.iter().any(|token| token.symbol == 19));
+    }
+
+    #[test]
+    fn repeat_level_runs_cover_the_whole_requested_length() {
+        for count in 3..=1024 {
+            let mut tokens = Buffer::new(&Allowance::default());
+            emit_repeat_level_run(&mut tokens, count).unwrap();
+            let emitted: usize = tokens
+                .iter()
+                .map(|token| match token.symbol {
+                    16 => usize::from(token.extra_value) + 3,
+                    17 => usize::from(token.extra_value) + 11,
+                    other => panic!("unexpected repeat symbol {other}"),
+                })
+                .sum();
+            assert_eq!(emitted, count, "repeat run of {count}");
+        }
     }
 
     #[test]
