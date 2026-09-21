@@ -5011,6 +5011,41 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     }
 
     #[test]
+    fn history_trimming_discards_stale_filters_and_keeps_future_filters() {
+        let mut decoder = Unpack29::new();
+        decoder.output.resize(MAX_HISTORY + 64, 0);
+        decoder.programs.push(VmProgram {
+            kind: VmProgramKind::Standard(StandardFilter::E8),
+            block_size: 8,
+            exec_count: 0,
+            globals: Vec::new(),
+        });
+        decoder.filters.push(VmFilter {
+            program: 0,
+            start: 0,
+            size: 8,
+            regs: [0; 7],
+            global_data: Vec::new(),
+        });
+        decoder.filters.push(VmFilter {
+            program: 0,
+            start: 128,
+            size: 8,
+            regs: [0; 7],
+            global_data: Vec::new(),
+        });
+
+        decoder.trim_history(MAX_HISTORY + 64, MAX_HISTORY + 64);
+
+        assert_eq!(decoder.base_offset, 64);
+        assert_eq!(decoder.output.len(), MAX_HISTORY);
+        assert_eq!(decoder.filters.len(), 1);
+        assert_eq!(decoder.filters[0].start, 128);
+        assert_eq!(decoder.filtered_range(64, 136, 0).unwrap(), vec![0; 72]);
+        assert!(decoder.filters.is_empty());
+    }
+
+    #[test]
     fn stale_filter_ranges_do_not_change_later_published_bytes() {
         let mut decoder = Unpack29::new();
         decoder.output.resize(32, 0x5a);
