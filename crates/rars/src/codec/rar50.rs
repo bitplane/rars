@@ -8533,6 +8533,49 @@ mod tests {
     }
 
     #[test]
+    fn optimal_match_collection_grows_beyond_one_run_per_position() {
+        let mut noise = 0x2545_f491_4f6c_dd1du64;
+        let data: Vec<u8> = (0..4096)
+            .map(|_| {
+                noise ^= noise << 13;
+                noise ^= noise >> 7;
+                noise ^= noise << 17;
+                b'A' + ((noise >> 40) as u8 & 1)
+            })
+            .collect();
+        let options = EncodeOptions::new(64).with_optimal_parse(true);
+        let baseline = RefusingBudget::new(usize::MAX);
+        let mut collector = OptimalCollector::with_allowance(&data, 0, options, &baseline).unwrap();
+        let matches = collector.collect(&data, 0..data.len(), options).unwrap();
+        assert!(matches.runs.len() > data.len());
+        drop(matches);
+        drop(collector);
+        assert_eq!(baseline.used(), 0);
+
+        assert_each_allocation_refusal(|budget| {
+            let mut collector = OptimalCollector::with_allowance(&data, 0, options, budget)?;
+            collector.collect(&data, 0..data.len(), options)
+        });
+
+        let start = data.len() / 2;
+        let baseline = RefusingBudget::new(usize::MAX);
+        let mut collector =
+            OptimalCollector::with_allowance(&data, start, options, &baseline).unwrap();
+        let matches = collector
+            .collect(&data, start..data.len(), options)
+            .unwrap();
+        assert!(matches.runs.len() > data.len() - start);
+        drop(matches);
+        drop(collector);
+        assert_eq!(baseline.used(), 0);
+
+        assert_each_allocation_refusal(|budget| {
+            let mut collector = OptimalCollector::with_allowance(&data, start, options, budget)?;
+            collector.collect(&data, start..data.len(), options)
+        });
+    }
+
+    #[test]
     fn distance_slots_beyond_native_address_width_use_out_of_window_sentinel() {
         for (slot, extra, distance) in [
             (63, (1u32 << 30) - 1, 1u64 << 32),
