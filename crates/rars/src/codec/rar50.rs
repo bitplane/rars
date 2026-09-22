@@ -660,13 +660,18 @@ pub fn encode_literal_only(data: &[u8], algorithm_version: u8) -> Result<Vec<u8>
     let present = literal_presence(data);
     let literal_count = present.iter().filter(|&&used| used).count();
     let literal_length = huffman::bits_for_symbol_count(literal_count);
+    let mut literal_codes = [0u16; 256];
+    let mut next_code = 0u16;
     for (symbol, used) in present.into_iter().enumerate() {
         if used {
             lengths.main[symbol] = literal_length;
+            // Every literal has the same length, so canonical order is simply
+            // the order of the present byte values.
+            literal_codes[symbol] = next_code;
+            next_code += 1;
         }
     }
 
-    let table = HuffmanTable::from_lengths(&lengths.main)?;
     let (table_data, table_bits) =
         encode_table_lengths_with_bit_count(&lengths, algorithm_version)?;
     let mut writer = BitWriter {
@@ -674,8 +679,10 @@ pub fn encode_literal_only(data: &[u8], algorithm_version: u8) -> Result<Vec<u8>
         bit_pos: table_bits,
     };
     for &byte in data {
-        let (code, len) = table.code_for_symbol(byte as usize)?;
-        writer.write_bits(usize::from(code), usize::from(len));
+        writer.write_bits(
+            usize::from(literal_codes[byte as usize]),
+            usize::from(literal_length),
+        );
     }
     let payload_bits = writer.bit_pos;
     encode_compressed_block(&writer.finish(), payload_bits, true, true)
@@ -4172,14 +4179,6 @@ impl HuffmanTable {
             }
         }
         Err(Error::InvalidData("RAR 5 invalid Huffman code"))
-    }
-
-    fn code_for_symbol(&self, symbol: usize) -> Result<(u16, u8)> {
-        self.symbols
-            .iter()
-            .find(|item| item.symbol == symbol)
-            .map(|item| (item.code, item.len))
-            .ok_or(Error::InvalidData("RAR 5 missing Huffman symbol"))
     }
 }
 
