@@ -5711,6 +5711,33 @@ mod tests {
     }
 
     #[test]
+    fn truncated_table_run_extras_need_more_input() {
+        // The last run symbol ends with fewer padding bits than its extra
+        // field needs. Exercise both repeat-previous and zero runs at each
+        // extra-field width.
+        for (prefix, run) in [
+            (&[][..], 19),
+            (&[1, 1][..], 18),
+            (&[1][..], 17),
+            (&[1, 1][..], 16),
+        ] {
+            let mut writer = BitWriter::new();
+            for _ in 0..LEVEL_TABLE_SIZE {
+                writer.write_bits(5, 4);
+            }
+            for &symbol in prefix {
+                writer.write_bits(symbol, 5);
+            }
+            writer.write_bits(run, 5);
+            assert_eq!(
+                read_table_lengths(&writer.finish(), 0),
+                Err(Error::NeedMoreInput),
+                "run symbol {run}"
+            );
+        }
+    }
+
+    #[test]
     fn reads_rar70_table_length_count() {
         assert_eq!(
             table_length_count(1).unwrap(),
