@@ -1084,10 +1084,6 @@ fn filtered_member_with_allowance<B: Budget>(
         if range.start >= range.end || range.end > data.len() {
             return Err(Error::InvalidData("RAR 5 filter range is invalid"));
         }
-        if range.start > u32::MAX as usize {
-            return Err(Error::InvalidData("RAR 5 filter offset is too large"));
-        }
-
         let filter_data = &mut filtered[range.clone()];
         let (filter_type, channels) = encode_filter_data(
             rar50_filter(filter.kind)?,
