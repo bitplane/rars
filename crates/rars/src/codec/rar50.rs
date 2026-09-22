@@ -5738,6 +5738,29 @@ mod tests {
     }
 
     #[test]
+    fn malformed_table_prefixes_fail_before_table_symbols() {
+        assert_eq!(read_table_lengths(&[], 0), Err(Error::NeedMoreInput));
+
+        let mut invalid = BitWriter::new();
+        for _ in 0..LEVEL_TABLE_SIZE {
+            invalid.write_bits(1, 4);
+        }
+        assert!(matches!(
+            read_table_lengths(&invalid.finish(), 0),
+            Err(Error::InvalidData(_))
+        ));
+
+        let mut no_symbols = BitWriter::new();
+        for _ in 0..LEVEL_TABLE_SIZE {
+            no_symbols.write_bits(5, 4);
+        }
+        assert_eq!(
+            read_table_lengths(&no_symbols.finish(), 0),
+            Err(Error::NeedMoreInput)
+        );
+    }
+
+    #[test]
     fn reads_rar70_table_length_count() {
         assert_eq!(
             table_length_count(1).unwrap(),
