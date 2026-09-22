@@ -3597,28 +3597,25 @@ impl StreamingOutput {
             return Err(Error::InvalidData("RAR 5 match exceeds output limit").into());
         }
         if distance == 1 {
-            let byte = self.byte_at_distance(1)?;
+            let byte = self.byte_at_distance(1);
             return self.push_repeated(byte, length, sink);
         }
         for _ in 0..length {
-            let byte = self.byte_at_distance(distance)?;
+            let byte = self.byte_at_distance(distance);
             self.push(byte, sink)?;
         }
         Ok(())
     }
 
-    fn byte_at_distance(&self, distance: usize) -> Result<u8> {
+    fn byte_at_distance(&self, distance: usize) -> u8 {
+        // copy_match admits only distances inside the current window. Every
+        // copied byte extends that window; flush retains at least distance
+        // bytes because distance is bounded by dictionary_size.
         if distance <= self.pending.len() {
-            Ok(self.pending[self.pending.len() - distance])
+            self.pending[self.pending.len() - distance]
         } else {
             let history_distance = distance - self.pending.len();
-            if history_distance > self.history.len() {
-                return Err(Error::InvalidData("RAR 5 match distance exceeds window"));
-            }
-            Ok(*self
-                .history
-                .get(self.history.len() - history_distance)
-                .ok_or(Error::InvalidData("RAR 5 match distance exceeds window"))?)
+            self.history[self.history.len() - history_distance]
         }
     }
 
@@ -8132,6 +8129,34 @@ mod tests {
         assert_eq!(chunks, [(0, 100_000)]);
         assert_eq!(output.written(), 100_000);
         assert_eq!(output.into_history(), [0, 0]);
+    }
+
+    #[test]
+    fn streaming_match_keeps_its_window_across_flushes() {
+        let count = STREAM_FLUSH_THRESHOLD + 11;
+        let mut output = StreamingOutput::new(b"abc".to_vec(), count, 3, 3);
+        let mut decoded = Vec::new();
+        let mut sink = |chunk: DecodedChunk<'_>| {
+            match chunk {
+                DecodedChunk::Bytes(bytes) => decoded.extend_from_slice(bytes),
+                DecodedChunk::Repeated { byte, len } => {
+                    decoded.extend(std::iter::repeat_n(byte, len));
+                }
+            }
+            Ok::<(), std::convert::Infallible>(())
+        };
+        output.copy_match(3, count, &mut sink).unwrap();
+        output.finish(&mut sink).unwrap();
+        assert_eq!(
+            decoded,
+            b"abc"
+                .iter()
+                .copied()
+                .cycle()
+                .take(count)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(output.into_history(), b"abc");
     }
 
     #[test]
