@@ -8461,6 +8461,58 @@ mod tests {
     }
 
     #[test]
+    fn match_pricing_and_encoding_reject_invalid_internal_candidates() {
+        let mut repeated = EncoderMatchState::default();
+        repeated.reps[0] = 1;
+        repeated.last_length = 2;
+        let too_short = Error::InvalidData("RAR 5 match length is too short");
+        assert_eq!(
+            repeated
+                .encode_match(1, 1, DISTANCE_TABLE_SIZE_50)
+                .unwrap_err(),
+            too_short
+        );
+        assert_eq!(
+            estimated_match_cost(&repeated, 1, 1, DISTANCE_TABLE_SIZE_50).unwrap_err(),
+            too_short
+        );
+
+        let fresh = EncoderMatchState::default();
+        let underflow = Error::InvalidData("RAR 5 adjusted match length underflows");
+        assert_eq!(
+            fresh
+                .encode_match(2, 0x40001, DISTANCE_TABLE_SIZE_50)
+                .unwrap_err(),
+            underflow
+        );
+        assert_eq!(
+            estimated_match_cost(&fresh, 2, 0x40001, DISTANCE_TABLE_SIZE_50).unwrap_err(),
+            underflow
+        );
+
+        #[cfg(target_pointer_width = "64")]
+        {
+            let too_distant = Error::InvalidData("RAR 5 match distance is too large");
+            assert_eq!(
+                estimated_match_cost(&fresh, 4, 1usize << 40, DISTANCE_TABLE_SIZE_50).unwrap_err(),
+                too_distant
+            );
+            let invalid_slot = Error::InvalidData("RAR 5 distance slot is too large");
+            assert_eq!(
+                fresh
+                    .encode_match(5, (1usize << 33) + 1, DISTANCE_TABLE_SIZE_70)
+                    .unwrap_err(),
+                invalid_slot
+            );
+            assert_eq!(
+                estimated_match_cost(&fresh, 5, (1usize << 33) + 1, DISTANCE_TABLE_SIZE_70)
+                    .unwrap_err(),
+                invalid_slot
+            );
+        }
+    }
+
+    #[test]
     fn distance_slots_beyond_native_address_width_use_out_of_window_sentinel() {
         for (slot, extra, distance) in [
             (63, (1u32 << 30) - 1, 1u64 << 32),
