@@ -5427,6 +5427,59 @@ mod tests {
     }
 
     #[test]
+    fn table_level_writer_refusals_release_bit_storage() {
+        let mut isolated_zeroes = [1u8; LEVEL_TABLE_SIZE];
+        for index in (1..LEVEL_TABLE_SIZE).step_by(2) {
+            isolated_zeroes[index] = 0;
+        }
+        for lengths in [
+            [0u8; LEVEL_TABLE_SIZE],
+            isolated_zeroes,
+            [15u8; LEVEL_TABLE_SIZE],
+        ] {
+            for prefix_bits in 0..=16 {
+                let mut expected = BitWriter::new();
+                expected.write_bits(0, prefix_bits);
+                try_write_level_lengths(&mut expected, &lengths).unwrap();
+                let expected = expected.finish();
+
+                let baseline = RefusingBudget::new(usize::MAX);
+                let mut writer = BitWriter::with_allowance(&baseline);
+                writer.try_write_bits(0, prefix_bits).unwrap();
+                try_write_level_lengths(&mut writer, &lengths).unwrap();
+                assert_eq!(&*writer.bytes, expected);
+                drop(writer);
+                assert_eq!(baseline.used(), 0);
+
+                assert_each_allocation_refusal(|budget| {
+                    let mut writer = BitWriter::with_allowance(budget);
+                    writer.try_write_bits(0, prefix_bits)?;
+                    try_write_level_lengths(&mut writer, &lengths)?;
+                    Ok(writer.bytes)
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn table_run_refusals_release_token_storage() {
+        for count in [3, 10, 11, 138, 139, 1000] {
+            assert_each_allocation_refusal(|budget| {
+                let mut tokens = Buffer::new(budget);
+                emit_repeat_level_run(&mut tokens, count)?;
+                Ok(tokens)
+            });
+        }
+        for count in [1, 3, 10, 11, 139, 1000] {
+            assert_each_allocation_refusal(|budget| {
+                let mut tokens = Buffer::new(budget);
+                emit_zero_level_run(&mut tokens, count)?;
+                Ok(tokens)
+            });
+        }
+    }
+
+    #[test]
     fn filter_preparation_rejects_legacy_only_kinds() {
         let data = b"plain bytes";
         let filters = [crate::FilterSpec::whole(crate::FilterKind::Itanium)];
