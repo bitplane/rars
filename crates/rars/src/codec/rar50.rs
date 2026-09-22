@@ -7562,6 +7562,59 @@ mod tests {
     }
 
     #[test]
+    fn decoders_propagate_malformed_table_errors() {
+        let mut incomplete = BitWriter::new();
+        for _ in 0..LEVEL_TABLE_SIZE {
+            incomplete.write_bits(5, 4);
+        }
+        let incomplete = incomplete.finish();
+
+        let mut invalid = TableLengths {
+            main: vec![0; MAIN_TABLE_SIZE],
+            distance: vec![0; DISTANCE_TABLE_SIZE_50],
+            align: vec![0; ALIGN_TABLE_SIZE],
+            length: vec![0; LENGTH_TABLE_SIZE],
+        };
+        invalid.main[..3].fill(1); // Three one-bit codes overfill the tree.
+        let (invalid, invalid_bits) = encode_table_lengths_with_bit_count(&invalid, 0).unwrap();
+
+        for (payload, payload_bits, expected) in [
+            (
+                incomplete.as_slice(),
+                incomplete.len() * 8,
+                Error::NeedMoreInput,
+            ),
+            (
+                invalid.as_slice(),
+                invalid_bits,
+                Error::InvalidData("RAR 5 oversubscribed Huffman table"),
+            ),
+        ] {
+            let input = encode_compressed_block(payload, payload_bits, true, true).unwrap();
+            assert_eq!(
+                Unpack50Decoder::new().decode_member_with_dictionary(
+                    &input,
+                    0,
+                    1,
+                    DEFAULT_DICTIONARY_SIZE,
+                    false,
+                    DecodeMode::LiteralOnly,
+                ),
+                Err(expected.clone())
+            );
+            let result = Unpack50Decoder::new().decode_member_from_reader_with_dictionary_to_sink(
+                &mut input.as_slice(),
+                0,
+                1,
+                DEFAULT_DICTIONARY_SIZE,
+                false,
+                |_chunk| Ok::<(), std::convert::Infallible>(()),
+            );
+            assert!(matches!(result, Err(StreamDecodeError::Decode(error)) if error == expected));
+        }
+    }
+
+    #[test]
     fn decodes_length_slots() {
         assert_eq!(slot_to_length(0, 0).unwrap(), 2);
         assert_eq!(slot_to_length(7, 0).unwrap(), 9);
