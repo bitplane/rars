@@ -121,6 +121,24 @@ impl<T, B: Budget> Buffer<T, B> {
         out.values = vec![value; len];
         Ok(out)
     }
+    /// Admit one exact allocation before copying slices that form a buffer.
+    /// The total is checked first, so none of the copies can grow past its
+    /// charged capacity.
+    pub(crate) fn from_slices(slices: &[&[T]], allowance: &B) -> Result<Self>
+    where
+        T: Copy,
+    {
+        let len = slices.iter().try_fold(0usize, |total, slice| {
+            total
+                .checked_add(slice.len())
+                .ok_or(Error::InvalidData("codec capacity overflows"))
+        })?;
+        let mut out = Self::with_capacity(len, allowance)?;
+        for slice in slices {
+            out.values.extend_from_slice(slice);
+        }
+        Ok(out)
+    }
     pub(crate) fn allowance(&self) -> B {
         B::allowance(&self.charge)
     }

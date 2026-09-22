@@ -512,23 +512,17 @@ fn encode_table_slices<B: Budget>(
         return Err(Error::InvalidData("RAR 5 table length count mismatch"));
     }
 
-    // The version and all four slice lengths were checked above. Fill the
-    // exact-sized table once, so copying its fields cannot request growth.
-    let mut flattened = Buffer::filled(
-        MAIN_TABLE_SIZE + distance_size + ALIGN_TABLE_SIZE + LENGTH_TABLE_SIZE,
-        0,
+    // The version and all four slice lengths were checked above. They form
+    // one exact-sized table, so assembly cannot request further growth.
+    let flattened = Buffer::from_slices(
+        &[
+            lengths.main,
+            lengths.distance,
+            lengths.align,
+            lengths.length,
+        ],
         allowance,
     )?;
-    let mut at = 0;
-    for field in [
-        lengths.main,
-        lengths.distance,
-        lengths.align,
-        lengths.length,
-    ] {
-        flattened[at..at + field.len()].copy_from_slice(field);
-        at += field.len();
-    }
     for &length in flattened.iter() {
         if length > 15 {
             return Err(Error::InvalidData("RAR 5 Huffman length is too large"));
@@ -620,14 +614,11 @@ fn encode_compressed_block_with_allowance<B: Budget>(
     let checksum = size_bytes[..size_len]
         .iter()
         .fold(0x5a ^ flags, |acc, &byte| acc ^ byte);
-    // The header and bounded payload have an exact final size. Admit that
-    // allocation once, then write into it without fallible growth calls.
-    let mut out = Buffer::filled(2 + size_len + payload.len(), 0u8, allowance)?;
-    out[0] = flags;
-    out[1] = checksum;
-    out[2..2 + size_len].copy_from_slice(&size_bytes[..size_len]);
-    out[2 + size_len..].copy_from_slice(payload);
-    Ok(out)
+    // The header and bounded payload have an exact final size.
+    Buffer::from_slices(
+        &[&[flags, checksum], &size_bytes[..size_len], payload],
+        allowance,
+    )
 }
 
 pub fn decode_literal_only(
@@ -1173,14 +1164,7 @@ fn filtered_lz_blocks<B: Budget>(
     let filters = normalized_filter_specs(data.len(), filters, allowance)?;
     let history = &history[history.len().saturating_sub(options.max_match_distance)..];
     let start = history.len();
-    let mut combined = Buffer::with_capacity(
-        start
-            .checked_add(data.len())
-            .ok_or(Error::InvalidData("RAR 5 input window size overflows"))?,
-        allowance,
-    )?;
-    combined.extend_from_slice(history).map_err(Into::into)?;
-    combined.extend_from_slice(data).map_err(Into::into)?;
+    let mut combined = Buffer::from_slices(&[history, data], allowance)?;
 
     let mut blocks = Buffer::new(allowance);
     let mut chunk_start = 0usize;
@@ -1728,13 +1712,7 @@ fn member_window_with_allowance<'a, B: Budget>(
     if history.is_empty() {
         return Ok((MemberWindow::Borrowed(data), 0));
     }
-    let size = history
-        .len()
-        .checked_add(data.len())
-        .ok_or(Error::InvalidData("RAR 5 input window size overflows"))?;
-    let mut combined = Buffer::with_capacity(size, allowance)?;
-    combined.extend_from_slice(history).map_err(Into::into)?;
-    combined.extend_from_slice(data).map_err(Into::into)?;
+    let combined = Buffer::from_slices(&[history, data], allowance)?;
     Ok((MemberWindow::Owned(combined), history.len()))
 }
 
