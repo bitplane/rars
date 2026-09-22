@@ -4575,7 +4575,7 @@ mod tests {
     impl RefusingBudget {
         fn new(fail_at: usize) -> Self {
             Self {
-                inner: Allowance::limited(1024 * 1024),
+                inner: Allowance::limited(64 * 1024 * 1024),
                 attempts: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 fail_at,
             }
@@ -4641,6 +4641,26 @@ mod tests {
             }
             <crate::codec::workspace::Limited as Budget>::resize(&mut charge.inner, bytes)
         }
+    }
+
+    fn assert_each_allocation_refusal<T>(
+        mut work: impl FnMut(&RefusingBudget) -> crate::codec::Result<T>,
+    ) -> usize {
+        let baseline = RefusingBudget::new(usize::MAX);
+        drop(work(&baseline).unwrap());
+        let attempts = baseline.attempts();
+        assert!(attempts > 0);
+        assert_eq!(baseline.used(), 0);
+
+        for fail_at in 0..attempts {
+            let budget = RefusingBudget::new(fail_at);
+            assert!(
+                matches!(work(&budget), Err(Error::Cancelled)),
+                "failure at allocation {fail_at}"
+            );
+            assert_eq!(budget.used(), 0, "failure at allocation {fail_at}");
+        }
+        attempts
     }
 
     #[test]
@@ -5230,6 +5250,86 @@ mod tests {
                 );
                 assert_eq!(budget.used(), 0);
             }
+        }
+    }
+
+    #[test]
+    fn member_allocation_refusals_release_search_and_output_owners() {
+        let data = b"ABCDABCDABCDABCD".repeat(16);
+        let filters = [EncodeFilter {
+            offset: 0,
+            length: data.len(),
+            filter_type: FilterType::E8,
+            channels: 0,
+        }];
+
+        for optimal in [false, true] {
+            let options = EncodeOptions::new(16)
+                .with_max_match_distance(256)
+                .with_optimal_parse(optimal);
+            let expected =
+                encode_member_with_allowance(&data, &[], 0, options, None, &Allowance::default())
+                    .unwrap();
+            assert_eq!(decode_lz(&expected, 0, data.len()).unwrap(), data);
+            let attempts = assert_each_allocation_refusal(|budget| {
+                encode_member_with_allowance(&data, &[], 0, options, None, budget)
+            });
+            assert!(attempts > 1);
+
+            let expected = encode_filtered_member_with_allowance(
+                &data,
+                &[],
+                0,
+                &filters,
+                options,
+                None,
+                &Allowance::default(),
+            )
+            .unwrap();
+            assert_eq!(decode_lz(&expected, 0, data.len()).unwrap(), data);
+            let attempts = assert_each_allocation_refusal(|budget| {
+                encode_filtered_member_with_allowance(
+                    &data,
+                    &[],
+                    0,
+                    &filters,
+                    options,
+                    None,
+                    budget,
+                )
+            });
+            assert!(attempts > 1);
+
+            let blocks = [(data.len() / 2, false), (data.len(), true)];
+            let expected = streaming_blocks_with_allowance(
+                &data,
+                &[],
+                &blocks,
+                0,
+                options,
+                None,
+                &Allowance::default(),
+            )
+            .unwrap();
+            let packed: Vec<_> = expected
+                .iter()
+                .flat_map(|block| block.iter().copied())
+                .collect();
+            assert_eq!(decode_lz(&packed, 0, data.len()).unwrap(), data);
+            let attempts = assert_each_allocation_refusal(|budget| {
+                streaming_blocks_with_allowance(&data, &[], &blocks, 0, options, None, budget)
+            });
+            assert!(attempts > 1);
+
+            let specs = [crate::FilterSpec::whole(crate::FilterKind::E8)];
+            let expected =
+                filtered_lz_blocks(&data, &specs, &[], 0, options, None, &Allowance::default())
+                    .unwrap();
+            assert_eq!(decode_lz(&expected, 0, data.len()).unwrap(), data);
+            let attempts = assert_each_allocation_refusal(|budget| {
+                filtered_lz_blocks(&data, &specs, &[], 0, options, None, budget)
+            });
+            assert!(attempts > 1);
         }
     }
 
