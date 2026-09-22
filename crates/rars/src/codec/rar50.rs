@@ -5427,6 +5427,21 @@ mod tests {
     }
 
     #[test]
+    fn filter_preparation_rejects_legacy_only_kinds() {
+        let data = b"plain bytes";
+        let filters = [crate::FilterSpec::whole(crate::FilterKind::Itanium)];
+        let expected = Error::InvalidData("RAR 5 has no builtin type for this filter");
+        assert_eq!(
+            normalized_filter_specs(data.len(), &filters, &Allowance::default()),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            filtered_member_with_allowance(data, &filters, &Allowance::default()),
+            Err(expected)
+        );
+    }
+
+    #[test]
     fn parser_allowance_preserves_tokens_and_retains_the_returned_owner() {
         let data: Vec<_> = (0..8192u32)
             .map(|n| (n.wrapping_mul(71) ^ (n >> 4)) as u8)
@@ -9108,6 +9123,38 @@ mod tests {
             result,
             Err(StreamDecodeError::Decode(Error::Cancelled))
         ));
+    }
+
+    #[test]
+    fn buffered_decoder_wrappers_observe_existing_cancellation() {
+        let token = crate::ReadCancellation::new();
+        token.cancel();
+        let control = crate::read_control::ReadControl::new(Some(&token));
+        let mut decoder = Unpack50Decoder::new();
+        decoder.read_control = control.clone();
+        assert_eq!(
+            decoder.decode_member(&[], 0, 1, false, DecodeMode::Lz),
+            Err(Error::Cancelled)
+        );
+
+        decoder.read_control = control.clone();
+        assert_eq!(
+            decoder.decode_member_with_dictionary(
+                &[],
+                0,
+                1,
+                DEFAULT_DICTIONARY_SIZE,
+                false,
+                DecodeMode::Lz,
+            ),
+            Err(Error::Cancelled)
+        );
+
+        decoder.read_control = control;
+        assert_eq!(
+            decoder.decode_member_from_reader(&mut &[][..], 0, 1, false, DecodeMode::Lz),
+            Err(Error::Cancelled)
+        );
     }
 
     #[test]
