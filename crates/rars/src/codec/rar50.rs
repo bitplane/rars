@@ -5370,6 +5370,49 @@ mod tests {
     }
 
     #[test]
+    fn member_history_and_large_output_refusals_release_storage() {
+        let data: Vec<u8> = (0..2048)
+            .map(|index| ((index * 71) ^ (index >> 3)) as u8)
+            .collect();
+        let history = vec![0xee; 256];
+        let blocks = [(data.len() / 2, false), (data.len(), true)];
+        let filters = [EncodeFilter {
+            offset: 0,
+            length: data.len(),
+            filter_type: FilterType::E8,
+            channels: 0,
+        }];
+
+        for optimal in [false, true] {
+            let options = EncodeOptions::new(16)
+                .with_max_match_distance(history.len())
+                .with_optimal_parse(optimal);
+            assert_each_allocation_refusal(|budget| {
+                streaming_blocks_with_allowance(&data, &history, &blocks, 0, options, None, budget)
+            });
+            assert_each_allocation_refusal(|budget| {
+                encode_filtered_member_with_allowance(
+                    &data, &history, 0, &filters, options, None, budget,
+                )
+            });
+            assert_each_allocation_refusal(|budget| {
+                let mut state = EncoderState::new(options, budget);
+                state.encode(&data, 0, None, None)
+            });
+        }
+
+        let large = vec![b'A'; LZ_BLOCK_SIZE + 1];
+        let options = EncodeOptions::new(16).with_max_match_distance(256);
+        let expected =
+            encode_member_with_allowance(&large, &[], 0, options, None, &Allowance::default())
+                .unwrap();
+        assert_eq!(decode_lz(&expected, 0, large.len()).unwrap(), large);
+        assert_each_allocation_refusal(|budget| {
+            encode_member_with_allowance(&large, &[], 0, options, None, budget)
+        });
+    }
+
+    #[test]
     fn token_block_allocation_refusals_cover_each_control_form() {
         let filter = EncodeToken::Filter(EncodeFilter {
             offset: 0,
