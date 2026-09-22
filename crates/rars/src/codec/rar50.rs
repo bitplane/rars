@@ -5878,6 +5878,60 @@ mod tests {
     }
 
     #[test]
+    fn truncated_level_escape_needs_its_count_nibble() {
+        // The low nibble is an escape; its following count nibble is absent.
+        assert_eq!(read_level_lengths(&[0x0f]), Err(Error::NeedMoreInput));
+    }
+
+    #[test]
+    fn decoders_reject_oversubscribed_secondary_huffman_tables() {
+        for invalid_table in ["distance", "align", "length"] {
+            let mut lengths = TableLengths {
+                main: vec![0; MAIN_TABLE_SIZE],
+                distance: vec![0; DISTANCE_TABLE_SIZE_50],
+                align: vec![0; ALIGN_TABLE_SIZE],
+                length: vec![0; LENGTH_TABLE_SIZE],
+            };
+            lengths.main[b'A' as usize] = 1;
+            let invalid_lengths = match invalid_table {
+                "distance" => &mut lengths.distance,
+                "align" => &mut lengths.align,
+                "length" => &mut lengths.length,
+                _ => unreachable!(),
+            };
+            invalid_lengths[..3].fill(1);
+            let (payload, payload_bits) = encode_table_lengths_with_bit_count(&lengths, 0).unwrap();
+            let input = encode_compressed_block(&payload, payload_bits, true, true).unwrap();
+            let expected = Error::InvalidData("RAR 5 oversubscribed Huffman table");
+
+            assert_eq!(
+                Unpack50Decoder::new().decode_member_with_dictionary(
+                    &input,
+                    0,
+                    1,
+                    DEFAULT_DICTIONARY_SIZE,
+                    false,
+                    DecodeMode::Lz,
+                ),
+                Err(expected.clone()),
+                "{invalid_table}"
+            );
+            let result = Unpack50Decoder::new().decode_member_from_reader_with_dictionary_to_sink(
+                &mut input.as_slice(),
+                0,
+                1,
+                DEFAULT_DICTIONARY_SIZE,
+                false,
+                |_chunk| Ok::<(), std::convert::Infallible>(()),
+            );
+            assert!(
+                matches!(result, Err(StreamDecodeError::Decode(error)) if error == expected),
+                "{invalid_table}"
+            );
+        }
+    }
+
+    #[test]
     fn reads_rar70_table_length_count() {
         assert_eq!(
             table_length_count(1).unwrap(),
