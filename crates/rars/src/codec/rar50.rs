@@ -7711,6 +7711,47 @@ mod tests {
     }
 
     #[test]
+    fn decoders_reject_rar7_distance_slot_above_bit_limit() {
+        let mut lengths = TableLengths {
+            main: vec![0; MAIN_TABLE_SIZE],
+            distance: vec![0; DISTANCE_TABLE_SIZE_70],
+            align: vec![0; ALIGN_TABLE_SIZE],
+            length: vec![0; LENGTH_TABLE_SIZE],
+        };
+        lengths.main[262] = 1; // New match with length slot 0.
+        lengths.distance[66] = 1; // (66 - 2) / 2 = 32 extra bits.
+        let (tables, table_bits) = encode_table_lengths_with_bit_count(&lengths, 1).unwrap();
+        let mut input = encode_compressed_block(&tables, table_bits, true, false).unwrap();
+        input.extend(encode_compressed_block(&[0], 2, false, true).unwrap());
+        let expected = Error::InvalidData("RAR 5 distance slot is too large");
+
+        let mut buffered = Unpack50Decoder::new();
+        assert_eq!(
+            buffered.decode_member_with_dictionary(
+                &input,
+                1,
+                2,
+                DEFAULT_DICTIONARY_SIZE,
+                false,
+                DecodeMode::Lz,
+            ),
+            Err(expected.clone())
+        );
+        assert!(buffered.tables.is_none());
+        let mut streaming = Unpack50Decoder::new();
+        let result = streaming.decode_member_from_reader_with_dictionary_to_sink(
+            &mut input.as_slice(),
+            1,
+            2,
+            DEFAULT_DICTIONARY_SIZE,
+            false,
+            |_chunk| Ok::<(), std::convert::Infallible>(()),
+        );
+        assert!(matches!(result, Err(StreamDecodeError::Decode(error)) if error == expected));
+        assert!(streaming.tables.is_none());
+    }
+
+    #[test]
     fn decodes_length_slots() {
         assert_eq!(slot_to_length(0, 0).unwrap(), 2);
         assert_eq!(slot_to_length(7, 0).unwrap(), 9);
