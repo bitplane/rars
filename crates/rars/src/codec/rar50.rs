@@ -1866,7 +1866,7 @@ fn encode_token_block_with_allowance<B: Budget>(
                 writer.write_admitted_bits(usize::from(code), usize::from(len));
             }
             EncodeToken::Match { length, distance } => {
-                match state.encode_match(length, distance, distance_size)? {
+                match state.encode_valid_match(length, distance, distance_size) {
                     EncodedMatch::LastLengthRepeat => {
                         let (code, len) = main_table.code_for_present_symbol(257);
                         writer.write_admitted_bits(usize::from(code), usize::from(len));
@@ -2125,6 +2125,44 @@ impl EncoderMatchState {
             distance_extra,
             distance_bit_count,
         })
+    }
+
+    /// Encode a match after [`table_lengths_with_allowance`] has validated the
+    /// same immutable token sequence from the same initial state.
+    fn encode_valid_match(
+        &self,
+        length: usize,
+        distance: usize,
+        distance_size: usize,
+    ) -> EncodedMatch {
+        if distance == self.reps[0] && length == self.last_length {
+            return EncodedMatch::LastLengthRepeat;
+        }
+        if let Some(index) = self
+            .reps
+            .iter()
+            .position(|&repeat_distance| repeat_distance == distance && repeat_distance != 0)
+        {
+            let (length_slot, length_extra) = length_slot_for_valid_match(length);
+            return EncodedMatch::RepeatDistance {
+                index,
+                length_slot,
+                length_extra,
+            };
+        }
+
+        let (distance_slot, distance_extra) = distance_slot_for_valid_match(distance);
+        debug_assert!(distance_slot < distance_size);
+        let bonus = length_bonus(distance);
+        debug_assert!(length >= bonus + 2);
+        let (length_slot, length_extra) = length_slot_for_valid_match(length - bonus);
+        EncodedMatch::New {
+            length_slot,
+            length_extra,
+            distance_slot,
+            distance_extra,
+            distance_bit_count: distance_slot_bit_count_valid(distance_slot),
+        }
     }
 
     fn remember(&mut self, length: usize, distance: usize) {
@@ -2981,29 +3019,51 @@ fn length_slot_for_match(length: usize) -> Result<(usize, usize)> {
     if length < 2 {
         return Err(Error::InvalidData("RAR 5 match length is too short"));
     }
+    Ok(length_slot_for_valid_match(length))
+}
+
+fn length_slot_for_valid_match(length: usize) -> (usize, usize) {
+    debug_assert!(length >= 2);
     let value = length - 2;
     if value < 8 {
-        return Ok((value, 0));
+        return (value, 0);
     }
     let bit_count = value.ilog2() as usize - 2;
     let slot = ((bit_count + 1) << 2) | ((value >> bit_count) & 3);
     // The encoder caps matches at 4096 bytes, which fits slots 0..44.
-    Ok((slot, value & ((1 << bit_count) - 1)))
+    (slot, value & ((1 << bit_count) - 1))
 }
 
 fn distance_slot_for_match(distance: usize, distance_size: usize) -> Result<(usize, usize)> {
     // Every emitted match comes from an earlier input position, and the two
     // production distance tables both have at least four entries.
+    if distance == 0 {
+        return Err(Error::InvalidData("RAR 5 match distance is zero"));
+    }
+    let result = distance_slot_for_valid_match(distance);
+    if result.0 >= distance_size {
+        return Err(Error::InvalidData("RAR 5 match distance is too large"));
+    }
+    Ok(result)
+}
+
+fn distance_slot_for_valid_match(distance: usize) -> (usize, usize) {
+    debug_assert!(distance != 0);
     let value = distance - 1;
     if value < 4 {
-        return Ok((value, 0));
+        return (value, 0);
     }
     let bit_count = value.ilog2() as usize - 1;
     let slot = (bit_count << 1) + 2 + ((value >> bit_count) & 1);
-    if slot >= distance_size {
-        return Err(Error::InvalidData("RAR 5 match distance is too large"));
+    (slot, value & ((1 << bit_count) - 1))
+}
+
+fn distance_slot_bit_count_valid(slot: usize) -> usize {
+    if slot < 4 {
+        0
+    } else {
+        (slot - 2) >> 1
     }
-    Ok((slot, value & ((1 << bit_count) - 1)))
 }
 
 fn literal_presence(data: &[u8]) -> [bool; 256] {
@@ -8570,6 +8630,17 @@ mod tests {
         );
 
         let fresh = EncoderMatchState::default();
+        let zero_distance = Error::InvalidData("RAR 5 match distance is zero");
+        assert_eq!(
+            fresh
+                .encode_match(4, 0, DISTANCE_TABLE_SIZE_50)
+                .unwrap_err(),
+            zero_distance
+        );
+        assert_eq!(
+            estimated_match_cost(&fresh, 4, 0, DISTANCE_TABLE_SIZE_50).unwrap_err(),
+            zero_distance
+        );
         let underflow = Error::InvalidData("RAR 5 adjusted match length underflows");
         assert_eq!(
             fresh
