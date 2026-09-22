@@ -743,7 +743,6 @@ pub fn encode_lz_member_with_history(
         data,
         history,
         algorithm_version,
-        &[],
         EncodeOptions::default(),
         None,
     )
@@ -764,7 +763,7 @@ pub(crate) fn encode_lz_member_with_options_and_progress(
     options: EncodeOptions,
     progress: &mut dyn FnMut(usize) -> bool,
 ) -> Result<Vec<u8>> {
-    encode_lz_member_inner(data, &[], algorithm_version, &[], options, Some(progress))
+    encode_lz_member_inner(data, &[], algorithm_version, options, Some(progress))
 }
 
 #[cfg(test)]
@@ -1021,7 +1020,7 @@ pub fn encode_lz_member_with_history_and_options(
     algorithm_version: u8,
     options: EncodeOptions,
 ) -> Result<Vec<u8>> {
-    encode_lz_member_inner(data, history, algorithm_version, &[], options, None)
+    encode_lz_member_inner(data, history, algorithm_version, options, None)
 }
 
 /// The filters RAR 5 has a builtin type for.
@@ -1272,7 +1271,6 @@ fn encode_lz_member_inner(
     data: &[u8],
     history: &[u8],
     algorithm_version: u8,
-    initial_filters: &[EncodeFilter],
     options: EncodeOptions,
     progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<u8>> {
@@ -1280,7 +1278,6 @@ fn encode_lz_member_inner(
         data,
         history,
         algorithm_version,
-        initial_filters,
         options,
         progress,
         &Allowance::default(),
@@ -1297,7 +1294,7 @@ pub(crate) fn encode_owned_member<B: Budget>(
     allowance: &B,
 ) -> Result<Buffer<u8, B>> {
     match filters {
-        None => encode_member_with_allowance(data, &[], version, &[], options, progress, allowance),
+        None => encode_member_with_allowance(data, &[], version, options, progress, allowance),
         Some(filters) => {
             EncoderState::new(options, allowance).encode(data, version, Some(filters), progress)
         }
@@ -1315,14 +1312,13 @@ fn encode_member_with_allowance<B: Budget>(
     data: &[u8],
     history: &[u8],
     algorithm_version: u8,
-    initial_filters: &[EncodeFilter],
     options: EncodeOptions,
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
     allowance: &B,
 ) -> Result<Buffer<u8, B>> {
     let (window, start) = member_window_with_allowance(data, history, options, allowance)?;
     let combined = &*window;
-    if data.len() > LZ_BLOCK_SIZE && initial_filters.is_empty() {
+    if data.len() > LZ_BLOCK_SIZE {
         // One search state for the whole member. It used to be built per
         // block, which meant rehashing a window of history every 64 KiB: on a
         // 16 MiB member that was half the encode. The optimal parse used to be
@@ -1385,7 +1381,32 @@ fn encode_member_with_allowance<B: Budget>(
         start..combined.len(),
         MemberSearch::Fresh,
         algorithm_version,
-        initial_filters,
+        &[],
+        options,
+        true,
+        progress,
+        allowance,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_filtered_member_with_allowance<B: Budget>(
+    data: &[u8],
+    history: &[u8],
+    algorithm_version: u8,
+    filters: &[EncodeFilter],
+    options: EncodeOptions,
+    progress: Option<&mut dyn FnMut(usize) -> bool>,
+    allowance: &B,
+) -> Result<Buffer<u8, B>> {
+    let (window, start) = member_window_with_allowance(data, history, options, allowance)?;
+    let end = window.len();
+    encode_lz_block_with_allowance(
+        &window,
+        start..end,
+        MemberSearch::Fresh,
+        algorithm_version,
+        filters,
         options,
         true,
         progress,
@@ -1964,7 +1985,6 @@ impl<B: Budget> EncoderState<B> {
                 input,
                 &self.history,
                 version,
-                &[],
                 self.options,
                 progress,
                 &allowance,
@@ -1981,7 +2001,7 @@ impl<B: Budget> EncoderState<B> {
             Some(filters) => {
                 let (filtered, records) =
                     filtered_member_with_allowance(input, filters, &allowance)?;
-                encode_member_with_allowance(
+                encode_filtered_member_with_allowance(
                     &filtered,
                     &self.history,
                     version,
@@ -4883,17 +4903,10 @@ mod tests {
                     .with_max_match_distance(65536);
                 for history in [&[][..], &history[..]] {
                     let expected =
-                        encode_lz_member_inner(&data, history, version, &[], options, None)
-                            .unwrap();
+                        encode_lz_member_inner(&data, history, version, options, None).unwrap();
                     let allowance = Allowance::limited(32 * 1024 * 1024);
                     let output = encode_member_with_allowance(
-                        &data,
-                        history,
-                        version,
-                        &[],
-                        options,
-                        None,
-                        &allowance,
+                        &data, history, version, options, None, &allowance,
                     )
                     .unwrap();
                     assert_eq!(&*output, expected);
@@ -4903,7 +4916,6 @@ mod tests {
                         b"another member",
                         &[],
                         version,
-                        &[],
                         options,
                         None,
                         &allowance,
@@ -4928,7 +4940,7 @@ mod tests {
 
             let unfiltered = Allowance::limited(0);
             assert!(matches!(
-                encode_member_with_allowance(&data, &[], 0, &[], options, None, &unfiltered,),
+                encode_member_with_allowance(&data, &[], 0, options, None, &unfiltered,),
                 Err(Error::WorkspaceLimitExceeded(_))
             ));
             assert_eq!(unfiltered.used(), 0);
@@ -4953,7 +4965,7 @@ mod tests {
         for limit in [1_080_000, 1_105_000] {
             let allowance = Allowance::limited(limit);
             assert!(matches!(
-                encode_member_with_allowance(&data, &[], 0, &[], options, None, &allowance),
+                encode_member_with_allowance(&data, &[], 0, options, None, &allowance),
                 Err(Error::WorkspaceLimitExceeded(_))
             ));
             assert_eq!(allowance.used(), 0);
@@ -4968,7 +4980,7 @@ mod tests {
         for limit in [0, 4096, 65536, 512 * 1024] {
             let allowance = Allowance::limited(limit);
             assert!(matches!(
-                encode_member_with_allowance(&data, &history, 0, &[], options, None, &allowance),
+                encode_member_with_allowance(&data, &history, 0, options, None, &allowance),
                 Err(Error::WorkspaceLimitExceeded(_))
             ));
             assert_eq!(allowance.used(), 0);
@@ -4979,7 +4991,6 @@ mod tests {
                 &data,
                 &history,
                 0,
-                &[],
                 options,
                 Some(&mut |_| false),
                 &allowance
@@ -4992,7 +5003,6 @@ mod tests {
                 &data,
                 &history,
                 0,
-                &[],
                 options,
                 Some(&mut |_| panic!("progress callback panic")),
                 &allowance,
