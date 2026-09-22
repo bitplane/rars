@@ -5355,6 +5355,19 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn optimal_streaming_blocks_allow_zero_match_distance() {
+        let data: Vec<u8> = (0..512).map(|i| (i * 71) as u8).collect();
+        let options = EncodeOptions::new(16)
+            .with_optimal_parse(true)
+            .with_max_match_distance(0);
+        let blocks =
+            encode_lz_streaming_blocks(&data, &[], &[(256, false), (512, true)], 0, options, None)
+                .unwrap();
+        let packed: Vec<u8> = blocks.into_iter().flatten().collect();
+        assert_eq!(decode_lz(&packed, 0, data.len()).unwrap(), data);
+    }
     use super::*;
 
     /// The flat code charged four bits for a symbol used once and four for one
