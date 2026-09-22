@@ -57,15 +57,20 @@ fn public_rar50_table_encoder_checks_each_table_shape() {
 }
 
 #[test]
-fn rar50_member_encoder_rejects_filter_ranges_outside_input_in_both_size_paths() {
+fn rar50_member_encoder_rejects_invalid_filter_ranges_in_both_size_paths() {
     for data in [vec![b'A'; 16], vec![b'A'; 0x40000 + 1]] {
-        let invalid = rars::FilterSpec::range(rars::FilterKind::E8, data.len()..data.len() + 1);
-        assert_eq!(
-            rars::codec::rar50::Unpack50Encoder::new().encode_member_with_filter(&data, 0, invalid),
-            Err(rars::codec::Error::InvalidData(
-                "RAR 5 filter range is invalid"
-            ))
-        );
+        for range in [0..0, data.len()..data.len() - 1, data.len()..data.len() + 1] {
+            let invalid = rars::FilterSpec::range(rars::FilterKind::E8, range.clone());
+            assert_eq!(
+                rars::codec::rar50::Unpack50Encoder::new()
+                    .encode_member_with_filter(&data, 0, invalid),
+                Err(rars::codec::Error::InvalidData(
+                    "RAR 5 filter range is invalid"
+                )),
+                "input length {}, range {range:?}",
+                data.len()
+            );
+        }
     }
 }
 
