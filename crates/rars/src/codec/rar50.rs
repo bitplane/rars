@@ -5389,6 +5389,44 @@ mod tests {
     }
 
     #[test]
+    fn filter_writer_allocation_refusals_cover_filter_type_bits() {
+        for filter_type in [
+            FilterType::Delta,
+            FilterType::E8,
+            FilterType::E8E9,
+            FilterType::Arm,
+        ] {
+            let filter = EncodeFilter {
+                offset: 0,
+                length: 1,
+                filter_type,
+                channels: 1,
+            };
+            for prefix_bits in [9, 12] {
+                let mut expected = BitWriter::new();
+                expected.write_bits(0, prefix_bits);
+                try_write_filter(&mut expected, filter).unwrap();
+                let expected = expected.finish();
+
+                let baseline = RefusingBudget::new(usize::MAX);
+                let mut writer = BitWriter::with_allowance(&baseline);
+                writer.try_write_bits(0, prefix_bits).unwrap();
+                try_write_filter(&mut writer, filter).unwrap();
+                assert_eq!(&*writer.bytes, expected);
+                drop(writer);
+                assert_eq!(baseline.used(), 0);
+
+                assert_each_allocation_refusal(|budget| {
+                    let mut writer = BitWriter::with_allowance(budget);
+                    writer.try_write_bits(0, prefix_bits)?;
+                    try_write_filter(&mut writer, filter)?;
+                    Ok(writer.bytes)
+                });
+            }
+        }
+    }
+
+    #[test]
     fn parser_allowance_preserves_tokens_and_retains_the_returned_owner() {
         let data: Vec<_> = (0..8192u32)
             .map(|n| (n.wrapping_mul(71) ^ (n >> 4)) as u8)
