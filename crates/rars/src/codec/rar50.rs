@@ -7888,6 +7888,11 @@ mod tests {
         assert_eq!(streamed.header.payload_bits, 0);
         assert!(streamed.payload.is_empty());
 
+        assert!(matches!(
+            read_compressed_block(&mut empty[..2].as_ref()),
+            Err(Error::NeedMoreInput)
+        ));
+
         let mut bad_checksum = empty.clone();
         bad_checksum[1] ^= 1;
         assert!(matches!(
