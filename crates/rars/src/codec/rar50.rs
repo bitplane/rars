@@ -5244,6 +5244,50 @@ mod tests {
     }
 
     #[test]
+    fn filter_application_propagates_range_and_cancellation_errors() {
+        let original = [0xe8, 0, 0, 0, 0];
+        let control = crate::read_control::ReadControl::default();
+        for (start, length, message) in [
+            (usize::MAX, 2, "RAR 5 filter range overflows"),
+            (4, 2, "RAR 5 filter range exceeds output"),
+        ] {
+            let mut output = original;
+            let filter = PendingFilter {
+                start,
+                length,
+                filter_type: FilterType::E8,
+                channels: 0,
+            };
+            assert_eq!(
+                apply_filters_with_control(&mut output, &[filter], &control),
+                Err(Error::InvalidData(message))
+            );
+            assert_eq!(output, original);
+        }
+
+        for kind in [FilterType::E8, FilterType::E8E9, FilterType::Arm] {
+            for checks in [0, 1, 2] {
+                let token = crate::ReadCancellation::new();
+                let control = crate::read_control::ReadControl::new(Some(&token));
+                control.cancel_after_checks(checks);
+                let mut output = original;
+                let filter = PendingFilter {
+                    start: 0,
+                    length: output.len(),
+                    filter_type: kind,
+                    channels: 0,
+                };
+                assert_eq!(
+                    apply_filters_with_control(&mut output, &[filter], &control),
+                    Err(Error::Cancelled),
+                    "kind={kind:?}, checks={checks}"
+                );
+                assert_eq!(output, original);
+            }
+        }
+    }
+
+    #[test]
     fn repricing_keeps_the_smallest_actual_block_including_filters() {
         for filtered in [false, true] {
             let data = wordy_text(4096);
