@@ -4934,6 +4934,31 @@ mod tests {
     }
 
     #[test]
+    fn large_member_search_setup_failures_release_the_allowance() {
+        let data = vec![b'A'; LZ_BLOCK_SIZE + 1];
+        let filters = [crate::FilterSpec::whole(crate::FilterKind::E8)];
+        for optimal in [false, true] {
+            let options = EncodeOptions::new(0).with_optimal_parse(optimal);
+
+            let unfiltered = Allowance::limited(0);
+            assert!(matches!(
+                encode_member_with_allowance(&data, &[], 0, &[], options, None, &unfiltered,),
+                Err(Error::WorkspaceLimitExceeded(_))
+            ));
+            assert_eq!(unfiltered.used(), 0);
+
+            for limit in [128, data.len() as u64 + 4096] {
+                let filtered = Allowance::limited(limit);
+                assert!(matches!(
+                    filtered_lz_blocks(&data, &filters, &[], 0, options, None, &filtered),
+                    Err(Error::WorkspaceLimitExceeded(_))
+                ));
+                assert_eq!(filtered.used(), 0);
+            }
+        }
+    }
+
+    #[test]
     fn member_refusal_cancellation_and_unwind_release_the_whole_pipeline() {
         let data = b"member cancellation and refusal\n".repeat(100);
         let history = b"history".repeat(100);
