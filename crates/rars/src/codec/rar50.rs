@@ -6140,6 +6140,13 @@ mod tests {
         assert_eq!((best.unwrap().length, best.unwrap().distance), (6, 262_144));
         consider_match_candidate(&mut best, &state, distance_size, 6, 262_143);
         assert_eq!((best.unwrap().length, best.unwrap().distance), (6, 262_143));
+
+        let mut best = None;
+        let longer = std::hint::black_box((6, 262_144));
+        let shorter = std::hint::black_box((5, 1));
+        consider_match_candidate(&mut best, &state, distance_size, longer.0, longer.1);
+        consider_match_candidate(&mut best, &state, distance_size, shorter.0, shorter.1);
+        assert_eq!((best.unwrap().length, best.unwrap().distance), (6, 262_144));
     }
 
     #[test]
