@@ -96,6 +96,31 @@ fn large_rar50_member_routes_reject_unknown_version_without_committing_history()
     }
 }
 
+#[test]
+fn large_rar50_delta_filter_rejects_invalid_channels_without_committing_history() {
+    let data = vec![b'A'; 64 * 1024 + 1];
+    let retry = b"ABABABAB";
+    let expected_retry = rars::codec::rar50::Unpack50Encoder::new()
+        .encode_member(retry, 0)
+        .unwrap();
+
+    for channels in [0, 33] {
+        let mut encoder = rars::codec::rar50::Unpack50Encoder::new();
+        assert_eq!(
+            encoder.encode_member_with_filter(
+                &data,
+                0,
+                rars::FilterSpec::whole(FilterKind::Delta { channels }),
+            ),
+            Err(rars::codec::Error::InvalidData(
+                "RAR 5 DELTA filter channel count is invalid"
+            )),
+            "channels={channels}"
+        );
+        assert_eq!(encoder.encode_member(retry, 0).unwrap(), expected_retry);
+    }
+}
+
 fn service_names(archive: &Archive) -> Vec<String> {
     archive
         .services()
