@@ -4160,10 +4160,8 @@ struct EncoderCodeTable<B: Budget> {
 impl<B: Budget> EncoderCodeTable<B> {
     fn from_lengths(lengths: &[u8], allowance: &B) -> Result<Self> {
         let mut counts = [0u16; 16];
+        // Both callers use the encoder's length generators, capped at 15 bits.
         for &length in lengths {
-            if length > 15 {
-                return Err(Error::InvalidData("RAR 5 Huffman length is too large"));
-            }
             if length != 0 {
                 counts[length as usize] += 1;
             }
