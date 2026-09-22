@@ -9003,6 +9003,41 @@ mod tests {
     }
 
     #[test]
+    fn streaming_match_output_propagates_sink_failures() {
+        let mut repeated = StreamingOutput::new(Vec::new(), STREAM_FLUSH_THRESHOLD, 2, 2);
+        assert!(matches!(
+            repeated.push_repeated(b'A', STREAM_FLUSH_THRESHOLD, &mut |_chunk| Err("sink")),
+            Err(StreamDecodeError::Sink("sink"))
+        ));
+
+        let mut zero_flush = StreamingOutput::new(Vec::new(), 2, 2, 2);
+        zero_flush
+            .push(b'A', &mut |_chunk| Ok::<(), &str>(()))
+            .unwrap();
+        assert!(matches!(
+            zero_flush.push_zeroes(1, &mut |_chunk| Err("sink")),
+            Err(StreamDecodeError::Sink("sink"))
+        ));
+
+        let mut zero_chunk = StreamingOutput::new(Vec::new(), 1, 2, 2);
+        assert!(matches!(
+            zero_chunk.push_zeroes(1, &mut |_chunk| Err("sink")),
+            Err(StreamDecodeError::Sink("sink"))
+        ));
+
+        let mut copied = StreamingOutput::new(Vec::new(), STREAM_FLUSH_THRESHOLD, 2, 2);
+        copied
+            .push_repeated(b'A', STREAM_FLUSH_THRESHOLD - 1, &mut |_chunk| {
+                Ok::<(), &str>(())
+            })
+            .unwrap();
+        assert!(matches!(
+            copied.copy_match(2, 1, &mut |_chunk| Err("sink")),
+            Err(StreamDecodeError::Sink("sink"))
+        ));
+    }
+
+    #[test]
     fn decoder_reader_entry_points_observe_existing_cancellation() {
         let token = crate::ReadCancellation::new();
         token.cancel();
