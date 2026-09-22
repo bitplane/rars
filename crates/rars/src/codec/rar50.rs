@@ -7829,6 +7829,88 @@ mod tests {
     }
 
     #[test]
+    fn decoders_report_malformed_new_match_distance_fields() {
+        let mut invalid_align = BitWriter::new();
+        invalid_align.write_bits(0, 1); // New match, length slot 0.
+        invalid_align.write_bits(0, 1); // Distance slot 10.
+        invalid_align.write_bits(0x7fff, 15); // No alignment prefix names a symbol.
+        let cases = [
+            (
+                None,
+                false,
+                0,
+                vec![0],
+                1,
+                Error::InvalidData("RAR 5 empty Huffman table"),
+            ),
+            (
+                Some(12),
+                true,
+                6,
+                vec![0b0000_0010],
+                8,
+                Error::NeedMoreInput,
+            ),
+            (
+                Some(10),
+                true,
+                0,
+                invalid_align.finish(),
+                17,
+                Error::InvalidData("RAR 5 invalid Huffman code"),
+            ),
+        ];
+
+        for (distance_slot, align_mode, literal_count, packed, packed_bits, expected) in cases {
+            let mut lengths = TableLengths {
+                main: vec![0; MAIN_TABLE_SIZE],
+                distance: vec![0; DISTANCE_TABLE_SIZE_50],
+                align: vec![0; ALIGN_TABLE_SIZE],
+                length: vec![0; LENGTH_TABLE_SIZE],
+            };
+            lengths.main[262] = 1;
+            if literal_count != 0 {
+                lengths.main[b'A' as usize] = 1;
+            }
+            if let Some(slot) = distance_slot {
+                lengths.distance[slot] = 1;
+            }
+            if align_mode {
+                lengths.align[0] = 1;
+            }
+            let (tables, table_bits) = encode_table_lengths_with_bit_count(&lengths, 0).unwrap();
+            let mut input = encode_compressed_block(&tables, table_bits, true, false).unwrap();
+            input.extend(encode_compressed_block(&packed, packed_bits, false, true).unwrap());
+
+            let mut buffered = Unpack50Decoder::new();
+            assert_eq!(
+                buffered.decode_member_with_dictionary(
+                    &input,
+                    0,
+                    20,
+                    DEFAULT_DICTIONARY_SIZE,
+                    false,
+                    DecodeMode::Lz,
+                ),
+                Err(expected.clone()),
+                "distance slot {distance_slot:?}"
+            );
+            assert!(buffered.tables.is_none());
+            let mut streaming = Unpack50Decoder::new();
+            let result = streaming.decode_member_from_reader_with_dictionary_to_sink(
+                &mut input.as_slice(),
+                0,
+                20,
+                DEFAULT_DICTIONARY_SIZE,
+                false,
+                |_chunk| Ok::<(), std::convert::Infallible>(()),
+            );
+            assert!(matches!(result, Err(StreamDecodeError::Decode(error)) if error == expected));
+            assert!(streaming.tables.is_none());
+        }
+    }
+
+    #[test]
     fn decodes_length_slots() {
         assert_eq!(slot_to_length(0, 0).unwrap(), 2);
         assert_eq!(slot_to_length(7, 0).unwrap(), 9);
