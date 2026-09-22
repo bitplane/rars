@@ -2110,7 +2110,7 @@ impl EncoderMatchState {
         distance: usize,
         distance_size: usize,
     ) -> Result<EncodedMatch> {
-        if distance == self.reps[0] && length == self.last_length && self.last_length != 0 {
+        if distance == self.reps[0] && length == self.last_length {
             return Ok(EncodedMatch::LastLengthRepeat);
         }
         if let Some(index) = self
@@ -2956,7 +2956,7 @@ fn estimated_match_cost(
     distance: usize,
     distance_size: usize,
 ) -> Result<usize> {
-    if distance == state.reps[0] && length == state.last_length && state.last_length != 0 {
+    if distance == state.reps[0] && length == state.last_length {
         return Ok(2);
     }
     if state
