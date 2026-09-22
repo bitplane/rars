@@ -3169,7 +3169,9 @@ impl Unpack50Decoder {
                         }
                         let length_slot = tables.length.decode(&mut bits)?;
                         let length_extra = bits.read_bits(length_slot_extra_bits(length_slot))?;
-                        let length = slot_to_length(length_slot, length_extra)?;
+                        // The length table has 44 symbols and read_bits limits
+                        // the extra value to this slot's declared width.
+                        let length = length_from_slot_parts(length_slot, length_extra);
                         self.reps[..=rep_index].rotate_right(1);
                         self.reps[0] = distance;
                         self.last_length = length;
@@ -3184,7 +3186,9 @@ impl Unpack50Decoder {
                     262.. if mode.uses_lz() => {
                         let length_slot = symbol - 262;
                         let length_extra = bits.read_bits(length_slot_extra_bits(length_slot))?;
-                        let mut length = slot_to_length(length_slot, length_extra)?;
+                        // Main symbols end at slot 43 and read_bits limits the
+                        // extra value to this slot's declared width.
+                        let mut length = length_from_slot_parts(length_slot, length_extra);
                         let distance_slot = tables.distance.decode(&mut bits)?;
                         let distance_bit_count = distance_slot_bit_count(distance_slot)?;
                         let distance_extra = if distance_bit_count >= 4 && tables.align_mode {
@@ -3194,7 +3198,13 @@ impl Unpack50Decoder {
                         } else {
                             bits.read_bits(distance_bit_count as u8)?
                         };
-                        let distance = slot_to_distance(distance_slot, distance_extra)?;
+                        // distance_slot_bit_count rejected slots above 65 and
+                        // the extra value was read at exactly that width.
+                        let distance = distance_from_slot_parts(
+                            distance_slot,
+                            distance_bit_count,
+                            distance_extra,
+                        );
                         length += length_bonus(distance);
                         self.reps.rotate_right(1);
                         self.reps[0] = distance;
@@ -3355,7 +3365,9 @@ impl Unpack50Decoder {
                         }
                         let length_slot = tables.length.decode(&mut bits)?;
                         let length_extra = bits.read_bits(length_slot_extra_bits(length_slot))?;
-                        let length = slot_to_length(length_slot, length_extra)?;
+                        // The length table has 44 symbols and read_bits limits
+                        // the extra value to this slot's declared width.
+                        let length = length_from_slot_parts(length_slot, length_extra);
                         self.reps[..=rep_index].rotate_right(1);
                         self.reps[0] = distance;
                         self.last_length = length;
@@ -3364,7 +3376,9 @@ impl Unpack50Decoder {
                     262.. => {
                         let length_slot = symbol - 262;
                         let length_extra = bits.read_bits(length_slot_extra_bits(length_slot))?;
-                        let mut length = slot_to_length(length_slot, length_extra)?;
+                        // Main symbols end at slot 43 and read_bits limits the
+                        // extra value to this slot's declared width.
+                        let mut length = length_from_slot_parts(length_slot, length_extra);
                         let distance_slot = tables.distance.decode(&mut bits)?;
                         let distance_bit_count = distance_slot_bit_count(distance_slot)?;
                         let distance_extra = if distance_bit_count >= 4 && tables.align_mode {
@@ -3374,7 +3388,13 @@ impl Unpack50Decoder {
                         } else {
                             bits.read_bits(distance_bit_count as u8)?
                         };
-                        let distance = slot_to_distance(distance_slot, distance_extra)?;
+                        // distance_slot_bit_count rejected slots above 65 and
+                        // the extra value was read at exactly that width.
+                        let distance = distance_from_slot_parts(
+                            distance_slot,
+                            distance_bit_count,
+                            distance_extra,
+                        );
                         length += length_bonus(distance);
                         self.reps.rotate_right(1);
                         self.reps[0] = distance;
@@ -4022,7 +4042,18 @@ pub fn slot_to_length(slot: usize, extra_bits: u32) -> Result<usize> {
     if extra_bits > max_extra {
         return Err(Error::InvalidData("RAR 5 length extra bits exceed slot"));
     }
-    Ok((((4 | (slot & 3)) << bit_count) | extra_bits as usize) + 2)
+    Ok(length_from_slot_parts(slot, extra_bits))
+}
+
+fn length_from_slot_parts(slot: usize, extra_bits: u32) -> usize {
+    if slot < 8 {
+        slot + 2
+    } else {
+        let bit_count = (slot >> 2) - 1;
+        debug_assert!(bit_count <= 24);
+        debug_assert!(extra_bits < 1u32 << bit_count);
+        (((4 | (slot & 3)) << bit_count) | extra_bits as usize) + 2
+    }
 }
 
 pub fn distance_slot_bit_count(slot: usize) -> Result<usize> {
@@ -4047,11 +4078,20 @@ pub fn slot_to_distance(slot: usize, extra_bits: u32) -> Result<usize> {
     if extra_bits > max_extra {
         return Err(Error::InvalidData("RAR 5 distance extra bits exceed slot"));
     }
+    Ok(distance_from_slot_parts(slot, bit_count, extra_bits))
+}
+
+fn distance_from_slot_parts(slot: usize, bit_count: usize, extra_bits: u32) -> usize {
+    if slot < 4 {
+        return slot + 1;
+    }
+    debug_assert!(bit_count <= 31);
+    debug_assert!(extra_bits < 1u32 << bit_count);
     let distance = (((2u64 | (slot & 1) as u64) << bit_count) | u64::from(extra_bits)) + 1;
     // RAR 5 slots can name more than a 32-bit host can address. Preserve the
     // decoder's out-of-window zero-fill behavior instead of wrapping to a
     // plausible distance (or panicking on arithmetic overflow).
-    Ok(usize::try_from(distance).unwrap_or(usize::MAX))
+    usize::try_from(distance).unwrap_or(usize::MAX)
 }
 
 #[derive(Debug, Clone)]
