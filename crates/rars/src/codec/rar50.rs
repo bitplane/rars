@@ -5168,6 +5168,26 @@ mod tests {
     }
 
     #[test]
+    fn delta_filter_cancellation_leaves_output_unchanged() {
+        let token = crate::ReadCancellation::new();
+        let control = crate::read_control::ReadControl::new(Some(&token));
+        control.cancel_after_checks(2);
+        let mut bytes = vec![0x5a; 384 * 1024];
+        let filter = PendingFilter {
+            start: 0,
+            length: bytes.len(),
+            filter_type: FilterType::Delta,
+            channels: 3,
+        };
+
+        assert_eq!(
+            apply_filter_data(&mut bytes, &filter, &control),
+            Err(Error::Cancelled)
+        );
+        assert!(bytes.iter().all(|&byte| byte == 0x5a));
+    }
+
+    #[test]
     fn repricing_keeps_the_smallest_actual_block_including_filters() {
         for filtered in [false, true] {
             let data = wordy_text(4096);
