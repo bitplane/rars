@@ -8576,6 +8576,70 @@ mod tests {
     }
 
     #[test]
+    fn streaming_decoder_observes_cancellation_after_literal_flush() {
+        let data = vec![b'A'; STREAM_FLUSH_THRESHOLD + 1];
+        let input = encode_literal_only(&data, 0).unwrap();
+        let token = crate::ReadCancellation::new();
+        let mut decoder = Unpack50Decoder::new();
+        decoder.read_control = crate::read_control::ReadControl::new(Some(&token));
+        let mut calls = 0;
+
+        let result = decoder.decode_member_from_reader_with_dictionary_to_sink(
+            &mut input.as_slice(),
+            0,
+            data.len(),
+            DEFAULT_DICTIONARY_SIZE,
+            false,
+            |_chunk| {
+                calls += 1;
+                token.cancel();
+                Ok::<(), std::convert::Infallible>(())
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(StreamDecodeError::Decode(Error::Cancelled))
+        ));
+        assert_eq!(calls, 1);
+        assert!(decoder.tables.is_none()); // The next symbol observed cancellation.
+    }
+
+    #[test]
+    fn decoder_reader_entry_points_observe_existing_cancellation() {
+        let token = crate::ReadCancellation::new();
+        token.cancel();
+        let control = crate::read_control::ReadControl::new(Some(&token));
+        let mut buffered = Unpack50Decoder::new();
+        buffered.read_control = control.clone();
+        assert_eq!(
+            buffered.decode_member_from_reader_with_dictionary(
+                &mut &[][..],
+                0,
+                1,
+                DEFAULT_DICTIONARY_SIZE,
+                false,
+                DecodeMode::Lz,
+            ),
+            Err(Error::Cancelled)
+        );
+
+        let mut streaming = Unpack50Decoder::new();
+        streaming.read_control = control;
+        let result = streaming.decode_member_from_reader_with_dictionary_to_sink(
+            &mut &[][..],
+            0,
+            1,
+            DEFAULT_DICTIONARY_SIZE,
+            false,
+            |_chunk| Ok::<(), std::convert::Infallible>(()),
+        );
+        assert!(matches!(
+            result,
+            Err(StreamDecodeError::Decode(Error::Cancelled))
+        ));
+    }
+
+    #[test]
     fn streaming_decoder_rejects_filter_beyond_declared_output() {
         let data = b"\xe8\0\0\0\0plain text after call";
         let input = encode_lz_member_with_filter(data, crate::FilterKind::E8).unwrap();
