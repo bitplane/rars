@@ -7506,6 +7506,42 @@ mod tests {
     }
 
     #[test]
+    fn zero_fills_a_zero_distance_match_in_both_outputs() {
+        let decoder = Unpack50Decoder::new();
+        let mut buffered = b"A".to_vec();
+        decoder
+            .copy_match(&mut buffered, 0, 3, 4, DEFAULT_DICTIONARY_SIZE)
+            .unwrap();
+        assert_eq!(buffered, b"A\0\0\0");
+
+        let mut streaming = StreamingOutput::new(b"A".to_vec(), 3, 1, 1);
+        let mut decoded = Vec::new();
+        streaming
+            .copy_match(0, 3, &mut |chunk| {
+                match chunk {
+                    DecodedChunk::Bytes(bytes) => decoded.extend_from_slice(bytes),
+                    DecodedChunk::Repeated { byte, len } => {
+                        decoded.extend(std::iter::repeat_n(byte, len));
+                    }
+                }
+                Ok::<(), std::convert::Infallible>(())
+            })
+            .unwrap();
+        streaming
+            .finish(&mut |chunk| {
+                match chunk {
+                    DecodedChunk::Bytes(bytes) => decoded.extend_from_slice(bytes),
+                    DecodedChunk::Repeated { byte, len } => {
+                        decoded.extend(std::iter::repeat_n(byte, len));
+                    }
+                }
+                Ok::<(), std::convert::Infallible>(())
+            })
+            .unwrap();
+        assert_eq!(decoded, b"\0\0\0");
+    }
+
+    #[test]
     fn rejects_a_match_that_runs_past_the_output_limit() {
         let decoder = Unpack50Decoder::new();
         let mut output = b"AB".to_vec();
