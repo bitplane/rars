@@ -4053,7 +4053,11 @@ pub fn slot_to_distance(slot: usize, extra_bits: u32) -> Result<usize> {
     if extra_bits > max_extra {
         return Err(Error::InvalidData("RAR 5 distance extra bits exceed slot"));
     }
-    Ok((((2 | (slot & 1)) << bit_count) | extra_bits as usize) + 1)
+    let distance = (((2u64 | (slot & 1) as u64) << bit_count) | u64::from(extra_bits)) + 1;
+    // RAR 5 slots can name more than a 32-bit host can address. Preserve the
+    // decoder's out-of-window zero-fill behavior instead of wrapping to a
+    // plausible distance (or panicking on arithmetic overflow).
+    Ok(usize::try_from(distance).unwrap_or(usize::MAX))
 }
 
 #[derive(Debug, Clone)]
@@ -7346,6 +7350,19 @@ mod tests {
         assert_eq!(slot_to_distance(4, 1).unwrap(), 6);
         assert_eq!(distance_slot_bit_count(10).unwrap(), 4);
         assert_eq!(slot_to_distance(10, 15).unwrap(), 48);
+    }
+
+    #[test]
+    fn distance_slots_beyond_native_address_width_use_out_of_window_sentinel() {
+        for (slot, extra, distance) in [
+            (63, (1u32 << 30) - 1, 1u64 << 32),
+            (65, (1u32 << 31) - 1, 1u64 << 33),
+        ] {
+            assert_eq!(
+                slot_to_distance(slot, extra).unwrap(),
+                usize::try_from(distance).unwrap_or(usize::MAX)
+            );
+        }
     }
 
     #[test]
