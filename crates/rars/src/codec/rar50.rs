@@ -9158,6 +9158,35 @@ mod tests {
     }
 
     #[test]
+    fn buffered_decoder_observes_cancellation_before_and_during_filters() {
+        let data: Vec<u8> = (0..96).map(|index| (index * 7 + index / 3) as u8).collect();
+        let input =
+            encode_lz_member_with_filter(&data, crate::FilterKind::Delta { channels: 3 }).unwrap();
+        assert_eq!(decode_lz(&input, 0, data.len()).unwrap(), data);
+
+        for successful_checks in [5, 6] {
+            let token = crate::ReadCancellation::new();
+            let mut decoder = Unpack50Decoder::new();
+            decoder.read_control = crate::read_control::ReadControl::new(Some(&token));
+            decoder.read_control.cancel_after_checks(successful_checks);
+            assert_eq!(
+                decoder.decode_member_from_reader_with_dictionary(
+                    &mut input.as_slice(),
+                    0,
+                    data.len(),
+                    DEFAULT_DICTIONARY_SIZE,
+                    false,
+                    DecodeMode::Lz,
+                ),
+                Err(Error::Cancelled),
+                "after {successful_checks} checks"
+            );
+            assert!(decoder.tables.is_some()); // All packed symbols decoded first.
+            assert!(decoder.history.is_empty()); // Filtered output was not committed.
+        }
+    }
+
+    #[test]
     fn streaming_decoder_rejects_filter_beyond_declared_output() {
         let data = b"\xe8\0\0\0\0plain text after call";
         let input = encode_lz_member_with_filter(data, crate::FilterKind::E8).unwrap();
