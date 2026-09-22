@@ -5478,6 +5478,61 @@ mod tests {
     }
 
     #[test]
+    fn parse_repricing_and_lazy_literal_refusals_release_storage() {
+        let optimal_data = wordy_text(4096);
+        let optimal = EncodeOptions::new(32).with_optimal_parse(true);
+        assert_each_allocation_refusal(|budget| {
+            encode_tokens_with_allowance(
+                &optimal_data,
+                0..optimal_data.len(),
+                MemberSearch::Fresh,
+                optimal,
+                DISTANCE_TABLE_SIZE_50,
+                &[],
+                None,
+                budget,
+            )
+        });
+
+        let pos = 160;
+        let mut lazy_data: Vec<u8> = (0..240u16)
+            .map(|value| value.wrapping_mul(91) as u8)
+            .collect();
+        lazy_data[pos - 30..pos - 22].copy_from_slice(b"ABCDEFGH");
+        lazy_data[pos - 80..pos - 70].copy_from_slice(b"CDEFGHIJKL");
+        lazy_data[pos..pos + 12].copy_from_slice(b"ABCDEFGHIJKL");
+        let lazy = EncodeOptions::default()
+            .with_lazy_matching(true)
+            .with_lazy_lookahead(2);
+        let tokens = encode_tokens_with_allowance(
+            &lazy_data,
+            pos..lazy_data.len(),
+            MemberSearch::Fresh,
+            lazy,
+            DISTANCE_TABLE_SIZE_50,
+            &[],
+            None,
+            &Allowance::default(),
+        )
+        .unwrap();
+        assert!(matches!(tokens.first(), Some(EncodeToken::Literal(_))));
+        assert_each_allocation_refusal(|budget| {
+            encode_tokens_with_allowance(
+                &lazy_data,
+                pos..lazy_data.len(),
+                MemberSearch::Fresh,
+                lazy,
+                DISTANCE_TABLE_SIZE_50,
+                &[],
+                None,
+                budget,
+            )
+        });
+
+        assert_each_allocation_refusal(|budget| EncoderCodeTable::from_lengths(&[1, 1], budget));
+    }
+
+    #[test]
     fn token_block_allocation_refusals_cover_each_control_form() {
         let filter = EncodeToken::Filter(EncodeFilter {
             offset: 0,
@@ -5576,9 +5631,14 @@ mod tests {
         for index in (1..LEVEL_TABLE_SIZE).step_by(2) {
             isolated_zeroes[index] = 0;
         }
+        let mut offset_zero_runs = [1u8; LEVEL_TABLE_SIZE];
+        for start in (1..LEVEL_TABLE_SIZE).step_by(4) {
+            offset_zero_runs[start..(start + 3).min(LEVEL_TABLE_SIZE)].fill(0);
+        }
         for lengths in [
             [0u8; LEVEL_TABLE_SIZE],
             isolated_zeroes,
+            offset_zero_runs,
             [15u8; LEVEL_TABLE_SIZE],
         ] {
             for prefix_bits in 0..=16 {
