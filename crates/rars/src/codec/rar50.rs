@@ -3567,7 +3567,9 @@ impl StreamingOutput {
         })
         .map_err(StreamDecodeError::Sink)?;
         self.written += count;
-        if self.history.is_empty() && self.history_limit != 0 {
+        // decode_member_to rejects zero dictionary sizes before constructing
+        // this output, so a zero fill always has room for one history byte.
+        if self.history.is_empty() {
             self.history.push_back(0);
         }
         Ok(())
