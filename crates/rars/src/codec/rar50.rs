@@ -5320,6 +5320,27 @@ mod tests {
     }
 
     #[test]
+    fn filtered_multiblock_output_growth_refusals_release_storage() {
+        let data = vec![b'A'; FILTERED_LZ_BLOCK_SIZE + 1];
+        let filters = [crate::FilterSpec::whole(crate::FilterKind::E8)];
+        let options = EncodeOptions::new(16).with_max_match_distance(256);
+        let expected = filtered_lz_blocks(
+            &data,
+            &filters,
+            &[],
+            0,
+            options,
+            None,
+            &Allowance::default(),
+        )
+        .unwrap();
+        assert_eq!(decode_lz(&expected, 0, data.len()).unwrap(), data);
+        assert_each_allocation_refusal(|budget| {
+            filtered_lz_blocks(&data, &filters, &[], 0, options, None, budget)
+        });
+    }
+
+    #[test]
     fn token_block_allocation_refusals_cover_each_control_form() {
         let filter = EncodeToken::Filter(EncodeFilter {
             offset: 0,
