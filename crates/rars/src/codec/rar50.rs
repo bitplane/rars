@@ -2988,21 +2988,15 @@ fn length_slot_for_match(length: usize) -> Result<(usize, usize)> {
     }
     let bit_count = value.ilog2() as usize - 2;
     let slot = ((bit_count + 1) << 2) | ((value >> bit_count) & 3);
-    if slot >= LENGTH_TABLE_SIZE {
-        return Err(Error::InvalidData("RAR 5 match length is too long"));
-    }
+    // The encoder caps matches at 4096 bytes, which fits slots 0..44.
     Ok((slot, value & ((1 << bit_count) - 1)))
 }
 
 fn distance_slot_for_match(distance: usize, distance_size: usize) -> Result<(usize, usize)> {
-    if distance == 0 {
-        return Err(Error::InvalidData("RAR 5 match distance is zero"));
-    }
+    // Every emitted match comes from an earlier input position, and the two
+    // production distance tables both have at least four entries.
     let value = distance - 1;
     if value < 4 {
-        if value >= distance_size {
-            return Err(Error::InvalidData("RAR 5 match distance is too large"));
-        }
         return Ok((value, 0));
     }
     let bit_count = value.ilog2() as usize - 1;
@@ -7423,6 +7417,17 @@ mod tests {
         assert_eq!(slot_to_distance(4, 1).unwrap(), 6);
         assert_eq!(distance_slot_bit_count(10).unwrap(), 4);
         assert_eq!(slot_to_distance(10, 15).unwrap(), 48);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn encoder_rejects_distance_beyond_rar50_table() {
+        // A caller may raise max_match_distance beyond the RAR 5.0 table's
+        // range. Such a match must fail before indexing the frequency table.
+        assert_eq!(
+            EncoderMatchState::default().encode_match(4, 1usize << 40, DISTANCE_TABLE_SIZE_50),
+            Err(Error::InvalidData("RAR 5 match distance is too large"))
+        );
     }
 
     #[test]
