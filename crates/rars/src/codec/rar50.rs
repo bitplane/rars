@@ -4959,6 +4959,22 @@ mod tests {
     }
 
     #[test]
+    fn optimal_parse_pass_failures_release_the_allowance() {
+        let data: Vec<u8> = (0..512).map(|i| (i * 71) as u8).collect();
+        let options = EncodeOptions::new(16).with_optimal_parse(true);
+        // The first limit fails while building the initial optimal path; the
+        // second permits that path but fails while repricing it.
+        for limit in [1_080_000, 1_105_000] {
+            let allowance = Allowance::limited(limit);
+            assert!(matches!(
+                encode_member_with_allowance(&data, &[], 0, &[], options, None, &allowance),
+                Err(Error::WorkspaceLimitExceeded(_))
+            ));
+            assert_eq!(allowance.used(), 0);
+        }
+    }
+
+    #[test]
     fn member_refusal_cancellation_and_unwind_release_the_whole_pipeline() {
         let data = b"member cancellation and refusal\n".repeat(100);
         let history = b"history".repeat(100);
