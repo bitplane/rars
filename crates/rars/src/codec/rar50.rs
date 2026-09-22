@@ -3879,15 +3879,7 @@ fn write_valid_filter<B: Budget>(writer: &mut BitWriter<B>, filter: EncodeFilter
 }
 
 fn try_write_filter_data<B: Budget>(writer: &mut BitWriter<B>, value: u32) -> Result<()> {
-    let byte_count = if value <= 0xff {
-        1
-    } else if value <= 0xffff {
-        2
-    } else if value <= 0x00ff_ffff {
-        3
-    } else {
-        4
-    };
+    let byte_count = filter_data_byte_count(value);
     writer
         .try_write_bits(byte_count - 1, 2)
         .map_err(Into::into)?;
@@ -3900,19 +3892,15 @@ fn try_write_filter_data<B: Budget>(writer: &mut BitWriter<B>, value: u32) -> Re
 }
 
 fn write_filter_data_admitted<B: Budget>(writer: &mut BitWriter<B>, value: u32) {
-    let byte_count = if value <= 0xff {
-        1
-    } else if value <= 0xffff {
-        2
-    } else if value <= 0x00ff_ffff {
-        3
-    } else {
-        4
-    };
+    let byte_count = filter_data_byte_count(value);
     writer.write_admitted_bits(byte_count - 1, 2);
     for index in 0..byte_count {
         writer.write_admitted_bits(((value >> (index * 8)) & 0xff) as usize, 8);
     }
+}
+
+fn filter_data_byte_count(value: u32) -> usize {
+    ((u32::BITS - value.leading_zeros()).div_ceil(8) as usize).max(1)
 }
 
 fn apply_filters_with_control(
@@ -4675,90 +4663,7 @@ fn try_write_level_lengths<B: Budget>(
 
 #[cfg(test)]
 mod tests {
-    #[derive(Clone, Debug)]
-    struct RefusingBudget {
-        inner: crate::codec::workspace::Limited,
-        attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        fail_at: usize,
-    }
-
-    #[derive(Debug)]
-    struct RefusingCharge {
-        inner: crate::codec::workspace::Charge,
-        attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        fail_at: usize,
-    }
-
-    impl RefusingBudget {
-        fn new(fail_at: usize) -> Self {
-            Self {
-                inner: Allowance::limited(64 * 1024 * 1024),
-                attempts: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                fail_at,
-            }
-        }
-
-        fn attempts(&self) -> usize {
-            self.attempts.load(std::sync::atomic::Ordering::Relaxed)
-        }
-
-        fn used(&self) -> u64 {
-            self.inner.used()
-        }
-    }
-
-    fn refuse_once(
-        attempts: &std::sync::atomic::AtomicUsize,
-        fail_at: usize,
-    ) -> crate::codec::Result<()> {
-        if attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == fail_at {
-            Err(Error::Cancelled)
-        } else {
-            Ok(())
-        }
-    }
-
-    impl Budget for RefusingBudget {
-        type Charge = RefusingCharge;
-        type Failure = Error;
-        const LIMITED: bool = true;
-
-        fn grow<T>(
-            values: &mut Vec<T>,
-            charge: &mut Self::Charge,
-            additional: usize,
-        ) -> crate::codec::Result<()> {
-            refuse_once(&charge.attempts, charge.fail_at)?;
-            <crate::codec::workspace::Limited as Budget>::grow(
-                values,
-                &mut charge.inner,
-                additional,
-            )
-        }
-
-        fn charge(&self) -> Self::Charge {
-            RefusingCharge {
-                inner: <crate::codec::workspace::Limited as Budget>::charge(&self.inner),
-                attempts: self.attempts.clone(),
-                fail_at: self.fail_at,
-            }
-        }
-
-        fn allowance(charge: &Self::Charge) -> Self {
-            Self {
-                inner: <crate::codec::workspace::Limited as Budget>::allowance(&charge.inner),
-                attempts: charge.attempts.clone(),
-                fail_at: charge.fail_at,
-            }
-        }
-
-        fn resize(charge: &mut Self::Charge, bytes: u64) -> crate::codec::Result<()> {
-            if bytes > charge.inner.bytes() {
-                refuse_once(&charge.attempts, charge.fail_at)?;
-            }
-            <crate::codec::workspace::Limited as Budget>::resize(&mut charge.inner, bytes)
-        }
-    }
+    use crate::codec::workspace::RefusingBudget;
 
     fn assert_each_allocation_refusal<T>(
         mut work: impl FnMut(&RefusingBudget) -> crate::codec::Result<T>,
@@ -5597,9 +5502,10 @@ mod tests {
             assert_eq!(probe.used(), 0);
 
             let span = data.len() - start;
-            let initial_bytes =
-                span * std::mem::size_of::<(u32, u32)>() + (span + 1) * std::mem::size_of::<u32>();
+            let run_bytes = span * std::mem::size_of::<(u32, u32)>();
+            let initial_bytes = run_bytes + (span + 1) * std::mem::size_of::<u32>();
             for limit in [
+                finder_bytes + run_bytes as u64 - 1,
                 finder_bytes + initial_bytes as u64 - 1,
                 finder_bytes + initial_bytes as u64,
             ] {

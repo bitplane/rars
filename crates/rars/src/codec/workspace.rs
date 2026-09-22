@@ -89,6 +89,89 @@ impl Budget for Limited {
     }
 }
 
+/// Test policy that uses the production ledger but can refuse one chosen
+/// growth operation. Keeping the policy beside [`Budget`] lets coverage count
+/// its monomorphizations as tests of production generic code rather than as
+/// test-module functions.
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct RefusingBudget {
+    inner: Limited,
+    attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    fail_at: usize,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct RefusingCharge {
+    inner: Charge,
+    attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    fail_at: usize,
+}
+
+#[cfg(test)]
+impl RefusingBudget {
+    pub(crate) fn new(fail_at: usize) -> Self {
+        Self {
+            inner: Allowance::limited(64 * 1024 * 1024),
+            attempts: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            fail_at,
+        }
+    }
+
+    pub(crate) fn attempts(&self) -> usize {
+        self.attempts.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn used(&self) -> u64 {
+        self.inner.used()
+    }
+}
+
+#[cfg(test)]
+fn refuse_once(attempts: &std::sync::atomic::AtomicUsize, fail_at: usize) -> Result<()> {
+    if attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == fail_at {
+        Err(Error::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl Budget for RefusingBudget {
+    type Charge = RefusingCharge;
+    type Failure = Error;
+    const LIMITED: bool = true;
+
+    fn grow<T>(values: &mut Vec<T>, charge: &mut Self::Charge, additional: usize) -> Result<()> {
+        refuse_once(&charge.attempts, charge.fail_at)?;
+        <Limited as Budget>::grow(values, &mut charge.inner, additional)
+    }
+
+    fn charge(&self) -> Self::Charge {
+        RefusingCharge {
+            inner: <Limited as Budget>::charge(&self.inner),
+            attempts: self.attempts.clone(),
+            fail_at: self.fail_at,
+        }
+    }
+
+    fn allowance(charge: &Self::Charge) -> Self {
+        Self {
+            inner: <Limited as Budget>::allowance(&charge.inner),
+            attempts: charge.attempts.clone(),
+            fail_at: charge.fail_at,
+        }
+    }
+
+    fn resize(charge: &mut Self::Charge, bytes: u64) -> Result<()> {
+        if bytes > charge.inner.bytes() {
+            refuse_once(&charge.attempts, charge.fail_at)?;
+        }
+        <Limited as Budget>::resize(&mut charge.inner, bytes)
+    }
+}
+
 /// Storage is dropped before its charge. Slice access cannot grow an allocation
 /// behind the ledger's back; growth and ownership transfer are explicit.
 #[derive(Debug)]
