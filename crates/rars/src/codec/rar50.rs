@@ -672,8 +672,10 @@ pub fn encode_literal_only(data: &[u8], algorithm_version: u8) -> Result<Vec<u8>
         }
     }
 
-    let (table_data, table_bits) =
-        encode_table_lengths_with_bit_count(&lengths, algorithm_version)?;
+    // The version, table sizes and generated lengths are all fixed above;
+    // malformed-table errors remain available on the public table encoder.
+    let (table_data, table_bits) = encode_table_lengths_with_bit_count(&lengths, algorithm_version)
+        .expect("generated literal table is valid");
     let mut writer = BitWriter {
         bytes: Buffer::from_vec(table_data),
         bit_pos: table_bits,
@@ -1859,7 +1861,9 @@ fn encode_token_block_with_allowance<B: Budget>(
             EncodeToken::Filter(filter) => {
                 let (code, len) = main_table.code_for_present_symbol(256);
                 writer.write_admitted_bits(usize::from(code), usize::from(len));
-                try_write_filter(&mut writer, filter)?;
+                // token_stream_bits_after_tables validated this same record
+                // before its exact payload allocation was admitted.
+                write_valid_filter(&mut writer, filter);
             }
             EncodeToken::Literal(byte) => {
                 let (code, len) = main_table.code_for_present_symbol(byte as usize);
@@ -3857,6 +3861,23 @@ fn try_write_filter<B: Budget>(writer: &mut BitWriter<B>, filter: EncodeFilter) 
     Ok(())
 }
 
+fn write_valid_filter<B: Budget>(writer: &mut BitWriter<B>, filter: EncodeFilter) {
+    debug_assert!(u32::try_from(filter.offset).is_ok());
+    debug_assert!(u32::try_from(filter.length).is_ok());
+    write_filter_data_admitted(writer, filter.offset as u32);
+    write_filter_data_admitted(writer, filter.length as u32);
+    match filter.filter_type {
+        FilterType::Delta => {
+            debug_assert!((1..=MAX_DELTA_CHANNELS).contains(&filter.channels));
+            writer.write_admitted_bits(0, 3);
+            writer.write_admitted_bits(filter.channels - 1, 5);
+        }
+        FilterType::E8 => writer.write_admitted_bits(1, 3),
+        FilterType::E8E9 => writer.write_admitted_bits(2, 3),
+        FilterType::Arm => writer.write_admitted_bits(3, 3),
+    }
+}
+
 fn try_write_filter_data<B: Budget>(writer: &mut BitWriter<B>, value: u32) -> Result<()> {
     let byte_count = if value <= 0xff {
         1
@@ -3876,6 +3897,22 @@ fn try_write_filter_data<B: Budget>(writer: &mut BitWriter<B>, value: u32) -> Re
             .map_err(Into::into)?;
     }
     Ok(())
+}
+
+fn write_filter_data_admitted<B: Budget>(writer: &mut BitWriter<B>, value: u32) {
+    let byte_count = if value <= 0xff {
+        1
+    } else if value <= 0xffff {
+        2
+    } else if value <= 0x00ff_ffff {
+        3
+    } else {
+        4
+    };
+    writer.write_admitted_bits(byte_count - 1, 2);
+    for index in 0..byte_count {
+        writer.write_admitted_bits(((value >> (index * 8)) & 0xff) as usize, 8);
+    }
 }
 
 fn apply_filters_with_control(
@@ -4295,7 +4332,7 @@ impl<'a> BitReader<'a> {
         // offset. Compare that local byte span rather than multiplying the
         // entire input length by eight, which can overflow for a huge slice.
         let bytes_needed = (bit_offset + count).div_ceil(8);
-        if byte_pos > self.input.len() || bytes_needed > self.input.len() - byte_pos {
+        if bytes_needed > self.input.len().saturating_sub(byte_pos) {
             return Err(Error::NeedMoreInput);
         }
 
@@ -5530,6 +5567,78 @@ mod tests {
         });
 
         assert_each_allocation_refusal(|budget| EncoderCodeTable::from_lengths(&[1, 1], budget));
+    }
+
+    #[test]
+    fn production_limited_budget_covers_residual_allocation_sites() {
+        let denied = Allowance::limited(0);
+        assert!(matches!(
+            EncoderCodeTable::from_lengths(&[1, 1], &denied),
+            Err(Error::WorkspaceLimitExceeded(_))
+        ));
+        assert_eq!(denied.used(), 0);
+
+        let mut noise = 0x2545_f491_4f6c_dd1du64;
+        let data: Vec<u8> = (0..4096)
+            .map(|_| {
+                noise ^= noise << 13;
+                noise ^= noise >> 7;
+                noise ^= noise << 17;
+                b'A' + ((noise >> 40) as u8 & 1)
+            })
+            .collect();
+        let options = EncodeOptions::new(64).with_optimal_parse(true);
+        for start in [0, data.len() / 2] {
+            let probe = Allowance::limited(64 * 1024 * 1024);
+            let collector =
+                OptimalCollector::with_allowance(&data, start, options, &probe).unwrap();
+            let finder_bytes = probe.used();
+            drop(collector);
+            assert_eq!(probe.used(), 0);
+
+            let span = data.len() - start;
+            let initial_bytes =
+                span * std::mem::size_of::<(u32, u32)>() + (span + 1) * std::mem::size_of::<u32>();
+            for limit in [
+                finder_bytes + initial_bytes as u64 - 1,
+                finder_bytes + initial_bytes as u64,
+            ] {
+                let allowance = Allowance::limited(limit);
+                let mut collector =
+                    OptimalCollector::with_allowance(&data, start, options, &allowance).unwrap();
+                assert!(matches!(
+                    collector.collect(&data, start..data.len(), options),
+                    Err(Error::WorkspaceLimitExceeded(_))
+                ));
+                drop(collector);
+                assert_eq!(allowance.used(), 0);
+            }
+        }
+
+        let input = b"state history must be admitted after its packed output";
+        let options = EncodeOptions::new(0).with_max_match_distance(32);
+        let mut limit = 0u64;
+        let mut refusals = 0;
+        loop {
+            let allowance = Allowance::limited(limit);
+            let mut state = EncoderState::new(options, &allowance);
+            match state.encode(input, 0, None, None) {
+                Err(Error::WorkspaceLimitExceeded(details)) => {
+                    refusals += 1;
+                    let next = details.used + details.required;
+                    assert!(next > limit);
+                    limit = next;
+                }
+                Ok(packed) => {
+                    assert_eq!(&*state.history, &input[input.len() - 32..]);
+                    drop((packed, state));
+                    assert_eq!(allowance.used(), 0);
+                    break;
+                }
+                Err(error) => panic!("unexpected state error: {error:?}"),
+            }
+        }
+        assert!(refusals > 1);
     }
 
     #[test]
