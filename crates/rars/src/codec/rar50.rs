@@ -5334,6 +5334,61 @@ mod tests {
     }
 
     #[test]
+    fn token_block_allocation_refusals_cover_each_control_form() {
+        let filter = EncodeToken::Filter(EncodeFilter {
+            offset: 0,
+            length: 1,
+            filter_type: FilterType::E8,
+            channels: 0,
+        });
+        let mut filters = vec![filter; 256];
+        filters.push(EncodeToken::Literal(b'A'));
+
+        let mut last_length = vec![
+            EncodeToken::Literal(b'A'),
+            EncodeToken::Match {
+                length: 2,
+                distance: 1,
+            },
+        ];
+        last_length.extend(std::iter::repeat_n(
+            EncodeToken::Match {
+                length: 2,
+                distance: 1,
+            },
+            256,
+        ));
+
+        let mut repeat_distance = last_length[..2].to_vec();
+        repeat_distance.extend((0..256).map(|index| EncodeToken::Match {
+            length: 3 + index % 2,
+            distance: 1,
+        }));
+
+        let mut new_distance = vec![EncodeToken::Literal(b'A'); 100];
+        new_distance.extend((0..256).map(|index| EncodeToken::Match {
+            length: 10,
+            distance: 70 + index % 5,
+        }));
+
+        for (tokens, output_size) in [
+            (filters, 1),
+            (last_length, 1 + 2 * 257),
+            (repeat_distance, 3 + 128 * (3 + 4)),
+            (new_distance, 100 + 256 * 10),
+        ] {
+            let packed = encode_token_block(&tokens, 0, DISTANCE_TABLE_SIZE_50, true).unwrap();
+            assert_eq!(
+                decode_lz(&packed, 0, output_size).unwrap(),
+                vec![b'A'; output_size]
+            );
+            assert_each_allocation_refusal(|budget| {
+                encode_token_block_with_allowance(&tokens, 0, DISTANCE_TABLE_SIZE_50, true, budget)
+            });
+        }
+    }
+
+    #[test]
     fn parser_allowance_preserves_tokens_and_retains_the_returned_owner() {
         let data: Vec<_> = (0..8192u32)
             .map(|n| (n.wrapping_mul(71) ^ (n >> 4)) as u8)
