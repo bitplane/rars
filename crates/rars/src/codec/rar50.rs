@@ -6466,6 +6466,60 @@ mod tests {
     }
 
     #[test]
+    fn truncated_filter_fields_and_overflowing_start_fail() {
+        assert_eq!(
+            read_filter_data(&mut BitReader::new(&[])),
+            Err(Error::NeedMoreInput)
+        );
+        assert_eq!(
+            read_filter_data(&mut BitReader::new(&[0])),
+            Err(Error::NeedMoreInput)
+        );
+        assert_eq!(
+            read_filter(&mut BitReader::new(&[]), 0),
+            Err(Error::NeedMoreInput)
+        );
+        assert_eq!(
+            read_filter(&mut BitReader::new(&[0, 0]), 0),
+            Err(Error::NeedMoreInput)
+        );
+
+        let mut type_missing = BitWriter::new();
+        type_missing.write_bits(0, 4); // The preceding Huffman code's tail.
+        try_write_filter_data(&mut type_missing, 0).unwrap();
+        try_write_filter_data(&mut type_missing, 1).unwrap();
+        let data = type_missing.finish();
+        let mut bits = BitReader::new(&data);
+        bits.bit_pos = 4;
+        assert_eq!(read_filter(&mut bits, 0), Err(Error::NeedMoreInput));
+
+        let mut channels_missing = BitWriter::new();
+        try_write_filter_data(&mut channels_missing, 0).unwrap();
+        try_write_filter_data(&mut channels_missing, 1).unwrap();
+        channels_missing.write_bits(0, 3); // DELTA, without its channel field.
+        assert_eq!(
+            read_filter(&mut BitReader::new(&channels_missing.finish()), 0),
+            Err(Error::NeedMoreInput)
+        );
+
+        let mut start_overflow = BitWriter::new();
+        try_write_filter(
+            &mut start_overflow,
+            EncodeFilter {
+                offset: 1,
+                length: 1,
+                filter_type: FilterType::E8,
+                channels: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            read_filter(&mut BitReader::new(&start_overflow.finish()), usize::MAX),
+            Err(Error::InvalidData("RAR 5 filter start overflows"))
+        );
+    }
+
+    #[test]
     fn filter_record_writer_rejects_invalid_delta_channels() {
         for channels in [0, MAX_DELTA_CHANNELS + 1] {
             let mut writer = BitWriter::new();
