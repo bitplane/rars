@@ -620,12 +620,13 @@ fn encode_compressed_block_with_allowance<B: Budget>(
     let checksum = size_bytes[..size_len]
         .iter()
         .fold(0x5a ^ flags, |acc, &byte| acc ^ byte);
-    let mut out = Buffer::with_capacity(2 + size_len + payload.len(), allowance)?;
-    out.push(flags).map_err(Into::into)?;
-    out.push(checksum).map_err(Into::into)?;
-    out.extend_from_slice(&size_bytes[..size_len])
-        .map_err(Into::into)?;
-    out.extend_from_slice(payload).map_err(Into::into)?;
+    // The header and bounded payload have an exact final size. Admit that
+    // allocation once, then write into it without fallible growth calls.
+    let mut out = Buffer::filled(2 + size_len + payload.len(), 0u8, allowance)?;
+    out[0] = flags;
+    out[1] = checksum;
+    out[2..2 + size_len].copy_from_slice(&size_bytes[..size_len]);
+    out[2 + size_len..].copy_from_slice(payload);
     Ok(out)
 }
 
