@@ -153,6 +153,12 @@ impl<T, B: Budget> Buffer<T, B> {
         self.values.push(value);
         Ok(())
     }
+    /// Append after the caller has admitted enough capacity for the complete
+    /// collection. This cannot grow the allocation or change its charge.
+    pub(crate) fn push_admitted(&mut self, value: T) {
+        debug_assert!(self.values.len() < self.values.capacity());
+        self.values.push(value);
+    }
     pub(crate) fn try_push(&mut self, value: T) -> Result<()> {
         self.push(value).map_err(Into::into)
     }

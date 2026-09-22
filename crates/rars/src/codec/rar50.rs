@@ -960,19 +960,17 @@ pub(crate) fn streaming_blocks_with_allowance<B: Budget>(
     };
     if start == 0 && options.optimal_parse && !blocks.is_empty() {
         let (end, is_last) = blocks[0];
-        output
-            .push(encode_lz_block_with_allowance(
-                &combined[..end],
-                0..end,
-                MemberSearch::Fresh,
-                algorithm_version,
-                &[],
-                options,
-                is_last,
-                None,
-                allowance,
-            )?)
-            .map_err(Into::into)?;
+        output.push_admitted(encode_lz_block_with_allowance(
+            &combined[..end],
+            0..end,
+            MemberSearch::Fresh,
+            algorithm_version,
+            &[],
+            options,
+            is_last,
+            None,
+            allowance,
+        )?);
         at = end;
         first = 1;
         if !report(end, &mut block_done) {
@@ -992,19 +990,17 @@ pub(crate) fn streaming_blocks_with_allowance<B: Budget>(
     };
     for &(end, is_last) in &blocks[first..] {
         let end = start + end;
-        output
-            .push(encode_lz_block_with_allowance(
-                &combined,
-                at..end,
-                search.borrow(),
-                algorithm_version,
-                &[],
-                options,
-                is_last,
-                None,
-                allowance,
-            )?)
-            .map_err(Into::into)?;
+        output.push_admitted(encode_lz_block_with_allowance(
+            &combined,
+            at..end,
+            search.borrow(),
+            algorithm_version,
+            &[],
+            options,
+            is_last,
+            None,
+            allowance,
+        )?);
         at = end;
         if !report(end - start, &mut block_done) {
             return Err(Error::Cancelled);
@@ -1089,14 +1085,12 @@ fn filtered_member_with_allowance<B: Budget>(
             range.start,
             allowance,
         )?;
-        records
-            .push(EncodeFilter {
-                offset: range.start,
-                length: range.len(),
-                filter_type,
-                channels,
-            })
-            .map_err(Into::into)?;
+        records.push_admitted(EncodeFilter {
+            offset: range.start,
+            length: range.len(),
+            filter_type,
+            channels,
+        });
     }
     Ok((filtered, records))
 }
@@ -1249,12 +1243,10 @@ fn normalized_filter_specs<B: Budget>(
         if range.start >= range.end || range.end > data_len {
             return Err(Error::InvalidData("RAR 5 filter range is invalid"));
         }
-        normalized
-            .push(NormalizedFilterSpec {
-                kind: rar50_filter(filter.kind)?,
-                range,
-            })
-            .map_err(Into::into)?;
+        normalized.push_admitted(NormalizedFilterSpec {
+            kind: rar50_filter(filter.kind)?,
+            range,
+        });
     }
     Ok(normalized)
 }
@@ -1583,10 +1575,7 @@ impl<B: Budget> OptimalCollector<B> {
         // which positions matter without having to be told.
         let mut committed_through = block.start;
         for pos in block.clone() {
-            matches
-                .starts
-                .push(matches.runs.len() as u32)
-                .map_err(Into::into)?;
+            matches.starts.push_admitted(matches.runs.len() as u32);
             let searching = pos >= committed_through && options.max_match_candidates != 0;
             let max_distance = pos.min(options.max_match_distance);
             let before = matches.runs.len();
@@ -1677,10 +1666,7 @@ impl<B: Budget> OptimalCollector<B> {
                 }
             }
         }
-        matches
-            .starts
-            .push(matches.runs.len() as u32)
-            .map_err(Into::into)?;
+        matches.starts.push_admitted(matches.runs.len() as u32);
         Ok(matches)
     }
 }
@@ -2585,14 +2571,17 @@ fn optimal_tokens_in_workspace<B: Budget>(
     // Admit the largest candidate list once. Pricing only borrows already
     // charged arrays, so its inner loop is identical for both budget policies.
     // Each position contributes at most four remembered-distance candidates.
-    let reach_capacity = matches
+    let longest_run = matches
         .starts
         .windows(2)
         .map(|pair| (pair[1] - pair[0]) as usize)
         .max()
-        .unwrap_or(0)
-        .checked_add(4)
-        .ok_or(Error::InvalidData("optimal candidate capacity overflows"))?;
+        .unwrap_or(0);
+    // A position contributes at most one run for each encodable match length.
+    // Four remembered distances are added while pricing, so this bound cannot
+    // approach usize::MAX for a valid BlockMatches collection.
+    debug_assert!(longest_run <= MAX_ENCODER_MATCH_LENGTH);
+    let reach_capacity = longest_run + 4;
     let mut reaches = Buffer::filled(reach_capacity, (0usize, 0usize, 0usize), &allowance)?;
     price_optimal_paths(
         combined,
