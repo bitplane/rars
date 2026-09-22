@@ -145,6 +145,13 @@ impl<T, B: Budget> Buffer<T, B> {
     fn reserve(&mut self, additional: usize) -> Result<()> {
         B::grow(&mut self.values, &mut self.charge, additional).map_err(Into::into)
     }
+    pub(crate) fn reserve_total_capacity(&mut self, total: usize) -> Result<()> {
+        if total > self.values.capacity() {
+            self.reserve(total.saturating_sub(self.values.len()))?;
+        }
+        debug_assert!(self.values.capacity() >= total);
+        Ok(())
+    }
     #[inline]
     pub(crate) fn push(&mut self, value: T) -> std::result::Result<(), B::Failure> {
         if B::LIMITED && self.values.len() == self.values.capacity() {
@@ -283,6 +290,17 @@ impl<B: Budget> Buffer<u8, B> {
         }
         super::fast::write_msb_bits(&mut self.values, bit_pos, value, count);
         Ok(())
+    }
+    pub(crate) fn write_msb_bits_admitted(
+        &mut self,
+        bit_pos: &mut usize,
+        value: u64,
+        count: usize,
+    ) {
+        let used = *bit_pos % 8;
+        let additional = (used + count).div_ceil(8) - usize::from(used != 0);
+        debug_assert!(additional <= self.values.capacity() - self.values.len());
+        super::fast::write_msb_bits(&mut self.values, bit_pos, value, count);
     }
 }
 fn allocation_size<T>(capacity: usize) -> Result<u64> {

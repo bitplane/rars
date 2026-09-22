@@ -1844,33 +1844,32 @@ fn encode_token_block_with_allowance<B: Budget>(
     let length_table = EncoderCodeTable::from_lengths(&lengths.length, allowance)?;
     let (table_data, table_bits) =
         encode_table_slices(lengths.slices(), algorithm_version, allowance)?;
+    let payload_bits =
+        token_stream_bits_after_tables(tokens, &[], &lengths, distance_size, table_bits)?;
     let mut writer = BitWriter {
         bytes: table_data,
         bit_pos: table_bits,
     };
+    writer
+        .bytes
+        .reserve_total_capacity(payload_bits.div_ceil(8))?;
     let mut state = EncoderMatchState::default();
     for &token in tokens {
         match token {
             EncodeToken::Filter(filter) => {
                 let (code, len) = main_table.code_for_present_symbol(256);
-                writer
-                    .try_write_bits(usize::from(code), usize::from(len))
-                    .map_err(Into::into)?;
+                writer.write_admitted_bits(usize::from(code), usize::from(len));
                 try_write_filter(&mut writer, filter)?;
             }
             EncodeToken::Literal(byte) => {
                 let (code, len) = main_table.code_for_present_symbol(byte as usize);
-                writer
-                    .try_write_bits(usize::from(code), usize::from(len))
-                    .map_err(Into::into)?;
+                writer.write_admitted_bits(usize::from(code), usize::from(len));
             }
             EncodeToken::Match { length, distance } => {
                 match state.encode_match(length, distance, distance_size)? {
                     EncodedMatch::LastLengthRepeat => {
                         let (code, len) = main_table.code_for_present_symbol(257);
-                        writer
-                            .try_write_bits(usize::from(code), usize::from(len))
-                            .map_err(Into::into)?;
+                        writer.write_admitted_bits(usize::from(code), usize::from(len));
                     }
                     EncodedMatch::RepeatDistance {
                         index,
@@ -1878,18 +1877,13 @@ fn encode_token_block_with_allowance<B: Budget>(
                         length_extra,
                     } => {
                         let (code, len) = main_table.code_for_present_symbol(258 + index);
-                        writer
-                            .try_write_bits(usize::from(code), usize::from(len))
-                            .map_err(Into::into)?;
+                        writer.write_admitted_bits(usize::from(code), usize::from(len));
                         let (code, len) = length_table.code_for_present_symbol(length_slot);
-                        writer
-                            .try_write_bits(usize::from(code), usize::from(len))
-                            .map_err(Into::into)?;
+                        writer.write_admitted_bits(usize::from(code), usize::from(len));
                         let length_extra_bits = length_slot_extra_bits(length_slot);
                         if length_extra_bits != 0 {
                             writer
-                                .try_write_bits(length_extra, usize::from(length_extra_bits))
-                                .map_err(Into::into)?;
+                                .write_admitted_bits(length_extra, usize::from(length_extra_bits));
                         }
                     }
                     EncodedMatch::New {
@@ -1900,34 +1894,26 @@ fn encode_token_block_with_allowance<B: Budget>(
                         distance_bit_count,
                     } => {
                         let (code, len) = main_table.code_for_present_symbol(262 + length_slot);
-                        writer
-                            .try_write_bits(usize::from(code), usize::from(len))
-                            .map_err(Into::into)?;
+                        writer.write_admitted_bits(usize::from(code), usize::from(len));
                         let length_extra_bits = length_slot_extra_bits(length_slot);
                         if length_extra_bits != 0 {
                             writer
-                                .try_write_bits(length_extra, usize::from(length_extra_bits))
-                                .map_err(Into::into)?;
+                                .write_admitted_bits(length_extra, usize::from(length_extra_bits));
                         }
                         let (code, len) = distance_table.code_for_present_symbol(distance_slot);
-                        writer
-                            .try_write_bits(usize::from(code), usize::from(len))
-                            .map_err(Into::into)?;
+                        writer.write_admitted_bits(usize::from(code), usize::from(len));
                         if distance_bit_count >= 4 {
                             if distance_bit_count > 4 {
-                                writer
-                                    .try_write_bits(distance_extra >> 4, distance_bit_count - 4)
-                                    .map_err(Into::into)?;
+                                writer.write_admitted_bits(
+                                    distance_extra >> 4,
+                                    distance_bit_count - 4,
+                                );
                             }
                             let (code, len) =
                                 align_table.code_for_present_symbol(distance_extra & 0x0f);
-                            writer
-                                .try_write_bits(usize::from(code), usize::from(len))
-                                .map_err(Into::into)?;
+                            writer.write_admitted_bits(usize::from(code), usize::from(len));
                         } else if distance_bit_count != 0 {
-                            writer
-                                .try_write_bits(distance_extra, distance_bit_count)
-                                .map_err(Into::into)?;
+                            writer.write_admitted_bits(distance_extra, distance_bit_count);
                         }
                     }
                 }
@@ -1936,7 +1922,7 @@ fn encode_token_block_with_allowance<B: Budget>(
         }
     }
 
-    let payload_bits = writer.bit_pos;
+    debug_assert_eq!(writer.bit_pos, payload_bits);
     encode_compressed_block_with_allowance(&writer.bytes, payload_bits, true, is_last, allowance)
 }
 
@@ -2245,7 +2231,18 @@ fn token_stream_bits<B: Budget>(
         0
     };
     let allowance = lengths.main.allowance();
-    let (_, mut bits) = encode_table_slices(lengths.slices(), version, &allowance)?;
+    let (_, bits) = encode_table_slices(lengths.slices(), version, &allowance)?;
+    token_stream_bits_after_tables(tokens, filters, lengths, distance_size, bits)
+}
+
+fn token_stream_bits_after_tables<B: Budget>(
+    tokens: &[EncodeToken],
+    filters: &[EncodeFilter],
+    lengths: &EncoderLengths<B>,
+    distance_size: usize,
+    mut bits: usize,
+) -> Result<usize> {
+    let allowance = lengths.main.allowance();
     let prices = TokenPrices {
         lengths: lengths.slices(),
     };
@@ -4293,6 +4290,10 @@ impl<B: Budget> BitWriter<B> {
     ) -> std::result::Result<(), B::Failure> {
         self.bytes
             .write_msb_bits(&mut self.bit_pos, value as u64, count)
+    }
+    fn write_admitted_bits(&mut self, value: usize, count: usize) {
+        self.bytes
+            .write_msb_bits_admitted(&mut self.bit_pos, value as u64, count);
     }
 }
 
