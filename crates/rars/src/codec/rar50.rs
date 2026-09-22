@@ -2413,10 +2413,10 @@ fn price_optimal_paths(
         if index < committed_through {
             continue;
         }
+        // Every priced position extends a literal path to its successor;
+        // a committed match skips only to an already priced endpoint. Blocks
+        // are at most 1 MiB, so even all 15-bit literals stay below u32::MAX.
         let here = price[index];
-        if here == u32::MAX {
-            continue;
-        }
         let literal_cost = prices.map_or(ESTIMATED_LITERAL_COST, |prices| {
             prices.literal(combined[pos]) as u32
         });
