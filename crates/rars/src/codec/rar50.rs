@@ -7656,6 +7656,61 @@ mod tests {
     }
 
     #[test]
+    fn decoders_report_truncated_match_extra_bits() {
+        for (length_slot, distance_slot, packed) in [
+            // Seven literals and a new match. Main symbol 270 means length
+            // slot 8, which needs one more bit.
+            (8, 0, 0b0000_0001),
+            // Six literals, a new match, and distance slot 4. Its extra bit
+            // is absent after the one-bit distance code.
+            (0, 4, 0b0000_0010),
+        ] {
+            let mut lengths = TableLengths {
+                main: vec![0; MAIN_TABLE_SIZE],
+                distance: vec![0; DISTANCE_TABLE_SIZE_50],
+                align: vec![0; ALIGN_TABLE_SIZE],
+                length: vec![0; LENGTH_TABLE_SIZE],
+            };
+            lengths.main[b'A' as usize] = 1;
+            lengths.main[262 + length_slot] = 1;
+            lengths.distance[distance_slot] = 1;
+            let (tables, table_bits) = encode_table_lengths_with_bit_count(&lengths, 0).unwrap();
+            let mut input = encode_compressed_block(&tables, table_bits, true, false).unwrap();
+            input.extend(encode_compressed_block(&[packed], 8, false, true).unwrap());
+
+            let mut buffered = Unpack50Decoder::new();
+            let mut cursor = std::io::Cursor::new(&input);
+            assert_eq!(
+                buffered.decode_member_from_reader_with_dictionary(
+                    &mut cursor,
+                    0,
+                    12,
+                    DEFAULT_DICTIONARY_SIZE,
+                    false,
+                    DecodeMode::Lz,
+                ),
+                Err(Error::NeedMoreInput),
+                "length slot {length_slot}, distance slot {distance_slot}"
+            );
+            assert!(buffered.tables.is_none()); // Error occurred before the block completed.
+            let mut streaming = Unpack50Decoder::new();
+            let result = streaming.decode_member_from_reader_with_dictionary_to_sink(
+                &mut input.as_slice(),
+                0,
+                12,
+                DEFAULT_DICTIONARY_SIZE,
+                false,
+                |_chunk| Ok::<(), std::convert::Infallible>(()),
+            );
+            assert!(matches!(
+                result,
+                Err(StreamDecodeError::Decode(Error::NeedMoreInput))
+            ));
+            assert!(streaming.tables.is_none());
+        }
+    }
+
+    #[test]
     fn decodes_length_slots() {
         assert_eq!(slot_to_length(0, 0).unwrap(), 2);
         assert_eq!(slot_to_length(7, 0).unwrap(), 9);
