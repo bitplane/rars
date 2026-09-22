@@ -4844,6 +4844,25 @@ mod tests {
     }
 
     #[test]
+    fn streaming_block_encode_errors_release_first_and_shared_search_state() {
+        let data = b"ABCD";
+        let blocks = [(2, false), (4, true)];
+        let expected = Error::InvalidData("RAR 5 unknown compression algorithm version");
+        for (optimal, history) in [(true, &b""[..]), (true, &b"prior"[..]), (false, &b""[..])] {
+            let allowance = Allowance::limited(32 * 1024 * 1024);
+            let options = EncodeOptions::new(0).with_optimal_parse(optimal);
+            assert_eq!(
+                streaming_blocks_with_allowance(
+                    data, history, &blocks, 2, options, None, &allowance,
+                ),
+                Err(expected.clone()),
+                "optimal={optimal}, history={history:?}"
+            );
+            assert_eq!(allowance.used(), 0);
+        }
+    }
+
+    #[test]
     fn empty_streaming_member_has_no_blocks_or_progress() {
         let options = EncodeOptions::new(0).with_optimal_parse(true);
         let allowance = Allowance::limited(0);
