@@ -69,6 +69,28 @@ fn rar50_member_encoder_rejects_filter_ranges_outside_input_in_both_size_paths()
     }
 }
 
+#[test]
+fn large_rar50_member_routes_reject_unknown_version_without_committing_history() {
+    let data = vec![b'A'; 64 * 1024 + 1];
+    let expected_error =
+        rars::codec::Error::InvalidData("RAR 5 unknown compression algorithm version");
+    let retry = b"ABABABAB";
+    let expected_retry = rars::codec::rar50::Unpack50Encoder::new()
+        .encode_member(retry, 0)
+        .unwrap();
+
+    for filtered in [false, true] {
+        let mut encoder = rars::codec::rar50::Unpack50Encoder::new();
+        let result = if filtered {
+            encoder.encode_member_with_filter(&data, 2, rars::FilterSpec::whole(FilterKind::E8))
+        } else {
+            encoder.encode_member(&data, 2)
+        };
+        assert_eq!(result, Err(expected_error.clone()), "filtered={filtered}");
+        assert_eq!(encoder.encode_member(retry, 0).unwrap(), expected_retry);
+    }
+}
+
 fn service_names(archive: &Archive) -> Vec<String> {
     archive
         .services()
