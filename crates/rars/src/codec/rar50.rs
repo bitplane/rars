@@ -7615,6 +7615,47 @@ mod tests {
     }
 
     #[test]
+    fn decoders_reject_invalid_packed_huffman_symbol() {
+        let mut lengths = TableLengths {
+            main: vec![0; MAIN_TABLE_SIZE],
+            distance: vec![0; DISTANCE_TABLE_SIZE_50],
+            align: vec![0; ALIGN_TABLE_SIZE],
+            length: vec![0; LENGTH_TABLE_SIZE],
+        };
+        lengths.main[b'A' as usize] = 1; // Only the zero bit names a symbol.
+        let (bytes, bit_pos) = encode_table_lengths_with_bit_count(&lengths, 0).unwrap();
+        let mut writer = BitWriter {
+            bytes: Buffer::from_vec(bytes),
+            bit_pos,
+        };
+        writer.write_bits(0x7fff, 15); // No prefix can name 'A'.
+        let payload_bits = writer.bit_pos;
+        let input = encode_compressed_block(&writer.finish(), payload_bits, true, true).unwrap();
+        let expected = Error::InvalidData("RAR 5 invalid Huffman code");
+
+        assert_eq!(
+            Unpack50Decoder::new().decode_member_with_dictionary(
+                &input,
+                0,
+                1,
+                DEFAULT_DICTIONARY_SIZE,
+                false,
+                DecodeMode::LiteralOnly,
+            ),
+            Err(expected.clone())
+        );
+        let result = Unpack50Decoder::new().decode_member_from_reader_with_dictionary_to_sink(
+            &mut input.as_slice(),
+            0,
+            1,
+            DEFAULT_DICTIONARY_SIZE,
+            false,
+            |_chunk| Ok::<(), std::convert::Infallible>(()),
+        );
+        assert!(matches!(result, Err(StreamDecodeError::Decode(error)) if error == expected));
+    }
+
+    #[test]
     fn decodes_length_slots() {
         assert_eq!(slot_to_length(0, 0).unwrap(), 2);
         assert_eq!(slot_to_length(7, 0).unwrap(), 9);
