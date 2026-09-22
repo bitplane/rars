@@ -5045,6 +5045,79 @@ mod tests {
     }
 
     #[test]
+    fn token_block_budget_refusals_release_all_encoder_owners() {
+        let base = [
+            EncodeToken::Literal(b'A'),
+            EncodeToken::Literal(b'B'),
+            EncodeToken::Match {
+                length: 2,
+                distance: 2,
+            },
+            EncodeToken::Match {
+                length: 2,
+                distance: 2,
+            },
+            EncodeToken::Match {
+                length: 3,
+                distance: 2,
+            },
+        ];
+
+        for filtered in [false, true] {
+            let mut tokens = Vec::new();
+            if filtered {
+                tokens.push(EncodeToken::Filter(EncodeFilter {
+                    offset: 0,
+                    length: 9,
+                    filter_type: FilterType::E8,
+                    channels: 0,
+                }));
+            }
+            tokens.extend_from_slice(&base);
+            tokens.extend(std::iter::repeat_n(EncodeToken::Literal(b'A'), 100));
+            let expected = encode_token_block(&tokens, 0, DISTANCE_TABLE_SIZE_50, true).unwrap();
+            let mut decoded = b"ABABABABA".to_vec();
+            decoded.extend(std::iter::repeat_n(b'A', 100));
+            assert_eq!(decode_lz(&expected, 0, decoded.len()).unwrap(), decoded);
+
+            let mut limit = 0;
+            let mut refusals = 0;
+            let mut admitted = false;
+            for _ in 0..256 {
+                let allowance = Allowance::limited(limit);
+                match encode_token_block_with_allowance(
+                    &tokens,
+                    0,
+                    DISTANCE_TABLE_SIZE_50,
+                    true,
+                    &allowance,
+                ) {
+                    Err(Error::WorkspaceLimitExceeded(details)) => {
+                        refusals += 1;
+                        assert_eq!(allowance.used(), 0);
+                        let next = details.used + details.required;
+                        assert!(next > limit);
+                        limit = next;
+                    }
+                    Ok(encoded) => {
+                        assert_eq!(&*encoded, expected);
+                        drop(encoded);
+                        assert_eq!(allowance.used(), 0);
+                        admitted = true;
+                        break;
+                    }
+                    Err(error) => panic!("unexpected token block error: {error:?}"),
+                }
+            }
+            assert!(
+                admitted,
+                "token block did not fit after 256 admission thresholds"
+            );
+            assert!(refusals > 1);
+        }
+    }
+
+    #[test]
     fn parser_allowance_preserves_tokens_and_retains_the_returned_owner() {
         let data: Vec<_> = (0..8192u32)
             .map(|n| (n.wrapping_mul(71) ^ (n >> 4)) as u8)
