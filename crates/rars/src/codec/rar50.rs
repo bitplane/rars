@@ -512,15 +512,22 @@ fn encode_table_slices<B: Budget>(
         return Err(Error::InvalidData("RAR 5 table length count mismatch"));
     }
 
-    let mut flattened = Buffer::with_capacity(table_length_count(algorithm_version)?, allowance)?;
-    for &length in lengths
-        .main
-        .iter()
-        .chain(lengths.distance)
-        .chain(lengths.align)
-        .chain(lengths.length)
-    {
-        flattened.push(length).map_err(Into::into)?;
+    // The version and all four slice lengths were checked above. Fill the
+    // exact-sized table once, so copying its fields cannot request growth.
+    let mut flattened = Buffer::filled(
+        MAIN_TABLE_SIZE + distance_size + ALIGN_TABLE_SIZE + LENGTH_TABLE_SIZE,
+        0,
+        allowance,
+    )?;
+    let mut at = 0;
+    for field in [
+        lengths.main,
+        lengths.distance,
+        lengths.align,
+        lengths.length,
+    ] {
+        flattened[at..at + field.len()].copy_from_slice(field);
+        at += field.len();
     }
     for &length in flattened.iter() {
         if length > 15 {
