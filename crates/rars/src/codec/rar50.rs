@@ -4231,16 +4231,19 @@ impl<'a> BitReader<'a> {
     }
 
     fn read_bits(&mut self, count: u8) -> Result<u32> {
-        let end = self
-            .bit_pos
-            .checked_add(usize::from(count))
-            .ok_or(Error::NeedMoreInput)?;
-        if end > self.input.len() * 8 {
+        let count = usize::from(count);
+        let byte_pos = self.bit_pos / 8;
+        let bit_offset = self.bit_pos % 8;
+        // A read spans at most 33 bits after accounting for its starting
+        // offset. Compare that local byte span rather than multiplying the
+        // entire input length by eight, which can overflow for a huge slice.
+        let bytes_needed = (bit_offset + count).div_ceil(8);
+        if byte_pos > self.input.len() || bytes_needed > self.input.len() - byte_pos {
             return Err(Error::NeedMoreInput);
         }
 
         let mut value = 0u32;
-        let mut remaining = usize::from(count);
+        let mut remaining = count;
         while remaining != 0 {
             let byte = self.input[self.bit_pos / 8];
             let bit_offset = self.bit_pos % 8;
