@@ -8552,6 +8552,30 @@ mod tests {
     }
 
     #[test]
+    fn streaming_decoder_propagates_sink_failure_during_literal_flush() {
+        let data = vec![b'A'; STREAM_FLUSH_THRESHOLD];
+        let input = encode_literal_only(&data, 0).unwrap();
+        let mut decoder = Unpack50Decoder::new();
+        let mut calls = 0;
+        let error = decoder
+            .decode_member_from_reader_with_dictionary_to_sink(
+                &mut input.as_slice(),
+                0,
+                data.len(),
+                DEFAULT_DICTIONARY_SIZE,
+                false,
+                |_chunk| {
+                    calls += 1;
+                    Err("sink failed")
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, StreamDecodeError::Sink("sink failed")));
+        assert_eq!(calls, 1);
+        assert!(decoder.tables.is_none()); // The flush failed inside the literal loop.
+    }
+
+    #[test]
     fn streaming_decoder_rejects_filter_beyond_declared_output() {
         let data = b"\xe8\0\0\0\0plain text after call";
         let input = encode_lz_member_with_filter(data, crate::FilterKind::E8).unwrap();
