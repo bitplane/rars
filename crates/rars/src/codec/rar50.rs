@@ -7752,6 +7752,83 @@ mod tests {
     }
 
     #[test]
+    fn solid_decoders_report_truncated_repeat_length() {
+        let bootstrap = new_match_payload();
+        let bootstrap =
+            encode_compressed_block(&bootstrap, bootstrap.len() * 8, true, true).unwrap();
+
+        for (length_slot, packed) in [
+            (0, 0b0000_0001), // Seven literals and a repeat, without its length code.
+            (8, 0b0000_0010), // Six literals, repeat, length slot 8; extra bit absent.
+        ] {
+            let mut lengths = TableLengths {
+                main: vec![0; MAIN_TABLE_SIZE],
+                distance: vec![0; DISTANCE_TABLE_SIZE_50],
+                align: vec![0; ALIGN_TABLE_SIZE],
+                length: vec![0; LENGTH_TABLE_SIZE],
+            };
+            lengths.main[b'A' as usize] = 1;
+            lengths.main[258] = 1;
+            lengths.length[length_slot] = 1;
+            let (tables, table_bits) = encode_table_lengths_with_bit_count(&lengths, 0).unwrap();
+            let mut input = encode_compressed_block(&tables, table_bits, true, false).unwrap();
+            input.extend(encode_compressed_block(&[packed], 8, false, true).unwrap());
+
+            let mut buffered = Unpack50Decoder::new();
+            assert_eq!(
+                buffered
+                    .decode_member_with_dictionary(
+                        &bootstrap,
+                        0,
+                        4,
+                        DEFAULT_DICTIONARY_SIZE,
+                        false,
+                        DecodeMode::Lz,
+                    )
+                    .unwrap(),
+                b"ABAB"
+            );
+            assert_eq!(
+                buffered.decode_member_with_dictionary(
+                    &input,
+                    0,
+                    20,
+                    DEFAULT_DICTIONARY_SIZE,
+                    true,
+                    DecodeMode::Lz,
+                ),
+                Err(Error::NeedMoreInput)
+            );
+            assert!(buffered.tables.is_none());
+
+            let mut streaming = Unpack50Decoder::new();
+            streaming
+                .decode_member_from_reader_with_dictionary_to_sink(
+                    &mut bootstrap.as_slice(),
+                    0,
+                    4,
+                    DEFAULT_DICTIONARY_SIZE,
+                    false,
+                    |_chunk| Ok::<(), std::convert::Infallible>(()),
+                )
+                .unwrap();
+            let result = streaming.decode_member_from_reader_with_dictionary_to_sink(
+                &mut input.as_slice(),
+                0,
+                20,
+                DEFAULT_DICTIONARY_SIZE,
+                true,
+                |_chunk| Ok::<(), std::convert::Infallible>(()),
+            );
+            assert!(matches!(
+                result,
+                Err(StreamDecodeError::Decode(Error::NeedMoreInput))
+            ));
+            assert!(streaming.tables.is_none());
+        }
+    }
+
+    #[test]
     fn decodes_length_slots() {
         assert_eq!(slot_to_length(0, 0).unwrap(), 2);
         assert_eq!(slot_to_length(7, 0).unwrap(), 9);
