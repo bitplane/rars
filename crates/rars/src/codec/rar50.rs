@@ -2874,7 +2874,9 @@ fn best_match<B: Budget>(
     let mut best = None;
     let mut checked = 0usize;
     for distance in state.reps {
-        if distance == 0 || distance > max_distance {
+        // Remembered matches were admitted under this same distance limit at
+        // an earlier position, so only unfilled repeat slots need skipping.
+        if distance == 0 {
             continue;
         }
         let length = match_length(input, pos, distance, max_length);
