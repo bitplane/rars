@@ -535,7 +535,7 @@ fn encode_table_slices<B: Budget>(
     let mut writer = BitWriter::with_allowance(allowance);
     try_write_level_lengths(&mut writer, &level_lengths)?;
     for token in level_tokens.iter() {
-        let (code, len) = level_table.code_for_symbol(token.symbol)?;
+        let (code, len) = level_table.code_for_present_symbol(token.symbol);
         writer
             .try_write_bits(usize::from(code), usize::from(len))
             .map_err(Into::into)?;
@@ -1845,14 +1845,14 @@ fn encode_token_block_with_allowance<B: Budget>(
     for &token in tokens {
         match token {
             EncodeToken::Filter(filter) => {
-                let (code, len) = main_table.code_for_symbol(256)?;
+                let (code, len) = main_table.code_for_present_symbol(256);
                 writer
                     .try_write_bits(usize::from(code), usize::from(len))
                     .map_err(Into::into)?;
                 try_write_filter(&mut writer, filter)?;
             }
             EncodeToken::Literal(byte) => {
-                let (code, len) = main_table.code_for_symbol(byte as usize)?;
+                let (code, len) = main_table.code_for_present_symbol(byte as usize);
                 writer
                     .try_write_bits(usize::from(code), usize::from(len))
                     .map_err(Into::into)?;
@@ -1860,7 +1860,7 @@ fn encode_token_block_with_allowance<B: Budget>(
             EncodeToken::Match { length, distance } => {
                 match state.encode_match(length, distance, distance_size)? {
                     EncodedMatch::LastLengthRepeat => {
-                        let (code, len) = main_table.code_for_symbol(257)?;
+                        let (code, len) = main_table.code_for_present_symbol(257);
                         writer
                             .try_write_bits(usize::from(code), usize::from(len))
                             .map_err(Into::into)?;
@@ -1870,11 +1870,11 @@ fn encode_token_block_with_allowance<B: Budget>(
                         length_slot,
                         length_extra,
                     } => {
-                        let (code, len) = main_table.code_for_symbol(258 + index)?;
+                        let (code, len) = main_table.code_for_present_symbol(258 + index);
                         writer
                             .try_write_bits(usize::from(code), usize::from(len))
                             .map_err(Into::into)?;
-                        let (code, len) = length_table.code_for_symbol(length_slot)?;
+                        let (code, len) = length_table.code_for_present_symbol(length_slot);
                         writer
                             .try_write_bits(usize::from(code), usize::from(len))
                             .map_err(Into::into)?;
@@ -1892,7 +1892,7 @@ fn encode_token_block_with_allowance<B: Budget>(
                         distance_extra,
                         distance_bit_count,
                     } => {
-                        let (code, len) = main_table.code_for_symbol(262 + length_slot)?;
+                        let (code, len) = main_table.code_for_present_symbol(262 + length_slot);
                         writer
                             .try_write_bits(usize::from(code), usize::from(len))
                             .map_err(Into::into)?;
@@ -1902,7 +1902,7 @@ fn encode_token_block_with_allowance<B: Budget>(
                                 .try_write_bits(length_extra, usize::from(length_extra_bits))
                                 .map_err(Into::into)?;
                         }
-                        let (code, len) = distance_table.code_for_symbol(distance_slot)?;
+                        let (code, len) = distance_table.code_for_present_symbol(distance_slot);
                         writer
                             .try_write_bits(usize::from(code), usize::from(len))
                             .map_err(Into::into)?;
@@ -1912,7 +1912,8 @@ fn encode_token_block_with_allowance<B: Budget>(
                                     .try_write_bits(distance_extra >> 4, distance_bit_count - 4)
                                     .map_err(Into::into)?;
                             }
-                            let (code, len) = align_table.code_for_symbol(distance_extra & 0x0f)?;
+                            let (code, len) =
+                                align_table.code_for_present_symbol(distance_extra & 0x0f);
                             writer
                                 .try_write_bits(usize::from(code), usize::from(len))
                                 .map_err(Into::into)?;
@@ -4210,12 +4211,13 @@ impl<B: Budget> EncoderCodeTable<B> {
         }
         Ok(Self { symbols })
     }
-    fn code_for_symbol(&self, symbol: usize) -> Result<(u16, u8)> {
-        self.symbols
-            .get(symbol)
-            .copied()
-            .filter(|&(_, length)| length != 0)
-            .ok_or(Error::InvalidData("RAR 5 missing Huffman symbol"))
+    fn code_for_present_symbol(&self, symbol: usize) -> (u16, u8) {
+        // Both encoder callers build frequencies from the exact token stream
+        // they emit immediately afterwards. Every requested symbol therefore
+        // has a non-zero code in this fixed-size array.
+        debug_assert!(symbol < self.symbols.len());
+        debug_assert_ne!(self.symbols[symbol].1, 0);
+        self.symbols[symbol]
     }
 }
 
@@ -8514,6 +8516,14 @@ mod tests {
         assert_eq!(
             slot_to_length(104, 0),
             Err(Error::InvalidData("RAR 5 length slot is too large"))
+        );
+    }
+
+    #[test]
+    fn encoder_code_table_rejects_oversubscribed_lengths() {
+        assert_eq!(
+            EncoderCodeTable::from_lengths(&[1, 1, 1], &Allowance::default()).err(),
+            Some(Error::InvalidData("RAR 5 oversubscribed Huffman table"))
         );
     }
 
