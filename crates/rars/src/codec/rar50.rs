@@ -2512,15 +2512,12 @@ fn price_optimal_paths(
             }
         }
 
-        // The loop above has priced every run to its end, so the longest match
-        // here is already on the board. If it is long enough to commit to,
-        // stepping over the bytes it covers changes nothing except the work not
-        // done. Only step over a node the parse can actually reach: pricing a
-        // match can fail, and skipping to a node no path arrives at would leave
-        // the rest of the block unreachable and emitted as literals.
+        // A committed match is at least 512 bytes long. Even after the
+        // distance bonus, that length and every collected u32 distance fit
+        // their encoder tables, so the endpoint has already been priced.
         let longest_reach = reaches.iter().map(|&(_, length, _)| length).max();
         if let Some(reach) = longest_reach {
-            if reach >= NICE_MATCH_LENGTH && price[index + reach] != u32::MAX {
+            if reach >= NICE_MATCH_LENGTH {
                 committed_through = index + reach;
             }
         }
