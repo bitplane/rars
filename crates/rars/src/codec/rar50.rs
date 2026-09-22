@@ -8513,6 +8513,26 @@ mod tests {
     }
 
     #[test]
+    fn table_construction_and_stream_pricing_reject_invalid_tokens() {
+        let invalid = [EncodeToken::Match {
+            length: 1,
+            distance: 1,
+        }];
+        assert_eq!(
+            table_lengths_for_tokens(&invalid, DISTANCE_TABLE_SIZE_50).err(),
+            Some(Error::InvalidData("RAR 5 match length is too short"))
+        );
+
+        let lengths =
+            table_lengths_for_tokens(&[EncodeToken::Literal(b'A')], DISTANCE_TABLE_SIZE_50)
+                .unwrap();
+        assert_eq!(
+            token_stream_bits(&invalid, &[], &lengths, DISTANCE_TABLE_SIZE_50),
+            Err(Error::InvalidData("RAR 5 match length is too short"))
+        );
+    }
+
+    #[test]
     fn distance_slots_beyond_native_address_width_use_out_of_window_sentinel() {
         for (slot, extra, distance) in [
             (63, (1u32 << 30) - 1, 1u64 << 32),
