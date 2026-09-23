@@ -34,6 +34,11 @@ const CMULTIV_R05: &[u8] = include_bytes!("fixtures/rar13/CMULTIV.R05");
 const CMULTIV_R06: &[u8] = include_bytes!("fixtures/rar13/CMULTIV.R06");
 const RAR140_NOAV: &[u8] = include_bytes!("fixtures/rar13/rar140_av/rar140_noav_baseline.rar");
 const RAR140_AV: &[u8] = include_bytes!("fixtures/rar13/rar140_av/rar140_av_patched.rar");
+const ENCRYPTED_SPLIT: [&[u8]; 3] = [
+    include_bytes!("fixtures/rar13/encrypted_split/ESPLIT.RAR"),
+    include_bytes!("fixtures/rar13/encrypted_split/ESPLIT.R00"),
+    include_bytes!("fixtures/rar13/encrypted_split/ESPLIT.R01"),
+];
 
 struct CollectWriter {
     data: Rc<RefCell<Vec<u8>>>,
@@ -75,6 +80,31 @@ fn ignores_a_cleared_solid_flag() {
     assert_eq!(extracted.len(), 2);
     assert_eq!(extracted[0].data.len(), 2700);
     assert_eq!(extracted[1].data, extracted[0].data);
+}
+
+#[test]
+fn decrypts_a_rar1402_compressed_member_across_volume_boundaries() {
+    let volumes: Vec<_> = ENCRYPTED_SPLIT
+        .iter()
+        .map(|part| Archive::parse(part).unwrap())
+        .collect();
+    assert!(volumes
+        .iter()
+        .all(|volume| volume.entries[0].is_encrypted()));
+    assert!(volumes.iter().all(|volume| !volume.entries[0].is_stored()));
+
+    let extracted = collect_extract_volumes(&volumes, Some(b"password")).unwrap();
+    assert_eq!(extracted.len(), 1);
+    assert_eq!(extracted[0].name, b"SOURCE.TXT");
+    assert_eq!(extracted[0].data, CMULTI_EXPECTED[..32768]);
+    assert_eq!(
+        collect_extract_volumes(&volumes, None).unwrap_err(),
+        Error::NeedPassword
+    );
+    assert_eq!(
+        collect_extract_volumes(&volumes, Some(b"wrong")).unwrap_err(),
+        Error::WrongPasswordOrCorruptData
+    );
 }
 
 fn collect_extract(

@@ -1338,7 +1338,7 @@ impl PendingSplitRefs {
         &self,
         volumes: &'a [Archive],
         password: Option<&'a [u8]>,
-    ) -> Result<ChainedReader<'a>> {
+    ) -> Result<Box<dyn Read + 'a>> {
         let mut readers = Vec::with_capacity(self.fragments.len());
         for &(volume_index, entry_index) in &self.fragments {
             let archive = volumes
@@ -1348,18 +1348,20 @@ impl PendingSplitRefs {
                 .entries
                 .get(entry_index)
                 .ok_or(Error::InvalidHeader("RAR 1.3 split entry is missing"))?;
-            let reader = archive.range_reader(entry.packed_range.clone())?;
-            if entry.is_encrypted() {
-                let password = password.ok_or(Error::NeedPassword)?;
-                readers.push(
-                    Box::new(Rar13DecryptReader::new(reader, Rar13Cipher::new(password)))
-                        as Box<dyn Read + 'a>,
-                );
-            } else {
-                readers.push(reader);
-            }
+            readers.push(archive.range_reader(entry.packed_range.clone())?);
         }
-        Ok(ChainedReader { readers, index: 0 })
+        let chained = ChainedReader { readers, index: 0 };
+        if self.was_encrypted {
+            let password = password.ok_or(Error::NeedPassword)?;
+            // RAR 1.402 encrypts the logical packed stream continuously across
+            // split volumes; restarting the cipher at each part corrupts it.
+            Ok(Box::new(Rar13DecryptReader::new(
+                chained,
+                Rar13Cipher::new(password),
+            )))
+        } else {
+            Ok(Box::new(chained))
+        }
     }
 }
 
