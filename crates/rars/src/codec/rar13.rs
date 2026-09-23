@@ -3246,4 +3246,47 @@ mod solid_regressions {
             ))
         );
     }
+
+    #[test]
+    fn decoder_reads_far_short_match_token() {
+        let mut encoder = Unpack15Encoder::new();
+        encoder.emit_short_lz_code(14).unwrap();
+        emit_decode_num(&mut encoder.bits, 0, 3, DEC_L2, POS_L2).unwrap();
+        encoder.bits.write_bits(0, 15);
+
+        let mut decoder = Unpack15::new();
+        decoder.bits = BitReader::new(&encoder.bits.finish());
+        // Buf60 lengthens the earlier 0xA0 prefix; otherwise it shadows 0xB0.
+        decoder.buf60 = 1;
+        decoder.target = 0x8000 + 5;
+        decoder.output_written = 0x8000;
+        decoder.unp_ptr = 0x8000;
+        decoder.window[..5].copy_from_slice(b"abcde");
+        let mut output = Vec::new();
+        decoder.short_lz(&mut output).unwrap();
+        assert_eq!(output, b"abcde");
+        assert_eq!(decoder.token_stats.short_matches, 1);
+    }
+
+    #[test]
+    fn decoder_reads_stmode_short_match_token() {
+        let mut bits = BitWriter::new();
+        emit_decode_num(&mut bits, 0, 5, DEC_HF1, POS_HF1).unwrap();
+        bits.write_bits(0, 1); // ST-mode match rather than exit.
+        bits.write_bits(1, 1); // Four-byte match.
+        emit_decode_num(&mut bits, 0, 5, DEC_HF2, POS_HF2).unwrap();
+        bits.write_bits(1, 5); // Distance one.
+
+        let mut decoder = Unpack15::new();
+        decoder.bits = BitReader::new(&bits.finish());
+        decoder.st_mode = true;
+        decoder.target = 5;
+        decoder.output_written = 1;
+        decoder.unp_ptr = 1;
+        decoder.window[0] = b'A';
+        let mut output = Vec::new();
+        decoder.huff_decode(&mut output).unwrap();
+        assert_eq!(output, b"AAAA");
+        assert_eq!(decoder.token_stats.st_matches, 1);
+    }
 }
