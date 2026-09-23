@@ -2484,7 +2484,7 @@ mod tests {
     use crate::codec::rar13::{find_long_lz, LongLz};
     use std::cell::RefCell;
     use std::rc::Rc;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
     struct CollectWriter(Rc<RefCell<Vec<u8>>>);
 
@@ -4467,6 +4467,144 @@ mod tests {
             collect_extract_volumes(&archives, None).unwrap()[0].data,
             entry.data
         );
+    }
+
+    #[test]
+    fn final_archive_progress_report_can_cancel() {
+        struct CancelOnAdvance(AtomicBool);
+        impl WriteProgress for CancelOnAdvance {
+            fn report(&self, event: WriteProgressEvent<'_>) {
+                if matches!(event, WriteProgressEvent::Advanced { .. }) {
+                    self.0.store(true, Ordering::Relaxed);
+                }
+            }
+
+            fn is_cancelled(&self) -> bool {
+                self.0.load(Ordering::Relaxed)
+            }
+        }
+        let reporter = CancelOnAdvance(AtomicBool::new(false));
+        let error = write_streaming_archive_to(
+            &[],
+            WriterOptions::default(),
+            MemberCoding::Stored,
+            None,
+            &WriterResources::default(),
+            Some(&reporter),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert_eq!(error, Error::Cancelled);
+    }
+
+    #[test]
+    fn final_volume_progress_report_can_cancel() {
+        struct CancelOnFinalAdvance {
+            entry_finished: AtomicBool,
+            cancelled: AtomicBool,
+        }
+        impl WriteProgress for CancelOnFinalAdvance {
+            fn report(&self, event: WriteProgressEvent<'_>) {
+                match event {
+                    WriteProgressEvent::EntryFinished { .. } => {
+                        self.entry_finished.store(true, Ordering::Relaxed);
+                    }
+                    WriteProgressEvent::Advanced { .. }
+                        if self.entry_finished.load(Ordering::Relaxed) =>
+                    {
+                        self.cancelled.store(true, Ordering::Relaxed);
+                    }
+                    _ => {}
+                }
+            }
+
+            fn is_cancelled(&self) -> bool {
+                self.cancelled.load(Ordering::Relaxed)
+            }
+        }
+        let reporter = CancelOnFinalAdvance {
+            entry_finished: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+        };
+        let entry = FileEntry {
+            name: b"FINAL.TXT",
+            data: b"final progress cancellation final progress cancellation",
+            file_time: 0,
+            file_attr: 0x20,
+            password: None,
+            file_comment: None,
+        };
+        let error = write_compressed_volumes_with_progress(
+            entry,
+            WriterOptions::default(),
+            16,
+            Some(&reporter),
+        )
+        .unwrap_err();
+        assert_eq!(error, Error::Cancelled);
+        assert!(reporter.entry_finished.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn preservation_reports_unsupported_legacy_header_variants() {
+        let entry = StoredEntry {
+            name: b"DIR",
+            data: b"",
+            file_time: 0,
+            file_attr: 0x10,
+            password: None,
+            file_comment: None,
+        };
+        let bytes = write_stored_archive(&[entry], WriterOptions::default()).unwrap();
+        let base = Archive::parse(&bytes).unwrap();
+        assert!(base.rewrite_preservation_issues().is_empty());
+
+        for mutate in [
+            (|archive: &mut Archive| archive.main.flags |= MHD_PACK_COMMENT) as fn(&mut Archive),
+            |archive| archive.main.extra.push(0),
+            |archive| archive.entries[0].header.method = METHOD_BEST + 1,
+            |archive| archive.entries[0].header.flags |= LHD_SOLID,
+            |archive| archive.entries[0].header.unp_size = 1,
+        ] {
+            let mut archive = base.clone();
+            mutate(&mut archive);
+            assert!(!archive.rewrite_preservation_issues().is_empty());
+        }
+    }
+
+    #[test]
+    fn volume_extraction_keeps_solid_history_across_regular_members() {
+        let entries = [
+            FileEntry {
+                name: b"FIRST.TXT",
+                data: b"first member establishes solid history first member",
+                file_time: 0,
+                file_attr: 0x20,
+                password: None,
+                file_comment: None,
+            },
+            FileEntry {
+                name: b"SECOND.TXT",
+                data: b"first member establishes solid history plus a tail",
+                file_time: 0,
+                file_attr: 0x20,
+                password: None,
+                file_comment: None,
+            },
+        ];
+        let mut features = FeatureSet::store_only();
+        features.solid = true;
+        let bytes = write_compressed_archive(
+            &entries,
+            WriterOptions::new(ArchiveVersion::Rar14, features),
+        )
+        .unwrap();
+        let archive = Archive::parse(&bytes).unwrap();
+        let extracted = collect_extract_volumes(std::slice::from_ref(&archive), None).unwrap();
+        assert_eq!(extracted.len(), entries.len());
+        for (actual, entry) in extracted.iter().zip(entries) {
+            assert_eq!(actual.data, entry.data);
+        }
     }
 
     #[test]
