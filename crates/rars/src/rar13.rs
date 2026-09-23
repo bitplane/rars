@@ -2121,23 +2121,29 @@ fn encode_verified_rar15_payload_with_progress(
     options: Rar15EncodeOptions,
     progress: &mut dyn FnMut(usize) -> bool,
 ) -> Result<Option<Vec<u8>>> {
-    let mut candidates = rar15_encode_fallback_options(options).into_iter();
-    let Some(first) = candidates.next() else {
-        return Ok(None);
-    };
-    let packed = match unpack15_encode_with_options_and_progress(data, first, progress) {
-        Err(crate::codec::Error::Cancelled) => return Err(Error::Cancelled),
-        result => result?,
-    };
-    if unpack15_payload_matches(&packed, data)? {
-        return Ok(Some(packed));
-    }
-    for candidate_options in candidates {
-        let packed =
-            match unpack15_encode_with_options_and_progress(data, candidate_options, progress) {
-                Err(crate::codec::Error::Cancelled) => return Err(Error::Cancelled),
-                result => result?,
-            };
+    encode_verified_rar15_payload_using(
+        data,
+        options,
+        progress,
+        unpack15_encode_with_options_and_progress,
+    )
+}
+
+fn encode_verified_rar15_payload_using(
+    data: &[u8],
+    options: Rar15EncodeOptions,
+    progress: &mut dyn FnMut(usize) -> bool,
+    mut encode: impl FnMut(
+        &[u8],
+        Rar15EncodeOptions,
+        &mut dyn FnMut(usize) -> bool,
+    ) -> crate::codec::Result<Vec<u8>>,
+) -> Result<Option<Vec<u8>>> {
+    for candidate_options in rar15_encode_fallback_options(options) {
+        let packed = match encode(data, candidate_options, progress) {
+            Err(crate::codec::Error::Cancelled) => return Err(Error::Cancelled),
+            result => result?,
+        };
         if unpack15_payload_matches(&packed, data)? {
             return Ok(Some(packed));
         }
@@ -4317,6 +4323,69 @@ mod tests {
                 .root_cause(),
             Error::InvalidArgument("RAR 1.3 file header is longer than 65535 bytes")
         ));
+    }
+
+    #[test]
+    fn verified_encoder_retries_corrupt_payload_then_accepts_valid_fallback() {
+        let data = b"legacy archive payload legacy archive payload";
+        let valid = unpack15_encode(data).unwrap();
+        let options = Rar15EncodeOptions::new();
+        let mut attempts = 0;
+        let packed =
+            encode_verified_rar15_payload_using(data, options, &mut |_| true, |_, _, _| {
+                attempts += 1;
+                Ok(if attempts == 1 {
+                    Vec::new()
+                } else {
+                    valid.clone()
+                })
+            })
+            .unwrap();
+        assert_eq!(packed, Some(valid));
+        assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn verified_encoder_stores_when_every_candidate_fails_verification() {
+        let data = b"legacy archive payload";
+        let mut attempts = 0;
+        let packed = encode_verified_rar15_payload_using(
+            data,
+            Rar15EncodeOptions::new(),
+            &mut |_| true,
+            |_, _, _| {
+                attempts += 1;
+                Ok(Vec::new())
+            },
+        )
+        .unwrap();
+        assert_eq!(packed, None);
+        assert_eq!(
+            attempts,
+            rar15_encode_fallback_options(Rar15EncodeOptions::new()).len()
+        );
+    }
+
+    #[test]
+    fn verified_encoder_propagates_cancellation_during_fallback() {
+        let data = b"legacy archive payload";
+        let mut attempts = 0;
+        let error = encode_verified_rar15_payload_using(
+            data,
+            Rar15EncodeOptions::new(),
+            &mut |_| true,
+            |_, _, _| {
+                attempts += 1;
+                if attempts == 1 {
+                    Ok(Vec::new())
+                } else {
+                    Err(crate::codec::Error::Cancelled)
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, Error::Cancelled);
+        assert_eq!(attempts, 2);
     }
 
     #[test]
