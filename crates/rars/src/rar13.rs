@@ -1606,10 +1606,10 @@ fn write_archive_to(
             rar15_encode_fallback_options(encode_options).len() as u64
         };
     let total_work = total_bytes.saturating_mul(attempts);
-    let reporting = progress;
+    let reporting = &control as &dyn WriteProgress;
     report_compression_operation(reporting, true, total_work, members.len());
     let work = WorkTracker::new(
-        reporting.map(ProgressReporter),
+        Some(ProgressReporter(reporting)),
         WriteOperation::Compression,
         total_work,
     );
@@ -1891,7 +1891,7 @@ pub(crate) fn write_stored_volumes_with_progress(
         name: entry.name,
         unpacked: entry.data,
         packed: &body,
-        progress: progress.map(ProgressReporter),
+        progress: ProgressReporter(&control),
         file_time: entry.file_time,
         file_attr: entry.file_attr,
         method: METHOD_STORE,
@@ -1935,14 +1935,15 @@ pub fn write_compressed_volumes_with_progress(
     let encode_options = rar15_encode_options_for_level(options.compression_level)?;
     let total_work = (entry.data.len() as u64)
         .saturating_mul(rar15_encode_fallback_options(encode_options).len() as u64);
-    report_compression_operation(progress, true, total_work, 1);
+    let reporting = &control as &dyn WriteProgress;
+    report_compression_operation(reporting, true, total_work, 1);
     let work = WorkTracker::new(
         progress.map(ProgressReporter),
         WriteOperation::Compression,
         total_work,
     );
     report_compression_entry(
-        progress,
+        reporting,
         true,
         0,
         1,
@@ -1975,7 +1976,7 @@ pub fn write_compressed_volumes_with_progress(
         name: entry.name,
         unpacked: entry.data,
         packed: &packed,
-        progress: work.reporter(),
+        progress: ProgressReporter(&control),
         file_time: entry.file_time,
         file_attr: entry.file_attr,
         method,
@@ -1984,7 +1985,7 @@ pub fn write_compressed_volumes_with_progress(
         max_packed_per_volume,
     });
     report_compression_entry(
-        progress,
+        reporting,
         false,
         0,
         1,
@@ -1995,18 +1996,17 @@ pub fn write_compressed_volumes_with_progress(
     if !work.finish() {
         return Err(Error::Cancelled);
     }
-    report_compression_operation(progress, false, total_work, 1);
+    report_compression_operation(reporting, false, total_work, 1);
     work.check()?;
     Ok(result)
 }
 
 fn report_compression_operation(
-    progress: Option<&dyn WriteProgress>,
+    progress: &dyn WriteProgress,
     started: bool,
     total_bytes: u64,
     total_entries: usize,
 ) {
-    let Some(progress) = progress else { return };
     if started {
         progress.report(WriteProgressEvent::OperationStarted {
             operation: WriteOperation::Compression,
@@ -2025,14 +2025,13 @@ fn report_compression_operation(
 }
 
 fn report_compression_entry(
-    progress: Option<&dyn WriteProgress>,
+    progress: &dyn WriteProgress,
     started: bool,
     index: usize,
     total_entries: usize,
     member: &Member<'_>,
     input_bytes: usize,
 ) {
-    let Some(progress) = progress else { return };
     let name = member.name;
     let input_bytes = input_bytes as u64;
     if started {
@@ -2249,7 +2248,7 @@ fn write_file_header(out: &mut Vec<u8>, entry: FileEntryRecord<'_>) -> Result<()
 }
 
 struct SplitVolumeRecord<'a> {
-    progress: Option<ProgressReporter<'a>>,
+    progress: ProgressReporter<'a>,
     name: &'a [u8],
     unpacked: &'a [u8],
     packed: &'a [u8],
@@ -2262,7 +2261,7 @@ struct SplitVolumeRecord<'a> {
 }
 
 fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
-    crate::write_progress::check_cancelled(entry.progress)?;
+    crate::write_progress::check_cancelled(Some(entry.progress))?;
     if entry.max_packed_per_volume == 0 {
         return Err(Error::InvalidArgument(
             "RAR 1.3 volume payload size must be non-zero",
@@ -2281,7 +2280,7 @@ fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
 
     let mut volumes = Vec::with_capacity(chunks.len());
     for (index, chunk) in chunks.iter().enumerate() {
-        crate::write_progress::check_cancelled(entry.progress)?;
+        crate::write_progress::check_cancelled(Some(entry.progress))?;
         let split_before = index > 0;
         let split_after = index + 1 < chunks.len();
         let mut flags = entry.base_flags;
@@ -2317,14 +2316,12 @@ fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
         .map_err(|error| {
             crate::write_stream::member_error(error, entry.name, "writing volume member")
         })?;
-        if let Some(progress) = entry.progress {
-            progress.report(WriteProgressEvent::VolumeFinished {
-                volume_number: index + 1,
-                total_volumes: Some(chunks.len()),
-                bytes: out.len() as u64,
-            });
-        }
-        crate::write_progress::check_cancelled(entry.progress)?;
+        entry.progress.report(WriteProgressEvent::VolumeFinished {
+            volume_number: index + 1,
+            total_volumes: Some(chunks.len()),
+            bytes: out.len() as u64,
+        });
+        crate::write_progress::check_cancelled(Some(entry.progress))?;
         volumes.push(out);
     }
 
@@ -2777,6 +2774,29 @@ mod tests {
             Err(Error::InvalidHeader(
                 "RAR 1.3 split entry requires multivolume extraction"
             ))
+        );
+    }
+
+    #[test]
+    fn controlled_extraction_rejects_split_member_without_volume_set() {
+        let entry = StoredEntry {
+            name: b"split.bin",
+            data: b"abcdefghijklmnopqrstuvwxyz",
+            file_time: 0,
+            file_attr: 0x20,
+            password: None,
+            file_comment: None,
+        };
+        let volumes = write_stored_volumes(entry, WriterOptions::default(), 8).unwrap();
+        let archive = crate::Archive::Rar13(Archive::parse(&volumes[0]).unwrap());
+        let error = archive
+            .extract_with_control(crate::ArchiveReadOptions::new(), |_| {
+                Ok(crate::ExtractionDecision::Extract(Box::new(Vec::new())))
+            })
+            .unwrap_err();
+        assert_eq!(
+            error.root_cause(),
+            &Error::InvalidHeader("RAR 1.3 split entry requires multivolume extraction")
         );
     }
 
