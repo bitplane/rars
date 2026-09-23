@@ -345,8 +345,8 @@ impl Unpack15Encoder {
                         write_planned_flag_bits(&mut flags, flag_bits, flag);
                         flag_bits += flag.len();
                         pos = next_pos;
-                        plan_encoder.emit_payloads(vec![token])?;
-                        payloads.push(token);
+                        plan_encoder.emit_payloads(vec![token.into()])?;
+                        payloads.push(token.into());
                         continue;
                     }
                 }
@@ -443,7 +443,7 @@ impl Unpack15Encoder {
         pos: usize,
         buckets: &Rar13MatchFinder,
         state: LzPlanState,
-    ) -> Option<EncodedToken> {
+    ) -> Option<MatchToken> {
         let candidates = find_lz_tokens(input, pos, buckets, state, self.options);
         candidates
             .into_iter()
@@ -458,20 +458,11 @@ impl Unpack15Encoder {
             .map(|(token, _)| token)
     }
 
-    fn token_bit_cost(&self, token: EncodedToken, state: LzPlanState) -> Option<usize> {
+    fn token_bit_cost(&self, token: MatchToken, state: LzPlanState) -> Option<usize> {
         let flag_cost = token.flag_bits(state.nlzb, state.nhfb).len();
         match token {
-            EncodedToken::Literal(byte) => {
-                let place = self
-                    .ch_set
-                    .iter()
-                    .position(|&value| (value >> 8) as u8 == byte)?;
-                Some(flag_cost + self.literal_place_bit_cost(place)?)
-            }
-            EncodedToken::RepeatLast(_) => {
-                Some(flag_cost + self.repeat_last_bit_cost(state.l_count))
-            }
-            EncodedToken::ShortLz(token) => {
+            MatchToken::RepeatLast(_) => Some(flag_cost + self.repeat_last_bit_cost(state.l_count)),
+            MatchToken::ShortLz(token) => {
                 let distance_value = token.distance.checked_sub(1)?;
                 let distance_place = self
                     .ch_set_a
@@ -484,7 +475,7 @@ impl Unpack15Encoder {
                         + decode_num_bit_cost(distance_place as u32, 5, DEC_HF2, POS_HF2)?,
                 )
             }
-            EncodedToken::OldDist(token) => {
+            MatchToken::OldDist(token) => {
                 let length_code = old_dist_lz_length_code(
                     token.length,
                     token.distance,
@@ -498,7 +489,7 @@ impl Unpack15Encoder {
                         + decode_num_bit_cost(length_code, 2, DEC_L1, POS_L1)?,
                 )
             }
-            EncodedToken::LongLz(token) => {
+            MatchToken::LongLz(token) => {
                 let length_code = long_lz_length_code_for_distance(token, state.max_dist3)?;
                 let distance_place = self.long_lz_distance_place(token.distance).ok()?;
                 Some(
@@ -882,20 +873,6 @@ impl Unpack15Encoder {
             ))
     }
 
-    fn literal_place_bit_cost(&self, place: usize) -> Option<usize> {
-        if self.avr_plc > 0x75ff {
-            decode_num_bit_cost(place as u32, 8, DEC_HF4, POS_HF4)
-        } else if self.avr_plc > 0x5dff {
-            decode_num_bit_cost(place as u32, 6, DEC_HF3, POS_HF3)
-        } else if self.avr_plc > 0x35ff {
-            decode_num_bit_cost(place as u32, 5, DEC_HF2, POS_HF2)
-        } else if self.avr_plc > 0x0dff {
-            decode_num_bit_cost(place as u32, 5, DEC_HF1, POS_HF1)
-        } else {
-            decode_num_bit_cost(place as u32, 4, DEC_HF0, POS_HF0)
-        }
-    }
-
     fn long_lz_length_bit_cost(&self, length_code: u32) -> Option<usize> {
         if self.avr_ln2 >= 122 {
             decode_num_bit_cost(length_code, 3, DEC_L2, POS_L2)
@@ -1004,10 +981,18 @@ enum EncodedToken {
     LongLz(LongLz),
 }
 
-impl EncodedToken {
+/// Candidates from the match finder; literals take a separate planning path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatchToken {
+    ShortLz(ShortLz),
+    RepeatLast(RepeatLastLz),
+    OldDist(OldDistLz),
+    LongLz(LongLz),
+}
+
+impl MatchToken {
     fn length(self) -> u32 {
         match self {
-            Self::Literal(_) => 1,
             Self::ShortLz(token) => token.length,
             Self::RepeatLast(token) => token.length,
             Self::OldDist(token) => token.length,
@@ -1017,9 +1002,19 @@ impl EncodedToken {
 
     fn flag_bits(self, nlzb: u32, nhfb: u32) -> &'static [bool] {
         match self {
-            Self::Literal(_) => huff_flag_bits(nlzb <= nhfb),
             Self::LongLz(_) => long_lz_flag_bits(nlzb > nhfb),
             Self::ShortLz(_) | Self::RepeatLast(_) | Self::OldDist(_) => &[false, false],
+        }
+    }
+}
+
+impl From<MatchToken> for EncodedToken {
+    fn from(token: MatchToken) -> Self {
+        match token {
+            MatchToken::ShortLz(value) => Self::ShortLz(value),
+            MatchToken::RepeatLast(value) => Self::RepeatLast(value),
+            MatchToken::OldDist(value) => Self::OldDist(value),
+            MatchToken::LongLz(value) => Self::LongLz(value),
         }
     }
 }
@@ -1124,7 +1119,7 @@ fn find_lz_token(
     buckets: &Rar13MatchFinder,
     state: LzPlanState,
     options: EncodeOptions,
-) -> Option<EncodedToken> {
+) -> Option<MatchToken> {
     find_lz_tokens(input, pos, buckets, state, options)
         .into_iter()
         .next()
@@ -1136,10 +1131,10 @@ fn find_lz_tokens(
     buckets: &Rar13MatchFinder,
     state: LzPlanState,
     options: EncodeOptions,
-) -> Vec<EncodedToken> {
+) -> Vec<MatchToken> {
     let mut tokens = Vec::with_capacity(4);
     if let Some(repeat) = find_repeat_last_lz(input, pos, state.last_dist, state.last_length) {
-        tokens.push(EncodedToken::RepeatLast(repeat));
+        tokens.push(MatchToken::RepeatLast(repeat));
     }
     if options.old_distance_tokens {
         if let Some(old_lz) = find_old_dist_lz(
@@ -1149,11 +1144,11 @@ fn find_lz_tokens(
             state.old_dist_ptr,
             state.max_dist3,
         ) {
-            tokens.push(EncodedToken::OldDist(old_lz));
+            tokens.push(MatchToken::OldDist(old_lz));
         }
     }
     if let Some(short_lz) = find_short_lz(input, pos) {
-        tokens.push(EncodedToken::ShortLz(short_lz));
+        tokens.push(MatchToken::ShortLz(short_lz));
     }
     if let Some(long_lz) = find_long_lz_with_buckets(
         input,
@@ -1164,7 +1159,7 @@ fn find_lz_tokens(
     )
     .filter(|long_lz| long_lz_length_code_for_distance(*long_lz, state.max_dist3).is_some())
     {
-        tokens.push(EncodedToken::LongLz(long_lz));
+        tokens.push(MatchToken::LongLz(long_lz));
     }
     tokens
 }
@@ -1173,12 +1168,11 @@ fn should_lazy_emit_literal(
     input: &[u8],
     pos: usize,
     buckets: &Rar13MatchFinder,
-    current: EncodedToken,
+    current: MatchToken,
     max_dist3: u32,
     options: EncodeOptions,
 ) -> bool {
-    if !matches!(current, EncodedToken::ShortLz(_) | EncodedToken::LongLz(_))
-        || pos + 1 >= input.len()
+    if !matches!(current, MatchToken::ShortLz(_) | MatchToken::LongLz(_)) || pos + 1 >= input.len()
     {
         return false;
     }
@@ -1200,7 +1194,7 @@ fn should_lazy_emit_literal(
         options,
     );
     next.is_some_and(|next| {
-        matches!(next, EncodedToken::ShortLz(_) | EncodedToken::LongLz(_))
+        matches!(next, MatchToken::ShortLz(_) | MatchToken::LongLz(_))
             && next.length() >= current.length() + 2
     })
 }
@@ -2261,10 +2255,10 @@ mod tests {
     use super::{
         decode_num_bit_cost, find_long_lz, find_long_lz_with_buckets, find_lz_token,
         find_old_dist_lz, find_short_lz, flag_fits, long_lz_buckets, should_lazy_emit_literal,
-        unpack15_decode, unpack15_encode, unpack15_encode_with_options, EncodeOptions,
-        EncodedToken, LongLz, LzPlanState, OldDistLz, Rar13MatchFinder, ShortLz, Unpack15,
-        Unpack15Encoder, DEC_HF0, DEC_HF1, DEC_HF2, DEC_HF3, DEC_HF4, DEC_L1, DEC_L2, POS_HF0,
-        POS_HF1, POS_HF2, POS_HF3, POS_HF4, POS_L1, POS_L2,
+        unpack15_decode, unpack15_encode, unpack15_encode_with_options, EncodeOptions, LongLz,
+        LzPlanState, MatchToken, OldDistLz, Rar13MatchFinder, ShortLz, Unpack15, Unpack15Encoder,
+        DEC_HF0, DEC_HF1, DEC_HF2, DEC_HF3, DEC_HF4, DEC_L1, DEC_L2, POS_HF0, POS_HF1, POS_HF2,
+        POS_HF3, POS_HF4, POS_L1, POS_L2,
     };
 
     fn decode_num_prefix_is_stable(
@@ -2612,7 +2606,7 @@ mod tests {
 
         assert!(matches!(
             encoder.choose_lz_token(&input, 16, &buckets, encoder.lz_plan_state()),
-            Some(EncodedToken::LongLz(LongLz {
+            Some(MatchToken::LongLz(LongLz {
                 distance: 16,
                 length: 258,
             }))
@@ -2780,7 +2774,7 @@ mod tests {
 
         assert_eq!(
             token,
-            EncodedToken::OldDist(OldDistLz {
+            MatchToken::OldDist(OldDistLz {
                 distance: 33,
                 length: 20,
                 short_code: 11,
@@ -2881,7 +2875,7 @@ mod tests {
 
         assert!(matches!(
             token,
-            EncodedToken::ShortLz(super::ShortLz { length: 3, .. })
+            MatchToken::ShortLz(super::ShortLz { length: 3, .. })
         ));
         assert!(should_lazy_emit_literal(
             input,
@@ -2930,7 +2924,7 @@ mod tests {
 
         assert_eq!(
             token,
-            EncodedToken::ShortLz(ShortLz {
+            MatchToken::ShortLz(ShortLz {
                 distance: 1,
                 length: 10,
             })
