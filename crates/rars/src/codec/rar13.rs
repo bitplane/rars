@@ -1664,11 +1664,8 @@ impl Unpack15 {
     ) -> Result<()> {
         self.read_control.check_codec()?;
         self.init_member(target, solid);
-        self.bits = BitReader::new_final(input);
-        self.decode_loop(out).map_err(|error| match error {
-            Error::NeedMoreInput => Error::InvalidData("RAR 1.3 bitstream is truncated"),
-            error => error,
-        })
+        self.bits = BitReader::new(input);
+        self.decode_loop(out)
     }
 
     pub fn decode_member_from_reader(
@@ -1689,8 +1686,7 @@ impl Unpack15 {
         input
             .read_to_end(&mut packed)
             .map_err(|_| Error::InvalidData("RAR 1.3 input read failed"))?;
-        self.bits.append(&packed);
-        self.bits.finish();
+        self.bits = BitReader::new(&packed);
 
         while self.output_written < self.target {
             let chunk_target = self
@@ -1698,11 +1694,7 @@ impl Unpack15 {
                 .saturating_add(OUTPUT_CHUNK)
                 .min(self.target);
             let mut chunk = Vec::with_capacity(chunk_target - self.output_written);
-            self.decode_loop_until(chunk_target, &mut chunk)
-                .map_err(|error| match error {
-                    Error::NeedMoreInput => Error::InvalidData("RAR 1.3 bitstream is truncated"),
-                    error => error,
-                })?;
+            self.decode_loop_until(chunk_target, &mut chunk)?;
             out.write_all(&chunk)
                 .map_err(|_| Error::InvalidData("RAR 1.3 output write failed"))?;
         }
@@ -1812,7 +1804,7 @@ impl Unpack15 {
 
     fn short_lz(&mut self, out: &mut impl Write) -> Result<()> {
         self.num_huf = 0;
-        let mut bit_field = self.bits.get_bits()?;
+        let mut bit_field = self.bits.get_bits();
         if self.l_count == 2 {
             self.bits.add_bits(1);
             if bit_field >= 0x8000 {
@@ -1866,8 +1858,8 @@ impl Unpack15 {
             }
             if length == 14 {
                 self.l_count = 0;
-                length = self.decode_num(self.bits.get_bits()?, 3, DEC_L2, POS_L2) + 5;
-                let distance = (self.bits.get_bits()? >> 1) | 0x8000;
+                length = self.decode_num(self.bits.get_bits(), 3, DEC_L2, POS_L2) + 5;
+                let distance = (self.bits.get_bits() >> 1) | 0x8000;
                 self.bits.add_bits(15);
                 self.last_length = length;
                 self.last_dist = distance;
@@ -1884,7 +1876,7 @@ impl Unpack15 {
             let save_length = length;
             let distance =
                 self.old_dist[(self.old_dist_ptr.wrapping_sub((length - 9) as usize)) & 3];
-            length = self.decode_num(self.bits.get_bits()?, 2, DEC_L1, POS_L1) + 2;
+            length = self.decode_num(self.bits.get_bits(), 2, DEC_L1, POS_L1) + 2;
             if length == 0x101 && save_length == 10 {
                 self.buf60 ^= 1;
                 return Ok(());
@@ -1924,7 +1916,7 @@ impl Unpack15 {
         self.avr_ln1 -= self.avr_ln1 >> 4;
 
         let distance_place =
-            (self.decode_num(self.bits.get_bits()?, 5, DEC_HF2, POS_HF2) & 0xff) as usize;
+            (self.decode_num(self.bits.get_bits(), 5, DEC_HF2, POS_HF2) & 0xff) as usize;
         let mut distance = self.ch_set_a[distance_place] as u32;
         if distance_place > 0 {
             let last_distance = self.ch_set_a[distance_place - 1];
@@ -1951,7 +1943,7 @@ impl Unpack15 {
         }
         let old_avr2 = self.avr_ln2;
 
-        let bit_field = self.bits.get_bits()?;
+        let bit_field = self.bits.get_bits();
         let mut length = if self.avr_ln2 >= 122 {
             self.decode_num(bit_field, 3, DEC_L2, POS_L2)
         } else if self.avr_ln2 >= 64 {
@@ -1971,7 +1963,7 @@ impl Unpack15 {
         self.avr_ln2 += length;
         self.avr_ln2 -= self.avr_ln2 >> 5;
 
-        let bit_field = self.bits.get_bits()?;
+        let bit_field = self.bits.get_bits();
         let distance_place = if self.avr_plc_b > 0x28ff {
             self.decode_num(bit_field, 5, DEC_HF2, POS_HF2)
         } else if self.avr_plc_b > 0x06ff {
@@ -2002,7 +1994,7 @@ impl Unpack15 {
         self.ch_set_b[idx] = self.ch_set_b[new_distance_place];
         self.ch_set_b[new_distance_place] = distance as u16;
 
-        distance = ((distance & 0xff00) | (self.bits.get_bits()? >> 8)) >> 1;
+        distance = ((distance & 0xff00) | (self.bits.get_bits() >> 8)) >> 1;
         self.bits.add_bits(7);
 
         let old_avr3 = self.avr_ln3;
@@ -2040,7 +2032,7 @@ impl Unpack15 {
     }
 
     fn huff_decode(&mut self, out: &mut impl Write) -> Result<()> {
-        let bit_field = self.bits.get_bits()?;
+        let bit_field = self.bits.get_bits();
 
         let mut byte_place = if self.avr_plc > 0x75ff {
             self.decode_num(bit_field, 8, DEC_HF4, POS_HF4)
@@ -2059,7 +2051,7 @@ impl Unpack15 {
                 byte_place = 0x100;
             }
             if byte_place == 0 {
-                let bit_field = self.bits.get_bits()?;
+                let bit_field = self.bits.get_bits();
                 self.bits.add_bits(1);
                 if bit_field & 0x8000 != 0 {
                     self.num_huf = 0;
@@ -2069,8 +2061,8 @@ impl Unpack15 {
 
                 let length = if bit_field & 0x4000 != 0 { 4 } else { 3 };
                 self.bits.add_bits(1);
-                let mut distance = self.decode_num(self.bits.get_bits()?, 5, DEC_HF2, POS_HF2);
-                distance = (distance << 5) | (self.bits.get_bits()? >> 11);
+                let mut distance = self.decode_num(self.bits.get_bits(), 5, DEC_HF2, POS_HF2);
+                distance = (distance << 5) | (self.bits.get_bits() >> 11);
                 self.bits.add_bits(5);
                 #[cfg(test)]
                 {
@@ -2127,7 +2119,7 @@ impl Unpack15 {
     }
 
     fn get_flags_buf(&mut self) -> Result<()> {
-        let flags_place = self.decode_num(self.bits.get_bits()?, 5, DEC_HF2, POS_HF2) as usize;
+        let flags_place = self.decode_num(self.bits.get_bits(), 5, DEC_HF2, POS_HF2) as usize;
         if flags_place >= self.ch_set_c.len() {
             return Ok(());
         }
@@ -2402,6 +2394,20 @@ mod tests {
             .unwrap();
 
         assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn final_input_zero_pads_missing_bits_in_both_decode_paths() {
+        let mut decoder = Unpack15::new();
+        let direct = decoder.decode_member(&[], 8, false).unwrap();
+        assert_eq!(direct.len(), 8);
+
+        let mut decoder = Unpack15::new();
+        let mut from_reader = Vec::new();
+        decoder
+            .decode_member_from_reader(&mut &[][..], 8, false, &mut from_reader)
+            .unwrap();
+        assert_eq!(from_reader, direct);
     }
 
     #[test]
@@ -3010,7 +3016,6 @@ mod tests {
 struct BitReader {
     input: Vec<u8>,
     bit_pos: usize,
-    final_input: bool,
 }
 
 impl BitReader {
@@ -3018,49 +3023,18 @@ impl BitReader {
         Self {
             input: input.to_vec(),
             bit_pos: 0,
-            final_input: false,
         }
     }
 
-    fn new_final(input: &[u8]) -> Self {
-        Self {
-            input: input.to_vec(),
-            bit_pos: 0,
-            final_input: true,
-        }
-    }
-
-    fn append(&mut self, input: &[u8]) {
-        self.compact();
-        self.input.extend_from_slice(input);
-    }
-
-    fn finish(&mut self) {
-        self.final_input = true;
-    }
-
-    fn compact(&mut self) {
-        let bytes = self.bit_pos / 8;
-        if bytes == 0 {
-            return;
-        }
-        self.input.drain(..bytes);
-        self.bit_pos -= bytes * 8;
-    }
-
-    fn get_bits(&self) -> Result<u32> {
+    fn get_bits(&self) -> u32 {
         let mut value = 0u32;
         for i in 0..16 {
             value <<= 1;
             let bit_index = self.bit_pos + i;
-            let byte = match self.input.get(bit_index / 8).copied() {
-                Some(byte) => byte,
-                None if self.final_input => 0,
-                None => return Err(Error::NeedMoreInput),
-            };
+            let byte = self.input.get(bit_index / 8).copied().unwrap_or(0);
             value |= ((byte >> (7 - (bit_index % 8))) & 1) as u32;
         }
-        Ok(value)
+        value
     }
 
     fn add_bits(&mut self, count: usize) {
