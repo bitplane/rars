@@ -2849,6 +2849,13 @@ mod tests {
             bad_prefix.authenticity_verification(),
             Err(Error::InvalidHeader("RAR 1.3 AV prefix mismatch"))
         );
+
+        let mut truncated_payload = bad_prefix;
+        truncated_payload.main.extra[0..2].copy_from_slice(&7u16.to_le_bytes());
+        assert_eq!(
+            truncated_payload.authenticity_verification(),
+            Err(Error::TooShort)
+        );
     }
 
     #[test]
@@ -2927,6 +2934,14 @@ mod tests {
             collect_extract(&archive, None).unwrap()[0].data,
             b"hello rar 1.3"
         );
+
+        let mut truncated_comment = archive.entries[0].clone();
+        truncated_comment.extra = vec![5, 0, b'x'];
+        assert_eq!(truncated_comment.file_comment(), Err(Error::TooShort));
+        assert!(matches!(
+            archive.entries[0].verify_checksum(b"wrong data"),
+            Err(Error::CrcMismatch { .. })
+        ));
     }
 
     #[test]
@@ -3651,6 +3666,24 @@ mod tests {
         assert_eq!(
             err,
             Error::InvalidHeader("RAR 1.3 split entry compression method changed"),
+        );
+    }
+
+    #[test]
+    fn extract_volumes_to_rejects_split_version_and_encryption_drift() {
+        let bytes = split_volumes_for(b"split.bin", b"abcdefghijklmnopqrstuvwxyz");
+        let mut volumes = parse_volumes(&bytes);
+        volumes[1].entries[0].header.unp_ver += 1;
+        assert_eq!(
+            collect_extract_volumes(&volumes, None).unwrap_err(),
+            Error::InvalidHeader("RAR 1.3 split entry unpack version changed")
+        );
+
+        let mut volumes = parse_volumes(&bytes);
+        volumes[1].entries[0].header.flags ^= LHD_PASSWORD;
+        assert_eq!(
+            collect_extract_volumes(&volumes, None).unwrap_err(),
+            Error::InvalidHeader("RAR 1.3 split entry encryption flag changed")
         );
     }
 
