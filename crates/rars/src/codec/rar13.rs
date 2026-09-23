@@ -1217,10 +1217,8 @@ fn find_short_lz(input: &[u8], pos: usize) -> Option<ShortLz> {
         {
             length += 1;
         }
-        if length >= 2
-            && (length > best.length as usize
-                || (length == best.length as usize && distance < best.distance as usize))
-        {
+        // Distances increase, so the first match of a given length is nearest.
+        if length >= 2 && length > best.length as usize {
             best = ShortLz {
                 distance: distance as u32,
                 length: length as u32,
@@ -1398,10 +1396,8 @@ fn find_long_lz_with_buckets(
         {
             let length = super::fast::match_length(input, pos, distance, max_length);
             let min_length = if distance <= 256 { 11 } else { 3 };
-            if length >= min_length
-                && (length > best.length as usize
-                    || (length == best.length as usize && distance < best.distance as usize))
-            {
+            // Candidates arrive nearest first, so equal lengths cannot win.
+            if length >= min_length && length > best.length as usize {
                 best = LongLz {
                     distance: distance as u32,
                     length: length as u32,
@@ -3212,6 +3208,33 @@ mod solid_regressions {
         assert_eq!(find_long_lz(input, 9, 0), None);
         let buckets = long_lz_buckets(input);
         assert_eq!(find_long_lz_with_buckets(input, 9, 0, &buckets, 8), None);
+    }
+
+    #[test]
+    fn equal_length_match_candidates_keep_nearest_distance() {
+        let short = b"abcXabcYabcZ";
+        assert_eq!(
+            find_short_lz(short, 8),
+            Some(ShortLz {
+                distance: 4,
+                length: 3,
+            })
+        );
+
+        let prefix = b"abcdefghijkl";
+        let mut long = Vec::new();
+        for suffix in [b'X', b'Y', b'Z'] {
+            long.extend_from_slice(prefix);
+            long.push(suffix);
+        }
+        let buckets = long_lz_buckets(&long);
+        assert_eq!(
+            find_long_lz_with_buckets(&long, 26, 0x7fff, &buckets, 64),
+            Some(LongLz {
+                distance: 13,
+                length: 12,
+            })
+        );
     }
 
     #[test]
