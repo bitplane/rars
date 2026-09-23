@@ -2443,6 +2443,45 @@ mod tests {
         ));
         assert_eq!(reader.reads, [7]);
     }
+
+    #[test]
+    fn limited_header_admission_rejects_malformed_fixed_prefixes() {
+        let options = crate::ArchiveReadOptions::new().with_max_header_count(2);
+        let check = |prefix: &[u8], remaining, main| {
+            let mut budget = crate::parse_budget::ParseBudget::new(options);
+            super::admit_header(prefix, remaining, main, &mut budget, 0).unwrap_err()
+        };
+
+        let mut main = [0u8; super::MAIN_HEAD_SIZE as usize];
+        main[..4].copy_from_slice(super::RAR13_SIGNATURE);
+        main[4..6].copy_from_slice(&7u16.to_le_bytes());
+        assert_eq!(check(&main[..6], 7, true), Error::TooShort);
+        let mut wrong_signature = main;
+        wrong_signature[0] = 0;
+        assert_eq!(
+            check(&wrong_signature, 7, true),
+            Error::UnsupportedSignature
+        );
+        main[4..6].copy_from_slice(&6u16.to_le_bytes());
+        assert_eq!(
+            check(&main, 7, true),
+            Error::InvalidHeader("RAR 1.3 main header is shorter than 7 bytes")
+        );
+        main[4..6].copy_from_slice(&8u16.to_le_bytes());
+        assert_eq!(check(&main, 7, true), Error::TooShort);
+
+        let mut file = [0u8; super::FILE_HEAD_BASE_SIZE];
+        file[19] = 3;
+        file[10..12].copy_from_slice(&24u16.to_le_bytes());
+        assert_eq!(check(&file[..20], 24, false), Error::TooShort);
+        file[10..12].copy_from_slice(&23u16.to_le_bytes());
+        assert_eq!(
+            check(&file, 24, false),
+            Error::InvalidHeader("RAR 1.3 file header is shorter than its name")
+        );
+        file[10..12].copy_from_slice(&25u16.to_le_bytes());
+        assert_eq!(check(&file, 24, false), Error::TooShort);
+    }
     use super::*;
     use crate::codec::rar13::{find_long_lz, LongLz};
     use std::cell::RefCell;
@@ -3786,6 +3825,73 @@ mod tests {
 
         let err = Archive::parse_path(&path).unwrap_err();
         assert_eq!(err, Error::UnsupportedSignature);
+    }
+
+    #[test]
+    fn supplied_rar13_signature_and_file_length_are_checked() {
+        let entries = [StoredEntry {
+            name: b"member",
+            data: b"payload",
+            file_time: 0,
+            file_attr: 0x20,
+            password: None,
+            file_comment: None,
+        }];
+        let bytes = write_stored_archive(&entries, WriterOptions::default()).unwrap();
+        let signature = crate::detect_archive_family(&bytes).unwrap();
+        let dir = crate::scratch::case("rars-rar13-supplied-signature");
+        let path = dir.join("archive.rar");
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert_eq!(
+            Archive::parse_owned(bytes.clone()).unwrap().entries.len(),
+            1
+        );
+        assert_eq!(
+            Archive::parse_path_with_signature(&path, signature)
+                .unwrap()
+                .entries
+                .len(),
+            1
+        );
+        assert_eq!(
+            Archive::parse_path_with_signature_and_options(
+                &path,
+                crate::ArchiveSignature {
+                    family: ArchiveFamily::Rar15To40,
+                    ..signature
+                },
+                crate::ArchiveReadOptions::new(),
+            )
+            .unwrap_err(),
+            Error::UnsupportedSignature
+        );
+
+        let mut wrong_magic = bytes.clone();
+        wrong_magic[0] = 0;
+        std::fs::write(&path, &wrong_magic).unwrap();
+        assert_eq!(
+            Archive::parse_path_with_signature(&path, signature).unwrap_err(),
+            Error::UnsupportedSignature
+        );
+
+        let mut oversized_payload = bytes;
+        oversized_payload[7..11].copy_from_slice(&u32::MAX.to_le_bytes());
+        std::fs::write(&path, &oversized_payload).unwrap();
+        assert_eq!(
+            Archive::parse_owned(oversized_payload).unwrap_err(),
+            Error::TooShort
+        );
+        assert_eq!(
+            Archive::parse_path_with_signature(&path, signature).unwrap_err(),
+            Error::TooShort
+        );
+
+        std::fs::write(&path, crate::detect::RAR15_SIGNATURE).unwrap();
+        assert_eq!(
+            Archive::parse_path(&path).unwrap_err(),
+            Error::UnsupportedSignature
+        );
     }
 
     #[test]
