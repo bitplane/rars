@@ -962,9 +962,6 @@ impl Entry {
         password: Option<&[u8]>,
         out: &mut impl Write,
     ) -> Result<()> {
-        if !self.is_stored() {
-            return Err(Error::InvalidHeader("RAR 1.3 entry is not stored"));
-        }
         if self.is_encrypted() {
             let password = password.ok_or(Error::NeedPassword)?;
             let mut checksum = Rar13Checksum::new();
@@ -1012,7 +1009,7 @@ impl Entry {
         solid: bool,
         out: &mut impl Write,
     ) -> Result<()> {
-        if self.is_stored() || self.is_directory() {
+        if self.is_stored() {
             return self.write_stored_to(archive, password, out);
         }
         let mut checksum = Rar13Checksum::new();
@@ -3891,6 +3888,25 @@ mod tests {
         assert_eq!(outcome, crate::ExtractionOutcome::Complete);
         assert_eq!(seen, [b"docs".to_vec(), b"docs/readme.txt".to_vec()]);
         assert_eq!(&*output.borrow(), b"old archive data");
+    }
+
+    #[test]
+    fn directory_extraction_skips_payload_even_with_compressed_method() {
+        let entries = [StoredEntry {
+            name: b"DIR",
+            data: b"",
+            file_time: 0,
+            file_attr: 0x10,
+            password: None,
+            file_comment: None,
+        }];
+        let bytes = write_stored_archive(&entries, WriterOptions::default()).unwrap();
+        let mut archive = Archive::parse(&bytes).unwrap();
+        archive.entries[0].header.method = METHOD_BEST;
+        assert!(collect_extract(&archive, None).unwrap()[0].is_directory);
+        assert!(
+            collect_extract_volumes(std::slice::from_ref(&archive), None).unwrap()[0].is_directory
+        );
     }
 
     #[test]
