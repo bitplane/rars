@@ -3094,7 +3094,7 @@ impl BitWriter {
 
 #[cfg(test)]
 mod solid_regressions {
-    use super::{EncodeOptions, Unpack15, Unpack15Encoder};
+    use super::*;
 
     /// The options the RAR 1.3 writer uses at its default level.
     fn rar13_options() -> EncodeOptions {
@@ -3186,5 +3186,64 @@ mod solid_regressions {
                 assert_eq!(got, want, "member {index} did not survive the solid run");
             }
         }
+    }
+
+    #[test]
+    fn final_encoder_progress_report_can_cancel() {
+        let mut encoder = Unpack15Encoder::new();
+        let mut reports = Vec::new();
+        let error = encoder
+            .encode_member_with_progress(b"nonempty", &mut |position| {
+                reports.push(position);
+                reports.len() == 1
+            })
+            .unwrap_err();
+        assert_eq!(error, Error::Cancelled);
+        assert_eq!(reports, [8, 8]);
+    }
+
+    #[test]
+    fn literal_only_encoder_exits_stmode_without_literal_runs() {
+        let input: Vec<_> = (0..128).map(|index| (index * 73 + 19) as u8).collect();
+        let mut encoder =
+            Unpack15Encoder::with_options(EncodeOptions::new().with_stmode_literal_runs(false));
+        let packed = encoder.encode_literals_only_member(&input).unwrap();
+        assert_eq!(unpack15_decode(&packed, input.len()).unwrap(), input);
+    }
+
+    #[test]
+    fn long_match_search_rejects_zero_history_or_distance_budget() {
+        let input = b"repeated repeated";
+        assert_eq!(find_long_lz(input, 0, 16), None);
+        assert_eq!(find_long_lz(input, 9, 0), None);
+        let buckets = long_lz_buckets(input);
+        assert_eq!(find_long_lz_with_buckets(input, 9, 0, &buckets, 8), None);
+    }
+
+    #[test]
+    fn decoder_refuses_literal_past_declared_output_size() {
+        let mut decoder = Unpack15::new();
+        decoder.target = 0;
+        assert_eq!(
+            decoder.put_byte(b'x', &mut Vec::new()),
+            Err(Error::InvalidData("RAR 1.3 literal exceeds output size"))
+        );
+    }
+
+    #[test]
+    fn bit_symbol_encoders_reject_unrepresentable_values() {
+        let mut bits = super::BitWriter::new();
+        assert_eq!(
+            super::emit_long_lz_length(&mut bits, 0, 256),
+            Err(Error::InvalidData(
+                "RAR 1.3 LongLZ encoder length is not encodable"
+            ))
+        );
+        assert_eq!(
+            super::emit_decode_num(&mut bits, u32::MAX, 4, super::DEC_HF0, super::POS_HF0),
+            Err(Error::InvalidData(
+                "RAR 1.3 DecodeNum value is not encodable"
+            ))
+        );
     }
 }
