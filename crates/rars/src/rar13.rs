@@ -3934,6 +3934,84 @@ mod tests {
     }
 
     #[test]
+    fn volume_writer_rejects_empty_payload_for_both_codings() {
+        let stored = StoredEntry {
+            name: b"empty",
+            data: b"",
+            file_time: 0,
+            file_attr: 0x20,
+            password: None,
+            file_comment: None,
+        };
+        let compressed = FileEntry {
+            name: stored.name,
+            data: stored.data,
+            file_time: stored.file_time,
+            file_attr: stored.file_attr,
+            password: None,
+            file_comment: None,
+        };
+        for error in [
+            write_stored_volumes(stored, WriterOptions::default(), 1024).unwrap_err(),
+            write_compressed_volumes(compressed, WriterOptions::default(), 1024).unwrap_err(),
+        ] {
+            assert!(matches!(
+                error.root_cause(),
+                Error::InvalidArgument("RAR 1.3 volume writer needs a non-empty packed payload")
+            ));
+        }
+    }
+
+    #[test]
+    fn archive_comment_rejects_packed_output_beyond_header_field() {
+        let mut state = 0x1234_5678u32;
+        let comment: Vec<_> = (0..u16::MAX)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect();
+        let valid = write_stored_archive_with_comment(
+            &[],
+            WriterOptions::default(),
+            Some(&comment[..64755]),
+        )
+        .unwrap();
+        assert_eq!(
+            Archive::parse(&valid)
+                .unwrap()
+                .archive_comment()
+                .unwrap()
+                .unwrap(),
+            comment[..64755]
+        );
+        assert_eq!(
+            encode_archive_comment(Some(&comment[..64760]))
+                .unwrap()
+                .len(),
+            65530
+        );
+        assert_eq!(
+            write_stored_archive_with_comment(
+                &[],
+                WriterOptions::default(),
+                Some(&comment[..64760]),
+            )
+            .unwrap_err(),
+            Error::InvalidArgument("RAR 1.3 main header comment extension is too large")
+        );
+        let error =
+            write_stored_archive_with_comment(&[], WriterOptions::default(), Some(&comment))
+                .unwrap_err();
+        assert_eq!(
+            error,
+            Error::InvalidArgument("RAR 1.3 packed archive comment is longer than 65535 bytes")
+        );
+    }
+
+    #[test]
     fn supplied_rar13_signature_and_file_length_are_checked() {
         let entries = [StoredEntry {
             name: b"member",
