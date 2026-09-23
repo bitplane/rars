@@ -238,8 +238,7 @@ impl Unpack15Encoder {
         }
         self.bits = BitWriter::new();
         let mut pos = 0usize;
-        let mut straddle: Option<Straddle> = None;
-        while pos < input.len() || straddle.is_some() {
+        while pos < input.len() {
             let mut flags = 0u8;
             let mut flag_bits = 0usize;
             let mut payloads = Vec::new();
@@ -248,26 +247,12 @@ impl Unpack15Encoder {
             let mut plan_num_huf = self.num_huf;
             let mut group_enters_stmode = false;
 
-            if let Some(carried) = straddle.take() {
-                write_planned_flag_bits(&mut flags, 0, carried.rest);
-                flag_bits = carried.rest.len();
-                payloads.push(carried.token);
-                plan_num_huf += 1;
-                plan_huff_effect(&mut plan_nhfb, &mut plan_nlzb);
-            }
-
             while flag_bits < 8 && pos < input.len() {
+                // Literal-only planning can start with two-bit flags after a
+                // match-heavy solid member. Huffman updates only move that
+                // choice toward one-bit flags; the switch occurs after an
+                // even number of bits, so a flag cannot straddle the byte.
                 let flag = huff_flag_bits(plan_nlzb <= plan_nhfb);
-                if flag_bits + flag.len() > 8 {
-                    straddle = Some(split_flag(
-                        &mut flags,
-                        flag_bits,
-                        flag,
-                        EncodedToken::Literal(input[pos]),
-                    ));
-                    pos += 1;
-                    break;
-                }
                 write_planned_flag_bits(&mut flags, flag_bits, flag);
                 payloads.push(EncodedToken::Literal(input[pos]));
                 flag_bits += flag.len();
@@ -2406,6 +2391,36 @@ mod tests {
             let decoded = unpack15_decode(&packed, input.len()).unwrap();
             assert_eq!(decoded, input, "literal-only length {length}");
         }
+    }
+
+    #[test]
+    fn literal_only_encoder_follows_match_heavy_solid_history() {
+        let second: Vec<u8> = (0..96).map(|index| (index * 73 + 17) as u8).collect();
+        let first = match_heavy_payload(176, 8000);
+        let mut encoder =
+            Unpack15Encoder::with_options(EncodeOptions::new().with_lazy_matching(false));
+        let first_packed = encoder.encode_member(&first).unwrap();
+        assert!(
+            encoder.nlzb > encoder.nhfb,
+            "nlzb={} nhfb={}",
+            encoder.nlzb,
+            encoder.nhfb
+        );
+        let second_packed = encoder.encode_literals_only(&second).unwrap();
+
+        let mut decoder = Unpack15::new();
+        assert_eq!(
+            decoder
+                .decode_member(&first_packed, first.len(), false)
+                .unwrap(),
+            first
+        );
+        assert_eq!(
+            decoder
+                .decode_member(&second_packed, second.len(), true)
+                .unwrap(),
+            second
+        );
     }
 
     #[test]
