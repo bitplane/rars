@@ -2788,16 +2788,18 @@ mod tests {
             file_comment: None,
         };
         let volumes = write_stored_volumes(entry, WriterOptions::default(), 8).unwrap();
-        let archive = crate::Archive::Rar13(Archive::parse(&volumes[0]).unwrap());
-        let error = archive
-            .extract_with_control(crate::ArchiveReadOptions::new(), |_| {
-                Ok(crate::ExtractionDecision::Extract(Box::new(Vec::new())))
-            })
-            .unwrap_err();
-        assert_eq!(
-            error.root_cause(),
-            &Error::InvalidHeader("RAR 1.3 split entry requires multivolume extraction")
-        );
+        for volume in [&volumes[0], volumes.last().unwrap()] {
+            let archive = crate::Archive::Rar13(Archive::parse(volume).unwrap());
+            let error = archive
+                .extract_with_control(crate::ArchiveReadOptions::new(), |_| {
+                    Ok(crate::ExtractionDecision::Extract(Box::new(Vec::new())))
+                })
+                .unwrap_err();
+            assert_eq!(
+                error.root_cause(),
+                &Error::InvalidHeader("RAR 1.3 split entry requires multivolume extraction")
+            );
+        }
     }
 
     #[test]
@@ -4623,6 +4625,7 @@ mod tests {
             |archive| archive.main.extra.push(0),
             |archive| archive.entries[0].header.method = METHOD_BEST + 1,
             |archive| archive.entries[0].header.flags |= LHD_SOLID,
+            |archive| archive.entries[0].header.pack_size = 1,
             |archive| archive.entries[0].header.unp_size = 1,
         ] {
             let mut archive = base.clone();
