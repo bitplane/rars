@@ -2228,10 +2228,12 @@ fn write_file_entry(out: &mut Vec<u8>, entry: FileEntryRecord<'_>, packed: &[u8]
 
 fn write_file_header(out: &mut Vec<u8>, entry: FileEntryRecord<'_>) -> Result<()> {
     let head_size = FILE_HEAD_BASE_SIZE + entry.name.len() + entry.extra.len();
+    let head_size = u16::try_from(head_size)
+        .map_err(|_| Error::InvalidArgument("RAR 1.3 file header is longer than 65535 bytes"))?;
     out.extend_from_slice(&entry.packed_size.to_le_bytes());
     out.extend_from_slice(&entry.unpacked_size.to_le_bytes());
     out.extend_from_slice(&entry.file_crc.to_le_bytes());
-    out.extend_from_slice(&(head_size as u16).to_le_bytes());
+    out.extend_from_slice(&head_size.to_le_bytes());
     out.extend_from_slice(&entry.file_time.to_le_bytes());
     out.push(entry.file_attr);
     out.push(entry.flags);
@@ -4268,6 +4270,37 @@ mod tests {
             assert_eq!(error.kind(), expected);
             assert_eq!(error.entry_context(), Some((&b"SOURCE.BIN"[..], operation)));
         }
+    }
+
+    #[test]
+    fn file_comment_respects_the_total_file_header_limit() {
+        let max_comment_len = u16::MAX as usize - FILE_HEAD_BASE_SIZE - 1 - 2;
+        let comment = vec![b'x'; max_comment_len + 1];
+        let entry = StoredEntry {
+            name: b"f",
+            data: b"payload",
+            file_time: 0,
+            file_attr: 0x20,
+            password: None,
+            file_comment: Some(&comment[..max_comment_len]),
+        };
+        let valid = write_stored_archive(&[entry], WriterOptions::default()).unwrap();
+        let archive = Archive::parse(&valid).unwrap();
+        assert_eq!(
+            archive.entries[0].file_comment().unwrap(),
+            Some(comment[..max_comment_len].to_vec())
+        );
+
+        let oversized = StoredEntry {
+            file_comment: Some(&comment),
+            ..entry
+        };
+        assert!(matches!(
+            write_stored_archive(&[oversized], WriterOptions::default())
+                .unwrap_err()
+                .root_cause(),
+            Error::InvalidArgument("RAR 1.3 file header is longer than 65535 bytes")
+        ));
     }
 
     #[test]
