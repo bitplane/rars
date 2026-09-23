@@ -1459,6 +1459,8 @@ pub fn write_streaming_archive_to(
     progress: Option<&dyn WriteProgress>,
     output: &mut dyn Write,
 ) -> Result<()> {
+    // This is the only route to write_archive_to with caller-supplied resources;
+    // collect_archive always passes the unrestricted defaults.
     if resources.max_preparation_bytes().is_some() || resources.max_memory_bytes().is_some() {
         return Err(Error::UnsupportedFamilyFeature {
             family: options.target.family(),
@@ -1563,17 +1565,6 @@ fn write_archive_to(
     progress: Option<&dyn WriteProgress>,
     output: &mut dyn Write,
 ) -> Result<()> {
-    if resources.max_preparation_bytes().is_some() || resources.max_memory_bytes().is_some() {
-        return Err(Error::UnsupportedFamilyFeature {
-            family: options.target.family(),
-            feature: if resources.max_memory_bytes().is_some() {
-                "aggregate managed-memory limit"
-            } else {
-                "preparation memory quota"
-            },
-        });
-    }
-
     let control =
         crate::write_progress::ResourceProgress::new(resources, progress.map(ProgressReporter));
     let progress = Some(&control as &dyn WriteProgress);
@@ -3909,6 +3900,37 @@ mod tests {
             .rewrite_preservation_issues()
             .iter()
             .any(|issue| issue.contains("empty legacy archive")));
+    }
+
+    #[test]
+    fn streaming_writer_refuses_unsupported_aggregate_quotas_before_output() {
+        for (resources, feature) in [
+            (
+                WriterResources::default().with_max_preparation_bytes(0),
+                "preparation memory quota",
+            ),
+            (
+                WriterResources::default().with_max_memory_bytes(0),
+                "aggregate managed-memory limit",
+            ),
+        ] {
+            let mut output = Vec::new();
+            let error = write_streaming_archive_to(
+                &[],
+                WriterOptions::default(),
+                MemberCoding::Stored,
+                None,
+                &resources,
+                None,
+                &mut output,
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                Error::UnsupportedFamilyFeature { feature: actual, .. } if actual == feature
+            ));
+            assert!(output.is_empty());
+        }
     }
 
     #[test]
