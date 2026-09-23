@@ -3202,6 +3202,15 @@ mod solid_regressions {
     }
 
     #[test]
+    fn default_encoder_round_trips_low_rank_literal_history() {
+        let input = vec![b'x'; 4096];
+        let mut encoder = Unpack15Encoder::default();
+        let packed = encoder.encode_literals_only_member(&input).unwrap();
+        assert_eq!(unpack15_decode(&packed, input.len()).unwrap(), input);
+        assert!(encoder.avr_plc <= 0x0dff);
+    }
+
+    #[test]
     fn long_match_search_rejects_zero_history_or_distance_budget() {
         let input = b"repeated repeated";
         assert_eq!(find_long_lz(input, 0, 16), None);
