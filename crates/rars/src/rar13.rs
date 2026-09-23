@@ -4389,6 +4389,87 @@ mod tests {
     }
 
     #[test]
+    fn streaming_writer_detects_source_size_change_between_passes() {
+        struct ChangingLength(AtomicUsize);
+        impl crate::streaming::SourceFactory for ChangingLength {
+            fn len(&self) -> Result<u64> {
+                if self.0.fetch_add(1, Ordering::Relaxed) == 0 {
+                    Ok(3)
+                } else {
+                    Err(Error::SourceChanged("source size changed"))
+                }
+            }
+
+            fn open(&self) -> Result<Box<dyn crate::EntryReader>> {
+                unreachable!("changed source must fail before opening")
+            }
+        }
+        let entry = StreamingEntry::new(
+            b"CHANGED.BIN".to_vec(),
+            EntrySource::from_factory(ChangingLength(AtomicUsize::new(0))),
+        );
+        let error = write_streaming_archive_to(
+            &[entry],
+            WriterOptions::default(),
+            MemberCoding::Stored,
+            None,
+            &WriterResources::default(),
+            None,
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::SourceChanged);
+        assert_eq!(
+            error.entry_context(),
+            Some((&b"CHANGED.BIN"[..], "reading source"))
+        );
+    }
+
+    #[test]
+    fn compression_level_zero_writes_a_stored_member() {
+        let entry = FileEntry {
+            name: b"ZERO.TXT",
+            data: b"zero-level compression leaves these bytes stored",
+            file_time: 0,
+            file_attr: 0x20,
+            password: None,
+            file_comment: None,
+        };
+        let bytes =
+            write_compressed_archive(&[entry], WriterOptions::default().with_compression_level(0))
+                .unwrap();
+        let archive = Archive::parse(&bytes).unwrap();
+        assert!(archive.entries[0].is_stored());
+        assert_eq!(collect_extract(&archive, None).unwrap()[0].data, entry.data);
+    }
+
+    #[test]
+    fn solid_volume_writer_marks_every_fragment() {
+        let data = b"a stored member across several solid volumes".repeat(16);
+        let entry = FileEntry {
+            name: b"SOLID.TXT",
+            data: &data,
+            file_time: 0,
+            file_attr: 0x20,
+            password: None,
+            file_comment: None,
+        };
+        let mut features = FeatureSet::store_only();
+        features.solid = true;
+        let options = WriterOptions::new(ArchiveVersion::Rar14, features);
+        let volumes = write_compressed_volumes(entry, options, 8).unwrap();
+        assert!(volumes.len() > 1);
+        let archives = parse_volumes(&volumes);
+        assert!(archives
+            .iter()
+            .all(|archive| archive.entries[0].header.flags & LHD_SOLID != 0));
+        assert_eq!(
+            collect_extract_volumes(&archives, None).unwrap()[0].data,
+            entry.data
+        );
+    }
+
+    #[test]
     fn streaming_writer_rejects_directory_payload() {
         let entry = StreamingEntry::new(
             b"directory".to_vec(),
