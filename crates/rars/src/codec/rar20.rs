@@ -2443,6 +2443,27 @@ mod tests {
     }
 
     #[test]
+    fn decoder_reports_truncated_tables_and_member_payloads() {
+        let mut decoder = Unpack20::new();
+        assert_eq!(
+            decoder.decode_member(&[0], 1).unwrap_err(),
+            Error::InvalidData("RAR 2.0 bitstream is truncated")
+        );
+
+        let input = expected_text();
+        for packed in [
+            &AUTOREJ_PACKED[..1],
+            &AUTOREJ_PACKED[..AUTOREJ_PACKED.len() / 2],
+        ] {
+            let mut decoder = Unpack20::new();
+            assert_eq!(
+                decoder.decode_member(packed, input.len()).unwrap_err(),
+                Error::InvalidData("RAR 2.0 bitstream is truncated")
+            );
+        }
+    }
+
+    #[test]
     fn copy_match_zero_fills_an_offset_that_reaches_past_the_stream() {
         let mut decoder = Unpack20::new();
         decoder.output.extend_from_slice(b"AB");
