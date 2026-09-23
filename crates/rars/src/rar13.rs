@@ -4235,4 +4235,119 @@ mod tests {
         archive.main.extra[1] = inflated[1];
         assert_eq!(archive.archive_comment(), Err(Error::TooShort));
     }
+
+    #[test]
+    fn streaming_writer_attributes_source_size_failures() {
+        let missing = crate::scratch::case("rars-rar13-missing-source").join("absent");
+        for (source, expected, operation) in [
+            (
+                EntrySource::from_path(missing),
+                crate::ErrorKind::Io,
+                "reading source",
+            ),
+            (
+                EntrySource::from_opener(u64::from(u32::MAX) + 1, || {
+                    unreachable!("oversized source must fail before opening")
+                }),
+                crate::ErrorKind::InvalidArgument,
+                "preparing",
+            ),
+        ] {
+            let entry = StreamingEntry::new(b"SOURCE.BIN".to_vec(), source);
+            let mut output = Vec::new();
+            let error = write_streaming_archive_to(
+                &[entry],
+                WriterOptions::default(),
+                MemberCoding::Stored,
+                None,
+                &WriterResources::default(),
+                None,
+                &mut output,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), expected);
+            assert_eq!(error.entry_context(), Some((&b"SOURCE.BIN"[..], operation)));
+        }
+    }
+
+    #[test]
+    fn streaming_writer_rejects_directory_payload() {
+        let entry = StreamingEntry::new(
+            b"directory".to_vec(),
+            EntrySource::from_bytes(b"unexpected payload".to_vec()),
+        )
+        .with_file_attr(0x10);
+        let error = write_streaming_archive_to(
+            &[entry],
+            WriterOptions::default(),
+            MemberCoding::Stored,
+            None,
+            &WriterResources::default(),
+            None,
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.root_cause(),
+            Error::InvalidArgument("RAR1.3/1.4 directories must have no payload")
+        ));
+        assert_eq!(
+            error.entry_context(),
+            Some((&b"directory"[..], "preparing"))
+        );
+    }
+
+    #[test]
+    fn compressed_volumes_report_each_volume_and_honor_cancellation() {
+        let data = b"a repeated sequence of archive bytes ".repeat(64);
+        let entry = FileEntry {
+            name: b"VOL.TXT",
+            data: &data,
+            file_time: 0,
+            file_attr: 0x20,
+            password: None,
+            file_comment: None,
+        };
+        let volume_count = AtomicUsize::new(0);
+        let reporter = |event: WriteProgressEvent<'_>| {
+            if let WriteProgressEvent::VolumeFinished { volume_number, .. } = event {
+                assert_eq!(
+                    volume_number,
+                    volume_count.fetch_add(1, Ordering::Relaxed) + 1
+                );
+            }
+        };
+        let volumes = write_compressed_volumes_with_progress(
+            entry,
+            WriterOptions::default(),
+            32,
+            Some(&reporter),
+        )
+        .unwrap();
+        assert_eq!(volume_count.load(Ordering::Relaxed), volumes.len());
+        assert!(volumes.len() > 1);
+
+        struct CancelAfterFirstVolume(AtomicUsize);
+        impl WriteProgress for CancelAfterFirstVolume {
+            fn report(&self, event: WriteProgressEvent<'_>) {
+                if matches!(event, WriteProgressEvent::VolumeFinished { .. }) {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+
+            fn is_cancelled(&self) -> bool {
+                self.0.load(Ordering::Relaxed) != 0
+            }
+        }
+        let cancelling = CancelAfterFirstVolume(AtomicUsize::new(0));
+        let error = write_compressed_volumes_with_progress(
+            entry,
+            WriterOptions::default(),
+            32,
+            Some(&cancelling),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::Cancelled);
+        assert_eq!(cancelling.0.load(Ordering::Relaxed), 1);
+    }
 }
