@@ -3863,6 +3863,55 @@ mod tests {
     }
 
     #[test]
+    fn controlled_extraction_uses_selected_directory_and_file_writers() {
+        let entries = [
+            StoredEntry {
+                name: b"docs",
+                data: b"",
+                file_time: 0,
+                file_attr: 0x10,
+                password: None,
+                file_comment: None,
+            },
+            StoredEntry {
+                name: b"docs/readme.txt",
+                data: b"old archive data",
+                file_time: 0,
+                file_attr: 0x20,
+                password: None,
+                file_comment: None,
+            },
+        ];
+        let bytes = write_stored_archive(&entries, WriterOptions::default()).unwrap();
+        let archive = crate::Archive::Rar13(Archive::parse(&bytes).unwrap());
+        let output = Rc::new(RefCell::new(Vec::new()));
+        let mut seen = Vec::new();
+        let outcome = archive
+            .extract_with_control(crate::ArchiveReadOptions::new(), |member| {
+                seen.push(member.meta.name.clone());
+                Ok(crate::ExtractionDecision::Extract(Box::new(CollectWriter(
+                    Rc::clone(&output),
+                ))))
+            })
+            .unwrap();
+
+        assert_eq!(outcome, crate::ExtractionOutcome::Complete);
+        assert_eq!(seen, [b"docs".to_vec(), b"docs/readme.txt".to_vec()]);
+        assert_eq!(&*output.borrow(), b"old archive data");
+    }
+
+    #[test]
+    fn empty_rar13_archive_cannot_supply_preservation_target_version() {
+        let bytes = write_stored_archive(&[], WriterOptions::default()).unwrap();
+        let archive = Archive::parse(&bytes).unwrap();
+        assert!(archive.entries.is_empty());
+        assert!(archive
+            .rewrite_preservation_issues()
+            .iter()
+            .any(|issue| issue.contains("empty legacy archive")));
+    }
+
+    #[test]
     fn supplied_rar13_signature_and_file_length_are_checked() {
         let entries = [StoredEntry {
             name: b"member",
