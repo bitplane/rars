@@ -2397,6 +2397,18 @@ mod tests {
     }
 
     #[test]
+    fn literal_only_encoder_round_trips_flag_and_mode_boundaries() {
+        for length in 0..=96 {
+            let input: Vec<u8> = (0..length)
+                .map(|index| (index * 73 + length * 17) as u8)
+                .collect();
+            let packed = Unpack15Encoder::new().encode_literals_only(&input).unwrap();
+            let decoded = unpack15_decode(&packed, input.len()).unwrap();
+            assert_eq!(decoded, input, "literal-only length {length}");
+        }
+    }
+
+    #[test]
     fn final_input_zero_pads_missing_bits_in_both_decode_paths() {
         let mut decoder = Unpack15::new();
         let direct = decoder.decode_member(&[], 8, false).unwrap();
