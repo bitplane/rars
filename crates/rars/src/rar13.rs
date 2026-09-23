@@ -4444,6 +4444,45 @@ mod tests {
     }
 
     #[test]
+    fn level_four_uses_a_distinct_verified_fallback_plan() {
+        let options = rar15_encode_options_for_level(Some(4)).unwrap();
+        let candidates = rar15_encode_fallback_options(options);
+        assert_eq!(candidates.len(), 2);
+
+        let data = b"level four compressed legacy payload ".repeat(32);
+        let entry = FileEntry {
+            name: b"LEVEL4.TXT",
+            data: &data,
+            file_time: 0,
+            file_attr: 0x20,
+            password: None,
+            file_comment: None,
+        };
+        let bytes =
+            write_compressed_archive(&[entry], WriterOptions::default().with_compression_level(4))
+                .unwrap();
+        let archive = Archive::parse(&bytes).unwrap();
+        assert_eq!(collect_extract(&archive, None).unwrap()[0].data, data);
+    }
+
+    #[test]
+    fn stored_volume_writer_refuses_non_legacy_target() {
+        let entry = StoredEntry {
+            name: b"WRONG.TXT",
+            data: b"contents",
+            file_time: 0,
+            file_attr: 0x20,
+            password: None,
+            file_comment: None,
+        };
+        let options = WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only());
+        assert_eq!(
+            write_stored_volumes(entry, options, 8).unwrap_err(),
+            Error::UnsupportedVersion(ArchiveVersion::Rar50)
+        );
+    }
+
+    #[test]
     fn solid_volume_writer_marks_every_fragment() {
         let data = b"a stored member across several solid volumes".repeat(16);
         let entry = FileEntry {
