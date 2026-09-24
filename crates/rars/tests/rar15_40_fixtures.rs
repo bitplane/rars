@@ -5656,6 +5656,44 @@ fn repairs_rar250_protect_head_single_damaged_sector() {
 }
 
 #[test]
+fn rar250_recovery_rejects_damage_beyond_parity_capacity() {
+    let mut bytes = std::fs::read(fixture("rar250_protect_head_rr5.rar")).unwrap();
+    let clean = Archive::parse(&bytes).unwrap();
+    let protect = clean.protect_records().next().unwrap();
+    assert_eq!(protect.rec_sectors, 5);
+    assert!(protect.block.offset > 7 * 512);
+
+    for sector in 1..=6 {
+        bytes[sector * 512 + 16] ^= 0x55;
+    }
+    let damaged = Archive::parse(&bytes).unwrap();
+    assert!(matches!(
+        damaged.repair_protect_head(),
+        Err(Error::InvalidHeader(
+            "RAR 2.x recovery damage exceeds parity sector count"
+        ))
+    ));
+}
+
+#[test]
+fn rar250_recovery_rejects_incorrect_parity() {
+    let mut bytes = std::fs::read(fixture("rar250_protect_head_rr5.rar")).unwrap();
+    let clean = Archive::parse(&bytes).unwrap();
+    let protect = clean.protect_records().next().unwrap();
+    let parity_start = protect.data_range.start + protect.total_blocks as usize * 2;
+
+    bytes[512 + 16] ^= 0x55;
+    bytes[parity_start + 512 + 16] ^= 0x01;
+    let damaged = Archive::parse(&bytes).unwrap();
+    let result = damaged.repair_protect_head();
+    assert!(
+        matches!(result, Err(Error::CrcMismatch { .. })),
+        "{:?}",
+        result.as_ref().map(Vec::len)
+    );
+}
+
+#[test]
 fn protect_head_does_not_repair_trailing_partial_sector_before_record() {
     let bytes = std::fs::read(fixture("rar250_protect_head_rr5.rar")).unwrap();
     let clean = Archive::parse(&bytes).unwrap();
@@ -5724,6 +5762,77 @@ fn repairs_rar300_newsub_recovery_single_damaged_sector() {
 }
 
 #[test]
+fn rar300_recovery_rejects_incorrect_parity() {
+    let mut bytes = std::fs::read(fixture("rar300/with_recovery_rar300.rar")).unwrap();
+    let clean = Archive::parse(&bytes).unwrap();
+    let recovery = clean
+        .new_subs()
+        .find(|sub| sub.kind == NewSubKind::RecoveryRecord)
+        .unwrap();
+    let protected_sectors = recovery.file.block.offset.div_ceil(512);
+    let parity_start = recovery.file.packed_range.start + protected_sectors * 2;
+
+    bytes[512 + 16] ^= 0x55;
+    bytes[parity_start + 512 + 16] ^= 0x01;
+    let damaged = Archive::parse(&bytes).unwrap();
+    let result = damaged.repair_protect_head();
+    assert!(
+        matches!(result, Err(Error::CrcMismatch { .. })),
+        "{:?}",
+        result.as_ref().map(Vec::len)
+    );
+}
+
+#[test]
+fn rar300_recovery_rejects_damage_beyond_parity_capacity() {
+    let mut bytes = std::fs::read(fixture("rar300/with_recovery_rar300.rar")).unwrap();
+    let clean = Archive::parse(&bytes).unwrap();
+    let recovery = clean
+        .new_subs()
+        .find(|sub| sub.kind == NewSubKind::RecoveryRecord)
+        .unwrap();
+    let protected_sectors = recovery.file.block.offset.div_ceil(512);
+    let tag_len = protected_sectors * 2;
+    let parity_sectors = (recovery.file.unp_size as usize - tag_len) / 512;
+    assert!(parity_sectors + 1 < protected_sectors);
+
+    for sector in 1..=parity_sectors + 1 {
+        bytes[sector * 512 + 16] ^= 0x55;
+    }
+    let damaged = Archive::parse(&bytes).unwrap();
+    assert!(matches!(
+        damaged.repair_protect_head(),
+        Err(Error::InvalidHeader(
+            "RAR 3.x recovery damage exceeds parity sector count"
+        ))
+    ));
+}
+
+#[test]
+fn rar300_recovery_rejects_two_damaged_sectors_in_one_parity_group() {
+    let mut bytes = std::fs::read(fixture("rar300/with_recovery_rar300.rar")).unwrap();
+    let clean = Archive::parse(&bytes).unwrap();
+    let recovery = clean
+        .new_subs()
+        .find(|sub| sub.kind == NewSubKind::RecoveryRecord)
+        .unwrap();
+    let protected_sectors = recovery.file.block.offset.div_ceil(512);
+    let tag_len = protected_sectors * 2;
+    let parity_sectors = (recovery.file.unp_size as usize - tag_len) / 512;
+    assert!(1 + parity_sectors < protected_sectors);
+
+    bytes[512 + 16] ^= 0x55;
+    bytes[(1 + parity_sectors) * 512 + 16] ^= 0x55;
+    let damaged = Archive::parse(&bytes).unwrap();
+    assert!(matches!(
+        damaged.repair_protect_head(),
+        Err(Error::InvalidHeader(
+            "RAR 3.x recovery cannot repair multiple sectors in the same parity group"
+        ))
+    ));
+}
+
+#[test]
 fn repairs_compressed_rar300_newsub_recovery_single_damaged_sector() {
     let compressed = std::fs::read(fixture("rar300/with_compressed_recovery_rar300.rar")).unwrap();
     let expected = std::fs::read(fixture("rar300/with_recovery_rar300.rar")).unwrap();
@@ -5784,7 +5893,12 @@ fn rejects_rar250_protect_head_same_group_damage() {
     damaged[512 * 6 + 10] ^= 0x55;
 
     let damaged_archive = Archive::parse(&damaged).unwrap();
-    assert!(damaged_archive.repair_protect_head().is_err());
+    assert!(matches!(
+        damaged_archive.repair_protect_head(),
+        Err(Error::InvalidHeader(
+            "RAR 2.x recovery cannot repair multiple sectors in the same parity group"
+        ))
+    ));
 }
 
 #[test]
