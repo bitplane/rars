@@ -2738,6 +2738,45 @@ mod tests {
             3,
             Some((0, 3, 2)),
         ));
+
+        // One extra bit for a longer match can exactly cancel the extra
+        // literal it saves. On that score tie, prefer the longer match.
+        let mut lengths = [0u8; super::TABLE_COUNT];
+        lengths[b'a' as usize] = 1;
+        lengths[super::MAIN_COUNT + super::OFFSET_COUNT + 2] = 1;
+        let prices = CostModel::new(&lengths);
+        let short = super::SelectedMatch::OldOffset {
+            index: 0,
+            length: 3,
+            offset: 1,
+        };
+        let long = super::SelectedMatch::OldOffset {
+            index: 1,
+            length: 4,
+            offset: 1,
+        };
+        assert_eq!(
+            prices.selected_score(short, b"aaaa", 0),
+            prices.selected_score(long, b"aaaa", 0)
+        );
+        assert!(super::is_better_old_offset_match(
+            Some(&prices),
+            b"aaaa",
+            0,
+            1,
+            4,
+            1,
+            Some((0, 3, 1)),
+        ));
+        assert!(!super::is_better_old_offset_match(
+            Some(&prices),
+            b"aaaa",
+            0,
+            0,
+            3,
+            1,
+            Some((1, 4, 1)),
+        ));
     }
 
     #[test]
