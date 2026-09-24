@@ -2577,6 +2577,18 @@ mod tests {
         assert_eq!(decoder.decode_member(&packed, 8).unwrap(), vec![0; 8]);
     }
 
+    #[test]
+    fn audio_member_reads_trailing_table_for_next_solid_member() {
+        let mut bits = BitWriter::default();
+        write_fresh_audio_block(&mut bits, 4, /*emit_end_sentinel=*/ true);
+        write_fresh_audio_block(&mut bits, 4, /*emit_end_sentinel=*/ false);
+        let packed = bits.finish();
+
+        let mut decoder = Unpack20::new();
+        assert_eq!(decoder.decode_member(&packed, 4).unwrap(), vec![0; 4]);
+        assert_eq!(decoder.decode_member(&[], 4).unwrap(), vec![0; 4]);
+    }
+
     fn expected_text() -> Vec<u8> {
         b"Hello text not audio.\r\n".repeat(100)
     }
