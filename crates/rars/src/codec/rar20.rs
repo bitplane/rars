@@ -614,19 +614,19 @@ fn encode_tokens_optimal(
             }
         }
 
-        if let Some(short @ SelectedMatch::ShortOffset { offset }) =
+        if let Some(SelectedMatch::ShortOffset { offset }) =
             best_short_offset_match(input, pos, end)
         {
-            if let Some(price) = cost_model.selected_cost(short) {
-                let mut pushed = node_reps;
-                push_old_offset(&mut pushed, offset);
-                relax(
-                    index + 2,
-                    price as u64,
-                    EncodeToken::ShortOffset { offset },
-                    pushed,
-                );
-            }
+            let slot = short_slot_index(offset);
+            let price = usize::from(cost_model.main[261 + slot]) + usize::from(SHORT_BITS[slot]);
+            let mut pushed = node_reps;
+            push_old_offset(&mut pushed, offset);
+            relax(
+                index + 2,
+                price as u64,
+                EncodeToken::ShortOffset { offset },
+                pushed,
+            );
         }
 
         finder.insert(input, pos);
@@ -1223,8 +1223,13 @@ fn short_slot_for_match(offset: usize) -> Result<(usize, usize)> {
         ));
     }
     let adjusted = offset - 1;
-    let slot = SHORT_BASES.partition_point(|&base| base <= adjusted) - 1;
+    let slot = short_slot_index(offset);
     Ok((slot, adjusted - SHORT_BASES[slot]))
+}
+
+fn short_slot_index(offset: usize) -> usize {
+    let adjusted = offset - 1;
+    SHORT_BASES.partition_point(|&base| base <= adjusted) - 1
 }
 
 fn literal_code_len(symbol_count: usize) -> u8 {
