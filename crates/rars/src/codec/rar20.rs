@@ -426,9 +426,7 @@ fn encode_member_with_tables(
                     "RAR 2.0 encoder missing short-offset Huffman code",
                 ))?;
                 bits.write_bits(code.code as u32, code.len);
-                if SHORT_BITS[slot] != 0 {
-                    bits.write_bits(extra as u32, SHORT_BITS[slot]);
-                }
+                bits.write_bits(extra as u32, SHORT_BITS[slot]);
             }
             EncodeToken::Match { length, offset } => {
                 let encoded_length = length.checked_sub(match_length_adjustment(offset)).ok_or(
@@ -541,9 +539,7 @@ fn encode_tokens_optimal(
     cost[0] = 0;
 
     for index in 0..span {
-        if cost[index] == UNREACHED {
-            continue;
-        }
+        // Every position is reachable through the one-byte literal edge.
         let pos = start + index;
         let here = cost[index];
         let node_reps = reps[index];
@@ -895,17 +891,18 @@ fn select_match(
     old_offsets: &[usize; 4],
     cost_model: Option<&CostModel<'_>>,
 ) -> Option<SelectedMatch> {
-    let fresh = best_match(input, pos, end, finder, options, cost_model)
-        .map(|(length, offset)| SelectedMatch::Fresh { length, offset });
-    let old = best_old_offset_match(input, pos, end, old_offsets, cost_model).map(
-        |(index, length, offset)| SelectedMatch::OldOffset {
-            index,
-            length,
-            offset,
-        },
-    );
+    let fresh = best_match(input, pos, end, finder, options, cost_model);
+    let old = best_old_offset_match(input, pos, end, old_offsets, cost_model);
     if let Some(cost_model) = cost_model {
-        return [fresh, old, best_short_offset_match(input, pos, end)]
+        return [
+            fresh.map(|(length, offset)| SelectedMatch::Fresh { length, offset }),
+            old.map(|(index, length, offset)| SelectedMatch::OldOffset {
+                index,
+                length,
+                offset,
+            }),
+            best_short_offset_match(input, pos, end),
+        ]
             .into_iter()
             .flatten()
             .max_by_key(|&selected| {
@@ -918,18 +915,6 @@ fn select_match(
             });
     }
 
-    let fresh = fresh.and_then(|selected| match selected {
-        SelectedMatch::Fresh { length, offset } => Some((length, offset)),
-        _ => None,
-    });
-    let old = old.and_then(|selected| match selected {
-        SelectedMatch::OldOffset {
-            index,
-            length,
-            offset,
-        } => Some((index, length, offset)),
-        _ => None,
-    });
     match (fresh, old) {
         (Some((fresh_length, _)), Some((index, old_length, old_offset)))
             if old_length + 1 >= fresh_length =>
@@ -1262,12 +1247,7 @@ fn short_slot_for_match(offset: usize) -> Result<(usize, usize)> {
     let adjusted = offset - 1;
     for (slot, &base) in SHORT_BASES.iter().enumerate() {
         let extra_bits = SHORT_BITS[slot];
-        let max = base
-            + if extra_bits == 0 {
-                0
-            } else {
-                (1usize << extra_bits) - 1
-            };
+        let max = base + (1usize << extra_bits) - 1;
         if adjusted >= base && adjusted <= max {
             return Ok((slot, adjusted - base));
         }
@@ -1420,7 +1400,7 @@ fn encode_audio_member(input: &[u8], channels: usize) -> Result<Vec<u8>> {
     if channels == 0 || channels > MAX_CHANNELS {
         return Err(Error::InvalidData("RAR 2.0 audio channel count is invalid"));
     }
-    let deltas = audio_encode(input, channels)?;
+    let deltas = audio_encode(input, channels);
     let mut levels = vec![0u8; AUDIO_COUNT * channels];
     for channel in 0..channels {
         let mut frequencies = [0usize; AUDIO_COUNT];
@@ -1447,11 +1427,7 @@ fn encode_audio_member(input: &[u8], channels: usize) -> Result<Vec<u8>> {
             "RAR 2.0 encoder missing audio-level Huffman code",
         ))?;
         bits.write_bits(code.code as u32, code.len);
-        match symbol {
-            17 => bits.write_bits(0, 3),
-            18 => bits.write_bits(127, 7),
-            _ => {}
-        }
+        // Audio levels are emitted directly as 0..=15, without run symbols.
     }
 
     for channel in 0..channels {
@@ -1507,10 +1483,7 @@ fn validate_audio_table(lengths: &[u8]) -> Result<()> {
     validate_huffman_counts(&count)
 }
 
-fn audio_encode(input: &[u8], channels: usize) -> Result<Vec<u8>> {
-    if channels == 0 || channels > MAX_CHANNELS {
-        return Err(Error::InvalidData("RAR 2.0 audio channel count is invalid"));
-    }
+fn audio_encode(input: &[u8], channels: usize) -> Vec<u8> {
     let mut states = [AudioState::default(); MAX_CHANNELS];
     let mut channel_delta = 0i32;
     let mut deltas = Vec::with_capacity(input.len());
@@ -1577,7 +1550,7 @@ fn audio_encode(input: &[u8], channels: usize) -> Result<Vec<u8>> {
 
         deltas.push(delta);
     }
-    Ok(deltas)
+    deltas
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2507,6 +2480,27 @@ mod tests {
     }
 
     #[test]
+    fn audio_predictor_coefficients_stop_at_their_format_limits() {
+        for winning_difference in 1..=10 {
+            let mut decoder = Unpack20::new();
+            let state = &mut decoder.audio[0];
+            state.byte_count = 31;
+            state.dif = [u32::MAX / 4; 11];
+            state.dif[winning_difference] = 0;
+            let coefficient = (winning_difference - 1) / 2;
+            state.k[coefficient] = if winning_difference % 2 == 1 {
+                -17
+            } else {
+                16
+            };
+            let before = state.k;
+
+            decoder.decode_audio(0);
+            assert_eq!(decoder.audio[0].k, before, "difference {winning_difference}");
+        }
+    }
+
+    #[test]
     fn copy_match_zero_fills_an_offset_that_reaches_past_the_stream() {
         let mut decoder = Unpack20::new();
         decoder.output.extend_from_slice(b"AB");
@@ -2585,6 +2579,51 @@ mod tests {
 
         assert!(auto.len() < lz.len());
         assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn short_auto_encoded_members_skip_audio_candidates() {
+        let input = b"short";
+        let packed = super::unpack20_encode_auto(input).unwrap();
+        assert_eq!(unpack20_decode(&packed, input.len()).unwrap(), input);
+
+        let mut always_continue = |_| true;
+        let packed = super::unpack20_encode_auto_with_options_and_progress(
+            input,
+            EncodeOptions::default(),
+            &mut always_continue,
+        )
+        .unwrap();
+        assert_eq!(unpack20_decode(&packed, input.len()).unwrap(), input);
+    }
+
+    #[test]
+    fn encoder_checks_cancellation_after_the_last_symbol() {
+        let mut calls = 0;
+        let mut cancel_at_end = |_| {
+            calls += 1;
+            calls == 1
+        };
+        assert_eq!(
+            super::unpack20_encode_auto_with_options_and_progress(
+                b"end",
+                EncodeOptions::new(0).with_try_audio(false),
+                &mut cancel_at_end,
+            )
+            .unwrap_err(),
+            Error::Cancelled
+        );
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn audio_encoder_rejects_channel_counts_outside_the_format() {
+        for channels in [0, 5] {
+            assert_eq!(
+                super::encode_audio_member(b"audio", channels).unwrap_err(),
+                Error::InvalidData("RAR 2.0 audio channel count is invalid")
+            );
+        }
     }
 
     #[test]
