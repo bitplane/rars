@@ -2517,6 +2517,49 @@ mod tests {
     }
 
     #[test]
+    fn repeat_last_without_a_previous_match_is_a_no_op() {
+        let mut lengths = [0u8; super::MAIN_COUNT];
+        lengths[0] = 1;
+        lengths[256] = 1;
+        let mut decoder = Unpack20::new();
+        decoder.main = Huffman::from_lengths(&lengths).unwrap();
+        decoder.in_block = true;
+        decoder.bits.append(&[0b1000_0000]); // Repeat last, then literal zero.
+
+        decoder.decode_until(1).unwrap();
+        assert_eq!(decoder.output, b"\0");
+        assert_eq!(decoder.last_length, 0);
+    }
+
+    #[test]
+    fn old_offset_match_applies_the_long_distance_length_adjustment() {
+        let mut main_lengths = [0u8; super::MAIN_COUNT];
+        main_lengths[0] = 1;
+        main_lengths[257] = 1;
+        let mut length_lengths = [0u8; super::LENGTH_COUNT];
+        length_lengths[0] = 1;
+        let mut decoder = Unpack20::new();
+        decoder.main = Huffman::from_lengths(&main_lengths).unwrap();
+        decoder.lengths = Huffman::from_lengths(&length_lengths).unwrap();
+        decoder.old_offsets[0] = 0x40000;
+        decoder.in_block = true;
+        decoder.bits.append(&[0b1000_0000]); // Old offset 0, length slot 0.
+
+        decoder.decode_until(1).unwrap();
+        assert_eq!(decoder.output, b"\0");
+        assert_eq!(decoder.last_length, 5); // 2 + three distance adjustments.
+        assert_eq!(decoder.pending_match, Some((4, 0x40000)));
+    }
+
+    #[test]
+    fn offset_slot_without_extra_bits_decodes_the_first_distance() {
+        let mut decoder = Unpack20::new();
+        decoder.offsets = Huffman::from_lengths(&[1, 1]).unwrap();
+        decoder.bits.append(&[0]);
+        assert_eq!(decoder.read_offset().unwrap(), 1);
+    }
+
+    #[test]
     fn decodes_synthetic_audio_block() {
         let packed = synthetic_audio_block(8);
         let mut decoder = Unpack20::new();
