@@ -145,6 +145,13 @@ impl EncodeOptions {
         self.try_audio = enabled;
         self
     }
+
+    const fn constrained(mut self) -> Self {
+        if self.max_match_distance > MAX_ENCODER_MATCH_OFFSET {
+            self.max_match_distance = MAX_ENCODER_MATCH_OFFSET;
+        }
+        self
+    }
 }
 
 impl Default for EncodeOptions {
@@ -169,7 +176,7 @@ impl Unpack20Encoder {
         Self {
             history: Vec::new(),
             table: None,
-            options,
+            options: options.constrained(),
         }
     }
 
@@ -228,6 +235,8 @@ fn encode_member(
     if input.is_empty() {
         return Ok(Vec::new());
     }
+    // The public field can be assigned directly, bypassing the builder clamp.
+    let options = options.constrained();
 
     let tokens = match progress.as_mut() {
         Some(report) => {
@@ -2813,6 +2822,50 @@ mod tests {
             legacy.encode_member(&second).unwrap(),
             explicit.encode_member(&second).unwrap()
         );
+    }
+
+    #[test]
+    fn direct_option_field_assignment_cannot_exceed_rar20_distance_limit() {
+        let mut options = EncodeOptions::new(1);
+        options.max_match_distance = super::MAX_ENCODER_MATCH_OFFSET + 1;
+        assert_eq!(
+            options.constrained().max_match_distance,
+            super::MAX_ENCODER_MATCH_OFFSET
+        );
+        assert_eq!(
+            Unpack20Encoder::with_options(options)
+                .options
+                .max_match_distance,
+            super::MAX_ENCODER_MATCH_OFFSET
+        );
+    }
+
+    #[test]
+    fn optimal_parser_skips_an_out_of_format_fresh_match() {
+        let start = super::MAX_ENCODER_MATCH_OFFSET + 1;
+        let end = start + 5;
+        let mut input = vec![b'X'; end];
+        input[..5].copy_from_slice(b"abcde");
+        input[start..].copy_from_slice(b"abcde");
+        let mut finder = super::Rar20MatchFinder::new(input.len());
+        finder.insert(&input, 0);
+        let mut options = EncodeOptions::new(1).with_optimal_parse(true);
+        options.max_match_distance = start;
+        let lengths = [0u8; super::TABLE_COUNT];
+        let prices = CostModel::new(&lengths);
+
+        let tokens = super::encode_tokens_optimal(
+            &input,
+            start,
+            end,
+            &mut finder,
+            options,
+            &prices,
+        );
+        assert_eq!(tokens.len(), 5);
+        assert!(tokens
+            .iter()
+            .all(|token| matches!(token, EncodeToken::Literal(_))));
     }
 
     #[test]
