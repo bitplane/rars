@@ -1741,14 +1741,7 @@ fn encode_member<'a>(
 
     let solid = solid_encoder.is_some();
     let mut last = 0usize;
-    let mut advance = |position: usize| {
-        if position < last {
-            last = 0;
-        }
-        let delta = position.saturating_sub(last);
-        last = position;
-        work.advance(delta as u64)
-    };
+    let mut advance = |position: usize| advance_rar15_attempt(&mut last, work, position);
     // Every arm that ends up stored hands the payload back below, so none of
     // them builds a copy of the member to be thrown away. At level zero and
     // where the encoder gave nothing back, that copy was the whole member.
@@ -1951,14 +1944,7 @@ pub fn write_compressed_volumes_with_progress(
         entry.data.len(),
     );
     let mut last = 0usize;
-    let mut advance = |position: usize| {
-        if position < last {
-            last = 0;
-        }
-        let delta = position.saturating_sub(last);
-        last = position;
-        work.advance(delta as u64)
-    };
+    let mut advance = |position: usize| advance_rar15_attempt(&mut last, &work, position);
     let mut packed =
         encode_verified_rar15_payload_with_progress(entry.data, encode_options, &mut advance)
             .map_err(|error| {
@@ -2113,6 +2099,17 @@ fn rar15_encode_options_for_level(level: Option<u8>) -> Result<Rar15EncodeOption
             "RAR compression level must be in the range 0..5",
         )),
     }
+}
+
+/// The encoder reports positions within each attempt, restarting at zero for
+/// a verification fallback. Account only the new bytes in that attempt.
+fn advance_rar15_attempt(last: &mut usize, work: &WorkTracker<'_>, position: usize) -> bool {
+    if position < *last {
+        *last = 0;
+    }
+    let delta = position.saturating_sub(*last);
+    *last = position;
+    work.advance(delta as u64)
 }
 
 fn encode_verified_rar15_payload_with_progress(
@@ -4365,6 +4362,54 @@ mod tests {
             .unwrap();
         assert_eq!(packed, Some(valid));
         assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn verified_encoder_progress_counts_each_retry_once() {
+        let data = b"legacy fallback progress payload";
+        let valid = unpack15_encode(data).unwrap();
+        let completed = std::sync::Mutex::new(Vec::new());
+        let reporter = |event: WriteProgressEvent<'_>| {
+            if let WriteProgressEvent::Advanced {
+                completed_bytes, ..
+            } = event
+            {
+                completed.lock().unwrap().push(completed_bytes);
+            }
+        };
+        let work = WorkTracker::new(
+            Some(ProgressReporter(&reporter)),
+            WriteOperation::Compression,
+            (data.len() * 3) as u64,
+        );
+        let mut last = 0;
+        let mut progress = |position| advance_rar15_attempt(&mut last, &work, position);
+        let mut attempts = 0;
+        let packed = encode_verified_rar15_payload_using(
+            data,
+            Rar15EncodeOptions::new(),
+            &mut progress,
+            |input, _, report| {
+                attempts += 1;
+                assert!(report(0));
+                assert!(report(input.len() / 2));
+                assert!(report(input.len()));
+                Ok(if attempts == 1 {
+                    Vec::new()
+                } else {
+                    valid.clone()
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(packed, Some(valid));
+        assert_eq!(attempts, 2);
+        let half = (data.len() / 2) as u64;
+        let full = data.len() as u64;
+        assert_eq!(
+            *completed.lock().unwrap(),
+            [0, half, full, full, full + half, full * 2]
+        );
     }
 
     #[test]
