@@ -3167,6 +3167,44 @@ mod tests {
     }
 
     #[test]
+    fn file_header_rejects_missing_size_and_overlong_optional_fields() {
+        let header = [0u8; 32];
+        let mut block = block_header_with(LONG_BLOCK);
+        block.head_size = 31;
+        assert!(matches!(
+            parse_file_like_header(&header, block.clone(), 0),
+            Err(Error::InvalidHeader("RAR 1.5 file header is too short"))
+        ));
+
+        block.head_size = 32;
+        block.flags = 0;
+        assert!(matches!(
+            parse_file_like_header(&header, block.clone(), 0),
+            Err(Error::InvalidHeader(
+                "RAR 1.5 file header is missing packed data size"
+            ))
+        ));
+
+        block.flags = LONG_BLOCK;
+        let mut with_name = header;
+        with_name[26..28].copy_from_slice(&1u16.to_le_bytes());
+        assert!(matches!(
+            parse_file_like_header(&with_name, block.clone(), 0),
+            Err(Error::InvalidHeader(
+                "RAR 1.5 file name extends beyond header"
+            ))
+        ));
+
+        block.flags |= FHD_SALT;
+        assert!(matches!(
+            parse_file_like_header(&header, block, 0),
+            Err(Error::InvalidHeader(
+                "RAR 1.5 salt extends beyond file header"
+            ))
+        ));
+    }
+
+    #[test]
     fn fhd_large_archive_extent_uses_high_packed_size_without_underflowing() {
         let name = b"large-zero-low.bin";
         let head_size = 32 + 8 + name.len();
@@ -3344,6 +3382,39 @@ mod tests {
         let mut bare_size = file_header_with(FHD_COMMENT);
         bare_size.file_comment = vec![3, 0, b'h', b'e', b'y'];
         assert!(bare_size.file_comment().is_err());
+    }
+
+    #[test]
+    fn file_header_comment_rejects_wrong_block_type_and_unsupported_codec() {
+        let mut wrong_type = file_header_with(FHD_COMMENT);
+        wrong_type.file_comment = comment_block(b"note");
+        wrong_type.file_comment[2] = FILE_HEAD;
+        test_write_header_crc(&mut wrong_type.file_comment, 0);
+        assert!(matches!(
+            wrong_type.file_comment(),
+            Err(Error::InvalidHeader(
+                "RAR 1.5 file comment is not a comment block"
+            ))
+        ));
+
+        let mut unsupported = file_header_with(FHD_COMMENT);
+        unsupported.file_comment = comment_block(b"note");
+        unsupported.file_comment[9] = 29;
+        unsupported.file_comment[10] = 0x33;
+        let crc = (crc32(&unsupported.file_comment[2..COMMENT_HEADER_SIZE]) & 0xffff) as u16;
+        unsupported.file_comment[..2].copy_from_slice(&crc.to_le_bytes());
+        let result = unsupported.file_comment();
+        assert!(
+            matches!(
+                result,
+                Err(Error::UnsupportedCompression {
+                    unpack_version: 29,
+                    method: 0x33,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
     }
 
     #[test]
@@ -3655,8 +3726,33 @@ mod tests {
         // Second unit 'i' = U+0069
         raw.extend_from_slice(&[0x69, 0x00]);
         let decoded = decode_file_name(&raw, FHD_UNICODE);
-        // The decoder may emit further units from the trailing flag bits;
-        // accept any output that begins with "Hi".
-        assert!(decoded.starts_with(b"Hi"), "got {decoded:?}");
+        assert_eq!(decoded, b"Hi");
+    }
+
+    #[test]
+    fn decode_file_name_decodes_high_byte_and_copy_commands() {
+        assert_eq!(
+            decode_file_name(b"old\0\x04\x40\xe9", FHD_UNICODE),
+            "\u{4e9}".as_bytes()
+        );
+        assert_eq!(decode_file_name(b"abc\0\0\xc0\x01", FHD_UNICODE), b"abc");
+        assert_eq!(
+            decode_file_name(b"ABC\0\x01\xc0\x81\x01", FHD_UNICODE),
+            "\u{142}\u{143}\u{144}".as_bytes()
+        );
+    }
+
+    #[test]
+    fn truncated_unicode_commands_keep_the_raw_name() {
+        for raw in [
+            &b"x\0\0\0"[..],       // mode 0: missing low byte
+            &b"x\0\x01\x40"[..],   // mode 1: missing low byte
+            &b"x\0\0\x80A"[..],    // mode 2: missing high byte
+            &b"x\0\0\xc0"[..],     // mode 3: missing run length
+            &b"x\0\0\xc0\x80"[..], // mode 3: missing correction
+            &b"x\0\0\xc0\0"[..],   // mode 3: run exceeds fallback
+        ] {
+            assert_eq!(decode_file_name(raw, FHD_UNICODE), raw);
+        }
     }
 }
