@@ -302,9 +302,7 @@ fn table_lengths_for_tokens(
                 main_frequencies[261 + slot] += 1;
             }
             EncodeToken::Match { length, offset } => {
-                let encoded_length = length.checked_sub(match_length_adjustment(offset)).ok_or(
-                    Error::InvalidData("RAR 2.0 adjusted match length underflows"),
-                )?;
+                let encoded_length = length - match_length_adjustment(offset);
                 let (slot, _) = length_slot_for_match(encoded_length)?;
                 main_frequencies[270 + slot] += 1;
                 let (offset_slot, _) = offset_slot_for_match(offset)?;
@@ -328,7 +326,7 @@ fn table_lengths_for_tokens(
                 .iter()
                 .filter(|&&frequency| frequency != 0)
                 .count();
-        literal_code_len(main_symbol_count)?
+        literal_code_len(main_symbol_count)
     };
 
     if fixed_table.is_some() {
@@ -350,11 +348,11 @@ fn table_lengths_for_tokens(
         }
     } else {
         table_lengths[..MAIN_COUNT]
-            .copy_from_slice(&validated_lengths_for_frequencies(&main_frequencies, 15));
+            .copy_from_slice(&huffman::lengths_for_frequency_array(&main_frequencies, 15));
         table_lengths[MAIN_COUNT..MAIN_COUNT + OFFSET_COUNT]
-            .copy_from_slice(&validated_lengths_for_frequencies(&offset_frequencies, 15));
+            .copy_from_slice(&huffman::lengths_for_frequency_array(&offset_frequencies, 15));
         table_lengths[MAIN_COUNT + OFFSET_COUNT..TABLE_COUNT]
-            .copy_from_slice(&validated_lengths_for_frequencies(&length_frequencies, 15));
+            .copy_from_slice(&huffman::lengths_for_frequency_array(&length_frequencies, 15));
     }
     Ok(table_lengths)
 }
@@ -429,9 +427,7 @@ fn encode_member_with_tables(
                 bits.write_bits(extra as u32, SHORT_BITS[slot]);
             }
             EncodeToken::Match { length, offset } => {
-                let encoded_length = length.checked_sub(match_length_adjustment(offset)).ok_or(
-                    Error::InvalidData("RAR 2.0 adjusted match length underflows"),
-                )?;
+                let encoded_length = length - match_length_adjustment(offset);
                 let (slot, extra) = length_slot_for_match(encoded_length)?;
                 let code = main_codes[270 + slot].ok_or(Error::InvalidData(
                     "RAR 2.0 encoder missing match Huffman code",
@@ -462,7 +458,7 @@ struct FixedEncodeTable {
 impl FixedEncodeTable {
     fn new() -> Result<Self> {
         Ok(Self {
-            length: literal_code_len(256 + LENGTH_COUNT + OFFSET_COUNT)?,
+            length: literal_code_len(256 + LENGTH_COUNT + OFFSET_COUNT),
         })
     }
 }
@@ -1007,10 +1003,7 @@ fn best_match(
     let mut checked = 0usize;
     let mut candidate = finder.first(input, pos);
     while candidate != match_finder::NO_POSITION {
-        if candidate >= pos {
-            candidate = finder.previous(candidate);
-            continue;
-        }
+        // Callers search before inserting this position, so every candidate is older.
         let offset = pos - candidate;
         if offset > max_offset {
             break;
@@ -1233,12 +1226,11 @@ fn short_slot_for_match(offset: usize) -> Result<(usize, usize)> {
     Ok((slot, adjusted - SHORT_BASES[slot]))
 }
 
-fn literal_code_len(symbol_count: usize) -> Result<u8> {
-    if symbol_count == 0 {
-        return Err(Error::InvalidData("RAR 2.0 encoder has no literal symbols"));
-    }
+fn literal_code_len(symbol_count: usize) -> u8 {
+    // A nonempty member always emits at least one token and there are at most
+    // TABLE_COUNT distinct symbols, so the result fits in u8.
     let len = usize::BITS - (symbol_count - 1).leading_zeros();
-    u8::try_from(len.max(1)).map_err(|_| Error::InvalidData("RAR 2.0 literal table is too large"))
+    len.max(1) as u8
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1358,20 +1350,6 @@ fn level_code_lengths_for_tokens(tokens: &[LevelToken]) -> [u8; LEVEL_COUNT] {
     level_code_lengths_for_used_symbols(used)
 }
 
-fn validated_lengths_for_frequencies<const N: usize>(
-    frequencies: &[usize; N],
-    max_bits: u8,
-) -> [u8; N] {
-    let mut lengths = [0u8; N];
-    lengths.copy_from_slice(&huffman::lengths_for_frequencies(frequencies, max_bits));
-    if canonical_codes(&lengths).is_ok() {
-        return lengths;
-    }
-
-    lengths.copy_from_slice(&huffman::uniform_lengths_for_frequencies(frequencies));
-    lengths
-}
-
 fn encode_audio_member(input: &[u8], channels: usize) -> Result<Vec<u8>> {
     if channels == 0 || channels > MAX_CHANNELS {
         return Err(Error::InvalidData("RAR 2.0 audio channel count is invalid"));
@@ -1406,10 +1384,6 @@ fn encode_audio_member(input: &[u8], channels: usize) -> Result<Vec<u8>> {
         // Audio levels are emitted directly as 0..=15, without run symbols.
     }
 
-    for channel in 0..channels {
-        let table = &levels[channel * AUDIO_COUNT..(channel + 1) * AUDIO_COUNT];
-        validate_audio_table(table)?;
-    }
     let audio_codes = (0..channels)
         .map(|channel| canonical_codes(&levels[channel * AUDIO_COUNT..(channel + 1) * AUDIO_COUNT]))
         .collect::<Result<Vec<_>>>()?;
@@ -1444,19 +1418,6 @@ fn level_code_lengths_for_used_symbols(used: [bool; LEVEL_COUNT]) -> [u8; LEVEL_
     }
     huffman::assign_flat_complete_code(&mut lengths);
     lengths
-}
-
-fn validate_audio_table(lengths: &[u8]) -> Result<()> {
-    let mut count = [0u16; 16];
-    for &len in lengths {
-        if len > 15 {
-            return Err(Error::InvalidData("RAR 2.0 Huffman length is too large"));
-        }
-        if len != 0 {
-            count[len as usize] += 1;
-        }
-    }
-    validate_huffman_counts(&count)
 }
 
 fn audio_encode(input: &[u8], channels: usize) -> Vec<u8> {
@@ -2548,6 +2509,32 @@ mod tests {
         assert!(super::offset_slot_for_match(super::MAX_HISTORY + 1).is_err());
         assert!(super::short_slot_for_match(0).is_err());
         assert!(super::short_slot_for_match(257).is_err());
+    }
+
+    #[test]
+    fn generated_huffman_lengths_are_canonical_for_rar20_table_sizes() {
+        fn check<const N: usize>() {
+            let mut seed = 0x9e37_79b9u32;
+            for round in 0..128 {
+                let mut frequencies = [0usize; N];
+                for frequency in &mut frequencies {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    if !seed.is_multiple_of(5) {
+                        *frequency = 1 + (seed as usize % (1 + round * round));
+                    }
+                }
+                if round % 2 == 0 {
+                    frequencies[0] = 1 << 24;
+                }
+                let lengths = super::huffman::lengths_for_frequency_array(&frequencies, 15);
+                assert!(super::canonical_codes(&lengths).is_ok(), "size {N}, round {round}");
+            }
+        }
+        check::<{ super::MAIN_COUNT }>();
+        check::<{ super::OFFSET_COUNT }>();
+        check::<{ super::LENGTH_COUNT }>();
     }
 
     #[test]

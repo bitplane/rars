@@ -263,18 +263,6 @@ pub(crate) fn lengths_for_frequency_array<const N: usize>(
     lengths
 }
 
-pub(crate) fn uniform_lengths_for_frequencies(frequencies: &[usize]) -> Vec<u8> {
-    let used_count = frequencies
-        .iter()
-        .filter(|&&frequency| frequency != 0)
-        .count();
-    let uniform_length = bits_for_symbol_count(used_count);
-    frequencies
-        .iter()
-        .map(|&frequency| if frequency == 0 { 0 } else { uniform_length })
-        .collect()
-}
-
 pub(crate) fn bits_for_symbol_count(count: usize) -> u8 {
     match count {
         0 | 1 => 1,
