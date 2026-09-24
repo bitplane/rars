@@ -2227,11 +2227,6 @@ fn repair_newsub_recovery_bytes(
         ));
     }
     let parity_sectors = (recovery_data.len() - tag_len) / 512;
-    if parity_sectors == 0 {
-        return Err(Error::InvalidHeader(
-            "RAR 3.x recovery record has no parity sectors",
-        ));
-    }
     let tags = &recovery_data[..tag_len];
     let parity = &recovery_data[tag_len..];
 

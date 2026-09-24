@@ -5548,6 +5548,78 @@ fn parses_rar250_protect_head_recovery_record() {
     assert_eq!(protect.block.offset % 512, 59);
 }
 
+fn rewrite_recovery_header_crc(bytes: &mut [u8], offset: usize, head_size: usize) {
+    let crc = (crc32(&bytes[offset + 2..offset + head_size]) & 0xffff) as u16;
+    bytes[offset..offset + 2].copy_from_slice(&crc.to_le_bytes());
+}
+
+#[test]
+fn rar250_recovery_rejects_invalid_mark_in_archive_bytes() {
+    let mut bytes = std::fs::read(fixture("rar250_protect_head_rr5.rar")).unwrap();
+    let clean = Archive::parse(&bytes).unwrap();
+    let protect = clean.protect_records().next().unwrap();
+    let start = protect.block.offset;
+    bytes[start + 18] ^= 1;
+    rewrite_recovery_header_crc(&mut bytes, start, protect.block.head_size as usize);
+
+    let malformed = Archive::parse(&bytes).unwrap();
+    assert!(matches!(
+        malformed.repair_protect_head(),
+        Err(Error::InvalidHeader("RAR 2.x recovery mark is invalid"))
+    ));
+}
+
+#[test]
+fn rar250_recovery_rejects_zero_parity_record_in_archive_bytes() {
+    let mut bytes = std::fs::read(fixture("rar250_protect_head_rr5.rar")).unwrap();
+    let clean = Archive::parse(&bytes).unwrap();
+    let protect = clean.protect_records().next().unwrap();
+    let start = protect.block.offset;
+    let tag_len = protect.total_blocks as usize * 2;
+    let parity_start = protect.data_range.start + tag_len;
+    bytes.drain(parity_start..protect.data_range.end);
+    bytes[start + 7..start + 11].copy_from_slice(&(tag_len as u32).to_le_bytes());
+    bytes[start + 12..start + 14].copy_from_slice(&0u16.to_le_bytes());
+    rewrite_recovery_header_crc(&mut bytes, start, protect.block.head_size as usize);
+
+    let malformed = Archive::parse(&bytes).unwrap();
+    assert!(matches!(
+        malformed.repair_protect_head(),
+        Err(Error::InvalidHeader(
+            "RAR 2.x recovery record has no parity sectors"
+        ))
+    ));
+}
+
+#[test]
+fn rar250_parser_rejects_inconsistent_recovery_header_geometry() {
+    let original = std::fs::read(fixture("rar250_protect_head_rr5.rar")).unwrap();
+    let clean = Archive::parse(&original).unwrap();
+    let protect = clean.protect_records().next().unwrap();
+    let start = protect.block.offset;
+
+    let mut short_header = original.clone();
+    short_header[start + 5..start + 7].copy_from_slice(&25u16.to_le_bytes());
+    rewrite_recovery_header_crc(&mut short_header, start, 25);
+    assert!(matches!(
+        Archive::parse(&short_header),
+        Err(Error::InvalidHeader(
+            "RAR 2.x recovery header size is invalid"
+        ))
+    ));
+
+    let mut wrong_data_size = original;
+    let add_size = protect.block.add_size.unwrap() as u32 - 1;
+    wrong_data_size[start + 7..start + 11].copy_from_slice(&add_size.to_le_bytes());
+    rewrite_recovery_header_crc(&mut wrong_data_size, start, 26);
+    assert!(matches!(
+        Archive::parse(&wrong_data_size),
+        Err(Error::InvalidHeader(
+            "RAR 2.x recovery data size does not match header"
+        ))
+    ));
+}
+
 #[test]
 fn rar250_protect_head_declares_final_sector_that_overlaps_record() {
     for (path, rec_sectors) in [
@@ -5589,6 +5661,59 @@ fn parses_rar300_newsub_recovery_record() {
     assert_eq!(recovery.file.method, 0x30);
     assert_eq!(recovery.file.pack_size, 5672);
     assert_eq!(recovery.file.unp_size, 5672);
+}
+
+#[test]
+fn rar300_recovery_rejects_stored_size_mismatch_in_archive_bytes() {
+    let mut bytes = std::fs::read(fixture("rar300/with_recovery_rar300.rar")).unwrap();
+    let clean = Archive::parse(&bytes).unwrap();
+    let recovery = clean
+        .new_subs()
+        .find(|sub| sub.kind == NewSubKind::RecoveryRecord)
+        .unwrap();
+    let start = recovery.file.block.offset;
+    let wrong_size = recovery.file.unp_size as u32 - 1;
+    bytes[start + 11..start + 15].copy_from_slice(&wrong_size.to_le_bytes());
+    rewrite_recovery_header_crc(&mut bytes, start, recovery.file.block.head_size as usize);
+
+    let malformed = Archive::parse(&bytes).unwrap();
+    assert!(matches!(
+        malformed.repair_protect_head(),
+        Err(Error::InvalidHeader(
+            "RAR 3.x recovery record packed size does not match unpacked size"
+        ))
+    ));
+}
+
+#[test]
+fn rar300_recovery_rejects_malformed_stored_body_lengths() {
+    let original = std::fs::read(fixture("rar300/with_recovery_rar300.rar")).unwrap();
+    let clean = Archive::parse(&original).unwrap();
+    let recovery = clean
+        .new_subs()
+        .find(|sub| sub.kind == NewSubKind::RecoveryRecord)
+        .unwrap();
+    let tag_len = recovery.file.block.offset.div_ceil(512) * 2;
+    let packed = recovery.file.packed_range.clone();
+    let start = recovery.file.block.offset;
+
+    // One missing parity byte leaves an incomplete sector. Tags alone leave
+    // no parity sectors. Both are malformed recovery payloads.
+    for kept in [packed.len() - 1, tag_len] {
+        let mut bytes = original.clone();
+        bytes.drain(packed.start + kept..packed.end);
+        bytes[start + 7..start + 11].copy_from_slice(&(kept as u32).to_le_bytes());
+        bytes[start + 11..start + 15].copy_from_slice(&(kept as u32).to_le_bytes());
+        rewrite_recovery_header_crc(&mut bytes, start, recovery.file.block.head_size as usize);
+
+        let malformed = Archive::parse(&bytes).unwrap();
+        assert!(matches!(
+            malformed.repair_protect_head(),
+            Err(Error::InvalidHeader(
+                "RAR 3.x recovery data size is invalid"
+            ))
+        ));
+    }
 }
 
 #[test]
