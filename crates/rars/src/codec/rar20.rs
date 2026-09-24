@@ -2554,6 +2554,35 @@ mod tests {
     }
 
     #[test]
+    fn encoder_slot_tables_cover_their_entire_format_ranges() {
+        for length in 3..=super::MAX_ENCODER_MATCH_LENGTH {
+            let (slot, extra) = super::length_slot_for_match(length).unwrap();
+            assert_eq!(super::LENGTH_BASES[slot] + extra + 3, length);
+            assert!(extra < 1usize << super::LENGTH_BITS[slot]);
+        }
+        for offset in 1..=256 {
+            let (slot, extra) = super::short_slot_for_match(offset).unwrap();
+            assert_eq!(super::SHORT_BASES[slot] + extra + 1, offset);
+            assert!(extra < 1usize << super::SHORT_BITS[slot]);
+        }
+        for slot in 0..super::OFFSET_COUNT {
+            for extra in [0, (1usize << super::OFFSET_BITS[slot]) - 1] {
+                let offset = super::OFFSET_BASES[slot] + extra + 1;
+                let (actual_slot, actual_extra) = super::offset_slot_for_match(offset).unwrap();
+                assert_eq!((actual_slot, actual_extra), (slot, extra));
+            }
+        }
+        assert_eq!(super::OFFSET_BASES[super::OFFSET_COUNT - 1] + 65536, super::MAX_HISTORY);
+
+        assert!(super::length_slot_for_match(2).is_err());
+        assert!(super::length_slot_for_match(259).is_err());
+        assert!(super::offset_slot_for_match(0).is_err());
+        assert!(super::offset_slot_for_match(super::MAX_HISTORY + 1).is_err());
+        assert!(super::short_slot_for_match(0).is_err());
+        assert!(super::short_slot_for_match(257).is_err());
+    }
+
+    #[test]
     fn decodes_synthetic_audio_block() {
         let packed = synthetic_audio_block(8);
         let mut decoder = Unpack20::new();
