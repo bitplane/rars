@@ -2300,6 +2300,40 @@ mod tests {
     }
 
     #[test]
+    fn rejects_an_empty_main_huffman_table() {
+        let mut bits = BitWriter::default();
+        bits.write_bits(0, 2); // LZ block with fresh tables.
+        for symbol in 0..LEVEL_COUNT {
+            bits.write_bits(u32::from(symbol == 0 || symbol == 18), 4);
+        }
+        for run in [138u32, 138, 98] {
+            bits.write_bit(true); // Pre-table symbol 18.
+            bits.write_bits(run - 11, 7);
+        }
+
+        assert_eq!(
+            Unpack20::new().decode_member(&bits.finish(), 1).unwrap_err(),
+            Error::InvalidData("RAR 2.0 empty Huffman table")
+        );
+    }
+
+    #[test]
+    fn internal_bit_and_huffman_helpers_reject_out_of_range_requests() {
+        assert!(matches!(
+            Huffman::from_lengths(&[16]),
+            Err(Error::InvalidData("RAR 2.0 Huffman length is too large"))
+        ));
+        assert!(matches!(
+            super::canonical_codes(&[16]),
+            Err(Error::InvalidData("RAR 2.0 Huffman length is too large"))
+        ));
+        assert_eq!(
+            super::BitReader::new().peek_bits(25).unwrap_err(),
+            Error::InvalidData("RAR 2.0 bit read is too wide")
+        );
+    }
+
+    #[test]
     fn decode_member_from_reader_accepts_incremental_input() {
         struct TinyReader<'a> {
             input: &'a [u8],
