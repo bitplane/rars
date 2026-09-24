@@ -498,9 +498,8 @@ fn candidate_lengths(best_length: usize, offset: usize, out: &mut Vec<usize>) {
             out.push(length);
         }
     }
-    if best_length >= 3 {
-        out.push(best_length);
-    }
+    // Callers only pass matches of at least three bytes.
+    out.push(best_length);
     out.sort_unstable();
     out.dedup();
 }
@@ -541,7 +540,8 @@ fn encode_tokens_optimal(
         let node_reps = reps[index];
 
         let mut relax = |next: usize, price: u64, what: EncodeToken, next_reps: [usize; 4]| {
-            if next <= span && here + price < cost[next] {
+            // Literal, fresh, old-offset and short-match edges all end within span.
+            if here + price < cost[next] {
                 cost[next] = here + price;
                 from[next] = index;
                 token[next] = Some(what);
@@ -626,7 +626,7 @@ fn encode_tokens_optimal(
     let mut out = Vec::new();
     let mut at = span;
     while at > 0 {
-        let Some(what) = token[at] else { break };
+        let what = token[at].expect("every parse position has a literal edge");
         out.push(what);
         at = from[at];
     }
@@ -636,7 +636,7 @@ fn encode_tokens_optimal(
 
 /// How far the bytes at `pos` repeat the bytes `offset` back, up to `cap`.
 fn match_run_length(input: &[u8], pos: usize, offset: usize, cap: usize) -> usize {
-    if offset == 0 || offset > pos {
+    if offset == 0 {
         return 0;
     }
     let mut length = 0;
@@ -945,7 +945,7 @@ fn should_lazy_emit_literal(
     current: SelectedMatch,
     context: LazyMatchContext<'_>,
 ) -> bool {
-    if !context.options.lazy_matching || pos + 1 >= context.end {
+    if !context.options.lazy_matching {
         return false;
     }
     let lookahead = context.options.lazy_lookahead.max(1);
@@ -995,7 +995,6 @@ fn best_match(
     if options.max_match_candidates == 0
         || max_offset == 0
         || max_length < 3
-        || pos + 2 >= input.len()
     {
         return None;
     }
@@ -1082,7 +1081,7 @@ fn best_old_offset_match(
     let max_length = (end - pos).min(MAX_ENCODER_MATCH_LENGTH);
     let mut best = None;
     for (index, &offset) in old_offsets.iter().enumerate() {
-        if offset == 0 || offset > pos {
+        if offset == 0 {
             continue;
         }
         let length = match_length_at_offset(input, pos, max_length, offset);
@@ -1186,21 +1185,13 @@ fn old_length_slot_for_match(length: usize, offset: usize) -> Result<(usize, usi
         ));
     }
     let adjusted = encoded - 2;
-    for (slot, &base) in LENGTH_BASES.iter().enumerate() {
-        let extra_bits = LENGTH_BITS[slot];
-        let max = base
-            + if extra_bits == 0 {
-                0
-            } else {
-                (1usize << extra_bits) - 1
-            };
-        if adjusted >= base && adjusted <= max {
-            return Ok((slot, adjusted - base));
-        }
+    if adjusted > 255 {
+        return Err(Error::InvalidData(
+            "RAR 2.0 old-offset match length is too long",
+        ));
     }
-    Err(Error::InvalidData(
-        "RAR 2.0 old-offset match length is too long",
-    ))
+    let slot = LENGTH_BASES.partition_point(|&base| base <= adjusted) - 1;
+    Ok((slot, adjusted - LENGTH_BASES[slot]))
 }
 
 fn offset_slot_for_match(offset: usize) -> Result<(usize, usize)> {
@@ -1326,7 +1317,7 @@ fn emit_zero_level_run(tokens: &mut Vec<LevelToken>, mut run: usize) {
     while run != 0 {
         if run >= 11 {
             let mut chunk = run.min(138);
-            if matches!(run - chunk, 1 | 2) && chunk >= 14 {
+            if matches!(run - chunk, 1 | 2) {
                 chunk -= 3;
             }
             tokens.push(LevelToken::zero_run_long(chunk));
@@ -2572,6 +2563,16 @@ mod tests {
         assert!(super::offset_slot_for_match(super::MAX_HISTORY + 1).is_err());
         assert!(super::short_slot_for_match(0).is_err());
         assert!(super::short_slot_for_match(257).is_err());
+
+        for offset in [1, 0x40000] {
+            let adjustment = super::old_length_adjustment(offset);
+            for adjusted in 0..=255 {
+                let length = adjusted + 2 + adjustment;
+                let (slot, extra) = super::old_length_slot_for_match(length, offset).unwrap();
+                assert_eq!(super::LENGTH_BASES[slot] + extra, adjusted);
+            }
+            assert!(super::old_length_slot_for_match(258 + adjustment, offset).is_err());
+        }
     }
 
     #[test]
