@@ -39,53 +39,11 @@ impl CodecState {
         archive: &Archive,
         file: &FileHeader,
         solid: bool,
-        password: Option<&[u8]>,
     ) -> Result<Vec<u8>> {
         match self {
-            Self::Unpack15(decoder) => {
-                if file.is_encrypted() {
-                    let mut packed = file
-                        .packed_reader_for_decode(archive, password)
-                        .map_err(|error| file.map_encrypted_payload_error(password, error))?;
-                    let mut out = Vec::new();
-                    decoder
-                        .decode_member_from_reader(
-                            &mut packed,
-                            usize::try_from(file.unp_size).map_err(|_| {
-                                Error::InvalidHeader("RAR 1.5 unpacked size overflows usize")
-                            })?,
-                            solid,
-                            &mut out,
-                        )
-                        .map(|_| out)
-                        .map_err(Into::into)
-                        .map_err(|error| file.map_encrypted_payload_error(password, error))
-                } else {
-                    file.unpacked_data_with_unpack15(archive, decoder, solid)
-                }
-            }
-            Self::Unpack20(decoder) => file.unpacked_data_with_unpack20(archive, decoder, password),
-            Self::Unpack29(decoder) => {
-                if file.is_encrypted() {
-                    let mut packed = file
-                        .packed_reader_for_decode(archive, password)
-                        .map_err(|error| file.map_encrypted_payload_error(password, error))?;
-                    let mut out = Vec::new();
-                    decoder
-                        .decode_member_from_reader(
-                            &mut packed,
-                            usize::try_from(file.unp_size).map_err(|_| {
-                                Error::InvalidHeader("RAR 2.9 unpacked size overflows usize")
-                            })?,
-                            &mut out,
-                        )
-                        .map(|_| out)
-                        .map_err(Into::into)
-                        .map_err(|error| file.map_encrypted_payload_error(password, error))
-                } else {
-                    file.unpacked_data_with_rar29(archive, decoder, solid)
-                }
-            }
+            Self::Unpack15(decoder) => file.unpacked_data_with_unpack15(archive, decoder, solid),
+            Self::Unpack20(decoder) => file.unpacked_data_with_unpack20(archive, decoder, None),
+            Self::Unpack29(decoder) => file.unpacked_data_with_rar29(archive, decoder, solid),
         }
     }
 
@@ -237,9 +195,7 @@ impl<'a> DecoderSession<'a> {
             return Ok(Vec::new());
         }
         let solid = self.file_is_solid(file);
-        let password = self.password;
-        self.codec_for(file)?
-            .decode_file_data(archive, file, solid, password)
+        self.codec_for(file)?.decode_file_data(archive, file, solid)
     }
 
     fn file_is_solid(&self, file: &FileHeader) -> bool {

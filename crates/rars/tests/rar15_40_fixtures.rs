@@ -5592,6 +5592,26 @@ fn parses_rar300_newsub_recovery_record() {
 }
 
 #[test]
+fn encrypted_rar300_newsub_recovery_is_rejected_before_decoding() {
+    let bytes = std::fs::read(fixture("rar300/with_recovery_rar300.rar")).unwrap();
+    let mut archive = Archive::parse(&bytes).unwrap();
+    let recovery = archive.blocks.iter_mut().find_map(|block| match block {
+        Block::NewSub(sub) if sub.kind == NewSubKind::RecoveryRecord => Some(sub),
+        _ => None,
+    });
+    let recovery = recovery.unwrap();
+    recovery.file.block.flags |= 0x0004; // FHD_PASSWORD
+
+    assert!(matches!(
+        archive.repair_protect_head(),
+        Err(Error::UnsupportedFeature {
+            version: ArchiveVersion::Rar30,
+            feature: "encrypted RAR 3.x NEWSUB recovery record",
+        })
+    ));
+}
+
+#[test]
 fn parses_compressed_rar300_newsub_recovery_record_fixture() {
     let bytes = std::fs::read(fixture("rar300/with_compressed_recovery_rar300.rar")).unwrap();
     let archive = Archive::parse(&bytes).unwrap();
