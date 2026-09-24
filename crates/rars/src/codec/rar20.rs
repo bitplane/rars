@@ -2378,6 +2378,17 @@ mod tests {
     }
 
     #[test]
+    fn decode_member_from_reader_accepts_an_empty_member() {
+        let mut decoder = Unpack20::new();
+        let mut input = &[][..];
+        let mut output = Vec::new();
+        decoder
+            .decode_member_from_reader(&mut input, 0, &mut output)
+            .unwrap();
+        assert!(output.is_empty());
+    }
+
+    #[test]
     fn decoder_reports_truncated_tables_and_member_payloads() {
         let mut decoder = Unpack20::new();
         assert_eq!(
@@ -2506,6 +2517,24 @@ mod tests {
         assert_eq!(decoder.output, b"\0");
         assert_eq!(decoder.last_length, 5); // 2 + three distance adjustments.
         assert_eq!(decoder.pending_match, Some((4, 0x40000)));
+    }
+
+    #[test]
+    fn unset_old_offset_match_uses_the_first_dictionary_byte() {
+        let mut main_lengths = [0u8; super::MAIN_COUNT];
+        main_lengths[0] = 1;
+        main_lengths[257] = 1;
+        let mut length_lengths = [0u8; super::LENGTH_COUNT];
+        length_lengths[0] = 1;
+        let mut decoder = Unpack20::new();
+        decoder.main = Huffman::from_lengths(&main_lengths).unwrap();
+        decoder.lengths = Huffman::from_lengths(&length_lengths).unwrap();
+        decoder.in_block = true;
+        decoder.bits.append(&[0b1000_0000]);
+
+        decoder.decode_until(2).unwrap();
+        assert_eq!(decoder.output, b"\0\0");
+        assert_eq!(decoder.last_offset, 0);
     }
 
     #[test]
