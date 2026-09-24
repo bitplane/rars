@@ -2451,6 +2451,26 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_table_repeat_without_a_previous_level() {
+        let mut bits = BitWriter::default();
+        bits.write_bits(0, 2); // LZ, new tables.
+        for symbol in 0..LEVEL_COUNT {
+            bits.write_bits(u32::from(symbol == 0 || symbol == 16), 4);
+        }
+        bits.write_bit(true); // Pre-table symbol 16 at position zero.
+        assert_eq!(
+            Unpack20::new().decode_member(&bits.finish(), 1).unwrap_err(),
+            Error::InvalidData("RAR 2.0 table repeat at start")
+        );
+    }
+
+    #[test]
+    fn empty_member_does_not_try_to_decode_an_absent_main_table() {
+        let mut decoder = Unpack20::new();
+        assert_eq!(decoder.decode_member(&[0; 5], 0).unwrap(), b"");
+    }
+
+    #[test]
     fn copy_match_zero_fills_an_offset_that_reaches_past_the_stream() {
         let mut decoder = Unpack20::new();
         decoder.output.extend_from_slice(b"AB");
