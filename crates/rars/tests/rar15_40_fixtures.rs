@@ -5592,6 +5592,35 @@ fn rar250_recovery_rejects_zero_parity_record_in_archive_bytes() {
 }
 
 #[test]
+fn rar250_recovery_rejects_protected_range_past_archive_end() {
+    let mut bytes = std::fs::read(fixture("rar250_protect_head_rr5.rar")).unwrap();
+    let clean = Archive::parse(&bytes).unwrap();
+    let protect = clean.protect_records().next().unwrap();
+    let start = protect.block.offset;
+    let old_tag_len = protect.total_blocks as usize * 2;
+    let declared_blocks = 300u32;
+    let extra_tags = (declared_blocks - protect.total_blocks) as usize * 2;
+    let parity_start = protect.data_range.start + old_tag_len;
+    bytes.splice(
+        parity_start..parity_start,
+        std::iter::repeat_n(0, extra_tags),
+    );
+    let add_size = protect.block.add_size.unwrap() as u32 + extra_tags as u32;
+    bytes[start + 7..start + 11].copy_from_slice(&add_size.to_le_bytes());
+    bytes[start + 14..start + 18].copy_from_slice(&declared_blocks.to_le_bytes());
+    rewrite_recovery_header_crc(&mut bytes, start, protect.block.head_size as usize);
+
+    let malformed = Archive::parse(&bytes).unwrap();
+    assert!((declared_blocks as usize) * 512 > bytes.len());
+    assert!(matches!(
+        malformed.repair_protect_head(),
+        Err(Error::InvalidHeader(
+            "RAR 2.x protected sector range is invalid"
+        ))
+    ));
+}
+
+#[test]
 fn rar250_parser_rejects_inconsistent_recovery_header_geometry() {
     let original = std::fs::read(fixture("rar250_protect_head_rr5.rar")).unwrap();
     let clean = Archive::parse(&original).unwrap();
