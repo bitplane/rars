@@ -2370,14 +2370,16 @@ mod tests {
 
     #[test]
     fn decode_member_from_reader_rejects_a_truncated_payload() {
-        let mut decoder = Unpack20::new();
-        let mut packed = &AUTOREJ_PACKED[..AUTOREJ_PACKED.len() / 2];
-        assert_eq!(
-            decoder
-                .decode_member_from_reader(&mut packed, expected_text().len(), &mut Vec::new())
-                .unwrap_err(),
-            Error::InvalidData("RAR 2.0 bitstream is truncated")
-        );
+        for end in [AUTOREJ_PACKED.len() / 2, AUTOREJ_PACKED.len() - 1] {
+            let mut decoder = Unpack20::new();
+            let mut packed = &AUTOREJ_PACKED[..end];
+            assert_eq!(
+                decoder
+                    .decode_member_from_reader(&mut packed, expected_text().len(), &mut Vec::new())
+                    .unwrap_err(),
+                Error::InvalidData("RAR 2.0 bitstream is truncated")
+            );
+        }
     }
 
     #[test]
@@ -2582,6 +2584,13 @@ mod tests {
         let packed = super::unpack20_encode_auto(input).unwrap();
         assert_eq!(unpack20_decode(&packed, input.len()).unwrap(), input);
 
+        let packed = super::unpack20_encode_auto_with_options(
+            input,
+            EncodeOptions::default().with_try_audio(false),
+        )
+        .unwrap();
+        assert_eq!(unpack20_decode(&packed, input.len()).unwrap(), input);
+
         let mut always_continue = |_| true;
         let packed = super::unpack20_encode_auto_with_options_and_progress(
             input,
@@ -2609,6 +2618,50 @@ mod tests {
             Error::Cancelled
         );
         assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn encoder_checks_cancellation_during_refinement() {
+        let mut calls = 0;
+        let mut cancel_during_refinement = |_| {
+            calls += 1;
+            calls <= 2
+        };
+        assert_eq!(
+            super::unpack20_encode_auto_with_options_and_progress(
+                b"ABCDABCDABCD",
+                EncodeOptions::default().with_try_audio(false),
+                &mut cancel_during_refinement,
+            )
+            .unwrap_err(),
+            Error::Cancelled
+        );
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn encoder_rejects_matches_beyond_the_configured_distance() {
+        let input = b"abcXYabc";
+        let mut finder = super::Rar20MatchFinder::new(input.len());
+        finder.insert(input, 0);
+        assert_eq!(
+            super::best_match(
+                input,
+                5,
+                input.len(),
+                &finder,
+                EncodeOptions::default().with_max_match_distance(2),
+                None,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn missing_literal_code_has_a_nonzero_refinement_cost() {
+        let lengths = [0u8; super::TABLE_COUNT];
+        let prices = CostModel::new(&lengths);
+        assert_eq!(prices.literal_bits(b"x", 0, 1), super::ABSENT_LITERAL_BITS);
     }
 
     #[test]
