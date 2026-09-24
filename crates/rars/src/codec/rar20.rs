@@ -1796,11 +1796,10 @@ impl Unpack20 {
                     let count = 3 + self.bits.read_bits(3)? as usize;
                     fill_levels(&mut new_levels, &mut pos, count, 0)?;
                 }
-                18 => {
+                _ => { // 18: the pre-table contains exactly 19 symbols.
                     let count = 11 + self.bits.read_bits(7)? as usize;
                     fill_levels(&mut new_levels, &mut pos, count, 0)?;
                 }
-                _ => return Err(Error::InvalidData("RAR 2.0 invalid level symbol")),
             }
         }
 
@@ -1855,9 +1854,6 @@ impl Unpack20 {
                     let index = symbol - 257;
                     let offset = self.old_offsets[index];
                     let length_slot = self.lengths.decode(&mut self.bits)?;
-                    if length_slot >= LENGTH_COUNT {
-                        return Err(Error::InvalidData("RAR 2.0 invalid repeat length slot"));
-                    }
                     let mut length = LENGTH_BASES[length_slot] + 2;
                     if LENGTH_BITS[length_slot] != 0 {
                         length += self.bits.read_bits(LENGTH_BITS[length_slot])? as usize;
@@ -1879,9 +1875,7 @@ impl Unpack20 {
                 261..=268 => {
                     let index = symbol - 261;
                     let mut offset = SHORT_BASES[index] + 1;
-                    if SHORT_BITS[index] != 0 {
-                        offset += self.bits.read_bits(SHORT_BITS[index])? as usize;
-                    }
+                    offset += self.bits.read_bits(SHORT_BITS[index])? as usize;
                     self.push_old_offset(offset);
                     self.last_offset = offset;
                     self.last_length = 2;
@@ -1891,7 +1885,7 @@ impl Unpack20 {
                     self.in_block = false;
                     return Ok(());
                 }
-                270..=297 => {
+                _ => { // 270..=297: the main table contains exactly 298 symbols.
                     let length_slot = symbol - 270;
                     let mut length = LENGTH_BASES[length_slot] + 3;
                     if LENGTH_BITS[length_slot] != 0 {
@@ -1909,7 +1903,6 @@ impl Unpack20 {
                     self.last_length = length;
                     self.copy_match(length, offset, output_size)?;
                 }
-                _ => return Err(Error::InvalidData("RAR 2.0 invalid main symbol")),
             }
         }
         Ok(())
@@ -1920,9 +1913,6 @@ impl Unpack20 {
         if symbol == 256 {
             self.in_block = false;
             return Ok(());
-        }
-        if symbol > 256 {
-            return Err(Error::InvalidData("RAR 2.0 invalid audio symbol"));
         }
         let byte = self.decode_audio(symbol as u8);
         self.output.push(byte);
@@ -1998,9 +1988,6 @@ impl Unpack20 {
 
     fn read_offset(&mut self) -> Result<usize> {
         let slot = self.offsets.decode(&mut self.bits)?;
-        if slot >= OFFSET_COUNT {
-            return Err(Error::InvalidData("RAR 2.0 invalid offset slot"));
-        }
         let mut offset = OFFSET_BASES[slot] + 1;
         if OFFSET_BITS[slot] != 0 {
             offset += self.bits.read_bits(OFFSET_BITS[slot])? as usize;
@@ -2587,6 +2574,62 @@ mod tests {
         let mut decoder = Unpack20::new();
         assert_eq!(decoder.decode_member(&packed, 4).unwrap(), vec![0; 4]);
         assert_eq!(decoder.decode_member(&[], 4).unwrap(), vec![0; 4]);
+    }
+
+    #[test]
+    fn lz_member_reads_trailing_table_for_next_solid_member() {
+        let mut bits = BitWriter::default();
+        write_fresh_lz_zero_block(&mut bits, 4, true);
+        write_fresh_lz_zero_block(&mut bits, 4, false);
+        let packed = bits.finish();
+
+        let mut decoder = Unpack20::new();
+        assert_eq!(decoder.decode_member(&packed, 4).unwrap(), vec![0; 4]);
+        assert_eq!(decoder.decode_member(&[], 4).unwrap(), vec![0; 4]);
+    }
+
+    fn write_fresh_lz_zero_block(bits: &mut BitWriter, count: usize, end: bool) {
+        let mut table = [0u8; super::TABLE_COUNT];
+        table[0] = 1;
+        table[269] = 1;
+        let level_tokens = super::encode_table_level_tokens(&table);
+        let level_lengths = super::level_code_lengths_for_tokens(&level_tokens);
+        let level_codes = super::canonical_codes(&level_lengths).unwrap();
+        let main_codes = super::canonical_codes(&table[..super::MAIN_COUNT]).unwrap();
+
+        bits.write_bits(0, 2);
+        for &len in &level_lengths {
+            bits.write_bits(len as u32, 4);
+        }
+        for token in level_tokens {
+            let code = level_codes[token.symbol].unwrap();
+            bits.write_bits(code.code as u32, code.len);
+            bits.write_bits(token.extra_value as u32, token.extra_bits);
+        }
+        let zero = main_codes[0].unwrap();
+        for _ in 0..count {
+            bits.write_bits(zero.code as u32, zero.len);
+        }
+        if end {
+            let end_code = main_codes[269].unwrap();
+            bits.write_bits(end_code.code as u32, end_code.len);
+        }
+    }
+
+    #[test]
+    fn decoder_and_encoder_retain_only_the_last_window_of_solid_history() {
+        let first = vec![b'A'; super::MAX_HISTORY / 2 + 64];
+        let second = vec![b'B'; super::MAX_HISTORY / 2 + 64];
+        let mut encoder = Unpack20Encoder::with_options(EncodeOptions::new(0));
+        let first_packed = encoder.encode_member(&first).unwrap();
+        let second_packed = encoder.encode_member(&second).unwrap();
+        assert_eq!(encoder.history.len(), super::MAX_HISTORY);
+
+        let mut decoder = Unpack20::new();
+        assert_eq!(decoder.decode_member(&first_packed, first.len()).unwrap(), first);
+        assert_eq!(decoder.decode_member(&second_packed, second.len()).unwrap(), second);
+        assert_eq!(decoder.output.len(), super::MAX_HISTORY);
+        assert_eq!(decoder.base_offset, 128);
     }
 
     #[test]
