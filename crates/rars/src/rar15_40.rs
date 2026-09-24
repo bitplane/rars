@@ -3413,6 +3413,22 @@ mod tests {
     }
 
     #[test]
+    fn stored_file_comment_rejects_declared_size_mismatch() {
+        let mut header = file_header_with(FHD_COMMENT);
+        header.file_comment = comment_block(b"note");
+        header.file_comment[7..9].copy_from_slice(&3u16.to_le_bytes());
+        let crc = (crc32(&header.file_comment[2..COMMENT_HEADER_SIZE]) & 0xffff) as u16;
+        header.file_comment[..2].copy_from_slice(&crc.to_le_bytes());
+
+        assert!(matches!(
+            header.file_comment(),
+            Err(Error::InvalidHeader(
+                "RAR 1.5 stored comment has mismatched packed and unpacked sizes"
+            ))
+        ));
+    }
+
+    #[test]
     fn file_header_name_metadata_and_crc_helpers_describe_entry() {
         let mut header = file_header_with(0);
         header.name = b"r\xc3\xa9sum\xc3\xa9.txt".to_vec();

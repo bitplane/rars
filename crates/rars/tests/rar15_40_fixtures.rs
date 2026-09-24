@@ -4920,6 +4920,43 @@ fn reads_rar202_comments_written_by_winrar() {
 }
 
 #[test]
+fn decodes_rar15_compressed_old_style_archive_comment() {
+    // Reuse a WinRAR 1.54 compressed member as comment data. The comment block
+    // carries the same unpack version and method but has a 16-bit output size.
+    let source = std::fs::read(fixture("rar154/readme_154_normal.rar")).unwrap();
+    let source_archive = Archive::parse(&source).unwrap();
+    let file = source_archive.files().next().unwrap();
+    let packed = file.packed_data(&source_archive).unwrap();
+    let expected = std::fs::read(fixture("rar154/expected/README.md")).unwrap();
+    assert_eq!(file.unp_ver, 15);
+    assert_eq!(file.method, 0x33);
+    assert_eq!(file.unp_size as usize, expected.len());
+
+    let comment_head_size = 13 + packed.len();
+    let main_head_size = 13 + comment_head_size;
+    let mut bytes = source[..7].to_vec(); // RAR 1.5 signature
+    let main_start = bytes.len();
+    bytes.extend_from_slice(&[0, 0, 0x73]); // MAIN_HEAD
+    bytes.extend_from_slice(&0x0002u16.to_le_bytes()); // MHD_COMMENT
+    bytes.extend_from_slice(&(main_head_size as u16).to_le_bytes());
+    bytes.extend_from_slice(&[0; 6]); // reserved main-header fields
+    let comment_start = bytes.len();
+    bytes.extend_from_slice(&[0, 0, 0x75, 0, 0]); // COMM_HEAD, no flags
+    bytes.extend_from_slice(&(comment_head_size as u16).to_le_bytes());
+    bytes.extend_from_slice(&(expected.len() as u16).to_le_bytes());
+    bytes.extend_from_slice(&[file.unp_ver, file.method]);
+    bytes.extend_from_slice(&((crc32(&expected) & 0xffff) as u16).to_le_bytes());
+    bytes.extend_from_slice(&packed);
+    let main_crc = (crc32(&bytes[main_start + 2..main_start + 13]) & 0xffff) as u16;
+    bytes[main_start..main_start + 2].copy_from_slice(&main_crc.to_le_bytes());
+    let comment_crc = (crc32(&bytes[comment_start + 2..comment_start + 13]) & 0xffff) as u16;
+    bytes[comment_start..comment_start + 2].copy_from_slice(&comment_crc.to_le_bytes());
+
+    let archive = Archive::parse(&bytes).unwrap();
+    assert_eq!(archive.archive_comment().unwrap().unwrap(), expected);
+}
+
+#[test]
 fn a_written_file_comment_matches_the_block_winrar_writes() {
     let winrar = std::fs::read(fixture("rar202/comment_nopsw.rar")).unwrap();
     let entries = [StoredEntry {
