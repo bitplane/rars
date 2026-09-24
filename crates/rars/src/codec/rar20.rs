@@ -1173,20 +1173,12 @@ fn length_slot_for_match(length: usize) -> Result<(usize, usize)> {
     if length < 3 {
         return Err(Error::InvalidData("RAR 2.0 match length is too short"));
     }
-    let adjusted = length - 3;
-    for (slot, &base) in LENGTH_BASES.iter().enumerate() {
-        let extra_bits = LENGTH_BITS[slot];
-        let max = base
-            + if extra_bits == 0 {
-                0
-            } else {
-                (1usize << extra_bits) - 1
-            };
-        if adjusted >= base && adjusted <= max {
-            return Ok((slot, adjusted - base));
-        }
+    if length > MAX_ENCODER_MATCH_LENGTH {
+        return Err(Error::InvalidData("RAR 2.0 match length is too long"));
     }
-    Err(Error::InvalidData("RAR 2.0 match length is too long"))
+    let adjusted = length - 3;
+    let slot = LENGTH_BASES.partition_point(|&base| base <= adjusted) - 1;
+    Ok((slot, adjusted - LENGTH_BASES[slot]))
 }
 
 fn old_length_slot_for_match(length: usize, offset: usize) -> Result<(usize, usize)> {
@@ -1222,20 +1214,12 @@ fn offset_slot_for_match(offset: usize) -> Result<(usize, usize)> {
     if offset == 0 {
         return Err(Error::InvalidData("RAR 2.0 match offset is zero"));
     }
-    let adjusted = offset - 1;
-    for (slot, &base) in OFFSET_BASES.iter().enumerate() {
-        let extra_bits = OFFSET_BITS[slot];
-        let max = base
-            + if extra_bits == 0 {
-                0
-            } else {
-                (1usize << extra_bits) - 1
-            };
-        if adjusted >= base && adjusted <= max {
-            return Ok((slot, adjusted - base));
-        }
+    if offset > MAX_ENCODER_MATCH_OFFSET {
+        return Err(Error::InvalidData("RAR 2.0 match offset is too large"));
     }
-    Err(Error::InvalidData("RAR 2.0 match offset is too large"))
+    let adjusted = offset - 1;
+    let slot = OFFSET_BASES.partition_point(|&base| base <= adjusted) - 1;
+    Ok((slot, adjusted - OFFSET_BASES[slot]))
 }
 
 fn short_slot_for_match(offset: usize) -> Result<(usize, usize)> {
@@ -1245,16 +1229,8 @@ fn short_slot_for_match(offset: usize) -> Result<(usize, usize)> {
         ));
     }
     let adjusted = offset - 1;
-    for (slot, &base) in SHORT_BASES.iter().enumerate() {
-        let extra_bits = SHORT_BITS[slot];
-        let max = base + (1usize << extra_bits) - 1;
-        if adjusted >= base && adjusted <= max {
-            return Ok((slot, adjusted - base));
-        }
-    }
-    Err(Error::InvalidData(
-        "RAR 2.0 short match offset is out of range",
-    ))
+    let slot = SHORT_BASES.partition_point(|&base| base <= adjusted) - 1;
+    Ok((slot, adjusted - SHORT_BASES[slot]))
 }
 
 fn literal_code_len(symbol_count: usize) -> Result<u8> {
