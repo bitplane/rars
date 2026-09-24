@@ -2716,6 +2716,30 @@ mod tests {
     }
 
     #[test]
+    fn old_offset_ties_prefer_the_shorter_distance() {
+        let lengths = [0u8; super::TABLE_COUNT];
+        let prices = CostModel::new(&lengths);
+        assert!(super::is_better_old_offset_match(
+            Some(&prices),
+            b"aaa",
+            0,
+            1,
+            3,
+            1,
+            Some((0, 3, 2)),
+        ));
+        assert!(!super::is_better_old_offset_match(
+            Some(&prices),
+            b"aaa",
+            0,
+            1,
+            3,
+            3,
+            Some((0, 3, 2)),
+        ));
+    }
+
+    #[test]
     fn audio_encoder_rejects_channel_counts_outside_the_format() {
         for channels in [0, 5] {
             assert_eq!(
