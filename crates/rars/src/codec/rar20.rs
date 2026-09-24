@@ -2430,6 +2430,18 @@ mod tests {
     }
 
     #[test]
+    fn decode_member_from_reader_rejects_a_truncated_payload() {
+        let mut decoder = Unpack20::new();
+        let mut packed = &AUTOREJ_PACKED[..AUTOREJ_PACKED.len() / 2];
+        assert_eq!(
+            decoder
+                .decode_member_from_reader(&mut packed, expected_text().len(), &mut Vec::new())
+                .unwrap_err(),
+            Error::InvalidData("RAR 2.0 bitstream is truncated")
+        );
+    }
+
+    #[test]
     fn decoder_reports_truncated_tables_and_member_payloads() {
         let mut decoder = Unpack20::new();
         assert_eq!(
@@ -2468,6 +2480,30 @@ mod tests {
     fn empty_member_does_not_try_to_decode_an_absent_main_table() {
         let mut decoder = Unpack20::new();
         assert_eq!(decoder.decode_member(&[0; 5], 0).unwrap(), b"");
+
+        decoder.audio_block = true;
+        assert_eq!(decoder.decode_member(&[0; 5], 0).unwrap(), b"");
+    }
+
+    #[test]
+    fn audio_table_resets_the_channel_when_channel_count_shrinks() {
+        let mut decoder = Unpack20::new();
+        decoder.channels = 4;
+        decoder.cur_channel = 3;
+        assert_eq!(
+            decoder.decode_member(&synthetic_audio_block(1), 1).unwrap(),
+            b"\0"
+        );
+        assert_eq!(decoder.cur_channel, 0);
+    }
+
+    #[test]
+    fn audio_lookahead_keeps_a_block_without_an_end_marker() {
+        let mut packed = synthetic_audio_block(4);
+        packed.extend_from_slice(&[0; 5]);
+        let mut decoder = Unpack20::new();
+        assert_eq!(decoder.decode_member(&packed, 4).unwrap(), vec![0; 4]);
+        assert!(decoder.in_block);
     }
 
     #[test]
