@@ -2589,6 +2589,22 @@ mod tests {
         assert_eq!(decoder.decode_member(&[], 4).unwrap(), vec![0; 4]);
     }
 
+    #[test]
+    fn decode_member_carries_a_match_across_output_boundary() {
+        let input = b"ABCD".repeat(20);
+        let packed = unpack20_encode_literals(&input).unwrap();
+        let mut decoder = Unpack20::new();
+
+        let first = decoder.decode_member(&packed, 6).unwrap();
+        assert!(decoder.pending_match.is_some());
+        let second = decoder
+            .decode_member(&[], input.len() - first.len())
+            .unwrap();
+
+        assert_eq!([first, second].concat(), input);
+        assert!(decoder.pending_match.is_none());
+    }
+
     fn expected_text() -> Vec<u8> {
         b"Hello text not audio.\r\n".repeat(100)
     }
