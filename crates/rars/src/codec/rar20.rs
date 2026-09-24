@@ -1065,10 +1065,11 @@ fn is_better_fresh_match(
             .selected_score(best, input, pos)
             .unwrap_or(isize::MIN);
         return candidate_score > best_score
-            || (candidate_score == best_score
-                && (length > best_length || (length == best_length && offset < best_offset)));
+            || (candidate_score == best_score && length > best_length);
     }
-    length > best_length || (length == best_length && offset < best_offset)
+    // The hash chain visits nearest matches first, so an equal-length later
+    // candidate cannot have a smaller offset.
+    length > best_length
 }
 
 fn best_old_offset_match(
