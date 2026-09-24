@@ -1629,7 +1629,7 @@ impl Unpack20 {
             error => error,
         })?;
         self.read_last_tables()?;
-        let out = self.raw_range(start, target)?.to_vec();
+        let out = self.raw_range(start, target).to_vec();
         self.trim_history(target, target);
         Ok(out)
     }
@@ -1678,7 +1678,7 @@ impl Unpack20 {
         })?;
         self.read_last_tables()?;
 
-        let decoded = self.raw_range(start, target)?;
+        let decoded = self.raw_range(start, target);
         out.write_all(decoded)
             .map_err(|_| Error::InvalidData("RAR 2.0 output write failed"))?;
         self.trim_history(target, target);
@@ -1689,7 +1689,7 @@ impl Unpack20 {
         let mut poller = self.read_control.poller();
         while self.current_pos() < target {
             poller.check_codec(self.current_pos())?;
-            self.drain_pending_match(target)?;
+            self.drain_pending_match(target);
             if self.current_pos() >= target {
                 break;
             }
@@ -1796,7 +1796,7 @@ impl Unpack20 {
                         let length = self.last_length;
                         let offset = self.last_offset;
                         self.push_old_offset(offset);
-                        self.copy_match(length, offset, output_size)?;
+                        self.copy_match(length, offset, output_size);
                     }
                 }
                 257..=260 => {
@@ -1819,7 +1819,7 @@ impl Unpack20 {
                     self.push_old_offset(offset);
                     self.last_offset = offset;
                     self.last_length = length;
-                    self.copy_match(length, offset, output_size)?;
+                    self.copy_match(length, offset, output_size);
                 }
                 261..=268 => {
                     let index = symbol - 261;
@@ -1828,7 +1828,7 @@ impl Unpack20 {
                     self.push_old_offset(offset);
                     self.last_offset = offset;
                     self.last_length = 2;
-                    self.copy_match(2, offset, output_size)?;
+                    self.copy_match(2, offset, output_size);
                 }
                 269 => {
                     self.in_block = false;
@@ -1850,7 +1850,7 @@ impl Unpack20 {
                     self.push_old_offset(offset);
                     self.last_offset = offset;
                     self.last_length = length;
-                    self.copy_match(length, offset, output_size)?;
+                    self.copy_match(length, offset, output_size);
                 }
             }
         }
@@ -1944,7 +1944,7 @@ impl Unpack20 {
         Ok(offset)
     }
 
-    fn copy_match(&mut self, length: usize, offset: usize, output_size: usize) -> Result<()> {
+    fn copy_match(&mut self, length: usize, offset: usize, output_size: usize) {
         let offset = if offset == 0 { 1 } else { offset };
         // A match reaching past the start of the stream writes zeroes rather
         // than failing. WinRAR never clears its window and guards the copy
@@ -1962,20 +1962,17 @@ impl Unpack20 {
                 0
             } else {
                 let src = self.current_pos() - offset;
-                *self
-                    .raw_byte(src)
-                    .ok_or(Error::InvalidData("RAR 2.0 match distance is out of range"))?
+                self.raw_byte(src)
             };
             self.output.push(byte);
         }
-        Ok(())
     }
 
-    fn drain_pending_match(&mut self, output_size: usize) -> Result<()> {
+    fn drain_pending_match(&mut self, output_size: usize) {
         let Some((length, offset)) = self.pending_match.take() else {
-            return Ok(());
+            return;
         };
-        self.copy_match(length, offset, output_size)
+        self.copy_match(length, offset, output_size);
     }
 
     fn read_last_tables(&mut self) -> Result<()> {
@@ -2013,23 +2010,16 @@ impl Unpack20 {
         self.base_offset + self.output.len()
     }
 
-    fn raw_byte(&self, position: usize) -> Option<&u8> {
-        self.output.get(position.checked_sub(self.base_offset)?)
+    fn raw_byte(&self, position: usize) -> u8 {
+        // Decoder offsets are at most MAX_HISTORY; trimming retains that window.
+        self.output[position - self.base_offset]
     }
 
-    fn raw_range(&self, start: usize, end: usize) -> Result<&[u8]> {
-        if start < self.base_offset || end < start {
-            return Err(Error::InvalidData(
-                "RAR 2.0 retained history is unavailable",
-            ));
-        }
+    fn raw_range(&self, start: usize, end: usize) -> &[u8] {
+        // Callers take the range before trimming the completed member.
         let rel_start = start - self.base_offset;
         let rel_end = end - self.base_offset;
-        self.output
-            .get(rel_start..rel_end)
-            .ok_or(Error::InvalidData(
-                "RAR 2.0 retained history is unavailable",
-            ))
+        &self.output[rel_start..rel_end]
     }
 
     fn trim_history(&mut self, flushed_pos: usize, current_pos: usize) {
@@ -2481,7 +2471,7 @@ mod tests {
         let mut decoder = Unpack20::new();
         decoder.output.extend_from_slice(b"AB");
 
-        decoder.copy_match(4, 9, 6).unwrap();
+        decoder.copy_match(4, 9, 6);
 
         assert_eq!(decoder.output, b"AB\0\0\0\0");
     }
