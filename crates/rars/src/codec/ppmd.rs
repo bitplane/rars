@@ -389,10 +389,7 @@ impl Suballocator {
             offset += MAX_BUCKET_UNITS as u32;
             remaining -= MAX_BUCKET_UNITS as u32;
         }
-        if remaining == 0 {
-            return;
-        }
-        // The loop above leaves a positive remainder of at most 128 units.
+        // Callers pass positive runs; the loop leaves 1..=128 units.
         let mut i = Self::bucket_for(remaining as usize).expect("run remainder fits a bucket");
         if Self::bucket_units(i) as u32 != remaining {
             let k = Self::bucket_units(i - 1) as u32;
@@ -1839,6 +1836,8 @@ mod tests {
         assert_eq!(s.alloc(0, AllocSide::Lo, 0), None);
         assert_eq!(s.alloc(MAX_BUCKET_UNITS + 1, AllocSide::Lo, 0), None);
         s.free(NULL_OFFSET, 1);
+        s.free(1, 0);
+        s.free(1, MAX_BUCKET_UNITS + 1);
         assert!(s.free_lists.iter().all(Vec::is_empty));
     }
 
@@ -1853,6 +1852,17 @@ mod tests {
             s.alloc(1, AllocSide::Hi, 0).unwrap();
         }
         assert_eq!(s.alloc(1, AllocSide::Hi, 0), Some(old));
+    }
+
+    #[test]
+    fn hi_side_exhaustion_without_a_free_header_uses_rare_allocation() {
+        let mut s = Suballocator::default();
+        s.reset(16 * ALLOC_UNIT_BYTES);
+        while s.hi_bump > s.lo_bump {
+            s.alloc(1, AllocSide::Hi, 0).unwrap();
+        }
+        let before = s.units_start;
+        assert_eq!(s.alloc(1, AllocSide::Hi, 0), Some(before - 1));
     }
 
     #[test]
@@ -2026,6 +2036,14 @@ mod tests {
         assert_eq!(s.free_lists[0], vec![304]);
     }
 
+    #[test]
+    fn in_place_split_buckets_an_inexact_five_unit_residue() {
+        let mut s = Suballocator::default();
+        s.split_in_place(100, 6, 1);
+        assert_eq!(s.free_lists[3], vec![101]);
+        assert_eq!(s.free_lists[0], vec![105]);
+    }
+
     // glue_count debounce: a single bump failure runs the glue pass exactly
     // once, then subsequent failures decrement instead of re-gluing.
     #[test]
@@ -2154,6 +2172,19 @@ mod tests {
             decoder.decode_init(0x20, &mut input, &mut esc),
             Err(Error::InvalidData("RAR PPMd order is invalid"))
         );
+    }
+
+    #[test]
+    fn decode_init_reads_explicit_escape_character() {
+        let mut decoder = PpmdDecoder::new();
+        let mut input = Bytes {
+            input: &[0, b'!', 0, 0, 0, 0],
+        };
+        let mut esc = 2;
+        decoder
+            .decode_init(0x20 | 0x40 | 3, &mut input, &mut esc)
+            .unwrap();
+        assert_eq!(esc, b'!');
     }
 
     #[test]
@@ -2553,6 +2584,14 @@ mod tests {
         assert_eq!(decoder.create_successors(), Some(0));
         decoder.contexts[selected].states[0].successor = Successor::None;
         assert_eq!(decoder.create_successors(), None);
+
+        decoder.min_context = 0;
+        decoder.found_state = StateRef {
+            context: 0,
+            index: 0,
+        };
+        decoder.contexts[0].states[0].successor = Successor::Raw(0);
+        assert_eq!(decoder.create_successors(), Some(0));
     }
 
     #[test]
@@ -2583,6 +2622,8 @@ mod tests {
         };
         let ctx = decoder.push_context(context).unwrap();
         let original = decoder.contexts[ctx].array_offset;
+        decoder.shrink_state_array(ctx, 12, 12);
+        assert_eq!(decoder.contexts[ctx].array_offset, original);
         // Six and five units share a bucket, so this shrink keeps its slot.
         decoder.shrink_state_array(ctx, 12, 10);
         assert_eq!(decoder.contexts[ctx].array_offset, original);
