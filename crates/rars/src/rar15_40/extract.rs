@@ -1096,6 +1096,30 @@ mod tests {
     }
 
     #[test]
+    fn empty_compressed_data_decode_preserves_solid_state_and_checks_crc() {
+        let mut session = DecoderSession::new(true);
+        let mut entry = file(b"empty.txt", super::super::FHD_SOLID);
+        entry.method = 0x35;
+        session.codec = Some(CodecState::new_for(&entry).unwrap());
+        session.decoded_files = 2;
+        let archive = archive_with(vec![Block::File(entry.clone())]);
+
+        assert_eq!(session.decode_file_data(&archive, &entry).unwrap(), b"");
+        assert_eq!(session.decoded_files, 2);
+        assert!(matches!(session.codec, Some(CodecState::Unpack29(_))));
+
+        entry.file_crc = 1;
+        assert!(matches!(
+            session.decode_file_data(&archive, &entry),
+            Err(Error::Crc32Mismatch {
+                expected: 1,
+                actual: 0
+            })
+        ));
+        assert_eq!(session.decoded_files, 2);
+    }
+
+    #[test]
     fn split_cipher_new_rejects_unsupported_unpack_version() {
         for ver in [14u8, 16, 19, 25, 27, 28] {
             assert!(
