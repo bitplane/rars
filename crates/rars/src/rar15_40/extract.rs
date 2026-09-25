@@ -1497,6 +1497,29 @@ mod tests {
     }
 
     #[test]
+    fn extraction_rejects_stored_members_with_mismatched_packed_size() {
+        let data = b"payload";
+        for unpacked_size in [data.len() as u64 - 1, data.len() as u64 + 1] {
+            let mut entry = file(b"stored.txt", 0);
+            entry.pack_size = data.len() as u64;
+            entry.unp_size = unpacked_size;
+            entry.packed_range = 0..data.len();
+            let archive = archive_with_source(vec![Block::File(entry)], data.to_vec());
+
+            for parallel in [false, true] {
+                let open = |_: &ExtractedEntryMeta| Ok(Box::new(std::io::sink()) as Box<dyn Write>);
+                let result = if parallel {
+                    archive.extract_to_parallel_buffered(crate::ArchiveReadOptions::default(), open)
+                } else {
+                    archive.extract_to(crate::ArchiveReadOptions::default(), open)
+                };
+                let error = result.expect_err("stored member size mismatch must fail");
+                assert!(matches!(error.root_cause(), Error::InvalidHeader(_)));
+            }
+        }
+    }
+
+    #[test]
     fn decrypting_reader_works_through_boxed_inner_reader() {
         let plain = *b"0123456789abcdefRAR2 block two!!";
         let mut encrypted = plain;
