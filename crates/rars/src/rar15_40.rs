@@ -3504,6 +3504,41 @@ mod tests {
     }
 
     #[test]
+    fn memory_and_seekable_parsers_reject_invalid_file_header_lengths() {
+        let original = stored_archive_bytes(b"lengths.txt", b"payload");
+        let file_offset = Archive::parse(&original)
+            .unwrap()
+            .files()
+            .next()
+            .unwrap()
+            .block
+            .offset;
+
+        for (head_size, truncated) in [(6u16, false), (u16::MAX, true)] {
+            let mut bytes = original.clone();
+            bytes[file_offset + 5..file_offset + 7].copy_from_slice(&head_size.to_le_bytes());
+
+            let memory = Archive::parse(&bytes).unwrap_err();
+            let seekable = Archive::parse_seekable(
+                std::io::Cursor::new(&bytes),
+                bytes.len() as u64,
+                0,
+                ArchiveSource::Memory(Arc::from(bytes.clone().into_boxed_slice())),
+                crate::ArchiveReadOptions::default(),
+            )
+            .unwrap_err();
+
+            if truncated {
+                assert!(matches!(memory, Error::TooShort));
+                assert!(matches!(seekable, Error::TooShort));
+            } else {
+                assert!(matches!(memory, Error::InvalidHeader(_)));
+                assert!(matches!(seekable, Error::InvalidHeader(_)));
+            }
+        }
+    }
+
+    #[test]
     fn archive_parse_owned_consumes_buffer_without_changing_dispatch() {
         let bytes = stored_archive_bytes(b"owned.txt", b"hello rar15 owned");
         let archive = Archive::parse_owned(bytes.clone()).unwrap();
