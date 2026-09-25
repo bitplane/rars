@@ -3518,22 +3518,27 @@ mod tests {
             let mut bytes = original.clone();
             bytes[file_offset + 5..file_offset + 7].copy_from_slice(&head_size.to_le_bytes());
 
-            let memory = Archive::parse(&bytes).unwrap_err();
-            let seekable = Archive::parse_seekable(
-                std::io::Cursor::new(&bytes),
-                bytes.len() as u64,
-                0,
-                ArchiveSource::Memory(Arc::from(bytes.clone().into_boxed_slice())),
+            for options in [
                 crate::ArchiveReadOptions::default(),
-            )
-            .unwrap_err();
+                crate::ArchiveReadOptions::default().with_max_header_bytes(u64::MAX),
+            ] {
+                let memory = Archive::parse_with_options(&bytes, options).unwrap_err();
+                let seekable = Archive::parse_seekable(
+                    std::io::Cursor::new(&bytes),
+                    bytes.len() as u64,
+                    0,
+                    ArchiveSource::Memory(Arc::from(bytes.clone().into_boxed_slice())),
+                    options,
+                )
+                .unwrap_err();
 
-            if truncated {
-                assert!(matches!(memory, Error::TooShort));
-                assert!(matches!(seekable, Error::TooShort));
-            } else {
-                assert!(matches!(memory, Error::InvalidHeader(_)));
-                assert!(matches!(seekable, Error::InvalidHeader(_)));
+                if truncated {
+                    assert!(matches!(memory, Error::TooShort));
+                    assert!(matches!(seekable, Error::TooShort));
+                } else {
+                    assert!(matches!(memory, Error::InvalidHeader(_)));
+                    assert!(matches!(seekable, Error::InvalidHeader(_)));
+                }
             }
         }
     }
