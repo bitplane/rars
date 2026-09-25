@@ -725,24 +725,29 @@ impl PpmdDecoder {
             let mut count = self.range.get_threshold(freq_sum)?;
             if count < hi_cnt {
                 let mut start = 0u32;
+                let mut selected = None;
                 for (index, state) in self.contexts[mc].states.iter().enumerate() {
                     if !mask[state.symbol as usize] {
                         continue;
                     }
                     let freq = state.freq as u32;
                     if count < freq {
-                        let symbol = state.symbol;
-                        self.range.decode(start, freq);
-                        self.update_see(see_ref);
-                        self.found_state = StateRef { context: mc, index };
-                        self.update2()?;
-                        self.range.normalize(input)?;
-                        return Ok(Some(symbol));
+                        selected = Some((index, start, freq, state.symbol));
+                        break;
                     }
                     count -= freq;
                     start += freq;
                 }
-                return Err(Error::InvalidData("RAR PPMd masked symbol is invalid"));
+                // hi_cnt was summed from these same unmodified, unmasked
+                // frequencies, so count < hi_cnt must select a state.
+                let (index, start, freq, symbol) =
+                    selected.expect("masked threshold selects a state");
+                self.range.decode(start, freq);
+                self.update_see(see_ref);
+                self.found_state = StateRef { context: mc, index };
+                self.update2()?;
+                self.range.normalize(input)?;
+                return Ok(Some(symbol));
             }
             if count >= freq_sum {
                 return Err(Error::InvalidData("RAR PPMd escape symbol is invalid"));
@@ -2171,6 +2176,57 @@ mod tests {
         assert_eq!(
             decoder.decode_symbol(&mut input),
             Err(Error::InvalidData("RAR PPMd frequency sum is invalid"))
+        );
+    }
+
+    #[test]
+    fn decoder_rejects_invalid_escape_range_and_symbol() {
+        fn escaping_model(code_delta: u32) -> PpmdDecoder {
+            let mut decoder = PpmdDecoder::new();
+            decoder.init_model(4);
+            let state = |symbol| State {
+                symbol,
+                freq: 1,
+                successor: Successor::None,
+            };
+            decoder.contexts.push(Context {
+                states: vec![state(b'a'), state(b'b'), state(b'c')],
+                summ_freq: 4,
+                suffix: Some(0),
+                header_offset: NULL_OFFSET,
+                array_offset: NULL_OFFSET,
+            });
+            decoder.contexts.push(Context {
+                states: vec![state(b'a'), state(b'b')],
+                summ_freq: 3,
+                suffix: Some(1),
+                header_offset: NULL_OFFSET,
+                array_offset: NULL_OFFSET,
+            });
+            decoder.min_context = 2;
+            decoder.range.range = 100_000;
+            // The first escape leaves a 33_333-unit range straddling TOP.
+            // That is above BOT, so normalization consumes no input.
+            decoder.range.low = TOP - 20_000 - 2 * (100_000 / 3);
+            decoder.range.code = decoder.range.low + code_delta;
+            decoder
+        }
+
+        let mut decoder = escaping_model(2 * (100_000 / 3));
+        decoder.see[0][7] = See {
+            summ: u16::MAX,
+            shift: 0,
+            count: 1,
+        };
+        assert_eq!(
+            decoder.decode_symbol(&mut Bytes { input: &[] }),
+            Err(Error::InvalidData("RAR PPMd escape range is invalid"))
+        );
+
+        let mut decoder = escaping_model(110_000);
+        assert_eq!(
+            decoder.decode_symbol(&mut Bytes { input: &[] }),
+            Err(Error::InvalidData("RAR PPMd escape symbol is invalid"))
         );
     }
 
