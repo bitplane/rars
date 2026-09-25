@@ -215,9 +215,8 @@ impl Suballocator {
     // (into the text-reservation zone). Succeeds only if the new units
     // floor would still sit above the current text-write position.
     fn fallback_bump(&mut self, bucket: usize, text_len_bytes: usize) -> Option<u32> {
-        if self.unbounded {
-            return None;
-        }
+        // An unbounded allocator always succeeds in try_bump, so only a
+        // bounded pool reaches this fallback.
         let need_units = Self::bucket_units(bucket) as u32;
         let need_bytes = need_units as u64 * ALLOC_UNIT_BYTES as u64;
         // UnitsStart byte pointer includes the pool-top remainder, matching
@@ -278,9 +277,8 @@ impl Suballocator {
     fn split_in_place(&mut self, base_offset: u32, old_units: u32, new_units: u32) {
         let nu = old_units - new_units;
         let residue_offset = base_offset + new_units;
-        let Some(mut i) = Self::bucket_for(nu as usize) else {
-            return;
-        };
+        // Both inputs are distinct bucket sizes; their difference is 1..128.
+        let mut i = Self::bucket_for(nu as usize).expect("split residue is a valid bucket size");
         if Self::bucket_units(i) as u32 != nu {
             // Inexact fit: the C reference pushes the smaller piece first
             // (at offset + bucket_units(i-1)) onto bucket index `nu - k - 1`,
@@ -394,9 +392,8 @@ impl Suballocator {
         if remaining == 0 {
             return;
         }
-        let Some(mut i) = Self::bucket_for(remaining as usize) else {
-            return;
-        };
+        // The loop above leaves a positive remainder of at most 128 units.
+        let mut i = Self::bucket_for(remaining as usize).expect("run remainder fits a bucket");
         if Self::bucket_units(i) as u32 != remaining {
             let k = Self::bucket_units(i - 1) as u32;
             let small_bucket = (remaining - k - 1) as usize;
@@ -1836,6 +1833,87 @@ mod tests {
         assert!(s.text_has_room(usize::MAX / 2));
     }
 
+    #[test]
+    fn suballoc_rejects_invalid_sizes_and_ignores_null_free() {
+        let mut s = Suballocator::default();
+        assert_eq!(s.alloc(0, AllocSide::Lo, 0), None);
+        assert_eq!(s.alloc(MAX_BUCKET_UNITS + 1, AllocSide::Lo, 0), None);
+        s.free(NULL_OFFSET, 1);
+        assert!(s.free_lists.iter().all(Vec::is_empty));
+    }
+
+    #[test]
+    fn hi_side_reuses_a_header_only_after_bump_space_is_exhausted() {
+        let mut s = Suballocator::default();
+        s.reset(16 * ALLOC_UNIT_BYTES);
+        let old = s.alloc(1, AllocSide::Hi, 0).unwrap();
+        s.free(old, 1);
+        assert_ne!(s.alloc(1, AllocSide::Hi, 0), Some(old));
+        while s.hi_bump > s.lo_bump {
+            s.alloc(1, AllocSide::Hi, 0).unwrap();
+        }
+        assert_eq!(s.alloc(1, AllocSide::Hi, 0), Some(old));
+    }
+
+    #[test]
+    fn rare_allocation_splits_larger_free_block() {
+        let mut s = Suballocator::default();
+        s.reset(32 * ALLOC_UNIT_BYTES);
+        // Exhaust the ordinary unit interval. Keep one six-unit block free
+        // and suppress glue so the rare path must split that exact block.
+        let large = s.alloc(6, AllocSide::Lo, 0).unwrap();
+        while s.hi_bump > s.lo_bump {
+            s.alloc(1, AllocSide::Lo, 0).unwrap();
+        }
+        s.free(large, 6);
+        s.glue_count = 1;
+        assert_eq!(s.alloc(1, AllocSide::Lo, 0), Some(large));
+        // A six-unit block minus one leaves five, represented as 4 + 1.
+        assert!(s.free_lists[3].contains(&(large + 1)));
+        assert!(s.free_lists[0].contains(&(large + 5)));
+    }
+
+    #[test]
+    fn rare_allocation_borrows_text_space() {
+        let mut s = Suballocator::default();
+        s.reset(16 * ALLOC_UNIT_BYTES);
+        while s.hi_bump > s.lo_bump {
+            s.alloc(1, AllocSide::Lo, 0).unwrap();
+        }
+        // With no free block, the allocator takes one unit from the text
+        // reservation while leaving room for the text pointer.
+        let before = s.units_start;
+        assert_eq!(s.alloc(1, AllocSide::Lo, 0), Some(before - 1));
+        assert_eq!(s.text_capacity_bytes, (before - 1) as usize * ALLOC_UNIT_BYTES);
+    }
+
+    #[test]
+    fn rare_allocation_stops_when_text_reservation_is_full() {
+        let mut s = Suballocator::default();
+        s.reset(16 * ALLOC_UNIT_BYTES);
+        while s.hi_bump > s.lo_bump {
+            s.alloc(1, AllocSide::Lo, 0).unwrap();
+        }
+        let text_end = s.text_capacity_bytes;
+        assert_eq!(s.alloc(1, AllocSide::Lo, text_end), None);
+    }
+
+    #[test]
+    fn cancelled_glue_aborts_rare_allocation() {
+        let token = crate::ReadCancellation::new();
+        let control = crate::read_control::ReadControl::new(Some(&token));
+        control.cancel_after_checks(1);
+        let mut s = Suballocator { read_control: control, ..Suballocator::default() };
+        s.reset(16 * ALLOC_UNIT_BYTES);
+        while s.hi_bump > s.lo_bump {
+            s.alloc(1, AllocSide::Lo, 0).unwrap();
+        }
+        s.free_lists[0] = (0..5000).collect();
+        assert_eq!(s.alloc(2, AllocSide::Lo, 0), None);
+        assert!(s.interrupted);
+        assert!(token.is_cancelled());
+    }
+
     // Spec §4.3: free blocks that are address-adjacent should merge into a
     // larger run during glue, and that merged run should be visible in the
     // bucket whose size matches.
@@ -1914,6 +1992,19 @@ mod tests {
         // The 128 block starts at `a`, the 64 follows.
         assert_eq!(s.free_lists[bucket_128][0], a);
         assert_eq!(s.free_lists[bucket_64][0], a + 128);
+    }
+
+    #[test]
+    fn glue_does_not_merge_a_run_to_65536_units() {
+        let mut s = Suballocator::default();
+        // A 16-bit NU cannot hold 65536 units. Populate the same 512 adjacent
+        // 128-unit free blocks without allocating a huge backing pool.
+        let bucket = Suballocator::bucket_for(128).unwrap();
+        s.free_lists[bucket] = (0..512).map(|i| i * 128).collect();
+        s.glue();
+        assert_eq!(s.free_lists[bucket].len(), 512);
+        assert_eq!(s.free_lists[bucket].iter().copied().min(), Some(0));
+        assert_eq!(s.free_lists[bucket].iter().copied().max(), Some(511 * 128));
     }
 
     // glue_count debounce: a single bump failure runs the glue pass exactly
