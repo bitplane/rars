@@ -1037,9 +1037,9 @@ impl PpmdDecoder {
         let freq = self.state(fs)?.freq as u32 + 4;
         self.contexts[fs.context].summ_freq = self.contexts[fs.context].summ_freq.wrapping_add(4);
         self.state_mut(fs)?.freq = freq as u8;
-        if fs.index > 0
-            && self.contexts[fs.context].states[fs.index].freq
-                > self.contexts[fs.context].states[fs.index - 1].freq
+        // Both decode and encode call update1 only for a non-first state.
+        if self.contexts[fs.context].states[fs.index].freq
+            > self.contexts[fs.context].states[fs.index - 1].freq
         {
             self.contexts[fs.context]
                 .states
@@ -2296,6 +2296,19 @@ mod tests {
         encoder.range = 100;
         encoder.normalize();
         assert!(!encoder.out.is_empty());
+
+        // Straddling TOP alone does not normalize while enough range remains.
+        let mut decoder = RangeDecoder::new();
+        decoder.low = TOP - 20_000;
+        decoder.range = 40_000;
+        decoder.normalize(&mut Bytes { input: &[] }).unwrap();
+        assert_eq!(decoder.range, 40_000);
+
+        let mut encoder = RangeEncoder::new();
+        encoder.low = TOP - 20_000;
+        encoder.range = 40_000;
+        encoder.normalize();
+        assert!(encoder.out.is_empty());
     }
 
     #[test]
@@ -2837,6 +2850,12 @@ mod tests {
             vec![(b'c', 40), (b'a', 7), (b'b', 1)]
         );
         assert_eq!(decoder.contexts[ctx].summ_freq, 49);
+
+        let (mut decoder, ctx) = model(&[(b'a', 10), (b'b', 125), (b'c', 2)], 138, 1, 1);
+        decoder.rescale();
+        assert_eq!(decoder.found_state.index, 0);
+        assert_eq!(decoder.contexts[ctx].states[0].symbol, b'b');
+        assert_eq!(decoder.contexts[ctx].states[0].freq, 65);
 
         let (mut decoder, ctx) = model(&[(b'a', 125), (b'b', 1), (b'c', 1)], 130, 0, 0);
         decoder.rescale();
