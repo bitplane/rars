@@ -31,9 +31,9 @@ fn build_alloc_tables() -> AllocTables {
     for (i, index_to_unit) in index_to_units.iter_mut().enumerate() {
         let step = if i >= 12 { 4 } else { i / 4 + 1 };
         for _ in 0..step {
-            if k < units_to_index.len() {
-                units_to_index[k] = i as u8;
-            }
+            // The bucket construction has exactly 128 entries: the first
+            // 12 buckets contribute 24 and the remaining 26 contribute 104.
+            units_to_index[k] = i as u8;
             k += 1;
         }
         *index_to_unit = k.min(u8::MAX as usize) as u8;
@@ -1884,7 +1884,10 @@ mod tests {
         // reservation while leaving room for the text pointer.
         let before = s.units_start;
         assert_eq!(s.alloc(1, AllocSide::Lo, 0), Some(before - 1));
-        assert_eq!(s.text_capacity_bytes, (before - 1) as usize * ALLOC_UNIT_BYTES);
+        assert_eq!(
+            s.text_capacity_bytes,
+            (before - 1) as usize * ALLOC_UNIT_BYTES
+        );
     }
 
     #[test]
@@ -1903,7 +1906,10 @@ mod tests {
         let token = crate::ReadCancellation::new();
         let control = crate::read_control::ReadControl::new(Some(&token));
         control.cancel_after_checks(1);
-        let mut s = Suballocator { read_control: control, ..Suballocator::default() };
+        let mut s = Suballocator {
+            read_control: control,
+            ..Suballocator::default()
+        };
         s.reset(16 * ALLOC_UNIT_BYTES);
         while s.hi_bump > s.lo_bump {
             s.alloc(1, AllocSide::Lo, 0).unwrap();
@@ -2005,6 +2011,19 @@ mod tests {
         assert_eq!(s.free_lists[bucket].len(), 512);
         assert_eq!(s.free_lists[bucket].iter().copied().min(), Some(0));
         assert_eq!(s.free_lists[bucket].iter().copied().max(), Some(511 * 128));
+    }
+
+    #[test]
+    fn glue_emits_exact_128_unit_chunks_and_inexact_remainder() {
+        let mut s = Suballocator::default();
+        s.emit_run(10, 256);
+        let full = Suballocator::bucket_for(128).unwrap();
+        assert_eq!(s.free_lists[full], vec![10, 138]);
+
+        // Five units have no dedicated bucket: split into four plus one.
+        s.emit_run(300, 5);
+        assert_eq!(s.free_lists[3], vec![300]);
+        assert_eq!(s.free_lists[0], vec![304]);
     }
 
     // glue_count debounce: a single bump failure runs the glue pass exactly
@@ -2122,6 +2141,102 @@ mod tests {
         assert_eq!(decoder.contexts.len(), 1);
         assert_eq!(decoder.contexts[0].states.len(), 256);
         assert_eq!(decoder.max_contexts, model_context_limit(1));
+    }
+
+    #[test]
+    fn decode_init_rejects_wire_order_one() {
+        let mut decoder = PpmdDecoder::new();
+        let mut input = Bytes {
+            input: &[0, 0, 0, 0, 0],
+        };
+        let mut esc = 0;
+        assert_eq!(
+            decoder.decode_init(0x20, &mut input, &mut esc),
+            Err(Error::InvalidData("RAR PPMd order is invalid"))
+        );
+    }
+
+    #[test]
+    fn decoder_reports_invalid_range_and_frequency_sum() {
+        let mut decoder = PpmdDecoder::new();
+        decoder.init_model(4);
+        let mut input = Bytes { input: &[] };
+        decoder.range.range = 1;
+        assert_eq!(
+            decoder.decode_symbol(&mut input),
+            Err(Error::InvalidData("RAR PPMd range is invalid"))
+        );
+
+        decoder.range.range = 257;
+        decoder.contexts[0].summ_freq = 1;
+        decoder.range.code = 256 * 257;
+        assert_eq!(
+            decoder.decode_symbol(&mut input),
+            Err(Error::InvalidData("RAR PPMd frequency sum is invalid"))
+        );
+    }
+
+    #[test]
+    fn root_escape_ends_ppmd_stream_and_interruption_takes_precedence() {
+        let mut decoder = PpmdDecoder::new();
+        decoder.init_model(4);
+        let total = decoder.contexts[0].summ_freq as u32;
+        decoder.range.code = 256 * (decoder.range.range / total);
+        let mut input = Bytes { input: &[0; 16] };
+        assert_eq!(decoder.decode_symbol(&mut input), Ok(None));
+
+        decoder.init_model(4);
+        decoder.suballoc.interrupted = true;
+        assert_eq!(decoder.decode_symbol(&mut input), Err(Error::Cancelled));
+    }
+
+    #[test]
+    fn range_decoder_rejects_reserved_initial_code() {
+        let mut range = RangeDecoder::new();
+        let mut input = Bytes { input: &[0xff; 4] };
+        assert_eq!(
+            range.init(&mut input),
+            Err(Error::InvalidData("RAR PPMd range code is invalid"))
+        );
+    }
+
+    #[test]
+    fn encoder_rejects_invalid_match_and_repeat_bounds() {
+        let mut encoder = PpmdEncoder::new(4, 2, 1).unwrap();
+        for length in [3, 260] {
+            assert_eq!(
+                encoder.encode_repeat_offset_one(length),
+                Err(Error::InvalidData(
+                    "RAR PPMd offset-one repeat length is invalid"
+                ))
+            );
+        }
+        for (offset, length) in [(1, 32), (0x1000002, 32), (2, 31), (2, 288)] {
+            assert_eq!(
+                encoder.encode_match(offset, length),
+                Err(Error::InvalidData("RAR PPMd match is invalid"))
+            );
+        }
+    }
+
+    #[test]
+    fn encoder_rejects_corrupt_frequency_sum_and_missing_root_symbol() {
+        let mut decoder = PpmdDecoder::new();
+        decoder.init_model(4);
+        decoder.contexts[0].states.truncate(2);
+        decoder.contexts[0].summ_freq = 2;
+        assert_eq!(
+            decoder.encode_symbol(2, &mut RangeEncoder::new()),
+            Err(Error::InvalidData("RAR PPMd frequency sum is invalid"))
+        );
+
+        decoder.init_model(4);
+        decoder.contexts[0].states.truncate(2);
+        decoder.contexts[0].summ_freq = 3;
+        assert_eq!(
+            decoder.encode_symbol(2, &mut RangeEncoder::new()),
+            Err(Error::InvalidData("RAR PPMd symbol is not encodable"))
+        );
     }
 
     #[test]
