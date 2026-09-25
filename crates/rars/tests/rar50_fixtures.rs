@@ -3801,6 +3801,43 @@ fn rejects_rar50_header_encrypted_archive_without_or_with_wrong_password() {
 }
 
 #[test]
+fn rejects_unsupported_rar50_header_encryption_version() {
+    let mut bytes = std::fs::read(fixture("header_encrypted.rar")).unwrap();
+    let start = 8; // RAR5 signature length.
+    let mut pos = start + 4; // Header CRC32.
+    let read_vint = |pos: &mut usize| {
+        let mut value = 0u64;
+        let mut shift = 0;
+        loop {
+            let byte = bytes[*pos];
+            *pos += 1;
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return value;
+            }
+            shift += 7;
+        }
+    };
+    let body_size = read_vint(&mut pos) as usize;
+    let header_end = pos + body_size;
+    assert_eq!(read_vint(&mut pos), 4); // HEAD_CRYPT.
+    read_vint(&mut pos); // Header flags.
+    let version_pos = pos;
+    assert_eq!(read_vint(&mut pos), 0);
+    bytes[version_pos] = 1;
+    let crc = crc32(&bytes[start + 4..header_end]);
+    bytes[start..start + 4].copy_from_slice(&crc.to_le_bytes());
+
+    assert!(matches!(
+        Archive::parse_with_password(&bytes, Some(b"password")),
+        Err(Error::UnsupportedFeature {
+            feature: "RAR 5 unknown header encryption version",
+            ..
+        })
+    ));
+}
+
+#[test]
 fn parses_and_extracts_rar50_header_encrypted_archive_with_password() {
     let bytes = std::fs::read(fixture("header_encrypted.rar")).unwrap();
     let archive = Archive::parse_with_password(&bytes, Some(b"password")).unwrap();
