@@ -3838,6 +3838,25 @@ fn rejects_unsupported_rar50_header_encryption_version() {
 }
 
 #[test]
+fn parses_rar50_header_encryption_without_optional_password_check() {
+    let mut bytes = std::fs::read(fixture("header_encrypted.rar")).unwrap();
+    // This fixture has a one-byte header size and the check value is the last
+    // 12 bytes of HEAD_CRYPT. RARLAB marks that field optional; reference
+    // UnRAR also tests the archive after removing it and fixing size and CRC.
+    assert_eq!(&bytes[12..18], &[33, 4, 0, 0, 1, 15]);
+    bytes.drain(34..46);
+    bytes[12] -= 12; // Header size.
+    bytes[16] = 0; // Encryption flags: no password check value.
+    let crc = crc32(&bytes[12..34]);
+    bytes[8..12].copy_from_slice(&crc.to_le_bytes());
+
+    let archive = Archive::parse_with_password(&bytes, Some(b"password")).unwrap();
+    let extracted = collect_extract(&archive).unwrap();
+    assert_eq!(extracted.len(), 1);
+    assert_eq!(extracted[0].data, b"Hello, RAR 5.0 fixture world.\n");
+}
+
+#[test]
 fn parses_and_extracts_rar50_header_encrypted_archive_with_password() {
     let bytes = std::fs::read(fixture("header_encrypted.rar")).unwrap();
     let archive = Archive::parse_with_password(&bytes, Some(b"password")).unwrap();
