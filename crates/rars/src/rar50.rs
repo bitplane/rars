@@ -2341,6 +2341,48 @@ fn decode_compression_info(raw: u64) -> Result<CompressionInfo> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn duplicate_and_unknown_file_extras_disable_rewrite_preservation() {
+        let archive = build_archive_with_optional_comment(None);
+        let original = archive.files().next().unwrap();
+        let control = crate::read_control::ReadControl::default();
+        let mut hash_record = vec![34, FHEXTRA_HASH as u8, 0];
+        hash_record.extend_from_slice(&[7; 32]);
+
+        let mut single = original.clone();
+        single.block.extra_area_size = Some(hash_record.len() as u64);
+        parse_file_extra_area(
+            &hash_record,
+            0..hash_record.len(),
+            false,
+            &mut single,
+            &control,
+        )
+        .unwrap();
+        assert!(single.rewrite_metadata_complete);
+        assert!(single.hash.is_some());
+
+        let duplicate = [hash_record.as_slice(), hash_record.as_slice()].concat();
+        let mut repeated = original.clone();
+        repeated.block.extra_area_size = Some(duplicate.len() as u64);
+        parse_file_extra_area(
+            &duplicate,
+            0..duplicate.len(),
+            false,
+            &mut repeated,
+            &control,
+        )
+        .unwrap();
+        assert!(!repeated.rewrite_metadata_complete);
+        assert!(repeated.hash.is_some());
+
+        let unknown = [1, 64];
+        let mut future = original.clone();
+        future.block.extra_area_size = Some(unknown.len() as u64);
+        parse_file_extra_area(&unknown, 0..unknown.len(), false, &mut future, &control).unwrap();
+        assert!(!future.rewrite_metadata_complete);
+    }
+
+    #[test]
     fn archive_metadata_time_flags_follow_rar5_wire_widths() {
         let control = crate::read_control::ReadControl::default();
         // RARLAB technote: 0x04 selects Unix time, and 0x08 widens Unix
