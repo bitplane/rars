@@ -1481,20 +1481,8 @@ impl FileHeader {
         decoder: &mut Unpack50Decoder,
         decryptor: Option<&SplitDecryptor>,
     ) -> Result<Vec<u8>> {
-        if self.is_stored() {
-            let mut data = Vec::new();
-            let mut reader = decoder
-                .read_control
-                .reader(split.fragment_reader(volumes, decryptor)?);
-            reader.read_to_end(&mut data)?;
-            if data.len() as u64 != self.unpacked_size {
-                return Err(Error::InvalidHeader(
-                    "RAR 5 stored split file has mismatched packed and unpacked sizes",
-                ));
-            }
-            return Ok(data);
-        }
-
+        // PendingSplitRefs::write_to dispatches stored members to
+        // write_stored_to before calling this compressed-member decoder.
         let info = self.decoded_compression_info()?;
         let dictionary_size = usize::try_from(info.dictionary_size).map_err(|_| {
             Error::InvalidHeader("RAR 5 dictionary size overflows host address size")
