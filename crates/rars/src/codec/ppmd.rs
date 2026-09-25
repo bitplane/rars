@@ -2436,6 +2436,88 @@ mod tests {
     }
 
     #[test]
+    fn successor_creation_materializes_raw_chain_and_handles_limits() {
+        let mut decoder = PpmdDecoder::new();
+        decoder.max_contexts = 10;
+        decoder.init_model(4);
+        let selected = decoder
+            .push_context(Context {
+                states: vec![State {
+                    symbol: b'a',
+                    freq: 2,
+                    successor: Successor::Raw(0),
+                }],
+                summ_freq: 0,
+                suffix: Some(0),
+                header_offset: NULL_OFFSET,
+                array_offset: NULL_OFFSET,
+            })
+            .unwrap();
+        decoder.contexts[0].states[b'a' as usize].successor = Successor::Raw(0);
+        decoder.min_context = selected;
+        decoder.found_state = StateRef {
+            context: selected,
+            index: 0,
+        };
+        decoder.order_fall = 1;
+        decoder.text.push(b'b');
+
+        let mut limited = decoder.clone();
+        limited.max_contexts = 2;
+        assert_eq!(limited.create_successors(), None);
+        let mut conflicting = decoder.clone();
+        conflicting.contexts[0].states[b'a' as usize].successor = Successor::None;
+        assert_eq!(conflicting.create_successors(), None);
+
+        let leaf = decoder.create_successors().unwrap();
+        assert_eq!(decoder.contexts.len(), 4);
+        assert_eq!(decoder.contexts[leaf].states[0].symbol, b'b');
+        assert_eq!(decoder.contexts[leaf].suffix, Some(2));
+        assert_eq!(
+            decoder.contexts[0].states[b'a' as usize].successor,
+            Successor::Context(2)
+        );
+        assert_eq!(
+            decoder.contexts[selected].states[0].successor,
+            Successor::Context(leaf)
+        );
+    }
+
+    #[test]
+    fn successor_creation_reuses_existing_context_without_materialization() {
+        let mut decoder = PpmdDecoder::new();
+        decoder.max_contexts = 4;
+        decoder.init_model(4);
+        let selected = decoder
+            .push_context(Context {
+                states: vec![State {
+                    symbol: b'a',
+                    freq: 2,
+                    successor: Successor::Raw(0),
+                }],
+                summ_freq: 0,
+                suffix: Some(0),
+                header_offset: NULL_OFFSET,
+                array_offset: NULL_OFFSET,
+            })
+            .unwrap();
+        decoder.min_context = selected;
+        decoder.found_state = StateRef {
+            context: selected,
+            index: 0,
+        };
+        decoder.order_fall = 0;
+        decoder.contexts[0].states[b'a' as usize].successor = Successor::Context(0);
+        assert_eq!(decoder.create_successors(), Some(0));
+        assert_eq!(decoder.contexts.len(), 2);
+
+        decoder.contexts[selected].states[0].successor = Successor::Context(0);
+        assert_eq!(decoder.create_successors(), Some(0));
+        decoder.contexts[selected].states[0].successor = Successor::None;
+        assert_eq!(decoder.create_successors(), None);
+    }
+
+    #[test]
     fn interrupted_model_init_does_not_erase_contexts() {
         let mut decoder = PpmdDecoder::new();
         decoder.init_model(4);
