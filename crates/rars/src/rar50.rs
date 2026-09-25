@@ -2341,6 +2341,53 @@ fn decode_compression_info(raw: u64) -> Result<CompressionInfo> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn archive_metadata_time_flags_follow_rar5_wire_widths() {
+        let control = crate::read_control::ReadControl::default();
+        // RARLAB technote: 0x04 selects Unix time, and 0x08 widens Unix
+        // seconds to nanoseconds. Without 0x04, time is a FILETIME u64.
+        for (flags, time, expected, complete) in [
+            (
+                0x02,
+                0x01d9_0000_0000_0000u64.to_le_bytes().to_vec(),
+                0x01d9_0000_0000_0000,
+                true,
+            ),
+            (
+                0x06,
+                1_700_000_000u32.to_le_bytes().to_vec(),
+                1_700_000_000,
+                true,
+            ),
+            (
+                0x0e,
+                1_700_000_000_123_456_789u64.to_le_bytes().to_vec(),
+                1_700_000_000_123_456_789,
+                true,
+            ),
+            (
+                0x0a,
+                1_700_000_000_123_456_789u64.to_le_bytes().to_vec(),
+                1_700_000_000_123_456_789,
+                false,
+            ),
+        ] {
+            let mut extra = vec![
+                (2 + time.len()) as u8,
+                MHEXTRA_ARCHIVE_METADATA as u8,
+                flags,
+            ];
+            extra.extend_from_slice(&time);
+            let (records, is_complete) =
+                parse_main_extra_area(&extra, 0..extra.len(), &control).unwrap();
+            assert_eq!(is_complete, complete, "flags {flags:#x}");
+            assert!(
+                matches!(records.as_slice(), [MainExtraRecord::ArchiveMetadata(record)]
+                if record.flags == u64::from(flags) && record.creation_time == Some(expected))
+            );
+        }
+    }
+
+    #[test]
     fn malformed_extra_tail_keeps_preceding_record_and_marks_area_incomplete() {
         let valid = [1, 2]; // Record type 2 with no data.
         let overflowing_size = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01];
