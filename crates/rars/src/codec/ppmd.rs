@@ -1655,12 +1655,7 @@ impl RangeDecoder {
     }
 
     fn normalize(&mut self, input: &mut impl PpmdByteReader) -> Result<()> {
-        while (self.low ^ self.low.wrapping_add(self.range)) < TOP
-            || (self.range < BOT && {
-                self.range = self.low.wrapping_neg() & (BOT - 1);
-                true
-            })
-        {
+        while normalize_range(self.low, &mut self.range) {
             self.code = (self.code << 8) | input.read_ppmd_byte()? as u32;
             self.range <<= 8;
             self.low <<= 8;
@@ -1701,12 +1696,7 @@ impl RangeEncoder {
     }
 
     fn normalize(&mut self) {
-        while (self.low ^ self.low.wrapping_add(self.range)) < TOP
-            || (self.range < BOT && {
-                self.range = self.low.wrapping_neg() & (BOT - 1);
-                true
-            })
-        {
+        while normalize_range(self.low, &mut self.range) {
             self.out.push((self.low >> 24) as u8);
             self.range <<= 8;
             self.low <<= 8;
@@ -1720,6 +1710,17 @@ impl RangeEncoder {
         }
         self.out
     }
+}
+
+fn normalize_range(low: u32, range: &mut u32) -> bool {
+    if (low ^ low.wrapping_add(*range)) < TOP {
+        return true;
+    }
+    if *range >= BOT {
+        return false;
+    }
+    *range = low.wrapping_neg() & (BOT - 1);
+    true
 }
 
 fn update_prob_1(prob: u32) -> u32 {
