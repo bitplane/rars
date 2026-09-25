@@ -358,10 +358,12 @@ fn table_lengths_for_tokens(
     } else {
         table_lengths[..MAIN_COUNT]
             .copy_from_slice(&huffman::lengths_for_frequency_array(&main_frequencies, 15));
-        table_lengths[MAIN_COUNT..MAIN_COUNT + OFFSET_COUNT]
-            .copy_from_slice(&huffman::lengths_for_frequency_array(&offset_frequencies, 15));
-        table_lengths[MAIN_COUNT + OFFSET_COUNT..TABLE_COUNT]
-            .copy_from_slice(&huffman::lengths_for_frequency_array(&length_frequencies, 15));
+        table_lengths[MAIN_COUNT..MAIN_COUNT + OFFSET_COUNT].copy_from_slice(
+            &huffman::lengths_for_frequency_array(&offset_frequencies, 15),
+        );
+        table_lengths[MAIN_COUNT + OFFSET_COUNT..TABLE_COUNT].copy_from_slice(
+            &huffman::lengths_for_frequency_array(&length_frequencies, 15),
+        );
     }
     Ok(table_lengths)
 }
@@ -908,16 +910,16 @@ fn select_match(
             }),
             best_short_offset_match(input, pos, end),
         ]
-            .into_iter()
-            .flatten()
-            .max_by_key(|&selected| {
-                (
-                    cost_model
-                        .selected_score(selected, input, pos)
-                        .unwrap_or(isize::MIN),
-                    selected.length(),
-                )
-            });
+        .into_iter()
+        .flatten()
+        .max_by_key(|&selected| {
+            (
+                cost_model
+                    .selected_score(selected, input, pos)
+                    .unwrap_or(isize::MIN),
+                selected.length(),
+            )
+        });
     }
 
     match (fresh, old) {
@@ -1001,10 +1003,7 @@ fn best_match(
 ) -> Option<(usize, usize)> {
     let max_offset = pos.min(options.max_match_distance);
     let max_length = (end - pos).min(MAX_ENCODER_MATCH_LENGTH);
-    if options.max_match_candidates == 0
-        || max_offset == 0
-        || max_length < 3
-    {
+    if options.max_match_candidates == 0 || max_offset == 0 || max_length < 3 {
         return None;
     }
     let mut best = None;
@@ -1712,7 +1711,8 @@ impl Unpack20 {
                     let count = 3 + self.bits.read_bits(3)? as usize;
                     fill_levels(&mut new_levels, &mut pos, count, 0)?;
                 }
-                _ => { // 18: the pre-table contains exactly 19 symbols.
+                _ => {
+                    // 18: the pre-table contains exactly 19 symbols.
                     let count = 11 + self.bits.read_bits(7)? as usize;
                     fill_levels(&mut new_levels, &mut pos, count, 0)?;
                 }
@@ -1801,7 +1801,8 @@ impl Unpack20 {
                     self.in_block = false;
                     return Ok(());
                 }
-                _ => { // 270..=297: the main table contains exactly 298 symbols.
+                _ => {
+                    // 270..=297: the main table contains exactly 298 symbols.
                     let length_slot = symbol - 270;
                     let mut length = LENGTH_BASES[length_slot] + 3;
                     if LENGTH_BITS[length_slot] != 0 {
@@ -2318,7 +2319,9 @@ mod tests {
         }
 
         assert_eq!(
-            Unpack20::new().decode_member(&bits.finish(), 1).unwrap_err(),
+            Unpack20::new()
+                .decode_member(&bits.finish(), 1)
+                .unwrap_err(),
             Error::InvalidData("RAR 2.0 empty Huffman table")
         );
     }
@@ -2424,7 +2427,9 @@ mod tests {
         }
         bits.write_bit(true); // Pre-table symbol 16 at position zero.
         assert_eq!(
-            Unpack20::new().decode_member(&bits.finish(), 1).unwrap_err(),
+            Unpack20::new()
+                .decode_member(&bits.finish(), 1)
+                .unwrap_err(),
             Error::InvalidData("RAR 2.0 table repeat at start")
         );
     }
@@ -2468,15 +2473,14 @@ mod tests {
             state.dif = [u32::MAX / 4; 11];
             state.dif[winning_difference] = 0;
             let coefficient = (winning_difference - 1) / 2;
-            state.k[coefficient] = if winning_difference % 2 == 1 {
-                -17
-            } else {
-                16
-            };
+            state.k[coefficient] = if winning_difference % 2 == 1 { -17 } else { 16 };
             let before = state.k;
 
             decoder.decode_audio(0);
-            assert_eq!(decoder.audio[0].k, before, "difference {winning_difference}");
+            assert_eq!(
+                decoder.audio[0].k, before,
+                "difference {winning_difference}"
+            );
         }
     }
 
@@ -2570,7 +2574,10 @@ mod tests {
                 assert_eq!((actual_slot, actual_extra), (slot, extra));
             }
         }
-        assert_eq!(super::OFFSET_BASES[super::OFFSET_COUNT - 1] + 65536, super::MAX_HISTORY);
+        assert_eq!(
+            super::OFFSET_BASES[super::OFFSET_COUNT - 1] + 65536,
+            super::MAX_HISTORY
+        );
 
         assert!(super::length_slot_for_match(2).is_err());
         assert!(super::length_slot_for_match(259).is_err());
@@ -2608,7 +2615,10 @@ mod tests {
                     frequencies[0] = 1 << 24;
                 }
                 let lengths = super::huffman::lengths_for_frequency_array(&frequencies, 15);
-                assert!(super::canonical_codes(&lengths).is_ok(), "size {N}, round {round}");
+                assert!(
+                    super::canonical_codes(&lengths).is_ok(),
+                    "size {N}, round {round}"
+                );
             }
         }
         check::<{ super::MAIN_COUNT }>();
@@ -2859,14 +2869,8 @@ mod tests {
         let lengths = [0u8; super::TABLE_COUNT];
         let prices = CostModel::new(&lengths);
 
-        let tokens = super::encode_tokens_optimal(
-            &input,
-            start,
-            end,
-            &mut finder,
-            options,
-            &prices,
-        );
+        let tokens =
+            super::encode_tokens_optimal(&input, start, end, &mut finder, options, &prices);
         assert_eq!(tokens.len(), 5);
         assert!(tokens
             .iter()
@@ -2985,8 +2989,14 @@ mod tests {
         assert_eq!(encoder.history.len(), super::MAX_HISTORY);
 
         let mut decoder = Unpack20::new();
-        assert_eq!(decoder.decode_member(&first_packed, first.len()).unwrap(), first);
-        assert_eq!(decoder.decode_member(&second_packed, second.len()).unwrap(), second);
+        assert_eq!(
+            decoder.decode_member(&first_packed, first.len()).unwrap(),
+            first
+        );
+        assert_eq!(
+            decoder.decode_member(&second_packed, second.len()).unwrap(),
+            second
+        );
         assert_eq!(decoder.output.len(), super::MAX_HISTORY);
         assert_eq!(decoder.base_offset, 128);
     }
