@@ -2565,6 +2565,137 @@ mod tests {
     }
 
     #[test]
+    fn rescale_sorts_survivors_and_collapses_or_shrinks_arrays() {
+        fn model(
+            freqs: &[(u8, u8)],
+            sum: u16,
+            order_fall: usize,
+            found: usize,
+        ) -> (PpmdDecoder, usize) {
+            let mut decoder = PpmdDecoder::new();
+            decoder.max_contexts = 4;
+            decoder.init_model(4);
+            let ctx = decoder
+                .push_context(Context {
+                    states: freqs
+                        .iter()
+                        .map(|&(symbol, freq)| State {
+                            symbol,
+                            freq,
+                            successor: Successor::None,
+                        })
+                        .collect(),
+                    summ_freq: sum,
+                    suffix: Some(0),
+                    header_offset: NULL_OFFSET,
+                    array_offset: NULL_OFFSET,
+                })
+                .unwrap();
+            decoder.min_context = ctx;
+            decoder.found_state = StateRef {
+                context: ctx,
+                index: found,
+            };
+            decoder.order_fall = order_fall;
+            (decoder, ctx)
+        }
+
+        let (mut decoder, ctx) = model(&[(b'a', 10), (b'b', 1), (b'c', 80)], 92, 1, 0);
+        decoder.rescale();
+        assert_eq!(
+            decoder.contexts[ctx]
+                .states
+                .iter()
+                .map(|s| (s.symbol, s.freq))
+                .collect::<Vec<_>>(),
+            vec![(b'c', 40), (b'a', 7), (b'b', 1)]
+        );
+        assert_eq!(decoder.contexts[ctx].summ_freq, 49);
+
+        let (mut decoder, ctx) = model(&[(b'a', 125), (b'b', 1), (b'c', 1)], 130, 0, 0);
+        decoder.rescale();
+        assert_eq!(decoder.contexts[ctx].states.len(), 1);
+        assert_eq!(decoder.contexts[ctx].states[0].freq, 16);
+        assert_eq!(decoder.contexts[ctx].array_offset, NULL_OFFSET);
+
+        let (mut decoder, ctx) = model(&[(b'a', 125), (b'b', 2), (b'c', 1)], 130, 0, 0);
+        let old_array = decoder.contexts[ctx].array_offset;
+        decoder.rescale();
+        assert_eq!(
+            decoder.contexts[ctx]
+                .states
+                .iter()
+                .map(|s| (s.symbol, s.freq))
+                .collect::<Vec<_>>(),
+            vec![(b'a', 64), (b'b', 1)]
+        );
+        assert_eq!(decoder.contexts[ctx].summ_freq, 67);
+        assert_eq!(decoder.contexts[ctx].array_offset, old_array);
+        assert!(decoder.suballoc.free_lists[0].contains(&(old_array + 1)));
+    }
+
+    #[test]
+    fn frequency_updates_rescale_at_the_reference_call_sites() {
+        fn model(freqs: &[(u8, u8)], selected: usize) -> (PpmdDecoder, usize) {
+            let mut decoder = PpmdDecoder::new();
+            decoder.max_contexts = 4;
+            decoder.init_model(4);
+            let ctx = decoder
+                .push_context(Context {
+                    states: freqs
+                        .iter()
+                        .map(|&(symbol, freq)| State {
+                            symbol,
+                            freq,
+                            successor: Successor::None,
+                        })
+                        .collect(),
+                    summ_freq: freqs.iter().map(|&(_, freq)| freq as u16).sum::<u16>() + 1,
+                    suffix: Some(0),
+                    header_offset: NULL_OFFSET,
+                    array_offset: NULL_OFFSET,
+                })
+                .unwrap();
+            for state in &mut decoder.contexts[ctx].states {
+                state.successor = Successor::Context(ctx);
+            }
+            decoder.min_context = ctx;
+            decoder.max_context = ctx;
+            decoder.found_state = StateRef {
+                context: ctx,
+                index: selected,
+            };
+            decoder.order_fall = 0;
+            (decoder, ctx)
+        }
+
+        let (mut decoder, ctx) = model(&[(b'a', 121), (b'b', 1)], 0);
+        decoder.update1_0().unwrap();
+        assert_eq!(decoder.contexts[ctx].states.len(), 1);
+
+        let (mut decoder, ctx) = model(&[(b'a', 1), (b'b', 121)], 1);
+        decoder.update1().unwrap();
+        assert_eq!(decoder.contexts[ctx].states.len(), 1);
+
+        // Variant H rescales update1 only when the selected state moves
+        // ahead of its predecessor, even if its frequency now exceeds 124.
+        let (mut decoder, ctx) = model(&[(b'a', 125), (b'b', 121)], 1);
+        decoder.update1().unwrap();
+        assert_eq!(decoder.contexts[ctx].states[1].freq, 125);
+        assert_eq!(decoder.contexts[ctx].states.len(), 2);
+
+        let (mut decoder, ctx) = model(&[(b'a', 121), (b'b', 1)], 0);
+        decoder.update2().unwrap();
+        assert_eq!(decoder.contexts[ctx].states.len(), 1);
+
+        let (mut decoder, ctx) = model(&[(b'a', 127)], 0);
+        decoder.update_bin().unwrap();
+        assert_eq!(decoder.contexts[ctx].states[0].freq, 128);
+        decoder.update_bin().unwrap();
+        assert_eq!(decoder.contexts[ctx].states[0].freq, 128);
+    }
+
+    #[test]
     fn make_esc_freq_rejects_invalid_masked_state_count() {
         let mut decoder = PpmdDecoder::new();
         decoder.init_model(4);
