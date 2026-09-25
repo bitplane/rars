@@ -1137,31 +1137,32 @@ impl PpmdDecoder {
             self.init_model(self.max_order);
             return Ok(());
         }
-        let mut min_successor = fs.successor;
-        if min_successor != Successor::None {
-            if matches!(min_successor, Successor::Raw(_)) {
+        let (min_context, had_successor) = match fs.successor {
+            Successor::None => {
+                self.state_mut(self.found_state)?.successor = max_successor;
+                (self.min_context, false)
+            }
+            Successor::Context(context) => (context, true),
+            Successor::Raw(_) => {
                 let Some(context) = self.create_successors() else {
                     self.init_model(self.max_order);
                     return Ok(());
                 };
-                min_successor = Successor::Context(context);
+                (context, true)
             }
+        };
+        if had_successor {
             self.order_fall -= 1;
             if self.order_fall == 0 && self.max_context != self.min_context {
                 self.text.pop();
             }
-        } else {
-            self.state_mut(self.found_state)?.successor = max_successor;
-            min_successor = Successor::Context(self.min_context);
         }
+        let min_successor = Successor::Context(min_context);
 
         let mc = self.min_context;
         let mut c = self.max_context;
-        self.min_context = match min_successor {
-            Successor::Context(context) => context,
-            _ => self.min_context,
-        };
-        self.max_context = self.min_context;
+        self.min_context = min_context;
+        self.max_context = min_context;
         if c == mc {
             return Ok(());
         }
@@ -2725,6 +2726,9 @@ mod tests {
 
         decoder.contexts[selected].states[0].successor = Successor::Context(0);
         assert_eq!(decoder.create_successors(), Some(0));
+        decoder.order_fall = 1;
+        assert_eq!(decoder.create_successors(), None);
+        decoder.order_fall = 0;
         decoder.contexts[selected].states[0].successor = Successor::None;
         assert_eq!(decoder.create_successors(), None);
 
