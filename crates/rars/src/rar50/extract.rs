@@ -494,6 +494,12 @@ impl FileHeader {
         password: Option<&[u8]>,
         writer: &mut dyn Write,
     ) -> Result<()> {
+        if !self.encrypted && self.packed_size() != self.unpacked_size {
+            return Err(self.entry_error(
+                "decoding",
+                Error::InvalidHeader("RAR 5 stored file has mismatched packed and unpacked sizes"),
+            ));
+        }
         let (mut reader, keys) = self
             .packed_reader_with_password(archive, password)
             .map_err(|error| self.entry_error("decoding", error))?;
@@ -2073,6 +2079,28 @@ mod tests {
             .decode_packed_with_decoder(&exact, &mut decoder)
             .unwrap();
         assert_eq!(trimmed.len(), encrypted.unpacked_size as usize);
+    }
+
+    #[test]
+    fn extraction_rejects_stored_members_with_mismatched_packed_size() {
+        let data = b"payload";
+        for unpacked_size in [data.len() as u64 - 1, data.len() as u64 + 1] {
+            let mut file = plain_file(b"stored.txt", data, None);
+            file.unpacked_size = unpacked_size;
+            file.block.data_range = 0..data.len();
+            let archive = archive_with_blocks(vec![Block::File(file)], data.to_vec());
+
+            for parallel in [false, true] {
+                let open = |_: &ExtractedEntryMeta| Ok(Box::new(std::io::sink()) as Box<dyn Write>);
+                let result = if parallel {
+                    archive.extract_to_parallel_buffered(crate::ArchiveReadOptions::default(), open)
+                } else {
+                    archive.extract_to(crate::ArchiveReadOptions::default(), open)
+                };
+                let error = result.expect_err("stored member size mismatch must fail");
+                assert!(matches!(error.root_cause(), Error::InvalidHeader(_)));
+            }
+        }
     }
 
     #[test]
