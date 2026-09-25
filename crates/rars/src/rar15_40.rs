@@ -3539,6 +3539,34 @@ mod tests {
     }
 
     #[test]
+    fn parsers_reject_a_validly_checksummed_non_main_header() {
+        let mut bytes = stored_archive_bytes(b"entry.txt", b"payload");
+        let main_offset = RAR15_SIGNATURE.len();
+        let main_size =
+            u16::from_le_bytes([bytes[main_offset + 5], bytes[main_offset + 6]]) as usize;
+        bytes[main_offset + 2] = FILE_HEAD;
+        test_write_header_crc(&mut bytes[main_offset..main_offset + main_size], 0);
+
+        let memory = Archive::parse(&bytes).unwrap_err();
+        let seekable = Archive::parse_seekable(
+            std::io::Cursor::new(&bytes),
+            bytes.len() as u64,
+            0,
+            ArchiveSource::Memory(Arc::from(bytes.clone().into_boxed_slice())),
+            crate::ArchiveReadOptions::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            memory,
+            Error::InvalidHeader("RAR 1.5 main header is missing")
+        ));
+        assert!(matches!(
+            seekable,
+            Error::InvalidHeader("RAR 1.5 main header is missing")
+        ));
+    }
+
+    #[test]
     fn archive_parse_owned_consumes_buffer_without_changing_dispatch() {
         let bytes = stored_archive_bytes(b"owned.txt", b"hello rar15 owned");
         let archive = Archive::parse_owned(bytes.clone()).unwrap();
