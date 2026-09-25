@@ -1194,13 +1194,11 @@ impl PpmdDecoder {
                 sum = freq as u32 + self.init_esc + u32::from(ns > 3);
             }
 
-            let mut cf = (sum + 6)
-                .checked_mul(2)
-                .and_then(|value| value.checked_mul(fs.freq as u32))
-                .ok_or(Error::InvalidData("RAR PPMd model frequency overflows"))?;
-            let sf = s0
-                .checked_add(sum)
-                .ok_or(Error::InvalidData("RAR PPMd model frequency overflows"))?;
+            // sum is at most u16::MAX + 3 here, s0 at most u16::MAX,
+            // and fs.freq at most u8::MAX. Even the largest product is
+            // below 34 million, so u32 arithmetic cannot overflow.
+            let mut cf = (sum + 6) * 2 * fs.freq as u32;
+            let sf = s0 + sum;
             if sf == 0 {
                 return Err(Error::InvalidData("RAR PPMd model frequency is invalid"));
             }
@@ -2541,6 +2539,71 @@ mod tests {
             decoder.update_model(),
             Err(Error::InvalidData("RAR PPMd model frequency is invalid"))
         ));
+    }
+
+    #[test]
+    fn update_model_rejects_zero_frequency_sum_and_unrepresentable_sum() {
+        fn chain(
+            ancestor: Vec<State>,
+            ancestor_sum: u16,
+            selected: Vec<State>,
+            selected_sum: u16,
+        ) -> PpmdDecoder {
+            let mut decoder = PpmdDecoder::new();
+            decoder.max_contexts = 10;
+            decoder.init_model(4);
+            let ancestor = decoder
+                .push_context(Context {
+                    states: ancestor,
+                    summ_freq: ancestor_sum,
+                    suffix: Some(0),
+                    header_offset: NULL_OFFSET,
+                    array_offset: NULL_OFFSET,
+                })
+                .unwrap();
+            let selected = decoder
+                .push_context(Context {
+                    states: selected,
+                    summ_freq: selected_sum,
+                    suffix: Some(ancestor),
+                    header_offset: NULL_OFFSET,
+                    array_offset: NULL_OFFSET,
+                })
+                .unwrap();
+            decoder.min_context = selected;
+            decoder.max_context = ancestor;
+            decoder.found_state = StateRef {
+                context: selected,
+                index: 0,
+            };
+            decoder.order_fall = 1;
+            decoder
+        }
+        let state = |symbol, freq| State {
+            symbol,
+            freq,
+            successor: Successor::None,
+        };
+
+        let mut decoder = chain(
+            vec![state(b'a', 0)],
+            0,
+            vec![state(b'c', 31), state(b'd', 1)],
+            32,
+        );
+        assert_eq!(
+            decoder.update_model(),
+            Err(Error::InvalidData("RAR PPMd model frequency is invalid"))
+        );
+
+        let selected = (0..10)
+            .map(|i| state(b'c' + i, if i == 0 { 31 } else { 1 }))
+            .collect();
+        let mut decoder = chain(vec![state(b'a', 1), state(b'b', 1)], u16::MAX, selected, 40);
+        assert_eq!(
+            decoder.update_model(),
+            Err(Error::InvalidData("RAR PPMd model frequency overflows"))
+        );
     }
 
     #[test]
