@@ -2341,6 +2341,64 @@ fn decode_compression_info(raw: u64) -> Result<CompressionInfo> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn file_encryption_record_accepts_optional_check_and_rejects_truncation() {
+        let mut without_check = vec![0, 0, 0]; // Version, flags, KDF count.
+        without_check.extend_from_slice(&[7; 16]); // Salt.
+        without_check.extend_from_slice(&[9; 16]); // IV.
+        let plain = parse_file_encryption_record(&without_check, 0..without_check.len()).unwrap();
+        assert_eq!(plain.check_value, None);
+        assert_eq!(plain.salt, [7; 16]);
+        assert_eq!(plain.iv, [9; 16]);
+
+        let mut with_check = without_check.clone();
+        with_check[1] = 1;
+        with_check.extend_from_slice(&[3; 12]);
+        let checked = parse_file_encryption_record(&with_check, 0..with_check.len()).unwrap();
+        assert_eq!(checked.check_value, Some([3; 12]));
+
+        assert!(matches!(
+            parse_file_encryption_record(&[0, 0], 0..2),
+            Err(Error::TooShort)
+        ));
+        assert!(matches!(
+            parse_file_encryption_record(
+                &without_check[..without_check.len() - 1],
+                0..without_check.len() - 1
+            ),
+            Err(Error::TooShort)
+        ));
+        let mut trailing = without_check;
+        trailing.push(0);
+        assert!(matches!(
+            parse_file_encryption_record(&trailing, 0..trailing.len()),
+            Err(Error::InvalidHeader(
+                "RAR 5 file encryption record has trailing bytes"
+            ))
+        ));
+
+        let archive = build_archive_with_optional_comment(None);
+        let mut file = archive.files().next().unwrap().clone();
+        file.encrypted = true;
+        file.encryption = Some(plain.clone());
+        attach_file_crypto(&mut file, Some(b"password")).unwrap();
+        assert!(file.crypto.is_some());
+
+        let mut unsupported = archive.files().next().unwrap().clone();
+        unsupported.encrypted = true;
+        unsupported.encryption = Some(FileEncryption {
+            version: 1,
+            ..plain
+        });
+        assert!(matches!(
+            attach_file_crypto(&mut unsupported, Some(b"password")),
+            Err(Error::UnsupportedFeature {
+                feature: "RAR 5 unknown file encryption version",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn duplicate_and_unknown_file_extras_disable_rewrite_preservation() {
         let archive = build_archive_with_optional_comment(None);
         let original = archive.files().next().unwrap();
