@@ -1338,9 +1338,8 @@ impl PpmdDecoder {
         let old_n = self.contexts[ctx_idx].states.len();
         let old_units = Self::state_array_units(old_n);
         let new_units = Self::state_array_units(new_n);
-        if new_units == 0 || new_units <= old_units {
-            return true;
-        }
+        // Called only for old_n + 1 during UpdateModel. The new array has
+        // positive size; unchanged bucket sizes are handled below.
         if old_units > 0 {
             let old_b = Suballocator::bucket_for(old_units);
             let new_b = Suballocator::bucket_for(new_units);
@@ -1375,7 +1374,8 @@ impl PpmdDecoder {
     fn shrink_state_array(&mut self, ctx_idx: usize, old_n: usize, new_n: usize) {
         let old_units = Self::state_array_units(old_n);
         let new_units = Self::state_array_units(new_n);
-        if old_units == 0 || new_units >= old_units {
+        // Rescale starts with a multi-state context, so old_units is positive.
+        if new_units >= old_units {
             return;
         }
         if new_units == 0 {
@@ -1385,12 +1385,10 @@ impl PpmdDecoder {
             self.contexts[ctx_idx].array_offset = NULL_OFFSET;
             return;
         }
-        let Some(i0) = Suballocator::bucket_for(old_units) else {
-            return;
-        };
-        let Some(i1) = Suballocator::bucket_for(new_units) else {
-            return;
-        };
+        // Contexts contain at most 256 states, so both nonzero array sizes
+        // are in the allocator's 1..=128-unit range.
+        let i0 = Suballocator::bucket_for(old_units).expect("old array fits a bucket");
+        let i1 = Suballocator::bucket_for(new_units).expect("new array fits a bucket");
         if i0 == i1 {
             return;
         }
@@ -2289,6 +2287,145 @@ mod tests {
             }),
             None
         );
+    }
+
+    #[test]
+    fn context_allocation_releases_header_when_state_array_does_not_fit() {
+        let mut decoder = PpmdDecoder::new();
+        decoder.max_contexts = 10;
+        decoder.suballoc.reset(16 * ALLOC_UNIT_BYTES);
+        let state = State {
+            symbol: 0,
+            freq: 1,
+            successor: Successor::None,
+        };
+        let context = Context {
+            states: vec![state; 256],
+            summ_freq: 257,
+            suffix: None,
+            header_offset: NULL_OFFSET,
+            array_offset: NULL_OFFSET,
+        };
+        assert_eq!(decoder.push_context(context), None);
+        assert_eq!(decoder.suballoc.free_lists[0].len(), 1);
+        assert!(decoder.contexts.is_empty());
+    }
+
+    #[test]
+    fn model_restarts_at_text_boundary_and_failed_successor_creation() {
+        let mut decoder = PpmdDecoder::new();
+        decoder.init_model(4);
+        decoder.suballoc.reset(16 * ALLOC_UNIT_BYTES);
+        decoder
+            .text
+            .resize(decoder.suballoc.text_capacity_bytes - 1, 0);
+        decoder.update_model().unwrap();
+        assert!(decoder.text.is_empty());
+        assert_eq!(decoder.contexts.len(), 1);
+
+        decoder.order_fall = 0;
+        decoder.update_model().unwrap();
+        assert_eq!(decoder.order_fall, 4);
+
+        decoder.contexts[0].states[0].successor = Successor::Raw(usize::MAX);
+        decoder.update_model().unwrap();
+        assert_eq!(decoder.contexts[0].states[0].successor, Successor::None);
+    }
+
+    #[test]
+    fn model_restarts_when_an_ancestor_state_array_cannot_grow() {
+        let mut decoder = PpmdDecoder::new();
+        decoder.max_contexts = 10;
+        decoder.init_model(4);
+        let state = |symbol| State {
+            symbol,
+            freq: 1,
+            successor: Successor::None,
+        };
+        let ancestor = decoder
+            .push_context(Context {
+                states: vec![state(b'a'), state(b'b')],
+                summ_freq: 3,
+                suffix: Some(0),
+                header_offset: NULL_OFFSET,
+                array_offset: NULL_OFFSET,
+            })
+            .unwrap();
+        let selected = decoder
+            .push_context(Context {
+                states: vec![state(b'c'), state(b'd')],
+                summ_freq: 3,
+                suffix: Some(ancestor),
+                header_offset: NULL_OFFSET,
+                array_offset: NULL_OFFSET,
+            })
+            .unwrap();
+        decoder.min_context = selected;
+        decoder.max_context = ancestor;
+        decoder.found_state = StateRef {
+            context: selected,
+            index: 0,
+        };
+        decoder.order_fall = 1;
+
+        decoder.suballoc.reset(16 * ALLOC_UNIT_BYTES);
+        decoder
+            .text
+            .resize(decoder.suballoc.text_capacity_bytes - 2, 0);
+        while decoder.suballoc.hi_bump > decoder.suballoc.lo_bump {
+            decoder.suballoc.alloc(1, AllocSide::Lo, 0).unwrap();
+        }
+        decoder.update_model().unwrap();
+        assert_eq!(decoder.contexts.len(), 1);
+        assert_eq!(decoder.order_fall, 4);
+        assert!(decoder.text.is_empty());
+    }
+
+    #[test]
+    fn interrupted_model_init_does_not_erase_contexts() {
+        let mut decoder = PpmdDecoder::new();
+        decoder.init_model(4);
+        decoder.suballoc.interrupted = true;
+        decoder.init_model(8);
+        assert_eq!(decoder.max_order, 4);
+        assert_eq!(decoder.contexts.len(), 1);
+    }
+
+    #[test]
+    fn shrink_array_reuses_a_free_bucket_or_splits_in_place() {
+        let mut decoder = PpmdDecoder::new();
+        decoder.max_contexts = 4;
+        let state = State {
+            symbol: 0,
+            freq: 1,
+            successor: Successor::None,
+        };
+        let context = Context {
+            states: vec![state; 12],
+            summ_freq: 13,
+            suffix: None,
+            header_offset: NULL_OFFSET,
+            array_offset: NULL_OFFSET,
+        };
+        let ctx = decoder.push_context(context).unwrap();
+        let original = decoder.contexts[ctx].array_offset;
+        // Six and five units share a bucket, so this shrink keeps its slot.
+        decoder.shrink_state_array(ctx, 12, 10);
+        assert_eq!(decoder.contexts[ctx].array_offset, original);
+
+        // Six to two units has no spare block: keep the prefix and free the
+        // four-unit residue. A spare two-unit block later selects the swap.
+        decoder.shrink_state_array(ctx, 12, 4);
+        assert_eq!(decoder.contexts[ctx].array_offset, original);
+        assert!(decoder.suballoc.free_lists[3].contains(&(original + 2)));
+        let spare = decoder.suballoc.alloc(2, AllocSide::Lo, 0).unwrap();
+        decoder.suballoc.free(spare, 2);
+        decoder.shrink_state_array(ctx, 12, 4);
+        assert_eq!(decoder.contexts[ctx].array_offset, spare);
+        assert!(decoder.suballoc.free_lists[4].contains(&original));
+
+        decoder.shrink_state_array(ctx, 4, 1);
+        assert_eq!(decoder.contexts[ctx].array_offset, NULL_OFFSET);
     }
 
     #[test]
