@@ -217,16 +217,15 @@ impl<'a> DecoderSession<'a> {
         if reset {
             self.codec = Some(CodecState::new_for(file)?);
         }
-        if let Some(codec) = &mut self.codec {
-            match codec {
-                CodecState::Unpack15(d) => d.read_control = self.read_control.clone(),
-                CodecState::Unpack20(d) => d.read_control = self.read_control.clone(),
-                CodecState::Unpack29(d) => d.read_control = self.read_control.clone(),
-            }
+        // A missing codec always sets `reset`; successful construction then
+        // installs it before reaching this point.
+        let codec = self.codec.as_mut().expect("codec is initialized above");
+        match codec {
+            CodecState::Unpack15(d) => d.read_control = self.read_control.clone(),
+            CodecState::Unpack20(d) => d.read_control = self.read_control.clone(),
+            CodecState::Unpack29(d) => d.read_control = self.read_control.clone(),
         }
-        self.codec
-            .as_mut()
-            .ok_or(Error::InvalidHeader("RAR 1.5 codec state is missing"))
+        Ok(codec)
     }
 }
 
@@ -1450,6 +1449,46 @@ mod tests {
             matches!(err, Error::InvalidHeader(_)),
             "expected Error::InvalidHeader, got {err:?}"
         );
+    }
+
+    #[test]
+    fn split_stored_extraction_rejects_file_source_truncated_after_header_read() {
+        let payload = b"split file source can change";
+        let split = 10;
+        let crc = super::super::crc32(payload);
+        let mut first = file(b"split.txt", FHD_SPLIT_AFTER);
+        first.unp_ver = 20;
+        first.pack_size = split as u64;
+        first.unp_size = payload.len() as u64;
+        first.packed_range = 0..split;
+        first.file_crc = crc;
+
+        let mut second = file(b"split.txt", FHD_SPLIT_BEFORE);
+        second.unp_ver = 20;
+        second.pack_size = (payload.len() - split) as u64;
+        second.unp_size = payload.len() as u64;
+        second.packed_range = 0..payload.len() - split;
+        second.file_crc = crc;
+
+        let scratch = crate::scratch::case("legacy-split-truncated-source");
+        let path = scratch.join("second.part");
+        std::fs::write(&path, &payload[split..]).unwrap();
+        let mut second_volume = archive_with(vec![Block::File(second)]);
+        second_volume.source = ArchiveSource::File(Arc::new(path.clone()));
+        std::fs::write(&path, &payload[split..payload.len() - 3]).unwrap();
+
+        let volumes = [
+            archive_with_source(vec![Block::File(first)], payload[..split].to_vec()),
+            second_volume,
+        ];
+        let err = extract_volumes_to(&volumes, crate::ArchiveReadOptions::default(), |_| {
+            Ok(Box::new(std::io::sink()))
+        })
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::InvalidHeader("RAR 1.5 split stored file ended before unpacked size")
+        ));
     }
 
     #[test]
