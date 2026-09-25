@@ -2104,6 +2104,29 @@ mod tests {
     }
 
     #[test]
+    fn stored_extraction_rejects_file_source_truncated_after_header_read() {
+        let data = b"stored source can change";
+        let mut file = plain_file(b"stored.txt", data, None);
+        file.block.data_range = 0..data.len();
+        let scratch = crate::scratch::case("rar5-stored-truncated-source");
+        let path = scratch.join("member.part");
+        std::fs::write(&path, data).unwrap();
+        let mut archive = archive_with_blocks(vec![Block::File(file)], Vec::new());
+        archive.source = ArchiveSource::File(Arc::new(path.clone()));
+        std::fs::write(&path, &data[..data.len() - 3]).unwrap();
+
+        let error = archive
+            .extract_to(crate::ArchiveReadOptions::default(), |_| {
+                Ok(Box::new(std::io::sink()))
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error.root_cause(),
+            Error::InvalidHeader("RAR 5 stored file has mismatched packed and unpacked sizes")
+        ));
+    }
+
+    #[test]
     fn verify_streaming_integrity_validates_crc_and_hash() {
         let payload = b"streaming";
         let crc_value = crc32(payload);
