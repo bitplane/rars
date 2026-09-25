@@ -977,9 +977,8 @@ impl PpmdDecoder {
         if num_masked >= num_stats {
             return Err(Error::InvalidData("RAR PPMd masked-state count is invalid"));
         }
-        let non_masked = num_stats
-            .checked_sub(num_masked)
-            .ok_or(Error::InvalidData("RAR PPMd masked-state count is invalid"))?;
+        // The guard above establishes num_masked < num_stats.
+        let non_masked = num_stats - num_masked;
         let suffix = self.contexts[mc].suffix.unwrap_or(mc);
         let suffix_stats = self.contexts[suffix].states.len();
         // Spec §9.1: the subtraction is unsigned C wraparound — when
@@ -2250,6 +2249,45 @@ mod tests {
             range.init(&mut input),
             Err(Error::InvalidData("RAR PPMd range code is invalid"))
         );
+    }
+
+    #[test]
+    fn range_coders_normalize_across_the_bottom_boundary() {
+        let mut decoder = RangeDecoder::new();
+        decoder.low = TOP - 50;
+        decoder.range = 100;
+        decoder.normalize(&mut Bytes { input: &[0; 8] }).unwrap();
+        assert_ne!(decoder.range, 100);
+
+        let mut encoder = RangeEncoder::new();
+        encoder.low = TOP - 50;
+        encoder.range = 100;
+        encoder.normalize();
+        assert!(!encoder.out.is_empty());
+    }
+
+    #[test]
+    fn see_counter_ages_and_dummy_accumulates_without_aging() {
+        let mut decoder = PpmdDecoder::new();
+        decoder.init_model(4);
+        decoder.see[0][0] = See {
+            summ: 7,
+            shift: PERIOD_BITS - 1,
+            count: 1,
+        };
+        decoder.update_see(SeeRef::Table(0, 0));
+        assert_eq!(decoder.see[0][0].summ, 14);
+        assert_eq!(decoder.see[0][0].shift, PERIOD_BITS);
+        assert_eq!(decoder.see[0][0].count, 3 << (PERIOD_BITS - 1));
+        decoder.update_see(SeeRef::Table(0, 0));
+        assert_eq!(decoder.see[0][0].summ, 14);
+
+        let before = decoder.dummy_see;
+        decoder.update_see(SeeRef::Dummy);
+        assert_eq!(decoder.dummy_see.summ, before.summ);
+        assert_eq!(decoder.dummy_see.count, before.count);
+        decoder.add_see_summ(SeeRef::Dummy, 9);
+        assert_eq!(decoder.dummy_see.summ, before.summ + 9);
     }
 
     #[test]
