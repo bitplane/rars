@@ -4633,13 +4633,13 @@ fn rar50_one_byte_fold_is_limited_to_service_subdata() {
 }
 
 /// A record that does not fit its extra area ends the walk. RAR 7.12 and UnRAR
-/// 7.20 extract from all four of these shapes, so failing the archive over one
-/// would discard file data that is intact.
+/// 7.20 extract from these shapes, so failing the archive over one would
+/// discard file data that is intact. The older SUBDATA one-byte shortfall is
+/// covered separately because it consumes the dangling byte instead.
 #[test]
 fn rar50_stops_on_a_malformed_extra_record_instead_of_failing_the_archive() {
-    let cases: [(&str, &[u8]); 4] = [
+    let cases: [(&str, &[u8]); 3] = [
         ("two bytes dangle after the record", b"\x01\x07\x0a\x0b"),
-        ("size vint runs past the extra area", b"\x02\x07\x0a\xff"),
         ("first record claims 127 bytes", b"\x7f\x07\x0a\x0b"),
         ("record too small for its type vint", b"\x00\x07\x0a\x0b"),
     ];

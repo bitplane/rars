@@ -2341,6 +2341,32 @@ fn decode_compression_info(raw: u64) -> Result<CompressionInfo> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn malformed_extra_tail_keeps_preceding_record_and_marks_area_incomplete() {
+        let valid = [1, 2]; // Record type 2 with no data.
+        let overflowing_size = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01];
+        let tails: [&[u8]; 3] = [&[0x80], &overflowing_size, &[1, 0x80]];
+        let control = crate::read_control::ReadControl::default();
+
+        for tail in tails {
+            let input = [valid.as_slice(), tail].concat();
+            let mut records = Vec::new();
+            let complete = super::parse_extra_records(
+                &input,
+                0..input.len(),
+                false,
+                &control,
+                |record_type, data| {
+                    records.push((record_type, input[data].to_vec()));
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert!(!complete, "tail {tail:?} must be incomplete");
+            assert_eq!(records, [(2, Vec::new())]);
+        }
+    }
+
+    #[test]
     fn cancellation_interrupts_metadata_record_iteration() {
         let input = [2, 127, 0].repeat(10000);
         let token = crate::ReadCancellation::new();
