@@ -2524,6 +2524,74 @@ mod tests {
     }
 
     #[test]
+    fn memory_and_file_backed_parsers_reject_a_non_main_first_header() {
+        let archive = build_archive_with_optional_comment(None);
+        let mut bytes = archive
+            .read_range(0..archive.source_len().unwrap())
+            .unwrap();
+        let start = RAR50_SIGNATURE.len();
+        let (body_size, size_len) = read_vint_at(&bytes, start + 4, bytes.len()).unwrap();
+        let header_end = start + 4 + size_len + body_size as usize;
+        let header_type = start + 4 + size_len;
+        assert_eq!(bytes[header_type], HEAD_MAIN as u8);
+        bytes[header_type] = HEAD_FILE as u8;
+        let crc = crc32(&bytes[start + 4..header_end]);
+        bytes[start..start + 4].copy_from_slice(&crc.to_le_bytes());
+
+        let memory = Archive::parse(&bytes).unwrap_err();
+        let mut cursor = std::io::Cursor::new(&bytes);
+        let file_backed = Archive::parse_file_backed(
+            &mut cursor,
+            bytes.len(),
+            0,
+            ArchiveSource::Memory(std::sync::Arc::from(bytes.clone().into_boxed_slice())),
+            crate::ArchiveReadOptions::default(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            memory,
+            Error::InvalidHeader("RAR 5 main header is missing")
+        ));
+        assert!(matches!(
+            file_backed,
+            Error::InvalidHeader("RAR 5 main header is missing")
+        ));
+    }
+
+    #[test]
+    fn memory_and_file_backed_parsers_reject_truncated_first_header() {
+        let archive = build_archive_with_optional_comment(None);
+        let original = archive
+            .read_range(0..archive.source_len().unwrap())
+            .unwrap();
+        let first_header = RAR50_SIGNATURE.len();
+
+        for len in [first_header + 4, first_header + 5] {
+            let bytes = original[..len].to_vec();
+            let memory = Archive::parse(&bytes).unwrap_err();
+            let mut cursor = std::io::Cursor::new(&bytes);
+            let file_backed = Archive::parse_file_backed(
+                &mut cursor,
+                bytes.len(),
+                0,
+                ArchiveSource::Memory(std::sync::Arc::from(bytes.clone().into_boxed_slice())),
+                crate::ArchiveReadOptions::default(),
+            )
+            .unwrap_err();
+
+            assert!(
+                matches!(memory.root_cause(), Error::TooShort),
+                "length {len}"
+            );
+            assert!(
+                matches!(file_backed.root_cause(), Error::TooShort),
+                "length {len}"
+            );
+        }
+    }
+
+    #[test]
     fn archive_comment_returns_none_for_archive_without_a_cmt_service() {
         let archive = build_archive_with_optional_comment(None);
         assert!(archive.archive_comment().unwrap().is_none());
