@@ -2615,6 +2615,12 @@ mod tests {
         assert!(!archive.main.is_locked());
         archive.main.archive_flags |= MHFL_LOCKED;
         assert!(archive.main.is_locked());
+        archive.main.extras = vec![MainExtraRecord::ArchiveMetadata(ArchiveMetadataRecord {
+            flags: 0,
+            name: None,
+            creation_time: None,
+        })];
+        assert!(archive.main.locator().is_none());
         archive.main.extras = vec![MainExtraRecord::Locator(LocatorRecord {
             flags: 0,
             quick_open_offset: None,
@@ -2759,6 +2765,15 @@ mod tests {
         let mut body = vec![HEAD_FILE as u8, HFL_DATA as u8];
         body.extend_from_slice(&maximum);
         assert!(matches!(parse(&image(&body)), Err(Error::InvalidHeader(_))));
+
+        empty = RAR50_SIGNATURE.to_vec();
+        empty.extend_from_slice(&image(&[HEAD_MAIN as u8, HFL_EXTRA as u8, 1, 0, 0]));
+        assert!(
+            !Archive::parse(&empty)
+                .unwrap()
+                .main
+                .rewrite_metadata_complete
+        );
 
         // A crypt header with a valid CRC can still truncate the KDF count,
         // salt or password-check field. Test every field boundary explicitly.
@@ -3069,6 +3084,31 @@ mod tests {
         assert_eq!(err.kind(), crate::ErrorKind::Cancelled);
         assert!(handled > 0 && handled < 10000);
     }
+    #[test]
+    fn file_extra_cancellation_propagates_from_the_metadata_phase() {
+        let archive = build_archive_with_optional_comment(None);
+        let file = archive.files().next().unwrap();
+        let bytes = archive
+            .read_range(file.block.offset..file.block.data_range.end)
+            .unwrap();
+        let mut parsed = parse_block_header_bytes(
+            &bytes,
+            0,
+            bytes.len(),
+            0,
+            &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new()),
+        )
+        .unwrap();
+        assert!(!parsed.extra_range.is_empty());
+        let token = crate::ReadCancellation::new();
+        parsed.control = crate::read_control::ReadControl::new(Some(&token));
+        token.cancel();
+        assert_eq!(
+            parse_file_header_bytes(&parsed).unwrap_err().kind(),
+            crate::ErrorKind::Cancelled
+        );
+    }
+
     #[test]
     fn encrypted_header_extent_rejects_short_prefix_and_declared_ciphertext() {
         use crate::parse_budget::ParseBudget;

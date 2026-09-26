@@ -328,3 +328,27 @@ fn skip_and_stop_do_not_read_payloads_from_a_caller_source() {
         );
     }
 }
+
+#[test]
+fn controlled_directory_extraction_selects_a_writer_without_spending_output_quota() {
+    for version in VERSIONS {
+        let mut builder = Builder::new(version);
+        builder.add_directory(b"dir".to_vec(), None, None).unwrap();
+        let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        let output = Rc::new(RefCell::new(Vec::new()));
+        let mut visits = 0;
+        let outcome = archive
+            .extract_with_control(
+                ArchiveReadOptions::new().with_max_total_output_bytes(0),
+                |member| {
+                    assert!(member.meta.is_directory);
+                    visits += 1;
+                    Ok(Decision::Extract(Box::new(Capture(output.clone()))))
+                },
+            )
+            .unwrap();
+        assert_eq!(outcome, Outcome::Complete);
+        assert_eq!(visits, 1);
+        assert!(output.borrow().is_empty());
+    }
+}

@@ -1671,6 +1671,81 @@ fn extracts_compressed_legacy_comment_blocks_with_rar15_and_rar20_coding() {
 }
 
 #[test]
+fn extracts_stored_solid_flagged_member_via_parallel_entry_point() {
+    let entry = StoredEntry {
+        name: b"file",
+        data: b"payload",
+        file_time: 0,
+        file_attr: 0x20,
+        host_os: 3,
+        password: None,
+        file_comment: None,
+    };
+    let mut bytes = write_stored_archive(
+        &[entry],
+        WriterOptions::new(ArchiveVersion::Rar30, FeatureSet::store_only()),
+    )
+    .unwrap();
+    let parsed = Archive::parse(&bytes).unwrap();
+    let file = parsed.files().next().unwrap();
+    let start = file.block.offset;
+    bytes[start + 3] |= 0x10;
+    let crc = crc32(&bytes[start + 2..start + file.block.head_size as usize]) as u16;
+    bytes[start..start + 2].copy_from_slice(&crc.to_le_bytes());
+    let archive = Archive::parse(&bytes).unwrap();
+    assert!(!archive.main.is_solid());
+    assert!(archive.files().next().unwrap().is_solid());
+    let output = Rc::new(RefCell::new(Vec::new()));
+    archive
+        .extract_to_parallel_buffered(ArchiveReadOptions::new(), |_| {
+            Ok(Box::new(CollectWriter {
+                data: output.clone(),
+            }))
+        })
+        .unwrap();
+    assert_eq!(*output.borrow(), b"payload");
+}
+
+#[test]
+fn rejects_unsupported_stored_split_cipher_without_decoding_or_diagnostics() {
+    let entry = StoredEntry {
+        name: b"file",
+        data: &[42; 120],
+        file_time: 0,
+        file_attr: 0x20,
+        host_os: 3,
+        password: Some(b"secret"),
+        file_comment: None,
+    };
+    let parts = write_stored_volumes(entry, WriterOptions::default(), 64).unwrap();
+    assert!(parts.len() > 1);
+    let mut archives: Vec<_> = parts
+        .iter()
+        .map(|bytes| Archive::parse(bytes).unwrap())
+        .collect();
+    for archive in &mut archives {
+        for block in &mut archive.blocks {
+            if let Block::File(file) = block {
+                file.unp_ver = 17;
+            }
+        }
+    }
+    let error = extract_volumes_to(
+        &archives,
+        ArchiveReadOptions::with_password(b"secret"),
+        |_| Ok(Box::new(std::io::sink())),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error.root_cause(),
+        Error::UnsupportedEncryption {
+            unpack_version: 17,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn extracts_stored_members_through_public_member_writer_for_each_cipher() {
     for version in [
         ArchiveVersion::Rar15,
@@ -1704,6 +1779,26 @@ fn extracts_stored_members_through_public_member_writer_for_each_cipher() {
                 "{version:?}, encrypted {}",
                 password.is_some()
             );
+            if password.is_some() && version == ArchiveVersion::Rar20 {
+                let mut rar26 = file.clone();
+                rar26.unp_ver = 26;
+                let mut output = Vec::new();
+                rar26.write_to(&archive, password, &mut output).unwrap();
+                assert_eq!(output, b"stored member data");
+            }
+            if password.is_some() && version == ArchiveVersion::Rar15 {
+                let mut unsupported = file.clone();
+                unsupported.unp_ver = 17;
+                let mut output = Vec::new();
+                assert!(matches!(
+                    unsupported.write_to(&archive, password, &mut output),
+                    Err(Error::UnsupportedEncryption {
+                        unpack_version: 17,
+                        ..
+                    })
+                ));
+                assert!(output.is_empty());
+            }
             if password.is_some() && version != ArchiveVersion::Rar15 {
                 let mut truncated = file.clone();
                 truncated.packed_range.end -= 1;

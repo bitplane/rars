@@ -149,3 +149,56 @@ fn explicit_legacy_signatures_still_require_the_exact_marker_block() {
         ));
     }
 }
+
+#[test]
+fn seekable_legacy_parser_retains_historical_protection_headers() {
+    let root = scratch::case("legacy-protect-header");
+    let path = root.join("protected.rar");
+    let bytes = include_bytes!("fixtures/rar15_40/rar250_protect_head_rr5.rar");
+    std::fs::write(&path, bytes).unwrap();
+    let memory = rar15_40::Archive::parse(bytes).unwrap();
+    let seekable = rar15_40::Archive::parse_path(&path).unwrap();
+    assert!(memory
+        .blocks
+        .iter()
+        .any(|b| matches!(b, rar15_40::Block::Protect(_))));
+    assert_eq!(memory.blocks, seekable.blocks);
+}
+
+#[test]
+fn source_failure_while_rereading_legacy_main_header_stays_an_io_error() {
+    struct Reader {
+        bytes: std::io::Cursor<Vec<u8>>,
+        main_reads: usize,
+    }
+    impl std::io::Read for Reader {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            if self.bytes.position() == 7 {
+                self.main_reads += 1;
+                if self.main_reads == 3 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "main header read failed",
+                    ));
+                }
+            }
+            std::io::Read::read(&mut self.bytes, output)
+        }
+    }
+    impl std::io::Seek for Reader {
+        fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
+            std::io::Seek::seek(&mut self.bytes, from)
+        }
+    }
+    let mut builder = rars::Builder::new(rars::ArchiveVersion::Rar30);
+    builder
+        .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+        .unwrap();
+    let error = rars::ArchiveReader::read_reader(Reader {
+        bytes: std::io::Cursor::new(builder.to_bytes().unwrap()),
+        main_reads: 0,
+    })
+    .unwrap_err();
+    assert_eq!(error.kind(), rars::ErrorKind::Io);
+    assert!(error.to_string().contains("main header read failed"));
+}
