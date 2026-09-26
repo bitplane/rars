@@ -2472,6 +2472,7 @@ mod tests {
             (vec![1, 127], Some(127), None, true),
             (vec![2, 0x80, 1], None, Some(128), true),
             (vec![3, 12, 34], Some(12), Some(34), true),
+            (vec![4], None, None, false),
             (vec![4, 99], None, None, false),
             (vec![0, 99], None, None, false),
         ] {
@@ -2503,13 +2504,22 @@ mod tests {
                 "duplicate records must not be silently rewritten"
             );
         }
-        let extra = [1, 64, 2, MHEXTRA_ARCHIVE_METADATA as u8, 16];
-        let (records, complete) = parse_main_extra_area(&extra, 0..extra.len(), &control).unwrap();
-        assert!(!complete);
-        assert!(
-            matches!(records.as_slice(), [MainExtraRecord::ArchiveMetadata(record)]
-            if record.flags == 16 && record.name.is_none() && record.creation_time.is_none())
-        );
+        for (extra, count) in [
+            (vec![1, 64], 0),
+            (vec![2, MHEXTRA_ARCHIVE_METADATA as u8, 16], 1),
+            (vec![1, 64, 2, MHEXTRA_ARCHIVE_METADATA as u8, 16], 1),
+        ] {
+            let (records, complete) =
+                parse_main_extra_area(&extra, 0..extra.len(), &control).unwrap();
+            assert!(!complete);
+            assert_eq!(records.len(), count);
+            if count != 0 {
+                assert!(
+                    matches!(records.as_slice(), [MainExtraRecord::ArchiveMetadata(record)]
+                    if record.flags == 16 && record.name.is_none() && record.creation_time.is_none())
+                );
+            }
+        }
         let extra = [2, MHEXTRA_LOCATOR as u8, 0, 0x80];
         let (records, complete) = parse_main_extra_area(&extra, 0..extra.len(), &control).unwrap();
         assert_eq!(records.len(), 1);
