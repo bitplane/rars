@@ -21,6 +21,10 @@ pub enum Error {
     NeedMoreInput,
     Cancelled,
     WorkspaceLimitExceeded(Box<WorkspaceLimitError>),
+    /// An error carried by a reader or writer, including typed library errors
+    /// transported through `io::Error`. Successful decoding allocates no
+    /// diagnostic storage.
+    Io(Box<crate::Error>),
 }
 
 /// A refused codec allocation. Boxed by `Error` so successful codec operations
@@ -44,11 +48,38 @@ impl std::fmt::Display for Error {
                 "codec workspace limit {} exceeded: owner requires {} bytes with {} bytes in use",
                 details.limit, details.required, details.used)
             }
+            Self::Io(error) => write!(f, "{error}"),
         }
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error.as_ref()),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(error: std::io::Error) -> Self {
+        match crate::Error::from(error) {
+            crate::Error::Cancelled => Self::Cancelled,
+            error => Self::Io(Box::new(error)),
+        }
+    }
+}
+
+impl Error {
+    fn from_read_error(error: std::io::Error) -> Self {
+        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            Self::NeedMoreInput
+        } else {
+            Self::from(error)
+        }
+    }
+}
 
 impl From<std::convert::Infallible> for Error {
     fn from(never: std::convert::Infallible) -> Self {

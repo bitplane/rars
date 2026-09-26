@@ -1608,8 +1608,7 @@ impl Unpack20 {
     ) -> Result<()> {
         self.read_control.check_codec()?;
         let decoded = self.decode_member(input, output_size)?;
-        out.write_all(&decoded)
-            .map_err(|_| Error::InvalidData("RAR 2.0 output write failed"))
+        out.write_all(&decoded).map_err(Error::from)
     }
 
     pub fn decode_member_from_reader(
@@ -1627,9 +1626,7 @@ impl Unpack20 {
             .ok_or(Error::InvalidData("RAR 2.0 output size overflows"))?;
         self.bits = BitReader::new();
         let mut packed = Vec::new();
-        input
-            .read_to_end(&mut packed)
-            .map_err(|_| Error::InvalidData("RAR 2.0 input read failed"))?;
+        input.read_to_end(&mut packed).map_err(Error::from)?;
         self.bits.append(&packed);
         if !self.in_block && self.bits.remaining_bytes_from_current() > 0 {
             self.read_tables().map_err(|error| match error {
@@ -1645,8 +1642,7 @@ impl Unpack20 {
         self.read_last_tables()?;
 
         let decoded = self.raw_range(start, target);
-        out.write_all(decoded)
-            .map_err(|_| Error::InvalidData("RAR 2.0 output write failed"))?;
+        out.write_all(decoded).map_err(Error::from)?;
         self.trim_history(target, target);
         Ok(())
     }
@@ -3389,6 +3385,6 @@ mod tests {
         let err = decoder
             .decode_member_to(&packed, input.len(), &mut FailingWriter)
             .unwrap_err();
-        assert_eq!(err, Error::InvalidData("RAR 2.0 output write failed"));
+        assert_eq!(err, Error::from(std::io::Error::other("disk full")));
     }
 }

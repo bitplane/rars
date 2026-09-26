@@ -3726,7 +3726,7 @@ fn read_compressed_block(input: &mut impl Read) -> Result<OwnedCompressedBlock> 
     let mut fixed = [0u8; 2];
     input
         .read_exact(&mut fixed)
-        .map_err(|_| Error::NeedMoreInput)?;
+        .map_err(Error::from_read_error)?;
     let flags = fixed[0];
     let checksum = fixed[1];
     let size_bytes_len = match (flags >> 3) & 0x03 {
@@ -3738,7 +3738,7 @@ fn read_compressed_block(input: &mut impl Read) -> Result<OwnedCompressedBlock> 
     let mut size_bytes = [0u8; 3];
     input
         .read_exact(&mut size_bytes[..size_bytes_len])
-        .map_err(|_| Error::NeedMoreInput)?;
+        .map_err(Error::from_read_error)?;
 
     let actual = size_bytes[..size_bytes_len]
         .iter()
@@ -3756,7 +3756,7 @@ fn read_compressed_block(input: &mut impl Read) -> Result<OwnedCompressedBlock> 
     let mut payload = vec![0; payload_size];
     input
         .read_exact(&mut payload)
-        .map_err(|_| Error::NeedMoreInput)?;
+        .map_err(Error::from_read_error)?;
     let final_byte_bits = ((flags & 0x07) + 1).min(8);
     let payload_bits = if payload_size == 0 {
         0

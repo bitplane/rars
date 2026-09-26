@@ -1658,9 +1658,7 @@ impl Unpack15 {
         self.init_member(target, solid);
         self.bits = BitReader::new(&[]);
         let mut packed = Vec::new();
-        input
-            .read_to_end(&mut packed)
-            .map_err(|_| Error::InvalidData("RAR 1.3 input read failed"))?;
+        input.read_to_end(&mut packed).map_err(Error::from)?;
         self.bits = BitReader::new(&packed);
 
         while self.output_written < self.target {
@@ -1670,8 +1668,7 @@ impl Unpack15 {
                 .min(self.target);
             let mut chunk = Vec::with_capacity(chunk_target - self.output_written);
             self.decode_loop_until(chunk_target, &mut chunk)?;
-            out.write_all(&chunk)
-                .map_err(|_| Error::InvalidData("RAR 1.3 output write failed"))?;
+            out.write_all(&chunk).map_err(Error::from)?;
         }
         Ok(())
     }
@@ -2165,8 +2162,7 @@ impl Unpack15 {
         }
         self.window[self.unp_ptr] = byte;
         self.unp_ptr = (self.unp_ptr + 1) & 0xffff;
-        out.write_all(&[byte])
-            .map_err(|_| Error::InvalidData("RAR 1.3 output write failed"))?;
+        out.write_all(&[byte]).map_err(Error::from)?;
         self.output_written += 1;
         Ok(())
     }

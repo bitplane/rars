@@ -453,6 +453,7 @@ impl Error {
             | Self::Rar5Recovery(crate::recovery::rar5::Error::RebuildTooLarge) => {
                 ErrorKind::ResourceLimit
             }
+            Self::Codec(crate::codec::Error::Io(error)) => error.kind(),
             Self::Codec(crate::codec::Error::WorkspaceLimitExceeded(_)) => ErrorKind::ResourceLimit,
             Self::Cancelled | Self::Codec(crate::codec::Error::Cancelled) => ErrorKind::Cancelled,
             Self::EntryNotFound => ErrorKind::EntryNotFound,
@@ -492,6 +493,7 @@ impl From<crate::codec::Error> for Error {
     fn from(error: crate::codec::Error) -> Self {
         match error {
             crate::codec::Error::Cancelled => Self::Cancelled,
+            crate::codec::Error::Io(error) => *error,
             error => Self::Codec(error),
         }
     }
@@ -533,6 +535,22 @@ impl From<crate::crypto::rar50::Error> for Error {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn codec_io_transport_retains_library_error_types() {
+        for cause in [
+            Error::Cancelled,
+            Error::NeedPassword,
+            Error::MemberOutputLimitExceeded {
+                limit: 1,
+                required: 2,
+            },
+        ] {
+            let transported = crate::codec::Error::from(std::io::Error::other(cause.clone()));
+            assert_eq!(Error::from(transported.clone()), cause);
+            assert_eq!(Error::Codec(transported).kind(), cause.kind());
+        }
+    }
+
     #[test]
     fn codec_workspace_refusal_keeps_its_resource_classification_and_details() {
         let cause = crate::codec::Error::WorkspaceLimitExceeded(Box::new(

@@ -805,7 +805,9 @@ where
         ParallelExtractedEntry::File { meta, data } => {
             let mut writer = open(&meta)?;
             control.check()?;
-            control.write_all(&mut writer, &data)?;
+            control
+                .write_all(&mut writer, &data)
+                .map_err(|error| Error::from(error).at_entry(meta.name.clone(), "extracting"))?;
         }
         ParallelExtractedEntry::Redirection { meta, redirection } => {
             redirect(&meta, &redirection)?;

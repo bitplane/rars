@@ -2535,9 +2535,7 @@ impl Unpack29 {
         let control = self.read_control.clone();
         let input = &mut control.reader(input);
         let mut packed = Vec::new();
-        input
-            .read_to_end(&mut packed)
-            .map_err(|_| Error::InvalidData("RAR 2.9 input read failed"))?;
+        input.read_to_end(&mut packed).map_err(Error::from)?;
         self.decode_loaded_member_to(&packed, output_size, out)
     }
 
@@ -2590,8 +2588,7 @@ impl Unpack29 {
             }
 
             let decoded = self.filtered_range(flushed, safe_end, start)?;
-            out.write_all(&decoded)
-                .map_err(|_| Error::InvalidData("RAR 2.9 output write failed"))?;
+            out.write_all(&decoded).map_err(Error::from)?;
             flushed = safe_end;
             self.trim_history(flushed, self.current_pos());
             target = self
@@ -6917,7 +6914,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
             }
         }
 
-        let expected = Error::InvalidData("RAR 2.9 output write failed");
+        let expected = Error::from(std::io::Error::other("deliberate failure"));
         let mut decoder = Unpack29::new();
         assert_eq!(
             decoder
