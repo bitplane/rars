@@ -1379,12 +1379,13 @@ impl PendingSplitRefs {
             if index == last {
                 break;
             }
-            let Some(archive) = volumes.get(volume_index) else {
-                continue;
-            };
-            let Some(file) = archive.files().nth(file_index) else {
-                continue;
-            };
+            // Indices originate in extract_volumes_to_impl's enumeration of
+            // this same immutable volume slice; neither collection can change.
+            let archive = &volumes[volume_index];
+            let file = archive
+                .files()
+                .nth(file_index)
+                .expect("split fragment index comes from archive enumeration");
             let Some(expected) = file.data_crc32 else {
                 continue;
             };
