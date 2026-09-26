@@ -230,7 +230,7 @@ fn publication_cancellation_cleans_up_scratch() {
 }
 
 #[test]
-fn scratch_preserves_the_raw_lz_integrity_fallback() {
+fn filtered_checksums_cannot_validate_raw_output_with_or_without_scratch() {
     let dir = scratch::case("reader-scratch-fallback");
     let policy = Rar50Scratch::new(&*dir, 1_000_000);
     let mut archive = archive(FilterKind::E8, false, ArchiveVersion::Rar50);
@@ -264,10 +264,14 @@ fn scratch_preserves_the_raw_lz_integrity_fallback() {
                 .with_rar50_scratch(&policy);
         }
         let output = Rc::new(RefCell::new(Vec::new()));
-        archive
+        let error = archive
             .extract_to_with_options(options, |_| Ok(Box::new(Capture(output.clone()))))
-            .unwrap();
-        assert_eq!(*output.borrow(), raw);
+            .unwrap_err();
+        assert!(matches!(
+            error.root_cause(),
+            rars::Error::Crc32Mismatch { .. }
+        ));
+        assert!(output.borrow().is_empty());
         assert_eq!(std::fs::read_dir(&*dir).unwrap().count(), 0);
     }
 }

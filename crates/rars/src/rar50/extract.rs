@@ -361,32 +361,10 @@ impl FileHeader {
         Ok(DecodedData { data, keys })
     }
 
-    fn decoded_data_with_mode(
-        &self,
-        archive: &Archive,
-        decoder: &mut Unpack50Decoder,
-        password: Option<&[u8]>,
-        mode: DecodeMode,
-    ) -> Result<DecodedData> {
-        let (packed, keys) =
-            self.packed_data_with_password(archive, password, &decoder.read_control)?;
-        let data = self.decode_packed_with_decoder_mode(&packed, decoder, mode)?;
-        Ok(DecodedData { data, keys })
-    }
-
     fn decode_packed_with_decoder(
         &self,
         packed: &[u8],
         decoder: &mut Unpack50Decoder,
-    ) -> Result<Vec<u8>> {
-        self.decode_packed_with_decoder_mode(packed, decoder, DecodeMode::Lz)
-    }
-
-    fn decode_packed_with_decoder_mode(
-        &self,
-        packed: &[u8],
-        decoder: &mut Unpack50Decoder,
-        mode: DecodeMode,
     ) -> Result<Vec<u8>> {
         if self.is_stored() {
             if self.encrypted {
@@ -430,7 +408,7 @@ impl FileHeader {
                 output_size,
                 dictionary_size,
                 info.solid,
-                mode,
+                DecodeMode::Lz,
             )
             .map_err(Error::from)
     }
@@ -882,28 +860,11 @@ impl<'a> DecoderSession<'a> {
         if file.should_stream_decode(self.buffered_decode_limit) {
             return self.stream_file_to(archive, file, writer);
         }
-        let checkpoint = self.decoder.clone();
         let decoded = self
             .decoded_file_data(archive, file)
             .map_err(|error| file.entry_error("decoding", error))?;
-        let decoded = match file.verify_integrity_with_keys(&decoded.data, decoded.keys.as_ref()) {
-            Ok(()) => decoded,
-            Err(filtered_error) => {
-                let mut unfiltered_decoder = checkpoint;
-                let unfiltered = file
-                    .decoded_data_with_mode(
-                        archive,
-                        &mut unfiltered_decoder,
-                        self.password,
-                        DecodeMode::LzNoFilters,
-                    )
-                    .map_err(|error| file.entry_error("decoding", error))?;
-                file.verify_integrity_with_keys(&unfiltered.data, unfiltered.keys.as_ref())
-                    .map_err(|_| file.entry_error("verifying", filtered_error))?;
-                self.decoder = unfiltered_decoder;
-                unfiltered
-            }
-        };
+        file.verify_integrity_with_keys(&decoded.data, decoded.keys.as_ref())
+            .map_err(|error| file.entry_error("verifying", error))?;
         writer
             .write_all(&decoded.data)
             .map_err(Error::from)
@@ -1871,6 +1832,89 @@ mod tests {
         .unwrap();
 
         assert_eq!(&*captured.borrow(), &full);
+    }
+
+    #[test]
+    fn filtered_checksum_failure_cannot_publish_unfiltered_payload() {
+        let data = [
+            b"prefix".as_slice(),
+            b"\xe8\0\0\0\0code".repeat(20).as_slice(),
+        ]
+        .concat();
+        let mut bytes = Rar50Writer::new(WriterOptions::new(
+            ArchiveVersion::Rar50,
+            FeatureSet::store_only(),
+        ))
+        .entry(entry(b"filtered.bin", &data))
+        .filter_policy(FilterPolicy::explicit(FilterKind::E8))
+        .finish()
+        .unwrap();
+        let archive = Archive::parse(&bytes).unwrap();
+        let file = archive.files().next().unwrap();
+        let info = file.decoded_compression_info().unwrap();
+        let raw = Unpack50Decoder::new()
+            .decode_member_with_dictionary(
+                &file.packed_data(&archive).unwrap(),
+                info.algorithm_version,
+                data.len(),
+                info.dictionary_size as usize,
+                false,
+                DecodeMode::LzNoFilters,
+            )
+            .unwrap();
+        assert_ne!(raw, data);
+        let mut fields = super::super::HeaderReader::new(&bytes, file.block.header_range.clone());
+        let flags = fields.read_vint().unwrap();
+        fields.read_vint().unwrap();
+        fields.read_vint().unwrap();
+        if flags & super::super::FHFL_MTIME != 0 {
+            fields.read_u32().unwrap();
+        }
+        let crc_pos = fields.pos;
+        assert_ne!(flags & super::super::FHFL_CRC32, 0);
+        let header_end = file.block.header_range.end + file.block.extra_area_size.unwrap() as usize;
+        let mut hash_range = None;
+        super::super::parse_extra_records(
+            &bytes,
+            file.block.header_range.end..header_end,
+            false,
+            &crate::read_control::ReadControl::default(),
+            |kind, range| {
+                if kind == super::super::FHEXTRA_HASH {
+                    assert_eq!(bytes[range.start], 0);
+                    hash_range = Some(range.start + 1..range.end);
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        bytes[crc_pos..crc_pos + 4].copy_from_slice(&crc32(&raw).to_le_bytes());
+        bytes[hash_range.unwrap()].copy_from_slice(&blake2sp::hash(&raw));
+        let start = file.block.offset;
+        let header_crc = crc32(&bytes[start + 4..header_end]);
+        bytes[start..start + 4].copy_from_slice(&header_crc.to_le_bytes());
+        let archive = Archive::parse(&bytes).unwrap();
+        let captured = Rc::new(RefCell::new(Vec::new()));
+        struct Capture(Rc<RefCell<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let error = archive
+            .extract_to(crate::ArchiveReadOptions::new(), |_| {
+                Ok(Box::new(Capture(captured.clone())))
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error.root_cause(),
+            Error::HashMismatch { hash_type: 0 }
+        ));
+        assert!(captured.borrow().is_empty());
     }
 
     #[test]
@@ -2877,30 +2921,6 @@ mod tests {
             matches!(err, Error::HashMismatch { hash_type: 0 }),
             "expected hash mismatch, got {err:?}"
         );
-    }
-
-    #[test]
-    fn decoded_data_with_mode_dispatches_through_decode_packed_for_stored_files() {
-        let payload = b"decoded_data_with_mode stored payload";
-        let mut file = plain_file(b"a.txt", payload, None);
-        file.block.data_range = 0..payload.len();
-        file.block.data_size = Some(payload.len() as u64);
-        file.unpacked_size = payload.len() as u64;
-
-        let archive = archive_with_blocks(vec![Block::File(file.clone())], payload.to_vec());
-        let mut decoder = Unpack50Decoder::new();
-        let decoded = file
-            .decoded_data_with_mode(&archive, &mut decoder, None, DecodeMode::Lz)
-            .unwrap();
-        assert_eq!(decoded.data, payload);
-        assert!(decoded.keys.is_none());
-
-        // LzNoFilters dispatches through the same stored short-circuit.
-        let mut decoder = Unpack50Decoder::new();
-        let decoded = file
-            .decoded_data_with_mode(&archive, &mut decoder, None, DecodeMode::LzNoFilters)
-            .unwrap();
-        assert_eq!(decoded.data, payload);
     }
 
     #[test]

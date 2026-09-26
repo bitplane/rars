@@ -284,20 +284,6 @@ pub(super) fn decode<R: Read>(
         transformed.seek(SeekFrom::Start(filter.start as u64))?;
         control.write_all(&mut transformed, &data)?;
     }
-    match verify(file, &mut transformed, keys, &control) {
-        Ok(()) => copy(&mut transformed, writer, &control),
-        Err(error) if error.kind() == crate::ErrorKind::ChecksumMismatch => {
-            // Preserve the existing compatibility retry for streams whose
-            // integrity records describe raw LZ output despite filter records.
-            verify(file, &mut raw, keys, &control).map_err(|raw_error| {
-                if raw_error.kind() == crate::ErrorKind::ChecksumMismatch {
-                    error
-                } else {
-                    raw_error
-                }
-            })?;
-            copy(&mut raw, writer, &control)
-        }
-        Err(error) => Err(error),
-    }
+    verify(file, &mut transformed, keys, &control)?;
+    copy(&mut transformed, writer, &control)
 }
