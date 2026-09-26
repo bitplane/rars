@@ -39,9 +39,30 @@ class CoverageTests(unittest.TestCase):
         ])
         self.assertEqual([str(p) for p in coverage.artifact_objects(messages)], ["/build/debug/deps/test-123", "/build/debug/build/rars/456/out/test-456"])
 
-    def test_only_namespace_tests_are_excluded(self):
-        self.assertTrue(coverage.test_symbol("rars::tests::example"))
-        self.assertFalse(coverage.test_symbol("rars::extract::<rars::tests::Sink>"))
+    def test_production_methods_instantiated_with_test_readers_are_counted(self):
+        filename = str(coverage.ROOT / "crates/rars/src/example.rs")
+        functions = [
+            {"name": "inherent", "count": 1, "filenames": [filename],
+             "regions": [[20, 1, 22, 2, 1, 0, 0, 0]],
+             "branches": [[21, 1, 21, 9, 1, 0, 0, 0, 4]]},
+            {"name": "trait", "count": 1, "filenames": [filename],
+             "regions": [[30, 1, 32, 2, 1, 0, 0, 0]],
+             "branches": [[31, 1, 31, 9, 0, 1, 0, 0, 4]]},
+            {"name": "test_helper", "count": 0, "filenames": [filename],
+             "regions": [[40, 1, 42, 2, 0, 0, 0, 0]]},
+        ]
+        names = {
+            "inherent": "<rars::Reader<rars::tests::ShortReads>>::fill",
+            "trait": "<rars::Reader<rars::tests::ShortReads> as std::io::Read>::read",
+            "test_helper": "<rars::tests::ShortReads as std::io::Read>::read",
+        }
+        sources = {filename: {"test_ranges": [[40, 42]], "declarations": []}}
+        rows, missing, _ = coverage.summarize(
+            {"functions": functions}, {filename: {20: 1, 30: 1, 40: 0}}, sources, names)
+        self.assertEqual(rows[0]["functions"], {"covered": 2, "total": 2})
+        self.assertEqual(rows[0]["branches"], {"covered": 2, "total": 4})
+        self.assertEqual(rows[0]["lines"], {"covered": 2, "total": 2})
+        self.assertEqual(missing, [])
 
 
 if __name__ == "__main__":

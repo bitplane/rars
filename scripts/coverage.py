@@ -59,11 +59,6 @@ def helper(mode, lines):
     return capture([binary, mode], input="\n".join(lines) + "\n").splitlines()
 
 
-def test_symbol(name):
-    # A production generic instantiated with a test callback is still production.
-    return "::tests::" in name.split("::<", 1)[0]
-
-
 def read_lcov(text):
     files = {}
     current = None
@@ -117,8 +112,8 @@ def summarize(data, line_counts, sources, names):
                            "regions": {}, "functions": {}, "branches": {}, "excluded": excluded}
     for fn in data["functions"]:
         name = names[fn["name"]]
-        if test_symbol(name):
-            continue
+        # Classify by source, not symbols: production methods instantiated
+        # with test readers/callbacks can contain ::tests:: in their type name.
         code = [r for r in fn["regions"] if r[7] == 0 and fn["filenames"][r[5]] in stats]
         if not code:
             continue
