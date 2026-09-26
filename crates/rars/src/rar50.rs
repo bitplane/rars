@@ -1520,27 +1520,28 @@ fn parse_htime_mtime(
 ) -> Option<(u32, Option<crate::TimeRefinement>)> {
     // Slice to the record first: malformed time fields must not borrow bytes
     // from a following extra record or the file payload.
-    let data = input.get(range)?;
+    let data = &input[range];
     let (flags, at) = read_vint_at(data, 0, data.len()).ok()?;
     if flags & 2 == 0 {
         return None;
     }
     let (seconds, nanos) = if flags & 1 != 0 {
-        let seconds = u32::from_le_bytes(data.get(at..at.checked_add(4)?)?.try_into().ok()?);
+        let seconds =
+            u32::from_le_bytes(data.get(at..at + 4)?.try_into().expect("four-byte slice"));
         // Unix fractions follow ALL present whole-second values, not each value.
         let count = (flags & 0x0e).count_ones() as usize;
-        let fraction_at = at.checked_add(count.checked_mul(4)?)?;
+        // A vint occupies at most ten bytes; at most three u32 times follow.
+        let fraction_at = at + count * 4;
         let nanos = if flags & 0x10 != 0 {
-            data.get(fraction_at..fraction_at.checked_add(4)?)
-                .and_then(|bytes| bytes.try_into().ok())
-                .map(u32::from_le_bytes)
+            data.get(fraction_at..fraction_at + 4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("four-byte slice")))
                 .filter(|nanos| *nanos < 1_000_000_000)
         } else {
             None
         };
         (seconds, nanos)
     } else {
-        let ticks = u64::from_le_bytes(data.get(at..at.checked_add(8)?)?.try_into().ok()?);
+        let ticks = u64::from_le_bytes(data.get(at..at + 8)?.try_into().expect("eight-byte slice"));
         let seconds = u32::try_from((ticks / 10_000_000).checked_sub(11_644_473_600)?).ok()?;
         (seconds, Some(((ticks % 10_000_000) * 100) as u32))
     };
@@ -1647,7 +1648,8 @@ fn parse_archive_encryption_header(
 }
 
 fn attach_file_crypto(file: &mut FileHeader, password: Option<&[u8]>) -> Result<()> {
-    if !file.encrypted || file.crypto.is_some() {
+    // Called once for each freshly parsed file or service header.
+    if !file.encrypted {
         return Ok(());
     }
     let Some(password) = password else {
@@ -2317,14 +2319,12 @@ fn decode_compression_info(raw: u64) -> Result<CompressionInfo> {
         ));
     }
 
+    // The wire fields are five bits each: v1 shifts by at most 43 and
+    // multiplies by at most 63. V0 is restricted above to a shift of 15.
     let dictionary_size = if algorithm_version == 1 {
-        u64::from(dictionary_fraction + 32)
-            .checked_shl(u32::from(dictionary_power) + 12)
-            .ok_or(Error::InvalidHeader("RAR 5 dictionary size overflows u64"))?
+        u64::from(dictionary_fraction + 32) << (u32::from(dictionary_power) + 12)
     } else {
-        (128 * 1024_u64)
-            .checked_shl(u32::from(dictionary_power))
-            .ok_or(Error::InvalidHeader("RAR 5 dictionary size overflows u64"))?
+        (128 * 1024_u64) << u32::from(dictionary_power)
     };
 
     Ok(CompressionInfo {
