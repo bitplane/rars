@@ -136,6 +136,8 @@ pub struct LocatorRecord {
 #[non_exhaustive]
 pub struct ArchiveMetadataRecord {
     pub flags: u64,
+    /// Encoded name buffer, including any reserved zero padding. A leading
+    /// zero means no original name was stored, even with a nonzero length.
     pub name: Option<Vec<u8>>,
     pub creation_time: Option<u64>,
 }
@@ -2438,6 +2440,121 @@ mod tests {
         future.block.extra_area_size = Some(unknown.len() as u64);
         parse_file_extra_area(&unknown, 0..unknown.len(), false, &mut future, &control).unwrap();
         assert!(!future.rewrite_metadata_complete);
+    }
+
+    #[test]
+    fn main_extra_records_keep_future_and_duplicate_layouts_readable() {
+        let control = crate::read_control::ReadControl::default();
+        // Locator zero offsets are retained as wire values; they do not
+        // indicate an actual service block at the main header's location.
+        for (data, quick_open, recovery, complete) in [
+            (vec![0], None, None, true),
+            (vec![1, 0], Some(0), None, true),
+            (vec![1, 127], Some(127), None, true),
+            (vec![2, 0x80, 1], None, Some(128), true),
+            (vec![3, 12, 34], Some(12), Some(34), true),
+            (vec![4, 99], None, None, false),
+            (vec![0, 99], None, None, false),
+        ] {
+            let extra = [vec![(1 + data.len()) as u8, MHEXTRA_LOCATOR as u8], data].concat();
+            let (records, is_complete) =
+                parse_main_extra_area(&extra, 0..extra.len(), &control).unwrap();
+            assert_eq!(is_complete, complete);
+            assert!(
+                matches!(records.as_slice(), [MainExtraRecord::Locator(record)]
+                if record.quick_open_offset == quick_open && record.recovery_record_offset == recovery)
+            );
+        }
+        for extra in [
+            vec![2, MHEXTRA_LOCATOR as u8, 0, 2, MHEXTRA_LOCATOR as u8, 0],
+            vec![
+                2,
+                MHEXTRA_ARCHIVE_METADATA as u8,
+                0,
+                2,
+                MHEXTRA_ARCHIVE_METADATA as u8,
+                0,
+            ],
+        ] {
+            let (records, complete) =
+                parse_main_extra_area(&extra, 0..extra.len(), &control).unwrap();
+            assert_eq!(records.len(), 2);
+            assert!(
+                !complete,
+                "duplicate records must not be silently rewritten"
+            );
+        }
+        let extra = [1, 64, 2, MHEXTRA_ARCHIVE_METADATA as u8, 16];
+        let (records, complete) = parse_main_extra_area(&extra, 0..extra.len(), &control).unwrap();
+        assert!(!complete);
+        assert!(
+            matches!(records.as_slice(), [MainExtraRecord::ArchiveMetadata(record)]
+            if record.flags == 16 && record.name.is_none() && record.creation_time.is_none())
+        );
+    }
+
+    #[test]
+    fn main_extra_records_reject_truncated_known_fields_and_metadata_trailing_bytes() {
+        let control = crate::read_control::ReadControl::default();
+        let truncated = [
+            vec![1, MHEXTRA_LOCATOR as u8],             // Missing locator flags.
+            vec![2, MHEXTRA_LOCATOR as u8, 1],          // Missing quick-open offset.
+            vec![2, MHEXTRA_LOCATOR as u8, 2],          // Missing recovery offset.
+            vec![1, MHEXTRA_ARCHIVE_METADATA as u8],    // Missing metadata flags.
+            vec![2, MHEXTRA_ARCHIVE_METADATA as u8, 1], // Missing name length.
+            vec![4, MHEXTRA_ARCHIVE_METADATA as u8, 1, 2, b'a'], // Short name.
+            vec![5, MHEXTRA_ARCHIVE_METADATA as u8, 6, 1, 2, 3], // Short Unix seconds.
+            vec![9, MHEXTRA_ARCHIVE_METADATA as u8, 2, 1, 2, 3, 4, 5, 6, 7], // Short FILETIME.
+            vec![9, MHEXTRA_ARCHIVE_METADATA as u8, 14, 1, 2, 3, 4, 5, 6, 7], // Short Unix nanoseconds.
+        ];
+        for extra in truncated {
+            // Bytes following the extra area must never satisfy a field read.
+            let input = [extra.clone(), vec![0; 16]].concat();
+            assert!(
+                matches!(
+                    parse_main_extra_area(&input, 0..extra.len(), &control),
+                    Err(Error::TooShort)
+                ),
+                "extra {extra:?}"
+            );
+        }
+        let trailing = [3, MHEXTRA_ARCHIVE_METADATA as u8, 0, 99];
+        assert!(matches!(
+            parse_main_extra_area(&trailing, 0..trailing.len(), &control),
+            Err(Error::InvalidHeader(
+                "RAR 5 archive metadata record has trailing bytes"
+            ))
+        ));
+    }
+
+    #[test]
+    fn main_extra_records_preserve_reserved_name_buffers_and_following_times() {
+        let control = crate::read_control::ReadControl::default();
+        let time = 0x01d9_0000_0000_0000u64;
+        // RARLAB documents padding after renamed archives and a leading zero
+        // when the final name did not fit the buffer reserved during archiving.
+        for name in [
+            b"original.rar".as_slice(),
+            b"short.rar\0\0\0",
+            b"\0old-name.rar",
+            b"",
+        ] {
+            let mut extra = vec![
+                (3 + name.len() + 8) as u8,
+                MHEXTRA_ARCHIVE_METADATA as u8,
+                3,
+                name.len() as u8,
+            ];
+            extra.extend_from_slice(name);
+            extra.extend_from_slice(&time.to_le_bytes());
+            let (records, complete) =
+                parse_main_extra_area(&extra, 0..extra.len(), &control).unwrap();
+            assert!(complete);
+            assert!(
+                matches!(records.as_slice(), [MainExtraRecord::ArchiveMetadata(record)]
+                if record.name.as_deref() == Some(name) && record.creation_time == Some(time))
+            );
+        }
     }
 
     #[test]
