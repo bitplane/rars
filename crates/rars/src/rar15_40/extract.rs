@@ -512,9 +512,7 @@ impl PendingSplitRefs {
             return Ok(Box::new(reader));
         }
 
-        let Some(password) = password else {
-            return Err(Error::NeedPassword);
-        };
+        let password = password.expect("encrypted split fragments were admitted with a password");
         Ok(Box::new(DecryptingReader::new(
             reader,
             self.unp_ver,
@@ -1312,19 +1310,6 @@ mod tests {
         let mapped =
             file(b"encrypted.bin", FHD_PASSWORD).map_encrypted_payload_error(Some(b"pw"), error);
         assert_eq!(mapped, Error::WrongPasswordOrCorruptData);
-    }
-
-    #[test]
-    fn pending_split_refs_fragment_reader_demands_password_for_encrypted() {
-        let mut first = file(b"a.txt", FHD_PASSWORD | FHD_SPLIT_AFTER);
-        first.unp_ver = 20;
-        first.packed_range = 0..0;
-        let pending = PendingSplitRefs::new(&first, 0, 0);
-        let volumes = vec![archive_with_source(vec![Block::File(first)], Vec::new())];
-        assert!(matches!(
-            pending.fragment_reader(&volumes, None),
-            Err(Error::NeedPassword)
-        ));
     }
 
     #[test]

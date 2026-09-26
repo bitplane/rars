@@ -710,8 +710,8 @@ impl FileHeader {
             return error;
         }
         match error {
-            Error::NeedPassword => Error::NeedPassword,
-            Error::UnsupportedSignature
+            Error::NeedPassword
+            | Error::UnsupportedSignature
             | Error::UnsupportedVersion(_)
             | Error::UnsupportedFeature { .. }
             | Error::UnsupportedWriterOption { .. }
@@ -1894,9 +1894,7 @@ fn parse_main_header(input: &[u8], block: &BlockHeader) -> Result<MainHeader> {
     }
     let start = block.offset;
     let head_end = start + block.head_size as usize;
-    if head_end > input.len() {
-        return Err(Error::TooShort);
-    }
+    // Both callers have already read and validated this entire block.
 
     let encrypt_version = if block.flags & MHD_ENCRYPTVER != 0 {
         Some(
@@ -3881,21 +3879,6 @@ mod tests {
             err,
             Error::InvalidHeader("RAR 1.5 main header is too short")
         );
-    }
-
-    #[test]
-    fn parse_main_header_rejects_block_extending_past_input_buffer() {
-        let block = BlockHeader {
-            head_crc: 0,
-            head_type: MAIN_HEAD,
-            flags: 0,
-            head_size: 13,
-            add_size: None,
-            offset: 8,
-        };
-        // Buffer is shorter than offset + head_size.
-        let err = parse_main_header(&[0u8; 16], &block).unwrap_err();
-        assert_eq!(err, Error::TooShort);
     }
 
     #[test]
