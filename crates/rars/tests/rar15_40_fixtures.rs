@@ -1610,9 +1610,75 @@ fn extracts_file_data_when_a_nested_legacy_comment_header_is_malformed() {
 }
 
 #[test]
+fn extracts_stored_newsub_comments_with_and_without_encryption() {
+    let plain = b"stored service comment";
+    for password in [None, Some(b"secret".as_slice())] {
+        let entry = StoredEntry {
+            name: b"CMT",
+            data: plain,
+            file_time: 0,
+            file_attr: 0x20,
+            host_os: 3,
+            password,
+            file_comment: None,
+        };
+        let mut bytes = write_stored_archive(
+            &[entry],
+            WriterOptions::new(ArchiveVersion::Rar30, FeatureSet::store_only()),
+        )
+        .unwrap();
+        let archive = Archive::parse(&bytes).unwrap();
+        let file = archive.files().next().unwrap();
+        let start = file.block.offset;
+        bytes[start + 2] = 0x7a; // NEWSUB_HEAD has the same file payload layout.
+        let crc = crc32(&bytes[start + 2..start + file.block.head_size as usize]) as u16;
+        bytes[start..start + 2].copy_from_slice(&crc.to_le_bytes());
+        let archive = Archive::parse(&bytes).unwrap();
+        assert!(archive.files().next().is_none());
+        assert!(archive.new_subs().next().unwrap().file.is_stored());
+        let options = ArchiveReadOptions::with_optional_password(password);
+        assert_eq!(
+            archive
+                .archive_comment_with_options(options)
+                .unwrap()
+                .unwrap(),
+            plain
+        );
+        assert_eq!(
+            archive
+                .archive_comment_with_options(
+                    options.with_max_member_output_bytes(plain.len() as u64)
+                )
+                .unwrap()
+                .unwrap(),
+            plain
+        );
+        assert_eq!(
+            archive
+                .archive_comment_with_options(
+                    options.with_max_member_output_bytes(plain.len() as u64 - 1)
+                )
+                .unwrap_err()
+                .kind(),
+            rars::ErrorKind::ResourceLimit
+        );
+        if password.is_some() {
+            assert_eq!(
+                archive.archive_comment().unwrap_err().kind(),
+                rars::ErrorKind::PasswordRequired
+            );
+        }
+    }
+}
+
+#[test]
 fn extracts_compressed_legacy_comment_blocks_with_rar15_and_rar20_coding() {
     let plain = b"compressed old comment compressed old comment\n";
-    for version in [ArchiveVersion::Rar15, ArchiveVersion::Rar20] {
+    for (version, comment_version) in [
+        (ArchiveVersion::Rar15, 15),
+        (ArchiveVersion::Rar20, 20),
+        (ArchiveVersion::Rar20, 26),
+    ] {
         let entry = FileEntry {
             name: b"file",
             data: plain,
@@ -1633,7 +1699,7 @@ fn extracts_compressed_legacy_comment_blocks_with_rar15_and_rar20_coding() {
         let mut comment = vec![0, 0, 0x75, 0, 0];
         comment.extend_from_slice(&((13 + packed.len()) as u16).to_le_bytes());
         comment.extend_from_slice(&(plain.len() as u16).to_le_bytes());
-        comment.push(file.unp_ver);
+        comment.push(comment_version);
         comment.push(file.method);
         comment.extend_from_slice(&((crc32(plain) & 0xffff) as u16).to_le_bytes());
         let crc = crc32(&comment[2..13]) as u16;
