@@ -4531,6 +4531,72 @@ fn extracts_rar50_encrypted_compressed_multivolume_archive() {
 }
 
 #[test]
+fn extracts_rar50_compressed_split_streams_and_preserves_failure_kinds() {
+    let mut volumes: Vec<_> = (1..=3)
+        .map(|part| {
+            Archive::parse_path_with_password(
+                fixture(&format!("encrypted_multivol.part{part}.rar")),
+                Some(b"password"),
+            )
+            .unwrap()
+        })
+        .collect();
+    let options = ArchiveReadOptions::default().with_rar50_buffered_decode_limit(0);
+    let data = Rc::new(RefCell::new(Vec::new()));
+    extract_volumes_to(&volumes, options, |meta| {
+        assert_eq!(meta.name, b"random_4k.bin");
+        Ok(Box::new(CollectWriter {
+            data: Rc::clone(&data),
+        }))
+    })
+    .unwrap();
+    assert_eq!(data.borrow().len(), 4096);
+    assert_eq!(crc32(&data.borrow()), 0xb9c5_4415);
+
+    struct FailedSink;
+    impl Write for FailedSink {
+        fn write(&mut self, _: &[u8]) -> IoResult<usize> {
+            Err(std::io::Error::other("split sink failed"))
+        }
+        fn flush(&mut self) -> IoResult<()> {
+            Ok(())
+        }
+    }
+    let error = extract_volumes_to(&volumes, options, |_| Ok(Box::new(FailedSink))).unwrap_err();
+    assert_eq!(error.kind(), rars::ErrorKind::Io);
+    assert!(
+        matches!(error.root_cause(), Error::Io(source) if source.message == "split sink failed")
+    );
+    assert_eq!(error.entry_context().unwrap().0, b"random_4k.bin");
+
+    // An integrity failure triggers the diagnostic scan of packed fragments.
+    // Give that scan a mismatching first-fragment CRC and force a final
+    // checksum failure without changing the encrypted payload.
+    let first = volumes[0]
+        .blocks
+        .iter_mut()
+        .find_map(|block| match block {
+            Block::File(file) => Some(file),
+            _ => None,
+        })
+        .unwrap();
+    first.data_crc32 = Some(0);
+    let last = volumes[2]
+        .blocks
+        .iter_mut()
+        .find_map(|block| match block {
+            Block::File(file) => Some(file),
+            _ => None,
+        })
+        .unwrap();
+    last.hash = None;
+    last.data_crc32 = Some(0);
+    let error =
+        extract_volumes_to(&volumes, options, |_| Ok(Box::new(std::io::sink()))).unwrap_err();
+    assert!(matches!(error.root_cause(), Error::Crc32Mismatch { .. }));
+}
+
+#[test]
 fn rejects_nonzero_encrypted_stored_padding_in_split_streaming_extraction() {
     let data = b"encrypted stored split RAR5 padding check".repeat(3);
     let entry = entry(b"split-secret.txt", &data)
