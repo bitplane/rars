@@ -2558,6 +2558,98 @@ mod tests {
     }
 
     #[test]
+    fn extraction_modes_handle_directories_links_and_single_volume_splits() {
+        let mut directory = plain_file(b"dir", b"", None);
+        directory.file_flags = 1;
+        directory.compression_info = 5 << 7;
+        let mut link = plain_file(b"link", b"", None);
+        link.compression_info = 5 << 7;
+        link.redirection = Some(super::super::FileRedirection {
+            redirection_type: 1,
+            flags: 0,
+            target_name: b"dir".to_vec(),
+        });
+        let archive = archive_with_blocks(vec![Block::File(directory), Block::File(link)], vec![]);
+        for parallel in [false, true] {
+            let mut opened = vec![];
+            let options = crate::ArchiveReadOptions::new()
+                .with_rar50_dictionary_size_limit(0)
+                .with_max_member_output_bytes(0);
+            let mut open = |meta: &ExtractedEntryMeta| {
+                opened.push(meta.name.clone());
+                assert!(meta.is_directory);
+                Ok(Box::new(std::io::sink()) as Box<dyn Write>)
+            };
+            if parallel {
+                archive.extract_to_parallel_buffered(options, &mut open)
+            } else {
+                extract_volumes_to(std::slice::from_ref(&archive), options, &mut open)
+            }
+            .unwrap();
+            assert_eq!(opened, [b"dir".to_vec()]);
+        }
+        let mut select = |_: &crate::ArchiveMember| {
+            Ok(crate::ExtractionDecision::Extract(
+                Box::new(std::io::sink()),
+            ))
+        };
+        let error = archive
+            .extract_controlled(crate::ArchiveReadOptions::new(), &mut select, None)
+            .unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::UnsupportedFeature);
+        assert_eq!(error.entry_context().unwrap().0, b"link");
+
+        for flags in [HFL_SPLIT_BEFORE, HFL_SPLIT_AFTER] {
+            let archive = archive_with_blocks(
+                vec![Block::File(split_fragment_file(b"split", flags))],
+                vec![],
+            );
+            let error = archive
+                .extract_to_parallel_buffered(crate::ArchiveReadOptions::new(), never_open)
+                .unwrap_err();
+            assert!(matches!(
+                error.root_cause(),
+                Error::InvalidHeader("RAR 5 split entry requires multivolume extraction")
+            ));
+        }
+    }
+
+    #[test]
+    fn encrypted_buffered_crc_verification_requires_keys_and_checks_mac() {
+        let data = b"MAC checked payload";
+        let keys = Rar50Keys::derive(b"pw", [3; 16], 0).unwrap();
+        let mut file = plain_file(b"encrypted", data, None);
+        file.encrypted = true;
+        file.encryption = Some(FileEncryption {
+            version: 0,
+            flags: 2,
+            kdf_count: 0,
+            salt: [3; 16],
+            iv: [4; 16],
+            check_value: None,
+        });
+        file.data_crc32 = Some(keys.mac_crc32(crc32(data)));
+        assert!(matches!(
+            file.verify_integrity_with_keys(data, None),
+            Err(Error::InvalidHeader(_))
+        ));
+        file.verify_integrity_with_keys(data, Some(&keys)).unwrap();
+        assert!(matches!(
+            file.verify_integrity_with_keys(b"damaged", Some(&keys)),
+            Err(Error::Crc32Mismatch { .. })
+        ));
+        file.block.data_range = 0..data.len();
+        file.block.data_size = Some(data.len() as u64);
+        let archive = archive_with_blocks(vec![], data.to_vec());
+        assert!(matches!(
+            file.packed_reader_with_password(&archive, Some(b"pw")),
+            Err(Error::InvalidHeader(
+                "RAR 5 encrypted file payload is not block aligned"
+            ))
+        ));
+    }
+
+    #[test]
     fn archive_extract_to_rejects_split_entries_in_single_volume_archive() {
         let split = split_fragment_file(b"a.txt", HFL_SPLIT_AFTER);
         let archive = archive_with_blocks(vec![Block::File(split)], Vec::new());
