@@ -238,7 +238,7 @@ fn split_and_parallel_sink_failures_keep_member_context() {
             builder
                 .add_bytes(b"payload".to_vec(), payload, None, None)
                 .unwrap();
-            let volumes: Vec<_> = builder
+            let mut volumes: Vec<_> = builder
                 .build_volumes(None)
                 .unwrap()
                 .into_iter()
@@ -257,6 +257,26 @@ fn split_and_parallel_sink_failures_keep_member_context() {
                 Some(b"payload".as_slice())
             );
             assert!(error.to_string().contains("injected sink failure"));
+            // A separately corrupted final integrity record must still name
+            // the logical split member after all fragments have been decoded.
+            if let Archive::Rar15To40(last) = volumes.last_mut().unwrap() {
+                for block in &mut last.blocks {
+                    if let rars::rar15_40::Block::File(file) = block {
+                        file.file_crc ^= 1;
+                    }
+                }
+                let error = rars::extract_volumes_to_with_options(
+                    &volumes,
+                    ArchiveReadOptions::default(),
+                    |_| Ok(Box::new(io::sink())),
+                )
+                .unwrap_err();
+                assert_eq!(error.kind(), ErrorKind::ChecksumMismatch);
+                assert_eq!(
+                    error.entry_context().map(|(name, _)| name),
+                    Some(b"payload".as_slice())
+                );
+            }
         }
     }
     for (_, encrypted, bytes) in images() {
@@ -265,6 +285,56 @@ fn split_and_parallel_sink_failures_keep_member_context() {
         let archive = ArchiveReader::read_owned_with_options(bytes, options).unwrap();
         let error = archive
             .extract_to_parallel_buffered_with_options(options, |_| Ok(Box::new(FailingSink)))
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Io);
+        assert_eq!(
+            error.entry_context().map(|(name, _)| name),
+            Some(b"payload".as_slice())
+        );
+    }
+}
+
+#[test]
+fn encrypted_header_source_failures_remain_io_errors() {
+    for version in [ArchiveVersion::Rar30, ArchiveVersion::Rar50] {
+        let mut builder = Builder::new(version)
+            .password(Some(b"secret".to_vec()))
+            .header_encryption(true);
+        builder
+            .add_bytes(b"payload".to_vec(), b"data".to_vec(), None, None)
+            .unwrap();
+        let bytes = builder.to_bytes().unwrap();
+        let options = ArchiveReadOptions::with_password(b"secret");
+        let fault = Arc::new(Mutex::new(Fault::default()));
+        parse(&bytes, &fault, options).unwrap();
+        let operations = fault.lock().unwrap().operations;
+        for fail_at in 1..=operations {
+            fault.lock().unwrap().arm(Some(fail_at));
+            let error = parse(&bytes, &fault, options).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                ErrorKind::Io,
+                "{version:?}, operation {fail_at}: {error}"
+            );
+            assert!(error.to_string().contains("injected source failure"));
+        }
+    }
+}
+
+#[test]
+fn parallel_stored_source_failure_retains_member_context() {
+    for version in [ArchiveVersion::Rar15, ArchiveVersion::Rar50] {
+        let mut builder = Builder::new(version).store(true);
+        builder
+            .add_bytes(b"payload".to_vec(), b"data".to_vec(), None, None)
+            .unwrap();
+        let bytes = builder.to_bytes().unwrap();
+        let fault = Arc::new(Mutex::new(Fault::default()));
+        let options = ArchiveReadOptions::default();
+        let archive = parse(&bytes, &fault, options).unwrap();
+        fault.lock().unwrap().arm(Some(1));
+        let error = archive
+            .extract_to_parallel_buffered_with_options(options, |_| Ok(Box::new(io::sink())))
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Io);
         assert_eq!(

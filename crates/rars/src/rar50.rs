@@ -3332,6 +3332,74 @@ mod tests {
     }
 
     #[test]
+    fn parser_metadata_failures_retain_physical_header_offsets() {
+        fn image(body: &[u8]) -> Vec<u8> {
+            assert!(body.len() < 128);
+            let mut bytes = vec![body.len() as u8];
+            bytes.extend_from_slice(body);
+            let mut result = crc32(&bytes).to_le_bytes().to_vec();
+            result.extend_from_slice(&bytes);
+            result
+        }
+        let main = image(&[HEAD_MAIN as u8, 0, 0]);
+        let mut cases = vec![(
+            image(&[HEAD_MAIN as u8, 0]),
+            true,
+            crate::ErrorKind::InvalidArchive,
+        )];
+        for kind in [HEAD_FILE, HEAD_SERVICE] {
+            cases.push((
+                image(&[kind as u8, 0]),
+                false,
+                crate::ErrorKind::InvalidArchive,
+            ));
+            // Structurally complete encryption record, unsupported version.
+            let mut record = vec![FHEXTRA_CRYPT as u8, 1, 0, 0];
+            record.extend_from_slice(&[0; 32]);
+            let mut body = vec![
+                kind as u8,
+                HFL_EXTRA as u8,
+                (record.len() + 1) as u8,
+                0,
+                0,
+                0,
+                0,
+                0,
+                1,
+                b'x',
+                record.len() as u8,
+            ];
+            body.extend_from_slice(&record);
+            cases.push((image(&body), false, crate::ErrorKind::UnsupportedFeature));
+        }
+        for (header, is_main, expected_kind) in cases {
+            let mut bytes = RAR50_SIGNATURE.to_vec();
+            if !is_main {
+                bytes.extend_from_slice(&main);
+            }
+            let offset = bytes.len();
+            bytes.extend_from_slice(&header);
+            let options = crate::ArchiveReadOptions::with_password(b"secret");
+            let memory = Archive::parse_with_options(&bytes, options).unwrap_err();
+            let seekable = Archive::parse_file_backed(
+                &mut std::io::Cursor::new(&bytes),
+                bytes.len(),
+                0,
+                ArchiveSource::Memory(std::sync::Arc::from(bytes.clone())),
+                options,
+            )
+            .unwrap_err();
+            for error in [memory, seekable] {
+                assert_eq!(error.kind(), expected_kind, "{error}");
+                assert!(
+                    matches!(error, Error::AtArchiveOffset { offset: actual, .. } if actual == offset),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn memory_and_file_backed_parsers_reject_a_non_main_first_header() {
         let archive = build_archive_with_optional_comment(None);
         let mut bytes = archive
