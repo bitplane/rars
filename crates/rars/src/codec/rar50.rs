@@ -200,9 +200,9 @@ pub struct CompressedBlockHeader {
     pub payload_bits: usize,
 }
 
-struct OwnedCompressedBlock {
+struct OwnedCompressedBlock<B: Budget = Allowance> {
     header: CompressedBlockHeader,
-    payload: Vec<u8>,
+    payload: Buffer<u8, B>,
 }
 
 #[derive(Debug)]
@@ -3183,7 +3183,7 @@ impl Unpack50Decoder {
 
         loop {
             let block = read_compressed_block(input)?;
-            let payload = block.payload.as_slice();
+            let payload = &*block.payload;
             let mut payload_bit_pos = 0;
             if block.header.has_tables {
                 let (lengths, table_bits) = read_table_lengths(payload, algorithm_version)?;
@@ -3369,7 +3369,7 @@ impl Unpack50Decoder {
 
         loop {
             let block = read_compressed_block(input)?;
-            let payload = block.payload.as_slice();
+            let payload = &*block.payload;
             let mut payload_bit_pos = 0;
             if block.header.has_tables {
                 let (lengths, table_bits) = read_table_lengths(payload, algorithm_version)?;
@@ -3764,6 +3764,13 @@ impl StreamingOutput {
 }
 
 fn read_compressed_block(input: &mut impl Read) -> Result<OwnedCompressedBlock> {
+    read_compressed_block_with_allowance(input, &Allowance::default())
+}
+
+fn read_compressed_block_with_allowance<B: Budget>(
+    input: &mut impl Read,
+    allowance: &B,
+) -> Result<OwnedCompressedBlock<B>> {
     let mut fixed = [0u8; 2];
     input
         .read_exact(&mut fixed)
@@ -3794,7 +3801,7 @@ fn read_compressed_block(input: &mut impl Read) -> Result<OwnedCompressedBlock> 
         .fold(0usize, |acc, (index, &byte)| {
             acc | (usize::from(byte) << (index * 8))
         });
-    let mut payload = vec![0; payload_size];
+    let mut payload = Buffer::filled(payload_size, 0, allowance)?;
     input
         .read_exact(&mut payload)
         .map_err(Error::from_read_error)?;
@@ -9347,6 +9354,87 @@ mod tests {
         let checksum = 0x5a ^ flags ^ 0xff ^ 0xff ^ 0xff;
         let header = [flags, checksum, 0xff, 0xff, 0xff];
         assert_eq!(parse_compressed_block(&header), Err(Error::NeedMoreInput));
+    }
+
+    #[test]
+    fn reader_block_admits_capacity_before_reading_payload_and_releases_failures() {
+        let packed = encode_compressed_block(&[0x31; 8], 64, false, true).unwrap();
+        let header_len = parse_compressed_block(&packed).unwrap().header_len;
+        let denied = Allowance::limited(7);
+        let mut input = std::io::Cursor::new(&packed);
+        let error = match read_compressed_block_with_allowance(&mut input, &denied) {
+            Ok(_) => panic!("payload must exceed the allowance"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, Error::WorkspaceLimitExceeded(ref details)
+            if details.limit == 7 && details.required == 8 && details.used == 0));
+        assert_eq!(input.position(), header_len as u64);
+        assert_eq!(denied.used(), 0);
+
+        let allowance = Allowance::limited(8);
+        let block =
+            read_compressed_block_with_allowance(&mut packed.as_slice(), &allowance).unwrap();
+        assert_eq!(&*block.payload, &[0x31; 8]);
+        assert_eq!(allowance.used(), 8);
+        drop(block);
+        assert_eq!(allowance.used(), 0);
+
+        struct FailingPayload<'a> {
+            header: &'a [u8],
+        }
+        impl Read for FailingPayload<'_> {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                if self.header.is_empty() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "payload read denied",
+                    ));
+                }
+                self.header.read(output)
+            }
+        }
+        let mut failing = FailingPayload {
+            header: &packed[..header_len],
+        };
+        let error = match read_compressed_block_with_allowance(&mut failing, &allowance) {
+            Ok(_) => panic!("payload read must fail"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, Error::Io(ref source)
+            if matches!(**source, crate::Error::Io(ref io)
+                if io.kind == std::io::ErrorKind::PermissionDenied)));
+        assert_eq!(allowance.used(), 0);
+
+        let mut truncated = &packed[..packed.len() - 1];
+        assert!(matches!(
+            read_compressed_block_with_allowance(&mut truncated, &allowance),
+            Err(Error::NeedMoreInput)
+        ));
+        assert_eq!(allowance.used(), 0);
+    }
+
+    #[test]
+    fn reader_block_keeps_its_worker_charge_after_reservation_retirement() {
+        use super::super::workspace::RESERVATION_BYTES;
+        let packed = encode_compressed_block(&[0x31; 8], 64, false, true).unwrap();
+        let ledger = Allowance::limited(128 + RESERVATION_BYTES);
+        let mut reservation = ledger.reserve(16).unwrap();
+        let allowance = reservation.allowance();
+        reservation.start();
+        let block =
+            read_compressed_block_with_allowance(&mut packed.as_slice(), &allowance).unwrap();
+        let larger = encode_compressed_block(&[0x31; 9], 72, false, true).unwrap();
+        assert!(matches!(
+            read_compressed_block_with_allowance(&mut larger.as_slice(), &allowance),
+            Err(Error::WorkspaceLimitExceeded(_))
+        ));
+        assert_eq!(allowance.used(), 8);
+        reservation.retire();
+        assert_eq!(ledger.used(), 8 + RESERVATION_BYTES);
+        drop(block);
+        assert_eq!(ledger.used(), RESERVATION_BYTES);
+        drop(allowance);
+        assert_eq!(ledger.used(), 0);
     }
 
     #[test]
