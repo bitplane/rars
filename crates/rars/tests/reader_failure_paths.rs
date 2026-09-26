@@ -343,3 +343,45 @@ fn parallel_stored_source_failure_retains_member_context() {
         );
     }
 }
+
+#[test]
+fn removed_file_sources_report_io_with_member_context() {
+    let directory =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/reader-failure-tests");
+    std::fs::create_dir_all(&directory).unwrap();
+    for (version, encrypted, bytes) in images()
+        .into_iter()
+        .filter(|(version, _, _)| matches!(version, ArchiveVersion::Rar30 | ArchiveVersion::Rar50))
+    {
+        for streaming in [false, true] {
+            let path = directory.join(format!(
+                "removed-{}-{version:?}-{encrypted}-{streaming}.rar",
+                std::process::id()
+            ));
+            std::fs::write(&path, &bytes).unwrap();
+            let mut options = ArchiveReadOptions::with_optional_password(
+                encrypted.then_some(b"secret".as_slice()),
+            );
+            if streaming {
+                options = options.with_rar50_buffered_decode_limit(0);
+            }
+            let archive = ArchiveReader::read_path_with_options(&path, options).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            let error = archive
+                .extract_to_with_options(options, |_| Ok(Box::new(io::sink())))
+                .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Io, "{version:?}: {error}");
+            assert_eq!(
+                error.entry_context().map(|(name, _)| name),
+                Some(b"payload".as_slice())
+            );
+            let rars::Error::Io(source) = error.root_cause() else {
+                panic!("{error}")
+            };
+            assert_eq!(
+                source.source().downcast_ref::<io::Error>().unwrap().kind(),
+                io::ErrorKind::NotFound
+            );
+        }
+    }
+}
