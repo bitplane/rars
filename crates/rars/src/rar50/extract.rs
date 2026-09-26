@@ -2221,6 +2221,7 @@ mod tests {
         let data = b"stored source can change";
         let mut file = plain_file(b"stored.txt", data, None);
         file.block.data_range = 0..data.len();
+        file.block.data_size = Some(data.len() as u64);
         let scratch = crate::scratch::case("rar5-stored-truncated-source");
         let path = scratch.join("member.part");
         std::fs::write(&path, data).unwrap();
@@ -2228,11 +2229,23 @@ mod tests {
         archive.source = ArchiveSource::File(Arc::new(path.clone()));
         std::fs::write(&path, &data[..data.len() - 3]).unwrap();
 
+        let captured = Rc::new(RefCell::new(Vec::new()));
+        struct Capture(Rc<RefCell<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
         let error = archive
             .extract_to(crate::ArchiveReadOptions::default(), |_| {
-                Ok(Box::new(std::io::sink()))
+                Ok(Box::new(Capture(captured.clone())))
             })
             .unwrap_err();
+        assert_eq!(*captured.borrow(), data[..data.len() - 3]);
         assert!(matches!(
             error.root_cause(),
             Error::InvalidHeader("RAR 5 stored file has mismatched packed and unpacked sizes")
