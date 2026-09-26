@@ -653,6 +653,9 @@ impl FileHeader {
         if self.is_directory() {
             return Ok(());
         }
+        if self.is_stored() {
+            return self.write_stored_to(archive, password, out);
+        }
         let mut session = DecoderSession::new_with_password(false, password);
         session.write_file_to(archive, self, out)
     }

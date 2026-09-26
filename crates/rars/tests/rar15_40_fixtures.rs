@@ -1581,6 +1581,44 @@ fn extract_to_reports_rar15_entry_context_on_write_failure() {
 }
 
 #[test]
+fn extracts_stored_members_through_public_member_writer_for_each_cipher() {
+    for version in [
+        ArchiveVersion::Rar15,
+        ArchiveVersion::Rar20,
+        ArchiveVersion::Rar30,
+        ArchiveVersion::Rar40,
+    ] {
+        for password in [None, Some(b"password".as_slice())] {
+            let entry = StoredEntry {
+                name: b"stored.txt",
+                data: b"stored member data",
+                file_time: 0,
+                file_attr: 0x20,
+                host_os: 3,
+                password,
+                file_comment: None,
+            };
+            let bytes = write_stored_archive(
+                &[entry],
+                WriterOptions::new(version, FeatureSet::store_only()),
+            )
+            .unwrap();
+            let archive = Archive::parse(&bytes).unwrap();
+            let file = archive.files().next().unwrap();
+            assert!(file.is_stored());
+            let mut output = Vec::new();
+            file.write_to(&archive, password, &mut output).unwrap();
+            assert_eq!(
+                output,
+                b"stored member data",
+                "{version:?}, encrypted {}",
+                password.is_some()
+            );
+        }
+    }
+}
+
+#[test]
 fn writes_store_only_rar15_archive_that_reader_extracts() {
     let entries = [
         StoredEntry {
