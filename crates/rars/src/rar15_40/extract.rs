@@ -795,6 +795,78 @@ mod tests {
     }
 
     #[test]
+    fn decrypting_reader_preserves_complete_blocks_and_caches_eof() {
+        struct CountingReader {
+            inner: Cursor<Vec<u8>>,
+            chunk: usize,
+            reads: usize,
+        }
+        impl Read for CountingReader {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                let count = out.len().min(self.chunk);
+                self.inner.read(&mut out[..count])
+            }
+        }
+
+        let plain = *b"0123456789abcdefRAR3 block two!!";
+        let salt = Some([7; 8]);
+        for version in [15, 20, 29] {
+            let mut encrypted = plain;
+            match version {
+                15 => Rar15Cipher::new(b"pw").crypt_in_place(&mut encrypted),
+                20 => Rar20Cipher::new(b"pw")
+                    .encrypt_in_place(&mut encrypted)
+                    .unwrap(),
+                _ => Rar30Cipher::new(b"pw", salt)
+                    .unwrap()
+                    .encrypt_in_place(&mut encrypted)
+                    .unwrap(),
+            }
+            for chunk in [5, 64 * 1024] {
+                for length in 0..=encrypted.len() {
+                    let inner = CountingReader {
+                        inner: Cursor::new(encrypted[..length].to_vec()),
+                        chunk,
+                        reads: 0,
+                    };
+                    let mut reader = DecryptingReader::new(inner, version, b"pw", salt).unwrap();
+                    assert_eq!(reader.read(&mut []).unwrap(), 0);
+                    assert_eq!(reader.inner.reads, 0);
+                    let mut out = Vec::new();
+                    let result = loop {
+                        let mut buf = [0; 3];
+                        match reader.read(&mut buf) {
+                            Ok(0) => break Ok(()),
+                            Ok(count) => out.extend_from_slice(&buf[..count]),
+                            Err(error) => break Err(error),
+                        }
+                    };
+                    let complete_length = if version == 15 {
+                        length
+                    } else {
+                        length / 16 * 16
+                    };
+                    assert_eq!(
+                        out,
+                        plain[..complete_length],
+                        "version {version}, length {length}, chunk {chunk}"
+                    );
+                    if version != 15 && length % 16 != 0 {
+                        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+                    } else {
+                        result.unwrap();
+                        let reads = reader.inner.reads;
+                        assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+                        assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+                        assert_eq!(reader.inner.reads, reads, "EOF must not reread the source");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn validate_split_fragment_rejects_directories_and_demands_password_for_encrypted() {
         let dir = file(b"d", FHD_DIRECTORY_MASK | FHD_SPLIT_AFTER);
         assert!(matches!(
