@@ -1759,6 +1759,70 @@ mod tests {
     }
 
     #[test]
+    fn split_solid_rar29_member_keeps_history_from_regular_predecessor() {
+        let archive = Archive::parse(include_bytes!(
+            "../../tests/fixtures/rar15_40/rar300/solid_simple_rar300.rar"
+        ))
+        .unwrap();
+        let files: Vec<_> = archive.files().cloned().collect();
+        assert_eq!(files.len(), 2);
+        assert!(files[1].is_solid());
+        let mut first_part = files[1].clone();
+        let mut last_part = first_part.clone();
+        let middle = first_part.packed_range.start + first_part.packed_range.len() / 2;
+        first_part.block.flags |= FHD_SPLIT_AFTER;
+        first_part.packed_range.end = middle;
+        first_part.pack_size = first_part.packed_range.len() as u64;
+        last_part.block.flags |= FHD_SPLIT_BEFORE;
+        last_part.packed_range.start = middle;
+        last_part.pack_size = last_part.packed_range.len() as u64;
+        let mut volume1 = archive.clone();
+        volume1.blocks = vec![Block::File(files[0].clone()), Block::File(first_part)];
+        let mut volume2 = archive;
+        volume2.blocks = vec![Block::File(last_part)];
+        let capture = Capture::default();
+        extract_volumes_to(
+            &[volume1, volume2],
+            crate::ArchiveReadOptions::default(),
+            capture.opener(),
+        )
+        .unwrap();
+        assert_eq!(capture.opened.borrow().len(), 2);
+        assert_eq!(capture.bytes.borrow().as_slice(),
+            b"shared prefix shared prefix shared prefix alpha\nshared prefix shared prefix shared prefix beta\n");
+    }
+
+    #[test]
+    fn split_rar15_encrypted_stored_member_has_no_block_padding() {
+        let payload = b"legacy byte cipher split";
+        let mut encrypted = payload.to_vec();
+        Rar15Cipher::new(b"pw").crypt_in_place(&mut encrypted);
+        let split = 7;
+        let mut first = file(b"split", FHD_PASSWORD | FHD_SPLIT_AFTER);
+        first.unp_ver = 15;
+        first.unp_size = payload.len() as u64;
+        first.pack_size = split as u64;
+        first.packed_range = 0..split;
+        first.file_crc = crc32(payload);
+        let mut last = first.clone();
+        last.block.flags = FHD_PASSWORD | FHD_SPLIT_BEFORE;
+        last.pack_size = (payload.len() - split) as u64;
+        last.packed_range = 0..payload.len() - split;
+        let volumes = [
+            archive_with_source(vec![Block::File(first)], encrypted[..split].to_vec()),
+            archive_with_source(vec![Block::File(last)], encrypted[split..].to_vec()),
+        ];
+        let capture = Capture::default();
+        extract_volumes_to(
+            &volumes,
+            crate::ArchiveReadOptions::with_password(b"pw"),
+            capture.opener(),
+        )
+        .unwrap();
+        assert_eq!(capture.bytes.borrow().as_slice(), payload);
+    }
+
+    #[test]
     fn extract_volumes_to_assembles_encrypted_stored_split_across_two_volumes() {
         let payload: &[u8] = b"twenty-byte payload!"; // exactly 20 bytes
         let unpacked_len = payload.len();
