@@ -603,41 +603,52 @@ impl<R: Read> DecryptingReader<R> {
                 self.decrypted.extend_from_slice(&read_buffer[..count]);
                 cipher.crypt_in_place(&mut self.decrypted);
             }
-            SplitCipher::Rar20(_) | SplitCipher::Rar30(_) => self.fill_block_decrypted()?,
+            SplitCipher::Rar20(cipher) => Self::fill_block_decrypted(
+                &mut self.inner,
+                &mut self.encrypted_block,
+                &mut self.decrypted,
+                &mut self.eof,
+                |block| cipher.decrypt_block(block),
+            )?,
+            SplitCipher::Rar30(cipher) => Self::fill_block_decrypted(
+                &mut self.inner,
+                &mut self.encrypted_block,
+                &mut self.decrypted,
+                &mut self.eof,
+                |block| cipher.decrypt_block(block),
+            )?,
         }
         Ok(())
     }
 
-    fn fill_block_decrypted(&mut self) -> std::io::Result<()> {
+    fn fill_block_decrypted(
+        inner: &mut R,
+        encrypted_block: &mut Vec<u8>,
+        decrypted: &mut Vec<u8>,
+        eof: &mut bool,
+        mut decrypt_block: impl FnMut(&mut [u8; 16]),
+    ) -> std::io::Result<()> {
         // fill_decrypted returns before calling us once EOF is known. The only
         // EOF transition below breaks the loop immediately.
-        while self.encrypted_block.len() < 16 {
+        while encrypted_block.len() < 16 {
             let mut buf = [0u8; 64 * 1024];
-            let count = self.inner.read(&mut buf)?;
+            let count = inner.read(&mut buf)?;
             if count == 0 {
-                self.eof = true;
+                *eof = true;
                 break;
             }
-            self.encrypted_block.extend_from_slice(&buf[..count]);
+            encrypted_block.extend_from_slice(&buf[..count]);
         }
 
-        let full_len = (self.encrypted_block.len() / 16) * 16;
+        let full_len = (encrypted_block.len() / 16) * 16;
         if full_len != 0 {
-            let tail = self.encrypted_block.split_off(full_len);
-            let mut data = std::mem::replace(&mut self.encrypted_block, tail);
-            match &mut self.cipher {
-                SplitCipher::Rar15(_) => unreachable!("RAR 1.5 is byte-stream decrypted"),
-                SplitCipher::Rar20(cipher) => cipher
-                    .decrypt_in_place(&mut data)
-                    .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?,
-                SplitCipher::Rar30(cipher) => cipher
-                    .decrypt_in_place(&mut data)
-                    .map_err(super::map_rar30_crypto_error)
-                    .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?,
+            let tail = encrypted_block.split_off(full_len);
+            let mut data = std::mem::replace(encrypted_block, tail);
+            for block in data.chunks_exact_mut(16) {
+                decrypt_block(block.try_into().expect("complete encrypted block"));
             }
-            self.decrypted = data;
-            self.decrypted_pos = 0;
-        } else if !self.encrypted_block.is_empty() {
+            *decrypted = data;
+        } else if !encrypted_block.is_empty() {
             // With no full block, the loop could only have ended at EOF.
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -764,16 +775,16 @@ mod tests {
         Rar20Cipher::new(b"pw")
             .encrypt_in_place(&mut encrypted)
             .unwrap();
-        let reader = DecryptingReader::new(
-            ChunkedReader::new(Cursor::new(encrypted), 5),
-            20,
-            b"pw",
-            None,
-        )
-        .unwrap();
-        let out = read_in_small_chunks(reader);
-
-        assert_eq!(out, plain);
+        for version in [20, 26] {
+            let reader = DecryptingReader::new(
+                ChunkedReader::new(Cursor::new(encrypted), 5),
+                version,
+                b"pw",
+                None,
+            )
+            .unwrap();
+            assert_eq!(read_in_small_chunks(reader), plain);
+        }
     }
 
     #[test]
@@ -1250,6 +1261,15 @@ mod tests {
                 "unp_ver {ver} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn decrypting_reader_rejects_non_utf8_rar30_password() {
+        let result = DecryptingReader::new(Cursor::new(Vec::<u8>::new()), 29, &[0xff], None);
+        assert!(matches!(
+            result,
+            Err(Error::Rar30Crypto(Rar30Error::NonUtf8Password))
+        ));
     }
 
     #[test]

@@ -58,7 +58,7 @@ impl Rar20Cipher {
             return Err(Error::UnalignedInput);
         }
         for block in data.chunks_exact_mut(16) {
-            self.decrypt_block(block);
+            self.decrypt_block(block.try_into().expect("RAR 2 block size"));
         }
         Ok(())
     }
@@ -115,8 +115,8 @@ impl Rar20Cipher {
         self.update_keys(block);
     }
 
-    fn decrypt_block(&mut self, block: &mut [u8]) {
-        let saved: [u8; 16] = block.try_into().expect("RAR 2 block size");
+    pub(crate) fn decrypt_block(&mut self, block: &mut [u8; 16]) {
+        let saved = *block;
         let (mut a, mut b, mut c, mut d) = self.load_block(block);
         for i in (0..32).rev() {
             (a, b, c, d) = self.round(i, a, b, c, d);

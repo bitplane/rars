@@ -45,7 +45,7 @@ impl Rar30Cipher {
             return Err(Error::UnalignedInput);
         }
         for block in data.chunks_exact_mut(16) {
-            self.decrypt_block(block);
+            self.decrypt_block(block.try_into().expect("AES block size"));
         }
         Ok(())
     }
@@ -69,9 +69,8 @@ impl Rar30Cipher {
         self.iv.copy_from_slice(block);
     }
 
-    fn decrypt_block(&mut self, block: &mut [u8]) {
-        let ciphertext: [u8; 16] = block.try_into().expect("AES block size");
-        let block: &mut [u8; 16] = block.try_into().expect("AES block size");
+    pub(crate) fn decrypt_block(&mut self, block: &mut [u8; 16]) {
+        let ciphertext = *block;
         self.cipher.decrypt_block(block.into());
         for (byte, iv_byte) in block.iter_mut().zip(self.iv) {
             *byte ^= iv_byte;

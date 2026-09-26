@@ -1562,10 +1562,7 @@ impl<R: Read> Rar50DecryptingReader<R> {
             }
             self.encrypted_len += count;
         }
-        self.cipher
-            .decrypt_in_place(&mut self.buffer)
-            .map_err(super::map_rar50_crypto_error)
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+        self.cipher.decrypt_block(&mut self.buffer);
         self.encrypted_len = 0;
         self.pos = 0;
         self.len = self.buffer.len();
