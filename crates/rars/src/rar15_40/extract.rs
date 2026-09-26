@@ -609,7 +609,9 @@ impl<R: Read> DecryptingReader<R> {
     }
 
     fn fill_block_decrypted(&mut self) -> std::io::Result<()> {
-        while self.encrypted_block.len() < 16 && !self.eof {
+        // fill_decrypted returns before calling us once EOF is known. The only
+        // EOF transition below breaks the loop immediately.
+        while self.encrypted_block.len() < 16 {
             let mut buf = [0u8; 64 * 1024];
             let count = self.inner.read(&mut buf)?;
             if count == 0 {
@@ -635,7 +637,8 @@ impl<R: Read> DecryptingReader<R> {
             }
             self.decrypted = data;
             self.decrypted_pos = 0;
-        } else if self.eof && !self.encrypted_block.is_empty() {
+        } else if !self.encrypted_block.is_empty() {
+            // With no full block, the loop could only have ended at EOF.
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "RAR encrypted payload is not block aligned",
