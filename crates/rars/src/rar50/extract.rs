@@ -1529,6 +1529,7 @@ struct Rar50DecryptingReader<R> {
     inner: R,
     cipher: Rar50Cipher,
     buffer: [u8; 16],
+    encrypted_len: usize,
     pos: usize,
     len: usize,
 }
@@ -1539,18 +1540,19 @@ impl<R: Read> Rar50DecryptingReader<R> {
             inner,
             cipher: Rar50Cipher::new(key, iv),
             buffer: [0; 16],
+            encrypted_len: 0,
             pos: 0,
             len: 0,
         }
     }
 
     fn fill_buffer(&mut self) -> std::io::Result<bool> {
-        let mut encrypted = [0; 16];
-        let mut read = 0;
-        while read < encrypted.len() {
-            let count = self.inner.read(&mut encrypted[read..])?;
+        // Preserve bytes already consumed if the source returns an error.
+        // In particular, Read::read_to_end retries Interrupted automatically.
+        while self.encrypted_len < self.buffer.len() {
+            let count = self.inner.read(&mut self.buffer[self.encrypted_len..])?;
             if count == 0 {
-                if read == 0 {
+                if self.encrypted_len == 0 {
                     return Ok(false);
                 }
                 return Err(std::io::Error::new(
@@ -1558,13 +1560,13 @@ impl<R: Read> Rar50DecryptingReader<R> {
                     "truncated RAR 5 encrypted stream",
                 ));
             }
-            read += count;
+            self.encrypted_len += count;
         }
-        self.buffer = encrypted;
         self.cipher
             .decrypt_in_place(&mut self.buffer)
             .map_err(super::map_rar50_crypto_error)
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+        self.encrypted_len = 0;
         self.pos = 0;
         self.len = self.buffer.len();
         Ok(true)
@@ -1712,6 +1714,39 @@ mod tests {
         }
 
         assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn decrypting_reader_preserves_partial_blocks_across_source_errors() {
+        let key = [3; 32];
+        let iv = [4; 16];
+        let plain = *b"0123456789abcdefRAR5 block two!!";
+        let mut encrypted = plain;
+        Rar50Cipher::new(key, iv)
+            .encrypt_in_place(&mut encrypted)
+            .unwrap();
+        for kind in [
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            for fail_at in [0, 5, 16, 21] {
+                let inner =
+                    crate::read_errors::ErrorOnceReader::new(encrypted.to_vec(), fail_at, kind);
+                let mut reader = Rar50DecryptingReader::new(inner, key, iv);
+                let mut out = Vec::new();
+                let result = reader.read_to_end(&mut out);
+                if kind == std::io::ErrorKind::Interrupted {
+                    result.unwrap();
+                } else {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.kind(), kind);
+                    assert_eq!(error.to_string(), "source read failed");
+                    assert_eq!(out, plain[..fail_at as usize / 16 * 16]);
+                    reader.read_to_end(&mut out).unwrap();
+                }
+                assert_eq!(out, plain, "error {kind:?} at {fail_at}");
+            }
+        }
     }
 
     #[test]

@@ -798,6 +798,52 @@ mod tests {
     }
 
     #[test]
+    fn decrypting_reader_preserves_partial_blocks_across_source_errors() {
+        let plain = *b"0123456789abcdefRAR3 block two!!";
+        let salt = Some([7; 8]);
+        for version in [15, 20, 29] {
+            let mut encrypted = plain;
+            match version {
+                15 => Rar15Cipher::new(b"pw").crypt_in_place(&mut encrypted),
+                20 => Rar20Cipher::new(b"pw")
+                    .encrypt_in_place(&mut encrypted)
+                    .unwrap(),
+                _ => Rar30Cipher::new(b"pw", salt)
+                    .unwrap()
+                    .encrypt_in_place(&mut encrypted)
+                    .unwrap(),
+            }
+            for kind in [
+                std::io::ErrorKind::Interrupted,
+                std::io::ErrorKind::PermissionDenied,
+            ] {
+                for fail_at in [0, 5, 16, 21] {
+                    let inner =
+                        crate::read_errors::ErrorOnceReader::new(encrypted.to_vec(), fail_at, kind);
+                    let mut reader = DecryptingReader::new(inner, version, b"pw", salt).unwrap();
+                    let mut out = Vec::new();
+                    let result = reader.read_to_end(&mut out);
+                    if kind == std::io::ErrorKind::Interrupted {
+                        result.unwrap();
+                    } else {
+                        let error = result.unwrap_err();
+                        assert_eq!(error.kind(), kind);
+                        assert_eq!(error.to_string(), "source read failed");
+                        let emitted = if version == 15 {
+                            fail_at as usize
+                        } else {
+                            fail_at as usize / 16 * 16
+                        };
+                        assert_eq!(out, plain[..emitted]);
+                        reader.read_to_end(&mut out).unwrap();
+                    }
+                    assert_eq!(out, plain, "version {version}, error {kind:?} at {fail_at}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn decrypting_reader_preserves_complete_blocks_and_caches_eof() {
         struct CountingReader {
             inner: Cursor<Vec<u8>>,

@@ -13,6 +13,10 @@
 #[path = "../tests/support/scratch.rs"]
 mod scratch;
 
+#[cfg(test)]
+#[path = "../tests/support/read_errors.rs"]
+mod read_errors;
+
 pub mod builder;
 #[doc(hidden)]
 pub mod codec;
