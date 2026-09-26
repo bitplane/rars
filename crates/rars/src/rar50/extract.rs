@@ -498,10 +498,9 @@ impl FileHeader {
                     Error::InvalidHeader("RAR 5 encrypted stored file has non-zero padding"),
                 ));
             }
-            written = written
-                .checked_add(chunk.len() as u64)
-                .ok_or(Error::InvalidHeader("RAR 5 stored size overflows"))
-                .map_err(|error| self.entry_error("decoding", error))?;
+            // chunk_len is bounded by unpacked_size - written, so this sum
+            // cannot exceed the declared u64 size, including u64::MAX.
+            written += chunk.len() as u64;
             crc.update(chunk);
             if let Some((_, hasher)) = &mut hash {
                 hasher.update(chunk);

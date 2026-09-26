@@ -224,8 +224,9 @@ fn split_and_parallel_sink_failures_keep_member_context() {
         for stored in [false, true] {
             let mut builder = Builder::new(version)
                 .compression_level(Some(if stored { 0 } else { 1 }))
-                .volume_size(Some(512));
-            // Poorly compressible bytes force genuine multiple volumes.
+                .volume_size(Some(if stored { 512 } else { 8 }));
+            // Store mode uses noise; compressed mode uses repeated bytes and
+            // very small fragments so the writer cannot choose a stored fallback.
             let mut state = 0x12345678u32;
             let payload: Vec<u8> = (0..16384)
                 .map(|_| {
@@ -235,6 +236,11 @@ fn split_and_parallel_sink_failures_keep_member_context() {
                     state as u8
                 })
                 .collect();
+            let payload = if stored {
+                payload
+            } else {
+                b"compressible member payload".repeat(128)
+            };
             builder
                 .add_bytes(b"payload".to_vec(), payload, None, None)
                 .unwrap();
@@ -245,6 +251,11 @@ fn split_and_parallel_sink_failures_keep_member_context() {
                 .map(|b| ArchiveReader::read_owned(b).unwrap())
                 .collect();
             assert!(volumes.len() > 1, "{version:?}, stored={stored}");
+            match &volumes[0] {
+                Archive::Rar15To40(a) => assert_eq!(a.files().next().unwrap().is_stored(), stored),
+                Archive::Rar50Plus(a) => assert_eq!(a.files().next().unwrap().is_stored(), stored),
+                _ => unreachable!(),
+            }
             let error = rars::extract_volumes_to_with_options(
                 &volumes,
                 ArchiveReadOptions::default(),
@@ -384,4 +395,110 @@ fn removed_file_sources_report_io_with_member_context() {
             );
         }
     }
+}
+
+#[test]
+fn compressed_worker_and_regular_volume_source_failures_keep_context() {
+    for version in [
+        ArchiveVersion::Rar15,
+        ArchiveVersion::Rar20,
+        ArchiveVersion::Rar30,
+    ] {
+        let mut builder = Builder::new(version).compression_level(Some(1));
+        builder
+            .add_bytes(
+                b"payload".to_vec(),
+                b"compressible member".repeat(256),
+                None,
+                None,
+            )
+            .unwrap();
+        let bytes = builder.to_bytes().unwrap();
+        let options = ArchiveReadOptions::default();
+        let fault = Arc::new(Mutex::new(Fault::default()));
+        let archive = parse(&bytes, &fault, options).unwrap();
+        let Archive::Rar15To40(native) = &archive else {
+            unreachable!()
+        };
+        assert!(!native.files().next().unwrap().is_stored());
+        for parallel in [false, true] {
+            fault.lock().unwrap().arm(Some(1));
+            let error = if parallel {
+                archive.extract_to_parallel_buffered_with_options(options, |_| {
+                    Ok(Box::new(io::sink()))
+                })
+            } else {
+                rars::extract_volumes_to_with_options(
+                    std::slice::from_ref(&archive),
+                    options,
+                    |_| Ok(Box::new(io::sink())),
+                )
+            }
+            .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Io);
+            assert_eq!(
+                error.entry_context().map(|(name, _)| name),
+                Some(b"payload".as_slice())
+            );
+        }
+    }
+}
+#[test]
+fn invalid_stored_hash_records_keep_decode_context() {
+    let archive = ArchiveReader::read_owned(
+        include_bytes!("fixtures/rar50/crc32_wrong_beside_blake2sp.rar").to_vec(),
+    )
+    .unwrap();
+    let Archive::Rar50Plus(native) = &archive else {
+        unreachable!()
+    };
+    let name = native.files().next().unwrap().name.clone();
+    let mut invalid = archive.clone();
+    let Archive::Rar50Plus(native) = &mut invalid else {
+        unreachable!()
+    };
+    for block in &mut native.blocks {
+        if let rars::rar50::Block::File(file) = block {
+            let hash = file.hash.as_mut().unwrap();
+            assert_eq!(hash.hash_type, 0);
+            hash.data.pop();
+        }
+    }
+    let error = invalid
+        .extract_to_with_options(ArchiveReadOptions::default(), |_| Ok(Box::new(io::sink())))
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidArchive);
+    assert_eq!(error.entry_context(), Some((name.as_slice(), "decoding")));
+}
+
+#[test]
+fn historical_aes_compressed_member_keeps_source_open_errors() {
+    let directory =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/reader-failure-tests");
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join(format!("winrar-aes-{}.rar", std::process::id()));
+    std::fs::write(
+        &path,
+        include_bytes!("fixtures/rar15_40/encrypted/per_file_rar300_password.rar"),
+    )
+    .unwrap();
+    let archive = ArchiveReader::read_path(&path).unwrap();
+    let Archive::Rar15To40(native) = &archive else {
+        unreachable!()
+    };
+    let file = native.files().next().unwrap();
+    assert_eq!(file.unp_ver, 29);
+    assert!(file.is_encrypted() && !file.is_stored());
+    let name = file.name.clone();
+    std::fs::remove_file(&path).unwrap();
+    let error = archive
+        .extract_to_with_options(ArchiveReadOptions::with_password(b"password"), |_| {
+            Ok(Box::new(io::sink()))
+        })
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Io);
+    assert_eq!(
+        error.entry_context().map(|(name, _)| name),
+        Some(name.as_slice())
+    );
 }
