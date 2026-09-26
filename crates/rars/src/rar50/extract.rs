@@ -2654,6 +2654,106 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_stored_split_checks_the_final_crc_mac() {
+        let data = b"Hello, RAR 5.0 fixture world.\n";
+        let bytes = Rar50Writer::new(
+            WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
+                .with_compression_level(0),
+        )
+        .entry(entry(b"hello.txt", data).with_password(b"password".to_vec()))
+        .finish()
+        .unwrap();
+        let archive = Archive::parse_with_password(&bytes, Some(b"password")).unwrap();
+        let mut original = archive.files().next().unwrap().clone();
+        assert!(original.uses_hash_mac());
+        assert!(original.is_stored());
+        // Exercise the CRC-only layout as well as the writer's default hash
+        // layout. The CRC is already MACed independently of its BLAKE2sp field.
+        original.hash = None;
+        let split = original.block.data_range.start + 13;
+        let mut first = original.clone();
+        first.block.flags |= HFL_SPLIT_AFTER;
+        first.block.data_range.end = split;
+        first.block.data_size = Some(13);
+        first.data_crc32 = Some(crc32(&first.packed_data(&archive).unwrap()));
+        let mut last = original;
+        last.block.flags |= HFL_SPLIT_BEFORE;
+        last.block.data_range.start = split;
+        last.block.data_size = Some(last.block.data_range.len() as u64);
+        let mut volume1 = archive.clone();
+        volume1.blocks = vec![Block::File(first)];
+        let mut volume2 = archive;
+        volume2.blocks = vec![Block::File(last)];
+        let captured = Rc::new(RefCell::new(Vec::new()));
+        struct Capture(Rc<RefCell<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut volumes = [volume1, volume2];
+        let options = crate::ArchiveReadOptions::with_password(b"password");
+        extract_volumes_to(&volumes, options, |_| {
+            Ok(Box::new(Capture(captured.clone())))
+        })
+        .unwrap();
+        assert_eq!(
+            captured.borrow().as_slice(),
+            b"Hello, RAR 5.0 fixture world.\n"
+        );
+        let Block::File(last) = &mut volumes[1].blocks[0] else {
+            unreachable!()
+        };
+        last.data_crc32 = Some(last.data_crc32.unwrap() ^ 1);
+        let error =
+            extract_volumes_to(&volumes, options, |_| Ok(Box::new(std::io::sink()))).unwrap_err();
+        assert!(matches!(error.root_cause(), Error::Crc32Mismatch { .. }));
+    }
+
+    #[test]
+    fn split_decode_failures_use_fragment_diagnostics_only_when_available() {
+        for crc in [None, Some(0), Some(1)] {
+            let mut first = split_fragment_file(b"truncated", HFL_SPLIT_AFTER);
+            first.compression_info = 5 << 7;
+            first.unpacked_size = 16;
+            first.data_crc32 = crc;
+            let mut last = first.clone();
+            last.block.flags = HFL_SPLIT_BEFORE;
+            last.data_crc32 = None;
+            let volumes = [
+                archive_with_blocks(vec![Block::File(first)], vec![]),
+                archive_with_blocks(vec![Block::File(last)], vec![]),
+            ];
+            for limit in [0, 1024] {
+                let error = extract_volumes_to(
+                    &volumes,
+                    crate::ArchiveReadOptions::new().with_rar50_buffered_decode_limit(limit),
+                    |_| Ok(Box::new(std::io::sink())),
+                )
+                .unwrap_err();
+                if crc == Some(1) {
+                    assert!(matches!(
+                        error.root_cause(),
+                        Error::Crc32Mismatch {
+                            expected: 1,
+                            actual: 0
+                        }
+                    ));
+                } else {
+                    assert!(matches!(
+                        error.root_cause(),
+                        Error::Codec(crate::codec::Error::NeedMoreInput)
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn encrypted_buffered_crc_verification_requires_keys_and_checks_mac() {
         let data = b"MAC checked payload";
         let keys = Rar50Keys::derive(b"pw", [3; 16], 0).unwrap();
