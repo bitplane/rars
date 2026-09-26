@@ -1714,6 +1714,50 @@ mod tests {
     }
 
     #[test]
+    fn decrypting_reader_handles_short_reads_and_truncated_final_blocks() {
+        let key = [3u8; 32];
+        let iv = [4u8; 16];
+        let plain = *b"0123456789abcdefRAR5 block two!!";
+        let mut encrypted = plain;
+        Rar50Cipher::new(key, iv)
+            .encrypt_in_place(&mut encrypted)
+            .unwrap();
+
+        struct ShortReads(Cursor<Vec<u8>>);
+        impl Read for ShortReads {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                let count = out.len().min(3);
+                self.0.read(&mut out[..count])
+            }
+        }
+
+        for length in 0..=encrypted.len() {
+            let mut reader = Rar50DecryptingReader::new(
+                ShortReads(Cursor::new(encrypted[..length].to_vec())),
+                key,
+                iv,
+            );
+            // An empty destination must neither consume nor validate input.
+            assert_eq!(reader.read(&mut []).unwrap(), 0);
+            assert_eq!(reader.inner.0.position(), 0);
+            let mut out = Vec::new();
+            let result = reader.read_to_end(&mut out);
+            let complete_length = length / 16 * 16;
+            assert_eq!(out, plain[..complete_length], "ciphertext length {length}");
+            if length % 16 == 0 {
+                result.unwrap();
+                assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+            } else {
+                assert_eq!(
+                    result.unwrap_err().kind(),
+                    std::io::ErrorKind::UnexpectedEof,
+                    "ciphertext length {length}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn stored_split_entries_stream_fragments_to_writer() {
         struct SharedWriter(Rc<RefCell<Vec<u8>>>);
 
