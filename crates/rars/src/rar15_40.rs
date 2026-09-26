@@ -1120,14 +1120,9 @@ impl Archive {
         let password = options.password;
         let mut budget = crate::parse_budget::ParseBudget::new(options);
         let archive = &input[sig.offset..];
-        if !archive.starts_with(RAR15_SIGNATURE) {
-            return Err(Error::UnsupportedSignature);
-        }
-
+        // find_archive_start matched these exact marker bytes, including the
+        // fixed MARK_HEAD type and seven-byte header length.
         let marker = parse_block_header(archive, 0)?;
-        if marker.head_type != MARK_HEAD || marker.head_size != RAR15_SIGNATURE.len() as u16 {
-            return Err(Error::InvalidHeader("RAR 1.5 marker block is invalid"));
-        }
 
         admit_plain_header(archive, marker.head_size as usize, &mut budget)?;
         let main_block = parse_block_header(archive, marker.head_size as usize)?;
@@ -1928,7 +1923,12 @@ fn parse_main_header(input: &[u8], block: &BlockHeader) -> Result<MainHeader> {
     }
 
     let encrypt_version = if block.flags & MHD_ENCRYPTVER != 0 {
-        Some(*input.get(start + 13).ok_or(Error::TooShort)?)
+        Some(
+            *input
+                .get(start + 13..head_end)
+                .and_then(|bytes| bytes.first())
+                .ok_or(Error::TooShort)?,
+        )
     } else {
         None
     };
@@ -2563,9 +2563,6 @@ fn parse_file_like_header(
 
     let start = block.offset;
     let head_end = start + block.head_size as usize;
-    if head_end > input.len() {
-        return Err(Error::TooShort);
-    }
 
     let pack_low = read_u32(input, start + 7)? as u64;
     let unp_low = read_u32(input, start + 11)? as u64;
@@ -2911,18 +2908,14 @@ fn file_header_comment_crc_end(input: &[u8], offset: usize) -> Result<usize> {
     let flags = read_u16(input, offset + 3)?;
     let name_size = read_u16(input, offset + 26)? as usize;
     let mut end = offset + 32;
+    // Offset is within a physical slice; the remaining fields add at most
+    // a u16 name length plus two eight-byte fields, so usize cannot overflow.
     if flags & FHD_LARGE != 0 {
-        end = end
-            .checked_add(8)
-            .ok_or(Error::InvalidHeader("RAR 1.5 file header size overflows"))?;
+        end += 8;
     }
-    end = end
-        .checked_add(name_size)
-        .ok_or(Error::InvalidHeader("RAR 1.5 file header size overflows"))?;
+    end += name_size;
     if flags & FHD_SALT != 0 {
-        end = end
-            .checked_add(8)
-            .ok_or(Error::InvalidHeader("RAR 1.5 file header size overflows"))?;
+        end += 8;
     }
     Ok(end)
 }
@@ -3596,6 +3589,36 @@ mod tests {
             assert_eq!(file.name, b"name");
             assert_eq!(file.file_comment.len(), 13);
         }
+    }
+
+    #[test]
+    fn main_encrypt_version_cannot_borrow_a_byte_from_the_next_header() {
+        let mut bytes = stored_archive_bytes(b"file", b"payload");
+        let main_start = RAR15_SIGNATURE.len();
+        let main_end = main_start + MAIN_HEADER_SIZE;
+        assert_eq!(
+            read_u16(&bytes, main_start + 5).unwrap(),
+            MAIN_HEADER_SIZE as u16
+        );
+        let flags = read_u16(&bytes, main_start + 3).unwrap() | MHD_ENCRYPTVER;
+        bytes[main_start + 3..main_start + 5].copy_from_slice(&flags.to_le_bytes());
+        let crc = (crc32(&bytes[main_start + 2..main_end]) & 0xffff) as u16;
+        bytes[main_start..main_start + 2].copy_from_slice(&crc.to_le_bytes());
+        let options = crate::ArchiveReadOptions::new();
+        assert!(matches!(
+            Archive::parse_with_options(&bytes, options),
+            Err(Error::TooShort)
+        ));
+        assert!(matches!(
+            Archive::parse_seekable(
+                std::io::Cursor::new(&bytes),
+                bytes.len() as u64,
+                0,
+                ArchiveSource::Memory(Arc::from(bytes.clone())),
+                options
+            ),
+            Err(Error::TooShort)
+        ));
     }
 
     #[test]
