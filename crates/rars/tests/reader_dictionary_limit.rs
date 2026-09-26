@@ -89,3 +89,46 @@ fn zero_dictionary_limit_allows_stored_members_and_directories() {
         .unwrap();
     assert_eq!(opened, 2);
 }
+
+#[test]
+fn invalid_compression_info_keeps_member_context_during_dictionary_admission() {
+    let mut builder = Builder::new(ArchiveVersion::Rar50).compression_level(Some(1));
+    builder
+        .add_bytes(b"file".to_vec(), b"data".repeat(32), None, None)
+        .unwrap();
+    let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    for raw in [2 | 128, (1 << 15) | 128, (16 << 10) | 128] {
+        let mut invalid = archive.clone();
+        let Archive::Rar50Plus(native) = &mut invalid else {
+            unreachable!()
+        };
+        for block in &mut native.blocks {
+            if let rars::rar50::Block::File(file) = block {
+                file.compression_info = raw;
+            }
+        }
+        let mut opened = false;
+        let error = invalid
+            .extract_to_with_options(
+                ArchiveReadOptions::new().with_rar50_dictionary_size_limit(u64::MAX),
+                |_| {
+                    opened = true;
+                    Ok(Box::new(std::io::sink()))
+                },
+            )
+            .unwrap_err();
+        assert!(!opened);
+        assert_eq!(
+            error.entry_context(),
+            Some((b"file".as_slice(), "checking dictionary limit"))
+        );
+        assert_eq!(
+            error.kind(),
+            if raw & 0x3f == 2 {
+                ErrorKind::UnsupportedFeature
+            } else {
+                ErrorKind::InvalidArchive
+            }
+        );
+    }
+}
