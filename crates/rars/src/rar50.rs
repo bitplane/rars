@@ -2441,6 +2441,161 @@ mod tests {
     }
 
     #[test]
+    fn file_extra_records_preserve_readable_metadata_and_limit_rewrites() {
+        let archive = build_archive_with_optional_comment(None);
+        let original = archive.files().next().unwrap();
+        let control = crate::read_control::ReadControl::default();
+        let parse = |kind: u8, payload: &[u8], service: bool, name: &[u8], mtime| {
+            let mut record = vec![(payload.len() + 1) as u8, kind];
+            record.extend_from_slice(payload);
+            let mut file = original.clone();
+            file.name = name.to_vec();
+            file.mtime = mtime;
+            file.block.extra_area_size = Some(record.len() as u64);
+            parse_file_extra_area(&record, 0..record.len(), service, &mut file, &control).unwrap();
+            file
+        };
+        for (kind, size, complete) in [
+            (0, 32, true),
+            (1, 32, false),
+            (0, 31, false),
+            (0, 33, false),
+        ] {
+            let mut payload = vec![kind];
+            payload.extend(vec![7; size]);
+            let file = parse(FHEXTRA_HASH as u8, &payload, false, b"file", None);
+            assert_eq!(file.rewrite_metadata_complete, complete);
+            assert_eq!(file.hash.unwrap().data, vec![7; size]);
+        }
+        for (version, flags, complete) in [(0, 0, true), (0, 2, true), (0, 4, false), (1, 0, false)]
+        {
+            let mut payload = vec![version, flags, 0];
+            payload.extend_from_slice(&[3; 16]);
+            payload.extend_from_slice(&[4; 16]);
+            let file = parse(FHEXTRA_CRYPT as u8, &payload, false, b"file", None);
+            assert!(file.encrypted);
+            assert_eq!(file.encryption.unwrap().flags, u64::from(flags));
+            assert_eq!(file.rewrite_metadata_complete, complete);
+        }
+        for (service, kind, complete) in [(false, 1, true), (true, 1, false), (false, 6, false)] {
+            let file = parse(
+                FHEXTRA_REDIR as u8,
+                &[kind, 0, 1, b'x'],
+                service,
+                b"file",
+                None,
+            );
+            assert_eq!(file.redirection.unwrap().target_name, b"x");
+            assert_eq!(file.rewrite_metadata_complete, complete);
+        }
+        for (service, name, payload, complete) in [
+            (false, b"file".as_slice(), b"".as_slice(), false),
+            (true, b"CMT".as_slice(), b"".as_slice(), true),
+            (true, b"CMT".as_slice(), b"x".as_slice(), false),
+            (true, b"RR".as_slice(), b"x".as_slice(), true),
+        ] {
+            let file = parse(FHEXTRA_SUBDATA as u8, payload, service, name, None);
+            assert_eq!(file.service_data.unwrap(), payload);
+            assert_eq!(file.rewrite_metadata_complete, complete);
+        }
+        for (flags, mtime, complete) in [(3, None, true), (3, Some(9), false), (5, Some(9), true)] {
+            let mut payload = vec![flags];
+            payload.extend_from_slice(&123u32.to_le_bytes());
+            let file = parse(FHEXTRA_HTIME as u8, &payload, false, b"file", mtime);
+            assert!(file.file_times.is_some());
+            assert_eq!(file.htime_mtime, (flags == 3).then_some(123));
+            assert_eq!(file.rewrite_metadata_complete, complete);
+        }
+        for payload in [vec![], vec![0x80], vec![3, 1], vec![0x23, 1, 0, 0, 0]] {
+            let file = parse(FHEXTRA_HTIME as u8, &payload, false, b"file", None);
+            assert!(file.file_times.is_none());
+            assert!(!file.rewrite_metadata_complete);
+        }
+        let mut no_extras = original.clone();
+        no_extras.block.extra_area_size = None;
+        parse_file_extra_area(&[0x80], 0..1, false, &mut no_extras, &control).unwrap();
+        assert!(no_extras.rewrite_metadata_complete);
+    }
+
+    #[test]
+    fn htime_mtime_retains_valid_seconds_at_format_boundaries() {
+        for bytes in [vec![], vec![0x80], vec![1], vec![5, 1, 0, 0, 0], vec![3, 1]] {
+            assert_eq!(parse_htime_mtime(&bytes, 0..bytes.len()), None);
+        }
+        for flags in [0x13u8, 0x17, 0x1b, 0x1f] {
+            for nanos in [0u32, 999_999_999] {
+                let mut bytes = vec![flags];
+                for _ in 0..(flags & 0x0e).count_ones() {
+                    bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+                }
+                bytes.extend_from_slice(&nanos.to_le_bytes());
+                let (seconds, detail) = parse_htime_mtime(&bytes, 0..bytes.len()).unwrap();
+                assert_eq!(seconds, u32::MAX);
+                assert_eq!(detail.unwrap().nanoseconds, nanos);
+            }
+        }
+        let epoch = 116_444_736_000_000_000u64;
+        for ticks in [epoch - 1, epoch + (u64::from(u32::MAX) + 1) * 10_000_000] {
+            let mut bytes = vec![2];
+            bytes.extend_from_slice(&ticks.to_le_bytes());
+            assert_eq!(parse_htime_mtime(&bytes, 0..bytes.len()), None);
+            // The lossless metadata representation still preserves FILETIME
+            // when the convenient u32 Unix-seconds view cannot represent it.
+            let archive = build_archive_with_optional_comment(None);
+            let mut file = archive.files().next().unwrap().clone();
+            let mut record = vec![(bytes.len() + 1) as u8, FHEXTRA_HTIME as u8];
+            record.extend_from_slice(&bytes);
+            file.block.extra_area_size = Some(record.len() as u64);
+            parse_file_extra_area(
+                &record,
+                0..record.len(),
+                false,
+                &mut file,
+                &crate::read_control::ReadControl::default(),
+            )
+            .unwrap();
+            assert!(file.rewrite_metadata_complete);
+            assert_eq!(
+                file.file_times.unwrap().modified,
+                Some(crate::FileTimestamp::WindowsFiletime(ticks))
+            );
+        }
+    }
+
+    #[test]
+    fn compression_dictionary_fields_obey_version_and_wire_limits() {
+        for raw in [2, 63] {
+            assert!(matches!(
+                decode_compression_info(raw),
+                Err(Error::UnsupportedFeature { .. })
+            ));
+        }
+        for raw in [1 << 15, 0x100000, 31 << 10] {
+            assert!(matches!(
+                decode_compression_info(raw),
+                Err(Error::InvalidHeader(_))
+            ));
+        }
+        for power in 0..=31u64 {
+            for fraction in 0..=31u64 {
+                let raw = 1 | (power << 10) | (fraction << 15);
+                assert_eq!(
+                    decode_compression_info(raw).unwrap().dictionary_size,
+                    (fraction + 32) * (1u64 << (power + 12))
+                );
+            }
+            if power <= 15 {
+                assert_eq!(
+                    decode_compression_info(power << 10)
+                        .unwrap()
+                        .dictionary_size,
+                    131_072 * (1u64 << power)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn header_reader_u32_obeys_type_specific_boundary() {
         // Extra-area bytes remain physically available in the header image,
         // but must not satisfy a field in the type-specific part.
