@@ -2110,6 +2110,7 @@ mod tests {
                 data: vec![0u8; 16],
             }),
         );
+        bad_length.data_crc32 = Some(crc32(data));
         assert!(matches!(
             bad_length.verify_integrity_with_keys(data, None),
             Err(Error::InvalidHeader(_))
@@ -2118,6 +2119,11 @@ mod tests {
         bad_length.hash.as_mut().unwrap().hash_type = 99;
         bad_length.hash.as_mut().unwrap().data = vec![0u8; 32];
         bad_length.verify_integrity_with_keys(data, None).unwrap();
+        bad_length.data_crc32 = Some(0);
+        assert!(matches!(
+            bad_length.verify_integrity_with_keys(data, None),
+            Err(Error::Crc32Mismatch { .. })
+        ));
     }
 
     #[test]
@@ -3015,6 +3021,17 @@ mod tests {
                 result.unwrap();
             }
         }
+        // An empty logical member with a present stream must still validate
+        // that stream rather than taking the omitted-stream shortcut.
+        let mut file = plain_file(b"empty-with-stream.txt", b"", None);
+        file.compression_info = 5 << 7;
+        file.block.data_range = 0..1;
+        file.block.data_size = Some(1);
+        let archive = archive_with_blocks(vec![Block::File(file.clone())], vec![0]);
+        assert!(matches!(
+            file.decoded_data_unverified(&archive, None),
+            Err(Error::Codec(_))
+        ));
     }
 
     #[test]

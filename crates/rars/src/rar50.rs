@@ -2591,11 +2591,52 @@ mod tests {
     }
 
     #[test]
+    fn audit_redirection_identity_and_volume_metadata() {
+        for (kind, flags, name, supported) in [
+            (1, 0, b"target".as_slice(), true),
+            (1, 2, b"target", false),
+            (4, 1, b"target", false),
+            (4, 0, b"target", true),
+            (1, 0, b"", false),
+            (1, 0, b"a\0b", false),
+            (1, 0, b"\xff", false),
+        ] {
+            assert_eq!(
+                FileRedirection {
+                    redirection_type: kind,
+                    flags,
+                    target_name: name.to_vec()
+                }
+                .is_supported(),
+                supported
+            );
+        }
+        let mut archive = build_archive_with_optional_comment(None);
+        assert!(!archive.main.is_locked());
+        archive.main.archive_flags |= MHFL_LOCKED;
+        assert!(archive.main.is_locked());
+        archive.main.extras = vec![MainExtraRecord::Locator(LocatorRecord {
+            flags: 0,
+            quick_open_offset: None,
+            recovery_record_offset: None,
+        })];
+        assert!(archive.main.locator().is_some());
+        for block in &mut archive.blocks {
+            if let Block::End(end) = block {
+                assert!(!end.has_next_volume());
+                end.flags |= EFL_NEXT_VOLUME;
+                assert!(end.has_next_volume());
+            }
+        }
+    }
+
+    #[test]
     fn explicit_integrity_checks_cover_absent_invalid_and_encrypted_records() {
         let archive = build_archive_with_optional_comment(None);
         let mut file = archive.files().next().unwrap().clone();
         let data = b"payload bytes";
         file.verify_integrity(data).unwrap();
+        file.verify_crc32(data).unwrap();
         assert!(matches!(
             file.verify_crc32(b"damaged"),
             Err(Error::Crc32Mismatch { .. })
@@ -2687,6 +2728,24 @@ mod tests {
                 Err(Error::TooShort)
             ));
         }
+        let header = image(&[HEAD_FILE as u8, 0, 0, 0, 0, 0, 0, 10]);
+        assert!(matches!(
+            parse_file_header_bytes(&parse(&header).unwrap()),
+            Err(Error::TooShort)
+        ));
+        let header = image(&[HEAD_FILE as u8, HFL_DATA as u8, 1]);
+        assert!(matches!(parse(&header), Err(Error::TooShort)));
+        let mut empty = RAR50_SIGNATURE.to_vec();
+        empty.extend_from_slice(&image(&[HEAD_MAIN as u8, 0, 0]));
+        assert!(Archive::parse(&empty).unwrap().blocks.is_empty());
+        empty = RAR50_SIGNATURE.to_vec();
+        empty.extend_from_slice(&image(&[HEAD_MAIN as u8, 0, 0, 0]));
+        assert!(
+            !Archive::parse(&empty)
+                .unwrap()
+                .main
+                .rewrite_metadata_complete
+        );
         let maximum = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1];
         let mut body = vec![HEAD_FILE as u8, 0, 0, 0, 0, 0, 0];
         body.extend_from_slice(&maximum);
@@ -3302,7 +3361,15 @@ mod tests {
 
     #[test]
     fn archive_comment_returns_none_for_archive_without_a_cmt_service() {
-        let archive = build_archive_with_optional_comment(None);
+        let mut archive = build_archive_with_optional_comment(None);
+        assert!(archive.archive_comment().unwrap().is_none());
+        for block in &mut archive.blocks {
+            if let Block::File(file) = block {
+                let mut service = file.clone();
+                service.name = b"STM".to_vec();
+                *block = Block::Service(service);
+            }
+        }
         assert!(archive.archive_comment().unwrap().is_none());
     }
 

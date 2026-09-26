@@ -98,3 +98,54 @@ fn typed_path_parsers_validate_explicit_signatures_and_sfx_offsets() {
         assert!(matches!(result, Err(Error::UnsupportedSignature)));
     }
 }
+
+#[test]
+fn legacy_stored_member_reports_source_truncation_after_header_read() {
+    let root = scratch::case("legacy-source-truncation");
+    let path = root.join("truncated.rar");
+    let mut builder = rars::Builder::new(rars::ArchiveVersion::Rar30).compression_level(Some(0));
+    builder
+        .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+        .unwrap();
+    std::fs::write(&path, builder.to_bytes().unwrap()).unwrap();
+    let archive = rar15_40::Archive::parse_path(&path).unwrap();
+    let file = archive.files().next().unwrap();
+    assert!(file.is_stored());
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len((file.packed_range.start + 2) as u64)
+        .unwrap();
+    let mut output = Vec::new();
+    let error = file.write_to(&archive, None, &mut output).unwrap_err();
+    assert!(matches!(
+        error.root_cause(),
+        Error::InvalidHeader("RAR 1.5 stored file ended before unpacked size")
+    ));
+    assert_eq!(output, b"pa");
+}
+
+#[test]
+fn explicit_legacy_signatures_still_require_the_exact_marker_block() {
+    let root = scratch::case("legacy-marker-admission");
+    let path = root.join("marker.rar");
+    let legacy = include_bytes!("fixtures/rar15_40/rar300/stored_multivol_rar300.rar");
+    let signature = detect_archive_family(legacy).unwrap();
+    let mut wrong_size = legacy[..7].to_vec();
+    wrong_size[5] = 8;
+    wrong_size.push(0);
+    for bytes in [legacy[7..20].to_vec(), wrong_size] {
+        std::fs::write(&path, bytes).unwrap();
+        let error = rar15_40::Archive::parse_path_with_signature(
+            &path,
+            signature,
+            ArchiveReadOptions::new(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::InvalidHeader("RAR 1.5 marker block is invalid")
+        ));
+    }
+}

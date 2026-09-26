@@ -3037,6 +3037,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn audit_nested_comments_and_time_fields_preserve_legacy_admission() {
+        let mut time = file_header_with(0);
+        time.ext_time = 0x0800u16.to_le_bytes().to_vec();
+        assert_eq!(time.mtime_refinement(), None);
+        for (kind, size) in [(COMM_HEAD, 13u16), (COMM_HEAD, 12), (0x7f, 13)] {
+            let mut bytes = RAR15_SIGNATURE.to_vec();
+            test_write_main_header(&mut bytes, MHD_COMMENT);
+            let nested_start = bytes.len();
+            bytes.extend_from_slice(&comment_block(b""));
+            bytes[nested_start + 2] = kind;
+            bytes[nested_start + 5..nested_start + 7].copy_from_slice(&size.to_le_bytes());
+            let main_start = RAR15_SIGNATURE.len();
+            let main_len = (bytes.len() - main_start) as u16;
+            bytes[main_start + 5..main_start + 7].copy_from_slice(&main_len.to_le_bytes());
+            test_write_header_crc(&mut bytes[..main_start + 13], main_start);
+            let seekable = Archive::parse_seekable(
+                std::io::Cursor::new(&bytes),
+                bytes.len() as u64,
+                0,
+                ArchiveSource::Memory(std::sync::Arc::from(bytes.clone())),
+                crate::ArchiveReadOptions::new(),
+            )
+            .unwrap();
+            assert_eq!(
+                seekable.blocks.len(),
+                usize::from(kind == COMM_HEAD && size == 13)
+            );
+        }
+        assert!(matches!(
+            Archive::parse_with_options(
+                RAR15_SIGNATURE,
+                crate::ArchiveReadOptions::new().with_max_header_bytes(100),
+            ),
+            Err(Error::TooShort)
+        ));
+    }
+
+    #[test]
     fn seekable_comment_unknown_and_truncated_payload_match_memory_parser() {
         for (kind, size, add_size) in [
             (COMM_HEAD, 13u16, 0u32),
@@ -3481,6 +3519,7 @@ mod tests {
             kind: NewSubKind::ArchiveComment,
         };
         assert_eq!(sub.name_lossy(), "CMT");
+        assert_eq!(sub.name_bytes(), b"CMT");
     }
 
     #[test]

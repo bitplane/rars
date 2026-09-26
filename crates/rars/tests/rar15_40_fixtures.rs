@@ -1581,6 +1581,96 @@ fn extract_to_reports_rar15_entry_context_on_write_failure() {
 }
 
 #[test]
+fn extracts_file_data_when_a_nested_legacy_comment_header_is_malformed() {
+    let entry = StoredEntry {
+        name: b"file",
+        data: b"payload",
+        file_time: 0,
+        file_attr: 0x20,
+        host_os: 3,
+        password: None,
+        file_comment: Some(b"note"),
+    };
+    let original = write_stored_archive(&[entry], WriterOptions::default()).unwrap();
+    let archive = Archive::parse(&original).unwrap();
+    let file = archive.files().next().unwrap();
+    let nested = file.block.offset + 32 + file.name.len();
+    assert_eq!(original[nested + 2], 0x75);
+    for (kind, size) in [(0x7f, 17u16), (0x75, 12), (0x75, u16::MAX)] {
+        let mut bytes = original.clone();
+        bytes[nested + 2] = kind;
+        bytes[nested + 5..nested + 7].copy_from_slice(&size.to_le_bytes());
+        let archive = Archive::parse(&bytes).unwrap();
+        assert_eq!(
+            archive.files().next().unwrap().file_comment().unwrap(),
+            None
+        );
+        assert_eq!(collect_extract(&archive).unwrap()[0].data, b"payload");
+    }
+}
+
+#[test]
+fn extracts_compressed_legacy_comment_blocks_with_rar15_and_rar20_coding() {
+    let plain = b"compressed old comment compressed old comment\n";
+    for version in [ArchiveVersion::Rar15, ArchiveVersion::Rar20] {
+        let entry = FileEntry {
+            name: b"file",
+            data: plain,
+            file_time: 0,
+            file_attr: 0x20,
+            host_os: 3,
+            password: None,
+            file_comment: None,
+        };
+        let original = write_compressed_archive(
+            &[entry],
+            WriterOptions::new(version, FeatureSet::store_only()),
+        )
+        .unwrap();
+        let archive = Archive::parse(&original).unwrap();
+        let file = archive.files().next().unwrap();
+        let packed = file.packed_data(&archive).unwrap();
+        let mut comment = vec![0, 0, 0x75, 0, 0];
+        comment.extend_from_slice(&((13 + packed.len()) as u16).to_le_bytes());
+        comment.extend_from_slice(&(plain.len() as u16).to_le_bytes());
+        comment.push(file.unp_ver);
+        comment.push(file.method);
+        comment.extend_from_slice(&((crc32(plain) & 0xffff) as u16).to_le_bytes());
+        let crc = crc32(&comment[2..13]) as u16;
+        comment[..2].copy_from_slice(&crc.to_le_bytes());
+        comment.extend_from_slice(&packed);
+        let mut bytes = original[..20].to_vec();
+        bytes[10] |= 2; // MHD_COMMENT; main flags at signature+3.
+        bytes[12..14].copy_from_slice(&((13 + comment.len()) as u16).to_le_bytes());
+        let crc = crc32(&bytes[9..20]) as u16;
+        bytes[7..9].copy_from_slice(&crc.to_le_bytes());
+        bytes.extend_from_slice(&comment);
+        bytes.extend_from_slice(&original[20..]);
+        let parsed = Archive::parse(&bytes).unwrap();
+        assert_eq!(parsed.archive_comment().unwrap().unwrap(), plain);
+        assert_eq!(
+            parsed
+                .archive_comment_with_options(
+                    ArchiveReadOptions::new().with_max_member_output_bytes(plain.len() as u64),
+                )
+                .unwrap()
+                .unwrap(),
+            plain
+        );
+        assert_eq!(
+            parsed
+                .archive_comment_with_options(
+                    ArchiveReadOptions::new().with_max_member_output_bytes(plain.len() as u64 - 1),
+                )
+                .unwrap_err()
+                .kind(),
+            rars::ErrorKind::ResourceLimit
+        );
+        assert_eq!(collect_extract(&parsed).unwrap()[0].data, plain);
+    }
+}
+
+#[test]
 fn extracts_stored_members_through_public_member_writer_for_each_cipher() {
     for version in [
         ArchiveVersion::Rar15,
@@ -1614,6 +1704,16 @@ fn extracts_stored_members_through_public_member_writer_for_each_cipher() {
                 "{version:?}, encrypted {}",
                 password.is_some()
             );
+            if password.is_some() && version != ArchiveVersion::Rar15 {
+                let mut truncated = file.clone();
+                truncated.packed_range.end -= 1;
+                let mut output = Vec::new();
+                assert!(matches!(
+                    truncated.write_to(&archive, password, &mut output),
+                    Err(Error::WrongPasswordOrCorruptData)
+                ));
+                assert!(output.is_empty());
+            }
         }
     }
 }
