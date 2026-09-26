@@ -53,12 +53,10 @@ impl FileHeader {
         Ok(())
     }
 
-    fn crypto_with_password(&self, password: Option<&[u8]>) -> Result<Option<Rar50Keys>> {
-        if !self.encrypted {
-            return Ok(None);
-        }
+    fn encryption_keys(&self, password: Option<&[u8]>) -> Result<Rar50Keys> {
+        // Both callers have already selected an encrypted member.
         if let Some(crypto) = &self.crypto {
-            return Ok(Some(crypto.keys.clone()));
+            return Ok(crypto.keys.clone());
         }
         let password = password.ok_or(Error::NeedPassword)?;
         let encryption = self.encryption.as_ref().ok_or(Error::InvalidHeader(
@@ -76,7 +74,7 @@ impl FileHeader {
             keys.check_password(&check_value)
                 .map_err(super::map_rar50_crypto_error)?;
         }
-        Ok(Some(keys))
+        Ok(keys)
     }
 
     fn encryption_iv(&self) -> Result<[u8; 16]> {
@@ -119,11 +117,7 @@ impl FileHeader {
                 "RAR 5 encrypted file payload is not block aligned",
             ));
         }
-        let keys = self
-            .crypto_with_password(password)?
-            .ok_or(Error::InvalidHeader(
-                "RAR 5 encrypted file is missing encryption keys",
-            ))?;
+        let keys = self.encryption_keys(password)?;
         let reader = Rar50DecryptingReader::new(reader, keys.key, self.encryption_iv()?);
         Ok((Box::new(reader), Some(keys)))
     }
@@ -1313,11 +1307,7 @@ impl PendingSplitRefs {
             .files()
             .nth(file_index)
             .ok_or(Error::InvalidHeader("RAR 5 split entry is missing"))?;
-        let keys = file
-            .crypto_with_password(password)?
-            .ok_or(Error::InvalidHeader(
-                "RAR 5 encrypted split file is missing encryption keys",
-            ))?;
+        let keys = file.encryption_keys(password)?;
         Ok(Some(SplitDecryptor {
             keys,
             iv: file.encryption_iv()?,
@@ -2162,19 +2152,15 @@ mod tests {
     }
 
     #[test]
-    fn crypto_with_password_short_circuits_for_unencrypted_or_unsupported_versions() {
-        let plain = plain_file(b"a.txt", b"", None);
-        assert!(plain.crypto_with_password(None).unwrap().is_none());
-        assert!(plain.crypto_with_password(Some(b"pw")).unwrap().is_none());
-
+    fn encryption_keys_reject_missing_password_record_and_unsupported_versions() {
         let mut missing = plain_file(b"a.txt", b"", None);
         missing.encrypted = true;
         assert!(matches!(
-            missing.crypto_with_password(None),
+            missing.encryption_keys(None),
             Err(Error::NeedPassword)
         ));
         assert!(matches!(
-            missing.crypto_with_password(Some(b"pw")),
+            missing.encryption_keys(Some(b"pw")),
             Err(Error::InvalidHeader(_))
         ));
 
@@ -2189,13 +2175,13 @@ mod tests {
             check_value: None,
         });
         assert!(matches!(
-            bad_version.crypto_with_password(Some(b"pw")),
+            bad_version.encryption_keys(Some(b"pw")),
             Err(Error::UnsupportedFeature { .. })
         ));
     }
 
     #[test]
-    fn crypto_with_password_handles_missing_check_value() {
+    fn encryption_keys_handles_missing_check_value() {
         let mut file = plain_file(b"a.txt", b"", None);
         file.encrypted = true;
         file.encryption = Some(FileEncryption {
@@ -2206,7 +2192,7 @@ mod tests {
             iv: [0u8; 16],
             check_value: None,
         });
-        assert!(file.crypto_with_password(Some(b"pw")).unwrap().is_some());
+        file.encryption_keys(Some(b"pw")).unwrap();
     }
 
     #[test]
