@@ -1861,11 +1861,7 @@ fn decode_parallel_entry(
     options.check_cancelled()?;
     let password = options.password;
     let mut budget = crate::output_limit::OutputBudget::new(options);
-    if file.is_split_before() || file.is_split_after() {
-        return Err(Error::InvalidHeader(
-            "RAR 1.5 split entry requires multivolume extraction",
-        ));
-    }
+    // The only caller dispatches workers after excluding split members.
     let meta = file.metadata();
     if meta.is_directory {
         return Ok(ParallelExtractedEntry::Directory(meta));
