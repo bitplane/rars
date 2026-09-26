@@ -275,3 +275,30 @@ fn filtered_checksums_cannot_validate_raw_output_with_or_without_scratch() {
         assert_eq!(std::fs::read_dir(&*dir).unwrap().count(), 0);
     }
 }
+
+#[test]
+fn unfiltered_zero_matches_stream_with_and_without_scratch() {
+    let dir = scratch::case("reader-scratch-zero-matches");
+    let policy = Rar50Scratch::new(&*dir, 400_000);
+    let plain = vec![0; 131_089];
+    let archive = ArchiveReader::read_owned(
+        Rar50Writer::new(options(ArchiveVersion::Rar50))
+            .entries([entry(&plain, false)])
+            .filter_policy(FilterPolicy::None)
+            .finish()
+            .unwrap(),
+    )
+    .unwrap();
+    for scratch in [false, true] {
+        let mut options = ArchiveReadOptions::new().with_rar50_buffered_decode_limit(0);
+        if scratch {
+            options = options.with_rar50_scratch(&policy);
+        }
+        let output = Rc::new(RefCell::new(Vec::new()));
+        archive
+            .extract_to_with_options(options, |_| Ok(Box::new(Capture(output.clone()))))
+            .unwrap();
+        assert_eq!(*output.borrow(), plain);
+        assert_eq!(std::fs::read_dir(&*dir).unwrap().count(), 0);
+    }
+}

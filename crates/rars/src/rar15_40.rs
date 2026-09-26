@@ -3060,6 +3060,42 @@ mod tests {
     }
     use super::*;
 
+    #[test]
+    fn seekable_comment_unknown_and_truncated_payload_match_memory_parser() {
+        for (kind, size, add_size) in [
+            (COMM_HEAD, 13u16, 0u32),
+            (0x7f, 11, 0),
+            (0x7f, 11, 1),
+            (COMM_HEAD, 12, 0),
+        ] {
+            let mut bytes = RAR15_SIGNATURE.to_vec();
+            test_write_main_header(&mut bytes, 0);
+            let start = bytes.len();
+            bytes.extend_from_slice(&0u16.to_le_bytes());
+            bytes.push(kind);
+            bytes.extend_from_slice(&0x8000u16.to_le_bytes());
+            bytes.extend_from_slice(&size.to_le_bytes());
+            bytes.extend_from_slice(&add_size.to_le_bytes());
+            bytes.resize(start + usize::from(size), 0);
+            test_write_header_crc(&mut bytes, start);
+            let memory = Archive::parse(&bytes);
+            let seekable = Archive::parse_seekable(
+                std::io::Cursor::new(&bytes),
+                bytes.len() as u64,
+                0,
+                ArchiveSource::Memory(std::sync::Arc::from(bytes.clone())),
+                crate::ArchiveReadOptions::new(),
+            );
+            if add_size != 0 || size < 13 && kind == COMM_HEAD {
+                assert_eq!(memory.unwrap_err().kind(), seekable.unwrap_err().kind());
+            } else {
+                let memory = memory.unwrap();
+                let seekable = seekable.unwrap();
+                assert_eq!(memory.blocks, seekable.blocks);
+            }
+        }
+    }
+
     fn test_write_main_header(out: &mut Vec<u8>, flags: u16) {
         let start = out.len();
         out.extend_from_slice(&0u16.to_le_bytes());

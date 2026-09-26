@@ -180,6 +180,12 @@ fn modern_comments_apply_dictionary_and_buffering_policy() {
                     .kind(),
                 ErrorKind::ResourceLimit
             );
+            assert_eq!(
+                archive
+                    .comment_with_options(defaults.with_rar50_dictionary_size_limit(u64::MAX))
+                    .unwrap(),
+                Some(comment.clone())
+            );
             let options = defaults
                 .with_rar50_buffered_decode_limit(0)
                 .with_max_member_output_bytes(comment.len() as u64);
@@ -189,6 +195,41 @@ fn modern_comments_apply_dictionary_and_buffering_policy() {
             );
         }
     }
+}
+
+#[test]
+fn unknown_size_modern_comments_reject_limits_before_decoding() {
+    let mut archive = ArchiveReader::read_owned(bytes(
+        ArchiveVersion::Rar50,
+        Some(b"unknown-size comment"),
+        false,
+    ))
+    .unwrap();
+    let Archive::Rar50Plus(raw) = &mut archive else {
+        unreachable!()
+    };
+    for block in &mut raw.blocks {
+        if let rars::rar50::Block::Service(file) = block {
+            if file.name == b"CMT" {
+                file.file_flags |= 0x8;
+                assert_eq!(file.known_unpacked_size(), None);
+            }
+        }
+    }
+    assert_eq!(
+        archive.comment(None).unwrap().unwrap(),
+        b"unknown-size comment"
+    );
+    let error = archive
+        .comment_with_options(ArchiveReadOptions::new().with_max_member_output_bytes(100))
+        .unwrap_err();
+    assert!(matches!(
+        error.root_cause(),
+        rars::Error::UnsupportedFeature {
+            feature: "output-limited decoding of an unknown-size comment",
+            ..
+        }
+    ));
 }
 
 struct ObservedReader {

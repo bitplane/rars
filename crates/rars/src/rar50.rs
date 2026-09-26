@@ -3011,6 +3011,44 @@ mod tests {
         assert!(handled > 0 && handled < 10000);
     }
     #[test]
+    fn encrypted_header_extent_rejects_short_prefix_and_declared_ciphertext() {
+        use crate::parse_budget::ParseBudget;
+        let keys = crate::crypto::rar50::Rar50Keys::derive(b"secret", [0; 16], 0).unwrap();
+        let mut plain = vec![0; 16];
+        plain[4] = 60;
+        crate::crypto::rar50::Rar50Cipher::new(keys.key, [0; 16])
+            .encrypt_in_place(&mut plain)
+            .unwrap();
+        let mut bytes = vec![0; 16];
+        bytes.extend_from_slice(&plain);
+        for len in [31, 32] {
+            let input = &bytes[..len];
+            let memory = super::parse_encrypted_block_header_bytes(
+                input,
+                0,
+                len,
+                0,
+                &keys,
+                &mut ParseBudget::new(crate::ArchiveReadOptions::new()),
+            )
+            .map(|_| ())
+            .unwrap_err();
+            let seekable = super::read_encrypted_block_header_at(
+                &mut std::io::Cursor::new(input),
+                0,
+                len,
+                0,
+                &keys,
+                &mut ParseBudget::new(crate::ArchiveReadOptions::new()),
+            )
+            .map(|_| ())
+            .unwrap_err();
+            assert!(matches!(memory, crate::Error::TooShort));
+            assert!(matches!(seekable, crate::Error::TooShort));
+        }
+    }
+
+    #[test]
     fn header_budget_refuses_full_reads_after_plain_and_encrypted_prefixes() {
         use crate::parse_budget::{ParseBudget, PrefixReader};
         let mut plain = vec![0u8; 16];
