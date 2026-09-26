@@ -454,9 +454,9 @@ impl FileHeader {
         }
     }
 
+    /// Checks the authoritative payload checksum, as extraction does.
     pub fn verify_integrity(&self, data: &[u8]) -> Result<()> {
-        self.verify_crc32(data)?;
-        self.verify_hash(data)
+        self.verify_integrity_with_keys(data, None)
     }
 
     fn uses_hash_mac(&self) -> bool {
@@ -2593,6 +2593,76 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn explicit_integrity_checks_cover_absent_invalid_and_encrypted_records() {
+        let archive = build_archive_with_optional_comment(None);
+        let mut file = archive.files().next().unwrap().clone();
+        let data = b"payload bytes";
+        file.verify_integrity(data).unwrap();
+        assert!(matches!(
+            file.verify_crc32(b"damaged"),
+            Err(Error::Crc32Mismatch { .. })
+        ));
+        file.data_crc32 = None;
+        file.verify_crc32(b"anything").unwrap();
+        file.hash = None;
+        file.verify_hash(b"anything").unwrap();
+        file.hash = Some(FileHash {
+            hash_type: 0,
+            data: blake2sp::hash(data).to_vec(),
+        });
+        file.verify_hash(data).unwrap();
+        assert!(matches!(
+            file.verify_hash(b"damaged"),
+            Err(Error::HashMismatch { hash_type: 0 })
+        ));
+        file.hash.as_mut().unwrap().data.pop();
+        assert!(matches!(
+            file.verify_hash(data),
+            Err(Error::InvalidHeader(_))
+        ));
+        file.hash.as_mut().unwrap().hash_type = 1;
+        assert!(matches!(
+            file.verify_hash(data),
+            Err(Error::UnsupportedFeature { .. })
+        ));
+        file.encryption = Some(FileEncryption {
+            version: 0,
+            flags: 2,
+            kdf_count: 0,
+            salt: [0; 16],
+            iv: [0; 16],
+            check_value: None,
+        });
+        assert!(matches!(
+            file.verify_hash(data),
+            Err(Error::InvalidHeader(_))
+        ));
+        file.data_crc32 = Some(crc32(data));
+        assert!(matches!(
+            file.verify_crc32(data),
+            Err(Error::InvalidHeader(_))
+        ));
+    }
+
+    #[test]
+    fn combined_integrity_check_uses_authoritative_blake2sp_record() {
+        // The fixture is independently accepted by RAR and UnRAR despite its
+        // deliberately wrong CRC32 beside the valid BLAKE2sp record.
+        let archive = Archive::parse(include_bytes!(
+            "../tests/fixtures/rar50/crc32_wrong_beside_blake2sp.rar"
+        ))
+        .unwrap();
+        let file = archive.files().next().unwrap();
+        let data = file.packed_data(&archive).unwrap();
+        assert!(matches!(
+            file.verify_crc32(&data),
+            Err(Error::Crc32Mismatch { .. })
+        ));
+        file.verify_hash(&data).unwrap();
+        file.verify_integrity(&data).unwrap();
     }
 
     #[test]

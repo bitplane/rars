@@ -145,7 +145,11 @@ impl FileHeader {
             .is_some_and(|hash| hash.hash_type == 0 && hash.data.len() == 32)
     }
 
-    fn verify_integrity_with_keys(&self, data: &[u8], keys: Option<&Rar50Keys>) -> Result<()> {
+    pub(super) fn verify_integrity_with_keys(
+        &self,
+        data: &[u8],
+        keys: Option<&Rar50Keys>,
+    ) -> Result<()> {
         if let Some(expected) = self
             .data_crc32
             .filter(|_| !self.blake2sp_supersedes_crc32())
