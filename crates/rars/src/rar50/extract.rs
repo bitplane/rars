@@ -1758,6 +1758,54 @@ mod tests {
     }
 
     #[test]
+    fn split_checksum_diagnostics_continue_past_uncheckable_fragments() {
+        let data = b"fragment";
+        let scratch = crate::scratch::case("rar5-split-checksum-source");
+        let missing = scratch.join("removed.part");
+        std::fs::write(&missing, data).unwrap();
+        for first_kind in 0..3 {
+            let mut first = stored_split_archive(data, data, crc32(data), HFL_SPLIT_AFTER);
+            match first_kind {
+                0 => {
+                    let Block::File(file) = &mut first.blocks[0] else {
+                        unreachable!();
+                    };
+                    file.data_crc32 = None;
+                }
+                1 => {}
+                _ => first.source = ArchiveSource::File(Arc::new(missing.clone())),
+            }
+            let mut volumes = vec![
+                first,
+                stored_split_archive(
+                    data,
+                    data,
+                    crc32(data) ^ 1,
+                    HFL_SPLIT_BEFORE | HFL_SPLIT_AFTER,
+                ),
+                stored_split_archive(data, data, crc32(data) ^ 2, HFL_SPLIT_BEFORE),
+            ];
+            let mut pending = PendingSplitRefs::new(volumes[0].files().next().unwrap(), 0, 0);
+            pending.append(1, 0);
+            pending.append(2, 0);
+            if first_kind == 2 {
+                std::fs::remove_file(&missing).unwrap();
+            }
+            let error = pending.checksum_error(&volumes).unwrap();
+            assert!(matches!(error, Error::InVolume { number: 2, source }
+                if matches!(*source, Error::Crc32Mismatch { expected, actual }
+                    if expected == crc32(data) ^ 1 && actual == crc32(data))));
+            let Block::File(file) = &mut volumes[1].blocks[0] else {
+                unreachable!();
+            };
+            file.data_crc32 = Some(crc32(data));
+            // The final fragment carries the member checksum, not a checksum
+            // of its packed bytes, and must be excluded from this diagnostic.
+            assert!(pending.checksum_error(&volumes).is_none());
+        }
+    }
+
+    #[test]
     fn stored_split_entries_stream_fragments_to_writer() {
         struct SharedWriter(Rc<RefCell<Vec<u8>>>);
 
