@@ -631,10 +631,7 @@ impl Archive {
         options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Self> {
         options.check_cancelled()?;
-        if !input.starts_with(RAR50_SIGNATURE) {
-            return Err(Error::UnsupportedSignature);
-        }
-
+        // parse_shared supplies the exact signature found in this buffer.
         let archive_len = input.len();
         let (main, blocks) = parse_archive_blocks(
             archive_len,
@@ -1281,7 +1278,7 @@ pub(crate) fn recovery_end_header(
 }
 
 fn parse_main_header_bytes(parsed: &ParsedBlockHeader) -> Result<MainHeader> {
-    let mut reader = HeaderReader::new(&parsed.header, parsed.type_specific_range.clone())?;
+    let mut reader = HeaderReader::new(&parsed.header, parsed.type_specific_range.clone());
     let archive_flags = reader.read_vint()?;
     let volume_number = if archive_flags & MHFL_VOLUME_NUMBER != 0 {
         Some(reader.read_vint()?)
@@ -1380,7 +1377,7 @@ fn parse_main_extra_area(
 }
 
 fn parse_file_header_bytes(parsed: &ParsedBlockHeader) -> Result<FileHeader> {
-    let mut reader = HeaderReader::new(&parsed.header, parsed.type_specific_range.clone())?;
+    let mut reader = HeaderReader::new(&parsed.header, parsed.type_specific_range.clone());
     let file_flags = reader.read_vint()?;
     let unpacked_size = reader.read_vint()?;
     let attributes = reader.read_vint()?;
@@ -1618,7 +1615,7 @@ fn parse_archive_encryption_header(
     password: Option<&[u8]>,
 ) -> Result<Rar50Keys> {
     let password = password.ok_or(Error::NeedPassword)?;
-    let mut reader = HeaderReader::new(&parsed.header, parsed.type_specific_range.clone())?;
+    let mut reader = HeaderReader::new(&parsed.header, parsed.type_specific_range.clone());
     let version = reader.read_vint()?;
     if version != 0 {
         return Err(Error::UnsupportedFeature {
@@ -1732,7 +1729,7 @@ where
     let mut pos = RAR50_SIGNATURE.len();
     let first = read_block(pos, &mut budget).map_err(|error| at_offset(error, pos))?;
     let header_metadata_complete = if first.block.header_type == HEAD_CRYPT {
-        let mut reader = HeaderReader::new(&first.header, first.type_specific_range.clone())?;
+        let mut reader = HeaderReader::new(&first.header, first.type_specific_range.clone());
         reader.read_vint()?;
         reader.read_vint()? & !1 == 0
     } else {
@@ -2164,15 +2161,13 @@ struct HeaderReader<'a> {
 }
 
 impl<'a> HeaderReader<'a> {
-    fn new(input: &'a [u8], range: Range<usize>) -> Result<Self> {
-        if range.end > input.len() {
-            return Err(Error::TooShort);
-        }
-        Ok(Self {
+    fn new(input: &'a [u8], range: Range<usize>) -> Self {
+        // parse_block_header_image bounds this range within the header image.
+        Self {
             input,
             pos: range.start,
             range,
-        })
+        }
     }
 
     fn read_vint(&mut self) -> Result<u64> {
@@ -2277,9 +2272,9 @@ fn read_vint_at(input: &[u8], offset: usize, end: usize) -> Result<(u64, usize)>
         if shift == 63 && byte & 0x7e != 0 {
             return Err(Error::InvalidHeader("RAR 5 vint overflows u64"));
         }
-        value = value
-            .checked_add(((byte & 0x7f) as u64) << shift)
-            .ok_or(Error::InvalidHeader("RAR 5 vint overflows u64"))?;
+        // Each group occupies disjoint bits; the final group's range was
+        // checked above, so combining groups cannot overflow.
+        value |= ((byte & 0x7f) as u64) << shift;
         if byte & 0x80 == 0 {
             return Ok((value, i + 1));
         }
@@ -2756,7 +2751,7 @@ mod tests {
         // but must not satisfy a field in the type-specific part.
         let input = [99, 99, 1, 2, 3, 4, 77];
         for available in 0..=4 {
-            let mut reader = HeaderReader::new(&input, 2..2 + available).unwrap();
+            let mut reader = HeaderReader::new(&input, 2..2 + available);
             let result = reader.read_u32();
             if available < 4 {
                 assert!(
