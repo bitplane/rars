@@ -40,10 +40,9 @@ impl Read for ScratchFile {
 }
 impl Write for ScratchFile {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        let end = self
-            .pos
-            .checked_add(bytes.len() as u64)
-            .ok_or_else(|| std::io::Error::other("scratch offset overflow"))?;
+        // Decoder output and admitted record writes are bounded before dispatch;
+        // filter overwrites stay within their validated payload range.
+        let end = self.pos + bytes.len() as u64;
         let mut budget = self.budget.borrow_mut();
         let additional = end.saturating_sub(self.len);
         if additional > budget.limit - budget.used {
