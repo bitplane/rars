@@ -3081,6 +3081,22 @@ mod tests {
     }
 
     #[test]
+    fn redirection_target_length_cannot_overflow_its_record() {
+        let input = [
+            1, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1,
+        ];
+        let expected = if usize::BITS == 64 {
+            "RAR 5 file redirection target length overflows"
+        } else {
+            "RAR 5 file redirection target length overflows host address size"
+        };
+        assert!(
+            matches!(parse_file_redirection_record(&input, 0..input.len()),
+            Err(Error::InvalidHeader(message)) if message == expected)
+        );
+    }
+
+    #[test]
     fn rejects_file_redirection_record_with_trailing_bytes() {
         let input = [1, 0, 3, b'f', b'o', b'o', 0];
 

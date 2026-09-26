@@ -1853,6 +1853,37 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_stored_split_rejects_unpacked_size_rounding_overflow() {
+        let mut first = file(b"overflow", FHD_PASSWORD | FHD_SPLIT_AFTER);
+        first.unp_ver = 20;
+        first.unp_size = u64::MAX;
+        first.pack_size = 16;
+        first.packed_range = 0..16;
+        let mut last = first.clone();
+        last.block.flags = FHD_PASSWORD | FHD_SPLIT_BEFORE;
+        let volumes = [
+            archive_with_source(vec![Block::File(first)], vec![0; 16]),
+            archive_with_source(vec![Block::File(last)], vec![0; 16]),
+        ];
+        let capture = Capture::default();
+        let error = extract_volumes_to(
+            &volumes,
+            crate::ArchiveReadOptions::with_password(b"pw"),
+            capture.opener(),
+        )
+        .unwrap_err();
+        let expected = if usize::BITS == 64 {
+            "RAR 2.x encrypted split stored size overflows"
+        } else {
+            "RAR 1.5 split unpacked size overflows usize"
+        };
+        assert!(
+            matches!(error.root_cause(), Error::InvalidHeader(message) if *message == expected)
+        );
+        assert!(capture.bytes.borrow().is_empty());
+    }
+
+    #[test]
     fn extract_volumes_to_rejects_encrypted_stored_split_when_padded_size_disagrees() {
         let unpacked_len = 20usize;
         // Two volumes total only 30 bytes, but expected_packed_len == 32.
