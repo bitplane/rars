@@ -1299,14 +1299,13 @@ impl PendingSplitRefs {
         if !self.encrypted {
             return Ok(None);
         }
+        // Fragment indices come from this immutable volume slice.
         let (volume_index, file_index) = self.fragments[0];
-        let archive = volumes
-            .get(volume_index)
-            .ok_or(Error::InvalidHeader("RAR 5 split volume is missing"))?;
+        let archive = &volumes[volume_index];
         let file = archive
             .files()
             .nth(file_index)
-            .ok_or(Error::InvalidHeader("RAR 5 split entry is missing"))?;
+            .expect("split fragment index comes from archive enumeration");
         let keys = file.encryption_keys(password)?;
         Ok(Some(SplitDecryptor {
             keys,
@@ -1364,13 +1363,11 @@ impl PendingSplitRefs {
     ) -> Result<Box<dyn Read + 'a>> {
         let mut readers = Vec::with_capacity(self.fragments.len());
         for &(volume_index, file_index) in &self.fragments {
-            let archive = volumes
-                .get(volume_index)
-                .ok_or(Error::InvalidHeader("RAR 5 split volume is missing"))?;
+            let archive = &volumes[volume_index];
             let file = archive
                 .files()
                 .nth(file_index)
-                .ok_or(Error::InvalidHeader("RAR 5 split entry is missing"))?;
+                .expect("split fragment index comes from archive enumeration");
             readers.push(archive.range_reader(file.block.data_range.clone())?);
         }
         let chained = ChainedReader::new(readers);

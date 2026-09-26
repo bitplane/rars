@@ -473,16 +473,16 @@ impl PendingSplitRefs {
     }
 
     fn packed_size(&self, volumes: &[Archive]) -> Result<usize> {
+        // Fragments index the same immutable volume slice enumerated by
+        // extract_volumes_to; their member indices cannot disappear.
         self.fragments
             .iter()
             .try_fold(0usize, |total, &(volume_index, file_index)| {
-                let archive = volumes
-                    .get(volume_index)
-                    .ok_or(Error::InvalidHeader("RAR 1.5 split volume is missing"))?;
+                let archive = &volumes[volume_index];
                 let file = archive
                     .files()
                     .nth(file_index)
-                    .ok_or(Error::InvalidHeader("RAR 1.5 split entry is missing"))?;
+                    .expect("split fragment index comes from archive enumeration");
                 total
                     .checked_add(usize::try_from(file.pack_size).map_err(|_| {
                         Error::InvalidHeader("RAR 1.5 split packed size overflows usize")
@@ -500,13 +500,11 @@ impl PendingSplitRefs {
     ) -> Result<Box<dyn Read + 'a>> {
         let mut readers = Vec::with_capacity(self.fragments.len());
         for &(volume_index, file_index) in &self.fragments {
-            let archive = volumes
-                .get(volume_index)
-                .ok_or(Error::InvalidHeader("RAR 1.5 split volume is missing"))?;
+            let archive = &volumes[volume_index];
             let file = archive
                 .files()
                 .nth(file_index)
-                .ok_or(Error::InvalidHeader("RAR 1.5 split entry is missing"))?;
+                .expect("split fragment index comes from archive enumeration");
             readers.push(archive.range_reader(file.packed_range.clone())?);
         }
         let reader = ChainedReader::new(readers);
@@ -1314,44 +1312,6 @@ mod tests {
         let mapped =
             file(b"encrypted.bin", FHD_PASSWORD).map_encrypted_payload_error(Some(b"pw"), error);
         assert_eq!(mapped, Error::WrongPasswordOrCorruptData);
-    }
-
-    #[test]
-    fn pending_split_refs_packed_size_rejects_missing_volume_or_file() {
-        let f = file(b"a.txt", FHD_SPLIT_AFTER);
-        let pending = PendingSplitRefs::new(&f, 9, 0);
-        let no_volumes: Vec<Archive> = Vec::new();
-        assert!(matches!(
-            pending.packed_size(&no_volumes),
-            Err(Error::InvalidHeader(_))
-        ));
-
-        let mut pending = PendingSplitRefs::new(&f, 0, 7);
-        pending.fragments[0] = (0, 7);
-        let one_volume = vec![archive_with(vec![Block::File(f)])];
-        assert!(matches!(
-            pending.packed_size(&one_volume),
-            Err(Error::InvalidHeader(_))
-        ));
-    }
-
-    #[test]
-    fn pending_split_refs_fragment_reader_rejects_missing_volume_or_file() {
-        let f = file(b"a.txt", FHD_SPLIT_AFTER);
-        let pending = PendingSplitRefs::new(&f, 9, 0);
-        let no_volumes: Vec<Archive> = Vec::new();
-        assert!(matches!(
-            pending.fragment_reader(&no_volumes, None),
-            Err(Error::InvalidHeader(_))
-        ));
-
-        let mut pending = PendingSplitRefs::new(&f, 0, 7);
-        pending.fragments[0] = (0, 7);
-        let one_volume = vec![archive_with(vec![Block::File(f)])];
-        assert!(matches!(
-            pending.fragment_reader(&one_volume, None),
-            Err(Error::InvalidHeader(_))
-        ));
     }
 
     #[test]
