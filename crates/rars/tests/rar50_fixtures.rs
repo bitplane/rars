@@ -2566,7 +2566,7 @@ fn writes_encrypted_stored_rar50_archive_that_reader_extracts_with_password() {
     assert!(matches!(
         file.verify_integrity(&extracted[0].data),
         Err(Error::InvalidHeader(
-            "RAR 5 encrypted CRC32 verification needs encryption keys"
+            "RAR 5 encrypted hash MAC needs encryption keys"
         ))
     ));
     assert!(matches!(
