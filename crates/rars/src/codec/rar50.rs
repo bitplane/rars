@@ -3291,7 +3291,7 @@ impl Unpack50Decoder {
 
         if output.len() == output_size {
             let history_output = if mode.applies_filters() && !filters.is_empty() {
-                Some(output.clone())
+                Some(output[output.len().saturating_sub(dictionary_size)..].to_vec())
             } else {
                 None
             };
@@ -3299,12 +3299,10 @@ impl Unpack50Decoder {
                 self.read_control.check_codec()?;
                 apply_filters_with_control(&mut output, &filters, &self.read_control)?;
             }
-            self.history
-                .extend_from_slice(history_output.as_deref().unwrap_or(&output));
-            if self.history.len() > dictionary_size {
-                let discard = self.history.len() - dictionary_size;
-                self.history.drain(..discard);
-            }
+            self.remember_history(
+                history_output.as_deref().unwrap_or(&output),
+                dictionary_size,
+            );
             Ok(output)
         } else {
             Err(Error::NeedMoreInput)
@@ -3477,6 +3475,25 @@ impl Unpack50Decoder {
         }
     }
 
+    fn remember_history(&mut self, output: &[u8], dictionary_size: usize) {
+        let incoming = &output[output.len().saturating_sub(dictionary_size)..];
+        let keep = self.history.len().min(dictionary_size - incoming.len());
+        let required = keep + incoming.len();
+        if self.history.capacity() > dictionary_size || self.history.capacity() < required {
+            // Allocate only the retained tail, never the whole member. Replace
+            // oversized storage when the active dictionary shrinks as well.
+            let capacity =
+                reader_history_capacity(self.history.capacity(), required, dictionary_size);
+            let mut history = Vec::with_capacity(capacity);
+            history.extend_from_slice(&self.history[self.history.len() - keep..]);
+            history.extend_from_slice(incoming);
+            self.history = history;
+        } else {
+            self.history.drain(..self.history.len() - keep);
+            self.history.extend_from_slice(incoming);
+        }
+    }
+
     fn reset(&mut self) {
         self.tables = None;
         self.reps = [0; 4];
@@ -3540,6 +3557,16 @@ impl Unpack50Decoder {
     }
 }
 
+// Preserve amortized growth without letting a retained dictionary allocation
+// grow to the member size or keep a previous, larger dictionary alive.
+fn reader_history_capacity(current: usize, required: usize, limit: usize) -> usize {
+    if current > limit {
+        required
+    } else {
+        required.max(current.saturating_mul(2)).max(8).min(limit)
+    }
+}
+
 struct StreamingOutput {
     history: VecDeque<u8>,
     pending: Vec<u8>,
@@ -3552,11 +3579,14 @@ struct StreamingOutput {
 
 impl StreamingOutput {
     fn new(
-        history: Vec<u8>,
+        mut history: Vec<u8>,
         output_limit: usize,
         dictionary_size: usize,
         history_limit: usize,
     ) -> Self {
+        if history.capacity() > history_limit {
+            history.shrink_to(history.len());
+        }
         Self {
             all_zero: history.iter().all(|&byte| byte == 0),
             history: history.into(),
@@ -3643,6 +3673,7 @@ impl StreamingOutput {
         // decode_member_to rejects zero dictionary sizes before constructing
         // this output, so a zero fill always has room for one history byte.
         if self.history.is_empty() {
+            self.history.reserve_exact(1);
             self.history.push_back(0);
         }
         Ok(())
@@ -3702,11 +3733,21 @@ impl StreamingOutput {
             return Ok(());
         }
         sink(DecodedChunk::Bytes(&self.pending)).map_err(StreamDecodeError::Sink)?;
-        self.history.extend(self.pending.iter().copied());
-        self.pending.clear();
-        while self.history.len() > self.history_limit {
-            self.history.pop_front();
+        let incoming = &self.pending[self.pending.len().saturating_sub(self.history_limit)..];
+        let keep = self.history.len().min(self.history_limit - incoming.len());
+        let required = keep + incoming.len();
+        if self.history.capacity() > self.history_limit || self.history.capacity() < required {
+            let capacity =
+                reader_history_capacity(self.history.capacity(), required, self.history_limit);
+            let mut history = VecDeque::with_capacity(capacity);
+            history.extend(self.history.iter().skip(self.history.len() - keep).copied());
+            history.extend(incoming.iter().copied());
+            self.history = history;
+        } else {
+            self.history.drain(..self.history.len() - keep);
+            self.history.extend(incoming.iter().copied());
         }
+        self.pending.clear();
         Ok(())
     }
 
@@ -8935,6 +8976,98 @@ mod tests {
     }
 
     #[test]
+    fn buffered_reader_history_capacity_follows_the_active_dictionary() {
+        let data = b"ABBA".repeat(4096);
+        let packed = encode_literal_only(&data, 0).unwrap();
+        let mut decoder = Unpack50Decoder::new();
+        assert_eq!(
+            decoder
+                .decode_member_with_dictionary(
+                    &packed,
+                    0,
+                    data.len(),
+                    1024,
+                    false,
+                    DecodeMode::LiteralOnly
+                )
+                .unwrap(),
+            data
+        );
+        assert_eq!(decoder.history, data[data.len() - 1024..]);
+        assert!(
+            decoder.history.capacity() <= 1024,
+            "retained {} bytes for a 1024-byte dictionary",
+            decoder.history.capacity()
+        );
+        let next = b"next solid member";
+        let packed = encode_literal_only(next, 0).unwrap();
+        decoder
+            .decode_member_with_dictionary(
+                &packed,
+                0,
+                next.len(),
+                1024,
+                true,
+                DecodeMode::LiteralOnly,
+            )
+            .unwrap();
+        let expected = [&data[data.len() - (1024 - next.len())..], next.as_slice()].concat();
+        assert_eq!(decoder.history, expected);
+        assert!(decoder.history.capacity() <= 1024);
+        decoder
+            .decode_member_with_dictionary(&packed, 0, next.len(), 8, true, DecodeMode::LiteralOnly)
+            .unwrap();
+        assert_eq!(decoder.history, next[next.len() - 8..]);
+        assert!(decoder.history.capacity() <= 8);
+    }
+
+    #[test]
+    fn filtered_reader_history_retains_only_the_raw_dictionary_tail() {
+        let data = b"\xe8\0\0\0\0abcdefgh".repeat(256);
+        let packed = encode_lz_member_with_filter(&data, crate::FilterKind::E8).unwrap();
+        let raw = Unpack50Decoder::new()
+            .decode_member_with_dictionary(
+                &packed,
+                0,
+                data.len(),
+                64,
+                false,
+                DecodeMode::LzNoFilters,
+            )
+            .unwrap();
+        let mut decoder = Unpack50Decoder::new();
+        let decoded = decoder
+            .decode_member_with_dictionary(&packed, 0, data.len(), 64, false, DecodeMode::Lz)
+            .unwrap();
+        assert_ne!(decoded, raw, "fixture must actually transform bytes");
+        assert_eq!(decoder.history, raw[raw.len() - 64..]);
+        assert!(decoder.history.capacity() <= 64);
+    }
+
+    #[test]
+    fn failed_buffered_filter_preserves_previous_solid_history() {
+        let data = b"\xe8\0\0\0\0abcdefghijklmnop".to_vec();
+        let packed = encode_lz_member_with_filter(&data, crate::FilterKind::E8).unwrap();
+        let mut decoder = Unpack50Decoder::new();
+        decoder.history = b"old raw history".to_vec();
+        let history = decoder.history.clone();
+        // The record spans the full member, but the advertised output stops
+        // one byte earlier: the failure happens during filter application.
+        assert_eq!(
+            decoder.decode_member_with_dictionary(
+                &packed,
+                0,
+                data.len() - 1,
+                64,
+                true,
+                DecodeMode::Lz
+            ),
+            Err(Error::InvalidData("RAR 5 filter range exceeds output"))
+        );
+        assert_eq!(decoder.history, history);
+    }
+
+    #[test]
     fn solid_history_is_capped_to_dictionary_size() {
         let mut decoder = Unpack50Decoder::new();
         let first_payload = literal_only_payload(b"ABBA");
@@ -8959,6 +9092,49 @@ mod tests {
             b"BAAB"
         );
         assert_eq!(decoder.history, b"BABAAB");
+    }
+
+    #[test]
+    fn streaming_reader_history_capacity_follows_the_active_dictionary() {
+        let data = b"ABBA".repeat(65536);
+        let packed = encode_literal_only(&data, 0).unwrap();
+        let mut decoder = Unpack50Decoder::new();
+        let mut decoded = Vec::new();
+        decoder
+            .decode_member_from_reader_with_dictionary_to_sink(
+                &mut packed.as_slice(),
+                0,
+                data.len(),
+                1024,
+                false,
+                |chunk| {
+                    match chunk {
+                        DecodedChunk::Bytes(bytes) => decoded.extend_from_slice(bytes),
+                        DecodedChunk::Repeated { byte, len } => {
+                            decoded.extend(std::iter::repeat_n(byte, len))
+                        }
+                    }
+                    Ok::<(), std::convert::Infallible>(())
+                },
+            )
+            .unwrap();
+        assert_eq!(decoded, data);
+        assert_eq!(decoder.history, data[data.len() - 1024..]);
+        assert!(decoder.history.capacity() <= 1024);
+        let next = b"next solid member";
+        let packed = encode_literal_only(next, 0).unwrap();
+        decoder
+            .decode_member_from_reader_with_dictionary_to_sink(
+                &mut packed.as_slice(),
+                0,
+                next.len(),
+                8,
+                true,
+                |_| Ok::<(), std::convert::Infallible>(()),
+            )
+            .unwrap();
+        assert_eq!(decoder.history, next[next.len() - 8..]);
+        assert!(decoder.history.capacity() <= 8);
     }
 
     #[test]
@@ -9723,6 +9899,24 @@ mod tests {
     }
 
     #[test]
+    fn virtual_zero_history_does_not_overallocate_a_tiny_dictionary() {
+        let mut output = StreamingOutput::new(Vec::new(), 100_000, 1, 1);
+        let mut emitted = 0;
+        output
+            .copy_match(0, 100_000, &mut |chunk| {
+                let DecodedChunk::Repeated { byte: 0, len } = chunk else {
+                    panic!("expected virtual zeros")
+                };
+                emitted += len;
+                Ok::<(), std::convert::Infallible>(())
+            })
+            .unwrap();
+        assert_eq!(emitted, 100_000);
+        assert_eq!(output.history, [0]);
+        assert_eq!(output.history.capacity(), 1);
+    }
+
+    #[test]
     fn streaming_zero_history_emits_large_match_without_materializing_it() {
         let mut output = StreamingOutput::new(vec![0, 0], 100_000, 2, 2);
         let mut chunks = Vec::new();
@@ -9765,6 +9959,7 @@ mod tests {
                 .take(count)
                 .collect::<Vec<_>>()
         );
+        assert!(output.history.capacity() <= 3);
         assert_eq!(output.into_history(), b"abc");
     }
 
