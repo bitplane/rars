@@ -2666,6 +2666,91 @@ mod tests {
     }
 
     #[test]
+    fn header_fields_reject_truncation_overflow_and_unexpected_encryption() {
+        let image = |body: &[u8]| {
+            assert!(body.len() < 128);
+            let mut bytes = vec![body.len() as u8];
+            bytes.extend_from_slice(body);
+            let mut header = crc32(&bytes).to_le_bytes().to_vec();
+            header.extend_from_slice(&bytes);
+            header
+        };
+        let parse = |bytes: &[u8]| {
+            parse_block_header_bytes(
+                bytes,
+                0,
+                bytes.len(),
+                0,
+                &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new()),
+            )
+        };
+        for flags in [FHFL_MTIME, FHFL_CRC32] {
+            let header = image(&[HEAD_FILE as u8, 0, flags as u8, 0, 0]);
+            let parsed = parse(&header).unwrap();
+            assert!(matches!(
+                parse_file_header_bytes(&parsed),
+                Err(Error::TooShort)
+            ));
+        }
+        let maximum = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1];
+        let mut body = vec![HEAD_FILE as u8, 0, 0, 0, 0, 0, 0];
+        body.extend_from_slice(&maximum);
+        let header = image(&body);
+        assert!(matches!(
+            parse_file_header_bytes(&parse(&header).unwrap()),
+            Err(Error::InvalidHeader(_))
+        ));
+        let header = image(&[HEAD_FILE as u8, HFL_EXTRA as u8, 20, 0]);
+        assert!(matches!(parse(&header), Err(Error::TooShort)));
+        let mut body = vec![HEAD_FILE as u8, HFL_DATA as u8];
+        body.extend_from_slice(&maximum);
+        assert!(matches!(parse(&image(&body)), Err(Error::InvalidHeader(_))));
+
+        // A crypt header with a valid CRC can still truncate the KDF count,
+        // salt or password-check field. Test every field boundary explicitly.
+        for flags in [0, 1] {
+            let mut body = vec![HEAD_CRYPT as u8, 0, 0, flags, 0];
+            body.extend_from_slice(&[0; 16]);
+            if flags == 1 {
+                body.extend_from_slice(&[0; 12]);
+            }
+            for end in 4..body.len() {
+                let header = image(&body[..end]);
+                let parsed = parse(&header).unwrap();
+                assert!(
+                    matches!(
+                        parse_archive_encryption_header(&parsed, Some(b"pw")),
+                        Err(Error::TooShort)
+                    ),
+                    "flags {flags}, end {end}"
+                );
+            }
+            if flags == 0 {
+                let header = image(&body);
+                parse_archive_encryption_header(&parse(&header).unwrap(), Some(b"pw")).unwrap();
+                body.push(0);
+                let header = image(&body);
+                assert!(matches!(
+                    parse_archive_encryption_header(&parse(&header).unwrap(), Some(b"pw")),
+                    Err(Error::InvalidHeader(
+                        "RAR 5 archive encryption header has trailing bytes"
+                    ))
+                ));
+            }
+        }
+        let mut bytes = RAR50_SIGNATURE.to_vec();
+        bytes.extend_from_slice(&image(&[HEAD_MAIN as u8, 0, 0]));
+        bytes.extend_from_slice(&image(&[HEAD_CRYPT as u8, 0]));
+        assert!(matches!(
+            Archive::parse(&bytes).unwrap_err().root_cause(),
+            Error::UnsupportedFeature {
+                feature: "RAR 5 encrypted headers",
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn header_reader_u32_obeys_type_specific_boundary() {
         // Extra-area bytes remain physically available in the header image,
         // but must not satisfy a field in the type-specific part.
@@ -2893,7 +2978,7 @@ mod tests {
     fn malformed_extra_tail_keeps_preceding_record_and_marks_area_incomplete() {
         let valid = [1, 2]; // Record type 2 with no data.
         let overflowing_size = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01];
-        let tails: [&[u8]; 3] = [&[0x80], &overflowing_size, &[1, 0x80]];
+        let tails: [&[u8]; 5] = [&[0x80], &overflowing_size, &[1, 0x80], &[0], &[9, 2]];
         let control = crate::read_control::ReadControl::default();
 
         for tail in tails {
