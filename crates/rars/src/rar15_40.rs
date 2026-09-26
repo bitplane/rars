@@ -3500,6 +3500,105 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_header_readers_reject_short_prefixes_and_declared_headers() {
+        let mut cache = EncryptedHeaderCipherCache::default();
+        for size in [0u16, 6, 17, 65] {
+            let mut plain = [0; 16];
+            plain[5..7].copy_from_slice(&size.to_le_bytes());
+            cache
+                .cipher(b"pw", [0; 8])
+                .unwrap()
+                .encrypt_in_place(&mut plain)
+                .unwrap();
+            let mut bytes = vec![0; 8];
+            bytes.extend_from_slice(&plain);
+            let options = crate::ArchiveReadOptions::new();
+            let memory = decrypt_encrypted_header_at(
+                &bytes,
+                0,
+                b"pw",
+                &mut cache,
+                &mut crate::parse_budget::ParseBudget::new(options),
+            )
+            .err()
+            .unwrap();
+            let seekable = read_encrypted_header_at(
+                &mut std::io::Cursor::new(&bytes),
+                bytes.len() as u64,
+                0,
+                0,
+                b"pw",
+                &mut cache,
+                &mut crate::parse_budget::ParseBudget::new(options),
+            )
+            .err()
+            .unwrap();
+            if size < 7 {
+                assert!(matches!(
+                    memory,
+                    Error::InvalidHeader("RAR 1.5 block header is too short")
+                ));
+                assert!(matches!(
+                    seekable,
+                    Error::InvalidHeader("RAR 1.5 block header is too short")
+                ));
+            } else {
+                assert!(matches!(memory, Error::TooShort));
+                assert!(matches!(seekable, Error::TooShort));
+            }
+        }
+        for available in [0, 7, 8, 23] {
+            let bytes = vec![0; available];
+            assert!(matches!(
+                read_encrypted_header_at(
+                    &mut std::io::Cursor::new(&bytes),
+                    available as u64,
+                    0,
+                    0,
+                    b"pw",
+                    &mut cache,
+                    &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new())
+                ),
+                Err(Error::TooShort)
+            ));
+        }
+    }
+
+    #[test]
+    fn file_comment_crc_boundary_includes_large_sizes_name_and_salt() {
+        let mut short = vec![0; 11];
+        short[2] = FILE_HEAD;
+        short[3..5].copy_from_slice(&(LONG_BLOCK | FHD_COMMENT).to_le_bytes());
+        short[5..7].copy_from_slice(&11u16.to_le_bytes());
+        assert!(matches!(
+            parse_block_header(&short, 0),
+            Err(Error::TooShort)
+        ));
+        for flags in [0, FHD_LARGE, FHD_SALT, FHD_LARGE | FHD_SALT] {
+            let name_start = 32 + if flags & FHD_LARGE != 0 { 8 } else { 0 };
+            let crc_end = name_start + 4 + if flags & FHD_SALT != 0 { 8 } else { 0 };
+            let mut header = vec![0; crc_end + 13];
+            header[2] = FILE_HEAD;
+            header[3..5].copy_from_slice(&(LONG_BLOCK | FHD_COMMENT | flags).to_le_bytes());
+            let size = header.len() as u16;
+            header[5..7].copy_from_slice(&size.to_le_bytes());
+            header[24] = 29;
+            header[25] = 0x30;
+            header[26..28].copy_from_slice(&4u16.to_le_bytes());
+            header[name_start..name_start + 4].copy_from_slice(b"name");
+            header[crc_end + 2] = COMM_HEAD;
+            header[crc_end + 5..crc_end + 7].copy_from_slice(&13u16.to_le_bytes());
+            assert_eq!(file_header_comment_crc_end(&header, 0).unwrap(), crc_end);
+            let crc = (crc32(&header[2..crc_end]) & 0xffff) as u16;
+            header[..2].copy_from_slice(&crc.to_le_bytes());
+            let block = parse_block_header(&header, 0).unwrap();
+            let file = parse_file_like_header(&header, block, 0).unwrap();
+            assert_eq!(file.name, b"name");
+            assert_eq!(file.file_comment.len(), 13);
+        }
+    }
+
+    #[test]
     fn memory_and_seekable_parsers_reject_invalid_file_header_lengths() {
         let original = stored_archive_bytes(b"lengths.txt", b"payload");
         let file_offset = Archive::parse(&original)
