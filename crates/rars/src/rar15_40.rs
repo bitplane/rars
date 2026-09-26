@@ -1262,7 +1262,7 @@ impl Archive {
         }
         let mut encrypted_header_ciphers = EncryptedHeaderCipherCache::default();
 
-        while (sfx_offset + pos) as u64 + 7 <= file_len {
+        while file_len.saturating_sub((sfx_offset + pos) as u64) >= 7 {
             let (block, header, total) = if main.has_encrypted_headers() {
                 let password = password.ok_or(Error::NeedPassword)?;
                 let encrypted = read_encrypted_header_at(
@@ -2492,7 +2492,10 @@ fn read_encrypted_header_at(
     let absolute = archive_offset
         .checked_add(offset)
         .ok_or(Error::InvalidHeader("RAR 1.5 block offset overflows usize"))?;
-    if absolute as u64 + 24 > file_len {
+    let remaining = file_len
+        .checked_sub(absolute as u64)
+        .ok_or(Error::TooShort)?;
+    if remaining < 24 {
         return Err(Error::TooShort);
     }
     let first = read_exact_at(file, absolute, 24)?;
@@ -2512,7 +2515,7 @@ fn read_encrypted_header_at(
     let encrypted_start = absolute
         .checked_add(8)
         .ok_or(Error::InvalidHeader("RAR 1.5 block offset overflows usize"))?;
-    if encrypted_start as u64 + encrypted_header_size as u64 > file_len {
+    if encrypted_header_size as u64 > remaining - 8 {
         return Err(Error::TooShort);
     }
     budget.admit(head_size, offset)?;
@@ -2796,7 +2799,10 @@ fn read_block_header_at(
     let absolute = archive_offset
         .checked_add(offset)
         .ok_or(Error::InvalidHeader("RAR 1.5 block offset overflows usize"))?;
-    if absolute as u64 + 7 > file_len {
+    let remaining = file_len
+        .checked_sub(absolute as u64)
+        .ok_or(Error::TooShort)?;
+    if remaining < 7 {
         return Err(Error::TooShort);
     }
     let base = read_exact_at(file, absolute, 7)?;
@@ -2804,7 +2810,7 @@ fn read_block_header_at(
     if head_size < 7 {
         return Err(Error::InvalidHeader("RAR 1.5 block header is too short"));
     }
-    if absolute as u64 + head_size as u64 > file_len {
+    if head_size as u64 > remaining {
         return Err(Error::TooShort);
     }
     if offset != 0 {

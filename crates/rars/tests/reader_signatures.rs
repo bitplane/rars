@@ -65,7 +65,7 @@ fn typed_path_parsers_validate_explicit_signatures_and_sfx_offsets() {
                 Err(Error::UnsupportedSignature)
             ));
         }
-        for offset in [prefix.len() + 1, image.len(), image.len() + 1] {
+        for offset in [prefix.len() + 1, image.len(), image.len() + 1, usize::MAX] {
             let mut invalid = signature;
             invalid.offset = offset;
             let result = if is_modern {
