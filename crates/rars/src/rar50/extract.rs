@@ -419,11 +419,6 @@ impl FileHeader {
         if let Some(policy) = scratch_policy {
             return scratch::decode(self, packed, keys, decoder, policy, writer);
         }
-        if self.is_stored() {
-            return Err(Error::InvalidHeader(
-                "RAR 5 stored file does not use streaming compressed decode",
-            ));
-        }
 
         let info = self.decoded_compression_info()?;
         let dictionary_size = usize::try_from(info.dictionary_size).map_err(|_| {
@@ -956,7 +951,7 @@ impl<'a> DecoderSession<'a> {
 
 impl FileHeader {
     fn should_stream_decode(&self, buffered_decode_limit: u64) -> bool {
-        !self.is_stored() && self.unpacked_size > buffered_decode_limit
+        self.unpacked_size > buffered_decode_limit
     }
 }
 
@@ -2901,28 +2896,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(seen, vec![(b"link".to_vec(), b"target".to_vec())]);
-    }
-
-    #[test]
-    fn stream_packed_with_decoder_rejects_stored_files() {
-        let file = plain_file(b"stored.txt", b"hello", None);
-        assert!(file.is_stored());
-        let mut decoder = Unpack50Decoder::new();
-        let mut out: Vec<u8> = Vec::new();
-        let err = file
-            .stream_packed_with_decoder(
-                &mut Cursor::new(Vec::<u8>::new()),
-                None,
-                &mut decoder,
-                BUFFERED_DECODE_LIMIT,
-                None,
-                &mut out,
-            )
-            .unwrap_err();
-        assert!(
-            matches!(err, Error::InvalidHeader(msg) if msg.contains("does not use streaming")),
-            "expected streaming-rejection error, got {err:?}"
-        );
     }
 
     #[test]

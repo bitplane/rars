@@ -666,9 +666,6 @@ impl FileHeader {
         password: Option<&[u8]>,
         out: &mut impl Write,
     ) -> Result<()> {
-        if !self.is_stored() {
-            return Err(self.unsupported_compression());
-        }
         if !self.is_encrypted() && self.pack_size != self.unp_size {
             return Err(Error::InvalidHeader(
                 "RAR 1.5 stored file has mismatched packed and unpacked sizes",
@@ -793,16 +790,6 @@ impl FileHeader {
         decoder: &mut Unpack29,
         out: &mut impl Write,
     ) -> Result<()> {
-        if self.is_stored() {
-            return self.write_stored_to(archive, None, out);
-        }
-        if self.is_encrypted() {
-            return Err(self.unsupported_encryption());
-        }
-        if self.unp_ver < 29 {
-            return Err(self.unsupported_compression());
-        }
-
         let mut packed = archive.range_reader(self.packed_range.clone())?;
         let mut crc = Crc32::new();
         let mut crc_writer = CrcWriter {
@@ -836,13 +823,6 @@ impl FileHeader {
         password: Option<&[u8]>,
         out: &mut impl Write,
     ) -> Result<()> {
-        if self.is_stored() {
-            return self.write_stored_to(archive, password, out);
-        }
-        if self.unp_ver != 15 {
-            return Err(self.unsupported_compression());
-        }
-
         let mut input = self
             .packed_reader_for_decode(archive, password)
             .map_err(|error| self.map_encrypted_payload_error(password, error))?;
@@ -883,13 +863,6 @@ impl FileHeader {
         password: Option<&[u8]>,
         out: &mut impl Write,
     ) -> Result<()> {
-        if self.is_stored() {
-            return self.write_stored_to(archive, password, out);
-        }
-        if self.unp_ver != 20 && self.unp_ver != 26 {
-            return Err(self.unsupported_compression());
-        }
-
         let mut crc = Crc32::new();
         let mut crc_writer = CrcWriter {
             inner: out,
