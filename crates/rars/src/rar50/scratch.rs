@@ -45,19 +45,11 @@ impl Write for ScratchFile {
             .checked_add(bytes.len() as u64)
             .ok_or_else(|| std::io::Error::other("scratch offset overflow"))?;
         let mut budget = self.budget.borrow_mut();
-        let required = budget
-            .used
-            .checked_add(end.saturating_sub(self.len))
-            .ok_or_else(|| {
-                std::io::Error::other(Error::Rar50ScratchLimitExceeded {
-                    limit: budget.limit,
-                    required: u64::MAX,
-                })
-            })?;
-        if required > budget.limit {
+        let additional = end.saturating_sub(self.len);
+        if additional > budget.limit - budget.used {
             return Err(std::io::Error::other(Error::Rar50ScratchLimitExceeded {
                 limit: budget.limit,
-                required,
+                required: budget.used.saturating_add(additional),
             }));
         }
         let count = self.spool.write(bytes)?;
@@ -133,7 +125,11 @@ fn encode_filter(filter: PendingFilter) -> [u8; 24] {
     bytes
 }
 
-fn decode_filter(bytes: [u8; 24]) -> Result<PendingFilter> {
+fn decode_filter(
+    bytes: [u8; 24],
+    output_size: usize,
+    filter_memory_limit: u64,
+) -> Result<PendingFilter> {
     let start = usize::try_from(u64::from_le_bytes(bytes[..8].try_into().unwrap()))
         .map_err(|_| Error::InvalidHeader("scratch filter offset overflows"))?;
     let length = usize::try_from(u64::from_le_bytes(bytes[8..16].try_into().unwrap()))
@@ -145,6 +141,19 @@ fn decode_filter(bytes: [u8; 24]) -> Result<PendingFilter> {
         3 => FilterType::Arm,
         _ => return Err(Error::InvalidHeader("scratch filter type changed")),
     };
+    let required = (length as u64).saturating_mul(2);
+    if required > filter_memory_limit {
+        return Err(Error::Rar50FilterMemoryLimitExceeded {
+            limit: filter_memory_limit,
+            required,
+        });
+    }
+    if start
+        .checked_add(length)
+        .is_none_or(|end| end > output_size)
+    {
+        return Err(Error::InvalidHeader("scratch filter range exceeds output"));
+    }
     Ok(PendingFilter {
         start,
         length,
@@ -262,21 +271,9 @@ pub(super) fn decode<R: Read>(
         control.check()?;
         let mut bytes = [0; 24];
         records.read_exact(&mut bytes)?;
-        let filter = decode_filter(bytes)?;
-        let required = (filter.length as u64).saturating_mul(2);
-        if required > policy.filter_memory_limit {
-            return Err(Error::Rar50FilterMemoryLimitExceeded {
-                limit: policy.filter_memory_limit,
-                required,
-            });
-        }
-        if filter
-            .start
-            .checked_add(filter.length)
-            .is_none_or(|end| end > output_size)
-        {
-            return Err(Error::InvalidHeader("scratch filter range exceeds output"));
-        }
+        // These bytes came back from disk. Revalidate them before allocating
+        // or seeking, even though the codec admitted the original record.
+        let filter = decode_filter(bytes, output_size, policy.filter_memory_limit)?;
         transformed.seek(SeekFrom::Start(filter.start as u64))?;
         let mut data = vec![0; filter.length];
         control.reader(&mut transformed).read_exact(&mut data)?;
@@ -286,4 +283,87 @@ pub(super) fn decode<R: Read>(
     }
     verify(file, &mut transformed, keys, &control)?;
     copy(&mut transformed, writer, &control)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scratch_files_share_disk_quota_and_overwrites_do_not_spend_it_twice() {
+        let dir = crate::scratch::case("reader-scratch-shared-quota");
+        let policy = crate::Rar50Scratch::new(&*dir, 8);
+        let budget = Rc::new(RefCell::new(DiskBudget { used: 0, limit: 8 }));
+        {
+            let mut first = ScratchFile::create(&policy, &budget).unwrap();
+            let mut second = ScratchFile::create(&policy, &budget).unwrap();
+            first.write_all(b"abcd").unwrap();
+            second.write_all(b"efgh").unwrap();
+            first.rewind().unwrap();
+            first.write_all(b"ABCD").unwrap();
+            first.flush().unwrap();
+            assert_eq!(budget.borrow().used, 8);
+            let error = second.write_all(b"i").unwrap_err();
+            assert!(matches!(
+                error.get_ref().unwrap().downcast_ref::<Error>(),
+                Some(Error::Rar50ScratchLimitExceeded {
+                    limit: 8,
+                    required: 9
+                })
+            ));
+            first.rewind().unwrap();
+            let mut data = Vec::new();
+            first.read_to_end(&mut data).unwrap();
+            assert_eq!(data, b"ABCD");
+        }
+        assert_eq!(std::fs::read_dir(&*dir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn scratch_filter_records_reject_corrupt_tags_and_preserve_offsets() {
+        for filter_type in [
+            FilterType::Delta,
+            FilterType::E8,
+            FilterType::E8E9,
+            FilterType::Arm,
+        ] {
+            let filter = PendingFilter {
+                start: usize::MAX - 17,
+                length: 17,
+                filter_type,
+                channels: 3,
+            };
+            let mut bytes = encode_filter(filter);
+            let decoded = decode_filter(bytes, usize::MAX, 34).unwrap();
+            assert_eq!(decoded.start, filter.start);
+            assert_eq!(decoded.length, filter.length);
+            assert_eq!(decoded.filter_type, filter.filter_type);
+            assert_eq!(decoded.channels, filter.channels);
+            bytes[16] = 4;
+            assert!(matches!(
+                decode_filter(bytes, usize::MAX, 34),
+                Err(Error::InvalidHeader("scratch filter type changed"))
+            ));
+            bytes[16] = 0;
+            bytes[8..16].copy_from_slice(&18u64.to_le_bytes());
+            assert!(matches!(
+                decode_filter(bytes, usize::MAX, 34),
+                Err(Error::Rar50FilterMemoryLimitExceeded {
+                    limit: 34,
+                    required: 36
+                })
+            ));
+            bytes[8..16].copy_from_slice(&17u64.to_le_bytes());
+            bytes[..8].copy_from_slice(&(usize::MAX as u64).to_le_bytes());
+            assert!(matches!(
+                decode_filter(bytes, usize::MAX, 34),
+                Err(Error::InvalidHeader("scratch filter range exceeds output"))
+            ));
+            bytes[..8].copy_from_slice(&1u64.to_le_bytes());
+            assert!(matches!(
+                decode_filter(bytes, 17, 34),
+                Err(Error::InvalidHeader("scratch filter range exceeds output"))
+            ));
+        }
+    }
 }

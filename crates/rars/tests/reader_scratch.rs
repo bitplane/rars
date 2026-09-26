@@ -302,3 +302,42 @@ fn unfiltered_zero_matches_stream_with_and_without_scratch() {
         assert_eq!(std::fs::read_dir(&*dir).unwrap().count(), 0);
     }
 }
+
+#[test]
+fn scratch_decoder_failure_discards_output_and_removes_temporary_files() {
+    let dir = scratch::case("reader-scratch-truncated-source");
+    let path = dir.join("input.rar");
+    let bytes = Rar50Writer::new(options(ArchiveVersion::Rar50))
+        .entries([entry(&[0; 2000], false)])
+        .filter_policy(FilterPolicy::None)
+        .finish()
+        .unwrap();
+    std::fs::write(&path, bytes).unwrap();
+    let archive = ArchiveReader::read_path(&path).unwrap();
+    let Archive::Rar50Plus(raw) = &archive else {
+        unreachable!()
+    };
+    let data_start = raw.files().next().unwrap().block.data_range.start;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(data_start as u64)
+        .unwrap();
+    let policy = Rar50Scratch::new(&*dir, 10_000);
+    let output = Rc::new(RefCell::new(Vec::new()));
+    let error = archive
+        .extract_to_with_options(
+            ArchiveReadOptions::new()
+                .with_rar50_buffered_decode_limit(0)
+                .with_rar50_scratch(&policy),
+            |_| Ok(Box::new(Capture(output.clone()))),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error.root_cause(),
+        Error::Codec(rars::codec::Error::NeedMoreInput)
+    ));
+    assert!(output.borrow().is_empty());
+    assert_eq!(std::fs::read_dir(&*dir).unwrap().count(), 1);
+}
