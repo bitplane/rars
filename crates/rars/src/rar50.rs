@@ -2180,9 +2180,7 @@ impl<'a> HeaderReader<'a> {
     }
 
     fn read_u32(&mut self) -> Result<u32> {
-        let value = read_u32(self.input, self.pos)?;
-        self.pos += 4;
-        Ok(value)
+        self.read_array::<4>().map(u32::from_le_bytes)
     }
 
     fn read_byte(&mut self) -> Result<u8> {
@@ -2443,6 +2441,27 @@ mod tests {
     }
 
     #[test]
+    fn header_reader_u32_obeys_type_specific_boundary() {
+        // Extra-area bytes remain physically available in the header image,
+        // but must not satisfy a field in the type-specific part.
+        let input = [99, 99, 1, 2, 3, 4, 77];
+        for available in 0..=4 {
+            let mut reader = HeaderReader::new(&input, 2..2 + available).unwrap();
+            let result = reader.read_u32();
+            if available < 4 {
+                assert!(
+                    matches!(result, Err(Error::TooShort)),
+                    "available {available}"
+                );
+                assert_eq!(reader.pos, 2);
+            } else {
+                assert_eq!(result.unwrap(), 0x0403_0201);
+                assert_eq!(reader.pos, 6);
+            }
+        }
+    }
+
+    #[test]
     fn main_extra_records_keep_future_and_duplicate_layouts_readable() {
         let control = crate::read_control::ReadControl::default();
         // Locator zero offsets are retained as wire values; they do not
@@ -2491,6 +2510,13 @@ mod tests {
             matches!(records.as_slice(), [MainExtraRecord::ArchiveMetadata(record)]
             if record.flags == 16 && record.name.is_none() && record.creation_time.is_none())
         );
+        let extra = [2, MHEXTRA_LOCATOR as u8, 0, 0x80];
+        let (records, complete) = parse_main_extra_area(&extra, 0..extra.len(), &control).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(
+            !complete,
+            "a malformed tail must not erase preceding records"
+        );
     }
 
     #[test]
@@ -2525,6 +2551,30 @@ mod tests {
                 "RAR 5 archive metadata record has trailing bytes"
             ))
         ));
+        let huge_name = [
+            12,
+            MHEXTRA_ARCHIVE_METADATA as u8,
+            1,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            1,
+        ];
+        let expected = if usize::BITS < 64 {
+            "RAR 5 archive metadata name length overflows usize"
+        } else {
+            "RAR 5 field size overflows usize"
+        };
+        assert!(
+            matches!(parse_main_extra_area(&huge_name, 0..huge_name.len(), &control),
+            Err(Error::InvalidHeader(message)) if message == expected)
+        );
     }
 
     #[test]
