@@ -1438,6 +1438,32 @@ mod tests {
     }
 
     #[test]
+    fn parallel_extraction_keeps_directory_callbacks_and_split_fallback() {
+        let directory = file(b"dir", FHD_DIRECTORY_MASK);
+        let archive = archive_with(vec![Block::File(directory.clone())]);
+        let capture = Capture::default();
+        archive
+            .extract_to_parallel_buffered(crate::ArchiveReadOptions::new(), capture.opener())
+            .unwrap();
+        assert!(capture.opened.borrow()[0].is_directory);
+        let mut bytes = vec![];
+        directory.write_to(&archive, None, &mut bytes).unwrap();
+        assert!(bytes.is_empty());
+        for flag in [FHD_SPLIT_BEFORE, FHD_SPLIT_AFTER] {
+            let archive = archive_with(vec![Block::File(file(b"split", flag))]);
+            let error = archive
+                .extract_to_parallel_buffered(crate::ArchiveReadOptions::new(), |_| {
+                    panic!("split cannot open output")
+                })
+                .unwrap_err();
+            assert!(matches!(
+                error.root_cause(),
+                Error::InvalidHeader("RAR 1.5 split entry requires multivolume extraction")
+            ));
+        }
+    }
+
+    #[test]
     fn extract_volumes_to_invokes_open_for_directory_entries() {
         let dir = file(b"d", FHD_DIRECTORY_MASK);
         let volumes = vec![archive_with(vec![Block::File(dir)])];
