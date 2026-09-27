@@ -168,6 +168,18 @@ pub struct ArchiveReadOptions<'a> {
     /// recovery helpers keep defaults. Each extraction starts a new budget.
     /// Options-aware comment decoding starts a separate single-comment budget.
     pub max_total_output_bytes: Option<u64>,
+    /// Aggregate capacity ceiling for reader-owned payload workspace in one
+    /// extraction or options-aware comment call, across all members and volumes.
+    /// Includes decoder/model state, packed and cipher staging, filter scratch,
+    /// checkpoints, split cursors and queued parallel results. None is unlimited.
+    /// Capacity growth charges old and replacement allocations while both live.
+    /// Parsed archive/source storage, metadata, caller sinks and collected final
+    /// output, allocator overhead and executor/control storage are excluded.
+    /// This is not a process RAM limit. Parsing and direct codecs do not apply it.
+    /// Parallel jobs receive fixed allowances before dispatch; a worker cannot
+    /// borrow a sibling's spare. Insufficient allowance returns ResourceLimit;
+    /// increase the limit or use sequential extraction. Partial output can remain.
+    pub max_reader_workspace_bytes: Option<u64>,
 }
 
 impl<'a> ArchiveReadOptions<'a> {
@@ -217,6 +229,12 @@ impl<'a> ArchiveReadOptions<'a> {
             password,
             ..Self::default()
         }
+    }
+
+    /// Sets the aggregate reader workspace capacity ceiling for each call.
+    pub fn with_max_reader_workspace_bytes(mut self, limit: u64) -> Self {
+        self.max_reader_workspace_bytes = Some(limit);
+        self
     }
 
     /// Sets the logical member output ceiling.

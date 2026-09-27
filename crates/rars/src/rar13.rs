@@ -1,6 +1,6 @@
 use crate::codec::rar13::{
     unpack15_decode, unpack15_encode, unpack15_encode_with_options_and_progress,
-    EncodeOptions as Rar15EncodeOptions, Reader15State, Unpack15, Unpack15Encoder,
+    EncodeOptions as Rar15EncodeOptions, Reader15State, Unpack15Encoder,
 };
 use crate::codec::workspace::{Allowance, Budget, Buffer};
 use crate::crypto::rar13::{Rar13Cipher, Rar13DecryptReader};
@@ -684,6 +684,15 @@ impl Archive {
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
+        if let Some(limit) = options.max_reader_workspace_bytes {
+            return self.extract_with_allowance(
+                options,
+                open,
+                selector,
+                on_error,
+                &crate::codec::workspace::Allowance::limited(limit),
+            );
+        }
         self.extract_with_allowance(options, open, selector, on_error, &Allowance::default())
     }
 
@@ -828,6 +837,17 @@ impl Archive {
         &self,
         options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Option<Vec<u8>>> {
+        if let Some(limit) = options.max_reader_workspace_bytes {
+            return self.archive_comment_with_allowance(options, &Allowance::limited(limit));
+        }
+        self.archive_comment_with_allowance(options, &Allowance::default())
+    }
+
+    fn archive_comment_with_allowance<B: Budget>(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+        allowance: &B,
+    ) -> Result<Option<Vec<u8>>> {
         options.check_cancelled()?;
         let mut budget = crate::output_limit::OutputBudget::new(options);
         if !self.main.has_archive_comment() {
@@ -854,13 +874,15 @@ impl Archive {
             }
 
             budget.check(unpacked_len as u64, b"CMT")?;
-            let mut packed = self.main.extra[packed_start..packed_end].to_vec();
-            Rar13Cipher::new_comment().decrypt_in_place(&mut packed);
-            let mut decoder = Unpack15::default();
+            let mut packed = Rar13DecryptReader::new(
+                &self.main.extra[packed_start..packed_end],
+                Rar13Cipher::new_comment(),
+            );
+            let mut decoder = Decoder15::with_allowance(allowance);
             decoder.read_control = budget.control.clone();
             let mut data = Vec::new();
             budget.run(b"CMT", &mut data, |writer| {
-                decoder.decode_member_to(&packed, unpacked_len, false, writer)?;
+                decoder.decode_member_from_reader(&mut packed, unpacked_len, false, writer)?;
                 Ok(())
             })?;
             return Ok(Some(data));
@@ -1162,6 +1184,9 @@ pub fn extract_volumes_to_with_options<F>(
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
 {
+    if let Some(limit) = options.max_reader_workspace_bytes {
+        return extract_volumes_with_allowance(volumes, options, open, &Allowance::limited(limit));
+    }
     extract_volumes_with_allowance(volumes, options, open, &Allowance::default())
 }
 

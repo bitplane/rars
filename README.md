@@ -64,6 +64,14 @@ Use `--legacy-name-encoding cp850` or the corresponding binding option; see
 [legacy filename decoding](FILENAME_ENCODINGS.md) for supported encodings and
 preservation semantics.
 
+## Reader resources
+
+Rust readers accept `ArchiveReadOptions::with_max_reader_workspace_bytes` to
+limit aggregate decoder workspace and queued parallel results across an extraction
+call or volume set. The default is unlimited. Logical output, parsed sources and
+caller output storage have separate costs; see the
+[reader resource contract](READER_RESOURCE_CONTRACT.md).
+
 ## Writer execution
 
 For writer execution modes, workspace estimates and retained storage, see

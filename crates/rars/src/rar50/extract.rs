@@ -319,6 +319,22 @@ impl FileHeader {
         archive: &Archive,
         options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Vec<u8>> {
+        if let Some(limit) = options.max_reader_workspace_bytes {
+            return self.decoded_comment_with_allowance(
+                archive,
+                options,
+                &Allowance::limited(limit),
+            );
+        }
+        self.decoded_comment_with_allowance(archive, options, &Allowance::default())
+    }
+
+    fn decoded_comment_with_allowance<B: Budget>(
+        &self,
+        archive: &Archive,
+        options: crate::ArchiveReadOptions<'_>,
+        allowance: &B,
+    ) -> Result<Vec<u8>> {
         let mut budget = crate::output_limit::OutputBudget::new(options);
         if budget.is_limited() && self.known_unpacked_size().is_none() {
             return Err(Error::UnsupportedFeature {
@@ -340,12 +356,33 @@ impl FileHeader {
         }
         // Comment services historically decode without checking payload hashes.
         // Reuse bounded member decoding while retaining that checksum contract.
-        let mut payload = self.clone();
-        payload.data_crc32 = None;
-        payload.hash = None;
-        let mut session = DecoderSession::new_with_password(
+        let payload = FileHeader {
+            block: self.block.clone(),
+            file_flags: self.file_flags,
+            rewrite_metadata_complete: self.rewrite_metadata_complete,
+            unpacked_size: self.unpacked_size,
+            attributes: self.attributes,
+            mtime: self.mtime,
+            htime_mtime: self.htime_mtime,
+            htime_mtime_refinement: self.htime_mtime_refinement,
+            file_times: self.file_times,
+            data_crc32: None,
+            compression_info: self.compression_info,
+            host_os: self.host_os,
+            name: self.name.clone(),
+            hash: None,
+            redirection: None,
+            // Parsed service payloads belong to the archive. Decoding reads its
+            // source range; copying service_data would create uncharged staging.
+            service_data: None,
+            encrypted: self.encrypted,
+            encryption: self.encryption.clone(),
+            crypto: self.crypto.clone(),
+        };
+        let mut session = DecoderSession::with_allowance(
             options.password,
             options.rar50_buffered_decode_limit.unwrap_or(u64::MAX),
+            allowance,
         );
         session.decoder.read_control = budget.control.clone();
         session.scratch = options.rar50_scratch;
@@ -644,6 +681,17 @@ impl Archive {
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
         R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
     {
+        if let Some(limit) = options.max_reader_workspace_bytes {
+            return self.extract_with_allowance(
+                options,
+                open,
+                redirect,
+                emit_redirections,
+                selector,
+                on_error,
+                &crate::codec::workspace::Allowance::limited(limit),
+            );
+        }
         self.extract_with_allowance(
             options,
             open,
@@ -781,6 +829,38 @@ impl Archive {
             return self.extract_to(options, open);
         }
 
+        if let Some(limit) = options.max_reader_workspace_bytes {
+            let ledger = Allowance::limited(limit);
+            let publication = crate::read_control::ReadControl::new(options.cancellation);
+            return crate::codec::workspace::coordinator::extract_windowed(
+                self.files(),
+                &ledger,
+                |file| {
+                    if file.is_directory() || file.redirection.is_some() {
+                        0
+                    } else if file.is_stored() {
+                        file.unpacked_size
+                    } else {
+                        file.unpacked_size
+                            .saturating_add(file.packed_size())
+                            .saturating_add(8192)
+                    }
+                },
+                |file, local| {
+                    options.check_cancelled()?;
+                    decode_parallel_entry_with_allowance(
+                        self,
+                        file,
+                        options.password,
+                        rar50_buffered_decode_limit(options),
+                        options,
+                        local,
+                    )
+                },
+                |entry| write_parallel_entry(entry, &mut open, &mut |_, _| Ok(()), &publication),
+            );
+        }
+
         let password = options.password;
         let buffered_decode_limit = rar50_buffered_decode_limit(options);
         let mut files = self.files().peekable();
@@ -810,18 +890,6 @@ impl Archive {
     }
 }
 
-enum ParallelExtractedEntry {
-    Directory(ExtractedEntryMeta),
-    File {
-        meta: ExtractedEntryMeta,
-        data: Vec<u8>,
-    },
-    Redirection {
-        meta: ExtractedEntryMeta,
-        redirection: FileRedirection,
-    },
-}
-
 fn decode_parallel_entry(
     archive: &Archive,
     file: &FileHeader,
@@ -829,6 +897,36 @@ fn decode_parallel_entry(
     buffered_decode_limit: u64,
     options: crate::ArchiveReadOptions<'_>,
 ) -> Result<ParallelExtractedEntry> {
+    decode_parallel_entry_with_allowance(
+        archive,
+        file,
+        password,
+        buffered_decode_limit,
+        options,
+        &Allowance::default(),
+    )
+}
+
+enum ParallelExtractedEntry<B: Budget = Allowance> {
+    Directory(ExtractedEntryMeta),
+    File {
+        meta: ExtractedEntryMeta,
+        data: Buffer<u8, B>,
+    },
+    Redirection {
+        meta: ExtractedEntryMeta,
+        redirection: FileRedirection,
+    },
+}
+
+fn decode_parallel_entry_with_allowance<B: Budget>(
+    archive: &Archive,
+    file: &FileHeader,
+    password: Option<&[u8]>,
+    buffered_decode_limit: u64,
+    options: crate::ArchiveReadOptions<'_>,
+    allowance: &B,
+) -> Result<ParallelExtractedEntry<B>> {
     options.check_cancelled()?;
     let mut budget = crate::output_limit::OutputBudget::new(options);
     file.check_dictionary_limit(options.rar50_dictionary_size_limit)?;
@@ -844,8 +942,8 @@ fn decode_parallel_entry(
     if meta.is_directory {
         return Ok(ParallelExtractedEntry::Directory(meta));
     }
-    let mut data = Vec::new();
-    let mut session = DecoderSession::new_with_password(password, buffered_decode_limit);
+    let mut data = Buffer::new(allowance);
+    let mut session = DecoderSession::with_allowance(password, buffered_decode_limit, allowance);
     session.decoder.read_control = budget.control.clone();
     session.scratch = options.rar50_scratch;
     budget.run(&file.name, &mut data, |writer| {
@@ -854,8 +952,8 @@ fn decode_parallel_entry(
     Ok(ParallelExtractedEntry::File { meta, data })
 }
 
-fn write_parallel_entry<F, R>(
-    entry: ParallelExtractedEntry,
+fn write_parallel_entry<F, R, B: Budget>(
+    entry: ParallelExtractedEntry<B>,
     open: &mut F,
     redirect: &mut R,
     control: &crate::read_control::ReadControl,
@@ -1094,6 +1192,16 @@ where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
 {
+    if let Some(limit) = options.max_reader_workspace_bytes {
+        return extract_volumes_with_allowance(
+            volumes,
+            options,
+            open,
+            redirect,
+            emit_redirections,
+            &Allowance::limited(limit),
+        );
+    }
     extract_volumes_with_allowance(
         volumes,
         options,

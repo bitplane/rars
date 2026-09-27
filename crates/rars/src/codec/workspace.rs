@@ -2,6 +2,7 @@
 //! reaches into a sibling worker's spare bytes. Internal admission tests connect
 //! these owners to coordinator reservations; unlimited handles preserve behaviour.
 use super::{Error, Result};
+pub(crate) mod coordinator;
 mod ledger;
 pub(crate) use ledger::{Charge, Limited, Reservation, RESERVATION_BYTES};
 

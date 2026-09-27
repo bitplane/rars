@@ -1,5 +1,6 @@
-use crate::codec::rar13::Unpack15;
-use crate::codec::rar20::Unpack20;
+use crate::codec::rar13::Reader15State;
+use crate::codec::rar20::Reader20State;
+use crate::codec::workspace::{Allowance, Budget, Buffer};
 use crate::crc32::{crc32, Crc32};
 use crate::crypto::rar15::Rar15Cipher;
 use crate::crypto::rar20::Rar20Cipher;
@@ -782,10 +783,6 @@ impl CommentHeader {
                 || ((0x31..=0x35).contains(&self.method) && matches!(self.unp_ver, 15 | 20 | 26)))
     }
 
-    fn packed_data(&self, archive: &Archive) -> Result<Vec<u8>> {
-        archive.read_range(self.packed_range.clone())
-    }
-
     /// Unpacks comment data and checks it against the header's 16-bit CRC.
     fn decode(&self, packed: &[u8]) -> Result<Vec<u8>> {
         self.decode_with_budget(
@@ -798,6 +795,15 @@ impl CommentHeader {
         &self,
         packed: &[u8],
         budget: &mut crate::output_limit::OutputBudget,
+    ) -> Result<Vec<u8>> {
+        self.decode_with_allowance(packed, budget, &Allowance::default())
+    }
+
+    fn decode_with_allowance<B: Budget>(
+        &self,
+        packed: &[u8],
+        budget: &mut crate::output_limit::OutputBudget,
+        allowance: &B,
     ) -> Result<Vec<u8>> {
         let target = usize::from(self.unp_size);
         budget.check(target as u64, b"CMT")?;
@@ -812,11 +818,17 @@ impl CommentHeader {
                 }
                 writer.write_all(packed)?;
             } else if self.unp_ver == 15 {
-                let mut decoder = Unpack15::default();
+                let mut decoder = crate::codec::workspace::Boxed::try_new(
+                    || Reader15State::with_allowance(allowance),
+                    allowance,
+                )?;
                 decoder.read_control = control;
                 decoder.decode_member_to(packed, target, false, writer)?;
             } else if self.unp_ver == 20 || self.unp_ver == 26 {
-                let mut decoder = Unpack20::new();
+                let mut decoder = crate::codec::workspace::Boxed::try_new(
+                    || Ok::<_, crate::codec::Error>(Reader20State::with_allowance(allowance)),
+                    allowance,
+                )?;
                 decoder.read_control = control;
                 decoder.decode_member_from_reader(&mut &packed[..], target, writer)?;
             } else {
@@ -1511,6 +1523,15 @@ impl Archive {
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
+        if let Some(limit) = options.max_reader_workspace_bytes {
+            return self.extract_with_allowance(
+                options,
+                open,
+                selector,
+                on_error,
+                &crate::codec::workspace::Allowance::limited(limit),
+            );
+        }
         self.extract_with_allowance(
             options,
             open,
@@ -1629,6 +1650,32 @@ impl Archive {
             return self.extract_to(options, open);
         }
 
+        if let Some(limit) = options.max_reader_workspace_bytes {
+            let ledger = Allowance::limited(limit);
+            let publication = crate::read_control::ReadControl::new(options.cancellation);
+            return crate::codec::workspace::coordinator::extract_windowed(
+                self.files(),
+                &ledger,
+                |file| {
+                    if file.is_directory() {
+                        0
+                    } else if file.is_stored() {
+                        file.unp_size
+                    } else {
+                        file.unp_size
+                            .saturating_add(file.pack_size)
+                            .saturating_add(if file.unp_ver == 15 { 65536 } else { 0 })
+                            .saturating_add(8192)
+                    }
+                },
+                |file, local| {
+                    options.check_cancelled()?;
+                    decode_parallel_entry_with_allowance(self, file, options, local)
+                },
+                |entry| write_parallel_entry(entry, &mut open, &publication),
+            );
+        }
+
         let mut files = self.files().peekable();
         let window = crate::parallel::default_window().max(1);
         let publication = crate::read_control::ReadControl::new(options.cancellation);
@@ -1664,6 +1711,17 @@ impl Archive {
         &self,
         options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Option<Vec<u8>>> {
+        if let Some(limit) = options.max_reader_workspace_bytes {
+            return self.archive_comment_with_allowance(options, &Allowance::limited(limit));
+        }
+        self.archive_comment_with_allowance(options, &Allowance::default())
+    }
+
+    fn archive_comment_with_allowance<B: Budget>(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+        allowance: &B,
+    ) -> Result<Option<Vec<u8>>> {
         options.check_cancelled()?;
         let mut budget = crate::output_limit::OutputBudget::new(options);
         if let Some(comment) = self.blocks.iter().find_map(|block| match block {
@@ -1671,8 +1729,14 @@ impl Archive {
             _ => None,
         }) {
             budget.check(u64::from(comment.unp_size), b"CMT")?;
-            let packed = comment.packed_data(self)?;
-            return comment.decode_with_budget(&packed, &mut budget).map(Some);
+            let mut packed = Buffer::new(allowance);
+            let mut reader = budget
+                .control
+                .reader(self.range_reader(comment.packed_range.clone())?);
+            packed.read_to_end(&mut reader)?;
+            return comment
+                .decode_with_allowance(&packed, &mut budget, allowance)
+                .map(Some);
         }
 
         let Some(comment) = self
@@ -1684,11 +1748,11 @@ impl Archive {
         let file = &comment.file;
         budget.check(file.unp_size, b"CMT")?;
         let mut data = Vec::new();
-        let mut session = DecoderSession::new_with_password(false, options.password);
+        let mut session = DecoderSession::with_allowance(false, options.password, allowance);
         session.read_control = budget.control.clone();
         budget.run(b"CMT", &mut data, |mut writer| {
             if file.is_stored() {
-                file.write_stored_to(self, options.password, &mut writer)
+                file.write_stored_with_allowance(self, options.password, &mut writer, allowance)
             } else {
                 session.write_file_to(self, file, &mut writer)
             }
@@ -1697,19 +1761,28 @@ impl Archive {
     }
 }
 
-enum ParallelExtractedEntry {
-    Directory(ExtractedEntryMeta),
-    File {
-        meta: ExtractedEntryMeta,
-        data: Vec<u8>,
-    },
-}
-
 fn decode_parallel_entry(
     archive: &Archive,
     file: &FileHeader,
     options: crate::ArchiveReadOptions<'_>,
 ) -> Result<ParallelExtractedEntry> {
+    decode_parallel_entry_with_allowance(archive, file, options, &Allowance::default())
+}
+
+enum ParallelExtractedEntry<B: Budget = Allowance> {
+    Directory(ExtractedEntryMeta),
+    File {
+        meta: ExtractedEntryMeta,
+        data: Buffer<u8, B>,
+    },
+}
+
+fn decode_parallel_entry_with_allowance<B: Budget>(
+    archive: &Archive,
+    file: &FileHeader,
+    options: crate::ArchiveReadOptions<'_>,
+    allowance: &B,
+) -> Result<ParallelExtractedEntry<B>> {
     options.check_cancelled()?;
     let password = options.password;
     let mut budget = crate::output_limit::OutputBudget::new(options);
@@ -1719,14 +1792,14 @@ fn decode_parallel_entry(
         return Ok(ParallelExtractedEntry::Directory(meta));
     }
     budget.check(file.unp_size, &file.name)?;
-    let mut data = Vec::new();
+    let mut data = Buffer::new(allowance);
     let control = budget.control.clone();
     budget.run(&file.name, &mut data, |mut data| {
         if file.is_stored() {
-            file.write_stored_to(archive, password, &mut data)
+            file.write_stored_with_allowance(archive, password, &mut data, allowance)
                 .map_err(|error| file.entry_error("extracting", error))?;
         } else {
-            let mut session = DecoderSession::new_with_password(false, password);
+            let mut session = DecoderSession::with_allowance(false, password, allowance);
             session.read_control = control.clone();
             session
                 .write_file_to(archive, file, &mut data)
@@ -1738,8 +1811,8 @@ fn decode_parallel_entry(
     Ok(ParallelExtractedEntry::File { meta, data })
 }
 
-fn write_parallel_entry<F>(
-    entry: ParallelExtractedEntry,
+fn write_parallel_entry<F, B: Budget>(
+    entry: ParallelExtractedEntry<B>,
     open: &mut F,
     control: &crate::read_control::ReadControl,
 ) -> Result<()>

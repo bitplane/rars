@@ -269,6 +269,9 @@ pub fn extract_volumes_to<F>(
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
 {
+    if let Some(limit) = options.max_reader_workspace_bytes {
+        return extract_volumes_with_allowance(volumes, options, open, &Allowance::limited(limit));
+    }
     extract_volumes_with_allowance(volumes, options, open, &Allowance::default())
 }
 
