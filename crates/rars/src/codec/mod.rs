@@ -66,6 +66,7 @@ impl From<std::io::Error> for Error {
     fn from(error: std::io::Error) -> Self {
         match crate::Error::from(error) {
             crate::Error::Cancelled => Self::Cancelled,
+            crate::Error::Codec(error) => error,
             error => Self::Io(Box::new(error)),
         }
     }

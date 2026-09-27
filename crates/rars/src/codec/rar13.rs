@@ -1,3 +1,4 @@
+use super::workspace::{Allowance, Budget, Buffer};
 use super::{Error, Result};
 use std::io::{Read, Write};
 
@@ -1498,10 +1499,61 @@ fn encode_decode_num_prefix(
 #[derive(Clone)]
 pub struct Unpack15 {
     pub(crate) read_control: crate::read_control::ReadControl,
-    bits: BitReader,
+    state: Reader15State<Allowance>,
+}
+impl Clone for Reader15State<Allowance> {
+    fn clone(&self) -> Self {
+        self.try_clone().expect("unlimited legacy decoder copy")
+    }
+}
+impl Unpack15 {
+    pub fn new() -> Self {
+        Self {
+            read_control: crate::read_control::ReadControl::default(),
+            state: Reader15State::with_allowance(&Allowance::default())
+                .expect("unlimited legacy decoder"),
+        }
+    }
+    pub fn decode_member(&mut self, input: &[u8], target: usize, solid: bool) -> Result<Vec<u8>> {
+        self.state.read_control = self.read_control.clone();
+        self.state
+            .decode_member(input, target, solid)
+            .map(Buffer::into_vec)
+    }
+    pub fn decode_member_to(
+        &mut self,
+        input: &[u8],
+        target: usize,
+        solid: bool,
+        out: &mut impl Write,
+    ) -> Result<()> {
+        self.state.read_control = self.read_control.clone();
+        self.state.decode_member_to(input, target, solid, out)
+    }
+    pub fn decode_member_from_reader(
+        &mut self,
+        input: &mut impl Read,
+        target: usize,
+        solid: bool,
+        out: &mut impl Write,
+    ) -> Result<()> {
+        self.state.read_control = self.read_control.clone();
+        self.state
+            .decode_member_from_reader(input, target, solid, out)
+    }
+}
+#[cfg(test)]
+impl Reader15State<Allowance> {
+    fn new() -> Self {
+        Self::with_allowance(&Allowance::default()).unwrap()
+    }
+}
+pub(crate) struct Reader15State<B: Budget> {
+    pub(crate) read_control: crate::read_control::ReadControl,
+    bits: ReaderBits<B>,
     target: usize,
     output_written: usize,
-    window: [u8; 0x10000],
+    window: Buffer<u8, B>,
     unp_ptr: usize,
     prev_ptr: usize,
     first_win_done: bool,
@@ -1570,7 +1622,7 @@ struct OldDistanceEvent {
     max_dist3: u32,
 }
 
-impl Unpack15 {
+impl<B: Budget> Reader15State<B> {
     /// A decoder ready to read either a fresh member or a solid continuation.
     ///
     /// The starting state comes from `reset_non_solid` rather than being
@@ -1579,13 +1631,13 @@ impl Unpack15 {
     /// non-solid member, since that member resets them before the first symbol
     /// is read. A first member carrying the solid flag skips the reset and
     /// decoded against zeroes.
-    pub fn new() -> Self {
+    pub(crate) fn with_allowance(allowance: &B) -> Result<Self> {
         let mut decoder = Self {
             read_control: crate::read_control::ReadControl::default(),
-            bits: BitReader::new(&[]),
+            bits: ReaderBits::with_allowance(&[], allowance)?,
             target: 0,
             output_written: 0,
-            window: [0; 0x10000],
+            window: Buffer::filled(0x10000, 0, allowance)?,
             unp_ptr: 0,
             prev_ptr: 0,
             first_win_done: false,
@@ -1620,12 +1672,58 @@ impl Unpack15 {
             old_distance_events: Vec::new(),
         };
         decoder.reset_non_solid();
-        decoder
+        Ok(decoder)
     }
 
-    pub fn decode_member(&mut self, input: &[u8], target: usize, solid: bool) -> Result<Vec<u8>> {
+    pub(crate) fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            read_control: self.read_control.clone(),
+            bits: self.bits.try_clone()?,
+            target: self.target,
+            output_written: self.output_written,
+            window: Buffer::copied(&self.window, &self.window.allowance())?,
+            unp_ptr: self.unp_ptr,
+            prev_ptr: self.prev_ptr,
+            first_win_done: self.first_win_done,
+            ch_set: self.ch_set,
+            ch_set_a: self.ch_set_a,
+            ch_set_b: self.ch_set_b,
+            ch_set_c: self.ch_set_c,
+            n_to_pl: self.n_to_pl,
+            n_to_pl_b: self.n_to_pl_b,
+            n_to_pl_c: self.n_to_pl_c,
+            avr_plc: self.avr_plc,
+            avr_plc_b: self.avr_plc_b,
+            avr_ln1: self.avr_ln1,
+            avr_ln2: self.avr_ln2,
+            avr_ln3: self.avr_ln3,
+            max_dist3: self.max_dist3,
+            nhfb: self.nhfb,
+            nlzb: self.nlzb,
+            num_huf: self.num_huf,
+            buf60: self.buf60,
+            st_mode: self.st_mode,
+            l_count: self.l_count,
+            flag_buf: self.flag_buf,
+            flags_cnt: self.flags_cnt,
+            old_dist: self.old_dist,
+            old_dist_ptr: self.old_dist_ptr,
+            last_dist: self.last_dist,
+            last_length: self.last_length,
+            #[cfg(test)]
+            token_stats: self.token_stats,
+            #[cfg(test)]
+            old_distance_events: self.old_distance_events.clone(),
+        })
+    }
+    pub fn decode_member(
+        &mut self,
+        input: &[u8],
+        target: usize,
+        solid: bool,
+    ) -> Result<Buffer<u8, B>> {
         self.read_control.check_codec()?;
-        let mut output = Vec::with_capacity(target);
+        let mut output = Buffer::with_capacity(target, &self.window.allowance())?;
         self.decode_member_to(input, target, solid, &mut output)?;
         Ok(output)
     }
@@ -1639,7 +1737,7 @@ impl Unpack15 {
     ) -> Result<()> {
         self.read_control.check_codec()?;
         self.init_member(target, solid);
-        self.bits = BitReader::new(input);
+        self.bits = ReaderBits::with_allowance(input, &self.window.allowance())?;
         self.decode_loop(out)
     }
 
@@ -1656,17 +1754,18 @@ impl Unpack15 {
         const OUTPUT_CHUNK: usize = 64 * 1024;
 
         self.init_member(target, solid);
-        self.bits = BitReader::new(&[]);
-        let mut packed = Vec::new();
-        input.read_to_end(&mut packed).map_err(Error::from)?;
-        self.bits = BitReader::new(&packed);
+        self.bits = ReaderBits::with_allowance(&[], &self.window.allowance())?;
+        self.bits.input.read_to_end(input)?;
 
         while self.output_written < self.target {
             let chunk_target = self
                 .output_written
                 .saturating_add(OUTPUT_CHUNK)
                 .min(self.target);
-            let mut chunk = Vec::with_capacity(chunk_target - self.output_written);
+            let mut chunk = Buffer::with_capacity(
+                chunk_target - self.output_written,
+                &self.window.allowance(),
+            )?;
             self.decode_loop_until(chunk_target, &mut chunk)?;
             out.write_all(&chunk).map_err(Error::from)?;
         }
@@ -1753,7 +1852,7 @@ impl Unpack15 {
     }
 
     fn reset_non_solid(&mut self) {
-        self.window = [0; 0x10000];
+        self.window.fill(0);
         self.unp_ptr = 0;
         self.prev_ptr = 0;
         self.first_win_done = false;
@@ -2229,6 +2328,89 @@ mod tests {
     use crate::codec::Error;
 
     #[test]
+    fn reader15_workspace_refusals_release_window_input_output_and_checkpoint() {
+        use crate::codec::workspace::{Allowance, RefusingBudget};
+        let data = b"legacy reader owned capacity\n".repeat(32);
+        let packed = unpack15_encode(&data).unwrap();
+        for streaming in [false, true] {
+            let run = |budget: &RefusingBudget| -> super::Result<()> {
+                let mut decoder = super::Reader15State::with_allowance(budget)?;
+                if streaming {
+                    let mut output = super::Buffer::new(budget);
+                    decoder.decode_member_from_reader(
+                        &mut packed.as_slice(),
+                        data.len(),
+                        false,
+                        &mut output,
+                    )?;
+                    assert_eq!(&*output, &data);
+                } else {
+                    let output = decoder.decode_member(&packed, data.len(), false)?;
+                    assert_eq!(&*output, &data);
+                }
+                let checkpoint = decoder.try_clone()?;
+                assert_eq!(checkpoint.window, decoder.window);
+                Ok(())
+            };
+            let baseline = RefusingBudget::new(usize::MAX);
+            run(&baseline).unwrap();
+            let attempts = baseline.attempts();
+            assert!(attempts >= 5);
+            assert_eq!(baseline.used(), 0);
+            for index in 0..attempts {
+                let budget = RefusingBudget::new(index);
+                assert!(
+                    matches!(run(&budget), Err(Error::Cancelled)),
+                    "allocation {index}, streaming={streaming}"
+                );
+                assert_eq!(budget.used(), 0);
+            }
+        }
+        let limit = Allowance::limited(0xffff);
+        assert!(matches!(
+            super::Reader15State::with_allowance(&limit),
+            Err(Error::WorkspaceLimitExceeded(_))
+        ));
+        assert_eq!(limit.used(), 0);
+    }
+
+    #[test]
+    fn reader15_workspace_releases_input_and_chunk_on_sink_failure() {
+        use crate::codec::workspace::Allowance;
+        struct FailingSink;
+        impl std::io::Write for FailingSink {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "sink denied",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let data = b"legacy output failure".repeat(10);
+        let packed = unpack15_encode(&data).unwrap();
+        let ledger = Allowance::limited(128 * 1024);
+        let mut decoder = super::Reader15State::with_allowance(&ledger).unwrap();
+        assert!(matches!(
+            decoder.decode_member_from_reader(
+                &mut packed.as_slice(),
+                data.len(),
+                false,
+                &mut FailingSink
+            ),
+            Err(Error::Io(_))
+        ));
+        assert_eq!(
+            ledger.used(),
+            0x10000 + decoder.bits.input.capacity() as u64
+        );
+        drop(decoder);
+        assert_eq!(ledger.used(), 0);
+    }
+
+    #[test]
     fn cancellation_interrupts_buffered_symbol_work() {
         let data = b"cancellable legacy symbols ".repeat(16384);
         let packed = unpack15_encode(&data).unwrap();
@@ -2242,7 +2424,7 @@ mod tests {
                 .unwrap_err(),
             Error::Cancelled
         );
-        assert!(decoder.output_written > 0 && decoder.output_written < data.len());
+        assert!(decoder.state.output_written > 0 && decoder.state.output_written < data.len());
     }
     use super::{
         decode_num_bit_cost, find_long_lz, find_long_lz_with_buckets, find_lz_token,
@@ -2626,8 +2808,8 @@ mod tests {
                 if entry.is_stored() || entry.is_directory() {
                     continue;
                 }
-                decoder.token_stats = super::DecodeTokenStats::default();
-                decoder.old_distance_events.clear();
+                decoder.state.token_stats = super::DecodeTokenStats::default();
+                decoder.state.old_distance_events.clear();
                 decoder
                     .decode_member(
                         entry.packed_data(&archive).unwrap(),
@@ -2635,15 +2817,15 @@ mod tests {
                         entry.header.flags & 0x10 != 0,
                     )
                     .unwrap();
-                if decoder.token_stats.old_distance_matches != 0 {
+                if decoder.state.token_stats.old_distance_matches != 0 {
                     println!(
                         "  {}: {:?}",
                         String::from_utf8_lossy(&entry.name),
-                        decoder.token_stats
+                        decoder.state.token_stats
                     );
                     if let Ok(from) = std::env::var("RARS_RAR14_EVENT_FROM") {
                         let from: usize = from.parse().unwrap();
-                        for event in decoder.old_distance_events.iter().filter(|event| {
+                        for event in decoder.state.old_distance_events.iter().filter(|event| {
                             event.output_position >= from
                                 && event.output_position < from.saturating_add(500)
                         }) {
@@ -3025,18 +3207,23 @@ mod tests {
     }
 }
 
-#[derive(Clone)]
-struct BitReader {
-    input: Vec<u8>,
+struct ReaderBits<B: Budget> {
+    input: Buffer<u8, B>,
     bit_pos: usize,
 }
 
-impl BitReader {
-    fn new(input: &[u8]) -> Self {
-        Self {
-            input: input.to_vec(),
+impl<B: Budget> ReaderBits<B> {
+    fn with_allowance(input: &[u8], allowance: &B) -> Result<Self> {
+        Ok(Self {
+            input: Buffer::copied(input, allowance)?,
             bit_pos: 0,
-        }
+        })
+    }
+    fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            input: Buffer::copied(&self.input, &self.input.allowance())?,
+            bit_pos: self.bit_pos,
+        })
     }
 
     fn get_bits(&self) -> u32 {
@@ -3052,6 +3239,13 @@ impl BitReader {
 
     fn add_bits(&mut self, count: usize) {
         self.bit_pos += count;
+    }
+}
+
+#[cfg(test)]
+impl ReaderBits<Allowance> {
+    fn new(input: &[u8]) -> Self {
+        Self::with_allowance(input, &Allowance::default()).unwrap()
     }
 }
 
@@ -3081,6 +3275,8 @@ impl BitWriter {
 #[cfg(test)]
 mod solid_regressions {
     use super::*;
+    type Unpack15 = Reader15State<Allowance>;
+    type BitReader = ReaderBits<Allowance>;
 
     /// The options the RAR 1.3 writer uses at its default level.
     fn rar13_options() -> EncodeOptions {
@@ -3102,7 +3298,12 @@ mod solid_regressions {
         packed
             .iter()
             .zip(members)
-            .map(|(packed, member)| decoder.decode_member(packed, member.len(), true).unwrap())
+            .map(|(packed, member)| {
+                decoder
+                    .decode_member(packed, member.len(), true)
+                    .unwrap()
+                    .into_vec()
+            })
             .collect()
     }
 

@@ -420,6 +420,18 @@ impl<T> Buffer<T> {
     }
 }
 impl<B: Budget> Buffer<u8, B> {
+    pub(crate) fn read_to_end(&mut self, input: &mut impl std::io::Read) -> Result<()> {
+        let mut chunk = [0u8; 32 * 1024];
+        loop {
+            let len = match input.read(&mut chunk) {
+                Ok(0) => return Ok(()),
+                Ok(len) => len,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(Error::from(error)),
+            };
+            self.extend_from_slice(&chunk[..len]).map_err(Into::into)?;
+        }
+    }
     pub(crate) fn write_msb_bits(
         &mut self,
         bit_pos: &mut usize,
@@ -453,6 +465,16 @@ fn allocation_size<T>(capacity: usize) -> Result<u64> {
         .map(|bytes| bytes as u64)
         .ok_or(Error::InvalidData("codec capacity overflows"))
 }
+impl<B: Budget> std::io::Write for Buffer<u8, B> {
+    fn write(&mut self, values: &[u8]) -> std::io::Result<usize> {
+        self.extend_from_slice(values)
+            .map_err(|error| std::io::Error::other(crate::Error::from(error.into())))?;
+        Ok(values.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 impl<T, B: Budget> std::ops::Deref for Buffer<T, B> {
     type Target = [T];
     #[inline]
@@ -480,6 +502,20 @@ impl<T: PartialEq, B: Budget> PartialEq<Vec<T>> for Buffer<T, B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reader_buffer_writer_preserves_typed_workspace_failure() {
+        use std::io::Write;
+        let ledger = Allowance::limited(0);
+        let mut buffer = Buffer::new(&ledger);
+        let error = buffer.write_all(b"cannot fit").unwrap_err();
+        assert!(matches!(
+            Error::from(error),
+            Error::WorkspaceLimitExceeded(_)
+        ));
+        assert!(buffer.is_empty());
+        assert_eq!(ledger.used(), 0);
+    }
 
     #[test]
     fn reader_ring_preserves_capacity_charge_through_wrapped_conversion() {
