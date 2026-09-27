@@ -1,3 +1,4 @@
+use super::workspace::{Allowance, Budget, Buffer};
 use super::{Error, Result};
 
 const MAX_FREQ: u32 = 124;
@@ -59,10 +60,9 @@ enum AllocSide {
     Hi, // context headers
 }
 
-#[derive(Debug, Clone)]
-struct Suballocator {
+#[derive(Debug)]
+struct Suballocator<B: Budget = Allowance> {
     read_control: crate::read_control::ReadControl,
-    interrupted: bool,
     // Original pool size in bytes (C's p->Size). Preserved across restarts so
     // the text/units split — which depends on the exact byte size, not the
     // unit-truncated one — stays identical to the reference each restart.
@@ -84,7 +84,7 @@ struct Suballocator {
     lo_bump: u32,
     hi_bump: u32,
     // Free lists hold released block offsets (in units), one list per bucket.
-    free_lists: [Vec<u32>; N_BUCKETS],
+    free_lists: [Buffer<u32, B>; N_BUCKETS],
     // Countdown for the glue pass (spec §4.3). Starts at 0, gets refreshed
     // to GLUE_RESET after each successful glue.
     glue_count: u32,
@@ -93,12 +93,30 @@ struct Suballocator {
     unbounded: bool,
 }
 
-impl Default for Suballocator {
-    fn default() -> Self {
-        const EMPTY: Vec<u32> = Vec::new();
+impl<B: Budget> Suballocator<B> {
+    fn try_clone(&self) -> Result<Self> {
+        let allowance = self.free_lists[0].allowance();
+        let mut free_lists = std::array::from_fn(|_| Buffer::new(&allowance));
+        for (copy, original) in free_lists.iter_mut().zip(&self.free_lists) {
+            *copy = Buffer::copied(original, &allowance)?;
+        }
+        Ok(Self {
+            read_control: self.read_control.clone(),
+            size_bytes: self.size_bytes,
+            pool_units: self.pool_units,
+            rem: self.rem,
+            text_capacity_bytes: self.text_capacity_bytes,
+            units_start: self.units_start,
+            lo_bump: self.lo_bump,
+            hi_bump: self.hi_bump,
+            free_lists,
+            glue_count: self.glue_count,
+            unbounded: self.unbounded,
+        })
+    }
+    fn with_allowance(allowance: &B) -> Self {
         Self {
             read_control: crate::read_control::ReadControl::default(),
-            interrupted: false,
             size_bytes: 0,
             pool_units: 0,
             rem: 0,
@@ -106,14 +124,14 @@ impl Default for Suballocator {
             units_start: 0,
             lo_bump: 0,
             hi_bump: 0,
-            free_lists: [EMPTY; N_BUCKETS],
+            free_lists: std::array::from_fn(|_| Buffer::new(allowance)),
             glue_count: 0,
             unbounded: true,
         }
     }
 }
 
-impl Suballocator {
+impl<B: Budget> Suballocator<B> {
     fn reset(&mut self, pool_bytes: usize) {
         let pool_units_usize = pool_bytes / ALLOC_UNIT_BYTES;
         // Cap at u32::MAX-1 (NULL_OFFSET is u32::MAX). Even 256 MiB / 12 =
@@ -155,8 +173,15 @@ impl Suballocator {
         alloc_tables().index_to_units[bucket] as usize
     }
 
-    fn alloc(&mut self, units: usize, side: AllocSide, text_len_bytes: usize) -> Option<u32> {
-        let bucket = Self::bucket_for(units)?;
+    fn try_alloc(
+        &mut self,
+        units: usize,
+        side: AllocSide,
+        text_len_bytes: usize,
+    ) -> Result<Option<u32>> {
+        let Some(bucket) = Self::bucket_for(units) else {
+            return Ok(None);
+        };
         // Reference ordering differs by side. Lo-side state arrays go through
         // `Ppmd7_AllocUnits` (free_list first, then lo-bump, then rare). Hi-side
         // 1-unit context headers go through the inlined sequence in
@@ -168,18 +193,18 @@ impl Suballocator {
         match side {
             AllocSide::Hi => {
                 if let Some(offset) = self.try_bump(bucket, side) {
-                    return Some(offset);
+                    return Ok(Some(offset));
                 }
                 if let Some(offset) = self.free_lists[bucket].pop() {
-                    return Some(offset);
+                    return Ok(Some(offset));
                 }
             }
             AllocSide::Lo => {
                 if let Some(offset) = self.free_lists[bucket].pop() {
-                    return Some(offset);
+                    return Ok(Some(offset));
                 }
                 if let Some(offset) = self.try_bump(bucket, side) {
-                    return Some(offset);
+                    return Ok(Some(offset));
                 }
             }
         }
@@ -188,13 +213,10 @@ impl Suballocator {
         //   2. Walk upward through larger buckets; if found, split.
         //   3. Otherwise shrink units_start (consume text-reservation).
         if self.glue_count == 0 {
-            self.glue();
-            if self.interrupted {
-                return None;
-            }
+            self.glue_inner()?;
             self.glue_count = GLUE_RESET;
             if let Some(offset) = self.free_lists[bucket].pop() {
-                return Some(offset);
+                return Ok(Some(offset));
             }
         }
         for i in (bucket + 1)..N_BUCKETS {
@@ -202,12 +224,12 @@ impl Suballocator {
                 let large_size = Self::bucket_units(i) as u32;
                 let need = Self::bucket_units(bucket) as u32;
                 let leftover = large_size - need;
-                self.emit_run(offset + need, leftover);
-                return Some(offset);
+                self.emit_run(offset + need, leftover)?;
+                return Ok(Some(offset));
             }
         }
         self.glue_count = self.glue_count.saturating_sub(1);
-        self.fallback_bump(bucket, text_len_bytes)
+        Ok(self.fallback_bump(bucket, text_len_bytes))
     }
 
     // Spec / ref Ppmd7_AllocUnitsRare bump-fallback: when no free block at
@@ -260,13 +282,14 @@ impl Suballocator {
         }
     }
 
-    fn free(&mut self, offset: u32, units: usize) {
+    fn try_free(&mut self, offset: u32, units: usize) -> Result<()> {
         if offset == NULL_OFFSET {
-            return;
+            return Ok(());
         }
         if let Some(bucket) = Self::bucket_for(units) {
-            self.free_lists[bucket].push(offset);
+            self.free_lists[bucket].try_push(offset)?;
         }
+        Ok(())
     }
 
     // Ppmd7_SplitBlock: carve a block of `old_units` (bucket I2U value) down
@@ -274,7 +297,12 @@ impl Suballocator {
     // stay at `base_offset`; the (old_units - new_units) residue is pushed
     // onto the appropriate smaller bucket(s). The "kept" prefix is NOT
     // pushed — the caller is still using it as live storage.
-    fn split_in_place(&mut self, base_offset: u32, old_units: u32, new_units: u32) {
+    fn try_split_in_place(
+        &mut self,
+        base_offset: u32,
+        old_units: u32,
+        new_units: u32,
+    ) -> Result<()> {
         let nu = old_units - new_units;
         let residue_offset = base_offset + new_units;
         // Both inputs are distinct bucket sizes; their difference is 1..128.
@@ -286,18 +314,11 @@ impl Suballocator {
             // buckets is irrelevant; per-bucket LIFO is unaffected.
             let k = Self::bucket_units(i - 1) as u32;
             let small_bucket = (nu - k - 1) as usize;
-            self.free_lists[small_bucket].push(residue_offset + k);
+            self.free_lists[small_bucket].try_push(residue_offset + k)?;
             i -= 1;
         }
-        self.free_lists[i].push(residue_offset);
-    }
-
-    fn glue(&mut self) {
-        if self.glue_inner().is_err() {
-            // Allocation failure normally restarts the model. Keep cancellation
-            // distinct and let decode_symbol return it instead of resuming.
-            self.interrupted = true;
-        }
+        self.free_lists[i].try_push(residue_offset)?;
+        Ok(())
     }
 
     // Faithful port of Ppmd7_GlueFreeBlocks (§4.4). The earlier
@@ -313,21 +334,25 @@ impl Suballocator {
     //      <=128 remainder via Ppmd7_SplitBlock's exact-or-two-piece rule —
     //      not "largest bucket fitting" greedily.
     fn glue_inner(&mut self) -> Result<()> {
-        use std::collections::HashMap;
         let mut poller = self.read_control.poller();
         // Step 1: thread free blocks into the reference's list order.
-        // list[k] = (offset, nu). Reference prepends; we emulate with a
-        // front-growing build then it is naturally bucket-37-first.
-        let mut list: Vec<(u32, u32)> = Vec::new();
-        for bucket in 0..N_BUCKETS {
+        // list[k] = (offset, nu). The reference's prepend walk ends with
+        // bucket 37 first, each bucket in its original Vec order.
+        let allowance = self.free_lists[0].allowance();
+        let count = self.free_lists.iter().try_fold(0usize, |total, list| {
+            total
+                .checked_add(list.len())
+                .ok_or(Error::InvalidData("PPMd free-list size overflows"))
+        })?;
+        let mut list = Buffer::with_capacity(count, &allowance)?;
+        // Reversing the bucket order and visiting each bucket oldest-first
+        // produces exactly the prior head-first/prepend walk, without moving
+        // all previous entries for each insertion.
+        for bucket in (0..N_BUCKETS).rev() {
             let nu = Self::bucket_units(bucket) as u32;
-            // Reference walks the bucket list head-first (recent->oldest) and
-            // prepends each node. Iterating our Vec recent->oldest and
-            // prepending reproduces that; doing it per-bucket with the whole
-            // bucket prepended keeps later buckets in front.
-            for &off in self.free_lists[bucket].iter().rev() {
+            for &off in &self.free_lists[bucket] {
                 poller.check_codec(0)?;
-                list.insert(0, (off, nu));
+                list.push_admitted((off, nu));
             }
             self.free_lists[bucket].clear();
         }
@@ -338,12 +363,8 @@ impl Suballocator {
         // Step 2: glue pass. Absorb the physically-next free block while the
         // combined size stays < 0x10000. `nu_at` maps a block's start offset
         // to its current size; absorbed blocks are set to 0.
-        let mut nu_at: HashMap<u32, u32> = HashMap::with_capacity(list.len() * 2);
-        for &(off, nu) in &list {
-            poller.check_codec(0)?;
-            nu_at.insert(off, nu);
-        }
-        for &(off, _) in &list {
+        let mut nu_at = GlueIndex::new(&list, &allowance, &self.read_control)?;
+        for &(off, _) in list.iter() {
             poller.check_codec(0)?;
             let mut cur = match nu_at.get(&off) {
                 Some(&n) if n != 0 => n,
@@ -368,13 +389,13 @@ impl Suballocator {
         }
 
         // Step 3: fill pass in list order.
-        for &(off, _) in &list {
+        for &(off, _) in list.iter() {
             poller.check_codec(0)?;
             let nu = match nu_at.get(&off) {
                 Some(&n) if n != 0 => n,
                 _ => continue,
             };
-            self.emit_run(off, nu);
+            self.emit_run(off, nu)?;
         }
         Ok(())
     }
@@ -382,10 +403,10 @@ impl Suballocator {
     // Re-bucket a single merged run exactly as Ppmd7_GlueFreeBlocks' fill /
     // Ppmd7_SplitBlock do: peel 128-unit (bucket 37) blocks, then split the
     // <=128 remainder into its exact bucket, or two pieces when inexact.
-    fn emit_run(&mut self, mut offset: u32, mut remaining: u32) {
+    fn emit_run(&mut self, mut offset: u32, mut remaining: u32) -> Result<()> {
         const LAST_BUCKET: usize = N_BUCKETS - 1; // 37 == 128 units
         while remaining > MAX_BUCKET_UNITS as u32 {
-            self.push_free(LAST_BUCKET, offset);
+            self.push_free(LAST_BUCKET, offset)?;
             offset += MAX_BUCKET_UNITS as u32;
             remaining -= MAX_BUCKET_UNITS as u32;
         }
@@ -394,14 +415,15 @@ impl Suballocator {
         if Self::bucket_units(i) as u32 != remaining {
             let k = Self::bucket_units(i - 1) as u32;
             let small_bucket = (remaining - k - 1) as usize;
-            self.push_free(small_bucket, offset + k);
+            self.push_free(small_bucket, offset + k)?;
             i -= 1;
         }
-        self.push_free(i, offset);
+        self.push_free(i, offset)?;
+        Ok(())
     }
 
-    fn push_free(&mut self, bucket: usize, offset: u32) {
-        self.free_lists[bucket].push(offset);
+    fn push_free(&mut self, bucket: usize, offset: u32) -> Result<()> {
+        self.free_lists[bucket].try_push(offset)
     }
 
     fn text_has_room(&self, text_len: usize) -> bool {
@@ -427,6 +449,42 @@ pub trait PpmdByteReader {
 
 #[derive(Debug, Clone)]
 pub struct PpmdDecoder {
+    state: PpmdState<Allowance>,
+}
+impl Clone for PpmdState<Allowance> {
+    fn clone(&self) -> Self {
+        self.try_clone().expect("unlimited PPMd model copy")
+    }
+}
+impl PpmdDecoder {
+    pub fn new() -> Self {
+        Self {
+            state: PpmdState::with_allowance(&Allowance::default()),
+        }
+    }
+    pub(crate) fn set_read_control(&mut self, control: crate::read_control::ReadControl) {
+        self.state.set_read_control(control);
+    }
+    pub fn decode_init(
+        &mut self,
+        first_byte: u8,
+        input: &mut impl PpmdByteReader,
+        esc_char: &mut u8,
+    ) -> Result<()> {
+        self.state.decode_init(first_byte, input, esc_char)
+    }
+    pub fn decode_symbol(&mut self, input: &mut impl PpmdByteReader) -> Result<Option<u8>> {
+        self.state.decode_symbol(input)
+    }
+}
+#[cfg(test)]
+impl PpmdState<Allowance> {
+    fn new() -> Self {
+        Self::with_allowance(&Allowance::default())
+    }
+}
+#[derive(Debug)]
+pub(crate) struct PpmdState<B: Budget> {
     min_context: usize,
     max_context: usize,
     found_state: StateRef,
@@ -442,12 +500,12 @@ pub struct PpmdDecoder {
     bin_summ: [[u16; 64]; 128],
     see: [[See; 16]; 25],
     dummy_see: See,
-    contexts: Vec<Context>,
-    text: Vec<u8>,
+    contexts: Buffer<Context<B>, B>,
+    text: Buffer<u8, B>,
     range: RangeDecoder,
     allocated: bool,
     max_contexts: usize,
-    suballoc: Suballocator,
+    suballoc: Suballocator<B>,
 }
 
 #[derive(Debug, Clone)]
@@ -457,9 +515,9 @@ pub struct PpmdEncoder {
     esc_char: u8,
 }
 
-#[derive(Debug, Clone)]
-struct Context {
-    states: Vec<State>,
+#[derive(Debug)]
+struct Context<B: Budget = Allowance> {
+    states: Buffer<State, B>,
     summ_freq: u16,
     suffix: Option<usize>,
     // Simulated suballoc offsets so gluing (spec §4.3) can detect adjacency.
@@ -468,6 +526,18 @@ struct Context {
     // carry their state inline.
     header_offset: u32,
     array_offset: u32,
+}
+
+impl<B: Budget> Context<B> {
+    fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            states: Buffer::copied(&self.states, &self.states.allowance())?,
+            summ_freq: self.summ_freq,
+            suffix: self.suffix,
+            header_offset: self.header_offset,
+            array_offset: self.array_offset,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -504,11 +574,11 @@ struct RangeDecoder {
     low: u32,
 }
 
-impl PpmdDecoder {
+impl<B: Budget> PpmdState<B> {
     pub(crate) fn set_read_control(&mut self, control: crate::read_control::ReadControl) {
         self.suballoc.read_control = control;
     }
-    pub fn new() -> Self {
+    pub(crate) fn with_allowance(allowance: &B) -> Self {
         let mut ns2bs_indx = [0u8; 256];
         ns2bs_indx[0] = 0;
         ns2bs_indx[1] = 2;
@@ -557,12 +627,12 @@ impl PpmdDecoder {
                 shift: PERIOD_BITS,
                 count: 64,
             },
-            contexts: Vec::new(),
-            text: Vec::new(),
+            contexts: Buffer::new(allowance),
+            text: Buffer::new(allowance),
             range: RangeDecoder::new(),
             allocated: false,
             max_contexts: MIN_MODEL_CONTEXTS,
-            suballoc: Suballocator::default(),
+            suballoc: Suballocator::with_allowance(allowance),
         }
     }
 
@@ -577,6 +647,34 @@ impl PpmdDecoder {
         }
     }
 
+    pub(crate) fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            min_context: self.min_context,
+            max_context: self.max_context,
+            found_state: self.found_state,
+            order_fall: self.order_fall,
+            init_esc: self.init_esc,
+            prev_success: self.prev_success,
+            max_order: self.max_order,
+            hi_bits_flag: self.hi_bits_flag,
+            run_length: self.run_length,
+            init_rl: self.init_rl,
+            ns2bs_indx: self.ns2bs_indx,
+            ns2indx: self.ns2indx,
+            bin_summ: self.bin_summ,
+            see: self.see,
+            dummy_see: self.dummy_see,
+            contexts: Buffer::try_collect(
+                self.contexts.iter().map(Context::try_clone),
+                &self.contexts.allowance(),
+            )?,
+            text: Buffer::copied(&self.text, &self.text.allowance())?,
+            range: self.range.clone(),
+            allocated: self.allocated,
+            max_contexts: self.max_contexts,
+            suballoc: self.suballoc.try_clone()?,
+        })
+    }
     pub fn decode_init(
         &mut self,
         first_byte: u8,
@@ -605,7 +703,7 @@ impl PpmdDecoder {
             self.max_contexts = model_context_limit(dictionary_mb);
             self.suballoc
                 .reset(dictionary_mb.saturating_mul(1024 * 1024));
-            self.init_model(max_order);
+            self.init_model(max_order)?;
             self.allocated = true;
         } else if !self.allocated {
             return Err(Error::InvalidData("RAR PPMd block reuses missing model"));
@@ -617,12 +715,7 @@ impl PpmdDecoder {
         // Ordinary symbol/context work is bounded by the model order and the
         // 256-symbol alphabet; the enclosing decoder polls between symbols.
         // Free-list maintenance can traverse the whole model and polls itself.
-        let result = self.decode_symbol_inner(input);
-        if self.suballoc.interrupted {
-            Err(Error::Cancelled)
-        } else {
-            result
-        }
+        self.decode_symbol_inner(input)
     }
 
     fn decode_symbol_inner(&mut self, input: &mut impl PpmdByteReader) -> Result<Option<u8>> {
@@ -872,10 +965,8 @@ impl PpmdDecoder {
         }
     }
 
-    fn init_model(&mut self, max_order: usize) {
-        if self.suballoc.interrupted {
-            return;
-        }
+    fn init_model(&mut self, max_order: usize) -> Result<()> {
+        self.suballoc.read_control.check_codec()?;
         self.contexts.clear();
         self.text.clear();
         // Spec §5.2 RestartModel: clear free lists, reserve root context
@@ -892,11 +983,11 @@ impl PpmdDecoder {
         // At init time text is empty.
         let header_offset = self
             .suballoc
-            .alloc(1, AllocSide::Hi, 0)
+            .try_alloc(1, AllocSide::Hi, 0)?
             .unwrap_or(NULL_OFFSET);
         let array_offset = self
             .suballoc
-            .alloc(128, AllocSide::Lo, 0)
+            .try_alloc(128, AllocSide::Lo, 0)?
             .unwrap_or(NULL_OFFSET);
         self.max_order = max_order;
         self.order_fall = max_order;
@@ -904,20 +995,21 @@ impl PpmdDecoder {
         self.run_length = self.init_rl;
         self.prev_success = 0;
 
-        let states = (0..=255)
-            .map(|symbol| State {
+        let states = Buffer::collect(
+            (0..=255).map(|symbol| State {
                 symbol,
                 freq: 1,
                 successor: Successor::None,
-            })
-            .collect();
-        self.contexts.push(Context {
+            }),
+            &self.contexts.allowance(),
+        )?;
+        self.contexts.try_push(Context {
             states,
             summ_freq: 257,
             suffix: None,
             header_offset,
             array_offset,
-        });
+        })?;
         self.min_context = 0;
         self.max_context = 0;
         self.found_state = StateRef {
@@ -948,6 +1040,7 @@ impl PpmdDecoder {
             shift: PERIOD_BITS,
             count: 64,
         };
+        Ok(())
     }
 
     fn bin_summ_index(&mut self, state: State) -> Result<(usize, usize)> {
@@ -1027,7 +1120,7 @@ impl PpmdDecoder {
         self.contexts[fs.context].summ_freq = self.contexts[fs.context].summ_freq.wrapping_add(4);
         self.state_mut(fs)?.freq = (freq + 4) as u8;
         if freq + 4 > MAX_FREQ {
-            self.rescale();
+            self.rescale()?;
         }
         self.next_context()
     }
@@ -1046,7 +1139,7 @@ impl PpmdDecoder {
                 .swap(fs.index, fs.index - 1);
             self.found_state.index -= 1;
             if freq > MAX_FREQ {
-                self.rescale();
+                self.rescale()?;
             }
         }
         self.next_context()
@@ -1059,7 +1152,7 @@ impl PpmdDecoder {
         self.contexts[fs.context].summ_freq = self.contexts[fs.context].summ_freq.wrapping_add(4);
         self.state_mut(fs)?.freq = freq as u8;
         if freq > MAX_FREQ {
-            self.rescale();
+            self.rescale()?;
         }
         self.update_model()
     }
@@ -1116,8 +1209,8 @@ impl PpmdDecoder {
         }
 
         if self.order_fall == 0 {
-            let Some(context) = self.create_successors() else {
-                self.init_model(self.max_order);
+            let Some(context) = self.create_successors()? else {
+                self.init_model(self.max_order)?;
                 return Ok(());
             };
             self.max_context = context;
@@ -1131,10 +1224,10 @@ impl PpmdDecoder {
         // restarted one symbol later than the reference, advancing the range
         // coder by one extra symbol before resetting — which left the
         // post-restart state out of sync.
-        self.text.push(found_symbol);
+        self.text.try_push(found_symbol)?;
         let max_successor = Successor::Raw(self.text.len());
         if !self.suballoc.text_has_room(self.text.len()) {
-            self.init_model(self.max_order);
+            self.init_model(self.max_order)?;
             return Ok(());
         }
         let (min_context, had_successor) = match fs.successor {
@@ -1144,8 +1237,8 @@ impl PpmdDecoder {
             }
             Successor::Context(context) => (context, true),
             Successor::Raw(_) => {
-                let Some(context) = self.create_successors() else {
-                    self.init_model(self.max_order);
+                let Some(context) = self.create_successors()? else {
+                    self.init_model(self.max_order)?;
                     return Ok(());
                 };
                 (context, true)
@@ -1210,11 +1303,11 @@ impl PpmdDecoder {
                 sum += cf;
             }
             let old_n = self.contexts[c].states.len();
-            if !self.grow_state_array(c, old_n + 1) {
-                self.init_model(self.max_order);
+            if !self.grow_state_array(c, old_n + 1)? {
+                self.init_model(self.max_order)?;
                 return Ok(());
             }
-            self.contexts[c].states.push(State {
+            self.contexts[c].states.try_push(State {
                 symbol: found_symbol,
                 freq: cf as u8,
                 successor: if self.order_fall == 0 {
@@ -1222,7 +1315,7 @@ impl PpmdDecoder {
                 } else {
                     max_successor
                 },
-            });
+            })?;
             self.contexts[c].summ_freq = u16::try_from(sum)
                 .map_err(|_| Error::InvalidData("RAR PPMd model frequency overflows"))?;
             c = self.contexts[c].suffix.unwrap_or(mc);
@@ -1230,50 +1323,60 @@ impl PpmdDecoder {
         Ok(())
     }
 
-    fn create_successors(&mut self) -> Option<usize> {
-        let up_branch = match self.state(self.found_state).ok()?.successor {
+    fn create_successors(&mut self) -> Result<Option<usize>> {
+        // Missing links retain the reference model's restart path. Workspace
+        // refusal is propagated separately and must never restart the model.
+        macro_rules! pressure {
+            ($value:expr) => {
+                match $value {
+                    Some(value) => value,
+                    None => return Ok(None),
+                }
+            };
+        }
+        let up_branch = match pressure!(self.state(self.found_state).ok()).successor {
             Successor::Raw(pos) => pos,
-            Successor::Context(context) if self.order_fall == 0 => return Some(context),
-            _ => return None,
+            Successor::Context(context) if self.order_fall == 0 => return Ok(Some(context)),
+            _ => return Ok(None),
         };
         let mut c = self.min_context;
-        let mut ps = Vec::new();
+        let allowance = self.contexts.allowance();
+        let mut ps = Buffer::new(&allowance);
         if self.order_fall != 0 {
-            ps.push(self.found_state);
+            ps.try_push(self.found_state)?;
         }
         while let Some(suffix) = self.contexts[c].suffix {
             c = suffix;
-            let found_symbol = self.state(self.found_state).ok()?.symbol;
-            let index = self.contexts[c]
+            let found_symbol = pressure!(self.state(self.found_state).ok()).symbol;
+            let index = pressure!(self.contexts[c]
                 .states
                 .iter()
-                .position(|state| state.symbol == found_symbol)?;
+                .position(|state| state.symbol == found_symbol));
             let successor = self.contexts[c].states[index].successor;
             if successor != Successor::Raw(up_branch) {
                 if let Successor::Context(context) = successor {
                     c = context;
                     if ps.is_empty() {
-                        return Some(c);
+                        return Ok(Some(c));
                     }
                     break;
                 }
-                return None;
+                return Ok(None);
             }
-            ps.push(StateRef { context: c, index });
+            ps.try_push(StateRef { context: c, index })?;
         }
         if ps.is_empty() {
-            return Some(c);
+            return Ok(Some(c));
         }
-
-        let new_sym = *self.text.get(up_branch)?;
+        let new_sym = *pressure!(self.text.get(up_branch));
         let up_successor = Successor::Raw(up_branch + 1);
         let new_freq = if self.contexts[c].states.len() == 1 {
             self.contexts[c].states[0].freq
         } else {
-            let state = self.contexts[c]
+            let state = pressure!(self.contexts[c]
                 .states
                 .iter()
-                .find(|state| state.symbol == new_sym)?;
+                .find(|state| state.symbol == new_sym));
             let cf = state.freq as u32 - 1;
             let s0 = self.contexts[c].summ_freq as u32 - self.contexts[c].states.len() as u32 - cf;
             (1 + if 2 * cf <= s0 {
@@ -1282,41 +1385,49 @@ impl PpmdDecoder {
                 (2 * cf + 3 * s0 - 1) / (2 * s0)
             }) as u8
         };
-
         while let Some(state_ref) = ps.pop() {
-            let context = self.push_context(Context {
-                states: vec![State {
-                    symbol: new_sym,
-                    freq: new_freq,
-                    successor: up_successor,
-                }],
+            let context = pressure!(self.push_context(Context {
+                states: Buffer::filled(
+                    1,
+                    State {
+                        symbol: new_sym,
+                        freq: new_freq,
+                        successor: up_successor
+                    },
+                    &allowance
+                )?,
                 summ_freq: 0,
                 suffix: Some(c),
                 header_offset: NULL_OFFSET,
                 array_offset: NULL_OFFSET,
-            })?;
-            self.state_mut(state_ref).ok()?.successor = Successor::Context(context);
+            })?);
+            pressure!(self.state_mut(state_ref).ok()).successor = Successor::Context(context);
             c = context;
         }
-        Some(c)
+        Ok(Some(c))
     }
 
-    fn push_context(&mut self, mut context: Context) -> Option<usize> {
+    fn push_context(&mut self, mut context: Context<B>) -> Result<Option<usize>> {
         if self.contexts.len() >= self.max_contexts {
-            return None;
+            return Ok(None);
         }
         // 1 unit for the context header (Hi side); binary contexts (1 state)
         // carry their state inline, multi-state contexts also need a state
         // array (Lo side).
         let text_len = self.text.len();
-        let header_offset = self.suballoc.alloc(1, AllocSide::Hi, text_len)?;
+        let Some(header_offset) = self.suballoc.try_alloc(1, AllocSide::Hi, text_len)? else {
+            return Ok(None);
+        };
         let array_units = Self::state_array_units(context.states.len());
         let array_offset = if array_units > 0 {
-            match self.suballoc.alloc(array_units, AllocSide::Lo, text_len) {
+            match self
+                .suballoc
+                .try_alloc(array_units, AllocSide::Lo, text_len)?
+            {
                 Some(off) => off,
                 None => {
-                    self.suballoc.free(header_offset, 1);
-                    return None;
+                    self.suballoc.try_free(header_offset, 1)?;
+                    return Ok(None);
                 }
             }
         } else {
@@ -1325,8 +1436,8 @@ impl PpmdDecoder {
         context.header_offset = header_offset;
         context.array_offset = array_offset;
         let index = self.contexts.len();
-        self.contexts.push(context);
-        Some(index)
+        self.contexts.try_push(context)?;
+        Ok(Some(index))
     }
 
     // Grow a context's state array from its current size → `new_n` states.
@@ -1334,30 +1445,33 @@ impl PpmdDecoder {
     // otherwise allocate the new size first, then release the old slot. The
     // context's array_offset is updated to point at the new block when
     // moved.
-    fn grow_state_array(&mut self, ctx_idx: usize, new_n: usize) -> bool {
+    fn grow_state_array(&mut self, ctx_idx: usize, new_n: usize) -> Result<bool> {
         let old_n = self.contexts[ctx_idx].states.len();
         let old_units = Self::state_array_units(old_n);
         let new_units = Self::state_array_units(new_n);
         // Called only for old_n + 1 during UpdateModel. The new array has
         // positive size; unchanged bucket sizes are handled below.
         if old_units > 0 {
-            let old_b = Suballocator::bucket_for(old_units);
-            let new_b = Suballocator::bucket_for(new_units);
+            let old_b = Suballocator::<B>::bucket_for(old_units);
+            let new_b = Suballocator::<B>::bucket_for(new_units);
             if old_b == new_b {
-                return true;
+                return Ok(true);
             }
         }
         let text_len = self.text.len();
-        let new_offset = match self.suballoc.alloc(new_units, AllocSide::Lo, text_len) {
+        let new_offset = match self
+            .suballoc
+            .try_alloc(new_units, AllocSide::Lo, text_len)?
+        {
             Some(off) => off,
-            None => return false,
+            None => return Ok(false),
         };
         if old_units > 0 {
             let old_offset = self.contexts[ctx_idx].array_offset;
-            self.suballoc.free(old_offset, old_units);
+            self.suballoc.try_free(old_offset, old_units)?;
         }
         self.contexts[ctx_idx].array_offset = new_offset;
-        true
+        Ok(true)
     }
 
     // Rescale shrinks a state array. Mirrors Ppmd7_Rescale's branch at
@@ -1371,52 +1485,54 @@ impl PpmdDecoder {
     // Collapse-to-unary (new_n == 1, new_units == 0) is handled by Rescale's
     // earlier branch (Ppmd7.c:881-898), which frees `stats` at bucket
     // U2I(n0) and copies the surviving state into the inline OneState slot.
-    fn shrink_state_array(&mut self, ctx_idx: usize, old_n: usize, new_n: usize) {
+    fn shrink_state_array(&mut self, ctx_idx: usize, old_n: usize, new_n: usize) -> Result<()> {
         let old_units = Self::state_array_units(old_n);
         let new_units = Self::state_array_units(new_n);
         // Rescale starts with a multi-state context, so old_units is positive.
         if new_units >= old_units {
-            return;
+            return Ok(());
         }
         if new_units == 0 {
             // Collapse to unary: free the whole array, clear the pointer.
             let old_offset = self.contexts[ctx_idx].array_offset;
-            self.suballoc.free(old_offset, old_units);
+            self.suballoc.try_free(old_offset, old_units)?;
             self.contexts[ctx_idx].array_offset = NULL_OFFSET;
-            return;
+            return Ok(());
         }
         // Contexts contain at most 256 states, so both nonzero array sizes
         // are in the allocator's 1..=128-unit range.
-        let i0 = Suballocator::bucket_for(old_units).expect("old array fits a bucket");
-        let i1 = Suballocator::bucket_for(new_units).expect("new array fits a bucket");
+        let i0 = Suballocator::<B>::bucket_for(old_units).expect("old array fits a bucket");
+        let i1 = Suballocator::<B>::bucket_for(new_units).expect("new array fits a bucket");
         if i0 == i1 {
-            return;
+            return Ok(());
         }
         let old_offset = self.contexts[ctx_idx].array_offset;
         if let Some(swap_offset) = self.suballoc.free_lists[i1].pop() {
             // Swap path: take a same-sized block from the target bucket,
             // return the oversized block to its bucket. Data lives in
             // self.contexts[ctx_idx].states (Vec), so no MEM_12_CPY needed.
-            self.suballoc.free(old_offset, old_units);
+            self.suballoc.try_free(old_offset, old_units)?;
             self.contexts[ctx_idx].array_offset = swap_offset;
         } else {
             // SplitBlock in place: keep the first I2U(i1) units at the same
             // address, bucket the residue. Matches Ppmd7_SplitBlock.
-            let i0_units = Suballocator::bucket_units(i0) as u32;
-            let i1_units = Suballocator::bucket_units(i1) as u32;
-            self.suballoc.split_in_place(old_offset, i0_units, i1_units);
+            let i0_units = Suballocator::<B>::bucket_units(i0) as u32;
+            let i1_units = Suballocator::<B>::bucket_units(i1) as u32;
+            self.suballoc
+                .try_split_in_place(old_offset, i0_units, i1_units)?;
             // array_offset is unchanged.
         }
+        Ok(())
     }
 
-    fn rescale(&mut self) {
+    fn rescale(&mut self) -> Result<()> {
         let ctx = self.min_context;
         let original_state_count = self.contexts[ctx].states.len();
-        let mut states = self.contexts[ctx].states.clone();
+        let mut states = Buffer::copied(&self.contexts[ctx].states, &self.contexts.allowance())?;
         let found = self.found_state.index;
         if found != 0 {
             let state = states.remove(found);
-            states.insert(0, state);
+            states.insert(0, state)?;
             self.found_state.index = 0;
         }
         let mut sum_freq = states[0].freq as u32;
@@ -1447,15 +1563,16 @@ impl PpmdDecoder {
                 freq = (freq + 1) >> 1;
             }
             states[0].freq = freq as u8;
-            self.shrink_state_array(ctx, original_state_count, 1);
+            self.shrink_state_array(ctx, original_state_count, 1)?;
             self.contexts[ctx].states = states;
             self.found_state.index = 0;
-            return;
+            return Ok(());
         }
         self.contexts[ctx].summ_freq = (sum_freq + esc_freq - (esc_freq >> 1)) as u16;
-        self.shrink_state_array(ctx, original_state_count, states.len());
+        self.shrink_state_array(ctx, original_state_count, states.len())?;
         self.contexts[ctx].states = states;
         self.found_state.index = 0;
+        Ok(())
     }
 
     fn state(&self, state: StateRef) -> Result<State> {
@@ -1483,12 +1600,13 @@ impl PpmdEncoder {
             return Err(Error::InvalidData("RAR PPMd dictionary size is invalid"));
         }
         let mut model = PpmdDecoder::new();
-        model.max_contexts = model_context_limit(dictionary_mb);
+        model.state.max_contexts = model_context_limit(dictionary_mb);
         model
+            .state
             .suballoc
             .reset(dictionary_mb.saturating_mul(1024 * 1024));
-        model.init_model(max_order);
-        model.allocated = true;
+        model.state.init_model(max_order)?;
+        model.state.allocated = true;
         Ok(Self {
             model,
             range: RangeEncoder::new(),
@@ -1513,16 +1631,20 @@ impl PpmdEncoder {
 
     /// Ends the block and hands the model back for the next one to continue.
     pub fn finish_keeping_model(mut self) -> Result<(Vec<u8>, PpmdDecoder)> {
-        self.model.encode_symbol(self.esc_char, &mut self.range)?;
-        self.model.encode_symbol(2, &mut self.range)?;
+        self.model
+            .state
+            .encode_symbol(self.esc_char, &mut self.range)?;
+        self.model.state.encode_symbol(2, &mut self.range)?;
         Ok((self.range.finish(), self.model))
     }
 
     /// Ends this PPMd block while keeping the member open for another block.
     #[cfg(test)]
     pub(crate) fn finish_block_keeping_model(mut self) -> Result<(Vec<u8>, PpmdDecoder)> {
-        self.model.encode_symbol(self.esc_char, &mut self.range)?;
-        self.model.encode_symbol(0, &mut self.range)?;
+        self.model
+            .state
+            .encode_symbol(self.esc_char, &mut self.range)?;
+        self.model.state.encode_symbol(0, &mut self.range)?;
         Ok((self.range.finish(), self.model))
     }
 
@@ -1537,18 +1659,20 @@ impl PpmdEncoder {
         command: u8,
         parameters: &[u8],
     ) -> Result<Vec<u8>> {
-        self.model.encode_symbol(self.esc_char, &mut self.range)?;
-        self.model.encode_symbol(command, &mut self.range)?;
+        self.model
+            .state
+            .encode_symbol(self.esc_char, &mut self.range)?;
+        self.model.state.encode_symbol(command, &mut self.range)?;
         for &parameter in parameters {
-            self.model.encode_symbol(parameter, &mut self.range)?;
+            self.model.state.encode_symbol(parameter, &mut self.range)?;
         }
         Ok(self.range.finish())
     }
 
     pub fn encode_literal(&mut self, symbol: u8) -> Result<()> {
-        self.model.encode_symbol(symbol, &mut self.range)?;
+        self.model.state.encode_symbol(symbol, &mut self.range)?;
         if symbol == self.esc_char {
-            self.model.encode_symbol(1, &mut self.range)?;
+            self.model.state.encode_symbol(1, &mut self.range)?;
         }
         Ok(())
     }
@@ -1559,9 +1683,12 @@ impl PpmdEncoder {
                 "RAR PPMd offset-one repeat length is invalid",
             ));
         }
-        self.model.encode_symbol(self.esc_char, &mut self.range)?;
-        self.model.encode_symbol(5, &mut self.range)?;
         self.model
+            .state
+            .encode_symbol(self.esc_char, &mut self.range)?;
+        self.model.state.encode_symbol(5, &mut self.range)?;
+        self.model
+            .state
             .encode_symbol((length - 4) as u8, &mut self.range)?;
         Ok(())
     }
@@ -1571,24 +1698,32 @@ impl PpmdEncoder {
             return Err(Error::InvalidData("RAR PPMd match is invalid"));
         }
         let encoded_offset = offset - 2;
-        self.model.encode_symbol(self.esc_char, &mut self.range)?;
-        self.model.encode_symbol(4, &mut self.range)?;
         self.model
+            .state
+            .encode_symbol(self.esc_char, &mut self.range)?;
+        self.model.state.encode_symbol(4, &mut self.range)?;
+        self.model
+            .state
             .encode_symbol(((encoded_offset >> 16) & 0xff) as u8, &mut self.range)?;
         self.model
+            .state
             .encode_symbol(((encoded_offset >> 8) & 0xff) as u8, &mut self.range)?;
         self.model
+            .state
             .encode_symbol((encoded_offset & 0xff) as u8, &mut self.range)?;
         self.model
+            .state
             .encode_symbol((length - 32) as u8, &mut self.range)?;
         Ok(())
     }
 
     pub fn encode_vm_filter_record(&mut self, record: &[u8]) -> Result<()> {
-        self.model.encode_symbol(self.esc_char, &mut self.range)?;
-        self.model.encode_symbol(3, &mut self.range)?;
+        self.model
+            .state
+            .encode_symbol(self.esc_char, &mut self.range)?;
+        self.model.state.encode_symbol(3, &mut self.range)?;
         for &byte in record {
-            self.model.encode_symbol(byte, &mut self.range)?;
+            self.model.state.encode_symbol(byte, &mut self.range)?;
         }
         Ok(())
     }
@@ -1731,6 +1866,94 @@ fn hi_bits_flag(symbol: u8, bits: u32) -> u32 {
     ((symbol as u32 + 0xc0) >> (8 - bits)) & (1 << bits)
 }
 
+#[cfg(test)]
+impl Default for Suballocator<Allowance> {
+    fn default() -> Self {
+        Self::with_allowance(&Allowance::default())
+    }
+}
+#[cfg(test)]
+impl Suballocator<Allowance> {
+    fn alloc(&mut self, units: usize, side: AllocSide, text_len_bytes: usize) -> Option<u32> {
+        self.try_alloc(units, side, text_len_bytes)
+            .expect("unlimited arena allocation")
+    }
+    fn free(&mut self, offset: u32, units: usize) {
+        self.try_free(offset, units).unwrap();
+    }
+    fn split_in_place(&mut self, base: u32, old: u32, new: u32) {
+        self.try_split_in_place(base, old, new).unwrap();
+    }
+    fn glue(&mut self) {
+        self.glue_inner().expect("unlimited glue maintenance");
+    }
+}
+/// Keep the glue walk's original order while admitting an exact allocation
+/// for its offset lookup. The last original entry wins for duplicate offsets,
+/// matching the previous map's insert semantics without opaque hash-table RAM.
+struct GlueIndex<B: Budget> {
+    entries: Buffer<Option<(u32, u32)>, B>,
+}
+impl<B: Budget> GlueIndex<B> {
+    fn new(
+        list: &[(u32, u32)],
+        allowance: &B,
+        control: &crate::read_control::ReadControl,
+    ) -> Result<Self> {
+        control.check_codec()?;
+        if list.is_empty() {
+            return Ok(Self {
+                entries: Buffer::new(allowance),
+            });
+        }
+        let count = list
+            .len()
+            .checked_mul(2)
+            .and_then(usize::checked_next_power_of_two)
+            .ok_or(Error::InvalidData("PPMd glue lookup size overflows"))?;
+        let mut out = Self {
+            entries: Buffer::filled(count, None, allowance)?,
+        };
+        let mut poller = control.poller();
+        for &(offset, units) in list {
+            poller.check_codec(0)?;
+            out.insert(offset, units);
+        }
+        Ok(out)
+    }
+    fn hash(mut value: u32) -> usize {
+        value ^= value >> 16;
+        value = value.wrapping_mul(0x85eb_ca6b);
+        value ^= value >> 13;
+        value = value.wrapping_mul(0xc2b2_ae35);
+        (value ^ (value >> 16)) as usize
+    }
+    fn slot(&self, offset: u32) -> Option<usize> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let mask = self.entries.len() - 1;
+        let mut index = Self::hash(offset) & mask;
+        loop {
+            match self.entries[index] {
+                Some((key, _)) if key != offset => index = (index + 1) & mask,
+                _ => return Some(index),
+            }
+        }
+    }
+    fn get(&self, offset: &u32) -> Option<&u32> {
+        self.entries[self.slot(*offset)?]
+            .as_ref()
+            .map(|(_, units)| units)
+    }
+    fn insert(&mut self, offset: u32, units: u32) {
+        let index = self
+            .slot(offset)
+            .expect("glue inserts into a nonempty lookup");
+        self.entries[index] = Some((offset, units));
+    }
+}
+
 // Upper bound on the number of live context records. The C reference
 // (Ppmd7.c) has NO independent context cap — model restart is driven solely
 // by suballocator exhaustion (`Ppmd7_AllocUnits`/`AllocUnitsRare` returning
@@ -1751,6 +1974,142 @@ fn model_context_limit(dictionary_mb: usize) -> usize {
 #[cfg(test)]
 mod tests {
 
+    fn refuse_each_ppmd_allocation(
+        mut run: impl FnMut(&crate::codec::workspace::RefusingBudget) -> Result<()>,
+    ) {
+        use crate::codec::workspace::RefusingBudget;
+        let baseline = RefusingBudget::new(usize::MAX);
+        run(&baseline).unwrap();
+        let attempts = baseline.attempts();
+        assert!(attempts > 0);
+        assert_eq!(baseline.used(), 0);
+        for index in 0..attempts {
+            let budget = RefusingBudget::new(index);
+            assert!(
+                matches!(run(&budget), Err(Error::Cancelled)),
+                "allocation {index}"
+            );
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    #[test]
+    fn reader_ppmd_workspace_refusals_release_contexts_states_text_and_checkpoints() {
+        let data = b"abracadabra and evolving contexts abracadabra";
+        let mut encoder = PpmdEncoder::new(4, 2, 1).unwrap();
+        for &byte in data {
+            encoder.encode_literal(byte).unwrap();
+        }
+        let (packed, _) = encoder.finish_keeping_model().unwrap();
+        refuse_each_ppmd_allocation(|budget| {
+            let mut model = PpmdState::with_allowance(budget);
+            model.max_contexts = model_context_limit(1);
+            model.suballoc.reset(1024 * 1024);
+            model.init_model(4)?;
+            let mut input = Bytes { input: &packed };
+            model.range.init(&mut input)?;
+            for &byte in data {
+                assert_eq!(model.decode_symbol(&mut input)?, Some(byte));
+            }
+            let checkpoint = model.try_clone()?;
+            assert_eq!(checkpoint.contexts.len(), model.contexts.len());
+            assert_eq!(checkpoint.text, model.text);
+            assert_eq!(
+                checkpoint.contexts[0].states[0].freq,
+                model.contexts[0].states[0].freq
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn reader_ppmd_workspace_refusals_release_free_lists_and_glue_lookup() {
+        refuse_each_ppmd_allocation(|budget| {
+            let mut allocator = super::Suballocator::with_allowance(budget);
+            allocator.reset(32 * ALLOC_UNIT_BYTES);
+            for offset in [10, 11, 20, 21] {
+                allocator.try_free(offset, 1)?;
+            }
+            allocator.glue_inner()?;
+            assert_eq!(&*allocator.free_lists[1], &[10, 20]);
+            let checkpoint = allocator.try_clone()?;
+            assert_eq!(checkpoint.free_lists[1], allocator.free_lists[1]);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn reader_ppmd_workspace_refusal_is_not_an_arena_restart() {
+        let ledger = Allowance::limited(1);
+        let mut model = PpmdState::with_allowance(&ledger);
+        let mut input = Bytes { input: &[0; 5] };
+        let mut escape = 2;
+        assert!(matches!(
+            model.decode_init(0x20 | 3, &mut input, &mut escape),
+            Err(Error::WorkspaceLimitExceeded(_))
+        ));
+        assert!(!model.allocated);
+        assert!(model.contexts.is_empty());
+        assert_eq!(ledger.used(), 0);
+    }
+
+    #[test]
+    fn reader_ppmd_glue_index_probes_collisions_wraps_and_accepts_zero_offsets() {
+        let keys: Vec<_> = (0..1000u32)
+            .filter(|&key| GlueIndex::<Allowance>::hash(key) & 7 == 7)
+            .take(3)
+            .collect();
+        let list: Vec<_> = keys
+            .iter()
+            .enumerate()
+            .map(|(index, &key)| (key, index as u32 + 1))
+            .collect();
+        let ledger = Allowance::limited(1024);
+        let control = crate::read_control::ReadControl::default();
+        let mut index = GlueIndex::new(&list, &ledger, &control).unwrap();
+        assert_eq!(index.entries.len(), 8);
+        assert!(
+            index.entries[7].is_some() && index.entries[0].is_some() && index.entries[1].is_some()
+        );
+        for &(key, units) in &list {
+            assert_eq!(index.get(&key), Some(&units));
+        }
+        index.insert(keys[1], 0);
+        assert_eq!(index.get(&keys[1]), Some(&0));
+        assert_eq!(index.get(&u32::MAX), None);
+        drop(index);
+        let zero = GlueIndex::new(&[(0, 1), (u32::MAX, 2)], &ledger, &control).unwrap();
+        assert_eq!(zero.get(&0), Some(&1));
+        assert_eq!(zero.get(&u32::MAX), Some(&2));
+        drop(zero);
+        let empty = GlueIndex::new(&[], &ledger, &control).unwrap();
+        assert_eq!(empty.get(&0), None);
+        assert_eq!(ledger.used(), 0);
+    }
+
+    #[test]
+    fn reader_ppmd_glue_index_matches_map_lookup_and_duplicate_overwrites() {
+        let list = [(10, 1), (4, 3), (10, 8), (20, 2), (4, 5)];
+        let ledger = Allowance::limited(1024);
+        let mut index =
+            GlueIndex::new(&list, &ledger, &crate::read_control::ReadControl::default()).unwrap();
+        let mut reference: std::collections::HashMap<_, _> = list.into_iter().collect();
+        for key in [0, 4, 10, 20, 21, u32::MAX] {
+            assert_eq!(index.get(&key), reference.get(&key));
+        }
+        for (key, value) in [(10, 0), (4, 7), (20, 0)] {
+            index.insert(key, value);
+            reference.insert(key, value);
+            assert_eq!(index.get(&key), reference.get(&key));
+        }
+        assert_eq!(
+            ledger.used(),
+            index.entries.capacity() as u64 * std::mem::size_of::<Option<(u32, u32)>>() as u64
+        );
+        drop(index);
+        assert_eq!(ledger.used(), 0);
+    }
+
     #[test]
     fn cancellation_interrupts_suballocator_maintenance() {
         let token = crate::ReadCancellation::new();
@@ -1760,12 +2119,13 @@ mod tests {
             read_control: control,
             ..Suballocator::default()
         };
-        allocator.free_lists[0] = (0..5000).collect();
-        allocator.glue();
-        assert!(allocator.interrupted);
+        allocator.free_lists[0] = (0..5000).collect::<Vec<_>>().into();
+        assert_eq!(allocator.glue_inner(), Err(Error::Cancelled));
         assert!(token.is_cancelled());
     }
     use super::*;
+    type PpmdDecoder = PpmdState<Allowance>;
+    type Suballocator = super::Suballocator<Allowance>;
 
     #[test]
     fn alloc_tables_match_spec_pattern() {
@@ -1840,7 +2200,7 @@ mod tests {
         s.free(NULL_OFFSET, 1);
         s.free(1, 0);
         s.free(1, MAX_BUCKET_UNITS + 1);
-        assert!(s.free_lists.iter().all(Vec::is_empty));
+        assert!(s.free_lists.iter().all(|list| list.is_empty()));
     }
 
     #[test]
@@ -1926,9 +2286,8 @@ mod tests {
         while s.hi_bump > s.lo_bump {
             s.alloc(1, AllocSide::Lo, 0).unwrap();
         }
-        s.free_lists[0] = (0..5000).collect();
-        assert_eq!(s.alloc(2, AllocSide::Lo, 0), None);
-        assert!(s.interrupted);
+        s.free_lists[0] = (0..5000).collect::<Vec<_>>().into();
+        assert_eq!(s.try_alloc(2, AllocSide::Lo, 0), Err(Error::Cancelled));
         assert!(token.is_cancelled());
     }
 
@@ -2018,7 +2377,7 @@ mod tests {
         // A 16-bit NU cannot hold 65536 units. Populate the same 512 adjacent
         // 128-unit free blocks without allocating a huge backing pool.
         let bucket = Suballocator::bucket_for(128).unwrap();
-        s.free_lists[bucket] = (0..512).map(|i| i * 128).collect();
+        s.free_lists[bucket] = (0..512).map(|i| i * 128).collect::<Vec<_>>().into();
         s.glue();
         assert_eq!(s.free_lists[bucket].len(), 512);
         assert_eq!(s.free_lists[bucket].iter().copied().min(), Some(0));
@@ -2028,12 +2387,12 @@ mod tests {
     #[test]
     fn glue_emits_exact_128_unit_chunks_and_inexact_remainder() {
         let mut s = Suballocator::default();
-        s.emit_run(10, 256);
+        s.emit_run(10, 256).unwrap();
         let full = Suballocator::bucket_for(128).unwrap();
         assert_eq!(s.free_lists[full], vec![10, 138]);
 
         // Five units have no dedicated bucket: split into four plus one.
-        s.emit_run(300, 5);
+        s.emit_run(300, 5).unwrap();
         assert_eq!(s.free_lists[3], vec![300]);
         assert_eq!(s.free_lists[0], vec![304]);
     }
@@ -2192,7 +2551,7 @@ mod tests {
     #[test]
     fn decoder_reports_invalid_range_and_frequency_sum() {
         let mut decoder = PpmdDecoder::new();
-        decoder.init_model(4);
+        decoder.init_model(4).unwrap();
         let mut input = Bytes { input: &[] };
         decoder.range.range = 1;
         assert_eq!(
@@ -2213,26 +2572,32 @@ mod tests {
     fn decoder_rejects_invalid_escape_range_and_symbol() {
         fn escaping_model(code_delta: u32) -> PpmdDecoder {
             let mut decoder = PpmdDecoder::new();
-            decoder.init_model(4);
+            decoder.init_model(4).unwrap();
             let state = |symbol| State {
                 symbol,
                 freq: 1,
                 successor: Successor::None,
             };
-            decoder.contexts.push(Context {
-                states: vec![state(b'a'), state(b'b'), state(b'c')],
-                summ_freq: 4,
-                suffix: Some(0),
-                header_offset: NULL_OFFSET,
-                array_offset: NULL_OFFSET,
-            });
-            decoder.contexts.push(Context {
-                states: vec![state(b'a'), state(b'b')],
-                summ_freq: 3,
-                suffix: Some(1),
-                header_offset: NULL_OFFSET,
-                array_offset: NULL_OFFSET,
-            });
+            decoder
+                .contexts
+                .push(Context {
+                    states: vec![state(b'a'), state(b'b'), state(b'c')].into(),
+                    summ_freq: 4,
+                    suffix: Some(0),
+                    header_offset: NULL_OFFSET,
+                    array_offset: NULL_OFFSET,
+                })
+                .unwrap();
+            decoder
+                .contexts
+                .push(Context {
+                    states: vec![state(b'a'), state(b'b')].into(),
+                    summ_freq: 3,
+                    suffix: Some(1),
+                    header_offset: NULL_OFFSET,
+                    array_offset: NULL_OFFSET,
+                })
+                .unwrap();
             decoder.min_context = 2;
             decoder.range.range = 100_000;
             // The first escape leaves a 33_333-unit range straddling TOP.
@@ -2261,17 +2626,13 @@ mod tests {
     }
 
     #[test]
-    fn root_escape_ends_ppmd_stream_and_interruption_takes_precedence() {
+    fn root_escape_ends_ppmd_stream() {
         let mut decoder = PpmdDecoder::new();
-        decoder.init_model(4);
+        decoder.init_model(4).unwrap();
         let total = decoder.contexts[0].summ_freq as u32;
         decoder.range.code = 256 * (decoder.range.range / total);
         let mut input = Bytes { input: &[0; 16] };
         assert_eq!(decoder.decode_symbol(&mut input), Ok(None));
-
-        decoder.init_model(4);
-        decoder.suballoc.interrupted = true;
-        assert_eq!(decoder.decode_symbol(&mut input), Err(Error::Cancelled));
     }
 
     #[test]
@@ -2315,7 +2676,7 @@ mod tests {
     #[test]
     fn see_counter_ages_and_dummy_accumulates_without_aging() {
         let mut decoder = PpmdDecoder::new();
-        decoder.init_model(4);
+        decoder.init_model(4).unwrap();
         decoder.see[0][0] = See {
             summ: 7,
             shift: PERIOD_BITS - 1,
@@ -2358,7 +2719,7 @@ mod tests {
     #[test]
     fn encoder_rejects_corrupt_frequency_sum_and_missing_root_symbol() {
         let mut decoder = PpmdDecoder::new();
-        decoder.init_model(4);
+        decoder.init_model(4).unwrap();
         decoder.contexts[0].states.truncate(2);
         decoder.contexts[0].summ_freq = 2;
         assert_eq!(
@@ -2366,7 +2727,7 @@ mod tests {
             Err(Error::InvalidData("RAR PPMd frequency sum is invalid"))
         );
 
-        decoder.init_model(4);
+        decoder.init_model(4).unwrap();
         decoder.contexts[0].states.truncate(2);
         decoder.contexts[0].summ_freq = 3;
         assert_eq!(
@@ -2413,16 +2774,18 @@ mod tests {
     fn context_allocation_respects_dictionary_limit() {
         let mut decoder = PpmdDecoder::new();
         decoder.max_contexts = 1;
-        decoder.init_model(4);
+        decoder.init_model(4).unwrap();
 
         assert_eq!(
-            decoder.push_context(Context {
-                states: Vec::new(),
-                summ_freq: 0,
-                suffix: None,
-                header_offset: NULL_OFFSET,
-                array_offset: NULL_OFFSET,
-            }),
+            decoder
+                .push_context(Context {
+                    states: Buffer::new(&Allowance::default()),
+                    summ_freq: 0,
+                    suffix: None,
+                    header_offset: NULL_OFFSET,
+                    array_offset: NULL_OFFSET,
+                })
+                .unwrap(),
             None
         );
     }
@@ -2438,13 +2801,13 @@ mod tests {
             successor: Successor::None,
         };
         let context = Context {
-            states: vec![state; 256],
+            states: vec![state; 256].into(),
             summ_freq: 257,
             suffix: None,
             header_offset: NULL_OFFSET,
             array_offset: NULL_OFFSET,
         };
-        assert_eq!(decoder.push_context(context), None);
+        assert_eq!(decoder.push_context(context).unwrap(), None);
         assert_eq!(decoder.suballoc.free_lists[0].len(), 1);
         assert!(decoder.contexts.is_empty());
     }
@@ -2452,11 +2815,12 @@ mod tests {
     #[test]
     fn model_restarts_at_text_boundary_and_failed_successor_creation() {
         let mut decoder = PpmdDecoder::new();
-        decoder.init_model(4);
+        decoder.init_model(4).unwrap();
         decoder.suballoc.reset(16 * ALLOC_UNIT_BYTES);
         decoder
             .text
-            .resize(decoder.suballoc.text_capacity_bytes - 1, 0);
+            .resize(decoder.suballoc.text_capacity_bytes - 1, 0)
+            .unwrap();
         decoder.update_model().unwrap();
         assert!(decoder.text.is_empty());
         assert_eq!(decoder.contexts.len(), 1);
@@ -2474,7 +2838,7 @@ mod tests {
     fn model_restarts_when_an_ancestor_state_array_cannot_grow() {
         let mut decoder = PpmdDecoder::new();
         decoder.max_contexts = 10;
-        decoder.init_model(4);
+        decoder.init_model(4).unwrap();
         let state = |symbol| State {
             symbol,
             freq: 1,
@@ -2482,30 +2846,33 @@ mod tests {
         };
         let ancestor = decoder
             .push_context(Context {
-                states: vec![state(b'a'), state(b'b')],
+                states: vec![state(b'a'), state(b'b')].into(),
                 summ_freq: 3,
                 suffix: Some(0),
                 header_offset: NULL_OFFSET,
                 array_offset: NULL_OFFSET,
             })
+            .unwrap()
             .unwrap();
         let selected = decoder
             .push_context(Context {
-                states: vec![state(b'c'), state(b'd')],
+                states: vec![state(b'c'), state(b'd')].into(),
                 summ_freq: 3,
                 suffix: Some(ancestor),
                 header_offset: NULL_OFFSET,
                 array_offset: NULL_OFFSET,
             })
+            .unwrap()
             .unwrap();
         let expanded = decoder
             .push_context(Context {
-                states: vec![state(b'a'), state(b'b')],
+                states: vec![state(b'a'), state(b'b')].into(),
                 summ_freq: 3,
                 suffix: Some(selected),
                 header_offset: NULL_OFFSET,
                 array_offset: NULL_OFFSET,
             })
+            .unwrap()
             .unwrap();
         decoder.min_context = selected;
         decoder.max_context = expanded;
@@ -2518,7 +2885,8 @@ mod tests {
         decoder.suballoc.reset(16 * ALLOC_UNIT_BYTES);
         decoder
             .text
-            .resize(decoder.suballoc.text_capacity_bytes - 2, 0);
+            .resize(decoder.suballoc.text_capacity_bytes - 2, 0)
+            .unwrap();
         while decoder.suballoc.hi_bump > decoder.suballoc.lo_bump {
             decoder.suballoc.alloc(1, AllocSide::Lo, 0).unwrap();
         }
@@ -2533,7 +2901,7 @@ mod tests {
         fn chain(existing_successor: Successor) -> (PpmdDecoder, usize) {
             let mut decoder = PpmdDecoder::new();
             decoder.max_contexts = 10;
-            decoder.init_model(4);
+            decoder.init_model(4).unwrap();
             let state = |symbol, successor| State {
                 symbol,
                 freq: 1,
@@ -2541,33 +2909,37 @@ mod tests {
             };
             let ancestor = decoder
                 .push_context(Context {
-                    states: vec![state(b'a', Successor::None), state(b'b', Successor::None)],
+                    states: vec![state(b'a', Successor::None), state(b'b', Successor::None)].into(),
                     summ_freq: 3,
                     suffix: Some(0),
                     header_offset: NULL_OFFSET,
                     array_offset: NULL_OFFSET,
                 })
+                .unwrap()
                 .unwrap();
             let selected = decoder
                 .push_context(Context {
                     states: vec![
                         state(b'c', existing_successor),
                         state(b'd', Successor::None),
-                    ],
+                    ]
+                    .into(),
                     summ_freq: 3,
                     suffix: Some(ancestor),
                     header_offset: NULL_OFFSET,
                     array_offset: NULL_OFFSET,
                 })
+                .unwrap()
                 .unwrap();
             let expanded = decoder
                 .push_context(Context {
-                    states: vec![state(b'a', Successor::None), state(b'b', Successor::None)],
+                    states: vec![state(b'a', Successor::None), state(b'b', Successor::None)].into(),
                     summ_freq: 3,
                     suffix: Some(selected),
                     header_offset: NULL_OFFSET,
                     array_offset: NULL_OFFSET,
                 })
+                .unwrap()
                 .unwrap();
             decoder.min_context = selected;
             decoder.max_context = expanded;
@@ -2586,7 +2958,7 @@ mod tests {
             decoder.contexts[expanded].states[2].successor,
             Successor::Raw(1)
         );
-        assert_eq!(decoder.text, b"c");
+        assert_eq!(&*decoder.text, b"c");
 
         let (mut decoder, expanded) = chain(Successor::Context(2));
         decoder.update_model().unwrap();
@@ -2603,15 +2975,16 @@ mod tests {
         fn chain(suffix: Vec<State>, symbol: u8) -> (PpmdDecoder, usize) {
             let mut decoder = PpmdDecoder::new();
             decoder.max_contexts = 10;
-            decoder.init_model(4);
+            decoder.init_model(4).unwrap();
             let ancestor = decoder
                 .push_context(Context {
                     summ_freq: suffix.iter().map(|s| s.freq as u16).sum::<u16>() + 1,
-                    states: suffix,
+                    states: suffix.into(),
                     suffix: Some(0),
                     header_offset: NULL_OFFSET,
                     array_offset: NULL_OFFSET,
                 })
+                .unwrap()
                 .unwrap();
             let selected = decoder
                 .push_context(Context {
@@ -2619,12 +2992,14 @@ mod tests {
                         symbol,
                         freq: 2,
                         successor: Successor::None,
-                    }],
+                    }]
+                    .into(),
                     summ_freq: 0,
                     suffix: Some(ancestor),
                     header_offset: NULL_OFFSET,
                     array_offset: NULL_OFFSET,
                 })
+                .unwrap()
                 .unwrap();
             decoder.min_context = selected;
             decoder.max_context = selected;
@@ -2666,19 +3041,21 @@ mod tests {
     fn successor_creation_materializes_raw_chain_and_handles_limits() {
         let mut decoder = PpmdDecoder::new();
         decoder.max_contexts = 10;
-        decoder.init_model(4);
+        decoder.init_model(4).unwrap();
         let selected = decoder
             .push_context(Context {
                 states: vec![State {
                     symbol: b'a',
                     freq: 2,
                     successor: Successor::Raw(0),
-                }],
+                }]
+                .into(),
                 summ_freq: 0,
                 suffix: Some(0),
                 header_offset: NULL_OFFSET,
                 array_offset: NULL_OFFSET,
             })
+            .unwrap()
             .unwrap();
         decoder.contexts[0].states[b'a' as usize].successor = Successor::Raw(0);
         decoder.min_context = selected;
@@ -2687,16 +3064,16 @@ mod tests {
             index: 0,
         };
         decoder.order_fall = 1;
-        decoder.text.push(b'b');
+        decoder.text.push(b'b').unwrap();
 
         let mut limited = decoder.clone();
         limited.max_contexts = 2;
-        assert_eq!(limited.create_successors(), None);
+        assert_eq!(limited.create_successors().unwrap(), None);
         let mut conflicting = decoder.clone();
         conflicting.contexts[0].states[b'a' as usize].successor = Successor::None;
-        assert_eq!(conflicting.create_successors(), None);
+        assert_eq!(conflicting.create_successors().unwrap(), None);
 
-        let leaf = decoder.create_successors().unwrap();
+        let leaf = decoder.create_successors().unwrap().unwrap();
         assert_eq!(decoder.contexts.len(), 4);
         assert_eq!(decoder.contexts[leaf].states[0].symbol, b'b');
         assert_eq!(decoder.contexts[leaf].suffix, Some(2));
@@ -2714,19 +3091,21 @@ mod tests {
     fn successor_creation_reuses_existing_context_without_materialization() {
         let mut decoder = PpmdDecoder::new();
         decoder.max_contexts = 4;
-        decoder.init_model(4);
+        decoder.init_model(4).unwrap();
         let selected = decoder
             .push_context(Context {
                 states: vec![State {
                     symbol: b'a',
                     freq: 2,
                     successor: Successor::Raw(0),
-                }],
+                }]
+                .into(),
                 summ_freq: 0,
                 suffix: Some(0),
                 header_offset: NULL_OFFSET,
                 array_offset: NULL_OFFSET,
             })
+            .unwrap()
             .unwrap();
         decoder.min_context = selected;
         decoder.found_state = StateRef {
@@ -2735,16 +3114,16 @@ mod tests {
         };
         decoder.order_fall = 0;
         decoder.contexts[0].states[b'a' as usize].successor = Successor::Context(0);
-        assert_eq!(decoder.create_successors(), Some(0));
+        assert_eq!(decoder.create_successors().unwrap(), Some(0));
         assert_eq!(decoder.contexts.len(), 2);
 
         decoder.contexts[selected].states[0].successor = Successor::Context(0);
-        assert_eq!(decoder.create_successors(), Some(0));
+        assert_eq!(decoder.create_successors().unwrap(), Some(0));
         decoder.order_fall = 1;
-        assert_eq!(decoder.create_successors(), None);
+        assert_eq!(decoder.create_successors().unwrap(), None);
         decoder.order_fall = 0;
         decoder.contexts[selected].states[0].successor = Successor::None;
-        assert_eq!(decoder.create_successors(), None);
+        assert_eq!(decoder.create_successors().unwrap(), None);
 
         decoder.min_context = 0;
         decoder.found_state = StateRef {
@@ -2752,15 +3131,17 @@ mod tests {
             index: 0,
         };
         decoder.contexts[0].states[0].successor = Successor::Raw(0);
-        assert_eq!(decoder.create_successors(), Some(0));
+        assert_eq!(decoder.create_successors().unwrap(), Some(0));
     }
 
     #[test]
-    fn interrupted_model_init_does_not_erase_contexts() {
+    fn cancelled_model_init_does_not_erase_contexts() {
         let mut decoder = PpmdDecoder::new();
-        decoder.init_model(4);
-        decoder.suballoc.interrupted = true;
-        decoder.init_model(8);
+        decoder.init_model(4).unwrap();
+        let token = crate::ReadCancellation::new();
+        decoder.set_read_control(crate::read_control::ReadControl::new(Some(&token)));
+        token.cancel();
+        assert_eq!(decoder.init_model(8), Err(Error::Cancelled));
         assert_eq!(decoder.max_order, 4);
         assert_eq!(decoder.contexts.len(), 1);
     }
@@ -2775,32 +3156,32 @@ mod tests {
             successor: Successor::None,
         };
         let context = Context {
-            states: vec![state; 12],
+            states: vec![state; 12].into(),
             summ_freq: 13,
             suffix: None,
             header_offset: NULL_OFFSET,
             array_offset: NULL_OFFSET,
         };
-        let ctx = decoder.push_context(context).unwrap();
+        let ctx = decoder.push_context(context).unwrap().unwrap();
         let original = decoder.contexts[ctx].array_offset;
-        decoder.shrink_state_array(ctx, 12, 12);
+        decoder.shrink_state_array(ctx, 12, 12).unwrap();
         assert_eq!(decoder.contexts[ctx].array_offset, original);
         // Six and five units share a bucket, so this shrink keeps its slot.
-        decoder.shrink_state_array(ctx, 12, 10);
+        decoder.shrink_state_array(ctx, 12, 10).unwrap();
         assert_eq!(decoder.contexts[ctx].array_offset, original);
 
         // Six to two units has no spare block: keep the prefix and free the
         // four-unit residue. A spare two-unit block later selects the swap.
-        decoder.shrink_state_array(ctx, 12, 4);
+        decoder.shrink_state_array(ctx, 12, 4).unwrap();
         assert_eq!(decoder.contexts[ctx].array_offset, original);
         assert!(decoder.suballoc.free_lists[3].contains(&(original + 2)));
         let spare = decoder.suballoc.alloc(2, AllocSide::Lo, 0).unwrap();
         decoder.suballoc.free(spare, 2);
-        decoder.shrink_state_array(ctx, 12, 4);
+        decoder.shrink_state_array(ctx, 12, 4).unwrap();
         assert_eq!(decoder.contexts[ctx].array_offset, spare);
         assert!(decoder.suballoc.free_lists[4].contains(&original));
 
-        decoder.shrink_state_array(ctx, 4, 1);
+        decoder.shrink_state_array(ctx, 4, 1).unwrap();
         assert_eq!(decoder.contexts[ctx].array_offset, NULL_OFFSET);
     }
 
@@ -2814,7 +3195,7 @@ mod tests {
         ) -> (PpmdDecoder, usize) {
             let mut decoder = PpmdDecoder::new();
             decoder.max_contexts = 4;
-            decoder.init_model(4);
+            decoder.init_model(4).unwrap();
             let ctx = decoder
                 .push_context(Context {
                     states: freqs
@@ -2824,12 +3205,14 @@ mod tests {
                             freq,
                             successor: Successor::None,
                         })
-                        .collect(),
+                        .collect::<Vec<_>>()
+                        .into(),
                     summ_freq: sum,
                     suffix: Some(0),
                     header_offset: NULL_OFFSET,
                     array_offset: NULL_OFFSET,
                 })
+                .unwrap()
                 .unwrap();
             decoder.min_context = ctx;
             decoder.found_state = StateRef {
@@ -2841,7 +3224,7 @@ mod tests {
         }
 
         let (mut decoder, ctx) = model(&[(b'a', 10), (b'b', 1), (b'c', 80)], 92, 1, 0);
-        decoder.rescale();
+        decoder.rescale().unwrap();
         assert_eq!(
             decoder.contexts[ctx]
                 .states
@@ -2853,20 +3236,20 @@ mod tests {
         assert_eq!(decoder.contexts[ctx].summ_freq, 49);
 
         let (mut decoder, ctx) = model(&[(b'a', 10), (b'b', 125), (b'c', 2)], 138, 1, 1);
-        decoder.rescale();
+        decoder.rescale().unwrap();
         assert_eq!(decoder.found_state.index, 0);
         assert_eq!(decoder.contexts[ctx].states[0].symbol, b'b');
         assert_eq!(decoder.contexts[ctx].states[0].freq, 65);
 
         let (mut decoder, ctx) = model(&[(b'a', 125), (b'b', 1), (b'c', 1)], 130, 0, 0);
-        decoder.rescale();
+        decoder.rescale().unwrap();
         assert_eq!(decoder.contexts[ctx].states.len(), 1);
         assert_eq!(decoder.contexts[ctx].states[0].freq, 16);
         assert_eq!(decoder.contexts[ctx].array_offset, NULL_OFFSET);
 
         let (mut decoder, ctx) = model(&[(b'a', 125), (b'b', 2), (b'c', 1)], 130, 0, 0);
         let old_array = decoder.contexts[ctx].array_offset;
-        decoder.rescale();
+        decoder.rescale().unwrap();
         assert_eq!(
             decoder.contexts[ctx]
                 .states
@@ -2885,7 +3268,7 @@ mod tests {
         fn model(freqs: &[(u8, u8)], selected: usize) -> (PpmdDecoder, usize) {
             let mut decoder = PpmdDecoder::new();
             decoder.max_contexts = 4;
-            decoder.init_model(4);
+            decoder.init_model(4).unwrap();
             let ctx = decoder
                 .push_context(Context {
                     states: freqs
@@ -2895,12 +3278,14 @@ mod tests {
                             freq,
                             successor: Successor::None,
                         })
-                        .collect(),
+                        .collect::<Vec<_>>()
+                        .into(),
                     summ_freq: freqs.iter().map(|&(_, freq)| freq as u16).sum::<u16>() + 1,
                     suffix: Some(0),
                     header_offset: NULL_OFFSET,
                     array_offset: NULL_OFFSET,
                 })
+                .unwrap()
                 .unwrap();
             for state in &mut decoder.contexts[ctx].states {
                 state.successor = Successor::Context(ctx);
@@ -2944,25 +3329,29 @@ mod tests {
     #[test]
     fn make_esc_freq_rejects_invalid_masked_state_count() {
         let mut decoder = PpmdDecoder::new();
-        decoder.init_model(4);
-        decoder.contexts.push(Context {
-            states: vec![
-                State {
-                    symbol: b'a',
-                    freq: 1,
-                    successor: Successor::None,
-                },
-                State {
-                    symbol: b'b',
-                    freq: 1,
-                    successor: Successor::None,
-                },
-            ],
-            summ_freq: 2,
-            suffix: Some(0),
-            header_offset: NULL_OFFSET,
-            array_offset: NULL_OFFSET,
-        });
+        decoder.init_model(4).unwrap();
+        decoder
+            .contexts
+            .push(Context {
+                states: vec![
+                    State {
+                        symbol: b'a',
+                        freq: 1,
+                        successor: Successor::None,
+                    },
+                    State {
+                        symbol: b'b',
+                        freq: 1,
+                        successor: Successor::None,
+                    },
+                ]
+                .into(),
+                summ_freq: 2,
+                suffix: Some(0),
+                header_offset: NULL_OFFSET,
+                array_offset: NULL_OFFSET,
+            })
+            .unwrap();
         decoder.min_context = 1;
 
         assert!(matches!(
@@ -2974,18 +3363,22 @@ mod tests {
     #[test]
     fn update_model_rejects_invalid_frequency_arithmetic() {
         let mut decoder = PpmdDecoder::new();
-        decoder.init_model(4);
-        decoder.contexts.push(Context {
-            states: vec![State {
-                symbol: b'a',
-                freq: 10,
-                successor: Successor::None,
-            }],
-            summ_freq: 1,
-            suffix: Some(0),
-            header_offset: NULL_OFFSET,
-            array_offset: NULL_OFFSET,
-        });
+        decoder.init_model(4).unwrap();
+        decoder
+            .contexts
+            .push(Context {
+                states: vec![State {
+                    symbol: b'a',
+                    freq: 10,
+                    successor: Successor::None,
+                }]
+                .into(),
+                summ_freq: 1,
+                suffix: Some(0),
+                header_offset: NULL_OFFSET,
+                array_offset: NULL_OFFSET,
+            })
+            .unwrap();
         decoder.min_context = 1;
         decoder.max_context = 0;
         decoder.found_state = StateRef {
@@ -3010,24 +3403,26 @@ mod tests {
         ) -> PpmdDecoder {
             let mut decoder = PpmdDecoder::new();
             decoder.max_contexts = 10;
-            decoder.init_model(4);
+            decoder.init_model(4).unwrap();
             let ancestor = decoder
                 .push_context(Context {
-                    states: ancestor,
+                    states: ancestor.into(),
                     summ_freq: ancestor_sum,
                     suffix: Some(0),
                     header_offset: NULL_OFFSET,
                     array_offset: NULL_OFFSET,
                 })
+                .unwrap()
                 .unwrap();
             let selected = decoder
                 .push_context(Context {
-                    states: selected,
+                    states: selected.into(),
                     summ_freq: selected_sum,
                     suffix: Some(ancestor),
                     header_offset: NULL_OFFSET,
                     array_offset: NULL_OFFSET,
                 })
+                .unwrap()
                 .unwrap();
             decoder.min_context = selected;
             decoder.max_context = ancestor;
@@ -3068,7 +3463,7 @@ mod tests {
     #[test]
     fn update_paths_reject_invalid_state_reference_without_panic() {
         let mut decoder = PpmdDecoder::new();
-        decoder.init_model(4);
+        decoder.init_model(4).unwrap();
         decoder.found_state = StateRef {
             context: 99,
             index: 0,

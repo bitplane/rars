@@ -295,6 +295,26 @@ impl<T, B: Budget> Buffer<T, B> {
     pub(crate) fn clear(&mut self) {
         self.values.clear();
     }
+    pub(crate) fn insert(&mut self, index: usize, value: T) -> Result<()> {
+        if B::LIMITED {
+            self.reserve(1)?;
+        }
+        self.values.insert(index, value);
+        Ok(())
+    }
+    pub(crate) fn remove(&mut self, index: usize) -> T {
+        self.values.remove(index)
+    }
+    pub(crate) fn try_collect(
+        values: impl ExactSizeIterator<Item = Result<T>>,
+        allowance: &B,
+    ) -> Result<Self> {
+        let mut out = Self::with_capacity(values.len(), allowance)?;
+        for value in values {
+            out.push_admitted(value?);
+        }
+        Ok(out)
+    }
     pub(crate) fn pop(&mut self) -> Option<T> {
         self.values.pop()
     }
@@ -390,6 +410,20 @@ pub(crate) struct BufferIter<T, B: Budget> {
     values: std::vec::IntoIter<T>,
     _charge: B::Charge,
 }
+impl<'a, T, B: Budget> IntoIterator for &'a Buffer<T, B> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+impl<'a, T, B: Budget> IntoIterator for &'a mut Buffer<T, B> {
+    type Item = &'a mut T;
+    type IntoIter = std::slice::IterMut<'a, T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
+}
 impl<T, B: Budget> IntoIterator for Buffer<T, B> {
     type Item = T;
     type IntoIter = BufferIter<T, B>;
@@ -410,6 +444,12 @@ impl<T, B: Budget> Iterator for BufferIter<T, B> {
     }
 }
 impl<T, B: Budget> ExactSizeIterator for BufferIter<T, B> {}
+#[cfg(test)]
+impl<T> From<Vec<T>> for Buffer<T> {
+    fn from(values: Vec<T>) -> Self {
+        Self::from_vec(values)
+    }
+}
 impl<T> Buffer<T> {
     pub(crate) fn from_vec(values: Vec<T>) -> Self {
         Self { values, charge: () }

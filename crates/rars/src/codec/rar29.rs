@@ -3960,14 +3960,17 @@ mod tests {
     #[test]
     fn cancellation_interrupts_lz_and_ppmd_after_non_solid_reset() {
         let data = b"cancellable legacy symbols ".repeat(16384);
-        for packed in [
-            unpack29_encode_literals(&data).unwrap(),
-            unpack29_encode_ppmd_literals(&data).unwrap(),
+        for (ppmd, packed) in [
+            (false, unpack29_encode_literals(&data).unwrap()),
+            (true, unpack29_encode_ppmd_literals(&data).unwrap()),
         ] {
             let token = crate::ReadCancellation::new();
             let mut decoder = Unpack29::new();
             decoder.read_control = crate::read_control::ReadControl::new(Some(&token));
-            decoder.read_control.cancel_after_checks(4);
+            // PPMd checks cancellation before allocating the initial model.
+            decoder
+                .read_control
+                .cancel_after_checks(4 + usize::from(ppmd));
             assert_eq!(
                 decoder
                     .decode_non_solid_member(&packed, data.len())
