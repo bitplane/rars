@@ -1,24 +1,36 @@
 use super::*;
+use crate::codec::rar13::Reader15State;
+use crate::codec::rar20::Reader20State;
+use crate::codec::rar29::Reader29State;
 use crate::codec::workspace::{Allowance, Boxed, Budget, Buffer};
 use crate::volume_extract::{ChainedReader, SplitVolumeState, SplitVolumeStep};
 use std::io::{Read, Write};
 
-enum CodecState {
-    Unpack15(Box<Unpack15>),
-    Unpack20(Box<Unpack20>),
-    Unpack29(Box<Unpack29>),
+enum CodecState<B: Budget = Allowance> {
+    Unpack15(Boxed<Reader15State<B>, B>),
+    Unpack20(Boxed<Reader20State<B>, B>),
+    Unpack29(Boxed<Reader29State<B>, B>),
 }
 
-impl CodecState {
-    fn new_for(file: &FileHeader) -> Result<Self> {
+impl<B: Budget> CodecState<B> {
+    fn with_allowance(file: &FileHeader, allowance: &B) -> Result<Self> {
         if file.unp_ver >= 29 {
-            return Ok(Self::Unpack29(Box::default()));
+            return Ok(Self::Unpack29(Boxed::try_new(
+                || Ok::<_, crate::codec::Error>(Reader29State::with_allowance(allowance)),
+                allowance,
+            )?));
         }
         if file.unp_ver == 20 || file.unp_ver == 26 {
-            return Ok(Self::Unpack20(Box::default()));
+            return Ok(Self::Unpack20(Boxed::try_new(
+                || Ok::<_, crate::codec::Error>(Reader20State::with_allowance(allowance)),
+                allowance,
+            )?));
         }
         if file.unp_ver == 15 {
-            return Ok(Self::Unpack15(Box::default()));
+            return Ok(Self::Unpack15(Boxed::try_new(
+                || Reader15State::with_allowance(allowance),
+                allowance,
+            )?));
         }
         Err(Error::UnsupportedCompression {
             family: "RAR 1.5-4.x",
@@ -35,65 +47,50 @@ impl CodecState {
         }
     }
 
-    fn decode_file_data(
-        &mut self,
-        archive: &Archive,
-        file: &FileHeader,
-        solid: bool,
-    ) -> Result<Vec<u8>> {
-        match self {
-            Self::Unpack15(decoder) => file.unpacked_data_with_unpack15(archive, decoder, solid),
-            Self::Unpack20(decoder) => file.unpacked_data_with_unpack20(archive, decoder, None),
-            Self::Unpack29(decoder) => file.unpacked_data_with_rar29(archive, decoder, solid),
-        }
-    }
-
     fn write_file_to(
         &mut self,
         archive: &Archive,
         file: &FileHeader,
         solid: bool,
         password: Option<&[u8]>,
+        allowance: &B,
         out: &mut impl Write,
     ) -> Result<()> {
-        match self {
-            Self::Unpack15(decoder) => {
-                file.write_unpack15_to(archive, decoder, solid, password, out)
-            }
-            Self::Unpack20(decoder) => file.write_unpack20_to(archive, decoder, password, out),
-            Self::Unpack29(decoder) => {
-                if file.is_encrypted() {
-                    let mut crc = Crc32::new();
-                    let mut crc_writer = CrcWriter {
-                        inner: out,
-                        crc: &mut crc,
-                    };
-                    let mut packed = file
-                        .packed_reader_for_decode(archive, password)
-                        .map_err(|error| file.map_encrypted_payload_error(password, error))?;
-                    let target = usize::try_from(file.unp_size).map_err(|_| {
-                        Error::InvalidHeader("RAR 1.5 unpacked size overflows usize")
-                    })?;
-                    if solid {
-                        decoder.decode_member_from_reader(&mut packed, target, &mut crc_writer)
-                    } else {
-                        decoder.decode_non_solid_member_from_reader(
-                            &mut packed,
-                            target,
-                            &mut crc_writer,
-                        )
-                    }
-                    .map_err(Error::from)
-                    .map_err(|error| file.map_encrypted_payload_error(password, error))?;
-                    let actual = crc.finish();
-                    file.crc_result(actual, password)
-                } else {
-                    file.write_rar29_to(archive, decoder, out)
-                }
-            }
-        }
+        let mut packed = file
+            .packed_reader_with_allowance(archive, password, allowance)
+            .map_err(|error| file.map_encrypted_payload_error(password, error))?;
+        self.write_split_to(&mut packed, file, solid, password, out)
     }
 
+    fn decode_to(
+        &mut self,
+        input: &mut impl Read,
+        file: &FileHeader,
+        solid: bool,
+        password: Option<&[u8]>,
+        out: &mut impl Write,
+    ) -> Result<()> {
+        let target = usize::try_from(file.unp_size)
+            .map_err(|_| Error::InvalidHeader("RAR 1.5 split unpacked size overflows usize"))?;
+        match self {
+            Self::Unpack15(decoder) => decoder
+                .decode_member_from_reader(input, target, solid, out)
+                .map_err(Error::from)
+                .map_err(|error| file.map_encrypted_payload_error(password, error))?,
+            Self::Unpack20(decoder) => decoder
+                .decode_member_from_reader(input, target, out)
+                .map_err(Error::from)
+                .map_err(|error| file.map_encrypted_payload_error(password, error))?,
+            Self::Unpack29(decoder) => if solid {
+                decoder.decode_member_from_reader(input, target, out)
+            } else {
+                decoder.decode_non_solid_member_from_reader(input, target, out)
+            }
+            .map_err(Error::from)
+            .map_err(|error| file.map_encrypted_payload_error(password, error))?,
+        }
+        Ok(())
+    }
     fn write_split_to(
         &mut self,
         input: &mut impl Read,
@@ -107,50 +104,36 @@ impl CodecState {
             inner: out,
             crc: &mut crc,
         };
-        let target = usize::try_from(file.unp_size)
-            .map_err(|_| Error::InvalidHeader("RAR 1.5 split unpacked size overflows usize"))?;
-        match self {
-            Self::Unpack15(decoder) => decoder
-                .decode_member_from_reader(input, target, solid, &mut crc_writer)
-                .map_err(Error::from)
-                .map_err(|error| file.map_encrypted_payload_error(password, error))?,
-            Self::Unpack20(decoder) => decoder
-                .decode_member_from_reader(input, target, &mut crc_writer)
-                .map_err(Error::from)
-                .map_err(|error| file.map_encrypted_payload_error(password, error))?,
-            Self::Unpack29(decoder) => if solid {
-                decoder.decode_member_from_reader(input, target, &mut crc_writer)
-            } else {
-                decoder.decode_non_solid_member_from_reader(input, target, &mut crc_writer)
-            }
-            .map_err(Error::from)
-            .map_err(|error| file.map_encrypted_payload_error(password, error))?,
-        }
-        let actual = crc.finish();
-        file.crc_result(actual, password)
+        self.decode_to(input, file, solid, password, &mut crc_writer)?;
+        file.crc_result(crc.finish(), password)
     }
 }
 
-pub(super) struct DecoderSession<'a> {
+#[cfg(test)]
+impl CodecState<Allowance> {
+    fn new_for(file: &FileHeader) -> Result<Self> {
+        Self::with_allowance(file, &Allowance::default())
+    }
+}
+
+pub(super) struct DecoderSession<'a, B: Budget = Allowance> {
     pub(super) read_control: crate::read_control::ReadControl,
-    codec: Option<CodecState>,
+    codec: Option<CodecState<B>>,
     solid: bool,
     decoded_files: usize,
     password: Option<&'a [u8]>,
+    allowance: B,
 }
 
-impl<'a> DecoderSession<'a> {
-    pub(super) fn new(solid: bool) -> Self {
-        Self::new_with_password(solid, None)
-    }
-
-    pub(super) fn new_with_password(solid: bool, password: Option<&'a [u8]>) -> Self {
+impl<'a, B: Budget> DecoderSession<'a, B> {
+    pub(super) fn with_allowance(solid: bool, password: Option<&'a [u8]>, allowance: &B) -> Self {
         Self {
             read_control: crate::read_control::ReadControl::default(),
             codec: None,
             solid,
             decoded_files: 0,
             password,
+            allowance: allowance.clone(),
         }
     }
 
@@ -160,14 +143,18 @@ impl<'a> DecoderSession<'a> {
         file: &FileHeader,
         out: &mut impl Write,
     ) -> Result<()> {
+        if file.is_stored() {
+            return file.write_stored_with_allowance(archive, self.password, out, &self.allowance);
+        }
         if file.is_empty_compressed_payload() {
             file.crc_result(0, self.password)?;
             return Ok(());
         }
         let solid = self.file_is_solid(file);
         let password = self.password;
+        let allowance = self.allowance.clone();
         self.codec_for(file)?
-            .write_file_to(archive, file, solid, password, out)?;
+            .write_file_to(archive, file, solid, password, &allowance, out)?;
         self.decoded_files += 1;
         Ok(())
     }
@@ -186,17 +173,38 @@ impl<'a> DecoderSession<'a> {
         Ok(())
     }
 
-    pub(super) fn decode_file_data(
+    pub(super) fn decode_file_owned(
         &mut self,
         archive: &Archive,
         file: &FileHeader,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Buffer<u8, B>> {
+        let mut out = Buffer::new(&self.allowance);
         if file.is_empty_compressed_payload() {
             file.crc_result(0, self.password)?;
-            return Ok(Vec::new());
+            return Ok(out);
         }
-        let solid = self.file_is_solid(file);
-        self.codec_for(file)?.decode_file_data(archive, file, solid)
+        let password = self.password;
+        let mut input = file.packed_reader_with_allowance(archive, password, &self.allowance)?;
+        if file.is_stored() {
+            if !file.is_encrypted() && file.pack_size != file.unp_size {
+                return Err(Error::InvalidHeader(
+                    "RAR 1.5 stored file has mismatched packed and unpacked sizes",
+                ));
+            }
+            out.read_to_end(&mut input)?;
+            if file.is_encrypted() {
+                out.truncate(
+                    usize::try_from(file.unp_size).map_err(|_| {
+                        Error::InvalidHeader("RAR 1.5 unpacked size overflows usize")
+                    })?,
+                );
+            }
+        } else {
+            let solid = self.file_is_solid(file);
+            self.codec_for(file)?
+                .decode_to(&mut input, file, solid, password, &mut out)?;
+        }
+        Ok(out)
     }
 
     fn file_is_solid(&self, file: &FileHeader) -> bool {
@@ -208,7 +216,7 @@ impl<'a> DecoderSession<'a> {
         file.unp_ver < 20 || file.is_solid()
     }
 
-    fn codec_for(&mut self, file: &FileHeader) -> Result<&mut CodecState> {
+    fn codec_for(&mut self, file: &FileHeader) -> Result<&mut CodecState<B>> {
         self.read_control.check()?;
         let reset = !self.file_is_solid(file)
             || self
@@ -216,7 +224,7 @@ impl<'a> DecoderSession<'a> {
                 .as_ref()
                 .is_none_or(|codec| !codec.supports(file));
         if reset {
-            self.codec = Some(CodecState::new_for(file)?);
+            self.codec = Some(CodecState::with_allowance(file, &self.allowance)?);
         }
         // A missing codec always sets `reset`; successful construction then
         // installs it before reaching this point.
@@ -227,6 +235,22 @@ impl<'a> DecoderSession<'a> {
             CodecState::Unpack29(d) => d.read_control = self.read_control.clone(),
         }
         Ok(codec)
+    }
+}
+
+impl<'a> DecoderSession<'a, Allowance> {
+    pub(super) fn new(solid: bool) -> Self {
+        Self::new_with_password(solid, None)
+    }
+    pub(super) fn new_with_password(solid: bool, password: Option<&'a [u8]>) -> Self {
+        Self::with_allowance(solid, password, &Allowance::default())
+    }
+    pub(super) fn decode_file_data(
+        &mut self,
+        archive: &Archive,
+        file: &FileHeader,
+    ) -> Result<Vec<u8>> {
+        self.decode_file_owned(archive, file).map(Buffer::into_vec)
     }
 }
 
@@ -494,32 +518,46 @@ impl PendingSplitRefs {
             })
     }
 
-    fn fragment_reader<'a>(
+    fn fragment_reader_with_allowance<'a, B: Budget>(
         &self,
         volumes: &'a [Archive],
         password: Option<&[u8]>,
-    ) -> Result<Box<dyn Read + 'a>> {
-        let mut readers = Vec::with_capacity(self.fragments.len());
+        allowance: &B,
+    ) -> Result<PackedReader<ChainedReader<crate::source::RangeReader<'a>, B>, B>> {
+        let mut readers = Buffer::with_capacity(self.fragments.len(), allowance)?;
         for &(volume_index, file_index) in &self.fragments {
             let archive = &volumes[volume_index];
             let file = archive
                 .files()
                 .nth(file_index)
                 .expect("split fragment index comes from archive enumeration");
-            readers.push(archive.range_reader(file.packed_range.clone())?);
+            readers.push_admitted(archive.range_reader(file.packed_range.clone())?);
         }
-        let reader = ChainedReader::new(readers);
+        let reader = ChainedReader::with_readers(readers);
         if !self.encrypted {
-            return Ok(Box::new(reader));
+            return Ok(PackedReader::Plain(reader));
         }
 
         let password = password.expect("encrypted split fragments were admitted with a password");
-        Ok(Box::new(DecryptingReader::new(
-            reader,
-            self.unp_ver,
-            password,
-            self.salt,
+        Ok(PackedReader::Encrypted(Boxed::try_new(
+            || {
+                DecryptingReader::with_allowance(
+                    reader,
+                    self.unp_ver,
+                    password,
+                    self.salt,
+                    allowance,
+                )
+            },
+            allowance,
         )?))
+    }
+    fn fragment_reader<'a>(
+        &self,
+        volumes: &'a [Archive],
+        password: Option<&[u8]>,
+    ) -> Result<PackedReader<ChainedReader<crate::source::RangeReader<'a>>>> {
+        self.fragment_reader_with_allowance(volumes, password, &Allowance::default())
     }
 }
 
@@ -558,6 +596,18 @@ impl<B: Budget> SplitCipher<B> {
     }
 }
 
+pub(super) enum PackedReader<R, B: Budget = Allowance> {
+    Plain(R),
+    Encrypted(Boxed<DecryptingReader<R, B>, B>),
+}
+impl<R: Read, B: Budget> Read for PackedReader<R, B> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(reader) => reader.read(out),
+            Self::Encrypted(reader) => reader.read(out),
+        }
+    }
+}
 pub(super) struct DecryptingReader<R, B: Budget = Allowance> {
     inner: R,
     cipher: SplitCipher<B>,
@@ -702,6 +752,7 @@ impl SplitCipher<Allowance> {
         Self::with_allowance(unp_ver, password, salt, &Allowance::default())
     }
 }
+#[cfg(test)]
 impl<R: Read> DecryptingReader<R, Allowance> {
     pub(super) fn new(
         inner: R,
@@ -714,6 +765,97 @@ impl<R: Read> DecryptingReader<R, Allowance> {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reader_session_workspace_refusals_charge_every_legacy_decoder_and_encrypted_payload() {
+        use crate::codec::workspace::RefusingBudget;
+        let plain = b"abcabcabc";
+        for version in [15, 20, 29] {
+            let packed = match version {
+                15 => crate::codec::rar13::unpack15_encode(plain).unwrap(),
+                20 => crate::codec::rar20::unpack20_encode_literals(plain).unwrap(),
+                _ => crate::codec::rar29::unpack29_encode_literals(plain).unwrap(),
+            };
+            for encrypted in [false, true] {
+                let mut payload = packed.clone();
+                if encrypted {
+                    match version {
+                        15 => Rar15Cipher::new(b"pw").crypt_in_place(&mut payload),
+                        20 => {
+                            payload.resize(payload.len().div_ceil(16) * 16, 0);
+                            Rar20Cipher::new(b"pw")
+                                .encrypt_in_place(&mut payload)
+                                .unwrap();
+                        }
+                        _ => {
+                            payload.resize(payload.len().div_ceil(16) * 16, 0);
+                            Rar30Cipher::new(b"pw", None)
+                                .unwrap()
+                                .encrypt_in_place(&mut payload)
+                                .unwrap();
+                        }
+                    }
+                }
+                let mut entry = file(b"charged.bin", if encrypted { FHD_PASSWORD } else { 0 });
+                entry.method = 0x33;
+                entry.unp_ver = version;
+                entry.unp_size = plain.len() as u64;
+                entry.pack_size = payload.len() as u64;
+                entry.packed_range = 0..payload.len();
+                entry.file_crc = crate::crc32::crc32(plain);
+                let archive = archive_with_source(vec![Block::File(entry.clone())], payload);
+                let run = |budget: &RefusingBudget| -> Result<()> {
+                    let mut session = DecoderSession::with_allowance(false, Some(b"pw"), budget);
+                    let mut out = Buffer::new(budget);
+                    session.write_file_to(&archive, &entry, &mut out)?;
+                    assert_eq!(&out[..], plain);
+                    let decoded = session.decode_file_owned(&archive, &entry)?;
+                    assert_eq!(&decoded[..], plain);
+                    Ok(())
+                };
+                let baseline = RefusingBudget::new(usize::MAX);
+                run(&baseline).unwrap();
+                assert_eq!(baseline.used(), 0);
+                for index in 0..baseline.attempts() {
+                    let budget = RefusingBudget::new(index);
+                    let error = run(&budget).unwrap_err();
+                    assert_eq!(
+                        error.kind(),
+                        crate::ErrorKind::Cancelled,
+                        "version {version}, encrypted {encrypted}, allocation {index}: {error}"
+                    );
+                    assert_eq!(budget.used(), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reader_session_workspace_refusal_keeps_its_resource_kind_for_encrypted_members() {
+        let mut entry = file(b"quota.bin", FHD_PASSWORD);
+        entry.method = 0x33;
+        entry.unp_ver = 29;
+        entry.unp_size = 1;
+        entry.pack_size = 16;
+        entry.packed_range = 0..16;
+        let archive = archive_with_source(vec![Block::File(entry.clone())], vec![0; 16]);
+        let budget = Allowance::limited(1);
+        let mut session = DecoderSession::with_allowance(false, Some(b"pw"), &budget);
+        let error = session
+            .write_file_to(&archive, &entry, &mut std::io::sink())
+            .unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::ResourceLimit);
+        assert_eq!(budget.used(), 0);
+        let error = entry
+            .packed_reader_with_allowance(&archive, Some(b"pw"), &budget)
+            .err()
+            .unwrap();
+        assert_eq!(
+            entry.map_encrypted_payload_error(Some(b"pw"), error).kind(),
+            crate::ErrorKind::ResourceLimit
+        );
+        assert_eq!(budget.used(), 0);
+    }
+
     #[test]
     fn reader_workspace_refusals_release_legacy_cipher_and_decryption_buffers() {
         use crate::codec::workspace::RefusingBudget;

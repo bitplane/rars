@@ -555,7 +555,7 @@ impl Archive {
         self.source.copy_range_to(range, out)
     }
 
-    fn range_reader(&self, range: Range<usize>) -> Result<Box<dyn Read + '_>> {
+    fn range_reader(&self, range: Range<usize>) -> Result<crate::source::RangeReader<'_>> {
         self.source.range_reader(range)
     }
 
@@ -1345,7 +1345,8 @@ impl PendingSplitRefs {
                 .entries
                 .get(entry_index)
                 .ok_or(Error::InvalidHeader("RAR 1.3 split entry is missing"))?;
-            readers.push(archive.range_reader(entry.packed_range.clone())?);
+            readers
+                .push(Box::new(archive.range_reader(entry.packed_range.clone())?) as Box<dyn Read>);
         }
         let chained = ChainedReader { readers, index: 0 };
         if self.was_encrypted {

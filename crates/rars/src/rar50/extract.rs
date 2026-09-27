@@ -110,7 +110,7 @@ impl FileHeader {
     ) -> Result<(Box<dyn Read + 'a>, Option<Rar50Keys>)> {
         let reader = archive.range_reader(self.block.data_range.clone())?;
         if !self.encrypted {
-            return Ok((reader, None));
+            return Ok((Box::new(reader), None));
         }
         if !self.packed_size().is_multiple_of(16) {
             return Err(Error::InvalidHeader(

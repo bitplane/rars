@@ -1,3 +1,4 @@
+use crate::codec::workspace::{Allowance, Budget, Buffer};
 use std::io::{Read, Result};
 
 pub(crate) struct SplitVolumeState<P> {
@@ -51,18 +52,26 @@ pub(crate) enum SplitVolumeStep<'a, P> {
     Interrupted,
 }
 
-pub(crate) struct ChainedReader<'a> {
-    readers: Vec<Box<dyn Read + 'a>>,
+pub(crate) struct ChainedReader<R, B: Budget = Allowance> {
+    readers: Buffer<R, B>,
     index: usize,
 }
 
-impl<'a> ChainedReader<'a> {
-    pub(crate) fn new(readers: Vec<Box<dyn Read + 'a>>) -> Self {
+impl<R, B: Budget> ChainedReader<R, B> {
+    pub(crate) fn with_readers(readers: Buffer<R, B>) -> Self {
         Self { readers, index: 0 }
     }
 }
+impl<R> ChainedReader<R, Allowance> {
+    pub(crate) fn new(readers: Vec<R>) -> Self {
+        Self {
+            readers: Buffer::from_vec(readers),
+            index: 0,
+        }
+    }
+}
 
-impl Read for ChainedReader<'_> {
+impl<R: Read, B: Budget> Read for ChainedReader<R, B> {
     fn read(&mut self, out: &mut [u8]) -> Result<usize> {
         while let Some(reader) = self.readers.get_mut(self.index) {
             let read = reader.read(out)?;

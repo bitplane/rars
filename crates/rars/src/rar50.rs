@@ -716,7 +716,7 @@ impl Archive {
         self.source.len()
     }
 
-    fn range_reader(&self, range: Range<usize>) -> Result<Box<dyn Read + '_>> {
+    fn range_reader(&self, range: Range<usize>) -> Result<crate::source::RangeReader<'_>> {
         self.source.range_reader(range)
     }
 

@@ -1,6 +1,5 @@
 use crate::codec::rar13::Unpack15;
 use crate::codec::rar20::Unpack20;
-use crate::codec::rar29::Unpack29;
 use crate::crc32::{crc32, Crc32};
 use crate::crypto::rar15::Rar15Cipher;
 use crate::crypto::rar20::Rar20Cipher;
@@ -23,7 +22,7 @@ mod write;
 pub use crate::streaming::{EntrySource, WriterResources};
 pub use crate::write_plan::MemberCoding;
 pub use extract::extract_volumes_to;
-use extract::{DecoderSession, DecryptingReader};
+use extract::{DecoderSession, DecryptingReader, PackedReader};
 pub(crate) use write::write_stored_volumes_with_progress;
 pub(crate) use write::{write_archive_with_retained_metadata, RetainedMemberMetadata};
 pub use write::{
@@ -467,82 +466,6 @@ impl FileHeader {
         Ok(data)
     }
 
-    pub(crate) fn unpacked_data_with_rar29(
-        &self,
-        archive: &Archive,
-        decoder: &mut Unpack29,
-        solid: bool,
-    ) -> Result<Vec<u8>> {
-        if self.is_stored() {
-            return self.stored_data(archive);
-        }
-        if self.is_encrypted() {
-            return Err(self.unsupported_encryption());
-        }
-        if self.unp_ver < 29 {
-            return Err(self.unsupported_compression());
-        }
-        let packed = self.packed_data(archive)?;
-        let target = usize::try_from(self.unp_size)
-            .map_err(|_| Error::InvalidHeader("RAR 2.9 unpacked size overflows usize"))?;
-        if solid {
-            decoder.decode_member(&packed, target)
-        } else {
-            decoder.decode_non_solid_member(&packed, target)
-        }
-        .map_err(Into::into)
-    }
-
-    pub(crate) fn unpacked_data_with_unpack15(
-        &self,
-        archive: &Archive,
-        decoder: &mut Unpack15,
-        solid: bool,
-    ) -> Result<Vec<u8>> {
-        if self.is_stored() {
-            return self.stored_data(archive);
-        }
-        if self.is_encrypted() {
-            return Err(self.unsupported_encryption());
-        }
-        if self.unp_ver != 15 {
-            return Err(self.unsupported_compression());
-        }
-        decoder
-            .decode_member(
-                &self.packed_data(archive)?,
-                usize::try_from(self.unp_size)
-                    .map_err(|_| Error::InvalidHeader("RAR 1.5 unpacked size overflows usize"))?,
-                solid,
-            )
-            .map_err(Into::into)
-    }
-
-    pub(crate) fn unpacked_data_with_unpack20(
-        &self,
-        archive: &Archive,
-        decoder: &mut Unpack20,
-        password: Option<&[u8]>,
-    ) -> Result<Vec<u8>> {
-        if self.is_stored() {
-            return self.stored_data_with_password(archive, password);
-        }
-        if self.unp_ver != 20 && self.unp_ver != 26 {
-            return Err(self.unsupported_compression());
-        }
-        let mut packed = self.packed_reader_for_decode(archive, password)?;
-        let mut out = Vec::new();
-        decoder
-            .decode_member_from_reader(
-                &mut packed,
-                usize::try_from(self.unp_size)
-                    .map_err(|_| Error::InvalidHeader("RAR 2.0 unpacked size overflows usize"))?,
-                &mut out,
-            )
-            .map(|_| out)
-            .map_err(Into::into)
-    }
-
     fn packed_data_for_decode(
         &self,
         archive: &Archive,
@@ -554,14 +477,15 @@ impl FileHeader {
         Ok(data)
     }
 
-    pub(super) fn packed_reader_for_decode<'a>(
+    fn packed_reader_with_allowance<'a, B: crate::codec::workspace::Budget>(
         &self,
         archive: &'a Archive,
         password: Option<&[u8]>,
-    ) -> Result<Box<dyn Read + 'a>> {
+        allowance: &B,
+    ) -> Result<PackedReader<crate::source::RangeReader<'a>, B>> {
         let reader = archive.range_reader(self.packed_range.clone())?;
         if !self.is_encrypted() {
-            return Ok(reader);
+            return Ok(PackedReader::Plain(reader));
         }
         let Some(password) = password else {
             return Err(Error::NeedPassword);
@@ -573,12 +497,32 @@ impl FileHeader {
                 "RAR encrypted payload is not block aligned",
             ));
         }
-        Ok(Box::new(DecryptingReader::new(
-            reader,
-            self.unp_ver,
+        Ok(PackedReader::Encrypted(
+            crate::codec::workspace::Boxed::try_new(
+                || {
+                    DecryptingReader::with_allowance(
+                        reader,
+                        self.unp_ver,
+                        password,
+                        self.salt,
+                        allowance,
+                    )
+                },
+                allowance,
+            )?,
+        ))
+    }
+
+    fn packed_reader_for_decode<'a>(
+        &self,
+        archive: &'a Archive,
+        password: Option<&[u8]>,
+    ) -> Result<PackedReader<crate::source::RangeReader<'a>>> {
+        self.packed_reader_with_allowance(
+            archive,
             password,
-            self.salt,
-        )?))
+            &crate::codec::workspace::Allowance::default(),
+        )
     }
 
     pub fn verify_crc32(&self, data: &[u8]) -> Result<()> {
@@ -660,11 +604,12 @@ impl FileHeader {
         session.write_file_to(archive, self, out)
     }
 
-    fn write_stored_to(
+    fn write_stored_with_allowance<B: crate::codec::workspace::Budget>(
         &self,
         archive: &Archive,
         password: Option<&[u8]>,
         out: &mut impl Write,
+        allowance: &B,
     ) -> Result<()> {
         if !self.is_encrypted() && self.pack_size != self.unp_size {
             return Err(Error::InvalidHeader(
@@ -672,7 +617,7 @@ impl FileHeader {
             ));
         }
         let mut reader = self
-            .packed_reader_for_decode(archive, password)
+            .packed_reader_with_allowance(archive, password, allowance)
             .map_err(|error| self.map_encrypted_payload_error(password, error))?;
         let expected_len = usize::try_from(self.unp_size)
             .map_err(|_| Error::InvalidHeader("RAR 1.5 unpacked size overflows usize"))?;
@@ -705,8 +650,28 @@ impl FileHeader {
         }
     }
 
+    fn write_stored_to(
+        &self,
+        archive: &Archive,
+        password: Option<&[u8]>,
+        out: &mut impl Write,
+    ) -> Result<()> {
+        self.write_stored_with_allowance(
+            archive,
+            password,
+            out,
+            &crate::codec::workspace::Allowance::default(),
+        )
+    }
+
     fn map_encrypted_payload_error(&self, password: Option<&[u8]>, error: Error) -> Error {
         if !self.is_encrypted() || password.is_none() {
+            return error;
+        }
+        if matches!(
+            error.kind(),
+            crate::ErrorKind::ResourceLimit | crate::ErrorKind::Cancelled | crate::ErrorKind::Io
+        ) {
             return error;
         }
         match error {
@@ -784,115 +749,11 @@ impl FileHeader {
         }
     }
 
-    fn write_rar29_to(
-        &self,
-        archive: &Archive,
-        decoder: &mut Unpack29,
-        out: &mut impl Write,
-    ) -> Result<()> {
-        let mut packed = archive.range_reader(self.packed_range.clone())?;
-        let mut crc = Crc32::new();
-        let mut crc_writer = CrcWriter {
-            inner: out,
-            crc: &mut crc,
-        };
-        decoder
-            .decode_member_from_reader(
-                &mut packed,
-                usize::try_from(self.unp_size)
-                    .map_err(|_| Error::InvalidHeader("RAR 1.5 unpacked size overflows usize"))?,
-                &mut crc_writer,
-            )
-            .map_err(Error::from)?;
-        let actual = crc.finish();
-        if actual == self.file_crc {
-            Ok(())
-        } else {
-            Err(Error::Crc32Mismatch {
-                expected: self.file_crc,
-                actual,
-            })
-        }
-    }
-
-    fn write_unpack15_to(
-        &self,
-        archive: &Archive,
-        decoder: &mut Unpack15,
-        solid: bool,
-        password: Option<&[u8]>,
-        out: &mut impl Write,
-    ) -> Result<()> {
-        let mut input = self
-            .packed_reader_for_decode(archive, password)
-            .map_err(|error| self.map_encrypted_payload_error(password, error))?;
-        self.write_unpack15_decoded(decoder, solid, &mut input, out, password)
-            .map_err(|error| self.map_encrypted_payload_error(password, error))
-    }
-
-    fn write_unpack15_decoded(
-        &self,
-        decoder: &mut Unpack15,
-        solid: bool,
-        input: &mut impl Read,
-        out: &mut impl Write,
-        password: Option<&[u8]>,
-    ) -> Result<()> {
-        let mut crc = Crc32::new();
-        let mut crc_writer = CrcWriter {
-            inner: out,
-            crc: &mut crc,
-        };
-        decoder
-            .decode_member_from_reader(
-                input,
-                usize::try_from(self.unp_size)
-                    .map_err(|_| Error::InvalidHeader("RAR 1.5 unpacked size overflows usize"))?,
-                solid,
-                &mut crc_writer,
-            )
-            .map_err(Error::from)?;
-        let actual = crc.finish();
-        self.crc_result(actual, password)
-    }
-
-    fn write_unpack20_to(
-        &self,
-        archive: &Archive,
-        decoder: &mut Unpack20,
-        password: Option<&[u8]>,
-        out: &mut impl Write,
-    ) -> Result<()> {
-        let mut crc = Crc32::new();
-        let mut crc_writer = CrcWriter {
-            inner: out,
-            crc: &mut crc,
-        };
-        let target = usize::try_from(self.unp_size)
-            .map_err(|_| Error::InvalidHeader("RAR 2.0 unpacked size overflows usize"))?;
-        let mut packed = self
-            .packed_reader_for_decode(archive, password)
-            .map_err(|error| self.map_encrypted_payload_error(password, error))?;
-        decoder
-            .decode_member_from_reader(&mut packed, target, &mut crc_writer)
-            .map_err(Error::from)
-            .map_err(|error| self.map_encrypted_payload_error(password, error))?;
-        let actual = crc.finish();
-        self.crc_result(actual, password)
-    }
-
     fn unsupported_compression(&self) -> Error {
         Error::UnsupportedCompression {
             family: "RAR 1.5-4.x",
             unpack_version: self.unp_ver,
             method: self.method,
-        }
-    }
-
-    fn unsupported_encryption(&self) -> Error {
-        Error::UnsupportedEncryption {
-            family: "RAR 1.5-4.x",
-            unpack_version: self.unp_ver,
         }
     }
 }
@@ -1544,7 +1405,7 @@ impl Archive {
         self.source.copy_range_to(range, out)
     }
 
-    fn range_reader(&self, range: Range<usize>) -> Result<Box<dyn Read + '_>> {
+    fn range_reader(&self, range: Range<usize>) -> Result<crate::source::RangeReader<'_>> {
         self.source.range_reader(range)
     }
 
@@ -3817,20 +3678,6 @@ mod tests {
                 family: "RAR 1.5-4.x",
                 unpack_version: 26,
                 method: 0x33,
-            }
-        ));
-    }
-
-    #[test]
-    fn file_header_unsupported_encryption_describes_unpack_version() {
-        let mut header = file_header_with(FHD_PASSWORD);
-        header.unp_ver = 36;
-        let err = header.unsupported_encryption();
-        assert!(matches!(
-            err,
-            Error::UnsupportedEncryption {
-                family: "RAR 1.5-4.x",
-                unpack_version: 36,
             }
         ));
     }

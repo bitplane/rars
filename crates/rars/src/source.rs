@@ -78,6 +78,23 @@ impl Seek for SourceCursor {
     }
 }
 
+/// Range cursors contain only inline state and references to the archive's
+/// existing source. Reading a member does not need another heap allocation.
+pub(crate) enum RangeReader<'a> {
+    Memory(Cursor<&'a [u8]>),
+    File(std::io::Take<File>),
+    Reader(std::io::Take<SourceCursor>),
+}
+impl Read for RangeReader<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Memory(reader) => reader.read(bytes),
+            Self::File(reader) => reader.read(bytes),
+            Self::Reader(reader) => reader.read(bytes),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum ArchiveSource {
     Memory(Arc<[u8]>),
@@ -120,7 +137,7 @@ impl ArchiveSource {
         Ok(())
     }
 
-    pub(crate) fn range_reader(&self, range: Range<usize>) -> Result<Box<dyn Read + '_>> {
+    pub(crate) fn range_reader(&self, range: Range<usize>) -> Result<RangeReader<'_>> {
         match self {
             Self::Reader(source) => {
                 if range.start > range.end || range.end > source.len {
@@ -128,16 +145,16 @@ impl ArchiveSource {
                 }
                 let mut reader = source.cursor();
                 reader.seek(SeekFrom::Start(range.start as u64))?;
-                Ok(Box::new(reader.take(range.len() as u64)))
+                Ok(RangeReader::Reader(reader.take(range.len() as u64)))
             }
             Self::Memory(data) => {
                 let data = data.get(range).ok_or(Error::TooShort)?;
-                Ok(Box::new(Cursor::new(data)))
+                Ok(RangeReader::Memory(Cursor::new(data)))
             }
             Self::File(path) => {
                 let mut file = File::open(path.as_ref())?;
                 file.seek(SeekFrom::Start(range.start as u64))?;
-                Ok(Box::new(file.take(range.len() as u64)))
+                Ok(RangeReader::File(file.take(range.len() as u64)))
             }
         }
     }
