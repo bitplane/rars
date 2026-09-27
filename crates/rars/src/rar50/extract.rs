@@ -1,7 +1,8 @@
 #[path = "scratch.rs"]
 mod scratch;
 use super::{blake2sp, Archive, ExtractedEntryMeta, FileHeader, FileRedirection};
-use crate::codec::rar50::{DecodeMode, DecodedChunk, StreamDecodeError, Unpack50Decoder};
+use crate::codec::rar50::{DecodeMode, DecodedChunk, ReaderState, StreamDecodeError};
+use crate::codec::workspace::{Allowance, Boxed, Budget, Buffer};
 use crate::crc32::{crc32, Crc32};
 use crate::crypto::rar50::{Rar50Cipher, Rar50Keys};
 use crate::error::{Error, Result};
@@ -89,28 +90,33 @@ impl FileHeader {
             ))
     }
 
-    fn packed_data_with_password(
+    fn packed_data_with_allowance<B: Budget>(
         &self,
         archive: &Archive,
         password: Option<&[u8]>,
         control: &crate::read_control::ReadControl,
-    ) -> Result<(Vec<u8>, Option<Rar50Keys>)> {
+        allowance: &B,
+    ) -> Result<(Buffer<u8, B>, Option<Rar50Keys>)> {
         control.check()?;
-        let (reader, keys) = self.packed_reader_with_password(archive, password)?;
+        let (reader, keys) = self.packed_reader_with_allowance(archive, password, allowance)?;
         let mut reader = control.reader(reader);
-        let mut packed = Vec::new();
-        reader.read_to_end(&mut packed)?;
+        let mut packed = Buffer::new(allowance);
+        packed.read_to_end(&mut reader)?;
         Ok((packed, keys))
     }
 
-    fn packed_reader_with_password<'a>(
+    fn packed_reader_with_allowance<'a, B: Budget>(
         &self,
         archive: &'a Archive,
         password: Option<&[u8]>,
-    ) -> Result<(Box<dyn Read + 'a>, Option<Rar50Keys>)> {
+        allowance: &B,
+    ) -> Result<(
+        PackedReader<crate::source::RangeReader<'a>, B>,
+        Option<Rar50Keys>,
+    )> {
         let reader = archive.range_reader(self.block.data_range.clone())?;
         if !self.encrypted {
-            return Ok((Box::new(reader), None));
+            return Ok((PackedReader::Plain(reader), None));
         }
         if !self.packed_size().is_multiple_of(16) {
             return Err(Error::InvalidHeader(
@@ -118,8 +124,24 @@ impl FileHeader {
             ));
         }
         let keys = self.encryption_keys(password)?;
-        let reader = Rar50DecryptingReader::new(reader, keys.key, self.encryption_iv()?);
-        Ok((Box::new(reader), Some(keys)))
+        let iv = self.encryption_iv()?;
+        let reader = Boxed::try_new(
+            || Ok::<_, crate::codec::Error>(Rar50DecryptingReader::new(reader, keys.key, iv)),
+            allowance,
+        )?;
+        Ok((PackedReader::Encrypted(reader), Some(keys)))
+    }
+
+    #[cfg(test)]
+    fn packed_reader_with_password<'a>(
+        &self,
+        archive: &'a Archive,
+        password: Option<&[u8]>,
+    ) -> Result<(
+        PackedReader<crate::source::RangeReader<'a>>,
+        Option<Rar50Keys>,
+    )> {
+        self.packed_reader_with_allowance(archive, password, &Allowance::default())
     }
 
     /// True when the header carries a BLAKE2sp record this build can check.
@@ -271,10 +293,11 @@ impl FileHeader {
         archive: &Archive,
         password: Option<&[u8]>,
     ) -> Result<Vec<u8>> {
-        let mut decoder = Unpack50Decoder::new();
+        let mut decoder = ReaderState::new(&Allowance::default());
         Ok(self
             .decoded_data_with_decoder(archive, &mut decoder, password)?
-            .data)
+            .data
+            .into_vec())
     }
 
     pub(super) fn decoded_recovery_data(
@@ -283,12 +306,12 @@ impl FileHeader {
         password: Option<&[u8]>,
         control: &crate::read_control::ReadControl,
     ) -> Result<Vec<u8>> {
-        let mut decoder = Unpack50Decoder::new();
+        let mut decoder = ReaderState::new(&Allowance::default());
         decoder.read_control = control.clone();
         let decoded =
             control.finish(self.decoded_data_with_decoder(archive, &mut decoder, password))?;
         control.check()?;
-        Ok(decoded.data)
+        Ok(decoded.data.into_vec())
     }
 
     pub(super) fn decoded_comment_with_options(
@@ -343,23 +366,27 @@ impl FileHeader {
         Ok(data)
     }
 
-    fn decoded_data_with_decoder(
+    fn decoded_data_with_decoder<B: Budget>(
         &self,
         archive: &Archive,
-        decoder: &mut Unpack50Decoder,
+        decoder: &mut ReaderState<B>,
         password: Option<&[u8]>,
-    ) -> Result<DecodedData> {
-        let (packed, keys) =
-            self.packed_data_with_password(archive, password, &decoder.read_control)?;
-        let data = self.decode_packed_with_decoder(&packed, decoder)?;
+    ) -> Result<DecodedData<B>> {
+        let (packed, keys) = self.packed_data_with_allowance(
+            archive,
+            password,
+            &decoder.read_control,
+            &decoder.allowance(),
+        )?;
+        let data = self.decode_packed_owned(&packed, decoder)?;
         Ok(DecodedData { data, keys })
     }
 
-    fn decode_packed_with_decoder(
+    fn decode_packed_owned<B: Budget>(
         &self,
         packed: &[u8],
-        decoder: &mut Unpack50Decoder,
-    ) -> Result<Vec<u8>> {
+        decoder: &mut ReaderState<B>,
+    ) -> Result<Buffer<u8, B>> {
         if self.is_stored() {
             if self.encrypted {
                 let unpacked_size = usize::try_from(self.unpacked_size).map_err(|_| {
@@ -375,19 +402,20 @@ impl FileHeader {
                         "RAR 5 encrypted stored file has non-zero padding",
                     ));
                 }
-                return Ok(packed[..unpacked_size].to_vec());
+                return Buffer::copied(&packed[..unpacked_size], &decoder.allowance())
+                    .map_err(Error::from);
             }
             if packed.len() as u64 != self.unpacked_size {
                 return Err(Error::InvalidHeader(
                     "RAR 5 stored file has mismatched packed and unpacked sizes",
                 ));
             }
-            return Ok(packed.to_vec());
+            return Buffer::copied(packed, &decoder.allowance()).map_err(Error::from);
         }
         // Empty compressed members can legitimately omit the packed stream.
         // Any other member must decode successfully, even without CRC/hash.
         if self.unpacked_size == 0 && packed.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Buffer::new(&decoder.allowance()));
         }
 
         let info = self.decoded_compression_info()?;
@@ -407,11 +435,11 @@ impl FileHeader {
             .map_err(Error::from)
     }
 
-    fn stream_packed_with_decoder<R: Read>(
+    fn stream_packed_with_decoder<R: Read, B: Budget>(
         &self,
         packed: &mut R,
         keys: Option<&Rar50Keys>,
-        decoder: &mut Unpack50Decoder,
+        decoder: &mut ReaderState<B>,
         buffered_decode_limit: u64,
         scratch_policy: Option<&crate::Rar50Scratch>,
         writer: &mut dyn Write,
@@ -459,11 +487,12 @@ impl FileHeader {
         self.verify_streaming_integrity(crc, hash, keys)
     }
 
-    fn write_stored_to(
+    fn write_stored_with_allowance<B: Budget>(
         &self,
         archive: &Archive,
         password: Option<&[u8]>,
         writer: &mut dyn Write,
+        allowance: &B,
     ) -> Result<()> {
         if !self.encrypted && self.packed_size() != self.unpacked_size {
             return Err(self.entry_error(
@@ -472,7 +501,7 @@ impl FileHeader {
             ));
         }
         let (mut reader, keys) = self
-            .packed_reader_with_password(archive, password)
+            .packed_reader_with_allowance(archive, password, allowance)
             .map_err(|error| self.entry_error("decoding", error))?;
         let mut crc = Crc32::new();
         let mut hash =
@@ -519,6 +548,16 @@ impl FileHeader {
         }
         self.verify_streaming_integrity(crc, hash, keys.as_ref())
             .map_err(|error| self.entry_error("verifying", error))
+    }
+
+    #[cfg(test)]
+    fn decode_packed_with_decoder(
+        &self,
+        packed: &[u8],
+        decoder: &mut ReaderState<Allowance>,
+    ) -> Result<Vec<u8>> {
+        self.decode_packed_owned(packed, decoder)
+            .map(Buffer::into_vec)
     }
 
     fn entry_error(&self, operation: &'static str, error: Error) -> Error {
@@ -816,22 +855,28 @@ where
     Ok(())
 }
 
-struct DecodedData {
-    data: Vec<u8>,
+struct DecodedData<B: Budget = Allowance> {
+    data: Buffer<u8, B>,
     keys: Option<Rar50Keys>,
 }
 
-struct DecoderSession<'a> {
-    decoder: Unpack50Decoder,
+struct DecoderSession<'a, B: Budget = Allowance> {
+    decoder: ReaderState<B>,
+    allowance: B,
     password: Option<&'a [u8]>,
     buffered_decode_limit: u64,
     scratch: Option<&'a crate::Rar50Scratch>,
 }
 
-impl<'a> DecoderSession<'a> {
-    fn new_with_password(password: Option<&'a [u8]>, buffered_decode_limit: u64) -> Self {
+impl<'a, B: Budget> DecoderSession<'a, B> {
+    fn with_allowance(
+        password: Option<&'a [u8]>,
+        buffered_decode_limit: u64,
+        allowance: &B,
+    ) -> Self {
         Self {
-            decoder: Unpack50Decoder::new(),
+            decoder: ReaderState::new(allowance),
+            allowance: allowance.clone(),
             password,
             buffered_decode_limit,
             scratch: None,
@@ -845,7 +890,12 @@ impl<'a> DecoderSession<'a> {
         writer: &mut dyn Write,
     ) -> Result<()> {
         if file.is_stored() {
-            return file.write_stored_to(archive, self.password, writer);
+            return file.write_stored_with_allowance(
+                archive,
+                self.password,
+                writer,
+                &self.allowance,
+            );
         }
         if file.should_stream_decode(self.buffered_decode_limit) {
             return self.stream_file_to(archive, file, writer);
@@ -867,9 +917,9 @@ impl<'a> DecoderSession<'a> {
         file: &FileHeader,
         writer: &mut dyn Write,
     ) -> Result<()> {
-        let mut streaming_decoder = self.decoder.clone();
+        let mut streaming_decoder = self.decoder.try_clone()?;
         let (mut packed, keys) = file
-            .packed_reader_with_password(archive, self.password)
+            .packed_reader_with_allowance(archive, self.password, &self.allowance)
             .map_err(|error| file.entry_error("reading", error))?;
         file.stream_packed_with_decoder(
             &mut packed,
@@ -884,7 +934,11 @@ impl<'a> DecoderSession<'a> {
         Ok(())
     }
 
-    fn decoded_file_data(&mut self, archive: &Archive, file: &FileHeader) -> Result<DecodedData> {
+    fn decoded_file_data(
+        &mut self,
+        archive: &Archive,
+        file: &FileHeader,
+    ) -> Result<DecodedData<B>> {
         file.decoded_data_with_decoder(archive, &mut self.decoder, self.password)
     }
 
@@ -902,7 +956,7 @@ impl<'a> DecoderSession<'a> {
         split: &PendingSplitRefs,
         final_file: &FileHeader,
         decryptor: Option<&SplitDecryptor>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Buffer<u8, B>> {
         final_file.decode_split_with_decoder(volumes, split, &mut self.decoder, decryptor)
     }
 
@@ -917,9 +971,10 @@ impl<'a> DecoderSession<'a> {
         // Keep solid state only after successful emission and integrity checks,
         // just as for a non-split streaming member.
         self.decoder.read_control.check()?;
-        let mut decoder = self.decoder.clone();
+        let mut decoder = self.decoder.try_clone()?;
         let control = decoder.read_control.clone();
-        let mut packed = split.fragment_reader(volumes, decryptor)?;
+        let mut packed =
+            split.fragment_reader_with_allowance(volumes, decryptor, &self.allowance)?;
         control
             .finish(final_file.stream_packed_with_decoder(
                 &mut packed,
@@ -947,6 +1002,12 @@ impl<'a> DecoderSession<'a> {
             })?;
         self.decoder = decoder;
         Ok(())
+    }
+}
+
+impl<'a> DecoderSession<'a, Allowance> {
+    fn new_with_password(password: Option<&'a [u8]>, buffered_decode_limit: u64) -> Self {
+        Self::with_allowance(password, buffered_decode_limit, &Allowance::default())
     }
 }
 
@@ -1352,30 +1413,43 @@ impl PendingSplitRefs {
         None
     }
 
-    fn fragment_reader<'a>(
+    fn fragment_reader_with_allowance<'a, B: Budget>(
         &self,
         volumes: &'a [Archive],
         decryptor: Option<&SplitDecryptor>,
-    ) -> Result<Box<dyn Read + 'a>> {
-        let mut readers = Vec::with_capacity(self.fragments.len());
+        allowance: &B,
+    ) -> Result<PackedReader<ChainedReader<crate::source::RangeReader<'a>, B>, B>> {
+        let mut readers = Buffer::with_capacity(self.fragments.len(), allowance)?;
         for &(volume_index, file_index) in &self.fragments {
             let archive = &volumes[volume_index];
             let file = archive
                 .files()
                 .nth(file_index)
                 .expect("split fragment index comes from archive enumeration");
-            readers.push(archive.range_reader(file.block.data_range.clone())?);
+            readers.push_admitted(archive.range_reader(file.block.data_range.clone())?);
         }
-        let chained = ChainedReader::new(readers);
+        let chained = ChainedReader::with_readers(readers);
         if let Some(decryptor) = decryptor {
-            Ok(Box::new(Rar50DecryptingReader::new(
-                chained,
-                decryptor.keys.key,
-                decryptor.iv,
-            )))
+            Ok(PackedReader::Encrypted(Boxed::try_new(
+                || {
+                    Ok::<_, crate::codec::Error>(Rar50DecryptingReader::new(
+                        chained,
+                        decryptor.keys.key,
+                        decryptor.iv,
+                    ))
+                },
+                allowance,
+            )?))
         } else {
-            Ok(Box::new(chained))
+            Ok(PackedReader::Plain(chained))
         }
+    }
+    fn fragment_reader<'a>(
+        &self,
+        volumes: &'a [Archive],
+        decryptor: Option<&SplitDecryptor>,
+    ) -> Result<PackedReader<ChainedReader<crate::source::RangeReader<'a>>>> {
+        self.fragment_reader_with_allowance(volumes, decryptor, &Allowance::default())
     }
 }
 
@@ -1418,20 +1492,21 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 }
 
 impl FileHeader {
-    fn decode_split_with_decoder(
+    fn decode_split_with_decoder<B: Budget>(
         &self,
         volumes: &[Archive],
         split: &PendingSplitRefs,
-        decoder: &mut Unpack50Decoder,
+        decoder: &mut ReaderState<B>,
         decryptor: Option<&SplitDecryptor>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Buffer<u8, B>> {
         // PendingSplitRefs::write_to dispatches stored members to
         // write_stored_to before calling this compressed-member decoder.
         let info = self.decoded_compression_info()?;
         let dictionary_size = usize::try_from(info.dictionary_size).map_err(|_| {
             Error::InvalidHeader("RAR 5 dictionary size overflows host address size")
         })?;
-        let mut reader = split.fragment_reader(volumes, decryptor)?;
+        let mut reader =
+            split.fragment_reader_with_allowance(volumes, decryptor, &decoder.allowance())?;
         let output_size = checked_unpacked_size(self.unpacked_size)?;
         let decoded = decoder
             .decode_member_from_reader_with_dictionary(
@@ -1448,6 +1523,17 @@ impl FileHeader {
         // the member fails as "truncated" instead. Checking the fragments here
         // turns that into the checksum mismatch it is.
         match decoded {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    crate::ErrorKind::ResourceLimit
+                        | crate::ErrorKind::Cancelled
+                        | crate::ErrorKind::Io
+                        | crate::ErrorKind::UnsupportedFeature
+                ) =>
+            {
+                Err(error)
+            }
             Err(error) => Err(split.checksum_error(volumes).unwrap_or(error)),
             decoded => decoded,
         }
@@ -1465,6 +1551,19 @@ impl Write for CrcSink<'_> {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+enum PackedReader<R, B: Budget = Allowance> {
+    Plain(R),
+    Encrypted(Boxed<Rar50DecryptingReader<R>, B>),
+}
+impl<R: Read, B: Budget> Read for PackedReader<R, B> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(reader) => reader.read(out),
+            Self::Encrypted(reader) => reader.read(out),
+        }
     }
 }
 
@@ -1530,6 +1629,112 @@ impl<R: Read> Read for Rar50DecryptingReader<R> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn reader_session_workspace_refusals_release_rar5_scratch_filter_buffers_and_files() {
+        let dir = crate::scratch::case("reader-workspace-rar5-scratch");
+        let policy = crate::Rar50Scratch::new(&*dir, 4096);
+        let data = b"scratch Delta quota buffers scratch Delta quota buffers".repeat(2);
+        let bytes = Rar50Writer::new(
+            WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
+                .with_compression_level(1),
+        )
+        .entry(entry(b"filtered.bin", &data))
+        .filter_policy(FilterPolicy::Explicit(crate::FilterSpec::whole(
+            FilterKind::Delta { channels: 2 },
+        )))
+        .finish()
+        .unwrap();
+        let archive = Archive::parse(&bytes).unwrap();
+        let file = archive.files().next().unwrap();
+        refuse_each_reader_session_allocation(|budget| {
+            let result = (|| {
+                let mut session = DecoderSession::with_allowance(None, 1, budget);
+                session.scratch = Some(&policy);
+                let mut out = Buffer::new(budget);
+                session.write_file_to(&archive, file, &mut out)?;
+                assert_eq!(&out[..], &data);
+                Ok(())
+            })();
+            assert_eq!(std::fs::read_dir(&*dir).unwrap().count(), 0);
+            result
+        });
+        let budget = Allowance::limited(1);
+        let mut session = DecoderSession::with_allowance(None, 1, &budget);
+        session.scratch = Some(&policy);
+        let error = session
+            .write_file_to(&archive, file, &mut std::io::sink())
+            .unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::ResourceLimit);
+        assert_eq!(budget.used(), 0);
+        assert_eq!(std::fs::read_dir(&*dir).unwrap().count(), 0);
+    }
+
+    fn refuse_each_reader_session_allocation(
+        mut run: impl FnMut(&crate::codec::workspace::RefusingBudget) -> Result<()>,
+    ) {
+        use crate::codec::workspace::RefusingBudget;
+        let baseline = RefusingBudget::new(usize::MAX);
+        run(&baseline).unwrap();
+        assert_eq!(baseline.used(), 0);
+        assert!(baseline.attempts() > 0);
+        for index in 0..baseline.attempts() {
+            let budget = RefusingBudget::new(index);
+            let error = run(&budget).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                crate::ErrorKind::Cancelled,
+                "allocation {index}: {error}"
+            );
+            assert_eq!(budget.used(), 0, "allocation {index}");
+        }
+    }
+
+    #[test]
+    fn reader_session_workspace_refusals_release_rar5_packed_output_cipher_and_checkpoints() {
+        let data = b"RAR5 charged member payload!\n".repeat(3);
+        for encrypted in [false, true] {
+            for filtered in [false, true] {
+                let input = if encrypted {
+                    entry(b"charged.bin", &data).with_password(b"password".to_vec())
+                } else {
+                    entry(b"charged.bin", &data)
+                };
+                let mut writer = Rar50Writer::new(
+                    WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
+                        .with_compression_level(1),
+                )
+                .entry(input);
+                if filtered {
+                    writer = writer.filter_policy(FilterPolicy::Explicit(
+                        crate::FilterSpec::whole(FilterKind::Delta { channels: 2 }),
+                    ));
+                }
+                let bytes = writer.finish().unwrap();
+                let archive = Archive::parse_with_password(&bytes, Some(b"password")).unwrap();
+                let file = archive.files().next().unwrap();
+                assert!(!file.is_stored());
+                for limit in if filtered {
+                    vec![u64::MAX]
+                } else {
+                    vec![u64::MAX, 1]
+                } {
+                    refuse_each_reader_session_allocation(|budget| {
+                        let mut session =
+                            DecoderSession::with_allowance(Some(b"password"), limit, budget);
+                        let mut out = Buffer::new(budget);
+                        session.write_file_to(&archive, file, &mut out)?;
+                        assert_eq!(&out[..], &data);
+                        let mut second = Buffer::new(budget);
+                        session.write_file_to(&archive, file, &mut second)?;
+                        assert_eq!(&second[..], &data);
+                        Ok(())
+                    });
+                }
+            }
+        }
+    }
+
     use super::super::{
         ArchiveEntry, ArchiveSource, Block, BlockHeader, FileEncryption, FileHash, FilterKind,
         FilterPolicy, MainHeader, Rar50Writer, WriterOptions, HEAD_FILE, HFL_SPLIT_AFTER,
@@ -1835,7 +2040,7 @@ mod tests {
         let archive = Archive::parse(&bytes).unwrap();
         let file = archive.files().next().unwrap();
         let info = file.decoded_compression_info().unwrap();
-        let raw = Unpack50Decoder::new()
+        let raw = ReaderState::new(&Allowance::default())
             .decode_member_with_dictionary(
                 &file.packed_data(&archive).unwrap(),
                 info.algorithm_version,
@@ -2037,7 +2242,7 @@ mod tests {
         let mut file = plain_file(b"secret.txt", b"secret", None);
         file.encrypted = true;
         file.unpacked_size = 6;
-        let mut decoder = Unpack50Decoder::new();
+        let mut decoder = ReaderState::new(&Allowance::default());
 
         assert_eq!(
             file.decode_packed_with_decoder(b"secret\0\0", &mut decoder)
@@ -2196,7 +2401,7 @@ mod tests {
 
     #[test]
     fn decode_packed_rejects_stored_size_mismatch() {
-        let mut decoder = Unpack50Decoder::new();
+        let mut decoder = ReaderState::new(&Allowance::default());
 
         let mut file = plain_file(b"a.txt", &[0u8; 32], None);
         file.unpacked_size = 32;

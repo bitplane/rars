@@ -3250,6 +3250,7 @@ impl Unpack50Decoder {
                 sink,
             )
     }
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn decode_to_sink_with_filters<E>(
         &mut self,
@@ -3284,6 +3285,9 @@ pub(crate) struct ReaderState<B: Budget> {
 }
 
 impl<B: Budget> ReaderState<B> {
+    pub(crate) fn allowance(&self) -> B {
+        self.history.allowance()
+    }
     pub(crate) fn new(allowance: &B) -> Self {
         Self {
             read_control: crate::read_control::ReadControl::default(),
@@ -4229,6 +4233,7 @@ fn apply_filters_with_allowance<B: Budget>(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn apply_filter_data(
     data: &mut [u8],
     filter: &PendingFilter,
@@ -4236,7 +4241,7 @@ pub(crate) fn apply_filter_data(
 ) -> Result<()> {
     apply_filter_data_with_allowance(data, filter, control, &Allowance::default())
 }
-fn apply_filter_data_with_allowance<B: Budget>(
+pub(crate) fn apply_filter_data_with_allowance<B: Budget>(
     data: &mut [u8],
     filter: &PendingFilter,
     control: &crate::read_control::ReadControl,

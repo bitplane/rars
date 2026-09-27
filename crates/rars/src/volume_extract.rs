@@ -62,6 +62,7 @@ impl<R, B: Budget> ChainedReader<R, B> {
         Self { readers, index: 0 }
     }
 }
+#[cfg(test)]
 impl<R> ChainedReader<R, Allowance> {
     pub(crate) fn new(readers: Vec<R>) -> Self {
         Self {

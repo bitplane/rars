@@ -1,5 +1,5 @@
 use super::*;
-use crate::codec::rar50::{apply_filter_data, FilterType, PendingFilter};
+use crate::codec::rar50::{apply_filter_data_with_allowance, FilterType, PendingFilter};
 use crate::streaming::Spool;
 use std::cell::RefCell;
 use std::io::{Seek, SeekFrom};
@@ -161,11 +161,11 @@ fn decode_filter(
     })
 }
 
-pub(super) fn decode<R: Read>(
+pub(super) fn decode<R: Read, B: Budget>(
     file: &FileHeader,
     packed: &mut R,
     keys: Option<&Rar50Keys>,
-    decoder: &mut Unpack50Decoder,
+    decoder: &mut ReaderState<B>,
     policy: &crate::Rar50Scratch,
     writer: &mut dyn Write,
 ) -> Result<()> {
@@ -274,9 +274,9 @@ pub(super) fn decode<R: Read>(
         // or seeking, even though the codec admitted the original record.
         let filter = decode_filter(bytes, output_size, policy.filter_memory_limit)?;
         transformed.seek(SeekFrom::Start(filter.start as u64))?;
-        let mut data = vec![0; filter.length];
+        let mut data = Buffer::filled(filter.length, 0, &decoder.allowance())?;
         control.reader(&mut transformed).read_exact(&mut data)?;
-        apply_filter_data(&mut data, &filter, &control)?;
+        apply_filter_data_with_allowance(&mut data, &filter, &control, &decoder.allowance())?;
         transformed.seek(SeekFrom::Start(filter.start as u64))?;
         control.write_all(&mut transformed, &data)?;
     }
