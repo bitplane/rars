@@ -5951,6 +5951,44 @@ fn reader_policy_flags_apply_to_parsing_comments_and_extraction() {
 }
 
 #[test]
+fn reader_workspace_flag_reaches_comment_and_extraction_decoders() {
+    let dir = scratch::case("cli-reader-workspace");
+    let mut builder = rars::Builder::new(rars::ArchiveVersion::Rar50)
+        .comment(Some(b"compressed comment".repeat(32)));
+    builder
+        .add_bytes(
+            b"file".to_vec(),
+            b"compressed payload".repeat(32),
+            None,
+            None,
+        )
+        .unwrap();
+    let archive = dir.join("workspace.rar");
+    fs::write(&archive, builder.to_bytes().unwrap()).unwrap();
+    for command in ["info", "test", "extract"] {
+        for limit in ["1", "64m"] {
+            let mut child = rars();
+            child
+                .args([command, "--max-reader-workspace-bytes", limit])
+                .arg(&archive);
+            if command == "extract" {
+                child.arg(dir.join(format!("out-{limit}")));
+            }
+            let result = child.output().unwrap();
+            assert_eq!(
+                result.status.success(),
+                limit == "64m",
+                "{command}: {}",
+                stderr(&result)
+            );
+            if limit == "1" {
+                assert!(stderr(&result).contains("workspace"));
+            }
+        }
+    }
+}
+
+#[test]
 fn cli_scratch_policy_decodes_filtered_members_and_cleans_up() {
     use rars::rar50::{ArchiveEntry, Rar50Writer, WriterOptions};
     use rars::{ArchiveVersion, EntrySource, FeatureSet, FilterKind, FilterPolicy};

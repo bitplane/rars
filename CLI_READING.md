@@ -11,6 +11,7 @@ see [filename decoding](FILENAME_ENCODINGS.md).
 | `--max-header-bytes SIZE` | Parsed header bytes per archive/volume |
 | `--max-member-output-bytes SIZE` | Logical output of one member or archive comment |
 | `--max-total-output-bytes SIZE` | Logical output across a decoding call, including a volume set |
+| `--max-reader-workspace-bytes SIZE` | Aggregate reader workspace capacity across members, volume fragments and queued parallel results |
 | `--rar50-dictionary-size-limit SIZE` | Declared RAR5/7 dictionary size |
 | `--rar50-buffered-decode-limit SIZE` | RAR5/7 buffered decoding allowance |
 
@@ -28,8 +29,12 @@ For RAR5/7 filtered decoding, `--rar50-scratch-dir PATH` and
 `--rar50-scratch-bytes SIZE` enable bounded scratch storage together.
 `--rar50-filter-memory-limit SIZE` optionally sets the in-memory filter allowance
 and requires scratch storage. Scratch files are cleaned up when decoding ends.
-These controls do not set an aggregate process-memory ceiling. Dictionary,
-packed input, concurrent jobs and other retained state have separate costs.
+`--max-reader-workspace-bytes` also charges the in-memory decoder/filter buffers
+used by scratch-backed decoding. Parsed sources and caller output storage remain
+outside that ceiling. Parallel workers receive fixed allowances before dispatch;
+increase the limit if a worker's share is insufficient. See the
+[reader resource contract](READER_RESOURCE_CONTRACT.md) for capacity accounting,
+exclusions and failure behavior. None of these options limits process RAM.
 
 A limit failure can leave earlier extracted members or a failing member's
 prefix. An unknown-size logical RAR5 member is refused when a member-output

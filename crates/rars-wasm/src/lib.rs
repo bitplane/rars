@@ -991,6 +991,7 @@ fn read_options<'a>(
     options.max_header_bytes = read_limit(settings, "maxHeaderBytes")?;
     options.max_member_output_bytes = read_limit(settings, "maxMemberOutputBytes")?;
     options.max_total_output_bytes = read_limit(settings, "maxTotalOutputBytes")?;
+    options.max_reader_workspace_bytes = read_limit(settings, "maxReaderWorkspaceBytes")?;
     options.rar50_dictionary_size_limit = read_limit(settings, "rar50DictionarySizeLimit")?;
     options.rar50_buffered_decode_limit = read_limit(settings, "rar50BufferedDecodeLimit")?;
     Ok(options)

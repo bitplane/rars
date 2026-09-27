@@ -27,6 +27,8 @@ export interface ReadOptions extends OperationOptions {
   maxHeaderBytes?: number | bigint;
   maxMemberOutputBytes?: number | bigint;
   maxTotalOutputBytes?: number | bigint;
+  /** Aggregate reader workspace capacity per call; excludes sources and final output. */
+  maxReaderWorkspaceBytes?: number | bigint;
   rar50DictionarySizeLimit?: number | bigint;
   rar50BufferedDecodeLimit?: number | bigint;
 }

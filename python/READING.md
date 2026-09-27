@@ -15,6 +15,7 @@ options = rars.ReadOptions(
     cancellation=token,
     max_member_output_bytes=16 * 1024**2,
     max_total_output_bytes=64 * 1024**2,
+    max_reader_workspace_bytes=128 * 1024**2,
     rar50_dictionary_size_limit=32 * 1024**2,
 )
 payload = archive.read("document.txt", options=options)
@@ -35,6 +36,7 @@ through `2**64 - 1`; `None` retains the default policy.
 | `cancellation` | A `CancellationToken` shared with the caller. Another Python thread may call `cancel()` while decoding runs with the GIL released. |
 | `max_member_output_bytes` | Inclusive logical output ceiling per decoded member, across all archive families. Zero permits empty output. |
 | `max_total_output_bytes` | Inclusive logical output ceiling for the call. Counts all decoded members, including discarded solid predecessors. Configuring it selects sequential extraction. |
+| `max_reader_workspace_bytes` | Inclusive aggregate reader workspace capacity per call, including decoder state and intermediate payload buffers. Parsed sources and returned bytes are excluded. |
 | `rar50_dictionary_size_limit` | Inclusive declared dictionary-size admission limit for compressed RAR5/7 members; not a total RAM quota. |
 | `rar50_buffered_decode_limit` | Threshold above which RAR5/7 uses streaming decoding where supported. Filtered members can require scratch-backed decoding; scratch policy is not exposed by this Python API yet. |
 
@@ -55,6 +57,13 @@ files and explicit directories are still created.
 buffer. `open` also decodes the complete member before returning `BytesIO`; it is
 not a streaming archive reader. Output limits do not account for all decoder
 workspace, retained input, copies or concurrent jobs.
+
+The workspace policy applies across members and volume fragments, including
+solid predecessors and options-aware comments. It counts allocation capacity and
+temporary replacement overlap; logical output limits count decoded bytes instead.
+It excludes Python objects, parsed archives, returned bytes and caller files.
+See the [reader resource contract](../READER_RESOURCE_CONTRACT.md) for the shared
+accounting and publication rules.
 
 Cancellation raises `InterruptedError` when observed. It is cooperative: blocked
 I/O and indivisible codec work cannot be interrupted midway. Cancelled tokens

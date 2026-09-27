@@ -50,7 +50,7 @@ const comment = await archive.readComment(limits); // undefined if absent
 ```
 
 The optional fields are `maxHeaderCount`, `maxHeaderBytes`,
-`maxMemberOutputBytes`, `maxTotalOutputBytes`, `rar50DictionarySizeLimit` and
+`maxMemberOutputBytes`, `maxTotalOutputBytes`, `maxReaderWorkspaceBytes`, `rar50DictionarySizeLimit` and
 `rar50BufferedDecodeLimit`. Values must be nonnegative safe integer numbers or
 `bigint` values through `2n ** 64n - 1n`. Zero is a real limit. Omission retains
 the library default. Resource options apply to one call and are not retained by `open()`.
@@ -66,6 +66,12 @@ has separate costs. RAR5/7 dictionary and buffered-decoding limits affect those
 formats only. Filesystem scratch decoding is unavailable in the WASM backend.
 Unknown-size RAR5 members are refused under a member-output limit; decode-to-end
 support remains separate work.
+
+`maxReaderWorkspaceBytes` limits aggregate reader allocation capacity per call,
+including decoder state and queued parallel payloads. Source buffers, JavaScript
+objects and returned bytes are outside the quota. Capacity replacement overlap
+counts; this is not a process RAM limit. Refusals retain the resource error code
+and byte details. See the [reader resource contract](https://github.com/bitplane/rars/blob/master/READER_RESOURCE_CONTRACT.md).
 
 ## Write
 

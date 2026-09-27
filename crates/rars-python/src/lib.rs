@@ -128,6 +128,8 @@ struct ReadOptions {
     #[pyo3(get)]
     max_total_output_bytes: Option<u64>,
     #[pyo3(get)]
+    max_reader_workspace_bytes: Option<u64>,
+    #[pyo3(get)]
     max_header_count: Option<u64>,
     #[pyo3(get)]
     max_header_bytes: Option<u64>,
@@ -141,11 +143,12 @@ struct ReadOptions {
 impl ReadOptions {
     #[new]
     #[allow(clippy::too_many_arguments)] // Python keyword-only policy fields.
-    #[pyo3(signature = (*, cancellation=None, max_member_output_bytes=None, max_total_output_bytes=None, rar50_dictionary_size_limit=None, rar50_buffered_decode_limit=None, max_header_count=None, max_header_bytes=None, legacy_name_encoding=None))]
+    #[pyo3(signature = (*, cancellation=None, max_member_output_bytes=None, max_total_output_bytes=None, max_reader_workspace_bytes=None, rar50_dictionary_size_limit=None, rar50_buffered_decode_limit=None, max_header_count=None, max_header_bytes=None, legacy_name_encoding=None))]
     fn new(
         cancellation: Option<&CancellationToken>,
         max_member_output_bytes: Option<u64>,
         max_total_output_bytes: Option<u64>,
+        max_reader_workspace_bytes: Option<u64>,
         rar50_dictionary_size_limit: Option<u64>,
         rar50_buffered_decode_limit: Option<u64>,
         max_header_count: Option<u64>,
@@ -163,6 +166,7 @@ impl ReadOptions {
             cancellation: cancellation.map(|token| token.inner.clone()),
             max_member_output_bytes,
             max_total_output_bytes,
+            max_reader_workspace_bytes,
             rar50_dictionary_size_limit,
             rar50_buffered_decode_limit,
             max_header_count,
@@ -190,6 +194,7 @@ fn python_read_options<'a>(
         options.max_header_bytes = settings.max_header_bytes;
         options.max_member_output_bytes = settings.max_member_output_bytes;
         options.max_total_output_bytes = settings.max_total_output_bytes;
+        options.max_reader_workspace_bytes = settings.max_reader_workspace_bytes;
         options.rar50_dictionary_size_limit = settings.rar50_dictionary_size_limit;
         options.rar50_buffered_decode_limit = settings.rar50_buffered_decode_limit;
     }
@@ -2316,6 +2321,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reader_workspace_options_reach_the_decoder_and_raise_memory_error() {
+        Python::initialize();
+        Python::attach(|py| {
+            let kwargs = pyo3::types::PyDict::new(py);
+            kwargs.set_item("max_reader_workspace_bytes", 1u64).unwrap();
+            let object = py
+                .get_type::<ReadOptions>()
+                .call((), Some(&kwargs))
+                .unwrap();
+            assert_eq!(
+                object
+                    .getattr("max_reader_workspace_bytes")
+                    .unwrap()
+                    .extract::<u64>()
+                    .unwrap(),
+                1
+            );
+            let settings = object.extract::<PyRef<'_, ReadOptions>>().unwrap();
+            let options = python_read_options(Some(&settings), None);
+            assert_eq!(options.max_reader_workspace_bytes, Some(1));
+            let mut builder = rars_rs::Builder::new(rars_rs::ArchiveVersion::Rar50);
+            builder
+                .add_bytes(
+                    b"file".to_vec(),
+                    b"compressed payload".repeat(32),
+                    None,
+                    None,
+                )
+                .unwrap();
+            let archive = rars_rs::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+            let error = map_error(archive.test_with_options(options).unwrap_err());
+            assert!(error.is_instance_of::<PyMemoryError>(py));
+        });
+    }
+
+    #[test]
     fn python_thread_cancels_an_in_progress_read_without_a_callback() {
         use std::io::{Cursor, Read, Seek, SeekFrom};
         use std::sync::mpsc;
@@ -2372,7 +2413,7 @@ mod tests {
                 };
                 let token = CancellationToken::new();
                 let options =
-                    ReadOptions::new(Some(&token), None, None, None, None, None, None, None)
+                    ReadOptions::new(Some(&token), None, None, None, None, None, None, None, None)
                         .unwrap();
                 let cancel_object = Py::new(py, token).unwrap();
                 armed.store(true, Ordering::Relaxed);

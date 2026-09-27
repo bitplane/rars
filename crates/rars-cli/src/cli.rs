@@ -77,6 +77,9 @@ pub(crate) struct ReadOptionsArgs {
     /// Maximum decoded output per extraction/test call, or per archive comment
     #[arg(long, value_name = "SIZE", value_parser = crate::parse_size_string)]
     pub max_total_output_bytes: Option<usize>,
+    /// Maximum aggregate reader workspace per call (not process RAM)
+    #[arg(long, value_name = "SIZE", value_parser = crate::parse_size_string)]
+    pub max_reader_workspace_bytes: Option<usize>,
     /// Maximum top-level headers per physical archive parse
     #[arg(long, value_name = "COUNT")]
     pub max_header_count: Option<u64>,
@@ -118,6 +121,8 @@ impl ReadOptionsArgs {
         options.max_header_bytes = self.max_header_bytes.map(|value| value as u64);
         options.max_member_output_bytes = self.max_member_output_bytes.map(|value| value as u64);
         options.max_total_output_bytes = self.max_total_output_bytes.map(|value| value as u64);
+        options.max_reader_workspace_bytes =
+            self.max_reader_workspace_bytes.map(|value| value as u64);
         options.rar50_dictionary_size_limit =
             self.rar50_dictionary_size_limit.map(|value| value as u64);
         options.rar50_buffered_decode_limit =

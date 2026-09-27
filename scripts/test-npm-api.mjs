@@ -41,3 +41,27 @@ assert.equal(decoded.getAll("café").length, 2);
 assert.equal(decoded.get(new Uint8Array([99, 97, 102, 130])).index, 1);
 assert.equal(decoded.get("missing"), undefined);
 console.log("npm decoded-name ambiguity checks passed");
+
+// The handwritten API validates and forwards workspace limits without a WASM build.
+const quotaRequests = [];
+const { RarArchive: QuotaArchive } = createApi({
+  prepareArchiveSources: async (input) => [input],
+  setErrorFactory() {},
+  request: async (operation, payload) => {
+    quotaRequests.push([operation, payload.readOptions]);
+    return { entries: [] };
+  },
+});
+const quotaArchive = await QuotaArchive.open(new Uint8Array(), { maxReaderWorkspaceBytes: 8192n });
+await quotaArchive.test({ maxReaderWorkspaceBytes: 4096 });
+await quotaArchive.readComment({ maxReaderWorkspaceBytes: 2048n });
+assert.deepEqual(quotaRequests, [
+  ["open", { maxReaderWorkspaceBytes: 8192n }],
+  ["test", { maxReaderWorkspaceBytes: 4096 }],
+  ["readComment", { maxReaderWorkspaceBytes: 2048n }],
+]);
+for (const value of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1, -1n, 1n << 64n]) {
+  await assert.rejects(QuotaArchive.open(new Uint8Array(), { maxReaderWorkspaceBytes: value }),
+    (error) => error.code === "INVALID_OPTION");
+}
+console.log("npm reader workspace forwarding checks passed");

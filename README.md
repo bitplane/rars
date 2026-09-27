@@ -66,9 +66,11 @@ preservation semantics.
 
 ## Reader resources
 
-Rust readers accept `ArchiveReadOptions::with_max_reader_workspace_bytes` to
-limit aggregate decoder workspace and queued parallel results across an extraction
-call or volume set. The default is unlimited. Logical output, parsed sources and
+Reader workspace limits are available as Rust
+`ArchiveReadOptions::with_max_reader_workspace_bytes`, CLI
+`--max-reader-workspace-bytes`, Python `ReadOptions(max_reader_workspace_bytes=...)`
+and npm `maxReaderWorkspaceBytes`. They limit aggregate decoder workspace and
+queued parallel results across an extraction call or volume set. The default is unlimited. Logical output, parsed sources and
 caller output storage have separate costs; see the
 [reader resource contract](READER_RESOURCE_CONTRACT.md).
 

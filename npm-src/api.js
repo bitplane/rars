@@ -34,7 +34,7 @@ export function createApi(runtime) {
       }
       limits.legacyNameEncoding = encoding;
     }
-    for (const key of ["maxHeaderCount", "maxHeaderBytes", "maxMemberOutputBytes", "maxTotalOutputBytes", "rar50DictionarySizeLimit", "rar50BufferedDecodeLimit"]) {
+    for (const key of ["maxHeaderCount", "maxHeaderBytes", "maxMemberOutputBytes", "maxTotalOutputBytes", "maxReaderWorkspaceBytes", "rar50DictionarySizeLimit", "rar50BufferedDecodeLimit"]) {
       const value = options[key];
       if (value == null) continue;
       if (!(typeof value === "number" && Number.isSafeInteger(value) && value >= 0) &&
