@@ -91,11 +91,14 @@ impl Rar20Cipher {
             }
         }
 
-        let mut padded = Zeroizing::new(password.to_vec());
-        let padding = (16 - padded.len() % 16) % 16;
-        let new_len = padded.len() + padding;
-        padded.resize(new_len, 0);
-        for block in padded.chunks_exact_mut(16) {
+        // clamp_password retains at most 127 Unicode scalars (four UTF-8
+        // bytes each). Round that fixed upper bound up to a cipher block.
+        const PADDED_PASSWORD_BYTES: usize =
+            (crate::crypto::MAX_PASSWORD_CHARS * 4).div_ceil(16) * 16;
+        let mut padded = Zeroizing::new([0u8; PADDED_PASSWORD_BYTES]);
+        padded[..password.len()].copy_from_slice(password);
+        let padded_len = password.len().div_ceil(16) * 16;
+        for block in padded[..padded_len].chunks_exact_mut(16) {
             self.encrypt_block(block);
         }
     }
@@ -201,6 +204,29 @@ mod tests {
             .decrypt_in_place(&mut encrypted)
             .unwrap();
         assert_eq!(encrypted, original);
+    }
+
+    #[test]
+    fn rar20_maximum_unicode_password_preserves_the_pinned_key_schedule() {
+        let password = "😀".repeat(crate::crypto::MAX_PASSWORD_CHARS);
+        let mut encrypted = *b"0123456789abcdef";
+        Rar20Cipher::new(password.as_bytes())
+            .encrypt_in_place(&mut encrypted)
+            .unwrap();
+        // Captured from the former Vec-based key schedule before replacing it.
+        assert_eq!(
+            encrypted,
+            [162, 163, 252, 197, 198, 249, 120, 35, 101, 82, 12, 143, 172, 74, 33, 216]
+        );
+        let mut longer = *b"0123456789abcdef";
+        Rar20Cipher::new((password.clone() + "ignored").as_bytes())
+            .encrypt_in_place(&mut longer)
+            .unwrap();
+        assert_eq!(longer, encrypted);
+        Rar20Cipher::new(password.as_bytes())
+            .decrypt_in_place(&mut encrypted)
+            .unwrap();
+        assert_eq!(&encrypted, b"0123456789abcdef");
     }
 
     #[test]
