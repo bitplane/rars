@@ -1,3 +1,4 @@
+use super::workspace::{Allowance, Budget, Buffer};
 use super::{Error, Result};
 
 const MEMORY_SIZE: usize = 0x40000;
@@ -69,7 +70,7 @@ pub enum Opcode {
     Print = 39,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operand {
     Register(u8),
     Immediate(u32),
@@ -96,54 +97,7 @@ pub struct ExecutionResult {
 
 impl Program {
     pub fn parse(blob: &[u8]) -> Result<Self> {
-        if blob.is_empty() {
-            return Err(Error::InvalidData("RARVM program blob is empty"));
-        }
-        if blob.iter().fold(0u8, |acc, &byte| acc ^ byte) != 0 {
-            return Err(Error::InvalidData("RARVM program checksum mismatch"));
-        }
-
-        let mut bits = BitReader::new(&blob[1..]);
-        let mut static_data = Vec::new();
-        if bits.read_bit()? != 0 {
-            let size = bits
-                .read_vm_number()?
-                .checked_add(1)
-                .ok_or(Error::InvalidData("RARVM static data size overflows"))?
-                as usize;
-            if size > MAX_STATIC_DATA {
-                return Err(Error::InvalidData("RARVM static data is too large"));
-            }
-            for _ in 0..size {
-                static_data.push(bits.read_bits(8)? as u8);
-            }
-        }
-
-        let mut instructions = Vec::new();
-        while bits.remaining_bits() >= 8 {
-            match parse_instruction(&mut bits, instructions.len()) {
-                Ok(instruction) => instructions.push(instruction),
-                // Instruction decoding only performs bounded bit reads. An
-                // incomplete final instruction is ignored for compatibility.
-                Err(_) => break,
-            }
-        }
-
-        if instructions
-            .last()
-            .is_none_or(|instruction| !instruction.opcode.is_unconditional_control_transfer())
-        {
-            instructions.push(Instruction {
-                opcode: Opcode::Ret,
-                byte_mode: false,
-                operands: Vec::new(),
-            });
-        }
-
-        Ok(Self {
-            static_data,
-            instructions,
-        })
+        OwnedProgram::parse(blob, &Allowance::default()).map(OwnedProgram::into_public)
     }
 
     pub fn execute(&self, invocation: Invocation<'_>) -> Result<ExecutionResult> {
@@ -156,8 +110,150 @@ impl Program {
         control: &crate::read_control::ReadControl,
     ) -> Result<ExecutionResult> {
         control.check_codec()?;
-        let mut vm = Vm::new(self, invocation)?;
-        vm.run(self, control)
+        let mut vm = Vm::with_allowance(self, invocation, &Allowance::default())?;
+        vm.run(self, control).map(OwnedExecutionResult::into_public)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct OwnedProgram<B: Budget> {
+    static_data: Buffer<u8, B>,
+    instructions: Buffer<OwnedInstruction<B>, B>,
+}
+#[derive(Debug)]
+struct OwnedInstruction<B: Budget> {
+    opcode: Opcode,
+    byte_mode: bool,
+    operands: Buffer<Operand, B>,
+}
+impl<B: Budget> OwnedProgram<B> {
+    pub(crate) fn parse(blob: &[u8], allowance: &B) -> Result<Self> {
+        if blob.is_empty() {
+            return Err(Error::InvalidData("RARVM program blob is empty"));
+        }
+        if blob.iter().fold(0u8, |acc, &byte| acc ^ byte) != 0 {
+            return Err(Error::InvalidData("RARVM program checksum mismatch"));
+        }
+
+        let mut bits = BitReader::new(&blob[1..]);
+        let mut static_data = Buffer::new(allowance);
+        if bits.read_bit()? != 0 {
+            let size = bits
+                .read_vm_number()?
+                .checked_add(1)
+                .ok_or(Error::InvalidData("RARVM static data size overflows"))?
+                as usize;
+            if size > MAX_STATIC_DATA {
+                return Err(Error::InvalidData("RARVM static data is too large"));
+            }
+            static_data = Buffer::with_capacity(size, allowance)?;
+            for _ in 0..size {
+                static_data.push_admitted(bits.read_bits(8)? as u8);
+            }
+        }
+
+        let mut instructions = Buffer::new(allowance);
+        while bits.remaining_bits() >= 8 {
+            match parse_instruction_with_allowance(&mut bits, instructions.len(), allowance) {
+                Ok(instruction) => instructions.try_push(instruction)?,
+                // Instruction decoding only performs bounded bit reads. An
+                // incomplete final instruction is ignored for compatibility.
+                Err(Error::NeedMoreInput | Error::InvalidData(_)) => break,
+                Err(error) => return Err(error),
+            }
+        }
+
+        if instructions
+            .last()
+            .is_none_or(|instruction| !instruction.opcode.is_unconditional_control_transfer())
+        {
+            instructions.try_push(OwnedInstruction {
+                opcode: Opcode::Ret,
+                byte_mode: false,
+                operands: Buffer::new(allowance),
+            })?;
+        }
+
+        Ok(Self {
+            static_data,
+            instructions,
+        })
+    }
+}
+impl OwnedProgram<Allowance> {
+    fn into_public(self) -> Program {
+        Program {
+            static_data: self.static_data.into_vec(),
+            instructions: self
+                .instructions
+                .into_vec()
+                .into_iter()
+                .map(|instruction| Instruction {
+                    opcode: instruction.opcode,
+                    byte_mode: instruction.byte_mode,
+                    operands: instruction.operands.into_vec(),
+                })
+                .collect(),
+        }
+    }
+}
+struct InstructionRef<'a> {
+    opcode: Opcode,
+    byte_mode: bool,
+    operands: &'a [Operand],
+}
+trait ProgramCode {
+    fn static_data(&self) -> &[u8];
+    fn instruction(&self, index: usize) -> Option<InstructionRef<'_>>;
+    fn instruction_count(&self) -> usize;
+}
+impl ProgramCode for Program {
+    fn static_data(&self) -> &[u8] {
+        &self.static_data
+    }
+    fn instruction(&self, index: usize) -> Option<InstructionRef<'_>> {
+        self.instructions
+            .get(index)
+            .map(|instruction| InstructionRef {
+                opcode: instruction.opcode,
+                byte_mode: instruction.byte_mode,
+                operands: &instruction.operands,
+            })
+    }
+    fn instruction_count(&self) -> usize {
+        self.instructions.len()
+    }
+}
+impl<B: Budget> ProgramCode for OwnedProgram<B> {
+    fn static_data(&self) -> &[u8] {
+        &self.static_data
+    }
+    fn instruction(&self, index: usize) -> Option<InstructionRef<'_>> {
+        self.instructions
+            .get(index)
+            .map(|instruction| InstructionRef {
+                opcode: instruction.opcode,
+                byte_mode: instruction.byte_mode,
+                operands: &instruction.operands,
+            })
+    }
+    fn instruction_count(&self) -> usize {
+        self.instructions.len()
+    }
+}
+#[derive(Debug)]
+pub(crate) struct OwnedExecutionResult<B: Budget> {
+    pub(crate) output: Buffer<u8, B>,
+    pub(crate) globals: Buffer<u8, B>,
+    pub(crate) regs: [u32; 8],
+}
+impl OwnedExecutionResult<Allowance> {
+    fn into_public(self) -> ExecutionResult {
+        ExecutionResult {
+            output: self.output.into_vec(),
+            globals: self.globals.into_vec(),
+            regs: self.regs,
+        }
     }
 }
 
@@ -297,14 +393,18 @@ impl Opcode {
     }
 }
 
-fn parse_instruction(bits: &mut BitReader<'_>, instruction_index: usize) -> Result<Instruction> {
+fn parse_instruction_with_allowance<B: Budget>(
+    bits: &mut BitReader<'_>,
+    instruction_index: usize,
+    allowance: &B,
+) -> Result<OwnedInstruction<B>> {
     let opcode = if bits.read_bit()? == 0 {
         Opcode::from_encoded(bits.read_bits(3)? as u8)
     } else {
         Opcode::from_encoded(bits.read_bits(5)? as u8 + 8)
     };
     let byte_mode = opcode.supports_byte_mode() && bits.read_bit()? != 0;
-    let mut operands = Vec::with_capacity(opcode.operand_count());
+    let mut operands = Buffer::with_capacity(opcode.operand_count(), allowance)?;
     for operand_index in 0..opcode.operand_count() {
         let mut operand = parse_operand(bits, byte_mode)?;
         if operand_index == 0 && opcode.is_jump_or_call() {
@@ -312,9 +412,9 @@ fn parse_instruction(bits: &mut BitReader<'_>, instruction_index: usize) -> Resu
                 operand = Operand::Immediate(remap_jump_target(value, instruction_index));
             }
         }
-        operands.push(operand);
+        operands.push_admitted(operand);
     }
-    Ok(Instruction {
+    Ok(OwnedInstruction {
         opcode,
         byte_mode,
         operands,
@@ -361,8 +461,8 @@ fn remap_jump_target(value: u32, instruction_index: usize) -> u32 {
     (instruction_index as i64).wrapping_add(distance) as u32
 }
 
-struct Vm {
-    memory: Vec<u8>,
+struct Vm<B: Budget = Allowance> {
+    memory: Buffer<u8, B>,
     regs: [u32; 8],
     flags: u32,
 }
@@ -374,24 +474,28 @@ enum ShiftKind {
     ArithmeticRight,
 }
 
-impl Vm {
-    fn new(program: &Program, invocation: Invocation<'_>) -> Result<Self> {
+impl<B: Budget> Vm<B> {
+    fn with_allowance(
+        program: &impl ProgramCode,
+        invocation: Invocation<'_>,
+        allowance: &B,
+    ) -> Result<Self> {
         if invocation.input.len() > GLOBAL_BASE {
             return Err(Error::InvalidData("RARVM filter input is too large"));
         }
 
-        let mut memory = vec![0u8; MEMORY_SIZE];
+        let mut memory = Buffer::filled(MEMORY_SIZE, 0, allowance)?;
         memory[..invocation.input.len()].copy_from_slice(invocation.input);
         let global_len = invocation.global_data.len().min(0x2000);
         memory[GLOBAL_BASE..GLOBAL_BASE + global_len]
             .copy_from_slice(&invocation.global_data[..global_len]);
         let static_start = GLOBAL_BASE + global_len;
         let static_len = program
-            .static_data
+            .static_data()
             .len()
             .min(MEMORY_SIZE.saturating_sub(static_start));
         memory[static_start..static_start + static_len]
-            .copy_from_slice(&program.static_data[..static_len]);
+            .copy_from_slice(&program.static_data()[..static_len]);
 
         write_u32(
             &mut memory,
@@ -428,30 +532,30 @@ impl Vm {
 
     fn run(
         &mut self,
-        program: &Program,
+        program: &impl ProgramCode,
         control: &crate::read_control::ReadControl,
-    ) -> Result<ExecutionResult> {
+    ) -> Result<OwnedExecutionResult<B>> {
         self.run_with_limit(program, control, MAX_INSTRUCTIONS)
     }
 
     fn run_with_limit(
         &mut self,
-        program: &Program,
+        program: &impl ProgramCode,
         control: &crate::read_control::ReadControl,
         instruction_limit: usize,
-    ) -> Result<ExecutionResult> {
+    ) -> Result<OwnedExecutionResult<B>> {
         let mut poller = control.poller();
         let mut ip = 0usize;
         let mut terminated = false;
         for _ in 0..instruction_limit {
             poller.check_codec(0)?;
-            let Some(instruction) = program.instructions.get(ip) else {
+            let Some(instruction) = program.instruction(ip) else {
                 terminated = true;
                 break;
             };
             ip += 1;
-            if let Some(next_ip) = self.execute_instruction(instruction, ip)? {
-                if next_ip >= program.instructions.len() {
+            if let Some(next_ip) = self.execute_instruction(&instruction, ip)? {
+                if next_ip >= program.instruction_count() {
                     terminated = true;
                     break;
                 }
@@ -475,12 +579,17 @@ impl Vm {
             output_pos = 0;
             output_size = 0;
         }
-        let output = self.memory[output_pos..output_pos + output_size].to_vec();
+        let output = Buffer::copied(
+            &self.memory[output_pos..output_pos + output_size],
+            &self.memory.allowance(),
+        )?;
 
         let user_global = (self.read_u32(GLOBAL_BASE + 0x30) as usize).min(MAX_USER_GLOBAL);
-        let globals =
-            self.memory[GLOBAL_BASE..GLOBAL_BASE + SYSTEM_GLOBAL_SIZE + user_global].to_vec();
-        Ok(ExecutionResult {
+        let globals = Buffer::copied(
+            &self.memory[GLOBAL_BASE..GLOBAL_BASE + SYSTEM_GLOBAL_SIZE + user_global],
+            &self.memory.allowance(),
+        )?;
+        Ok(OwnedExecutionResult {
             output,
             globals,
             regs: self.regs,
@@ -489,7 +598,7 @@ impl Vm {
 
     fn execute_instruction(
         &mut self,
-        instruction: &Instruction,
+        instruction: &InstructionRef<'_>,
         ip: usize,
     ) -> Result<Option<usize>> {
         let byte_mode = instruction.byte_mode;
@@ -880,6 +989,13 @@ fn write_u32(memory: &mut [u8], address: usize, value: u32) {
     }
 }
 
+#[cfg(test)]
+impl Vm<Allowance> {
+    fn new(program: &impl ProgramCode, invocation: Invocation<'_>) -> Result<Self> {
+        Self::with_allowance(program, invocation, &Allowance::default())
+    }
+}
+
 #[derive(Debug, Clone)]
 struct BitReader<'a> {
     input: &'a [u8],
@@ -933,6 +1049,85 @@ impl<'a> BitReader<'a> {
 #[cfg(test)]
 mod tests {
 
+    fn reader_vm_blob() -> Vec<u8> {
+        let mut bits = BitWriter::new();
+        bits.write_bits(1, 1);
+        write_vm_number(&mut bits, 2);
+        for byte in [0xaa, 0xbb, 0xcc] {
+            bits.write_bits(byte, 8);
+        }
+        for (address, value) in [(0, 0x41), (GLOBAL_BASE as u32 + 0x30, 8)] {
+            write_opcode(&mut bits, Opcode::Mov);
+            bits.write_bits(0, 1);
+            write_absolute(&mut bits, address);
+            write_number_immediate(&mut bits, value);
+        }
+        write_opcode(&mut bits, Opcode::Ret);
+        with_xor(bits.finish())
+    }
+    fn reader_vm_invocation() -> Invocation<'static> {
+        Invocation {
+            input: &[1, 2, 3, 4],
+            regs: [0; 7],
+            global_data: &[],
+            file_offset: 0,
+            exec_count: 0,
+        }
+    }
+
+    #[test]
+    fn reader_vm_workspace_refusals_release_program_operands_memory_and_results() {
+        use crate::codec::workspace::RefusingBudget;
+        let blob = reader_vm_blob();
+        let run = |budget: &RefusingBudget| -> Result<()> {
+            let program = OwnedProgram::parse(&blob, budget)?;
+            let mut vm = Vm::with_allowance(&program, reader_vm_invocation(), budget)?;
+            let result = vm.run(&program, &crate::read_control::ReadControl::default())?;
+            assert_eq!(&*result.output, b"A\0\0\0");
+            assert_eq!(result.globals.len(), SYSTEM_GLOBAL_SIZE + 8);
+            Ok(())
+        };
+        let baseline = RefusingBudget::new(usize::MAX);
+        run(&baseline).unwrap();
+        let attempts = baseline.attempts();
+        assert!(attempts >= 7);
+        assert_eq!(baseline.used(), 0);
+        for index in 0..attempts {
+            let budget = RefusingBudget::new(index);
+            assert!(
+                matches!(run(&budget), Err(Error::Cancelled)),
+                "allocation {index}"
+            );
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    #[test]
+    fn reader_vm_workspace_results_remain_charged_after_worker_retirement() {
+        use crate::codec::workspace::RESERVATION_BYTES;
+        let ledger = Allowance::limited(1024 * 1024 + RESERVATION_BYTES);
+        let mut reservation = ledger.reserve(1024 * 1024).unwrap();
+        let budget = reservation.allowance();
+        reservation.start();
+        let program = OwnedProgram::parse(&reader_vm_blob(), &budget).unwrap();
+        let mut vm = Vm::with_allowance(&program, reader_vm_invocation(), &budget).unwrap();
+        let result = vm
+            .run(&program, &crate::read_control::ReadControl::default())
+            .unwrap();
+        reservation.retire();
+        assert!(ledger.used() >= MEMORY_SIZE as u64 + RESERVATION_BYTES);
+        drop(vm);
+        drop(program);
+        assert_eq!(
+            ledger.used(),
+            (result.output.capacity() + result.globals.capacity()) as u64 + RESERVATION_BYTES
+        );
+        drop(result);
+        assert_eq!(ledger.used(), RESERVATION_BYTES);
+        drop(budget);
+        assert_eq!(ledger.used(), 0);
+    }
+
     #[test]
     fn cancellation_interrupts_vm_work_without_output() {
         let program = Program {
@@ -972,10 +1167,10 @@ mod tests {
         };
         let mut vm = Vm::new(&program, invocation).unwrap();
 
-        assert_eq!(
+        assert!(matches!(
             vm.run_with_limit(&program, &crate::read_control::ReadControl::default(), 3),
             Err(Error::InvalidData("RARVM instruction limit exceeded"))
-        );
+        ));
     }
     use super::*;
 
