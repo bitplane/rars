@@ -356,3 +356,89 @@ fn callback_cancellation_during_encoding_and_recovery_is_typed() {
         assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
     }
 }
+
+#[test]
+fn cancellation_on_final_compression_update_prevents_archive_and_volume_emission() {
+    use rars::{Error, WriteProgress};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Default)]
+    struct CancelFinalUpdate {
+        member_finished: AtomicBool,
+        cancelled: AtomicBool,
+    }
+    impl WriteProgress for CancelFinalUpdate {
+        fn report(&self, event: WriteProgressEvent<'_>) {
+            match event {
+                WriteProgressEvent::EntryFinished { .. } => {
+                    self.member_finished.store(true, Ordering::Relaxed);
+                }
+                WriteProgressEvent::Advanced {
+                    operation: WriteOperation::Compression,
+                    ..
+                } if self.member_finished.load(Ordering::Relaxed) => {
+                    self.cancelled.store(true, Ordering::Relaxed);
+                }
+                WriteProgressEvent::OperationFinished {
+                    operation: WriteOperation::Compression,
+                    ..
+                }
+                | WriteProgressEvent::OperationStarted {
+                    operation: WriteOperation::Emission,
+                    ..
+                } => panic!("cancelled preparation reported success or began emission"),
+                _ => {}
+            }
+        }
+        fn is_cancelled(&self) -> bool {
+            self.cancelled.load(Ordering::Relaxed)
+        }
+    }
+
+    for version in [ArchiveVersion::Rar50, ArchiveVersion::Rar70] {
+        for volumes in [false, true] {
+            for size in [0, 1024] {
+                let scratch = scratch::case("cancel-final-compression-update");
+                let resources = WriterResources::default()
+                    .with_temp_dir(&*scratch)
+                    .with_max_memory_bytes(8 * 1024 * 1024);
+                let entries = [ArchiveEntry::new(
+                    b"file".to_vec(),
+                    EntrySource::from_bytes(vec![42; size]),
+                )];
+                let options =
+                    WriterOptions::new(version, FeatureSet::store_only()).with_compression_level(0);
+                let reporter = CancelFinalUpdate::default();
+                let mut output = Vec::new();
+                let mut sink = rar50::CollectedVolumes::new();
+                let result = if volumes {
+                    rar50::write_streaming_volumes_with_progress(
+                        &entries,
+                        options,
+                        ArchiveExtras::default(),
+                        512,
+                        &mut sink,
+                        &resources,
+                        Some(&reporter),
+                    )
+                } else {
+                    rar50::write_streaming_archive_with_progress(
+                        &entries,
+                        options,
+                        ArchiveExtras::default(),
+                        &resources,
+                        Some(&reporter),
+                        &mut output,
+                    )
+                };
+                assert_eq!(result, Err(Error::Cancelled));
+                assert!(reporter.member_finished.load(Ordering::Relaxed));
+                assert!(reporter.cancelled.load(Ordering::Relaxed));
+                assert!(output.is_empty());
+                assert!(sink.take().is_empty());
+                assert_eq!(resources.managed_memory_in_use(), 0);
+                assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
+            }
+        }
+    }
+}
