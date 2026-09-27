@@ -1,7 +1,8 @@
 use crate::codec::rar13::{
     unpack15_decode, unpack15_encode, unpack15_encode_with_options_and_progress,
-    EncodeOptions as Rar15EncodeOptions, Unpack15, Unpack15Encoder,
+    EncodeOptions as Rar15EncodeOptions, Reader15State, Unpack15, Unpack15Encoder,
 };
+use crate::codec::workspace::{Allowance, Budget, Buffer};
 use crate::crypto::rar13::{Rar13Cipher, Rar13DecryptReader};
 use crate::detect::{find_archive_start, ArchiveSignature, RAR13_SIGNATURE, SFX_SCAN_LIMIT};
 use crate::error::{Error, Result};
@@ -10,6 +11,7 @@ use crate::io_util::{read_exact_at, read_u16, read_u32};
 pub(crate) use crate::source::ArchiveSource;
 pub use crate::streaming::{EntrySource, WriterResources};
 use crate::version::{ArchiveFamily, ArchiveVersion};
+use crate::volume_extract::ChainedReader;
 pub use crate::write_plan::MemberCoding;
 use crate::write_plan::{PlanShape, WriterOption};
 use crate::write_progress::{ProgressReporter, WorkTracker};
@@ -346,6 +348,46 @@ impl FileHeader {
     }
 }
 
+/// Stored members need no dictionary. Delay model allocation until the first
+/// compressed member, retaining the same allowance throughout a solid chain.
+struct Decoder15<B: Budget = Allowance> {
+    read_control: crate::read_control::ReadControl,
+    allowance: B,
+    state: Option<Reader15State<B>>,
+}
+impl<B: Budget> Decoder15<B> {
+    fn with_allowance(allowance: &B) -> Self {
+        Self {
+            read_control: Default::default(),
+            allowance: allowance.clone(),
+            state: None,
+        }
+    }
+    fn reset(&mut self) {
+        self.state = None;
+    }
+    fn decode_member_from_reader(
+        &mut self,
+        input: &mut impl Read,
+        output_size: usize,
+        solid: bool,
+        out: &mut impl Write,
+    ) -> crate::codec::Result<()> {
+        self.read_control.check_codec()?;
+        if self.state.is_none() {
+            self.state = Some(Reader15State::with_allowance(&self.allowance)?);
+        }
+        let state = self.state.as_mut().expect("decoder initialized above");
+        state.read_control = self.read_control.clone();
+        state.decode_member_from_reader(input, output_size, solid, out)
+    }
+}
+impl Decoder15<Allowance> {
+    fn new() -> Self {
+        Self::with_allowance(&Allowance::default())
+    }
+}
+
 impl Archive {
     pub fn parse(input: &[u8]) -> Result<Self> {
         Self::parse_with_options(input, crate::ArchiveReadOptions::default())
@@ -636,8 +678,22 @@ impl Archive {
         &self,
         options: crate::ArchiveReadOptions<'_>,
         open: &mut F,
+        selector: Option<&mut crate::extraction_control::Selector<'_>>,
+        on_error: Option<&mut crate::extraction_control::ErrorHandler<'_>>,
+    ) -> Result<crate::ExtractionOutcome>
+    where
+        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    {
+        self.extract_with_allowance(options, open, selector, on_error, &Allowance::default())
+    }
+
+    fn extract_with_allowance<F, B: Budget>(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+        open: &mut F,
         mut selector: Option<&mut crate::extraction_control::Selector<'_>>,
         mut on_error: Option<&mut crate::extraction_control::ErrorHandler<'_>>,
+        allowance: &B,
     ) -> Result<crate::ExtractionOutcome>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -645,7 +701,7 @@ impl Archive {
         options.check_cancelled()?;
         let password = options.password;
         let mut budget = crate::output_limit::OutputBudget::new(options);
-        let mut unpack15 = Unpack15::new();
+        let mut unpack15 = Decoder15::with_allowance(allowance);
         unpack15.read_control = budget.control.clone();
         let mut extracted_count = 0usize;
         let solid = self.main.is_solid();
@@ -717,7 +773,7 @@ impl Archive {
                 solid,
                 result,
             )? {
-                unpack15 = Unpack15::new();
+                unpack15.reset();
                 unpack15.read_control = budget.control.clone();
             }
         }
@@ -1001,11 +1057,11 @@ impl Entry {
         }
     }
 
-    fn write_compressed_to(
+    fn write_compressed_to<B: Budget>(
         &self,
         archive: &Archive,
         password: Option<&[u8]>,
-        unpack15: &mut Unpack15,
+        unpack15: &mut Decoder15<B>,
         solid: bool,
         out: &mut impl Write,
     ) -> Result<()> {
@@ -1053,7 +1109,7 @@ impl Entry {
         password: Option<&[u8]>,
         out: &mut impl Write,
     ) -> Result<()> {
-        self.write_compressed_to(archive, password, &mut Unpack15::new(), false, out)
+        self.write_compressed_to(archive, password, &mut Decoder15::new(), false, out)
     }
 
     fn entry_error(&self, operation: &'static str, error: Error) -> Error {
@@ -1064,6 +1120,12 @@ impl Entry {
             return error;
         }
         if self.is_encrypted()
+            && !matches!(
+                error.kind(),
+                crate::ErrorKind::ResourceLimit
+                    | crate::ErrorKind::Cancelled
+                    | crate::ErrorKind::Io
+            )
             && matches!(
                 error,
                 Error::InvalidHeader(_)
@@ -1095,7 +1157,19 @@ where
 pub fn extract_volumes_to_with_options<F>(
     volumes: &[Archive],
     options: crate::ArchiveReadOptions<'_>,
+    open: F,
+) -> Result<()>
+where
+    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+{
+    extract_volumes_with_allowance(volumes, options, open, &Allowance::default())
+}
+
+fn extract_volumes_with_allowance<F, B: Budget>(
+    volumes: &[Archive],
+    options: crate::ArchiveReadOptions<'_>,
     mut open: F,
+    allowance: &B,
 ) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -1104,7 +1178,7 @@ where
     let password = options.password;
     let mut budget = crate::output_limit::OutputBudget::new(options);
     let mut pending: Option<PendingSplitRefs> = None;
-    let mut unpack15 = Unpack15::new();
+    let mut unpack15 = Decoder15::with_allowance(allowance);
     unpack15.read_control = budget.control.clone();
     let mut extracted_count = 0usize;
 
@@ -1276,13 +1350,13 @@ impl PendingSplitRefs {
 
     // Split decoding needs format state, policy accounting and the output callback.
     #[allow(clippy::too_many_arguments)]
-    fn write_to<F>(
+    fn write_to<F, B: Budget>(
         self,
         volumes: &[Archive],
         final_entry: &Entry,
         options: crate::ArchiveReadOptions<'_>,
         budget: &mut crate::output_limit::OutputBudget,
-        unpack15: &mut Unpack15,
+        unpack15: &mut Decoder15<B>,
         solid: bool,
         open: &mut F,
     ) -> Result<()>
@@ -1292,7 +1366,8 @@ impl PendingSplitRefs {
         options.check_cancelled()?;
         let password = options.password;
         budget.check(u64::from(final_entry.header.unp_size), &self.name)?;
-        let mut reader = self.fragment_reader(volumes, password)?;
+        let mut reader =
+            self.fragment_reader_with_allowance(volumes, password, &unpack15.allowance)?;
         let meta = ExtractedEntryMeta {
             name: self.name,
             file_time: self.file_time,
@@ -1331,12 +1406,13 @@ impl PendingSplitRefs {
         })
     }
 
-    fn fragment_reader<'a>(
+    fn fragment_reader_with_allowance<'a, B: Budget>(
         &self,
         volumes: &'a [Archive],
         password: Option<&'a [u8]>,
-    ) -> Result<Box<dyn Read + 'a>> {
-        let mut readers = Vec::with_capacity(self.fragments.len());
+        allowance: &B,
+    ) -> Result<PackedReader<ChainedReader<crate::source::RangeReader<'a>, B>>> {
+        let mut readers = Buffer::with_capacity(self.fragments.len(), allowance)?;
         for &(volume_index, entry_index) in &self.fragments {
             let archive = volumes
                 .get(volume_index)
@@ -1345,39 +1421,33 @@ impl PendingSplitRefs {
                 .entries
                 .get(entry_index)
                 .ok_or(Error::InvalidHeader("RAR 1.3 split entry is missing"))?;
-            readers
-                .push(Box::new(archive.range_reader(entry.packed_range.clone())?) as Box<dyn Read>);
+            readers.push_admitted(archive.range_reader(entry.packed_range.clone())?);
         }
-        let chained = ChainedReader { readers, index: 0 };
+        let chained = ChainedReader::with_readers(readers);
         if self.was_encrypted {
             let password = password.ok_or(Error::NeedPassword)?;
             // RAR 1.402 encrypts the logical packed stream continuously across
             // split volumes; restarting the cipher at each part corrupts it.
-            Ok(Box::new(Rar13DecryptReader::new(
+            Ok(PackedReader::Encrypted(Rar13DecryptReader::new(
                 chained,
                 Rar13Cipher::new(password),
             )))
         } else {
-            Ok(Box::new(chained))
+            Ok(PackedReader::Plain(chained))
         }
     }
 }
 
-struct ChainedReader<'a> {
-    readers: Vec<Box<dyn Read + 'a>>,
-    index: usize,
+enum PackedReader<R> {
+    Plain(R),
+    Encrypted(Rar13DecryptReader<R>),
 }
-
-impl Read for ChainedReader<'_> {
+impl<R: Read> Read for PackedReader<R> {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-        while let Some(reader) = self.readers.get_mut(self.index) {
-            let read = reader.read(out)?;
-            if read != 0 {
-                return Ok(read);
-            }
-            self.index += 1;
+        match self {
+            Self::Plain(reader) => reader.read(out),
+            Self::Encrypted(reader) => reader.read(out),
         }
-        Ok(0)
     }
 }
 
@@ -2397,6 +2467,85 @@ pub fn file_checksum(input: &[u8]) -> u16 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reader_workspace_rar13_stored_archives_need_no_dictionary_allocation() {
+        for password in [None, Some(&b"pw"[..])] {
+            let input = [StoredEntry {
+                name: b"stored.bin",
+                data: b"stored payload",
+                file_time: 0,
+                file_attr: 0x20,
+                password,
+                file_comment: None,
+            }];
+            let bytes = write_stored_archive(&input, WriterOptions::default()).unwrap();
+            let archive = Archive::parse(&bytes).unwrap();
+            let quota = Allowance::limited(0);
+            archive
+                .extract_with_allowance(
+                    crate::ArchiveReadOptions::with_optional_password(password),
+                    &mut |_| Ok(Box::new(std::io::sink())),
+                    None,
+                    None,
+                    &quota,
+                )
+                .unwrap();
+            assert_eq!(quota.used(), 0);
+        }
+    }
+
+    #[test]
+    fn reader_workspace_rar13_refusals_release_dictionary_input_and_stream_buffers() {
+        use crate::codec::workspace::RefusingBudget;
+        let data = b"abcabcabc".repeat(64);
+        for password in [None, Some(&b"pw"[..])] {
+            let input = [FileEntry {
+                name: b"compressed.bin",
+                data: &data,
+                file_time: 0,
+                file_attr: 0x20,
+                password,
+                file_comment: None,
+            }];
+            let bytes = write_compressed_archive(&input, WriterOptions::default()).unwrap();
+            let archive = Archive::parse(&bytes).unwrap();
+            let entry = &archive.entries[0];
+            assert!(!entry.is_stored());
+            let run = |quota: &RefusingBudget| -> Result<()> {
+                let mut decoder = Decoder15::with_allowance(quota);
+                let mut out = Buffer::new(quota);
+                entry.write_compressed_to(&archive, password, &mut decoder, false, &mut out)?;
+                assert_eq!(&out[..], &data);
+                Ok(())
+            };
+            let baseline = RefusingBudget::new(usize::MAX);
+            run(&baseline).unwrap();
+            assert_eq!(baseline.used(), 0);
+            for index in 0..baseline.attempts() {
+                let quota = RefusingBudget::new(index);
+                let error = run(&quota).unwrap_err();
+                assert_eq!(
+                    entry.entry_error("extracting", error).kind(),
+                    crate::ErrorKind::Cancelled,
+                    "allocation {index}"
+                );
+                assert_eq!(quota.used(), 0);
+            }
+            let quota = Allowance::limited(1);
+            let error = archive
+                .extract_with_allowance(
+                    crate::ArchiveReadOptions::with_optional_password(password),
+                    &mut |_| Ok(Box::new(std::io::sink())),
+                    None,
+                    None,
+                    &quota,
+                )
+                .unwrap_err();
+            assert_eq!(error.kind(), crate::ErrorKind::ResourceLimit);
+            assert_eq!(quota.used(), 0);
+        }
+    }
+
     #[test]
     fn writer_limits_are_invalid_arguments() {
         for error in [
