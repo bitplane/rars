@@ -2,9 +2,13 @@ use super::{Error, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FilterOp {
+    #[cfg(test)]
     E8,
+    #[cfg(test)]
     E8E9,
-    Delta { channels: usize },
+    Delta {
+        channels: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -20,8 +24,11 @@ pub(crate) fn encode_in_place(
     file_offset: u32,
     messages: DeltaErrorMessages,
 ) -> Result<()> {
+    let _ = file_offset;
     match op {
+        #[cfg(test)]
         FilterOp::E8 => e8e9_encode(data, file_offset, false),
+        #[cfg(test)]
         FilterOp::E8E9 => e8e9_encode(data, file_offset, true),
         FilterOp::Delta { channels } => {
             let encoded = delta_encode(data, channels, messages)?;
@@ -57,6 +64,7 @@ pub(crate) fn decode_in_place(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn decode_in_place_with_control(
     op: FilterOp,
     data: &mut Vec<u8>,
@@ -67,7 +75,9 @@ pub(crate) fn decode_in_place_with_control(
     control.check_codec()?;
 
     match op {
+        #[cfg(test)]
         FilterOp::E8 => e8e9_decode_with_control(data, file_offset, false, control)?,
+        #[cfg(test)]
         FilterOp::E8E9 => e8e9_decode_with_control(data, file_offset, true, control)?,
         FilterOp::Delta { channels } => {
             *data = delta_decode_with_control(data, channels, messages, control)?;
@@ -165,6 +175,7 @@ pub(crate) fn e8e9_encode(data: &mut [u8], file_offset: u32, include_e9: bool) {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn delta_decode_with_control(
     data: &[u8],
     channels: usize,

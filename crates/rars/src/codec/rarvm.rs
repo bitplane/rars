@@ -127,6 +127,31 @@ struct OwnedInstruction<B: Budget> {
     operands: Buffer<Operand, B>,
 }
 impl<B: Budget> OwnedProgram<B> {
+    pub(crate) fn try_clone(&self) -> Result<Self> {
+        let allowance = self.static_data.allowance();
+        Ok(Self {
+            static_data: Buffer::copied(&self.static_data, &allowance)?,
+            instructions: Buffer::try_collect(
+                self.instructions.iter().map(|instruction| {
+                    Ok(OwnedInstruction {
+                        opcode: instruction.opcode,
+                        byte_mode: instruction.byte_mode,
+                        operands: Buffer::copied(&instruction.operands, &allowance)?,
+                    })
+                }),
+                &allowance,
+            )?,
+        })
+    }
+    pub(crate) fn execute_with_control(
+        &self,
+        invocation: Invocation<'_>,
+        control: &crate::read_control::ReadControl,
+    ) -> Result<OwnedExecutionResult<B>> {
+        control.check_codec()?;
+        let mut vm = Vm::with_allowance(self, invocation, &self.static_data.allowance())?;
+        vm.run(self, control)
+    }
     pub(crate) fn parse(blob: &[u8], allowance: &B) -> Result<Self> {
         if blob.is_empty() {
             return Err(Error::InvalidData("RARVM program blob is empty"));
@@ -178,6 +203,24 @@ impl<B: Budget> OwnedProgram<B> {
             static_data,
             instructions,
         })
+    }
+}
+#[cfg(test)]
+impl From<Program> for OwnedProgram<Allowance> {
+    fn from(program: Program) -> Self {
+        Self {
+            static_data: program.static_data.into(),
+            instructions: program
+                .instructions
+                .into_iter()
+                .map(|instruction| OwnedInstruction {
+                    opcode: instruction.opcode,
+                    byte_mode: instruction.byte_mode,
+                    operands: instruction.operands.into(),
+                })
+                .collect::<Vec<_>>()
+                .into(),
+        }
     }
 }
 impl OwnedProgram<Allowance> {

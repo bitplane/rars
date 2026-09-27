@@ -462,20 +462,6 @@ impl PpmdDecoder {
             state: PpmdState::with_allowance(&Allowance::default()),
         }
     }
-    pub(crate) fn set_read_control(&mut self, control: crate::read_control::ReadControl) {
-        self.state.set_read_control(control);
-    }
-    pub fn decode_init(
-        &mut self,
-        first_byte: u8,
-        input: &mut impl PpmdByteReader,
-        esc_char: &mut u8,
-    ) -> Result<()> {
-        self.state.decode_init(first_byte, input, esc_char)
-    }
-    pub fn decode_symbol(&mut self, input: &mut impl PpmdByteReader) -> Result<Option<u8>> {
-        self.state.decode_symbol(input)
-    }
 }
 #[cfg(test)]
 impl PpmdState<Allowance> {

@@ -292,6 +292,14 @@ impl<T, B: Budget> Buffer<T, B> {
         self.values.resize(len, value);
         Ok(())
     }
+    #[cfg(test)]
+    pub(crate) fn resize_with(&mut self, len: usize, make: impl FnMut() -> T) -> Result<()> {
+        if B::LIMITED && len > self.values.capacity() {
+            self.reserve(len - self.values.len())?;
+        }
+        self.values.resize_with(len, make);
+        Ok(())
+    }
     pub(crate) fn clear(&mut self) {
         self.values.clear();
     }

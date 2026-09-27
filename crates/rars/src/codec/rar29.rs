@@ -1,7 +1,8 @@
 use super::filters::{self, DeltaErrorMessages, FilterOp, MAX_DELTA_CHANNELS};
 use super::huffman;
-use super::ppmd::{PpmdByteReader, PpmdDecoder, PpmdEncoder};
+use super::ppmd::{PpmdByteReader, PpmdDecoder, PpmdEncoder, PpmdState};
 use super::rarvm;
+use super::workspace::{Allowance, Budget, Buffer};
 use super::{match_finder, Error, Result};
 use crate::crc32::crc32;
 use std::io::{Read, Write};
@@ -2368,12 +2369,89 @@ fn canonical_codes(lengths: &[u8]) -> Result<Vec<Option<HuffmanCode>>> {
 #[derive(Debug, Clone)]
 pub struct Unpack29 {
     pub(crate) read_control: crate::read_control::ReadControl,
-    bits: BitReader,
+    state: Reader29State<Allowance>,
+}
+impl Clone for Reader29State<Allowance> {
+    fn clone(&self) -> Self {
+        self.try_clone().expect("unlimited RAR3 decoder copy")
+    }
+}
+impl Default for Unpack29 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl Unpack29 {
+    pub fn new() -> Self {
+        Self {
+            read_control: Default::default(),
+            state: Reader29State::with_allowance(&Allowance::default()),
+        }
+    }
+    pub fn reset_non_solid(&mut self) {
+        self.state.reset_non_solid();
+    }
+    pub fn decode_member(&mut self, input: &[u8], output_size: usize) -> Result<Vec<u8>> {
+        self.state.read_control = self.read_control.clone();
+        self.state
+            .decode_member_owned(input, output_size)
+            .map(Buffer::into_vec)
+    }
+    pub fn decode_member_to(
+        &mut self,
+        input: &[u8],
+        output_size: usize,
+        out: &mut impl Write,
+    ) -> Result<()> {
+        self.state.read_control = self.read_control.clone();
+        self.state.decode_member_to(input, output_size, out)
+    }
+    pub fn decode_member_from_reader(
+        &mut self,
+        input: &mut impl Read,
+        output_size: usize,
+        out: &mut impl Write,
+    ) -> Result<()> {
+        self.state.read_control = self.read_control.clone();
+        self.state
+            .decode_member_from_reader(input, output_size, out)
+    }
+    pub fn decode_non_solid_member(&mut self, input: &[u8], output_size: usize) -> Result<Vec<u8>> {
+        self.state.read_control = self.read_control.clone();
+        self.state
+            .decode_non_solid_member_owned(input, output_size)
+            .map(Buffer::into_vec)
+    }
+    pub fn decode_non_solid_member_to(
+        &mut self,
+        input: &[u8],
+        output_size: usize,
+        out: &mut impl Write,
+    ) -> Result<()> {
+        self.state.read_control = self.read_control.clone();
+        self.state
+            .decode_non_solid_member_to(input, output_size, out)
+    }
+    pub fn decode_non_solid_member_from_reader(
+        &mut self,
+        input: &mut impl Read,
+        output_size: usize,
+        out: &mut impl Write,
+    ) -> Result<()> {
+        self.state.read_control = self.read_control.clone();
+        self.state
+            .decode_non_solid_member_from_reader(input, output_size, out)
+    }
+}
+#[derive(Debug)]
+pub(crate) struct Reader29State<B: Budget> {
+    pub(crate) read_control: crate::read_control::ReadControl,
+    bits: BitReader<B>,
     levels: [u8; TABLE_COUNT],
-    main: Huffman,
-    offsets: Huffman,
-    low_offsets: Huffman,
-    lengths: Huffman,
+    main: Huffman<B>,
+    offsets: Huffman<B>,
+    low_offsets: Huffman<B>,
+    lengths: Huffman<B>,
     old_offsets: [usize; 4],
     last_offset: usize,
     last_length: usize,
@@ -2382,13 +2460,13 @@ pub struct Unpack29 {
     pending_match: Option<(usize, usize)>,
     in_lz_block: bool,
     block_mode: BlockMode,
-    ppmd: PpmdDecoder,
+    ppmd: PpmdState<B>,
     ppmd_esc: u8,
-    filters: Vec<VmFilter>,
-    programs: Vec<VmProgram>,
+    filters: Buffer<VmFilter<B>, B>,
+    programs: Buffer<VmProgram<B>, B>,
     last_filter: usize,
     base_offset: usize,
-    output: Vec<u8>,
+    output: Buffer<u8, B>,
     last_block_end: Option<LzBlockEnd>,
 }
 
@@ -2409,27 +2487,27 @@ fn require_ppmd_symbol(symbol: Option<u8>) -> Result<u8> {
     symbol.ok_or(Error::InvalidData("RAR 2.9 PPMd model is corrupt"))
 }
 
-#[derive(Debug, Clone)]
-struct VmFilter {
+#[derive(Debug)]
+struct VmFilter<B: Budget = Allowance> {
     program: usize,
     start: usize,
     size: usize,
     regs: [u32; 7],
-    global_data: Vec<u8>,
+    global_data: Buffer<u8, B>,
 }
 
-#[derive(Debug, Clone)]
-struct VmProgram {
-    kind: VmProgramKind,
+#[derive(Debug)]
+struct VmProgram<B: Budget = Allowance> {
+    kind: VmProgramKind<B>,
     block_size: usize,
     exec_count: u32,
-    globals: Vec<u8>,
+    globals: Buffer<u8, B>,
 }
 
-#[derive(Debug, Clone)]
-enum VmProgramKind {
+#[derive(Debug)]
+enum VmProgramKind<B: Budget = Allowance> {
     Standard(StandardFilter),
-    Generic(rarvm::Program),
+    Generic(rarvm::OwnedProgram<B>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2442,16 +2520,16 @@ enum StandardFilter {
     Audio,
 }
 
-impl Unpack29 {
-    pub fn new() -> Self {
+impl<B: Budget> Reader29State<B> {
+    pub(crate) fn with_allowance(allowance: &B) -> Self {
         Self {
             read_control: crate::read_control::ReadControl::default(),
-            bits: BitReader::new(),
+            bits: BitReader::with_allowance(allowance),
             levels: [0; TABLE_COUNT],
-            main: Huffman::empty(),
-            offsets: Huffman::empty(),
-            low_offsets: Huffman::empty(),
-            lengths: Huffman::empty(),
+            main: Huffman::with_allowance(allowance),
+            offsets: Huffman::with_allowance(allowance),
+            low_offsets: Huffman::with_allowance(allowance),
+            lengths: Huffman::with_allowance(allowance),
             // UnRAR uses an invalid all-bits-one distance here. If a malformed
             // stream repeats a distance before defining one, CopyString sees
             // it as unavailable history and writes deterministic zeroes.
@@ -2463,27 +2541,85 @@ impl Unpack29 {
             pending_match: None,
             in_lz_block: false,
             block_mode: BlockMode::Lz,
-            ppmd: PpmdDecoder::new(),
+            ppmd: PpmdState::with_allowance(allowance),
             ppmd_esc: 2,
-            filters: Vec::new(),
-            programs: Vec::new(),
+            filters: Buffer::new(allowance),
+            programs: Buffer::new(allowance),
             last_filter: 0,
             base_offset: 0,
-            output: Vec::new(),
+            output: Buffer::new(allowance),
             last_block_end: None,
         }
     }
 
+    pub(crate) fn try_clone(&self) -> Result<Self> {
+        let allowance = self.output.allowance();
+        Ok(Self {
+            read_control: self.read_control.clone(),
+            bits: self.bits.try_clone()?,
+            levels: self.levels,
+            main: self.main.try_clone()?,
+            offsets: self.offsets.try_clone()?,
+            low_offsets: self.low_offsets.try_clone()?,
+            lengths: self.lengths.try_clone()?,
+            old_offsets: self.old_offsets,
+            last_offset: self.last_offset,
+            last_length: self.last_length,
+            last_low_offset: self.last_low_offset,
+            low_offset_repeats: self.low_offset_repeats,
+            pending_match: self.pending_match,
+            in_lz_block: self.in_lz_block,
+            block_mode: self.block_mode,
+            ppmd: self.ppmd.try_clone()?,
+            ppmd_esc: self.ppmd_esc,
+            filters: Buffer::try_collect(
+                self.filters.iter().map(|filter| {
+                    Ok(VmFilter {
+                        program: filter.program,
+                        start: filter.start,
+                        size: filter.size,
+                        regs: filter.regs,
+                        global_data: Buffer::copied(&filter.global_data, &allowance)?,
+                    })
+                }),
+                &allowance,
+            )?,
+            programs: Buffer::try_collect(
+                self.programs.iter().map(|program| {
+                    Ok(VmProgram {
+                        kind: match &program.kind {
+                            VmProgramKind::Standard(kind) => VmProgramKind::Standard(*kind),
+                            VmProgramKind::Generic(program) => {
+                                VmProgramKind::Generic(program.try_clone()?)
+                            }
+                        },
+                        block_size: program.block_size,
+                        exec_count: program.exec_count,
+                        globals: Buffer::copied(&program.globals, &allowance)?,
+                    })
+                }),
+                &allowance,
+            )?,
+            last_filter: self.last_filter,
+            base_offset: self.base_offset,
+            output: Buffer::copied(&self.output, &allowance)?,
+            last_block_end: self.last_block_end,
+        })
+    }
     pub fn reset_non_solid(&mut self) {
         let control = self.read_control.clone();
-        *self = Self::new();
+        *self = Self::with_allowance(&self.output.allowance());
         self.read_control = control;
     }
 
-    pub fn decode_non_solid_member(&mut self, input: &[u8], output_size: usize) -> Result<Vec<u8>> {
+    pub fn decode_non_solid_member_owned(
+        &mut self,
+        input: &[u8],
+        output_size: usize,
+    ) -> Result<Buffer<u8, B>> {
         self.read_control.check_codec()?;
         self.reset_non_solid();
-        self.decode_member(input, output_size)
+        self.decode_member_owned(input, output_size)
     }
 
     pub fn decode_non_solid_member_to(
@@ -2510,8 +2646,12 @@ impl Unpack29 {
         self.decode_member_from_reader(input, output_size, out)
     }
 
-    pub fn decode_member(&mut self, input: &[u8], output_size: usize) -> Result<Vec<u8>> {
-        let mut out = Vec::new();
+    pub fn decode_member_owned(
+        &mut self,
+        input: &[u8],
+        output_size: usize,
+    ) -> Result<Buffer<u8, B>> {
+        let mut out = Buffer::new(&self.output.allowance());
         self.decode_member_to(input, output_size, &mut out)?;
         Ok(out)
     }
@@ -2534,9 +2674,9 @@ impl Unpack29 {
         self.read_control.check_codec()?;
         let control = self.read_control.clone();
         let input = &mut control.reader(input);
-        let mut packed = Vec::new();
-        input.read_to_end(&mut packed).map_err(Error::from)?;
-        self.decode_loaded_member_to(&packed, output_size, out)
+        self.bits = BitReader::with_allowance(&self.output.allowance());
+        self.bits.input.read_to_end(input)?;
+        self.decode_bits_member_to(output_size, out)
     }
 
     /// Decodes one complete packed member while retaining solid dictionary,
@@ -2548,7 +2688,10 @@ impl Unpack29 {
         out: &mut impl Write,
     ) -> Result<()> {
         self.read_control.check_codec()?;
-        self.bits = BitReader::from_bytes(packed);
+        self.bits = BitReader::from_bytes_with_allowance(packed, &self.output.allowance())?;
+        self.decode_bits_member_to(output_size, out)
+    }
+    fn decode_bits_member_to(&mut self, output_size: usize, out: &mut impl Write) -> Result<()> {
         // `last_block_end` describes control flow within one member. A solid
         // follower legitimately starts after the previous member's new-file
         // marker, so do not mistake that marker for an early end in this one.
@@ -2564,7 +2707,7 @@ impl Unpack29 {
         // flush). When output_size is zero, decode_until skips its loop body
         // and never reads tables, so do the init here so finish_member can
         // observe the block end.
-        if final_target == start && !self.in_lz_block && !packed.is_empty() {
+        if final_target == start && !self.in_lz_block && !self.bits.input.is_empty() {
             self.read_tables().map_err(|error| match error {
                 Error::NeedMoreInput => Error::InvalidData("RAR 2.9 bitstream is truncated"),
                 error => error,
@@ -2587,7 +2730,7 @@ impl Unpack29 {
                 continue;
             }
 
-            let decoded = self.filtered_range(flushed, safe_end, start)?;
+            let decoded = self.filtered_range_owned(flushed, safe_end, start)?;
             out.write_all(&decoded).map_err(Error::from)?;
             flushed = safe_end;
             self.trim_history(flushed, self.current_pos());
@@ -2656,7 +2799,8 @@ impl Unpack29 {
         }
 
         let level_lengths = Self::read_level_lengths(&mut self.bits)?;
-        let level_decoder = Huffman::from_lengths(&level_lengths)?;
+        let level_decoder =
+            Huffman::from_lengths_with_allowance(&level_lengths, &self.output.allowance())?;
         let mut new_levels = [0u8; TABLE_COUNT];
         let mut pos = 0usize;
         while pos < TABLE_COUNT {
@@ -2694,17 +2838,26 @@ impl Unpack29 {
         }
 
         self.levels = new_levels;
-        self.main = Huffman::from_lengths(&self.levels[..MAIN_COUNT])?;
-        self.offsets = Huffman::from_lengths(&self.levels[MAIN_COUNT..MAIN_COUNT + OFFSET_COUNT])?;
-        self.low_offsets = Huffman::from_lengths(
-            &self.levels[MAIN_COUNT + OFFSET_COUNT..MAIN_COUNT + OFFSET_COUNT + LOW_OFFSET_COUNT],
+        self.main = Huffman::from_lengths_with_allowance(
+            &self.levels[..MAIN_COUNT],
+            &self.output.allowance(),
         )?;
-        self.lengths =
-            Huffman::from_lengths(&self.levels[MAIN_COUNT + OFFSET_COUNT + LOW_OFFSET_COUNT..])?;
+        self.offsets = Huffman::from_lengths_with_allowance(
+            &self.levels[MAIN_COUNT..MAIN_COUNT + OFFSET_COUNT],
+            &self.output.allowance(),
+        )?;
+        self.low_offsets = Huffman::from_lengths_with_allowance(
+            &self.levels[MAIN_COUNT + OFFSET_COUNT..MAIN_COUNT + OFFSET_COUNT + LOW_OFFSET_COUNT],
+            &self.output.allowance(),
+        )?;
+        self.lengths = Huffman::from_lengths_with_allowance(
+            &self.levels[MAIN_COUNT + OFFSET_COUNT + LOW_OFFSET_COUNT..],
+            &self.output.allowance(),
+        )?;
         Ok(())
     }
 
-    fn read_level_lengths(bits: &mut BitReader) -> Result<[u8; LEVEL_COUNT]> {
+    fn read_level_lengths(bits: &mut BitReader<B>) -> Result<[u8; LEVEL_COUNT]> {
         let mut lengths = [0u8; LEVEL_COUNT];
         let mut pos = 0usize;
         while pos < LEVEL_COUNT {
@@ -2731,7 +2884,7 @@ impl Unpack29 {
             poller.check_codec(self.current_pos())?;
             let symbol = self.main.decode(&mut self.bits)?;
             match symbol {
-                0..=255 => self.output.push(symbol as u8),
+                0..=255 => self.output.try_push(symbol as u8)?,
                 256 => {
                     self.read_end_of_block()?;
                     return Ok(());
@@ -2795,7 +2948,7 @@ impl Unpack29 {
             poller.check_codec(self.current_pos())?;
             let symbol = require_ppmd_symbol(self.ppmd.decode_symbol(&mut self.bits)?)?;
             if symbol != self.ppmd_esc {
-                self.output.push(symbol);
+                self.output.try_push(symbol)?;
                 continue;
             }
 
@@ -2805,7 +2958,7 @@ impl Unpack29 {
                     self.in_lz_block = false;
                     return Ok(());
                 }
-                1 => self.output.push(self.ppmd_esc),
+                1 => self.output.try_push(self.ppmd_esc)?,
                 2 => {
                     return Err(Error::InvalidData(
                         "RAR 2.9 member ended before its declared size",
@@ -2948,13 +3101,13 @@ impl Unpack29 {
         } else if len == 8 {
             len = self.bits.read_bits(16)?;
         }
-        let mut data = Vec::with_capacity(len as usize);
+        let mut data = Buffer::with_capacity(len as usize, &self.output.allowance())?;
         for _ in 0..len {
             poller.check_codec(data.len())?;
-            data.push(self.bits.read_bits(8)? as u8);
+            data.push_admitted(self.bits.read_bits(8)? as u8);
         }
 
-        self.parse_vm_code(first_byte, data)
+        self.parse_vm_code_owned(first_byte, data)
     }
 
     fn read_vm_code_ppmd(&mut self) -> Result<()> {
@@ -2967,17 +3120,20 @@ impl Unpack29 {
             len = (u32::from(self.read_ppmd_required_byte()?) << 8)
                 | u32::from(self.read_ppmd_required_byte()?);
         }
-        let mut data = Vec::with_capacity(len as usize);
+        let mut data = Buffer::with_capacity(len as usize, &self.output.allowance())?;
         for _ in 0..len {
             poller.check_codec(data.len())?;
-            data.push(self.read_ppmd_required_byte()?);
+            data.push_admitted(self.read_ppmd_required_byte()?);
         }
 
-        self.parse_vm_code(first_byte, data)
+        self.parse_vm_code_owned(first_byte, data)
     }
 
-    fn parse_vm_code(&mut self, first_byte: u32, data: Vec<u8>) -> Result<()> {
-        let mut vm = BitReader::from_bytes(&data);
+    fn parse_vm_code_owned(&mut self, first_byte: u32, data: Buffer<u8, B>) -> Result<()> {
+        let mut vm = BitReader {
+            input: data,
+            bit_pos: 0,
+        };
         let program_index = if first_byte & 0x80 != 0 {
             let value = vm.read_encoded_u32()?;
             if value == 0 {
@@ -3041,22 +3197,25 @@ impl Unpack29 {
             if code_size >= MAX_VM_CODE_SIZE {
                 return Err(Error::InvalidData("RAR 2.9 VM code is too large"));
             }
-            let mut code = Vec::with_capacity(code_size);
+            let mut code = Buffer::with_capacity(code_size, &self.output.allowance())?;
             for _ in 0..code_size {
-                code.push(vm.read_bits(8)? as u8);
+                code.push_admitted(vm.read_bits(8)? as u8);
             }
             let kind = identify_standard_filter(&code)
                 .map(VmProgramKind::Standard)
                 .map_or_else(
-                    || rarvm::Program::parse(&code).map(VmProgramKind::Generic),
+                    || {
+                        rarvm::OwnedProgram::parse(&code, &self.output.allowance())
+                            .map(VmProgramKind::Generic)
+                    },
                     Ok,
                 )?;
-            self.programs.push(VmProgram {
+            self.programs.try_push(VmProgram {
                 kind,
                 block_size,
                 exec_count: 0,
-                globals: Vec::new(),
-            });
+                globals: Buffer::new(&self.output.allowance()),
+            })?;
         } else {
             // Equality is the new-program case above, and greater indices were
             // rejected before parsing the record.
@@ -3065,44 +3224,51 @@ impl Unpack29 {
             program.block_size = block_size;
         }
 
-        let mut global_data = Vec::new();
+        let mut global_data = Buffer::new(&self.output.allowance());
         if first_byte & 0x08 != 0 {
             let data_size = vm.read_encoded_u32()? as usize;
             if data_size > MAX_VM_USER_GLOBAL_DATA {
                 return Err(Error::InvalidData("RAR 2.9 VM global data is too large"));
             }
-            global_data.resize(VM_SYSTEM_GLOBAL_SIZE, 0);
-            global_data.reserve(data_size);
+            global_data =
+                Buffer::with_capacity(VM_SYSTEM_GLOBAL_SIZE + data_size, &self.output.allowance())?;
+            global_data.resize(VM_SYSTEM_GLOBAL_SIZE, 0)?;
             for _ in 0..data_size {
-                global_data.push(vm.read_bits(8)? as u8);
+                global_data.push_admitted(vm.read_bits(8)? as u8);
             }
         }
 
         if self.filters.len() >= MAX_VM_FILTERS {
             return Err(Error::InvalidData("RAR 2.9 VM filter limit exceeded"));
         }
-        self.filters.push(VmFilter {
+        self.filters.try_push(VmFilter {
             program: program_index,
             start: block_start,
             size: block_size,
             regs,
             global_data,
-        });
+        })?;
         Ok(())
     }
 
-    fn filtered_range(&mut self, start: usize, end: usize, member_start: usize) -> Result<Vec<u8>> {
-        let mut out = Vec::with_capacity(end - start);
+    fn filtered_range_owned(
+        &mut self,
+        start: usize,
+        end: usize,
+        member_start: usize,
+    ) -> Result<Buffer<u8, B>> {
+        let mut out = Buffer::with_capacity(end - start, &self.output.allowance())?;
         let mut pos = start;
-        let filters: Vec<_> = self
-            .filters
-            .iter()
-            .enumerate()
-            .filter_map(|(index, filter)| {
-                (filter.start >= start && filter.start + filter.size <= end).then_some(index)
-            })
-            .collect();
-        let mut applied = vec![false; self.filters.len()];
+        let filters = Buffer::collect(
+            self.filters
+                .iter()
+                .enumerate()
+                .filter_map(|(index, filter)| {
+                    (filter.start >= start && filter.start + filter.size <= end).then_some(index)
+                }),
+            &self.output.allowance(),
+        )?;
+        let mut applied = Buffer::filled(self.filters.len(), false, &self.output.allowance())?;
         let mut index = 0;
         while index < filters.len() {
             let first = self
@@ -3114,10 +3280,12 @@ impl Unpack29 {
             if filter_start < pos {
                 return Err(Error::InvalidData("RAR 2.9 VM filters partially overlap"));
             }
-            out.extend_from_slice(self.raw_range(pos, filter_start)?);
-            let mut block = self
-                .raw_range(filter_start, filter_start + filter_size)?
-                .to_vec();
+            out.extend_from_slice(self.raw_range(pos, filter_start)?)
+                .map_err(Into::into)?;
+            let mut block = Buffer::copied(
+                self.raw_range(filter_start, filter_start + filter_size)?,
+                &self.output.allowance(),
+            )?;
             let file_offset = filter_start
                 .checked_sub(member_start)
                 .ok_or(Error::InvalidData("RAR 2.9 VM filter starts before file"))?
@@ -3128,14 +3296,14 @@ impl Unpack29 {
                         .filters
                         .get(filters[index])
                         .ok_or(Error::InvalidData("RAR 2.9 VM filter is missing"))?;
-                    (filter.program, filter.regs, filter.global_data.clone())
+                    (filter.program, filter.regs, &filter.global_data)
                 };
                 let program = self
                     .programs
                     .get_mut(program_index)
                     .ok_or(Error::InvalidData("RAR 2.9 VM program is missing"))?;
                 match &program.kind {
-                    VmProgramKind::Standard(standard) => apply_standard_filter_with_control(
+                    VmProgramKind::Standard(standard) => apply_standard_filter_with_allowance(
                         *standard,
                         &mut block,
                         file_offset,
@@ -3144,9 +3312,9 @@ impl Unpack29 {
                     )?,
                     VmProgramKind::Generic(generic) => {
                         let globals = if global_data.is_empty() {
-                            program.globals.as_slice()
+                            &program.globals[..]
                         } else {
-                            global_data.as_slice()
+                            &global_data[..]
                         };
                         let result = generic.execute_with_control(
                             rarvm::Invocation {
@@ -3171,10 +3339,11 @@ impl Unpack29 {
                     break;
                 }
             }
-            out.extend_from_slice(&block);
+            out.extend_from_slice(&block).map_err(Into::into)?;
             pos = filter_start + filter_size;
         }
-        out.extend_from_slice(self.raw_range(pos, end)?);
+        out.extend_from_slice(self.raw_range(pos, end)?)
+            .map_err(Into::into)?;
         let mut index = 0;
         self.filters.retain(|_| {
             let keep = !applied[index];
@@ -3228,7 +3397,7 @@ impl Unpack29 {
                     .raw_byte(src)
                     .ok_or(Error::InvalidData("RAR 2.9 match distance is out of range"))?
             };
-            self.output.push(byte);
+            self.output.try_push(byte)?;
         }
         Ok(())
     }
@@ -3285,19 +3454,35 @@ impl Unpack29 {
             return;
         }
         let drain = keep_from - self.base_offset;
-        self.output.drain(..drain);
+        self.output.discard_prefix(drain);
         self.base_offset = keep_from;
         self.filters
             .retain(|filter| filter.start + filter.size > self.base_offset);
     }
 }
 
-impl Default for Unpack29 {
-    fn default() -> Self {
-        Self::new()
+#[cfg(test)]
+impl Reader29State<Allowance> {
+    fn filtered_range(&mut self, start: usize, end: usize, member_start: usize) -> Result<Vec<u8>> {
+        self.filtered_range_owned(start, end, member_start)
+            .map(Buffer::into_vec)
+    }
+    fn parse_vm_code(&mut self, first_byte: u32, data: Vec<u8>) -> Result<()> {
+        self.parse_vm_code_owned(first_byte, data.into())
+    }
+
+    fn new() -> Self {
+        Self::with_allowance(&Allowance::default())
+    }
+    fn decode_member(&mut self, input: &[u8], output_size: usize) -> Result<Vec<u8>> {
+        self.decode_member_owned(input, output_size)
+            .map(Buffer::into_vec)
+    }
+    fn decode_non_solid_member(&mut self, input: &[u8], output_size: usize) -> Result<Vec<u8>> {
+        self.decode_non_solid_member_owned(input, output_size)
+            .map(Buffer::into_vec)
     }
 }
-
 fn fill_levels(levels: &mut [u8], pos: &mut usize, count: usize, value: u8) -> Result<()> {
     let end = pos
         .checked_add(count)
@@ -3310,32 +3495,32 @@ fn fill_levels(levels: &mut [u8], pos: &mut usize, count: usize, value: u8) -> R
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-struct Huffman {
-    symbols: Vec<HuffmanSymbol>,
+#[derive(Debug)]
+struct Huffman<B: Budget = Allowance> {
+    symbols: Buffer<HuffmanSymbol, B>,
     first_code: [u16; 16],
     first_index: [usize; 16],
     counts: [u16; 16],
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct HuffmanSymbol {
     code: u16,
     len: u8,
     symbol: usize,
 }
 
-impl Huffman {
-    fn empty() -> Self {
+impl<B: Budget> Huffman<B> {
+    fn with_allowance(allowance: &B) -> Self {
         Self {
-            symbols: Vec::new(),
+            symbols: Buffer::new(allowance),
             first_code: [0; 16],
             first_index: [0; 16],
             counts: [0; 16],
         }
     }
 
-    fn from_lengths(lengths: &[u8]) -> Result<Self> {
+    fn from_lengths_with_allowance(lengths: &[u8], allowance: &B) -> Result<Self> {
         let mut count = [0u16; 16];
         for &len in lengths {
             if len != 0 {
@@ -3343,7 +3528,7 @@ impl Huffman {
             }
         }
         if count.iter().all(|&value| value == 0) {
-            return Ok(Self::empty());
+            return Ok(Self::with_allowance(allowance));
         }
         validate_huffman_counts(&count)?;
 
@@ -3363,16 +3548,16 @@ impl Huffman {
             index += usize::from(count[len]);
         }
 
-        let mut symbols = Vec::new();
+        let mut symbols = Buffer::with_capacity(index, allowance)?;
         for (symbol, &len) in lengths.iter().enumerate() {
             if len == 0 {
                 continue;
             }
             let code = next_code[len as usize];
             next_code[len as usize] += 1;
-            symbols.push(HuffmanSymbol { code, len, symbol });
+            symbols.push_admitted(HuffmanSymbol { code, len, symbol });
         }
-        symbols.sort_by_key(|item| (item.len, item.code, item.symbol));
+        symbols.sort_unstable_by_key(|item| (item.len, item.code, item.symbol));
         Ok(Self {
             symbols,
             first_code,
@@ -3381,7 +3566,15 @@ impl Huffman {
         })
     }
 
-    fn decode(&self, bits: &mut BitReader) -> Result<usize> {
+    fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            symbols: Buffer::copied(&self.symbols, &self.symbols.allowance())?,
+            first_code: self.first_code,
+            first_index: self.first_index,
+            counts: self.counts,
+        })
+    }
+    fn decode(&self, bits: &mut BitReader<B>) -> Result<usize> {
         let mut code = 0u16;
         if self.symbols.is_empty() {
             return Err(Error::InvalidData("RAR 2.9 empty Huffman table"));
@@ -3402,6 +3595,18 @@ impl Huffman {
     }
 }
 
+impl Clone for Huffman<Allowance> {
+    fn clone(&self) -> Self {
+        self.try_clone().expect("unlimited RAR3 Huffman copy")
+    }
+}
+#[cfg(test)]
+impl Huffman<Allowance> {
+    fn from_lengths(lengths: &[u8]) -> Result<Self> {
+        Self::from_lengths_with_allowance(lengths, &Allowance::default())
+    }
+}
+
 fn validate_huffman_counts(count: &[u16; 16]) -> Result<()> {
     let mut available = 1i32;
     for &len_count in count.iter().skip(1) {
@@ -3413,31 +3618,40 @@ fn validate_huffman_counts(count: &[u16; 16]) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-struct BitReader {
-    input: Vec<u8>,
+#[derive(Debug)]
+struct BitReader<B: Budget = Allowance> {
+    input: Buffer<u8, B>,
     bit_pos: usize,
 }
 
-impl BitReader {
-    fn new() -> Self {
+impl<B: Budget> BitReader<B> {
+    fn with_allowance(allowance: &B) -> Self {
         Self {
-            input: Vec::new(),
+            input: Buffer::new(allowance),
             bit_pos: 0,
         }
     }
 
-    fn from_bytes(input: &[u8]) -> Self {
-        Self {
-            input: input.to_vec(),
+    fn from_bytes_with_allowance(input: &[u8], allowance: &B) -> Result<Self> {
+        Ok(Self {
+            input: Buffer::copied(input, allowance)?,
             bit_pos: 0,
-        }
+        })
+    }
+    fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            input: Buffer::copied(&self.input, &self.input.allowance())?,
+            bit_pos: self.bit_pos,
+        })
     }
 
     #[cfg(test)]
     fn append(&mut self, input: &[u8]) {
         self.compact();
-        self.input.extend_from_slice(input);
+        self.input
+            .extend_from_slice(input)
+            .map_err(Into::into)
+            .expect("test input allowance");
     }
 
     #[cfg(test)]
@@ -3446,7 +3660,7 @@ impl BitReader {
         if bytes == 0 {
             return;
         }
-        self.input.drain(..bytes);
+        self.input.discard_prefix(bytes);
         self.bit_pos -= bytes * 8;
     }
 
@@ -3499,9 +3713,21 @@ impl BitReader {
     }
 }
 
-impl PpmdByteReader for BitReader {
+impl<B: Budget> PpmdByteReader for BitReader<B> {
     fn read_ppmd_byte(&mut self) -> Result<u8> {
         self.read_bits(8).map(|value| value as u8)
+    }
+}
+
+impl Clone for BitReader<Allowance> {
+    fn clone(&self) -> Self {
+        self.try_clone().expect("unlimited RAR3 input copy")
+    }
+}
+#[cfg(test)]
+impl BitReader<Allowance> {
+    fn from_bytes(input: &[u8]) -> Self {
+        Self::from_bytes_with_allowance(input, &Allowance::default()).expect("unlimited RAR3 input")
     }
 }
 
@@ -3570,6 +3796,20 @@ fn identify_standard_filter(code: &[u8]) -> Option<StandardFilter> {
 }
 
 #[cfg(test)]
+fn apply_standard_filter_with_control(
+    filter: StandardFilter,
+    data: &mut Vec<u8>,
+    file_offset: u32,
+    regs: &[u32; 7],
+    control: &crate::read_control::ReadControl,
+) -> Result<()> {
+    let mut owned = Buffer::from_vec(std::mem::take(data));
+    let result =
+        apply_standard_filter_with_allowance(filter, &mut owned, file_offset, regs, control);
+    *data = owned.into_vec();
+    result
+}
+#[cfg(test)]
 fn apply_standard_filter(
     filter: StandardFilter,
     data: &mut Vec<u8>,
@@ -3585,9 +3825,9 @@ fn apply_standard_filter(
     )
 }
 
-fn apply_standard_filter_with_control(
+fn apply_standard_filter_with_allowance<B: Budget>(
     filter: StandardFilter,
-    data: &mut Vec<u8>,
+    data: &mut Buffer<u8, B>,
     file_offset: u32,
     regs: &[u32; 7],
     control: &crate::read_control::ReadControl,
@@ -3595,20 +3835,10 @@ fn apply_standard_filter_with_control(
     control.check_codec()?;
 
     match filter {
-        StandardFilter::E8 => filters::decode_in_place_with_control(
-            FilterOp::E8,
-            data,
-            file_offset,
-            rar29_delta_messages(),
-            control,
-        )?,
-        StandardFilter::E8E9 => filters::decode_in_place_with_control(
-            FilterOp::E8E9,
-            data,
-            file_offset,
-            rar29_delta_messages(),
-            control,
-        )?,
+        StandardFilter::E8 => filters::e8e9_decode_with_control(data, file_offset, false, control)?,
+        StandardFilter::E8E9 => {
+            filters::e8e9_decode_with_control(data, file_offset, true, control)?
+        }
         StandardFilter::Itanium => itanium_decode_with_control(data, file_offset, control)?,
         StandardFilter::Delta => {
             let channels = regs[0] as usize;
@@ -3617,12 +3847,12 @@ fn apply_standard_filter_with_control(
                     "RAR 2.9 DELTA filter channel count is invalid",
                 ));
             }
-            filters::decode_in_place_with_control(
-                FilterOp::Delta { channels },
+            *data = filters::delta_decode_with_allowance(
                 data,
-                0,
+                channels,
                 rar29_delta_messages(),
                 control,
+                &data.allowance(),
             )?;
         }
         StandardFilter::Rgb => {
@@ -3633,7 +3863,7 @@ fn apply_standard_filter_with_control(
             }
             let width = regs[0] as usize - 3;
             let pos_r = regs[1] as usize;
-            *data = rgb_decode_with_control(data, width, pos_r, control)?;
+            *data = rgb_decode_with_allowance(data, width, pos_r, control, &data.allowance())?;
         }
         StandardFilter::Audio => {
             let channels = regs[0] as usize;
@@ -3642,7 +3872,7 @@ fn apply_standard_filter_with_control(
                     "RAR 2.9 AUDIO filter channel count is invalid",
                 ));
             }
-            *data = audio_decode_with_control(data, channels, control)?;
+            *data = audio_decode_with_allowance(data, channels, control, &data.allowance())?;
         }
     }
     Ok(())
@@ -3697,12 +3927,23 @@ fn itanium_decode_with_control(
     Ok(())
 }
 
+#[cfg(test)]
 fn rgb_decode_with_control(
     data: &[u8],
     width: usize,
     pos_r: usize,
     control: &crate::read_control::ReadControl,
 ) -> Result<Vec<u8>> {
+    rgb_decode_with_allowance(data, width, pos_r, control, &Allowance::default())
+        .map(Buffer::into_vec)
+}
+fn rgb_decode_with_allowance<B: Budget>(
+    data: &[u8],
+    width: usize,
+    pos_r: usize,
+    control: &crate::read_control::ReadControl,
+    allowance: &B,
+) -> Result<Buffer<u8, B>> {
     control.check_codec()?;
     let mut poller = control.poller();
     if data.len() < 3 || width == 0 || !width.is_multiple_of(3) || width > data.len() || pos_r > 2 {
@@ -3710,7 +3951,7 @@ fn rgb_decode_with_control(
             "RAR 2.9 RGB filter parameters are invalid",
         ));
     }
-    let mut out = vec![0u8; data.len()];
+    let mut out = Buffer::filled(data.len(), 0, allowance)?;
     let mut src = 0usize;
     for channel in 0..3 {
         let mut prev = 0u8;
@@ -3754,14 +3995,24 @@ fn rgb_predict(prev: u8, upper: u8, upper_left: u8) -> u8 {
     }
 }
 
+#[cfg(test)]
 fn audio_decode_with_control(
     data: &[u8],
     channels: usize,
     control: &crate::read_control::ReadControl,
 ) -> Result<Vec<u8>> {
+    audio_decode_with_allowance(data, channels, control, &Allowance::default())
+        .map(Buffer::into_vec)
+}
+fn audio_decode_with_allowance<B: Budget>(
+    data: &[u8],
+    channels: usize,
+    control: &crate::read_control::ReadControl,
+    allowance: &B,
+) -> Result<Buffer<u8, B>> {
     control.check_codec()?;
     let mut poller = control.poller();
-    let mut out = vec![0u8; data.len()];
+    let mut out = Buffer::filled(data.len(), 0, allowance)?;
     let mut src = 0usize;
     for channel in 0..channels {
         let mut prev_byte = 0u32;
@@ -3826,6 +4077,138 @@ fn audio_decode_with_control(
 
 #[cfg(test)]
 mod tests {
+    fn refuse_each_rar29_allocation(
+        mut run: impl FnMut(&crate::codec::workspace::RefusingBudget) -> Result<()>,
+    ) {
+        use crate::codec::workspace::RefusingBudget;
+        let baseline = RefusingBudget::new(usize::MAX);
+        run(&baseline).unwrap();
+        let attempts = baseline.attempts();
+        assert!(attempts > 0);
+        assert_eq!(baseline.used(), 0);
+        for index in 0..attempts {
+            let budget = RefusingBudget::new(index);
+            assert!(
+                matches!(run(&budget), Err(Error::Cancelled)),
+                "allocation {index}"
+            );
+            assert_eq!(budget.used(), 0, "allocation {index}");
+        }
+    }
+
+    #[test]
+    fn reader_rar29_refusals_release_input_huffman_history_results_and_checkpoints() {
+        refuse_each_rar29_allocation(|budget| {
+            let mut state = super::Reader29State::with_allowance(budget);
+            let decoded = state.decode_member_owned(COMPRESSED_TEXT, 2400)?;
+            assert_eq!(&decoded[..], expected_text());
+            let checkpoint = state.try_clone()?;
+            assert_eq!(checkpoint.output, state.output);
+            assert_eq!(checkpoint.main.symbols.len(), state.main.symbols.len());
+            let mut follower = COMPRESSED_TEXT;
+            let mut out = super::Buffer::new(budget);
+            state.decode_non_solid_member_from_reader(&mut follower, 2400, &mut out)?;
+            assert_eq!(&out[..], expected_text());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn reader_rar29_refusals_release_vm_code_records_globals_execution_and_filters() {
+        const COUNTER: &[u8] = &[
+            0x0d, 0x05, 0xc0, 0x7c, 0x00, 0x0f, 0x01, 0x01, 0xaf, 0x80, 0x01, 0xe0, 0x20, 0x01,
+            0xf0, 0x00, 0x3c, 0x03, 0x00, 0x1b, 0x80,
+        ];
+        let records = [
+            OwnedVmFilterRecord {
+                block_start: 0,
+                block_size: 1,
+                init_regs: Vec::new(),
+                code: COUNTER,
+                global_data: vec![b'A'],
+            },
+            OwnedVmFilterRecord {
+                block_start: 1,
+                block_size: 1,
+                init_regs: Vec::new(),
+                code: COUNTER,
+                global_data: Vec::new(),
+            },
+        ];
+        let refs = records.iter().collect::<Vec<_>>();
+        let records = encoded_filter_records_at(&refs, 0, usize::MAX, &mut Vec::new()).unwrap();
+        let packed = super::encode_member_inner(
+            b"xx",
+            &[],
+            &records,
+            EncodeOptions::default(),
+            false,
+            &mut [0; TABLE_COUNT],
+            None,
+        )
+        .unwrap();
+        refuse_each_rar29_allocation(|budget| {
+            let mut state = super::Reader29State::with_allowance(budget);
+            let decoded = state.decode_member_owned(&packed, 2)?;
+            assert_eq!(&decoded[..], b"AB");
+            let checkpoint = state.try_clone()?;
+            assert_eq!(checkpoint.programs[0].globals, state.programs[0].globals);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn reader_rar29_refusals_release_standard_filter_scratch_and_output() {
+        for (filter, regs) in [
+            (StandardFilter::Delta, [2, 0, 0, 0, 0, 0, 0]),
+            (StandardFilter::Rgb, [9, 0, 0, 0, 0, 0, 0]),
+            (StandardFilter::Audio, [2, 0, 0, 0, 0, 0, 0]),
+        ] {
+            refuse_each_rar29_allocation(|budget| {
+                let mut state = super::Reader29State::with_allowance(budget);
+                state.output = super::Buffer::copied(&[0; 96], budget)?;
+                state.programs.try_push(VmProgram {
+                    kind: VmProgramKind::Standard(filter),
+                    block_size: 96,
+                    exec_count: 0,
+                    globals: super::Buffer::new(budget),
+                })?;
+                state.filters.try_push(VmFilter {
+                    program: 0,
+                    start: 0,
+                    size: 96,
+                    regs,
+                    global_data: super::Buffer::new(budget),
+                })?;
+                let checkpoint = state.try_clone()?;
+                assert_eq!(checkpoint.filters.len(), 1);
+                let out = state.filtered_range_owned(0, 96, 0)?;
+                assert_eq!(&out[..], &[0; 96]);
+                assert!(state.filters.is_empty());
+                Ok(())
+            });
+        }
+    }
+
+    #[test]
+    fn reader_rar29_returned_output_keeps_reservation_after_decoder_drop() {
+        use crate::codec::workspace::Allowance;
+        let ledger = Allowance::limited(128 * 1024);
+        let mut reservation = ledger.reserve(120 * 1024).unwrap();
+        reservation.start();
+        let budget = reservation.allowance();
+        let mut state = super::Reader29State::with_allowance(&budget);
+        let out = state.decode_member_owned(COMPRESSED_TEXT, 2400).unwrap();
+        drop(state);
+        drop(budget);
+        reservation.retire();
+        assert!(ledger.used() >= out.capacity() as u64);
+        assert_eq!(&out[..], expected_text());
+        drop(out);
+        assert_eq!(ledger.used(), 0);
+    }
+
+    type Unpack29 = super::Reader29State<super::Allowance>;
     #[test]
     fn ppmd_progress_preserves_bytes_and_interrupts_both_engines() {
         let input = b"PPMd cooperative cancellation payload\n".repeat(400);
@@ -4042,13 +4425,12 @@ mod tests {
         unpack29_encode_ppmd_with_filter, BitReader, BitWriter, ChainEngine, EncodeOptions,
         EncodeToken, EncoderMatchState, Error, Huffman, LevelToken, MatchCandidate,
         OwnedVmFilterRecord, PpmdEncodeToken, PpmdEncoder, Rar29MatchFinder, Result,
-        StandardFilter, Unpack29, Unpack29Encoder, VmFilter, VmProgram, VmProgramKind,
-        LENGTH_COUNT, LOW_OFFSET_COUNT, MAIN_COUNT, MAX_ENCODER_MATCH_LENGTH,
-        MAX_ENCODER_MATCH_OFFSET, MAX_HISTORY, MAX_MATCH_CANDIDATES,
-        MAX_VM_AUDIO_FILTER_BLOCK_SIZE, MAX_VM_DELTA_FILTER_BLOCK_SIZE, MAX_VM_FILTER_BLOCK_SIZE,
-        OFFSET_COUNT, PPMD_DICTIONARY_MB, PPMD_ESC, PPMD_ORDER, RAR3_AUDIO_FILTER_BYTECODE,
-        RAR3_DELTA_FILTER_BYTECODE, RAR3_ITANIUM_FILTER_BYTECODE, RAR3_RGB_FILTER_BYTECODE,
-        STREAM_CHUNK, TABLE_COUNT,
+        StandardFilter, Unpack29Encoder, VmFilter, VmProgram, VmProgramKind, LENGTH_COUNT,
+        LOW_OFFSET_COUNT, MAIN_COUNT, MAX_ENCODER_MATCH_LENGTH, MAX_ENCODER_MATCH_OFFSET,
+        MAX_HISTORY, MAX_MATCH_CANDIDATES, MAX_VM_AUDIO_FILTER_BLOCK_SIZE,
+        MAX_VM_DELTA_FILTER_BLOCK_SIZE, MAX_VM_FILTER_BLOCK_SIZE, OFFSET_COUNT, PPMD_DICTIONARY_MB,
+        PPMD_ESC, PPMD_ORDER, RAR3_AUDIO_FILTER_BYTECODE, RAR3_DELTA_FILTER_BYTECODE,
+        RAR3_ITANIUM_FILTER_BYTECODE, RAR3_RGB_FILTER_BYTECODE, STREAM_CHUNK, TABLE_COUNT,
     };
 
     /// A flat code charges the same for every symbol in play. The keep-tables
@@ -4427,7 +4809,7 @@ mod tests {
 
         let mut decoder = Unpack29::new();
         decoder.base_offset = 10;
-        decoder.output.extend_from_slice(b"retained");
+        decoder.output.extend_from_slice(b"retained").unwrap();
         assert_eq!(
             decoder.raw_range(9, 10),
             Err(Error::InvalidData(
@@ -4917,7 +5299,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         let packed = encoder.encode_member(b"AB").unwrap();
 
         let mut decoder = Unpack29::new();
-        decoder.output = history;
+        decoder.output = history.into();
         assert_eq!(decoder.decode_member(&packed, 2).unwrap(), b"AB");
         assert_eq!(encoder.history.len(), MAX_HISTORY);
         assert_eq!(&encoder.history[MAX_HISTORY - 2..], b"AB");
@@ -4987,20 +5369,26 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     #[test]
     fn a_future_filter_stays_scheduled_until_its_range_is_published() {
         let mut decoder = Unpack29::new();
-        decoder.output.resize(128, 0);
-        decoder.programs.push(VmProgram {
-            kind: VmProgramKind::Standard(StandardFilter::E8),
-            block_size: 8,
-            exec_count: 0,
-            globals: Vec::new(),
-        });
-        decoder.filters.push(VmFilter {
-            program: 0,
-            start: 64,
-            size: 8,
-            regs: [0; 7],
-            global_data: Vec::new(),
-        });
+        decoder.output.resize(128, 0).unwrap();
+        decoder
+            .programs
+            .push(VmProgram {
+                kind: VmProgramKind::Standard(StandardFilter::E8),
+                block_size: 8,
+                exec_count: 0,
+                globals: Vec::new().into(),
+            })
+            .unwrap();
+        decoder
+            .filters
+            .push(VmFilter {
+                program: 0,
+                start: 64,
+                size: 8,
+                regs: [0; 7],
+                global_data: Vec::new().into(),
+            })
+            .unwrap();
 
         assert_eq!(decoder.safe_flush_end(0, 32, 128).unwrap(), 32);
         assert_eq!(decoder.filtered_range(0, 32, 0).unwrap(), vec![0; 32]);
@@ -5013,27 +5401,36 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     #[test]
     fn history_trimming_discards_stale_filters_and_keeps_future_filters() {
         let mut decoder = Unpack29::new();
-        decoder.output.resize(MAX_HISTORY + 64, 0);
-        decoder.programs.push(VmProgram {
-            kind: VmProgramKind::Standard(StandardFilter::E8),
-            block_size: 8,
-            exec_count: 0,
-            globals: Vec::new(),
-        });
-        decoder.filters.push(VmFilter {
-            program: 0,
-            start: 0,
-            size: 8,
-            regs: [0; 7],
-            global_data: Vec::new(),
-        });
-        decoder.filters.push(VmFilter {
-            program: 0,
-            start: 128,
-            size: 8,
-            regs: [0; 7],
-            global_data: Vec::new(),
-        });
+        decoder.output.resize(MAX_HISTORY + 64, 0).unwrap();
+        decoder
+            .programs
+            .push(VmProgram {
+                kind: VmProgramKind::Standard(StandardFilter::E8),
+                block_size: 8,
+                exec_count: 0,
+                globals: Vec::new().into(),
+            })
+            .unwrap();
+        decoder
+            .filters
+            .push(VmFilter {
+                program: 0,
+                start: 0,
+                size: 8,
+                regs: [0; 7],
+                global_data: Vec::new().into(),
+            })
+            .unwrap();
+        decoder
+            .filters
+            .push(VmFilter {
+                program: 0,
+                start: 128,
+                size: 8,
+                regs: [0; 7],
+                global_data: Vec::new().into(),
+            })
+            .unwrap();
 
         decoder.trim_history(MAX_HISTORY + 64, MAX_HISTORY + 64);
 
@@ -5048,14 +5445,17 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     #[test]
     fn stale_filter_ranges_do_not_change_later_published_bytes() {
         let mut decoder = Unpack29::new();
-        decoder.output.resize(32, 0x5a);
-        decoder.filters.push(VmFilter {
-            program: usize::MAX,
-            start: 0,
-            size: 8,
-            regs: [0; 7],
-            global_data: Vec::new(),
-        });
+        decoder.output.resize(32, 0x5a).unwrap();
+        decoder
+            .filters
+            .push(VmFilter {
+                program: usize::MAX,
+                start: 0,
+                size: 8,
+                regs: [0; 7],
+                global_data: Vec::new().into(),
+            })
+            .unwrap();
 
         assert_eq!(decoder.safe_flush_end(16, 32, 32).unwrap(), 32);
         assert_eq!(decoder.filtered_range(16, 32, 0).unwrap(), vec![0x5a; 16]);
@@ -5425,11 +5825,11 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     #[test]
     fn copy_match_zero_fills_an_offset_that_reaches_past_the_stream() {
         let mut decoder = Unpack29::new();
-        decoder.output.extend_from_slice(b"AB");
+        decoder.output.extend_from_slice(b"AB").unwrap();
 
         decoder.copy_match(4, 9, 6).unwrap();
 
-        assert_eq!(decoder.output, b"AB\0\0\0\0");
+        assert_eq!(&decoder.output[..], b"AB\0\0\0\0");
     }
 
     #[test]
@@ -5457,7 +5857,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
 
         decoder.decode_lz(5).unwrap();
 
-        assert_eq!(decoder.output, b"Z\0\0\0\0");
+        assert_eq!(&decoder.output[..], b"Z\0\0\0\0");
     }
 
     #[test]
@@ -5479,7 +5879,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
 
         decoder.decode_lz(2).unwrap();
 
-        assert_eq!(decoder.output, b"XY");
+        assert_eq!(&decoder.output[..], b"XY");
         assert_eq!(decoder.last_length, 0);
     }
 
@@ -6884,19 +7284,25 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
             .encode_member(&expected)
             .unwrap();
         let mut decoder = Unpack29::new();
-        decoder.programs.push(VmProgram {
-            kind: VmProgramKind::Standard(StandardFilter::E8),
-            block_size: expected.len(),
-            exec_count: 0,
-            globals: Vec::new(),
-        });
-        decoder.filters.push(VmFilter {
-            program: 0,
-            start: 0,
-            size: expected.len(),
-            regs: [0; 7],
-            global_data: Vec::new(),
-        });
+        decoder
+            .programs
+            .push(VmProgram {
+                kind: VmProgramKind::Standard(StandardFilter::E8),
+                block_size: expected.len(),
+                exec_count: 0,
+                globals: Vec::new().into(),
+            })
+            .unwrap();
+        decoder
+            .filters
+            .push(VmFilter {
+                program: 0,
+                start: 0,
+                size: expected.len(),
+                regs: [0; 7],
+                global_data: Vec::new().into(),
+            })
+            .unwrap();
 
         assert_eq!(
             decoder.decode_member(&packed, expected.len()).unwrap(),
@@ -6936,13 +7342,16 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         );
 
         let mut decoder = Unpack29::new();
-        decoder.filters.push(VmFilter {
-            program: 0,
-            start: 0,
-            size: 1,
-            regs: [0; 7],
-            global_data: vec![1],
-        });
+        decoder
+            .filters
+            .push(VmFilter {
+                program: 0,
+                start: 0,
+                size: 1,
+                regs: [0; 7],
+                global_data: vec![1].into(),
+            })
+            .unwrap();
         assert_eq!(
             decoder
                 .decode_non_solid_member_to(COMPRESSED_TEXT, 2400, &mut FailingWriter)
@@ -6955,14 +7364,17 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     #[test]
     fn decode_non_solid_member_resets_reusable_decoder_state() {
         let mut decoder = Unpack29::new();
-        decoder.output.extend_from_slice(b"stale history");
-        decoder.filters.push(VmFilter {
-            program: 0,
-            start: 0,
-            size: 1,
-            regs: [0; 7],
-            global_data: vec![1, 2, 3],
-        });
+        decoder.output.extend_from_slice(b"stale history").unwrap();
+        decoder
+            .filters
+            .push(VmFilter {
+                program: 0,
+                start: 0,
+                size: 1,
+                regs: [0; 7],
+                global_data: vec![1, 2, 3].into(),
+            })
+            .unwrap();
 
         let mut output = Vec::new();
         decoder
@@ -6978,7 +7390,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         let mut decoder = Unpack29::new();
         let member_start = 1000usize;
         let filter_start = member_start + 100;
-        decoder.output.resize(filter_start + 8, 0);
+        decoder.output.resize(filter_start + 8, 0).unwrap();
         decoder.output[filter_start] = 0xe8;
 
         let call_operand_pos = 1u32;
@@ -6989,19 +7401,25 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
             .wrapping_add(call_operand_pos);
         decoder.output[filter_start + 1..filter_start + 5]
             .copy_from_slice(&encoded_addr.to_le_bytes());
-        decoder.programs.push(VmProgram {
-            kind: VmProgramKind::Standard(StandardFilter::E8),
-            block_size: 5,
-            exec_count: 0,
-            globals: Vec::new(),
-        });
-        decoder.filters.push(VmFilter {
-            program: 0,
-            start: filter_start,
-            size: 5,
-            regs: [0; 7],
-            global_data: Vec::new(),
-        });
+        decoder
+            .programs
+            .push(VmProgram {
+                kind: VmProgramKind::Standard(StandardFilter::E8),
+                block_size: 5,
+                exec_count: 0,
+                globals: Vec::new().into(),
+            })
+            .unwrap();
+        decoder
+            .filters
+            .push(VmFilter {
+                program: 0,
+                start: filter_start,
+                size: 5,
+                regs: [0; 7],
+                global_data: Vec::new().into(),
+            })
+            .unwrap();
 
         let filtered = decoder
             .filtered_range(member_start, filter_start + 5, member_start)
@@ -7015,34 +7433,46 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     #[test]
     fn generic_vm_filter_executes_from_filtered_range() {
         let mut decoder = Unpack29::new();
-        decoder.output.extend_from_slice(&[0x11, 0x22, 0x33]);
-        decoder.programs.push(VmProgram {
-            kind: VmProgramKind::Generic(Program {
-                static_data: Vec::new(),
-                instructions: vec![
-                    Instruction {
-                        opcode: Opcode::Mov,
-                        byte_mode: true,
-                        operands: vec![Operand::Absolute(0), Operand::Immediate(0x44)],
-                    },
-                    Instruction {
-                        opcode: Opcode::Ret,
-                        byte_mode: false,
-                        operands: Vec::new(),
-                    },
-                ],
-            }),
-            block_size: 3,
-            exec_count: 0,
-            globals: Vec::new(),
-        });
-        decoder.filters.push(VmFilter {
-            program: 0,
-            start: 0,
-            size: 3,
-            regs: [0; 7],
-            global_data: Vec::new(),
-        });
+        decoder
+            .output
+            .extend_from_slice(&[0x11, 0x22, 0x33])
+            .unwrap();
+        decoder
+            .programs
+            .push(VmProgram {
+                kind: VmProgramKind::Generic(
+                    Program {
+                        static_data: Vec::new(),
+                        instructions: vec![
+                            Instruction {
+                                opcode: Opcode::Mov,
+                                byte_mode: true,
+                                operands: vec![Operand::Absolute(0), Operand::Immediate(0x44)],
+                            },
+                            Instruction {
+                                opcode: Opcode::Ret,
+                                byte_mode: false,
+                                operands: Vec::new(),
+                            },
+                        ],
+                    }
+                    .into(),
+                ),
+                block_size: 3,
+                exec_count: 0,
+                globals: Vec::new().into(),
+            })
+            .unwrap();
+        decoder
+            .filters
+            .push(VmFilter {
+                program: 0,
+                start: 0,
+                size: 3,
+                regs: [0; 7],
+                global_data: Vec::new().into(),
+            })
+            .unwrap();
 
         let filtered = decoder.filtered_range(0, 3, 0).unwrap();
 
@@ -7559,12 +7989,15 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     #[test]
     fn vm_global_data_size_is_capped_before_reading_or_allocation() {
         let mut decoder = Unpack29::new();
-        decoder.programs.push(VmProgram {
-            kind: VmProgramKind::Standard(StandardFilter::E8),
-            block_size: 1,
-            exec_count: 0,
-            globals: Vec::new(),
-        });
+        decoder
+            .programs
+            .push(VmProgram {
+                kind: VmProgramKind::Standard(StandardFilter::E8),
+                block_size: 1,
+                exec_count: 0,
+                globals: Vec::new().into(),
+            })
+            .unwrap();
 
         let mut data = BitWriter::default();
         data.write_encoded_u32(1);
@@ -7600,8 +8033,9 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
                 kind: VmProgramKind::Standard(StandardFilter::E8),
                 block_size: 1,
                 exec_count: 0,
-                globals: Vec::new(),
-            });
+                globals: Vec::new().into(),
+            })
+            .unwrap();
 
         let mut new_program = BitWriter::default();
         new_program.write_encoded_u32((super::MAX_VM_PROGRAMS + 1) as u32);
@@ -7622,8 +8056,9 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
                 start: 0,
                 size: 1,
                 regs: [0; 7],
-                global_data: Vec::new(),
-            });
+                global_data: Vec::new().into(),
+            })
+            .unwrap();
         let mut reused_program = BitWriter::default();
         reused_program.write_encoded_u32(0);
         assert_eq!(
