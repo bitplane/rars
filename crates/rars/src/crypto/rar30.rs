@@ -81,29 +81,37 @@ impl Rar30Cipher {
 
 fn derive_key_iv(password: &[u8], salt: Option<[u8; 8]>) -> Result<([u8; 16], [u8; 16])> {
     let password = crate::crypto::clamp_password(password);
-    let mut raw = Zeroizing::new(Vec::with_capacity(password.len() * 2 + 8));
+    // The reference password ceiling is in Unicode scalar values. Each can
+    // contribute at most two UTF-16 units, followed by an optional eight-byte salt.
+    let mut storage = Zeroizing::new([0u8; crate::crypto::MAX_PASSWORD_CHARS * 4 + 8]);
+    let mut used = 0;
     let password = str::from_utf8(password).map_err(|_| Error::NonUtf8Password)?;
     for code_unit in password.encode_utf16() {
-        raw.extend_from_slice(&code_unit.to_le_bytes());
+        storage[used..used + 2].copy_from_slice(&code_unit.to_le_bytes());
+        used += 2;
     }
     if let Some(salt) = salt {
-        raw.extend_from_slice(&salt);
+        storage[used..used + salt.len()].copy_from_slice(&salt);
+        used += salt.len();
     }
+
+    let raw = &mut storage[..used];
 
     // RAR 3.x mutates password/salt bytes only when the repeated KDF input
     // crosses complete SHA-1 blocks. The stock SHA-1 path is equivalent while
     // the password+salt material never fills a 64-byte block.
     if raw.len() < 64 {
-        return Ok(derive_key_iv_fast(&raw));
+        return Ok(derive_key_iv_fast(raw));
     }
 
-    Ok(derive_key_iv_slow(&mut raw))
+    Ok(derive_key_iv_slow(raw))
 }
 
 fn derive_key_iv_slow(raw: &mut [u8]) -> ([u8; 16], [u8; 16]) {
     let raw_size = raw.len();
-    let mut raw = Zeroizing::new(raw.to_vec());
-    raw.resize(raw_size + 64, 0);
+    let mut storage = Zeroizing::new([0u8; crate::crypto::MAX_PASSWORD_CHARS * 4 + 8 + 64]);
+    storage[..raw_size].copy_from_slice(raw);
+    let raw = &mut storage[..raw_size + 64];
     let mut sha1 = FastSha1::new();
     let mut iv = [0; 16];
     let mut pos = 0u32;
@@ -182,6 +190,24 @@ fn derive_key_iv_fast(raw: &[u8]) -> ([u8; 16], [u8; 16]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maximum_supplementary_unicode_password_fits_bounded_kdf_scratch() {
+        let password = "🙂".repeat(crate::crypto::MAX_PASSWORD_CHARS);
+        let longer = format!("{password}🙂");
+        let mut exact = *b"0123456789abcdef";
+        let mut clamped = exact;
+        let salt = Some(*b"longsalt");
+        Rar30Cipher::new(password.as_bytes(), salt)
+            .unwrap()
+            .encrypt_in_place(&mut exact)
+            .unwrap();
+        Rar30Cipher::new(longer.as_bytes(), salt)
+            .unwrap()
+            .encrypt_in_place(&mut clamped)
+            .unwrap();
+        assert_eq!(exact, clamped);
+    }
 
     fn raw_kdf_material(password: &[u8], salt: Option<[u8; 8]>) -> Vec<u8> {
         let mut raw = Vec::with_capacity(password.len() * 2 + 8);

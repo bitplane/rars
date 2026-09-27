@@ -1,4 +1,5 @@
 use super::*;
+use crate::codec::workspace::{Allowance, Boxed, Budget, Buffer};
 use crate::volume_extract::{ChainedReader, SplitVolumeState, SplitVolumeStep};
 use std::io::{Read, Write};
 
@@ -522,24 +523,33 @@ impl PendingSplitRefs {
     }
 }
 
-enum SplitCipher {
+enum SplitCipher<B: Budget = Allowance> {
     Rar15(Rar15Cipher),
-    Rar20(Box<Rar20Cipher>),
-    Rar30(Box<Rar30Cipher>),
+    Rar20(Boxed<Rar20Cipher, B>),
+    Rar30(Boxed<Rar30Cipher, B>),
 }
 
-impl SplitCipher {
-    fn new(unp_ver: u8, password: &[u8], salt: Option<[u8; 8]>) -> Result<Self> {
+impl<B: Budget> SplitCipher<B> {
+    fn with_allowance(
+        unp_ver: u8,
+        password: &[u8],
+        salt: Option<[u8; 8]>,
+        allowance: &B,
+    ) -> Result<Self> {
         if unp_ver == 15 {
             return Ok(Self::Rar15(Rar15Cipher::new(password)));
         }
         if unp_ver == 20 || unp_ver == 26 {
-            return Ok(Self::Rar20(Box::new(Rar20Cipher::new(password))));
+            return Ok(Self::Rar20(Boxed::try_new(
+                || Ok::<_, crate::codec::Error>(Rar20Cipher::new(password)),
+                allowance,
+            )?));
         }
         if unp_ver >= 29 {
-            return Ok(Self::Rar30(Box::new(
-                Rar30Cipher::new(password, salt).map_err(super::map_rar30_crypto_error)?,
-            )));
+            return Ok(Self::Rar30(Boxed::try_new(
+                || Rar30Cipher::new(password, salt).map_err(super::map_rar30_crypto_error),
+                allowance,
+            )?));
         }
         Err(Error::UnsupportedEncryption {
             family: "RAR 1.5-4.x split volume",
@@ -548,30 +558,33 @@ impl SplitCipher {
     }
 }
 
-pub(super) struct DecryptingReader<R> {
+pub(super) struct DecryptingReader<R, B: Budget = Allowance> {
     inner: R,
-    cipher: SplitCipher,
-    encrypted_block: Vec<u8>,
-    decrypted: Vec<u8>,
-    read_buffer: Option<Vec<u8>>,
+    cipher: SplitCipher<B>,
+    encrypted_block: Buffer<u8, B>,
+    decrypted: Buffer<u8, B>,
+    read_buffer: Option<Buffer<u8, B>>,
     decrypted_pos: usize,
     eof: bool,
 }
 
-impl<R: Read> DecryptingReader<R> {
-    pub(super) fn new(
+impl<R: Read, B: Budget> DecryptingReader<R, B> {
+    pub(super) fn with_allowance(
         inner: R,
         unp_ver: u8,
         password: &[u8],
         salt: Option<[u8; 8]>,
+        allowance: &B,
     ) -> Result<Self> {
-        let cipher = SplitCipher::new(unp_ver, password, salt)?;
-        let read_buffer = matches!(cipher, SplitCipher::Rar15(_)).then(|| vec![0; 64 * 1024]);
+        let cipher = SplitCipher::with_allowance(unp_ver, password, salt, allowance)?;
+        let read_buffer = matches!(cipher, SplitCipher::Rar15(_))
+            .then(|| Buffer::filled(64 * 1024, 0, allowance))
+            .transpose()?;
         Ok(Self {
             inner,
             cipher,
-            encrypted_block: Vec::new(),
-            decrypted: Vec::new(),
+            encrypted_block: Buffer::new(allowance),
+            decrypted: Buffer::new(allowance),
             read_buffer,
             decrypted_pos: 0,
             eof: false,
@@ -596,7 +609,11 @@ impl<R: Read> DecryptingReader<R> {
                     self.eof = true;
                     return Ok(());
                 }
-                self.decrypted.extend_from_slice(&read_buffer[..count]);
+                self.decrypted
+                    .extend_from_slice(&read_buffer[..count])
+                    .map_err(Into::<crate::codec::Error>::into)
+                    .map_err(Error::from)
+                    .map_err(std::io::Error::other)?;
                 cipher.crypt_in_place(&mut self.decrypted);
             }
             SplitCipher::Rar20(cipher) => Self::fill_block_decrypted(
@@ -619,8 +636,8 @@ impl<R: Read> DecryptingReader<R> {
 
     fn fill_block_decrypted(
         inner: &mut R,
-        encrypted_block: &mut Vec<u8>,
-        decrypted: &mut Vec<u8>,
+        encrypted_block: &mut Buffer<u8, B>,
+        decrypted: &mut Buffer<u8, B>,
         eof: &mut bool,
         mut decrypt_block: impl FnMut(&mut [u8; 16]),
     ) -> std::io::Result<()> {
@@ -633,13 +650,20 @@ impl<R: Read> DecryptingReader<R> {
                 *eof = true;
                 break;
             }
-            encrypted_block.extend_from_slice(&buf[..count]);
+            encrypted_block
+                .extend_from_slice(&buf[..count])
+                .map_err(Into::<crate::codec::Error>::into)
+                .map_err(Error::from)
+                .map_err(std::io::Error::other)?;
         }
 
         let full_len = (encrypted_block.len() / 16) * 16;
         if full_len != 0 {
-            let tail = encrypted_block.split_off(full_len);
+            let tail = Buffer::copied(&encrypted_block[full_len..], &encrypted_block.allowance())
+                .map_err(Error::from)
+                .map_err(std::io::Error::other)?;
             let mut data = std::mem::replace(encrypted_block, tail);
+            data.truncate(full_len);
             for block in data.chunks_exact_mut(16) {
                 decrypt_block(block.try_into().expect("complete encrypted block"));
             }
@@ -655,7 +679,7 @@ impl<R: Read> DecryptingReader<R> {
     }
 }
 
-impl<R: Read> Read for DecryptingReader<R> {
+impl<R: Read, B: Budget> Read for DecryptingReader<R, B> {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         if out.is_empty() {
             return Ok(0);
@@ -673,7 +697,64 @@ impl<R: Read> Read for DecryptingReader<R> {
 }
 
 #[cfg(test)]
+impl SplitCipher<Allowance> {
+    fn new(unp_ver: u8, password: &[u8], salt: Option<[u8; 8]>) -> Result<Self> {
+        Self::with_allowance(unp_ver, password, salt, &Allowance::default())
+    }
+}
+impl<R: Read> DecryptingReader<R, Allowance> {
+    pub(super) fn new(
+        inner: R,
+        unp_ver: u8,
+        password: &[u8],
+        salt: Option<[u8; 8]>,
+    ) -> Result<Self> {
+        Self::with_allowance(inner, unp_ver, password, salt, &Allowance::default())
+    }
+}
+#[cfg(test)]
 mod tests {
+    #[test]
+    fn reader_workspace_refusals_release_legacy_cipher_and_decryption_buffers() {
+        use crate::codec::workspace::RefusingBudget;
+        for version in [15, 20, 29] {
+            let plain = *b"0123456789abcdefRAR AES CBC data";
+            let mut encrypted = plain;
+            match version {
+                15 => Rar15Cipher::new(b"pw").crypt_in_place(&mut encrypted),
+                20 => Rar20Cipher::new(b"pw")
+                    .encrypt_in_place(&mut encrypted)
+                    .unwrap(),
+                _ => Rar30Cipher::new(b"pw", None)
+                    .unwrap()
+                    .encrypt_in_place(&mut encrypted)
+                    .unwrap(),
+            }
+            let run = |budget: &RefusingBudget| -> Result<()> {
+                let input = ChunkedReader::new(Cursor::new(&encrypted), 7);
+                let mut reader =
+                    DecryptingReader::with_allowance(input, version, b"pw", None, budget)?;
+                let mut out = Buffer::new(budget);
+                out.read_to_end(&mut reader)?;
+                assert_eq!(&out[..], &plain);
+                Ok(())
+            };
+            let baseline = RefusingBudget::new(usize::MAX);
+            run(&baseline).unwrap();
+            assert_eq!(baseline.used(), 0);
+            for index in 0..baseline.attempts() {
+                let budget = RefusingBudget::new(index);
+                let error = run(&budget).unwrap_err();
+                assert_eq!(
+                    error.kind(),
+                    crate::ErrorKind::Cancelled,
+                    "version {version}, allocation {index}: {error}"
+                );
+                assert_eq!(budget.used(), 0);
+            }
+        }
+    }
+
     use super::super::{
         ArchiveSource, Block, BlockHeader, MainHeader, FHD_DIRECTORY_MASK, FHD_PASSWORD,
         FHD_SPLIT_AFTER, FHD_SPLIT_BEFORE,

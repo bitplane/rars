@@ -30,6 +30,39 @@ pub(crate) trait Budget: Clone + std::fmt::Debug {
     fn allowance(charge: &Self::Charge) -> Self;
     fn resize(charge: &mut Self::Charge, bytes: u64) -> Result<()>;
 }
+
+/// Admit a boxed value before constructing it. Its storage is freed before
+/// the charge, including when construction fails or a decoder is replaced.
+#[derive(Debug)]
+pub(crate) struct Boxed<T, B: Budget = Allowance> {
+    value: Box<T>,
+    _charge: B::Charge,
+}
+impl<T, B: Budget> Boxed<T, B> {
+    pub(crate) fn try_new<E: From<Error>>(
+        make: impl FnOnce() -> std::result::Result<T, E>,
+        allowance: &B,
+    ) -> std::result::Result<Self, E> {
+        let mut charge = allowance.charge();
+        B::resize(&mut charge, allocation_size::<T>(1)?)?;
+        let value = make()?;
+        Ok(Self {
+            value: Box::new(value),
+            _charge: charge,
+        })
+    }
+}
+impl<T, B: Budget> std::ops::Deref for Boxed<T, B> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+impl<T, B: Budget> std::ops::DerefMut for Boxed<T, B> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.value
+    }
+}
 impl Budget for Allowance {
     type Charge = ();
     type Failure = std::convert::Infallible;
@@ -549,6 +582,32 @@ impl<T: PartialEq, B: Budget> PartialEq<Vec<T>> for Buffer<T, B> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn boxed_workspace_is_admitted_before_construction_and_released_on_failure() {
+        let small = Allowance::limited(31);
+        let mut constructed = false;
+        let denied = Boxed::try_new(
+            || {
+                constructed = true;
+                Ok::<_, Error>([0u8; 32])
+            },
+            &small,
+        );
+        assert!(matches!(denied, Err(Error::WorkspaceLimitExceeded(_))));
+        assert!(!constructed);
+        assert_eq!(small.used(), 0);
+        let budget = Allowance::limited(32);
+        let failed =
+            Boxed::<[u8; 32], _>::try_new(|| Err::<[u8; 32], _>(Error::Cancelled), &budget);
+        assert!(matches!(failed, Err(Error::Cancelled)));
+        assert_eq!(budget.used(), 0);
+        let value = Boxed::try_new(|| Ok::<_, Error>([7u8; 32]), &budget).unwrap();
+        assert_eq!(budget.used(), 32);
+        assert_eq!(*value, [7; 32]);
+        drop(value);
+        assert_eq!(budget.used(), 0);
+    }
+
     use super::*;
 
     #[test]
