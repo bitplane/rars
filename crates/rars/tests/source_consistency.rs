@@ -276,3 +276,54 @@ fn member_io_failures_keep_identity_through_compression_routes() {
         }
     }
 }
+
+#[test]
+fn rar50_writer_rejects_aggregate_source_size_overflow_before_reading_or_emitting() {
+    for version in [ArchiveVersion::Rar50, ArchiveVersion::Rar70] {
+        for volumes in [false, true] {
+            let entries: Vec<_> = [(b"huge".as_slice(), u64::MAX), (b"overflow", 1)]
+                .into_iter()
+                .map(|(name, len)| {
+                    rar50::ArchiveEntry::new(
+                        name.to_vec(),
+                        EntrySource::from_opener(len, || {
+                            panic!("overflowing input opened a source")
+                        }),
+                    )
+                })
+                .collect();
+            let options =
+                rar50::WriterOptions::new(version, FeatureSet::default()).with_compression_level(0);
+            let mut output = Vec::new();
+            let mut sink = rar50::CollectedVolumes::new();
+            let error = if volumes {
+                rar50::write_streaming_volumes_to(
+                    &entries,
+                    options,
+                    rar50::ArchiveExtras::default(),
+                    1024,
+                    &mut sink,
+                    &WriterResources::default(),
+                )
+                .unwrap_err()
+            } else {
+                rar50::write_streaming_archive_to(
+                    &entries,
+                    options,
+                    rar50::ArchiveExtras::default(),
+                    &WriterResources::default(),
+                    &mut output,
+                )
+                .unwrap_err()
+            };
+            assert_eq!(error.kind(), rars::ErrorKind::InvalidArgument);
+            assert_eq!(
+                error.entry_context().unwrap(),
+                (b"overflow".as_slice(), "preparing")
+            );
+            assert!(error.to_string().contains("total input size overflows"));
+            assert!(output.is_empty());
+            assert!(sink.take().is_empty());
+        }
+    }
+}

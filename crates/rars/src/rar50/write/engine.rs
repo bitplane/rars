@@ -153,6 +153,25 @@ impl CheckedReader {
     }
 }
 
+// Both archive and volume emission report and account for one aggregate input
+// length. Caller-provided source lengths need not fit that sum even when each
+// length fits a member header. Reject overflow before any payload read.
+fn total_input_size(entries: &[ArchiveEntry]) -> Result<u64> {
+    entries.iter().try_fold(0u64, |total, entry| {
+        let length = entry
+            .source
+            .len()
+            .map_err(|error| member_error(error, &entry.name, "preparing"))?;
+        total.checked_add(length).ok_or_else(|| {
+            member_error(
+                Error::InvalidArgument("RAR 5 writer total input size overflows"),
+                &entry.name,
+                "preparing",
+            )
+        })
+    })
+}
+
 pub(super) fn write_archive(
     entries: &[ArchiveEntry],
     plan: EnginePlan<'_>,
@@ -183,15 +202,7 @@ pub(super) fn write_archive(
     for entry in entries {
         sources.push(entry.source.clone())?;
     }
-    let total_input: u64 = entries
-        .iter()
-        .map(|entry| {
-            entry
-                .source
-                .len()
-                .map_err(|error| member_error(error, &entry.name, "preparing"))
-        })
-        .sum::<Result<u64>>()?;
+    let total_input = total_input_size(entries)?;
     let total_entries = entries.len();
     if let Some(progress) = plan.progress {
         progress.report(crate::WriteProgressEvent::OperationStarted {
@@ -1209,15 +1220,7 @@ pub(super) fn write_volumes(
     for entry in entries {
         sources.push(entry.source.clone())?;
     }
-    let total_input: u64 = entries
-        .iter()
-        .map(|entry| {
-            entry
-                .source
-                .len()
-                .map_err(|error| member_error(error, &entry.name, "preparing"))
-        })
-        .sum::<Result<u64>>()?;
+    let total_input = total_input_size(entries)?;
     let total_entries = entries.len();
     if let Some(progress) = plan.progress {
         progress.report(crate::WriteProgressEvent::OperationStarted {
@@ -1735,6 +1738,67 @@ fn member_error(error: Error, name: &[u8], operation: &'static str) -> Error {
         error
     } else {
         error.at_entry(name.to_vec(), operation)
+    }
+}
+
+#[cfg(test)]
+mod input_size_tests {
+    use super::*;
+
+    fn virtual_entry(name: &[u8], length: u64) -> ArchiveEntry {
+        ArchiveEntry::new(
+            name.to_vec(),
+            crate::EntrySource::from_opener(length, || panic!("measuring input opened a source")),
+        )
+    }
+
+    #[test]
+    fn total_input_size_accepts_empty_and_exact_u64_maximum() {
+        assert_eq!(total_input_size(&[]).unwrap(), 0);
+        let entries = [
+            virtual_entry(b"first", u64::MAX - 1),
+            virtual_entry(b"last", 1),
+            virtual_entry(b"empty", 0),
+        ];
+        assert_eq!(total_input_size(&entries).unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn total_input_size_preserves_source_errors_and_cancellation() {
+        struct Broken(bool);
+        impl crate::streaming::SourceFactory for Broken {
+            fn len(&self) -> Result<u64> {
+                if self.0 {
+                    Err(Error::Cancelled)
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "injected metadata failure",
+                    )
+                    .into())
+                }
+            }
+            fn open(&self) -> Result<Box<dyn crate::EntryReader>> {
+                panic!("measuring input opened a source")
+            }
+        }
+        for cancelled in [false, true] {
+            let entry = ArchiveEntry::new(
+                b"broken".to_vec(),
+                crate::EntrySource::from_factory(Broken(cancelled)),
+            );
+            let error = total_input_size(&[entry]).unwrap_err();
+            if cancelled {
+                assert_eq!(error, Error::Cancelled);
+                assert!(error.entry_context().is_none());
+            } else {
+                assert_eq!(error.kind(), crate::ErrorKind::Io);
+                assert_eq!(
+                    error.entry_context().unwrap(),
+                    (b"broken".as_slice(), "preparing")
+                );
+            }
+        }
     }
 }
 
