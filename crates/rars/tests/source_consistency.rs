@@ -76,6 +76,59 @@ fn rar50_fragment_checksums_are_verified_against_the_emission_read() {
     assert_eq!(error.entry_context().unwrap().0, b"file");
 }
 
+// Equal-length CRC32 collision, independently constructed with zlib's CRC32.
+// Repeating each block preserves the collision for every 1024-byte fragment.
+fn crc_collision_payloads() -> (Vec<u8>, Vec<u8>) {
+    let original = vec![b'A'; 64];
+    let mut changed = vec![b'B'; 60];
+    changed.extend_from_slice(&[224, 101, 112, 255]);
+    assert_ne!(original, changed);
+    assert_eq!(rars::crc32::crc32(&original), 0x414c623c);
+    assert_eq!(rars::crc32::crc32(&changed), 0x414c623c);
+    let original = original.repeat(64);
+    let changed = changed.repeat(64);
+    assert_eq!(rars::crc32::crc32(&original), rars::crc32::crc32(&changed));
+    (original, changed)
+}
+
+#[test]
+fn rar50_stored_emission_rejects_crc_collisions_using_the_payload_hash() {
+    for (encrypted, volumes, change_at) in [
+        (false, false, 1),
+        (true, false, 1),
+        (false, true, 1), // Fragment checksums match the changed bytes; whole-member hash refuses.
+        (false, true, 2), // First fragment's CRC matches, but its hash changed after header preparation.
+        (true, true, 1), // Encrypted volume staging must verify the source before retaining ciphertext.
+    ] {
+        let (original, changed) = crc_collision_payloads();
+        let opens = Arc::new(AtomicUsize::new(0));
+        let source = EntrySource::from_opener(original.len() as u64, move || {
+            let data = if opens.fetch_add(1, Ordering::Relaxed) >= change_at {
+                changed.clone()
+            } else {
+                original.clone()
+            };
+            Ok(Box::new(Cursor::new(data)))
+        });
+        let error = write_rar50(source, encrypted, volumes, 0).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            rars::ErrorKind::SourceChanged,
+            "encrypted={encrypted}, volumes={volumes}, change_at={change_at}: {error}"
+        );
+        assert_eq!(error.entry_context().unwrap().0, b"file");
+        assert!(error.to_string().contains("contents changed"));
+    }
+}
+
+#[test]
+fn rar50_split_header_preparation_rejects_a_truncated_source_reread() {
+    let error = write_rar50(changing_source(4096, 1, 1), false, true, 0).unwrap_err();
+    assert_eq!(error.kind(), rars::ErrorKind::SourceChanged);
+    assert_eq!(error.entry_context().unwrap().0, b"file");
+    assert!(error.to_string().contains("size changed"));
+}
+
 #[test]
 fn rar50_empty_sources_and_compression_store_fallback_are_verified() {
     for encrypted in [false, true] {
