@@ -74,6 +74,9 @@ impl<R> ChainedReader<R, Allowance> {
 
 impl<R: Read, B: Budget> Read for ChainedReader<R, B> {
     fn read(&mut self, out: &mut [u8]) -> Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
         while let Some(reader) = self.readers.get_mut(self.index) {
             let read = reader.read(out)?;
             if read != 0 {
@@ -148,6 +151,19 @@ mod tests {
             SplitVolumeStep::Interrupted
         ));
         assert!(state.is_pending());
+    }
+
+    #[test]
+    fn chained_reader_empty_reads_do_not_consume_fragments() {
+        let mut reader = ChainedReader::new(vec![Cursor::new(b"one"), Cursor::new(b"two")]);
+        assert_eq!(reader.read(&mut []).unwrap(), 0);
+        let mut byte = [0];
+        reader.read_exact(&mut byte).unwrap();
+        assert_eq!(&byte, b"o");
+        assert_eq!(reader.read(&mut []).unwrap(), 0);
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b"netwo");
     }
 
     #[test]

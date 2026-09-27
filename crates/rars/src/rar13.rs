@@ -1177,7 +1177,7 @@ where
     options.check_cancelled()?;
     let password = options.password;
     let mut budget = crate::output_limit::OutputBudget::new(options);
-    let mut pending: Option<PendingSplitRefs> = None;
+    let mut pending: Option<PendingSplitRefs<B>> = None;
     let mut unpack15 = Decoder15::with_allowance(allowance);
     unpack15.read_control = budget.control.clone();
     let mut extracted_count = 0usize;
@@ -1226,7 +1226,12 @@ where
                 entry.is_split_after(),
             ) {
                 (None, false, true) => {
-                    pending = Some(PendingSplitRefs::new(entry, volume_index, entry_index));
+                    pending = Some(PendingSplitRefs::with_allowance(
+                        entry,
+                        volume_index,
+                        entry_index,
+                        allowance,
+                    )?);
                 }
                 (Some(current), true, true) => {
                     current.append(entry, volume_index, entry_index)?;
@@ -1302,9 +1307,9 @@ impl Rar13Checksum {
     }
 }
 
-struct PendingSplitRefs {
+struct PendingSplitRefs<B: Budget = Allowance> {
     name: Vec<u8>,
-    fragments: Vec<(usize, usize)>,
+    fragments: Buffer<(usize, usize), B>,
     file_time: u32,
     file_attr: u8,
     method: u8,
@@ -1312,17 +1317,22 @@ struct PendingSplitRefs {
     was_encrypted: bool,
 }
 
-impl PendingSplitRefs {
-    fn new(entry: &Entry, volume_index: usize, entry_index: usize) -> Self {
-        Self {
+impl<B: Budget> PendingSplitRefs<B> {
+    fn with_allowance(
+        entry: &Entry,
+        volume_index: usize,
+        entry_index: usize,
+        allowance: &B,
+    ) -> Result<Self> {
+        Ok(Self {
             name: entry.name.clone(),
-            fragments: vec![(volume_index, entry_index)],
+            fragments: Buffer::copied(&[(volume_index, entry_index)], allowance)?,
             file_time: entry.header.file_time,
             file_attr: entry.header.file_attr,
             method: entry.header.method,
             unp_ver: entry.header.unp_ver,
             was_encrypted: entry.is_encrypted(),
-        }
+        })
     }
 
     fn append(&mut self, entry: &Entry, volume_index: usize, entry_index: usize) -> Result<()> {
@@ -1344,13 +1354,13 @@ impl PendingSplitRefs {
                 "RAR 1.3 split entry encryption flag changed",
             ));
         }
-        self.fragments.push((volume_index, entry_index));
+        self.fragments.try_push((volume_index, entry_index))?;
         Ok(())
     }
 
     // Split decoding needs format state, policy accounting and the output callback.
     #[allow(clippy::too_many_arguments)]
-    fn write_to<F, B: Budget>(
+    fn write_to<F>(
         self,
         volumes: &[Archive],
         final_entry: &Entry,
@@ -1406,7 +1416,7 @@ impl PendingSplitRefs {
         })
     }
 
-    fn fragment_reader_with_allowance<'a, B: Budget>(
+    fn fragment_reader_with_allowance<'a>(
         &self,
         volumes: &'a [Archive],
         password: Option<&'a [u8]>,

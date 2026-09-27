@@ -637,8 +637,34 @@ impl Archive {
         open: &mut F,
         redirect: &mut R,
         emit_redirections: bool,
+        selector: Option<&mut crate::extraction_control::Selector<'_>>,
+        on_error: Option<&mut crate::extraction_control::ErrorHandler<'_>>,
+    ) -> Result<crate::ExtractionOutcome>
+    where
+        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+        R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
+    {
+        self.extract_with_allowance(
+            options,
+            open,
+            redirect,
+            emit_redirections,
+            selector,
+            on_error,
+            &Allowance::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn extract_with_allowance<F, R, B: Budget>(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+        open: &mut F,
+        redirect: &mut R,
+        emit_redirections: bool,
         mut selector: Option<&mut crate::extraction_control::Selector<'_>>,
         mut on_error: Option<&mut crate::extraction_control::ErrorHandler<'_>>,
+        allowance: &B,
     ) -> Result<crate::ExtractionOutcome>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -648,7 +674,7 @@ impl Archive {
         let mut budget = crate::output_limit::OutputBudget::new(options);
         let buffered_decode_limit = rar50_buffered_decode_limit(options);
         let mut session =
-            DecoderSession::new_with_password(options.password, buffered_decode_limit);
+            DecoderSession::with_allowance(options.password, buffered_decode_limit, allowance);
         session.decoder.read_control = budget.control.clone();
         session.scratch = options.rar50_scratch;
         let solid = selector.is_some()
@@ -715,8 +741,11 @@ impl Archive {
                 solid,
                 result,
             )? {
-                session =
-                    DecoderSession::new_with_password(options.password, buffered_decode_limit);
+                session = DecoderSession::with_allowance(
+                    options.password,
+                    buffered_decode_limit,
+                    allowance,
+                );
                 session.decoder.read_control = budget.control.clone();
                 session.scratch = options.rar50_scratch;
             }
@@ -944,7 +973,7 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
 
     fn split_decryptor(
         &self,
-        split: &PendingSplitRefs,
+        split: &PendingSplitRefs<B>,
         volumes: &[Archive],
     ) -> Result<Option<SplitDecryptor>> {
         split.split_decryptor(volumes, self.password)
@@ -953,7 +982,7 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
     fn decode_split(
         &mut self,
         volumes: &[Archive],
-        split: &PendingSplitRefs,
+        split: &PendingSplitRefs<B>,
         final_file: &FileHeader,
         decryptor: Option<&SplitDecryptor>,
     ) -> Result<Buffer<u8, B>> {
@@ -963,7 +992,7 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
     fn stream_split_to(
         &mut self,
         volumes: &[Archive],
-        split: &PendingSplitRefs,
+        split: &PendingSplitRefs<B>,
         final_file: &FileHeader,
         decryptor: Option<&SplitDecryptor>,
         writer: &mut dyn Write,
@@ -1065,6 +1094,28 @@ where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
 {
+    extract_volumes_with_allowance(
+        volumes,
+        options,
+        open,
+        redirect,
+        emit_redirections,
+        &Allowance::default(),
+    )
+}
+
+fn extract_volumes_with_allowance<F, R, B: Budget>(
+    volumes: &[Archive],
+    options: crate::ArchiveReadOptions<'_>,
+    open: &mut F,
+    redirect: &mut R,
+    emit_redirections: bool,
+    allowance: &B,
+) -> Result<()>
+where
+    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
+{
     options.check_cancelled()?;
     if volumes.is_empty() {
         return Err(Error::InvalidHeader("RAR 5 volume set is empty"));
@@ -1074,7 +1125,7 @@ where
     let mut budget = crate::output_limit::OutputBudget::new(options);
     let mut split = SplitVolumeState::new();
     let buffered_decode_limit = rar50_buffered_decode_limit(options);
-    let mut session = DecoderSession::new_with_password(password, buffered_decode_limit);
+    let mut session = DecoderSession::with_allowance(password, buffered_decode_limit, allowance);
     session.decoder.read_control = budget.control.clone();
     session.scratch = options.rar50_scratch;
 
@@ -1107,15 +1158,20 @@ where
                 }
                 SplitVolumeStep::Start => {
                     validate_split_fragment(file, password)?;
-                    split.begin(PendingSplitRefs::new(file, volume_index, file_index));
+                    split.begin(PendingSplitRefs::with_allowance(
+                        file,
+                        volume_index,
+                        file_index,
+                        allowance,
+                    )?);
                 }
                 SplitVolumeStep::Continue(current) => {
                     validate_split_continuation_refs(current, file, password)?;
-                    current.append(volume_index, file_index);
+                    current.append(volume_index, file_index)?;
                 }
                 SplitVolumeStep::Finish(mut completed) => {
                     validate_split_continuation_refs(&completed, file, password)?;
-                    completed.append(volume_index, file_index);
+                    completed.append(volume_index, file_index)?;
                     file.check_output_limit(&budget)?;
                     completed.write_to(volumes, file, &mut session, &mut budget, &mut *open)?;
                 }
@@ -1153,8 +1209,8 @@ fn validate_split_fragment(file: &FileHeader, password: Option<&[u8]>) -> Result
     Ok(())
 }
 
-fn validate_split_continuation_refs(
-    pending: &PendingSplitRefs,
+fn validate_split_continuation_refs<B: Budget>(
+    pending: &PendingSplitRefs<B>,
     file: &FileHeader,
     password: Option<&[u8]>,
 ) -> Result<()> {
@@ -1175,9 +1231,9 @@ fn validate_split_continuation_refs(
     Ok(())
 }
 
-struct PendingSplitRefs {
+struct PendingSplitRefs<B: Budget = Allowance> {
     name: Vec<u8>,
-    fragments: Vec<(usize, usize)>,
+    fragments: Buffer<(usize, usize), B>,
     file_time: Option<u32>,
     mtime_refinement: Option<crate::TimeRefinement>,
     attr: u64,
@@ -1186,29 +1242,35 @@ struct PendingSplitRefs {
     encrypted: bool,
 }
 
-impl PendingSplitRefs {
-    fn new(file: &FileHeader, volume_index: usize, file_index: usize) -> Self {
-        Self {
+impl<B: Budget> PendingSplitRefs<B> {
+    fn with_allowance(
+        file: &FileHeader,
+        volume_index: usize,
+        file_index: usize,
+        allowance: &B,
+    ) -> Result<Self> {
+        Ok(Self {
             name: file.name.clone(),
-            fragments: vec![(volume_index, file_index)],
+            fragments: Buffer::copied(&[(volume_index, file_index)], allowance)?,
             file_time: file.modification_time(),
             mtime_refinement: file.modification_time_refinement(),
             attr: file.attributes,
             host_os: file.host_os,
             compression_info: file.compression_info,
             encrypted: file.encrypted,
-        }
+        })
     }
 
-    fn append(&mut self, volume_index: usize, file_index: usize) {
-        self.fragments.push((volume_index, file_index));
+    fn append(&mut self, volume_index: usize, file_index: usize) -> Result<()> {
+        self.fragments.try_push((volume_index, file_index))?;
+        Ok(())
     }
 
     fn write_to<F>(
         self,
         volumes: &[Archive],
         final_file: &FileHeader,
-        session: &mut DecoderSession<'_>,
+        session: &mut DecoderSession<'_, B>,
         budget: &mut crate::output_limit::OutputBudget,
         open: &mut F,
     ) -> Result<()>
@@ -1274,7 +1336,8 @@ impl PendingSplitRefs {
         decryptor: Option<&SplitDecryptor>,
         writer: &mut dyn Write,
     ) -> Result<()> {
-        let mut reader = self.fragment_reader(volumes, decryptor)?;
+        let mut reader =
+            self.fragment_reader_with_allowance(volumes, decryptor, &self.fragments.allowance())?;
         let mut crc = Crc32::new();
         let mut hash = streaming_hash_verifier(final_file)?;
         let mut written = 0u64;
@@ -1413,7 +1476,7 @@ impl PendingSplitRefs {
         None
     }
 
-    fn fragment_reader_with_allowance<'a, B: Budget>(
+    fn fragment_reader_with_allowance<'a>(
         &self,
         volumes: &'a [Archive],
         decryptor: Option<&SplitDecryptor>,
@@ -1444,12 +1507,13 @@ impl PendingSplitRefs {
             Ok(PackedReader::Plain(chained))
         }
     }
-    fn fragment_reader<'a>(
-        &self,
-        volumes: &'a [Archive],
-        decryptor: Option<&SplitDecryptor>,
-    ) -> Result<PackedReader<ChainedReader<crate::source::RangeReader<'a>>>> {
-        self.fragment_reader_with_allowance(volumes, decryptor, &Allowance::default())
+}
+
+#[cfg(test)]
+impl PendingSplitRefs<Allowance> {
+    fn new(file: &FileHeader, volume_index: usize, file_index: usize) -> Self {
+        Self::with_allowance(file, volume_index, file_index, &Allowance::default())
+            .expect("unlimited split bookkeeping")
     }
 }
 
@@ -1495,7 +1559,7 @@ impl FileHeader {
     fn decode_split_with_decoder<B: Budget>(
         &self,
         volumes: &[Archive],
-        split: &PendingSplitRefs,
+        split: &PendingSplitRefs<B>,
         decoder: &mut ReaderState<B>,
         decryptor: Option<&SplitDecryptor>,
     ) -> Result<Buffer<u8, B>> {
@@ -1629,6 +1693,24 @@ impl<R: Read> Read for Rar50DecryptingReader<R> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reader_workspace_split_descriptor_growth_is_admitted_before_mutation() {
+        let first = stored_split_archive(b"a", b"a", crc32(b"a"), HFL_SPLIT_AFTER)
+            .files()
+            .next()
+            .unwrap()
+            .clone();
+        let bytes = std::mem::size_of::<(usize, usize)>() as u64;
+        let quota = Allowance::limited(bytes);
+        let mut pending = PendingSplitRefs::with_allowance(&first, 0, 0, &quota).unwrap();
+        assert_eq!(quota.used(), bytes);
+        let error = pending.append(1, 0).unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::ResourceLimit);
+        assert_eq!(&pending.fragments[..], &[(0, 0)]);
+        assert_eq!(quota.used(), bytes);
+        drop(pending);
+        assert_eq!(quota.used(), 0);
+    }
 
     #[test]
     fn reader_session_workspace_refusals_release_rar5_scratch_filter_buffers_and_files() {
@@ -1967,8 +2049,8 @@ mod tests {
                 stored_split_archive(data, data, crc32(data) ^ 2, HFL_SPLIT_BEFORE),
             ];
             let mut pending = PendingSplitRefs::new(volumes[0].files().next().unwrap(), 0, 0);
-            pending.append(1, 0);
-            pending.append(2, 0);
+            pending.append(1, 0).unwrap();
+            pending.append(2, 0).unwrap();
             if first_kind == 2 {
                 std::fs::remove_file(&missing).unwrap();
             }

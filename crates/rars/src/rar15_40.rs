@@ -1505,8 +1505,28 @@ impl Archive {
         &self,
         options: crate::ArchiveReadOptions<'_>,
         open: &mut F,
+        selector: Option<&mut crate::extraction_control::Selector<'_>>,
+        on_error: Option<&mut crate::extraction_control::ErrorHandler<'_>>,
+    ) -> Result<crate::ExtractionOutcome>
+    where
+        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    {
+        self.extract_with_allowance(
+            options,
+            open,
+            selector,
+            on_error,
+            &crate::codec::workspace::Allowance::default(),
+        )
+    }
+
+    fn extract_with_allowance<F, B: crate::codec::workspace::Budget>(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+        open: &mut F,
         mut selector: Option<&mut crate::extraction_control::Selector<'_>>,
         mut on_error: Option<&mut crate::extraction_control::ErrorHandler<'_>>,
+        allowance: &B,
     ) -> Result<crate::ExtractionOutcome>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -1514,7 +1534,7 @@ impl Archive {
         options.check_cancelled()?;
         let password = options.password;
         let mut budget = crate::output_limit::OutputBudget::new(options);
-        let mut session = DecoderSession::new_with_password(self.main.is_solid(), password);
+        let mut session = DecoderSession::with_allowance(self.main.is_solid(), password, allowance);
         session.read_control = budget.control.clone();
         let solid = selector.is_some()
             && (self.main.is_solid() || self.files().any(|file| file.is_solid()));
@@ -1559,7 +1579,7 @@ impl Archive {
                 options.check_cancelled()?;
                 budget.run(&file.name, &mut writer, |mut writer| {
                     if file.is_stored() {
-                        file.write_stored_to(self, password, &mut writer)
+                        file.write_stored_with_allowance(self, password, &mut writer, allowance)
                             .map_err(|error| file.entry_error("extracting", error))?;
                     } else {
                         session
@@ -1577,7 +1597,7 @@ impl Archive {
                 solid,
                 result,
             )? {
-                session = DecoderSession::new_with_password(false, password);
+                session = DecoderSession::with_allowance(false, password, allowance);
                 session.read_control = budget.control.clone();
             }
         }

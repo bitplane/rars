@@ -264,7 +264,19 @@ impl FileHeader {
 pub fn extract_volumes_to<F>(
     volumes: &[Archive],
     options: crate::ArchiveReadOptions<'_>,
+    open: F,
+) -> Result<()>
+where
+    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+{
+    extract_volumes_with_allowance(volumes, options, open, &Allowance::default())
+}
+
+fn extract_volumes_with_allowance<F, B: Budget>(
+    volumes: &[Archive],
+    options: crate::ArchiveReadOptions<'_>,
     mut open: F,
+    allowance: &B,
 ) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -277,11 +289,12 @@ where
     let password = options.password;
     let mut budget = crate::output_limit::OutputBudget::new(options);
     let mut split = SplitVolumeState::new();
-    let mut session = DecoderSession::new_with_password(
+    let mut session = DecoderSession::with_allowance(
         volumes
             .first()
             .is_some_and(|archive| archive.main.is_solid()),
         password,
+        allowance,
     );
     session.read_control = budget.control.clone();
     for (volume_index, archive) in volumes.iter().enumerate() {
@@ -301,8 +314,13 @@ where
                         options.check_cancelled()?;
                         budget.run(&file.name, &mut writer, |mut writer| {
                             if file.is_stored() {
-                                file.write_stored_to(archive, password, &mut writer)
-                                    .map_err(|error| file.entry_error("extracting", error))?;
+                                file.write_stored_with_allowance(
+                                    archive,
+                                    password,
+                                    &mut writer,
+                                    allowance,
+                                )
+                                .map_err(|error| file.entry_error("extracting", error))?;
                             } else {
                                 session
                                     .write_file_to(archive, file, &mut writer)
@@ -315,15 +333,20 @@ where
                 }
                 SplitVolumeStep::Start => {
                     validate_split_fragment(file, password)?;
-                    split.begin(PendingSplitRefs::new(file, volume_index, file_index));
+                    split.begin(PendingSplitRefs::with_allowance(
+                        file,
+                        volume_index,
+                        file_index,
+                        allowance,
+                    )?);
                 }
                 SplitVolumeStep::Continue(current) => {
                     validate_split_continuation_refs(current, file, password)?;
-                    current.append(file, volume_index, file_index);
+                    current.append(file, volume_index, file_index)?;
                 }
                 SplitVolumeStep::Finish(mut completed) => {
                     validate_split_continuation_refs(&completed, file, password)?;
-                    completed.append(file, volume_index, file_index);
+                    completed.append(file, volume_index, file_index)?;
                     completed.write_to(
                         volumes,
                         file,
@@ -367,8 +390,8 @@ fn validate_split_fragment(file: &FileHeader, password: Option<&[u8]>) -> Result
     Ok(())
 }
 
-fn validate_split_continuation_refs(
-    pending: &PendingSplitRefs,
+fn validate_split_continuation_refs<B: Budget>(
+    pending: &PendingSplitRefs<B>,
     file: &FileHeader,
     password: Option<&[u8]>,
 ) -> Result<()> {
@@ -397,9 +420,9 @@ fn validate_split_continuation_refs(
     Ok(())
 }
 
-struct PendingSplitRefs {
+struct PendingSplitRefs<B: Budget = Allowance> {
     name: Vec<u8>,
-    fragments: Vec<(usize, usize)>,
+    fragments: Buffer<(usize, usize), B>,
     file_time: u32,
     mtime_refinement: Option<crate::TimeRefinement>,
     attr: u32,
@@ -410,11 +433,16 @@ struct PendingSplitRefs {
     salt: Option<[u8; 8]>,
 }
 
-impl PendingSplitRefs {
-    fn new(file: &FileHeader, volume_index: usize, file_index: usize) -> Self {
-        Self {
+impl<B: Budget> PendingSplitRefs<B> {
+    fn with_allowance(
+        file: &FileHeader,
+        volume_index: usize,
+        file_index: usize,
+        allowance: &B,
+    ) -> Result<Self> {
+        Ok(Self {
             name: file.name.clone(),
-            fragments: vec![(volume_index, file_index)],
+            fragments: Buffer::copied(&[(volume_index, file_index)], allowance)?,
             file_time: file.file_time,
             mtime_refinement: file.mtime_refinement(),
             attr: file.attr,
@@ -423,11 +451,12 @@ impl PendingSplitRefs {
             unp_ver: file.unp_ver,
             encrypted: file.is_encrypted(),
             salt: file.salt,
-        }
+        })
     }
 
-    fn append(&mut self, _file: &FileHeader, volume_index: usize, file_index: usize) {
-        self.fragments.push((volume_index, file_index));
+    fn append(&mut self, _file: &FileHeader, volume_index: usize, file_index: usize) -> Result<()> {
+        self.fragments.try_push((volume_index, file_index))?;
+        Ok(())
     }
 
     fn write_to<F>(
@@ -435,7 +464,7 @@ impl PendingSplitRefs {
         volumes: &[Archive],
         final_file: &FileHeader,
         password: Option<&[u8]>,
-        session: &mut DecoderSession,
+        session: &mut DecoderSession<'_, B>,
         budget: &mut crate::output_limit::OutputBudget,
         open: &mut F,
     ) -> Result<()>
@@ -454,7 +483,11 @@ impl PendingSplitRefs {
         };
         let mut writer = open(&meta)?;
         budget.run(&final_file.name, &mut writer, |mut writer| {
-            let mut reader = self.fragment_reader(volumes, password)?;
+            let mut reader = self.fragment_reader_with_allowance(
+                volumes,
+                password,
+                &self.fragments.allowance(),
+            )?;
 
             if final_file.is_stored() {
                 let expected_len = usize::try_from(final_file.unp_size).map_err(|_| {
@@ -518,7 +551,7 @@ impl PendingSplitRefs {
             })
     }
 
-    fn fragment_reader_with_allowance<'a, B: Budget>(
+    fn fragment_reader_with_allowance<'a>(
         &self,
         volumes: &'a [Archive],
         password: Option<&[u8]>,
@@ -552,6 +585,15 @@ impl PendingSplitRefs {
             allowance,
         )?))
     }
+}
+
+#[cfg(test)]
+impl PendingSplitRefs<Allowance> {
+    fn new(file: &FileHeader, volume_index: usize, file_index: usize) -> Self {
+        Self::with_allowance(file, volume_index, file_index, &Allowance::default())
+            .expect("unlimited split bookkeeping")
+    }
+    #[cfg(test)]
     fn fragment_reader<'a>(
         &self,
         volumes: &'a [Archive],
@@ -765,6 +807,21 @@ impl<R: Read> DecryptingReader<R, Allowance> {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reader_workspace_split_descriptor_growth_is_admitted_before_mutation() {
+        let first = file(b"a.txt", FHD_SPLIT_AFTER);
+        let bytes = std::mem::size_of::<(usize, usize)>() as u64;
+        let quota = Allowance::limited(bytes);
+        let mut pending = PendingSplitRefs::with_allowance(&first, 0, 0, &quota).unwrap();
+        assert_eq!(quota.used(), bytes);
+        let error = pending.append(&first, 1, 0).unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::ResourceLimit);
+        assert_eq!(&pending.fragments[..], &[(0, 0)]);
+        assert_eq!(quota.used(), bytes);
+        drop(pending);
+        assert_eq!(quota.used(), 0);
+    }
+
     #[test]
     fn reader_session_workspace_refusals_charge_every_legacy_decoder_and_encrypted_payload() {
         use crate::codec::workspace::RefusingBudget;
@@ -1275,7 +1332,7 @@ mod tests {
         second.packed_range = 0..(encrypted.len() - split);
 
         let mut pending = PendingSplitRefs::new(&first, 0, 0);
-        pending.append(&second, 1, 0);
+        pending.append(&second, 1, 0).unwrap();
         let volumes = vec![
             archive_with_source(vec![Block::File(first)], encrypted[..split].to_vec()),
             archive_with_source(vec![Block::File(second)], encrypted[split..].to_vec()),
@@ -1548,7 +1605,7 @@ mod tests {
         second.packed_range = 0..(plain.len() - split);
 
         let mut pending = PendingSplitRefs::new(&first, 0, 0);
-        pending.append(&second, 1, 0);
+        pending.append(&second, 1, 0).unwrap();
         let volumes = vec![
             archive_with_source(vec![Block::File(first)], plain[..split].to_vec()),
             archive_with_source(vec![Block::File(second)], plain[split..].to_vec()),
@@ -1567,7 +1624,7 @@ mod tests {
         second.pack_size = 5;
 
         let mut pending = PendingSplitRefs::new(&first, 0, 0);
-        pending.append(&second, 1, 0);
+        pending.append(&second, 1, 0).unwrap();
         let volumes = vec![
             archive_with(vec![Block::File(first)]),
             archive_with(vec![Block::File(second)]),
