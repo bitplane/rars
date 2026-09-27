@@ -1,3 +1,4 @@
+use super::workspace::{Allowance, Budget, Buffer};
 use super::{huffman, match_finder, Error, Result};
 use std::io::{Read, Write};
 
@@ -1535,12 +1536,65 @@ fn canonical_codes(lengths: &[u8]) -> Result<Vec<Option<HuffmanCode>>> {
 #[derive(Debug, Clone)]
 pub struct Unpack20 {
     pub(crate) read_control: crate::read_control::ReadControl,
-    bits: BitReader,
+    state: Reader20State<Allowance>,
+}
+impl Clone for Reader20State<Allowance> {
+    fn clone(&self) -> Self {
+        self.try_clone().expect("unlimited legacy decoder copy")
+    }
+}
+impl Unpack20 {
+    pub fn new() -> Self {
+        Self {
+            read_control: crate::read_control::ReadControl::default(),
+            state: Reader20State::with_allowance(&Allowance::default()),
+        }
+    }
+    pub fn decode_member(&mut self, input: &[u8], output_size: usize) -> Result<Vec<u8>> {
+        self.state.read_control = self.read_control.clone();
+        self.state
+            .decode_member_owned(input, output_size)
+            .map(Buffer::into_vec)
+    }
+    pub fn decode_member_to(
+        &mut self,
+        input: &[u8],
+        output_size: usize,
+        out: &mut impl Write,
+    ) -> Result<()> {
+        self.state.read_control = self.read_control.clone();
+        self.state.decode_member_to(input, output_size, out)
+    }
+    pub fn decode_member_from_reader(
+        &mut self,
+        input: &mut impl Read,
+        output_size: usize,
+        out: &mut impl Write,
+    ) -> Result<()> {
+        self.state.read_control = self.read_control.clone();
+        self.state
+            .decode_member_from_reader(input, output_size, out)
+    }
+}
+#[cfg(test)]
+impl Reader20State<Allowance> {
+    fn new() -> Self {
+        Self::with_allowance(&Allowance::default())
+    }
+    fn decode_member(&mut self, input: &[u8], output_size: usize) -> Result<Vec<u8>> {
+        self.decode_member_owned(input, output_size)
+            .map(Buffer::into_vec)
+    }
+}
+#[derive(Debug)]
+pub(crate) struct Reader20State<B: Budget> {
+    pub(crate) read_control: crate::read_control::ReadControl,
+    bits: BitReader<B>,
     levels: [u8; OLD_LEVEL_COUNT],
-    main: Huffman,
-    offsets: Huffman,
-    lengths: Huffman,
-    audio_tables: [Huffman; MAX_CHANNELS],
+    main: Huffman<B>,
+    offsets: Huffman<B>,
+    lengths: Huffman<B>,
+    audio_tables: [Huffman<B>; MAX_CHANNELS],
     audio_block: bool,
     channels: usize,
     cur_channel: usize,
@@ -1551,20 +1605,20 @@ pub struct Unpack20 {
     last_length: usize,
     pending_match: Option<(usize, usize)>,
     in_block: bool,
-    output: Vec<u8>,
+    output: Buffer<u8, B>,
     base_offset: usize,
 }
 
-impl Unpack20 {
-    pub fn new() -> Self {
+impl<B: Budget> Reader20State<B> {
+    pub(crate) fn with_allowance(allowance: &B) -> Self {
         Self {
             read_control: crate::read_control::ReadControl::default(),
-            bits: BitReader::new(),
+            bits: BitReader::with_allowance(allowance),
             levels: [0; OLD_LEVEL_COUNT],
-            main: Huffman::empty(),
-            offsets: Huffman::empty(),
-            lengths: Huffman::empty(),
-            audio_tables: std::array::from_fn(|_| Huffman::empty()),
+            main: Huffman::with_allowance(allowance),
+            offsets: Huffman::with_allowance(allowance),
+            lengths: Huffman::with_allowance(allowance),
+            audio_tables: std::array::from_fn(|_| Huffman::with_allowance(allowance)),
             audio_block: false,
             channels: 1,
             cur_channel: 0,
@@ -1575,27 +1629,59 @@ impl Unpack20 {
             last_length: 0,
             pending_match: None,
             in_block: false,
-            output: Vec::new(),
+            output: Buffer::new(allowance),
             base_offset: 0,
         }
     }
 
-    pub fn decode_member(&mut self, input: &[u8], output_size: usize) -> Result<Vec<u8>> {
+    pub(crate) fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            read_control: self.read_control.clone(),
+            bits: self.bits.try_clone()?,
+            levels: self.levels,
+            main: self.main.try_clone()?,
+            offsets: self.offsets.try_clone()?,
+            lengths: self.lengths.try_clone()?,
+            audio_tables: [
+                self.audio_tables[0].try_clone()?,
+                self.audio_tables[1].try_clone()?,
+                self.audio_tables[2].try_clone()?,
+                self.audio_tables[3].try_clone()?,
+            ],
+            audio_block: self.audio_block,
+            channels: self.channels,
+            cur_channel: self.cur_channel,
+            audio: self.audio,
+            channel_delta: self.channel_delta,
+            old_offsets: self.old_offsets,
+            last_offset: self.last_offset,
+            last_length: self.last_length,
+            pending_match: self.pending_match,
+            in_block: self.in_block,
+            output: Buffer::copied(&self.output, &self.output.allowance())?,
+            base_offset: self.base_offset,
+        })
+    }
+    pub fn decode_member_owned(
+        &mut self,
+        input: &[u8],
+        output_size: usize,
+    ) -> Result<Buffer<u8, B>> {
         self.read_control.check_codec()?;
         let start = self.current_pos();
         let target = start
             .checked_add(output_size)
             .ok_or(Error::InvalidData("RAR 2.0 output size overflows"))?;
         if !input.is_empty() {
-            self.bits = BitReader::new();
+            self.bits = BitReader::with_allowance(&self.output.allowance());
         }
-        self.bits.append(input);
+        self.bits.append(input)?;
         self.decode_until(target).map_err(|error| match error {
             Error::NeedMoreInput => Error::InvalidData("RAR 2.0 bitstream is truncated"),
             error => error,
         })?;
         self.read_last_tables()?;
-        let out = self.raw_range(start, target).to_vec();
+        let out = Buffer::copied(self.raw_range(start, target), &self.output.allowance())?;
         self.trim_history(target, target);
         Ok(out)
     }
@@ -1607,7 +1693,7 @@ impl Unpack20 {
         out: &mut impl Write,
     ) -> Result<()> {
         self.read_control.check_codec()?;
-        let decoded = self.decode_member(input, output_size)?;
+        let decoded = self.decode_member_owned(input, output_size)?;
         out.write_all(&decoded).map_err(Error::from)
     }
 
@@ -1624,10 +1710,8 @@ impl Unpack20 {
         let target = start
             .checked_add(output_size)
             .ok_or(Error::InvalidData("RAR 2.0 output size overflows"))?;
-        self.bits = BitReader::new();
-        let mut packed = Vec::new();
-        input.read_to_end(&mut packed).map_err(Error::from)?;
-        self.bits.append(&packed);
+        self.bits = BitReader::with_allowance(&self.output.allowance());
+        self.bits.input.read_to_end(input)?;
         if !self.in_block && self.bits.remaining_bytes_from_current() > 0 {
             self.read_tables().map_err(|error| match error {
                 Error::NeedMoreInput => Error::InvalidData("RAR 2.0 bitstream is truncated"),
@@ -1651,7 +1735,7 @@ impl Unpack20 {
         let mut poller = self.read_control.poller();
         while self.current_pos() < target {
             poller.check_codec(self.current_pos())?;
-            self.drain_pending_match(target);
+            self.drain_pending_match(target)?;
             if self.current_pos() >= target {
                 break;
             }
@@ -1685,7 +1769,7 @@ impl Unpack20 {
         };
 
         let level_lengths = Self::read_level_lengths(&mut self.bits)?;
-        let level_decoder = Huffman::from_lengths(&level_lengths)?;
+        let level_decoder = Huffman::with_lengths(&level_lengths, &self.output.allowance())?;
         let mut new_levels = [0u8; OLD_LEVEL_COUNT];
         let mut pos = 0usize;
         while pos < table_size {
@@ -1719,20 +1803,27 @@ impl Unpack20 {
         if self.audio_block {
             for channel in 0..self.channels {
                 let start = channel * AUDIO_COUNT;
-                self.audio_tables[channel] =
-                    Huffman::from_lengths(&self.levels[start..start + AUDIO_COUNT])?;
+                self.audio_tables[channel] = Huffman::with_lengths(
+                    &self.levels[start..start + AUDIO_COUNT],
+                    &self.output.allowance(),
+                )?;
             }
         } else {
-            self.main = Huffman::from_lengths(&self.levels[..MAIN_COUNT])?;
-            self.offsets =
-                Huffman::from_lengths(&self.levels[MAIN_COUNT..MAIN_COUNT + OFFSET_COUNT])?;
-            self.lengths =
-                Huffman::from_lengths(&self.levels[MAIN_COUNT + OFFSET_COUNT..TABLE_COUNT])?;
+            self.main =
+                Huffman::with_lengths(&self.levels[..MAIN_COUNT], &self.output.allowance())?;
+            self.offsets = Huffman::with_lengths(
+                &self.levels[MAIN_COUNT..MAIN_COUNT + OFFSET_COUNT],
+                &self.output.allowance(),
+            )?;
+            self.lengths = Huffman::with_lengths(
+                &self.levels[MAIN_COUNT + OFFSET_COUNT..TABLE_COUNT],
+                &self.output.allowance(),
+            )?;
         }
         Ok(())
     }
 
-    fn read_level_lengths(bits: &mut BitReader) -> Result<[u8; LEVEL_COUNT]> {
+    fn read_level_lengths(bits: &mut BitReader<B>) -> Result<[u8; LEVEL_COUNT]> {
         let mut lengths = [0u8; LEVEL_COUNT];
         for length in &mut lengths {
             *length = bits.read_bits(4)? as u8;
@@ -1753,13 +1844,13 @@ impl Unpack20 {
             }
             let symbol = self.main.decode(&mut self.bits)?;
             match symbol {
-                0..=255 => self.output.push(symbol as u8),
+                0..=255 => self.output.try_push(symbol as u8)?,
                 256 => {
                     if self.last_length != 0 {
                         let length = self.last_length;
                         let offset = self.last_offset;
                         self.push_old_offset(offset);
-                        self.copy_match(length, offset, output_size);
+                        self.copy_match(length, offset, output_size)?;
                     }
                 }
                 257..=260 => {
@@ -1782,7 +1873,7 @@ impl Unpack20 {
                     self.push_old_offset(offset);
                     self.last_offset = offset;
                     self.last_length = length;
-                    self.copy_match(length, offset, output_size);
+                    self.copy_match(length, offset, output_size)?;
                 }
                 261..=268 => {
                     let index = symbol - 261;
@@ -1791,7 +1882,7 @@ impl Unpack20 {
                     self.push_old_offset(offset);
                     self.last_offset = offset;
                     self.last_length = 2;
-                    self.copy_match(2, offset, output_size);
+                    self.copy_match(2, offset, output_size)?;
                 }
                 269 => {
                     self.in_block = false;
@@ -1814,7 +1905,7 @@ impl Unpack20 {
                     self.push_old_offset(offset);
                     self.last_offset = offset;
                     self.last_length = length;
-                    self.copy_match(length, offset, output_size);
+                    self.copy_match(length, offset, output_size)?;
                 }
             }
         }
@@ -1828,7 +1919,7 @@ impl Unpack20 {
             return Ok(());
         }
         let byte = self.decode_audio(symbol as u8);
-        self.output.push(byte);
+        self.output.try_push(byte)?;
         self.cur_channel += 1;
         if self.cur_channel == self.channels {
             self.cur_channel = 0;
@@ -1908,7 +1999,7 @@ impl Unpack20 {
         Ok(offset)
     }
 
-    fn copy_match(&mut self, length: usize, offset: usize, output_size: usize) {
+    fn copy_match(&mut self, length: usize, offset: usize, output_size: usize) -> Result<()> {
         let offset = if offset == 0 { 1 } else { offset };
         // A match reaching past the start of the stream writes zeroes rather
         // than failing. WinRAR never clears its window and guards the copy
@@ -1928,15 +2019,17 @@ impl Unpack20 {
                 let src = self.current_pos() - offset;
                 self.raw_byte(src)
             };
-            self.output.push(byte);
+            self.output.try_push(byte)?;
         }
+        Ok(())
     }
 
-    fn drain_pending_match(&mut self, output_size: usize) {
+    fn drain_pending_match(&mut self, output_size: usize) -> Result<()> {
         let Some((length, offset)) = self.pending_match.take() else {
-            return;
+            return Ok(());
         };
-        self.copy_match(length, offset, output_size);
+        self.copy_match(length, offset, output_size)?;
+        Ok(())
     }
 
     fn read_last_tables(&mut self) -> Result<()> {
@@ -1992,7 +2085,7 @@ impl Unpack20 {
             return;
         }
         let drain = keep_from - self.base_offset;
-        self.output.drain(..drain);
+        self.output.discard_prefix(drain);
         self.base_offset = keep_from;
     }
 }
@@ -2028,32 +2121,32 @@ fn fill_levels(levels: &mut [u8], pos: &mut usize, count: usize, value: u8) -> R
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-struct Huffman {
-    symbols: Vec<HuffmanSymbol>,
+#[derive(Debug)]
+struct Huffman<B: Budget = Allowance> {
+    symbols: Buffer<HuffmanSymbol, B>,
     first_code: [u16; 16],
     first_index: [usize; 16],
     counts: [u16; 16],
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct HuffmanSymbol {
     code: u16,
     len: u8,
     symbol: usize,
 }
 
-impl Huffman {
-    fn empty() -> Self {
+impl<B: Budget> Huffman<B> {
+    fn with_allowance(allowance: &B) -> Self {
         Self {
-            symbols: Vec::new(),
+            symbols: Buffer::new(allowance),
             first_code: [0; 16],
             first_index: [0; 16],
             counts: [0; 16],
         }
     }
 
-    fn from_lengths(lengths: &[u8]) -> Result<Self> {
+    fn with_lengths(lengths: &[u8], allowance: &B) -> Result<Self> {
         let mut count = [0u16; 16];
         for &len in lengths {
             if len > 15 {
@@ -2064,7 +2157,7 @@ impl Huffman {
             }
         }
         if count.iter().all(|&value| value == 0) {
-            return Ok(Self::empty());
+            return Ok(Self::with_allowance(allowance));
         }
         validate_huffman_counts(&count)?;
 
@@ -2084,16 +2177,16 @@ impl Huffman {
             index += usize::from(count[len]);
         }
 
-        let mut symbols = Vec::new();
+        let mut symbols = Buffer::with_capacity(index, allowance)?;
         for (symbol, &len) in lengths.iter().enumerate() {
             if len == 0 {
                 continue;
             }
             let code = next_code[len as usize];
             next_code[len as usize] += 1;
-            symbols.push(HuffmanSymbol { code, len, symbol });
+            symbols.push_admitted(HuffmanSymbol { code, len, symbol });
         }
-        symbols.sort_by_key(|item| (item.len, item.code, item.symbol));
+        symbols.sort_unstable_by_key(|item| (item.len, item.code, item.symbol));
         Ok(Self {
             symbols,
             first_code,
@@ -2102,7 +2195,15 @@ impl Huffman {
         })
     }
 
-    fn decode(&self, bits: &mut BitReader) -> Result<usize> {
+    fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            symbols: Buffer::copied(&self.symbols, &self.symbols.allowance())?,
+            first_code: self.first_code,
+            first_index: self.first_index,
+            counts: self.counts,
+        })
+    }
+    fn decode(&self, bits: &mut BitReader<B>) -> Result<usize> {
         let mut code = 0u16;
         if self.symbols.is_empty() {
             return Err(Error::InvalidData("RAR 2.0 empty Huffman table"));
@@ -2123,6 +2224,13 @@ impl Huffman {
     }
 }
 
+#[cfg(test)]
+impl Huffman<Allowance> {
+    fn from_lengths(lengths: &[u8]) -> Result<Self> {
+        Self::with_lengths(lengths, &Allowance::default())
+    }
+}
+
 fn validate_huffman_counts(count: &[u16; 16]) -> Result<()> {
     let mut available = 1i32;
     for &len_count in count.iter().skip(1) {
@@ -2134,23 +2242,29 @@ fn validate_huffman_counts(count: &[u16; 16]) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-struct BitReader {
-    input: Vec<u8>,
+#[derive(Debug)]
+struct BitReader<B: Budget = Allowance> {
+    input: Buffer<u8, B>,
     bit_pos: usize,
 }
 
-impl BitReader {
-    fn new() -> Self {
+impl<B: Budget> BitReader<B> {
+    fn with_allowance(allowance: &B) -> Self {
         Self {
-            input: Vec::new(),
+            input: Buffer::new(allowance),
             bit_pos: 0,
         }
     }
 
-    fn append(&mut self, input: &[u8]) {
+    fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            input: Buffer::copied(&self.input, &self.input.allowance())?,
+            bit_pos: self.bit_pos,
+        })
+    }
+    fn append(&mut self, input: &[u8]) -> Result<()> {
         self.compact();
-        self.input.extend_from_slice(input);
+        self.input.extend_from_slice(input).map_err(Into::into)
     }
 
     fn compact(&mut self) {
@@ -2158,7 +2272,7 @@ impl BitReader {
         if bytes == 0 {
             return;
         }
-        self.input.drain(..bytes);
+        self.input.discard_prefix(bytes);
         self.bit_pos -= bytes * 8;
     }
 
@@ -2191,6 +2305,12 @@ impl BitReader {
     }
 }
 
+#[cfg(test)]
+impl BitReader<Allowance> {
+    fn new() -> Self {
+        Self::with_allowance(&Allowance::default())
+    }
+}
 #[derive(Default)]
 struct BitWriter {
     bytes: Vec<u8>,
@@ -2221,6 +2341,66 @@ impl BitWriter {
 mod tests {
 
     #[test]
+    fn reader20_workspace_refusals_release_lz_audio_input_and_checkpoints() {
+        use crate::codec::workspace::RefusingBudget;
+        let data = b"resource accounting for legacy audio and LZ\n".repeat(24);
+        let streams = [
+            super::unpack20_encode_literals(&data).unwrap(),
+            super::encode_audio_member(&data, 4).unwrap(),
+        ];
+        for packed in streams {
+            for streaming in [false, true] {
+                let run = |budget: &RefusingBudget| -> super::Result<()> {
+                    let mut decoder = super::Reader20State::with_allowance(budget);
+                    if streaming {
+                        let mut output = super::Buffer::new(budget);
+                        decoder.decode_member_from_reader(
+                            &mut packed.as_slice(),
+                            data.len(),
+                            &mut output,
+                        )?;
+                        assert_eq!(&*output, &data);
+                    } else {
+                        let output = decoder.decode_member_owned(&packed, data.len())?;
+                        assert_eq!(&*output, &data);
+                    }
+                    let checkpoint = decoder.try_clone()?;
+                    assert_eq!(checkpoint.output, decoder.output);
+                    Ok(())
+                };
+                let baseline = RefusingBudget::new(usize::MAX);
+                run(&baseline).unwrap();
+                let attempts = baseline.attempts();
+                assert!(attempts > 10);
+                assert_eq!(baseline.used(), 0);
+                for index in 0..attempts {
+                    let budget = RefusingBudget::new(index);
+                    assert!(
+                        matches!(run(&budget), Err(Error::Cancelled)),
+                        "allocation {index}, streaming={streaming}"
+                    );
+                    assert_eq!(budget.used(), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reader20_workspace_keeps_returned_data_charged_after_decoder_drop() {
+        let data = b"owned legacy result".repeat(32);
+        let packed = unpack20_encode_literals(&data).unwrap();
+        let ledger = super::Allowance::limited(256 * 1024);
+        let mut decoder = super::Reader20State::with_allowance(&ledger);
+        let output = decoder.decode_member_owned(&packed, data.len()).unwrap();
+        assert!(ledger.used() > output.capacity() as u64);
+        drop(decoder);
+        assert_eq!(ledger.used(), output.capacity() as u64);
+        assert_eq!(&*output, &data);
+        drop(output);
+        assert_eq!(ledger.used(), 0);
+    }
+
+    #[test]
     fn cancellation_interrupts_buffered_symbol_work() {
         let data = b"cancellable legacy symbols ".repeat(16384);
         let packed = unpack20_encode_literals(&data).unwrap();
@@ -2234,10 +2414,11 @@ mod tests {
         );
         assert!(decoder.current_pos() > 0 && decoder.current_pos() < data.len());
     }
+    type Unpack20 = super::Reader20State<super::Allowance>;
     use super::{
         encode_tokens_with_progress, level_code_lengths_for_used_symbols, unpack20_decode,
         unpack20_encode_literals, BitWriter, CostModel, EncodeOptions, EncodeToken, Error, Huffman,
-        Unpack20, Unpack20Encoder, LEVEL_COUNT,
+        Unpack20Encoder, LEVEL_COUNT,
     };
 
     /// 7-Zip builds the RAR pre-table with `k_BuildMode_Full` and refuses a
@@ -2483,11 +2664,11 @@ mod tests {
     #[test]
     fn copy_match_zero_fills_an_offset_that_reaches_past_the_stream() {
         let mut decoder = Unpack20::new();
-        decoder.output.extend_from_slice(b"AB");
+        decoder.output.extend_from_slice(b"AB").unwrap();
 
-        decoder.copy_match(4, 9, 6);
+        decoder.copy_match(4, 9, 6).unwrap();
 
-        assert_eq!(decoder.output, b"AB\0\0\0\0");
+        assert_eq!(&*decoder.output, b"AB\0\0\0\0");
     }
 
     #[test]
@@ -2498,10 +2679,10 @@ mod tests {
         let mut decoder = Unpack20::new();
         decoder.main = Huffman::from_lengths(&lengths).unwrap();
         decoder.in_block = true;
-        decoder.bits.append(&[0b1000_0000]); // Repeat last, then literal zero.
+        decoder.bits.append(&[0b1000_0000]).unwrap(); // Repeat last, then literal zero.
 
         decoder.decode_until(1).unwrap();
-        assert_eq!(decoder.output, b"\0");
+        assert_eq!(&*decoder.output, b"\0");
         assert_eq!(decoder.last_length, 0);
     }
 
@@ -2517,10 +2698,10 @@ mod tests {
         decoder.lengths = Huffman::from_lengths(&length_lengths).unwrap();
         decoder.old_offsets[0] = 0x40000;
         decoder.in_block = true;
-        decoder.bits.append(&[0b1000_0000]); // Old offset 0, length slot 0.
+        decoder.bits.append(&[0b1000_0000]).unwrap(); // Old offset 0, length slot 0.
 
         decoder.decode_until(1).unwrap();
-        assert_eq!(decoder.output, b"\0");
+        assert_eq!(&*decoder.output, b"\0");
         assert_eq!(decoder.last_length, 5); // 2 + three distance adjustments.
         assert_eq!(decoder.pending_match, Some((4, 0x40000)));
     }
@@ -2536,10 +2717,10 @@ mod tests {
         decoder.main = Huffman::from_lengths(&main_lengths).unwrap();
         decoder.lengths = Huffman::from_lengths(&length_lengths).unwrap();
         decoder.in_block = true;
-        decoder.bits.append(&[0b1000_0000]);
+        decoder.bits.append(&[0b1000_0000]).unwrap();
 
         decoder.decode_until(2).unwrap();
-        assert_eq!(decoder.output, b"\0\0");
+        assert_eq!(&*decoder.output, b"\0\0");
         assert_eq!(decoder.last_offset, 0);
     }
 
@@ -2547,7 +2728,7 @@ mod tests {
     fn offset_slot_without_extra_bits_decodes_the_first_distance() {
         let mut decoder = Unpack20::new();
         decoder.offsets = Huffman::from_lengths(&[1, 1]).unwrap();
-        decoder.bits.append(&[0]);
+        decoder.bits.append(&[0]).unwrap();
         assert_eq!(decoder.read_offset().unwrap(), 1);
     }
 
