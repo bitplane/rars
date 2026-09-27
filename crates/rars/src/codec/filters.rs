@@ -171,6 +171,23 @@ pub(crate) fn delta_decode_with_control(
     messages: DeltaErrorMessages,
     control: &crate::read_control::ReadControl,
 ) -> Result<Vec<u8>> {
+    delta_decode_with_allowance(
+        data,
+        channels,
+        messages,
+        control,
+        &super::workspace::Allowance::default(),
+    )
+    .map(super::workspace::Buffer::into_vec)
+}
+
+pub(crate) fn delta_decode_with_allowance<B: super::workspace::Budget>(
+    data: &[u8],
+    channels: usize,
+    messages: DeltaErrorMessages,
+    control: &crate::read_control::ReadControl,
+    allowance: &B,
+) -> Result<super::workspace::Buffer<u8, B>> {
     control.check_codec()?;
     let mut poller = control.poller();
     if channels == 0 {
@@ -179,7 +196,7 @@ pub(crate) fn delta_decode_with_control(
     if channels > MAX_DELTA_CHANNELS {
         return Err(Error::InvalidData(messages.invalid_channels));
     }
-    let mut out = vec![0u8; data.len()];
+    let mut out = super::workspace::Buffer::filled(data.len(), 0, allowance)?;
     let mut src = 0usize;
     for channel in 0..channels {
         let mut prev = 0u8;

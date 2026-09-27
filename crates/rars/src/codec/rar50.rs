@@ -1,7 +1,6 @@
 use super::filters::{self, DeltaErrorMessages};
 use super::workspace::{Allowance, Budget, Buffer};
 use super::{huffman, match_finder, Error, Result};
-use std::collections::VecDeque;
 use std::io::Read;
 #[cfg(test)]
 use std::io::Write;
@@ -234,7 +233,7 @@ pub struct TableLengths {
     pub length: Vec<u8>,
 }
 
-struct EncoderLengths<B: Budget = Allowance> {
+struct OwnedLengths<B: Budget = Allowance> {
     main: Buffer<u8, B>,
     distance: Buffer<u8, B>,
     align: Buffer<u8, B>,
@@ -248,7 +247,7 @@ struct LengthSlices<'a> {
     align: &'a [u8],
     length: &'a [u8],
 }
-impl<B: Budget> EncoderLengths<B> {
+impl<B: Budget> OwnedLengths<B> {
     fn slices(&self) -> LengthSlices<'_> {
         LengthSlices {
             main: &self.main,
@@ -390,6 +389,38 @@ pub fn read_level_lengths(input: &[u8]) -> Result<([u8; LEVEL_TABLE_SIZE], usize
     Ok((lengths, bits.bit_pos))
 }
 
+#[derive(Debug)]
+struct ReaderTables<B: Budget> {
+    main: HuffmanState<B>,
+    distance: HuffmanState<B>,
+    align: HuffmanState<B>,
+    length: HuffmanState<B>,
+    align_mode: bool,
+}
+impl<B: Budget> ReaderTables<B> {
+    fn from_lengths(lengths: &OwnedLengths<B>, allowance: &B) -> Result<Self> {
+        Ok(Self {
+            main: HuffmanState::from_lengths(&lengths.main, allowance)?,
+            distance: HuffmanState::from_lengths(&lengths.distance, allowance)?,
+            align: HuffmanState::from_lengths(&lengths.align, allowance)?,
+            length: HuffmanState::from_lengths(&lengths.length, allowance)?,
+            align_mode: lengths
+                .align
+                .iter()
+                .any(|&length| length != 0 && length != 4),
+        })
+    }
+    fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            main: self.main.try_clone()?,
+            distance: self.distance.try_clone()?,
+            align: self.align.try_clone()?,
+            length: self.length.try_clone()?,
+            align_mode: self.align_mode,
+        })
+    }
+}
+
 pub fn table_length_count(algorithm_version: u8) -> Result<usize> {
     match algorithm_version {
         0 => Ok(MAIN_TABLE_SIZE + DISTANCE_TABLE_SIZE_50 + ALIGN_TABLE_SIZE + LENGTH_TABLE_SIZE),
@@ -401,17 +432,37 @@ pub fn table_length_count(algorithm_version: u8) -> Result<usize> {
 }
 
 pub fn read_table_lengths(input: &[u8], algorithm_version: u8) -> Result<(TableLengths, usize)> {
+    read_table_lengths_with_allowance(input, algorithm_version, &Allowance::default()).map(
+        |(lengths, bits)| {
+            (
+                TableLengths {
+                    main: lengths.main.into_vec(),
+                    distance: lengths.distance.into_vec(),
+                    align: lengths.align.into_vec(),
+                    length: lengths.length.into_vec(),
+                },
+                bits,
+            )
+        },
+    )
+}
+
+fn read_table_lengths_with_allowance<B: Budget>(
+    input: &[u8],
+    algorithm_version: u8,
+    allowance: &B,
+) -> Result<(OwnedLengths<B>, usize)> {
     let table_size = table_length_count(algorithm_version)?;
     let (level_lengths, level_bits) = read_level_lengths(input)?;
-    let level_decoder = HuffmanTable::from_lengths(&level_lengths)?;
+    let level_decoder = HuffmanState::from_lengths(&level_lengths, allowance)?;
     let mut bits = BitReader::new(input);
     bits.bit_pos = level_bits;
 
-    let mut lengths = Vec::with_capacity(table_size);
+    let mut lengths = Buffer::with_capacity(table_size, allowance)?;
     while lengths.len() < table_size {
         let number = level_decoder.decode(&mut bits)?;
         match number {
-            0..=15 => lengths.push(number as u8),
+            0..=15 => lengths.push_admitted(number as u8),
             16 | 17 => {
                 if lengths.is_empty() {
                     return Err(Error::InvalidData(
@@ -428,7 +479,7 @@ pub fn read_table_lengths(input: &[u8], algorithm_version: u8) -> Result<(TableL
                     if lengths.len() >= table_size {
                         break;
                     }
-                    lengths.push(previous);
+                    lengths.push_admitted(previous);
                 }
             }
             _ => {
@@ -442,7 +493,7 @@ pub fn read_table_lengths(input: &[u8], algorithm_version: u8) -> Result<(TableL
                     if lengths.len() >= table_size {
                         break;
                     }
-                    lengths.push(0);
+                    lengths.push_admitted(0);
                 }
             }
         }
@@ -459,11 +510,11 @@ pub fn read_table_lengths(input: &[u8], algorithm_version: u8) -> Result<(TableL
     let length_start = align_start + ALIGN_TABLE_SIZE;
 
     Ok((
-        TableLengths {
-            main: lengths[..distance_start].to_vec(),
-            distance: lengths[distance_start..align_start].to_vec(),
-            align: lengths[align_start..length_start].to_vec(),
-            length: lengths[length_start..].to_vec(),
+        OwnedLengths {
+            main: Buffer::copied(&lengths[..distance_start], allowance)?,
+            distance: Buffer::copied(&lengths[distance_start..align_start], allowance)?,
+            align: Buffer::copied(&lengths[align_start..length_start], allowance)?,
+            length: Buffer::copied(&lengths[length_start..], allowance)?,
         },
         bits.bit_pos,
     ))
@@ -2191,10 +2242,7 @@ impl EncoderMatchState {
 /// these to emit the tables; the optimal parse needs them to know what each
 /// token it is considering will actually cost.
 #[cfg(test)]
-fn table_lengths_for_tokens(
-    tokens: &[EncodeToken],
-    distance_size: usize,
-) -> Result<EncoderLengths> {
+fn table_lengths_for_tokens(tokens: &[EncodeToken], distance_size: usize) -> Result<OwnedLengths> {
     table_lengths_with_filters(tokens, &[], distance_size)
 }
 
@@ -2203,7 +2251,7 @@ fn table_lengths_with_filters(
     tokens: &[EncodeToken],
     filters: &[EncodeFilter],
     distance_size: usize,
-) -> Result<EncoderLengths> {
+) -> Result<OwnedLengths> {
     table_lengths_with_allowance(tokens, filters, distance_size, &Allowance::default())
 }
 
@@ -2212,7 +2260,7 @@ fn table_lengths_with_allowance<B: Budget>(
     filters: &[EncodeFilter],
     distance_size: usize,
     allowance: &B,
-) -> Result<EncoderLengths<B>> {
+) -> Result<OwnedLengths<B>> {
     let mut main_frequencies = Buffer::filled(MAIN_TABLE_SIZE, 0usize, allowance)?;
     main_frequencies[256] = filters.len();
     let mut distance_frequencies = Buffer::filled(distance_size, 0usize, allowance)?;
@@ -2251,7 +2299,7 @@ fn table_lengths_with_allowance<B: Budget>(
         }
     }
 
-    Ok(EncoderLengths {
+    Ok(OwnedLengths {
         main: huffman::complete_lengths_with_allowance(&main_frequencies, 15, allowance)?,
         distance: huffman::complete_lengths_with_allowance(&distance_frequencies, 15, allowance)?,
         align: huffman::complete_lengths_with_allowance(&align_frequencies, 15, allowance)?,
@@ -2264,7 +2312,7 @@ fn table_lengths_with_allowance<B: Budget>(
 fn token_stream_bits<B: Budget>(
     tokens: &[EncodeToken],
     filters: &[EncodeFilter],
-    lengths: &EncoderLengths<B>,
+    lengths: &OwnedLengths<B>,
     distance_size: usize,
 ) -> Result<usize> {
     let version = if distance_size == DISTANCE_TABLE_SIZE_70 {
@@ -2280,7 +2328,7 @@ fn token_stream_bits<B: Budget>(
 fn token_stream_bits_after_tables<B: Budget>(
     tokens: &[EncodeToken],
     filters: &[EncodeFilter],
-    lengths: &EncoderLengths<B>,
+    lengths: &OwnedLengths<B>,
     distance_size: usize,
     mut bits: usize,
 ) -> Result<usize> {
@@ -3078,26 +3126,42 @@ fn literal_presence(data: &[u8]) -> [bool; 256] {
     present
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Unpack50Decoder {
     pub(crate) read_control: crate::read_control::ReadControl,
-    tables: Option<DecodeTables>,
-    reps: [usize; 4],
-    last_length: usize,
-    history: Vec<u8>,
+    state: ReaderState<Allowance>,
 }
-
+impl Clone for Unpack50Decoder {
+    fn clone(&self) -> Self {
+        Self {
+            read_control: self.read_control.clone(),
+            state: self.state.try_clone().expect("unlimited decoder copy"),
+        }
+    }
+}
 impl Unpack50Decoder {
     pub fn new() -> Self {
         Self {
             read_control: crate::read_control::ReadControl::default(),
-            tables: None,
-            reps: [0; 4],
-            last_length: 0,
-            history: Vec::new(),
+            state: ReaderState::new(&Allowance::default()),
         }
     }
-
+    #[cfg(test)]
+    fn copy_match(
+        &self,
+        output: &mut Vec<u8>,
+        distance: usize,
+        length: usize,
+        output_limit: usize,
+        dictionary_size: usize,
+    ) -> Result<()> {
+        let mut owned = Buffer::from_vec(std::mem::take(output));
+        let result =
+            self.state
+                .copy_match(&mut owned, distance, length, output_limit, dictionary_size);
+        *output = owned.into_vec();
+        result
+    }
     pub fn decode_member(
         &mut self,
         input: &[u8],
@@ -3106,6 +3170,151 @@ impl Unpack50Decoder {
         solid: bool,
         mode: DecodeMode,
     ) -> Result<Vec<u8>> {
+        self.state.read_control = self.read_control.clone();
+        self.state
+            .decode_member(input, algorithm_version, output_size, solid, mode)
+            .map(Buffer::into_vec)
+    }
+    pub fn decode_member_with_dictionary(
+        &mut self,
+        input: &[u8],
+        algorithm_version: u8,
+        output_size: usize,
+        dictionary_size: usize,
+        solid: bool,
+        mode: DecodeMode,
+    ) -> Result<Vec<u8>> {
+        self.state.read_control = self.read_control.clone();
+        self.state
+            .decode_member_with_dictionary(
+                input,
+                algorithm_version,
+                output_size,
+                dictionary_size,
+                solid,
+                mode,
+            )
+            .map(Buffer::into_vec)
+    }
+    pub fn decode_member_from_reader(
+        &mut self,
+        input: &mut impl Read,
+        algorithm_version: u8,
+        output_size: usize,
+        solid: bool,
+        mode: DecodeMode,
+    ) -> Result<Vec<u8>> {
+        self.state.read_control = self.read_control.clone();
+        self.state
+            .decode_member_from_reader(input, algorithm_version, output_size, solid, mode)
+            .map(Buffer::into_vec)
+    }
+    pub fn decode_member_from_reader_with_dictionary(
+        &mut self,
+        input: &mut impl Read,
+        algorithm_version: u8,
+        output_size: usize,
+        dictionary_size: usize,
+        solid: bool,
+        mode: DecodeMode,
+    ) -> Result<Vec<u8>> {
+        self.state.read_control = self.read_control.clone();
+        self.state
+            .decode_member_from_reader_with_dictionary(
+                input,
+                algorithm_version,
+                output_size,
+                dictionary_size,
+                solid,
+                mode,
+            )
+            .map(Buffer::into_vec)
+    }
+    pub fn decode_member_from_reader_with_dictionary_to_sink<E>(
+        &mut self,
+        input: &mut impl Read,
+        algorithm_version: u8,
+        output_size: usize,
+        dictionary_size: usize,
+        solid: bool,
+        sink: impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), StreamDecodeError<E>> {
+        self.state.read_control = self.read_control.clone();
+        self.state
+            .decode_member_from_reader_with_dictionary_to_sink(
+                input,
+                algorithm_version,
+                output_size,
+                dictionary_size,
+                solid,
+                sink,
+            )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn decode_to_sink_with_filters<E>(
+        &mut self,
+        input: &mut impl Read,
+        algorithm_version: u8,
+        output_size: usize,
+        dictionary_size: usize,
+        solid: bool,
+        sink: impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
+        filters: Option<&mut dyn FnMut(PendingFilter) -> std::result::Result<(), E>>,
+    ) -> std::result::Result<(), StreamDecodeError<E>> {
+        self.state.read_control = self.read_control.clone();
+        self.state.decode_to_sink_with_filters(
+            input,
+            algorithm_version,
+            output_size,
+            dictionary_size,
+            solid,
+            sink,
+            filters,
+        )
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ReaderState<B: Budget> {
+    pub(crate) read_control: crate::read_control::ReadControl,
+    tables: Option<ReaderTables<B>>,
+    reps: [usize; 4],
+    last_length: usize,
+    history: Buffer<u8, B>,
+}
+
+impl<B: Budget> ReaderState<B> {
+    pub(crate) fn new(allowance: &B) -> Self {
+        Self {
+            read_control: crate::read_control::ReadControl::default(),
+            tables: None,
+            reps: [0; 4],
+            last_length: 0,
+            history: Buffer::new(allowance),
+        }
+    }
+
+    pub(crate) fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            read_control: self.read_control.clone(),
+            tables: self
+                .tables
+                .as_ref()
+                .map(ReaderTables::try_clone)
+                .transpose()?,
+            reps: self.reps,
+            last_length: self.last_length,
+            history: Buffer::copied(&self.history, &self.history.allowance())?,
+        })
+    }
+    pub fn decode_member(
+        &mut self,
+        input: &[u8],
+        algorithm_version: u8,
+        output_size: usize,
+        solid: bool,
+        mode: DecodeMode,
+    ) -> Result<Buffer<u8, B>> {
         self.read_control.check_codec()?;
         self.decode_member_with_dictionary(
             input,
@@ -3125,7 +3334,7 @@ impl Unpack50Decoder {
         dictionary_size: usize,
         solid: bool,
         mode: DecodeMode,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Buffer<u8, B>> {
         self.read_control.check_codec()?;
         let mut input = std::io::Cursor::new(input);
         self.decode_member_from_reader_with_dictionary(
@@ -3145,7 +3354,7 @@ impl Unpack50Decoder {
         output_size: usize,
         solid: bool,
         mode: DecodeMode,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Buffer<u8, B>> {
         self.read_control.check_codec()?;
         let control = self.read_control.clone();
         let input = &mut control.reader(input);
@@ -3167,7 +3376,7 @@ impl Unpack50Decoder {
         dictionary_size: usize,
         solid: bool,
         mode: DecodeMode,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Buffer<u8, B>> {
         self.read_control.check_codec()?;
         let control = self.read_control.clone();
         let input = &mut control.reader(input);
@@ -3178,16 +3387,25 @@ impl Unpack50Decoder {
             self.reset();
         }
 
-        let mut output = Vec::with_capacity(output_size.min(MAX_INITIAL_OUTPUT_CAPACITY));
-        let mut filters = Vec::new();
+        let allowance = self.history.allowance();
+        let mut output =
+            Buffer::with_capacity(output_size.min(MAX_INITIAL_OUTPUT_CAPACITY), &allowance)?;
+        let mut filters = Buffer::new(&allowance);
 
         loop {
-            let block = read_compressed_block(input)?;
+            let block = read_compressed_block_with_allowance(input, &self.history.allowance())?;
             let payload = &*block.payload;
             let mut payload_bit_pos = 0;
             if block.header.has_tables {
-                let (lengths, table_bits) = read_table_lengths(payload, algorithm_version)?;
-                self.tables = Some(DecodeTables::from_lengths(&lengths)?);
+                let (lengths, table_bits) = read_table_lengths_with_allowance(
+                    payload,
+                    algorithm_version,
+                    &block.payload.allowance(),
+                )?;
+                self.tables = Some(ReaderTables::from_lengths(
+                    &lengths,
+                    &block.payload.allowance(),
+                )?);
                 payload_bit_pos = table_bits;
             }
             let tables = self
@@ -3202,9 +3420,9 @@ impl Unpack50Decoder {
                 poller.check_codec(output.len())?;
                 let symbol = tables.main.decode(&mut bits)?;
                 match symbol {
-                    0..=255 => output.push(symbol as u8),
+                    0..=255 => output.try_push(symbol as u8)?,
                     256 if mode.uses_lz() => {
-                        filters.push(read_filter(&mut bits, output.len())?);
+                        filters.try_push(read_filter(&mut bits, output.len())?)?;
                     }
                     257 if mode.uses_lz() => {
                         if self.last_length != 0 {
@@ -3291,18 +3509,26 @@ impl Unpack50Decoder {
 
         if output.len() == output_size {
             let history_output = if mode.applies_filters() && !filters.is_empty() {
-                Some(output[output.len().saturating_sub(dictionary_size)..].to_vec())
+                Some(Buffer::copied(
+                    &output[output.len().saturating_sub(dictionary_size)..],
+                    &allowance,
+                )?)
             } else {
                 None
             };
             if mode.applies_filters() {
                 self.read_control.check_codec()?;
-                apply_filters_with_control(&mut output, &filters, &self.read_control)?;
+                apply_filters_with_allowance(
+                    &mut output,
+                    &filters,
+                    &self.read_control,
+                    &allowance,
+                )?;
             }
             self.remember_history(
                 history_output.as_deref().unwrap_or(&output),
                 dictionary_size,
-            );
+            )?;
             Ok(output)
         } else {
             Err(Error::NeedMoreInput)
@@ -3358,22 +3584,32 @@ impl Unpack50Decoder {
         let history_limit = dictionary_size;
         if self.history.len() > history_limit {
             let discard = self.history.len() - history_limit;
-            self.history.drain(..discard);
+            self.history.discard_prefix(discard);
         }
         let mut output = StreamingOutput::new(
-            std::mem::take(&mut self.history),
+            {
+                let allowance = self.history.allowance();
+                std::mem::replace(&mut self.history, Buffer::new(&allowance))
+            },
             output_size,
             dictionary_size,
             history_limit,
-        );
+        )?;
 
         loop {
-            let block = read_compressed_block(input)?;
+            let block = read_compressed_block_with_allowance(input, &output.history.allowance())?;
             let payload = &*block.payload;
             let mut payload_bit_pos = 0;
             if block.header.has_tables {
-                let (lengths, table_bits) = read_table_lengths(payload, algorithm_version)?;
-                self.tables = Some(DecodeTables::from_lengths(&lengths)?);
+                let (lengths, table_bits) = read_table_lengths_with_allowance(
+                    payload,
+                    algorithm_version,
+                    &block.payload.allowance(),
+                )?;
+                self.tables = Some(ReaderTables::from_lengths(
+                    &lengths,
+                    &block.payload.allowance(),
+                )?);
                 payload_bit_pos = table_bits;
             }
             let tables = self
@@ -3475,7 +3711,7 @@ impl Unpack50Decoder {
         }
     }
 
-    fn remember_history(&mut self, output: &[u8], dictionary_size: usize) {
+    fn remember_history(&mut self, output: &[u8], dictionary_size: usize) -> Result<()> {
         let incoming = &output[output.len().saturating_sub(dictionary_size)..];
         let keep = self.history.len().min(dictionary_size - incoming.len());
         let required = keep + incoming.len();
@@ -3484,14 +3720,19 @@ impl Unpack50Decoder {
             // oversized storage when the active dictionary shrinks as well.
             let capacity =
                 reader_history_capacity(self.history.capacity(), required, dictionary_size);
-            let mut history = Vec::with_capacity(capacity);
-            history.extend_from_slice(&self.history[self.history.len() - keep..]);
-            history.extend_from_slice(incoming);
+            let mut history = Buffer::with_capacity(capacity, &self.history.allowance())?;
+            history
+                .extend_from_slice(&self.history[self.history.len() - keep..])
+                .map_err(Into::into)?;
+            history.extend_from_slice(incoming).map_err(Into::into)?;
             self.history = history;
         } else {
-            self.history.drain(..self.history.len() - keep);
-            self.history.extend_from_slice(incoming);
+            self.history.discard_prefix(self.history.len() - keep);
+            self.history
+                .extend_from_slice(incoming)
+                .map_err(Into::into)?;
         }
+        Ok(())
     }
 
     fn reset(&mut self) {
@@ -3503,7 +3744,7 @@ impl Unpack50Decoder {
 
     fn copy_match(
         &self,
-        output: &mut Vec<u8>,
+        output: &mut Buffer<u8, B>,
         distance: usize,
         length: usize,
         output_limit: usize,
@@ -3526,7 +3767,7 @@ impl Unpack50Decoder {
             || distance > dictionary_size
             || distance > self.history.len() + output.len()
         {
-            output.resize(output.len() + length, 0);
+            output.resize(output.len() + length, 0)?;
             return Ok(());
         }
         let mut remaining = length;
@@ -3537,19 +3778,21 @@ impl Unpack50Decoder {
                 if distance == 1 {
                     // A one-byte repeat is a fill, not a copy.
                     let b = output[output.len() - 1];
-                    output.resize(output.len() + remaining, b);
+                    output.resize(output.len() + remaining, b)?;
                     remaining = 0;
                 } else {
                     let start = output.len() - distance;
                     let take = remaining.min(distance);
-                    output.extend_from_within(start..start + take);
+                    output.extend_from_within(start..start + take)?;
                     remaining -= take;
                 }
             } else {
                 let history_distance = distance - output.len();
                 let index = self.history.len() - history_distance;
                 let take = remaining.min(history_distance);
-                output.extend_from_slice(&self.history[index..index + take]);
+                output
+                    .extend_from_slice(&self.history[index..index + take])
+                    .map_err(Into::into)?;
                 remaining -= take;
             }
         }
@@ -3567,9 +3810,9 @@ fn reader_history_capacity(current: usize, required: usize, limit: usize) -> usi
     }
 }
 
-struct StreamingOutput {
-    history: VecDeque<u8>,
-    pending: Vec<u8>,
+struct StreamingOutput<B: Budget = Allowance> {
+    history: super::workspace::Deque<u8, B>,
+    pending: Buffer<u8, B>,
     written: usize,
     output_limit: usize,
     dictionary_size: usize,
@@ -3577,25 +3820,26 @@ struct StreamingOutput {
     all_zero: bool,
 }
 
-impl StreamingOutput {
+impl<B: Budget> StreamingOutput<B> {
     fn new(
-        mut history: Vec<u8>,
+        mut history: Buffer<u8, B>,
         output_limit: usize,
         dictionary_size: usize,
         history_limit: usize,
-    ) -> Self {
+    ) -> Result<Self> {
         if history.capacity() > history_limit {
-            history.shrink_to(history.len());
+            history = Buffer::copied(&history, &history.allowance())?;
         }
-        Self {
+        let allowance = history.allowance();
+        Ok(Self {
             all_zero: history.iter().all(|&byte| byte == 0),
-            history: history.into(),
-            pending: Vec::with_capacity(STREAM_FLUSH_THRESHOLD),
+            history: super::workspace::Deque::from_buffer(history),
+            pending: Buffer::with_capacity(STREAM_FLUSH_THRESHOLD, &allowance)?,
             written: 0,
             output_limit,
             dictionary_size,
             history_limit,
-        }
+        })
     }
 
     fn written(&self) -> usize {
@@ -3613,7 +3857,7 @@ impl StreamingOutput {
         if byte != 0 {
             self.all_zero = false;
         }
-        self.pending.push(byte);
+        self.pending.try_push(byte)?;
         self.written += 1;
         if self.pending.len() >= STREAM_FLUSH_THRESHOLD {
             self.flush(sink)?;
@@ -3641,7 +3885,7 @@ impl StreamingOutput {
             let available = STREAM_FLUSH_THRESHOLD - self.pending.len();
             let take = count.min(available.max(1));
             let old_len = self.pending.len();
-            self.pending.resize(old_len + take, byte);
+            self.pending.resize(old_len + take, byte)?;
             self.written += take;
             count -= take;
             if self.pending.len() >= STREAM_FLUSH_THRESHOLD {
@@ -3673,8 +3917,11 @@ impl StreamingOutput {
         // decode_member_to rejects zero dictionary sizes before constructing
         // this output, so a zero fill always has room for one history byte.
         if self.history.is_empty() {
-            self.history.reserve_exact(1);
-            self.history.push_back(0);
+            self.history = super::workspace::Deque::from_buffer(Buffer::filled(
+                1,
+                0,
+                &self.history.allowance(),
+            )?);
         }
         Ok(())
     }
@@ -3739,13 +3986,14 @@ impl StreamingOutput {
         if self.history.capacity() > self.history_limit || self.history.capacity() < required {
             let capacity =
                 reader_history_capacity(self.history.capacity(), required, self.history_limit);
-            let mut history = VecDeque::with_capacity(capacity);
-            history.extend(self.history.iter().skip(self.history.len() - keep).copied());
-            history.extend(incoming.iter().copied());
+            let mut history =
+                super::workspace::Deque::with_capacity(capacity, &self.history.allowance())?;
+            history.extend_admitted(self.history.iter().skip(self.history.len() - keep).copied());
+            history.extend_admitted(incoming.iter().copied());
             self.history = history;
         } else {
-            self.history.drain(..self.history.len() - keep);
-            self.history.extend(incoming.iter().copied());
+            self.history.discard_prefix(self.history.len() - keep);
+            self.history.extend_admitted(incoming.iter().copied());
         }
         self.pending.clear();
         Ok(())
@@ -3758,11 +4006,12 @@ impl StreamingOutput {
         self.flush(sink)
     }
 
-    fn into_history(self) -> Vec<u8> {
-        self.history.into()
+    fn into_history(self) -> Buffer<u8, B> {
+        self.history.into_buffer()
     }
 }
 
+#[cfg(test)]
 fn read_compressed_block(input: &mut impl Read) -> Result<OwnedCompressedBlock> {
     read_compressed_block_with_allowance(input, &Allowance::default())
 }
@@ -3951,10 +4200,19 @@ fn filter_data_byte_count(value: u32) -> usize {
     ((u32::BITS - value.leading_zeros()).div_ceil(8) as usize).max(1)
 }
 
+#[cfg(test)]
 fn apply_filters_with_control(
     output: &mut [u8],
     filters: &[PendingFilter],
     control: &crate::read_control::ReadControl,
+) -> Result<()> {
+    apply_filters_with_allowance(output, filters, control, &Allowance::default())
+}
+fn apply_filters_with_allowance<B: Budget>(
+    output: &mut [u8],
+    filters: &[PendingFilter],
+    control: &crate::read_control::ReadControl,
+    allowance: &B,
 ) -> Result<()> {
     control.check_codec()?;
     for filter in filters {
@@ -3966,7 +4224,7 @@ fn apply_filters_with_control(
         let data = output
             .get_mut(filter.start..end)
             .ok_or(Error::InvalidData("RAR 5 filter range exceeds output"))?;
-        apply_filter_data(data, filter, control)?;
+        apply_filter_data_with_allowance(data, filter, control, allowance)?;
     }
     Ok(())
 }
@@ -3976,13 +4234,22 @@ pub(crate) fn apply_filter_data(
     filter: &PendingFilter,
     control: &crate::read_control::ReadControl,
 ) -> Result<()> {
+    apply_filter_data_with_allowance(data, filter, control, &Allowance::default())
+}
+fn apply_filter_data_with_allowance<B: Budget>(
+    data: &mut [u8],
+    filter: &PendingFilter,
+    control: &crate::read_control::ReadControl,
+    allowance: &B,
+) -> Result<()> {
     match filter.filter_type {
         FilterType::Delta => {
-            let decoded = filters::delta_decode_with_control(
+            let decoded = filters::delta_decode_with_allowance(
                 data,
                 filter.channels,
                 rar50_delta_messages(),
                 control,
+                allowance,
             )?;
             data.copy_from_slice(&decoded);
         }
@@ -4221,23 +4488,48 @@ fn distance_from_slot_parts(slot: usize, bit_count: usize, extra_bits: u32) -> u
     usize::try_from(distance).unwrap_or(usize::MAX)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct HuffmanTable {
-    symbols: Vec<HuffmanSymbol>,
+    state: HuffmanState<Allowance>,
+}
+impl Clone for HuffmanTable {
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state.try_clone().expect("unlimited table copy"),
+        }
+    }
+}
+impl HuffmanTable {
+    pub fn from_lengths(lengths: &[u8]) -> Result<Self> {
+        Ok(Self {
+            state: HuffmanState::from_lengths(lengths, &Allowance::default())?,
+        })
+    }
+    pub fn is_empty(&self) -> bool {
+        self.state.is_empty()
+    }
+    #[cfg(test)]
+    fn decode(&self, bits: &mut BitReader<'_>) -> Result<usize> {
+        self.state.decode(bits)
+    }
+}
+#[derive(Debug)]
+struct HuffmanState<B: Budget> {
+    symbols: Buffer<HuffmanSymbol, B>,
     first_code: [u16; 16],
     first_index: [usize; 16],
     counts: [u16; 16],
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct HuffmanSymbol {
     code: u16,
     len: u8,
     symbol: usize,
 }
 
-impl HuffmanTable {
-    pub fn from_lengths(lengths: &[u8]) -> Result<Self> {
+impl<B: Budget> HuffmanState<B> {
+    fn from_lengths(lengths: &[u8], allowance: &B) -> Result<Self> {
         let mut count = [0u16; 16];
         for &length in lengths {
             if length > 15 {
@@ -4265,20 +4557,20 @@ impl HuffmanTable {
             index += usize::from(count[length]);
         }
 
-        let mut symbols = Vec::new();
+        let mut symbols = Buffer::with_capacity(index, allowance)?;
         for (symbol, &length) in lengths.iter().enumerate() {
             if length == 0 {
                 continue;
             }
             let code = next_code[length as usize];
             next_code[length as usize] += 1;
-            symbols.push(HuffmanSymbol {
+            symbols.push_admitted(HuffmanSymbol {
                 code,
                 len: length,
                 symbol,
             });
         }
-        symbols.sort_by_key(|item| (item.len, item.code, item.symbol));
+        symbols.sort_unstable_by_key(|item| (item.len, item.code, item.symbol));
         Ok(Self {
             symbols,
             first_code,
@@ -4287,6 +4579,14 @@ impl HuffmanTable {
         })
     }
 
+    fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            symbols: Buffer::copied(&self.symbols, &self.symbols.allowance())?,
+            first_code: self.first_code,
+            first_index: self.first_index,
+            counts: self.counts,
+        })
+    }
     pub fn is_empty(&self) -> bool {
         self.symbols.is_empty()
     }
@@ -4731,6 +5031,110 @@ mod tests {
             assert_eq!(budget.used(), 0, "failure at allocation {fail_at}");
         }
         attempts
+    }
+
+    #[test]
+    fn reader_workspace_refusals_release_buffered_filters_and_checkpoints() {
+        let data = b"raw reader dictionary and filtered output\n".repeat(32);
+        for kind in [
+            crate::FilterKind::E8,
+            crate::FilterKind::Delta { channels: 2 },
+        ] {
+            let packed = Unpack50Encoder::new()
+                .encode_member_with_filter(&data, 0, crate::FilterSpec::whole(kind))
+                .unwrap();
+            let attempts = assert_each_allocation_refusal(|budget| {
+                let mut state = ReaderState::new(budget);
+                let decoded = state.decode_member_with_dictionary(
+                    &packed,
+                    0,
+                    data.len(),
+                    64,
+                    false,
+                    DecodeMode::Lz,
+                )?;
+                assert_eq!(&*decoded, &data);
+                let checkpoint = state.try_clone()?;
+                assert_eq!(checkpoint.history, state.history);
+                assert_eq!(
+                    checkpoint.tables.as_ref().unwrap().main.symbols.len(),
+                    state.tables.as_ref().unwrap().main.symbols.len()
+                );
+                Ok(decoded)
+            });
+            assert!(attempts > 15);
+        }
+    }
+
+    #[test]
+    fn reader_workspace_refusals_release_streaming_history_and_input() {
+        let data = b"streaming reader window\n".repeat(4000);
+        let packed = encode_literal_only(&data, 0).unwrap();
+        let attempts = assert_each_allocation_refusal(|budget| {
+            let mut state = ReaderState::new(budget);
+            let mut emitted = 0;
+            let result = state.decode_member_from_reader_with_dictionary_to_sink(
+                &mut packed.as_slice(),
+                0,
+                data.len(),
+                1024,
+                false,
+                |chunk| {
+                    emitted += match chunk {
+                        DecodedChunk::Bytes(bytes) => bytes.len(),
+                        DecodedChunk::Repeated { len, .. } => len,
+                    };
+                    Ok::<(), std::convert::Infallible>(())
+                },
+            );
+            match result {
+                Ok(()) => {
+                    assert_eq!(emitted, data.len());
+                    assert_eq!(&*state.history, &data[data.len() - 1024..]);
+                    Ok(())
+                }
+                Err(StreamDecodeError::Decode(error)) => Err(error),
+                Err(_) => panic!("unexpected streaming failure"),
+            }
+        });
+        assert!(attempts > 8);
+    }
+
+    #[test]
+    fn reader_workspace_retained_output_and_checkpoint_remain_charged() {
+        let data = b"retained reader result".repeat(20);
+        let packed = encode_literal_only(&data, 0).unwrap();
+        let ledger = Allowance::limited(256 * 1024);
+        let mut state = ReaderState::new(&ledger);
+        let output = state
+            .decode_member_with_dictionary(&packed, 0, data.len(), 64, false, DecodeMode::Lz)
+            .unwrap();
+        let owners = ledger.used();
+        let checkpoint = state.try_clone().unwrap();
+        assert!(ledger.used() > owners);
+        drop(state);
+        assert!(ledger.used() > output.capacity() as u64);
+        drop(checkpoint);
+        assert_eq!(ledger.used(), output.capacity() as u64);
+        assert_eq!(&*output, &data);
+        drop(output);
+        assert_eq!(ledger.used(), 0);
+    }
+
+    #[test]
+    fn reader_workspace_history_replacement_admits_overlap_before_mutating() {
+        let ledger = Allowance::limited(8);
+        let mut state = ReaderState::new(&ledger);
+        state.remember_history(b"ABCDEFGH", 8).unwrap();
+        assert_eq!(ledger.used(), 8);
+        assert!(matches!(
+            state.remember_history(b"xy", 2),
+            Err(Error::WorkspaceLimitExceeded(_))
+        ));
+        assert_eq!(&*state.history, b"ABCDEFGH");
+        assert_eq!(ledger.used(), 8);
+        drop(state);
+        assert_eq!(ledger.used(), 0);
     }
 
     #[test]
@@ -8463,7 +8867,7 @@ mod tests {
                 Err(Error::NeedMoreInput),
                 "length slot {length_slot}, distance slot {distance_slot}"
             );
-            assert!(buffered.tables.is_none()); // Error occurred before the block completed.
+            assert!(buffered.state.tables.is_none()); // Error occurred before the block completed.
             let mut streaming = Unpack50Decoder::new();
             let result = streaming.decode_member_from_reader_with_dictionary_to_sink(
                 &mut input.as_slice(),
@@ -8477,7 +8881,7 @@ mod tests {
                 result,
                 Err(StreamDecodeError::Decode(Error::NeedMoreInput))
             ));
-            assert!(streaming.tables.is_none());
+            assert!(streaming.state.tables.is_none());
         }
     }
 
@@ -8508,7 +8912,7 @@ mod tests {
             ),
             Err(expected.clone())
         );
-        assert!(buffered.tables.is_none());
+        assert!(buffered.state.tables.is_none());
         let mut streaming = Unpack50Decoder::new();
         let result = streaming.decode_member_from_reader_with_dictionary_to_sink(
             &mut input.as_slice(),
@@ -8519,7 +8923,7 @@ mod tests {
             |_chunk| Ok::<(), std::convert::Infallible>(()),
         );
         assert!(matches!(result, Err(StreamDecodeError::Decode(error)) if error == expected));
-        assert!(streaming.tables.is_none());
+        assert!(streaming.state.tables.is_none());
     }
 
     #[test]
@@ -8570,7 +8974,7 @@ mod tests {
                 ),
                 Err(Error::NeedMoreInput)
             );
-            assert!(buffered.tables.is_none());
+            assert!(buffered.state.tables.is_none());
 
             let mut streaming = Unpack50Decoder::new();
             streaming
@@ -8595,7 +8999,7 @@ mod tests {
                 result,
                 Err(StreamDecodeError::Decode(Error::NeedMoreInput))
             ));
-            assert!(streaming.tables.is_none());
+            assert!(streaming.state.tables.is_none());
         }
     }
 
@@ -8666,7 +9070,7 @@ mod tests {
                 Err(expected.clone()),
                 "distance slot {distance_slot:?}"
             );
-            assert!(buffered.tables.is_none());
+            assert!(buffered.state.tables.is_none());
             let mut streaming = Unpack50Decoder::new();
             let result = streaming.decode_member_from_reader_with_dictionary_to_sink(
                 &mut input.as_slice(),
@@ -8677,7 +9081,7 @@ mod tests {
                 |_chunk| Ok::<(), std::convert::Infallible>(()),
             );
             assert!(matches!(result, Err(StreamDecodeError::Decode(error)) if error == expected));
-            assert!(streaming.tables.is_none());
+            assert!(streaming.state.tables.is_none());
         }
     }
 
@@ -8933,7 +9337,7 @@ mod tests {
             .unwrap();
         assert_eq!(buffered, b"A\0\0\0");
 
-        let mut streaming = StreamingOutput::new(b"A".to_vec(), 3, 1, 1);
+        let mut streaming = StreamingOutput::new(Buffer::from_vec(b"A".to_vec()), 3, 1, 1).unwrap();
         let mut decoded = Vec::new();
         streaming
             .copy_match(0, 3, &mut |chunk| {
@@ -9000,11 +9404,11 @@ mod tests {
                 .unwrap(),
             data
         );
-        assert_eq!(decoder.history, data[data.len() - 1024..]);
+        assert_eq!(&*decoder.state.history, &data[data.len() - 1024..][..]);
         assert!(
-            decoder.history.capacity() <= 1024,
+            decoder.state.history.capacity() <= 1024,
             "retained {} bytes for a 1024-byte dictionary",
-            decoder.history.capacity()
+            decoder.state.history.capacity()
         );
         let next = b"next solid member";
         let packed = encode_literal_only(next, 0).unwrap();
@@ -9019,13 +9423,13 @@ mod tests {
             )
             .unwrap();
         let expected = [&data[data.len() - (1024 - next.len())..], next.as_slice()].concat();
-        assert_eq!(decoder.history, expected);
-        assert!(decoder.history.capacity() <= 1024);
+        assert_eq!(decoder.state.history, expected);
+        assert!(decoder.state.history.capacity() <= 1024);
         decoder
             .decode_member_with_dictionary(&packed, 0, next.len(), 8, true, DecodeMode::LiteralOnly)
             .unwrap();
-        assert_eq!(decoder.history, next[next.len() - 8..]);
-        assert!(decoder.history.capacity() <= 8);
+        assert_eq!(&*decoder.state.history, &next[next.len() - 8..][..]);
+        assert!(decoder.state.history.capacity() <= 8);
     }
 
     #[test]
@@ -9047,8 +9451,8 @@ mod tests {
             .decode_member_with_dictionary(&packed, 0, data.len(), 64, false, DecodeMode::Lz)
             .unwrap();
         assert_ne!(decoded, raw, "fixture must actually transform bytes");
-        assert_eq!(decoder.history, raw[raw.len() - 64..]);
-        assert!(decoder.history.capacity() <= 64);
+        assert_eq!(&*decoder.state.history, &raw[raw.len() - 64..][..]);
+        assert!(decoder.state.history.capacity() <= 64);
     }
 
     #[test]
@@ -9056,8 +9460,8 @@ mod tests {
         let data = b"\xe8\0\0\0\0abcdefghijklmnop".to_vec();
         let packed = encode_lz_member_with_filter(&data, crate::FilterKind::E8).unwrap();
         let mut decoder = Unpack50Decoder::new();
-        decoder.history = b"old raw history".to_vec();
-        let history = decoder.history.clone();
+        decoder.state.history = Buffer::from_vec(b"old raw history".to_vec());
+        let history = decoder.state.history.to_vec();
         // The record spans the full member, but the advertised output stops
         // one byte earlier: the failure happens during filter application.
         assert_eq!(
@@ -9071,7 +9475,7 @@ mod tests {
             ),
             Err(Error::InvalidData("RAR 5 filter range exceeds output"))
         );
-        assert_eq!(decoder.history, history);
+        assert_eq!(decoder.state.history, history);
     }
 
     #[test]
@@ -9090,7 +9494,7 @@ mod tests {
                 .unwrap(),
             b"ABBA"
         );
-        assert_eq!(decoder.history, b"ABBA");
+        assert_eq!(&*decoder.state.history, &b"ABBA"[..]);
 
         assert_eq!(
             decoder
@@ -9098,7 +9502,7 @@ mod tests {
                 .unwrap(),
             b"BAAB"
         );
-        assert_eq!(decoder.history, b"BABAAB");
+        assert_eq!(&*decoder.state.history, &b"BABAAB"[..]);
     }
 
     #[test]
@@ -9126,8 +9530,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(decoded, data);
-        assert_eq!(decoder.history, data[data.len() - 1024..]);
-        assert!(decoder.history.capacity() <= 1024);
+        assert_eq!(&*decoder.state.history, &data[data.len() - 1024..][..]);
+        assert!(decoder.state.history.capacity() <= 1024);
         let next = b"next solid member";
         let packed = encode_literal_only(next, 0).unwrap();
         decoder
@@ -9140,8 +9544,8 @@ mod tests {
                 |_| Ok::<(), std::convert::Infallible>(()),
             )
             .unwrap();
-        assert_eq!(decoder.history, next[next.len() - 8..]);
-        assert!(decoder.history.capacity() <= 8);
+        assert_eq!(&*decoder.state.history, &next[next.len() - 8..][..]);
+        assert!(decoder.state.history.capacity() <= 8);
     }
 
     #[test]
@@ -9174,7 +9578,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(decoded, b"ABBA");
-        assert_eq!(decoder.history, b"ABBA");
+        assert_eq!(&*decoder.state.history, &b"ABBA"[..]);
 
         decoded.clear();
         decoder
@@ -9196,7 +9600,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(decoded, b"BAAB");
-        assert_eq!(decoder.history, b"BABAAB");
+        assert_eq!(&*decoder.state.history, &b"BABAAB"[..]);
     }
 
     #[test]
@@ -9204,7 +9608,7 @@ mod tests {
         let payload = literal_only_payload(b"AB");
         let input = encode_compressed_block(&payload, payload.len() * 8, true, true).unwrap();
         let mut decoder = Unpack50Decoder::new();
-        decoder.history.extend_from_slice(b"123456");
+        decoder.state.history.extend_from_slice(b"123456").unwrap();
         let mut decoded = Vec::new();
 
         decoder
@@ -9227,7 +9631,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(decoded, b"AB");
-        assert_eq!(decoder.history, b"56AB");
+        assert_eq!(&*decoder.state.history, &b"56AB"[..]);
     }
 
     #[test]
@@ -9558,11 +9962,11 @@ mod tests {
 
         let default = Unpack50Decoder::default();
         let fresh = Unpack50Decoder::new();
-        assert!(default.tables.is_none());
-        assert!(fresh.tables.is_none());
-        assert_eq!(default.reps, fresh.reps);
-        assert_eq!(default.last_length, fresh.last_length);
-        assert_eq!(default.history, fresh.history);
+        assert!(default.state.tables.is_none());
+        assert!(fresh.state.tables.is_none());
+        assert_eq!(default.state.reps, fresh.state.reps);
+        assert_eq!(default.state.last_length, fresh.state.last_length);
+        assert_eq!(default.state.history, fresh.state.history);
     }
 
     #[test]
@@ -9693,7 +10097,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, StreamDecodeError::Sink("sink failed")));
         assert_eq!(calls, 1);
-        assert!(decoder.tables.is_none()); // The flush failed inside the literal loop.
+        assert!(decoder.state.tables.is_none()); // The flush failed inside the literal loop.
     }
 
     #[test]
@@ -9722,18 +10126,25 @@ mod tests {
             Err(StreamDecodeError::Decode(Error::Cancelled))
         ));
         assert_eq!(calls, 1);
-        assert!(decoder.tables.is_none()); // The next symbol observed cancellation.
+        assert!(decoder.state.tables.is_none()); // The next symbol observed cancellation.
     }
 
     #[test]
     fn streaming_match_output_propagates_sink_failures() {
-        let mut repeated = StreamingOutput::new(Vec::new(), STREAM_FLUSH_THRESHOLD, 2, 2);
+        let mut repeated = StreamingOutput::new(
+            Buffer::new(&Allowance::default()),
+            STREAM_FLUSH_THRESHOLD,
+            2,
+            2,
+        )
+        .unwrap();
         assert!(matches!(
             repeated.push_repeated(b'A', STREAM_FLUSH_THRESHOLD, &mut |_chunk| Err("sink")),
             Err(StreamDecodeError::Sink("sink"))
         ));
 
-        let mut zero_flush = StreamingOutput::new(Vec::new(), 2, 2, 2);
+        let mut zero_flush =
+            StreamingOutput::new(Buffer::new(&Allowance::default()), 2, 2, 2).unwrap();
         zero_flush
             .push(b'A', &mut |_chunk| Ok::<(), &str>(()))
             .unwrap();
@@ -9742,13 +10153,20 @@ mod tests {
             Err(StreamDecodeError::Sink("sink"))
         ));
 
-        let mut zero_chunk = StreamingOutput::new(Vec::new(), 1, 2, 2);
+        let mut zero_chunk =
+            StreamingOutput::new(Buffer::new(&Allowance::default()), 1, 2, 2).unwrap();
         assert!(matches!(
             zero_chunk.push_zeroes(1, &mut |_chunk| Err("sink")),
             Err(StreamDecodeError::Sink("sink"))
         ));
 
-        let mut copied = StreamingOutput::new(Vec::new(), STREAM_FLUSH_THRESHOLD, 2, 2);
+        let mut copied = StreamingOutput::new(
+            Buffer::new(&Allowance::default()),
+            STREAM_FLUSH_THRESHOLD,
+            2,
+            2,
+        )
+        .unwrap();
         copied
             .push_repeated(b'A', STREAM_FLUSH_THRESHOLD - 1, &mut |_chunk| {
                 Ok::<(), &str>(())
@@ -9851,8 +10269,8 @@ mod tests {
                 Err(Error::Cancelled),
                 "after {successful_checks} checks"
             );
-            assert!(decoder.tables.is_some()); // All packed symbols decoded first.
-            assert!(decoder.history.is_empty()); // Filtered output was not committed.
+            assert!(decoder.state.tables.is_some()); // All packed symbols decoded first.
+            assert!(decoder.state.history.is_empty()); // Filtered output was not committed.
         }
     }
 
@@ -9950,7 +10368,8 @@ mod tests {
             Ok::<(), std::convert::Infallible>(())
         };
 
-        let mut literal = StreamingOutput::new(Vec::new(), 1, 1, 1);
+        let mut literal =
+            StreamingOutput::new(Buffer::new(&Allowance::default()), 1, 1, 1).unwrap();
         literal.push(b'A', &mut sink).unwrap();
         assert!(matches!(
             literal.push(b'B', &mut sink),
@@ -9962,7 +10381,8 @@ mod tests {
         assert_eq!(&*emitted.borrow(), b"A");
 
         emitted.borrow_mut().clear();
-        let mut repeated = StreamingOutput::new(Vec::new(), 1, 1, 1);
+        let mut repeated =
+            StreamingOutput::new(Buffer::new(&Allowance::default()), 1, 1, 1).unwrap();
         assert!(matches!(
             repeated.push_repeated(b'B', 2, &mut sink),
             Err(StreamDecodeError::Decode(Error::InvalidData(
@@ -9972,7 +10392,7 @@ mod tests {
         assert_eq!(repeated.written(), 0);
         assert!(emitted.borrow().is_empty());
 
-        let mut zeroes = StreamingOutput::new(Vec::new(), 1, 1, 1);
+        let mut zeroes = StreamingOutput::new(Buffer::new(&Allowance::default()), 1, 1, 1).unwrap();
         assert!(matches!(
             zeroes.push_zeroes(2, &mut sink),
             Err(StreamDecodeError::Decode(Error::InvalidData(
@@ -9983,12 +10403,13 @@ mod tests {
         assert!(emitted.borrow().is_empty());
         zeroes.push_zeroes(1, &mut sink).unwrap();
         assert_eq!(&*emitted.borrow(), &[0]);
-        assert_eq!(zeroes.into_history(), [0]);
+        assert_eq!(zeroes.into_history().into_vec(), [0]);
     }
 
     #[test]
     fn virtual_zero_history_does_not_overallocate_a_tiny_dictionary() {
-        let mut output = StreamingOutput::new(Vec::new(), 100_000, 1, 1);
+        let mut output =
+            StreamingOutput::new(Buffer::new(&Allowance::default()), 100_000, 1, 1).unwrap();
         let mut emitted = 0;
         output
             .copy_match(0, 100_000, &mut |chunk| {
@@ -10000,13 +10421,13 @@ mod tests {
             })
             .unwrap();
         assert_eq!(emitted, 100_000);
-        assert_eq!(output.history, [0]);
+        assert_eq!(output.history.iter().copied().collect::<Vec<_>>(), [0]);
         assert_eq!(output.history.capacity(), 1);
     }
 
     #[test]
     fn streaming_zero_history_emits_large_match_without_materializing_it() {
-        let mut output = StreamingOutput::new(vec![0, 0], 100_000, 2, 2);
+        let mut output = StreamingOutput::new(Buffer::from_vec(vec![0, 0]), 100_000, 2, 2).unwrap();
         let mut chunks = Vec::new();
         output
             .copy_match(2, 100_000, &mut |chunk| {
@@ -10019,13 +10440,14 @@ mod tests {
             .unwrap();
         assert_eq!(chunks, [(0, 100_000)]);
         assert_eq!(output.written(), 100_000);
-        assert_eq!(output.into_history(), [0, 0]);
+        assert_eq!(output.into_history().into_vec(), [0, 0]);
     }
 
     #[test]
     fn streaming_match_keeps_its_window_across_flushes() {
         let count = STREAM_FLUSH_THRESHOLD + 11;
-        let mut output = StreamingOutput::new(b"abc".to_vec(), count, 3, 3);
+        let mut output =
+            StreamingOutput::new(Buffer::from_vec(b"abc".to_vec()), count, 3, 3).unwrap();
         let mut decoded = Vec::new();
         let mut sink = |chunk: DecodedChunk<'_>| {
             match chunk {
@@ -10048,7 +10470,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(output.history.capacity() <= 3);
-        assert_eq!(output.into_history(), b"abc");
+        assert_eq!(output.into_history().into_vec(), b"abc");
     }
 
     #[test]
@@ -10056,7 +10478,8 @@ mod tests {
         const OLD_STREAM_HISTORY_LIMIT: usize = 64 * 1024 * 1024;
         let distance = OLD_STREAM_HISTORY_LIMIT + 1;
         let history = vec![b'A'; distance];
-        let mut output = StreamingOutput::new(history, 1, distance, distance);
+        let mut output =
+            StreamingOutput::new(Buffer::from_vec(history), 1, distance, distance).unwrap();
         let mut decoded = Vec::new();
 
         output
@@ -10087,7 +10510,7 @@ mod tests {
 
     #[test]
     fn streaming_window_zero_fills_match_beyond_declared_dictionary() {
-        let mut output = StreamingOutput::new(vec![b'A'; 8], 1, 7, 8);
+        let mut output = StreamingOutput::new(Buffer::from_vec(vec![b'A'; 8]), 1, 7, 8).unwrap();
         let mut decoded = Vec::new();
 
         output
