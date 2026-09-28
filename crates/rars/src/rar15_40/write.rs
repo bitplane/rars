@@ -1834,15 +1834,14 @@ fn encode_filtered_payload(
     progress: Option<&WorkTracker<'_>>,
 ) -> Result<EncodedPayload> {
     let lz_method = compression_method_for_level(options);
-    let codes_through_the_chain = lz_method != 0x30
-        && matches!(solid_encoder, Some(SolidEncoder::Rar29(_)))
-        // A named filter under forced PPMd is the one request the chain cannot
-        // take: its PPMd side codes no filters, and coding the member LZ
-        // instead would quietly overrule a flag the caller set. It codes on its
-        // own inside the solid archive, as it always has.
-        && !(options.method == Rar29Method::Ppmd && matches!(policy, FilterPolicy::Explicit(_)));
-    if !codes_through_the_chain {
-        return encode_rar29_policy_filtered_payload(
+    // A named filter under forced PPMd is the one request the chain cannot
+    // take: its PPMd side codes no filters, and coding the member LZ instead
+    // would quietly overrule a flag the caller set.
+    let forced_ppmd_filter =
+        options.method == Rar29Method::Ppmd && matches!(policy, FilterPolicy::Explicit(_));
+    let encoder = match (lz_method != 0x30 && !forced_ppmd_filter, solid_encoder.as_mut()) {
+        (true, Some(SolidEncoder::Rar29(encoder))) => encoder,
+        _ => return encode_rar29_policy_filtered_payload(
             data,
             policy,
             options.method,
@@ -1850,12 +1849,9 @@ fn encode_filtered_payload(
             lz_method,
             ppmd_trial_pays(lz_method.saturating_sub(0x30)),
             progress,
-        );
-    }
-
-    let Some(SolidEncoder::Rar29(encoder)) = solid_encoder.as_mut() else {
-        unreachable!("the chain was just checked for a RAR 2.9 encoder");
+        ),
     };
+
     // An empty member has no range to filter, and `--no-filter` asked for none,
     // but both still go through the chain's encoder like any other member.
     // Coding either one on its own would leave the encoder's history in place
