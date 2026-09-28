@@ -178,7 +178,8 @@ pub fn split_prefix_shard_ranges(
     for shard_index in 0..data_shards {
         let start = shard_index
             .checked_mul(group_count)
-            .ok_or(Error::PlanOverflow)?;
+            .ok_or(Error::PlanOverflow)?
+            .min(prefix_len);
         let end = start.saturating_add(group_count).min(prefix_len);
         ranges.push(start..end);
     }
@@ -2568,6 +2569,26 @@ mod tests {
         assert_eq!(
             split_prefix_shards(b"abcde", plan),
             Err(Error::PrefixExceedsPlan)
+        );
+    }
+
+    #[test]
+    fn rar5_prefix_split_handles_extra_empty_data_shards() {
+        let plan = InlineRecoveryPlan {
+            data_shards: 3,
+            recovery_shards: 1,
+            group_count: 4,
+            header_size: 96,
+            shard_size: 100,
+        };
+
+        assert_eq!(
+            split_prefix_shard_ranges(3, plan).unwrap(),
+            vec![0..3, 3..3, 3..3]
+        );
+        assert_eq!(
+            split_prefix_shards(b"abc", plan).unwrap(),
+            vec![b"abc\0".to_vec(), vec![0; 4], vec![0; 4]]
         );
     }
 
