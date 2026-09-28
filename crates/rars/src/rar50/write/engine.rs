@@ -2784,4 +2784,52 @@ mod emission_ledger_tests {
             assert_eq!(resources.preparation_in_use(), 0, "admission {index}");
         }
     }
+
+    #[test]
+    fn encrypted_outputs_release_late_preparation_refusals() {
+        use std::sync::atomic::Ordering;
+
+        let entries = [ArchiveEntry::new(
+            b"payload".to_vec(),
+            crate::EntrySource::from_bytes(b"contents".to_vec()),
+        )
+        .with_password(b"secret")];
+        for volumes in [false, true] {
+            let run = |resources: &WriterResources| -> Result<()> {
+                let mut settings = plan(true);
+                settings.compress.method = 0;
+                settings.recovery_percent = None;
+                settings.archive_comment = None;
+                if volumes {
+                    write_volumes(
+                        &entries,
+                        settings,
+                        4096,
+                        &mut super::super::CollectedVolumes::new(),
+                        resources,
+                    )
+                } else {
+                    write_archive(&entries, settings, resources, &mut Vec::new())
+                }
+            };
+            let (resources, attempts) = WriterResources::default()
+                .refuse_preparation_growth_at(usize::MAX);
+            run(&resources).unwrap();
+            let count = attempts.load(Ordering::Relaxed);
+            assert!(count > 3);
+            assert!(count < 200);
+            assert_eq!(resources.preparation_in_use(), 0);
+
+            for index in count - 3..count {
+                let (resources, _) = WriterResources::default().refuse_preparation_growth_at(index);
+                let error = run(&resources).unwrap_err();
+                assert_eq!(
+                    error.root_cause(),
+                    &Error::WriterFailure("injected preparation admission failure"),
+                    "volume mode {volumes}, admission {index}"
+                );
+                assert_eq!(resources.preparation_in_use(), 0, "admission {index}");
+            }
+        }
+    }
 }
