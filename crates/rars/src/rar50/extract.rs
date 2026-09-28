@@ -2258,7 +2258,7 @@ mod tests {
         let scratch = crate::scratch::case("rar5-split-checksum-source");
         let missing = scratch.join("removed.part");
         std::fs::write(&missing, data).unwrap();
-        for first_kind in 0..3 {
+        for first_kind in 0..5 {
             let mut first = stored_split_archive(data, data, crc32(data), HFL_SPLIT_AFTER);
             match first_kind {
                 0 => {
@@ -2268,7 +2268,18 @@ mod tests {
                     file.data_crc32 = None;
                 }
                 1 => {}
-                _ => first.source = ArchiveSource::File(Arc::new(missing.clone())),
+                2 => first.source = ArchiveSource::File(Arc::new(missing.clone())),
+                3 | 4 => {
+                    let Block::File(file) = &mut first.blocks[0] else {
+                        unreachable!();
+                    };
+                    file.block.data_range = if first_kind == 3 {
+                        data.len()..0
+                    } else {
+                        0..data.len() + 1
+                    };
+                }
+                _ => unreachable!(),
             }
             let mut volumes = vec![
                 first,

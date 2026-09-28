@@ -1993,6 +1993,33 @@ fn rejects_rar50_inline_recovery_when_all_recovery_chunks_are_damaged() {
 }
 
 #[test]
+fn rar50_recovery_rejects_a_public_service_offset_past_the_archive() {
+    let bytes = write_stored_archive_with_recovery(
+        &[entry(b"recoverable.txt", b"payload protected by recovery")],
+        rar50::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only()),
+        20,
+    )
+    .unwrap();
+    let mut archive = Archive::parse(&bytes).unwrap();
+    let service = archive
+        .blocks
+        .iter_mut()
+        .find_map(|block| match block {
+            rar50::Block::Service(service) => Some(service),
+            _ => None,
+        })
+        .unwrap();
+    service.block.offset = bytes.len() + 1;
+
+    assert!(matches!(
+        archive.repair_recovery(),
+        Err(Error::InvalidHeader(
+            "RAR 5 recovery prefix is out of bounds"
+        ))
+    ));
+}
+
+#[test]
 fn rejects_rar50_inline_recovery_when_damage_exceeds_available_shards() {
     let bytes = write_stored_archive_with_recovery(
         &[entry(b"recoverable.txt", &vec![b'A'; 32 * 1024])],
