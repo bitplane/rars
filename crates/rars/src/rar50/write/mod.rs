@@ -1049,6 +1049,62 @@ mod tests {
     use super::VolumeSink;
 
     #[test]
+    fn source_integrity_cancellation_and_short_read_fail_before_hashing() {
+        struct Cancelled;
+        impl super::compress::CompressionProgress for Cancelled {
+            fn advance(&self, _: u64) -> bool {
+                false
+            }
+            fn is_cancelled(&self) -> bool {
+                true
+            }
+        }
+        let unopened = crate::EntrySource::from_opener(1, || {
+            panic!("cancelled scan opened the source")
+        });
+        let allowance = crate::codec::workspace::Allowance::default();
+        assert!(matches!(
+            super::source_integrity_with_allowance(&unopened, 1, 16, &Cancelled, &allowance),
+            Err(crate::Error::Cancelled)
+        ));
+
+        let short = crate::EntrySource::from_opener(2, || {
+            Ok(Box::new(std::io::Cursor::new(b"x".to_vec())))
+        });
+        let progress = |_: u64| true;
+        assert_eq!(
+            super::source_integrity_with_allowance(&short, 2, 16, &progress, &allowance)
+                .unwrap_err()
+                .kind(),
+            crate::ErrorKind::SourceChanged
+        );
+    }
+
+    #[test]
+    fn volume_compression_plan_refusal_does_not_open_sources_or_start_a_volume() {
+        let entries = [super::ArchiveEntry::new(
+            b"file".to_vec(),
+            crate::EntrySource::from_opener(1, || panic!("plan refusal opened source")),
+        )];
+        let resources = crate::WriterResources::default().with_max_preparation_bytes(0);
+        let mut volumes = super::CollectedVolumes::new();
+        let error = super::write_streaming_volumes_to(
+            &entries,
+            super::WriterOptions::new(
+                crate::ArchiveVersion::Rar50,
+                crate::FeatureSet::store_only(),
+            ),
+            super::ArchiveExtras::default(),
+            64,
+            &mut volumes,
+            &resources,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::ResourceLimit);
+        assert!(volumes.take().is_empty());
+    }
+
+    #[test]
     fn collected_volumes_enforce_order_and_report_length_mismatch() {
         let mut volumes = super::CollectedVolumes::new();
         assert!(matches!(
