@@ -66,6 +66,56 @@ fn staging_finished_events_require_verified_payloads() {
     assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
 }
 
+#[test]
+fn staging_progress_cancellation_prevents_source_creation() {
+    use rars::{WriteProgress, WriteProgressEvent};
+    use std::sync::atomic::AtomicBool;
+
+    struct CancelAtStart {
+        cancelled: AtomicBool,
+        cancel_on_report: bool,
+    }
+    impl WriteProgress for CancelAtStart {
+        fn report(&self, _: WriteProgressEvent<'_>) {
+            if self.cancel_on_report {
+                self.cancelled.store(true, Ordering::SeqCst);
+            }
+        }
+        fn is_cancelled(&self) -> bool {
+            self.cancelled.load(Ordering::SeqCst)
+        }
+    }
+
+    let root = scratch::case("rewrite-progress-cancel");
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    builder
+        .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+        .unwrap();
+    let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    let staging = RewriteStaging {
+        directory: root.to_path_buf(),
+        max_staged_bytes: 7,
+    };
+    for cancel_on_report in [false, true] {
+        let progress: Arc<dyn WriteProgress> = Arc::new(CancelAtStart {
+            cancelled: AtomicBool::new(!cancel_on_report),
+            cancel_on_report,
+        });
+        assert_eq!(
+            archive
+                .stage_rewrite_sources_with_progress(
+                    &[0],
+                    ArchiveReadOptions::default(),
+                    &staging,
+                    Some(progress),
+                )
+                .unwrap_err(),
+            Error::Cancelled
+        );
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    }
+}
+
 struct Counted {
     data: Cursor<Vec<u8>>,
     count: Arc<AtomicU64>,
