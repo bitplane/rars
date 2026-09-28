@@ -1709,6 +1709,89 @@ mod tests {
         }
     }
 
+    #[test]
+    fn x86_screen_releases_storage_on_each_admission_failure() {
+        use crate::codec::workspace::RefusingBudget;
+        use std::cell::Cell;
+
+        struct ScreenSearch {
+            budget: RefusingBudget,
+            encodes: Cell<usize>,
+        }
+        impl OwnedSearch for ScreenSearch {
+            type Options = ();
+            type Memory = RefusingBudget;
+
+            fn allowance(&self) -> &Self::Memory {
+                &self.budget
+            }
+            fn screened_kinds(&self, _: &[u8]) -> Result<Buffer<FilterKind, Self::Memory>> {
+                Ok(Buffer::new(&self.budget))
+            }
+            fn detects_x86(&self) -> bool {
+                true
+            }
+            fn max_delta_channels(&self) -> usize {
+                0
+            }
+            fn screen_options(&self, options: ()) {
+                options
+            }
+            fn filtered_bytes(
+                &self,
+                data: &[u8],
+                _: &[FilterSpec],
+            ) -> Result<Buffer<u8, Self::Memory>> {
+                Ok(Buffer::collect(data.iter().copied(), &self.budget)?)
+            }
+            fn encode_plain(
+                &self,
+                _: &[u8],
+                _: (),
+                _: Option<&mut dyn FnMut(usize) -> bool>,
+            ) -> Result<Buffer<u8, Self::Memory>> {
+                let pass = self.encodes.get();
+                self.encodes.set(pass + 1);
+                let size = [10, 5, 6][pass];
+                Ok(Buffer::collect(std::iter::repeat_n(0, size), &self.budget)?)
+            }
+            fn encode_filtered(
+                &self,
+                _: &[u8],
+                _: &[FilterSpec],
+                _: (),
+                _: Option<&mut dyn FnMut(usize) -> bool>,
+            ) -> Result<Buffer<u8, Self::Memory>> {
+                unreachable!("the x86 screen encodes filtered bytes as plain data")
+            }
+        }
+
+        let run = |budget: &RefusingBudget| -> Result<()> {
+            let search = ScreenSearch {
+                budget: budget.clone(),
+                encodes: Cell::new(0),
+            };
+            let region = 0..64;
+            let result = super::x86_screened_regions(
+                &search,
+                &[0; 64],
+                std::slice::from_ref(&region),
+                (),
+            )?;
+            assert_eq!(result.kept.len(), 1);
+            assert!(!result.jumps_cost_more);
+            Ok(())
+        };
+        let baseline = RefusingBudget::new(usize::MAX);
+        run(&baseline).unwrap();
+        assert_eq!(baseline.used(), 0);
+        for index in 0..baseline.attempts() {
+            let budget = RefusingBudget::new(index);
+            assert_eq!(run(&budget), Err(crate::Error::Cancelled), "admission {index}");
+            assert_eq!(budget.used(), 0, "admission {index}");
+        }
+    }
+
     /// The E8-only filter costs a whole-member encode to ask whether leaving
     /// the jump opcodes alone packs better. Over twenty-four members it won
     /// seven times and never by more than 0.21%, so it only earns that encode
