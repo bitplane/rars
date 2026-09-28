@@ -482,6 +482,14 @@ pub(crate) fn streamed_recovery_with_allowance<B: Budget>(
     {
         return Err(Error::PlanOverflow);
     }
+    if plan.shard_size
+        != plan
+            .header_size
+            .checked_add(plan.group_count)
+            .ok_or(Error::PlanOverflow)?
+    {
+        return Err(Error::PlanOverflow);
+    }
 
     // Fail on unrepresentable geometry before doing any work.
     let total_size = u32::try_from(plan.shard_size).map_err(|_| Error::PlanOverflow)?;
@@ -571,11 +579,9 @@ pub(crate) fn streamed_recovery_with_allowance<B: Budget>(
     // known before the first chunk can be framed.
     let mut buffer = Buffer::filled(RECOVERY_IO_BLOCK.min(group_count.max(1)), 0u8, allowance)?;
     let mut final_state = 0u64;
-    if recovery_shards > 0 {
-        rows.for_each_chunk(0, &mut buffer, |chunk| {
-            final_state = crc64_update(chunk, final_state);
-        })?;
-    }
+    rows.for_each_chunk(0, &mut buffer, |chunk| {
+        final_state = crc64_update(chunk, final_state);
+    })?;
 
     let chunk_data_extent = body_len
         .saturating_sub(
@@ -615,10 +621,6 @@ pub(crate) fn streamed_recovery_with_allowance<B: Budget>(
             writer.write_all(&state.to_le_bytes())?;
         }
         writer.write_all(&final_state.to_le_bytes())?;
-        if writer.position() != header_size as u64 {
-            return Err(Error::PlanOverflow);
-        }
-
         // The chunk CRC covers everything from 0x0c onwards, so compute it
         // over the header and the parity row before either is emitted.
         let mut chunk_crc = crc64_update(&header[0x0c..], CRC64_XZ_INIT);
@@ -631,7 +633,6 @@ pub(crate) fn streamed_recovery_with_allowance<B: Budget>(
         payload_crc32.update(&header);
         written += header.len() as u64;
 
-        let mut row_written = 0u64;
         let mut sink_error = None;
         rows.for_each_chunk(shard_index, &mut buffer, |chunk| {
             if sink_error.is_some() {
@@ -642,22 +643,16 @@ pub(crate) fn streamed_recovery_with_allowance<B: Budget>(
                 return;
             }
             payload_crc32.update(chunk);
-            row_written += chunk.len() as u64;
         })?;
         if let Some(error) = sink_error {
             return Err(error.into());
         }
-        if row_written != plan.group_count {
-            return Err(Error::PlanOverflow);
-        }
-        written += row_written;
+        written += plan.group_count;
 
         report(encode_units + (shard_index as u64 + 1) * plan.header_size)?;
     }
 
-    if written != payload_len {
-        return Err(Error::PlanOverflow);
-    }
+    debug_assert_eq!(written, payload_len);
     if let Some(progress) = progress {
         progress.report(WriteProgressEvent::OperationFinished {
             operation: WriteOperation::Recovery,
@@ -772,9 +767,6 @@ impl<B: Budget> ParityRows<'_, B> {
                 scratch,
                 group_count,
             } => {
-                if buffer.is_empty() {
-                    return Ok(());
-                }
                 let start = (index as u64)
                     .checked_mul(*group_count)
                     .ok_or(Error::PlanOverflow)?;
@@ -2393,6 +2385,67 @@ mod tests {
         assert_eq!(error, Error::Io(std::io::ErrorKind::BrokenPipe));
         assert!(output.is_empty());
         assert_eq!(allowance.used(), 0);
+    }
+
+    #[test]
+    fn streamed_recovery_rejects_invalid_plan_before_output() {
+        use super::{streamed_recovery_with_allowance, Allowance, RecoveryMemoryMode};
+        use std::io::Cursor;
+
+        let body = vec![0x5a; 4096];
+        let valid = plan_inline_recovery(body.len() as u64, 10).unwrap();
+        let allowance = Allowance::limited(2 * 1048576);
+        for (name, plan, expected) in [
+            (
+                "header length",
+                InlineRecoveryPlan {
+                    header_size: valid.header_size + 1,
+                    ..valid
+                },
+                Error::PlanOverflow,
+            ),
+            (
+                "shard length",
+                InlineRecoveryPlan {
+                    shard_size: valid.shard_size + 1,
+                    ..valid
+                },
+                Error::PlanOverflow,
+            ),
+            (
+                "prefix capacity",
+                InlineRecoveryPlan {
+                    group_count: 2,
+                    shard_size: valid.header_size + 2,
+                    ..valid
+                },
+                Error::PrefixExceedsPlan,
+            ),
+            (
+                "zero recovery shards",
+                InlineRecoveryPlan {
+                    recovery_shards: 0,
+                    ..valid
+                },
+                Error::TooManyShards,
+            ),
+        ] {
+            let mut output = Vec::new();
+            let result = streamed_recovery_with_allowance(
+                &mut Cursor::new(&body),
+                body.len() as u64,
+                plan,
+                RecoveryMemoryMode::Resident,
+                None,
+                &mut output,
+                None,
+                0,
+                &allowance,
+            );
+            assert_eq!(result.unwrap_err(), expected, "{name}");
+            assert!(output.is_empty(), "{name}");
+            assert_eq!(allowance.used(), 0, "{name}");
+        }
     }
 
     #[test]
