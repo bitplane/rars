@@ -86,10 +86,26 @@ enum Payload<'a> {
     Packed(Spool),
     /// Encrypted on the way out, so the ciphertext is never stored anywhere.
     Encrypted {
-        plain: Owned<Payload<'a>>,
+        plain: Owned<PlainPayload<'a>>,
         keys: Rar50Keys,
         iv: [u8; 16],
     },
+}
+
+enum PlainPayload<'a> {
+    Borrowed(&'a [u8]),
+    Stored(PreparedSource),
+    Packed(Spool),
+}
+
+impl<'a> From<PlainPayload<'a>> for Payload<'a> {
+    fn from(plain: PlainPayload<'a>) -> Self {
+        match plain {
+            PlainPayload::Borrowed(data) => Self::Borrowed(data),
+            PlainPayload::Stored(source) => Self::Stored(source),
+            PlainPayload::Packed(packed) => Self::Packed(packed),
+        }
+    }
 }
 
 // A reopenable source is not a snapshot. Keep the size and integrity used by
@@ -641,7 +657,7 @@ fn encrypted_service_block<'a>(
     Ok(PreparedBlock {
         header,
         payload: Payload::Encrypted {
-            plain: Owned::new(Payload::Borrowed(data), resources)?,
+            plain: Owned::new(PlainPayload::Borrowed(data), resources)?,
             keys,
             iv,
         },
@@ -682,9 +698,9 @@ fn prepare_member(
         member.packed.len()
     };
     let plain = if member.store {
-        Payload::Stored(PreparedSource::new(&entry.source, &member))
+        PlainPayload::Stored(PreparedSource::new(&entry.source, &member))
     } else {
-        Payload::Packed(member.packed)
+        PlainPayload::Packed(member.packed)
     };
 
     let mut extra = Bytes::new(resources);
@@ -721,7 +737,7 @@ fn prepare_member(
                 hash,
             )
         }
-        None => (plain, plain_len, member.crc32, member.hash),
+        None => (plain.into(), plain_len, member.crc32, member.hash),
     };
     // A link has no file payload to hash; its target is protected by the header CRC.
     if entry.redirection.is_none() {
@@ -804,14 +820,16 @@ fn write_payload(
         Payload::Encrypted { plain, keys, iv } => {
             const ENCRYPT_CHUNK: usize = 64 * 1024;
             let chunk_size = match &*plain {
-                Payload::Borrowed(data) => data.len().clamp(1, ENCRYPT_CHUNK).div_ceil(16) * 16,
+                PlainPayload::Borrowed(data) => {
+                    data.len().clamp(1, ENCRYPT_CHUNK).div_ceil(16) * 16
+                }
                 _ => ENCRYPT_CHUNK,
             };
             let _permit = resources.acquire_cancellable(chunk_size as u64, 0, &|| {
                 progress.is_some_and(ProgressReporter::is_cancelled)
             })?;
             match plain.into_inner() {
-                Payload::Stored(source) => {
+                PlainPayload::Stored(source) => {
                     let mut reader = source.open()?;
                     encrypt_reader_to(
                         &mut reader,
@@ -827,7 +845,7 @@ fn write_payload(
                     source.source.release();
                     Ok(())
                 }
-                Payload::Packed(mut packed) => {
+                PlainPayload::Packed(mut packed) => {
                     let len = packed.len();
                     packed.rewind()?;
                     encrypt_reader_to(
@@ -841,15 +859,12 @@ fn write_payload(
                         resources,
                     )
                 }
-                Payload::Borrowed(mut data) => {
+                PlainPayload::Borrowed(mut data) => {
                     let len = data.len() as u64;
                     encrypt_reader_to(
                         &mut data, len, output, &keys, iv, chunk_size, progress, resources,
                     )
                 }
-                Payload::Encrypted { .. } => Err(Error::WriterFailure(
-                    "RAR 5 payload cannot be encrypted here",
-                )),
             }
         }
     }
@@ -1855,7 +1870,7 @@ mod service_payload_tests {
             let Payload::Encrypted { plain, keys, iv } = &encrypted.payload else {
                 panic!("expected streaming encryption")
             };
-            let Payload::Borrowed(borrowed) = plain.as_ref() else {
+            let PlainPayload::Borrowed(borrowed) = plain.as_ref() else {
                 panic!("expected borrowed plaintext")
             };
             assert_eq!(borrowed.as_ptr(), data.as_ptr());
@@ -1993,7 +2008,7 @@ mod emission_ledger_tests {
                     .encrypt_in_place(&mut expected)
                     .unwrap();
                 let payload = Payload::Encrypted {
-                    plain: Owned::new(Payload::Borrowed(&data), &resources).unwrap(),
+                    plain: Owned::new(PlainPayload::Borrowed(&data), &resources).unwrap(),
                     keys,
                     iv: [2; 16],
                 };
