@@ -205,6 +205,54 @@ pub(crate) fn check_source_length(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn source_end_probe_retries_interruptions_and_reports_other_io_errors() {
+        struct Probe {
+            calls: usize,
+            fail: bool,
+        }
+        impl std::io::Read for Probe {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    Err(std::io::ErrorKind::Interrupted.into())
+                } else if self.fail {
+                    Err(std::io::ErrorKind::PermissionDenied.into())
+                } else {
+                    Ok(0)
+                }
+            }
+        }
+        let mut end = Probe {
+            calls: 0,
+            fail: false,
+        };
+        super::check_source_length(&mut end, 7, 7, "changed").unwrap();
+        assert_eq!(end.calls, 2);
+        let mut failed = Probe {
+            calls: 0,
+            fail: true,
+        };
+        assert_eq!(
+            super::check_source_length(&mut failed, 7, 7, "changed")
+                .unwrap_err()
+                .kind(),
+            crate::ErrorKind::Io
+        );
+    }
+
+    #[test]
+    fn member_error_preserves_cancellation_and_existing_context() {
+        assert_eq!(
+            super::member_error(crate::Error::Cancelled, b"file", "writing"),
+            crate::Error::Cancelled
+        );
+        let existing = crate::Error::InvalidArgument("source failed")
+            .at_entry(b"file".to_vec(), "reading");
+        let error = super::member_error(existing, b"file", "writing");
+        assert_eq!(error.entry_context(), Some((b"file".as_slice(), "reading")));
+    }
+
+    #[test]
     fn entropy_failure_is_io_and_keeps_the_backend_diagnostic() {
         let error = super::entropy_error(getrandom::Error::UNSUPPORTED, "encryption salt");
         assert_eq!(error.kind(), crate::ErrorKind::Io);
@@ -301,5 +349,8 @@ mod tests {
         let bytes = MemberBytes::Borrowed(&data);
         assert!(matches!(bytes.load().unwrap(), Cow::Borrowed(_)));
         assert!(bytes.source().is_none());
+        let mut visited = Vec::new();
+        bytes.walk(|chunk| visited.extend_from_slice(chunk)).unwrap();
+        assert_eq!(visited, data);
     }
 }
