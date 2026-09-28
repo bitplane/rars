@@ -1231,6 +1231,59 @@ pub(super) fn compress_members_reporting(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn streaming_compression_releases_each_refused_preparation_allocation() {
+        use std::sync::atomic::Ordering;
+
+        let scratch = crate::scratch::case("streaming-preparation-refusals");
+        let sources = [EntrySource::from_bytes(vec![b'A'; 2048])];
+        let options = EncodeOptions::new(8);
+        for solid in [false, true] {
+            let plan = CompressPlan {
+                algorithm_version: 0,
+                encode_options: options,
+                dictionary_size: 65536,
+                block_size: 1024,
+                solid,
+                method: 1,
+                filter_policy: FilterPolicy::None,
+                candidates: vec![options].into(),
+            };
+            let run = |resources: &WriterResources| -> Result<()> {
+                let packed = compress_members_reporting(
+                    &sources,
+                    plan.clone(),
+                    resources,
+                    &|_| true,
+                )?;
+                assert_eq!(packed.len(), 1);
+                Ok(())
+            };
+            let (resources, attempts) = WriterResources::default()
+                .with_temp_dir(&*scratch)
+                .refuse_preparation_growth_at(usize::MAX);
+            run(&resources).unwrap();
+            let count = attempts.load(Ordering::Relaxed);
+            assert!(count > 5);
+            assert!(count < 100);
+            assert_eq!(resources.preparation_in_use(), 0);
+
+            for index in 0..count {
+                let (resources, _) = WriterResources::default()
+                    .with_temp_dir(&*scratch)
+                    .refuse_preparation_growth_at(index);
+                let error = run(&resources).unwrap_err();
+                assert_eq!(
+                    error.root_cause(),
+                    &Error::WriterFailure("injected preparation admission failure"),
+                    "solid mode {solid}, admission {index}"
+                );
+                assert_eq!(resources.preparation_in_use(), 0, "admission {index}");
+                assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
+            }
+        }
+    }
+
+    #[test]
     fn stored_member_descriptor_refusal_releases_preparation_charge() {
         let options = EncodeOptions::new(8);
         let plan = CompressPlan {
