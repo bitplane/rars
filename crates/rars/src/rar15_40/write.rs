@@ -3212,6 +3212,28 @@ mod tests {
         let offered = encode_rar29_auto_filtered_member(&data, options, 0x35, true).unwrap();
         let lz_only = encode_rar29_auto_filtered_member(&data, options, 0x35, false).unwrap();
         assert_eq!(offered.data, lz_only.data);
+
+        let plain_offered = super::encode_rar29_policy_filtered_payload(
+            &data,
+            &super::FilterPolicy::None,
+            super::Rar29Method::Auto,
+            options,
+            0x35,
+            true,
+            None,
+        )
+        .unwrap();
+        let plain_lz = super::encode_rar29_policy_filtered_payload(
+            &data,
+            &super::FilterPolicy::None,
+            super::Rar29Method::Auto,
+            options,
+            0x35,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(plain_offered.data, plain_lz.data);
     }
 
     #[test]
