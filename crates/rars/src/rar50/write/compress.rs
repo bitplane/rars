@@ -974,9 +974,8 @@ where
                 job.blocks
                     .push_growing((stream.member, job.data.len(), !stream.has_more()))?;
             }
-            if job.blocks.is_empty() {
-                break;
-            }
+            // The outer loop found a stream with data, so this job contains
+            // at least that stream's next block.
             history.remember(&job.data, plan.encode_options.max_match_distance)?;
             jobs.push(job)?;
         }
