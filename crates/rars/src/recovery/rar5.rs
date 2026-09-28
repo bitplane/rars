@@ -1074,7 +1074,11 @@ where
     }
     if chunks
         .iter()
-        .any(|chunk| chunk.plan != first.plan || chunk.protected_size != first.protected_size)
+        .any(|chunk| {
+            chunk.plan != first.plan
+                || chunk.protected_size != first.protected_size
+                || chunk.data_shard_states != first.data_shard_states
+        })
     {
         return Err(Error::BadRecoveryChunk);
     }
@@ -2900,6 +2904,39 @@ mod tests {
 
         for (name, chunk) in cases {
             assert_eq!(parse(&chunk), Error::BadRecoveryChunk, "{name}");
+        }
+    }
+
+    #[test]
+    fn rar5_repair_rejects_inconsistent_recovery_chunks() {
+        let prefix = recovery_test_bytes(32_000, 33);
+        let plan = plan_inline_recovery(prefix.len() as u64, 20).unwrap();
+        assert!(plan.recovery_shards > 2);
+        let valid = build_structural_inline_recovery_data(&prefix, 20).unwrap();
+        let start = plan.shard_size as usize;
+        let end = start + plan.shard_size as usize;
+        for (name, edit) in [
+            ("states", 0x40),
+            ("protected size", 0x22),
+            ("recovery shard count", 0x3c),
+        ] {
+            let mut recovery_data = valid.clone();
+            recovery_data[start + edit] ^= 1;
+            let crc = crc64_xz(&recovery_data[start + 0x0c..end]);
+            recovery_data[start + 0x04..start + 0x0c].copy_from_slice(&crc.to_le_bytes());
+
+            assert_eq!(
+                repair_inline_recovery_prefix(&prefix, &recovery_data),
+                Err(Error::BadRecoveryChunk),
+                "{name}"
+            );
+            assert_eq!(
+                repair_inline_recovery_prefix_shards(prefix.len(), &recovery_data, |range| {
+                    Ok(prefix[range].to_vec())
+                }),
+                Err(Error::BadRecoveryChunk),
+                "{name}"
+            );
         }
     }
 
