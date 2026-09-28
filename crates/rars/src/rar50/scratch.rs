@@ -364,5 +364,25 @@ mod tests {
                 Err(Error::InvalidHeader("scratch filter range exceeds output"))
             ));
         }
+
+        if usize::BITS < 64 {
+            let mut bytes = encode_filter(PendingFilter {
+                start: 0,
+                length: 1,
+                filter_type: FilterType::Delta,
+                channels: 1,
+            });
+            bytes[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+            assert!(matches!(
+                decode_filter(bytes, usize::MAX, u64::MAX),
+                Err(Error::InvalidHeader("scratch filter offset overflows"))
+            ));
+            bytes[..8].copy_from_slice(&0u64.to_le_bytes());
+            bytes[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+            assert!(matches!(
+                decode_filter(bytes, usize::MAX, u64::MAX),
+                Err(Error::InvalidHeader("scratch filter length overflows"))
+            ));
+        }
     }
 }
