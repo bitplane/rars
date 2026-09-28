@@ -183,6 +183,19 @@ mod tests {
     use crate::{Error, ErrorKind};
 
     #[test]
+    fn impossible_spool_growth_is_rejected_before_allocation() {
+        let resources = WriterResources::default().with_max_spool_memory_bytes(u64::MAX);
+        let mut spool = MemorySpool::new(&resources);
+        let Store::Bounded(bounded) = &mut spool.store else {
+            panic!("memory limit must select bounded storage");
+        };
+        let error = bounded.grow(usize::MAX).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(used(&resources), 0);
+        spool.flush().unwrap();
+    }
+
+    #[test]
     fn admitted_spool_retains_its_capacity_after_worker_retirement() {
         use crate::codec::workspace::{Allowance, Buffer, RESERVATION_BYTES};
         use crate::streaming::preparation::Bytes;
