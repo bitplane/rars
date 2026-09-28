@@ -1230,6 +1230,58 @@ pub(super) fn compress_members_reporting(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[test]
+    fn whole_member_cancellation_after_start_does_not_open_source() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct StopAfterStart(AtomicBool);
+        impl CompressionProgress for StopAfterStart {
+            fn advance(&self, _: u64) -> bool {
+                !self.is_cancelled()
+            }
+            fn is_cancelled(&self) -> bool {
+                self.0.load(Ordering::SeqCst)
+            }
+            fn started(&self, _: usize, _: u64) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let scratch = crate::scratch::case("whole-member-cancel-after-start");
+        let resources = WriterResources::default().with_temp_dir(&*scratch);
+        let options = EncodeOptions::new(8);
+        let plan = CompressPlan {
+            algorithm_version: 0,
+            encode_options: options,
+            dictionary_size: 128 * 1024,
+            block_size: 4096,
+            solid: false,
+            method: 1,
+            filter_policy: FilterPolicy::None,
+            candidates: vec![options].into(),
+        };
+        for size in [0, 16] {
+            let source = EntrySource::from_opener(size, || {
+                panic!("cancelled compression must not open the source")
+            });
+            let progress = StopAfterStart(AtomicBool::new(false));
+            assert!(matches!(
+                compress_whole_member(
+                    0,
+                    &source,
+                    (size, 0, [0; 32]),
+                    &plan,
+                    &resources,
+                    &progress,
+                    &Allowance::default(),
+                ),
+                Err(Error::Cancelled)
+            ));
+            assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
+        }
+    }
+
     struct Cancelled;
 
     impl CompressionProgress for Cancelled {
