@@ -1556,6 +1556,24 @@ mod tests {
             .all(|specs| specs.iter().all(|spec| spec.range.is_none())));
     }
 
+    #[test]
+    fn sparse_x86_code_prices_region_and_whole_member_finalists() {
+        let code = calls_to_fixed_addresses(32 * 1024);
+        let mut data = code.clone();
+        data.resize(512 * 1024, 0);
+        let regions = x86_code_regions(&data);
+        let screen = x86_screened_regions(&FULL, &data, &regions, options()).unwrap();
+        assert_eq!(screen.kept.len(), 1, "{regions:?}");
+        assert!(!screen.rejected_a_region);
+        let finalists = x86_finalists(&data, &screen);
+        assert!(finalists
+            .iter()
+            .any(|specs| specs.iter().all(|spec| spec.range.is_some())));
+        assert!(finalists
+            .iter()
+            .any(|specs| specs.iter().all(|spec| spec.range.is_none())));
+    }
+
     /// And the member as a whole has to come out smaller for it.
     #[test]
     fn the_search_filters_the_code_in_an_unstripped_binary() {
