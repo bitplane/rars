@@ -408,6 +408,32 @@ fn generated_rar29_e8_filtered_archive_round_trips() {
 }
 
 #[test]
+fn forced_rar29_lz_round_trips_with_each_filter_policy() {
+    let payload = b"\xe8\0\0\0\0forced LZ and filter policy\n".repeat(32);
+    let entries = [FileEntry {
+        name: b"forced-lz.bin",
+        data: &payload,
+        file_time: 0,
+        file_attr: 0x20,
+        host_os: 3,
+        password: None,
+        file_comment: None,
+    }];
+    let options = WriterOptions::new(ArchiveVersion::Rar29, FeatureSet::store_only())
+        .with_method(Rar29Method::Lz);
+    for policy in [
+        FilterPolicy::None,
+        FilterPolicy::Auto,
+        FilterPolicy::explicit(FilterKind::E8),
+    ] {
+        let bytes = write_rar29_compressed_archive_with_filter_policy(&entries, options, policy)
+            .unwrap();
+        let archive = Archive::parse(&bytes).unwrap();
+        assert_eq!(collect_extract(&archive).unwrap()[0].data, payload);
+    }
+}
+
+#[test]
 fn generated_rar29_auto_filtered_archive_round_trips() {
     let payload = b"\xe8\0\0\0\0rar29 auto filtered payload\n".repeat(16);
     let entries = [FileEntry {
@@ -2301,6 +2327,42 @@ fn rar15_writer_levels_control_unpack15_encoder_policy() {
         assert_eq!(collect_extract(&archive).unwrap()[0].data, data);
     }
     assert!(packed_sizes[5] < packed_sizes[1]);
+}
+
+#[test]
+fn rar15_solid_level_zero_stores_each_member_without_a_solid_dependency() {
+    let entries = [
+        FileEntry {
+            name: b"first",
+            data: b"repeated repeated repeated",
+            file_time: 0,
+            file_attr: 0x20,
+            host_os: 3,
+            password: None,
+            file_comment: None,
+        },
+        FileEntry {
+            name: b"second",
+            data: b"repeated repeated repeated again",
+            file_time: 0,
+            file_attr: 0x20,
+            host_os: 3,
+            password: None,
+            file_comment: None,
+        },
+    ];
+    let mut features = FeatureSet::store_only();
+    features.solid = true;
+    let bytes = write_compressed_archive(
+        &entries,
+        WriterOptions::new(ArchiveVersion::Rar15, features).with_compression_level(0),
+    )
+    .unwrap();
+    let archive = Archive::parse(&bytes).unwrap();
+    assert!(archive.files().all(|file| file.method == 0x30));
+    let extracted = collect_extract(&archive).unwrap();
+    assert_eq!(extracted[0].data, entries[0].data);
+    assert_eq!(extracted[1].data, entries[1].data);
 }
 
 #[test]

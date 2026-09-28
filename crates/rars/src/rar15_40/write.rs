@@ -590,10 +590,9 @@ fn encode_rar29_policy_filtered_payload(
             })?,
             method: lz_method,
         }),
-        // Rejected by validate_rar29_filter_policy before any encoding starts.
-        (Rar29Method::Ppmd, FilterPolicy::Auto) => Err(Error::InvalidArgument(
-            "RAR 2.9 cannot search for a filter while PPMd is forced",
-        )),
+        // Filtered writes are rejected before encoding; plain compressed writes
+        // use FilterPolicy::None when PPMd is forced.
+        (Rar29Method::Ppmd, FilterPolicy::Auto) => unreachable!(),
         (Rar29Method::Lz, FilterPolicy::None) => {
             encode_rar29_lz_member(data, options, lz_method, progress)
         }

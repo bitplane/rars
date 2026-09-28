@@ -61,6 +61,20 @@ fn invalid_rar29_filters_fail_before_opening_a_member_or_writing_output() {
         assert_eq!(error.kind(), expected, "{filter:?}: {error}");
         assert!(output.is_empty(), "{filter:?} wrote archive bytes");
     }
+
+    let mut output = Vec::new();
+    let error = rar15_40::write_streaming_archive_to(
+        &entries,
+        options.with_method(rar15_40::Rar29Method::Ppmd),
+        MemberCoding::Filtered(FilterPolicy::Auto),
+        None,
+        &WriterResources::default(),
+        None,
+        &mut output,
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidArgument);
+    assert!(output.is_empty());
 }
 
 #[test]
