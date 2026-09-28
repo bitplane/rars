@@ -411,6 +411,36 @@ mod tests {
     }
 
     #[test]
+    fn the_tree_drops_candidates_outside_its_window() {
+        let input = vec![b'x'; 4096];
+        let mut finder = TreeMatchFinder::new(64);
+        let mut matches = super::Buffer::new(&super::Allowance::default());
+        finder.matches(&input, 0, 16, 0, 8, &mut matches).unwrap();
+        finder
+            .matches(&input, 2048, 16, 2048, 8, &mut matches)
+            .unwrap();
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn the_tree_does_not_report_matches_beyond_the_requested_distance() {
+        let input = vec![b'x'; 64];
+        let mut finder = TreeMatchFinder::new(64);
+        let mut matches = super::Buffer::new(&super::Allowance::default());
+        finder.matches(&input, 0, 16, 0, 8, &mut matches).unwrap();
+        finder.matches(&input, 16, 16, 8, 8, &mut matches).unwrap();
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn a_refused_tree_child_table_releases_its_head_table() {
+        let head_bytes = (1 << 17) * std::mem::size_of::<u32>();
+        let allowance = super::Allowance::limited(head_bytes as u64);
+        assert!(TreeMatchFinder::with_allowance(64, &allowance).is_err());
+        assert_eq!(allowance.used(), 0);
+    }
+
+    #[test]
     fn a_node_matching_the_whole_limit_hands_its_children_to_the_new_position() {
         // Degenerate data: every position matches every earlier one to the
         // limit, so each descent must stop at its first node rather than walk
