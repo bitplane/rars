@@ -1423,7 +1423,9 @@ impl Builder {
         progress: Option<ProgressReporter<'_>>,
     ) -> Result<std::borrow::Cow<'_, Self>> {
         check_cancelled(progress)?;
-        if self.streams_rar50() || !self.entries.iter().any(|entry| entry.source.is_some()) {
+        // All RAR5/7 entry points dispatch to the streaming writer before
+        // calling this legacy-only helper.
+        if !self.entries.iter().any(|entry| entry.source.is_some()) {
             return Ok(std::borrow::Cow::Borrowed(self));
         }
         let mut owned = self.clone();
