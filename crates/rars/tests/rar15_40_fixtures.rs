@@ -3818,7 +3818,7 @@ fn the_writer_fits_the_dictionary_to_the_member() {
 #[test]
 fn rar29_family_writer_stamps_requested_dictionary_size() {
     let entries = [FileEntry {
-        name: b"dict4m.txt",
+        name: b"dictionary.txt",
         data: b"dictionary override payload\n",
         file_time: 0x5a21_0000,
         file_attr: 0x20,
@@ -3826,18 +3826,20 @@ fn rar29_family_writer_stamps_requested_dictionary_size() {
         password: None,
         file_comment: None,
     }];
-    let bytes = write_compressed_archive(
-        &entries,
-        WriterOptions::new(ArchiveVersion::Rar29, FeatureSet::store_only())
-            .with_compression_level(3)
-            .with_dictionary_size(4 * 1024 * 1024),
-    )
-    .unwrap();
-    let archive = Archive::parse(&bytes).unwrap();
-    let file = archive.files().next().unwrap();
+    for (size, flags) in [(2 * 1024 * 1024, 0x00a0), (4 * 1024 * 1024, 0x00c0)] {
+        let bytes = write_compressed_archive(
+            &entries,
+            WriterOptions::new(ArchiveVersion::Rar29, FeatureSet::store_only())
+                .with_compression_level(3)
+                .with_dictionary_size(size),
+        )
+        .unwrap();
+        let archive = Archive::parse(&bytes).unwrap();
+        let file = archive.files().next().unwrap();
 
-    assert_eq!(file.block.flags & 0x00e0, 0x00c0);
-    assert_eq!(collect_extract(&archive).unwrap()[0].data, entries[0].data);
+        assert_eq!(file.block.flags & 0x00e0, flags);
+        assert_eq!(collect_extract(&archive).unwrap()[0].data, entries[0].data);
+    }
 }
 
 #[test]

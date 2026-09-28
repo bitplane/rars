@@ -93,6 +93,30 @@ fn invalid_rar29_filters_fail_before_opening_a_member_or_writing_output() {
 }
 
 #[test]
+fn legacy_dictionary_size_is_validated_before_member_io() {
+    let entries = [rar15_40::StreamingEntry::new(
+        b"member".to_vec(),
+        EntrySource::from_opener(1, || panic!("invalid dictionary opened the source")),
+    )];
+    for size in [0, 96 * 1024, 8 * 1024 * 1024] {
+        let mut output = Vec::new();
+        let error = rar15_40::write_streaming_archive_to(
+            &entries,
+            rar15_40::WriterOptions::new(ArchiveVersion::Rar29, FeatureSet::store_only())
+                .with_dictionary_size(size),
+            MemberCoding::Compressed,
+            None,
+            &WriterResources::default(),
+            None,
+            &mut output,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidArgument, "{size}: {error}");
+        assert!(output.is_empty());
+    }
+}
+
+#[test]
 fn legacy_resource_limits_fail_before_opening_a_member_or_writing_output() {
     let entries = [rar15_40::StreamingEntry::new(
         b"member".to_vec(),
