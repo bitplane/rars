@@ -1,6 +1,36 @@
 use rars::{ArchiveReader, ArchiveVersion, Builder};
 
 #[test]
+fn preserving_builder_accepts_native_unix_directories() {
+    for version in [
+        ArchiveVersion::Rar20,
+        ArchiveVersion::Rar29,
+        ArchiveVersion::Rar50,
+    ] {
+        let mut builder = Builder::new(version).store(true);
+        builder
+            .add_directory(b"directory".to_vec(), None, Some(0o750))
+            .unwrap();
+        let source = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        assert!(
+            source.rewrite_preservation_issues().is_empty(),
+            "{version:?}: {:?}",
+            source.rewrite_preservation_issues()
+        );
+
+        let mut preserving = source.preserving_builder(None).unwrap();
+        preserving
+            .add_directory(b"renamed".to_vec(), None, Some(0o750))
+            .unwrap();
+        let output = ArchiveReader::read_owned(preserving.to_bytes().unwrap()).unwrap();
+        assert!(output.rewrite_preservation_issues().is_empty());
+        let directory = output.members().next().unwrap();
+        assert!(directory.meta.is_directory);
+        assert_eq!(directory.meta.file_attr & 0o170777, 0o040750);
+    }
+}
+
+#[test]
 fn preserving_builder_accepts_rar13_family_and_rar7_sources() {
     for version in [
         ArchiveVersion::Rar13,
