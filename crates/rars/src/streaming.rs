@@ -1039,6 +1039,22 @@ impl Drop for MemoryPermit {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn entry_source_length_helpers_handle_empty_data_and_length_errors() {
+        use super::*;
+
+        let empty = EntrySource::from_bytes(Arc::<[u8]>::from(&b""[..]));
+        assert!(empty.is_empty().unwrap());
+        assert!(format!("{empty:?}").contains("len: Some(0)"));
+
+        let nonempty = EntrySource::from_bytes(Arc::<[u8]>::from(&b"x"[..]));
+        assert!(!nonempty.is_empty().unwrap());
+
+        let missing = EntrySource::from_path(crate::scratch::case("missing-source").join("missing"));
+        assert!(missing.is_empty().is_err());
+        assert!(format!("{missing:?}").contains("len: None"));
+    }
+
+    #[test]
     fn preparation_refusal_is_one_shot_and_releases_the_charge() {
         use super::*;
         use super::preparation::Bytes;

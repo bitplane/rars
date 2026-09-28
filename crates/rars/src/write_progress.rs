@@ -299,3 +299,10 @@ impl<T: std::io::Seek> std::io::Seek for CancellableIo<'_, T> {
         self.inner.seek(from)
     }
 }
+
+#[cfg(test)]
+#[test]
+fn progress_reporter_debug_does_not_expose_the_callback() {
+    let callback = |_event: WriteProgressEvent<'_>| {};
+    assert_eq!(format!("{:?}", ProgressReporter(&callback)), "ProgressReporter(..)");
+}
