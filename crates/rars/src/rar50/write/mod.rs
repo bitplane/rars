@@ -1128,6 +1128,119 @@ mod tests {
     }
 
     #[test]
+    fn volume_preflight_rejects_unsupported_member_and_archive_shapes() {
+        fn reject(
+            entries: &[super::ArchiveEntry],
+            options: super::WriterOptions,
+            extras: super::ArchiveExtras<'_>,
+        ) -> crate::Error {
+            let mut sink = super::CollectedVolumes::new();
+            let error = super::write_streaming_volumes_to(
+                entries,
+                options,
+                extras,
+                4096,
+                &mut sink,
+                &crate::WriterResources::default(),
+            )
+            .unwrap_err();
+            assert!(sink.take().is_empty());
+            error
+        }
+
+        let plain = simple_entry(b"payload");
+        let encrypted = simple_entry(b"payload").with_password(b"secret");
+        assert_eq!(
+            reject(
+                &[encrypted, plain.clone()],
+                super::WriterOptions::default(),
+                super::ArchiveExtras::default(),
+            )
+            .kind(),
+            crate::ErrorKind::UnsupportedFeature
+        );
+
+        let locked = super::ArchiveExtras {
+            locked: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            reject(std::slice::from_ref(&plain), super::WriterOptions::default(), locked),
+            crate::Error::InvalidArgument("archive lock flag is not supported in volume output")
+        );
+
+        let metadata = super::ArchiveExtras::default().with_metadata(super::ArchiveMetadataEntry {
+            name: None,
+            creation_time: Some(1),
+        });
+        assert_eq!(
+            reject(std::slice::from_ref(&plain), super::WriterOptions::default(), metadata).kind(),
+            crate::ErrorKind::UnsupportedFeature
+        );
+
+        let link = simple_entry(b"").with_redirection(Some(super::super::FileRedirection {
+            redirection_type: 4,
+            flags: 0,
+            target_name: b"target".to_vec(),
+        }));
+        assert_eq!(
+            reject(&[link], super::WriterOptions::default(), super::ArchiveExtras::default()),
+            crate::Error::InvalidArgument("symbolic links are not supported in volume output")
+        );
+
+        let commented = simple_entry(b"")
+            .with_service(super::ServiceEntry::new(b"CMT", b"file comment"));
+        assert_eq!(
+            reject(
+                &[commented],
+                super::WriterOptions::default(),
+                super::ArchiveExtras::default(),
+            )
+            .kind(),
+            crate::ErrorKind::UnsupportedFeature
+        );
+
+        let mut features = crate::FeatureSet::store_only();
+        features.header_encryption = true;
+        assert_eq!(
+            reject(
+                &[plain],
+                super::WriterOptions::new(crate::ArchiveVersion::Rar50, features),
+                super::ArchiveExtras::default(),
+            ),
+            crate::Error::NeedPassword
+        );
+    }
+
+    #[test]
+    fn archive_preflight_rejects_duplicate_metadata_before_emission() {
+        let record = super::super::ArchiveMetadataRecord {
+            flags: 2,
+            name: None,
+            creation_time: Some(1),
+        };
+        let mut extras = super::ArchiveExtras::default().with_metadata(super::ArchiveMetadataEntry {
+            name: None,
+            creation_time: Some(1),
+        });
+        extras.metadata_record = Some(&record);
+        let mut output = Vec::new();
+        let error = super::write_streaming_archive_to(
+            &[simple_entry(b"payload")],
+            super::WriterOptions::default(),
+            extras,
+            &crate::WriterResources::default(),
+            &mut output,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            crate::Error::InvalidArgument("duplicate archive metadata settings")
+        );
+        assert!(output.is_empty());
+    }
+
+    #[test]
     fn quick_open_with_encrypted_headers_is_rejected_by_plan_validation() {
         let mut features = crate::FeatureSet::store_only();
         features.quick_open = true;
