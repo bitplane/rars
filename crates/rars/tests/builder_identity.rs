@@ -141,3 +141,59 @@ fn removing_a_duplicate_ignores_directories_and_unrelated_copies() {
     assert_eq!(output.read_member(b"other", None).unwrap().unwrap(), b"payload");
     assert_eq!(output.read_member(b"same", None).unwrap().unwrap(), b"second");
 }
+
+#[test]
+fn renaming_a_duplicate_updates_only_copies_of_that_identity() {
+    let mut seed = Builder::new(ArchiveVersion::Rar50).store(true);
+    seed.add_unix_symlink(b"copy".to_vec(), b"same".to_vec(), false, None, None)
+        .unwrap();
+    let archive = ArchiveReader::read_owned(seed.to_bytes().unwrap()).unwrap();
+    let mut copy = archive.members().next().unwrap();
+    copy.meta.host_os = Some(0);
+    copy.meta.file_attr = 0x20;
+    copy.meta.unpacked_size = 7;
+    if let rars::ArchiveMemberDetail::Rar50Plus {
+        redirection: Some(link),
+        ..
+    } = &mut copy.detail
+    {
+        link.redirection_type = 5;
+        link.flags = 0;
+    }
+
+    let mut builder = Builder::new(ArchiveVersion::Rar50)
+        .store(true)
+        .allow_duplicate_names(true);
+    builder
+        .add_bytes(b"same".to_vec(), b"payload".to_vec(), None, None)
+        .unwrap();
+    builder.add_archive_redirection(&copy).unwrap();
+    builder
+        .add_bytes(b"same".to_vec(), b"another".to_vec(), None, None)
+        .unwrap();
+    copy.meta.name = b"later-copy".to_vec();
+    builder.add_archive_redirection(&copy).unwrap();
+    builder
+        .add_bytes(b"other".to_vec(), b"payload".to_vec(), None, None)
+        .unwrap();
+    copy.meta.name = b"other-copy".to_vec();
+    if let rars::ArchiveMemberDetail::Rar50Plus {
+        redirection: Some(link),
+        ..
+    } = &mut copy.detail
+    {
+        link.target_name = b"other".to_vec();
+    }
+    builder.add_archive_redirection(&copy).unwrap();
+
+    builder.rename_by_id(0, b"first".to_vec()).unwrap();
+    let output = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    for (name, target) in [
+        (b"copy".as_slice(), b"first".as_slice()),
+        (b"later-copy".as_slice(), b"same".as_slice()),
+        (b"other-copy".as_slice(), b"other".as_slice()),
+    ] {
+        let member = output.members().find(|member| member.meta.name == name).unwrap();
+        assert_eq!(member.supported_redirection().unwrap().target_name, target);
+    }
+}
