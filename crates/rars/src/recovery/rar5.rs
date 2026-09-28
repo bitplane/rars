@@ -1074,9 +1074,6 @@ where
 
     let plan = first.plan;
     let shard_len = usize::try_from(plan.group_count).map_err(|_| Error::PlanOverflow)?;
-    if !shard_len.is_multiple_of(2) {
-        return Err(Error::OddShardSize);
-    }
     let shard_ranges = split_prefix_shard_ranges(protected_size, plan)?;
     let mut damaged = Vec::new();
     for (index, range) in shard_ranges.iter().enumerate() {
@@ -1100,12 +1097,6 @@ where
         .iter()
         .map(|chunk| (chunk.shard_index, chunk.parity.as_slice()))
         .collect();
-    if recovery_rows
-        .iter()
-        .any(|(_, shard)| shard.len() != shard_len)
-    {
-        return Err(Error::ShardSizeMismatch);
-    }
     let matrix = make_encoder_matrix(shard_ranges.len(), plan.recovery_shards as usize)?;
     let equations: Vec<Vec<u16>> = recovery_rows
         .iter()
@@ -1139,9 +1130,6 @@ where
         for (row_index, rhs) in rhs_by_row.iter_mut().enumerate() {
             poller.check(0).map_err(|_| Error::Cancelled)?;
             let coeff = matrix[recovery_rows[row_index].0][data_index];
-            if coeff == 0 {
-                continue;
-            }
             for (word_index, word) in shard.chunks_exact(2).enumerate() {
                 poller.check(0).map_err(|_| Error::Cancelled)?;
                 let data_symbol = u16::from_le_bytes([word[0], word[1]]);
@@ -1567,6 +1555,9 @@ fn parse_inline_recovery_chunk_with_control(
 
     let protected_size = read_u64(input, 0x22)?;
     let group_count = read_u64(input, 0x2a)?;
+    if !group_count.is_multiple_of(2) {
+        return Err(Error::BadRecoveryChunk);
+    }
     let shard_size = read_u64(input, 0x32)?;
     let data_shards = u16::from_le_bytes(input[0x3a..0x3c].try_into().unwrap()) as u64;
     let recovery_shards = u16::from_le_bytes(input[0x3c..0x3e].try_into().unwrap()) as u64;
@@ -1699,7 +1690,7 @@ fn invert_linear_system_matrix_with_control(
     let mut poller = control.poller();
     check_repair(control)?;
     let n = matrix.len();
-    if matrix.len() != n || matrix.iter().any(|row| row.len() != n) {
+    if matrix.iter().any(|row| row.len() != n) {
         return Err(Error::BadRecoveryChunk);
     }
     let mut matrix = matrix.to_vec();
@@ -2800,6 +2791,23 @@ mod tests {
     }
 
     #[test]
+    fn rar5_recovery_matrix_rejects_non_square_inputs() {
+        let gf = shared_gf16();
+        assert_eq!(
+            invert_linear_system_matrix(gf, &[vec![1], vec![1]]),
+            Err(Error::BadRecoveryChunk)
+        );
+        assert_eq!(
+            apply_inverse_matrix(gf, &[vec![1]], &[1, 2]),
+            Err(Error::BadRecoveryChunk)
+        );
+        assert_eq!(
+            apply_inverse_matrix(gf, &[vec![1], vec![1]], &[1, 2]),
+            Err(Error::BadRecoveryChunk)
+        );
+    }
+
+    #[test]
     fn rar5_parity_encoder_generates_systematic_recovery_shards() {
         let first = [1, 0, 2, 0, 3, 0, 4, 0];
         let parity = encode_parity_shards(&[&first], 1).unwrap();
@@ -3009,6 +3017,31 @@ mod tests {
         for (name, chunk) in cases {
             assert_eq!(parse(&chunk), Error::BadRecoveryChunk, "{name}");
         }
+    }
+
+    #[test]
+    fn rar5_repair_rejects_odd_gf16_shards() {
+        let mut chunk = build_structural_inline_recovery_data(b"x", 10).unwrap();
+        chunk.pop();
+        let size = chunk.len() as u32;
+        chunk[0x0c..0x10].copy_from_slice(&size.to_le_bytes());
+        chunk[0x2a..0x32].copy_from_slice(&1u64.to_le_bytes());
+        chunk[0x32..0x3a].copy_from_slice(&(size as u64).to_le_bytes());
+        let crc = crc64_xz(&chunk[0x0c..]);
+        chunk[0x04..0x0c].copy_from_slice(&crc.to_le_bytes());
+
+        assert_eq!(
+            super::parse_inline_recovery_chunk_with_control(
+                &chunk,
+                &crate::read_control::ReadControl::default()
+            )
+            .unwrap_err(),
+            Error::BadRecoveryChunk
+        );
+        assert_eq!(
+            repair_inline_recovery_prefix(b"y", &chunk),
+            Err(Error::BadRecoveryChunk)
+        );
     }
 
     #[test]
