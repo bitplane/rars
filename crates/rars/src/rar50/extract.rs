@@ -1821,6 +1821,53 @@ mod tests {
     }
 
     #[test]
+    fn compressed_split_reader_releases_each_refused_allocation() {
+        let volumes = [
+            include_bytes!("../../tests/fixtures/rar50/multivol.part1.rar").as_slice(),
+            include_bytes!("../../tests/fixtures/rar50/multivol.part2.rar").as_slice(),
+            include_bytes!("../../tests/fixtures/rar50/multivol.part3.rar").as_slice(),
+        ]
+        .map(|bytes| Archive::parse(bytes).unwrap());
+        let first = volumes[0].files().next().unwrap();
+        let last = volumes[2].files().next().unwrap();
+        assert!(!last.is_stored());
+        refuse_each_reader_session_allocation(|budget| {
+            let mut split = PendingSplitRefs::with_allowance(first, 0, 0, budget)?;
+            split.append(1, 0)?;
+            split.append(2, 0)?;
+            let mut decoder = ReaderState::new(budget);
+            let decoded = last.decode_split_with_decoder(&volumes, &split, &mut decoder, None)?;
+            assert_eq!(decoded.len(), 4096);
+            assert_eq!(crc32(&decoded), 0xb9c5_4415);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn encrypted_split_reader_releases_descriptor_and_cipher_allocations() {
+        let volumes = [
+            include_bytes!("../../tests/fixtures/rar50/encrypted_multivol.part1.rar").as_slice(),
+            include_bytes!("../../tests/fixtures/rar50/encrypted_multivol.part2.rar").as_slice(),
+            include_bytes!("../../tests/fixtures/rar50/encrypted_multivol.part3.rar").as_slice(),
+        ]
+        .map(|bytes| Archive::parse_with_password(bytes, Some(b"password")).unwrap());
+        let first = volumes[0].files().next().unwrap();
+        assert!(first.encrypted);
+        let decryptor = SplitDecryptor {
+            keys: first.encryption_keys(Some(b"password")).unwrap(),
+            iv: first.encryption_iv().unwrap(),
+        };
+        refuse_each_reader_session_allocation(|budget| {
+            let mut split = PendingSplitRefs::with_allowance(first, 0, 0, budget)?;
+            split.append(1, 0)?;
+            split.append(2, 0)?;
+            let _reader =
+                split.fragment_reader_with_allowance(&volumes, Some(&decryptor), budget)?;
+            Ok(())
+        });
+    }
+
+    #[test]
     fn reader_session_workspace_refusals_release_rar5_scratch_filter_buffers_and_files() {
         let dir = crate::scratch::case("reader-workspace-rar5-scratch");
         let policy = crate::Rar50Scratch::new(&*dir, 4096);
@@ -2068,6 +2115,40 @@ mod tests {
             .unwrap();
         assert_eq!(seen, [(b"dir".to_vec(), true), (b"file".to_vec(), false)]);
         assert_eq!(&*output.borrow(), b"payload");
+    }
+
+    #[test]
+    fn direct_streaming_extracts_compressed_zero_run() {
+        struct Capture(Rc<RefCell<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let data = vec![0; 16 * 1024];
+        let bytes = Rar50Writer::new(WriterOptions::new(
+            ArchiveVersion::Rar50,
+            FeatureSet::store_only(),
+        ))
+        .entries([entry(b"zeroes", &data)])
+        .finish()
+        .unwrap();
+        let archive = Archive::parse_owned(bytes).unwrap();
+        assert!(!archive.files().next().unwrap().is_stored());
+        let output = Rc::new(RefCell::new(Vec::new()));
+        archive
+            .extract_to(
+                crate::ArchiveReadOptions::new().with_rar50_buffered_decode_limit(0),
+                |_| Ok(Box::new(Capture(output.clone()))),
+            )
+            .unwrap();
+        assert_eq!(*output.borrow(), data);
     }
 
     #[test]
