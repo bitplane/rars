@@ -1519,6 +1519,29 @@ mod tests {
         assert!(screen.rejected_a_region);
     }
 
+    #[test]
+    fn x86_region_scan_releases_all_storage_on_each_admission_failure() {
+        use crate::codec::workspace::RefusingBudget;
+
+        let data = calls_to_fixed_addresses(256 * 1024);
+        let baseline = RefusingBudget::new(usize::MAX);
+        let regions = super::x86_code_regions(&data, &baseline).unwrap();
+        assert!(!regions.is_empty());
+        drop(regions);
+        assert_eq!(baseline.used(), 0);
+        assert!(baseline.attempts() > 0);
+
+        for index in 0..baseline.attempts() {
+            let budget = RefusingBudget::new(index);
+            assert_eq!(
+                super::x86_code_regions(&data, &budget).unwrap_err(),
+                crate::Error::Cancelled,
+                "admission {index}"
+            );
+            assert_eq!(budget.used(), 0, "admission {index}");
+        }
+    }
+
     /// The E8-only filter costs a whole-member encode to ask whether leaving
     /// the jump opcodes alone packs better. Over twenty-four members it won
     /// seven times and never by more than 0.21%, so it only earns that encode
