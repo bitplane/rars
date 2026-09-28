@@ -221,4 +221,15 @@ mod tests {
         let solid = ExecutionPlan::new(&settings, [16, u64::MAX].into_iter(), u64::MAX);
         assert!(matches!(solid, ExecutionPlan::Blocks { workspace } if workspace > 0));
     }
+
+    #[test]
+    fn independent_member_planning_respects_the_execution_ledger() {
+        let ledger = crate::codec::workspace::Allowance::limited(0);
+        let resources = WriterResources::default().with_execution_allowance(ledger.clone());
+        let error = ExecutionPlan::with_resources(&settings(), [1].into_iter(), &resources)
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), crate::ErrorKind::ResourceLimit);
+        assert_eq!(ledger.used(), 0);
+    }
 }

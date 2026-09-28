@@ -324,4 +324,22 @@ mod tests {
             Error::InvalidArgument("RAR 5 service block size overflows")
         );
     }
+
+    #[test]
+    fn layout_and_service_sizing_release_refused_admission() {
+        let ledger = crate::codec::workspace::Allowance::limited(0);
+        let resources = WriterResources::default().with_execution_allowance(ledger.clone());
+        assert_eq!(
+            resolve_layout(&inputs(0), &resources).err().unwrap().kind(),
+            crate::ErrorKind::ResourceLimit
+        );
+        assert_eq!(ledger.used(), 0);
+        assert_eq!(
+            stored_service_block_len(b"QO", 1, &[], false, &resources)
+                .unwrap_err()
+                .kind(),
+            crate::ErrorKind::ResourceLimit
+        );
+        assert_eq!(ledger.used(), 0);
+    }
 }
