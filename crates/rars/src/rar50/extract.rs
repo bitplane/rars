@@ -2028,6 +2028,49 @@ mod tests {
     }
 
     #[test]
+    fn limited_parallel_extraction_accounts_for_directory_link_and_stored_file() {
+        struct Capture(Rc<RefCell<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut directory = plain_file(b"dir", b"", None);
+        directory.file_flags |= super::super::FHFL_DIRECTORY;
+        let mut link = plain_file(b"link", b"", None);
+        link.redirection = Some(super::super::FileRedirection {
+            redirection_type: 1,
+            flags: 0,
+            target_name: b"file".to_vec(),
+        });
+        let mut file = plain_file(b"file", b"payload", None);
+        file.block = empty_block(HEAD_FILE, 0, 0..7);
+        let archive = archive_with_blocks(
+            vec![Block::File(directory), Block::File(link), Block::File(file)],
+            b"payload".to_vec(),
+        );
+        let output = Rc::new(RefCell::new(Vec::new()));
+        let mut seen = Vec::new();
+        archive
+            .extract_to_parallel_buffered(
+                crate::ArchiveReadOptions::new().with_max_reader_workspace_bytes(1 << 20),
+                |meta| {
+                    seen.push((meta.name.clone(), meta.is_directory));
+                    Ok(Box::new(Capture(output.clone())))
+                },
+            )
+            .unwrap();
+        assert_eq!(seen, [(b"dir".to_vec(), true), (b"file".to_vec(), false)]);
+        assert_eq!(&*output.borrow(), b"payload");
+    }
+
+    #[test]
     fn decrypting_reader_streams_rar50_blocks() {
         let key = [3u8; 32];
         let iv = [4u8; 16];

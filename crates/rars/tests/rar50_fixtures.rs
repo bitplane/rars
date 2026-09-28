@@ -6321,6 +6321,23 @@ fn streams_rar50_match_that_reaches_past_the_start_of_the_window() {
     let archive = Archive::parse(&bytes).unwrap();
     let entries = RefCell::new(Vec::new());
 
+    archive
+        .extract_to(
+            ArchiveReadOptions::default().with_rar50_buffered_decode_limit(0),
+            |meta| {
+                let data = Rc::new(RefCell::new(Vec::new()));
+                entries
+                    .borrow_mut()
+                    .push((meta.name.clone(), Rc::clone(&data)));
+                Ok(Box::new(CollectWriter { data }))
+            },
+        )
+        .unwrap();
+    assert_eq!(entries.borrow().len(), 1);
+    assert_eq!(entries.borrow()[0].0, b"zerofill.bin");
+    assert_eq!(*entries.borrow()[0].1.borrow(), zero_fill_payload());
+    entries.borrow_mut().clear();
+
     extract_volumes_to(
         std::slice::from_ref(&archive),
         ArchiveReadOptions::default().with_rar50_buffered_decode_limit(0),
