@@ -126,3 +126,26 @@ fn legacy_families_refuse_before_emission_even_with_zero_budget() {
         assert_eq!(resources.managed_memory_in_use(), 0);
     }
 }
+
+#[test]
+fn managed_builder_handles_encrypted_file_comment_and_releases_its_charge() {
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    builder
+        .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+        .unwrap();
+    builder
+        .set_file_comment(b"file", Some(b"private comment".to_vec()))
+        .unwrap();
+    builder
+        .set_entry_encryption(b"file", None, Some(b"password".to_vec()))
+        .unwrap();
+
+    let resources = WriterResources::default().with_max_memory_bytes(16 << 20);
+    let output = builder.to_output(&resources, None).unwrap();
+    assert!(resources.managed_memory_in_use() >= output.as_bytes().len() as u64);
+    let archive = ArchiveReader::read(output.as_bytes()).unwrap();
+    assert_eq!(archive.read_member(b"file", None).unwrap().unwrap(), b"payload");
+    drop(archive);
+    drop(output);
+    assert_eq!(resources.managed_memory_in_use(), 0);
+}

@@ -1864,6 +1864,43 @@ fn unix_mode(_metadata: &fs::Metadata) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn converted_rar50_entries_charge_encrypted_comment_storage() {
+        let resources = crate::WriterResources::default().with_max_memory_bytes(1 << 20);
+        let mut builder = crate::Builder::new(crate::ArchiveVersion::Rar50);
+        builder
+            .add_source(
+                b"file".to_vec(),
+                crate::EntrySource::from_bytes(b"payload".as_slice()),
+                None,
+                None,
+            )
+            .unwrap();
+        let baseline = builder.rar50_entries_with_resources(&resources).unwrap();
+        let baseline_charge = resources.managed_memory_in_use();
+        drop(baseline);
+        assert_eq!(resources.managed_memory_in_use(), 0);
+
+        let comment = b"private comment";
+        let password = b"password";
+        builder
+            .set_file_comment(b"file", Some(comment.to_vec()))
+            .unwrap();
+        builder
+            .set_entry_encryption(b"file", None, Some(password.to_vec()))
+            .unwrap();
+        let converted = builder.rar50_entries_with_resources(&resources).unwrap();
+        assert_eq!(
+            resources.managed_memory_in_use() - baseline_charge,
+            (std::mem::size_of::<crate::rar50::ServiceEntry>()
+                + 3
+                + comment.len()
+                + password.len()) as u64
+        );
+        drop(converted);
+        assert_eq!(resources.managed_memory_in_use(), 0);
+    }
+
+    #[test]
     fn builder_rejects_legacy_volume_directory_and_metadata_settings() {
         use crate::{ArchiveVersion, Builder, ErrorKind};
 
