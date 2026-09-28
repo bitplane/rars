@@ -324,3 +324,28 @@ fn compressed_legacy_volume_preserves_cancellation_from_codec() {
     assert_eq!(error.kind(), ErrorKind::Cancelled);
     assert!(progress.cancelled.load(Ordering::Relaxed));
 }
+
+#[test]
+fn rar13_compressed_volume_preserves_cancellation_from_codec() {
+    use rars::rar13;
+
+    let data = b"a repeating RAR 1.3 volume member ".repeat(4096);
+    let entry = rar13::FileEntry {
+        name: b"file",
+        data: &data,
+        file_time: 0,
+        file_attr: 0x20,
+        password: None,
+        file_comment: None,
+    };
+    let progress = Stop::new(WriteOperation::Compression, false);
+    let error = rar13::write_compressed_volumes_with_progress(
+        entry,
+        rar13::WriterOptions::default(),
+        1024,
+        Some(&progress),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Cancelled);
+    assert!(progress.cancelled.load(Ordering::Relaxed));
+}
