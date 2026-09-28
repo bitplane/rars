@@ -436,7 +436,7 @@ fn write_members_to(
     // Solid members share one encoder, so they are coded in order. Independent
     // ones are coded a window at a time and written as each window lands.
     if options.features.solid && coding.compresses() {
-        let mut solid_encoder = SolidEncoder::for_target(options, true)?;
+        let mut solid_encoder = Some(SolidEncoder::for_target(options)?);
         let mut solid_run_has_member = false;
         for member in members {
             let encoded = encode_member(
@@ -1171,7 +1171,7 @@ fn encode_member<'a>(
     // reference readers handle links separately from the solid unpacker.
     let coding = if member.is_symlink {
         if options.features.solid && coding.compresses() {
-            *solid_encoder = SolidEncoder::for_target(options, true)?;
+            *solid_encoder = Some(SolidEncoder::for_target(options)?);
         }
         &MemberCoding::Stored
     } else {
@@ -1812,10 +1812,7 @@ enum SolidEncoder {
 }
 
 impl SolidEncoder {
-    fn for_target(options: WriterOptions, solid: bool) -> Result<Option<Self>> {
-        if !solid {
-            return Ok(None);
-        }
+    fn for_target(options: WriterOptions) -> Result<Self> {
         let encoder = match options.target {
             ArchiveVersion::Rar15 => Self::Rar15(Box::new(Unpack15Encoder::with_options(
                 rar15_encode_options_for_level(options.compression_level)?,
@@ -1828,9 +1825,9 @@ impl SolidEncoder {
                     rar29_encode_options_for_options(options)?,
                 )))
             }
-            _ => return Ok(None),
+            _ => return Err(Error::UnsupportedVersion(options.target)),
         };
-        Ok(Some(encoder))
+        Ok(encoder)
     }
 }
 
@@ -1912,7 +1909,7 @@ fn encode_filtered_payload(
     // A member the encoder could not shrink is stored, exactly as an unfiltered
     // one is, which rebuilds the encoder and ends the chain here.
     if should_store_fallback(options.target, true, data.len(), packed.len()) {
-        *solid_encoder = SolidEncoder::for_target(options, true)?;
+        *solid_encoder = Some(SolidEncoder::for_target(options)?);
         return Ok(EncodedPayload {
             data: data.to_vec(),
             method: 0x30,
@@ -1965,7 +1962,7 @@ fn encode_or_store_payload(
     let compressed = encode_compressed_payload(data, options, solid_encoder.as_mut(), progress)?;
     if should_store_fallback(target, solid, data.len(), compressed.len()) {
         if solid {
-            *solid_encoder = SolidEncoder::for_target(options, true)?;
+            *solid_encoder = Some(SolidEncoder::for_target(options)?);
         }
         return Ok(EncodedPayload {
             data: data.to_vec(),
