@@ -181,6 +181,36 @@ fn emitted_header_len(plain_len: u64, header_encrypted: bool) -> u64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn layout_header_sizes_release_preparation_charge_at_every_limit() {
+        for measure in [
+            &(|resources: &WriterResources| main_header_len(&inputs(0), &[], resources))
+                as &dyn Fn(&WriterResources) -> Result<u64>,
+            &(|resources: &WriterResources| {
+                stored_service_block_len(b"QO", 16, &[], false, resources)
+            }),
+        ] {
+            let mut succeeded = false;
+            let mut failed_after_admission = false;
+            for limit in 0..512 {
+                let resources = WriterResources::default().with_max_preparation_bytes(limit);
+                match measure(&resources) {
+                    Ok(_) => {
+                        succeeded = true;
+                        break;
+                    }
+                    Err(Error::WriterPreparationLimitExceeded { used, .. }) => {
+                        failed_after_admission |= used > 0;
+                        drop(Bytes::zeroed(limit as usize, &resources).unwrap());
+                    }
+                    Err(error) => panic!("unexpected limit {limit} failure: {error}"),
+                }
+            }
+            assert!(failed_after_admission);
+            assert!(succeeded);
+        }
+    }
+
     fn inputs(body_len: u64) -> LayoutInputs<'static> {
         LayoutInputs {
             header_encrypted: false,
