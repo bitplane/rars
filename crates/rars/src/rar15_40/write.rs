@@ -1260,7 +1260,6 @@ fn write_member(
 ) -> Result<()> {
     let target = options.target;
     crate::write_progress::check_cancelled(progress)?;
-    validate_writer_password(target, member.password)?;
     let (payload, salt) = match encoded.payload {
         MemberPayload::Packed(mut packed) => {
             let salt =
@@ -2231,17 +2230,6 @@ fn encrypt_split_packed_data(
     }
 }
 
-fn writer_supports_file_encryption(target: ArchiveVersion) -> bool {
-    matches!(
-        target,
-        ArchiveVersion::Rar15
-            | ArchiveVersion::Rar20
-            | ArchiveVersion::Rar29
-            | ArchiveVersion::Rar30
-            | ArchiveVersion::Rar40
-    )
-}
-
 fn header_encryption_password<'a>(
     mut passwords: impl Iterator<Item = Option<&'a [u8]>>,
 ) -> Result<&'a [u8]> {
@@ -2274,7 +2262,6 @@ fn encrypt_packed_data_with_progress(
     let Some(password) = password else {
         return Ok(None);
     };
-    validate_writer_password(target, Some(password))?;
     match target {
         ArchiveVersion::Rar15 => {
             let mut cipher = Rar15Cipher::new(password);
@@ -2468,16 +2455,6 @@ fn write_encrypted_header(out: &mut dyn Write, header: &[u8], password: &[u8]) -
         .map_err(super::map_rar30_crypto_error)?;
     out.write_all(&salt)?;
     out.write_all(&encrypted_header)?;
-    Ok(())
-}
-
-fn validate_writer_password(target: ArchiveVersion, password: Option<&[u8]>) -> Result<()> {
-    if password.is_some() && !writer_supports_file_encryption(target) {
-        return Err(Error::UnsupportedFeature {
-            version: target,
-            feature: "RAR writer file encryption",
-        });
-    }
     Ok(())
 }
 

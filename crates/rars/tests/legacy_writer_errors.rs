@@ -161,6 +161,28 @@ fn legacy_source_length_failure_identifies_the_member_before_output() {
 }
 
 #[test]
+fn legacy_archive_rejects_modern_target_before_encrypted_member_io() {
+    let entries = [rar15_40::StreamingEntry::new(
+        b"file".to_vec(),
+        EntrySource::from_opener(1, || panic!("wrong target opened member")),
+    )
+    .with_password(b"secret".to_vec())];
+    let mut output = Vec::new();
+    let error = rar15_40::write_streaming_archive_to(
+        &entries,
+        rar15_40::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only()),
+        MemberCoding::Stored,
+        None,
+        &WriterResources::default(),
+        None,
+        &mut output,
+    )
+    .unwrap_err();
+    assert!(matches!(error, Error::UnsupportedVersion(ArchiveVersion::Rar50)));
+    assert!(output.is_empty());
+}
+
+#[test]
 fn legacy_volume_preflight_rejects_unsupported_options_and_empty_payloads() {
     let entry = rar15_40::StoredEntry {
         name: b"member",
