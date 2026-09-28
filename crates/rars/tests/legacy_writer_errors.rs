@@ -287,6 +287,12 @@ fn legacy_volume_preflight_rejects_unsupported_options_and_empty_payloads() {
     );
     let empty = rar15_40::StoredEntry { data: b"", ..entry };
     assert_eq!(
+        rar15_40::write_stored_volumes(empty, plain, 8)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidArgument
+    );
+    assert_eq!(
         rar15_40::write_stored_volumes(empty, encrypted, 8)
             .unwrap_err()
             .kind(),

@@ -3023,6 +3023,26 @@ mod tests {
 
         assert!(is_audio_filter_candidate(&data, 4));
         assert!(!is_audio_filter_candidate(&data, 3));
+        assert!(!is_audio_filter_candidate(&data, 0));
+        assert!(!is_audio_filter_candidate(&data, 5));
+    }
+
+    #[test]
+    fn rar15_unix_directory_and_file_modes_become_dos_attributes() {
+        use crate::ArchiveVersion;
+
+        assert_eq!(
+            super::rar15_compatible_metadata(ArchiveVersion::Rar15, 3, 0o040755),
+            (0, 0x10)
+        );
+        assert_eq!(
+            super::rar15_compatible_metadata(ArchiveVersion::Rar15, 3, 0o100644),
+            (0, 0x20)
+        );
+        assert_eq!(
+            super::rar15_compatible_metadata(ArchiveVersion::Rar20, 3, 0o040755),
+            (3, 0o040755)
+        );
     }
 
     #[test]
