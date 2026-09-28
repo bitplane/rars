@@ -6348,6 +6348,26 @@ fn rar250_parser_rejects_inconsistent_recovery_header_geometry() {
 }
 
 #[test]
+fn rar250_repair_rejects_inconsistent_public_protection_metadata() {
+    let bytes = std::fs::read(fixture("rar250_protect_head_rr5.rar")).unwrap();
+    let mut archive = Archive::parse(&bytes).unwrap();
+    let protect = archive
+        .blocks
+        .iter_mut()
+        .find_map(|block| match block {
+            Block::Protect(protect) => Some(protect),
+            _ => None,
+        })
+        .unwrap();
+    protect.data_range.end -= 1;
+
+    assert!(matches!(
+        archive.repair_protect_head(),
+        Err(Error::InvalidHeader("RAR 2.x recovery data size is invalid"))
+    ));
+}
+
+#[test]
 fn rar250_protect_head_declares_final_sector_that_overlaps_record() {
     for (path, rec_sectors) in [
         ("rar250_protect_head_rr1.rar", 1),
@@ -6444,6 +6464,52 @@ fn rar300_recovery_rejects_stored_size_mismatch_in_archive_bytes() {
         malformed.repair_protect_head(),
         Err(Error::InvalidHeader(
             "RAR 3.x recovery record packed size does not match unpacked size"
+        ))
+    ));
+}
+
+#[test]
+fn rar300_repair_rejects_inconsistent_public_recovery_metadata() {
+    fn recovery_file(archive: &mut Archive) -> &mut rars::rar15_40::FileHeader {
+        archive
+            .blocks
+            .iter_mut()
+            .find_map(|block| match block {
+                Block::NewSub(sub) if sub.kind == NewSubKind::RecoveryRecord => {
+                    Some(&mut sub.file)
+                }
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    let bytes = std::fs::read(fixture("rar300/with_recovery_rar300.rar")).unwrap();
+    let original = Archive::parse(&bytes).unwrap();
+
+    let mut short_payload = original.clone();
+    recovery_file(&mut short_payload).packed_range.end -= 1;
+    assert!(matches!(
+        short_payload.repair_protect_head(),
+        Err(Error::InvalidHeader(
+            "RAR 3.x recovery data size does not match unpacked size"
+        ))
+    ));
+
+    let mut past_source = original.clone();
+    recovery_file(&mut past_source).block.offset = bytes.len() + 1;
+    assert!(matches!(
+        past_source.repair_protect_head(),
+        Err(Error::InvalidHeader(
+            "RAR 3.x recovery protected range is invalid"
+        ))
+    ));
+
+    let mut no_protected_sectors = original;
+    recovery_file(&mut no_protected_sectors).block.offset = 0;
+    assert!(matches!(
+        no_protected_sectors.repair_protect_head(),
+        Err(Error::InvalidHeader(
+            "RAR 3.x recovery record has no protected sectors"
         ))
     ));
 }
