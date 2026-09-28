@@ -1467,6 +1467,26 @@ mod tests {
             .unwrap(),
             Error::InvalidArgument("codec failure")
         );
+
+        let jobs = Records::collect(
+            [
+                (None::<u8>, Some(Err::<u8, _>(Error::InvalidArgument("first")))),
+                (None, Some(Err(Error::InvalidArgument("second")))),
+            ]
+            .into_iter()
+            .map(Ok),
+            &resources,
+        )
+        .unwrap();
+        let output = Records::new(2, &resources).unwrap();
+        assert_eq!(
+            complete_jobs(jobs, output, &resources, &Cancelled, |_, _, _| -> Result<u8> {
+                panic!("cancelled worker overwrote its recorded result")
+            })
+            .err()
+            .unwrap(),
+            Error::InvalidArgument("first")
+        );
     }
 
     #[test]
