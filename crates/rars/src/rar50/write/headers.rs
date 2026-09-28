@@ -316,6 +316,34 @@ mod tests {
         ));
         assert!(output.is_empty());
     }
+
+    #[test]
+    fn archive_metadata_extra_releases_each_refused_preparation_charge() {
+        let metadata = ArchiveMetadataEntry {
+            name: Some(b"archive"),
+            creation_time: Some(1),
+        };
+        let mut limit = 0;
+        let mut refusals = 0;
+        loop {
+            let resources = WriterResources::default().with_max_preparation_bytes(limit);
+            match resolved_main_extra(Some(metadata), None, None, &resources) {
+                Ok(extra) => {
+                    assert!(!extra.is_empty());
+                    break;
+                }
+                Err(Error::WriterPreparationLimitExceeded { required, .. }) => {
+                    assert!(required > limit);
+                    refusals += 1;
+                    drop(Bytes::zeroed(limit as usize, &resources).unwrap());
+                    limit = required;
+                    assert!(limit < 4096);
+                }
+                Err(error) => panic!("unexpected metadata error: {error}"),
+            }
+        }
+        assert!(refusals > 2);
+    }
 }
 
 /// Encrypts a header block under `keys`, returning `iv || ciphertext || data`.
