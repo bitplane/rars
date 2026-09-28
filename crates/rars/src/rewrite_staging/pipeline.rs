@@ -230,6 +230,27 @@ pub(super) fn run<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    struct CancelAtStagingFinish(AtomicBool);
+
+    impl crate::WriteProgress for CancelAtStagingFinish {
+        fn report(&self, event: crate::WriteProgressEvent<'_>) {
+            if matches!(
+                event,
+                crate::WriteProgressEvent::OperationFinished {
+                    operation: crate::WriteOperation::Staging,
+                    ..
+                }
+            ) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+
+        fn is_cancelled(&self) -> bool {
+            self.0.load(Ordering::Relaxed)
+        }
+    }
 
     fn delivery() -> Arc<Delivery> {
         Arc::new(Delivery {
@@ -336,6 +357,37 @@ mod tests {
             .unwrap_err(),
             Error::InvalidArgument("writer refused")
         );
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn cancellation_after_final_source_request_reaches_writer() {
+        let root = crate::scratch::case("rewrite-final-request-cancelled");
+        let mut builder = crate::Builder::new(crate::ArchiveVersion::Rar50).store(true);
+        builder
+            .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+        let archive = crate::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        let staging = RewriteStaging {
+            directory: root.to_path_buf(),
+            max_staged_bytes: 7,
+        };
+        let progress = Arc::new(CancelAtStagingFinish(AtomicBool::new(false)));
+
+        let result = run(
+            &archive,
+            &[0],
+            ArchiveReadOptions::default(),
+            &staging,
+            Some(progress.clone()),
+            |sources| {
+                let error = sources[0].open().err().expect("staging should cancel");
+                assert_eq!(error.kind(), crate::ErrorKind::Cancelled, "{error:?}");
+                Ok(17)
+            },
+        );
+        assert!(progress.0.load(Ordering::Relaxed));
+        assert_eq!(result.unwrap_err(), Error::Cancelled);
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
     }
 }
