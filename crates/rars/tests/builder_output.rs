@@ -43,6 +43,22 @@ fn legacy_volume_builder_refuses_existing_directories_and_symlinks() {
 }
 
 #[test]
+fn legacy_volumes_accept_regular_unix_mode_files() {
+    for version in [ArchiveVersion::Rar20, ArchiveVersion::Rar29, ArchiveVersion::Rar40] {
+        let mut builder = Builder::new(version).store(true).volume_size(Some(64));
+        builder
+            .add_bytes(b"file".to_vec(), vec![42; 128], None, Some(0o100640))
+            .unwrap();
+        let volumes = builder.build_volumes(None).unwrap();
+        assert!(volumes.len() > 1, "{version:?}");
+        let first = ArchiveReader::read_owned(volumes[0].clone()).unwrap();
+        let member = first.members().next().unwrap();
+        assert_eq!(member.meta.attr_source(), rars::AttrSource::Unix);
+        assert_eq!(member.meta.file_attr & 0o170777, 0o100640);
+    }
+}
+
+#[test]
 fn single_output_rejects_volume_metadata_before_opening_a_source() {
     let mut builder = Builder::new(ArchiveVersion::Rar50)
         .archive_metadata(None, true, false)
