@@ -309,3 +309,39 @@ fn invalid_complete_times_leave_builder_output_unchanged() {
         }
     }
 }
+
+#[test]
+fn legacy_extended_times_are_validated_before_the_archive_is_written() {
+    let mut builder = Builder::new(ArchiveVersion::Rar29).store(true);
+    builder
+        .add_bytes(
+            b"file".to_vec(),
+            b"payload".to_vec(),
+            Some(0x5a21_0000),
+            None,
+        )
+        .unwrap();
+    let before = builder.to_bytes().unwrap();
+    assert!(builder
+        .set_legacy_extended_times(b"file", Some(vec![0x00, 0x90]))
+        .is_err());
+    assert_eq!(builder.to_bytes().unwrap(), before);
+    builder
+        .set_legacy_extended_times(b"file", Some(vec![0x00, 0x90, 0x01]))
+        .unwrap();
+    let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    assert!(archive
+        .members()
+        .next()
+        .unwrap()
+        .file_times()
+        .unwrap()
+        .is_some());
+
+    let mut old = Builder::new(ArchiveVersion::Rar20).store(true);
+    old.add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+        .unwrap();
+    assert!(old
+        .set_legacy_extended_times(b"file", Some(vec![0x00, 0x90, 0x01]))
+        .is_err());
+}

@@ -114,6 +114,40 @@ fn unicode_names_take_precedence_in_metadata_and_extraction() {
 }
 
 #[test]
+fn legacy_unicode_metadata_is_validated_and_renamed_with_its_member() {
+    let mut builder = Builder::new(ArchiveVersion::Rar29).store(true);
+    builder
+        .add_bytes(b"old.txt".to_vec(), b"payload".to_vec(), None, None)
+        .unwrap();
+    let before = builder.to_bytes().unwrap();
+    assert!(builder
+        .set_legacy_unicode_name(b"old.txt", b"bad".to_vec())
+        .is_err());
+    assert_eq!(builder.to_bytes().unwrap(), before);
+
+    let mut wire = b"old.txt\0\0".to_vec();
+    for group in "old.txt".encode_utf16().collect::<Vec<_>>().chunks(4) {
+        wire.push(0xaa);
+        for unit in group {
+            wire.extend_from_slice(&unit.to_le_bytes());
+        }
+    }
+    builder
+        .set_legacy_unicode_name(b"old.txt", wire.clone())
+        .unwrap();
+    builder.rename(b"old.txt", b"new.txt".to_vec()).unwrap();
+    let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    let member = archive.members().next().unwrap();
+    assert_eq!(member.meta.name, b"new.txt");
+    assert!(member.name_is_unicode());
+
+    let mut old = Builder::new(ArchiveVersion::Rar15).store(true);
+    old.add_bytes(b"old.txt".to_vec(), b"payload".to_vec(), None, None)
+        .unwrap();
+    assert!(old.set_legacy_unicode_name(b"old.txt", wire).is_err());
+}
+
+#[test]
 fn split_legacy_names_keep_their_encoding_classification() {
     let mut builder = Builder::new(ArchiveVersion::Rar29)
         .store(true)
