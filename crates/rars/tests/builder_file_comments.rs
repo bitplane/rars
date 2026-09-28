@@ -1,6 +1,29 @@
 use rars::{Archive, ArchiveReader, ArchiveVersion, Builder, ErrorKind};
 
 #[test]
+fn recovery_service_does_not_change_rar5_member_comments() {
+    let mut builder = Builder::new(ArchiveVersion::Rar50)
+        .store(true)
+        .recovery_percent(Some(5));
+    builder
+        .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+        .unwrap();
+    builder
+        .set_file_comment(b"file", Some(b"note".to_vec()))
+        .unwrap();
+    let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    let Archive::Rar50Plus(ref rar50) = archive else {
+        unreachable!()
+    };
+    assert!(rar50
+        .blocks
+        .iter()
+        .any(|block| matches!(block, rars::rar50::Block::Service(service) if service.name == b"RR")));
+    assert_eq!(archive.member_comments(None).unwrap(), vec![Some(b"note".to_vec())]);
+    assert_eq!(archive.member_comment_encryption(), [false]);
+}
+
+#[test]
 fn comments_follow_renames_and_round_trip_through_supported_writers() {
     for version in [
         ArchiveVersion::Rar14,
