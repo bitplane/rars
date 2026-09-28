@@ -1064,14 +1064,11 @@ where
     if first.protected_size != protected_size as u64 {
         return Err(Error::BadRecoveryChunk);
     }
-    if chunks
-        .iter()
-        .any(|chunk| {
-            chunk.plan != first.plan
-                || chunk.protected_size != first.protected_size
-                || chunk.data_shard_states != first.data_shard_states
-        })
-    {
+    if chunks.iter().any(|chunk| {
+        chunk.plan != first.plan
+            || chunk.protected_size != first.protected_size
+            || chunk.data_shard_states != first.data_shard_states
+    }) {
         return Err(Error::BadRecoveryChunk);
     }
 
@@ -2452,6 +2449,57 @@ mod tests {
     }
 
     #[test]
+    fn streamed_recovery_reports_progress_through_completion() {
+        use std::io::Cursor;
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct Progress(Mutex<Vec<(u8, u64)>>);
+        impl crate::WriteProgress for Progress {
+            fn report(&self, event: crate::WriteProgressEvent<'_>) {
+                let item = match event {
+                    crate::WriteProgressEvent::OperationStarted {
+                        total_bytes: Some(total),
+                        ..
+                    } => (0, total),
+                    crate::WriteProgressEvent::Advanced {
+                        completed_bytes, ..
+                    } => (1, completed_bytes),
+                    crate::WriteProgressEvent::OperationFinished {
+                        total_bytes: Some(total),
+                        ..
+                    } => (2, total),
+                    _ => panic!("unexpected recovery progress event"),
+                };
+                self.0.lock().unwrap().push(item);
+            }
+        }
+
+        let body = vec![0x5a; 4096];
+        let progress = Progress::default();
+        let mut output = Vec::new();
+        let result = super::build_streamed_inline_recovery(
+            &mut Cursor::new(&body),
+            body.len() as u64,
+            10,
+            super::RecoveryMemoryMode::Resident,
+            None,
+            &mut output,
+            Some(crate::write_progress::ProgressReporter(&progress)),
+            3,
+        )
+        .unwrap();
+        let events = progress.0.into_inner().unwrap();
+        assert_eq!(events.first(), Some(&(0, result.payload_len)));
+        assert_eq!(events.last(), Some(&(2, result.payload_len)));
+        assert!(events[1..events.len() - 1]
+            .iter()
+            .all(|&(kind, bytes)| kind == 1 && bytes <= result.payload_len));
+        assert!(events.len() > 2);
+        assert_eq!(output.len() as u64, result.payload_len);
+    }
+
+    #[test]
     fn streamed_recovery_matches_the_legacy_writer_byte_for_byte() {
         for &len in RECOVERY_CASES {
             let body = recovery_test_bytes(len, len as u32);
@@ -3003,21 +3051,18 @@ mod tests {
         let mut damaged = prefix.clone();
         damaged[0] ^= 1;
 
-        let short_first = repair_inline_recovery_prefix_shards(
-            prefix.len(),
-            &recovery_data,
-            |range| Ok(damaged[range.start..range.end - 1].to_vec()),
-        );
+        let short_first =
+            repair_inline_recovery_prefix_shards(prefix.len(), &recovery_data, |range| {
+                Ok(damaged[range.start..range.end - 1].to_vec())
+            });
         assert_eq!(short_first, Err(Error::ShardSizeMismatch));
 
         let mut reads = 0;
         let data_shards = plan_inline_recovery(prefix.len() as u64, 20)
             .unwrap()
             .data_shards as usize;
-        let short_second = repair_inline_recovery_prefix_shards(
-            prefix.len(),
-            &recovery_data,
-            |range| {
+        let short_second =
+            repair_inline_recovery_prefix_shards(prefix.len(), &recovery_data, |range| {
                 reads += 1;
                 let end = if reads > data_shards {
                     range.end - 1
@@ -3025,8 +3070,7 @@ mod tests {
                     range.end
                 };
                 Ok(damaged[range.start..end].to_vec())
-            },
-        );
+            });
         assert_eq!(short_second, Err(Error::ShardSizeMismatch));
         assert!(reads > data_shards);
     }
@@ -3184,6 +3228,47 @@ mod tests {
         let repaired = repair_inline_recovery_archive(&archive).unwrap();
 
         assert_eq!(repaired, archive);
+    }
+
+    #[test]
+    fn rar5_archive_repair_rejects_impossible_protected_ranges() {
+        let chunk = build_structural_inline_recovery_data(b"x", 10).unwrap();
+        assert_eq!(
+            repair_inline_recovery_archive(&chunk),
+            Err(Error::BadRecoveryChunk)
+        );
+
+        let mut beyond_end = chunk.clone();
+        let protected_size = beyond_end.len() as u64 + 1;
+        beyond_end[0x22..0x2a].copy_from_slice(&protected_size.to_le_bytes());
+        let crc = crc64_xz(&beyond_end[0x0c..]);
+        beyond_end[0x04..0x0c].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(
+            repair_inline_recovery_archive(&beyond_end),
+            Err(Error::BadRecoveryChunk)
+        );
+    }
+
+    #[test]
+    fn rar5_record_rebuild_checks_resource_and_record_length() {
+        let control = crate::read_control::ReadControl::default();
+        let huge = InlineRecoveryPlan {
+            data_shards: 1,
+            recovery_shards: 1000,
+            group_count: 2_000_000,
+            header_size: 80,
+            shard_size: 2_000_080,
+        };
+        assert_eq!(
+            super::rebuild_inline_recovery_record_with_control(&[], b"x", 0..0, huge, &control),
+            Err(Error::RebuildTooLarge)
+        );
+
+        let plan = plan_inline_recovery(1, 10).unwrap();
+        assert_eq!(
+            super::rebuild_inline_recovery_record_with_control(&[], b"x", 0..0, plan, &control),
+            Err(Error::BadRecoveryChunk)
+        );
     }
 
     #[test]
