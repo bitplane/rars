@@ -1117,7 +1117,10 @@ where
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    let damaged_lookup = damaged_lookup(shard_ranges.len(), &damaged)?;
+    let mut damaged_lookup = vec![false; shard_ranges.len()];
+    for &index in &damaged {
+        damaged_lookup[index] = true;
+    }
 
     for (data_index, range) in shard_ranges.iter().enumerate() {
         poller.check(0).map_err(|_| Error::Cancelled)?;
@@ -1163,17 +1166,6 @@ where
         .zip(repaired)
         .map(|(index, data)| (shard_ranges[index].clone(), data))
         .collect())
-}
-
-fn damaged_lookup(data_count: usize, damaged: &[usize]) -> Result<Vec<bool>> {
-    let mut lookup = vec![false; data_count];
-    for &index in damaged {
-        if index >= data_count {
-            return Err(Error::TooManyDamagedShards);
-        }
-        lookup[index] = true;
-    }
-    Ok(lookup)
 }
 
 fn read_padded_prefix_shard<F>(
@@ -1401,16 +1393,14 @@ fn find_inline_recovery_chunks_with_control(
     while let Some(relative) = repair_marker(&input[offset..], control)? {
         let start = offset + relative;
         if let Ok(chunk) = parse_inline_recovery_chunk_with_control(&input[start..], control) {
-            let shard_size =
-                usize::try_from(chunk.plan.shard_size).map_err(|_| Error::PlanOverflow)?;
-            if input.len().saturating_sub(start) >= shard_size {
-                chunks.push(FoundInlineRecoveryChunk {
-                    offset: start,
-                    chunk,
-                });
-                offset = start + shard_size;
-                continue;
-            }
+            // Parsing already checked that this entire declared shard fits.
+            let shard_size = chunk.plan.shard_size as usize;
+            chunks.push(FoundInlineRecoveryChunk {
+                offset: start,
+                chunk,
+            });
+            offset = start + shard_size;
+            continue;
         }
         check_repair(control)?;
         offset = start + 1;
@@ -1620,9 +1610,6 @@ fn recover_damaged_shards_with_control(
     let mut damaged_lookup = vec![false; data_count];
     for &data_index in damaged {
         poller.check(0).map_err(|_| Error::Cancelled)?;
-        if data_index >= data_count {
-            return Err(Error::TooManyDamagedShards);
-        }
         damaged_lookup[data_index] = true;
     }
 
@@ -2855,6 +2842,27 @@ mod tests {
     }
 
     #[test]
+    fn rar5_recovery_matrix_handles_zero_elimination_factors() {
+        let gf = shared_gf16();
+        assert_eq!(
+            invert_linear_system_matrix(gf, &[vec![1, 0], vec![0, 1]]),
+            Ok(vec![vec![1, 0], vec![0, 1]])
+        );
+    }
+
+    #[test]
+    fn rar5_budgeted_encoder_rejects_invalid_shard_counts() {
+        let allowance = super::Allowance::default();
+        let gf = shared_gf16().view();
+        for (data, recovery) in [(0, 1), (1, 0), (usize::MAX, 1)] {
+            assert_eq!(
+                super::encoder_matrix_with_allowance(data, recovery, &gf, &allowance).unwrap_err(),
+                Error::TooManyShards
+            );
+        }
+    }
+
+    #[test]
     fn rar5_parity_encoder_generates_systematic_recovery_shards() {
         let first = [1, 0, 2, 0, 3, 0, 4, 0];
         let parity = encode_parity_shards(&[&first], 1).unwrap();
@@ -3064,6 +3072,23 @@ mod tests {
         for (name, chunk) in cases {
             assert_eq!(parse(&chunk), Error::BadRecoveryChunk, "{name}");
         }
+    }
+
+    #[test]
+    fn rar5_recovery_scan_ignores_truncated_markers() {
+        for data in [&b""[..], &b"{RB"[..], &b"noise{RB}"[..]] {
+            assert_eq!(
+                repair_inline_recovery_prefix(b"prefix", data),
+                Err(Error::BadRecoveryChunk)
+            );
+        }
+        let valid = build_structural_inline_recovery_data(b"prefix", 10).unwrap();
+        let mut data = b"{RB}".to_vec();
+        data.extend_from_slice(&valid);
+        assert_eq!(
+            repair_inline_recovery_prefix(b"prefix", &data),
+            Ok(b"prefix".to_vec())
+        );
     }
 
     #[test]
