@@ -2485,6 +2485,37 @@ mod tests {
             let expected = if service { "service record" } else { "member 0" };
             assert!(issues.iter().any(|issue| issue.contains(expected)), "{issues:?}");
         }
+
+        let mut builder = crate::Builder::new(crate::ArchiveVersion::Rar50)
+            .store(true)
+            .archive_metadata(None, false, true)
+            .unwrap();
+        builder
+            .add_bytes(b"payload.txt".to_vec(), b"payload bytes".to_vec(), None, None)
+            .unwrap();
+        let crate::Archive::Rar50Plus(mut indexed) =
+            crate::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap()
+        else {
+            panic!("expected RAR5 archive")
+        };
+        assert!(crate::Archive::Rar50Plus(indexed.clone())
+            .rewrite_preservation_issues()
+            .is_empty());
+        let quick_open = indexed
+            .blocks
+            .iter_mut()
+            .find_map(|block| match block {
+                Block::Service(service) if service.name == b"QO" => Some(service),
+                _ => None,
+            })
+            .unwrap();
+        quick_open.block.extra_area_size = Some(unknown.len() as u64);
+        parse_file_extra_area(&unknown, 0..unknown.len(), true, quick_open, &control).unwrap();
+        assert!(!quick_open.rewrite_metadata_complete);
+        assert!(crate::Archive::Rar50Plus(indexed)
+            .rewrite_preservation_issues()
+            .iter()
+            .any(|issue| issue.contains("unsupported derived service")));
     }
 
     #[test]
