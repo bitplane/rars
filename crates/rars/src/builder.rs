@@ -1886,6 +1886,72 @@ fn unix_mode(_metadata: &fs::Metadata) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn rar13_entry_encryption_override_can_clear_the_builder_password() {
+        use crate::{ArchiveReader, ArchiveVersion, Builder};
+
+        for store in [false, true] {
+            let mut builder = Builder::new(ArchiveVersion::Rar13)
+                .store(store)
+                .password(Some(b"default password".to_vec()));
+            builder
+                .add_bytes(b"plain".to_vec(), b"payload".to_vec(), None, None)
+                .unwrap();
+            builder.set_entry_encryption(b"plain", None, None).unwrap();
+            let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+            assert_eq!(
+                archive.read_member(b"plain", None).unwrap().unwrap(),
+                b"payload"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_builder_materializes_only_the_entries_with_sources() {
+        use crate::{ArchiveReader, ArchiveVersion, Builder, EntrySource};
+
+        let mut builder = Builder::new(ArchiveVersion::Rar29).store(true);
+        builder
+            .add_bytes(b"bytes".to_vec(), b"in memory".to_vec(), None, None)
+            .unwrap();
+        builder
+            .add_source(
+                b"source".to_vec(),
+                EntrySource::from_bytes(b"from source".as_slice()),
+                None,
+                None,
+            )
+            .unwrap();
+        let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        assert_eq!(
+            archive.read_member(b"bytes", None).unwrap().unwrap(),
+            b"in memory"
+        );
+        assert_eq!(
+            archive.read_member(b"source", None).unwrap().unwrap(),
+            b"from source"
+        );
+    }
+
+    #[test]
+    fn retained_unpack_version_cannot_be_written_to_legacy_volumes() {
+        use crate::{ArchiveVersion, Builder, Error};
+
+        let mut builder = Builder::new(ArchiveVersion::Rar29)
+            .store(true)
+            .volume_size(Some(64))
+            .legacy_unpack_version(Some(29));
+        builder
+            .add_bytes(b"file".to_vec(), b"data".to_vec(), None, None)
+            .unwrap();
+        assert_eq!(
+            builder.build_volumes(None).unwrap_err(),
+            Error::InvalidArgument(
+                "retained legacy unpacker version requires single-archive output"
+            )
+        );
+    }
+
+    #[test]
     fn replacing_source_keeps_metadata_and_refuses_entry_kind_changes() {
         use crate::{ArchiveReader, ArchiveVersion, Builder, EntrySource, ErrorKind};
         let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
