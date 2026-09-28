@@ -7298,23 +7298,28 @@ fn decodes_node_unrar_js_utf16_archive_comment() {
 
 #[test]
 fn rejects_split_rar15_40_entries_until_volume_reassembly_exists() {
-    let bytes = std::fs::read(fixture("rar300/multivol_oldnaming_rar300.rar")).unwrap();
-    let archive = Archive::parse(&bytes).unwrap();
-
-    assert!(matches!(
-        collect_extract(&archive),
-        Err(Error::InvalidHeader(
-            "RAR 1.5 split entry requires multivolume extraction"
-        ))
-    ));
-    assert!(matches!(
-        archive.extract_to_parallel_buffered(ArchiveReadOptions::new(), |_| {
-            Ok(Box::new(std::io::sink()))
-        }),
-        Err(Error::InvalidHeader(
-            "RAR 1.5 split entry requires multivolume extraction"
-        ))
-    ));
+    for (path, split_before) in [
+        ("rar300/multivol_oldnaming_rar300.rar", false),
+        ("rar300/multivol_oldnaming_rar300.r00", true),
+    ] {
+        let bytes = std::fs::read(fixture(path)).unwrap();
+        let archive = Archive::parse(&bytes).unwrap();
+        assert_eq!(archive.files().next().unwrap().is_split_before(), split_before);
+        assert!(matches!(
+            collect_extract(&archive),
+            Err(Error::InvalidHeader(
+                "RAR 1.5 split entry requires multivolume extraction"
+            ))
+        ));
+        assert!(matches!(
+            archive.extract_to_parallel_buffered(ArchiveReadOptions::new(), |_| {
+                Ok(Box::new(std::io::sink()))
+            }),
+            Err(Error::InvalidHeader(
+                "RAR 1.5 split entry requires multivolume extraction"
+            ))
+        ));
+    }
 }
 
 #[test]
