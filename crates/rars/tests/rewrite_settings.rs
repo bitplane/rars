@@ -82,6 +82,37 @@ fn preserving_builder_keeps_rar20_unpacker_26() {
 }
 
 #[test]
+fn retained_legacy_comment_metadata_requires_the_comment_to_be_copied() {
+    let mut builder = Builder::new(ArchiveVersion::Rar30)
+        .store(true)
+        .comment(Some(b"archive note".to_vec()));
+    builder
+        .add_bytes(b"source".to_vec(), b"payload".to_vec(), None, None)
+        .unwrap();
+    let source = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    assert!(source.rewrite_preservation_issues().is_empty());
+
+    let mut preserving = source.preserving_builder(None).unwrap();
+    preserving
+        .add_bytes(b"source".to_vec(), b"payload".to_vec(), None, None)
+        .unwrap();
+    assert!(matches!(
+        preserving.to_bytes(),
+        Err(rars::Error::InvalidArgument(
+            "retained archive comment metadata requires a RAR3/4 archive comment"
+        ))
+    ));
+    let output = ArchiveReader::read_owned(
+        preserving
+            .comment(Some(b"archive note".to_vec()))
+            .to_bytes()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(output.comment(None).unwrap(), Some(b"archive note".to_vec()));
+}
+
+#[test]
 fn preserving_builder_keeps_rar7_compression_version() {
     use rars::{rar50, EntrySource, FeatureSet};
 
