@@ -1859,11 +1859,8 @@ fn encode_filtered_payload(
     // be coded against a dictionary its own flags told the decoder to discard.
     let mut last = 0usize;
     let mut advance = |position: usize| {
-        if position < last {
-            last = 0;
-        }
         let delta = position.saturating_sub(last);
-        last = position;
+        last = last.max(position);
         progress.is_none_or(|work| work.advance(delta as u64))
     };
     let packed = match policy {
