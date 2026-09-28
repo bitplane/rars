@@ -2646,7 +2646,8 @@ pub(crate) fn decode_file_name(raw: &[u8], flags: u16) -> Vec<u8> {
                 units.push((u16::from(high) << 8) | u16::from(low));
                 dst_pos += 1;
             }
-            3 => {
+            // The mode is the top two bits of a byte, so this is mode 3.
+            _ => {
                 let Some(&length_byte) = encoded.get(pos) else {
                     return raw.to_vec();
                 };
@@ -2669,7 +2670,6 @@ pub(crate) fn decode_file_name(raw: &[u8], flags: u16) -> Vec<u8> {
                     dst_pos += 1;
                 }
             }
-            _ => unreachable!("2-bit filename mode"),
         }
     }
 
