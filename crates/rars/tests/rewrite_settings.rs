@@ -195,6 +195,15 @@ fn preservation_preflight_refuses_metadata_it_cannot_rewrite() {
         "main header metadata",
     );
     check(|archive| archive.main.archive_flags |= 1, "volume layout");
+    check(|archive| archive.main.volume_number = Some(1), "volume layout");
+    check(
+        |archive| archive.main.block.flags |= 2,
+        "main header metadata",
+    );
+    check(
+        |archive| archive.main.block.data_size = Some(1),
+        "main header metadata",
+    );
     check(
         |archive| archive.main.archive_flags |= 8,
         "recovery flag and service disagree",
@@ -226,6 +235,22 @@ fn preservation_preflight_refuses_metadata_it_cannot_rewrite() {
     check(
         |archive| {
             if let rar50::Block::File(file) = &mut archive.blocks[0] {
+                file.file_flags |= 8;
+            }
+        },
+        "unsupported, duplicate or incomplete metadata",
+    );
+    check(
+        |archive| {
+            if let rar50::Block::File(file) = &mut archive.blocks[0] {
+                file.compression_info |= 1 << 21;
+            }
+        },
+        "unsupported, duplicate or incomplete metadata",
+    );
+    check(
+        |archive| {
+            if let rar50::Block::File(file) = &mut archive.blocks[0] {
                 file.compression_info = (file.compression_info & !0x3f) | 2;
             }
         },
@@ -243,6 +268,22 @@ fn preservation_preflight_refuses_metadata_it_cannot_rewrite() {
         |archive| {
             if let rar50::Block::End(end) = archive.blocks.last_mut().unwrap() {
                 end.flags = 1;
+            }
+        },
+        "end header flags",
+    );
+    check(
+        |archive| {
+            if let rar50::Block::End(end) = archive.blocks.last_mut().unwrap() {
+                end.block.flags = 1;
+            }
+        },
+        "end header flags",
+    );
+    check(
+        |archive| {
+            if let rar50::Block::End(end) = archive.blocks.last_mut().unwrap() {
+                end.block.header_size = 4;
             }
         },
         "end header flags",
@@ -307,6 +348,138 @@ fn preservation_preflight_checks_derived_service_and_locator_consistency() {
         .rewrite_preservation_issues()
         .iter()
         .any(|issue| issue.contains("quick-open index with encrypted headers")));
+}
+
+#[test]
+fn preservation_preflight_checks_every_derived_service_field() {
+    use rars::{rar50, Archive, FileTimes, FileTimestamp};
+
+    let mut builder = Builder::new(ArchiveVersion::Rar50)
+        .store(true)
+        .recovery_percent(Some(5))
+        .archive_metadata(None, false, true)
+        .unwrap();
+    builder
+        .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+        .unwrap();
+    let Archive::Rar50Plus(seed) = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap()
+    else {
+        unreachable!()
+    };
+    let check = |name: &[u8], mutate: fn(&mut rar50::FileHeader)| {
+        let mut candidate = seed.clone();
+        let service = candidate
+            .blocks
+            .iter_mut()
+            .find_map(|block| match block {
+                rar50::Block::Service(service) if service.name == name => Some(service),
+                _ => None,
+            })
+            .unwrap();
+        mutate(service);
+        let issues = Archive::Rar50Plus(candidate).rewrite_preservation_issues();
+        assert!(
+            issues.iter().any(|issue| issue.contains("unsupported derived service")),
+            "{name:?}: {issues:?}"
+        );
+    };
+    let q = b"QO";
+    check(q, |service| service.encrypted = true);
+    check(q, |service| service.mtime = Some(1));
+    check(q, |service| {
+        service.file_times = Some(FileTimes {
+            modified: Some(FileTimestamp::Unix {
+                seconds: 1,
+                nanoseconds: 0,
+            }),
+            ..FileTimes::default()
+        });
+    });
+    check(q, |service| service.file_flags |= 8);
+    check(q, |service| service.block.flags |= 4);
+    check(q, |service| service.attributes = 1);
+    check(q, |service| service.host_os = 1);
+    check(q, |service| service.compression_info = 1);
+    check(b"RR", |service| service.service_data = Some(vec![0]));
+
+    let mut duplicate = seed.clone();
+    let service = duplicate
+        .blocks
+        .iter()
+        .find(|block| matches!(block, rar50::Block::Service(service) if service.name == q))
+        .unwrap()
+        .clone();
+    duplicate.blocks.push(service);
+    assert!(Archive::Rar50Plus(duplicate)
+        .rewrite_preservation_issues()
+        .iter()
+        .any(|issue| issue.contains("unsupported derived service")));
+}
+
+#[test]
+fn preservation_preflight_checks_comment_service_metadata_and_duplicates() {
+    use rars::{rar50, Archive, FileTimes, FileTimestamp};
+
+    let mut builder = Builder::new(ArchiveVersion::Rar50)
+        .store(true)
+        .comment(Some(b"comment".to_vec()));
+    builder
+        .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+        .unwrap();
+    let Archive::Rar50Plus(seed) = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap()
+    else {
+        unreachable!()
+    };
+    assert!(Archive::Rar50Plus(seed.clone())
+        .rewrite_preservation_issues()
+        .is_empty());
+    let check = |mutate: fn(&mut rar50::FileHeader)| {
+        let mut candidate = seed.clone();
+        let service = candidate
+            .blocks
+            .iter_mut()
+            .find_map(|block| match block {
+                rar50::Block::Service(service) if service.name == b"CMT" => Some(service),
+                _ => None,
+            })
+            .unwrap();
+        mutate(service);
+        let issues = Archive::Rar50Plus(candidate).rewrite_preservation_issues();
+        assert!(
+            issues.iter().any(|issue| issue.contains("service record")),
+            "{issues:?}"
+        );
+    };
+    check(|service| service.name = b"OTHER".to_vec());
+    check(|service| service.mtime = Some(1));
+    check(|service| {
+        service.file_times = Some(FileTimes {
+            modified: Some(FileTimestamp::Unix {
+                seconds: 1,
+                nanoseconds: 0,
+            }),
+            ..FileTimes::default()
+        });
+    });
+    check(|service| service.file_flags |= 8);
+    check(|service| service.block.flags |= 4);
+    check(|service| service.attributes = 1);
+    check(|service| service.host_os = 1);
+    check(|service| service.compression_info |= 1 << 15);
+    check(|service| service.compression_info |= 1);
+
+    let mut duplicate = seed;
+    let index = duplicate
+        .blocks
+        .iter()
+        .position(|block| matches!(block, rar50::Block::Service(service) if service.name == b"CMT"))
+        .unwrap();
+    let service = duplicate.blocks[index].clone();
+    duplicate.blocks.insert(index + 1, service);
+    assert!(Archive::Rar50Plus(duplicate)
+        .rewrite_preservation_issues()
+        .iter()
+        .any(|issue| issue.contains("service record")));
 }
 
 #[test]
