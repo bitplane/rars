@@ -1004,6 +1004,12 @@ mod tests {
             resources.acquire_cancellable(1, 0, &|| true),
             Err(Error::Cancelled)
         ));
+        assert!(matches!(
+            resources.acquire_serialising_cancellable(1, &|| {
+                panic!("pre-cancelled resources called the progress callback")
+            }),
+            Err(Error::Cancelled)
+        ));
         assert_eq!(resources.workspace_in_use(), 0);
     }
 
