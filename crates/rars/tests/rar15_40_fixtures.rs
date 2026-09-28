@@ -494,6 +494,49 @@ fn rar29_level_zero_stores_even_with_a_filter_policy() {
 }
 
 #[test]
+fn solid_rar29_writer_respects_forced_lz_and_ppmd_engines() {
+    let mut features = FeatureSet::store_only();
+    features.solid = true;
+    let payload = b"solid engine choice repeats this phrase across members\n".repeat(256);
+    let entries = [
+        FileEntry {
+            name: b"first.txt",
+            data: &payload,
+            file_time: 0,
+            file_attr: 0x20,
+            host_os: 3,
+            password: None,
+            file_comment: None,
+        },
+        FileEntry {
+            name: b"second.txt",
+            data: &payload,
+            file_time: 0,
+            file_attr: 0x20,
+            host_os: 3,
+            password: None,
+            file_comment: None,
+        },
+    ];
+    for method in [Rar29Method::Lz, Rar29Method::Ppmd] {
+        let options = WriterOptions::new(ArchiveVersion::Rar29, features).with_method(method);
+        let bytes = write_compressed_archive(&entries, options).unwrap();
+        let archive = Archive::parse(&bytes).unwrap();
+        let files: Vec<_> = archive.files().collect();
+        assert_eq!(files.len(), 2);
+        assert_ne!(files[0].method, 0x30, "{method:?}");
+        assert!(files[1].is_solid(), "{method:?}");
+        for file in &files {
+            let packed = file.packed_data(&archive).unwrap();
+            assert_eq!(packed[0] & 0x80 != 0, method == Rar29Method::Ppmd);
+        }
+        for member in collect_extract(&archive).unwrap() {
+            assert_eq!(member.data, payload, "{method:?}");
+        }
+    }
+}
+
+#[test]
 fn generated_rar29_auto_filtered_archive_round_trips() {
     let payload = b"\xe8\0\0\0\0rar29 auto filtered payload\n".repeat(16);
     let entries = [FileEntry {
