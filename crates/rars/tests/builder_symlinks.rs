@@ -136,6 +136,38 @@ fn preflight_rejects_unsupported_redirections_and_inconsistent_link_headers() {
 }
 
 #[test]
+fn zero_size_rar5_unix_link_header_preserves_its_target() {
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    builder
+        .add_unix_symlink(b"link".to_vec(), b"target".to_vec(), false, None, None)
+        .unwrap();
+    let mut source = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    let rars::Archive::Rar50Plus(archive) = &mut source else {
+        unreachable!()
+    };
+    let file = archive
+        .blocks
+        .iter_mut()
+        .find_map(|block| match block {
+            rars::rar50::Block::File(file) => Some(file),
+            _ => None,
+        })
+        .unwrap();
+    file.unpacked_size = 0;
+
+    let member = source.members().next().unwrap();
+    assert_eq!(member.unix_symlink().unwrap().target_name, b"target");
+    assert!(source.rewrite_preservation_issues().is_empty());
+    let mut rewritten = source.preserving_builder(None).unwrap();
+    rewritten.add_archive_redirection(&member).unwrap();
+    let output = ArchiveReader::read_owned(rewritten.to_bytes().unwrap()).unwrap();
+    assert_eq!(
+        output.members().next().unwrap().unix_symlink().unwrap().target_name,
+        b"target"
+    );
+}
+
+#[test]
 fn links_survive_solid_and_encrypted_output_and_unix_byte_mapping() {
     for solid in [false, true] {
         let mut builder = Builder::new(ArchiveVersion::Rar50)
