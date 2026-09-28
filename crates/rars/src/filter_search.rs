@@ -1541,6 +1541,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dense_x86_code_uses_a_whole_member_finalist() {
+        let data = calls_to_fixed_addresses(256 * 1024);
+        let regions = x86_code_regions(&data);
+        let screen = x86_screened_regions(&FULL, &data, &regions, options()).unwrap();
+        assert!(!screen.rejected_a_region, "{regions:?}");
+        let finalists = x86_finalists(&data, &screen);
+        assert!(!finalists.is_empty());
+        assert!(finalists
+            .iter()
+            .all(|specs| specs.iter().all(|spec| spec.range.is_none())));
+    }
+
     /// And the member as a whole has to come out smaller for it.
     #[test]
     fn the_search_filters_the_code_in_an_unstripped_binary() {
