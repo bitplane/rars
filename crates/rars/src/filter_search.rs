@@ -1652,7 +1652,10 @@ mod tests {
                 &self.0
             }
             fn screened_kinds(&self, _: &[u8]) -> Result<Buffer<FilterKind, Self::Memory>> {
-                Ok(Buffer::collect([FilterKind::Delta { channels: 3 }], &self.0)?)
+                Ok(Buffer::collect(
+                    [1, 2, 3].map(|channels| FilterKind::Delta { channels }),
+                    &self.0,
+                )?)
             }
             fn detects_x86(&self) -> bool {
                 false
@@ -1691,7 +1694,7 @@ mod tests {
 
         let run = |budget: &RefusingBudget| -> Result<()> {
             let finalists = super::finalists(&DeltaSearch(budget.clone()), &[0; 512], ())?;
-            assert_eq!(finalists.len(), 3);
+            assert_eq!(finalists.len(), 7);
             assert!(finalists[1].0[0].range.is_none());
             assert!(finalists[2].0[0].range.is_some());
             Ok(())
