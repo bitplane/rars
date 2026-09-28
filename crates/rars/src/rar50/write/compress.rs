@@ -1290,6 +1290,7 @@ mod tests {
         struct StopAfterFirst {
             finished: AtomicBool,
             checks_after_finish: AtomicUsize,
+            resource_cancellation: Option<crate::WriteCancellation>,
         }
         impl CompressionProgress for StopAfterFirst {
             fn advance(&self, _: u64) -> bool {
@@ -1298,8 +1299,18 @@ mod tests {
             fn is_cancelled(&self) -> bool {
                 // Let the completed wave return its result, then cancel at
                 // the coordinator's check before admitting the next wave.
-                self.finished.load(Ordering::SeqCst)
-                    && self.checks_after_finish.fetch_add(1, Ordering::SeqCst) != 0
+                if !self.finished.load(Ordering::SeqCst) {
+                    return false;
+                }
+                if self.checks_after_finish.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return false;
+                }
+                if let Some(token) = &self.resource_cancellation {
+                    token.cancel();
+                    false
+                } else {
+                    true
+                }
             }
             fn finished(&self, index: usize, _: u64) {
                 if index == 0 {
@@ -1319,27 +1330,38 @@ mod tests {
             filter_policy: FilterPolicy::Auto,
             candidates: vec![options].into(),
         };
-        let first = EntrySource::from_bytes(b"first".to_vec());
-        let second = EntrySource::from_opener(6, || {
-            panic!("cancellation between waves must not open the next source")
-        });
         let scratch = crate::scratch::case("whole-member-cancel-between-waves");
-        let resources = WriterResources::new(80 * 1024 * 1024).with_temp_dir(&*scratch);
-        let progress = StopAfterFirst {
-            finished: AtomicBool::new(false),
-            checks_after_finish: AtomicUsize::new(0),
-        };
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(1)
             .build()
             .unwrap();
-        let result = pool.install(|| {
-            compress_members_reporting(&[first, second], plan, &resources, &progress)
-        });
-        assert!(matches!(result, Err(Error::Cancelled)), "{:?}", result.err());
-        assert!(progress.is_cancelled());
-        assert_eq!(resources.workspace_in_use(), 0);
-        assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
+        for resource_cancellation in [false, true] {
+            let first = EntrySource::from_bytes(b"first".to_vec());
+            let second = EntrySource::from_opener(6, || {
+                panic!("cancellation between waves must not open the next source")
+            });
+            let token = resource_cancellation.then(crate::WriteCancellation::new);
+            let mut resources = WriterResources::new(80 * 1024 * 1024).with_temp_dir(&*scratch);
+            if let Some(token) = &token {
+                resources = resources.with_cancellation(token.clone());
+            }
+            let progress = StopAfterFirst {
+                finished: AtomicBool::new(false),
+                checks_after_finish: AtomicUsize::new(0),
+                resource_cancellation: token.clone(),
+            };
+            let result = pool.install(|| {
+                compress_members_reporting(&[first, second], plan.clone(), &resources, &progress)
+            });
+            assert!(matches!(result, Err(Error::Cancelled)), "{:?}", result.err());
+            if let Some(token) = &token {
+                assert!(token.is_cancelled());
+            } else {
+                assert!(progress.is_cancelled());
+            }
+            assert_eq!(resources.workspace_in_use(), 0);
+            assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
+        }
     }
 
     struct Cancelled;
