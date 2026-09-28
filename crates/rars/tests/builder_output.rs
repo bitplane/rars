@@ -52,6 +52,52 @@ fn resource_aware_byte_output_matches_the_standard_builder_path() {
 }
 
 #[test]
+fn header_encryption_uses_a_shared_entry_password_without_a_builder_default() {
+    let mut builder = Builder::new(ArchiveVersion::Rar50)
+        .store(true)
+        .header_encryption(true);
+    builder
+        .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+        .unwrap();
+    builder
+        .set_entry_encryption(b"file", Some(b"secret".to_vec()), None)
+        .unwrap();
+    let archive = ArchiveReader::read_owned_with_options(
+        builder.to_bytes().unwrap(),
+        rars::ArchiveReadOptions::with_password(b"secret"),
+    )
+    .unwrap();
+    assert_eq!(
+        archive.read_member(b"file", Some(b"secret")).unwrap().unwrap(),
+        b"payload"
+    );
+}
+
+#[test]
+fn missing_header_password_fails_before_reading_a_source() {
+    let mut builder = Builder::new(ArchiveVersion::Rar50)
+        .store(true)
+        .header_encryption(true);
+    builder
+        .add_source(
+            b"file".to_vec(),
+            EntrySource::from_opener(7, || panic!("password error must precede source I/O")),
+            None,
+            None,
+        )
+        .unwrap();
+    assert_eq!(builder.to_bytes().unwrap_err(), rars::Error::NeedPassword);
+    let mut output = Vec::new();
+    assert_eq!(
+        builder
+            .write_to(&mut output, &rars::WriterResources::default(), None)
+            .unwrap_err(),
+        rars::Error::NeedPassword
+    );
+    assert!(output.is_empty());
+}
+
+#[test]
 fn failed_builder_writes_preserve_the_destination_and_remove_staging_files() {
     for existing in [false, true] {
         let root = scratch::case("builder-failed-write");

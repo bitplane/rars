@@ -1146,10 +1146,7 @@ impl Builder {
         progress: Option<&dyn WriteProgress>,
     ) -> Result<()> {
         self.check_single()?;
-        if self.streams_rar50()
-            || (resources.max_memory_bytes().is_some()
-                && self.format.family() == ArchiveFamily::Rar50Plus)
-        {
+        if self.streams_rar50() {
             return self.write_streaming_rar50(output, resources, progress);
         }
         if resources.max_preparation_bytes().is_some() || resources.max_memory_bytes().is_some() {
@@ -1388,13 +1385,11 @@ impl Builder {
     }
 
     /// Whether writing goes through the streaming RAR 5 writer, which serves
-    /// everything this builder can ask for except volume sets. Header
-    /// encryption without a password is not one of the things it can do, so
-    /// that combination falls back and is rejected by the writer proper.
+    /// everything this builder can ask for except volume sets. It validates
+    /// missing header passwords before opening member sources.
     pub fn streams_rar50(&self) -> bool {
         matches!(self.format, ArchiveVersion::Rar50 | ArchiveVersion::Rar70)
             && self.volume_size.is_none()
-            && (!self.encrypt_headers || self.password.is_some())
     }
 
     fn check_recovery_option(&self) -> Result<()> {
@@ -1457,7 +1452,7 @@ impl Builder {
 
     fn build_single(&self, progress: Option<&dyn WriteProgress>) -> Result<Vec<u8>> {
         match self.format.family() {
-            ArchiveFamily::Rar50Plus => self.build_rar50_single(progress),
+            ArchiveFamily::Rar50Plus => unreachable!("RAR 5/7 use the streaming writer"),
             ArchiveFamily::Rar15To40 => self.build_rar15_single(progress),
             ArchiveFamily::Rar13 => self.build_rar13_single(progress),
         }
@@ -1494,12 +1489,6 @@ impl Builder {
         } else {
             rar50::FilterPolicy::Auto
         }
-    }
-
-    fn rar50_entries(&self) -> Result<Vec<rar50::ArchiveEntry>> {
-        Ok(self
-            .rar50_entries_with_resources(&WriterResources::default())?
-            .entries)
     }
 
     fn rar50_entries_with_resources(
@@ -1629,23 +1618,6 @@ impl Builder {
             progress,
             output,
         )
-    }
-
-    fn build_rar50_single(&self, progress: Option<&dyn WriteProgress>) -> Result<Vec<u8>> {
-        let writer = rar50::Rar50Writer::new(self.rar50_options());
-        let writer = match progress {
-            Some(progress) => writer.progress(progress),
-            None => writer,
-        };
-        let writer = writer
-            .entries(self.rar50_entries()?)
-            .filter_policy(self.rar50_filter_policy())
-            .recovery_percent(self.recovery_percent);
-        let writer = match (self.comment.as_deref(), self.comment_password.as_deref()) {
-            (Some(comment), Some(password)) => writer.encrypted_archive_comment(comment, password),
-            (comment, _) => writer.archive_comment(comment),
-        };
-        writer.finish()
     }
 
     fn rar15_options(&self) -> rar15_40::WriterOptions {
