@@ -1640,6 +1640,19 @@ mod tests {
     }
 
     #[test]
+    fn matching_table_strides_do_not_merge_across_a_non_table_gap() {
+        let mut data = reloc_table(4096);
+        let first_end = data.len();
+        data.extend(incompressible(2 * TABLE_SCAN_WINDOW));
+        let second_start = data.len();
+        data.extend(reloc_table(4096));
+        let regions = delta_table_regions(&data, MAX_TABLE_STRIDE);
+        assert_eq!(regions.len(), 2, "{regions:?}");
+        assert_eq!(regions[0], (0..first_end, 24));
+        assert_eq!(regions[1], (second_start..data.len(), 24));
+    }
+
+    #[test]
     fn text_and_random_bytes_do_not_scan_as_tables() {
         for data in [
             b"the quick brown fox jumps over the lazy dog ".repeat(6_000),
