@@ -5,6 +5,35 @@ use rars::{entry_relative_path, ArchiveReader, ArchiveVersion, Builder, EntrySou
 use std::fs;
 
 #[test]
+fn empty_rar50_builder_writes_a_readable_archive() {
+    let archive =
+        ArchiveReader::read_owned(Builder::new(ArchiveVersion::Rar50).to_bytes().unwrap()).unwrap();
+    assert_eq!(archive.members().count(), 0);
+}
+
+#[test]
+fn single_output_rejects_volume_metadata_before_opening_a_source() {
+    let mut builder = Builder::new(ArchiveVersion::Rar50)
+        .archive_metadata(None, true, false)
+        .unwrap()
+        .volume_size(Some(64));
+    builder
+        .add_source(
+            b"file".to_vec(),
+            EntrySource::from_opener(1, || panic!("single-output refusal opened source")),
+            None,
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        builder.to_bytes().unwrap_err(),
+        rars::Error::InvalidArgument(
+            "archive metadata settings require the RAR5/7 streaming writer"
+        )
+    );
+}
+
+#[test]
 fn legacy_entry_paths_keep_relative_components_and_reject_escape() {
     assert_eq!(
         entry_relative_path(b"folder\\subdir/file.txt").unwrap(),
