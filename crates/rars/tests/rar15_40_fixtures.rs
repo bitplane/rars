@@ -4285,6 +4285,14 @@ fn ppmd_rar29_writer_stamps_the_level_and_still_reads_back_as_ppmd() {
     );
     assert_eq!(file.unp_ver, 29);
     assert_eq!(collect_extract(&archive).unwrap()[0].data, payload);
+
+    let default_route = write_compressed_archive(
+        &entries,
+        WriterOptions::new(ArchiveVersion::Rar29, FeatureSet::store_only())
+            .with_method(Rar29Method::Ppmd),
+    )
+    .unwrap();
+    assert_eq!(default_route, bytes);
 }
 
 #[test]
