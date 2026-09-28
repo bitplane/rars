@@ -297,6 +297,8 @@ impl WriterResources {
             resource: StorageResource::LogicalBytes,
             limit,
             used: Mutex::new(0),
+            #[cfg(test)]
+            refusal: None,
         }));
         self
     }
@@ -321,6 +323,8 @@ impl WriterResources {
             resource: StorageResource::PayloadMemory,
             limit,
             used: Mutex::new(0),
+            #[cfg(test)]
+            refusal: None,
         }));
         self
     }
@@ -340,6 +344,8 @@ impl WriterResources {
             resource: StorageResource::PreparedHeaders,
             limit,
             used: Mutex::new(0),
+            #[cfg(test)]
+            refusal: None,
         }));
         self
     }
@@ -380,8 +386,23 @@ impl WriterResources {
             resource: StorageResource::Preparation,
             limit,
             used: Mutex::new(0),
+            #[cfg(test)]
+            refusal: None,
         }));
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn refuse_preparation_growth_at(
+        self,
+        fail_at: usize,
+    ) -> (Self, Arc<std::sync::atomic::AtomicUsize>) {
+        let mut resources = self.with_max_preparation_bytes(u64::MAX);
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        Arc::get_mut(resources.preparation_budget.as_mut().unwrap())
+            .unwrap()
+            .refusal = Some((attempts.clone(), fail_at));
+        (resources, attempts)
     }
 
     /// The optional shared RAR5/7 engine preparation capacity limit.
@@ -454,6 +475,13 @@ impl WriterResources {
     }
 
     #[cfg(test)]
+    pub(crate) fn preparation_in_use(&self) -> u64 {
+        self.preparation_budget
+            .as_ref()
+            .map_or(0, |budget| *budget.used.lock().unwrap())
+    }
+
+    #[cfg(test)]
     pub(crate) fn acquire(&self, required: u64, dictionary_size: u64) -> Result<MemoryPermit> {
         self.acquire_cancellable(required, dictionary_size, &|| false)
     }
@@ -512,6 +540,8 @@ struct StorageBudget {
     resource: StorageResource,
     limit: u64,
     used: Mutex<u64>,
+    #[cfg(test)]
+    refusal: Option<(Arc<std::sync::atomic::AtomicUsize>, usize)>,
 }
 
 #[derive(Debug)]
@@ -532,6 +562,14 @@ impl StorageCharge {
         let growth = bytes.saturating_sub(self.bytes);
         if growth == 0 {
             return Ok(());
+        }
+        #[cfg(test)]
+        if let Some((attempts, fail_at)) = &self.budget.refusal {
+            if attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == *fail_at {
+                return Err(Error::WriterFailure(
+                    "injected preparation admission failure",
+                ));
+            }
         }
         let mut used = self.budget.used.lock().expect("spool budget lock poisoned");
         let required = used.checked_add(growth);
@@ -1000,6 +1038,22 @@ impl Drop for MemoryPermit {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn preparation_refusal_is_one_shot_and_releases_the_charge() {
+        use super::*;
+        use super::preparation::Bytes;
+        use std::sync::atomic::Ordering;
+
+        let (resources, attempts) = WriterResources::default().refuse_preparation_growth_at(0);
+        assert_eq!(
+            Bytes::zeroed(1, &resources).unwrap_err(),
+            Error::WriterFailure("injected preparation admission failure")
+        );
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(*resources.preparation_budget.as_ref().unwrap().used.lock().unwrap(), 0);
+        drop(Bytes::zeroed(1, &resources).unwrap());
+        assert_eq!(*resources.preparation_budget.as_ref().unwrap().used.lock().unwrap(), 0);
+    }
     #[test]
     fn workspace_admission_reports_preexisting_cancellation_before_budget_checks() {
         use super::*;
