@@ -347,9 +347,7 @@ pub(crate) fn search_applies(data: &[u8]) -> bool {
 
 fn is_text_like(data: &[u8]) -> bool {
     let sample_len = data.len().min(8192);
-    if sample_len == 0 {
-        return false;
-    }
+    // `search_applies` screens empty members before calling this helper.
     let sample = &data[..sample_len];
     let text_bytes = sample
         .iter()
@@ -1253,6 +1251,19 @@ mod tests {
     const FULL: TestSearch = TestSearch {
         cheap_screens: false,
     };
+
+    #[test]
+    fn tiny_scanner_regions_do_not_trigger_sample_encodes() {
+        let data = b"abcdefgh";
+        let region = 0..data.len();
+        let x86 = x86_screened_regions(&FULL, data, std::slice::from_ref(&region), options()).unwrap();
+        assert!(x86.kept.is_empty());
+        assert!(!x86.rejected_a_region);
+        let tables = table_screened_regions(&FULL, data, &[(0..data.len(), 1)], options()).unwrap();
+        assert!(tables.is_empty());
+        assert!(auto_delta_filter_range(data, 0).is_none());
+        assert!(!search_applies(b""));
+    }
 
     fn options() -> EncodeOptions {
         EncodeOptions::new(64).with_max_match_distance(128 * 1024)
