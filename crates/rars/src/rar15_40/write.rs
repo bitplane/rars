@@ -354,8 +354,8 @@ fn write_archive_to(
     if options.dictionary_size.is_none() {
         // A solid run is one stream, so its window has to reach back across the
         // members it already coded; independent members only ever look inside
-        // themselves.
-        let reach = if options.features.solid && coding.compresses() {
+        // themselves. Validation has already rejected solid stored coding.
+        let reach = if options.features.solid {
             total_bytes
         } else {
             largest_member
@@ -413,7 +413,7 @@ fn write_members_to(
 ) -> Result<()> {
     output.write_all(RAR15_SIGNATURE)?;
     let mut main_flags = 0;
-    if options.features.solid && coding.compresses() {
+    if options.features.solid {
         main_flags |= MHD_SOLID;
     }
     if header_password.is_some() {
@@ -435,7 +435,7 @@ fn write_members_to(
 
     // Solid members share one encoder, so they are coded in order. Independent
     // ones are coded a window at a time and written as each window lands.
-    if options.features.solid && coding.compresses() {
+    if options.features.solid {
         let mut solid_encoder = Some(SolidEncoder::for_target(options)?);
         let mut solid_run_has_member = false;
         for member in members {
@@ -1169,7 +1169,7 @@ fn encode_member<'a>(
     // Legacy link targets must not become dependencies of later solid data:
     // reference readers handle links separately from the solid unpacker.
     let coding = if member.is_symlink {
-        if options.features.solid && coding.compresses() {
+        if options.features.solid {
             *solid_encoder = Some(SolidEncoder::for_target(options)?);
         }
         &MemberCoding::Stored

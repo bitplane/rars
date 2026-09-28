@@ -2469,6 +2469,43 @@ fn rar15_solid_level_zero_stores_each_member_without_a_solid_dependency() {
 }
 
 #[test]
+fn stored_writer_refuses_solid_option_before_emitting_members() {
+    let entries = [
+        StoredEntry {
+            name: b"first",
+            data: b"shared shared shared",
+            file_time: 0,
+            file_attr: 0x20,
+            host_os: 0,
+            password: None,
+            file_comment: None,
+        },
+        StoredEntry {
+            name: b"second",
+            data: b"shared shared shared again",
+            file_time: 0,
+            file_attr: 0x20,
+            host_os: 0,
+            password: None,
+            file_comment: None,
+        },
+    ];
+    let mut features = FeatureSet::store_only();
+    features.solid = true;
+    for target in [
+        ArchiveVersion::Rar15,
+        ArchiveVersion::Rar20,
+        ArchiveVersion::Rar29,
+        ArchiveVersion::Rar40,
+    ] {
+        assert!(matches!(
+            write_stored_archive(&entries, WriterOptions::new(target, features)),
+            Err(Error::UnsupportedWriterOption { .. })
+        ), "{target:?}");
+    }
+}
+
+#[test]
 fn later_legacy_solid_level_zero_stores_each_member() {
     let entries = [
         FileEntry {
