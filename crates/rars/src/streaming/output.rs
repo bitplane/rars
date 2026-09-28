@@ -161,6 +161,7 @@ impl Write for VolumeOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rar50::VolumeSink;
 
     #[test]
     fn refused_adapter_copy_keeps_source_charged_and_never_calls_adapter() {
@@ -192,5 +193,61 @@ mod tests {
         assert_eq!(resources.managed_memory_in_use(), 4096);
         assert_eq!(output.into_vec(), copied);
         assert_eq!(resources.managed_memory_in_use(), 0);
+    }
+
+    #[test]
+    fn unbounded_output_copy_and_flush_preserve_bytes() {
+        let mut output = WriterOutput::new(&WriterResources::default());
+        output.write_all(b"payload").unwrap();
+        output.flush().unwrap();
+        assert_eq!(
+            output.copy_with(|bytes| bytes.to_vec()).unwrap(),
+            b"payload"
+        );
+        assert_eq!(output.into_vec(), b"payload");
+    }
+
+    #[test]
+    fn volume_collector_requires_sequential_closed_outputs() {
+        let resources = WriterResources::default();
+        let mut collector = VolumeCollector::new(&resources).unwrap();
+        assert!(matches!(
+            collector.start_volume(1),
+            Err(Error::WriterFailure("nonsequential volume output"))
+        ));
+        let mut output = collector.start_volume(0).unwrap();
+        output.write_all(b"first").unwrap();
+        output.flush().unwrap();
+        assert!(matches!(
+            collector.start_volume(0),
+            Err(Error::WriterFailure("nonsequential volume output"))
+        ));
+        assert!(matches!(
+            collector.finish(),
+            Err(Error::WriterFailure("volume output still open"))
+        ));
+        drop(output);
+
+        let mut collector = VolumeCollector::new(&resources).unwrap();
+        let mut first = collector.start_volume(0).unwrap();
+        first.write_all(b"first").unwrap();
+        drop(first);
+        let mut second = collector.start_volume(1).unwrap();
+        second.write_all(b"second").unwrap();
+        drop(second);
+        let volumes = collector.finish().unwrap();
+        assert_eq!(
+            volumes
+                .copy_with(|parts| parts
+                    .iter()
+                    .map(|part| part.as_bytes().to_vec())
+                    .collect::<Vec<_>>())
+                .unwrap(),
+            [b"first".to_vec(), b"second".to_vec()]
+        );
+        assert_eq!(
+            volumes.into_vec().unwrap(),
+            [b"first".to_vec(), b"second".to_vec()]
+        );
     }
 }
