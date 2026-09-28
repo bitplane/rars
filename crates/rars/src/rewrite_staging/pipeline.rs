@@ -295,4 +295,47 @@ mod tests {
         ));
         assert_eq!(delivery.used.load(Ordering::Relaxed), 0);
     }
+
+    #[test]
+    fn writer_that_never_opens_its_rewrite_source_stops_the_decoder() {
+        let root = crate::scratch::case("rewrite-unused-source");
+        let mut builder = crate::Builder::new(crate::ArchiveVersion::Rar50).store(true);
+        builder
+            .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+        let archive = crate::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        let staging = RewriteStaging {
+            directory: root.to_path_buf(),
+            max_staged_bytes: 7,
+        };
+
+        let value = run(
+            &archive,
+            &[0],
+            ArchiveReadOptions::default(),
+            &staging,
+            None,
+            |sources| {
+                assert_eq!(sources.len(), 1);
+                Ok(17)
+            },
+        )
+        .unwrap();
+        assert_eq!(value, 17);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+
+        assert_eq!(
+            run(
+                &archive,
+                &[0],
+                ArchiveReadOptions::default(),
+                &staging,
+                None,
+                |_sources| -> Result<()> { Err(Error::InvalidArgument("writer refused")) },
+            )
+            .unwrap_err(),
+            Error::InvalidArgument("writer refused")
+        );
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    }
 }
