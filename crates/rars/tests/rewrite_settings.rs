@@ -150,6 +150,14 @@ fn preservation_preflight_refuses_metadata_it_cannot_rewrite() {
     check(
         |archive| {
             if let rar50::Block::File(file) = &mut archive.blocks[0] {
+                file.block.flags |= 0x100;
+            }
+        },
+        "unsupported, duplicate or incomplete metadata",
+    );
+    check(
+        |archive| {
+            if let rar50::Block::File(file) = &mut archive.blocks[0] {
                 file.compression_info = (file.compression_info & !0x3f) | 2;
             }
         },
@@ -231,6 +239,71 @@ fn preservation_preflight_checks_derived_service_and_locator_consistency() {
         .rewrite_preservation_issues()
         .iter()
         .any(|issue| issue.contains("quick-open index with encrypted headers")));
+}
+
+#[test]
+fn legacy_rewrite_helpers_leave_regular_files_without_link_or_modern_metadata() {
+    let mut builder = Builder::new(ArchiveVersion::Rar14).store(true);
+    builder
+        .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+        .unwrap();
+    let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    assert_eq!(archive.member_comment_encryption(), [false]);
+    assert_eq!(archive.legacy_symlink_targets(None).unwrap(), [None]);
+    let member = archive.members().next().unwrap();
+    assert!(member.file_times().unwrap().is_none());
+    assert!(member.unix_symlink().is_none());
+}
+
+#[test]
+fn preserving_builder_retains_encrypted_rar5_archive_comment_settings() {
+    let mut builder = Builder::new(ArchiveVersion::Rar50)
+        .store(true)
+        .comment(Some(b"private comment".to_vec()))
+        .archive_comment_password(Some(b"secret".to_vec()));
+    builder
+        .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+        .unwrap();
+    let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    assert!(archive.rewrite_preservation_issues().is_empty());
+    assert!(matches!(
+        archive.preserving_builder(None),
+        Err(rars::Error::NeedPassword)
+    ));
+    let mut preserving = archive
+        .preserving_builder(Some(b"secret"))
+        .unwrap()
+        .comment(Some(b"private comment".to_vec()));
+    preserving
+        .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+        .unwrap();
+    let output = ArchiveReader::read_owned(preserving.to_bytes().unwrap()).unwrap();
+    assert!(matches!(
+        output.comment(None),
+        Err(rars::Error::NeedPassword)
+    ));
+    assert_eq!(
+        output.comment(Some(b"secret")).unwrap(),
+        Some(b"private comment".to_vec())
+    );
+}
+
+#[test]
+fn preservation_preflight_refuses_volume_layout() {
+    let mut builder = Builder::new(ArchiveVersion::Rar50)
+        .store(true)
+        .volume_size(Some(64));
+    builder
+        .add_bytes(b"file".to_vec(), vec![42; 1024], None, None)
+        .unwrap();
+    let parts = builder.build_volumes(None).unwrap();
+    assert!(parts.len() > 1);
+    let first = ArchiveReader::read_owned(parts[0].clone()).unwrap();
+    assert!(first
+        .rewrite_preservation_issues()
+        .iter()
+        .any(|issue| issue.contains("volume layout")));
+    assert!(first.preserving_builder(None).is_err());
 }
 
 #[test]
@@ -322,6 +395,20 @@ fn metadata_lock_indexes_and_recovery_are_retained_and_regenerated() {
             "{:?}",
             source.rewrite_preservation_issues()
         );
+        if flags == 3 {
+            let mut invalid = source.clone();
+            if let rars::Archive::Rar50Plus(archive) = &mut invalid {
+                for extra in &mut archive.main.extras {
+                    if let MainExtraRecord::ArchiveMetadata(metadata) = extra {
+                        metadata.flags |= 1 << 20;
+                    }
+                }
+            }
+            assert!(invalid
+                .rewrite_preservation_issues()
+                .iter()
+                .any(|issue| issue.contains("unsupported archive metadata")));
+        }
         let mut rewritten = source.preserving_builder(None).unwrap();
         rewritten
             .add_bytes(b"renamed".to_vec(), b"new payload".to_vec(), None, None)

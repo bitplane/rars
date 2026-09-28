@@ -183,6 +183,19 @@ fn retains_windows_links_and_file_copy_records() {
         assert_eq!(actual.meta.unpacked_size, member.meta.unpacked_size);
         assert_eq!(actual.meta.file_attr, member.meta.file_attr);
         if kind >= 4 {
+            let mut broken = output.clone();
+            if let rars::Archive::Rar50Plus(archive) = &mut broken {
+                if let rars::rar50::Block::File(file) = &mut archive.blocks[1] {
+                    file.redirection.as_mut().unwrap().target_name = b"missing".to_vec();
+                }
+            }
+            assert!(
+                broken
+                    .rewrite_preservation_issues()
+                    .iter()
+                    .any(|issue| issue
+                        .contains("missing, forward or inconsistent redirection target"))
+            );
             builder.rename(b"target", b"renamed".to_vec()).unwrap();
             let output = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
             assert_eq!(
