@@ -1,5 +1,25 @@
 use rars::{ArchiveReader, ArchiveVersion, Builder, EntrySource};
 
+fn file_copy_member(name: &[u8], target: &[u8]) -> rars::ArchiveMember {
+    let mut seed = Builder::new(ArchiveVersion::Rar50).store(true);
+    seed.add_unix_symlink(name.to_vec(), target.to_vec(), false, None, None)
+        .unwrap();
+    let archive = ArchiveReader::read_owned(seed.to_bytes().unwrap()).unwrap();
+    let mut copy = archive.members().next().unwrap();
+    copy.meta.host_os = Some(0);
+    copy.meta.file_attr = 0x20;
+    copy.meta.unpacked_size = 7;
+    if let rars::ArchiveMemberDetail::Rar50Plus {
+        redirection: Some(link),
+        ..
+    } = &mut copy.detail
+    {
+        link.redirection_type = 5;
+        link.flags = 0;
+    }
+    copy
+}
+
 #[test]
 fn duplicate_payloads_and_metadata_follow_ids_in_every_family() {
     for format in [
@@ -41,22 +61,7 @@ fn duplicate_payloads_and_metadata_follow_ids_in_every_family() {
 
 #[test]
 fn removing_a_duplicate_cannot_retarget_a_file_copy() {
-    let mut seed = Builder::new(ArchiveVersion::Rar50).store(true);
-    seed.add_unix_symlink(b"copy".to_vec(), b"same".to_vec(), false, None, None)
-        .unwrap();
-    let archive = ArchiveReader::read_owned(seed.to_bytes().unwrap()).unwrap();
-    let mut copy = archive.members().next().unwrap();
-    copy.meta.host_os = Some(0);
-    copy.meta.file_attr = 0x20;
-    copy.meta.unpacked_size = 7;
-    if let rars::ArchiveMemberDetail::Rar50Plus {
-        redirection: Some(link),
-        ..
-    } = &mut copy.detail
-    {
-        link.redirection_type = 5;
-        link.flags = 0;
-    }
+    let copy = file_copy_member(b"copy", b"same");
 
     let mut builder = Builder::new(ArchiveVersion::Rar50)
         .store(true)
@@ -102,22 +107,7 @@ fn removing_a_duplicate_cannot_retarget_a_file_copy() {
 
 #[test]
 fn removing_a_duplicate_ignores_directories_and_unrelated_copies() {
-    let mut seed = Builder::new(ArchiveVersion::Rar50).store(true);
-    seed.add_unix_symlink(b"copy".to_vec(), b"other".to_vec(), false, None, None)
-        .unwrap();
-    let archive = ArchiveReader::read_owned(seed.to_bytes().unwrap()).unwrap();
-    let mut copy = archive.members().next().unwrap();
-    copy.meta.host_os = Some(0);
-    copy.meta.file_attr = 0x20;
-    copy.meta.unpacked_size = 7;
-    if let rars::ArchiveMemberDetail::Rar50Plus {
-        redirection: Some(link),
-        ..
-    } = &mut copy.detail
-    {
-        link.redirection_type = 5;
-        link.flags = 0;
-    }
+    let copy = file_copy_member(b"copy", b"other");
 
     let mut builder = Builder::new(ArchiveVersion::Rar50)
         .store(true)
@@ -144,22 +134,7 @@ fn removing_a_duplicate_ignores_directories_and_unrelated_copies() {
 
 #[test]
 fn renaming_a_duplicate_updates_only_copies_of_that_identity() {
-    let mut seed = Builder::new(ArchiveVersion::Rar50).store(true);
-    seed.add_unix_symlink(b"copy".to_vec(), b"same".to_vec(), false, None, None)
-        .unwrap();
-    let archive = ArchiveReader::read_owned(seed.to_bytes().unwrap()).unwrap();
-    let mut copy = archive.members().next().unwrap();
-    copy.meta.host_os = Some(0);
-    copy.meta.file_attr = 0x20;
-    copy.meta.unpacked_size = 7;
-    if let rars::ArchiveMemberDetail::Rar50Plus {
-        redirection: Some(link),
-        ..
-    } = &mut copy.detail
-    {
-        link.redirection_type = 5;
-        link.flags = 0;
-    }
+    let mut copy = file_copy_member(b"copy", b"same");
 
     let mut builder = Builder::new(ArchiveVersion::Rar50)
         .store(true)
@@ -196,4 +171,23 @@ fn renaming_a_duplicate_updates_only_copies_of_that_identity() {
         let member = output.members().find(|member| member.meta.name == name).unwrap();
         assert_eq!(member.supported_redirection().unwrap().target_name, target);
     }
+}
+
+#[test]
+fn file_copy_validation_ignores_interleaved_unix_symlink() {
+    let copy = file_copy_member(b"copy", b"other");
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    builder
+        .add_bytes(b"other".to_vec(), b"payload".to_vec(), None, None)
+        .unwrap();
+    builder
+        .add_unix_symlink(b"link".to_vec(), b"other".to_vec(), false, None, None)
+        .unwrap();
+    builder.add_archive_redirection(&copy).unwrap();
+
+    let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    assert_eq!(archive.read_member(b"other", None).unwrap().unwrap(), b"payload");
+    let members: Vec<_> = archive.members().collect();
+    assert_eq!(members[1].unix_symlink().unwrap().target_name, b"other");
+    assert_eq!(members[2].supported_redirection().unwrap().target_name, b"other");
 }
