@@ -305,6 +305,24 @@ mod tests {
     }
 
     #[test]
+    fn retained_layout_metadata_obeys_preparation_limit() {
+        let metadata = crate::rar50::ArchiveMetadataRecord {
+            flags: 2,
+            name: None,
+            creation_time: Some(123),
+        };
+        let mut inputs = inputs(0);
+        inputs.quick_open_payload_len = None;
+        inputs.recovery_percent = None;
+        inputs.metadata_record = Some(&metadata);
+        let resources = crate::WriterResources::default().with_max_preparation_bytes(0);
+        assert!(matches!(
+            resolve_layout(&inputs, &resources),
+            Err(Error::WriterPreparationLimitExceeded { limit: 0, .. })
+        ));
+    }
+
+    #[test]
     fn layout_rejects_offset_and_service_length_overflow() {
         let resources = crate::WriterResources::default();
         for (body_len, head_crypt_len, quick_open_payload_len) in [
