@@ -1000,9 +1000,8 @@ impl Rev5VolumeMeta {
         if header_size <= 5 || header_size > 0x100000 {
             return Err(Error::InvalidHeader("RAR 5 REV header size is invalid"));
         }
-        let header_end = 16usize
-            .checked_add(header_size)
-            .ok_or(Error::InvalidHeader("RAR 5 REV header size overflows"))?;
+        // The header-size limit above keeps this sum within usize even on 32-bit hosts.
+        let header_end = 16 + header_size;
         if header_end > input.len() {
             return Err(Error::TooShort);
         }
@@ -1040,13 +1039,8 @@ impl Rev5VolumeMeta {
             return Err(Error::InvalidHeader("RAR 5 REV volume number is invalid"));
         }
 
-        let expected_table_len = data_count as usize * 12;
-        let expected_table_end =
-            11usize
-                .checked_add(expected_table_len)
-                .ok_or(Error::InvalidHeader(
-                    "RAR 5 REV metadata table size overflows",
-                ))?;
+        // data_count is u16, so the complete table fits in usize on 32-bit hosts.
+        let expected_table_end = 11 + data_count as usize * 12;
         if body.len() < expected_table_end {
             return Err(Error::InvalidHeader(
                 "RAR 5 REV metadata table size is invalid",

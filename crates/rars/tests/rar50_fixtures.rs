@@ -4893,6 +4893,12 @@ fn rejects_rar50_rev5_header_boundaries_before_reading_payload() {
         Err(Error::InvalidHeader("RAR 5 REV header size is invalid"))
     ));
 
+    invalid_size[12..16].copy_from_slice(&0x10_0001u32.to_le_bytes());
+    assert!(matches!(
+        Rev5VolumeMeta::parse(&invalid_size),
+        Err(Error::InvalidHeader("RAR 5 REV header size is invalid"))
+    ));
+
     let mut truncated_header = original.clone();
     truncated_header[12..16].copy_from_slice(&(original.len() as u32).to_le_bytes());
     assert!(matches!(
@@ -5110,6 +5116,22 @@ fn rejects_rar50_rev5_volume_number_outside_recovery_range() {
     bytes[22] = 0;
     update_rev5_header_crc(&mut bytes);
 
+    assert!(matches!(
+        Rev5Volume::parse(&bytes),
+        Err(Error::InvalidHeader("RAR 5 REV volume number is invalid"))
+    ));
+
+    let mut bytes = std::fs::read(fixture("multivol_rev.part1.rev")).unwrap();
+    bytes[19..21].copy_from_slice(&0u16.to_le_bytes());
+    update_rev5_header_crc(&mut bytes);
+    assert!(matches!(
+        Rev5Volume::parse(&bytes),
+        Err(Error::InvalidHeader("RAR 5 REV volume number is invalid"))
+    ));
+
+    let mut bytes = std::fs::read(fixture("multivol_rev.part1.rev")).unwrap();
+    bytes[21..23].copy_from_slice(&7u16.to_le_bytes());
+    update_rev5_header_crc(&mut bytes);
     assert!(matches!(
         Rev5Volume::parse(&bytes),
         Err(Error::InvalidHeader("RAR 5 REV volume number is invalid"))
