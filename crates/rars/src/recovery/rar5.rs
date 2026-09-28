@@ -204,49 +204,13 @@ pub fn encode_inline_recovery_parity(
     archive_prefix: &[u8],
     recovery_percent: u64,
 ) -> Result<(InlineRecoveryPlan, Vec<Vec<u8>>)> {
-    encode_inline_recovery_parity_with_progress(archive_prefix, recovery_percent, None, 1)
-}
-
-fn encode_inline_recovery_parity_with_progress(
-    archive_prefix: &[u8],
-    recovery_percent: u64,
-    progress: Option<ProgressReporter<'_>>,
-    pass: usize,
-) -> Result<(InlineRecoveryPlan, Vec<Vec<u8>>)> {
     let plan = plan_inline_recovery(archive_prefix.len() as u64, recovery_percent)?;
     let shards = split_prefix_shards(archive_prefix, plan)?;
     let shard_refs: Vec<&[u8]> = shards.iter().map(Vec::as_slice).collect();
-    let total_bytes = plan.payload_size()?;
-    if let Some(progress) = progress {
-        progress.report(WriteProgressEvent::OperationStarted {
-            operation: WriteOperation::Recovery,
-            total_bytes: Some(total_bytes),
-            total_entries: None,
-            pass,
-        });
-    }
-    let parity = encode_parity_shards_with_progress(
+    let parity = encode_parity_shards(
         &shard_refs,
         usize::try_from(plan.recovery_shards).map_err(|_| Error::PlanOverflow)?,
-        |completed| {
-            if let Some(progress) = progress {
-                progress.report(WriteProgressEvent::Advanced {
-                    operation: WriteOperation::Recovery,
-                    completed_bytes: completed,
-                    total_bytes,
-                    pass,
-                });
-            }
-        },
     )?;
-    if let Some(progress) = progress {
-        progress.report(WriteProgressEvent::OperationFinished {
-            operation: WriteOperation::Recovery,
-            total_bytes: Some(total_bytes),
-            total_entries: None,
-            pass,
-        });
-    }
     Ok((plan, parity))
 }
 
@@ -1926,14 +1890,6 @@ pub fn make_encoder_matrix(data_shards: usize, recovery_shards: usize) -> Result
 }
 
 pub fn encode_parity_shards(data: &[&[u8]], recovery_shards: usize) -> Result<Vec<Vec<u8>>> {
-    encode_parity_shards_with_progress(data, recovery_shards, |_| {})
-}
-
-fn encode_parity_shards_with_progress(
-    data: &[&[u8]],
-    recovery_shards: usize,
-    mut progress: impl FnMut(u64),
-) -> Result<Vec<Vec<u8>>> {
     let Some(first) = data.first() else {
         return Err(Error::TooManyShards);
     };
@@ -1957,7 +1913,6 @@ fn encode_parity_shards_with_progress(
             parity[recovery_index][word_offset..word_offset + 2]
                 .copy_from_slice(&symbol.to_le_bytes());
         }
-        progress(((recovery_index + 1) * first.len()) as u64);
     }
     Ok(parity)
 }
