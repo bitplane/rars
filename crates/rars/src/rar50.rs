@@ -918,11 +918,6 @@ impl Archive {
         let data_repaired = !repaired_shards.is_empty();
         for (range, data) in repaired_shards {
             control.check()?;
-            if range.start < cursor || range.end > prefix_len || range.len() != data.len() {
-                return Err(Error::InvalidHeader(
-                    "RAR 5 recovery shard range is invalid",
-                ));
-            }
             self.copy_repair_range(
                 prefix_start + cursor..prefix_start + range.start,
                 writer,
