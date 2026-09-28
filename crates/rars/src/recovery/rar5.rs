@@ -2338,6 +2338,105 @@ mod tests {
     }
 
     #[test]
+    fn streamed_recovery_reports_parity_sink_failure_after_header() {
+        use super::{streamed_recovery_with_allowance, Allowance, RecoveryMemoryMode};
+        use std::io::{Cursor, Write};
+
+        struct HeaderOnlySink {
+            header_len: usize,
+            written: usize,
+        }
+        impl Write for HeaderOnlySink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.written == self.header_len {
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+                let count = bytes.len().min(self.header_len - self.written);
+                self.written += count;
+                Ok(count)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let body = vec![0x5a; 4096];
+        let plan = plan_inline_recovery(body.len() as u64, 10).unwrap();
+        for mode in [
+            RecoveryMemoryMode::Resident,
+            RecoveryMemoryMode::Striped { stripe_len: 64 },
+        ] {
+            let allowance = Allowance::limited(2 * 1048576);
+            let mut sink = HeaderOnlySink {
+                header_len: plan.header_size as usize,
+                written: 0,
+            };
+            let error = streamed_recovery_with_allowance(
+                &mut Cursor::new(&body),
+                body.len() as u64,
+                plan,
+                mode,
+                Some(&mut Cursor::new(Vec::new())),
+                &mut sink,
+                None,
+                0,
+                &allowance,
+            )
+            .unwrap_err();
+            assert_eq!(error, Error::Io(std::io::ErrorKind::BrokenPipe));
+            assert_eq!(sink.written, plan.header_size as usize);
+            assert_eq!(allowance.used(), 0);
+        }
+    }
+
+    #[test]
+    fn striped_recovery_reports_scratch_read_failure_before_output() {
+        use super::{streamed_recovery_with_allowance, Allowance, RecoveryMemoryMode};
+        use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+
+        struct UnreadableScratch(Cursor<Vec<u8>>);
+        impl Read for UnreadableScratch {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        impl Write for UnreadableScratch {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.write(bytes)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.0.flush()
+            }
+        }
+        impl Seek for UnreadableScratch {
+            fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+                self.0.seek(pos)
+            }
+        }
+
+        let body = vec![0x5a; 4096];
+        let plan = plan_inline_recovery(body.len() as u64, 10).unwrap();
+        let allowance = Allowance::limited(2 * 1048576);
+        let mut output = Vec::new();
+        let error = streamed_recovery_with_allowance(
+            &mut Cursor::new(&body),
+            body.len() as u64,
+            plan,
+            RecoveryMemoryMode::Striped { stripe_len: 64 },
+            Some(&mut UnreadableScratch(Cursor::new(Vec::new()))),
+            &mut output,
+            None,
+            0,
+            &allowance,
+        )
+        .unwrap_err();
+        assert_eq!(error, Error::Io(std::io::ErrorKind::BrokenPipe));
+        assert!(output.is_empty());
+        assert_eq!(allowance.used(), 0);
+    }
+
+    #[test]
     fn streamed_recovery_matches_the_legacy_writer_byte_for_byte() {
         for &len in RECOVERY_CASES {
             let body = recovery_test_bytes(len, len as u32);
