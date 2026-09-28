@@ -2156,7 +2156,7 @@ fn repair_newsub_recovery_bytes(
     let mut damaged = Vec::new();
     for index in 0..protected_sectors {
         control.check()?;
-        let sector = protected_sector(source, protected_start, protected_len, index)?;
+        let sector = protected_sector(source, protected_start, protected_len, index);
         let actual = (!crc32(&sector) & 0xffff) as u16;
         let expected = read_u16(tags, index * 2)?;
         if actual != expected {
@@ -2194,7 +2194,7 @@ fn repair_newsub_recovery_bytes(
             if index == missing_index {
                 continue;
             }
-            let other = protected_sector(&repaired, protected_start, protected_len, index)?;
+            let other = protected_sector(&repaired, protected_start, protected_len, index);
             for (out, byte) in sector.iter_mut().zip(other) {
                 control.check()?;
                 *out ^= byte;
@@ -2246,28 +2246,16 @@ fn protected_sector(
     protected_start: usize,
     protected_len: usize,
     index: usize,
-) -> Result<[u8; 512]> {
-    let sector_offset = index.checked_mul(512).ok_or(Error::InvalidHeader(
-        "RAR 3.x recovery sector offset overflows",
-    ))?;
-    if sector_offset >= protected_len {
-        return Err(Error::InvalidHeader(
-            "RAR 3.x recovery sector offset is invalid",
-        ));
-    }
-    let sector_start = protected_start
-        .checked_add(sector_offset)
-        .ok_or(Error::InvalidHeader(
-            "RAR 3.x recovery sector range overflows",
-        ))?;
+) -> [u8; 512] {
+    // Both callers bound index by ceil(protected_len / 512), after validating
+    // the complete protected range against source.
+    let sector_offset = index * 512;
+    debug_assert!(sector_offset < protected_len);
+    let sector_start = protected_start + sector_offset;
     let available = 512.min(protected_len - sector_offset);
     let mut sector = [0u8; 512];
-    sector[..available].copy_from_slice(
-        source
-            .get(sector_start..sector_start + available)
-            .ok_or(Error::TooShort)?,
-    );
-    Ok(sector)
+    sector[..available].copy_from_slice(&source[sector_start..sector_start + available]);
+    sector
 }
 
 pub fn repair_rev3_volumes_to<F>(
