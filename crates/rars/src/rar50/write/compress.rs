@@ -1283,19 +1283,25 @@ mod tests {
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     #[test]
     fn whole_member_cancellation_between_waves_does_not_open_next_source() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-        struct StopAfterFirst(AtomicBool);
+        struct StopAfterFirst {
+            finished: AtomicBool,
+            checks_after_finish: AtomicUsize,
+        }
         impl CompressionProgress for StopAfterFirst {
             fn advance(&self, _: u64) -> bool {
                 !self.is_cancelled()
             }
             fn is_cancelled(&self) -> bool {
-                self.0.load(Ordering::SeqCst)
+                // Let the completed wave return its result, then cancel at
+                // the coordinator's check before admitting the next wave.
+                self.finished.load(Ordering::SeqCst)
+                    && self.checks_after_finish.fetch_add(1, Ordering::SeqCst) != 0
             }
             fn finished(&self, index: usize, _: u64) {
                 if index == 0 {
-                    self.0.store(true, Ordering::SeqCst);
+                    self.finished.store(true, Ordering::SeqCst);
                 }
             }
         }
@@ -1308,7 +1314,7 @@ mod tests {
             block_size: 65536,
             solid: false,
             method: 1,
-            filter_policy: FilterPolicy::None,
+            filter_policy: FilterPolicy::Auto,
             candidates: vec![options].into(),
         };
         let first = EntrySource::from_bytes(b"first".to_vec());
@@ -1317,7 +1323,10 @@ mod tests {
         });
         let scratch = crate::scratch::case("whole-member-cancel-between-waves");
         let resources = WriterResources::new(80 * 1024 * 1024).with_temp_dir(&*scratch);
-        let progress = StopAfterFirst(AtomicBool::new(false));
+        let progress = StopAfterFirst {
+            finished: AtomicBool::new(false),
+            checks_after_finish: AtomicUsize::new(0),
+        };
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(1)
             .build()
