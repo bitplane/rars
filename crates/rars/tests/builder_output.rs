@@ -338,3 +338,32 @@ fn legacy_builder_materializes_reopenable_sources_once() {
         assert_eq!(opens.load(Ordering::SeqCst), 1, "{version:?}");
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn add_path_refuses_symlinks_without_following_them() {
+    use std::os::unix::fs::symlink;
+
+    let root = scratch::case("builder-input-symlink");
+    let target = root.join("target");
+    let link = root.join("link");
+    fs::write(&target, b"private payload").unwrap();
+    symlink(&target, &link).unwrap();
+    let mut builder = Builder::new(ArchiveVersion::Rar50);
+    let error = builder.add_path(&link, b"member").unwrap_err();
+    assert_eq!(error.entry_context(), Some((&b"member"[..], "adding")));
+    assert_eq!(error.kind(), rars::ErrorKind::InvalidArgument);
+    assert!(builder.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn add_path_refuses_special_files_instead_of_silently_omitting_them() {
+    let mut builder = Builder::new(ArchiveVersion::Rar50);
+    let error = builder
+        .add_path(std::path::Path::new("/dev/null"), b"member")
+        .unwrap_err();
+    assert_eq!(error.entry_context(), Some((&b"member"[..], "adding")));
+    assert_eq!(error.kind(), rars::ErrorKind::InvalidArgument);
+    assert!(builder.is_empty());
+}

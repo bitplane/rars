@@ -915,6 +915,7 @@ impl Builder {
     /// Symlinks are refused rather than followed, at the root and at every
     /// level below it: a link is a name for someone else's file, and copying
     /// what it points at is not what the caller asked for.
+    /// Other special files are refused instead of being silently omitted.
     pub fn add_path(&mut self, path: &Path, archive_name: &[u8]) -> Result<()> {
         let link_meta = fs::symlink_metadata(path)?;
         if link_meta.file_type().is_symlink() {
@@ -946,6 +947,11 @@ impl Builder {
                 archive_name.to_vec()
             };
             self.add_source(name, EntrySource::from_path(path), None, unix_mode(&meta))?;
+        } else {
+            return Err(Error::InvalidArgument(
+                "input path is not a regular file or directory",
+            )
+            .at_entry(archive_name.to_vec(), "adding"));
         }
         Ok(())
     }
