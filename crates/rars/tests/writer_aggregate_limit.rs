@@ -110,20 +110,25 @@ fn legacy_families_refuse_before_emission_even_with_zero_budget() {
         ArchiveVersion::Rar40,
     ] {
         let builder = builder(version);
-        let resources = WriterResources::default().with_max_memory_bytes(0);
-        let mut bytes = Vec::new();
-        let error = builder.write_to(&mut bytes, &resources, None).unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::UnsupportedFeature);
-        assert!(bytes.is_empty());
-        assert_eq!(
-            builder
-                .volume_size(Some(2048))
-                .build_volumes_with_resources(&resources, None)
-                .unwrap_err()
-                .kind(),
-            ErrorKind::UnsupportedFeature
-        );
-        assert_eq!(resources.managed_memory_in_use(), 0);
+        for resources in [
+            WriterResources::default().with_max_memory_bytes(0),
+            WriterResources::default().with_max_preparation_bytes(0),
+        ] {
+            let mut bytes = Vec::new();
+            let error = builder.write_to(&mut bytes, &resources, None).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::UnsupportedFeature);
+            assert!(bytes.is_empty());
+            assert_eq!(
+                builder
+                    .clone()
+                    .volume_size(Some(2048))
+                    .build_volumes_with_resources(&resources, None)
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::UnsupportedFeature
+            );
+            assert_eq!(resources.managed_memory_in_use(), 0);
+        }
     }
 }
 
