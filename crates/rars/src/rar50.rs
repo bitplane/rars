@@ -2903,6 +2903,38 @@ mod tests {
     }
 
     #[test]
+    fn unknown_header_remains_readable_and_budget_error_keeps_one_offset() {
+        let header = |body: &[u8]| {
+            let mut encoded = vec![body.len() as u8];
+            encoded.extend_from_slice(body);
+            let mut header = crc32(&encoded).to_le_bytes().to_vec();
+            header.extend_from_slice(&encoded);
+            header
+        };
+        let mut bytes = RAR50_SIGNATURE.to_vec();
+        bytes.extend_from_slice(&header(&[HEAD_MAIN as u8, 0, 0]));
+        bytes.extend_from_slice(&header(&[127, 0]));
+        bytes.extend_from_slice(&header(&[HEAD_END as u8, 0, 0]));
+
+        let archive = Archive::parse(&bytes).unwrap();
+        assert!(matches!(
+            archive.blocks.as_slice(),
+            [Block::Unknown(_), Block::End(_)]
+        ));
+
+        let error = Archive::parse_with_options(
+            &bytes,
+            crate::ArchiveReadOptions::new().with_max_header_bytes(0),
+        )
+        .unwrap_err();
+        let Error::AtArchiveOffset { offset, source } = error else {
+            panic!("header refusal needs its physical offset");
+        };
+        assert_eq!(offset, RAR50_SIGNATURE.len());
+        assert!(matches!(*source, Error::HeaderBytesLimitExceeded { .. }));
+    }
+
+    #[test]
     fn header_reader_u32_obeys_type_specific_boundary() {
         // Extra-area bytes remain physically available in the header image,
         // but must not satisfy a field in the type-specific part.
