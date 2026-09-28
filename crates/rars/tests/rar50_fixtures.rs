@@ -2015,6 +2015,71 @@ fn rejects_rar50_inline_recovery_when_damage_exceeds_available_shards() {
 }
 
 #[test]
+fn rar50_recovery_reports_output_failure_before_a_late_repaired_shard() {
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _: &[u8]) -> IoResult<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+
+        fn flush(&mut self) -> IoResult<()> {
+            Ok(())
+        }
+    }
+
+    let bytes = write_stored_archive_with_recovery(
+        &[entry(b"recoverable.txt", &vec![b'A'; 32 * 1024])],
+        rar50::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only()),
+        20,
+    )
+    .unwrap();
+    let archive = Archive::parse(&bytes).unwrap();
+    let data_range = archive.files().next().unwrap().block.data_range.clone();
+    let mut damaged = bytes;
+    damaged[data_range.end - 64..data_range.end - 32].fill(0xa5);
+
+    let damaged_archive = Archive::parse(&damaged).unwrap();
+    let error = damaged_archive
+        .repair_recovery_to(&mut FailingWriter)
+        .unwrap_err();
+    assert_eq!(error.kind(), rars::ErrorKind::Io);
+}
+
+#[test]
+fn repairs_sfx_prefixed_rar50_data_with_a_missing_recovery_row() {
+    let archive_bytes = write_stored_archive_with_recovery(
+        &[entry(b"recoverable.txt", &vec![b'A'; 32 * 1024])],
+        rar50::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only()),
+        20,
+    )
+    .unwrap();
+    let mut prefixed = b"MZ SFX stub".to_vec();
+    prefixed.extend_from_slice(&archive_bytes);
+    let clean = Archive::parse(&prefixed).unwrap();
+    assert_eq!(clean.sfx_offset, b"MZ SFX stub".len());
+    let data_range = clean.files().next().unwrap().block.data_range.clone();
+    let recovery_range = clean.services().next().unwrap().block.data_range.clone();
+    let mut damaged = prefixed.clone();
+    damaged[data_range.start + 128..data_range.start + 160].fill(0xa5);
+    damaged[recovery_range.start + 0x48] ^= 0xff;
+    let mut expected = prefixed;
+    expected[recovery_range.start + 0x48] ^= 0xff;
+
+    let result = Archive::parse(&damaged)
+        .unwrap()
+        .repair_recovery_with_report(None)
+        .unwrap();
+    assert!(result.report.data_repaired);
+    assert!(!result.report.recovery_record_rebuilt);
+    assert_eq!(result.data, expected);
+    assert_eq!(
+        collect_extract(&Archive::parse(&result.data).unwrap()).unwrap()[0].data,
+        vec![b'A'; 32 * 1024]
+    );
+}
+
+#[test]
 fn repairs_rar50_inline_recovery_header_damage_without_parsing() {
     let payload = b"payload protected by raw inline recovery fallback\n".repeat(64);
     let entries = [entry(b"header-damaged.txt", &payload)
