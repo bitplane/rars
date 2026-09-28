@@ -5329,6 +5329,47 @@ fn parse_path_family_accepts_os_string_paths() {
     assert_eq!(no_password.files().count(), 1);
 }
 
+#[test]
+fn direct_rar50_parser_rejects_legacy_input_and_stale_signatures() {
+    let legacy_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/rar15_40/rars_generated/stored.rar");
+    let legacy = fs::read(&legacy_path).unwrap();
+    let legacy_signature = detect_archive_family(&legacy).unwrap();
+    assert_eq!(legacy_signature.family, ArchiveFamily::Rar15To40);
+    assert!(matches!(
+        Archive::parse(&legacy),
+        Err(Error::UnsupportedSignature)
+    ));
+    assert!(matches!(
+        Archive::parse_path_with_options(&legacy_path, ArchiveReadOptions::new()),
+        Err(Error::UnsupportedSignature)
+    ));
+    assert!(matches!(
+        Archive::parse_path_with_signature(
+            &legacy_path,
+            legacy_signature,
+            ArchiveReadOptions::new(),
+        ),
+        Err(Error::UnsupportedSignature)
+    ));
+
+    let rar50_path = fixture("empty_file.rar");
+    let rar50_bytes = fs::read(&rar50_path).unwrap();
+    let signature = detect_archive_family(&rar50_bytes).unwrap();
+    let parsed = Archive::parse_path_with_signature_and_password(&rar50_path, signature, None)
+        .unwrap();
+    assert_eq!(parsed.files().count(), 1);
+
+    let mut prefixed = vec![0];
+    prefixed.extend_from_slice(&rar50_bytes);
+    let stale = rars::detect::find_archive_start(&prefixed, 1).unwrap();
+    assert_eq!(stale.offset, 1);
+    assert!(matches!(
+        Archive::parse_path_with_signature(&rar50_path, stale, ArchiveReadOptions::new()),
+        Err(Error::UnsupportedSignature)
+    ));
+}
+
 /// Members whose contents overlap heavily, and which together fit inside the
 /// default dictionary, so a shared dictionary has something obvious to find.
 fn solid_test_entries() -> Vec<rar50::ArchiveEntry> {

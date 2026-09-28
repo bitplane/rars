@@ -2785,6 +2785,32 @@ mod tests {
     }
 
     #[test]
+    fn recovery_record_distinguishes_other_services_and_rejects_missing_or_extra_data() {
+        let archive = build_archive_with_optional_comment(None);
+        let mut file = archive.files().next().unwrap().clone();
+        assert_eq!(file.recovery_record().unwrap(), None);
+
+        file.name = b"RR".to_vec();
+        assert!(matches!(
+            file.recovery_record(),
+            Err(Error::InvalidHeader(
+                "RAR 5 recovery service is missing service data"
+            ))
+        ));
+        file.service_data = Some(vec![5, 0]);
+        assert!(matches!(
+            file.recovery_record(),
+            Err(Error::InvalidHeader(
+                "RAR 5 recovery service data has trailing bytes"
+            ))
+        ));
+        file.service_data = Some(vec![5]);
+        let record = file.recovery_record().unwrap().unwrap();
+        assert_eq!(record.percent, 5);
+        assert_eq!(record.payload_size, file.packed_size());
+    }
+
+    #[test]
     fn header_fields_reject_truncation_overflow_and_unexpected_encryption() {
         let image = |body: &[u8]| {
             assert!(body.len() < 128);
