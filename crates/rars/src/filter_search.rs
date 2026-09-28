@@ -1812,6 +1812,19 @@ mod tests {
     }
 
     #[test]
+    fn a_table_without_code_gets_its_own_filter_candidate() {
+        let data = reloc_table(2048);
+        let candidates = filter_candidates(&FULL, &data, options()).unwrap();
+        assert!(candidates.iter().any(|specs| matches!(
+            specs.as_slice(),
+            [FilterSpec {
+                kind: FilterKind::Delta { channels: 24 },
+                range: Some(_),
+            }]
+        )));
+    }
+
+    #[test]
     fn adjacent_struct_tables_with_different_record_sizes_stay_separate() {
         let mut data = reloc_table(4096);
         let boundary = data.len();
