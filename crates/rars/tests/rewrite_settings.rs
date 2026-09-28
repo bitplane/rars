@@ -437,6 +437,18 @@ fn preservation_preflight_checks_derived_service_and_locator_consistency() {
         .iter()
         .any(|issue| issue.contains("locator refers to a missing service")));
 
+    let mut missing_recovery = seed.clone();
+    missing_recovery
+        .blocks
+        .retain(|block| !matches!(block, rar50::Block::Service(service) if service.name == b"RR"));
+    let issues = Archive::Rar50Plus(missing_recovery).rewrite_preservation_issues();
+    assert!(issues
+        .iter()
+        .any(|issue| issue.contains("recovery flag and service disagree")));
+    assert!(issues
+        .iter()
+        .any(|issue| issue.contains("locator refers to a missing service")));
+
     let mut conflicting_encryption = seed;
     conflicting_encryption.main.encrypted_headers = true;
     assert!(Archive::Rar50Plus(conflicting_encryption)
