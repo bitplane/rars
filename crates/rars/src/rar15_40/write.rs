@@ -3193,6 +3193,28 @@ mod tests {
             offered.data.len(),
             lz_only.data.len()
         );
+
+        let plain_auto = super::encode_rar29_policy_filtered_payload(
+            &data,
+            &super::FilterPolicy::None,
+            super::Rar29Method::Auto,
+            EncodeOptions::default(),
+            0x35,
+            true,
+            None,
+        )
+        .unwrap();
+        let forced_ppmd = super::encode_rar29_policy_filtered_payload(
+            &data,
+            &super::FilterPolicy::None,
+            super::Rar29Method::Ppmd,
+            EncodeOptions::default(),
+            0x35,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(plain_auto.data, forced_ppmd.data);
     }
 
     #[test]
