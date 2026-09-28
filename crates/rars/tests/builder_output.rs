@@ -250,6 +250,21 @@ fn volume_builder_rejects_unsupported_settings_before_opening_sources() {
         empty.build_volumes(None),
         Err(rars::Error::InvalidArgument("archive builder has no entries"))
     ));
+
+    let mut multiple = Builder::new(ArchiveVersion::Rar20)
+        .store(true)
+        .volume_size(Some(1024));
+    for name in [b"first".as_slice(), b"second".as_slice()] {
+        multiple
+            .add_bytes(name.to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+    }
+    assert!(matches!(
+        multiple.build_volumes(None),
+        Err(rars::Error::InvalidArgument(
+            "legacy volumes support one input"
+        ))
+    ));
 }
 
 #[test]
@@ -294,4 +309,32 @@ fn legacy_builder_rejects_modern_streaming_outputs_before_creating_files() {
         })
     ));
     assert!(!destination.exists());
+}
+
+#[test]
+fn legacy_builder_materializes_reopenable_sources_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let payload = b"legacy source materialization ".repeat(32);
+    for version in [ArchiveVersion::Rar13, ArchiveVersion::Rar20, ArchiveVersion::Rar29] {
+        let opens = Arc::new(AtomicUsize::new(0));
+        let opened = opens.clone();
+        let data = payload.clone();
+        let mut builder = Builder::new(version).store(false);
+        builder
+            .add_source(
+                b"source".to_vec(),
+                EntrySource::from_opener(payload.len() as u64, move || {
+                    opened.fetch_add(1, Ordering::SeqCst);
+                    Ok(Box::new(std::io::Cursor::new(data.clone())))
+                }),
+                None,
+                None,
+            )
+            .unwrap();
+        let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        assert_eq!(archive.read_member(b"source", None).unwrap().unwrap(), payload);
+        assert_eq!(opens.load(Ordering::SeqCst), 1, "{version:?}");
+    }
 }
