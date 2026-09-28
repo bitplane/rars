@@ -1590,6 +1590,55 @@ mod tests {
         }
     }
 
+    #[test]
+    fn candidate_search_preserves_codec_cancellation() {
+        struct CancelledCodec;
+
+        impl FilterSearch for CancelledCodec {
+            type Options = ();
+
+            fn screened_kinds(&self, _: &[u8]) -> Vec<FilterKind> {
+                Vec::new()
+            }
+
+            fn detects_x86(&self) -> bool {
+                false
+            }
+
+            fn max_delta_channels(&self) -> usize {
+                0
+            }
+
+            fn filtered_bytes(&self, _: &[u8], _: &[FilterSpec]) -> Result<Vec<u8>> {
+                unreachable!("no filters are proposed")
+            }
+
+            fn encode_plain(
+                &self,
+                _: &[u8],
+                _: (),
+                _: Option<&mut dyn FnMut(usize) -> bool>,
+            ) -> Result<Vec<u8>> {
+                Err(crate::Error::Cancelled)
+            }
+
+            fn encode_filtered(
+                &self,
+                _: &[u8],
+                _: &[FilterSpec],
+                _: (),
+                _: Option<&mut dyn FnMut(usize) -> bool>,
+            ) -> Result<Vec<u8>> {
+                unreachable!("no filters are proposed")
+            }
+        }
+
+        assert_eq!(
+            filter_candidates(&CancelledCodec, b"binary\0member", ()),
+            Err(crate::Error::Cancelled)
+        );
+    }
+
     /// The E8-only filter costs a whole-member encode to ask whether leaving
     /// the jump opcodes alone packs better. Over twenty-four members it won
     /// seven times and never by more than 0.21%, so it only earns that encode
