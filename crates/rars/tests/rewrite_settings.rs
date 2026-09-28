@@ -260,32 +260,40 @@ fn preserving_builder_keeps_rar7_compression_version() {
 }
 
 #[test]
-fn preserving_builder_requires_password_for_encrypted_rar14_members() {
-    let mut builder = Builder::new(ArchiveVersion::Rar14)
-        .store(true)
-        .password(Some(b"secret".to_vec()));
-    builder
-        .add_bytes(b"encrypted".to_vec(), b"payload".to_vec(), None, None)
-        .unwrap();
-    let source = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
-    assert!(source.rewrite_preservation_issues().is_empty());
-    assert!(matches!(
-        source.preserving_builder(None),
-        Err(rars::Error::NeedPassword)
-    ));
-    assert!(matches!(
-        source.preserving_builder(Some(b"")),
-        Err(rars::Error::NeedPassword)
-    ));
-    let mut preserving = source.preserving_builder(Some(b"secret")).unwrap();
-    preserving
-        .add_bytes(b"encrypted".to_vec(), b"payload".to_vec(), None, None)
-        .unwrap();
-    let output = ArchiveReader::read_owned(preserving.to_bytes().unwrap()).unwrap();
-    assert_eq!(
-        output.read_member_at(0, Some(b"secret")).unwrap().unwrap(),
-        b"payload"
-    );
+fn preserving_builder_requires_password_for_encrypted_legacy_members() {
+    for version in [
+        ArchiveVersion::Rar14,
+        ArchiveVersion::Rar20,
+        ArchiveVersion::Rar29,
+        ArchiveVersion::Rar40,
+    ] {
+        let mut builder = Builder::new(version)
+            .store(true)
+            .password(Some(b"secret".to_vec()));
+        builder
+            .add_bytes(b"encrypted".to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+        let source = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        assert!(source.rewrite_preservation_issues().is_empty(), "{version:?}");
+        assert!(matches!(
+            source.preserving_builder(None),
+            Err(rars::Error::NeedPassword)
+        ));
+        assert!(matches!(
+            source.preserving_builder(Some(b"")),
+            Err(rars::Error::NeedPassword)
+        ));
+        let mut preserving = source.preserving_builder(Some(b"secret")).unwrap();
+        preserving
+            .add_bytes(b"encrypted".to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+        let output = ArchiveReader::read_owned(preserving.to_bytes().unwrap()).unwrap();
+        assert_eq!(
+            output.read_member_at(0, Some(b"secret")).unwrap().unwrap(),
+            b"payload",
+            "{version:?}"
+        );
+    }
 }
 
 #[test]
