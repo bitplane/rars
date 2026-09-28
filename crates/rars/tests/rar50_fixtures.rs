@@ -4872,6 +4872,62 @@ fn rejects_rar50_rev5_metadata_with_truncated_table() {
 }
 
 #[test]
+fn rejects_rar50_rev5_header_boundaries_before_reading_payload() {
+    let original = std::fs::read(fixture("multivol_rev.part1.rev")).unwrap();
+
+    let mut wrong_signature = original.clone();
+    wrong_signature[0] ^= 1;
+    assert!(matches!(
+        Rev5VolumeMeta::parse(&wrong_signature),
+        Err(Error::UnsupportedSignature)
+    ));
+    assert!(matches!(
+        Rev5VolumeMeta::parse(&original[..15]),
+        Err(Error::TooShort)
+    ));
+
+    let mut invalid_size = original.clone();
+    invalid_size[12..16].copy_from_slice(&5u32.to_le_bytes());
+    assert!(matches!(
+        Rev5VolumeMeta::parse(&invalid_size),
+        Err(Error::InvalidHeader("RAR 5 REV header size is invalid"))
+    ));
+
+    let mut truncated_header = original.clone();
+    truncated_header[12..16].copy_from_slice(&(original.len() as u32).to_le_bytes());
+    assert!(matches!(
+        Rev5VolumeMeta::parse(&truncated_header),
+        Err(Error::TooShort)
+    ));
+
+    let mut wrong_crc = original.clone();
+    wrong_crc[16] ^= 1;
+    assert!(matches!(
+        Rev5VolumeMeta::parse(&wrong_crc),
+        Err(Error::Crc32Mismatch { .. })
+    ));
+
+    let mut short_body = original.clone();
+    short_body[12..16].copy_from_slice(&10u32.to_le_bytes());
+    update_rev5_header_crc(&mut short_body);
+    assert!(matches!(
+        Rev5VolumeMeta::parse(&short_body),
+        Err(Error::TooShort)
+    ));
+
+    let mut unknown_version = original;
+    unknown_version[16] = 2;
+    update_rev5_header_crc(&mut unknown_version);
+    assert!(matches!(
+        Rev5VolumeMeta::parse(&unknown_version),
+        Err(Error::UnsupportedFeature {
+            feature: "RAR 5 REV version",
+            ..
+        })
+    ));
+}
+
+#[test]
 fn repairs_missing_rar50_data_volume_from_rev5_recovery_volume() {
     let data: Vec<_> = (1..=5)
         .map(|index| std::fs::read(fixture(&format!("multivol_rev.part{index}.rar"))).unwrap())
