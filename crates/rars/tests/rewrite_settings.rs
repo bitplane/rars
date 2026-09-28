@@ -56,6 +56,36 @@ fn preserving_builder_refuses_unix_device_entries() {
 }
 
 #[test]
+fn preserving_builder_refuses_directory_flag_with_unix_device_mode() {
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    builder
+        .add_directory(b"directory".to_vec(), None, Some(0o750))
+        .unwrap();
+    let mut source = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    let rars::Archive::Rar50Plus(archive) = &mut source else {
+        unreachable!()
+    };
+    let file = archive
+        .blocks
+        .iter_mut()
+        .find_map(|block| match block {
+            rars::rar50::Block::File(file) => Some(file),
+            _ => None,
+        })
+        .unwrap();
+    file.attributes = 0o020600;
+
+    let meta = source.members().next().unwrap().meta;
+    assert!(meta.is_directory);
+    assert_eq!(meta.attr_source(), rars::AttrSource::Unix);
+    assert!(source
+        .rewrite_preservation_issues()
+        .iter()
+        .any(|issue| issue.contains("special entry type or directory contents")));
+    assert!(source.preserving_builder(None).is_err());
+}
+
+#[test]
 fn preserving_builder_accepts_rar13_family_and_rar7_sources() {
     for version in [
         ArchiveVersion::Rar13,
