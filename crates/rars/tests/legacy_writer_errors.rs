@@ -634,3 +634,60 @@ fn cancellation_and_shared_output_failures_do_not_blame_a_member() {
         assert_eq!(error, Error::Cancelled);
     }
 }
+
+#[test]
+fn stored_legacy_emission_propagates_failure_at_every_output_write() {
+    struct FailOnWrite {
+        fail_at: usize,
+        writes: usize,
+    }
+    impl Write for FailOnWrite {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            let call = self.writes;
+            self.writes += 1;
+            if call == self.fail_at {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed output"))
+            } else {
+                Ok(data.len())
+            }
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    for format in FORMATS {
+        let run = |sink: &mut dyn Write| {
+            write(
+                format,
+                EntrySource::from_bytes(b"good".to_vec()),
+                false,
+                false,
+                &WriterResources::default(),
+                sink,
+            )
+        };
+        let mut counting = FailOnWrite {
+            fail_at: usize::MAX,
+            writes: 0,
+        };
+        run(&mut counting).unwrap();
+        assert!(counting.writes >= 4, "{format:?}");
+
+        let mut member_failure = false;
+        let mut archive_failure = false;
+        for fail_at in 0..counting.writes {
+            let mut sink = FailOnWrite { fail_at, writes: 0 };
+            let error = run(&mut sink).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Io, "{format:?} write {fail_at}");
+            assert_eq!(sink.writes, fail_at + 1);
+            if error.entry_context().is_some() {
+                member_failure = true;
+            } else {
+                archive_failure = true;
+            }
+        }
+        assert!(member_failure, "{format:?}");
+        assert!(archive_failure, "{format:?}");
+    }
+}
