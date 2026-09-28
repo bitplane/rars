@@ -511,13 +511,6 @@ pub(crate) fn write_streaming_archive_reporting(
     if options.features.header_encryption && !encrypted && extras.header_password.is_none() {
         return Err(Error::NeedPassword);
     }
-    if options.features.quick_open && options.features.header_encryption {
-        return Err(Error::UnsupportedFeature {
-            version: options.target,
-            feature: "RAR 5 quick-open index in a header-encrypted archive",
-        });
-    }
-
     engine::write_archive(
         entries,
         engine::EnginePlan {
@@ -1053,6 +1046,107 @@ fn validate_service(service: &ServiceEntry) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    fn simple_entry(data: &[u8]) -> super::ArchiveEntry {
+        super::ArchiveEntry::new(b"file".to_vec(), crate::EntrySource::from_bytes(data.to_vec()))
+    }
+
+    #[test]
+    fn malformed_member_metadata_is_rejected_before_serialization() {
+        let mut file = simple_entry(b"payload");
+        file.redirection_size = Some(0);
+        assert_eq!(
+            super::validate_entry(&file).unwrap_err(),
+            crate::Error::InvalidArgument("redirection size requires a redirection record")
+        );
+
+        let link = super::super::FileRedirection {
+            redirection_type: 4,
+            flags: 0,
+            target_name: b"target".to_vec(),
+        };
+        file.redirection_size = None;
+        file.redirection = Some(link.clone());
+        assert_eq!(
+            super::validate_entry(&file).unwrap_err(),
+            crate::Error::InvalidArgument(
+                "redirections require supported target metadata and empty contents"
+            )
+        );
+        file.redirection_size = Some(0);
+        assert_eq!(
+            super::validate_entry(&file).unwrap_err(),
+            crate::Error::InvalidArgument(
+                "redirections require supported target metadata and empty contents"
+            )
+        );
+        file.source = crate::EntrySource::from_bytes(Vec::new());
+        file.host_os = 99;
+        assert_eq!(
+            super::validate_entry(&file).unwrap_err(),
+            crate::Error::InvalidArgument(
+                "redirections require supported target metadata and empty contents"
+            )
+        );
+        file.host_os = 0;
+        super::validate_entry(&file).unwrap();
+
+        let mut directory = simple_entry(b"payload").with_directory(true);
+        assert_eq!(
+            super::validate_entry(&directory).unwrap_err(),
+            crate::Error::InvalidArgument("directory entries cannot carry file contents")
+        );
+        directory.source = crate::EntrySource::from_bytes(Vec::new());
+        super::validate_entry(&directory).unwrap();
+
+        let mut timestamped = simple_entry(b"");
+        timestamped.mtime_nanoseconds = Some(1);
+        assert!(super::validate_entry(&timestamped).is_err());
+        timestamped.mtime = Some(0);
+        timestamped.mtime_nanoseconds = Some(1_000_000_000);
+        assert!(super::validate_entry(&timestamped).is_err());
+        timestamped.mtime_nanoseconds = None;
+        timestamped.file_times = Some(
+            crate::FileTimes::from_unix_nanoseconds(Some(0), None, None).unwrap(),
+        );
+        assert_eq!(
+            super::validate_entry(&timestamped).unwrap_err(),
+            crate::Error::InvalidArgument("conflicting file modification timestamps")
+        );
+    }
+
+    #[test]
+    fn unsupported_or_empty_member_services_are_rejected() {
+        for service in [
+            super::ServiceEntry::new(b"BAD", b"data"),
+            super::ServiceEntry::new(b"ACL", b""),
+            super::ServiceEntry::new(b"CMT", b"data").with_password(b""),
+        ] {
+            assert!(super::validate_entry(&simple_entry(b"").with_service(service)).is_err());
+        }
+        super::validate_entry(&simple_entry(b"").with_service(super::ServiceEntry::new(b"CMT", b"")))
+            .unwrap();
+    }
+
+    #[test]
+    fn quick_open_with_encrypted_headers_is_rejected_by_plan_validation() {
+        let mut features = crate::FeatureSet::store_only();
+        features.quick_open = true;
+        features.header_encryption = true;
+        let options = super::WriterOptions::new(crate::ArchiveVersion::Rar50, features);
+        let error = super::validate_plan(
+            options,
+            crate::write_plan::PlanShape::new().compressed(true),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::Error::UnsupportedWriterOption {
+                option: crate::write_plan::WriterOption::Feature(crate::Feature::QuickOpen),
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn empty_volume_set_is_rejected_before_opening_a_sink() {
         let mut sink = super::CollectedVolumes::new();
