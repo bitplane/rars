@@ -181,6 +181,29 @@ fn invalid_rar29_filters_fail_before_opening_a_member_or_writing_output() {
 }
 
 #[test]
+fn rar13_family_rejects_filter_policy_before_member_io_or_output() {
+    let entries = [rar13::StreamingEntry::new(
+        b"member".to_vec(),
+        EntrySource::from_opener(1, || panic!("unsupported filter opened the source")),
+    )];
+    for format in [ArchiveVersion::Rar13, ArchiveVersion::Rar14] {
+        let mut output = Vec::new();
+        let error = rar13::write_streaming_archive_to(
+            &entries,
+            rar13::WriterOptions::new(format, FeatureSet::store_only()),
+            MemberCoding::Filtered(FilterPolicy::Auto),
+            None,
+            &WriterResources::default(),
+            None,
+            &mut output,
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::UnsupportedWriterOption { .. }));
+        assert!(output.is_empty());
+    }
+}
+
+#[test]
 fn legacy_dictionary_size_is_validated_before_member_io() {
     let entries = [rar15_40::StreamingEntry::new(
         b"member".to_vec(),
