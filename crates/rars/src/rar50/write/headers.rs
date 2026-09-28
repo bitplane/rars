@@ -894,6 +894,80 @@ mod image_tests {
     use super::*;
 
     #[test]
+    fn header_length_checks_reject_overflow_without_allocating() {
+        assert_eq!(checked_image_len(&[0, 7]).unwrap(), 7);
+        for parts in [
+            [usize::MAX, 1],
+            [isize::MAX as usize, 1],
+        ] {
+            assert_eq!(
+                checked_image_len(&parts).unwrap_err(),
+                Error::InvalidArgument("RAR 5 header size overflows")
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_archive_metadata_is_rejected_at_serialization() {
+        let resources = crate::WriterResources::default();
+        for (name, time, reason) in [
+            (None, None, "RAR 5 archive metadata writer needs a name or creation time"),
+            (Some(b"name".as_slice()), None, "RAR 5 archive metadata name needs a creation time"),
+            (Some(b"".as_slice()), Some(1), "RAR 5 archive metadata name is empty"),
+        ] {
+            let error = archive_metadata_record(
+                ArchiveMetadataEntry {
+                    name,
+                    creation_time: time,
+                },
+                &resources,
+            )
+            .unwrap_err();
+            assert_eq!(error, Error::InvalidArgument(reason));
+        }
+        assert_eq!(
+            file_specific(b"", 0, None, 0, None, 0, 0, false, &resources).unwrap_err(),
+            Error::InvalidArgument("RAR 5 file name is empty")
+        );
+    }
+
+    #[test]
+    fn retained_metadata_rejects_inconsistent_flags_and_names() {
+        let resources = crate::WriterResources::default();
+        for (flags, name, time) in [
+            (16, None, None),
+            (8, None, None),
+            (1, None, None),
+            (2, None, None),
+            (0, Some(b"name".to_vec()), None),
+            (0, None, Some(1)),
+            (4, None, None),
+            (1, Some(Vec::new()), None),
+            (1, Some(vec![0xff]), None),
+        ] {
+            let record = crate::rar50::ArchiveMetadataRecord {
+                flags,
+                name,
+                creation_time: time,
+            };
+            assert_eq!(
+                retained_archive_metadata(&record, &resources).unwrap_err(),
+                Error::InvalidArgument("unsupported archive metadata record"),
+                "flags {flags}"
+            );
+        }
+        let record = crate::rar50::ArchiveMetadataRecord {
+            flags: 6,
+            name: None,
+            creation_time: Some(u64::from(u32::MAX) + 1),
+        };
+        assert_eq!(
+            retained_archive_metadata(&record, &resources).unwrap_err(),
+            Error::InvalidArgument("archive Unix timestamp exceeds 32 bits")
+        );
+    }
+
+    #[test]
     fn encrypted_images_match_buffered_ciphertext_and_leave_trailing_data_plain() {
         let keys = header_encryption_keys(b"secret").unwrap();
         for size in [0, 1, 15, 16, 17, 127, 128, 16384] {
