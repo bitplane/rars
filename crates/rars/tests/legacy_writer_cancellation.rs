@@ -349,3 +349,37 @@ fn rar13_compressed_volume_preserves_cancellation_from_codec() {
     assert_eq!(error.kind(), ErrorKind::Cancelled);
     assert!(progress.cancelled.load(Ordering::Relaxed));
 }
+
+#[test]
+fn rar29_filter_search_preserves_cancellation() {
+    use rars::{rar15_40, FeatureSet, FilterPolicy};
+
+    let mut state = 0x1357_9bdfu32;
+    let data: Vec<u8> = (0..16_384)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect();
+    let entry = rar15_40::FileEntry {
+        name: b"binary",
+        data: &data,
+        file_time: 0,
+        file_attr: 0x20,
+        host_os: 3,
+        password: None,
+        file_comment: None,
+    };
+    let progress = Stop::new(WriteOperation::Compression, false);
+    let error = rar15_40::write_rar29_compressed_archive_with_filter_policy_and_progress(
+        &[entry],
+        rar15_40::WriterOptions::new(ArchiveVersion::Rar29, FeatureSet::default()),
+        FilterPolicy::Auto,
+        Some(&progress),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Cancelled);
+    assert!(progress.cancelled.load(Ordering::Relaxed));
+}
