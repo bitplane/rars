@@ -4993,6 +4993,65 @@ fn rejects_duplicate_rar50_rev5_recovery_rows() {
 }
 
 #[test]
+fn rejects_rar50_rev5_repair_inputs_with_inconsistent_metadata() {
+    let rev =
+        Rev5Volume::parse(&std::fs::read(fixture("multivol_rev.part1.rev")).unwrap()).unwrap();
+    let data = [None; 5];
+    assert!(matches!(
+        repair_rev5_volumes_to(&data[..4], std::slice::from_ref(&rev), |_, _| Ok(())),
+        Err(Error::InvalidHeader(
+            "RAR 5 REV data volume count does not match metadata"
+        ))
+    ));
+
+    let mut inconsistent = rev.clone();
+    inconsistent.data_volumes[0].crc32 ^= 1;
+    assert!(matches!(
+        repair_rev5_volumes_to(&data, &[rev, inconsistent], |_, _| Ok(())),
+        Err(Error::InvalidHeader(
+            "RAR 5 REV recovery volume metadata differs across files"
+        ))
+    ));
+}
+
+#[test]
+fn rejects_rar50_rev5_repaired_data_with_wrong_size_or_checksum() {
+    let data: Vec<_> = (1..=5)
+        .map(|index| std::fs::read(fixture(&format!("multivol_rev.part{index}.rar"))).unwrap())
+        .collect();
+    let rev =
+        Rev5Volume::parse(&std::fs::read(fixture("multivol_rev.part1.rev")).unwrap()).unwrap();
+    let inputs = [
+        None,
+        Some(data[1].as_slice()),
+        Some(data[2].as_slice()),
+        Some(data[3].as_slice()),
+        Some(data[4].as_slice()),
+    ];
+
+    let mut oversized = rev.clone();
+    oversized.data_volumes[0].file_size = oversized.payload_size + 1;
+    assert!(matches!(
+        repair_rev5_volumes_to(&inputs, &[oversized], |_, _| Ok(())),
+        Err(Error::InvalidHeader(
+            "RAR 5 REV repaired shard is shorter than data volume size"
+        ))
+    ));
+
+    let mut wrong_crc = rev;
+    wrong_crc.data_volumes[0].crc32 ^= 1;
+    let mut written = false;
+    assert!(matches!(
+        repair_rev5_volumes_to(&inputs, &[wrong_crc], |_, _| {
+            written = true;
+            Ok(())
+        }),
+        Err(Error::Crc32Mismatch { .. })
+    ));
+    assert!(!written, "invalid reconstructed data must not be published");
+}
+
+#[test]
 fn repairs_corrupt_rar50_data_volume_from_rev5_recovery_volume() {
     let mut data: Vec<_> = (1..=5)
         .map(|index| std::fs::read(fixture(&format!("multivol_rev.part{index}.rar"))).unwrap())
