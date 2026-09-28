@@ -336,6 +336,49 @@ fn admission_fails_before_io_and_indices_include_directories() {
 }
 
 #[test]
+fn staging_rejects_redirections_and_split_volume_fragments() {
+    let root = scratch::case("rewrite-special-admission");
+    let staging = RewriteStaging {
+        directory: root.to_path_buf(),
+        max_staged_bytes: 1024,
+    };
+    let mut link = Builder::new(ArchiveVersion::Rar50).store(true);
+    link.add_unix_symlink(b"link".to_vec(), b"target".to_vec(), false, None, None)
+        .unwrap();
+    let archive = ArchiveReader::read_owned(link.to_bytes().unwrap()).unwrap();
+    assert!(archive.members().next().unwrap().meta.is_redirection);
+    assert!(matches!(
+        archive.stage_rewrite_sources(&[0], ArchiveReadOptions::default(), &staging),
+        Err(Error::InvalidArgument(_))
+    ));
+
+    let mut builder = Builder::new(ArchiveVersion::Rar50)
+        .store(true)
+        .volume_size(Some(4));
+    builder
+        .add_bytes(b"file".to_vec(), b"a split payload".to_vec(), None, None)
+        .unwrap();
+    let volumes = builder.build_volumes(None).unwrap();
+    assert!(volumes.len() >= 2);
+    for (index, bytes) in volumes.iter().take(2).enumerate() {
+        let archive = ArchiveReader::read_owned(bytes.clone()).unwrap();
+        let member = archive.members().next().unwrap();
+        assert!(
+            if index == 0 {
+                member.meta.is_split_after
+            } else {
+                member.meta.is_split_before
+            }
+        );
+        assert!(matches!(
+            archive.stage_rewrite_sources(&[0], ArchiveReadOptions::default(), &staging),
+            Err(Error::InvalidArgument(_))
+        ));
+    }
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+}
+
+#[test]
 fn corrupt_dependencies_fail_cleanly_but_independent_omissions_are_skipped() {
     let root = scratch::case("rewrite-corruption");
     for solid in [false, true] {
