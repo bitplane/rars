@@ -46,6 +46,51 @@ fn invalid_legacy_compression_level_fails_before_member_io_or_output() {
 }
 
 #[test]
+fn legacy_header_encryption_requires_password_before_member_io_or_output() {
+    let entries = [rar15_40::StreamingEntry::new(
+        b"member".to_vec(),
+        EntrySource::from_opener(1, || panic!("missing password opened member")),
+    )];
+    let mut features = FeatureSet::store_only();
+    features.header_encryption = true;
+    let mut output = Vec::new();
+    let error = rar15_40::write_streaming_archive_to(
+        &entries,
+        rar15_40::WriterOptions::new(ArchiveVersion::Rar30, features),
+        MemberCoding::Stored,
+        None,
+        &WriterResources::default(),
+        None,
+        &mut output,
+    )
+    .unwrap_err();
+    assert!(matches!(error, Error::UnsupportedWriterOption { .. }));
+    assert!(output.is_empty());
+}
+
+#[test]
+fn oversized_legacy_comment_fails_before_opening_member_source() {
+    let entries = [rar15_40::StreamingEntry::new(
+        b"member".to_vec(),
+        EntrySource::from_opener(1, || panic!("oversized comment opened member")),
+    )];
+    let comment = vec![b'x'; 65536];
+    let mut output = Vec::new();
+    let error = rar15_40::write_streaming_archive_to(
+        &entries,
+        rar15_40::WriterOptions::new(ArchiveVersion::Rar15, FeatureSet::store_only()),
+        MemberCoding::Stored,
+        Some(&comment),
+        &WriterResources::default(),
+        None,
+        &mut output,
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidArgument);
+    assert!(!output.is_empty());
+}
+
+#[test]
 fn invalid_rar29_filters_fail_before_opening_a_member_or_writing_output() {
     let entries = [rar15_40::StreamingEntry::new(
         b"member".to_vec(),

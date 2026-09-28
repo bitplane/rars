@@ -1793,9 +1793,6 @@ fn compression_method_for_level(options: WriterOptions) -> u8 {
     let Some(level) = options.compression_level else {
         return 0x33;
     };
-    if level == 0 {
-        return 0x30;
-    }
     0x30 + level
 }
 
