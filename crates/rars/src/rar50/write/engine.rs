@@ -2485,4 +2485,44 @@ mod emission_ledger_tests {
             assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
         }
     }
+
+    #[test]
+    fn archive_preparation_refusals_release_capacity_at_each_boundary() {
+        let entries = [ArchiveEntry::new(
+            b"payload".to_vec(),
+            crate::EntrySource::from_bytes(b"contents".to_vec()),
+        )];
+        let mut limit = 0;
+        let mut refusals = 0;
+        loop {
+            let resources = WriterResources::default().with_max_preparation_bytes(limit);
+            let mut settings = plan(false);
+            settings.compress.method = 0;
+            settings.recovery_percent = None;
+            settings.quick_open = true;
+            let mut output = Vec::new();
+            match write_archive(&entries, settings, &resources, &mut output) {
+                Ok(()) => {
+                    assert!(!output.is_empty());
+                    break;
+                }
+                Err(error) => match error.root_cause() {
+                    Error::WriterPreparationLimitExceeded {
+                        limit: actual_limit,
+                        required,
+                        ..
+                    } => {
+                        assert_eq!(*actual_limit, limit);
+                        assert!(*required > limit);
+                        refusals += 1;
+                        drop(Records::<u8>::new(limit as usize, &resources).unwrap());
+                        limit = *required;
+                        assert!(limit < 64 * 1024, "tiny archive used too much preparation");
+                    }
+                    _ => panic!("unexpected preparation failure: {error}"),
+                },
+            }
+        }
+        assert!(refusals > 3, "the test must cross several admission sites");
+    }
 }
