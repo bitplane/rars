@@ -442,44 +442,6 @@ impl FileHeader {
         archive.copy_range_to(self.packed_range.clone(), out)
     }
 
-    pub(crate) fn stored_data(&self, archive: &Archive) -> Result<Vec<u8>> {
-        self.stored_data_with_password(archive, None)
-    }
-
-    pub(crate) fn stored_data_with_password(
-        &self,
-        archive: &Archive,
-        password: Option<&[u8]>,
-    ) -> Result<Vec<u8>> {
-        if !self.is_stored() {
-            return Err(self.unsupported_compression());
-        }
-        if !self.is_encrypted() && self.pack_size != self.unp_size {
-            return Err(Error::InvalidHeader(
-                "RAR 1.5 stored file has mismatched packed and unpacked sizes",
-            ));
-        }
-        let mut data = self.packed_data_for_decode(archive, password)?;
-        if self.is_encrypted() {
-            data.truncate(
-                usize::try_from(self.unp_size)
-                    .map_err(|_| Error::InvalidHeader("RAR 1.5 unpacked size overflows usize"))?,
-            );
-        }
-        Ok(data)
-    }
-
-    fn packed_data_for_decode(
-        &self,
-        archive: &Archive,
-        password: Option<&[u8]>,
-    ) -> Result<Vec<u8>> {
-        let mut reader = self.packed_reader_for_decode(archive, password)?;
-        let mut data = Vec::new();
-        reader.read_to_end(&mut data)?;
-        Ok(data)
-    }
-
     fn packed_reader_with_allowance<'a, B: crate::codec::workspace::Budget>(
         &self,
         archive: &'a Archive,
@@ -514,18 +476,6 @@ impl FileHeader {
                 allowance,
             )?,
         ))
-    }
-
-    fn packed_reader_for_decode<'a>(
-        &self,
-        archive: &'a Archive,
-        password: Option<&[u8]>,
-    ) -> Result<PackedReader<crate::source::RangeReader<'a>>> {
-        self.packed_reader_with_allowance(
-            archive,
-            password,
-            &crate::codec::workspace::Allowance::default(),
-        )
     }
 
     pub fn verify_crc32(&self, data: &[u8]) -> Result<()> {
@@ -752,13 +702,6 @@ impl FileHeader {
         }
     }
 
-    fn unsupported_compression(&self) -> Error {
-        Error::UnsupportedCompression {
-            family: "RAR 1.5-4.x",
-            unpack_version: self.unp_ver,
-            method: self.method,
-        }
-    }
 }
 
 impl NewSubHeader {
@@ -2234,7 +2177,7 @@ fn newsub_recovery_data(
                 "RAR 3.x recovery record packed size does not match unpacked size",
             ));
         }
-        return recovery.file.stored_data(archive);
+        return recovery.file.packed_data(archive);
     }
     let mut session = DecoderSession::new(false);
     session.read_control = control.clone();
@@ -3792,22 +3735,6 @@ mod tests {
         let mut sink = Vec::new();
         file.write_packed_data(&archive, &mut sink).unwrap();
         assert_eq!(sink, payload);
-    }
-
-    #[test]
-    fn file_header_unsupported_compression_describes_method_and_unpack_version() {
-        let mut header = file_header_with(0);
-        header.method = 0x33;
-        header.unp_ver = 26;
-        let err = header.unsupported_compression();
-        assert!(matches!(
-            err,
-            Error::UnsupportedCompression {
-                family: "RAR 1.5-4.x",
-                unpack_version: 26,
-                method: 0x33,
-            }
-        ));
     }
 
     #[test]
