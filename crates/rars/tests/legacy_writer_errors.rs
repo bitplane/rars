@@ -1,6 +1,6 @@
 use rars::{
     rar13, rar15_40, ArchiveVersion, Builder, EntrySource, Error, ErrorKind, FeatureSet,
-    MemberCoding, WriteCancellation, WriterResources,
+    FilterKind, FilterPolicy, MemberCoding, WriteCancellation, WriterResources,
 };
 use std::{
     io::{self, Cursor, Write},
@@ -19,6 +19,49 @@ const FORMATS: [ArchiveVersion; 7] = [
     ArchiveVersion::Rar30,
     ArchiveVersion::Rar40,
 ];
+
+#[test]
+fn invalid_rar29_filters_fail_before_opening_a_member_or_writing_output() {
+    let entries = [rar15_40::StreamingEntry::new(
+        b"member".to_vec(),
+        EntrySource::from_opener(1, || panic!("invalid filter opened the source")),
+    )];
+    let options = rar15_40::WriterOptions::new(ArchiveVersion::Rar29, FeatureSet::store_only());
+    let cases = [
+        (FilterKind::Delta { channels: 0 }, ErrorKind::InvalidArgument),
+        (FilterKind::Delta { channels: 33 }, ErrorKind::InvalidArgument),
+        (FilterKind::Audio { channels: 0 }, ErrorKind::InvalidArgument),
+        (FilterKind::Audio { channels: 33 }, ErrorKind::InvalidArgument),
+        (
+            FilterKind::Rgb { width: 0, pos_r: 0 },
+            ErrorKind::InvalidArgument,
+        ),
+        (
+            FilterKind::Rgb { width: 4, pos_r: 0 },
+            ErrorKind::InvalidArgument,
+        ),
+        (
+            FilterKind::Rgb { width: 3, pos_r: 3 },
+            ErrorKind::InvalidArgument,
+        ),
+        (FilterKind::Arm, ErrorKind::UnsupportedFeature),
+    ];
+    for (filter, expected) in cases {
+        let mut output = Vec::new();
+        let error = rar15_40::write_streaming_archive_to(
+            &entries,
+            options,
+            MemberCoding::Filtered(FilterPolicy::explicit(filter)),
+            None,
+            &WriterResources::default(),
+            None,
+            &mut output,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), expected, "{filter:?}: {error}");
+        assert!(output.is_empty(), "{filter:?} wrote archive bytes");
+    }
+}
 
 #[test]
 fn volume_validation_identifies_members_but_not_global_options() {

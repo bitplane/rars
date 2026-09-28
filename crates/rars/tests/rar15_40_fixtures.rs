@@ -2286,28 +2286,21 @@ fn rar15_writer_levels_control_unpack15_encoder_policy() {
         file_comment: None,
     }];
 
-    let level_one = write_compressed_archive(
-        &entries,
-        WriterOptions::new(ArchiveVersion::Rar15, FeatureSet::store_only())
-            .with_compression_level(1),
-    )
-    .unwrap();
-    let level_five = write_compressed_archive(
-        &entries,
-        WriterOptions::new(ArchiveVersion::Rar15, FeatureSet::store_only())
-            .with_compression_level(5),
-    )
-    .unwrap();
-    let level_one = Archive::parse(&level_one).unwrap();
-    let level_five = Archive::parse(&level_five).unwrap();
-    let level_one_file = level_one.files().next().unwrap();
-    let level_five_file = level_five.files().next().unwrap();
-
-    assert_eq!(level_one_file.method, 0x31);
-    assert_eq!(level_five_file.method, 0x35);
-    assert!(level_five_file.pack_size < level_one_file.pack_size);
-    assert_eq!(collect_extract(&level_one).unwrap()[0].data, data);
-    assert_eq!(collect_extract(&level_five).unwrap()[0].data, data);
+    let mut packed_sizes = [0; 6];
+    for level in 0..=5 {
+        let bytes = write_compressed_archive(
+            &entries,
+            WriterOptions::new(ArchiveVersion::Rar15, FeatureSet::store_only())
+                .with_compression_level(level),
+        )
+        .unwrap();
+        let archive = Archive::parse(&bytes).unwrap();
+        let file = archive.files().next().unwrap();
+        assert_eq!(file.method, 0x30 + level);
+        packed_sizes[usize::from(level)] = file.pack_size;
+        assert_eq!(collect_extract(&archive).unwrap()[0].data, data);
+    }
+    assert!(packed_sizes[5] < packed_sizes[1]);
 }
 
 #[test]
