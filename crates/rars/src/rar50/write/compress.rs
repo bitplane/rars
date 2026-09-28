@@ -1470,7 +1470,7 @@ mod tests {
     }
 
     #[test]
-    fn stored_compression_honours_cancellation_before_and_after_source_reads() {
+    fn compression_guards_sources_before_start_and_fallback() {
         struct Untouched;
         impl crate::streaming::SourceFactory for Untouched {
             fn len(&self) -> Result<u64> {
@@ -1526,6 +1526,27 @@ mod tests {
             .unwrap(),
             Error::Cancelled
         );
+        let running = |_: u64| true;
+        for (resources, progress) in [
+            (WriterResources::default(), &Cancelled as &dyn CompressionProgress),
+            (resources, &running as &dyn CompressionProgress),
+        ] {
+            assert_eq!(
+                compress_fallback_member(
+                    0,
+                    &EntrySource::from_factory(Untouched),
+                    (7, 0, [0; 32]),
+                    &plan,
+                    0,
+                    &resources,
+                    progress,
+                    &|_, error| error,
+                )
+                .err()
+                .unwrap(),
+                Error::Cancelled
+            );
+        }
     }
 
     #[test]
