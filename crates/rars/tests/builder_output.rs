@@ -197,3 +197,101 @@ fn legacy_recovery_requests_fail_before_reading_sources_or_writing_output() {
         }
     }
 }
+
+#[test]
+fn volume_builder_rejects_unsupported_settings_before_opening_sources() {
+    let source = || {
+        EntrySource::from_opener(7, || {
+            panic!("volume preflight must not open the member source")
+        })
+    };
+
+    let mut commented = Builder::new(ArchiveVersion::Rar50)
+        .comment(Some(b"comment".to_vec()))
+        .volume_size(Some(1024));
+    commented
+        .add_source(b"file".to_vec(), source(), None, None)
+        .unwrap();
+    assert!(matches!(
+        commented.build_volumes(None),
+        Err(rars::Error::InvalidArgument("RAR 5 volume comments are not supported"))
+    ));
+
+    let mut locked = Builder::new(ArchiveVersion::Rar50)
+        .archive_metadata(None, true, false)
+        .unwrap()
+        .volume_size(Some(1024));
+    locked
+        .add_source(b"file".to_vec(), source(), None, None)
+        .unwrap();
+    assert!(matches!(
+        locked.build_volumes(None),
+        Err(rars::Error::InvalidArgument(
+            "archive metadata settings are not supported in volume output"
+        ))
+    ));
+
+    let mut directory = Builder::new(ArchiveVersion::Rar20);
+    directory
+        .add_directory(b"directory".to_vec(), None, None)
+        .unwrap();
+    directory
+        .add_source(b"file".to_vec(), source(), None, None)
+        .unwrap();
+    assert!(matches!(
+        directory.volume_size(Some(1024)).build_volumes(None),
+        Err(rars::Error::InvalidArgument(
+            "legacy directories and symbolic links are unsupported in volume output"
+        ))
+    ));
+
+    let empty = Builder::new(ArchiveVersion::Rar20).volume_size(Some(1024));
+    assert!(matches!(
+        empty.build_volumes(None),
+        Err(rars::Error::InvalidArgument("archive builder has no entries"))
+    ));
+}
+
+#[test]
+fn legacy_builder_rejects_modern_streaming_outputs_before_creating_files() {
+    let mut builder = Builder::new(ArchiveVersion::Rar20).store(true);
+    builder
+        .add_source(
+            b"file".to_vec(),
+            EntrySource::from_opener(7, || {
+                panic!("unsupported output must not open the source")
+            }),
+            None,
+            None,
+        )
+        .unwrap();
+    let resources = rars::WriterResources::default();
+    assert!(matches!(
+        builder.to_volume_output(&resources, None),
+        Err(rars::Error::UnsupportedFamilyFeature {
+            feature: "streaming managed volume output",
+            ..
+        })
+    ));
+    let mut sink = rars::rar50::CollectedVolumes::new();
+    assert!(matches!(
+        builder.write_volumes_to(&mut sink, &resources, None),
+        Err(rars::Error::UnsupportedFamilyFeature {
+            feature: "streaming managed volume output",
+            ..
+        })
+    ));
+    assert!(sink.take().is_empty());
+
+    let root = scratch::case("builder-legacy-memory-quota");
+    let destination = root.join("archive.rar");
+    let limited = resources.with_max_memory_bytes(1024);
+    assert!(matches!(
+        builder.write_to_path_with_resources(&destination, &limited, None),
+        Err(rars::Error::UnsupportedFamilyFeature {
+            feature: "aggregate managed memory quota",
+            ..
+        })
+    ));
+    assert!(!destination.exists());
+}
