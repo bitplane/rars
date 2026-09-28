@@ -1978,6 +1978,49 @@ mod tests {
     }
 
     #[test]
+    fn streaming_writer_propagates_partial_output_failure_and_cleans_spools() {
+        struct FailingOutput {
+            remaining: usize,
+            written: usize,
+        }
+        impl Write for FailingOutput {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.remaining == 0 {
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+                let count = bytes.len().min(self.remaining);
+                self.remaining -= count;
+                self.written += count;
+                Ok(count)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let scratch = crate::scratch::case("rar50-partial-output-failure");
+        let resources = WriterResources::default().with_temp_dir(&*scratch);
+        let data = vec![42u8; 8192];
+        let entry = ArchiveEntry::new(b"file".to_vec(), EntrySource::from_bytes(data));
+        let mut output = FailingOutput {
+            remaining: 1024,
+            written: 0,
+        };
+        let error = write_streaming_archive_to(
+            &[entry],
+            WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
+                .with_compression_level(0),
+            ArchiveExtras::default(),
+            &resources,
+            &mut output,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::Io);
+        assert_eq!(output.written, 1024);
+        assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
+    }
+
+    #[test]
     fn parallel_streaming_blocks_are_byte_identical_to_serial_blocks() {
         let mut data = Vec::new();
         for index in 0..52_000u32 {
