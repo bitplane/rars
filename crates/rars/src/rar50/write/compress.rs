@@ -1511,6 +1511,21 @@ mod tests {
             .unwrap(),
             Error::Cancelled
         );
+        let token = crate::WriteCancellation::new();
+        token.cancel();
+        let resources = WriterResources::default().with_cancellation(token);
+        assert_eq!(
+            compress_members_with_context(
+                &[EntrySource::from_factory(Untouched)],
+                &plan,
+                &resources,
+                &|_| true,
+                &|_, error| error,
+            )
+            .err()
+            .unwrap(),
+            Error::Cancelled
+        );
     }
 
     #[test]
