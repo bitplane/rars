@@ -4841,6 +4841,39 @@ fn writes_compressed_rar15_volume_set_that_reader_reassembles() {
 }
 
 #[test]
+fn solid_compressed_volume_sets_keep_the_solid_main_flag() {
+    let data = b"solid split payload solid split payload ".repeat(32);
+    for (target, encrypted_headers) in [
+        (ArchiveVersion::Rar20, false),
+        (ArchiveVersion::Rar29, false),
+        (ArchiveVersion::Rar30, true),
+    ] {
+        let mut features = FeatureSet::store_only();
+        features.solid = true;
+        features.header_encryption = encrypted_headers;
+        let entry = FileEntry {
+            name: b"split-solid.txt",
+            data: &data,
+            file_time: 0,
+            file_attr: 0x20,
+            host_os: 3,
+            password: encrypted_headers.then_some(b"password".as_slice()),
+            file_comment: None,
+        };
+        let parts = write_compressed_volumes(entry, WriterOptions::new(target, features), 24)
+            .unwrap();
+        assert!(parts.len() > 1, "{target:?}");
+        let archives: Vec<_> = parts
+            .iter()
+            .map(|part| Archive::parse_with_password(part, entry.password).unwrap())
+            .collect();
+        assert!(archives.iter().all(|archive| archive.main.is_solid()), "{target:?}");
+        let extracted = collect_extract_volumes_with_password(&archives, entry.password).unwrap();
+        assert_eq!(extracted[0].data, data, "{target:?}");
+    }
+}
+
+#[test]
 fn writes_compressed_rar20_volume_set_that_reader_reassembles() {
     let entry = FileEntry {
         name: b"split-rar20-compressed.txt",
