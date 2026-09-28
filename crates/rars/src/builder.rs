@@ -1920,6 +1920,37 @@ mod tests {
     }
 
     #[test]
+    fn builder_rejects_invalid_retained_archive_metadata_at_setter() {
+        let record = crate::rar50::ArchiveMetadataRecord {
+            flags: 2,
+            name: None,
+            creation_time: None,
+        };
+        let error = crate::Builder::new(crate::ArchiveVersion::Rar50)
+            .archive_metadata(Some(record), false, false)
+            .err()
+            .unwrap();
+        assert_eq!(
+            error,
+            crate::Error::InvalidArgument("unsupported archive metadata record")
+        );
+    }
+
+    #[test]
+    fn renaming_a_member_to_its_existing_name_preserves_its_identity() {
+        use crate::{ArchiveReader, ArchiveVersion, Builder};
+
+        let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+        builder
+            .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+        let id = builder.entry_id(b"file").unwrap();
+        builder.rename_by_id(id, b"file".to_vec()).unwrap();
+        let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        assert_eq!(archive.read_member(b"file", None).unwrap().unwrap(), b"payload");
+    }
+
+    #[test]
     fn builder_rejects_unsupported_per_entry_password_shapes() {
         use crate::{ArchiveVersion, Builder, ErrorKind};
 
