@@ -164,11 +164,13 @@ impl Archive {
                 if current > last {
                     return Ok(ExtractionDecision::Stop);
                 }
+                // Finding a legacy link above confines this traversal to
+                // RAR1.5–4, whose member metadata has no redirection flag.
                 if member.is_legacy_unix_symlink() {
                     let bytes = Arc::new(Mutex::new(Some(Vec::new())));
                     targets[current] = Some(SharedBuffer(bytes.clone()));
                     Ok(ExtractionDecision::Extract(Box::new(SharedBuffer(bytes))))
-                } else if solid && !member.meta.is_directory && !member.meta.is_redirection {
+                } else if solid && !member.meta.is_directory {
                     Ok(ExtractionDecision::Extract(Box::new(std::io::sink())))
                 } else {
                     Ok(ExtractionDecision::Skip)
