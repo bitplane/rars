@@ -2039,6 +2039,8 @@ fn encode_compressed_payload(
         last = position;
         progress.is_none_or(|progress| progress.advance(delta as u64))
     };
+    // Non-solid RAR 2.9 members take the policy path in
+    // encode_or_store_payload before reaching this solid-chain encoder.
     match (target, solid_encoder) {
         (ArchiveVersion::Rar15, Some(SolidEncoder::Rar15(encoder))) => encoder
             .encode_member_with_progress(data, &mut advance)
@@ -2058,14 +2060,6 @@ fn encode_compressed_payload(
         (ArchiveVersion::Rar20, Some(SolidEncoder::Rar20(encoder))) => encoder
             .encode_member_with_progress(data, &mut advance)
             .map_err(map_codec_cancel),
-        (ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40, None) => {
-            unpack29_encode_literals_with_options_and_progress(
-                data,
-                Rar29EncodeOptions::default(),
-                &mut advance,
-            )
-            .map_err(map_codec_cancel)
-        }
         (
             ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40,
             Some(SolidEncoder::Rar29(encoder)),
