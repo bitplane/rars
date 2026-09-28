@@ -145,6 +145,16 @@ fn legacy_unicode_metadata_is_validated_and_renamed_with_its_member() {
     old.add_bytes(b"old.txt".to_vec(), b"payload".to_vec(), None, None)
         .unwrap();
     assert!(old.set_legacy_unicode_name(b"old.txt", wire).is_err());
+
+    let mut volume = Builder::new(ArchiveVersion::Rar29)
+        .store(true)
+        .volume_size(Some(512));
+    volume
+        .add_bytes(b"old.txt".to_vec(), b"payload".to_vec(), None, None)
+        .unwrap();
+    assert!(volume
+        .set_legacy_unicode_name(b"old.txt", b"old.txt\0\0".to_vec())
+        .is_err());
 }
 
 #[test]

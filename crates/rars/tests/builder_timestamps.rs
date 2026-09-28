@@ -344,4 +344,14 @@ fn legacy_extended_times_are_validated_before_the_archive_is_written() {
     assert!(old
         .set_legacy_extended_times(b"file", Some(vec![0x00, 0x90, 0x01]))
         .is_err());
+
+    let mut volume = Builder::new(ArchiveVersion::Rar29)
+        .store(true)
+        .volume_size(Some(512));
+    volume
+        .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+        .unwrap();
+    assert!(volume
+        .set_legacy_extended_times(b"file", Some(vec![0x00, 0x90, 0x01]))
+        .is_err());
 }
