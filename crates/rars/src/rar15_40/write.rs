@@ -249,17 +249,6 @@ pub fn write_streaming_archive_to(
     progress: Option<&dyn WriteProgress>,
     output: &mut dyn Write,
 ) -> Result<()> {
-    if resources.max_preparation_bytes().is_some() || resources.max_memory_bytes().is_some() {
-        return Err(Error::UnsupportedFamilyFeature {
-            family: options.target.family(),
-            feature: if resources.max_memory_bytes().is_some() {
-                "aggregate managed-memory limit"
-            } else {
-                "preparation memory quota"
-            },
-        });
-    }
-
     let members: Vec<_> = entries.iter().map(Member::from_streaming).collect();
     write_archive_to(
         &members,

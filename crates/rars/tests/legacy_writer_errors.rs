@@ -64,6 +64,48 @@ fn invalid_rar29_filters_fail_before_opening_a_member_or_writing_output() {
 }
 
 #[test]
+fn legacy_resource_limits_fail_before_opening_a_member_or_writing_output() {
+    let entries = [rar15_40::StreamingEntry::new(
+        b"member".to_vec(),
+        EntrySource::from_opener(1, || panic!("unsupported limit opened the source")),
+    )];
+    let options = rar15_40::WriterOptions::new(ArchiveVersion::Rar29, FeatureSet::store_only());
+    for (resources, expected_feature) in [
+        (
+            WriterResources::default().with_max_preparation_bytes(1),
+            "preparation memory quota",
+        ),
+        (
+            WriterResources::default().with_max_memory_bytes(1),
+            "aggregate managed-memory limit",
+        ),
+        (
+            WriterResources::default()
+                .with_max_preparation_bytes(1)
+                .with_max_memory_bytes(1),
+            "aggregate managed-memory limit",
+        ),
+    ] {
+        let mut output = Vec::new();
+        let error = rar15_40::write_streaming_archive_to(
+            &entries,
+            options,
+            MemberCoding::Stored,
+            None,
+            &resources,
+            None,
+            &mut output,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, Error::UnsupportedFamilyFeature { feature, .. } if feature == expected_feature),
+            "{error}"
+        );
+        assert!(output.is_empty());
+    }
+}
+
+#[test]
 fn volume_validation_identifies_members_but_not_global_options() {
     for format in FORMATS {
         for store in [false, true] {
