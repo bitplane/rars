@@ -325,6 +325,20 @@ impl PartialEq<Bytes> for Vec<u8> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn preparation_vint_encodes_single_and_multiple_byte_boundaries() {
+        use super::*;
+
+        let mut bytes = Bytes::new(&WriterResources::default());
+        bytes.vint(127).unwrap();
+        bytes.vint(128).unwrap();
+        bytes.vint(u64::MAX).unwrap();
+        let mut expected = vec![0x7f, 0x80, 0x01];
+        expected.extend_from_slice(&[0xff; 9]);
+        expected.push(0x01);
+        assert_eq!(bytes.as_slice(), expected);
+    }
+
+    #[test]
     fn fixed_preparation_capacity_refuses_extra_records_and_impossible_growth() {
         use super::*;
 
