@@ -946,7 +946,6 @@ fn choose_filter_inner<S: OwnedSearch>(
 pub(crate) fn walk_bytes_for_kinds(
     data: &[u8],
     screened: u64,
-    detects_x86: bool,
     encoder_candidates: usize,
 ) -> u64 {
     let member = data.len() as u64;
@@ -957,11 +956,8 @@ pub(crate) fn walk_bytes_for_kinds(
     // not knowable without scanning, so this assumes [`X86_ASSUMED_REGIONS`],
     // bounded by the member: the regions are disjoint, so however many the
     // scanner finds, their samples together cannot come to more than that.
-    let (x86_screen, x86_finalists) = if detects_x86 {
-        ((sample * X86_ASSUMED_REGIONS).min(member) * 2, 2)
-    } else {
-        (0, 0)
-    };
+    let x86_screen = (sample * X86_ASSUMED_REGIONS).min(member) * 2;
+    let x86_finalists = 2;
     // And two more per table region, on the same assumption and with the same
     // bound. Tables graft into the x86 finalists rather than earning an encode
     // of their own, and this already assumes the detector finds code, so they

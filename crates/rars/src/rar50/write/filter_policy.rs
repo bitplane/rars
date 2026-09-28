@@ -137,7 +137,6 @@ pub(super) fn filter_policy_walk_bytes(
     crate::filter_search::walk_bytes_for_kinds(
         data,
         SCREENED_KINDS.len() as u64,
-        true,
         encoder_candidates,
     )
 }
