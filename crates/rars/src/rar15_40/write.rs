@@ -1392,7 +1392,6 @@ pub(crate) fn write_stored_volumes_with_progress(
     validate_volume_writer_inputs(
         entry.name,
         entry.data,
-        entry.password,
         entry.file_comment,
         options,
     )?;
@@ -1488,7 +1487,6 @@ fn write_compressed_volumes_impl(
     validate_volume_writer_inputs(
         entry.name,
         entry.data,
-        entry.password,
         entry.file_comment,
         options,
     )?;
@@ -2189,28 +2187,12 @@ fn should_store_fallback(
 fn validate_volume_writer_inputs(
     name: &[u8],
     data: &[u8],
-    password: Option<&[u8]>,
     file_comment: Option<&[u8]>,
     options: WriterOptions,
 ) -> Result<()> {
     validate_file_entry(name, data).map_err(|error| {
         crate::write_stream::member_error(error, name, "preparing volume member")
     })?;
-    if password.is_some()
-        && !matches!(
-            options.target,
-            ArchiveVersion::Rar15
-                | ArchiveVersion::Rar20
-                | ArchiveVersion::Rar29
-                | ArchiveVersion::Rar30
-                | ArchiveVersion::Rar40
-        )
-    {
-        return Err(Error::UnsupportedFeature {
-            version: options.target,
-            feature: "RAR 2.9 encrypted volume writer",
-        });
-    }
     if file_comment.is_some() {
         return Err(Error::UnsupportedFeature {
             version: options.target,

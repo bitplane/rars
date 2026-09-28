@@ -120,6 +120,63 @@ fn legacy_resource_limits_fail_before_opening_a_member_or_writing_output() {
 }
 
 #[test]
+fn legacy_volume_preflight_rejects_unsupported_options_and_empty_payloads() {
+    let entry = rar15_40::StoredEntry {
+        name: b"member",
+        data: b"payload",
+        file_time: 0,
+        file_attr: 0x20,
+        host_os: 3,
+        password: Some(b"password"),
+        file_comment: None,
+    };
+    let plain = rar15_40::WriterOptions::new(ArchiveVersion::Rar30, FeatureSet::store_only());
+    let error = rar15_40::write_stored_volumes(
+        entry,
+        rar15_40::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only()),
+        8,
+    )
+    .unwrap_err();
+    assert!(matches!(error, Error::UnsupportedVersion(ArchiveVersion::Rar50)));
+
+    let error = rar15_40::write_stored_volumes(
+        rar15_40::StoredEntry {
+            file_comment: Some(b"comment"),
+            ..entry
+        },
+        plain,
+        8,
+    )
+    .unwrap_err();
+    assert!(matches!(error, Error::UnsupportedFeature { feature: "volume_file_comment", .. }));
+
+    let mut features = FeatureSet::store_only();
+    features.header_encryption = true;
+    let encrypted = rar15_40::WriterOptions::new(ArchiveVersion::Rar30, features);
+    let no_password = rar15_40::StoredEntry {
+        password: None,
+        ..entry
+    };
+    assert!(matches!(
+        rar15_40::write_stored_volumes(no_password, encrypted, 8),
+        Err(Error::UnsupportedWriterOption { .. })
+    ));
+    assert_eq!(
+        rar15_40::write_stored_volumes(entry, encrypted, 0)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidArgument
+    );
+    let empty = rar15_40::StoredEntry { data: b"", ..entry };
+    assert_eq!(
+        rar15_40::write_stored_volumes(empty, encrypted, 8)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidArgument
+    );
+}
+
+#[test]
 fn volume_validation_identifies_members_but_not_global_options() {
     for format in FORMATS {
         for store in [false, true] {
