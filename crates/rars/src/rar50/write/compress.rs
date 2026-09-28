@@ -313,50 +313,52 @@ pub(super) fn compress_members_with_context(
 
     let execution =
         ExecutionPlan::with_resources(plan, integrity.iter().map(|entry| entry.0), resources)?;
-    if let ExecutionPlan::IndependentMembers(ref members) = execution {
-        return compress_members_whole(
-            sources,
-            &integrity,
-            plan,
-            members,
-            resources,
-            advance,
-            error_context,
-        );
-    }
-
-    // Storing is not "compress and hope it does not help": the header records
-    // method zero, so the payload must be the source bytes.
-    let packed = if plan.method == 0 {
-        for (index, (source, (input_size, crc, hash))) in
-            sources.iter().zip(&mut integrity).enumerate()
-        {
-            advance.started(index, *input_size);
-            (*crc, *hash) =
-                super::source_integrity(source, *input_size, plan.block_size, advance, resources)
-                    .map_err(|error| error_context(index, error))?;
-            if !advance.advance(*input_size) {
-                return Err(Error::Cancelled);
-            }
-            advance.finished(index, *input_size);
+    let packed = match execution {
+        ExecutionPlan::IndependentMembers(members) => {
+            return compress_members_whole(
+                sources,
+                &integrity,
+                plan,
+                &members,
+                resources,
+                advance,
+                error_context,
+            );
         }
-        Records::collect(
-            integrity.iter().map(|_| Spool::create_parked(resources)),
-            resources,
-        )?
-    } else {
-        compress_streaming_members(
+        // Storing is not "compress and hope it does not help": the header
+        // records method zero, so the payload must be the source bytes.
+        ExecutionPlan::Stored => {
+            for (index, (source, (input_size, crc, hash))) in
+                sources.iter().zip(&mut integrity).enumerate()
+            {
+                advance.started(index, *input_size);
+                (*crc, *hash) = super::source_integrity(
+                    source,
+                    *input_size,
+                    plan.block_size,
+                    advance,
+                    resources,
+                )
+                .map_err(|error| error_context(index, error))?;
+                if !advance.advance(*input_size) {
+                    return Err(Error::Cancelled);
+                }
+                advance.finished(index, *input_size);
+            }
+            Records::collect(
+                integrity.iter().map(|_| Spool::create_parked(resources)),
+                resources,
+            )?
+        }
+        ExecutionPlan::Blocks { workspace } => compress_streaming_members(
             sources,
             &mut integrity,
             plan,
-            match execution {
-                ExecutionPlan::Blocks { workspace } => workspace,
-                _ => unreachable!("streaming execution planned"),
-            },
+            workspace,
             resources,
             advance,
             error_context,
-        )?
+        )?,
     };
 
     Records::collect(
