@@ -2469,6 +2469,49 @@ fn rar15_solid_level_zero_stores_each_member_without_a_solid_dependency() {
 }
 
 #[test]
+fn later_legacy_solid_level_zero_stores_each_member() {
+    let entries = [
+        FileEntry {
+            name: b"first",
+            data: b"shared shared shared",
+            file_time: 0,
+            file_attr: 0x20,
+            host_os: 3,
+            password: None,
+            file_comment: None,
+        },
+        FileEntry {
+            name: b"second",
+            data: b"shared shared shared again",
+            file_time: 0,
+            file_attr: 0x20,
+            host_os: 3,
+            password: None,
+            file_comment: None,
+        },
+    ];
+    let mut features = FeatureSet::store_only();
+    features.solid = true;
+    for target in [
+        ArchiveVersion::Rar20,
+        ArchiveVersion::Rar29,
+        ArchiveVersion::Rar30,
+        ArchiveVersion::Rar40,
+    ] {
+        let bytes = write_compressed_archive(
+            &entries,
+            WriterOptions::new(target, features).with_compression_level(0),
+        )
+        .unwrap();
+        let archive = Archive::parse(&bytes).unwrap();
+        assert!(archive.files().all(|file| file.method == 0x30), "{target:?}");
+        let extracted = collect_extract(&archive).unwrap();
+        assert_eq!(extracted[0].data, entries[0].data, "{target:?}");
+        assert_eq!(extracted[1].data, entries[1].data, "{target:?}");
+    }
+}
+
+#[test]
 fn writes_literal_compressed_rar20_archive_that_reader_extracts() {
     let entries = [
         FileEntry {
