@@ -5699,6 +5699,25 @@ fn header_encrypted_rar3_archive_requires_password_to_parse() {
 }
 
 #[test]
+fn header_encrypted_rar3_rejects_non_utf8_password_before_decryption() {
+    let bytes = std::fs::read(fixture("encrypted/header_enc_1234.rar")).unwrap();
+    let expected = |result: Result<Archive, Error>| {
+        assert!(matches!(
+            result,
+            Err(Error::Rar30Crypto(
+                rars::crypto::rar30::Error::NonUtf8Password
+            ))
+        ));
+    };
+
+    expected(Archive::parse_with_password(&bytes, Some(b"\xff")));
+    let root = scratch::case("non-utf8-rar3-password");
+    let path = root.join("encrypted.rar");
+    std::fs::write(&path, &bytes).unwrap();
+    expected(Archive::parse_path_with_password(&path, Some(b"\xff")));
+}
+
+#[test]
 fn extracts_rar300_header_encrypted_archive_with_password() {
     let bytes = std::fs::read(fixture("encrypted/header_rar300_password.rar")).unwrap();
     let archive = Archive::parse_with_password(&bytes, Some(b"password")).unwrap();
@@ -6369,6 +6388,17 @@ fn parses_rar300_newsub_recovery_record() {
     assert_eq!(recovery.file.method, 0x30);
     assert_eq!(recovery.file.pack_size, 5672);
     assert_eq!(recovery.file.unp_size, 5672);
+}
+
+#[test]
+fn intact_rar300_recovery_record_leaves_archive_unchanged() {
+    let bytes = std::fs::read(fixture("rar300/with_recovery_rar300.rar")).unwrap();
+    let archive = Archive::parse(&bytes).unwrap();
+    let repaired = archive.repair_protect_head_with_report().unwrap();
+
+    assert_eq!(repaired.data, bytes);
+    assert!(!repaired.report.changed);
+    assert!(!repaired.report.data_repaired);
 }
 
 #[test]
