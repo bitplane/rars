@@ -226,3 +226,73 @@ pub(super) fn run<T>(
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn delivery() -> Arc<Delivery> {
+        Arc::new(Delivery {
+            state: Mutex::new(State::default()),
+            changed: Condvar::new(),
+            cancellation: ReadCancellation::new(),
+            used: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
+    #[test]
+    fn rewrite_source_reopens_a_live_lease_and_refuses_a_consumed_one() {
+        let delivery = delivery();
+        delivery.used.store(6, Ordering::Relaxed);
+        delivery.state.lock().unwrap().ready.insert(
+            0,
+            Arc::new(Lease {
+                source: Some(EntrySource::from_bytes(b"abcdef".to_vec())),
+                size: 6,
+                used: delivery.used.clone(),
+            }),
+        );
+        let source = Source {
+            index: 0,
+            size: 6,
+            delivery: delivery.clone(),
+        };
+        let mut reader = source.open().unwrap();
+        assert_eq!(reader.seek(SeekFrom::Start(3)).unwrap(), 3);
+        let mut suffix = Vec::new();
+        reader.read_to_end(&mut suffix).unwrap();
+        assert_eq!(suffix, b"def");
+        delivery.wait_for(0).unwrap();
+        source.release();
+        assert_eq!(delivery.used.load(Ordering::Relaxed), 6);
+        drop(reader);
+        assert_eq!(delivery.used.load(Ordering::Relaxed), 0);
+        delivery.state.lock().unwrap().published.insert(0);
+        assert!(matches!(
+            source.open(),
+            Err(Error::WriterFailure("rewrite source already consumed"))
+        ));
+        delivery.state.lock().unwrap().published.clear();
+        delivery.state.lock().unwrap().done = true;
+        assert!(matches!(source.open(), Err(Error::Cancelled)));
+    }
+
+    #[test]
+    fn cancelled_delivery_refuses_waits_opens_and_publication() {
+        let delivery = delivery();
+        delivery.cancellation.cancel();
+        let source = Source {
+            index: 0,
+            size: 1,
+            delivery: delivery.clone(),
+        };
+        assert!(matches!(delivery.wait_for(1), Err(Error::Cancelled)));
+        assert!(matches!(source.open(), Err(Error::Cancelled)));
+        assert!(matches!(delivery.wait_for(0), Err(Error::Cancelled)));
+        assert!(matches!(
+            delivery.publish(0, EntrySource::from_bytes(b"x".to_vec())),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(delivery.used.load(Ordering::Relaxed), 0);
+    }
+}
