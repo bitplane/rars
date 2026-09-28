@@ -1846,9 +1846,6 @@ pub fn entry_relative_path(name: &[u8]) -> Result<std::path::PathBuf> {
             _ => return Err(Error::UnsafePath("unsafe archive path")),
         }
     }
-    if out.as_os_str().is_empty() {
-        return Err(Error::InvalidArgument("empty archive path"));
-    }
     Ok(out)
 }
 
