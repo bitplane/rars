@@ -792,13 +792,12 @@ fn compress_fallback_member(
         input_size,
         crc32,
         hash,
-        store: input_size == 0
-            || should_store_compressed_payload(
-                input_size,
-                packed.len(),
-                false,
-                &FilterPolicy::None,
-            ),
+        store: should_store_compressed_payload(
+            input_size,
+            packed.len(),
+            false,
+            &FilterPolicy::None,
+        ),
         packed,
         solid_continuation: false,
     })

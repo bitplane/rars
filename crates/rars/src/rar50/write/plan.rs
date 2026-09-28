@@ -213,6 +213,7 @@ mod tests {
         let mut settings = settings();
         let empty = ExecutionPlan::new(&settings, [0].into_iter(), 0);
         assert_eq!(empty.members()[0].workspace, 0);
+        assert_eq!(empty.members()[0].execution, Execution::WholeMember);
         settings.method = 0;
         let stored = ExecutionPlan::new(&settings, [u64::MAX].into_iter(), 0);
         assert!(matches!(stored, ExecutionPlan::Stored));
