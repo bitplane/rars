@@ -943,9 +943,7 @@ fn encode_parity_striped<B: Budget>(
 }
 
 fn scaled_progress(consumed: u64, total: u64, units: u64) -> u64 {
-    if total == 0 {
-        return units;
-    }
+    // Both callers report only after consuming body bytes, so total is nonzero.
     ((consumed as u128 * units as u128) / total as u128) as u64
 }
 
@@ -2656,6 +2654,22 @@ mod tests {
     }
 
     #[test]
+    fn rar5_recovery_planning_handles_zero_percent_and_tight_budgets() {
+        let large = plan_inline_recovery(200 * 1024, 0).unwrap();
+        assert_eq!(large.recovery_shards, 0);
+
+        let plan = plan_inline_recovery(4096, 10).unwrap();
+        let (mode, _) = super::choose_recovery_memory_mode(plan, 0).unwrap();
+        assert!(matches!(mode, super::RecoveryMemoryMode::Striped { .. }));
+
+        let allowance = super::Allowance::limited(2 * 1048576);
+        let (mode, required) =
+            super::choose_recovery_capacity_mode(plan, 2 * 1048576, &allowance).unwrap();
+        assert_eq!(mode, super::RecoveryMemoryMode::Resident);
+        assert!(required <= allowance.available());
+    }
+
+    #[test]
     fn gf16_matches_rar5_polynomial_wrap() {
         let gf = Gf16::new();
 
@@ -2750,6 +2764,39 @@ mod tests {
             assert_eq!(gf.mul(value, inverse), 1);
         }
         assert_eq!(gf.inv(0), Err(Error::SingularElement));
+    }
+
+    #[test]
+    fn gf16_public_arithmetic_matches_field_identities() {
+        let gf = Gf16::default();
+        assert_eq!(gf.add(0x1234, 0x1234), 0);
+        assert_eq!(gf.add(0x1234, 0), 0x1234);
+        assert_eq!(gf.div(0x1234, 1), Ok(0x1234));
+        assert_eq!(gf.div(0, 0x1234), Ok(0));
+        assert_eq!(gf.div(1, 0), Err(Error::SingularElement));
+    }
+
+    #[test]
+    fn rar5_recovery_errors_display_and_preserve_typed_sources() {
+        for error in [
+            Error::Cancelled,
+            Error::BadRecoveryChunk,
+            Error::OddShardSize,
+            Error::PlanOverflow,
+            Error::PrefixExceedsPlan,
+            Error::TooManyDamagedShards,
+            Error::ShardSizeMismatch,
+            Error::TooManyShards,
+            Error::SingularElement,
+            Error::RebuildTooLarge,
+            Error::Io(std::io::ErrorKind::BrokenPipe),
+        ] {
+            assert!(!error.to_string().is_empty());
+            assert!(std::error::Error::source(&error).is_none());
+        }
+        let typed = Error::TypedIo(Box::new(crate::Error::Cancelled));
+        assert_eq!(typed.to_string(), crate::Error::Cancelled.to_string());
+        assert!(std::error::Error::source(&typed).is_some());
     }
 
     #[test]
@@ -3075,6 +3122,28 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn rar5_prefix_repair_checks_protected_size_and_healthy_ranges() {
+        let prefix = b"prefix";
+        let recovery_data = build_structural_inline_recovery_data(prefix, 10).unwrap();
+        assert_eq!(
+            repair_inline_recovery_prefix_shards(prefix.len(), &recovery_data, |range| {
+                Ok(prefix[range].to_vec())
+            }),
+            Ok(Vec::new())
+        );
+        assert_eq!(
+            repair_inline_recovery_prefix(b"prefix!", &recovery_data),
+            Err(Error::BadRecoveryChunk)
+        );
+        assert_eq!(
+            repair_inline_recovery_prefix_shards(prefix.len() + 1, &recovery_data, |_| {
+                panic!("unexpected read after mismatched protected size")
+            }),
+            Err(Error::BadRecoveryChunk)
+        );
     }
 
     #[test]
