@@ -813,12 +813,6 @@ fn encode_rar29_auto_filtered_member_with_progress(
     include_ppmd: bool,
     progress: Option<&WorkTracker<'_>>,
 ) -> Result<EncodedPayload> {
-    if data.is_empty() {
-        return Ok(EncodedPayload {
-            data: Vec::new(),
-            method: 0x30,
-        });
-    }
     // The search measures the unfiltered member as one of its own candidates
     // and returns the winner's bytes, so encoding the member plainly here as
     // well was a second full pass over every binary member on the default
