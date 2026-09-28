@@ -2051,6 +2051,111 @@ mod emission_ledger_tests {
     }
 
     #[test]
+    fn volume_emission_propagates_sink_failures_before_handoff() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct State {
+            writes: usize,
+            finishes: usize,
+        }
+        struct Sink {
+            state: Arc<Mutex<State>>,
+            fail_write: Option<usize>,
+            fail_start: bool,
+            fail_flush: bool,
+            fail_finish: bool,
+        }
+        struct Volume {
+            state: Arc<Mutex<State>>,
+            fail_write: Option<usize>,
+            fail_flush: bool,
+        }
+        impl Write for Volume {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let mut state = self.state.lock().unwrap();
+                let call = state.writes;
+                state.writes += 1;
+                if self.fail_write == Some(call) {
+                    Err(std::io::Error::other("injected volume write failure"))
+                } else {
+                    Ok(bytes.len())
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                if self.fail_flush {
+                    Err(std::io::Error::other("injected volume flush failure"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        impl super::super::VolumeSink for Sink {
+            fn start_volume(&mut self, _: u64) -> Result<Box<dyn Write + Send>> {
+                if self.fail_start {
+                    return Err(std::io::Error::other("injected volume start failure").into());
+                }
+                Ok(Box::new(Volume {
+                    state: self.state.clone(),
+                    fail_write: self.fail_write,
+                    fail_flush: self.fail_flush,
+                }))
+            }
+            fn finish_volume(&mut self, _: u64, _: u64) -> Result<()> {
+                self.state.lock().unwrap().finishes += 1;
+                if self.fail_finish {
+                    Err(std::io::Error::other("injected volume finish failure").into())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let entries = [ArchiveEntry::new(
+            b"file".to_vec(),
+            crate::EntrySource::from_bytes(b"payload".to_vec()),
+        )];
+        let settings = || {
+            let mut plan = plan(false);
+            plan.recovery_percent = None;
+            plan
+        };
+        let resources = WriterResources::default();
+        let make_sink = || Sink {
+            state: Arc::new(Mutex::new(State::default())),
+            fail_write: None,
+            fail_start: false,
+            fail_flush: false,
+            fail_finish: false,
+        };
+        let mut success = make_sink();
+        write_volumes(&entries, settings(), 4096, &mut success, &resources).unwrap();
+        let writes = success.state.lock().unwrap().writes;
+        assert!(writes >= 4);
+        assert_eq!(success.state.lock().unwrap().finishes, 1);
+
+        for fail_at in 0..writes {
+            let mut sink = make_sink();
+            sink.fail_write = Some(fail_at);
+            let error = write_volumes(&entries, settings(), 4096, &mut sink, &resources)
+                .unwrap_err();
+            assert_eq!(error.kind(), crate::ErrorKind::Io, "write {fail_at}");
+            assert_eq!(sink.state.lock().unwrap().writes, fail_at + 1);
+            assert_eq!(sink.state.lock().unwrap().finishes, 0);
+        }
+        for failure in 0..3 {
+            let mut sink = make_sink();
+            sink.fail_start = failure == 0;
+            sink.fail_flush = failure == 1;
+            sink.fail_finish = failure == 2;
+            let error = write_volumes(&entries, settings(), 4096, &mut sink, &resources)
+                .unwrap_err();
+            assert_eq!(error.kind(), crate::ErrorKind::Io);
+            assert_eq!(sink.state.lock().unwrap().finishes, usize::from(failure == 2));
+        }
+    }
+
+    #[test]
     fn encryption_emission_counts_retained_preparation_and_releases_chunk() {
         let data = vec![7; 65537];
         for limit in [65536, 131072] {
