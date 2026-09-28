@@ -244,13 +244,11 @@ impl Archive {
                     .then_some(26),
                 )
                 .solid(archive.main.is_solid())
+                // Preflight accepts only CMT new-sub records, and at most one.
                 .archive_comment_password(
                     archive
                         .new_subs()
-                        .any(|sub| {
-                            sub.kind == crate::rar15_40::NewSubKind::ArchiveComment
-                                && sub.file.is_encrypted()
-                        })
+                        .any(|sub| sub.file.is_encrypted())
                         .then(|| password.clone())
                         .flatten(),
                 )
@@ -259,7 +257,7 @@ impl Archive {
                 .legacy_archive_comment_metadata(
                     archive
                         .new_subs()
-                        .find(|sub| sub.kind == crate::rar15_40::NewSubKind::ArchiveComment)
+                        .next()
                         .map(|sub| (sub.file.file_time, sub.file.host_os)),
                 ));
         }
