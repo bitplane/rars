@@ -296,6 +296,28 @@ pub(super) fn write_block(
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_header_admission_failure_leaves_output_empty() {
+        let resources = WriterResources::default().with_max_preparation_bytes(0);
+        let mut output = Bytes::new(&resources);
+        let error = write_block(&mut output, HEAD_MAIN, 0, None, &[], &[], &[], &resources)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::WriterPreparationLimitExceeded {
+                limit: 0,
+                used: 0,
+                ..
+            }
+        ));
+        assert!(output.is_empty());
+    }
+}
+
 /// Encrypts a header block under `keys`, returning `iv || ciphertext || data`.
 ///
 /// Each block gets its own IV and its own CBC chain, so headers can be built
