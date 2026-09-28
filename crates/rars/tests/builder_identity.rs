@@ -1,4 +1,4 @@
-use rars::{ArchiveReader, ArchiveVersion, Builder};
+use rars::{ArchiveReader, ArchiveVersion, Builder, EntrySource};
 
 #[test]
 fn duplicate_payloads_and_metadata_follow_ids_in_every_family() {
@@ -37,4 +37,65 @@ fn duplicate_payloads_and_metadata_follow_ids_in_every_family() {
         assert_eq!(members[0].meta.unpacked_size, 5);
         assert_eq!(members[1].meta.unpacked_size, 6);
     }
+}
+
+#[test]
+fn removing_a_duplicate_cannot_retarget_a_file_copy() {
+    let mut seed = Builder::new(ArchiveVersion::Rar50).store(true);
+    seed.add_unix_symlink(b"copy".to_vec(), b"same".to_vec(), false, None, None)
+        .unwrap();
+    let archive = ArchiveReader::read_owned(seed.to_bytes().unwrap()).unwrap();
+    let mut copy = archive.members().next().unwrap();
+    copy.meta.host_os = Some(0);
+    copy.meta.file_attr = 0x20;
+    copy.meta.unpacked_size = 7;
+    if let rars::ArchiveMemberDetail::Rar50Plus {
+        redirection: Some(link),
+        ..
+    } = &mut copy.detail
+    {
+        link.redirection_type = 5;
+        link.flags = 0;
+    }
+
+    let mut builder = Builder::new(ArchiveVersion::Rar50)
+        .store(true)
+        .allow_duplicate_names(true);
+    builder
+        .add_source(
+            b"same".to_vec(),
+            EntrySource::from_bytes(b"payload".as_slice()),
+            None,
+            None,
+        )
+        .unwrap();
+    builder.add_archive_redirection(&copy).unwrap();
+    builder
+        .add_bytes(b"same".to_vec(), b"another".to_vec(), None, None)
+        .unwrap();
+    assert!(matches!(
+        builder.remove_by_id(0),
+        Err(rars::Error::InvalidArgument(
+            "removing this duplicate would retarget a hard link or file copy"
+        ))
+    ));
+    assert_eq!(builder.member_ids().collect::<Vec<_>>(), [0, 1, 2]);
+    builder.remove_by_id(2).unwrap();
+    let output = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    assert!(output.rewrite_preservation_issues().is_empty());
+    assert_eq!(output.read_member_at(0, None).unwrap().unwrap(), b"payload");
+
+    let mut shadowed = Builder::new(ArchiveVersion::Rar50)
+        .store(true)
+        .allow_duplicate_names(true);
+    for data in [b"payload".as_slice(), b"another".as_slice()] {
+        shadowed
+            .add_bytes(b"same".to_vec(), data.to_vec(), None, None)
+            .unwrap();
+    }
+    shadowed.add_archive_redirection(&copy).unwrap();
+    shadowed.remove_by_id(0).unwrap();
+    let output = ArchiveReader::read_owned(shadowed.to_bytes().unwrap()).unwrap();
+    assert!(output.rewrite_preservation_issues().is_empty());
+    assert_eq!(output.read_member_at(0, None).unwrap().unwrap(), b"another");
 }
