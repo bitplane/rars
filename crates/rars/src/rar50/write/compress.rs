@@ -1230,6 +1230,135 @@ pub(super) fn compress_members_reporting(
 
 #[cfg(test)]
 mod tests {
+    struct Cancelled;
+
+    impl CompressionProgress for Cancelled {
+        fn advance(&self, _: u64) -> bool {
+            false
+        }
+
+        fn is_cancelled(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn cancellation_prevents_worker_dispatch_and_empty_source_open() {
+        let resources = WriterResources::default();
+        let jobs = Records::collect([1u8].into_iter().map(Ok), &resources).unwrap();
+        assert_eq!(
+            run_jobs(jobs, &resources, &Cancelled, |_, _| -> Result<u8> {
+                panic!("cancelled job was dispatched")
+            })
+            .err()
+            .unwrap(),
+            Error::Cancelled
+        );
+
+        let ledger = crate::codec::workspace::Allowance::limited(1024 * 1024);
+        let admitted = resources.with_execution_allowance(ledger.clone());
+        let jobs = Records::collect([1u8].into_iter().map(Ok), &admitted).unwrap();
+        assert_eq!(
+            run_jobs_admitted(
+                jobs,
+                &admitted,
+                &Cancelled,
+                |_| 1,
+                |_, _, _, _| -> Result<u8> { panic!("cancelled job was admitted") },
+            )
+            .err()
+            .unwrap(),
+            Error::Cancelled
+        );
+        assert_eq!(ledger.used(), 0);
+
+        let source = EntrySource::from_opener(0, || panic!("empty source was opened"));
+        assert_eq!(
+            MemberStream::new(
+                0,
+                &source,
+                0,
+                &WriterResources::default(),
+                &Cancelled,
+                &crate::codec::workspace::Allowance::default(),
+            )
+            .err()
+            .unwrap(),
+            Error::Cancelled
+        );
+    }
+
+    #[test]
+    fn a_codec_failure_takes_precedence_over_sibling_cancellation() {
+        let resources = WriterResources::default();
+        let jobs = Records::collect(
+            [
+                (None::<u8>, Some(Err::<u8, _>(Error::Cancelled))),
+                (
+                    None,
+                    Some(Err(Error::InvalidArgument("codec failure"))),
+                ),
+            ]
+            .into_iter()
+            .map(Ok),
+            &resources,
+        )
+        .unwrap();
+        let output = Records::new(2, &resources).unwrap();
+        assert_eq!(
+            complete_jobs(jobs, output, &resources, &Cancelled, |_, _, _| -> Result<u8> {
+                panic!("cancelled worker overwrote its recorded result")
+            })
+            .err()
+            .unwrap(),
+            Error::InvalidArgument("codec failure")
+        );
+    }
+
+    #[test]
+    fn stored_compression_honours_cancellation_before_and_after_source_reads() {
+        struct Untouched;
+        impl crate::streaming::SourceFactory for Untouched {
+            fn len(&self) -> Result<u64> {
+                panic!("cancelled compression measured a source")
+            }
+            fn open(&self) -> Result<Box<dyn crate::EntryReader>> {
+                panic!("cancelled compression opened a source")
+            }
+        }
+        let options = EncodeOptions::new(8);
+        let plan = CompressPlan {
+            algorithm_version: 0,
+            encode_options: options,
+            dictionary_size: 128 * 1024,
+            block_size: 4096,
+            solid: false,
+            method: 0,
+            filter_policy: FilterPolicy::None,
+            candidates: vec![options].into(),
+        };
+        let resources = WriterResources::default();
+        let source = EntrySource::from_factory(Untouched);
+        assert_eq!(
+            compress_members_with_context(&[source], &plan, &resources, &Cancelled, &|_, error| error)
+                .err()
+                .unwrap(),
+            Error::Cancelled
+        );
+        assert_eq!(
+            compress_members_with_context(
+                &[EntrySource::from_bytes(b"payload".to_vec())],
+                &plan,
+                &resources,
+                &|_| false,
+                &|_, error| error,
+            )
+            .err()
+            .unwrap(),
+            Error::Cancelled
+        );
+    }
+
     #[test]
     fn whole_waves_admit_the_sum_without_crossing_fallbacks_or_overflowing() {
         let whole = |workspace| MemberPlan {
