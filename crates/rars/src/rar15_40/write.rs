@@ -2801,10 +2801,16 @@ mod tests {
             )
             .unwrap_err(),
             super::rar29_encode_options_for_level(Some(6)).unwrap_err(),
+            super::rar20_encode_options_for_level(Some(6)).unwrap_err(),
+            super::rar15_encode_options_for_level(Some(6)).unwrap_err(),
         ] {
             assert_eq!(error.kind(), crate::ErrorKind::InvalidArgument, "{error}");
         }
         assert_eq!(super::checked_align16(17, "padding overflow").unwrap(), 32);
+        assert_eq!(
+            super::header_encryption_password([None].into_iter()).unwrap_err(),
+            crate::Error::NeedPassword
+        );
         #[cfg(target_pointer_width = "64")]
         assert_eq!(
             super::validate_member(b"large", u32::MAX as usize + 1)
