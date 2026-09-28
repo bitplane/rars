@@ -278,6 +278,34 @@ fn member_io_failures_keep_identity_through_compression_routes() {
 }
 
 #[test]
+fn volume_compression_source_failure_keeps_member_identity() {
+    let entry = rar50::ArchiveEntry::new(
+        b"failed-member".to_vec(),
+        EntrySource::from_opener(128, || {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected open failure",
+            )
+            .into())
+        }),
+    );
+    let mut sink = rar50::CollectedVolumes::new();
+    let error = rar50::write_streaming_volumes_to(
+        &[entry],
+        rar50::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::default())
+            .with_compression_level(1),
+        rar50::ArchiveExtras::default(),
+        64,
+        &mut sink,
+        &WriterResources::default(),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), rars::ErrorKind::Io);
+    assert_eq!(error.entry_context(), Some((b"failed-member".as_slice(), "compressing")));
+    assert!(sink.take().is_empty());
+}
+
+#[test]
 fn rar50_writer_rejects_aggregate_source_size_overflow_before_reading_or_emitting() {
     for version in [ArchiveVersion::Rar50, ArchiveVersion::Rar70] {
         for volumes in [false, true] {
