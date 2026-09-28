@@ -449,6 +449,88 @@ pub(super) fn dictionary_size_fields(algorithm_version: u8, size: u64) -> Result
     }
 }
 
+#[cfg(test)]
+mod dictionary_encoding_tests {
+    use super::*;
+
+    #[test]
+    fn rar5_dictionary_boundaries_and_rejections() {
+        let unit = DEFAULT_RAR50_DICTIONARY_SIZE;
+        assert_eq!(dictionary_size_fields(0, unit).unwrap(), (0, 0));
+        assert_eq!(dictionary_size_fields(0, 1u64 << 32).unwrap(), (15, 0));
+        for (size, reason) in [
+            (unit - 1, "RAR 5 v0 dictionary size must be at least 128 KiB"),
+            (
+                unit + 4096,
+                "RAR 5 v0 dictionary size must be a power-of-two multiple of 128 KiB",
+            ),
+            (
+                unit * 3,
+                "RAR 5 v0 dictionary size must be a power-of-two multiple of 128 KiB",
+            ),
+            (1u64 << 33, "RAR 5 v0 dictionary size exceeds 4 GiB"),
+        ] {
+            assert_eq!(
+                dictionary_size_fields(0, size).unwrap_err(),
+                Error::InvalidArgument(reason),
+                "size {size}"
+            );
+        }
+    }
+
+    #[test]
+    fn rar7_dictionary_boundaries_and_rejections() {
+        assert_eq!(dictionary_size_fields(1, 128 * 1024).unwrap(), (0, 0));
+        assert_eq!(dictionary_size_fields(1, 63 * 4096).unwrap(), (0, 31));
+        assert_eq!(dictionary_size_fields(1, 64 * 4096).unwrap(), (1, 0));
+        for (size, reason) in [
+            (4096, "RAR 7 dictionary size must be at least 128 KiB"),
+            (65 * 4096, "RAR 7 dictionary size is not encodable"),
+            (
+                64u64 * (1u64 << 31) * 4096,
+                "RAR 7 dictionary size is not encodable",
+            ),
+        ] {
+            assert_eq!(
+                dictionary_size_fields(1, size).unwrap_err(),
+                Error::InvalidArgument(reason),
+                "size {size}"
+            );
+        }
+    }
+
+    #[test]
+    fn dictionary_and_compression_options_reject_unsupported_encodings() {
+        for level in [6, u8::MAX] {
+            assert_eq!(
+                encode_options_for_level(Some(level), 128 * 1024).unwrap_err(),
+                Error::InvalidArgument("RAR 5 compression level must be in the range 0..5")
+            );
+        }
+        let rar5 = WriterOptions::default();
+        let rar7 = WriterOptions::new(
+            crate::ArchiveVersion::Rar70,
+            crate::FeatureSet::store_only(),
+        );
+        let fractional = 160 * 1024;
+        assert!(validate_dictionary_size(rar5.target, fractional).is_err());
+        validate_dictionary_size(rar7.target, fractional).unwrap();
+        assert_eq!(rar50_algorithm_version(rar7, 128 * 1024).unwrap(), 0);
+        assert_eq!(rar50_algorithm_version(rar7, fractional).unwrap(), 1);
+        assert_eq!(
+            rar50_algorithm_version(
+                WriterOptions::new(
+                    crate::ArchiveVersion::Rar40,
+                    crate::FeatureSet::store_only(),
+                ),
+                128 * 1024,
+            )
+            .unwrap_err(),
+            Error::UnsupportedVersion(crate::ArchiveVersion::Rar40)
+        );
+    }
+}
+
 pub(super) fn compression_info(
     algorithm_version: u8,
     method: u8,
