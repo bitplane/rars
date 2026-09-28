@@ -146,6 +146,20 @@ fn push_x86_filter_range(
 mod tests {
     use super::*;
 
+    #[test]
+    fn scanned_regions_in_members_large_enough_to_screen_are_never_short_samples() {
+        for len in 12..=64 {
+            for start in 0..len - 5 {
+                let mut data = vec![0; len];
+                data[start] = 0xe8;
+                data[start + 1] = 0xe8;
+                for region in auto_x86_filter_ranges(&data, true) {
+                    assert!(region.len() >= 12, "{len}, {start}, {region:?}");
+                }
+            }
+        }
+    }
+
     fn scalar_auto_x86_filter_ranges(data: &[u8], include_e9: bool) -> Vec<Range<usize>> {
         let mut ranges =
             scalar_auto_x86_filter_ranges_with_cluster_gap(data, include_e9, AUTO_X86_CLUSTER_GAP);

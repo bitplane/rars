@@ -500,7 +500,8 @@ fn x86_screened_regions<S: OwnedSearch>(
     for region in regions {
         let sample = screen_sample(&data[region.clone()]);
         if sample.len() < SCREEN_SAMPLE_ALIGNMENT {
-            kept.try_push((region.clone(), None))?;
+            // Scanner padding makes this possible only when the entire
+            // member is too short to provide a useful x86 sample.
             continue;
         }
         // Measured at the caller's real settings, not the cheaper screen ones.
@@ -518,7 +519,7 @@ fn x86_screened_regions<S: OwnedSearch>(
         // already ruled on where code is, so a small win on this sample is
         // evidence rather than noise.
         helped |= filtered.len() < baseline.len();
-        kept.try_push((region.clone(), Some(filtered.len())))?;
+        kept.try_push((region.clone(), filtered.len()))?;
     }
     let rejected_a_region = kept.len() < regions.len();
     if !helped {
@@ -535,11 +536,10 @@ fn x86_screened_regions<S: OwnedSearch>(
     // nothing reads.
     let mut jumps_cost_more = false;
     for (region, e8e9) in kept.iter() {
-        let Some(e8e9) = *e8e9 else { continue };
         let sample = screen_sample(&data[region.clone()]);
         let e8_only = search.filtered_bytes(sample, &[FilterSpec::whole(FilterKind::E8)])?;
         let e8_only = search.encode_plain(&e8_only, options, None)?;
-        jumps_cost_more |= e8_only.len() < e8e9;
+        jumps_cost_more |= e8_only.len() < *e8e9;
     }
 
     Ok(X86Screen {
