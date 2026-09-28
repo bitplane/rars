@@ -1434,6 +1434,44 @@ mod tests {
     }
 
     #[test]
+    fn header_encryption_rejects_conflicting_member_password_before_output() {
+        let mut features = crate::FeatureSet::store_only();
+        features.header_encryption = true;
+        let options = super::WriterOptions::new(crate::ArchiveVersion::Rar50, features);
+        let extras = super::ArchiveExtras {
+            header_password: Some(b"header password"),
+            ..Default::default()
+        };
+        let mut entry = simple_entry(b"payload");
+        entry.password = Some(b"member password".to_vec());
+
+        let mut archive = Vec::new();
+        let error = super::write_streaming_archive_to(
+            &[entry.clone()],
+            options,
+            extras.clone(),
+            &crate::WriterResources::default(),
+            &mut archive,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidArgument);
+        assert!(archive.is_empty());
+
+        let mut volumes = super::CollectedVolumes::new();
+        let error = super::write_streaming_volumes_to(
+            &[entry],
+            options,
+            extras,
+            64,
+            &mut volumes,
+            &crate::WriterResources::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidArgument);
+        assert!(volumes.take().is_empty());
+    }
+
+    #[test]
     fn quick_open_with_encrypted_headers_is_rejected_by_plan_validation() {
         let mut features = crate::FeatureSet::store_only();
         features.quick_open = true;
