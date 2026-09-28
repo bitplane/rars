@@ -231,8 +231,8 @@ impl<B: Budget> TreeMatchFinder<B> {
     /// the two are interchangeable prefixes and the new one is nearer
     /// everything to come. `cut` bounds the nodes visited,
     /// and whatever hangs below the last one is cut off rather than left
-    /// dangling. Positions with fewer than four bytes left are not inserted,
-    /// as with the chain finder. On allocation refusal, discard the finder:
+    /// dangling. The caller must skip positions with fewer than four bytes
+    /// left, as the tree collector does. On allocation refusal, discard the finder:
     /// the insertion may have been partially applied before output growth failed.
     pub(crate) fn matches(
         &mut self,
@@ -243,9 +243,8 @@ impl<B: Budget> TreeMatchFinder<B> {
         cut: usize,
         out: &mut Buffer<(u32, u32), B>,
     ) -> std::result::Result<(), B::Failure> {
-        if pos + Self::MIN_MATCH > input.len() {
-            return Ok(());
-        }
+        // The tree collector calls this only when at least four bytes remain.
+        // Unlike the chain finder, it skips near-end positions before calling.
         debug_assert!(len_limit >= Self::MIN_MATCH && pos + len_limit <= input.len());
         let hash = mix(
             u32::from_le_bytes([input[pos], input[pos + 1], input[pos + 2], input[pos + 3]]),
