@@ -1230,6 +1230,36 @@ pub(super) fn compress_members_reporting(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stored_member_descriptor_refusal_releases_preparation_charge() {
+        let options = EncodeOptions::new(8);
+        let plan = CompressPlan {
+            algorithm_version: 0,
+            encode_options: options,
+            dictionary_size: 128 * 1024,
+            block_size: 4096,
+            solid: false,
+            method: 0,
+            filter_policy: FilterPolicy::None,
+            candidates: vec![options].into(),
+        };
+        let source = EntrySource::from_bytes(b"payload".to_vec());
+        let limit = std::mem::size_of::<(u64, u32, [u8; 32])>() as u64;
+        let resources = WriterResources::default().with_max_preparation_bytes(limit);
+        let error = compress_members_reporting(&[source], plan, &resources, &|_| true)
+            .err()
+            .expect("the stored spool descriptors must exceed the integrity record");
+        assert!(matches!(
+            error,
+            Error::WriterPreparationLimitExceeded {
+                limit: actual_limit,
+                used,
+                ..
+            } if actual_limit == limit && used == limit
+        ));
+        drop(Records::<u8>::new(limit as usize, &resources).unwrap());
+    }
+
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     #[test]
     fn whole_member_cancellation_after_start_does_not_open_source() {
