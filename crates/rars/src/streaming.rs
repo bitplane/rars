@@ -126,17 +126,20 @@ struct WriterMemorySource {
 struct WriterMemoryReader {
     data: Arc<WriterMemoryData>,
     position: u64,
-    _charge: Option<CapacityCharge>,
+    _charge: CapacityCharge,
 }
 impl SourceFactory for WriterMemorySource {
     fn len(&self) -> Result<u64> {
         Ok(self.data.bytes.len() as u64)
     }
     fn open(&self) -> Result<Box<dyn EntryReader>> {
-        let mut charge = self.resources.execution_charge();
-        if let Some(charge) = &mut charge {
-            charge.grow_to(std::mem::size_of::<WriterMemoryReader>() as u64)?;
-        }
+        // WriterMemorySource is constructed only after copy_for_writer has
+        // admitted an execution charge from these same resources.
+        let mut charge = self
+            .resources
+            .execution_charge()
+            .expect("writer memory source has an execution allowance");
+        charge.grow_to(std::mem::size_of::<WriterMemoryReader>() as u64)?;
         Ok(Box::new(WriterMemoryReader {
             data: self.data.clone(),
             position: 0,
