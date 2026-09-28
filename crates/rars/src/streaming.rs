@@ -1304,6 +1304,21 @@ mod tests {
         assert!(another.write_all(b"x").is_err());
     }
 
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[test]
+    fn spool_cleanup_failure_without_quota_does_not_panic() {
+        let root = crate::scratch::case("spool-unlimited-cleanup");
+        let resources = WriterResources::default().with_temp_dir(&*root);
+        let mut spool = Spool::create(&resources).unwrap();
+        spool.write_all(b"abc").unwrap();
+        let original = spool.path.clone();
+        std::fs::rename(&original, root.join("orphan")).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        drop(spool);
+        assert!(original.is_dir());
+        assert_eq!(std::fs::read(root.join("orphan")).unwrap(), b"abc");
+    }
+
     #[test]
     fn spool_quota_is_released_on_unwind() {
         let root = crate::scratch::case("spool-quota-unwind");
