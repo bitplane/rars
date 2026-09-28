@@ -2806,6 +2806,54 @@ mod tests {
     }
 
     #[test]
+    fn rar5_inline_recovery_rejects_malformed_chunk_fields() {
+        let valid = build_structural_inline_recovery_data(b"prefix", 10).unwrap();
+        let parse = |chunk: &[u8]| {
+            super::parse_inline_recovery_chunk_with_control(
+                chunk,
+                &crate::read_control::ReadControl::default(),
+            )
+            .unwrap_err()
+        };
+        let mut cases = Vec::new();
+        cases.push(("short header", valid[..0x47].to_vec()));
+        let mut wrong_magic = valid.clone();
+        wrong_magic[0] = b'X';
+        cases.push(("wrong magic", wrong_magic));
+        let mut truncated = valid.clone();
+        truncated.pop();
+        cases.push(("truncated chunk", truncated));
+        let mut bad_crc = valid.clone();
+        bad_crc[0x40] ^= 1;
+        cases.push(("bad CRC", bad_crc));
+
+        let mut altered = |name, edit: fn(&mut Vec<u8>)| {
+            let mut chunk = valid.clone();
+            edit(&mut chunk);
+            let crc = crc64_xz(&chunk[0x0c..]);
+            chunk[0x04..0x0c].copy_from_slice(&crc.to_le_bytes());
+            cases.push((name, chunk));
+        };
+        altered("short declared header", |chunk| {
+            chunk[0x10..0x14].copy_from_slice(&0x47u32.to_le_bytes())
+        });
+        altered("header larger than chunk", |chunk| {
+            let size = u32::try_from(chunk.len()).unwrap() + 1;
+            chunk[0x10..0x14].copy_from_slice(&size.to_le_bytes());
+        });
+        altered("wrong format version", |chunk| chunk[0x14] = 2);
+        altered("wrong record version", |chunk| chunk[0x15] = 2);
+        altered("wrong shard size", |chunk| chunk[0x32] ^= 1);
+        altered("out-of-range shard index", |chunk| chunk[0x3e] = 1);
+        altered("wrong data-state count", |chunk| chunk[0x3a] = 2);
+        altered("wrong parity length", |chunk| chunk[0x2a] ^= 1);
+
+        for (name, chunk) in cases {
+            assert_eq!(parse(&chunk), Error::BadRecoveryChunk, "{name}");
+        }
+    }
+
+    #[test]
     fn rar5_parity_encoder_rejects_invalid_shard_shapes() {
         assert_eq!(encode_parity_shards(&[], 1), Err(Error::TooManyShards));
         assert_eq!(
