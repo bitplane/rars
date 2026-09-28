@@ -1,8 +1,55 @@
 #[path = "support/scratch.rs"]
 mod scratch;
 
-use rars::{ArchiveReader, ArchiveVersion, Builder, EntrySource};
+use rars::{entry_relative_path, ArchiveReader, ArchiveVersion, Builder, EntrySource};
 use std::fs;
+
+#[test]
+fn legacy_entry_paths_keep_relative_components_and_reject_escape() {
+    assert_eq!(
+        entry_relative_path(b"folder\\subdir/file.txt").unwrap(),
+        std::path::Path::new("folder/subdir/file.txt")
+    );
+    assert_eq!(
+        entry_relative_path(b"./file.txt").unwrap(),
+        std::path::Path::new("file.txt")
+    );
+    for name in [
+        b"../escape".as_slice(),
+        b"/absolute",
+        b"folder/../../escape",
+        b"",
+        b".",
+    ] {
+        assert!(entry_relative_path(name).is_err(), "{name:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_entry_paths_preserve_non_utf8_bytes_on_unix() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = entry_relative_path(b"folder/\xff.bin").unwrap();
+    assert_eq!(path.as_os_str().as_bytes(), b"folder/\xff.bin");
+}
+
+#[test]
+fn resource_aware_byte_output_matches_the_standard_builder_path() {
+    for version in [ArchiveVersion::Rar29, ArchiveVersion::Rar50] {
+        let mut builder = Builder::new(version).store(true);
+        builder
+            .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+        let expected = builder.to_bytes().unwrap();
+        let actual = builder
+            .to_bytes_with_resources(&rars::WriterResources::default(), None)
+            .unwrap();
+        assert_eq!(actual, expected, "{version:?}");
+        let archive = ArchiveReader::read_owned(actual).unwrap();
+        assert_eq!(archive.read_member(b"file", None).unwrap().unwrap(), b"payload");
+    }
+}
 
 #[test]
 fn failed_builder_writes_preserve_the_destination_and_remove_staging_files() {

@@ -90,7 +90,9 @@ fn unicode_names_take_precedence_in_metadata_and_extraction() {
                     wire.extend_from_slice(&unit.to_le_bytes());
                 }
             }
-            builder.set_legacy_unicode_name_by_id(0, wire).unwrap();
+            builder
+                .set_legacy_unicode_name("café.txt".as_bytes(), wire)
+                .unwrap();
         }
         let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
         let member = archive.members().next().unwrap();
