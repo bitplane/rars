@@ -2599,4 +2599,25 @@ mod emission_ledger_tests {
         }
         assert!(refusals > 3);
     }
+
+    #[test]
+    fn oversized_archive_metadata_is_refused_during_layout_before_output() {
+        let name = vec![b'm'; 4096];
+        let mut settings = plan(false);
+        settings.archive_comment = None;
+        settings.recovery_percent = None;
+        settings.archive_metadata = Some(super::super::ArchiveMetadataEntry {
+            name: Some(&name),
+            creation_time: Some(1),
+        });
+        let resources = WriterResources::default().with_max_preparation_bytes(128);
+        let mut output = Vec::new();
+        let error = write_archive(&[], settings, &resources, &mut output).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::WriterPreparationLimitExceeded { limit: 128, .. }
+        ));
+        assert!(output.is_empty());
+        drop(Records::<u8>::new(128, &resources).unwrap());
+    }
 }
