@@ -1607,6 +1607,21 @@ mod tests {
     }
 
     #[test]
+    fn adjacent_struct_tables_with_different_record_sizes_stay_separate() {
+        let mut data = reloc_table(4096);
+        let boundary = data.len();
+        for index in 0..8192u64 {
+            data.extend_from_slice(&(0x7f80_1234_0000 + index * 8).to_le_bytes());
+        }
+        let regions = delta_table_regions(&data, MAX_TABLE_STRIDE);
+        assert_eq!(regions.len(), 2, "{regions:?}");
+        assert_eq!(regions[0].1, 24);
+        assert_eq!(regions[1].1, 8);
+        assert_eq!(regions[0].0.end, boundary);
+        assert_eq!(regions[1].0.start, boundary);
+    }
+
+    #[test]
     fn text_and_random_bytes_do_not_scan_as_tables() {
         for data in [
             b"the quick brown fox jumps over the lazy dog ".repeat(6_000),
