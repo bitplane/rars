@@ -113,6 +113,34 @@ fn retained_legacy_comment_metadata_requires_the_comment_to_be_copied() {
 }
 
 #[test]
+fn preserving_builder_requires_password_for_encrypted_legacy_archive_comment() {
+    let mut builder = Builder::new(ArchiveVersion::Rar30)
+        .store(true)
+        .comment(Some(b"private note".to_vec()))
+        .archive_comment_password(Some(b"secret".to_vec()));
+    builder
+        .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+        .unwrap();
+    let source = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    assert!(source.rewrite_preservation_issues().is_empty());
+    assert!(matches!(source.preserving_builder(None), Err(rars::Error::NeedPassword)));
+
+    let mut preserving = source
+        .preserving_builder(Some(b"secret"))
+        .unwrap()
+        .store(true)
+        .comment(Some(b"private note".to_vec()));
+    preserving
+        .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+        .unwrap();
+    preserving.set_entry_encryption(b"file", None, None).unwrap();
+    let output = ArchiveReader::read_owned(preserving.to_bytes().unwrap()).unwrap();
+    assert!(matches!(output.comment(None), Err(rars::Error::NeedPassword)));
+    assert_eq!(output.comment(Some(b"secret")).unwrap(), Some(b"private note".to_vec()));
+    assert_eq!(output.read_member(b"file", None).unwrap().unwrap(), b"payload");
+}
+
+#[test]
 fn preserving_builder_keeps_rar7_compression_version() {
     use rars::{rar50, EntrySource, FeatureSet};
 
@@ -254,6 +282,42 @@ fn preservation_preflight_refuses_metadata_it_cannot_rewrite() {
             }
         },
         "unknown host attributes",
+    );
+    check(
+        |archive| {
+            if let rar50::Block::File(file) = &mut archive.blocks[0] {
+                file.block.flags |= 8;
+            }
+        },
+        "split-volume layout",
+    );
+    check(
+        |archive| {
+            if let rar50::Block::File(file) = &mut archive.blocks[0] {
+                file.host_os = 1;
+                file.attributes = 1 << 20;
+            }
+        },
+        "unsupported or inconsistent attributes",
+    );
+    check(
+        |archive| {
+            if let rar50::Block::File(file) = &mut archive.blocks[0] {
+                file.host_os = 1;
+                file.file_flags |= 1;
+                file.attributes = 0o100644;
+            }
+        },
+        "unsupported or inconsistent attributes",
+    );
+    check(
+        |archive| {
+            if let rar50::Block::File(file) = &mut archive.blocks[0] {
+                file.host_os = 0;
+                file.attributes = 0x10;
+            }
+        },
+        "unsupported or inconsistent attributes",
     );
     check(
         |archive| {
