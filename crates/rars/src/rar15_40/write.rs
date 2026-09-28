@@ -1014,13 +1014,12 @@ fn is_audio_filter_candidate(data: &[u8], channels: usize) -> bool {
     let mut small_delta = 0usize;
     let mut compared = 0usize;
     for start in text_sample_offsets(data.len()) {
+        // The admission check leaves at least 64 samples per channel, even
+        // for the shortest window, so every window has comparisons to make.
         let end = start
             .saturating_add(RAR29_AUDIO_SAMPLE_SIZE)
             .min(data.len());
         let aligned_start = start + ((channels - start % channels) % channels);
-        if aligned_start + channels >= end {
-            continue;
-        }
         for channel in 0..channels {
             let mut previous = None;
             let mut index = aligned_start + channel;
@@ -1039,7 +1038,7 @@ fn is_audio_filter_candidate(data: &[u8], channels: usize) -> bool {
         }
     }
 
-    compared != 0 && total_delta <= compared * 24 && small_delta * 100 >= compared * 55
+    total_delta <= compared * 24 && small_delta * 100 >= compared * 55
 }
 
 /// One member, however the caller supplied it.
@@ -3022,6 +3021,14 @@ mod tests {
         assert!(!is_audio_filter_candidate(&data, 3));
         assert!(!is_audio_filter_candidate(&data, 0));
         assert!(!is_audio_filter_candidate(&data, 5));
+    }
+
+    #[test]
+    fn audio_filter_candidate_checks_the_smallest_admitted_window() {
+        for channels in 1..=4 {
+            assert!(!is_audio_filter_candidate(&vec![0; channels * 64 - 1], channels));
+            assert!(is_audio_filter_candidate(&vec![0; channels * 64], channels));
+        }
     }
 
     #[test]
