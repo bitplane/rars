@@ -5012,6 +5012,24 @@ fn rejects_rar50_rev5_repair_inputs_with_inconsistent_metadata() {
             "RAR 5 REV recovery volume metadata differs across files"
         ))
     ));
+
+    let mut invalid_number = Rev5Volume::parse(
+        &std::fs::read(fixture("multivol_rev.part1.rev")).unwrap(),
+    )
+    .unwrap();
+    invalid_number.recovery_number = 0;
+    assert!(matches!(
+        repair_rev5_volumes_to(&data, &[invalid_number], |_, _| Ok(())),
+        Err(Error::InvalidHeader("RAR 5 REV recovery number is invalid"))
+    ));
+}
+
+#[test]
+fn rejects_non_rar50_input_to_inline_recovery() {
+    assert!(matches!(
+        rars::rar50::repair_inline_recovery_bytes(b"not a RAR archive"),
+        Err(Error::UnsupportedSignature)
+    ));
 }
 
 #[test]
