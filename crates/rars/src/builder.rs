@@ -45,8 +45,16 @@ impl PendingArchive {
     fn with_resources(destination: &Path, resources: &WriterResources) -> Result<(Self, fs::File)> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
+        Self::with_sequence(destination, resources, || NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn with_sequence(
+        destination: &Path,
+        resources: &WriterResources,
+        mut next_sequence: impl FnMut() -> u64,
+    ) -> Result<(Self, fs::File)> {
         for _ in 0..128 {
-            let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+            let sequence = next_sequence();
             let mut name = [0u8; 64];
             let mut name_writer = std::io::Cursor::new(&mut name[..]);
             write!(
@@ -1862,6 +1870,47 @@ fn unix_mode(_metadata: &fs::Metadata) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pending_archive_retries_name_collisions_and_reports_exhaustion() {
+        let root = crate::scratch::case("pending-archive-collision");
+        let destination = root.join("archive.rar");
+        let name = |sequence| format!(".rars-writing-{}-{sequence:016x}", std::process::id());
+        std::fs::write(root.join(name(0)), b"occupied").unwrap();
+        let resources = crate::WriterResources::default().with_temp_dir(&*root);
+        let mut sequence = 0;
+        let (pending, file) = super::PendingArchive::with_sequence(&destination, &resources, || {
+            let value = sequence;
+            sequence += 1;
+            value
+        })
+        .unwrap();
+        assert_eq!(sequence, 2);
+        assert_eq!(pending.path.as_deref(), Some(root.join(name(1)).as_path()));
+        drop(file);
+        drop(pending);
+
+        for sequence in 1..128 {
+            std::fs::write(root.join(name(sequence)), b"occupied").unwrap();
+        }
+        let mut sequence = 0;
+        let error = super::PendingArchive::with_sequence(&destination, &resources, || {
+            let value = sequence;
+            sequence += 1;
+            value
+        })
+        .err()
+        .unwrap();
+        assert_eq!(sequence, 128);
+        assert_eq!(error.kind(), crate::ErrorKind::Io);
+        assert_eq!(std::fs::read(root.join(name(0))).unwrap(), b"occupied");
+
+        let missing = root.join("missing/archive.rar");
+        let error = super::PendingArchive::with_sequence(&missing, &resources, || 0)
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), crate::ErrorKind::Io);
+    }
+
     #[test]
     fn converted_rar50_entries_charge_encrypted_comment_storage() {
         let resources = crate::WriterResources::default().with_max_memory_bytes(1 << 20);
