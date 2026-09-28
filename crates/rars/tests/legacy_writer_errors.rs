@@ -2,6 +2,9 @@ use rars::{
     rar13, rar15_40, ArchiveVersion, Builder, EntrySource, Error, ErrorKind, FeatureSet,
     FilterKind, FilterPolicy, MemberCoding, WriteCancellation, WriterResources,
 };
+
+#[path = "support/scratch.rs"]
+mod scratch;
 use std::{
     io::{self, Cursor, Write},
     sync::{
@@ -28,10 +31,22 @@ fn invalid_rar29_filters_fail_before_opening_a_member_or_writing_output() {
     )];
     let options = rar15_40::WriterOptions::new(ArchiveVersion::Rar29, FeatureSet::store_only());
     let cases = [
-        (FilterKind::Delta { channels: 0 }, ErrorKind::InvalidArgument),
-        (FilterKind::Delta { channels: 33 }, ErrorKind::InvalidArgument),
-        (FilterKind::Audio { channels: 0 }, ErrorKind::InvalidArgument),
-        (FilterKind::Audio { channels: 33 }, ErrorKind::InvalidArgument),
+        (
+            FilterKind::Delta { channels: 0 },
+            ErrorKind::InvalidArgument,
+        ),
+        (
+            FilterKind::Delta { channels: 33 },
+            ErrorKind::InvalidArgument,
+        ),
+        (
+            FilterKind::Audio { channels: 0 },
+            ErrorKind::InvalidArgument,
+        ),
+        (
+            FilterKind::Audio { channels: 33 },
+            ErrorKind::InvalidArgument,
+        ),
         (
             FilterKind::Rgb { width: 0, pos_r: 0 },
             ErrorKind::InvalidArgument,
@@ -120,6 +135,32 @@ fn legacy_resource_limits_fail_before_opening_a_member_or_writing_output() {
 }
 
 #[test]
+fn legacy_source_length_failure_identifies_the_member_before_output() {
+    let root = scratch::case("legacy-missing-source-length");
+    let entries = [rar15_40::StreamingEntry::new(
+        b"missing".to_vec(),
+        EntrySource::from_path(root.join("does-not-exist")),
+    )];
+    let mut output = Vec::new();
+    let error = rar15_40::write_streaming_archive_to(
+        &entries,
+        rar15_40::WriterOptions::new(ArchiveVersion::Rar29, FeatureSet::store_only()),
+        MemberCoding::Stored,
+        None,
+        &WriterResources::default(),
+        None,
+        &mut output,
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Io);
+    assert_eq!(
+        error.entry_context(),
+        Some((&b"missing"[..], "reading source"))
+    );
+    assert!(output.is_empty());
+}
+
+#[test]
 fn legacy_volume_preflight_rejects_unsupported_options_and_empty_payloads() {
     let entry = rar15_40::StoredEntry {
         name: b"member",
@@ -137,7 +178,10 @@ fn legacy_volume_preflight_rejects_unsupported_options_and_empty_payloads() {
         8,
     )
     .unwrap_err();
-    assert!(matches!(error, Error::UnsupportedVersion(ArchiveVersion::Rar50)));
+    assert!(matches!(
+        error,
+        Error::UnsupportedVersion(ArchiveVersion::Rar50)
+    ));
 
     let error = rar15_40::write_stored_volumes(
         rar15_40::StoredEntry {
@@ -148,7 +192,13 @@ fn legacy_volume_preflight_rejects_unsupported_options_and_empty_payloads() {
         8,
     )
     .unwrap_err();
-    assert!(matches!(error, Error::UnsupportedFeature { feature: "volume_file_comment", .. }));
+    assert!(matches!(
+        error,
+        Error::UnsupportedFeature {
+            feature: "volume_file_comment",
+            ..
+        }
+    ));
 
     let mut features = FeatureSet::store_only();
     features.header_encryption = true;

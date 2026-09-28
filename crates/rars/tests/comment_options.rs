@@ -20,6 +20,42 @@ const FORMATS: [ArchiveVersion; 9] = [
     ArchiveVersion::Rar70,
 ];
 
+#[test]
+fn legacy_encrypted_archive_comment_requires_comment_password_and_rar3_or_rar4() {
+    for (format, comment, password) in [
+        (ArchiveVersion::Rar30, None, b"secret".as_slice()),
+        (
+            ArchiveVersion::Rar30,
+            Some(b"comment".as_slice()),
+            b"".as_slice(),
+        ),
+        (
+            ArchiveVersion::Rar20,
+            Some(b"comment".as_slice()),
+            b"secret".as_slice(),
+        ),
+        (
+            ArchiveVersion::Rar29,
+            Some(b"comment".as_slice()),
+            b"secret".as_slice(),
+        ),
+    ] {
+        let mut builder = Builder::new(format)
+            .store(true)
+            .comment(comment.map(Vec::from))
+            .archive_comment_password(Some(password.to_vec()));
+        builder
+            .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+        let error = builder.to_bytes().unwrap_err();
+        assert_eq!(
+            error.kind(),
+            ErrorKind::InvalidArgument,
+            "{format:?}: {error}"
+        );
+    }
+}
+
 fn bytes(format: ArchiveVersion, comment: Option<&[u8]>, encrypted: bool) -> Vec<u8> {
     let mut builder = Builder::new(format).comment(comment.map(Vec::from));
     if encrypted {
