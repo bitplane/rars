@@ -1971,6 +1971,50 @@ fn repairs_rar50_inline_recovery_payload_damage() {
 }
 
 #[test]
+fn rejects_rar50_inline_recovery_when_all_recovery_chunks_are_damaged() {
+    let bytes = write_stored_archive_with_recovery(
+        &[entry(b"recoverable.txt", b"payload protected by recovery")],
+        rar50::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only()),
+        20,
+    )
+    .unwrap();
+    let archive = Archive::parse(&bytes).unwrap();
+    let recovery_range = archive.services().next().unwrap().block.data_range.clone();
+    let mut damaged = bytes;
+    damaged[recovery_range].fill(0);
+
+    let damaged_archive = Archive::parse(&damaged).unwrap();
+    assert!(matches!(
+        damaged_archive.repair_recovery(),
+        Err(Error::Rar5Recovery(
+            rars::recovery::rar5::Error::BadRecoveryChunk
+        ))
+    ));
+}
+
+#[test]
+fn rejects_rar50_inline_recovery_when_damage_exceeds_available_shards() {
+    let bytes = write_stored_archive_with_recovery(
+        &[entry(b"recoverable.txt", &vec![b'A'; 32 * 1024])],
+        rar50::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only()),
+        5,
+    )
+    .unwrap();
+    let archive = Archive::parse(&bytes).unwrap();
+    let data_range = archive.files().next().unwrap().block.data_range.clone();
+    let mut damaged = bytes;
+    damaged[data_range].fill(0xa5);
+
+    let damaged_archive = Archive::parse(&damaged).unwrap();
+    assert!(matches!(
+        damaged_archive.repair_recovery(),
+        Err(Error::Rar5Recovery(
+            rars::recovery::rar5::Error::TooManyDamagedShards
+        ))
+    ));
+}
+
+#[test]
 fn repairs_rar50_inline_recovery_header_damage_without_parsing() {
     let payload = b"payload protected by raw inline recovery fallback\n".repeat(64);
     let entries = [entry(b"header-damaged.txt", &payload)
@@ -5014,14 +5058,26 @@ fn rejects_rar50_rev5_repair_inputs_with_inconsistent_metadata() {
         ))
     ));
 
-    let mut inconsistent = rev.clone();
-    inconsistent.data_volumes[0].crc32 ^= 1;
-    assert!(matches!(
-        repair_rev5_volumes_to(&data, &[rev, inconsistent], |_, _| Ok(())),
-        Err(Error::InvalidHeader(
-            "RAR 5 REV recovery volume metadata differs across files"
-        ))
-    ));
+    for field in 0..5 {
+        let mut inconsistent = rev.clone();
+        match field {
+            0 => inconsistent.version ^= 1,
+            1 => inconsistent.data_count += 1,
+            2 => inconsistent.recovery_count += 1,
+            3 => inconsistent.data_volumes[0].crc32 ^= 1,
+            4 => inconsistent.payload.pop().map(|_| ()).unwrap(),
+            _ => unreachable!(),
+        }
+        assert!(
+            matches!(
+                repair_rev5_volumes_to(&data, &[rev.clone(), inconsistent], |_, _| Ok(())),
+                Err(Error::InvalidHeader(
+                    "RAR 5 REV recovery volume metadata differs across files"
+                ))
+            ),
+            "metadata field {field}"
+        );
+    }
 
     let mut invalid_number = Rev5Volume::parse(
         &std::fs::read(fixture("multivol_rev.part1.rev")).unwrap(),
@@ -5097,6 +5153,23 @@ fn repairs_corrupt_rar50_data_volume_from_rev5_recovery_volume() {
     ];
 
     let repaired = repair_rev5_volumes(&inputs, &[first_rev]).unwrap();
+
+    assert_eq!(repaired, expected);
+}
+
+#[test]
+fn repairs_truncated_rar50_data_volume_from_rev5_recovery_volume() {
+    let mut data: Vec<_> = (1..=5)
+        .map(|index| std::fs::read(fixture(&format!("multivol_rev.part{index}.rar"))).unwrap())
+        .collect();
+    let expected = data.clone();
+    let truncated_len = data[1].len() / 2;
+    data[1].truncate(truncated_len);
+    let rev =
+        Rev5Volume::parse(&std::fs::read(fixture("multivol_rev.part1.rev")).unwrap()).unwrap();
+    let inputs: Vec<_> = data.iter().map(|bytes| Some(bytes.as_slice())).collect();
+
+    let repaired = repair_rev5_volumes(&inputs, &[rev]).unwrap();
 
     assert_eq!(repaired, expected);
 }
