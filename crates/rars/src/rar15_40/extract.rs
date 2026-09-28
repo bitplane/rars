@@ -1635,6 +1635,25 @@ mod tests {
         assert_eq!(pending.packed_size(&volumes).unwrap(), 12);
     }
 
+    #[test]
+    fn pending_split_refs_rejects_advertised_packed_size_overflow() {
+        let mut first = file(b"a.txt", FHD_SPLIT_AFTER);
+        first.pack_size = u64::MAX;
+        let mut second = file(b"a.txt", FHD_SPLIT_BEFORE);
+        second.pack_size = 1;
+
+        let mut pending = PendingSplitRefs::new(&first, 0, 0);
+        pending.append(&second, 1, 0).unwrap();
+        let volumes = vec![
+            archive_with(vec![Block::File(first)]),
+            archive_with(vec![Block::File(second)]),
+        ];
+        assert_eq!(
+            pending.packed_size(&volumes).unwrap_err(),
+            Error::InvalidHeader("RAR 1.5 split packed size overflows usize")
+        );
+    }
+
     #[derive(Default, Clone)]
     struct Capture {
         bytes: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,

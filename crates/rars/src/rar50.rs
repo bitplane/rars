@@ -3279,7 +3279,7 @@ mod tests {
     }
 
     #[test]
-    fn read_vint_at_rejects_values_wider_than_u64() {
+    fn read_vint_at_rejects_overflow_and_overlong_continuations() {
         let max = [0xff; 9].into_iter().chain([0x01]).collect::<Vec<_>>();
         assert_eq!(read_vint_at(&max, 0, max.len()).unwrap(), (u64::MAX, 10));
 
@@ -3287,6 +3287,12 @@ mod tests {
         assert_eq!(
             read_vint_at(&overflow, 0, overflow.len()),
             Err(Error::InvalidHeader("RAR 5 vint overflows u64"))
+        );
+
+        let overlong = [0x80; 10];
+        assert_eq!(
+            read_vint_at(&overlong, 0, overlong.len()),
+            Err(Error::InvalidHeader("RAR 5 vint is too long"))
         );
     }
 
