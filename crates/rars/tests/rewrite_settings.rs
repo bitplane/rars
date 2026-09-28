@@ -26,7 +26,32 @@ fn preserving_builder_accepts_native_unix_directories() {
         assert!(output.rewrite_preservation_issues().is_empty());
         let directory = output.members().next().unwrap();
         assert!(directory.meta.is_directory);
+        assert_eq!(directory.meta.attr_source(), rars::AttrSource::Unix);
         assert_eq!(directory.meta.file_attr & 0o170777, 0o040750);
+    }
+}
+
+#[test]
+fn preserving_builder_refuses_unix_device_entries() {
+    for version in [ArchiveVersion::Rar20, ArchiveVersion::Rar29, ArchiveVersion::Rar50] {
+        let mut builder = Builder::new(version).store(true);
+        builder
+            .add_bytes(b"device".to_vec(), Vec::new(), None, Some(0o020600))
+            .unwrap();
+        let source = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        let member = source.members().next().unwrap();
+        assert_eq!(member.meta.attr_source(), rars::AttrSource::Unix);
+        assert!(!member.meta.is_directory);
+        assert!(
+            source
+                .rewrite_preservation_issues()
+                .iter()
+                .any(|issue| issue.contains("special entry type or directory contents")),
+            "{version:?}: attr={:o}, issues={:?}",
+            member.meta.file_attr,
+            source.rewrite_preservation_issues()
+        );
+        assert!(source.preserving_builder(None).is_err());
     }
 }
 
