@@ -95,6 +95,11 @@ fn unsupported_link_options_leave_entries_unchanged() {
         .unwrap();
     assert!(builder.set_dos_attributes(b"link", 0x20).is_err());
     assert!(builder.volume_size(Some(4096)).build_volumes(None).is_err());
+    let mut volume = Builder::new(ArchiveVersion::Rar50).volume_size(Some(4096));
+    assert!(volume
+        .add_unix_symlink(b"link".to_vec(), b"target".to_vec(), false, None, None)
+        .is_err());
+    assert!(volume.is_empty());
     let mut legacy = Builder::new(ArchiveVersion::Rar15);
     assert!(legacy
         .add_unix_symlink(b"link".to_vec(), b"target".to_vec(), false, None, None)
