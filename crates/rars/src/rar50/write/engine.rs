@@ -98,12 +98,27 @@ enum PlainPayload<'a> {
     Packed(Spool),
 }
 
-impl<'a> From<PlainPayload<'a>> for Payload<'a> {
-    fn from(plain: PlainPayload<'a>) -> Self {
-        match plain {
-            PlainPayload::Borrowed(data) => Self::Borrowed(data),
-            PlainPayload::Stored(source) => Self::Stored(source),
-            PlainPayload::Packed(packed) => Self::Packed(packed),
+// Member payloads cannot borrow comment/service bytes. Keeping their two
+// forms distinct avoids an impossible borrowed arm during plain emission.
+enum MemberPlainPayload {
+    Stored(PreparedSource),
+    Packed(Spool),
+}
+
+impl From<MemberPlainPayload> for PlainPayload<'_> {
+    fn from(member: MemberPlainPayload) -> Self {
+        match member {
+            MemberPlainPayload::Stored(source) => Self::Stored(source),
+            MemberPlainPayload::Packed(packed) => Self::Packed(packed),
+        }
+    }
+}
+
+impl From<MemberPlainPayload> for Payload<'_> {
+    fn from(member: MemberPlainPayload) -> Self {
+        match member {
+            MemberPlainPayload::Stored(source) => Self::Stored(source),
+            MemberPlainPayload::Packed(packed) => Self::Packed(packed),
         }
     }
 }
@@ -698,9 +713,9 @@ fn prepare_member(
         member.packed.len()
     };
     let plain = if member.store {
-        PlainPayload::Stored(PreparedSource::new(&entry.source, &member))
+        MemberPlainPayload::Stored(PreparedSource::new(&entry.source, &member))
     } else {
-        PlainPayload::Packed(member.packed)
+        MemberPlainPayload::Packed(member.packed)
     };
 
     let mut extra = Bytes::new(resources);
@@ -727,7 +742,7 @@ fn prepare_member(
             let hash = keys.mac_hash32(member.hash);
             (
                 Payload::Encrypted {
-                    plain: Owned::new(plain, resources)?,
+                    plain: Owned::new(plain.into(), resources)?,
                     keys,
                     iv,
                 },
