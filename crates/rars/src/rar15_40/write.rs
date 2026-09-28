@@ -388,7 +388,7 @@ fn write_archive_to(
         header_password,
         archive_comment_password,
         resources,
-        Some(&work),
+        &work,
         output,
     );
     result?;
@@ -408,7 +408,7 @@ fn write_members_to(
     header_password: Option<&[u8]>,
     archive_comment_password: Option<&[u8]>,
     resources: &WriterResources,
-    progress: Option<&WorkTracker<'_>>,
+    progress: &WorkTracker<'_>,
     output: &mut dyn Write,
 ) -> Result<()> {
     output.write_all(RAR15_SIGNATURE)?;
@@ -469,7 +469,7 @@ fn write_members_to(
                 options,
                 solid_continuation,
                 header_password,
-                progress.and_then(WorkTracker::reporter),
+                progress.reporter(),
             )
             .map_err(|error| crate::write_stream::member_error(error, member.name, "writing"))?;
         }
@@ -490,7 +490,7 @@ fn write_members_to(
                     options,
                     false,
                     header_password,
-                    progress.and_then(WorkTracker::reporter),
+                    progress.reporter(),
                 )
                 .map_err(|error| crate::write_stream::member_error(error, member.name, "writing"))
             },
@@ -1146,11 +1146,9 @@ fn encode_member<'a>(
     coding: &MemberCoding,
     solid_encoder: &mut Option<SolidEncoder>,
     resources: &WriterResources,
-    progress: Option<&WorkTracker<'_>>,
+    progress: &WorkTracker<'_>,
 ) -> Result<EncodedMember<'a>> {
-    if let Some(progress) = progress {
-        progress.check()?;
-    }
+    progress.check()?;
     let unpacked_size = member.unpacked_size()?;
     validate_member(member.name, unpacked_size)?;
     if member.is_directory {
@@ -1163,7 +1161,7 @@ fn encode_member<'a>(
     }
     let _permit = resources.acquire_serialising_cancellable(
         member_workspace(options, unpacked_size as u64, coding.compresses()),
-        &|| progress.is_some_and(WorkTracker::is_cancelled),
+        &|| progress.is_cancelled(),
     )?;
 
     // Legacy link targets must not become dependencies of later solid data:
@@ -1189,12 +1187,10 @@ fn encode_member<'a>(
             file_crc: {
                 let mut crc = Crc32::new();
                 member.bytes.walk_with_progress(
-                    progress.and_then(WorkTracker::reporter),
+                    progress.reporter(),
                     |chunk| {
                         crc.update(chunk);
-                        if let Some(progress) = progress {
-                            progress.advance(chunk.len() as u64);
-                        }
+                        progress.advance(chunk.len() as u64);
                     },
                 )?;
                 crc.finish()
@@ -1204,33 +1200,27 @@ fn encode_member<'a>(
 
     let data = member
         .bytes
-        .load_with_progress(progress.and_then(WorkTracker::reporter))?;
+        .load_with_progress(progress.reporter())?;
     let mut crc = Crc32::new();
     for chunk in data.chunks(64 * 1024) {
-        if let Some(progress) = progress {
-            progress.check()?;
-        }
+        progress.check()?;
         crc.update(chunk);
         if !coding.compresses() {
-            if let Some(progress) = progress {
-                progress.advance(chunk.len() as u64);
-            }
+            progress.advance(chunk.len() as u64);
         }
     }
     let file_crc = crc.finish();
-    if let Some(progress) = progress {
-        progress.check()?;
-    }
+    progress.check()?;
     let payload = match coding {
         MemberCoding::Stored => EncodedPayload {
             data: data.into_owned(),
             method: 0x30,
         },
         MemberCoding::Compressed => {
-            encode_or_store_payload(&data, options, solid_encoder, progress)?
+            encode_or_store_payload(&data, options, solid_encoder, Some(progress))?
         }
         MemberCoding::Filtered(policy) => {
-            encode_filtered_payload(&data, policy, options, solid_encoder, progress)?
+            encode_filtered_payload(&data, policy, options, solid_encoder, Some(progress))?
         }
     };
     Ok(EncodedMember {
