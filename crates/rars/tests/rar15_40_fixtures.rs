@@ -4442,6 +4442,45 @@ fn ppmd_rar29_writer_embeds_vm_filter_record() {
 }
 
 #[test]
+fn solid_rar29_forced_ppmd_keeps_explicit_filters_self_contained() {
+    let first = b"\xe8\0\0\0\0first filtered ppmd payload\n".repeat(16);
+    let second = b"\xe8\0\0\0\0second filtered ppmd payload\n".repeat(16);
+    let entries = [
+        FileEntry {
+            name: b"first",
+            data: &first,
+            file_time: 0,
+            file_attr: 0x20,
+            host_os: 3,
+            password: None,
+            file_comment: None,
+        },
+        FileEntry {
+            name: b"second",
+            data: &second,
+            file_time: 0,
+            file_attr: 0x20,
+            host_os: 3,
+            password: None,
+            file_comment: None,
+        },
+    ];
+    let mut features = FeatureSet::store_only();
+    features.solid = true;
+    let bytes = write_rar29_compressed_archive_with_filter_policy(
+        &entries,
+        WriterOptions::new(ArchiveVersion::Rar29, features).with_method(Rar29Method::Ppmd),
+        FilterPolicy::explicit(FilterKind::E8),
+    )
+    .unwrap();
+    let archive = Archive::parse(&bytes).unwrap();
+    assert!(archive.main.is_solid());
+    let extracted = collect_extract(&archive).unwrap();
+    assert_eq!(extracted[0].data, first);
+    assert_eq!(extracted[1].data, second);
+}
+
+#[test]
 fn writes_solid_compressed_rar15_archive_that_reader_extracts() {
     let entries = [
         FileEntry {
