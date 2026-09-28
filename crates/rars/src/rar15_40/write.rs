@@ -1800,17 +1800,9 @@ fn compression_method_for_level(options: WriterOptions) -> Result<u8> {
     if level == 0 {
         return Ok(0x30);
     }
-    if matches!(
-        options.target,
-        ArchiveVersion::Rar20
-            | ArchiveVersion::Rar15
-            | ArchiveVersion::Rar29
-            | ArchiveVersion::Rar30
-            | ArchiveVersion::Rar40
-    ) {
-        return Ok(0x30 + level);
-    }
-    Ok(0x33)
+    // Every production caller has passed the target-family preflight before
+    // resolving a method byte.
+    Ok(0x30 + level)
 }
 
 enum SolidEncoder {
