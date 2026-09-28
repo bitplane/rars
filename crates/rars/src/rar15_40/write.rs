@@ -3196,6 +3196,25 @@ mod tests {
     }
 
     #[test]
+    fn repeated_high_entropy_text_keeps_lz_when_ppmd_loses() {
+        let mut state = 0x9e37_79b9u32;
+        let mut block = Vec::with_capacity(64 * 1024);
+        for _ in 0..64 * 1024 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            block.push(b' ' + (state % 95) as u8);
+        }
+        let mut data = block.clone();
+        data.extend_from_slice(&block);
+        assert!(super::is_text_ppmd_candidate(&data));
+        let options = EncodeOptions::default();
+        let offered = encode_rar29_auto_filtered_member(&data, options, 0x35, true).unwrap();
+        let lz_only = encode_rar29_auto_filtered_member(&data, options, 0x35, false).unwrap();
+        assert_eq!(offered.data, lz_only.data);
+    }
+
+    #[test]
     fn auto_x86_filter_ranges_include_code_section_spans() {
         let mut data = vec![0x41; 32_000];
         for pos in [4096, 4128, 4160] {
