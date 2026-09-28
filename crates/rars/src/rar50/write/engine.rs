@@ -2525,4 +2525,43 @@ mod emission_ledger_tests {
         }
         assert!(refusals > 3, "the test must cross several admission sites");
     }
+
+    #[test]
+    fn volume_preparation_refusals_release_capacity_at_each_boundary() {
+        let entries = [ArchiveEntry::new(
+            b"payload".to_vec(),
+            crate::EntrySource::from_bytes(b"contents".to_vec()),
+        )];
+        let mut limit = 0;
+        let mut refusals = 0;
+        loop {
+            let resources = WriterResources::default().with_max_preparation_bytes(limit);
+            let mut settings = plan(false);
+            settings.compress.method = 0;
+            settings.recovery_percent = None;
+            let mut volumes = super::super::CollectedVolumes::new();
+            match write_volumes(&entries, settings, 4096, &mut volumes, &resources) {
+                Ok(()) => {
+                    assert_eq!(volumes.take().len(), 1);
+                    break;
+                }
+                Err(error) => match error.root_cause() {
+                    Error::WriterPreparationLimitExceeded {
+                        limit: actual_limit,
+                        required,
+                        ..
+                    } => {
+                        assert_eq!(*actual_limit, limit);
+                        assert!(*required > limit);
+                        refusals += 1;
+                        drop(Records::<u8>::new(limit as usize, &resources).unwrap());
+                        limit = *required;
+                        assert!(limit < 1024 * 1024, "tiny volumes used {limit} bytes of preparation");
+                    }
+                    _ => panic!("unexpected preparation failure: {error}"),
+                },
+            }
+        }
+        assert!(refusals > 3, "the test must cross several admission sites");
+    }
 }
