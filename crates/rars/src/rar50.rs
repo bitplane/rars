@@ -2436,6 +2436,58 @@ mod tests {
     }
 
     #[test]
+    fn preservation_preflight_rejects_unknown_parsed_file_and_comment_extras() {
+        let mut builder = crate::Builder::new(crate::ArchiveVersion::Rar50)
+            .store(true)
+            .comment(Some(b"archive note".to_vec()));
+        builder
+            .add_bytes(b"payload.txt".to_vec(), b"payload bytes".to_vec(), None, None)
+            .unwrap();
+        let crate::Archive::Rar50Plus(seed) =
+            crate::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap()
+        else {
+            panic!("expected RAR5 archive")
+        };
+        let baseline = crate::Archive::Rar50Plus(seed.clone()).rewrite_preservation_issues();
+        assert!(baseline.is_empty(), "{baseline:?}");
+
+        // An extra byte in a CRC-valid main header is readable, but cannot
+        // be claimed to survive a rewrite.
+        let mut header = vec![4, HEAD_MAIN as u8, 0, 0, 0];
+        let mut malformed = RAR50_SIGNATURE.to_vec();
+        malformed.extend_from_slice(&crc32(&header).to_le_bytes());
+        malformed.append(&mut header);
+        let parsed = Archive::parse(&malformed).unwrap();
+        assert!(!parsed.main.rewrite_metadata_complete);
+        assert!(crate::Archive::Rar50Plus(parsed)
+            .rewrite_preservation_issues()
+            .iter()
+            .any(|issue| issue.contains("main header metadata")));
+
+        let unknown = [1, 64];
+        let control = crate::read_control::ReadControl::default();
+        for service in [false, true] {
+            let mut candidate = seed.clone();
+            let file = candidate
+                .blocks
+                .iter_mut()
+                .find_map(|block| match block {
+                    Block::File(file) if !service => Some(file),
+                    Block::Service(file) if service && file.name == b"CMT" => Some(file),
+                    _ => None,
+                })
+                .unwrap();
+            file.block.extra_area_size = Some(unknown.len() as u64);
+            parse_file_extra_area(&unknown, 0..unknown.len(), service, file, &control).unwrap();
+            assert!(!file.rewrite_metadata_complete);
+
+            let issues = crate::Archive::Rar50Plus(candidate).rewrite_preservation_issues();
+            let expected = if service { "service record" } else { "member 0" };
+            assert!(issues.iter().any(|issue| issue.contains(expected)), "{issues:?}");
+        }
+    }
+
+    #[test]
     fn file_extra_records_preserve_readable_metadata_and_limit_rewrites() {
         let archive = build_archive_with_optional_comment(None);
         let original = archive.files().next().unwrap();
