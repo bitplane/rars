@@ -727,9 +727,17 @@ pub(crate) struct Spool {
 impl Spool {
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub(crate) fn create(resources: &WriterResources) -> Result<Self> {
+        Self::create_with_sequence(resources, || SPOOL_SEQUENCE.fetch_add(1, Ordering::Relaxed))
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn create_with_sequence(
+        resources: &WriterResources,
+        mut next_sequence: impl FnMut() -> u64,
+    ) -> Result<Self> {
         let directory = resources.temp_dir().unwrap_or_else(|| Path::new("."));
         for _ in 0..128 {
-            let sequence = SPOOL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let sequence = next_sequence();
             let mut name = [0u8; 64];
             let mut name_writer = std::io::Cursor::new(&mut name[..]);
             write!(
@@ -1317,6 +1325,44 @@ mod tests {
         drop(spool);
         assert!(original.is_dir());
         assert_eq!(std::fs::read(root.join("orphan")).unwrap(), b"abc");
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[test]
+    fn spool_creation_retries_collisions_and_reports_exhaustion() {
+        let root = crate::scratch::case("spool-name-collision");
+        let name = |sequence| format!(".rars-spool-{}-{sequence:016x}", std::process::id());
+        std::fs::write(root.join(name(0)), b"occupied").unwrap();
+        let resources = WriterResources::default().with_temp_dir(&*root);
+        let mut sequence = 0;
+        let spool = Spool::create_with_sequence(&resources, || {
+            let value = sequence;
+            sequence += 1;
+            value
+        })
+        .unwrap();
+        assert_eq!(sequence, 2);
+        assert_eq!(spool.path, root.join(name(1)));
+        drop(spool);
+
+        for sequence in 1..128 {
+            std::fs::write(root.join(name(sequence)), b"occupied").unwrap();
+        }
+        let mut sequence = 0;
+        let error = Spool::create_with_sequence(&resources, || {
+            let value = sequence;
+            sequence += 1;
+            value
+        })
+        .err()
+        .unwrap();
+        assert_eq!(sequence, 128);
+        assert_eq!(error.kind(), crate::ErrorKind::Io);
+        assert_eq!(std::fs::read(root.join(name(0))).unwrap(), b"occupied");
+
+        let missing = WriterResources::default().with_temp_dir(root.join("missing"));
+        let error = Spool::create_with_sequence(&missing, || 0).err().unwrap();
+        assert_eq!(error.kind(), crate::ErrorKind::Io);
     }
 
     #[test]
