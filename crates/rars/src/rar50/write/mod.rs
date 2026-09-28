@@ -1054,6 +1054,22 @@ fn validate_service(service: &ServiceEntry) -> Result<()> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn empty_volume_set_is_rejected_before_opening_a_sink() {
+        let mut sink = super::CollectedVolumes::new();
+        let error = super::write_streaming_volumes_to(
+            &[],
+            super::WriterOptions::default(),
+            super::ArchiveExtras::default(),
+            4096,
+            &mut sink,
+            &crate::WriterResources::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidArgument);
+        assert!(sink.take().is_empty());
+    }
+
+    #[test]
     fn invalid_writer_inputs_and_internal_failures_have_distinct_categories() {
         for error in [
             super::validate_file_entry(b"").unwrap_err(),

@@ -1488,10 +1488,9 @@ impl VolumeWriter<'_> {
     }
 
     fn finish(mut self) -> Result<()> {
-        if self.body.is_some() {
-            self.finish_volume(false)?;
-        }
-        Ok(())
+        // The public volume entry point rejects empty member lists; each
+        // nonempty member starts a volume, even when its payload is empty.
+        self.finish_volume(false)
     }
 
     fn start_volume(&mut self) -> Result<()> {
@@ -1674,15 +1673,13 @@ fn fragment_header(
         resources,
     )?;
 
-    let mut flags = HFL_DATA;
+    // Every fragment has a hash record, so its extra area is never empty.
+    let mut flags = HFL_DATA | HFL_EXTRA;
     if split_before {
         flags |= crate::rar50::HFL_SPLIT_BEFORE;
     }
     if split_after {
         flags |= crate::rar50::HFL_SPLIT_AFTER;
-    }
-    if !extra.is_empty() {
-        flags |= HFL_EXTRA;
     }
     match header_keys {
         Some(keys) => encrypted_header_block(
