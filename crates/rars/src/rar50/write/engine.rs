@@ -2714,4 +2714,74 @@ mod emission_ledger_tests {
             assert_eq!(resources.preparation_in_use(), 0, "admission {index}");
         }
     }
+
+    #[test]
+    fn recovery_releases_preparation_for_each_injected_admission_failure() {
+        use std::sync::atomic::Ordering;
+
+        let entries = [ArchiveEntry::new(
+            b"payload".to_vec(),
+            crate::EntrySource::from_bytes(b"contents".to_vec()),
+        )];
+        let run = |resources: &WriterResources| -> Result<Vec<u8>> {
+            let mut settings = plan(false);
+            settings.compress.method = 0;
+            let mut output = Vec::new();
+            write_archive(&entries, settings, resources, &mut output)?;
+            Ok(output)
+        };
+        let (resources, attempts) = WriterResources::default()
+            .refuse_preparation_growth_at(usize::MAX);
+        assert!(!run(&resources).unwrap().is_empty());
+        let count = attempts.load(Ordering::Relaxed);
+        assert!(count > 10);
+        assert!(count < 200, "unexpectedly many preparation admissions");
+        assert_eq!(resources.preparation_in_use(), 0);
+
+        for index in 0..count {
+            let (resources, _) = WriterResources::default().refuse_preparation_growth_at(index);
+            let error = run(&resources).unwrap_err();
+            assert_eq!(
+                error.root_cause(),
+                &Error::WriterFailure("injected preparation admission failure"),
+                "admission {index}"
+            );
+            assert_eq!(resources.preparation_in_use(), 0, "admission {index}");
+        }
+    }
+
+    #[test]
+    fn volume_recovery_releases_preparation_for_each_injected_admission_failure() {
+        use std::sync::atomic::Ordering;
+
+        let entries = [ArchiveEntry::new(
+            b"payload".to_vec(),
+            crate::EntrySource::from_bytes(b"contents".to_vec()),
+        )];
+        let run = |resources: &WriterResources| -> Result<usize> {
+            let mut settings = plan(false);
+            settings.compress.method = 0;
+            let mut volumes = super::super::CollectedVolumes::new();
+            write_volumes(&entries, settings, 4096, &mut volumes, resources)?;
+            Ok(volumes.take().len())
+        };
+        let (resources, attempts) = WriterResources::default()
+            .refuse_preparation_growth_at(usize::MAX);
+        assert!(run(&resources).unwrap() > 0);
+        let count = attempts.load(Ordering::Relaxed);
+        assert!(count > 10);
+        assert!(count < 200, "unexpectedly many preparation admissions");
+        assert_eq!(resources.preparation_in_use(), 0);
+
+        for index in 0..count {
+            let (resources, _) = WriterResources::default().refuse_preparation_growth_at(index);
+            let error = run(&resources).unwrap_err();
+            assert_eq!(
+                error.root_cause(),
+                &Error::WriterFailure("injected preparation admission failure"),
+                "admission {index}"
+            );
+            assert_eq!(resources.preparation_in_use(), 0, "admission {index}");
+        }
+    }
 }
