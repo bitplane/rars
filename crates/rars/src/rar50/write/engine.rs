@@ -2101,7 +2101,7 @@ mod emission_ledger_tests {
         }
     }
 
-    fn plan(encrypted: bool) -> EnginePlan<'static> {
+    fn plan<'a>(encrypted: bool) -> EnginePlan<'a> {
         let options = crate::codec::rar50::EncodeOptions::new(8).with_max_match_distance(131072);
         EnginePlan {
             compress: CompressPlan {
@@ -2131,6 +2131,44 @@ mod emission_ledger_tests {
             quick_open: false,
             progress: None,
         }
+    }
+
+    #[test]
+    fn volume_emission_reports_compression_completion() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let finished = AtomicBool::new(false);
+        let report = |event: crate::WriteProgressEvent<'_>| {
+            if matches!(
+                event,
+                crate::WriteProgressEvent::OperationFinished {
+                    operation: crate::WriteOperation::Compression,
+                    total_bytes: Some(7),
+                    total_entries: Some(1),
+                    ..
+                }
+            ) {
+                finished.store(true, Ordering::Relaxed);
+            }
+        };
+        let mut plan = plan(false);
+        plan.progress = Some(ProgressReporter(&report));
+        plan.recovery_percent = None;
+        let entries = [ArchiveEntry::new(
+            b"file".to_vec(),
+            crate::EntrySource::from_bytes(b"payload".to_vec()),
+        )];
+        let mut sink = super::super::CollectedVolumes::new();
+        write_volumes(&entries, plan, 4096, &mut sink, &WriterResources::default()).unwrap();
+        assert!(finished.load(Ordering::Relaxed));
+        assert_eq!(sink.take().len(), 1);
+    }
+
+    #[test]
+    fn an_existing_member_context_is_not_wrapped_again() {
+        let original = Error::InvalidArgument("source changed").at_entry(b"file".to_vec(), "reading");
+        let error = member_error(original, b"file", "writing");
+        assert_eq!(error.entry_context(), Some((b"file".as_slice(), "reading")));
     }
 
     #[test]
