@@ -2564,4 +2564,39 @@ mod emission_ledger_tests {
         }
         assert!(refusals > 3, "the test must cross several admission sites");
     }
+
+    #[test]
+    fn encrypted_archive_preparation_refusals_release_capacity() {
+        let entries = [ArchiveEntry::new(
+            b"payload".to_vec(),
+            crate::EntrySource::from_bytes(b"contents".to_vec()),
+        )
+        .with_password(b"secret")];
+        let mut limit = 0;
+        let mut refusals = 0;
+        loop {
+            let resources = WriterResources::default().with_max_preparation_bytes(limit);
+            let mut settings = plan(true);
+            settings.compress.method = 0;
+            settings.recovery_percent = None;
+            let mut output = Vec::new();
+            match write_archive(&entries, settings, &resources, &mut output) {
+                Ok(()) => {
+                    assert!(!output.is_empty());
+                    break;
+                }
+                Err(error) => match error.root_cause() {
+                    Error::WriterPreparationLimitExceeded { required, .. } => {
+                        assert!(*required > limit);
+                        refusals += 1;
+                        drop(Records::<u8>::new(limit as usize, &resources).unwrap());
+                        limit = *required;
+                        assert!(limit < 64 * 1024, "encrypted archive used too much preparation");
+                    }
+                    _ => panic!("unexpected preparation failure: {error}"),
+                },
+            }
+        }
+        assert!(refusals > 3);
+    }
 }
