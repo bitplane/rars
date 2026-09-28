@@ -4874,6 +4874,29 @@ fn solid_compressed_volume_sets_keep_the_solid_main_flag() {
 }
 
 #[test]
+fn compressed_rar29_volumes_keep_requested_dictionary_size() {
+    let data = b"dictionary override across split volumes ".repeat(16);
+    let entry = FileEntry {
+        name: b"dictionary.txt",
+        data: &data,
+        file_time: 0,
+        file_attr: 0x20,
+        host_os: 3,
+        password: None,
+        file_comment: None,
+    };
+    let options = WriterOptions::new(ArchiveVersion::Rar29, FeatureSet::store_only())
+        .with_dictionary_size(2 * 1024 * 1024);
+    let parts = write_compressed_volumes(entry, options, 24).unwrap();
+    assert!(parts.len() > 1);
+    let archives: Vec<_> = parts.iter().map(|part| Archive::parse(part).unwrap()).collect();
+    assert!(archives
+        .iter()
+        .all(|archive| archive.files().next().unwrap().block.flags & 0x00e0 == 0x00a0));
+    assert_eq!(collect_extract_volumes(&archives).unwrap()[0].data, data);
+}
+
+#[test]
 fn writes_compressed_rar20_volume_set_that_reader_reassembles() {
     let entry = FileEntry {
         name: b"split-rar20-compressed.txt",
