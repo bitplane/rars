@@ -3506,6 +3506,26 @@ mod tests {
     }
 
     #[test]
+    fn flagged_but_missing_file_comment_does_not_hide_the_member() {
+        let mut bytes = stored_archive_bytes(b"entry", b"payload");
+        let file_start = RAR15_SIGNATURE.len() + MAIN_HEADER_SIZE;
+        let head_size = usize::from(u16::from_le_bytes(
+            bytes[file_start + 5..file_start + 7].try_into().unwrap(),
+        ));
+        let flags = u16::from_le_bytes(
+            bytes[file_start + 3..file_start + 5].try_into().unwrap(),
+        ) | FHD_COMMENT;
+        bytes[file_start + 3..file_start + 5].copy_from_slice(&flags.to_le_bytes());
+        test_write_header_crc(&mut bytes[file_start..file_start + head_size], 0);
+
+        let archive = Archive::parse(&bytes).unwrap();
+        let file = archive.files().next().unwrap();
+        assert_eq!(file.name, b"entry");
+        assert!(!file.has_file_comment());
+        assert_eq!(file.packed_data(&archive).unwrap(), b"payload");
+    }
+
+    #[test]
     fn encrypted_header_readers_reject_short_prefixes_and_declared_headers() {
         let mut cache = EncryptedHeaderCipherCache::default();
         for size in [0u16, 6, 17, 65] {

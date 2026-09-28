@@ -6372,6 +6372,31 @@ fn parses_rar300_newsub_recovery_record() {
 }
 
 #[test]
+fn preserves_unknown_rar300_service_records_without_hiding_files() {
+    let mut bytes = std::fs::read(fixture("rar300/with_recovery_rar300.rar")).unwrap();
+    let original = Archive::parse(&bytes).unwrap();
+    let recovery = original.new_subs().next().unwrap();
+    let start = recovery.file.block.offset;
+    let name_start = start + 32;
+    assert_eq!(&bytes[name_start..name_start + 2], b"RR");
+    bytes[name_start..name_start + 2].copy_from_slice(b"XY");
+    rewrite_recovery_header_crc(&mut bytes, start, recovery.file.block.head_size as usize);
+
+    let parsed = Archive::parse(&bytes).unwrap();
+    assert!(matches!(
+        parsed.new_subs().next().unwrap().kind,
+        NewSubKind::Unknown(ref name) if name == b"XY"
+    ));
+    assert_eq!(parsed.files().count(), original.files().count());
+
+    let root = scratch::case("unknown-rar300-service-record");
+    let path = root.join("unknown-service.rar");
+    std::fs::write(&path, &bytes).unwrap();
+    let seekable = Archive::parse_path(&path).unwrap();
+    assert_eq!(seekable.blocks, parsed.blocks);
+}
+
+#[test]
 fn rar300_recovery_rejects_stored_size_mismatch_in_archive_bytes() {
     let mut bytes = std::fs::read(fixture("rar300/with_recovery_rar300.rar")).unwrap();
     let clean = Archive::parse(&bytes).unwrap();
