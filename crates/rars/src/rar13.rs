@@ -1693,7 +1693,7 @@ fn write_archive_to(
     write_main_header(&mut head, options.features, archive_comment)?;
     output.write_all(&head)?;
 
-    let encode_options = rar15_encode_options_for_level(options.compression_level)?;
+    let encode_options = rar15_encode_options_for_level(options.compression_level);
     let mut solid_encoder = (options.features.solid && coding.compresses())
         .then(|| Unpack15Encoder::with_options(encode_options));
 
@@ -2031,7 +2031,7 @@ pub fn write_compressed_volumes_with_progress(
         options,
     )?;
 
-    let encode_options = rar15_encode_options_for_level(options.compression_level)?;
+    let encode_options = rar15_encode_options_for_level(options.compression_level);
     let total_work = (entry.data.len() as u64)
         .saturating_mul(rar15_encode_fallback_options(encode_options).len() as u64);
     let reporting = &control as &dyn WriteProgress;
@@ -2178,32 +2178,23 @@ fn validate_volume_writer_inputs(
     Ok(())
 }
 
-fn rar15_encode_options_for_level(level: Option<u8>) -> Result<Rar15EncodeOptions> {
-    let level = level.unwrap_or(5);
-    let compatible = Rar15EncodeOptions::new();
-    match level {
-        0 => Ok(compatible
-            .with_lazy_matching(false)
-            .with_stmode_literal_runs(false)
-            .with_max_long_match_distance(0)),
-        1 => Ok(compatible
-            .with_lazy_matching(false)
-            .with_stmode_literal_runs(false)
-            .with_max_long_match_distance(4 * 1024)),
-        2 => Ok(compatible
-            .with_lazy_matching(false)
-            .with_stmode_literal_runs(false)
-            .with_max_long_match_distance(8 * 1024)),
-        3 => Ok(compatible
-            .with_lazy_matching(false)
-            .with_max_long_match_distance(16 * 1024)),
-        4 => Ok(compatible
-            .with_lazy_matching(false)
-            .with_max_long_match_distance(24 * 1024)),
-        5 => Ok(compatible),
-        _ => Err(Error::InvalidArgument(
-            "RAR compression level must be in the range 0..5",
-        )),
+fn rar15_encode_options_for_level(level: Option<u8>) -> Rar15EncodeOptions {
+    // Both callers have validated 0..=5 before resolving the encoder policy.
+    let level = usize::from(level.unwrap_or(5));
+    let options = Rar15EncodeOptions::new()
+        .with_lazy_matching(level == 5)
+        .with_stmode_literal_runs(level >= 3);
+    let max_distance = [
+        Some(0),
+        Some(4 * 1024),
+        Some(8 * 1024),
+        Some(16 * 1024),
+        Some(24 * 1024),
+        None,
+    ][level];
+    match max_distance {
+        Some(distance) => options.with_max_long_match_distance(distance),
+        None => options,
     }
 }
 
@@ -3228,7 +3219,7 @@ mod tests {
     #[test]
     fn rar14_writer_uses_old_distance_tokens() {
         for level in 0..=5 {
-            let options = rar15_encode_options_for_level(Some(level)).unwrap();
+            let options = rar15_encode_options_for_level(Some(level));
             assert!(
                 options.old_distance_tokens_enabled(),
                 "RAR 1.4 level {level} should consider old-distance tokens"
@@ -3240,11 +3231,9 @@ mod tests {
     fn rar14_level_five_uses_lazy_matching() {
         for level in 0..5 {
             assert!(!rar15_encode_options_for_level(Some(level))
-                .unwrap()
                 .lazy_matching_enabled());
         }
         assert!(rar15_encode_options_for_level(Some(5))
-            .unwrap()
             .lazy_matching_enabled());
     }
 
@@ -4697,7 +4686,7 @@ mod tests {
 
     #[test]
     fn level_four_uses_a_distinct_verified_fallback_plan() {
-        let options = rar15_encode_options_for_level(Some(4)).unwrap();
+        let options = rar15_encode_options_for_level(Some(4));
         let candidates = rar15_encode_fallback_options(options);
         assert_eq!(candidates.len(), 2);
 
