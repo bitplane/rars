@@ -3509,6 +3509,36 @@ mod tests {
     }
 
     #[test]
+    fn repaired_legacy_volume_keeps_missing_end_block_and_nonzero_trailer() {
+        let mut bytes = stored_archive_bytes(b"entry", b"payload");
+        let end_start = bytes.len();
+        bytes.extend_from_slice(&[0, 0, ENDARC_HEAD, 0, 0, 7, 0]);
+        test_write_header_crc(&mut bytes[end_start..], 0);
+        let archive = Archive::parse(&bytes).unwrap();
+        let end = archive
+            .blocks
+            .iter()
+            .find_map(|block| match block {
+                Block::End(end) => Some(end),
+                _ => None,
+            })
+            .unwrap();
+        let mut without_end = bytes[..end.offset].to_vec();
+        assert!(Archive::parse(&without_end).unwrap().files().next().is_some());
+        assert_eq!(
+            truncate_repaired_rev3_volume(without_end.clone()).unwrap(),
+            without_end
+        );
+
+        without_end = bytes;
+        without_end.extend_from_slice(b"not padding");
+        assert_eq!(
+            truncate_repaired_rev3_volume(without_end.clone()).unwrap(),
+            without_end
+        );
+    }
+
+    #[test]
     fn encrypted_header_readers_reject_short_prefixes_and_declared_headers() {
         let mut cache = EncryptedHeaderCipherCache::default();
         for size in [0u16, 6, 17, 65] {
