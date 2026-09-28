@@ -2767,6 +2767,31 @@ fn write_comment_header_crc(out: &mut [u8], start: usize) {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn retained_archive_comment_metadata_requires_rar3_or_4_comment() {
+        let mut options = super::WriterOptions::new(
+            crate::ArchiveVersion::Rar30,
+            crate::FeatureSet::store_only(),
+        );
+        options.archive_comment_metadata = Some((123, 0));
+        let shape = crate::write_plan::PlanShape::new();
+        assert_eq!(
+            super::validate_plan(options, shape, false, false).unwrap_err(),
+            crate::Error::InvalidArgument(
+                "retained archive comment metadata requires a RAR3/4 archive comment"
+            )
+        );
+        options.target = crate::ArchiveVersion::Rar20;
+        assert_eq!(
+            super::validate_plan(options, shape, true, false).unwrap_err(),
+            crate::Error::InvalidArgument(
+                "retained archive comment metadata requires a RAR3/4 archive comment"
+            )
+        );
+        options.target = crate::ArchiveVersion::Rar30;
+        assert!(super::validate_plan(options, shape, true, false).is_ok());
+    }
+
+    #[test]
     fn writer_limits_and_invalid_options_are_not_archive_corruption() {
         for error in [
             super::validate_member(b"", 0).unwrap_err(),
