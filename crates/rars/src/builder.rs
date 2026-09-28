@@ -1633,35 +1633,32 @@ impl Builder {
         let entries: Vec<_> = self
             .entries
             .iter()
-            .map(|entry| rar15_40::FileEntry {
-                name: &entry.name,
-                data: &entry.data,
-                file_time: entry.mtime.unwrap_or(0),
-                file_attr: entry.rar15_attr(),
-                host_os: entry.rar15_host_os(),
-                password: entry
-                    .encryption
-                    .as_ref()
-                    .map_or(self.password.as_deref(), |encryption| {
-                        encryption.data_password.as_deref()
-                    }),
-                file_comment: entry.file_comment.as_deref(),
-            })
-            .collect();
-        let metadata: Vec<_> = self
-            .entries
-            .iter()
-            .map(|entry| rar15_40::RetainedMemberMetadata {
-                unicode_name: entry.legacy_unicode_name.as_deref(),
-                unpack_version: self.legacy_unpack_version,
-                extended_times: entry.legacy_extended_times.as_deref(),
-                is_directory: entry.is_directory,
-                is_symlink: matches!(entry.attributes, EntryAttributes::Unix(mode) if mode & 0o170000 == 0o120000),
+            .map(|entry| rar15_40::RetainedFileEntry {
+                file: rar15_40::FileEntry {
+                    name: &entry.name,
+                    data: &entry.data,
+                    file_time: entry.mtime.unwrap_or(0),
+                    file_attr: entry.rar15_attr(),
+                    host_os: entry.rar15_host_os(),
+                    password: entry
+                        .encryption
+                        .as_ref()
+                        .map_or(self.password.as_deref(), |encryption| {
+                            encryption.data_password.as_deref()
+                        }),
+                    file_comment: entry.file_comment.as_deref(),
+                },
+                metadata: rar15_40::RetainedMemberMetadata {
+                    unicode_name: entry.legacy_unicode_name.as_deref(),
+                    unpack_version: self.legacy_unpack_version,
+                    extended_times: entry.legacy_extended_times.as_deref(),
+                    is_directory: entry.is_directory,
+                    is_symlink: matches!(entry.attributes, EntryAttributes::Unix(mode) if mode & 0o170000 == 0o120000),
+                },
             })
             .collect();
         rar15_40::write_archive_with_retained_metadata(
             &entries,
-            &metadata,
             self.rar15_options(),
             if self.store {
                 crate::write_plan::MemberCoding::Stored

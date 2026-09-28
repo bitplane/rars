@@ -101,12 +101,16 @@ pub(crate) struct RetainedMemberMetadata<'a> {
     pub(crate) is_symlink: bool,
 }
 
+pub(crate) struct RetainedFileEntry<'a> {
+    pub(crate) file: FileEntry<'a>,
+    pub(crate) metadata: RetainedMemberMetadata<'a>,
+}
+
 /// Builder path for retained native metadata and entry kinds. Existing direct
 /// entry structs keep their API.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_archive_with_retained_metadata(
-    entries: &[FileEntry<'_>],
-    metadata: &[RetainedMemberMetadata<'_>],
+    entries: &[RetainedFileEntry<'_>],
     options: WriterOptions,
     coding: MemberCoding,
     archive_comment: Option<&[u8]>,
@@ -114,55 +118,21 @@ pub(crate) fn write_archive_with_retained_metadata(
     header_password: Option<&[u8]>,
     archive_comment_password: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
-    if entries.len() != metadata.len() {
-        return Err(Error::InvalidArgument(
-            "retained metadata count does not match members",
-        ));
-    }
-    let mut members: Vec<_> = entries.iter().map(Member::from_file).collect();
-    for (member, metadata) in members.iter_mut().zip(metadata) {
-        if let Some(raw) = metadata.extended_times {
-            if !matches!(
-                options.target,
-                ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
-            ) {
-                return Err(Error::InvalidArgument(
-                    "legacy extended timestamps require RAR2.9–4.x output",
-                ));
-            }
-            crate::file_times::validate_legacy_extended_times(raw)?;
-        }
-        if metadata.unpack_version.is_some()
-            && !(options.target == ArchiveVersion::Rar20 && metadata.unpack_version == Some(26))
-        {
-            return Err(Error::InvalidArgument(
-                "unsupported retained legacy unpacker version",
-            ));
-        }
-        if let Some(raw) = metadata.unicode_name {
-            super::validate_unicode_name(raw, member.name)?;
-        }
-        member.unicode_name = metadata.unicode_name;
-        member.unpack_version = metadata.unpack_version;
-        member.extended_times = metadata.extended_times;
-        member.is_directory = metadata.is_directory;
-        member.is_symlink = metadata.is_symlink;
-        if member.is_directory
-            && (member.unpacked_size()? != 0
-                || !matches!(
-                    options.target,
-                    ArchiveVersion::Rar15
-                        | ArchiveVersion::Rar20
-                        | ArchiveVersion::Rar29
-                        | ArchiveVersion::Rar30
-                        | ArchiveVersion::Rar40
-                ))
-        {
-            return Err(Error::InvalidArgument(
-                "legacy directories require empty RAR1.5–4.x entries",
-            ));
-        }
-    }
+    // Builder validates retained records at their setters and constructs each
+    // file with its metadata, so neither record validity nor array length can
+    // change at this private handoff.
+    let members: Vec<_> = entries
+        .iter()
+        .map(|entry| {
+            let mut member = Member::from_file(&entry.file);
+            member.unicode_name = entry.metadata.unicode_name;
+            member.unpack_version = entry.metadata.unpack_version;
+            member.extended_times = entry.metadata.extended_times;
+            member.is_directory = entry.metadata.is_directory;
+            member.is_symlink = entry.metadata.is_symlink;
+            member
+        })
+        .collect();
     let mut out = Vec::new();
     write_archive_to(
         &members,
