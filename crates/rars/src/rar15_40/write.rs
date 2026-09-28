@@ -1338,8 +1338,8 @@ pub(crate) fn write_stored_volumes_with_progress(
     let resources = WriterResources::default();
     let control =
         crate::write_progress::ResourceProgress::new(&resources, progress.map(ProgressReporter));
-    let progress = Some(&control as &dyn WriteProgress);
-    crate::write_progress::check_cancelled(progress.map(ProgressReporter))?;
+    let progress = ProgressReporter(&control);
+    crate::write_progress::check_cancelled(Some(progress))?;
     validate_plan(options, PlanShape::new().volumes(true), false, false)?;
     validate_volume_writer_inputs(
         entry.name,
@@ -1349,7 +1349,7 @@ pub(crate) fn write_stored_volumes_with_progress(
     )?;
     if options.features.header_encryption {
         return write_header_encrypted_split_volumes(SplitVolumeRecord {
-            progress: progress.map(ProgressReporter),
+            progress,
             name: entry.name,
             unpacked: entry.data,
             packed: entry.data,
@@ -1367,7 +1367,7 @@ pub(crate) fn write_stored_volumes_with_progress(
     }
 
     write_split_volumes(SplitVolumeRecord {
-        progress: progress.map(ProgressReporter),
+        progress,
         name: entry.name,
         unpacked: entry.data,
         packed: entry.data,
@@ -1415,7 +1415,7 @@ pub fn write_compressed_volumes_with_progress(
         WriteOperation::Compression,
         total_work,
     );
-    let result = write_compressed_volumes_impl(entry, options, max_packed_per_volume, Some(&work));
+    let result = write_compressed_volumes_impl(entry, options, max_packed_per_volume, &work);
     let result = result?;
     if !work.finish() {
         return Err(Error::Cancelled);
@@ -1429,7 +1429,7 @@ fn write_compressed_volumes_impl(
     entry: FileEntry<'_>,
     mut options: WriterOptions,
     max_packed_per_volume: usize,
-    progress: Option<&WorkTracker<'_>>,
+    progress: &WorkTracker<'_>,
 ) -> Result<Vec<Vec<u8>>> {
     validate_plan(
         options,
@@ -1453,13 +1453,15 @@ fn write_compressed_volumes_impl(
     }
 
     let mut solid_encoder = None;
-    let payload = encode_or_store_payload(entry.data, options, &mut solid_encoder, progress)
+    let payload = encode_or_store_payload(entry.data, options, &mut solid_encoder, Some(progress))
         .map_err(|error| {
             crate::write_stream::member_error(error, entry.name, "compressing volume member")
         })?;
     if options.features.header_encryption {
         return write_header_encrypted_split_volumes(SplitVolumeRecord {
-            progress: progress.and_then(WorkTracker::reporter),
+            progress: progress
+                .reporter()
+                .expect("volume compression has a resource reporter"),
             name: entry.name,
             unpacked: entry.data,
             packed: &payload.data,
@@ -1477,7 +1479,9 @@ fn write_compressed_volumes_impl(
     }
 
     write_split_volumes(SplitVolumeRecord {
-        progress: progress.and_then(WorkTracker::reporter),
+        progress: progress
+            .reporter()
+            .expect("volume compression has a resource reporter"),
         name: entry.name,
         unpacked: entry.data,
         packed: &payload.data,
@@ -2529,7 +2533,7 @@ fn dictionary_flags_for_target(target: ArchiveVersion) -> u16 {
 }
 
 struct SplitVolumeRecord<'a> {
-    progress: Option<ProgressReporter<'a>>,
+    progress: ProgressReporter<'a>,
     name: &'a [u8],
     unpacked: &'a [u8],
     packed: &'a [u8],
@@ -2546,23 +2550,21 @@ struct SplitVolumeRecord<'a> {
 }
 
 fn report_volume(
-    progress: Option<ProgressReporter<'_>>,
+    progress: ProgressReporter<'_>,
     index: usize,
     total: usize,
     bytes: usize,
 ) -> Result<()> {
-    if let Some(progress) = progress {
-        progress.report(WriteProgressEvent::VolumeFinished {
-            volume_number: index + 1,
-            total_volumes: Some(total),
-            bytes: bytes as u64,
-        });
-    }
-    crate::write_progress::check_cancelled(progress)
+    progress.report(WriteProgressEvent::VolumeFinished {
+        volume_number: index + 1,
+        total_volumes: Some(total),
+        bytes: bytes as u64,
+    });
+    crate::write_progress::check_cancelled(Some(progress))
 }
 
 fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
-    crate::write_progress::check_cancelled(entry.progress)?;
+    crate::write_progress::check_cancelled(Some(entry.progress))?;
     if entry.max_packed_per_volume == 0 {
         return Err(Error::InvalidArgument(
             "RAR 1.5 volume payload size must be non-zero",
@@ -2596,7 +2598,7 @@ fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
     let mut volumes = Vec::with_capacity(chunks.len());
     let unpacked_crc = crc32(entry.unpacked);
     for (index, chunk) in chunks.iter().enumerate() {
-        crate::write_progress::check_cancelled(entry.progress)?;
+        crate::write_progress::check_cancelled(Some(entry.progress))?;
         let split_before = index > 0;
         let split_after = index + 1 < chunks.len();
         let mut file_flags = base_flags;
@@ -2650,7 +2652,7 @@ fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
 }
 
 fn write_header_encrypted_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
-    crate::write_progress::check_cancelled(entry.progress)?;
+    crate::write_progress::check_cancelled(Some(entry.progress))?;
     validate_header_encrypted_archive_options(entry.target, entry.password.is_some())?;
     let password = entry.password.ok_or(Error::NeedPassword)?;
     if entry.max_packed_per_volume == 0 {
@@ -2682,7 +2684,7 @@ fn write_header_encrypted_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<
     let mut volumes = Vec::with_capacity(chunks.len());
     let unpacked_crc = crc32(entry.unpacked);
     for (index, chunk) in chunks.iter().enumerate() {
-        crate::write_progress::check_cancelled(entry.progress)?;
+        crate::write_progress::check_cancelled(Some(entry.progress))?;
         let split_before = index > 0;
         let split_after = index + 1 < chunks.len();
         let mut file_flags = base_flags;
