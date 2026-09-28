@@ -24,6 +24,28 @@ const FORMATS: [ArchiveVersion; 7] = [
 ];
 
 #[test]
+fn invalid_legacy_compression_level_fails_before_member_io_or_output() {
+    let entries = [rar15_40::StreamingEntry::new(
+        b"member".to_vec(),
+        EntrySource::from_opener(1, || panic!("invalid level opened the source")),
+    )];
+    let mut output = Vec::new();
+    let error = rar15_40::write_streaming_archive_to(
+        &entries,
+        rar15_40::WriterOptions::new(ArchiveVersion::Rar29, FeatureSet::store_only())
+            .with_compression_level(6),
+        MemberCoding::Compressed,
+        None,
+        &WriterResources::default(),
+        None,
+        &mut output,
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::UnsupportedFeature);
+    assert!(output.is_empty());
+}
+
+#[test]
 fn invalid_rar29_filters_fail_before_opening_a_member_or_writing_output() {
     let entries = [rar15_40::StreamingEntry::new(
         b"member".to_vec(),

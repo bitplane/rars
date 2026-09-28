@@ -1788,21 +1788,15 @@ fn dictionary_flags_for_size(size: usize) -> Result<u16> {
     Ok((bits as u16) << 5)
 }
 
-fn compression_method_for_level(options: WriterOptions) -> Result<u8> {
+// Callers have passed `validate_plan`, including compression-level validation.
+fn compression_method_for_level(options: WriterOptions) -> u8 {
     let Some(level) = options.compression_level else {
-        return Ok(0x33);
+        return 0x33;
     };
-    if level > 5 {
-        return Err(Error::InvalidArgument(
-            "RAR compression level must be in the range 0..5",
-        ));
-    }
     if level == 0 {
-        return Ok(0x30);
+        return 0x30;
     }
-    // Every production caller has passed the target-family preflight before
-    // resolving a method byte.
-    Ok(0x30 + level)
+    0x30 + level
 }
 
 enum SolidEncoder {
@@ -1849,7 +1843,7 @@ fn encode_filtered_payload(
     solid_encoder: &mut Option<SolidEncoder>,
     progress: Option<&WorkTracker<'_>>,
 ) -> Result<EncodedPayload> {
-    let lz_method = compression_method_for_level(options)?;
+    let lz_method = compression_method_for_level(options);
     let codes_through_the_chain = lz_method != 0x30
         && matches!(solid_encoder, Some(SolidEncoder::Rar29(_)))
         // A named filter under forced PPMd is the one request the chain cannot
@@ -1942,7 +1936,7 @@ fn encode_or_store_payload(
         )
     {
         let encode_options = rar29_encode_options_for_options(options)?;
-        let lz_method = compression_method_for_level(options)?;
+        let lz_method = compression_method_for_level(options);
         // Forcing PPMd leaves nothing for a filter search to measure against.
         let policy = if options.method == Rar29Method::Ppmd {
             FilterPolicy::None
@@ -1971,7 +1965,7 @@ fn encode_or_store_payload(
     }
     Ok(EncodedPayload {
         data: compressed,
-        method: compression_method_for_level(options)?,
+        method: compression_method_for_level(options),
     })
 }
 
@@ -1999,7 +1993,7 @@ fn encode_rar29_chain_member(
     // content question here as in a non-solid archive, so it gets the same
     // answer and the same gate: a level willing to encode the member twice, and
     // content that looks like PPMd will win on it.
-    let level = compression_method_for_level(options)?.saturating_sub(0x30);
+    let level = compression_method_for_level(options).saturating_sub(0x30);
     let engine = match options.method {
         Rar29Method::Lz => ChainEngine::Lz,
         Rar29Method::Ppmd => ChainEngine::Ppmd,
@@ -2982,12 +2976,11 @@ mod tests {
             target: crate::ArchiveVersion::Rar30,
             ..Default::default()
         };
-        let default_level = super::compression_method_for_level(options).unwrap();
+        let default_level = super::compression_method_for_level(options);
         let named_level = super::compression_method_for_level(crate::rar15_40::WriterOptions {
             compression_level: Some(3),
             ..options
-        })
-        .unwrap();
+        });
 
         assert_eq!(default_level, named_level);
         assert_eq!(
