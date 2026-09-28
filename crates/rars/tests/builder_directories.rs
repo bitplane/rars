@@ -66,3 +66,16 @@ fn directory_validation_does_not_change_entry_kind_or_queued_names() {
         .is_err());
     assert!(legacy.is_empty());
 }
+
+#[test]
+fn rar15_directory_uses_legacy_directory_attributes() {
+    let mut builder = Builder::new(ArchiveVersion::Rar15).store(true);
+    builder
+        .add_directory(b"empty".to_vec(), Some(123), None)
+        .unwrap();
+    let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    let member = archive.members().next().unwrap();
+    assert!(member.meta.is_directory);
+    assert_eq!(member.meta.file_attr, 0x10);
+    assert_eq!(member.meta.file_time, Some(123));
+}
