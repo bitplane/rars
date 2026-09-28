@@ -298,3 +298,29 @@ fn compressed_legacy_volume_can_cancel_at_final_progress() {
     assert!(progress.final_volume.load(Ordering::Relaxed));
     assert!(progress.checks_after_final.load(Ordering::Relaxed) >= 2);
 }
+
+#[test]
+fn compressed_legacy_volume_preserves_cancellation_from_codec() {
+    use rars::{rar15_40, FeatureSet};
+
+    let data = b"a repeating legacy volume member ".repeat(4096);
+    let entry = rar15_40::FileEntry {
+        name: b"file",
+        data: &data,
+        file_time: 0,
+        file_attr: 0x20,
+        host_os: 3,
+        password: None,
+        file_comment: None,
+    };
+    let progress = Stop::new(WriteOperation::Compression, false);
+    let error = rar15_40::write_compressed_volumes_with_progress(
+        entry,
+        rar15_40::WriterOptions::new(ArchiveVersion::Rar29, FeatureSet::default()),
+        1024,
+        Some(&progress),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Cancelled);
+    assert!(progress.cancelled.load(Ordering::Relaxed));
+}

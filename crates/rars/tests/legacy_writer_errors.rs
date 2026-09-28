@@ -24,6 +24,26 @@ const FORMATS: [ArchiveVersion; 7] = [
 ];
 
 #[test]
+fn compressed_legacy_volume_rejects_an_invalid_target_before_encoding() {
+    let entry = rar15_40::FileEntry {
+        name: b"file",
+        data: b"payload",
+        file_time: 0,
+        file_attr: 0x20,
+        host_os: 3,
+        password: None,
+        file_comment: None,
+    };
+    let error = rar15_40::write_compressed_volumes(
+        entry,
+        rar15_40::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only()),
+        1024,
+    )
+    .unwrap_err();
+    assert_eq!(error, Error::UnsupportedVersion(ArchiveVersion::Rar50));
+}
+
+#[test]
 fn invalid_legacy_compression_level_fails_before_member_io_or_output() {
     let entries = [rar15_40::StreamingEntry::new(
         b"member".to_vec(),
