@@ -379,6 +379,42 @@ fn staging_rejects_redirections_and_split_volume_fragments() {
 }
 
 #[test]
+fn solid_staging_skips_directory_and_link_between_payload_dependencies() {
+    let root = scratch::case("rewrite-solid-special-dependencies");
+    let mut builder = Builder::new(ArchiveVersion::Rar50).solid(true);
+    builder
+        .add_bytes(b"first".to_vec(), b"first payload".to_vec(), None, None)
+        .unwrap();
+    builder.add_directory(b"dir".to_vec(), None, None).unwrap();
+    builder
+        .add_unix_symlink(b"link".to_vec(), b"first".to_vec(), false, None, None)
+        .unwrap();
+    builder
+        .add_bytes(b"last".to_vec(), b"last payload".to_vec(), None, None)
+        .unwrap();
+    let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    let members: Vec<_> = archive.members().collect();
+    assert!(members[1].meta.is_directory);
+    assert!(members[2].meta.is_redirection);
+
+    let sources = archive
+        .stage_rewrite_sources(
+            &[3],
+            ArchiveReadOptions::default(),
+            &RewriteStaging {
+                directory: root.to_path_buf(),
+                max_staged_bytes: 64,
+            },
+        )
+        .unwrap();
+    let mut data = Vec::new();
+    sources[0].open().unwrap().read_to_end(&mut data).unwrap();
+    assert_eq!(data, b"last payload");
+    drop(sources);
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+}
+
+#[test]
 fn corrupt_dependencies_fail_cleanly_but_independent_omissions_are_skipped() {
     let root = scratch::case("rewrite-corruption");
     for solid in [false, true] {
