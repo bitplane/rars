@@ -1549,6 +1549,10 @@ fn parse_inline_recovery_chunk_with_control(
     let shard_size = read_u64(input, 0x32)?;
     let data_shards = u16::from_le_bytes(input[0x3a..0x3c].try_into().unwrap()) as u64;
     let recovery_shards = u16::from_le_bytes(input[0x3c..0x3e].try_into().unwrap()) as u64;
+    if data_shards == 0 || recovery_shards == 0 || data_shards + recovery_shards > FIELD_SIZE as u64
+    {
+        return Err(Error::BadRecoveryChunk);
+    }
     let shard_index = u16::from_le_bytes(input[0x3e..0x40].try_into().unwrap()) as usize;
     let plan = InlineRecoveryPlan {
         data_shards,
@@ -2318,6 +2322,48 @@ mod tests {
     }
 
     #[test]
+    fn striped_recovery_stops_writing_after_mid_row_sink_failure() {
+        use std::io::{Cursor, Write};
+
+        struct HeaderSink(usize);
+        impl Write for HeaderSink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.0 != 0 {
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+                self.0 += bytes.len();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let body = vec![7; 65_538];
+        let plan = InlineRecoveryPlan {
+            data_shards: 1,
+            recovery_shards: 1,
+            group_count: body.len() as u64,
+            header_size: 80,
+            shard_size: 80 + body.len() as u64,
+        };
+        let mut sink = HeaderSink(0);
+        let error = super::build_streamed_inline_recovery_for_plan(
+            &mut Cursor::new(&body),
+            body.len() as u64,
+            plan,
+            super::RecoveryMemoryMode::Striped { stripe_len: 4096 },
+            Some(&mut Cursor::new(Vec::new())),
+            &mut sink,
+            None,
+            1,
+        )
+        .unwrap_err();
+        assert_eq!(error, Error::Io(std::io::ErrorKind::BrokenPipe));
+        assert_eq!(sink.0, plan.header_size as usize);
+    }
+
+    #[test]
     fn striped_recovery_reports_scratch_read_failure_before_output() {
         use super::{streamed_recovery_with_allowance, Allowance, RecoveryMemoryMode};
         use std::io::{Cursor, Read, Seek, SeekFrom, Write};
@@ -2473,6 +2519,51 @@ mod tests {
             .all(|&(kind, bytes)| kind == 1 && bytes <= result.payload_len));
         assert!(events.len() > 2);
         assert_eq!(output.len() as u64, result.payload_len);
+    }
+
+    #[test]
+    fn streamed_recovery_handles_empty_and_unused_data_shards() {
+        use std::io::Cursor;
+
+        for (body, plan) in [
+            (
+                &b""[..],
+                InlineRecoveryPlan {
+                    data_shards: 1,
+                    recovery_shards: 1,
+                    group_count: 2,
+                    header_size: 80,
+                    shard_size: 82,
+                },
+            ),
+            (
+                &b"abc"[..],
+                InlineRecoveryPlan {
+                    data_shards: 3,
+                    recovery_shards: 1,
+                    group_count: 4,
+                    header_size: 96,
+                    shard_size: 100,
+                },
+            ),
+        ] {
+            let mut output = Vec::new();
+            super::build_streamed_inline_recovery_for_plan(
+                &mut Cursor::new(body),
+                body.len() as u64,
+                plan,
+                super::RecoveryMemoryMode::Resident,
+                None,
+                &mut output,
+                None,
+                1,
+            )
+            .unwrap();
+            assert_eq!(
+                repair_inline_recovery_prefix(body, &output),
+                Ok(body.to_vec())
+            );
+        }
     }
 
     #[test]
@@ -3067,6 +3158,12 @@ mod tests {
         altered("wrong shard size", |chunk| chunk[0x32] ^= 1);
         altered("out-of-range shard index", |chunk| chunk[0x3e] = 1);
         altered("wrong data-state count", |chunk| chunk[0x3a] = 2);
+        altered("no data shards", |chunk| {
+            let parity_len = (chunk.len() - 0x48) as u64;
+            chunk[0x10..0x14].copy_from_slice(&0x48u32.to_le_bytes());
+            chunk[0x2a..0x32].copy_from_slice(&parity_len.to_le_bytes());
+            chunk[0x3a..0x3c].copy_from_slice(&0u16.to_le_bytes());
+        });
         altered("wrong parity length", |chunk| chunk[0x2a] ^= 1);
 
         for (name, chunk) in cases {
@@ -3113,6 +3210,33 @@ mod tests {
         assert_eq!(
             repair_inline_recovery_prefix(b"y", &chunk),
             Err(Error::BadRecoveryChunk)
+        );
+    }
+
+    #[test]
+    fn rar5_recovery_rejects_shard_counts_above_field_capacity() {
+        let data_shards = 32_768u16;
+        let recovery_shards = 32_768u16;
+        let header_size = 0x48 + data_shards as usize * 8;
+        let mut chunk = vec![0u8; header_size];
+        chunk[..4].copy_from_slice(b"{RB}");
+        chunk[0x0c..0x10].copy_from_slice(&(header_size as u32).to_le_bytes());
+        chunk[0x10..0x14].copy_from_slice(&(header_size as u32).to_le_bytes());
+        chunk[0x14] = 1;
+        chunk[0x15] = 1;
+        chunk[0x32..0x3a].copy_from_slice(&(header_size as u64).to_le_bytes());
+        chunk[0x3a..0x3c].copy_from_slice(&data_shards.to_le_bytes());
+        chunk[0x3c..0x3e].copy_from_slice(&recovery_shards.to_le_bytes());
+        let crc = crc64_xz(&chunk[0x0c..]);
+        chunk[0x04..0x0c].copy_from_slice(&crc.to_le_bytes());
+
+        assert_eq!(
+            super::parse_inline_recovery_chunk_with_control(
+                &chunk,
+                &crate::read_control::ReadControl::default()
+            )
+            .unwrap_err(),
+            Error::BadRecoveryChunk
         );
     }
 
