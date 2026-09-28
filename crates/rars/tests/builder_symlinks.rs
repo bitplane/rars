@@ -215,6 +215,40 @@ fn retains_windows_links_and_file_copy_records() {
 }
 
 #[test]
+fn link_setters_refuse_shapes_the_target_format_cannot_write() {
+    for (volume, directory_target, target) in [
+        (true, false, b"target".as_slice()),
+        (false, true, b"target".as_slice()),
+        (false, false, b"".as_slice()),
+        (false, false, b"bad\0target".as_slice()),
+    ] {
+        let mut builder = Builder::new(ArchiveVersion::Rar20).volume_size(volume.then_some(1024));
+        assert!(builder
+            .add_unix_symlink(
+                b"link".to_vec(),
+                target.to_vec(),
+                directory_target,
+                None,
+                None,
+            )
+            .is_err());
+        assert!(builder.is_empty());
+    }
+
+    let mut seed = Builder::new(ArchiveVersion::Rar50).store(true);
+    seed.add_unix_symlink(b"link".to_vec(), b"target".to_vec(), false, None, None)
+        .unwrap();
+    let archive = ArchiveReader::read_owned(seed.to_bytes().unwrap()).unwrap();
+    let member = archive.members().next().unwrap();
+    for format in [ArchiveVersion::Rar20, ArchiveVersion::Rar50] {
+        let mut builder = Builder::new(format)
+            .volume_size((format == ArchiveVersion::Rar50).then_some(1024));
+        assert!(builder.add_archive_redirection(&member).is_err());
+        assert!(builder.is_empty());
+    }
+}
+
+#[test]
 fn legacy_link_payloads_are_decoded_with_integrity_and_password_checks() {
     for format in [ArchiveVersion::Rar29, ArchiveVersion::Rar40] {
         let mut builder = Builder::new(format).password(Some(b"secret".to_vec()));
