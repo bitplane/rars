@@ -990,6 +990,41 @@ impl Drop for MemoryPermit {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn workspace_admission_reports_preexisting_cancellation_before_budget_checks() {
+        use super::*;
+
+        let cancellation = WriteCancellation::new();
+        cancellation.cancel();
+        let resources = WriterResources::new(1).with_cancellation(cancellation);
+        assert!(matches!(
+            resources.acquire_cancellable(2, 0, &|| false),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(
+            resources.acquire_cancellable(1, 0, &|| true),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(resources.workspace_in_use(), 0);
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[test]
+    fn spool_rejects_length_overflow_before_writing_or_charging() {
+        use super::*;
+
+        let root = crate::scratch::case("spool-length-overflow");
+        let resources = WriterResources::default()
+            .with_temp_dir(&*root)
+            .with_max_spool_bytes(16);
+        let mut spool = Spool::create(&resources).unwrap();
+        spool.pos = u64::MAX;
+        let error = spool.write(b"ab").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(spool.len, 0);
+        assert_eq!(spool_used(&resources), 0);
+    }
+
+    #[test]
     fn writer_memory_reader_retains_payload_after_source_drop() {
         use super::*;
         let resources = WriterResources::default().with_max_memory_bytes(8192);
