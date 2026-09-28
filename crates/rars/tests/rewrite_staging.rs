@@ -67,6 +67,48 @@ fn staging_finished_events_require_verified_payloads() {
 }
 
 #[test]
+fn staging_finishes_selected_member_before_a_trailing_archive_member() {
+    use rars::{WriteOperation, WriteProgressEvent};
+    use std::sync::Mutex;
+
+    let root = scratch::case("rewrite-progress-trailing");
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    for name in [b"selected".as_slice(), b"trailing".as_slice()] {
+        builder
+            .add_bytes(name.to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+    }
+    let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let recorded = events.clone();
+    let progress = Arc::new(move |event: WriteProgressEvent<'_>| match event {
+        WriteProgressEvent::EntryFinished {
+            operation: WriteOperation::Staging,
+            name,
+            ..
+        } => recorded.lock().unwrap().push(name.to_vec()),
+        WriteProgressEvent::OperationFinished {
+            operation: WriteOperation::Staging,
+            ..
+        } => recorded.lock().unwrap().push(b"finished".to_vec()),
+        _ => {}
+    });
+    let sources = archive
+        .stage_rewrite_sources_with_progress(
+            &[0],
+            ArchiveReadOptions::default(),
+            &RewriteStaging {
+                directory: root.to_path_buf(),
+                max_staged_bytes: 7,
+            },
+            Some(progress),
+        )
+        .unwrap();
+    assert_eq!(&*events.lock().unwrap(), &[b"selected".to_vec(), b"finished".to_vec()]);
+    assert_eq!(sources.len(), 1);
+}
+
+#[test]
 fn staging_progress_cancellation_prevents_source_creation() {
     use rars::{WriteProgress, WriteProgressEvent};
     use std::sync::atomic::AtomicBool;
