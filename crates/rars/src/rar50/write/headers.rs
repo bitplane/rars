@@ -321,7 +321,7 @@ pub(crate) fn encrypted_header_block(
 pub(super) fn stored_file_specific(
     name: &[u8],
     unpacked_size: u64,
-    data_crc32: Option<u32>,
+    data_crc32: u32,
     attributes: u64,
     mtime: Option<u32>,
     host_os: u64,
@@ -345,7 +345,7 @@ pub(super) fn stored_file_specific(
 pub(super) fn file_specific(
     name: &[u8],
     unpacked_size: u64,
-    data_crc32: Option<u32>,
+    data_crc32: u32,
     attributes: u64,
     mtime: Option<u32>,
     compression_info: u64,
@@ -356,7 +356,7 @@ pub(super) fn file_specific(
     if name.is_empty() {
         return Err(Error::InvalidArgument("RAR 5 file name is empty"));
     }
-    let mut file_flags = if data_crc32.is_some() { FHFL_CRC32 } else { 0 };
+    let mut file_flags = FHFL_CRC32;
     if is_directory {
         file_flags |= FHFL_DIRECTORY;
     }
@@ -371,9 +371,7 @@ pub(super) fn file_specific(
     if let Some(mtime) = mtime {
         specific.extend_from_slice(&mtime.to_le_bytes());
     }
-    if let Some(data_crc32) = data_crc32 {
-        specific.extend_from_slice(&data_crc32.to_le_bytes());
-    }
+    specific.extend_from_slice(&data_crc32.to_le_bytes());
     specific.vint(compression_info);
     specific.vint(host_os);
     specific.vint(name.len() as u64);
@@ -445,9 +443,8 @@ pub(super) fn archive_metadata_record(
     if metadata.name.is_some() {
         flags |= MHEXTRA_ARCHIVE_METADATA_NAME;
     }
-    if metadata.creation_time.is_some() {
-        flags |= MHEXTRA_ARCHIVE_METADATA_TIME;
-    }
+    // A creation time is required, with or without a name.
+    flags |= MHEXTRA_ARCHIVE_METADATA_TIME;
 
     if metadata.name.is_some_and(|name| name.is_empty()) {
         return Err(Error::InvalidArgument(
@@ -926,7 +923,7 @@ mod image_tests {
             assert_eq!(error, Error::InvalidArgument(reason));
         }
         assert_eq!(
-            file_specific(b"", 0, None, 0, None, 0, 0, false, &resources).unwrap_err(),
+            file_specific(b"", 0, 0, 0, None, 0, 0, false, &resources).unwrap_err(),
             Error::InvalidArgument("RAR 5 file name is empty")
         );
     }
@@ -1062,7 +1059,7 @@ mod image_tests {
         let actual = file_specific(
             &name,
             u64::MAX,
-            Some(u32::MAX),
+            u32::MAX,
             u64::MAX,
             Some(u32::MAX),
             u64::MAX,

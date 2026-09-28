@@ -1842,7 +1842,7 @@ mod tests {
         let specific = file_specific(
             name,
             data.len() as u64,
-            Some(crc32(data)),
+            crc32(data),
             0x20,
             None,
             compression_info,
@@ -2195,7 +2195,7 @@ mod tests {
         let specific = file_specific(
             name,
             data.len() as u64,
-            Some(crc32(data)),
+            crc32(data),
             0x20,
             None,
             1 << 7,
@@ -2264,7 +2264,7 @@ mod tests {
         let specific = file_specific(
             name,
             data.len() as u64,
-            Some(crc32(&data)),
+            crc32(&data),
             0x20,
             None,
             1 << 7,

@@ -538,7 +538,7 @@ fn stored_service_header(
 ) -> Result<PreparedHeader> {
     let mut extra = Bytes::new(resources);
     write_extra_record(&mut extra, FHEXTRA_SUBDATA, service_data)?;
-    let specific = stored_file_specific(name, data_len, Some(crc32), 0, None, 0, resources)?;
+    let specific = stored_file_specific(name, data_len, crc32, 0, None, 0, resources)?;
     prepared_header_image(
         HEAD_SERVICE,
         HFL_EXTRA | HFL_DATA,
@@ -617,7 +617,7 @@ fn encrypted_service_block<'a>(
     let specific = stored_file_specific(
         name,
         data.len() as u64,
-        Some(keys.mac_crc32(crate::crc32::crc32(data))),
+        keys.mac_crc32(crate::crc32::crc32(data)),
         0,
         None,
         0,
@@ -751,7 +751,7 @@ fn prepare_member(
                     .redirection_size
                     .unwrap_or_else(|| decoded_rar50_name_len(&link.target_name) as u64)
             }),
-        Some(data_crc32),
+        data_crc32,
         entry.attributes,
         entry.mtime.filter(|_| entry.mtime_nanoseconds.is_none()),
         compression_info,
@@ -955,7 +955,7 @@ fn recovery_service_with_allowance<B: crate::codec::workspace::Budget>(
     let specific = stored_file_specific(
         b"RR",
         built.payload_len,
-        Some(built.payload_crc32),
+        built.payload_crc32,
         0,
         None,
         0,
@@ -1664,7 +1664,7 @@ fn fragment_header(
     let specific = file_specific(
         member.name,
         member.unpacked_size,
-        Some(fragment.map_or(member.crc32, |f| f.crc32)),
+        fragment.map_or(member.crc32, |f| f.crc32),
         member.attributes,
         member.mtime.filter(|_| member.mtime_nanoseconds.is_none()),
         member.compression_info,

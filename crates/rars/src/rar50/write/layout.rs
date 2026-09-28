@@ -153,7 +153,7 @@ pub(super) fn stored_service_block_len(
     let mut extra = Bytes::new(resources);
     super::headers::write_extra_record(&mut extra, FHEXTRA_SUBDATA, service_data)?;
     // The CRC is a fixed-width field, so any value gives the right size.
-    let specific = stored_file_specific(name, data_len, Some(0), 0, None, 0, resources)?;
+    let specific = stored_file_specific(name, data_len, 0, 0, None, 0, resources)?;
     let header = block_header_image(
         HEAD_SERVICE,
         HFL_EXTRA | HFL_DATA,
