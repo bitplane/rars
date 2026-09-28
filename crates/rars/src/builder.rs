@@ -1937,6 +1937,33 @@ mod tests {
     }
 
     #[test]
+    fn builder_refuses_retained_archive_metadata_in_volume_output() {
+        let record = crate::rar50::ArchiveMetadataRecord {
+            flags: 2,
+            name: None,
+            creation_time: Some(123),
+        };
+        let mut builder = crate::Builder::new(crate::ArchiveVersion::Rar50)
+            .archive_metadata(Some(record), false, false)
+            .unwrap()
+            .volume_size(Some(64));
+        builder
+            .add_source(
+                b"file".to_vec(),
+                crate::EntrySource::from_opener(1, || panic!("volume refusal opened source")),
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            builder.build_volumes(None).unwrap_err(),
+            crate::Error::InvalidArgument(
+                "archive metadata settings are not supported in volume output"
+            )
+        );
+    }
+
+    #[test]
     fn renaming_a_member_to_its_existing_name_preserves_its_identity() {
         use crate::{ArchiveReader, ArchiveVersion, Builder};
 

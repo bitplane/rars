@@ -12,6 +12,37 @@ fn empty_rar50_builder_writes_a_readable_archive() {
 }
 
 #[test]
+fn empty_legacy_builder_refuses_single_archive_output() {
+    assert_eq!(
+        Builder::new(ArchiveVersion::Rar29).to_bytes().unwrap_err(),
+        rars::Error::InvalidArgument("archive builder has no entries")
+    );
+}
+
+#[test]
+fn legacy_volume_builder_refuses_existing_directories_and_symlinks() {
+    let mut directory = Builder::new(ArchiveVersion::Rar29);
+    directory.add_directory(b"dir".to_vec(), None, None).unwrap();
+    assert_eq!(
+        directory.volume_size(Some(64)).build_volumes(None).unwrap_err(),
+        rars::Error::InvalidArgument(
+            "legacy directories and symbolic links are unsupported in volume output"
+        )
+    );
+
+    let mut symlink = Builder::new(ArchiveVersion::Rar29);
+    symlink
+        .add_unix_symlink(b"link".to_vec(), b"target".to_vec(), false, None, None)
+        .unwrap();
+    assert_eq!(
+        symlink.volume_size(Some(64)).build_volumes(None).unwrap_err(),
+        rars::Error::InvalidArgument(
+            "legacy directories and symbolic links are unsupported in volume output"
+        )
+    );
+}
+
+#[test]
 fn single_output_rejects_volume_metadata_before_opening_a_source() {
     let mut builder = Builder::new(ArchiveVersion::Rar50)
         .archive_metadata(None, true, false)
@@ -29,6 +60,24 @@ fn single_output_rejects_volume_metadata_before_opening_a_source() {
         builder.to_bytes().unwrap_err(),
         rars::Error::InvalidArgument(
             "archive metadata settings require the RAR5/7 streaming writer"
+        )
+    );
+}
+
+#[test]
+fn volume_builder_refuses_quick_open_before_source_io() {
+    let source = || EntrySource::from_opener(1, || panic!("volume setting opened source"));
+    let mut builder = Builder::new(ArchiveVersion::Rar50)
+        .archive_metadata(None, false, true)
+        .unwrap()
+        .volume_size(Some(64));
+    builder
+        .add_source(b"file".to_vec(), source(), None, None)
+        .unwrap();
+    assert_eq!(
+        builder.build_volumes(None).unwrap_err(),
+        rars::Error::InvalidArgument(
+            "archive metadata settings are not supported in volume output"
         )
     );
 }
