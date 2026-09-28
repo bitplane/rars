@@ -1824,6 +1824,7 @@ fn extracts_compressed_legacy_comment_blocks_with_rar15_and_rar20_coding() {
         .unwrap();
         let archive = Archive::parse(&original).unwrap();
         let file = archive.files().next().unwrap();
+        assert!(!file.is_stored(), "{version:?} must exercise comment decoding");
         let packed = file.packed_data(&archive).unwrap();
         let mut comment = vec![0, 0, 0x75, 0, 0];
         comment.extend_from_slice(&((13 + packed.len()) as u16).to_le_bytes());
@@ -1843,6 +1844,16 @@ fn extracts_compressed_legacy_comment_blocks_with_rar15_and_rar20_coding() {
         bytes.extend_from_slice(&original[20..]);
         let parsed = Archive::parse(&bytes).unwrap();
         assert_eq!(parsed.archive_comment().unwrap().unwrap(), plain);
+        assert_eq!(
+            parsed
+                .archive_comment_with_options(
+                    ArchiveReadOptions::new().with_max_reader_workspace_bytes(1024),
+                )
+                .unwrap_err()
+                .kind(),
+            rars::ErrorKind::ResourceLimit,
+            "{version:?} compressed comment must allocate a decoder",
+        );
         assert_eq!(
             parsed
                 .archive_comment_with_options(
@@ -7292,6 +7303,14 @@ fn rejects_split_rar15_40_entries_until_volume_reassembly_exists() {
 
     assert!(matches!(
         collect_extract(&archive),
+        Err(Error::InvalidHeader(
+            "RAR 1.5 split entry requires multivolume extraction"
+        ))
+    ));
+    assert!(matches!(
+        archive.extract_to_parallel_buffered(ArchiveReadOptions::new(), |_| {
+            Ok(Box::new(std::io::sink()))
+        }),
         Err(Error::InvalidHeader(
             "RAR 1.5 split entry requires multivolume extraction"
         ))

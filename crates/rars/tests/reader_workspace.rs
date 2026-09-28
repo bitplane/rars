@@ -78,6 +78,31 @@ fn stored_sequential_payloads_do_not_require_a_dictionary() {
 }
 
 #[test]
+fn limited_parallel_legacy_extraction_handles_directories_and_stored_files() {
+    for version in [ArchiveVersion::Rar15, ArchiveVersion::Rar29] {
+        let mut builder = Builder::new(version).store(true);
+        builder.add_directory(b"dir".to_vec(), None, None).unwrap();
+        builder
+            .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+        let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        let output = Rc::new(RefCell::new(Vec::new()));
+        let mut seen = Vec::new();
+        archive
+            .extract_to_parallel_buffered_with_options(
+                ArchiveReadOptions::new().with_max_reader_workspace_bytes(1 << 20),
+                |meta| {
+                    seen.push((meta.name.clone(), meta.is_directory));
+                    Ok(Box::new(Capture(output.clone())) as Box<dyn Write>)
+                },
+            )
+            .unwrap();
+        assert_eq!(seen, [(b"dir".to_vec(), true), (b"file".to_vec(), false)]);
+        assert_eq!(*output.borrow(), b"payload");
+    }
+}
+
+#[test]
 fn workspace_refusal_is_not_remapped_to_a_password_or_integrity_failure() {
     for version in [
         ArchiveVersion::Rar13,

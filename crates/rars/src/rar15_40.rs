@@ -3738,6 +3738,71 @@ mod tests {
     }
 
     #[test]
+    fn direct_stored_writer_rejects_inconsistent_and_short_payloads() {
+        let bytes = stored_archive_bytes(b"entry", b"payload");
+        let archive = Archive::parse(&bytes).unwrap();
+        let file = archive.files().next().unwrap();
+
+        let mut inconsistent = file.clone();
+        inconsistent.unp_size += 1;
+        let mut output = Vec::new();
+        assert!(matches!(
+            inconsistent.write_to(&archive, None, &mut output),
+            Err(Error::InvalidHeader(
+                "RAR 1.5 stored file has mismatched packed and unpacked sizes"
+            ))
+        ));
+        assert!(output.is_empty());
+
+        // A valid header can still name a short range when its source is damaged.
+        let mut short = file.clone();
+        short.packed_range.end -= 1;
+        assert!(matches!(
+            short.write_to(&archive, None, &mut output),
+            Err(Error::InvalidHeader(
+                "RAR 1.5 stored file ended before unpacked size"
+            ))
+        ));
+        assert_eq!(output, b"payloa");
+
+        let mut directory = file.clone();
+        directory.attr |= 0x10;
+        let mut output = Vec::new();
+        directory.write_to(&archive, None, &mut output).unwrap();
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn encrypted_stored_workspace_refusal_keeps_resource_error() {
+        let bytes = write_stored_archive(
+            &[StoredEntry {
+                name: b"entry",
+                data: b"payload",
+                file_time: 0,
+                file_attr: 0x20,
+                host_os: 3,
+                password: Some(b"secret"),
+                file_comment: None,
+            }],
+            WriterOptions::new(ArchiveVersion::Rar30, FeatureSet::store_only()),
+        )
+        .unwrap();
+        let archive = Archive::parse(&bytes).unwrap();
+        let file = archive.files().next().unwrap();
+        let mut output = Vec::new();
+        let error = file
+            .write_stored_with_allowance(
+                &archive,
+                Some(b"secret"),
+                &mut output,
+                &Allowance::limited(0),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::ResourceLimit);
+        assert!(output.is_empty());
+    }
+
+    #[test]
     fn crc_writer_flush_propagates_to_inner_writer() {
         struct FlushSpy {
             data: Vec<u8>,
