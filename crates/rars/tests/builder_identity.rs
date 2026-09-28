@@ -99,3 +99,45 @@ fn removing_a_duplicate_cannot_retarget_a_file_copy() {
     assert!(output.rewrite_preservation_issues().is_empty());
     assert_eq!(output.read_member_at(0, None).unwrap().unwrap(), b"another");
 }
+
+#[test]
+fn removing_a_duplicate_ignores_directories_and_unrelated_copies() {
+    let mut seed = Builder::new(ArchiveVersion::Rar50).store(true);
+    seed.add_unix_symlink(b"copy".to_vec(), b"other".to_vec(), false, None, None)
+        .unwrap();
+    let archive = ArchiveReader::read_owned(seed.to_bytes().unwrap()).unwrap();
+    let mut copy = archive.members().next().unwrap();
+    copy.meta.host_os = Some(0);
+    copy.meta.file_attr = 0x20;
+    copy.meta.unpacked_size = 7;
+    if let rars::ArchiveMemberDetail::Rar50Plus {
+        redirection: Some(link),
+        ..
+    } = &mut copy.detail
+    {
+        link.redirection_type = 5;
+        link.flags = 0;
+    }
+
+    let mut builder = Builder::new(ArchiveVersion::Rar50)
+        .store(true)
+        .allow_duplicate_names(true);
+    builder
+        .add_bytes(b"same".to_vec(), b"first".to_vec(), None, None)
+        .unwrap();
+    builder.add_directory(b"same".to_vec(), None, None).unwrap();
+    builder
+        .add_bytes(b"other".to_vec(), b"payload".to_vec(), None, None)
+        .unwrap();
+    builder.add_archive_redirection(&copy).unwrap();
+    builder
+        .add_bytes(b"same".to_vec(), b"second".to_vec(), None, None)
+        .unwrap();
+
+    builder.remove_by_id(0).unwrap();
+    let output = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    let copy = output.members().find(|member| member.meta.name == b"copy").unwrap();
+    assert_eq!(copy.supported_redirection().unwrap().target_name, b"other");
+    assert_eq!(output.read_member(b"other", None).unwrap().unwrap(), b"payload");
+    assert_eq!(output.read_member(b"same", None).unwrap().unwrap(), b"second");
+}
