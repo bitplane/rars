@@ -435,6 +435,39 @@ mod native {
         use super::*;
 
         #[test]
+        fn progress_sink_forwards_flush_failure() {
+            struct FailingFlush(Arc<AtomicU64>);
+
+            impl Write for FailingFlush {
+                fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                    Ok(bytes.len())
+                }
+
+                fn flush(&mut self) -> std::io::Result<()> {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                    Err(std::io::Error::other("injected staging flush failure"))
+                }
+            }
+
+            let calls = Arc::new(AtomicU64::new(0));
+            let progress = Rc::new(Progress {
+                callback: Arc::new(|_: WriteProgressEvent<'_>| {}),
+                completed: Cell::new(0),
+                total: 0,
+                entries: 0,
+            });
+            let mut sink = ProgressSink {
+                inner: Box::new(FailingFlush(calls.clone())),
+                progress,
+            };
+            assert_eq!(
+                sink.flush().unwrap_err().to_string(),
+                "injected staging flush failure"
+            );
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+        }
+
+        #[test]
         fn runtime_limit_counts_all_sinks_and_refuses_before_writing() {
             let root = crate::scratch::case("rewrite-runtime-limit");
             let resources = WriterResources::new(0).with_temp_dir(&*root);

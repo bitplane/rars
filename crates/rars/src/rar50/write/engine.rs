@@ -1772,6 +1772,64 @@ fn member_error(error: Error, name: &[u8], operation: &'static str) -> Error {
 mod input_size_tests {
     use super::*;
 
+    #[test]
+    fn writer_adapters_flush_the_output_and_preserve_checksums() {
+        struct FlushingSink {
+            bytes: Vec<u8>,
+            flushes: usize,
+            fail: bool,
+        }
+
+        impl Write for FlushingSink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.flushes += 1;
+                if self.fail {
+                    Err(std::io::Error::other("injected flush failure"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let mut output = FlushingSink {
+            bytes: Vec::new(),
+            flushes: 0,
+            fail: false,
+        };
+        {
+            let mut tee = Tee {
+                output: &mut output,
+                mirror: None,
+            };
+            tee.write_all(b"payload").unwrap();
+            tee.flush().unwrap();
+        }
+        assert_eq!(output.bytes, b"payload");
+        assert_eq!(output.flushes, 1);
+        output.fail = true;
+        assert_eq!(
+            Tee {
+                output: &mut output,
+                mirror: None,
+            }
+            .flush()
+            .unwrap_err()
+            .to_string(),
+            "injected flush failure"
+        );
+        assert_eq!(output.flushes, 2);
+
+        let mut checksum = ChecksumSink::default();
+        checksum.write_all(b"payload").unwrap();
+        checksum.flush().unwrap();
+        assert_eq!(checksum.crc.finish(), crate::crc32::crc32(b"payload"));
+    }
+
     fn virtual_entry(name: &[u8], length: u64) -> ArchiveEntry {
         ArchiveEntry::new(
             name.to_vec(),
