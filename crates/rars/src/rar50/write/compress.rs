@@ -1281,6 +1281,57 @@ mod tests {
         }
     }
 
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[test]
+    fn whole_member_cancellation_between_waves_does_not_open_next_source() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct StopAfterFirst(AtomicBool);
+        impl CompressionProgress for StopAfterFirst {
+            fn advance(&self, _: u64) -> bool {
+                !self.is_cancelled()
+            }
+            fn is_cancelled(&self) -> bool {
+                self.0.load(Ordering::SeqCst)
+            }
+            fn finished(&self, index: usize, _: u64) {
+                if index == 0 {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+
+        let options = EncodeOptions::new(8).with_max_match_distance(65536);
+        let plan = CompressPlan {
+            algorithm_version: 0,
+            encode_options: options,
+            dictionary_size: 65536,
+            block_size: 65536,
+            solid: false,
+            method: 1,
+            filter_policy: FilterPolicy::None,
+            candidates: vec![options].into(),
+        };
+        let first = EntrySource::from_bytes(b"first".to_vec());
+        let second = EntrySource::from_opener(6, || {
+            panic!("cancellation between waves must not open the next source")
+        });
+        let scratch = crate::scratch::case("whole-member-cancel-between-waves");
+        let resources = WriterResources::new(80 * 1024 * 1024).with_temp_dir(&*scratch);
+        let progress = StopAfterFirst(AtomicBool::new(false));
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let result = pool.install(|| {
+            compress_members_reporting(&[first, second], plan, &resources, &progress)
+        });
+        assert!(matches!(result, Err(Error::Cancelled)), "{:?}", result.err());
+        assert!(progress.is_cancelled());
+        assert_eq!(resources.workspace_in_use(), 0);
+        assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
+    }
+
     struct Cancelled;
 
     impl CompressionProgress for Cancelled {
