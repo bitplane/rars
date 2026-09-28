@@ -626,7 +626,9 @@ fn x86_finalists<B: Budget>(
 /// and the shortest stride within [`TABLE_STRIDE_TIE_PERCENT`] of the best
 /// wins, because a period repeats at its own multiples.
 fn table_stride(window: &[u8], max_stride: usize) -> Option<usize> {
-    if max_stride == 0 || window.len() < max_stride * 8 {
+    // table_regions supplies a full scan window and caps the stride, so the
+    // only caller-side case without a candidate is a format with no delta.
+    if max_stride == 0 {
         return None;
     }
     let mut hits = [0usize; MAX_TABLE_STRIDE + 1];
