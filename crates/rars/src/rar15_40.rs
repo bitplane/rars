@@ -1949,10 +1949,8 @@ fn parse_protect_header(
     ))?;
     let rec_sectors = read_u16(input, 12)?;
     let total_blocks = read_u32(input, 14)?;
-    let expected_add_size = u64::from(total_blocks)
-        .checked_mul(2)
-        .and_then(|size| size.checked_add(u64::from(rec_sectors) * 512))
-        .ok_or(Error::InvalidHeader("RAR 2.x recovery data size overflows"))?;
+    // These wire fields are u32 and u16; their maximum sum fits in u64.
+    let expected_add_size = u64::from(total_blocks) * 2 + u64::from(rec_sectors) * 512;
     if add_size != expected_add_size {
         return Err(Error::InvalidHeader(
             "RAR 2.x recovery data size does not match header",
@@ -2002,9 +2000,10 @@ fn repair_protect_head_bytes(
         return Err(Error::InvalidHeader("RAR 2.x recovery mark is invalid"));
     }
     let protected_start = sfx_offset;
-    let protected_len = usize::try_from(protect.total_blocks)
-        .ok()
-        .and_then(|blocks| blocks.checked_mul(512))
+    let declared_blocks = usize::try_from(protect.total_blocks)
+        .map_err(|_| Error::InvalidHeader("RAR 2.x protected sector size overflows"))?;
+    let protected_len = declared_blocks
+        .checked_mul(512)
         .ok_or(Error::InvalidHeader(
             "RAR 2.x protected sector size overflows",
         ))?;
@@ -2021,12 +2020,8 @@ fn repair_protect_head_bytes(
     let recovery_data = source
         .get(protect.data_range.clone())
         .ok_or(Error::TooShort)?;
-    let declared_blocks = usize::try_from(protect.total_blocks).map_err(|_| {
-        Error::InvalidHeader("RAR 2.x recovery protected sector count overflows usize")
-    })?;
-    let tag_len = declared_blocks
-        .checked_mul(2)
-        .ok_or(Error::InvalidHeader("RAR 2.x recovery tag size overflows"))?;
+    // The successful 512-byte sector calculation also bounds two-byte tags.
+    let tag_len = declared_blocks * 2;
     let parity_len =
         usize::from(protect.rec_sectors)
             .checked_mul(512)
