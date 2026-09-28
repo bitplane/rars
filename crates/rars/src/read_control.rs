@@ -293,4 +293,64 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn controlled_write_retries_interrupts_and_preserves_failures() {
+        struct ScriptedWriter {
+            replies: std::collections::VecDeque<io::Result<usize>>,
+            written: Vec<u8>,
+        }
+        impl Write for ScriptedWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let count = self.replies.pop_front().expect("unexpected write")?;
+                self.written.extend_from_slice(&bytes[..count]);
+                Ok(count)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let token = ReadCancellation::new();
+        let control = ReadControl::new(Some(&token));
+        let mut writer = ScriptedWriter {
+            replies: [
+                Err(io::ErrorKind::Interrupted.into()),
+                Ok(1),
+                Ok(2),
+            ]
+            .into(),
+            written: Vec::new(),
+        };
+        control.write_all(&mut writer, b"abc").unwrap();
+        assert_eq!(writer.written, b"abc");
+        assert!(writer.replies.is_empty());
+
+        for (reply, kind) in [
+            (Ok(0), io::ErrorKind::WriteZero),
+            (Err(io::ErrorKind::BrokenPipe.into()), io::ErrorKind::BrokenPipe),
+        ] {
+            let mut writer = ScriptedWriter {
+                replies: [reply].into(),
+                written: Vec::new(),
+            };
+            assert_eq!(control.write_all(&mut writer, b"x").unwrap_err().kind(), kind);
+            assert!(writer.written.is_empty());
+        }
+
+        struct CancelAfterWrite(ReadCancellation);
+        impl Write for CancelAfterWrite {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.cancel();
+                Ok(bytes.len().min(1))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let error = control
+            .write_all(&mut CancelAfterWrite(token), b"abc")
+            .unwrap_err();
+        assert_eq!(Error::from(error).kind(), crate::ErrorKind::Cancelled);
+    }
 }
