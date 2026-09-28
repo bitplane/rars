@@ -325,6 +325,33 @@ impl PartialEq<Bytes> for Vec<u8> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn fixed_preparation_capacity_refuses_extra_records_and_impossible_growth() {
+        use super::*;
+
+        let resources = WriterResources::default().with_max_preparation_bytes(64);
+        let mut bytes = Bytes::zeroed(4, &resources).unwrap();
+        bytes.grow(4).unwrap();
+        assert_eq!(
+            bytes.grow(isize::MAX as usize + 1).unwrap_err().kind(),
+            crate::ErrorKind::InvalidArgument
+        );
+        assert_eq!(&*bytes, &[0; 4]);
+        assert_eq!(bytes, vec![0; 4]);
+        assert_eq!(vec![0; 4], bytes);
+        assert_eq!(bytes, Bytes::zeroed(4, &resources).unwrap());
+
+        let mut records = Records::new(1, &resources).unwrap();
+        records.push(7u8).unwrap();
+        assert!(matches!(
+            records.push(9),
+            Err(Error::WriterFailure(
+                "preparation record count exceeded admission"
+            ))
+        ));
+        assert_eq!(&*records, &[7]);
+    }
+
+    #[test]
     fn preparation_growth_satisfies_both_ledgers_or_leaves_both_unchanged() {
         use crate::codec::workspace::Allowance;
         let ledger = Allowance::limited(1024);
