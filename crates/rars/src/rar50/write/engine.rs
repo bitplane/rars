@@ -2620,4 +2620,25 @@ mod emission_ledger_tests {
         assert!(output.is_empty());
         drop(Records::<u8>::new(128, &resources).unwrap());
     }
+
+    #[test]
+    fn encrypted_service_rejects_oversized_name_after_extra_preparation() {
+        let name = vec![b'n'; 4096];
+        let resources = WriterResources::default().with_max_preparation_bytes(512);
+        let error = encrypted_service_block(
+            &name,
+            b"payload",
+            &[],
+            b"secret",
+            None,
+            &resources,
+        )
+        .err()
+        .expect("the service name exceeds the preparation quota");
+        assert!(matches!(
+            error,
+            Error::WriterPreparationLimitExceeded { limit: 512, .. }
+        ));
+        drop(Records::<u8>::new(512, &resources).unwrap());
+    }
 }
