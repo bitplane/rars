@@ -311,6 +311,33 @@ fn invalid_complete_times_leave_builder_output_unchanged() {
 }
 
 #[test]
+fn clearing_complete_times_removes_the_rar5_time_record() {
+    use rars::{FileTimes, FileTimestamp};
+
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    builder
+        .add_bytes(b"file".to_vec(), b"payload".to_vec(), Some(123), None)
+        .unwrap();
+    builder
+        .set_file_times(
+            b"file",
+            Some(FileTimes {
+                modified: Some(FileTimestamp::Unix {
+                    seconds: 456,
+                    nanoseconds: 789,
+                }),
+                created: None,
+                accessed: None,
+            }),
+        )
+        .unwrap();
+    builder.set_file_times(b"file", None).unwrap();
+
+    let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    assert_eq!(archive.members().next().unwrap().file_times().unwrap(), None);
+}
+
+#[test]
 fn legacy_extended_times_are_validated_before_the_archive_is_written() {
     let mut builder = Builder::new(ArchiveVersion::Rar29).store(true);
     builder
