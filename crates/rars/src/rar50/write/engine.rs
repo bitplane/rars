@@ -1904,6 +1904,70 @@ mod emission_ledger_tests {
     use super::*;
     use crate::codec::workspace::Allowance;
 
+    #[test]
+    fn zero_volume_payload_is_rejected_before_opening_a_sink() {
+        let entries = [ArchiveEntry::new(
+            b"file".to_vec(),
+            crate::EntrySource::from_bytes(b"payload".to_vec()),
+        )];
+        let mut sink = super::super::CollectedVolumes::new();
+        let error = write_volumes(
+            &entries,
+            plan(false),
+            0,
+            &mut sink,
+            &WriterResources::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::InvalidArgument);
+        assert!(sink.take().is_empty());
+    }
+
+    #[test]
+    fn quick_open_skips_file_services_but_keeps_plain_comments() {
+        let entry = ArchiveEntry::new(
+            b"file".to_vec(),
+            crate::EntrySource::from_bytes(b"payload".to_vec()),
+        )
+        .with_service(super::super::ServiceEntry::new(b"CMT", b"file note"));
+        let mut plan = plan(false);
+        plan.quick_open = true;
+        plan.recovery_percent = None;
+        let mut bytes = Vec::new();
+        write_archive(&[entry], plan, &WriterResources::default(), &mut bytes).unwrap();
+
+        let archive = crate::ArchiveReader::read_owned(bytes).unwrap();
+        let raw = archive.as_rar50().unwrap();
+        assert!(raw.main.locator().unwrap().quick_open_offset.is_some());
+        let quick_open = raw.services().find(|service| service.name == b"QO").unwrap();
+        let payload = quick_open.packed_data(raw).unwrap();
+        fn vint(data: &[u8], cursor: &mut usize) -> usize {
+            let mut value = 0usize;
+            for shift in (0..70).step_by(7) {
+                let byte = data[*cursor];
+                *cursor += 1;
+                value |= ((byte & 0x7f) as usize) << shift;
+                if byte & 0x80 == 0 {
+                    return value;
+                }
+            }
+            panic!("invalid quick-open record length")
+        }
+        let mut cursor = 0;
+        let mut records = 0;
+        while cursor < payload.len() {
+            cursor += 4; // Per-record CRC32.
+            let body_len = vint(&payload, &mut cursor);
+            cursor += body_len;
+            assert!(cursor <= payload.len());
+            records += 1;
+        }
+        // The plain archive comment and file are cached; the attached service is not.
+        assert_eq!(records, 2);
+        assert_eq!(archive.member_comment_at(0, None).unwrap(), Some(b"file note".to_vec()));
+        assert_eq!(archive.read_member(b"file", None).unwrap().unwrap(), b"payload");
+    }
+
     struct FailingSink;
     impl Write for FailingSink {
         fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
