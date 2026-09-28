@@ -296,7 +296,8 @@ fn write_archive_to(
     }
     let control =
         crate::write_progress::ResourceProgress::new(resources, progress.map(ProgressReporter));
-    let progress = Some(&control as &dyn WriteProgress);
+    let reporting = &control as &dyn WriteProgress;
+    let progress = Some(reporting);
     crate::write_progress::check_cancelled(progress.map(ProgressReporter))?;
     let mut output = crate::write_progress::CancellableIo {
         inner: output,
@@ -372,10 +373,9 @@ fn write_archive_to(
     } else {
         total_bytes
     };
-    let reporting = progress;
     report_compression_operation(reporting, true, total_work, members.len());
     let work = WorkTracker::new(
-        reporting.map(ProgressReporter),
+        Some(ProgressReporter(reporting)),
         WriteOperation::Compression,
         total_work,
     );
@@ -1401,16 +1401,17 @@ pub fn write_compressed_volumes_with_progress(
     let resources = WriterResources::default();
     let control =
         crate::write_progress::ResourceProgress::new(&resources, progress.map(ProgressReporter));
-    let progress = Some(&control as &dyn WriteProgress);
+    let reporting = &control as &dyn WriteProgress;
+    let progress = Some(reporting);
     crate::write_progress::check_cancelled(progress.map(ProgressReporter))?;
     let total_work = if options.target == ArchiveVersion::Rar20 && !options.features.solid {
         (entry.data.len() as u64).saturating_mul(2)
     } else {
         entry.data.len() as u64
     };
-    report_compression_operation(progress, true, total_work, 1);
+    report_compression_operation(reporting, true, total_work, 1);
     let work = WorkTracker::new(
-        progress.map(ProgressReporter),
+        Some(ProgressReporter(reporting)),
         WriteOperation::Compression,
         total_work,
     );
@@ -1419,7 +1420,7 @@ pub fn write_compressed_volumes_with_progress(
     if !work.finish() {
         return Err(Error::Cancelled);
     }
-    report_compression_operation(progress, false, total_work, 1);
+    report_compression_operation(reporting, false, total_work, 1);
     work.check()?;
     Ok(result)
 }
@@ -1494,12 +1495,11 @@ fn write_compressed_volumes_impl(
 }
 
 fn report_compression_operation(
-    progress: Option<&dyn WriteProgress>,
+    progress: &dyn WriteProgress,
     started: bool,
     total_bytes: u64,
     total_entries: usize,
 ) {
-    let Some(progress) = progress else { return };
     if started {
         progress.report(WriteProgressEvent::OperationStarted {
             operation: WriteOperation::Compression,
