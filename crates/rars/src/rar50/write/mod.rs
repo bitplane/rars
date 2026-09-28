@@ -1232,6 +1232,12 @@ mod tests {
             super::validate_entry(&timestamped).unwrap_err(),
             crate::Error::InvalidArgument("conflicting file modification timestamps")
         );
+        timestamped.mtime = None;
+        timestamped.mtime_nanoseconds = Some(1);
+        assert_eq!(
+            super::validate_entry(&timestamped).unwrap_err(),
+            crate::Error::InvalidArgument("conflicting file modification timestamps")
+        );
     }
 
     #[test]
@@ -1358,6 +1364,73 @@ mod tests {
             crate::Error::InvalidArgument("duplicate archive metadata settings")
         );
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn volume_preflight_rejects_retained_metadata_before_opening_source_or_sink() {
+        let entry = super::ArchiveEntry::new(
+            b"file".to_vec(),
+            crate::EntrySource::from_opener(1, || panic!("metadata refusal opened source")),
+        );
+        let record = super::super::ArchiveMetadataRecord {
+            flags: 2,
+            name: None,
+            creation_time: Some(1),
+        };
+        let extras = super::ArchiveExtras {
+            metadata_record: Some(&record),
+            ..Default::default()
+        };
+        let mut sink = super::CollectedVolumes::new();
+        let error = super::write_streaming_volumes_to(
+            &[entry],
+            super::WriterOptions::default(),
+            extras,
+            64,
+            &mut sink,
+            &crate::WriterResources::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::Error::UnsupportedWriterOption {
+                option: crate::WriterOption::ArchiveMetadata,
+                ..
+            }
+        ));
+        assert!(sink.take().is_empty());
+    }
+
+    #[test]
+    fn volume_header_password_can_encrypt_headers_without_encrypting_member_data() {
+        let mut features = crate::FeatureSet::store_only();
+        features.header_encryption = true;
+        let extras = super::ArchiveExtras {
+            header_password: Some(b"password"),
+            ..Default::default()
+        };
+        let mut sink = super::CollectedVolumes::new();
+        super::write_streaming_volumes_to(
+            &[simple_entry(b"payload")],
+            super::WriterOptions::new(crate::ArchiveVersion::Rar50, features),
+            extras,
+            64,
+            &mut sink,
+            &crate::WriterResources::default(),
+        )
+        .unwrap();
+        let parts = sink.take();
+        assert!(!parts.is_empty());
+        for part in parts {
+            assert!(matches!(
+                super::super::Archive::parse(&part),
+                Err(crate::Error::NeedPassword)
+            ));
+            let archive = super::super::Archive::parse_with_password(&part, Some(b"password"))
+                .unwrap();
+            assert!(archive.main.encrypted_headers);
+            assert!(archive.files().all(|file| !file.encrypted));
+        }
     }
 
     #[test]
