@@ -2907,4 +2907,34 @@ mod emission_ledger_tests {
         assert_eq!(opens.load(Ordering::Relaxed), 2);
         assert!(volumes.take().is_empty());
     }
+
+    #[test]
+    fn encrypted_compressed_volume_payload_propagates_spool_refusal() {
+        let scratch = crate::scratch::case("encrypted-volume-spool-refusal");
+        let resources = WriterResources::default().with_temp_dir(&*scratch);
+        let entry = ArchiveEntry::new(
+            b"payload".to_vec(),
+            crate::EntrySource::from_bytes(vec![b'A'; 64 * 1024]),
+        )
+        .with_password(b"secret");
+        let mut settings = plan(false);
+        settings.compress.method = 1;
+        settings.recovery_percent = None;
+        let member = compress::compress_members_reporting(
+            std::slice::from_ref(&entry.source),
+            settings.compress.clone(),
+            &resources,
+            &|_| true,
+        )
+        .unwrap()
+        .remove(0);
+        assert!(!member.store);
+
+        let constrained = resources.clone().with_max_spool_bytes(0);
+        let error = prepare_volume_member(&entry, member, &settings, &constrained)
+            .err()
+            .expect("encrypted ciphertext must be charged to its spool");
+        assert_eq!(error.kind(), crate::ErrorKind::ResourceLimit);
+        assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
+    }
 }
