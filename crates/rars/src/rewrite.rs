@@ -274,6 +274,11 @@ impl Archive {
         } else {
             crate::ArchiveVersion::Rar50
         };
+        let rar7_dictionary_size = archive
+            .files()
+            .find(|file| file.compression_info & 0x3f == 1)
+            .map(|file| file.decoded_compression_info().map(|info| info.dictionary_size))
+            .transpose()?;
         let encrypted = archive.main.encrypted_headers
             || archive.blocks.iter().any(|block| match block {
                 crate::rar50::Block::File(file) | crate::rar50::Block::Service(file) => {
@@ -312,6 +317,7 @@ impl Archive {
         });
         crate::Builder::new(version)
             .compression_level(Some(3))
+            .rar50_dictionary_size(rar7_dictionary_size)
             .solid(archive.main.is_solid())
             .password(password.clone())
             .header_encryption(archive.main.encrypted_headers)

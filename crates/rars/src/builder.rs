@@ -215,6 +215,7 @@ pub struct Builder {
     archive_metadata: Option<rar50::ArchiveMetadataRecord>,
     legacy_archive_comment_metadata: Option<(u32, u8)>,
     legacy_unpack_version: Option<u8>,
+    rar50_dictionary_size: Option<u64>,
     volume_size: Option<usize>,
     entries: Vec<BuilderEntry>,
     next_entry_id: usize,
@@ -239,6 +240,7 @@ impl Builder {
             archive_metadata: None,
             legacy_archive_comment_metadata: None,
             legacy_unpack_version: None,
+            rar50_dictionary_size: None,
             volume_size: None,
             entries: Vec::new(),
             next_entry_id: 0,
@@ -295,6 +297,11 @@ impl Builder {
 
     pub(crate) fn legacy_unpack_version(mut self, version: Option<u8>) -> Self {
         self.legacy_unpack_version = version;
+        self
+    }
+
+    pub(crate) fn rar50_dictionary_size(mut self, size: Option<u64>) -> Self {
+        self.rar50_dictionary_size = size;
         self
     }
 
@@ -1470,6 +1477,9 @@ impl Builder {
     /// over any level the caller asked for.
     fn rar50_options(&self) -> rar50::WriterOptions {
         let mut options = rar50::WriterOptions::new(self.format, self.features());
+        if let Some(size) = self.rar50_dictionary_size {
+            options = options.with_dictionary_size(size);
+        }
         if let Some(level) = self.compression {
             options = options.with_compression_level(level);
         }

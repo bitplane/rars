@@ -48,6 +48,74 @@ fn preserving_builder_accepts_rar13_family_and_rar7_sources() {
 }
 
 #[test]
+fn preserving_builder_keeps_rar20_unpacker_26() {
+    let payload = b"older RAR 2.x payload ".repeat(64);
+    let mut builder = Builder::new(ArchiveVersion::Rar20).store(true);
+    builder
+        .add_bytes(b"source".to_vec(), payload.clone(), None, None)
+        .unwrap();
+    let mut bytes = builder.to_bytes().unwrap();
+    let original = ArchiveReader::read_owned(bytes.clone()).unwrap();
+    let rars::Archive::Rar15To40(original) = original else {
+        unreachable!()
+    };
+    let file = original.files().next().unwrap();
+    let start = file.block.offset;
+    let end = start + usize::from(file.block.head_size);
+    bytes[start + 24] = 26;
+    let crc = (rars::crc32::crc32(&bytes[start + 2..end]) as u16).to_le_bytes();
+    bytes[start..start + 2].copy_from_slice(&crc);
+
+    let source = ArchiveReader::read_owned(bytes).unwrap();
+    assert!(source.rewrite_preservation_issues().is_empty());
+    assert_eq!(source.read_member_at(0, None).unwrap().unwrap(), payload);
+    let mut preserving = source.preserving_builder(None).unwrap();
+    preserving
+        .add_bytes(b"source".to_vec(), payload.clone(), None, None)
+        .unwrap();
+    let output = ArchiveReader::read_owned(preserving.to_bytes().unwrap()).unwrap();
+    let rars::Archive::Rar15To40(ref archive) = output else {
+        unreachable!()
+    };
+    assert_eq!(archive.files().next().unwrap().unp_ver, 26);
+    assert_eq!(output.read_member_at(0, None).unwrap().unwrap(), payload);
+}
+
+#[test]
+fn preserving_builder_keeps_rar7_compression_version() {
+    use rars::{rar50, EntrySource, FeatureSet};
+
+    let payload = b"RAR7 compression payload ".repeat(256);
+    let entry = rar50::ArchiveEntry::new(
+        b"source".to_vec(),
+        EntrySource::from_bytes(std::sync::Arc::<[u8]>::from(payload.clone())),
+    );
+    let bytes = rar50::Rar50Writer::new(
+        rar50::WriterOptions::new(ArchiveVersion::Rar70, FeatureSet::default())
+            .with_dictionary_size(192 * 1024),
+    )
+    .entry(entry)
+    .finish()
+    .unwrap();
+    let source = ArchiveReader::read_owned(bytes).unwrap();
+    let rars::Archive::Rar50Plus(ref archive) = source else {
+        unreachable!()
+    };
+    assert_eq!(archive.files().next().unwrap().compression_info & 0x3f, 1);
+    let mut preserving = source.preserving_builder(None).unwrap();
+    assert_eq!(preserving.format(), ArchiveVersion::Rar70);
+    preserving
+        .add_bytes(b"source".to_vec(), payload.clone(), None, None)
+        .unwrap();
+    let output = ArchiveReader::read_owned(preserving.to_bytes().unwrap()).unwrap();
+    let rars::Archive::Rar50Plus(ref archive) = output else {
+        unreachable!()
+    };
+    assert_eq!(archive.files().next().unwrap().compression_info & 0x3f, 1);
+    assert_eq!(output.read_member_at(0, None).unwrap().unwrap(), payload);
+}
+
+#[test]
 fn preserving_builder_requires_password_for_encrypted_rar14_members() {
     let mut builder = Builder::new(ArchiveVersion::Rar14)
         .store(true)
