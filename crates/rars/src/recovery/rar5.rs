@@ -1085,6 +1085,9 @@ where
     for (index, range) in shard_ranges.iter().enumerate() {
         poller.check(0).map_err(|_| Error::Cancelled)?;
         let shard = read_range(range.clone())?;
+        if shard.len() != range.len() {
+            return Err(Error::ShardSizeMismatch);
+        }
         if repair_crc(&shard, 0, control)? != first.data_shard_states[index] {
             damaged.push(index);
         }
@@ -1199,8 +1202,8 @@ where
     F: FnMut(std::ops::Range<usize>) -> Result<Vec<u8>>,
 {
     let mut shard = vec![0; shard_len];
-    let bytes = read_range(range)?;
-    if bytes.len() > shard_len {
+    let bytes = read_range(range.clone())?;
+    if bytes.len() != range.len() {
         return Err(Error::ShardSizeMismatch);
     }
     shard[..bytes.len()].copy_from_slice(&bytes);
@@ -2991,6 +2994,41 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn rar5_range_repair_rejects_short_callback_reads() {
+        let prefix = recovery_test_bytes(32_000, 41);
+        let recovery_data = build_structural_inline_recovery_data(&prefix, 20).unwrap();
+        let mut damaged = prefix.clone();
+        damaged[0] ^= 1;
+
+        let short_first = repair_inline_recovery_prefix_shards(
+            prefix.len(),
+            &recovery_data,
+            |range| Ok(damaged[range.start..range.end - 1].to_vec()),
+        );
+        assert_eq!(short_first, Err(Error::ShardSizeMismatch));
+
+        let mut reads = 0;
+        let data_shards = plan_inline_recovery(prefix.len() as u64, 20)
+            .unwrap()
+            .data_shards as usize;
+        let short_second = repair_inline_recovery_prefix_shards(
+            prefix.len(),
+            &recovery_data,
+            |range| {
+                reads += 1;
+                let end = if reads > data_shards {
+                    range.end - 1
+                } else {
+                    range.end
+                };
+                Ok(damaged[range.start..end].to_vec())
+            },
+        );
+        assert_eq!(short_second, Err(Error::ShardSizeMismatch));
+        assert!(reads > data_shards);
     }
 
     #[test]
