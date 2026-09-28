@@ -114,6 +114,31 @@ fn unicode_names_take_precedence_in_metadata_and_extraction() {
 }
 
 #[test]
+fn rar3_direct_utf8_unicode_name_round_trips_without_a_separator() {
+    let name = "café.txt".as_bytes();
+    let mut builder = Builder::new(ArchiveVersion::Rar29).store(true);
+    builder
+        .add_bytes(name.to_vec(), b"data".to_vec(), None, None)
+        .unwrap();
+    builder.set_legacy_unicode_name(name, name.to_vec()).unwrap();
+
+    let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    let member = archive.members().next().unwrap();
+    assert_eq!(member.meta.name, name);
+    assert!(member.name_is_unicode());
+    assert_eq!(member.decoded_name(None).unwrap().as_ref(), name);
+
+    let invalid = b"\xff.txt";
+    let mut builder = Builder::new(ArchiveVersion::Rar29).store(true);
+    builder
+        .add_bytes(invalid.to_vec(), b"data".to_vec(), None, None)
+        .unwrap();
+    assert!(builder
+        .set_legacy_unicode_name(invalid, invalid.to_vec())
+        .is_err());
+}
+
+#[test]
 fn legacy_unicode_metadata_is_validated_and_renamed_with_its_member() {
     let mut builder = Builder::new(ArchiveVersion::Rar29).store(true);
     builder
