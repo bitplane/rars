@@ -97,6 +97,143 @@ fn preserving_builder_refuses_an_sfx_prefix_it_cannot_preserve() {
 }
 
 #[test]
+fn preservation_preflight_refuses_metadata_it_cannot_rewrite() {
+    use rars::{rar50, Archive};
+
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    builder
+        .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+        .unwrap();
+    let Archive::Rar50Plus(seed) = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap()
+    else {
+        unreachable!()
+    };
+    assert!(Archive::Rar50Plus(seed.clone())
+        .rewrite_preservation_issues()
+        .is_empty());
+    let check = |mutate: fn(&mut rar50::Archive), expected: &str| {
+        let mut candidate = seed.clone();
+        mutate(&mut candidate);
+        let archive = Archive::Rar50Plus(candidate);
+        let issues = archive.rewrite_preservation_issues();
+        assert!(
+            issues.iter().any(|issue| issue.contains(expected)),
+            "missing {expected:?}: {issues:?}"
+        );
+        assert!(archive.preserving_builder(None).is_err());
+    };
+    check(
+        |archive| archive.main.archive_flags |= 1 << 20,
+        "main header metadata",
+    );
+    check(|archive| archive.main.archive_flags |= 1, "volume layout");
+    check(
+        |archive| archive.main.archive_flags |= 8,
+        "recovery flag and service disagree",
+    );
+    check(
+        |archive| {
+            if let rar50::Block::File(file) = &mut archive.blocks[0] {
+                file.name = b"../file".to_vec();
+            }
+        },
+        "unsupported output name",
+    );
+    check(
+        |archive| {
+            if let rar50::Block::File(file) = &mut archive.blocks[0] {
+                file.host_os = 99;
+            }
+        },
+        "unknown host attributes",
+    );
+    check(
+        |archive| {
+            if let rar50::Block::File(file) = &mut archive.blocks[0] {
+                file.compression_info = (file.compression_info & !0x3f) | 2;
+            }
+        },
+        "unsupported compression algorithm",
+    );
+    check(
+        |archive| {
+            if let rar50::Block::File(file) = &mut archive.blocks[0] {
+                file.compression_info |= 0x40;
+            }
+        },
+        "solid dependency without a solid archive",
+    );
+    check(
+        |archive| {
+            if let rar50::Block::End(end) = archive.blocks.last_mut().unwrap() {
+                end.flags = 1;
+            }
+        },
+        "end header flags",
+    );
+    check(
+        |archive| {
+            let mut unknown = archive.main.block.clone();
+            unknown.header_type = 99;
+            archive.blocks.push(rar50::Block::Unknown(unknown));
+        },
+        "unknown archive block",
+    );
+}
+
+#[test]
+fn preservation_preflight_checks_derived_service_and_locator_consistency() {
+    use rars::{rar50, Archive};
+
+    let mut builder = Builder::new(ArchiveVersion::Rar50)
+        .store(true)
+        .recovery_percent(Some(5))
+        .archive_metadata(None, false, true)
+        .unwrap();
+    builder
+        .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+        .unwrap();
+    let Archive::Rar50Plus(seed) = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap()
+    else {
+        unreachable!()
+    };
+    assert!(Archive::Rar50Plus(seed.clone())
+        .rewrite_preservation_issues()
+        .is_empty());
+
+    let mut invalid_service = seed.clone();
+    let service = invalid_service
+        .blocks
+        .iter_mut()
+        .find_map(|block| match block {
+            rar50::Block::Service(service) if service.name == b"QO" => Some(service),
+            _ => None,
+        })
+        .unwrap();
+    service.attributes = 1;
+    assert!(Archive::Rar50Plus(invalid_service)
+        .rewrite_preservation_issues()
+        .iter()
+        .any(|issue| issue.contains("unsupported derived service")));
+
+    let mut missing_service = seed.clone();
+    missing_service
+        .blocks
+        .retain(|block| !matches!(block, rar50::Block::Service(service) if service.name == b"QO"));
+    assert!(Archive::Rar50Plus(missing_service)
+        .rewrite_preservation_issues()
+        .iter()
+        .any(|issue| issue.contains("locator refers to a missing service")));
+
+    let mut conflicting_encryption = seed;
+    conflicting_encryption.main.encrypted_headers = true;
+    assert!(Archive::Rar50Plus(conflicting_encryption)
+        .rewrite_preservation_issues()
+        .iter()
+        .any(|issue| issue.contains("quick-open index with encrypted headers")));
+}
+
+#[test]
 fn mixed_data_and_comment_encryption_are_independent() {
     for solid in [false, true] {
         let mut builder = Builder::new(ArchiveVersion::Rar50)
