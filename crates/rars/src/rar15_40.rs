@@ -3077,14 +3077,24 @@ mod tests {
             add_size: Some(0x89ab_cdef),
             offset: 0,
         };
-        let file = parse_file_like_header(&header, block, 0).unwrap();
+        let parsed = parse_file_like_header(&header, block, 0);
+        if usize::BITS == 32 {
+            assert!(matches!(
+                parsed,
+                Err(Error::InvalidHeader(
+                    "RAR 1.5 packed file size overflows usize"
+                ))
+            ));
+            return;
+        }
+        let file = parsed.unwrap();
 
         assert_eq!(file.pack_size, 0x0000_0001_89ab_cdef);
         assert_eq!(file.unp_size, 0x0000_0002_7654_3210);
         assert_eq!(file.name, name);
         assert_eq!(
             file.packed_range,
-            head_size..head_size + 0x0000_0001_89ab_cdefusize
+            head_size..head_size + usize::try_from(0x0000_0001_89ab_cdefu64).unwrap()
         );
     }
 
