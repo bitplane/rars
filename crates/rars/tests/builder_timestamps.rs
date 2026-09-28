@@ -243,3 +243,69 @@ fn complete_file_times_survive_streaming_and_volume_paths() {
         }
     }
 }
+
+#[test]
+fn adding_creation_time_preserves_an_existing_fractional_modification_time() {
+    use rars::{FileTimes, FileTimestamp};
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    builder
+        .add_bytes(b"file".to_vec(), b"payload".to_vec(), Some(123), None)
+        .unwrap();
+    builder.set_mtime_nanoseconds(b"file", 456_789_123).unwrap();
+    let before = builder.to_bytes().unwrap();
+    let mixed = FileTimes {
+        modified: None,
+        created: Some(FileTimestamp::WindowsFiletime(116_444_736_000_000_001)),
+        accessed: None,
+    };
+    assert!(builder.set_file_times(b"file", Some(mixed)).is_err());
+    assert_eq!(builder.to_bytes().unwrap(), before);
+    let times = FileTimes {
+        modified: None,
+        created: Some(FileTimestamp::Unix {
+            seconds: 456,
+            nanoseconds: 0,
+        }),
+        accessed: None,
+    };
+    builder.set_file_times(b"file", Some(times)).unwrap();
+    let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    assert_eq!(
+        archive.members().next().unwrap().file_times().unwrap(),
+        Some(FileTimes {
+            modified: Some(FileTimestamp::Unix {
+                seconds: 123,
+                nanoseconds: 456_789_123,
+            }),
+            ..times
+        })
+    );
+}
+
+#[test]
+fn invalid_complete_times_leave_builder_output_unchanged() {
+    use rars::{FileTimes, FileTimestamp};
+    for format in [ArchiveVersion::Rar29, ArchiveVersion::Rar50] {
+        let mut builder = Builder::new(format).store(true);
+        builder
+            .add_bytes(b"file".to_vec(), b"payload".to_vec(), Some(123), None)
+            .unwrap();
+        let before = builder.to_bytes().unwrap();
+        let invalid = FileTimes {
+            modified: Some(FileTimestamp::Unix {
+                seconds: 123,
+                nanoseconds: 1_000_000_000,
+            }),
+            created: None,
+            accessed: None,
+        };
+        assert!(builder.set_file_times(b"file", Some(invalid)).is_err());
+        assert_eq!(builder.to_bytes().unwrap(), before);
+        if format == ArchiveVersion::Rar29 {
+            assert!(builder
+                .set_file_times(b"file", Some(FileTimes::default()))
+                .is_err());
+            assert_eq!(builder.to_bytes().unwrap(), before);
+        }
+    }
+}
