@@ -3043,6 +3043,43 @@ mod tests {
     }
 
     #[test]
+    fn codec_progress_restart_counts_new_work_and_preserves_codec_errors() {
+        use crate::write_progress::{ProgressReporter, WorkTracker};
+        use crate::{WriteOperation, WriteProgressEvent};
+        use std::sync::Mutex;
+
+        let advanced = Mutex::new(Vec::new());
+        let reporter = |event: WriteProgressEvent<'_>| {
+            if let WriteProgressEvent::Advanced {
+                completed_bytes, ..
+            } = event
+            {
+                advanced.lock().unwrap().push(completed_bytes);
+            }
+        };
+        let work = WorkTracker::new(
+            Some(ProgressReporter(&reporter)),
+            WriteOperation::Compression,
+            30,
+        );
+        let encoded = super::with_codec_progress(Some(&work), |progress| {
+            assert!(progress(10));
+            assert!(progress(3));
+            assert!(progress(5));
+            Ok(b"packed".to_vec())
+        })
+        .unwrap();
+        assert_eq!(encoded, b"packed");
+        assert_eq!(*advanced.lock().unwrap(), [10, 13, 15]);
+
+        let error = super::with_codec_progress(None, |_| {
+            Err(crate::codec::Error::InvalidData("injected codec failure"))
+        })
+        .unwrap_err();
+        assert!(matches!(error, crate::Error::Codec(_)));
+    }
+
+    #[test]
     fn audio_filter_candidate_rejects_high_entropy_binary_payloads() {
         let mut state = 0xfeed_faceu32;
         let data: Vec<_> = (0..16_384)
