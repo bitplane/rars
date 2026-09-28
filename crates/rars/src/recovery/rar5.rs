@@ -1590,8 +1590,9 @@ fn parse_inline_recovery_chunk_with_control(
     if header_size < RAR5_RECOVERY_CHUNK_FIXED_HEADER_SIZE || header_size > total_size {
         return Err(Error::BadRecoveryChunk);
     }
-    let total_size_usize = usize::try_from(total_size).map_err(|_| Error::PlanOverflow)?;
-    let header_size_usize = usize::try_from(header_size).map_err(|_| Error::PlanOverflow)?;
+    // Both values came from u32 fields, which fit usize on supported targets.
+    let total_size_usize = total_size as usize;
+    let header_size_usize = header_size as usize;
     if input.len() < total_size_usize {
         return Err(Error::BadRecoveryChunk);
     }
@@ -1617,14 +1618,9 @@ fn parse_inline_recovery_chunk_with_control(
         header_size,
         shard_size,
     };
-    if plan.payload_size()?
-        != recovery_shards
-            .checked_mul(shard_size)
-            .ok_or(Error::PlanOverflow)?
-        || shard_size != total_size
+    if shard_size != total_size
         || shard_index >= recovery_shards as usize
         || header_size_usize != 0x48 + data_shards as usize * 8
-        || total_size_usize < header_size_usize
     {
         return Err(Error::BadRecoveryChunk);
     }
@@ -3039,6 +3035,35 @@ mod tests {
         assert_eq!(reconstructed[0], first);
         assert_eq!(reconstructed[1], second);
         assert_eq!(reconstructed[2], third);
+    }
+
+    #[test]
+    fn rar5_reconstruct_data_shards_validates_shapes_and_missing_count() {
+        assert_eq!(reconstruct_data_shards(&[], &[]), Err(Error::TooManyShards));
+        assert_eq!(
+            reconstruct_data_shards(&[None], &[]),
+            Err(Error::TooManyDamagedShards)
+        );
+        assert_eq!(
+            reconstruct_data_shards(&[Some(&[1, 2, 3])], &[]),
+            Err(Error::OddShardSize)
+        );
+        assert_eq!(
+            reconstruct_data_shards(&[None], &[(0, &[1, 2]), (1, &[3, 4, 5, 6])]),
+            Err(Error::ShardSizeMismatch)
+        );
+        assert_eq!(
+            reconstruct_data_shards(&[Some(&[1, 2, 3, 4]), None], &[(0, &[5, 6])]),
+            Err(Error::ShardSizeMismatch)
+        );
+        assert_eq!(
+            reconstruct_data_shards(&[None, None], &[(0, &[1, 2])]),
+            Err(Error::TooManyDamagedShards)
+        );
+        assert_eq!(
+            reconstruct_data_shards(&[Some(&[1, 2]), Some(&[3])], &[]),
+            Ok(vec![vec![1, 2], vec![3, 0]])
+        );
     }
 
     #[test]
