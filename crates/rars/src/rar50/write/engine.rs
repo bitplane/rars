@@ -1994,6 +1994,63 @@ mod emission_ledger_tests {
     }
 
     #[test]
+    fn archive_emission_propagates_each_output_write_failure() {
+        struct FailOnWrite {
+            fail_at: usize,
+            writes: usize,
+        }
+        impl Write for FailOnWrite {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                let call = self.writes;
+                self.writes += 1;
+                if call == self.fail_at {
+                    Err(std::io::Error::other("injected output failure"))
+                } else {
+                    Ok(data.len())
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let entries = [ArchiveEntry::new(
+            b"file".to_vec(),
+            crate::EntrySource::from_bytes(b"payload".to_vec()),
+        )];
+        let settings = || {
+            let mut plan = plan(false);
+            plan.recovery_percent = None;
+            plan.quick_open = true;
+            plan
+        };
+        let resources = WriterResources::default();
+        let mut counting = FailOnWrite {
+            fail_at: usize::MAX,
+            writes: 0,
+        };
+        write_archive(&entries, settings(), &resources, &mut counting).unwrap();
+        assert!(counting.writes >= 6);
+
+        let mut member_failure = false;
+        let mut archive_failure = false;
+        for fail_at in 0..counting.writes {
+            let mut sink = FailOnWrite { fail_at, writes: 0 };
+            let error = write_archive(&entries, settings(), &resources, &mut sink)
+                .unwrap_err();
+            assert_eq!(error.kind(), crate::ErrorKind::Io, "write {fail_at}");
+            assert_eq!(sink.writes, fail_at + 1);
+            if error.entry_context() == Some((b"file".as_slice(), "writing")) {
+                member_failure = true;
+            } else {
+                archive_failure = true;
+            }
+        }
+        assert!(member_failure);
+        assert!(archive_failure);
+    }
+
+    #[test]
     fn encryption_emission_counts_retained_preparation_and_releases_chunk() {
         let data = vec![7; 65537];
         for limit in [65536, 131072] {
