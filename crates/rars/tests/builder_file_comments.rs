@@ -24,6 +24,29 @@ fn recovery_service_does_not_change_rar5_member_comments() {
 }
 
 #[test]
+fn rar5_comment_before_first_file_belongs_to_archive() {
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    builder
+        .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+        .unwrap();
+    builder
+        .set_file_comment(b"file", Some(b"note".to_vec()))
+        .unwrap();
+    let mut archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    let Archive::Rar50Plus(ref mut rar50) = archive else {
+        unreachable!()
+    };
+    assert!(matches!(rar50.blocks[0], rars::rar50::Block::File(_)));
+    assert!(matches!(rar50.blocks[1], rars::rar50::Block::Service(_)));
+    rar50.blocks.swap(0, 1);
+
+    assert_eq!(archive.comment(None).unwrap(), Some(b"note".to_vec()));
+    assert_eq!(archive.member_comments(None).unwrap(), vec![None]);
+    assert_eq!(archive.member_comment_encryption(), [false]);
+    assert!(archive.rewrite_preservation_issues().is_empty());
+}
+
+#[test]
 fn comments_follow_renames_and_round_trip_through_supported_writers() {
     for version in [
         ArchiveVersion::Rar14,
