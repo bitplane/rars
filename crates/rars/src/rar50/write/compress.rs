@@ -1284,6 +1284,32 @@ mod tests {
     }
 
     #[test]
+    fn admitted_whole_member_worker_propagates_source_failure() {
+        let options = EncodeOptions::new(8);
+        let plan = CompressPlan {
+            algorithm_version: 0,
+            encode_options: options,
+            dictionary_size: 65536,
+            block_size: 1024,
+            solid: false,
+            method: 1,
+            filter_policy: FilterPolicy::None,
+            candidates: vec![options, options].into(),
+        };
+        let source = EntrySource::from_opener(1024, || {
+            Err(std::io::Error::other("injected worker source failure").into())
+        });
+        let resources = WriterResources::new(70 * 1024 * 1024)
+            .with_max_memory_bytes(70 * 1024 * 1024);
+        let error = compress_members_reporting(&[source], plan, &resources, &|_| true)
+            .err()
+            .expect("the admitted worker must report its source failure");
+        assert_eq!(error.kind(), crate::ErrorKind::Io);
+        assert_eq!(resources.workspace_in_use(), 0);
+        assert_eq!(resources.execution.as_ref().unwrap().used(), 0);
+    }
+
+    #[test]
     fn stored_member_descriptor_refusal_releases_preparation_charge() {
         let options = EncodeOptions::new(8);
         let plan = CompressPlan {
