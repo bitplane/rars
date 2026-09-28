@@ -528,6 +528,38 @@ mod dictionary_encoding_tests {
             .unwrap_err(),
             Error::UnsupportedVersion(crate::ArchiveVersion::Rar40)
         );
+        assert_eq!(
+            validate_dictionary_size(crate::ArchiveVersion::Rar40, 128 * 1024).unwrap_err(),
+            Error::UnsupportedVersion(crate::ArchiveVersion::Rar40)
+        );
+        assert_eq!(
+            dictionary_size_fields(2, 128 * 1024).unwrap_err(),
+            Error::InvalidArgument("RAR 5 unknown compression algorithm version")
+        );
+    }
+
+    #[test]
+    fn filter_trials_propagate_codec_allocation_refusals() {
+        use crate::codec::workspace::Allowance;
+        use crate::filter_search::OwnedSearch;
+
+        let search = Rar50OwnedSearch {
+            algorithm_version: 0,
+            allowance: Allowance::limited(0),
+        };
+        let filter = FilterSpec::whole(FilterKind::Delta { channels: 1 });
+        let data = vec![42; 4096];
+        assert_eq!(
+            search.filtered_bytes(&data, std::slice::from_ref(&filter)).unwrap_err().kind(),
+            crate::ErrorKind::ResourceLimit
+        );
+        assert_eq!(
+            search
+                .encode_filtered(&data, &[filter], EncodeOptions::new(8), None)
+                .unwrap_err()
+                .kind(),
+            crate::ErrorKind::ResourceLimit
+        );
     }
 }
 
