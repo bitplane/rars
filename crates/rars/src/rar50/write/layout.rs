@@ -288,4 +288,40 @@ mod tests {
         assert_eq!(layout.recovery_prefix_len, None);
         assert!(layout.main_extra.is_empty());
     }
+
+    #[test]
+    fn layout_includes_retained_metadata_before_solving_offsets() {
+        let metadata = crate::rar50::ArchiveMetadataRecord {
+            flags: 2,
+            name: None,
+            creation_time: Some(123),
+        };
+        let mut inputs = inputs(4096);
+        inputs.metadata_record = Some(&metadata);
+        inputs.quick_open_payload_len = Some(17);
+        let layout = resolve_layout(&inputs, &crate::WriterResources::default()).unwrap();
+        assert!(!layout.main_extra.is_empty());
+        assert_self_consistent(&inputs, &layout);
+    }
+
+    #[test]
+    fn layout_rejects_offset_and_service_length_overflow() {
+        let resources = crate::WriterResources::default();
+        for (body_len, head_crypt_len, quick_open_payload_len) in [
+            (u64::MAX, 0, None),
+            (0, u64::MAX, None),
+        ] {
+            let mut inputs = inputs(body_len);
+            inputs.head_crypt_len = head_crypt_len;
+            inputs.quick_open_payload_len = quick_open_payload_len;
+            assert_eq!(
+                resolve_layout(&inputs, &resources).unwrap_err(),
+                Error::InvalidArgument("RAR 5 archive layout overflows")
+            );
+        }
+        assert_eq!(
+            stored_service_block_len(b"QO", u64::MAX, &[], false, &resources).unwrap_err(),
+            Error::InvalidArgument("RAR 5 service block size overflows")
+        );
+    }
 }
