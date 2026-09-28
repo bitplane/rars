@@ -2866,4 +2866,45 @@ mod emission_ledger_tests {
             assert_eq!(resources.preparation_in_use(), 0, "admission {index}");
         }
     }
+
+    #[test]
+    fn encrypted_volume_reread_failure_keeps_member_context() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let opens = Arc::new(AtomicUsize::new(0));
+        let source = crate::EntrySource::from_opener(8, {
+            let opens = opens.clone();
+            move || {
+                if opens.fetch_add(1, Ordering::Relaxed) == 0 {
+                    Ok(Box::new(std::io::Cursor::new(b"contents".to_vec())))
+                } else {
+                    Err(std::io::Error::other("injected encrypted reread failure").into())
+                }
+            }
+        });
+        let entries = [ArchiveEntry::new(b"payload".to_vec(), source).with_password(b"secret")];
+        let mut settings = plan(false);
+        settings.compress.method = 0;
+        settings.archive_comment = None;
+        settings.recovery_percent = None;
+        let mut volumes = super::super::CollectedVolumes::new();
+        let error = write_volumes(
+            &entries,
+            settings,
+            4096,
+            &mut volumes,
+            &WriterResources::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::Io);
+        assert_eq!(
+            error.entry_context(),
+            Some((b"payload".as_slice(), "preparing volume payload"))
+        );
+        assert_eq!(opens.load(Ordering::Relaxed), 2);
+        assert!(volumes.take().is_empty());
+    }
 }
