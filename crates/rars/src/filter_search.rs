@@ -1542,6 +1542,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn x86_candidate_construction_releases_storage_on_each_admission_failure() {
+        use crate::codec::workspace::RefusingBudget;
+
+        let run = |budget: &RefusingBudget| -> Result<()> {
+            let screen = X86Screen {
+                rejected_a_region: true,
+                kept: Buffer::collect(std::iter::once(0..3), budget)?,
+                jumps_cost_more: true,
+            };
+            let finalists = super::x86_finalists(&[0; 100], &screen)?;
+            assert_eq!(finalists.len(), 2);
+            assert!(finalists.iter().all(|specs| specs.len() == 1));
+            Ok(())
+        };
+        let baseline = RefusingBudget::new(usize::MAX);
+        run(&baseline).unwrap();
+        assert_eq!(baseline.used(), 0);
+        for index in 0..baseline.attempts() {
+            let budget = RefusingBudget::new(index);
+            assert_eq!(run(&budget), Err(crate::Error::Cancelled), "admission {index}");
+            assert_eq!(budget.used(), 0, "admission {index}");
+        }
+    }
+
+    #[test]
+    fn table_grafting_releases_storage_on_each_admission_failure() {
+        use crate::codec::workspace::RefusingBudget;
+
+        let run = |budget: &RefusingBudget| -> Result<()> {
+            let specs = Buffer::collect([FilterSpec::whole(FilterKind::E8E9)], budget)?;
+            let grafted = super::graft_owned(specs, &[(20..40, 2)], 100)?;
+            assert_eq!(grafted.len(), 3);
+            assert_eq!(grafted[0].range, Some(0..20));
+            assert_eq!(grafted[1].range, Some(20..40));
+            assert_eq!(grafted[2].range, Some(40..100));
+            Ok(())
+        };
+        let baseline = RefusingBudget::new(usize::MAX);
+        run(&baseline).unwrap();
+        assert_eq!(baseline.used(), 0);
+        for index in 0..baseline.attempts() {
+            let budget = RefusingBudget::new(index);
+            assert_eq!(run(&budget), Err(crate::Error::Cancelled), "admission {index}");
+            assert_eq!(budget.used(), 0, "admission {index}");
+        }
+    }
+
     /// The E8-only filter costs a whole-member encode to ask whether leaving
     /// the jump opcodes alone packs better. Over twenty-four members it won
     /// seven times and never by more than 0.21%, so it only earns that encode
