@@ -1046,6 +1046,70 @@ fn validate_service(service: &ServiceEntry) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::VolumeSink;
+
+    #[test]
+    fn collected_volumes_enforce_order_and_report_length_mismatch() {
+        let mut volumes = super::CollectedVolumes::new();
+        assert!(matches!(
+            volumes.start_volume(1),
+            Err(crate::Error::WriterFailure(
+                "RAR 5 volumes arrived out of order"
+            ))
+        ));
+        let mut output = volumes.start_volume(0).unwrap();
+        output.write_all(b"abc").unwrap();
+        output.flush().unwrap();
+        assert!(matches!(
+            volumes.finish_volume(0, 2),
+            Err(crate::Error::WriterFailure(
+                "RAR 5 volume length does not match what was written"
+            ))
+        ));
+        volumes.finish_volume(0, 3).unwrap();
+        drop(output);
+        assert_eq!(volumes.take(), [b"abc".to_vec()]);
+    }
+
+    #[test]
+    fn writer_plan_rejects_wrong_family_and_solid_filters_before_opening_source() {
+        let entry = || {
+            super::ArchiveEntry::new(
+                b"file".to_vec(),
+                crate::EntrySource::from_opener(1, || panic!("invalid plan opened source")),
+            )
+        };
+        let wrong_family = super::Rar50Writer::new(super::WriterOptions::new(
+            crate::ArchiveVersion::Rar29,
+            crate::FeatureSet::store_only(),
+        ))
+        .entry(entry())
+        .finish()
+        .unwrap_err();
+        assert!(matches!(
+            wrong_family,
+            crate::Error::UnsupportedVersion(crate::ArchiveVersion::Rar29)
+        ));
+
+        let mut features = crate::FeatureSet::store_only();
+        features.solid = true;
+        let solid_filter = super::Rar50Writer::new(super::WriterOptions::new(
+            crate::ArchiveVersion::Rar50,
+            features,
+        ))
+        .entry(entry())
+        .filter_policy(super::FilterPolicy::explicit(super::FilterKind::E8))
+        .finish()
+        .unwrap_err();
+        assert!(matches!(
+            solid_filter,
+            crate::Error::UnsupportedWriterOption {
+                option: crate::WriterOption::Filter,
+                ..
+            }
+        ));
+    }
+
     fn simple_entry(data: &[u8]) -> super::ArchiveEntry {
         super::ArchiveEntry::new(b"file".to_vec(), crate::EntrySource::from_bytes(data.to_vec()))
     }
