@@ -459,5 +459,31 @@ mod native {
             assert_eq!(used.load(Ordering::Acquire), 5);
             assert_eq!(second.spool.borrow().len(), 2);
         }
+
+        #[test]
+        fn spool_write_failure_releases_the_provisional_staging_charge() {
+            let root = crate::scratch::case("rewrite-spool-write-failure");
+            let resources = WriterResources::new(0).with_temp_dir(&*root);
+            let used = Arc::new(AtomicU64::new(0));
+            let mut sink = Sink {
+                spool: Rc::new(RefCell::new(Spool::create(&resources).unwrap())),
+                used: used.clone(),
+                limit: 16,
+            };
+            sink.flush().unwrap();
+            sink.spool.borrow_mut().park();
+            let path = std::fs::read_dir(&root)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            std::fs::remove_file(path).unwrap();
+            assert_eq!(
+                sink.write(b"payload").unwrap_err().kind(),
+                std::io::ErrorKind::NotFound
+            );
+            assert_eq!(used.load(Ordering::Acquire), 0);
+        }
     }
 }
