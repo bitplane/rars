@@ -6,6 +6,22 @@ use rars::{ArchiveFamily, ArchiveReader, ArchiveVersion, Builder};
 const MODES: [Option<u32>; 4] = [None, Some(0o640), Some(0o100750), Some(0)];
 
 #[test]
+fn rar5_archive_metadata_settings_refuse_volume_output() {
+    for (locked, quick_open) in [(true, false), (false, true)] {
+        let mut builder = Builder::new(ArchiveVersion::Rar50)
+            .store(true)
+            .archive_metadata(None, locked, quick_open)
+            .unwrap()
+            .volume_size(Some(4096));
+        builder
+            .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+        assert!(builder.to_bytes().is_err());
+        assert!(builder.build_volumes(None).is_err());
+    }
+}
+
+#[test]
 fn builder_preserves_explicit_dos_attributes_in_all_writer_paths() {
     let flags = [0, 1, 2, 4, 0x20, 0x27, 0x80];
     let root = scratch::case("builder-dos-attributes");

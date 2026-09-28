@@ -1956,6 +1956,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
+            builder.to_bytes().unwrap_err(),
+            crate::Error::InvalidArgument(
+                "archive metadata settings require the RAR5/7 streaming writer"
+            )
+        );
+        assert_eq!(
             builder.build_volumes(None).unwrap_err(),
             crate::Error::InvalidArgument(
                 "archive metadata settings are not supported in volume output"
