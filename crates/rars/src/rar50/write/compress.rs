@@ -1324,6 +1324,26 @@ mod tests {
         );
         assert_eq!(ledger.used(), 0);
 
+        let cancellation = crate::WriteCancellation::new();
+        let admitted = WriterResources::default()
+            .with_cancellation(cancellation.clone())
+            .with_execution_allowance(ledger.clone());
+        let jobs = Records::collect([1u8].into_iter().map(Ok), &admitted).unwrap();
+        cancellation.cancel();
+        assert_eq!(
+            run_jobs_admitted(
+                jobs,
+                &admitted,
+                &|_| true,
+                |_| 1,
+                |_, _, _, _| -> Result<u8> { panic!("cancelled resource dispatched a job") },
+            )
+            .err()
+            .unwrap(),
+            Error::Cancelled
+        );
+        assert_eq!(ledger.used(), 0);
+
         let source = EntrySource::from_opener(0, || panic!("empty source was opened"));
         assert_eq!(
             MemberStream::new(
