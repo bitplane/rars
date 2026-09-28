@@ -4812,6 +4812,10 @@ fn parses_rar50_rev5_recovery_volume_metadata() {
     assert_eq!(rev.data_volumes.len(), 5);
     assert_eq!(rev.data_volumes[0].file_size, 4096);
     assert_eq!(rev.data_volumes[4].file_size, 1032);
+
+    let parsed_meta = Rev5VolumeMeta::parse(&bytes).unwrap();
+    assert_eq!(Rev5VolumeMeta::from(&rev), parsed_meta);
+    assert_eq!(Rev5VolumeMeta::from(rev), parsed_meta);
 }
 
 #[test]

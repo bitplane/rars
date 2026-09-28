@@ -2811,6 +2811,39 @@ mod tests {
     }
 
     #[test]
+    fn recovery_end_header_preserves_split_volume_continuation() {
+        let first = include_bytes!("../tests/fixtures/rar50/multivol.part1.rar");
+        let last = include_bytes!("../tests/fixtures/rar50/multivol.part3.rar");
+        for (bytes, expected) in [
+            (first.as_slice(), EFL_NEXT_VOLUME),
+            (last.as_slice(), 0),
+        ] {
+            let archive = Archive::parse(bytes).unwrap();
+            assert_eq!(
+                archive.files().last().unwrap().is_split_after(),
+                expected != 0
+            );
+            let end = recovery_end_header(bytes, crate::ArchiveReadOptions::new()).unwrap();
+            let parsed = parse_block_header_bytes(
+                &end,
+                0,
+                end.len(),
+                0,
+                &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new()),
+            )
+            .unwrap();
+            assert_eq!(parsed.block.header_type, HEAD_END);
+            let mut reader = HeaderReader::new(&parsed.header, parsed.type_specific_range);
+            assert_eq!(reader.read_vint().unwrap(), expected);
+        }
+
+        assert!(matches!(
+            recovery_end_header(RAR50_SIGNATURE, crate::ArchiveReadOptions::new()),
+            Err(Error::TooShort)
+        ));
+    }
+
+    #[test]
     fn header_fields_reject_truncation_overflow_and_unexpected_encryption() {
         let image = |body: &[u8]| {
             assert!(body.len() < 128);
