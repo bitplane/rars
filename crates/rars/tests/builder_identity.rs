@@ -191,3 +191,27 @@ fn file_copy_validation_ignores_interleaved_unix_symlink() {
     assert_eq!(members[1].unix_symlink().unwrap().target_name, b"other");
     assert_eq!(members[2].supported_redirection().unwrap().target_name, b"other");
 }
+
+#[test]
+fn removing_duplicate_does_not_treat_unix_symlink_as_file_copy() {
+    let mut builder = Builder::new(ArchiveVersion::Rar50)
+        .store(true)
+        .allow_duplicate_names(true);
+    builder
+        .add_bytes(b"same".to_vec(), b"first".to_vec(), None, None)
+        .unwrap();
+    builder
+        .add_unix_symlink(b"link".to_vec(), b"same".to_vec(), false, None, None)
+        .unwrap();
+    builder
+        .add_bytes(b"same".to_vec(), b"second".to_vec(), None, None)
+        .unwrap();
+
+    builder.remove_by_id(0).unwrap();
+    let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    assert_eq!(
+        archive.members().next().unwrap().unix_symlink().unwrap().target_name,
+        b"same"
+    );
+    assert_eq!(archive.read_member(b"same", None).unwrap().unwrap(), b"second");
+}
