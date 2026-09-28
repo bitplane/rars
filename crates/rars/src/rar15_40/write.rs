@@ -2762,6 +2762,53 @@ fn write_comment_header_crc(out: &mut [u8], start: usize) {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn member_cancellation_during_workspace_admission_is_preserved() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CancelOnSecondPoll(AtomicUsize);
+        impl crate::WriteProgress for CancelOnSecondPoll {
+            fn report(&self, _: crate::WriteProgressEvent<'_>) {}
+
+            fn is_cancelled(&self) -> bool {
+                self.0.fetch_add(1, Ordering::Relaxed) != 0
+            }
+        }
+
+        let entry = super::FileEntry {
+            name: b"file",
+            data: b"payload",
+            file_time: 0,
+            file_attr: 0x20,
+            host_os: 3,
+            password: None,
+            file_comment: None,
+        };
+        let callback = CancelOnSecondPoll(AtomicUsize::new(0));
+        let work = super::WorkTracker::new(
+            Some(super::ProgressReporter(&callback)),
+            crate::WriteOperation::Compression,
+            7,
+        );
+        let resources = crate::WriterResources::new(1);
+        assert!(matches!(
+            super::encode_member(
+                &super::Member::from_file(&entry),
+                super::WriterOptions::new(
+                    crate::ArchiveVersion::Rar29,
+                    crate::FeatureSet::store_only(),
+                ),
+                &crate::MemberCoding::Stored,
+                &mut None,
+                &resources,
+                &work,
+            ),
+            Err(crate::Error::Cancelled)
+        ));
+        assert_eq!(callback.0.load(Ordering::Relaxed), 2);
+        assert_eq!(resources.workspace_in_use(), 0);
+    }
+
+    #[test]
     fn retained_archive_comment_metadata_requires_rar3_or_4_comment() {
         let mut options = super::WriterOptions::new(
             crate::ArchiveVersion::Rar30,

@@ -2494,6 +2494,51 @@ pub fn file_checksum(input: &[u8]) -> u16 {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn writer_cancellation_during_workspace_admission_is_preserved() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CancelOnSecondPoll(AtomicUsize);
+        impl crate::WriteProgress for CancelOnSecondPoll {
+            fn report(&self, _: crate::WriteProgressEvent<'_>) {}
+
+            fn is_cancelled(&self) -> bool {
+                self.0.fetch_add(1, Ordering::Relaxed) != 0
+            }
+        }
+
+        let entry = super::FileEntry {
+            name: b"file",
+            data: b"payload",
+            file_time: 0,
+            file_attr: 0x20,
+            password: None,
+            file_comment: None,
+        };
+        let callback = CancelOnSecondPoll(AtomicUsize::new(0));
+        let work = super::WorkTracker::new(
+            Some(super::ProgressReporter(&callback)),
+            crate::WriteOperation::Compression,
+            7,
+        );
+        let resources = crate::WriterResources::new(1);
+        let options = super::WriterOptions::default();
+        assert!(matches!(
+            super::encode_member(
+                &super::Member::from_file(&entry),
+                options,
+                &crate::MemberCoding::Stored,
+                super::rar15_encode_options_for_level(options.compression_level),
+                None,
+                &resources,
+                &work,
+            ),
+            Err(crate::Error::Cancelled)
+        ));
+        assert_eq!(callback.0.load(Ordering::Relaxed), 2);
+        assert_eq!(resources.workspace_in_use(), 0);
+    }
+
+    #[test]
     fn reader_workspace_rar13_stored_archives_need_no_dictionary_allocation() {
         for password in [None, Some(&b"pw"[..])] {
             let input = [StoredEntry {
