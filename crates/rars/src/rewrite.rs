@@ -205,129 +205,134 @@ impl Archive {
                 "archive has unsupported preservation settings",
             ));
         }
-        if let Archive::Rar13(archive) = self {
-            let password = if archive.entries.iter().any(|entry| entry.is_encrypted()) {
-                Some(
-                    password
-                        .filter(|value| !value.is_empty())
-                        .ok_or(crate::Error::NeedPassword)?
-                        .to_vec(),
-                )
-            } else {
-                None
-            };
-            return Ok(crate::Builder::new(crate::ArchiveVersion::Rar14)
-                .compression_level(Some(3))
-                .solid(archive.main.is_solid())
-                .password(password));
-        }
-        if let Archive::Rar15To40(archive) = self {
-            let encrypted = archive.main.has_encrypted_headers()
-                || archive.files().any(|file| file.is_encrypted())
-                || archive.new_subs().any(|sub| sub.file.is_encrypted());
-            let password = if encrypted {
-                Some(
-                    password
-                        .filter(|password| !password.is_empty())
-                        .ok_or(crate::Error::NeedPassword)?
-                        .to_vec(),
-                )
-            } else {
-                None
-            };
-            let version = archive.preservation_version();
-            return Ok(crate::Builder::new(version)
-                .compression_level(Some(3))
-                .legacy_unpack_version(
-                    (version == crate::ArchiveVersion::Rar20
-                        && archive.files().any(|file| file.unp_ver == 26))
-                    .then_some(26),
-                )
-                .solid(archive.main.is_solid())
-                // Preflight accepts only CMT new-sub records, and at most one.
-                .archive_comment_password(
-                    archive
-                        .new_subs()
-                        .any(|sub| sub.file.is_encrypted())
-                        .then(|| password.clone())
-                        .flatten(),
-                )
-                .password(password)
-                .header_encryption(archive.main.has_encrypted_headers())
-                .legacy_archive_comment_metadata(
-                    archive
-                        .new_subs()
-                        .next()
-                        .map(|sub| (sub.file.file_time, sub.file.host_os)),
-                ));
-        }
-        let Archive::Rar50Plus(archive) = self else {
-            return Err(crate::Error::InvalidArgument(
-                "legacy preservation is unsupported",
-            ));
-        };
-        let version = if archive
-            .files()
-            .any(|file| file.compression_info & 0x3f == 1)
-        {
-            crate::ArchiveVersion::Rar70
-        } else {
-            crate::ArchiveVersion::Rar50
-        };
-        let rar7_dictionary_size = archive
-            .files()
-            .find(|file| file.compression_info & 0x3f == 1)
-            .map(|file| file.decoded_compression_info().map(|info| info.dictionary_size))
-            .transpose()?;
-        let encrypted = archive.main.encrypted_headers
-            || archive.blocks.iter().any(|block| match block {
-                crate::rar50::Block::File(file) | crate::rar50::Block::Service(file) => {
-                    file.encrypted
-                }
-                _ => false,
-            });
-        let password = if encrypted {
-            Some(
-                password
-                    .filter(|password| !password.is_empty())
-                    .ok_or(crate::Error::NeedPassword)?
-                    .to_vec(),
-            )
-        } else {
-            None
-        };
-        let archive_comment_encrypted = archive.blocks.iter().take_while(|block| !matches!(block, crate::rar50::Block::File(_)))
+        match self {
+            Archive::Rar13(archive) => {
+                let password = if archive.entries.iter().any(|entry| entry.is_encrypted()) {
+                    Some(
+                        password
+                            .filter(|value| !value.is_empty())
+                            .ok_or(crate::Error::NeedPassword)?
+                            .to_vec(),
+                    )
+                } else {
+                    None
+                };
+                Ok(crate::Builder::new(crate::ArchiveVersion::Rar14)
+                    .compression_level(Some(3))
+                    .solid(archive.main.is_solid())
+                    .password(password))
+            }
+            Archive::Rar15To40(archive) => {
+                let encrypted = archive.main.has_encrypted_headers()
+                    || archive.files().any(|file| file.is_encrypted())
+                    || archive.new_subs().any(|sub| sub.file.is_encrypted());
+                let password = if encrypted {
+                    Some(
+                        password
+                            .filter(|password| !password.is_empty())
+                            .ok_or(crate::Error::NeedPassword)?
+                            .to_vec(),
+                    )
+                } else {
+                    None
+                };
+                let version = archive.preservation_version();
+                Ok(crate::Builder::new(version)
+                    .compression_level(Some(3))
+                    .legacy_unpack_version(
+                        (version == crate::ArchiveVersion::Rar20
+                            && archive.files().any(|file| file.unp_ver == 26))
+                        .then_some(26),
+                    )
+                    .solid(archive.main.is_solid())
+                    // Preflight accepts only CMT new-sub records, and at most one.
+                    .archive_comment_password(
+                        archive
+                            .new_subs()
+                            .any(|sub| sub.file.is_encrypted())
+                            .then(|| password.clone())
+                            .flatten(),
+                    )
+                    .password(password)
+                    .header_encryption(archive.main.has_encrypted_headers())
+                    .legacy_archive_comment_metadata(
+                        archive
+                            .new_subs()
+                            .next()
+                            .map(|sub| (sub.file.file_time, sub.file.host_os)),
+                    ))
+            }
+            Archive::Rar50Plus(archive) => {
+                let version = if archive
+                    .files()
+                    .any(|file| file.compression_info & 0x3f == 1)
+                {
+                    crate::ArchiveVersion::Rar70
+                } else {
+                    crate::ArchiveVersion::Rar50
+                };
+                let rar7_dictionary_size = archive
+                    .files()
+                    .find(|file| file.compression_info & 0x3f == 1)
+                    .map(|file| {
+                        file.decoded_compression_info()
+                            .map(|info| info.dictionary_size)
+                    })
+                    .transpose()?;
+                let encrypted = archive.main.encrypted_headers
+                    || archive.blocks.iter().any(|block| match block {
+                        crate::rar50::Block::File(file) | crate::rar50::Block::Service(file) => {
+                            file.encrypted
+                        }
+                        _ => false,
+                    });
+                let password = if encrypted {
+                    Some(
+                        password
+                            .filter(|password| !password.is_empty())
+                            .ok_or(crate::Error::NeedPassword)?
+                            .to_vec(),
+                    )
+                } else {
+                    None
+                };
+                let archive_comment_encrypted = archive.blocks.iter().take_while(|block| !matches!(block, crate::rar50::Block::File(_)))
             .any(|block| matches!(block, crate::rar50::Block::Service(service) if service.name == b"CMT" && service.encrypted));
-        let mut quick_open = false;
-        let mut recovery_percent = None;
-        for block in &archive.blocks {
-            if let crate::rar50::Block::Service(service) = block {
-                if service.name == b"QO" || service.name == b"RR" {
-                    service.write_to(archive, password.as_deref(), &mut std::io::sink())?;
-                    quick_open |= service.name == b"QO";
-                    if service.name == b"RR" {
-                        recovery_percent = service.recovery_record()?.map(|record| record.percent);
+                let mut quick_open = false;
+                let mut recovery_percent = None;
+                for block in &archive.blocks {
+                    if let crate::rar50::Block::Service(service) = block {
+                        if service.name == b"QO" || service.name == b"RR" {
+                            service.write_to(archive, password.as_deref(), &mut std::io::sink())?;
+                            quick_open |= service.name == b"QO";
+                            if service.name == b"RR" {
+                                recovery_percent =
+                                    service.recovery_record()?.map(|record| record.percent);
+                            }
+                        }
                     }
                 }
+                let metadata = archive.main.extras.iter().find_map(|extra| match extra {
+                    crate::rar50::MainExtraRecord::ArchiveMetadata(metadata) => {
+                        Some(metadata.clone())
+                    }
+                    _ => None,
+                });
+                crate::Builder::new(version)
+                    .compression_level(Some(3))
+                    .rar50_dictionary_size(rar7_dictionary_size)
+                    .solid(archive.main.is_solid())
+                    .password(password.clone())
+                    .header_encryption(archive.main.encrypted_headers)
+                    .archive_comment_password(if archive_comment_encrypted {
+                        password
+                    } else {
+                        None
+                    })
+                    .recovery_percent(recovery_percent)
+                    .archive_metadata(metadata, archive.main.is_locked(), quick_open)
             }
         }
-        let metadata = archive.main.extras.iter().find_map(|extra| match extra {
-            crate::rar50::MainExtraRecord::ArchiveMetadata(metadata) => Some(metadata.clone()),
-            _ => None,
-        });
-        crate::Builder::new(version)
-            .compression_level(Some(3))
-            .rar50_dictionary_size(rar7_dictionary_size)
-            .solid(archive.main.is_solid())
-            .password(password.clone())
-            .header_encryption(archive.main.encrypted_headers)
-            .archive_comment_password(if archive_comment_encrypted {
-                password
-            } else {
-                None
-            })
-            .recovery_percent(recovery_percent)
-            .archive_metadata(metadata, archive.main.is_locked(), quick_open)
     }
 
     /// Whether each member's comment payload is encrypted, in archive member order.
