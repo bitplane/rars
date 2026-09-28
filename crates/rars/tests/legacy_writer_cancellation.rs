@@ -243,3 +243,58 @@ fn cancellation_from_final_zero_byte_progress_is_not_reported_as_success() {
         ErrorKind::Cancelled
     );
 }
+
+#[test]
+fn compressed_legacy_volume_can_cancel_at_final_progress() {
+    use rars::{rar15_40, FeatureSet};
+    use std::sync::atomic::AtomicUsize;
+
+    struct StopAfterLastVolume {
+        final_volume: AtomicBool,
+        checks_after_final: AtomicUsize,
+    }
+    impl WriteProgress for StopAfterLastVolume {
+        fn report(&self, event: WriteProgressEvent<'_>) {
+            if let WriteProgressEvent::VolumeFinished {
+                volume_number,
+                total_volumes: Some(total_volumes),
+                ..
+            } = event
+            {
+                if volume_number == total_volumes {
+                    self.final_volume.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+        fn is_cancelled(&self) -> bool {
+            // The volume reporter checks once before returning. Cancel at
+            // the wrapper's final compression-progress update after that.
+            self.final_volume.load(Ordering::Relaxed)
+                && self.checks_after_final.fetch_add(1, Ordering::Relaxed) != 0
+        }
+    }
+
+    let data = b"legacy volume compression".repeat(100);
+    let entry = rar15_40::FileEntry {
+        name: b"file",
+        data: &data,
+        file_time: 0,
+        file_attr: 0x20,
+        host_os: 3,
+        password: None,
+        file_comment: None,
+    };
+    let progress = StopAfterLastVolume {
+        final_volume: AtomicBool::new(false),
+        checks_after_final: AtomicUsize::new(0),
+    };
+    let result = rar15_40::write_compressed_volumes_with_progress(
+        entry,
+        rar15_40::WriterOptions::new(ArchiveVersion::Rar29, FeatureSet::default()),
+        1024,
+        Some(&progress),
+    );
+    assert_eq!(result.unwrap_err().kind(), ErrorKind::Cancelled);
+    assert!(progress.final_volume.load(Ordering::Relaxed));
+    assert!(progress.checks_after_final.load(Ordering::Relaxed) >= 2);
+}
