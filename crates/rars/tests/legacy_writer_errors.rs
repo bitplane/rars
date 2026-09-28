@@ -91,6 +91,27 @@ fn oversized_legacy_comment_fails_before_opening_member_source() {
 }
 
 #[test]
+fn embedded_comment_that_exceeds_file_header_size_is_rejected() {
+    for (comment_len, fits) in [(65486, true), (65487, false)] {
+        let mut builder = Builder::new(ArchiveVersion::Rar29).store(true);
+        builder
+            .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+        builder
+            .set_file_comment(b"file", Some(vec![b'x'; comment_len]))
+            .unwrap();
+        if fits {
+            let archive = rars::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+            assert_eq!(archive.read_member(b"file", None).unwrap().unwrap(), b"payload");
+        } else {
+            let error = builder.to_bytes().unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::InvalidArgument);
+            assert_eq!(error.entry_context(), Some((b"file".as_slice(), "writing")));
+        }
+    }
+}
+
+#[test]
 fn invalid_rar29_filters_fail_before_opening_a_member_or_writing_output() {
     let entries = [rar15_40::StreamingEntry::new(
         b"member".to_vec(),
