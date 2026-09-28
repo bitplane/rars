@@ -6837,6 +6837,18 @@ fn repairs_rar300_old_style_recovery_volume_set() {
 }
 
 #[test]
+fn rev3_repair_keeps_supplied_damaged_volume_when_no_shard_is_missing() {
+    let mut volume = std::fs::read(fixture("rar300/rev_oldstyle.part1.rar")).unwrap();
+    volume[0] ^= 1;
+    assert!(Archive::parse(&volume).is_err());
+    let parity = vec![0; volume.len()];
+
+    let repaired = repair_rev3_volumes(&[Some(&volume)], 1, &[(0, &parity)]).unwrap();
+
+    assert_eq!(repaired, [volume]);
+}
+
+#[test]
 fn repairs_rar4_new_style_recovery_volume_set_with_zeroed_rev_trailer() {
     let part1 = std::fs::read(fixture("rar300/rev_newstyle.part1.rar")).unwrap();
     let part2 = std::fs::read(fixture("rar300/rev_newstyle.part2.rar")).unwrap();
