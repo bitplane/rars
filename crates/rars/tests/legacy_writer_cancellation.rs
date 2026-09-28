@@ -210,3 +210,36 @@ fn cancellation_after_a_volume_does_not_return_a_partial_set() {
         }
     }
 }
+
+#[test]
+fn cancellation_from_final_zero_byte_progress_is_not_reported_as_success() {
+    struct StopAtFinalAdvance(AtomicBool);
+    impl WriteProgress for StopAtFinalAdvance {
+        fn report(&self, event: WriteProgressEvent<'_>) {
+            if matches!(
+                event,
+                WriteProgressEvent::Advanced {
+                    operation: WriteOperation::Compression,
+                    completed_bytes: 0,
+                    total_bytes: 0,
+                    ..
+                }
+            ) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        fn is_cancelled(&self) -> bool {
+            self.0.load(Ordering::Relaxed)
+        }
+    }
+
+    let mut builder = Builder::new(ArchiveVersion::Rar30).store(true);
+    builder
+        .add_bytes(b"empty".to_vec(), Vec::new(), None, None)
+        .unwrap();
+    let stop = StopAtFinalAdvance(AtomicBool::new(false));
+    assert_eq!(
+        builder.to_bytes_with_progress(Some(&stop)).unwrap_err().kind(),
+        ErrorKind::Cancelled
+    );
+}
