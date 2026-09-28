@@ -454,19 +454,7 @@ impl Builder {
                 "RAR1.x directory output requires DOS attributes",
             ));
         }
-        let legacy = matches!(
-            self.format,
-            ArchiveVersion::Rar13
-                | ArchiveVersion::Rar14
-                | ArchiveVersion::Rar15
-                | ArchiveVersion::Rar20
-                | ArchiveVersion::Rar29
-                | ArchiveVersion::Rar30
-                | ArchiveVersion::Rar40
-        );
-        if (!legacy && self.format.family() != ArchiveFamily::Rar50Plus)
-            || (legacy && self.volume_size.is_some())
-        {
+        if self.format.family() != ArchiveFamily::Rar50Plus && self.volume_size.is_some() {
             return Err(Error::InvalidArgument(
                 "explicit directories require RAR5/7 or single-archive RAR1.3–4.x output",
             ));
@@ -645,18 +633,8 @@ impl Builder {
     ) -> Result<()> {
         let index = self.index_by_id(id)?;
 
-        let legacy = matches!(
-            self.format,
-            ArchiveVersion::Rar13
-                | ArchiveVersion::Rar14
-                | ArchiveVersion::Rar15
-                | ArchiveVersion::Rar20
-                | ArchiveVersion::Rar29
-                | ArchiveVersion::Rar30
-                | ArchiveVersion::Rar40
-        );
-        if (!legacy && self.format.family() != ArchiveFamily::Rar50Plus)
-            || (legacy && (comment_password.is_some() || self.volume_size.is_some()))
+        if (self.format.family() != ArchiveFamily::Rar50Plus
+            && (comment_password.is_some() || self.volume_size.is_some()))
             || data_password.as_ref().is_some_and(Vec::is_empty)
             || comment_password.as_ref().is_some_and(Vec::is_empty)
         {
@@ -1885,6 +1863,74 @@ fn unix_mode(_metadata: &fs::Metadata) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn builder_rejects_legacy_volume_directory_and_metadata_settings() {
+        use crate::{ArchiveVersion, Builder, ErrorKind};
+
+        let mut volume = Builder::new(ArchiveVersion::Rar29).volume_size(Some(64));
+        assert_eq!(
+            volume.add_directory(b"dir".to_vec(), None, None).unwrap_err().kind(),
+            ErrorKind::InvalidArgument
+        );
+        assert_eq!(
+            Builder::new(ArchiveVersion::Rar29)
+                .archive_metadata(None, false, false)
+                .err()
+                .unwrap()
+                .kind(),
+            ErrorKind::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn builder_rejects_unsupported_per_entry_password_shapes() {
+        use crate::{ArchiveVersion, Builder, ErrorKind};
+
+        for format in [ArchiveVersion::Rar13, ArchiveVersion::Rar29, ArchiveVersion::Rar50] {
+            let mut builder = Builder::new(format).store(true);
+            builder
+                .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+                .unwrap();
+            assert_eq!(
+                builder
+                    .set_entry_encryption(b"file", Some(Vec::new()), None)
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::InvalidArgument
+            );
+            assert_eq!(
+                builder
+                    .set_entry_encryption(b"file", None, Some(Vec::new()))
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::InvalidArgument
+            );
+            if format != ArchiveVersion::Rar50 {
+                assert_eq!(
+                    builder
+                        .set_entry_encryption(b"file", None, Some(b"comment".to_vec()))
+                        .unwrap_err()
+                        .kind(),
+                    ErrorKind::InvalidArgument
+                );
+            }
+        }
+
+        let mut volume = Builder::new(ArchiveVersion::Rar29)
+            .store(true)
+            .volume_size(Some(64));
+        volume
+            .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+        assert_eq!(
+            volume
+                .set_entry_encryption(b"file", Some(b"password".to_vec()), None)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidArgument
+        );
+    }
+
     #[test]
     fn rar13_entry_encryption_override_can_clear_the_builder_password() {
         use crate::{ArchiveReader, ArchiveVersion, Builder};
