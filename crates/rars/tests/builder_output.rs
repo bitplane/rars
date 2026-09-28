@@ -65,6 +65,22 @@ fn single_output_rejects_volume_metadata_before_opening_a_source() {
 }
 
 #[test]
+fn path_output_reports_missing_parent_without_creating_an_archive() {
+    let root = scratch::case("builder-missing-parent");
+    let destination = root.join("missing").join("archive.rar");
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    builder
+        .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+        .unwrap();
+    assert_eq!(
+        builder.write_to_path(&destination, None).unwrap_err().kind(),
+        rars::ErrorKind::Io
+    );
+    assert!(!destination.exists());
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+}
+
+#[test]
 fn volume_builder_refuses_quick_open_before_source_io() {
     let source = || EntrySource::from_opener(1, || panic!("volume setting opened source"));
     let mut builder = Builder::new(ArchiveVersion::Rar50)

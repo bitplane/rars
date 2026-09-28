@@ -59,6 +59,29 @@ fn unix_symlinks_round_trip_without_resolving_targets() {
 }
 
 #[test]
+fn archive_redirection_retains_unix_symlink_attributes() {
+    let mut seed = Builder::new(ArchiveVersion::Rar50).store(true);
+    seed.add_unix_symlink(
+        b"link".to_vec(),
+        b"missing".to_vec(),
+        false,
+        Some(123),
+        Some(0o750),
+    )
+    .unwrap();
+    let source = ArchiveReader::read_owned(seed.to_bytes().unwrap()).unwrap();
+    let member = source.members().next().unwrap();
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    builder.add_archive_redirection(&member).unwrap();
+    let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    let link = archive.members().next().unwrap();
+    assert_eq!(link.unix_symlink().unwrap().target_name, b"missing");
+    assert_eq!(link.meta.host_os, Some(1));
+    assert_eq!(link.meta.file_attr, 0o120750);
+    assert_eq!(link.meta.file_time, Some(123));
+}
+
+#[test]
 fn unsupported_link_options_leave_entries_unchanged() {
     let mut builder = Builder::new(ArchiveVersion::Rar50);
     for target in [b"".as_slice(), b"bad\0target", b"\xff"] {
