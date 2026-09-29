@@ -202,5 +202,51 @@ mod tests {
         range.read_to_end(&mut result).unwrap();
         assert_eq!(result, b"45");
         assert!(source.range_reader(9..11).is_err());
+        let start = 6;
+        let end = 4;
+        assert!(source.range_reader(start..end).is_err());
+    }
+
+    #[test]
+    fn empty_and_exhausted_cursors_do_not_read_the_underlying_source() {
+        let source = ReaderSource::new(Cursor::new(b"0123".to_vec())).unwrap();
+        assert_eq!(format!("{source:?}"), "ReaderSource { len: 4, .. }");
+        let mut cursor = source.cursor();
+        assert_eq!(cursor.read(&mut []).unwrap(), 0);
+        assert_eq!(cursor.stream_position().unwrap(), 0);
+        cursor.seek(SeekFrom::End(0)).unwrap();
+        let mut bytes = [0xff; 2];
+        assert_eq!(cursor.read(&mut bytes).unwrap(), 0);
+        assert_eq!(bytes, [0xff; 2]);
+        cursor.seek(SeekFrom::End(10)).unwrap();
+        assert_eq!(cursor.read(&mut bytes).unwrap(), 0);
+        assert_eq!(cursor.stream_position().unwrap(), 14);
+    }
+
+    #[test]
+    fn a_panicking_reader_leaves_sibling_cursors_with_a_typed_io_error() {
+        struct PanicReader(Cursor<Vec<u8>>);
+        impl Seek for PanicReader {
+            fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+                self.0.seek(from)
+            }
+        }
+        impl Read for PanicReader {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                panic!("reader failed during callback");
+            }
+        }
+        let source = ReaderSource::new(PanicReader(Cursor::new(vec![1]))).unwrap();
+        let mut first = source.cursor();
+        let mut sibling = source.cursor();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            first.read(&mut [0]).unwrap();
+        }))
+        .is_err());
+        let error = sibling.read(&mut [0]).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "archive reader lock poisoned");
+        assert!(matches!(Error::from(error), Error::Io(_)));
+        assert_eq!(sibling.stream_position().unwrap(), 0);
     }
 }

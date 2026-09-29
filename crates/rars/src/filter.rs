@@ -153,6 +153,15 @@ mod tests {
     ];
 
     #[test]
+    fn kind_conversion_selects_the_whole_member_without_changing_parameters() {
+        for kind in ALL {
+            let spec = FilterSpec::from(kind);
+            assert_eq!(spec.kind, kind);
+            assert_eq!(spec.range, None);
+        }
+    }
+
+    #[test]
     fn every_filter_is_named_and_accepted_by_at_least_one_format() {
         for kind in ALL {
             assert!(

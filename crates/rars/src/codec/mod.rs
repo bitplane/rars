@@ -87,3 +87,56 @@ impl From<std::convert::Infallible> for Error {
         match never {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error as _;
+
+    #[test]
+    fn codec_io_errors_expose_the_library_cause_and_leaf_errors_have_no_source() {
+        let cause = crate::Error::InvalidHeader("bad block").at_archive_offset(42);
+        let error = Error::Io(Box::new(cause.clone()));
+        assert_eq!(
+            error.to_string(),
+            "at archive offset 0x2a: invalid header: bad block"
+        );
+        let source = error.source().unwrap();
+        assert_eq!(source.downcast_ref::<crate::Error>(), Some(&cause));
+        assert_eq!(
+            source.source().unwrap().to_string(),
+            "invalid header: bad block"
+        );
+        for error in [
+            Error::InvalidData("bad symbol"),
+            Error::NeedMoreInput,
+            Error::Cancelled,
+            Error::WorkspaceLimitExceeded(Box::new(WorkspaceLimitError {
+                limit: 1,
+                required: 2,
+                used: 1,
+            })),
+        ] {
+            assert!(error.source().is_none());
+        }
+    }
+
+    #[test]
+    fn codec_diagnostics_propagate_formatter_failure() {
+        struct RefuseFormatting;
+        impl std::fmt::Write for RefuseFormatting {
+            fn write_str(&mut self, _: &str) -> std::fmt::Result {
+                Err(std::fmt::Error)
+            }
+        }
+        let error = Error::WorkspaceLimitExceeded(Box::new(WorkspaceLimitError {
+            limit: 1,
+            required: 2,
+            used: 1,
+        }));
+        assert_eq!(
+            std::fmt::write(&mut RefuseFormatting, format_args!("{error}")),
+            Err(std::fmt::Error),
+        );
+    }
+}
