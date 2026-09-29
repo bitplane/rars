@@ -61,6 +61,24 @@ impl SourceFactory for Source {
         Ok(self.size)
     }
     fn open(&self) -> Result<Box<dyn crate::EntryReader>> {
+        self.open_with_cancellation(|| self.delivery.cancellation.is_cancelled())
+    }
+    fn release(&self) {
+        self.delivery
+            .state
+            .lock()
+            .unwrap()
+            .ready
+            .remove(&self.index);
+        self.delivery.changed.notify_all();
+    }
+}
+
+impl Source {
+    fn open_with_cancellation(
+        &self,
+        mut is_cancelled: impl FnMut() -> bool,
+    ) -> Result<Box<dyn crate::EntryReader>> {
         let mut state = self.delivery.state.lock().unwrap();
         state.requested = Some(
             state
@@ -72,7 +90,7 @@ impl SourceFactory for Source {
             if let Some(error) = &state.error {
                 return Err(error.clone());
             }
-            if self.delivery.cancellation.is_cancelled() {
+            if is_cancelled() {
                 return Err(Error::Cancelled);
             }
             if let Some(lease) = state.ready.get(&self.index).cloned() {
@@ -85,20 +103,11 @@ impl SourceFactory for Source {
             if state.published.contains(&self.index) {
                 return Err(Error::WriterFailure("rewrite source already consumed"));
             }
-            if state.done || self.delivery.cancellation.is_cancelled() {
+            if state.done || is_cancelled() {
                 return Err(Error::Cancelled);
             }
             state = self.delivery.changed.wait(state).unwrap();
         }
-    }
-    fn release(&self) {
-        self.delivery
-            .state
-            .lock()
-            .unwrap()
-            .ready
-            .remove(&self.index);
-        self.delivery.changed.notify_all();
     }
 }
 
@@ -315,6 +324,63 @@ mod tests {
             Err(Error::Cancelled)
         ));
         assert_eq!(delivery.used.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn cancellation_between_observations_refuses_to_wait_for_a_source() {
+        let delivery = delivery();
+        let source = Source {
+            index: 0,
+            size: 1,
+            delivery: delivery.clone(),
+        };
+        let mut observations = 0;
+        let result = source.open_with_cancellation(|| {
+            let cancelled = delivery.cancellation.is_cancelled();
+            observations += 1;
+            if observations == 1 {
+                // Model cancellation after the first atomic load returned false.
+                delivery.cancellation.cancel();
+            }
+            cancelled
+        });
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert_eq!(observations, 2);
+        let state = delivery.state.lock().unwrap();
+        assert_eq!(state.requested, Some(0));
+        assert!(!state.done);
+        assert!(state.ready.is_empty());
+        assert!(state.published.is_empty());
+        assert_eq!(delivery.used.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn published_source_delivers_bytes_and_releases_its_charge() {
+        let delivery = delivery();
+        let source = Source {
+            index: 0,
+            size: 7,
+            delivery: delivery.clone(),
+        };
+        assert_eq!(source.len().unwrap(), 7);
+        // Native staging charges the bytes before publishing the lease.
+        delivery.used.store(7, Ordering::Relaxed);
+        delivery
+            .publish(0, EntrySource::from_bytes(b"payload".to_vec()))
+            .unwrap();
+        let mut reader = source.open().unwrap();
+        delivery.wait_for(0).unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"payload");
+        source.release();
+        assert_eq!(delivery.used.load(Ordering::Relaxed), 7);
+        drop(reader);
+        assert_eq!(delivery.used.load(Ordering::Relaxed), 0);
+        assert!(matches!(
+            source.open(),
+            Err(Error::WriterFailure("rewrite source already consumed"))
+        ));
     }
 
     #[test]
