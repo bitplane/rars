@@ -776,13 +776,16 @@ impl Spool {
         let directory = resources.temp_dir().unwrap_or_else(|| Path::new("."));
         for _ in 0..128 {
             let sequence = next_sequence();
+            // Prefix (12), u32 process ID (at most 10), separator (1), and
+            // u64 hex sequence (16) total at most 39 bytes in this buffer.
             let mut name = [0u8; 64];
             let mut name_writer = std::io::Cursor::new(&mut name[..]);
             write!(
                 name_writer,
                 ".rars-spool-{}-{sequence:016x}",
                 std::process::id()
-            )?;
+            )
+            .expect("spool name fits its fixed buffer");
             let name_len = name_writer.position() as usize;
             let name = std::str::from_utf8(&name[..name_len]).expect("ASCII spool name");
             let capacity = directory
@@ -1395,6 +1398,19 @@ mod tests {
         drop(spool);
         assert!(original.is_dir());
         assert_eq!(std::fs::read(root.join("orphan")).unwrap(), b"abc");
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[test]
+    fn spool_creation_accepts_the_maximum_sequence() {
+        let root = crate::scratch::case("spool-max-sequence");
+        let resources = WriterResources::default().with_temp_dir(&*root);
+        let spool = Spool::create_with_sequence(&resources, || u64::MAX).unwrap();
+        let path = root.join(format!(".rars-spool-{}-ffffffffffffffff", std::process::id()));
+        assert_eq!(spool.path, path);
+        assert!(path.is_file());
+        drop(spool);
+        assert!(!path.exists());
     }
 
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
