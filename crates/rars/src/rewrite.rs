@@ -143,6 +143,9 @@ impl Archive {
         use crate::{ArchiveReadOptions, Error, ExtractionDecision, SharedBuffer};
         use std::sync::{Arc, Mutex};
 
+        let Archive::Rar15To40(legacy) = self else {
+            return Ok(self.members().map(|_| None).collect());
+        };
         let members: Vec<_> = self.members().collect();
         let Some(last) = members
             .iter()
@@ -151,10 +154,7 @@ impl Archive {
             return Ok((0..members.len()).map(|_| None).collect());
         };
         let mut targets: Vec<Option<SharedBuffer>> = (0..members.len()).map(|_| None).collect();
-        let solid = match self {
-            Archive::Rar15To40(archive) => archive.main.is_solid(),
-            _ => false,
-        };
+        let solid = legacy.main.is_solid();
         let mut index = 0;
         self.extract_with_control(
             ArchiveReadOptions::with_optional_password(password),

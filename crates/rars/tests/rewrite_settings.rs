@@ -697,6 +697,33 @@ fn legacy_rewrite_helpers_leave_regular_files_without_link_or_modern_metadata() 
 }
 
 #[test]
+fn link_target_scan_skips_corrupt_regular_payloads_in_every_family() {
+    const PAYLOAD: &[u8] = b"a distinct stored payload for the link scan";
+    for version in [
+        ArchiveVersion::Rar14,
+        ArchiveVersion::Rar20,
+        ArchiveVersion::Rar50,
+    ] {
+        let mut builder = Builder::new(version).store(true);
+        builder
+            .add_directory(b"directory".to_vec(), None, None)
+            .unwrap();
+        builder
+            .add_bytes(b"file".to_vec(), PAYLOAD.to_vec(), None, None)
+            .unwrap();
+        let mut bytes = builder.to_bytes().unwrap();
+        let offset = bytes
+            .windows(PAYLOAD.len())
+            .position(|window| window == PAYLOAD)
+            .unwrap();
+        bytes[offset] ^= 1;
+        let archive = ArchiveReader::read_owned(bytes).unwrap();
+        assert!(archive.read_member_at(1, None).is_err(), "{version:?}");
+        assert_eq!(archive.legacy_symlink_targets(None).unwrap(), [None, None]);
+    }
+}
+
+#[test]
 fn preserving_builder_retains_encrypted_rar5_archive_comment_settings() {
     let mut builder = Builder::new(ArchiveVersion::Rar50)
         .store(true)
