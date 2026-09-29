@@ -5397,6 +5397,78 @@ mod tests {
     }
 
     #[test]
+    fn volume_facade_rejects_empty_and_every_mixed_family_ordering() {
+        let never_open = |_: &ExtractedEntryMeta| -> Result<Box<dyn Write>> {
+            panic!("invalid volume set must be rejected before opening output")
+        };
+        let empty = Error::InvalidHeader("volume set is empty");
+        assert_eq!(volume_members(&[]).unwrap_err(), empty);
+        assert_eq!(extract_volumes_to(&[], None, never_open).unwrap_err(), empty);
+        let cancellation = ReadCancellation::new();
+        cancellation.cancel();
+        assert_eq!(
+            extract_volumes_to_with_options(
+                &[],
+                ArchiveReadOptions::new().with_cancellation(&cancellation),
+                never_open,
+            )
+            .unwrap_err(),
+            Error::Cancelled
+        );
+
+        let archives: Vec<_> = [
+            ArchiveVersion::Rar13,
+            ArchiveVersion::Rar29,
+            ArchiveVersion::Rar50,
+        ]
+        .into_iter()
+        .map(|version| {
+            let mut builder = Builder::new(version).store(true);
+            builder
+                .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+                .unwrap();
+            ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap()
+        })
+        .collect();
+        for first in 0..archives.len() {
+            for second in 0..archives.len() {
+                if first == second {
+                    continue;
+                }
+                let mixed = [archives[first].clone(), archives[second].clone()];
+                let error = Error::InvalidHeader("mixed archive families in volume set");
+                assert_eq!(volume_members(&mixed).unwrap_err(), error);
+                assert_eq!(
+                    extract_volumes_to(&mixed, None, never_open).unwrap_err(),
+                    error
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn volume_index_reads_skip_directories_and_absent_indices_in_each_family() {
+        for version in [
+            ArchiveVersion::Rar13,
+            ArchiveVersion::Rar29,
+            ArchiveVersion::Rar50,
+        ] {
+            let mut builder = Builder::new(version).store(true);
+            builder.add_directory(b"dir".to_vec(), None, None).unwrap();
+            builder
+                .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+                .unwrap();
+            let archives = [ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap()];
+            assert_eq!(read_volume_member_at(&archives, 0, None).unwrap(), None);
+            assert_eq!(
+                read_volume_member_at(&archives, 1, None).unwrap(),
+                Some(b"payload".to_vec())
+            );
+            assert_eq!(read_volume_member_at(&archives, 2, None).unwrap(), None);
+        }
+    }
+
+    #[test]
     fn volume_members_and_index_reads_fold_split_fragments() {
         let payload = vec![7; 200_000];
         let mut builder = Builder::new(ArchiveVersion::Rar50)
@@ -5413,6 +5485,10 @@ mod tests {
             .collect();
 
         let members = volume_members(&archives).unwrap();
+        assert_eq!(
+            volume_members(&archives[1..]).unwrap_err(),
+            Error::InvalidHeader("volume set starts with a continuation")
+        );
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].meta.name, b"big.bin");
         assert_eq!(
