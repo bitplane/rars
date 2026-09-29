@@ -168,6 +168,18 @@ mod tests {
     }
 
     #[test]
+    fn shorter_signatures_in_scan_lookahead_do_not_escape_the_offset_limit() {
+        for signature in [RAR15_SIGNATURE.as_slice(), RAR13_SIGNATURE.as_slice()] {
+            let mut input = vec![0];
+            input.extend_from_slice(signature);
+            assert_eq!(find_archive_start(&input, 0), None);
+            let found = find_archive_start(&input, 1).unwrap();
+            assert_eq!(found.offset, 1);
+            assert_eq!(found.length, signature.len());
+        }
+    }
+
+    #[test]
     fn sfx_scan_limit_finds_signature_past_128kib_stub() {
         // Real SFX installers routinely place the RAR payload past 128 KiB
         // (modern WinRAR-built SFXes, Nero, anti-virus installers, etc.).

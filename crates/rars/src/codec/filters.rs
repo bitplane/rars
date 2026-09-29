@@ -266,6 +266,28 @@ pub(crate) fn delta_encode_with_allowance<B: super::workspace::Budget>(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn short_x86_operands_are_unchanged_and_still_observe_cancellation() {
+        for length in 0..=4 {
+            for include_e9 in [false, true] {
+                let original = vec![0xe8; length];
+                let mut data = original.clone();
+                super::e8e9_encode(&mut data, u32::MAX, include_e9);
+                assert_eq!(data, original);
+                super::e8e9_decode(&mut data, u32::MAX, include_e9);
+                assert_eq!(data, original);
+                let token = crate::ReadCancellation::new();
+                token.cancel();
+                let control = crate::read_control::ReadControl::new(Some(&token));
+                assert_eq!(
+                    super::e8e9_decode_with_control(&mut data, 0, include_e9, &control),
+                    Err(super::Error::Cancelled)
+                );
+                assert_eq!(data, original);
+            }
+        }
+    }
+
+    #[test]
     fn configured_x86_scanning_matches_default_across_poll_boundaries() {
         let mut input = vec![0; 192 * 1024];
         for pos in [65530, 65535, 65541, 131070, 131080] {

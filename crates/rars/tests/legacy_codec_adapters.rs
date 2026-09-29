@@ -56,6 +56,48 @@ fn members() -> (Vec<u8>, Vec<u8>) {
 }
 
 #[test]
+fn rar29_tiny_x86_filter_members_preserve_incomplete_operands() {
+    let bytes = [0xe8, 0xff, 0xe9, 0x01];
+    for length in 1..=4 {
+        for kind in [rars::FilterKind::E8, rars::FilterKind::E8E9] {
+            let input = &bytes[..length];
+            let packed = Unpack29Encoder::new()
+                .encode_member_with_filter(input, rars::FilterSpec::whole(kind))
+                .unwrap();
+            let output = Unpack29::default().decode_member(&packed, length).unwrap();
+            assert_eq!(output, input);
+        }
+    }
+}
+
+#[test]
+fn rar29_x86_filters_round_trip_the_negative_address_wrap_boundary() {
+    // Relative +0x00ffffff crosses the 16MiB boundary when the operand's
+    // position (one) is added; its coded operand wraps to -1.
+    for kind in [rars::FilterKind::E8, rars::FilterKind::E8E9] {
+        let input = [0xe8, 0xff, 0xff, 0xff, 0x00];
+        let packed = Unpack29Encoder::new()
+            .encode_member_with_filter(&input, rars::FilterSpec::whole(kind))
+            .unwrap();
+        assert_eq!(
+            Unpack29::default()
+                .decode_member(&packed, input.len())
+                .unwrap(),
+            input
+        );
+    }
+    assert_eq!(
+        Unpack29Encoder::new().encode_member_with_filter(
+            b"x",
+            rars::FilterSpec::whole(rars::FilterKind::Delta { channels: 0 })
+        ),
+        Err(rars::codec::Error::InvalidData(
+            "RAR 2.9 VM filter channel count is invalid"
+        ))
+    );
+}
+
+#[test]
 fn rar15_public_adapters_preserve_cloned_solid_state_and_reset_non_solid_state() {
     let (first, second) = members();
     let mut encoder = Unpack15Encoder::new();

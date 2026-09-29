@@ -1,4 +1,6 @@
-use super::filters::{self, DeltaErrorMessages, FilterOp, MAX_DELTA_CHANNELS};
+#[cfg(test)]
+use super::filters::MAX_DELTA_CHANNELS;
+use super::filters::{self, DeltaErrorMessages, FilterOp};
 use super::huffman;
 use super::ppmd::{PpmdByteReader, PpmdDecoder, PpmdEncoder, PpmdState};
 use super::rarvm;
@@ -3832,15 +3834,14 @@ fn apply_standard_filter_with_allowance<B: Budget>(
         StandardFilter::Itanium => itanium_decode_with_control(data, file_offset, control)?,
         StandardFilter::Delta => {
             let channels = regs[0] as usize;
-            if channels == 0 || channels > MAX_DELTA_CHANNELS {
-                return Err(Error::InvalidData(
-                    "RAR 2.9 DELTA filter channel count is invalid",
-                ));
-            }
+            // Validate once in the shared decoder, retaining the register
+            // diagnostic for zero as well as excessive channel counts.
+            let mut messages = rar29_delta_messages();
+            messages.zero_channels = messages.invalid_channels;
             *data = filters::delta_decode_with_allowance(
                 data,
                 channels,
-                rar29_delta_messages(),
+                messages,
                 control,
                 &data.allowance(),
             )?;

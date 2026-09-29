@@ -123,7 +123,9 @@ fn push_range<B: Budget>(
     let range_start = start.saturating_sub(AUTO_X86_RANGE_PADDING);
     let range_end = (last + 5 + AUTO_X86_RANGE_PADDING).min(data_len);
     let range = range_start..range_end;
-    if range.start < range.end && !ranges.contains(&range) {
+    // Scanned clusters satisfy start <= last <= data_len - 5, so padding
+    // and clamping cannot turn their range into an empty one.
+    if !ranges.contains(&range) {
         ranges.try_push(range)?;
     }
     Ok(())
@@ -145,6 +147,42 @@ fn push_x86_filter_range(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn span_limit_keeps_first_four_disjoint_spans_and_best_clusters() {
+        let mut data = vec![0x90; 300_000];
+        for span in 0..6 {
+            let start = span * 50_000;
+            for offset in [0, 1, 5_000, 5_001] {
+                data[start + offset] = 0xe8;
+            }
+        }
+        let mut expected = Vec::new();
+        for span in 0..4usize {
+            let start = span * 50_000;
+            expected.push(start.saturating_sub(16)..start + 5_022);
+        }
+        for span in 0..4usize {
+            for offset in [0, 5_000] {
+                let start = span * 50_000 + offset;
+                expected.push(start.saturating_sub(16)..start + 22);
+            }
+        }
+        assert_eq!(auto_x86_filter_ranges(&data, true), expected);
+        assert_eq!(scalar_auto_x86_filter_ranges(&data, true), expected);
+    }
+
+    #[test]
+    fn scanner_retains_sparse_clusters_without_emitting_a_sparse_span() {
+        let mut data = vec![0x90; 40_030];
+        for pos in [0, 1, 40_000, 40_001, 40_002, 40_003] {
+            data[pos] = 0xe8;
+        }
+        let expected = vec![39_984..40_024, 0..22];
+        assert_eq!(auto_x86_filter_ranges(&data, true), expected);
+        assert_eq!(scalar_auto_x86_filter_ranges(&data, true), expected);
+        assert!(auto_x86_filter_ranges(&vec![0x90; 40_030], true).is_empty());
+    }
 
     #[test]
     fn scanned_regions_in_members_large_enough_to_screen_are_never_short_samples() {
