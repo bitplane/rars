@@ -203,6 +203,36 @@ mod tests {
     use crate::codec::workspace::Buffer;
 
     #[test]
+    fn scoped_capacity_never_borrows_global_spare_space_and_stays_retired() {
+        let ledger = Limited::new(128 + RESERVATION_BYTES);
+        let reservation = ledger.reserve(16).unwrap();
+        let local = reservation.allowance();
+        assert_eq!(local.available(), 16);
+        local.check_capacity(16).unwrap();
+        assert!(
+            matches!(local.check_capacity(17), Err(Error::WorkspaceLimitExceeded(e)) if (e.limit, e.required, e.used) == (16, 17, 0))
+        );
+        let bytes = Buffer::filled(8, 1u8, &local).unwrap();
+        assert_eq!(local.available(), 8);
+        assert!(ledger.available() > local.available());
+        local.check_capacity(8).unwrap();
+        assert!(
+            matches!(local.check_capacity(9), Err(Error::WorkspaceLimitExceeded(e)) if (e.limit, e.required, e.used) == (16, 9, 8))
+        );
+        reservation.retire();
+        assert_eq!(local.available(), 0);
+        local.check_capacity(0).unwrap();
+        assert!(
+            matches!(local.check_capacity(1), Err(Error::WorkspaceLimitExceeded(e)) if (e.limit, e.required, e.used) == (8, 1, 8))
+        );
+        drop(bytes);
+        assert_eq!(local.available(), 0);
+        assert_eq!(ledger.used(), RESERVATION_BYTES);
+        drop(local);
+        assert_eq!(ledger.used(), 0);
+    }
+
+    #[test]
     fn retirement_releases_only_unused_reservations_and_keeps_escaped_outputs() {
         let ledger = Limited::new(128 + 2 * RESERVATION_BYTES);
         let mut first = ledger.reserve(64).unwrap();

@@ -584,6 +584,61 @@ impl<T: PartialEq, B: Budget> PartialEq<Vec<T>> for Buffer<T, B> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn limited_insert_preserves_reordered_storage_and_refuses_growth_atomically() {
+        let ledger = Allowance::limited(4);
+        let mut bytes = Buffer::copied(b"ABCD", &ledger).unwrap();
+        let storage = bytes.as_ptr();
+        let value = bytes.remove(2);
+        bytes.insert(0, value).unwrap();
+        assert_eq!(&*bytes, b"CABD");
+        assert_eq!(bytes.as_ptr(), storage);
+        assert_eq!(ledger.used(), 4);
+        assert!(matches!(
+            bytes.insert(0, b'X'),
+            Err(Error::WorkspaceLimitExceeded(_))
+        ));
+        assert_eq!(&*bytes, b"CABD");
+        assert_eq!(bytes.as_ptr(), storage);
+        assert_eq!(ledger.used(), 4);
+        drop(bytes);
+        assert_eq!(ledger.used(), 0);
+    }
+
+    #[test]
+    fn interrupted_reads_retry_and_buffer_flush_preserves_charge() {
+        use std::io::{self, Cursor, Read, Write};
+        struct InterruptedOnce {
+            interrupted: bool,
+            data: Cursor<&'static [u8]>,
+        }
+        impl Read for InterruptedOnce {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                if !self.interrupted {
+                    self.interrupted = true;
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                self.data.read(out)
+            }
+        }
+        let ledger = Allowance::limited(16);
+        let mut input = InterruptedOnce {
+            interrupted: false,
+            data: Cursor::new(b"payload".as_slice()),
+        };
+        let mut bytes = Buffer::new(&ledger);
+        bytes.read_to_end(&mut input).unwrap();
+        assert!(input.interrupted);
+        assert_eq!(&*bytes, b"payload");
+        let charged = ledger.used();
+        assert!(charged >= 7);
+        bytes.flush().unwrap();
+        assert_eq!(&*bytes, b"payload");
+        assert_eq!(ledger.used(), charged);
+        drop(bytes);
+        assert_eq!(ledger.used(), 0);
+    }
+
+    #[test]
     fn boxed_workspace_is_admitted_before_construction_and_released_on_failure() {
         let small = Allowance::limited(31);
         let mut constructed = false;

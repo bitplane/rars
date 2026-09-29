@@ -100,6 +100,39 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     #[test]
+    fn a_large_later_hint_waits_for_the_next_batch_in_publication_order() {
+        let overhead = std::mem::size_of::<Slot<usize, Buffer<u8, Limited>>>() as u64;
+        let limit = 4 * (overhead + RESERVATION_BYTES + 16);
+        let ledger = Allowance::limited(limit);
+        let published = AtomicUsize::new(0);
+        extract_windowed(
+            0..3usize,
+            &ledger,
+            |index| {
+                if index == 1 {
+                    limit - overhead - RESERVATION_BYTES
+                } else {
+                    16
+                }
+            },
+            |index, local| {
+                if index == 1 {
+                    assert_eq!(published.load(Ordering::SeqCst), 1);
+                }
+                Ok(Buffer::filled(16, index as u8, local)?)
+            },
+            |data| {
+                let expected = published.fetch_add(1, Ordering::SeqCst) as u8;
+                assert_eq!(&*data, &[expected; 16]);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(published.load(Ordering::SeqCst), 3);
+        assert_eq!(ledger.used(), 0);
+    }
+
+    #[test]
     fn admitted_results_remain_charged_during_publication() {
         let ledger = Allowance::limited(8192);
         let published = AtomicUsize::new(0);

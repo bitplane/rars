@@ -299,7 +299,12 @@ mod tests {
         let expected = scalar_auto_x86_filter_ranges(&data, true);
         let mut successes = 0;
         let mut refusals = 0;
-        for limit in [0, 95, 128, 256, 512, 1024, 2048, 8192] {
+        // Close limits distinguish tight-pass refusal while broad-pass ranges
+        // remain charged from refusal during the initial scan.
+        for limit in [0, 95, 128, 256, 512, 1024, 2048, 8192]
+            .into_iter()
+            .chain((2048..=3072).step_by(32))
+        {
             let allowance = Allowance::limited(limit);
             match ranges_with_allowance(&data, true, &allowance) {
                 Ok(ranges) => {
