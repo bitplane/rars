@@ -185,6 +185,46 @@ fn skipping_a_bad_checksum_continues_but_extracting_it_stops() {
             }
             _ => unreachable!(),
         }
+        let token = rars::ReadCancellation::new();
+        let mut selected = 0;
+        let mut failures = 0;
+        let error = archive
+            .extract_with_control_and_errors(
+                ArchiveReadOptions::new().with_cancellation(&token),
+                |_| {
+                    selected += 1;
+                    Ok(Decision::Extract(Box::new(io::sink())))
+                },
+                |_, error| {
+                    assert_eq!(error.kind(), rars::ErrorKind::ChecksumMismatch);
+                    failures += 1;
+                    token.cancel();
+                    Ok(rars::ExtractionErrorAction::Continue)
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), rars::ErrorKind::Cancelled);
+        assert_eq!((selected, failures), (1, 1));
+        let mut selected = 0;
+        let mut failures = 0;
+        let error = archive
+            .extract_with_control_and_errors(
+                ArchiveReadOptions::new(),
+                |_| {
+                    selected += 1;
+                    Ok(Decision::Extract(Box::new(io::sink())))
+                },
+                |member, error| {
+                    assert_eq!(member.meta.name, b"first");
+                    assert_eq!(error.kind(), rars::ErrorKind::ChecksumMismatch);
+                    failures += 1;
+                    Ok(rars::ExtractionErrorAction::Abort)
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), rars::ErrorKind::ChecksumMismatch);
+        assert_eq!(error.entry_context().unwrap().0, b"first");
+        assert_eq!((selected, failures), (1, 1));
         let output = Rc::new(RefCell::new(Vec::new()));
         assert_eq!(
             archive
@@ -275,6 +315,61 @@ fn solid_failures_and_callback_errors_cannot_be_continued() {
         )
         .unwrap_err();
     assert_eq!(error.kind(), rars::ErrorKind::Io);
+}
+
+#[test]
+fn split_members_never_offer_independent_error_recovery() {
+    // These flags are exposed in the parsed archive model. A split payload
+    // requires the multivolume reader, even if an error callback asks to continue.
+    for flags in [0x0001, 0x0002, 0x0003] {
+        let mut archive = archive(ArchiveVersion::Rar29, false, false);
+        let Archive::Rar15To40(legacy) = &mut archive else {
+            unreachable!()
+        };
+        let file = legacy
+            .blocks
+            .iter_mut()
+            .find_map(|block| match block {
+                rars::rar15_40::Block::File(file) => Some(file),
+                _ => None,
+            })
+            .unwrap();
+        file.block.flags |= flags;
+        let mut selected = 0;
+        let error = archive
+            .extract_with_control_and_errors(
+                ArchiveReadOptions::new(),
+                |_| {
+                    selected += 1;
+                    Ok(Decision::Extract(Box::new(io::sink())))
+                },
+                |_, _| panic!("split payloads cannot be recovered independently"),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), rars::ErrorKind::InvalidArchive);
+        assert_eq!(selected, 1);
+    }
+}
+
+#[test]
+fn selector_errors_preserve_existing_entry_context() {
+    for version in VERSIONS {
+        let archive = archive(version, false, false);
+        let mut calls = 0;
+        let error = archive
+            .extract_with_control(ArchiveReadOptions::new(), |_| {
+                calls += 1;
+                Err(Error::InvalidHeader("selection failed")
+                    .at_entry(b"external entry".to_vec(), "external operation"))
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), rars::ErrorKind::InvalidArchive);
+        assert_eq!(
+            error.entry_context(),
+            Some((b"external entry".as_slice(), "external operation"))
+        );
+        assert_eq!(calls, 1);
+    }
 }
 
 #[test]

@@ -196,6 +196,42 @@ mod tests {
     }
 
     #[test]
+    fn impossible_write_extent_keeps_position_and_capacity() {
+        let resources = WriterResources::default().with_max_spool_memory_bytes(u64::MAX);
+        let mut spool = MemorySpool::new(&resources);
+        spool.seek(SeekFrom::Start(usize::MAX as u64)).unwrap();
+        let error = spool.write(b"x").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), "memory spool length overflow");
+        assert_eq!(spool.stream_position().unwrap(), usize::MAX as u64);
+        assert_eq!(used(&resources), 0);
+        spool.seek(SeekFrom::Start(0)).unwrap();
+        assert_eq!(spool.read(&mut [0]).unwrap(), 0);
+        spool.write_all(b"valid").unwrap();
+        spool.seek(SeekFrom::Start(0)).unwrap();
+        let mut payload = [0; 5];
+        spool.read_exact(&mut payload).unwrap();
+        assert_eq!(&payload, b"valid");
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn position_wider_than_address_space_is_rejected_before_allocation() {
+        let resources = WriterResources::default().with_max_spool_memory_bytes(u64::MAX);
+        let mut spool = MemorySpool::new(&resources);
+        let position = u64::from(u32::MAX) + 1;
+        spool.seek(SeekFrom::Start(position)).unwrap();
+        let error = spool.write(b"x").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), "memory spool position overflow");
+        assert_eq!(spool.stream_position().unwrap(), position);
+        assert_eq!(used(&resources), 0);
+        // Empty writes need no addressable extent.
+        assert_eq!(spool.write(&[]).unwrap(), 0);
+        assert_eq!(spool.stream_position().unwrap(), position);
+    }
+
+    #[test]
     fn admitted_spool_retains_its_capacity_after_worker_retirement() {
         use crate::codec::workspace::{Allowance, Buffer, RESERVATION_BYTES};
         use crate::streaming::preparation::Bytes;
