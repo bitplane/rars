@@ -2740,6 +2740,15 @@ mod tests {
     fn rar5_recovery_planning_handles_zero_percent_and_tight_budgets() {
         let large = plan_inline_recovery(200 * 1024, 0).unwrap();
         assert_eq!(large.recovery_shards, 0);
+        let body = vec![0; 200 * 1024];
+        assert_eq!(
+            encode_inline_recovery_parity(&body, 0),
+            Err(Error::TooManyShards)
+        );
+        assert_eq!(
+            build_structural_inline_recovery_data(&body, 0),
+            Err(Error::TooManyShards)
+        );
 
         let plan = plan_inline_recovery(4096, 10).unwrap();
         let (mode, _) = super::choose_recovery_memory_mode(plan, 0).unwrap();
