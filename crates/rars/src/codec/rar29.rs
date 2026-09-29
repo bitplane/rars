@@ -7929,6 +7929,47 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         );
     }
 
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn member_relative_vm_filter_offsets_obey_the_u32_wire_boundary() {
+        // PPMd callers declare filters relative to the whole member (base 0),
+        // unlike LZ callers, which rebase them into dictionary-sized blocks.
+        let mut filter = OwnedVmFilterRecord {
+            block_start: u32::MAX as usize,
+            block_size: 4,
+            init_regs: Vec::new(),
+            code: super::RAR3_E8_FILTER_BYTECODE,
+            global_data: Vec::new(),
+        };
+        let records =
+            encoded_filter_records_at(&[&filter], 0, usize::MAX, &mut Vec::new()).unwrap();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        let header_len = match record[0] & 7 {
+            0..=5 => 1,
+            6 => 2,
+            _ => 3,
+        };
+        let mut body = BitReader::from_bytes(&record[header_len..]);
+        assert_eq!(body.read_encoded_u32().unwrap(), 0);
+        assert_eq!(body.read_encoded_u32().unwrap(), u32::MAX);
+        assert_eq!(body.read_encoded_u32().unwrap(), 4);
+
+        filter.block_start += 1;
+        assert_eq!(
+            encoded_filter_records_at(&[&filter], 0, usize::MAX, &mut Vec::new()),
+            Err(Error::InvalidData("RAR 2.9 VM block start overflows"))
+        );
+        // The same absolute position is representable after an LZ block rebase.
+        assert!(encoded_filter_records_at(
+            &[&filter],
+            filter.block_start,
+            4,
+            &mut Vec::new(),
+        )
+        .is_ok());
+    }
+
     #[test]
     fn archive_decoder_rejects_invalid_vm_program_records() {
         let cases = [
