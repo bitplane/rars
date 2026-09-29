@@ -240,7 +240,7 @@ mod tests {
         let mut first = source.cursor();
         let mut sibling = source.cursor();
         assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            first.read(&mut [0]).unwrap();
+            first.read_exact(&mut [0]).unwrap();
         }))
         .is_err());
         let error = sibling.read(&mut [0]).unwrap_err();

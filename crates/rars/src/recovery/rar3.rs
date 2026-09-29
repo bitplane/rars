@@ -422,7 +422,13 @@ mod tests {
     fn rev3_rejects_invalid_shard_geometry_and_duplicate_recovery_indices() {
         let present = [1u8, 2];
         let recovery = [3u8, 4];
-        let cases: &[(&[Option<&[u8]>], usize, &[(usize, &[u8])], Error)] = &[
+        type Case<'a> = (
+            &'a [Option<&'a [u8]>],
+            usize,
+            &'a [(usize, &'a [u8])],
+            Error,
+        );
+        let cases: &[Case<'_>] = &[
             (&[], 1, &[(0, &recovery)], Error::InvalidCodewordSize),
             (&[None], 255, &[(0, &recovery)], Error::InvalidCodewordSize),
             (&[None], 0, &[(0, &recovery)], Error::InvalidParitySize),
