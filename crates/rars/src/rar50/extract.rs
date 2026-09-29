@@ -1802,6 +1802,22 @@ impl<R: Read> Read for Rar50DecryptingReader<R> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn checksum_sink_flush_preserves_accumulated_checksum() {
+        let mut crc = Crc32::new();
+        {
+            let mut sink = CrcSink(&mut crc);
+            sink.flush().unwrap();
+            assert_eq!(sink.write(b"").unwrap(), 0);
+            assert_eq!(sink.write(b"a").unwrap(), 1);
+            sink.flush().unwrap();
+            sink.write_all(b"bc").unwrap();
+            sink.flush().unwrap();
+            sink.flush().unwrap();
+        }
+        assert_eq!(crc.finish(), 0x3524_41c2);
+    }
+
+    #[test]
     fn reader_workspace_split_descriptor_growth_is_admitted_before_mutation() {
         let first = stored_split_archive(b"a", b"a", crc32(b"a"), HFL_SPLIT_AFTER)
             .files()
