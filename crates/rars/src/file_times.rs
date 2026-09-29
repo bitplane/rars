@@ -225,7 +225,8 @@ impl FileTimes {
             .ok_or_else(invalid)?;
             let duration = time
                 .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|_| invalid())?;
+                // extracted_system_time adds nonnegative durations to UNIX_EPOCH.
+                .expect("extracted timestamps cannot precede the Unix epoch");
             *slot = Some(FileTimestamp::Unix {
                 seconds: u32::try_from(duration.as_secs()).map_err(|_| invalid())?,
                 nanoseconds: duration.subsec_nanos(),
@@ -320,6 +321,8 @@ mod tests {
     fn malformed_or_mixed_time_records_are_rejected() {
         assert!(FileTimes::parse(0x23, &[0; 4]).is_none());
         assert!(FileTimes::parse(0x13, &[0; 4]).is_none());
+        // Fractional seconds are available only with Unix encoding.
+        assert!(FileTimes::parse(0x12, &[0; 8]).is_none());
         let mut data = vec![0; 4];
         data.extend(1_000_000_000u32.to_le_bytes());
         assert!(FileTimes::parse(0x13, &data).is_none());
@@ -332,6 +335,47 @@ mod tests {
             accessed: None,
         };
         assert!(mixed.encode().is_err());
+    }
+
+    #[test]
+    fn archival_time_is_preserved_natively_but_cannot_be_converted_to_rar5() {
+        // Legacy extended-time flags place archival time in the low nibble.
+        let mut raw = 0x0008u16.to_le_bytes().to_vec();
+        raw.extend(0x5022_1882u32.to_le_bytes());
+        validate_legacy_extended_times(&raw).unwrap();
+        assert_eq!(
+            FileTimes::legacy(&raw, None),
+            Err(Error::InvalidArgument(
+                "legacy archival time has no supported RAR5 representation"
+            ))
+        );
+    }
+
+    #[test]
+    fn legacy_fractions_end_before_one_second_and_records_have_no_trailing_bytes() {
+        let dos = 0x5022_1882;
+        for (ticks, valid) in [
+            (9_999_999u32, true),
+            (10_000_000, false),
+            (0xff_ffff, false),
+        ] {
+            let mut raw = 0xb000u16.to_le_bytes().to_vec();
+            raw.extend_from_slice(&ticks.to_le_bytes()[..3]);
+            assert_eq!(validate_legacy_extended_times(&raw).is_ok(), valid);
+            let converted = FileTimes::legacy(&raw, Some(dos));
+            assert_eq!(converted.is_ok(), valid);
+            if valid {
+                let FileTimestamp::Unix { nanoseconds, .. } =
+                    converted.unwrap().unwrap().modified.unwrap()
+                else {
+                    panic!("legacy conversion must use Unix seconds");
+                };
+                assert_eq!(nanoseconds, ticks * 100);
+            }
+        }
+        assert_eq!(FileTimes::legacy(&[0, 0], None).unwrap(), None);
+        assert!(FileTimes::legacy(&[0, 0, 1], None).is_err());
+        assert!(validate_legacy_extended_times(&[0, 0, 1]).is_err());
     }
 
     #[test]

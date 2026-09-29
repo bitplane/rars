@@ -163,7 +163,8 @@ fn dos_time_to_system_time(time: u32) -> Option<SystemTime> {
     let day = (time >> 16) & 0x1f;
     let month = (time >> 21) & 0x0f;
     let year = 1980 + i32::try_from((time >> 25) & 0x7f).ok()?;
-    if month == 0 || month > 12 || day == 0 || day > 31 || hour > 23 || minute > 59 || second > 59 {
+    // The five-bit day field cannot exceed 31.
+    if month == 0 || month > 12 || day == 0 || hour > 23 || minute > 59 || second > 59 {
         return None;
     }
     let days = days_from_civil(year, month, day);
@@ -226,6 +227,25 @@ fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::StoredTimestamp;
+
+    #[test]
+    fn invalid_dos_fields_do_not_become_extracted_instants() {
+        // Packed DOS fields have independent ranges, with two-second units.
+        let year = 40u32 << 25;
+        let valid_date = year | (1 << 21) | (1 << 16);
+        for raw in [
+            year | (1 << 16), // month zero
+            year | (13 << 21) | (1 << 16),
+            year | (1 << 21), // day zero
+            valid_date | (24 << 11),
+            valid_date | (60 << 5),
+            valid_date | 30, // second 60
+        ] {
+            for family in [crate::ArchiveFamily::Rar13, crate::ArchiveFamily::Rar15To40] {
+                assert!(super::extracted_system_time(family, Some(raw), None).is_none());
+            }
+        }
+    }
 
     #[test]
     fn stored_calendar_fields_keep_wall_clock_separate_from_utc() {
