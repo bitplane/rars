@@ -1632,6 +1632,102 @@ mod tests {
     use std::rc::Rc;
 
     #[test]
+    fn facade_buffer_flush_preserves_written_bytes() {
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut writer = SharedBuffer(bytes.clone());
+        writer.flush().unwrap();
+        assert!(bytes.lock().unwrap().is_none());
+        assert_eq!(writer.write(b"").unwrap(), 0);
+        writer.write_all(b"a").unwrap();
+        writer.flush().unwrap();
+        writer.write_all(b"bc").unwrap();
+        writer.flush().unwrap();
+        writer.flush().unwrap();
+        assert_eq!(*bytes.lock().unwrap(), Some(b"abc".to_vec()));
+    }
+
+    #[test]
+    fn facade_family_accessors_and_public_hash_models_preserve_information() {
+        for version in [
+            ArchiveVersion::Rar13,
+            ArchiveVersion::Rar29,
+            ArchiveVersion::Rar50,
+        ] {
+            let mut builder = Builder::new(version).store(true);
+            builder
+                .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+                .unwrap();
+            let mut archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+            assert_eq!(
+                archive.as_rar13().is_some(),
+                version == ArchiveVersion::Rar13
+            );
+            assert_eq!(
+                archive.as_rar15_40().is_some(),
+                version == ArchiveVersion::Rar29
+            );
+            assert_eq!(
+                archive.as_rar50().is_some(),
+                version == ArchiveVersion::Rar50
+            );
+            if !matches!(archive, Archive::Rar50Plus(_)) {
+                continue;
+            }
+            for (hash_type, data) in [
+                (0, vec![7; 32]),
+                (0, vec![7; 31]),
+                (0, vec![7; 33]),
+                (1, vec![7; 32]),
+                (u64::MAX, vec![]),
+            ] {
+                let Archive::Rar50Plus(modern) = &mut archive else {
+                    unreachable!()
+                };
+                let file = modern
+                    .blocks
+                    .iter_mut()
+                    .find_map(|block| match block {
+                        rar50::Block::File(file) => Some(file),
+                        _ => None,
+                    })
+                    .unwrap();
+                file.hash = Some(rar50::FileHash {
+                    hash_type,
+                    data: data.clone(),
+                });
+                let member = archive.members().next().unwrap();
+                let ArchiveMemberDetail::Rar50Plus { hash, .. } = member.detail else {
+                    panic!("modern member must retain its family")
+                };
+                let expected = if hash_type == 0 && data.len() == 32 {
+                    ArchiveMemberHash::Blake2sp([7; 32])
+                } else {
+                    ArchiveMemberHash::Other { hash_type, data }
+                };
+                assert_eq!(hash, Some(expected));
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_publication_rename_failure_preserves_destination_and_cleans_staging() {
+        let root = crate::scratch::case("recovery-publication-rename-failure");
+        let destination = root.join("destination");
+        std::fs::create_dir(&destination).unwrap();
+        let sentinel = destination.join("existing");
+        std::fs::write(&sentinel, b"keep these bytes").unwrap();
+        let result = RecoveryRepairResult {
+            data: b"repaired bytes".to_vec(),
+            report: RecoveryRepairReport::default(),
+        };
+        let error = result.write_to_path(&destination, None).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Io);
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep these bytes");
+        assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+    }
+
+    #[test]
     fn member_mtime_matches_rar50_extraction_without_losing_absence() {
         let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
         builder
