@@ -2582,6 +2582,81 @@ mod tests {
         ));
     }
 
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn unrepresentable_dictionary_is_refused_by_buffered_streaming_and_split_decoders() {
+        struct NeverRead;
+        impl Read for NeverRead {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                panic!("an unrepresentable dictionary must be rejected before reading")
+            }
+        }
+        let mut file = plain_file(b"large-dictionary", &[0], None);
+        file.compression_info = (5 << 7) | (15 << 10);
+        assert_eq!(
+            file.decoded_compression_info().unwrap().dictionary_size,
+            1u64 << 32
+        );
+        let expected = Error::InvalidHeader("RAR 5 dictionary size overflows host address size");
+        let mut decoder = ReaderState::new(&Allowance::default());
+        assert_eq!(
+            file.decode_packed_owned(&[0], &mut decoder).unwrap_err(),
+            expected
+        );
+        assert_eq!(
+            file.stream_packed_with_decoder(
+                &mut NeverRead,
+                None,
+                &mut decoder,
+                u64::MAX,
+                None,
+                &mut std::io::sink()
+            )
+            .unwrap_err(),
+            expected
+        );
+
+        let mut first = file.clone();
+        first.block.flags = HFL_SPLIT_AFTER;
+        first.block.data_range = 0..1;
+        first.block.data_size = Some(1);
+        let mut last = first.clone();
+        last.block.flags = HFL_SPLIT_BEFORE;
+        let volumes = [
+            archive_with_blocks(vec![Block::File(first.clone())], vec![0]),
+            archive_with_blocks(vec![Block::File(last.clone())], vec![0]),
+        ];
+        let mut split = PendingSplitRefs::new(&first, 0, 0);
+        split.append(1, 0).unwrap();
+        assert_eq!(
+            last.decode_split_with_decoder(&volumes, &split, &mut decoder, None)
+                .unwrap_err(),
+            expected
+        );
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn encrypted_stored_size_above_the_host_limit_is_refused() {
+        let mut file = plain_file(b"large-stored", &[], None);
+        file.encrypted = true;
+        file.encryption = Some(FileEncryption {
+            version: 0,
+            flags: 0,
+            kdf_count: 0,
+            salt: [0; 16],
+            iv: [0; 16],
+            check_value: None,
+        });
+        file.unpacked_size = 1u64 << 32;
+        let mut decoder = ReaderState::new(&Allowance::default());
+        assert_eq!(
+            file.decode_packed_owned(&[0; 16], &mut decoder)
+                .unwrap_err(),
+            Error::InvalidHeader("RAR 5 unpacked size overflows host address size")
+        );
+    }
+
     #[test]
     fn checked_unpacked_size_rejects_values_above_host_usize() {
         assert_eq!(checked_unpacked_size(123).unwrap(), 123usize);

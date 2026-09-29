@@ -452,6 +452,17 @@ pub(super) fn dictionary_size_fields(algorithm_version: u8, size: u64) -> Result
 mod dictionary_encoding_tests {
     use super::*;
 
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn encode_options_refuse_a_valid_dictionary_above_the_host_limit() {
+        let size = 1u64 << 32;
+        assert_eq!(dictionary_size_fields(0, size).unwrap(), (15, 0));
+        assert_eq!(
+            encode_options_for_level(Some(3), size).unwrap_err(),
+            Error::InvalidArgument("RAR 5 dictionary size exceeds this platform's address space")
+        );
+    }
+
     #[test]
     fn rar5_dictionary_boundaries_and_rejections() {
         let unit = DEFAULT_RAR50_DICTIONARY_SIZE;
