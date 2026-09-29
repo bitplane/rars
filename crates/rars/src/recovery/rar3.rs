@@ -125,10 +125,8 @@ impl RSCoder8 {
                 denominators.push(denominator);
             }
         }
-        if error_locs.is_empty() || error_locs.len() > self.parity_size {
-            return Err(Error::DecodeFailed);
-        }
-
+        // Each validated erasure supplies a root in this range. The locator's
+        // constant term is one, so it has at most parity_size distinct roots.
         let evaluator = self.multiply_polynomials(&locator, &syndromes);
         for (&loc, &denominator) in error_locs.iter().zip(&denominators) {
             if denominator == 0 {
@@ -214,7 +212,7 @@ pub fn reconstruct_data_volumes(
     if data_volumes.is_empty() || data_volumes.len() + recovery_count > MAX_PARITY {
         return Err(Error::InvalidCodewordSize);
     }
-    if recovery_volumes.is_empty() || recovery_count == 0 || recovery_count > MAX_PARITY {
+    if recovery_volumes.is_empty() || recovery_count == 0 {
         return Err(Error::InvalidParitySize);
     }
     let shard_len = recovery_volumes[0].1.len();
@@ -248,10 +246,10 @@ pub fn reconstruct_data_volumes(
         return Ok(data_volumes
             .iter()
             .map(|data| {
+                // No missing data volumes were found above.
+                let data = data.expect("every data volume is present");
                 let mut out = vec![0; shard_len];
-                if let Some(data) = data {
-                    out[..data.len()].copy_from_slice(data);
-                }
+                out[..data.len()].copy_from_slice(data);
                 out
             })
             .collect());
@@ -352,6 +350,119 @@ mod tests {
         assert_eq!(
             coder.correct_erasures(&mut codeword, &[0, 1, 2]),
             Err(Error::TooManyErasures)
+        );
+    }
+
+    #[test]
+    fn rs8_rejects_invalid_parameters_and_corrupt_unmarked_codewords() {
+        assert_eq!(RSCoder8::new(0).unwrap_err(), Error::InvalidParitySize);
+        assert_eq!(RSCoder8::new(256).unwrap_err(), Error::InvalidParitySize);
+
+        let coder = RSCoder8::new(1).unwrap();
+        assert_eq!(
+            coder.correct_erasures(&mut [], &[]),
+            Err(Error::InvalidCodewordSize)
+        );
+        assert_eq!(
+            coder.correct_erasures(&mut [0; 256], &[]),
+            Err(Error::InvalidCodewordSize)
+        );
+        assert_eq!(
+            coder.correct_erasures(&mut [0; 2], &[2]),
+            Err(Error::InvalidCodewordSize)
+        );
+        assert_eq!(coder.correct_erasures(&mut [0; 2], &[]), Ok(()));
+        assert_eq!(
+            coder.correct_erasures(&mut [1, 0], &[]),
+            Err(Error::DecodeFailed)
+        );
+    }
+
+    #[test]
+    fn rs8_reports_each_failure_category() {
+        for (error, message) in [
+            (
+                Error::InvalidParitySize,
+                "RAR 3 recovery parity size is invalid",
+            ),
+            (
+                Error::InvalidCodewordSize,
+                "RAR 3 recovery codeword size is invalid",
+            ),
+            (
+                Error::TooManyErasures,
+                "RAR 3 recovery data cannot repair this many erasures",
+            ),
+            (Error::DecodeFailed, "RAR 3 recovery decode failed"),
+        ] {
+            assert_eq!(error.to_string(), message);
+        }
+    }
+
+    #[test]
+    fn rs8_rejects_duplicate_erasure_positions() {
+        for parity in 2..=4 {
+            let coder = RSCoder8::new(parity).unwrap();
+            for codeword_len in 2..=8 {
+                for index in 0..codeword_len {
+                    let mut codeword = vec![0; codeword_len];
+                    codeword[0] = 1;
+                    assert!(
+                        coder
+                            .correct_erasures(&mut codeword, &[index, index])
+                            .is_err(),
+                        "parity={parity}, length={codeword_len}, index={index}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rev3_rejects_invalid_shard_geometry_and_duplicate_recovery_indices() {
+        let present = [1u8, 2];
+        let recovery = [3u8, 4];
+        let cases: &[(&[Option<&[u8]>], usize, &[(usize, &[u8])], Error)] = &[
+            (&[], 1, &[(0, &recovery)], Error::InvalidCodewordSize),
+            (&[None], 255, &[(0, &recovery)], Error::InvalidCodewordSize),
+            (&[None], 0, &[(0, &recovery)], Error::InvalidParitySize),
+            (&[None], 1, &[], Error::InvalidParitySize),
+            (&[None], 1, &[(1, &recovery)], Error::InvalidCodewordSize),
+            (
+                &[None],
+                1,
+                &[(0, &recovery), (0, &present[..1])],
+                Error::InvalidCodewordSize,
+            ),
+            (
+                &[Some(&present)],
+                1,
+                &[(0, &recovery[..1])],
+                Error::InvalidCodewordSize,
+            ),
+            (
+                &[None],
+                1,
+                &[(0, &recovery), (0, &recovery)],
+                Error::InvalidCodewordSize,
+            ),
+            (&[None, None], 1, &[(0, &recovery)], Error::TooManyErasures),
+        ];
+        for &(data, count, shards, ref expected) in cases {
+            assert_eq!(
+                reconstruct_data_volumes(data, count, shards),
+                Err(expected.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn rev3_returns_healthy_padded_data_without_decoding() {
+        let actual = b"a";
+        let recovery = b"rs";
+        assert_eq!(
+            reconstruct_data_volumes(&[Some(actual)], 1, &[(0, recovery)]),
+            Ok(vec![b"a\0".to_vec()])
         );
     }
 
