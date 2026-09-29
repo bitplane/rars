@@ -3595,11 +3595,6 @@ impl<B: Budget> Huffman<B> {
     }
 }
 
-impl Clone for Huffman<Allowance> {
-    fn clone(&self) -> Self {
-        self.try_clone().expect("unlimited RAR3 Huffman copy")
-    }
-}
 #[cfg(test)]
 impl Huffman<Allowance> {
     fn from_lengths(lengths: &[u8]) -> Result<Self> {
@@ -3719,11 +3714,6 @@ impl<B: Budget> PpmdByteReader for BitReader<B> {
     }
 }
 
-impl Clone for BitReader<Allowance> {
-    fn clone(&self) -> Self {
-        self.try_clone().expect("unlimited RAR3 input copy")
-    }
-}
 #[cfg(test)]
 impl BitReader<Allowance> {
     fn from_bytes(input: &[u8]) -> Self {
