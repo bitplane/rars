@@ -11,8 +11,21 @@ use crate::streaming::EntrySource;
 use std::borrow::Cow;
 use std::io::{Read, Write};
 
-pub(crate) fn entropy_error(error: getrandom::Error, context: &'static str) -> Error {
+fn entropy_error(error: getrandom::Error, context: &'static str) -> Error {
     std::io::Error::other(format!("{context}: {error}")).into()
+}
+
+/// Fill salt or IV bytes using the operating system's entropy source.
+pub(crate) fn fill_entropy(bytes: &mut [u8], context: &'static str) -> Result<()> {
+    fill_entropy_with(bytes, context, getrandom::fill)
+}
+
+fn fill_entropy_with(
+    bytes: &mut [u8],
+    context: &'static str,
+    fill: fn(&mut [u8]) -> std::result::Result<(), getrandom::Error>,
+) -> Result<()> {
+    fill(bytes).map_err(|error| entropy_error(error, context))
 }
 
 /// Attribute a writer failure without blaming a member for cancellation.
@@ -246,8 +259,8 @@ mod tests {
             super::member_error(crate::Error::Cancelled, b"file", "writing"),
             crate::Error::Cancelled
         );
-        let existing = crate::Error::InvalidArgument("source failed")
-            .at_entry(b"file".to_vec(), "reading");
+        let existing =
+            crate::Error::InvalidArgument("source failed").at_entry(b"file".to_vec(), "reading");
         let error = super::member_error(existing, b"file", "writing");
         assert_eq!(error.entry_context(), Some((b"file".as_slice(), "reading")));
     }
@@ -260,6 +273,37 @@ mod tests {
         assert!(error
             .to_string()
             .contains(&getrandom::Error::UNSUPPORTED.to_string()));
+    }
+
+    #[test]
+    fn entropy_fill_delegates_the_whole_buffer_and_refuses_backend_failure() {
+        fn success(bytes: &mut [u8]) -> std::result::Result<(), getrandom::Error> {
+            for (index, byte) in bytes.iter_mut().enumerate() {
+                *byte = index as u8;
+            }
+            Ok(())
+        }
+        fn failure(bytes: &mut [u8]) -> std::result::Result<(), getrandom::Error> {
+            bytes[0] = 42;
+            Err(getrandom::Error::UNSUPPORTED)
+        }
+        for context in [
+            "RAR 3.x writer could not generate encryption salt",
+            "RAR 5 writer could not generate encryption salt",
+            "RAR 5 writer could not generate encryption IV",
+        ] {
+            let mut bytes = [0xff; 16];
+            fill_entropy_with(&mut bytes, context, success).unwrap();
+            assert_eq!(bytes, std::array::from_fn(|index| index as u8));
+            let error = fill_entropy_with(&mut bytes, context, failure).unwrap_err();
+            assert_eq!(error.kind(), crate::ErrorKind::Io);
+            assert_eq!(
+                error.to_string(),
+                format!("I/O error: {context}: {}", getrandom::Error::UNSUPPORTED)
+            );
+            assert_eq!(bytes[0], 42);
+            assert_eq!(&bytes[1..], &(1u8..16).collect::<Vec<_>>());
+        }
     }
 
     use super::*;
@@ -365,7 +409,9 @@ mod tests {
         assert!(matches!(bytes.load().unwrap(), Cow::Borrowed(_)));
         assert!(bytes.source().is_none());
         let mut visited = Vec::new();
-        bytes.walk(|chunk| visited.extend_from_slice(chunk)).unwrap();
+        bytes
+            .walk(|chunk| visited.extend_from_slice(chunk))
+            .unwrap();
         assert_eq!(visited, data);
     }
 }

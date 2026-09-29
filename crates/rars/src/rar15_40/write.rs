@@ -2264,12 +2264,10 @@ fn encrypt_packed_data_with_progress(
 
 fn random_rar30_salt() -> Result<[u8; 8]> {
     let mut salt = [0; 8];
-    getrandom::fill(&mut salt).map_err(|error| {
-        crate::write_stream::entropy_error(
-            error,
-            "RAR 3.x writer could not generate encryption salt",
-        )
-    })?;
+    crate::write_stream::fill_entropy(
+        &mut salt,
+        "RAR 3.x writer could not generate encryption salt",
+    )?;
     Ok(salt)
 }
 

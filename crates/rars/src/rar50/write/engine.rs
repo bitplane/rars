@@ -629,12 +629,14 @@ fn encrypted_service_block<'a>(
     super::validate_nonempty_password(password)?;
     let mut salt = [0u8; 16];
     let mut iv = [0u8; 16];
-    getrandom::fill(&mut salt).map_err(|error| {
-        crate::write_stream::entropy_error(error, "RAR 5 writer could not generate encryption salt")
-    })?;
-    getrandom::fill(&mut iv).map_err(|error| {
-        crate::write_stream::entropy_error(error, "RAR 5 writer could not generate encryption IV")
-    })?;
+    crate::write_stream::fill_entropy(
+        &mut salt,
+        "RAR 5 writer could not generate encryption salt",
+    )?;
+    crate::write_stream::fill_entropy(
+        &mut iv,
+        "RAR 5 writer could not generate encryption IV",
+    )?;
     let keys = Rar50Keys::derive(password, salt, WRITE_KDF_COUNT_LOG)
         .map_err(crate::rar50::map_rar50_crypto_error)?;
 
@@ -723,18 +725,14 @@ fn prepare_member(
         Some(password) => {
             let mut salt = [0u8; 16];
             let mut iv = [0u8; 16];
-            getrandom::fill(&mut salt).map_err(|error| {
-                crate::write_stream::entropy_error(
-                    error,
-                    "RAR 5 writer could not generate encryption salt",
-                )
-            })?;
-            getrandom::fill(&mut iv).map_err(|error| {
-                crate::write_stream::entropy_error(
-                    error,
-                    "RAR 5 writer could not generate encryption IV",
-                )
-            })?;
+            crate::write_stream::fill_entropy(
+                &mut salt,
+                "RAR 5 writer could not generate encryption salt",
+            )?;
+            crate::write_stream::fill_entropy(
+                &mut iv,
+                "RAR 5 writer could not generate encryption IV",
+            )?;
             let keys = Rar50Keys::derive(password, salt, WRITE_KDF_COUNT_LOG)
                 .map_err(crate::rar50::map_rar50_crypto_error)?;
             write_file_encryption_record(&mut extra, salt, iv, keys.password_check_record())?;
@@ -1342,18 +1340,14 @@ fn prepare_volume_member<'a>(
         Some(password) => {
             let mut salt = [0u8; 16];
             let mut iv = [0u8; 16];
-            getrandom::fill(&mut salt).map_err(|error| {
-                crate::write_stream::entropy_error(
-                    error,
-                    "RAR 5 writer could not generate encryption salt",
-                )
-            })?;
-            getrandom::fill(&mut iv).map_err(|error| {
-                crate::write_stream::entropy_error(
-                    error,
-                    "RAR 5 writer could not generate encryption IV",
-                )
-            })?;
+            crate::write_stream::fill_entropy(
+                &mut salt,
+                "RAR 5 writer could not generate encryption salt",
+            )?;
+            crate::write_stream::fill_entropy(
+                &mut iv,
+                "RAR 5 writer could not generate encryption IV",
+            )?;
             let keys = Rar50Keys::derive(password, salt, WRITE_KDF_COUNT_LOG)
                 .map_err(crate::rar50::map_rar50_crypto_error)?;
 

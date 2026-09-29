@@ -241,12 +241,10 @@ impl<'a> HeaderImage<'a> {
         out[start..start + 4].copy_from_slice(&crc.to_le_bytes());
         if let Some(keys) = keys {
             let mut iv = [0; 16];
-            getrandom::fill(&mut iv).map_err(|error| {
-                crate::write_stream::entropy_error(
-                    error,
-                    "RAR 5 writer could not generate encryption IV",
-                )
-            })?;
+            crate::write_stream::fill_entropy(
+                &mut iv,
+                "RAR 5 writer could not generate encryption IV",
+            )?;
             out[..16].copy_from_slice(&iv);
             Rar50Cipher::new(keys.key, iv)
                 .encrypt_in_place(&mut out[16..header_len])
@@ -608,9 +606,10 @@ pub(crate) struct HeaderEncryptionKeys {
 
 pub(super) fn header_encryption_keys(password: &[u8]) -> Result<HeaderEncryptionKeys> {
     let mut salt = [0u8; 16];
-    getrandom::fill(&mut salt).map_err(|error| {
-        crate::write_stream::entropy_error(error, "RAR 5 writer could not generate encryption salt")
-    })?;
+    crate::write_stream::fill_entropy(
+        &mut salt,
+        "RAR 5 writer could not generate encryption salt",
+    )?;
     let keys =
         Rar50Keys::derive(password, salt, WRITE_KDF_COUNT_LOG).map_err(map_rar50_crypto_error)?;
     Ok(HeaderEncryptionKeys { keys, salt })
