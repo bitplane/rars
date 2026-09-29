@@ -4904,9 +4904,9 @@ fn emit_zero_level_run<B: Budget>(
 ///
 /// Either way the code must be *complete*. Strict decoders rebuild the
 /// pre-table (7-Zip's `k_BuildMode_Full`) and reject an under-full one. Huffman
-/// gives Kraft equality by construction once two symbols are in play, and the
-/// flat assignment is only valid when the used-symbol count is a power of two,
-/// which is what `assign_flat_complete_code` arranges.
+/// gives Kraft equality by construction once two symbols are in play. The
+/// near-uniform assignment also satisfies equality for any used-symbol count,
+/// adding a phantom code when only one symbol is used.
 #[cfg(test)]
 fn level_code_lengths_for_tokens(tokens: &[LevelToken]) -> [u8; LEVEL_TABLE_SIZE] {
     level_code_lengths_with_allowance(tokens, &Allowance::default()).unwrap()
