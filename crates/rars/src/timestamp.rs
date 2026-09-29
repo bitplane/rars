@@ -200,8 +200,9 @@ fn format_system_time_utc(time: SystemTime) -> Option<String> {
 }
 
 fn civil_from_days(days_since_unix_epoch: i64) -> (i32, u32, u32) {
+    // All callers derive days from nonnegative Unix durations.
     let z = days_since_unix_epoch + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let era = z / 146_097;
     let doe = z - era * 146_097;
     let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
     let y = yoe + era * 400;
@@ -214,8 +215,9 @@ fn civil_from_days(days_since_unix_epoch: i64) -> (i32, u32, u32) {
 }
 
 fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    // The sole production caller extracts DOS years in 1980..=2107.
     let year = i64::from(year) - i64::from(month <= 2);
-    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let era = year / 400;
     let yoe = year - era * 400;
     let month = i64::from(month);
     let day = i64::from(day);
@@ -227,6 +229,74 @@ fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::StoredTimestamp;
+
+    #[test]
+    fn calendar_conversions_match_every_day_in_the_dos_range() {
+        // Independent Gregorian reference: count days from the Unix epoch,
+        // using month lengths rather than the production March-based formula.
+        let mut days = 0;
+        for year in 1970..=2107 {
+            let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+            let months = [
+                31,
+                if leap { 29 } else { 28 },
+                31,
+                30,
+                31,
+                30,
+                31,
+                31,
+                30,
+                31,
+                30,
+                31,
+            ];
+            for (index, length) in months.into_iter().enumerate() {
+                let month = index as u32 + 1;
+                for day in 1..=length {
+                    assert_eq!(super::civil_from_days(days), (year, month, day));
+                    if year >= 1980 {
+                        assert_eq!(super::days_from_civil(year, month, day), days);
+                    }
+                    days += 1;
+                }
+            }
+        }
+        assert_eq!(super::unix_datetime(u32::MAX), (2106, 2, 7, 6, 28, 15));
+    }
+
+    #[test]
+    fn source_dos_conversion_refuses_dates_outside_its_year_range() {
+        use std::time::{Duration, UNIX_EPOCH};
+        assert!(super::system_time_to_dos_time(UNIX_EPOCH - Duration::from_secs(1)).is_none());
+        // These dates remain outside the DOS range in every real timezone.
+        for seconds in [0, 4_386_528_000] {
+            // 1970-01-01 and 2109-01-02 UTC
+            assert!(
+                super::system_time_to_dos_time(UNIX_EPOCH + Duration::from_secs(seconds)).is_none()
+            );
+        }
+        // Midyear is safely separated from a timezone-dependent year boundary.
+        for (seconds, year) in [(331_344_000, 1980), (4_339_852_800, 2107)] {
+            let packed =
+                super::system_time_to_dos_time(UNIX_EPOCH + Duration::from_secs(seconds)).unwrap();
+            assert_eq!(1980 + (packed >> 25), year);
+            let decoded = super::dos_time_to_system_time(packed).unwrap();
+            let original = UNIX_EPOCH + Duration::from_secs(seconds);
+            assert!(original.duration_since(decoded).unwrap() < Duration::from_secs(2));
+        }
+    }
+
+    #[test]
+    fn filetime_format_boundaries_keep_epoch_and_far_future_dates() {
+        let epoch = 116_444_736_000_000_000;
+        assert_eq!(super::format_filetime_utc(epoch - 1), "0x019db1ded53e7fff");
+        assert_eq!(super::format_filetime_utc(epoch), "1970-01-01T00:00:00Z");
+        assert_eq!(
+            super::format_filetime_utc(u64::MAX),
+            "60056-05-28T05:36:10Z"
+        );
+    }
 
     #[test]
     fn invalid_dos_fields_do_not_become_extracted_instants() {

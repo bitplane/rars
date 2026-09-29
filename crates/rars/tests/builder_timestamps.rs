@@ -5,6 +5,44 @@ use std::time::{Duration, UNIX_EPOCH};
 mod scratch;
 
 #[test]
+fn source_metadata_preserves_unix_epoch_and_refuses_unrepresentable_seconds() {
+    let root = scratch::case("source-timestamp-boundaries");
+    let file = std::fs::File::create(root.join("source")).unwrap();
+    for (instant, expected_unix, expected_dos_year) in [
+        (UNIX_EPOCH - Duration::from_secs(1), None, None),
+        (UNIX_EPOCH, Some(0), None),
+        (
+            UNIX_EPOCH + Duration::from_secs(1_594_771_200),
+            Some(1_594_771_200),
+            Some(2020),
+        ),
+        (
+            UNIX_EPOCH + Duration::from_secs(u64::from(u32::MAX)),
+            Some(u32::MAX),
+            Some(2106),
+        ),
+        (
+            UNIX_EPOCH + Duration::from_secs(u64::from(u32::MAX) + 1),
+            None,
+            Some(2106),
+        ),
+    ] {
+        file.set_modified(instant).unwrap();
+        let metadata = file.metadata().unwrap();
+        assert_eq!(metadata.modified().unwrap(), instant);
+        assert_eq!(rars::timestamp::source_unix_mtime(&metadata), expected_unix);
+        let packed = rars::timestamp::source_dos_mtime(&metadata);
+        assert_eq!(
+            (packed != 0).then_some(1980 + (packed >> 25)),
+            expected_dos_year
+        );
+    }
+    let current = rars::timestamp::current_filetime();
+    assert!(current >= 116_444_736_000_000_000);
+    assert!(!rars::timestamp::format_filetime_utc(current).starts_with("0x"));
+}
+
+#[test]
 fn stored_timestamp_view_retains_family_presence_and_refinements() {
     use rars::{ArchiveFamily, StoredTimestamp, TimeRefinement};
     for format in ArchiveVersion::ALL {
@@ -334,7 +372,10 @@ fn clearing_complete_times_removes_the_rar5_time_record() {
     builder.set_file_times(b"file", None).unwrap();
 
     let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
-    assert_eq!(archive.members().next().unwrap().file_times().unwrap(), None);
+    assert_eq!(
+        archive.members().next().unwrap().file_times().unwrap(),
+        None
+    );
 }
 
 #[test]
@@ -349,6 +390,20 @@ fn legacy_extended_times_are_validated_before_the_archive_is_written() {
         )
         .unwrap();
     let before = builder.to_bytes().unwrap();
+    // No odd-second or fraction control bits may be present without the
+    // corresponding timestamp-present bit, in any of the four legacy slots.
+    for index in 0..4 {
+        for mode in 1..8u16 {
+            let flags = mode << (12 - index * 4);
+            assert_eq!(
+                builder.set_legacy_extended_times(b"file", Some(flags.to_le_bytes().to_vec())),
+                Err(rars::Error::InvalidArgument(
+                    "legacy extended timestamps are incomplete or invalid"
+                ))
+            );
+            assert_eq!(builder.to_bytes().unwrap(), before);
+        }
+    }
     assert!(builder
         .set_legacy_extended_times(b"file", Some(vec![0x00, 0x90]))
         .is_err());
