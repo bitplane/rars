@@ -36,9 +36,9 @@ pub(crate) fn write_msb_bits(
 }
 
 pub(crate) fn match_length(input: &[u8], pos: usize, distance: usize, max_length: usize) -> usize {
-    if distance == 0 || distance > pos {
-        return 0;
-    }
+    // Encoders supply older match-finder candidates or remembered distances
+    // already admitted at an earlier position in this forward-moving parse.
+    debug_assert!(distance != 0 && distance <= pos);
 
     let max_length = max_length.min(input.len().saturating_sub(pos));
     match_length_scalar(input, pos, distance, max_length, 0)
@@ -130,6 +130,27 @@ mod tests {
             length += 1;
         }
         length
+    }
+
+    #[test]
+    fn match_length_clamps_the_requested_extent_at_input_end() {
+        let input = b"abcdabcdabcdabcd";
+        for pos in 1..=input.len() {
+            for distance in 1..=pos {
+                for requested in [0, 1, 3, 8, 32, usize::MAX] {
+                    let available = requested.min(input.len() - pos);
+                    assert_eq!(
+                        match_length(input, pos, distance, requested),
+                        reference_match_length(input, pos, distance, available),
+                        "pos={pos}, distance={distance}, requested={requested}"
+                    );
+                }
+            }
+        }
+        // The public RAR13 match finder also permits positions past EOF.
+        // There are no bytes to compare, so no indexing is attempted.
+        assert_eq!(match_length(input, input.len() + 1, 1, usize::MAX), 0);
+        assert_eq!(match_length(input, usize::MAX, usize::MAX, usize::MAX), 0);
     }
 
     #[test]
