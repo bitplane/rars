@@ -142,6 +142,94 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_unicode_names_respect_the_header_length_limit() {
+        // ASCII fallback plus full UTF-16 units and one command per four
+        // units: 20154 characters produce the largest fitting field.
+        let name = vec![b'a'; 20_154];
+        let encoded = encode_legacy_unicode(&name).unwrap();
+        assert_eq!(encoded.len(), 65_503);
+        crate::rar15_40::validate_unicode_name(&encoded, &name).unwrap();
+        let too_long = vec![b'a'; 20_155];
+        assert_eq!(
+            encode_legacy_unicode(&too_long),
+            Err(Error::InvalidArgument(
+                "legacy Unicode filename is too long"
+            )),
+        );
+    }
+
+    #[test]
+    fn legacy_unicode_commands_preserve_supplementary_characters_and_group_tails() {
+        for name in ["a", "abcd", "abcde", "notes/🦀/é.txt"] {
+            let encoded = encode_legacy_unicode(name.as_bytes()).unwrap();
+            crate::rar15_40::validate_unicode_name(&encoded, name.as_bytes()).unwrap();
+        }
+    }
+
+    #[test]
+    fn utf8_legacy_decoding_is_strict_for_both_valid_and_invalid_input() {
+        for name in ["", "é", "🦀", "a/b"] {
+            assert_eq!(
+                LegacyNameEncoding::Utf8.decode(name.as_bytes()).unwrap(),
+                name
+            );
+        }
+        assert_eq!(
+            LegacyNameEncoding::Utf8.decode(&[0xff]),
+            Err(Error::InvalidArgument("legacy name is not valid UTF-8")),
+        );
+    }
+
+    #[test]
+    fn native_names_preserve_utf8_and_unix_legacy_bytes_without_replacement() {
+        let bytes = "café.txt".as_bytes();
+        let name = native_string(bytes).unwrap();
+        assert_eq!(native_bytes(&name).unwrap(), bytes);
+        #[cfg(unix)]
+        {
+            let bytes = b"caf\xff.txt";
+            let name = native_string(bytes).unwrap();
+            assert_eq!(native_bytes(&name).unwrap(), bytes);
+        }
+        #[cfg(not(unix))]
+        assert!(native_string(b"caf\xff.txt").is_err());
+    }
+
+    #[test]
+    fn relative_names_reject_unsafe_or_empty_paths_in_both_legacy_separator_styles() {
+        for name in [
+            b"a\0b".as_slice(),
+            b"/root",
+            b"\\root",
+            b"C:\\root",
+            b"a/../b",
+            b"a\\..\\b",
+        ] {
+            assert!(
+                matches!(validate_relative(name), Err(Error::UnsafePath(_))),
+                "{name:?}"
+            );
+        }
+        for name in [b"".as_slice(), b".", b".//.", b".\\.\\"] {
+            assert_eq!(
+                validate_relative(name),
+                Err(Error::InvalidArgument("empty archive path"))
+            );
+        }
+        for name in [
+            b"a/b".as_slice(),
+            b"a\\b",
+            b".//a",
+            b"a\\.\\b",
+            b"legacy-\xff",
+        ] {
+            validate_relative(name).unwrap();
+        }
+        assert!(matches!(decode_rar50(b"plain-name"), Cow::Borrowed(_)));
+        assert!(matches!(decode_rar50(b"bad-\xff"), Cow::Borrowed(_)));
+    }
+
+    #[test]
     fn rar50_mapping_is_reversible_and_does_not_alias_unicode() {
         let mut bytes: Vec<u8> = (0x80..=0xff).collect();
         bytes.extend_from_slice("/日本語/\u{fffe}\u{e080}".as_bytes());
@@ -214,19 +302,18 @@ impl std::str::FromStr for LegacyNameEncoding {
 impl LegacyNameEncoding {
     /// Strict decoding: undefined bytes never become replacement characters.
     pub fn decode(self, name: &[u8]) -> Result<String> {
-        if self == Self::Utf8 {
-            return std::str::from_utf8(name)
-                .map(str::to_owned)
-                .map_err(|_| Error::InvalidArgument("legacy name is not valid UTF-8"));
-        }
         let table = match self {
+            Self::Utf8 => {
+                return std::str::from_utf8(name)
+                    .map(str::to_owned)
+                    .map_err(|_| Error::InvalidArgument("legacy name is not valid UTF-8"));
+            }
             Self::Cp437 => &CP437,
             Self::Cp850 => &CP850,
             Self::Cp852 => &CP852,
             Self::Cp866 => &CP866,
             Self::Windows1251 => &CP1251,
             Self::Windows1252 => &CP1252,
-            Self::Utf8 => unreachable!(),
         };
         name.iter()
             .map(|&byte| {
