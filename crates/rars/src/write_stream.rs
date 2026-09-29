@@ -264,6 +264,21 @@ mod tests {
 
     use super::*;
 
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn oversized_member_is_refused_before_opening_its_source() {
+        let length = u64::from(u32::MAX) + 1;
+        let source = EntrySource::from_opener(length, || {
+            panic!("an unrepresentable member must not open its source")
+        });
+        let member = MemberBytes::Source(&source);
+        assert_eq!(member.len().unwrap(), length);
+        assert_eq!(
+            member.load().unwrap_err(),
+            Error::InvalidArgument("member is larger than this host can hold")
+        );
+    }
+
     #[test]
     fn changed_sources_are_bounded_and_rejected() {
         use std::io::{Cursor, Seek, SeekFrom};
