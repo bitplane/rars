@@ -1236,7 +1236,7 @@ pub(crate) fn recovery_end_header(
         {
             EFL_NEXT_VOLUME
         }
-        Err(error) if error.kind() == crate::ErrorKind::Cancelled => return Err(error),
+        Err(error) => recovery_end_parse_error(error)?,
         _ => 0,
     };
     let first = parse_block_header_bytes(
@@ -1264,6 +1264,14 @@ pub(crate) fn recovery_end_header(
         &crate::WriterResources::default(),
     )
     .map(|bytes| bytes.to_vec())
+}
+
+fn recovery_end_parse_error(error: Error) -> Result<u64> {
+    if error.kind() == crate::ErrorKind::Cancelled {
+        Err(error)
+    } else {
+        Ok(0)
+    }
 }
 
 fn parse_main_header_bytes(parsed: &ParsedBlockHeader) -> Result<MainHeader> {
@@ -2836,6 +2844,15 @@ mod tests {
             recovery_end_header(RAR50_SIGNATURE, crate::ArchiveReadOptions::new()),
             Err(Error::TooShort)
         ));
+    }
+
+    #[test]
+    fn recovery_end_header_keeps_parse_cancellation_distinct() {
+        assert!(matches!(
+            recovery_end_parse_error(Error::Cancelled),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(recovery_end_parse_error(Error::TooShort).unwrap(), 0);
     }
 
     #[test]
