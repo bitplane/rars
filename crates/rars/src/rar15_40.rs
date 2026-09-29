@@ -3461,6 +3461,285 @@ mod tests {
             .unwrap()
     }
 
+    fn preservation_comment_seed(target: ArchiveVersion) -> Archive {
+        let mut builder = crate::Builder::new(target)
+            .store(true)
+            .comment(Some(b"archive note".to_vec()));
+        builder
+            .add_bytes(b"entry".to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+        builder
+            .set_file_comment(b"entry", Some(b"member note".to_vec()))
+            .unwrap();
+        let archive = Archive::parse_owned(builder.to_bytes().unwrap()).unwrap();
+        assert!(archive.rewrite_preservation_issues().is_empty());
+        archive
+    }
+
+    #[test]
+    fn preservation_old_comment_envelopes_refuse_unsupported_metadata() {
+        let seed = preservation_comment_seed(ArchiveVersion::Rar20);
+        let comment = seed
+            .blocks
+            .iter()
+            .find_map(|block| match block {
+                Block::Comment(comment) => Some(comment),
+                _ => None,
+            })
+            .unwrap();
+        assert!(comment.supports_rewrite());
+        type Edit = fn(&mut CommentHeader);
+        let edits: &[Edit] = &[
+            |c| c.block.head_type = FILE_HEAD,
+            |c| c.block.flags = 1,
+            |c| c.block.add_size = Some(0),
+            |c| c.block.head_size = 12,
+            |c| c.unp_size = u16::MAX,
+            |c| c.method = 0x36,
+            |c| {
+                c.method = 0x31;
+                c.unp_ver = 29;
+            },
+        ];
+        for edit in edits {
+            let mut edited = comment.clone();
+            edit(&mut edited);
+            assert!(!edited.supports_rewrite(), "{edited:?}");
+        }
+        for version in [15, 20, 26] {
+            let mut supported = comment.clone();
+            supported.method = 0x35;
+            supported.unp_ver = version;
+            assert!(supported.supports_rewrite());
+        }
+    }
+
+    #[test]
+    fn preservation_archive_and_member_comments_report_layout_and_envelope_refusals() {
+        let standalone = preservation_comment_seed(ArchiveVersion::Rar20);
+        // Standalone comments remain preservable even without MHD_COMMENT.
+        let mut unflagged = standalone.clone();
+        unflagged.main.flags &= !MHD_COMMENT;
+        assert!(unflagged.rewrite_preservation_issues().is_empty());
+        let Block::Comment(comment) = &standalone.blocks[0] else {
+            unreachable!()
+        };
+        let mut bytes = standalone
+            .source
+            .read_range(0..standalone.source.len().unwrap())
+            .unwrap();
+        let start = RAR15_SIGNATURE.len();
+        let size = MAIN_HEADER_SIZE as u16 + comment.block.head_size;
+        bytes[start + 3..start + 5]
+            .copy_from_slice(&(standalone.main.flags | MHD_COMMENT).to_le_bytes());
+        bytes[start + 5..start + 7].copy_from_slice(&size.to_le_bytes());
+        test_write_header_crc(&mut bytes[start..start + MAIN_HEADER_SIZE], 0);
+        let seed = Archive::parse_owned(bytes).unwrap();
+        assert!(seed.rewrite_preservation_issues().is_empty());
+        type Edit = fn(&mut Archive);
+        let cases: &[(&str, Edit)] = &[
+            ("legacy main header settings", |a| {
+                a.main.flags &= !MHD_COMMENT
+            }),
+            ("legacy main header settings", |a| {
+                a.main.head_size = MAIN_HEADER_SIZE as u16 + 1
+            }),
+            ("legacy main header settings", |a| {
+                if let Block::Comment(c) = &mut a.blocks[0] {
+                    c.block.offset += 1;
+                }
+            }),
+            ("archive comment location", |a| {
+                let comment = a.blocks.remove(0);
+                a.blocks.push(comment);
+            }),
+            ("archive comment location", |a| {
+                if let Block::Comment(c) = &mut a.blocks[0] {
+                    c.method = 0x36;
+                }
+            }),
+            ("duplicate legacy archive comments", |a| {
+                a.blocks.insert(1, a.blocks[0].clone())
+            }),
+            ("file comments have unsupported", |a| {
+                preservation_file(a).file_comment.clear()
+            }),
+            ("file comments have unsupported", |a| {
+                let c = &mut preservation_file(a).file_comment;
+                c[10] = 0x36;
+                test_write_header_crc(&mut c[..COMMENT_HEADER_SIZE], 0);
+            }),
+            ("file comments have unsupported", |a| {
+                preservation_file(a).file_comment.push(0)
+            }),
+            (
+                "embedded legacy file comments with encrypted headers",
+                |a| a.main.flags |= MHD_PASSWORD,
+            ),
+        ];
+        for &(expected, edit) in cases {
+            let mut archive = seed.clone();
+            edit(&mut archive);
+            let issues = archive.rewrite_preservation_issues();
+            assert!(
+                issues.iter().any(|issue| issue.contains(expected)),
+                "{expected}: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preservation_cmt_services_refuse_every_unsupported_metadata_field() {
+        let seed = preservation_comment_seed(ArchiveVersion::Rar30);
+        let index = seed
+            .blocks
+            .iter()
+            .position(|block| {
+                matches!(block,
+            Block::NewSub(sub) if sub.kind == NewSubKind::ArchiveComment)
+            })
+            .unwrap();
+        type Edit = fn(&mut FileHeader);
+        let edits: &[Edit] = &[
+            |f| f.block.flags |= FHD_DIRECTORY_MASK,
+            |f| f.block.flags |= FHD_PASSWORD,
+            |f| f.block.flags |= 0x0800,
+            |f| f.block.head_size += 1,
+            |f| f.unp_ver = 20,
+            |f| f.method = 0x36,
+            |f| f.attr = 1,
+            |f| f.host_os = 4,
+            |f| f.unp_size = u64::from(u32::MAX) + 1,
+        ];
+        for edit in edits {
+            let mut archive = seed.clone();
+            let Block::NewSub(sub) = &mut archive.blocks[index] else {
+                unreachable!()
+            };
+            edit(&mut sub.file);
+            assert!(archive
+                .rewrite_preservation_issues()
+                .iter()
+                .any(|issue| issue.contains("legacy CMT service metadata or encryption")));
+        }
+        let mut late = seed.clone();
+        let comment = late.blocks.remove(index);
+        late.blocks.push(comment);
+        assert!(late
+            .rewrite_preservation_issues()
+            .iter()
+            .any(|issue| issue.contains("legacy CMT service metadata")));
+        let mut duplicate = seed.clone();
+        duplicate
+            .blocks
+            .insert(index, duplicate.blocks[index].clone());
+        assert!(duplicate
+            .rewrite_preservation_issues()
+            .iter()
+            .any(|issue| issue.contains("duplicate legacy archive comments")));
+        let mut unknown = seed;
+        let Block::NewSub(sub) = &mut unknown.blocks[index] else {
+            unreachable!()
+        };
+        sub.kind = NewSubKind::Unknown(b"future".to_vec());
+        assert!(unknown
+            .rewrite_preservation_issues()
+            .iter()
+            .any(|issue| issue.contains("legacy recovery or other service records")));
+    }
+
+    #[test]
+    fn preservation_accepts_encrypted_cmt_with_its_declared_salt() {
+        let mut builder = crate::Builder::new(ArchiveVersion::Rar30)
+            .store(true)
+            .comment(Some(b"archive note".to_vec()))
+            .archive_comment_password(Some(b"secret".to_vec()));
+        builder
+            .add_bytes(b"entry".to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+        let archive = Archive::parse_owned(builder.to_bytes().unwrap()).unwrap();
+        let comment = archive
+            .new_subs()
+            .find(|sub| sub.kind == NewSubKind::ArchiveComment)
+            .unwrap();
+        assert!(comment.file.is_encrypted());
+        assert!(comment.file.salt.is_some());
+        assert!(archive.rewrite_preservation_issues().is_empty());
+    }
+
+    #[test]
+    fn preservation_accepts_unicode_names_and_consistent_compressed_solid_members() {
+        let mut builder = crate::Builder::new(ArchiveVersion::Rar29)
+            .solid(true)
+            .compression_level(Some(1));
+        for name in [b"entry".as_slice(), b"second"] {
+            builder
+                .add_bytes(name.to_vec(), b"payload".repeat(50), None, None)
+                .unwrap();
+        }
+        builder
+            .set_legacy_unicode_name(
+                b"entry",
+                crate::filename::encode_legacy_unicode(b"entry").unwrap(),
+            )
+            .unwrap();
+        let archive = Archive::parse_owned(builder.to_bytes().unwrap()).unwrap();
+        assert!(archive.main.is_solid());
+        assert!(archive.files().next().unwrap().unicode_name.is_some());
+        assert!(archive.files().nth(1).unwrap().is_solid());
+        assert!(archive.rewrite_preservation_issues().is_empty());
+    }
+
+    #[test]
+    fn preservation_end_records_require_complete_supported_layout() {
+        let seed = preservation_seed(ArchiveVersion::Rar29);
+        let mut bytes = seed
+            .source
+            .read_range(0..seed.source.len().unwrap())
+            .unwrap();
+        let start = bytes.len();
+        bytes.extend([0, 0, ENDARC_HEAD, 0, 0, 7, 0]);
+        test_write_header_crc(&mut bytes[start..], 0);
+        let seed = Archive::parse_owned(bytes).unwrap();
+        assert!(seed.rewrite_preservation_issues().is_empty());
+        type Edit = fn(&mut BlockHeader);
+        let edits: &[Edit] = &[
+            |e| e.flags = 1,
+            |e| e.head_size = 8,
+            |e| e.add_size = Some(0),
+            |e| e.offset += 1,
+            |e| e.offset = usize::MAX,
+        ];
+        for edit in edits {
+            let mut archive = seed.clone();
+            let Some(Block::End(end)) = archive.blocks.last_mut() else {
+                unreachable!()
+            };
+            edit(end);
+            assert!(archive
+                .rewrite_preservation_issues()
+                .iter()
+                .any(|issue| issue.contains("legacy end header metadata or trailing bytes")));
+        }
+        let mut encrypted_header = seed.clone();
+        encrypted_header.main.flags |= MHD_PASSWORD;
+        let Some(Block::End(end)) = encrypted_header.blocks.last_mut() else {
+            unreachable!()
+        };
+        // Header encryption requires salt plus a padded AES header block.
+        assert_eq!(end.offset + 7, encrypted_header.source.len().unwrap());
+        assert!(encrypted_header
+            .rewrite_preservation_issues()
+            .iter()
+            .any(|issue| issue.contains("legacy end header metadata or trailing bytes")));
+        let mut overflow = seed;
+        overflow.sfx_offset = usize::MAX;
+        assert!(overflow
+            .rewrite_preservation_issues()
+            .iter()
+            .any(|issue| issue.contains("legacy end header metadata or trailing bytes")));
+    }
+
     #[test]
     fn preservation_preflight_reports_public_main_header_inconsistencies() {
         let seed = preservation_seed(ArchiveVersion::Rar29);
