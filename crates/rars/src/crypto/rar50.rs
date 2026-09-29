@@ -125,8 +125,12 @@ impl Rar50Keys {
             return Ok(());
         }
         let checksum = sha256(&stored[..8]);
-        let checksum_matches = constant_time_eq(&checksum[..4], &stored[8..12]);
-        let password_matches = constant_time_eq(&self.password_check, &stored[..8]);
+        let checksum_matches = constant_time_eq(
+            checksum.first_chunk::<4>().unwrap(),
+            stored.last_chunk::<4>().unwrap(),
+        );
+        let password_matches =
+            constant_time_eq(&self.password_check, stored.first_chunk::<8>().unwrap());
         if !(checksum_matches & password_matches) {
             return Err(Error::BadPassword);
         }
@@ -152,10 +156,7 @@ impl Rar50Keys {
     }
 }
 
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
+fn constant_time_eq<const N: usize>(left: &[u8; N], right: &[u8; N]) -> bool {
     let mut diff = 0u8;
     for (&left, &right) in left.iter().zip(right) {
         diff |= left ^ right;
