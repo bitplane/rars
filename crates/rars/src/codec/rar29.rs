@@ -1124,8 +1124,8 @@ fn encode_member_inner(
     *previous_levels = table_lengths;
 
     let level_lengths = level_code_lengths(&level_tokens);
-    let level_codes = canonical_codes(&level_lengths)?;
-    let main_codes = canonical_codes(&table_lengths[..MAIN_COUNT])?;
+    let level_codes = canonical_codes(&level_lengths);
+    let main_codes = canonical_codes(&table_lengths[..MAIN_COUNT]);
 
     let mut bits = BitWriter::default();
     bits.write_bit(false); // LZ block.
@@ -1142,12 +1142,12 @@ fn encode_member_inner(
             bits.write_bits(token.extra_value as u32, token.extra_bits);
         }
     }
-    let offset_codes = canonical_codes(&table_lengths[MAIN_COUNT..MAIN_COUNT + OFFSET_COUNT])?;
+    let offset_codes = canonical_codes(&table_lengths[MAIN_COUNT..MAIN_COUNT + OFFSET_COUNT]);
     let low_offset_codes = canonical_codes(
         &table_lengths[MAIN_COUNT + OFFSET_COUNT..MAIN_COUNT + OFFSET_COUNT + LOW_OFFSET_COUNT],
-    )?;
+    );
     let length_codes =
-        canonical_codes(&table_lengths[MAIN_COUNT + OFFSET_COUNT + LOW_OFFSET_COUNT..])?;
+        canonical_codes(&table_lengths[MAIN_COUNT + OFFSET_COUNT + LOW_OFFSET_COUNT..]);
     for filter in initial_filters {
         let code = main_codes[257].ok_or(Error::InvalidData(
             "RAR 2.9 encoder missing VM filter Huffman code",
@@ -2337,17 +2337,16 @@ struct HuffmanCode {
     len: u8,
 }
 
-fn canonical_codes(lengths: &[u8]) -> Result<Vec<Option<HuffmanCode>>> {
+// Only encoder-generated tables reach this helper; archive tables use Huffman.
+fn canonical_codes(lengths: &[u8]) -> Vec<Option<HuffmanCode>> {
+    debug_assert!(lengths.iter().all(|&len| len <= 15));
     let mut count = [0u16; 16];
     for &len in lengths {
-        if len > 15 {
-            return Err(Error::InvalidData("RAR 2.9 Huffman length is too large"));
-        }
         if len != 0 {
             count[len as usize] += 1;
         }
     }
-    validate_huffman_counts(&count)?;
+    debug_assert!(validate_huffman_counts(&count).is_ok());
 
     let mut next_code = [0u16; 16];
     let mut code = 0u16;
@@ -2365,7 +2364,7 @@ fn canonical_codes(lengths: &[u8]) -> Result<Vec<Option<HuffmanCode>>> {
         next_code[len as usize] += 1;
         codes[symbol] = Some(HuffmanCode { code, len });
     }
-    Ok(codes)
+    codes
 }
 
 #[derive(Debug, Clone)]
@@ -4788,11 +4787,7 @@ mod tests {
     }
 
     #[test]
-    fn codec_helpers_reject_out_of_contract_reads_and_tables() {
-        assert!(matches!(
-            canonical_codes(&[16]),
-            Err(Error::InvalidData("RAR 2.9 Huffman length is too large"))
-        ));
+    fn codec_helpers_reject_out_of_contract_reads_and_history() {
         assert_eq!(
             BitReader::from_bytes(&[0; 4]).peek_bits(25),
             Err(Error::InvalidData("RAR 2.9 bit read is too wide"))
@@ -4822,11 +4817,64 @@ mod tests {
     }
 
     #[test]
+    fn canonical_assignment_matches_pinned_codes_and_generated_alphabets() {
+        let pinned = canonical_codes(&[1, 2, 3, 3, 0]);
+        assert_eq!(
+            pinned
+                .iter()
+                .map(|code| code.map(|code| (code.code, code.len)))
+                .collect::<Vec<_>>(),
+            [Some((0, 1)), Some((2, 2)), Some((6, 3)), Some((7, 3)), None]
+        );
+        for size in [
+            super::LEVEL_COUNT,
+            MAIN_COUNT,
+            OFFSET_COUNT,
+            LOW_OFFSET_COUNT,
+            LENGTH_COUNT,
+        ] {
+            let mut single = vec![0; size];
+            single[size - 1] = 1;
+            let mut deep = vec![0; size];
+            let (mut a, mut b) = (1, 1);
+            for frequency in deep.iter_mut().take(40) {
+                *frequency = a;
+                (a, b) = (b, a + b);
+            }
+            for frequencies in [
+                vec![0; size],
+                single,
+                vec![1; size],
+                (0..size).map(|i| usize::from(i % 3 == 0)).collect(),
+                deep,
+            ] {
+                let lengths = crate::codec::huffman::lengths_for_frequencies(&frequencies, 15);
+                assert!(lengths.iter().all(|&length| length <= 15));
+                let codes = canonical_codes(&lengths);
+                let table = Huffman::from_lengths(&lengths).unwrap();
+                for (symbol, code) in codes.iter().enumerate() {
+                    assert_eq!(code.is_some(), frequencies[symbol] != 0);
+                    if let Some(code) = code {
+                        let mut bits = BitWriter::default();
+                        bits.write_bits(u32::from(code.code), code.len);
+                        assert_eq!(
+                            table
+                                .decode(&mut BitReader::from_bytes(&bits.finish()))
+                                .unwrap(),
+                            symbol
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn huffman_decoding_returns_the_index_from_its_constructor_alphabet() {
         for size in [20, MAIN_COUNT, OFFSET_COUNT, LOW_OFFSET_COUNT, LENGTH_COUNT] {
             let lengths =
                 crate::codec::huffman::complete_lengths_for_frequencies(&vec![1; size], 15);
-            let codes = canonical_codes(&lengths).unwrap();
+            let codes = canonical_codes(&lengths);
             let table = Huffman::from_lengths(&lengths).unwrap();
 
             for (expected, code) in codes.iter().enumerate() {
@@ -4842,7 +4890,7 @@ mod tests {
     }
 
     fn table_description(level_lengths: &[u8; 20], tokens: &[LevelToken]) -> Vec<u8> {
-        let codes = canonical_codes(level_lengths).unwrap();
+        let codes = canonical_codes(level_lengths);
         let mut bits = BitWriter::default();
         bits.write_bit(false);
         bits.write_bit(false);
@@ -5834,8 +5882,8 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         repeat_lengths[2] = 1;
         decoder.lengths = Huffman::from_lengths(&repeat_lengths).unwrap();
 
-        let main_codes = canonical_codes(&main_lengths).unwrap();
-        let repeat_codes = canonical_codes(&repeat_lengths).unwrap();
+        let main_codes = canonical_codes(&main_lengths);
+        let repeat_codes = canonical_codes(&repeat_lengths);
         let mut bits = BitWriter::default();
         for code in [
             main_codes[b'Z' as usize].unwrap(),
@@ -5860,7 +5908,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         main_lengths[b'Y' as usize] = 2;
         decoder.main = Huffman::from_lengths(&main_lengths).unwrap();
 
-        let main_codes = canonical_codes(&main_lengths).unwrap();
+        let main_codes = canonical_codes(&main_lengths);
         let mut bits = BitWriter::default();
         for symbol in [b'X' as usize, 258, b'Y' as usize] {
             let code = main_codes[symbol].unwrap();
@@ -7250,7 +7298,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         assert_ne!(first_packed[keep_tables_bit / 8] & mask, 0);
         first_packed[keep_tables_bit / 8] &= !mask;
 
-        let codes = canonical_codes(&encoder.levels[..MAIN_COUNT]).unwrap();
+        let codes = canonical_codes(&encoder.levels[..MAIN_COUNT]);
         let end = codes[256].unwrap();
         let mut bits = BitWriter::default();
         bits.write_bits(u32::from(end.code), end.len);
