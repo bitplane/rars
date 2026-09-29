@@ -1279,13 +1279,8 @@ pub(crate) fn repair_inline_recovery_archive_with_report(
     if (record_complete || recovery_record_rebuilt) && repaired.len() <= record_end {
         let mut read_options = crate::ArchiveReadOptions::with_optional_password(options.password);
         read_options.cancellation = control.cancellation();
-        let end = crate::rar50::recovery_end_header(&repaired, read_options).map_err(|error| {
-            if error.kind() == crate::ErrorKind::Cancelled {
-                Error::Cancelled
-            } else {
-                Error::BadRecoveryChunk
-            }
-        })?;
+        let end = crate::rar50::recovery_end_header(&repaired, read_options)
+            .map_err(map_recovery_end_error)?;
         repaired.extend_from_slice(&end);
         end_record_rebuilt = true;
     }
@@ -1299,6 +1294,14 @@ pub(crate) fn repair_inline_recovery_archive_with_report(
     };
     check_repair(control)?;
     Ok((repaired, report))
+}
+
+fn map_recovery_end_error(error: crate::Error) -> Error {
+    if error.kind() == crate::ErrorKind::Cancelled {
+        Error::Cancelled
+    } else {
+        Error::BadRecoveryChunk
+    }
 }
 
 /// Rebuilds the whole recovery record from the repaired prefix, replacing
@@ -3528,6 +3531,27 @@ mod tests {
         assert_eq!(
             repair_inline_recovery_archive(&archive),
             Err(Error::BadRecoveryChunk)
+        );
+
+        let options = super::InlineRepairOptions {
+            record_range: Some(0..0),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::repair_inline_recovery_archive_with_report(&archive, &options).unwrap_err(),
+            Error::BadRecoveryChunk
+        );
+    }
+
+    #[test]
+    fn rar5_end_header_errors_preserve_cancellation() {
+        assert_eq!(
+            super::map_recovery_end_error(crate::Error::Cancelled),
+            Error::Cancelled
+        );
+        assert_eq!(
+            super::map_recovery_end_error(crate::Error::WrongPasswordOrCorruptData),
+            Error::BadRecoveryChunk
         );
     }
 
