@@ -137,15 +137,14 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
         }
     }
 
+    /// Stream a compressed member; callers handle stored members separately.
     pub(super) fn write_file_to(
         &mut self,
         archive: &Archive,
         file: &FileHeader,
         out: &mut impl Write,
     ) -> Result<()> {
-        if file.is_stored() {
-            return file.write_stored_with_allowance(archive, self.password, out, &self.allowance);
-        }
+        debug_assert!(!file.is_stored());
         if file.is_empty_compressed_payload() {
             file.crc_result(0, self.password)?;
             return Ok(());
@@ -173,11 +172,13 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
         Ok(())
     }
 
+    /// Decode compressed recovery data into a charged buffer.
     pub(super) fn decode_file_owned(
         &mut self,
         archive: &Archive,
         file: &FileHeader,
     ) -> Result<Buffer<u8, B>> {
+        debug_assert!(!file.is_stored());
         let mut out = Buffer::new(&self.allowance);
         if file.is_empty_compressed_payload() {
             file.crc_result(0, self.password)?;
@@ -185,25 +186,9 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
         }
         let password = self.password;
         let mut input = file.packed_reader_with_allowance(archive, password, &self.allowance)?;
-        if file.is_stored() {
-            if !file.is_encrypted() && file.pack_size != file.unp_size {
-                return Err(Error::InvalidHeader(
-                    "RAR 1.5 stored file has mismatched packed and unpacked sizes",
-                ));
-            }
-            out.read_to_end(&mut input)?;
-            if file.is_encrypted() {
-                out.truncate(
-                    usize::try_from(file.unp_size).map_err(|_| {
-                        Error::InvalidHeader("RAR 1.5 unpacked size overflows usize")
-                    })?,
-                );
-            }
-        } else {
-            let solid = self.file_is_solid(file);
-            self.codec_for(file)?
-                .decode_to(&mut input, file, solid, password, &mut out)?;
-        }
+        let solid = self.file_is_solid(file);
+        self.codec_for(file)?
+            .decode_to(&mut input, file, solid, password, &mut out)?;
         Ok(out)
     }
 
@@ -1953,7 +1938,7 @@ mod tests {
     }
 
     #[test]
-    fn decoder_session_decode_file_data_dispatches_to_stored_path_for_each_codec_version() {
+    fn public_file_writer_dispatches_stored_data_without_a_codec_session() {
         let payload = b"decode_file_data stored dispatch".to_vec();
         let crc = super::super::crc32(&payload);
         for unp_ver in [15u8, 20, 26, 29] {
@@ -1965,10 +1950,10 @@ mod tests {
             entry.file_crc = crc;
 
             let archive = archive_with_source(vec![Block::File(entry.clone())], payload.clone());
-            let mut session = DecoderSession::new(false);
-            let data = session
-                .decode_file_data(&archive, &entry)
-                .unwrap_or_else(|err| panic!("decode for unp_ver {unp_ver}: {err:?}"));
+            let mut data = Vec::new();
+            entry
+                .write_to(&archive, None, &mut data)
+                .unwrap_or_else(|err| panic!("write for unp_ver {unp_ver}: {err:?}"));
             assert_eq!(data, payload, "unp_ver {unp_ver} payload mismatch");
         }
     }
