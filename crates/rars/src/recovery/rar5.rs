@@ -207,25 +207,14 @@ pub fn encode_inline_recovery_parity(
     let plan = plan_inline_recovery(archive_prefix.len() as u64, recovery_percent)?;
     let shards = split_prefix_shards(archive_prefix, plan)?;
     let shard_refs: Vec<&[u8]> = shards.iter().map(Vec::as_slice).collect();
-    let parity = encode_parity_shards(
-        &shard_refs,
-        usize::try_from(plan.recovery_shards).map_err(|_| Error::PlanOverflow)?,
-    )?;
+    // Planning caps recovery_shards at 200.
+    let parity = encode_parity_shards(&shard_refs, plan.recovery_shards as usize)?;
     Ok((plan, parity))
 }
 
 pub fn build_structural_inline_recovery_data(
     archive_prefix: &[u8],
     recovery_percent: u64,
-) -> Result<Vec<u8>> {
-    build_structural_inline_recovery_data_with_progress(archive_prefix, recovery_percent, None, 1)
-}
-
-pub(crate) fn build_structural_inline_recovery_data_with_progress(
-    archive_prefix: &[u8],
-    recovery_percent: u64,
-    progress: Option<ProgressReporter<'_>>,
-    pass: usize,
 ) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     build_streamed_inline_recovery(
@@ -235,8 +224,8 @@ pub(crate) fn build_structural_inline_recovery_data_with_progress(
         RecoveryMemoryMode::Resident,
         None,
         &mut out,
-        progress,
-        pass,
+        None,
+        1,
     )?;
     Ok(out)
 }
@@ -612,11 +601,8 @@ pub(crate) fn streamed_recovery_with_allowance<B: Budget>(
         writer.write_all(&plan.shard_size.to_le_bytes())?;
         writer.write_all(&data_shards_u16.to_le_bytes())?;
         writer.write_all(&recovery_shards_u16.to_le_bytes())?;
-        writer.write_all(
-            &u16::try_from(shard_index)
-                .map_err(|_| Error::PlanOverflow)?
-                .to_le_bytes(),
-        )?;
+        // The loop bound was checked as u16 before writing any chunk.
+        writer.write_all(&(shard_index as u16).to_le_bytes())?;
         for &state in shard_states.iter() {
             writer.write_all(&state.to_le_bytes())?;
         }
@@ -2339,7 +2325,7 @@ mod tests {
             }
         }
 
-        let body = vec![7; 65_538];
+        let body = vec![7; super::RECOVERY_IO_BLOCK + 2];
         let plan = InlineRecoveryPlan {
             data_shards: 1,
             recovery_shards: 1,
@@ -2468,6 +2454,25 @@ mod tests {
             assert!(output.is_empty(), "{name}");
             assert_eq!(allowance.used(), 0, "{name}");
         }
+    }
+
+    #[test]
+    fn rar5_record_builder_preserves_plan_errors() {
+        let plan = InlineRecoveryPlan {
+            data_shards: 1,
+            recovery_shards: 1,
+            group_count: 0,
+            header_size: 80,
+            shard_size: 80,
+        };
+        assert_eq!(
+            super::build_inline_recovery_data_for_plan_with_control(
+                b"abc",
+                plan,
+                &crate::read_control::ReadControl::default()
+            ),
+            Err(Error::PrefixExceedsPlan)
+        );
     }
 
     #[test]
@@ -3164,7 +3169,8 @@ mod tests {
             chunk[0x2a..0x32].copy_from_slice(&parity_len.to_le_bytes());
             chunk[0x3a..0x3c].copy_from_slice(&0u16.to_le_bytes());
         });
-        altered("wrong parity length", |chunk| chunk[0x2a] ^= 1);
+        altered("wrong parity length", |chunk| chunk[0x2a] ^= 2);
+        altered("no recovery shards", |chunk| chunk[0x3c..0x3e].fill(0));
 
         for (name, chunk) in cases {
             assert_eq!(parse(&chunk), Error::BadRecoveryChunk, "{name}");
@@ -3501,6 +3507,22 @@ mod tests {
     }
 
     #[test]
+    fn rar5_archive_repair_rejects_missing_chunks_and_invalid_end_header_source() {
+        assert_eq!(
+            repair_inline_recovery_archive(b"no recovery chunks"),
+            Err(Error::BadRecoveryChunk)
+        );
+
+        let prefix = b"not a RAR archive";
+        let mut archive = prefix.to_vec();
+        archive.extend_from_slice(&build_structural_inline_recovery_data(prefix, 10).unwrap());
+        assert_eq!(
+            repair_inline_recovery_archive(&archive),
+            Err(Error::BadRecoveryChunk)
+        );
+    }
+
+    #[test]
     fn rar5_record_rebuild_checks_resource_and_record_length() {
         let control = crate::read_control::ReadControl::default();
         let huge = InlineRecoveryPlan {
@@ -3519,6 +3541,37 @@ mod tests {
         assert_eq!(
             super::rebuild_inline_recovery_record_with_control(&[], b"x", 0..0, plan, &control),
             Err(Error::BadRecoveryChunk)
+        );
+    }
+
+    #[test]
+    fn rar5_archive_repair_keeps_prefix_when_record_rebuild_exceeds_limit() {
+        let mut chunk = build_structural_inline_recovery_data(b"x", 10).unwrap();
+        let group_count = 8192u64;
+        let shard_size = 80 + group_count;
+        let recovery_shards = u16::MAX - 1;
+        chunk.resize(shard_size as usize, 0);
+        chunk[0x0c..0x10].copy_from_slice(&(shard_size as u32).to_le_bytes());
+        chunk[0x2a..0x32].copy_from_slice(&group_count.to_le_bytes());
+        chunk[0x32..0x3a].copy_from_slice(&shard_size.to_le_bytes());
+        chunk[0x3c..0x3e].copy_from_slice(&recovery_shards.to_le_bytes());
+        let crc = crc64_xz(&chunk[0x0c..]);
+        chunk[0x04..0x0c].copy_from_slice(&crc.to_le_bytes());
+
+        let mut archive = b"x".to_vec();
+        archive.extend_from_slice(&chunk);
+        let (repaired, report) = super::repair_inline_recovery_archive_with_report(
+            &archive,
+            &super::InlineRepairOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(repaired, archive);
+        assert!(!report.changed);
+        assert!(!report.recovery_record_rebuilt);
+        assert_eq!(report.available_recovery_shards, Some(1));
+        assert_eq!(
+            report.expected_recovery_shards,
+            Some(recovery_shards as u64)
         );
     }
 
