@@ -81,7 +81,7 @@ impl TimeZone {
         // 64-bit transition times. That block is the authoritative one; the
         // first exists only for readers that predate it.
         if header.version >= b'2' {
-            let second = header.data_end(TimeWidth::Bits32);
+            let second = header.data_end(TimeWidth::Bits32)?;
             let header = Header::parse(bytes, second)?;
             Self::parse_block(bytes, &header, second + Header::LEN, TimeWidth::Bits64)
         } else {
@@ -90,6 +90,9 @@ impl TimeZone {
     }
 
     fn parse_block(bytes: &[u8], header: &Header, start: usize, width: TimeWidth) -> Option<Self> {
+        // Check every declared field, including skipped data, before reserving
+        // arrays from the header's counts.
+        bytes.get(start..start.checked_add(header.data_len(width)?)?)?;
         let stride = width.bytes();
         let mut pos = start;
 
@@ -295,16 +298,18 @@ impl Header {
     }
 
     /// Where this block's data ends, which is where the next header begins.
-    fn data_end(&self, width: TimeWidth) -> usize {
-        let leap_size = width.bytes() + 4;
-        Self::LEN
-            + self.timecnt * width.bytes()
-            + self.timecnt
-            + self.typecnt * 6
-            + self.charcnt
-            + self.leapcnt * leap_size
-            + self.isstdcnt
-            + self.isutcnt
+    fn data_end(&self, width: TimeWidth) -> Option<usize> {
+        Self::LEN.checked_add(self.data_len(width)?)
+    }
+
+    fn data_len(&self, width: TimeWidth) -> Option<usize> {
+        self.timecnt
+            .checked_mul(width.bytes() + 1)?
+            .checked_add(self.typecnt.checked_mul(6)?)?
+            .checked_add(self.charcnt)?
+            .checked_add(self.leapcnt.checked_mul(width.bytes() + 4)?)?
+            .checked_add(self.isstdcnt)?
+            .checked_add(self.isutcnt)
     }
 }
 
@@ -505,6 +510,68 @@ mod tests {
         let mut foreign = bytes;
         foreign[..4].copy_from_slice(b"NOPE");
         assert!(TimeZone::parse(&foreign).is_none());
+    }
+
+    #[test]
+    fn rejects_truncated_designations_and_other_declared_block_data() {
+        let bytes = version_one(&[(0, 0)], &[(0, false)]);
+        for cut in bytes.len() - 4..bytes.len() {
+            assert!(TimeZone::parse(&bytes[..cut]).is_none(), "cut {cut}");
+        }
+        // Counts for leap records and standard/UT indicators also contribute
+        // to the block extent, even though conversion does not interpret them.
+        for count_at in [20, 24, 28] {
+            let mut incomplete = bytes.clone();
+            incomplete[count_at..count_at + 4].copy_from_slice(&1u32.to_be_bytes());
+            assert!(
+                TimeZone::parse(&incomplete).is_none(),
+                "count at {count_at}"
+            );
+        }
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn declared_block_sizes_reject_overflow_on_native_32_bit_hosts() {
+        use super::{Header, TimeWidth};
+        let empty = Header {
+            version: 0,
+            isutcnt: 0,
+            isstdcnt: 0,
+            leapcnt: 0,
+            timecnt: 0,
+            typecnt: 0,
+            charcnt: 0,
+        };
+        let wire_maximum = u32::MAX as usize;
+        for header in [
+            Header {
+                timecnt: wire_maximum,
+                ..empty
+            },
+            Header {
+                typecnt: wire_maximum,
+                ..empty
+            },
+            Header {
+                leapcnt: wire_maximum,
+                ..empty
+            },
+            Header {
+                isstdcnt: wire_maximum,
+                isutcnt: 1,
+                ..empty
+            },
+        ] {
+            assert!(header.data_len(TimeWidth::Bits32).is_none());
+            assert!(header.data_len(TimeWidth::Bits64).is_none());
+        }
+        let header = Header {
+            charcnt: wire_maximum,
+            ..empty
+        };
+        assert_eq!(header.data_len(TimeWidth::Bits32), Some(wire_maximum));
+        assert!(header.data_end(TimeWidth::Bits32).is_none());
     }
 
     #[test]
