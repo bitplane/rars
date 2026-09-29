@@ -536,6 +536,76 @@ impl From<crate::crypto::rar50::Error> for Error {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn machine_readable_codes_remain_stable_and_distinct() {
+        let cases = [
+            (ErrorKind::InvalidArchive, "INVALID_ARCHIVE"),
+            (ErrorKind::InvalidArgument, "INVALID_OPTION"),
+            (ErrorKind::UnsupportedFormat, "UNSUPPORTED_FORMAT"),
+            (ErrorKind::UnsupportedFeature, "UNSUPPORTED_FEATURE"),
+            (ErrorKind::PasswordRequired, "PASSWORD_REQUIRED"),
+            (ErrorKind::BadPassword, "BAD_PASSWORD"),
+            (ErrorKind::ChecksumMismatch, "CHECKSUM_MISMATCH"),
+            (ErrorKind::EntryNotFound, "ENTRY_NOT_FOUND"),
+            (ErrorKind::DuplicateEntry, "DUPLICATE_ENTRY"),
+            (ErrorKind::UnsafePath, "UNSAFE_ENTRY_NAME"),
+            (ErrorKind::Io, "IO"),
+            (ErrorKind::ResourceLimit, "RESOURCE_LIMIT"),
+            (ErrorKind::Cancelled, "CANCELLED"),
+            (ErrorKind::SourceChanged, "SOURCE_CHANGED"),
+            (ErrorKind::WriterFailure, "WRITE_FAILED"),
+        ];
+        let mut codes = std::collections::HashSet::new();
+        for (kind, expected) in cases {
+            assert_eq!(kind.code(), expected);
+            assert!(codes.insert(kind.code()), "duplicate error code {expected}");
+        }
+    }
+
+    #[test]
+    fn resource_diagnostics_retain_required_used_and_limit_values() {
+        let cases = [
+            (
+                Error::Rar50ScratchLimitExceeded { limit: 11, required: 23 },
+                "RAR 5 scratch limit 11 bytes exceeded (requires 23)",
+            ),
+            (
+                Error::Rar50FilterMemoryLimitExceeded { limit: 11, required: 23 },
+                "RAR 5 filter workspace limit 11 bytes exceeded (requires 23)",
+            ),
+            (
+                Error::WriterSpoolLimitExceeded { limit: 11, required: 23, used: 7 },
+                "writer spool limit 11 bytes exceeded (requires 23; 7 bytes already retained or reserved)",
+            ),
+            (
+                Error::WriterPreparationLimitExceeded { limit: 11, required: 23, used: 7 },
+                "writer preparation limit 11 bytes exceeded (requires 23; 7 bytes already retained or reserved)",
+            ),
+            (
+                Error::WriterPreparedHeaderLimitExceeded { limit: 11, required: 23, used: 7 },
+                "writer prepared header limit 11 bytes exceeded (requires 23; 7 bytes already retained or reserved)",
+            ),
+            (
+                Error::WriterSpoolMemoryLimitExceeded { limit: 11, required: 23, used: 7 },
+                "writer spool memory limit 11 bytes exceeded (requires 23; 7 bytes already retained or reserved)",
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.kind(), ErrorKind::ResourceLimit);
+            assert_eq!(error.to_string(), expected);
+            assert!(std::error::Error::source(&error).is_none());
+        }
+        assert_eq!(
+            Error::CannotSkipSolidMember.to_string(),
+            "cannot skip file data in a solid archive"
+        );
+        assert_eq!(
+            Error::CannotSkipSolidMember.kind(),
+            ErrorKind::UnsupportedFeature
+        );
+        assert!(Error::CannotSkipSolidMember.entry_context().is_none());
+    }
+
+    #[test]
     fn codec_io_transport_retains_library_error_types() {
         for cause in [
             Error::Cancelled,
