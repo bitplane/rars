@@ -701,7 +701,6 @@ impl FileHeader {
             ))
         }
     }
-
 }
 
 impl NewSubHeader {
@@ -3441,6 +3440,136 @@ mod tests {
         .unwrap()
     }
 
+    fn preservation_seed(target: ArchiveVersion) -> Archive {
+        let mut builder = crate::Builder::new(target).store(true);
+        builder
+            .add_bytes(b"entry".to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+        let archive = Archive::parse_owned(builder.to_bytes().unwrap()).unwrap();
+        assert!(archive.rewrite_preservation_issues().is_empty());
+        archive
+    }
+
+    fn preservation_file(archive: &mut Archive) -> &mut FileHeader {
+        archive
+            .blocks
+            .iter_mut()
+            .find_map(|block| match block {
+                Block::File(file) => Some(file),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn preservation_preflight_reports_public_main_header_inconsistencies() {
+        let seed = preservation_seed(ArchiveVersion::Rar29);
+        type Edit = fn(&mut Archive);
+        let cases: &[(&str, Edit)] = &[
+            ("legacy volume layout", |a| a.main.flags |= MHD_VOLUME),
+            ("legacy recovery records", |a| a.main.flags |= MHD_PROTECT),
+            ("legacy main header settings", |a| {
+                a.main.flags |= MHD_NEWNUMBERING
+            }),
+            ("legacy main header settings", |a| a.main.head_size += 1),
+            ("legacy main header settings", |a| a.main.reserved1 = 1),
+            ("legacy main header settings", |a| a.main.reserved2 = 1),
+            ("empty legacy archive", |a| {
+                a.blocks.retain(|b| !matches!(b, Block::File(_)))
+            }),
+            ("missing or malformed legacy archive comment", |a| {
+                a.main.flags |= MHD_COMMENT
+            }),
+        ];
+        // These fields are public: a caller can edit a parsed archive before
+        // preflight. Every such refusal must remain observable and specific.
+        for &(expected, edit) in cases {
+            let mut archive = seed.clone();
+            edit(&mut archive);
+            let issues = archive.rewrite_preservation_issues();
+            assert!(
+                issues.iter().any(|issue| issue.contains(expected)),
+                "{expected}: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preservation_preflight_reports_public_member_metadata_inconsistencies() {
+        let seed = preservation_seed(ArchiveVersion::Rar29);
+        type Edit = fn(&mut FileHeader);
+        let cases: &[(&str, Edit)] = &[
+            ("requires unpacker 21", |f| f.unp_ver = 21),
+            ("encryption salt settings", |f| {
+                f.unp_ver = 20;
+                f.salt = Some([0; 8]);
+            }),
+            ("encryption salt settings", |f| {
+                f.block.flags |= FHD_PASSWORD
+            }),
+            ("Pre-RAR2.9 extended timestamps", |f| {
+                f.unp_ver = 20;
+                f.block.flags |= FHD_EXTTIME;
+                f.ext_time = vec![0, 0];
+            }),
+            ("extended timestamps are incomplete", |f| {
+                f.block.flags |= FHD_EXTTIME;
+                f.ext_time = vec![0];
+            }),
+            ("legacy host metadata", |f| f.host_os = 4),
+            ("solid dependency without archive solid flag", |f| {
+                f.block.flags |= FHD_SOLID
+            }),
+            ("legacy file flags or extra metadata", |f| {
+                f.block.flags |= 0x0800
+            }),
+            ("legacy file flags or extra metadata", |f| {
+                f.block.head_size += 1
+            }),
+            ("unsupported legacy method or size", |f| f.method = 0x36),
+            ("unsupported legacy method or size", |f| {
+                f.unp_size = u64::from(u32::MAX) + 1
+            }),
+            ("unsupported legacy directory payload", |f| {
+                f.block.flags |= FHD_DIRECTORY_MASK
+            }),
+            ("unsupported legacy directory payload", |f| {
+                f.block.flags |= FHD_DIRECTORY_MASK;
+                f.pack_size = 0;
+            }),
+            ("unsupported legacy directory payload", |f| {
+                f.block.flags |= FHD_DIRECTORY_MASK | FHD_SOLID;
+                f.pack_size = 0;
+                f.unp_size = 0;
+            }),
+            ("malformed or unsupported legacy Unicode name", |f| {
+                f.unicode_name = Some(b"bad".to_vec())
+            }),
+        ];
+        for &(expected, edit) in cases {
+            let mut archive = seed.clone();
+            edit(preservation_file(&mut archive));
+            let issues = archive.rewrite_preservation_issues();
+            assert!(
+                issues.iter().any(|issue| issue.contains(expected)),
+                "{expected}: {issues:?}"
+            );
+        }
+        let mut rar15 = preservation_seed(ArchiveVersion::Rar15);
+        preservation_file(&mut rar15).host_os = 3;
+        assert!(rar15
+            .rewrite_preservation_issues()
+            .iter()
+            .any(|issue| issue.contains("RAR1.5 Unix metadata")));
+        let mut rar15 = preservation_seed(ArchiveVersion::Rar15);
+        preservation_file(&mut rar15).unicode_name =
+            Some(crate::filename::encode_legacy_unicode(b"entry").unwrap());
+        assert!(rar15
+            .rewrite_preservation_issues()
+            .iter()
+            .any(|issue| issue.contains("malformed or unsupported legacy Unicode name")));
+    }
+
     #[test]
     fn flagged_but_missing_file_comment_does_not_hide_the_member() {
         let mut bytes = stored_archive_bytes(b"entry", b"payload");
@@ -3448,9 +3577,8 @@ mod tests {
         let head_size = usize::from(u16::from_le_bytes(
             bytes[file_start + 5..file_start + 7].try_into().unwrap(),
         ));
-        let flags = u16::from_le_bytes(
-            bytes[file_start + 3..file_start + 5].try_into().unwrap(),
-        ) | FHD_COMMENT;
+        let flags = u16::from_le_bytes(bytes[file_start + 3..file_start + 5].try_into().unwrap())
+            | FHD_COMMENT;
         bytes[file_start + 3..file_start + 5].copy_from_slice(&flags.to_le_bytes());
         test_write_header_crc(&mut bytes[file_start..file_start + head_size], 0);
 
@@ -3477,7 +3605,11 @@ mod tests {
             })
             .unwrap();
         let mut without_end = bytes[..end.offset].to_vec();
-        assert!(Archive::parse(&without_end).unwrap().files().next().is_some());
+        assert!(Archive::parse(&without_end)
+            .unwrap()
+            .files()
+            .next()
+            .is_some());
         assert_eq!(
             truncate_repaired_rev3_volume(without_end.clone()).unwrap(),
             without_end
