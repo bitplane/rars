@@ -151,6 +151,16 @@ mod tests {
     }
 
     #[test]
+    fn default_accumulator_uses_the_standard_seed_and_finalization() {
+        assert_eq!(Crc32::default().finish(), 0);
+        let mut crc = Crc32::default();
+        crc.update(b"1234");
+        crc.update(b"");
+        crc.update(b"56789");
+        assert_eq!(crc.finish(), 0xcbf4_3926);
+    }
+
+    #[test]
     fn raw_crc_matches_unfinalized_seeded_rar15_value() {
         assert_eq!(crc32_raw(b"password"), 0xca3d_b92a);
     }
