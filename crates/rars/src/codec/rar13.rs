@@ -1893,8 +1893,10 @@ impl<B: Budget> Reader15State<B> {
 
         let bit_byte = (bit_field >> 8) as u8;
         let mut length = 0usize;
+        // Both prefix tables cover every byte in either Buf60 state.
+        // The exhaustive table test verifies that a matching entry always exists.
         if self.avr_ln1 < 37 {
-            while length < SHORT_XOR1.len() {
+            loop {
                 let short_len = self.short_len1(length);
                 let mask = (!(0xffu16 >> short_len)) as u8;
                 if ((bit_byte ^ SHORT_XOR1[length]) & mask) == 0 {
@@ -1904,7 +1906,7 @@ impl<B: Budget> Reader15State<B> {
             }
             self.bits.add_bits(self.short_len1(length) as usize);
         } else {
-            while length < SHORT_XOR2.len() {
+            loop {
                 let short_len = self.short_len2(length);
                 let mask = (!(0xffu16 >> short_len)) as u8;
                 if ((bit_byte ^ SHORT_XOR2[length]) & mask) == 0 {
@@ -3492,6 +3494,64 @@ mod solid_regressions {
         decoder.short_lz(&mut output).unwrap();
         assert_eq!(output, b"abcde");
         assert_eq!(decoder.token_stats.short_matches, 1);
+    }
+
+    #[test]
+    fn short_lz_prefix_tables_cover_every_byte_with_each_buf60_state() {
+        // RAR13_FORMAT_SPECIFICATION.md §6.13: Buf60 changes one prefix in
+        // each table. Completeness must hold for both wire states.
+        for (lengths, prefixes, adjusted) in [
+            (&super::SHORT_LEN1, &super::SHORT_XOR1, 1),
+            (&super::SHORT_LEN2, &super::SHORT_XOR2, 3),
+        ] {
+            for buf60 in 0..=1 {
+                for byte in 0..=u8::MAX {
+                    assert!(
+                        prefixes.iter().enumerate().any(|(index, &prefix)| {
+                            let len = if index == adjusted {
+                                buf60 + 3
+                            } else {
+                                lengths[index]
+                            };
+                            (byte ^ prefix) & (!(0xffu16 >> len) as u8) == 0
+                        }),
+                        "byte {byte:#04x}, Buf60={buf60}, adjusted prefix={adjusted}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn old_distance_all_ones_length_does_not_toggle_buf60_for_other_codes() {
+        // The historical decoder reserves length 257 only for code 10.
+        // Current encoders avoid this symbol, but old/crafted streams can
+        // carry it with the other old-distance codes (§6.13).
+        for code in 11..=13 {
+            let mut encoder = Unpack15Encoder::new();
+            encoder.emit_short_lz_code(code).unwrap();
+            emit_decode_num(&mut encoder.bits, 0xff, 2, DEC_L1, POS_L1).unwrap();
+            let mut decoder = Unpack15::new();
+            decoder.bits = BitReader::new(&encoder.bits.finish());
+            decoder.target = 257;
+            decoder.unp_ptr = 1;
+            decoder.window[0] = b'a';
+            decoder.old_dist[(0usize.wrapping_sub(code - 9)) & 3] = 1;
+            let mut output = Vec::new();
+            decoder.short_lz(&mut output).unwrap();
+            assert_eq!(output, vec![b'a'; 257]);
+            assert_eq!(decoder.buf60, 0);
+        }
+    }
+
+    #[test]
+    fn zero_distance_after_window_wrap_retains_historical_zero_fill() {
+        let mut decoder = Unpack15::new();
+        decoder.first_win_done = true;
+        decoder.target = 3;
+        let mut output = Vec::new();
+        decoder.copy_string(0, 3, &mut output).unwrap();
+        assert_eq!(output, [0; 3]);
     }
 
     #[test]
