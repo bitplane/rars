@@ -2777,6 +2777,44 @@ mod tests {
     }
 
     #[test]
+    fn context_header_pressure_is_distinct_from_the_context_count_limit() {
+        let mut decoder = PpmdDecoder::new();
+        decoder.max_contexts = model_context_limit(1);
+        decoder.suballoc.reset(1024 * 1024);
+        decoder.init_model(4).unwrap();
+
+        // Occupy the pool through the allocator's normal state-array and
+        // header operations, including its rare text-reservation fallback.
+        // The root's 128-unit array alone makes memory bind before the
+        // defensive one-header-per-unit context-count cap.
+        while decoder.suballoc.alloc(128, AllocSide::Lo, 0).is_some() {}
+        while decoder.suballoc.alloc(1, AllocSide::Hi, 0).is_some() {}
+        assert!(decoder.contexts.len() < decoder.max_contexts);
+        let root_header = decoder.contexts[0].header_offset;
+        let root_array = decoder.contexts[0].array_offset;
+        let new_context = || Context {
+            states: vec![State {
+                symbol: b'a',
+                freq: 1,
+                successor: Successor::None,
+            }]
+            .into(),
+            summ_freq: 0,
+            suffix: Some(0),
+            header_offset: NULL_OFFSET,
+            array_offset: NULL_OFFSET,
+        };
+        assert_eq!(decoder.push_context(new_context()).unwrap(), None);
+        assert_eq!(decoder.contexts.len(), 1);
+        assert_eq!(decoder.contexts[0].header_offset, root_header);
+        assert_eq!(decoder.contexts[0].array_offset, root_array);
+        assert_eq!(decoder.contexts[0].states.len(), 256);
+
+        decoder.init_model(4).unwrap();
+        assert_eq!(decoder.push_context(new_context()).unwrap(), Some(1));
+    }
+
+    #[test]
     fn context_allocation_releases_header_when_state_array_does_not_fit() {
         let mut decoder = PpmdDecoder::new();
         decoder.max_contexts = 10;
