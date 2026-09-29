@@ -22,10 +22,6 @@ use crate::rar50::{FHEXTRA_SUBDATA, HEAD_MAIN, HEAD_SERVICE, HFL_DATA, HFL_EXTRA
 use crate::streaming::preparation::Bytes;
 use crate::{Error, Result, WriterResources};
 
-/// Offsets only ever grow as the header grows, and a vint is at most 10 bytes
-/// wide, so this is far more headroom than the fixed point can need.
-const MAX_LAYOUT_PASSES: usize = 16;
-
 #[derive(Debug, Clone, Copy)]
 pub(super) struct LayoutInputs<'a> {
     /// Header encryption pads every header to a 16-byte boundary and prefixes
@@ -73,7 +69,16 @@ pub(super) fn resolve_layout(
     let mut quick_open_offset = inputs.quick_open_payload_len.map(|_| 0);
     let mut recovery_offset = inputs.recovery_percent.map(|_| 0);
 
-    for _ in 0..MAX_LAYOUT_PASSES {
+    // Starting with zero offsets makes header sizes and offsets monotone.
+    // The two locator vints can grow by at most 18 bytes altogether; their
+    // record-size vint stays one byte. The extra-size and header-size vints
+    // can each grow by one byte, so the plaintext header grows by at most 20
+    // bytes, or 32 after encryption padding. After the first offset update,
+    // each offset can therefore cross at most one further vint boundary
+    // (consecutive boundaries are at least 16,256 bytes apart). Those two
+    // possible width changes, plus the initial update and propagation, settle
+    // within five passes. Allocation or arithmetic failures return via `?`.
+    loop {
         let mut main_extra = resolved_main_extra(
             inputs.archive_metadata,
             quick_open_offset,
@@ -111,10 +116,6 @@ pub(super) fn resolve_layout(
         quick_open_offset = next_quick_open;
         recovery_offset = next_recovery;
     }
-
-    Err(Error::WriterFailure(
-        "RAR 5 writer could not resolve archive layout offsets",
-    ))
 }
 
 /// Size of a main header carrying `extra`, as it will appear in the archive.
@@ -241,6 +242,26 @@ mod tests {
         .unwrap();
         assert_eq!(rebuilt, layout.main_header_len, "main header size moved");
 
+        let (records, complete) = crate::rar50::parse_main_extra_area(
+            &layout.main_extra,
+            0..layout.main_extra.len(),
+            &crate::read_control::ReadControl::new(None),
+        )
+        .unwrap();
+        assert!(complete);
+        for record in records {
+            if let crate::rar50::MainExtraRecord::Locator(locator) = record {
+                assert_eq!(
+                    locator.quick_open_offset,
+                    inputs
+                        .quick_open_payload_len
+                        .map(|_| quick_open_position - signature_len)
+                        .or_else(|| inputs.archive_metadata.map(|_| 0))
+                );
+                assert_eq!(locator.recovery_record_offset, layout.recovery_offset);
+            }
+        }
+
         if let Some(offset) = layout.recovery_offset {
             let quick_open_block_len = match inputs.quick_open_payload_len {
                 Some(len) => stored_service_block_len(
@@ -275,6 +296,39 @@ mod tests {
                 let inputs = inputs(body_len);
                 let layout = resolve_layout(&inputs, &crate::WriterResources::default()).unwrap();
                 assert_self_consistent(&inputs, &layout);
+            }
+        }
+    }
+
+    #[test]
+    fn layout_settles_at_every_u64_offset_width_with_metadata_and_padding() {
+        let resources = WriterResources::default();
+        for name_len in [0, 104, 120, 16_360] {
+            let metadata = crate::rar50::ArchiveMetadataRecord {
+                flags: 1,
+                name: Some(vec![b'x'; name_len]),
+                creation_time: None,
+            };
+            for encrypted in [false, true] {
+                for features in 1..=3 {
+                    let mut inputs = inputs(0);
+                    inputs.header_encrypted = encrypted;
+                    inputs.head_crypt_len = if encrypted { 60 } else { 0 };
+                    inputs.quick_open_payload_len = (features & 1 != 0).then_some(17);
+                    inputs.recovery_percent = (features & 2 != 0).then_some(5);
+                    inputs.metadata_record = (name_len != 0).then_some(&metadata);
+                    let initial = resolve_layout(&inputs, &resources).unwrap();
+                    for bits in (7..=63).step_by(7) {
+                        let boundary = 1u64 << bits;
+                        let base = boundary
+                            .saturating_sub(inputs.head_crypt_len + initial.main_header_len);
+                        for delta in -32i64..=32 {
+                            inputs.body_len = base.saturating_add_signed(delta);
+                            let layout = resolve_layout(&inputs, &resources).unwrap();
+                            assert_self_consistent(&inputs, &layout);
+                        }
+                    }
+                }
             }
         }
     }
