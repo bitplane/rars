@@ -119,7 +119,7 @@ impl TimeZone {
         if types.is_empty() || indices.iter().any(|&i| usize::from(i) >= types.len()) {
             return None;
         }
-        if transitions.windows(2).any(|pair| pair[0] > pair[1]) {
+        if transitions.windows(2).any(|pair| pair[0] >= pair[1]) {
             return None;
         }
         Some(Self {
@@ -136,14 +136,8 @@ impl TimeZone {
             .partition_point(|&transition| transition <= unix_seconds);
         match after.checked_sub(1) {
             Some(index) => self.types[usize::from(self.indices[index])],
-            // Before the first transition RFC 8536 wants the first type that is
-            // not daylight saving, and the first type otherwise.
-            None => self
-                .types
-                .iter()
-                .find(|local| !local.is_dst)
-                .copied()
-                .unwrap_or(self.types[0]),
+            // RFC 8536 section 3.2 specifies type 0 before the first transition.
+            None => self.types[0],
         }
     }
 
@@ -216,9 +210,19 @@ impl TimeZone {
 /// `/etc/localtime` is the answer. A `TZ` holding a POSIX rule string rather
 /// than a name has no file, and resolves to nothing here.
 fn local_zone_path() -> Option<PathBuf> {
+    zone_path(
+        std::env::var_os("TZ").as_deref(),
+        std::env::var_os("TZDIR").as_deref(),
+    )
+}
+
+fn zone_path(
+    name: Option<&std::ffi::OsStr>,
+    directory: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
     const DEFAULT_DIR: &str = "/usr/share/zoneinfo";
 
-    let Some(name) = std::env::var_os("TZ") else {
+    let Some(name) = name else {
         return Some(PathBuf::from("/etc/localtime"));
     };
     let name = name.to_str()?;
@@ -238,7 +242,7 @@ fn local_zone_path() -> Option<PathBuf> {
     {
         return None;
     }
-    let dir = std::env::var_os("TZDIR").map_or_else(|| PathBuf::from(DEFAULT_DIR), PathBuf::from);
+    let dir = directory.map_or_else(|| PathBuf::from(DEFAULT_DIR), PathBuf::from);
     Some(dir.join(name))
 }
 
@@ -444,6 +448,132 @@ mod tests {
         );
     }
 
+    // RFC 8536 sections 3.1 and 3.2: a version-1 header, signed 32-bit
+    // transition instants, type indices, six-byte type records and designations.
+    fn version_one(transitions: &[(i32, u8)], types: &[(i32, bool)]) -> Vec<u8> {
+        let mut bytes = b"TZif\0".to_vec();
+        bytes.resize(20, 0);
+        for count in [0, 0, 0, transitions.len() as u32, types.len() as u32, 4] {
+            bytes.extend(count.to_be_bytes());
+        }
+        for &(instant, _) in transitions {
+            bytes.extend(instant.to_be_bytes());
+        }
+        bytes.extend(transitions.iter().map(|&(_, index)| index));
+        for &(offset, daylight) in types {
+            bytes.extend(offset.to_be_bytes());
+            bytes.extend([u8::from(daylight), 0]);
+        }
+        bytes.extend(b"STD\0");
+        bytes
+    }
+
+    #[test]
+    fn version_one_signed_transitions_apply_at_the_exact_instant() {
+        let bytes = version_one(&[(-3600, 1), (3600, 0)], &[(1800, false), (3600, true)]);
+        let zone = TimeZone::parse(&bytes).unwrap();
+        for (instant, offset) in [(-3601, 1800), (-3600, 3600), (3599, 3600), (3600, 1800)] {
+            assert_eq!(zone.offset_at(instant), offset);
+        }
+    }
+
+    #[test]
+    fn before_first_transition_uses_type_zero_even_when_it_is_daylight_time() {
+        let bytes = version_one(&[(2_000_000_000, 1)], &[(3600, true), (0, false)]);
+        let zone = TimeZone::parse(&bytes).unwrap();
+        assert_eq!(zone.offset_at(1_000_000_000), 3600);
+        assert_eq!(zone.offset_at(1_999_999_999), 3600);
+        assert_eq!(zone.offset_at(2_000_000_000), 0);
+        assert_eq!(zone.offset_for_local(1_000_000_000), 3600);
+    }
+
+    #[test]
+    fn rejects_empty_types_invalid_indices_and_nonascending_transitions() {
+        for bytes in [
+            version_one(&[], &[]),
+            version_one(&[(0, 1)], &[(0, false)]),
+            version_one(&[(3600, 0), (0, 0)], &[(0, false)]),
+            version_one(&[(0, 0), (0, 0)], &[(0, false)]),
+        ] {
+            assert!(TimeZone::parse(&bytes).is_none());
+        }
+        let bytes = version_one(&[(0, 0)], &[(0, false)]);
+        // Every prefix missing transition/type data is incomplete.
+        for cut in 0..bytes.len() - 4 {
+            assert!(TimeZone::parse(&bytes[..cut]).is_none(), "cut {cut}");
+        }
+        let mut foreign = bytes;
+        foreign[..4].copy_from_slice(b"NOPE");
+        assert!(TimeZone::parse(&foreign).is_none());
+    }
+
+    #[test]
+    fn zone_paths_honor_colons_and_directories_without_parent_traversal() {
+        use std::ffi::OsStr;
+        use std::path::PathBuf;
+        assert_eq!(
+            super::zone_path(None, None),
+            Some(PathBuf::from("/etc/localtime"))
+        );
+        for name in [
+            "",
+            ":",
+            "Europe//London",
+            "Europe/../London",
+            "./Europe/London",
+            "Europe/./London",
+            "Europe/",
+        ] {
+            assert!(
+                super::zone_path(Some(OsStr::new(name)), None).is_none(),
+                "{name}"
+            );
+        }
+        for name in ["Europe/London", ":Europe/London"] {
+            assert_eq!(
+                super::zone_path(Some(OsStr::new(name)), None),
+                Some(PathBuf::from("/usr/share/zoneinfo/Europe/London")),
+            );
+            assert_eq!(
+                super::zone_path(Some(OsStr::new(name)), Some(OsStr::new("custom-zones"))),
+                Some(PathBuf::from("custom-zones/Europe/London")),
+            );
+        }
+        let absolute = std::env::current_dir().unwrap().join("chosen-zone");
+        for name in [
+            absolute.as_os_str().to_owned(),
+            format!(":{}", absolute.display()).into(),
+        ] {
+            assert_eq!(super::zone_path(Some(&name), None), Some(absolute.clone()));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert!(super::zone_path(Some(OsStr::from_bytes(&[0xff])), None).is_none());
+        }
+    }
+
+    #[test]
+    fn daylight_only_gap_uses_the_offset_at_the_reading_when_no_standard_type_exists() {
+        let bytes = version_one(&[(1_000_000_000, 1)], &[(3600, true), (7200, true)]);
+        let zone = TimeZone::parse(&bytes).unwrap();
+        assert_eq!(zone.offset_for_local(1_000_005_000), 7200);
+    }
+
+    #[test]
+    fn repeated_reading_retains_first_candidate_when_daylight_status_is_equal() {
+        // A political offset change can repeat a reading without changing
+        // daylight status. Both instants are valid; preserve the first match.
+        for daylight in [false, true] {
+            let bytes = version_one(&[(1_000_000_000, 1)], &[(7200, daylight), (3600, daylight)]);
+            let zone = TimeZone::parse(&bytes).unwrap();
+            let reading = 1_000_005_000;
+            assert_eq!(zone.offset_at(reading - 7200), 7200);
+            assert_eq!(zone.offset_at(reading - 3600), 3600);
+            assert_eq!(zone.offset_for_local(reading), 7200);
+        }
+    }
+
     /// A damaged or foreign file must not panic or be believed.
     #[test]
     fn rejects_files_that_are_not_a_usable_zone() {
@@ -451,13 +581,5 @@ mod tests {
         assert!(TimeZone::parse(b"not a tzif file at all").is_none());
         assert!(TimeZone::parse(&LONDON[..20]).is_none(), "truncated header");
         assert!(TimeZone::parse(&LONDON[..200]).is_none(), "truncated body");
-
-        // A type index pointing past the type table would index out of bounds.
-        let mut corrupt = LONDON.to_vec();
-        let indices_start = corrupt.len() - 40;
-        corrupt[indices_start] = 0xff;
-        // Either it is rejected or the byte landed somewhere harmless; what
-        // matters is that parsing never panics.
-        let _ = TimeZone::parse(&corrupt);
     }
 }
