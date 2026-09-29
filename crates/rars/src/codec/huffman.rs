@@ -234,12 +234,13 @@ fn limit_code_lengths(lengths: &mut [u8], frequencies: &[usize], max_bits: u8) {
         .sum();
 
     while sum > target {
-        let Some(symbol) = (0..lengths.len())
+        // If every used length were max_bits, sum would equal used, which
+        // the capacity check above bounds by target. An overfull code must
+        // therefore have a symbol whose length can still be increased.
+        let symbol = (0..lengths.len())
             .filter(|&symbol| lengths[symbol] != 0 && lengths[symbol] < max_bits)
             .min_by_key(|&symbol| (frequencies[symbol], std::cmp::Reverse(lengths[symbol])))
-        else {
-            break;
-        };
+            .expect("overfull prefix code has a short symbol");
         sum -= 1u64 << (max_bits - lengths[symbol] - 1);
         lengths[symbol] += 1;
     }
@@ -452,6 +453,61 @@ mod tests {
             .map(|&len| 1u64 << (max_len - len))
             .sum();
         sum == (1u64 << max_len)
+    }
+
+    #[test]
+    fn small_alphabets_have_non_overlapping_canonical_codes() {
+        for symbols in 2u32..=7 {
+            for mut pattern in 0..3usize.pow(symbols) {
+                let frequencies: Vec<_> = (0..symbols)
+                    .map(|_| {
+                        let frequency = pattern % 3;
+                        pattern /= 3;
+                        frequency
+                    })
+                    .collect();
+                let used = frequencies
+                    .iter()
+                    .filter(|&&frequency| frequency != 0)
+                    .count();
+                for max_bits in 1..=4 {
+                    let lengths = lengths_for_frequencies(&frequencies, max_bits);
+                    for (&frequency, &length) in frequencies.iter().zip(&lengths) {
+                        assert_eq!(frequency == 0, length == 0);
+                    }
+                    if used > 1usize << max_bits {
+                        // An impossible limit retains the documented uniform fallback.
+                        let uniform = (usize::BITS - (used - 1).leading_zeros()) as u8;
+                        assert!(lengths
+                            .iter()
+                            .all(|&length| length == 0 || length == uniform));
+                    } else {
+                        assert!(lengths.iter().all(|&length| length <= max_bits));
+                    }
+
+                    // Assign canonical integers independently, then occupy every
+                    // suffix below each prefix. No two symbols may share a slot.
+                    let depth = lengths.iter().copied().max().unwrap_or(0);
+                    let mut occupied = vec![false; 1usize << depth];
+                    let mut ordered: Vec<_> = lengths.iter().copied().filter(|&n| n != 0).collect();
+                    ordered.sort_unstable();
+                    let mut code = 0usize;
+                    let mut previous = 0;
+                    for length in ordered {
+                        code <<= length - previous;
+                        let start = code << (depth - length);
+                        let end = start + (1usize << (depth - length));
+                        assert!(end <= occupied.len(), "{frequencies:?}: {lengths:?}");
+                        for slot in &mut occupied[start..end] {
+                            assert!(!*slot, "{frequencies:?}: {lengths:?}");
+                            *slot = true;
+                        }
+                        code += 1;
+                        previous = length;
+                    }
+                }
+            }
+        }
     }
 
     #[test]
