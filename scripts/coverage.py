@@ -3,6 +3,7 @@
 
 Run with --branches --toolchain nightly for branch instrumentation. Native Rust
 and Python boundary coverage share a profile; JS and WASM are separate targets.
+Use --build-target to reuse an existing instrumented Cargo build directory.
 """
 from __future__ import annotations
 import argparse
@@ -176,11 +177,15 @@ def artifact_objects(messages):
     return objects
 
 
-def report(output, tools, manifest, source_files):
-    env = os.environ.copy()
-    env["CARGO_TARGET_DIR"] = str(ROOT / "target/coverage-tools")
-    if run(["cargo", "build", "--manifest-path", "scripts/coverage-tools/Cargo.toml", "--locked", "--offline"], env=env, log=output / "tools.log"):
-        raise RuntimeError("Coverage source helper failed; see tools.log")
+def report(output, build_target, tools, manifest, source_files):
+    helper_root = ROOT / "scripts/coverage-tools"
+    helper_binary = ROOT / "target/coverage-tools/debug/rars-coverage-tools"
+    helper_inputs = [helper_root / "Cargo.toml", helper_root / "Cargo.lock", *(helper_root / "src").rglob("*.rs")]
+    if not helper_binary.is_file() or any(path.stat().st_mtime > helper_binary.stat().st_mtime for path in helper_inputs):
+        env = os.environ.copy()
+        env["CARGO_TARGET_DIR"] = str(ROOT / "target/coverage-tools")
+        if run(["cargo", "build", "--manifest-path", "scripts/coverage-tools/Cargo.toml", "--locked", "--offline"], env=env, log=output / "tools.log"):
+            raise RuntimeError("Coverage source helper failed; see tools.log")
     profiles = sorted((output / "profraw").glob("*.profraw"))
     if not profiles:
         raise RuntimeError("No profiles produced")
@@ -192,7 +197,7 @@ def report(output, tools, manifest, source_files):
     # Cargo's artifact layout differs between stable and recent nightly builds.
     # Ask Cargo for its executable manifest instead of guessing a deps directory.
     build_env = os.environ.copy()
-    build_env.update(CARGO_TARGET_DIR=str(output), CARGO_PROFILE_DEV_OPT_LEVEL="1", CARGO_PROFILE_DEV_DEBUG="1", LLVM_PROFILE_FILE=str(output / "profraw/%p-%m.profraw"))
+    build_env.update(CARGO_TARGET_DIR=str(build_target), CARGO_PROFILE_DEV_OPT_LEVEL="1", CARGO_PROFILE_DEV_DEBUG="1", LLVM_PROFILE_FILE=str(output / "profraw/%p-%m.profraw"))
     build_env["RUSTFLAGS"] = "-Cinstrument-coverage" + (" -Zcoverage-options=branch" if manifest["branches"] else "")
     toolchain = manifest.get("toolchain") or ("nightly" if "nightly" in manifest["rustc"] else None)
     cargo = ["cargo"] + ([f"+{toolchain}"] if toolchain else [])
@@ -200,7 +205,7 @@ def report(output, tools, manifest, source_files):
     if run(cargo + ["test", "--workspace", "--tests", "--no-run", "--locked", "--message-format=json"], env=build_env, log=artifact_log):
         raise RuntimeError("Cannot collect executable manifest; see cargo-artifacts.jsonl")
     objects = artifact_objects(artifact_log.read_text())
-    for path in [output / "debug/rars", output / "python/rars.abi3.so"]:
+    for path in [build_target / "debug/rars", output / "python/rars.abi3.so"]:
         if path.is_file():
             objects.append(path)
     if not objects:
@@ -256,12 +261,14 @@ def report(output, tools, manifest, source_files):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=ROOT / "target/coverage")
+    parser.add_argument("--build-target", type=Path, help="Reuse an instrumented Cargo target directory (defaults to --output)")
     parser.add_argument("--toolchain")
     parser.add_argument("--branches", action="store_true")
     parser.add_argument("--reuse", action="store_true", help="Regenerate reports from existing profiles; source fingerprint must match")
     parser.add_argument("--python", type=Path, default=ROOT / ".venv/bin/python", help="Python with pytest installed; its native boundary suite is included")
     args = parser.parse_args()
     output = args.output.resolve()
+    build_target = (args.build_target or output).resolve()
     tools, version = llvm_tools(args.toolchain)
     if args.branches and "nightly" not in version:
         raise RuntimeError("Branch instrumentation requires --toolchain nightly")
@@ -272,15 +279,17 @@ def main():
             raise RuntimeError("Compiler differs from profiling; select the original toolchain or collect fresh profiles")
         if manifest["source_sha256"] != fingerprint:
             raise RuntimeError("Source changed since profiling; collect fresh profiles instead of reusing stale coverage")
+        if manifest.get("build_target", str(output)) != str(build_target):
+            raise RuntimeError("Build target differs from profiling; select the original build target")
     else:
         if (output / "profraw").exists():
             raise RuntimeError("Output already contains profiles; use --reuse or a fresh --output directory")
         (output / "profraw").mkdir(parents=True)
         manifest = {"revision": capture(["git", "rev-parse", "HEAD"]).strip(), "working_tree": capture(["git", "status", "--porcelain"]),
                     "source_sha256": fingerprint, "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(), "host": platform.platform(),
-                    "rustc": version, "toolchain": args.toolchain, "branches": args.branches, "steps": {}}
+                    "rustc": version, "toolchain": args.toolchain, "branches": args.branches, "build_target": str(build_target), "steps": {}}
         env = os.environ.copy()
-        env.update(CARGO_TARGET_DIR=str(output), CARGO_PROFILE_DEV_OPT_LEVEL="1", CARGO_PROFILE_DEV_DEBUG="1", LLVM_PROFILE_FILE=str(output / "profraw/%p-%m.profraw"))
+        env.update(CARGO_TARGET_DIR=str(build_target), CARGO_PROFILE_DEV_OPT_LEVEL="1", CARGO_PROFILE_DEV_DEBUG="1", LLVM_PROFILE_FILE=str(output / "profraw/%p-%m.profraw"))
         env["RUSTFLAGS"] = "-Cinstrument-coverage" + (" -Zcoverage-options=branch" if args.branches else "")
         manifest["environment"] = {key: env[key] for key in ["CARGO_TARGET_DIR", "CARGO_PROFILE_DEV_OPT_LEVEL", "CARGO_PROFILE_DEV_DEBUG", "LLVM_PROFILE_FILE", "RUSTFLAGS"]}
         cargo = ["cargo"] + ([f"+{args.toolchain}"] if args.toolchain else [])
@@ -289,11 +298,11 @@ def main():
         if manifest["steps"]["python_build"] == 0:
             import shutil
             (output / "python").mkdir()
-            shutil.copy2(output / "debug/librars.so", output / "python/rars.abi3.so")
+            shutil.copy2(build_target / "debug/librars.so", output / "python/rars.abi3.so")
             env["PYTHONPATH"] = str(output / "python")
             manifest["steps"]["python_tests"] = run([args.python, "-m", "pytest", "-q", "python/tests", "--basetemp", output / "pytest-tmp"], env=env, log=output / "python-tests.log")
         (output / "manifest.json").write_text(json.dumps(manifest, indent=2))
-    report(output, tools, manifest, source_files)
+    report(output, build_target, tools, manifest, source_files)
     return int(any(manifest["steps"].values()))
 
 
