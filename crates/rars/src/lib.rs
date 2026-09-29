@@ -1179,6 +1179,14 @@ impl RecoveryRepairResult {
         cancellation: Option<&ReadCancellation>,
     ) -> Result<()> {
         let control = crate::read_control::ReadControl::new(cancellation);
+        self.write_to_path_controlled(path, &control)
+    }
+
+    fn write_to_path_controlled(
+        &self,
+        path: &std::path::Path,
+        control: &crate::read_control::ReadControl,
+    ) -> Result<()> {
         control.check()?;
         let (mut pending, output) = crate::builder::PendingArchive::create(path)?;
         {
@@ -1725,6 +1733,34 @@ mod tests {
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep these bytes");
         assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 1);
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn recovery_publication_cancellation_at_each_checkpoint_preserves_destination() {
+        let root = crate::scratch::case("recovery-publication-checkpoints");
+        let destination = root.join("archive.rar");
+        let result = RecoveryRepairResult {
+            // Three writes, including a partial final chunk.
+            data: vec![7; 2 * 64 * 1024 + 1],
+            report: RecoveryRepairReport::default(),
+        };
+        for successful_checks in 0..=6 {
+            std::fs::write(&destination, b"original archive").unwrap();
+            let token = ReadCancellation::new();
+            let control = crate::read_control::ReadControl::new(Some(&token));
+            control.cancel_after_checks(successful_checks);
+            let published = result.write_to_path_controlled(&destination, &control);
+            if successful_checks < 6 {
+                assert_eq!(published.unwrap_err(), Error::Cancelled);
+                assert!(token.is_cancelled());
+                assert_eq!(std::fs::read(&destination).unwrap(), b"original archive");
+            } else {
+                published.unwrap();
+                assert!(!token.is_cancelled());
+                assert_eq!(std::fs::read(&destination).unwrap(), result.data);
+            }
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        }
     }
 
     #[test]
