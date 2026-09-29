@@ -20,7 +20,6 @@ const SIGMA: [[usize; 16]; 10] = [
     [10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0],
 ];
 
-#[derive(Clone)]
 struct Blake2s {
     h: [u32; 8],
     t: u64,
@@ -54,9 +53,9 @@ impl Blake2s {
     }
 
     fn update(&mut self, mut input: &[u8]) {
-        if input.is_empty() {
-            return;
-        }
+        // Stripe updates are one 64-byte block, final leaf tails are 1..=64
+        // bytes, and the root consumes one 32-byte leaf digest at a time.
+        debug_assert!(!input.is_empty() && input.len() <= BLOCK_BYTES);
         if self.buflen > 0 {
             let fill = BLOCK_BYTES - self.buflen;
             if input.len() > fill {
@@ -71,14 +70,6 @@ impl Blake2s {
                 self.buflen += input.len();
                 return;
             }
-        }
-        while input.len() > BLOCK_BYTES {
-            self.t = self.t.wrapping_add(BLOCK_BYTES as u64);
-            self.compress(
-                input[..BLOCK_BYTES].try_into().expect("block length"),
-                false,
-            );
-            input = &input[BLOCK_BYTES..];
         }
         self.buf[..input.len()].copy_from_slice(input);
         self.buflen = input.len();
@@ -242,6 +233,81 @@ mod tests {
             hex(&hash(b"abc")),
             "70f75b58f1fecab821db43c88ad84edde5a52600616cd22517b7bb14d440a7d5"
         );
+    }
+
+    #[test]
+    fn block_and_stripe_boundaries_match_independent_tree_hash_vectors() {
+        // Python hashlib.blake2s oracle: distribute consecutive 64-byte
+        // blocks over eight leaves, fanout=8, depth=2, inner_size=32,
+        // node_offset=leaf index, node_depth=0, last_node on leaf 7. Hash
+        // their concatenated digests at node_depth=1, last_node=true.
+        // The same oracle reproduces both public vectors above.
+        for (length, expected) in [
+            (
+                1,
+                "a6b9eecc25227ad788c99d3f236debc8da408849e9a5178978727a81457f7239",
+            ),
+            (
+                63,
+                "1024c940be7341449b5010522b509f65bbdc1287b455c2bb7f72b2c92fd0d189",
+            ),
+            (
+                64,
+                "52603b6cbfad4966cb044cb267568385cf35f21e6c45cf30aed19832cb51e9f5",
+            ),
+            (
+                65,
+                "fff24d3cc729d395daf978b0157306cb495797e6c8dca1731d2f6f81b849baae",
+            ),
+            (
+                127,
+                "a626543c271fccc3e4450b48d66bc9cbdeb25e5d077a6213cd90cbbd0fd22076",
+            ),
+            (
+                511,
+                "8e1e8ee1ffa0a01028fff3bff0ae9df2565a82e55a04e9541bb78b9c4778336f",
+            ),
+            (
+                512,
+                "8d9e357863298dd8364b7caf4234317f8a49f180d788b7abffb521925f1e1ff1",
+            ),
+            (
+                513,
+                "8a4bc3330497e681f15daf24fc496044a1c32bf0a837a210399e1ae4af7e92be",
+            ),
+            (
+                1023,
+                "0db3cb64828effe5b2aa6be5e865121f03226cca6423b8841b1019cfad09ac09",
+            ),
+            (
+                1024,
+                "48467549502e2d3f422870bfb1d09bce71a065735763bf654582cf46a5112793",
+            ),
+            (
+                1025,
+                "04e03e65b8f19a5f46288802b2a515bab73363262caa300ae75c0eb29c016e5a",
+            ),
+            (
+                4097,
+                "055d3f5f5440fe6c8dd0dcceb503b93caa03a533b71b1e47b4fdcb5577b8762a",
+            ),
+        ] {
+            let input: Vec<_> = (0..length).map(|i| (i % 251) as u8).collect();
+            assert_eq!(hex(&hash(&input)), expected, "length={length}");
+            for chunk_size in [1, 31, 32, 63, 64, 65, 127, 511, 512, 513] {
+                let mut hasher = Hasher::new();
+                hasher.update(&[]);
+                for chunk in input.chunks(chunk_size) {
+                    hasher.update(chunk);
+                    hasher.update(&[]);
+                }
+                assert_eq!(
+                    hex(&hasher.finalize()),
+                    expected,
+                    "length={length}, chunk_size={chunk_size}"
+                );
+            }
+        }
     }
 
     #[test]
