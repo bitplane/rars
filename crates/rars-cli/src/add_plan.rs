@@ -276,6 +276,194 @@ mod tests {
     use super::*;
 
     #[test]
+    fn flags_filters_and_conflicts_have_actionable_messages() {
+        let cases = [
+            (
+                AskedFilters {
+                    delta: true,
+                    ..Default::default()
+                },
+                "--delta-filter",
+                FilterKind::Delta { channels: 1 },
+            ),
+            (
+                AskedFilters {
+                    e8: true,
+                    ..Default::default()
+                },
+                "--e8-filter",
+                FilterKind::E8,
+            ),
+            (
+                AskedFilters {
+                    e8e9: true,
+                    ..Default::default()
+                },
+                "--e8e9-filter",
+                FilterKind::E8,
+            ),
+            (
+                AskedFilters {
+                    itanium: true,
+                    ..Default::default()
+                },
+                "--itanium-filter",
+                FilterKind::Itanium,
+            ),
+            (
+                AskedFilters {
+                    rgb: true,
+                    ..Default::default()
+                },
+                "--rgb-filter",
+                FilterKind::Rgb { width: 3, pos_r: 0 },
+            ),
+            (
+                AskedFilters {
+                    audio: true,
+                    ..Default::default()
+                },
+                "--audio-filter",
+                FilterKind::Audio { channels: 1 },
+            ),
+            (
+                AskedFilters {
+                    arm: true,
+                    ..Default::default()
+                },
+                "--arm-filter",
+                FilterKind::Arm,
+            ),
+        ];
+        for (filters, flag, kind) in cases {
+            assert_eq!(flag_for(WriterOption::Filter, &filters), flag);
+            assert_eq!(asked_filter_kind(&filters), Some(kind));
+            assert_eq!(filters.count(), 1);
+            assert!(reject_multiple_filters(&filters).is_ok());
+            assert!(reject_coding_without_compression(&filters, false, false)
+                .unwrap_err()
+                .to_string()
+                .starts_with(flag));
+        }
+        let none = AskedFilters::default();
+        assert_eq!(flag_for(WriterOption::Filter, &none), "--auto-filter");
+        assert_eq!(asked_filter_kind(&none), None);
+        assert!(reject_coding_without_compression(&none, false, false).is_ok());
+        assert!(reject_coding_without_compression(&none, true, false)
+            .unwrap_err()
+            .to_string()
+            .starts_with("--auto-filter"));
+        assert!(reject_coding_without_compression(&none, true, true)
+            .unwrap_err()
+            .to_string()
+            .starts_with("--ppmd"));
+        let aliases = AskedFilters {
+            e8: true,
+            e8e9: true,
+            ..Default::default()
+        };
+        assert_eq!(aliases.count(), 1);
+        let multiple = AskedFilters {
+            delta: true,
+            arm: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            reject_multiple_filters(&multiple).unwrap_err().exit_code(),
+            2
+        );
+    }
+
+    #[test]
+    fn solid_filter_refusals_depend_on_family_and_request() {
+        let none = AskedFilters::default();
+        let delta = AskedFilters {
+            delta: true,
+            ..Default::default()
+        };
+        assert!(reject_filter_with_solid(ArchiveVersion::Rar50, &delta, false, false).is_ok());
+        assert!(reject_filter_with_solid(ArchiveVersion::Rar29, &delta, false, true).is_ok());
+        assert!(reject_filter_with_solid(ArchiveVersion::Rar50, &none, false, true).is_ok());
+        assert!(
+            reject_filter_with_solid(ArchiveVersion::Rar50, &none, true, true)
+                .unwrap_err()
+                .to_string()
+                .starts_with("--auto-filter")
+        );
+        assert!(
+            reject_filter_with_solid(ArchiveVersion::Rar70, &delta, false, true)
+                .unwrap_err()
+                .to_string()
+                .starts_with("--delta-filter")
+        );
+        assert!(reject_unsupported_filter(ArchiveVersion::Rar50, &none).is_ok());
+        assert!(reject_unsupported_filter(ArchiveVersion::Rar50, &delta).is_ok());
+    }
+
+    #[test]
+    fn refusals_cover_every_current_option_and_preserve_other_errors() {
+        let flags = [
+            "--solid",
+            "--encrypt-headers",
+            "--quick-open",
+            "--level",
+            "--ppmd",
+            "--dict-size",
+            "--auto-filter",
+            "--recovery-percent",
+            "--volume-size",
+            "--comment",
+            "--file-comment",
+            "--archive-name",
+            "--password",
+            "--memory-limit",
+            "--temp-dir",
+        ];
+        for (option, flag) in WriterOption::ALL.into_iter().zip(flags) {
+            assert_eq!(flag_for(option, &AskedFilters::default()), flag);
+        }
+        let error = map_write_error(
+            rars::Error::InvalidHeader("broken"),
+            PlanShape::new(),
+            &AskedFilters::default(),
+        );
+        assert_eq!(error.exit_code(), 1);
+        assert_eq!(
+            error.to_string(),
+            rars::Error::InvalidHeader("broken").to_string()
+        );
+        assert_eq!(format_list(vec![], ArchiveVersion::Rar50), "");
+        assert_eq!(
+            format_list(
+                vec![
+                    ArchiveVersion::Rar13,
+                    ArchiveVersion::Rar50,
+                    ArchiveVersion::Rar29
+                ],
+                ArchiveVersion::Rar50
+            ),
+            "; use --format rar29"
+        );
+        let shape = PlanShape::new()
+            .compressed(true)
+            .filtered(true)
+            .volumes(true);
+        let error = reject_unsupported(
+            ArchiveVersion::Rar50,
+            shape,
+            &AskedFilters::default(),
+            &[
+                (WriterOption::FileComment, false),
+                (WriterOption::ArchiveMetadata, true),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.to_string().contains("--archive-name"));
+        assert!(error.to_string().contains("in a volume set"), "{error}");
+    }
+
+    #[test]
     fn a_refusal_names_the_flag_that_was_typed() {
         let filters = AskedFilters {
             rgb: true,
