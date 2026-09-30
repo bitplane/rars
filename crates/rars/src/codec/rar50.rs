@@ -3912,21 +3912,16 @@ impl<B: Budget> StreamingOutput<B> {
             return Err(Error::InvalidData("RAR 5 match exceeds output limit").into());
         }
         self.flush(sink)?;
+        // copy_match only reaches this path with an initialized positive
+        // distance. Either retained history exists, or flushing the pending
+        // zero literals retains at least one byte (the dictionary is nonzero).
+        debug_assert!(!self.history.is_empty());
         sink(DecodedChunk::Repeated {
             byte: 0,
             len: count,
         })
         .map_err(StreamDecodeError::Sink)?;
         self.written += count;
-        // decode_member_to rejects zero dictionary sizes before constructing
-        // this output, so a zero fill always has room for one history byte.
-        if self.history.is_empty() {
-            self.history = super::workspace::Deque::from_buffer(Buffer::filled(
-                1,
-                0,
-                &self.history.allowance(),
-            )?);
-        }
         Ok(())
     }
 
@@ -10202,7 +10197,7 @@ mod tests {
         ));
 
         let mut zero_chunk =
-            StreamingOutput::new(Buffer::new(&Allowance::default()), 1, 2, 2).unwrap();
+            StreamingOutput::new(Buffer::from_vec(vec![0]), 1, 2, 2).unwrap();
         assert!(matches!(
             zero_chunk.push_zeroes(1, &mut |_chunk| Err("sink")),
             Err(StreamDecodeError::Sink("sink"))
@@ -10440,7 +10435,7 @@ mod tests {
         assert_eq!(repeated.written(), 0);
         assert!(emitted.borrow().is_empty());
 
-        let mut zeroes = StreamingOutput::new(Buffer::new(&Allowance::default()), 1, 1, 1).unwrap();
+        let mut zeroes = StreamingOutput::new(Buffer::from_vec(vec![0]), 1, 1, 1).unwrap();
         assert!(matches!(
             zeroes.push_zeroes(2, &mut sink),
             Err(StreamDecodeError::Decode(Error::InvalidData(
@@ -10457,10 +10452,10 @@ mod tests {
     #[test]
     fn virtual_zero_history_does_not_overallocate_a_tiny_dictionary() {
         let mut output =
-            StreamingOutput::new(Buffer::new(&Allowance::default()), 100_000, 1, 1).unwrap();
+            StreamingOutput::new(Buffer::from_vec(vec![0]), 100_000, 1, 1).unwrap();
         let mut emitted = 0;
         output
-            .copy_match(0, 100_000, &mut |chunk| {
+            .copy_match(1, 100_000, &mut |chunk| {
                 let DecodedChunk::Repeated { byte: 0, len } = chunk else {
                     panic!("expected virtual zeros")
                 };
@@ -10471,6 +10466,168 @@ mod tests {
         assert_eq!(emitted, 100_000);
         assert_eq!(output.history.iter().copied().collect::<Vec<_>>(), [0]);
         assert_eq!(output.history.capacity(), 1);
+    }
+
+    #[test]
+    fn virtual_zero_history_flush_refusal_releases_streaming_charge() {
+        let budget = RefusingBudget::new(1);
+        {
+            let mut output = StreamingOutput::new(Buffer::new(&budget), 3, 1, 1).unwrap();
+            output
+                .push(0, &mut |_| Ok::<(), std::convert::Infallible>(()))
+                .unwrap();
+            let mut emitted = Vec::new();
+            let error = output
+                .copy_match(1, 2, &mut |chunk| {
+                    let DecodedChunk::Bytes(bytes) = chunk else {
+                        panic!("expected initial literal")
+                    };
+                    emitted.extend_from_slice(bytes);
+                    Ok::<(), std::convert::Infallible>(())
+                })
+                .unwrap_err();
+            assert!(matches!(error, StreamDecodeError::Decode(Error::Cancelled)));
+            // The initial literal is streamed before retaining its history fails.
+            assert_eq!(emitted, [0]);
+            assert_eq!(output.written(), 1);
+            assert!(output.history.is_empty());
+            assert_eq!(budget.attempts(), 2);
+        }
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn streaming_flush_preserves_dictionary_tail_with_excess_allocation_capacity() {
+        let mut output = StreamingOutput::new(Buffer::from_vec(b"ABC".to_vec()), 1, 3, 3).unwrap();
+        // Model an allocator returning more capacity than requested. Vec's
+        // public contract permits this even though this host allocates exactly.
+        let mut history = Vec::with_capacity(8);
+        history.extend_from_slice(b"ABC");
+        output.history = super::super::workspace::Deque::from_buffer(Buffer::from_vec(history));
+        assert!(output.history.capacity() > output.history_limit);
+        let mut emitted = Vec::new();
+        let mut sink = |chunk: DecodedChunk<'_>| {
+            let DecodedChunk::Bytes(bytes) = chunk else {
+                panic!("expected bytes")
+            };
+            emitted.extend_from_slice(bytes);
+            Ok::<(), std::convert::Infallible>(())
+        };
+        output.push(b'D', &mut sink).unwrap();
+        output.finish(&mut sink).unwrap();
+        assert_eq!(emitted, b"D");
+        assert_eq!(output.history.iter().copied().collect::<Vec<_>>(), b"BCD");
+    }
+
+    #[test]
+    fn initial_repeat_distance_zero_is_rejected_before_streaming_output() {
+        let mut lengths = TableLengths {
+            main: vec![0; MAIN_TABLE_SIZE],
+            distance: vec![0; DISTANCE_TABLE_SIZE_50],
+            align: vec![0; ALIGN_TABLE_SIZE],
+            length: vec![0; LENGTH_TABLE_SIZE],
+        };
+        lengths.main[b'A' as usize] = 1;
+        lengths.main[258] = 1;
+        lengths.length[0] = 1;
+        lengths.length[1] = 1;
+        let (bytes, bit_pos) = encode_table_lengths_with_bit_count(&lengths, 0).unwrap();
+        let mut writer = BitWriter {
+            bytes: Buffer::from_vec(bytes),
+            bit_pos,
+        };
+        writer.write_bits(1, 1); // Repeat the still-zero first distance.
+        writer.write_bits(0, 1); // Length two.
+        let payload_bits = writer.bit_pos;
+        let packed = encode_compressed_block(&writer.finish(), payload_bits, true, true).unwrap();
+        assert_eq!(
+            decode_lz(&packed, 0, 2),
+            Err(Error::InvalidData(
+                "RAR 5 repeat distance is not initialized"
+            ))
+        );
+        let mut decoder = Unpack50Decoder::new();
+        let mut emitted = Vec::new();
+        let error = decoder
+            .decode_member_from_reader_with_dictionary_to_sink(
+                &mut packed.as_slice(),
+                0,
+                2,
+                1,
+                false,
+                |chunk| {
+                    match chunk {
+                        DecodedChunk::Bytes(bytes) => emitted.extend_from_slice(bytes),
+                        DecodedChunk::Repeated { byte, len } => {
+                            emitted.extend(std::iter::repeat_n(byte, len))
+                        }
+                    }
+                    Ok::<(), std::convert::Infallible>(())
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            StreamDecodeError::Decode(Error::InvalidData(
+                "RAR 5 repeat distance is not initialized"
+            ))
+        ));
+        assert!(emitted.is_empty());
+    }
+
+    #[test]
+    fn zero_literal_and_initialized_matches_stream_virtual_zero_history() {
+        let mut lengths = TableLengths {
+            main: vec![0; MAIN_TABLE_SIZE],
+            distance: vec![0; DISTANCE_TABLE_SIZE_50],
+            align: vec![0; ALIGN_TABLE_SIZE],
+            length: vec![0; LENGTH_TABLE_SIZE],
+        };
+        lengths.main[0] = 1;
+        lengths.main[258] = 2;
+        lengths.main[262] = 2;
+        lengths.distance[0] = 1;
+        lengths.distance[1] = 1;
+        lengths.length[0] = 1;
+        lengths.length[1] = 1;
+        let (bytes, bit_pos) = encode_table_lengths_with_bit_count(&lengths, 0).unwrap();
+        let mut writer = BitWriter {
+            bytes: Buffer::from_vec(bytes),
+            bit_pos,
+        };
+        writer.write_bits(0, 1); // Zero literal.
+        writer.write_bits(3, 2); // New match: length two.
+        writer.write_bits(0, 1); // Distance one.
+        writer.write_bits(2, 2); // Repeat distance one.
+        writer.write_bits(0, 1); // Length two.
+        let payload_bits = writer.bit_pos;
+        let packed = encode_compressed_block(&writer.finish(), payload_bits, true, true).unwrap();
+        assert_eq!(decode_lz(&packed, 0, 5).unwrap(), [0; 5]);
+        let mut decoder = Unpack50Decoder::new();
+        let mut bytes = Vec::new();
+        let mut virtual_bytes = 0;
+        decoder
+            .decode_member_from_reader_with_dictionary_to_sink(
+                &mut packed.as_slice(),
+                0,
+                5,
+                1,
+                false,
+                |chunk| {
+                    match chunk {
+                        DecodedChunk::Bytes(literals) => bytes.extend_from_slice(literals),
+                        DecodedChunk::Repeated { byte, len } => {
+                            assert_eq!(byte, 0);
+                            virtual_bytes += len;
+                            bytes.extend(std::iter::repeat_n(byte, len));
+                        }
+                    }
+                    Ok::<(), std::convert::Infallible>(())
+                },
+            )
+            .unwrap();
+        assert_eq!(bytes, [0; 5]);
+        assert_eq!(virtual_bytes, 4);
     }
 
     #[test]
