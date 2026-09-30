@@ -841,7 +841,13 @@ impl Archive {
                 &control,
             )?;
         if available == expected || self.sfx_offset != 0 {
-            return self.repair_recovery_to_legacy(writer, password, available, expected, &control);
+            return self.repair_recovery_to_legacy(
+                writer,
+                &recovery_data,
+                available,
+                expected,
+                &control,
+            );
         }
         let bytes = self.read_range(0..self.source_len()?)?;
         let options = crate::recovery::rar5::InlineRepairOptions {
@@ -867,11 +873,12 @@ impl Archive {
     fn repair_recovery_to_legacy(
         &self,
         writer: &mut dyn Write,
-        password: Option<&[u8]>,
+        recovery_data: &[u8],
         available: u64,
         expected: u64,
         control: &crate::read_control::ReadControl,
     ) -> Result<crate::RecoveryRepairReport> {
+        control.check()?;
         let recovery = self.recovery_service()?;
         let prefix_start = self.sfx_offset;
         let prefix_end = recovery
@@ -888,9 +895,6 @@ impl Archive {
                 "RAR 5 recovery prefix is out of bounds",
             ));
         }
-        let recovery_data = recovery
-            .decoded_recovery_data(self, password, control)
-            .map_err(|error| error.at_entry(recovery.name.clone(), "reading recovery data"))?;
         let prefix_len = prefix_end
             .checked_sub(prefix_start)
             .ok_or(Error::InvalidHeader(
@@ -899,7 +903,7 @@ impl Archive {
         let repaired_shards =
             crate::recovery::rar5::repair_inline_recovery_prefix_shards_with_control(
                 prefix_len,
-                &recovery_data,
+                recovery_data,
                 |range| {
                     let start = prefix_start
                         .checked_add(range.start)
