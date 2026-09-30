@@ -471,6 +471,274 @@ mod tests {
         crate::scratch::case(&format!("rars-output-{name}"))
     }
 
+    #[test]
+    fn path_validation_rejects_empty_drive_root_and_parent_names() {
+        use super::*;
+        let dir = scratch("path-validation");
+        for name in [
+            b"".as_slice(),
+            b".",
+            b"./",
+            b"C:relative",
+            b"z:/absolute",
+            b"/absolute",
+            b"../escape",
+            b"name\0suffix",
+        ] {
+            assert!(output_relative_path(name).is_err(), "{name:?}");
+            let meta = ExtractedEntryMeta::new(name.to_vec(), None, 0, false);
+            assert!(output_path_for_entry(&dir, &meta).is_err());
+        }
+        for path in [
+            Path::new("../escape"),
+            Path::new("/absolute"),
+            Path::new("."),
+        ] {
+            assert!(checked_output_path(&dir, path).is_err());
+        }
+        assert_eq!(
+            output_relative_path(b"./nested/./file").unwrap(),
+            Path::new("nested/file")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writers_refuse_symlink_parents_and_redirections_report_permission_errors() {
+        use super::*;
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = scratch("output-filesystem-errors");
+        let target = dir.join("target");
+        fs::create_dir(&target).unwrap();
+        symlink(&target, dir.join("link")).unwrap();
+        let meta = ExtractedEntryMeta::new(b"link/child".to_vec(), None, 0, false);
+        assert!(
+            open_output_writer(&dir, &meta, OverwritePolicy::Always, Backslash::Separator).is_err()
+        );
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+        let locked = dir.join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
+        let permission_bits_enforced = fs::write(locked.join("probe"), b"probe").is_err();
+        let (mut meta, mut redirection) = redirection_fixture();
+        meta.name = b"locked/child".to_vec();
+        redirection.redirection_type = FSREDIR_UNIX_SYMLINK;
+        redirection.target_name = b"target".to_vec();
+        let result = create_rar50_redirection(
+            &dir,
+            &meta,
+            &redirection,
+            OverwritePolicy::Always,
+            &HashMap::new(),
+        );
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+        if !permission_bits_enforced {
+            eprintln!("permission-denial case unavailable on privileged runner");
+            return;
+        }
+        assert!(result.is_err());
+        assert!(!locked.join("child").exists());
+    }
+
+    #[test]
+    fn output_creation_preserves_existing_files_on_refusal() {
+        use super::*;
+        let dir = scratch("writer-errors");
+        let mut meta = ExtractedEntryMeta::new(b"existing".to_vec(), None, 0, false);
+        fs::write(dir.join("existing"), b"keep").unwrap();
+        assert!(
+            open_output_writer(&dir, &meta, OverwritePolicy::Never, Backslash::Separator).is_err()
+        );
+        assert_eq!(fs::read(dir.join("existing")).unwrap(), b"keep");
+        for name in [b"../escape".as_slice(), b"invalid\0name"] {
+            meta.name = name.to_vec();
+            assert!(
+                open_output_writer(&dir, &meta, OverwritePolicy::Always, Backslash::Separator)
+                    .is_err()
+            );
+        }
+        meta.name = b"existing/child".to_vec();
+        for directory in [false, true] {
+            meta.is_directory = directory;
+            assert!(
+                open_output_writer(&dir, &meta, OverwritePolicy::Always, Backslash::Separator)
+                    .is_err()
+            );
+        }
+        assert_eq!(fs::read(dir.join("existing")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn redirections_replace_empty_directories_but_preserve_nonempty_ones() {
+        use super::*;
+        let dir = scratch("redirection-directories");
+        let (mut meta, mut redirection) = redirection_fixture();
+        meta.name = b"destination".to_vec();
+        redirection.redirection_type = FSREDIR_FILE_COPY;
+        redirection.target_name = b"source".to_vec();
+        let source = dir.join("source");
+        fs::write(&source, b"payload").unwrap();
+        let created = HashMap::from([(PathBuf::from("source"), source)]);
+        let destination = dir.join("destination");
+        fs::create_dir(&destination).unwrap();
+        assert!(create_rar50_redirection(
+            &dir,
+            &meta,
+            &redirection,
+            OverwritePolicy::Never,
+            &created
+        )
+        .is_err());
+        assert!(destination.is_dir());
+        fs::write(destination.join("keep"), b"keep").unwrap();
+        assert!(create_rar50_redirection(
+            &dir,
+            &meta,
+            &redirection,
+            OverwritePolicy::Always,
+            &created
+        )
+        .is_err());
+        assert_eq!(fs::read(destination.join("keep")).unwrap(), b"keep");
+        fs::remove_file(destination.join("keep")).unwrap();
+        create_rar50_redirection(&dir, &meta, &redirection, OverwritePolicy::Always, &created)
+            .unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"payload");
+        let error =
+            prepare_redirection_destination(&destination.join("child"), OverwritePolicy::Always)
+                .unwrap_err();
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(fs::read(&destination).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn redirection_filesystem_and_path_errors_are_reported() {
+        use super::*;
+        let dir = scratch("redirection-errors");
+        let (mut meta, mut redirection) = redirection_fixture();
+        meta.name = b"destination".to_vec();
+        let destination = dir.join("destination");
+        fs::write(&destination, b"keep").unwrap();
+        for kind in [FSREDIR_HARDLINK, FSREDIR_FILE_COPY] {
+            redirection.redirection_type = kind;
+            redirection.target_name = b"../escape".to_vec();
+            assert!(create_rar50_redirection(
+                &dir,
+                &meta,
+                &redirection,
+                OverwritePolicy::Always,
+                &HashMap::new()
+            )
+            .is_err());
+            assert_eq!(fs::read(&destination).unwrap(), b"keep");
+        }
+        redirection.redirection_type = FSREDIR_FILE_COPY;
+        redirection.target_name = b"source".to_vec();
+        let source = dir.join("source");
+        fs::write(&source, b"payload").unwrap();
+        let created = HashMap::from([(PathBuf::from("source"), source.clone())]);
+        for name in [b"../escape".as_slice(), b"destination/child"] {
+            meta.name = name.to_vec();
+            for kind in [FSREDIR_FILE_COPY, FSREDIR_HARDLINK, FSREDIR_UNIX_SYMLINK] {
+                redirection.redirection_type = kind;
+                assert!(create_rar50_redirection(
+                    &dir,
+                    &meta,
+                    &redirection,
+                    OverwritePolicy::Always,
+                    &created
+                )
+                .is_err());
+                assert_eq!(fs::read(&destination).unwrap(), b"keep");
+            }
+        }
+        // Previously extracted sources can disappear before a later redirection.
+        fs::remove_file(&source).unwrap();
+        meta.name = b"new-destination".to_vec();
+        for kind in [FSREDIR_HARDLINK, FSREDIR_FILE_COPY] {
+            redirection.redirection_type = kind;
+            assert!(create_rar50_redirection(
+                &dir,
+                &meta,
+                &redirection,
+                OverwritePolicy::Always,
+                &created
+            )
+            .is_err());
+            assert!(!dir.join("new-destination").exists());
+        }
+    }
+
+    #[test]
+    fn metadata_restoration_errors_and_opt_out_are_observable() {
+        use super::*;
+        let dir = scratch("metadata-errors");
+        for directory in [false, true] {
+            for timestamp in [None, Some(1_704_067_200)] {
+                let output = ExtractedOutput {
+                    name: b"missing".to_vec(),
+                    path: dir.join("missing"),
+                    meta: ExtractedEntryMeta::new(
+                        b"missing".to_vec(),
+                        timestamp,
+                        if directory { 0o040700 } else { 0o100600 },
+                        directory,
+                    )
+                    .with_attr_source(AttrSource::Unix),
+                    family: ArchiveFamily::Rar50Plus,
+                    restore_metadata: false,
+                };
+                restore_output_metadata(std::slice::from_ref(&output)).unwrap();
+                #[cfg(unix)]
+                {
+                    let output = ExtractedOutput {
+                        restore_metadata: true,
+                        ..output
+                    };
+                    assert!(restore_output_metadata(&[output]).is_err());
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permissions_respect_attribute_source_and_type_bits() {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("permission-policy");
+        for (source, attr, directory, expected) in [
+            (AttrSource::Dos, 0, false, 0o640),
+            (AttrSource::Dos, 1, false, 0o444),
+            (AttrSource::Dos, 1, true, 0o640),
+            (AttrSource::Unix, 0o777, false, 0o640),
+            (AttrSource::Unix, 0o100754, false, 0o754),
+            (AttrSource::Unix, u64::MAX, false, 0o777),
+            (AttrSource::Unknown, u64::MAX, false, 0o640),
+        ] {
+            let path = dir.join("entry");
+            if path.exists() {
+                if path.is_dir() {
+                    fs::remove_dir(&path).unwrap();
+                } else {
+                    fs::remove_file(&path).unwrap();
+                }
+            }
+            if directory {
+                fs::create_dir(&path).unwrap();
+            } else {
+                fs::write(&path, b"payload").unwrap();
+            }
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+            set_extracted_permissions(&path, attr, source, directory).unwrap();
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                expected
+            );
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+
     fn redirection_fixture() -> (
         rars::rar50::ExtractedEntryMeta,
         rars::rar50::FileRedirection,

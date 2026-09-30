@@ -556,6 +556,25 @@ fn rejects_output_path_that_is_existing_symlink() {
     assert_eq!(fs::read(&target).unwrap(), b"do not overwrite\n");
 }
 
+#[test]
+fn test_reports_directory_entries_and_redirection_warnings() {
+    let output = rars()
+        .arg("test")
+        .arg(fixture_rar50("wild/symlink.rar"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let stdout = stdout(&output);
+    let stderr = stderr(&output);
+    assert!(stdout.contains("OK dir/"), "{stdout}");
+    for name in ["symlink.txt", "dirlink"] {
+        assert!(
+            stderr.contains(&format!("redirection entry '{name}' is not recreated")),
+            "{stderr}"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn extracts_rar50_symlink_redirection_entries() {
