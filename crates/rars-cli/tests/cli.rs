@@ -399,6 +399,38 @@ fn add_refuses_header_encryption_without_password_and_stdout_volume_sets() {
 }
 
 #[test]
+fn info_identifies_self_extracting_archives_and_unpacked_legacy_comments() {
+    let sfx = rars()
+        .arg("info")
+        .arg(fixture("SFXSRC.EXE"))
+        .output()
+        .unwrap();
+    assert!(sfx.status.success(), "{}", stderr(&sfx));
+    assert!(stdout(&sfx).contains("(SFX, payload at offset "));
+    let root = scratch("info-unpacked-comment");
+    let archive = root.join("comment.rar");
+    // Current writers pack archive comments. The legacy reader also accepts
+    // the original uncompressed extension: length followed by comment bytes.
+    let comment = b"unpacked note";
+    let mut bytes = b"RE~^".to_vec();
+    bytes.extend_from_slice(&(7u16 + 2 + comment.len() as u16).to_le_bytes());
+    bytes.push(0x82); // required flag and archive-comment flag, no packed flag
+    bytes.extend_from_slice(&(comment.len() as u16).to_le_bytes());
+    bytes.extend_from_slice(comment);
+    fs::write(&archive, bytes).unwrap();
+    let output = rars()
+        .args(["info", "--verbose"])
+        .arg(&archive)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("archive comment extension:"));
+    assert!(text.contains("comment: unpacked note"));
+    assert!(!text.contains("(packed)"));
+}
+
+#[test]
 fn test_verifies_rar15_40_stored_fixture() {
     let output = rars()
         .arg("test")

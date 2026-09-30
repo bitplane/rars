@@ -2117,6 +2117,81 @@ pub(crate) fn resolve_password_args(args: &PasswordArgs) -> CliResult<Option<Pas
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn buffered_volume_warning_uses_file_sizes_without_reading_payloads() {
+        const CHILD_INPUT: &str = "RARS_CLI_TEST_BUFFER_WARNING_INPUT";
+        if let Some(path) = std::env::var_os(CHILD_INPUT) {
+            let path = std::path::PathBuf::from(path);
+            super::warn_if_buffered_write_is_large(
+                std::slice::from_ref(&path),
+                super::ArchiveVersion::Rar50,
+            );
+            super::warn_if_buffered_write_is_large(
+                &[path.with_file_name("missing")],
+                super::ArchiveVersion::Rar14,
+            );
+            super::warn_if_buffered_write_is_large(&[path], super::ArchiveVersion::Rar14);
+            return;
+        }
+        let root = crate::scratch::case("buffered-volume-warning");
+        let path = root.join("sparse.bin");
+        let file = std::fs::File::create(&path).unwrap();
+        for (size, expected_warnings) in [(0, 0), (256 * 1024 * 1024, 1)] {
+            // A sparse file exercises the real metadata threshold without
+            // allocating or decoding hundreds of megabytes.
+            file.set_len(size).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::buffered_volume_warning_uses_file_sizes_without_reading_payloads",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_INPUT, &path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert_eq!(
+                stderr.matches("warning:").count(),
+                expected_warnings,
+                "{stderr}"
+            );
+            if expected_warnings != 0 {
+                assert!(stderr.contains("--format rar14 builds a volume set in memory"));
+                assert!(stderr.contains("--format rar50 splits as it goes"));
+            }
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), size);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_sniffing_reports_permission_errors_after_successful_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::scratch::case("archive-sniff-permissions");
+        let path = root.join("private.rar");
+        std::fs::write(&path, b"private contents").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0)).unwrap();
+        // Privileged runners can still read mode-zero files. Restore the mode
+        // before returning so the scratch cleanup always remains possible.
+        let privileged = std::fs::File::open(&path).is_ok();
+        if !privileged {
+            let error = super::looks_like_archive_path(&path)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("failed to inspect extract output path"));
+            assert!(error.contains(&path.display().to_string()));
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(!super::looks_like_archive_path(&path).unwrap());
+    }
+
     #[test]
     fn info_accepts_independent_archive_metadata_fields() {
         // The reader admits independent NAME and TIME bits, including neither.
@@ -2290,6 +2365,10 @@ mod tests {
             .contains("--store"));
         let mut args = arguments();
         args.level = Some(0);
+        assert!(super::build_add_command(args).unwrap().store);
+        let mut args = arguments();
+        args.level = Some(0);
+        args.store = true;
         assert!(super::build_add_command(args).unwrap().store);
         let mut args = arguments();
         args.store = true;
