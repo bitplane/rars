@@ -269,9 +269,9 @@ impl Unpack15Encoder {
             self.emit_payloads(payloads)?;
             if group_enters_stmode {
                 if self.options.stmode_literal_runs {
-                    self.emit_stmode_literal_run(input, None, &mut pos)?;
+                    self.emit_stmode_literal_run(input, None, &mut pos);
                 }
-                self.emit_stmode_exit()?;
+                self.emit_stmode_exit();
             }
         }
         Ok(std::mem::take(&mut self.bits).finish())
@@ -371,16 +371,16 @@ impl Unpack15Encoder {
                     group_enters_stmode = true;
                 }
                 pos += 1;
-                plan_encoder.emit_literal(literal)?;
+                plan_encoder.emit_literal(literal);
             }
 
             self.emit_flags_byte(flags)?;
             self.emit_payloads(payloads)?;
             if group_enters_stmode {
                 if self.options.stmode_literal_runs {
-                    self.emit_stmode_literal_run(input, Some(&buckets), &mut pos)?;
+                    self.emit_stmode_literal_run(input, Some(&buckets), &mut pos);
                 }
-                self.emit_stmode_exit()?;
+                self.emit_stmode_exit();
             }
             if pos >= next_report {
                 if progress.as_deref_mut().is_some_and(|report| !report(pos)) {
@@ -506,7 +506,7 @@ impl Unpack15Encoder {
     fn emit_payloads(&mut self, payloads: Vec<EncodedToken>) -> Result<()> {
         for payload in payloads {
             match payload {
-                EncodedToken::Literal(byte) => self.emit_literal(byte)?,
+                EncodedToken::Literal(byte) => self.emit_literal(byte),
                 EncodedToken::ShortLz(short_lz) => {
                     self.emit_short_lz(short_lz)?;
                 }
@@ -553,7 +553,7 @@ impl Unpack15Encoder {
         Ok(())
     }
 
-    fn emit_literal(&mut self, byte: u8) -> Result<()> {
+    fn emit_literal(&mut self, byte: u8) {
         let byte_place = self
             .ch_set
             .iter()
@@ -562,7 +562,7 @@ impl Unpack15Encoder {
         self.emit_literal_place(byte_place, byte_place, true)
     }
 
-    fn emit_stmode_literal(&mut self, byte: u8) -> Result<()> {
+    fn emit_stmode_literal(&mut self, byte: u8) {
         let byte_place = self
             .ch_set
             .iter()
@@ -580,7 +580,7 @@ impl Unpack15Encoder {
         input: &[u8],
         buckets: Option<&Rar13MatchFinder>,
         pos: &mut usize,
-    ) -> Result<()> {
+    ) {
         while *pos + 1 < input.len() {
             if buckets
                 .and_then(|buckets| {
@@ -605,18 +605,12 @@ impl Unpack15Encoder {
             {
                 break;
             }
-            self.emit_stmode_literal(input[*pos])?;
+            self.emit_stmode_literal(input[*pos]);
             *pos += 1;
         }
-        Ok(())
     }
 
-    fn emit_literal_place(
-        &mut self,
-        encoded_place: usize,
-        decoded_place: usize,
-        update_num_huf: bool,
-    ) -> Result<()> {
+    fn emit_literal_place(&mut self, encoded_place: usize, decoded_place: usize, update_num_huf: bool) {
         debug_assert!(encoded_place <= self.ch_set.len());
         debug_assert!(decoded_place < self.ch_set.len());
 
@@ -637,7 +631,8 @@ impl Unpack15Encoder {
             start_pos,
             dec_tab,
             pos_tab,
-        )?;
+        )
+        .expect("literal codebooks represent ranks 0 through 256");
 
         self.avr_plc += decoded_place as u32;
         self.avr_plc -= self.avr_plc >> 8;
@@ -668,7 +663,6 @@ impl Unpack15Encoder {
 
         self.ch_set[idx] = self.ch_set[new_byte_place];
         self.ch_set[new_byte_place] = cur_byte as u16;
-        Ok(())
     }
 
     fn emit_short_lz(&mut self, short_lz: ShortLz) -> Result<()> {
@@ -895,7 +889,7 @@ impl Unpack15Encoder {
         }
     }
 
-    fn emit_stmode_exit(&mut self) -> Result<()> {
+    fn emit_stmode_exit(&mut self) {
         let (start_pos, dec_tab, pos_tab) = if self.avr_plc > 0x75ff {
             (8, DEC_HF4, POS_HF4)
         } else if self.avr_plc > 0x5dff {
@@ -907,10 +901,10 @@ impl Unpack15Encoder {
         } else {
             (4, DEC_HF0, POS_HF0)
         };
-        emit_decode_num(&mut self.bits, 0, start_pos, dec_tab, pos_tab)?;
+        emit_decode_num(&mut self.bits, 0, start_pos, dec_tab, pos_tab)
+            .expect("literal codebooks represent the stmode exit marker");
         self.bits.write_bits(1, 1);
         self.num_huf = 0;
-        Ok(())
     }
 
     fn init_huff(&mut self) {
@@ -2349,9 +2343,9 @@ mod tests {
                         .unwrap()
                         & 0xff;
                     if stmode {
-                        encoder.emit_stmode_literal(byte).unwrap();
+                        encoder.emit_stmode_literal(byte);
                     } else {
-                        encoder.emit_literal(byte).unwrap();
+                        encoder.emit_literal(byte);
                     }
                     let after = encoder
                         .ch_set
@@ -2674,6 +2668,30 @@ mod tests {
             .decode_member_from_reader(&mut &[][..], 8, false, &mut from_reader)
             .unwrap();
         assert_eq!(from_reader, direct);
+    }
+
+    #[test]
+    fn literal_codebooks_decode_every_rank_independently_of_following_bits() {
+        for (start, thresholds, ranks) in [
+            (4, DEC_HF0, POS_HF0),
+            (5, DEC_HF1, POS_HF1),
+            (5, DEC_HF2, POS_HF2),
+            (6, DEC_HF3, POS_HF3),
+            (8, DEC_HF4, POS_HF4),
+        ] {
+            for rank in 0..=256 {
+                let (prefix, length) =
+                    super::encode_decode_num_prefix(rank, start, thresholds, ranks).unwrap();
+                for suffix in 0..(1u32 << (16 - length)) {
+                    let field = (prefix << (16 - length)) | suffix;
+                    assert_eq!(
+                        simulate_decode_num(field, start, thresholds, ranks),
+                        (rank, length),
+                        "start={start}, rank={rank}, suffix={suffix}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
