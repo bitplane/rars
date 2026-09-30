@@ -1096,6 +1096,24 @@ fn add_accepts_equals_flags_and_double_dash_input() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn add_progress_renders_on_real_terminals() {
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/test_cli_tty.py");
+    let output = Command::new("python3")
+        .arg(script)
+        .arg(env!("CARGO_BIN_EXE_rars"))
+        .arg("progress")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+}
+
 #[test]
 fn add_progress_modes_are_plain_when_stderr_is_captured() {
     let dir = scratch("add-progress-modes");

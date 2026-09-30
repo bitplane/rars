@@ -29,7 +29,7 @@ pub(crate) struct CliProgress {
     mode: RenderMode,
     bar: ProgressBar,
     plain: Arc<(Mutex<PlainState>, Condvar)>,
-    heartbeat: Mutex<Option<JoinHandle<()>>>,
+    heartbeat: Option<JoinHandle<()>>,
     determinate: AtomicBool,
     emitting: AtomicBool,
 }
@@ -51,7 +51,9 @@ impl CliProgress {
         let plain = Arc::new((Mutex::new(PlainState::default()), Condvar::new()));
         let heartbeat = if mode == RenderMode::Periodic {
             let state = Arc::clone(&plain);
-            Some(std::thread::spawn(move || heartbeat_loop(state)))
+            Some(std::thread::spawn(move || {
+                heartbeat_loop(state, LOG_INTERVAL, report_heartbeat);
+            }))
         } else {
             None
         };
@@ -59,7 +61,7 @@ impl CliProgress {
             mode,
             bar,
             plain,
-            heartbeat: Mutex::new(heartbeat),
+            heartbeat,
             determinate: AtomicBool::new(false),
             emitting: AtomicBool::new(false),
         }
@@ -186,11 +188,9 @@ impl CliProgress {
         if total == 0 || !matches!(self.mode, RenderMode::Milestones | RenderMode::Periodic) {
             return;
         }
-        let percent = completed
-            .saturating_mul(100)
-            .checked_div(total)
-            .unwrap_or(100)
-            .min(100) as u8;
+        // Multiplication in u64 can saturate before division and under-report
+        // valid large counters, even when completed == total.
+        let percent = (u128::from(completed) * 100 / u128::from(total)).min(100) as u8;
         let step = if self.mode == RenderMode::Periodic {
             10
         } else {
@@ -281,30 +281,33 @@ impl Drop for CliProgress {
         state.stop = true;
         wake.notify_all();
         drop(state);
-        if let Some(handle) = self
-            .heartbeat
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-        {
+        if let Some(handle) = self.heartbeat.take() {
             let _ = handle.join();
         }
     }
 }
 
-fn heartbeat_loop(shared: Arc<(Mutex<PlainState>, Condvar)>) {
+fn report_heartbeat(message: &str) {
+    eprintln!("progress: still working: {message}");
+}
+
+fn heartbeat_loop(
+    shared: Arc<(Mutex<PlainState>, Condvar)>,
+    interval: Duration,
+    mut report: impl FnMut(&str),
+) {
     let (lock, wake) = &*shared;
     let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     loop {
         let (next, timeout) = wake
-            .wait_timeout(state, LOG_INTERVAL)
+            .wait_timeout(state, interval)
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state = next;
         if state.stop {
             break;
         }
         if timeout.timed_out() && state.active {
-            eprintln!("progress: still working: {}", state.message);
+            report(&state.message);
         }
     }
 }
@@ -335,6 +338,213 @@ fn display_bytes(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_percent_is_monotonic_and_exact_at_u64_boundaries() {
+        let mut progress = CliProgress::new(ProgressMode::Never);
+        progress.mode = RenderMode::Milestones;
+        progress.bar("work", 100);
+        for (completed, total, expected) in [
+            (0, 0, 0),
+            (24, 100, 0),
+            (25, 100, 25),
+            (90, 100, 75),
+            (40, 100, 75),
+            (u64::MAX, u64::MAX, 100),
+        ] {
+            progress.report_plain_percent(completed, total);
+            assert_eq!(progress.plain.0.lock().unwrap().last_percent, expected);
+        }
+        progress.mode = RenderMode::Periodic;
+        progress.bar("next", 100);
+        progress.report_plain_percent(19, 100);
+        assert_eq!(progress.plain.0.lock().unwrap().last_percent, 10);
+        progress.report_plain_percent(u64::MAX, 1);
+        assert_eq!(progress.plain.0.lock().unwrap().last_percent, 100);
+    }
+
+    #[test]
+    fn terminal_restart_and_entry_events_preserve_work_accounting() {
+        let mut progress = CliProgress::new(ProgressMode::Never);
+        progress.mode = RenderMode::Terminal;
+        progress.bar("reading", 100);
+        progress.advance(30);
+        assert_eq!(progress.bar.position(), 30);
+        progress.set_message("source");
+        assert_eq!(progress.bar.message(), "source");
+        progress.finish("done");
+        assert!(progress.bar.is_finished());
+        progress.spinner("next phase");
+        assert!(!progress.bar.is_finished());
+        assert_eq!(progress.bar.position(), 0);
+        progress.report(WriteProgressEvent::Advanced {
+            operation: WriteOperation::Recovery,
+            completed_bytes: 50,
+            total_bytes: 100,
+            pass: 2,
+        });
+        assert_eq!(progress.bar.message(), "next phase");
+        assert_eq!(progress.bar.position(), 50);
+        progress.report(WriteProgressEvent::EntryStarted {
+            operation: WriteOperation::Compression,
+            index: 0,
+            total_entries: 1,
+            name: b"name\x1b",
+            input_bytes: 50,
+        });
+        assert!(progress.bar.message().contains("name\\u{1b}"));
+        progress.report(WriteProgressEvent::VolumeFinished {
+            volume_number: 1,
+            total_volumes: Some(1),
+            bytes: 999,
+        });
+        assert_eq!(progress.bar.position(), 50);
+        progress.report(WriteProgressEvent::OperationFinished {
+            operation: WriteOperation::Emission,
+            total_bytes: Some(100),
+            total_entries: Some(1),
+            pass: 1,
+        });
+        assert!(!progress.emitting.load(Ordering::Relaxed));
+        assert_eq!(
+            operation_label(WriteOperation::Staging, 1),
+            "Staging archive"
+        );
+        assert_eq!(
+            operation_label(WriteOperation::Recovery, 2),
+            "Building recovery record (pass 2)"
+        );
+    }
+
+    #[test]
+    fn heartbeat_reports_only_active_work_and_stops_after_notification() {
+        let shared = Arc::new((Mutex::new(PlainState::default()), Condvar::new()));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let state = Arc::clone(&shared);
+        let handle = std::thread::spawn(move || {
+            heartbeat_loop(state, Duration::from_millis(5), |message| {
+                sender.send(message.to_owned()).unwrap();
+            })
+        });
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(20)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        {
+            let mut state = shared.0.lock().unwrap();
+            state.active = true;
+            state.message = "busy".into();
+            shared.1.notify_all();
+        }
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "busy"
+        );
+        {
+            let mut state = shared.0.lock().unwrap();
+            state.active = false;
+            shared.1.notify_all();
+        }
+        while receiver.try_recv().is_ok() {}
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(20)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        shared.0.lock().unwrap().stop = true;
+        shared.1.notify_all();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn plain_state_survives_poisoned_locks_during_updates_and_drop() {
+        let mut progress = CliProgress::new(ProgressMode::Never);
+        let shared = Arc::clone(&progress.plain);
+        assert!(std::thread::spawn(move || {
+            let _guard = shared.0.lock().unwrap();
+            panic!("simulate failure while holding progress state");
+        })
+        .join()
+        .is_err());
+        progress.set_message("recovered");
+        progress.spinner("another phase");
+        progress.mode = RenderMode::Milestones;
+        progress.report_plain_percent(100, 100);
+        progress.finish("done");
+        assert!(progress.plain.0.is_poisoned());
+        let state = progress
+            .plain
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(state.message, "done");
+        assert!(!state.active);
+        assert_eq!(state.last_percent, 100);
+        drop(state);
+        drop(progress);
+    }
+
+    #[test]
+    fn heartbeat_recovers_state_after_a_reporting_panic() {
+        let shared = Arc::new((
+            Mutex::new(PlainState {
+                active: true,
+                message: "busy".into(),
+                ..Default::default()
+            }),
+            Condvar::new(),
+        ));
+        let first = Arc::clone(&shared);
+        assert!(std::thread::spawn(move || heartbeat_loop(
+            first,
+            Duration::from_millis(1),
+            |_| panic!("simulate failed reporting")
+        ))
+        .join()
+        .is_err());
+        assert!(shared.0.is_poisoned());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let second = Arc::clone(&shared);
+        let handle = std::thread::spawn(move || {
+            heartbeat_loop(second, Duration::from_millis(1), |message| {
+                report_heartbeat(message);
+                sender.send(message.to_owned()).unwrap();
+            })
+        });
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "busy"
+        );
+        shared
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .stop = true;
+        shared.1.notify_all();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn hidden_progress_and_standalone_recovery_do_not_invent_emission_work() {
+        let progress = CliProgress::new(ProgressMode::Never);
+        progress.advance(999);
+        assert_eq!(progress.bar.position(), 0);
+        progress.report(WriteProgressEvent::OperationStarted {
+            operation: WriteOperation::Recovery,
+            total_bytes: None,
+            total_entries: None,
+            pass: 2,
+        });
+        progress.report(WriteProgressEvent::OperationFinished {
+            operation: WriteOperation::Recovery,
+            total_bytes: None,
+            total_entries: None,
+            pass: 2,
+        });
+        let state = progress.plain.0.lock().unwrap();
+        assert!(!state.active);
+        assert_eq!(state.message, "Building recovery record (pass 2) complete");
+        assert!(!progress.emitting.load(Ordering::Relaxed));
+    }
 
     #[test]
     fn entry_completion_does_not_add_to_absolute_progress() {
