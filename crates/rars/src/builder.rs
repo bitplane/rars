@@ -2673,3 +2673,38 @@ mod tests {
         assert!(volumes.len() > 1, "expected a split, got {}", volumes.len());
     }
 }
+
+#[cfg(test)]
+#[test]
+fn parentless_output_path_uses_default_resources_and_publishes_readable_archives() {
+    struct Destination(std::path::PathBuf);
+    impl Drop for Destination {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let destination = Destination(std::path::PathBuf::from(format!(
+        ".rars-parentless-test-{}-{sequence}.rar",
+        std::process::id()
+    )));
+    assert!(destination.0.parent().unwrap().as_os_str().is_empty());
+    for version in [
+        ArchiveVersion::Rar13,
+        ArchiveVersion::Rar29,
+        ArchiveVersion::Rar50,
+    ] {
+        let mut builder = Builder::new(version).store(true);
+        builder
+            .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+        builder.write_to_path(&destination.0, None).unwrap();
+        let archive =
+            crate::ArchiveReader::read_owned(std::fs::read(&destination.0).unwrap()).unwrap();
+        assert_eq!(
+            archive.read_member(b"file", None).unwrap().unwrap(),
+            b"payload"
+        );
+    }
+}
