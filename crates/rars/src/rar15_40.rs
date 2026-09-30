@@ -2071,7 +2071,7 @@ fn repair_newsub_recovery_bytes(
             .ok_or(Error::InvalidHeader(
                 "RAR 3.x recovery protected range overflows",
             ))?;
-    if protected_end > source.len() || protected_start > protected_end {
+    if protected_end > source.len() {
         return Err(Error::InvalidHeader(
             "RAR 3.x recovery protected range is invalid",
         ));
