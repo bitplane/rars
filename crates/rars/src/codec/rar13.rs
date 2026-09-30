@@ -464,15 +464,16 @@ impl Unpack15Encoder {
         match token {
             MatchToken::RepeatLast(_) => Some(flag_cost + self.repeat_last_bit_cost(state.l_count)),
             MatchToken::ShortLz(token) => {
-                let distance_value = token.distance.checked_sub(1)?;
+                let distance_value = token.distance - 1;
                 let distance_place = self
                     .ch_set_a
                     .iter()
-                    .position(|&value| value as u32 == distance_value)?;
+                    .position(|&value| value as u32 == distance_value)
+                    .expect("short-distance alphabet contains every distance");
                 Some(
                     flag_cost
                         + l_count_break_bit_cost(state.l_count)
-                        + self.short_lz_prefix_bit_cost(token.length - 2)?
+                        + self.short_lz_prefix_bit_cost(token.length - 2)
                         + decode_num_bit_cost(distance_place as u32, 5, DEC_HF2, POS_HF2)?,
                 )
             }
@@ -482,21 +483,23 @@ impl Unpack15Encoder {
                     token.distance,
                     state.max_dist3,
                     token.short_code,
-                )?;
+                )
+                .expect("old-distance candidate passed both distance thresholds");
                 Some(
                     flag_cost
                         + l_count_break_bit_cost(state.l_count)
-                        + self.short_lz_prefix_bit_cost(token.short_code)?
+                        + self.short_lz_prefix_bit_cost(token.short_code)
                         + decode_num_bit_cost(length_code, 2, DEC_L1, POS_L1)?,
                 )
             }
             MatchToken::LongLz(token) => {
-                let length_code = long_lz_length_code_for_distance(token, state.max_dist3)?;
+                let length_code = long_lz_length_code_for_distance(token, state.max_dist3)
+                    .expect("long-match candidate passed distance threshold validation");
                 let distance_place = self.long_lz_distance_place(token.distance);
                 Some(
                     flag_cost
-                        + self.long_lz_length_bit_cost(length_code)?
-                        + self.long_lz_distance_bit_cost(distance_place)?
+                        + self.long_lz_length_bit_cost(length_code)
+                        + self.long_lz_distance_bit_cost(distance_place)
                         + 7,
                 )
             }
@@ -529,8 +532,7 @@ impl Unpack15Encoder {
             .iter()
             .position(|&value| (value >> 8) as u8 == flags)
             .expect("flag alphabet contains every byte");
-        emit_decode_num(&mut self.bits, flags_place as u32, 5, DEC_HF2, POS_HF2)
-            .expect("HF2 represents every flag rank");
+        emit_decode_num(&mut self.bits, flags_place as u32, 5, DEC_HF2, POS_HF2);
 
         let mut cur_flags;
         let mut new_flags_place;
@@ -629,8 +631,7 @@ impl Unpack15Encoder {
             start_pos,
             dec_tab,
             pos_tab,
-        )
-        .expect("literal codebooks represent ranks 0 through 256");
+        );
 
         self.avr_plc += decoded_place as u32;
         self.avr_plc -= self.avr_plc >> 8;
@@ -684,8 +685,7 @@ impl Unpack15Encoder {
             .iter()
             .position(|&value| value as u32 == distance_value)
             .expect("short-distance alphabet contains every distance");
-        emit_decode_num(&mut self.bits, distance_place as u32, 5, DEC_HF2, POS_HF2)
-            .expect("HF2 represents every short-distance rank");
+        emit_decode_num(&mut self.bits, distance_place as u32, 5, DEC_HF2, POS_HF2);
         if distance_place > 0 {
             let last_distance = self.ch_set_a[distance_place - 1];
             self.ch_set_a[distance_place] = last_distance;
@@ -727,8 +727,7 @@ impl Unpack15Encoder {
             old_lz.short_code,
         )
         .expect("selected old-distance length passed planner validation");
-        emit_decode_num(&mut self.bits, length_code, 2, DEC_L1, POS_L1)
-            .expect("selected old-distance symbol passed planner validation");
+        emit_decode_num(&mut self.bits, length_code, 2, DEC_L1, POS_L1);
         self.remember_match(old_lz.distance, old_lz.length);
     }
 
@@ -742,16 +741,14 @@ impl Unpack15Encoder {
             .write_bits((code_byte >> (8 - code_len)) as u32, code_len as usize);
     }
 
-    fn short_lz_prefix_bit_cost(&self, code: u32) -> Option<usize> {
-        let code = usize::try_from(code).ok()?;
-        if code >= SHORT_XOR1.len() {
-            return None;
-        }
-        Some(if self.avr_ln1 < 37 {
+    fn short_lz_prefix_bit_cost(&self, code: u32) -> usize {
+        debug_assert!(code < SHORT_XOR1.len() as u32);
+        let code = code as usize;
+        (if self.avr_ln1 < 37 {
             self.short_len1(code)
         } else {
             self.short_len2(code)
-        } as usize)
+        }) as usize
     }
 
     fn repeat_last_bit_cost(&self, l_count: u32) -> usize {
@@ -759,7 +756,6 @@ impl Unpack15Encoder {
             1
         } else {
             self.short_lz_prefix_bit_cost(9)
-                .expect("repeat-last code is encodable")
         }
     }
 
@@ -775,8 +771,7 @@ impl Unpack15Encoder {
         let length_code = self
             .long_lz_length_code(long_lz)
             .expect("selected long-match length passed planner validation");
-        emit_long_lz_length(&mut self.bits, self.avr_ln2, length_code)
-            .expect("selected long-match symbol passed planner validation");
+        emit_long_lz_length(&mut self.bits, self.avr_ln2, length_code);
         self.avr_ln2 += length_code;
         self.avr_ln2 -= self.avr_ln2 >> 5;
 
@@ -794,8 +789,7 @@ impl Unpack15Encoder {
             start_pos,
             dec_tab,
             pos_tab,
-        )
-        .expect("distance codebooks represent every adaptive rank");
+        );
         self.avr_plc_b += distance_place as u32;
         self.avr_plc_b -= self.avr_plc_b >> 8;
 
@@ -851,28 +845,31 @@ impl Unpack15Encoder {
             .expect("long-distance alphabet contains every high byte")
     }
 
-    fn long_lz_length_bit_cost(&self, length_code: u32) -> Option<usize> {
+    fn long_lz_length_bit_cost(&self, length_code: u32) -> usize {
+        debug_assert!(length_code < 0x100);
         if self.avr_ln2 >= 122 {
             decode_num_bit_cost(length_code, 3, DEC_L2, POS_L2)
+                .expect("L2 represents every length symbol")
         } else if self.avr_ln2 >= 64 {
             decode_num_bit_cost(length_code, 2, DEC_L1, POS_L1)
+                .expect("L1 represents every length symbol")
         } else if length_code <= 7 {
-            Some(length_code as usize + 1)
-        } else if length_code < 0x100 {
-            Some(16)
+            length_code as usize + 1
         } else {
-            None
+            16
         }
     }
 
-    fn long_lz_distance_bit_cost(&self, distance_place: usize) -> Option<usize> {
-        if self.avr_plc_b > 0x28ff {
+    fn long_lz_distance_bit_cost(&self, distance_place: usize) -> usize {
+        debug_assert!(distance_place < 256);
+        let cost = if self.avr_plc_b > 0x28ff {
             decode_num_bit_cost(distance_place as u32, 5, DEC_HF2, POS_HF2)
         } else if self.avr_plc_b > 0x06ff {
             decode_num_bit_cost(distance_place as u32, 5, DEC_HF1, POS_HF1)
         } else {
             decode_num_bit_cost(distance_place as u32, 4, DEC_HF0, POS_HF0)
-        }
+        };
+        cost.expect("distance codebooks represent every adaptive rank")
     }
 
     fn emit_stmode_exit(&mut self) {
@@ -887,8 +884,7 @@ impl Unpack15Encoder {
         } else {
             (4, DEC_HF0, POS_HF0)
         };
-        emit_decode_num(&mut self.bits, 0, start_pos, dec_tab, pos_tab)
-            .expect("literal codebooks represent the stmode exit marker");
+        emit_decode_num(&mut self.bits, 0, start_pos, dec_tab, pos_tab);
         self.bits.write_bits(1, 1);
         self.num_huf = 0;
     }
@@ -1394,24 +1390,17 @@ fn long_lz_buckets(input: &[u8]) -> Rar13MatchFinder {
     Rar13MatchFinder::build(input)
 }
 
-fn emit_long_lz_length(bits: &mut BitWriter, avr_ln2: u32, length_code: u32) -> Result<()> {
+fn emit_long_lz_length(bits: &mut BitWriter, avr_ln2: u32, length_code: u32) {
+    debug_assert!(length_code < 0x100);
     if avr_ln2 >= 122 {
-        return emit_decode_num(bits, length_code, 3, DEC_L2, POS_L2);
-    }
-    if avr_ln2 >= 64 {
-        return emit_decode_num(bits, length_code, 2, DEC_L1, POS_L1);
-    }
-    if length_code <= 7 {
+        emit_decode_num(bits, length_code, 3, DEC_L2, POS_L2);
+    } else if avr_ln2 >= 64 {
+        emit_decode_num(bits, length_code, 2, DEC_L1, POS_L1);
+    } else if length_code <= 7 {
         bits.write_bits(1, length_code as usize + 1);
-        return Ok(());
-    }
-    if length_code < 0x100 {
+    } else {
         bits.write_bits(length_code, 16);
-        return Ok(());
     }
-    Err(Error::InvalidData(
-        "RAR 1.3 LongLZ encoder length is not encodable",
-    ))
 }
 
 fn emit_decode_num(
@@ -1420,14 +1409,10 @@ fn emit_decode_num(
     start_pos: u32,
     dec_tab: &[u16],
     pos_tab: &[u16],
-) -> Result<()> {
-    if let Some((code, len)) = encode_decode_num_prefix(target, start_pos, dec_tab, pos_tab) {
-        bits.write_bits(code, len);
-        return Ok(());
-    }
-    Err(Error::InvalidData(
-        "RAR 1.3 DecodeNum value is not encodable",
-    ))
+) {
+    let (code, len) = encode_decode_num_prefix(target, start_pos, dec_tab, pos_tab)
+        .expect("emitted symbol passed fixed codebook validation");
+    bits.write_bits(code, len);
 }
 
 fn decode_num_bit_cost(
@@ -1445,6 +1430,7 @@ fn encode_decode_num_prefix(
     dec_tab: &[u16],
     pos_tab: &[u16],
 ) -> Option<(u32, usize)> {
+    // Fixed table/start pairs cover every visited index and have positive thresholds.
     let end = 16.min(pos_tab.len().saturating_sub(1));
     for (len, &base) in pos_tab
         .iter()
@@ -1452,14 +1438,14 @@ fn encode_decode_num_prefix(
         .take(end + 1)
         .skip(start_pos as usize)
     {
-        let dec_index = len.checked_sub(start_pos as usize)?;
-        let upper = u32::from(*dec_tab.get(dec_index)?);
+        let dec_index = len - start_pos as usize;
+        let upper = u32::from(dec_tab[dec_index]);
         let previous = if dec_index == 0 {
             0
         } else {
             u32::from(dec_tab[dec_index - 1])
         };
-        let max_num = upper.checked_sub(1)? & !0xf;
+        let max_num = (upper - 1) & !0xf;
         if max_num < previous {
             continue;
         }
@@ -2336,39 +2322,29 @@ mod tests {
         for average in [0, 63, 64, 121, 122, 1000] {
             let mut encoder = super::Unpack15Encoder::new();
             encoder.avr_ln2 = average;
-            for code in 0..=256 {
-                let cost = encoder.long_lz_length_bit_cost(code);
+            for code in 0..=255 {
+                let length = encoder.long_lz_length_bit_cost(code);
                 let mut bits = super::BitWriter::new();
-                let result = super::emit_long_lz_length(&mut bits, average, code);
-                assert_eq!(
-                    cost.is_some(),
-                    result.is_ok(),
-                    "average={average}, code={code}"
-                );
-                if let Some(length) = cost {
-                    assert_eq!(bits.bit_pos, length);
-                    let field = (u32::from(bits.output[0]) << 8)
-                        | u32::from(bits.output.get(1).copied().unwrap_or(0));
-                    if average >= 64 {
-                        let (start, thresholds, ranks) = if average >= 122 {
-                            (3, DEC_L2, POS_L2)
-                        } else {
-                            (2, DEC_L1, POS_L1)
-                        };
-                        for suffix in 0..(1u32 << (16 - length)) {
-                            assert_eq!(
-                                simulate_decode_num(field | suffix, start, thresholds, ranks),
-                                (code, length)
-                            );
-                        }
-                    } else if code <= 7 {
-                        assert_eq!(field, 1 << (15 - code));
+                super::emit_long_lz_length(&mut bits, average, code);
+                assert_eq!(bits.bit_pos, length);
+                let field = (u32::from(bits.output[0]) << 8)
+                    | u32::from(bits.output.get(1).copied().unwrap_or(0));
+                if average >= 64 {
+                    let (start, thresholds, ranks) = if average >= 122 {
+                        (3, DEC_L2, POS_L2)
                     } else {
-                        assert_eq!(field, code);
+                        (2, DEC_L1, POS_L1)
+                    };
+                    for suffix in 0..(1u32 << (16 - length)) {
+                        assert_eq!(
+                            simulate_decode_num(field | suffix, start, thresholds, ranks),
+                            (code, length)
+                        );
                     }
+                } else if code <= 7 {
+                    assert_eq!(field, 1 << (15 - code));
                 } else {
-                    assert_eq!(bits.bit_pos, 0);
-                    assert!(bits.output.is_empty());
+                    assert_eq!(field, code);
                 }
             }
         }
@@ -2831,6 +2807,34 @@ mod tests {
             .decode_member_from_reader(&mut &[][..], 8, false, &mut from_reader)
             .unwrap();
         assert_eq!(from_reader, direct);
+    }
+
+    #[test]
+    fn fixed_number_tables_reencode_every_decoder_prefix() {
+        for (start, thresholds, ranks) in [
+            (4, DEC_HF0, POS_HF0),
+            (5, DEC_HF1, POS_HF1),
+            (5, DEC_HF2, POS_HF2),
+            (6, DEC_HF3, POS_HF3),
+            (8, DEC_HF4, POS_HF4),
+            (2, DEC_L1, POS_L1),
+            (3, DEC_L2, POS_L2),
+        ] {
+            assert!(ranks.len() <= 17);
+            assert!(ranks.len() > start as usize);
+            assert!(thresholds.len() >= ranks.len() - start as usize);
+            assert!(thresholds.iter().all(|&threshold| threshold != 0));
+            assert!(thresholds.windows(2).all(|pair| pair[0] <= pair[1]));
+            assert_eq!(thresholds.last(), Some(&u16::MAX));
+            for field in 0..=u16::MAX {
+                let (target, consumed) =
+                    simulate_decode_num(u32::from(field), start, thresholds, ranks);
+                let (prefix, length) =
+                    super::encode_decode_num_prefix(target, start, thresholds, ranks).unwrap();
+                assert_eq!(length, consumed);
+                assert_eq!(prefix, u32::from(field) >> (16 - length));
+            }
+        }
     }
 
     #[test]
@@ -3706,19 +3710,18 @@ mod solid_regressions {
     }
 
     #[test]
-    fn bit_symbol_encoders_reject_unrepresentable_values() {
-        let mut bits = super::BitWriter::new();
+    fn number_prefix_search_rejects_unrepresentable_candidates() {
         assert_eq!(
-            super::emit_long_lz_length(&mut bits, 0, 256),
-            Err(Error::InvalidData(
-                "RAR 1.3 LongLZ encoder length is not encodable"
-            ))
+            super::encode_decode_num_prefix(u32::MAX, 4, super::DEC_HF0, super::POS_HF0),
+            None
         );
         assert_eq!(
-            super::emit_decode_num(&mut bits, u32::MAX, 4, super::DEC_HF0, super::POS_HF0),
-            Err(Error::InvalidData(
-                "RAR 1.3 DecodeNum value is not encodable"
-            ))
+            super::decode_num_bit_cost(256, 2, super::DEC_L1, super::POS_L1),
+            None
+        );
+        assert_eq!(
+            super::decode_num_bit_cost(256, 3, super::DEC_L2, super::POS_L2),
+            None
         );
     }
 
@@ -3726,9 +3729,9 @@ mod solid_regressions {
     fn decoder_reads_far_short_match_token() {
         let mut encoder = Unpack15Encoder::new();
         encoder.emit_short_lz_code(10);
-        emit_decode_num(&mut encoder.bits, 0xff, 2, DEC_L1, POS_L1).unwrap();
+        emit_decode_num(&mut encoder.bits, 0xff, 2, DEC_L1, POS_L1);
         encoder.emit_short_lz_code(14);
-        emit_decode_num(&mut encoder.bits, 0, 3, DEC_L2, POS_L2).unwrap();
+        emit_decode_num(&mut encoder.bits, 0, 3, DEC_L2, POS_L2);
         encoder.bits.write_bits(0, 15);
 
         let mut decoder = Unpack15::new();
@@ -3780,7 +3783,7 @@ mod solid_regressions {
         for code in 11..=13 {
             let mut encoder = Unpack15Encoder::new();
             encoder.emit_short_lz_code(code);
-            emit_decode_num(&mut encoder.bits, 0xff, 2, DEC_L1, POS_L1).unwrap();
+            emit_decode_num(&mut encoder.bits, 0xff, 2, DEC_L1, POS_L1);
             let mut decoder = Unpack15::new();
             decoder.bits = BitReader::new(&encoder.bits.finish());
             decoder.target = 257;
@@ -3807,10 +3810,10 @@ mod solid_regressions {
     #[test]
     fn decoder_reads_stmode_short_match_token() {
         let mut bits = BitWriter::new();
-        emit_decode_num(&mut bits, 0, 5, DEC_HF1, POS_HF1).unwrap();
+        emit_decode_num(&mut bits, 0, 5, DEC_HF1, POS_HF1);
         bits.write_bits(0, 1); // ST-mode match rather than exit.
         bits.write_bits(1, 1); // Four-byte match.
-        emit_decode_num(&mut bits, 0, 5, DEC_HF2, POS_HF2).unwrap();
+        emit_decode_num(&mut bits, 0, 5, DEC_HF2, POS_HF2);
         bits.write_bits(1, 5); // Distance one.
 
         let mut decoder = Unpack15::new();
