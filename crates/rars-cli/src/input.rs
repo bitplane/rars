@@ -132,17 +132,13 @@ fn input_archive_base(path: &Path) -> CliResult<PathBuf> {
     Ok(out)
 }
 
+// Called only with a nonempty base validated by input_archive_base, followed by
+// filesystem child names. All components are normal; revalidating here is redundant.
 fn archive_path_bytes(path: &Path) -> CliResult<Vec<u8>> {
-    let mut parts = Vec::new();
-    for component in path.components() {
-        let Component::Normal(part) = component else {
-            return Err(format!("unsafe input archive path: {}", path.display()).into());
-        };
-        parts.push(rars::filename::native_bytes(part)?);
-    }
-    if parts.is_empty() {
-        return Err("input path has no file name".into());
-    }
+    let parts = path
+        .components()
+        .map(|component| rars::filename::native_bytes(component.as_os_str()))
+        .collect::<rars::Result<Vec<_>>>()?;
     Ok(parts.join(&b'/'))
 }
 
@@ -256,6 +252,55 @@ mod tests {
             u32::from(DOS_ARCHIVE_ATTR)
         );
         assert_eq!(rar15_file_attr(Some(0o100640), DOS_ARCHIVE_ATTR), 0o100640);
+    }
+
+    #[test]
+    fn validation_failure_does_not_emit_discovery_or_progress() {
+        let error = read_inputs_with_progress(
+            &[],
+            None,
+            |_, _| panic!("invalid inputs must not emit discovery"),
+            |_, _| panic!("invalid inputs must not emit progress"),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.to_string(), "no regular input files found");
+        #[cfg(unix)]
+        assert_eq!(
+            input_archive_base(Path::new("/")).unwrap_err().to_string(),
+            "input path has no file name"
+        );
+        for (path, name) in [
+            ("./dir/./file", b"dir/file".as_slice()),
+            ("name", b"name".as_slice()),
+        ] {
+            let base = input_archive_base(Path::new(path)).unwrap();
+            assert_eq!(archive_path_bytes(&base).unwrap(), name);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_directory_error_names_the_source() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::scratch::case("input-unreadable-directory");
+        let input = root.join("unreadable");
+        fs::create_dir(&input).unwrap();
+        fs::write(input.join("file"), b"payload").unwrap();
+        let original = fs::metadata(&input).unwrap().permissions();
+        fs::set_permissions(&input, fs::Permissions::from_mode(0o0)).unwrap();
+        // Privileged runners may bypass permission bits; restore before returning
+        // or asserting so the scratch directory remains removable in either case.
+        let permission_bits_enforced = fs::read_dir(&input).is_err();
+        let result = collect_inputs(std::slice::from_ref(&input));
+        fs::set_permissions(&input, original).unwrap();
+        if !permission_bits_enforced {
+            eprintln!("permission-denial case unavailable on this privileged runner");
+            return;
+        }
+        let error = result.err().unwrap().to_string();
+        assert!(error.contains("failed to read directory"));
+        assert!(error.contains(&input.display().to_string()));
     }
 
     #[test]
