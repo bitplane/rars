@@ -3818,3 +3818,45 @@ mod cancellation_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[test]
+fn missing_end_header_repair_preserves_an_active_cancellation_token() {
+    let mut builder = crate::Builder::new(crate::ArchiveVersion::Rar50)
+        .store(true)
+        .recovery_percent(Some(20));
+    builder
+        .add_bytes(
+            b"recoverable".to_vec(),
+            b"protected payload".to_vec(),
+            None,
+            None,
+        )
+        .unwrap();
+    let original = builder.to_bytes().unwrap();
+    let archive = crate::rar50::Archive::parse(&original).unwrap();
+    let end_start = archive
+        .blocks
+        .iter()
+        .find_map(|block| match block {
+            crate::rar50::Block::End(end) => Some(end.block.offset),
+            _ => None,
+        })
+        .unwrap();
+    let truncated = &original[..end_start];
+    let token = crate::ReadCancellation::new();
+    let options = InlineRepairOptions {
+        control: crate::read_control::ReadControl::new(Some(&token)),
+        ..Default::default()
+    };
+    let (repaired, report) =
+        repair_inline_recovery_archive_with_report(truncated, &options).unwrap();
+    assert!(!token.is_cancelled());
+    assert!(report.end_record_rebuilt);
+    assert_eq!(repaired, original);
+    token.cancel();
+    assert_eq!(
+        repair_inline_recovery_archive_with_report(truncated, &options).unwrap_err(),
+        Error::Cancelled
+    );
+}
