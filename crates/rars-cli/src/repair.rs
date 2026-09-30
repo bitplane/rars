@@ -157,8 +157,7 @@ fn cmd_repair_rev3(paths: &[PathBuf]) -> CliResult<()> {
     let input_paths = &paths[..paths.len() - 1];
     let mut data_inputs = Vec::new();
     let mut recovery_inputs = Vec::new();
-    let mut data_count = None;
-    let mut recovery_count = None;
+    let mut counts = None;
 
     for path in input_paths {
         let bytes = fs::read(path)?;
@@ -170,12 +169,9 @@ fn cmd_repair_rev3(paths: &[PathBuf]) -> CliResult<()> {
                         path.display()
                     ))
                 })?;
-            if recovery_count
-                .replace(rec_count)
-                .is_some_and(|count| count != rec_count)
-                || data_count
-                    .replace(dat_count)
-                    .is_some_and(|count| count != dat_count)
+            if counts
+                .replace((rec_count, dat_count))
+                .is_some_and(|previous| previous != (rec_count, dat_count))
             {
                 return Err("RAR 3 REV volume metadata differs across files".into());
             }
@@ -185,9 +181,8 @@ fn cmd_repair_rev3(paths: &[PathBuf]) -> CliResult<()> {
         }
     }
 
-    let data_count = data_count.ok_or("RAR 3 REV repair requires at least one .rev file")?;
-    let recovery_count =
-        recovery_count.ok_or("RAR 3 REV repair requires at least one .rev file")?;
+    let (recovery_count, data_count) =
+        counts.ok_or("RAR 3 REV repair requires at least one .rev file")?;
     let mut slots: Vec<Option<&[u8]>> = vec![None; data_count];
     for (path, bytes) in &data_inputs {
         if let Some(index) = infer_part_index(path, data_count as u16) {
