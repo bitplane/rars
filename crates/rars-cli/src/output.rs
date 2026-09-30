@@ -58,15 +58,14 @@ pub(crate) fn open_output_writer(
         relative_path(name, backslash.is_separator())
             .map_err(|_| Error::InvalidHeader("unsafe archive path"))
     };
-    let mut out_path = checked_output_path(out_dir, &resolve(&entry.name)?)?;
+    let rel = resolve(&entry.name)?;
+    let mut out_path = checked_output_path(out_dir, &rel)?;
     if entry.is_directory {
         fs::create_dir_all(&out_path)?;
         return Ok((out_path, Box::new(std::io::sink())));
     }
-    if let Some(parent) = out_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let rel = resolve(&entry.name)?;
+    // A validated nonempty relative name always leaves a final path component.
+    fs::create_dir_all(out_path.parent().expect("validated output path has a parent"))?;
     out_path = checked_output_path(out_dir, &rel)?;
     Ok((
         out_path.clone(),
@@ -130,12 +129,10 @@ pub(crate) fn create_rar50_redirection(
 ) -> rars::Result<(PathBuf, bool)> {
     // Validate the operation and its target before removing an existing output.
     let prepare_destination = || -> rars::Result<PathBuf> {
-        let mut out_path = output_path_for_rar50_entry(out_dir, entry)?;
-        if let Some(parent) = out_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let rel = rar50_output_relative_path(&entry.name, entry.host_os)
             .map_err(|_| Error::InvalidHeader("unsafe archive path"))?;
+        let mut out_path = checked_output_path(out_dir, &rel)?;
+        fs::create_dir_all(out_path.parent().expect("validated output path has a parent"))?;
         out_path = checked_output_path(out_dir, &rel)?;
         prepare_redirection_destination(&out_path, overwrite)?;
         Ok(out_path)
@@ -191,7 +188,7 @@ fn prepare_redirection_destination(path: &Path, overwrite: OverwritePolicy) -> s
                 "file exists",
             )),
             OverwritePolicy::Always => {
-                if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                if metadata.is_dir() {
                     fs::remove_dir(path)
                 } else {
                     fs::remove_file(path)
@@ -311,9 +308,9 @@ fn set_extracted_permissions(
         // bits. Without them the value is not a mode, and stripping a file to
         // whatever the low bits happen to say is worse than leaving it.
         AttrSource::Unix if file_attr & 0o170000 != 0 => {
-            Some(u32::try_from(file_attr & 0o777).unwrap_or(0o644))
+            Some((file_attr & 0o777) as u32)
         }
-        AttrSource::Unix | AttrSource::Unknown => None,
+        // Missing type bits and unknown (including future) hosts leave modes unchanged.
         _ => None,
     };
 
@@ -488,6 +485,9 @@ mod tests {
             assert!(output_relative_path(name).is_err(), "{name:?}");
             let meta = ExtractedEntryMeta::new(name.to_vec(), None, 0, false);
             assert!(output_path_for_entry(&dir, &meta).is_err());
+            let (mut rar50_meta, _) = redirection_fixture();
+            rar50_meta.name = name.to_vec();
+            assert!(output_path_for_rar50_entry(&dir, &rar50_meta).is_err());
         }
         for path in [
             Path::new("../escape"),
@@ -515,6 +515,19 @@ mod tests {
         assert!(
             open_output_writer(&dir, &meta, OverwritePolicy::Always, Backslash::Separator).is_err()
         );
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+        let (mut link_meta, mut link_redirection) = redirection_fixture();
+        link_meta.name = b"link/child".to_vec();
+        link_redirection.redirection_type = FSREDIR_UNIX_SYMLINK;
+        link_redirection.target_name = b"target".to_vec();
+        assert!(create_rar50_redirection(
+            &dir,
+            &link_meta,
+            &link_redirection,
+            OverwritePolicy::Always,
+            &HashMap::new()
+        )
+        .is_err());
         assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
         let locked = dir.join("locked");
         fs::create_dir(&locked).unwrap();
