@@ -24,6 +24,47 @@ const FORMATS: [ArchiveVersion; 7] = [
 ];
 
 #[test]
+fn encrypted_legacy_volumes_preserve_non_utf8_password_failure_context() {
+    let payload = b"legacy compressed volume payload".repeat(32);
+    for format in [
+        ArchiveVersion::Rar29,
+        ArchiveVersion::Rar30,
+        ArchiveVersion::Rar40,
+    ] {
+        for header_encryption in [false, true] {
+            if format == ArchiveVersion::Rar29 && header_encryption {
+                continue;
+            }
+            let mut features = FeatureSet::store_only();
+            features.header_encryption = header_encryption;
+            let entry = rar15_40::FileEntry {
+                name: b"member",
+                data: &payload,
+                file_time: 0,
+                file_attr: 0x20,
+                host_os: 3,
+                password: Some(b"\xff"),
+                file_comment: None,
+            };
+            let error = rar15_40::write_compressed_volumes(
+                entry,
+                rar15_40::WriterOptions::new(format, features),
+                64,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.root_cause(),
+                &Error::Rar30Crypto(rars::crypto::rar30::Error::NonUtf8Password)
+            );
+            assert_eq!(
+                error.entry_context(),
+                Some((b"member".as_slice(), "encrypting volume member"))
+            );
+        }
+    }
+}
+
+#[test]
 fn compressed_legacy_volume_rejects_an_invalid_target_before_encoding() {
     let entry = rar15_40::FileEntry {
         name: b"file",
