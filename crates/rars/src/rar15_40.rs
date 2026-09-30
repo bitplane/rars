@@ -2663,7 +2663,8 @@ fn read_block_header_at(
         return Err(Error::TooShort);
     }
     let base = read_exact_at(file, absolute, 7)?;
-    let head_size = read_u16(&base, 5)? as usize;
+    // A successful exact read has admitted the entire fixed prefix.
+    let head_size = u16::from_le_bytes([base[5], base[6]]) as usize;
     if head_size < 7 {
         return Err(Error::InvalidHeader("RAR 1.5 block header is too short"));
     }
@@ -2710,10 +2711,11 @@ fn parse_block_header(input: &[u8], offset: usize) -> Result<BlockHeader> {
     if input.len() < offset + 7 {
         return Err(Error::TooShort);
     }
-    let head_crc = read_u16(input, offset)?;
-    let head_type = input[offset + 2];
-    let flags = read_u16(input, offset + 3)?;
-    let head_size = read_u16(input, offset + 5)?;
+    let prefix = &input[offset..offset + 7];
+    let head_crc = u16::from_le_bytes([prefix[0], prefix[1]]);
+    let head_type = prefix[2];
+    let flags = u16::from_le_bytes([prefix[3], prefix[4]]);
+    let head_size = u16::from_le_bytes([prefix[5], prefix[6]]);
     if head_size < 7 {
         return Err(Error::InvalidHeader("RAR 1.5 block header is too short"));
     }
