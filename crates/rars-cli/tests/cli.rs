@@ -431,6 +431,46 @@ fn info_identifies_self_extracting_archives_and_unpacked_legacy_comments() {
 }
 
 #[test]
+fn legacy_stdout_aliases_emit_archives_and_quick_open_refuses_encrypted_headers() {
+    let root = scratch("stdout-aliases-and-header-conflict");
+    let source = root.join("payload.txt");
+    fs::write(&source, b"stdout payload").unwrap();
+    for destination in ["-", "/dev/stdout"] {
+        let output = rars()
+            .args(["add", "--format", "rar14", "--store", destination])
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        let archive = rars::rar13::Archive::parse(&output.stdout).unwrap();
+        assert_eq!(archive.entries.len(), 1);
+        assert_eq!(archive.entries[0].name, b"payload.txt");
+        let saved = root.join("captured.rar");
+        fs::write(&saved, &output.stdout).unwrap();
+        assert_archive_tests_and_extracts_file(&saved, None, "payload.txt", b"stdout payload");
+    }
+    let archive = root.join("conflict.rar");
+    let conflict = rars()
+        .args([
+            "add",
+            "--format",
+            "rar50",
+            "--store",
+            "--quick-open",
+            "--encrypt-headers",
+            "--password",
+            "pass",
+        ])
+        .arg(&archive)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(!conflict.status.success());
+    assert!(stderr(&conflict).contains("quick-open cannot be combined with header encryption"));
+    assert!(!archive.exists());
+}
+
+#[test]
 fn test_verifies_rar15_40_stored_fixture() {
     let output = rars()
         .arg("test")

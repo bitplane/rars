@@ -2117,6 +2117,18 @@ pub(crate) fn resolve_password_args(args: &PasswordArgs) -> CliResult<Option<Pas
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn repeated_worker_configuration_reports_the_global_pool_error() {
+        // Other tests may have initialized Rayon already. Either way, a second
+        // attempt must expose the library error through the CLI diagnostic.
+        let _ = super::configure_threads(Some(2));
+        let error = super::configure_threads(Some(2)).unwrap_err();
+        assert_eq!(error.exit_code(), 1);
+        assert!(error
+            .to_string()
+            .contains("failed to configure parallel workers"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn buffered_volume_warning_uses_file_sizes_without_reading_payloads() {
