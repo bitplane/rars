@@ -5735,6 +5735,49 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     }
 
     #[test]
+    fn match_search_respects_fresh_distance_length_adjustments() {
+        for distance in [0x1fff, 0x2000, 0x3ffff, 0x40000] {
+            let mut input = vec![0xff; distance + 4];
+            input[..4].copy_from_slice(b"ABCD");
+            input[distance..].copy_from_slice(b"ABCD");
+            let mut finder = Rar29MatchFinder::new(input.len());
+            finder.insert(&input, 0);
+            let options = EncodeOptions::default();
+            let fresh = best_match(
+                &input,
+                distance,
+                input.len(),
+                &finder,
+                options,
+                &EncoderMatchState::default(),
+            );
+            if distance == 0x40000 {
+                assert_eq!(fresh, None);
+            } else {
+                let candidate = fresh.unwrap();
+                assert_eq!((candidate.length, candidate.offset), (4, distance));
+            }
+
+            // A prior legal five-byte fresh match establishes this distance.
+            // Repeat-distance lengths do not receive fresh-distance additions.
+            let mut state = EncoderMatchState::default();
+            assert!(matches!(
+                state.encode_match(5, distance).unwrap(),
+                super::EncodedMatch::Fresh { .. }
+            ));
+            state.remember(5, distance);
+            let repeated = best_match(&input, distance, input.len(), &finder, options, &state).unwrap();
+            assert_eq!((repeated.length, repeated.offset), (4, distance));
+            assert!(matches!(
+                state
+                    .encode_match(repeated.length, repeated.offset)
+                    .unwrap(),
+                super::EncodedMatch::RepeatOffset { index: 0, .. }
+            ));
+        }
+    }
+
+    #[test]
     fn match_search_ignores_a_remembered_offset_outside_its_window() {
         let input = b"abcdefghijklmnop";
         let finder = Rar29MatchFinder::new(input.len());
