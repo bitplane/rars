@@ -2961,60 +2961,86 @@ mod tests {
             }
         }
 
-        let bytes = write_stored_archive_with_comment(
-            &[StoredEntry {
-                name: b"member",
-                data: b"payload",
-                file_time: 0,
-                file_attr: 0x20,
-                host_os: 3,
-                password: None,
-                file_comment: None,
-            }],
-            WriterOptions::default(),
-            Some(b"archive comment"),
-        )
-        .unwrap();
-        let operations = Arc::new(AtomicUsize::new(0));
-        let parse = |fail_at, cancellation: Option<&crate::ReadCancellation>| {
-            operations.store(0, Ordering::Relaxed);
-            Archive::parse_seekable(
-                FaultReader {
-                    input: Cursor::new(bytes.clone()),
-                    operations: operations.clone(),
-                    fail_at,
-                    cancellation: cancellation.cloned(),
-                },
-                bytes.len() as u64,
-                0,
-                ArchiveSource::Memory(Arc::from(bytes.clone())),
-                cancellation.map_or_else(crate::ArchiveReadOptions::new, |token| {
-                    crate::ArchiveReadOptions::new().with_cancellation(token)
-                }),
-            )
-        };
-        let archive = parse(usize::MAX, None).unwrap();
-        assert_eq!(archive.files().count(), 1);
-        assert_eq!(
-            archive.archive_comment().unwrap().as_deref(),
-            Some(&b"archive comment"[..])
-        );
-        let count = operations.load(Ordering::Relaxed);
-        assert!(count > 0);
-        for operation in 0..count {
-            let error = parse(operation, None).unwrap_err();
-            match error.root_cause() {
-                Error::Io(error) => {
-                    assert_eq!(error.kind, io::ErrorKind::PermissionDenied);
-                    assert_eq!(error.message, "input fault");
+        let mut cases = Vec::new();
+        for (target, encrypted) in [
+            (ArchiveVersion::Rar15, false),
+            (ArchiveVersion::Rar20, false),
+            (ArchiveVersion::Rar29, false),
+            (ArchiveVersion::Rar30, true),
+            (ArchiveVersion::Rar40, true),
+        ] {
+            let mut builder = crate::Builder::new(target)
+                .store(true)
+                .comment(Some(b"archive comment".to_vec()))
+                .password(encrypted.then(|| b"secret".to_vec()))
+                .header_encryption(encrypted);
+            builder
+                .add_bytes(b"member".to_vec(), b"payload".to_vec(), None, None)
+                .unwrap();
+            cases.push((builder.to_bytes().unwrap(), encrypted));
+        }
+        // Historical recovery records cannot be produced by the legacy writer.
+        for bytes in [
+            &include_bytes!("../tests/fixtures/rar15_40/rar250_protect_head_rr1.rar")[..],
+            &include_bytes!("../tests/fixtures/rar15_40/rar300/with_recovery_rar300.rar")[..],
+        ] {
+            cases.push((bytes.to_vec(), false));
+        }
+        for (bytes, encrypted) in cases {
+            let options = if encrypted {
+                crate::ArchiveReadOptions::with_password(b"secret")
+            } else {
+                crate::ArchiveReadOptions::new()
+            };
+            let expected = Archive::parse_with_options(&bytes, options).unwrap();
+            let operations = Arc::new(AtomicUsize::new(0));
+            let parse = |fail_at, cancellation: Option<&crate::ReadCancellation>| {
+                operations.store(0, Ordering::Relaxed);
+                Archive::parse_seekable(
+                    FaultReader {
+                        input: Cursor::new(bytes.clone()),
+                        operations: operations.clone(),
+                        fail_at,
+                        cancellation: cancellation.cloned(),
+                    },
+                    bytes.len() as u64,
+                    0,
+                    ArchiveSource::Memory(Arc::from(bytes.clone())),
+                    cancellation.map_or_else(|| options, |token| options.with_cancellation(token)),
+                )
+            };
+            let archive = parse(usize::MAX, None).unwrap();
+            assert_eq!(archive.blocks, expected.blocks);
+            assert_eq!(
+                archive.archive_comment().unwrap(),
+                expected.archive_comment().unwrap()
+            );
+            let count = operations.load(Ordering::Relaxed);
+            let cancelled = crate::ReadCancellation::new();
+            cancelled.cancel();
+            assert!(matches!(
+                parse(usize::MAX, Some(&cancelled))
+                    .unwrap_err()
+                    .root_cause(),
+                Error::Cancelled
+            ));
+            assert_eq!(operations.load(Ordering::Relaxed), 0);
+            assert!(count > 0);
+            for operation in 0..count {
+                let error = parse(operation, None).unwrap_err();
+                match error.root_cause() {
+                    Error::Io(error) => {
+                        assert_eq!(error.kind, io::ErrorKind::PermissionDenied);
+                        assert_eq!(error.message, "input fault");
+                    }
+                    error => panic!("operation {operation}: {error:?}"),
                 }
-                error => panic!("operation {operation}: {error:?}"),
+                assert_eq!(operations.load(Ordering::Relaxed), operation + 1);
+                let token = crate::ReadCancellation::new();
+                let error = parse(operation, Some(&token)).unwrap_err();
+                assert!(matches!(error.root_cause(), Error::Cancelled));
+                assert_eq!(operations.load(Ordering::Relaxed), operation + 1);
             }
-            assert_eq!(operations.load(Ordering::Relaxed), operation + 1);
-            let token = crate::ReadCancellation::new();
-            let error = parse(operation, Some(&token)).unwrap_err();
-            assert!(matches!(error.root_cause(), Error::Cancelled));
-            assert_eq!(operations.load(Ordering::Relaxed), operation + 1);
         }
     }
 
