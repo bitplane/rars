@@ -306,3 +306,35 @@ fn progress_reporter_debug_does_not_expose_the_callback() {
     let callback = |_event: WriteProgressEvent<'_>| {};
     assert_eq!(format!("{:?}", ProgressReporter(&callback)), "ProgressReporter(..)");
 }
+
+#[cfg(test)]
+#[test]
+fn callback_panic_keeps_peer_progress_and_completion_usable() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let panic_once = AtomicBool::new(true);
+    let reported = Mutex::new(Vec::new());
+    let callback = |event: WriteProgressEvent<'_>| {
+        if let WriteProgressEvent::Advanced {
+            completed_bytes, ..
+        } = event
+        {
+            if panic_once.swap(false, Ordering::Relaxed) {
+                panic!("injected progress callback panic");
+            }
+            reported.lock().unwrap().push(completed_bytes);
+        }
+    };
+    let work = WorkTracker::new(
+        Some(ProgressReporter(&callback)),
+        WriteOperation::Compression,
+        10,
+    );
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| work.advance(3));
+        assert!(worker.join().is_err());
+        let peer = scope.spawn(|| work.advance(2));
+        assert!(peer.join().unwrap());
+    });
+    assert!(work.finish());
+    assert_eq!(*reported.lock().unwrap(), [5, 10]);
+}
