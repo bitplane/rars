@@ -22,7 +22,12 @@ pub(crate) fn resolve_password(
         if path == Path::new("-") {
             return Ok(Some(read_password_value("-")?));
         }
-        let bytes = Zeroizing::new(fs::read(path)?);
+        let bytes = Zeroizing::new(fs::read(path).map_err(|error| {
+            CliError::general(format!(
+                "failed to read password file '{}': {error}",
+                path.display()
+            ))
+        })?);
         return Ok(Some(trim_password_line(bytes)));
     }
     Ok(None)
@@ -196,7 +201,11 @@ mod tests {
             Some(b"inline".as_slice())
         );
         assert!(resolve_password(None, None).unwrap().is_none());
-        assert!(resolve_password(None, Some(&root.join("missing"))).is_err());
+        let missing = root.join("missing");
+        let error = resolve_password(None, Some(&missing)).unwrap_err();
+        assert_eq!(error.exit_code(), 1);
+        assert!(error.to_string().contains("failed to read password file"));
+        assert!(error.to_string().contains(&missing.display().to_string()));
         assert!(should_prompt_password(true));
         assert!(!should_prompt_password(false));
     }
