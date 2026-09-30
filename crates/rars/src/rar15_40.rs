@@ -8,7 +8,7 @@ use crate::crypto::rar30::{Error as Rar30Error, Rar30Cipher};
 use crate::detect::{find_archive_start, ArchiveSignature, RAR15_SIGNATURE, SFX_SCAN_LIMIT};
 use crate::error::{Error, Result};
 use crate::features::FeatureSet;
-use crate::io_util::{align16 as checked_align16, read_exact_at, read_u16, read_u32};
+use crate::io_util::{read_exact_at, read_u16, read_u32};
 pub(crate) use crate::source::ArchiveSource;
 use crate::version::ArchiveFamily;
 use crate::ArchiveVersion;
@@ -514,7 +514,8 @@ impl FileHeader {
         const ADD_SECOND: u8 = 0x4;
         const TICK_NANOSECONDS: u32 = 100;
 
-        let flags = u16::from_le_bytes(self.ext_time.get(..2)?.try_into().ok()?);
+        let flag_bytes = self.ext_time.get(..2)?;
+        let flags = u16::from_le_bytes([flag_bytes[0], flag_bytes[1]]);
         let rmode = ((flags >> 12) & 0xf) as u8;
         if rmode & PRESENT == 0 {
             return None;
@@ -1892,8 +1893,10 @@ fn parse_protect_header(
     let add_size = block.add_size.ok_or(Error::InvalidHeader(
         "RAR 2.x recovery header is missing data size",
     ))?;
-    let rec_sectors = read_u16(input, 12)?;
-    let total_blocks = read_u32(input, 14)?;
+    // The parser admitted the complete 26-byte block before dispatching here.
+    let fixed = &input[..26];
+    let rec_sectors = u16::from_le_bytes([fixed[12], fixed[13]]);
+    let total_blocks = u32::from_le_bytes([fixed[14], fixed[15], fixed[16], fixed[17]]);
     // These wire fields are u32 and u16; their maximum sum fits in u64.
     let expected_add_size = u64::from(total_blocks) * 2 + u64::from(rec_sectors) * 512;
     if add_size != expected_add_size {
@@ -1901,11 +1904,7 @@ fn parse_protect_header(
             "RAR 2.x recovery data size does not match header",
         ));
     }
-    let mark: [u8; 8] = input
-        .get(18..26)
-        .ok_or(Error::TooShort)?
-        .try_into()
-        .expect("RAR protect mark size");
+    let mark: [u8; 8] = fixed[18..26].try_into().expect("RAR protect mark size");
     let data_start = archive_offset
         .checked_add(block.offset)
         .and_then(|offset| offset.checked_add(block.head_size as usize))
@@ -1920,7 +1919,7 @@ fn parse_protect_header(
         ))?;
     Ok(ProtectHeader {
         block: block.clone(),
-        version: *input.get(11).ok_or(Error::TooShort)?,
+        version: fixed[11],
         rec_sectors,
         total_blocks,
         mark,
@@ -2299,11 +2298,12 @@ fn decrypt_encrypted_header_at(
     cipher
         .decrypt_in_place(&mut first_block)
         .map_err(map_rar30_crypto_error)?;
-    let head_size = read_u16(&first_block, 5)? as usize;
+    let head_size = u16::from_le_bytes([first_block[5], first_block[6]]) as usize;
     if head_size < 7 {
         return Err(Error::InvalidHeader("RAR 1.5 block header is too short"));
     }
-    let encrypted_header_size = checked_align16(head_size, "RAR 1.5 block size overflows usize")?;
+    // A u16 wire length rounds to at most 65536, including on 32-bit hosts.
+    let encrypted_header_size = head_size.next_multiple_of(16);
     let encrypted_start = offset
         .checked_add(8)
         .ok_or(Error::InvalidHeader("RAR 1.5 block offset overflows usize"))?;
@@ -2367,11 +2367,12 @@ fn read_encrypted_header_at(
     cipher
         .decrypt_in_place(&mut first_block)
         .map_err(map_rar30_crypto_error)?;
-    let head_size = read_u16(&first_block, 5)? as usize;
+    let head_size = u16::from_le_bytes([first_block[5], first_block[6]]) as usize;
     if head_size < 7 {
         return Err(Error::InvalidHeader("RAR 1.5 block header is too short"));
     }
-    let encrypted_header_size = checked_align16(head_size, "RAR 1.5 block size overflows usize")?;
+    // A u16 wire length rounds to at most 65536, including on 32-bit hosts.
+    let encrypted_header_size = head_size.next_multiple_of(16);
     let encrypted_start = absolute
         .checked_add(8)
         .ok_or(Error::InvalidHeader("RAR 1.5 block offset overflows usize"))?;
@@ -2427,15 +2428,17 @@ fn parse_file_like_header(
     let start = block.offset;
     let head_end = start + block.head_size as usize;
 
-    let pack_low = read_u32(input, start + 7)? as u64;
-    let unp_low = read_u32(input, start + 11)? as u64;
-    let host_os = input[start + 15];
-    let file_crc = read_u32(input, start + 16)?;
-    let file_time = read_u32(input, start + 20)?;
-    let unp_ver = input[start + 24];
-    let method = input[start + 25];
-    let name_size = read_u16(input, start + 26)? as usize;
-    let attr = read_u32(input, start + 28)?;
+    // Complete block admission plus the minimum-size guard bounds base fields.
+    let fixed = &input[start..start + 32];
+    let pack_low = u32::from_le_bytes([fixed[7], fixed[8], fixed[9], fixed[10]]) as u64;
+    let unp_low = u32::from_le_bytes([fixed[11], fixed[12], fixed[13], fixed[14]]) as u64;
+    let host_os = fixed[15];
+    let file_crc = u32::from_le_bytes([fixed[16], fixed[17], fixed[18], fixed[19]]);
+    let file_time = u32::from_le_bytes([fixed[20], fixed[21], fixed[22], fixed[23]]);
+    let unp_ver = fixed[24];
+    let method = fixed[25];
+    let name_size = u16::from_le_bytes([fixed[26], fixed[27]]) as usize;
+    let attr = u32::from_le_bytes([fixed[28], fixed[29], fixed[30], fixed[31]]);
     let mut pos = start + 32;
 
     let (pack_size, unp_size) = if block.flags & FHD_LARGE != 0 {
@@ -2773,8 +2776,9 @@ fn file_header_comment_crc_end(input: &[u8], offset: usize) -> Result<usize> {
     if input.len() < offset + 32 {
         return Err(Error::TooShort);
     }
-    let flags = read_u16(input, offset + 3)?;
-    let name_size = read_u16(input, offset + 26)? as usize;
+    let fixed = &input[offset..offset + 32];
+    let flags = u16::from_le_bytes([fixed[3], fixed[4]]);
+    let name_size = u16::from_le_bytes([fixed[26], fixed[27]]) as usize;
     let mut end = offset + 32;
     // Offset is within a physical slice; the remaining fields add at most
     // a u16 name length plus two eight-byte fields, so usize cannot overflow.
@@ -2921,6 +2925,51 @@ mod tests {
         assert_eq!(reader.reads, [24]);
     }
     use super::*;
+
+    #[test]
+    fn directory_callbacks_preserve_failure_and_cancellation_in_both_extractors() {
+        let mut builder = crate::Builder::new(ArchiveVersion::Rar29);
+        builder
+            .add_directory(b"directory".to_vec(), None, None)
+            .unwrap();
+        let archive = Archive::parse_owned(builder.to_bytes().unwrap()).unwrap();
+        for parallel in [false, true] {
+            for cancel in [false, true] {
+                let token = crate::ReadCancellation::new();
+                let mut calls = 0;
+                let open = |meta: &ExtractedEntryMeta| -> Result<Box<dyn Write>> {
+                    calls += 1;
+                    assert!(meta.is_directory);
+                    assert_eq!(meta.name, b"directory");
+                    if cancel {
+                        token.cancel();
+                        Ok(Box::new(std::io::sink()))
+                    } else {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "directory refused",
+                        )
+                        .into())
+                    }
+                };
+                let options = crate::ArchiveReadOptions::new().with_cancellation(&token);
+                let error = if parallel {
+                    archive.extract_to_parallel_buffered(options, open)
+                } else {
+                    archive.extract_to(options, open)
+                }
+                .unwrap_err();
+                if cancel {
+                    assert!(matches!(error.root_cause(), Error::Cancelled));
+                } else {
+                    assert!(
+                        matches!(error.root_cause(), Error::Io(error) if error.kind == std::io::ErrorKind::PermissionDenied && error.message == "directory refused")
+                    );
+                }
+                assert_eq!(calls, 1);
+            }
+        }
+    }
 
     #[test]
     fn block_prefix_truncation_returns_too_short_before_field_decoding() {
