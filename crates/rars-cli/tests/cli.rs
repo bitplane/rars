@@ -514,6 +514,170 @@ fn info_keeps_file_comment_services_separate_from_archive_comments() {
 }
 
 #[test]
+fn explicit_utf8_legacy_decoding_refuses_invalid_names_without_outputs() {
+    let root = scratch("legacy-name-decoding-errors");
+    let legacy13 = write_stored_archive(
+        &[StoredEntry {
+            name: b"\xff.txt",
+            data: b"payload",
+            file_time: 0,
+            file_attr: 0x20,
+            password: None,
+            file_comment: None,
+        }],
+        WriterOptions::default(),
+    )
+    .unwrap();
+    let legacy15 = rar15_40::write_stored_archive(
+        &[rar15_40::StoredEntry {
+            name: b"\xff.txt",
+            data: b"payload",
+            file_time: 0,
+            file_attr: 0x20,
+            host_os: 3,
+            password: None,
+            file_comment: None,
+        }],
+        rar15_40::WriterOptions::new(rars::ArchiveVersion::Rar15, rars::FeatureSet::store_only()),
+    )
+    .unwrap();
+    for (index, bytes) in [legacy13, legacy15].into_iter().enumerate() {
+        let archive = root.join(format!("legacy-{index}.rar"));
+        fs::write(&archive, bytes).unwrap();
+        for verbose in [false, true] {
+            let mut command = rars();
+            command.args(["info", "--legacy-name-encoding", "utf-8"]);
+            if verbose {
+                command.arg("--verbose");
+            }
+            let output = command.arg(&archive).output().unwrap();
+            assert_eq!(output.status.code(), Some(1));
+            assert!(stderr(&output).contains("legacy name is not valid UTF-8"));
+        }
+        let destination = root.join(format!("out-{index}"));
+        let extract = rars()
+            .args(["extract", "--legacy-name-encoding", "utf-8"])
+            .arg(&archive)
+            .arg(&destination)
+            .output()
+            .unwrap();
+        assert_eq!(extract.status.code(), Some(1));
+        assert!(stderr(&extract).contains("legacy name is not valid UTF-8"));
+        assert!(!destination.exists());
+    }
+}
+
+#[test]
+fn unicode_archive_names_override_explicit_legacy_encoding() {
+    let root = scratch("unicode-overrides-legacy-encoding");
+    let output = rars()
+        .args([
+            "extract",
+            "--legacy-name-encoding",
+            "cp850",
+            "--password",
+            "test",
+        ])
+        .arg(fixture_rar15_40(
+            "encrypted/rar4_junrar_file_content_encrypted_unicode.rar",
+        ))
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        fs::read(root.join("新建文本文档.txt")).unwrap(),
+        b"aaaaaaaaaa"
+    );
+}
+
+#[test]
+fn creates_encrypted_rar14_archives_through_the_streaming_cli() {
+    for stored in [false, true] {
+        let root = scratch("rar14-encrypted-streaming");
+        let source = root.join("secret.txt");
+        let archive = root.join("encrypted.rar");
+        fs::write(&source, b"legacy secret").unwrap();
+        let mut command = rars();
+        command.args(["add", "--format", "rar14", "--password", "pass"]);
+        if stored {
+            command.arg("--store");
+        }
+        let output = command.arg(&archive).arg(&source).output().unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert_archive_tests_and_extracts_file(
+            &archive,
+            Some("pass"),
+            "secret.txt",
+            b"legacy secret",
+        );
+    }
+}
+
+#[test]
+fn legacy_volume_output_creation_failure_has_context_and_leaves_no_archive() {
+    let root = scratch("legacy-volume-output-error");
+    let source = root.join("payload.txt");
+    let archive = root.join("missing/split.rar");
+    fs::write(&source, b"volume output error payload").unwrap();
+    let output = rars()
+        .args([
+            "add",
+            "--format",
+            "rar14",
+            "--store",
+            "--volume-size",
+            "256",
+        ])
+        .arg(&archive)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let text = stderr(&output);
+    assert!(
+        text.contains("failed to write volume set starting at"),
+        "{text}"
+    );
+    assert!(text.contains(&archive.display().to_string()), "{text}");
+    assert!(!archive.exists());
+    assert!(!root.join("missing").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn streaming_input_permission_failures_preserve_existing_archives() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = scratch("streaming-input-permission-errors");
+    let source = root.join("private.txt");
+    let archive = root.join("existing.rar");
+    fs::write(&source, b"private payload").unwrap();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o0)).unwrap();
+    if fs::File::open(&source).is_ok() {
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+        return; // privileged runners bypass Unix file permissions
+    }
+    for format in ["rar14", "rar50"] {
+        fs::write(&archive, b"existing archive").unwrap();
+        let output = rars()
+            .args(["add", "--format", format, "--store"])
+            .arg(&archive)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+        assert!(
+            stderr(&output).contains("private.txt"),
+            "{}",
+            stderr(&output)
+        );
+        assert_eq!(fs::read(&archive).unwrap(), b"existing archive");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
+    }
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[test]
 fn test_verifies_rar15_40_stored_fixture() {
     let output = rars()
         .arg("test")
