@@ -2927,6 +2927,88 @@ mod tests {
     use super::*;
 
     #[test]
+    fn comment_decoders_preserve_limits_and_each_cancellation_checkpoint() {
+        let text = b"checkpoint comment";
+        for (version, method, packed) in [
+            (15, 0x30, text.to_vec()),
+            (
+                15,
+                0x31,
+                crate::codec::rar13::unpack15_encode(text).unwrap(),
+            ),
+            (
+                20,
+                0x31,
+                crate::codec::rar20::unpack20_encode_literals(text).unwrap(),
+            ),
+            (
+                26,
+                0x31,
+                crate::codec::rar20::unpack20_encode_literals(text).unwrap(),
+            ),
+        ] {
+            let mut block = block_header_with(0);
+            block.head_type = COMM_HEAD;
+            block.head_size = COMMENT_HEADER_SIZE as u16;
+            let comment = CommentHeader {
+                block,
+                unp_size: text.len() as u16,
+                unp_ver: version,
+                method,
+                comment_crc: (crc32(text) & 0xffff) as u16,
+                packed_range: 0..packed.len(),
+            };
+            assert_eq!(comment.decode(&packed).unwrap(), text);
+            let mut limited = crate::output_limit::OutputBudget::new(
+                crate::ArchiveReadOptions::new().with_max_member_output_bytes(0),
+            );
+            assert!(matches!(
+                comment
+                    .decode_with_budget(&packed, &mut limited)
+                    .unwrap_err()
+                    .root_cause(),
+                Error::MemberOutputLimitExceeded { .. }
+            ));
+            let mut completed = false;
+            for checks in 0..128 {
+                let token = crate::ReadCancellation::new();
+                let mut budget = crate::output_limit::OutputBudget::new(
+                    crate::ArchiveReadOptions::new().with_cancellation(&token),
+                );
+                budget.control.cancel_after_checks(checks);
+                match comment.decode_with_budget(&packed, &mut budget) {
+                    Ok(output) => {
+                        assert_eq!(output, text);
+                        assert!(checks > 2);
+                        completed = true;
+                        break;
+                    }
+                    Err(error) => assert!(
+                        matches!(error.root_cause(), Error::Cancelled),
+                        "version {version}, check {checks}: {error:?}"
+                    ),
+                }
+            }
+            assert!(
+                completed,
+                "version {version}: checkpoint sweep did not finish"
+            );
+        }
+    }
+
+    #[test]
+    fn file_comment_rejects_a_complete_but_undersized_comment_header() {
+        let mut file = file_header_with(FHD_COMMENT);
+        file.file_comment = comment_block(b"note");
+        file.file_comment[5..7].copy_from_slice(&12u16.to_le_bytes());
+        test_write_header_crc(&mut file.file_comment[..12], 0);
+        assert!(matches!(
+            file.file_comment(),
+            Err(Error::InvalidHeader("RAR 1.5 comment header is too short"))
+        ));
+    }
+
+    #[test]
     fn directory_callbacks_preserve_failure_and_cancellation_in_both_extractors() {
         let mut builder = crate::Builder::new(ArchiveVersion::Rar29);
         builder
