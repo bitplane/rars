@@ -7176,6 +7176,13 @@ mod tests {
         assert!(!tables.align.is_empty());
         assert!(!tables.length.is_empty());
         assert!(!tables.align_mode);
+        let copied = tables.clone();
+        drop(tables);
+        for table in [&copied.main, &copied.distance, &copied.align, &copied.length] {
+            assert!(!table.is_empty());
+            assert_eq!(table.decode(&mut BitReader::new(&[0])).unwrap(), 0);
+        }
+        assert!(!copied.align_mode);
     }
 
     #[test]
@@ -8053,6 +8060,42 @@ mod tests {
             second
         );
         assert!(solid.len() < standalone.len());
+    }
+
+    #[test]
+    fn public_decoder_clone_keeps_independent_solid_history_and_tables() {
+        let first = b"RAR5 independent decoder history ".repeat(32);
+        let second = b"RAR5 independent decoder history ".repeat(8);
+        let packed_first = encode_lz_member(&first, 0).unwrap();
+        let packed_second = encode_lz_member_with_history(&second, &first, 0).unwrap();
+        let mut original = Unpack50Decoder::new();
+        assert_eq!(
+            original
+                .decode_member(&packed_first, 0, first.len(), false, DecodeMode::Lz)
+                .unwrap(),
+            first
+        );
+        let mut copied = original.clone();
+        let other = b"a different non-solid member";
+        assert_eq!(
+            original
+                .decode_member(
+                    &encode_lz_member(other, 0).unwrap(),
+                    0,
+                    other.len(),
+                    false,
+                    DecodeMode::Lz
+                )
+                .unwrap(),
+            other
+        );
+        drop(original);
+        assert_eq!(
+            copied
+                .decode_member(&packed_second, 0, second.len(), true, DecodeMode::Lz)
+                .unwrap(),
+            second
+        );
     }
 
     #[test]

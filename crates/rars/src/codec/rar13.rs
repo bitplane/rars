@@ -2330,6 +2330,37 @@ mod tests {
     use crate::codec::Error;
 
     #[test]
+    fn public_decoder_clone_keeps_independent_solid_history_and_tables() {
+        let first = b"legacy adaptive solid history ".repeat(32);
+        let second = b"legacy adaptive solid history ".repeat(8);
+        let mut encoder = super::Unpack15Encoder::new();
+        let packed_first = encoder.encode_member(&first).unwrap();
+        let packed_second = encoder.encode_member(&second).unwrap();
+        let mut original = super::Unpack15::new();
+        assert_eq!(
+            original
+                .decode_member(&packed_first, first.len(), false)
+                .unwrap(),
+            first
+        );
+        let mut copied = original.clone();
+        let other = b"a different non-solid member";
+        assert_eq!(
+            original
+                .decode_member(&super::unpack15_encode(other).unwrap(), other.len(), false)
+                .unwrap(),
+            other
+        );
+        drop(original);
+        assert_eq!(
+            copied
+                .decode_member(&packed_second, second.len(), true)
+                .unwrap(),
+            second
+        );
+    }
+
+    #[test]
     fn reader15_workspace_refusals_release_window_input_output_and_checkpoint() {
         use crate::codec::workspace::{Allowance, RefusingBudget};
         let data = b"legacy reader owned capacity\n".repeat(32);

@@ -4067,6 +4067,35 @@ fn audio_decode_with_allowance<B: Budget>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn public_decoder_clone_keeps_independent_lz_and_ppmd_solid_state() {
+        let first = b"RAR29 model and window history ".repeat(32);
+        let second = b"RAR29 model and window history ".repeat(8);
+        for engine in [super::ChainEngine::Lz, super::ChainEngine::Ppmd] {
+            let mut encoder = super::Unpack29Encoder::new();
+            let packed_first = encoder
+                .encode_member_with_engine(&first, engine, &[], &mut |_| true)
+                .unwrap();
+            let packed_second = encoder
+                .encode_member_with_engine(&second, engine, &[], &mut |_| true)
+                .unwrap();
+            let mut original = super::Unpack29::new();
+            assert_eq!(
+                original
+                    .decode_non_solid_member(&packed_first, first.len())
+                    .unwrap(),
+                first
+            );
+            let mut copied = original.clone();
+            original.reset_non_solid();
+            drop(original);
+            assert_eq!(
+                copied.decode_member(&packed_second, second.len()).unwrap(),
+                second
+            );
+        }
+    }
+
     fn refuse_each_rar29_allocation(
         mut run: impl FnMut(&crate::codec::workspace::RefusingBudget) -> Result<()>,
     ) {
