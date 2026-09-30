@@ -1232,6 +1232,111 @@ pub(super) fn compress_members_reporting(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[test]
+    fn stream_creation_failure_keeps_member_context_before_opening_source() {
+        let scratch = crate::scratch::case("stream-creation-context");
+        for solid in [false, true] {
+            let resources = WriterResources::new(128 * 1024 * 1024)
+                .with_max_memory_bytes(128 * 1024 * 1024)
+                .with_temp_dir(scratch.join("missing-directory"));
+            let options = EncodeOptions::new(8).with_max_match_distance(65536);
+            let plan = CompressPlan {
+                algorithm_version: 0,
+                encode_options: options,
+                dictionary_size: 65536,
+                block_size: 65536,
+                solid,
+                method: 1,
+                filter_policy: FilterPolicy::None,
+                candidates: vec![options].into(),
+            };
+            let source = EntrySource::from_opener(1, || {
+                panic!("spool creation must fail before opening the source")
+            });
+            let error = compress_members_with_context(
+                &[source],
+                &plan,
+                &resources,
+                &|_| true,
+                &|index, error| {
+                    assert_eq!(index, 0);
+                    error.at_entry(b"unopened.bin".to_vec(), "compressing")
+                },
+            )
+            .err()
+            .unwrap();
+            assert_eq!(error.kind(), crate::ErrorKind::Io);
+            assert_eq!(
+                error.entry_context(),
+                Some((b"unopened.bin".as_slice(), "compressing"))
+            );
+            assert_eq!(resources.workspace_in_use(), 0);
+            assert_eq!(resources.managed_memory_in_use(), 0);
+            assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
+        }
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[test]
+    fn cancellation_after_wave_check_keeps_admission_error_context() {
+        struct CancelAfterObservation(crate::WriteCancellation);
+        impl CompressionProgress for CancelAfterObservation {
+            fn advance(&self, _: u64) -> bool {
+                !self.0.is_cancelled()
+            }
+            fn is_cancelled(&self) -> bool {
+                // Model cancellation arriving just after the observation.
+                let observed = self.0.is_cancelled();
+                self.0.cancel();
+                observed
+            }
+        }
+        let scratch = crate::scratch::case("wave-admission-context");
+        let resources = WriterResources::new(128 * 1024 * 1024).with_temp_dir(&*scratch);
+        let options = EncodeOptions::new(8).with_max_match_distance(65536);
+        let plan = CompressPlan {
+            algorithm_version: 0,
+            encode_options: options,
+            dictionary_size: 65536,
+            block_size: 65536,
+            solid: false,
+            method: 1,
+            filter_policy: FilterPolicy::Auto,
+            candidates: vec![options].into(),
+        };
+        let execution = ExecutionPlan::with_resources(&plan, [32].into_iter(), &resources).unwrap();
+        let ExecutionPlan::IndependentMembers(members) = execution else {
+            panic!("expected whole-member plan");
+        };
+        assert_eq!(members[0].execution, Execution::WholeMember);
+        let source = EntrySource::from_opener(32, || {
+            panic!("cancelled admission must precede source opening")
+        });
+        let progress = CancelAfterObservation(crate::WriteCancellation::new());
+        let error = compress_members_whole(
+            &[source],
+            &[(32, 0, [0; 32])],
+            &plan,
+            &members,
+            &resources,
+            &progress,
+            &|index, error| {
+                assert_eq!(index, 0);
+                error.at_entry(b"waiting.bin".to_vec(), "compressing")
+            },
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), crate::ErrorKind::Cancelled);
+        assert_eq!(
+            error.entry_context(),
+            Some((b"waiting.bin".as_slice(), "compressing"))
+        );
+        assert_eq!(resources.workspace_in_use(), 0);
+        assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
+    }
+
     #[test]
     fn streaming_compression_releases_each_refused_preparation_allocation() {
         use std::sync::atomic::Ordering;
