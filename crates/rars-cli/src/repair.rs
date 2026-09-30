@@ -21,15 +21,19 @@ pub(crate) fn cmd_repair(args: RepairArgs) -> CliResult<()> {
     let archive = read_archive_path_prompting(&paths[0], &mut password);
     match archive {
         Ok(archive) => {
-            let mut output = fs::File::create(&paths[1])?;
-            let report = archive
-                .repair_recovery_to_with_report(
-                    &mut output,
-                    crate::password::password_bytes(&password),
-                )
-                .map_err(|err| {
-                    format!("failed to repair archive '{}': {err}", paths[0].display())
-                })?;
+            let report = crate::write_archive_file(&paths[1], |output| {
+                archive
+                    .repair_recovery_to_with_report(
+                        output,
+                        crate::password::password_bytes(&password),
+                    )
+                    .map_err(|err| {
+                        CliError::general(format!(
+                            "failed to repair archive '{}': {err}",
+                            paths[0].display()
+                        ))
+                    })
+            })?;
             print_repair_report(&paths[1], report);
         }
         Err(parse_error) => {
@@ -48,8 +52,11 @@ pub(crate) fn cmd_repair(args: RepairArgs) -> CliResult<()> {
                         paths[0].display(), parse_error, repair_error
                     )
                 })?;
-            fs::write(&paths[1], &repaired.data)?;
-            print_repair_report(&paths[1], repaired.report);
+            let report = crate::write_archive_file(&paths[1], |output| {
+                output.write_all(&repaired.data)?;
+                Ok(repaired.report)
+            })?;
+            print_repair_report(&paths[1], report);
         }
     }
     Ok(())
@@ -240,4 +247,107 @@ fn repaired_volume_path(
             .unwrap_or_else(|_| out_dir.join(format!("repaired.part{}.rar", index + 1)));
     }
     out_dir.join(format!("repaired.part{}.rar", index + 1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn repair(input: &Path, output: &Path) -> CliResult<()> {
+        cmd_repair(RepairArgs {
+            password: crate::cli::PasswordArgs {
+                password: None,
+                password_file: None,
+            },
+            paths: vec![input.to_path_buf(), output.to_path_buf()],
+        })
+    }
+
+    fn destinations(root: &Path, input: &Path) -> Vec<PathBuf> {
+        let output = root.join("existing.rar");
+        fs::write(&output, b"existing destination").unwrap();
+        let paths = vec![output, input.to_path_buf()];
+        #[cfg(unix)]
+        let paths = {
+            let mut paths = paths;
+            let hard = root.join("hard.rar");
+            fs::hard_link(input, &hard).unwrap();
+            let symbolic = root.join("symbolic.rar");
+            std::os::unix::fs::symlink(input, &symbolic).unwrap();
+            paths.extend([hard, symbolic]);
+            paths
+        };
+        paths
+    }
+
+    #[test]
+    fn repair_failure_preserves_existing_files() {
+        let root = crate::scratch::case("repair-preserves-failure");
+        let mut builder = rars::Builder::new(rars::ArchiveVersion::Rar50).store(true);
+        builder
+            .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+        let original = builder.to_bytes().unwrap();
+        let input = root.join("input.rar");
+        fs::write(&input, &original).unwrap();
+        for output in destinations(&root, &input) {
+            let previous = fs::read(&output).unwrap();
+            let error = repair(&input, &output).unwrap_err();
+            assert!(error.to_string().contains("failed to repair archive"));
+            assert_eq!(fs::read(&output).unwrap(), previous);
+            assert_eq!(fs::read(&input).unwrap(), original);
+        }
+        assert!(fs::read_dir(&*root).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".rars-writing-")));
+    }
+
+    #[test]
+    fn repair_success_replaces_destination_without_truncating_aliases() {
+        let root = crate::scratch::case("repair-safe-aliases");
+        let mut builder = rars::Builder::new(rars::ArchiveVersion::Rar50)
+            .store(true)
+            .recovery_percent(Some(20));
+        builder
+            .add_bytes(b"file".to_vec(), vec![b'p'; 4096], None, None)
+            .unwrap();
+        let original = builder.to_bytes().unwrap();
+        let archive = rars::ArchiveReader::read_owned(original.clone()).unwrap();
+        let range = archive
+            .as_rar50()
+            .unwrap()
+            .files()
+            .next()
+            .unwrap()
+            .block
+            .data_range
+            .clone();
+        let mut damaged = original.clone();
+        damaged[range.start + 16..range.start + 32].fill(0xa5);
+        let input = root.join("input.rar");
+        fs::write(&input, &damaged).unwrap();
+        let paths = destinations(&root, &input);
+        for output in paths
+            .iter()
+            .filter(|path| **path != input)
+            .chain(std::iter::once(&input))
+        {
+            repair(&input, output).unwrap();
+            assert_eq!(fs::read(output).unwrap(), original);
+            if output != &input {
+                assert_eq!(fs::read(&input).unwrap(), damaged);
+            }
+            assert!(!fs::symlink_metadata(output)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        }
+        assert!(fs::read_dir(&*root).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".rars-writing-")));
+    }
 }

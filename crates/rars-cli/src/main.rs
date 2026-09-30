@@ -1949,13 +1949,26 @@ fn write_archive_streaming(
     if archive_path == Path::new("-") || archive_path == Path::new("/dev/stdout") {
         return write(&mut std::io::stdout());
     }
+    write_archive_file(archive_path, write)
+}
+
+/// Replaces the destination entry only after writing and syncing succeeds.
+/// Existing symlinks and hard links are replaced rather than written through.
+fn write_archive_file<T>(
+    archive_path: &Path,
+    write: impl FnOnce(&mut dyn Write) -> CliResult<T>,
+) -> CliResult<T> {
     let (temporary, mut output) = create_streaming_archive_temp(archive_path)?;
-    let result = (|| -> CliResult<()> {
-        write(&mut output)?;
+    let result = (|| -> CliResult<T> {
+        let value = write(&mut output)?;
         output.sync_all()?;
-        fs::rename(&temporary, archive_path)?;
-        Ok(())
+        Ok(value)
     })();
+    drop(output);
+    let result = result.and_then(|value| {
+        fs::rename(&temporary, archive_path)?;
+        Ok(value)
+    });
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
