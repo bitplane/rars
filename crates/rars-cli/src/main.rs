@@ -2118,6 +2118,41 @@ pub(crate) fn resolve_password_args(args: &PasswordArgs) -> CliResult<Option<Pas
 #[cfg(test)]
 mod tests {
     #[test]
+    fn volume_publication_reports_backup_cleanup_failure_after_success() {
+        let root = crate::scratch::case("volume-backup-cleanup-failure");
+        let first = root.join("archive.rar");
+        let paths: Vec<_> = (0..2)
+            .map(|i| super::rar50_volume_part_path(&first, i, 2).unwrap())
+            .collect();
+        std::fs::write(&paths[0], b"old archive").unwrap();
+        let retained = root.join("retained-original");
+        let mut blocked_backup = None;
+        let error = stage_two_volumes(&first)
+            .finish_with_rename(Ok(()), |source, destination| {
+                if blocked_backup.is_none() {
+                    let backup = std::fs::read_dir(&root)?
+                        .map(|entry| entry.unwrap().path())
+                        .find(|path| std::fs::read(path).is_ok_and(|bytes| bytes == b"old archive"))
+                        .unwrap();
+                    // Simulate an external replacement after backup creation. The
+                    // real cleanup must report its error without undoing publication.
+                    std::fs::rename(&backup, &retained)?;
+                    std::fs::create_dir(&backup)?;
+                    blocked_backup = Some(backup);
+                }
+                std::fs::rename(source, destination)
+            })
+            .unwrap_err();
+        let error = error.to_string();
+        assert!(error.contains("volumes published, but cannot remove backups"));
+        assert!(error.contains(&blocked_backup.unwrap().display().to_string()));
+        assert_eq!(std::fs::read(retained).unwrap(), b"old archive");
+        for (i, path) in paths.iter().enumerate() {
+            assert_eq!(std::fs::read(path).unwrap(), format!("new {i}").as_bytes());
+        }
+    }
+
+    #[test]
     fn add_command_validation_and_filter_selection_preserve_explicit_requests() {
         use clap::Parser;
         let arguments = || {

@@ -195,6 +195,147 @@ fn info_displays_services_redirections_and_legacy_comments_in_both_modes() {
 }
 
 #[test]
+fn extraction_volume_failures_preserve_existing_files_and_legacy_encoding() {
+    let root = scratch("extract-volume-boundaries");
+    let output_directory = root.join("out");
+    let parts: Vec<_> = [
+        "rar300/stored_multivol_rar300.rar",
+        "rar300/stored_multivol_rar300.r00",
+        "rar300/stored_multivol_rar300.r01",
+        "rar300/stored_multivol_rar300.r02",
+    ]
+    .into_iter()
+    .map(fixture_rar15_40)
+    .collect();
+    let extract = rars()
+        .args(["extract", "--legacy-name-encoding", "cp850"])
+        .args(&parts)
+        .arg(&output_directory)
+        .output()
+        .unwrap();
+    assert!(extract.status.success(), "{}", stderr(&extract));
+    let destination = output_directory.join("stored-volume.txt");
+    assert_eq!(
+        fs::read(&destination).unwrap(),
+        expected_rar15_40_stored_volume_payload()
+    );
+    fs::write(&destination, b"keep existing contents").unwrap();
+    let refusal = rars()
+        .args(["extract", "--legacy-name-encoding", "cp850"])
+        .args(&parts)
+        .arg(&output_directory)
+        .output()
+        .unwrap();
+    assert!(!refusal.status.success());
+    assert!(stderr(&refusal).contains("failed to extract volume set"));
+    assert_eq!(fs::read(&destination).unwrap(), b"keep existing contents");
+    let incomplete = rars()
+        .arg("extract")
+        .args(&parts[..2])
+        .arg(root.join("incomplete"))
+        .output()
+        .unwrap();
+    assert!(!incomplete.status.success());
+    assert!(stderr(&incomplete).contains("failed to extract volume set"));
+
+    let single = rars()
+        .args(["extract", "--legacy-name-encoding", "cp850"])
+        .arg(fixture("README_store.rar"))
+        .arg(root.join("single"))
+        .output()
+        .unwrap();
+    assert!(single.status.success(), "{}", stderr(&single));
+    assert!(root.join("single/README").is_file());
+}
+
+#[test]
+fn info_displays_archive_name_and_creation_time_in_both_modes() {
+    let root = scratch("info-archive-metadata");
+    let source = root.join("file.txt");
+    let archive = root.join("named.rar");
+    fs::write(&source, b"metadata payload").unwrap();
+    let create = rars()
+        .args([
+            "add",
+            "--format",
+            "rar70",
+            "--store",
+            "--archive-name",
+            "original.rar",
+        ])
+        .arg(&archive)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(create.status.success(), "{}", stderr(&create));
+    for (arguments, name, time) in [
+        (vec!["info"], "Archive name: original.rar", "Created:"),
+        (
+            vec!["info", "--verbose"],
+            "archive name: original.rar",
+            "archive creation time:",
+        ),
+    ] {
+        let info = rars().args(arguments).arg(&archive).output().unwrap();
+        assert!(info.status.success(), "{}", stderr(&info));
+        let text = stdout(&info);
+        assert!(text.contains(name), "{text}");
+        assert!(text.contains(time), "{text}");
+    }
+}
+
+#[test]
+fn extracts_rar50_volume_fixture_through_the_cli() {
+    let root = scratch("extract-rar50-volumes");
+    let parts: Vec<_> = (1..=3)
+        .map(|part| fixture_rar50(&format!("stored_multivol.part{part}.rar")))
+        .collect();
+    let output = rars()
+        .arg("extract")
+        .args(&parts)
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let data = fs::read(root.join("random_4k.bin")).unwrap();
+    assert_eq!(data.len(), 4096);
+    assert_eq!(crc32(&data), 0xb9c5_4415);
+    assert!(stdout(&output).contains("x random_4k.bin"));
+}
+
+#[test]
+fn creates_legacy_volumes_with_explicit_compression_settings() {
+    for (format, flags) in [
+        ("rar14", vec!["--store"]),
+        ("rar14", vec!["--level", "3"]),
+        ("rar20", vec!["--level", "3", "--dict-size", "64k"]),
+        ("rar29", vec!["--level", "3", "--dict-size", "64k"]),
+    ] {
+        let root = scratch("legacy-volume-options");
+        let source = root.join("payload.bin");
+        let archive = root.join("split.rar");
+        let payload = deterministic_noise(1024);
+        fs::write(&source, &payload).unwrap();
+        let create = rars()
+            .args(["add", "--format", format, "--volume-size", "256"])
+            .args(flags)
+            .arg(&archive)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(create.status.success(), "{format}: {}", stderr(&create));
+        let extract = rars()
+            .arg("extract")
+            .arg(&archive)
+            .arg(root.join("out"))
+            .output()
+            .unwrap();
+        assert!(extract.status.success(), "{format}: {}", stderr(&extract));
+        assert_eq!(fs::read(root.join("out/payload.bin")).unwrap(), payload);
+    }
+}
+
+#[test]
 fn test_verifies_rar15_40_stored_fixture() {
     let output = rars()
         .arg("test")
