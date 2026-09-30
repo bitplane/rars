@@ -357,3 +357,110 @@ pub(crate) fn parse() -> Cli {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepted_formats_round_trip_through_command_line_spelling() {
+        for (name, version) in [
+            ("rar14", ArchiveVersion::Rar14),
+            ("rar15", ArchiveVersion::Rar15),
+            ("rar20", ArchiveVersion::Rar20),
+            ("rar29", ArchiveVersion::Rar29),
+            ("rar30", ArchiveVersion::Rar30),
+            ("rar40", ArchiveVersion::Rar40),
+            ("rar50", ArchiveVersion::Rar50),
+            ("rar70", ArchiveVersion::Rar70),
+        ] {
+            let cli =
+                Cli::try_parse_from(["rars", "a", "--format", name, "out.rar", "input"]).unwrap();
+            let Command::Add(args) = cli.command else {
+                panic!("expected add command")
+            };
+            assert_eq!(args.format.archive_version(), version);
+            assert_eq!(
+                TargetFormat::from_archive_version(version)
+                    .unwrap()
+                    .archive_version(),
+                version
+            );
+        }
+        assert!(TargetFormat::from_archive_version(ArchiveVersion::Rar13).is_none());
+        assert!(
+            Cli::try_parse_from(["rars", "a", "--format", "rar13", "out.rar", "input"]).is_err()
+        );
+    }
+
+    #[test]
+    fn reader_policy_forwards_all_limits_and_optional_password_without_loss() {
+        let args = ReadOptionsArgs {
+            rar50_buffered_decode_limit: Some(0),
+            rar50_dictionary_size_limit: Some(11),
+            max_member_output_bytes: Some(12),
+            max_total_output_bytes: Some(13),
+            max_reader_workspace_bytes: Some(14),
+            max_header_count: Some(15),
+            max_header_bytes: Some(16),
+            rar50_scratch_dir: Some("scratch".into()),
+            rar50_scratch_bytes: Some(17),
+            ..Default::default()
+        };
+        let scratch = args.scratch().unwrap();
+        let options = args.options(Some(b""), Some(&scratch));
+        assert_eq!(options.password, Some(b"".as_slice()));
+        assert_eq!(options.rar50_buffered_decode_limit, Some(0));
+        assert_eq!(options.rar50_dictionary_size_limit, Some(11));
+        assert_eq!(options.max_member_output_bytes, Some(12));
+        assert_eq!(options.max_total_output_bytes, Some(13));
+        assert_eq!(options.max_reader_workspace_bytes, Some(14));
+        assert_eq!(options.max_header_count, Some(15));
+        assert_eq!(options.max_header_bytes, Some(16));
+        assert!(std::ptr::eq(options.rar50_scratch.unwrap(), &scratch));
+        let defaults = ReadOptionsArgs::default();
+        assert!(defaults.scratch().is_none());
+        assert!(defaults.options(None, None).password.is_none());
+        assert!(defaults.options(None, None).rar50_scratch.is_none());
+        let with_filter_limit = ReadOptionsArgs {
+            rar50_filter_memory_limit: Some(0),
+            ..args
+        };
+        assert!(with_filter_limit.scratch().is_some());
+    }
+
+    #[test]
+    fn parser_enforces_scratch_pairs_password_conflicts_and_path_counts() {
+        for args in [
+            vec![
+                "rars",
+                "test",
+                "--rar50-scratch-dir",
+                "scratch",
+                "input.rar",
+            ],
+            vec!["rars", "test", "--rar50-scratch-bytes", "1m", "input.rar"],
+            vec![
+                "rars",
+                "test",
+                "--password",
+                "secret",
+                "--password-file",
+                "password",
+                "input.rar",
+            ],
+            vec!["rars", "x", "input.rar"],
+            vec!["rars", "repair", "input.rar"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        assert!(matches!(
+            crate::output::OverwritePolicy::from(OverwriteCli::Never),
+            crate::output::OverwritePolicy::Never
+        ));
+        assert!(matches!(
+            crate::output::OverwritePolicy::from(OverwriteCli::Always),
+            crate::output::OverwritePolicy::Always
+        ));
+    }
+}
