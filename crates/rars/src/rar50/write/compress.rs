@@ -1198,9 +1198,10 @@ fn append_packed_runs<B: Budget, C: Budget>(
             advance.finished(stream.member, stream.input_size);
         }
     }
-    if let Some(previous) = previous {
-        streams[previous].packed.park();
-    }
+    // Both wave builders dispatch only non-empty jobs, and every job emits
+    // one packed block for each recorded boundary.
+    let previous = previous.expect("compression wave contains a packed block");
+    streams[previous].packed.park();
     Ok(())
 }
 
