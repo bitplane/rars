@@ -425,17 +425,21 @@ impl RarFile {
         settings: JsValue,
     ) -> Result<Vec<u8>, JsValue> {
         let password = password_bytes(password)?.or_else(|| self.password.clone());
-        self.archives[0]
-            .read_member_with_options(
-                name.as_bytes(),
-                read_options(password.as_deref(), &settings)?,
-            )
-            .map_err(js_error)?
-            .ok_or_else(|| {
-                js_error(
-                    rars_rs::Error::EntryNotFound.at_entry(name.as_bytes().to_vec(), "reading"),
-                )
-            })
+        let options = read_options(password.as_deref(), &settings)?;
+        let found = if self.archives.len() == 1 {
+            self.archives[0].read_member_with_options(name.as_bytes(), options)
+        } else if let Some(index) = self
+            .infos
+            .iter()
+            .position(|info| info.name == name.as_bytes())
+        {
+            rars_rs::read_volume_member_at_with_options(&self.archives, index, options)
+        } else {
+            Ok(None)
+        };
+        found.map_err(js_error)?.ok_or_else(|| {
+            js_error(rars_rs::Error::EntryNotFound.at_entry(name.as_bytes().to_vec(), "reading"))
+        })
     }
 
     /// Decode one member by archive-order index.
