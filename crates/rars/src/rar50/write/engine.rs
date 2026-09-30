@@ -260,15 +260,14 @@ pub(super) fn write_archive(
     )?;
 
     // Everything between the main header and the quick-open block, in order.
-    let block_count = entries.iter().try_fold(
+    // Entries and their owned service vectors contain records larger than a byte
+    // in disjoint live storage. Their combined count fits usize, including
+    // the single optional archive comment. This relies on services being owned
+    // vectors, rather than shared or borrowed lists counted repeatedly.
+    let block_count = entries.iter().fold(
         usize::from(plan.archive_comment.is_some()),
-        |total, entry| {
-            total
-                .checked_add(1)
-                .and_then(|total| total.checked_add(entry.services.len()))
-                .ok_or(Error::InvalidArgument("preparation record count overflows"))
-        },
-    )?;
+        |total, entry| total + 1 + entry.services.len(),
+    );
     let mut blocks = Records::<PreparedBlock>::new(block_count, resources)?;
     if let Some(comment) = &plan.archive_comment {
         blocks.push(prepare_comment(comment, header_keys.as_ref(), resources)?)?;
@@ -2003,6 +2002,55 @@ mod emission_ledger_tests {
         .unwrap_err();
         assert_eq!(error.kind(), crate::ErrorKind::InvalidArgument);
         assert!(sink.take().is_empty());
+    }
+
+    #[test]
+    fn prepared_record_counts_include_empty_archives_comments_and_services() {
+        // The aggregate bound uses distinct live storage for owned records.
+        assert!(std::mem::size_of::<ArchiveEntry>() >= 2);
+        assert!(std::mem::size_of::<super::super::ServiceEntry>() >= 2);
+        for count in 0..=2 {
+            for comment in [false, true] {
+                let entries: Vec<_> = (0..count)
+                    .map(|index| {
+                        let entry = ArchiveEntry::new(
+                            format!("file{index}").into_bytes(),
+                            crate::EntrySource::from_bytes(b"payload".to_vec()),
+                        );
+                        if index == 1 {
+                            entry.with_service(super::super::ServiceEntry::new(b"CMT", b"note"))
+                        } else {
+                            entry
+                        }
+                    })
+                    .collect();
+                let mut settings = plan(false);
+                settings.compress.method = 0;
+                settings.quick_open = false;
+                settings.recovery_percent = None;
+                if !comment {
+                    settings.archive_comment = None;
+                }
+                let mut bytes = Vec::new();
+                write_archive(&entries, settings, &WriterResources::default(), &mut bytes).unwrap();
+                let archive = crate::ArchiveReader::read_owned(bytes).unwrap();
+                let raw = archive.as_rar50().unwrap();
+                assert_eq!(raw.files().count(), count);
+                assert_eq!(
+                    raw.services().count(),
+                    usize::from(comment) + usize::from(count == 2)
+                );
+                for index in 0..count {
+                    assert_eq!(
+                        archive
+                            .read_member(format!("file{index}").as_bytes(), None)
+                            .unwrap()
+                            .unwrap(),
+                        b"payload"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
