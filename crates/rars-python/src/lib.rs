@@ -2323,6 +2323,130 @@ mod tests {
     use super::*;
 
     #[test]
+    fn binding_boundary_values_and_error_mappings_preserve_their_contracts() {
+        Python::initialize();
+        Python::attach(|py| {
+            let mut event = ProgressEvent {
+                phase: "writing".into(),
+                completed: 0,
+                total: 0,
+                pass_number: 1,
+                entry_name: None,
+                entry_index: None,
+                total_entries: None,
+            };
+            assert_eq!(event.percentage(), 100.0);
+            event.completed = u64::MAX;
+            event.total = u64::MAX;
+            assert_eq!(event.percentage(), 100.0);
+            let token = CancellationToken::new();
+            assert!(!token.is_cancelled());
+            token.cancel();
+            assert!(token.is_cancelled());
+            assert_eq!(
+                hash_label(Some(rars_rs::ArchiveMemberHash::Other {
+                    hash_type: 42,
+                    data: vec![1, 2],
+                })),
+                "other:42"
+            );
+            for error in [
+                rars_rs::Error::EntryNotFound,
+                rars_rs::Error::DuplicateEntry,
+                rars_rs::Error::InputSymlink,
+            ] {
+                let mapped = map_builder_error(error);
+                assert!(!mapped.to_string().is_empty());
+            }
+            let symlink = map_builder_error(
+                rars_rs::Error::InputSymlink.at_entry(b"link".to_vec(), "adding"),
+            );
+            assert!(symlink.is_instance_of::<PyValueError>(py));
+            assert!(symlink.to_string().contains("link"));
+            for (name, separator, expected) in [
+                (&b"./nested/./file"[..], false, Some("nested/file")),
+                (&b"nested\\file"[..], true, Some("nested/file")),
+                (&b""[..], false, None),
+                (&b"."[..], false, None),
+                (&b"nul\0file"[..], false, None),
+                (&b"C:file"[..], false, None),
+            ] {
+                let result = output_relative_path(name, separator);
+                match expected {
+                    Some(expected) => assert_eq!(result.unwrap(), PathBuf::from(expected)),
+                    None => assert!(result.is_err()),
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn progress_suppresses_reports_after_either_cancellation_signal() {
+        use rars_rs::WriteProgress;
+        let event = rars_rs::WriteProgressEvent::Advanced {
+            operation: rars_rs::WriteOperation::Emission,
+            completed_bytes: 1,
+            total_bytes: 2,
+            pass: 1,
+        };
+        let progress = PythonProgress::new(None, None);
+        progress.report(event);
+        assert!(progress.state.lock().unwrap().is_empty());
+        progress.cancelled.store(true, Ordering::Relaxed);
+        progress.report(event);
+        assert!(progress.is_cancelled());
+        let token = CancellationToken::new();
+        let progress = PythonProgress::new(None, Some(&token));
+        token.cancel();
+        progress.report(event);
+        assert!(progress.is_cancelled());
+        assert!(progress.state.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn progress_recovers_poisoned_state_and_preserves_callback_exceptions() {
+        use rars_rs::WriteProgress;
+        Python::initialize();
+        Python::attach(|py| {
+            let callback = py.eval(c"lambda event: None", None, None).unwrap().unbind();
+            let progress = PythonProgress::new(Some(callback), None);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = progress.state.lock().unwrap();
+                panic!("poison progress state");
+            }));
+            progress.report(rars_rs::WriteProgressEvent::OperationStarted {
+                operation: rars_rs::WriteOperation::Emission,
+                total_bytes: None,
+                total_entries: None,
+                pass: 2,
+            });
+            assert!(!progress.is_cancelled());
+            assert!(progress.take_error().is_none());
+            let callback = py
+                .eval(c"lambda event: 1 / 0", None, None)
+                .unwrap()
+                .unbind();
+            let progress = PythonProgress::new(Some(callback), None);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = progress.error.lock().unwrap();
+                panic!("poison progress error");
+            }));
+            progress.report(rars_rs::WriteProgressEvent::Advanced {
+                operation: rars_rs::WriteOperation::Emission,
+                completed_bytes: 1,
+                total_bytes: 2,
+                pass: 1,
+            });
+            assert!(progress.is_cancelled());
+            assert!(progress
+                .take_error()
+                .unwrap()
+                .is_instance_of::<pyo3::exceptions::PyZeroDivisionError>(py));
+            assert!(progress.take_error().is_none());
+        });
+    }
+
+    #[test]
     fn reader_workspace_options_reach_the_decoder_and_raise_memory_error() {
         Python::initialize();
         Python::attach(|py| {
