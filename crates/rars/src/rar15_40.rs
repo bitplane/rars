@@ -2920,6 +2920,63 @@ mod tests {
     use super::*;
 
     #[test]
+    fn block_prefix_truncation_returns_too_short_before_field_decoding() {
+        let bytes = stored_archive_bytes(b"member", b"payload");
+        let file = Archive::parse(&bytes)
+            .unwrap()
+            .files()
+            .next()
+            .unwrap()
+            .clone();
+        let header =
+            &bytes[file.block.offset..file.block.offset + usize::from(file.block.head_size)];
+        for prefix in 0..header.len() {
+            assert!(matches!(
+                parse_block_header(&header[..prefix], 0),
+                Err(Error::TooShort)
+            ));
+        }
+        assert_eq!(
+            parse_block_header(header, 0).unwrap().head_size,
+            file.block.head_size
+        );
+    }
+
+    #[test]
+    fn incomplete_large_size_fields_have_matching_parser_refusals() {
+        for size in 32u16..=40 {
+            let mut bytes = RAR15_SIGNATURE.to_vec();
+            test_write_main_header(&mut bytes, 0);
+            let start = bytes.len();
+            let mut header = vec![0; usize::from(size)];
+            header[2] = FILE_HEAD;
+            header[3..5].copy_from_slice(&(LONG_BLOCK | FHD_LARGE).to_le_bytes());
+            header[5..7].copy_from_slice(&size.to_le_bytes());
+            header[24] = 29;
+            header[25] = 0x30;
+            bytes.extend_from_slice(&header);
+            test_write_header_crc(&mut bytes, start);
+            let memory = Archive::parse(&bytes);
+            let seekable = Archive::parse_seekable(
+                std::io::Cursor::new(&bytes),
+                bytes.len() as u64,
+                0,
+                ArchiveSource::Memory(Arc::from(bytes.clone())),
+                crate::ArchiveReadOptions::new(),
+            );
+            if size < 40 {
+                assert!(matches!(memory, Err(Error::TooShort)), "memory size {size}");
+                assert!(
+                    matches!(seekable, Err(Error::TooShort)),
+                    "seekable size {size}"
+                );
+            } else {
+                assert_eq!(memory.unwrap().blocks, seekable.unwrap().blocks);
+            }
+        }
+    }
+
+    #[test]
     fn seekable_parser_preserves_failures_at_each_input_operation() {
         use std::io::{self, Cursor, Read, Seek, SeekFrom};
         use std::sync::{
