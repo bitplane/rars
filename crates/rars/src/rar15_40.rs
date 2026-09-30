@@ -1795,6 +1795,7 @@ fn parse_main_header(input: &[u8], block: &BlockHeader) -> Result<MainHeader> {
     let start = block.offset;
     let head_end = start + block.head_size as usize;
     // Both callers have already read and validated this entire block.
+    let fixed = &input[start + 7..start + 13];
 
     let encrypt_version = if block.flags & MHD_ENCRYPTVER != 0 {
         Some(
@@ -1811,8 +1812,8 @@ fn parse_main_header(input: &[u8], block: &BlockHeader) -> Result<MainHeader> {
         head_crc: block.head_crc,
         flags: block.flags,
         head_size: block.head_size,
-        reserved1: read_u16(input, start + 7)?,
-        reserved2: read_u32(input, start + 9)?,
+        reserved1: u16::from_le_bytes([fixed[0], fixed[1]]),
+        reserved2: u32::from_le_bytes([fixed[2], fixed[3], fixed[4], fixed[5]]),
         encrypt_version,
     })
 }
@@ -1822,12 +1823,14 @@ fn parse_comment_header(input: &[u8], block: BlockHeader) -> Result<CommentHeade
         return Err(Error::InvalidHeader("RAR 1.5 comment header is too short"));
     }
     let start = block.offset;
+    // Callers admitted the complete block before its fixed fields are decoded.
+    let fixed = &input[start + 7..start + 13];
     Ok(CommentHeader {
         block,
-        unp_size: read_u16(input, start + 7)?,
-        unp_ver: *input.get(start + 9).ok_or(Error::TooShort)?,
-        method: *input.get(start + 10).ok_or(Error::TooShort)?,
-        comment_crc: read_u16(input, start + 11)?,
+        unp_size: u16::from_le_bytes([fixed[0], fixed[1]]),
+        unp_ver: fixed[2],
+        method: fixed[3],
+        comment_crc: u16::from_le_bytes([fixed[4], fixed[5]]),
         packed_range: 0..0,
     })
 }
