@@ -1453,22 +1453,24 @@ impl RarBuilder {
             },
         )?;
         py.detach(|| {
-            let mut paths = Vec::with_capacity(parts.len());
-            for index in 0..parts.len() {
-                let part = parts.part(index);
+            // A naming refusal must precede any replacement of existing parts.
+            let paths = (0..parts.len())
+                .map(|index| {
+                    if matches!(
+                        self.format,
+                        rars_rs::ArchiveVersion::Rar50 | rars_rs::ArchiveVersion::Rar70
+                    ) {
+                        rar50_volume_part_path(&first_path, index, parts.len())
+                    } else {
+                        legacy_volume_part_path(&first_path, index)
+                    }
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+            for (index, path) in paths.iter().enumerate() {
                 if cancellation.is_some_and(CancellationToken::is_cancelled) {
                     return Err(map_error(rars_rs::Error::Cancelled));
                 }
-                let path = if matches!(
-                    self.format,
-                    rars_rs::ArchiveVersion::Rar50 | rars_rs::ArchiveVersion::Rar70
-                ) {
-                    rar50_volume_part_path(&first_path, index, parts.len())?
-                } else {
-                    legacy_volume_part_path(&first_path, index)?
-                };
-                fs::write(&path, part).map_err(map_io_error)?;
-                paths.push(path);
+                fs::write(path, parts.part(index)).map_err(map_io_error)?;
             }
             Ok(paths)
         })
