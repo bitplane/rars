@@ -61,7 +61,8 @@ impl PendingArchive {
                 name_writer,
                 ".rars-writing-{}-{sequence:016x}",
                 std::process::id()
-            )?;
+            )
+            .expect("fixed ASCII temporary name fits its buffer");
             let name_len = name_writer.position() as usize;
             let name = std::str::from_utf8(&name[..name_len]).expect("ASCII temporary name");
             let directory = destination.parent().unwrap_or_else(|| Path::new(""));
