@@ -2606,6 +2606,58 @@ mod tests {
     }
 
     #[test]
+    fn automatic_filter_fallback_source_failure_keeps_member_context() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let scratch = crate::scratch::case("fallback-source-error");
+        let resources = WriterResources::new(70 * 1024 * 1024).with_temp_dir(&*scratch);
+        let length = 2 * 1024 * 1024;
+        let options = EncodeOptions::new(8).with_max_match_distance(128 * 1024);
+        let plan = CompressPlan {
+            algorithm_version: 0,
+            encode_options: options,
+            dictionary_size: 128 * 1024,
+            block_size: crate::codec::rar50::LZ_BLOCK_SIZE,
+            solid: false,
+            method: 1,
+            filter_policy: FilterPolicy::Auto,
+            candidates: vec![options].into(),
+        };
+        let execution =
+            ExecutionPlan::with_resources(&plan, std::iter::once(length), &resources).unwrap();
+        let ExecutionPlan::IndependentMembers(ref members) = execution else {
+            panic!("automatic filtering should plan independent members");
+        };
+        assert!(matches!(members[0].execution, Execution::Blocks { .. }));
+        drop(execution);
+        let opens = Arc::new(AtomicUsize::new(0));
+        let source = EntrySource::from_opener(length, {
+            let opens = Arc::clone(&opens);
+            move || {
+                opens.fetch_add(1, Ordering::Relaxed);
+                Err(std::io::Error::other("fallback source refused").into())
+            }
+        });
+        let error =
+            compress_members_with_context(&[source], &plan, &resources, &|_| true, &|index, error| {
+                assert_eq!(index, 0);
+                error.at_entry(b"fallback.bin".to_vec(), "compressing")
+            })
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), crate::ErrorKind::Io);
+        assert_eq!(
+            error.entry_context(),
+            Some((b"fallback.bin".as_slice(), "compressing"))
+        );
+        assert!(error.to_string().contains("fallback source refused"));
+        assert_eq!(opens.load(Ordering::Relaxed), 1);
+        assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
+    }
+
+    #[test]
     fn mixed_whole_and_fallback_members_keep_order_progress_and_cleanup() {
         use std::sync::{
             atomic::{AtomicBool, Ordering},
