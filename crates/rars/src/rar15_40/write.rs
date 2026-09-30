@@ -2760,6 +2760,46 @@ fn write_comment_header_crc(out: &mut [u8], start: usize) {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn encrypted_payload_padding_preserves_cipher_state_across_chunks() {
+        for target in [crate::ArchiveVersion::Rar20, crate::ArchiveVersion::Rar30] {
+            for length in [0usize, 1, 15, 16, 17, 65535, 65536, 65537] {
+                let plaintext: Vec<u8> = (0..length)
+                    .map(|index| (index as u8).wrapping_mul(37))
+                    .collect();
+                for split in [false, true] {
+                    let mut data = plaintext.clone();
+                    let salt = if split {
+                        super::encrypt_split_packed_data(&mut data, target, b"pw")
+                    } else {
+                        super::encrypt_packed_data_for_writer(&mut data, target, Some(b"pw"))
+                    }
+                    .unwrap();
+                    let padded = length.div_ceil(16) * 16;
+                    assert_eq!(data.len(), padded);
+                    match target {
+                        crate::ArchiveVersion::Rar20 => {
+                            assert_eq!(salt, None);
+                            super::Rar20Cipher::new(b"pw")
+                                .decrypt_in_place(&mut data)
+                                .unwrap();
+                        }
+                        crate::ArchiveVersion::Rar30 => {
+                            assert!(salt.is_some());
+                            super::Rar30Cipher::new(b"pw", salt)
+                                .unwrap()
+                                .decrypt_in_place(&mut data)
+                                .unwrap();
+                        }
+                        _ => unreachable!(),
+                    }
+                    assert_eq!(&data[..length], plaintext);
+                    assert!(data[length..].iter().all(|&byte| byte == 0));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn member_cancellation_during_workspace_admission_is_preserved() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
