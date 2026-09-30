@@ -1985,6 +1985,59 @@ mod emission_ledger_tests {
     use super::*;
     use crate::codec::workspace::Allowance;
 
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[test]
+    fn source_disappearing_at_compression_start_retains_member_context() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for volumes in [false, true] {
+            let scratch = crate::scratch::case("source-disappears-before-compression");
+            let path = scratch.join("source");
+            std::fs::write(&path, b"payload").unwrap();
+            let entries = [ArchiveEntry::new(
+                b"missing.bin".to_vec(),
+                crate::EntrySource::from_path(&path),
+            )];
+            let resources = WriterResources::new(128 * 1024 * 1024)
+                .with_max_memory_bytes(128 * 1024 * 1024)
+                .with_temp_dir(&*scratch);
+            let removed = AtomicBool::new(false);
+            let callback = |event: crate::WriteProgressEvent<'_>| {
+                if matches!(
+                    event,
+                    crate::WriteProgressEvent::OperationStarted {
+                        operation: crate::WriteOperation::Compression,
+                        ..
+                    }
+                ) && !removed.swap(true, Ordering::Relaxed)
+                {
+                    std::fs::remove_file(&path).unwrap();
+                }
+            };
+            let mut plan = plan(false);
+            plan.progress = Some(ProgressReporter(&callback));
+            let error = if volumes {
+                let mut output = super::super::CollectedVolumes::new();
+                let error = write_volumes(&entries, plan, 64, &mut output, &resources).unwrap_err();
+                assert!(output.take().is_empty());
+                error
+            } else {
+                let mut output = Vec::new();
+                let error = write_archive(&entries, plan, &resources, &mut output).unwrap_err();
+                assert!(output.is_empty());
+                error
+            };
+            assert!(removed.load(Ordering::Relaxed));
+            assert_eq!(error.kind(), crate::ErrorKind::Io);
+            assert_eq!(
+                error.entry_context(),
+                Some((b"missing.bin".as_slice(), "compressing"))
+            );
+            assert_eq!(resources.workspace_in_use(), 0);
+            assert_eq!(resources.managed_memory_in_use(), 0);
+            assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
+        }
+    }
+
     #[test]
     fn zero_volume_payload_is_rejected_before_opening_a_sink() {
         let entries = [ArchiveEntry::new(
