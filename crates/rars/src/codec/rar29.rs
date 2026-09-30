@@ -1133,10 +1133,10 @@ fn encode_member_inner(
     for &len in &level_lengths {
         bits.write_bits(len as u32, 4);
     }
+    // Both passes replay the same tokens from the same initial match state.
+    // Every emitted symbol was counted, and positive frequencies receive codes.
     for token in level_tokens {
-        let code = level_codes[token.symbol].ok_or(Error::InvalidData(
-            "RAR 2.9 encoder missing level Huffman code",
-        ))?;
+        let code = level_codes[token.symbol].expect("counted level Huffman code");
         bits.write_bits(code.code as u32, code.len);
         if token.extra_bits != 0 {
             bits.write_bits(token.extra_value as u32, token.extra_bits);
@@ -1149,9 +1149,7 @@ fn encode_member_inner(
     let length_codes =
         canonical_codes(&table_lengths[MAIN_COUNT + OFFSET_COUNT + LOW_OFFSET_COUNT..]);
     for filter in initial_filters {
-        let code = main_codes[257].ok_or(Error::InvalidData(
-            "RAR 2.9 encoder missing VM filter Huffman code",
-        ))?;
+        let code = main_codes[257].expect("counted VM filter Huffman code");
         bits.write_bits(code.code as u32, code.len);
         for &byte in filter {
             bits.write_bits(u32::from(byte), 8);
@@ -1161,17 +1159,14 @@ fn encode_member_inner(
     for token in tokens {
         match token {
             EncodeToken::Literal(byte) => {
-                let code = main_codes[byte as usize].ok_or(Error::InvalidData(
-                    "RAR 2.9 encoder missing literal Huffman code",
-                ))?;
+                let code = main_codes[byte as usize].expect("counted literal Huffman code");
                 bits.write_bits(code.code as u32, code.len);
             }
             EncodeToken::Match { length, offset } => {
                 match match_state.encode_match(length, offset)? {
                     EncodedMatch::LastLengthRepeat => {
-                        let code = main_codes[258].ok_or(Error::InvalidData(
-                            "RAR 2.9 encoder missing last-length repeat Huffman code",
-                        ))?;
+                        let code =
+                            main_codes[258].expect("counted last-length repeat Huffman code");
                         bits.write_bits(code.code as u32, code.len);
                     }
                     EncodedMatch::RepeatOffset {
@@ -1179,13 +1174,11 @@ fn encode_member_inner(
                         length_slot,
                         length_extra,
                     } => {
-                        let code = main_codes[259 + index].ok_or(Error::InvalidData(
-                            "RAR 2.9 encoder missing repeat-offset Huffman code",
-                        ))?;
+                        let code =
+                            main_codes[259 + index].expect("counted repeat-offset Huffman code");
                         bits.write_bits(code.code as u32, code.len);
-                        let length_code = length_codes[length_slot].ok_or(Error::InvalidData(
-                            "RAR 2.9 encoder missing repeat length Huffman code",
-                        ))?;
+                        let length_code =
+                            length_codes[length_slot].expect("counted repeat length Huffman code");
                         bits.write_bits(length_code.code as u32, length_code.len);
                         if LENGTH_BITS[length_slot] != 0 {
                             bits.write_bits(length_extra as u32, LENGTH_BITS[length_slot]);
@@ -1197,26 +1190,22 @@ fn encode_member_inner(
                         offset_slot,
                         offset_extra,
                     } => {
-                        let code = main_codes[271 + length_slot].ok_or(Error::InvalidData(
-                            "RAR 2.9 encoder missing match Huffman code",
-                        ))?;
+                        let code =
+                            main_codes[271 + length_slot].expect("counted match Huffman code");
                         bits.write_bits(code.code as u32, code.len);
                         if LENGTH_BITS[length_slot] != 0 {
                             bits.write_bits(length_extra as u32, LENGTH_BITS[length_slot]);
                         }
-                        let offset = offset_codes[offset_slot].ok_or(Error::InvalidData(
-                            "RAR 2.9 encoder missing offset Huffman code",
-                        ))?;
+                        let offset =
+                            offset_codes[offset_slot].expect("counted offset Huffman code");
                         bits.write_bits(offset.code as u32, offset.len);
                         if offset_slot > 9 {
                             let offset_bits = OFFSET_BITS[offset_slot];
                             if offset_bits > 4 {
                                 bits.write_bits((offset_extra >> 4) as u32, offset_bits - 4);
                             }
-                            let low_offset =
-                                low_offset_codes[offset_extra & 0x0f].ok_or(Error::InvalidData(
-                                    "RAR 2.9 encoder missing low-offset Huffman code",
-                                ))?;
+                            let low_offset = low_offset_codes[offset_extra & 0x0f]
+                                .expect("counted low-offset Huffman code");
                             bits.write_bits(low_offset.code as u32, low_offset.len);
                         } else if OFFSET_BITS[offset_slot] != 0 {
                             bits.write_bits(offset_extra as u32, OFFSET_BITS[offset_slot]);
@@ -1227,9 +1216,7 @@ fn encode_member_inner(
             }
         }
     }
-    let end = main_codes[256].ok_or(Error::InvalidData(
-        "RAR 2.9 encoder missing end-of-block Huffman code",
-    ))?;
+    let end = main_codes[256].expect("counted end-of-block Huffman code");
     bits.write_bits(end.code as u32, end.len);
     // The end-of-block symbol on its own does not end the member: the next bit
     // says whether another table follows. A block in the middle of a member
