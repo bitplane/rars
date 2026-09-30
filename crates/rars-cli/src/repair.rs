@@ -526,6 +526,78 @@ mod tests {
     }
 
     #[test]
+    fn repair_propagates_input_and_output_filesystem_errors() {
+        let root = crate::scratch::case("repair-filesystem-errors");
+        let input = root.join("input.rar");
+        let output = root.join("output.rar");
+        fs::write(&input, b"invalid archive").unwrap();
+        fs::write(&output, b"keep").unwrap();
+        assert!(cmd_repair(RepairArgs {
+            password: crate::cli::PasswordArgs {
+                password: None,
+                password_file: Some(root.join("missing-password")),
+            },
+            paths: vec![input.clone(), output.clone()],
+        })
+        .is_err());
+        assert!(repair(&root.join("missing-input"), &output).is_err());
+        #[cfg(unix)]
+        assert!(repair(&root, &output).is_err());
+        assert_eq!(fs::read(&output).unwrap(), b"keep");
+
+        for (family, rev, data) in [
+            ("rar50", "multivol_rev.part1.rev", "multivol_rev.part1.rar"),
+            (
+                "rar15_40",
+                "rar300/rev_oldstyle.part4_2_1.rev",
+                "rar300/rev_oldstyle.part1.rar",
+            ),
+        ] {
+            let paths = vec![fixture(family, rev), fixture(family, data), output.clone()];
+            assert!(repair_set(paths).is_err());
+            assert_eq!(fs::read(&output).unwrap(), b"keep");
+            // Dispatch can find a valid REV before encountering a missing data input.
+            let out_dir = root.join(family);
+            assert!(repair_set(vec![
+                fixture(family, rev),
+                root.join("missing-data"),
+                out_dir.clone()
+            ])
+            .is_err());
+            assert_eq!(fs::read_dir(out_dir).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn raw_repair_publication_failure_keeps_input_and_destination() {
+        let root = crate::scratch::case("repair-raw-publication-error");
+        let mut builder = rars::Builder::new(rars::ArchiveVersion::Rar50)
+            .store(true)
+            .recovery_percent(Some(20));
+        builder
+            .add_bytes(b"file".to_vec(), vec![b'p'; 4096], None, None)
+            .unwrap();
+        let mut damaged = builder.to_bytes().unwrap();
+        let offset = rars::rar50::Archive::parse(&damaged)
+            .unwrap()
+            .files()
+            .next()
+            .unwrap()
+            .block
+            .offset;
+        damaged[offset] ^= 0xff;
+        let input = root.join("input.rar");
+        fs::write(&input, &damaged).unwrap();
+        let output = root.join("destination");
+        fs::create_dir(&output).unwrap();
+        fs::write(output.join("keep"), b"keep").unwrap();
+        assert!(repair(&input, &output).is_err());
+        assert_eq!(fs::read(&input).unwrap(), damaged);
+        assert_eq!(fs::read(output.join("keep")).unwrap(), b"keep");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
+    }
+
+    #[test]
     fn volume_publication_failure_preserves_destinations() {
         let root = crate::scratch::case("repair-volume-publication-failure");
         for (family, names, first_output) in [
