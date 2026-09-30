@@ -1146,10 +1146,12 @@ fn should_lazy_emit_literal(
     max_dist3: u32,
     options: EncodeOptions,
 ) -> bool {
-    if !matches!(current, MatchToken::ShortLz(_) | MatchToken::LongLz(_)) || pos + 1 >= input.len()
-    {
+    if !matches!(current, MatchToken::ShortLz(_) | MatchToken::LongLz(_)) {
         return false;
     }
+
+    // Selected matches fit at least two bytes of the remaining input.
+    debug_assert!(pos + 1 < input.len());
 
     let next = find_lz_token(
         input,
@@ -1453,7 +1455,10 @@ fn encode_decode_num_prefix(
         }
         let base = u32::from(base);
         let max_target = ((max_num - previous) >> (16 - len)) + base;
-        if target >= base && target <= max_target {
+        if target <= max_target {
+            // Nonempty fixed-table intervals are contiguous, so earlier ones
+            // already handle every target below this base.
+            debug_assert!(target >= base);
             let num = previous + ((target - base) << (16 - len));
             return Some((num >> (16 - len), len));
         }
@@ -2295,6 +2300,65 @@ mod tests {
     use crate::codec::Error;
 
     #[test]
+    fn normal_encoder_round_trips_terminal_literal_flag_groups() {
+        for length in [23, 24, 25] {
+            let input: Vec<u8> = (0..length).collect();
+            let packed = super::unpack15_encode(&input).unwrap();
+            assert_eq!(super::unpack15_decode(&packed, input.len()).unwrap(), input);
+        }
+    }
+
+    #[test]
+    fn final_literal_flag_crosses_into_a_terminal_flags_group() {
+        let first = match_heavy_payload(176, 8000);
+        let mut encoder =
+            super::Unpack15Encoder::with_options(super::EncodeOptions::new().with_lazy_matching(false));
+        let first_packed = encoder.encode_member(&first).unwrap();
+        let mut decoder = super::Unpack15::new();
+        assert_eq!(
+            decoder
+                .decode_member(&first_packed, first.len(), false)
+                .unwrap(),
+            first
+        );
+        let input: Vec<u8> = [b'A'; 24].into_iter().chain(*b"XYZ").collect();
+        let mut planned = encoder.clone_for_planning();
+        planned.emit_literal(b'A');
+        let buckets = long_lz_buckets(&input);
+        assert_eq!(
+            planned.choose_lz_token(&input, 1, &buckets, planned.lz_plan_state()),
+            Some(MatchToken::LongLz(LongLz {
+                distance: 1,
+                length: 23
+            }))
+        );
+        let packed = encoder.encode_member(&input).unwrap();
+        let mut partial = decoder.clone();
+        assert_eq!(
+            decoder.decode_member(&packed, input.len(), true).unwrap(),
+            input
+        );
+        assert_eq!(
+            partial
+                .decode_member(&packed, input.len() - 1, true)
+                .unwrap(),
+            input[..input.len() - 1]
+        );
+        assert_eq!(
+            partial.state.flags_cnt, 1,
+            "one flag bit remains before the terminal literal"
+        );
+        partial.state.target = input.len();
+        let mut tail = Vec::new();
+        partial.state.decode_step(&mut tail).unwrap();
+        assert_eq!(tail, b"Z");
+        assert_eq!(
+            partial.state.flags_cnt, 7,
+            "the second flag bit comes from the terminal flags group"
+        );
+    }
+
+    #[test]
     fn empty_encoder_fast_paths_skip_progress_and_nonempty_work_can_cancel() {
         assert!(
             super::unpack15_encode_with_options(&[], super::EncodeOptions::default())
@@ -3053,14 +3117,14 @@ mod tests {
 
     #[test]
     fn fixed_number_tables_reencode_every_decoder_prefix() {
-        for (start, thresholds, ranks) in [
-            (4, DEC_HF0, POS_HF0),
-            (5, DEC_HF1, POS_HF1),
-            (5, DEC_HF2, POS_HF2),
-            (6, DEC_HF3, POS_HF3),
-            (8, DEC_HF4, POS_HF4),
-            (2, DEC_L1, POS_L1),
-            (3, DEC_L2, POS_L2),
+        for (start, thresholds, ranks, maximum) in [
+            (4, DEC_HF0, POS_HF0, 256),
+            (5, DEC_HF1, POS_HF1, 256),
+            (5, DEC_HF2, POS_HF2, 256),
+            (6, DEC_HF3, POS_HF3, 256),
+            (8, DEC_HF4, POS_HF4, 256),
+            (2, DEC_L1, POS_L1, 255),
+            (3, DEC_L2, POS_L2, 255),
         ] {
             assert!(ranks.len() <= 17);
             assert!(ranks.len() > start as usize);
@@ -3068,14 +3132,28 @@ mod tests {
             assert!(thresholds.iter().all(|&threshold| threshold != 0));
             assert!(thresholds.windows(2).all(|pair| pair[0] <= pair[1]));
             assert_eq!(thresholds.last(), Some(&u16::MAX));
+            let mut intervals = [None::<(u32, u32)>; 17];
             for field in 0..=u16::MAX {
                 let (target, consumed) =
                     simulate_decode_num(u32::from(field), start, thresholds, ranks);
+                assert!(target <= maximum);
+                let span = intervals[consumed].get_or_insert((target, target));
+                span.0 = span.0.min(target);
+                span.1 = span.1.max(target);
                 let (prefix, length) =
                     super::encode_decode_num_prefix(target, start, thresholds, ranks).unwrap();
                 assert_eq!(length, consumed);
                 assert_eq!(prefix, u32::from(field) >> (16 - length));
             }
+            let mut next = 0;
+            for (minimum, maximum) in intervals.into_iter().flatten() {
+                assert_eq!(
+                    minimum, next,
+                    "nonempty intervals are contiguous in bit-length order"
+                );
+                next = maximum + 1;
+            }
+            assert_eq!(next, maximum + 1);
         }
     }
 
@@ -3916,6 +3994,13 @@ mod solid_regressions {
 
     #[test]
     fn equal_length_match_candidates_keep_nearest_distance() {
+        assert_eq!(
+            super::find_long_lz(&[0; 24], 11, 11),
+            Some(super::LongLz {
+                distance: 1,
+                length: 13
+            })
+        );
         let short = b"abcXabcYabcZ";
         assert_eq!(
             find_short_lz(short, 8),
