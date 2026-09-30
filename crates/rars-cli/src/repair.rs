@@ -243,6 +243,11 @@ fn repaired_volume_path(
         })
     {
         let first_out = out_dir.join(file_name);
+        let first_out = if lower.ends_with(".rar") {
+            first_out
+        } else {
+            first_out.with_extension("rar")
+        };
         return crate::volumes::volume_part_path(&first_out, index)
             .unwrap_or_else(|_| out_dir.join(format!("repaired.part{}.rar", index + 1)));
     }
@@ -252,6 +257,212 @@ fn repaired_volume_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture(family: &str, name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../rars/tests/fixtures")
+            .join(family)
+            .join(name)
+    }
+
+    fn repair_set(paths: Vec<PathBuf>) -> CliResult<()> {
+        cmd_repair(RepairArgs {
+            password: crate::cli::PasswordArgs {
+                password: None,
+                password_file: None,
+            },
+            paths,
+        })
+    }
+
+    #[test]
+    fn legacy_repair_recovers_missing_first_part_without_name_collisions() {
+        let root = crate::scratch::case("repair-missing-first-old-name");
+        let mut paths = Vec::new();
+        for index in 1..4 {
+            let path = root.join(format!("set.r{:02}", index - 1));
+            fs::copy(
+                fixture(
+                    "rar15_40",
+                    &format!("rar300/rev_oldstyle.part{}.rar", index + 1),
+                ),
+                &path,
+            )
+            .unwrap();
+            paths.push(path);
+        }
+        let rev = root.join("set_4_2_1.rev");
+        fs::copy(
+            fixture("rar15_40", "rar300/rev_oldstyle.part4_2_1.rev"),
+            &rev,
+        )
+        .unwrap();
+        paths.push(rev);
+        let output = root.join("out");
+        paths.push(output.clone());
+        repair_set(paths).unwrap();
+        for index in 0..4 {
+            let name = if index == 0 {
+                "set.rar".to_owned()
+            } else {
+                format!("set.r{:02}", index - 1)
+            };
+            assert_eq!(
+                fs::read(output.join(name)).unwrap(),
+                fs::read(fixture(
+                    "rar15_40",
+                    &format!("rar300/rev_oldstyle.part{}.rar", index + 1)
+                ))
+                .unwrap()
+            );
+        }
+        assert_eq!(fs::read_dir(output).unwrap().count(), 4);
+    }
+
+    #[test]
+    fn volume_output_names_preserve_part_width_and_use_safe_fallbacks() {
+        let output = Path::new("out");
+        for (input, index, count, expected) in [
+            ("Set.PART009.RAR", 1, 1200, "Set.part0002.rar"),
+            ("set.partx.rar", 1, 2, "set.partx.r00"),
+            ("set.part.rar", 0, 2, "set.part.rar"),
+            ("set.part1.bin", 0, 2, "repaired.part1.rar"),
+            ("set.rar", 101, 200, "repaired.part102.rar"),
+            ("set.r01", 2, 3, "set.r01"),
+            ("set.rXX", 0, 2, "repaired.part1.rar"),
+            ("set.rev", 0, 2, "repaired.part1.rar"),
+            ("/", 0, 2, "repaired.part1.rar"),
+        ] {
+            assert_eq!(
+                repaired_volume_path(output, &[(PathBuf::from(input), Vec::new())], index, count),
+                output.join(expected)
+            );
+        }
+        assert_eq!(
+            repaired_volume_path(output, &[], 1, 2),
+            output.join("repaired.part2.rar")
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let path = PathBuf::from(std::ffi::OsStr::from_bytes(b"set-\xff.rar"));
+            assert_eq!(
+                repaired_volume_path(output, &[(path, Vec::new())], 0, 2),
+                output.join("repaired.part1.rar")
+            );
+        }
+    }
+
+    #[test]
+    fn rev3_rejects_missing_malformed_and_conflicting_recovery_inputs() {
+        let root = crate::scratch::case("repair-rev3-refusals");
+        for (names, expected) in [
+            (["set.rar", "set.r00"], "requires at least one .rev"),
+            (
+                ["set.rar", "bad.rev"],
+                "failed to parse RAR 3 REV volume name",
+            ),
+            (
+                ["set_3_2_1.rev", "set_3_3_2.rev"],
+                "metadata differs across files",
+            ),
+            (
+                ["set_3_2_1.rev", "set_4_2_2.rev"],
+                "metadata differs across files",
+            ),
+            (
+                ["set.rar", "set_3_2_1.rev"],
+                "failed to repair RAR 3 REV volume set",
+            ),
+            (
+                ["unknown.bin", "set_3_2_1.rev"],
+                "failed to repair RAR 3 REV volume set",
+            ),
+        ] {
+            let mut paths = Vec::new();
+            for name in names {
+                let path = root.join(name);
+                fs::write(&path, []).unwrap();
+                paths.push(path);
+            }
+            let output = root.join("out");
+            paths.push(output.clone());
+            assert!(repair_set(paths)
+                .unwrap_err()
+                .to_string()
+                .contains(expected));
+            assert_eq!(fs::read_dir(output).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn rev5_identifies_renamed_parts_by_crc_and_rejects_bad_recovery() {
+        let root = crate::scratch::case("repair-rev5-identification");
+        let mut paths = Vec::new();
+        for index in [1, 3, 4, 5] {
+            let path = root.join(format!("unknown-{index}.bin"));
+            fs::copy(
+                fixture("rar50", &format!("multivol_rev.part{index}.rar")),
+                &path,
+            )
+            .unwrap();
+            paths.push(path);
+        }
+        let unknown = root.join("not-a-volume.bin");
+        fs::write(&unknown, b"unrelated").unwrap();
+        paths.push(unknown);
+        let recovery = root.join("set.rev");
+        fs::copy(fixture("rar50", "multivol_rev.part1.rev"), &recovery).unwrap();
+        paths.push(recovery.clone());
+        let output = root.join("out");
+        paths.push(output.clone());
+        repair_set(paths.clone()).unwrap();
+        for index in 1..=5 {
+            assert_eq!(
+                fs::read(output.join(format!("repaired.part{index}.rar"))).unwrap(),
+                fs::read(fixture("rar50", &format!("multivol_rev.part{index}.rar"))).unwrap()
+            );
+        }
+        let bad = root.join("bad.rev");
+        let mut bytes = fs::read(&recovery).unwrap();
+        *bytes.last_mut().unwrap() ^= 0xff;
+        fs::write(&bad, bytes).unwrap();
+        paths.insert(paths.len() - 1, bad);
+        let error = repair_set(paths).unwrap_err().to_string();
+        assert!(error.contains("failed to parse REV volume"));
+    }
+
+    #[test]
+    fn repair_refuses_volume_passwords_and_missing_paths() {
+        let root = crate::scratch::case("repair-input-refusals");
+        let paths = vec![
+            root.join("missing.rev"),
+            root.join("missing.rar"),
+            root.join("out"),
+        ];
+        let error = cmd_repair(RepairArgs {
+            password: crate::cli::PasswordArgs {
+                password: Some("secret".into()),
+                password_file: None,
+            },
+            paths: paths.clone(),
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("does not use archive passwords"));
+        assert!(repair_set(paths).is_err());
+        for data in [b"".as_slice(), b"Rar!", RAR50_SIGNATURE, b"not rar"] {
+            let input = root.join("input");
+            fs::write(&input, data).unwrap();
+            let output = root.join("existing");
+            fs::write(&output, b"keep").unwrap();
+            let error = repair(&input, &output).unwrap_err().to_string();
+            assert_eq!(
+                error.contains("raw inline recovery repair also failed"),
+                data == RAR50_SIGNATURE
+            );
+            assert_eq!(fs::read(&output).unwrap(), b"keep");
+        }
+    }
 
     fn repair(input: &Path, output: &Path) -> CliResult<()> {
         cmd_repair(RepairArgs {
