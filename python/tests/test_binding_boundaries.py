@@ -332,3 +332,109 @@ def test_conversion_refuses_payload_on_legacy_directory():
     assert info.file_size == 7
     with pytest.raises(rars.UnsupportedRarFeature, match="special entry"):
         rars.RarBuilder.from_archive(archive, preserve=False)
+
+
+def test_selected_solid_file_skips_unselected_directory(tmp_path):
+    builder = rars.RarBuilder(format="rar29", solid=True)
+    builder.add_directory("unused")
+    builder.add_bytes(b"payload", "selected")
+    archive = rars.RarFile.from_bytes(builder.to_bytes())
+    archive.extractall(tmp_path, members=["selected"])
+    assert not (tmp_path / "unused").exists()
+    assert (tmp_path / "selected").read_bytes() == b"payload"
+
+
+def test_path_add_explicit_archive_name_and_default_extract_destination(tmp_path, monkeypatch):
+    source = tmp_path / "input"
+    source.write_bytes(b"payload")
+    builder = rars.RarBuilder(store=True)
+    builder.add(source, arcname="renamed")
+    archive = rars.RarFile.from_bytes(builder.to_bytes())
+    monkeypatch.chdir(tmp_path)
+    assert Path(archive.extract("renamed")) == Path("renamed")
+    assert Path("renamed").read_bytes() == b"payload"
+    Path("renamed").unlink()
+    assert [Path(p) for p in archive.extractall()] == [Path("renamed")]
+
+
+def test_recovery_progress_reports_its_phase_and_percentage():
+    builder = rars.RarBuilder(store=True, recovery_percent=1)
+    builder.add_bytes(b"payload", "file.txt")
+    events = []
+    rars.RarFile.from_bytes(builder.to_bytes(progress=events.append)).testrar()
+    assert "recovery" in {event.phase for event in events}
+    assert all(0 <= event.percentage <= 100 for event in events)
+
+
+@pytest.mark.parametrize("method", ["getinfo", "read", "open", "extract", "getcomment", "readlink", "gettimes"])
+def test_member_conversion_errors_are_typeerrors(method):
+    archive = rars.RarFile(STORED)
+    with pytest.raises(TypeError):
+        getattr(archive, method)(object())
+
+
+@pytest.mark.parametrize("method", ["read", "extract", "extractall", "testrar", "read_comment", "getcomment"])
+def test_per_call_password_conversion_errors_are_typeerrors(tmp_path, method):
+    archive = rars.RarFile(STORED)
+    args = (archive.namelist()[0],) if method in {"read", "extract", "getcomment"} else ()
+    kwargs = {"pwd": object()}
+    if method == "extract":
+        kwargs["path"] = tmp_path
+    if method == "extractall":
+        kwargs["path"] = tmp_path
+    with pytest.raises(TypeError):
+        getattr(archive, method)(*args, **kwargs)
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("method,args", [
+    ("add_directory", [object()]),
+    ("rename", ["file.txt", object()]),
+    ("add_unix_symlink", [object(), "target"]),
+    ("add_unix_symlink", ["link", object()]),
+    ("set_file_comment", ["file.txt", object()]),
+])
+def test_builder_argument_conversion_errors_are_typeerrors(method, args):
+    builder = rars.RarBuilder(store=True)
+    builder.add_bytes(b"payload", "file.txt")
+    with pytest.raises(TypeError):
+        getattr(builder, method)(*args)
+    assert rars.RarFile.from_bytes(builder.to_bytes()).namelist() == ["file.txt"]
+
+
+def test_pathlike_errors_survive_binding_conversion(tmp_path):
+    class BrokenPath:
+        def __fspath__(self):
+            raise RuntimeError("path conversion failed")
+
+    builder = rars.RarBuilder(store=True)
+    for operation in [lambda: rars.RarFile(BrokenPath()),
+                      lambda: builder.add(BrokenPath()),
+                      lambda: builder.write(BrokenPath()),
+                      lambda: builder.write_volumes(BrokenPath())]:
+        with pytest.raises(RuntimeError, match="path conversion failed"):
+            operation()
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("format", ["rar14", "rar50"])
+def test_volume_write_failure_names_an_oserror(tmp_path, format):
+    builder = rars.RarBuilder(format=format, store=True, volume_size=64)
+    builder.add_bytes(b"payload" * 20, "file.txt")
+    with pytest.raises(OSError):
+        builder.write_volumes(tmp_path / "missing/archive.rar")
+    assert not (tmp_path / "missing").exists()
+
+
+@pytest.mark.parametrize("operation", [rars.repair, rars.repair_detailed, rars.repair_to_path,
+                                       rars.test_volumes, rars.extract_volumes])
+def test_module_password_conversion_errors_are_typeerrors(tmp_path, operation):
+    if operation in {rars.test_volumes, rars.extract_volumes}:
+        args = ([STORED],)
+    else:
+        args = (STORED,)
+    if operation in {rars.repair_to_path, rars.extract_volumes}:
+        args += (tmp_path / "output",)
+    with pytest.raises(TypeError):
+        operation(*args, password=object())
+    assert list(tmp_path.iterdir()) == []

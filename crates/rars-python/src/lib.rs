@@ -2355,6 +2355,8 @@ mod tests {
                 (&b"."[..], false, None),
                 (&b"nul\0file"[..], false, None),
                 (&b"C:file"[..], false, None),
+                (&b"/absolute"[..], false, None),
+                (&b"../parent"[..], false, None),
             ] {
                 let result = output_relative_path(name, separator);
                 match expected {
@@ -2461,6 +2463,14 @@ mod tests {
         assert_eq!(*written.lock().unwrap(), vec![path]);
         drop(sink);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repair_parse_cancellation_does_not_enter_damaged_header_fallback() {
+        let token = CancellationToken::new();
+        token.cancel();
+        let error = repair_core(b"not an archive", None, Some(&token)).unwrap_err();
+        assert_eq!(error.kind(), rars_rs::ErrorKind::Cancelled);
     }
 
     #[test]
