@@ -426,3 +426,20 @@ const CP1252: [u16; 128] = [
     0x00ec, 0x00ed, 0x00ee, 0x00ef, 0x00f0, 0x00f1, 0x00f2, 0x00f3, 0x00f4, 0x00f5, 0x00f6, 0x00f7,
     0x00f8, 0x00f9, 0x00fa, 0x00fb, 0x00fc, 0x00fd, 0x00fe, 0x00ff,
 ];
+
+#[cfg(all(test, windows))]
+#[test]
+fn windows_native_names_reject_unpaired_surrogates_without_replacement() {
+    use std::os::windows::ffi::OsStringExt;
+    for units in [&[0xd800][..], &[0xdc00], &[u16::from(b'a'), 0xd800]] {
+        let name = OsString::from_wide(units);
+        assert_eq!(
+            native_bytes(&name),
+            Err(Error::InvalidArgument(
+                "native filename cannot be represented as Unicode"
+            ))
+        );
+    }
+    let paired = OsString::from_wide(&[0xd83d, 0xde00]);
+    assert_eq!(native_bytes(&paired).unwrap(), "😀".as_bytes());
+}
