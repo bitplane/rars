@@ -78,7 +78,7 @@ mod threaded {
     }
 }
 
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[cfg(any(test, all(target_arch = "wasm32", target_os = "unknown")))]
 mod wasm {
     /// Process preallocated slots without allocating a separate result vector.
     /// Returns only after every admitted callback has finished.
@@ -131,5 +131,87 @@ mod wasm {
 
     pub(crate) fn threads() -> usize {
         1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wasm;
+
+    #[test]
+    fn sequential_slots_and_collect_keep_order_and_stop_on_error() {
+        let mut slots = [7, 7, 7];
+        wasm::for_each_mut(&mut slots, |index, slot| *slot += index);
+        assert_eq!(slots, [7, 8, 9]);
+        wasm::for_each_mut::<usize, _>(&mut [], |_, _| panic!("empty callback"));
+        let mapped: Result<Vec<_>, ()> = wasm::map_collect(vec![3, 1, 2], |x| Ok(x * 2));
+        assert_eq!(mapped, Ok(vec![6, 2, 4]));
+        let empty: Result<Vec<usize>, ()> =
+            wasm::map_collect(Vec::<usize>::new(), |_| panic!("empty map"));
+        assert_eq!(empty, Ok(vec![]));
+        let visited = std::sync::Mutex::new(Vec::new());
+        let mapped = wasm::map_collect(vec![3, 1, 2], |x| {
+            visited.lock().unwrap().push(x);
+            if x == 1 { Err(11) } else { Ok(x) }
+        });
+        assert_eq!(mapped, Err(11));
+        assert_eq!(*visited.lock().unwrap(), [3, 1]);
+        assert_eq!(wasm::default_window(), 1);
+        assert_eq!(wasm::threads(), 1);
+    }
+
+    #[test]
+    fn sequential_windows_publish_in_order_and_preserve_both_failure_kinds() {
+        let input = [3, 1, 2];
+        for window in [0, 1, 8] {
+            let mut emitted = vec![];
+            let result: Result<(), ()> = wasm::map_slice_windowed(
+                &input,
+                window,
+                |x| Ok(x * 2),
+                |x, y| {
+                    emitted.push((*x, y));
+                    Ok(())
+                },
+            );
+            assert_eq!(result, Ok(()));
+            assert_eq!(emitted, [(3, 6), (1, 2), (2, 4)]);
+        }
+        let mut emitted = vec![];
+        let result = wasm::map_slice_windowed(
+            &input,
+            2,
+            |x| if *x == 1 { Err(11) } else { Ok(x * 2) },
+            |x, y| {
+                emitted.push((*x, y));
+                Ok(())
+            },
+        );
+        assert_eq!(result, Err(11));
+        assert_eq!(emitted, [(3, 6)]);
+        let mut emitted = vec![];
+        let visited = std::sync::Mutex::new(Vec::new());
+        let result = wasm::map_slice_windowed(
+            &input,
+            2,
+            |x| {
+                visited.lock().unwrap().push(*x);
+                Ok(x * 2)
+            },
+            |x, y| {
+                emitted.push((*x, y));
+                if *x == 1 { Err(12) } else { Ok(()) }
+            },
+        );
+        assert_eq!(result, Err(12));
+        assert_eq!(emitted, [(3, 6), (1, 2)]);
+        assert_eq!(*visited.lock().unwrap(), [3, 1]);
+        let empty: Result<(), ()> = wasm::map_slice_windowed::<usize, usize, _, _, _>(
+            &[],
+            0,
+            |_| panic!("empty map"),
+            |_, _| panic!("empty consume"),
+        );
+        assert_eq!(empty, Ok(()));
     }
 }
