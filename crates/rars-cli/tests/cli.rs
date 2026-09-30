@@ -865,18 +865,70 @@ fn password_file_and_stdin_password_unlock_encrypted_archives() {
         .unwrap();
     assert!(create.status.success(), "stderr: {}", stderr(&create));
 
-    let mut command = rars();
-    command
-        .args(["test", "--password", "-"])
-        .arg(&archive)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command.spawn().unwrap();
-    child.stdin.as_mut().unwrap().write_all(b"pass\n").unwrap();
-    let test = child.wait_with_output().unwrap();
-    assert!(test.status.success(), "stderr: {}", stderr(&test));
-    assert!(stdout(&test).contains("OK secret.txt"));
+    for flag in ["--password", "--password-file"] {
+        let mut command = rars();
+        command
+            .args(["test", flag, "-"])
+            .arg(&archive)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        child.stdin.as_mut().unwrap().write_all(b"pass\n").unwrap();
+        let test = child.wait_with_output().unwrap();
+        assert!(test.status.success(), "stderr: {}", stderr(&test));
+        assert!(stdout(&test).contains("OK secret.txt"));
+    }
+}
+
+#[test]
+fn missing_passwords_fail_without_prompting_when_stdin_is_not_a_terminal() {
+    for name in [
+        "encrypted/header_rar300_password.rar",
+        "encrypted/per_file_rar300_password.rar",
+    ] {
+        let output = rars()
+            .arg("test")
+            .arg(fixture_rar15_40(name))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+        assert!(!stderr(&output).contains("password: "));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn stdin_password_read_errors_are_reported_for_both_flags() {
+    let dir = scratch("stdin-password-read-error");
+    for flag in ["--password", "--password-file"] {
+        let output = rars()
+            .args(["test", flag, "-"])
+            .arg(fixture_rar15_40("encrypted/header_rar300_password.rar"))
+            .stdin(Stdio::from(fs::File::open(&dir).unwrap()))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+        assert!(stderr(&output).contains("error:"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn password_prompts_use_real_controlling_terminals() {
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/test_cli_tty.py");
+    let output = Command::new("python3")
+        .arg(script)
+        .arg(env!("CARGO_BIN_EXE_rars"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
 }
 
 #[test]

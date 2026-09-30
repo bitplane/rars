@@ -19,6 +19,9 @@ pub(crate) fn resolve_password(
         return Ok(Some(read_password_value(value)?));
     }
     if let Some(path) = path {
+        if path == Path::new("-") {
+            return Ok(Some(read_password_value("-")?));
+        }
         let bytes = Zeroizing::new(fs::read(path)?);
         return Ok(Some(trim_password_line(bytes)));
     }
@@ -140,13 +143,9 @@ pub(crate) fn error_is_password_class(error: &Error) -> bool {
 
 fn read_archive_error(path: &Path, err: Error) -> String {
     let path = path.display();
-    match err.kind() {
-        rars::ErrorKind::Io => format!("failed to read archive '{path}': {err}"),
-        rars::ErrorKind::UnsupportedFormat
-            if matches!(err.root_cause(), Error::UnsupportedSignature) =>
-        {
-            format!("failed to identify archive '{path}': {err}")
-        }
+    match err.root_cause() {
+        Error::Io(_) => format!("failed to read archive '{path}': {err}"),
+        Error::UnsupportedSignature => format!("failed to identify archive '{path}': {err}"),
         _ => format!("failed to parse archive '{path}': {err}"),
     }
 }
@@ -174,6 +173,107 @@ pub(crate) fn classify_rars_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn password_sources_preserve_bytes_spaces_and_explicit_empty_values() {
+        let root = crate::scratch::case("password-source-bytes");
+        let file = root.join("password");
+        for (bytes, expected) in [
+            (b" secret \r\n\n".as_slice(), b" secret ".as_slice()),
+            (b"\xff\xfe\n", b"\xff\xfe"),
+            (b"\r\n", b""),
+        ] {
+            fs::write(&file, bytes).unwrap();
+            let password = resolve_password(None, Some(&file)).unwrap();
+            assert_eq!(password_bytes(&password), Some(expected));
+        }
+        assert_eq!(
+            password_bytes(&resolve_password(Some(""), None).unwrap()),
+            Some(b"".as_slice())
+        );
+        assert_eq!(
+            password_bytes(&resolve_password(Some("inline"), Some(&root.join("missing"))).unwrap()),
+            Some(b"inline".as_slice())
+        );
+        assert!(resolve_password(None, None).unwrap().is_none());
+        assert!(resolve_password(None, Some(&root.join("missing"))).is_err());
+        assert!(should_prompt_password(true));
+        assert!(!should_prompt_password(false));
+    }
+
+    #[test]
+    fn read_errors_keep_context_exit_class_and_message() {
+        let path = Path::new("archive.rar");
+        for (error, class, prefix) in [
+            (Error::NeedPassword, 3, "failed to parse archive"),
+            (
+                Error::WrongPasswordOrCorruptData,
+                3,
+                "failed to parse archive",
+            ),
+            (Error::UnsupportedSignature, 1, "failed to identify archive"),
+            (
+                Error::UnsupportedVersion(rars::ArchiveVersion::Rar50),
+                1,
+                "failed to parse archive",
+            ),
+            (
+                Error::from(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "denied",
+                )),
+                1,
+                "failed to read archive",
+            ),
+        ] {
+            let cli = read_archive_cli_error(path, error);
+            assert_eq!(cli.exit_code(), class);
+            assert!(cli.to_string().starts_with(prefix));
+            assert!(cli.to_string().contains("archive.rar"));
+        }
+    }
+
+    #[test]
+    fn path_reading_preserves_passwords_and_stops_on_the_first_error() {
+        let root = crate::scratch::case("password-path-read-errors");
+        let path = root.join("plain.rar");
+        let missing = root.join("missing.rar");
+        let mut builder = rars::Builder::new(rars::ArchiveVersion::Rar50).store(true);
+        builder
+            .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+        fs::write(&path, builder.to_bytes().unwrap()).unwrap();
+        let mut password = None;
+        let archive = read_archive_path_prompting(&path, &mut password).unwrap();
+        ensure_password_for_extract(&archive, &mut password).unwrap();
+        assert!(password.is_none());
+        let parsed = parse_archives_prompting(
+            std::slice::from_ref(&path),
+            &mut password,
+            &crate::cli::ReadOptionsArgs::default(),
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 1);
+        let error = parse_archives_prompting(
+            &[path.clone(), missing.clone()],
+            &mut password,
+            &crate::cli::ReadOptionsArgs::default(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.exit_code(), 1);
+        password = Some(Zeroizing::new(b"secret".to_vec()));
+        let error = read_archive_path_prompting(&missing, &mut password)
+            .err()
+            .unwrap();
+        assert_eq!(error.exit_code(), 1);
+        assert_eq!(password_bytes(&password), Some(b"secret".as_slice()));
+        let error = classify_rars_error(Error::InvalidHeader("broken"), |error| {
+            format!("operation: {error}")
+        });
+        assert_eq!(error.exit_code(), 1);
+        assert!(error.to_string().starts_with("operation:"));
+    }
 
     #[test]
     fn password_classification_survives_volume_context() {
