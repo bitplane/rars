@@ -2054,6 +2054,94 @@ mod emission_ledger_tests {
     }
 
     #[test]
+    fn compression_completion_cancellation_precedes_archive_and_volume_emission() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct CancelAtCompletion {
+            armed: AtomicBool,
+            cancelled: AtomicBool,
+            finished: AtomicBool,
+            emitted: AtomicBool,
+        }
+        impl crate::WriteProgress for CancelAtCompletion {
+            fn report(&self, event: crate::WriteProgressEvent<'_>) {
+                use crate::{WriteOperation, WriteProgressEvent};
+                match event {
+                    WriteProgressEvent::OperationStarted {
+                        operation: WriteOperation::Compression,
+                        total_entries: Some(0),
+                        ..
+                    }
+                    | WriteProgressEvent::EntryFinished {
+                        operation: WriteOperation::Compression,
+                        ..
+                    } => self.armed.store(true, Ordering::Relaxed),
+                    WriteProgressEvent::Advanced {
+                        operation: WriteOperation::Compression,
+                        ..
+                    } if self.armed.load(Ordering::Relaxed) => {
+                        self.cancelled.store(true, Ordering::Relaxed);
+                    }
+                    WriteProgressEvent::OperationFinished {
+                        operation: WriteOperation::Compression,
+                        ..
+                    } => self.finished.store(true, Ordering::Relaxed),
+                    WriteProgressEvent::OperationStarted {
+                        operation: WriteOperation::Emission,
+                        ..
+                    } => self.emitted.store(true, Ordering::Relaxed),
+                    _ => {}
+                }
+            }
+            fn is_cancelled(&self) -> bool {
+                self.cancelled.load(Ordering::Relaxed)
+            }
+        }
+        for empty in [false, true] {
+            for volumes in [false, true] {
+                let scratch = crate::scratch::case("completion-cancellation");
+                let resources = WriterResources::default().with_temp_dir(&*scratch);
+                let progress = CancelAtCompletion {
+                    armed: AtomicBool::new(false),
+                    cancelled: AtomicBool::new(false),
+                    finished: AtomicBool::new(false),
+                    emitted: AtomicBool::new(false),
+                };
+                let entries = if empty {
+                    Vec::new()
+                } else {
+                    vec![ArchiveEntry::new(
+                        b"file".to_vec(),
+                        crate::EntrySource::from_bytes(b"payload".to_vec()),
+                    )]
+                };
+                let mut settings = plan(false);
+                settings.archive_comment = None;
+                settings.recovery_percent = None;
+                settings.progress = Some(ProgressReporter(&progress));
+                let error = if volumes {
+                    let mut sink = super::super::CollectedVolumes::new();
+                    let error =
+                        write_volumes(&entries, settings, 1024, &mut sink, &resources).unwrap_err();
+                    assert!(sink.take().is_empty());
+                    error
+                } else {
+                    let mut output = Vec::new();
+                    let error = write_archive(&entries, settings, &resources, &mut output).unwrap_err();
+                    assert!(output.is_empty());
+                    error
+                };
+                assert_eq!(error, Error::Cancelled);
+                assert!(progress.armed.load(Ordering::Relaxed));
+                assert!(progress.cancelled.load(Ordering::Relaxed));
+                assert!(!progress.finished.load(Ordering::Relaxed));
+                assert!(!progress.emitted.load(Ordering::Relaxed));
+                assert_eq!(resources.workspace_in_use(), 0);
+                assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
+            }
+        }
+    }
+
+    #[test]
     fn quick_open_skips_file_services_but_keeps_plain_comments() {
         let entry = ArchiveEntry::new(
             b"file".to_vec(),
