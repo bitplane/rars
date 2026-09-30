@@ -2918,6 +2918,107 @@ mod tests {
     use super::*;
 
     #[test]
+    fn seekable_parser_preserves_failures_at_each_input_operation() {
+        use std::io::{self, Cursor, Read, Seek, SeekFrom};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        struct FaultReader {
+            input: Cursor<Vec<u8>>,
+            operations: Arc<AtomicUsize>,
+            fail_at: usize,
+            cancellation: Option<crate::ReadCancellation>,
+        }
+        impl FaultReader {
+            fn check(&self) -> io::Result<()> {
+                let operation = self.operations.fetch_add(1, Ordering::Relaxed);
+                if operation == self.fail_at {
+                    if let Some(token) = &self.cancellation {
+                        token.cancel();
+                        return Ok(());
+                    }
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "input fault",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        impl Read for FaultReader {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                self.check()?;
+                self.input.read(output)
+            }
+        }
+        impl Seek for FaultReader {
+            fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+                self.check()?;
+                self.input.seek(position)
+            }
+        }
+
+        let bytes = write_stored_archive_with_comment(
+            &[StoredEntry {
+                name: b"member",
+                data: b"payload",
+                file_time: 0,
+                file_attr: 0x20,
+                host_os: 3,
+                password: None,
+                file_comment: None,
+            }],
+            WriterOptions::default(),
+            Some(b"archive comment"),
+        )
+        .unwrap();
+        let operations = Arc::new(AtomicUsize::new(0));
+        let parse = |fail_at, cancellation: Option<&crate::ReadCancellation>| {
+            operations.store(0, Ordering::Relaxed);
+            Archive::parse_seekable(
+                FaultReader {
+                    input: Cursor::new(bytes.clone()),
+                    operations: operations.clone(),
+                    fail_at,
+                    cancellation: cancellation.cloned(),
+                },
+                bytes.len() as u64,
+                0,
+                ArchiveSource::Memory(Arc::from(bytes.clone())),
+                cancellation.map_or_else(crate::ArchiveReadOptions::new, |token| {
+                    crate::ArchiveReadOptions::new().with_cancellation(token)
+                }),
+            )
+        };
+        let archive = parse(usize::MAX, None).unwrap();
+        assert_eq!(archive.files().count(), 1);
+        assert_eq!(
+            archive.archive_comment().unwrap().as_deref(),
+            Some(&b"archive comment"[..])
+        );
+        let count = operations.load(Ordering::Relaxed);
+        assert!(count > 0);
+        for operation in 0..count {
+            let error = parse(operation, None).unwrap_err();
+            match error.root_cause() {
+                Error::Io(error) => {
+                    assert_eq!(error.kind, io::ErrorKind::PermissionDenied);
+                    assert_eq!(error.message, "input fault");
+                }
+                error => panic!("operation {operation}: {error:?}"),
+            }
+            assert_eq!(operations.load(Ordering::Relaxed), operation + 1);
+            let token = crate::ReadCancellation::new();
+            let error = parse(operation, Some(&token)).unwrap_err();
+            assert!(matches!(error.root_cause(), Error::Cancelled));
+            assert_eq!(operations.load(Ordering::Relaxed), operation + 1);
+        }
+    }
+
+    #[test]
     fn audit_nested_comments_and_time_fields_preserve_legacy_admission() {
         let mut time = file_header_with(0);
         time.ext_time = 0x0800u16.to_le_bytes().to_vec();
