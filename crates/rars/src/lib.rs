@@ -580,9 +580,10 @@ struct SharedBuffer(std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>);
 
 impl SharedBuffer {
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<Vec<u8>>> {
-        self.0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        // Only private buffer operations run under this lock. A panic while
+        // appending unwinds extraction before its owner can read the result;
+        // no callback runs with the guard held or can resume that extraction.
+        self.0.lock().expect("member buffer mutex is not poisoned")
     }
 }
 
@@ -903,7 +904,7 @@ impl Archive {
         })?;
         let taken = collected
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("member buffer mutex is not poisoned")
             .take();
         Ok(taken)
     }
@@ -1482,7 +1483,7 @@ pub fn read_volume_member_at_with_options(
     })?;
     let taken = collected
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .expect("member buffer mutex is not poisoned")
         .take();
     Ok(taken)
 }
