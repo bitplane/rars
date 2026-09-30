@@ -471,6 +471,49 @@ fn legacy_stdout_aliases_emit_archives_and_quick_open_refuses_encrypted_headers(
 }
 
 #[test]
+fn info_keeps_file_comment_services_separate_from_archive_comments() {
+    let root = scratch("info-file-comment-services");
+    let source = root.join("payload.txt");
+    let archive = root.join("services.rar");
+    fs::write(&source, b"service payload").unwrap();
+    let create = rars()
+        .args([
+            "add",
+            "--format",
+            "rar50",
+            "--store",
+            "--quick-open",
+            "--file-comment",
+            "member note",
+        ])
+        .arg(&archive)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(create.status.success(), "{}", stderr(&create));
+    for verbose in [false, true] {
+        let mut command = rars();
+        command.arg("info");
+        if verbose {
+            command.arg("--verbose");
+        }
+        let output = command.arg(&archive).output().unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        let text = stdout(&output);
+        if verbose {
+            assert!(text.contains("service: CMT"), "{text}");
+            assert!(text.contains("service: QO"), "{text}");
+        } else {
+            assert!(text.contains("Services:"), "{text}");
+            assert!(text.contains("comment"), "{text}");
+            assert!(text.contains("quick-open"), "{text}");
+        }
+        assert!(!text.contains("Comment:"), "{text}");
+        assert!(!text.contains("  comment:"), "{text}");
+    }
+}
+
+#[test]
 fn test_verifies_rar15_40_stored_fixture() {
     let output = rars()
         .arg("test")
