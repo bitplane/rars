@@ -558,7 +558,7 @@ impl Unpack15Encoder {
             .ch_set
             .iter()
             .position(|&value| (value >> 8) as u8 == byte)
-            .ok_or(Error::InvalidData("RAR 1.3 literal is not encodable"))?;
+            .expect("literal alphabet contains every byte");
         self.emit_literal_place(byte_place, byte_place, true)
     }
 
@@ -567,9 +567,7 @@ impl Unpack15Encoder {
             .ch_set
             .iter()
             .position(|&value| (value >> 8) as u8 == byte)
-            .ok_or(Error::InvalidData(
-                "RAR 1.3 stmode literal is not encodable",
-            ))?;
+            .expect("literal alphabet contains every byte");
         #[cfg(test)]
         {
             self.stmode_literal_count += 1;
@@ -619,9 +617,8 @@ impl Unpack15Encoder {
         decoded_place: usize,
         update_num_huf: bool,
     ) -> Result<()> {
-        if encoded_place > self.ch_set.len() || decoded_place >= self.ch_set.len() {
-            return Err(Error::InvalidData("RAR 1.3 literal is not encodable"));
-        }
+        debug_assert!(encoded_place <= self.ch_set.len());
+        debug_assert!(decoded_place < self.ch_set.len());
 
         let (start_pos, dec_tab, pos_tab) = if self.avr_plc > 0x75ff {
             (8, DEC_HF4, POS_HF4)
@@ -2328,6 +2325,47 @@ fn corr_huff(char_set: &mut [u16; 256], num_to_place: &mut [u8; 256]) {
 #[cfg(test)]
 mod tests {
     use crate::codec::Error;
+
+    #[test]
+    fn adaptive_literal_updates_preserve_every_byte_through_renormalization() {
+        fn assert_alphabet(encoder: &super::Unpack15Encoder) {
+            let mut counts = [0u16; 256];
+            for &entry in &encoder.ch_set {
+                counts[(entry >> 8) as usize] += 1;
+                assert!(entry & 0xff <= 0xa1);
+            }
+            assert_eq!(counts, [1; 256]);
+        }
+        for stmode in [false, true] {
+            for average in [0, 0x0e00, 0x3600, 0x5e00, 0x7600] {
+                let mut encoder = super::Unpack15Encoder::new();
+                encoder.avr_plc = average;
+                let mut renormalizations = 0;
+                for byte in std::iter::repeat_n(0, 512).chain(0..=255) {
+                    let before = encoder
+                        .ch_set
+                        .iter()
+                        .find(|&&entry| entry >> 8 == 0)
+                        .unwrap()
+                        & 0xff;
+                    if stmode {
+                        encoder.emit_stmode_literal(byte).unwrap();
+                    } else {
+                        encoder.emit_literal(byte).unwrap();
+                    }
+                    let after = encoder
+                        .ch_set
+                        .iter()
+                        .find(|&&entry| entry >> 8 == 0)
+                        .unwrap()
+                        & 0xff;
+                    renormalizations += usize::from(byte == 0 && after < before);
+                    assert_alphabet(&encoder);
+                }
+                assert!(renormalizations >= 2);
+            }
+        }
+    }
 
     #[test]
     fn public_decoder_clone_keeps_independent_solid_history_and_tables() {
