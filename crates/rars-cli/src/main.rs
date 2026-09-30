@@ -266,13 +266,13 @@ where
         .iter()
         .map(|(unp, _, _)| unp.to_string().len())
         .max()
-        .unwrap_or(0)
+        .expect("entry table is nonempty")
         .max(4);
     let pack_w = rows
         .iter()
         .map(|(_, pack, _)| pack.to_string().len())
         .max()
-        .unwrap_or(0)
+        .expect("entry table is nonempty")
         .max(6);
     println!("  {:>size_w$}  {:>pack_w$}  Name", "Size", "Packed");
     for (unp, pack, name) in &rows {
@@ -336,12 +336,11 @@ fn info_rar13_verbose(
                 ""
             }
         );
-        if let Some(comment) = archive
+        let comment = archive
             .archive_comment_with_options(options)
             .map_err(|err| format!("failed to decode archive comment '{path}': {err}"))?
-        {
-            println!("  comment: {}", display_bytes_lossy(&comment));
-        }
+            .expect("archive comment flag checked above");
+        println!("  comment: {}", display_bytes_lossy(&comment));
     }
     if let Some(av) = archive
         .authenticity_verification()
@@ -2054,14 +2053,16 @@ fn write_volume_parts(
     parts: &[Vec<u8>],
     progress: &CliProgress,
 ) -> CliResult<()> {
+    // Naming can fail before any filesystem work (for example after .r99).
+    // Plan the complete set first so that refusal cannot overwrite old parts.
+    let paths = (0..parts.len())
+        .map(|index| volume_part_path(first_path, index))
+        .collect::<CliResult<Vec<_>>>()?;
     let total = parts.iter().map(|part| part.len() as u64).sum();
     progress.bar(format!("Writing {} volumes", parts.len()), total);
-    let mut paths = Vec::with_capacity(parts.len());
-    for (index, bytes) in parts.iter().enumerate() {
-        let path = volume_part_path(first_path, index)?;
-        let mut file = fs::File::create(&path)?;
+    for (path, bytes) in paths.iter().zip(parts) {
+        let mut file = fs::File::create(path)?;
         write_bytes_with_progress(&mut file, bytes, progress)?;
-        paths.push(path);
     }
     progress.finish("Volumes written");
     print_created_volumes(&paths);
@@ -2119,6 +2120,49 @@ pub(crate) fn resolve_password_args(args: &PasswordArgs) -> CliResult<Option<Pas
 mod tests {
     #[cfg(unix)]
     #[test]
+    fn volume_preflight_reports_parent_symlink_loops_and_cleans_staging() {
+        let root = crate::scratch::case("volume-preflight-symlink-loop");
+        let first = root.join("archive.rar");
+        let blocked = root.join("loop/archive.rar");
+        std::os::unix::fs::symlink("loop", root.join("loop")).unwrap();
+        let mut sink = stage_two_volumes(&first);
+        sink.first_path = &blocked;
+        let error = sink.finish(Ok(())).unwrap_err();
+        assert_eq!(error.exit_code(), 1);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        assert!(std::fs::symlink_metadata(root.join("loop"))
+            .unwrap()
+            .is_symlink());
+    }
+
+    fn append_rar50_test_header(bytes: &mut Vec<u8>, body: &[u8]) {
+        assert!(body.len() < 128);
+        let mut encoded = vec![body.len() as u8];
+        encoded.extend_from_slice(body);
+        bytes.extend_from_slice(&rars::crc32::crc32(&encoded).to_le_bytes());
+        bytes.extend_from_slice(&encoded);
+    }
+
+    #[test]
+    fn info_preserves_unknown_services_before_an_archive_comment() {
+        let mut bytes = b"Rar!\x1a\x07\x01\x00".to_vec();
+        append_rar50_test_header(&mut bytes, &[1, 0, 0]);
+        // Zero-length stored service records, with an unknown name preceding
+        // CMT. The comment search must traverse earlier service headers.
+        append_rar50_test_header(&mut bytes, b"\x03\0\0\0\0\0\0\x05OTHER");
+        append_rar50_test_header(&mut bytes, b"\x03\0\0\0\0\0\0\x03CMT");
+        append_rar50_test_header(&mut bytes, &[5, 0, 0]);
+        let archive = rars::rar50::Archive::parse(&bytes).unwrap();
+        assert_eq!(archive.services().count(), 2);
+        assert_eq!(archive.archive_comment().unwrap(), Some(Vec::new()));
+        super::info_rar50_verbose("services.rar", &archive, super::ArchiveReadOptions::new())
+            .unwrap();
+        super::info_rar50_terse("services.rar", &archive, super::ArchiveReadOptions::new())
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn collection_extraction_preserves_fixture_redirections_and_unicode_names() {
         let fixtures =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../rars/tests/fixtures");
@@ -2145,6 +2189,26 @@ mod tests {
             std::path::PathBuf::from("dir")
         );
         assert!(root.join("file.txt").is_file());
+
+        let root = crate::scratch::case("collection-redirection-refusal");
+        std::fs::write(root.join("symlink.txt"), b"existing destination").unwrap();
+        let archive =
+            rars::rar50::Archive::parse_path(fixtures.join("rar50/wild/symlink.rar")).unwrap();
+        let state = std::cell::RefCell::new(super::ExtractOutputState::new(
+            &root,
+            super::OverwritePolicy::Never,
+            rars::ArchiveFamily::Rar50Plus,
+        ));
+        assert!(super::extract_volume_archives(
+            &[super::DetectedArchive::Rar50Plus(archive)],
+            super::ArchiveReadOptions::new(),
+            &state
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read(root.join("symlink.txt")).unwrap(),
+            b"existing destination"
+        );
 
         let root = crate::scratch::case("collection-extract-unicode");
         let archive = rars::rar15_40::Archive::parse_path(
@@ -2262,13 +2326,6 @@ mod tests {
         // The reader admits independent NAME and TIME bits, including neither.
         // Build physical headers because the writer deliberately requires a
         // creation time whenever it emits a name.
-        fn header(bytes: &mut Vec<u8>, body: &[u8]) {
-            assert!(body.len() < 128);
-            let mut encoded = vec![body.len() as u8];
-            encoded.extend_from_slice(body);
-            bytes.extend_from_slice(&rars::crc32::crc32(&encoded).to_le_bytes());
-            bytes.extend_from_slice(&encoded);
-        }
         for flags in [0u8, 1, 2, 3] {
             let mut record = vec![2, flags]; // metadata record type, field bits
             if flags & 1 != 0 {
@@ -2282,8 +2339,8 @@ mod tests {
             let mut main = vec![1, 1, extra.len() as u8, 0]; // main, extras, size, archive flags
             main.extend_from_slice(&extra);
             let mut bytes = b"Rar!\x1a\x07\x01\x00".to_vec();
-            header(&mut bytes, &main);
-            header(&mut bytes, &[5, 0, 0]); // end header with no flags
+            append_rar50_test_header(&mut bytes, &main);
+            append_rar50_test_header(&mut bytes, &[5, 0, 0]); // end header with no flags
             let archive = rars::rar50::Archive::parse(&bytes).unwrap();
             let metadata = archive.main.archive_metadata().unwrap();
             assert_eq!(
@@ -2496,6 +2553,7 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("failed to inspect"));
+            assert!(super::reject_ambiguous_extract_target(&[loop_path]).is_err());
             assert!(
                 super::looks_like_archive_path(std::path::Path::new("/dev/null"))
                     .unwrap_err()
@@ -2823,6 +2881,15 @@ mod tests {
             rar50_buffered_decode_limit_hint(&error),
             "\nhint: retry with --rar50-buffered-decode-limit 943718400 if you trust this archive and have enough memory"
         );
+        let offset_context = Error::AtArchiveOffset {
+            offset: 123,
+            source: Box::new(error),
+        };
+        assert_eq!(
+            super::find_rar50_buffered_decode_limit_error(&offset_context),
+            Some((512 * 1024 * 1024, 900 * 1024 * 1024))
+        );
+        assert!(rar50_buffered_decode_limit_hint(&offset_context).contains("943718400"));
     }
 
     #[test]
