@@ -610,8 +610,8 @@ pub(super) fn header_encryption_keys(password: &[u8]) -> Result<HeaderEncryption
         &mut salt,
         "RAR 5 writer could not generate encryption salt",
     )?;
-    let keys =
-        Rar50Keys::derive(password, salt, WRITE_KDF_COUNT_LOG).map_err(map_rar50_crypto_error)?;
+    let keys = Rar50Keys::derive(password, salt, WRITE_KDF_COUNT_LOG)
+        .expect("writer KDF count is supported");
     Ok(HeaderEncryptionKeys { keys, salt })
 }
 
