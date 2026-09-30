@@ -3741,6 +3741,27 @@ mod tests {
     }
 
     #[test]
+    fn preservation_accepts_empty_non_solid_directories() {
+        for target in [
+            ArchiveVersion::Rar15,
+            ArchiveVersion::Rar20,
+            ArchiveVersion::Rar29,
+            ArchiveVersion::Rar30,
+            ArchiveVersion::Rar40,
+        ] {
+            let mut builder = crate::Builder::new(target);
+            builder.add_directory(b"empty".to_vec(), None, None).unwrap();
+            let archive = Archive::parse_owned(builder.to_bytes().unwrap()).unwrap();
+            let file = archive.files().next().unwrap();
+            assert!(file.is_directory());
+            assert_eq!((file.pack_size, file.unp_size), (0, 0));
+            assert!(!file.is_solid());
+            let issues = archive.rewrite_preservation_issues();
+            assert!(issues.is_empty(), "{target:?}: {issues:?}");
+        }
+    }
+
+    #[test]
     fn preservation_preflight_reports_public_main_header_inconsistencies() {
         let seed = preservation_seed(ArchiveVersion::Rar29);
         type Edit = fn(&mut Archive);
