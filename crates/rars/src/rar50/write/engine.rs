@@ -2805,6 +2805,64 @@ mod emission_ledger_tests {
     }
 
     #[test]
+    fn archive_service_preparation_failure_preserves_member_context() {
+        for encrypted in [false, true] {
+            let mut service = super::super::ServiceEntry::new(b"CMT", b"note");
+            if encrypted {
+                service = service.with_password(b"secret");
+            }
+            let mut entry = ArchiveEntry::new(
+                b"member".to_vec(),
+                crate::EntrySource::from_bytes(b"payload".to_vec()),
+            );
+            for _ in 0..8 {
+                entry = entry.with_service(service.clone());
+            }
+            let mut limit = 0;
+            let mut service_refused = false;
+            loop {
+                let mut settings = plan(false);
+                settings.archive_comment = None;
+                settings.recovery_percent = None;
+                let resources = WriterResources::default().with_max_preparation_bytes(limit);
+                let mut output = Vec::new();
+                let result = write_archive(
+                    std::slice::from_ref(&entry),
+                    settings,
+                    &resources,
+                    &mut output,
+                );
+                assert_eq!(resources.workspace_in_use(), 0);
+                drop(Records::<u8>::new(limit as usize, &resources).unwrap());
+                match result {
+                    Ok(()) => {
+                        assert!(!output.is_empty());
+                        assert!(service_refused);
+                        break;
+                    }
+                    Err(error) => {
+                        assert!(output.is_empty());
+                        let Error::WriterPreparationLimitExceeded {
+                            required,
+                            limit: actual,
+                            ..
+                        } = error.root_cause()
+                        else {
+                            panic!("unexpected preparation failure: {error}");
+                        };
+                        assert_eq!(*actual, limit);
+                        assert!(*required > limit);
+                        service_refused |=
+                            error.entry_context() == Some((b"member".as_slice(), "preparing service"));
+                        limit = *required;
+                        assert!(limit < 64 * 1024);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn encrypted_service_rejects_oversized_name_after_extra_preparation() {
         let name = vec![b'n'; 4096];
         let resources = WriterResources::default().with_max_preparation_bytes(512);
