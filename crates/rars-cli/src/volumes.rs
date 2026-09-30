@@ -28,7 +28,9 @@ pub(crate) fn rar50_volume_part_path(
     )?;
     let stem = rar50_volume_stem(file_name);
     let width = total_parts.to_string().len().max(2);
-    let mut name = rars::filename::native_string(stem)?;
+    // Unix accepts any native bytes; elsewhere removing ASCII suffixes keeps UTF-8 valid.
+    let mut name = rars::filename::native_string(stem)
+        .expect("stem from a native filename remains representable");
     name.push(format!(".part{:0width$}.rar", index + 1));
     Ok(parent.join(name))
 }
@@ -154,7 +156,7 @@ fn parse_rar3_new_style_rev(bytes: &[u8]) -> Option<(usize, usize, usize)> {
         return None;
     }
     let trailer = &bytes[bytes.len() - 7..];
-    let stored_crc = u32::from_le_bytes(trailer[3..7].try_into().ok()?);
+    let stored_crc = u32::from_le_bytes([trailer[3], trailer[4], trailer[5], trailer[6]]);
     if crc32(&bytes[..bytes.len() - 4]) != stored_crc {
         return None;
     }
@@ -179,8 +181,9 @@ fn parse_rar3_old_style_rev_name(path: &Path) -> Option<(usize, usize, usize)> {
         while cursor > 0 && bytes[cursor - 1].is_ascii_digit() {
             cursor -= 1;
         }
+        // The scan above includes only ASCII digits; UTF-8 validation cannot fail.
         let number = std::str::from_utf8(&bytes[cursor..end])
-            .ok()?
+            .expect("digit run is ASCII")
             .parse::<usize>()
             .ok()?;
         numbers.push(number);
@@ -219,6 +222,7 @@ mod tests {
             ("set.part.rar", "set.part.part01.rar"),
             ("set.partx.rar", "set.partx.part01.rar"),
             ("set", "set.part01.rar"),
+            ("set.bin", "set.bin.part01.rar"),
             ("set.part2.part3.rar", "set.part2.part01.rar"),
         ] {
             assert_eq!(
