@@ -147,6 +147,20 @@ secretly buffers an entire archive.
 The same library is available as a [Rust crate][crate], [Python package][pypi]
 and [command-line tool][repo].
 
+## Development coverage
+
+From the repository root, run `python3 scripts/coverage-wasm.py` to measure
+Rust engine coverage under Node. It requires Node, `wasm-bindgen` matching
+`Cargo.lock`, and a Rust nightly using LLVM 23 with `wasm32-unknown-unknown`
+and `llvm-tools-preview` installed. The command uses one build job and at most
+two available CPUs, and saves reports under the ignored
+`target/coverage-wasm-focused` directory.
+
+An independent two-branch probe checks the measurement before testing the
+engine. Private error conversion tests are compiled with `cfg(test)`;
+their exports and the profiling runtime stub are absent from release builds.
+This measures Rust WASM source, separately from JavaScript facade coverage.
+
 [crate]: https://crates.io/crates/rars
 [pypi]: https://pypi.org/project/rars/
 [repo]: https://github.com/bitplane/rars

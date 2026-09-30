@@ -877,9 +877,6 @@ fn password_bytes(password: Option<Password>) -> Result<Option<Vec<u8>>, JsValue
         return Ok(None);
     };
     let value: JsValue = password.into();
-    if value.is_undefined() || value.is_null() {
-        return Ok(None);
-    }
     if let Some(text) = value.as_string() {
         return Ok(Some(text.into_bytes()));
     }
@@ -999,4 +996,81 @@ fn read_options<'a>(
     options.rar50_dictionary_size_limit = read_limit(settings, "rar50DictionarySizeLimit")?;
     options.rar50_buffered_decode_limit = read_limit(settings, "rar50BufferedDecodeLimit")?;
     Ok(options)
+}
+
+// This export exists only in the test engine built by coverage-wasm.py.
+// It exercises private error conversion in a real JavaScript host without
+// requiring browser-only types to work in native Rust unit tests.
+#[cfg(test)]
+mod host_tests {
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = __testErrorRecords)]
+    pub fn error_records() -> js_sys::Array {
+        use rars_rs::Error;
+        let limit = 9_007_199_254_740_993;
+        let required = u64::MAX;
+        let used = 17;
+        let errors = [
+            Error::Codec(rars_rs::codec::Error::WorkspaceLimitExceeded(Box::new(
+                rars_rs::codec::WorkspaceLimitError {
+                    limit,
+                    required,
+                    used,
+                },
+            ))),
+            Error::MemoryLimitExceeded {
+                limit,
+                required,
+                dictionary_size: used,
+            },
+            Error::WriterPreparationLimitExceeded {
+                limit,
+                required,
+                used,
+            },
+            Error::WriterPreparedHeaderLimitExceeded {
+                limit,
+                required,
+                used,
+            },
+            Error::WriterSpoolMemoryLimitExceeded {
+                limit,
+                required,
+                used,
+            },
+            Error::WriterSpoolLimitExceeded {
+                limit,
+                required,
+                used,
+            },
+            Error::TotalOutputLimitExceeded {
+                limit,
+                required,
+                used,
+            },
+            Error::MemberOutputLimitExceeded { limit, required },
+            Error::HeaderBytesLimitExceeded { limit, required },
+            Error::Rar50DictionaryLimitExceeded { limit, required },
+            Error::Rar50BufferedDecodeLimitExceeded { limit, required },
+            Error::HeaderCountLimitExceeded { limit, required },
+            Error::from(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            Error::Rar5Recovery(rars_rs::recovery::rar5::Error::Io(
+                std::io::ErrorKind::BrokenPipe,
+            )),
+        ];
+        errors
+            .into_iter()
+            .map(|error| {
+                let wrapped = Error::InVolume {
+                    number: 3,
+                    source: Box::new(
+                        error
+                            .at_entry(vec![0xff, 0, 1], "reading")
+                            .at_archive_offset(usize::MAX),
+                    ),
+                };
+                super::js_error(wrapped)
+            })
+            .collect()
+    }
 }

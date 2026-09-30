@@ -1,4 +1,5 @@
 // Exercise the packed-shape async JavaScript API under Node.
+import "./test-wasm-bindings.cjs";
 import "./test-npm-api.mjs";
 import "./test-npm-errors.mjs";
 import "./test-npm-client.mjs";

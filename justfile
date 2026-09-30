@@ -48,3 +48,7 @@ coverage *ARGS:
 # Coverage of the existing npm package and worker tests.
 coverage-js *ARGS:
     ./scripts/coverage-js.sh {{ ARGS }}
+
+# Rust WASM source coverage from the real Node engine, using LLVM 23 nightly.
+coverage-wasm *ARGS:
+    python3 scripts/coverage-wasm.py {{ ARGS }}
