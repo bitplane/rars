@@ -2295,6 +2295,127 @@ mod tests {
     use crate::codec::Error;
 
     #[test]
+    fn empty_encoder_fast_paths_skip_progress_and_nonempty_work_can_cancel() {
+        assert!(
+            super::unpack15_encode_with_options(&[], super::EncodeOptions::default())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(super::unpack15_encode_with_options_and_progress(
+            &[],
+            super::EncodeOptions::default(),
+            &mut |_| panic!("empty input has no codec work")
+        )
+        .unwrap()
+        .is_empty());
+        let mut checkpoints = Vec::new();
+        assert_eq!(
+            super::unpack15_encode_with_options_and_progress(
+                b"abc",
+                super::EncodeOptions::default(),
+                &mut |position| {
+                    checkpoints.push(position);
+                    false
+                }
+            ),
+            Err(Error::Cancelled)
+        );
+        assert_eq!(checkpoints, [3]);
+    }
+
+    #[test]
+    fn public_decoder_renormalizes_repeated_flags_without_losing_the_alphabet() {
+        let mut encoder = super::Unpack15Encoder::new();
+        let first = encoder.encode_member(&[0]).unwrap();
+        let mut decoder = super::Unpack15::new();
+        assert_eq!(decoder.decode_member(&first, 1, false).unwrap(), [0]);
+        for _ in 0..300 {
+            encoder.emit_flags_byte(0);
+            for _ in 0..4 {
+                encoder.emit_short_lz(super::ShortLz {
+                    distance: 1,
+                    length: 2,
+                });
+            }
+        }
+        let packed = std::mem::take(&mut encoder.bits).finish();
+        assert_eq!(
+            decoder.decode_member(&packed, 2400, true).unwrap(),
+            vec![0; 2400]
+        );
+        assert_eq!(decoder.state.ch_set_c, encoder.ch_set_c);
+        let frequency = decoder
+            .state
+            .ch_set_c
+            .iter()
+            .find(|&&entry| entry >> 8 == 0)
+            .unwrap()
+            & 0xff;
+        assert_eq!(
+            frequency, 52,
+            "256th update renormalizes the hot entry to 7, then increments it"
+        );
+    }
+
+    #[test]
+    fn invalid_flag_rank_preserves_the_table_and_match_overrun_writes_nothing() {
+        let mut bits = super::BitWriter::new();
+        super::emit_decode_num(&mut bits, 256, 5, super::DEC_HF2, super::POS_HF2);
+        let packed = bits.finish();
+        let mut decoder = super::Unpack15::new();
+        let alphabet = decoder.state.ch_set_c;
+        assert_eq!(decoder.decode_member(&packed, 2, false).unwrap(), [0; 2]);
+        assert_eq!(decoder.state.ch_set_c, alphabet);
+        let mut streaming = super::Unpack15::new();
+        let mut output = Vec::new();
+        streaming
+            .decode_member_from_reader(&mut packed.as_slice(), 2, false, &mut output)
+            .unwrap();
+        assert_eq!(output, [0; 2]);
+        assert_eq!(streaming.state.ch_set_c, alphabet);
+        assert_eq!(
+            super::Unpack15::new().decode_member(&[], 1, false),
+            Err(Error::InvalidData("RAR 1.3 match exceeds output size"))
+        );
+        output.clear();
+        assert_eq!(
+            super::Unpack15::new().decode_member_from_reader(&mut &[][..], 1, false, &mut output),
+            Err(Error::InvalidData("RAR 1.3 match exceeds output size"))
+        );
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn consecutive_minimum_long_matches_cross_the_distance_threshold() {
+        let mut encoder = super::Unpack15Encoder::new();
+        let first = encoder.encode_literals_only_member(&[0; 256]);
+        let mut decoder = super::Unpack15::new();
+        assert_eq!(decoder.decode_member(&first, 256, false).unwrap(), [0; 256]);
+        assert!(decoder.state.avr_plc < 0x2a00);
+        for _ in 0..178 {
+            encoder.emit_long_lz(super::LongLz {
+                distance: 1,
+                length: 11,
+            });
+        }
+        let payload = std::mem::take(&mut encoder.bits).finish();
+        decoder.state.init_member(178 * 11, true);
+        decoder.state.bits =
+            super::ReaderBits::with_allowance(&payload, &decoder.state.window.allowance()).unwrap();
+        let mut output = Vec::new();
+        for index in 0..178 {
+            decoder.state.long_lz(&mut output).unwrap();
+            if index < 177 {
+                assert_eq!(decoder.state.max_dist3, 0x2001);
+            }
+        }
+        assert_eq!(output, vec![0; 178 * 11]);
+        assert_eq!(decoder.state.avr_ln3, 178);
+        assert_eq!(decoder.state.max_dist3, 0x7f00);
+        assert_eq!(decoder.state.ch_set_b, encoder.ch_set_b);
+    }
+
+    #[test]
     fn maximum_far_distance_zero_fills_then_reads_wrapped_solid_history() {
         fn far_member(encoder: &mut super::Unpack15Encoder) -> Vec<u8> {
             encoder.emit_flags_byte(0);
@@ -3930,23 +4051,26 @@ mod solid_regressions {
 
     #[test]
     fn decoder_reads_stmode_short_match_token() {
-        let mut bits = BitWriter::new();
-        emit_decode_num(&mut bits, 0, 5, DEC_HF1, POS_HF1);
-        bits.write_bits(0, 1); // ST-mode match rather than exit.
-        bits.write_bits(1, 1); // Four-byte match.
-        emit_decode_num(&mut bits, 0, 5, DEC_HF2, POS_HF2);
-        bits.write_bits(1, 5); // Distance one.
+        for length in [3, 4] {
+            let mut bits = BitWriter::new();
+            emit_decode_num(&mut bits, 0, 5, DEC_HF1, POS_HF1);
+            bits.write_bits(0, 1); // ST-mode match rather than exit.
+            bits.write_bits(u32::from(length == 4), 1); // Three- or four-byte match.
+            emit_decode_num(&mut bits, 0, 5, DEC_HF2, POS_HF2);
+            bits.write_bits(1, 5); // Distance one.
 
-        let mut decoder = Unpack15::new();
-        decoder.bits = BitReader::new(&bits.finish());
-        decoder.st_mode = true;
-        decoder.target = 5;
-        decoder.output_written = 1;
-        decoder.unp_ptr = 1;
-        decoder.window[0] = b'A';
-        let mut output = Vec::new();
-        decoder.huff_decode(&mut output).unwrap();
-        assert_eq!(output, b"AAAA");
-        assert_eq!(decoder.token_stats.st_matches, 1);
+            let mut decoder = Unpack15::new();
+            decoder.bits = BitReader::new(&bits.finish());
+            decoder.st_mode = true;
+            decoder.target = 1 + length;
+            decoder.output_written = 1;
+            decoder.unp_ptr = 1;
+            decoder.window[0] = b'A';
+            let mut output = Vec::new();
+            decoder.huff_decode(&mut output).unwrap();
+            assert_eq!(output, vec![b'A'; length]);
+            assert_eq!(decoder.token_stats.st_matches, 1);
+        }
     }
+
 }
