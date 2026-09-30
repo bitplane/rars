@@ -2117,6 +2117,106 @@ pub(crate) fn resolve_password_args(args: &PasswordArgs) -> CliResult<Option<Pas
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn archive_publication_failures_preserve_destinations_and_clean_staging() {
+        let root = crate::scratch::case("archive-publication-errors");
+        let archive = root.join("archive.rar");
+        std::fs::write(&archive, b"original").unwrap();
+        let error = super::write_archive_file(&archive, |output| {
+            output.write_all(b"partial")?;
+            Err::<(), _>(super::CliError::general("injected writer failure"))
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "injected writer failure");
+        assert_eq!(std::fs::read(&archive).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+
+        let directory = root.join("directory.rar");
+        std::fs::create_dir(&directory).unwrap();
+        assert!(super::write_archive_file(&directory, |output| {
+            output.write_all(b"new")?;
+            Ok(())
+        })
+        .is_err());
+        assert!(directory.is_dir());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+        assert!(super::create_streaming_archive_temp(std::path::Path::new("/")).is_err());
+        assert!(super::create_streaming_archive_temp(&root.join("missing/archive.rar")).is_err());
+
+        // Every name is owned by this test's private directory. A collision must
+        // never truncate an existing staging file, including after exhaustion.
+        for sequence in 0..128u8 {
+            let temporary = root.join(format!(
+                ".archive.rar.rars-writing-{}-{sequence:02x}",
+                std::process::id()
+            ));
+            std::fs::write(temporary, b"occupied").unwrap();
+        }
+        assert_eq!(
+            super::create_streaming_archive_temp(&archive)
+                .unwrap_err()
+                .to_string(),
+            "could not allocate a unique temporary archive file"
+        );
+        let first = root.join(format!(
+            ".archive.rar.rars-writing-{}-00",
+            std::process::id()
+        ));
+        assert_eq!(std::fs::read(&first).unwrap(), b"occupied");
+        std::fs::remove_file(&first).unwrap();
+        let (temporary, output) = super::create_streaming_archive_temp(&archive).unwrap();
+        assert_eq!(temporary, first);
+        drop(output);
+        std::fs::remove_file(temporary).unwrap();
+    }
+
+    #[test]
+    fn archive_comments_escape_controls_and_preserve_text() {
+        for (bytes, expected) in [
+            (b"".as_slice(), ""),
+            (b"\0\0", ""),
+            (b"hello\r\n\0\0", "hello"),
+            (b"first\n\tsecond", "first\n\tsecond"),
+            (b"\x1b[31m\r\x7f", "\\x1b[31m\\x0d\\x7f"),
+            (b"invalid \xff", "invalid \u{fffd}"),
+            ("café\u{0085}".as_bytes(), "café\\x85"),
+        ] {
+            assert_eq!(super::render_comment_safe(bytes), expected);
+            super::print_comment("  ", bytes);
+        }
+        super::print_entry_table(std::iter::empty());
+        super::print_entry_table([(u64::MAX, 0, "large.txt".to_owned())]);
+    }
+
+    #[test]
+    fn size_and_thread_parsers_reject_invalid_and_overflowing_values() {
+        for value in ["", "  ", "k", "M", "G", "-1", "1.5k", "nope"] {
+            assert!(super::parse_size_string(value).is_err(), "{value:?}");
+        }
+        assert_eq!(super::parse_size_string(" 2K ").unwrap(), 2048);
+        assert_eq!(super::parse_size_string("0").unwrap(), 0);
+        assert_eq!(
+            super::parse_size_string(&usize::MAX.to_string()).unwrap(),
+            usize::MAX
+        );
+        assert!(super::parse_size_string(&format!("{}k", usize::MAX))
+            .unwrap_err()
+            .contains("overflows usize"));
+        assert!(super::parse_size_string(&format!("{}0", usize::MAX)).is_err());
+        assert_eq!(super::parse_thread_count("1").unwrap(), 1);
+        assert_eq!(
+            super::parse_thread_count(&usize::MAX.to_string()).unwrap(),
+            usize::MAX
+        );
+        assert_eq!(
+            super::parse_thread_count("0").unwrap_err(),
+            "thread count must be at least 1"
+        );
+        for value in ["", "-1", " 1", "1k"] {
+            assert!(super::parse_thread_count(value).is_err(), "{value:?}");
+        }
+    }
+
     fn stage_two_volumes(first_path: &std::path::Path) -> super::CliVolumeSink<'_> {
         use rars::rar50::VolumeSink;
         use std::io::Write;
