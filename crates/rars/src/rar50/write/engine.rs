@@ -638,7 +638,7 @@ fn encrypted_service_block<'a>(
         "RAR 5 writer could not generate encryption IV",
     )?;
     let keys = Rar50Keys::derive(password, salt, WRITE_KDF_COUNT_LOG)
-        .map_err(crate::rar50::map_rar50_crypto_error)?;
+        .expect("writer KDF count is supported");
 
     let mut extra = Bytes::new(resources);
     write_extra_record(&mut extra, FHEXTRA_SUBDATA, service_data)?;
@@ -734,7 +734,7 @@ fn prepare_member(
                 "RAR 5 writer could not generate encryption IV",
             )?;
             let keys = Rar50Keys::derive(password, salt, WRITE_KDF_COUNT_LOG)
-                .map_err(crate::rar50::map_rar50_crypto_error)?;
+                .expect("writer KDF count is supported");
             write_file_encryption_record(&mut extra, salt, iv, keys.password_check_record())?;
             let crc32 = keys.mac_crc32(member.crc32);
             let hash = keys.mac_hash32(member.hash);
@@ -1349,7 +1349,7 @@ fn prepare_volume_member<'a>(
                 "RAR 5 writer could not generate encryption IV",
             )?;
             let keys = Rar50Keys::derive(password, salt, WRITE_KDF_COUNT_LOG)
-                .map_err(crate::rar50::map_rar50_crypto_error)?;
+                .expect("writer KDF count is supported");
 
             // A volume boundary can fall anywhere, and the cipher runs as one
             // chain over the member, so encrypt it up front into scratch
