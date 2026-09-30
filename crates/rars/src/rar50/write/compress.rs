@@ -517,7 +517,8 @@ fn compress_members_whole(
                     error_context,
                 )
                 .map_err(|error| error_context(start, error))?,
-            )?;
+            )
+            .expect("one compression result per source was admitted");
             start += 1;
             continue;
         }
