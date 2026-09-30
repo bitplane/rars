@@ -265,7 +265,7 @@ impl Unpack15Encoder {
                 plan_huff_effect(&mut plan_nhfb, &mut plan_nlzb);
             }
 
-            self.emit_flags_byte(flags)?;
+            self.emit_flags_byte(flags);
             self.emit_payloads(payloads)?;
             if group_enters_stmode {
                 if self.options.stmode_literal_runs {
@@ -374,7 +374,7 @@ impl Unpack15Encoder {
                 plan_encoder.emit_literal(literal);
             }
 
-            self.emit_flags_byte(flags)?;
+            self.emit_flags_byte(flags);
             self.emit_payloads(payloads)?;
             if group_enters_stmode {
                 if self.options.stmode_literal_runs {
@@ -508,7 +508,7 @@ impl Unpack15Encoder {
             match payload {
                 EncodedToken::Literal(byte) => self.emit_literal(byte),
                 EncodedToken::ShortLz(short_lz) => {
-                    self.emit_short_lz(short_lz)?;
+                    self.emit_short_lz(short_lz);
                 }
                 EncodedToken::RepeatLast(repeat) => {
                     self.emit_repeat_last(repeat)?;
@@ -525,13 +525,14 @@ impl Unpack15Encoder {
         Ok(())
     }
 
-    fn emit_flags_byte(&mut self, flags: u8) -> Result<()> {
+    fn emit_flags_byte(&mut self, flags: u8) {
         let flags_place = self
             .ch_set_c
             .iter()
             .position(|&value| (value >> 8) as u8 == flags)
-            .ok_or(Error::InvalidData("RAR 1.3 flag byte is not encodable"))?;
-        emit_decode_num(&mut self.bits, flags_place as u32, 5, DEC_HF2, POS_HF2)?;
+            .expect("flag alphabet contains every byte");
+        emit_decode_num(&mut self.bits, flags_place as u32, 5, DEC_HF2, POS_HF2)
+            .expect("HF2 represents every flag rank");
 
         let mut cur_flags;
         let mut new_flags_place;
@@ -550,7 +551,6 @@ impl Unpack15Encoder {
 
         self.ch_set_c[flags_place] = self.ch_set_c[new_flags_place];
         self.ch_set_c[new_flags_place] = cur_flags as u16;
-        Ok(())
     }
 
     fn emit_literal(&mut self, byte: u8) {
@@ -665,14 +665,16 @@ impl Unpack15Encoder {
         self.ch_set[new_byte_place] = cur_byte as u16;
     }
 
-    fn emit_short_lz(&mut self, short_lz: ShortLz) -> Result<()> {
+    fn emit_short_lz(&mut self, short_lz: ShortLz) {
+        debug_assert!((1..=256).contains(&short_lz.distance));
+        debug_assert!((2..=10).contains(&short_lz.length));
         self.num_huf = 0;
         if self.l_count == 2 {
             self.bits.write_bits(0, 1);
             self.l_count = 0;
         }
         let length_place = short_lz.length - 2;
-        self.emit_short_lz_code(length_place as usize)?;
+        self.emit_short_lz_code(length_place as usize);
         self.l_count = 0;
 
         self.avr_ln1 += length_place;
@@ -683,17 +685,15 @@ impl Unpack15Encoder {
             .ch_set_a
             .iter()
             .position(|&value| value as u32 == distance_value)
-            .ok_or(Error::InvalidData(
-                "RAR 1.3 ShortLZ distance is not encodable",
-            ))?;
-        emit_decode_num(&mut self.bits, distance_place as u32, 5, DEC_HF2, POS_HF2)?;
+            .expect("short-distance alphabet contains every distance");
+        emit_decode_num(&mut self.bits, distance_place as u32, 5, DEC_HF2, POS_HF2)
+            .expect("HF2 represents every short-distance rank");
         if distance_place > 0 {
             let last_distance = self.ch_set_a[distance_place - 1];
             self.ch_set_a[distance_place] = last_distance;
             self.ch_set_a[distance_place - 1] = distance_value as u16;
         }
         self.remember_match(short_lz.distance, short_lz.length);
-        Ok(())
     }
 
     fn emit_repeat_last(&mut self, repeat: RepeatLastLz) -> Result<()> {
@@ -706,7 +706,7 @@ impl Unpack15Encoder {
         if self.l_count == 2 {
             self.bits.write_bits(1, 1);
         } else {
-            self.emit_short_lz_code(9)?;
+            self.emit_short_lz_code(9);
             self.l_count += 1;
         }
         Ok(())
@@ -718,7 +718,7 @@ impl Unpack15Encoder {
             self.bits.write_bits(0, 1);
             self.l_count = 0;
         }
-        self.emit_short_lz_code(old_lz.short_code as usize)?;
+        self.emit_short_lz_code(old_lz.short_code as usize);
         self.l_count = 0;
 
         let expected_distance = self.old_dist[(self
@@ -744,7 +744,7 @@ impl Unpack15Encoder {
         Ok(())
     }
 
-    fn emit_short_lz_code(&mut self, code: usize) -> Result<()> {
+    fn emit_short_lz_code(&mut self, code: usize) {
         let (code_len, code_byte) = if self.avr_ln1 < 37 {
             (self.short_len1(code), SHORT_XOR1[code])
         } else {
@@ -752,7 +752,6 @@ impl Unpack15Encoder {
         };
         self.bits
             .write_bits((code_byte >> (8 - code_len)) as u32, code_len as usize);
-        Ok(())
     }
 
     fn short_lz_prefix_bit_cost(&self, code: u32) -> Option<usize> {
@@ -2321,6 +2320,43 @@ mod tests {
     use crate::codec::Error;
 
     #[test]
+    fn flags_and_short_distance_updates_preserve_complete_alphabets() {
+        let mut encoder = super::Unpack15Encoder::new();
+        let mut renormalizations = 0;
+        for flags in std::iter::repeat_n(255, 768).chain(0..=255) {
+            let before = encoder.ch_set_c.iter().find(|&&v| v >> 8 == 255).unwrap() & 0xff;
+            encoder.emit_flags_byte(flags);
+            let after = encoder.ch_set_c.iter().find(|&&v| v >> 8 == 255).unwrap() & 0xff;
+            renormalizations += usize::from(flags == 255 && after < before);
+            let mut counts = [0u16; 256];
+            for &entry in &encoder.ch_set_c {
+                counts[(entry >> 8) as usize] += 1;
+            }
+            assert_eq!(counts, [1; 256]);
+        }
+        assert!(renormalizations >= 2);
+        for length in 2..=10 {
+            for distance in (1..=256).rev() {
+                encoder.emit_short_lz(super::ShortLz { distance, length });
+                let mut counts = [0u16; 256];
+                for &entry in &encoder.ch_set_a {
+                    counts[entry as usize] += 1;
+                }
+                assert_eq!(counts, [1; 256]);
+            }
+        }
+        let mut input: Vec<u8> = (0..=255).collect();
+        input.extend_from_slice(&[0, 1]);
+        assert_eq!(
+            super::find_short_lz(&input, 256),
+            Some(super::ShortLz {
+                distance: 256,
+                length: 2
+            })
+        );
+    }
+
+    #[test]
     fn adaptive_literal_updates_preserve_every_byte_through_renormalization() {
         fn assert_alphabet(encoder: &super::Unpack15Encoder) {
             let mut counts = [0u16; 256];
@@ -3562,9 +3598,9 @@ mod solid_regressions {
     #[test]
     fn decoder_reads_far_short_match_token() {
         let mut encoder = Unpack15Encoder::new();
-        encoder.emit_short_lz_code(10).unwrap();
+        encoder.emit_short_lz_code(10);
         emit_decode_num(&mut encoder.bits, 0xff, 2, DEC_L1, POS_L1).unwrap();
-        encoder.emit_short_lz_code(14).unwrap();
+        encoder.emit_short_lz_code(14);
         emit_decode_num(&mut encoder.bits, 0, 3, DEC_L2, POS_L2).unwrap();
         encoder.bits.write_bits(0, 15);
 
@@ -3616,7 +3652,7 @@ mod solid_regressions {
         // carry it with the other old-distance codes (§6.13).
         for code in 11..=13 {
             let mut encoder = Unpack15Encoder::new();
-            encoder.emit_short_lz_code(code).unwrap();
+            encoder.emit_short_lz_code(code);
             emit_decode_num(&mut encoder.bits, 0xff, 2, DEC_L1, POS_L1).unwrap();
             let mut decoder = Unpack15::new();
             decoder.bits = BitReader::new(&encoder.bits.finish());
