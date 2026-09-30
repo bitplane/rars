@@ -679,7 +679,7 @@ fn cancellation_and_shared_output_failures_do_not_blame_a_member() {
 }
 
 #[test]
-fn stored_legacy_emission_propagates_failure_at_every_output_write() {
+fn legacy_emission_propagates_failure_at_every_output_write() {
     struct FailOnWrite {
         fail_at: usize,
         writes: usize,
@@ -699,13 +699,19 @@ fn stored_legacy_emission_propagates_failure_at_every_output_write() {
         }
     }
 
-    for format in FORMATS {
+    for (format, compressed, solid) in FORMATS.into_iter().flat_map(|format| {
+        [
+            (format, false, false),
+            (format, true, false),
+            (format, true, true),
+        ]
+    }) {
         let run = |sink: &mut dyn Write| {
             write(
                 format,
                 EntrySource::from_bytes(b"good".to_vec()),
-                false,
-                false,
+                compressed,
+                solid,
                 &WriterResources::default(),
                 sink,
             )
@@ -724,7 +730,9 @@ fn stored_legacy_emission_propagates_failure_at_every_output_write() {
             let error = run(&mut sink).unwrap_err();
             assert_eq!(error.kind(), ErrorKind::Io, "{format:?} write {fail_at}");
             assert_eq!(sink.writes, fail_at + 1);
-            if error.entry_context().is_some() {
+            if let Some((name, operation)) = error.entry_context() {
+                assert!(name == b"first" || name == b"second");
+                assert_eq!(operation, "writing");
                 member_failure = true;
             } else {
                 archive_failure = true;
