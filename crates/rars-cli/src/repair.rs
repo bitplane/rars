@@ -142,7 +142,7 @@ fn cmd_repair_rev5(paths: &[PathBuf]) -> CliResult<()> {
     rars::rar50::repair_rev5_volumes_to(&slots, &recovery, |index, bytes| {
         let path =
             repaired_volume_path(&out_dir, &data_inputs, index, usize::from(first.data_count));
-        fs::write(&path, bytes)?;
+        write_repaired_volume(&path, bytes)?;
         println!("repaired {}", path.display());
         Ok(())
     })
@@ -200,12 +200,20 @@ fn cmd_repair_rev3(paths: &[PathBuf]) -> CliResult<()> {
         .collect();
     rars::rar15_40::repair_rev3_volumes_to(&slots, recovery_count, &recovery, |index, bytes| {
         let path = repaired_volume_path(&out_dir, &data_inputs, index, data_count);
-        fs::write(&path, bytes)?;
+        write_repaired_volume(&path, bytes)?;
         println!("repaired {}", path.display());
         Ok(())
     })
     .map_err(|err| CliError::general(format!("failed to repair RAR 3 REV volume set: {err}")))?;
     Ok(())
+}
+
+fn write_repaired_volume(path: &Path, bytes: &[u8]) -> rars::Result<()> {
+    crate::write_archive_file(path, |output| {
+        output.write_all(bytes)?;
+        Ok(())
+    })
+    .map_err(|error| Error::from(std::io::Error::other(error)))
 }
 
 fn repaired_volume_path(
@@ -331,6 +339,8 @@ mod tests {
             ("set.r01", 2, 3, "set.r01"),
             ("set.rXX", 0, 2, "repaired.part1.rar"),
             ("set.rev", 0, 2, "repaired.part1.rar"),
+            ("set.binlong", 0, 2, "repaired.part1.rar"),
+            ("set", 0, 2, "repaired.part1.rar"),
             ("/", 0, 2, "repaired.part1.rar"),
         ] {
             assert_eq!(
@@ -409,7 +419,11 @@ mod tests {
             paths.push(path);
         }
         let unknown = root.join("not-a-volume.bin");
-        fs::write(&unknown, b"unrelated").unwrap();
+        fs::write(
+            &unknown,
+            vec![0; fs::metadata(&paths[0]).unwrap().len() as usize],
+        )
+        .unwrap();
         paths.push(unknown);
         let recovery = root.join("set.rev");
         fs::copy(fixture("rar50", "multivol_rev.part1.rev"), &recovery).unwrap();
@@ -462,6 +476,101 @@ mod tests {
             );
             assert_eq!(fs::read(&output).unwrap(), b"keep");
         }
+    }
+
+    #[test]
+    fn raw_inline_repair_restores_headers_and_preserves_clean_output() {
+        let root = crate::scratch::case("repair-raw-headers");
+        for encrypted in [false, true] {
+            let mut builder = rars::Builder::new(rars::ArchiveVersion::Rar50)
+                .store(true)
+                .recovery_percent(Some(20))
+                .password(encrypted.then(|| b"secret".to_vec()));
+            builder
+                .add_bytes(b"file".to_vec(), vec![b'p'; 4096], None, None)
+                .unwrap();
+            let original = builder.to_bytes().unwrap();
+            let raw = rars::rar50::Archive::parse_with_password(
+                &original,
+                encrypted.then_some(b"secret".as_slice()),
+            )
+            .unwrap();
+            let mut damaged = original.clone();
+            damaged[raw.files().next().unwrap().block.offset] ^= 0xff;
+            assert!(rars::rar50::Archive::parse(&damaged).is_err());
+            let input = root.join("input.rar");
+            let output = root.join("output.rar");
+            fs::write(&input, &damaged).unwrap();
+            fs::write(&output, b"previous output").unwrap();
+            cmd_repair(RepairArgs {
+                password: crate::cli::PasswordArgs {
+                    password: encrypted.then(|| "secret".into()),
+                    password_file: None,
+                },
+                paths: vec![input.clone(), output.clone()],
+            })
+            .unwrap();
+            assert_eq!(fs::read(&output).unwrap(), original);
+            assert_eq!(fs::read(&input).unwrap(), damaged);
+            // A clean input is still copied, with no repair action reported.
+            cmd_repair(RepairArgs {
+                password: crate::cli::PasswordArgs {
+                    password: encrypted.then(|| "secret".into()),
+                    password_file: None,
+                },
+                paths: vec![output, input.clone()],
+            })
+            .unwrap();
+            assert_eq!(fs::read(input).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn volume_publication_failure_preserves_destinations() {
+        let root = crate::scratch::case("repair-volume-publication-failure");
+        for (family, names, first_output) in [
+            (
+                "rar50",
+                vec![
+                    "multivol_rev.part1.rar",
+                    "multivol_rev.part3.rar",
+                    "multivol_rev.part4.rar",
+                    "multivol_rev.part5.rar",
+                    "multivol_rev.part1.rev",
+                ],
+                "multivol_rev.part1.rar",
+            ),
+            (
+                "rar15_40",
+                vec![
+                    "rar300/rev_oldstyle.part1.rar",
+                    "rar300/rev_oldstyle.part3.rar",
+                    "rar300/rev_oldstyle.part4.rar",
+                    "rar300/rev_oldstyle.part4_2_1.rev",
+                ],
+                "rev_oldstyle.part1.rar",
+            ),
+        ] {
+            let out = root.join(family);
+            fs::create_dir(&out).unwrap();
+            let blocked = out.join(first_output);
+            fs::create_dir(&blocked).unwrap();
+            fs::write(blocked.join("keep"), b"keep").unwrap();
+            let mut paths: Vec<_> = names.iter().map(|name| fixture(family, name)).collect();
+            paths.push(out.clone());
+            let error = repair_set(paths).unwrap_err().to_string();
+            assert!(error.contains("failed to repair RAR"));
+            assert_eq!(fs::read(blocked.join("keep")).unwrap(), b"keep");
+            assert_eq!(fs::read_dir(out).unwrap().count(), 1);
+        }
+        let bad = root.join("no-inputs.rev");
+        fs::copy(fixture("rar50", "multivol_rev.part1.rev"), &bad).unwrap();
+        let unknown = root.join("unknown.bin");
+        fs::write(&unknown, b"unknown").unwrap();
+        assert!(repair_set(vec![bad, unknown, root.join("insufficient")])
+            .unwrap_err()
+            .to_string()
+            .contains("failed to repair RAR 5 REV volume set"));
     }
 
     fn repair(input: &Path, output: &Path) -> CliResult<()> {

@@ -4211,6 +4211,51 @@ fn repair_rejects_non_rar_input_without_raw_inline_scan() {
 }
 
 #[test]
+fn repair_reports_rebuilt_recovery_and_end_records() {
+    let dir = scratch("repair-rebuilt-record-reports");
+    let mut builder = rars::Builder::new(rars::ArchiveVersion::Rar50)
+        .store(true)
+        .recovery_percent(Some(20));
+    builder
+        .add_bytes(b"file".to_vec(), vec![b'p'; 32 * 1024], None, None)
+        .unwrap();
+    let original = builder.to_bytes().unwrap();
+    let archive = rars::rar50::Archive::parse(&original).unwrap();
+    let recovery = archive
+        .services()
+        .find(|service| service.name == b"RR")
+        .unwrap()
+        .block
+        .data_range
+        .start;
+    for (end_damaged, message) in [
+        (false, "rebuilt recovery record"),
+        (true, "rebuilt archive end"),
+    ] {
+        let mut damaged = original.clone();
+        if end_damaged {
+            // Truncate the recovery tail, leaving enough redundancy to rebuild
+            // both the recovery record and the archive end.
+            damaged.truncate(damaged.len() - 4096);
+        } else {
+            damaged[recovery + 0x48] ^= 0xff;
+        }
+        let input = dir.join("damaged.rar");
+        let output = dir.join("repaired.rar");
+        fs::write(&input, damaged).unwrap();
+        let command = rars()
+            .arg("repair")
+            .arg(&input)
+            .arg(&output)
+            .output()
+            .unwrap();
+        assert!(command.status.success(), "{}", stderr(&command));
+        assert!(stdout(&command).contains(message), "{}", stdout(&command));
+        assert_eq!(fs::read(&output).unwrap(), original);
+    }
+}
+
+#[test]
 fn repairs_rar250_protect_head_archive() {
     let dir = scratch("repair-rar250-protect-head");
     let archive = dir.join("damaged.rar");
