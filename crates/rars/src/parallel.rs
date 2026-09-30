@@ -152,7 +152,11 @@ mod tests {
         let visited = std::sync::Mutex::new(Vec::new());
         let mapped = wasm::map_collect(vec![3, 1, 2], |x| {
             visited.lock().unwrap().push(x);
-            if x == 1 { Err(11) } else { Ok(x) }
+            if x == 1 {
+                Err(11)
+            } else {
+                Ok(x)
+            }
         });
         assert_eq!(mapped, Err(11));
         assert_eq!(*visited.lock().unwrap(), [3, 1]);
@@ -200,7 +204,11 @@ mod tests {
             },
             |x, y| {
                 emitted.push((*x, y));
-                if *x == 1 { Err(12) } else { Ok(()) }
+                if *x == 1 {
+                    Err(12)
+                } else {
+                    Ok(())
+                }
             },
         );
         assert_eq!(result, Err(12));

@@ -167,7 +167,13 @@ fn zero_size_rar5_unix_link_header_preserves_its_target() {
     rewritten.add_archive_redirection(&member).unwrap();
     let output = ArchiveReader::read_owned(rewritten.to_bytes().unwrap()).unwrap();
     assert_eq!(
-        output.members().next().unwrap().unix_symlink().unwrap().target_name,
+        output
+            .members()
+            .next()
+            .unwrap()
+            .unix_symlink()
+            .unwrap()
+            .target_name,
         b"target"
     );
 }
@@ -301,8 +307,8 @@ fn link_setters_refuse_shapes_the_target_format_cannot_write() {
     let archive = ArchiveReader::read_owned(seed.to_bytes().unwrap()).unwrap();
     let member = archive.members().next().unwrap();
     for format in [ArchiveVersion::Rar20, ArchiveVersion::Rar50] {
-        let mut builder = Builder::new(format)
-            .volume_size((format == ArchiveVersion::Rar50).then_some(1024));
+        let mut builder =
+            Builder::new(format).volume_size((format == ArchiveVersion::Rar50).then_some(1024));
         assert!(builder.add_archive_redirection(&member).is_err());
         assert!(builder.is_empty());
     }

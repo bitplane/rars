@@ -3750,7 +3750,9 @@ mod tests {
             ArchiveVersion::Rar40,
         ] {
             let mut builder = crate::Builder::new(target);
-            builder.add_directory(b"empty".to_vec(), None, None).unwrap();
+            builder
+                .add_directory(b"empty".to_vec(), None, None)
+                .unwrap();
             let archive = Archive::parse_owned(builder.to_bytes().unwrap()).unwrap();
             let file = archive.files().next().unwrap();
             assert!(file.is_directory());

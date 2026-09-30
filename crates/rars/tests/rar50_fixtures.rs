@@ -5171,10 +5171,8 @@ fn rejects_rar50_rev5_repair_inputs_with_inconsistent_metadata() {
         );
     }
 
-    let mut invalid_number = Rev5Volume::parse(
-        &std::fs::read(fixture("multivol_rev.part1.rev")).unwrap(),
-    )
-    .unwrap();
+    let mut invalid_number =
+        Rev5Volume::parse(&std::fs::read(fixture("multivol_rev.part1.rev")).unwrap()).unwrap();
     invalid_number.recovery_number = 0;
     assert!(matches!(
         repair_rev5_volumes_to(&data, &[invalid_number], |_, _| Ok(())),
@@ -5525,8 +5523,8 @@ fn direct_rar50_parser_rejects_legacy_input_and_stale_signatures() {
     let rar50_path = fixture("empty_file.rar");
     let rar50_bytes = fs::read(&rar50_path).unwrap();
     let signature = detect_archive_family(&rar50_bytes).unwrap();
-    let parsed = Archive::parse_path_with_signature_and_password(&rar50_path, signature, None)
-        .unwrap();
+    let parsed =
+        Archive::parse_path_with_signature_and_password(&rar50_path, signature, None).unwrap();
     assert_eq!(parsed.files().count(), 1);
 
     let mut prefixed = vec![0];

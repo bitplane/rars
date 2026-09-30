@@ -126,10 +126,19 @@ fn removing_a_duplicate_ignores_directories_and_unrelated_copies() {
 
     builder.remove_by_id(0).unwrap();
     let output = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
-    let copy = output.members().find(|member| member.meta.name == b"copy").unwrap();
+    let copy = output
+        .members()
+        .find(|member| member.meta.name == b"copy")
+        .unwrap();
     assert_eq!(copy.supported_redirection().unwrap().target_name, b"other");
-    assert_eq!(output.read_member(b"other", None).unwrap().unwrap(), b"payload");
-    assert_eq!(output.read_member(b"same", None).unwrap().unwrap(), b"second");
+    assert_eq!(
+        output.read_member(b"other", None).unwrap().unwrap(),
+        b"payload"
+    );
+    assert_eq!(
+        output.read_member(b"same", None).unwrap().unwrap(),
+        b"second"
+    );
 }
 
 #[test]
@@ -168,7 +177,10 @@ fn renaming_a_duplicate_updates_only_copies_of_that_identity() {
         (b"later-copy".as_slice(), b"same".as_slice()),
         (b"other-copy".as_slice(), b"other".as_slice()),
     ] {
-        let member = output.members().find(|member| member.meta.name == name).unwrap();
+        let member = output
+            .members()
+            .find(|member| member.meta.name == name)
+            .unwrap();
         assert_eq!(member.supported_redirection().unwrap().target_name, target);
     }
 }
@@ -186,10 +198,16 @@ fn file_copy_validation_ignores_interleaved_unix_symlink() {
     builder.add_archive_redirection(&copy).unwrap();
 
     let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
-    assert_eq!(archive.read_member(b"other", None).unwrap().unwrap(), b"payload");
+    assert_eq!(
+        archive.read_member(b"other", None).unwrap().unwrap(),
+        b"payload"
+    );
     let members: Vec<_> = archive.members().collect();
     assert_eq!(members[1].unix_symlink().unwrap().target_name, b"other");
-    assert_eq!(members[2].supported_redirection().unwrap().target_name, b"other");
+    assert_eq!(
+        members[2].supported_redirection().unwrap().target_name,
+        b"other"
+    );
 }
 
 #[test]
@@ -210,8 +228,17 @@ fn removing_duplicate_does_not_treat_unix_symlink_as_file_copy() {
     builder.remove_by_id(0).unwrap();
     let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
     assert_eq!(
-        archive.members().next().unwrap().unix_symlink().unwrap().target_name,
+        archive
+            .members()
+            .next()
+            .unwrap()
+            .unix_symlink()
+            .unwrap()
+            .target_name,
         b"same"
     );
-    assert_eq!(archive.read_member(b"same", None).unwrap().unwrap(), b"second");
+    assert_eq!(
+        archive.read_member(b"same", None).unwrap().unwrap(),
+        b"second"
+    );
 }

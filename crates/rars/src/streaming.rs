@@ -1052,15 +1052,16 @@ mod tests {
         let nonempty = EntrySource::from_bytes(Arc::<[u8]>::from(&b"x"[..]));
         assert!(!nonempty.is_empty().unwrap());
 
-        let missing = EntrySource::from_path(crate::scratch::case("missing-source").join("missing"));
+        let missing =
+            EntrySource::from_path(crate::scratch::case("missing-source").join("missing"));
         assert!(missing.is_empty().is_err());
         assert!(format!("{missing:?}").contains("len: None"));
     }
 
     #[test]
     fn preparation_refusal_is_one_shot_and_releases_the_charge() {
-        use super::*;
         use super::preparation::Bytes;
+        use super::*;
         use std::sync::atomic::Ordering;
 
         let (resources, attempts) = WriterResources::default().refuse_preparation_growth_at(0);
@@ -1069,9 +1070,27 @@ mod tests {
             Error::WriterFailure("injected preparation admission failure")
         );
         assert_eq!(attempts.load(Ordering::Relaxed), 1);
-        assert_eq!(*resources.preparation_budget.as_ref().unwrap().used.lock().unwrap(), 0);
+        assert_eq!(
+            *resources
+                .preparation_budget
+                .as_ref()
+                .unwrap()
+                .used
+                .lock()
+                .unwrap(),
+            0
+        );
         drop(Bytes::zeroed(1, &resources).unwrap());
-        assert_eq!(*resources.preparation_budget.as_ref().unwrap().used.lock().unwrap(), 0);
+        assert_eq!(
+            *resources
+                .preparation_budget
+                .as_ref()
+                .unwrap()
+                .used
+                .lock()
+                .unwrap(),
+            0
+        );
     }
     #[test]
     fn workspace_admission_reports_preexisting_cancellation_before_budget_checks() {
@@ -1406,7 +1425,10 @@ mod tests {
         let root = crate::scratch::case("spool-max-sequence");
         let resources = WriterResources::default().with_temp_dir(&*root);
         let spool = Spool::create_with_sequence(&resources, || u64::MAX).unwrap();
-        let path = root.join(format!(".rars-spool-{}-ffffffffffffffff", std::process::id()));
+        let path = root.join(format!(
+            ".rars-spool-{}-ffffffffffffffff",
+            std::process::id()
+        ));
         assert_eq!(spool.path, path);
         assert!(path.is_file());
         drop(spool);

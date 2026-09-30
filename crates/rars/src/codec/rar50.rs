@@ -7173,7 +7173,12 @@ mod tests {
         assert!(!tables.align_mode);
         let copied = tables.clone();
         drop(tables);
-        for table in [&copied.main, &copied.distance, &copied.align, &copied.length] {
+        for table in [
+            &copied.main,
+            &copied.distance,
+            &copied.align,
+            &copied.length,
+        ] {
             assert!(!table.is_empty());
             assert_eq!(table.decode(&mut BitReader::new(&[0])).unwrap(), 0);
         }
@@ -10196,8 +10201,7 @@ mod tests {
             Err(StreamDecodeError::Sink("sink"))
         ));
 
-        let mut zero_chunk =
-            StreamingOutput::new(Buffer::from_vec(vec![0]), 1, 2, 2).unwrap();
+        let mut zero_chunk = StreamingOutput::new(Buffer::from_vec(vec![0]), 1, 2, 2).unwrap();
         assert!(matches!(
             zero_chunk.push_zeroes(1, &mut |_chunk| Err("sink")),
             Err(StreamDecodeError::Sink("sink"))
@@ -10451,8 +10455,7 @@ mod tests {
 
     #[test]
     fn virtual_zero_history_does_not_overallocate_a_tiny_dictionary() {
-        let mut output =
-            StreamingOutput::new(Buffer::from_vec(vec![0]), 100_000, 1, 1).unwrap();
+        let mut output = StreamingOutput::new(Buffer::from_vec(vec![0]), 100_000, 1, 1).unwrap();
         let mut emitted = 0;
         output
             .copy_match(1, 100_000, &mut |chunk| {

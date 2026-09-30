@@ -5536,7 +5536,10 @@ mod tests {
         };
         let empty = Error::InvalidHeader("volume set is empty");
         assert_eq!(volume_members(&[]).unwrap_err(), empty);
-        assert_eq!(extract_volumes_to(&[], None, never_open).unwrap_err(), empty);
+        assert_eq!(
+            extract_volumes_to(&[], None, never_open).unwrap_err(),
+            empty
+        );
         let cancellation = ReadCancellation::new();
         cancellation.cancel();
         assert_eq!(

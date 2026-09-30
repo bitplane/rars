@@ -632,10 +632,7 @@ fn encrypted_service_block<'a>(
         &mut salt,
         "RAR 5 writer could not generate encryption salt",
     )?;
-    crate::write_stream::fill_entropy(
-        &mut iv,
-        "RAR 5 writer could not generate encryption IV",
-    )?;
+    crate::write_stream::fill_entropy(&mut iv, "RAR 5 writer could not generate encryption IV")?;
     let keys = Rar50Keys::derive(password, salt, WRITE_KDF_COUNT_LOG)
         .expect("writer KDF count is supported");
 
@@ -2179,7 +2176,8 @@ mod emission_ledger_tests {
                     error
                 } else {
                     let mut output = Vec::new();
-                    let error = write_archive(&entries, settings, &resources, &mut output).unwrap_err();
+                    let error =
+                        write_archive(&entries, settings, &resources, &mut output).unwrap_err();
                     assert!(output.is_empty());
                     error
                 };
@@ -2210,7 +2208,10 @@ mod emission_ledger_tests {
         let archive = crate::ArchiveReader::read_owned(bytes).unwrap();
         let raw = archive.as_rar50().unwrap();
         assert!(raw.main.locator().unwrap().quick_open_offset.is_some());
-        let quick_open = raw.services().find(|service| service.name == b"QO").unwrap();
+        let quick_open = raw
+            .services()
+            .find(|service| service.name == b"QO")
+            .unwrap();
         let payload = quick_open.packed_data(raw).unwrap();
         fn vint(data: &[u8], cursor: &mut usize) -> usize {
             let mut value = 0usize;
@@ -2235,8 +2236,14 @@ mod emission_ledger_tests {
         }
         // The plain archive comment and file are cached; the attached service is not.
         assert_eq!(records, 2);
-        assert_eq!(archive.member_comment_at(0, None).unwrap(), Some(b"file note".to_vec()));
-        assert_eq!(archive.read_member(b"file", None).unwrap().unwrap(), b"payload");
+        assert_eq!(
+            archive.member_comment_at(0, None).unwrap(),
+            Some(b"file note".to_vec())
+        );
+        assert_eq!(
+            archive.read_member(b"file", None).unwrap().unwrap(),
+            b"payload"
+        );
     }
 
     struct FailingSink;
@@ -2292,8 +2299,7 @@ mod emission_ledger_tests {
         let mut archive_failure = false;
         for fail_at in 0..counting.writes {
             let mut sink = FailOnWrite { fail_at, writes: 0 };
-            let error = write_archive(&entries, settings(), &resources, &mut sink)
-                .unwrap_err();
+            let error = write_archive(&entries, settings(), &resources, &mut sink).unwrap_err();
             assert_eq!(error.kind(), crate::ErrorKind::Io, "write {fail_at}");
             assert_eq!(sink.writes, fail_at + 1);
             if error.entry_context() == Some((b"file".as_slice(), "writing")) {
@@ -2393,8 +2399,8 @@ mod emission_ledger_tests {
         for fail_at in 0..writes {
             let mut sink = make_sink();
             sink.fail_write = Some(fail_at);
-            let error = write_volumes(&entries, settings(), 4096, &mut sink, &resources)
-                .unwrap_err();
+            let error =
+                write_volumes(&entries, settings(), 4096, &mut sink, &resources).unwrap_err();
             assert_eq!(error.kind(), crate::ErrorKind::Io, "write {fail_at}");
             assert_eq!(sink.state.lock().unwrap().writes, fail_at + 1);
             assert_eq!(sink.state.lock().unwrap().finishes, 0);
@@ -2404,10 +2410,13 @@ mod emission_ledger_tests {
             sink.fail_start = failure == 0;
             sink.fail_flush = failure == 1;
             sink.fail_finish = failure == 2;
-            let error = write_volumes(&entries, settings(), 4096, &mut sink, &resources)
-                .unwrap_err();
+            let error =
+                write_volumes(&entries, settings(), 4096, &mut sink, &resources).unwrap_err();
             assert_eq!(error.kind(), crate::ErrorKind::Io);
-            assert_eq!(sink.state.lock().unwrap().finishes, usize::from(failure == 2));
+            assert_eq!(
+                sink.state.lock().unwrap().finishes,
+                usize::from(failure == 2)
+            );
         }
     }
 
@@ -2599,7 +2608,8 @@ mod emission_ledger_tests {
 
     #[test]
     fn an_existing_member_context_is_not_wrapped_again() {
-        let original = Error::InvalidArgument("source changed").at_entry(b"file".to_vec(), "reading");
+        let original =
+            Error::InvalidArgument("source changed").at_entry(b"file".to_vec(), "reading");
         let error = member_error(original, b"file", "writing");
         assert_eq!(error.entry_context(), Some((b"file".as_slice(), "reading")));
     }
@@ -2739,7 +2749,10 @@ mod emission_ledger_tests {
                         refusals += 1;
                         drop(Records::<u8>::new(limit as usize, &resources).unwrap());
                         limit = *required;
-                        assert!(limit < 1024 * 1024, "tiny volumes used {limit} bytes of preparation");
+                        assert!(
+                            limit < 1024 * 1024,
+                            "tiny volumes used {limit} bytes of preparation"
+                        );
                     }
                     _ => panic!("unexpected preparation failure: {error}"),
                 },
@@ -2774,7 +2787,10 @@ mod emission_ledger_tests {
                         refusals += 1;
                         drop(Records::<u8>::new(limit as usize, &resources).unwrap());
                         limit = *required;
-                        assert!(limit < 64 * 1024, "encrypted archive used too much preparation");
+                        assert!(
+                            limit < 64 * 1024,
+                            "encrypted archive used too much preparation"
+                        );
                     }
                     _ => panic!("unexpected preparation failure: {error}"),
                 },
@@ -2852,8 +2868,8 @@ mod emission_ledger_tests {
                         };
                         assert_eq!(*actual, limit);
                         assert!(*required > limit);
-                        service_refused |=
-                            error.entry_context() == Some((b"member".as_slice(), "preparing service"));
+                        service_refused |= error.entry_context()
+                            == Some((b"member".as_slice(), "preparing service"));
                         limit = *required;
                         assert!(limit < 64 * 1024);
                     }
@@ -2866,16 +2882,9 @@ mod emission_ledger_tests {
     fn encrypted_service_rejects_oversized_name_after_extra_preparation() {
         let name = vec![b'n'; 4096];
         let resources = WriterResources::default().with_max_preparation_bytes(512);
-        let error = encrypted_service_block(
-            &name,
-            b"payload",
-            &[],
-            b"secret",
-            None,
-            &resources,
-        )
-        .err()
-        .expect("the service name exceeds the preparation quota");
+        let error = encrypted_service_block(&name, b"payload", &[], b"secret", None, &resources)
+            .err()
+            .expect("the service name exceeds the preparation quota");
         assert!(matches!(
             error,
             Error::WriterPreparationLimitExceeded { limit: 512, .. }
@@ -2900,8 +2909,8 @@ mod emission_ledger_tests {
             write_archive(&entries, settings, resources, &mut output)?;
             Ok(output)
         };
-        let (resources, attempts) = WriterResources::default()
-            .refuse_preparation_growth_at(usize::MAX);
+        let (resources, attempts) =
+            WriterResources::default().refuse_preparation_growth_at(usize::MAX);
         assert!(!run(&resources).unwrap().is_empty());
         let count = attempts.load(Ordering::Relaxed);
         assert!(count > 10);
@@ -2936,8 +2945,8 @@ mod emission_ledger_tests {
             write_volumes(&entries, settings, 4096, &mut volumes, resources)?;
             Ok(volumes.take().len())
         };
-        let (resources, attempts) = WriterResources::default()
-            .refuse_preparation_growth_at(usize::MAX);
+        let (resources, attempts) =
+            WriterResources::default().refuse_preparation_growth_at(usize::MAX);
         assert_eq!(run(&resources).unwrap(), 1);
         let count = attempts.load(Ordering::Relaxed);
         assert!(count > 10);
@@ -2971,8 +2980,8 @@ mod emission_ledger_tests {
             write_archive(&entries, settings, resources, &mut output)?;
             Ok(output)
         };
-        let (resources, attempts) = WriterResources::default()
-            .refuse_preparation_growth_at(usize::MAX);
+        let (resources, attempts) =
+            WriterResources::default().refuse_preparation_growth_at(usize::MAX);
         assert!(!run(&resources).unwrap().is_empty());
         let count = attempts.load(Ordering::Relaxed);
         assert!(count > 10);
@@ -3006,8 +3015,8 @@ mod emission_ledger_tests {
             write_volumes(&entries, settings, 4096, &mut volumes, resources)?;
             Ok(volumes.take().len())
         };
-        let (resources, attempts) = WriterResources::default()
-            .refuse_preparation_growth_at(usize::MAX);
+        let (resources, attempts) =
+            WriterResources::default().refuse_preparation_growth_at(usize::MAX);
         assert!(run(&resources).unwrap() > 0);
         let count = attempts.load(Ordering::Relaxed);
         assert!(count > 10);
@@ -3053,8 +3062,8 @@ mod emission_ledger_tests {
                     write_archive(&entries, settings, resources, &mut Vec::new())
                 }
             };
-            let (resources, attempts) = WriterResources::default()
-                .refuse_preparation_growth_at(usize::MAX);
+            let (resources, attempts) =
+                WriterResources::default().refuse_preparation_growth_at(usize::MAX);
             run(&resources).unwrap();
             let count = attempts.load(Ordering::Relaxed);
             assert!(count > 3);
@@ -3089,8 +3098,8 @@ mod emission_ledger_tests {
             settings.archive_comment = None;
             write_archive(&entries, settings, resources, &mut Vec::new())
         };
-        let (resources, attempts) = WriterResources::default()
-            .refuse_preparation_growth_at(usize::MAX);
+        let (resources, attempts) =
+            WriterResources::default().refuse_preparation_growth_at(usize::MAX);
         run(&resources).unwrap();
         let count = attempts.load(Ordering::Relaxed);
         assert!(count > 5);
@@ -3111,8 +3120,8 @@ mod emission_ledger_tests {
     #[test]
     fn encrypted_volume_reread_failure_keeps_member_context() {
         use std::sync::{
-            Arc,
             atomic::{AtomicUsize, Ordering},
+            Arc,
         };
 
         let opens = Arc::new(AtomicUsize::new(0));

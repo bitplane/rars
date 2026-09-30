@@ -163,7 +163,10 @@ fn embedded_comment_that_exceeds_file_header_size_is_rejected() {
             .unwrap();
         if fits {
             let archive = rars::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
-            assert_eq!(archive.read_member(b"file", None).unwrap().unwrap(), b"payload");
+            assert_eq!(
+                archive.read_member(b"file", None).unwrap().unwrap(),
+                b"payload"
+            );
         } else {
             let error = builder.to_bytes().unwrap_err();
             assert_eq!(error.kind(), ErrorKind::InvalidArgument);
@@ -374,7 +377,10 @@ fn legacy_archive_rejects_modern_target_before_encrypted_member_io() {
         &mut output,
     )
     .unwrap_err();
-    assert!(matches!(error, Error::UnsupportedVersion(ArchiveVersion::Rar50)));
+    assert!(matches!(
+        error,
+        Error::UnsupportedVersion(ArchiveVersion::Rar50)
+    ));
     assert!(output.is_empty());
 }
 

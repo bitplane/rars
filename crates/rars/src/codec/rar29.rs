@@ -5766,7 +5766,8 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
                 super::EncodedMatch::Fresh { .. }
             ));
             state.remember(5, distance);
-            let repeated = best_match(&input, distance, input.len(), &finder, options, &state).unwrap();
+            let repeated =
+                best_match(&input, distance, input.len(), &finder, options, &state).unwrap();
             assert_eq!((repeated.length, repeated.offset), (4, distance));
             assert!(matches!(
                 state
@@ -8020,13 +8021,9 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
             Err(Error::InvalidData("RAR 2.9 VM block start overflows"))
         );
         // The same absolute position is representable after an LZ block rebase.
-        assert!(encoded_filter_records_at(
-            &[&filter],
-            filter.block_start,
-            4,
-            &mut Vec::new(),
-        )
-        .is_ok());
+        assert!(
+            encoded_filter_records_at(&[&filter], filter.block_start, 4, &mut Vec::new(),).is_ok()
+        );
     }
 
     #[test]

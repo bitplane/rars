@@ -239,7 +239,10 @@ fn cancellation_from_final_zero_byte_progress_is_not_reported_as_success() {
         .unwrap();
     let stop = StopAtFinalAdvance(AtomicBool::new(false));
     assert_eq!(
-        builder.to_bytes_with_progress(Some(&stop)).unwrap_err().kind(),
+        builder
+            .to_bytes_with_progress(Some(&stop))
+            .unwrap_err()
+            .kind(),
         ErrorKind::Cancelled
     );
 }

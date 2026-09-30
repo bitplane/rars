@@ -1059,9 +1059,8 @@ mod tests {
                 true
             }
         }
-        let unopened = crate::EntrySource::from_opener(1, || {
-            panic!("cancelled scan opened the source")
-        });
+        let unopened =
+            crate::EntrySource::from_opener(1, || panic!("cancelled scan opened the source"));
         let allowance = crate::codec::workspace::Allowance::default();
         assert!(matches!(
             super::source_integrity_with_allowance(&unopened, 1, 16, &Cancelled, &allowance),
@@ -1167,7 +1166,10 @@ mod tests {
     }
 
     fn simple_entry(data: &[u8]) -> super::ArchiveEntry {
-        super::ArchiveEntry::new(b"file".to_vec(), crate::EntrySource::from_bytes(data.to_vec()))
+        super::ArchiveEntry::new(
+            b"file".to_vec(),
+            crate::EntrySource::from_bytes(data.to_vec()),
+        )
     }
 
     #[test]
@@ -1225,9 +1227,8 @@ mod tests {
         timestamped.mtime_nanoseconds = Some(1_000_000_000);
         assert!(super::validate_entry(&timestamped).is_err());
         timestamped.mtime_nanoseconds = None;
-        timestamped.file_times = Some(
-            crate::FileTimes::from_unix_nanoseconds(Some(0), None, None).unwrap(),
-        );
+        timestamped.file_times =
+            Some(crate::FileTimes::from_unix_nanoseconds(Some(0), None, None).unwrap());
         assert_eq!(
             super::validate_entry(&timestamped).unwrap_err(),
             crate::Error::InvalidArgument("conflicting file modification timestamps")
@@ -1249,8 +1250,10 @@ mod tests {
         ] {
             assert!(super::validate_entry(&simple_entry(b"").with_service(service)).is_err());
         }
-        super::validate_entry(&simple_entry(b"").with_service(super::ServiceEntry::new(b"CMT", b"")))
-            .unwrap();
+        super::validate_entry(
+            &simple_entry(b"").with_service(super::ServiceEntry::new(b"CMT", b"")),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1291,7 +1294,11 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            reject(std::slice::from_ref(&plain), super::WriterOptions::default(), locked),
+            reject(
+                std::slice::from_ref(&plain),
+                super::WriterOptions::default(),
+                locked
+            ),
             crate::Error::InvalidArgument("archive lock flag is not supported in volume output")
         );
 
@@ -1300,7 +1307,12 @@ mod tests {
             creation_time: Some(1),
         });
         assert_eq!(
-            reject(std::slice::from_ref(&plain), super::WriterOptions::default(), metadata).kind(),
+            reject(
+                std::slice::from_ref(&plain),
+                super::WriterOptions::default(),
+                metadata
+            )
+            .kind(),
             crate::ErrorKind::UnsupportedFeature
         );
 
@@ -1310,12 +1322,16 @@ mod tests {
             target_name: b"target".to_vec(),
         }));
         assert_eq!(
-            reject(&[link], super::WriterOptions::default(), super::ArchiveExtras::default()),
+            reject(
+                &[link],
+                super::WriterOptions::default(),
+                super::ArchiveExtras::default()
+            ),
             crate::Error::InvalidArgument("symbolic links are not supported in volume output")
         );
 
-        let commented = simple_entry(b"")
-            .with_service(super::ServiceEntry::new(b"CMT", b"file comment"));
+        let commented =
+            simple_entry(b"").with_service(super::ServiceEntry::new(b"CMT", b"file comment"));
         assert_eq!(
             reject(
                 &[commented],
@@ -1345,10 +1361,11 @@ mod tests {
             name: None,
             creation_time: Some(1),
         };
-        let mut extras = super::ArchiveExtras::default().with_metadata(super::ArchiveMetadataEntry {
-            name: None,
-            creation_time: Some(1),
-        });
+        let mut extras =
+            super::ArchiveExtras::default().with_metadata(super::ArchiveMetadataEntry {
+                name: None,
+                creation_time: Some(1),
+            });
         extras.metadata_record = Some(&record);
         let mut output = Vec::new();
         let error = super::write_streaming_archive_to(
@@ -1426,8 +1443,8 @@ mod tests {
                 super::super::Archive::parse(&part),
                 Err(crate::Error::NeedPassword)
             ));
-            let archive = super::super::Archive::parse_with_password(&part, Some(b"password"))
-                .unwrap();
+            let archive =
+                super::super::Archive::parse_with_password(&part, Some(b"password")).unwrap();
             assert!(archive.main.encrypted_headers);
             assert!(archive.files().all(|file| !file.encrypted));
         }

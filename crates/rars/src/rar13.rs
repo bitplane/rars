@@ -2201,7 +2201,11 @@ fn select_verified_payload(
 ) -> (Vec<u8>, u8) {
     match packed {
         Some(packed)
-            if !crate::write_plan::StoreFallback::new().applies(solid, data.len(), packed.len()) =>
+            if !crate::write_plan::StoreFallback::new().applies(
+                solid,
+                data.len(),
+                packed.len(),
+            ) =>
         {
             (packed, METHOD_BEST)
         }
@@ -3331,11 +3335,9 @@ mod tests {
     #[test]
     fn rar14_level_five_uses_lazy_matching() {
         for level in 0..5 {
-            assert!(!rar15_encode_options_for_level(Some(level))
-                .lazy_matching_enabled());
+            assert!(!rar15_encode_options_for_level(Some(level)).lazy_matching_enabled());
         }
-        assert!(rar15_encode_options_for_level(Some(5))
-            .lazy_matching_enabled());
+        assert!(rar15_encode_options_for_level(Some(5)).lazy_matching_enabled());
     }
 
     #[test]

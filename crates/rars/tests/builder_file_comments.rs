@@ -15,11 +15,13 @@ fn recovery_service_does_not_change_rar5_member_comments() {
     let Archive::Rar50Plus(ref rar50) = archive else {
         unreachable!()
     };
-    assert!(rar50
-        .blocks
-        .iter()
-        .any(|block| matches!(block, rars::rar50::Block::Service(service) if service.name == b"RR")));
-    assert_eq!(archive.member_comments(None).unwrap(), vec![Some(b"note".to_vec())]);
+    assert!(rar50.blocks.iter().any(
+        |block| matches!(block, rars::rar50::Block::Service(service) if service.name == b"RR")
+    ));
+    assert_eq!(
+        archive.member_comments(None).unwrap(),
+        vec![Some(b"note".to_vec())]
+    );
     assert_eq!(archive.member_comment_encryption(), [false]);
 }
 

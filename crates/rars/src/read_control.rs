@@ -314,12 +314,7 @@ mod tests {
         let token = ReadCancellation::new();
         let control = ReadControl::new(Some(&token));
         let mut writer = ScriptedWriter {
-            replies: [
-                Err(io::ErrorKind::Interrupted.into()),
-                Ok(1),
-                Ok(2),
-            ]
-            .into(),
+            replies: [Err(io::ErrorKind::Interrupted.into()), Ok(1), Ok(2)].into(),
             written: Vec::new(),
         };
         control.write_all(&mut writer, b"abc").unwrap();
@@ -328,13 +323,19 @@ mod tests {
 
         for (reply, kind) in [
             (Ok(0), io::ErrorKind::WriteZero),
-            (Err(io::ErrorKind::BrokenPipe.into()), io::ErrorKind::BrokenPipe),
+            (
+                Err(io::ErrorKind::BrokenPipe.into()),
+                io::ErrorKind::BrokenPipe,
+            ),
         ] {
             let mut writer = ScriptedWriter {
                 replies: [reply].into(),
                 written: Vec::new(),
             };
-            assert_eq!(control.write_all(&mut writer, b"x").unwrap_err().kind(), kind);
+            assert_eq!(
+                control.write_all(&mut writer, b"x").unwrap_err().kind(),
+                kind
+            );
             assert!(writer.written.is_empty());
         }
 

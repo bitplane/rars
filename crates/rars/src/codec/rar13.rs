@@ -610,7 +610,12 @@ impl Unpack15Encoder {
         }
     }
 
-    fn emit_literal_place(&mut self, encoded_place: usize, decoded_place: usize, update_num_huf: bool) {
+    fn emit_literal_place(
+        &mut self,
+        encoded_place: usize,
+        decoded_place: usize,
+        update_num_huf: bool,
+    ) {
         debug_assert!(encoded_place <= self.ch_set.len());
         debug_assert!(decoded_place < self.ch_set.len());
 
@@ -2311,8 +2316,9 @@ mod tests {
     #[test]
     fn final_literal_flag_crosses_into_a_terminal_flags_group() {
         let first = match_heavy_payload(176, 8000);
-        let mut encoder =
-            super::Unpack15Encoder::with_options(super::EncodeOptions::new().with_lazy_matching(false));
+        let mut encoder = super::Unpack15Encoder::with_options(
+            super::EncodeOptions::new().with_lazy_matching(false),
+        );
         let first_packed = encoder.encode_member(&first).unwrap();
         let mut decoder = super::Unpack15::new();
         assert_eq!(
@@ -2602,7 +2608,9 @@ mod tests {
     fn long_distance_updates_preserve_every_high_byte_through_counter_wraps() {
         let mut encoder = super::Unpack15Encoder::new();
         let mut wraps = 0;
-        for distance in std::iter::repeat_n(128, 768).chain((0..256).map(|high| (high * 128).max(1))) {
+        for distance in
+            std::iter::repeat_n(128, 768).chain((0..256).map(|high| (high * 128).max(1)))
+        {
             let before = encoder.ch_set_b.iter().find(|&&v| v >> 8 == 1).unwrap() & 0xff;
             let token = super::LongLz {
                 distance,
@@ -2658,7 +2666,9 @@ mod tests {
 
     #[test]
     fn planned_old_distance_and_repeat_tokens_replay_after_flag_updates() {
-        fn state(encoder: &super::Unpack15Encoder) -> (u32, u32, [u32; 4], usize, u32, u32, u32, u32) {
+        fn state(
+            encoder: &super::Unpack15Encoder,
+        ) -> (u32, u32, [u32; 4], usize, u32, u32, u32, u32) {
             let s = encoder.lz_plan_state();
             (
                 s.last_dist,
@@ -2682,8 +2692,8 @@ mod tests {
             }
             for code in 10..=13 {
                 for length in [3, 4, 256] {
-                    let distance =
-                        encoder.old_dist[(encoder.old_dist_ptr.wrapping_sub((code - 9) as usize)) & 3];
+                    let distance = encoder.old_dist
+                        [(encoder.old_dist_ptr.wrapping_sub((code - 9) as usize)) & 3];
                     let token = super::OldDistLz {
                         distance,
                         length,
@@ -4157,5 +4167,4 @@ mod solid_regressions {
             assert_eq!(decoder.token_stats.st_matches, 1);
         }
     }
-
 }

@@ -1186,21 +1186,18 @@ fn encode_member<'a>(
             unpacked_size,
             file_crc: {
                 let mut crc = Crc32::new();
-                member.bytes.walk_with_progress(
-                    progress.reporter(),
-                    |chunk| {
+                member
+                    .bytes
+                    .walk_with_progress(progress.reporter(), |chunk| {
                         crc.update(chunk);
                         progress.advance(chunk.len() as u64);
-                    },
-                )?;
+                    })?;
                 crc.finish()
             },
         });
     }
 
-    let data = member
-        .bytes
-        .load_with_progress(progress.reporter())?;
+    let data = member.bytes.load_with_progress(progress.reporter())?;
     let mut crc = Crc32::new();
     for chunk in data.chunks(64 * 1024) {
         progress.check()?;
@@ -1341,12 +1338,7 @@ pub(crate) fn write_stored_volumes_with_progress(
     let progress = ProgressReporter(&control);
     crate::write_progress::check_cancelled(Some(progress))?;
     validate_plan(options, PlanShape::new().volumes(true), false, false)?;
-    validate_volume_writer_inputs(
-        entry.name,
-        entry.data,
-        entry.file_comment,
-        options,
-    )?;
+    validate_volume_writer_inputs(entry.name, entry.data, entry.file_comment, options)?;
     if options.features.header_encryption {
         return write_header_encrypted_split_volumes(SplitVolumeRecord {
             progress,
@@ -1437,12 +1429,7 @@ fn write_compressed_volumes_impl(
         false,
         false,
     )?;
-    validate_volume_writer_inputs(
-        entry.name,
-        entry.data,
-        entry.file_comment,
-        options,
-    )?;
+    validate_volume_writer_inputs(entry.name, entry.data, entry.file_comment, options)?;
     // A volume set holds one member, and splitting it changes nothing about
     // how far back the window has to reach.
     if options.dictionary_size.is_none() {
@@ -1839,17 +1826,22 @@ fn encode_filtered_payload(
     // would quietly overrule a flag the caller set.
     let forced_ppmd_filter =
         options.method == Rar29Method::Ppmd && matches!(policy, FilterPolicy::Explicit(_));
-    let encoder = match (lz_method != 0x30 && !forced_ppmd_filter, solid_encoder.as_mut()) {
+    let encoder = match (
+        lz_method != 0x30 && !forced_ppmd_filter,
+        solid_encoder.as_mut(),
+    ) {
         (true, Some(SolidEncoder::Rar29(encoder))) => encoder,
-        _ => return encode_rar29_policy_filtered_payload(
-            data,
-            policy,
-            options.method,
-            rar29_encode_options_for_options(options)?,
-            lz_method,
-            ppmd_trial_pays(lz_method.saturating_sub(0x30)),
-            progress,
-        ),
+        _ => {
+            return encode_rar29_policy_filtered_payload(
+                data,
+                policy,
+                options.method,
+                rar29_encode_options_for_options(options)?,
+                lz_method,
+                ppmd_trial_pays(lz_method.saturating_sub(0x30)),
+                progress,
+            )
+        }
     };
 
     // An empty member has no range to filter, and `--no-filter` asked for none,
@@ -3130,7 +3122,10 @@ mod tests {
     #[test]
     fn audio_filter_candidate_checks_the_smallest_admitted_window() {
         for channels in 1..=4 {
-            assert!(!is_audio_filter_candidate(&vec![0; channels * 64 - 1], channels));
+            assert!(!is_audio_filter_candidate(
+                &vec![0; channels * 64 - 1],
+                channels
+            ));
             assert!(is_audio_filter_candidate(&vec![0; channels * 64], channels));
         }
     }

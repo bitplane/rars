@@ -505,20 +505,21 @@ fn compress_members_whole(
             return Err(Error::Cancelled);
         }
         if members[start].execution != Execution::WholeMember {
-            results.push(
-                compress_fallback_member(
-                    start,
-                    &sources[start],
-                    integrity[start],
-                    plan,
-                    members[start].workspace,
-                    resources,
-                    advance,
-                    error_context,
+            results
+                .push(
+                    compress_fallback_member(
+                        start,
+                        &sources[start],
+                        integrity[start],
+                        plan,
+                        members[start].workspace,
+                        resources,
+                        advance,
+                        error_context,
+                    )
+                    .map_err(|error| error_context(start, error))?,
                 )
-                .map_err(|error| error_context(start, error))?,
-            )
-            .expect("one compression result per source was admitted");
+                .expect("one compression result per source was admitted");
             start += 1;
             continue;
         }
@@ -1356,12 +1357,8 @@ mod tests {
                 candidates: vec![options].into(),
             };
             let run = |resources: &WriterResources| -> Result<()> {
-                let packed = compress_members_reporting(
-                    &sources,
-                    plan.clone(),
-                    resources,
-                    &|_| true,
-                )?;
+                let packed =
+                    compress_members_reporting(&sources, plan.clone(), resources, &|_| true)?;
                 assert_eq!(packed.len(), 1);
                 Ok(())
             };
@@ -1406,8 +1403,8 @@ mod tests {
         let source = EntrySource::from_opener(1024, || {
             Err(std::io::Error::other("injected worker source failure").into())
         });
-        let resources = WriterResources::new(70 * 1024 * 1024)
-            .with_max_memory_bytes(70 * 1024 * 1024);
+        let resources =
+            WriterResources::new(70 * 1024 * 1024).with_max_memory_bytes(70 * 1024 * 1024);
         let error = compress_members_reporting(&[source], plan, &resources, &|_| true)
             .err()
             .expect("the admitted worker must report its source failure");
@@ -1569,7 +1566,11 @@ mod tests {
             let result = pool.install(|| {
                 compress_members_reporting(&[first, second], plan.clone(), &resources, &progress)
             });
-            assert!(matches!(result, Err(Error::Cancelled)), "{:?}", result.err());
+            assert!(
+                matches!(result, Err(Error::Cancelled)),
+                "{:?}",
+                result.err()
+            );
             if let Some(token) = &token {
                 assert!(token.is_cancelled());
             } else {
@@ -1664,10 +1665,7 @@ mod tests {
         let jobs = Records::collect(
             [
                 (None::<u8>, Some(Err::<u8, _>(Error::Cancelled))),
-                (
-                    None,
-                    Some(Err(Error::InvalidArgument("codec failure"))),
-                ),
+                (None, Some(Err(Error::InvalidArgument("codec failure")))),
             ]
             .into_iter()
             .map(Ok),
@@ -1676,9 +1674,15 @@ mod tests {
         .unwrap();
         let output = Records::new(2, &resources).unwrap();
         assert_eq!(
-            complete_jobs(jobs, output, &resources, &Cancelled, |_, _, _| -> Result<u8> {
-                panic!("cancelled worker overwrote its recorded result")
-            })
+            complete_jobs(
+                jobs,
+                output,
+                &resources,
+                &Cancelled,
+                |_, _, _| -> Result<u8> {
+                    panic!("cancelled worker overwrote its recorded result")
+                }
+            )
             .err()
             .unwrap(),
             Error::InvalidArgument("codec failure")
@@ -1686,7 +1690,10 @@ mod tests {
 
         let jobs = Records::collect(
             [
-                (None::<u8>, Some(Err::<u8, _>(Error::InvalidArgument("first")))),
+                (
+                    None::<u8>,
+                    Some(Err::<u8, _>(Error::InvalidArgument("first"))),
+                ),
                 (None, Some(Err(Error::InvalidArgument("second")))),
             ]
             .into_iter()
@@ -1696,9 +1703,15 @@ mod tests {
         .unwrap();
         let output = Records::new(2, &resources).unwrap();
         assert_eq!(
-            complete_jobs(jobs, output, &resources, &Cancelled, |_, _, _| -> Result<u8> {
-                panic!("cancelled worker overwrote its recorded result")
-            })
+            complete_jobs(
+                jobs,
+                output,
+                &resources,
+                &Cancelled,
+                |_, _, _| -> Result<u8> {
+                    panic!("cancelled worker overwrote its recorded result")
+                }
+            )
             .err()
             .unwrap(),
             Error::InvalidArgument("first")
@@ -1730,9 +1743,11 @@ mod tests {
         let resources = WriterResources::default();
         let source = EntrySource::from_factory(Untouched);
         assert_eq!(
-            compress_members_with_context(&[source], &plan, &resources, &Cancelled, &|_, error| error)
-                .err()
-                .unwrap(),
+            compress_members_with_context(&[source], &plan, &resources, &Cancelled, &|_, error| {
+                error
+            })
+            .err()
+            .unwrap(),
             Error::Cancelled
         );
         assert_eq!(
@@ -1764,7 +1779,10 @@ mod tests {
         );
         let running = |_: u64| true;
         for (resources, progress) in [
-            (WriterResources::default(), &Cancelled as &dyn CompressionProgress),
+            (
+                WriterResources::default(),
+                &Cancelled as &dyn CompressionProgress,
+            ),
             (resources, &running as &dyn CompressionProgress),
         ] {
             assert_eq!(
@@ -2746,13 +2764,18 @@ mod tests {
                 Err(std::io::Error::other("fallback source refused").into())
             }
         });
-        let error =
-            compress_members_with_context(&[source], &plan, &resources, &|_| true, &|index, error| {
+        let error = compress_members_with_context(
+            &[source],
+            &plan,
+            &resources,
+            &|_| true,
+            &|index, error| {
                 assert_eq!(index, 0);
                 error.at_entry(b"fallback.bin".to_vec(), "compressing")
-            })
-            .err()
-            .unwrap();
+            },
+        )
+        .err()
+        .unwrap();
         assert_eq!(error.kind(), crate::ErrorKind::Io);
         assert_eq!(
             error.entry_context(),

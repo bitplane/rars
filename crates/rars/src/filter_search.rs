@@ -945,11 +945,7 @@ fn choose_filter_inner<S: OwnedSearch>(
 /// inside the search cost a second pass over the member to sharpen a percentage.
 /// A progress bar that finishes a little early or a little late is not worth
 /// that.
-pub(crate) fn walk_bytes_for_kinds(
-    data: &[u8],
-    screened: u64,
-    encoder_candidates: usize,
-) -> u64 {
+pub(crate) fn walk_bytes_for_kinds(data: &[u8], screened: u64, encoder_candidates: usize) -> u64 {
     let member = data.len() as u64;
     let encoder_candidates = encoder_candidates.max(1) as u64;
     let sample = screen_sample(data).len() as u64;
@@ -1254,7 +1250,8 @@ mod tests {
     fn tiny_scanner_regions_do_not_trigger_sample_encodes() {
         let data = b"abcdefgh";
         let region = 0..data.len();
-        let x86 = x86_screened_regions(&FULL, data, std::slice::from_ref(&region), options()).unwrap();
+        let x86 =
+            x86_screened_regions(&FULL, data, std::slice::from_ref(&region), options()).unwrap();
         assert!(x86.kept.is_empty());
         assert!(!x86.rejected_a_region);
         let tables = table_screened_regions(&FULL, data, &[(0..data.len(), 1)], options()).unwrap();
@@ -1562,7 +1559,11 @@ mod tests {
         assert_eq!(baseline.used(), 0);
         for index in 0..baseline.attempts() {
             let budget = RefusingBudget::new(index);
-            assert_eq!(run(&budget), Err(crate::Error::Cancelled), "admission {index}");
+            assert_eq!(
+                run(&budget),
+                Err(crate::Error::Cancelled),
+                "admission {index}"
+            );
             assert_eq!(budget.used(), 0, "admission {index}");
         }
     }
@@ -1585,7 +1586,11 @@ mod tests {
         assert_eq!(baseline.used(), 0);
         for index in 0..baseline.attempts() {
             let budget = RefusingBudget::new(index);
-            assert_eq!(run(&budget), Err(crate::Error::Cancelled), "admission {index}");
+            assert_eq!(
+                run(&budget),
+                Err(crate::Error::Cancelled),
+                "admission {index}"
+            );
             assert_eq!(budget.used(), 0, "admission {index}");
         }
     }
@@ -1704,7 +1709,11 @@ mod tests {
         assert_eq!(baseline.used(), 0);
         for index in 0..baseline.attempts() {
             let budget = RefusingBudget::new(index);
-            assert_eq!(run(&budget), Err(crate::Error::Cancelled), "admission {index}");
+            assert_eq!(
+                run(&budget),
+                Err(crate::Error::Cancelled),
+                "admission {index}"
+            );
             assert_eq!(budget.used(), 0, "admission {index}");
         }
     }
@@ -1772,12 +1781,8 @@ mod tests {
                 encodes: Cell::new(0),
             };
             let region = 0..64;
-            let result = super::x86_screened_regions(
-                &search,
-                &[0; 64],
-                std::slice::from_ref(&region),
-                (),
-            )?;
+            let result =
+                super::x86_screened_regions(&search, &[0; 64], std::slice::from_ref(&region), ())?;
             assert_eq!(result.kept.len(), 1);
             assert!(!result.jumps_cost_more);
             Ok(())
@@ -1787,7 +1792,11 @@ mod tests {
         assert_eq!(baseline.used(), 0);
         for index in 0..baseline.attempts() {
             let budget = RefusingBudget::new(index);
-            assert_eq!(run(&budget), Err(crate::Error::Cancelled), "admission {index}");
+            assert_eq!(
+                run(&budget),
+                Err(crate::Error::Cancelled),
+                "admission {index}"
+            );
             assert_eq!(budget.used(), 0, "admission {index}");
         }
     }
@@ -1861,7 +1870,11 @@ mod tests {
         assert_eq!(baseline.used(), 0);
         for index in 0..baseline.attempts() {
             let budget = RefusingBudget::new(index);
-            assert_eq!(run(&budget), Err(crate::Error::Cancelled), "admission {index}");
+            assert_eq!(
+                run(&budget),
+                Err(crate::Error::Cancelled),
+                "admission {index}"
+            );
             assert_eq!(budget.used(), 0, "admission {index}");
         }
     }

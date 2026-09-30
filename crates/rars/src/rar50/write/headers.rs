@@ -302,8 +302,8 @@ mod tests {
     fn block_header_admission_failure_leaves_output_empty() {
         let resources = WriterResources::default().with_max_preparation_bytes(0);
         let mut output = Bytes::new(&resources);
-        let error = write_block(&mut output, HEAD_MAIN, 0, None, &[], &[], &[], &resources)
-            .unwrap_err();
+        let error =
+            write_block(&mut output, HEAD_MAIN, 0, None, &[], &[], &[], &resources).unwrap_err();
         assert!(matches!(
             error,
             Error::WriterPreparationLimitExceeded {
@@ -942,10 +942,7 @@ mod image_tests {
     #[test]
     fn header_length_checks_reject_overflow_without_allocating() {
         assert_eq!(checked_image_len(&[0, 7]).unwrap(), 7);
-        for parts in [
-            [usize::MAX, 1],
-            [isize::MAX as usize, 1],
-        ] {
+        for parts in [[usize::MAX, 1], [isize::MAX as usize, 1]] {
             assert_eq!(
                 checked_image_len(&parts).unwrap_err(),
                 Error::InvalidArgument("RAR 5 header size overflows")
@@ -957,9 +954,21 @@ mod image_tests {
     fn invalid_archive_metadata_is_rejected_at_serialization() {
         let resources = crate::WriterResources::default();
         for (name, time, reason) in [
-            (None, None, "RAR 5 archive metadata writer needs a name or creation time"),
-            (Some(b"name".as_slice()), None, "RAR 5 archive metadata name needs a creation time"),
-            (Some(b"".as_slice()), Some(1), "RAR 5 archive metadata name is empty"),
+            (
+                None,
+                None,
+                "RAR 5 archive metadata writer needs a name or creation time",
+            ),
+            (
+                Some(b"name".as_slice()),
+                None,
+                "RAR 5 archive metadata name needs a creation time",
+            ),
+            (
+                Some(b"".as_slice()),
+                Some(1),
+                "RAR 5 archive metadata name is empty",
+            ),
         ] {
             let error = archive_metadata_record(
                 ArchiveMetadataEntry {

@@ -65,7 +65,11 @@ pub(crate) fn open_output_writer(
         return Ok((out_path, Box::new(std::io::sink())));
     }
     // A validated nonempty relative name always leaves a final path component.
-    fs::create_dir_all(out_path.parent().expect("validated output path has a parent"))?;
+    fs::create_dir_all(
+        out_path
+            .parent()
+            .expect("validated output path has a parent"),
+    )?;
     out_path = checked_output_path(out_dir, &rel)?;
     Ok((
         out_path.clone(),
@@ -132,7 +136,11 @@ pub(crate) fn create_rar50_redirection(
         let rel = rar50_output_relative_path(&entry.name, entry.host_os)
             .map_err(|_| Error::InvalidHeader("unsafe archive path"))?;
         let mut out_path = checked_output_path(out_dir, &rel)?;
-        fs::create_dir_all(out_path.parent().expect("validated output path has a parent"))?;
+        fs::create_dir_all(
+            out_path
+                .parent()
+                .expect("validated output path has a parent"),
+        )?;
         out_path = checked_output_path(out_dir, &rel)?;
         prepare_redirection_destination(&out_path, overwrite)?;
         Ok(out_path)
@@ -307,9 +315,7 @@ fn set_extracted_permissions(
         // A st_mode is applied verbatim, but only when it carries file-type
         // bits. Without them the value is not a mode, and stripping a file to
         // whatever the low bits happen to say is worse than leaving it.
-        AttrSource::Unix if file_attr & 0o170000 != 0 => {
-            Some((file_attr & 0o777) as u32)
-        }
+        AttrSource::Unix if file_attr & 0o170000 != 0 => Some((file_attr & 0o777) as u32),
         // Missing type bits and unknown (including future) hosts leave modes unchanged.
         _ => None,
     };

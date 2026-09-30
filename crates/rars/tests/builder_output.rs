@@ -22,9 +22,14 @@ fn empty_legacy_builder_refuses_single_archive_output() {
 #[test]
 fn legacy_volume_builder_refuses_existing_directories_and_symlinks() {
     let mut directory = Builder::new(ArchiveVersion::Rar29);
-    directory.add_directory(b"dir".to_vec(), None, None).unwrap();
+    directory
+        .add_directory(b"dir".to_vec(), None, None)
+        .unwrap();
     assert_eq!(
-        directory.volume_size(Some(64)).build_volumes(None).unwrap_err(),
+        directory
+            .volume_size(Some(64))
+            .build_volumes(None)
+            .unwrap_err(),
         rars::Error::InvalidArgument(
             "legacy directories and symbolic links are unsupported in volume output"
         )
@@ -35,7 +40,10 @@ fn legacy_volume_builder_refuses_existing_directories_and_symlinks() {
         .add_unix_symlink(b"link".to_vec(), b"target".to_vec(), false, None, None)
         .unwrap();
     assert_eq!(
-        symlink.volume_size(Some(64)).build_volumes(None).unwrap_err(),
+        symlink
+            .volume_size(Some(64))
+            .build_volumes(None)
+            .unwrap_err(),
         rars::Error::InvalidArgument(
             "legacy directories and symbolic links are unsupported in volume output"
         )
@@ -44,7 +52,11 @@ fn legacy_volume_builder_refuses_existing_directories_and_symlinks() {
 
 #[test]
 fn legacy_volumes_accept_regular_unix_mode_files() {
-    for version in [ArchiveVersion::Rar20, ArchiveVersion::Rar29, ArchiveVersion::Rar40] {
+    for version in [
+        ArchiveVersion::Rar20,
+        ArchiveVersion::Rar29,
+        ArchiveVersion::Rar40,
+    ] {
         let mut builder = Builder::new(version).store(true).volume_size(Some(64));
         builder
             .add_bytes(b"file".to_vec(), vec![42; 128], None, Some(0o100640))
@@ -89,7 +101,10 @@ fn path_output_reports_missing_parent_without_creating_an_archive() {
         .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
         .unwrap();
     assert_eq!(
-        builder.write_to_path(&destination, None).unwrap_err().kind(),
+        builder
+            .write_to_path(&destination, None)
+            .unwrap_err()
+            .kind(),
         rars::ErrorKind::Io
     );
     assert!(!destination.exists());
@@ -157,7 +172,10 @@ fn resource_aware_byte_output_matches_the_standard_builder_path() {
             .unwrap();
         assert_eq!(actual, expected, "{version:?}");
         let archive = ArchiveReader::read_owned(actual).unwrap();
-        assert_eq!(archive.read_member(b"file", None).unwrap().unwrap(), b"payload");
+        assert_eq!(
+            archive.read_member(b"file", None).unwrap().unwrap(),
+            b"payload"
+        );
     }
 }
 
@@ -178,7 +196,10 @@ fn header_encryption_uses_a_shared_entry_password_without_a_builder_default() {
     )
     .unwrap();
     assert_eq!(
-        archive.read_member(b"file", Some(b"secret")).unwrap().unwrap(),
+        archive
+            .read_member(b"file", Some(b"secret"))
+            .unwrap()
+            .unwrap(),
         b"payload"
     );
 }
@@ -324,7 +345,9 @@ fn volume_builder_rejects_unsupported_settings_before_opening_sources() {
         .unwrap();
     assert!(matches!(
         commented.build_volumes(None),
-        Err(rars::Error::InvalidArgument("RAR 5 volume comments are not supported"))
+        Err(rars::Error::InvalidArgument(
+            "RAR 5 volume comments are not supported"
+        ))
     ));
 
     let mut locked = Builder::new(ArchiveVersion::Rar50)
@@ -358,7 +381,9 @@ fn volume_builder_rejects_unsupported_settings_before_opening_sources() {
     let empty = Builder::new(ArchiveVersion::Rar20).volume_size(Some(1024));
     assert!(matches!(
         empty.build_volumes(None),
-        Err(rars::Error::InvalidArgument("archive builder has no entries"))
+        Err(rars::Error::InvalidArgument(
+            "archive builder has no entries"
+        ))
     ));
 
     let mut multiple = Builder::new(ArchiveVersion::Rar20)
@@ -383,9 +408,7 @@ fn legacy_builder_rejects_modern_streaming_outputs_before_creating_files() {
     builder
         .add_source(
             b"file".to_vec(),
-            EntrySource::from_opener(7, || {
-                panic!("unsupported output must not open the source")
-            }),
+            EntrySource::from_opener(7, || panic!("unsupported output must not open the source")),
             None,
             None,
         )
@@ -427,7 +450,11 @@ fn legacy_builder_materializes_reopenable_sources_once() {
     use std::sync::Arc;
 
     let payload = b"legacy source materialization ".repeat(32);
-    for version in [ArchiveVersion::Rar13, ArchiveVersion::Rar20, ArchiveVersion::Rar29] {
+    for version in [
+        ArchiveVersion::Rar13,
+        ArchiveVersion::Rar20,
+        ArchiveVersion::Rar29,
+    ] {
         let opens = Arc::new(AtomicUsize::new(0));
         let opened = opens.clone();
         let data = payload.clone();
@@ -444,7 +471,10 @@ fn legacy_builder_materializes_reopenable_sources_once() {
             )
             .unwrap();
         let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
-        assert_eq!(archive.read_member(b"source", None).unwrap().unwrap(), payload);
+        assert_eq!(
+            archive.read_member(b"source", None).unwrap().unwrap(),
+            payload
+        );
         assert_eq!(opens.load(Ordering::SeqCst), 1, "{version:?}");
     }
 }

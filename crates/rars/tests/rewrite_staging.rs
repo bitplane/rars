@@ -104,7 +104,10 @@ fn staging_finishes_selected_member_before_a_trailing_archive_member() {
             Some(progress),
         )
         .unwrap();
-    assert_eq!(&*events.lock().unwrap(), &[b"selected".to_vec(), b"finished".to_vec()]);
+    assert_eq!(
+        &*events.lock().unwrap(),
+        &[b"selected".to_vec(), b"finished".to_vec()]
+    );
     assert_eq!(sources.len(), 1);
 }
 
@@ -405,13 +408,11 @@ fn staging_rejects_redirections_and_split_volume_fragments() {
     for (index, bytes) in volumes.iter().take(2).enumerate() {
         let archive = ArchiveReader::read_owned(bytes.clone()).unwrap();
         let member = archive.members().next().unwrap();
-        assert!(
-            if index == 0 {
-                member.meta.is_split_after
-            } else {
-                member.meta.is_split_before
-            }
-        );
+        assert!(if index == 0 {
+            member.meta.is_split_after
+        } else {
+            member.meta.is_split_before
+        });
         assert!(matches!(
             archive.stage_rewrite_sources(&[0], ArchiveReadOptions::default(), &staging),
             Err(Error::InvalidArgument(_))

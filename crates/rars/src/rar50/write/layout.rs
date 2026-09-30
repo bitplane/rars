@@ -409,10 +409,9 @@ mod tests {
     #[test]
     fn layout_rejects_offset_and_service_length_overflow() {
         let resources = crate::WriterResources::default();
-        for (body_len, head_crypt_len, quick_open_payload_len) in [
-            (u64::MAX, 0, None),
-            (0, u64::MAX, None),
-        ] {
+        for (body_len, head_crypt_len, quick_open_payload_len) in
+            [(u64::MAX, 0, None), (0, u64::MAX, None)]
+        {
             let mut inputs = inputs(body_len);
             inputs.head_crypt_len = head_crypt_len;
             inputs.quick_open_payload_len = quick_open_payload_len;

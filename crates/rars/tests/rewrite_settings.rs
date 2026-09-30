@@ -33,7 +33,11 @@ fn preserving_builder_accepts_native_unix_directories() {
 
 #[test]
 fn preserving_builder_refuses_unix_device_entries() {
-    for version in [ArchiveVersion::Rar20, ArchiveVersion::Rar29, ArchiveVersion::Rar50] {
+    for version in [
+        ArchiveVersion::Rar20,
+        ArchiveVersion::Rar29,
+        ArchiveVersion::Rar50,
+    ] {
         let mut builder = Builder::new(version).store(true);
         builder
             .add_bytes(b"device".to_vec(), Vec::new(), None, Some(0o020600))
@@ -194,7 +198,10 @@ fn retained_legacy_comment_metadata_requires_the_comment_to_be_copied() {
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(output.comment(None).unwrap(), Some(b"archive note".to_vec()));
+    assert_eq!(
+        output.comment(None).unwrap(),
+        Some(b"archive note".to_vec())
+    );
 }
 
 #[test]
@@ -208,7 +215,10 @@ fn preserving_builder_requires_password_for_encrypted_legacy_archive_comment() {
         .unwrap();
     let source = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
     assert!(source.rewrite_preservation_issues().is_empty());
-    assert!(matches!(source.preserving_builder(None), Err(rars::Error::NeedPassword)));
+    assert!(matches!(
+        source.preserving_builder(None),
+        Err(rars::Error::NeedPassword)
+    ));
 
     let mut preserving = source
         .preserving_builder(Some(b"secret"))
@@ -218,11 +228,22 @@ fn preserving_builder_requires_password_for_encrypted_legacy_archive_comment() {
     preserving
         .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
         .unwrap();
-    preserving.set_entry_encryption(b"file", None, None).unwrap();
+    preserving
+        .set_entry_encryption(b"file", None, None)
+        .unwrap();
     let output = ArchiveReader::read_owned(preserving.to_bytes().unwrap()).unwrap();
-    assert!(matches!(output.comment(None), Err(rars::Error::NeedPassword)));
-    assert_eq!(output.comment(Some(b"secret")).unwrap(), Some(b"private note".to_vec()));
-    assert_eq!(output.read_member(b"file", None).unwrap().unwrap(), b"payload");
+    assert!(matches!(
+        output.comment(None),
+        Err(rars::Error::NeedPassword)
+    ));
+    assert_eq!(
+        output.comment(Some(b"secret")).unwrap(),
+        Some(b"private note".to_vec())
+    );
+    assert_eq!(
+        output.read_member(b"file", None).unwrap().unwrap(),
+        b"payload"
+    );
 }
 
 #[test]
@@ -274,7 +295,10 @@ fn preserving_builder_requires_password_for_encrypted_legacy_members() {
             .add_bytes(b"encrypted".to_vec(), b"payload".to_vec(), None, None)
             .unwrap();
         let source = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
-        assert!(source.rewrite_preservation_issues().is_empty(), "{version:?}");
+        assert!(
+            source.rewrite_preservation_issues().is_empty(),
+            "{version:?}"
+        );
         assert!(matches!(
             source.preserving_builder(None),
             Err(rars::Error::NeedPassword)
@@ -347,7 +371,10 @@ fn preservation_preflight_refuses_metadata_it_cannot_rewrite() {
         "main header metadata",
     );
     check(|archive| archive.main.archive_flags |= 1, "volume layout");
-    check(|archive| archive.main.volume_number = Some(1), "volume layout");
+    check(
+        |archive| archive.main.volume_number = Some(1),
+        "volume layout",
+    );
     check(
         |archive| archive.main.block.flags |= 2,
         "main header metadata",
@@ -579,7 +606,9 @@ fn preservation_preflight_checks_every_derived_service_field() {
         mutate(service);
         let issues = Archive::Rar50Plus(candidate).rewrite_preservation_issues();
         assert!(
-            issues.iter().any(|issue| issue.contains("unsupported derived service")),
+            issues
+                .iter()
+                .any(|issue| issue.contains("unsupported derived service")),
             "{name:?}: {issues:?}"
         );
     };

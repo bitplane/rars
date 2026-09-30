@@ -2442,7 +2442,12 @@ mod tests {
             .store(true)
             .comment(Some(b"archive note".to_vec()));
         builder
-            .add_bytes(b"payload.txt".to_vec(), b"payload bytes".to_vec(), None, None)
+            .add_bytes(
+                b"payload.txt".to_vec(),
+                b"payload bytes".to_vec(),
+                None,
+                None,
+            )
             .unwrap();
         let crate::Archive::Rar50Plus(seed) =
             crate::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap()
@@ -2483,8 +2488,15 @@ mod tests {
             assert!(!file.rewrite_metadata_complete);
 
             let issues = crate::Archive::Rar50Plus(candidate).rewrite_preservation_issues();
-            let expected = if service { "service record" } else { "member 0" };
-            assert!(issues.iter().any(|issue| issue.contains(expected)), "{issues:?}");
+            let expected = if service {
+                "service record"
+            } else {
+                "member 0"
+            };
+            assert!(
+                issues.iter().any(|issue| issue.contains(expected)),
+                "{issues:?}"
+            );
         }
 
         let mut builder = crate::Builder::new(crate::ArchiveVersion::Rar50)
@@ -2492,7 +2504,12 @@ mod tests {
             .archive_metadata(None, false, true)
             .unwrap();
         builder
-            .add_bytes(b"payload.txt".to_vec(), b"payload bytes".to_vec(), None, None)
+            .add_bytes(
+                b"payload.txt".to_vec(),
+                b"payload bytes".to_vec(),
+                None,
+                None,
+            )
             .unwrap();
         let crate::Archive::Rar50Plus(mut indexed) =
             crate::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap()
@@ -2821,10 +2838,7 @@ mod tests {
     fn recovery_end_header_preserves_split_volume_continuation() {
         let first = include_bytes!("../tests/fixtures/rar50/multivol.part1.rar");
         let last = include_bytes!("../tests/fixtures/rar50/multivol.part3.rar");
-        for (bytes, expected) in [
-            (first.as_slice(), EFL_NEXT_VOLUME),
-            (last.as_slice(), 0),
-        ] {
+        for (bytes, expected) in [(first.as_slice(), EFL_NEXT_VOLUME), (last.as_slice(), 0)] {
             let archive = Archive::parse(bytes).unwrap();
             assert_eq!(
                 archive.files().last().unwrap().is_split_after(),

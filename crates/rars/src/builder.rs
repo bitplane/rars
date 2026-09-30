@@ -45,7 +45,9 @@ impl PendingArchive {
     fn with_resources(destination: &Path, resources: &WriterResources) -> Result<(Self, fs::File)> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        Self::with_sequence(destination, resources, || NEXT.fetch_add(1, Ordering::Relaxed))
+        Self::with_sequence(destination, resources, || {
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        })
     }
 
     fn with_sequence(
@@ -935,10 +937,10 @@ impl Builder {
             };
             self.add_source(name, EntrySource::from_path(path), None, unix_mode(&meta))?;
         } else {
-            return Err(Error::InvalidArgument(
-                "input path is not a regular file or directory",
-            )
-            .at_entry(archive_name.to_vec(), "adding"));
+            return Err(
+                Error::InvalidArgument("input path is not a regular file or directory")
+                    .at_entry(archive_name.to_vec(), "adding"),
+            );
         }
         Ok(())
     }
@@ -1879,12 +1881,13 @@ mod tests {
         std::fs::write(root.join(name(0)), b"occupied").unwrap();
         let resources = crate::WriterResources::default().with_temp_dir(&*root);
         let mut sequence = 0;
-        let (pending, file) = super::PendingArchive::with_sequence(&destination, &resources, || {
-            let value = sequence;
-            sequence += 1;
-            value
-        })
-        .unwrap();
+        let (pending, file) =
+            super::PendingArchive::with_sequence(&destination, &resources, || {
+                let value = sequence;
+                sequence += 1;
+                value
+            })
+            .unwrap();
         assert_eq!(sequence, 2);
         assert_eq!(pending.path.as_deref(), Some(root.join(name(1)).as_path()));
         drop(file);
@@ -1940,10 +1943,8 @@ mod tests {
         let converted = builder.rar50_entries_with_resources(&resources).unwrap();
         assert_eq!(
             resources.managed_memory_in_use() - baseline_charge,
-            (std::mem::size_of::<crate::rar50::ServiceEntry>()
-                + 3
-                + comment.len()
-                + password.len()) as u64
+            (std::mem::size_of::<crate::rar50::ServiceEntry>() + 3 + comment.len() + password.len())
+                as u64
         );
         drop(converted);
         assert_eq!(resources.managed_memory_in_use(), 0);
@@ -1955,7 +1956,10 @@ mod tests {
 
         let mut volume = Builder::new(ArchiveVersion::Rar29).volume_size(Some(64));
         assert_eq!(
-            volume.add_directory(b"dir".to_vec(), None, None).unwrap_err().kind(),
+            volume
+                .add_directory(b"dir".to_vec(), None, None)
+                .unwrap_err()
+                .kind(),
             ErrorKind::InvalidArgument
         );
         assert_eq!(
@@ -2029,14 +2033,21 @@ mod tests {
         let id = builder.entry_id(b"file").unwrap();
         builder.rename_by_id(id, b"file".to_vec()).unwrap();
         let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
-        assert_eq!(archive.read_member(b"file", None).unwrap().unwrap(), b"payload");
+        assert_eq!(
+            archive.read_member(b"file", None).unwrap().unwrap(),
+            b"payload"
+        );
     }
 
     #[test]
     fn builder_rejects_unsupported_per_entry_password_shapes() {
         use crate::{ArchiveVersion, Builder, ErrorKind};
 
-        for format in [ArchiveVersion::Rar13, ArchiveVersion::Rar29, ArchiveVersion::Rar50] {
+        for format in [
+            ArchiveVersion::Rar13,
+            ArchiveVersion::Rar29,
+            ArchiveVersion::Rar50,
+        ] {
             let mut builder = Builder::new(format).store(true);
             builder
                 .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
