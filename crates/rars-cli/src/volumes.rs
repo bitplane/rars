@@ -200,6 +200,194 @@ pub(crate) fn infer_part_index(path: &Path, data_count: u16) -> Option<usize> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn generated_volume_names_observe_format_boundaries() {
+        let first = Path::new("dir/set.rar");
+        assert_eq!(volume_part_path(first, 0).unwrap(), first);
+        assert_eq!(
+            volume_part_path(first, 1).unwrap(),
+            Path::new("dir/set.r00")
+        );
+        assert_eq!(
+            volume_part_path(first, 100).unwrap(),
+            Path::new("dir/set.r99")
+        );
+        assert!(volume_part_path(first, 101).is_err());
+        for (input, expected) in [
+            ("set.RAR", "set.part01.rar"),
+            ("set.PART009.RAR", "set.part01.rar"),
+            ("set.part.rar", "set.part.part01.rar"),
+            ("set.partx.rar", "set.partx.part01.rar"),
+            ("set", "set.part01.rar"),
+            ("set.part2.part3.rar", "set.part2.part01.rar"),
+        ] {
+            assert_eq!(
+                rar50_volume_part_path(Path::new(input), 0, 2).unwrap(),
+                Path::new(expected)
+            );
+        }
+        assert_eq!(
+            rar50_volume_part_path(first, 9, 100).unwrap(),
+            Path::new("dir/set.part010.rar")
+        );
+        assert!(rar50_volume_part_path(Path::new("/"), 0, 1).is_err());
+    }
+
+    #[test]
+    fn volume_indices_reject_invalid_and_out_of_range_names() {
+        for (name, expected) in [
+            ("set.rar", Some(0)),
+            ("set.R99", Some(100)),
+            ("set.part2.rar", Some(1)),
+            ("set.part0.rar", None),
+            ("set.part.rar", None),
+            ("set.partx.rar", None),
+            ("set.part999999999999999999999999999999.rar", None),
+            ("set.rx0", None),
+            ("set.r100", None),
+            ("set.txt", None),
+            ("set", None),
+            ("/", None),
+        ] {
+            assert_eq!(volume_sort_key(Path::new(name)), expected, "{name}");
+        }
+        assert_eq!(infer_part_index(Path::new("set.part2.rar"), 2), Some(1));
+        assert_eq!(infer_part_index(Path::new("set.part2.rar"), 1), None);
+        assert_eq!(infer_part_index(Path::new("set.rar"), 0), None);
+        assert!(path_has_extension(Path::new("set.REV"), "rev"));
+        assert!(!path_has_extension(Path::new("set"), "rev"));
+        let mut paths = vec![
+            PathBuf::from("set.part10.rar"),
+            PathBuf::from("set.part2.rar"),
+            PathBuf::from("set.part1.rar"),
+        ];
+        sort_volume_paths(&mut paths);
+        assert_eq!(
+            paths,
+            ["set.part1.rar", "set.part2.rar", "set.part10.rar"].map(PathBuf::from)
+        );
+    }
+
+    #[test]
+    fn discovery_falls_back_and_excludes_invalid_part_numbers() {
+        let dir = crate::scratch::case("volume-discovery-fallbacks");
+        for name in [
+            "set.part1.rar",
+            "set.part02.rar",
+            "set.part0.rar",
+            "set.partx.rar",
+            "set.part999999999999999999999999999999.rar",
+            "other.part1.rar",
+        ] {
+            fs::write(dir.join(name), []).unwrap();
+        }
+        assert_eq!(
+            discover_sibling_volumes(&dir.join("set.part1.rar")),
+            vec![dir.join("set.part1.rar"), dir.join("set.part02.rar")]
+        );
+        for path in [
+            dir.join("not-a-volume.bin"),
+            dir.join("absent.rar"),
+            dir.join("missing-parent/set.rar"),
+            PathBuf::from("/"),
+        ] {
+            assert_eq!(discover_sibling_volumes(&path), vec![path]);
+        }
+        assert_eq!(
+            discover_sibling_volumes(Path::new("not-a-volume.bin")),
+            vec![PathBuf::from("not-a-volume.bin")]
+        );
+    }
+
+    #[test]
+    fn malformed_suffixes_and_equal_indices_have_deterministic_order() {
+        for name in [
+            "x",
+            "set.part",
+            "set.partx",
+            "set.part.rar",
+            "set.partx.rar",
+            "set.rx0",
+        ] {
+            assert_eq!(
+                volume_name_key(Path::new(name)),
+                if name.ends_with(".rar") {
+                    Some([b"old:".as_slice(), &name.as_bytes()[..name.len() - 4]].concat())
+                } else {
+                    None
+                },
+                "{name}"
+            );
+        }
+        assert_eq!(volume_sort_key(Path::new("set.part")), None);
+        assert_eq!(volume_sort_key(Path::new("set.partx")), None);
+        let mut paths = [
+            PathBuf::from("set.part01.rar"),
+            PathBuf::from("set.part1.rar"),
+        ];
+        let expected = paths.clone();
+        paths.reverse();
+        sort_volume_paths(&mut paths);
+        assert_eq!(paths, expected);
+        assert_eq!(
+            parse_rar3_old_style_rev_name(Path::new("4_2_1.rev")),
+            Some((0, 2, 4))
+        );
+        assert_eq!(parse_rar3_old_style_rev_name(Path::new("123.rev")), None);
+        assert_eq!(parse_rar3_old_style_rev_name(Path::new(".rev")), None);
+        #[cfg(unix)]
+        {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+            let name = Path::new(OsStr::from_bytes(b"set.part\xff.rar"));
+            assert_eq!(volume_sort_key(name), None);
+            assert!(!path_has_extension(
+                Path::new(OsStr::from_bytes(b"set.\xff")),
+                "rev"
+            ));
+            assert_eq!(
+                volume_sort_key(Path::new(OsStr::from_bytes(b"set.\xff"))),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn rev_trailer_crc_and_old_style_metadata_boundaries() {
+        let mut bytes = b"recovery payload".to_vec();
+        bytes.extend_from_slice(&[3, 1, 1]);
+        let crc = crc32(&bytes);
+        bytes.extend_from_slice(&crc.to_le_bytes());
+        let (index, recovery, data, payload) =
+            parse_rar3_rev_volume(Path::new("unnamed.rev"), &bytes).unwrap();
+        assert_eq!((index, recovery, data), (1, 2, 4));
+        assert_eq!(&payload[..payload.len() - 7], b"recovery payload");
+        assert_eq!(&payload[payload.len() - 7..], &[0; 7]);
+        bytes[0] ^= 1;
+        assert!(parse_rar3_rev_volume(Path::new("unnamed.rev"), &bytes).is_none());
+        assert_eq!(
+            parse_rar3_rev_volume(Path::new("set_4_2_1.rev"), &bytes).unwrap(),
+            (0, 2, 4, bytes)
+        );
+        assert!(parse_rar3_rev_volume(Path::new("unnamed.rev"), b"short").is_none());
+        for (name, expected) in [
+            ("set_4_2_1.rev", Some((0, 2, 4))),
+            ("set_255_255_255.rev", Some((254, 255, 255))),
+            ("set_0_2_1.rev", None),
+            ("set_256_2_1.rev", None),
+            ("set_4_2.rev", None),
+            ("set.rev", None),
+            ("set_999999999999999999999999999999_2_1.rev", None),
+            ("/", None),
+        ] {
+            assert_eq!(
+                parse_rar3_old_style_rev_name(Path::new(name)),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn native_volume_names_remain_distinct() {
