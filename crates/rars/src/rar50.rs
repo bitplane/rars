@@ -3700,3 +3700,55 @@ mod tests {
         assert!(archive.archive_comment().unwrap().is_none());
     }
 }
+
+#[cfg(test)]
+#[test]
+fn redirection_preservation_refuses_inconsistent_header_metadata() {
+    let mut builder = crate::Builder::new(crate::ArchiveVersion::Rar50).store(true);
+    builder
+        .add_bytes(b"link".to_vec(), Vec::new(), None, None)
+        .unwrap();
+    let archive = crate::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    let original = archive.members().next().unwrap();
+    for (kind, flags, host, attr, directory, supported) in [
+        (2, 0, 0, 0x400, false, true),
+        (2, 0, 1, 0x400, false, false),
+        (2, 0, 0, 0, false, false),
+        (2, 0, 0, 0x410, false, false),
+        (2, 1, 0, 0x400, false, false),
+        (3, 0, 0, 0x400, false, false),
+        (3, 1, 0, 0x410, true, true),
+        (4, 0, 0, 0, false, true),
+        (4, 0, 0, 0, true, false),
+        (5, 0, 1, 0o100600, false, true),
+        (0, 0, 0, 0, false, false),
+        (6, 0, 0, 0, false, false),
+    ] {
+        let mut member = original.clone();
+        member.meta.host_os = Some(host);
+        member.meta.file_attr = attr;
+        member.meta.is_directory = directory;
+        member.meta.is_redirection = true;
+        let crate::ArchiveMemberDetail::Rar50Plus { redirection, .. } = &mut member.detail else {
+            panic!("expected RAR5 member");
+        };
+        *redirection = Some(FileRedirection {
+            redirection_type: kind,
+            flags,
+            target_name: b"target".to_vec(),
+        });
+        assert_eq!(
+            member.supported_redirection().is_some(),
+            supported,
+            "kind={kind}, flags={flags}, host={host}, attr={attr:#x}, directory={directory}"
+        );
+        if !supported {
+            let mut output = crate::Builder::new(crate::ArchiveVersion::Rar50);
+            assert_eq!(
+                output.add_archive_redirection(&member),
+                Err(Error::InvalidArgument("unsupported redirection metadata"))
+            );
+            assert!(output.is_empty());
+        }
+    }
+}
