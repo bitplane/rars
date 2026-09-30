@@ -133,6 +133,68 @@ fn info_lists_rar15_40_metadata() {
 }
 
 #[test]
+fn info_displays_services_redirections_and_legacy_comments_in_both_modes() {
+    for (path, terse, verbose) in [
+        (
+            fixture_rar50("with_all_services.rar"),
+            vec![
+                "Comment: This is the archive comment.",
+                "Services: quick-open, recovery",
+                "hello.txt",
+            ],
+            vec!["service: QO", "service: RR", "crc=none", "hello.txt"],
+        ),
+        (
+            fixture_rar50("wild/symlink.rar"),
+            vec!["symlink.txt → file.txt", "dirlink → dir"],
+            vec!["redirection: type=1", "target=file.txt"],
+        ),
+        (
+            fixture_rar15_40("rar300/with_comment_rar300.rar"),
+            vec![
+                "Comment: This is the archive comment.",
+                "Subblocks: ArchiveComment",
+                "hello.txt",
+            ],
+            vec![
+                "comment: This is the archive comment.",
+                "subblock: ArchiveComment CMT",
+            ],
+        ),
+        (
+            fixture("COMMENT.RAR"),
+            vec!["Comment: This is the archive comment."],
+            vec!["archive comment extension:", "(packed)"],
+        ),
+    ] {
+        for (is_verbose, expected) in [(false, terse), (true, verbose)] {
+            let mut command = rars();
+            command.arg("info");
+            if is_verbose {
+                command.arg("--verbose");
+            }
+            let output = command.arg(&path).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}: {}",
+                path.display(),
+                stderr(&output)
+            );
+            let text = stdout(&output);
+            for expected in expected {
+                assert!(text.contains(expected), "missing {expected:?}: {text}");
+            }
+            if path == fixture_rar50("with_all_services.rar") {
+                // The archive CMT is displayed once as a comment, rather than
+                // again in the remaining service list.
+                assert!(!text.contains("service: CMT"));
+                assert!(!text.contains("Services: comment"));
+            }
+        }
+    }
+}
+
+#[test]
 fn test_verifies_rar15_40_stored_fixture() {
     let output = rars()
         .arg("test")

@@ -2118,6 +2118,122 @@ pub(crate) fn resolve_password_args(args: &PasswordArgs) -> CliResult<Option<Pas
 #[cfg(test)]
 mod tests {
     #[test]
+    fn add_command_validation_and_filter_selection_preserve_explicit_requests() {
+        use clap::Parser;
+        let arguments = || {
+            let parsed =
+                super::cli::Cli::try_parse_from(["rars", "add", "archive.rar", "input.txt"])
+                    .unwrap();
+            let super::Command::Add(args) = parsed.command else {
+                panic!("expected add")
+            };
+            args
+        };
+        let mut args = arguments();
+        args.level = Some(6);
+        assert_eq!(super::build_add_command(args).err().unwrap().exit_code(), 2);
+        let mut args = arguments();
+        args.store = true;
+        args.level = Some(1);
+        assert!(super::build_add_command(args)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("--store"));
+        let mut args = arguments();
+        args.level = Some(0);
+        assert!(super::build_add_command(args).unwrap().store);
+        let mut args = arguments();
+        args.store = true;
+        args.solid = true;
+        assert!(super::build_add_command(args)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("solid output requires compression"));
+        for target in [
+            super::ArchiveVersion::Rar13,
+            super::ArchiveVersion::Rar50,
+            super::ArchiveVersion::Rar70,
+        ] {
+            assert!(super::AddWritePlan::for_target(target).is_err());
+        }
+        use rars::rar50::FilterPolicy;
+        assert!(matches!(
+            super::rar50_filter_policy(false, false, true, false, None, None, false),
+            FilterPolicy::None
+        ));
+        assert!(matches!(
+            super::rar50_filter_policy(true, false, true, false, None, None, false),
+            FilterPolicy::Auto
+        ));
+    }
+
+    #[test]
+    fn extraction_destinations_refuse_files_and_duplicate_planned_paths() {
+        let root = crate::scratch::case("extract-destination-boundaries");
+        let file = root.join("plain.txt");
+        std::fs::write(&file, b"not an archive").unwrap();
+        assert!(super::validate_extract_destination(&file)
+            .unwrap_err()
+            .to_string()
+            .contains("not a directory"));
+        assert!(super::validate_extract_destination(&root).is_ok());
+        assert!(super::validate_extract_destination(&root.join("missing")).is_ok());
+        assert!(!super::looks_like_archive_path(&file).unwrap());
+        assert!(!super::looks_like_archive_path(&root).unwrap());
+        assert!(!super::looks_like_archive_path(&root.join("missing")).unwrap());
+        assert!(super::reject_ambiguous_extract_target(&[]).is_ok());
+        let mut state = super::ExtractOutputState::new(
+            &root,
+            super::OverwritePolicy::Always,
+            rars::ArchiveFamily::Rar50Plus,
+        );
+        state.reserve_output_path(file.clone()).unwrap();
+        assert!(matches!(
+            state.reserve_output_path(file),
+            Err(rars::Error::InvalidHeader(
+                "multiple archive entries map to the same output path"
+            ))
+        ));
+        #[cfg(unix)]
+        {
+            let loop_path = root.join("loop");
+            std::os::unix::fs::symlink("loop", &loop_path).unwrap();
+            assert!(super::looks_like_archive_path(&loop_path)
+                .unwrap_err()
+                .to_string()
+                .contains("failed to inspect"));
+            assert!(
+                super::looks_like_archive_path(std::path::Path::new("/dev/null"))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("not a regular file or directory")
+            );
+        }
+    }
+
+    #[test]
+    fn reader_errors_keep_password_exit_classes_and_service_labels() {
+        let password_error = super::CliError::from(rars::Error::NeedPassword);
+        assert_eq!(password_error.exit_code(), 3);
+        assert_eq!(
+            super::CliError::from(rars::Error::InvalidHeader("invalid")).exit_code(),
+            1
+        );
+        for (name, label) in [
+            (b"QO".as_slice(), "quick-open"),
+            (b"RR", "recovery"),
+            (b"CMT", "comment"),
+            (b"ACL", "acl"),
+            (b"STM", "stream"),
+            (b"OTHER", "OTHER"),
+        ] {
+            assert_eq!(super::service_label(name), label);
+        }
+    }
+
+    #[test]
     fn archive_publication_failures_preserve_destinations_and_clean_staging() {
         let root = crate::scratch::case("archive-publication-errors");
         let archive = root.join("archive.rar");
