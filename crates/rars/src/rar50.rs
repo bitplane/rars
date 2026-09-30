@@ -2904,9 +2904,14 @@ mod tests {
         let mut body = vec![HEAD_FILE as u8, 0, 0, 0, 0, 0, 0];
         body.extend_from_slice(&maximum);
         let header = image(&body);
+        let expected_name_error = if usize::BITS < 64 {
+            "RAR 5 file name length overflows usize"
+        } else {
+            "RAR 5 field size overflows usize"
+        };
         assert!(matches!(
             parse_file_header_bytes(&parse(&header).unwrap()),
-            Err(Error::InvalidHeader(_))
+            Err(Error::InvalidHeader(message)) if message == expected_name_error
         ));
         let header = image(&[HEAD_FILE as u8, HFL_EXTRA as u8, 20, 0]);
         assert!(matches!(parse(&header), Err(Error::TooShort)));
