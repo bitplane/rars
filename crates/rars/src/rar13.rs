@@ -2316,12 +2316,6 @@ struct FileEntryRecord<'a> {
     extra: &'a [u8],
 }
 
-fn write_file_entry(out: &mut Vec<u8>, entry: FileEntryRecord<'_>, packed: &[u8]) -> Result<()> {
-    write_file_header(out, entry)?;
-    out.extend_from_slice(packed);
-    Ok(())
-}
-
 fn write_file_header(out: &mut Vec<u8>, entry: FileEntryRecord<'_>) -> Result<()> {
     let head_size = FILE_HEAD_BASE_SIZE + entry.name.len() + entry.extra.len();
     let head_size = u16::try_from(head_size)
@@ -2391,7 +2385,9 @@ fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
         let mut out = Vec::new();
         write_main_header_with_flags(&mut out, entry.features, None, MHD_VOLUME)?;
         let checksum_data = if split_after { *chunk } else { entry.unpacked };
-        write_file_entry(
+        // Both public callers validate the 255-byte name limit and forbid
+        // comments, so this header is at most 21 + 255 bytes.
+        write_file_header(
             &mut out,
             FileEntryRecord {
                 name: entry.name,
@@ -2405,11 +2401,9 @@ fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
                 method: entry.method,
                 extra: &[],
             },
-            chunk,
         )
-        .map_err(|error| {
-            crate::write_stream::member_error(error, entry.name, "writing volume member")
-        })?;
+        .expect("validated legacy volume header fits the u16 size field");
+        out.extend_from_slice(chunk);
         entry.progress.report(WriteProgressEvent::VolumeFinished {
             volume_number: index + 1,
             total_volumes: Some(chunks.len()),
