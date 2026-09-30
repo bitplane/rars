@@ -2708,3 +2708,68 @@ fn parentless_output_path_uses_default_resources_and_publishes_readable_archives
         );
     }
 }
+
+#[cfg(test)]
+#[test]
+fn converted_redirections_charge_targets_and_preserve_them_in_output() {
+    let resources = WriterResources::default().with_max_memory_bytes(1 << 20);
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    builder
+        .add_unix_symlink(b"link".to_vec(), b"a".to_vec(), false, None, None)
+        .unwrap();
+    let short = builder.rar50_entries_with_resources(&resources).unwrap();
+    let short_charge = resources.managed_memory_in_use();
+    drop(short);
+    assert_eq!(resources.managed_memory_in_use(), 0);
+    let target = "destination-😀".as_bytes();
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    builder
+        .add_unix_symlink(b"link".to_vec(), target.to_vec(), false, None, None)
+        .unwrap();
+    let converted = builder.rar50_entries_with_resources(&resources).unwrap();
+    assert_eq!(
+        resources.managed_memory_in_use() - short_charge,
+        (target.len() - 1) as u64
+    );
+    assert_eq!(
+        converted.entries[0]
+            .redirection
+            .as_ref()
+            .unwrap()
+            .target_name,
+        target
+    );
+    drop(converted);
+    assert_eq!(resources.managed_memory_in_use(), 0);
+    let bytes = builder.to_bytes_with_resources(&resources, None).unwrap();
+    let archive = crate::ArchiveReader::read_owned(bytes).unwrap();
+    let member = archive.members().next().unwrap();
+    assert_eq!(member.unix_symlink().unwrap().target_name, target);
+    assert_eq!(resources.managed_memory_in_use(), 0);
+}
+
+#[cfg(all(test, not(all(target_arch = "wasm32", target_os = "unknown"))))]
+#[test]
+fn pending_archive_accepts_maximum_sequence_without_a_destination_parent() {
+    let destination = Path::new("");
+    assert!(destination.parent().is_none());
+    let expected = PathBuf::from(format!(
+        ".rars-writing-{}-{:016x}",
+        std::process::id(),
+        u64::MAX
+    ));
+    assert!(
+        !expected.exists(),
+        "unique maximum-sequence path is already occupied"
+    );
+    let resources = WriterResources::default().with_max_memory_bytes(1 << 20);
+    let (pending, file) =
+        PendingArchive::with_sequence(destination, &resources, || u64::MAX).unwrap();
+    assert_eq!(pending.path.as_ref().unwrap(), &expected);
+    assert!(expected.is_file());
+    assert!(expected.as_os_str().len() <= 41);
+    drop(file);
+    drop(pending);
+    assert!(!expected.exists());
+    assert_eq!(resources.managed_memory_in_use(), 0);
+}
