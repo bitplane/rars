@@ -2118,6 +2118,119 @@ pub(crate) fn resolve_password_args(args: &PasswordArgs) -> CliResult<Option<Pas
 #[cfg(test)]
 mod tests {
     #[test]
+    fn info_accepts_independent_archive_metadata_fields() {
+        // The reader admits independent NAME and TIME bits, including neither.
+        // Build physical headers because the writer deliberately requires a
+        // creation time whenever it emits a name.
+        fn header(bytes: &mut Vec<u8>, body: &[u8]) {
+            assert!(body.len() < 128);
+            let mut encoded = vec![body.len() as u8];
+            encoded.extend_from_slice(body);
+            bytes.extend_from_slice(&rars::crc32::crc32(&encoded).to_le_bytes());
+            bytes.extend_from_slice(&encoded);
+        }
+        for flags in [0u8, 1, 2, 3] {
+            let mut record = vec![2, flags]; // metadata record type, field bits
+            if flags & 1 != 0 {
+                record.extend_from_slice(b"\x08name.rar");
+            }
+            if flags & 2 != 0 {
+                record.extend_from_slice(&0x01dcd60e662d7a32u64.to_le_bytes());
+            }
+            let mut extra = vec![record.len() as u8];
+            extra.extend_from_slice(&record);
+            let mut main = vec![1, 1, extra.len() as u8, 0]; // main, extras, size, archive flags
+            main.extend_from_slice(&extra);
+            let mut bytes = b"Rar!\x1a\x07\x01\x00".to_vec();
+            header(&mut bytes, &main);
+            header(&mut bytes, &[5, 0, 0]); // end header with no flags
+            let archive = rars::rar50::Archive::parse(&bytes).unwrap();
+            let metadata = archive.main.archive_metadata().unwrap();
+            assert_eq!(
+                metadata.name.as_deref(),
+                (flags & 1 != 0).then_some(b"name.rar".as_slice())
+            );
+            assert_eq!(metadata.creation_time.is_some(), flags & 2 != 0);
+            super::info_rar50_terse("metadata.rar", &archive, super::ArchiveReadOptions::new())
+                .unwrap();
+            super::info_rar50_verbose("metadata.rar", &archive, super::ArchiveReadOptions::new())
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn verbose_info_reports_lazy_comment_and_compression_errors() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../rars/tests/fixtures");
+        let mut legacy = rars::rar13::Archive::parse_path(root.join("rar13/FCOMM.RAR")).unwrap();
+        let entry = legacy
+            .entries
+            .iter_mut()
+            .find(|entry| entry.has_file_comment())
+            .unwrap();
+        entry.extra.clear();
+        let error =
+            super::info_rar13_verbose("broken13.rar", &legacy, super::ArchiveReadOptions::new())
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("failed to decode file comment"));
+        assert!(error.contains("broken13.rar"));
+
+        let mut authenticity =
+            rars::rar13::Archive::parse_path(root.join("rar13/rar140_av/rar140_av_patched.rar"))
+                .unwrap();
+        authenticity.main.extra.clear();
+        let error = super::info_rar13_verbose(
+            "broken-av.rar",
+            &authenticity,
+            super::ArchiveReadOptions::new(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("failed to parse authenticity verification"));
+        assert!(error.contains("broken-av.rar"));
+
+        let mut legacy15 =
+            rars::rar15_40::Archive::parse_path(root.join("rar15_40/rars_generated/comments.rar"))
+                .unwrap();
+        let file = legacy15
+            .blocks
+            .iter_mut()
+            .find_map(|block| match block {
+                rars::rar15_40::Block::File(file) if file.has_file_comment() => Some(file),
+                _ => None,
+            })
+            .unwrap();
+        file.file_comment.truncate(1);
+        let error = super::info_rar15_40_verbose(
+            "broken15.rar",
+            &legacy15,
+            super::ArchiveReadOptions::new(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("failed to decode file comment"));
+        assert!(error.contains("broken15.rar"));
+
+        let mut modern =
+            rars::rar50::Archive::parse_path(root.join("rar50/with_all_services.rar")).unwrap();
+        let file = modern
+            .blocks
+            .iter_mut()
+            .find_map(|block| match block {
+                rars::rar50::Block::File(file) => Some(file),
+                _ => None,
+            })
+            .unwrap();
+        file.compression_info = u64::MAX;
+        let error =
+            super::info_rar50_verbose("broken50.rar", &modern, super::ArchiveReadOptions::new())
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("failed to decode RAR 5 compression info"));
+        assert!(error.contains("hello.txt"));
+    }
+
+    #[test]
     fn volume_publication_reports_backup_cleanup_failure_after_success() {
         let root = crate::scratch::case("volume-backup-cleanup-failure");
         let first = root.join("archive.rar");
