@@ -630,11 +630,11 @@ impl RarFile {
             .find(|(_, member)| member.meta.name == name)
             .ok_or_else(|| PyKeyError::new_err("member not found"))?;
         if member.is_legacy_unix_symlink() {
-            return self
+            return Ok(self
                 .archive
                 .legacy_symlink_target_at(index, self.password.as_deref())
                 .map_err(map_error)?
-                .ok_or_else(|| PyKeyError::new_err("member not found"));
+                .expect("legacy symlink predicate checked above"));
         }
         member
             .supported_redirection()
@@ -903,23 +903,19 @@ fn classify_builder_error(error: &rars_rs::Error) -> BuilderRefusal {
 }
 
 fn map_builder_error(error: rars_rs::Error) -> PyErr {
-    let refusal = classify_builder_error(&error);
-    if refusal == BuilderRefusal::Other {
-        return map_error(error);
-    }
-    let Some((name, _)) = error.entry_context() else {
-        return map_error(error);
-    };
-    let name = String::from_utf8_lossy(name).into_owned();
-    match refusal {
-        BuilderRefusal::NoSuchEntry => PyKeyError::new_err(name),
-        BuilderRefusal::DuplicateName => {
-            PyValueError::new_err(format!("duplicate archive entry name: {name}"))
+    match (classify_builder_error(&error), error.entry_context()) {
+        (BuilderRefusal::NoSuchEntry, Some((name, _))) => {
+            PyKeyError::new_err(String::from_utf8_lossy(name).into_owned())
         }
-        BuilderRefusal::Symlink => PyValueError::new_err(format!(
-            "input '{name}' is a symlink; refusing to follow it"
+        (BuilderRefusal::DuplicateName, Some((name, _))) => PyValueError::new_err(format!(
+            "duplicate archive entry name: {}",
+            String::from_utf8_lossy(name)
         )),
-        BuilderRefusal::Other => map_error(error),
+        (BuilderRefusal::Symlink, Some((name, _))) => PyValueError::new_err(format!(
+            "input '{}' is a symlink; refusing to follow it",
+            String::from_utf8_lossy(name)
+        )),
+        _ => map_error(error),
     }
 }
 
@@ -1512,11 +1508,6 @@ impl RarBuilder {
             + Send,
     {
         let progress = python_progress(callback, cancellation)?;
-        if self.rewrite.is_some() && self.resources.max_memory_bytes().is_some() {
-            return Err(UnsupportedRarFeature::new_err(
-                "aggregate writer memory limits are not supported for rewrite staging",
-            ));
-        }
         let rewrite = self.rewrite.clone();
         let worker = progress.clone();
         let result = py.detach(move || {
@@ -1752,7 +1743,6 @@ fn py_paths(value: &Bound<'_, PyAny>) -> PyResult<Vec<PathBuf>> {
 fn py_password(value: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Vec<u8>>> {
     match value {
         None => Ok(None),
-        Some(value) if value.is_none() => Ok(None),
         Some(value) => {
             if let Ok(bytes) = value.extract::<Vec<u8>>() {
                 Ok(Some(bytes))
@@ -1766,7 +1756,6 @@ fn py_password(value: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Vec<u8>>> {
 fn py_optional_bytes(value: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Vec<u8>>> {
     match value {
         None => Ok(None),
-        Some(value) if value.is_none() => Ok(None),
         Some(value) => {
             if let Ok(bytes) = value.extract::<Vec<u8>>() {
                 Ok(Some(bytes))
@@ -1814,9 +1803,11 @@ struct DeferredExtractedFile {
 impl DeferredExtractedFile {
     fn open(&mut self) -> io::Result<&mut fs::File> {
         if self.file.is_none() {
-            if let Some(parent) = self.path.parent() {
-                fs::create_dir_all(parent)?;
-            }
+            fs::create_dir_all(
+                self.path
+                    .parent()
+                    .expect("checked output path has a file name"),
+            )?;
             let mut options = fs::OpenOptions::new();
             options.write(true);
             if self.overwrite {
@@ -1879,9 +1870,7 @@ fn extract_archive<S: Selection>(
                 written.lock().expect("written lock poisoned").push(path);
                 return Ok(Box::new(io::sink()) as Box<dyn Write>);
             }
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
+            fs::create_dir_all(path.parent().expect("checked output path has a file name"))?;
             let mut options = fs::OpenOptions::new();
             options.write(true);
             if overwrite {
@@ -2022,9 +2011,7 @@ fn extract_volumes_archive(
                 written.lock().expect("written lock poisoned").push(path);
                 return Ok(Box::new(io::sink()) as Box<dyn Write>);
             }
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
+            fs::create_dir_all(path.parent().expect("checked output path has a file name"))?;
             let mut options = fs::OpenOptions::new();
             options.write(true);
             if overwrite {
@@ -2168,10 +2155,8 @@ fn checked_output_path(
     };
     let rel = output_relative_path(&name, !rar50)?;
     let mut out_path = out_dir.to_path_buf();
-    for component in rel.components() {
-        let Component::Normal(part) = component else {
-            return Err(rars_rs::Error::UnsafePath("unsafe archive path"));
-        };
+    // output_relative_path constructed this exclusively from normal components.
+    for part in rel.iter() {
         out_path.push(part);
         if fs::symlink_metadata(&out_path)
             .map(|metadata| metadata.file_type().is_symlink())
@@ -2444,6 +2429,38 @@ mod tests {
                 .is_instance_of::<pyo3::exceptions::PyZeroDivisionError>(py));
             assert!(progress.take_error().is_none());
         });
+    }
+
+    #[test]
+    fn deferred_sink_flush_materializes_empty_files_and_reuses_open_file() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!(
+                "python-deferred-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("nested/file");
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let file = std::rc::Rc::new(std::cell::RefCell::new(DeferredExtractedFile {
+            path: path.clone(),
+            overwrite: false,
+            file: None,
+            written: written.clone(),
+        }));
+        let mut sink = DeferredExtractedSink(file);
+        sink.flush().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"");
+        sink.write_all(b"payload").unwrap();
+        sink.flush().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"payload");
+        assert_eq!(*written.lock().unwrap(), vec![path]);
+        drop(sink);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -248,3 +248,87 @@ def test_conversion_refuses_legacy_special_types(host, attributes):
     archive.testrar()
     with pytest.raises(rars.UnsupportedRarFeature, match="special entry"):
         rars.RarBuilder.from_archive(archive, preserve=False)
+
+
+def test_modern_dos_backslash_name_uses_portable_destination(tmp_path):
+    from test_extract_guards import hostile_archive
+
+    archive = rars.RarFile.from_bytes(hostile_archive(b"one\\two.txt"))
+    archive.testrar()
+    archive.extractall(tmp_path)
+    assert (tmp_path / "one_two.txt").read_bytes() == b"owned\n"
+
+
+def test_selected_extraction_skips_redirection_before_later_file(tmp_path):
+    builder = rars.RarBuilder(store=True)
+    builder.add_unix_symlink("link", "target")
+    builder.add_bytes(b"payload", "selected")
+    archive = rars.RarFile.from_bytes(builder.to_bytes())
+    archive.extractall(tmp_path, members=["selected"])
+    assert not (tmp_path / "link").exists()
+    assert (tmp_path / "selected").read_bytes() == b"payload"
+
+
+def test_explicit_none_password_and_comment_arguments_remain_optional():
+    builder = rars.RarBuilder(store=True, password=None, comment=None)
+    builder.add_bytes(b"payload", "file.txt")
+    builder.set_file_comment("file.txt", b"comment")
+    builder.set_file_comment("file.txt", None)
+    archive = rars.RarFile.from_bytes(builder.to_bytes(), password=None)
+    assert archive.comment is None
+    assert archive.getcomment("file.txt", pwd=None) is None
+    assert archive.read("file.txt", pwd=None) == b"payload"
+
+
+def test_conversion_refuses_unknown_redirection_kind():
+    import zlib
+    from test_extract_guards import _headers, _read_vint
+
+    builder = rars.RarBuilder(store=True)
+    builder.add_unix_symlink("link", "target")
+    data = bytearray(builder.to_bytes())
+    changed = False
+    for crc_at, body_at, body_end in _headers(data):
+        _, cursor = _read_vint(data, body_at)
+        kind, cursor = _read_vint(data, cursor)
+        flags, cursor = _read_vint(data, cursor)
+        if kind != 2 or not flags & 1:
+            continue
+        extra_size, cursor = _read_vint(data, cursor)
+        cursor = body_end - extra_size
+        while cursor < body_end:
+            size, record_start = _read_vint(data, cursor)
+            tag, payload_start = _read_vint(data, record_start)
+            if tag == 5:
+                assert data[payload_start] == 1
+                data[payload_start] = 6
+                data[crc_at:crc_at + 4] = zlib.crc32(data[body_at:body_end]).to_bytes(4, "little")
+                changed = True
+                break
+            cursor = record_start + size
+    assert changed
+    archive = rars.RarFile.from_bytes(bytes(data))
+    assert archive.namelist() == ["link"]
+    with pytest.raises(rars.UnsupportedRarFeature, match="not a supported redirection"):
+        archive.readlink("link")
+    with pytest.raises(rars.UnsupportedRarFeature, match="special entry"):
+        rars.RarBuilder.from_archive(archive, preserve=False)
+
+
+def test_conversion_refuses_payload_on_legacy_directory():
+    import struct
+    import zlib
+    from test_rewrite_legacy import headers
+
+    builder = rars.RarBuilder(format="rar29", store=True)
+    builder.add_bytes(b"payload", "directory")
+    data = bytearray(builder.to_bytes())
+    offset, _, flags, size = next(h for h in headers(data) if h[1] == 0x74)
+    struct.pack_into("<H", data, offset + 3, flags | 0xe0)
+    struct.pack_into("<H", data, offset, zlib.crc32(data[offset + 2:offset + size]) & 0xffff)
+    archive = rars.RarFile.from_bytes(bytes(data))
+    info = archive.getinfo("directory")
+    assert info.is_dir()
+    assert info.file_size == 7
+    with pytest.raises(rars.UnsupportedRarFeature, match="special entry"):
+        rars.RarBuilder.from_archive(archive, preserve=False)
