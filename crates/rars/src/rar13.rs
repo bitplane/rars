@@ -2539,6 +2539,68 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_extraction_preserves_output_io_failures() {
+        struct FailingWriter;
+        impl std::io::Write for FailingWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "closed output",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let data = b"encrypted output failure".repeat(64);
+        let input = [FileEntry {
+            name: b"encrypted.bin",
+            data: &data,
+            file_time: 0,
+            file_attr: 0x20,
+            password: Some(b"pw"),
+            file_comment: None,
+        }];
+        let bytes = write_compressed_archive(&input, WriterOptions::default()).unwrap();
+        let archive = Archive::parse(&bytes).unwrap();
+        assert!(archive.entries[0].is_encrypted());
+        assert!(!archive.entries[0].is_stored());
+        let error = archive
+            .extract_to(Some(b"pw"), |_| Ok(Box::new(FailingWriter)))
+            .unwrap_err();
+        assert_eq!(error.kind(), crate::ErrorKind::Io);
+        assert!(error.to_string().contains("closed output"));
+    }
+
+    #[test]
+    fn volume_headers_accept_the_largest_legacy_name() {
+        let name = vec![b'N'; 255];
+        let payload = b"abcdef";
+        let volumes = write_stored_volumes(
+            StoredEntry {
+                name: &name,
+                data: payload,
+                file_time: 0,
+                file_attr: 0x20,
+                password: None,
+                file_comment: None,
+            },
+            WriterOptions::default(),
+            3,
+        )
+        .unwrap();
+        assert_eq!(volumes.len(), 2);
+        let archives: Vec<_> = volumes.iter().map(|v| Archive::parse(v).unwrap()).collect();
+        for archive in &archives {
+            assert_eq!(archive.entries[0].name, name);
+        }
+        assert_eq!(
+            collect_extract_volumes(&archives, None).unwrap()[0].data,
+            payload
+        );
+    }
+
+    #[test]
     fn reader_workspace_rar13_stored_archives_need_no_dictionary_allocation() {
         for password in [None, Some(&b"pw"[..])] {
             let input = [StoredEntry {
