@@ -2117,6 +2117,59 @@ pub(crate) fn resolve_password_args(args: &PasswordArgs) -> CliResult<Option<Pas
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn collection_extraction_preserves_fixture_redirections_and_unicode_names() {
+        let fixtures =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../rars/tests/fixtures");
+        let root = crate::scratch::case("collection-extract-redirections");
+        let archive =
+            rars::rar50::Archive::parse_path(fixtures.join("rar50/wild/symlink.rar")).unwrap();
+        let state = std::cell::RefCell::new(super::ExtractOutputState::new(
+            &root,
+            super::OverwritePolicy::Never,
+            rars::ArchiveFamily::Rar50Plus,
+        ));
+        super::extract_volume_archives(
+            &[super::DetectedArchive::Rar50Plus(archive)],
+            super::ArchiveReadOptions::new(),
+            &state,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_link(root.join("symlink.txt")).unwrap(),
+            std::path::PathBuf::from("file.txt")
+        );
+        assert_eq!(
+            std::fs::read_link(root.join("dirlink")).unwrap(),
+            std::path::PathBuf::from("dir")
+        );
+        assert!(root.join("file.txt").is_file());
+
+        let root = crate::scratch::case("collection-extract-unicode");
+        let archive = rars::rar15_40::Archive::parse_path(
+            fixtures.join("rar15_40/encrypted/rar4_junrar_file_content_encrypted_unicode.rar"),
+        )
+        .unwrap();
+        let state = std::cell::RefCell::new(super::ExtractOutputState::new(
+            &root,
+            super::OverwritePolicy::Never,
+            rars::ArchiveFamily::Rar15To40,
+        ));
+        let mut options = super::ArchiveReadOptions::with_optional_password(Some(b"test"));
+        options.legacy_name_encoding = Some(rars::filename::LegacyNameEncoding::Cp850);
+        super::extract_volume_archives(
+            &[super::DetectedArchive::Rar15To40(archive)],
+            options,
+            &state,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(root.join("新建文本文档.txt")).unwrap(),
+            b"aaaaaaaaaa"
+        );
+    }
+
     #[test]
     fn repeated_worker_configuration_reports_the_global_pool_error() {
         // Other tests may have initialized Rayon already. Either way, a second
