@@ -1858,16 +1858,7 @@ fn encode_member<'a>(
     } else {
         encode_verified_rar15_payload_with_progress(&data, encode_options, &mut advance)?
     };
-    let stored = match &packed {
-        Some(packed) => {
-            crate::write_plan::StoreFallback::new().applies(solid, data.len(), packed.len())
-        }
-        None => true,
-    };
-    let (packed, method) = match packed {
-        Some(packed) if !stored => (packed, METHOD_BEST),
-        _ => (data.into_owned(), METHOD_STORE),
-    };
+    let (packed, method) = select_verified_payload(data, packed, solid);
     Ok(EncodedMember {
         payload: MemberPayload::Packed(packed),
         method,
@@ -2051,19 +2042,13 @@ pub fn write_compressed_volumes_with_progress(
     );
     let mut last = 0usize;
     let mut advance = |position: usize| advance_rar15_attempt(&mut last, &work, position);
-    let mut packed =
+    let packed =
         encode_verified_rar15_payload_with_progress(entry.data, encode_options, &mut advance)
             .map_err(|error| {
                 crate::write_stream::member_error(error, entry.name, "compressing volume member")
-            })?
-            .unwrap_or_else(|| entry.data.to_vec());
-    let method =
-        if crate::write_plan::StoreFallback::new().applies(false, entry.data.len(), packed.len()) {
-            packed = entry.data.to_vec();
-            METHOD_STORE
-        } else {
-            METHOD_BEST
-        };
+            })?;
+    let (packed, method) =
+        select_verified_payload(std::borrow::Cow::Borrowed(entry.data), packed, false);
     let result = write_split_volumes(SplitVolumeRecord {
         name: entry.name,
         unpacked: entry.data,
@@ -2207,6 +2192,21 @@ fn advance_rar15_attempt(last: &mut usize, work: &WorkTracker<'_>, position: usi
     let delta = position.saturating_sub(*last);
     *last = position;
     work.advance(delta as u64)
+}
+
+fn select_verified_payload(
+    data: std::borrow::Cow<'_, [u8]>,
+    packed: Option<Vec<u8>>,
+    solid: bool,
+) -> (Vec<u8>, u8) {
+    match packed {
+        Some(packed)
+            if !crate::write_plan::StoreFallback::new().applies(solid, data.len(), packed.len()) =>
+        {
+            (packed, METHOD_BEST)
+        }
+        _ => (data.into_owned(), METHOD_STORE),
+    }
 }
 
 fn encode_verified_rar15_payload_with_progress(
@@ -4688,6 +4688,32 @@ mod tests {
     }
 
     #[test]
+    fn verified_payload_selection_preserves_storage_and_solid_history() {
+        let data = b"original payload";
+        let (payload, method) =
+            select_verified_payload(std::borrow::Cow::Borrowed(data), Some(vec![1, 2]), false);
+        assert_eq!(payload, [1, 2]);
+        assert_eq!(method, METHOD_BEST);
+
+        let owned = data.to_vec();
+        let allocation = owned.as_ptr();
+        let (payload, method) = select_verified_payload(
+            std::borrow::Cow::Owned(owned),
+            Some(vec![0; data.len() + 1]),
+            false,
+        );
+        assert_eq!(payload, data);
+        assert_eq!(payload.as_ptr(), allocation);
+        assert_eq!(method, METHOD_STORE);
+
+        let packed = vec![0; data.len() + 1];
+        let (payload, method) =
+            select_verified_payload(std::borrow::Cow::Borrowed(data), Some(packed.clone()), true);
+        assert_eq!(payload, packed);
+        assert_eq!(method, METHOD_BEST);
+    }
+
+    #[test]
     fn verified_encoder_stores_when_every_candidate_fails_verification() {
         let data = b"legacy archive payload";
         let mut attempts = 0;
@@ -4702,6 +4728,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(packed, None);
+        let (payload, method) =
+            select_verified_payload(std::borrow::Cow::Borrowed(data), packed, false);
+        assert_eq!(payload, data);
+        assert_eq!(method, METHOD_STORE);
         assert_eq!(
             attempts,
             rar15_encode_fallback_options(Rar15EncodeOptions::new()).len()
