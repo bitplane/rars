@@ -1,6 +1,4 @@
 use std::error::Error as StdError;
-use std::num::ParseIntError;
-use std::string::FromUtf8Error;
 
 pub(crate) type CliResult<T> = std::result::Result<T, CliError>;
 
@@ -74,14 +72,31 @@ impl From<std::io::Error> for CliError {
     }
 }
 
-impl From<ParseIntError> for CliError {
-    fn from(error: ParseIntError) -> Self {
-        Self::usage(error.to_string())
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl From<FromUtf8Error> for CliError {
-    fn from(error: FromUtf8Error) -> Self {
-        Self::general(error.to_string())
+    #[test]
+    fn exit_classes_preserve_messages_and_standard_error_behavior() {
+        for (error, code) in [
+            (CliError::general("operation failed"), 1),
+            (CliError::usage("invalid arguments"), 2),
+            (CliError::password("password required"), 3),
+        ] {
+            assert_eq!(error.exit_code(), code);
+            assert_eq!(format!("{error}"), error.message);
+            assert!(StdError::source(&error).is_none());
+        }
+        for error in [
+            CliError::from("message"),
+            CliError::from(String::from("message")),
+        ] {
+            assert_eq!(error.exit_code(), 1);
+            assert_eq!(error.to_string(), "message");
+        }
+        let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission refused");
+        let error = CliError::from(io);
+        assert_eq!(error.exit_code(), 1);
+        assert_eq!(error.to_string(), "permission refused");
     }
 }
