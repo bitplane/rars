@@ -2165,19 +2165,23 @@ fn encrypt_split_packed_data(
             Ok(None)
         }
         ArchiveVersion::Rar20 => {
-            let padded_len = checked_align16(data.len(), RAR15_ALIGN_OVERFLOW)?;
+            let padded_len = checked_align16(data.len(), RAR15_ALIGN_OVERFLOW)
+                .expect("byte vector length plus padding fits usize");
             data.resize(padded_len, 0);
-            Rar20Cipher::new(password).encrypt_in_place(data)?;
+            Rar20Cipher::new(password)
+                .encrypt_in_place(data)
+                .expect("padded legacy ciphertext is block aligned");
             Ok(None)
         }
         ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40 => {
             let salt = random_rar30_salt()?;
-            let padded_len = checked_align16(data.len(), RAR15_ALIGN_OVERFLOW)?;
+            let padded_len = checked_align16(data.len(), RAR15_ALIGN_OVERFLOW)
+                .expect("byte vector length plus padding fits usize");
             data.resize(padded_len, 0);
             Rar30Cipher::new(password, Some(salt))
                 .map_err(super::map_rar30_crypto_error)?
                 .encrypt_in_place(data)
-                .map_err(super::map_rar30_crypto_error)?;
+                .expect("padded legacy ciphertext is block aligned");
             Ok(Some(salt))
         }
         _ => Err(Error::UnsupportedVersion(target)),
@@ -2226,24 +2230,23 @@ fn encrypt_packed_data_with_progress(
             Ok(None)
         }
         ArchiveVersion::Rar20 => {
-            let padded_len = checked_align16(data.len(), RAR15_ALIGN_OVERFLOW)?;
+            let padded_len = checked_align16(data.len(), RAR15_ALIGN_OVERFLOW)
+                .expect("byte vector length plus padding fits usize");
             data.resize(padded_len, 0);
             let mut cipher = Rar20Cipher::new(password);
             for chunk in data.chunks_mut(64 * 1024) {
                 crate::write_progress::check_cancelled(progress)?;
-                cipher.encrypt_in_place(chunk)?;
+                cipher
+                    .encrypt_in_place(chunk)
+                    .expect("padded ciphertext and 64 KiB chunks are block aligned");
             }
             Ok(None)
         }
         ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40 => {
             let salt = random_rar30_salt()?;
-            let padded_len =
-                data.len()
-                    .checked_add(15)
-                    .map(|len| len & !15)
-                    .ok_or(Error::InvalidArgument(
-                        "RAR 3.x encrypted data size overflows",
-                    ))?;
+            // Byte vectors are bounded by isize::MAX, so adding 15 fits usize.
+            let padded_len = checked_align16(data.len(), RAR15_ALIGN_OVERFLOW)
+                .expect("byte vector length plus padding fits usize");
             data.resize(padded_len, 0);
             let mut cipher =
                 Rar30Cipher::new(password, Some(salt)).map_err(super::map_rar30_crypto_error)?;
@@ -2251,7 +2254,7 @@ fn encrypt_packed_data_with_progress(
                 crate::write_progress::check_cancelled(progress)?;
                 cipher
                     .encrypt_in_place(chunk)
-                    .map_err(super::map_rar30_crypto_error)?;
+                    .expect("padded ciphertext and 64 KiB chunks are block aligned");
             }
             Ok(Some(salt))
         }
