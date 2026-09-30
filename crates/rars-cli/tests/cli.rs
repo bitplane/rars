@@ -336,6 +336,69 @@ fn creates_legacy_volumes_with_explicit_compression_settings() {
 }
 
 #[test]
+fn info_reports_comment_output_limits_for_every_archive_family() {
+    for path in [
+        fixture("COMMENT.RAR"),
+        fixture_rar15_40("rar300/with_comment_rar300.rar"),
+        fixture_rar50("with_comment.rar"),
+    ] {
+        for verbose in [false, true] {
+            let mut command = rars();
+            command.args(["info", "--max-member-output-bytes", "0"]);
+            if verbose {
+                command.arg("--verbose");
+            }
+            let output = command.arg(&path).output().unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{}: {}",
+                path.display(),
+                stderr(&output)
+            );
+            let text = stderr(&output);
+            assert!(text.contains("failed to decode archive comment"), "{text}");
+            assert!(text.contains(&path.display().to_string()), "{text}");
+        }
+    }
+}
+
+#[test]
+fn add_refuses_header_encryption_without_password_and_stdout_volume_sets() {
+    let root = scratch("add-invalid-destinations");
+    let source = root.join("file.txt");
+    let archive = root.join("output.rar");
+    fs::write(&source, b"small payload").unwrap();
+    let no_password = rars()
+        .args(["add", "--format", "rar50", "--encrypt-headers"])
+        .arg(&archive)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert_eq!(no_password.status.code(), Some(2));
+    assert!(stderr(&no_password).contains("--encrypt-headers needs a --password"));
+    assert!(!archive.exists());
+    for destination in ["-", "/dev/stdout"] {
+        let output = rars()
+            .args([
+                "add",
+                "--format",
+                "rar50",
+                "--store",
+                "--volume-size",
+                "256",
+                destination,
+            ])
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(stderr(&output).contains("volume sets cannot be written to stdout"));
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
 fn test_verifies_rar15_40_stored_fixture() {
     let output = rars()
         .arg("test")
