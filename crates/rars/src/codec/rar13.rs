@@ -1209,12 +1209,15 @@ fn find_repeat_last_lz(
     last_dist: u32,
     last_length: u32,
 ) -> Option<RepeatLastLz> {
-    if last_dist == u32::MAX || last_dist == 0 || last_length == 0 {
+    if last_dist == u32::MAX {
         return None;
     }
-    let distance = usize::try_from(last_dist).ok()?;
-    let length = usize::try_from(last_length).ok()?;
-    if distance > pos || pos.checked_add(length)? > input.len() {
+    debug_assert!((1..=MAX_LONG_LZ_DISTANCE as u32).contains(&last_dist));
+    debug_assert!((2..=258).contains(&last_length));
+    debug_assert!(pos <= input.len());
+    let distance = last_dist as usize;
+    let length = last_length as usize;
+    if distance > pos || pos + length > input.len() {
         return None;
     }
     let matches = (0..length).all(|offset| input[pos + offset] == input[pos + offset - distance]);
@@ -1238,12 +1241,11 @@ fn find_old_dist_lz(
     };
     for short_code in 10..=13 {
         let distance = old_dist[(old_dist_ptr.wrapping_sub((short_code - 9) as usize)) & 3];
-        if distance == u32::MAX || distance == 0 {
+        if distance == u32::MAX {
             continue;
         }
-        let Ok(distance_usize) = usize::try_from(distance) else {
-            continue;
-        };
+        debug_assert!((1..=MAX_LONG_LZ_DISTANCE as u32).contains(&distance));
+        let distance_usize = distance as usize;
         if distance_usize > pos {
             continue;
         }
@@ -2291,6 +2293,125 @@ fn corr_huff(char_set: &mut [u16; 256], num_to_place: &mut [u8; 256]) {
 #[cfg(test)]
 mod tests {
     use crate::codec::Error;
+
+    #[test]
+    fn maximum_far_distance_zero_fills_then_reads_wrapped_solid_history() {
+        fn far_member(encoder: &mut super::Unpack15Encoder) -> Vec<u8> {
+            encoder.emit_flags_byte(0);
+            // Code 14 is distinct from code 1 only after the Buf60 toggle.
+            encoder.emit_short_lz_code(10);
+            super::emit_decode_num(&mut encoder.bits, 255, 2, super::DEC_L1, super::POS_L1);
+            encoder.emit_short_lz_code(14);
+            super::emit_decode_num(&mut encoder.bits, 0, 3, super::DEC_L2, super::POS_L2);
+            encoder.bits.write_bits(0x7fff, 15);
+            std::mem::take(&mut encoder.bits).finish()
+        }
+        let mut encoder = super::Unpack15Encoder::new();
+        let packed = far_member(&mut encoder);
+        let mut decoder = super::Unpack15::new();
+        assert_eq!(decoder.decode_member(&packed, 5, false).unwrap(), [0; 5]);
+        assert_eq!(decoder.state.last_dist, 0xffff);
+
+        let mut first = vec![0; 0x10000];
+        first[1..6].copy_from_slice(b"abcde");
+        let mut encoder = super::Unpack15Encoder::new();
+        let packed_first = encoder.encode_literals_only_member(&first);
+        let mut decoder = super::Unpack15::new();
+        assert_eq!(
+            decoder
+                .decode_member(&packed_first, first.len(), false)
+                .unwrap(),
+            first
+        );
+        assert_eq!(decoder.state.unp_ptr, 0);
+        assert_eq!(decoder.state.old_dist, [u32::MAX; 4]);
+        // The next decoding step observes the wrap before reading a match.
+        let mut unused_history = decoder.clone();
+        let mut unused_streaming = decoder.clone();
+        let mut old_encoder = encoder.clone_for_planning();
+        old_encoder.emit_flags_byte(0);
+        old_encoder.emit_short_lz_code(10);
+        super::emit_decode_num(&mut old_encoder.bits, 0, 2, super::DEC_L1, super::POS_L1);
+        let old_packed = std::mem::take(&mut old_encoder.bits).finish();
+        assert_eq!(
+            unused_history.decode_member(&old_packed, 4, true).unwrap(),
+            [0; 4]
+        );
+        assert!(unused_history.state.first_win_done);
+        assert_eq!(unused_history.state.last_dist, u32::MAX);
+        let mut zeros = Vec::new();
+        unused_streaming
+            .decode_member_from_reader(&mut old_packed.as_slice(), 4, true, &mut zeros)
+            .unwrap();
+        assert_eq!(zeros, [0; 4]);
+        let packed = far_member(&mut encoder);
+        let mut streaming = decoder.clone();
+        assert_eq!(decoder.decode_member(&packed, 5, true).unwrap(), b"abcde");
+        assert_eq!(decoder.state.last_dist, 0xffff);
+        assert!(decoder.state.first_win_done);
+        let mut output = Vec::new();
+        streaming
+            .decode_member_from_reader(&mut packed.as_slice(), 5, true, &mut output)
+            .unwrap();
+        assert_eq!(output, b"abcde");
+    }
+
+    #[test]
+    fn old_distance_finder_keeps_recent_entry_when_match_lengths_tie() {
+        let mut encoder = super::Unpack15Encoder::new();
+        for distance in 1..=4 {
+            encoder.remember_match(distance, 3);
+        }
+        let token = super::find_old_dist_lz(
+            &[0; 16],
+            8,
+            encoder.old_dist,
+            encoder.old_dist_ptr,
+            encoder.max_dist3,
+        )
+        .unwrap();
+        assert_eq!(
+            token,
+            super::OldDistLz {
+                distance: 4,
+                length: 8,
+                short_code: 10
+            }
+        );
+        for _ in 0..4 {
+            encoder.remember_match(4, 3);
+        }
+        assert_eq!(
+            super::find_old_dist_lz(
+                &[0; 16],
+                8,
+                encoder.old_dist,
+                encoder.old_dist_ptr,
+                encoder.max_dist3
+            ),
+            Some(token)
+        );
+    }
+
+    #[test]
+    fn repeat_and_old_finders_refuse_history_before_the_member_prefix() {
+        assert_eq!(super::find_repeat_last_lz(&[0; 8], 4, u32::MAX, 0), None);
+        assert_eq!(super::find_repeat_last_lz(&[0; 8], 4, 5, 3), None);
+        assert_eq!(super::find_repeat_last_lz(&[0; 8], 4, 4, 5), None);
+        assert_eq!(super::find_repeat_last_lz(b"abcdabce", 4, 4, 4), None);
+        assert_eq!(
+            super::find_repeat_last_lz(b"abcdabcd", 4, 4, 4),
+            Some(super::RepeatLastLz {
+                distance: 4,
+                length: 4
+            })
+        );
+        assert_eq!(
+            super::find_old_dist_lz(&[0; 8], 4, [u32::MAX; 4], 0, 0x2001),
+            None
+        );
+        assert_eq!(super::find_old_dist_lz(&[0; 8], 4, [5; 4], 0, 0x2001), None);
+    }
 
     #[test]
     fn long_distance_updates_preserve_every_high_byte_through_counter_wraps() {
