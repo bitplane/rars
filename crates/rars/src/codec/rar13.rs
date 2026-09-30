@@ -511,7 +511,7 @@ impl Unpack15Encoder {
                     self.emit_short_lz(short_lz);
                 }
                 EncodedToken::RepeatLast(repeat) => {
-                    self.emit_repeat_last(repeat)?;
+                    self.emit_repeat_last(repeat);
                 }
                 EncodedToken::OldDist(old_lz) => {
                     self.emit_old_dist_lz(old_lz)?;
@@ -696,12 +696,9 @@ impl Unpack15Encoder {
         self.remember_match(short_lz.distance, short_lz.length);
     }
 
-    fn emit_repeat_last(&mut self, repeat: RepeatLastLz) -> Result<()> {
-        if self.last_dist != repeat.distance || self.last_length != repeat.length {
-            return Err(Error::InvalidData(
-                "RAR 1.3 repeat-last state is not encodable",
-            ));
-        }
+    fn emit_repeat_last(&mut self, repeat: RepeatLastLz) {
+        debug_assert_eq!(self.last_dist, repeat.distance);
+        debug_assert_eq!(self.last_length, repeat.length);
         self.num_huf = 0;
         if self.l_count == 2 {
             self.bits.write_bits(1, 1);
@@ -709,7 +706,6 @@ impl Unpack15Encoder {
             self.emit_short_lz_code(9);
             self.l_count += 1;
         }
-        Ok(())
     }
 
     fn emit_old_dist_lz(&mut self, old_lz: OldDistLz) -> Result<()> {
@@ -725,11 +721,7 @@ impl Unpack15Encoder {
             .old_dist_ptr
             .wrapping_sub((old_lz.short_code - 9) as usize))
             & 3];
-        if expected_distance != old_lz.distance {
-            return Err(Error::InvalidData(
-                "RAR 1.3 old-distance state is not encodable",
-            ));
-        }
+        debug_assert_eq!(expected_distance, old_lz.distance);
         let length_code = old_dist_lz_length_code(
             old_lz.length,
             old_lz.distance,
@@ -2318,6 +2310,78 @@ fn corr_huff(char_set: &mut [u16; 256], num_to_place: &mut [u8; 256]) {
 #[cfg(test)]
 mod tests {
     use crate::codec::Error;
+
+    #[test]
+    fn planned_old_distance_and_repeat_tokens_replay_after_flag_updates() {
+        fn state(encoder: &super::Unpack15Encoder) -> (u32, u32, [u32; 4], usize, u32, u32, u32, u32) {
+            let s = encoder.lz_plan_state();
+            (
+                s.last_dist,
+                s.last_length,
+                s.old_dist,
+                s.old_dist_ptr,
+                s.max_dist3,
+                s.nlzb,
+                s.nhfb,
+                s.l_count,
+            )
+        }
+        for maximum in [0x2001, 0x7f00] {
+            let mut encoder = super::Unpack15Encoder::new();
+            encoder.max_dist3 = maximum;
+            for distance in 1..=4 {
+                encoder.emit_short_lz(super::ShortLz {
+                    distance,
+                    length: 3,
+                });
+            }
+            for code in 10..=13 {
+                for length in [3, 4, 256] {
+                    let distance =
+                        encoder.old_dist[(encoder.old_dist_ptr.wrapping_sub((code - 9) as usize)) & 3];
+                    let token = super::OldDistLz {
+                        distance,
+                        length,
+                        short_code: code,
+                    };
+                    assert!(encoder
+                        .token_bit_cost(
+                            super::MatchToken::OldDist(super::OldDistLz {
+                                length: 258,
+                                ..token
+                            }),
+                            encoder.lz_plan_state(),
+                        )
+                        .is_none());
+                    assert!(encoder
+                        .token_bit_cost(super::MatchToken::OldDist(token), encoder.lz_plan_state())
+                        .is_some());
+                    let mut planned = encoder.clone_for_planning();
+                    planned.emit_old_dist_lz(token).unwrap();
+                    // Real emission writes the flags table before replaying payloads.
+                    // Wrap its adaptive counter to check that this remains independent.
+                    for _ in 0..512 {
+                        encoder.emit_flags_byte(255);
+                    }
+                    encoder.emit_old_dist_lz(token).unwrap();
+                    assert_eq!(state(&encoder), state(&planned));
+                    for _ in 0..3 {
+                        let repeat = super::find_repeat_last_lz(
+                            &[0; 1024],
+                            512,
+                            encoder.last_dist,
+                            encoder.last_length,
+                        )
+                        .unwrap();
+                        planned.emit_repeat_last(repeat);
+                        encoder.emit_flags_byte(0);
+                        encoder.emit_repeat_last(repeat);
+                        assert_eq!(state(&encoder), state(&planned));
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn flags_and_short_distance_updates_preserve_complete_alphabets() {
