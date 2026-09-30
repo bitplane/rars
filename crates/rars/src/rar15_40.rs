@@ -423,10 +423,8 @@ impl FileHeader {
         }
         let head_size = block.head_size as usize;
         let header = parse_comment_header(&self.file_comment, block)?;
-        let packed = self
-            .file_comment
-            .get(COMMENT_HEADER_SIZE..head_size)
-            .ok_or(Error::TooShort)?;
+        // Block admission bounded head_size; comment admission requires >=13.
+        let packed = &self.file_comment[COMMENT_HEADER_SIZE..head_size];
         header.decode(packed).map(Some)
     }
 
@@ -916,10 +914,9 @@ impl Archive {
         let archive = &input[sig.offset..];
         // find_archive_start matched these exact marker bytes, including the
         // fixed MARK_HEAD type and seven-byte header length.
-        let marker = parse_block_header(archive, 0)?;
-
-        admit_plain_header(archive, marker.head_size as usize, &mut budget)?;
-        let main_block = parse_block_header(archive, marker.head_size as usize)?;
+        let marker_size = RAR15_SIGNATURE.len();
+        admit_plain_header(archive, marker_size, &mut budget)?;
+        let main_block = parse_block_header(archive, marker_size)?;
         if main_block.head_type != MAIN_HEAD {
             return Err(Error::InvalidHeader("RAR 1.5 main header is missing"));
         }
@@ -962,8 +959,7 @@ impl Archive {
                     let total = file_block_total_size(&block, total, file.pack_size)?;
                     let next = checked_block_next(&block, total, archive.len())?;
                     file.block.offset = block.offset;
-                    file.packed_range =
-                        packed_range(sig.offset, block.offset, total, file.pack_size)?;
+                    file.packed_range = packed_range(sig.offset, next, file.pack_size);
                     blocks.push(Block::File(file));
                     pos = next;
                 }
@@ -972,8 +968,7 @@ impl Archive {
                     let total = file_block_total_size(&block, total, file.pack_size)?;
                     let next = checked_block_next(&block, total, archive.len())?;
                     file.block.offset = block.offset;
-                    file.packed_range =
-                        packed_range(sig.offset, block.offset, total, file.pack_size)?;
+                    file.packed_range = packed_range(sig.offset, next, file.pack_size);
                     let kind = classify_new_sub(&file.name);
                     blocks.push(Block::NewSub(NewSubHeader { file, kind }));
                     pos = next;
@@ -1084,7 +1079,7 @@ impl Archive {
                     let next = checked_file_block_next(sfx_offset, &block, total, file_len)?;
                     file_header.block.offset = block.offset;
                     file_header.packed_range =
-                        packed_range(sfx_offset, block.offset, total, file_header.pack_size)?;
+                        packed_range(sfx_offset, next, file_header.pack_size);
                     blocks.push(Block::File(file_header));
                     pos = next;
                 }
@@ -1095,7 +1090,7 @@ impl Archive {
                     let next = checked_file_block_next(sfx_offset, &block, total, file_len)?;
                     file_header.block.offset = block.offset;
                     file_header.packed_range =
-                        packed_range(sfx_offset, block.offset, total, file_header.pack_size)?;
+                        packed_range(sfx_offset, next, file_header.pack_size);
                     let kind = classify_new_sub(&file_header.name);
                     blocks.push(Block::NewSub(NewSubHeader {
                         file: file_header,
@@ -1845,11 +1840,10 @@ fn comment_block_end(input: &[u8], start: usize, head_end: usize) -> Option<usiz
     if start + COMMENT_HEADER_SIZE > head_end {
         return None;
     }
-    let head_size = read_u16(input, start + 5).ok()? as usize;
-    let end = start.checked_add(head_size)?;
-    (input.get(start + 2) == Some(&COMM_HEAD)
-        && head_size >= COMMENT_HEADER_SIZE
-        && end <= head_end)
+    // Callers supply a complete u16-sized header and an in-header position.
+    let head_size = u16::from_le_bytes([input[start + 5], input[start + 6]]) as usize;
+    let end = start + head_size;
+    (input[start + 2] == COMM_HEAD && head_size >= COMMENT_HEADER_SIZE && end <= head_end)
         .then_some(end)
 }
 
@@ -2220,33 +2214,29 @@ where
     .into_iter()
     .enumerate()
     {
-        let bytes = truncate_repaired_rev3_volume(bytes)?;
+        let bytes = truncate_repaired_rev3_volume(bytes);
         write(index, &bytes)?;
     }
     Ok(())
 }
 
-fn truncate_repaired_rev3_volume(mut bytes: Vec<u8>) -> Result<Vec<u8>> {
+fn truncate_repaired_rev3_volume(mut bytes: Vec<u8>) -> Vec<u8> {
     let Ok(archive) = Archive::parse(&bytes) else {
-        return Ok(bytes);
+        return bytes;
     };
     let Some(end) = archive.blocks.iter().find_map(|block| match block {
         Block::End(end) => Some(end),
         _ => None,
     }) else {
-        return Ok(bytes);
+        return bytes;
     };
-    let end_pos = archive
-        .sfx_offset
-        .checked_add(end.offset)
-        .and_then(|offset| offset.checked_add(block_total_size(end).ok()?))
-        .ok_or(Error::InvalidHeader(
-            "RAR 3 repaired volume end offset overflows",
-        ))?;
+    // Successful parsing admitted this end block and its full physical extent.
+    let end_size = (u64::from(end.head_size) + end.add_size.unwrap_or(0)) as usize;
+    let end_pos = archive.sfx_offset + end.offset + end_size;
     if end_pos < bytes.len() && bytes[end_pos..].iter().all(|&byte| byte == 0) {
         bytes.truncate(end_pos);
     }
-    Ok(bytes)
+    bytes
 }
 
 struct EncryptedHeader {
@@ -2450,9 +2440,8 @@ fn parse_file_like_header(
         (pack_low, unp_low)
     };
 
-    let name_end = pos
-        .checked_add(name_size)
-        .ok_or(Error::InvalidHeader("RAR 1.5 file name size overflows"))?;
+    // Relative headers start at zero: base+LARGE prefix <=40, name is a u16.
+    let name_end = pos + name_size;
     if name_end > head_end {
         return Err(Error::InvalidHeader(
             "RAR 1.5 file name extends beyond header",
@@ -2463,15 +2452,14 @@ fn parse_file_like_header(
     pos = name_end;
 
     let salt = if block.flags & FHD_SALT != 0 {
-        let salt_end = pos
-            .checked_add(8)
-            .ok_or(Error::InvalidHeader("RAR 1.5 salt size overflows"))?;
+        // name_end was bounded by the complete u16-sized header above.
+        let salt_end = pos + 8;
         if salt_end > head_end {
             return Err(Error::InvalidHeader(
                 "RAR 1.5 salt extends beyond file header",
             ));
         }
-        let salt_bytes = input.get(pos..salt_end).ok_or(Error::TooShort)?;
+        let salt_bytes = &input[pos..salt_end];
         pos = salt_end;
         Some(
             salt_bytes
@@ -2638,11 +2626,12 @@ fn admit_plain_header(
     if !budget.is_limited() {
         return Ok(());
     }
-    let prefix = input.get(offset..).ok_or(Error::TooShort)?;
+    // Both parser call sites bound offset by the physical archive extent.
+    let prefix = &input[offset..];
     if prefix.len() < 7 {
         return Err(Error::TooShort);
     }
-    let size = read_u16(prefix, 5)? as usize;
+    let size = u16::from_le_bytes([prefix[5], prefix[6]]) as usize;
     if size < 7 {
         return Err(Error::InvalidHeader("RAR 1.5 block header is too short"));
     }
@@ -2864,22 +2853,11 @@ fn checked_file_block_next(
     Ok(next)
 }
 
-fn packed_range(
-    archive_offset: usize,
-    block_offset: usize,
-    total: usize,
-    pack_size: u64,
-) -> Result<Range<usize>> {
-    let pack_size = usize::try_from(pack_size)
-        .map_err(|_| Error::InvalidHeader("RAR 1.5 packed file size overflows usize"))?;
-    let block_end = archive_offset
-        .checked_add(block_offset)
-        .and_then(|start| start.checked_add(total))
-        .ok_or(Error::InvalidHeader("RAR 1.5 block size overflows usize"))?;
-    let block_start = block_end
-        .checked_sub(pack_size)
-        .ok_or(Error::InvalidHeader("RAR 1.5 block size overflows usize"))?;
-    Ok(block_start..block_end)
+/// Called only after full packed-size conversion and the next block extent have
+/// been admitted. The checked total includes the payload, so subtraction fits.
+fn packed_range(archive_offset: usize, next: usize, pack_size: u64) -> Range<usize> {
+    let block_end = archive_offset + next;
+    block_end - pack_size as usize..block_end
 }
 
 #[cfg(test)]
@@ -4233,14 +4211,14 @@ mod tests {
             .next()
             .is_some());
         assert_eq!(
-            truncate_repaired_rev3_volume(without_end.clone()).unwrap(),
+            truncate_repaired_rev3_volume(without_end.clone()),
             without_end
         );
 
         without_end = bytes;
         without_end.extend_from_slice(b"not padding");
         assert_eq!(
-            truncate_repaired_rev3_volume(without_end.clone()).unwrap(),
+            truncate_repaired_rev3_volume(without_end.clone()),
             without_end
         );
     }
