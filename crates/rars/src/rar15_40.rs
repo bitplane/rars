@@ -2885,6 +2885,68 @@ mod tests {
     use super::*;
     use crate::io_util::read_u16;
 
+    #[test]
+    fn nested_comment_crc_failure_survives_both_parser_adapters() {
+        let mut bytes = RAR15_SIGNATURE.to_vec();
+        test_write_main_header(&mut bytes, MHD_COMMENT);
+        let nested = bytes.len();
+        bytes.extend_from_slice(&comment_block(b"note"));
+        let main = RAR15_SIGNATURE.len();
+        let size = (bytes.len() - main) as u16;
+        bytes[main + 5..main + 7].copy_from_slice(&size.to_le_bytes());
+        test_write_header_crc(&mut bytes[..main + MAIN_HEADER_SIZE], main);
+        for corrupt in [false, true] {
+            let mut input = bytes.clone();
+            if corrupt {
+                input[nested] ^= 1;
+            }
+            let memory = Archive::parse(&input);
+            let seekable = Archive::parse_seekable(
+                std::io::Cursor::new(&input),
+                input.len() as u64,
+                0,
+                ArchiveSource::Memory(Arc::from(input.clone())),
+                crate::ArchiveReadOptions::new(),
+            );
+            if corrupt {
+                assert!(matches!(memory, Err(Error::CrcMismatch { .. })));
+                assert!(matches!(seekable, Err(Error::CrcMismatch { .. })));
+            } else {
+                for archive in [memory.unwrap(), seekable.unwrap()] {
+                    assert_eq!(
+                        archive.archive_comment().unwrap().as_deref(),
+                        Some(&b"note"[..])
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn edited_archive_comment_range_preserves_source_refusal() {
+        let mut builder = crate::Builder::new(ArchiveVersion::Rar15)
+            .store(true)
+            .comment(Some(b"note".to_vec()));
+        builder
+            .add_bytes(b"entry".to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+        let mut archive = Archive::parse_owned(builder.to_bytes().unwrap()).unwrap();
+        assert_eq!(
+            archive.archive_comment().unwrap().as_deref(),
+            Some(&b"note"[..])
+        );
+        let comment = archive
+            .blocks
+            .iter_mut()
+            .find_map(|block| match block {
+                Block::Comment(comment) => Some(comment),
+                _ => None,
+            })
+            .unwrap();
+        comment.packed_range = usize::MAX..usize::MAX;
+        assert!(matches!(archive.archive_comment(), Err(Error::TooShort)));
+    }
+
     #[cfg(target_pointer_width = "32")]
     #[test]
     fn seekable_main_offset_above_native_address_size_is_refused() {
@@ -3250,34 +3312,36 @@ mod tests {
 
     #[test]
     fn incomplete_large_size_fields_have_matching_parser_refusals() {
-        for size in 32u16..=40 {
-            let mut bytes = RAR15_SIGNATURE.to_vec();
-            test_write_main_header(&mut bytes, 0);
-            let start = bytes.len();
-            let mut header = vec![0; usize::from(size)];
-            header[2] = FILE_HEAD;
-            header[3..5].copy_from_slice(&(LONG_BLOCK | FHD_LARGE).to_le_bytes());
-            header[5..7].copy_from_slice(&size.to_le_bytes());
-            header[24] = 29;
-            header[25] = 0x30;
-            bytes.extend_from_slice(&header);
-            test_write_header_crc(&mut bytes, start);
-            let memory = Archive::parse(&bytes);
-            let seekable = Archive::parse_seekable(
-                std::io::Cursor::new(&bytes),
-                bytes.len() as u64,
-                0,
-                ArchiveSource::Memory(Arc::from(bytes.clone())),
-                crate::ArchiveReadOptions::new(),
-            );
-            if size < 40 {
-                assert!(matches!(memory, Err(Error::TooShort)), "memory size {size}");
-                assert!(
-                    matches!(seekable, Err(Error::TooShort)),
-                    "seekable size {size}"
+        for head_type in [FILE_HEAD, NEWSUB_HEAD] {
+            for size in 32u16..=40 {
+                let mut bytes = RAR15_SIGNATURE.to_vec();
+                test_write_main_header(&mut bytes, 0);
+                let start = bytes.len();
+                let mut header = vec![0; usize::from(size)];
+                header[2] = head_type;
+                header[3..5].copy_from_slice(&(LONG_BLOCK | FHD_LARGE).to_le_bytes());
+                header[5..7].copy_from_slice(&size.to_le_bytes());
+                header[24] = 29;
+                header[25] = 0x30;
+                bytes.extend_from_slice(&header);
+                test_write_header_crc(&mut bytes, start);
+                let memory = Archive::parse(&bytes);
+                let seekable = Archive::parse_seekable(
+                    std::io::Cursor::new(&bytes),
+                    bytes.len() as u64,
+                    0,
+                    ArchiveSource::Memory(Arc::from(bytes.clone())),
+                    crate::ArchiveReadOptions::new(),
                 );
-            } else {
-                assert_eq!(memory.unwrap().blocks, seekable.unwrap().blocks);
+                if size < 40 {
+                    assert!(matches!(memory, Err(Error::TooShort)), "memory size {size}");
+                    assert!(
+                        matches!(seekable, Err(Error::TooShort)),
+                        "seekable size {size}"
+                    );
+                } else {
+                    assert_eq!(memory.unwrap().blocks, seekable.unwrap().blocks);
+                }
             }
         }
     }
