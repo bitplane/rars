@@ -2895,6 +2895,176 @@ mod tests {
     use crate::io_util::read_u16;
 
     #[test]
+    fn declared_payload_extents_are_checked_for_each_block_kind() {
+        for head_type in [
+            FILE_HEAD,
+            NEWSUB_HEAD,
+            COMM_HEAD,
+            PROTECT_HEAD,
+            ENDARC_HEAD,
+            0x7e,
+        ] {
+            let size: u16 = match head_type {
+                FILE_HEAD | NEWSUB_HEAD => 33,
+                PROTECT_HEAD => 26,
+                COMM_HEAD => 13,
+                _ => 11,
+            };
+            let mut header = vec![0; usize::from(size)];
+            header[2] = head_type;
+            header[3..5].copy_from_slice(&LONG_BLOCK.to_le_bytes());
+            header[5..7].copy_from_slice(&size.to_le_bytes());
+            header[7..11].copy_from_slice(&4u32.to_le_bytes());
+            if matches!(head_type, FILE_HEAD | NEWSUB_HEAD) {
+                header[24] = 29;
+                header[25] = 0x30;
+                header[26..28].copy_from_slice(&1u16.to_le_bytes());
+                header[32] = b'x';
+            } else if head_type == PROTECT_HEAD {
+                header[14..18].copy_from_slice(&2u32.to_le_bytes());
+                header[18..26].copy_from_slice(b"Protect!");
+            }
+            test_write_header_crc(&mut header, 0);
+            for available in 0..=4 {
+                let mut bytes = RAR15_SIGNATURE.to_vec();
+                test_write_main_header(&mut bytes, 0);
+                bytes.extend_from_slice(&header);
+                bytes.resize(bytes.len() + available, 0);
+                for result in [
+                    Archive::parse(&bytes),
+                    Archive::parse_seekable(
+                        std::io::Cursor::new(&bytes),
+                        bytes.len() as u64,
+                        0,
+                        ArchiveSource::Memory(Arc::from(bytes.clone())),
+                        crate::ArchiveReadOptions::new(),
+                    ),
+                ] {
+                    if available < 4 {
+                        assert!(
+                            matches!(result, Err(Error::TooShort)),
+                            "type {head_type:x}, extent {available}: {result:?}"
+                        );
+                    } else {
+                        assert_eq!(result.unwrap().blocks.len(), 1);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn large_file_totals_refuse_relative_and_encrypted_prefix_overflow() {
+        for head_type in [FILE_HEAD, NEWSUB_HEAD] {
+            for encrypted in [false, true] {
+                let pack_size = u64::MAX - 41;
+                let mut header = vec![0; 41];
+                header[2] = head_type;
+                header[3..5].copy_from_slice(&(LONG_BLOCK | FHD_LARGE).to_le_bytes());
+                header[5..7].copy_from_slice(&41u16.to_le_bytes());
+                header[7..11].copy_from_slice(&(pack_size as u32).to_le_bytes());
+                header[24] = 29;
+                header[25] = 0x30;
+                header[26..28].copy_from_slice(&1u16.to_le_bytes());
+                header[32..36].copy_from_slice(&((pack_size >> 32) as u32).to_le_bytes());
+                header[40] = b'x';
+                test_write_header_crc(&mut header, 0);
+                let mut bytes = RAR15_SIGNATURE.to_vec();
+                test_write_main_header(&mut bytes, if encrypted { MHD_PASSWORD } else { 0 });
+                if encrypted {
+                    header.resize(48, 0);
+                    crate::crypto::rar30::Rar30Cipher::new(b"pw", Some([0; 8]))
+                        .unwrap()
+                        .encrypt_in_place(&mut header)
+                        .unwrap();
+                    bytes.extend_from_slice(&[0; 8]);
+                }
+                bytes.extend_from_slice(&header);
+                let options = crate::ArchiveReadOptions::with_password(b"pw");
+                for result in [
+                    Archive::parse_with_options(&bytes, options),
+                    Archive::parse_seekable(
+                        std::io::Cursor::new(&bytes),
+                        bytes.len() as u64,
+                        0,
+                        ArchiveSource::Memory(Arc::from(bytes.clone())),
+                        options,
+                    ),
+                ] {
+                    // On 64-bit, plain relative FILE size fits exactly, but the
+                    // containing archive offset (or encrypted physical prefix) does not.
+                    let expected = if usize::BITS == 32 && !encrypted {
+                        "RAR 1.5 packed file size overflows usize"
+                    } else {
+                        "RAR 1.5 block size overflows usize"
+                    };
+                    assert!(
+                        matches!(result, Err(Error::InvalidHeader(message)) if message == expected),
+                        "{result:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_source_failures_are_preserved_after_successful_parsing() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct FailingSource {
+            bytes: std::io::Cursor<Vec<u8>>,
+            fail: Arc<AtomicBool>,
+        }
+        impl Read for FailingSource {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                if self.fail.load(Ordering::Relaxed) {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "recovery source denied",
+                    ))
+                } else {
+                    self.bytes.read(bytes)
+                }
+            }
+        }
+        impl std::io::Seek for FailingSource {
+            fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
+                self.bytes.seek(from)
+            }
+        }
+        for bytes in [
+            &include_bytes!("../tests/fixtures/rar15_40/rar250_protect_head_rr1.rar")[..],
+            &include_bytes!("../tests/fixtures/rar15_40/rar300/with_recovery_rar300.rar")[..],
+        ] {
+            let fail = Arc::new(AtomicBool::new(false));
+            let source = crate::source::ReaderSource::new(FailingSource {
+                bytes: std::io::Cursor::new(bytes.to_vec()),
+                fail: fail.clone(),
+            })
+            .unwrap();
+            let archive = Archive::parse_seekable(
+                source.cursor(),
+                bytes.len() as u64,
+                0,
+                ArchiveSource::Reader(source),
+                crate::ArchiveReadOptions::new(),
+            )
+            .unwrap();
+            fail.store(true, Ordering::Relaxed);
+            assert!(
+                matches!(archive.repair_protect_head(), Err(Error::Io(error))
+                if error.kind == std::io::ErrorKind::PermissionDenied && error.message == "recovery source denied")
+            );
+        }
+        let archive = preservation_seed(ArchiveVersion::Rar29);
+        assert!(matches!(
+            archive.repair_protect_head(),
+            Err(Error::InvalidHeader(
+                "RAR 2.x archive does not contain a PROTECT_HEAD recovery record"
+            ))
+        ));
+    }
+
+    #[test]
     fn complete_header_crc_failures_survive_plain_and_encrypted_adapters() {
         for encrypted in [false, true] {
             for corrupt in [false, true] {
