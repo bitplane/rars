@@ -2905,6 +2905,105 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sfx_payload_ranges_agree_for_plain_and_encrypted_headers() {
+        for encrypted in [false, true] {
+            let mut builder = crate::Builder::new(if encrypted {
+                ArchiveVersion::Rar30
+            } else {
+                ArchiveVersion::Rar29
+            })
+            .store(true)
+            .password(encrypted.then(|| b"secret".to_vec()))
+            .header_encryption(encrypted);
+            builder
+                .add_bytes(
+                    b"payload".to_vec(),
+                    b"sfx payload bytes".to_vec(),
+                    None,
+                    None,
+                )
+                .unwrap();
+            let mut bytes = vec![0; 19];
+            bytes.extend_from_slice(&builder.to_bytes().unwrap());
+            let options = crate::ArchiveReadOptions::with_optional_password(
+                encrypted.then_some(&b"secret"[..]),
+            );
+            let memory = Archive::parse_with_options(&bytes, options).unwrap();
+            let seekable = Archive::parse_seekable(
+                std::io::Cursor::new(&bytes),
+                bytes.len() as u64,
+                19,
+                ArchiveSource::Memory(Arc::from(bytes.clone())),
+                options,
+            )
+            .unwrap();
+            assert_eq!(memory.sfx_offset, 19);
+            assert_eq!(memory.blocks, seekable.blocks);
+            for archive in [&memory, &seekable] {
+                let mut output = Vec::new();
+                archive
+                    .files()
+                    .next()
+                    .unwrap()
+                    .write_stored_to(archive, options.password, &mut output)
+                    .unwrap();
+                assert_eq!(output, b"sfx payload bytes");
+            }
+        }
+    }
+
+    #[test]
+    fn edited_public_recovery_ranges_keep_typed_refusals() {
+        let old = Archive::parse(include_bytes!(
+            "../tests/fixtures/rar15_40/rar250_protect_head_rr1.rar"
+        ))
+        .unwrap();
+        let mut out_of_source = old.clone();
+        let protect = out_of_source
+            .blocks
+            .iter_mut()
+            .find_map(|block| match block {
+                Block::Protect(protect) => Some(protect),
+                _ => None,
+            })
+            .unwrap();
+        protect.data_range = usize::MAX..usize::MAX;
+        assert!(matches!(
+            out_of_source.repair_protect_head(),
+            Err(Error::TooShort)
+        ));
+        let mut overflow = old;
+        overflow.sfx_offset = usize::MAX;
+        assert!(matches!(
+            overflow.repair_protect_head(),
+            Err(Error::InvalidHeader(
+                "RAR 2.x protected sector range overflows"
+            ))
+        ));
+
+        let mut modern = Archive::parse(include_bytes!(
+            "../tests/fixtures/rar15_40/rar300/with_recovery_rar300.rar"
+        ))
+        .unwrap();
+        modern.sfx_offset = 1;
+        let recovery = modern
+            .blocks
+            .iter_mut()
+            .find_map(|block| match block {
+                Block::NewSub(sub) if sub.kind == NewSubKind::RecoveryRecord => Some(sub),
+                _ => None,
+            })
+            .unwrap();
+        recovery.file.block.offset = usize::MAX;
+        assert!(matches!(
+            modern.repair_protect_head(),
+            Err(Error::InvalidHeader(
+                "RAR 3.x recovery protected range overflows"
+            ))
+        ));
+    }
+
+    #[test]
     fn comment_decoders_preserve_limits_and_each_cancellation_checkpoint() {
         let text = b"checkpoint comment";
         for (version, method, packed) in [
