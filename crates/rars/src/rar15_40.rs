@@ -2895,6 +2895,112 @@ mod tests {
     use crate::io_util::read_u16;
 
     #[test]
+    fn complete_header_crc_failures_survive_plain_and_encrypted_adapters() {
+        for encrypted in [false, true] {
+            for corrupt in [false, true] {
+                let mut bytes = RAR15_SIGNATURE.to_vec();
+                test_write_main_header(&mut bytes, if encrypted { MHD_PASSWORD } else { 0 });
+                let mut header = vec![0; 7];
+                header[2] = ENDARC_HEAD;
+                header[5..7].copy_from_slice(&7u16.to_le_bytes());
+                test_write_header_crc(&mut header, 0);
+                if corrupt {
+                    header[0] ^= 1;
+                }
+                if encrypted {
+                    header.resize(16, 0);
+                    crate::crypto::rar30::Rar30Cipher::new(b"pw", Some([0; 8]))
+                        .unwrap()
+                        .encrypt_in_place(&mut header)
+                        .unwrap();
+                    bytes.extend_from_slice(&[0; 8]);
+                }
+                bytes.extend_from_slice(&header);
+                let options = crate::ArchiveReadOptions::with_password(b"pw");
+                for result in [
+                    Archive::parse_with_options(&bytes, options),
+                    Archive::parse_seekable(
+                        std::io::Cursor::new(&bytes),
+                        bytes.len() as u64,
+                        0,
+                        ArchiveSource::Memory(Arc::from(bytes.clone())),
+                        options,
+                    ),
+                ] {
+                    if corrupt {
+                        assert!(
+                            matches!(result, Err(Error::CrcMismatch { .. })),
+                            "{result:?}"
+                        );
+                    } else {
+                        assert!(matches!(result.unwrap().blocks.last(), Some(Block::End(_))));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rev3_repair_preserves_reconstruction_and_publication_failures() {
+        let mut calls = 0;
+        let error = repair_rev3_volumes_to(&[], 1, &[(0, b"data")], |_, _| {
+            calls += 1;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Rar3Recovery(crate::recovery::rar3::Error::InvalidCodewordSize)
+        ));
+        assert_eq!(calls, 0);
+
+        let volumes: &[Option<&[u8]>] = &[Some(b"data"), Some(b"next")];
+        let error = repair_rev3_volumes_to(volumes, 1, &[(0, b"0000")], |index, bytes| {
+            calls += 1;
+            assert_eq!(index, 0);
+            assert_eq!(bytes, b"data");
+            Err(
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, "publication denied")
+                    .into(),
+            )
+        })
+        .unwrap_err();
+        assert!(
+            matches!(error, Error::Io(ref source) if source.kind == std::io::ErrorKind::PermissionDenied && source.message == "publication denied")
+        );
+        assert_eq!(calls, 1, "publication stops at the failing volume");
+        let mut published = Vec::new();
+        repair_rev3_volumes_to(volumes, 1, &[(0, b"0000")], |index, bytes| {
+            published.push((index, bytes.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(published, [(0, b"data".to_vec()), (1, b"next".to_vec())]);
+    }
+
+    #[test]
+    fn preservation_refuses_unsafe_unicode_names_and_independent_fallbacks() {
+        for unsafe_decoded in [false, true] {
+            let mut archive = preservation_seed(ArchiveVersion::Rar29);
+            let file = preservation_file(&mut archive);
+            if unsafe_decoded {
+                file.name = b"../entry".to_vec();
+                file.unicode_name = Some(b"../entry\0".to_vec());
+            } else {
+                let mut raw = crate::filename::encode_legacy_unicode(b"entry").unwrap();
+                // Full UTF-16 commands leave the decoded name independent of this fallback.
+                raw[..5].copy_from_slice(b"/evil");
+                assert_eq!(decode_file_name(&raw, FHD_UNICODE), b"entry");
+                file.unicode_name = Some(raw);
+            }
+            assert!(archive
+                .rewrite_preservation_issues()
+                .iter()
+                .any(|issue| issue.contains("malformed or unsupported legacy Unicode name")));
+        }
+    }
+
+    #[test]
     fn nested_comment_crc_failure_survives_both_parser_adapters() {
         let mut bytes = RAR15_SIGNATURE.to_vec();
         test_write_main_header(&mut bytes, MHD_COMMENT);
