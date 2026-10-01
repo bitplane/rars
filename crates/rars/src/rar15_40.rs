@@ -1036,13 +1036,19 @@ impl Archive {
         if main_block.head_type != MAIN_HEAD {
             return Err(Error::InvalidHeader("RAR 1.5 main header is missing"));
         }
+        // File lengths are u64, so even a complete header can cross usize on 32-bit hosts.
+        let mut pos = checked_file_block_next(
+            sfx_offset,
+            &main_block,
+            usize::from(main_block.head_size),
+            file_len,
+        )?;
         let main_header = read_exact_at(
             &mut file,
             sfx_offset + main_block.offset,
             main_block.head_size as usize,
         )?;
         let main = parse_main_header(&main_header, &relative_block(&main_block))?;
-        let mut pos = main_block.offset + main_block.head_size as usize;
         let mut blocks = Vec::new();
         if let Some(comment) =
             nested_main_comment(&main_header, &main_block, sfx_offset + main_block.offset)?
@@ -2352,7 +2358,10 @@ fn read_encrypted_header_at(
         return Err(Error::TooShort);
     }
     budget.admit(head_size, offset)?;
-    let encrypted_rest = read_exact_at(file, encrypted_start + 16, encrypted_header_size - 16)?;
+    let encrypted_rest_start = encrypted_start
+        .checked_add(16)
+        .ok_or(Error::InvalidHeader("RAR 1.5 block offset overflows usize"))?;
+    let encrypted_rest = read_exact_at(file, encrypted_rest_start, encrypted_header_size - 16)?;
     let mut header = Vec::with_capacity(encrypted_header_size);
     header.extend_from_slice(&first_block);
     header.extend_from_slice(&encrypted_rest);
@@ -2949,39 +2958,91 @@ mod tests {
 
     #[cfg(target_pointer_width = "32")]
     #[test]
-    fn seekable_main_offset_above_native_address_size_is_refused() {
+    fn seekable_offsets_above_native_address_size_are_refused() {
         use std::io::{self, Read, Seek, SeekFrom};
-        struct HighMarker(u64);
-        impl Read for HighMarker {
+        struct HighInput<'a> {
+            start: u64,
+            position: u64,
+            bytes: &'a [u8],
+        }
+        impl Read for HighInput<'_> {
             fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-                let start = u64::from(u32::MAX) - 3;
-                if !(start..start + 7).contains(&self.0) {
+                if !(self.start..self.start + self.bytes.len() as u64).contains(&self.position) {
                     return Ok(0);
                 }
-                let offset = (self.0 - start) as usize;
-                let length = output.len().min(RAR15_SIGNATURE.len() - offset);
-                output[..length].copy_from_slice(&RAR15_SIGNATURE[offset..offset + length]);
-                self.0 += length as u64;
+                let offset = (self.position - self.start) as usize;
+                let length = output.len().min(self.bytes.len() - offset);
+                output[..length].copy_from_slice(&self.bytes[offset..offset + length]);
+                self.position += length as u64;
                 Ok(length)
             }
         }
-        impl Seek for HighMarker {
+        impl Seek for HighInput<'_> {
             fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
                 match position {
                     SeekFrom::Start(position) => {
-                        self.0 = position;
+                        self.position = position;
                         Ok(position)
                     }
                     _ => Err(io::ErrorKind::Unsupported.into()),
                 }
             }
         }
-        let result = Archive::parse_seekable(
-            HighMarker(0),
-            u64::from(u32::MAX) + 4,
-            u32::MAX as usize - 3,
-            ArchiveSource::Memory(Arc::from(&[][..])),
-            crate::ArchiveReadOptions::new(),
+        let mut main = RAR15_SIGNATURE.to_vec();
+        test_write_main_header(&mut main, 0);
+        for (start, bytes, expected) in [
+            (
+                u64::from(u32::MAX) - 3,
+                &RAR15_SIGNATURE[..],
+                "RAR 1.5 block offset overflows usize",
+            ),
+            (
+                u64::from(u32::MAX) - 17,
+                &main[..],
+                "RAR 1.5 block size overflows usize",
+            ),
+        ] {
+            let result = Archive::parse_seekable(
+                HighInput {
+                    start,
+                    position: 0,
+                    bytes,
+                },
+                start + bytes.len() as u64,
+                start as usize,
+                ArchiveSource::Memory(Arc::from(&[][..])),
+                crate::ArchiveReadOptions::new(),
+            );
+            assert!(
+                matches!(result, Err(Error::InvalidHeader(message)) if message == expected),
+                "{result:?}"
+            );
+        }
+        // A complete salt/first AES block may fit the u64 file but leave the
+        // address of its (possibly empty) tail beyond native usize.
+        let mut header = vec![0; 16];
+        header[2] = ENDARC_HEAD;
+        header[5..7].copy_from_slice(&7u16.to_le_bytes());
+        test_write_header_crc(&mut header[..7], 0);
+        Rar30Cipher::new(b"pw", Some([0; 8]))
+            .unwrap()
+            .encrypt_in_place(&mut header)
+            .unwrap();
+        let mut bytes = vec![0; 8];
+        bytes.extend_from_slice(&header);
+        let start = u64::from(u32::MAX) - 10;
+        let result = read_encrypted_header_at(
+            &mut HighInput {
+                start,
+                position: 0,
+                bytes: &bytes,
+            },
+            start + bytes.len() as u64,
+            start as usize,
+            0,
+            b"pw",
+            &mut EncryptedHeaderCipherCache::default(),
+            &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new()),
         );
         assert!(matches!(
             result,
