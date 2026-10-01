@@ -8,7 +8,7 @@ use crate::crypto::rar30::{Error as Rar30Error, Rar30Cipher};
 use crate::detect::{find_archive_start, ArchiveSignature, RAR15_SIGNATURE, SFX_SCAN_LIMIT};
 use crate::error::{Error, Result};
 use crate::features::FeatureSet;
-use crate::io_util::{read_exact_at, read_u16, read_u32};
+use crate::io_util::{read_exact_at, read_u32};
 pub(crate) use crate::source::ArchiveSource;
 use crate::version::ArchiveFamily;
 use crate::ArchiveVersion;
@@ -1899,18 +1899,9 @@ fn parse_protect_header(
         ));
     }
     let mark: [u8; 8] = fixed[18..26].try_into().expect("RAR protect mark size");
-    let data_start = archive_offset
-        .checked_add(block.offset)
-        .and_then(|offset| offset.checked_add(block.head_size as usize))
-        .ok_or(Error::InvalidHeader(
-            "RAR 2.x recovery data range overflows",
-        ))?;
-    let data_end = archive_offset
-        .checked_add(block.offset)
-        .and_then(|offset| offset.checked_add(total_size))
-        .ok_or(Error::InvalidHeader(
-            "RAR 2.x recovery data range overflows",
-        ))?;
+    // Both parser callers admitted this entire block's absolute next offset.
+    let data_start = archive_offset + block.offset + usize::from(block.head_size);
+    let data_end = archive_offset + block.offset + total_size;
     Ok(ProtectHeader {
         block: block.clone(),
         version: fixed[11],
@@ -1938,8 +1929,8 @@ fn repair_protect_head_bytes(
         return Err(Error::InvalidHeader("RAR 2.x recovery mark is invalid"));
     }
     let protected_start = sfx_offset;
-    let declared_blocks = usize::try_from(protect.total_blocks)
-        .map_err(|_| Error::InvalidHeader("RAR 2.x protected sector size overflows"))?;
+    // A u32 count fits the supported 32/64-bit host address sizes.
+    let declared_blocks = protect.total_blocks as usize;
     let protected_len = declared_blocks
         .checked_mul(512)
         .ok_or(Error::InvalidHeader(
@@ -1960,12 +1951,8 @@ fn repair_protect_head_bytes(
         .ok_or(Error::TooShort)?;
     // The successful 512-byte sector calculation also bounds two-byte tags.
     let tag_len = declared_blocks * 2;
-    let parity_len =
-        usize::from(protect.rec_sectors)
-            .checked_mul(512)
-            .ok_or(Error::InvalidHeader(
-                "RAR 2.x recovery parity size overflows",
-            ))?;
+    // A u16 sector count needs at most 33553920 parity bytes on either host.
+    let parity_len = usize::from(protect.rec_sectors) * 512;
     if recovery_data.len() != tag_len + parity_len {
         return Err(Error::InvalidHeader(
             "RAR 2.x recovery data size is invalid",
@@ -1984,7 +1971,7 @@ fn repair_protect_head_bytes(
         let sector_start = protected_start + index * 512;
         let sector = &source[sector_start..sector_start + 512];
         let actual = (!crc32(sector) & 0xffff) as u16;
-        let expected = read_u16(tags, index * 2)?;
+        let expected = u16::from_le_bytes([tags[index * 2], tags[index * 2 + 1]]);
         if actual != expected {
             damaged.push(index);
         }
@@ -2079,9 +2066,8 @@ fn repair_newsub_recovery_bytes(
             "RAR 3.x recovery record has no protected sectors",
         ));
     }
-    let tag_len = protected_sectors
-        .checked_mul(2)
-        .ok_or(Error::InvalidHeader("RAR 3.x recovery tag size overflows"))?;
+    // Sector count is ceil(an already-admitted physical extent / 512).
+    let tag_len = protected_sectors * 2;
     if recovery_data.len() <= tag_len || !(recovery_data.len() - tag_len).is_multiple_of(512) {
         return Err(Error::InvalidHeader(
             "RAR 3.x recovery data size is invalid",
@@ -2096,7 +2082,7 @@ fn repair_newsub_recovery_bytes(
         control.check()?;
         let sector = protected_sector(source, protected_start, protected_len, index);
         let actual = (!crc32(&sector) & 0xffff) as u16;
-        let expected = read_u16(tags, index * 2)?;
+        let expected = u16::from_le_bytes([tags[index * 2], tags[index * 2 + 1]]);
         if actual != expected {
             damaged.push(index);
         }
@@ -2285,9 +2271,7 @@ fn decrypt_encrypted_header_at(
     let mut cipher = cipher_cache.cipher(password, salt)?;
     let mut first_block = [0u8; 16];
     first_block.copy_from_slice(first_ciphertext);
-    cipher
-        .decrypt_in_place(&mut first_block)
-        .map_err(map_rar30_crypto_error)?;
+    cipher.decrypt_block(&mut first_block);
     let head_size = u16::from_le_bytes([first_block[5], first_block[6]]) as usize;
     if head_size < 7 {
         return Err(Error::InvalidHeader("RAR 1.5 block header is too short"));
@@ -2354,9 +2338,7 @@ fn read_encrypted_header_at(
     let mut cipher = cipher_cache.cipher(password, salt)?;
     let mut first_block = [0u8; 16];
     first_block.copy_from_slice(&first[8..24]);
-    cipher
-        .decrypt_in_place(&mut first_block)
-        .map_err(map_rar30_crypto_error)?;
+    cipher.decrypt_block(&mut first_block);
     let head_size = u16::from_le_bytes([first_block[5], first_block[6]]) as usize;
     if head_size < 7 {
         return Err(Error::InvalidHeader("RAR 1.5 block header is too short"));
@@ -2811,11 +2793,9 @@ fn file_block_total_size(
     default_total: usize,
     pack_size: u64,
 ) -> Result<usize> {
-    let low_payload_size = usize::try_from(block.add_size.unwrap_or(0))
-        .map_err(|_| Error::InvalidHeader("RAR 1.5 block size overflows usize"))?;
-    let header_prefix = default_total
-        .checked_sub(low_payload_size)
-        .ok_or(Error::InvalidHeader("RAR 1.5 block size overflows usize"))?;
+    // Parsed add_size is a widened u32, and default_total already includes it.
+    let low_payload_size = block.add_size.unwrap_or(0) as usize;
+    let header_prefix = default_total - low_payload_size;
     let pack_size = usize::try_from(pack_size)
         .map_err(|_| Error::InvalidHeader("RAR 1.5 packed file size overflows usize"))?;
     header_prefix
@@ -2903,6 +2883,72 @@ mod tests {
         assert_eq!(reader.reads, [24]);
     }
     use super::*;
+    use crate::io_util::read_u16;
+
+    #[test]
+    fn protection_header_requires_a_declared_data_size() {
+        let mut bytes = RAR15_SIGNATURE.to_vec();
+        test_write_main_header(&mut bytes, 0);
+        let start = bytes.len();
+        let mut header = vec![0; 26];
+        header[2] = PROTECT_HEAD;
+        header[5..7].copy_from_slice(&26u16.to_le_bytes());
+        bytes.extend_from_slice(&header);
+        test_write_header_crc(&mut bytes, start);
+        for result in [
+            Archive::parse(&bytes),
+            Archive::parse_seekable(
+                std::io::Cursor::new(&bytes),
+                bytes.len() as u64,
+                0,
+                ArchiveSource::Memory(Arc::from(bytes.clone())),
+                crate::ArchiveReadOptions::new(),
+            ),
+        ] {
+            assert!(matches!(
+                result,
+                Err(Error::InvalidHeader(
+                    "RAR 2.x recovery header is missing data size"
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn maximum_large_packed_size_is_refused_before_payload_access() {
+        let mut bytes = RAR15_SIGNATURE.to_vec();
+        test_write_main_header(&mut bytes, 0);
+        let start = bytes.len();
+        let mut header = vec![0; 41];
+        header[2] = FILE_HEAD;
+        header[3..5].copy_from_slice(&(LONG_BLOCK | FHD_LARGE).to_le_bytes());
+        header[5..7].copy_from_slice(&41u16.to_le_bytes());
+        header[7..11].copy_from_slice(&u32::MAX.to_le_bytes());
+        header[24] = 29;
+        header[25] = 0x30;
+        header[26..28].copy_from_slice(&1u16.to_le_bytes());
+        header[32..36].copy_from_slice(&u32::MAX.to_le_bytes());
+        header[40] = b'x';
+        bytes.extend_from_slice(&header);
+        test_write_header_crc(&mut bytes, start);
+        for result in [
+            Archive::parse(&bytes),
+            Archive::parse_seekable(
+                std::io::Cursor::new(&bytes),
+                bytes.len() as u64,
+                0,
+                ArchiveSource::Memory(Arc::from(bytes.clone())),
+                crate::ArchiveReadOptions::new(),
+            ),
+        ] {
+            assert!(matches!(
+                result,
+                Err(Error::InvalidHeader(
+                    "RAR 1.5 packed file size overflows usize"
+                ))
+            ));
+        }
+    }
 
     #[test]
     fn sfx_payload_ranges_agree_for_plain_and_encrypted_headers() {
