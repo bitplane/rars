@@ -2885,6 +2885,48 @@ mod tests {
     use super::*;
     use crate::io_util::read_u16;
 
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn seekable_main_offset_above_native_address_size_is_refused() {
+        use std::io::{self, Read, Seek, SeekFrom};
+        struct HighMarker(u64);
+        impl Read for HighMarker {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                let start = u64::from(u32::MAX) - 3;
+                if !(start..start + 7).contains(&self.0) {
+                    return Ok(0);
+                }
+                let offset = (self.0 - start) as usize;
+                let length = output.len().min(RAR15_SIGNATURE.len() - offset);
+                output[..length].copy_from_slice(&RAR15_SIGNATURE[offset..offset + length]);
+                self.0 += length as u64;
+                Ok(length)
+            }
+        }
+        impl Seek for HighMarker {
+            fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+                match position {
+                    SeekFrom::Start(position) => {
+                        self.0 = position;
+                        Ok(position)
+                    }
+                    _ => Err(io::ErrorKind::Unsupported.into()),
+                }
+            }
+        }
+        let result = Archive::parse_seekable(
+            HighMarker(0),
+            u64::from(u32::MAX) + 4,
+            u32::MAX as usize - 3,
+            ArchiveSource::Memory(Arc::from(&[][..])),
+            crate::ArchiveReadOptions::new(),
+        );
+        assert!(matches!(
+            result,
+            Err(Error::InvalidHeader("RAR 1.5 block offset overflows usize"))
+        ));
+    }
+
     #[test]
     fn protection_header_requires_a_declared_data_size() {
         let mut bytes = RAR15_SIGNATURE.to_vec();
@@ -2941,12 +2983,19 @@ mod tests {
                 crate::ArchiveReadOptions::new(),
             ),
         ] {
-            assert!(matches!(
-                result,
-                Err(Error::InvalidHeader(
-                    "RAR 1.5 packed file size overflows usize"
-                ))
-            ));
+            let expected = if usize::BITS == 32 {
+                // The low u32 payload plus its header already exceeds usize.
+                "RAR 1.5 block size overflows usize"
+            } else {
+                "RAR 1.5 packed file size overflows usize"
+            };
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::InvalidHeader(message)) if message == expected
+                ),
+                "expected {expected}, got {result:?}"
+            );
         }
     }
 
@@ -3604,7 +3653,20 @@ mod tests {
         archive.extend_from_slice(name);
         test_write_header_crc(&mut archive, start);
 
-        assert!(matches!(Archive::parse(&archive), Err(Error::TooShort)));
+        let result = Archive::parse(&archive);
+        if usize::BITS == 32 {
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::InvalidHeader(
+                        "RAR 1.5 packed file size overflows usize"
+                    ))
+                ),
+                "{result:?}"
+            );
+        } else {
+            assert!(matches!(result, Err(Error::TooShort)), "{result:?}");
+        }
     }
 
     fn block_header_with(flags: u16) -> BlockHeader {
