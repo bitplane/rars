@@ -555,10 +555,10 @@ impl Archive {
         if sig.family != ArchiveFamily::Rar50Plus {
             return Err(Error::UnsupportedSignature);
         }
+        // The detector found sig.offset inside the scanned prefix of this file.
         let archive_len = usize::try_from(len)
             .map_err(|_| Error::InvalidHeader("RAR 5 archive size overflows usize"))?
-            .checked_sub(sig.offset)
-            .ok_or(Error::TooShort)?;
+            - sig.offset;
         Self::parse_file_backed(
             &mut file,
             archive_len,
@@ -611,7 +611,8 @@ impl Archive {
         if sig.family != ArchiveFamily::Rar50Plus {
             return Err(Error::UnsupportedSignature);
         }
-        let archive = input.get(sig.offset..).ok_or(Error::TooShort)?;
+        // Signature detection admitted this offset within the immutable input.
+        let archive = &input[sig.offset..];
         let mut parsed = Self::parse_seekable(
             archive,
             sig.offset,

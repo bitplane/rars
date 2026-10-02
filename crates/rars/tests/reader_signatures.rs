@@ -4,6 +4,61 @@ mod scratch;
 use rars::{detect_archive_family, find_archive_start, rar15_40, rar50, ArchiveReadOptions, Error};
 
 #[test]
+fn rar5_path_parser_reports_missing_files_and_missing_signatures() {
+    let root = scratch::case("rar5-path-input-errors");
+    let path = root.join("missing.rar");
+    let error = rar50::Archive::parse_path(&path).unwrap_err();
+    assert!(matches!(error.root_cause(), Error::Io(io) if io.kind == std::io::ErrorKind::NotFound));
+
+    std::fs::write(&path, b"ordinary bytes, with no RAR marker").unwrap();
+    assert!(matches!(
+        rar50::Archive::parse_path(&path),
+        Err(Error::UnsupportedSignature)
+    ));
+
+    let cancelled = rars::ReadCancellation::new();
+    cancelled.cancel();
+    assert!(matches!(
+        rar50::Archive::parse_path_with_options(
+            &path,
+            ArchiveReadOptions::new().with_cancellation(&cancelled)
+        ),
+        Err(Error::Cancelled)
+    ));
+    let signature = detect_archive_family(b"Rar!\x1a\x07\x01\0").unwrap();
+    assert!(matches!(
+        rar50::Archive::parse_path_with_signature(
+            &path,
+            signature,
+            ArchiveReadOptions::new().with_cancellation(&cancelled)
+        ),
+        Err(Error::Cancelled)
+    ));
+}
+
+#[cfg(target_pointer_width = "32")]
+#[test]
+fn rar5_path_parser_rejects_sparse_archives_above_native_size() {
+    let root = scratch::case("rar5-native32-sparse-size");
+    let path = root.join("large.rar");
+    let mut file = std::fs::File::create(&path).unwrap();
+    std::io::Write::write_all(&mut file, b"Rar!\x1a\x07\x01\0").unwrap();
+    file.set_len(u64::from(u32::MAX) + 1).unwrap();
+    drop(file);
+
+    let signature = detect_archive_family(b"Rar!\x1a\x07\x01\0").unwrap();
+    for result in [
+        rar50::Archive::parse_path(&path),
+        rar50::Archive::parse_path_with_signature(&path, signature, ArchiveReadOptions::new()),
+    ] {
+        assert!(matches!(
+            result,
+            Err(Error::InvalidHeader("RAR 5 archive size overflows usize"))
+        ));
+    }
+}
+
+#[test]
 fn typed_path_parsers_validate_explicit_signatures_and_sfx_offsets() {
     let legacy = include_bytes!("fixtures/rar15_40/rar300/stored_multivol_rar300.rar");
     let modern = include_bytes!("fixtures/rar50/stored.rar");
