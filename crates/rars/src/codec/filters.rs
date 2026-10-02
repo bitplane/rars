@@ -244,6 +244,7 @@ pub(crate) fn delta_encode(
     .map(super::workspace::Buffer::into_vec)
 }
 
+#[cfg(any(test, feature = "write"))]
 pub(crate) fn delta_encode_with_allowance<B: super::workspace::Budget>(
     data: &[u8],
     channels: usize,

@@ -241,6 +241,7 @@ impl<T, B: Budget> Buffer<T, B> {
     /// Admit one exact allocation before copying slices that form a buffer.
     /// The total is checked first, so none of the copies can grow past its
     /// charged capacity.
+    #[cfg(feature = "write")]
     pub(crate) fn from_slices(slices: &[&[T]], allowance: &B) -> Result<Self>
     where
         T: Copy,
@@ -278,6 +279,7 @@ impl<T, B: Budget> Buffer<T, B> {
     fn reserve(&mut self, additional: usize) -> Result<()> {
         B::grow(&mut self.values, &mut self.charge, additional).map_err(Into::into)
     }
+    #[cfg(feature = "write")]
     pub(crate) fn reserve_total_capacity(&mut self, total: usize) -> Result<()> {
         if total > self.values.capacity() {
             self.reserve(total.saturating_sub(self.values.len()))?;
@@ -370,6 +372,7 @@ impl<T, B: Budget> Buffer<T, B> {
     }
     /// Admit the final window before modifying it. A refusal keeps the old
     /// history intact, and input larger than the window is never copied in full.
+    #[cfg(any(test, feature = "write"))]
     pub(crate) fn remember(&mut self, input: &[T], limit: usize) -> Result<()>
     where
         T: Copy,
@@ -392,6 +395,7 @@ impl<T, B: Budget> Buffer<T, B> {
         self.values.extend_from_slice(values);
         Ok(())
     }
+    #[cfg(any(test, feature = "write"))]
     pub(crate) fn prepend(&mut self, prefix: impl ExactSizeIterator<Item = T>) -> Result<()> {
         self.reserve(prefix.len())?;
         let old_len = self.values.len();
@@ -493,6 +497,7 @@ impl<T> From<Vec<T>> for Buffer<T> {
     }
 }
 impl<T> Buffer<T> {
+    #[cfg(any(test, feature = "write"))]
     pub(crate) fn from_vec(values: Vec<T>) -> Self {
         Self { values, charge: () }
     }
@@ -514,6 +519,7 @@ impl<B: Budget> Buffer<u8, B> {
             self.extend_from_slice(&chunk[..len]).map_err(Into::into)?;
         }
     }
+    #[cfg(feature = "write")]
     pub(crate) fn write_msb_bits(
         &mut self,
         bit_pos: &mut usize,
@@ -528,6 +534,7 @@ impl<B: Budget> Buffer<u8, B> {
         super::fast::write_msb_bits(&mut self.values, bit_pos, value, count);
         Ok(())
     }
+    #[cfg(feature = "write")]
     pub(crate) fn write_msb_bits_admitted(
         &mut self,
         bit_pos: &mut usize,

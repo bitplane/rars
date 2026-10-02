@@ -115,6 +115,7 @@ impl<const MIN_MATCH: usize, B: Budget> MatchFinder<MIN_MATCH, B> {
         })
     }
 
+    #[cfg(feature = "write")]
     pub(crate) fn allowance(&self) -> B {
         self.head.allowance()
     }
@@ -216,6 +217,7 @@ impl<B: Budget> TreeMatchFinder<B> {
         })
     }
 
+    #[cfg(feature = "write")]
     pub(crate) fn allowance(&self) -> B {
         self.head.allowance()
     }

@@ -1,8 +1,10 @@
 use super::filters::{self, DeltaErrorMessages};
 use super::workspace::{Allowance, Budget, Buffer};
-use super::{huffman, match_finder, Error, Result};
+#[cfg(feature = "write")]
+use super::{huffman, match_finder};
+use super::{Error, Result};
 use std::io::Read;
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 use std::io::Write;
 use std::ops::Range;
 
@@ -15,9 +17,12 @@ pub const LENGTH_TABLE_SIZE: usize = 44;
 const DEFAULT_DICTIONARY_SIZE: usize = 4 * 1024 * 1024;
 const MAX_INITIAL_OUTPUT_CAPACITY: usize = 1024 * 1024;
 const STREAM_FLUSH_THRESHOLD: usize = 64 * 1024;
+#[cfg(feature = "write")]
 const MAX_ENCODER_MATCH_OFFSET: usize = DEFAULT_DICTIONARY_SIZE;
+#[cfg(feature = "write")]
 const MAX_ENCODER_MATCH_LENGTH: usize = 4096;
 /// The largest block the format allows a writer to emit.
+#[cfg(feature = "write")]
 const MAX_COMPRESSED_BLOCK_OUTPUT: usize = 4 * 1024 * 1024;
 /// How much input goes into one compressed block.
 ///
@@ -28,7 +33,9 @@ const MAX_COMPRESSED_BLOCK_OUTPUT: usize = 4 * 1024 * 1024;
 /// than a mebibyte and within 0.2% of the best size tried at any point between
 /// 16 KiB and 256 KiB. The streaming writer reads in the same units, so both
 /// paths produce the same blocks for the same input.
+#[cfg(feature = "write")]
 pub(crate) const LZ_BLOCK_SIZE: usize = 64 * 1024;
+#[cfg(feature = "write")]
 const _: () = assert!(LZ_BLOCK_SIZE <= MAX_COMPRESSED_BLOCK_OUTPUT);
 
 /// The most input one block may cover once blocks are being extended.
@@ -40,7 +47,9 @@ const _: () = assert!(LZ_BLOCK_SIZE <= MAX_COMPRESSED_BLOCK_OUTPUT);
 /// optimal parse prices every position in a block and its arrays scale with
 /// the block, so a mebibyte is the point where the extra table sets saved stop
 /// being worth the pages.
+#[cfg(feature = "write")]
 pub(crate) const MAX_LZ_BLOCK_SIZE: usize = 1024 * 1024;
+#[cfg(feature = "write")]
 const _: () = assert!(MAX_LZ_BLOCK_SIZE <= MAX_COMPRESSED_BLOCK_OUTPUT);
 
 /// How far a chunk's byte distribution may sit from the open block's before
@@ -65,6 +74,7 @@ const _: () = assert!(MAX_LZ_BLOCK_SIZE <= MAX_COMPRESSED_BLOCK_OUTPUT);
 /// that does move sits four and a half times above it. That gap is the whole
 /// design: a block grows over data a fresh table set could not describe any
 /// better, and over nothing else.
+#[cfg(feature = "write")]
 const BLOCK_DRIFT_DIVISOR: u64 = 128;
 
 /// Decides where one block ends, from the raw bytes alone.
@@ -81,17 +91,20 @@ const BLOCK_DRIFT_DIVISOR: u64 = 128;
 /// thing more directly, but no archive WinRAR writes sets it, so no third
 /// party decoder is known to have been tested against one that does.
 #[derive(Debug, Clone)]
+#[cfg(feature = "write")]
 pub(crate) struct BlockSplitter {
     counts: [u32; 256],
     total: u64,
 }
 
+#[cfg(feature = "write")]
 impl Default for BlockSplitter {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "write")]
 impl BlockSplitter {
     pub(crate) const fn new() -> Self {
         Self {
@@ -141,9 +154,11 @@ impl BlockSplitter {
         misplaced / open <= chunk_len / BLOCK_DRIFT_DIVISOR
     }
 }
+#[cfg(feature = "write")]
 const MAX_FILTER_BLOCK_LENGTH: usize = 0x3ffff;
 /// The most channels a RAR 5 delta filter record can name. The count is written
 /// as five bits biased by one, so this is what the format can say, not a policy.
+#[cfg(feature = "write")]
 pub(crate) const MAX_DELTA_CHANNELS: usize = 32;
 /// How much input goes into one compressed block once a filter is carried.
 ///
@@ -153,6 +168,7 @@ pub(crate) const MAX_DELTA_CHANNELS: usize = 32;
 /// the same bytes either way: the transform reads an absolute file offset, and
 /// an instruction straddling a boundary was already left alone at the old
 /// 256 KiB one.
+#[cfg(feature = "write")]
 const FILTERED_LZ_BLOCK_SIZE: usize = if LZ_BLOCK_SIZE < MAX_FILTER_BLOCK_LENGTH {
     LZ_BLOCK_SIZE
 } else {
@@ -175,11 +191,14 @@ const FILTERED_LZ_BLOCK_SIZE: usize = if LZ_BLOCK_SIZE < MAX_FILTER_BLOCK_LENGTH
 /// buy time, and it is not worth it: at 128 the source packs 0.16% larger for
 /// 1.2x, at 64 it packs 0.47% larger for 1.5x, and neither closes the distance
 /// to WinRAR.
+#[cfg(feature = "write")]
 const NICE_MATCH_LENGTH: usize = 512;
 
 /// Matches shorter than 4 bytes are never emitted, so candidate positions are
 /// chained by a hash of their first 4 bytes.
+#[cfg(feature = "write")]
 type Rar50MatchFinder<B = Allowance> = match_finder::MatchFinder<4, B>;
+#[cfg(feature = "write")]
 const MAX_MATCH_CANDIDATES: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,12 +260,14 @@ struct OwnedLengths<B: Budget = Allowance> {
 }
 
 #[derive(Clone, Copy)]
+#[cfg(feature = "write")]
 struct LengthSlices<'a> {
     main: &'a [u8],
     distance: &'a [u8],
     align: &'a [u8],
     length: &'a [u8],
 }
+#[cfg(feature = "write")]
 impl<B: Budget> OwnedLengths<B> {
     fn slices(&self) -> LengthSlices<'_> {
         LengthSlices {
@@ -520,10 +541,12 @@ fn read_table_lengths_with_allowance<B: Budget>(
     ))
 }
 
+#[cfg(feature = "write")]
 pub fn encode_table_lengths(lengths: &TableLengths, algorithm_version: u8) -> Result<Vec<u8>> {
     encode_table_lengths_with_bit_count(lengths, algorithm_version).map(|(data, _)| data)
 }
 
+#[cfg(feature = "write")]
 pub fn encode_table_lengths_with_bit_count(
     lengths: &TableLengths,
     algorithm_version: u8,
@@ -541,6 +564,7 @@ pub fn encode_table_lengths_with_bit_count(
     .map(|(bytes, bits)| (bytes.into_vec(), bits))
 }
 
+#[cfg(feature = "write")]
 fn encode_table_slices<B: Budget>(
     lengths: LengthSlices<'_>,
     algorithm_version: u8,
@@ -603,6 +627,7 @@ fn encode_table_slices<B: Budget>(
     Ok((writer.bytes, bit_count))
 }
 
+#[cfg(feature = "write")]
 pub fn encode_compressed_block(
     payload: &[u8],
     payload_bits: usize,
@@ -618,6 +643,7 @@ pub fn encode_compressed_block(
     )
     .map(Buffer::into_vec)
 }
+#[cfg(feature = "write")]
 fn encode_compressed_block_with_allowance<B: Budget>(
     payload: &[u8],
     payload_bits: usize,
@@ -692,6 +718,7 @@ pub fn decode_lz(input: &[u8], algorithm_version: u8, output_size: usize) -> Res
     decoder.decode_member(input, algorithm_version, output_size, false, DecodeMode::Lz)
 }
 
+#[cfg(feature = "write")]
 pub fn encode_literal_only(data: &[u8], algorithm_version: u8) -> Result<Vec<u8>> {
     let distance_size = match algorithm_version {
         0 => DISTANCE_TABLE_SIZE_50,
@@ -741,12 +768,14 @@ pub fn encode_literal_only(data: &[u8], algorithm_version: u8) -> Result<Vec<u8>
     encode_compressed_block(&writer.finish(), payload_bits, true, true)
 }
 
+#[cfg(feature = "write")]
 pub fn encode_lz_member(data: &[u8], algorithm_version: u8) -> Result<Vec<u8>> {
     encode_lz_member_with_history(data, &[], algorithm_version)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
+#[cfg(feature = "write")]
 pub struct EncodeOptions {
     pub max_match_candidates: usize,
     pub lazy_matching: bool,
@@ -755,6 +784,7 @@ pub struct EncodeOptions {
     pub optimal_parse: bool,
 }
 
+#[cfg(feature = "write")]
 impl EncodeOptions {
     pub const fn new(max_match_candidates: usize) -> Self {
         Self {
@@ -787,12 +817,14 @@ impl EncodeOptions {
     }
 }
 
+#[cfg(feature = "write")]
 impl Default for EncodeOptions {
     fn default() -> Self {
         Self::new(MAX_MATCH_CANDIDATES)
     }
 }
 
+#[cfg(feature = "write")]
 pub fn encode_lz_member_with_history(
     data: &[u8],
     history: &[u8],
@@ -807,6 +839,7 @@ pub fn encode_lz_member_with_history(
     )
 }
 
+#[cfg(feature = "write")]
 pub fn encode_lz_member_with_options(
     data: &[u8],
     algorithm_version: u8,
@@ -816,6 +849,7 @@ pub fn encode_lz_member_with_options(
 }
 
 #[cfg(all(test, feature = "write"))]
+#[cfg(feature = "write")]
 pub(crate) fn encode_lz_member_with_options_and_progress(
     data: &[u8],
     algorithm_version: u8,
@@ -826,6 +860,7 @@ pub(crate) fn encode_lz_member_with_options_and_progress(
 }
 
 #[cfg(all(test, feature = "write"))]
+#[cfg(feature = "write")]
 pub(crate) fn encode_lz_reader_to(
     reader: &mut dyn Read,
     input_size: u64,
@@ -846,8 +881,9 @@ pub(crate) fn encode_lz_reader_to(
         &Allowance::default(),
     )
 }
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "write")]
 fn reader_to_with_allowance<B: Budget>(
     reader: &mut dyn Read,
     input_size: u64,
@@ -937,7 +973,8 @@ fn reader_to_with_allowance<B: Budget>(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
+#[cfg(feature = "write")]
 pub(crate) fn encode_lz_streaming_block(
     data: &[u8],
     history: &[u8],
@@ -959,7 +996,8 @@ pub(crate) fn encode_lz_streaming_block(
 /// Encode adjacent streaming blocks with one seeded chain finder. The first
 /// block without history keeps its existing tree parse; subsequent blocks use
 /// chains just as separately seeded streaming blocks do.
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
+#[cfg(feature = "write")]
 pub(crate) fn encode_lz_streaming_blocks(
     data: &[u8],
     history: &[u8],
@@ -979,7 +1017,7 @@ pub(crate) fn encode_lz_streaming_blocks(
     )
     .map(|outputs| outputs.into_iter().map(Buffer::into_vec).collect())
 }
-#[cfg(any(test, feature = "write"))]
+#[cfg(feature = "write")]
 pub(crate) fn streaming_blocks_with_allowance<B: Budget>(
     data: &[u8],
     history: &[u8],
@@ -1070,6 +1108,7 @@ pub(crate) fn streaming_blocks_with_allowance<B: Budget>(
     Ok(output)
 }
 
+#[cfg(feature = "write")]
 pub fn encode_lz_member_with_history_and_options(
     data: &[u8],
     history: &[u8],
@@ -1094,6 +1133,7 @@ pub(crate) enum Rar50Filter {
 
 /// The writer rejects these before compressing anything, so reaching this is
 /// either a direct `codec` caller or a bug. Either way the codec stays total.
+#[cfg(feature = "write")]
 fn rar50_filter(kind: crate::FilterKind) -> Result<Rar50Filter> {
     Rar50Filter::try_from(kind)
         .map_err(|_| Error::InvalidData("RAR 5 has no builtin type for this filter"))
@@ -1120,6 +1160,7 @@ impl TryFrom<crate::FilterKind> for Rar50Filter {
 /// Applies `filters` to a copy of `data`, returning the transformed bytes and
 /// the records that describe them.
 #[cfg(all(test, feature = "write"))]
+#[cfg(feature = "write")]
 pub(crate) fn filtered_lz_member(
     data: &[u8],
     filters: &[crate::FilterSpec],
@@ -1127,6 +1168,7 @@ pub(crate) fn filtered_lz_member(
     filtered_member_with_allowance(data, filters, &Allowance::default())
         .map(|(data, records)| (data.into_vec(), records.into_vec()))
 }
+#[cfg(feature = "write")]
 fn filtered_member_with_allowance<B: Budget>(
     data: &[u8],
     filters: &[crate::FilterSpec],
@@ -1156,6 +1198,7 @@ fn filtered_member_with_allowance<B: Budget>(
     Ok((filtered, records))
 }
 
+#[cfg(feature = "write")]
 fn encode_filter_data<B: Budget>(
     kind: Rar50Filter,
     data: &mut [u8],
@@ -1207,6 +1250,7 @@ fn encode_filter_data<B: Budget>(
 /// cost [`encode_lz_member_inner`] took off the unfiltered path and left
 /// here: at 64 KiB a block, a four-megabyte member re-copied and re-inserted
 /// 126 MiB of history, thirty-one times what it holds.
+#[cfg(feature = "write")]
 fn filtered_lz_blocks<B: Budget>(
     data: &[u8],
     filters: &[crate::FilterSpec],
@@ -1288,11 +1332,13 @@ fn filtered_lz_blocks<B: Budget>(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(feature = "write")]
 struct NormalizedFilterSpec {
     kind: Rar50Filter,
     range: Range<usize>,
 }
 
+#[cfg(feature = "write")]
 fn normalized_filter_specs<B: Budget>(
     data_len: usize,
     filters: &[crate::FilterSpec],
@@ -1312,6 +1358,7 @@ fn normalized_filter_specs<B: Budget>(
     Ok(normalized)
 }
 
+#[cfg(feature = "write")]
 fn encode_lz_member_inner(
     data: &[u8],
     history: &[u8],
@@ -1355,6 +1402,7 @@ pub(crate) fn filtered_owned_member<B: Budget>(
     filtered_member_with_allowance(data, filters, allowance).map(|(bytes, _)| bytes)
 }
 
+#[cfg(feature = "write")]
 fn encode_member_with_allowance<B: Budget>(
     data: &[u8],
     history: &[u8],
@@ -1437,6 +1485,7 @@ fn encode_member_with_allowance<B: Budget>(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "write")]
 fn encode_filtered_member_with_allowance<B: Budget>(
     data: &[u8],
     history: &[u8],
@@ -1469,6 +1518,7 @@ fn encode_filtered_member_with_allowance<B: Budget>(
 /// sets the window instead: asking for `--dict-size 32m` on a one-megabyte
 /// member should not reserve thirty-two megabytes of links that can never name
 /// a position.
+#[cfg(feature = "write")]
 fn finder_window(options: EncodeOptions, reach: usize) -> usize {
     options.max_match_distance.min(reach).max(LZ_BLOCK_SIZE)
 }
@@ -1476,6 +1526,7 @@ fn finder_window(options: EncodeOptions, reach: usize) -> usize {
 /// A finder for the whole member, seeded with the history it carries in. It
 /// keeps growing as the blocks are parsed, so it is sized to the widest window
 /// the member could ever want rather than to any one block.
+#[cfg(feature = "write")]
 fn member_finder_with_allowance<B: Budget>(
     combined: &[u8],
     start: usize,
@@ -1492,6 +1543,7 @@ fn member_finder_with_allowance<B: Budget>(
 
 /// A finder holding everything a parse of `block` may reach back to, and
 /// nothing older.
+#[cfg(feature = "write")]
 fn seeded_finder<B: Budget>(
     combined: &[u8],
     block: std::ops::Range<usize>,
@@ -1511,6 +1563,7 @@ fn seeded_finder<B: Budget>(
 }
 
 /// The search state a member shares across its blocks, when it has any.
+#[cfg(feature = "write")]
 enum MemberSearch<'a, B: Budget = Allowance> {
     /// Nothing shared: the block builds what it needs and drops it.
     Fresh,
@@ -1521,11 +1574,13 @@ enum MemberSearch<'a, B: Budget = Allowance> {
     Optimal(&'a mut OptimalCollector<B>),
 }
 
+#[cfg(feature = "write")]
 enum SharedMemberSearch<B: Budget> {
     Lazy(Rar50MatchFinder<B>),
     Optimal(OptimalCollector<B>),
 }
 
+#[cfg(feature = "write")]
 impl<B: Budget> SharedMemberSearch<B> {
     fn borrow(&mut self) -> MemberSearch<'_, B> {
         match self {
@@ -1545,6 +1600,7 @@ impl<B: Budget> SharedMemberSearch<B> {
 /// approaches that: the worst measured is about six runs per position, on a
 /// mebibyte of two-symbol noise, where every position has many candidates whose
 /// lengths creep up one byte at a time. That block cost three megabytes.
+#[cfg(feature = "write")]
 struct BlockMatches<B: Budget = Allowance> {
     /// Every position's runs, one position after another.
     runs: Buffer<(u32, u32), B>,
@@ -1569,23 +1625,27 @@ struct BlockMatches<B: Budget = Allowance> {
 /// history keeps the chains, because the only way into a tree is a descent per
 /// position, and paying that across a dictionary of history would cost more
 /// than the chains ever did.
+#[cfg(feature = "write")]
 struct OptimalCollector<B: Budget = Allowance> {
     finder: CollectorFinder<B>,
 }
 
+#[cfg(feature = "write")]
 enum CollectorFinder<B: Budget = Allowance> {
     Tree(match_finder::TreeMatchFinder<B>),
     Chains(Rar50MatchFinder<B>),
 }
 
+#[cfg(feature = "write")]
 impl OptimalCollector {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "write"))]
     fn new(combined: &[u8], start: usize, options: EncodeOptions) -> Self {
         Self::with_allowance(combined, start, options, &Allowance::default())
             .expect("unlimited collector allocation")
     }
 }
 
+#[cfg(feature = "write")]
 impl<B: Budget> OptimalCollector<B> {
     fn with_allowance(
         combined: &[u8],
@@ -1738,10 +1798,12 @@ impl<B: Budget> OptimalCollector<B> {
 ///
 /// A member with no history to carry borrows its own data rather than copying
 /// it, which is every member of a non-solid archive.
+#[cfg(feature = "write")]
 enum MemberWindow<'a, B: Budget> {
     Borrowed(&'a [u8]),
     Owned(Buffer<u8, B>),
 }
+#[cfg(feature = "write")]
 impl<B: Budget> std::ops::Deref for MemberWindow<'_, B> {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
@@ -1751,6 +1813,7 @@ impl<B: Budget> std::ops::Deref for MemberWindow<'_, B> {
         }
     }
 }
+#[cfg(feature = "write")]
 fn member_window_with_allowance<'a, B: Budget>(
     data: &'a [u8],
     history: &[u8],
@@ -1768,7 +1831,8 @@ fn member_window_with_allowance<'a, B: Budget>(
 /// One block, with its own history and its own finder. The member path shares
 /// a finder across blocks instead; this is for the callers that encode a block
 /// on its own, which are the filtered path and the tests.
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
+#[cfg(feature = "write")]
 fn encode_lz_block(
     data: &[u8],
     history: &[u8],
@@ -1793,7 +1857,8 @@ fn encode_lz_block(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
+#[cfg(feature = "write")]
 fn encode_lz_block_in_window(
     combined: &[u8],
     block: std::ops::Range<usize>,
@@ -1827,6 +1892,7 @@ fn encode_lz_block_in_window(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "write")]
 fn encode_lz_block_with_allowance<B: Budget>(
     combined: &[u8],
     block: std::ops::Range<usize>,
@@ -1869,7 +1935,8 @@ fn encode_lz_block_with_allowance<B: Budget>(
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
+#[cfg(feature = "write")]
 fn encode_token_block(
     tokens: &[EncodeToken],
     algorithm_version: u8,
@@ -1885,6 +1952,7 @@ fn encode_token_block(
     )
     .map(Buffer::into_vec)
 }
+#[cfg(feature = "write")]
 fn encode_token_block_with_allowance<B: Budget>(
     tokens: &[EncodeToken],
     algorithm_version: u8,
@@ -1985,10 +2053,12 @@ fn encode_token_block_with_allowance<B: Budget>(
 }
 
 #[derive(Debug)]
+#[cfg(feature = "write")]
 struct EncoderState<B: Budget> {
     history: Buffer<u8, B>,
     options: EncodeOptions,
 }
+#[cfg(feature = "write")]
 impl<B: Budget> EncoderState<B> {
     fn new(options: EncodeOptions, allowance: &B) -> Self {
         Self {
@@ -2045,9 +2115,11 @@ impl<B: Budget> EncoderState<B> {
 }
 
 #[derive(Debug)]
+#[cfg(feature = "write")]
 pub struct Unpack50Encoder {
     state: EncoderState<Allowance>,
 }
+#[cfg(feature = "write")]
 impl Clone for Unpack50Encoder {
     fn clone(&self) -> Self {
         Self {
@@ -2058,11 +2130,13 @@ impl Clone for Unpack50Encoder {
         }
     }
 }
+#[cfg(feature = "write")]
 impl Default for Unpack50Encoder {
     fn default() -> Self {
         Self::with_options(EncodeOptions::default())
     }
 }
+#[cfg(feature = "write")]
 impl Unpack50Encoder {
     pub fn new() -> Self {
         Self::default()
@@ -2110,6 +2184,7 @@ impl Unpack50Encoder {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "write")]
 enum EncodeToken {
     Filter(EncodeFilter),
     Literal(u8),
@@ -2117,6 +2192,7 @@ enum EncodeToken {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "write")]
 pub(crate) struct EncodeFilter {
     offset: usize,
     length: usize,
@@ -2125,12 +2201,14 @@ pub(crate) struct EncodeFilter {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+#[cfg(feature = "write")]
 struct EncoderMatchState {
     reps: [usize; 4],
     last_length: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "write")]
 enum EncodedMatch {
     LastLengthRepeat,
     RepeatDistance {
@@ -2147,6 +2225,7 @@ enum EncodedMatch {
     },
 }
 
+#[cfg(feature = "write")]
 impl EncoderMatchState {
     fn encode_match(
         &self,
@@ -2244,12 +2323,14 @@ impl EncoderMatchState {
 /// The Huffman code lengths a block of tokens produces. The block writer needs
 /// these to emit the tables; the optimal parse needs them to know what each
 /// token it is considering will actually cost.
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
+#[cfg(feature = "write")]
 fn table_lengths_for_tokens(tokens: &[EncodeToken], distance_size: usize) -> Result<OwnedLengths> {
     table_lengths_with_filters(tokens, &[], distance_size)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
+#[cfg(feature = "write")]
 fn table_lengths_with_filters(
     tokens: &[EncodeToken],
     filters: &[EncodeFilter],
@@ -2258,6 +2339,7 @@ fn table_lengths_with_filters(
     table_lengths_with_allowance(tokens, filters, distance_size, &Allowance::default())
 }
 
+#[cfg(feature = "write")]
 fn table_lengths_with_allowance<B: Budget>(
     tokens: &[EncodeToken],
     filters: &[EncodeFilter],
@@ -2312,6 +2394,7 @@ fn table_lengths_with_allowance<B: Budget>(
 
 /// Actual payload size, including the transmitted tables and filter records.
 /// Padding and block-header size are monotonic in this bit count.
+#[cfg(feature = "write")]
 fn token_stream_bits<B: Budget>(
     tokens: &[EncodeToken],
     filters: &[EncodeFilter],
@@ -2328,6 +2411,7 @@ fn token_stream_bits<B: Budget>(
     token_stream_bits_after_tables(tokens, filters, lengths, distance_size, bits)
 }
 
+#[cfg(feature = "write")]
 fn token_stream_bits_after_tables<B: Budget>(
     tokens: &[EncodeToken],
     filters: &[EncodeFilter],
@@ -2362,6 +2446,7 @@ fn token_stream_bits_after_tables<B: Budget>(
     Ok(bits)
 }
 
+#[cfg(feature = "write")]
 struct OptimalWorkspace<B: Budget = Allowance> {
     price: Buffer<u32, B>,
     arrive_length: Buffer<u32, B>,
@@ -2369,6 +2454,7 @@ struct OptimalWorkspace<B: Budget = Allowance> {
     arrive_reps: Buffer<[u32; 4], B>,
     arrive_last_length: Buffer<u32, B>,
 }
+#[cfg(feature = "write")]
 impl<B: Budget> OptimalWorkspace<B> {
     fn new(allowance: &B) -> Self {
         Self {
@@ -2385,24 +2471,29 @@ impl<B: Budget> OptimalWorkspace<B> {
 /// same bit units [`estimated_match_cost`] reports. A literal is one main-table
 /// symbol out of 256 plus the odds that the table is skewed, so eight is the
 /// floor and nine is what real blocks measure.
+#[cfg(feature = "write")]
 const ESTIMATED_LITERAL_COST: u32 = 9;
 
 /// How many times the optimal parse runs over a block. The first pass guesses
 /// prices; the rest reprice against the tables the pass before produced.
+#[cfg(feature = "write")]
 const OPTIMAL_PARSE_PASSES: usize = 3;
 
 /// What a symbol the first pass never used is assumed to cost. Reaching for
 /// one is not forbidden, only expensive: the tables are rebuilt from whatever
 /// the last pass chose, so a symbol that earns its place gets a real code.
+#[cfg(feature = "write")]
 const UNUSED_SYMBOL_COST: usize = 15;
 
 /// Prices a token against the code lengths a previous pass produced, which is
 /// what the block will really spend, rather than against the flat guess in
 /// [`estimated_match_cost`].
+#[cfg(feature = "write")]
 struct TokenPrices<'a> {
     lengths: LengthSlices<'a>,
 }
 
+#[cfg(feature = "write")]
 impl TokenPrices<'_> {
     fn code(bits: u8) -> usize {
         if bits == 0 {
@@ -2457,6 +2548,7 @@ impl TokenPrices<'_> {
     }
 }
 
+#[cfg(feature = "write")]
 struct OptimalSlices<'a> {
     price: &'a mut [u32],
     arrive_length: &'a mut [u32],
@@ -2469,6 +2561,7 @@ struct OptimalSlices<'a> {
 // for bounded and unlimited execution instead of specializing this hot loop on
 // their differently sized allocation owners and fallible push operations.
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "write")]
 fn price_optimal_paths(
     combined: &[u8],
     block: std::ops::Range<usize>,
@@ -2633,6 +2726,7 @@ fn price_optimal_paths(
 /// Does no searching of its own: `matches` holds what an [`OptimalCollector`]
 /// found at each position of this block, and prices never change what a
 /// search would find, so every pass prices the same collection.
+#[cfg(feature = "write")]
 fn optimal_tokens_in_workspace<B: Budget>(
     combined: &[u8],
     block: std::ops::Range<usize>,
@@ -2722,7 +2816,8 @@ fn optimal_tokens_in_workspace<B: Budget>(
     Ok(reversed)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
+#[cfg(feature = "write")]
 fn encode_tokens_with_progress(
     combined: &[u8],
     block: std::ops::Range<usize>,
@@ -2753,6 +2848,7 @@ fn encode_tokens_with_progress(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "write")]
 fn encode_tokens_with_allowance<B: Budget>(
     combined: &[u8],
     block: std::ops::Range<usize>,
@@ -2904,6 +3000,7 @@ fn encode_tokens_with_allowance<B: Budget>(
 /// match found one byte ahead (when computed) so the caller can reuse it for
 /// the next position instead of searching again.
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "write")]
 fn lazy_match_decision<B: Budget>(
     input: &[u8],
     pos: usize,
@@ -2944,12 +3041,14 @@ fn lazy_match_decision<B: Budget>(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "write")]
 struct MatchCandidate {
     length: usize,
     distance: usize,
     score: isize,
 }
 
+#[cfg(feature = "write")]
 fn best_match<B: Budget>(
     input: &[u8],
     pos: usize,
@@ -3007,10 +3106,12 @@ fn best_match<B: Budget>(
     best
 }
 
+#[cfg(feature = "write")]
 fn match_length(input: &[u8], pos: usize, distance: usize, max_length: usize) -> usize {
     super::fast::match_length(input, pos, distance, max_length)
 }
 
+#[cfg(feature = "write")]
 fn consider_match_candidate(
     best: &mut Option<MatchCandidate>,
     state: &EncoderMatchState,
@@ -3042,6 +3143,7 @@ fn consider_match_candidate(
 // Generic parsers can be instantiated in a different codegen unit. Keep the
 // estimate available for inlining into their per-length pricing loop.
 #[inline]
+#[cfg(feature = "write")]
 fn estimated_match_cost(
     state: &EncoderMatchState,
     length: usize,
@@ -3070,6 +3172,7 @@ fn estimated_match_cost(
         + distance_slot_bit_count(distance_slot)?)
 }
 
+#[cfg(feature = "write")]
 fn length_slot_for_match(length: usize) -> Result<(usize, usize)> {
     if length < 2 {
         return Err(Error::InvalidData("RAR 5 match length is too short"));
@@ -3077,6 +3180,7 @@ fn length_slot_for_match(length: usize) -> Result<(usize, usize)> {
     Ok(length_slot_for_valid_match(length))
 }
 
+#[cfg(feature = "write")]
 fn length_slot_for_valid_match(length: usize) -> (usize, usize) {
     debug_assert!(length >= 2);
     let value = length - 2;
@@ -3089,6 +3193,7 @@ fn length_slot_for_valid_match(length: usize) -> (usize, usize) {
     (slot, value & ((1 << bit_count) - 1))
 }
 
+#[cfg(feature = "write")]
 fn distance_slot_for_match(distance: usize, distance_size: usize) -> Result<(usize, usize)> {
     // Every emitted match comes from an earlier input position, and the two
     // production distance tables both have at least four entries.
@@ -3102,6 +3207,7 @@ fn distance_slot_for_match(distance: usize, distance_size: usize) -> Result<(usi
     Ok(result)
 }
 
+#[cfg(feature = "write")]
 fn distance_slot_for_valid_match(distance: usize) -> (usize, usize) {
     debug_assert!(distance != 0);
     let value = distance - 1;
@@ -3113,6 +3219,7 @@ fn distance_slot_for_valid_match(distance: usize) -> (usize, usize) {
     (slot, value & ((1 << bit_count) - 1))
 }
 
+#[cfg(feature = "write")]
 fn distance_slot_bit_count_valid(slot: usize) -> usize {
     if slot < 4 {
         0
@@ -3121,6 +3228,7 @@ fn distance_slot_bit_count_valid(slot: usize) -> usize {
     }
 }
 
+#[cfg(feature = "write")]
 fn literal_presence(data: &[u8]) -> [bool; 256] {
     let mut present = [false; 256];
     for &byte in data {
@@ -3149,7 +3257,7 @@ impl Unpack50Decoder {
             state: ReaderState::new(&Allowance::default()),
         }
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "write"))]
     fn copy_match(
         &self,
         output: &mut Vec<u8>,
@@ -3253,7 +3361,7 @@ impl Unpack50Decoder {
                 sink,
             )
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "write"))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn decode_to_sink_with_filters<E>(
         &mut self,
@@ -4013,7 +4121,7 @@ impl<B: Budget> StreamingOutput<B> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 fn read_compressed_block(input: &mut impl Read) -> Result<OwnedCompressedBlock> {
     read_compressed_block_with_allowance(input, &Allowance::default())
 }
@@ -4132,6 +4240,7 @@ fn read_filter_data(bits: &mut BitReader<'_>) -> Result<u32> {
     Ok(data)
 }
 
+#[cfg(feature = "write")]
 fn try_write_filter<B: Budget>(writer: &mut BitWriter<B>, filter: EncodeFilter) -> Result<()> {
     if filter.offset > u32::MAX as usize {
         return Err(Error::InvalidData("RAR 5 filter offset is too large"));
@@ -4160,6 +4269,7 @@ fn try_write_filter<B: Budget>(writer: &mut BitWriter<B>, filter: EncodeFilter) 
     Ok(())
 }
 
+#[cfg(feature = "write")]
 fn write_valid_filter<B: Budget>(writer: &mut BitWriter<B>, filter: EncodeFilter) {
     debug_assert!(u32::try_from(filter.offset).is_ok());
     debug_assert!(u32::try_from(filter.length).is_ok());
@@ -4177,6 +4287,7 @@ fn write_valid_filter<B: Budget>(writer: &mut BitWriter<B>, filter: EncodeFilter
     }
 }
 
+#[cfg(feature = "write")]
 fn try_write_filter_data<B: Budget>(writer: &mut BitWriter<B>, value: u32) -> Result<()> {
     let byte_count = filter_data_byte_count(value);
     writer
@@ -4190,6 +4301,7 @@ fn try_write_filter_data<B: Budget>(writer: &mut BitWriter<B>, value: u32) -> Re
     Ok(())
 }
 
+#[cfg(feature = "write")]
 fn write_filter_data_admitted<B: Budget>(writer: &mut BitWriter<B>, value: u32) {
     let byte_count = filter_data_byte_count(value);
     writer.write_admitted_bits(byte_count - 1, 2);
@@ -4198,11 +4310,12 @@ fn write_filter_data_admitted<B: Budget>(writer: &mut BitWriter<B>, value: u32) 
     }
 }
 
+#[cfg(feature = "write")]
 fn filter_data_byte_count(value: u32) -> usize {
     ((u32::BITS - value.leading_zeros()).div_ceil(8) as usize).max(1)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 fn apply_filters_with_control(
     output: &mut [u8],
     filters: &[PendingFilter],
@@ -4231,7 +4344,7 @@ fn apply_filters_with_allowance<B: Budget>(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 pub(crate) fn apply_filter_data(
     data: &mut [u8],
     filter: &PendingFilter,
@@ -4271,7 +4384,7 @@ fn rar50_delta_messages() -> DeltaErrorMessages {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 fn e8e9_decode(data: &mut [u8], file_offset: u32, include_e9: bool) {
     e8e9_decode_with_control(
         data,
@@ -4331,6 +4444,7 @@ fn e8e9_decode_with_control(
     Ok(())
 }
 
+#[cfg(feature = "write")]
 fn e8e9_encode(data: &mut [u8], file_offset: u32, include_e9: bool) {
     if data.len() <= 4 {
         return;
@@ -4364,7 +4478,7 @@ fn e8e9_encode(data: &mut [u8], file_offset: u32, include_e9: bool) {
 
 const X86_FILTER_FILE_SIZE: u32 = 0x0100_0000;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 fn arm_decode(data: &mut [u8], file_offset: u32) {
     arm_decode_with_control(
         data,
@@ -4399,6 +4513,7 @@ fn arm_decode_with_control(
     Ok(())
 }
 
+#[cfg(feature = "write")]
 fn arm_encode(data: &mut [u8], file_offset: u32) {
     let mut pos = 0usize;
     while pos + 3 < data.len() {
@@ -4511,7 +4626,7 @@ impl HuffmanTable {
     pub fn is_empty(&self) -> bool {
         self.state.is_empty()
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "write"))]
     fn decode(&self, bits: &mut BitReader<'_>) -> Result<usize> {
         self.state.decode(bits)
     }
@@ -4615,9 +4730,11 @@ impl<B: Budget> HuffmanState<B> {
     }
 }
 
+#[cfg(feature = "write")]
 struct EncoderCodeTable<B: Budget> {
     symbols: Buffer<(u16, u8), B>,
 }
+#[cfg(feature = "write")]
 impl<B: Budget> EncoderCodeTable<B> {
     fn from_lengths(lengths: &[u8], allowance: &B) -> Result<Self> {
         let mut counts = [0u16; 16];
@@ -4694,13 +4811,15 @@ impl<'a> BitReader<'a> {
     }
 }
 
+#[cfg(feature = "write")]
 struct BitWriter<B: Budget = Allowance> {
     bytes: Buffer<u8, B>,
     bit_pos: usize,
 }
 
+#[cfg(feature = "write")]
 impl BitWriter {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "write"))]
     fn new() -> Self {
         Self::with_allowance(&Allowance::default())
     }
@@ -4711,6 +4830,7 @@ impl BitWriter {
         self.bytes.into_vec()
     }
 }
+#[cfg(feature = "write")]
 impl<B: Budget> BitWriter<B> {
     fn with_allowance(allowance: &B) -> Self {
         Self {
@@ -4745,12 +4865,14 @@ fn validate_huffman_counts(count: &[u16; 16]) -> Result<()> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "write")]
 struct LevelToken {
     symbol: usize,
     extra_bits: u8,
     extra_value: u8,
 }
 
+#[cfg(feature = "write")]
 impl LevelToken {
     const fn plain(symbol: usize) -> Self {
         Self {
@@ -4793,12 +4915,14 @@ impl LevelToken {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
+#[cfg(feature = "write")]
 fn encode_table_level_tokens(lengths: &[u8]) -> Vec<LevelToken> {
     encode_table_level_tokens_with_allowance(lengths, &Allowance::default())
         .unwrap()
         .into_vec()
 }
+#[cfg(feature = "write")]
 fn encode_table_level_tokens_with_allowance<B: Budget>(
     lengths: &[u8],
     allowance: &B,
@@ -4835,6 +4959,7 @@ fn encode_table_level_tokens_with_allowance<B: Budget>(
     Ok(tokens)
 }
 
+#[cfg(feature = "write")]
 fn emit_repeat_level_run<B: Budget>(
     tokens: &mut Buffer<LevelToken, B>,
     mut run: usize,
@@ -4861,6 +4986,7 @@ fn emit_repeat_level_run<B: Budget>(
     Ok(())
 }
 
+#[cfg(feature = "write")]
 fn emit_zero_level_run<B: Budget>(
     tokens: &mut Buffer<LevelToken, B>,
     mut run: usize,
@@ -4905,10 +5031,12 @@ fn emit_zero_level_run<B: Budget>(
 /// gives Kraft equality by construction once two symbols are in play. The
 /// near-uniform assignment also satisfies equality for any used-symbol count,
 /// adding a phantom code when only one symbol is used.
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
+#[cfg(feature = "write")]
 fn level_code_lengths_for_tokens(tokens: &[LevelToken]) -> [u8; LEVEL_TABLE_SIZE] {
     level_code_lengths_with_allowance(tokens, &Allowance::default()).unwrap()
 }
+#[cfg(feature = "write")]
 fn level_code_lengths_with_allowance<B: Budget>(
     tokens: &[LevelToken],
     allowance: &B,
@@ -4944,6 +5072,7 @@ fn level_code_lengths_with_allowance<B: Budget>(
 /// [`write_level_lengths`] will write them, plus the tokens they code.
 ///
 /// The tokens' own extra bits are the same under either code and are left out.
+#[cfg(feature = "write")]
 fn level_code_cost(
     lengths: &[u8; LEVEL_TABLE_SIZE],
     frequencies: &[usize; LEVEL_TABLE_SIZE],
@@ -4972,10 +5101,12 @@ fn level_code_cost(
         .sum::<usize>()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
+#[cfg(feature = "write")]
 fn write_level_lengths(writer: &mut BitWriter, lengths: &[u8; LEVEL_TABLE_SIZE]) {
     try_write_level_lengths(writer, lengths).unwrap();
 }
+#[cfg(feature = "write")]
 fn try_write_level_lengths<B: Budget>(
     writer: &mut BitWriter<B>,
     lengths: &[u8; LEVEL_TABLE_SIZE],
@@ -5012,7 +5143,7 @@ fn try_write_level_lengths<B: Budget>(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 mod tests {
     use crate::codec::workspace::RefusingBudget;
 

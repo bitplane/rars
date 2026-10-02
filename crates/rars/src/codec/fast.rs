@@ -2,6 +2,7 @@
 /// extracted from a word; only the two edge bytes need masking. The final
 /// partial byte stays zero-padded so callers can inspect or resume the buffer.
 #[inline]
+#[cfg(any(test, feature = "write"))]
 pub(crate) fn write_msb_bits(
     bytes: &mut Vec<u8>,
     bit_pos: &mut usize,
@@ -35,6 +36,7 @@ pub(crate) fn write_msb_bits(
     }
 }
 
+#[cfg(any(test, feature = "write"))]
 pub(crate) fn match_length(input: &[u8], pos: usize, distance: usize, max_length: usize) -> usize {
     // Encoders supply older match-finder candidates or remembered distances
     // already admitted at an earlier position in this forward-moving parse.
@@ -44,6 +46,7 @@ pub(crate) fn match_length(input: &[u8], pos: usize, distance: usize, max_length
     match_length_scalar(input, pos, distance, max_length, 0)
 }
 
+#[cfg(any(test, feature = "write"))]
 fn match_length_scalar(
     input: &[u8],
     pos: usize,

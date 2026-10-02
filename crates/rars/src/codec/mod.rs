@@ -2,7 +2,9 @@
 
 mod fast;
 pub(crate) mod filters;
+#[cfg(any(test, feature = "write"))]
 mod huffman;
+#[cfg(any(test, feature = "write"))]
 mod match_finder;
 mod ppmd;
 pub mod rar13;
