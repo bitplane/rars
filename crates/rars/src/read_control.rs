@@ -85,14 +85,23 @@ impl ReadControl {
     pub(crate) fn check(&self) -> Result<()> {
         if let Some(state) = &self.0 {
             #[cfg(test)]
-            if state
-                .checks_remaining
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                    (n != usize::MAX).then(|| n.saturating_sub(1))
-                })
-                == Ok(0)
             {
-                state.token.cancel();
+                let mut remaining = state.checks_remaining.load(Ordering::Relaxed);
+                while remaining != usize::MAX {
+                    match state.checks_remaining.compare_exchange_weak(
+                        remaining,
+                        remaining.saturating_sub(1),
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(0) => {
+                            state.token.cancel();
+                            break;
+                        }
+                        Ok(_) => break,
+                        Err(actual) => remaining = actual,
+                    }
+                }
             }
             if state.token.is_cancelled() {
                 state.observed.store(true, Ordering::Relaxed);
