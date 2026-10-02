@@ -33,7 +33,40 @@ const DOS_ARCHIVE_ATTR: u32 = 0x20;
 const RAR15_HOST_UNIX: u8 = 3;
 const RAR50_HOST_UNIX: u64 = 1;
 
-pub(crate) use crate::pending_archive::PendingArchive;
+type PendingArchive =
+    crate::pending_archive::PendingArchive<Option<crate::streaming::CapacityCharge>>;
+
+impl PendingArchive {
+    fn path_charge(
+        resources: &WriterResources,
+        capacity: usize,
+    ) -> Result<Option<crate::streaming::CapacityCharge>> {
+        let mut charge = resources.execution_charge();
+        if let Some(charge) = &mut charge {
+            charge.grow_to(capacity as u64)?;
+        }
+        Ok(charge)
+    }
+
+    fn with_resources(destination: &Path, resources: &WriterResources) -> Result<(Self, fs::File)> {
+        Self::with_admission(destination, |capacity| {
+            Self::path_charge(resources, capacity)
+        })
+    }
+
+    #[cfg(test)]
+    fn with_sequence(
+        destination: &Path,
+        resources: &WriterResources,
+        next_sequence: impl FnMut() -> u64,
+    ) -> Result<(Self, fs::File)> {
+        Self::create_with_sequence(
+            destination,
+            |capacity| Self::path_charge(resources, capacity),
+            next_sequence,
+        )
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 enum EntryAttributes {

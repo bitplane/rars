@@ -1,33 +1,34 @@
 //! Temporary archive publication shared by writing and recovery repair.
 
-use crate::{Error, Result, WriterResources};
+use crate::{Error, Result};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-pub(crate) struct PendingArchive {
+pub(crate) struct PendingArchive<C = ()> {
     pub(crate) path: Option<PathBuf>,
-    _charge: Option<crate::streaming::CapacityCharge>,
+    _charge: C,
 }
 
-impl PendingArchive {
+impl PendingArchive<()> {
     pub(crate) fn create(destination: &Path) -> Result<(Self, fs::File)> {
-        Self::with_resources(destination, &WriterResources::default())
+        Self::with_admission(destination, |_| Ok(()))
     }
-    pub(crate) fn with_resources(
+}
+
+impl<C> PendingArchive<C> {
+    pub(crate) fn with_admission(
         destination: &Path,
-        resources: &WriterResources,
+        admit: impl FnMut(usize) -> Result<C>,
     ) -> Result<(Self, fs::File)> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        Self::with_sequence(destination, resources, || {
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        })
+        Self::create_with_sequence(destination, admit, || NEXT.fetch_add(1, Ordering::Relaxed))
     }
 
-    pub(crate) fn with_sequence(
+    pub(crate) fn create_with_sequence(
         destination: &Path,
-        resources: &WriterResources,
+        mut admit: impl FnMut(usize) -> Result<C>,
         mut next_sequence: impl FnMut() -> u64,
     ) -> Result<(Self, fs::File)> {
         for _ in 0..128 {
@@ -48,10 +49,9 @@ impl PendingArchive {
                 .len()
                 .checked_add(1 + name_len)
                 .ok_or(Error::InvalidArgument("temporary path capacity overflows"))?;
-            let mut charge = resources.execution_charge();
-            if let Some(charge) = &mut charge {
-                charge.grow_to(capacity as u64)?;
-            }
+            // Keep admission before allocation and hold its owner until this
+            // pending archive is published or removed.
+            let charge = admit(capacity)?;
             let mut path = PathBuf::with_capacity(capacity);
             path.push(directory);
             path.push(name);
@@ -77,7 +77,7 @@ impl PendingArchive {
     }
 }
 
-impl Drop for PendingArchive {
+impl<C> Drop for PendingArchive<C> {
     fn drop(&mut self) {
         if let Some(path) = &self.path {
             let _ = fs::remove_file(path);
