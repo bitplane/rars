@@ -2941,6 +2941,24 @@ mod tests {
     }
 
     #[test]
+    fn recovery_end_header_requires_keys_for_encrypted_archive() {
+        let bytes = include_bytes!("../tests/fixtures/rar50/header_encrypted.rar");
+        assert!(matches!(
+            recovery_end_header(bytes, crate::ArchiveReadOptions::new()),
+            Err(Error::NeedPassword)
+        ));
+        assert!(matches!(
+            recovery_end_header(bytes, crate::ArchiveReadOptions::with_password(b"wrong")),
+            Err(Error::WrongPasswordOrCorruptData)
+        ));
+        assert!(
+            !recovery_end_header(bytes, crate::ArchiveReadOptions::with_password(b"password"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn header_fields_reject_truncation_overflow_and_unexpected_encryption() {
         let image = |body: &[u8]| {
             assert!(body.len() < 128);
