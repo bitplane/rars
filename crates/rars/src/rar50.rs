@@ -3173,6 +3173,119 @@ mod tests {
     }
 
     #[test]
+    fn file_extra_field_failures_reach_both_archive_readers() {
+        fn image(body: &[u8]) -> Vec<u8> {
+            let mut encoded = vec![body.len() as u8];
+            encoded.extend_from_slice(body);
+            let mut header = crc32(&encoded).to_le_bytes().to_vec();
+            header.extend_from_slice(&encoded);
+            header
+        }
+        let mut records = Vec::new();
+        for mut crypt in [vec![0, 0, 0], vec![0, 1, 0]] {
+            crypt.extend_from_slice(&[0; 32]); // Salt and IV.
+            if crypt[1] == 1 {
+                crypt.extend_from_slice(&[0; 12]); // Optional password check.
+            }
+            for included in 0..=crypt.len() {
+                records.push((
+                    FHEXTRA_CRYPT as u8,
+                    crypt[..included].to_vec(),
+                    included == crypt.len(),
+                ));
+            }
+        }
+        records.extend([
+            (FHEXTRA_HASH as u8, vec![], false),
+            (FHEXTRA_HASH as u8, vec![0], true),
+            (FHEXTRA_REDIR as u8, vec![], false),
+            (FHEXTRA_REDIR as u8, vec![1], false),
+            (FHEXTRA_REDIR as u8, vec![1, 0], false),
+            (FHEXTRA_REDIR as u8, vec![1, 0, 1], false),
+            (FHEXTRA_REDIR as u8, vec![1, 0, 1, b'y'], true),
+        ]);
+        for (kind, record, valid) in records {
+            let mut extra = vec![(record.len() + 1) as u8, kind];
+            extra.extend_from_slice(&record);
+            let mut file_body = vec![
+                HEAD_FILE as u8,
+                HFL_EXTRA as u8,
+                extra.len() as u8,
+                0,
+                0,
+                0,
+                0,
+                0,
+                1,
+                b'x',
+            ];
+            file_body.extend_from_slice(&extra);
+            let mut bytes = RAR50_SIGNATURE.to_vec();
+            bytes.extend_from_slice(&image(&[HEAD_MAIN as u8, 0, 0]));
+            let offset = bytes.len();
+            bytes.extend_from_slice(&image(&file_body));
+            for result in [
+                Archive::parse(&bytes),
+                Archive::parse_file_backed(
+                    &mut std::io::Cursor::new(&bytes),
+                    bytes.len(),
+                    0,
+                    ArchiveSource::Memory(Arc::from(bytes.clone())),
+                    crate::ArchiveReadOptions::new(),
+                ),
+            ] {
+                if valid {
+                    assert_eq!(result.unwrap().files().count(), 1);
+                } else {
+                    let error = result.unwrap_err();
+                    assert!(
+                        matches!(error, Error::AtArchiveOffset { offset: actual, .. } if actual == offset)
+                    );
+                    assert!(matches!(
+                        error.root_cause(),
+                        Error::TooShort | Error::InvalidHeader(_)
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn main_volume_and_first_crypt_fields_reject_truncation() {
+        fn image(body: &[u8]) -> Vec<u8> {
+            let mut encoded = vec![body.len() as u8];
+            encoded.extend_from_slice(body);
+            let mut header = crc32(&encoded).to_le_bytes().to_vec();
+            header.extend_from_slice(&encoded);
+            header
+        }
+        for body in [
+            &[HEAD_MAIN as u8, 0, MHFL_VOLUME_NUMBER as u8][..],
+            &[HEAD_CRYPT as u8, 0][..],
+            &[HEAD_CRYPT as u8, 0, 0][..],
+        ] {
+            let mut bytes = RAR50_SIGNATURE.to_vec();
+            bytes.extend_from_slice(&image(body));
+            for result in [
+                Archive::parse(&bytes),
+                Archive::parse_file_backed(
+                    &mut std::io::Cursor::new(&bytes),
+                    bytes.len(),
+                    0,
+                    ArchiveSource::Memory(Arc::from(bytes.clone())),
+                    crate::ArchiveReadOptions::new(),
+                ),
+            ] {
+                assert!(matches!(result.unwrap_err().root_cause(), Error::TooShort));
+            }
+        }
+        let mut bytes = RAR50_SIGNATURE.to_vec();
+        bytes.extend_from_slice(&image(&[HEAD_MAIN as u8, 0, MHFL_VOLUME_NUMBER as u8, 3]));
+        let archive = Archive::parse(&bytes).unwrap();
+        assert_eq!(archive.main.volume_number, Some(3));
+    }
+
+    #[test]
     fn unknown_header_remains_readable_and_budget_error_keeps_one_offset() {
         let header = |body: &[u8]| {
             let mut encoded = vec![body.len() as u8];
