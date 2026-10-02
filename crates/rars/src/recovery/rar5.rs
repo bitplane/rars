@@ -3025,6 +3025,41 @@ mod tests {
         );
     }
 
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn rar5_prefix_split_rejects_unrepresentable_native_geometry() {
+        let plan = InlineRecoveryPlan {
+            data_shards: u32::MAX as u64 + 1,
+            recovery_shards: 1,
+            group_count: 1,
+            header_size: 80,
+            shard_size: 81,
+        };
+        assert_eq!(split_prefix_shard_ranges(0, plan), Err(Error::PlanOverflow));
+        assert_eq!(
+            split_prefix_shard_ranges(
+                0,
+                InlineRecoveryPlan {
+                    data_shards: 1,
+                    group_count: u32::MAX as u64 + 1,
+                    ..plan
+                }
+            ),
+            Err(Error::PlanOverflow)
+        );
+        assert_eq!(
+            split_prefix_shards(
+                b"",
+                InlineRecoveryPlan {
+                    data_shards: 1,
+                    group_count: u32::MAX as u64 + 1,
+                    ..plan
+                }
+            ),
+            Err(Error::PlanOverflow)
+        );
+    }
+
     #[test]
     fn rar5_prefix_split_handles_extra_empty_data_shards() {
         let plan = InlineRecoveryPlan {
@@ -3772,6 +3807,19 @@ mod tests {
         assert_eq!(
             repair_inline_recovery_archive(&beyond_end),
             Err(Error::BadRecoveryChunk)
+        );
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn rar5_archive_repair_rejects_protected_size_above_native_range() {
+        let mut chunk = build_structural_inline_recovery_data(b"x", 10).unwrap();
+        chunk[0x22..0x2a].copy_from_slice(&(u32::MAX as u64 + 1).to_le_bytes());
+        let crc = crc64_xz(&chunk[0x0c..]);
+        chunk[0x04..0x0c].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(
+            repair_inline_recovery_archive(&chunk),
+            Err(Error::PlanOverflow)
         );
     }
 
