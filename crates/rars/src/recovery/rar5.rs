@@ -1324,9 +1324,9 @@ fn rebuild_inline_recovery_record_with_control(
     if rebuilt.len() != record.len() {
         return Err(Error::BadRecoveryChunk);
     }
-    let gap = input
-        .get(repaired_prefix.len()..record.start)
-        .ok_or(Error::BadRecoveryChunk)?;
+    // record.start came from a parsed chunk within input, and the prefix
+    // boundary was checked above.
+    let gap = &input[repaired_prefix.len()..record.start];
     let mut out = Vec::with_capacity(input.len().max(record.end));
     out.extend_from_slice(repaired_prefix);
     out.extend_from_slice(gap);
@@ -1412,11 +1412,11 @@ fn append_inline_recovery_chunk(
     found: &FoundInlineRecoveryChunk,
     out: &mut Vec<u8>,
 ) -> Result<()> {
-    let shard_size =
-        usize::try_from(found.chunk.plan.shard_size).map_err(|_| Error::PlanOverflow)?;
+    // The scanner parsed this complete u32-sized shard from input[start..].
+    let shard_size = found.chunk.plan.shard_size as usize;
     let start = found.offset;
-    let end = start.checked_add(shard_size).ok_or(Error::PlanOverflow)?;
-    out.extend_from_slice(input.get(start..end).ok_or(Error::BadRecoveryChunk)?);
+    let end = start + shard_size;
+    out.extend_from_slice(&input[start..end]);
     Ok(())
 }
 
@@ -3884,6 +3884,23 @@ mod tests {
     #[test]
     fn rar5_record_rebuild_checks_resource_and_record_length() {
         let control = crate::read_control::ReadControl::default();
+        let impossible = InlineRecoveryPlan {
+            data_shards: 1,
+            recovery_shards: u64::MAX,
+            group_count: 2,
+            header_size: 80,
+            shard_size: 82,
+        };
+        assert_eq!(
+            super::rebuild_inline_recovery_record_with_control(
+                &[],
+                b"x",
+                0..0,
+                impossible,
+                &control
+            ),
+            Err(Error::PlanOverflow)
+        );
         let huge = InlineRecoveryPlan {
             data_shards: 1,
             recovery_shards: 1000,
