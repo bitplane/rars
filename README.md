@@ -71,13 +71,13 @@ recovery algorithms, cryptographic dependencies or Rayon:
 
 ```toml
 [dependencies]
-rars = { version = "0.9", default-features = false }
+rars = { version = "0.10", default-features = false }
 ```
 
 Enable encrypted reading independently when needed:
 
 ```toml
-rars = { version = "0.9", default-features = false, features = ["encryption"] }
+rars = { version = "0.10", default-features = false, features = ["encryption"] }
 ```
 
 | Feature | Adds |

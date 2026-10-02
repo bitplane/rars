@@ -4072,7 +4072,7 @@ mod solid_regressions {
 
         let prefix = b"abcdefghijkl";
         let mut long = Vec::new();
-        for suffix in [b'X', b'Y', b'Z'] {
+        for suffix in *b"XYZ" {
             long.extend_from_slice(prefix);
             long.push(suffix);
         }
