@@ -586,27 +586,25 @@ pub(crate) fn streamed_recovery_with_allowance<B: Budget>(
     for shard_index in 0..recovery_shards {
         check_recovery_cancelled(progress)?;
         let mut header = Buffer::filled(header_size, 0u8, allowance)?;
-        let mut writer = std::io::Cursor::new(&mut header[..]);
-        use std::io::Write;
-        writer.write_all(b"{RB}")?;
-        writer.write_all(&0u64.to_le_bytes())?;
-        writer.write_all(&total_size.to_le_bytes())?;
-        writer.write_all(&header_size_u32.to_le_bytes())?;
-        writer.write_all(&[1])?;
-        writer.write_all(&[1])?;
-        writer.write_all(&0u64.to_le_bytes())?;
-        writer.write_all(&chunk_data_extent_u32.to_le_bytes())?;
-        writer.write_all(&body_len.to_le_bytes())?;
-        writer.write_all(&plan.group_count.to_le_bytes())?;
-        writer.write_all(&plan.shard_size.to_le_bytes())?;
-        writer.write_all(&data_shards_u16.to_le_bytes())?;
-        writer.write_all(&recovery_shards_u16.to_le_bytes())?;
-        // The loop bound was checked as u16 before writing any chunk.
-        writer.write_all(&(shard_index as u16).to_le_bytes())?;
-        for &state in shard_states.iter() {
-            writer.write_all(&state.to_le_bytes())?;
+        // The validated header size is exactly 0x48 + 8 * data_shards.
+        // Writing its fields directly removes impossible short writes to a
+        // fixed-size in-memory Cursor while retaining the RAR wire layout.
+        header[0x00..0x04].copy_from_slice(b"{RB}");
+        header[0x0c..0x10].copy_from_slice(&total_size.to_le_bytes());
+        header[0x10..0x14].copy_from_slice(&header_size_u32.to_le_bytes());
+        header[0x14] = 1;
+        header[0x15] = 1;
+        header[0x1e..0x22].copy_from_slice(&chunk_data_extent_u32.to_le_bytes());
+        header[0x22..0x2a].copy_from_slice(&body_len.to_le_bytes());
+        header[0x2a..0x32].copy_from_slice(&plan.group_count.to_le_bytes());
+        header[0x32..0x3a].copy_from_slice(&plan.shard_size.to_le_bytes());
+        header[0x3a..0x3c].copy_from_slice(&data_shards_u16.to_le_bytes());
+        header[0x3c..0x3e].copy_from_slice(&recovery_shards_u16.to_le_bytes());
+        header[0x3e..0x40].copy_from_slice(&(shard_index as u16).to_le_bytes());
+        for (index, &state) in shard_states.iter().enumerate() {
+            header[0x40 + index * 8..0x48 + index * 8].copy_from_slice(&state.to_le_bytes());
         }
-        writer.write_all(&final_state.to_le_bytes())?;
+        header[header_size - 8..].copy_from_slice(&final_state.to_le_bytes());
         // The chunk CRC covers everything from 0x0c onwards, so compute it
         // over the header and the parity row before either is emitted.
         let mut chunk_crc = crc64_update(&header[0x0c..], CRC64_XZ_INIT);
