@@ -3297,7 +3297,7 @@ mod tests {
     }
 
     #[test]
-    fn rar5_range_repair_rejects_short_callback_reads() {
+    fn rar5_range_repair_preserves_short_and_failed_callback_reads() {
         let prefix = recovery_test_bytes(32_000, 41);
         let recovery_data = build_structural_inline_recovery_data(&prefix, 20).unwrap();
         let mut damaged = prefix.clone();
@@ -3308,6 +3308,14 @@ mod tests {
                 Ok(damaged[range.start..range.end - 1].to_vec())
             });
         assert_eq!(short_first, Err(Error::ShardSizeMismatch));
+        let failed_first =
+            repair_inline_recovery_prefix_shards(prefix.len(), &recovery_data, |_| {
+                Err(Error::Io(std::io::ErrorKind::PermissionDenied))
+            });
+        assert_eq!(
+            failed_first,
+            Err(Error::Io(std::io::ErrorKind::PermissionDenied))
+        );
 
         let mut reads = 0;
         let data_shards = plan_inline_recovery(prefix.len() as u64, 20)
@@ -3324,6 +3332,22 @@ mod tests {
                 Ok(damaged[range.start..end].to_vec())
             });
         assert_eq!(short_second, Err(Error::ShardSizeMismatch));
+        assert!(reads > data_shards);
+
+        reads = 0;
+        let failed_second =
+            repair_inline_recovery_prefix_shards(prefix.len(), &recovery_data, |range| {
+                reads += 1;
+                if reads > data_shards {
+                    Err(Error::Io(std::io::ErrorKind::PermissionDenied))
+                } else {
+                    Ok(damaged[range].to_vec())
+                }
+            });
+        assert_eq!(
+            failed_second,
+            Err(Error::Io(std::io::ErrorKind::PermissionDenied))
+        );
         assert!(reads > data_shards);
     }
 
