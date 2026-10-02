@@ -3622,6 +3622,29 @@ mod tests {
     }
 
     #[test]
+    fn rar5_prefix_repair_rejects_duplicate_parity_rows() {
+        let prefix = recovery_test_bytes(10_000, 83);
+        let plan = plan_inline_recovery(prefix.len() as u64, 20).unwrap();
+        assert!(plan.recovery_shards >= 2);
+        let recovery_data = build_structural_inline_recovery_data(&prefix, 20).unwrap();
+        let first = &recovery_data[..plan.shard_size as usize];
+        let duplicated = [first, first].concat();
+        let mut damaged = prefix.clone();
+        damaged[0] ^= 1;
+        damaged[plan.group_count as usize] ^= 1;
+        assert_eq!(
+            repair_inline_recovery_prefix(&damaged, &duplicated),
+            Err(Error::SingularElement)
+        );
+        assert_eq!(
+            repair_inline_recovery_prefix_shards(prefix.len(), &duplicated, |range| {
+                Ok(damaged[range].to_vec())
+            }),
+            Err(Error::SingularElement)
+        );
+    }
+
+    #[test]
     fn rar5_range_repair_restores_short_final_shard() {
         let prefix = recovery_test_bytes(10_001, 79);
         let plan = plan_inline_recovery(prefix.len() as u64, 20).unwrap();
