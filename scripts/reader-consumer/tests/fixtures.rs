@@ -433,3 +433,106 @@ fn unavailable_low_level_key_derivation_keeps_a_typed_error() {
         }
     );
 }
+
+#[cfg(any(feature = "full", feature = "write"))]
+#[test]
+fn independent_writer_round_trips_plaintext_in_every_generation() {
+    let contents = b"independent writer feature\n";
+    for version in rars::ArchiveVersion::ALL {
+        let mut builder = rars::Builder::new(version).store(true);
+        builder
+            .add_bytes(b"file".to_vec(), contents.to_vec(), None, None)
+            .unwrap();
+        let bytes = builder.to_bytes().unwrap();
+        let archive = ArchiveReader::read(&bytes).unwrap();
+        let output = Rc::new(RefCell::new(Vec::new()));
+        archive
+            .extract_to(None, |_| Ok(Box::new(Collect(output.clone()))))
+            .unwrap();
+        assert_eq!(&*output.borrow(), contents, "{version:?}");
+    }
+}
+
+#[test]
+fn buffered_extraction_matches_sequential_with_or_without_rayon() {
+    for name in [
+        "rar50/filter_e8e9.rar",
+        "rar15_40/rar300/solid_simple_rar300.rar",
+    ] {
+        let expected = decode(name);
+        let archive = ArchiveReader::read(&fixture(name)).unwrap();
+        let mut outputs = Vec::new();
+        archive
+            .extract_to_parallel_buffered(None, |_| {
+                let output = Rc::new(RefCell::new(Vec::new()));
+                outputs.push(output.clone());
+                Ok(Box::new(Collect(output)))
+            })
+            .unwrap();
+        let actual: Vec<_> = outputs
+            .into_iter()
+            .map(|output| Rc::try_unwrap(output).unwrap().into_inner())
+            .collect();
+        assert_eq!(actual, expected, "{name}");
+    }
+}
+
+#[cfg(any(feature = "full", all(feature = "write", feature = "encryption")))]
+#[test]
+fn independent_encrypted_writer_round_trips_payloads_and_headers() {
+    let contents = b"independent encrypted writer\n";
+    for version in rars::ArchiveVersion::ALL {
+        let headers_supported = matches!(
+            version,
+            rars::ArchiveVersion::Rar30
+                | rars::ArchiveVersion::Rar40
+                | rars::ArchiveVersion::Rar50
+                | rars::ArchiveVersion::Rar70
+        );
+        for headers in [false, true]
+            .into_iter()
+            .filter(|headers| !headers || headers_supported)
+        {
+            let mut builder = rars::Builder::new(version)
+                .store(true)
+                .password(Some(b"password".to_vec()))
+                .header_encryption(headers);
+            builder
+                .add_bytes(b"secret".to_vec(), contents.to_vec(), None, None)
+                .unwrap();
+            let bytes = builder.to_bytes().unwrap();
+            let options = rars::ArchiveReadOptions::with_password(b"password");
+            let archive = ArchiveReader::read_with_options(&bytes, options).unwrap();
+            let output = Rc::new(RefCell::new(Vec::new()));
+            archive
+                .extract_to_with_options(options, |_| Ok(Box::new(Collect(output.clone()))))
+                .unwrap();
+            assert_eq!(
+                &*output.borrow(),
+                contents,
+                "{version:?}, encrypted headers: {headers}"
+            );
+        }
+    }
+}
+
+#[cfg(any(feature = "full", all(feature = "write", feature = "recovery")))]
+#[test]
+fn independent_recovery_writer_repairs_damaged_plaintext() {
+    let contents = b"independent recovery writer\n".repeat(128);
+    let mut builder = rars::Builder::new(rars::ArchiveVersion::Rar50)
+        .store(true)
+        .recovery_percent(Some(20));
+    builder
+        .add_bytes(b"file".to_vec(), contents, None, None)
+        .unwrap();
+    let bytes = builder.to_bytes().unwrap();
+    let archive = rars::rar50::Archive::parse(&bytes).unwrap();
+    let range = archive.files().next().unwrap().block.data_range.clone();
+    let mut damaged = bytes.clone();
+    damaged[range.start..range.start + 32].fill(0xa5);
+    let archive = ArchiveReader::read(&damaged).unwrap();
+    let repaired = archive.repair_recovery_with_report(None).unwrap();
+    assert!(repaired.report.changed);
+    assert_eq!(repaired.data, bytes);
+}
