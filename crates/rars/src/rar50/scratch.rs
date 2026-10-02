@@ -1,6 +1,6 @@
 use super::*;
 use crate::codec::rar50::{apply_filter_data_with_allowance, FilterType, PendingFilter};
-use crate::streaming::Spool;
+use crate::temp_file::TemporaryFile;
 use std::cell::RefCell;
 use std::io::{Seek, SeekFrom};
 use std::rc::Rc;
@@ -10,7 +10,7 @@ struct DiskBudget {
     limit: u64,
 }
 struct ScratchFile {
-    spool: Spool,
+    spool: TemporaryFile,
     budget: Rc<RefCell<DiskBudget>>,
     pos: u64,
     len: u64,
@@ -18,9 +18,8 @@ struct ScratchFile {
 
 impl ScratchFile {
     fn create(policy: &crate::Rar50Scratch, budget: &Rc<RefCell<DiskBudget>>) -> Result<Self> {
-        let resources = crate::WriterResources::new(0).with_temp_dir(&policy.directory);
         Ok(Self {
-            spool: Spool::create(&resources)?,
+            spool: TemporaryFile::create(&policy.directory)?,
             budget: budget.clone(),
             pos: 0,
             len: 0,

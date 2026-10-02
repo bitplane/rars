@@ -52,6 +52,7 @@ mod rewrite_staging;
 pub use rewrite_staging::RewriteStaging;
 mod source;
 mod streaming;
+mod temp_file;
 pub mod timestamp;
 pub use file_times::{FileTimes, FileTimestamp};
 mod tzif;

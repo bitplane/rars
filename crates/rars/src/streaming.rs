@@ -7,7 +7,9 @@ use std::fmt;
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 /// Default aggregate compression workspace budget (256 MiB).
@@ -734,8 +736,6 @@ pub(crate) struct MemoryPermit {
     bytes: u64,
 }
 
-static SPOOL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
 /// Where a spool keeps its bytes.
 ///
 /// A file on every real platform, which is the point: the RAR 5 writer spools
@@ -765,75 +765,39 @@ pub(crate) struct Spool {
 impl Spool {
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub(crate) fn create(resources: &WriterResources) -> Result<Self> {
-        Self::create_with_sequence(resources, || SPOOL_SEQUENCE.fetch_add(1, Ordering::Relaxed))
+        Self::create_with_sequence(resources, crate::temp_file::next_sequence)
     }
 
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     fn create_with_sequence(
         resources: &WriterResources,
-        mut next_sequence: impl FnMut() -> u64,
+        next_sequence: impl FnMut() -> u64,
     ) -> Result<Self> {
         let directory = resources.temp_dir().unwrap_or_else(|| Path::new("."));
-        for _ in 0..128 {
-            let sequence = next_sequence();
-            // Prefix (12), u32 process ID (at most 10), separator (1), and
-            // u64 hex sequence (16) total at most 39 bytes in this buffer.
-            let mut name = [0u8; 64];
-            let mut name_writer = std::io::Cursor::new(&mut name[..]);
-            write!(
-                name_writer,
-                ".rars-spool-{}-{sequence:016x}",
-                std::process::id()
-            )
-            .expect("spool name fits its fixed buffer");
-            let name_len = name_writer.position() as usize;
-            let name = std::str::from_utf8(&name[..name_len]).expect("ASCII spool name");
-            let capacity = directory
-                .as_os_str()
-                .len()
-                .checked_add(1 + name_len)
-                .ok_or(Error::InvalidArgument("spool path capacity overflows"))?;
-            let mut path_charge = CapacityCharge::new(resources, &None);
-            if let Some(charge) = &mut path_charge {
-                charge.grow_to(capacity as u64)?;
-            }
-            let mut path = PathBuf::with_capacity(capacity);
-            path.push(directory);
-            path.push(name);
-            let mut options = File::options();
-            options.read(true).write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                // Encryption happens after compression; the temporary payload
-                // must not inherit the usual world-readable creation mode.
-                options.mode(0o600);
-            }
-            match options.open(&path) {
-                Ok(file) => {
-                    return Ok(Self {
-                        path,
-                        _path_charge: path_charge,
-                        file: Some(file),
-                        len: 0,
-                        pos: 0,
-                        charge: StorageCharge::new(resources),
-                    })
+        let (path, file, path_charge) = crate::temp_file::create_with_sequence(
+            directory,
+            |capacity| {
+                let mut charge = CapacityCharge::new(resources, &None);
+                if let Some(charge) = &mut charge {
+                    charge.grow_to(capacity as u64)?;
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "could not allocate a unique rars spool file",
-        )
-        .into())
+                Ok(charge)
+            },
+            next_sequence,
+        )?;
+        Ok(Self {
+            path,
+            _path_charge: path_charge,
+            file: Some(file),
+            len: 0,
+            pos: 0,
+            charge: StorageCharge::new(resources),
+        })
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     pub(crate) fn create(resources: &WriterResources) -> Result<Self> {
-        SPOOL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        crate::temp_file::next_sequence();
         Ok(Self {
             file: Some(memory_spool::MemorySpool::new(resources)),
             len: 0,
