@@ -880,11 +880,9 @@ impl Archive {
         control.check()?;
         let recovery = self.recovery_service()?;
         let prefix_start = self.sfx_offset;
-        let prefix_end = recovery
-            .block
-            .offset
+        let prefix_end = recovery.block.offset;
+        let prefix_len = prefix_end
             .checked_sub(prefix_start)
-            .and_then(|relative| prefix_start.checked_add(relative))
             .ok_or(Error::InvalidHeader(
                 "RAR 5 recovery prefix range overflows archive bounds",
             ))?;
@@ -894,22 +892,15 @@ impl Archive {
                 "RAR 5 recovery prefix is out of bounds",
             ));
         }
-        let prefix_len = prefix_end
-            .checked_sub(prefix_start)
-            .ok_or(Error::InvalidHeader(
-                "RAR 5 recovery prefix range overflows archive bounds",
-            ))?;
         let repaired_shards =
             crate::recovery::rar5::repair_inline_recovery_prefix_shards_with_control(
                 prefix_len,
                 recovery_data,
                 |range| {
-                    let start = prefix_start
-                        .checked_add(range.start)
-                        .ok_or(crate::recovery::rar5::Error::PlanOverflow)?;
-                    let end = prefix_start
-                        .checked_add(range.end)
-                        .ok_or(crate::recovery::rar5::Error::PlanOverflow)?;
+                    // The repair helper bounds every range by prefix_len, and
+                    // prefix_start + prefix_len equals admitted prefix_end.
+                    let start = prefix_start + range.start;
+                    let end = prefix_start + range.end;
                     self.read_range(start..end)
                         .map_err(|_| crate::recovery::rar5::Error::BadRecoveryChunk)
                 },

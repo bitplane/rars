@@ -2017,6 +2017,15 @@ fn rar50_recovery_rejects_a_public_service_offset_past_the_archive() {
             "RAR 5 recovery prefix is out of bounds"
         ))
     ));
+
+    let mut archive = Archive::parse(&bytes).unwrap();
+    archive.sfx_offset = bytes.len() + 1;
+    assert!(matches!(
+        archive.repair_recovery(),
+        Err(Error::InvalidHeader(
+            "RAR 5 recovery prefix range overflows archive bounds"
+        ))
+    ));
 }
 
 #[test]
