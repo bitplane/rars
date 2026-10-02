@@ -479,14 +479,17 @@ pub(crate) fn streamed_recovery_with_allowance<B: Budget>(
 
     // Fail on unrepresentable geometry before doing any work.
     let total_size = u32::try_from(plan.shard_size).map_err(|_| Error::PlanOverflow)?;
-    let header_size_u32 = u32::try_from(plan.header_size).map_err(|_| Error::PlanOverflow)?;
+    // shard_size >= header_size was checked above, and shard_size fits u32.
+    let header_size_u32 = plan.header_size as u32;
     let data_shards_u16 = u16::try_from(plan.data_shards).map_err(|_| Error::PlanOverflow)?;
     let recovery_shards_u16 =
         u16::try_from(plan.recovery_shards).map_err(|_| Error::PlanOverflow)?;
-    let data_shards = usize::try_from(plan.data_shards).map_err(|_| Error::PlanOverflow)?;
-    let recovery_shards = usize::try_from(plan.recovery_shards).map_err(|_| Error::PlanOverflow)?;
-    let group_count = usize::try_from(plan.group_count).map_err(|_| Error::PlanOverflow)?;
-    let header_size = usize::try_from(plan.header_size).map_err(|_| Error::PlanOverflow)?;
+    // Both shard counts fit u16; group_count and header_size are bounded by
+    // the admitted u32 shard_size. All four fit native usize, including i386.
+    let data_shards = plan.data_shards as usize;
+    let recovery_shards = plan.recovery_shards as usize;
+    let group_count = plan.group_count as usize;
+    let header_size = plan.header_size as usize;
     if body_len > plan.group_count.saturating_mul(plan.data_shards) {
         return Err(Error::PrefixExceedsPlan);
     }
@@ -575,8 +578,8 @@ pub(crate) fn streamed_recovery_with_allowance<B: Budget>(
                 .saturating_mul(plan.data_shards.saturating_sub(1)),
         )
         .min(plan.group_count);
-    let chunk_data_extent_u32 =
-        u32::try_from(chunk_data_extent).map_err(|_| Error::PlanOverflow)?;
+    // The extent cannot exceed group_count, already bounded by shard_size.
+    let chunk_data_extent_u32 = chunk_data_extent as u32;
 
     let mut payload_crc32 = crate::crc32::Crc32::new();
     let mut written = 0u64;
@@ -2490,6 +2493,66 @@ mod tests {
         let allowance = Allowance::limited(2 * 1048576);
         for (name, plan, expected) in [
             (
+                "payload length overflow",
+                InlineRecoveryPlan {
+                    recovery_shards: u64::MAX,
+                    ..valid
+                },
+                Error::PlanOverflow,
+            ),
+            (
+                "header state multiplication overflow",
+                InlineRecoveryPlan {
+                    data_shards: u64::MAX,
+                    ..valid
+                },
+                Error::PlanOverflow,
+            ),
+            (
+                "header state addition overflow",
+                InlineRecoveryPlan {
+                    data_shards: (u64::MAX - 0x48) / 8 + 1,
+                    ..valid
+                },
+                Error::PlanOverflow,
+            ),
+            (
+                "shard length addition overflow",
+                InlineRecoveryPlan {
+                    group_count: u64::MAX,
+                    ..valid
+                },
+                Error::PlanOverflow,
+            ),
+            (
+                "u32 shard length",
+                InlineRecoveryPlan {
+                    group_count: u32::MAX as u64,
+                    shard_size: u32::MAX as u64 + valid.header_size,
+                    ..valid
+                },
+                Error::PlanOverflow,
+            ),
+            (
+                "u16 data count",
+                InlineRecoveryPlan {
+                    data_shards: u16::MAX as u64 + 1,
+                    group_count: 0,
+                    header_size: 0x48 + 8 * (u16::MAX as u64 + 1),
+                    shard_size: 0x48 + 8 * (u16::MAX as u64 + 1),
+                    ..valid
+                },
+                Error::PlanOverflow,
+            ),
+            (
+                "u16 recovery count",
+                InlineRecoveryPlan {
+                    recovery_shards: u16::MAX as u64 + 1,
+                    ..valid
+                },
+                Error::PlanOverflow,
+            ),
+            (
                 "header length",
                 InlineRecoveryPlan {
                     header_size: valid.header_size + 1,
@@ -2539,6 +2602,24 @@ mod tests {
             assert!(output.is_empty(), "{name}");
             assert_eq!(allowance.used(), 0, "{name}");
         }
+        let mut output = Vec::new();
+        assert_eq!(
+            streamed_recovery_with_allowance(
+                &mut Cursor::new(&body),
+                body.len() as u64,
+                valid,
+                RecoveryMemoryMode::Striped { stripe_len: 64 },
+                None,
+                &mut output,
+                None,
+                0,
+                &allowance,
+            )
+            .unwrap_err(),
+            Error::PlanOverflow
+        );
+        assert!(output.is_empty());
+        assert_eq!(allowance.used(), 0);
     }
 
     #[test]
