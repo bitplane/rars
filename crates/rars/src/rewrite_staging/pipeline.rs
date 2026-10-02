@@ -226,20 +226,42 @@ pub(super) fn run<T>(
         match result {
             Err(error) => Err(error),
             Ok(value) => {
-                match decoded {
-                    Err(Error::Cancelled) if requested != indices.iter().copied().max() => {}
-                    other => other?,
-                }
+                finish_decoder(decoded, requested != indices.iter().copied().max())?;
                 Ok(value)
             }
         }
     })
 }
 
+fn finish_decoder(decoded: Result<()>, unused_sources: bool) -> Result<()> {
+    match decoded {
+        // Stopping an unused source can race with entry selection, which adds
+        // context to cancellation. Its category is unchanged by that context.
+        Err(error) if unused_sources && error.kind() == crate::ErrorKind::Cancelled => Ok(()),
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn unused_source_shutdown_accepts_contextual_cancellation_only() {
+        let cancelled = Error::AtEntry {
+            name: b"file".to_vec(),
+            operation: "selecting",
+            source: Box::new(Error::Cancelled),
+        };
+        assert_eq!(finish_decoder(Err(cancelled.clone()), true), Ok(()));
+        assert_eq!(
+            finish_decoder(Err(cancelled.clone()), false),
+            Err(cancelled)
+        );
+        let error = Error::InvalidArgument("decoder refused");
+        assert_eq!(finish_decoder(Err(error.clone()), true), Err(error));
+    }
 
     struct CancelAtStagingFinish(AtomicBool);
 
