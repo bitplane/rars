@@ -504,10 +504,9 @@ pub(crate) fn streamed_recovery_with_allowance<B: Budget>(
     }
 
     // Phase A budget is the parity bytes; phase B adds the chunk headers.
-    let encode_units = plan
-        .recovery_shards
-        .checked_mul(plan.group_count)
-        .ok_or(Error::PlanOverflow)?;
+    // group_count <= shard_size and payload_size admitted the product of
+    // recovery_shards and shard_size above.
+    let encode_units = plan.recovery_shards * plan.group_count;
     let report = |completed: u64| {
         check_recovery_cancelled(progress)?;
         if let Some(progress) = progress {
