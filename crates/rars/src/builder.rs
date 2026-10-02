@@ -1290,6 +1290,7 @@ impl Builder {
     }
 
     fn volume_payload_size(&self) -> Result<usize> {
+        self.check_encryption_option()?;
         self.check_recovery_option()?;
         if self.legacy_unpack_version.is_some() {
             return Err(Error::InvalidArgument(
@@ -1363,7 +1364,33 @@ impl Builder {
         Ok(())
     }
 
+    fn check_encryption_option(&self) -> Result<()> {
+        if cfg!(feature = "encryption") {
+            return Ok(());
+        }
+        let encrypted_entry = self.entries.iter().any(|entry| {
+            let data_password = entry
+                .encryption
+                .as_ref()
+                .map_or(self.password.as_deref(), |encryption| {
+                    encryption.data_password.as_deref()
+                });
+            let comment_password = entry
+                .encryption
+                .as_ref()
+                .map_or(self.password.as_deref(), |encryption| {
+                    encryption.comment_password.as_deref()
+                });
+            data_password.is_some() || (entry.file_comment.is_some() && comment_password.is_some())
+        });
+        if self.encrypt_headers || self.comment_password.is_some() || encrypted_entry {
+            crate::crypto::require_encryption()?;
+        }
+        Ok(())
+    }
+
     fn check_single(&self) -> Result<()> {
+        self.check_encryption_option()?;
         self.check_recovery_option()?;
         self.check_redirection_targets()?;
         if !self.streams_rar50()

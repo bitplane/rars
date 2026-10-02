@@ -41,6 +41,17 @@ pub fn clamp_password(password: &[u8]) -> &[u8] {
     }
 }
 
+/// Refuses encrypted operations when the implementation is omitted.
+pub(crate) fn require_encryption() -> crate::Result<()> {
+    if cfg!(feature = "encryption") {
+        Ok(())
+    } else {
+        Err(crate::Error::FeatureDisabled {
+            feature: "encryption",
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{clamp_password, MAX_PASSWORD_CHARS};

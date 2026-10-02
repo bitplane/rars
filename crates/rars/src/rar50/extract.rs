@@ -55,6 +55,8 @@ impl FileHeader {
     }
 
     fn encryption_keys(&self, password: Option<&[u8]>) -> Result<Rar50Keys> {
+        crate::crypto::require_encryption()?;
+
         // Both callers have already selected an encrypted member.
         if let Some(crypto) = &self.crypto {
             return Ok(crypto.keys.clone());
@@ -1311,6 +1313,9 @@ fn validate_split_fragment(file: &FileHeader, password: Option<&[u8]>) -> Result
         return Err(Error::InvalidHeader(
             "RAR 5 split directory entry is invalid",
         ));
+    }
+    if file.encrypted {
+        crate::crypto::require_encryption()?;
     }
     if file.encrypted && password.is_none() && file.crypto.is_none() {
         return Err(Error::NeedPassword);

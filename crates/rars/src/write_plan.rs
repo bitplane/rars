@@ -127,6 +127,15 @@ pub fn supported_features(target: ArchiveVersion, shape: PlanShape) -> FeatureSe
 /// Whether this format's writer can honour `option` for an archive of this
 /// shape.
 pub fn supports(target: ArchiveVersion, option: WriterOption, shape: PlanShape) -> bool {
+    if !cfg!(feature = "encryption")
+        && matches!(
+            option,
+            WriterOption::Password | WriterOption::Feature(Feature::HeaderEncryption)
+        )
+    {
+        return false;
+    }
+
     let family = target.family();
     match option {
         // Solid means compressing members against each other, so there has to
@@ -213,6 +222,10 @@ pub fn validate_features(
     asked: FeatureSet,
     shape: PlanShape,
 ) -> Result<()> {
+    if asked.header_encryption {
+        crate::crypto::require_encryption()?;
+    }
+
     match asked.first_unsupported(supported_features(target, shape)) {
         Some(feature) => Err(Error::UnsupportedWriterOption {
             target,

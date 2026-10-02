@@ -15,6 +15,7 @@ full = ["rars/default"]
 parallel = ["rars/parallel"]
 recovery = ["rars/recovery"]
 write = ["rars/write"]
+encryption = ["rars/encryption"]
 
 [profile.release]
 strip = true

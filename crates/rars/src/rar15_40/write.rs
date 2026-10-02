@@ -423,6 +423,13 @@ fn write_archive_to(
     explicit_header_password: Option<&[u8]>,
     archive_comment_password: Option<&[u8]>,
 ) -> Result<()> {
+    if explicit_header_password.is_some()
+        || archive_comment_password.is_some()
+        || members.iter().any(|member| member.password.is_some())
+    {
+        crate::crypto::require_encryption()?;
+    }
+
     if resources.max_preparation_bytes().is_some() || resources.max_memory_bytes().is_some() {
         return Err(Error::UnsupportedFamilyFeature {
             family: options.target.family(),

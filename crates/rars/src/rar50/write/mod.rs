@@ -962,6 +962,8 @@ fn validate_recovery_percent(percent: u64) -> Result<()> {
 }
 
 fn validate_nonempty_password(password: &[u8]) -> Result<()> {
+    crate::crypto::require_encryption()?;
+
     if password.is_empty() {
         return Err(Error::InvalidArgument(
             "RAR 5 encrypted writer needs a non-empty password",

@@ -31,7 +31,7 @@ fn decode(name: &str) -> Vec<Vec<u8>> {
 }
 
 fn decode_with_options(name: &str, options: rars::ArchiveReadOptions<'_>) -> Vec<Vec<u8>> {
-    let archive = ArchiveReader::read(&fixture(name)).unwrap();
+    let archive = ArchiveReader::read_with_options(&fixture(name), options).unwrap();
     let mut outputs = Vec::new();
     archive
         .extract_to_with_options(options, |_| {
@@ -278,5 +278,140 @@ fn enabled_recovery_preserves_healthy_legacy_and_modern_archives() {
         let repaired = archive.repair_recovery_with_report(None).unwrap();
         assert!(!repaired.report.changed, "{name}");
         assert_eq!(repaired.data, input, "{name}");
+    }
+}
+
+#[cfg(not(any(feature = "full", feature = "encryption")))]
+#[test]
+fn encrypted_metadata_is_visible_and_payloads_refuse_without_crypto() {
+    for name in [
+        "rar13/README_password=password.rar",
+        "rar15_40/rar154/readme_154_password.rar",
+        "rar15_40/encrypted/per_file_rar300_password.rar",
+        "rar50/password_aes.rar",
+    ] {
+        for password in [None, Some(&b"password"[..])] {
+            let archive = ArchiveReader::read_with_options(
+                &fixture(name),
+                rars::ArchiveReadOptions::with_optional_password(password),
+            )
+            .unwrap();
+            let index = archive
+                .members()
+                .position(|member| member.meta.is_encrypted)
+                .unwrap();
+            let error = archive.read_member_at(index, password).unwrap_err();
+            assert_eq!(
+                error.root_cause(),
+                &rars::Error::FeatureDisabled {
+                    feature: "encryption"
+                },
+                "{name}"
+            );
+        }
+    }
+}
+
+#[cfg(not(any(feature = "full", feature = "encryption")))]
+#[test]
+fn encrypted_headers_refuse_without_crypto_with_or_without_a_password() {
+    for name in [
+        "rar15_40/encrypted/header_rar300_password.rar",
+        "rar50/header_encrypted.rar",
+    ] {
+        for password in [None, Some(&b"password"[..])] {
+            let error = ArchiveReader::read_with_options(
+                &fixture(name),
+                rars::ArchiveReadOptions::with_optional_password(password),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.root_cause(),
+                &rars::Error::FeatureDisabled {
+                    feature: "encryption"
+                },
+                "{name}"
+            );
+        }
+    }
+}
+
+#[cfg(any(feature = "full", feature = "encryption"))]
+#[test]
+fn independent_crypto_reader_decodes_historical_and_modern_archives() {
+    let options = rars::ArchiveReadOptions::with_password(b"password");
+    assert_eq!(
+        decode_with_options("rar13/README_password=password.rar", options),
+        decode("rar13/README.RAR")
+    );
+    assert_eq!(
+        decode_with_options("rar15_40/rar154/readme_154_password.rar", options),
+        decode("rar15_40/rar154/readme_154_normal.rar")
+    );
+    for name in [
+        "rar15_40/encrypted/per_file_rar300_password.rar",
+        "rar15_40/encrypted/header_rar300_password.rar",
+        "rar15_40/encrypted/header_rar420_password.rar",
+    ] {
+        let output = decode_with_options(name, options);
+        assert_eq!(output.len(), 1);
+        assert_eq!(crc32(&output[0]), 0xa538_535e, "{name}");
+    }
+    for name in ["rar50/password_aes.rar", "rar50/header_encrypted.rar"] {
+        assert_eq!(
+            decode_with_options(name, options),
+            [b"Hello, RAR 5.0 fixture world.\n".to_vec()],
+            "{name}"
+        );
+    }
+}
+
+#[cfg(all(feature = "write", not(any(feature = "full", feature = "encryption"))))]
+#[test]
+fn encrypted_writing_refuses_before_source_io_or_output() {
+    let source =
+        rars::EntrySource::from_opener(1, || panic!("crypto refusal must precede source I/O"));
+    let entry = rars::rar50::ArchiveEntry::new(b"file".to_vec(), source)
+        .with_password(b"password".to_vec());
+    let writer = rars::rar50::Rar50Writer::new(rars::rar50::WriterOptions::default()).entry(entry);
+    let mut output = Vec::new();
+    let error = writer
+        .write_to(&mut output, &rars::WriterResources::default())
+        .unwrap_err();
+    assert_eq!(
+        error.root_cause(),
+        &rars::Error::FeatureDisabled {
+            feature: "encryption"
+        }
+    );
+    assert!(output.is_empty());
+}
+
+#[cfg(all(feature = "write", not(any(feature = "full", feature = "encryption"))))]
+#[test]
+fn encrypted_builders_refuse_before_materializing_legacy_sources() {
+    for version in [
+        rars::ArchiveVersion::Rar14,
+        rars::ArchiveVersion::Rar15,
+        rars::ArchiveVersion::Rar29,
+        rars::ArchiveVersion::Rar50,
+    ] {
+        let source =
+            rars::EntrySource::from_opener(1, || panic!("crypto refusal must precede source I/O"));
+        let mut builder = rars::Builder::new(version).password(Some(b"password".to_vec()));
+        builder
+            .add_source(b"file".to_vec(), source, None, None)
+            .unwrap();
+        let mut output = Vec::new();
+        let error = builder
+            .write_to(&mut output, &rars::WriterResources::default(), None)
+            .unwrap_err();
+        assert_eq!(
+            error.root_cause(),
+            &rars::Error::FeatureDisabled {
+                feature: "encryption"
+            }
+        );
+        assert!(output.is_empty());
     }
 }

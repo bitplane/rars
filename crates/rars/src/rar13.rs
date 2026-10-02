@@ -952,6 +952,7 @@ impl Entry {
         out: &mut impl Write,
     ) -> Result<()> {
         if self.is_encrypted() {
+            crate::crypto::require_encryption()?;
             let password = password.ok_or(Error::NeedPassword)?;
             let mut checksum = Rar13Checksum::new();
             let mut checksum_writer = Rar13ChecksumWriter {
@@ -1007,6 +1008,7 @@ impl Entry {
             checksum: &mut checksum,
         };
         if self.is_encrypted() {
+            crate::crypto::require_encryption()?;
             let password = password.ok_or(Error::NeedPassword)?;
             let packed = archive.range_reader(self.packed_range.clone())?;
             let mut packed = Rar13DecryptReader::new(packed, Rar13Cipher::new(password));
@@ -1371,6 +1373,7 @@ impl<B: Budget> PendingSplitRefs<B> {
         }
         let chained = ChainedReader::with_readers(readers);
         if self.was_encrypted {
+            crate::crypto::require_encryption()?;
             let password = password.ok_or(Error::NeedPassword)?;
             // RAR 1.402 encrypts the logical packed stream continuously across
             // split volumes; restarting the cipher at each part corrupts it.

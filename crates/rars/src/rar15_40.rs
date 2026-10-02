@@ -308,6 +308,7 @@ impl FileHeader {
         if !self.is_encrypted() {
             return Ok(PackedReader::Plain(reader));
         }
+        crate::crypto::require_encryption()?;
         let Some(password) = password else {
             return Err(Error::NeedPassword);
         };
@@ -797,6 +798,7 @@ impl Archive {
                 break;
             }
             let (block, header, total) = if main.has_encrypted_headers() {
+                crate::crypto::require_encryption()?;
                 let password = password.ok_or(Error::NeedPassword)?;
                 let encrypted = decrypt_encrypted_header_at(
                     archive,
@@ -919,6 +921,7 @@ impl Archive {
 
         while file_len.saturating_sub((sfx_offset + pos) as u64) >= 7 {
             let (block, header, total) = if main.has_encrypted_headers() {
+                crate::crypto::require_encryption()?;
                 let password = password.ok_or(Error::NeedPassword)?;
                 let encrypted = read_encrypted_header_at(
                     &mut file,

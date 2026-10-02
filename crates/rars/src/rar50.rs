@@ -1648,6 +1648,8 @@ fn parse_archive_encryption_header(
     parsed: &ParsedBlockHeader,
     password: Option<&[u8]>,
 ) -> Result<(Rar50Keys, bool)> {
+    crate::crypto::require_encryption()?;
+
     let mut reader = HeaderReader::new(&parsed.header, parsed.type_specific_range.clone());
     let version = reader.read_vint()?;
     let flags = reader.read_vint()?;
@@ -1680,6 +1682,10 @@ fn parse_archive_encryption_header(
 }
 
 fn attach_file_crypto(file: &mut FileHeader, password: Option<&[u8]>) -> Result<()> {
+    if !cfg!(feature = "encryption") {
+        return Ok(());
+    }
+
     // Called once for each freshly parsed file or service header.
     if !file.encrypted {
         return Ok(());

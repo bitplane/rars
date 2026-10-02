@@ -298,6 +298,10 @@ fn write_archive_to(
     progress: Option<&dyn WriteProgress>,
     output: &mut dyn Write,
 ) -> Result<()> {
+    if members.iter().any(|member| member.password.is_some()) {
+        crate::crypto::require_encryption()?;
+    }
+
     let control =
         crate::write_progress::ResourceProgress::new(resources, progress.map(ProgressReporter));
     let progress = Some(&control as &dyn WriteProgress);

@@ -375,6 +375,9 @@ fn validate_split_fragment(file: &FileHeader, password: Option<&[u8]>) -> Result
             "RAR 1.5 split directory entry is invalid",
         ));
     }
+    if file.is_encrypted() {
+        crate::crypto::require_encryption()?;
+    }
     if file.is_encrypted() && password.is_none() {
         return Err(Error::NeedPassword);
     }
