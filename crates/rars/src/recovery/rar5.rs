@@ -3823,6 +3823,27 @@ mod tests {
         );
     }
 
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn rar5_archive_repair_rejects_declared_payload_above_native_range() {
+        let mut chunk = build_structural_inline_recovery_data(b"x", 10).unwrap();
+        let group_count = 65_536u64;
+        let shard_size = 80 + group_count;
+        chunk.resize(shard_size as usize, 0);
+        chunk[0x0c..0x10].copy_from_slice(&(shard_size as u32).to_le_bytes());
+        chunk[0x2a..0x32].copy_from_slice(&group_count.to_le_bytes());
+        chunk[0x32..0x3a].copy_from_slice(&shard_size.to_le_bytes());
+        chunk[0x3c..0x3e].copy_from_slice(&(u16::MAX - 1).to_le_bytes());
+        let crc = crc64_xz(&chunk[0x0c..]);
+        chunk[0x04..0x0c].copy_from_slice(&crc.to_le_bytes());
+        let mut archive = b"x".to_vec();
+        archive.extend_from_slice(&chunk);
+        assert_eq!(
+            repair_inline_recovery_archive(&archive),
+            Err(Error::PlanOverflow)
+        );
+    }
+
     #[test]
     fn rar5_archive_repair_rejects_missing_chunks_and_invalid_end_header_source() {
         assert_eq!(
