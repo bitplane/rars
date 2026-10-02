@@ -35,6 +35,7 @@ mod output_limit;
 mod parallel;
 mod parse_budget;
 mod pending_archive;
+mod progress;
 mod read_control;
 pub use read_control::ReadCancellation;
 mod extraction_control;
@@ -69,6 +70,7 @@ pub use filename::{entry_relative_path, validate_entry_name};
 pub use filter::{
     formats_supporting_filter, FilterKind, FilterPolicy, FilterSpec, UnsupportedFilterKind,
 };
+pub use progress::{WriteOperation, WriteProgress, WriteProgressEvent};
 pub use reader_scratch::Rar50Scratch;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -81,7 +83,6 @@ pub use version::{ArchiveFamily, ArchiveVersion};
 pub use write_plan::{
     formats_supporting, supported_features, supports, MemberCoding, PlanShape, WriterOption,
 };
-pub use write_progress::{WriteOperation, WriteProgress, WriteProgressEvent};
 
 #[derive(Debug, Clone, Copy, Default)]
 #[non_exhaustive]

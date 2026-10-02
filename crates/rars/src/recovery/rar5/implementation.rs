@@ -13,9 +13,9 @@ const KIB: u64 = 1024;
 const RAR5_RECOVERY_CHUNK_FIXED_HEADER_SIZE: u64 = 0x48;
 /// Resident parity a record rebuild may allocate. The archive itself is
 /// already in memory by the time a rebuild starts, so this bounds the extra.
-const MAX_REBUILD_PARITY_BYTES: u64 = crate::DEFAULT_WRITER_MEMORY_LIMIT;
+const MAX_REBUILD_PARITY_BYTES: u64 = 256 * 1024 * 1024;
 
-use crate::write_progress::ProgressReporter;
+use crate::progress::ProgressReporter;
 use crate::{WriteOperation, WriteProgressEvent};
 
 fn shared_gf16() -> &'static Gf16 {
@@ -2086,7 +2086,7 @@ mod tests {
                     mode,
                     Some(&mut Cursor::new(Vec::new())),
                     &mut output,
-                    Some(crate::write_progress::ProgressReporter(&progress)),
+                    Some(crate::progress::ProgressReporter(&progress)),
                     0,
                     &allowance,
                 );
@@ -2588,7 +2588,7 @@ mod tests {
             super::RecoveryMemoryMode::Resident,
             None,
             &mut output,
-            Some(crate::write_progress::ProgressReporter(&progress)),
+            Some(crate::progress::ProgressReporter(&progress)),
             3,
         )
         .unwrap();
