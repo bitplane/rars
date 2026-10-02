@@ -2865,6 +2865,43 @@ mod tests {
     }
 
     #[test]
+    fn recovery_entry_points_preserve_missing_record_and_precancellation() {
+        let archive = build_archive_with_optional_comment(None);
+        assert!(matches!(
+            archive.repair_recovery_to(&mut Vec::new()),
+            Err(Error::InvalidHeader(
+                "RAR 5 archive does not contain an inline recovery record"
+            ))
+        ));
+        let cancelled = crate::ReadCancellation::new();
+        cancelled.cancel();
+        let options = crate::ArchiveReadOptions::new().with_cancellation(&cancelled);
+        let mut output = Vec::new();
+        assert!(matches!(
+            archive.repair_recovery_to_with_options(&mut output, options),
+            Err(Error::Cancelled)
+        ));
+        assert!(output.is_empty());
+        assert!(matches!(
+            repair_inline_recovery_bytes_with_options(RAR50_SIGNATURE, options),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(
+            recovery_end_header(RAR50_SIGNATURE, options),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(
+            repair_inline_recovery_bytes_with_options(
+                RAR50_SIGNATURE,
+                crate::ArchiveReadOptions::new()
+            ),
+            Err(Error::Rar5Recovery(
+                crate::recovery::rar5::Error::BadRecoveryChunk
+            ))
+        ));
+    }
+
+    #[test]
     fn recovery_end_header_preserves_split_volume_continuation() {
         let first = include_bytes!("../tests/fixtures/rar50/multivol.part1.rar");
         let last = include_bytes!("../tests/fixtures/rar50/multivol.part3.rar");
