@@ -2,7 +2,7 @@ use crate::crc32::crc32;
 use crate::crypto::rar50::{Rar50Cipher, Rar50Keys};
 use crate::detect::{find_archive_start, ArchiveSignature, RAR50_SIGNATURE, SFX_SCAN_LIMIT};
 use crate::error::{Error, Result};
-use crate::io_util::{align16 as checked_align16, read_exact_at, read_u32};
+use crate::io_util::{align16 as checked_align16, read_exact_at};
 pub(crate) use crate::source::ArchiveSource;
 use crate::version::ArchiveFamily;
 use std::fs::File;
@@ -1935,14 +1935,19 @@ fn parse_encrypted_block_header_bytes(
         return Err(Error::TooShort);
     }
     budget.check_count(offset)?;
-    let first = input.get(offset..offset + 32).ok_or(Error::TooShort)?;
+    // archive_len is this physical slice's length; remaining admitted 32 bytes.
+    let first = &input[offset..offset + 32];
     let mut iv = [0; 16];
     iv.copy_from_slice(&first[..16]);
-    let mut first_plain = first[16..32].to_vec();
-    Rar50Cipher::new(keys.key, iv)
-        .decrypt_in_place(&mut first_plain)
-        .map_err(map_rar50_crypto_error)?;
-    let header_crc = read_u32(&first_plain, 0)?;
+    let mut first_plain = [0; 16];
+    first_plain.copy_from_slice(&first[16..32]);
+    Rar50Cipher::new(keys.key, iv).decrypt_block(&mut first_plain);
+    let header_crc = u32::from_le_bytes([
+        first_plain[0],
+        first_plain[1],
+        first_plain[2],
+        first_plain[3],
+    ]);
     let (header_size, header_size_len) = read_vint_at(&first_plain, 4, first_plain.len())?;
     let header_body_len = usize_from_u64(header_size, "RAR 5 header size overflows usize")?;
     let header_total = 4usize
@@ -1959,9 +1964,8 @@ fn parse_encrypted_block_header_bytes(
         return Err(Error::TooShort);
     }
     budget.admit(header_total, offset)?;
-    let encrypted = input
-        .get(offset + 16..offset + disk_header_len)
-        .ok_or(Error::TooShort)?;
+    // The complete IV plus ciphertext length was admitted above.
+    let encrypted = &input[offset + 16..offset + disk_header_len];
     let mut header = encrypted.to_vec();
     Rar50Cipher::new(keys.key, iv)
         .decrypt_in_place(&mut header)
@@ -2033,11 +2037,15 @@ fn read_encrypted_block_header_at(
     let first = read_exact_at(file, sfx_offset + offset, 32)?;
     let mut iv = [0; 16];
     iv.copy_from_slice(&first[..16]);
-    let mut first_plain = first[16..32].to_vec();
-    Rar50Cipher::new(keys.key, iv)
-        .decrypt_in_place(&mut first_plain)
-        .map_err(map_rar50_crypto_error)?;
-    let header_crc = read_u32(&first_plain, 0)?;
+    let mut first_plain = [0; 16];
+    first_plain.copy_from_slice(&first[16..32]);
+    Rar50Cipher::new(keys.key, iv).decrypt_block(&mut first_plain);
+    let header_crc = u32::from_le_bytes([
+        first_plain[0],
+        first_plain[1],
+        first_plain[2],
+        first_plain[3],
+    ]);
     let (header_size, header_size_len) = read_vint_at(&first_plain, 4, first_plain.len())?;
     let header_body_len = usize_from_u64(header_size, "RAR 5 header size overflows usize")?;
     let header_total = 4usize
