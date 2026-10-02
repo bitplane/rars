@@ -5901,6 +5901,18 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     }
 
     #[test]
+    fn solid_member_rejects_declared_output_beyond_native_range() {
+        let mut decoder = super::Unpack29::new();
+        decoder
+            .decode_non_solid_member(COMPRESSED_TEXT, 2400)
+            .unwrap();
+        assert_eq!(
+            decoder.decode_member(&[], usize::MAX),
+            Err(Error::InvalidData("RAR 2.9 output size overflows"))
+        );
+    }
+
+    #[test]
     fn ppmd_match_finder_uses_the_declared_dictionary_past_one_megabyte() {
         let distance = MAX_ENCODER_MATCH_OFFSET + 4096;
         let phrase = b"RAR29 PPMd match beyond the old one-megabyte ceiling";
