@@ -1,0 +1,17 @@
+[package]
+name = "rars-reader-consumer"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Deliberately independent: other workspace consumers enable rars defaults.
+[workspace]
+
+[dependencies]
+rars = { path = "../../crates/rars", default-features = false }
+
+[features]
+full = ["rars/default"]
+
+[profile.release]
+strip = true

@@ -18,6 +18,10 @@ workspace = true
 [package.metadata.docs.rs]
 all-features = true
 
+[features]
+# Feature boundaries are introduced incrementally without changing defaults.
+default = []
+
 [dependencies]
 aes.workspace = true
 aho-corasick.workspace = true
