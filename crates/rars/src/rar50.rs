@@ -3089,6 +3089,90 @@ mod tests {
     }
 
     #[test]
+    fn file_header_field_boundaries_agree_across_reader_adapters() {
+        fn image(body: &[u8]) -> Vec<u8> {
+            let mut encoded = vec![body.len() as u8];
+            encoded.extend_from_slice(body);
+            let mut header = crc32(&encoded).to_le_bytes().to_vec();
+            header.extend_from_slice(&encoded);
+            header
+        }
+        // Type, block flags, file flags, unpacked size, attributes,
+        // compression, host, name length and one name byte.
+        let complete = [HEAD_FILE as u8, 0, 0, 0, 0, 0, 0, 1, b'x'];
+        for included in 0..=complete.len() {
+            let mut bytes = RAR50_SIGNATURE.to_vec();
+            bytes.extend_from_slice(&image(&[HEAD_MAIN as u8, 0, 0]));
+            bytes.extend_from_slice(&image(&complete[..included]));
+            for result in [
+                Archive::parse(&bytes),
+                Archive::parse_file_backed(
+                    &mut std::io::Cursor::new(&bytes),
+                    bytes.len(),
+                    0,
+                    ArchiveSource::Memory(Arc::from(bytes.clone())),
+                    crate::ArchiveReadOptions::new(),
+                ),
+            ] {
+                if included < complete.len() {
+                    assert!(
+                        matches!(result.unwrap_err().root_cause(), Error::TooShort),
+                        "field prefix {included}"
+                    );
+                } else {
+                    let archive = result.unwrap();
+                    assert_eq!(archive.files().next().unwrap().name, b"x");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn optional_block_header_fields_need_their_own_vints() {
+        for (body, complete) in [
+            (vec![HEAD_FILE as u8, HFL_EXTRA as u8], false),
+            (vec![HEAD_FILE as u8, HFL_DATA as u8], false),
+            (
+                vec![HEAD_FILE as u8, (HFL_EXTRA | HFL_DATA) as u8, 0],
+                false,
+            ),
+            (
+                vec![HEAD_FILE as u8, (HFL_EXTRA | HFL_DATA) as u8, 0, 0],
+                true,
+            ),
+        ] {
+            let mut encoded = vec![body.len() as u8];
+            encoded.extend_from_slice(&body);
+            let mut header = crc32(&encoded).to_le_bytes().to_vec();
+            header.extend_from_slice(&encoded);
+            for result in [
+                parse_block_header_bytes(
+                    &header,
+                    0,
+                    header.len(),
+                    0,
+                    &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new()),
+                ),
+                read_block_header_at(
+                    &mut std::io::Cursor::new(&header),
+                    0,
+                    header.len(),
+                    0,
+                    &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new()),
+                ),
+            ] {
+                if complete {
+                    let parsed = result.unwrap();
+                    assert_eq!(parsed.block.extra_area_size, Some(0));
+                    assert_eq!(parsed.block.data_size, Some(0));
+                } else {
+                    assert!(matches!(result, Err(Error::TooShort)));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn unknown_header_remains_readable_and_budget_error_keeps_one_offset() {
         let header = |body: &[u8]| {
             let mut encoded = vec![body.len() as u8];
