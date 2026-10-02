@@ -1879,6 +1879,12 @@ struct ParsedBlockHeader {
     next_offset: usize,
 }
 
+struct HeaderPrefix {
+    crc: u32,
+    size: u64,
+    size_len: usize,
+}
+
 fn parse_block_header_bytes(
     input: &[u8],
     offset: usize,
@@ -1886,7 +1892,7 @@ fn parse_block_header_bytes(
     sfx_offset: usize,
     budget: &mut crate::parse_budget::ParseBudget,
 ) -> Result<ParsedBlockHeader> {
-    let remaining = archive_len.checked_sub(offset).ok_or(Error::TooShort)?;
+    let remaining = archive_len.saturating_sub(offset);
     if remaining < 5 {
         return Err(Error::TooShort);
     }
@@ -1916,7 +1922,11 @@ fn parse_block_header_bytes(
         offset,
         archive_len,
         sfx_offset,
-        header_crc,
+        HeaderPrefix {
+            crc: header_crc,
+            size: header_size,
+            size_len: header_size_len,
+        },
         header_total,
         &budget.control,
     )
@@ -1930,7 +1940,7 @@ fn parse_encrypted_block_header_bytes(
     keys: &Rar50Keys,
     budget: &mut crate::parse_budget::ParseBudget,
 ) -> Result<ParsedBlockHeader> {
-    let remaining = archive_len.checked_sub(offset).ok_or(Error::TooShort)?;
+    let remaining = archive_len.saturating_sub(offset);
     if remaining < 32 {
         return Err(Error::TooShort);
     }
@@ -1977,7 +1987,11 @@ fn parse_encrypted_block_header_bytes(
         offset,
         archive_len,
         sfx_offset,
-        header_crc,
+        HeaderPrefix {
+            crc: header_crc,
+            size: header_size,
+            size_len: header_size_len,
+        },
         disk_header_len,
         &budget.control,
     )
@@ -1990,7 +2004,7 @@ fn read_block_header_at(
     sfx_offset: usize,
     budget: &mut crate::parse_budget::ParseBudget,
 ) -> Result<ParsedBlockHeader> {
-    let remaining = archive_len.checked_sub(offset).ok_or(Error::TooShort)?;
+    let remaining = archive_len.saturating_sub(offset);
     if remaining < 5 {
         return Err(Error::TooShort);
     }
@@ -2015,7 +2029,11 @@ fn read_block_header_at(
         offset,
         archive_len,
         sfx_offset,
-        header_crc,
+        HeaderPrefix {
+            crc: header_crc,
+            size: header_size,
+            size_len: header_size_len,
+        },
         header_total,
         &budget.control,
     )
@@ -2029,7 +2047,7 @@ fn read_encrypted_block_header_at(
     keys: &Rar50Keys,
     budget: &mut crate::parse_budget::ParseBudget,
 ) -> Result<ParsedBlockHeader> {
-    let remaining = archive_len.checked_sub(offset).ok_or(Error::TooShort)?;
+    let remaining = archive_len.saturating_sub(offset);
     if remaining < 32 {
         return Err(Error::TooShort);
     }
@@ -2074,7 +2092,11 @@ fn read_encrypted_block_header_at(
         offset,
         archive_len,
         sfx_offset,
-        header_crc,
+        HeaderPrefix {
+            crc: header_crc,
+            size: header_size,
+            size_len: header_size_len,
+        },
         disk_header_len,
         &budget.control,
     )
@@ -2085,15 +2107,16 @@ fn parse_block_header_image(
     offset: usize,
     archive_len: usize,
     sfx_offset: usize,
-    header_crc: u32,
+    prefix: HeaderPrefix,
     disk_header_len: usize,
     control: &crate::read_control::ReadControl,
 ) -> Result<ParsedBlockHeader> {
     control.check()?;
     let header_total = header.len();
-    let (decoded_header_size, header_size_len) = read_vint_at(&header, 4, header_total)?;
-    validate_block_header_crc(&header, header_crc)?;
-    let type_start = 4 + header_size_len;
+    // All four callers decoded this same immutable size prefix before reading
+    // or decrypting the complete header image.
+    validate_block_header_crc(&header, prefix.crc)?;
+    let type_start = 4 + prefix.size_len;
     let mut reader = SliceReader::new(&header, type_start, header_total);
     let header_type = reader.read_vint()?;
     let flags = reader.read_vint()?;
@@ -2135,8 +2158,8 @@ fn parse_block_header_image(
     Ok(ParsedBlockHeader {
         control: control.clone(),
         block: BlockHeader {
-            header_crc,
-            header_size: decoded_header_size,
+            header_crc: prefix.crc,
+            header_size: prefix.size,
             header_type,
             flags,
             extra_area_size,
@@ -3082,6 +3105,101 @@ mod tests {
                 assert!(
                     matches!(result, Err(Error::InvalidHeader(message)) if message == expected)
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_header_size_vints_and_optional_lengths_reach_both_adapters() {
+        let mut overlong = vec![0; 4];
+        overlong.extend_from_slice(&[0x80; 10]);
+        for result in [
+            parse_block_header_bytes(
+                &overlong,
+                0,
+                overlong.len(),
+                0,
+                &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new()),
+            ),
+            read_block_header_at(
+                &mut std::io::Cursor::new(&overlong),
+                0,
+                overlong.len(),
+                0,
+                &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new()),
+            ),
+        ] {
+            assert!(matches!(
+                result,
+                Err(Error::InvalidHeader("RAR 5 vint is too long"))
+            ));
+        }
+        let keys = Rar50Keys::derive(b"pw", [0; 16], 0).unwrap();
+        let mut first_plain = overlong;
+        first_plain.resize(16, 0);
+        Rar50Cipher::new(keys.key, [0; 16])
+            .encrypt_in_place(&mut first_plain)
+            .unwrap();
+        let mut encrypted = vec![0; 16];
+        encrypted.extend_from_slice(&first_plain);
+        for result in [
+            parse_encrypted_block_header_bytes(
+                &encrypted,
+                0,
+                encrypted.len(),
+                0,
+                &keys,
+                &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new()),
+            ),
+            read_encrypted_block_header_at(
+                &mut std::io::Cursor::new(&encrypted),
+                0,
+                encrypted.len(),
+                0,
+                &keys,
+                &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new()),
+            ),
+        ] {
+            assert!(matches!(
+                result,
+                Err(Error::InvalidHeader("RAR 5 vint is too long"))
+            ));
+        }
+
+        let maximum_vint = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1];
+        for (flag, expected) in [
+            (HFL_EXTRA, "RAR 5 extra area size overflows usize"),
+            (HFL_DATA, "RAR 5 data size overflows usize"),
+        ] {
+            let mut body = vec![HEAD_FILE as u8, flag as u8];
+            body.extend_from_slice(&maximum_vint);
+            let mut encoded = vec![body.len() as u8];
+            encoded.extend_from_slice(&body);
+            let mut header = crc32(&encoded).to_le_bytes().to_vec();
+            header.extend_from_slice(&encoded);
+            for result in [
+                parse_block_header_bytes(
+                    &header,
+                    0,
+                    header.len(),
+                    0,
+                    &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new()),
+                ),
+                read_block_header_at(
+                    &mut std::io::Cursor::new(&header),
+                    0,
+                    header.len(),
+                    0,
+                    &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new()),
+                ),
+            ] {
+                if flag == HFL_EXTRA && usize::BITS == 64 {
+                    assert!(matches!(result, Err(Error::TooShort)));
+                } else {
+                    assert!(
+                        matches!(result, Err(Error::InvalidHeader(message)) if message == expected)
+                    );
+                }
             }
         }
     }
