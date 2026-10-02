@@ -2083,6 +2083,42 @@ fn rar50_recovery_reports_output_failure_before_a_late_repaired_shard() {
 }
 
 #[test]
+fn rar50_recovery_observes_cancellation_from_output_in_both_repair_paths() {
+    struct CancellingWriter<'a>(&'a rars::ReadCancellation);
+    impl Write for CancellingWriter<'_> {
+        fn write(&mut self, bytes: &[u8]) -> IoResult<usize> {
+            self.0.cancel();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> IoResult<()> {
+            Ok(())
+        }
+    }
+
+    let bytes = write_stored_archive_with_recovery(
+        &[entry(b"recoverable.txt", &vec![b'A'; 32 * 1024])],
+        rar50::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only()),
+        20,
+    )
+    .unwrap();
+    let archive = Archive::parse(&bytes).unwrap();
+    let recovery_range = archive.services().next().unwrap().block.data_range.clone();
+    let mut damaged = bytes.clone();
+    damaged[recovery_range.start + 0x48] ^= 1;
+
+    for source in [&bytes[..], &damaged[..]] {
+        let archive = Archive::parse(source).unwrap();
+        let token = rars::ReadCancellation::new();
+        let options = rars::ArchiveReadOptions::new().with_cancellation(&token);
+        assert!(matches!(
+            archive.repair_recovery_to_with_options(&mut CancellingWriter(&token), options),
+            Err(Error::Cancelled)
+        ));
+        assert!(token.is_cancelled());
+    }
+}
+
+#[test]
 fn repairs_sfx_prefixed_rar50_data_with_a_missing_recovery_row() {
     let archive_bytes = write_stored_archive_with_recovery(
         &[entry(b"recoverable.txt", &vec![b'A'; 32 * 1024])],
