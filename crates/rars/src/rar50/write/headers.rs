@@ -6,57 +6,19 @@
 //! against the writer resource policy.
 
 use super::ArchiveMetadataEntry;
-use crate::crypto::rar50::{Rar50Cipher, Rar50Keys, WRITE_KDF_COUNT_LOG};
+use crate::crypto::rar50::{Rar50Keys, WRITE_KDF_COUNT_LOG};
+use crate::rar50::framing::{checked_image_len, image_size_error, HeaderImage, HeaderScratch};
 use crate::rar50::{
-    map_rar50_crypto_error, FHEXTRA_CRYPT, FHEXTRA_HASH, FHFL_CRC32, FHFL_DIRECTORY, FHFL_MTIME,
-    HEAD_CRYPT, HEAD_END, HEAD_MAIN, HFL_EXTRA, MHEXTRA_ARCHIVE_METADATA,
-    MHEXTRA_ARCHIVE_METADATA_NAME, MHEXTRA_ARCHIVE_METADATA_TIME, MHEXTRA_LOCATOR,
-    MHEXTRA_LOCATOR_QUICK_OPEN, MHEXTRA_LOCATOR_RECOVERY,
+    FHEXTRA_CRYPT, FHEXTRA_HASH, FHFL_CRC32, FHFL_DIRECTORY, FHFL_MTIME, HEAD_CRYPT, HEAD_END,
+    HEAD_MAIN, HFL_EXTRA, MHEXTRA_ARCHIVE_METADATA, MHEXTRA_ARCHIVE_METADATA_NAME,
+    MHEXTRA_ARCHIVE_METADATA_TIME, MHEXTRA_LOCATOR, MHEXTRA_LOCATOR_QUICK_OPEN,
+    MHEXTRA_LOCATOR_RECOVERY,
 };
 use crate::streaming::preparation::Bytes;
 use crate::WriterResources;
-use crate::{crc32::crc32, Error, Result};
-
-/// Bounded framing scratch; callers choose capacities from the on-disk fields.
-pub(crate) struct HeaderScratch<const N: usize> {
-    bytes: [u8; N],
-    len: usize,
-}
-
-impl<const N: usize> HeaderScratch<N> {
-    fn new() -> Self {
-        Self {
-            bytes: [0; N],
-            len: 0,
-        }
-    }
-    fn extend_from_slice(&mut self, bytes: &[u8]) {
-        self.bytes[self.len..self.len + bytes.len()].copy_from_slice(bytes);
-        self.len += bytes.len();
-    }
-    fn vint(&mut self, mut value: u64) {
-        loop {
-            self.extend_from_slice(&[(value as u8 & 0x7f) | if value >= 0x80 { 0x80 } else { 0 }]);
-            value >>= 7;
-            if value == 0 {
-                break;
-            }
-        }
-    }
-    fn as_slice(&self) -> &[u8] {
-        &self.bytes[..self.len]
-    }
-    fn len(&self) -> usize {
-        self.len
-    }
-}
-
-impl<const N: usize> std::ops::Deref for HeaderScratch<N> {
-    type Target = [u8];
-    fn deref(&self) -> &[u8] {
-        self.as_slice()
-    }
-}
+#[cfg(test)]
+use crate::{crc32::crc32, crypto::rar50::Rar50Cipher};
+use crate::{Error, Result};
 
 pub(crate) trait HeaderOutput {
     fn append(&mut self, bytes: &[u8]) -> Result<()>;
@@ -136,21 +98,6 @@ pub(super) fn write_file_encryption_record(
     Ok(())
 }
 
-fn image_size_error() -> Error {
-    Error::InvalidArgument("RAR 5 header size overflows")
-}
-
-fn checked_image_len(parts: &[usize]) -> Result<usize> {
-    let len = parts
-        .iter()
-        .try_fold(0usize, |total, &size| total.checked_add(size))
-        .ok_or_else(image_size_error)?;
-    if len > isize::MAX as usize {
-        return Err(image_size_error());
-    }
-    Ok(len)
-}
-
 fn join_record(parts: &[&[u8]], resources: &WriterResources) -> Result<Bytes> {
     let len = parts
         .iter()
@@ -165,92 +112,15 @@ fn join_record(parts: &[&[u8]], resources: &WriterResources) -> Result<Bytes> {
     Ok(out)
 }
 
-/// Computes framing without copying variable-length fields. All header paths
-/// render into their final allocation, including IV, padding and trailing data.
-struct HeaderImage<'a> {
-    prefix: HeaderScratch<40>,
-    size: HeaderScratch<10>,
-    specific: &'a [u8],
-    extra: &'a [u8],
-    plain_len: usize,
-}
-
-impl<'a> HeaderImage<'a> {
-    fn new(
-        kind: u64,
-        flags: u64,
-        data_size: Option<u64>,
-        specific: &'a [u8],
-        extra: &'a [u8],
-    ) -> Result<Self> {
-        let mut prefix = HeaderScratch::new();
-        prefix.vint(kind);
-        prefix.vint(flags);
-        if flags & HFL_EXTRA != 0 {
-            prefix.vint(extra.len() as u64);
-        }
-        if let Some(data_size) = data_size {
-            prefix.vint(data_size);
-        }
-        let body_len = checked_image_len(&[prefix.len(), specific.len(), extra.len()])?;
-        let mut size = HeaderScratch::new();
-        size.vint(body_len as u64);
-        let plain_len = checked_image_len(&[4, size.len(), body_len])?;
-        Ok(Self {
-            prefix,
-            size,
-            specific,
-            extra,
-            plain_len,
-        })
-    }
-
-    fn header_len(&self, encrypted: bool) -> Result<usize> {
-        if encrypted {
-            let padded = self
-                .plain_len
-                .checked_add(15)
-                .ok_or_else(image_size_error)?
-                & !15;
-            checked_image_len(&[16, padded])
-        } else {
-            Ok(self.plain_len)
-        }
-    }
-
+impl HeaderImage<'_> {
     fn render(
         &self,
         keys: Option<&Rar50Keys>,
         data: &[u8],
         resources: &WriterResources,
     ) -> Result<Bytes> {
-        let header_len = self.header_len(keys.is_some())?;
-        let mut out = Bytes::zeroed(checked_image_len(&[header_len, data.len()])?, resources)?;
-        let start = if keys.is_some() { 16 } else { 0 };
-        let mut offset = start + 4;
-        for part in [
-            self.size.as_slice(),
-            self.prefix.as_slice(),
-            self.specific,
-            self.extra,
-        ] {
-            out[offset..offset + part.len()].copy_from_slice(part);
-            offset += part.len();
-        }
-        let crc = crc32(&out[start + 4..start + self.plain_len]);
-        out[start..start + 4].copy_from_slice(&crc.to_le_bytes());
-        if let Some(keys) = keys {
-            let mut iv = [0; 16];
-            crate::write_stream::fill_entropy(
-                &mut iv,
-                "RAR 5 writer could not generate encryption IV",
-            )?;
-            out[..16].copy_from_slice(&iv);
-            Rar50Cipher::new(keys.key, iv)
-                .encrypt_in_place(&mut out[16..header_len])
-                .map_err(map_rar50_crypto_error)?;
-        }
-        out[header_len..].copy_from_slice(data);
+        let mut out = Bytes::zeroed(self.image_len(keys.is_some(), data.len())?, resources)?;
+        self.render_into(keys, data, &mut out)?;
         Ok(out)
     }
 }

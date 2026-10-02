@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 mod blake2sp;
 mod extract;
+mod framing;
 pub(crate) mod write;
 
 pub use extract::{extract_volumes_to, extract_volumes_to_with_redirections};
@@ -1283,24 +1284,17 @@ pub(crate) fn recovery_end_header(
         0,
         &mut crate::parse_budget::ParseBudget::new(options),
     )?;
-    if first.block.header_type != HEAD_CRYPT {
-        let resources = crate::WriterResources::default();
-        let mut end = crate::streaming::preparation::Bytes::new(&resources);
-        write::headers::write_end_header(&mut end, end_flags, &crate::WriterResources::default())?;
-        return Ok(end.to_vec());
-    }
-    let (keys, _) = parse_archive_encryption_header(&first, password)?;
-    write::headers::encrypted_header_block(
-        &keys,
-        HEAD_END,
-        0,
-        None,
-        &write::end_header_specific(end_flags),
-        &[],
-        &[],
-        &crate::WriterResources::default(),
-    )
-    .map(|bytes| bytes.to_vec())
+    let keys = if first.block.header_type == HEAD_CRYPT {
+        Some(parse_archive_encryption_header(&first, password)?.0)
+    } else {
+        None
+    };
+    let mut specific = framing::HeaderScratch::<10>::new();
+    specific.vint(end_flags);
+    let image = framing::HeaderImage::new(HEAD_END, 0, None, &specific, &[])?;
+    let mut end = vec![0; image.image_len(keys.is_some(), 0)?];
+    image.render_into(keys.as_ref(), &[], &mut end)?;
+    Ok(end)
 }
 
 #[cfg(feature = "recovery")]

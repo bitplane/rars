@@ -24,6 +24,7 @@ pub mod crc32;
 #[doc(hidden)]
 pub mod crypto;
 pub mod detect;
+mod entropy;
 pub mod error;
 mod fast;
 pub mod features;
