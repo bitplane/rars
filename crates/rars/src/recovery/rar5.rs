@@ -807,8 +807,9 @@ fn encode_parity_resident<B: Budget>(
     gf: &GfView<'_>,
     allowance: &B,
 ) -> Result<Buffer<Buffer<u8, B>, B>> {
-    let group_count = usize::try_from(plan.group_count).map_err(|_| Error::PlanOverflow)?;
-    let recovery_shards = usize::try_from(plan.recovery_shards).map_err(|_| Error::PlanOverflow)?;
+    // The streaming entry point admitted these as native-size values.
+    let group_count = plan.group_count as usize;
+    let recovery_shards = plan.recovery_shards as usize;
     let mut parity = rows_with_allowance(recovery_shards, group_count, allowance)?;
     if group_count == 0 || body_len == 0 {
         return Ok(parity);
@@ -829,12 +830,11 @@ fn encode_parity_resident<B: Budget>(
 
         let mut offset = 0u64;
         while offset < shard_bytes {
-            let want = usize::try_from((shard_bytes - offset).min(buffer.len() as u64))
-                .map_err(|_| Error::PlanOverflow)?;
+            let want = (shard_bytes - offset).min(buffer.len() as u64) as usize;
             body.read_exact(&mut buffer[..want])?;
             *state = crc64_update(&buffer[..want], *state);
 
-            let destination_offset = usize::try_from(offset).map_err(|_| Error::PlanOverflow)?;
+            let destination_offset = offset as usize;
             for (row, parity_row) in matrix.iter().zip(parity.iter_mut()) {
                 accumulate_scaled(
                     &mut parity_row[destination_offset..],
@@ -869,7 +869,7 @@ fn encode_parity_striped<B: Budget>(
     gf: &GfView<'_>,
     allowance: &B,
 ) -> Result<()> {
-    let recovery_shards = usize::try_from(plan.recovery_shards).map_err(|_| Error::PlanOverflow)?;
+    let recovery_shards = plan.recovery_shards as usize;
     if plan.group_count == 0 {
         return Ok(());
     }
@@ -881,7 +881,7 @@ fn encode_parity_striped<B: Budget>(
     let mut column = 0u64;
     while column < plan.group_count {
         let width = (plan.group_count - column).min(stripe_len as u64);
-        let width_usize = usize::try_from(width).map_err(|_| Error::PlanOverflow)?;
+        let width_usize = width as usize;
         for row in stripe.iter_mut() {
             row[..width_usize].fill(0);
         }
@@ -895,7 +895,7 @@ fn encode_parity_striped<B: Budget>(
                 continue;
             }
             let span = width.min(shard_bytes - column);
-            let span_usize = usize::try_from(span).map_err(|_| Error::PlanOverflow)?;
+            let span_usize = span as usize;
 
             body.seek(std::io::SeekFrom::Start(shard_start + column))?;
             body.read_exact(&mut buffer[..span_usize])?;
