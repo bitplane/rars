@@ -1,5 +1,7 @@
 use super::workspace::{Allowance, Budget, Buffer};
-use super::{huffman, match_finder, Error, Result};
+#[cfg(feature = "write")]
+use super::{huffman, match_finder};
+use super::{Error, Result};
 use std::io::{Read, Write};
 
 const MAIN_COUNT: usize = 298;
@@ -30,10 +32,14 @@ const OFFSET_BITS: [u8; OFFSET_COUNT] = [
 ];
 const SHORT_BASES: [usize; 8] = [0, 4, 8, 16, 32, 64, 128, 192];
 const SHORT_BITS: [u8; 8] = [2, 2, 3, 4, 5, 6, 6, 6];
+#[cfg(feature = "write")]
 const MAX_ENCODER_MATCH_OFFSET: usize = MAX_HISTORY;
+#[cfg(feature = "write")]
 const MAX_ENCODER_MATCH_LENGTH: usize = 258;
+#[cfg(feature = "write")]
 const MAX_MATCH_CANDIDATES: usize = 256;
 
+#[cfg(feature = "write")]
 type Rar20MatchFinder = match_finder::MatchFinder<3>;
 
 pub fn unpack20_decode(input: &[u8], output_size: usize) -> Result<Vec<u8>> {
@@ -41,10 +47,12 @@ pub fn unpack20_decode(input: &[u8], output_size: usize) -> Result<Vec<u8>> {
     decoder.decode_member(input, output_size)
 }
 
+#[cfg(feature = "write")]
 pub fn unpack20_encode_literals(input: &[u8]) -> Result<Vec<u8>> {
     unpack20_encode_literals_with_options(input, EncodeOptions::default())
 }
 
+#[cfg(feature = "write")]
 pub fn unpack20_encode_literals_with_options(
     input: &[u8],
     options: EncodeOptions,
@@ -52,10 +60,12 @@ pub fn unpack20_encode_literals_with_options(
     encode_member(input, &[], None, options, None)
 }
 
+#[cfg(feature = "write")]
 pub fn unpack20_encode_auto(input: &[u8]) -> Result<Vec<u8>> {
     unpack20_encode_auto_with_options(input, EncodeOptions::default())
 }
 
+#[cfg(feature = "write")]
 pub fn unpack20_encode_auto_with_options(input: &[u8], options: EncodeOptions) -> Result<Vec<u8>> {
     let lz = unpack20_encode_literals_with_options(input, options)?;
     let mut best = lz;
@@ -73,7 +83,7 @@ pub fn unpack20_encode_auto_with_options(input: &[u8], options: EncodeOptions) -
     Ok(best)
 }
 
-#[cfg(any(test, feature = "write"))]
+#[cfg(feature = "write")]
 pub(crate) fn unpack20_encode_auto_with_options_and_progress(
     input: &[u8],
     options: EncodeOptions,
@@ -96,6 +106,7 @@ pub(crate) fn unpack20_encode_auto_with_options_and_progress(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
+#[cfg(feature = "write")]
 pub struct EncodeOptions {
     pub max_match_candidates: usize,
     pub max_match_distance: usize,
@@ -107,6 +118,7 @@ pub struct EncodeOptions {
     pub try_audio: bool,
 }
 
+#[cfg(feature = "write")]
 impl EncodeOptions {
     pub const fn new(max_match_candidates: usize) -> Self {
         Self {
@@ -156,6 +168,7 @@ impl EncodeOptions {
     }
 }
 
+#[cfg(feature = "write")]
 impl Default for EncodeOptions {
     fn default() -> Self {
         Self::new(MAX_MATCH_CANDIDATES)
@@ -163,12 +176,14 @@ impl Default for EncodeOptions {
 }
 
 #[derive(Debug, Clone, Default)]
+#[cfg(feature = "write")]
 pub struct Unpack20Encoder {
     history: Vec<u8>,
     table: Option<FixedEncodeTable>,
     options: EncodeOptions,
 }
 
+#[cfg(feature = "write")]
 impl Unpack20Encoder {
     pub fn new() -> Self {
         Self::default()
@@ -228,6 +243,7 @@ impl Unpack20Encoder {
     }
 }
 
+#[cfg(feature = "write")]
 fn encode_member(
     input: &[u8],
     history: &[u8],
@@ -289,6 +305,7 @@ fn encode_member(
     Ok(best_packed)
 }
 
+#[cfg(feature = "write")]
 fn table_lengths_for_tokens(
     tokens: &[EncodeToken],
     fixed_table: Option<FixedEncodeTable>,
@@ -371,6 +388,7 @@ fn table_lengths_for_tokens(
     Ok(table_lengths)
 }
 
+#[cfg(feature = "write")]
 fn encode_member_with_tables(
     tokens: &[EncodeToken],
     history: &[u8],
@@ -465,10 +483,12 @@ fn encode_member_with_tables(
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg(feature = "write")]
 struct FixedEncodeTable {
     length: u8,
 }
 
+#[cfg(feature = "write")]
 impl FixedEncodeTable {
     fn new() -> Result<Self> {
         Ok(Self {
@@ -478,6 +498,7 @@ impl FixedEncodeTable {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "write")]
 enum EncodeToken {
     Literal(u8),
     RepeatLast,
@@ -502,6 +523,7 @@ enum EncodeToken {
 /// So the parse only needs the longest length in each slot, plus the longest
 /// match found. That is at most twenty-nine candidates where trying every
 /// length is up to two hundred and fifty-six, for 0.03% of packed size.
+#[cfg(feature = "write")]
 fn candidate_lengths(best_length: usize, offset: usize, out: &mut Vec<usize>) {
     out.clear();
     let adjustment = match_length_adjustment(offset);
@@ -530,6 +552,7 @@ fn candidate_lengths(best_length: usize, offset: usize, out: &mut Vec<usize>) {
 /// carrying every reachable rep state would multiply the search out of reach.
 /// Each position keeps the rep list of the cheapest route that reached it,
 /// which is what LZMA's optimal parser does with the same justification.
+#[cfg(feature = "write")]
 fn encode_tokens_optimal(
     input: &[u8],
     start: usize,
@@ -649,6 +672,7 @@ fn encode_tokens_optimal(
 }
 
 /// How far the bytes at `pos` repeat the bytes `offset` back, up to `cap`.
+#[cfg(feature = "write")]
 fn match_run_length(input: &[u8], pos: usize, offset: usize, cap: usize) -> usize {
     if offset == 0 {
         return 0;
@@ -660,6 +684,7 @@ fn match_run_length(input: &[u8], pos: usize, offset: usize, cap: usize) -> usiz
     length
 }
 
+#[cfg(feature = "write")]
 fn encode_tokens_with_progress(
     input: &[u8],
     history: &[u8],
@@ -782,15 +807,18 @@ fn encode_tokens_with_progress(
 }
 
 /// Stand-in price for a literal the current table has no code for.
+#[cfg(feature = "write")]
 const ABSENT_LITERAL_BITS: usize = 15;
 
 #[derive(Debug, Clone, Copy)]
+#[cfg(feature = "write")]
 struct CostModel<'a> {
     main: &'a [u8],
     offsets: &'a [u8],
     lengths: &'a [u8],
 }
 
+#[cfg(feature = "write")]
 impl<'a> CostModel<'a> {
     fn new(table_lengths: &'a [u8; TABLE_COUNT]) -> Self {
         Self {
@@ -859,6 +887,7 @@ impl<'a> CostModel<'a> {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg(feature = "write")]
 enum SelectedMatch {
     Fresh {
         length: usize,
@@ -874,6 +903,7 @@ enum SelectedMatch {
     },
 }
 
+#[cfg(feature = "write")]
 impl SelectedMatch {
     fn length(self) -> usize {
         match self {
@@ -892,6 +922,7 @@ impl SelectedMatch {
     }
 }
 
+#[cfg(feature = "write")]
 fn select_match(
     input: &[u8],
     pos: usize,
@@ -945,6 +976,7 @@ fn select_match(
     }
 }
 
+#[cfg(feature = "write")]
 struct LazyMatchContext<'a> {
     input: &'a [u8],
     end: usize,
@@ -954,6 +986,7 @@ struct LazyMatchContext<'a> {
     cost_model: Option<&'a CostModel<'a>>,
 }
 
+#[cfg(feature = "write")]
 fn should_lazy_emit_literal(
     pos: usize,
     current: SelectedMatch,
@@ -996,6 +1029,7 @@ fn should_lazy_emit_literal(
         })
 }
 
+#[cfg(feature = "write")]
 fn best_match(
     input: &[u8],
     pos: usize,
@@ -1046,12 +1080,14 @@ fn best_match(
     best
 }
 
+#[cfg(feature = "write")]
 fn offset_slot_index(offset: usize) -> usize {
     offset_slot_for_match(offset)
         .map(|(slot, _)| slot)
         .unwrap_or(OFFSET_BITS.len() - 1)
 }
 
+#[cfg(feature = "write")]
 fn is_better_fresh_match(
     cost_model: Option<&CostModel<'_>>,
     input: &[u8],
@@ -1083,6 +1119,7 @@ fn is_better_fresh_match(
     length > best_length
 }
 
+#[cfg(feature = "write")]
 fn best_old_offset_match(
     input: &[u8],
     pos: usize,
@@ -1106,6 +1143,7 @@ fn best_old_offset_match(
     best
 }
 
+#[cfg(feature = "write")]
 fn is_better_old_offset_match(
     cost_model: Option<&CostModel<'_>>,
     input: &[u8],
@@ -1142,6 +1180,7 @@ fn is_better_old_offset_match(
     length > best_length || (length == best_length && offset < best_offset)
 }
 
+#[cfg(feature = "write")]
 fn best_short_offset_match(input: &[u8], pos: usize, end: usize) -> Option<SelectedMatch> {
     if end - pos < 2 {
         return None;
@@ -1154,18 +1193,22 @@ fn best_short_offset_match(input: &[u8], pos: usize, end: usize) -> Option<Selec
         .map(|offset| SelectedMatch::ShortOffset { offset })
 }
 
+#[cfg(feature = "write")]
 fn match_length_at_offset(input: &[u8], pos: usize, max_length: usize, offset: usize) -> usize {
     super::fast::match_length(input, pos, offset, max_length)
 }
 
+#[cfg(feature = "write")]
 fn match_length_adjustment(offset: usize) -> usize {
     usize::from(offset >= 0x2000) + usize::from(offset >= 0x40000)
 }
 
+#[cfg(feature = "write")]
 fn old_length_adjustment(offset: usize) -> usize {
     usize::from(offset >= 0x101) + usize::from(offset >= 0x2000) + usize::from(offset >= 0x40000)
 }
 
+#[cfg(feature = "write")]
 fn push_old_offset(old_offsets: &mut [usize; 4], offset: usize) {
     old_offsets[3] = old_offsets[2];
     old_offsets[2] = old_offsets[1];
@@ -1173,6 +1216,7 @@ fn push_old_offset(old_offsets: &mut [usize; 4], offset: usize) {
     old_offsets[0] = offset;
 }
 
+#[cfg(feature = "write")]
 fn length_slot_for_match(length: usize) -> Result<(usize, usize)> {
     if length < 3 {
         return Err(Error::InvalidData("RAR 2.0 match length is too short"));
@@ -1185,6 +1229,7 @@ fn length_slot_for_match(length: usize) -> Result<(usize, usize)> {
     Ok((slot, adjusted - LENGTH_BASES[slot]))
 }
 
+#[cfg(feature = "write")]
 fn old_length_slot_for_match(length: usize, offset: usize) -> Result<(usize, usize)> {
     let encoded = length
         .checked_sub(old_length_adjustment(offset))
@@ -1206,6 +1251,7 @@ fn old_length_slot_for_match(length: usize, offset: usize) -> Result<(usize, usi
     Ok((slot, adjusted - LENGTH_BASES[slot]))
 }
 
+#[cfg(feature = "write")]
 fn offset_slot_for_match(offset: usize) -> Result<(usize, usize)> {
     if offset == 0 {
         return Err(Error::InvalidData("RAR 2.0 match offset is zero"));
@@ -1218,6 +1264,7 @@ fn offset_slot_for_match(offset: usize) -> Result<(usize, usize)> {
     Ok((slot, adjusted - OFFSET_BASES[slot]))
 }
 
+#[cfg(feature = "write")]
 fn short_slot_for_match(offset: usize) -> Result<(usize, usize)> {
     if offset == 0 || offset > 256 {
         return Err(Error::InvalidData(
@@ -1229,11 +1276,13 @@ fn short_slot_for_match(offset: usize) -> Result<(usize, usize)> {
     Ok((slot, adjusted - SHORT_BASES[slot]))
 }
 
+#[cfg(feature = "write")]
 fn short_slot_index(offset: usize) -> usize {
     let adjusted = offset - 1;
     SHORT_BASES.partition_point(|&base| base <= adjusted) - 1
 }
 
+#[cfg(feature = "write")]
 fn literal_code_len(symbol_count: usize) -> u8 {
     // A nonempty member always emits at least one token and there are at most
     // TABLE_COUNT distinct symbols, so the result fits in u8.
@@ -1242,12 +1291,14 @@ fn literal_code_len(symbol_count: usize) -> u8 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "write")]
 struct LevelToken {
     symbol: usize,
     extra_bits: u8,
     extra_value: u8,
 }
 
+#[cfg(feature = "write")]
 impl LevelToken {
     const fn plain(symbol: usize) -> Self {
         Self {
@@ -1282,10 +1333,12 @@ impl LevelToken {
     }
 }
 
+#[cfg(feature = "write")]
 fn encode_table_level_tokens(lengths: &[u8; TABLE_COUNT]) -> Vec<LevelToken> {
     encode_level_tokens(lengths)
 }
 
+#[cfg(feature = "write")]
 fn encode_level_tokens(lengths: &[u8]) -> Vec<LevelToken> {
     let mut tokens = Vec::new();
     let mut pos = 0usize;
@@ -1330,6 +1383,7 @@ fn encode_level_tokens(lengths: &[u8]) -> Vec<LevelToken> {
     tokens
 }
 
+#[cfg(feature = "write")]
 fn emit_zero_level_run(tokens: &mut Vec<LevelToken>, mut run: usize) {
     while run != 0 {
         if run >= 11 {
@@ -1350,6 +1404,7 @@ fn emit_zero_level_run(tokens: &mut Vec<LevelToken>, mut run: usize) {
     }
 }
 
+#[cfg(feature = "write")]
 fn level_code_lengths_for_tokens(tokens: &[LevelToken]) -> [u8; LEVEL_COUNT] {
     let mut used = [false; LEVEL_COUNT];
     for token in tokens {
@@ -1358,6 +1413,7 @@ fn level_code_lengths_for_tokens(tokens: &[LevelToken]) -> [u8; LEVEL_COUNT] {
     level_code_lengths_for_used_symbols(used)
 }
 
+#[cfg(feature = "write")]
 fn encode_audio_member(input: &[u8], channels: usize) -> Result<Vec<u8>> {
     if channels == 0 || channels > MAX_CHANNELS {
         return Err(Error::InvalidData("RAR 2.0 audio channel count is invalid"));
@@ -1405,10 +1461,12 @@ fn encode_audio_member(input: &[u8], channels: usize) -> Result<Vec<u8>> {
     Ok(bits.finish())
 }
 
+#[cfg(feature = "write")]
 fn encode_audio_table_level_symbols(levels: &[u8]) -> Vec<usize> {
     levels.iter().map(|&len| len as usize).collect()
 }
 
+#[cfg(feature = "write")]
 fn level_code_lengths_for_symbols(symbols: &[usize]) -> [u8; LEVEL_COUNT] {
     let mut used = [false; LEVEL_COUNT];
     for &symbol in symbols {
@@ -1417,6 +1475,7 @@ fn level_code_lengths_for_symbols(symbols: &[usize]) -> [u8; LEVEL_COUNT] {
     level_code_lengths_for_used_symbols(used)
 }
 
+#[cfg(feature = "write")]
 fn level_code_lengths_for_used_symbols(used: [bool; LEVEL_COUNT]) -> [u8; LEVEL_COUNT] {
     let mut lengths = [0u8; LEVEL_COUNT];
     for (symbol, is_used) in used.into_iter().enumerate() {
@@ -1428,6 +1487,7 @@ fn level_code_lengths_for_used_symbols(used: [bool; LEVEL_COUNT]) -> [u8; LEVEL_
     lengths
 }
 
+#[cfg(feature = "write")]
 fn audio_encode(input: &[u8], channels: usize) -> Vec<u8> {
     let mut states = [AudioState::default(); MAX_CHANNELS];
     let mut channel_delta = 0i32;
@@ -1499,11 +1559,13 @@ fn audio_encode(input: &[u8], channels: usize) -> Vec<u8> {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg(feature = "write")]
 struct HuffmanCode {
     code: u16,
     len: u8,
 }
 
+#[cfg(feature = "write")]
 fn canonical_codes(lengths: &[u8]) -> Result<Vec<Option<HuffmanCode>>> {
     let mut count = [0u16; 16];
     for &len in lengths {
@@ -1578,7 +1640,7 @@ impl Unpack20 {
             .decode_member_from_reader(input, output_size, out)
     }
 }
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 impl Reader20State<Allowance> {
     fn new() -> Self {
         Self::with_allowance(&Allowance::default())
@@ -2226,7 +2288,7 @@ impl<B: Budget> Huffman<B> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 impl Huffman<Allowance> {
     fn from_lengths(lengths: &[u8]) -> Result<Self> {
         Self::with_lengths(lengths, &Allowance::default())
@@ -2307,18 +2369,20 @@ impl<B: Budget> BitReader<B> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 impl BitReader<Allowance> {
     fn new() -> Self {
         Self::with_allowance(&Allowance::default())
     }
 }
 #[derive(Default)]
+#[cfg(feature = "write")]
 struct BitWriter {
     bytes: Vec<u8>,
     bit_pos: usize,
 }
 
+#[cfg(feature = "write")]
 impl BitWriter {
     fn write_bits(&mut self, value: u32, count: u8) {
         super::fast::write_msb_bits(
@@ -2329,7 +2393,7 @@ impl BitWriter {
         );
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "write"))]
     fn write_bit(&mut self, bit: bool) {
         self.write_bits(u32::from(bit), 1);
     }
@@ -2339,7 +2403,7 @@ impl BitWriter {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 mod tests {
 
     #[test]
