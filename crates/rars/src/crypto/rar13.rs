@@ -42,6 +42,7 @@ impl Rar13Cipher {
         Self { key: [0, 7, 77] }
     }
 
+    #[cfg(any(test, feature = "write"))]
     pub fn encrypt_in_place(mut self, data: &mut [u8]) {
         for byte in data {
             *byte = self.encrypt_byte(*byte);
@@ -54,6 +55,7 @@ impl Rar13Cipher {
         }
     }
 
+    #[cfg(any(test, feature = "write"))]
     pub fn encrypt_byte(&mut self, byte: u8) -> u8 {
         self.advance();
         byte.wrapping_add(self.key[0])

@@ -47,6 +47,7 @@ impl Rar20Cipher {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "write"))]
     pub fn encrypt_in_place(&mut self, data: &mut [u8]) -> Result<()> {
         if !data.len().is_multiple_of(16) {
             return Err(Error::UnalignedInput);

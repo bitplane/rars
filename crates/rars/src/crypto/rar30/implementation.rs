@@ -1,6 +1,8 @@
 use super::{Error, Result};
 
-use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
+#[cfg(any(test, feature = "write"))]
+use aes::cipher::BlockCipherEncrypt;
+use aes::cipher::{BlockCipherDecrypt, KeyInit};
 use aes::Aes128;
 use sha1::{Digest, Sha1 as FastSha1};
 use std::str;
@@ -32,6 +34,7 @@ impl Rar30Cipher {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "write"))]
     pub fn encrypt_in_place(&mut self, data: &mut [u8]) -> Result<()> {
         if !data.len().is_multiple_of(16) {
             return Err(Error::UnalignedInput);
@@ -42,6 +45,7 @@ impl Rar30Cipher {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "write"))]
     fn encrypt_block(&mut self, block: &mut [u8]) {
         for (byte, iv_byte) in block.iter_mut().zip(self.iv) {
             *byte ^= iv_byte;
