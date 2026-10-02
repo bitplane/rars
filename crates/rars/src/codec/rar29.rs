@@ -5519,6 +5519,38 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     }
 
     #[test]
+    fn ppmd_member_rejects_a_vm_filter_range_beyond_native_output() {
+        let record = super::encode_vm_filter_record_inner(
+            super::VmFilterRecord {
+                block_start: 0,
+                block_size: u32::MAX as usize,
+                init_regs: &[],
+                code: super::RAR3_E8_FILTER_BYTECODE,
+                global_data: &[],
+            },
+            0,
+            true,
+        )
+        .unwrap();
+        let mut encoder = PpmdEncoder::new(PPMD_ORDER, PPMD_ESC, 1).unwrap();
+        encoder.encode_literal(b'A').unwrap();
+        encoder.encode_vm_filter_record(&record).unwrap();
+        encoder.encode_literal(b'B').unwrap();
+        let (body, _) = encoder.finish_keeping_model().unwrap();
+        let mut packed = vec![0x80 | 0x20 | (PPMD_ORDER as u8 - 1), 0];
+        packed.extend_from_slice(&body);
+        let message = if cfg!(target_pointer_width = "32") {
+            "RAR 2.9 VM filter size overflows"
+        } else {
+            "RAR 2.9 VM filter extends beyond output"
+        };
+        assert_eq!(
+            unpack29_decode(&packed, 2),
+            Err(Error::InvalidData(message))
+        );
+    }
+
+    #[test]
     fn stale_filter_ranges_do_not_change_later_published_bytes() {
         let mut decoder = Unpack29::new();
         decoder.output.resize(32, 0x5a).unwrap();
