@@ -1601,11 +1601,15 @@ fn recover_damaged_shards_with_control(
         damaged_lookup[data_index] = true;
     }
 
-    let recovery_count = recovery_shards
-        .iter()
-        .map(|(row, _)| row + 1)
-        .max()
-        .ok_or(Error::TooManyDamagedShards)?;
+    let recovery_count =
+        recovery_shards
+            .iter()
+            .try_fold(0usize, |count, (row, _)| -> Result<usize> {
+                Ok(count.max(row.checked_add(1).ok_or(Error::TooManyShards)?))
+            })?;
+    if recovery_count == 0 {
+        return Err(Error::TooManyDamagedShards);
+    }
     let matrix = make_encoder_matrix(data_count, recovery_count)?;
     let gf = shared_gf16();
     let equations: Vec<Vec<u16>> = recovery_shards
@@ -3918,6 +3922,10 @@ mod tests {
             Err(Error::TooManyDamagedShards)
         );
         assert_eq!(
+            reconstruct_data_shards(&[None], &[(usize::MAX, &[1, 2])]),
+            Err(Error::TooManyShards)
+        );
+        assert_eq!(
             reconstruct_data_shards(&[Some(&[1, 2]), Some(&[3])], &[]),
             Ok(vec![vec![1, 2], vec![3, 0]])
         );
@@ -3930,6 +3938,14 @@ mod tests {
         let third = b"qrstuvwx".to_vec();
         let refs = [first.as_slice(), second.as_slice(), third.as_slice()];
         let parity = encode_parity_shards(&refs, 2).unwrap();
+
+        assert_eq!(
+            reconstruct_data_shards(
+                &[None, Some(&second), None],
+                &[(0, parity[0].as_slice()), (0, parity[0].as_slice())]
+            ),
+            Err(Error::SingularElement)
+        );
 
         let reconstructed = reconstruct_data_shards(
             &[None, Some(&second), None],
