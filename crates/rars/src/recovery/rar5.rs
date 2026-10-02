@@ -1204,7 +1204,7 @@ pub(crate) fn repair_inline_recovery_archive_with_report(
     );
     for found in &chunks {
         check_repair(control)?;
-        append_inline_recovery_chunk(input, found, &mut recovery_data)?;
+        append_inline_recovery_chunk(input, found, &mut recovery_data);
     }
     let original_prefix = &input[..protected_size];
     let repaired_prefix =
@@ -1405,17 +1405,12 @@ fn find_recovery_marker(input: &[u8]) -> Option<usize> {
     None
 }
 
-fn append_inline_recovery_chunk(
-    input: &[u8],
-    found: &FoundInlineRecoveryChunk,
-    out: &mut Vec<u8>,
-) -> Result<()> {
+fn append_inline_recovery_chunk(input: &[u8], found: &FoundInlineRecoveryChunk, out: &mut Vec<u8>) {
     // The scanner parsed this complete u32-sized shard from input[start..].
     let shard_size = found.chunk.plan.shard_size as usize;
     let start = found.offset;
     let end = start + shard_size;
     out.extend_from_slice(&input[start..end]);
-    Ok(())
 }
 
 pub fn reconstruct_data_shards(
