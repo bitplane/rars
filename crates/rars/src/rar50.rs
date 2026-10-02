@@ -2858,6 +2858,8 @@ mod tests {
                 "RAR 5 recovery service is missing service data"
             ))
         ));
+        file.service_data = Some(Vec::new());
+        assert_eq!(file.recovery_record(), Err(Error::TooShort));
         file.service_data = Some(vec![5, 0]);
         assert!(matches!(
             file.recovery_record(),
