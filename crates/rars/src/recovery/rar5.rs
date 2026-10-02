@@ -820,9 +820,9 @@ fn encode_parity_resident<B: Budget>(
 
     let mut consumed = 0u64;
     for (shard_index, state) in shard_states.iter_mut().enumerate() {
-        let shard_start = (shard_index as u64)
-            .checked_mul(plan.group_count)
-            .ok_or(Error::PlanOverflow)?;
+        // The wire limits admit at most u16::MAX data shards of u32-sized
+        // groups, so every data-shard offset fits u64.
+        let shard_start = shard_index as u64 * plan.group_count;
         if shard_start >= body_len {
             break;
         }
@@ -887,9 +887,7 @@ fn encode_parity_striped<B: Budget>(
         }
 
         for (shard_index, state) in shard_states.iter_mut().enumerate() {
-            let shard_start = (shard_index as u64)
-                .checked_mul(plan.group_count)
-                .ok_or(Error::PlanOverflow)?;
+            let shard_start = shard_index as u64 * plan.group_count;
             let shard_bytes = plan.group_count.min(body_len.saturating_sub(shard_start));
             if column >= shard_bytes {
                 continue;
