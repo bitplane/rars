@@ -173,10 +173,9 @@ pub fn split_prefix_shard_ranges(
 
     let mut ranges = Vec::with_capacity(data_shards);
     for shard_index in 0..data_shards {
-        let start = shard_index
-            .checked_mul(group_count)
-            .ok_or(Error::PlanOverflow)?
-            .min(prefix_len);
+        // Every shard index is below data_shards, whose full product with
+        // group_count was admitted above.
+        let start = (shard_index * group_count).min(prefix_len);
         let end = start.saturating_add(group_count).min(prefix_len);
         ranges.push(start..end);
     }
@@ -317,7 +316,8 @@ pub(crate) fn choose_recovery_memory_mode(
         stripe_len = MIN_STRIPE_LEN.min(plan.group_count.max(2));
     }
     stripe_len = stripe_len.max(2);
-    let stripe_len_usize = usize::try_from(stripe_len).map_err(|_| Error::PlanOverflow)?;
+    // The budget caps this width at 64 MiB on every supported host.
+    let stripe_len_usize = stripe_len as usize;
     let required = rows.saturating_mul(stripe_len);
     Ok((
         RecoveryMemoryMode::Striped {
@@ -364,7 +364,7 @@ pub(crate) fn choose_recovery_capacity_mode(
     let stripe_len = width.min(plan.group_count).max(2) & !1;
     Ok((
         RecoveryMemoryMode::Striped {
-            stripe_len: usize::try_from(stripe_len).map_err(|_| Error::PlanOverflow)?,
+            stripe_len: stripe_len as usize,
         },
         rows.saturating_add(1).saturating_mul(stripe_len),
     ))
@@ -2746,6 +2746,17 @@ mod tests {
             "striping must fit the budget it was given: {required} > {limit}"
         );
         assert!(required < parity_bytes);
+        assert_eq!(
+            super::choose_recovery_memory_mode(
+                InlineRecoveryPlan {
+                    recovery_shards: u64::MAX,
+                    group_count: 2,
+                    ..plan
+                },
+                u64::MAX,
+            ),
+            Err(Error::PlanOverflow)
+        );
     }
 
     #[test]
@@ -2917,6 +2928,16 @@ mod tests {
         assert_eq!(
             split_prefix_shards(b"abcde", plan),
             Err(Error::PrefixExceedsPlan)
+        );
+        assert_eq!(
+            split_prefix_shard_ranges(
+                0,
+                InlineRecoveryPlan {
+                    group_count: usize::MAX as u64,
+                    ..plan
+                }
+            ),
+            Err(Error::PlanOverflow)
         );
     }
 
