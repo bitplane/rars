@@ -1890,10 +1890,14 @@ fn parse_block_header_bytes(
     if remaining < 5 {
         return Err(Error::TooShort);
     }
-    let header_crc = read_u32(input, offset)?;
-    let after_crc = offset
-        .checked_add(4)
-        .ok_or(Error::InvalidHeader("RAR 5 header offset overflows usize"))?;
+    // The physical archive slice contains this complete five-byte prefix.
+    let header_crc = u32::from_le_bytes([
+        input[offset],
+        input[offset + 1],
+        input[offset + 2],
+        input[offset + 3],
+    ]);
+    let after_crc = offset + 4;
     let (header_size, header_size_len) = read_vint_at(input, after_crc, archive_len)?;
     let header_body_len = usize_from_u64(header_size, "RAR 5 header size overflows usize")?;
     let header_total = 4usize
@@ -1904,13 +1908,9 @@ fn parse_block_header_bytes(
         return Err(Error::TooShort);
     }
     budget.admit(header_total, offset)?;
-    let header_end = offset
-        .checked_add(header_total)
-        .ok_or(Error::InvalidHeader("RAR 5 header size overflows usize"))?;
-    let header = input
-        .get(offset..header_end)
-        .ok_or(Error::TooShort)?
-        .to_vec();
+    // header_total <= archive_len-offset and archive_len == input.len().
+    let header_end = offset + header_total;
+    let header = input[offset..header_end].to_vec();
     parse_block_header_image(
         header,
         offset,
@@ -1992,7 +1992,8 @@ fn read_block_header_at(
     }
     let prefix_len = remaining.min(14);
     let prefix = read_exact_at(file, sfx_offset + offset, prefix_len)?;
-    let header_crc = read_u32(&prefix, 0)?;
+    // An exact prefix read returned at least five bytes above.
+    let header_crc = u32::from_le_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]);
     let (header_size, header_size_len) = read_vint_at(&prefix, 4, prefix.len())?;
     let header_body_len = usize_from_u64(header_size, "RAR 5 header size overflows usize")?;
     let header_total = 4usize
@@ -2118,13 +2119,10 @@ fn parse_block_header_image(
         return Err(Error::TooShort);
     }
     let type_specific_start = reader.pos;
-    let data_start = sfx_offset
-        .checked_add(offset)
-        .and_then(|pos| pos.checked_add(disk_header_len))
-        .ok_or(Error::InvalidHeader("RAR 5 data offset overflows usize"))?;
-    let data_end = data_start
-        .checked_add(data_len)
-        .ok_or(Error::InvalidHeader("RAR 5 data size overflows usize"))?;
+    // Both source adapters set archive_len = source_len-sfx_offset. Since
+    // next_offset <= archive_len, these absolute positions fit the source.
+    let data_start = sfx_offset + offset + disk_header_len;
+    let data_end = data_start + data_len;
 
     Ok(ParsedBlockHeader {
         control: control.clone(),
@@ -2147,7 +2145,8 @@ fn parse_block_header_image(
 }
 
 fn validate_block_header_crc(header: &[u8], expected: u32) -> Result<()> {
-    let actual = crc32(header.get(4..).ok_or(Error::TooShort)?);
+    // Every admitted header has a four-byte CRC and at least one size byte.
+    let actual = crc32(&header[4..]);
     if actual != expected {
         return Err(Error::Crc32Mismatch { expected, actual });
     }
