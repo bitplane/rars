@@ -5103,6 +5103,66 @@ fn repairs_missing_rar50_data_volume_from_rev5_recovery_volume() {
 }
 
 #[test]
+fn rar50_rev5_repair_preserves_reconstruction_and_sink_errors() {
+    let data: Vec<_> = (1..=5)
+        .map(|index| std::fs::read(fixture(&format!("multivol_rev.part{index}.rar"))).unwrap())
+        .collect();
+    let rev =
+        Rev5Volume::parse(&std::fs::read(fixture("multivol_rev.part1.rev")).unwrap()).unwrap();
+    let too_many_missing = [
+        None,
+        None,
+        Some(data[2].as_slice()),
+        Some(data[3].as_slice()),
+        Some(data[4].as_slice()),
+    ];
+    assert!(matches!(
+        repair_rev5_volumes_to(&too_many_missing, std::slice::from_ref(&rev), |_, _| Ok(())),
+        Err(Error::Rar5Recovery(
+            rars::recovery::rar5::Error::TooManyDamagedShards
+        ))
+    ));
+
+    let one_missing = [
+        Some(data[0].as_slice()),
+        None,
+        Some(data[2].as_slice()),
+        Some(data[3].as_slice()),
+        Some(data[4].as_slice()),
+    ];
+    let mut written = Vec::new();
+    assert!(matches!(
+        repair_rev5_volumes_to(&one_missing, &[rev], |index, _| {
+            if index == 1 {
+                return Err(Error::Cancelled);
+            }
+            written.push(index);
+            Ok(())
+        }),
+        Err(Error::Cancelled)
+    ));
+    assert_eq!(written, vec![0]);
+}
+
+#[cfg(target_pointer_width = "32")]
+#[test]
+fn rar50_rev5_repair_rejects_data_size_above_native_range() {
+    let data: Vec<_> = (1..=5)
+        .map(|index| std::fs::read(fixture(&format!("multivol_rev.part{index}.rar"))).unwrap())
+        .collect();
+    let mut rev =
+        Rev5Volume::parse(&std::fs::read(fixture("multivol_rev.part1.rev")).unwrap()).unwrap();
+    rev.data_volumes[0].file_size = u32::MAX as u64 + 1;
+    let inputs: Vec<_> = data.iter().map(|volume| Some(volume.as_slice())).collect();
+    assert!(matches!(
+        repair_rev5_volumes_to(&inputs, &[rev], |_, _| panic!("unexpected write")),
+        Err(Error::InvalidHeader(
+            "RAR 5 REV data volume size overflows usize"
+        ))
+    ));
+}
+
+#[test]
 fn repairs_two_missing_rar50_data_volumes_from_rev5_recovery_volumes() {
     let data: Vec<_> = (1..=5)
         .map(|index| std::fs::read(fixture(&format!("multivol_rev.part{index}.rar"))).unwrap())
