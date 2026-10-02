@@ -738,7 +738,7 @@ impl<B: Budget> ParityRows<'_, B> {
     ) -> Result<()> {
         match self {
             Self::Resident(rows) => {
-                let row = rows.get(index).ok_or(Error::PlanOverflow)?;
+                let row = &rows[index];
                 if !row.is_empty() {
                     visit(row);
                 }
@@ -748,14 +748,13 @@ impl<B: Budget> ParityRows<'_, B> {
                 scratch,
                 group_count,
             } => {
-                let start = (index as u64)
-                    .checked_mul(*group_count)
-                    .ok_or(Error::PlanOverflow)?;
+                // The admitted payload contains every recovery row, and the
+                // caller supplies only row zero or an in-range shard index.
+                let start = index as u64 * *group_count;
                 scratch.seek(std::io::SeekFrom::Start(start))?;
                 let mut remaining = *group_count;
                 while remaining != 0 {
-                    let want = usize::try_from(remaining.min(buffer.len() as u64))
-                        .map_err(|_| Error::PlanOverflow)?;
+                    let want = remaining.min(buffer.len() as u64) as usize;
                     scratch.read_exact(&mut buffer[..want])?;
                     visit(&buffer[..want]);
                     remaining -= want as u64;
@@ -909,10 +908,8 @@ fn encode_parity_striped<B: Budget>(
         }
 
         for (shard_index, stripe_row) in stripe.iter().enumerate() {
-            let position = (shard_index as u64)
-                .checked_mul(plan.group_count)
-                .and_then(|start| start.checked_add(column))
-                .ok_or(Error::PlanOverflow)?;
+            // position is within an admitted row of the complete payload.
+            let position = shard_index as u64 * plan.group_count + column;
             scratch.seek(std::io::SeekFrom::Start(position))?;
             scratch.write_all(&stripe_row[..width_usize])?;
         }
