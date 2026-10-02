@@ -6,6 +6,16 @@
 //! caller-provided writers without requiring callers to buffer whole archives
 //! in memory. New Rust users should depend on this crate rather than the
 //! lower-level `rars-*` implementation crates, which ended at 0.3.x.
+//!
+//! All capabilities are enabled by default. Set `default-features = false` for
+//! sequential parsing and decoding without encoders, recovery algorithms, crypto
+//! dependencies or Rayon. Select `write`, `recovery`, `encryption` and `parallel`
+//! independently as needed. Encrypted writing needs `write` and `encryption`;
+//! writing recovery records needs `write` and `recovery`. Recovery repair does
+//! not require `write`. Unavailable encrypted or recovery operations report
+//! [`Error::FeatureDisabled`], while metadata remains readable where the format
+//! permits it. Buffered extraction falls back to sequential execution without
+//! `parallel`, and on bare WebAssembly.
 
 /// Where the unit tests write their files. Shared with the integration tests
 /// by path rather than by API.

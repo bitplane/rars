@@ -64,6 +64,52 @@ Use `--legacy-name-encoding cp850` or the corresponding binding option; see
 [legacy filename decoding](FILENAME_ENCODINGS.md) for supported encodings and
 preservation semantics.
 
+## Library features
+
+All features are enabled by default. For a sequential reader without encoders,
+recovery algorithms, cryptographic dependencies or Rayon:
+
+```toml
+[dependencies]
+rars = { version = "0.9", default-features = false }
+```
+
+Enable encrypted reading independently when needed:
+
+```toml
+rars = { version = "0.9", default-features = false, features = ["encryption"] }
+```
+
+| Feature | Adds |
+| --- | --- |
+| None | Parsing and sequential decoding for RAR 1.3–7, metadata, checksums, comments, solid/split archives, cancellation and reader resource policies |
+| `write` | Encoders, `Builder`, writer resources, archive writing and rewriting |
+| `recovery` | Recovery generation and repair; recovery metadata remains readable without this feature |
+| `encryption` | Encrypted headers and payloads, password derivation and cryptographic dependencies |
+| `parallel` | Rayon execution on supported native targets |
+
+Every combination is supported. Writing encrypted archives requires `write` and
+`encryption`; writing recovery records requires `write` and `recovery`. Recovery
+repair works without `write`. Without `parallel`, buffered extraction APIs use
+sequential execution; bare WebAssembly also runs sequentially. Writing and
+recovery enable entropy support, including encrypted header reconstruction during
+repair; encrypted reading alone does not need entropy.
+
+Without `encryption`, plaintext headers still expose encrypted member metadata.
+Opening encrypted headers or extracting encrypted payloads returns
+`Error::FeatureDisabled { feature: "encryption" }`, even if a password is supplied.
+Recovery operations similarly return a disabled-feature error without `recovery`.
+These errors have `ErrorKind::UnsupportedFeature`. Writer and encoder APIs are
+absent when `write` is disabled. RAR 1.3's fixed archive-comment transformation
+remains available to readers without `encryption`.
+
+Cargo unifies features across consumers of the same crate. Another dependency
+that enables `rars` defaults can therefore restore the full build. Use
+`cargo tree -e features` to inspect the resolved configuration. The CLI, Python
+and npm bindings retain their full builds. See the
+[independent consumer checks](scripts/reader-consumer/README.md) for reproduction
+commands that avoid workspace feature unification.
+
 ## Reader resources
 
 Reader workspace limits are available as Rust

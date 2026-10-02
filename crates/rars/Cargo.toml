@@ -19,7 +19,7 @@ workspace = true
 all-features = true
 
 [features]
-# Feature boundaries are introduced incrementally without changing defaults.
+# Default builds retain all capabilities; each optional feature is independent.
 default = ["write", "parallel", "recovery", "encryption"]
 parallel = ["dep:rayon"]
 recovery = ["dep:getrandom"]
