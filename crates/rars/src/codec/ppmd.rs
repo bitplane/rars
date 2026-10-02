@@ -448,6 +448,7 @@ pub trait PpmdByteReader {
 }
 
 #[derive(Debug, Clone)]
+#[cfg(any(test, feature = "write"))]
 pub struct PpmdDecoder {
     state: PpmdState<Allowance>,
 }
@@ -456,6 +457,7 @@ impl Clone for PpmdState<Allowance> {
         self.try_clone().expect("unlimited PPMd model copy")
     }
 }
+#[cfg(any(test, feature = "write"))]
 impl PpmdDecoder {
     pub fn new() -> Self {
         Self {
@@ -495,6 +497,7 @@ pub(crate) struct PpmdState<B: Budget> {
 }
 
 #[derive(Debug, Clone)]
+#[cfg(any(test, feature = "write"))]
 pub struct PpmdEncoder {
     model: PpmdDecoder,
     range: RangeEncoder,
@@ -836,6 +839,7 @@ impl<B: Budget> PpmdState<B> {
         }
     }
 
+    #[cfg(any(test, feature = "write"))]
     fn encode_symbol(&mut self, symbol: u8, output: &mut RangeEncoder) -> Result<()> {
         let mut mask = [true; 256];
         let min = self.min_context;
@@ -1577,6 +1581,7 @@ impl<B: Budget> PpmdState<B> {
     }
 }
 
+#[cfg(any(test, feature = "write"))]
 impl PpmdEncoder {
     pub fn new(max_order: usize, esc_char: u8, dictionary_mb: usize) -> Result<Self> {
         if !(2..=64).contains(&max_order) {
@@ -1607,6 +1612,7 @@ impl PpmdEncoder {
     /// one model across every member in it. Each block still gets a fresh range
     /// coder, which is what lets a member's packed bytes start on a byte
     /// boundary of their own.
+    #[cfg(feature = "write")]
     pub fn continuing(model: PpmdDecoder, esc_char: u8) -> Self {
         Self {
             model,
@@ -1703,6 +1709,7 @@ impl PpmdEncoder {
         Ok(())
     }
 
+    #[cfg(feature = "write")]
     pub fn encode_vm_filter_record(&mut self, record: &[u8]) -> Result<()> {
         self.model
             .state
@@ -1719,6 +1726,7 @@ impl PpmdEncoder {
     /// normalisation flushes, so the difference between two readings is the
     /// cost of whatever was coded between them. The RAR 2.9 tokeniser reads
     /// this to price escape tokens against the literals they would replace.
+    #[cfg(feature = "write")]
     pub(crate) fn spent_bits(&self) -> f64 {
         8.0 * self.range.out.len() as f64 - f64::from(self.range.range.max(1)).log2()
     }
@@ -1786,12 +1794,14 @@ impl RangeDecoder {
 }
 
 #[derive(Debug, Clone)]
+#[cfg(any(test, feature = "write"))]
 struct RangeEncoder {
     low: u32,
     range: u32,
     out: Vec<u8>,
 }
 
+#[cfg(any(test, feature = "write"))]
 impl RangeEncoder {
     fn new() -> Self {
         Self {

@@ -76,6 +76,7 @@ pub(crate) struct MatchFinder<const MIN_MATCH: usize, B: Budget = Allowance> {
     newest: usize,
 }
 
+#[cfg(any(test, feature = "write"))]
 impl<const MIN_MATCH: usize> MatchFinder<MIN_MATCH> {
     pub(crate) fn new(window: usize) -> Self {
         Self::with_allowance(window, &Allowance::default()).expect("unlimited finder allocation")

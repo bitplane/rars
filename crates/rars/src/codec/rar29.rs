@@ -1,11 +1,18 @@
+#[cfg(feature = "write")]
+use super::filters::FilterOp;
 #[cfg(all(test, feature = "write"))]
 use super::filters::MAX_DELTA_CHANNELS;
-use super::filters::{self, DeltaErrorMessages, FilterOp};
+use super::filters::{self, DeltaErrorMessages};
+#[cfg(feature = "write")]
 use super::huffman;
-use super::ppmd::{PpmdByteReader, PpmdDecoder, PpmdEncoder, PpmdState};
+#[cfg(feature = "write")]
+use super::match_finder;
+use super::ppmd::{PpmdByteReader, PpmdState};
+#[cfg(feature = "write")]
+use super::ppmd::{PpmdDecoder, PpmdEncoder};
 use super::rarvm;
 use super::workspace::{Allowance, Budget, Buffer};
-use super::{match_finder, Error, Result};
+use super::{Error, Result};
 use crate::crc32::crc32;
 use std::io::{Read, Write};
 
@@ -17,11 +24,14 @@ const LEVEL_COUNT: usize = 20;
 const TABLE_COUNT: usize = MAIN_COUNT + OFFSET_COUNT + LOW_OFFSET_COUNT + LENGTH_COUNT;
 const MAX_HISTORY: usize = 4 * 1024 * 1024;
 const STREAM_CHUNK: usize = 1024 * 1024;
+#[cfg(feature = "write")]
 const MAX_VM_FILTER_BLOCK_SIZE: usize = 128 * 1024;
 // The standard AUDIO bytecode uses separate input/output regions inside RARVM
 // memory. Keep generated blocks below the overlap boundary accepted by period
 // decoders.
+#[cfg(feature = "write")]
 pub(crate) const MAX_VM_DELTA_FILTER_BLOCK_SIZE: usize = 120_000;
+#[cfg(feature = "write")]
 const MAX_VM_AUDIO_FILTER_BLOCK_SIZE: usize = 120_000;
 // RARVM's standard AUDIO filter reserves an eight-bit-ish compatibility
 // range wider than WinRAR's usual 1..=4 channel choices. UnRAR accepts up to
@@ -55,57 +65,78 @@ const OFFSET_BITS: [u8; OFFSET_COUNT] = [
 ];
 const SHORT_BASES: [usize; 8] = [0, 4, 8, 16, 32, 64, 128, 192];
 const SHORT_BITS: [u8; 8] = [2, 2, 3, 4, 5, 6, 6, 6];
+#[cfg(feature = "write")]
 const MAX_ENCODER_MATCH_OFFSET: usize = 1024 * 1024;
+#[cfg(feature = "write")]
 const MAX_ENCODER_MATCH_LENGTH: usize = 258;
 const INVALID_MATCH_OFFSET: usize = usize::MAX;
+#[cfg(feature = "write")]
 const MAX_MATCH_CANDIDATES: usize = 256;
+#[cfg(feature = "write")]
 const MAX_PPMD_MATCH_LENGTH: usize = 255;
+#[cfg(feature = "write")]
 const MIN_PPMD_MATCH_LENGTH: usize = 32;
+#[cfg(feature = "write")]
 const MAX_PPMD_REPEAT_LENGTH: usize = 259;
 // The parameters rar 3.00 itself declares at -m5, read out of its streams.
+#[cfg(feature = "write")]
 const PPMD_ORDER: usize = 8;
+#[cfg(feature = "write")]
 const PPMD_DICTIONARY_MB: u8 = 25;
+#[cfg(feature = "write")]
 const PPMD_ESC: u8 = 2;
 // Seeds and weights for the escape-token cost model in `encode_ppmd_hybrid`.
 // The seeds only steer the first few decisions; measured costs take over as
 // the member is coded. All five are tuning knobs, not format constants.
+#[cfg(feature = "write")]
 const PPMD_LITERAL_BITS_SEED: f64 = 4.0;
+#[cfg(feature = "write")]
 const PPMD_MATCH_BITS_SEED: f64 = 60.0;
+#[cfg(feature = "write")]
 const PPMD_REPEAT_BITS_SEED: f64 = 24.0;
+#[cfg(feature = "write")]
 const PPMD_LITERAL_EMA_WEIGHT: f64 = 1.0 / 32.0;
+#[cfg(feature = "write")]
 const PPMD_TOKEN_EMA_WEIGHT: f64 = 1.0 / 8.0;
 // An escape token's copied bytes never reach the model, so the literals right
 // after it are predicted from the token's own bytes and pay for the broken
 // context. That cost lands on the literals' ledger, not the token's, so the
 // token is charged a flat estimate of it here.
+#[cfg(feature = "write")]
 const PPMD_CONTEXT_BREAK_BITS: f64 = 16.0;
 // After a match is priced out, nearby positions almost always price out the
 // same way, so the search sleeps a few bytes rather than re-walking the hash
 // chain at every literal.
+#[cfg(feature = "write")]
 const PPMD_REJECT_SEARCH_COOLDOWN: usize = 8;
 
+#[cfg(feature = "write")]
 type Rar29MatchFinder = match_finder::MatchFinder<4>;
 
 // RAR 3.x standard filters are stored as RARVM bytecode in the compressed
 // stream. RAR15_40_FORMAT_SPECIFICATION.md §20 and FILTER_TRANSFORMS.md §9
 // define these blobs by byte length plus CRC32 fingerprint; keep the bytes
 // verbatim so writer output and reader recognition use the same wire identity.
+#[cfg(feature = "write")]
 const RAR3_E8_FILTER_BYTECODE: &[u8] = &[
     0x97, 0x1b, 0x01, 0x28, 0x07, 0x06, 0x98, 0x08, 0x00, 0x00, 0x00, 0xd1, 0x3a, 0x10, 0x15, 0x92,
     0xec, 0x50, 0xcb, 0x99, 0x20, 0xb9, 0x25, 0xf0, 0x29, 0x19, 0x15, 0x53, 0x03, 0x12, 0xae, 0x51,
     0x10, 0x35, 0x59, 0x2b, 0x60, 0x04, 0x15, 0x6d, 0x40, 0x66, 0xab, 0x02, 0x34, 0x49, 0x04, 0x36,
     0x02, 0x52, 0x3e, 0x97, 0x00,
 ];
+#[cfg(feature = "write")]
 const RAR3_E8E9_FILTER_BYTECODE: &[u8] = &[
     0x84, 0x1b, 0x01, 0x28, 0x11, 0x10, 0x69, 0x80, 0x80, 0x00, 0x00, 0x0d, 0x13, 0xa1, 0x01, 0xc6,
     0x89, 0xd2, 0x80, 0xac, 0x97, 0x62, 0x85, 0x5c, 0xc9, 0x05, 0xc9, 0x2f, 0x81, 0x48, 0xc8, 0xaa,
     0x98, 0x18, 0x95, 0x72, 0x88, 0x81, 0xaa, 0xc9, 0x5b, 0x00, 0x20, 0xab, 0x6a, 0x03, 0x35, 0x58,
     0x11, 0xa2, 0x48, 0x21, 0xb0, 0x12, 0x91, 0xf4, 0xb8,
 ];
+#[cfg(feature = "write")]
 const RAR3_DELTA_FILTER_BYTECODE: &[u8] = &[
     0x2f, 0x01, 0x9a, 0x41, 0x80, 0xec, 0x27, 0x48, 0x2f, 0x09, 0x76, 0x6d, 0xd3, 0xea, 0x41, 0x5b,
     0x59, 0x44, 0xe8, 0x17, 0x5c, 0xe1, 0x6c, 0x91, 0x4c, 0x4e, 0x3f, 0x77, 0x00,
 ];
+#[cfg(feature = "write")]
 const RAR3_ITANIUM_FILTER_BYTECODE: &[u8] = &[
     0x46, 0x9e, 0x08, 0x08, 0x0c, 0x0c, 0x00, 0x00, 0x0e, 0x0e, 0x08, 0x08, 0x00, 0x00, 0x08, 0x08,
     0x00, 0x00, 0x6c, 0x11, 0x5a, 0x04, 0xac, 0x0c, 0xc4, 0xcc, 0x5c, 0x08, 0x18, 0x46, 0x24, 0x08,
@@ -116,6 +147,7 @@ const RAR3_ITANIUM_FILTER_BYTECODE: &[u8] = &[
     0x88, 0x83, 0x38, 0xcc, 0xc4, 0x11, 0x09, 0x87, 0xa6, 0xe0, 0x46, 0x02, 0xb2, 0x24, 0x03, 0xe2,
     0xa0, 0x32, 0x54, 0x83, 0x52, 0xc5, 0xb1, 0x70,
 ];
+#[cfg(feature = "write")]
 const RAR3_RGB_FILTER_BYTECODE: &[u8] = &[
     0xc5, 0x01, 0x9a, 0x41, 0x95, 0xc9, 0xa6, 0x4d, 0xba, 0x4b, 0x14, 0x0a, 0xf4, 0x9b, 0x80, 0x4c,
     0x00, 0x15, 0xa6, 0xa8, 0x07, 0x26, 0x2a, 0xc9, 0xc4, 0x8b, 0x86, 0x62, 0x32, 0x0f, 0x86, 0x64,
@@ -128,6 +160,7 @@ const RAR3_RGB_FILTER_BYTECODE: &[u8] = &[
     0x71, 0xdb, 0xb2, 0x49, 0x38, 0x6e, 0x02, 0x2a, 0x2c, 0x41, 0x2b, 0x10, 0x98, 0x82, 0x49, 0x03,
     0x14, 0xf4, 0xe1, 0x97, 0x00,
 ];
+#[cfg(feature = "write")]
 const RAR3_AUDIO_FILTER_BYTECODE: &[u8] = &[
     0x47, 0x01, 0x9a, 0x41, 0x95, 0xe5, 0x72, 0x0d, 0xc2, 0x64, 0x82, 0x74, 0x93, 0x24, 0xb1, 0x40,
     0x06, 0xd8, 0x38, 0x44, 0x00, 0xa8, 0x01, 0x34, 0x11, 0xdc, 0xa1, 0xba, 0x01, 0x99, 0x0c, 0xc4,
@@ -150,10 +183,12 @@ pub fn unpack29_decode(input: &[u8], output_size: usize) -> Result<Vec<u8>> {
     decoder.decode_non_solid_member(input, output_size)
 }
 
+#[cfg(feature = "write")]
 pub fn unpack29_encode_literals(input: &[u8]) -> Result<Vec<u8>> {
     encode_member(input, &[])
 }
 
+#[cfg(feature = "write")]
 pub fn unpack29_encode_literals_with_options(
     input: &[u8],
     options: EncodeOptions,
@@ -170,6 +205,7 @@ pub(crate) fn unpack29_encode_literals_with_options_and_progress(
     encode_member_with_options_and_progress(input, &[], options, &mut [0; TABLE_COUNT], progress)
 }
 
+#[cfg(feature = "write")]
 pub fn unpack29_encode_ppmd_literals(input: &[u8]) -> Result<Vec<u8>> {
     encode_ppmd_member(input, false, &[], 0)
 }
@@ -216,10 +252,12 @@ pub(crate) fn unpack29_encode_ppmd_with_progress(
 /// escape-4 matches copy out of the same window the LZ decoder uses, so a match
 /// that reaches further back than the header promises lands on whatever the
 /// decoder still happens to hold, and unrar fails the member on its checksum.
+#[cfg(feature = "write")]
 pub fn unpack29_encode_ppmd(input: &[u8], max_match_distance: usize) -> Result<Vec<u8>> {
     encode_ppmd_member(input, true, &[], max_match_distance)
 }
 
+#[cfg(feature = "write")]
 pub fn unpack29_encode_ppmd_with_filter(
     input: &[u8],
     filter: crate::FilterSpec,
@@ -228,6 +266,7 @@ pub fn unpack29_encode_ppmd_with_filter(
     encode_ppmd_filtered_member(input, filter, true, max_match_distance)
 }
 
+#[cfg(feature = "write")]
 fn encode_ppmd_filtered_member(
     input: &[u8],
     filter: crate::FilterSpec,
@@ -243,6 +282,7 @@ fn encode_ppmd_filtered_member(
     encode_ppmd_member(&filtered.data, lz_escapes, &records, max_match_distance)
 }
 
+#[cfg(feature = "write")]
 pub(crate) fn filtered_members(
     input: &[u8],
     filters: &[crate::FilterSpec],
@@ -250,6 +290,7 @@ pub(crate) fn filtered_members(
     filtered_members_with_progress(input, filters, None)
 }
 
+#[cfg(feature = "write")]
 fn filtered_members_with_progress(
     input: &[u8],
     filters: &[crate::FilterSpec],
@@ -301,11 +342,13 @@ fn filtered_members_with_progress(
     Ok(FilteredMembers { data, records })
 }
 
+#[cfg(feature = "write")]
 pub(crate) struct FilteredMembers {
     pub(crate) data: Vec<u8>,
     records: Vec<OwnedVmFilterRecord>,
 }
 
+#[cfg(feature = "write")]
 fn split_large_filter(
     input_len: usize,
     filter: crate::FilterSpec,
@@ -367,6 +410,7 @@ fn split_large_filter(
     Ok(filters)
 }
 
+#[cfg(feature = "write")]
 fn checked_filter_range(
     input_len: usize,
     filter: &crate::FilterSpec,
@@ -378,6 +422,7 @@ fn checked_filter_range(
     Ok(range)
 }
 
+#[cfg(feature = "write")]
 struct OwnedVmFilterRecord {
     block_start: usize,
     block_size: usize,
@@ -386,6 +431,7 @@ struct OwnedVmFilterRecord {
     global_data: Vec<u8>,
 }
 
+#[cfg(feature = "write")]
 fn encode_ppmd_member(
     input: &[u8],
     lz_escapes: bool,
@@ -395,6 +441,7 @@ fn encode_ppmd_member(
     encode_ppmd_block(input, lz_escapes, initial_filters, max_match_distance)
 }
 
+#[cfg(feature = "write")]
 fn encode_ppmd_block(
     input: &[u8],
     lz_escapes: bool,
@@ -422,6 +469,7 @@ fn encode_ppmd_block(
 /// difference is most of why that archive is 18% smaller than ours was.
 ///
 /// The model comes back out so the next block can continue it in turn.
+#[cfg(feature = "write")]
 fn encode_ppmd_block_with_model(
     input: &[u8],
     lz_escapes: bool,
@@ -476,6 +524,7 @@ fn encode_ppmd_block_with_model(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "write")]
 enum PpmdEncodeToken {
     Literal(u8),
     RepeatOffsetOne { length: usize },
@@ -517,11 +566,13 @@ impl TryFrom<crate::FilterKind> for Rar29Filter {
 
 /// The writer rejects these before compressing anything, so reaching this is
 /// either a direct `codec` caller or a bug. Either way the codec stays total.
+#[cfg(feature = "write")]
 fn rar29_filter(kind: crate::FilterKind) -> Result<Rar29Filter> {
     Rar29Filter::try_from(kind)
         .map_err(|_| Error::InvalidData("the RAR 2.9 family has no program for this filter"))
 }
 
+#[cfg(feature = "write")]
 struct FilteredMember {
     data: Vec<u8>,
     block_start: usize,
@@ -530,6 +581,7 @@ struct FilteredMember {
     code: &'static [u8],
 }
 
+#[cfg(feature = "write")]
 fn filtered_member(input: &[u8], filter: &crate::FilterSpec) -> Result<FilteredMember> {
     let range = checked_filter_range(input.len(), filter)?;
     let mut filtered = input.to_vec();
@@ -593,6 +645,7 @@ fn rar29_delta_messages() -> DeltaErrorMessages {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
+#[cfg(feature = "write")]
 pub struct EncodeOptions {
     pub max_match_candidates: usize,
     pub lazy_matching: bool,
@@ -601,6 +654,7 @@ pub struct EncodeOptions {
     pub block_size: Option<usize>,
 }
 
+#[cfg(feature = "write")]
 impl EncodeOptions {
     pub const fn new(max_match_candidates: usize) -> Self {
         Self {
@@ -644,6 +698,7 @@ impl EncodeOptions {
     }
 }
 
+#[cfg(feature = "write")]
 impl Default for EncodeOptions {
     fn default() -> Self {
         Self::new(MAX_MATCH_CANDIDATES)
@@ -656,6 +711,7 @@ impl Default for EncodeOptions {
 /// from member to member, so this is a per-member choice inside one chain
 /// rather than a property of the archive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "write")]
 pub enum ChainEngine {
     Lz,
     Ppmd,
@@ -959,10 +1015,12 @@ impl Unpack29Encoder {
     }
 }
 
+#[cfg(feature = "write")]
 fn encode_member(input: &[u8], history: &[u8]) -> Result<Vec<u8>> {
     encode_member_with_options(input, history, EncodeOptions::default())
 }
 
+#[cfg(feature = "write")]
 fn encode_member_with_options(
     input: &[u8],
     history: &[u8],
@@ -982,6 +1040,7 @@ fn encode_member_with_options_and_progress(
     encode_member_with_options_impl(input, history, options, levels, Some(progress))
 }
 
+#[cfg(feature = "write")]
 fn encode_member_with_options_impl(
     input: &[u8],
     history: &[u8],
@@ -998,6 +1057,7 @@ fn encode_member_with_options_impl(
     encode_member_inner(input, history, &[], options, false, levels, progress)
 }
 
+#[cfg(feature = "write")]
 fn encode_member_blocks(
     input: &[u8],
     history: &[u8],
@@ -1048,6 +1108,7 @@ fn encode_member_blocks(
 /// unless the archive is solid, so a caller that is not chaining members hands
 /// over a table of zeroes and gets one block's worth of state back it can throw
 /// away.
+#[cfg(feature = "write")]
 fn encode_member_inner(
     input: &[u8],
     history: &[u8],
@@ -1249,6 +1310,7 @@ fn encode_member_inner(
 ///
 /// `programs` carries across blocks so a program declared once is referenced by
 /// index afterwards, which is what the decoder expects.
+#[cfg(feature = "write")]
 fn encoded_filter_records_at(
     filters: &[&OwnedVmFilterRecord],
     base: usize,
@@ -1371,6 +1433,7 @@ fn encode_filtered_member_blocks(
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg(feature = "write")]
 struct VmFilterRecord<'a> {
     block_start: usize,
     block_size: usize,
@@ -1379,6 +1442,7 @@ struct VmFilterRecord<'a> {
     global_data: &'a [u8],
 }
 
+#[cfg(feature = "write")]
 fn encode_vm_filter_record_inner(
     record: VmFilterRecord<'_>,
     program_selector: u32,
@@ -1463,6 +1527,7 @@ fn encode_vm_filter_record_inner(
     Ok(out)
 }
 
+#[cfg(feature = "write")]
 fn rgb_encode(data: &[u8], width: usize, pos_r: usize) -> Result<Vec<u8>> {
     if data.len() < 3 || width == 0 || !width.is_multiple_of(3) || width > data.len() || pos_r > 2 {
         return Err(Error::InvalidData(
@@ -1495,6 +1560,7 @@ fn rgb_encode(data: &[u8], width: usize, pos_r: usize) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+#[cfg(feature = "write")]
 fn audio_encode(data: &[u8], channels: usize) -> Result<Vec<u8>> {
     if channels == 0 || channels > MAX_AUDIO_CHANNELS {
         return Err(Error::InvalidData(
@@ -1559,6 +1625,7 @@ fn audio_encode(data: &[u8], channels: usize) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+#[cfg(feature = "write")]
 fn itanium_encode(data: &mut [u8], file_offset: u32) {
     if data.len() <= 21 {
         return;
@@ -1587,12 +1654,14 @@ fn itanium_encode(data: &mut [u8], file_offset: u32) {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg(feature = "write")]
 enum EncodeToken {
     Literal(u8),
     Match { length: usize, offset: usize },
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+#[cfg(feature = "write")]
 struct EncoderMatchState {
     old_offsets: [usize; 4],
     last_offset: usize,
@@ -1600,6 +1669,7 @@ struct EncoderMatchState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "write")]
 enum EncodedMatch {
     LastLengthRepeat,
     RepeatOffset {
@@ -1615,6 +1685,7 @@ enum EncodedMatch {
     },
 }
 
+#[cfg(feature = "write")]
 impl EncoderMatchState {
     fn encode_match(&self, length: usize, offset: usize) -> Result<EncodedMatch> {
         if self.last_length != 0 && offset == self.last_offset && length == self.last_length {
@@ -1676,6 +1747,7 @@ impl EncoderMatchState {
     }
 }
 
+#[cfg(feature = "write")]
 fn encode_tokens_with_progress(
     input: &[u8],
     history: &[u8],
@@ -1744,6 +1816,7 @@ fn encode_tokens_with_progress(
 /// better match starts within the lazy lookahead window. Also returns the
 /// match found one byte ahead (when computed) so the caller can reuse it for
 /// the next position instead of searching again.
+#[cfg(feature = "write")]
 fn lazy_match_decision(
     input: &[u8],
     pos: usize,
@@ -1775,6 +1848,7 @@ fn lazy_match_decision(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "write")]
 struct MatchCandidate {
     length: usize,
     offset: usize,
@@ -1795,12 +1869,14 @@ struct MatchCandidate {
 /// token averages track a near-fixed overhead, so they move fast. All three
 /// are only ever compared against each other, so the model self-corrects: a
 /// token kind that keeps losing keeps its measured price and stays rejected.
+#[cfg(feature = "write")]
 struct PpmdTokenCosts {
     literal_bits: f64,
     match_bits: f64,
     repeat_bits: f64,
 }
 
+#[cfg(feature = "write")]
 impl PpmdTokenCosts {
     fn new() -> Self {
         Self {
@@ -1831,6 +1907,7 @@ impl PpmdTokenCosts {
     }
 }
 
+#[cfg(feature = "write")]
 fn ema(slot: &mut f64, sample: f64, weight: f64) {
     *slot += weight * (sample - *slot);
 }
@@ -1844,6 +1921,7 @@ fn ema(slot: &mut f64, sample: f64, weight: f64) {
 /// `on_token` sees every emitted token, in order. Production passes a no-op;
 /// the tests collect them.
 #[cfg(all(test, feature = "write"))]
+#[cfg(feature = "write")]
 fn encode_ppmd_hybrid(
     input: &[u8],
     max_match_distance: usize,
@@ -1853,6 +1931,7 @@ fn encode_ppmd_hybrid(
     encode_ppmd_hybrid_with_progress(input, max_match_distance, encoder, on_token, None)
 }
 
+#[cfg(feature = "write")]
 fn encode_ppmd_hybrid_with_progress(
     input: &[u8],
     max_match_distance: usize,
@@ -1914,6 +1993,7 @@ fn encode_ppmd_hybrid_with_progress(
     Ok(())
 }
 
+#[cfg(feature = "write")]
 fn ppmd_offset_one_repeat(input: &[u8], pos: usize) -> Option<usize> {
     if pos == 0 || input[pos] != input[pos - 1] {
         return None;
@@ -1928,6 +2008,7 @@ fn ppmd_offset_one_repeat(input: &[u8], pos: usize) -> Option<usize> {
     (length >= 4).then_some(length)
 }
 
+#[cfg(feature = "write")]
 fn best_ppmd_match(
     input: &[u8],
     pos: usize,
@@ -1973,6 +2054,7 @@ fn best_ppmd_match(
     best
 }
 
+#[cfg(feature = "write")]
 fn best_match(
     input: &[u8],
     pos: usize,
@@ -2027,10 +2109,12 @@ fn best_match(
     best
 }
 
+#[cfg(feature = "write")]
 fn match_length(input: &[u8], pos: usize, offset: usize, max_length: usize) -> usize {
     super::fast::match_length(input, pos, offset, max_length)
 }
 
+#[cfg(feature = "write")]
 fn consider_match_candidate(
     best: &mut Option<MatchCandidate>,
     state: &EncoderMatchState,
@@ -2059,6 +2143,7 @@ fn consider_match_candidate(
     }
 }
 
+#[cfg(feature = "write")]
 fn estimated_match_cost(state: &EncoderMatchState, length: usize, offset: usize) -> Result<usize> {
     match state.encode_match(length, offset)? {
         EncodedMatch::LastLengthRepeat => Ok(2),
@@ -2078,10 +2163,12 @@ fn estimated_match_cost(state: &EncoderMatchState, length: usize, offset: usize)
     }
 }
 
+#[cfg(feature = "write")]
 fn match_length_adjustment(offset: usize) -> usize {
     usize::from(offset >= 0x2000) + usize::from(offset >= 0x40000)
 }
 
+#[cfg(feature = "write")]
 fn length_slot_for_match(length: usize) -> Result<(usize, usize)> {
     if length < 3 {
         return Err(Error::InvalidData("RAR 2.9 match length is too short"));
@@ -2102,6 +2189,7 @@ fn length_slot_for_match(length: usize) -> Result<(usize, usize)> {
     Err(Error::InvalidData("RAR 2.9 match length is too long"))
 }
 
+#[cfg(feature = "write")]
 fn length_slot_for_repeat_match(length: usize) -> Result<(usize, usize)> {
     if length < 2 {
         return Err(Error::InvalidData(
@@ -2126,6 +2214,7 @@ fn length_slot_for_repeat_match(length: usize) -> Result<(usize, usize)> {
     ))
 }
 
+#[cfg(feature = "write")]
 fn offset_slot_for_match(offset: usize) -> Result<(usize, usize)> {
     if offset == 0 {
         return Err(Error::InvalidData("RAR 2.9 match offset is zero"));
@@ -2147,12 +2236,14 @@ fn offset_slot_for_match(offset: usize) -> Result<(usize, usize)> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "write")]
 struct LevelToken {
     symbol: usize,
     extra_bits: u8,
     extra_value: u8,
 }
 
+#[cfg(feature = "write")]
 impl LevelToken {
     const fn plain(symbol: usize) -> Self {
         Self {
@@ -2195,6 +2286,7 @@ impl LevelToken {
     }
 }
 
+#[cfg(feature = "write")]
 fn encode_table_level_tokens(lengths: &[u8; TABLE_COUNT]) -> Vec<LevelToken> {
     encode_level_tokens_against(lengths, &[0; TABLE_COUNT])
 }
@@ -2211,6 +2303,7 @@ fn encode_table_level_tokens(lengths: &[u8; TABLE_COUNT]) -> Vec<LevelToken> {
 /// The run symbols do not take part. 16 and 17 repeat the length just decoded
 /// and 18 and 19 write zeroes, both regardless of `base`, so runs are found in
 /// the lengths themselves either way.
+#[cfg(feature = "write")]
 fn encode_level_tokens_against(lengths: &[u8], base: &[u8]) -> Vec<LevelToken> {
     let delta = |pos: usize, value: u8| (value.wrapping_sub(base[pos]) & 0x0f) as usize;
     let mut tokens = Vec::new();
@@ -2247,6 +2340,7 @@ fn encode_level_tokens_against(lengths: &[u8], base: &[u8]) -> Vec<LevelToken> {
 ///
 /// The 20 four-bit code lengths at the head of the table are the same either
 /// way and are left out.
+#[cfg(feature = "write")]
 fn level_tokens_bit_cost(tokens: &[LevelToken]) -> usize {
     let lengths = level_code_lengths(tokens);
     tokens
@@ -2255,6 +2349,7 @@ fn level_tokens_bit_cost(tokens: &[LevelToken]) -> usize {
         .sum()
 }
 
+#[cfg(feature = "write")]
 fn emit_repeat_level_run(tokens: &mut Vec<LevelToken>, mut run: usize) {
     while run >= 11 {
         let mut chunk = run.min(138);
@@ -2269,6 +2364,7 @@ fn emit_repeat_level_run(tokens: &mut Vec<LevelToken>, mut run: usize) {
     }
 }
 
+#[cfg(feature = "write")]
 fn emit_zero_level_run(
     tokens: &mut Vec<LevelToken>,
     start: usize,
@@ -2308,6 +2404,7 @@ fn emit_zero_level_run(
 /// nothing. Weighting by frequency is what makes it pay.
 ///
 /// The 20 lengths are written four bits each, hence the cap of 15.
+#[cfg(feature = "write")]
 fn level_code_lengths(tokens: &[LevelToken]) -> [u8; LEVEL_COUNT] {
     let mut frequencies = [0usize; LEVEL_COUNT];
     for token in tokens {
@@ -2327,12 +2424,14 @@ fn level_code_lengths(tokens: &[LevelToken]) -> [u8; LEVEL_COUNT] {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg(feature = "write")]
 struct HuffmanCode {
     code: u16,
     len: u8,
 }
 
 // Only encoder-generated tables reach this helper; archive tables use Huffman.
+#[cfg(feature = "write")]
 fn canonical_codes(lengths: &[u8]) -> Vec<Option<HuffmanCode>> {
     debug_assert!(lengths.iter().all(|&len| len <= 15));
     let mut count = [0u16; 16];
@@ -3718,11 +3817,13 @@ impl BitReader<Allowance> {
 }
 
 #[derive(Default)]
+#[cfg(feature = "write")]
 struct BitWriter {
     bytes: Vec<u8>,
     bit_pos: usize,
 }
 
+#[cfg(feature = "write")]
 impl BitWriter {
     fn write_bits(&mut self, value: u32, count: u8) {
         super::fast::write_msb_bits(

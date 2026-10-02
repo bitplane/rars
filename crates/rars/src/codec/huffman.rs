@@ -1,4 +1,6 @@
-use super::workspace::{Allowance, Budget, Buffer};
+#[cfg(any(test, feature = "write"))]
+use super::workspace::Allowance;
+use super::workspace::{Budget, Buffer};
 use super::Result;
 
 /// Like [`lengths_for_frequencies`], but guarantees the returned code lengths
@@ -70,6 +72,7 @@ pub(crate) fn assign_flat_complete_code(lengths: &mut [u8]) {
     }
 }
 
+#[cfg(any(test, feature = "write"))]
 pub(crate) fn lengths_for_frequencies(frequencies: &[usize], max_bits: u8) -> Vec<u8> {
     lengths_with_allowance(frequencies, max_bits, &Allowance::default())
         .expect("unlimited Huffman allocation")
@@ -257,6 +260,7 @@ fn limit_code_lengths(lengths: &mut [u8], frequencies: &[usize], max_bits: u8) {
     }
 }
 
+#[cfg(feature = "write")]
 pub(crate) fn lengths_for_frequency_array<const N: usize>(
     frequencies: &[usize; N],
     max_bits: u8,

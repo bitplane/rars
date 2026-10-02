@@ -1,6 +1,7 @@
 use super::{Error, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(test, feature = "write"))]
 pub(crate) enum FilterOp {
     #[cfg(test)]
     E8,
@@ -18,6 +19,7 @@ pub(crate) struct DeltaErrorMessages {
     pub truncated_source: &'static str,
 }
 
+#[cfg(any(test, feature = "write"))]
 pub(crate) fn encode_in_place(
     op: FilterOp,
     data: &mut [u8],
@@ -146,6 +148,7 @@ pub(crate) fn e8e9_decode_with_control(
     Ok(())
 }
 
+#[cfg(any(test, feature = "write"))]
 pub(crate) fn e8e9_encode(data: &mut [u8], file_offset: u32, include_e9: bool) {
     if data.len() <= 4 {
         return;
@@ -226,6 +229,7 @@ pub(crate) fn delta_decode_with_allowance<B: super::workspace::Budget>(
     Ok(out)
 }
 
+#[cfg(any(test, feature = "write"))]
 pub(crate) fn delta_encode(
     data: &[u8],
     channels: usize,
