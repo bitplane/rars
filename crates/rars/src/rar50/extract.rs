@@ -4,7 +4,9 @@ use super::{blake2sp, Archive, ExtractedEntryMeta, FileHeader, FileRedirection};
 use crate::codec::rar50::{DecodeMode, DecodedChunk, ReaderState, StreamDecodeError};
 use crate::codec::workspace::{Allowance, Boxed, Budget, Buffer};
 use crate::crc32::{crc32, Crc32};
-use crate::crypto::rar50::{Rar50Cipher, Rar50Keys};
+#[cfg(feature = "encryption")]
+use crate::crypto::rar50::Rar50Cipher;
+use crate::crypto::rar50::Rar50Keys;
 use crate::error::{Error, Result};
 use crate::volume_extract::{ChainedReader, SplitVolumeState, SplitVolumeStep};
 use std::io::{Read, Write};
@@ -55,29 +57,39 @@ impl FileHeader {
     }
 
     fn encryption_keys(&self, password: Option<&[u8]>) -> Result<Rar50Keys> {
-        crate::crypto::require_encryption()?;
+        #[cfg(not(feature = "encryption"))]
+        {
+            let _ = (self, password);
+            Err(Error::FeatureDisabled {
+                feature: "encryption",
+            })
+        }
+        #[cfg(feature = "encryption")]
+        {
+            crate::crypto::require_encryption()?;
 
-        // Both callers have already selected an encrypted member.
-        if let Some(crypto) = &self.crypto {
-            return Ok(crypto.keys.clone());
-        }
-        let password = password.ok_or(Error::NeedPassword)?;
-        let encryption = self.encryption.as_ref().ok_or(Error::InvalidHeader(
-            "RAR 5 encrypted file is missing encryption record",
-        ))?;
-        if encryption.version != 0 {
-            return Err(Error::UnsupportedFeature {
-                version: crate::version::ArchiveVersion::Rar50,
-                feature: "RAR 5 unknown file encryption version",
-            });
-        }
-        let keys = Rar50Keys::derive(password, encryption.salt, encryption.kdf_count)
-            .map_err(super::map_rar50_crypto_error)?;
-        if let Some(check_value) = encryption.check_value {
-            keys.check_password(&check_value)
+            // Both callers have already selected an encrypted member.
+            if let Some(crypto) = &self.crypto {
+                return Ok(crypto.keys.clone());
+            }
+            let password = password.ok_or(Error::NeedPassword)?;
+            let encryption = self.encryption.as_ref().ok_or(Error::InvalidHeader(
+                "RAR 5 encrypted file is missing encryption record",
+            ))?;
+            if encryption.version != 0 {
+                return Err(Error::UnsupportedFeature {
+                    version: crate::version::ArchiveVersion::Rar50,
+                    feature: "RAR 5 unknown file encryption version",
+                });
+            }
+            let keys = Rar50Keys::derive(password, encryption.salt, encryption.kdf_count)
                 .map_err(super::map_rar50_crypto_error)?;
+            if let Some(check_value) = encryption.check_value {
+                keys.check_password(&check_value)
+                    .map_err(super::map_rar50_crypto_error)?;
+            }
+            Ok(keys)
         }
-        Ok(keys)
     }
 
     fn encryption_iv(&self) -> Result<[u8; 16]> {
@@ -128,7 +140,7 @@ impl FileHeader {
         let keys = self.encryption_keys(password)?;
         let iv = self.encryption_iv()?;
         let reader = Boxed::try_new(
-            || Ok::<_, crate::codec::Error>(Rar50DecryptingReader::new(reader, keys.key, iv)),
+            || Rar50DecryptingReader::with_keys(reader, keys.key, iv),
             allowance,
         )?;
         Ok((PackedReader::Encrypted(reader), Some(keys)))
@@ -177,7 +189,7 @@ impl FileHeader {
                 let keys = keys.ok_or(Error::InvalidHeader(
                     "RAR 5 encrypted hash MAC needs encryption keys",
                 ))?;
-                keys.mac_crc32(actual)
+                keys.checked_crc_mac(actual)?
             } else {
                 actual
             };
@@ -196,7 +208,7 @@ impl FileHeader {
                     let keys = keys.ok_or(Error::InvalidHeader(
                         "RAR 5 encrypted hash MAC needs encryption keys",
                     ))?;
-                    keys.mac_hash32(actual)
+                    keys.checked_hash_mac(actual)?
                 } else {
                     actual
                 };
@@ -227,7 +239,7 @@ impl FileHeader {
                 let keys = keys.ok_or(Error::InvalidHeader(
                     "RAR 5 encrypted hash MAC needs encryption keys",
                 ))?;
-                keys.mac_crc32(crc.finish())
+                keys.checked_crc_mac(crc.finish())?
             } else {
                 crc.finish()
             };
@@ -241,7 +253,7 @@ impl FileHeader {
                 let keys = keys.ok_or(Error::InvalidHeader(
                     "RAR 5 encrypted hash MAC needs encryption keys",
                 ))?;
-                keys.mac_hash32(hasher.finalize())
+                keys.checked_hash_mac(hasher.finalize())?
             } else {
                 hasher.finalize()
             };
@@ -1501,7 +1513,7 @@ impl<B: Budget> PendingSplitRefs<B> {
                 let decryptor = decryptor.ok_or(Error::InvalidHeader(
                     "RAR 5 encrypted split CRC needs encryption keys",
                 ))?;
-                decryptor.keys.mac_crc32(crc.finish())
+                decryptor.keys.checked_crc_mac(crc.finish())?
             } else {
                 crc.finish()
             };
@@ -1514,7 +1526,7 @@ impl<B: Budget> PendingSplitRefs<B> {
                 let decryptor = decryptor.ok_or(Error::InvalidHeader(
                     "RAR 5 encrypted split hash needs encryption keys",
                 ))?;
-                decryptor.keys.mac_hash32(hasher.finalize())
+                decryptor.keys.checked_hash_mac(hasher.finalize())?
             } else {
                 hasher.finalize()
             };
@@ -1608,13 +1620,7 @@ impl<B: Budget> PendingSplitRefs<B> {
         let chained = ChainedReader::with_readers(readers);
         if let Some(decryptor) = decryptor {
             Ok(PackedReader::Encrypted(Boxed::try_new(
-                || {
-                    Ok::<_, crate::codec::Error>(Rar50DecryptingReader::new(
-                        chained,
-                        decryptor.keys.key,
-                        decryptor.iv,
-                    ))
-                },
+                || Rar50DecryptingReader::with_keys(chained, decryptor.keys.key, decryptor.iv),
                 allowance,
             )?))
         } else {
@@ -1745,6 +1751,10 @@ impl<R: Read, B: Budget> Read for PackedReader<R, B> {
     }
 }
 
+#[cfg(not(feature = "encryption"))]
+type Rar50DecryptingReader<R> = crate::crypto::unavailable::Reader<R>;
+
+#[cfg(feature = "encryption")]
 struct Rar50DecryptingReader<R> {
     inner: R,
     cipher: Rar50Cipher,
@@ -1754,7 +1764,12 @@ struct Rar50DecryptingReader<R> {
     len: usize,
 }
 
+#[cfg(feature = "encryption")]
 impl<R: Read> Rar50DecryptingReader<R> {
+    fn with_keys(inner: R, key: [u8; 32], iv: [u8; 16]) -> Result<Self> {
+        Ok(Self::new(inner, key, iv))
+    }
+
     fn new(inner: R, key: [u8; 32], iv: [u8; 16]) -> Self {
         Self {
             inner,
@@ -1790,6 +1805,7 @@ impl<R: Read> Rar50DecryptingReader<R> {
     }
 }
 
+#[cfg(feature = "encryption")]
 impl<R: Read> Read for Rar50DecryptingReader<R> {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         if out.is_empty() {

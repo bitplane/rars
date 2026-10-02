@@ -1,7 +1,11 @@
 //! Header framing shared by writers and recovery repair.
 
-use super::{map_rar50_crypto_error, HFL_EXTRA};
-use crate::crypto::rar50::{Rar50Cipher, Rar50Keys};
+#[cfg(feature = "encryption")]
+use super::map_rar50_crypto_error;
+use super::HFL_EXTRA;
+#[cfg(feature = "encryption")]
+use crate::crypto::rar50::Rar50Cipher;
+use crate::crypto::rar50::Rar50Keys;
 use crate::{crc32::crc32, Error, Result};
 
 /// Bounded framing scratch; callers choose capacities from the on-disk fields.
@@ -125,6 +129,9 @@ impl<'a> HeaderImage<'a> {
         data: &[u8],
         out: &mut [u8],
     ) -> Result<()> {
+        if keys.is_some() {
+            crate::crypto::require_encryption()?;
+        }
         let header_len = self.header_len(keys.is_some())?;
         let start = if keys.is_some() { 16 } else { 0 };
         let mut offset = start + 4;
@@ -140,12 +147,25 @@ impl<'a> HeaderImage<'a> {
         let crc = crc32(&out[start + 4..start + self.plain_len]);
         out[start..start + 4].copy_from_slice(&crc.to_le_bytes());
         if let Some(keys) = keys {
-            let mut iv = [0; 16];
-            crate::entropy::fill_entropy(&mut iv, "RAR 5 writer could not generate encryption IV")?;
-            out[..16].copy_from_slice(&iv);
-            Rar50Cipher::new(keys.key, iv)
-                .encrypt_in_place(&mut out[16..header_len])
-                .map_err(map_rar50_crypto_error)?;
+            #[cfg(not(feature = "encryption"))]
+            {
+                let _ = keys;
+                return Err(Error::FeatureDisabled {
+                    feature: "encryption",
+                });
+            }
+            #[cfg(feature = "encryption")]
+            {
+                let mut iv = [0; 16];
+                crate::entropy::fill_entropy(
+                    &mut iv,
+                    "RAR 5 writer could not generate encryption IV",
+                )?;
+                out[..16].copy_from_slice(&iv);
+                Rar50Cipher::new(keys.key, iv)
+                    .encrypt_in_place(&mut out[16..header_len])
+                    .map_err(map_rar50_crypto_error)?;
+            }
         }
         out[header_len..].copy_from_slice(data);
         Ok(())

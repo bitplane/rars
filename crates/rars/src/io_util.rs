@@ -24,6 +24,7 @@ pub(crate) fn read_u32(input: &[u8], offset: usize) -> Result<u32> {
     Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
+#[cfg(feature = "encryption")]
 pub(crate) fn align16(value: usize, overflow_message: &'static str) -> Result<usize> {
     value
         .checked_add(15)

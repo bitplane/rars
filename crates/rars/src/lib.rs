@@ -25,7 +25,7 @@ pub mod crc32;
 #[doc(hidden)]
 pub mod crypto;
 pub mod detect;
-#[cfg(any(feature = "write", feature = "recovery"))]
+#[cfg(any(feature = "write", all(feature = "recovery", feature = "encryption")))]
 mod entropy;
 pub mod error;
 #[cfg(feature = "write")]

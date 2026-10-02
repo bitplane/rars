@@ -428,6 +428,7 @@ impl Error {
                 ErrorKind::UnsupportedFormat
             }
             Self::FeatureDisabled { .. }
+            | Self::Rar50Crypto(crate::crypto::rar50::Error::FeatureDisabled)
             | Self::CannotSkipSolidMember
             | Self::UnsupportedFeature { .. }
             | Self::UnsupportedFamilyFeature { .. }
@@ -535,6 +536,11 @@ impl From<crate::crypto::rar30::Error> for Error {
 
 impl From<crate::crypto::rar50::Error> for Error {
     fn from(error: crate::crypto::rar50::Error) -> Self {
+        if error == crate::crypto::rar50::Error::FeatureDisabled {
+            return Self::FeatureDisabled {
+                feature: "encryption",
+            };
+        }
         Self::Rar50Crypto(error)
     }
 }

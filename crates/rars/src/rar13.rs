@@ -961,7 +961,7 @@ impl Entry {
             };
             archive.copy_decrypted_range_to(
                 self.packed_range.clone(),
-                Rar13Cipher::new(password),
+                Rar13Cipher::for_password(password)?,
                 &mut checksum_writer,
             )?;
             let actual = checksum.finish();
@@ -1011,7 +1011,7 @@ impl Entry {
             crate::crypto::require_encryption()?;
             let password = password.ok_or(Error::NeedPassword)?;
             let packed = archive.range_reader(self.packed_range.clone())?;
-            let mut packed = Rar13DecryptReader::new(packed, Rar13Cipher::new(password));
+            let mut packed = Rar13DecryptReader::new(packed, Rar13Cipher::for_password(password)?);
             unpack15.decode_member_from_reader(
                 &mut packed,
                 self.header.unp_size as usize,
@@ -1379,7 +1379,7 @@ impl<B: Budget> PendingSplitRefs<B> {
             // split volumes; restarting the cipher at each part corrupts it.
             Ok(PackedReader::Encrypted(Rar13DecryptReader::new(
                 chained,
-                Rar13Cipher::new(password),
+                Rar13Cipher::for_password(password)?,
             )))
         } else {
             Ok(PackedReader::Plain(chained))

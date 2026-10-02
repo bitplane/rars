@@ -2,8 +2,11 @@ use crate::codec::rar13::Reader15State;
 use crate::codec::rar20::Reader20State;
 use crate::codec::workspace::{Allowance, Budget, Buffer};
 use crate::crc32::{crc32, Crc32};
+#[cfg(feature = "encryption")]
 use crate::crypto::rar15::Rar15Cipher;
+#[cfg(feature = "encryption")]
 use crate::crypto::rar20::Rar20Cipher;
+#[cfg(feature = "encryption")]
 use crate::crypto::rar30::{Error as Rar30Error, Rar30Cipher};
 use crate::detect::{find_archive_start, ArchiveSignature, RAR15_SIGNATURE, SFX_SCAN_LIMIT};
 use crate::error::{Error, Result};
@@ -2135,10 +2138,13 @@ struct EncryptedHeader {
 
 #[derive(Default)]
 struct EncryptedHeaderCipherCache {
+    #[cfg(feature = "encryption")]
     salt: Option<[u8; 8]>,
+    #[cfg(feature = "encryption")]
     cipher: Option<Rar30Cipher>,
 }
 
+#[cfg(feature = "encryption")]
 impl EncryptedHeaderCipherCache {
     fn cipher(&mut self, password: &[u8], salt: [u8; 8]) -> Result<Rar30Cipher> {
         if self.salt != Some(salt) {
@@ -2154,6 +2160,7 @@ impl EncryptedHeaderCipherCache {
     }
 }
 
+#[cfg(feature = "encryption")]
 fn map_rar30_crypto_error(error: Rar30Error) -> Error {
     Error::from(error)
 }
@@ -2165,52 +2172,62 @@ fn decrypt_encrypted_header_at(
     cipher_cache: &mut EncryptedHeaderCipherCache,
     budget: &mut crate::parse_budget::ParseBudget,
 ) -> Result<EncryptedHeader> {
-    let salt = read_header_salt(archive, offset)?;
-    let first_ciphertext = archive
-        .get(offset + 8..offset + 24)
-        .ok_or(Error::TooShort)?;
-    budget.check_count(offset)?;
-    let mut cipher = cipher_cache.cipher(password, salt)?;
-    let mut first_block = [0u8; 16];
-    first_block.copy_from_slice(first_ciphertext);
-    cipher.decrypt_block(&mut first_block);
-    let head_size = u16::from_le_bytes([first_block[5], first_block[6]]) as usize;
-    if head_size < 7 {
-        return Err(Error::InvalidHeader("RAR 1.5 block header is too short"));
+    #[cfg(not(feature = "encryption"))]
+    {
+        let _ = (archive, offset, password, cipher_cache, budget);
+        Err(Error::FeatureDisabled {
+            feature: "encryption",
+        })
     }
-    // A u16 wire length rounds to at most 65536, including on 32-bit hosts.
-    let encrypted_header_size = head_size.next_multiple_of(16);
-    // offset is within a physical slice (at most isize::MAX); this u16 wire
-    // length adds at most 65544, which fits usize on both supported widths.
-    let encrypted_end = offset + 8 + encrypted_header_size;
-    if encrypted_end > archive.len() {
-        return Err(Error::TooShort);
-    }
-    budget.admit(head_size, offset)?;
-    // The first 24 bytes and the rounded header end were admitted above.
-    let encrypted_rest = &archive[offset + 24..encrypted_end];
-    let mut header = Vec::with_capacity(encrypted_header_size);
-    header.extend_from_slice(&first_block);
-    header.extend_from_slice(encrypted_rest);
-    // The rounded header minus its first block is a whole number of AES blocks.
-    for block in header[16..].chunks_exact_mut(16) {
-        cipher.decrypt_block(block.try_into().expect("AES block size"));
-    }
-    header.truncate(head_size);
+    #[cfg(feature = "encryption")]
+    {
+        let salt = read_header_salt(archive, offset)?;
+        let first_ciphertext = archive
+            .get(offset + 8..offset + 24)
+            .ok_or(Error::TooShort)?;
+        budget.check_count(offset)?;
+        let mut cipher = cipher_cache.cipher(password, salt)?;
+        let mut first_block = [0u8; 16];
+        first_block.copy_from_slice(first_ciphertext);
+        cipher.decrypt_block(&mut first_block);
+        let head_size = u16::from_le_bytes([first_block[5], first_block[6]]) as usize;
+        if head_size < 7 {
+            return Err(Error::InvalidHeader("RAR 1.5 block header is too short"));
+        }
+        // A u16 wire length rounds to at most 65536, including on 32-bit hosts.
+        let encrypted_header_size = head_size.next_multiple_of(16);
+        // offset is within a physical slice (at most isize::MAX); this u16 wire
+        // length adds at most 65544, which fits usize on both supported widths.
+        let encrypted_end = offset + 8 + encrypted_header_size;
+        if encrypted_end > archive.len() {
+            return Err(Error::TooShort);
+        }
+        budget.admit(head_size, offset)?;
+        // The first 24 bytes and the rounded header end were admitted above.
+        let encrypted_rest = &archive[offset + 24..encrypted_end];
+        let mut header = Vec::with_capacity(encrypted_header_size);
+        header.extend_from_slice(&first_block);
+        header.extend_from_slice(encrypted_rest);
+        // The rounded header minus its first block is a whole number of AES blocks.
+        for block in header[16..].chunks_exact_mut(16) {
+            cipher.decrypt_block(block.try_into().expect("AES block size"));
+        }
+        header.truncate(head_size);
 
-    let mut block = parse_block_header(&header, 0)?;
-    block.offset = offset;
-    // Parsed add_size is a widened wire u32 and fits both supported widths.
-    let payload_size = block.add_size.unwrap_or(0) as usize;
-    let total_size = 8usize
-        .checked_add(encrypted_header_size)
-        .and_then(|size| size.checked_add(payload_size))
-        .ok_or(Error::InvalidHeader("RAR 1.5 block size overflows usize"))?;
-    Ok(EncryptedHeader {
-        block,
-        header,
-        total_size,
-    })
+        let mut block = parse_block_header(&header, 0)?;
+        block.offset = offset;
+        // Parsed add_size is a widened wire u32 and fits both supported widths.
+        let payload_size = block.add_size.unwrap_or(0) as usize;
+        let total_size = 8usize
+            .checked_add(encrypted_header_size)
+            .and_then(|size| size.checked_add(payload_size))
+            .ok_or(Error::InvalidHeader("RAR 1.5 block size overflows usize"))?;
+        Ok(EncryptedHeader {
+            block,
+            header,
+            total_size,
+        })
+    }
 }
 
 fn read_encrypted_header_at(
@@ -2222,63 +2239,82 @@ fn read_encrypted_header_at(
     cipher_cache: &mut EncryptedHeaderCipherCache,
     budget: &mut crate::parse_budget::ParseBudget,
 ) -> Result<EncryptedHeader> {
-    let absolute = archive_offset
-        .checked_add(offset)
-        .ok_or(Error::InvalidHeader("RAR 1.5 block offset overflows usize"))?;
-    let remaining = file_len
-        .checked_sub(absolute as u64)
-        .ok_or(Error::TooShort)?;
-    if remaining < 24 {
-        return Err(Error::TooShort);
+    #[cfg(not(feature = "encryption"))]
+    {
+        let _ = (
+            file,
+            file_len,
+            archive_offset,
+            offset,
+            password,
+            cipher_cache,
+            budget,
+        );
+        Err(Error::FeatureDisabled {
+            feature: "encryption",
+        })
     }
-    let first = read_exact_at(file, absolute, 24)?;
-    let salt = read_header_salt(&first, 0)?;
-    budget.check_count(offset)?;
-    let mut cipher = cipher_cache.cipher(password, salt)?;
-    let mut first_block = [0u8; 16];
-    first_block.copy_from_slice(&first[8..24]);
-    cipher.decrypt_block(&mut first_block);
-    let head_size = u16::from_le_bytes([first_block[5], first_block[6]]) as usize;
-    if head_size < 7 {
-        return Err(Error::InvalidHeader("RAR 1.5 block header is too short"));
-    }
-    // A u16 wire length rounds to at most 65536, including on 32-bit hosts.
-    let encrypted_header_size = head_size.next_multiple_of(16);
-    let encrypted_start = absolute
-        .checked_add(8)
-        .ok_or(Error::InvalidHeader("RAR 1.5 block offset overflows usize"))?;
-    if encrypted_header_size as u64 > remaining - 8 {
-        return Err(Error::TooShort);
-    }
-    budget.admit(head_size, offset)?;
-    let encrypted_rest_start = encrypted_start
-        .checked_add(16)
-        .ok_or(Error::InvalidHeader("RAR 1.5 block offset overflows usize"))?;
-    let encrypted_rest = read_exact_at(file, encrypted_rest_start, encrypted_header_size - 16)?;
-    let mut header = Vec::with_capacity(encrypted_header_size);
-    header.extend_from_slice(&first_block);
-    header.extend_from_slice(&encrypted_rest);
-    // The rounded header minus its first block is a whole number of AES blocks.
-    for block in header[16..].chunks_exact_mut(16) {
-        cipher.decrypt_block(block.try_into().expect("AES block size"));
-    }
-    header.truncate(head_size);
+    #[cfg(feature = "encryption")]
+    {
+        let absolute = archive_offset
+            .checked_add(offset)
+            .ok_or(Error::InvalidHeader("RAR 1.5 block offset overflows usize"))?;
+        let remaining = file_len
+            .checked_sub(absolute as u64)
+            .ok_or(Error::TooShort)?;
+        if remaining < 24 {
+            return Err(Error::TooShort);
+        }
+        let first = read_exact_at(file, absolute, 24)?;
+        let salt = read_header_salt(&first, 0)?;
+        budget.check_count(offset)?;
+        let mut cipher = cipher_cache.cipher(password, salt)?;
+        let mut first_block = [0u8; 16];
+        first_block.copy_from_slice(&first[8..24]);
+        cipher.decrypt_block(&mut first_block);
+        let head_size = u16::from_le_bytes([first_block[5], first_block[6]]) as usize;
+        if head_size < 7 {
+            return Err(Error::InvalidHeader("RAR 1.5 block header is too short"));
+        }
+        // A u16 wire length rounds to at most 65536, including on 32-bit hosts.
+        let encrypted_header_size = head_size.next_multiple_of(16);
+        let encrypted_start = absolute
+            .checked_add(8)
+            .ok_or(Error::InvalidHeader("RAR 1.5 block offset overflows usize"))?;
+        if encrypted_header_size as u64 > remaining - 8 {
+            return Err(Error::TooShort);
+        }
+        budget.admit(head_size, offset)?;
+        let encrypted_rest_start = encrypted_start
+            .checked_add(16)
+            .ok_or(Error::InvalidHeader("RAR 1.5 block offset overflows usize"))?;
+        let encrypted_rest = read_exact_at(file, encrypted_rest_start, encrypted_header_size - 16)?;
+        let mut header = Vec::with_capacity(encrypted_header_size);
+        header.extend_from_slice(&first_block);
+        header.extend_from_slice(&encrypted_rest);
+        // The rounded header minus its first block is a whole number of AES blocks.
+        for block in header[16..].chunks_exact_mut(16) {
+            cipher.decrypt_block(block.try_into().expect("AES block size"));
+        }
+        header.truncate(head_size);
 
-    let mut block = parse_block_header(&header, 0)?;
-    block.offset = offset;
-    // Parsed add_size is a widened wire u32 and fits both supported widths.
-    let payload_size = block.add_size.unwrap_or(0) as usize;
-    let total_size = 8usize
-        .checked_add(encrypted_header_size)
-        .and_then(|size| size.checked_add(payload_size))
-        .ok_or(Error::InvalidHeader("RAR 1.5 block size overflows usize"))?;
-    Ok(EncryptedHeader {
-        block,
-        header,
-        total_size,
-    })
+        let mut block = parse_block_header(&header, 0)?;
+        block.offset = offset;
+        // Parsed add_size is a widened wire u32 and fits both supported widths.
+        let payload_size = block.add_size.unwrap_or(0) as usize;
+        let total_size = 8usize
+            .checked_add(encrypted_header_size)
+            .and_then(|size| size.checked_add(payload_size))
+            .ok_or(Error::InvalidHeader("RAR 1.5 block size overflows usize"))?;
+        Ok(EncryptedHeader {
+            block,
+            header,
+            total_size,
+        })
+    }
 }
 
+#[cfg(feature = "encryption")]
 fn read_header_salt(input: &[u8], offset: usize) -> Result<[u8; 8]> {
     input
         .get(offset..offset + 8)

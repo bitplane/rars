@@ -1,8 +1,12 @@
 use crate::crc32::crc32;
-use crate::crypto::rar50::{Rar50Cipher, Rar50Keys};
+#[cfg(feature = "encryption")]
+use crate::crypto::rar50::Rar50Cipher;
+use crate::crypto::rar50::Rar50Keys;
 use crate::detect::{find_archive_start, ArchiveSignature, RAR50_SIGNATURE, SFX_SCAN_LIMIT};
 use crate::error::{Error, Result};
-use crate::io_util::{align16 as checked_align16, read_exact_at};
+#[cfg(feature = "encryption")]
+use crate::io_util::align16 as checked_align16;
+use crate::io_util::read_exact_at;
 pub(crate) use crate::source::ArchiveSource;
 use crate::version::ArchiveFamily;
 use std::fs::File;
@@ -1648,71 +1652,89 @@ fn parse_archive_encryption_header(
     parsed: &ParsedBlockHeader,
     password: Option<&[u8]>,
 ) -> Result<(Rar50Keys, bool)> {
-    crate::crypto::require_encryption()?;
+    #[cfg(not(feature = "encryption"))]
+    {
+        let _ = (parsed, password);
+        Err(Error::FeatureDisabled {
+            feature: "encryption",
+        })
+    }
+    #[cfg(feature = "encryption")]
+    {
+        crate::crypto::require_encryption()?;
 
-    let mut reader = HeaderReader::new(&parsed.header, parsed.type_specific_range.clone());
-    let version = reader.read_vint()?;
-    let flags = reader.read_vint()?;
-    // The first encrypted-header fields are decoded before password refusal.
-    let password = password.ok_or(Error::NeedPassword)?;
-    if version != 0 {
-        return Err(Error::UnsupportedFeature {
-            version: crate::version::ArchiveVersion::Rar50,
-            feature: "RAR 5 unknown header encryption version",
-        });
+        let mut reader = HeaderReader::new(&parsed.header, parsed.type_specific_range.clone());
+        let version = reader.read_vint()?;
+        let flags = reader.read_vint()?;
+        // The first encrypted-header fields are decoded before password refusal.
+        let password = password.ok_or(Error::NeedPassword)?;
+        if version != 0 {
+            return Err(Error::UnsupportedFeature {
+                version: crate::version::ArchiveVersion::Rar50,
+                feature: "RAR 5 unknown header encryption version",
+            });
+        }
+        let kdf_count = reader.read_byte()?;
+        let salt = reader.read_array::<16>()?;
+        let check_value = if flags & 0x0001 != 0 {
+            Some(reader.read_array::<12>()?)
+        } else {
+            None
+        };
+        if reader.pos != reader.range.end {
+            return Err(Error::InvalidHeader(
+                "RAR 5 archive encryption header has trailing bytes",
+            ));
+        }
+        let keys = Rar50Keys::derive(password, salt, kdf_count).map_err(map_rar50_crypto_error)?;
+        if let Some(check_value) = check_value {
+            keys.check_password(&check_value)
+                .map_err(map_rar50_crypto_error)?;
+        }
+        Ok((keys, flags & !1 == 0))
     }
-    let kdf_count = reader.read_byte()?;
-    let salt = reader.read_array::<16>()?;
-    let check_value = if flags & 0x0001 != 0 {
-        Some(reader.read_array::<12>()?)
-    } else {
-        None
-    };
-    if reader.pos != reader.range.end {
-        return Err(Error::InvalidHeader(
-            "RAR 5 archive encryption header has trailing bytes",
-        ));
-    }
-    let keys = Rar50Keys::derive(password, salt, kdf_count).map_err(map_rar50_crypto_error)?;
-    if let Some(check_value) = check_value {
-        keys.check_password(&check_value)
-            .map_err(map_rar50_crypto_error)?;
-    }
-    Ok((keys, flags & !1 == 0))
 }
 
 fn attach_file_crypto(file: &mut FileHeader, password: Option<&[u8]>) -> Result<()> {
-    if !cfg!(feature = "encryption") {
-        return Ok(());
+    #[cfg(not(feature = "encryption"))]
+    {
+        let _ = (file, password);
+        Ok(())
     }
+    #[cfg(feature = "encryption")]
+    {
+        if !cfg!(feature = "encryption") {
+            return Ok(());
+        }
 
-    // Called once for each freshly parsed file or service header.
-    if !file.encrypted {
-        return Ok(());
-    }
-    let Some(password) = password else {
-        return Ok(());
-    };
-    let encryption = file.encryption.as_ref().ok_or(Error::InvalidHeader(
-        "RAR 5 encrypted file is missing encryption record",
-    ))?;
-    if encryption.version != 0 {
-        return Err(Error::UnsupportedFeature {
-            version: crate::version::ArchiveVersion::Rar50,
-            feature: "RAR 5 unknown file encryption version",
-        });
-    }
-    let keys = Rar50Keys::derive(password, encryption.salt, encryption.kdf_count)
-        .map_err(map_rar50_crypto_error)?;
-    if let Some(check_value) = encryption.check_value {
-        keys.check_password(&check_value)
+        // Called once for each freshly parsed file or service header.
+        if !file.encrypted {
+            return Ok(());
+        }
+        let Some(password) = password else {
+            return Ok(());
+        };
+        let encryption = file.encryption.as_ref().ok_or(Error::InvalidHeader(
+            "RAR 5 encrypted file is missing encryption record",
+        ))?;
+        if encryption.version != 0 {
+            return Err(Error::UnsupportedFeature {
+                version: crate::version::ArchiveVersion::Rar50,
+                feature: "RAR 5 unknown file encryption version",
+            });
+        }
+        let keys = Rar50Keys::derive(password, encryption.salt, encryption.kdf_count)
             .map_err(map_rar50_crypto_error)?;
+        if let Some(check_value) = encryption.check_value {
+            keys.check_password(&check_value)
+                .map_err(map_rar50_crypto_error)?;
+        }
+        file.crypto = Some(FileCryptoState {
+            keys,
+            iv: encryption.iv,
+        });
+        Ok(())
     }
-    file.crypto = Some(FileCryptoState {
-        keys,
-        iv: encryption.iv,
-    });
-    Ok(())
 }
 
 fn attach_service_crypto(service: &mut FileHeader, password: Option<&[u8]>) -> Result<()> {
@@ -1726,8 +1748,12 @@ fn attach_service_crypto(service: &mut FileHeader, password: Option<&[u8]>) -> R
     attach_file_crypto(service, password)
 }
 
+#[cfg(feature = "encryption")]
 fn map_rar50_crypto_error(error: crate::crypto::rar50::Error) -> Error {
     match error {
+        crate::crypto::rar50::Error::FeatureDisabled => Error::FeatureDisabled {
+            feature: "encryption",
+        },
         crate::crypto::rar50::Error::KdfCountTooLarge => Error::UnsupportedFeature {
             version: crate::version::ArchiveVersion::Rar50,
             feature: "RAR 5 KDF count",
@@ -1975,61 +2001,71 @@ fn parse_encrypted_block_header_bytes(
     keys: &Rar50Keys,
     budget: &mut crate::parse_budget::ParseBudget,
 ) -> Result<ParsedBlockHeader> {
-    let remaining = archive_len.saturating_sub(offset);
-    if remaining < 32 {
-        return Err(Error::TooShort);
+    #[cfg(not(feature = "encryption"))]
+    {
+        let _ = (input, offset, archive_len, sfx_offset, keys, budget);
+        Err(Error::FeatureDisabled {
+            feature: "encryption",
+        })
     }
-    budget.check_count(offset)?;
-    // archive_len is this physical slice's length; remaining admitted 32 bytes.
-    let first = &input[offset..offset + 32];
-    let mut iv = [0; 16];
-    iv.copy_from_slice(&first[..16]);
-    let mut first_plain = [0; 16];
-    first_plain.copy_from_slice(&first[16..32]);
-    Rar50Cipher::new(keys.key, iv).decrypt_block(&mut first_plain);
-    let header_crc = u32::from_le_bytes([
-        first_plain[0],
-        first_plain[1],
-        first_plain[2],
-        first_plain[3],
-    ]);
-    let (header_size, header_size_len) = read_vint_at(&first_plain, 4, first_plain.len())?;
-    let header_body_len = usize_from_u64(header_size, "RAR 5 header size overflows usize")?;
-    let header_total = 4usize
-        .checked_add(header_size_len)
-        .and_then(|size| size.checked_add(header_body_len))
-        .ok_or(Error::InvalidHeader("RAR 5 header size overflows usize"))?;
-    let encrypted_len = checked_align16(header_total, "RAR 5 encrypted header size overflows")?;
-    let disk_header_len = 16usize
-        .checked_add(encrypted_len)
-        .ok_or(Error::InvalidHeader(
-            "RAR 5 encrypted header size overflows",
-        ))?;
-    if disk_header_len > remaining {
-        return Err(Error::TooShort);
-    }
-    budget.admit(header_total, offset)?;
-    // The complete IV plus ciphertext length was admitted above.
-    let encrypted = &input[offset + 16..offset + disk_header_len];
-    let mut header = encrypted.to_vec();
-    Rar50Cipher::new(keys.key, iv)
-        .decrypt_in_place(&mut header)
-        .map_err(map_rar50_crypto_error)?;
-    header.truncate(header_total);
+    #[cfg(feature = "encryption")]
+    {
+        let remaining = archive_len.saturating_sub(offset);
+        if remaining < 32 {
+            return Err(Error::TooShort);
+        }
+        budget.check_count(offset)?;
+        // archive_len is this physical slice's length; remaining admitted 32 bytes.
+        let first = &input[offset..offset + 32];
+        let mut iv = [0; 16];
+        iv.copy_from_slice(&first[..16]);
+        let mut first_plain = [0; 16];
+        first_plain.copy_from_slice(&first[16..32]);
+        Rar50Cipher::new(keys.key, iv).decrypt_block(&mut first_plain);
+        let header_crc = u32::from_le_bytes([
+            first_plain[0],
+            first_plain[1],
+            first_plain[2],
+            first_plain[3],
+        ]);
+        let (header_size, header_size_len) = read_vint_at(&first_plain, 4, first_plain.len())?;
+        let header_body_len = usize_from_u64(header_size, "RAR 5 header size overflows usize")?;
+        let header_total = 4usize
+            .checked_add(header_size_len)
+            .and_then(|size| size.checked_add(header_body_len))
+            .ok_or(Error::InvalidHeader("RAR 5 header size overflows usize"))?;
+        let encrypted_len = checked_align16(header_total, "RAR 5 encrypted header size overflows")?;
+        let disk_header_len = 16usize
+            .checked_add(encrypted_len)
+            .ok_or(Error::InvalidHeader(
+                "RAR 5 encrypted header size overflows",
+            ))?;
+        if disk_header_len > remaining {
+            return Err(Error::TooShort);
+        }
+        budget.admit(header_total, offset)?;
+        // The complete IV plus ciphertext length was admitted above.
+        let encrypted = &input[offset + 16..offset + disk_header_len];
+        let mut header = encrypted.to_vec();
+        Rar50Cipher::new(keys.key, iv)
+            .decrypt_in_place(&mut header)
+            .map_err(map_rar50_crypto_error)?;
+        header.truncate(header_total);
 
-    parse_block_header_image(
-        header,
-        offset,
-        archive_len,
-        sfx_offset,
-        HeaderPrefix {
-            crc: header_crc,
-            size: header_size,
-            size_len: header_size_len,
-        },
-        disk_header_len,
-        &budget.control,
-    )
+        parse_block_header_image(
+            header,
+            offset,
+            archive_len,
+            sfx_offset,
+            HeaderPrefix {
+                crc: header_crc,
+                size: header_size,
+                size_len: header_size_len,
+            },
+            disk_header_len,
+            &budget.control,
+        )
+    }
 }
 
 fn read_block_header_at(
@@ -2082,59 +2118,69 @@ fn read_encrypted_block_header_at(
     keys: &Rar50Keys,
     budget: &mut crate::parse_budget::ParseBudget,
 ) -> Result<ParsedBlockHeader> {
-    let remaining = archive_len.saturating_sub(offset);
-    if remaining < 32 {
-        return Err(Error::TooShort);
+    #[cfg(not(feature = "encryption"))]
+    {
+        let _ = (file, offset, archive_len, sfx_offset, keys, budget);
+        Err(Error::FeatureDisabled {
+            feature: "encryption",
+        })
     }
-    budget.check_count(offset)?;
-    let first = read_exact_at(file, sfx_offset + offset, 32)?;
-    let mut iv = [0; 16];
-    iv.copy_from_slice(&first[..16]);
-    let mut first_plain = [0; 16];
-    first_plain.copy_from_slice(&first[16..32]);
-    Rar50Cipher::new(keys.key, iv).decrypt_block(&mut first_plain);
-    let header_crc = u32::from_le_bytes([
-        first_plain[0],
-        first_plain[1],
-        first_plain[2],
-        first_plain[3],
-    ]);
-    let (header_size, header_size_len) = read_vint_at(&first_plain, 4, first_plain.len())?;
-    let header_body_len = usize_from_u64(header_size, "RAR 5 header size overflows usize")?;
-    let header_total = 4usize
-        .checked_add(header_size_len)
-        .and_then(|size| size.checked_add(header_body_len))
-        .ok_or(Error::InvalidHeader("RAR 5 header size overflows usize"))?;
-    let encrypted_len = checked_align16(header_total, "RAR 5 encrypted header size overflows")?;
-    let disk_header_len = 16usize
-        .checked_add(encrypted_len)
-        .ok_or(Error::InvalidHeader(
-            "RAR 5 encrypted header size overflows",
-        ))?;
-    if disk_header_len > remaining {
-        return Err(Error::TooShort);
-    }
-    budget.admit(header_total, offset)?;
-    let encrypted = read_exact_at(file, sfx_offset + offset + 16, encrypted_len)?;
-    let mut header = encrypted;
-    Rar50Cipher::new(keys.key, iv)
-        .decrypt_in_place(&mut header)
-        .map_err(map_rar50_crypto_error)?;
-    header.truncate(header_total);
+    #[cfg(feature = "encryption")]
+    {
+        let remaining = archive_len.saturating_sub(offset);
+        if remaining < 32 {
+            return Err(Error::TooShort);
+        }
+        budget.check_count(offset)?;
+        let first = read_exact_at(file, sfx_offset + offset, 32)?;
+        let mut iv = [0; 16];
+        iv.copy_from_slice(&first[..16]);
+        let mut first_plain = [0; 16];
+        first_plain.copy_from_slice(&first[16..32]);
+        Rar50Cipher::new(keys.key, iv).decrypt_block(&mut first_plain);
+        let header_crc = u32::from_le_bytes([
+            first_plain[0],
+            first_plain[1],
+            first_plain[2],
+            first_plain[3],
+        ]);
+        let (header_size, header_size_len) = read_vint_at(&first_plain, 4, first_plain.len())?;
+        let header_body_len = usize_from_u64(header_size, "RAR 5 header size overflows usize")?;
+        let header_total = 4usize
+            .checked_add(header_size_len)
+            .and_then(|size| size.checked_add(header_body_len))
+            .ok_or(Error::InvalidHeader("RAR 5 header size overflows usize"))?;
+        let encrypted_len = checked_align16(header_total, "RAR 5 encrypted header size overflows")?;
+        let disk_header_len = 16usize
+            .checked_add(encrypted_len)
+            .ok_or(Error::InvalidHeader(
+                "RAR 5 encrypted header size overflows",
+            ))?;
+        if disk_header_len > remaining {
+            return Err(Error::TooShort);
+        }
+        budget.admit(header_total, offset)?;
+        let encrypted = read_exact_at(file, sfx_offset + offset + 16, encrypted_len)?;
+        let mut header = encrypted;
+        Rar50Cipher::new(keys.key, iv)
+            .decrypt_in_place(&mut header)
+            .map_err(map_rar50_crypto_error)?;
+        header.truncate(header_total);
 
-    parse_block_header_image(
-        header,
-        offset,
-        archive_len,
-        sfx_offset,
-        HeaderPrefix {
-            crc: header_crc,
-            size: header_size,
-            size_len: header_size_len,
-        },
-        disk_header_len,
-        &budget.control,
-    )
+        parse_block_header_image(
+            header,
+            offset,
+            archive_len,
+            sfx_offset,
+            HeaderPrefix {
+                crc: header_crc,
+                size: header_size,
+                size_len: header_size_len,
+            },
+            disk_header_len,
+            &budget.control,
+        )
+    }
 }
 
 fn parse_block_header_image(
@@ -2245,6 +2291,7 @@ impl<'a> HeaderReader<'a> {
         self.read_array::<4>().map(u32::from_le_bytes)
     }
 
+    #[cfg(feature = "encryption")]
     fn read_byte(&mut self) -> Result<u8> {
         if self.pos >= self.range.end {
             return Err(Error::TooShort);

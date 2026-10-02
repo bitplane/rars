@@ -513,7 +513,7 @@ fn write_member(
     let payload = match encoded.payload {
         MemberPayload::Packed(mut packed) => {
             if let Some(password) = member.password {
-                let mut cipher = Rar13Cipher::new(password);
+                let mut cipher = Rar13Cipher::for_password(password)?;
                 for chunk in packed.chunks_mut(64 * 1024) {
                     crate::write_progress::check_cancelled(progress)?;
                     for byte in chunk {

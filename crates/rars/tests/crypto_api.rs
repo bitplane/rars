@@ -1,3 +1,5 @@
+#![cfg(feature = "encryption")]
+
 use rars::crypto::{rar30, rar50};
 
 #[test]

@@ -173,6 +173,7 @@ impl StreamingEntry {
     }
 }
 
+#[cfg(any(test, feature = "encryption"))]
 fn checked_align16(value: usize, message: &'static str) -> Result<usize> {
     value
         .checked_add(15)
@@ -222,6 +223,7 @@ const RAR29_LZ_BLOCK_SIZE: usize = 64 * 1024;
 /// cannot resolve the real one. It has to stay an upper bound, so it does not
 /// follow the block size.
 const RAR29_MAX_DICTIONARY_SIZE: usize = 4 * 1024 * 1024;
+#[cfg(feature = "encryption")]
 const RAR15_ALIGN_OVERFLOW: &str = "RAR 1.5 block size overflows usize";
 
 pub fn write_stored_archive(
@@ -2311,32 +2313,42 @@ fn encrypt_split_packed_data(
     target: ArchiveVersion,
     password: &[u8],
 ) -> Result<Option<[u8; 8]>> {
-    match target {
-        ArchiveVersion::Rar15 => {
-            Rar15Cipher::new(password).crypt_in_place(data);
-            Ok(None)
+    #[cfg(not(feature = "encryption"))]
+    {
+        let _ = (data, target, password);
+        Err(Error::FeatureDisabled {
+            feature: "encryption",
+        })
+    }
+    #[cfg(feature = "encryption")]
+    {
+        match target {
+            ArchiveVersion::Rar15 => {
+                Rar15Cipher::new(password).crypt_in_place(data);
+                Ok(None)
+            }
+            ArchiveVersion::Rar20 => {
+                let padded_len = checked_align16(data.len(), RAR15_ALIGN_OVERFLOW)
+                    .expect("byte vector length plus padding fits usize");
+                data.resize(padded_len, 0);
+                Rar20Cipher::new(password)
+                    .encrypt_in_place(data)
+                    .expect("padded legacy ciphertext is block aligned");
+                Ok(None)
+            }
+            ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40 => {
+                let salt = random_rar30_salt()?;
+                let padded_len = checked_align16(data.len(), RAR15_ALIGN_OVERFLOW)
+                    .expect("byte vector length plus padding fits usize");
+                data.resize(padded_len, 0);
+                Rar30Cipher::new(password, Some(salt))
+                    .map_err(super::map_rar30_crypto_error)?
+                    .encrypt_in_place(data)
+                    .expect("padded legacy ciphertext is block aligned");
+                Ok(Some(salt))
+            }
+            _ => Err(Error::UnsupportedVersion(target)),
         }
-        ArchiveVersion::Rar20 => {
-            let padded_len = checked_align16(data.len(), RAR15_ALIGN_OVERFLOW)
-                .expect("byte vector length plus padding fits usize");
-            data.resize(padded_len, 0);
-            Rar20Cipher::new(password)
-                .encrypt_in_place(data)
-                .expect("padded legacy ciphertext is block aligned");
-            Ok(None)
-        }
-        ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40 => {
-            let salt = random_rar30_salt()?;
-            let padded_len = checked_align16(data.len(), RAR15_ALIGN_OVERFLOW)
-                .expect("byte vector length plus padding fits usize");
-            data.resize(padded_len, 0);
-            Rar30Cipher::new(password, Some(salt))
-                .map_err(super::map_rar30_crypto_error)?
-                .encrypt_in_place(data)
-                .expect("padded legacy ciphertext is block aligned");
-            Ok(Some(salt))
-        }
-        _ => Err(Error::UnsupportedVersion(target)),
     }
 }
 
@@ -2368,55 +2380,71 @@ fn encrypt_packed_data_with_progress(
     password: Option<&[u8]>,
     progress: Option<ProgressReporter<'_>>,
 ) -> Result<Option<[u8; 8]>> {
-    crate::write_progress::check_cancelled(progress)?;
-    let Some(password) = password else {
-        return Ok(None);
-    };
-    match target {
-        ArchiveVersion::Rar15 => {
-            let mut cipher = Rar15Cipher::new(password);
-            for chunk in data.chunks_mut(64 * 1024) {
-                crate::write_progress::check_cancelled(progress)?;
-                cipher.crypt_in_place(chunk);
-            }
+    #[cfg(not(feature = "encryption"))]
+    {
+        let _ = (data, target);
+        crate::write_progress::check_cancelled(progress)?;
+        if password.is_none() {
             Ok(None)
+        } else {
+            Err(Error::FeatureDisabled {
+                feature: "encryption",
+            })
         }
-        ArchiveVersion::Rar20 => {
-            let padded_len = checked_align16(data.len(), RAR15_ALIGN_OVERFLOW)
-                .expect("byte vector length plus padding fits usize");
-            data.resize(padded_len, 0);
-            let mut cipher = Rar20Cipher::new(password);
-            for chunk in data.chunks_mut(64 * 1024) {
-                crate::write_progress::check_cancelled(progress)?;
-                cipher
-                    .encrypt_in_place(chunk)
-                    .expect("padded ciphertext and 64 KiB chunks are block aligned");
+    }
+    #[cfg(feature = "encryption")]
+    {
+        crate::write_progress::check_cancelled(progress)?;
+        let Some(password) = password else {
+            return Ok(None);
+        };
+        match target {
+            ArchiveVersion::Rar15 => {
+                let mut cipher = Rar15Cipher::new(password);
+                for chunk in data.chunks_mut(64 * 1024) {
+                    crate::write_progress::check_cancelled(progress)?;
+                    cipher.crypt_in_place(chunk);
+                }
+                Ok(None)
             }
-            Ok(None)
-        }
-        ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40 => {
-            let salt = random_rar30_salt()?;
-            // Byte vectors are bounded by isize::MAX, so adding 15 fits usize.
-            let padded_len = checked_align16(data.len(), RAR15_ALIGN_OVERFLOW)
-                .expect("byte vector length plus padding fits usize");
-            data.resize(padded_len, 0);
-            let mut cipher =
-                Rar30Cipher::new(password, Some(salt)).map_err(super::map_rar30_crypto_error)?;
-            for chunk in data.chunks_mut(64 * 1024) {
-                crate::write_progress::check_cancelled(progress)?;
-                cipher
-                    .encrypt_in_place(chunk)
-                    .expect("padded ciphertext and 64 KiB chunks are block aligned");
+            ArchiveVersion::Rar20 => {
+                let padded_len = checked_align16(data.len(), RAR15_ALIGN_OVERFLOW)
+                    .expect("byte vector length plus padding fits usize");
+                data.resize(padded_len, 0);
+                let mut cipher = Rar20Cipher::new(password);
+                for chunk in data.chunks_mut(64 * 1024) {
+                    crate::write_progress::check_cancelled(progress)?;
+                    cipher
+                        .encrypt_in_place(chunk)
+                        .expect("padded ciphertext and 64 KiB chunks are block aligned");
+                }
+                Ok(None)
             }
-            Ok(Some(salt))
+            ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40 => {
+                let salt = random_rar30_salt()?;
+                // Byte vectors are bounded by isize::MAX, so adding 15 fits usize.
+                let padded_len = checked_align16(data.len(), RAR15_ALIGN_OVERFLOW)
+                    .expect("byte vector length plus padding fits usize");
+                data.resize(padded_len, 0);
+                let mut cipher = Rar30Cipher::new(password, Some(salt))
+                    .map_err(super::map_rar30_crypto_error)?;
+                for chunk in data.chunks_mut(64 * 1024) {
+                    crate::write_progress::check_cancelled(progress)?;
+                    cipher
+                        .encrypt_in_place(chunk)
+                        .expect("padded ciphertext and 64 KiB chunks are block aligned");
+                }
+                Ok(Some(salt))
+            }
+            _ => Err(Error::UnsupportedFeature {
+                version: target,
+                feature: "RAR writer file encryption",
+            }),
         }
-        _ => Err(Error::UnsupportedFeature {
-            version: target,
-            feature: "RAR writer file encryption",
-        }),
     }
 }
 
+#[cfg(feature = "encryption")]
 fn random_rar30_salt() -> Result<[u8; 8]> {
     let mut salt = [0; 8];
     crate::write_stream::fill_entropy(
@@ -2551,18 +2579,28 @@ fn write_encrypted_end_block(out: &mut dyn Write, password: &[u8]) -> Result<()>
 }
 
 fn write_encrypted_header(out: &mut dyn Write, header: &[u8], password: &[u8]) -> Result<()> {
-    let salt = random_rar30_salt()?;
-    let encrypted_size = checked_align16(header.len(), RAR15_ALIGN_OVERFLOW)?;
-    let mut encrypted_header = Vec::with_capacity(encrypted_size);
-    encrypted_header.extend_from_slice(header);
-    encrypted_header.resize(encrypted_size, 0);
-    Rar30Cipher::new(password, Some(salt))
-        .map_err(super::map_rar30_crypto_error)?
-        .encrypt_in_place(&mut encrypted_header)
-        .map_err(super::map_rar30_crypto_error)?;
-    out.write_all(&salt)?;
-    out.write_all(&encrypted_header)?;
-    Ok(())
+    #[cfg(not(feature = "encryption"))]
+    {
+        let _ = (out, header, password);
+        Err(Error::FeatureDisabled {
+            feature: "encryption",
+        })
+    }
+    #[cfg(feature = "encryption")]
+    {
+        let salt = random_rar30_salt()?;
+        let encrypted_size = checked_align16(header.len(), RAR15_ALIGN_OVERFLOW)?;
+        let mut encrypted_header = Vec::with_capacity(encrypted_size);
+        encrypted_header.extend_from_slice(header);
+        encrypted_header.resize(encrypted_size, 0);
+        Rar30Cipher::new(password, Some(salt))
+            .map_err(super::map_rar30_crypto_error)?
+            .encrypt_in_place(&mut encrypted_header)
+            .map_err(super::map_rar30_crypto_error)?;
+        out.write_all(&salt)?;
+        out.write_all(&encrypted_header)?;
+        Ok(())
+    }
 }
 
 fn validate_member(name: &[u8], unpacked_size: usize) -> Result<()> {

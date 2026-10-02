@@ -415,3 +415,21 @@ fn encrypted_builders_refuse_before_materializing_legacy_sources() {
         assert!(output.is_empty());
     }
 }
+
+#[cfg(not(any(feature = "full", feature = "encryption")))]
+#[test]
+fn unavailable_low_level_key_derivation_keeps_a_typed_error() {
+    let error = rars::crypto::rar50::Rar50Keys::derive(b"password", [0; 16], 0).unwrap_err();
+    assert_eq!(error, rars::crypto::rar50::Error::FeatureDisabled);
+    assert_eq!(error.to_string(), "Cargo feature encryption is disabled");
+    assert_eq!(
+        rars::Error::Rar50Crypto(error.clone()).kind(),
+        rars::ErrorKind::UnsupportedFeature
+    );
+    assert_eq!(
+        rars::Error::from(error),
+        rars::Error::FeatureDisabled {
+            feature: "encryption"
+        }
+    );
+}

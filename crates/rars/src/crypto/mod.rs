@@ -1,10 +1,14 @@
 //! RAR legacy and modern archive encryption primitives used by `rars`.
 
 pub mod rar13;
+#[cfg(feature = "encryption")]
 pub mod rar15;
 pub mod rar20;
 pub mod rar30;
 pub mod rar50;
+
+#[cfg(not(feature = "encryption"))]
+pub(crate) mod unavailable;
 
 /// The longest password any RAR key derivation sees.
 ///

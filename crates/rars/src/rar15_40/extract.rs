@@ -597,12 +597,14 @@ impl PendingSplitRefs<Allowance> {
     }
 }
 
+#[cfg(feature = "encryption")]
 enum SplitCipher<B: Budget = Allowance> {
     Rar15(Rar15Cipher),
     Rar20(Boxed<Rar20Cipher, B>),
     Rar30(Boxed<Rar30Cipher, B>),
 }
 
+#[cfg(feature = "encryption")]
 impl<B: Budget> SplitCipher<B> {
     fn with_allowance(
         unp_ver: u8,
@@ -644,6 +646,10 @@ impl<R: Read, B: Budget> Read for PackedReader<R, B> {
         }
     }
 }
+#[cfg(not(feature = "encryption"))]
+pub(super) type DecryptingReader<R, B = Allowance> = crate::crypto::unavailable::Reader<R, B>;
+
+#[cfg(feature = "encryption")]
 pub(super) struct DecryptingReader<R, B: Budget = Allowance> {
     inner: R,
     cipher: SplitCipher<B>,
@@ -654,6 +660,7 @@ pub(super) struct DecryptingReader<R, B: Budget = Allowance> {
     eof: bool,
 }
 
+#[cfg(feature = "encryption")]
 impl<R: Read, B: Budget> DecryptingReader<R, B> {
     pub(super) fn with_allowance(
         inner: R,
@@ -765,6 +772,7 @@ impl<R: Read, B: Budget> DecryptingReader<R, B> {
     }
 }
 
+#[cfg(feature = "encryption")]
 impl<R: Read, B: Budget> Read for DecryptingReader<R, B> {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         if out.is_empty() {
@@ -783,12 +791,14 @@ impl<R: Read, B: Budget> Read for DecryptingReader<R, B> {
 }
 
 #[cfg(all(test, feature = "write"))]
+#[cfg(feature = "encryption")]
 impl SplitCipher<Allowance> {
     fn new(unp_ver: u8, password: &[u8], salt: Option<[u8; 8]>) -> Result<Self> {
         Self::with_allowance(unp_ver, password, salt, &Allowance::default())
     }
 }
 #[cfg(all(test, feature = "write"))]
+#[cfg(feature = "encryption")]
 impl<R: Read> DecryptingReader<R, Allowance> {
     pub(super) fn new(
         inner: R,

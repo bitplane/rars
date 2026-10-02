@@ -24,16 +24,16 @@ default = ["write", "parallel", "recovery", "encryption"]
 parallel = ["dep:rayon"]
 recovery = ["dep:getrandom"]
 write = ["dep:getrandom"]
-encryption = []
+encryption = ["dep:aes", "dep:hmac", "dep:sha1", "dep:sha2", "dep:zeroize"]
 
 [dependencies]
-aes.workspace = true
+aes = { workspace = true, optional = true }
 aho-corasick.workspace = true
 getrandom = { workspace = true, optional = true }
-hmac.workspace = true
-sha1.workspace = true
-sha2.workspace = true
-zeroize.workspace = true
+hmac = { workspace = true, optional = true }
+sha1 = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+zeroize = { workspace = true, optional = true }
 
 # Bare WebAssembly cannot start a thread, so rayon's pool panics rather than
 # running sequentially. `parallel.rs` has a single-threaded path for that target

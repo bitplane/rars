@@ -1,6 +1,8 @@
 use super::*;
 use crate::crc32::Crc32;
-use crate::crypto::rar50::{Rar50Cipher, Rar50Keys};
+#[cfg(feature = "encryption")]
+use crate::crypto::rar50::Rar50Cipher;
+use crate::crypto::rar50::Rar50Keys;
 pub use crate::filter::{FilterKind, FilterPolicy, FilterSpec};
 use crate::write_plan::{PlanShape, WriterOption};
 use crate::write_progress::ProgressReporter;
@@ -760,38 +762,50 @@ fn encrypt_reader_with_allowance<B: crate::codec::workspace::Budget>(
     progress: Option<ProgressReporter<'_>>,
     allowance: &B,
 ) -> Result<()> {
-    crate::write_progress::check_cancelled(progress)?;
-    if input_size == 0 {
-        return Ok(());
+    #[cfg(not(feature = "encryption"))]
+    {
+        let _ = (
+            reader, input_size, output, keys, iv, block_size, progress, allowance,
+        );
+        Err(Error::FeatureDisabled {
+            feature: "encryption",
+        })
     }
-    let mut cipher = Rar50Cipher::new(keys.key, iv);
-    let chunk_size = block_size.max(16) & !15;
-    let mut buffer = crate::codec::workspace::Buffer::filled(chunk_size, 0u8, allowance)?;
-    let mut remaining = input_size;
-    while remaining >= chunk_size as u64 {
+    #[cfg(feature = "encryption")]
+    {
         crate::write_progress::check_cancelled(progress)?;
-        reader.read_exact(&mut buffer)?;
-        cipher
-            .encrypt_in_place(&mut buffer)
-            .map_err(super::map_rar50_crypto_error)?;
-        output.write_all(&buffer)?;
-        remaining -= chunk_size as u64;
+        if input_size == 0 {
+            return Ok(());
+        }
+        let mut cipher = Rar50Cipher::new(keys.key, iv);
+        let chunk_size = block_size.max(16) & !15;
+        let mut buffer = crate::codec::workspace::Buffer::filled(chunk_size, 0u8, allowance)?;
+        let mut remaining = input_size;
+        while remaining >= chunk_size as u64 {
+            crate::write_progress::check_cancelled(progress)?;
+            reader.read_exact(&mut buffer)?;
+            cipher
+                .encrypt_in_place(&mut buffer)
+                .map_err(super::map_rar50_crypto_error)?;
+            output.write_all(&buffer)?;
+            remaining -= chunk_size as u64;
+        }
+        let final_plain = usize::try_from(remaining)
+            .map_err(|_| Error::InvalidArgument("RAR 5 encrypted data size overflows"))?;
+        let final_padded = final_plain.checked_add(15).ok_or(Error::InvalidArgument(
+            "RAR 5 encrypted data size overflows",
+        ))? & !15;
+        if final_padded != 0 {
+            crate::write_progress::check_cancelled(progress)?;
+            buffer[..final_padded].fill(0);
+            reader.read_exact(&mut buffer[..final_plain])?;
+            cipher
+                .encrypt_in_place(&mut buffer[..final_padded])
+                .map_err(super::map_rar50_crypto_error)?;
+            output.write_all(&buffer[..final_padded])?;
+        }
+        Ok(())
     }
-    let final_plain = usize::try_from(remaining)
-        .map_err(|_| Error::InvalidArgument("RAR 5 encrypted data size overflows"))?;
-    let final_padded = final_plain.checked_add(15).ok_or(Error::InvalidArgument(
-        "RAR 5 encrypted data size overflows",
-    ))? & !15;
-    if final_padded != 0 {
-        crate::write_progress::check_cancelled(progress)?;
-        buffer[..final_padded].fill(0);
-        reader.read_exact(&mut buffer[..final_plain])?;
-        cipher
-            .encrypt_in_place(&mut buffer[..final_padded])
-            .map_err(super::map_rar50_crypto_error)?;
-        output.write_all(&buffer[..final_padded])?;
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -315,6 +315,7 @@ impl<T, B: Budget> Buffer<T, B> {
     pub(crate) fn retain(&mut self, keep: impl FnMut(&T) -> bool) {
         self.values.retain(keep);
     }
+    #[cfg(any(test, feature = "write", feature = "encryption"))]
     pub(crate) fn truncate(&mut self, len: usize) {
         self.values.truncate(len);
     }

@@ -1,4 +1,4 @@
-use super::{Error, Result};
+use super::{constant_time_eq, Error, Rar50Keys, Result};
 
 use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 use aes::Aes256;
@@ -8,40 +8,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 const MAX_KDF_COUNT_LOG: u8 = 24;
 
-/// The PBKDF2 iteration exponent this writer stores in new archives, giving
-/// `2^15` = 32768 iterations.
-///
-/// WinRAR writes 15 and a reader honours whatever the archive declares, so the
-/// only thing a smaller exponent buys is a faster offline password guess
-/// against the archives we produce. It costs about 15 ms per encrypted member
-/// on the write side, which is what WinRAR pays too.
-pub const WRITE_KDF_COUNT_LOG: u8 = 15;
 type HmacSha256 = Hmac<Sha256>;
-
-#[derive(Clone, ZeroizeOnDrop)]
-#[non_exhaustive]
-pub struct Rar50Keys {
-    pub key: [u8; 32],
-    pub hash_key: [u8; 32],
-    pub password_check: [u8; 8],
-}
-
-impl std::fmt::Debug for Rar50Keys {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Rar50Keys").finish_non_exhaustive()
-    }
-}
-
-impl PartialEq for Rar50Keys {
-    fn eq(&self, other: &Self) -> bool {
-        let key_eq = constant_time_eq(&self.key, &other.key);
-        let hash_eq = constant_time_eq(&self.hash_key, &other.hash_key);
-        let check_eq = constant_time_eq(&self.password_check, &other.password_check);
-        key_eq & hash_eq & check_eq
-    }
-}
-
-impl Eq for Rar50Keys {}
 
 impl Rar50Keys {
     pub fn derive(password: &[u8], salt: [u8; 16], kdf_count_log: u8) -> Result<Self> {
@@ -134,14 +101,6 @@ impl Rar50Keys {
     pub fn mac_hash32(&self, hash: [u8; 32]) -> [u8; 32] {
         hmac_sha256(&self.hash_key, &hash)
     }
-}
-
-fn constant_time_eq<const N: usize>(left: &[u8; N], right: &[u8; N]) -> bool {
-    let mut diff = 0u8;
-    for (&left, &right) in left.iter().zip(right) {
-        diff |= left ^ right;
-    }
-    diff == 0
 }
 
 #[derive(ZeroizeOnDrop)]

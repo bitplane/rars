@@ -475,13 +475,13 @@ pub(crate) struct HeaderEncryptionKeys {
 }
 
 pub(super) fn header_encryption_keys(password: &[u8]) -> Result<HeaderEncryptionKeys> {
+    crate::crypto::require_encryption()?;
     let mut salt = [0u8; 16];
     crate::write_stream::fill_entropy(
         &mut salt,
         "RAR 5 writer could not generate encryption salt",
     )?;
-    let keys = Rar50Keys::derive(password, salt, WRITE_KDF_COUNT_LOG)
-        .expect("writer KDF count is supported");
+    let keys = Rar50Keys::derive(password, salt, WRITE_KDF_COUNT_LOG).map_err(Error::from)?;
     Ok(HeaderEncryptionKeys { keys, salt })
 }
 
@@ -511,7 +511,7 @@ pub(super) fn write_head_crypt(
     specific.vint(0x0001);
     specific.extend_from_slice(&[WRITE_KDF_COUNT_LOG]);
     specific.extend_from_slice(&header_keys.salt);
-    specific.extend_from_slice(&header_keys.keys.password_check_record());
+    specific.extend_from_slice(&header_keys.keys.checked_password_record()?);
     write_block(
         out,
         HEAD_CRYPT,
