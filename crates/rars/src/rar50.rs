@@ -2284,7 +2284,9 @@ fn read_vint_at(input: &[u8], offset: usize, end: usize) -> Result<(u64, usize)>
     let mut value = 0u64;
     let mut shift = 0u32;
     for i in 0..10 {
-        let pos = offset.checked_add(i).ok_or(Error::TooShort)?;
+        // Each previous byte was strictly before `end`, so this addition
+        // cannot overflow even when a caller supplies an extreme offset.
+        let pos = offset + i;
         if pos >= end {
             return Err(Error::TooShort);
         }
@@ -4051,6 +4053,10 @@ mod tests {
         assert_eq!(read_vint_at(&[0x01], 0, 0), Err(Error::TooShort));
         assert_eq!(read_vint_at(&[0x81, 0x01], 0, 1), Err(Error::TooShort));
         assert_eq!(read_vint_at(&[0x81, 0x01], 0, 2).unwrap(), (129, 2));
+        assert_eq!(
+            read_vint_at(&[], usize::MAX, usize::MAX),
+            Err(Error::TooShort)
+        );
     }
 
     #[test]
