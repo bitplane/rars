@@ -1,3 +1,5 @@
+#![cfg(feature = "write")]
+
 use rars::{ArchiveReader, ArchiveVersion, Builder, EntrySource};
 
 fn file_copy_member(name: &[u8], target: &[u8]) -> rars::ArchiveMember {

@@ -54,6 +54,7 @@ mod threaded {
     /// Mapping everything up front is simpler, but it holds every result at
     /// once; when the results are compressed file payloads that is the
     /// difference between one copy of the archive in memory and two.
+    #[cfg(any(test, feature = "write"))]
     pub(crate) fn map_slice_windowed<'a, T, O, E, F, C>(
         items: &'a [T],
         window: usize,
@@ -119,6 +120,7 @@ mod sequential {
 
     /// One at a time, so the window only decides how much output is alive at
     /// once rather than how much work runs at once.
+    #[cfg(any(test, feature = "write"))]
     pub(crate) fn map_slice_windowed<'a, T, O, E, F, C>(
         items: &'a [T],
         _window: usize,
@@ -143,6 +145,7 @@ mod sequential {
         1
     }
 
+    #[cfg(any(test, feature = "write"))]
     pub(crate) fn threads() -> usize {
         1
     }

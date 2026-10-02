@@ -1,3 +1,5 @@
+#![cfg(feature = "write")]
+
 use rars::{
     ArchiveVersion, Builder, ErrorKind, WriteCancellation, WriteOperation, WriteProgress,
     WriteProgressEvent, WriterResources,

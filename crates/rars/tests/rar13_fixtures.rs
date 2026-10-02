@@ -1,3 +1,5 @@
+#![cfg(feature = "write")]
+
 use rars::rar13::{extract_volumes_to, file_checksum, Archive, Entry};
 use rars::{detect_archive_family, find_archive_start, ArchiveFamily, Error};
 use std::cell::RefCell;

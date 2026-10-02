@@ -1,3 +1,5 @@
+#![cfg(feature = "write")]
+
 use rars::codec::{
     rar13::{Unpack15, Unpack15Encoder},
     rar20::{Unpack20, Unpack20Encoder},

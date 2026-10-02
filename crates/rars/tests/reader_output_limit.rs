@@ -1,3 +1,5 @@
+#![cfg(feature = "write")]
+
 use rars::{Archive, ArchiveReader, ArchiveVersion, Builder};
 
 fn archive(size: usize) -> rars::rar50::Archive {

@@ -1,3 +1,5 @@
+#![cfg(feature = "write")]
+
 use rars::{Archive, ArchiveReadOptions, ArchiveReader, ArchiveVersion, Builder, ErrorKind};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};

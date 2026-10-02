@@ -1625,7 +1625,7 @@ impl PpmdEncoder {
     }
 
     /// Ends this PPMd block while keeping the member open for another block.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "write"))]
     pub(crate) fn finish_block_keeping_model(mut self) -> Result<(Vec<u8>, PpmdDecoder)> {
         self.model
             .state
@@ -1634,12 +1634,12 @@ impl PpmdEncoder {
         Ok((self.range.finish(), self.model))
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "write"))]
     pub(crate) fn finish_with_command(self, command: u8) -> Result<Vec<u8>> {
         self.finish_with_command_prefix(command, &[])
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "write"))]
     pub(crate) fn finish_with_command_prefix(
         mut self,
         command: u8,

@@ -27,10 +27,14 @@ fn fixture(name: &str) -> Vec<u8> {
 }
 
 fn decode(name: &str) -> Vec<Vec<u8>> {
+    decode_with_options(name, rars::ArchiveReadOptions::default())
+}
+
+fn decode_with_options(name: &str, options: rars::ArchiveReadOptions<'_>) -> Vec<Vec<u8>> {
     let archive = ArchiveReader::read(&fixture(name)).unwrap();
     let mut outputs = Vec::new();
     archive
-        .extract_to(None, |_| {
+        .extract_to_with_options(options, |_| {
             let output = Rc::new(RefCell::new(Vec::new()));
             outputs.push(output.clone());
             Ok(Box::new(Collect(output)))
@@ -40,6 +44,45 @@ fn decode(name: &str) -> Vec<Vec<u8>> {
         .into_iter()
         .map(|output| Rc::try_unwrap(output).unwrap().into_inner())
         .collect()
+}
+
+#[test]
+fn comments_decode_without_archive_writers() {
+    let archive = ArchiveReader::read(&fixture("rar13/COMMENT.RAR")).unwrap();
+    assert_eq!(
+        archive.comment(None).unwrap().unwrap(),
+        b"This is the archive comment.\r\n"
+    );
+    let archive = ArchiveReader::read(&fixture("rar50/with_comment.rar")).unwrap();
+    assert_eq!(archive.comment(None).unwrap().unwrap().len(), 30);
+}
+
+#[test]
+fn disk_scratch_preserves_filtered_contents_without_writer_resources() {
+    struct Directory(std::path::PathBuf);
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target")
+        .join(format!("reader-consumer-scratch-{}", std::process::id()));
+    std::fs::create_dir_all(directory.parent().unwrap()).unwrap();
+    std::fs::create_dir(&directory).unwrap();
+    let directory = Directory(directory);
+    let policy = rars::Rar50Scratch::new(&directory.0, 32 * 1024 * 1024);
+    for name in [
+        "rar50/filter_e8e9.rar",
+        "rar50/filter_delta.rar",
+        "rar50/filter_arm.rar",
+    ] {
+        let options = rars::ArchiveReadOptions::default()
+            .with_rar50_buffered_decode_limit(0)
+            .with_rar50_scratch(&policy);
+        assert_eq!(decode_with_options(name, options), decode(name), "{name}");
+        assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(), 0);
+    }
 }
 
 #[test]
@@ -202,6 +245,7 @@ fn unavailable_recovery_returns_a_typed_error_without_output() {
 
 #[cfg(not(any(feature = "full", feature = "recovery")))]
 #[test]
+#[cfg(feature = "write")]
 fn unavailable_recovery_generation_refuses_before_reading_sources() {
     let source =
         rars::EntrySource::from_opener(1, || panic!("recovery refusal must precede source I/O"));

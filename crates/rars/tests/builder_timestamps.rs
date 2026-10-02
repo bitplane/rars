@@ -1,3 +1,5 @@
+#![cfg(feature = "write")]
+
 use rars::{ArchiveReader, ArchiveVersion, Builder};
 use std::time::{Duration, UNIX_EPOCH};
 

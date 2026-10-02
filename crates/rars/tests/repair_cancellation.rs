@@ -1,3 +1,5 @@
+#![cfg(all(feature = "write", feature = "recovery"))]
+
 use rars::{
     ArchiveReadOptions, ArchiveReader, ArchiveVersion, Builder, ErrorKind, ReadCancellation,
 };

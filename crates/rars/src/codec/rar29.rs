@@ -1,4 +1,4 @@
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 use super::filters::MAX_DELTA_CHANNELS;
 use super::filters::{self, DeltaErrorMessages, FilterOp};
 use super::huffman;
@@ -161,6 +161,7 @@ pub fn unpack29_encode_literals_with_options(
     encode_member_with_options(input, &[], options)
 }
 
+#[cfg(feature = "write")]
 pub(crate) fn unpack29_encode_literals_with_options_and_progress(
     input: &[u8],
     options: EncodeOptions,
@@ -173,6 +174,7 @@ pub fn unpack29_encode_ppmd_literals(input: &[u8]) -> Result<Vec<u8>> {
     encode_ppmd_member(input, false, &[], 0)
 }
 
+#[cfg(feature = "write")]
 pub(crate) fn unpack29_encode_ppmd_with_progress(
     input: &[u8],
     lz_escapes: bool,
@@ -669,6 +671,7 @@ pub enum ChainEngine {
 /// must not move the chain: the reader rebuilds its code-length table from the
 /// bytes it actually reads, so committing a table the winner never wrote leaves
 /// every later member coded against a table no decoder holds.
+#[cfg(feature = "write")]
 struct LzCandidate {
     packed: Vec<u8>,
     /// The bytes the LZ layer coded, when a filter rewrote them. `None` when
@@ -678,6 +681,7 @@ struct LzCandidate {
 }
 
 #[derive(Debug, Clone)]
+#[cfg(feature = "write")]
 pub struct Unpack29Encoder {
     history: Vec<u8>,
     options: EncodeOptions,
@@ -694,12 +698,14 @@ pub struct Unpack29Encoder {
     ppmd: Option<PpmdDecoder>,
 }
 
+#[cfg(feature = "write")]
 impl Default for Unpack29Encoder {
     fn default() -> Self {
         Self::with_options(EncodeOptions::default())
     }
 }
 
+#[cfg(feature = "write")]
 impl Unpack29Encoder {
     pub fn new() -> Self {
         Self::default()
@@ -965,6 +971,7 @@ fn encode_member_with_options(
     encode_member_with_options_impl(input, history, options, &mut [0; TABLE_COUNT], None)
 }
 
+#[cfg(feature = "write")]
 fn encode_member_with_options_and_progress(
     input: &[u8],
     history: &[u8],
@@ -1304,6 +1311,7 @@ fn encoded_filter_records_at(
 /// Codes filtered bytes a block at a time, so that no filter is declared
 /// further ahead of its block than the decoder's window can express, and so a
 /// large member does not need a whole LZ pass in memory at once.
+#[cfg(feature = "write")]
 fn encode_filtered_member_blocks(
     data: &[u8],
     history: &[u8],
@@ -1835,7 +1843,7 @@ fn ema(slot: &mut f64, sample: f64, weight: f64) {
 ///
 /// `on_token` sees every emitted token, in order. Production passes a no-op;
 /// the tests collect them.
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 fn encode_ppmd_hybrid(
     input: &[u8],
     max_match_distance: usize,
@@ -3449,7 +3457,7 @@ impl<B: Budget> Reader29State<B> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 impl Reader29State<Allowance> {
     fn filtered_range(&mut self, start: usize, end: usize, member_start: usize) -> Result<Vec<u8>> {
         self.filtered_range_owned(start, end, member_start)
@@ -3583,7 +3591,7 @@ impl<B: Budget> Huffman<B> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 impl Huffman<Allowance> {
     fn from_lengths(lengths: &[u8]) -> Result<Self> {
         Self::from_lengths_with_allowance(lengths, &Allowance::default())
@@ -3628,7 +3636,7 @@ impl<B: Budget> BitReader<B> {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "write"))]
     fn append(&mut self, input: &[u8]) {
         self.compact();
         self.input
@@ -3637,7 +3645,7 @@ impl<B: Budget> BitReader<B> {
             .expect("test input allowance");
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "write"))]
     fn compact(&mut self) {
         let bytes = self.bit_pos / 8;
         if bytes == 0 {
@@ -3702,7 +3710,7 @@ impl<B: Budget> PpmdByteReader for BitReader<B> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 impl BitReader<Allowance> {
     fn from_bytes(input: &[u8]) -> Self {
         Self::from_bytes_with_allowance(input, &Allowance::default()).expect("unlimited RAR3 input")
@@ -3773,7 +3781,7 @@ fn identify_standard_filter(code: &[u8]) -> Option<StandardFilter> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 fn apply_standard_filter_with_control(
     filter: StandardFilter,
     data: &mut Vec<u8>,
@@ -3787,7 +3795,7 @@ fn apply_standard_filter_with_control(
     *data = owned.into_vec();
     result
 }
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 fn apply_standard_filter(
     filter: StandardFilter,
     data: &mut Vec<u8>,
@@ -3855,7 +3863,7 @@ fn apply_standard_filter_with_allowance<B: Budget>(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 fn itanium_decode(data: &mut [u8], file_offset: u32) {
     itanium_decode_with_control(
         data,
@@ -3904,7 +3912,7 @@ fn itanium_decode_with_control(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 fn rgb_decode_with_control(
     data: &[u8],
     width: usize,
@@ -3972,7 +3980,7 @@ fn rgb_predict(prev: u8, upper: u8, upper_left: u8) -> u8 {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 fn audio_decode_with_control(
     data: &[u8],
     channels: usize,
@@ -4052,7 +4060,7 @@ fn audio_decode_with_allowance<B: Budget>(
     Ok(out)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 mod tests {
     #[test]
     fn public_decoder_clone_keeps_independent_lz_and_ppmd_solid_state() {

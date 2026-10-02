@@ -1,3 +1,4 @@
+#![cfg(feature = "write")]
 #![cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 #[path = "support/scratch.rs"]
 mod scratch;

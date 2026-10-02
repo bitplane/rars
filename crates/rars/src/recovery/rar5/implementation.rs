@@ -189,10 +189,12 @@ pub(crate) fn build_inline_recovery_data_for_plan_with_control(
 /// straddle a chunk boundary.
 pub(crate) const RECOVERY_IO_BLOCK: usize = 256 * 1024;
 /// Striped mode never claims more than this, however large the budget is.
+#[cfg(any(test, feature = "write"))]
 const STRIPE_BUDGET_CAP: u64 = 64 * 1024 * 1024;
 /// Below this a stripe pass seeks far more than it reads, so rather than
 /// thrash we report what striping would actually cost and let the caller
 /// refuse the job.
+#[cfg(any(test, feature = "write"))]
 const MIN_STRIPE_LEN: u64 = 4 * 1024;
 
 /// How a recovery pass holds parity while it works.
@@ -204,11 +206,14 @@ pub(crate) enum RecoveryMemoryMode {
     /// Parity is built one column stripe at a time and spilled to scratch
     /// storage, so memory is bounded regardless of archive size. Costs one
     /// seek per data shard per stripe.
+    // Reader repair uses resident parity; writers select bounded stripes.
+    #[cfg_attr(not(any(test, feature = "write")), expect(dead_code))]
     Striped { stripe_len: usize },
 }
 
 /// Picks a memory mode for `plan` under `memory_limit`, returning the mode and
 /// the number of bytes the caller should reserve for it.
+#[cfg(any(test, feature = "write"))]
 pub(crate) fn choose_recovery_memory_mode(
     plan: InlineRecoveryPlan,
     memory_limit: u64,
@@ -243,6 +248,7 @@ pub(crate) fn choose_recovery_memory_mode(
 
 /// Choose a phase geometry from actual managed capacity as well as the legacy
 /// workspace policy. Both parity construction and later chunk framing must fit.
+#[cfg(any(test, feature = "write"))]
 pub(crate) fn choose_recovery_capacity_mode(
     plan: InlineRecoveryPlan,
     memory_limit: u64,
@@ -288,8 +294,11 @@ pub(crate) fn choose_recovery_capacity_mode(
 /// service block around the payload it just wrote.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct StreamedRecoveryOutput {
+    #[cfg_attr(not(any(test, feature = "write")), expect(dead_code))]
     pub(crate) plan: InlineRecoveryPlan,
+    #[cfg_attr(not(any(test, feature = "write")), expect(dead_code))]
     pub(crate) payload_len: u64,
+    #[cfg_attr(not(any(test, feature = "write")), expect(dead_code))]
     pub(crate) payload_crc32: u32,
 }
 
@@ -1865,7 +1874,7 @@ mod legacy_reference {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 mod tests {
     use super::{
         apply_inverse_matrix, build_inline_recovery_data_for_plan,
@@ -4157,7 +4166,7 @@ mod cancellation_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 #[test]
 fn missing_end_header_repair_preserves_an_active_cancellation_token() {
     let mut builder = crate::Builder::new(crate::ArchiveVersion::Rar50)

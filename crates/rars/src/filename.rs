@@ -69,6 +69,7 @@ pub fn encode_rar50(name: &[u8]) -> Cow<'_, [u8]> {
 
 /// Encode a renamed legacy Unicode entry without relying on a code page.
 /// Full UTF-16 units make the Unicode stream independent of the ASCII fallback.
+#[cfg(any(test, feature = "write"))]
 pub(crate) fn encode_legacy_unicode(name: &[u8]) -> Result<Vec<u8>> {
     validate_relative(name)?;
     let text = std::str::from_utf8(name)

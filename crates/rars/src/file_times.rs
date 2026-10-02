@@ -27,10 +27,12 @@ pub struct FileTimes {
     pub accessed: Option<FileTimestamp>,
 }
 
+#[cfg(any(test, feature = "write"))]
 pub(crate) struct EncodedTimes {
     bytes: [u8; 25],
     len: usize,
 }
+#[cfg(any(test, feature = "write"))]
 impl std::ops::Deref for EncodedTimes {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
@@ -80,6 +82,7 @@ impl FileTimes {
         })
     }
 
+    #[cfg(any(test, feature = "write"))]
     pub(crate) fn encode(self) -> Result<EncodedTimes> {
         let times = [self.modified, self.created, self.accessed];
         let first = times
@@ -177,6 +180,7 @@ impl FileTimes {
         })
     }
 
+    #[cfg(any(test, feature = "write"))]
     pub(crate) fn legacy(raw: &[u8], mtime: Option<u32>) -> Result<Option<Self>> {
         if raw.is_empty() {
             return Ok(None);
@@ -246,6 +250,7 @@ impl FileTimes {
 
 /// Validate a native legacy record without interpreting DOS wall-clock times.
 /// Includes the fourth (archival) timestamp, which RAR5 cannot represent.
+#[cfg(any(test, feature = "write"))]
 pub(crate) fn validate_legacy_extended_times(raw: &[u8]) -> Result<()> {
     let invalid = || Error::InvalidArgument("legacy extended timestamps are incomplete or invalid");
     let flags = u16::from_le_bytes(raw.get(..2).ok_or_else(invalid)?.try_into().unwrap());

@@ -73,6 +73,7 @@ pub fn unpack20_encode_auto_with_options(input: &[u8], options: EncodeOptions) -
     Ok(best)
 }
 
+#[cfg(any(test, feature = "write"))]
 pub(crate) fn unpack20_encode_auto_with_options_and_progress(
     input: &[u8],
     options: EncodeOptions,
@@ -185,6 +186,7 @@ impl Unpack20Encoder {
         self.encode_member_inner(input, None)
     }
 
+    #[cfg(feature = "write")]
     pub(crate) fn encode_member_with_progress(
         &mut self,
         input: &[u8],

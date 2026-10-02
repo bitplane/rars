@@ -1,6 +1,8 @@
 //! RAR 1.3/1.4 format parsing and sequential extraction.
 
+#[cfg(feature = "write")]
 pub(crate) mod write;
+#[cfg(feature = "write")]
 pub use write::{
     write_compressed_archive, write_compressed_archive_with_comment,
     write_compressed_archive_with_comment_and_progress, write_compressed_volumes,
@@ -9,18 +11,19 @@ pub use write::{
     EntrySource, FileEntry, MemberCoding, StoredEntry, StreamingEntry, WriterOptions,
     WriterResources,
 };
+#[cfg(feature = "write")]
 pub(crate) use write::{
     write_stored_archive_with_comment_and_progress, write_stored_volumes_with_progress,
 };
 
-use crate::codec::rar13::{unpack15_decode, Reader15State};
+use crate::codec::rar13::Reader15State;
 use crate::codec::workspace::{Allowance, Budget, Buffer};
 use crate::crypto::rar13::{Rar13Cipher, Rar13DecryptReader};
 use crate::detect::{find_archive_start, ArchiveSignature, RAR13_SIGNATURE, SFX_SCAN_LIMIT};
 use crate::error::{Error, Result};
 use crate::io_util::{read_exact_at, read_u16, read_u32};
 pub(crate) use crate::source::ArchiveSource;
-use crate::version::{ArchiveFamily, ArchiveVersion};
+use crate::version::ArchiveFamily;
 use crate::volume_extract::ChainedReader;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -35,6 +38,7 @@ const MHD_COMMENT: u8 = 0x02;
 const MHD_SOLID: u8 = 0x08;
 const MHD_PACK_COMMENT: u8 = 0x10;
 const MHD_AV: u8 = 0x20;
+#[cfg(feature = "write")]
 const MHD_ALWAYS_SET: u8 = 0x80;
 const RAR13_AV_PREFIX: &[u8; 6] = b"\x1ai\x6d\x02\xda\xae";
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
@@ -42,9 +46,12 @@ const LHD_SPLIT_BEFORE: u8 = 0x01;
 const LHD_SPLIT_AFTER: u8 = 0x02;
 const LHD_PASSWORD: u8 = 0x04;
 const LHD_COMMENT: u8 = 0x08;
+#[cfg(feature = "write")]
 const LHD_SOLID: u8 = 0x10;
 const METHOD_STORE: u8 = 0;
+#[cfg(feature = "write")]
 const METHOD_BEST: u8 = 5;
+#[cfg(feature = "write")]
 const DEFAULT_UNP_VER: u8 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -693,6 +700,7 @@ impl Archive {
         Ok(crate::ExtractionOutcome::Complete)
     }
 
+    #[cfg(feature = "write")]
     pub(crate) fn rewrite_preservation_issues(&self) -> Vec<String> {
         let mut issues = Vec::new();
         let exact_comment = |extra: &[u8], present: bool| {

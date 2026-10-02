@@ -112,7 +112,7 @@ pub enum Error {
     /// honour it.
     UnsupportedWriterOption {
         target: ArchiveVersion,
-        option: crate::write_plan::WriterOption,
+        option: crate::WriterOption,
         /// Why, when the format alone is not the reason: "in a compressed
         /// archive", "levels run from 0 to 5". Rendered after the format.
         because: Option<&'static str>,

@@ -326,7 +326,7 @@ impl<T, B: Budget> Buffer<T, B> {
         self.values.resize(len, value);
         Ok(())
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "write"))]
     pub(crate) fn resize_with(&mut self, len: usize, make: impl FnMut() -> T) -> Result<()> {
         if B::LIMITED && len > self.values.capacity() {
             self.reserve(len - self.values.len())?;

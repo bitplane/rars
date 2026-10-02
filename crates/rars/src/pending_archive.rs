@@ -10,6 +10,7 @@ pub(crate) struct PendingArchive<C = ()> {
     _charge: C,
 }
 
+#[cfg(feature = "recovery")]
 impl PendingArchive<()> {
     pub(crate) fn create(destination: &Path) -> Result<(Self, fs::File)> {
         Self::with_admission(destination, |_| Ok(()))

@@ -1,3 +1,5 @@
+#![cfg(feature = "write")]
+
 use rars::{rar50, ArchiveVersion, EntrySource, FeatureSet, WriterResources};
 use std::io::Cursor;
 use std::sync::{

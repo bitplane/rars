@@ -1,3 +1,5 @@
+#![cfg(feature = "write")]
+
 //! Byte-for-byte golden fixtures for structural RAR 5/7 writer output.
 //!
 //! These cover *stored* archives only. Their bytes exercise header layout,

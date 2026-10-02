@@ -815,7 +815,7 @@ pub fn encode_lz_member_with_options(
     encode_lz_member_with_history_and_options(data, &[], algorithm_version, options)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 pub(crate) fn encode_lz_member_with_options_and_progress(
     data: &[u8],
     algorithm_version: u8,
@@ -825,7 +825,7 @@ pub(crate) fn encode_lz_member_with_options_and_progress(
     encode_lz_member_inner(data, &[], algorithm_version, options, Some(progress))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 pub(crate) fn encode_lz_reader_to(
     reader: &mut dyn Read,
     input_size: u64,
@@ -979,6 +979,7 @@ pub(crate) fn encode_lz_streaming_blocks(
     )
     .map(|outputs| outputs.into_iter().map(Buffer::into_vec).collect())
 }
+#[cfg(any(test, feature = "write"))]
 pub(crate) fn streaming_blocks_with_allowance<B: Budget>(
     data: &[u8],
     history: &[u8],
@@ -1118,7 +1119,7 @@ impl TryFrom<crate::FilterKind> for Rar50Filter {
 
 /// Applies `filters` to a copy of `data`, returning the transformed bytes and
 /// the records that describe them.
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 pub(crate) fn filtered_lz_member(
     data: &[u8],
     filters: &[crate::FilterSpec],
@@ -1329,6 +1330,7 @@ fn encode_lz_member_inner(
     .map(Buffer::into_vec)
 }
 
+#[cfg(feature = "write")]
 pub(crate) fn encode_owned_member<B: Budget>(
     data: &[u8],
     version: u8,
@@ -1344,6 +1346,7 @@ pub(crate) fn encode_owned_member<B: Budget>(
         }
     }
 }
+#[cfg(feature = "write")]
 pub(crate) fn filtered_owned_member<B: Budget>(
     data: &[u8],
     filters: &[crate::FilterSpec],
@@ -2092,7 +2095,7 @@ impl Unpack50Encoder {
             .encode(input, algorithm_version, Some(filters), None)
             .map(Buffer::into_vec)
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "write"))]
     pub(crate) fn encode_member_with_filters_and_progress(
         &mut self,
         input: &[u8],

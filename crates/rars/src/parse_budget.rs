@@ -58,13 +58,13 @@ impl ParseBudget {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 pub(crate) struct PrefixReader {
     inner: std::io::Cursor<Vec<u8>>,
     pub reads: Vec<usize>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 impl PrefixReader {
     pub(crate) fn new(prefix: Vec<u8>) -> Self {
         Self {
@@ -74,7 +74,7 @@ impl PrefixReader {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 impl std::io::Read for PrefixReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.reads.push(buf.len());
@@ -85,14 +85,14 @@ impl std::io::Read for PrefixReader {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 impl std::io::Seek for PrefixReader {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
         std::io::Seek::seek(&mut self.inner, pos)
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 mod tests {
     use super::*;
 

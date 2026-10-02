@@ -1,3 +1,5 @@
+#![cfg(feature = "write")]
+
 #[path = "support/scratch.rs"]
 mod scratch;
 use rars::{ArchiveReader, ArchiveVersion, Builder, ErrorKind, WriterResources};

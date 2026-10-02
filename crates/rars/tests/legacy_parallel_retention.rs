@@ -1,3 +1,4 @@
+#![cfg(feature = "write")]
 #![cfg(all(
     feature = "parallel",
     not(all(target_arch = "wasm32", target_os = "unknown"))

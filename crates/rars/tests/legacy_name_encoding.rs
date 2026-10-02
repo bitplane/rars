@@ -1,3 +1,5 @@
+#![cfg(feature = "write")]
+
 use rars::{
     filename::{decoded_name, LegacyNameEncoding},
     ArchiveReader, ArchiveVersion, Builder,

@@ -1,3 +1,5 @@
+#![cfg(feature = "write")]
+
 use rars::{Archive, ArchiveReader, ArchiveVersion, Builder, ErrorKind};
 
 fn mixed(format: ArchiveVersion, solid: bool, stored: bool) -> Archive {

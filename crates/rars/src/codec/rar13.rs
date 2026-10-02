@@ -92,6 +92,7 @@ pub fn unpack15_encode_with_options(input: &[u8], options: EncodeOptions) -> Res
     encoder.encode_member(input)
 }
 
+#[cfg(any(test, feature = "write"))]
 pub(crate) fn unpack15_encode_with_options_and_progress(
     input: &[u8],
     options: EncodeOptions,
@@ -180,7 +181,7 @@ impl EncodeOptions {
         self.old_distance_tokens
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "write"))]
     pub(crate) const fn lazy_matching_enabled(self) -> bool {
         self.lazy_matching
     }
@@ -281,6 +282,7 @@ impl Unpack15Encoder {
         self.encode_member_inner(input, None)
     }
 
+    #[cfg(any(test, feature = "write"))]
     pub(crate) fn encode_member_with_progress(
         &mut self,
         input: &[u8],

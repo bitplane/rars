@@ -13,12 +13,165 @@ use crate::codec::rar29::{
 };
 use crate::crc32::Crc32;
 pub use crate::filter::{FilterKind, FilterPolicy, FilterSpec};
+pub use crate::streaming::EntrySource;
 use crate::streaming::WriterResources;
 use crate::write_plan::{MemberCoding, PlanShape, WriterOption};
 use crate::write_progress::{ProgressReporter, WorkTracker};
 use crate::write_stream::{MemberBytes, MemberPayload};
+use crate::FeatureSet;
 use crate::{WriteOperation, WriteProgress, WriteProgressEvent};
 use std::io::Write;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct WriterOptions {
+    pub target: ArchiveVersion,
+    pub features: FeatureSet,
+    pub compression_level: Option<u8>,
+    pub dictionary_size: Option<usize>,
+    /// Which engine compresses a member. Only the RAR 2.9 family has more than
+    /// one, so the other targets ignore anything but the default.
+    pub method: Rar29Method,
+    /// Retained NewSub comment DOS timestamp and host ID.
+    pub(crate) archive_comment_metadata: Option<(u32, u8)>,
+}
+
+/// Which compression engine the RAR 2.9 family writer uses for a member.
+///
+/// PPMd is an alternative to LZ, not a filter, even though the writer used to
+/// carry it as one. Keeping the two apart is what lets a filter be chosen
+/// without also deciding the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum Rar29Method {
+    /// Let the content decide. Text-shaped members are measured against PPMd;
+    /// anything else goes straight to LZ, so a binary member never pays for a
+    /// PPMd encode it was always going to lose. Compression levels 1 to 4 skip
+    /// the trial entirely, since those settings are asking for speed.
+    #[default]
+    Auto,
+    Lz,
+    Ppmd,
+}
+
+impl WriterOptions {
+    pub const fn new(target: ArchiveVersion, features: FeatureSet) -> Self {
+        Self {
+            target,
+            features,
+            compression_level: None,
+            dictionary_size: None,
+            method: Rar29Method::Auto,
+            archive_comment_metadata: None,
+        }
+    }
+
+    pub const fn with_method(mut self, method: Rar29Method) -> Self {
+        self.method = method;
+        self
+    }
+
+    pub const fn with_compression_level(mut self, level: u8) -> Self {
+        self.compression_level = Some(level);
+        self
+    }
+
+    pub const fn with_dictionary_size(mut self, size: usize) -> Self {
+        self.dictionary_size = Some(size);
+        self
+    }
+}
+
+impl Default for WriterOptions {
+    fn default() -> Self {
+        Self {
+            target: ArchiveVersion::Rar15,
+            features: FeatureSet::store_only(),
+            compression_level: None,
+            dictionary_size: None,
+            method: Rar29Method::Auto,
+            archive_comment_metadata: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredEntry<'a> {
+    pub name: &'a [u8],
+    pub data: &'a [u8],
+    pub file_time: u32,
+    pub file_attr: u32,
+    pub host_os: u8,
+    pub password: Option<&'a [u8]>,
+    pub file_comment: Option<&'a [u8]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileEntry<'a> {
+    pub name: &'a [u8],
+    pub data: &'a [u8],
+    pub file_time: u32,
+    pub file_attr: u32,
+    pub host_os: u8,
+    pub password: Option<&'a [u8]>,
+    pub file_comment: Option<&'a [u8]>,
+}
+
+/// One member of an archive written a member at a time.
+///
+/// The bytes are opened when the member is coded and dropped once it is
+/// written, so an archive of many files never holds more than the members
+/// being worked on. A stored member is copied straight from its source and
+/// never lands on the heap at all.
+#[derive(Debug, Clone)]
+pub struct StreamingEntry {
+    pub name: Vec<u8>,
+    pub source: EntrySource,
+    pub file_time: u32,
+    pub file_attr: u32,
+    pub host_os: u8,
+    pub password: Option<Vec<u8>>,
+    pub file_comment: Option<Vec<u8>>,
+}
+
+impl StreamingEntry {
+    pub fn new(name: impl Into<Vec<u8>>, source: EntrySource) -> Self {
+        Self {
+            name: name.into(),
+            source,
+            file_time: 0,
+            file_attr: 0,
+            host_os: 3,
+            password: None,
+            file_comment: None,
+        }
+    }
+
+    pub fn with_file_time(mut self, file_time: u32) -> Self {
+        self.file_time = file_time;
+        self
+    }
+
+    pub fn with_file_attr(mut self, file_attr: u32) -> Self {
+        self.file_attr = file_attr;
+        self
+    }
+
+    pub fn with_host_os(mut self, host_os: u8) -> Self {
+        self.host_os = host_os;
+        self
+    }
+
+    pub fn with_password(mut self, password: impl Into<Vec<u8>>) -> Self {
+        self.password = Some(password.into());
+        self
+    }
+
+    pub fn with_file_comment(mut self, comment: impl Into<Vec<u8>>) -> Self {
+        self.file_comment = Some(comment.into());
+        self
+    }
+}
 
 fn checked_align16(value: usize, message: &'static str) -> Result<usize> {
     value

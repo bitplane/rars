@@ -1,3 +1,5 @@
+#![cfg(feature = "write")]
+
 use rars::{ArchiveReader, ArchiveVersion, Builder};
 
 #[path = "support/scratch.rs"]

@@ -11,17 +11,21 @@ use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 
+pub use crate::filter::{FilterKind, FilterPolicy, FilterSpec};
+
 mod blake2sp;
 mod extract;
+#[cfg(any(feature = "write", feature = "recovery"))]
 mod framing;
+#[cfg(feature = "write")]
 pub(crate) mod write;
 
 pub use extract::{extract_volumes_to, extract_volumes_to_with_redirections};
+#[cfg(feature = "write")]
 pub use write::{
     write_streaming_archive_to, write_streaming_archive_with_progress, write_streaming_volumes_to,
     write_streaming_volumes_with_progress, ArchiveEntry, ArchiveExtras, ArchiveMetadataEntry,
-    CollectedVolumes, FilterKind, FilterPolicy, FilterSpec, Rar50Writer, ServiceEntry, VolumeSink,
-    WriterOptions,
+    CollectedVolumes, Rar50Writer, ServiceEntry, VolumeSink, WriterOptions,
 };
 
 const HEAD_MAIN: u64 = 1;
@@ -236,6 +240,7 @@ impl FileRedirection {
             && std::str::from_utf8(&self.target_name).is_ok()
     }
 
+    #[cfg(feature = "write")]
     pub(crate) fn supports_header(&self, host: u64, attr: u64, directory: bool) -> bool {
         if !self.is_supported() {
             return false;
@@ -2379,7 +2384,7 @@ fn decode_compression_info(raw: u64) -> Result<CompressionInfo> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 mod tests {
     #[test]
     fn file_encryption_record_accepts_optional_check_and_rejects_truncation() {
@@ -4487,7 +4492,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 #[test]
 fn redirection_preservation_refuses_inconsistent_header_metadata() {
     let mut builder = crate::Builder::new(crate::ArchiveVersion::Rar50).store(true);

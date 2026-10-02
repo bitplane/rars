@@ -1,3 +1,5 @@
+#![cfg(feature = "write")]
+
 use rars::{ArchiveReadOptions, ArchiveReader, ArchiveVersion, Builder, ErrorKind};
 use std::{cell::RefCell, io::Write, rc::Rc};
 

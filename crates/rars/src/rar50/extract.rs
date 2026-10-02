@@ -132,7 +132,7 @@ impl FileHeader {
         Ok((PackedReader::Encrypted(reader), Some(keys)))
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "write"))]
     fn packed_reader_with_password<'a>(
         &self,
         archive: &'a Archive,
@@ -287,7 +287,7 @@ impl FileHeader {
         session.write_file_to(archive, self, out)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "write"))]
     pub(crate) fn decoded_data_unverified(
         &self,
         archive: &Archive,
@@ -588,7 +588,7 @@ impl FileHeader {
             .map_err(|error| self.entry_error("verifying", error))
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "write"))]
     fn decode_packed_with_decoder(
         &self,
         packed: &[u8],
@@ -1618,7 +1618,7 @@ impl<B: Budget> PendingSplitRefs<B> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 impl PendingSplitRefs<Allowance> {
     fn new(file: &FileHeader, volume_index: usize, file_index: usize) -> Self {
         Self::with_allowance(file, volume_index, file_index, &Allowance::default())
@@ -1800,7 +1800,7 @@ impl<R: Read> Read for Rar50DecryptingReader<R> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 mod tests {
     #[test]
     fn checksum_sink_flush_preserves_accumulated_checksum() {

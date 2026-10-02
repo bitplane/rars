@@ -13,10 +13,11 @@
 #[path = "../tests/support/scratch.rs"]
 mod scratch;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 #[path = "../tests/support/read_errors.rs"]
 mod read_errors;
 
+#[cfg(feature = "write")]
 pub mod builder;
 #[doc(hidden)]
 pub mod codec;
@@ -24,18 +25,23 @@ pub mod crc32;
 #[doc(hidden)]
 pub mod crypto;
 pub mod detect;
+#[cfg(any(feature = "write", feature = "recovery"))]
 mod entropy;
 pub mod error;
+#[cfg(feature = "write")]
 mod fast;
 pub mod features;
 pub mod filename;
 pub mod filter;
+#[cfg(feature = "write")]
 mod filter_search;
 mod io_util;
 mod output_limit;
 mod parallel;
 mod parse_budget;
+#[cfg(any(feature = "write", feature = "recovery"))]
 mod pending_archive;
+#[cfg(any(feature = "write", feature = "recovery"))]
 mod progress;
 mod read_control;
 pub use read_control::ReadCancellation;
@@ -47,10 +53,14 @@ pub mod rar50;
 mod reader_scratch;
 #[doc(hidden)]
 pub mod recovery;
+#[cfg(feature = "write")]
 mod rewrite;
+#[cfg(feature = "write")]
 mod rewrite_staging;
+#[cfg(feature = "write")]
 pub use rewrite_staging::RewriteStaging;
 mod source;
+#[cfg(feature = "write")]
 mod streaming;
 mod temp_file;
 pub mod timestamp;
@@ -58,11 +68,18 @@ pub use file_times::{FileTimes, FileTimestamp};
 mod tzif;
 pub mod version;
 mod volume_extract;
+#[cfg(feature = "write")]
 pub mod write_plan;
+#[cfg(feature = "write")]
 mod write_progress;
+mod writer_option;
+pub use writer_option::WriterOption;
+#[cfg(feature = "write")]
 mod write_stream;
+#[cfg(feature = "write")]
 mod x86_filter_scan;
 
+#[cfg(feature = "write")]
 pub use builder::Builder;
 pub use detect::{detect_archive_family, find_archive_start, ArchiveSignature, SFX_SCAN_LIMIT};
 pub use error::{Error, ErrorKind, Result};
@@ -72,19 +89,21 @@ pub use filename::{entry_relative_path, validate_entry_name};
 pub use filter::{
     formats_supporting_filter, FilterKind, FilterPolicy, FilterSpec, UnsupportedFilterKind,
 };
+#[cfg(any(feature = "write", feature = "recovery"))]
 pub use progress::{WriteOperation, WriteProgress, WriteProgressEvent};
 pub use reader_scratch::Rar50Scratch;
 use std::io::{Read, Write};
 use std::path::Path;
+#[cfg(feature = "write")]
 pub use streaming::output::{WriterOutput, WriterVolumes};
+#[cfg(feature = "write")]
 pub use streaming::{
     EntryReader, EntrySource, WriteCancellation, WriterResources, DEFAULT_WRITER_MEMORY_LIMIT,
 };
 pub use timestamp::StoredTimestamp;
 pub use version::{ArchiveFamily, ArchiveVersion};
-pub use write_plan::{
-    formats_supporting, supported_features, supports, MemberCoding, PlanShape, WriterOption,
-};
+#[cfg(feature = "write")]
+pub use write_plan::{formats_supporting, supported_features, supports, MemberCoding, PlanShape};
 
 #[derive(Debug, Clone, Copy, Default)]
 #[non_exhaustive]
@@ -1184,6 +1203,7 @@ pub struct RecoveryRepairResult {
     pub report: RecoveryRepairReport,
 }
 
+#[cfg(feature = "recovery")]
 impl RecoveryRepairResult {
     /// Publishes repaired bytes beside the destination, replacing it only after
     /// writing, syncing and a final cancellation check succeed. Cancellation
@@ -1648,7 +1668,7 @@ fn rar50_volumes(archives: &[Archive]) -> Result<Vec<rar50::Archive>> {
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 mod tests {
     use super::*;
     use std::cell::RefCell;
@@ -1734,6 +1754,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn recovery_publication_rename_failure_preserves_destination_and_cleans_staging() {
         let root = crate::scratch::case("recovery-publication-rename-failure");
         let destination = root.join("destination");
@@ -1752,6 +1773,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn recovery_publication_cancellation_at_each_checkpoint_preserves_destination() {
         let root = crate::scratch::case("recovery-publication-checkpoints");
         let destination = root.join("archive.rar");

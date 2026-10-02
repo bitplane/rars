@@ -1,3 +1,5 @@
+#![cfg(feature = "write")]
+
 use rars::{
     rar13, rar15_40, ArchiveVersion, Builder, EntrySource, Error, ErrorKind, FeatureSet,
     FilterKind, FilterPolicy, MemberCoding, WriteCancellation, WriterResources,

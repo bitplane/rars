@@ -109,7 +109,7 @@ impl<B: Budget> CodecState<B> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 impl CodecState<Allowance> {
     fn new_for(file: &FileHeader) -> Result<Self> {
         Self::with_allowance(file, &Allowance::default())
@@ -173,7 +173,7 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
     }
 
     /// Decode compressed recovery data into a charged buffer.
-    #[cfg(any(test, feature = "recovery"))]
+    #[cfg(any(all(test, feature = "write"), feature = "recovery"))]
     pub(super) fn decode_file_owned(
         &mut self,
         archive: &Archive,
@@ -225,14 +225,14 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
 }
 
 impl<'a> DecoderSession<'a, Allowance> {
-    #[cfg(any(test, feature = "recovery"))]
+    #[cfg(any(all(test, feature = "write"), feature = "recovery"))]
     pub(super) fn new(solid: bool) -> Self {
         Self::new_with_password(solid, None)
     }
     pub(super) fn new_with_password(solid: bool, password: Option<&'a [u8]>) -> Self {
         Self::with_allowance(solid, password, &Allowance::default())
     }
-    #[cfg(any(test, feature = "recovery"))]
+    #[cfg(any(all(test, feature = "write"), feature = "recovery"))]
     pub(super) fn decode_file_data(
         &mut self,
         archive: &Archive,
@@ -578,13 +578,13 @@ impl<B: Budget> PendingSplitRefs<B> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 impl PendingSplitRefs<Allowance> {
     fn new(file: &FileHeader, volume_index: usize, file_index: usize) -> Self {
         Self::with_allowance(file, volume_index, file_index, &Allowance::default())
             .expect("unlimited split bookkeeping")
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "write"))]
     fn fragment_reader<'a>(
         &self,
         volumes: &'a [Archive],
@@ -779,13 +779,13 @@ impl<R: Read, B: Budget> Read for DecryptingReader<R, B> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 impl SplitCipher<Allowance> {
     fn new(unp_ver: u8, password: &[u8], salt: Option<[u8; 8]>) -> Result<Self> {
         Self::with_allowance(unp_ver, password, salt, &Allowance::default())
     }
 }
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 impl<R: Read> DecryptingReader<R, Allowance> {
     pub(super) fn new(
         inner: R,
@@ -796,7 +796,7 @@ impl<R: Read> DecryptingReader<R, Allowance> {
         Self::with_allowance(inner, unp_ver, password, salt, &Allowance::default())
     }
 }
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 mod tests {
     #[test]
     fn reader_workspace_split_descriptor_growth_is_admitted_before_mutation() {

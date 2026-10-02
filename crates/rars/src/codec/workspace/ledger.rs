@@ -56,6 +56,7 @@ impl Limited {
             scope: None,
         }
     }
+    #[cfg(any(test, feature = "write"))]
     pub(crate) fn limit(&self) -> u64 {
         self.ledger.limit
     }
@@ -124,6 +125,7 @@ impl Limited {
     }
 }
 impl Charge {
+    #[cfg(any(test, feature = "write"))]
     pub(crate) fn bytes(&self) -> u64 {
         self.bytes
     }

@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::codec::rar13::{
-    unpack15_encode, unpack15_encode_with_options_and_progress,
+    unpack15_decode, unpack15_encode, unpack15_encode_with_options_and_progress,
     EncodeOptions as Rar15EncodeOptions, Unpack15Encoder,
 };
 use crate::features::FeatureSet;
@@ -11,6 +11,7 @@ pub use crate::write_plan::MemberCoding;
 use crate::write_plan::{PlanShape, WriterOption};
 use crate::write_progress::{ProgressReporter, WorkTracker};
 use crate::write_stream::{MemberBytes, MemberPayload};
+use crate::ArchiveVersion;
 use crate::{WriteOperation, WriteProgress, WriteProgressEvent};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
