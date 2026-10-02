@@ -2379,6 +2379,111 @@ mod tests {
     }
 
     #[test]
+    fn striped_recovery_preserves_scratch_seek_failures() {
+        use super::{streamed_recovery_with_allowance, Allowance, RecoveryMemoryMode};
+        use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+
+        struct FaultScratch {
+            data: Cursor<Vec<u8>>,
+            reads: usize,
+            fail_initial_seek: bool,
+        }
+        impl Read for FaultScratch {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                self.data.read(bytes)
+            }
+        }
+        impl Write for FaultScratch {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.data.write(bytes)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.data.flush()
+            }
+        }
+        impl Seek for FaultScratch {
+            fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+                if self.fail_initial_seek || self.reads != 0 {
+                    return Err(std::io::ErrorKind::PermissionDenied.into());
+                }
+                self.data.seek(from)
+            }
+        }
+
+        let body = vec![0x5a; 4096];
+        let plan = plan_inline_recovery(body.len() as u64, 10).unwrap();
+        for fail_initial_seek in [true, false] {
+            let allowance = Allowance::limited(2 * 1048576);
+            let mut scratch = FaultScratch {
+                data: Cursor::new(Vec::new()),
+                reads: 0,
+                fail_initial_seek,
+            };
+            let mut output = Vec::new();
+            let error = streamed_recovery_with_allowance(
+                &mut Cursor::new(&body),
+                body.len() as u64,
+                plan,
+                RecoveryMemoryMode::Striped { stripe_len: 64 },
+                Some(&mut scratch),
+                &mut output,
+                None,
+                0,
+                &allowance,
+            )
+            .unwrap_err();
+            assert_eq!(error, Error::Io(std::io::ErrorKind::PermissionDenied));
+            assert_eq!(scratch.reads == 0, fail_initial_seek);
+            assert!(output.is_empty());
+            assert_eq!(allowance.used(), 0);
+        }
+    }
+
+    #[test]
+    fn recovery_encoder_preserves_body_seek_failures() {
+        use super::{streamed_recovery_with_allowance, Allowance, RecoveryMemoryMode};
+        use std::io::{Cursor, Read, Seek, SeekFrom};
+
+        struct UnseekableBody(Cursor<Vec<u8>>);
+        impl Read for UnseekableBody {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                self.0.read(bytes)
+            }
+        }
+        impl Seek for UnseekableBody {
+            fn seek(&mut self, _: SeekFrom) -> std::io::Result<u64> {
+                Err(std::io::ErrorKind::PermissionDenied.into())
+            }
+        }
+
+        let body = vec![0x5a; 4096];
+        let plan = plan_inline_recovery(body.len() as u64, 10).unwrap();
+        for mode in [
+            RecoveryMemoryMode::Resident,
+            RecoveryMemoryMode::Striped { stripe_len: 64 },
+        ] {
+            let allowance = Allowance::limited(2 * 1048576);
+            let mut output = Vec::new();
+            let error = streamed_recovery_with_allowance(
+                &mut UnseekableBody(Cursor::new(body.clone())),
+                body.len() as u64,
+                plan,
+                mode,
+                Some(&mut Cursor::new(Vec::new())),
+                &mut output,
+                None,
+                0,
+                &allowance,
+            )
+            .unwrap_err();
+            assert_eq!(error, Error::Io(std::io::ErrorKind::PermissionDenied));
+            assert!(output.is_empty());
+            assert_eq!(allowance.used(), 0);
+        }
+    }
+
+    #[test]
     fn streamed_recovery_rejects_invalid_plan_before_output() {
         use super::{streamed_recovery_with_allowance, Allowance, RecoveryMemoryMode};
         use std::io::Cursor;
