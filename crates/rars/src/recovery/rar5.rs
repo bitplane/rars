@@ -3831,7 +3831,7 @@ mod tests {
 
     #[cfg(target_pointer_width = "32")]
     #[test]
-    fn rar5_archive_repair_rejects_declared_payload_above_native_range() {
+    fn rar5_archive_repair_rejects_payload_and_row_offset_above_native_range() {
         let mut chunk = build_structural_inline_recovery_data(b"x", 10).unwrap();
         let group_count = 65_536u64;
         let shard_size = 80 + group_count;
@@ -3847,6 +3847,15 @@ mod tests {
         assert_eq!(
             repair_inline_recovery_archive(&archive),
             Err(Error::PlanOverflow)
+        );
+        chunk[0x3e..0x40].copy_from_slice(&(u16::MAX - 2).to_le_bytes());
+        let crc = crc64_xz(&chunk[0x0c..]);
+        chunk[0x04..0x0c].copy_from_slice(&crc.to_le_bytes());
+        archive.truncate(1);
+        archive.extend_from_slice(&chunk);
+        assert_eq!(
+            repair_inline_recovery_archive(&archive),
+            Err(Error::BadRecoveryChunk)
         );
     }
 
