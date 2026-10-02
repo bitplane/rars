@@ -3402,6 +3402,212 @@ mod tests {
     }
 
     #[test]
+    fn seekable_parser_preserves_input_faults_and_cancellation() {
+        use std::io::{Cursor, Read, Seek, SeekFrom};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct FaultReader {
+            input: Cursor<Vec<u8>>,
+            operations: Arc<AtomicUsize>,
+            stop_at: usize,
+            cancellation: Option<crate::ReadCancellation>,
+        }
+        impl FaultReader {
+            fn check(&self) -> std::io::Result<()> {
+                let operation = self.operations.fetch_add(1, Ordering::Relaxed);
+                if operation != self.stop_at {
+                    return Ok(());
+                }
+                if let Some(token) = &self.cancellation {
+                    token.cancel();
+                    Ok(())
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "RAR5 input fault",
+                    ))
+                }
+            }
+        }
+        impl Read for FaultReader {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                self.check()?;
+                self.input.read(output)
+            }
+        }
+        impl Seek for FaultReader {
+            fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+                self.check()?;
+                self.input.seek(from)
+            }
+        }
+        let source = build_archive_with_optional_comment(Some(b"comment"));
+        let bytes = source.read_range(0..source.source_len().unwrap()).unwrap();
+        let operations = Arc::new(AtomicUsize::new(0));
+        let parse = |stop_at, cancellation: Option<&crate::ReadCancellation>| {
+            operations.store(0, Ordering::Relaxed);
+            Archive::parse_file_backed(
+                &mut FaultReader {
+                    input: Cursor::new(bytes.clone()),
+                    operations: operations.clone(),
+                    stop_at,
+                    cancellation: cancellation.cloned(),
+                },
+                bytes.len(),
+                0,
+                ArchiveSource::Memory(Arc::from(bytes.clone())),
+                cancellation.map_or_else(crate::ArchiveReadOptions::new, |token| {
+                    crate::ArchiveReadOptions::new().with_cancellation(token)
+                }),
+            )
+        };
+        assert_eq!(parse(usize::MAX, None).unwrap().blocks, source.blocks);
+        let count = operations.load(Ordering::Relaxed);
+        assert!(count > 4);
+        let pre_cancelled = crate::ReadCancellation::new();
+        pre_cancelled.cancel();
+        assert!(matches!(
+            parse(usize::MAX, Some(&pre_cancelled))
+                .unwrap_err()
+                .root_cause(),
+            Error::Cancelled
+        ));
+        assert_eq!(operations.load(Ordering::Relaxed), 0);
+        for operation in 0..count {
+            let error = parse(operation, None).unwrap_err();
+            assert!(matches!(error.root_cause(), Error::Io(source)
+                if source.kind == std::io::ErrorKind::PermissionDenied && source.message == "RAR5 input fault"));
+            assert_eq!(operations.load(Ordering::Relaxed), operation + 1);
+            let cancelled = crate::ReadCancellation::new();
+            let error = parse(operation, Some(&cancelled)).unwrap_err();
+            assert!(
+                matches!(error.root_cause(), Error::Cancelled),
+                "operation {operation}: {error:?}"
+            );
+            assert!(cancelled.is_cancelled());
+        }
+
+        let keys = Rar50Keys::derive(b"pw", [0; 16], 0).unwrap();
+        let mut encoded = vec![3, HEAD_MAIN as u8, 0, 0];
+        let mut first_plain = crc32(&encoded).to_le_bytes().to_vec();
+        first_plain.append(&mut encoded);
+        first_plain.resize(16, 0);
+        Rar50Cipher::new(keys.key, [0; 16])
+            .encrypt_in_place(&mut first_plain)
+            .unwrap();
+        let mut encrypted = vec![0; 16];
+        encrypted.extend_from_slice(&first_plain);
+        let parse_encrypted = |stop_at, cancellation: Option<&crate::ReadCancellation>| {
+            operations.store(0, Ordering::Relaxed);
+            read_encrypted_block_header_at(
+                &mut FaultReader {
+                    input: Cursor::new(encrypted.clone()),
+                    operations: operations.clone(),
+                    stop_at,
+                    cancellation: cancellation.cloned(),
+                },
+                0,
+                encrypted.len(),
+                0,
+                &keys,
+                &mut crate::parse_budget::ParseBudget::new(
+                    cancellation.map_or_else(crate::ArchiveReadOptions::new, |token| {
+                        crate::ArchiveReadOptions::new().with_cancellation(token)
+                    }),
+                ),
+            )
+        };
+        assert_eq!(
+            parse_encrypted(usize::MAX, None).unwrap().block.header_type,
+            HEAD_MAIN
+        );
+        let count = operations.load(Ordering::Relaxed);
+        assert!(count > 1);
+        for operation in 0..count {
+            let error = parse_encrypted(operation, None)
+                .err()
+                .expect("input fault refused");
+            assert!(matches!(error.root_cause(), Error::Io(source)
+                if source.kind == std::io::ErrorKind::PermissionDenied && source.message == "RAR5 input fault"));
+            assert_eq!(operations.load(Ordering::Relaxed), operation + 1);
+            let cancelled = crate::ReadCancellation::new();
+            let error = parse_encrypted(operation, Some(&cancelled))
+                .err()
+                .expect("cancellation observed");
+            assert!(
+                matches!(error.root_cause(), Error::Cancelled),
+                "encrypted operation {operation}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn encryption_key_failures_retain_specific_diagnostics() {
+        let mut encoded = vec![HEAD_CRYPT as u8, 0, 0, 0, 25];
+        encoded.extend_from_slice(&[0; 16]);
+        let mut image = vec![encoded.len() as u8];
+        image.extend_from_slice(&encoded);
+        let mut bytes = RAR50_SIGNATURE.to_vec();
+        bytes.extend_from_slice(&crc32(&image).to_le_bytes());
+        bytes.extend_from_slice(&image);
+        let options = crate::ArchiveReadOptions::with_password(b"pw");
+        for result in [
+            Archive::parse_with_options(&bytes, options),
+            Archive::parse_file_backed(
+                &mut std::io::Cursor::new(&bytes),
+                bytes.len(),
+                0,
+                ArchiveSource::Memory(Arc::from(bytes.clone())),
+                options,
+            ),
+        ] {
+            assert!(matches!(
+                result.unwrap_err().root_cause(),
+                Error::UnsupportedFeature {
+                    feature: "RAR 5 KDF count",
+                    ..
+                }
+            ));
+        }
+
+        let archive = build_archive_with_optional_comment(None);
+        let mut file = archive.files().next().unwrap().clone();
+        file.encrypted = true;
+        file.encryption = None;
+        assert!(matches!(
+            attach_file_crypto(&mut file, Some(b"pw")),
+            Err(Error::InvalidHeader(
+                "RAR 5 encrypted file is missing encryption record"
+            ))
+        ));
+        file.encryption = Some(FileEncryption {
+            version: 0,
+            flags: 1,
+            kdf_count: 25,
+            salt: [0; 16],
+            iv: [0; 16],
+            check_value: Some([0; 12]),
+        });
+        assert!(matches!(
+            attach_file_crypto(&mut file, Some(b"pw")),
+            Err(Error::UnsupportedFeature {
+                feature: "RAR 5 KDF count",
+                ..
+            })
+        ));
+        file.encryption.as_mut().unwrap().kdf_count = 0;
+        // WinRAR 5.21 and earlier wrote an all-zero password check, which
+        // deliberately defers verification to the data checksum.
+        attach_file_crypto(&mut file, Some(b"pw")).unwrap();
+        let mut bad_check = file.clone();
+        bad_check.encryption.as_mut().unwrap().check_value = Some([1; 12]);
+        assert!(matches!(
+            attach_file_crypto(&mut bad_check, Some(b"pw")),
+            Err(Error::WrongPasswordOrCorruptData)
+        ));
+    }
+
+    #[test]
     fn unknown_archive_encryption_flags_disable_rewrite_preservation() {
         let mut builder = crate::Builder::new(crate::ArchiveVersion::Rar50)
             .store(true)
