@@ -1,6 +1,6 @@
 use super::{constant_time_eq, Error, Rar50Keys, Result};
 
-#[cfg(any(test, feature = "write"))]
+#[cfg(any(test, feature = "write", feature = "recovery"))]
 use aes::cipher::BlockCipherEncrypt;
 use aes::cipher::{BlockCipherDecrypt, KeyInit};
 use aes::Aes256;
@@ -129,7 +129,7 @@ impl Rar50Cipher {
         Ok(())
     }
 
-    #[cfg(any(test, feature = "write"))]
+    #[cfg(any(test, feature = "write", feature = "recovery"))]
     pub fn encrypt_in_place(&mut self, data: &mut [u8]) -> Result<()> {
         if !data.len().is_multiple_of(16) {
             return Err(Error::UnalignedInput);
@@ -140,7 +140,7 @@ impl Rar50Cipher {
         Ok(())
     }
 
-    #[cfg(any(test, feature = "write"))]
+    #[cfg(any(test, feature = "write", feature = "recovery"))]
     fn encrypt_block(&mut self, block: &mut [u8]) {
         for (byte, iv_byte) in block.iter_mut().zip(self.iv) {
             *byte ^= iv_byte;
