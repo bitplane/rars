@@ -4067,6 +4067,15 @@ mod tests {
             reconstruct_data_shards(&[None], &[(usize::MAX, &[1, 2])]),
             Err(Error::TooManyShards)
         );
+        let mut data_shards = vec![vec![0, 0]];
+        assert_eq!(
+            super::recover_damaged_shards(&mut data_shards, &[0], &[(usize::MAX, &[1, 2])]),
+            Err(Error::TooManyShards)
+        );
+        assert_eq!(
+            super::recover_damaged_shards(&mut data_shards, &[0], &[]),
+            Err(Error::TooManyDamagedShards)
+        );
         assert_eq!(
             reconstruct_data_shards(&[None], &[(super::FIELD_SIZE - 1, &[1, 2])]),
             Err(Error::TooManyShards)
