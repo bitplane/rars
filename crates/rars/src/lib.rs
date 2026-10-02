@@ -34,6 +34,7 @@ mod io_util;
 mod output_limit;
 mod parallel;
 mod parse_budget;
+mod pending_archive;
 mod read_control;
 pub use read_control::ReadCancellation;
 mod extraction_control;
@@ -59,11 +60,12 @@ mod write_progress;
 mod write_stream;
 mod x86_filter_scan;
 
-pub use builder::{entry_relative_path, validate_entry_name, Builder};
+pub use builder::Builder;
 pub use detect::{detect_archive_family, find_archive_start, ArchiveSignature, SFX_SCAN_LIMIT};
 pub use error::{Error, ErrorKind, Result};
 pub use extraction_control::{ExtractionDecision, ExtractionErrorAction, ExtractionOutcome};
 pub use features::{Feature, FeatureSet};
+pub use filename::{entry_relative_path, validate_entry_name};
 pub use filter::{
     formats_supporting_filter, FilterKind, FilterPolicy, FilterSpec, UnsupportedFilterKind,
 };
@@ -1189,7 +1191,7 @@ impl RecoveryRepairResult {
         control: &crate::read_control::ReadControl,
     ) -> Result<()> {
         control.check()?;
-        let (mut pending, output) = crate::builder::PendingArchive::create(path)?;
+        let (mut pending, output) = crate::pending_archive::PendingArchive::create(path)?;
         {
             let mut output = output;
             control.finish(

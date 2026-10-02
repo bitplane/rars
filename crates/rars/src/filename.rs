@@ -443,3 +443,35 @@ fn windows_native_names_reject_unpaired_surrogates_without_replacement() {
     let paired = OsString::from_wide(&[0xd83d, 0xde00]);
     assert_eq!(native_bytes(&paired).unwrap(), "😀".as_bytes());
 }
+
+/// Reject absolute paths, `..`, drive prefixes and NUL bytes without assuming
+/// a filename encoding. Destination filesystem representability and RAR5 Unix
+/// byte mapping are separate from archive member identity validation.
+pub fn validate_entry_name(name: Vec<u8>) -> Result<Vec<u8>> {
+    crate::filename::validate_relative(&name)?;
+    Ok(name)
+}
+
+/// The path a member name denotes below an output directory, or an error if it
+/// denotes anywhere else. Backslashes are separators, because that is what a
+/// DOS-era writer put in the header. On Unix non-UTF-8 bytes are preserved.
+/// This is the legacy path convention, not a RAR5 wire-name decoder.
+pub fn entry_relative_path(name: &[u8]) -> Result<std::path::PathBuf> {
+    use std::path::{Component, PathBuf};
+
+    crate::filename::validate_relative(name)?;
+    let bytes: Vec<_> = name
+        .iter()
+        .map(|&b| if b == b'\\' { b'/' } else { b })
+        .collect();
+    let text = crate::filename::native_string(&bytes)?;
+    let mut out = PathBuf::new();
+    for component in std::path::Path::new(&text).components() {
+        match component {
+            Component::Normal(part) => out.push(part),
+            Component::CurDir => {}
+            _ => return Err(Error::UnsafePath("unsafe archive path")),
+        }
+    }
+    Ok(out)
+}

@@ -14,7 +14,7 @@ use crate::{
 };
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 struct ConvertedEntries {
     entries: Vec<rar50::ArchiveEntry>,
@@ -33,82 +33,7 @@ const DOS_ARCHIVE_ATTR: u32 = 0x20;
 const RAR15_HOST_UNIX: u8 = 3;
 const RAR50_HOST_UNIX: u64 = 1;
 
-pub(crate) struct PendingArchive {
-    pub(crate) path: Option<PathBuf>,
-    _charge: Option<crate::streaming::CapacityCharge>,
-}
-
-impl PendingArchive {
-    pub(crate) fn create(destination: &Path) -> Result<(Self, fs::File)> {
-        Self::with_resources(destination, &WriterResources::default())
-    }
-    fn with_resources(destination: &Path, resources: &WriterResources) -> Result<(Self, fs::File)> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        Self::with_sequence(destination, resources, || {
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        })
-    }
-
-    fn with_sequence(
-        destination: &Path,
-        resources: &WriterResources,
-        mut next_sequence: impl FnMut() -> u64,
-    ) -> Result<(Self, fs::File)> {
-        for _ in 0..128 {
-            let sequence = next_sequence();
-            let mut name = [0u8; 64];
-            let mut name_writer = std::io::Cursor::new(&mut name[..]);
-            write!(
-                name_writer,
-                ".rars-writing-{}-{sequence:016x}",
-                std::process::id()
-            )
-            .expect("fixed ASCII temporary name fits its buffer");
-            let name_len = name_writer.position() as usize;
-            let name = std::str::from_utf8(&name[..name_len]).expect("ASCII temporary name");
-            let directory = destination.parent().unwrap_or_else(|| Path::new(""));
-            let capacity = directory
-                .as_os_str()
-                .len()
-                .checked_add(1 + name_len)
-                .ok_or(Error::InvalidArgument("temporary path capacity overflows"))?;
-            let mut charge = resources.execution_charge();
-            if let Some(charge) = &mut charge {
-                charge.grow_to(capacity as u64)?;
-            }
-            let mut path = PathBuf::with_capacity(capacity);
-            path.push(directory);
-            path.push(name);
-            match fs::File::options().write(true).create_new(true).open(&path) {
-                Ok(file) => {
-                    return Ok((
-                        Self {
-                            path: Some(path),
-                            _charge: charge,
-                        },
-                        file,
-                    ))
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "could not allocate a unique archive temporary file",
-        )
-        .into())
-    }
-}
-
-impl Drop for PendingArchive {
-    fn drop(&mut self) {
-        if let Some(path) = &self.path {
-            let _ = fs::remove_file(path);
-        }
-    }
-}
+pub(crate) use crate::pending_archive::PendingArchive;
 
 #[derive(Debug, Clone, Copy)]
 enum EntryAttributes {
@@ -1828,37 +1753,9 @@ impl Builder {
     }
 }
 
-/// Reject absolute paths, `..`, drive prefixes and NUL bytes without assuming
-/// a filename encoding. Destination filesystem representability and RAR5 Unix
-/// byte mapping are separate from archive member identity validation.
-pub fn validate_entry_name(name: Vec<u8>) -> Result<Vec<u8>> {
-    crate::filename::validate_relative(&name)?;
-    Ok(name)
-}
-
-/// The path a member name denotes below an output directory, or an error if it
-/// denotes anywhere else. Backslashes are separators, because that is what a
-/// DOS-era writer put in the header. On Unix non-UTF-8 bytes are preserved.
-/// This is the legacy path convention, not a RAR5 wire-name decoder.
-pub fn entry_relative_path(name: &[u8]) -> Result<std::path::PathBuf> {
-    use std::path::{Component, PathBuf};
-
-    crate::filename::validate_relative(name)?;
-    let bytes: Vec<_> = name
-        .iter()
-        .map(|&b| if b == b'\\' { b'/' } else { b })
-        .collect();
-    let text = crate::filename::native_string(&bytes)?;
-    let mut out = PathBuf::new();
-    for component in Path::new(&text).components() {
-        match component {
-            Component::Normal(part) => out.push(part),
-            Component::CurDir => {}
-            _ => return Err(Error::UnsafePath("unsafe archive path")),
-        }
-    }
-    Ok(out)
-}
+// Retain the established public paths while the implementations live with
+// the reader filename utilities.
+pub use crate::filename::{entry_relative_path, validate_entry_name};
 
 #[cfg(unix)]
 fn unix_mode(metadata: &fs::Metadata) -> Option<u32> {
@@ -2765,7 +2662,7 @@ fn converted_redirections_charge_targets_and_preserve_them_in_output() {
 fn pending_archive_accepts_maximum_sequence_without_a_destination_parent() {
     let destination = Path::new("");
     assert!(destination.parent().is_none());
-    let expected = PathBuf::from(format!(
+    let expected = std::path::PathBuf::from(format!(
         ".rars-writing-{}-{:016x}",
         std::process::id(),
         u64::MAX
