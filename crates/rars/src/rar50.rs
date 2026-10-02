@@ -3005,6 +3005,90 @@ mod tests {
     }
 
     #[test]
+    fn oversized_header_declarations_refuse_before_payload_access() {
+        fn vint(mut value: u64) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            loop {
+                let byte = (value & 0x7f) as u8;
+                value >>= 7;
+                bytes.push(byte | if value != 0 { 0x80 } else { 0 });
+                if value == 0 {
+                    return bytes;
+                }
+            }
+        }
+
+        let keys = Rar50Keys::derive(b"pw", [0; 16], 0).unwrap();
+        for (declared, encrypted_expected) in [
+            (u64::MAX, "RAR 5 header size overflows usize"),
+            (u64::MAX - 28, "RAR 5 encrypted header size overflows"),
+            (u64::MAX - 34, "RAR 5 encrypted header size overflows"),
+        ] {
+            let mut prefix = vec![0; 4];
+            prefix.extend_from_slice(&vint(declared));
+            assert_eq!(prefix.len(), 14);
+            let memory = parse_block_header_bytes(
+                &prefix,
+                0,
+                prefix.len(),
+                0,
+                &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new()),
+            );
+            let seekable = read_block_header_at(
+                &mut std::io::Cursor::new(&prefix),
+                0,
+                prefix.len(),
+                0,
+                &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new()),
+            );
+            for result in [memory, seekable] {
+                if usize::BITS == 32 || declared == u64::MAX {
+                    assert!(matches!(
+                        result,
+                        Err(Error::InvalidHeader("RAR 5 header size overflows usize"))
+                    ));
+                } else {
+                    assert!(matches!(result, Err(Error::TooShort)));
+                }
+            }
+
+            let mut first_plain = prefix;
+            first_plain.resize(16, 0);
+            Rar50Cipher::new(keys.key, [0; 16])
+                .encrypt_in_place(&mut first_plain)
+                .unwrap();
+            let mut encrypted = vec![0; 16];
+            encrypted.extend_from_slice(&first_plain);
+            let memory = parse_encrypted_block_header_bytes(
+                &encrypted,
+                0,
+                encrypted.len(),
+                0,
+                &keys,
+                &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new()),
+            );
+            let seekable = read_encrypted_block_header_at(
+                &mut std::io::Cursor::new(&encrypted),
+                0,
+                encrypted.len(),
+                0,
+                &keys,
+                &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new()),
+            );
+            for result in [memory, seekable] {
+                let expected = if usize::BITS == 32 {
+                    "RAR 5 header size overflows usize"
+                } else {
+                    encrypted_expected
+                };
+                assert!(
+                    matches!(result, Err(Error::InvalidHeader(message)) if message == expected)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn unknown_header_remains_readable_and_budget_error_keeps_one_offset() {
         let header = |body: &[u8]| {
             let mut encoded = vec![body.len() as u8];
