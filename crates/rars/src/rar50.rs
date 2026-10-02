@@ -1254,7 +1254,7 @@ pub(crate) fn recovery_end_header(
         write::headers::write_end_header(&mut end, end_flags, &crate::WriterResources::default())?;
         return Ok(end.to_vec());
     }
-    let keys = parse_archive_encryption_header(&first, password)?;
+    let (keys, _) = parse_archive_encryption_header(&first, password)?;
     write::headers::encrypted_header_block(
         &keys,
         HEAD_END,
@@ -1612,17 +1612,18 @@ fn parse_file_encryption_record(input: &[u8], range: Range<usize>) -> Result<Fil
 fn parse_archive_encryption_header(
     parsed: &ParsedBlockHeader,
     password: Option<&[u8]>,
-) -> Result<Rar50Keys> {
-    let password = password.ok_or(Error::NeedPassword)?;
+) -> Result<(Rar50Keys, bool)> {
     let mut reader = HeaderReader::new(&parsed.header, parsed.type_specific_range.clone());
     let version = reader.read_vint()?;
+    let flags = reader.read_vint()?;
+    // The first encrypted-header fields are decoded before password refusal.
+    let password = password.ok_or(Error::NeedPassword)?;
     if version != 0 {
         return Err(Error::UnsupportedFeature {
             version: crate::version::ArchiveVersion::Rar50,
             feature: "RAR 5 unknown header encryption version",
         });
     }
-    let flags = reader.read_vint()?;
     let kdf_count = reader.read_byte()?;
     let salt = reader.read_array::<16>()?;
     let check_value = if flags & 0x0001 != 0 {
@@ -1640,7 +1641,7 @@ fn parse_archive_encryption_header(
         keys.check_password(&check_value)
             .map_err(map_rar50_crypto_error)?;
     }
-    Ok(keys)
+    Ok((keys, flags & !1 == 0))
 }
 
 fn attach_file_crypto(file: &mut FileHeader, password: Option<&[u8]>) -> Result<()> {
@@ -1727,18 +1728,12 @@ where
     let mut budget = crate::parse_budget::ParseBudget::new(options);
     let mut pos = RAR50_SIGNATURE.len();
     let first = read_block(pos, &mut budget).map_err(|error| at_offset(error, pos))?;
-    let header_metadata_complete = if first.block.header_type == HEAD_CRYPT {
-        let mut reader = HeaderReader::new(&first.header, first.type_specific_range.clone());
-        reader.read_vint()?;
-        reader.read_vint()? & !1 == 0
-    } else {
-        true
-    };
-    let header_keys = if first.block.header_type == HEAD_CRYPT {
+    let (header_keys, header_metadata_complete) = if first.block.header_type == HEAD_CRYPT {
         pos = first.next_offset;
-        Some(parse_archive_encryption_header(&first, password)?)
+        let (keys, complete) = parse_archive_encryption_header(&first, password)?;
+        (Some(keys), complete)
     } else {
-        None
+        (None, true)
     };
 
     let main_pos = pos;
@@ -3283,6 +3278,44 @@ mod tests {
         bytes.extend_from_slice(&image(&[HEAD_MAIN as u8, 0, MHFL_VOLUME_NUMBER as u8, 3]));
         let archive = Archive::parse(&bytes).unwrap();
         assert_eq!(archive.main.volume_number, Some(3));
+    }
+
+    #[test]
+    fn unknown_archive_encryption_flags_disable_rewrite_preservation() {
+        let mut builder = crate::Builder::new(crate::ArchiveVersion::Rar50)
+            .store(true)
+            .password(Some(b"pw".to_vec()))
+            .header_encryption(true);
+        builder
+            .add_bytes(b"x".to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+        let mut bytes = builder.to_bytes().unwrap();
+        let parsed = parse_block_header_bytes(
+            &bytes,
+            RAR50_SIGNATURE.len(),
+            bytes.len(),
+            0,
+            &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new()),
+        )
+        .unwrap();
+        assert_eq!(parsed.block.header_type, HEAD_CRYPT);
+        let options = crate::ArchiveReadOptions::with_password(b"pw");
+        assert!(
+            Archive::parse_with_options(&bytes, options)
+                .unwrap()
+                .main
+                .rewrite_metadata_complete
+        );
+
+        let flags_at = RAR50_SIGNATURE.len() + parsed.type_specific_range.start + 1;
+        bytes[flags_at] |= 2; // Retain the check-value bit and add a future flag.
+        let crc_at = RAR50_SIGNATURE.len();
+        let end = crc_at + parsed.header.len();
+        let crc = crc32(&bytes[crc_at + 4..end]);
+        bytes[crc_at..crc_at + 4].copy_from_slice(&crc.to_le_bytes());
+        let archive = Archive::parse_with_options(&bytes, options).unwrap();
+        assert!(!archive.main.rewrite_metadata_complete);
+        assert_eq!(archive.files().next().unwrap().name, b"x");
     }
 
     #[test]
