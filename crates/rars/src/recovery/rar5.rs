@@ -664,7 +664,7 @@ fn rows_with_allowance<B: Budget>(
 ) -> Result<Buffer<Buffer<u8, B>, B>> {
     let mut out = Buffer::with_capacity(rows, allowance)?;
     for _ in 0..rows {
-        out.try_push(Buffer::filled(width, 0u8, allowance)?)?;
+        out.push_admitted(Buffer::filled(width, 0u8, allowance)?);
     }
     Ok(out)
 }
@@ -714,7 +714,7 @@ fn encoder_matrix_with_allowance<B: Budget>(
         for (j, cell) in row.iter_mut().enumerate() {
             *cell = gf.inv(((i + data_shards) ^ j) as u16)?;
         }
-        matrix.try_push(row)?;
+        matrix.push_admitted(row);
     }
     Ok(matrix)
 }
