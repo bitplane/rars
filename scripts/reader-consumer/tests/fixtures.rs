@@ -264,6 +264,27 @@ fn unavailable_recovery_generation_refuses_before_reading_sources() {
         }
     );
     assert!(output.is_empty());
+    let mut builder = rars::Builder::new(rars::ArchiveVersion::Rar50).recovery_percent(Some(1));
+    builder
+        .add_source(
+            b"file".to_vec(),
+            rars::EntrySource::from_opener(1, || {
+                panic!("builder recovery refusal must precede source I/O")
+            }),
+            None,
+            None,
+        )
+        .unwrap();
+    let error = builder
+        .write_to(&mut output, &rars::WriterResources::default(), None)
+        .unwrap_err();
+    assert_eq!(
+        error.root_cause(),
+        &rars::Error::FeatureDisabled {
+            feature: "recovery"
+        }
+    );
+    assert!(output.is_empty());
 }
 
 #[cfg(any(feature = "full", feature = "recovery"))]
@@ -535,4 +556,35 @@ fn independent_recovery_writer_repairs_damaged_plaintext() {
     let repaired = archive.repair_recovery_with_report(None).unwrap();
     assert!(repaired.report.changed);
     assert_eq!(repaired.data, bytes);
+}
+
+#[cfg(any(feature = "full", feature = "write"))]
+#[test]
+fn writer_capabilities_and_validation_respect_optional_features() {
+    use rars::write_plan::{supports, validate_option, PlanShape, WriterOption};
+    let encryption = cfg!(any(feature = "full", feature = "encryption"));
+    let recovery = cfg!(any(feature = "full", feature = "recovery"));
+    for (option, enabled, feature) in [
+        (WriterOption::Password, encryption, "encryption"),
+        (
+            WriterOption::Feature(rars::Feature::HeaderEncryption),
+            encryption,
+            "encryption",
+        ),
+        (WriterOption::RecoveryRecord, recovery, "recovery"),
+    ] {
+        assert_eq!(
+            supports(rars::ArchiveVersion::Rar50, option, PlanShape::new()),
+            enabled
+        );
+        let result = validate_option(rars::ArchiveVersion::Rar50, option, PlanShape::new());
+        if enabled {
+            result.unwrap();
+        } else {
+            assert_eq!(
+                result.unwrap_err(),
+                rars::Error::FeatureDisabled { feature }
+            );
+        }
+    }
 }

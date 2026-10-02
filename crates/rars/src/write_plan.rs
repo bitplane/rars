@@ -176,7 +176,9 @@ pub fn supports(target: ArchiveVersion, option: WriterOption, shape: PlanShape) 
                     | ArchiveVersion::Rar20
             ) && (family == ArchiveFamily::Rar50Plus || !shape.volumes)
         }
-        WriterOption::RecoveryRecord => family == ArchiveFamily::Rar50Plus,
+        WriterOption::RecoveryRecord => {
+            cfg!(feature = "recovery") && family == ArchiveFamily::Rar50Plus
+        }
         WriterOption::VolumeSize => true,
         // No volume writer carries a comment: the legacy one emits the split
         // member and nothing else, and the RAR 5 one refuses comments outright
@@ -254,6 +256,21 @@ pub fn validate_option(
     option: WriterOption,
     shape: PlanShape,
 ) -> Result<()> {
+    if !cfg!(feature = "encryption")
+        && matches!(
+            option,
+            WriterOption::Password | WriterOption::Feature(Feature::HeaderEncryption)
+        )
+    {
+        return Err(Error::FeatureDisabled {
+            feature: "encryption",
+        });
+    }
+    if !cfg!(feature = "recovery") && matches!(option, WriterOption::RecoveryRecord) {
+        return Err(Error::FeatureDisabled {
+            feature: "recovery",
+        });
+    }
     if supports(target, option, shape) {
         Ok(())
     } else {
