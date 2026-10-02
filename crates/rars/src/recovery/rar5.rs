@@ -3854,7 +3854,7 @@ mod tests {
 
     #[cfg(target_pointer_width = "32")]
     #[test]
-    fn rar5_archive_repair_rejects_payload_and_row_offset_above_native_range() {
+    fn rar5_archive_repair_rejects_native_payload_and_offset_overflows() {
         let mut chunk = build_structural_inline_recovery_data(b"x", 10).unwrap();
         let group_count = 65_536u64;
         let shard_size = 80 + group_count;
@@ -3879,6 +3879,24 @@ mod tests {
         assert_eq!(
             repair_inline_recovery_archive(&archive),
             Err(Error::BadRecoveryChunk)
+        );
+
+        let mut chunk = build_structural_inline_recovery_data(b"abcd", 10).unwrap();
+        let group_count = 65_458u64;
+        let shard_size = 80 + group_count;
+        assert_eq!((u16::MAX as u64 - 1) * shard_size, u32::MAX as u64 - 3);
+        chunk.resize(shard_size as usize, 0);
+        chunk[0x0c..0x10].copy_from_slice(&(shard_size as u32).to_le_bytes());
+        chunk[0x2a..0x32].copy_from_slice(&group_count.to_le_bytes());
+        chunk[0x32..0x3a].copy_from_slice(&shard_size.to_le_bytes());
+        chunk[0x3c..0x3e].copy_from_slice(&(u16::MAX - 1).to_le_bytes());
+        let crc = crc64_xz(&chunk[0x0c..]);
+        chunk[0x04..0x0c].copy_from_slice(&crc.to_le_bytes());
+        let mut archive = b"abcd".to_vec();
+        archive.extend_from_slice(&chunk);
+        assert_eq!(
+            repair_inline_recovery_archive(&archive),
+            Err(Error::PlanOverflow)
         );
     }
 
