@@ -168,6 +168,7 @@ impl ArchiveSource {
         }
     }
 
+    #[cfg(feature = "recovery")]
     pub(crate) fn bytes(&self) -> Result<Vec<u8>> {
         match self {
             Self::Reader(source) => self.read_range(0..source.len),

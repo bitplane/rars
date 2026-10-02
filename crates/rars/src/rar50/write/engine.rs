@@ -29,6 +29,7 @@ use crate::rar50::{
     FHEXTRA_SUBDATA, HEAD_END, HEAD_FILE, HEAD_SERVICE, HFL_DATA, HFL_EXTRA, MHFL_RECOVERY,
     MHFL_SOLID,
 };
+#[cfg(feature = "recovery")]
 use crate::recovery::rar5::{
     choose_recovery_memory_mode, plan_inline_recovery, streamed_recovery_with_allowance,
     ReadWriteSeek,
@@ -888,28 +889,46 @@ fn write_recovery_service(
     progress: Option<ProgressReporter<'_>>,
     output: &mut dyn Write,
 ) -> Result<u64> {
-    if let Some(allowance) = &resources.execution {
-        return recovery_service_with_allowance(
+    #[cfg(not(feature = "recovery"))]
+    {
+        let _ = (
             recovery_percent,
             prefix,
             header_keys,
             resources,
             progress,
             output,
-            allowance,
         );
+        Err(Error::FeatureDisabled {
+            feature: "recovery",
+        })
     }
-    recovery_service_with_allowance(
-        recovery_percent,
-        prefix,
-        header_keys,
-        resources,
-        progress,
-        output,
-        &crate::codec::workspace::Allowance::default(),
-    )
+    #[cfg(feature = "recovery")]
+    {
+        if let Some(allowance) = &resources.execution {
+            return recovery_service_with_allowance(
+                recovery_percent,
+                prefix,
+                header_keys,
+                resources,
+                progress,
+                output,
+                allowance,
+            );
+        }
+        recovery_service_with_allowance(
+            recovery_percent,
+            prefix,
+            header_keys,
+            resources,
+            progress,
+            output,
+            &crate::codec::workspace::Allowance::default(),
+        )
+    }
 }
 
+#[cfg(feature = "recovery")]
 fn recovery_service_with_allowance<B: crate::codec::workspace::Budget>(
     recovery_percent: u64,
     prefix: &mut Spool,
@@ -2463,6 +2482,7 @@ mod emission_ledger_tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn recovery_emission_shares_ledger_in_resident_and_striped_modes() {
         let scratch = crate::scratch::case("recovery-emission-ledger");
         let data = vec![7; 131072];
@@ -2522,9 +2542,11 @@ mod emission_ledger_tests {
         }
     }
 
+    #[cfg(feature = "recovery")]
     struct CancelRecovery {
         cancelled: std::sync::atomic::AtomicBool,
     }
+    #[cfg(feature = "recovery")]
     impl crate::WriteProgress for CancelRecovery {
         fn report(&self, event: crate::WriteProgressEvent<'_>) {
             if matches!(

@@ -65,6 +65,7 @@ struct Observation {
 }
 
 impl ReadControl {
+    #[cfg(feature = "recovery")]
     pub(crate) fn cancellation(&self) -> Option<&ReadCancellation> {
         self.0.as_ref().map(|state| &state.token)
     }

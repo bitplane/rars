@@ -173,6 +173,7 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
     }
 
     /// Decode compressed recovery data into a charged buffer.
+    #[cfg(any(test, feature = "recovery"))]
     pub(super) fn decode_file_owned(
         &mut self,
         archive: &Archive,
@@ -224,12 +225,14 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
 }
 
 impl<'a> DecoderSession<'a, Allowance> {
+    #[cfg(any(test, feature = "recovery"))]
     pub(super) fn new(solid: bool) -> Self {
         Self::new_with_password(solid, None)
     }
     pub(super) fn new_with_password(solid: bool, password: Option<&'a [u8]>) -> Self {
         Self::with_allowance(solid, password, &Allowance::default())
     }
+    #[cfg(any(test, feature = "recovery"))]
     pub(super) fn decode_file_data(
         &mut self,
         archive: &Archive,

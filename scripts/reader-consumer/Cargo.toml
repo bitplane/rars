@@ -13,6 +13,7 @@ rars = { path = "../../crates/rars", default-features = false }
 [features]
 full = ["rars/default"]
 parallel = ["rars/parallel"]
+recovery = ["rars/recovery"]
 
 [profile.release]
 strip = true

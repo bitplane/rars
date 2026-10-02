@@ -98,6 +98,10 @@ pub enum Error {
         source: Box<Error>,
     },
     UnsupportedVersion(ArchiveVersion),
+    /// The requested implementation was omitted at compile time.
+    FeatureDisabled {
+        feature: &'static str,
+    },
     /// Skipping payload decoding would leave solid history unavailable.
     CannotSkipSolidMember,
     UnsupportedFeature {
@@ -250,6 +254,7 @@ impl std::fmt::Display for Error {
                 )
             }
             Self::UnsupportedVersion(version) => write!(f, "unsupported version: {version}"),
+            Self::FeatureDisabled { feature } => write!(f, "Cargo feature {feature} is disabled"),
             Self::CannotSkipSolidMember => write!(f, "cannot skip file data in a solid archive"),
             Self::UnsupportedFeature { version, feature } => {
                 write!(f, "feature {feature} is not supported by {version}")
@@ -422,7 +427,8 @@ impl Error {
             Self::UnsupportedSignature | Self::UnsupportedVersion(_) => {
                 ErrorKind::UnsupportedFormat
             }
-            Self::CannotSkipSolidMember
+            Self::FeatureDisabled { .. }
+            | Self::CannotSkipSolidMember
             | Self::UnsupportedFeature { .. }
             | Self::UnsupportedFamilyFeature { .. }
             | Self::UnsupportedCompression { .. }

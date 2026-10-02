@@ -300,6 +300,7 @@ impl FileHeader {
             .into_vec())
     }
 
+    #[cfg(feature = "recovery")]
     pub(super) fn decoded_recovery_data(
         &self,
         archive: &Archive,

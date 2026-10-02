@@ -829,38 +829,50 @@ impl Archive {
         writer: &mut dyn Write,
         options: crate::ArchiveReadOptions<'_>,
     ) -> Result<crate::RecoveryRepairReport> {
-        options.check_cancelled()?;
-        let password = options.password;
-        let control = crate::read_control::ReadControl::new(options.cancellation);
-        let recovery = self.recovery_service()?;
-        let recovery_data = recovery.decoded_recovery_data(self, password, &control)?;
-        let (available, expected) =
-            crate::recovery::rar5::inline_recovery_chunk_counts_with_control(
-                &recovery_data,
-                &control,
-            )?;
-        if available == expected || self.sfx_offset != 0 {
-            return self.repair_recovery_to_legacy(
-                writer,
-                &recovery_data,
-                available,
-                expected,
-                &control,
-            );
+        #[cfg(not(feature = "recovery"))]
+        {
+            let _ = (self, writer, options);
+            Err(Error::FeatureDisabled {
+                feature: "recovery",
+            })
         }
-        let bytes = self.read_range(0..self.source_len()?)?;
-        let options = crate::recovery::rar5::InlineRepairOptions {
-            password,
-            control: control.clone(),
-            record_range: Some(recovery.block.data_range.clone()),
-        };
-        let (data, report) =
-            crate::recovery::rar5::repair_inline_recovery_archive_with_report(&bytes, &options)?;
-        control.finish(control.write_all(writer, &data).map_err(Error::from))?;
-        control.check()?;
-        Ok(report)
+        #[cfg(feature = "recovery")]
+        {
+            options.check_cancelled()?;
+            let password = options.password;
+            let control = crate::read_control::ReadControl::new(options.cancellation);
+            let recovery = self.recovery_service()?;
+            let recovery_data = recovery.decoded_recovery_data(self, password, &control)?;
+            let (available, expected) =
+                crate::recovery::rar5::inline_recovery_chunk_counts_with_control(
+                    &recovery_data,
+                    &control,
+                )?;
+            if available == expected || self.sfx_offset != 0 {
+                return self.repair_recovery_to_legacy(
+                    writer,
+                    &recovery_data,
+                    available,
+                    expected,
+                    &control,
+                );
+            }
+            let bytes = self.read_range(0..self.source_len()?)?;
+            let options = crate::recovery::rar5::InlineRepairOptions {
+                password,
+                control: control.clone(),
+                record_range: Some(recovery.block.data_range.clone()),
+            };
+            let (data, report) = crate::recovery::rar5::repair_inline_recovery_archive_with_report(
+                &bytes, &options,
+            )?;
+            control.finish(control.write_all(writer, &data).map_err(Error::from))?;
+            control.check()?;
+            Ok(report)
+        }
     }
 
+    #[cfg(feature = "recovery")]
     fn recovery_service(&self) -> Result<&FileHeader> {
         self.services()
             .find(|service| matches!(service.recovery_record(), Ok(Some(_))))
@@ -869,6 +881,7 @@ impl Archive {
             ))
     }
 
+    #[cfg(feature = "recovery")]
     fn repair_recovery_to_legacy(
         &self,
         writer: &mut dyn Write,
@@ -932,6 +945,7 @@ impl Archive {
             expected_recovery_shards: Some(expected),
         })
     }
+    #[cfg(feature = "recovery")]
     fn copy_repair_range(
         &self,
         range: Range<usize>,
@@ -1101,80 +1115,91 @@ pub fn repair_rev5_volumes_to<F>(
 where
     F: FnMut(usize, &[u8]) -> Result<()>,
 {
-    let first = recovery_volumes.first().ok_or(Error::InvalidHeader(
-        "RAR 5 REV recovery volume set is empty",
-    ))?;
-    let data_count = usize::from(first.data_count);
-    if data_volumes.len() != data_count {
-        return Err(Error::InvalidHeader(
-            "RAR 5 REV data volume count does not match metadata",
-        ));
-    }
-    if recovery_volumes.iter().any(|rev| {
-        rev.version != first.version
-            || rev.data_count != first.data_count
-            || rev.recovery_count != first.recovery_count
-            || rev.data_volumes != first.data_volumes
-            || rev.payload.len() != first.payload.len()
-    }) {
-        return Err(Error::InvalidHeader(
-            "RAR 5 REV recovery volume metadata differs across files",
-        ));
-    }
-
-    let mut shards = Vec::with_capacity(data_count);
-    for (index, data) in data_volumes.iter().enumerate() {
-        let Some(data) = data else {
-            shards.push(None);
-            continue;
-        };
-        let meta = &first.data_volumes[index];
-        if data.len() as u64 != meta.file_size || crc32(data) != meta.crc32 {
-            shards.push(None);
-        } else {
-            shards.push(Some(*data));
-        }
-    }
-
-    let recovery_rows: Vec<_> = recovery_volumes
-        .iter()
-        .map(|rev| {
-            let row = usize::from(rev.recovery_number)
-                .checked_sub(data_count)
-                .ok_or(Error::InvalidHeader("RAR 5 REV recovery number is invalid"))?;
-            Ok((row, rev.payload.as_slice()))
-        })
-        .collect::<Result<_>>()?;
-    let mut seen_recovery_rows = std::collections::HashSet::with_capacity(recovery_rows.len());
-    if recovery_rows
-        .iter()
-        .any(|(row, _)| !seen_recovery_rows.insert(*row))
+    #[cfg(not(feature = "recovery"))]
     {
-        return Err(Error::InvalidHeader(
-            "RAR 5 REV recovery volume set contains duplicate recovery rows",
-        ));
+        let _ = (data_volumes, recovery_volumes, &mut write);
+        Err(Error::FeatureDisabled {
+            feature: "recovery",
+        })
     }
-    let repaired = crate::recovery::rar5::reconstruct_data_shards(&shards, &recovery_rows)?;
-
-    for (index, (mut shard, meta)) in repaired.into_iter().zip(&first.data_volumes).enumerate() {
-        let file_size = usize::try_from(meta.file_size)
-            .map_err(|_| Error::InvalidHeader("RAR 5 REV data volume size overflows usize"))?;
-        if shard.len() < file_size {
+    #[cfg(feature = "recovery")]
+    {
+        let first = recovery_volumes.first().ok_or(Error::InvalidHeader(
+            "RAR 5 REV recovery volume set is empty",
+        ))?;
+        let data_count = usize::from(first.data_count);
+        if data_volumes.len() != data_count {
             return Err(Error::InvalidHeader(
-                "RAR 5 REV repaired shard is shorter than data volume size",
+                "RAR 5 REV data volume count does not match metadata",
             ));
         }
-        shard.truncate(file_size);
-        let actual = crc32(&shard);
-        if actual != meta.crc32 {
-            return Err(Error::Crc32Mismatch {
-                expected: meta.crc32,
-                actual,
-            });
+        if recovery_volumes.iter().any(|rev| {
+            rev.version != first.version
+                || rev.data_count != first.data_count
+                || rev.recovery_count != first.recovery_count
+                || rev.data_volumes != first.data_volumes
+                || rev.payload.len() != first.payload.len()
+        }) {
+            return Err(Error::InvalidHeader(
+                "RAR 5 REV recovery volume metadata differs across files",
+            ));
         }
-        write(index, &shard)?;
+
+        let mut shards = Vec::with_capacity(data_count);
+        for (index, data) in data_volumes.iter().enumerate() {
+            let Some(data) = data else {
+                shards.push(None);
+                continue;
+            };
+            let meta = &first.data_volumes[index];
+            if data.len() as u64 != meta.file_size || crc32(data) != meta.crc32 {
+                shards.push(None);
+            } else {
+                shards.push(Some(*data));
+            }
+        }
+
+        let recovery_rows: Vec<_> = recovery_volumes
+            .iter()
+            .map(|rev| {
+                let row = usize::from(rev.recovery_number)
+                    .checked_sub(data_count)
+                    .ok_or(Error::InvalidHeader("RAR 5 REV recovery number is invalid"))?;
+                Ok((row, rev.payload.as_slice()))
+            })
+            .collect::<Result<_>>()?;
+        let mut seen_recovery_rows = std::collections::HashSet::with_capacity(recovery_rows.len());
+        if recovery_rows
+            .iter()
+            .any(|(row, _)| !seen_recovery_rows.insert(*row))
+        {
+            return Err(Error::InvalidHeader(
+                "RAR 5 REV recovery volume set contains duplicate recovery rows",
+            ));
+        }
+        let repaired = crate::recovery::rar5::reconstruct_data_shards(&shards, &recovery_rows)?;
+
+        for (index, (mut shard, meta)) in repaired.into_iter().zip(&first.data_volumes).enumerate()
+        {
+            let file_size = usize::try_from(meta.file_size)
+                .map_err(|_| Error::InvalidHeader("RAR 5 REV data volume size overflows usize"))?;
+            if shard.len() < file_size {
+                return Err(Error::InvalidHeader(
+                    "RAR 5 REV repaired shard is shorter than data volume size",
+                ));
+            }
+            shard.truncate(file_size);
+            let actual = crc32(&shard);
+            if actual != meta.crc32 {
+                return Err(Error::Crc32Mismatch {
+                    expected: meta.crc32,
+                    actual,
+                });
+            }
+            write(index, &shard)?;
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 pub fn repair_inline_recovery_bytes(input: &[u8]) -> Result<Vec<u8>> {
@@ -1191,24 +1216,36 @@ pub fn repair_inline_recovery_bytes_with_options(
     input: &[u8],
     options: crate::ArchiveReadOptions<'_>,
 ) -> Result<crate::RecoveryRepairResult> {
-    options.check_cancelled()?;
-    if !input.starts_with(RAR50_SIGNATURE) {
-        return Err(Error::UnsupportedSignature);
+    #[cfg(not(feature = "recovery"))]
+    {
+        let _ = (input, options);
+        Err(Error::FeatureDisabled {
+            feature: "recovery",
+        })
     }
-    let repair_options = crate::recovery::rar5::InlineRepairOptions {
-        password: options.password,
-        control: crate::read_control::ReadControl::new(options.cancellation),
-        ..Default::default()
-    };
-    let (repaired, report) =
-        crate::recovery::rar5::repair_inline_recovery_archive_with_report(input, &repair_options)
-            .map_err(Error::from)?;
-    let parse_target = if repaired == input { input } else { &repaired };
-    let _ = Archive::parse_with_options(parse_target, options)?;
-    Ok(crate::RecoveryRepairResult {
-        data: repaired,
-        report,
-    })
+    #[cfg(feature = "recovery")]
+    {
+        options.check_cancelled()?;
+        if !input.starts_with(RAR50_SIGNATURE) {
+            return Err(Error::UnsupportedSignature);
+        }
+        let repair_options = crate::recovery::rar5::InlineRepairOptions {
+            password: options.password,
+            control: crate::read_control::ReadControl::new(options.cancellation),
+            ..Default::default()
+        };
+        let (repaired, report) = crate::recovery::rar5::repair_inline_recovery_archive_with_report(
+            input,
+            &repair_options,
+        )
+        .map_err(Error::from)?;
+        let parse_target = if repaired == input { input } else { &repaired };
+        let _ = Archive::parse_with_options(parse_target, options)?;
+        Ok(crate::RecoveryRepairResult {
+            data: repaired,
+            report,
+        })
+    }
 }
 
 /// Frames a replacement end-of-archive header for an archive that lost its
@@ -1220,6 +1257,7 @@ pub fn repair_inline_recovery_bytes_with_options(
 /// are the ones the caller is about to write. A volume that splits cleanly on
 /// an entry boundary is indistinguishable from a final one and loses the flag;
 /// unrar and WinRAR both walk such a set from the main header anyway.
+#[cfg(feature = "recovery")]
 pub(crate) fn recovery_end_header(
     input: &[u8],
     options: crate::ArchiveReadOptions<'_>,
@@ -1265,6 +1303,7 @@ pub(crate) fn recovery_end_header(
     .map(|bytes| bytes.to_vec())
 }
 
+#[cfg(feature = "recovery")]
 fn recovery_end_parse_error(error: Error) -> Result<u64> {
     if error.kind() == crate::ErrorKind::Cancelled {
         Err(error)
@@ -2865,6 +2904,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn recovery_entry_points_preserve_missing_record_and_precancellation() {
         let archive = build_archive_with_optional_comment(None);
         assert!(matches!(
@@ -2902,6 +2942,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn recovery_end_header_preserves_split_volume_continuation() {
         let first = include_bytes!("../tests/fixtures/rar50/multivol.part1.rar");
         let last = include_bytes!("../tests/fixtures/rar50/multivol.part3.rar");
@@ -2932,6 +2973,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn recovery_end_header_keeps_parse_cancellation_distinct() {
         assert!(matches!(
             recovery_end_parse_error(Error::Cancelled),
@@ -2941,6 +2983,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn recovery_end_header_requires_keys_for_encrypted_archive() {
         let bytes = include_bytes!("../tests/fixtures/rar50/header_encrypted.rar");
         assert!(matches!(

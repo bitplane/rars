@@ -20,8 +20,9 @@ all-features = true
 
 [features]
 # Feature boundaries are introduced incrementally without changing defaults.
-default = ["parallel"]
+default = ["parallel", "recovery"]
 parallel = ["dep:rayon"]
+recovery = []
 
 [dependencies]
 aes.workspace = true

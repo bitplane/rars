@@ -948,6 +948,11 @@ fn validate_plan(options: WriterOptions, shape: PlanShape) -> Result<()> {
 }
 
 fn validate_recovery_percent(percent: u64) -> Result<()> {
+    if !cfg!(feature = "recovery") {
+        return Err(Error::FeatureDisabled {
+            feature: "recovery",
+        });
+    }
     if !(1..=100).contains(&percent) {
         return Err(Error::InvalidArgument(
             "RAR 5 recovery percent must be in 1..=100",
@@ -1525,6 +1530,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn invalid_writer_inputs_and_internal_failures_have_distinct_categories() {
         for error in [
             super::validate_file_entry(b"").unwrap_err(),
@@ -1965,6 +1971,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn recovery_writer_reports_determinate_pass_progress() {
         let entry = entry(b"payload.bin", b"recovery progress payload")
             .with_attributes(0x20)

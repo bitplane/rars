@@ -984,6 +984,11 @@ impl Archive {
         &self,
         options: ArchiveReadOptions<'_>,
     ) -> Result<RecoveryRepairResult> {
+        if !cfg!(feature = "recovery") {
+            return Err(Error::FeatureDisabled {
+                feature: "recovery",
+            });
+        }
         options.check_cancelled()?;
         match self {
             Self::Rar15To40(archive) => archive.repair_protect_head_with_options(options),
@@ -1007,6 +1012,11 @@ impl Archive {
         writer: &mut dyn Write,
         password: Option<&[u8]>,
     ) -> Result<RecoveryRepairReport> {
+        if !cfg!(feature = "recovery") {
+            return Err(Error::FeatureDisabled {
+                feature: "recovery",
+            });
+        }
         match self {
             Self::Rar15To40(archive) => {
                 let repaired = archive.repair_protect_head_with_report()?;
@@ -4072,6 +4082,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn direct_writer_creates_rar50_stored_archive_with_recovery_service() {
         let features = FeatureSet::store_only();
         let bytes = rar50::Rar50Writer::new(
@@ -4101,6 +4112,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn archive_facade_repairs_rar50_inline_recovery_damage() {
         let features = FeatureSet::store_only();
         let payload = b"facade rar5 repair payload\n".repeat(64);
@@ -4143,6 +4155,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn archive_facade_reports_rar13_family_for_unsupported_recovery_repair() {
         let bytes = rar13::write_stored_archive(
             &[rar13::StoredEntry {
@@ -4170,6 +4183,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn archive_facade_repairs_rar15_40_recovery_as_full_archive_bytes() {
         let bytes = std::fs::read(rar15_40_fixture("rar250_protect_head_rr5.rar")).unwrap();
         let mut damaged = bytes.clone();
@@ -4189,6 +4203,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn archive_facade_repairs_rar3_newsub_recovery_as_full_archive_bytes() {
         let bytes = std::fs::read(rar15_40_fixture("rar300/with_recovery_rar300.rar")).unwrap();
         let mut damaged = bytes.clone();
@@ -4208,6 +4223,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn direct_writer_creates_rar50_compressed_archive_with_recovery_service() {
         let features = FeatureSet::store_only();
         let payload = b"facade rar5 compressed recovery payload repeated repeated\n".repeat(8);
@@ -4824,6 +4840,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn direct_writer_creates_rar50_encrypted_stored_archive_with_recovery() {
         let features = FeatureSet::store_only();
         let bytes = rar50::Rar50Writer::new(
@@ -4867,6 +4884,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn direct_writer_creates_rar50_encrypted_compressed_archive_with_recovery() {
         let features = FeatureSet::store_only();
         let payload = b"facade rar5 encrypted compressed recovery payload repeated\n".repeat(8);
@@ -4900,6 +4918,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn direct_writer_creates_rar50_header_encrypted_stored_archive_with_recovery() {
         let mut features = FeatureSet::store_only();
         features.header_encryption = true;
@@ -4949,6 +4968,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn direct_writer_creates_rar50_header_encrypted_compressed_archive_with_recovery() {
         let mut features = FeatureSet::store_only();
         features.header_encryption = true;
@@ -5472,6 +5492,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn archive_facade_repair_recovery_returns_full_repaired_archive_bytes() {
         let bytes = std::fs::read(rar15_40_fixture("rar250_protect_head_rr5.rar")).unwrap();
         let mut damaged = bytes.clone();
@@ -5483,6 +5504,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn archive_facade_repair_recovery_rejects_rar13_archives() {
         let bytes = rar13::write_stored_archive(
             &[rar13::StoredEntry {

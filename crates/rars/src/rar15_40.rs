@@ -627,7 +627,8 @@ impl FileHeader {
             return error;
         }
         match error {
-            Error::NeedPassword
+            Error::FeatureDisabled { .. }
+            | Error::NeedPassword
             | Error::UnsupportedSignature
             | Error::UnsupportedVersion(_)
             | Error::UnsupportedFeature { .. }
@@ -1388,6 +1389,7 @@ impl Archive {
         })
     }
 
+    #[cfg(feature = "recovery")]
     fn source_bytes(&self) -> Result<Vec<u8>> {
         self.source.bytes()
     }
@@ -1406,34 +1408,49 @@ impl Archive {
         &self,
         options: crate::ArchiveReadOptions<'_>,
     ) -> Result<crate::RecoveryRepairResult> {
-        options.check_cancelled()?;
-        let control = crate::read_control::ReadControl::new(options.cancellation);
-        let (data, data_repaired) = if let Some(recovery) = self
-            .new_subs()
-            .find(|sub| sub.kind == NewSubKind::RecoveryRecord)
+        #[cfg(not(feature = "recovery"))]
         {
-            repair_newsub_recovery_bytes(
-                &self.source_bytes()?,
-                self.sfx_offset,
-                self,
-                recovery,
-                &control,
-            )?
-        } else {
-            let protect = self.protect_records().next().ok_or(Error::InvalidHeader(
-                "RAR 2.x archive does not contain a PROTECT_HEAD recovery record",
-            ))?;
-            repair_protect_head_bytes(&self.source_bytes()?, self.sfx_offset, protect, &control)?
-        };
-        control.check()?;
-        Ok(crate::RecoveryRepairResult {
-            data,
-            report: crate::RecoveryRepairReport {
-                changed: data_repaired,
-                data_repaired,
-                ..Default::default()
-            },
-        })
+            let _ = (self, options);
+            Err(Error::FeatureDisabled {
+                feature: "recovery",
+            })
+        }
+        #[cfg(feature = "recovery")]
+        {
+            options.check_cancelled()?;
+            let control = crate::read_control::ReadControl::new(options.cancellation);
+            let (data, data_repaired) = if let Some(recovery) = self
+                .new_subs()
+                .find(|sub| sub.kind == NewSubKind::RecoveryRecord)
+            {
+                repair_newsub_recovery_bytes(
+                    &self.source_bytes()?,
+                    self.sfx_offset,
+                    self,
+                    recovery,
+                    &control,
+                )?
+            } else {
+                let protect = self.protect_records().next().ok_or(Error::InvalidHeader(
+                    "RAR 2.x archive does not contain a PROTECT_HEAD recovery record",
+                ))?;
+                repair_protect_head_bytes(
+                    &self.source_bytes()?,
+                    self.sfx_offset,
+                    protect,
+                    &control,
+                )?
+            };
+            control.check()?;
+            Ok(crate::RecoveryRepairResult {
+                data,
+                report: crate::RecoveryRepairReport {
+                    changed: data_repaired,
+                    data_repaired,
+                    ..Default::default()
+                },
+            })
+        }
     }
 
     /// Streams extracted entries to caller-provided writers.
@@ -1919,6 +1936,7 @@ fn parse_protect_header(
 }
 
 /// Repaired bytes plus whether any sector was actually rebuilt.
+#[cfg(feature = "recovery")]
 fn repair_protect_head_bytes(
     source: &[u8],
     sfx_offset: usize,
@@ -2037,6 +2055,7 @@ fn repair_protect_head_bytes(
 }
 
 /// Repaired bytes plus whether any sector was actually rebuilt.
+#[cfg(feature = "recovery")]
 fn repair_newsub_recovery_bytes(
     source: &[u8],
     sfx_offset: usize,
@@ -2147,6 +2166,7 @@ fn repair_newsub_recovery_bytes(
     Ok((repaired, true))
 }
 
+#[cfg(feature = "recovery")]
 fn newsub_recovery_data(
     archive: &Archive,
     recovery: &NewSubHeader,
@@ -2171,6 +2191,7 @@ fn newsub_recovery_data(
     control.finish(session.decode_file_data(archive, &recovery.file))
 }
 
+#[cfg(feature = "recovery")]
 fn protected_sector(
     source: &[u8],
     protected_start: usize,
@@ -2197,21 +2218,32 @@ pub fn repair_rev3_volumes_to<F>(
 where
     F: FnMut(usize, &[u8]) -> Result<()>,
 {
-    for (index, bytes) in crate::recovery::rar3::reconstruct_data_volumes(
-        data_volumes,
-        recovery_count,
-        recovery_volumes,
-    )
-    .map_err(Error::from)?
-    .into_iter()
-    .enumerate()
+    #[cfg(not(feature = "recovery"))]
     {
-        let bytes = truncate_repaired_rev3_volume(bytes);
-        write(index, &bytes)?;
+        let _ = (data_volumes, recovery_volumes, recovery_count, &mut write);
+        Err(Error::FeatureDisabled {
+            feature: "recovery",
+        })
     }
-    Ok(())
+    #[cfg(feature = "recovery")]
+    {
+        for (index, bytes) in crate::recovery::rar3::reconstruct_data_volumes(
+            data_volumes,
+            recovery_count,
+            recovery_volumes,
+        )
+        .map_err(Error::from)?
+        .into_iter()
+        .enumerate()
+        {
+            let bytes = truncate_repaired_rev3_volume(bytes);
+            write(index, &bytes)?;
+        }
+        Ok(())
+    }
 }
 
+#[cfg(feature = "recovery")]
 fn truncate_repaired_rev3_volume(mut bytes: Vec<u8>) -> Vec<u8> {
     let Ok(archive) = Archive::parse(&bytes) else {
         return bytes;
@@ -3007,6 +3039,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn recovery_source_failures_are_preserved_after_successful_parsing() {
         use std::sync::atomic::{AtomicBool, Ordering};
         struct FailingSource {
@@ -3110,6 +3143,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn rev3_repair_preserves_reconstruction_and_publication_failures() {
         let mut calls = 0;
         let error = repair_rev3_volumes_to(&[], 1, &[(0, b"data")], |_, _| {
@@ -3446,6 +3480,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn edited_public_recovery_ranges_keep_typed_refusals() {
         let old = Archive::parse(include_bytes!(
             "../tests/fixtures/rar15_40/rar250_protect_head_rr1.rar"
@@ -4797,6 +4832,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn repaired_legacy_volume_keeps_missing_end_block_and_nonzero_trailer() {
         let mut bytes = stored_archive_bytes(b"entry", b"payload");
         let end_start = bytes.len();
