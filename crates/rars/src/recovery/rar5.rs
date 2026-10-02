@@ -2834,6 +2834,19 @@ mod tests {
             ),
             Err(Error::PlanOverflow)
         );
+        let allowance = super::Allowance::limited(2 * 1048576);
+        assert_eq!(
+            super::choose_recovery_capacity_mode(
+                InlineRecoveryPlan {
+                    recovery_shards: u64::MAX,
+                    group_count: 2,
+                    ..plan
+                },
+                u64::MAX,
+                &allowance,
+            ),
+            Err(Error::PlanOverflow)
+        );
     }
 
     #[test]
@@ -4002,6 +4015,10 @@ mod tests {
         );
         assert_eq!(
             reconstruct_data_shards(&[None], &[(usize::MAX, &[1, 2])]),
+            Err(Error::TooManyShards)
+        );
+        assert_eq!(
+            reconstruct_data_shards(&[None], &[(super::FIELD_SIZE - 1, &[1, 2])]),
             Err(Error::TooManyShards)
         );
         assert_eq!(
