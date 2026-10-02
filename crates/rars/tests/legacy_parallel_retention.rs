@@ -1,4 +1,7 @@
-#![cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#![cfg(all(
+    feature = "parallel",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
 
 use rars::{rar15_40, ArchiveReadOptions, ArchiveVersion, Builder, Error};
 use std::io::{self, Write};

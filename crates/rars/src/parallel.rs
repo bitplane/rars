@@ -1,17 +1,27 @@
 //! Fan-out helpers, and the one place that knows whether there is anything to
 //! fan out to.
 //!
-//! Bare WebAssembly has no threads: `wasm32-unknown-unknown` has no way to
+//! Without the `parallel` feature these helpers run sequentially.
+//! Bare WebAssembly also has no threads: `wasm32-unknown-unknown` has no way to
 //! start one, so rayon's pool panics the first time it is touched rather than
-//! degrading. The `wasm` module below is the same three functions done in
+//! degrading. The `sequential` module below is the same three functions done in
 //! sequence, and rayon is not compiled in at all for that target.
 
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[cfg(any(
+    not(feature = "parallel"),
+    all(target_arch = "wasm32", target_os = "unknown")
+))]
+pub(crate) use sequential::*;
+#[cfg(all(
+    feature = "parallel",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
 pub(crate) use threaded::*;
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-pub(crate) use wasm::*;
 
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[cfg(all(
+    feature = "parallel",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
 mod threaded {
     use rayon::prelude::*;
 
@@ -78,8 +88,12 @@ mod threaded {
     }
 }
 
-#[cfg(any(test, all(target_arch = "wasm32", target_os = "unknown")))]
-mod wasm {
+#[cfg(any(
+    test,
+    not(feature = "parallel"),
+    all(target_arch = "wasm32", target_os = "unknown")
+))]
+mod sequential {
     /// Process preallocated slots without allocating a separate result vector.
     /// Returns only after every admitted callback has finished.
     pub(crate) fn for_each_mut<T, F>(items: &mut [T], apply: F)
@@ -136,21 +150,21 @@ mod wasm {
 
 #[cfg(test)]
 mod tests {
-    use super::wasm;
+    use super::sequential;
 
     #[test]
     fn sequential_slots_and_collect_keep_order_and_stop_on_error() {
         let mut slots = [7, 7, 7];
-        wasm::for_each_mut(&mut slots, |index, slot| *slot += index);
+        sequential::for_each_mut(&mut slots, |index, slot| *slot += index);
         assert_eq!(slots, [7, 8, 9]);
-        wasm::for_each_mut::<usize, _>(&mut [], |_, _| panic!("empty callback"));
-        let mapped: Result<Vec<_>, ()> = wasm::map_collect(vec![3, 1, 2], |x| Ok(x * 2));
+        sequential::for_each_mut::<usize, _>(&mut [], |_, _| panic!("empty callback"));
+        let mapped: Result<Vec<_>, ()> = sequential::map_collect(vec![3, 1, 2], |x| Ok(x * 2));
         assert_eq!(mapped, Ok(vec![6, 2, 4]));
         let empty: Result<Vec<usize>, ()> =
-            wasm::map_collect(Vec::<usize>::new(), |_| panic!("empty map"));
+            sequential::map_collect(Vec::<usize>::new(), |_| panic!("empty map"));
         assert_eq!(empty, Ok(vec![]));
         let visited = std::sync::Mutex::new(Vec::new());
-        let mapped = wasm::map_collect(vec![3, 1, 2], |x| {
+        let mapped = sequential::map_collect(vec![3, 1, 2], |x| {
             visited.lock().unwrap().push(x);
             if x == 1 {
                 Err(11)
@@ -160,8 +174,8 @@ mod tests {
         });
         assert_eq!(mapped, Err(11));
         assert_eq!(*visited.lock().unwrap(), [3, 1]);
-        assert_eq!(wasm::default_window(), 1);
-        assert_eq!(wasm::threads(), 1);
+        assert_eq!(sequential::default_window(), 1);
+        assert_eq!(sequential::threads(), 1);
     }
 
     #[test]
@@ -169,7 +183,7 @@ mod tests {
         let input = [3, 1, 2];
         for window in [0, 1, 8] {
             let mut emitted = vec![];
-            let result: Result<(), ()> = wasm::map_slice_windowed(
+            let result: Result<(), ()> = sequential::map_slice_windowed(
                 &input,
                 window,
                 |x| Ok(x * 2),
@@ -182,7 +196,7 @@ mod tests {
             assert_eq!(emitted, [(3, 6), (1, 2), (2, 4)]);
         }
         let mut emitted = vec![];
-        let result = wasm::map_slice_windowed(
+        let result = sequential::map_slice_windowed(
             &input,
             2,
             |x| if *x == 1 { Err(11) } else { Ok(x * 2) },
@@ -195,7 +209,7 @@ mod tests {
         assert_eq!(emitted, [(3, 6)]);
         let mut emitted = vec![];
         let visited = std::sync::Mutex::new(Vec::new());
-        let result = wasm::map_slice_windowed(
+        let result = sequential::map_slice_windowed(
             &input,
             2,
             |x| {
@@ -214,7 +228,7 @@ mod tests {
         assert_eq!(result, Err(12));
         assert_eq!(emitted, [(3, 6), (1, 2)]);
         assert_eq!(*visited.lock().unwrap(), [3, 1]);
-        let empty: Result<(), ()> = wasm::map_slice_windowed::<usize, usize, _, _, _>(
+        let empty: Result<(), ()> = sequential::map_slice_windowed::<usize, usize, _, _, _>(
             &[],
             0,
             |_| panic!("empty map"),

@@ -20,7 +20,8 @@ all-features = true
 
 [features]
 # Feature boundaries are introduced incrementally without changing defaults.
-default = []
+default = ["parallel"]
+parallel = ["dep:rayon"]
 
 [dependencies]
 aes.workspace = true
@@ -35,7 +36,7 @@ zeroize.workspace = true
 # running sequentially. `parallel.rs` has a single-threaded path for that target
 # and rayon is left out of the build entirely.
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
-rayon.workspace = true
+rayon = { workspace = true, optional = true }
 
 # `getrandom` has no default entropy source on bare WebAssembly. RAR 5 header
 # encryption needs one, so point it at the host's `crypto.getRandomValues`. The
@@ -53,3 +54,4 @@ harness = false
 [[bench]]
 name = "parallel"
 harness = false
+required-features = ["parallel"]

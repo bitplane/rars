@@ -1233,7 +1233,10 @@ pub(super) fn compress_members_reporting(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
     #[test]
     fn stream_creation_failure_keeps_member_context_before_opening_source() {
         let scratch = crate::scratch::case("stream-creation-context");
@@ -1278,7 +1281,10 @@ mod tests {
         }
     }
 
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
     #[test]
     fn cancellation_after_wave_check_keeps_admission_error_context() {
         struct CancelAfterObservation(crate::WriteCancellation);
@@ -1443,7 +1449,10 @@ mod tests {
         drop(Records::<u8>::new(limit as usize, &resources).unwrap());
     }
 
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
     #[test]
     fn whole_member_cancellation_after_start_does_not_open_source() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -1495,7 +1504,10 @@ mod tests {
         }
     }
 
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
     #[test]
     fn whole_member_cancellation_between_waves_does_not_open_next_source() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -2062,7 +2074,10 @@ mod tests {
         }
     }
 
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
     #[test]
     fn streaming_ledger_covers_repeated_waves_and_retained_history() {
         use std::sync::atomic::AtomicU64;
@@ -2307,7 +2322,10 @@ mod tests {
         }
     }
 
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
     #[test]
     fn admitted_workers_share_one_ledger_without_racing_for_spare_capacity() {
         use crate::streaming::preparation::Bytes;
@@ -2370,7 +2388,10 @@ mod tests {
         }
     }
 
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
     #[test]
     fn whole_member_ledger_selects_fitting_waves_before_opening_sources() {
         use std::sync::{atomic::AtomicUsize, Arc, Barrier};
@@ -2479,7 +2500,10 @@ mod tests {
         }
     }
 
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
     #[test]
     fn failed_wave_skips_queued_sources_and_releases_successful_siblings() {
         use std::sync::atomic::AtomicUsize;
@@ -2531,7 +2555,10 @@ mod tests {
         );
     }
 
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
     #[test]
     fn sibling_failure_joins_running_work_and_keeps_the_original_error() {
         use std::sync::{atomic::AtomicUsize, Barrier};
@@ -2564,7 +2591,10 @@ mod tests {
         drop(Records::<u8>::new(65536, &resources).unwrap());
     }
 
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
     #[test]
     fn whole_member_allowance_precedes_source_open_and_survives_until_spooling() {
         use std::sync::{atomic::AtomicUsize, Arc};
@@ -2686,7 +2716,10 @@ mod tests {
         assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
     }
 
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
     #[test]
     fn whole_member_sources_open_only_after_combined_admission() {
         use std::sync::{atomic::AtomicUsize, Arc};
@@ -3081,7 +3114,10 @@ mod tests {
         larger.encode_options.max_match_distance *= 2;
         assert_eq!(whole_member_workspace(size as u64, &larger), required);
     }
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
     #[test]
     fn whole_members_use_multiple_workers_without_changing_bytes() {
         use std::collections::HashSet;
