@@ -239,24 +239,22 @@ impl FileRedirection {
         if !self.is_supported() {
             return false;
         }
-        match self.redirection_type {
-            1 => host == 1 && attr & !0o7777 == 0o120000 && !directory,
-            2 | 3 => {
-                host == 0
-                    && attr & 0x400 != 0
-                    && (attr & 0x10 != 0) == directory
-                    && (self.redirection_type != 3 || self.flags == 1)
-                    && directory == (self.flags & 1 != 0)
-            }
-            4 | 5 => {
-                !directory
-                    && match host {
-                        0 => attr & (0x400 | 0x10) == 0,
-                        1 => attr & !0o7777 == 0o100000,
-                        _ => false,
-                    }
-            }
-            _ => false,
+        if self.redirection_type == 1 {
+            host == 1 && attr & !0o7777 == 0o120000 && !directory
+        } else if self.redirection_type <= 3 {
+            host == 0
+                && attr & 0x400 != 0
+                && (attr & 0x10 != 0) == directory
+                && (self.redirection_type != 3 || self.flags == 1)
+                && directory == (self.flags & 1 != 0)
+        } else {
+            // is_supported admitted only kinds 1..=5 above.
+            !directory
+                && match host {
+                    0 => attr & (0x400 | 0x10) == 0,
+                    1 => attr & !0o7777 == 0o100000,
+                    _ => false,
+                }
         }
     }
 
@@ -2701,6 +2699,7 @@ mod tests {
             (1, 0, b"", false),
             (1, 0, b"a\0b", false),
             (1, 0, b"\xff", false),
+            (6, 0, b"target", false),
         ] {
             assert_eq!(
                 FileRedirection {
@@ -2711,6 +2710,21 @@ mod tests {
                 .is_supported(),
                 supported
             );
+        }
+        for (kind, flags, host, attr, directory, expected) in [
+            (1, 0, 1, 0o120777, false, true),
+            (2, 0, 0, 0x400, false, true),
+            (3, 1, 0, 0x410, true, true),
+            (4, 0, 0, 0, false, true),
+            (5, 0, 1, 0o100644, false, true),
+            (6, 0, 1, 0o120777, false, false),
+        ] {
+            let link = FileRedirection {
+                redirection_type: kind,
+                flags,
+                target_name: b"target".to_vec(),
+            };
+            assert_eq!(link.supports_header(host, attr, directory), expected);
         }
         let mut archive = build_archive_with_optional_comment(None);
         assert!(!archive.main.is_locked());
@@ -3440,6 +3454,23 @@ mod tests {
             matches!(parse_file_redirection_record(&input, 0..input.len()),
             Err(Error::InvalidHeader(message)) if message == expected)
         );
+    }
+
+    #[test]
+    fn oversized_extra_record_length_keeps_preceding_metadata() {
+        let mut extra = vec![2, MHEXTRA_LOCATOR as u8, 0];
+        // A valid vint can declare more bytes than a 32-bit process can
+        // address; on 64-bit the physical record still cannot contain them.
+        extra.extend_from_slice(&[0xff; 9]);
+        extra.push(1);
+        let (records, complete) = parse_main_extra_area(
+            &extra,
+            0..extra.len(),
+            &crate::read_control::ReadControl::default(),
+        )
+        .unwrap();
+        assert!(!complete);
+        assert!(matches!(records.as_slice(), [MainExtraRecord::Locator(_)]));
     }
 
     #[test]
