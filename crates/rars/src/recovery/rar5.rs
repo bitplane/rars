@@ -1508,8 +1508,9 @@ fn parse_inline_recovery_chunk_with_control(
     if input.len() < 0x48 || &input[..4] != b"{RB}" {
         return Err(Error::BadRecoveryChunk);
     }
-    let total_size = read_u32(input, 0x0c)? as u64;
-    let header_size = read_u32(input, 0x10)? as u64;
+    // The fixed 0x48-byte prefix is present, so all fixed fields fit.
+    let total_size = u32::from_le_bytes(input[0x0c..0x10].try_into().unwrap()) as u64;
+    let header_size = u32::from_le_bytes(input[0x10..0x14].try_into().unwrap()) as u64;
     if header_size < RAR5_RECOVERY_CHUNK_FIXED_HEADER_SIZE || header_size > total_size {
         return Err(Error::BadRecoveryChunk);
     }
@@ -1519,7 +1520,7 @@ fn parse_inline_recovery_chunk_with_control(
     if input.len() < total_size_usize {
         return Err(Error::BadRecoveryChunk);
     }
-    let expected_crc = read_u64(input, 0x04)?;
+    let expected_crc = u64::from_le_bytes(input[0x04..0x0c].try_into().unwrap());
     let actual_crc = !repair_crc(&input[0x0c..total_size_usize], CRC64_XZ_INIT, control)?;
     if actual_crc != expected_crc {
         return Err(Error::BadRecoveryChunk);
@@ -1528,12 +1529,12 @@ fn parse_inline_recovery_chunk_with_control(
         return Err(Error::BadRecoveryChunk);
     }
 
-    let protected_size = read_u64(input, 0x22)?;
-    let group_count = read_u64(input, 0x2a)?;
+    let protected_size = u64::from_le_bytes(input[0x22..0x2a].try_into().unwrap());
+    let group_count = u64::from_le_bytes(input[0x2a..0x32].try_into().unwrap());
     if !group_count.is_multiple_of(2) {
         return Err(Error::BadRecoveryChunk);
     }
-    let shard_size = read_u64(input, 0x32)?;
+    let shard_size = u64::from_le_bytes(input[0x32..0x3a].try_into().unwrap());
     let data_shards = u16::from_le_bytes(input[0x3a..0x3c].try_into().unwrap()) as u64;
     let recovery_shards = u16::from_le_bytes(input[0x3c..0x3e].try_into().unwrap()) as u64;
     if data_shards == 0 || recovery_shards == 0 || data_shards + recovery_shards > FIELD_SIZE as u64
@@ -1559,10 +1560,10 @@ fn parse_inline_recovery_chunk_with_control(
     let mut pos = 0x40;
     for _ in 0..data_shards {
         check_repair(control)?;
-        data_shard_states.push(read_u64(input, pos)?);
+        data_shard_states.push(u64::from_le_bytes(input[pos..pos + 8].try_into().unwrap()));
         pos += 8;
     }
-    let _final_state = read_u64(input, pos)?;
+    let _final_state = u64::from_le_bytes(input[pos..pos + 8].try_into().unwrap());
     let parity = input[header_size_usize..total_size_usize].to_vec();
     if parity.len() as u64 != group_count {
         return Err(Error::BadRecoveryChunk);
@@ -1736,22 +1737,6 @@ fn apply_inverse_matrix(gf: &Gf16, inverse: &[Vec<u16>], rhs: &[u16]) -> Result<
                 })
         })
         .collect())
-}
-
-fn read_u32(input: &[u8], offset: usize) -> Result<u32> {
-    input
-        .get(offset..offset + 4)
-        .and_then(|bytes| bytes.try_into().ok())
-        .map(u32::from_le_bytes)
-        .ok_or(Error::BadRecoveryChunk)
-}
-
-fn read_u64(input: &[u8], offset: usize) -> Result<u64> {
-    input
-        .get(offset..offset + 8)
-        .and_then(|bytes| bytes.try_into().ok())
-        .map(u64::from_le_bytes)
-        .ok_or(Error::BadRecoveryChunk)
 }
 
 #[derive(Debug, Clone)]
