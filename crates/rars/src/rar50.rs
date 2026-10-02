@@ -992,8 +992,9 @@ impl Rev5VolumeMeta {
         if input.len() < 16 {
             return Err(Error::TooShort);
         }
-        let header_crc = read_u32(input, 8)?;
-        let header_size = read_u32(input, 12)? as usize;
+        // The complete 16-byte REV prefix was admitted above.
+        let header_crc = u32::from_le_bytes([input[8], input[9], input[10], input[11]]);
+        let header_size = u32::from_le_bytes([input[12], input[13], input[14], input[15]]) as usize;
         if header_size <= 5 || header_size > 0x100000 {
             return Err(Error::InvalidHeader("RAR 5 REV header size is invalid"));
         }
@@ -1014,18 +1015,18 @@ impl Rev5VolumeMeta {
         if body.len() < 11 {
             return Err(Error::TooShort);
         }
-        let mut reader = SliceReader::new(body, 0, body.len());
-        let version = reader.read_byte()?;
+        // The complete fixed 11-byte REV prefix was admitted above.
+        let version = body[0];
         if version != 1 {
             return Err(Error::UnsupportedFeature {
                 version: crate::version::ArchiveVersion::Rar50,
                 feature: "RAR 5 REV version",
             });
         }
-        let data_count = reader.read_u16()?;
-        let recovery_count = reader.read_u16()?;
-        let recovery_number = reader.read_u16()?;
-        let payload_crc32 = reader.read_u32()?;
+        let data_count = u16::from_le_bytes([body[1], body[2]]);
+        let recovery_count = u16::from_le_bytes([body[3], body[4]]);
+        let recovery_number = u16::from_le_bytes([body[5], body[6]]);
+        let payload_crc32 = u32::from_le_bytes([body[7], body[8], body[9], body[10]]);
         let first_recovery_number = u32::from(data_count);
         let recovery_end = first_recovery_number + u32::from(recovery_count);
         let recovery_number = u32::from(recovery_number);
@@ -1044,9 +1045,13 @@ impl Rev5VolumeMeta {
             ));
         }
         let mut data_volumes = Vec::with_capacity(data_count as usize);
-        for _ in 0..data_count {
-            let file_size = reader.read_u64()?;
-            let crc = reader.read_u32()?;
+        for index in 0..usize::from(data_count) {
+            // The whole 12-byte metadata table was admitted above.
+            let entry = &body[11 + index * 12..11 + (index + 1) * 12];
+            let file_size = u64::from_le_bytes([
+                entry[0], entry[1], entry[2], entry[3], entry[4], entry[5], entry[6], entry[7],
+            ]);
+            let crc = u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]]);
             data_volumes.push(Rev5DataVolume {
                 file_size,
                 crc32: crc,
@@ -2216,16 +2221,6 @@ impl<'a> SliceReader<'a> {
         let (value, len) = read_vint_at(self.input, self.pos, self.end)?;
         self.pos += len;
         Ok(value)
-    }
-
-    fn read_byte(&mut self) -> Result<u8> {
-        let bytes = self.read_bytes(1)?;
-        Ok(bytes[0])
-    }
-
-    fn read_u16(&mut self) -> Result<u16> {
-        let bytes = self.read_bytes(2)?;
-        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
     }
 
     fn read_u32(&mut self) -> Result<u32> {
