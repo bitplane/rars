@@ -5884,6 +5884,23 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     }
 
     #[test]
+    fn public_encoders_handle_zero_match_distance_and_one_byte_blocks() {
+        let input = b"small RAR29 blocks";
+        let options = EncodeOptions::default()
+            .with_max_match_distance(0)
+            .with_block_size(1);
+        let packed = Unpack29Encoder::with_options(options)
+            .encode_member(input)
+            .unwrap();
+        assert_eq!(unpack29_decode(&packed, input.len()).unwrap(), input);
+
+        let packed = Unpack29Encoder::with_options(options)
+            .encode_member_with_filter(input, crate::FilterSpec::whole(crate::FilterKind::E8))
+            .unwrap();
+        assert_eq!(unpack29_decode(&packed, input.len()).unwrap(), input);
+    }
+
+    #[test]
     fn ppmd_match_finder_uses_the_declared_dictionary_past_one_megabyte() {
         let distance = MAX_ENCODER_MATCH_OFFSET + 4096;
         let phrase = b"RAR29 PPMd match beyond the old one-megabyte ceiling";
