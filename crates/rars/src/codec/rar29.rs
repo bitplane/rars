@@ -5773,6 +5773,24 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
             super::offset_slot_for_match(largest_offset + 1),
             Err(Error::InvalidData("RAR 2.9 match offset is too large"))
         );
+        let state = EncoderMatchState::default();
+        for (length, offset, message) in [
+            (0, 0x40000, "RAR 2.9 adjusted match length underflows"),
+            (4, 0, "RAR 2.9 match offset is zero"),
+            (5, largest_offset + 1, "RAR 2.9 match offset is too large"),
+        ] {
+            assert_eq!(
+                state.encode_match(length, offset),
+                Err(Error::InvalidData(message))
+            );
+            assert_eq!(
+                super::estimated_match_cost(&state, length, offset),
+                Err(Error::InvalidData(message))
+            );
+            let mut candidate = None;
+            super::consider_match_candidate(&mut candidate, &state, length, offset);
+            assert_eq!(candidate, None);
+        }
     }
 
     #[test]
