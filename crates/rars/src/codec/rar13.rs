@@ -11,12 +11,15 @@ use std::io::{Read, Write};
 /// position in the member, forcing every query to pointer-chase past all
 /// not-yet-reached positions.
 #[derive(Debug, Clone)]
+#[cfg(feature = "write")]
 struct Rar13MatchFinder {
     buckets: Vec<Vec<usize>>,
 }
 
+#[cfg(feature = "write")]
 const LONG_LZ_HASH_BITS: u32 = 16;
 
+#[cfg(feature = "write")]
 impl Rar13MatchFinder {
     fn build(input: &[u8]) -> Self {
         let mut buckets = vec![Vec::new(); 1 << LONG_LZ_HASH_BITS];
@@ -42,7 +45,9 @@ impl Rar13MatchFinder {
     }
 }
 
+#[cfg(feature = "write")]
 const MAX_LONG_MATCH_CANDIDATES: usize = 64;
+#[cfg(feature = "write")]
 const MAX_LONG_LZ_DISTANCE: usize = 0x7fff;
 
 const DEC_L1: &[u16] = &[
@@ -79,10 +84,12 @@ const SHORT_XOR2: [u8; 15] = [
     0x00, 0x40, 0x60, 0xa0, 0xd0, 0xe0, 0xf0, 0xf8, 0xfc, 0xc0, 0x80, 0x90, 0x98, 0x9c, 0xb0,
 ];
 
+#[cfg(feature = "write")]
 pub fn unpack15_encode(input: &[u8]) -> Result<Vec<u8>> {
     unpack15_encode_with_options(input, EncodeOptions::default())
 }
 
+#[cfg(feature = "write")]
 pub fn unpack15_encode_with_options(input: &[u8], options: EncodeOptions) -> Result<Vec<u8>> {
     if input.is_empty() {
         return Ok(Vec::new());
@@ -92,7 +99,7 @@ pub fn unpack15_encode_with_options(input: &[u8], options: EncodeOptions) -> Res
     encoder.encode_member(input)
 }
 
-#[cfg(any(test, feature = "write"))]
+#[cfg(feature = "write")]
 pub(crate) fn unpack15_encode_with_options_and_progress(
     input: &[u8],
     options: EncodeOptions,
@@ -109,6 +116,7 @@ pub fn unpack15_decode(input: &[u8], output_size: usize) -> Result<Vec<u8>> {
     decoder.decode_member(input, output_size, false)
 }
 
+#[cfg(feature = "write")]
 pub struct Unpack15Encoder {
     bits: BitWriter,
     options: EncodeOptions,
@@ -135,11 +143,12 @@ pub struct Unpack15Encoder {
     last_dist: u32,
     last_length: u32,
     l_count: u32,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "write"))]
     stmode_literal_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "write")]
 pub struct EncodeOptions {
     old_distance_tokens: bool,
     lazy_matching: bool,
@@ -147,6 +156,7 @@ pub struct EncodeOptions {
     max_long_match_distance: usize,
 }
 
+#[cfg(feature = "write")]
 impl EncodeOptions {
     pub const fn new() -> Self {
         Self {
@@ -187,12 +197,14 @@ impl EncodeOptions {
     }
 }
 
+#[cfg(feature = "write")]
 impl Default for EncodeOptions {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "write")]
 impl Unpack15Encoder {
     pub fn new() -> Self {
         Self::with_options(EncodeOptions::default())
@@ -223,7 +235,7 @@ impl Unpack15Encoder {
             last_dist: u32::MAX,
             last_length: 0,
             l_count: 0,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "write"))]
             stmode_literal_count: 0,
         };
         encoder.init_huff();
@@ -422,7 +434,7 @@ impl Unpack15Encoder {
             last_dist: self.last_dist,
             last_length: self.last_length,
             l_count: self.l_count,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "write"))]
             stmode_literal_count: self.stmode_literal_count,
         }
     }
@@ -570,7 +582,7 @@ impl Unpack15Encoder {
             .iter()
             .position(|&value| (value >> 8) as u8 == byte)
             .expect("literal alphabet contains every byte");
-        #[cfg(test)]
+        #[cfg(all(test, feature = "write"))]
         {
             self.stmode_literal_count += 1;
         }
@@ -935,6 +947,7 @@ impl Unpack15Encoder {
     }
 }
 
+#[cfg(feature = "write")]
 impl Default for Unpack15Encoder {
     fn default() -> Self {
         Self::new()
@@ -942,6 +955,7 @@ impl Default for Unpack15Encoder {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg(feature = "write")]
 struct LzPlanState {
     last_dist: u32,
     last_length: u32,
@@ -954,6 +968,7 @@ struct LzPlanState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "write")]
 enum EncodedToken {
     Literal(u8),
     ShortLz(ShortLz),
@@ -964,6 +979,7 @@ enum EncodedToken {
 
 /// Candidates from the match finder; literals take a separate planning path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "write")]
 enum MatchToken {
     ShortLz(ShortLz),
     RepeatLast(RepeatLastLz),
@@ -971,6 +987,7 @@ enum MatchToken {
     LongLz(LongLz),
 }
 
+#[cfg(feature = "write")]
 impl MatchToken {
     fn length(self) -> u32 {
         match self {
@@ -989,6 +1006,7 @@ impl MatchToken {
     }
 }
 
+#[cfg(feature = "write")]
 impl From<MatchToken> for EncodedToken {
     fn from(token: MatchToken) -> Self {
         match token {
@@ -1001,18 +1019,21 @@ impl From<MatchToken> for EncodedToken {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "write")]
 struct ShortLz {
     pub distance: u32,
     pub length: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "write")]
 struct RepeatLastLz {
     pub distance: u32,
     pub length: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "write")]
 struct OldDistLz {
     pub distance: u32,
     pub length: u32,
@@ -1020,11 +1041,13 @@ struct OldDistLz {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "write")]
 pub struct LongLz {
     pub distance: u32,
     pub length: u32,
 }
 
+#[cfg(feature = "write")]
 fn huff_flag_bits(prefer_huff_on_one: bool) -> &'static [bool] {
     if prefer_huff_on_one {
         &[true]
@@ -1033,6 +1056,7 @@ fn huff_flag_bits(prefer_huff_on_one: bool) -> &'static [bool] {
     }
 }
 
+#[cfg(feature = "write")]
 fn long_lz_flag_bits(prefer_long_lz_on_one: bool) -> &'static [bool] {
     if prefer_long_lz_on_one {
         &[true]
@@ -1050,12 +1074,14 @@ fn long_lz_flag_bits(prefer_long_lz_on_one: bool) -> &'static [bool] {
 /// the token's payload. Padding the byte out instead leaves a bit the decoder
 /// still reads as a flag, which desynchronises everything after it.
 #[derive(Clone, Copy)]
+#[cfg(feature = "write")]
 struct Straddle {
     token: EncodedToken,
     /// The flag bits that belong at the front of the next flags byte.
     rest: &'static [bool],
 }
 
+#[cfg(feature = "write")]
 fn split_flag(
     flags: &mut u8,
     flag_bits: usize,
@@ -1070,6 +1096,7 @@ fn split_flag(
     }
 }
 
+#[cfg(feature = "write")]
 fn write_planned_flag_bits(flags: &mut u8, start: usize, bits: &[bool]) {
     for (offset, &bit) in bits.iter().enumerate() {
         if bit {
@@ -1078,10 +1105,12 @@ fn write_planned_flag_bits(flags: &mut u8, start: usize, bits: &[bool]) {
     }
 }
 
+#[cfg(feature = "write")]
 fn flag_fits(used: usize, flag: &[bool]) -> bool {
     used + flag.len() <= 8
 }
 
+#[cfg(feature = "write")]
 fn plan_huff_effect(nhfb: &mut u32, nlzb: &mut u32) {
     *nhfb += 16;
     if *nhfb > 0xff {
@@ -1090,10 +1119,12 @@ fn plan_huff_effect(nhfb: &mut u32, nlzb: &mut u32) {
     }
 }
 
+#[cfg(feature = "write")]
 fn l_count_break_bit_cost(l_count: u32) -> usize {
     usize::from(l_count == 2)
 }
 
+#[cfg(feature = "write")]
 fn find_lz_token(
     input: &[u8],
     pos: usize,
@@ -1106,6 +1137,7 @@ fn find_lz_token(
         .next()
 }
 
+#[cfg(feature = "write")]
 fn find_lz_tokens(
     input: &[u8],
     pos: usize,
@@ -1145,6 +1177,7 @@ fn find_lz_tokens(
     tokens
 }
 
+#[cfg(feature = "write")]
 fn should_lazy_emit_literal(
     input: &[u8],
     pos: usize,
@@ -1182,6 +1215,7 @@ fn should_lazy_emit_literal(
     })
 }
 
+#[cfg(feature = "write")]
 fn find_short_lz(input: &[u8], pos: usize) -> Option<ShortLz> {
     if pos == 0 {
         return None;
@@ -1212,6 +1246,7 @@ fn find_short_lz(input: &[u8], pos: usize) -> Option<ShortLz> {
     (best.length >= 2).then_some(best)
 }
 
+#[cfg(feature = "write")]
 fn find_repeat_last_lz(
     input: &[u8],
     pos: usize,
@@ -1236,6 +1271,7 @@ fn find_repeat_last_lz(
     })
 }
 
+#[cfg(feature = "write")]
 fn find_old_dist_lz(
     input: &[u8],
     pos: usize,
@@ -1280,11 +1316,13 @@ fn find_old_dist_lz(
     (best.length >= 3).then_some(best)
 }
 
+#[cfg(feature = "write")]
 fn old_dist_lz_is_encodable(length: u32, distance: u32, short_code: u32) -> bool {
     old_dist_lz_length_code(length, distance, 0x2001, short_code).is_some()
         && old_dist_lz_length_code(length, distance, 0x7f00, short_code).is_some()
 }
 
+#[cfg(feature = "write")]
 fn old_dist_lz_length_code(
     length: u32,
     distance: u32,
@@ -1303,12 +1341,14 @@ fn old_dist_lz_length_code(
     Some(length_code)
 }
 
+#[cfg(feature = "write")]
 fn long_lz_length_code_for_distance(long_lz: LongLz, max_dist3: u32) -> Option<u32> {
     let decoded_bonus =
         u32::from(long_lz.distance >= max_dist3) + if long_lz.distance <= 256 { 8 } else { 0 };
     long_lz.length.checked_sub(3 + decoded_bonus)
 }
 
+#[cfg(feature = "write")]
 pub fn find_long_lz(input: &[u8], pos: usize, max_match_distance: usize) -> Option<LongLz> {
     if pos == 0 {
         return None;
@@ -1338,6 +1378,7 @@ pub fn find_long_lz(input: &[u8], pos: usize, max_match_distance: usize) -> Opti
     (best.length >= 3).then_some(best)
 }
 
+#[cfg(feature = "write")]
 fn find_long_lz_with_buckets(
     input: &[u8],
     pos: usize,
@@ -1397,10 +1438,12 @@ fn find_long_lz_with_buckets(
     (best.length >= 3).then_some(best)
 }
 
+#[cfg(feature = "write")]
 fn long_lz_buckets(input: &[u8]) -> Rar13MatchFinder {
     Rar13MatchFinder::build(input)
 }
 
+#[cfg(feature = "write")]
 fn emit_long_lz_length(bits: &mut BitWriter, avr_ln2: u32, length_code: u32) {
     debug_assert!(length_code < 0x100);
     if avr_ln2 >= 122 {
@@ -1414,6 +1457,7 @@ fn emit_long_lz_length(bits: &mut BitWriter, avr_ln2: u32, length_code: u32) {
     }
 }
 
+#[cfg(feature = "write")]
 fn emit_decode_num(
     bits: &mut BitWriter,
     target: u32,
@@ -1426,6 +1470,7 @@ fn emit_decode_num(
     bits.write_bits(code, len);
 }
 
+#[cfg(feature = "write")]
 fn decode_num_bit_cost(
     target: u32,
     start_pos: u32,
@@ -1435,6 +1480,7 @@ fn decode_num_bit_cost(
     encode_decode_num_prefix(target, start_pos, dec_tab, pos_tab).map(|(_, len)| len)
 }
 
+#[cfg(feature = "write")]
 fn encode_decode_num_prefix(
     target: u32,
     start_pos: u32,
@@ -1519,7 +1565,7 @@ impl Unpack15 {
             .decode_member_from_reader(input, target, solid, out)
     }
 }
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 impl Reader15State<Allowance> {
     fn new() -> Self {
         Self::with_allowance(&Allowance::default()).unwrap()
@@ -1561,13 +1607,13 @@ pub(crate) struct Reader15State<B: Budget> {
     old_dist_ptr: usize,
     last_dist: u32,
     last_length: u32,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "write"))]
     token_stats: DecodeTokenStats,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "write"))]
     old_distance_events: Vec<OldDistanceEvent>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 #[derive(Clone, Copy, Debug, Default)]
 struct DecodeTokenStats {
     literals: u64,
@@ -1589,7 +1635,7 @@ struct DecodeTokenStats {
     long_far_match_bytes: u64,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 #[derive(Clone, Copy, Debug)]
 struct OldDistanceEvent {
     output_position: usize,
@@ -1643,9 +1689,9 @@ impl<B: Budget> Reader15State<B> {
             old_dist_ptr: 0,
             last_dist: 0,
             last_length: 0,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "write"))]
             token_stats: DecodeTokenStats::default(),
-            #[cfg(test)]
+            #[cfg(all(test, feature = "write"))]
             old_distance_events: Vec::new(),
         };
         decoder.reset_non_solid();
@@ -1687,9 +1733,9 @@ impl<B: Budget> Reader15State<B> {
             old_dist_ptr: self.old_dist_ptr,
             last_dist: self.last_dist,
             last_length: self.last_length,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "write"))]
             token_stats: self.token_stats,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "write"))]
             old_distance_events: self.old_distance_events.clone(),
         })
     }
@@ -1856,7 +1902,7 @@ impl<B: Budget> Reader15State<B> {
         if self.l_count == 2 {
             self.bits.add_bits(1);
             if bit_field >= 0x8000 {
-                #[cfg(test)]
+                #[cfg(all(test, feature = "write"))]
                 {
                     self.token_stats.repeat_matches += 1;
                     self.token_stats.repeat_match_bytes += u64::from(self.last_length);
@@ -1898,7 +1944,7 @@ impl<B: Budget> Reader15State<B> {
         if length >= 9 {
             if length == 9 {
                 self.l_count += 1;
-                #[cfg(test)]
+                #[cfg(all(test, feature = "write"))]
                 {
                     self.token_stats.repeat_matches += 1;
                     self.token_stats.repeat_match_bytes += u64::from(self.last_length);
@@ -1913,7 +1959,7 @@ impl<B: Budget> Reader15State<B> {
                 self.bits.add_bits(15);
                 self.last_length = length;
                 self.last_dist = distance;
-                #[cfg(test)]
+                #[cfg(all(test, feature = "write"))]
                 {
                     self.token_stats.short_matches += 1;
                     self.token_stats.short_match_bytes += u64::from(length);
@@ -1939,7 +1985,7 @@ impl<B: Budget> Reader15State<B> {
             }
 
             self.remember_match(distance, length);
-            #[cfg(test)]
+            #[cfg(all(test, feature = "write"))]
             {
                 self.old_distance_events.push(OldDistanceEvent {
                     output_position: self.output_written,
@@ -1976,7 +2022,7 @@ impl<B: Budget> Reader15State<B> {
         length += 2;
         distance += 1;
         self.remember_match(distance, length);
-        #[cfg(test)]
+        #[cfg(all(test, feature = "write"))]
         {
             self.token_stats.short_matches += 1;
             self.token_stats.short_match_bytes += u64::from(length);
@@ -2070,7 +2116,7 @@ impl<B: Budget> Reader15State<B> {
         }
 
         self.remember_match(distance, length);
-        #[cfg(test)]
+        #[cfg(all(test, feature = "write"))]
         if distance <= 256 {
             self.token_stats.long_near_matches += 1;
             self.token_stats.long_near_match_bytes += u64::from(length);
@@ -2114,7 +2160,7 @@ impl<B: Budget> Reader15State<B> {
                 let mut distance = self.decode_num(self.bits.get_bits(), 5, DEC_HF2, POS_HF2);
                 distance = (distance << 5) | (self.bits.get_bits() >> 11);
                 self.bits.add_bits(5);
-                #[cfg(test)]
+                #[cfg(all(test, feature = "write"))]
                 {
                     self.token_stats.st_matches += 1;
                     self.token_stats.st_match_bytes += u64::from(length);
@@ -2139,7 +2185,7 @@ impl<B: Budget> Reader15State<B> {
         }
 
         let byte = (self.ch_set[byte_place as usize] >> 8) as u8;
-        #[cfg(test)]
+        #[cfg(all(test, feature = "write"))]
         if self.st_mode {
             self.token_stats.st_literals += 1;
         } else {
@@ -2302,7 +2348,7 @@ fn corr_huff(char_set: &mut [u16; 256], num_to_place: &mut [u8; 256]) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 mod tests {
     use crate::codec::Error;
 
@@ -3830,7 +3876,7 @@ impl<B: Budget> ReaderBits<B> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 impl ReaderBits<Allowance> {
     fn new(input: &[u8]) -> Self {
         Self::with_allowance(input, &Allowance::default()).unwrap()
@@ -3838,11 +3884,13 @@ impl ReaderBits<Allowance> {
 }
 
 #[derive(Default)]
+#[cfg(feature = "write")]
 struct BitWriter {
     output: Vec<u8>,
     bit_pos: usize,
 }
 
+#[cfg(feature = "write")]
 impl BitWriter {
     fn new() -> Self {
         Self {
@@ -3860,7 +3908,7 @@ impl BitWriter {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 mod solid_regressions {
     use super::*;
     type Unpack15 = Reader15State<Allowance>;
