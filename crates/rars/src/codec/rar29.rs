@@ -5498,6 +5498,27 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     }
 
     #[test]
+    fn solid_ppmd_match_rejects_distance_beyond_retained_history() {
+        let input = vec![b'Z'; MAX_HISTORY + 64];
+        let packed = unpack29_encode_literals(&input).unwrap();
+        let mut decoder = Unpack29::new();
+        decoder
+            .decode_non_solid_member_to(&packed, input.len(), &mut std::io::sink())
+            .unwrap();
+        assert_eq!(decoder.base_offset, 64);
+
+        let mut encoder = PpmdEncoder::new(PPMD_ORDER, PPMD_ESC, 1).unwrap();
+        encoder.encode_match(MAX_HISTORY + 1, 32).unwrap();
+        let (body, _) = encoder.finish_keeping_model().unwrap();
+        let mut packed = vec![0x80 | 0x20 | (PPMD_ORDER as u8 - 1), 0];
+        packed.extend_from_slice(&body);
+        assert_eq!(
+            decoder.decode_member_to(&packed, 32, &mut std::io::sink()),
+            Err(Error::InvalidData("RAR 2.9 match distance is out of range"))
+        );
+    }
+
+    #[test]
     fn stale_filter_ranges_do_not_change_later_published_bytes() {
         let mut decoder = Unpack29::new();
         decoder.output.resize(32, 0x5a).unwrap();
