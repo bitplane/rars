@@ -124,13 +124,10 @@ pub fn plan_inline_recovery(
     }
     let mut group_count = archive_size.div_ceil(data_shards);
     group_count += group_count & 1;
-    let header_size = data_shards
-        .checked_mul(8)
-        .and_then(|value| value.checked_add(RAR5_RECOVERY_CHUNK_FIXED_HEADER_SIZE))
-        .ok_or(Error::PlanOverflow)?;
-    let shard_size = header_size
-        .checked_add(group_count)
-        .ok_or(Error::PlanOverflow)?;
+    // data_shards is capped at 200 and group_count is at most
+    // ceil(size / 200) + 1 for large inputs, so both additions fit at u64::MAX.
+    let header_size = data_shards * 8 + RAR5_RECOVERY_CHUNK_FIXED_HEADER_SIZE;
+    let shard_size = header_size + group_count;
 
     Ok(InlineRecoveryPlan {
         data_shards,
@@ -2694,6 +2691,14 @@ mod tests {
                 header_size: 1672,
                 shard_size: 2696,
             }
+        );
+        let largest = plan_inline_recovery(u64::MAX, 1000).unwrap();
+        assert_eq!(largest.data_shards, MAX_WINRAR602_DATA_SHARDS);
+        assert_eq!(largest.header_size, 1672);
+        assert_eq!(largest.group_count, u64::MAX.div_ceil(200) + 1);
+        assert_eq!(
+            largest.shard_size,
+            largest.header_size + largest.group_count
         );
     }
 
