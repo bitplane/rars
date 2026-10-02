@@ -2284,31 +2284,28 @@ fn decrypt_encrypted_header_at(
     }
     // A u16 wire length rounds to at most 65536, including on 32-bit hosts.
     let encrypted_header_size = head_size.next_multiple_of(16);
-    let encrypted_start = offset
-        .checked_add(8)
-        .ok_or(Error::InvalidHeader("RAR 1.5 block offset overflows usize"))?;
-    let encrypted_end = encrypted_start
-        .checked_add(encrypted_header_size)
-        .ok_or(Error::InvalidHeader("RAR 1.5 block size overflows usize"))?;
+    // offset is within a physical slice (at most isize::MAX); this u16 wire
+    // length adds at most 65544, which fits usize on both supported widths.
+    let encrypted_end = offset + 8 + encrypted_header_size;
     if encrypted_end > archive.len() {
         return Err(Error::TooShort);
     }
     budget.admit(head_size, offset)?;
-    let encrypted_rest = archive
-        .get(offset + 24..encrypted_end)
-        .ok_or(Error::TooShort)?;
+    // The first 24 bytes and the rounded header end were admitted above.
+    let encrypted_rest = &archive[offset + 24..encrypted_end];
     let mut header = Vec::with_capacity(encrypted_header_size);
     header.extend_from_slice(&first_block);
     header.extend_from_slice(encrypted_rest);
-    cipher
-        .decrypt_in_place(&mut header[16..])
-        .map_err(map_rar30_crypto_error)?;
+    // The rounded header minus its first block is a whole number of AES blocks.
+    for block in header[16..].chunks_exact_mut(16) {
+        cipher.decrypt_block(block.try_into().expect("AES block size"));
+    }
     header.truncate(head_size);
 
     let mut block = parse_block_header(&header, 0)?;
     block.offset = offset;
-    let payload_size = usize::try_from(block.add_size.unwrap_or(0))
-        .map_err(|_| Error::InvalidHeader("RAR 1.5 block size overflows usize"))?;
+    // Parsed add_size is a widened wire u32 and fits both supported widths.
+    let payload_size = block.add_size.unwrap_or(0) as usize;
     let total_size = 8usize
         .checked_add(encrypted_header_size)
         .and_then(|size| size.checked_add(payload_size))
@@ -2365,15 +2362,16 @@ fn read_encrypted_header_at(
     let mut header = Vec::with_capacity(encrypted_header_size);
     header.extend_from_slice(&first_block);
     header.extend_from_slice(&encrypted_rest);
-    cipher
-        .decrypt_in_place(&mut header[16..])
-        .map_err(map_rar30_crypto_error)?;
+    // The rounded header minus its first block is a whole number of AES blocks.
+    for block in header[16..].chunks_exact_mut(16) {
+        cipher.decrypt_block(block.try_into().expect("AES block size"));
+    }
     header.truncate(head_size);
 
     let mut block = parse_block_header(&header, 0)?;
     block.offset = offset;
-    let payload_size = usize::try_from(block.add_size.unwrap_or(0))
-        .map_err(|_| Error::InvalidHeader("RAR 1.5 block size overflows usize"))?;
+    // Parsed add_size is a widened wire u32 and fits both supported widths.
+    let payload_size = block.add_size.unwrap_or(0) as usize;
     let total_size = 8usize
         .checked_add(encrypted_header_size)
         .and_then(|size| size.checked_add(payload_size))
@@ -2805,8 +2803,9 @@ fn file_block_total_size(
     // Parsed add_size is a widened u32, and default_total already includes it.
     let low_payload_size = block.add_size.unwrap_or(0) as usize;
     let header_prefix = default_total - low_payload_size;
-    let pack_size = usize::try_from(pack_size)
-        .map_err(|_| Error::InvalidHeader("RAR 1.5 packed file size overflows usize"))?;
+    // Every caller obtained pack_size from parse_file_like_header, which
+    // admitted its conversion and relative payload end before returning.
+    let pack_size = pack_size as usize;
     header_prefix
         .checked_add(pack_size)
         .ok_or(Error::InvalidHeader("RAR 1.5 block size overflows usize"))
@@ -4881,6 +4880,16 @@ mod tests {
         }
         for available in [0, 7, 8, 23] {
             let bytes = vec![0; available];
+            assert!(matches!(
+                decrypt_encrypted_header_at(
+                    &bytes,
+                    0,
+                    b"pw",
+                    &mut cache,
+                    &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new())
+                ),
+                Err(Error::TooShort)
+            ));
             assert!(matches!(
                 read_encrypted_header_at(
                     &mut std::io::Cursor::new(&bytes),
