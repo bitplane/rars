@@ -3357,6 +3357,44 @@ mod tests {
     }
 
     #[test]
+    fn rar5_range_repair_rejects_damage_beyond_available_parity() {
+        let prefix = recovery_test_bytes(10_000, 73);
+        let plan = plan_inline_recovery(prefix.len() as u64, 10).unwrap();
+        assert_eq!(plan.recovery_shards, 1);
+        let recovery_data = build_structural_inline_recovery_data(&prefix, 10).unwrap();
+        let mut damaged = prefix.clone();
+        damaged[0] ^= 1;
+        damaged[plan.group_count as usize] ^= 1;
+        assert_eq!(
+            repair_inline_recovery_prefix_shards(prefix.len(), &recovery_data, |range| {
+                Ok(damaged[range].to_vec())
+            }),
+            Err(Error::TooManyDamagedShards)
+        );
+    }
+
+    #[test]
+    fn rar5_range_repair_restores_short_final_shard() {
+        let prefix = recovery_test_bytes(10_001, 79);
+        let plan = plan_inline_recovery(prefix.len() as u64, 20).unwrap();
+        let final_start = (plan.data_shards as usize - 1) * plan.group_count as usize;
+        assert!(final_start < prefix.len());
+        assert!((prefix.len() - final_start) % 2 == 1);
+        let recovery_data = build_structural_inline_recovery_data(&prefix, 20).unwrap();
+        let mut damaged = prefix.clone();
+        damaged[final_start] ^= 1;
+        let repaired =
+            repair_inline_recovery_prefix_shards(prefix.len(), &recovery_data, |range| {
+                Ok(damaged[range].to_vec())
+            })
+            .unwrap();
+        assert_eq!(
+            repaired,
+            vec![(final_start..prefix.len(), prefix[final_start..].to_vec())]
+        );
+    }
+
+    #[test]
     fn rar5_parity_encoder_rejects_invalid_shard_shapes() {
         assert_eq!(encode_parity_shards(&[], 1), Err(Error::TooManyShards));
         assert_eq!(
