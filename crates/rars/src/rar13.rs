@@ -3,6 +3,10 @@
 #[cfg(feature = "write")]
 pub(crate) mod write;
 #[cfg(feature = "write")]
+pub(crate) use write::{
+    write_archive_with_sources, write_stored_volumes_with_progress, BorrowedFileEntry,
+};
+#[cfg(feature = "write")]
 pub use write::{
     write_compressed_archive, write_compressed_archive_with_comment,
     write_compressed_archive_with_comment_and_progress, write_compressed_volumes,
@@ -10,10 +14,6 @@ pub use write::{
     write_stored_archive_with_comment, write_stored_volumes, write_streaming_archive_to,
     EntrySource, FileEntry, MemberCoding, StoredEntry, StreamingEntry, WriterOptions,
     WriterResources,
-};
-#[cfg(feature = "write")]
-pub(crate) use write::{
-    write_stored_archive_with_comment_and_progress, write_stored_volumes_with_progress,
 };
 
 use crate::codec::rar13::Reader15State;

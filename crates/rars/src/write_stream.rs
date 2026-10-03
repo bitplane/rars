@@ -54,10 +54,21 @@ impl<'a> MemberBytes<'a> {
         progress: Option<crate::write_progress::ProgressReporter<'_>>,
     ) -> Result<Cow<'_, [u8]>> {
         crate::write_progress::check_cancelled(progress)?;
+        self.load_exact_with_progress(self.len()?, progress)
+    }
+
+    /// Use the source size already captured for the header and workspace.
+    /// Requerying a changing path here could disagree with that header. Inline
+    /// bytes remain borrowed and immutable throughout the write.
+    pub(crate) fn load_exact_with_progress(
+        &self,
+        expected: u64,
+        progress: Option<crate::write_progress::ProgressReporter<'_>>,
+    ) -> Result<Cow<'_, [u8]>> {
+        crate::write_progress::check_cancelled(progress)?;
         match self {
             Self::Borrowed(data) => Ok(Cow::Borrowed(data)),
             Self::Source(source) => {
-                let expected = source.len()?;
                 let capacity = usize::try_from(expected).map_err(|_| {
                     Error::InvalidArgument("member is larger than this host can hold")
                 })?;
@@ -88,8 +99,20 @@ impl<'a> MemberBytes<'a> {
         self.walk_with_progress(None, visit)
     }
 
-    pub(crate) fn walk_with_progress(
+    #[cfg(test)]
+    fn walk_with_progress(
         &self,
+        progress: Option<crate::write_progress::ProgressReporter<'_>>,
+        visit: impl FnMut(&[u8]),
+    ) -> Result<()> {
+        crate::write_progress::check_cancelled(progress)?;
+        self.walk_exact_with_progress(self.len()?, progress, visit)
+    }
+
+    /// Walk against the same captured source size that the member header uses.
+    pub(crate) fn walk_exact_with_progress(
+        &self,
+        expected: u64,
         progress: Option<crate::write_progress::ProgressReporter<'_>>,
         mut visit: impl FnMut(&[u8]),
     ) -> Result<()> {
@@ -102,7 +125,6 @@ impl<'a> MemberBytes<'a> {
                 }
             }
             Self::Source(source) => {
-                let expected = source.len()?;
                 crate::write_progress::check_cancelled(progress)?;
                 let mut reader = crate::write_progress::CancellableIo {
                     inner: source.open()?,
@@ -137,6 +159,15 @@ impl<'a> MemberBytes<'a> {
         match self {
             Self::Borrowed(_) => None,
             Self::Source(source) => Some(source),
+        }
+    }
+
+    /// The member has been written and verified, so this write will not
+    /// reopen its session-owned staged payload. Public source factories keep
+    /// their usual reopenable behavior.
+    pub(crate) fn release(&self) {
+        if let Self::Source(source) = self {
+            source.release();
         }
     }
 }
@@ -202,6 +233,36 @@ pub(crate) fn check_source_length(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn captured_source_size_controls_loading_and_checksum_walks() {
+        struct Source;
+        impl crate::streaming::SourceFactory for Source {
+            fn len(&self) -> Result<u64> {
+                panic!("must use the size already captured for the member header")
+            }
+            fn open(&self) -> Result<Box<dyn crate::streaming::EntryReader>> {
+                Ok(Box::new(std::io::Cursor::new(b"abc".as_slice())))
+            }
+        }
+        for expected in [0, 1, 3, 4] {
+            let source = EntrySource::from_factory(Source);
+            let member = MemberBytes::Source(&source);
+            let loaded = member.load_exact_with_progress(expected, None);
+            let mut observed = Vec::new();
+            let walked = member.walk_exact_with_progress(expected, None, |chunk| {
+                observed.extend_from_slice(chunk)
+            });
+            if expected == 3 {
+                assert_eq!(loaded.unwrap().as_ref(), b"abc");
+                walked.unwrap();
+                assert_eq!(observed, b"abc");
+            } else {
+                assert_eq!(loaded.unwrap_err().kind(), crate::ErrorKind::SourceChanged);
+                assert_eq!(walked.unwrap_err().kind(), crate::ErrorKind::SourceChanged);
+            }
+        }
+    }
+
     #[test]
     fn source_end_probe_retries_interruptions_and_reports_other_io_errors() {
         struct Probe {

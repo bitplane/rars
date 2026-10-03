@@ -258,6 +258,7 @@ pub(crate) struct RetainedMemberMetadata<'a> {
 
 pub(crate) struct RetainedFileEntry<'a> {
     pub(crate) file: FileEntry<'a>,
+    pub(crate) source: Option<&'a EntrySource>,
     pub(crate) metadata: RetainedMemberMetadata<'a>,
 }
 
@@ -269,6 +270,7 @@ pub(crate) fn write_archive_with_retained_metadata(
     options: WriterOptions,
     coding: MemberCoding,
     archive_comment: Option<&[u8]>,
+    resources: &WriterResources,
     progress: Option<&dyn WriteProgress>,
     header_password: Option<&[u8]>,
     archive_comment_password: Option<&[u8]>,
@@ -280,6 +282,9 @@ pub(crate) fn write_archive_with_retained_metadata(
         .iter()
         .map(|entry| {
             let mut member = Member::from_file(&entry.file);
+            if let Some(source) = entry.source {
+                member.bytes = MemberBytes::Source(source);
+            }
             member.unicode_name = entry.metadata.unicode_name;
             member.unpack_version = entry.metadata.unpack_version;
             member.extended_times = entry.metadata.extended_times;
@@ -294,7 +299,7 @@ pub(crate) fn write_archive_with_retained_metadata(
         options,
         coding,
         archive_comment,
-        &WriterResources::default(),
+        resources,
         progress,
         &mut out,
         header_password,
@@ -634,6 +639,7 @@ fn write_members_to(
                 progress.reporter(),
             )
             .map_err(|error| crate::write_stream::member_error(error, member.name, "writing"))?;
+            member.bytes.release();
         }
     } else {
         crate::parallel::map_slice_windowed(
@@ -654,7 +660,11 @@ fn write_members_to(
                     header_password,
                     progress.reporter(),
                 )
-                .map_err(|error| crate::write_stream::member_error(error, member.name, "writing"))
+                .map_err(|error| {
+                    crate::write_stream::member_error(error, member.name, "writing")
+                })?;
+                member.bytes.release();
+                Ok(())
             },
         )?;
     }
@@ -1348,18 +1358,22 @@ fn encode_member<'a>(
             unpacked_size,
             file_crc: {
                 let mut crc = Crc32::new();
-                member
-                    .bytes
-                    .walk_with_progress(progress.reporter(), |chunk| {
+                member.bytes.walk_exact_with_progress(
+                    unpacked_size as u64,
+                    progress.reporter(),
+                    |chunk| {
                         crc.update(chunk);
                         progress.advance(chunk.len() as u64);
-                    })?;
+                    },
+                )?;
                 crc.finish()
             },
         });
     }
 
-    let data = member.bytes.load_with_progress(progress.reporter())?;
+    let data = member
+        .bytes
+        .load_exact_with_progress(unpacked_size as u64, progress.reporter())?;
     let mut crc = Crc32::new();
     for chunk in data.chunks(64 * 1024) {
         progress.check()?;

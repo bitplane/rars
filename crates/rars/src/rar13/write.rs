@@ -154,6 +154,44 @@ pub fn write_compressed_archive(
     write_compressed_archive_with_comment(entries, options, None)
 }
 
+/// Builder entries borrow either caller bytes or reopenable sources. This
+/// keeps a source-backed archive from materializing every member up front.
+pub(crate) struct BorrowedFileEntry<'a> {
+    pub(crate) file: FileEntry<'a>,
+    pub(crate) source: Option<&'a EntrySource>,
+}
+
+pub(crate) fn write_archive_with_sources(
+    entries: &[BorrowedFileEntry<'_>],
+    options: WriterOptions,
+    coding: MemberCoding,
+    archive_comment: Option<&[u8]>,
+    resources: &WriterResources,
+    progress: Option<&dyn WriteProgress>,
+) -> Result<Vec<u8>> {
+    let members: Vec<_> = entries
+        .iter()
+        .map(|entry| {
+            let mut member = Member::from_file(&entry.file);
+            if let Some(source) = entry.source {
+                member.bytes = MemberBytes::Source(source);
+            }
+            member
+        })
+        .collect();
+    let mut out = Vec::new();
+    write_archive_to(
+        &members,
+        options,
+        coding,
+        archive_comment,
+        resources,
+        progress,
+        &mut out,
+    )?;
+    Ok(out)
+}
+
 pub fn write_compressed_archive_with_comment(
     entries: &[FileEntry<'_>],
     options: WriterOptions,
@@ -373,6 +411,7 @@ fn write_archive_to(
         .map_err(|error| crate::write_stream::member_error(error, member.name, "preparing"))?;
         write_member(output, member, encoded, options, work.reporter())
             .map_err(|error| crate::write_stream::member_error(error, member.name, "writing"))?;
+        member.bytes.release();
         report_compression_entry(
             reporting,
             false,
@@ -450,16 +489,22 @@ fn encode_member<'a>(
             unpacked_size,
             file_crc: {
                 let mut checksum = Rar13Checksum::new();
-                member.bytes.walk_with_progress(work.reporter(), |chunk| {
-                    checksum.update(chunk);
-                    work.advance(chunk.len() as u64);
-                })?;
+                member.bytes.walk_exact_with_progress(
+                    unpacked_size as u64,
+                    work.reporter(),
+                    |chunk| {
+                        checksum.update(chunk);
+                        work.advance(chunk.len() as u64);
+                    },
+                )?;
                 checksum.finish()
             },
         });
     }
 
-    let data = member.bytes.load_with_progress(work.reporter())?;
+    let data = member
+        .bytes
+        .load_exact_with_progress(unpacked_size as u64, work.reporter())?;
     let mut checksum = Rar13Checksum::new();
     for chunk in data.chunks(64 * 1024) {
         work.check()?;

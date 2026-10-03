@@ -78,8 +78,8 @@ enum EntryAttributes {
 ///
 /// The bytes are either held directly or fetched from an [`EntrySource`] when
 /// the writer reaches the member. Sources are what keep a large archive off the
-/// heap; the legacy families cannot stream, so they read each source into
-/// `data` first.
+/// heap. Legacy single archives pass sources to the per-member writers;
+/// legacy volume collection still materializes its one input.
 #[derive(Debug, Clone)]
 struct BuilderEntry {
     id: usize,
@@ -1065,9 +1065,7 @@ impl Builder {
         let progress = ResourceProgress::new(&resources, progress.map(ProgressReporter));
         let reporting = Some(ProgressReporter(&progress));
         check_cancelled(reporting)?;
-        let data = self
-            .materialized(reporting)?
-            .build_single(Some(&progress))?;
+        let data = self.build_single(&resources, Some(&progress))?;
         check_cancelled(reporting)?;
         Ok(data)
     }
@@ -1122,9 +1120,7 @@ impl Builder {
         let progress = ResourceProgress::new(resources, progress.map(ProgressReporter));
         let reporting = Some(ProgressReporter(&progress));
         check_cancelled(reporting)?;
-        let data = self
-            .materialized(reporting)?
-            .build_single(Some(&progress))?;
+        let data = self.build_single(resources, Some(&progress))?;
         check_cancelled(reporting)?;
         progress.report(crate::WriteProgressEvent::OperationStarted {
             operation: crate::WriteOperation::Emission,
@@ -1229,7 +1225,8 @@ impl Builder {
         let control = ResourceProgress::new(resources, progress.map(ProgressReporter));
         let progress = Some(&control as &dyn WriteProgress);
         check_cancelled(progress.map(ProgressReporter))?;
-        let this = self.materialized(progress.map(ProgressReporter))?;
+        self.single_volume_entry()?;
+        let this = self.materialized_volume_input(progress.map(ProgressReporter))?;
         let result = match self.format.family() {
             ArchiveFamily::Rar15To40 => this.build_rar15_volumes(volume_size, progress),
             ArchiveFamily::Rar13 => this.build_rar13_volumes(volume_size, progress),
@@ -1411,16 +1408,14 @@ impl Builder {
         Ok(())
     }
 
-    /// A copy with every source read into memory, for the writers that cannot
-    /// take one. Returns a borrow when there is nothing to read, so the common
-    /// case does not copy the members twice.
-    fn materialized(
+    /// Legacy volume collection needs its one input as a slice. Borrow an
+    /// inline input; read a source without copying any other member payloads.
+    fn materialized_volume_input(
         &self,
         progress: Option<ProgressReporter<'_>>,
     ) -> Result<std::borrow::Cow<'_, Self>> {
         check_cancelled(progress)?;
-        // All RAR5/7 entry points dispatch to the streaming writer before
-        // calling this legacy-only helper.
+        // The caller has validated the legacy volume path and its one input.
         if !self.entries.iter().any(|entry| entry.source.is_some()) {
             return Ok(std::borrow::Cow::Borrowed(self));
         }
@@ -1439,11 +1434,15 @@ impl Builder {
         Ok(std::borrow::Cow::Owned(owned))
     }
 
-    fn build_single(&self, progress: Option<&dyn WriteProgress>) -> Result<Vec<u8>> {
+    fn build_single(
+        &self,
+        resources: &WriterResources,
+        progress: Option<&dyn WriteProgress>,
+    ) -> Result<Vec<u8>> {
         match self.format.family() {
             ArchiveFamily::Rar50Plus => unreachable!("RAR 5/7 use the streaming writer"),
-            ArchiveFamily::Rar15To40 => self.build_rar15_single(progress),
-            ArchiveFamily::Rar13 => self.build_rar13_single(progress),
+            ArchiveFamily::Rar15To40 => self.build_rar15_single(resources, progress),
+            ArchiveFamily::Rar13 => self.build_rar13_single(resources, progress),
         }
     }
 
@@ -1621,11 +1620,16 @@ impl Builder {
         options
     }
 
-    fn build_rar15_single(&self, progress: Option<&dyn WriteProgress>) -> Result<Vec<u8>> {
+    fn build_rar15_single(
+        &self,
+        resources: &WriterResources,
+        progress: Option<&dyn WriteProgress>,
+    ) -> Result<Vec<u8>> {
         let entries: Vec<_> = self
             .entries
             .iter()
             .map(|entry| rar15_40::RetainedFileEntry {
+                source: entry.source.as_ref(),
                 file: rar15_40::FileEntry {
                     name: &entry.name,
                     data: &entry.data,
@@ -1658,6 +1662,7 @@ impl Builder {
                 crate::write_plan::MemberCoding::Compressed
             },
             self.comment.as_deref(),
+            resources,
             progress,
             self.encrypt_headers
                 .then_some(self.password.as_deref())
@@ -1674,13 +1679,16 @@ impl Builder {
         options
     }
 
-    fn build_rar13_single(&self, progress: Option<&dyn WriteProgress>) -> Result<Vec<u8>> {
-        let options = self.rar13_options();
-        if self.store {
-            let entries: Vec<_> = self
-                .entries
-                .iter()
-                .map(|entry| rar13::StoredEntry {
+    fn build_rar13_single(
+        &self,
+        resources: &WriterResources,
+        progress: Option<&dyn WriteProgress>,
+    ) -> Result<Vec<u8>> {
+        let entries: Vec<_> = self
+            .entries
+            .iter()
+            .map(|entry| rar13::BorrowedFileEntry {
+                file: rar13::FileEntry {
                     name: &entry.name,
                     data: &entry.data,
                     file_time: entry.mtime.unwrap_or(0),
@@ -1692,39 +1700,22 @@ impl Builder {
                             encryption.data_password.as_deref()
                         }),
                     file_comment: entry.file_comment.as_deref(),
-                })
-                .collect();
-            rar13::write_stored_archive_with_comment_and_progress(
-                &entries,
-                options,
-                self.comment.as_deref(),
-                progress,
-            )
-        } else {
-            let entries: Vec<_> = self
-                .entries
-                .iter()
-                .map(|entry| rar13::FileEntry {
-                    name: &entry.name,
-                    data: &entry.data,
-                    file_time: entry.mtime.unwrap_or(0),
-                    file_attr: entry.rar13_attr(),
-                    password: entry
-                        .encryption
-                        .as_ref()
-                        .map_or(self.password.as_deref(), |encryption| {
-                            encryption.data_password.as_deref()
-                        }),
-                    file_comment: entry.file_comment.as_deref(),
-                })
-                .collect();
-            rar13::write_compressed_archive_with_comment_and_progress(
-                &entries,
-                options,
-                self.comment.as_deref(),
-                progress,
-            )
-        }
+                },
+                source: entry.source.as_ref(),
+            })
+            .collect();
+        rar13::write_archive_with_sources(
+            &entries,
+            self.rar13_options(),
+            if self.store {
+                crate::write_plan::MemberCoding::Stored
+            } else {
+                crate::write_plan::MemberCoding::Compressed
+            },
+            self.comment.as_deref(),
+            resources,
+            progress,
+        )
     }
 
     fn single_volume_entry(&self) -> Result<&BuilderEntry> {
@@ -2070,7 +2061,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_builder_materializes_only_the_entries_with_sources() {
+    fn legacy_builder_combines_inline_and_source_members() {
         use crate::{ArchiveReader, ArchiveVersion, Builder, EntrySource};
 
         let mut builder = Builder::new(ArchiveVersion::Rar29).store(true);
