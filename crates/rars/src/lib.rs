@@ -44,6 +44,8 @@ pub mod filter;
 #[cfg(feature = "write")]
 mod filter_search;
 mod io_util;
+mod member;
+pub use member::{ArchiveMemberRef, ArchiveMemberRefs};
 mod output_limit;
 mod parallel;
 mod parse_budget;
@@ -575,46 +577,18 @@ pub enum ArchiveMemberHash {
 #[non_exhaustive]
 /// Lazy iterator returned by [`Archive::members`].
 pub struct ArchiveMembers<'a> {
-    inner: ArchiveMembersInner<'a>,
-    index: usize,
-}
-
-#[derive(Debug, Clone)]
-enum ArchiveMembersInner<'a> {
-    Rar13(&'a [rar13::Entry]),
-    Rar15To40(&'a [rar15_40::Block]),
-    Rar50Plus(&'a [rar50::Block]),
+    inner: ArchiveMemberRefs<'a>,
 }
 
 impl Iterator for ArchiveMembers<'_> {
     type Item = ArchiveMember;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.inner {
-            ArchiveMembersInner::Rar13(entries) => {
-                let entry = entries.get(self.index)?;
-                self.index += 1;
-                Some(rar13_member(entry))
-            }
-            ArchiveMembersInner::Rar15To40(blocks) => {
-                while let Some(block) = blocks.get(self.index) {
-                    self.index += 1;
-                    if let rar15_40::Block::File(file) = block {
-                        return Some(rar15_40_member(file));
-                    }
-                }
-                None
-            }
-            ArchiveMembersInner::Rar50Plus(blocks) => {
-                while let Some(block) = blocks.get(self.index) {
-                    self.index += 1;
-                    if let rar50::Block::File(file) = block {
-                        return Some(rar50_member(file));
-                    }
-                }
-                None
-            }
-        }
+        self.inner.next().map(|member| member.to_owned())
+    }
+
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        self.inner.nth(n).map(|member| member.to_owned())
     }
 }
 
@@ -665,20 +639,15 @@ impl Archive {
 
     /// Iterates over file-like members using a common cross-version metadata view.
     pub fn members(&self) -> ArchiveMembers<'_> {
-        match self {
-            Self::Rar13(archive) => ArchiveMembers {
-                inner: ArchiveMembersInner::Rar13(&archive.entries),
-                index: 0,
-            },
-            Self::Rar15To40(archive) => ArchiveMembers {
-                inner: ArchiveMembersInner::Rar15To40(&archive.blocks),
-                index: 0,
-            },
-            Self::Rar50Plus(archive) => ArchiveMembers {
-                inner: ArchiveMembersInner::Rar50Plus(&archive.blocks),
-                index: 0,
-            },
+        ArchiveMembers {
+            inner: self.member_refs(),
         }
+    }
+
+    /// Traverses member headers without allocating names or copying metadata.
+    /// The borrow prevents mutation of the archive while these views are in use.
+    pub fn member_refs(&self) -> ArchiveMemberRefs<'_> {
+        ArchiveMemberRefs::new(self)
     }
 
     /// Streams extracted entries to caller-provided writers.
@@ -871,10 +840,10 @@ impl Archive {
     ) -> Result<Option<Vec<u8>>> {
         options.check_cancelled()?;
         let index = self
-            .members()
+            .member_refs()
             .enumerate()
             .filter(|(_, member)| {
-                member.meta.name == name && !member.meta.is_directory && !member.meta.is_redirection
+                member.name_bytes() == name && !member.is_directory() && !member.is_redirection()
             })
             .map(|(index, _)| index)
             .last();
@@ -905,10 +874,10 @@ impl Archive {
         options: ArchiveReadOptions<'_>,
     ) -> Result<Option<Vec<u8>>> {
         options.check_cancelled()?;
-        let Some(member) = self.members().nth(index) else {
+        let Some(member) = self.member_refs().nth(index) else {
             return Ok(None);
         };
-        if member.meta.is_directory || member.meta.is_redirection {
+        if member.is_directory() || member.is_redirection() {
             return Ok(None);
         }
         // Match controlled extraction's conservative solid admission policy,
