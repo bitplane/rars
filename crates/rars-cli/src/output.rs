@@ -6,7 +6,7 @@ use rars::{
 };
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -337,20 +337,10 @@ fn set_extracted_permissions(
 }
 
 pub(crate) fn checked_output_path(out_dir: &Path, rel: &Path) -> rars::Result<PathBuf> {
-    let mut out_path = out_dir.to_path_buf();
-    for component in rel.components() {
-        let Component::Normal(part) = component else {
-            return Err(Error::InvalidHeader("unsafe archive path"));
-        };
-        out_path.push(part);
-        if fs::symlink_metadata(&out_path)
-            .map(|metadata| metadata.file_type().is_symlink())
-            .unwrap_or(false)
-        {
-            return Err(Error::InvalidHeader("unsafe archive path crosses symlink"));
-        }
-    }
-    Ok(out_path)
+    rars::filename::checked_output_path(out_dir, rel).map_err(|error| match error {
+        Error::UnsafePath(message) => Error::InvalidHeader(message),
+        other => other,
+    })
 }
 
 pub(crate) fn print_ok_entry(entry: &ExtractedEntryMeta) {
@@ -401,36 +391,29 @@ pub(crate) fn output_relative_path(name: &[u8]) -> CliResult<PathBuf> {
 }
 
 fn relative_path(name: &[u8], backslash_is_separator: bool) -> CliResult<PathBuf> {
-    if name.contains(&0) {
-        return Err("unsafe archive path contains NUL byte".into());
-    }
-    let bytes: Vec<_> = name
-        .iter()
-        .map(|&b| {
-            if backslash_is_separator && b == b'\\' {
-                b'/'
-            } else {
-                b
-            }
-        })
-        .collect();
-    let text = rars::filename::native_string(&bytes)?;
-    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-        return Err(format!("unsafe archive path: {}", Path::new(&text).display()).into());
-    }
-    let path = Path::new(&text);
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Normal(part) => out.push(part),
-            Component::CurDir => {}
-            _ => return Err(format!("unsafe archive path: {}", Path::new(&text).display()).into()),
+    match rars::filename::relative_path(name, backslash_is_separator) {
+        Ok(path) => Ok(path),
+        Err(Error::UnsafePath("unsafe archive path contains NUL byte")) => {
+            Err("unsafe archive path contains NUL byte".into())
         }
+        Err(Error::InvalidHeader("empty archive path")) => Err("empty archive path".into()),
+        Err(Error::UnsafePath(_)) => {
+            // Preserve the CLI's diagnostic path spelling on the error path.
+            let bytes: Vec<_> = name
+                .iter()
+                .map(|&byte| {
+                    if backslash_is_separator && byte == b'\\' {
+                        b'/'
+                    } else {
+                        byte
+                    }
+                })
+                .collect();
+            let text = rars::filename::native_string(&bytes)?;
+            Err(format!("unsafe archive path: {}", Path::new(&text).display()).into())
+        }
+        Err(error) => Err(error.into()),
     }
-    if out.as_os_str().is_empty() {
-        return Err("empty archive path".into());
-    }
-    Ok(out)
 }
 
 fn create_output_file(path: &Path, overwrite: OverwritePolicy) -> std::io::Result<File> {

@@ -4,10 +4,11 @@ use pyo3::exceptions::{
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList, PyModule};
 use pyo3::{create_exception, PyErr};
+use rars_rs::filename::relative_path as output_relative_path;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -1959,25 +1960,15 @@ fn extract_archive<S: Selection>(
     };
     if let Some(selected) = selected {
         let last = archive
-            .members()
+            .member_refs()
             .enumerate()
             .filter(|(index, member)| {
-                !member.meta.is_redirection && selected.contains_member(*index, &member.meta.name)
+                !member.is_redirection() && selected.contains_member(*index, member.name_bytes())
             })
             .map(|(index, _)| index)
             .last();
         if let Some(last) = last {
-            let solid = match archive {
-                rars_rs::Archive::Rar13(a) => a.main.is_solid(),
-                rars_rs::Archive::Rar15To40(a) => {
-                    a.main.is_solid() || a.files().any(|file| file.is_solid())
-                }
-                rars_rs::Archive::Rar50Plus(a) => {
-                    a.main.is_solid() || a.files().any(|file| file.compression_info & 0x40 != 0)
-                }
-                // Future families must not skip possible history dependencies.
-                _ => true,
-            };
+            let solid = archive.is_solid();
             let mut index = 0;
             let mut pending: Option<std::rc::Rc<std::cell::RefCell<DeferredExtractedFile>>> = None;
             archive.extract_with_control(options, |member| {
@@ -2227,55 +2218,7 @@ fn checked_output_path(
         rars_rs::filename::decoded_name(&meta.name, meta.name_is_unicode, encoding)?.into_owned()
     };
     let rel = output_relative_path(&name, !rar50)?;
-    let mut out_path = out_dir.to_path_buf();
-    // output_relative_path constructed this exclusively from normal components.
-    for part in rel.iter() {
-        out_path.push(part);
-        if fs::symlink_metadata(&out_path)
-            .map(|metadata| metadata.file_type().is_symlink())
-            .unwrap_or(false)
-        {
-            return Err(rars_rs::Error::UnsafePath(
-                "unsafe archive path crosses symlink",
-            ));
-        }
-    }
-    Ok(out_path)
-}
-
-fn output_relative_path(name: &[u8], backslash_separator: bool) -> rars_rs::Result<PathBuf> {
-    if name.contains(&0) {
-        return Err(rars_rs::Error::UnsafePath(
-            "unsafe archive path contains NUL byte",
-        ));
-    }
-    let bytes: Vec<_> = name
-        .iter()
-        .map(|&b| {
-            if backslash_separator && b == b'\\' {
-                b'/'
-            } else {
-                b
-            }
-        })
-        .collect();
-    let text = rars_rs::filename::native_string(&bytes)?;
-    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-        return Err(rars_rs::Error::UnsafePath("unsafe archive path"));
-    }
-    let path = Path::new(&text);
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Normal(part) => out.push(part),
-            Component::CurDir => {}
-            _ => return Err(rars_rs::Error::UnsafePath("unsafe archive path")),
-        }
-    }
-    if out.as_os_str().is_empty() {
-        return Err(rars_rs::Error::InvalidHeader("empty archive path"));
-    }
-    Ok(out)
+    rars_rs::filename::checked_output_path(out_dir, &rel)
 }
 
 fn archive_base_name(path: &Path) -> PyResult<Vec<u8>> {

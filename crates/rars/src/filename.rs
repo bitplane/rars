@@ -8,6 +8,7 @@
 use crate::{Error, Result};
 use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
+use std::path::{Component, Path, PathBuf};
 
 /// Native filename bytes on Unix, UTF-8 elsewhere. Never substitutes characters.
 pub fn native_bytes(name: &OsStr) -> Result<&[u8]> {
@@ -30,19 +31,82 @@ pub fn native_bytes(name: &OsStr) -> Result<&[u8]> {
 /// Non-Unix platforms require Unicode; an unspecified legacy code page is not
 /// guessed. This function does not validate paths or decode RAR5 wire names.
 pub fn native_string(name: &[u8]) -> Result<OsString> {
+    Ok(native_str(name)?.to_os_string())
+}
+
+/// Borrows decoded filename bytes as a native name without replacement.
+/// Like [`native_string`], this does not validate paths or decode RAR5 wire names.
+pub fn native_str(name: &[u8]) -> Result<&OsStr> {
     #[cfg(unix)]
     {
-        use std::os::unix::ffi::OsStringExt;
-        Ok(OsString::from_vec(name.to_vec()))
+        use std::os::unix::ffi::OsStrExt;
+        Ok(OsStr::from_bytes(name))
     }
     #[cfg(not(unix))]
     {
-        std::str::from_utf8(name).map(OsString::from).map_err(|_| {
+        std::str::from_utf8(name).map(OsStr::new).map_err(|_| {
             Error::InvalidArgument(
                 "archive name requires an explicit legacy code page on this platform",
             )
         })
     }
+}
+
+/// Constructs a nonempty native relative path from already decoded name bytes.
+///
+/// Callers choose whether backslashes separate components (legacy RAR) or remain
+/// literal characters (RAR5 on Unix). Native platform path syntax still applies.
+/// Rejects NUL, drive prefixes, roots and parent components; removes `.` and
+/// repeated separators. Filename interpretation and identity preflight remain
+/// separate caller policies.
+pub fn relative_path(name: &[u8], backslash_separator: bool) -> Result<PathBuf> {
+    if name.contains(&0) {
+        return Err(Error::UnsafePath("unsafe archive path contains NUL byte"));
+    }
+    let bytes = if backslash_separator && name.contains(&b'\\') {
+        Cow::Owned(
+            name.iter()
+                .map(|&byte| if byte == b'\\' { b'/' } else { byte })
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        Cow::Borrowed(name)
+    };
+    let text = native_str(&bytes)?;
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return Err(Error::UnsafePath("unsafe archive path"));
+    }
+    let mut out = PathBuf::new();
+    for component in Path::new(text).components() {
+        match component {
+            Component::Normal(part) => out.push(part),
+            Component::CurDir => {}
+            _ => return Err(Error::UnsafePath("unsafe archive path")),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        return Err(Error::InvalidHeader("empty archive path"));
+    }
+    Ok(out)
+}
+
+/// Joins normal relative components to a caller-selected, trusted root.
+/// Rejects existing symlinks in appended components; an empty relative path
+/// returns the root. This does not create or open files. Symlink checks are a
+/// snapshot; callers control subsequent filesystem access and publication.
+pub fn checked_output_path(root: &Path, relative: &Path) -> Result<PathBuf> {
+    let mut path = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            return Err(Error::UnsafePath("unsafe archive path"));
+        };
+        path.push(part);
+        if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            return Err(Error::UnsafePath("unsafe archive path crosses symlink"));
+        }
+    }
+    Ok(path)
 }
 
 /// Encode native Unix filename bytes as a RAR5 UTF-8 name.
@@ -184,6 +248,11 @@ mod tests {
     #[test]
     fn native_names_preserve_utf8_and_unix_legacy_bytes_without_replacement() {
         let bytes = "café.txt".as_bytes();
+        let borrowed = native_str(bytes).unwrap();
+        assert!(std::ptr::eq(
+            native_bytes(borrowed).unwrap().as_ptr(),
+            bytes.as_ptr()
+        ));
         let name = native_string(bytes).unwrap();
         assert_eq!(native_bytes(&name).unwrap(), bytes);
         #[cfg(unix)]
@@ -194,6 +263,81 @@ mod tests {
         }
         #[cfg(not(unix))]
         assert!(native_string(b"caf\xff.txt").is_err());
+    }
+
+    #[test]
+    fn destination_paths_preserve_selected_separator_policy_and_error_categories() {
+        for separator in [false, true] {
+            for name in [b"a\0b".as_slice(), b"/root", b"a/../b", b"C:root"] {
+                assert!(matches!(
+                    relative_path(name, separator),
+                    Err(Error::UnsafePath(_))
+                ));
+            }
+            for name in [b"".as_slice(), b".", b"././"] {
+                assert_eq!(
+                    relative_path(name, separator),
+                    Err(Error::InvalidHeader("empty archive path"))
+                );
+            }
+            assert_eq!(
+                relative_path(b"./a//./b", separator).unwrap(),
+                PathBuf::from("a").join("b")
+            );
+        }
+        assert_eq!(
+            relative_path(b"a\\b", true).unwrap(),
+            PathBuf::from("a").join("b")
+        );
+        assert!(relative_path(b"a\\..\\b", true).is_err());
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                relative_path(b"..\\literal", false).unwrap(),
+                PathBuf::from("..\\literal")
+            );
+            assert_eq!(
+                native_bytes(relative_path(b"caf\xff", false).unwrap().as_os_str()).unwrap(),
+                b"caf\xff"
+            );
+        }
+        #[cfg(not(unix))]
+        assert!(relative_path(b"caf\xff", false).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn destination_paths_refuse_link_components_and_keep_root_selection_separate() {
+        let root = crate::scratch::case("shared-destination-policy");
+        let target = root.join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, root.join("link")).unwrap();
+        assert_eq!(
+            checked_output_path(&root, Path::new("link/file")),
+            Err(Error::UnsafePath("unsafe archive path crosses symlink"))
+        );
+        assert_eq!(
+            checked_output_path(&root, Path::new("link")),
+            Err(Error::UnsafePath("unsafe archive path crosses symlink"))
+        );
+        for path in ["../file", "/file", "./file"] {
+            assert_eq!(
+                checked_output_path(&root, Path::new(path)),
+                Err(Error::UnsafePath("unsafe archive path"))
+            );
+        }
+        assert_eq!(
+            checked_output_path(&root, Path::new("")),
+            Ok(root.to_path_buf())
+        );
+        assert_eq!(
+            checked_output_path(&root.join("link"), Path::new("file")),
+            Ok(root.join("link/file"))
+        );
+        assert_eq!(
+            checked_output_path(&root, Path::new("missing/file")),
+            Ok(root.join("missing/file"))
+        );
     }
 
     #[test]
@@ -458,21 +602,6 @@ pub fn validate_entry_name(name: Vec<u8>) -> Result<Vec<u8>> {
 /// DOS-era writer put in the header. On Unix non-UTF-8 bytes are preserved.
 /// This is the legacy path convention, not a RAR5 wire-name decoder.
 pub fn entry_relative_path(name: &[u8]) -> Result<std::path::PathBuf> {
-    use std::path::{Component, PathBuf};
-
     crate::filename::validate_relative(name)?;
-    let bytes: Vec<_> = name
-        .iter()
-        .map(|&b| if b == b'\\' { b'/' } else { b })
-        .collect();
-    let text = crate::filename::native_string(&bytes)?;
-    let mut out = PathBuf::new();
-    for component in std::path::Path::new(&text).components() {
-        match component {
-            Component::Normal(part) => out.push(part),
-            Component::CurDir => {}
-            _ => return Err(Error::UnsafePath("unsafe archive path")),
-        }
-    }
-    Ok(out)
+    relative_path(name, true)
 }
