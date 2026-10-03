@@ -409,6 +409,7 @@ impl RarFile {
     pub fn get_info(&self, name: &str) -> Option<RarInfo> {
         self.infos
             .iter()
+            .rev()
             .find(|info| info.name == name.as_bytes())
             .cloned()
     }
@@ -426,14 +427,16 @@ impl RarFile {
     ) -> Result<Vec<u8>, JsValue> {
         let password = password_bytes(password)?.or_else(|| self.password.clone());
         let options = read_options(password.as_deref(), &settings)?;
-        let found = if self.archives.len() == 1 {
-            self.archives[0].read_member_with_options(name.as_bytes(), options)
-        } else if let Some(index) = self
+        let found = if let Some(index) = self
             .infos
             .iter()
-            .position(|info| info.name == name.as_bytes())
+            .rposition(|info| info.name == name.as_bytes())
         {
-            rars_rs::read_volume_member_at_with_options(&self.archives, index, options)
+            if self.archives.len() == 1 {
+                self.archives[0].read_member_at_with_options(index, options)
+            } else {
+                rars_rs::read_volume_member_at_with_options(&self.archives, index, options)
+            }
         } else {
             Ok(None)
         };
@@ -1004,6 +1007,25 @@ fn read_options<'a>(
 // requiring browser-only types to work in native Rust unit tests.
 #[cfg(test)]
 mod host_tests {
+    #[test]
+    fn duplicate_name_metadata_selects_the_last_entry() {
+        let mut builder = rars_rs::Builder::new(rars_rs::ArchiveVersion::Rar50)
+            .store(true)
+            .allow_duplicate_names(true);
+        for payload in [b"first".as_slice(), b"second".as_slice()] {
+            builder
+                .add_bytes(b"same".to_vec(), payload.to_vec(), None, None)
+                .unwrap();
+        }
+        let archive = rars_rs::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        let file = super::RarFile {
+            infos: archive.members().map(super::info_from_member).collect(),
+            archives: vec![archive],
+            password: None,
+        };
+        assert_eq!(file.get_info("same").unwrap().size, 6.0);
+    }
+
     #[test]
     fn binding_preserves_rar5_member_solid_flags() {
         for version in [

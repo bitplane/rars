@@ -24,6 +24,13 @@ archive.testrar(options=options)
 comment = archive.read_comment(options=options)
 ```
 
+Member names select the last matching archive entry. Each `RarInfo` from
+`infolist()` or `getinfo()` retains its `member_index` and selects that exact
+entry in reads, extraction, comments, timestamps and link inspection. This
+distinguishes duplicate raw names. A `RarInfo` from another `RarFile` is rejected,
+even when that file was opened from the same bytes. `extractall(members=...)`
+also preserves object identity; omit `members` to extract every entry.
+
 `ReadOptions` is immutable and reusable. Its limits and cancellation token are
 readable properties. Every call starts fresh output budgets; sharing an options
 object does not share a cumulative budget. Limits accept nonnegative integers

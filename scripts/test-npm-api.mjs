@@ -42,6 +42,31 @@ assert.equal(decoded.get(new Uint8Array([99, 97, 102, 130])).index, 1);
 assert.equal(decoded.get("missing"), undefined);
 console.log("npm decoded-name ambiguity checks passed");
 
+// Repeated raw names are distinct entries; names select the last one.
+const duplicateRequests = [];
+const { RarArchive: DuplicateArchive } = createApi({
+  prepareArchiveSources: async (input) => [input],
+  setErrorFactory() {},
+  request: async (operation, payload) => {
+    if (operation === "open") return { entries: [
+      { index: 0, name: "same", nameBytes: new TextEncoder().encode("same"), size: 5 },
+      { index: 1, name: "same", nameBytes: new TextEncoder().encode("same"), size: 6 },
+    ] };
+    duplicateRequests.push(payload.index);
+    return new Uint8Array([payload.index]);
+  },
+});
+for (const settings of [{}, { legacyNameEncoding: "cp850" }]) {
+  const archive = await DuplicateArchive.open(new Uint8Array(), settings);
+  assert.equal(archive.get("same").index, 1);
+  assert.equal(archive.get("same").size, 6);
+  for (const entry of archive.getAll("same")) {
+    assert.deepEqual(await entry.bytes(), new Uint8Array([entry.index]));
+  }
+}
+assert.deepEqual(duplicateRequests, [0, 1, 0, 1]);
+console.log("npm duplicate member identity checks passed");
+
 // The handwritten API validates and forwards workspace limits without a WASM build.
 const quotaRequests = [];
 const { RarArchive: QuotaArchive } = createApi({

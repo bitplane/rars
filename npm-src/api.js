@@ -106,10 +106,11 @@ export function createApi(runtime) {
 
     get(name) {
       const matches = this.getAll(name);
-      if (this._legacyNameEncoding != null && typeof name === "string" && matches.length > 1) {
+      if (this._legacyNameEncoding != null && typeof name === "string"
+          && matches.some((entry) => !sameName(entry.nameBytes, matches[0].nameBytes))) {
         throw new RarError("AMBIGUOUS_ENTRY", "decoded name is ambiguous; use getAll() or an entry index");
       }
-      return matches[0];
+      return matches.at(-1);
     }
 
     getAll(name) {

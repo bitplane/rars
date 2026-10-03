@@ -27,6 +27,9 @@ to open a volume set. Entry objects use archive-order indices internally, so
 duplicate names and non-UTF-8 names remain unambiguous; `nameBytes` contains
 the exact header bytes.
 
+`get(name)` selects the last matching entry; `getAll(name)` returns every match
+in archive order. Each returned entry reads its own payload by index.
+
 Node also accepts paths and file URLs. Passing the first path of a conventional
 volume set discovers its siblings automatically.
 

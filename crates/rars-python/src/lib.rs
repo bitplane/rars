@@ -349,6 +349,9 @@ fn progress_phase(operation: rars_rs::WriteOperation) -> &'static str {
 #[derive(Debug, Clone)]
 struct RarInfo {
     #[pyo3(get)]
+    member_index: usize,
+    archive_identity: Option<Arc<()>>,
+    #[pyo3(get)]
     filename: String,
     #[pyo3(get)]
     orig_filename_bytes: Vec<u8>,
@@ -402,6 +405,7 @@ impl RarInfo {
 
 #[pyclass(module = "rars", skip_from_py_object)]
 struct RarFile {
+    identity: Arc<()>,
     encoding: Option<rars_rs::filename::LegacyNameEncoding>,
     archive: rars_rs::Archive,
     password: Option<Vec<u8>>,
@@ -454,12 +458,7 @@ impl RarFile {
     }
 
     fn getinfo(&self, name: &Bound<'_, PyAny>) -> PyResult<RarInfo> {
-        let target = self.resolve_name(name)?;
-        self.infos
-            .iter()
-            .find(|info| info.orig_filename_bytes == target)
-            .cloned()
-            .ok_or_else(|| PyKeyError::new_err(String::from_utf8_lossy(&target).into_owned()))
+        Ok(self.infos[self.resolve_index(name)?].clone())
     }
 
     #[pyo3(signature = (name, pwd = None, *, options = None))]
@@ -470,16 +469,17 @@ impl RarFile {
         pwd: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
     ) -> PyResult<Vec<u8>> {
-        let target = self.resolve_name(name)?;
+        check_read_options_cancellation(options)?;
+        let index = self.resolve_index(name)?;
         let password = py_password(pwd)?.or_else(|| self.password.clone());
         py.detach(|| {
-            self.archive.read_member_with_options(
-                &target,
+            self.archive.read_member_at_with_options(
+                index,
                 self.extraction_options(options, password.as_deref()),
             )
         })
         .map_err(map_error)?
-        .ok_or_else(|| PyKeyError::new_err(String::from_utf8_lossy(&target).into_owned()))
+        .ok_or_else(|| PyKeyError::new_err("member has no file payload"))
     }
 
     #[pyo3(signature = (name, pwd = None, *, options = None))]
@@ -506,7 +506,8 @@ impl RarFile {
         overwrite: bool,
         options: Option<&ReadOptions>,
     ) -> PyResult<PathBuf> {
-        let target = self.resolve_name(member)?;
+        check_read_options_cancellation(options)?;
+        let target = self.resolve_index(member)?;
         let out_dir = path.unwrap_or_else(|| PathBuf::from("."));
         let password = py_password(pwd)?.or_else(|| self.password.clone());
         let written = py
@@ -523,7 +524,7 @@ impl RarFile {
         written
             .into_iter()
             .next()
-            .ok_or_else(|| PyKeyError::new_err(String::from_utf8_lossy(&target).into_owned()))
+            .ok_or_else(|| PyKeyError::new_err("member has no extractable payload"))
     }
 
     #[pyo3(signature = (path = None, members = None, pwd = None, overwrite = false, *, options = None))]
@@ -536,13 +537,14 @@ impl RarFile {
         overwrite: bool,
         options: Option<&ReadOptions>,
     ) -> PyResult<Vec<PathBuf>> {
+        check_read_options_cancellation(options)?;
         let out_dir = path.unwrap_or_else(|| PathBuf::from("."));
         let selected = match members {
             Some(members) => Some(
                 members
                     .try_iter()?
-                    .map(|member| self.resolve_name(&member?))
-                    .collect::<PyResult<HashSet<Vec<u8>>>>()?,
+                    .map(|member| self.resolve_index(&member?))
+                    .collect::<PyResult<HashSet<usize>>>()?,
             ),
             None => None,
         };
@@ -608,12 +610,7 @@ impl RarFile {
         member: &Bound<'_, PyAny>,
         pwd: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Option<Vec<u8>>> {
-        let name = self.resolve_name(member)?;
-        let index = self
-            .archive
-            .members()
-            .position(|member| member.meta.name == name)
-            .ok_or_else(|| PyKeyError::new_err("member not found"))?;
+        let index = self.resolve_index(member)?;
         let password = py_password(pwd)?.or_else(|| self.password.clone());
         py.detach(|| self.archive.member_comment_at(index, password.as_deref()))
             .map_err(map_error)
@@ -622,12 +619,11 @@ impl RarFile {
     /// Returns raw target bytes for a supported RAR5 or legacy Unix link.
     /// This reads archive metadata and never follows the link.
     fn readlink(&self, member: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
-        let name = self.resolve_name(member)?;
-        let (index, member) = self
+        let index = self.resolve_index(member)?;
+        let member = self
             .archive
             .members()
-            .enumerate()
-            .find(|(_, member)| member.meta.name == name)
+            .nth(index)
             .ok_or_else(|| PyKeyError::new_err("member not found"))?;
         if member.is_legacy_unix_symlink() {
             return Ok(self
@@ -644,11 +640,11 @@ impl RarFile {
 
     /// Stored file timestamps as exact integer Unix nanoseconds. Missing kinds are absent.
     fn gettimes(&self, member: &Bound<'_, PyAny>) -> PyResult<HashMap<String, i128>> {
-        let name = self.resolve_name(member)?;
+        let index = self.resolve_index(member)?;
         let member = self
             .archive
             .members()
-            .find(|member| member.meta.name == name)
+            .nth(index)
             .ok_or_else(|| PyKeyError::new_err("member not found"))?;
         let mut times = member.file_times().map_err(map_error)?.unwrap_or_default();
         if times.modified.is_none() {
@@ -711,6 +707,26 @@ impl RarFile {
 }
 
 impl RarFile {
+    fn resolve_index(&self, member: &Bound<'_, PyAny>) -> PyResult<usize> {
+        if let Ok(info) = member.extract::<PyRef<'_, RarInfo>>() {
+            if !info
+                .archive_identity
+                .as_ref()
+                .is_some_and(|identity| Arc::ptr_eq(identity, &self.identity))
+            {
+                return Err(PyValueError::new_err(
+                    "RarInfo belongs to a different archive",
+                ));
+            }
+            return Ok(info.member_index);
+        }
+        let name = self.resolve_name(member)?;
+        self.infos
+            .iter()
+            .rposition(|info| info.orig_filename_bytes == name)
+            .ok_or_else(|| PyKeyError::new_err(String::from_utf8_lossy(&name).into_owned()))
+    }
+
     fn extraction_options<'a>(
         &self,
         settings: Option<&'a ReadOptions>,
@@ -726,9 +742,9 @@ impl RarFile {
             if let Ok(text) = name.extract::<String>() {
                 let mut matches = self.infos.iter().filter(|info| info.filename == text);
                 if let Some(found) = matches.next() {
-                    if matches.next().is_some() {
+                    if matches.any(|other| other.orig_filename_bytes != found.orig_filename_bytes) {
                         return Err(PyValueError::new_err(
-                            "ambiguous decoded name; select an entry by its original bytes",
+                            "ambiguous decoded name; select an entry by its RarInfo or original bytes",
                         ));
                     }
                     return Ok(found.orig_filename_bytes.clone());
@@ -753,17 +769,22 @@ impl RarFile {
             })
             .map_err(map_error)?;
         let encoding = options.and_then(|settings| settings.encoding);
+        let identity = Arc::new(());
         let infos = archive
             .members()
-            .map(|member| {
+            .enumerate()
+            .map(|(index, member)| {
                 let name = member.decoded_name(encoding)?.into_owned();
                 let mut info = info_from_member(member);
+                info.member_index = index;
+                info.archive_identity = Some(identity.clone());
                 info.filename = String::from_utf8_lossy(&name).into_owned();
                 Ok(info)
             })
             .collect::<rars_rs::Result<Vec<_>>>()
             .map_err(map_error)?;
         Ok(Self {
+            identity,
             encoding,
             archive,
             password,
@@ -1001,6 +1022,7 @@ impl RarBuilder {
     ) -> PyResult<Self> {
         let archive = match source.extract::<PyRef<'_, RarFile>>() {
             Ok(archive) => RarFile {
+                identity: archive.identity.clone(),
                 encoding: None,
                 archive: archive.archive.clone(),
                 password: archive.password.clone(),
@@ -1776,19 +1798,41 @@ fn member_name_bytes(value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
     Ok(value.extract::<String>()?.into_bytes())
 }
 
+fn check_read_options_cancellation(options: Option<&ReadOptions>) -> PyResult<()> {
+    if options
+        .and_then(|options| options.cancellation.as_ref())
+        .is_some_and(rars_rs::ReadCancellation::is_cancelled)
+    {
+        return Err(map_error(rars_rs::Error::Cancelled));
+    }
+    Ok(())
+}
+
 trait Selection {
-    fn contains_member(&self, name: &[u8]) -> bool;
+    fn contains_member(&self, index: usize, name: &[u8]) -> bool;
 }
 
 impl Selection for Vec<u8> {
-    fn contains_member(&self, name: &[u8]) -> bool {
+    fn contains_member(&self, _index: usize, name: &[u8]) -> bool {
         self.as_slice() == name
     }
 }
 
 impl Selection for HashSet<Vec<u8>> {
-    fn contains_member(&self, name: &[u8]) -> bool {
+    fn contains_member(&self, _index: usize, name: &[u8]) -> bool {
         self.contains(name)
+    }
+}
+
+impl Selection for usize {
+    fn contains_member(&self, index: usize, _name: &[u8]) -> bool {
+        *self == index
+    }
+}
+
+impl Selection for HashSet<usize> {
+    fn contains_member(&self, index: usize, _name: &[u8]) -> bool {
+        self.contains(&index)
     }
 }
 
@@ -1888,8 +1932,8 @@ fn extract_archive<S: Selection>(
         let last = archive
             .members()
             .enumerate()
-            .filter(|(_, member)| {
-                !member.meta.is_redirection && selected.contains_member(&member.meta.name)
+            .filter(|(index, member)| {
+                !member.meta.is_redirection && selected.contains_member(*index, &member.meta.name)
             })
             .map(|(index, _)| index)
             .last();
@@ -1922,7 +1966,7 @@ fn extract_archive<S: Selection>(
                 if meta.is_redirection {
                     return Ok(rars_rs::ExtractionDecision::Skip);
                 }
-                if !selected.contains_member(&meta.name) {
+                if !selected.contains_member(current, &meta.name) {
                     return Ok(if solid && !meta.is_directory {
                         rars_rs::ExtractionDecision::Extract(Box::new(io::sink()))
                     } else {
@@ -2090,6 +2134,8 @@ fn info_from_member(member: rars_rs::ArchiveMember) -> RarInfo {
         .and_then(rars_rs::StoredTimestamp::calendar_fields);
     let filename = String::from_utf8_lossy(&member.meta.name).into_owned();
     RarInfo {
+        member_index: 0,
+        archive_identity: None,
         filename,
         orig_filename_bytes: member.meta.name,
         file_size: member.meta.unpacked_size,
@@ -2578,6 +2624,7 @@ mod tests {
                 })
                 .unwrap();
                 let file = RarFile {
+                    identity: Arc::new(()),
                     encoding: None,
                     infos: archive.members().map(info_from_member).collect(),
                     archive,
@@ -2756,6 +2803,7 @@ mod tests {
                     let source = Py::new(
                         py,
                         RarFile {
+                            identity: Arc::new(()),
                             encoding: None,
                             archive,
                             password: None,

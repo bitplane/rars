@@ -19,6 +19,22 @@ function refuses(run, code) {
     return true;
   });
 }
+check('duplicate names select matching metadata and preserve indexed payloads', () => {
+  // Two stored RAR5 entries named one.txt, containing first and second. The
+  // second header name was changed from two.txt and its header CRC repaired.
+  const duplicate = new Uint8Array(Buffer.from(
+    'UmFyIRoHAQDFGjMyAwEAAIe1fWw4AgMjBQQFIFfucZIAAAdvbmUudHh0IgIASJ7flVWyNBvXKh1H6TwHIs0a76r8wrPpigI6do4ABypmaXJzdFbJyX04AgMjBgQGIGkRH7YAAAdvbmUudHh0IgIAJJVKEjlQkpNfDgy070r9SAIVz/fdw+qSIEAjdC8w2e9zZWNvbmQZsjo1AwUAAA==',
+    'base64',
+  ));
+  const archive = new engine.RarFile(duplicate);
+  const info = archive.getInfo('one.txt');
+  assert.equal(info.size, 6);
+  assert.deepEqual(archive.read('one.txt'), bytes('second'));
+  assert.deepEqual(archive.readAt(0), bytes('first'));
+  assert.deepEqual(archive.readAt(1), bytes('second'));
+  info.free();
+  archive.free();
+});
 check('version and stored round trips expose all metadata getters', () => {
   assert.match(engine.version(), /^\d+\.\d+\.\d+$/);
   for (const format of engine.formats()) {
