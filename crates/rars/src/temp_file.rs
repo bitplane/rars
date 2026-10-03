@@ -1,4 +1,4 @@
-//! Private temporary files shared by reader scratch and writer spools.
+//! Temporary creation shared by private spools and archive publication.
 
 use crate::{Error, Result};
 use std::fs::File;
@@ -8,46 +8,77 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TemporaryKind {
+    Spool,
+    #[cfg(any(feature = "write", feature = "recovery"))]
+    Archive,
+}
+
 pub(crate) fn next_sequence() -> u64 {
     SEQUENCE.fetch_add(1, Ordering::Relaxed)
 }
 
 pub(crate) fn create_with_sequence<C>(
     directory: &Path,
+    admit: impl FnMut(usize) -> Result<C>,
+    next_sequence: impl FnMut() -> u64,
+) -> Result<(PathBuf, File, C)> {
+    create_named_with_sequence(TemporaryKind::Spool, directory, admit, next_sequence)
+}
+
+pub(crate) fn create_named_with_sequence<C>(
+    kind: TemporaryKind,
+    directory: &Path,
     mut admit: impl FnMut(usize) -> Result<C>,
     mut next_sequence: impl FnMut() -> u64,
 ) -> Result<(PathBuf, File, C)> {
+    let (prefix, overflow, collision) = match kind {
+        TemporaryKind::Spool => (
+            ".rars-spool",
+            "spool path capacity overflows",
+            "could not allocate a unique rars spool file",
+        ),
+        #[cfg(any(feature = "write", feature = "recovery"))]
+        TemporaryKind::Archive => (
+            ".rars-writing",
+            "temporary path capacity overflows",
+            "could not allocate a unique archive temporary file",
+        ),
+    };
     for _ in 0..128 {
         let sequence = next_sequence();
-        // Prefix (12), u32 process ID (at most 10), separator (1), and
-        // u64 hex sequence (16) total at most 39 bytes in this buffer.
+        // Both prefixes, a process ID and u64 hex sequence fit this buffer.
         let mut name = [0u8; 64];
         let mut name_writer = std::io::Cursor::new(&mut name[..]);
         write!(
             name_writer,
-            ".rars-spool-{}-{sequence:016x}",
+            "{prefix}-{}-{sequence:016x}",
             std::process::id()
         )
-        .expect("spool name fits its fixed buffer");
+        .expect("temporary name fits its fixed buffer");
         let name_len = name_writer.position() as usize;
-        let name = std::str::from_utf8(&name[..name_len]).expect("ASCII spool name");
+        let name = std::str::from_utf8(&name[..name_len]).expect("ASCII temporary name");
         let capacity = directory
             .as_os_str()
             .len()
             .checked_add(1 + name_len)
-            .ok_or(Error::InvalidArgument("spool path capacity overflows"))?;
+            .ok_or(Error::InvalidArgument(overflow))?;
         let path_charge = admit(capacity)?;
         let mut path = PathBuf::with_capacity(capacity);
         path.push(directory);
         path.push(name);
         let mut options = File::options();
-        options.read(true).write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            // Temporary storage can hold plaintext before encryption or after
-            // decryption, so keep its creation mode private.
-            options.mode(0o600);
+        options.write(true).create_new(true);
+        if kind == TemporaryKind::Spool {
+            options.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                // Temporary storage can hold plaintext before encryption or after
+                // decryption, so keep its creation mode private.
+                options.mode(0o600);
+            }
         }
         match options.open(&path) {
             Ok(file) => {
@@ -57,11 +88,7 @@ pub(crate) fn create_with_sequence<C>(
             Err(error) => return Err(error.into()),
         }
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        "could not allocate a unique rars spool file",
-    )
-    .into())
+    Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, collision).into())
 }
 
 /// An uncharged file owner. The reader applies its own logical disk quota.
@@ -114,5 +141,40 @@ impl Drop for TemporaryFile {
     fn drop(&mut self) {
         self.file = None;
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(all(test, unix, any(feature = "write", feature = "recovery")))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn creation_permissions_preserve_private_spools_and_default_archives() {
+        let root = crate::scratch::case("temporary-creation-permissions");
+        let reference = File::create(root.join("reference")).unwrap();
+        let default_mode = reference.metadata().unwrap().permissions().mode() & 0o777;
+        for kind in [TemporaryKind::Spool, TemporaryKind::Archive] {
+            let (_, mut file, ()) =
+                create_named_with_sequence(kind, &root, |_| Ok(()), || 0).unwrap();
+            let mode = file.metadata().unwrap().permissions().mode() & 0o777;
+            if kind == TemporaryKind::Spool {
+                assert_eq!(mode & 0o077, 0, "plaintext spool must remain private");
+                file.write_all(b"payload").unwrap();
+                file.rewind().unwrap();
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes).unwrap();
+                assert_eq!(bytes, b"payload");
+            } else {
+                assert_eq!(
+                    mode, default_mode,
+                    "publication retains ordinary archive permissions"
+                );
+                assert!(
+                    file.read(&mut [0]).is_err(),
+                    "publication file remains write-only"
+                );
+            }
+        }
     }
 }
