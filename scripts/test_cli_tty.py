@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 import tempfile
+import termios
 
 
 def run_terminal(binary, arguments, password=None):
@@ -33,7 +34,11 @@ def run_terminal(binary, arguments, password=None):
                 if not block:
                     break
                 output.extend(block)
-                if password is not None and b"password: " in output and not sent:
+            if password is not None and b"password: " in output and not sent:
+                # rpassword prints its prompt before disabling echo. Check the
+                # terminal state even without new output: disabling echo itself
+                # produces no bytes on the master.
+                if not termios.tcgetattr(master)[3] & termios.ECHO:
                     os.write(master, password + b"\n")
                     sent = True
             if not reaped:
@@ -70,6 +75,23 @@ def prompted(binary, fixture, password, expected_code):
     assert password + b"\r\n" not in output, "password was echoed"
 
 
+def prompt_readiness_regression():
+    # Deliberately separate prompt publication from echo suppression to expose
+    # the ordering that was intermittently hit under CI scheduling.
+    child = """
+import sys, termios, time
+print('password: ', end='', flush=True)
+time.sleep(0.2)
+settings = termios.tcgetattr(0)
+settings[3] &= ~termios.ECHO
+termios.tcsetattr(0, termios.TCSANOW, settings)
+assert sys.stdin.readline() == 'terminal-secret\\n'
+"""
+    code, output, sent = run_terminal(sys.executable, ["-c", child], b"terminal-secret")
+    assert sent and code == 0, (code, output, sent)
+    assert b"terminal-secret" not in output, "harness sent input before echo was disabled"
+
+
 def progress_suite(binary, root):
     with tempfile.TemporaryDirectory(prefix="cli-progress-", dir=root / "target") as name:
         directory = Path(name)
@@ -92,6 +114,7 @@ def main():
         progress_suite(binary, root)
         return
     fixtures = root / "crates/rars/tests/fixtures/rar15_40/encrypted"
+    prompt_readiness_regression()
     header = fixtures / "header_rar300_password.rar"
     prompted(binary, header, b"password", 0)
     wrong = subprocess.run([binary, "--threads", "1", "test", "--password", "wrong-password", str(header)],
