@@ -2,6 +2,51 @@
 
 use rars::{Archive, ArchiveReader, ArchiveVersion, Builder, ErrorKind};
 
+#[test]
+fn volume_lookup_counts_redirections_in_logical_member_indices() {
+    for format in [ArchiveVersion::Rar50, ArchiveVersion::Rar70] {
+        let mut first = Builder::new(format).store(true);
+        first.add_directory(b"dir".to_vec(), None, None).unwrap();
+        first
+            .add_unix_symlink(b"link".to_vec(), b"first".to_vec(), false, None, None)
+            .unwrap();
+        first
+            .add_bytes(b"first".to_vec(), b"first payload".to_vec(), None, None)
+            .unwrap();
+        let mut second = Builder::new(format).store(true);
+        second
+            .add_bytes(b"last".to_vec(), b"last payload".to_vec(), None, None)
+            .unwrap();
+        let archives = [
+            ArchiveReader::read_owned(first.to_bytes().unwrap()).unwrap(),
+            ArchiveReader::read_owned(second.to_bytes().unwrap()).unwrap(),
+        ];
+        let members = rars::volume_members(&archives).unwrap();
+        assert_eq!(members.len(), 4);
+        for (index, expected) in [
+            None,
+            None,
+            Some(b"first payload".as_slice()),
+            Some(b"last payload"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                rars::read_volume_member_at(&archives, index, None)
+                    .unwrap()
+                    .as_deref(),
+                expected,
+                "{format}, index {index}"
+            );
+        }
+        assert_eq!(
+            rars::read_volume_member_at(&archives, 4, None).unwrap(),
+            None
+        );
+    }
+}
+
 fn mixed(format: ArchiveVersion, solid: bool, stored: bool) -> Archive {
     let mut builder = Builder::new(format).solid(solid).store(stored);
     builder

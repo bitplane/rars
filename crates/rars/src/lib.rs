@@ -1509,12 +1509,31 @@ pub fn read_volume_member_at_with_options(
     index: usize,
     options: ArchiveReadOptions<'_>,
 ) -> Result<Option<Vec<u8>>> {
+    options.check_cancelled()?;
+    // Metadata indices include redirections, while the volume extractor opens
+    // writers only for files and directories. Fold continuation headers and
+    // translate the requested logical index to that callback order.
+    let mut logical = 0usize;
+    let mut output = 0usize;
+    let mut selected_output = None;
+    for member in archives.iter().flat_map(Archive::member_refs) {
+        if member.is_split_before() {
+            continue;
+        }
+        if !member.is_redirection() {
+            if logical == index {
+                selected_output = Some(output);
+            }
+            output += 1;
+        }
+        logical += 1;
+    }
     let collected = std::sync::Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
     let current = std::cell::Cell::new(0usize);
     extract_volumes_to_with_options(archives, options, |meta| {
         let this = current.get();
         current.set(this.saturating_add(1));
-        if this != index || meta.is_directory {
+        if Some(this) != selected_output || meta.is_directory {
             return Ok(Box::new(std::io::sink()) as Box<dyn Write>);
         }
         let sink = SharedBuffer(std::sync::Arc::clone(&collected));

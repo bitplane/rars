@@ -42,6 +42,15 @@ impl<'a> ArchiveMemberRef<'a> {
         matches!(self, Self::Rar50Plus(file) if file.is_redirection())
     }
 
+    /// Whether this header continues a member from an earlier volume.
+    pub fn is_split_before(self) -> bool {
+        match self {
+            Self::Rar13(entry) => entry.is_split_before(),
+            Self::Rar15To40(file) => file.is_split_before(),
+            Self::Rar50Plus(file) => file.is_split_before(),
+        }
+    }
+
     /// Whether this member declares a dependency on preceding decoded history.
     /// RAR 1.3 has no member flag; consult its archive main header.
     pub fn is_solid(self) -> bool {
