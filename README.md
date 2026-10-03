@@ -158,6 +158,10 @@ created outside timing and compression setup clones source handles without
 copying payloads. Input copying and pool creation have separate benchmarks.
 Runs default to one and two threads; set `RARS_BENCH_THREADS=1,2,4` explicitly
 for a wider comparison. Keep build concurrency low with `CARGO_BUILD_JOBS=1`.
+`cargo bench -p rars --bench huffman_tables` measures decoder table construction
+and checkpoint copying separately, with fixed inputs prepared outside the timer.
+It also works with `--no-default-features`.
+
 Record the source revision, compiler, benchmark selection and thread counts
 beside saved results under `target/`; compare measurements with the same setup.
 

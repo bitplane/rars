@@ -64,3 +64,7 @@ required-features = ["write", "parallel"]
 name = "member_lookup"
 harness = false
 required-features = ["write"]
+
+[[bench]]
+name = "huffman_tables"
+harness = false

@@ -5,17 +5,10 @@ use super::{Error, Result};
 
 #[derive(Debug)]
 pub(super) struct Huffman<B: Budget = Allowance> {
-    symbols: Buffer<HuffmanSymbol, B>,
+    symbols: Buffer<usize, B>,
     first_code: [u16; 16],
     first_index: [usize; 16],
     counts: [u16; 16],
-}
-
-#[derive(Debug, Clone, Copy)]
-struct HuffmanSymbol {
-    code: u16,
-    len: u8,
-    symbol: usize,
 }
 
 impl<B: Budget> Huffman<B> {
@@ -34,12 +27,10 @@ impl<B: Budget> Huffman<B> {
     /// the supported formats. Invalid prefixes are rejected when decoded.
     pub(super) fn from_counts(lengths: &[u8], counts: [u16; 16], allowance: &B) -> Result<Self> {
         let mut first_code = [0u16; 16];
-        let mut next_code = [0u16; 16];
         let mut code = 0u16;
         for len in 1..=15 {
             code = (code + counts[len - 1]) << 1;
             first_code[len] = code;
-            next_code[len] = code;
         }
         let mut first_index = [0usize; 16];
         let mut index = 0usize;
@@ -47,16 +38,19 @@ impl<B: Budget> Huffman<B> {
             first_index[len] = index;
             index += usize::from(counts[len]);
         }
-        let mut symbols = Buffer::with_capacity(index, allowance)?;
+        // Codes of one length follow alphabet order. Scatter directly into
+        // those ranges instead of storing (code, length, symbol) and sorting.
+        // Keep usize indices: the public RAR5 constructor also accepts sparse
+        // alphabets whose symbol index exceeds a 16-bit value.
+        let mut symbols = Buffer::filled(index, 0, allowance)?;
+        let mut next_index = first_index;
         for (symbol, &len) in lengths.iter().enumerate() {
             if len == 0 {
                 continue;
             }
-            let code = next_code[len as usize];
-            next_code[len as usize] += 1;
-            symbols.push_admitted(HuffmanSymbol { code, len, symbol });
+            symbols[next_index[len as usize]] = symbol;
+            next_index[len as usize] += 1;
         }
-        symbols.sort_unstable_by_key(|item| (item.len, item.code, item.symbol));
         Ok(Self {
             symbols,
             first_code,
@@ -100,7 +94,7 @@ impl<B: Budget> Huffman<B> {
                 let offset = code.wrapping_sub(self.first_code[len]);
                 if offset < count {
                     let index = self.first_index[len] + usize::from(offset);
-                    return Ok(self.symbols[index].symbol);
+                    return Ok(self.symbols[index]);
                 }
             }
         }
@@ -131,6 +125,7 @@ mod tests {
         counts[2] = 1;
         counts[3] = 2;
         let table = Huffman::from_counts(&lengths, counts, &Allowance::default()).unwrap();
+        assert_eq!(table.len(), 4);
         // Canonical order is (length, alphabet index): 2=0, 4=10,
         // 0=110, 3=111. Each input ends exactly at the selected code.
         for (symbol, bits) in [
@@ -188,7 +183,7 @@ mod tests {
         let allowance = Allowance::limited(64 * 1024);
         let table = Huffman::from_counts(&[1, 1], counts, &allowance).unwrap();
         let retained = allowance.used();
-        assert!(retained > 0);
+        assert_eq!(retained, (2 * std::mem::size_of::<usize>()) as u64);
         let copy = table.try_clone().unwrap();
         assert_eq!(allowance.used(), retained * 2);
         drop(table);
@@ -209,5 +204,15 @@ mod tests {
             Huffman::from_counts(&[1, 1], counts, &Allowance::limited(0)),
             Err(Error::WorkspaceLimitExceeded(_))
         ));
+    }
+
+    #[test]
+    fn sparse_alphabet_keeps_the_full_symbol_index() {
+        let mut lengths = vec![0; 65_538];
+        lengths[65_537] = 1;
+        let mut counts = [0; 16];
+        counts[1] = 1;
+        let table = Huffman::from_counts(&lengths, counts, &Allowance::default()).unwrap();
+        assert_eq!(table.decode(|| Ok(0), "empty", "invalid"), Ok(65_537));
     }
 }
