@@ -45,7 +45,7 @@ pub mod filter;
 mod filter_search;
 mod io_util;
 mod member;
-pub use member::{ArchiveMemberRef, ArchiveMemberRefs};
+pub use member::{ArchiveIndex, ArchiveMemberRef, ArchiveMemberRefs};
 mod output_limit;
 mod parallel;
 mod parse_budget;
@@ -648,6 +648,22 @@ impl Archive {
     /// The borrow prevents mutation of the archive while these views are in use.
     pub fn member_refs(&self) -> ArchiveMemberRefs<'_> {
         ArchiveMemberRefs::new(self)
+    }
+
+    /// Builds an optional zero-copy metadata index for repeated lookup.
+    /// The archive cannot be mutated while this index remains in use.
+    ///
+    /// ```compile_fail
+    /// # fn example(archive: &mut rars::Archive) {
+    /// let index = archive.index();
+    /// if let rars::Archive::Rar13(legacy) = archive {
+    ///     legacy.entries.clear();
+    /// }
+    /// println!("{}", index.len());
+    /// # }
+    /// ```
+    pub fn index(&self) -> ArchiveIndex<'_> {
+        ArchiveIndex::new(self)
     }
 
     /// Streams extracted entries to caller-provided writers.

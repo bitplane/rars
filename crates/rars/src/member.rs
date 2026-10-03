@@ -2,6 +2,7 @@
 
 use crate::{rar13, rar15_40, rar50, Archive, ArchiveMember, Result};
 use std::borrow::Cow;
+use std::collections::HashMap;
 
 /// A member header borrowed from its archive, including all format metadata.
 ///
@@ -120,6 +121,71 @@ impl<'a> Iterator for ArchiveMemberRefs<'a> {
     }
 }
 
+/// An optional index borrowing immutable archive headers and name bytes.
+///
+/// Construction traverses headers once and allocates caller-owned index storage.
+/// Indexed metadata lookup does not allocate or traverse preceding members.
+/// Duplicate entries retain their archive-order indices. Name lookup selects the
+/// last entry, while payload lookup excludes directories and redirections.
+/// Payload decoding still uses the archive's extraction policies.
+#[derive(Debug)]
+pub struct ArchiveIndex<'a> {
+    members: Vec<ArchiveMemberRef<'a>>,
+    names: HashMap<&'a [u8], NameIndices>,
+}
+
+#[derive(Debug, Default)]
+struct NameIndices {
+    last: usize,
+    payload: Option<usize>,
+}
+
+impl<'a> ArchiveIndex<'a> {
+    pub(crate) fn new(archive: &'a Archive) -> Self {
+        let members: Vec<_> = archive.member_refs().collect();
+        let mut names: HashMap<&[u8], NameIndices> = HashMap::new();
+        for (index, member) in members.iter().enumerate() {
+            let indices = names.entry(member.name_bytes()).or_default();
+            indices.last = index;
+            if !member.is_directory() && !member.is_redirection() {
+                indices.payload = Some(index);
+            }
+        }
+        Self { members, names }
+    }
+
+    /// Number of members, including directories and redirections.
+    pub fn len(&self) -> usize {
+        self.members.len()
+    }
+
+    /// Whether the archive contains no members.
+    pub fn is_empty(&self) -> bool {
+        self.members.is_empty()
+    }
+
+    /// Borrows metadata for an archive-order index without copying it.
+    pub fn get(&self, index: usize) -> Option<ArchiveMemberRef<'a>> {
+        self.members.get(index).copied()
+    }
+
+    /// Archive-order index of the last entry with this exact stored name.
+    pub fn index_of(&self, name: &[u8]) -> Option<usize> {
+        self.names.get(name).map(|indices| indices.last)
+    }
+
+    /// Last payload index, matching [`Archive::read_member`] selection.
+    /// A later directory or redirection with the same name does not hide a file.
+    pub fn payload_index_of(&self, name: &[u8]) -> Option<usize> {
+        self.names.get(name).and_then(|indices| indices.payload)
+    }
+
+    /// All borrowed member headers in archive order.
+    pub fn members(&self) -> &[ArchiveMemberRef<'a>] {
+        &self.members
+    }
+}
+
 #[cfg(all(test, feature = "write"))]
 mod tests {
     use crate::{ArchiveReader, ArchiveVersion, Builder};
@@ -163,6 +229,38 @@ mod tests {
             assert_eq!(
                 archive.read_member_at(1, None).unwrap().unwrap(),
                 b"payload"
+            );
+        }
+    }
+
+    #[test]
+    fn member_index_preserves_duplicates_and_distinguishes_payload_lookup() {
+        for version in ArchiveVersion::ALL {
+            let mut builder = Builder::new(version)
+                .store(true)
+                .allow_duplicate_names(true);
+            for data in [b"first".as_slice(), b"second"] {
+                builder
+                    .add_bytes(b"same".to_vec(), data.to_vec(), None, None)
+                    .unwrap();
+            }
+            builder.add_directory(b"same".to_vec(), None, None).unwrap();
+            let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+            let index = archive.index();
+            assert_eq!(index.len(), 3, "{version}");
+            assert!(!index.is_empty());
+            assert_eq!(index.index_of(b"same"), Some(2));
+            assert_eq!(index.payload_index_of(b"same"), Some(1));
+            assert_eq!(index.index_of(b"missing"), None);
+            assert_eq!(index.payload_index_of(b"missing"), None);
+            assert_eq!(index.get(0).unwrap().to_owned().meta.unpacked_size, 5);
+            assert_eq!(index.get(1).unwrap().to_owned().meta.unpacked_size, 6);
+            assert!(index.get(2).unwrap().is_directory());
+            assert!(index.get(3).is_none());
+            assert_eq!(index.members().len(), 3);
+            assert_eq!(
+                archive.read_member(b"same", None).unwrap().unwrap(),
+                b"second"
             );
         }
     }

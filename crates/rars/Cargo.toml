@@ -59,3 +59,8 @@ required-features = ["write"]
 name = "parallel"
 harness = false
 required-features = ["write", "parallel"]
+
+[[bench]]
+name = "member_lookup"
+harness = false
+required-features = ["write"]

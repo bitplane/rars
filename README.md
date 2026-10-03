@@ -83,6 +83,13 @@ Enable encrypted reading independently when needed:
 rars = { version = "0.10", default-features = false, features = ["encryption"] }
 ```
 
+Use `Archive::member_refs()` to inspect headers without copying names or extra
+records. For repeated metadata lookup, `Archive::index()` builds an optional
+index that borrows those headers and keeps duplicate entries addressable by
+archive-order index. Its storage belongs to the caller; the archive cannot be
+mutated while the borrowed index is in use. Ordinary `members()` still returns
+owned metadata.
+
 | Feature | Adds |
 | --- | --- |
 | None | Parsing and sequential decoding for RAR 1.3–7, metadata, checksums, comments, solid/split archives, cancellation and reader resource policies |
