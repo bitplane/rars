@@ -2101,7 +2101,7 @@ impl<B: Budget> Reader20State<B> {
             return Ok(());
         }
         if self.audio_block {
-            if self.audio_tables[self.cur_channel].symbols.is_empty() {
+            if self.audio_tables[self.cur_channel].state.is_empty() {
                 return Ok(());
             }
             if self.audio_tables[self.cur_channel].decode(&mut self.bits)? == 256 {
@@ -2109,7 +2109,7 @@ impl<B: Budget> Reader20State<B> {
                 self.in_block = true;
             }
         } else {
-            if self.main.symbols.is_empty() {
+            if self.main.state.is_empty() {
                 return Ok(());
             }
             if self.main.decode(&mut self.bits)? == 269 {
@@ -2187,29 +2187,15 @@ fn fill_levels(levels: &mut [u8], pos: &mut usize, count: usize, value: u8) -> R
 
 #[derive(Debug)]
 struct Huffman<B: Budget = Allowance> {
-    symbols: Buffer<HuffmanSymbol, B>,
-    first_code: [u16; 16],
-    first_index: [usize; 16],
-    counts: [u16; 16],
-}
-
-#[derive(Debug, Clone, Copy)]
-struct HuffmanSymbol {
-    code: u16,
-    len: u8,
-    symbol: usize,
+    state: super::canonical::Huffman<B>,
 }
 
 impl<B: Budget> Huffman<B> {
     fn with_allowance(allowance: &B) -> Self {
         Self {
-            symbols: Buffer::new(allowance),
-            first_code: [0; 16],
-            first_index: [0; 16],
-            counts: [0; 16],
+            state: super::canonical::Huffman::with_allowance(allowance),
         }
     }
-
     fn with_lengths(lengths: &[u8], allowance: &B) -> Result<Self> {
         let mut count = [0u16; 16];
         for &len in lengths {
@@ -2225,66 +2211,21 @@ impl<B: Budget> Huffman<B> {
         }
         validate_huffman_counts(&count)?;
 
-        let mut first_code = [0u16; 16];
-        let mut next_code = [0u16; 16];
-        let mut code = 0u16;
-        for len in 1..=15 {
-            code = (code + count[len - 1]) << 1;
-            first_code[len] = code;
-            next_code[len] = code;
-        }
-
-        let mut first_index = [0usize; 16];
-        let mut index = 0usize;
-        for len in 1..=15 {
-            first_index[len] = index;
-            index += usize::from(count[len]);
-        }
-
-        let mut symbols = Buffer::with_capacity(index, allowance)?;
-        for (symbol, &len) in lengths.iter().enumerate() {
-            if len == 0 {
-                continue;
-            }
-            let code = next_code[len as usize];
-            next_code[len as usize] += 1;
-            symbols.push_admitted(HuffmanSymbol { code, len, symbol });
-        }
-        symbols.sort_unstable_by_key(|item| (item.len, item.code, item.symbol));
         Ok(Self {
-            symbols,
-            first_code,
-            first_index,
-            counts: count,
+            state: super::canonical::Huffman::from_counts(lengths, count, allowance)?,
         })
     }
-
     fn try_clone(&self) -> Result<Self> {
         Ok(Self {
-            symbols: Buffer::copied(&self.symbols, &self.symbols.allowance())?,
-            first_code: self.first_code,
-            first_index: self.first_index,
-            counts: self.counts,
+            state: self.state.try_clone()?,
         })
     }
     fn decode(&self, bits: &mut BitReader<B>) -> Result<usize> {
-        let mut code = 0u16;
-        if self.symbols.is_empty() {
-            return Err(Error::InvalidData("RAR 2.0 empty Huffman table"));
-        }
-        for len in 1..=15 {
-            code = (code << 1) | bits.read_bit()? as u16;
-            let count = self.counts[len];
-            if count != 0 {
-                let first = self.first_code[len];
-                let offset = code.wrapping_sub(first);
-                if offset < count {
-                    let index = self.first_index[len] + usize::from(offset);
-                    return Ok(self.symbols[index].symbol);
-                }
-            }
-        }
-        Err(Error::InvalidData("RAR 2.0 invalid Huffman code"))
+        self.state.decode(
+            || bits.read_bit().map(|bit| bit as u16),
+            "RAR 2.0 empty Huffman table",
+            "RAR 2.0 invalid Huffman code",
+        )
     }
 }
 
@@ -2296,14 +2237,7 @@ impl Huffman<Allowance> {
 }
 
 fn validate_huffman_counts(count: &[u16; 16]) -> Result<()> {
-    let mut available = 1i32;
-    for &len_count in count.iter().skip(1) {
-        available = (available << 1) - i32::from(len_count);
-        if available < 0 {
-            return Err(Error::InvalidData("RAR 2.0 oversubscribed Huffman table"));
-        }
-    }
-    Ok(())
+    super::canonical::validate_counts(count, "RAR 2.0 oversubscribed Huffman table")
 }
 
 #[derive(Debug)]

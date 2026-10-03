@@ -4633,20 +4633,13 @@ impl HuffmanTable {
 }
 #[derive(Debug)]
 struct HuffmanState<B: Budget> {
-    symbols: Buffer<HuffmanSymbol, B>,
-    first_code: [u16; 16],
-    first_index: [usize; 16],
-    counts: [u16; 16],
-}
-
-#[derive(Debug, Clone, Copy)]
-struct HuffmanSymbol {
-    code: u16,
-    len: u8,
-    symbol: usize,
+    state: super::canonical::Huffman<B>,
 }
 
 impl<B: Budget> HuffmanState<B> {
+    pub fn is_empty(&self) -> bool {
+        self.state.is_empty()
+    }
     fn from_lengths(lengths: &[u8], allowance: &B) -> Result<Self> {
         let mut count = [0u16; 16];
         for &length in lengths {
@@ -4659,74 +4652,21 @@ impl<B: Budget> HuffmanState<B> {
         }
         validate_huffman_counts(&count)?;
 
-        let mut first_code = [0u16; 16];
-        let mut next_code = [0u16; 16];
-        let mut code = 0u16;
-        for length in 1..=15 {
-            code = (code + count[length - 1]) << 1;
-            first_code[length] = code;
-            next_code[length] = code;
-        }
-
-        let mut first_index = [0usize; 16];
-        let mut index = 0usize;
-        for length in 1..=15 {
-            first_index[length] = index;
-            index += usize::from(count[length]);
-        }
-
-        let mut symbols = Buffer::with_capacity(index, allowance)?;
-        for (symbol, &length) in lengths.iter().enumerate() {
-            if length == 0 {
-                continue;
-            }
-            let code = next_code[length as usize];
-            next_code[length as usize] += 1;
-            symbols.push_admitted(HuffmanSymbol {
-                code,
-                len: length,
-                symbol,
-            });
-        }
-        symbols.sort_unstable_by_key(|item| (item.len, item.code, item.symbol));
         Ok(Self {
-            symbols,
-            first_code,
-            first_index,
-            counts: count,
+            state: super::canonical::Huffman::from_counts(lengths, count, allowance)?,
         })
     }
-
     fn try_clone(&self) -> Result<Self> {
         Ok(Self {
-            symbols: Buffer::copied(&self.symbols, &self.symbols.allowance())?,
-            first_code: self.first_code,
-            first_index: self.first_index,
-            counts: self.counts,
+            state: self.state.try_clone()?,
         })
     }
-    pub fn is_empty(&self) -> bool {
-        self.symbols.is_empty()
-    }
-
     fn decode(&self, bits: &mut BitReader<'_>) -> Result<usize> {
-        if self.symbols.is_empty() {
-            return Err(Error::InvalidData("RAR 5 empty Huffman table"));
-        }
-        let mut code = 0u16;
-        for len in 1..=15 {
-            code = (code << 1) | bits.read_bits(1)? as u16;
-            let count = self.counts[len];
-            if count != 0 {
-                let first = self.first_code[len];
-                let offset = code.wrapping_sub(first);
-                if offset < count {
-                    let index = self.first_index[len] + usize::from(offset);
-                    return Ok(self.symbols[index].symbol);
-                }
-            }
-        }
-        Err(Error::InvalidData("RAR 5 invalid Huffman code"))
+        self.state.decode(
+            || bits.read_bits(1).map(|bit| bit as u16),
+            "RAR 5 empty Huffman table",
+            "RAR 5 invalid Huffman code",
+        )
     }
 }
 
@@ -4854,14 +4794,7 @@ impl<B: Budget> BitWriter<B> {
 }
 
 fn validate_huffman_counts(count: &[u16; 16]) -> Result<()> {
-    let mut available = 1i32;
-    for &len_count in count.iter().skip(1) {
-        available = (available << 1) - i32::from(len_count);
-        if available < 0 {
-            return Err(Error::InvalidData("RAR 5 oversubscribed Huffman table"));
-        }
-    }
-    Ok(())
+    super::canonical::validate_counts(count, "RAR 5 oversubscribed Huffman table")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5191,8 +5124,8 @@ mod tests {
                 let checkpoint = state.try_clone()?;
                 assert_eq!(checkpoint.history, state.history);
                 assert_eq!(
-                    checkpoint.tables.as_ref().unwrap().main.symbols.len(),
-                    state.tables.as_ref().unwrap().main.symbols.len()
+                    checkpoint.tables.as_ref().unwrap().main.state.len(),
+                    state.tables.as_ref().unwrap().main.state.len()
                 );
                 Ok(decoded)
             });

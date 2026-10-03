@@ -3592,29 +3592,15 @@ fn fill_levels(levels: &mut [u8], pos: &mut usize, count: usize, value: u8) -> R
 
 #[derive(Debug)]
 struct Huffman<B: Budget = Allowance> {
-    symbols: Buffer<HuffmanSymbol, B>,
-    first_code: [u16; 16],
-    first_index: [usize; 16],
-    counts: [u16; 16],
-}
-
-#[derive(Debug, Clone, Copy)]
-struct HuffmanSymbol {
-    code: u16,
-    len: u8,
-    symbol: usize,
+    state: super::canonical::Huffman<B>,
 }
 
 impl<B: Budget> Huffman<B> {
     fn with_allowance(allowance: &B) -> Self {
         Self {
-            symbols: Buffer::new(allowance),
-            first_code: [0; 16],
-            first_index: [0; 16],
-            counts: [0; 16],
+            state: super::canonical::Huffman::with_allowance(allowance),
         }
     }
-
     fn from_lengths_with_allowance(lengths: &[u8], allowance: &B) -> Result<Self> {
         let mut count = [0u16; 16];
         for &len in lengths {
@@ -3627,66 +3613,21 @@ impl<B: Budget> Huffman<B> {
         }
         validate_huffman_counts(&count)?;
 
-        let mut first_code = [0u16; 16];
-        let mut next_code = [0u16; 16];
-        let mut code = 0u16;
-        for len in 1..=15 {
-            code = (code + count[len - 1]) << 1;
-            first_code[len] = code;
-            next_code[len] = code;
-        }
-
-        let mut first_index = [0usize; 16];
-        let mut index = 0usize;
-        for len in 1..=15 {
-            first_index[len] = index;
-            index += usize::from(count[len]);
-        }
-
-        let mut symbols = Buffer::with_capacity(index, allowance)?;
-        for (symbol, &len) in lengths.iter().enumerate() {
-            if len == 0 {
-                continue;
-            }
-            let code = next_code[len as usize];
-            next_code[len as usize] += 1;
-            symbols.push_admitted(HuffmanSymbol { code, len, symbol });
-        }
-        symbols.sort_unstable_by_key(|item| (item.len, item.code, item.symbol));
         Ok(Self {
-            symbols,
-            first_code,
-            first_index,
-            counts: count,
+            state: super::canonical::Huffman::from_counts(lengths, count, allowance)?,
         })
     }
-
     fn try_clone(&self) -> Result<Self> {
         Ok(Self {
-            symbols: Buffer::copied(&self.symbols, &self.symbols.allowance())?,
-            first_code: self.first_code,
-            first_index: self.first_index,
-            counts: self.counts,
+            state: self.state.try_clone()?,
         })
     }
     fn decode(&self, bits: &mut BitReader<B>) -> Result<usize> {
-        let mut code = 0u16;
-        if self.symbols.is_empty() {
-            return Err(Error::InvalidData("RAR 2.9 empty Huffman table"));
-        }
-        for len in 1..=15 {
-            code = (code << 1) | bits.read_bit()? as u16;
-            let count = self.counts[len];
-            if count != 0 {
-                let first = self.first_code[len];
-                let offset = code.wrapping_sub(first);
-                if offset < count {
-                    let index = self.first_index[len] + usize::from(offset);
-                    return Ok(self.symbols[index].symbol);
-                }
-            }
-        }
-        Err(Error::InvalidData("RAR 2.9 invalid Huffman code"))
+        self.state.decode(
+            || bits.read_bit().map(|bit| bit as u16),
+            "RAR 2.9 empty Huffman table",
+            "RAR 2.9 invalid Huffman code",
+        )
     }
 }
 
@@ -3698,14 +3639,7 @@ impl Huffman<Allowance> {
 }
 
 fn validate_huffman_counts(count: &[u16; 16]) -> Result<()> {
-    let mut available = 1i32;
-    for &len_count in count.iter().skip(1) {
-        available = (available << 1) - i32::from(len_count);
-        if available < 0 {
-            return Err(Error::InvalidData("RAR 2.9 oversubscribed Huffman table"));
-        }
-    }
-    Ok(())
+    super::canonical::validate_counts(count, "RAR 2.9 oversubscribed Huffman table")
 }
 
 #[derive(Debug)]
@@ -4219,7 +4153,7 @@ mod tests {
             assert_eq!(&decoded[..], expected_text());
             let checkpoint = state.try_clone()?;
             assert_eq!(checkpoint.output, state.output);
-            assert_eq!(checkpoint.main.symbols.len(), state.main.symbols.len());
+            assert_eq!(checkpoint.main.state.len(), state.main.state.len());
             let mut follower = COMPRESSED_TEXT;
             let mut out = super::Buffer::new(budget);
             state.decode_non_solid_member_from_reader(&mut follower, 2400, &mut out)?;
@@ -5215,15 +5149,15 @@ mod tests {
 
         decoder.read_tables().unwrap();
 
-        assert!(!decoder.main.symbols.is_empty());
-        assert!(decoder.offsets.symbols.is_empty());
-        assert!(decoder.low_offsets.symbols.is_empty());
-        assert!(decoder.lengths.symbols.is_empty());
+        assert!(!decoder.main.state.is_empty());
+        assert!(decoder.offsets.state.is_empty());
+        assert!(decoder.low_offsets.state.is_empty());
+        assert!(decoder.lengths.state.is_empty());
         assert_eq!(
-            decoder.main.symbols.len()
-                + decoder.offsets.symbols.len()
-                + decoder.low_offsets.symbols.len()
-                + decoder.lengths.symbols.len(),
+            decoder.main.state.len()
+                + decoder.offsets.state.len()
+                + decoder.low_offsets.state.len()
+                + decoder.lengths.state.len(),
             2
         );
         assert_eq!(
