@@ -416,9 +416,8 @@ impl RarFile {
 
     /// Decode one member.
     ///
-    /// Solid archives decode from the start every time, so pulling several
-    /// members out of one costs a pass each. Reading a whole solid archive is
-    /// better served by asking for each member in archive order.
+    /// Each call starts a new decoder session. Use `readMany` for several
+    /// members so required solid predecessors are decoded once.
     pub fn read(
         &self,
         name: &str,
@@ -470,6 +469,36 @@ impl RarFile {
                 &format!("no such archive entry index: {index}"),
             )
         })
+    }
+
+    /// Decode selected indices in one session, preserving order and duplicates.
+    #[wasm_bindgen(js_name = readMany)]
+    pub fn read_many(
+        &self,
+        indices: Vec<u32>,
+        password: Option<Password>,
+        settings: JsValue,
+    ) -> Result<js_sys::Array, JsValue> {
+        let indices: Vec<usize> = indices.into_iter().map(|index| index as usize).collect();
+        let password = password_bytes(password)?.or_else(|| self.password.clone());
+        let options = read_options(password.as_deref(), &settings)?;
+        let data = if self.archives.len() == 1 {
+            self.archives[0].read_members_at_with_options(&indices, options)
+        } else {
+            rars_rs::read_volume_members_at_with_options(&self.archives, &indices, options)
+        }
+        .map_err(js_error)?;
+        let results = js_sys::Array::new();
+        for (index, bytes) in indices.into_iter().zip(data) {
+            let bytes = bytes.ok_or_else(|| {
+                binding_error(
+                    "ENTRY_NOT_FOUND",
+                    &format!("no file payload at archive entry index: {index}"),
+                )
+            })?;
+            results.push(&js_sys::Uint8Array::from(bytes.as_slice()));
+        }
+        Ok(results)
     }
 
     /// Decode every member and discard the bytes, throwing on the first

@@ -7,7 +7,7 @@ export type RarData = string | RarInput;
 export type RarName = string | Uint8Array;
 
 export interface RarProgress {
-  operation: "open" | "read" | "readComment" | "test" | "build" | "buildVolumes" | "writeTo" | "writeVolumesTo" | "repair" | "repairDetailed";
+  operation: "open" | "read" | "readMany" | "readComment" | "test" | "build" | "buildVolumes" | "writeTo" | "writeVolumesTo" | "repair" | "repairDetailed";
   phase: string;
   completed: number;
   total?: number;
@@ -68,6 +68,7 @@ export type RarErrorCode =
   | "INVALID_ARCHIVE" | "INVALID_OPTION" | "UNSUPPORTED_FORMAT"
   | "UNSUPPORTED_FEATURE" | "PASSWORD_REQUIRED" | "BAD_PASSWORD"
   | "CHECKSUM_MISMATCH" | "ENTRY_NOT_FOUND" | "ENTRY_IS_DIRECTORY"
+  | "AMBIGUOUS_ENTRY"
   | "DUPLICATE_ENTRY" | "UNSAFE_ENTRY_NAME" | "IO" | "CLOSED"
   | "RESOURCE_LIMIT" | "CANCELLED" | "SOURCE_CHANGED"
   | "WORKER_FAILED" | "INTERNAL";
@@ -106,6 +107,8 @@ export class RarArchive {
   readonly comment?: Uint8Array;
   get(name: RarName): RarEntry | undefined;
   getAll(name: RarName): readonly RarEntry[];
+  /** One session and shared output budgets; request order and duplicates are retained. */
+  readMany(members: Iterable<RarEntry | RarName>, options?: ReadOptions): Promise<Uint8Array[]>;
   readComment(options?: ReadOptions): Promise<Uint8Array | undefined>;
   test(options?: ReadOptions): Promise<void>;
   close(): void;

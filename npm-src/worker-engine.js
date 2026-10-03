@@ -140,18 +140,20 @@ export function startWorker(port, wasm, platform) {
     try {
       port.post({ id, progress: { operation, phase: "working", completed: 0 } });
       let result;
-      if (operation === "open") {
+      if (operation === "open" || operation === "read" || operation === "readMany"
+          || operation === "test" || operation === "readComment") {
         const archive = await openArchive(wasm, payload.sources, payload.password, platform, payload.readOptions);
-        try { result = metadata(archive, payload.password, payload.readOptions); } finally { archive.free(); }
-      } else if (operation === "read") {
-        const archive = await openArchive(wasm, payload.sources, payload.password, platform, payload.readOptions);
-        try { result = archive.readAt(payload.index, payload.password, payload.readOptions); } finally { archive.free(); }
-      } else if (operation === "test") {
-        const archive = await openArchive(wasm, payload.sources, payload.password, platform, payload.readOptions);
-        try { archive.test(payload.password, payload.readOptions); result = undefined; } finally { archive.free(); }
-      } else if (operation === "readComment") {
-        const archive = await openArchive(wasm, payload.sources, payload.password, platform, payload.readOptions);
-        try { result = archive.readComment(payload.password, payload.readOptions); } finally { archive.free(); }
+        try {
+          switch (operation) {
+            case "open": result = metadata(archive, payload.password, payload.readOptions); break;
+            case "read": result = archive.readAt(payload.index, payload.password, payload.readOptions); break;
+            case "readMany": result = archive.readMany(payload.indices, payload.password, payload.readOptions); break;
+            case "test": archive.test(payload.password, payload.readOptions); break;
+            case "readComment": result = archive.readComment(payload.password, payload.readOptions); break;
+          }
+        } finally {
+          archive.free();
+        }
       } else if (operation === "repair") {
         const bytes = await sourceBytes(payload.sources[0], platform);
         result = wasm.repair(bytes, payload.password);

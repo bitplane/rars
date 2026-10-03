@@ -43,12 +43,13 @@ identity. Reopen to select another encoding. `get()` refuses ambiguous decoded
 names with `AMBIGUOUS_ENTRY`; use `getAll()` or archive-order entry indices.
 This setting does not affect comments, passwords, payloads or writer names.
 
-`open()`, `entry.bytes()`, `test()` and `readComment()` accept `ReadOptions`:
+`open()`, `entry.bytes()`, `readMany()`, `test()` and `readComment()` accept `ReadOptions`:
 
 ```js
 const limits = { maxHeaderCount: 10000, maxMemberOutputBytes: 256 * 1024 * 1024 };
 const archive = await RarArchive.open(file, limits);
 const bytes = await archive.entries[0].bytes(limits);
+const selected = await archive.readMany([archive.entries[1], archive.entries[0]], limits);
 const comment = await archive.readComment(limits); // undefined if absent
 ```
 
@@ -58,6 +59,13 @@ The optional fields are `maxHeaderCount`, `maxHeaderBytes`,
 `bigint` values through `2n ** 64n - 1n`. Zero is a real limit. Omission retains
 the library default. Resource options apply to one call and are not retained by `open()`.
 Each operation reparses its input; header limits apply per archive/volume.
+`readMany()` accepts an iterable of entries or names and performs one parse and
+decoder traversal for the batch. Results retain request order and duplicates;
+prefer entry objects for duplicate identity and direct index selection. Entries
+from another archive are rejected. Solid predecessors are decoded once, and
+output limits apply to the whole batch. Repeated results have independent byte
+buffers but do not consume logical decode quota again. Failures return no partial
+list. Directories are rejected; RAR5 redirections have no readable file payload.
 The cached `archive.comment` is decoded under the options passed to `open()`;
 `readComment()` decodes it again with fresh options and an optional password.
 
@@ -149,6 +157,14 @@ secretly buffers an entire archive.
 
 The same library is available as a [Rust crate][crate], [Python package][pypi]
 and [command-line tool][repo].
+
+## Development validation
+
+Run `CARGO_BUILD_JOBS=1 scripts/build-npm.sh --debug` and then
+`node scripts/test-npm-package.js` for focused engine and worker checks.
+The debug build skips LTO and `wasm-opt`. Build release artifacts with
+`scripts/build-npm.sh` without `--debug`. Both modes require a `wasm-bindgen`
+CLI matching `Cargo.lock`.
 
 ## Development coverage
 

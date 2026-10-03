@@ -121,6 +121,28 @@ export function createApi(runtime) {
       ));
     }
 
+    async readMany(members, options) {
+      assertOpen(this);
+      const operation = operationOptions(options);
+      const indices = [];
+      for (const member of members) {
+        const entry = member instanceof RarEntry ? member : this.get(member);
+        if (!entry) throw new RarError("ENTRY_NOT_FOUND", "no such archive entry");
+        if (entry._archive !== this || this.entries[entry.index] !== entry) {
+          throw new RarError("INVALID_OPTION", "entry belongs to a different archive");
+        }
+        if (entry.isDirectory) {
+          throw new RarError("ENTRY_IS_DIRECTORY", `cannot read directory entry: ${entry.name}`);
+        }
+        indices.push(entry.index);
+      }
+      return this._request("readMany", {
+        indices,
+        readOptions: readOptions(operation),
+        password: operation.password ?? this._password,
+      }, operation);
+    }
+
     async readComment(options) {
       const operation = operationOptions(options);
       return this._request("readComment", {

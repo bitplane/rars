@@ -44,6 +44,7 @@ console.log("npm decoded-name ambiguity checks passed");
 
 // Repeated raw names are distinct entries; names select the last one.
 const duplicateRequests = [];
+const batchRequests = [];
 const { RarArchive: DuplicateArchive } = createApi({
   prepareArchiveSources: async (input) => [input],
   setErrorFactory() {},
@@ -52,6 +53,10 @@ const { RarArchive: DuplicateArchive } = createApi({
       { index: 0, name: "same", nameBytes: new TextEncoder().encode("same"), size: 5 },
       { index: 1, name: "same", nameBytes: new TextEncoder().encode("same"), size: 6 },
     ] };
+    if (operation === "readMany") {
+      batchRequests.push([payload.indices, payload.readOptions, payload.password]);
+      return payload.indices.map((index) => new Uint8Array([index]));
+    }
     duplicateRequests.push(payload.index);
     return new Uint8Array([payload.index]);
   },
@@ -63,8 +68,20 @@ for (const settings of [{}, { legacyNameEncoding: "cp850" }]) {
   for (const entry of archive.getAll("same")) {
     assert.deepEqual(await entry.bytes(), new Uint8Array([entry.index]));
   }
+  assert.deepEqual(await archive.readMany([archive.entries[0], "same", archive.entries[1]], {
+    maxTotalOutputBytes: 11, password: "secret",
+  }), [new Uint8Array([0]), new Uint8Array([1]), new Uint8Array([1])]);
+  const other = await DuplicateArchive.open(new Uint8Array(), settings);
+  await assert.rejects(archive.readMany([other.entries[0]]), (error) => error.code === "INVALID_OPTION");
+  await assert.rejects(archive.readMany(["missing"]), (error) => error.code === "ENTRY_NOT_FOUND");
+  archive.close();
+  await assert.rejects(archive.readMany([]), (error) => error.code === "CLOSED");
 }
 assert.deepEqual(duplicateRequests, [0, 1, 0, 1]);
+assert.deepEqual(batchRequests, [
+  [[0, 1, 1], {maxTotalOutputBytes: 11}, "secret"],
+  [[0, 1, 1], {maxTotalOutputBytes: 11}, "secret"],
+]);
 console.log("npm duplicate member identity checks passed");
 
 // The handwritten API validates and forwards workspace limits without a WASM build.

@@ -32,6 +32,13 @@ check('duplicate names select matching metadata and preserve indexed payloads', 
   assert.deepEqual(archive.read('one.txt'), bytes('second'));
   assert.deepEqual(archive.readAt(0), bytes('first'));
   assert.deepEqual(archive.readAt(1), bytes('second'));
+  const batch = archive.readMany([1, 0, 1], undefined, {maxTotalOutputBytes: 11});
+  assert.deepEqual(batch, [bytes('second'), bytes('first'), bytes('second')]);
+  batch[0][0] = 0;
+  assert.deepEqual(batch[2], bytes('second'), 'repeated results must not alias');
+  assert.deepEqual(archive.readMany([]), []);
+  refuses(() => archive.readMany([1, 0], undefined, {maxTotalOutputBytes: 10}), 'RESOURCE_LIMIT');
+  refuses(() => archive.readMany([0, 10]), 'ENTRY_NOT_FOUND');
   info.free();
   archive.free();
 });
@@ -122,6 +129,7 @@ check('comments passwords and indexed volume extraction round trip', () => {
     assert.deepEqual(archive.readAt(0), bytes('payload'.repeat(30)));
     assert.deepEqual(archive.read('file'), bytes('payload'.repeat(30)));
     if (format === 'rar50' || format === 'rar70') assert.deepEqual(archive.read('later'), bytes('last member'));
+    assert.deepEqual(archive.readMany([0, 0]), [bytes('payload'.repeat(30)), bytes('payload'.repeat(30))]);
     refuses(() => archive.read('missing'), 'ENTRY_NOT_FOUND');
     refuses(() => archive.readAt(0, undefined, {maxMemberOutputBytes: 'bad'}), 'INVALID_OPTION');
     refuses(() => archive.test(undefined, {maxMemberOutputBytes: 'bad'}), 'INVALID_OPTION');

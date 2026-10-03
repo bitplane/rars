@@ -46,6 +46,7 @@ await check("every format round-trips without blocking API calls", async () => {
     const archive = await RarArchive.open(bytes);
     assert.deepEqual(archive.entries.map((entry) => entry.name), ["hello.txt", "dir/second.txt"]);
     assert.deepEqual(await archive.get("hello.txt").bytes(), HELLO, format);
+    assert.deepEqual(await archive.readMany([archive.entries[1], "hello.txt", archive.entries[1]]), [SECOND, HELLO, SECOND]);
     await archive.test();
     archive.close();
     writer.close();

@@ -39,3 +39,27 @@ assert.equal(missing.code, "IO");
 assert.equal(missing.details.systemCode, "ENOENT");
 assert.equal(missing.details.syscall, "open");
 console.log("npm worker error-code and context checks passed");
+
+// Every reader operation owns one parsed archive and frees it on success/failure.
+for (const operation of ["read", "readMany", "test", "readComment"]) {
+  for (const fails of [false, true]) {
+    let dispatch, opened = 0, freed = 0;
+    const replies = [];
+    class Archive {
+      constructor() { opened++; }
+      run() { if (fails) throw Object.assign(new Error("refused"), {code: "RESOURCE_LIMIT"}); }
+      readAt() { this.run(); return new Uint8Array([1]); }
+      readMany(indices) { this.run(); assert.deepEqual(indices, [1, 0, 1]); return indices.map((index) => new Uint8Array([index])); }
+      test() { this.run(); }
+      readComment() { this.run(); return new Uint8Array([2]); }
+      free() { freed++; }
+    }
+    startWorker({onMessage(callback) {dispatch = callback;}, post(message) {replies.push(message);}}, {RarFile: Archive}, {});
+    await dispatch({id: 1, operation, payload: {sources: [new Uint8Array([0])], index: 1, indices: [1, 0, 1]}});
+    assert.equal(opened, 1);
+    assert.equal(freed, 1);
+    assert.equal(replies.filter((reply) => reply.error).length, fails ? 1 : 0);
+    assert.equal(replies.filter((reply) => reply.progress?.phase === "complete").length, fails ? 0 : 1);
+  }
+}
+console.log("npm reader parse ownership and failure cleanup checks passed");
