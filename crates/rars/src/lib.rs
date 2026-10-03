@@ -38,8 +38,6 @@ pub mod detect;
 #[cfg(any(feature = "write", all(feature = "recovery", feature = "encryption")))]
 mod entropy;
 pub mod error;
-#[cfg(feature = "write")]
-mod fast;
 pub mod features;
 pub mod filename;
 pub mod filter;

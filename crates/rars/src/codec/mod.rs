@@ -1,6 +1,6 @@
 //! RAR compression codecs, filters, PPMd, and RARVM components used by `rars`.
 
-mod fast;
+pub(crate) mod fast;
 pub(crate) mod filters;
 #[cfg(any(test, feature = "write"))]
 mod huffman;

@@ -103,16 +103,7 @@ pub(crate) fn next_x86_opcode(
         return None;
     }
 
-    next_x86_opcode_scalar(data, start, end_exclusive, cmp_mask)
-}
-
-fn next_x86_opcode_scalar(
-    data: &[u8],
-    start: usize,
-    end_exclusive: usize,
-    cmp_mask: u8,
-) -> Option<usize> {
-    data[start..end_exclusive]
+    data[start..end]
         .iter()
         .position(|&byte| byte & cmp_mask == 0xe8)
         .map(|offset| start + offset)
@@ -121,6 +112,18 @@ fn next_x86_opcode_scalar(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opcode_scan_clamps_the_end_and_handles_empty_extents() {
+        assert_eq!(next_x86_opcode(b"a\xe8b", 0, usize::MAX, 0xff), Some(1));
+        assert_eq!(next_x86_opcode(b"a\xe8b", 2, usize::MAX, 0xff), None);
+        assert_eq!(
+            next_x86_opcode(b"a\xe8b", usize::MAX, usize::MAX, 0xff),
+            None
+        );
+        assert_eq!(next_x86_opcode(b"a\xe8b", 1, 1, 0xff), None);
+        assert_eq!(next_x86_opcode(b"", 0, usize::MAX, 0xff), None);
+    }
 
     fn reference_match_length(
         input: &[u8],

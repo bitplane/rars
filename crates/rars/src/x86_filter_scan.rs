@@ -53,7 +53,9 @@ fn auto_x86_filter_ranges_with_cluster_gap<B: Budget>(
     let mut clusters = Buffer::new(allowance);
     let mut current: Option<(usize, usize, usize)> = None;
     let mut scan_pos = 0usize;
-    while let Some(pos) = crate::fast::next_x86_opcode(data, scan_pos, data.len() - 4, cmp_mask) {
+    while let Some(pos) =
+        crate::codec::fast::next_x86_opcode(data, scan_pos, data.len() - 4, cmp_mask)
+    {
         match current {
             Some((start, last, count)) if pos - last <= cluster_gap => {
                 current = Some((start, pos, count + 1));
