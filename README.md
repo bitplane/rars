@@ -90,6 +90,13 @@ archive-order index. Its storage belongs to the caller; the archive cannot be
 mutated while the borrowed index is in use. Ordinary `members()` still returns
 owned metadata.
 
+Use `read_members_at()` or `read_members_at_with_options()` to read several
+indices in one session, especially for solid archives. Results retain request
+order and duplicate indices; shared output budgets count each decoded payload
+and required predecessor once. The corresponding `read_volume_members_at*`
+functions traverse a volume set once; that traversal currently verifies all
+payloads, including unselected ones.
+
 | Feature | Adds |
 | --- | --- |
 | None | Parsing and sequential decoding for RAR 1.3–7, metadata, checksums, comments, solid/split archives, cancellation and reader resource policies |

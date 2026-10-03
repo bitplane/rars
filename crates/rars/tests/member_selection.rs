@@ -44,6 +44,34 @@ fn volume_lookup_counts_redirections_in_logical_member_indices() {
             rars::read_volume_member_at(&archives, 4, None).unwrap(),
             None
         );
+        let selection = [3, 2, 1, 3, 0, usize::MAX];
+        let expected = vec![
+            Some(b"last payload".to_vec()),
+            Some(b"first payload".to_vec()),
+            None,
+            Some(b"last payload".to_vec()),
+            None,
+            None,
+        ];
+        assert_eq!(
+            rars::read_volume_members_at(&archives, &selection, None).unwrap(),
+            expected
+        );
+        let options = rars::ArchiveReadOptions::new().with_max_total_output_bytes(25);
+        assert_eq!(
+            rars::read_volume_members_at_with_options(&archives, &selection, options).unwrap(),
+            expected
+        );
+        assert_eq!(
+            rars::read_volume_members_at_with_options(
+                &archives,
+                &selection,
+                options.with_max_total_output_bytes(24)
+            )
+            .unwrap_err()
+            .kind(),
+            ErrorKind::ResourceLimit
+        );
     }
 }
 
@@ -61,6 +89,167 @@ fn mixed(format: ArchiveVersion, solid: bool, stored: bool) -> Archive {
         .set_entry_encryption(b"secret", Some(b"password".to_vec()), None)
         .unwrap();
     ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap()
+}
+
+#[test]
+fn batch_reads_share_budgets_and_decode_solid_dependencies_once() {
+    use rars::{ArchiveReadOptions, ReadCancellation};
+    for format in ArchiveVersion::ALL {
+        for solid in [false, true] {
+            let archive = mixed(format, solid, false);
+            assert_eq!(archive.is_solid(), solid, "{format}");
+            let limit = if solid { 1500 } else { 900 };
+            let options =
+                ArchiveReadOptions::with_password(b"password").with_max_total_output_bytes(limit);
+            let expected = vec![
+                Some(b"last".repeat(100)),
+                None,
+                Some(b"first".repeat(100)),
+                Some(b"last".repeat(100)),
+                None,
+            ];
+            assert_eq!(
+                archive
+                    .read_members_at_with_options(&[3, 0, 1, 3, usize::MAX], options)
+                    .unwrap(),
+                expected,
+                "{format}, solid={solid}"
+            );
+            assert_eq!(
+                archive
+                    .read_members_at_with_options(
+                        &[3, 1, 3],
+                        options.with_max_total_output_bytes(limit - 1)
+                    )
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::ResourceLimit
+            );
+            let without_password = archive.read_members_at(&[3, 1], None);
+            if solid {
+                assert_eq!(
+                    without_password.unwrap_err().kind(),
+                    ErrorKind::PasswordRequired
+                );
+            } else {
+                assert_eq!(
+                    without_password.unwrap(),
+                    vec![Some(b"last".repeat(100)), Some(b"first".repeat(100))]
+                );
+            }
+            assert_eq!(
+                archive.read_members_at(&[1], None).unwrap(),
+                vec![Some(b"first".repeat(100))]
+            );
+            assert_eq!(
+                archive.read_members_at(&[0, usize::MAX], None).unwrap(),
+                vec![None, None]
+            );
+            assert!(archive.read_members_at(&[], None).unwrap().is_empty());
+            let token = ReadCancellation::new();
+            token.cancel();
+            for selection in [&[][..], &[0, usize::MAX][..], &[3][..]] {
+                assert_eq!(
+                    archive
+                        .read_members_at_with_options(selection, options.with_cancellation(&token))
+                        .unwrap_err()
+                        .kind(),
+                    ErrorKind::Cancelled
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn batch_reads_verify_selected_payloads_and_preserve_redirection_indices() {
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    builder
+        .add_unix_symlink(b"link".to_vec(), b"first".to_vec(), false, None, None)
+        .unwrap();
+    builder
+        .add_bytes(b"first".to_vec(), b"payload".to_vec(), None, None)
+        .unwrap();
+    builder
+        .add_bytes(b"empty".to_vec(), vec![], None, None)
+        .unwrap();
+    builder
+        .add_bytes(b"bad".to_vec(), b"bad checksum".to_vec(), None, None)
+        .unwrap();
+    let mut archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    if let Archive::Rar50Plus(inner) = &mut archive {
+        let bad = inner
+            .blocks
+            .iter_mut()
+            .filter_map(|block| match block {
+                rars::rar50::Block::File(file) => Some(file),
+                _ => None,
+            })
+            .last()
+            .unwrap();
+        bad.data_crc32 = Some(bad.data_crc32.unwrap() ^ 1);
+        bad.hash = None; // Exercise CRC verification rather than the stronger hash.
+    }
+    assert_eq!(
+        archive.read_members_at(&[2, 0, 1, 2], None).unwrap(),
+        vec![Some(vec![]), None, Some(b"payload".to_vec()), Some(vec![])]
+    );
+    assert_eq!(
+        archive.read_members_at(&[1, 3], None).unwrap_err().kind(),
+        ErrorKind::ChecksumMismatch
+    );
+}
+
+#[test]
+fn batch_reads_reduce_payload_io_compared_with_repeated_solid_reads() {
+    use std::io::{self, Cursor, Read, Seek, SeekFrom};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    struct Counted {
+        source: Cursor<Vec<u8>>,
+        bytes: Arc<AtomicUsize>,
+    }
+    impl Read for Counted {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            let count = self.source.read(out)?;
+            self.bytes.fetch_add(count, Ordering::Relaxed);
+            Ok(count)
+        }
+    }
+    impl Seek for Counted {
+        fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+            self.source.seek(position)
+        }
+    }
+    for format in [ArchiveVersion::Rar29, ArchiveVersion::Rar50] {
+        let mut builder = Builder::new(format).solid(true);
+        for name in [b"first".as_slice(), b"last"] {
+            builder
+                .add_bytes(name.to_vec(), name.repeat(100), None, None)
+                .unwrap();
+        }
+        let bytes = Arc::new(AtomicUsize::new(0));
+        let archive = ArchiveReader::read_reader(Counted {
+            source: Cursor::new(builder.to_bytes().unwrap()),
+            bytes: Arc::clone(&bytes),
+        })
+        .unwrap();
+        bytes.store(0, Ordering::Relaxed);
+        let selection = [1, 0, 1];
+        let expected: Vec<_> = selection
+            .iter()
+            .map(|&index| archive.read_member_at(index, None).unwrap())
+            .collect();
+        let repeated = bytes.swap(0, Ordering::Relaxed);
+        assert_eq!(archive.read_members_at(&selection, None).unwrap(), expected);
+        let batch = bytes.load(Ordering::Relaxed);
+        assert!(
+            batch > 0 && batch < repeated,
+            "{format}: {batch} bytes in batch vs {repeated} repeated"
+        );
+    }
 }
 
 #[test]

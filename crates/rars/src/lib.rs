@@ -46,6 +46,8 @@ mod filter_search;
 mod io_util;
 mod member;
 pub use member::{ArchiveIndex, ArchiveMemberRef, ArchiveMemberRefs};
+mod member_read;
+pub use member_read::{read_volume_members_at, read_volume_members_at_with_options};
 mod output_limit;
 mod parallel;
 mod parse_budget;
@@ -898,18 +900,7 @@ impl Archive {
         }
         // Match controlled extraction's conservative solid admission policy,
         // including member flags in archives without a main solid flag.
-        let solid = match self {
-            Self::Rar13(archive) => archive.main.is_solid(),
-            Self::Rar15To40(archive) => {
-                archive.main.is_solid() || archive.files().any(|file| file.is_solid())
-            }
-            Self::Rar50Plus(archive) => {
-                archive.main.is_solid()
-                    || archive
-                        .files()
-                        .any(|file| file.compression_info & 0x40 != 0)
-            }
-        };
+        let solid = self.is_solid();
         let collected = std::sync::Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
         let mut current = 0usize;
         self.extract_with_control(options, |member| {
@@ -1510,30 +1501,10 @@ pub fn read_volume_member_at_with_options(
     options: ArchiveReadOptions<'_>,
 ) -> Result<Option<Vec<u8>>> {
     options.check_cancelled()?;
-    // Metadata indices include redirections, while the volume extractor opens
-    // writers only for files and directories. Fold continuation headers and
-    // translate the requested logical index to that callback order.
-    let mut logical = 0usize;
-    let mut output = 0usize;
-    let mut selected_output = None;
-    for member in archives.iter().flat_map(Archive::member_refs) {
-        if member.is_split_before() {
-            continue;
-        }
-        if !member.is_redirection() {
-            if logical == index {
-                selected_output = Some(output);
-            }
-            output += 1;
-        }
-        logical += 1;
-    }
+    let mut output_indices = member_read::volume_output_indices(archives);
     let collected = std::sync::Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
-    let current = std::cell::Cell::new(0usize);
     extract_volumes_to_with_options(archives, options, |meta| {
-        let this = current.get();
-        current.set(this.saturating_add(1));
-        if Some(this) != selected_output || meta.is_directory {
+        if output_indices.next() != Some(index) || meta.is_directory {
             return Ok(Box::new(std::io::sink()) as Box<dyn Write>);
         }
         let sink = SharedBuffer(std::sync::Arc::clone(&collected));
@@ -5609,6 +5580,7 @@ mod tests {
         };
         let empty = Error::InvalidHeader("volume set is empty");
         assert_eq!(volume_members(&[]).unwrap_err(), empty);
+        assert_eq!(read_volume_members_at(&[], &[], None).unwrap_err(), empty);
         assert_eq!(
             extract_volumes_to(&[], None, never_open).unwrap_err(),
             empty
@@ -5703,6 +5675,10 @@ mod tests {
         assert_eq!(
             read_volume_member_at(&archives, 0, None).unwrap().unwrap(),
             payload
+        );
+        assert_eq!(
+            read_volume_members_at(&archives, &[0, 0, usize::MAX], None).unwrap(),
+            vec![Some(payload.clone()), Some(payload), None]
         );
     }
 }
