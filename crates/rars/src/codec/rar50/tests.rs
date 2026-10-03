@@ -4797,7 +4797,7 @@ fn reader_block_admits_capacity_before_reading_payload_and_releases_failures() {
 
 #[test]
 fn reader_block_keeps_its_worker_charge_after_reservation_retirement() {
-    use super::super::workspace::RESERVATION_BYTES;
+    use crate::codec::workspace::RESERVATION_BYTES;
     let packed = encode_compressed_block(&[0x31; 8], 64, false, true).unwrap();
     let ledger = Allowance::limited(128 + RESERVATION_BYTES);
     let mut reservation = ledger.reserve(16).unwrap();
@@ -5432,7 +5432,7 @@ fn streaming_flush_preserves_dictionary_tail_with_excess_allocation_capacity() {
     // public contract permits this even though this host allocates exactly.
     let mut history = Vec::with_capacity(8);
     history.extend_from_slice(b"ABC");
-    output.history = super::super::workspace::Deque::from_buffer(Buffer::from_vec(history));
+    output.history = crate::codec::workspace::Deque::from_buffer(Buffer::from_vec(history));
     assert!(output.history.capacity() > output.history_limit);
     let mut emitted = Vec::new();
     let mut sink = |chunk: DecodedChunk<'_>| {
