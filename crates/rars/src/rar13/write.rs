@@ -168,7 +168,8 @@ pub(crate) fn write_archive_with_sources(
     archive_comment: Option<&[u8]>,
     resources: &WriterResources,
     progress: Option<&dyn WriteProgress>,
-) -> Result<Vec<u8>> {
+    output: &mut dyn Write,
+) -> Result<()> {
     let members: Vec<_> = entries
         .iter()
         .map(|entry| {
@@ -179,7 +180,6 @@ pub(crate) fn write_archive_with_sources(
             member
         })
         .collect();
-    let mut out = Vec::new();
     write_archive_to(
         &members,
         options,
@@ -187,9 +187,8 @@ pub(crate) fn write_archive_with_sources(
         archive_comment,
         resources,
         progress,
-        &mut out,
-    )?;
-    Ok(out)
+        output,
+    )
 }
 
 pub fn write_compressed_archive_with_comment(
@@ -230,8 +229,8 @@ pub fn write_streaming_archive_to(
     progress: Option<&dyn WriteProgress>,
     output: &mut dyn Write,
 ) -> Result<()> {
-    // This is the only route to write_archive_to with caller-supplied resources;
-    // collect_archive always passes the unrestricted defaults.
+    // Managed-memory quotas require codec and source allocations to be charged;
+    // legacy members do not yet provide that accounting.
     if resources.max_preparation_bytes().is_some() || resources.max_memory_bytes().is_some() {
         return Err(Error::UnsupportedFamilyFeature {
             family: options.target.family(),

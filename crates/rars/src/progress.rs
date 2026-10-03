@@ -18,9 +18,10 @@ pub enum WriteOperation {
 ///
 /// Callbacks can be invoked concurrently when parallel compression is enabled.
 /// Each member starts before its source is consumed and finishes after its packed
-/// payload is prepared. Different members may overlap. `Advanced` is the absolute
-/// byte counter; entry events must not be added to it. A failed operation does not
-/// report `OperationFinished`. Emission can contain recovery sub-operations.
+/// payload is prepared. Different members may overlap. `Advanced` and
+/// `BytesWritten` carry absolute byte counts; entry events must not be added to
+/// them. A failed operation does not
+/// report `OperationFinished`. Emission can overlap compression and contain recovery sub-operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WriteProgressEvent<'a> {
@@ -54,6 +55,8 @@ pub enum WriteProgressEvent<'a> {
         total_bytes: u64,
         pass: usize,
     },
+    /// Absolute archive bytes accepted by the output while its final size is unknown.
+    BytesWritten { completed_bytes: u64 },
     /// One volume of a multi-volume set has been written out.
     VolumeFinished {
         volume_number: usize,

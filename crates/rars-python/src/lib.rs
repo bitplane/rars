@@ -40,6 +40,7 @@ struct ProgressEvent {
     entry_index: Option<usize>,
     #[pyo3(get)]
     total_entries: Option<usize>,
+    finished: bool,
 }
 
 #[pyclass(frozen, module = "rars", skip_from_py_object)]
@@ -83,11 +84,14 @@ struct RepairResult {
 #[pymethods]
 impl ProgressEvent {
     #[getter]
-    fn percentage(&self) -> f64 {
+    fn percentage(&self) -> Option<f64> {
+        if self.phase == "writing" && self.total == 0 && !self.finished {
+            return None;
+        }
         if self.total == 0 {
-            100.0
+            Some(100.0)
         } else {
-            self.completed as f64 * 100.0 / self.total as f64
+            Some(self.completed as f64 * 100.0 / self.total as f64)
         }
     }
 }
@@ -260,6 +264,7 @@ impl rars_rs::WriteProgress for PythonProgress {
                 entry_name: None,
                 entry_index: None,
                 total_entries: None,
+                finished: false,
             });
             match event {
                 rars_rs::WriteProgressEvent::OperationStarted {
@@ -269,6 +274,7 @@ impl rars_rs::WriteProgress for PythonProgress {
                     pass,
                 } => {
                     state.phase = progress_phase(operation).to_string();
+                    state.finished = false;
                     state.completed = 0;
                     state.total = total_bytes.unwrap_or(0);
                     state.pass_number = pass;
@@ -303,6 +309,14 @@ impl rars_rs::WriteProgress for PythonProgress {
                     state.total = total_bytes;
                     state.pass_number = pass;
                 }
+                rars_rs::WriteProgressEvent::VolumeFinished { bytes, .. } => {
+                    state.finished = true;
+                    state.completed = bytes;
+                    state.total = bytes;
+                }
+                rars_rs::WriteProgressEvent::BytesWritten { completed_bytes } => {
+                    state.completed = completed_bytes;
+                }
                 rars_rs::WriteProgressEvent::OperationFinished {
                     operation,
                     total_bytes,
@@ -310,6 +324,7 @@ impl rars_rs::WriteProgress for PythonProgress {
                     ..
                 } => {
                     state.phase = progress_phase(operation).to_string();
+                    state.finished = true;
                     state.total = total_bytes.unwrap_or(state.total);
                     state.completed = state.total;
                     state.pass_number = pass;
@@ -2408,11 +2423,14 @@ mod tests {
                 entry_name: None,
                 entry_index: None,
                 total_entries: None,
+                finished: false,
             };
-            assert_eq!(event.percentage(), 100.0);
+            assert_eq!(event.percentage(), None);
+            event.finished = true;
+            assert_eq!(event.percentage(), Some(100.0));
             event.completed = u64::MAX;
             event.total = u64::MAX;
-            assert_eq!(event.percentage(), 100.0);
+            assert_eq!(event.percentage(), Some(100.0));
             let token = CancellationToken::new();
             assert!(!token.is_cancelled());
             token.cancel();

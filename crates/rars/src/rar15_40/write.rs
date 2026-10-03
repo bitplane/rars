@@ -274,7 +274,8 @@ pub(crate) fn write_archive_with_retained_metadata(
     progress: Option<&dyn WriteProgress>,
     header_password: Option<&[u8]>,
     archive_comment_password: Option<&[u8]>,
-) -> Result<Vec<u8>> {
+    output: &mut dyn Write,
+) -> Result<()> {
     // Builder validates retained records at their setters and constructs each
     // file with its metadata, so neither record validity nor array length can
     // change at this private handoff.
@@ -293,7 +294,6 @@ pub(crate) fn write_archive_with_retained_metadata(
             member
         })
         .collect();
-    let mut out = Vec::new();
     write_archive_to(
         &members,
         options,
@@ -301,11 +301,10 @@ pub(crate) fn write_archive_with_retained_metadata(
         archive_comment,
         resources,
         progress,
-        &mut out,
+        output,
         header_password,
         archive_comment_password,
-    )?;
-    Ok(out)
+    )
 }
 
 pub fn write_compressed_archive(

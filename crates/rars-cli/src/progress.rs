@@ -256,6 +256,16 @@ impl WriteProgress for CliProgress {
                     self.report_plain_percent(completed_bytes, total_bytes);
                 }
             }
+            WriteProgressEvent::BytesWritten { completed_bytes } => {
+                let message = format!("Writing: {completed_bytes} bytes");
+                if self.mode == RenderMode::Terminal
+                    && (self.determinate.load(Ordering::Relaxed) || self.bar.is_finished())
+                {
+                    self.spinner(message);
+                } else {
+                    self.set_message(message);
+                }
+            }
             WriteProgressEvent::OperationFinished {
                 operation, pass, ..
             } => {

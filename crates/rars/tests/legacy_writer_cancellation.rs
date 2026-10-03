@@ -68,7 +68,12 @@ fn resource_cancellation_stops_source_loading() {
                     .kind(),
                 ErrorKind::Cancelled
             );
-            assert!(output.is_empty());
+            if precancel {
+                assert!(output.is_empty());
+            } else {
+                // Only the archive header can precede source verification.
+                assert!(output.len() < 100_000);
+            }
         }
     }
 }
@@ -95,6 +100,9 @@ impl WriteProgress for Stop {
                 completed_bytes,
                 ..
             } => !self.finished && operation == self.operation && completed_bytes > 0,
+            WriteProgressEvent::BytesWritten { completed_bytes } => {
+                !self.finished && self.operation == WriteOperation::Emission && completed_bytes > 0
+            }
             WriteProgressEvent::OperationFinished { operation, .. } => {
                 self.finished && operation == self.operation
             }

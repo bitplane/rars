@@ -363,7 +363,7 @@ def test_recovery_progress_reports_its_phase_and_percentage():
     events = []
     rars.RarFile.from_bytes(builder.to_bytes(progress=events.append)).testrar()
     assert "recovery" in {event.phase for event in events}
-    assert all(0 <= event.percentage <= 100 for event in events)
+    assert all(event.percentage is None or 0 <= event.percentage <= 100 for event in events)
 
 
 @pytest.mark.parametrize("method", ["getinfo", "read", "open", "extract", "getcomment", "readlink", "gettimes"])

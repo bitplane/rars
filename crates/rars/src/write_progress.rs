@@ -224,3 +224,81 @@ fn callback_panic_keeps_peer_progress_and_completion_usable() {
     assert!(work.finish());
     assert_eq!(*reported.lock().unwrap(), [5, 10]);
 }
+
+/// Count accepted output without buffering an archive or guessing its final size.
+pub(crate) struct EmissionWriter<'a> {
+    output: &'a mut dyn std::io::Write,
+    progress: Option<ProgressReporter<'a>>,
+    completed: u64,
+    reported: u64,
+    started: bool,
+}
+impl<'a> EmissionWriter<'a> {
+    pub(crate) fn new(
+        output: &'a mut dyn std::io::Write,
+        progress: Option<ProgressReporter<'a>>,
+    ) -> Self {
+        Self {
+            output,
+            progress,
+            completed: 0,
+            reported: 0,
+            started: false,
+        }
+    }
+    fn start(&mut self) -> crate::Result<()> {
+        check_cancelled(self.progress)?;
+        if !self.started {
+            self.started = true;
+            if let Some(progress) = self.progress {
+                progress.report(WriteProgressEvent::OperationStarted {
+                    operation: WriteOperation::Emission,
+                    total_bytes: None,
+                    total_entries: None,
+                    pass: 1,
+                });
+            }
+        }
+        check_cancelled(self.progress)
+    }
+    fn advance(&mut self) -> crate::Result<()> {
+        if self.completed != self.reported {
+            self.reported = self.completed;
+            if let Some(progress) = self.progress {
+                progress.report(WriteProgressEvent::BytesWritten {
+                    completed_bytes: self.completed,
+                });
+            }
+        }
+        check_cancelled(self.progress)
+    }
+    pub(crate) fn finish(&mut self) -> crate::Result<()> {
+        self.start()?;
+        self.advance()?;
+        if let Some(progress) = self.progress {
+            progress.report(WriteProgressEvent::OperationFinished {
+                operation: WriteOperation::Emission,
+                total_bytes: Some(self.completed),
+                total_entries: None,
+                pass: 1,
+            });
+        }
+        check_cancelled(self.progress)
+    }
+}
+impl std::io::Write for EmissionWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.start().map_err(std::io::Error::other)?;
+        let written = self.output.write(&bytes[..bytes.len().min(64 * 1024)])?;
+        self.completed += written as u64;
+        if self.completed - self.reported >= 64 * 1024 {
+            self.advance().map_err(std::io::Error::other)?;
+        }
+        check_cancelled(self.progress).map_err(std::io::Error::other)?;
+        Ok(written)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        check_cancelled(self.progress).map_err(std::io::Error::other)?;
+        self.output.flush()
+    }
+}

@@ -183,6 +183,13 @@ cancellation, output ceilings and RAR5/7 decoder limits. See the
 [reader controls](python/READING.md) and [rewrite contract](python/REWRITING.md).
 Repair operations also accept `cancellation=`; see [repair cancellation](python/REPAIRING.md).
 
+Writer progress reports `percentage=None` while the final output size is unknown,
+and 100 when the operation or a volume completes. Legacy single-archive output streams directly;
+compressed or encrypted members still require memory, stored sources are read
+twice for checksum verification, and legacy volume output still collects the
+volume set in memory. A failed write to a caller-owned stream can leave a prefix;
+writing to a path publishes the completed archive atomically.
+
 For JS it's built to WebAssembly and published to
 [npm](https://www.npmjs.com/package/@bitplane/rars);
 `npm install @bitplane/rars`. It reads and writes in the browser and in Node,

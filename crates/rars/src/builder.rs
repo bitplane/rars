@@ -7,7 +7,7 @@
 //! are thin translations of the type below, which is the point of it living
 //! here rather than in one of them.
 
-use crate::write_progress::{check_cancelled, CancellableIo, ProgressReporter, ResourceProgress};
+use crate::write_progress::{check_cancelled, EmissionWriter, ProgressReporter, ResourceProgress};
 use crate::{
     rar13, rar15_40, rar50, ArchiveFamily, ArchiveVersion, EntrySource, Error, FeatureSet, Result,
     WriteProgress, WriterResources,
@@ -1061,13 +1061,9 @@ impl Builder {
             self.write_streaming_rar50(&mut output, &WriterResources::default(), progress)?;
             return Ok(output);
         }
-        let resources = WriterResources::default();
-        let progress = ResourceProgress::new(&resources, progress.map(ProgressReporter));
-        let reporting = Some(ProgressReporter(&progress));
-        check_cancelled(reporting)?;
-        let data = self.build_single(&resources, Some(&progress))?;
-        check_cancelled(reporting)?;
-        Ok(data)
+        let mut output = Vec::new();
+        self.write_to(&mut output, &WriterResources::default(), progress)?;
+        Ok(output)
     }
 
     /// Encode into a collector that remains charged until handoff or drop.
@@ -1095,8 +1091,11 @@ impl Builder {
     ///
     /// RAR 5 and RAR 7 stream using the supplied workspace and spool policy;
     /// see [`WriterResources`] for its scope and bare-WASM memory limits.
-    /// The legacy families encode into memory first, so this is
-    /// [`to_bytes`](Self::to_bytes) followed by a write.
+    /// Legacy families emit headers and members directly, retaining compressed
+    /// members in memory. Stored sources are read twice to prepare and verify
+    /// checksums. Legacy managed-memory quotas are not supported.
+    /// On failure, `output` may contain a partial archive. Use
+    /// [`write_to_path`](Self::write_to_path) for atomic file publication.
     pub fn write_to(
         &self,
         output: &mut dyn Write,
@@ -1120,37 +1119,9 @@ impl Builder {
         let progress = ResourceProgress::new(resources, progress.map(ProgressReporter));
         let reporting = Some(ProgressReporter(&progress));
         check_cancelled(reporting)?;
-        let data = self.build_single(resources, Some(&progress))?;
-        check_cancelled(reporting)?;
-        progress.report(crate::WriteProgressEvent::OperationStarted {
-            operation: crate::WriteOperation::Emission,
-            total_bytes: Some(data.len() as u64),
-            total_entries: None,
-            pass: 1,
-        });
-        let mut output = CancellableIo {
-            inner: output,
-            progress: reporting,
-        };
-        for (index, chunk) in data.chunks(64 * 1024).enumerate() {
-            output.write_all(chunk)?;
-            progress.report(crate::WriteProgressEvent::Advanced {
-                operation: crate::WriteOperation::Emission,
-                completed_bytes: ((index + 1) * 64 * 1024).min(data.len()) as u64,
-                total_bytes: data.len() as u64,
-                pass: 1,
-            });
-            check_cancelled(reporting)?;
-        }
-        check_cancelled(reporting)?;
-        progress.report(crate::WriteProgressEvent::OperationFinished {
-            operation: crate::WriteOperation::Emission,
-            total_bytes: Some(data.len() as u64),
-            total_entries: None,
-            pass: 1,
-        });
-        check_cancelled(reporting)?;
-        Ok(())
+        let mut output = EmissionWriter::new(output, reporting);
+        self.write_legacy_to(&mut output, resources, Some(&progress))?;
+        output.finish()
     }
 
     /// Write the archive to `path`, streaming where the format allows it.
@@ -1434,15 +1405,16 @@ impl Builder {
         Ok(std::borrow::Cow::Owned(owned))
     }
 
-    fn build_single(
+    fn write_legacy_to(
         &self,
+        output: &mut dyn Write,
         resources: &WriterResources,
         progress: Option<&dyn WriteProgress>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<()> {
         match self.format.family() {
             ArchiveFamily::Rar50Plus => unreachable!("RAR 5/7 use the streaming writer"),
-            ArchiveFamily::Rar15To40 => self.build_rar15_single(resources, progress),
-            ArchiveFamily::Rar13 => self.build_rar13_single(resources, progress),
+            ArchiveFamily::Rar15To40 => self.write_rar15_single(output, resources, progress),
+            ArchiveFamily::Rar13 => self.write_rar13_single(output, resources, progress),
         }
     }
 
@@ -1620,11 +1592,12 @@ impl Builder {
         options
     }
 
-    fn build_rar15_single(
+    fn write_rar15_single(
         &self,
+        output: &mut dyn Write,
         resources: &WriterResources,
         progress: Option<&dyn WriteProgress>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<()> {
         let entries: Vec<_> = self
             .entries
             .iter()
@@ -1668,6 +1641,7 @@ impl Builder {
                 .then_some(self.password.as_deref())
                 .flatten(),
             self.comment_password.as_deref(),
+            output,
         )
     }
 
@@ -1679,11 +1653,12 @@ impl Builder {
         options
     }
 
-    fn build_rar13_single(
+    fn write_rar13_single(
         &self,
+        output: &mut dyn Write,
         resources: &WriterResources,
         progress: Option<&dyn WriteProgress>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<()> {
         let entries: Vec<_> = self
             .entries
             .iter()
@@ -1715,6 +1690,7 @@ impl Builder {
             self.comment.as_deref(),
             resources,
             progress,
+            output,
         )
     }
 
