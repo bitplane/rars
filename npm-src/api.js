@@ -74,6 +74,9 @@ export function createApi(runtime) {
   }
 
   class RarArchive {
+    #nameEntries = new Map();
+    #indexedEntries;
+
     static async open(input, options) {
       const operation = operationOptions(options);
       const sources = await runtime.prepareArchiveSources(input);
@@ -97,6 +100,12 @@ export function createApi(runtime) {
       this.entries = Object.freeze(metadata.entries.map(
         (entry) => Object.freeze(new RarEntry(this, entry)),
       ));
+      this.#indexedEntries = this.entries;
+      for (const entry of this.entries) {
+        const matches = this.#nameEntries.get(entry.name);
+        if (matches) matches.push(entry);
+        else this.#nameEntries.set(entry.name, [entry]);
+      }
     }
 
     _request(operation, payload, options) {
@@ -105,7 +114,7 @@ export function createApi(runtime) {
     }
 
     get(name) {
-      const matches = this.getAll(name);
+      const matches = this.#matchingEntries(name, false);
       if (this._legacyNameEncoding != null && typeof name === "string"
           && matches.some((entry) => !sameName(entry.nameBytes, matches[0].nameBytes))) {
         throw new RarError("AMBIGUOUS_ENTRY", "decoded name is ambiguous; use getAll() or an entry index");
@@ -114,7 +123,17 @@ export function createApi(runtime) {
     }
 
     getAll(name) {
+      return this.#matchingEntries(name, true);
+    }
+
+    #matchingEntries(name, copy) {
       assertOpen(this);
+      if (typeof name === "string" && this.entries === this.#indexedEntries) {
+        const matches = this.#nameEntries.get(name) ?? [];
+        return copy ? matches.slice() : matches;
+      }
+      // Raw Uint8Array names remain mutable, even on frozen entries. Also
+      // preserve traversal if a caller replaces the public entries property.
       return this.entries.filter((entry) => sameName(
         typeof name === "string" ? entry.name : entry.nameBytes,
         name,
@@ -163,6 +182,8 @@ export function createApi(runtime) {
       if (this._closed) return;
       this._closed = true;
       this._sources = [];
+      this.#nameEntries.clear();
+      this.#indexedEntries = undefined;
     }
   }
 

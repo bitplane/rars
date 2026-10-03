@@ -65,6 +65,10 @@ for (const settings of [{}, { legacyNameEncoding: "cp850" }]) {
   const archive = await DuplicateArchive.open(new Uint8Array(), settings);
   assert.equal(archive.get("same").index, 1);
   assert.equal(archive.get("same").size, 6);
+  const selected = archive.getAll("same");
+  selected.pop();
+  assert.equal(archive.getAll("same").length, 2);
+  assert.equal(archive.get("same").index, 1);
   for (const entry of archive.getAll("same")) {
     assert.deepEqual(await entry.bytes(), new Uint8Array([entry.index]));
   }
@@ -83,6 +87,19 @@ assert.deepEqual(batchRequests, [
   [[0, 1, 1], {maxTotalOutputBytes: 11}, "secret"],
 ]);
 console.log("npm duplicate member identity checks passed");
+
+// Index only immutable display names; raw bytes and a replaced public entry
+// array must retain their existing lookup behavior.
+const mutable = await DuplicateArchive.open(new Uint8Array());
+mutable.entries[0].nameBytes[0] = "l".charCodeAt(0);
+assert.equal(mutable.get("same").index, 1);
+assert.equal(mutable.get(new TextEncoder().encode("lame")).index, 0);
+mutable.entries = Object.freeze([mutable.entries[0]]);
+assert.equal(mutable.get("same").index, 0);
+assert.equal(mutable.getAll("same").length, 1);
+mutable.close();
+assert.throws(() => mutable.get("same"), (error) => error.code === "CLOSED");
+console.log("npm indexed-name ownership checks passed");
 
 // The handwritten API validates and forwards workspace limits without a WASM build.
 const quotaRequests = [];
