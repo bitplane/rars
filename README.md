@@ -138,6 +138,15 @@ overhead are excluded. Legacy writers refuse the policy. Reader and rewrite
 staging limits are separate. See [the resource contract](WRITER_RESOURCE_CONTRACT.md)
 for ownership boundaries and the separate estimated-workspace policy.
 
+For focused performance checks, use `cargo bench -p rars --bench parallel --
+parallel_rar50_extraction` or select `parallel_rar50_compression`. Pools are
+created outside timing and compression setup clones source handles without
+copying payloads. Input copying and pool creation have separate benchmarks.
+Runs default to one and two threads; set `RARS_BENCH_THREADS=1,2,4` explicitly
+for a wider comparison. Keep build concurrency low with `CARGO_BUILD_JOBS=1`.
+Record the source revision, compiler, benchmark selection and thread counts
+beside saved results under `target/`; compare measurements with the same setup.
+
 ## Bindings
 
 Python bindings are published to [pypi](https://pypi.org/project/rars/), so you

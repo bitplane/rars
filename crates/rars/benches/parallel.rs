@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use rars::rar50::{Archive, ArchiveEntry, Rar50Writer, WriterOptions};
 use rars::{ArchiveReadOptions, ArchiveVersion, Builder, EntrySource, FeatureSet, WriterResources};
 use std::hint::black_box;
@@ -80,10 +80,29 @@ fn extract_rar50_archive(archive: &Archive) {
 
 fn thread_counts() -> Vec<usize> {
     let available = std::thread::available_parallelism().map_or(1, usize::from);
+    if let Ok(requested) = std::env::var("RARS_BENCH_THREADS") {
+        let mut counts: Vec<usize> = requested
+            .split(',')
+            .map(|count| {
+                let count = count
+                    .trim()
+                    .parse()
+                    .expect("RARS_BENCH_THREADS must contain integer thread counts");
+                assert!(
+                    count > 0 && count <= available,
+                    "benchmark thread count exceeds available CPUs"
+                );
+                count
+            })
+            .collect();
+        counts.sort_unstable();
+        counts.dedup();
+        return counts;
+    }
     if available == 1 {
         vec![1]
     } else {
-        vec![1, available]
+        vec![1, available.min(2)]
     }
 }
 
@@ -96,32 +115,41 @@ fn thread_label(threads: usize) -> String {
     }
 }
 
-fn with_threads<T>(threads: usize, run: impl FnOnce() -> T + Send) -> T
-where
-    T: Send,
-{
+fn thread_pool(threads: usize) -> rayon::ThreadPool {
     rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build()
         .expect("benchmark Rayon pool should build")
-        .install(run)
 }
 
 fn bench_parallel_compression(c: &mut Criterion) {
     let fixture = ArchiveFixture::new(MEMBER_COUNT, MEMBER_SIZE);
+    let entries = fixture.compressed_entries();
     let mut group = c.benchmark_group("parallel_rar50_compression");
     group.throughput(Throughput::Bytes(fixture.total_unpacked_size()));
 
     for threads in thread_counts() {
+        let pool = thread_pool(threads);
         group.bench_with_input(
             BenchmarkId::from_parameter(thread_label(threads)),
             &threads,
-            |b, &threads| {
-                b.iter(|| {
-                    with_threads(threads, || {
-                        black_box(write_rar50_archive(black_box(&fixture)));
-                    });
-                });
+            |b, _| {
+                // Entry handles clone their Arc-backed sources in untimed setup.
+                // Pool lifetime and caller payload copies are not compression.
+                b.iter_batched(
+                    || entries.clone(),
+                    |entries| {
+                        pool.install(|| {
+                            black_box(
+                                Rar50Writer::new(rar50_options())
+                                    .entries(entries)
+                                    .finish()
+                                    .unwrap(),
+                            )
+                        });
+                    },
+                    BatchSize::SmallInput,
+                );
             },
         );
     }
@@ -139,12 +167,13 @@ fn bench_parallel_extraction(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(fixture.total_unpacked_size()));
 
     for threads in thread_counts() {
+        let pool = thread_pool(threads);
         group.bench_with_input(
             BenchmarkId::from_parameter(thread_label(threads)),
             &threads,
-            |b, &threads| {
+            |b, _| {
                 b.iter(|| {
-                    with_threads(threads, || {
+                    pool.install(|| {
                         extract_rar50_archive(black_box(&archive));
                     });
                 });
@@ -152,6 +181,24 @@ fn bench_parallel_extraction(c: &mut Criterion) {
         );
     }
 
+    group.finish();
+}
+
+fn bench_setup(c: &mut Criterion) {
+    let fixture = ArchiveFixture::new(MEMBER_COUNT, MEMBER_SIZE);
+    c.bench_function("rar50_input_copy_and_entry_setup", |b| {
+        b.iter(|| black_box(fixture.compressed_entries()));
+    });
+    let mut group = c.benchmark_group("parallel_pool_setup");
+    for threads in thread_counts() {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(threads),
+            &threads,
+            |b, &threads| {
+                b.iter(|| black_box(thread_pool(threads)));
+            },
+        );
+    }
     group.finish();
 }
 
@@ -176,10 +223,7 @@ fn bench_candidate_pricing(c: &mut Criterion) {
             .expect("benchmark member should be accepted");
     }
     let resources = WriterResources::new(256 * 1024 * 1024);
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(4)
-        .build()
-        .expect("benchmark Rayon pool should build");
+    let pool = thread_pool(thread_counts().into_iter().max().unwrap());
     let mut group = c.benchmark_group("rar50_candidate_pricing");
     group.throughput(Throughput::Bytes(4 * data.len() as u64));
     group.bench_function("numeric_samples", |b| {
@@ -197,6 +241,6 @@ fn bench_candidate_pricing(c: &mut Criterion) {
 criterion_group!(
     name = benches;
     config = Criterion::default().sample_size(10);
-    targets = bench_parallel_compression, bench_parallel_extraction, bench_candidate_pricing
+    targets = bench_parallel_compression, bench_parallel_extraction, bench_candidate_pricing, bench_setup
 );
 criterion_main!(benches);
