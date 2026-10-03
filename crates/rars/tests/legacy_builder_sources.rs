@@ -297,3 +297,44 @@ fn legacy_output_failure_stops_before_later_source_reads() {
         assert!(!finished.load(Ordering::Relaxed));
     }
 }
+
+#[cfg(feature = "parallel")]
+#[test]
+fn ordinary_legacy_sources_keep_parallel_preparation() {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
+    pool.install(|| {
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let mut builder = Builder::new(ArchiveVersion::Rar29).store(true);
+        for value in 0..2u8 {
+            let barrier = barrier.clone();
+            let opens = AtomicUsize::new(0);
+            builder
+                .add_source(
+                    vec![b'a' + value],
+                    EntrySource::from_opener(1, move || {
+                        if opens.fetch_add(1, Ordering::Relaxed) == 0 {
+                            // Both independent sources must enter preparation together.
+                            barrier.wait();
+                        }
+                        Ok(Box::new(Cursor::new(vec![value])))
+                    }),
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        for value in 0..2u8 {
+            assert_eq!(
+                archive
+                    .read_member_at(value as usize, None)
+                    .unwrap()
+                    .unwrap(),
+                [value]
+            );
+        }
+    });
+}

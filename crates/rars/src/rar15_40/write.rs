@@ -641,9 +641,16 @@ fn write_members_to(
             member.bytes.release();
         }
     } else {
+        // Scoped rewrite sources retain plaintext until emission; their disk
+        // quota may admit fewer inputs than the CPU pool can prepare at once.
+        let window = members
+            .iter()
+            .filter_map(|member| member.bytes.source())
+            .map(EntrySource::max_preparation_window)
+            .fold(crate::parallel::default_window(), usize::min);
         crate::parallel::map_slice_windowed(
             members,
-            crate::parallel::default_window(),
+            window,
             |member| {
                 encode_member(member, options, coding, &mut None, resources, progress).map_err(
                     |error| crate::write_stream::member_error(error, member.name, "preparing"),

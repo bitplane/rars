@@ -20,6 +20,10 @@ pub trait EntryReader: Read + Seek + Send {}
 impl<T: Read + Seek + Send> EntryReader for T {}
 
 pub(crate) trait SourceFactory: Send + Sync {
+    /// Bound simultaneous preparation when a scoped producer retains plaintext.
+    fn max_preparation_window(&self) -> usize {
+        usize::MAX
+    }
     fn release(&self) {}
     fn len(&self) -> Result<u64>;
     fn open(&self) -> Result<Box<dyn EntryReader>>;
@@ -45,6 +49,10 @@ impl fmt::Debug for EntrySource {
 impl EntrySource {
     pub(crate) fn from_factory(factory: impl SourceFactory + 'static) -> Self {
         Self(Arc::new(factory))
+    }
+
+    pub(crate) fn max_preparation_window(&self) -> usize {
+        self.0.max_preparation_window()
     }
 
     /// Release a session-owned payload once this write will never reopen it.

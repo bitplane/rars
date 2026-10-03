@@ -23,6 +23,7 @@ pub(super) struct Delivery {
     changed: Condvar,
     cancellation: ReadCancellation,
     pub(super) used: Arc<AtomicU64>,
+    max_preparation_window: usize,
 }
 
 struct Lease {
@@ -57,6 +58,9 @@ struct Source {
     delivery: Arc<Delivery>,
 }
 impl SourceFactory for Source {
+    fn max_preparation_window(&self) -> usize {
+        self.delivery.max_preparation_window
+    }
     fn len(&self) -> Result<u64> {
         Ok(self.size)
     }
@@ -167,6 +171,22 @@ pub(super) fn run<T>(
     consume: impl FnOnce(Vec<EntrySource>) -> Result<T>,
 ) -> Result<T> {
     options.check_cancelled()?;
+    let sizes: BTreeMap<_, _> = archive
+        .members()
+        .enumerate()
+        .map(|(i, member)| (i, member.meta.unpacked_size))
+        .collect();
+    // A preparation window can retain every source until its members are emitted.
+    // Bound it by the largest selected payload so even mixed-size windows fit.
+    let largest = indices
+        .iter()
+        .filter_map(|index| sizes.get(index))
+        .copied()
+        .max()
+        .unwrap_or(0);
+    let max_preparation_window = usize::try_from(staging.max_staged_bytes / largest.max(1))
+        .unwrap_or(usize::MAX)
+        .max(1);
     let delivery = Arc::new(Delivery {
         state: Mutex::new(State::default()),
         changed: Condvar::new(),
@@ -174,12 +194,8 @@ pub(super) fn run<T>(
             .cancellation
             .map_or_else(ReadCancellation::new, ReadCancellation::child),
         used: Arc::new(AtomicU64::new(0)),
+        max_preparation_window,
     });
-    let sizes: BTreeMap<_, _> = archive
-        .members()
-        .enumerate()
-        .map(|(i, member)| (i, member.meta.unpacked_size))
-        .collect();
     let sources = indices
         .iter()
         .map(|&index| {
@@ -289,6 +305,7 @@ mod tests {
             changed: Condvar::new(),
             cancellation: ReadCancellation::new(),
             used: Arc::new(AtomicU64::new(0)),
+            max_preparation_window: usize::MAX,
         })
     }
 

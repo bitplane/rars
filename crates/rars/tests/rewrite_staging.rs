@@ -499,46 +499,72 @@ fn corrupt_dependencies_fail_cleanly_but_independent_omissions_are_skipped() {
 }
 
 #[test]
-fn incremental_legacy_materialization_releases_each_verified_payload() {
-    let root = scratch::case("rewrite-incremental-legacy");
-    let mut original = Builder::new(ArchiveVersion::Rar50).store(true);
-    for index in 0..3 {
-        original
-            .add_bytes(
-                format!("f{index}").into_bytes(),
-                vec![b'a' + index; 2048],
-                None,
-                None,
-            )
-            .unwrap();
-    }
-    let archive = ArchiveReader::read_owned(original.to_bytes().unwrap()).unwrap();
-    let bytes = archive
-        .with_rewrite_sources(
-            &[0, 1, 2],
-            ArchiveReadOptions::default(),
-            &RewriteStaging {
-                directory: root.to_path_buf(),
-                max_staged_bytes: 2048,
-            },
-            None,
-            |sources| {
-                let mut output = Builder::new(ArchiveVersion::Rar29).store(true);
-                for (index, source) in sources.into_iter().enumerate() {
-                    output.add_source(format!("f{index}").into_bytes(), source, None, None)?;
+fn incremental_legacy_sources_fit_staging_preparation_windows() {
+    let run = || {
+        let root = scratch::case("rewrite-incremental-legacy");
+        for sizes in [[2048, 2048, 2048], [512, 2048, 1024]] {
+            let mut original = Builder::new(ArchiveVersion::Rar50).store(true);
+            for (index, size) in sizes.into_iter().enumerate() {
+                original
+                    .add_bytes(
+                        format!("f{index}").into_bytes(),
+                        vec![b'a' + index as u8; size],
+                        None,
+                        None,
+                    )
+                    .unwrap();
+            }
+            let archive = ArchiveReader::read_owned(original.to_bytes().unwrap()).unwrap();
+            for format in [
+                ArchiveVersion::Rar13,
+                ArchiveVersion::Rar14,
+                ArchiveVersion::Rar15,
+                ArchiveVersion::Rar20,
+                ArchiveVersion::Rar29,
+                ArchiveVersion::Rar30,
+                ArchiveVersion::Rar40,
+            ] {
+                for (store, solid, encrypted) in [
+                    (true, false, false),
+                    (false, false, false),
+                    (false, true, false),
+                    (true, false, true),
+                ] {
+                    if encrypted && !cfg!(feature = "encryption") {
+                        continue;
+                    }
+                    let password = encrypted.then_some(b"secret".as_slice());
+                    for max_staged_bytes in [2048, 4096] {
+                        let bytes = archive.with_rewrite_sources(&[0, 1, 2], ArchiveReadOptions::default(),
+                            &RewriteStaging { directory: root.to_path_buf(), max_staged_bytes }, None,
+                            |sources| {
+                                let mut output = Builder::new(format).store(store).solid(solid).password(password.map(<[u8]>::to_vec));
+                                for (index, source) in sources.into_iter().enumerate() {
+                                    output.add_source(format!("f{index}").into_bytes(), source, None, None)?;
+                                }
+                                output.to_bytes()
+                            }).unwrap_or_else(|error| panic!("{format:?} store={store} solid={solid} encrypted={encrypted} quota={max_staged_bytes}: {error}"));
+                        let output = ArchiveReader::read_owned(bytes).unwrap();
+                        for (index, size) in sizes.into_iter().enumerate() {
+                            assert_eq!(
+                                output.read_member_at(index, password).unwrap().unwrap(),
+                                vec![b'a' + index as u8; size]
+                            );
+                        }
+                        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+                    }
                 }
-                output.to_bytes()
-            },
-        )
-        .unwrap();
-    let output = ArchiveReader::read_owned(bytes).unwrap();
-    for index in 0..3 {
-        assert_eq!(
-            output.read_member_at(index, None).unwrap().unwrap(),
-            vec![b'a' + index as u8; 2048]
-        );
-    }
-    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+            }
+        }
+    };
+    #[cfg(feature = "parallel")]
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap()
+        .install(run);
+    #[cfg(not(feature = "parallel"))]
+    run();
 }
 
 #[test]
