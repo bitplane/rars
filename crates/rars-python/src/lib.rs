@@ -496,6 +496,35 @@ impl RarFile {
         Ok(io.getattr("BytesIO")?.call1((bytes,))?.unbind())
     }
 
+    /// Read selected members in one session, preserving request order and duplicates.
+    /// Output limits apply to the whole call, including required solid predecessors.
+    #[pyo3(signature = (members, pwd = None, *, options = None))]
+    fn read_many(
+        &self,
+        py: Python<'_>,
+        members: &Bound<'_, PyAny>,
+        pwd: Option<&Bound<'_, PyAny>>,
+        options: Option<&ReadOptions>,
+    ) -> PyResult<Vec<Vec<u8>>> {
+        check_read_options_cancellation(options)?;
+        let indices = members
+            .try_iter()?
+            .map(|member| self.resolve_index(&member?))
+            .collect::<PyResult<Vec<_>>>()?;
+        let password = py_password(pwd)?.or_else(|| self.password.clone());
+        let data = py
+            .detach(|| {
+                self.archive.read_members_at_with_options(
+                    &indices,
+                    self.extraction_options(options, password.as_deref()),
+                )
+            })
+            .map_err(map_error)?;
+        data.into_iter()
+            .map(|bytes| bytes.ok_or_else(|| PyKeyError::new_err("member has no file payload")))
+            .collect()
+    }
+
     #[pyo3(signature = (member, path = None, pwd = None, overwrite = false, *, options = None))]
     fn extract(
         &self,

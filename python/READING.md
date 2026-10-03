@@ -31,6 +31,15 @@ distinguishes duplicate raw names. A `RarInfo` from another `RarFile` is rejecte
 even when that file was opened from the same bytes. `extractall(members=...)`
 also preserves object identity; omit `members` to extract every entry.
 
+`read_many(members, pwd=None, *, options=None)` reads an iterable of names or
+`RarInfo` objects in one decoder session and returns a list of byte buffers in
+request order. Repeated members are decoded once; their verified bytes are
+copied into repeated result positions. Prefer `RarInfo` objects for exact
+duplicate identity and to avoid repeated name lookup. Solid predecessors are
+decoded once, and output budgets apply to the entire batch. Missing members,
+directories and RAR5 redirections raise `KeyError`; no partial list is returned
+on failure. An empty iterable returns an empty list and still checks cancellation.
+
 `ReadOptions` is immutable and reusable. Its limits and cancellation token are
 readable properties. Every call starts fresh output budgets; sharing an options
 object does not share a cumulative budget. Limits accept nonnegative integers

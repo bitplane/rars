@@ -21,6 +21,21 @@ def test_duplicate_member_objects_keep_payload_and_metadata_identity(tmp_path, f
     assert archive.getinfo("one.txt").member_index == 2
     assert archive.getinfo(first).member_index == 1
     assert archive.read("one.txt") == b"second"
+    assert archive.read_many([second, first, second]) == [b"second", b"first", b"second"]
+    assert archive.read_many(iter([first, "one.txt", second])) == [b"first", b"second", b"second"]
+    assert archive.read_many([second, first, second], options=rars.ReadOptions(max_total_output_bytes=11)) == [b"second", b"first", b"second"]
+    with pytest.raises(MemoryError):
+        archive.read_many([second, first], options=rars.ReadOptions(max_total_output_bytes=10))
+    assert archive.read_many([]) == []
+    with pytest.raises(KeyError):
+        archive.read_many([archive.infolist()[0]])
+    with pytest.raises(KeyError):
+        archive.read_many([first, "missing"])
+    token = rars.CancellationToken()
+    token.cancel()
+    for members in [[], ["missing"], [first]]:
+        with pytest.raises(InterruptedError):
+            archive.read_many(members, options=rars.ReadOptions(cancellation=token))
     for info, payload, timestamp, comment in [
         (first, b"first", 10, b"first comment"),
         (second, b"second", 20, b"second comment"),
@@ -42,4 +57,6 @@ def test_duplicate_member_objects_keep_payload_and_metadata_identity(tmp_path, f
         other.extract(first, tmp_path / "foreign")
     with pytest.raises(ValueError, match="different archive"):
         other.extractall(tmp_path / "foreign", members=[first])
+    with pytest.raises(ValueError, match="different archive"):
+        other.read_many([first])
     assert not (tmp_path / "foreign").exists()
