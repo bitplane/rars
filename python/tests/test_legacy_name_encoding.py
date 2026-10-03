@@ -14,6 +14,7 @@ def test_decoded_names_select_extract_and_preserve(tmp_path, format):
     archive = rars.RarFile.from_bytes(data, options=options)
     assert archive.namelist() == ["café.txt"]
     info = archive.getinfo("café.txt")
+    assert isinstance(info.orig_filename_bytes, bytes)
     assert info.orig_filename_bytes == b"caf\x82.txt"
     assert archive.read("café.txt") == b"payload"
     assert archive.read(info) == b"payload"
@@ -75,8 +76,12 @@ def test_legacy_unicode_and_decoded_collisions(tmp_path):
     options = rars.ReadOptions(legacy_name_encoding="cp850")
     archive = rars.RarFile.from_bytes(data, options=options)
     assert archive.namelist() == ["café.txt", "café.txt"]
+    for operation in [archive.read, archive.getinfo]:
+        with pytest.raises(ValueError, match="ambiguous"):
+            operation("café.txt")
     with pytest.raises(ValueError, match="ambiguous"):
-        archive.read("café.txt")
+        archive.read_many(["café.txt"])
+    assert archive.read_many([info.orig_filename_bytes for info in archive.infolist()]) == [b"unicode", b"legacy"]
     assert archive.read(archive.infolist()[0]) == b"unicode"
     assert archive.read(archive.infolist()[1]) == b"legacy"
     for selected in [None, archive.infolist()]:
