@@ -537,14 +537,15 @@ fn info_with_encoding(
 }
 
 fn info_from_member(member: rars_rs::ArchiveMember) -> RarInfo {
+    let solid = member.is_solid();
     // RAR 1.3 checksums are 16 bit and RAR 5 may carry a BLAKE2sp hash instead
     // of a CRC, so the one field JavaScript sees is the CRC-32 where the format
     // has one and null everywhere else.
-    let (crc, solid) = match member.detail {
-        rars_rs::ArchiveMemberDetail::Rar13 { .. } => (None, false),
-        rars_rs::ArchiveMemberDetail::Rar15To40 { crc32, solid, .. } => (Some(crc32), solid),
-        rars_rs::ArchiveMemberDetail::Rar50Plus { crc32, .. } => (crc32, false),
-        _ => (None, false),
+    let crc = match member.detail {
+        rars_rs::ArchiveMemberDetail::Rar13 { .. } => None,
+        rars_rs::ArchiveMemberDetail::Rar15To40 { crc32, .. } => Some(crc32),
+        rars_rs::ArchiveMemberDetail::Rar50Plus { crc32, .. } => crc32,
+        _ => None,
     };
     RarInfo {
         display_name: String::from_utf8_lossy(&member.meta.name).into_owned(),
@@ -1003,6 +1004,27 @@ fn read_options<'a>(
 // requiring browser-only types to work in native Rust unit tests.
 #[cfg(test)]
 mod host_tests {
+    #[test]
+    fn binding_preserves_rar5_member_solid_flags() {
+        for version in [
+            rars_rs::ArchiveVersion::Rar50,
+            rars_rs::ArchiveVersion::Rar70,
+        ] {
+            let mut builder = rars_rs::Builder::new(version).solid(true);
+            for name in [b"first".as_slice(), b"second".as_slice()] {
+                builder
+                    .add_bytes(name.to_vec(), b"repeated payload ".repeat(4), None, None)
+                    .unwrap();
+            }
+            let archive = rars_rs::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+            let flags: Vec<_> = archive
+                .members()
+                .map(|member| super::info_from_member(member).solid)
+                .collect();
+            assert_eq!(flags, [false, true], "{version:?}");
+        }
+    }
+
     #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = __testErrorRecords)]
     pub fn error_records() -> js_sys::Array {

@@ -393,6 +393,18 @@ pub struct ArchiveMember {
 }
 
 impl ArchiveMember {
+    /// Whether this member declares a dependency on preceding decoded history.
+    /// RAR 1.3 has no member-level solid flag; consult its archive main header.
+    pub fn is_solid(&self) -> bool {
+        match &self.detail {
+            ArchiveMemberDetail::Rar15To40 { solid, .. } => *solid,
+            ArchiveMemberDetail::Rar50Plus {
+                compression_info, ..
+            } => compression_info & 0x40 != 0,
+            ArchiveMemberDetail::Rar13 { .. } => false,
+        }
+    }
+
     /// Name interpretation for display or destination adapters. Stored bytes and
     /// rewrite identity remain unchanged; Unicode metadata takes precedence.
     pub fn decoded_name(

@@ -2042,7 +2042,7 @@ fn read_archives_from_paths(
 fn info_from_member(member: rars_rs::ArchiveMember) -> RarInfo {
     let mut detail = HashMap::new();
     let mut crc = None;
-    let mut solid = false;
+    let solid = member.is_solid();
     match member.detail {
         rars_rs::ArchiveMemberDetail::Rar13 {
             method,
@@ -2060,13 +2060,11 @@ fn info_from_member(member: rars_rs::ArchiveMember) -> RarInfo {
             method,
             unpack_version,
             crc32,
-            solid: member_solid,
             salt,
             has_file_comment,
             ..
         } => {
             crc = Some(crc32);
-            solid = member_solid;
             detail.insert("method".to_string(), method.to_string());
             detail.insert("unpack_version".to_string(), unpack_version.to_string());
             detail.insert("has_salt".to_string(), salt.is_some().to_string());
@@ -2306,6 +2304,27 @@ fn error_is_bad_password(error: &rars_rs::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binding_preserves_rar5_member_solid_flags() {
+        for version in [
+            rars_rs::ArchiveVersion::Rar50,
+            rars_rs::ArchiveVersion::Rar70,
+        ] {
+            let mut builder = rars_rs::Builder::new(version).solid(true);
+            for name in [b"first".as_slice(), b"second".as_slice()] {
+                builder
+                    .add_bytes(name.to_vec(), b"repeated payload ".repeat(4), None, None)
+                    .unwrap();
+            }
+            let archive = rars_rs::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+            let flags: Vec<_> = archive
+                .members()
+                .map(|member| info_from_member(member).is_solid)
+                .collect();
+            assert_eq!(flags, [false, true], "{version:?}");
+        }
+    }
 
     #[test]
     fn binding_boundary_values_and_error_mappings_preserve_their_contracts() {
