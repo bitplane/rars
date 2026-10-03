@@ -1,4 +1,3 @@
-
 use super::*;
 type Unpack15 = Reader15State<Allowance>;
 type BitReader = ReaderBits<Allowance>;

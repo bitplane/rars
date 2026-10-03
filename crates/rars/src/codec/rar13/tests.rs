@@ -1,4 +1,3 @@
-
 use crate::codec::Error;
 
 #[test]
