@@ -17,6 +17,26 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  msrv:
+    name: Minimum Rust (1.89)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: 1
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Check workspace and independent readers at the minimum compiler version
+        run: |
+          cargo check --workspace --lib --bins --locked
+          cargo check --locked --manifest-path scripts/reader-consumer/Cargo.toml
+          cargo check --locked --manifest-path scripts/reader-consumer/Cargo.toml --features encryption
+
   rust:
     name: Rust checks
     runs-on: ubuntu-latest

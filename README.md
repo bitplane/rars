@@ -66,6 +66,9 @@ preservation semantics.
 
 ## Library features
 
+The workspace supports Rust 1.89 and newer. CI checks this minimum as well as
+the current stable compiler.
+
 All features are enabled by default. For a sequential reader without encoders,
 recovery algorithms, cryptographic dependencies or Rayon:
 
