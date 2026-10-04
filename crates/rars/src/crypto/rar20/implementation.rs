@@ -41,8 +41,8 @@ impl Rar20Cipher {
         if !data.len().is_multiple_of(16) {
             return Err(Error::UnalignedInput);
         }
-        for block in data.chunks_exact_mut(16) {
-            self.decrypt_block(block.try_into().expect("RAR 2 block size"));
+        for block in data.as_chunks_mut::<16>().0.iter_mut() {
+            self.decrypt_block(block);
         }
         Ok(())
     }
@@ -52,7 +52,7 @@ impl Rar20Cipher {
         if !data.len().is_multiple_of(16) {
             return Err(Error::UnalignedInput);
         }
-        for block in data.chunks_exact_mut(16) {
+        for block in data.as_chunks_mut::<16>().0.iter_mut() {
             self.encrypt_block(block);
         }
         Ok(())
@@ -83,7 +83,7 @@ impl Rar20Cipher {
         let mut padded = Zeroizing::new([0u8; PADDED_PASSWORD_BYTES]);
         padded[..password.len()].copy_from_slice(password);
         let padded_len = password.len().div_ceil(16) * 16;
-        for block in padded[..padded_len].chunks_exact_mut(16) {
+        for block in padded[..padded_len].as_chunks_mut::<16>().0.iter_mut() {
             self.encrypt_block(block);
         }
     }
@@ -144,7 +144,7 @@ impl Rar20Cipher {
     }
 
     fn update_keys(&mut self, block: &[u8]) {
-        for chunk in block.chunks_exact(4) {
+        for chunk in block.as_chunks::<4>().0.iter() {
             self.key[0] ^= crc32_table_entry(chunk[0]);
             self.key[1] ^= crc32_table_entry(chunk[1]);
             self.key[2] ^= crc32_table_entry(chunk[2]);

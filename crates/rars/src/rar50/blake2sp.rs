@@ -39,7 +39,7 @@ impl Blake2s {
         param[15] = OUT_BYTES as u8;
 
         let mut h = IV;
-        for (word, chunk) in h.iter_mut().zip(param.chunks_exact(4)) {
+        for (word, chunk) in h.iter_mut().zip(param.as_chunks::<4>().0.iter()) {
             *word ^= u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         }
 
@@ -82,7 +82,7 @@ impl Blake2s {
         self.compress(&block, true);
 
         let mut out = [0u8; OUT_BYTES];
-        for (chunk, word) in out.chunks_exact_mut(4).zip(self.h) {
+        for (chunk, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(self.h) {
             chunk.copy_from_slice(&word.to_le_bytes());
         }
         out
@@ -90,7 +90,7 @@ impl Blake2s {
 
     fn compress(&mut self, block: &[u8; BLOCK_BYTES], last_block: bool) {
         let mut m = [0u32; 16];
-        for (word, chunk) in m.iter_mut().zip(block.chunks_exact(4)) {
+        for (word, chunk) in m.iter_mut().zip(block.as_chunks::<4>().0.iter()) {
             *word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         }
 
@@ -167,11 +167,10 @@ impl Hasher {
             }
         }
 
-        let mut chunks = input.chunks_exact(BUFFER_BYTES);
-        for group in &mut chunks {
+        let (groups, tail) = input.as_chunks::<BUFFER_BYTES>();
+        for group in groups {
             self.update_group(group);
         }
-        let tail = chunks.remainder();
         self.buffer[..tail.len()].copy_from_slice(tail);
         self.buffer_len = tail.len();
     }
@@ -196,7 +195,11 @@ impl Hasher {
     }
 
     fn update_group(&mut self, group: &[u8]) {
-        for (leaf, block) in self.leaves.iter_mut().zip(group.chunks_exact(BLOCK_BYTES)) {
+        for (leaf, block) in self
+            .leaves
+            .iter_mut()
+            .zip(group.as_chunks::<BLOCK_BYTES>().0.iter())
+        {
             leaf.update(block);
         }
     }

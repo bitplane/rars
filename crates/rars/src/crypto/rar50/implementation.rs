@@ -95,9 +95,11 @@ impl Rar50Keys {
 
     pub fn mac_crc32(&self, crc: u32) -> u32 {
         let digest = hmac_sha256(&self.hash_key, &crc.to_le_bytes());
-        digest.chunks_exact(4).fold(0, |acc, chunk| {
-            acc ^ u32::from_le_bytes(chunk.try_into().unwrap())
-        })
+        digest
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .fold(0, |acc, chunk| acc ^ u32::from_le_bytes(*chunk))
     }
 
     pub fn mac_hash32(&self, hash: [u8; 32]) -> [u8; 32] {
@@ -123,8 +125,8 @@ impl Rar50Cipher {
         if !data.len().is_multiple_of(16) {
             return Err(Error::UnalignedInput);
         }
-        for block in data.chunks_exact_mut(16) {
-            self.decrypt_block(block.try_into().expect("AES block size"));
+        for block in data.as_chunks_mut::<16>().0.iter_mut() {
+            self.decrypt_block(block);
         }
         Ok(())
     }
@@ -134,7 +136,7 @@ impl Rar50Cipher {
         if !data.len().is_multiple_of(16) {
             return Err(Error::UnalignedInput);
         }
-        for block in data.chunks_exact_mut(16) {
+        for block in data.as_chunks_mut::<16>().0.iter_mut() {
             self.encrypt_block(block);
         }
         Ok(())

@@ -757,8 +757,8 @@ impl<R: Read, B: Budget> DecryptingReader<R, B> {
                 .map_err(std::io::Error::other)?;
             let mut data = std::mem::replace(encrypted_block, tail);
             data.truncate(full_len);
-            for block in data.chunks_exact_mut(16) {
-                decrypt_block(block.try_into().expect("complete encrypted block"));
+            for block in data.as_chunks_mut::<16>().0.iter_mut() {
+                decrypt_block(block);
             }
             *decrypted = data;
         } else if !encrypted_block.is_empty() {

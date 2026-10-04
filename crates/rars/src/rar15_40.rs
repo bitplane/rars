@@ -2209,8 +2209,8 @@ fn decrypt_encrypted_header_at(
         header.extend_from_slice(&first_block);
         header.extend_from_slice(encrypted_rest);
         // The rounded header minus its first block is a whole number of AES blocks.
-        for block in header[16..].chunks_exact_mut(16) {
-            cipher.decrypt_block(block.try_into().expect("AES block size"));
+        for block in header[16..].as_chunks_mut::<16>().0.iter_mut() {
+            cipher.decrypt_block(block);
         }
         header.truncate(head_size);
 
@@ -2293,8 +2293,8 @@ fn read_encrypted_header_at(
         header.extend_from_slice(&first_block);
         header.extend_from_slice(&encrypted_rest);
         // The rounded header minus its first block is a whole number of AES blocks.
-        for block in header[16..].chunks_exact_mut(16) {
-            cipher.decrypt_block(block.try_into().expect("AES block size"));
+        for block in header[16..].as_chunks_mut::<16>().0.iter_mut() {
+            cipher.decrypt_block(block);
         }
         header.truncate(head_size);
 

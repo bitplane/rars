@@ -1013,7 +1013,9 @@ where
         .iter()
         .map(|(_, parity)| {
             parity
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|word| u16::from_le_bytes([word[0], word[1]]))
                 .collect::<Vec<_>>()
         })
@@ -1032,7 +1034,7 @@ where
         for (row_index, rhs) in rhs_by_row.iter_mut().enumerate() {
             poller.check(0).map_err(|_| Error::Cancelled)?;
             let coeff = matrix[recovery_rows[row_index].0][data_index];
-            for (word_index, word) in shard.chunks_exact(2).enumerate() {
+            for (word_index, word) in shard.as_chunks::<2>().0.iter().enumerate() {
                 poller.check(0).map_err(|_| Error::Cancelled)?;
                 let data_symbol = u16::from_le_bytes([word[0], word[1]]);
                 rhs[word_index] ^= gf.mul(coeff, data_symbol);

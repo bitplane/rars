@@ -28,8 +28,8 @@ impl Rar30Cipher {
         if !data.len().is_multiple_of(16) {
             return Err(Error::UnalignedInput);
         }
-        for block in data.chunks_exact_mut(16) {
-            self.decrypt_block(block.try_into().expect("AES block size"));
+        for block in data.as_chunks_mut::<16>().0.iter_mut() {
+            self.decrypt_block(block);
         }
         Ok(())
     }
@@ -39,7 +39,7 @@ impl Rar30Cipher {
         if !data.len().is_multiple_of(16) {
             return Err(Error::UnalignedInput);
         }
-        for block in data.chunks_exact_mut(16) {
+        for block in data.as_chunks_mut::<16>().0.iter_mut() {
             self.encrypt_block(block);
         }
         Ok(())
@@ -128,7 +128,7 @@ fn derive_key_iv_slow(raw: &mut [u8]) -> ([u8; 16], [u8; 16]) {
 
     let digest = sha1.finalize();
     let mut key = [0; 16];
-    for (word_index, chunk) in digest[..16].chunks_exact(4).enumerate() {
+    for (word_index, chunk) in digest[..16].as_chunks::<4>().0.iter().enumerate() {
         key[word_index * 4..word_index * 4 + 4]
             .copy_from_slice(&[chunk[3], chunk[2], chunk[1], chunk[0]]);
     }
@@ -137,8 +137,8 @@ fn derive_key_iv_slow(raw: &mut [u8]) -> ([u8; 16], [u8; 16]) {
 
 fn update_password_data_sha1(data: &mut [u8]) {
     let mut w = [0u32; 80];
-    for (i, chunk) in data.chunks_exact(4).take(16).enumerate() {
-        w[i] = u32::from_be_bytes(chunk.try_into().expect("SHA-1 word size"));
+    for (i, chunk) in data.as_chunks::<4>().0.iter().take(16).enumerate() {
+        w[i] = u32::from_be_bytes(*chunk);
     }
     for i in 16..80 {
         w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
@@ -166,7 +166,7 @@ fn derive_key_iv_fast(raw: &[u8]) -> ([u8; 16], [u8; 16]) {
 
     let digest = sha1.finalize();
     let mut key = [0; 16];
-    for (word_index, chunk) in digest[..16].chunks_exact(4).enumerate() {
+    for (word_index, chunk) in digest[..16].as_chunks::<4>().0.iter().enumerate() {
         key[word_index * 4..word_index * 4 + 4]
             .copy_from_slice(&[chunk[3], chunk[2], chunk[1], chunk[0]]);
     }
