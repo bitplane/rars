@@ -27,6 +27,7 @@ mod scratch;
 #[path = "../tests/support/read_errors.rs"]
 mod read_errors;
 
+mod atomic64;
 #[cfg(feature = "write")]
 pub mod builder;
 #[doc(hidden)]

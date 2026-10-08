@@ -1,10 +1,11 @@
 //! Temporary creation shared by private spools and archive publication.
 
+use crate::atomic64::AtomicU64;
 use crate::{Error, Result};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 

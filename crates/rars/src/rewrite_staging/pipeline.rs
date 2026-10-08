@@ -1,13 +1,11 @@
 //! Demand-driven, archive-order decoding for one scoped writer call.
 use super::*;
+use crate::atomic64::AtomicU64;
 use crate::streaming::SourceFactory;
 use crate::{Error, ReadCancellation};
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Condvar, Mutex,
-};
+use std::sync::{atomic::Ordering, Condvar, Mutex};
 
 #[derive(Default)]
 struct State {

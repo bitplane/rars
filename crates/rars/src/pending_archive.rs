@@ -21,7 +21,8 @@ impl<C> PendingArchive<C> {
         destination: &Path,
         admit: impl FnMut(usize) -> Result<C>,
     ) -> Result<(Self, fs::File)> {
-        use std::sync::atomic::{AtomicU64, Ordering};
+        use crate::atomic64::AtomicU64;
+        use std::sync::atomic::Ordering;
         static NEXT: AtomicU64 = AtomicU64::new(0);
         Self::create_with_sequence(destination, admit, || NEXT.fetch_add(1, Ordering::Relaxed))
     }

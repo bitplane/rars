@@ -109,11 +109,12 @@ impl Archive {
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod native {
     use super::*;
+    use crate::atomic64::AtomicU64;
     use crate::{
         streaming::Spool, Error, ExtractionDecision, WriteOperation, WriteProgress,
         WriteProgressEvent, WriterResources,
     };
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::Ordering;
     use std::{
         cell::{Cell, RefCell},
         collections::BTreeMap,
