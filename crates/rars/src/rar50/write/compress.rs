@@ -146,7 +146,7 @@ fn complete_jobs<T: Send, O: Send>(
 /// Admit fixed worker scopes only after coordinator slots have capacity. Keep
 /// every reservation until all callbacks join, then retire unused capacity;
 /// output owners remain charged after return. No worker can extend its scope.
-fn run_jobs_admitted<T: Send, O: Send>(
+pub(super) fn run_jobs_admitted<T: Send, O: Send>(
     jobs: Records<T>,
     resources: &WriterResources,
     progress: &dyn CompressionProgress,
@@ -303,6 +303,9 @@ pub(super) fn compress_members_with_context(
 ) -> Result<Records<CompressedMember>> {
     if advance.is_cancelled() || resources.is_cancelled() {
         return Err(Error::Cancelled);
+    }
+    if resources.hybrid.is_some() && plan.method != 0 {
+        return super::hybrid::compress_members(sources, plan, resources, advance, error_context);
     }
     let mut integrity = Records::new(sources.len(), resources)?;
     for (index, source) in sources.iter().enumerate() {

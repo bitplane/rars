@@ -16,6 +16,9 @@ pub(crate) use encoder::{
     LZ_BLOCK_SIZE, MAX_DELTA_CHANNELS, MAX_LZ_BLOCK_SIZE,
 };
 
+#[cfg(feature = "write")]
+pub(crate) use encoder::hybrid_encoder::{encode_partition, HybridCodecOptions, HybridCodecState};
+
 use super::filters::{self, DeltaErrorMessages};
 use super::workspace::{Allowance, Budget, Buffer};
 use super::{Error, Result};

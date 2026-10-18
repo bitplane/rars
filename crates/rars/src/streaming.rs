@@ -20,6 +20,9 @@ pub trait EntryReader: Read + Seek + Send {}
 impl<T: Read + Seek + Send> EntryReader for T {}
 
 pub(crate) trait SourceFactory: Send + Sync {
+    fn consistency_token(&self) -> Result<Option<SourceConsistency>> {
+        Ok(None)
+    }
     /// Bound simultaneous preparation when a scoped producer retains plaintext.
     fn max_preparation_window(&self) -> usize {
         usize::MAX
@@ -38,6 +41,16 @@ pub(crate) trait SourceFactory: Send + Sync {
 /// output stream can already contain partial data when the error is returned.
 pub struct EntrySource(Arc<dyn SourceFactory>);
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SourceConsistency {
+    size: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
 impl fmt::Debug for EntrySource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EntrySource")
@@ -47,6 +60,9 @@ impl fmt::Debug for EntrySource {
 }
 
 impl EntrySource {
+    pub(crate) fn consistency_token(&self) -> Result<Option<SourceConsistency>> {
+        self.0.consistency_token()
+    }
     pub(crate) fn from_factory(factory: impl SourceFactory + 'static) -> Self {
         Self(Arc::new(factory))
     }
@@ -193,6 +209,19 @@ impl SourceFactory for OpenerSource {
 }
 
 impl SourceFactory for PathSource {
+    fn consistency_token(&self) -> Result<Option<SourceConsistency>> {
+        let metadata = std::fs::metadata(&self.0)?;
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Ok(Some(SourceConsistency {
+            size: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        }))
+    }
     fn len(&self) -> Result<u64> {
         Ok(std::fs::metadata(&self.0)?.len())
     }
@@ -233,6 +262,7 @@ impl WriteCancellation {
 /// logical spool contents on both backends. `with_max_spool_memory_bytes` caps
 /// bare-WASM spool payload and index capacity, excluding other writer memory.
 pub struct WriterResources {
+    pub(crate) hybrid: Option<crate::HybridOptions>,
     memory_limit: u64,
     temp_dir: Option<Arc<PathBuf>>,
     budget: Arc<MemoryBudget>,
@@ -253,6 +283,7 @@ impl Default for WriterResources {
 impl WriterResources {
     pub fn new(memory_limit: u64) -> Self {
         Self {
+            hybrid: None,
             memory_limit,
             temp_dir: None,
             budget: Arc::new(MemoryBudget::new(memory_limit)),
@@ -316,6 +347,26 @@ impl WriterResources {
     /// The optional logical spool quota, independent of `memory_limit()`.
     pub fn max_spool_bytes(&self) -> Option<u64> {
         self.spool_budget.as_ref().map(|budget| budget.limit)
+    }
+
+    pub(crate) fn spool_remaining(&self) -> Option<u64> {
+        self.spool_budget
+            .as_ref()
+            .map(|budget| budget.limit.saturating_sub(*budget.used.lock().unwrap()))
+    }
+
+    pub(crate) fn reserve_external_spool(&self, bytes: u64) -> Result<Option<StorageCharge>> {
+        self.spool_budget
+            .as_ref()
+            .map(|budget| {
+                let mut charge = StorageCharge {
+                    budget: budget.clone(),
+                    bytes: 0,
+                };
+                charge.grow_to(bytes)?;
+                Ok(charge)
+            })
+            .transpose()
     }
 
     /// Cap shared in-memory spool payload and index capacity on bare WASM.
@@ -561,6 +612,10 @@ pub(crate) struct StorageCharge {
 }
 
 impl StorageCharge {
+    /// Keep quota debt when backing storage could not be removed.
+    pub(crate) fn retain_debt(&mut self) {
+        self.bytes = 0;
+    }
     fn new(resources: &WriterResources) -> Option<Self> {
         resources.spool_budget.as_ref().map(|budget| Self {
             budget: budget.clone(),

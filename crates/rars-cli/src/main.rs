@@ -1279,6 +1279,7 @@ impl AddWritePlan {
 }
 
 struct AddCommand {
+    hybrid: Option<rars::HybridOptions>,
     password: Option<Password>,
     target: ArchiveVersion,
     store: bool,
@@ -1311,6 +1312,41 @@ struct AddCommand {
 fn build_add_command(args: AddArgs) -> CliResult<AddCommand> {
     let password = resolve_password_args(&args.password)?;
     let target = args.format.archive_version();
+    let hybrid = args
+        .experimental_hybrid
+        .as_deref()
+        .map(|profile| {
+            let profile = if profile == "server" {
+                rars::HybridProfile::Server
+            } else {
+                rars::HybridProfile::Desktop
+            };
+            let mut options = rars::HybridOptions::new(profile)
+                .with_variant(args.hybrid_variant.unwrap_or(
+                    if args.hybrid_architecture.as_deref() == Some("streams") {
+                        15
+                    } else {
+                        63
+                    },
+                ))?
+                .with_archive_analysis(args.analyze_relationships)
+                .with_member_order_optimization(args.optimize_member_order);
+            options = options.with_architecture(match args.hybrid_architecture.as_deref() {
+                Some("relationships") => rars::HybridArchitecture::Relationships,
+                Some("streams") => rars::HybridArchitecture::Streams,
+                _ => rars::HybridArchitecture::Hybrid,
+            });
+            if let Some(ceiling) = args.hybrid_dictionary_ceiling {
+                options = options.with_dictionary_ceiling(ceiling as u64);
+            }
+            Ok::<_, rars::Error>(options)
+        })
+        .transpose()?;
+    if hybrid.is_some() && !matches!(target, ArchiveVersion::Rar50 | ArchiveVersion::Rar70) {
+        return Err(CliError::usage(
+            "--experimental-hybrid requires RAR5 or RAR7",
+        ));
+    }
     let mut store = args.store;
     let compression_level = args.level;
     if let Some(level) = compression_level {
@@ -1339,6 +1375,7 @@ fn build_add_command(args: AddArgs) -> CliResult<AddCommand> {
         None
     };
     Ok(AddCommand {
+        hybrid,
         password,
         target,
         store,
@@ -1371,6 +1408,7 @@ fn build_add_command(args: AddArgs) -> CliResult<AddCommand> {
 
 fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
     let AddCommand {
+        hybrid,
         password,
         target,
         store,
@@ -1420,6 +1458,13 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
         audio: audio_filter.is_some(),
         arm: arm_filter,
     };
+    let auto_filter = auto_filter
+        || (!store
+            && !no_filter
+            && asked_filters.count() == 0
+            && hybrid.is_some_and(|options| options.variant & 8 != 0));
+    let no_filter =
+        no_filter || (!auto_filter && hybrid.is_some_and(|options| options.variant & 8 == 0));
     let shape = rars::PlanShape::new()
         .compressed(compress)
         .volumes(volume_size.is_some())
@@ -1497,6 +1542,7 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
             return Err("RAR 5 quick-open cannot be combined with header encryption".into());
         }
         return write_plain_rar50_streaming(
+            hybrid,
             input_paths,
             &archive_path,
             target,
@@ -1863,6 +1909,7 @@ fn write_legacy_volumes(plan: LegacyVolumeWrite<'_>, progress: &CliProgress) -> 
 
 #[allow(clippy::too_many_arguments)]
 fn write_plain_rar50_streaming(
+    hybrid: Option<rars::HybridOptions>,
     input_paths: &[PathBuf],
     archive_path: &Path,
     target: ArchiveVersion,
@@ -1927,6 +1974,9 @@ fn write_plain_rar50_streaming(
     features.solid = solid;
     features.quick_open = quick_open;
     let mut options = rars::rar50::WriterOptions::new(target, features);
+    if let Some(hybrid) = hybrid {
+        options = options.with_hybrid(hybrid);
+    }
     if let Some(level) = compression_level {
         options = options.with_compression_level(level);
     }
@@ -1936,9 +1986,14 @@ fn write_plain_rar50_streaming(
     let default_temp = archive_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty());
-    let mut resources = rars::WriterResources::new(
-        memory_limit.map_or(rars::DEFAULT_WRITER_MEMORY_LIMIT, |limit| limit as u64),
-    );
+    let mut resources = rars::WriterResources::new(memory_limit.map_or_else(
+        || {
+            hybrid.map_or(rars::DEFAULT_WRITER_MEMORY_LIMIT, |options| {
+                options.memory_bytes()
+            })
+        },
+        |limit| limit as u64,
+    ));
     if let Some(limit) = max_memory {
         resources = resources.with_max_memory_bytes(limit as u64);
     }

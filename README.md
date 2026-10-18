@@ -52,4 +52,9 @@ rars a --format rar29 --solid archive.rar files...
 rars a --format rar70 --volume-size 10m archive.part1.rar files...
 ```
 
+The opt-in [hybrid encoder](HYBRID_ENCODER.md) has a separate
+[candidate runner](scripts/hybrid/README.md). It freezes 64 configurations per
+profile, resumes bounded screening and confirmation, and verifies native/rars
+extraction before ranking candidates. It requires prebuilt binaries.
+
 Licensed under the [Apache License, Version 2.0](COPYING).

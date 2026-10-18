@@ -1609,7 +1609,26 @@ fn encode_token_block_with_allowance<B: Budget>(
     is_last: bool,
     allowance: &B,
 ) -> Result<Buffer<u8, B>> {
-    let lengths = table_lengths_with_allowance(tokens, &[], distance_size, allowance)?;
+    encode_token_block_with_state(
+        tokens,
+        algorithm_version,
+        distance_size,
+        is_last,
+        allowance,
+        EncoderMatchState::default(),
+    )
+    .map(|(packed, _)| packed)
+}
+
+fn encode_token_block_with_state<B: Budget>(
+    tokens: &[EncodeToken],
+    algorithm_version: u8,
+    distance_size: usize,
+    is_last: bool,
+    allowance: &B,
+    initial: EncoderMatchState,
+) -> Result<(Buffer<u8, B>, EncoderMatchState)> {
+    let lengths = table_lengths_with_state(tokens, &[], distance_size, allowance, initial)?;
 
     let main_table = EncoderCodeTable::from_lengths(&lengths.main, allowance)?;
     let distance_table = EncoderCodeTable::from_lengths(&lengths.distance, allowance)?;
@@ -1618,7 +1637,7 @@ fn encode_token_block_with_allowance<B: Budget>(
     let (table_data, table_bits) =
         encode_table_slices(lengths.slices(), algorithm_version, allowance)?;
     let payload_bits =
-        token_stream_bits_after_tables(tokens, &[], &lengths, distance_size, table_bits)?;
+        token_stream_bits_with_state(tokens, &[], &lengths, distance_size, table_bits, initial)?;
     let mut writer = BitWriter {
         bytes: table_data,
         bit_pos: table_bits,
@@ -1626,7 +1645,7 @@ fn encode_token_block_with_allowance<B: Budget>(
     writer
         .bytes
         .reserve_total_capacity(payload_bits.div_ceil(8))?;
-    let mut state = EncoderMatchState::default();
+    let mut state = initial;
     for &token in tokens {
         match token {
             EncodeToken::Filter(filter) => {
@@ -1698,7 +1717,14 @@ fn encode_token_block_with_allowance<B: Budget>(
     }
 
     debug_assert_eq!(writer.bit_pos, payload_bits);
-    encode_compressed_block_with_allowance(&writer.bytes, payload_bits, true, is_last, allowance)
+    let packed = encode_compressed_block_with_allowance(
+        &writer.bytes,
+        payload_bits,
+        true,
+        is_last,
+        allowance,
+    )?;
+    Ok((packed, state))
 }
 
 #[derive(Debug)]
@@ -1985,12 +2011,28 @@ fn table_lengths_with_allowance<B: Budget>(
     distance_size: usize,
     allowance: &B,
 ) -> Result<OwnedLengths<B>> {
+    table_lengths_with_state(
+        tokens,
+        filters,
+        distance_size,
+        allowance,
+        EncoderMatchState::default(),
+    )
+}
+
+fn table_lengths_with_state<B: Budget>(
+    tokens: &[EncodeToken],
+    filters: &[EncodeFilter],
+    distance_size: usize,
+    allowance: &B,
+    initial: EncoderMatchState,
+) -> Result<OwnedLengths<B>> {
     let mut main_frequencies = Buffer::filled(MAIN_TABLE_SIZE, 0usize, allowance)?;
     main_frequencies[256] = filters.len();
     let mut distance_frequencies = Buffer::filled(distance_size, 0usize, allowance)?;
     let mut align_frequencies = Buffer::filled(ALIGN_TABLE_SIZE, 0usize, allowance)?;
     let mut length_frequencies = Buffer::filled(LENGTH_TABLE_SIZE, 0usize, allowance)?;
-    let mut state = EncoderMatchState::default();
+    let mut state = initial;
     for token in tokens {
         match *token {
             EncodeToken::Filter(_) => main_frequencies[256] += 1,
@@ -2054,13 +2096,31 @@ fn token_stream_bits_after_tables<B: Budget>(
     filters: &[EncodeFilter],
     lengths: &OwnedLengths<B>,
     distance_size: usize,
+    bits: usize,
+) -> Result<usize> {
+    token_stream_bits_with_state(
+        tokens,
+        filters,
+        lengths,
+        distance_size,
+        bits,
+        EncoderMatchState::default(),
+    )
+}
+
+fn token_stream_bits_with_state<B: Budget>(
+    tokens: &[EncodeToken],
+    filters: &[EncodeFilter],
+    lengths: &OwnedLengths<B>,
+    distance_size: usize,
     mut bits: usize,
+    initial: EncoderMatchState,
 ) -> Result<usize> {
     let allowance = lengths.main.allowance();
     let prices = TokenPrices {
         lengths: lengths.slices(),
     };
-    let mut state = EncoderMatchState::default();
+    let mut state = initial;
     for token in filters
         .iter()
         .copied()
@@ -3462,3 +3522,6 @@ mod pricing_tests;
 #[cfg(test)]
 #[path = "literal_pricing_tests.rs"]
 mod literal_pricing_tests;
+
+#[path = "hybrid_encoder.rs"]
+pub(crate) mod hybrid_encoder;
