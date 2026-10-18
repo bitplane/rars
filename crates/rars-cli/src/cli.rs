@@ -201,6 +201,24 @@ pub(crate) struct AddArgs {
     /// time and memory to search.
     #[arg(long, value_name = "SIZE", value_parser = crate::parse_size_string)]
     pub dict_size: Option<usize>,
+    /// Enable the experimental relationship-aware RAR5/7 encoder
+    #[arg(long, value_parser = ["desktop", "server"])]
+    pub experimental_hybrid: Option<String>,
+    /// Complete architecture used by the experimental comparison
+    #[arg(long, requires = "experimental_hybrid", value_parser = ["hybrid", "relationships", "streams"])]
+    pub hybrid_architecture: Option<String>,
+    /// Frozen experimental candidate number (0..63)
+    #[arg(long, requires = "experimental_hybrid", value_parser = clap::value_parser!(u8).range(0..64))]
+    pub hybrid_variant: Option<u8>,
+    /// Analyze relationships across archive members
+    #[arg(long, requires = "experimental_hybrid")]
+    pub analyze_relationships: bool,
+    /// Permit relationship-guided member ordering
+    #[arg(long, requires_all = ["experimental_hybrid", "analyze_relationships"])]
+    pub optimize_member_order: bool,
+    /// Maximum automatically chosen hybrid dictionary size
+    #[arg(long, requires = "experimental_hybrid", value_parser = crate::parse_size_string)]
+    pub hybrid_dictionary_ceiling: Option<usize>,
     /// Maximum total compression working memory (default: 256m)
     ///
     /// Left unset rather than defaulted here, so a volume set below RAR 5, which

@@ -13,6 +13,7 @@ mod compress;
 mod engine;
 mod filter_policy;
 pub(crate) mod headers;
+mod hybrid;
 mod layout;
 mod plan;
 #[cfg(test)]
@@ -32,6 +33,8 @@ pub struct WriterOptions {
     pub features: crate::FeatureSet,
     pub compression_level: Option<u8>,
     pub dictionary_size: Option<u64>,
+    /// Opt-in relationship analysis and state-aware stream optimization.
+    pub hybrid: Option<crate::HybridOptions>,
 }
 
 impl WriterOptions {
@@ -41,6 +44,7 @@ impl WriterOptions {
             features,
             compression_level: None,
             dictionary_size: None,
+            hybrid: None,
         }
     }
 
@@ -53,6 +57,12 @@ impl WriterOptions {
         self.dictionary_size = Some(size);
         self
     }
+
+    /// Enables the experimental encoder; ordinary writer defaults are unchanged.
+    pub const fn with_hybrid(mut self, options: crate::HybridOptions) -> Self {
+        self.hybrid = Some(options);
+        self
+    }
 }
 
 impl Default for WriterOptions {
@@ -62,6 +72,7 @@ impl Default for WriterOptions {
             features: crate::FeatureSet::store_only(),
             compression_level: None,
             dictionary_size: None,
+            hybrid: None,
         }
     }
 }
@@ -365,6 +376,45 @@ pub fn write_streaming_volumes_with_progress(
         return Err(Error::NeedPassword);
     }
 
+    if let Some(hybrid_options) = options.hybrid {
+        hybrid::validate(entries, hybrid_options, &extras.filter_policy)?;
+        let mut resources = hybrid::resources(resources, hybrid_options);
+        if hybrid_options.architecture == crate::HybridArchitecture::Streams {
+            let mut selected = options;
+            selected.hybrid = None;
+            return write_streaming_volumes_with_progress(
+                entries,
+                selected,
+                extras,
+                max_payload_per_volume,
+                sink,
+                &resources,
+                progress,
+            );
+        }
+        let captured = hybrid::capture(
+            entries,
+            hybrid_options,
+            &resources,
+            progress.map(ProgressReporter),
+        )?;
+        let dictionary =
+            hybrid::select_dictionary(&captured, options, &extras.filter_policy, &resources)?;
+        let mut selected = options.with_dictionary_size(dictionary);
+        selected.hybrid = None;
+        if hybrid_options.architecture == crate::HybridArchitecture::Relationships {
+            resources.hybrid = None;
+        }
+        return write_streaming_volumes_with_progress(
+            &captured.entries,
+            selected,
+            extras,
+            max_payload_per_volume,
+            sink,
+            &resources,
+            progress,
+        );
+    }
     engine::write_volumes(
         entries,
         engine::EnginePlan {
@@ -513,6 +563,33 @@ pub(crate) fn write_streaming_archive_reporting(
     if options.features.header_encryption && !encrypted && extras.header_password.is_none() {
         return Err(Error::NeedPassword);
     }
+    if let Some(hybrid_options) = options.hybrid {
+        hybrid::validate(entries, hybrid_options, &extras.filter_policy)?;
+        let mut resources = hybrid::resources(resources, hybrid_options);
+        if hybrid_options.architecture == crate::HybridArchitecture::Streams {
+            let mut selected = options;
+            selected.hybrid = None;
+            return write_streaming_archive_reporting(
+                entries, selected, extras, &resources, progress, output,
+            );
+        }
+        let captured = hybrid::capture(entries, hybrid_options, &resources, progress)?;
+        let dictionary =
+            hybrid::select_dictionary(&captured, options, &extras.filter_policy, &resources)?;
+        let mut selected = options.with_dictionary_size(dictionary);
+        selected.hybrid = None;
+        if hybrid_options.architecture == crate::HybridArchitecture::Relationships {
+            resources.hybrid = None;
+        }
+        return write_streaming_archive_reporting(
+            &captured.entries,
+            selected,
+            extras,
+            &resources,
+            progress,
+            output,
+        );
+    }
     engine::write_archive(
         entries,
         engine::EnginePlan {
@@ -574,7 +651,13 @@ fn compression_plan(
     // its header, so fitting one to the data would only inflate what the header
     // claims.
     let reach = if method == 0 { 0 } else { content };
-    let dictionary_size = dictionary_size_for_options(options, reach, memory_limit)?;
+    let mut dictionary_size = dictionary_size_for_options(options, reach, memory_limit)?;
+    if options.dictionary_size.is_none() {
+        if let Some(hybrid) = resources.hybrid {
+            filter_policy::validate_dictionary_size(options.target, hybrid.dictionary_ceiling)?;
+            dictionary_size = dictionary_size.min(hybrid.dictionary_ceiling);
+        }
+    }
     let candidates =
         encode_option_candidates_for_level(options.compression_level, dictionary_size)?;
     let encode_options = *candidates.first().ok_or(Error::WriterFailure(
@@ -938,6 +1021,11 @@ fn validate_plan(options: WriterOptions, shape: PlanShape) -> Result<()> {
     crate::write_plan::validate_features(options.target, options.features, shape)?;
     crate::write_plan::validate_compression_level(options.target, options.compression_level)?;
     let _ = dictionary_size_for_options(options, 0, u64::MAX)?;
+    if options.dictionary_size.is_none() {
+        if let Some(hybrid) = options.hybrid {
+            filter_policy::validate_dictionary_size(options.target, hybrid.dictionary_ceiling)?;
+        }
+    }
     // Quick-open is an index of the headers, so it has nothing to index once
     // they are encrypted.
     if options.features.quick_open && options.features.header_encryption {
@@ -1068,6 +1156,52 @@ fn validate_service(service: &ServiceEntry) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::VolumeSink;
+
+    #[test]
+    fn stream_control_caps_automatic_dictionary_without_changing_explicit_requests() {
+        let hybrid = crate::HybridOptions::default().with_dictionary_ceiling(256 * 1024);
+        let resources = super::hybrid::resources(&crate::WriterResources::default(), hybrid);
+        let options = super::WriterOptions::new(
+            crate::ArchiveVersion::Rar50,
+            crate::FeatureSet::store_only(),
+        )
+        .with_compression_level(3);
+        for (options, expected) in [
+            (options, 256 * 1024),
+            (
+                options.with_dictionary_size(8 * 1024 * 1024),
+                8 * 1024 * 1024,
+            ),
+        ] {
+            let plan = super::compression_plan(
+                options,
+                super::FilterPolicy::None,
+                16 * 1024 * 1024,
+                resources.memory_limit(),
+                &resources,
+            )
+            .unwrap();
+            assert_eq!(plan.dictionary_size, expected);
+        }
+    }
+
+    #[test]
+    fn invalid_automatic_hybrid_ceiling_is_refused_before_source_capture() {
+        let hybrid = crate::HybridOptions::default().with_dictionary_ceiling(7);
+        let options = super::WriterOptions::new(
+            crate::ArchiveVersion::Rar50,
+            crate::FeatureSet::store_only(),
+        )
+        .with_compression_level(3)
+        .with_hybrid(hybrid);
+        assert!(super::Rar50Writer::new(options)
+            .entry(super::ArchiveEntry::new(
+                b"file".to_vec(),
+                crate::EntrySource::from_opener(1, || panic!("invalid ceiling opened source")),
+            ))
+            .finish()
+            .is_err());
+    }
 
     #[test]
     fn source_integrity_cancellation_and_short_read_fail_before_hashing() {

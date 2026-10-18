@@ -45,6 +45,11 @@ pub mod error;
 pub mod features;
 pub mod filename;
 pub mod filter;
+/// Experimental complete repeat analysis and bounded hybrid encoding options.
+#[cfg(feature = "write")]
+pub mod hybrid;
+#[cfg(feature = "write")]
+pub use hybrid::{HybridArchitecture, HybridOptions, HybridProfile};
 #[cfg(feature = "write")]
 mod filter_search;
 mod io_util;

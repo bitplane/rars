@@ -170,6 +170,7 @@ impl BuilderEntry {
 /// ```
 #[derive(Debug, Clone)]
 pub struct Builder {
+    hybrid: Option<crate::HybridOptions>,
     format: ArchiveVersion,
     compression: Option<u8>,
     store: bool,
@@ -195,6 +196,7 @@ impl Builder {
     /// A builder for `format`, with the writer's own default compression level.
     pub fn new(format: ArchiveVersion) -> Self {
         Self {
+            hybrid: None,
             format,
             compression: None,
             store: false,
@@ -226,6 +228,18 @@ impl Builder {
     pub fn compression_level(mut self, level: Option<u8>) -> Self {
         self.compression = level;
         self
+    }
+
+    /// Enable the experimental, bounded RAR5/7 hybrid encoder.
+    pub fn experimental_hybrid(mut self, options: crate::HybridOptions) -> Result<Self> {
+        if self.format.family() != ArchiveFamily::Rar50Plus {
+            return Err(Error::UnsupportedFeature {
+                version: self.format,
+                feature: "hybrid compression",
+            });
+        }
+        self.hybrid = Some(options);
+        Ok(self)
     }
 
     /// Store members without compressing them. Storing is a compression level,
@@ -1430,6 +1444,9 @@ impl Builder {
     /// over any level the caller asked for.
     fn rar50_options(&self) -> rar50::WriterOptions {
         let mut options = rar50::WriterOptions::new(self.format, self.features());
+        if let Some(hybrid) = self.hybrid {
+            options = options.with_hybrid(hybrid);
+        }
         if let Some(size) = self.rar50_dictionary_size {
             options = options.with_dictionary_size(size);
         }

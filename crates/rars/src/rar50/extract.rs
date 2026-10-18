@@ -2824,6 +2824,7 @@ mod tests {
             features: crate::FeatureSet::store_only(),
             compression_level: None,
             dictionary_size: None,
+            hybrid: None,
         })
         .entries(
             [entry(b"filtered.bin", &data)
@@ -2857,6 +2858,7 @@ mod tests {
                 features: crate::FeatureSet::store_only(),
                 compression_level: None,
                 dictionary_size: None,
+                hybrid: None,
             })
             .entries(
                 [entry(b"filtered.bin", &data)
