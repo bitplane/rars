@@ -36,6 +36,8 @@ const LENGTH_COUNT: usize = 28;
 const LEVEL_COUNT: usize = 20;
 const TABLE_COUNT: usize = MAIN_COUNT + OFFSET_COUNT + LOW_OFFSET_COUNT + LENGTH_COUNT;
 const MAX_HISTORY: usize = 4 * 1024 * 1024;
+// Matches up to this long are copied byte by byte (see `copy_match`).
+const SHORT_MATCH: usize = 64;
 const STREAM_CHUNK: usize = 1024 * 1024;
 // RARVM's standard AUDIO filter reserves an eight-bit-ish compatibility
 // range wider than WinRAR's usual 1..=4 channel choices. UnRAR accepts up to
@@ -1135,20 +1137,48 @@ impl<B: Budget> Reader29State<B> {
         // match: a copy does not start on zeroes and cross into real bytes
         // partway.
         let before_window = offset > self.current_pos();
-        for index in 0..length {
-            if self.current_pos() >= output_size {
-                self.pending_match = Some((length - index, offset));
-                break;
-            }
-            let byte = if before_window {
-                0
+        // The part of the match that fits before `output_size` is copied at
+        // once, with room made for it once; the rest waits in
+        // `pending_match`.
+        let now = length.min(output_size.saturating_sub(self.current_pos()));
+        if now > 0 {
+            if before_window {
+                self.output.resize(self.output.len() + now, 0)?;
             } else {
-                let src = self.current_pos() - offset;
-                *self
-                    .raw_byte(src)
-                    .ok_or(Error::InvalidData("RAR 2.9 match distance is out of range"))?
-            };
-            self.output.try_push(byte)?;
+                // RAR 2.9's window is 4 MiB. A longer distance is refused
+                // here, not by whether its bytes have been trimmed yet:
+                // `trim_history` keeps some slack, so they may still be held.
+                let out_of_range = Error::InvalidData("RAR 2.9 match distance is out of range");
+                if offset == 0 || offset > MAX_HISTORY {
+                    return Err(out_of_range);
+                }
+                let start = (self.current_pos() - offset)
+                    .checked_sub(self.base_offset)
+                    .ok_or(out_of_range)?;
+                if now <= SHORT_MATCH {
+                    // Most matches are a few bytes: room once, then a plain
+                    // loop, which also repeats an overlapping run correctly.
+                    // A call to `memmove` per match cost more than the copy.
+                    let at = self.output.len();
+                    self.output.resize(at + now, 0)?;
+                    for i in 0..now {
+                        self.output[at + i] = self.output[start + i];
+                    }
+                } else {
+                    // Each run repeats the bytes `offset` back, which are
+                    // already in place, so a short distance doubles what one
+                    // copy moves.
+                    let mut remaining = now;
+                    while remaining > 0 {
+                        let take = remaining.min(self.output.len() - start);
+                        self.output.extend_from_within(start..start + take)?;
+                        remaining -= take;
+                    }
+                }
+            }
+        }
+        if now < length {
+            self.pending_match = Some((length - now, offset));
         }
         Ok(())
     }
@@ -1179,10 +1209,6 @@ impl<B: Budget> Reader29State<B> {
         self.base_offset + self.output.len()
     }
 
-    fn raw_byte(&self, position: usize) -> Option<&u8> {
-        self.output.get(position.checked_sub(self.base_offset)?)
-    }
-
     fn raw_range(&self, start: usize, end: usize) -> Result<&[u8]> {
         if start < self.base_offset || end < start {
             return Err(Error::InvalidData(
@@ -1205,6 +1231,13 @@ impl<B: Budget> Reader29State<B> {
             return;
         }
         let drain = keep_from - self.base_offset;
+        // Draining moves the whole retained window to the front of the
+        // buffer, so wait until a quarter window can go rather than draining
+        // after every flush. The bytes kept a little longer are never read:
+        // `copy_match` refuses distances past the window.
+        if drain < MAX_HISTORY / 4 {
+            return;
+        }
         self.output.discard_prefix(drain);
         self.base_offset = keep_from;
         self.filters
