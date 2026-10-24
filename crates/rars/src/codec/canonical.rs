@@ -3,12 +3,19 @@
 use super::workspace::{Allowance, Budget, Buffer};
 use super::{Error, Result};
 
+/// Codes up to this long are decoded by one lookup in [`Huffman::quick`].
+const QUICK_BITS: usize = 10;
+
 #[derive(Debug)]
 pub(super) struct Huffman<B: Budget = Allowance> {
     symbols: Buffer<usize, B>,
     first_code: [u16; 16],
     first_index: [usize; 16],
     counts: [u16; 16],
+    /// For every 10-bit prefix, the symbol whose code it starts with and the
+    /// code's length, packed as `symbol << 4 | length`; 0 where the code is
+    /// longer (or the prefix is no code at all).
+    quick: Buffer<u32, B>,
 }
 
 impl<B: Budget> Huffman<B> {
@@ -18,6 +25,7 @@ impl<B: Budget> Huffman<B> {
             first_code: [0; 16],
             first_index: [0; 16],
             counts: [0; 16],
+            quick: Buffer::new(allowance),
         }
     }
 
@@ -51,11 +59,23 @@ impl<B: Budget> Huffman<B> {
             symbols[next_index[len as usize]] = symbol;
             next_index[len as usize] += 1;
         }
+        let mut quick = Buffer::filled(1 << QUICK_BITS, 0u32, allowance)?;
+        for len in 1..=QUICK_BITS {
+            for i in 0..usize::from(counts[len]) {
+                let code = usize::from(first_code[len]) + i;
+                let entry = (symbols[first_index[len] + i] as u32) << 4 | len as u32;
+                let start = code << (QUICK_BITS - len);
+                for slot in &mut quick[start..start + (1 << (QUICK_BITS - len))] {
+                    *slot = entry;
+                }
+            }
+        }
         Ok(Self {
             symbols,
             first_code,
             first_index,
             counts,
+            quick,
         })
     }
 
@@ -65,6 +85,7 @@ impl<B: Budget> Huffman<B> {
             first_code: self.first_code,
             first_index: self.first_index,
             counts: self.counts,
+            quick: Buffer::copied(&self.quick, &self.quick.allowance())?,
         })
     }
     #[cfg(test)]
@@ -73,6 +94,34 @@ impl<B: Budget> Huffman<B> {
     }
     pub(super) fn is_empty(&self) -> bool {
         self.symbols.is_empty()
+    }
+
+    /// Decodes from the next 15 bits of input, most significant first (`peek`),
+    /// without consuming them: the symbol and its code's length, or `None` if
+    /// they start no code. One lookup for codes of up to 10 bits, which are
+    /// nearly all of them. The caller consumes only the code's bits, and must
+    /// check that they were real input rather than padding past its end.
+    // Always inlined: it is the inner loop of two decoders, and with both
+    // calling it the compiler stopped inlining it into RAR5's (11% slower).
+    #[inline(always)]
+    pub(super) fn decode_peeked(&self, peek: u32) -> Option<(usize, usize)> {
+        let entry = self.quick[(peek >> (15 - QUICK_BITS)) as usize];
+        if entry != 0 {
+            return Some(((entry >> 4) as usize, (entry & 15) as usize));
+        }
+        for len in QUICK_BITS + 1..=15 {
+            let count = self.counts[len];
+            if count != 0 {
+                let offset = ((peek >> (15 - len)) as u16).wrapping_sub(self.first_code[len]);
+                if offset < count {
+                    return Some((
+                        self.symbols[self.first_index[len] + usize::from(offset)],
+                        len,
+                    ));
+                }
+            }
+        }
+        None
     }
 
     /// Read only the bits of the selected code. A speculative wide peek would
@@ -183,7 +232,9 @@ mod tests {
         let allowance = Allowance::limited(64 * 1024);
         let table = Huffman::from_counts(&[1, 1], counts, &allowance).unwrap();
         let retained = allowance.used();
-        assert_eq!(retained, (2 * std::mem::size_of::<usize>()) as u64);
+        // The symbols, and the 10-bit lookup table.
+        let quick = (1 << QUICK_BITS) * std::mem::size_of::<u32>();
+        assert_eq!(retained, (2 * std::mem::size_of::<usize>() + quick) as u64);
         let copy = table.try_clone().unwrap();
         assert_eq!(allowance.used(), retained * 2);
         drop(table);

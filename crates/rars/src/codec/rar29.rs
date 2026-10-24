@@ -1278,12 +1278,23 @@ impl<B: Budget> Huffman<B> {
             state: self.state.try_clone()?,
         })
     }
+    /// Decodes from a 15-bit peek, with the results of reading bit by bit;
+    /// see the RAR 5 decoder's `HuffmanState::decode`.
     fn decode(&self, bits: &mut BitReader<B>) -> Result<usize> {
-        self.state.decode(
-            || bits.read_bit().map(|bit| bit as u16),
-            "RAR 2.9 empty Huffman table",
-            "RAR 2.9 invalid Huffman code",
-        )
+        if self.state.is_empty() {
+            return Err(Error::InvalidData("RAR 2.9 empty Huffman table"));
+        }
+        let (peek, available) = bits.peek15();
+        match self.state.decode_peeked(peek) {
+            Some((symbol, len)) if len <= available => {
+                bits.bit_pos += len;
+                Ok(symbol)
+            }
+            // The code needs bits past the end of the input, or the input
+            // ends before any code is complete.
+            _ if available < 15 => Err(Error::NeedMoreInput),
+            _ => Err(Error::InvalidData("RAR 2.9 invalid Huffman code")),
+        }
     }
 }
 
@@ -1366,14 +1377,43 @@ impl<B: Budget> BitReader<B> {
         if count > 24 {
             return Err(Error::InvalidData("RAR 2.9 bit read is too wide"));
         }
-        let mut value = 0u32;
-        for i in 0..count as usize {
-            let bit_index = self.bit_pos + i;
-            let byte = *self.input.get(bit_index / 8).ok_or(Error::NeedMoreInput)?;
-            let bit = (byte >> (7 - (bit_index % 8))) & 1;
-            value = (value << 1) | bit as u32;
+        if count == 0 {
+            return Ok(0);
         }
-        Ok(value)
+        // The at most four bytes the bits span, read at once and shifted
+        // into place.
+        let byte_pos = self.bit_pos / 8;
+        let bit_offset = self.bit_pos % 8;
+        let needed = (bit_offset + usize::from(count)).div_ceil(8);
+        let bytes = self
+            .input
+            .get(byte_pos..byte_pos + needed)
+            .ok_or(Error::NeedMoreInput)?;
+        let word = bytes.iter().fold(0u32, |w, &b| (w << 8) | u32::from(b));
+        let shift = needed * 8 - bit_offset - usize::from(count);
+        Ok((word >> shift) & ((1u32 << count) - 1))
+    }
+
+    /// The next 15 bits, most significant first, with zeros past the end of
+    /// the input, and how many of them are real (at most 15).
+    #[inline]
+    fn peek15(&self) -> (u32, usize) {
+        let byte_pos = self.bit_pos / 8;
+        let bit_offset = self.bit_pos % 8;
+        let rest = self.input.get(byte_pos..).unwrap_or_default();
+        let word = match rest {
+            [a, b, c, ..] => u32::from_be_bytes([0, *a, *b, *c]),
+            [a, b] => u32::from_be_bytes([0, *a, *b, 0]),
+            [a] => u32::from_be_bytes([0, *a, 0, 0]),
+            [] => 0,
+        };
+        let peek = (word >> (24 - bit_offset - 15)) & 0x7fff;
+        let available = rest
+            .len()
+            .saturating_mul(8)
+            .saturating_sub(bit_offset)
+            .min(15);
+        (peek, available)
     }
 
     fn read_encoded_u32(&mut self) -> Result<u32> {
