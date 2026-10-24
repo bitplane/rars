@@ -2073,7 +2073,7 @@ impl<B: Budget> HuffmanState<B> {
         validate_huffman_counts(&count)?;
 
         Ok(Self {
-            state: super::canonical::Huffman::from_counts(lengths, count, allowance)?,
+            state: super::canonical::Huffman::from_counts_with_lookup(lengths, count, allowance)?,
         })
     }
     fn try_clone(&self) -> Result<Self> {
@@ -2081,12 +2081,21 @@ impl<B: Budget> HuffmanState<B> {
             state: self.state.try_clone()?,
         })
     }
+    /// Decodes from a 15-bit peek: one table lookup for nearly every code
+    /// rather than a bounds-checked read per bit. Only the code's own bits
+    /// are consumed, and the results are those of reading bit by bit: a code
+    /// that runs past the end of the input needs more input, and a code is
+    /// invalid only when 15 real bits start none.
     fn decode(&self, bits: &mut BitReader<'_>) -> Result<usize> {
-        self.state.decode(
-            || bits.read_bits(1).map(|bit| bit as u16),
+        let (peek, available) = bits.peek15();
+        let (symbol, len) = self.state.decode_peeked_checked(
+            peek,
+            available,
             "RAR 5 empty Huffman table",
             "RAR 5 invalid Huffman code",
-        )
+        )?;
+        bits.skip(len);
+        Ok(symbol)
     }
 }
 
@@ -2098,6 +2107,34 @@ struct BitReader<'a> {
 impl<'a> BitReader<'a> {
     fn new(input: &'a [u8]) -> Self {
         Self { input, bit_pos: 0 }
+    }
+
+    /// The next 15 bits, most significant first, with zeros past the end of
+    /// the input, and how many of them are real (at most 15).
+    #[inline]
+    fn peek15(&self) -> (u32, usize) {
+        let byte_pos = self.bit_pos / 8;
+        let bit_offset = self.bit_pos % 8;
+        let rest = self.input.get(byte_pos..).unwrap_or_default();
+        let word = match rest {
+            [a, b, c, ..] => u32::from_be_bytes([0, *a, *b, *c]),
+            [a, b] => u32::from_be_bytes([0, *a, *b, 0]),
+            [a] => u32::from_be_bytes([0, *a, 0, 0]),
+            [] => 0,
+        };
+        let peek = (word >> (24 - bit_offset - 15)) & 0x7fff;
+        let available = rest
+            .len()
+            .saturating_mul(8)
+            .saturating_sub(bit_offset)
+            .min(15);
+        (peek, available)
+    }
+
+    /// Consumes `count` bits already seen through [`Self::peek15`].
+    #[inline]
+    fn skip(&mut self, count: usize) {
+        self.bit_pos += count;
     }
 
     #[inline]
@@ -2178,6 +2215,8 @@ mod checkpoint_tests;
 #[path = "rar50/history_retention_tests.rs"]
 mod history_retention_tests;
 
+#[cfg(test)]
+mod bit_lookup_tests;
 #[cfg(test)]
 #[path = "rar50/history_window_tests.rs"]
 mod history_window_tests;
