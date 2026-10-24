@@ -25,19 +25,28 @@ struct AllocTables {
     index_to_units: [u8; N_BUCKETS],
 }
 
-fn build_alloc_tables() -> AllocTables {
+// Built at compile time, so allocations read them directly.
+const fn build_alloc_tables() -> AllocTables {
     let mut units_to_index = [0u8; MAX_BUCKET_UNITS];
     let mut index_to_units = [0u8; N_BUCKETS];
     let mut k: usize = 0;
-    for (i, index_to_unit) in index_to_units.iter_mut().enumerate() {
+    let mut i = 0;
+    while i < N_BUCKETS {
         let step = if i >= 12 { 4 } else { i / 4 + 1 };
-        for _ in 0..step {
+        let mut n = 0;
+        while n < step {
             // The bucket construction has exactly 128 entries: the first
             // 12 buckets contribute 24 and the remaining 26 contribute 104.
             units_to_index[k] = i as u8;
             k += 1;
+            n += 1;
         }
-        *index_to_unit = k.min(u8::MAX as usize) as u8;
+        index_to_units[i] = if k > u8::MAX as usize {
+            u8::MAX
+        } else {
+            k as u8
+        };
+        i += 1;
     }
     AllocTables {
         units_to_index,
@@ -45,10 +54,10 @@ fn build_alloc_tables() -> AllocTables {
     }
 }
 
+static ALLOC_TABLES: AllocTables = build_alloc_tables();
+
 fn alloc_tables() -> &'static AllocTables {
-    use std::sync::OnceLock;
-    static TABLES: OnceLock<AllocTables> = OnceLock::new();
-    TABLES.get_or_init(build_alloc_tables)
+    &ALLOC_TABLES
 }
 
 // Spec §4.1 layout: contexts grow downward from `hi_unit`, state arrays
@@ -488,12 +497,16 @@ pub(crate) struct PpmdState<B: Budget> {
     bin_summ: [[u16; 64]; 128],
     see: [[See; 16]; 25],
     dummy_see: See,
-    contexts: Buffer<Context<B>, B>,
+    contexts: Buffer<Context, B>,
+    arena: StateArena<B>,
     text: Buffer<u8, B>,
     range: RangeDecoder,
     allocated: bool,
     max_contexts: usize,
     suballoc: Suballocator<B>,
+    // `create_successors`' list of states to link, kept so it is not
+    // allocated again on every call. Empty between calls.
+    successor_scratch: Buffer<StateRef, B>,
 }
 
 #[derive(Debug, Clone)]
@@ -504,28 +517,252 @@ pub struct PpmdEncoder {
     esc_char: u8,
 }
 
-#[derive(Debug)]
-struct Context<B: Budget = Allowance> {
-    states: Buffer<State, B>,
+// A context is plain data (32 bytes). Its state is inline when it has one, as
+// the reference keeps OneState inside the context; otherwise its states are a
+// block of the state arena below. The suffix is a u32 index. Where states are
+// kept does not affect the model: the simulated suballocator offsets decide
+// every restart.
+#[derive(Debug, Clone, Copy)]
+struct Context {
+    stats: Stats,
+    num_stats: u16,
     summ_freq: u16,
-    suffix: Option<usize>,
+    suffix: Option<u32>,
     // Simulated suballoc offsets so gluing (spec §4.3) can detect adjacency.
     // header_offset: from Hi side (1 unit). array_offset: from Lo side,
-    // set to NULL_OFFSET for binary contexts (states.len() == 1) which
+    // set to NULL_OFFSET for binary contexts (num_stats == 1) which
     // carry their state inline.
     header_offset: u32,
     array_offset: u32,
 }
 
-impl<B: Budget> Context<B> {
+impl Context {
+    #[inline]
+    fn suffix(&self) -> Option<usize> {
+        self.suffix.map(|suffix| suffix as usize)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Stats {
+    One(State),
+    // The first state of this context's block in `StateArena::states`.
+    Many(u32),
+}
+
+// The states of every context with more than one, in blocks
+// of 2, 4, ..., 256 states: a context with n states has the block of the
+// smallest class that holds n. Freed blocks wait in per-class lists; a larger
+// free block is halved for a smaller class, and a context that shrinks keeps
+// the front of its block and frees the rest the same way. A restart empties
+// the arena and keeps its storage, as the reference reuses its one pool.
+#[derive(Debug)]
+struct StateArena<B: Budget> {
+    states: Buffer<State, B>,
+    free: [Buffer<u32, B>; ARENA_CLASSES],
+    free_slots: usize,
+    released_since_coalesce: usize,
+    read_control: crate::read_control::ReadControl,
+}
+
+const ARENA_CLASSES: usize = 8;
+
+impl<B: Budget> StateArena<B> {
+    fn with_allowance(allowance: &B) -> Self {
+        Self {
+            states: Buffer::new(allowance),
+            free: std::array::from_fn(|_| Buffer::new(allowance)),
+            free_slots: 0,
+            released_since_coalesce: 0,
+            read_control: crate::read_control::ReadControl::default(),
+        }
+    }
+
     fn try_clone(&self) -> Result<Self> {
+        let allowance = self.states.allowance();
+        let mut free = std::array::from_fn(|_| Buffer::new(&allowance));
+        for (copy, original) in free.iter_mut().zip(&self.free) {
+            *copy = Buffer::copied(original, &allowance)?;
+        }
         Ok(Self {
-            states: Buffer::copied(&self.states, &self.states.allowance())?,
-            summ_freq: self.summ_freq,
-            suffix: self.suffix,
-            header_offset: self.header_offset,
-            array_offset: self.array_offset,
+            states: Buffer::copied(&self.states, &allowance)?,
+            free,
+            free_slots: self.free_slots,
+            released_since_coalesce: self.released_since_coalesce,
+            read_control: crate::read_control::ReadControl::default(),
         })
+    }
+
+    fn reset(&mut self) {
+        self.states.clear();
+        for list in &mut self.free {
+            list.clear();
+        }
+        self.free_slots = 0;
+        self.released_since_coalesce = 0;
+    }
+
+    // The class of the block that holds `states` (at most 256) states.
+    #[inline]
+    fn class(states: usize) -> usize {
+        states.max(2).next_power_of_two().trailing_zeros() as usize - 1
+    }
+
+    #[inline]
+    fn block_len(class: usize) -> usize {
+        2 << class
+    }
+
+    fn reuse(&mut self, class: usize) -> Result<Option<u32>> {
+        if let Some(at) = self.free[class].pop() {
+            self.free_slots -= Self::block_len(class);
+            return Ok(Some(at));
+        }
+        if let Some(larger) = (class + 1..ARENA_CLASSES).find(|&k| !self.free[k].is_empty()) {
+            let at = self.free[larger].pop().expect("the list was not empty");
+            self.free_slots -= Self::block_len(larger);
+            // Splitting already-free storage is not a new release and must
+            // not bring the next coalescing pass forward.
+            for tail in class..larger {
+                self.free[tail].try_push(at + Self::block_len(tail) as u32)?;
+                self.free_slots += Self::block_len(tail);
+            }
+            return Ok(Some(at));
+        }
+        Ok(None)
+    }
+
+    fn alloc(&mut self, class: usize) -> Result<u32> {
+        if let Some(at) = self.reuse(class)? {
+            return Ok(at);
+        }
+        // Every scan, successful or not, is paid for by actual frees.
+        // Otherwise a large arena could be scanned for each tiny allocation.
+        if self.free_slots >= Self::block_len(class)
+            && self.released_since_coalesce >= 256.max(self.states.len() / 8)
+        {
+            match self.coalesce() {
+                Ok(()) => {
+                    if let Some(at) = self.reuse(class)? {
+                        return Ok(at);
+                    }
+                }
+                Err(Error::WorkspaceLimitExceeded(_)) => {
+                    // Maintenance scratch may not fit even when appending
+                    // into already admitted arena capacity does. Ownership
+                    // remains intact on refusal, so try ordinary growth.
+                    self.released_since_coalesce = 0;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let at = self.states.len();
+        let end = at + Self::block_len(class);
+        if u32::try_from(end).is_err() {
+            return Err(Error::InvalidData("RAR PPMd state arena overflows"));
+        }
+        self.states.resize(end, State::EMPTY)?;
+        Ok(at as u32)
+    }
+
+    fn release(&mut self, at: u32, class: usize) -> Result<()> {
+        self.free[class].try_push(at)?;
+        let len = Self::block_len(class);
+        self.free_slots += len;
+        self.released_since_coalesce = self.released_since_coalesce.saturating_add(len);
+        Ok(())
+    }
+
+    // Keep the first block of class `to` at `at` and free the rest of the
+    // block of class `from` there, as blocks of classes `to` .. `from` - 1.
+    fn release_tail(&mut self, at: u32, from: usize, to: usize) -> Result<()> {
+        for class in to..from {
+            self.release(at + Self::block_len(class) as u32, class)?;
+        }
+        Ok(())
+    }
+
+    // Join free ranges without moving live states or changing the simulated
+    // PPMd allocator. Blocks need only be aligned to two slots, not their
+    // size. One bitmap bit per pair keeps temporary storage at 1/16 byte per
+    // arena slot; all scratch and free-list growth remain budgeted.
+    fn coalesce(&mut self) -> Result<()> {
+        self.read_control.check_codec()?;
+        let mut bitmap = Buffer::filled(
+            self.states.len().div_ceil(16),
+            0u8,
+            &self.states.allowance(),
+        )?;
+        let mut poller = self.read_control.poller();
+        for (class, list) in self.free.iter().enumerate() {
+            for &at in list {
+                for pair in at as usize / 2..(at as usize + Self::block_len(class)) / 2 {
+                    poller.check_codec(pair)?;
+                    bitmap[pair / 8] |= 1 << (pair % 8);
+                }
+            }
+        }
+        let mut counts = [0usize; ARENA_CLASSES];
+        Self::visit_free_blocks(
+            &bitmap,
+            self.states.len(),
+            Some(&self.read_control),
+            |_, class| {
+                counts[class] += 1;
+            },
+        )?;
+        // Admit all destinations before clearing any list. Refusal or
+        // cancellation leaves the original block ownership intact.
+        for (list, count) in self.free.iter_mut().zip(counts) {
+            self.read_control.check_codec()?;
+            list.reserve_total_capacity(count)?;
+        }
+        self.read_control.check_codec()?;
+        for list in &mut self.free {
+            list.clear();
+        }
+        Self::visit_free_blocks(&bitmap, self.states.len(), None, |at, class| {
+            self.free[class].push_admitted(at);
+        })
+        .expect("admitted free-list publication cannot fail");
+        self.released_since_coalesce = 0;
+        debug_assert_eq!(
+            self.free_slots,
+            self.free
+                .iter()
+                .enumerate()
+                .map(|(class, list)| list.len() * Self::block_len(class))
+                .sum::<usize>()
+        );
+        Ok(())
+    }
+
+    fn visit_free_blocks(
+        bitmap: &[u8],
+        slots: usize,
+        control: Option<&crate::read_control::ReadControl>,
+        mut visit: impl FnMut(u32, usize),
+    ) -> Result<()> {
+        let mut poller = control.map(crate::read_control::ReadControl::poller);
+        let mut start = 0;
+        for pair in 0..=slots / 2 {
+            if let Some(poller) = &mut poller {
+                poller.check_codec(pair)?;
+            }
+            if pair < slots / 2 && bitmap[pair / 8] & (1 << (pair % 8)) != 0 {
+                continue;
+            }
+            let mut at = start * 2;
+            let end = pair * 2;
+            while at < end {
+                let class = ((usize::BITS - (end - at).leading_zeros() - 2) as usize)
+                    .min(ARENA_CLASSES - 1);
+                visit(at as u32, class);
+                at += Self::block_len(class);
+            }
+            start = pair + 1;
+        }
+        Ok(())
     }
 }
 
@@ -536,11 +773,38 @@ struct State {
     successor: Successor,
 }
 
+impl State {
+    // What unused arena slots hold.
+    const EMPTY: Self = Self {
+        symbol: 0,
+        freq: 0,
+        successor: Successor::None,
+    };
+}
+
+// Text positions and context indices are u32, which keeps a state at 12
+// bytes. Both stay far below u32::MAX (the model is at most 256 MiB, a context
+// at least one 12-byte unit); `raw` and `context` refuse what would not fit
+// rather than wrap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Successor {
     None,
-    Raw(usize),
-    Context(usize),
+    Raw(u32),
+    Context(u32),
+}
+
+impl Successor {
+    fn raw(position: usize) -> Result<Self> {
+        u32::try_from(position)
+            .map(Self::Raw)
+            .map_err(|_| Error::InvalidData("RAR PPMd text position overflows"))
+    }
+
+    fn context(index: usize) -> Result<Self> {
+        u32::try_from(index)
+            .map(Self::Context)
+            .map_err(|_| Error::InvalidData("RAR PPMd context index overflows"))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -565,6 +829,7 @@ struct RangeDecoder {
 
 impl<B: Budget> PpmdState<B> {
     pub(crate) fn set_read_control(&mut self, control: crate::read_control::ReadControl) {
+        self.arena.read_control = control.clone();
         self.suballoc.read_control = control;
     }
     pub(crate) fn with_allowance(allowance: &B) -> Self {
@@ -617,11 +882,13 @@ impl<B: Budget> PpmdState<B> {
                 count: 64,
             },
             contexts: Buffer::new(allowance),
+            arena: StateArena::with_allowance(allowance),
             text: Buffer::new(allowance),
             range: RangeDecoder::new(),
             allocated: false,
             max_contexts: MIN_MODEL_CONTEXTS,
             suballoc: Suballocator::with_allowance(allowance),
+            successor_scratch: Buffer::new(allowance),
         }
     }
 
@@ -653,15 +920,14 @@ impl<B: Budget> PpmdState<B> {
             bin_summ: self.bin_summ,
             see: self.see,
             dummy_see: self.dummy_see,
-            contexts: Buffer::try_collect(
-                self.contexts.iter().map(Context::try_clone),
-                &self.contexts.allowance(),
-            )?,
+            contexts: Buffer::copied(&self.contexts, &self.contexts.allowance())?,
+            arena: self.arena.try_clone()?,
             text: Buffer::copied(&self.text, &self.text.allowance())?,
             range: self.range.clone(),
             allocated: self.allocated,
             max_contexts: self.max_contexts,
             suballoc: self.suballoc.try_clone()?,
+            successor_scratch: Buffer::new(&self.contexts.allowance()),
         })
     }
     pub fn decode_init(
@@ -708,9 +974,8 @@ impl<B: Budget> PpmdState<B> {
     }
 
     fn decode_symbol_inner(&mut self, input: &mut impl PpmdByteReader) -> Result<Option<u8>> {
-        let mut mask = [true; 256];
         let min = self.min_context;
-        if self.contexts[min].states.len() != 1 {
+        if self.contexts[min].num_stats != 1 {
             let summ_freq = self.contexts[min].summ_freq as u32;
             if summ_freq > self.range.range {
                 return Err(Error::InvalidData("RAR PPMd range is invalid"));
@@ -718,7 +983,7 @@ impl<B: Budget> PpmdState<B> {
             let mut count = self.range.get_threshold(summ_freq)?;
             let mut hi_cnt = 0u32;
             let mut found = None;
-            for (index, state) in self.contexts[min].states.iter().enumerate() {
+            for (index, state) in self.states(min).iter().enumerate() {
                 if count < state.freq as u32 {
                     found = Some((index, hi_cnt, state.freq as u32, state.symbol));
                     break;
@@ -747,11 +1012,8 @@ impl<B: Budget> PpmdState<B> {
             self.prev_success = 0;
             self.range.decode(hi_cnt, summ_freq - hi_cnt);
             self.hi_bits_flag = hi_bits_flag(self.state(self.found_state)?.symbol, 3);
-            for state in &self.contexts[min].states {
-                mask[state.symbol as usize] = false;
-            }
         } else {
-            let state = self.contexts[min].states[0];
+            let state = self.states(min)[0];
             let idx = self.bin_summ_index(state)?;
             let prob = self.bin_summ[idx.0][idx.1] as u32;
             let size0 = (self.range.range >> 14).wrapping_mul(prob);
@@ -770,28 +1032,34 @@ impl<B: Budget> PpmdState<B> {
             self.bin_summ[idx.0][idx.1] = next_prob as u16;
             self.init_esc = EXP_ESCAPE[(next_prob >> 10) as usize] as u32;
             self.range.decode_bit1(size0);
-            mask[state.symbol as usize] = false;
             self.prev_success = 0;
+        }
+        // The mask is only needed once the first context has escaped, which
+        // most symbols never do. Both escapes above leave this context's
+        // states as they were, so these are the symbols they masked.
+        let mut mask = [true; 256];
+        for state in self.states(min) {
+            mask[state.symbol as usize] = false;
         }
 
         loop {
             self.range.normalize(input)?;
             let mut mc = self.min_context;
-            let num_masked = self.contexts[mc].states.len();
+            let num_masked = self.contexts[mc].num_stats as usize;
             loop {
                 self.order_fall += 1;
-                let Some(suffix) = self.contexts[mc].suffix else {
+                let Some(suffix) = self.contexts[mc].suffix() else {
                     return Ok(None);
                 };
                 mc = suffix;
-                if self.contexts[mc].states.len() != num_masked {
+                if usize::from(self.contexts[mc].num_stats) != num_masked {
                     break;
                 }
             }
             self.min_context = mc;
 
-            let hi_cnt = self.contexts[mc]
-                .states
+            let hi_cnt = self
+                .states(mc)
                 .iter()
                 .filter(|state| mask[state.symbol as usize])
                 .map(|state| state.freq as u32)
@@ -805,7 +1073,7 @@ impl<B: Budget> PpmdState<B> {
             if count < hi_cnt {
                 let mut start = 0u32;
                 let mut selected = None;
-                for (index, state) in self.contexts[mc].states.iter().enumerate() {
+                for (index, state) in self.states(mc).iter().enumerate() {
                     if !mask[state.symbol as usize] {
                         continue;
                     }
@@ -833,7 +1101,7 @@ impl<B: Budget> PpmdState<B> {
             }
             self.range.decode(hi_cnt, freq_sum - hi_cnt);
             self.add_see_summ(see_ref, freq_sum);
-            for state in &self.contexts[mc].states {
+            for state in self.states(mc) {
                 mask[state.symbol as usize] = false;
             }
         }
@@ -843,11 +1111,11 @@ impl<B: Budget> PpmdState<B> {
     fn encode_symbol(&mut self, symbol: u8, output: &mut RangeEncoder) -> Result<()> {
         let mut mask = [true; 256];
         let min = self.min_context;
-        if self.contexts[min].states.len() != 1 {
+        if self.contexts[min].num_stats != 1 {
             let summ_freq = self.contexts[min].summ_freq as u32;
             let mut start = 0u32;
             let mut found = None;
-            for (index, state) in self.contexts[min].states.iter().enumerate() {
+            for (index, state) in self.states(min).iter().enumerate() {
                 if state.symbol == symbol {
                     found = Some((index, start, state.freq as u32));
                     break;
@@ -875,11 +1143,11 @@ impl<B: Budget> PpmdState<B> {
             self.prev_success = 0;
             output.encode(start, summ_freq - start, summ_freq);
             self.hi_bits_flag = hi_bits_flag(self.state(self.found_state)?.symbol, 3);
-            for state in &self.contexts[min].states {
+            for state in self.states(min) {
                 mask[state.symbol as usize] = false;
             }
         } else {
-            let state = self.contexts[min].states[0];
+            let state = self.states(min)[0];
             let idx = self.bin_summ_index(state)?;
             let prob = self.bin_summ[idx.0][idx.1] as u32;
             let size0 = (output.range >> 14).wrapping_mul(prob);
@@ -905,21 +1173,21 @@ impl<B: Budget> PpmdState<B> {
         loop {
             output.normalize();
             let mut mc = self.min_context;
-            let num_masked = self.contexts[mc].states.len();
+            let num_masked = self.contexts[mc].num_stats as usize;
             loop {
                 self.order_fall += 1;
-                let Some(suffix) = self.contexts[mc].suffix else {
+                let Some(suffix) = self.contexts[mc].suffix() else {
                     return Err(Error::InvalidData("RAR PPMd symbol is not encodable"));
                 };
                 mc = suffix;
-                if self.contexts[mc].states.len() != num_masked {
+                if usize::from(self.contexts[mc].num_stats) != num_masked {
                     break;
                 }
             }
             self.min_context = mc;
 
-            let hi_cnt = self.contexts[mc]
-                .states
+            let hi_cnt = self
+                .states(mc)
                 .iter()
                 .filter(|state| mask[state.symbol as usize])
                 .map(|state| state.freq as u32)
@@ -928,7 +1196,7 @@ impl<B: Budget> PpmdState<B> {
             let freq_sum = hi_cnt + esc_freq;
             let mut start = 0u32;
             let mut found = None;
-            for (index, state) in self.contexts[mc].states.iter().enumerate() {
+            for (index, state) in self.states(mc).iter().enumerate() {
                 if !mask[state.symbol as usize] {
                     continue;
                 }
@@ -949,7 +1217,7 @@ impl<B: Budget> PpmdState<B> {
             }
             output.encode(hi_cnt, freq_sum - hi_cnt, freq_sum);
             self.add_see_summ(see_ref, freq_sum);
-            for state in &self.contexts[mc].states {
+            for state in self.states(mc) {
                 mask[state.symbol as usize] = false;
             }
         }
@@ -958,6 +1226,7 @@ impl<B: Budget> PpmdState<B> {
     fn init_model(&mut self, max_order: usize) -> Result<()> {
         self.suballoc.read_control.check_codec()?;
         self.contexts.clear();
+        self.arena.reset();
         self.text.clear();
         // Spec §5.2 RestartModel: clear free lists, reserve root context
         // (1 unit from Hi) + its 256-state array (128 units from Lo).
@@ -985,16 +1254,17 @@ impl<B: Budget> PpmdState<B> {
         self.run_length = self.init_rl;
         self.prev_success = 0;
 
-        let states = Buffer::collect(
-            (0..=255).map(|symbol| State {
+        let at = self.arena.alloc(StateArena::<B>::class(256))?;
+        for (symbol, state) in (0..=255).zip(&mut self.arena.states[at as usize..][..256]) {
+            *state = State {
                 symbol,
                 freq: 1,
                 successor: Successor::None,
-            }),
-            &self.contexts.allowance(),
-        )?;
+            };
+        }
         self.contexts.try_push(Context {
-            states,
+            stats: Stats::Many(at),
+            num_stats: 256,
             summ_freq: 257,
             suffix: None,
             header_offset,
@@ -1035,9 +1305,9 @@ impl<B: Budget> PpmdState<B> {
 
     fn bin_summ_index(&mut self, state: State) -> Result<(usize, usize)> {
         let suffix = self.contexts[self.min_context]
-            .suffix
+            .suffix()
             .ok_or(Error::InvalidData("RAR PPMd binary context has no suffix"))?;
-        let suffix_stats = self.contexts[suffix].states.len();
+        let suffix_stats = self.contexts[suffix].num_stats as usize;
         self.hi_bits_flag = hi_bits_flag(self.state(self.found_state)?.symbol, 3);
         let row = state.freq as usize - 1;
         let col = self.prev_success as usize
@@ -1050,7 +1320,7 @@ impl<B: Budget> PpmdState<B> {
 
     fn make_esc_freq(&mut self, num_masked: usize) -> Result<(SeeRef, u32)> {
         let mc = self.min_context;
-        let num_stats = self.contexts[mc].states.len();
+        let num_stats = self.contexts[mc].num_stats as usize;
         if num_stats == 256 {
             return Ok((SeeRef::Dummy, 1));
         }
@@ -1059,8 +1329,8 @@ impl<B: Budget> PpmdState<B> {
         }
         // The guard above establishes num_masked < num_stats.
         let non_masked = num_stats - num_masked;
-        let suffix = self.contexts[mc].suffix.unwrap_or(mc);
-        let suffix_stats = self.contexts[suffix].states.len();
+        let suffix = self.contexts[mc].suffix().unwrap_or(mc);
+        let suffix_stats = self.contexts[suffix].num_stats as usize;
         // Spec §9.1: the subtraction is unsigned C wraparound — when
         // `suffix.num_stats < min_context.num_stats`, the underflow yields a
         // very large value and the `non_masked < suffix_delta` comparison
@@ -1121,12 +1391,8 @@ impl<B: Budget> PpmdState<B> {
         self.contexts[fs.context].summ_freq = self.contexts[fs.context].summ_freq.wrapping_add(4);
         self.state_mut(fs)?.freq = freq as u8;
         // Both decode and encode call update1 only for a non-first state.
-        if self.contexts[fs.context].states[fs.index].freq
-            > self.contexts[fs.context].states[fs.index - 1].freq
-        {
-            self.contexts[fs.context]
-                .states
-                .swap(fs.index, fs.index - 1);
+        if self.states(fs.context)[fs.index].freq > self.states(fs.context)[fs.index - 1].freq {
+            self.states_mut(fs.context).swap(fs.index, fs.index - 1);
             self.found_state.index -= 1;
             if freq > MAX_FREQ {
                 self.rescale()?;
@@ -1160,8 +1426,8 @@ impl<B: Budget> PpmdState<B> {
         let successor = self.state(self.found_state)?.successor;
         if let Successor::Context(context) = successor {
             if self.order_fall == 0 {
-                self.max_context = context;
-                self.min_context = context;
+                self.max_context = context as usize;
+                self.min_context = context as usize;
                 return Ok(());
             }
         }
@@ -1171,27 +1437,26 @@ impl<B: Budget> PpmdState<B> {
     fn update_model(&mut self) -> Result<()> {
         let fs = self.state(self.found_state)?;
         let found_symbol = fs.symbol;
-        if fs.freq < (MAX_FREQ / 4) as u8 && self.contexts[self.min_context].suffix.is_some() {
-            let suffix = self.contexts[self.min_context].suffix.unwrap();
-            if self.contexts[suffix].states.len() == 1 {
-                let freq = self.contexts[suffix].states[0].freq;
+        if fs.freq < (MAX_FREQ / 4) as u8 && self.contexts[self.min_context].suffix().is_some() {
+            let suffix = self.contexts[self.min_context].suffix().unwrap();
+            if self.contexts[suffix].num_stats == 1 {
+                let freq = self.states(suffix)[0].freq;
                 if freq < 32 {
-                    self.contexts[suffix].states[0].freq += 1;
+                    self.states_mut(suffix)[0].freq += 1;
                 }
-            } else if let Some(mut index) = self.contexts[suffix]
-                .states
+            } else if let Some(mut index) = self
+                .states(suffix)
                 .iter()
                 .position(|state| state.symbol == found_symbol)
             {
                 if index > 0
-                    && self.contexts[suffix].states[index].freq
-                        >= self.contexts[suffix].states[index - 1].freq
+                    && self.states(suffix)[index].freq >= self.states(suffix)[index - 1].freq
                 {
-                    self.contexts[suffix].states.swap(index, index - 1);
+                    self.states_mut(suffix).swap(index, index - 1);
                     index -= 1;
                 }
-                if self.contexts[suffix].states[index].freq < (MAX_FREQ - 9) as u8 {
-                    self.contexts[suffix].states[index].freq += 2;
+                if self.states(suffix)[index].freq < (MAX_FREQ - 9) as u8 {
+                    self.states_mut(suffix)[index].freq += 2;
                     self.contexts[suffix].summ_freq =
                         self.contexts[suffix].summ_freq.wrapping_add(2);
                 }
@@ -1205,7 +1470,7 @@ impl<B: Budget> PpmdState<B> {
             };
             self.max_context = context;
             self.min_context = context;
-            self.state_mut(self.found_state)?.successor = Successor::Context(context);
+            self.state_mut(self.found_state)?.successor = Successor::context(context)?;
             return Ok(());
         }
 
@@ -1215,7 +1480,7 @@ impl<B: Budget> PpmdState<B> {
         // coder by one extra symbol before resetting — which left the
         // post-restart state out of sync.
         self.text.try_push(found_symbol)?;
-        let max_successor = Successor::Raw(self.text.len());
+        let max_successor = Successor::raw(self.text.len())?;
         if !self.suballoc.text_has_room(self.text.len()) {
             self.init_model(self.max_order)?;
             return Ok(());
@@ -1225,7 +1490,7 @@ impl<B: Budget> PpmdState<B> {
                 self.state_mut(self.found_state)?.successor = max_successor;
                 (self.min_context, false)
             }
-            Successor::Context(context) => (context, true),
+            Successor::Context(context) => (context as usize, true),
             Successor::Raw(_) => {
                 let Some(context) = self.create_successors()? else {
                     self.init_model(self.max_order)?;
@@ -1240,7 +1505,7 @@ impl<B: Budget> PpmdState<B> {
                 self.text.pop();
             }
         }
-        let min_successor = Successor::Context(min_context);
+        let min_successor = Successor::context(min_context)?;
 
         let mc = self.min_context;
         let mut c = self.max_context;
@@ -1250,7 +1515,7 @@ impl<B: Budget> PpmdState<B> {
             return Ok(());
         }
 
-        let ns = self.contexts[mc].states.len() as u32;
+        let ns = u32::from(self.contexts[mc].num_stats);
         let s0 = self.contexts[mc]
             .summ_freq
             .checked_sub(ns as u16)
@@ -1258,19 +1523,19 @@ impl<B: Budget> PpmdState<B> {
             .and_then(|value| value.checked_sub(fs.freq as u32 - 1))
             .ok_or(Error::InvalidData("RAR PPMd model frequency is invalid"))?;
         while c != mc {
-            let ns1 = self.contexts[c].states.len() as u32;
+            let ns1 = u32::from(self.contexts[c].num_stats);
             let mut sum;
             if ns1 != 1 {
                 sum = self.contexts[c].summ_freq as u32;
                 sum += u32::from(2 * ns1 < ns) + 2 * u32::from(4 * ns1 <= ns && sum <= 8 * ns1);
             } else {
-                let old = self.contexts[c].states[0];
+                let old = self.states(c)[0];
                 let freq = if old.freq < (MAX_FREQ / 4 - 1) as u8 {
                     old.freq * 2
                 } else {
                     (MAX_FREQ - 4) as u8
                 };
-                self.contexts[c].states[0].freq = freq;
+                self.states_mut(c)[0].freq = freq;
                 sum = freq as u32 + self.init_esc + u32::from(ns > 3);
             }
 
@@ -1292,28 +1557,43 @@ impl<B: Budget> PpmdState<B> {
                     + u32::from(cf >= 15 * sf);
                 sum += cf;
             }
-            let old_n = self.contexts[c].states.len();
+            let old_n = self.contexts[c].num_stats as usize;
             if !self.grow_state_array(c, old_n + 1)? {
                 self.init_model(self.max_order)?;
                 return Ok(());
             }
-            self.contexts[c].states.try_push(State {
-                symbol: found_symbol,
-                freq: cf as u8,
-                successor: if self.order_fall == 0 {
-                    min_successor
-                } else {
-                    max_successor
+            self.push_state(
+                c,
+                State {
+                    symbol: found_symbol,
+                    freq: cf as u8,
+                    successor: if self.order_fall == 0 {
+                        min_successor
+                    } else {
+                        max_successor
+                    },
                 },
-            })?;
+            )?;
             self.contexts[c].summ_freq = u16::try_from(sum)
                 .map_err(|_| Error::InvalidData("RAR PPMd model frequency overflows"))?;
-            c = self.contexts[c].suffix.unwrap_or(mc);
+            c = self.contexts[c].suffix().unwrap_or(mc);
         }
         Ok(())
     }
 
     fn create_successors(&mut self) -> Result<Option<usize>> {
+        // Borrow the kept list for the walk and hand it back emptied,
+        // whichever way the walk ends.
+        let allowance = self.contexts.allowance();
+        let mut ps = std::mem::replace(&mut self.successor_scratch, Buffer::new(&allowance));
+        ps.clear();
+        let created = self.create_successors_with(&mut ps);
+        ps.clear();
+        self.successor_scratch = ps;
+        created
+    }
+
+    fn create_successors_with(&mut self, ps: &mut Buffer<StateRef, B>) -> Result<Option<usize>> {
         // Missing links retain the reference model's restart path. Workspace
         // refusal is propagated separately and must never restart the model.
         macro_rules! pressure {
@@ -1326,26 +1606,28 @@ impl<B: Budget> PpmdState<B> {
         }
         let up_branch = match pressure!(self.state(self.found_state).ok()).successor {
             Successor::Raw(pos) => pos,
-            Successor::Context(context) if self.order_fall == 0 => return Ok(Some(context)),
+            Successor::Context(context) if self.order_fall == 0 => {
+                return Ok(Some(context as usize));
+            }
             _ => return Ok(None),
         };
         let mut c = self.min_context;
-        let allowance = self.contexts.allowance();
-        let mut ps = Buffer::new(&allowance);
         if self.order_fall != 0 {
             ps.try_push(self.found_state)?;
         }
-        while let Some(suffix) = self.contexts[c].suffix {
+        // Read once: the walk changes neither the found state nor its
+        // context.
+        let found_symbol = pressure!(self.state(self.found_state).ok()).symbol;
+        while let Some(suffix) = self.contexts[c].suffix() {
             c = suffix;
-            let found_symbol = pressure!(self.state(self.found_state).ok()).symbol;
-            let index = pressure!(self.contexts[c]
-                .states
+            let index = pressure!(self
+                .states(c)
                 .iter()
                 .position(|state| state.symbol == found_symbol));
-            let successor = self.contexts[c].states[index].successor;
+            let successor = self.states(c)[index].successor;
             if successor != Successor::Raw(up_branch) {
                 if let Successor::Context(context) = successor {
-                    c = context;
+                    c = context as usize;
                     if ps.is_empty() {
                         return Ok(Some(c));
                     }
@@ -1358,17 +1640,14 @@ impl<B: Budget> PpmdState<B> {
         if ps.is_empty() {
             return Ok(Some(c));
         }
-        let new_sym = *pressure!(self.text.get(up_branch));
+        let new_sym = *pressure!(self.text.get(up_branch as usize));
         let up_successor = Successor::Raw(up_branch + 1);
-        let new_freq = if self.contexts[c].states.len() == 1 {
-            self.contexts[c].states[0].freq
+        let new_freq = if self.contexts[c].num_stats == 1 {
+            self.states(c)[0].freq
         } else {
-            let state = pressure!(self.contexts[c]
-                .states
-                .iter()
-                .find(|state| state.symbol == new_sym));
+            let state = pressure!(self.states(c).iter().find(|state| state.symbol == new_sym));
             let cf = state.freq as u32 - 1;
-            let s0 = self.contexts[c].summ_freq as u32 - self.contexts[c].states.len() as u32 - cf;
+            let s0 = self.contexts[c].summ_freq as u32 - u32::from(self.contexts[c].num_stats) - cf;
             (1 + if 2 * cf <= s0 {
                 u32::from(5 * cf > s0)
             } else {
@@ -1377,27 +1656,26 @@ impl<B: Budget> PpmdState<B> {
         };
         while let Some(state_ref) = ps.pop() {
             let context = pressure!(self.push_context(Context {
-                states: Buffer::filled(
-                    1,
-                    State {
-                        symbol: new_sym,
-                        freq: new_freq,
-                        successor: up_successor
-                    },
-                    &allowance
-                )?,
+                stats: Stats::One(State {
+                    symbol: new_sym,
+                    freq: new_freq,
+                    successor: up_successor,
+                }),
+                num_stats: 1,
                 summ_freq: 0,
-                suffix: Some(c),
+                // An existing context's index; `Successor::context` below
+                // checks the new one's.
+                suffix: Some(c as u32),
                 header_offset: NULL_OFFSET,
                 array_offset: NULL_OFFSET,
             })?);
-            pressure!(self.state_mut(state_ref).ok()).successor = Successor::Context(context);
+            pressure!(self.state_mut(state_ref).ok()).successor = Successor::context(context)?;
             c = context;
         }
         Ok(Some(c))
     }
 
-    fn push_context(&mut self, mut context: Context<B>) -> Result<Option<usize>> {
+    fn push_context(&mut self, mut context: Context) -> Result<Option<usize>> {
         if self.contexts.len() >= self.max_contexts {
             return Ok(None);
         }
@@ -1408,7 +1686,7 @@ impl<B: Budget> PpmdState<B> {
         let Some(header_offset) = self.suballoc.try_alloc(1, AllocSide::Hi, text_len)? else {
             return Ok(None);
         };
-        let array_units = Self::state_array_units(context.states.len());
+        let array_units = Self::state_array_units(context.num_stats as usize);
         let array_offset = if array_units > 0 {
             match self
                 .suballoc
@@ -1436,7 +1714,7 @@ impl<B: Budget> PpmdState<B> {
     // context's array_offset is updated to point at the new block when
     // moved.
     fn grow_state_array(&mut self, ctx_idx: usize, new_n: usize) -> Result<bool> {
-        let old_n = self.contexts[ctx_idx].states.len();
+        let old_n = self.contexts[ctx_idx].num_stats as usize;
         let old_units = Self::state_array_units(old_n);
         let new_units = Self::state_array_units(new_n);
         // Called only for old_n + 1 during UpdateModel. The new array has
@@ -1500,7 +1778,7 @@ impl<B: Budget> PpmdState<B> {
         if let Some(swap_offset) = self.suballoc.free_lists[i1].pop() {
             // Swap path: take a same-sized block from the target bucket,
             // return the oversized block to its bucket. Data lives in
-            // self.contexts[ctx_idx].states (Vec), so no MEM_12_CPY needed.
+            // the state arena, so no MEM_12_CPY needed.
             self.suballoc.try_free(old_offset, old_units)?;
             self.contexts[ctx_idx].array_offset = swap_offset;
         } else {
@@ -1517,17 +1795,16 @@ impl<B: Budget> PpmdState<B> {
 
     fn rescale(&mut self) -> Result<()> {
         let ctx = self.min_context;
-        let original_state_count = self.contexts[ctx].states.len();
-        let mut states = Buffer::copied(&self.contexts[ctx].states, &self.contexts.allowance())?;
-        let found = self.found_state.index;
-        if found != 0 {
-            let state = states.remove(found);
-            states.insert(0, state)?;
-            self.found_state.index = 0;
-        }
-        let mut sum_freq = states[0].freq as u32;
-        let mut esc_freq = self.contexts[ctx].summ_freq as u32 - sum_freq;
+        let original_state_count = self.contexts[ctx].num_stats as usize;
+        let summ_freq = self.contexts[ctx].summ_freq as u32;
         let adder = u32::from(self.order_fall != 0);
+        let found = self.found_state.index;
+        self.found_state.index = 0;
+        let states = self.states_mut(ctx);
+        // The found state moves to the front, the ones before it back by one.
+        states[..=found].rotate_right(1);
+        let mut sum_freq = states[0].freq as u32;
+        let mut esc_freq = summ_freq - sum_freq;
         sum_freq = (sum_freq + 4 + adder) >> 1;
         states[0].freq = sum_freq as u8;
         for index in 1..states.len() {
@@ -1542,42 +1819,122 @@ impl<B: Budget> PpmdState<B> {
                 j -= 1;
             }
         }
-        while states.last().is_some_and(|state| state.freq == 0) {
-            states.pop();
+        let mut len = states.len();
+        while len > 0 && states[len - 1].freq == 0 {
+            len -= 1;
             esc_freq += 1;
         }
-        if states.len() == 1 {
-            let mut freq = states[0].freq as u32;
+        if len == 1 {
+            let state = &mut states[0];
+            let mut freq = state.freq as u32;
             while esc_freq > 1 {
                 esc_freq >>= 1;
                 freq = (freq + 1) >> 1;
             }
-            states[0].freq = freq as u8;
+            state.freq = freq as u8;
             self.shrink_state_array(ctx, original_state_count, 1)?;
-            self.contexts[ctx].states = states;
-            self.found_state.index = 0;
-            return Ok(());
+            return self.truncate_states(ctx, 1);
         }
         self.contexts[ctx].summ_freq = (sum_freq + esc_freq - (esc_freq >> 1)) as u16;
-        self.shrink_state_array(ctx, original_state_count, states.len())?;
-        self.contexts[ctx].states = states;
-        self.found_state.index = 0;
-        Ok(())
+        self.shrink_state_array(ctx, original_state_count, len)?;
+        self.truncate_states(ctx, len)
     }
 
     fn state(&self, state: StateRef) -> Result<State> {
-        self.contexts
-            .get(state.context)
-            .and_then(|context| context.states.get(state.index))
+        if state.context >= self.contexts.len() {
+            return Err(Error::InvalidData("RAR PPMd state reference is invalid"));
+        }
+        self.states(state.context)
+            .get(state.index)
             .copied()
             .ok_or(Error::InvalidData("RAR PPMd state reference is invalid"))
     }
 
     fn state_mut(&mut self, state: StateRef) -> Result<&mut State> {
-        self.contexts
-            .get_mut(state.context)
-            .and_then(|context| context.states.get_mut(state.index))
+        if state.context >= self.contexts.len() {
+            return Err(Error::InvalidData("RAR PPMd state reference is invalid"));
+        }
+        self.states_mut(state.context)
+            .get_mut(state.index)
             .ok_or(Error::InvalidData("RAR PPMd state reference is invalid"))
+    }
+
+    // A context's states, wherever they are kept.
+    #[inline]
+    fn states(&self, context: usize) -> &[State] {
+        let context = &self.contexts[context];
+        match &context.stats {
+            Stats::One(state) => std::slice::from_ref(state),
+            Stats::Many(at) => &self.arena.states[*at as usize..][..context.num_stats as usize],
+        }
+    }
+
+    #[inline]
+    fn states_mut(&mut self, context: usize) -> &mut [State] {
+        let context = &mut self.contexts[context];
+        match &mut context.stats {
+            Stats::One(state) => std::slice::from_mut(state),
+            Stats::Many(at) => &mut self.arena.states[*at as usize..][..context.num_stats as usize],
+        }
+    }
+
+    // Add a state to a context, moving its states to a larger block when
+    // they outgrow theirs.
+    fn push_state(&mut self, context: usize, state: State) -> Result<()> {
+        let Context {
+            stats, num_stats, ..
+        } = self.contexts[context];
+        let n = num_stats as usize;
+        if n >= 256 {
+            return Err(Error::InvalidData("RAR PPMd context has too many states"));
+        }
+        let at = match stats {
+            Stats::One(first) => {
+                let at = self.arena.alloc(StateArena::<B>::class(2))?;
+                self.arena.states[at as usize] = first;
+                at
+            }
+            Stats::Many(at) => {
+                let (old, new) = (StateArena::<B>::class(n), StateArena::<B>::class(n + 1));
+                if old == new {
+                    at
+                } else {
+                    let moved = self.arena.alloc(new)?;
+                    let from = at as usize;
+                    self.arena
+                        .states
+                        .copy_within(from..from + n, moved as usize);
+                    self.arena.release(at, old)?;
+                    moved
+                }
+            }
+        };
+        self.arena.states[at as usize + n] = state;
+        let context = &mut self.contexts[context];
+        context.stats = Stats::Many(at);
+        context.num_stats += 1;
+        Ok(())
+    }
+
+    // Keep a context's first `len` (at least one) states.
+    fn truncate_states(&mut self, context: usize, len: usize) -> Result<()> {
+        let Context {
+            stats, num_stats, ..
+        } = self.contexts[context];
+        let Stats::Many(at) = stats else {
+            return Ok(());
+        };
+        let old = StateArena::<B>::class(num_stats as usize);
+        if len == 1 {
+            let first = self.arena.states[at as usize];
+            self.arena.release(at, old)?;
+            self.contexts[context].stats = Stats::One(first);
+        } else {
+            self.arena
+                .release_tail(at, old, StateArena::<B>::class(len))?;
+        }
+        self.contexts[context].num_stats = len as u16;
+        Ok(())
     }
 }
 
@@ -1969,3 +2326,6 @@ fn model_context_limit(dictionary_mb: usize) -> usize {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod arena_tests;

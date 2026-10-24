@@ -38,10 +38,7 @@ fn reader_ppmd_workspace_refusals_release_contexts_states_text_and_checkpoints()
         let checkpoint = model.try_clone()?;
         assert_eq!(checkpoint.contexts.len(), model.contexts.len());
         assert_eq!(checkpoint.text, model.text);
-        assert_eq!(
-            checkpoint.contexts[0].states[0].freq,
-            model.contexts[0].states[0].freq
-        );
+        assert_eq!(checkpoint.states(0)[0].freq, model.states(0)[0].freq);
         Ok(())
     });
 }
@@ -147,6 +144,54 @@ fn cancellation_interrupts_suballocator_maintenance() {
 }
 use super::*;
 type PpmdDecoder = PpmdState<Allowance>;
+
+// Contexts built by hand keep their states where the model keeps its own:
+// tests name the states, sum and suffix and get a context.
+impl PpmdDecoder {
+    fn context(&mut self, states: Vec<State>, summ_freq: u16, suffix: Option<usize>) -> Context {
+        let stats = match *states {
+            [state] => Stats::One(state),
+            _ => {
+                let at = self
+                    .arena
+                    .alloc(StateArena::<Allowance>::class(states.len()))
+                    .unwrap();
+                self.arena.states[at as usize..][..states.len()].copy_from_slice(&states);
+                Stats::Many(at)
+            }
+        };
+        Context {
+            stats,
+            num_stats: states.len() as u16,
+            summ_freq,
+            suffix: suffix.map(|suffix| suffix as u32),
+            header_offset: NULL_OFFSET,
+            array_offset: NULL_OFFSET,
+        }
+    }
+
+    // Through `push_context`, as the model adds its own.
+    fn push_test_context(
+        &mut self,
+        states: Vec<State>,
+        summ_freq: u16,
+        suffix: Option<usize>,
+    ) -> Result<Option<usize>> {
+        let context = self.context(states, summ_freq, suffix);
+        self.push_context(context)
+    }
+
+    // Straight onto the list, with no simulated allocation.
+    fn push_raw_context(
+        &mut self,
+        states: Vec<State>,
+        summ_freq: u16,
+        suffix: Option<usize>,
+    ) -> Result<()> {
+        let context = self.context(states, summ_freq, suffix);
+        self.contexts.try_push(context)
+    }
+}
 type Suballocator = super::Suballocator<Allowance>;
 
 #[test]
@@ -540,7 +585,7 @@ fn decode_init_accepts_max_wire_order_without_growing_unbounded_model() {
 
     assert_eq!(decoder.max_order, 64);
     assert_eq!(decoder.contexts.len(), 1);
-    assert_eq!(decoder.contexts[0].states.len(), 256);
+    assert_eq!(decoder.states(0).len(), 256);
     assert_eq!(decoder.max_contexts, model_context_limit(1));
 }
 
@@ -601,24 +646,10 @@ fn decoder_rejects_invalid_escape_range_and_symbol() {
             successor: Successor::None,
         };
         decoder
-            .contexts
-            .push(Context {
-                states: vec![state(b'a'), state(b'b'), state(b'c')].into(),
-                summ_freq: 4,
-                suffix: Some(0),
-                header_offset: NULL_OFFSET,
-                array_offset: NULL_OFFSET,
-            })
+            .push_raw_context(vec![state(b'a'), state(b'b'), state(b'c')], 4, Some(0))
             .unwrap();
         decoder
-            .contexts
-            .push(Context {
-                states: vec![state(b'a'), state(b'b')].into(),
-                summ_freq: 3,
-                suffix: Some(1),
-                header_offset: NULL_OFFSET,
-                array_offset: NULL_OFFSET,
-            })
+            .push_raw_context(vec![state(b'a'), state(b'b')], 3, Some(1))
             .unwrap();
         decoder.min_context = 2;
         decoder.range.range = 100_000;
@@ -742,7 +773,7 @@ fn encoder_rejects_invalid_match_and_repeat_bounds() {
 fn encoder_rejects_corrupt_frequency_sum_and_missing_root_symbol() {
     let mut decoder = PpmdDecoder::new();
     decoder.init_model(4).unwrap();
-    decoder.contexts[0].states.truncate(2);
+    decoder.truncate_states(0, 2).unwrap();
     decoder.contexts[0].summ_freq = 2;
     assert_eq!(
         decoder.encode_symbol(2, &mut RangeEncoder::new()),
@@ -750,7 +781,7 @@ fn encoder_rejects_corrupt_frequency_sum_and_missing_root_symbol() {
     );
 
     decoder.init_model(4).unwrap();
-    decoder.contexts[0].states.truncate(2);
+    decoder.truncate_states(0, 2).unwrap();
     decoder.contexts[0].summ_freq = 3;
     assert_eq!(
         decoder.encode_symbol(2, &mut RangeEncoder::new()),
@@ -799,15 +830,7 @@ fn context_allocation_respects_dictionary_limit() {
     decoder.init_model(4).unwrap();
 
     assert_eq!(
-        decoder
-            .push_context(Context {
-                states: Buffer::new(&Allowance::default()),
-                summ_freq: 0,
-                suffix: None,
-                header_offset: NULL_OFFSET,
-                array_offset: NULL_OFFSET,
-            })
-            .unwrap(),
+        decoder.push_test_context(Vec::new(), 0, None).unwrap(),
         None
     );
 }
@@ -828,26 +851,31 @@ fn context_header_pressure_is_distinct_from_the_context_count_limit() {
     assert!(decoder.contexts.len() < decoder.max_contexts);
     let root_header = decoder.contexts[0].header_offset;
     let root_array = decoder.contexts[0].array_offset;
-    let new_context = || Context {
-        states: vec![State {
+    let new_context = || {
+        vec![State {
             symbol: b'a',
             freq: 1,
             successor: Successor::None,
         }]
-        .into(),
-        summ_freq: 0,
-        suffix: Some(0),
-        header_offset: NULL_OFFSET,
-        array_offset: NULL_OFFSET,
     };
-    assert_eq!(decoder.push_context(new_context()).unwrap(), None);
+    assert_eq!(
+        decoder
+            .push_test_context(new_context(), 0, Some(0))
+            .unwrap(),
+        None
+    );
     assert_eq!(decoder.contexts.len(), 1);
     assert_eq!(decoder.contexts[0].header_offset, root_header);
     assert_eq!(decoder.contexts[0].array_offset, root_array);
-    assert_eq!(decoder.contexts[0].states.len(), 256);
+    assert_eq!(decoder.states(0).len(), 256);
 
     decoder.init_model(4).unwrap();
-    assert_eq!(decoder.push_context(new_context()).unwrap(), Some(1));
+    assert_eq!(
+        decoder
+            .push_test_context(new_context(), 0, Some(0))
+            .unwrap(),
+        Some(1)
+    );
 }
 
 #[test]
@@ -860,13 +888,7 @@ fn context_allocation_releases_header_when_state_array_does_not_fit() {
         freq: 1,
         successor: Successor::None,
     };
-    let context = Context {
-        states: vec![state; 256].into(),
-        summ_freq: 257,
-        suffix: None,
-        header_offset: NULL_OFFSET,
-        array_offset: NULL_OFFSET,
-    };
+    let context = decoder.context(vec![state; 256], 257, None);
     assert_eq!(decoder.push_context(context).unwrap(), None);
     assert_eq!(decoder.suballoc.free_lists[0].len(), 1);
     assert!(decoder.contexts.is_empty());
@@ -889,9 +911,9 @@ fn model_restarts_at_text_boundary_and_failed_successor_creation() {
     decoder.update_model().unwrap();
     assert_eq!(decoder.order_fall, 4);
 
-    decoder.contexts[0].states[0].successor = Successor::Raw(usize::MAX);
+    decoder.states_mut(0)[0].successor = Successor::Raw(u32::MAX);
     decoder.update_model().unwrap();
-    assert_eq!(decoder.contexts[0].states[0].successor, Successor::None);
+    assert_eq!(decoder.states(0)[0].successor, Successor::None);
 }
 
 #[test]
@@ -905,33 +927,15 @@ fn model_restarts_when_an_ancestor_state_array_cannot_grow() {
         successor: Successor::None,
     };
     let ancestor = decoder
-        .push_context(Context {
-            states: vec![state(b'a'), state(b'b')].into(),
-            summ_freq: 3,
-            suffix: Some(0),
-            header_offset: NULL_OFFSET,
-            array_offset: NULL_OFFSET,
-        })
+        .push_test_context(vec![state(b'a'), state(b'b')], 3, Some(0))
         .unwrap()
         .unwrap();
     let selected = decoder
-        .push_context(Context {
-            states: vec![state(b'c'), state(b'd')].into(),
-            summ_freq: 3,
-            suffix: Some(ancestor),
-            header_offset: NULL_OFFSET,
-            array_offset: NULL_OFFSET,
-        })
+        .push_test_context(vec![state(b'c'), state(b'd')], 3, Some(ancestor))
         .unwrap()
         .unwrap();
     let expanded = decoder
-        .push_context(Context {
-            states: vec![state(b'a'), state(b'b')].into(),
-            summ_freq: 3,
-            suffix: Some(selected),
-            header_offset: NULL_OFFSET,
-            array_offset: NULL_OFFSET,
-        })
+        .push_test_context(vec![state(b'a'), state(b'b')], 3, Some(selected))
         .unwrap()
         .unwrap();
     decoder.min_context = selected;
@@ -968,37 +972,30 @@ fn model_adds_ancestor_state_with_raw_or_context_successor() {
             successor,
         };
         let ancestor = decoder
-            .push_context(Context {
-                states: vec![state(b'a', Successor::None), state(b'b', Successor::None)].into(),
-                summ_freq: 3,
-                suffix: Some(0),
-                header_offset: NULL_OFFSET,
-                array_offset: NULL_OFFSET,
-            })
+            .push_test_context(
+                vec![state(b'a', Successor::None), state(b'b', Successor::None)],
+                3,
+                Some(0),
+            )
             .unwrap()
             .unwrap();
         let selected = decoder
-            .push_context(Context {
-                states: vec![
+            .push_test_context(
+                vec![
                     state(b'c', existing_successor),
                     state(b'd', Successor::None),
-                ]
-                .into(),
-                summ_freq: 3,
-                suffix: Some(ancestor),
-                header_offset: NULL_OFFSET,
-                array_offset: NULL_OFFSET,
-            })
+                ],
+                3,
+                Some(ancestor),
+            )
             .unwrap()
             .unwrap();
         let expanded = decoder
-            .push_context(Context {
-                states: vec![state(b'a', Successor::None), state(b'b', Successor::None)].into(),
-                summ_freq: 3,
-                suffix: Some(selected),
-                header_offset: NULL_OFFSET,
-                array_offset: NULL_OFFSET,
-            })
+            .push_test_context(
+                vec![state(b'a', Successor::None), state(b'b', Successor::None)],
+                3,
+                Some(selected),
+            )
             .unwrap()
             .unwrap();
         decoder.min_context = selected;
@@ -1013,20 +1010,14 @@ fn model_adds_ancestor_state_with_raw_or_context_successor() {
 
     let (mut decoder, expanded) = chain(Successor::None);
     decoder.update_model().unwrap();
-    assert_eq!(decoder.contexts[expanded].states.len(), 3);
-    assert_eq!(
-        decoder.contexts[expanded].states[2].successor,
-        Successor::Raw(1)
-    );
+    assert_eq!(decoder.states(expanded).len(), 3);
+    assert_eq!(decoder.states(expanded)[2].successor, Successor::Raw(1));
     assert_eq!(&*decoder.text, b"c");
 
     let (mut decoder, expanded) = chain(Successor::Context(2));
     decoder.update_model().unwrap();
-    assert_eq!(decoder.contexts[expanded].states.len(), 3);
-    assert_eq!(
-        decoder.contexts[expanded].states[2].successor,
-        Successor::Context(2)
-    );
+    assert_eq!(decoder.states(expanded).len(), 3);
+    assert_eq!(decoder.states(expanded)[2].successor, Successor::Context(2));
     assert!(decoder.text.is_empty());
 }
 
@@ -1036,29 +1027,21 @@ fn model_updates_suffix_frequencies_at_the_binary_and_multi_state_caps() {
         let mut decoder = PpmdDecoder::new();
         decoder.max_contexts = 10;
         decoder.init_model(4).unwrap();
+        let summ_freq = suffix.iter().map(|s| s.freq as u16).sum::<u16>() + 1;
         let ancestor = decoder
-            .push_context(Context {
-                summ_freq: suffix.iter().map(|s| s.freq as u16).sum::<u16>() + 1,
-                states: suffix.into(),
-                suffix: Some(0),
-                header_offset: NULL_OFFSET,
-                array_offset: NULL_OFFSET,
-            })
+            .push_test_context(suffix, summ_freq, Some(0))
             .unwrap()
             .unwrap();
         let selected = decoder
-            .push_context(Context {
-                states: vec![State {
+            .push_test_context(
+                vec![State {
                     symbol,
                     freq: 2,
                     successor: Successor::None,
-                }]
-                .into(),
-                summ_freq: 0,
-                suffix: Some(ancestor),
-                header_offset: NULL_OFFSET,
-                array_offset: NULL_OFFSET,
-            })
+                }],
+                0,
+                Some(ancestor),
+            )
             .unwrap()
             .unwrap();
         decoder.min_context = selected;
@@ -1079,22 +1062,22 @@ fn model_updates_suffix_frequencies_at_the_binary_and_multi_state_caps() {
     for (initial, expected) in [(31, 32), (32, 32)] {
         let (mut decoder, ancestor) = chain(vec![state(b'a', initial)], b'a');
         decoder.update_model().unwrap();
-        assert_eq!(decoder.contexts[ancestor].states[0].freq, expected);
+        assert_eq!(decoder.states(ancestor)[0].freq, expected);
     }
 
     let (mut decoder, ancestor) = chain(vec![state(b'a', 2), state(b'b', 2)], b'b');
     decoder.update_model().unwrap();
-    assert_eq!(decoder.contexts[ancestor].states[0].symbol, b'b');
-    assert_eq!(decoder.contexts[ancestor].states[0].freq, 4);
+    assert_eq!(decoder.states(ancestor)[0].symbol, b'b');
+    assert_eq!(decoder.states(ancestor)[0].freq, 4);
 
     let (mut decoder, ancestor) = chain(vec![state(b'a', 1), state(b'b', 115)], b'b');
     decoder.update_model().unwrap();
-    assert_eq!(decoder.contexts[ancestor].states[0].freq, 115);
+    assert_eq!(decoder.states(ancestor)[0].freq, 115);
 
     let (mut decoder, ancestor) = chain(vec![state(b'a', 2), state(b'b', 2)], b'c');
     decoder.update_model().unwrap();
-    assert_eq!(decoder.contexts[ancestor].states[0].freq, 2);
-    assert_eq!(decoder.contexts[ancestor].states[1].freq, 2);
+    assert_eq!(decoder.states(ancestor)[0].freq, 2);
+    assert_eq!(decoder.states(ancestor)[1].freq, 2);
 }
 
 #[test]
@@ -1103,21 +1086,18 @@ fn successor_creation_materializes_raw_chain_and_handles_limits() {
     decoder.max_contexts = 10;
     decoder.init_model(4).unwrap();
     let selected = decoder
-        .push_context(Context {
-            states: vec![State {
+        .push_test_context(
+            vec![State {
                 symbol: b'a',
                 freq: 2,
                 successor: Successor::Raw(0),
-            }]
-            .into(),
-            summ_freq: 0,
-            suffix: Some(0),
-            header_offset: NULL_OFFSET,
-            array_offset: NULL_OFFSET,
-        })
+            }],
+            0,
+            Some(0),
+        )
         .unwrap()
         .unwrap();
-    decoder.contexts[0].states[b'a' as usize].successor = Successor::Raw(0);
+    decoder.states_mut(0)[b'a' as usize].successor = Successor::Raw(0);
     decoder.min_context = selected;
     decoder.found_state = StateRef {
         context: selected,
@@ -1130,20 +1110,20 @@ fn successor_creation_materializes_raw_chain_and_handles_limits() {
     limited.max_contexts = 2;
     assert_eq!(limited.create_successors().unwrap(), None);
     let mut conflicting = decoder.clone();
-    conflicting.contexts[0].states[b'a' as usize].successor = Successor::None;
+    conflicting.states_mut(0)[b'a' as usize].successor = Successor::None;
     assert_eq!(conflicting.create_successors().unwrap(), None);
 
     let leaf = decoder.create_successors().unwrap().unwrap();
     assert_eq!(decoder.contexts.len(), 4);
-    assert_eq!(decoder.contexts[leaf].states[0].symbol, b'b');
-    assert_eq!(decoder.contexts[leaf].suffix, Some(2));
+    assert_eq!(decoder.states(leaf)[0].symbol, b'b');
+    assert_eq!(decoder.contexts[leaf].suffix(), Some(2));
     assert_eq!(
-        decoder.contexts[0].states[b'a' as usize].successor,
+        decoder.states(0)[b'a' as usize].successor,
         Successor::Context(2)
     );
     assert_eq!(
-        decoder.contexts[selected].states[0].successor,
-        Successor::Context(leaf)
+        decoder.states(selected)[0].successor,
+        Successor::Context(leaf as u32)
     );
 }
 
@@ -1153,18 +1133,15 @@ fn successor_creation_reuses_existing_context_without_materialization() {
     decoder.max_contexts = 4;
     decoder.init_model(4).unwrap();
     let selected = decoder
-        .push_context(Context {
-            states: vec![State {
+        .push_test_context(
+            vec![State {
                 symbol: b'a',
                 freq: 2,
                 successor: Successor::Raw(0),
-            }]
-            .into(),
-            summ_freq: 0,
-            suffix: Some(0),
-            header_offset: NULL_OFFSET,
-            array_offset: NULL_OFFSET,
-        })
+            }],
+            0,
+            Some(0),
+        )
         .unwrap()
         .unwrap();
     decoder.min_context = selected;
@@ -1173,16 +1150,16 @@ fn successor_creation_reuses_existing_context_without_materialization() {
         index: 0,
     };
     decoder.order_fall = 0;
-    decoder.contexts[0].states[b'a' as usize].successor = Successor::Context(0);
+    decoder.states_mut(0)[b'a' as usize].successor = Successor::Context(0);
     assert_eq!(decoder.create_successors().unwrap(), Some(0));
     assert_eq!(decoder.contexts.len(), 2);
 
-    decoder.contexts[selected].states[0].successor = Successor::Context(0);
+    decoder.states_mut(selected)[0].successor = Successor::Context(0);
     assert_eq!(decoder.create_successors().unwrap(), Some(0));
     decoder.order_fall = 1;
     assert_eq!(decoder.create_successors().unwrap(), None);
     decoder.order_fall = 0;
-    decoder.contexts[selected].states[0].successor = Successor::None;
+    decoder.states_mut(selected)[0].successor = Successor::None;
     assert_eq!(decoder.create_successors().unwrap(), None);
 
     decoder.min_context = 0;
@@ -1190,7 +1167,7 @@ fn successor_creation_reuses_existing_context_without_materialization() {
         context: 0,
         index: 0,
     };
-    decoder.contexts[0].states[0].successor = Successor::Raw(0);
+    decoder.states_mut(0)[0].successor = Successor::Raw(0);
     assert_eq!(decoder.create_successors().unwrap(), Some(0));
 }
 
@@ -1215,13 +1192,7 @@ fn shrink_array_reuses_a_free_bucket_or_splits_in_place() {
         freq: 1,
         successor: Successor::None,
     };
-    let context = Context {
-        states: vec![state; 12].into(),
-        summ_freq: 13,
-        suffix: None,
-        header_offset: NULL_OFFSET,
-        array_offset: NULL_OFFSET,
-    };
+    let context = decoder.context(vec![state; 12], 13, None);
     let ctx = decoder.push_context(context).unwrap().unwrap();
     let original = decoder.contexts[ctx].array_offset;
     decoder.shrink_state_array(ctx, 12, 12).unwrap();
@@ -1257,21 +1228,18 @@ fn rescale_sorts_survivors_and_collapses_or_shrinks_arrays() {
         decoder.max_contexts = 4;
         decoder.init_model(4).unwrap();
         let ctx = decoder
-            .push_context(Context {
-                states: freqs
+            .push_test_context(
+                freqs
                     .iter()
                     .map(|&(symbol, freq)| State {
                         symbol,
                         freq,
                         successor: Successor::None,
                     })
-                    .collect::<Vec<_>>()
-                    .into(),
-                summ_freq: sum,
-                suffix: Some(0),
-                header_offset: NULL_OFFSET,
-                array_offset: NULL_OFFSET,
-            })
+                    .collect::<Vec<_>>(),
+                sum,
+                Some(0),
+            )
             .unwrap()
             .unwrap();
         decoder.min_context = ctx;
@@ -1286,8 +1254,8 @@ fn rescale_sorts_survivors_and_collapses_or_shrinks_arrays() {
     let (mut decoder, ctx) = model(&[(b'a', 10), (b'b', 1), (b'c', 80)], 92, 1, 0);
     decoder.rescale().unwrap();
     assert_eq!(
-        decoder.contexts[ctx]
-            .states
+        decoder
+            .states(ctx)
             .iter()
             .map(|s| (s.symbol, s.freq))
             .collect::<Vec<_>>(),
@@ -1298,21 +1266,21 @@ fn rescale_sorts_survivors_and_collapses_or_shrinks_arrays() {
     let (mut decoder, ctx) = model(&[(b'a', 10), (b'b', 125), (b'c', 2)], 138, 1, 1);
     decoder.rescale().unwrap();
     assert_eq!(decoder.found_state.index, 0);
-    assert_eq!(decoder.contexts[ctx].states[0].symbol, b'b');
-    assert_eq!(decoder.contexts[ctx].states[0].freq, 65);
+    assert_eq!(decoder.states(ctx)[0].symbol, b'b');
+    assert_eq!(decoder.states(ctx)[0].freq, 65);
 
     let (mut decoder, ctx) = model(&[(b'a', 125), (b'b', 1), (b'c', 1)], 130, 0, 0);
     decoder.rescale().unwrap();
-    assert_eq!(decoder.contexts[ctx].states.len(), 1);
-    assert_eq!(decoder.contexts[ctx].states[0].freq, 16);
+    assert_eq!(decoder.states(ctx).len(), 1);
+    assert_eq!(decoder.states(ctx)[0].freq, 16);
     assert_eq!(decoder.contexts[ctx].array_offset, NULL_OFFSET);
 
     let (mut decoder, ctx) = model(&[(b'a', 125), (b'b', 2), (b'c', 1)], 130, 0, 0);
     let old_array = decoder.contexts[ctx].array_offset;
     decoder.rescale().unwrap();
     assert_eq!(
-        decoder.contexts[ctx]
-            .states
+        decoder
+            .states(ctx)
             .iter()
             .map(|s| (s.symbol, s.freq))
             .collect::<Vec<_>>(),
@@ -1330,25 +1298,22 @@ fn frequency_updates_rescale_at_the_reference_call_sites() {
         decoder.max_contexts = 4;
         decoder.init_model(4).unwrap();
         let ctx = decoder
-            .push_context(Context {
-                states: freqs
+            .push_test_context(
+                freqs
                     .iter()
                     .map(|&(symbol, freq)| State {
                         symbol,
                         freq,
                         successor: Successor::None,
                     })
-                    .collect::<Vec<_>>()
-                    .into(),
-                summ_freq: freqs.iter().map(|&(_, freq)| freq as u16).sum::<u16>() + 1,
-                suffix: Some(0),
-                header_offset: NULL_OFFSET,
-                array_offset: NULL_OFFSET,
-            })
+                    .collect::<Vec<_>>(),
+                freqs.iter().map(|&(_, freq)| freq as u16).sum::<u16>() + 1,
+                Some(0),
+            )
             .unwrap()
             .unwrap();
-        for state in &mut decoder.contexts[ctx].states {
-            state.successor = Successor::Context(ctx);
+        for state in decoder.states_mut(ctx) {
+            state.successor = Successor::Context(ctx as u32);
         }
         decoder.min_context = ctx;
         decoder.max_context = ctx;
@@ -1362,28 +1327,28 @@ fn frequency_updates_rescale_at_the_reference_call_sites() {
 
     let (mut decoder, ctx) = model(&[(b'a', 121), (b'b', 1)], 0);
     decoder.update1_0().unwrap();
-    assert_eq!(decoder.contexts[ctx].states.len(), 1);
+    assert_eq!(decoder.states(ctx).len(), 1);
 
     let (mut decoder, ctx) = model(&[(b'a', 1), (b'b', 121)], 1);
     decoder.update1().unwrap();
-    assert_eq!(decoder.contexts[ctx].states.len(), 1);
+    assert_eq!(decoder.states(ctx).len(), 1);
 
     // Variant H rescales update1 only when the selected state moves
     // ahead of its predecessor, even if its frequency now exceeds 124.
     let (mut decoder, ctx) = model(&[(b'a', 125), (b'b', 121)], 1);
     decoder.update1().unwrap();
-    assert_eq!(decoder.contexts[ctx].states[1].freq, 125);
-    assert_eq!(decoder.contexts[ctx].states.len(), 2);
+    assert_eq!(decoder.states(ctx)[1].freq, 125);
+    assert_eq!(decoder.states(ctx).len(), 2);
 
     let (mut decoder, ctx) = model(&[(b'a', 121), (b'b', 1)], 0);
     decoder.update2().unwrap();
-    assert_eq!(decoder.contexts[ctx].states.len(), 1);
+    assert_eq!(decoder.states(ctx).len(), 1);
 
     let (mut decoder, ctx) = model(&[(b'a', 127)], 0);
     decoder.update_bin().unwrap();
-    assert_eq!(decoder.contexts[ctx].states[0].freq, 128);
+    assert_eq!(decoder.states(ctx)[0].freq, 128);
     decoder.update_bin().unwrap();
-    assert_eq!(decoder.contexts[ctx].states[0].freq, 128);
+    assert_eq!(decoder.states(ctx)[0].freq, 128);
 }
 
 #[test]
@@ -1391,9 +1356,8 @@ fn make_esc_freq_rejects_invalid_masked_state_count() {
     let mut decoder = PpmdDecoder::new();
     decoder.init_model(4).unwrap();
     decoder
-        .contexts
-        .push(Context {
-            states: vec![
+        .push_raw_context(
+            vec![
                 State {
                     symbol: b'a',
                     freq: 1,
@@ -1404,13 +1368,10 @@ fn make_esc_freq_rejects_invalid_masked_state_count() {
                     freq: 1,
                     successor: Successor::None,
                 },
-            ]
-            .into(),
-            summ_freq: 2,
-            suffix: Some(0),
-            header_offset: NULL_OFFSET,
-            array_offset: NULL_OFFSET,
-        })
+            ],
+            2,
+            Some(0),
+        )
         .unwrap();
     decoder.min_context = 1;
 
@@ -1425,19 +1386,15 @@ fn update_model_rejects_invalid_frequency_arithmetic() {
     let mut decoder = PpmdDecoder::new();
     decoder.init_model(4).unwrap();
     decoder
-        .contexts
-        .push(Context {
-            states: vec![State {
+        .push_raw_context(
+            vec![State {
                 symbol: b'a',
                 freq: 10,
                 successor: Successor::None,
-            }]
-            .into(),
-            summ_freq: 1,
-            suffix: Some(0),
-            header_offset: NULL_OFFSET,
-            array_offset: NULL_OFFSET,
-        })
+            }],
+            1,
+            Some(0),
+        )
         .unwrap();
     decoder.min_context = 1;
     decoder.max_context = 0;
@@ -1465,23 +1422,11 @@ fn update_model_rejects_zero_frequency_sum_and_unrepresentable_sum() {
         decoder.max_contexts = 10;
         decoder.init_model(4).unwrap();
         let ancestor = decoder
-            .push_context(Context {
-                states: ancestor.into(),
-                summ_freq: ancestor_sum,
-                suffix: Some(0),
-                header_offset: NULL_OFFSET,
-                array_offset: NULL_OFFSET,
-            })
+            .push_test_context(ancestor, ancestor_sum, Some(0))
             .unwrap()
             .unwrap();
         let selected = decoder
-            .push_context(Context {
-                states: selected.into(),
-                summ_freq: selected_sum,
-                suffix: Some(ancestor),
-                header_offset: NULL_OFFSET,
-                array_offset: NULL_OFFSET,
-            })
+            .push_test_context(selected, selected_sum, Some(ancestor))
             .unwrap()
             .unwrap();
         decoder.min_context = selected;
