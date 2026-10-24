@@ -9,6 +9,7 @@ struct StateSnapshot {
     last_length: usize,
     history: Vec<u8>,
     history_capacity: usize,
+    history_window: usize,
 }
 
 fn snapshot<B: Budget>(state: &ReaderState<B>) -> StateSnapshot {
@@ -18,6 +19,7 @@ fn snapshot<B: Budget>(state: &ReaderState<B>) -> StateSnapshot {
         last_length: state.last_length,
         history: state.history.to_vec(),
         history_capacity: state.history.capacity(),
+        history_window: state.history_window,
     }
 }
 
@@ -125,6 +127,7 @@ fn independent_history_unlimited_matches_original_bytes_and_live_decode_state() 
                         assert!(!old_state.history.is_empty());
                         old_state.history.clear();
                         old_state.history_capacity = 0;
+                        old_state.history_window = 0;
                         assert!(actual.history.is_empty());
                         assert_eq!(actual.history.capacity(), 0);
                     }
@@ -314,6 +317,7 @@ fn independent_history_preserves_reader_corruption_and_cancellation_order() {
                         if output.is_ok() {
                             expected_state.history.clear();
                             expected_state.history_capacity = 0;
+                            expected_state.history_window = 0;
                         }
                         assert_eq!(snapshot(&actual), expected_state);
                     }
@@ -423,7 +427,7 @@ fn independent_history_omits_only_final_explicit_buffer_admissions() {
             assert_eq!(output, expected);
             assert_eq!(output.unwrap(), data);
             assert_eq!(old.history.len(), 4096);
-            assert_eq!(old.history.capacity(), 4096);
+            assert_eq!(old.history.capacity(), 4096 + 4096 / 4);
             assert!(actual.history.is_empty());
             assert_eq!(actual.history.capacity(), 0);
             let old = retained.0.lock().unwrap();
@@ -432,7 +436,7 @@ fn independent_history_omits_only_final_explicit_buffer_admissions() {
             assert_eq!(old.len() - actual.len(), omitted);
             assert_eq!(
                 old.iter().sum::<u64>() - actual.iter().sum::<u64>(),
-                omitted as u64 * 4096
+                4096 + 4096 / 4 + if filter.is_some() { 4096 } else { 0 }
             );
             // This observes only explicit Buffer capacity admissions, not every
             // allocator call or whole-chain peak memory.
@@ -479,6 +483,7 @@ fn independent_history_preserves_undersized_window_zero_fill_compatibility() {
         let mut old_state = snapshot(&old);
         old_state.history.clear();
         old_state.history_capacity = 0;
+        old_state.history_window = 0;
         assert_eq!(snapshot(&actual), old_state);
     }
 }

@@ -575,6 +575,8 @@ pub(crate) struct ReaderState<B: Budget> {
     reps: [usize; 4],
     last_length: usize,
     history: Buffer<u8, B>,
+    // Only this tail is reachable. Older bytes may remain as physical slack.
+    history_window: usize,
 }
 
 impl<B: Budget> ReaderState<B> {
@@ -588,7 +590,21 @@ impl<B: Budget> ReaderState<B> {
             reps: [0; 4],
             last_length: 0,
             history: Buffer::new(allowance),
+            history_window: 0,
         }
+    }
+
+    fn reachable_history(&self) -> &[u8] {
+        debug_assert!(self.history_window <= self.history.len());
+        &self.history[self.history.len() - self.history_window..]
+    }
+
+    #[cfg(test)]
+    fn with_history(history: Buffer<u8, B>) -> Self {
+        let mut state = Self::new(&history.allowance());
+        state.history_window = history.len();
+        state.history = history;
+        state
     }
 
     pub(crate) fn try_clone(&self) -> Result<Self> {
@@ -609,6 +625,7 @@ impl<B: Budget> ReaderState<B> {
                 .transpose()?,
             reps: self.reps,
             last_length: self.last_length,
+            history_window: self.history_window,
             history: if preserve_capacity {
                 // Solid streaming checkpoints otherwise discard geometric spare
                 // capacity and grow again after each member. Keep the capacity
@@ -616,13 +633,13 @@ impl<B: Budget> ReaderState<B> {
                 let mut history =
                     Buffer::with_capacity(self.history.capacity(), &self.history.allowance())?;
                 history
-                    .extend_from_slice(&self.history)
+                    .extend_from_slice(self.reachable_history())
                     .map_err(Into::into)?;
                 history
             } else {
-                // Public clones and bounded streaming checkpoints retain their
-                // existing allocation charge and refusal boundary.
-                Buffer::copied(&self.history, &self.history.allowance())?
+                // Slack is not reachable history and need not be checkpointed.
+                // Bounded histories have no slack, preserving their old charge.
+                Buffer::copied(self.reachable_history(), &self.history.allowance())?
             },
         })
     }
@@ -950,10 +967,11 @@ impl<B: Budget> ReaderState<B> {
         // up front. It does, however, retain every byte that a legal match may
         // reference instead of silently truncating the window at 64 MiB.
         let history_limit = dictionary_size;
-        if self.history.len() > history_limit {
-            let discard = self.history.len() - history_limit;
-            self.history.discard_prefix(discard);
-        }
+        let retained = self.history_window.min(history_limit);
+        self.history.discard_prefix(self.history.len() - retained);
+        // The buffer is moved out below. Keep the empty state consistent even
+        // if streaming setup or decoding fails; callers checkpoint as needed.
+        self.history_window = 0;
         let mut output = StreamingOutput::new(
             {
                 let allowance = self.history.allowance();
@@ -1074,6 +1092,7 @@ impl<B: Budget> ReaderState<B> {
         if output.written() == output_size {
             output.finish(&mut sink)?;
             self.history = output.into_history();
+            self.history_window = self.history.len();
             Ok(())
         } else {
             Err(Error::NeedMoreInput.into())
@@ -1082,25 +1101,45 @@ impl<B: Budget> ReaderState<B> {
 
     fn remember_history(&mut self, output: &[u8], dictionary_size: usize) -> Result<()> {
         let incoming = &output[output.len().saturating_sub(dictionary_size)..];
-        let keep = self.history.len().min(dictionary_size - incoming.len());
+        let keep = self.history_window.min(dictionary_size - incoming.len());
         let required = keep + incoming.len();
-        if self.history.capacity() > dictionary_size || self.history.capacity() < required {
-            // Allocate only the retained tail, never the whole member. Replace
-            // oversized storage when the active dictionary shrinks as well.
-            let capacity =
-                reader_history_capacity(self.history.capacity(), required, dictionary_size);
+        let limit = reader_history_limit::<B>(dictionary_size);
+        let capacity = self.history.capacity();
+
+        // Unlimited readers amortize moves across small members. Bounded
+        // readers retain the original exact-window growth and peak charge.
+        if !B::LIMITED
+            && incoming.len() < dictionary_size
+            && capacity <= limit
+            && self.history.len() + incoming.len() <= capacity
+        {
+            self.history
+                .extend_from_slice(incoming)
+                .map_err(Into::into)?;
+        } else if capacity <= limit
+            && capacity >= required
+            && (B::LIMITED || capacity == limit || incoming.len() == dictionary_size)
+        {
+            // Compact a full slack buffer in place. A full incoming dictionary
+            // replaces every old byte, including any discontinuous prefix.
+            self.history.discard_prefix(self.history.len() - keep);
+            self.history
+                .extend_from_slice(incoming)
+                .map_err(Into::into)?;
+        } else {
+            // Admit the replacement before touching the old window. Growing
+            // toward the slack limit avoids moving a full dictionary per file.
+            let capacity = reader_history_capacity::<B>(capacity, required, dictionary_size);
             let mut history = Buffer::with_capacity(capacity, &self.history.allowance())?;
             history
                 .extend_from_slice(&self.history[self.history.len() - keep..])
                 .map_err(Into::into)?;
             history.extend_from_slice(incoming).map_err(Into::into)?;
             self.history = history;
-        } else {
-            self.history.discard_prefix(self.history.len() - keep);
-            self.history
-                .extend_from_slice(incoming)
-                .map_err(Into::into)?;
         }
+        // Physical slack must never become reachable when a later member
+        // declares a larger dictionary.
+        self.history_window = required;
         Ok(())
     }
 
@@ -1109,6 +1148,7 @@ impl<B: Budget> ReaderState<B> {
         self.reps = [0; 4];
         self.last_length = 0;
         self.history.clear();
+        self.history_window = 0;
     }
 
     fn copy_match(
@@ -1134,7 +1174,7 @@ impl<B: Budget> ReaderState<B> {
         // fails its file hash.
         if distance == 0
             || distance > dictionary_size
-            || distance > self.history.len() + output.len()
+            || distance > self.history_window + output.len()
         {
             output.resize(output.len() + length, 0)?;
             return Ok(());
@@ -1178,13 +1218,37 @@ impl<B: Budget> ReaderState<B> {
     }
 }
 
-// Preserve amortized growth without letting a retained dictionary allocation
-// grow to the member size or keep a previous, larger dictionary alive.
-fn reader_history_capacity(current: usize, required: usize, limit: usize) -> usize {
-    if current > limit {
-        required
+// Bounded readers keep the original allocation and refusal policy. Unlimited
+// readers keep a quarter dictionary of spare storage across both decode paths.
+fn reader_history_limit<B: Budget>(dictionary_size: usize) -> usize {
+    if B::LIMITED {
+        dictionary_size
+    } else {
+        dictionary_size.saturating_add(dictionary_size / 4)
+    }
+}
+
+fn reader_history_capacity<B: Budget>(
+    current: usize,
+    required: usize,
+    dictionary_size: usize,
+) -> usize {
+    let limit = reader_history_limit::<B>(dictionary_size);
+    let capacity = if current > limit {
+        if B::LIMITED {
+            required
+        } else {
+            // A reset can leave a large allocation with little live history.
+            // Start small again instead of preallocating the new dictionary.
+            required.max(8).min(limit)
+        }
     } else {
         required.max(current.saturating_mul(2)).max(8).min(limit)
+    };
+    if !B::LIMITED && capacity >= dictionary_size {
+        limit
+    } else {
+        capacity
     }
 }
 
@@ -1206,8 +1270,14 @@ impl<B: Budget> StreamingOutput<B> {
         dictionary_size: usize,
         history_limit: usize,
     ) -> Result<Self> {
-        if history.capacity() > history_limit {
-            history = Buffer::copied(&history, &history.allowance())?;
+        if history.capacity() > reader_history_limit::<B>(history_limit) {
+            let capacity =
+                reader_history_capacity::<B>(history.capacity(), history.len(), history_limit);
+            let mut replacement = Buffer::with_capacity(capacity, &history.allowance())?;
+            replacement
+                .extend_from_slice(&history)
+                .map_err(Into::into)?;
+            history = replacement;
         }
         let allowance = history.allowance();
         Ok(Self {
@@ -1396,9 +1466,11 @@ impl<B: Budget> StreamingOutput<B> {
         let incoming = &self.pending[self.pending.len().saturating_sub(self.history_limit)..];
         let keep = self.history.len().min(self.history_limit - incoming.len());
         let required = keep + incoming.len();
-        if self.history.capacity() > self.history_limit || self.history.capacity() < required {
+        if self.history.capacity() > reader_history_limit::<B>(self.history_limit)
+            || self.history.capacity() < required
+        {
             let capacity =
-                reader_history_capacity(self.history.capacity(), required, self.history_limit);
+                reader_history_capacity::<B>(self.history.capacity(), required, self.history_limit);
             let mut history =
                 super::workspace::Deque::with_capacity(capacity, &self.history.allowance())?;
             history.extend_admitted(self.history.iter().skip(self.history.len() - keep).copied());
@@ -2145,3 +2217,6 @@ mod history_retention_tests;
 
 #[cfg(test)]
 mod bit_lookup_tests;
+#[cfg(test)]
+#[path = "rar50/history_window_tests.rs"]
+mod history_window_tests;

@@ -1228,8 +1228,11 @@ fn matched_member_streams_across_flush_and_history_boundaries() {
             .chain([513])
             .collect::<Vec<_>>()
     );
-    assert_eq!(decoder.base_offset, input.len() - MAX_HISTORY);
-    assert_eq!(decoder.output.len(), MAX_HISTORY);
+    // History keeps up to a quarter window of slack: the whole window is
+    // retained, and at most that much more.
+    assert_eq!(decoder.base_offset + decoder.output.len(), input.len());
+    assert!(decoder.output.len() >= MAX_HISTORY);
+    assert!(decoder.output.len() <= MAX_HISTORY + MAX_HISTORY / 4);
     assert!(decoder.pending_match.is_none());
 }
 
@@ -1244,37 +1247,44 @@ fn solid_follower_can_match_the_oldest_retained_history() {
             state as u8
         })
         .collect();
-    let mut first = vec![b'X'; 17];
-    first.extend_from_slice(&marker);
-    first.resize(MAX_HISTORY + 17, b'Z');
+    for prefix in [17, MAX_HISTORY / 4] {
+        let mut first = vec![b'X'; prefix];
+        first.extend_from_slice(&marker);
+        first.resize(MAX_HISTORY + prefix, b'Z');
 
-    let options = EncodeOptions::default().with_max_match_distance(MAX_HISTORY);
-    let mut encoder = Unpack29Encoder::with_options(options);
-    let first_packed = encoder.encode_member(&first).unwrap();
-    assert_eq!(encoder.history.len(), MAX_HISTORY);
-    assert_eq!(&encoder.history[..marker.len()], marker);
+        let options = EncodeOptions::default().with_max_match_distance(MAX_HISTORY);
+        let mut encoder = Unpack29Encoder::with_options(options);
+        let first_packed = encoder.encode_member(&first).unwrap();
+        assert_eq!(encoder.history.len(), MAX_HISTORY);
+        assert_eq!(&encoder.history[..marker.len()], marker);
 
-    let follower_tokens = encode_tokens(&marker, &encoder.history, options);
-    assert!(follower_tokens.iter().any(|token| matches!(
-        token,
-        EncodeToken::Match { offset, .. } if *offset == MAX_HISTORY
-    )));
-    let follower_packed = encoder.encode_member(&marker).unwrap();
+        let follower_tokens = encode_tokens(&marker, &encoder.history, options);
+        assert!(follower_tokens.iter().any(|token| matches!(
+            token,
+            EncodeToken::Match { offset, .. } if *offset == MAX_HISTORY
+        )));
+        let follower_packed = encoder.encode_member(&marker).unwrap();
 
-    let mut decoder = Unpack29::new();
-    assert_eq!(
-        decoder.decode_member(&first_packed, first.len()).unwrap(),
-        first
-    );
-    assert_eq!(decoder.base_offset, 17);
-    assert_eq!(
-        decoder
-            .decode_member(&follower_packed, marker.len())
-            .unwrap(),
-        marker
-    );
-    assert_eq!(decoder.output.len(), MAX_HISTORY);
-    assert_eq!(decoder.base_offset, 17 + marker.len());
+        let mut decoder = Unpack29::new();
+        assert_eq!(
+            decoder.decode_member(&first_packed, first.len()).unwrap(),
+            first
+        );
+        let expected_base = if prefix < MAX_HISTORY / 4 { 0 } else { prefix };
+        assert_eq!(decoder.base_offset, expected_base);
+        assert_eq!(decoder.output.len(), first.len() - expected_base);
+        assert_eq!(
+            decoder
+                .decode_member(&follower_packed, marker.len())
+                .unwrap(),
+            marker
+        );
+        assert_eq!(decoder.base_offset, expected_base);
+        assert_eq!(
+            decoder.output.len(),
+            first.len() + marker.len() - expected_base
+        );
+    }
 }
 
 #[test]
@@ -1290,7 +1300,9 @@ fn block_encoder_trims_local_history_at_the_dictionary_boundary() {
     assert_eq!(decoder.decode_member(&packed, 2).unwrap(), b"AB");
     assert_eq!(encoder.history.len(), MAX_HISTORY);
     assert_eq!(&encoder.history[MAX_HISTORY - 2..], b"AB");
-    assert_eq!(&decoder.output[MAX_HISTORY - 2..], b"AB");
+    // The decoder keeps some slack past the window, so "AB" ends its buffer
+    // rather than sitting at fixed positions.
+    assert!(decoder.output.ends_with(b"AB"));
 }
 
 #[test]
@@ -1387,8 +1399,11 @@ fn a_future_filter_stays_scheduled_until_its_range_is_published() {
 
 #[test]
 fn history_trimming_discards_stale_filters_and_keeps_future_filters() {
+    // History is trimmed only once a quarter window can go, so the test
+    // trims exactly that much.
+    let slack = MAX_HISTORY / 4;
     let mut decoder = Unpack29::new();
-    decoder.output.resize(MAX_HISTORY + 64, 0).unwrap();
+    decoder.output.resize(MAX_HISTORY + slack, 0).unwrap();
     decoder
         .programs
         .push(VmProgram {
@@ -1412,20 +1427,28 @@ fn history_trimming_discards_stale_filters_and_keeps_future_filters() {
         .filters
         .push(VmFilter {
             program: 0,
-            start: 128,
+            start: slack + 128,
             size: 8,
             regs: [0; 7],
             global_data: Vec::new().into(),
         })
         .unwrap();
 
+    // Less than the slack: nothing moves, both filters stay.
     decoder.trim_history(MAX_HISTORY + 64, MAX_HISTORY + 64);
+    assert_eq!(decoder.base_offset, 0);
+    assert_eq!(decoder.filters.len(), 2);
 
-    assert_eq!(decoder.base_offset, 64);
+    decoder.trim_history(MAX_HISTORY + slack, MAX_HISTORY + slack);
+
+    assert_eq!(decoder.base_offset, slack);
     assert_eq!(decoder.output.len(), MAX_HISTORY);
     assert_eq!(decoder.filters.len(), 1);
-    assert_eq!(decoder.filters[0].start, 128);
-    assert_eq!(decoder.filtered_range(64, 136, 0).unwrap(), vec![0; 72]);
+    assert_eq!(decoder.filters[0].start, slack + 128);
+    assert_eq!(
+        decoder.filtered_range(slack + 64, slack + 136, 0).unwrap(),
+        vec![0; 72]
+    );
     assert!(decoder.filters.is_empty());
 }
 
@@ -1437,7 +1460,9 @@ fn solid_ppmd_match_rejects_distance_beyond_retained_history() {
     decoder
         .decode_non_solid_member_to(&packed, input.len(), &mut std::io::sink())
         .unwrap();
-    assert_eq!(decoder.base_offset, 64);
+    // With the history's slack the bytes past the window may still be held;
+    // the distance is refused for being past the window.
+    assert_eq!(decoder.base_offset, 0);
 
     let mut encoder = PpmdEncoder::new(PPMD_ORDER, PPMD_ESC, 1).unwrap();
     encoder.encode_match(MAX_HISTORY + 1, 32).unwrap();

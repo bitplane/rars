@@ -57,7 +57,20 @@ fn update_raw_byte(crc: u32, byte: u8) -> u32 {
     (crc >> 8) ^ table_entry((crc as u8) ^ byte)
 }
 
-fn update_raw(mut crc: u32, mut input: &[u8]) -> u32 {
+// Every extracted byte goes through here. crc32fast uses the CPU's CRC
+// instructions where there are any (ARMv8 CRC32, x86 PCLMULQDQ) and tables
+// where not; short inputs keep the tables below, which cost less than
+// setting it up.
+fn update_raw(crc: u32, input: &[u8]) -> u32 {
+    if input.len() < 64 {
+        return update_raw_tables(crc, input);
+    }
+    let mut hasher = crc32fast::Hasher::new_with_initial(!crc);
+    hasher.update(input);
+    !hasher.finalize()
+}
+
+fn update_raw_tables(mut crc: u32, mut input: &[u8]) -> u32 {
     while input.len() >= 8 {
         let word = u32::from_le_bytes([input[0], input[1], input[2], input[3]]);
         crc ^= word;

@@ -31,6 +31,7 @@ encryption = ["dep:aes", "dep:hmac", "dep:sha1", "dep:sha2", "dep:zeroize"]
 [dependencies]
 aes = { workspace = true, optional = true }
 aho-corasick.workspace = true
+crc32fast.workspace = true
 getrandom = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 sha1 = { workspace = true, optional = true }
