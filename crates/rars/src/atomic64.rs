@@ -5,10 +5,10 @@
 //! those targets get a mutex with the same interface instead.
 
 #[cfg(target_has_atomic = "64")]
-pub(crate) use std::sync::atomic::AtomicU64;
+pub use std::sync::atomic::AtomicU64;
 
 #[cfg(not(target_has_atomic = "64"))]
-pub(crate) use fallback::AtomicU64;
+pub use fallback::AtomicU64;
 
 // Also built for tests so 64-bit hosts exercise it.
 #[cfg(any(test, not(target_has_atomic = "64")))]
@@ -17,12 +17,12 @@ mod fallback {
     use std::sync::Mutex;
 
     #[derive(Debug, Default)]
-    pub(crate) struct AtomicU64(Mutex<u64>);
+    pub struct AtomicU64(Mutex<u64>);
 
     // Which methods are live depends on the enabled features.
     #[allow(dead_code)]
     impl AtomicU64 {
-        pub(crate) const fn new(value: u64) -> Self {
+        pub const fn new(value: u64) -> Self {
             Self(Mutex::new(value))
         }
 
@@ -32,29 +32,40 @@ mod fallback {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
         }
 
-        pub(crate) fn load(&self, _: Ordering) -> u64 {
+        pub fn load(&self, _: Ordering) -> u64 {
             *self.lock()
         }
 
-        pub(crate) fn store(&self, value: u64, _: Ordering) {
+        pub fn store(&self, value: u64, _: Ordering) {
             *self.lock() = value;
         }
 
-        pub(crate) fn fetch_add(&self, value: u64, _: Ordering) -> u64 {
+        pub fn fetch_add(&self, value: u64, _: Ordering) -> u64 {
             let mut current = self.lock();
             let previous = *current;
             *current = previous.wrapping_add(value);
             previous
         }
 
-        pub(crate) fn fetch_sub(&self, value: u64, _: Ordering) -> u64 {
+        pub fn fetch_sub(&self, value: u64, _: Ordering) -> u64 {
             let mut current = self.lock();
             let previous = *current;
             *current = previous.wrapping_sub(value);
             previous
         }
 
-        pub(crate) fn compare_exchange_weak(
+        pub fn swap(&self, value: u64, _: Ordering) -> u64 {
+            std::mem::replace(&mut *self.lock(), value)
+        }
+
+        pub fn fetch_max(&self, value: u64, _: Ordering) -> u64 {
+            let mut current = self.lock();
+            let previous = *current;
+            *current = (*current).max(value);
+            previous
+        }
+
+        pub fn compare_exchange_weak(
             &self,
             expected: u64,
             new: u64,
@@ -93,6 +104,17 @@ mod fallback {
             assert_eq!(value.compare_exchange_weak(6, 9, AcqRel, Acquire), Err(7));
             assert_eq!(value.compare_exchange_weak(7, 9, AcqRel, Acquire), Ok(7));
             assert_eq!(value.load(Relaxed), 9);
+        }
+
+        #[test]
+        fn swap_and_fetch_max_preserve_64_bit_values() {
+            let large = 1u64 << 40;
+            let value = AtomicU64::new(large);
+            assert_eq!(value.fetch_max(large - 1, Relaxed), large);
+            assert_eq!(value.load(Relaxed), large);
+            assert_eq!(value.fetch_max(large + 1, Relaxed), large);
+            assert_eq!(value.swap(large + 2, Relaxed), large + 1);
+            assert_eq!(value.load(Relaxed), large + 2);
         }
 
         #[test]

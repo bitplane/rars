@@ -2644,7 +2644,7 @@ fn parentless_output_path_uses_default_resources_and_publishes_readable_archives
             let _ = std::fs::remove_file(&self.0);
         }
     }
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static NEXT: crate::atomic64::AtomicU64 = crate::atomic64::AtomicU64::new(0);
     let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let destination = Destination(std::path::PathBuf::from(format!(
         ".rars-parentless-test-{}-{sequence}.rar",

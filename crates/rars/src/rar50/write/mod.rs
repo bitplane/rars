@@ -1975,7 +1975,7 @@ mod tests {
         let entry = entry(b"payload.bin", &data)
             .with_attributes(0x20)
             .with_host_os(1);
-        let last = std::sync::atomic::AtomicU64::new(0);
+        let last = crate::atomic64::AtomicU64::new(0);
         let advances = AtomicUsize::new(0);
         let intermediate = std::sync::atomic::AtomicBool::new(false);
         let reporter = |event: WriteProgressEvent<'_>| {

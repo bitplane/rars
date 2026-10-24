@@ -30,7 +30,9 @@ mod test_features;
 #[path = "../tests/support/read_errors.rs"]
 mod read_errors;
 
-mod atomic64;
+// Shared with the CLI and bindings; not part of the supported archive API.
+#[doc(hidden)]
+pub mod atomic64;
 #[cfg(feature = "write")]
 pub mod builder;
 #[doc(hidden)]

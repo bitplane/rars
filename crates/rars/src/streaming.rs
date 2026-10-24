@@ -3,12 +3,12 @@ use crate::{Error, Result};
 mod memory_spool;
 pub(crate) mod output;
 pub(crate) mod preparation;
+#[cfg(test)]
+use crate::atomic64::AtomicU64;
 use std::fmt;
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 

@@ -145,6 +145,27 @@ jobs:
       - name: Check full library
         run: cargo check -p rars --lib --locked --target '${{ matrix.target }}'
 
+  portable-atomics:
+    name: Library and CLI without 64-bit atomics
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: 1
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: powerpc-unknown-linux-gnu
+      # Criterion's alloca dependency builds C even during cargo check.
+      - name: Install PowerPC C compiler
+        run: sudo apt-get update && sudo apt-get install -y gcc-powerpc-linux-gnu
+      # Compile the binary and tests on a target that exercises the mutex
+      # fallback, without needing an emulator to run them.
+      - name: Check library, CLI and tests
+        run: cargo check -p rars -p rars-cli --all-targets --locked --target powerpc-unknown-linux-gnu
+
   unit-features:
     name: Library unit features (${{ matrix.features }})
     runs-on: ubuntu-latest

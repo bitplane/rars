@@ -1444,10 +1444,11 @@ mod tests {
         assert_eq!(check(&file, 24, false), Error::TooShort);
     }
     use super::*;
+    use crate::atomic64::AtomicU64;
     use crate::codec::rar13::{find_long_lz, LongLz};
     use std::cell::RefCell;
     use std::rc::Rc;
-    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct CollectWriter(Rc<RefCell<Vec<u8>>>);
 

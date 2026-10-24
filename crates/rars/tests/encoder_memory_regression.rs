@@ -6,12 +6,13 @@
 #[path = "support/scratch.rs"]
 mod scratch;
 
+use rars::atomic64::AtomicU64;
 use rars::rar50::{self, ArchiveEntry, ArchiveExtras, FilterPolicy, WriterOptions};
 use rars::{
     ArchiveReader, ArchiveVersion, Builder, EntrySource, ErrorKind, FeatureSet, WriteOperation,
     WriteProgress, WriteProgressEvent, WriterResources,
 };
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const KIB: usize = 1024;
 const MIB: u64 = 1024 * 1024;

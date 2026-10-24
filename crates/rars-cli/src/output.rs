@@ -1,5 +1,6 @@
 use crate::time::extracted_system_time;
 use crate::CliResult;
+use rars::atomic64::AtomicU64;
 use rars::{
     Archive as DetectedArchive, ArchiveFamily, ArchiveVersion, AttrSource, Error,
     ExtractedEntryMeta,
@@ -7,7 +8,7 @@ use rars::{
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 
 /// Private, same-filesystem storage for a verified extraction's pending outputs.
