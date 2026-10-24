@@ -1247,39 +1247,44 @@ fn solid_follower_can_match_the_oldest_retained_history() {
             state as u8
         })
         .collect();
-    let mut first = vec![b'X'; 17];
-    first.extend_from_slice(&marker);
-    first.resize(MAX_HISTORY + 17, b'Z');
+    for prefix in [17, MAX_HISTORY / 4] {
+        let mut first = vec![b'X'; prefix];
+        first.extend_from_slice(&marker);
+        first.resize(MAX_HISTORY + prefix, b'Z');
 
-    let options = EncodeOptions::default().with_max_match_distance(MAX_HISTORY);
-    let mut encoder = Unpack29Encoder::with_options(options);
-    let first_packed = encoder.encode_member(&first).unwrap();
-    assert_eq!(encoder.history.len(), MAX_HISTORY);
-    assert_eq!(&encoder.history[..marker.len()], marker);
+        let options = EncodeOptions::default().with_max_match_distance(MAX_HISTORY);
+        let mut encoder = Unpack29Encoder::with_options(options);
+        let first_packed = encoder.encode_member(&first).unwrap();
+        assert_eq!(encoder.history.len(), MAX_HISTORY);
+        assert_eq!(&encoder.history[..marker.len()], marker);
 
-    let follower_tokens = encode_tokens(&marker, &encoder.history, options);
-    assert!(follower_tokens.iter().any(|token| matches!(
-        token,
-        EncodeToken::Match { offset, .. } if *offset == MAX_HISTORY
-    )));
-    let follower_packed = encoder.encode_member(&marker).unwrap();
+        let follower_tokens = encode_tokens(&marker, &encoder.history, options);
+        assert!(follower_tokens.iter().any(|token| matches!(
+            token,
+            EncodeToken::Match { offset, .. } if *offset == MAX_HISTORY
+        )));
+        let follower_packed = encoder.encode_member(&marker).unwrap();
 
-    let mut decoder = Unpack29::new();
-    assert_eq!(
-        decoder.decode_member(&first_packed, first.len()).unwrap(),
-        first
-    );
-    // With the history's slack the 17 bytes past the window need not be
-    // trimmed yet; the match at exactly the window still works.
-    assert!(decoder.base_offset <= 17);
-    assert_eq!(
-        decoder
-            .decode_member(&follower_packed, marker.len())
-            .unwrap(),
-        marker
-    );
-    assert!(decoder.output.len() >= MAX_HISTORY);
-    assert!(decoder.base_offset <= 17 + marker.len());
+        let mut decoder = Unpack29::new();
+        assert_eq!(
+            decoder.decode_member(&first_packed, first.len()).unwrap(),
+            first
+        );
+        let expected_base = if prefix < MAX_HISTORY / 4 { 0 } else { prefix };
+        assert_eq!(decoder.base_offset, expected_base);
+        assert_eq!(decoder.output.len(), first.len() - expected_base);
+        assert_eq!(
+            decoder
+                .decode_member(&follower_packed, marker.len())
+                .unwrap(),
+            marker
+        );
+        assert_eq!(decoder.base_offset, expected_base);
+        assert_eq!(
+            decoder.output.len(),
+            first.len() + marker.len() - expected_base
+        );
+    }
 }
 
 #[test]
@@ -1457,7 +1462,7 @@ fn solid_ppmd_match_rejects_distance_beyond_retained_history() {
         .unwrap();
     // With the history's slack the bytes past the window may still be held;
     // the distance is refused for being past the window.
-    assert!(decoder.base_offset <= 64);
+    assert_eq!(decoder.base_offset, 0);
 
     let mut encoder = PpmdEncoder::new(PPMD_ORDER, PPMD_ESC, 1).unwrap();
     encoder.encode_match(MAX_HISTORY + 1, 32).unwrap();
