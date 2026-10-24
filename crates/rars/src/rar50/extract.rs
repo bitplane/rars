@@ -476,11 +476,9 @@ impl FileHeader {
                         "RAR 5 encrypted stored file is shorter than unpacked size",
                     ));
                 }
-                if packed[unpacked_size..].iter().any(|&byte| byte != 0) {
-                    return Err(Error::InvalidHeader(
-                        "RAR 5 encrypted stored file has non-zero padding",
-                    ));
-                }
+                // The cipher block's padding holds whatever the packer left
+                // there; WinRAR leaves random bytes, and unrar writes the
+                // unpacked size without reading them.
                 return Buffer::copied(&packed[..unpacked_size], &decoder.allowance())
                     .map_err(Error::from);
             }
@@ -633,13 +631,9 @@ impl FileHeader {
             let remaining =
                 usize::try_from(self.unpacked_size.saturating_sub(written)).unwrap_or(usize::MAX);
             let chunk_len = count.min(remaining);
+            // Past the unpacked size is the cipher block's padding, which
+            // may hold any bytes; only the unpacked bytes are written.
             let chunk = &buf[..chunk_len];
-            if self.encrypted && buf[chunk_len..count].iter().any(|&byte| byte != 0) {
-                return Err(self.entry_error(
-                    "decoding",
-                    Error::InvalidHeader("RAR 5 encrypted stored file has non-zero padding"),
-                ));
-            }
             // chunk_len is bounded by unpacked_size - written, so this sum
             // cannot exceed the declared u64 size, including u64::MAX.
             written += chunk.len() as u64;
@@ -1660,12 +1654,9 @@ impl<B: Budget> PendingSplitRefs<B> {
             let chunk = if final_file.encrypted {
                 let remaining = usize::try_from(final_file.unpacked_size.saturating_sub(written))
                     .unwrap_or(usize::MAX);
+                // The padding after the unpacked size may hold any bytes, as
+                // unrar accepts.
                 let chunk_len = count.min(remaining);
-                if buf[chunk_len..count].iter().any(|&byte| byte != 0) {
-                    return Err(Error::InvalidHeader(
-                        "RAR 5 encrypted stored split file has non-zero padding",
-                    ));
-                }
                 &buf[..chunk_len]
             } else {
                 &buf[..count]
@@ -2914,23 +2905,19 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_stored_decode_rejects_nonzero_discarded_padding() {
+    fn encrypted_stored_decode_discards_padding_whatever_it_holds() {
         let mut file = plain_file(b"secret.txt", b"secret", None);
         file.encrypted = true;
         file.unpacked_size = 6;
         let mut decoder = ReaderState::new(&Allowance::default());
 
-        assert_eq!(
-            file.decode_packed_with_decoder(b"secret\0\0", &mut decoder)
-                .unwrap(),
-            b"secret"
-        );
-        assert!(matches!(
-            file.decode_packed_with_decoder(b"secret\0\x01", &mut decoder),
-            Err(Error::InvalidHeader(
-                "RAR 5 encrypted stored file has non-zero padding"
-            ))
-        ));
+        for packed in [&b"secret\0\0"[..], b"secret\0\x01", b"secret\x6f\x46"] {
+            assert_eq!(
+                file.decode_packed_with_decoder(packed, &mut decoder)
+                    .unwrap(),
+                b"secret"
+            );
+        }
     }
 
     #[cfg(target_pointer_width = "32")]

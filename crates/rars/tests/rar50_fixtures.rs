@@ -299,7 +299,9 @@ fn deterministic_noise(len: usize) -> Vec<u8> {
         .collect()
 }
 
-fn corrupt_encrypted_stored_padding(bytes: &mut [u8], password: &[u8]) {
+/// Fills the cipher-block padding after the unpacked data with non-zero
+/// bytes, as WinRAR does, and re-encrypts it.
+fn fill_encrypted_stored_padding(bytes: &mut [u8], password: &[u8]) {
     let archive = Archive::parse(bytes).unwrap();
     let file = archive.files().next().unwrap();
     let encryption = file.encryption.as_ref().unwrap();
@@ -310,14 +312,15 @@ fn corrupt_encrypted_stored_padding(bytes: &mut [u8], password: &[u8]) {
         .decrypt_in_place(&mut plaintext)
         .unwrap();
     assert!(file.unpacked_size < plaintext.len() as u64);
-    plaintext[file.unpacked_size as usize] = 1;
+    fill_padding(&mut plaintext[file.unpacked_size as usize..]);
     Rar50Cipher::new(keys.key, encryption.iv)
         .encrypt_in_place(&mut plaintext)
         .unwrap();
     bytes[range].copy_from_slice(&plaintext);
 }
 
-fn corrupt_encrypted_stored_split_padding(volumes: &mut [Vec<u8>], password: &[u8]) {
+/// The split-volume form of [`fill_encrypted_stored_padding`].
+fn fill_encrypted_stored_split_padding(volumes: &mut [Vec<u8>], password: &[u8]) {
     let archives = volumes
         .iter()
         .map(|bytes| Archive::parse(bytes).unwrap())
@@ -339,7 +342,7 @@ fn corrupt_encrypted_stored_split_padding(volumes: &mut [Vec<u8>], password: &[u
         .decrypt_in_place(&mut plaintext)
         .unwrap();
     assert!(final_file.unpacked_size < plaintext.len() as u64);
-    plaintext[final_file.unpacked_size as usize] = 1;
+    fill_padding(&mut plaintext[final_file.unpacked_size as usize..]);
     Rar50Cipher::new(keys.key, encryption.iv)
         .encrypt_in_place(&mut plaintext)
         .unwrap();
@@ -349,6 +352,12 @@ fn corrupt_encrypted_stored_split_padding(volumes: &mut [Vec<u8>], password: &[u
         let len = range.len();
         volume[range].copy_from_slice(&plaintext[offset..offset + len]);
         offset += len;
+    }
+}
+
+fn fill_padding(padding: &mut [u8]) {
+    for (index, byte) in padding.iter_mut().enumerate() {
+        *byte = (0x6f ^ (index as u8).wrapping_mul(0x3b)) | 1;
     }
 }
 
@@ -4553,7 +4562,7 @@ fn extracts_rar50_solid_archive() {
 }
 
 #[test]
-fn rejects_nonzero_encrypted_stored_padding_in_streaming_extraction() {
+fn accepts_nonzero_encrypted_stored_padding_in_streaming_extraction() {
     let payload = b"encrypted stored RAR5 padding check";
     let entries = [entry(b"secret.txt", payload)
         .with_mtime(Some(0x5a21_0000))
@@ -4566,20 +4575,13 @@ fn rejects_nonzero_encrypted_stored_padding_in_streaming_extraction() {
         rar50::WriterOptions::new(ArchiveVersion::Rar50, features),
     )
     .unwrap();
-    corrupt_encrypted_stored_padding(&mut bytes, b"password");
+    fill_encrypted_stored_padding(&mut bytes, b"password");
 
     let archive = Archive::parse(&bytes).unwrap();
-    assert!(matches!(
-        collect_extract_with_password(&archive, Some(b"password")),
-        Err(Error::AtEntry {
-            name,
-            operation: "decoding",
-            source
-        }) if name == b"secret.txt"
-            && matches!(*source, Error::InvalidHeader(
-                "RAR 5 encrypted stored file has non-zero padding"
-            ))
-    ));
+    let extracted = collect_extract_with_password(&archive, Some(b"password")).unwrap();
+    assert_eq!(extracted.len(), 1);
+    assert_eq!(extracted[0].name, b"secret.txt");
+    assert_eq!(extracted[0].data, payload);
 }
 
 #[test]
@@ -4924,7 +4926,7 @@ fn extracts_rar50_compressed_split_streams_and_preserves_failure_kinds() {
 }
 
 #[test]
-fn rejects_nonzero_encrypted_stored_padding_in_split_streaming_extraction() {
+fn accepts_nonzero_encrypted_stored_padding_in_split_streaming_extraction() {
     let data = b"encrypted stored split RAR5 padding check".repeat(3);
     let entry = entry(b"split-secret.txt", &data)
         .with_mtime(Some(0x5a21_0000))
@@ -4939,23 +4941,16 @@ fn rejects_nonzero_encrypted_stored_padding_in_split_streaming_extraction() {
         None,
     )
     .unwrap();
-    corrupt_encrypted_stored_split_padding(&mut volumes, b"password");
+    fill_encrypted_stored_split_padding(&mut volumes, b"password");
     let archives = volumes
         .iter()
         .map(|bytes| Archive::parse(bytes).unwrap())
         .collect::<Vec<_>>();
 
-    assert!(matches!(
-        collect_extract_volumes_with_password(&archives, Some(b"password")),
-        Err(Error::AtEntry {
-            name,
-            operation: "extracting",
-            source
-        }) if name == b"split-secret.txt"
-            && matches!(*source, Error::InvalidHeader(
-                "RAR 5 encrypted stored split file has non-zero padding"
-            ))
-    ));
+    let extracted = collect_extract_volumes_with_password(&archives, Some(b"password")).unwrap();
+    assert_eq!(extracted.len(), 1);
+    assert_eq!(extracted[0].name, b"split-secret.txt");
+    assert_eq!(extracted[0].data, data);
 }
 
 #[test]

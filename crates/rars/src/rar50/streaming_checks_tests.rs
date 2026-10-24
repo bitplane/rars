@@ -292,12 +292,14 @@ fn ordinary_encrypted_streaming_preserves_crc_mac_hash_mac_padding_and_truncatio
             Error::InvalidHeader("RAR 5 encrypted file payload is not block aligned")
         ));
         if stored {
-            let mut padding = bad_hash;
-            padding.unpacked_size -= 1;
-            let error = ordinary(&archive, &padding).0.unwrap_err();
+            // A data byte past the unpacked size counts as padding, which
+            // holds anything; the hash over the shorter data refuses it.
+            let mut short = original.clone();
+            short.unpacked_size -= 1;
+            let error = ordinary(&archive, &short).0.unwrap_err();
             assert!(matches!(
                 error.root_cause(),
-                Error::InvalidHeader("RAR 5 encrypted stored file has non-zero padding")
+                Error::HashMismatch { hash_type: 0 }
             ));
         }
     }
