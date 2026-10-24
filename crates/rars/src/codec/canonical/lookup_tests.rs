@@ -13,6 +13,13 @@ fn counts(lengths: &[u8]) -> [u16; 16] {
 
 #[test]
 fn lookup_matches_bitwise_decoding_for_every_prefix_and_input_boundary() {
+    compare_with_bitwise(&Allowance::default());
+    let budget = Allowance::limited(1024 * 1024);
+    compare_with_bitwise(&budget);
+    assert_eq!(budget.used(), 0);
+}
+
+fn compare_with_bitwise<B: Budget>(budget: &B) {
     let tables = [
         (1..=15).chain([15]).collect::<Vec<_>>(),
         vec![0, 2, 2, 10, 11, 15],
@@ -22,11 +29,13 @@ fn lookup_matches_bitwise_decoding_for_every_prefix_and_input_boundary() {
     for lengths in tables {
         for wide in [false, true] {
             let mut table =
-                Huffman::from_counts_with_lookup(&lengths, counts(&lengths), &Allowance::default())
-                    .unwrap();
+                Huffman::from_counts_with_lookup(&lengths, counts(&lengths), budget).unwrap();
+            assert_eq!(table.quick.is_empty(), B::LIMITED);
             if wide {
                 table.symbols[1] = (1usize << 28) + 1;
-                table.build_lookup().unwrap();
+                if !B::LIMITED {
+                    table.build_lookup().unwrap();
+                }
             }
             for prefix in 0..1u32 << 15 {
                 for available in 0..=15 {
@@ -103,11 +112,42 @@ fn bitwise_only_and_empty_tables_do_not_allocate_a_lookup() {
 }
 
 #[test]
-fn failed_lookup_allocation_releases_the_previously_admitted_symbols() {
-    let budget = Allowance::limited(2 * std::mem::size_of::<usize>() as u64);
+fn failed_lookup_allocation_preserves_previously_admitted_symbols() {
+    let bytes = 2 * std::mem::size_of::<usize>() as u64;
+    let budget = Allowance::limited(bytes);
+    let mut table = Huffman::from_counts(&[1, 1], counts(&[1, 1]), &budget).unwrap();
     assert!(matches!(
-        Huffman::from_counts_with_lookup(&[1, 1], counts(&[1, 1]), &budget),
+        table.build_lookup(),
         Err(Error::WorkspaceLimitExceeded(_))
     ));
+    assert!(table.quick.is_empty());
+    assert_eq!(budget.used(), bytes);
+    assert_eq!(
+        table.decode_peeked_checked(0, 1, "empty", "invalid"),
+        Ok((0, 1))
+    );
+    drop(table);
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn bounded_peek_tables_and_clones_need_only_symbol_workspace() {
+    let bytes = 2 * std::mem::size_of::<usize>() as u64;
+    let budget = Allowance::limited(bytes * 2);
+    let table = Huffman::from_counts_with_lookup(&[1, 1], counts(&[1, 1]), &budget).unwrap();
+    assert_eq!(budget.used(), bytes);
+    assert!(table.quick.is_empty());
+    let copy = table.try_clone().unwrap();
+    assert_eq!(budget.used(), bytes * 2);
+    assert!(copy.quick.is_empty());
+    assert_eq!(
+        table.decode_peeked_checked(0, 1, "empty", "invalid"),
+        Ok((0, 1))
+    );
+    assert_eq!(
+        copy.decode_peeked_checked(1 << 14, 1, "empty", "invalid"),
+        Ok((1, 1))
+    );
+    drop((table, copy));
     assert_eq!(budget.used(), 0);
 }
