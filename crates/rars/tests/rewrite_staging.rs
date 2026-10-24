@@ -1,15 +1,13 @@
 #![cfg(feature = "write")]
 #![cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 
+use rars::atomic64::AtomicU64;
 use rars::{
     ArchiveReadOptions, ArchiveReader, ArchiveVersion, Builder, Error, ErrorKind,
     ExtractionDecision, RewriteStaging,
 };
 use std::io::{Cursor, Read, Seek, SeekFrom};
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
-};
+use std::sync::{atomic::Ordering, Arc};
 
 #[path = "support/scratch.rs"]
 mod scratch;

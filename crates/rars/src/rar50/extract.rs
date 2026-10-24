@@ -2951,7 +2951,8 @@ mod tests {
         let expected = Error::InvalidHeader("RAR 5 dictionary size overflows host address size");
         let mut decoder = ReaderState::new(&Allowance::default());
         assert_eq!(
-            file.decode_packed_owned(&[0], &mut decoder).unwrap_err(),
+            file.decode_packed_owned(&[0], &mut decoder, HistoryRetention::Retain)
+                .unwrap_err(),
             expected
         );
         assert_eq!(
@@ -3002,7 +3003,7 @@ mod tests {
         file.unpacked_size = 1u64 << 32;
         let mut decoder = ReaderState::new(&Allowance::default());
         assert_eq!(
-            file.decode_packed_owned(&[0; 16], &mut decoder)
+            file.decode_packed_owned(&[0; 16], &mut decoder, HistoryRetention::Retain)
                 .unwrap_err(),
             Error::InvalidHeader("RAR 5 unpacked size overflows host address size")
         );

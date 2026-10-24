@@ -6598,8 +6598,9 @@ fn write_volume_set(
 /// the single-archive path uses.
 #[test]
 fn a_volume_set_reports_compression_progress() {
+    use rars::atomic64::AtomicU64;
     use rars::{WriteOperation, WriteProgressEvent};
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     // Blocks are a megabyte, so three of them is what proves the reporting is
     // incremental rather than one jump at the end.

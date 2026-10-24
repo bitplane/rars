@@ -2087,7 +2087,7 @@ mod tests {
     ))]
     #[test]
     fn streaming_ledger_covers_repeated_waves_and_retained_history() {
-        use std::sync::atomic::AtomicU64;
+        use crate::atomic64::AtomicU64;
         let scratch = crate::scratch::case("stream-ledger-waves");
         let size = crate::codec::rar50::MAX_LZ_BLOCK_SIZE * 2 + 4096;
         let data: Vec<u8> = (0..size).map(|i| ((i * 71) % 251) as u8).collect();
@@ -2335,8 +2335,9 @@ mod tests {
     ))]
     #[test]
     fn admitted_workers_share_one_ledger_without_racing_for_spare_capacity() {
+        use crate::atomic64::AtomicU64;
         use crate::streaming::preparation::Bytes;
-        use std::sync::{atomic::AtomicU64, Barrier};
+        use std::sync::Barrier;
         let ledger = Allowance::limited(65536);
         let resources = WriterResources::default().with_execution_allowance(ledger.clone());
         let pool = rayon::ThreadPoolBuilder::new()

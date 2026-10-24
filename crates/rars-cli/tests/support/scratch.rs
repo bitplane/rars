@@ -18,7 +18,7 @@
 
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A directory of a test's own, removed when the test drops it.
 ///
@@ -66,7 +66,8 @@ impl Drop for Scratch {
 /// The name only has to be readable; the process id and a counter make it
 /// unique, so two tests running at once cannot collide.
 pub fn case(name: &str) -> Scratch {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
+    // This is a directory serial, not a byte count, so pointer width suffices.
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
     let serial = NEXT.fetch_add(1, Ordering::Relaxed);
     let path = root().join(format!("{name}-{}-{serial}", std::process::id()));
     let _ = std::fs::remove_dir_all(&path);

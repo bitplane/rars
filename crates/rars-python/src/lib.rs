@@ -2757,8 +2757,8 @@ mod tests {
 
     #[test]
     fn python_rewrite_batches_link_metadata_and_stages_one_pass_per_write() {
+        use rars_rs::atomic64::AtomicU64;
         use std::io::{Cursor, Read, Seek, SeekFrom};
-        use std::sync::atomic::AtomicU64;
 
         struct Counted {
             input: Cursor<Vec<u8>>,
