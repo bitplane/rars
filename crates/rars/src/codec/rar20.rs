@@ -116,7 +116,7 @@ pub(crate) struct Reader20State<B: Budget> {
     old_offsets: [usize; 4],
     last_offset: usize,
     last_length: usize,
-    pending_match: Option<(usize, usize)>,
+    pending_match: Option<(usize, usize, bool)>,
     in_block: bool,
     output: Buffer<u8, B>,
     base_offset: usize,
@@ -519,11 +519,22 @@ impl<B: Budget> Reader20State<B> {
         // with a first-wrap flag instead, so those bytes read as zero there,
         // and an archive that leans on it stays readable here. The decision
         // is taken once for the whole match, as it is there: a copy does not
-        // start on zeroes and cross into real bytes partway.
+        // start on zeroes and cross into real bytes partway, even when it
+        // pauses at an output boundary and resumes later.
         let before_window = offset > self.current_pos();
+        self.copy_match_with_window(length, offset, output_size, before_window)
+    }
+
+    fn copy_match_with_window(
+        &mut self,
+        length: usize,
+        offset: usize,
+        output_size: usize,
+        before_window: bool,
+    ) -> Result<()> {
         for index in 0..length {
             if self.current_pos() >= output_size {
-                self.pending_match = Some((length - index, offset));
+                self.pending_match = Some((length - index, offset, before_window));
                 break;
             }
             let byte = if before_window {
@@ -538,11 +549,10 @@ impl<B: Budget> Reader20State<B> {
     }
 
     fn drain_pending_match(&mut self, output_size: usize) -> Result<()> {
-        let Some((length, offset)) = self.pending_match.take() else {
+        let Some((length, offset, before_window)) = self.pending_match.take() else {
             return Ok(());
         };
-        self.copy_match(length, offset, output_size)?;
-        Ok(())
+        self.copy_match_with_window(length, offset, output_size, before_window)
     }
 
     fn read_last_tables(&mut self) -> Result<()> {
