@@ -204,7 +204,9 @@ class RealBinaryTests(unittest.TestCase):
         self.assertEqual(row["task_id"], digest(row["task"])[:24])
         self.assertEqual(row["manifest_sha256"], sha(self.run / "manifest.json"))
         self.assertGreater(row["reserved_seconds"], 0)
-        self.assertLessEqual(row["reserved_seconds"], TASK_TIMEOUT)
+        # Rounding begin + timeout can put deadline - begin just above the
+        # timeout. Allow a microsecond even on hosts with long uptimes.
+        self.assertLessEqual(row["reserved_seconds"], TASK_TIMEOUT + 1e-6)
         result_path = self.run / row["result"]
         self.assertEqual(sha(result_path), row["result_sha256"])
         result = read_json(result_path)
