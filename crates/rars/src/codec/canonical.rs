@@ -14,6 +14,7 @@ pub(super) struct Huffman<B: Budget = Allowance> {
     counts: [u16; 16],
     /// For every 10-bit prefix, `symbol << 4 | length`; 0 for long codes,
     /// invalid prefixes, or sparse alphabet indices too wide to pack.
+    /// Bounded readers leave this empty to preserve their workspace budget.
     quick: Buffer<u32, B>,
     quick_has_wide_symbols: bool,
 }
@@ -70,13 +71,18 @@ impl<B: Budget> Huffman<B> {
         })
     }
 
+    /// Prepare the peek decoder. Bounded readers scan canonical codes to
+    /// preserve the symbol-only workspace cost; unrestricted readers allocate
+    /// acceleration storage.
     pub(super) fn from_counts_with_lookup(
         lengths: &[u8],
         counts: [u16; 16],
         allowance: &B,
     ) -> Result<Self> {
         let mut table = Self::from_counts(lengths, counts, allowance)?;
-        table.build_lookup()?;
+        if !B::LIMITED {
+            table.build_lookup()?;
+        }
         Ok(table)
     }
 
@@ -126,20 +132,24 @@ impl<B: Budget> Huffman<B> {
 
     /// Decodes from the next 15 bits of input, most significant first (`peek`),
     /// without consuming them: the symbol and its code's length, or `None` if
-    /// they start no code. One lookup for codes of up to 10 bits, which are
-    /// nearly all of them. The caller consumes only the code's bits, and must
+    /// they start no code. Unrestricted readers use one lookup for codes of
+    /// up to 10 bits; bounded readers scan without extra storage. The caller
+    /// consumes only the code's bits, and must
     /// check that they were real input rather than padding past its end.
     // Always inlined: it is the inner loop of two decoders, and with both
     // calling it the compiler stopped inlining it into RAR5's (11% slower).
     #[inline(always)]
     pub(super) fn decode_peeked(&self, peek: u32) -> Option<(usize, usize)> {
+        if B::LIMITED {
+            return self.decode_scan(peek);
+        }
         debug_assert!(!self.quick.is_empty());
         let entry = self.quick[(peek >> (15 - QUICK_BITS)) as usize];
         if entry != 0 {
             return Some(((entry >> 4) as usize, (entry & 15) as usize));
         }
         if self.quick_has_wide_symbols {
-            return self.decode_wide_symbol(peek);
+            return self.decode_scan(peek);
         }
         for len in QUICK_BITS + 1..=15 {
             let count = self.counts[len];
@@ -156,10 +166,10 @@ impl<B: Budget> Huffman<B> {
         None
     }
 
-    // Real archive alphabets fit in quick entries. Preserve arbitrary public
-    // sparse alphabets without adding a dependent load to every quick hit.
-    #[cold]
-    fn decode_wide_symbol(&self, peek: u32) -> Option<(usize, usize)> {
+    // Full-width symbols for bounded readers and rare wide sparse alphabets.
+    // Keep the scan out of the always-inlined unrestricted lookup path.
+    #[inline(never)]
+    fn decode_scan(&self, peek: u32) -> Option<(usize, usize)> {
         for len in 1..=15 {
             let count = self.counts[len];
             if count != 0 {
@@ -297,10 +307,19 @@ mod tests {
 
     #[test]
     fn table_and_checkpoint_allocations_are_admitted_and_released() {
+        fn build_lookup<B: Budget>(
+            lengths: &[u8],
+            counts: [u16; 16],
+            allowance: &B,
+        ) -> Result<Huffman<B>> {
+            let mut table = Huffman::from_counts(lengths, counts, allowance)?;
+            table.build_lookup()?;
+            Ok(table)
+        }
         let mut counts = [0; 16];
         counts[1] = 2;
         let allowance = Allowance::limited(64 * 1024);
-        let table = Huffman::from_counts_with_lookup(&[1, 1], counts, &allowance).unwrap();
+        let table = build_lookup(&[1, 1], counts, &allowance).unwrap();
         let retained = allowance.used();
         // The symbols, and the 10-bit lookup table.
         let quick = (1 << QUICK_BITS) * std::mem::size_of::<u32>();
@@ -313,7 +332,7 @@ mod tests {
         drop(copy);
         assert_eq!(allowance.used(), 0);
         let allowance = Allowance::limited(retained);
-        let table = Huffman::from_counts_with_lookup(&[1, 1], counts, &allowance).unwrap();
+        let table = build_lookup(&[1, 1], counts, &allowance).unwrap();
         assert!(matches!(
             table.try_clone(),
             Err(Error::WorkspaceLimitExceeded(_))
@@ -322,7 +341,7 @@ mod tests {
         drop(table);
         assert_eq!(allowance.used(), 0);
         assert!(matches!(
-            Huffman::from_counts_with_lookup(&[1, 1], counts, &Allowance::limited(0)),
+            build_lookup(&[1, 1], counts, &Allowance::limited(0)),
             Err(Error::WorkspaceLimitExceeded(_))
         ));
     }
