@@ -201,6 +201,9 @@ pub(crate) struct Poller {
 }
 impl Poller {
     // Bound both no-output symbol work and runs that expand large matches.
+    // Inlined: decoders call this once per symbol, and without a control it
+    // is a single test that should cost no call.
+    #[inline]
     pub(crate) fn check(&mut self, position: usize) -> Result<()> {
         if self.control.0.is_none() {
             return Ok(());
@@ -213,6 +216,7 @@ impl Poller {
         self.steps -= 1;
         Ok(())
     }
+    #[inline]
     pub(crate) fn check_codec(&mut self, position: usize) -> crate::codec::Result<()> {
         self.check(position)
             .map_err(|_| crate::codec::Error::Cancelled)
