@@ -340,16 +340,6 @@ impl<T, B: Budget> Buffer<T, B> {
     pub(crate) fn clear(&mut self) {
         self.values.clear();
     }
-    pub(crate) fn insert(&mut self, index: usize, value: T) -> Result<()> {
-        if B::LIMITED {
-            self.reserve(1)?;
-        }
-        self.values.insert(index, value);
-        Ok(())
-    }
-    pub(crate) fn remove(&mut self, index: usize) -> T {
-        self.values.remove(index)
-    }
     pub(crate) fn try_collect(
         values: impl ExactSizeIterator<Item = Result<T>>,
         allowance: &B,
@@ -591,27 +581,6 @@ impl<T: PartialEq, B: Budget> PartialEq<Vec<T>> for Buffer<T, B> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn limited_insert_preserves_reordered_storage_and_refuses_growth_atomically() {
-        let ledger = Allowance::limited(4);
-        let mut bytes = Buffer::copied(b"ABCD", &ledger).unwrap();
-        let storage = bytes.as_ptr();
-        let value = bytes.remove(2);
-        bytes.insert(0, value).unwrap();
-        assert_eq!(&*bytes, b"CABD");
-        assert_eq!(bytes.as_ptr(), storage);
-        assert_eq!(ledger.used(), 4);
-        assert!(matches!(
-            bytes.insert(0, b'X'),
-            Err(Error::WorkspaceLimitExceeded(_))
-        ));
-        assert_eq!(&*bytes, b"CABD");
-        assert_eq!(bytes.as_ptr(), storage);
-        assert_eq!(ledger.used(), 4);
-        drop(bytes);
-        assert_eq!(ledger.used(), 0);
-    }
-
     #[test]
     fn interrupted_reads_retry_and_buffer_flush_preserves_charge() {
         use std::io::{self, Cursor, Read, Write};
