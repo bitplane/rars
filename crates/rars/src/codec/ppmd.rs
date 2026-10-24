@@ -560,6 +560,9 @@ enum Stats {
 struct StateArena<B: Budget> {
     states: Buffer<State, B>,
     free: [Buffer<u32, B>; ARENA_CLASSES],
+    free_slots: usize,
+    released_since_coalesce: usize,
+    read_control: crate::read_control::ReadControl,
 }
 
 const ARENA_CLASSES: usize = 8;
@@ -569,6 +572,9 @@ impl<B: Budget> StateArena<B> {
         Self {
             states: Buffer::new(allowance),
             free: std::array::from_fn(|_| Buffer::new(allowance)),
+            free_slots: 0,
+            released_since_coalesce: 0,
+            read_control: crate::read_control::ReadControl::default(),
         }
     }
 
@@ -581,6 +587,9 @@ impl<B: Budget> StateArena<B> {
         Ok(Self {
             states: Buffer::copied(&self.states, &allowance)?,
             free,
+            free_slots: self.free_slots,
+            released_since_coalesce: self.released_since_coalesce,
+            read_control: crate::read_control::ReadControl::default(),
         })
     }
 
@@ -589,6 +598,8 @@ impl<B: Budget> StateArena<B> {
         for list in &mut self.free {
             list.clear();
         }
+        self.free_slots = 0;
+        self.released_since_coalesce = 0;
     }
 
     // The class of the block that holds `states` (at most 256) states.
@@ -602,14 +613,48 @@ impl<B: Budget> StateArena<B> {
         2 << class
     }
 
-    fn alloc(&mut self, class: usize) -> Result<u32> {
+    fn reuse(&mut self, class: usize) -> Result<Option<u32>> {
         if let Some(at) = self.free[class].pop() {
-            return Ok(at);
+            self.free_slots -= Self::block_len(class);
+            return Ok(Some(at));
         }
         if let Some(larger) = (class + 1..ARENA_CLASSES).find(|&k| !self.free[k].is_empty()) {
             let at = self.free[larger].pop().expect("the list was not empty");
-            self.release_tail(at, larger, class)?;
+            self.free_slots -= Self::block_len(larger);
+            // Splitting already-free storage is not a new release and must
+            // not bring the next coalescing pass forward.
+            for tail in class..larger {
+                self.free[tail].try_push(at + Self::block_len(tail) as u32)?;
+                self.free_slots += Self::block_len(tail);
+            }
+            return Ok(Some(at));
+        }
+        Ok(None)
+    }
+
+    fn alloc(&mut self, class: usize) -> Result<u32> {
+        if let Some(at) = self.reuse(class)? {
             return Ok(at);
+        }
+        // Every scan, successful or not, is paid for by actual frees.
+        // Otherwise a large arena could be scanned for each tiny allocation.
+        if self.free_slots >= Self::block_len(class)
+            && self.released_since_coalesce >= 256.max(self.states.len() / 8)
+        {
+            match self.coalesce() {
+                Ok(()) => {
+                    if let Some(at) = self.reuse(class)? {
+                        return Ok(at);
+                    }
+                }
+                Err(Error::WorkspaceLimitExceeded(_)) => {
+                    // Maintenance scratch may not fit even when appending
+                    // into already admitted arena capacity does. Ownership
+                    // remains intact on refusal, so try ordinary growth.
+                    self.released_since_coalesce = 0;
+                }
+                Err(error) => return Err(error),
+            }
         }
         let at = self.states.len();
         let end = at + Self::block_len(class);
@@ -621,7 +666,11 @@ impl<B: Budget> StateArena<B> {
     }
 
     fn release(&mut self, at: u32, class: usize) -> Result<()> {
-        self.free[class].try_push(at)
+        self.free[class].try_push(at)?;
+        let len = Self::block_len(class);
+        self.free_slots += len;
+        self.released_since_coalesce = self.released_since_coalesce.saturating_add(len);
+        Ok(())
     }
 
     // Keep the first block of class `to` at `at` and free the rest of the
@@ -629,6 +678,89 @@ impl<B: Budget> StateArena<B> {
     fn release_tail(&mut self, at: u32, from: usize, to: usize) -> Result<()> {
         for class in to..from {
             self.release(at + Self::block_len(class) as u32, class)?;
+        }
+        Ok(())
+    }
+
+    // Join free ranges without moving live states or changing the simulated
+    // PPMd allocator. Blocks need only be aligned to two slots, not their
+    // size. One bitmap bit per pair keeps temporary storage at 1/16 byte per
+    // arena slot; all scratch and free-list growth remain budgeted.
+    fn coalesce(&mut self) -> Result<()> {
+        self.read_control.check_codec()?;
+        let mut bitmap = Buffer::filled(
+            self.states.len().div_ceil(16),
+            0u8,
+            &self.states.allowance(),
+        )?;
+        let mut poller = self.read_control.poller();
+        for (class, list) in self.free.iter().enumerate() {
+            for &at in list {
+                for pair in at as usize / 2..(at as usize + Self::block_len(class)) / 2 {
+                    poller.check_codec(pair)?;
+                    bitmap[pair / 8] |= 1 << (pair % 8);
+                }
+            }
+        }
+        let mut counts = [0usize; ARENA_CLASSES];
+        Self::visit_free_blocks(
+            &bitmap,
+            self.states.len(),
+            Some(&self.read_control),
+            |_, class| {
+                counts[class] += 1;
+            },
+        )?;
+        // Admit all destinations before clearing any list. Refusal or
+        // cancellation leaves the original block ownership intact.
+        for (list, count) in self.free.iter_mut().zip(counts) {
+            self.read_control.check_codec()?;
+            list.reserve_total_capacity(count)?;
+        }
+        self.read_control.check_codec()?;
+        for list in &mut self.free {
+            list.clear();
+        }
+        Self::visit_free_blocks(&bitmap, self.states.len(), None, |at, class| {
+            self.free[class].push_admitted(at);
+        })
+        .expect("admitted free-list publication cannot fail");
+        self.released_since_coalesce = 0;
+        debug_assert_eq!(
+            self.free_slots,
+            self.free
+                .iter()
+                .enumerate()
+                .map(|(class, list)| list.len() * Self::block_len(class))
+                .sum::<usize>()
+        );
+        Ok(())
+    }
+
+    fn visit_free_blocks(
+        bitmap: &[u8],
+        slots: usize,
+        control: Option<&crate::read_control::ReadControl>,
+        mut visit: impl FnMut(u32, usize),
+    ) -> Result<()> {
+        let mut poller = control.map(crate::read_control::ReadControl::poller);
+        let mut start = 0;
+        for pair in 0..=slots / 2 {
+            if let Some(poller) = &mut poller {
+                poller.check_codec(pair)?;
+            }
+            if pair < slots / 2 && bitmap[pair / 8] & (1 << (pair % 8)) != 0 {
+                continue;
+            }
+            let mut at = start * 2;
+            let end = pair * 2;
+            while at < end {
+                let class = ((usize::BITS - (end - at).leading_zeros() - 2) as usize)
+                    .min(ARENA_CLASSES - 1);
+                visit(at as u32, class);
+                at += Self::block_len(class);
+            }
+            start = pair + 1;
         }
         Ok(())
     }
@@ -697,6 +829,7 @@ struct RangeDecoder {
 
 impl<B: Budget> PpmdState<B> {
     pub(crate) fn set_read_control(&mut self, control: crate::read_control::ReadControl) {
+        self.arena.read_control = control.clone();
         self.suballoc.read_control = control;
     }
     pub(crate) fn with_allowance(allowance: &B) -> Self {
@@ -2193,3 +2326,6 @@ fn model_context_limit(dictionary_mb: usize) -> usize {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod arena_tests;

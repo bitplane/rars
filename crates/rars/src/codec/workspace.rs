@@ -279,7 +279,6 @@ impl<T, B: Budget> Buffer<T, B> {
     fn reserve(&mut self, additional: usize) -> Result<()> {
         B::grow(&mut self.values, &mut self.charge, additional).map_err(Into::into)
     }
-    #[cfg(feature = "write")]
     pub(crate) fn reserve_total_capacity(&mut self, total: usize) -> Result<()> {
         if total > self.values.capacity() {
             self.reserve(total.saturating_sub(self.values.len()))?;
