@@ -307,3 +307,47 @@ fn scratch_filter_allocations_obey_the_shared_quota_and_clean_up() {
         assert_eq!(std::fs::read_dir(&*dir).unwrap().count(), 0);
     }
 }
+
+#[test]
+fn solid_rar5_mixed_decode_paths_preserve_bounded_workspace() {
+    use rars::rar50::{ArchiveEntry, Rar50Writer, WriterOptions};
+    use rars::{EntrySource, FeatureSet};
+    let dictionary = 1024 * 1024;
+    for sizes in [
+        [dictionary, dictionary / 4, dictionary * 2],
+        [dictionary * 2, dictionary / 4, dictionary],
+    ] {
+        let mut features = FeatureSet::default();
+        features.solid = true;
+        let mut writer = Rar50Writer::new(
+            WriterOptions::new(ArchiveVersion::Rar50, features)
+                .with_compression_level(1)
+                .with_dictionary_size(dictionary as u64),
+        );
+        let mut expected = Vec::new();
+        for (index, size) in sizes.into_iter().enumerate() {
+            let data: Vec<_> = (0..size)
+                .map(|at| b'A' + ((at + index) % 23) as u8)
+                .collect();
+            expected.extend_from_slice(&data);
+            writer = writer.entry(ArchiveEntry::new(
+                format!("member{index}").into_bytes(),
+                EntrySource::from_bytes(data),
+            ));
+        }
+        let archive = ArchiveReader::read_owned(writer.finish().unwrap()).unwrap();
+        let output = Rc::new(RefCell::new(Vec::new()));
+        // The original exact-window reader needs 2,163,802 bytes for the first
+        // ordering and 2,098,243 for the second. Allow small bookkeeping changes,
+        // but not a third dictionary.
+        let options = ArchiveReadOptions::new()
+            .with_max_reader_workspace_bytes(2_200_000)
+            .with_rar50_buffered_decode_limit(dictionary as u64);
+        archive
+            .extract_to_with_options(options, |_| {
+                Ok(Box::new(Capture(output.clone())) as Box<dyn Write>)
+            })
+            .unwrap();
+        assert_eq!(*output.borrow(), expected);
+    }
+}

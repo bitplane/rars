@@ -26,8 +26,7 @@ fn reference_match(history: &[u8], pending: &[u8], distance: usize, length: usiz
 fn buffered_matches_equal_scalar_with_history_pending_overlap_and_missing_history() {
     for history_len in 0..=6 {
         let history: Vec<_> = (0..history_len).map(|n| n as u8 + 11).collect();
-        let mut decoder = ReaderState::new(&Allowance::default());
-        decoder.history = Buffer::from_vec(history.clone());
+        let decoder = ReaderState::with_history(Buffer::from_vec(history.clone()));
         for pending_len in 0..=6 {
             let pending: Vec<_> = (0..pending_len).map(|n| n as u8 + 31).collect();
             for distance in 0..=history_len + pending_len + 2 {

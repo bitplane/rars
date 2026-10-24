@@ -4607,8 +4607,8 @@ fn buffered_reader_history_capacity_follows_the_active_dictionary() {
     );
     assert_eq!(&*decoder.state.history, &data[data.len() - 1024..][..]);
     assert!(
-        decoder.state.history.capacity() <= 1024,
-        "retained {} bytes for a 1024-byte dictionary",
+        decoder.state.history.capacity() <= 1024 + 1024 / 4,
+        "retained {} bytes for a 1024-byte dictionary with slack",
         decoder.state.history.capacity()
     );
     let next = b"next solid member";
@@ -4616,14 +4616,17 @@ fn buffered_reader_history_capacity_follows_the_active_dictionary() {
     decoder
         .decode_member_with_dictionary(&packed, 0, next.len(), 1024, true, DecodeMode::LiteralOnly)
         .unwrap();
+    // The history may keep up to a quarter dictionary of older bytes (the
+    // slack that spares a move per member); what matches can reach is the
+    // last dictionary of it.
     let expected = [&data[data.len() - (1024 - next.len())..], next.as_slice()].concat();
-    assert_eq!(decoder.state.history, expected);
-    assert!(decoder.state.history.capacity() <= 1024);
+    assert!(decoder.state.history.ends_with(&expected));
+    assert!(decoder.state.history.capacity() <= 1024 + 1024 / 4);
     decoder
         .decode_member_with_dictionary(&packed, 0, next.len(), 8, true, DecodeMode::LiteralOnly)
         .unwrap();
-    assert_eq!(&*decoder.state.history, &next[next.len() - 8..][..]);
-    assert!(decoder.state.history.capacity() <= 8);
+    assert!(decoder.state.history.ends_with(&next[next.len() - 8..]));
+    assert!(decoder.state.history.capacity() <= 8 + 8 / 4);
 }
 
 #[test]
@@ -4639,7 +4642,7 @@ fn filtered_reader_history_retains_only_the_raw_dictionary_tail() {
         .unwrap();
     assert_ne!(decoded, raw, "fixture must actually transform bytes");
     assert_eq!(&*decoder.state.history, &raw[raw.len() - 64..][..]);
-    assert!(decoder.state.history.capacity() <= 64);
+    assert!(decoder.state.history.capacity() <= 64 + 64 / 4);
 }
 
 #[test]
@@ -4647,7 +4650,7 @@ fn failed_buffered_filter_preserves_previous_solid_history() {
     let data = b"\xe8\0\0\0\0abcdefghijklmnop".to_vec();
     let packed = encode_lz_member_with_filter(&data, crate::FilterKind::E8).unwrap();
     let mut decoder = Unpack50Decoder::new();
-    decoder.state.history = Buffer::from_vec(b"old raw history".to_vec());
+    decoder.state = ReaderState::with_history(Buffer::from_vec(b"old raw history".to_vec()));
     let history = decoder.state.history.to_vec();
     // The record spans the full member, but the advertised output stops
     // one byte earlier: the failure happens during filter application.
@@ -4711,7 +4714,7 @@ fn streaming_reader_history_capacity_follows_the_active_dictionary() {
         .unwrap();
     assert_eq!(decoded, data);
     assert_eq!(&*decoder.state.history, &data[data.len() - 1024..][..]);
-    assert!(decoder.state.history.capacity() <= 1024);
+    assert!(decoder.state.history.capacity() <= 1024 + 1024 / 4);
     let next = b"next solid member";
     let packed = encode_literal_only(next, 0).unwrap();
     decoder
@@ -4725,7 +4728,7 @@ fn streaming_reader_history_capacity_follows_the_active_dictionary() {
         )
         .unwrap();
     assert_eq!(&*decoder.state.history, &next[next.len() - 8..][..]);
-    assert!(decoder.state.history.capacity() <= 8);
+    assert!(decoder.state.history.capacity() <= 8 + 8 / 4);
 }
 
 #[test]
@@ -4788,7 +4791,7 @@ fn solid_streaming_decoder_trims_inherited_history_before_member() {
     let payload = literal_only_payload(b"AB");
     let input = encode_compressed_block(&payload, payload.len() * 8, true, true).unwrap();
     let mut decoder = Unpack50Decoder::new();
-    decoder.state.history.extend_from_slice(b"123456").unwrap();
+    decoder.state = ReaderState::with_history(Buffer::from_vec(b"123456".to_vec()));
     let mut decoded = Vec::new();
 
     decoder

@@ -3,12 +3,19 @@
 use super::workspace::{Allowance, Budget, Buffer};
 use super::{Error, Result};
 
+/// Codes up to this long are decoded by one lookup in [`Huffman::quick`].
+const QUICK_BITS: usize = 10;
+
 #[derive(Debug)]
 pub(super) struct Huffman<B: Budget = Allowance> {
     symbols: Buffer<usize, B>,
     first_code: [u16; 16],
     first_index: [usize; 16],
     counts: [u16; 16],
+    /// For every 10-bit prefix, `symbol << 4 | length`; 0 for long codes,
+    /// invalid prefixes, or sparse alphabet indices too wide to pack.
+    quick: Buffer<u32, B>,
+    quick_has_wide_symbols: bool,
 }
 
 impl<B: Budget> Huffman<B> {
@@ -18,6 +25,8 @@ impl<B: Budget> Huffman<B> {
             first_code: [0; 16],
             first_index: [0; 16],
             counts: [0; 16],
+            quick: Buffer::new(allowance),
+            quick_has_wide_symbols: false,
         }
     }
 
@@ -56,7 +65,45 @@ impl<B: Budget> Huffman<B> {
             first_code,
             first_index,
             counts,
+            quick: Buffer::new(allowance),
+            quick_has_wide_symbols: false,
         })
+    }
+
+    pub(super) fn from_counts_with_lookup(
+        lengths: &[u8],
+        counts: [u16; 16],
+        allowance: &B,
+    ) -> Result<Self> {
+        let mut table = Self::from_counts(lengths, counts, allowance)?;
+        table.build_lookup()?;
+        Ok(table)
+    }
+
+    fn build_lookup(&mut self) -> Result<()> {
+        if self.is_empty() {
+            return Ok(());
+        }
+        let mut quick = Buffer::filled(1 << QUICK_BITS, 0u32, &self.symbols.allowance())?;
+        let mut has_wide_symbols = false;
+        for len in 1..=QUICK_BITS {
+            for i in 0..usize::from(self.counts[len]) {
+                let code = usize::from(self.first_code[len]) + i;
+                let symbol = self.symbols[self.first_index[len] + i];
+                if symbol > (u32::MAX >> 4) as usize {
+                    has_wide_symbols = true;
+                    continue;
+                }
+                let entry = (symbol as u32) << 4 | len as u32;
+                let start = code << (QUICK_BITS - len);
+                for slot in &mut quick[start..start + (1 << (QUICK_BITS - len))] {
+                    *slot = entry;
+                }
+            }
+        }
+        self.quick = quick;
+        self.quick_has_wide_symbols = has_wide_symbols;
+        Ok(())
     }
 
     pub(super) fn try_clone(&self) -> Result<Self> {
@@ -65,6 +112,8 @@ impl<B: Budget> Huffman<B> {
             first_code: self.first_code,
             first_index: self.first_index,
             counts: self.counts,
+            quick: Buffer::copied(&self.quick, &self.quick.allowance())?,
+            quick_has_wide_symbols: self.quick_has_wide_symbols,
         })
     }
     #[cfg(test)]
@@ -75,8 +124,78 @@ impl<B: Budget> Huffman<B> {
         self.symbols.is_empty()
     }
 
-    /// Read only the bits of the selected code. A speculative wide peek would
-    /// change truncation and incremental-input behavior near an input boundary.
+    /// Decodes from the next 15 bits of input, most significant first (`peek`),
+    /// without consuming them: the symbol and its code's length, or `None` if
+    /// they start no code. One lookup for codes of up to 10 bits, which are
+    /// nearly all of them. The caller consumes only the code's bits, and must
+    /// check that they were real input rather than padding past its end.
+    // Always inlined: it is the inner loop of two decoders, and with both
+    // calling it the compiler stopped inlining it into RAR5's (11% slower).
+    #[inline(always)]
+    pub(super) fn decode_peeked(&self, peek: u32) -> Option<(usize, usize)> {
+        debug_assert!(!self.quick.is_empty());
+        let entry = self.quick[(peek >> (15 - QUICK_BITS)) as usize];
+        if entry != 0 {
+            return Some(((entry >> 4) as usize, (entry & 15) as usize));
+        }
+        if self.quick_has_wide_symbols {
+            return self.decode_wide_symbol(peek);
+        }
+        for len in QUICK_BITS + 1..=15 {
+            let count = self.counts[len];
+            if count != 0 {
+                let offset = ((peek >> (15 - len)) as u16).wrapping_sub(self.first_code[len]);
+                if offset < count {
+                    return Some((
+                        self.symbols[self.first_index[len] + usize::from(offset)],
+                        len,
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    // Real archive alphabets fit in quick entries. Preserve arbitrary public
+    // sparse alphabets without adding a dependent load to every quick hit.
+    #[cold]
+    fn decode_wide_symbol(&self, peek: u32) -> Option<(usize, usize)> {
+        for len in 1..=15 {
+            let count = self.counts[len];
+            if count != 0 {
+                let offset = ((peek >> (15 - len)) as u16).wrapping_sub(self.first_code[len]);
+                if offset < count {
+                    return Some((
+                        self.symbols[self.first_index[len] + usize::from(offset)],
+                        len,
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    /// Apply the same empty, truncated and invalid-code rules to both readers.
+    #[inline(always)]
+    pub(super) fn decode_peeked_checked(
+        &self,
+        peek: u32,
+        available: usize,
+        empty: &'static str,
+        invalid: &'static str,
+    ) -> Result<(usize, usize)> {
+        if self.is_empty() {
+            return Err(Error::InvalidData(empty));
+        }
+        match self.decode_peeked(peek) {
+            Some(decoded @ (_, len)) if len <= available => Ok(decoded),
+            _ if available < 15 => Err(Error::NeedMoreInput),
+            _ => Err(Error::InvalidData(invalid)),
+        }
+    }
+
+    /// Bitwise decoder used by RAR 2.0, which does not need a lookup table.
+    /// Also serves as an independent oracle for the lookup decoder in tests.
     pub(super) fn decode(
         &self,
         mut read_bit: impl FnMut() -> Result<u16>,
@@ -181,9 +300,11 @@ mod tests {
         let mut counts = [0; 16];
         counts[1] = 2;
         let allowance = Allowance::limited(64 * 1024);
-        let table = Huffman::from_counts(&[1, 1], counts, &allowance).unwrap();
+        let table = Huffman::from_counts_with_lookup(&[1, 1], counts, &allowance).unwrap();
         let retained = allowance.used();
-        assert_eq!(retained, (2 * std::mem::size_of::<usize>()) as u64);
+        // The symbols, and the 10-bit lookup table.
+        let quick = (1 << QUICK_BITS) * std::mem::size_of::<u32>();
+        assert_eq!(retained, (2 * std::mem::size_of::<usize>() + quick) as u64);
         let copy = table.try_clone().unwrap();
         assert_eq!(allowance.used(), retained * 2);
         drop(table);
@@ -192,7 +313,7 @@ mod tests {
         drop(copy);
         assert_eq!(allowance.used(), 0);
         let allowance = Allowance::limited(retained);
-        let table = Huffman::from_counts(&[1, 1], counts, &allowance).unwrap();
+        let table = Huffman::from_counts_with_lookup(&[1, 1], counts, &allowance).unwrap();
         assert!(matches!(
             table.try_clone(),
             Err(Error::WorkspaceLimitExceeded(_))
@@ -201,7 +322,7 @@ mod tests {
         drop(table);
         assert_eq!(allowance.used(), 0);
         assert!(matches!(
-            Huffman::from_counts(&[1, 1], counts, &Allowance::limited(0)),
+            Huffman::from_counts_with_lookup(&[1, 1], counts, &Allowance::limited(0)),
             Err(Error::WorkspaceLimitExceeded(_))
         ));
     }
@@ -216,3 +337,6 @@ mod tests {
         assert_eq!(table.decode(|| Ok(0), "empty", "invalid"), Ok(65_537));
     }
 }
+
+#[cfg(test)]
+mod lookup_tests;

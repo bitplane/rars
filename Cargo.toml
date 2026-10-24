@@ -22,6 +22,7 @@ categories = ["compression"]
 aes = { version = "0.9", features = ["zeroize"] }
 aho-corasick = "1.1"
 clap = { version = "4.6", features = ["derive", "wrap_help"] }
+crc32fast = "1.5"
 getrandom = "0.4"
 hmac = "0.13"
 indicatif = "0.18.6"

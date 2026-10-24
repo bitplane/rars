@@ -36,6 +36,8 @@ const LENGTH_COUNT: usize = 28;
 const LEVEL_COUNT: usize = 20;
 const TABLE_COUNT: usize = MAIN_COUNT + OFFSET_COUNT + LOW_OFFSET_COUNT + LENGTH_COUNT;
 const MAX_HISTORY: usize = 4 * 1024 * 1024;
+// Matches up to this long are copied byte by byte (see `copy_match`).
+const SHORT_MATCH: usize = 64;
 const STREAM_CHUNK: usize = 1024 * 1024;
 // RARVM's standard AUDIO filter reserves an eight-bit-ish compatibility
 // range wider than WinRAR's usual 1..=4 channel choices. UnRAR accepts up to
@@ -208,7 +210,7 @@ pub(crate) struct Reader29State<B: Budget> {
     last_length: usize,
     last_low_offset: usize,
     low_offset_repeats: usize,
-    pending_match: Option<(usize, usize)>,
+    pending_match: Option<(usize, usize, bool)>,
     in_lz_block: bool,
     block_mode: BlockMode,
     ppmd: PpmdState<B>,
@@ -1133,31 +1135,69 @@ impl<B: Budget> Reader29State<B> {
         // first-window flag, and libarchive reads from a zero-initialized
         // circular dictionary. The decision is taken once for the whole
         // match: a copy does not start on zeroes and cross into real bytes
-        // partway.
+        // partway, including when a pending match resumes after a flush.
         let before_window = offset > self.current_pos();
-        for index in 0..length {
-            if self.current_pos() >= output_size {
-                self.pending_match = Some((length - index, offset));
-                break;
-            }
-            let byte = if before_window {
-                0
+        self.copy_match_with_window(length, offset, output_size, before_window)
+    }
+
+    fn copy_match_with_window(
+        &mut self,
+        length: usize,
+        offset: usize,
+        output_size: usize,
+        before_window: bool,
+    ) -> Result<()> {
+        // The part of the match that fits before `output_size` is copied at
+        // once, with room made for it once; the rest waits in
+        // `pending_match`.
+        let now = length.min(output_size.saturating_sub(self.current_pos()));
+        if now > 0 {
+            if before_window {
+                self.output.resize(self.output.len() + now, 0)?;
             } else {
-                let src = self.current_pos() - offset;
-                *self
-                    .raw_byte(src)
-                    .ok_or(Error::InvalidData("RAR 2.9 match distance is out of range"))?
-            };
-            self.output.try_push(byte)?;
+                // RAR 2.9's window is 4 MiB. A longer distance is refused
+                // here, not by whether its bytes have been trimmed yet:
+                // `trim_history` keeps some slack, so they may still be held.
+                let out_of_range = Error::InvalidData("RAR 2.9 match distance is out of range");
+                if offset == 0 || offset > MAX_HISTORY {
+                    return Err(out_of_range);
+                }
+                let start = (self.current_pos() - offset)
+                    .checked_sub(self.base_offset)
+                    .ok_or(out_of_range)?;
+                if now <= SHORT_MATCH {
+                    // Most matches are a few bytes: room once, then a plain
+                    // loop, which also repeats an overlapping run correctly.
+                    // A call to `memmove` per match cost more than the copy.
+                    let at = self.output.len();
+                    self.output.resize(at + now, 0)?;
+                    for i in 0..now {
+                        self.output[at + i] = self.output[start + i];
+                    }
+                } else {
+                    // Each run repeats the bytes `offset` back, which are
+                    // already in place, so a short distance doubles what one
+                    // copy moves.
+                    let mut remaining = now;
+                    while remaining > 0 {
+                        let take = remaining.min(self.output.len() - start);
+                        self.output.extend_from_within(start..start + take)?;
+                        remaining -= take;
+                    }
+                }
+            }
+        }
+        if now < length {
+            self.pending_match = Some((length - now, offset, before_window));
         }
         Ok(())
     }
 
     fn drain_pending_match(&mut self, output_size: usize) -> Result<()> {
-        let Some((length, offset)) = self.pending_match.take() else {
+        let Some((length, offset, before_window)) = self.pending_match.take() else {
             return Ok(());
         };
-        self.copy_match(length, offset, output_size)
+        self.copy_match_with_window(length, offset, output_size, before_window)
     }
 
     fn push_old_offset(&mut self, offset: usize) {
@@ -1177,10 +1217,6 @@ impl<B: Budget> Reader29State<B> {
 
     fn current_pos(&self) -> usize {
         self.base_offset + self.output.len()
-    }
-
-    fn raw_byte(&self, position: usize) -> Option<&u8> {
-        self.output.get(position.checked_sub(self.base_offset)?)
     }
 
     fn raw_range(&self, start: usize, end: usize) -> Result<&[u8]> {
@@ -1205,6 +1241,13 @@ impl<B: Budget> Reader29State<B> {
             return;
         }
         let drain = keep_from - self.base_offset;
+        // Draining moves the whole retained window to the front of the
+        // buffer, so wait until a quarter window can go rather than draining
+        // after every flush. The bytes kept a little longer are never read:
+        // `copy_match` refuses distances past the window.
+        if drain < MAX_HISTORY / 4 {
+            return;
+        }
         self.output.discard_prefix(drain);
         self.base_offset = keep_from;
         self.filters
@@ -1270,7 +1313,7 @@ impl<B: Budget> Huffman<B> {
         validate_huffman_counts(&count)?;
 
         Ok(Self {
-            state: super::canonical::Huffman::from_counts(lengths, count, allowance)?,
+            state: super::canonical::Huffman::from_counts_with_lookup(lengths, count, allowance)?,
         })
     }
     fn try_clone(&self) -> Result<Self> {
@@ -1278,12 +1321,18 @@ impl<B: Budget> Huffman<B> {
             state: self.state.try_clone()?,
         })
     }
+    /// Decodes from a 15-bit peek, with the results of reading bit by bit;
+    /// see the RAR 5 decoder's `HuffmanState::decode`.
     fn decode(&self, bits: &mut BitReader<B>) -> Result<usize> {
-        self.state.decode(
-            || bits.read_bit().map(|bit| bit as u16),
+        let (peek, available) = bits.peek15();
+        let (symbol, len) = self.state.decode_peeked_checked(
+            peek,
+            available,
             "RAR 2.9 empty Huffman table",
             "RAR 2.9 invalid Huffman code",
-        )
+        )?;
+        bits.bit_pos += len;
+        Ok(symbol)
     }
 }
 
@@ -1366,14 +1415,43 @@ impl<B: Budget> BitReader<B> {
         if count > 24 {
             return Err(Error::InvalidData("RAR 2.9 bit read is too wide"));
         }
-        let mut value = 0u32;
-        for i in 0..count as usize {
-            let bit_index = self.bit_pos + i;
-            let byte = *self.input.get(bit_index / 8).ok_or(Error::NeedMoreInput)?;
-            let bit = (byte >> (7 - (bit_index % 8))) & 1;
-            value = (value << 1) | bit as u32;
+        if count == 0 {
+            return Ok(0);
         }
-        Ok(value)
+        // The at most four bytes the bits span, read at once and shifted
+        // into place.
+        let byte_pos = self.bit_pos / 8;
+        let bit_offset = self.bit_pos % 8;
+        let needed = (bit_offset + usize::from(count)).div_ceil(8);
+        let bytes = self
+            .input
+            .get(byte_pos..byte_pos + needed)
+            .ok_or(Error::NeedMoreInput)?;
+        let word = bytes.iter().fold(0u32, |w, &b| (w << 8) | u32::from(b));
+        let shift = needed * 8 - bit_offset - usize::from(count);
+        Ok((word >> shift) & ((1u32 << count) - 1))
+    }
+
+    /// The next 15 bits, most significant first, with zeros past the end of
+    /// the input, and how many of them are real (at most 15).
+    #[inline]
+    fn peek15(&self) -> (u32, usize) {
+        let byte_pos = self.bit_pos / 8;
+        let bit_offset = self.bit_pos % 8;
+        let rest = self.input.get(byte_pos..).unwrap_or_default();
+        let word = match rest {
+            [a, b, c, ..] => u32::from_be_bytes([0, *a, *b, *c]),
+            [a, b] => u32::from_be_bytes([0, *a, *b, 0]),
+            [a] => u32::from_be_bytes([0, *a, 0, 0]),
+            [] => 0,
+        };
+        let peek = (word >> (24 - bit_offset - 15)) & 0x7fff;
+        let available = rest
+            .len()
+            .saturating_mul(8)
+            .saturating_sub(bit_offset)
+            .min(15);
+        (peek, available)
     }
 
     fn read_encoded_u32(&mut self) -> Result<u32> {
@@ -1405,3 +1483,8 @@ impl BitReader<Allowance> {
         Self::from_bytes_with_allowance(input, &Allowance::default()).expect("unlimited RAR3 input")
     }
 }
+
+#[cfg(test)]
+mod bit_lookup_tests;
+#[cfg(all(test, feature = "write"))]
+mod match_copy_tests;

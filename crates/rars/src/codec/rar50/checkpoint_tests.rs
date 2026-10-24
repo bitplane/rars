@@ -2,9 +2,9 @@ use super::*;
 
 #[test]
 fn unlimited_checkpoint_retains_capacity_and_independent_history() {
-    let mut original = ReaderState::new(&Allowance::default());
-    original.history = Buffer::with_capacity(16, &Allowance::default()).unwrap();
-    original.history.extend_from_slice(b"ABCDE").unwrap();
+    let mut history = Buffer::with_capacity(16, &Allowance::default()).unwrap();
+    history.extend_from_slice(b"ABCDE").unwrap();
+    let mut original = ReaderState::with_history(history);
     original.reps = [1, 2, 3, 4];
     original.last_length = 7;
     let public_copy = original.try_clone().unwrap();
@@ -26,9 +26,9 @@ fn unlimited_checkpoint_retains_capacity_and_independent_history() {
 fn limited_checkpoint_keeps_its_existing_length_charge_and_refusal() {
     for limit in [20, 21] {
         let budget = Allowance::limited(limit);
-        let mut original = ReaderState::new(&budget);
-        original.history = Buffer::with_capacity(16, &budget).unwrap();
-        original.history.extend_from_slice(b"ABCDE").unwrap();
+        let mut history = Buffer::with_capacity(16, &budget).unwrap();
+        history.extend_from_slice(b"ABCDE").unwrap();
+        let original = ReaderState::with_history(history);
         assert_eq!(budget.used(), 16);
         match original.try_clone_for_stream() {
             Ok(copied) => {
@@ -55,9 +55,9 @@ fn limited_checkpoint_keeps_its_existing_length_charge_and_refusal() {
 #[test]
 fn refused_checkpoint_preserves_the_previous_history_owner() {
     let budget = super::super::workspace::RefusingBudget::new(1);
-    let mut original = ReaderState::new(&budget);
-    original.history = Buffer::with_capacity(16, &budget).unwrap();
-    original.history.extend_from_slice(b"ABCDE").unwrap();
+    let mut history = Buffer::with_capacity(16, &budget).unwrap();
+    history.extend_from_slice(b"ABCDE").unwrap();
+    let original = ReaderState::with_history(history);
     let address = original.history.as_ptr();
     assert!(matches!(
         original.try_clone_for_stream(),
@@ -108,7 +108,7 @@ fn solid_streaming_checkpoints_keep_geometric_capacity_between_small_members() {
         let discard = expected_history.len().saturating_sub(dictionary);
         expected_history.drain(..discard);
         assert_eq!(&*checkpoint.history, &expected_history);
-        assert!(checkpoint.history.capacity() <= dictionary);
+        assert!(checkpoint.history.capacity() <= dictionary + dictionary / 4);
         capacities.insert(checkpoint.history.capacity());
         decoder = checkpoint;
     }
