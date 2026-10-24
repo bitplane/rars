@@ -1120,8 +1120,9 @@ impl Archive {
                     ));
                 }
             }
-            if file.is_directory() && (file.pack_size != 0 || file.unp_size != 0 || file.is_solid())
-            {
+            // FHD_SOLID on a directory only says the run goes on past it, as
+            // RAR itself writes it; a directory with data cannot be kept.
+            if file.is_directory() && (file.pack_size != 0 || file.unp_size != 0) {
                 issues.push(format!(
                     "{label}: unsupported legacy directory payload or compression"
                 ));
@@ -4729,7 +4730,9 @@ mod tests {
                 f.block.flags |= FHD_DIRECTORY_MASK;
                 f.pack_size = 0;
             }),
-            ("unsupported legacy directory payload", |f| {
+            // In a solid archive FHD_SOLID on a directory is what RAR writes;
+            // this archive is not solid, so it is still refused.
+            ("solid dependency without archive solid flag", |f| {
                 f.block.flags |= FHD_DIRECTORY_MASK | FHD_SOLID;
                 f.pack_size = 0;
                 f.unp_size = 0;

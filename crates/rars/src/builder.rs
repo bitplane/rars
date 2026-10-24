@@ -2180,6 +2180,53 @@ mod tests {
     }
 
     #[test]
+    fn directories_inside_a_solid_run_are_flagged_solid() {
+        // 7-Zip restarts its decoder at any header without FHD_SOLID, so a
+        // directory between two members of a run must carry it, or the member
+        // after the directory cannot be read there.
+        let text = b"shared text ".repeat(200);
+        for target in [
+            ArchiveVersion::Rar20,
+            ArchiveVersion::Rar29,
+            ArchiveVersion::Rar30,
+            ArchiveVersion::Rar40,
+        ] {
+            let mut builder = Builder::new(target).solid(true);
+            builder
+                .add_directory(b"first".to_vec(), Some(0), None)
+                .unwrap();
+            builder
+                .add_bytes(b"first/a".to_vec(), text.clone(), Some(0), None)
+                .unwrap();
+            builder
+                .add_directory(b"second".to_vec(), Some(0), None)
+                .unwrap();
+            builder
+                .add_bytes(b"second/b".to_vec(), text.clone(), Some(0), None)
+                .unwrap();
+            let archive = crate::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+            let flags: Vec<_> = archive
+                .as_rar15_40()
+                .unwrap()
+                .files()
+                .map(|file| (file.is_directory(), file.is_solid()))
+                .collect();
+            // Nothing precedes the first directory or the first member; the
+            // second directory and member continue the run.
+            assert_eq!(
+                flags,
+                [(true, false), (false, false), (true, true), (false, true)],
+                "{target:?}"
+            );
+            assert_eq!(
+                archive.read_member(b"second/b", None).unwrap().unwrap(),
+                text,
+                "{target:?}"
+            );
+        }
+    }
+
+    #[test]
     #[cfg(feature = "encryption")]
     fn legacy_comments_coexist_with_salt_and_extended_times() {
         let mut builder = Builder::new(ArchiveVersion::Rar29)
