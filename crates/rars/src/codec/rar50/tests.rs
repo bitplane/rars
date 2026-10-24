@@ -4616,14 +4616,17 @@ fn buffered_reader_history_capacity_follows_the_active_dictionary() {
     decoder
         .decode_member_with_dictionary(&packed, 0, next.len(), 1024, true, DecodeMode::LiteralOnly)
         .unwrap();
+    // The history may keep up to a quarter dictionary of older bytes (the
+    // slack that spares a move per member); what matches can reach is the
+    // last dictionary of it.
     let expected = [&data[data.len() - (1024 - next.len())..], next.as_slice()].concat();
-    assert_eq!(decoder.state.history, expected);
-    assert!(decoder.state.history.capacity() <= 1024);
+    assert!(decoder.state.history.ends_with(&expected));
+    assert!(decoder.state.history.capacity() <= 1024 + 1024 / 4);
     decoder
         .decode_member_with_dictionary(&packed, 0, next.len(), 8, true, DecodeMode::LiteralOnly)
         .unwrap();
-    assert_eq!(&*decoder.state.history, &next[next.len() - 8..][..]);
-    assert!(decoder.state.history.capacity() <= 8);
+    assert!(decoder.state.history.ends_with(&next[next.len() - 8..]));
+    assert!(decoder.state.history.capacity() <= 8 + 8 / 4);
 }
 
 #[test]

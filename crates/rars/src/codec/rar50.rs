@@ -1082,25 +1082,38 @@ impl<B: Budget> ReaderState<B> {
 
     fn remember_history(&mut self, output: &[u8], dictionary_size: usize) -> Result<()> {
         let incoming = &output[output.len().saturating_sub(dictionary_size)..];
-        let keep = self.history.len().min(dictionary_size - incoming.len());
-        let required = keep + incoming.len();
-        if self.history.capacity() > dictionary_size || self.history.capacity() < required {
-            // Allocate only the retained tail, never the whole member. Replace
-            // oversized storage when the active dictionary shrinks as well.
-            let capacity =
-                reader_history_capacity(self.history.capacity(), required, dictionary_size);
-            let mut history = Buffer::with_capacity(capacity, &self.history.allowance())?;
-            history
-                .extend_from_slice(&self.history[self.history.len() - keep..])
-                .map_err(Into::into)?;
-            history.extend_from_slice(incoming).map_err(Into::into)?;
-            self.history = history;
-        } else {
-            self.history.discard_prefix(self.history.len() - keep);
-            self.history
-                .extend_from_slice(incoming)
-                .map_err(Into::into)?;
+        // The history may run up to a quarter dictionary past the window, so
+        // a member that fits in that slack is appended and nothing moves; the
+        // kept tail moves only once the slack is full. Trimming to exactly one
+        // dictionary after every member would move a whole dictionary per
+        // member. Matches never reach past `dictionary_size` (see
+        // `copy_match`), so the older bytes in the slack are never read.
+        let limit = dictionary_size.saturating_add(dictionary_size / 4);
+        let capacity = self.history.capacity();
+        if self.history.len() + incoming.len() <= capacity && capacity <= limit.saturating_mul(2) {
+            return self.history.extend_from_slice(incoming).map_err(Into::into);
         }
+        let keep = self.history.len().min(dictionary_size - incoming.len());
+        if (limit..=limit.saturating_mul(2)).contains(&capacity) {
+            // The slack is full: drop what is older than one dictionary.
+            self.history.discard_prefix(self.history.len() - keep);
+            return self.history.extend_from_slice(incoming).map_err(Into::into);
+        }
+        // Grow toward the limit (doubling, so moves stay amortized), or give
+        // back storage a larger dictionary left behind. Allocate only the
+        // retained tail, never the whole member.
+        let new_capacity = if capacity > limit {
+            keep + incoming.len()
+        } else {
+            reader_history_capacity(capacity, keep + incoming.len(), limit)
+        };
+        let keep = self.history.len().min(new_capacity - incoming.len());
+        let mut history = Buffer::with_capacity(new_capacity, &self.history.allowance())?;
+        history
+            .extend_from_slice(&self.history[self.history.len() - keep..])
+            .map_err(Into::into)?;
+        history.extend_from_slice(incoming).map_err(Into::into)?;
+        self.history = history;
         Ok(())
     }
 
