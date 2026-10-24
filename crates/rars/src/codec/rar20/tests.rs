@@ -330,6 +330,107 @@ fn copy_match_zero_fills_an_offset_that_reaches_past_the_stream() {
 }
 
 #[test]
+fn split_matches_preserve_zero_fill_and_copy_decisions_in_checkpoints() {
+    for base in [0, super::MAX_HISTORY] {
+        for offset in [0, 1, 2, 3] {
+            // Once history has been trimmed, real encoded distances cannot
+            // reach before the stream. Exercise normal copies at that base.
+            if base != 0 && offset == 3 {
+                continue;
+            }
+            let mut initial = Unpack20::new();
+            initial.base_offset = base;
+            initial.output.extend_from_slice(b"AB").unwrap();
+            let end = base + 12;
+            let mut whole = initial.clone();
+            whole.copy_match(10, offset, end).unwrap();
+            let expected = if offset == 3 {
+                b"AB\0\0\0\0\0\0\0\0\0\0".as_slice()
+            } else if offset == 2 {
+                b"ABABABABABAB".as_slice()
+            } else {
+                b"ABBBBBBBBBBB".as_slice()
+            };
+            assert_eq!(&*whole.output, expected);
+            for split in 0..=10 {
+                let target = base + 2 + split;
+                let mut decoder = initial.clone();
+                decoder.copy_match(10, offset, target).unwrap();
+                for mut resumed in [decoder.clone(), decoder] {
+                    // A no-progress drain must also preserve the decision.
+                    resumed.drain_pending_match(target).unwrap();
+                    for next in target + 1..=end {
+                        resumed.drain_pending_match(next).unwrap();
+                    }
+                    assert_eq!(
+                        &*resumed.output, expected,
+                        "base={base}, offset={offset}, split={split}"
+                    );
+                    assert!(resumed.pending_match.is_none());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn encoded_zero_fill_match_survives_member_boundaries() {
+    // Two literals followed by a ten-byte match at distance three. It starts
+    // before the stream, so the entire match must remain zero-filled.
+    let mut table = [0u8; super::TABLE_COUNT];
+    table[b'A' as usize] = 2;
+    table[b'B' as usize] = 2;
+    table[277] = 1; // length slot 7: 7 + 3, no extra bits.
+    table[super::MAIN_COUNT + 2] = 1; // offset slot 2: distance 3.
+    let tokens = super::encode_table_level_tokens(&table);
+    let levels = super::level_code_lengths_for_tokens(&tokens);
+    let codes = super::canonical_codes(&levels).unwrap();
+    let main = super::canonical_codes(&table[..super::MAIN_COUNT]).unwrap();
+    let mut bits = BitWriter::default();
+    bits.write_bits(0, 2);
+    for len in levels {
+        bits.write_bits(u32::from(len), 4);
+    }
+    for token in tokens {
+        let code = codes[token.symbol].unwrap();
+        bits.write_bits(u32::from(code.code), code.len);
+        bits.write_bits(u32::from(token.extra_value), token.extra_bits);
+    }
+    for symbol in [b'A' as usize, b'B' as usize, 277] {
+        let code = main[symbol].unwrap();
+        bits.write_bits(u32::from(code.code), code.len);
+    }
+    bits.write_bits(0, 1); // The only offset code.
+    let packed = bits.finish();
+    let expected = b"AB\0\0\0\0\0\0\0\0\0\0";
+    assert_eq!(
+        Unpack20::new().decode_member(&packed, 12).unwrap(),
+        expected
+    );
+    for split in 1..12 {
+        let mut decoder = Unpack20::new();
+        let first = decoder.decode_member(&packed, split).unwrap();
+        for mut resumed in [decoder.clone(), decoder] {
+            let rest = resumed.decode_member(&[], 12 - split).unwrap();
+            assert_eq!(
+                [first.as_slice(), &rest].concat(),
+                expected,
+                "split={split}"
+            );
+        }
+    }
+    let mut decoder = Unpack20::new();
+    let mut output = Vec::new();
+    decoder
+        .decode_member_from_reader(&mut packed.as_slice(), 3, &mut output)
+        .unwrap();
+    decoder
+        .decode_member_from_reader(&mut [].as_slice(), 9, &mut output)
+        .unwrap();
+    assert_eq!(output, expected);
+}
+
+#[test]
 fn repeat_last_without_a_previous_match_is_a_no_op() {
     let mut lengths = [0u8; super::MAIN_COUNT];
     lengths[0] = 1;
@@ -361,7 +462,7 @@ fn old_offset_match_applies_the_long_distance_length_adjustment() {
     decoder.decode_until(1).unwrap();
     assert_eq!(&*decoder.output, b"\0");
     assert_eq!(decoder.last_length, 5); // 2 + three distance adjustments.
-    assert_eq!(decoder.pending_match, Some((4, 0x40000)));
+    assert_eq!(decoder.pending_match, Some((4, 0x40000, true)));
 }
 
 #[test]

@@ -619,12 +619,14 @@ impl<B: Budget> StateArena<B> {
             return Ok(Some(at));
         }
         if let Some(larger) = (class + 1..ARENA_CLASSES).find(|&k| !self.free[k].is_empty()) {
+            // Admit every tail before giving up ownership of the source.
+            self.reserve_tail(larger, class)?;
             let at = self.free[larger].pop().expect("the list was not empty");
             self.free_slots -= Self::block_len(larger);
             // Splitting already-free storage is not a new release and must
             // not bring the next coalescing pass forward.
             for tail in class..larger {
-                self.free[tail].try_push(at + Self::block_len(tail) as u32)?;
+                self.free[tail].push_admitted(at + Self::block_len(tail) as u32);
                 self.free_slots += Self::block_len(tail);
             }
             return Ok(Some(at));
@@ -633,6 +635,21 @@ impl<B: Budget> StateArena<B> {
     }
 
     fn alloc(&mut self, class: usize) -> Result<u32> {
+        self.alloc_reserving_release(class, None)
+    }
+
+    // A growing context will release its old, smaller block after copying.
+    // Admit that release before acquiring a destination, so it cannot fail
+    // with an allocated block that no context owns.
+    fn alloc_reserving_release(
+        &mut self,
+        class: usize,
+        release_class: Option<usize>,
+    ) -> Result<u32> {
+        if let Some(old) = release_class {
+            debug_assert!(old < class);
+            self.reserve_free_entry(old)?;
+        }
         if let Some(at) = self.reuse(class)? {
             return Ok(at);
         }
@@ -643,6 +660,12 @@ impl<B: Budget> StateArena<B> {
         {
             match self.coalesce() {
                 Ok(()) => {
+                    // Coalescing can fill the reserved list. Renew its spare
+                    // slot before acquiring the destination. This refusal
+                    // must propagate, not take the maintenance fallback.
+                    if let Some(old) = release_class {
+                        self.reserve_free_entry(old)?;
+                    }
                     if let Some(at) = self.reuse(class)? {
                         return Ok(at);
                     }
@@ -665,19 +688,37 @@ impl<B: Budget> StateArena<B> {
         Ok(at as u32)
     }
 
+    fn reserve_free_entry(&mut self, class: usize) -> Result<()> {
+        let list = &mut self.free[class];
+        list.reserve_total_capacity(list.len() + 1)
+    }
+
     fn release(&mut self, at: u32, class: usize) -> Result<()> {
-        self.free[class].try_push(at)?;
+        self.reserve_free_entry(class)?;
+        self.release_admitted(at, class);
+        Ok(())
+    }
+
+    fn release_admitted(&mut self, at: u32, class: usize) {
+        self.free[class].push_admitted(at);
         let len = Self::block_len(class);
         self.free_slots += len;
         self.released_since_coalesce = self.released_since_coalesce.saturating_add(len);
+    }
+
+    fn reserve_tail(&mut self, from: usize, to: usize) -> Result<()> {
+        for class in to..from {
+            self.reserve_free_entry(class)?;
+        }
         Ok(())
     }
 
     // Keep the first block of class `to` at `at` and free the rest of the
     // block of class `from` there, as blocks of classes `to` .. `from` - 1.
     fn release_tail(&mut self, at: u32, from: usize, to: usize) -> Result<()> {
+        self.reserve_tail(from, to)?;
         for class in to..from {
-            self.release(at + Self::block_len(class) as u32, class)?;
+            self.release_admitted(at + Self::block_len(class) as u32, class);
         }
         Ok(())
     }
@@ -1899,12 +1940,12 @@ impl<B: Budget> PpmdState<B> {
                 if old == new {
                     at
                 } else {
-                    let moved = self.arena.alloc(new)?;
+                    let moved = self.arena.alloc_reserving_release(new, Some(old))?;
                     let from = at as usize;
                     self.arena
                         .states
                         .copy_within(from..from + n, moved as usize);
-                    self.arena.release(at, old)?;
+                    self.arena.release_admitted(at, old);
                     moved
                 }
             }
@@ -2329,3 +2370,6 @@ mod tests;
 
 #[cfg(test)]
 mod arena_tests;
+
+#[cfg(test)]
+mod allocation_failure_tests;
