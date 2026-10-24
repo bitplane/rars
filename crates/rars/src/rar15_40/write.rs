@@ -622,7 +622,12 @@ fn write_members_to(
                 progress,
             )
             .map_err(|error| crate::write_stream::member_error(error, member.name, "preparing"))?;
-            let solid_continuation = encoded.method != 0x30 && solid_run_has_member;
+            // A directory header carries no data but still sits in the chain.
+            // 7-Zip restarts its decoder at any header without FHD_SOLID,
+            // directories included, so one inside a run must say the run goes
+            // on; UnRAR passes over directory headers either way.
+            let solid_continuation =
+                (encoded.method != 0x30 || member.is_directory) && solid_run_has_member;
             // Storing a member rebuilds the encoder, so the chain ends there.
             // An empty compressed member leaves the chain exactly as it was:
             // it feeds the encoder nothing, and readers pass over an empty
