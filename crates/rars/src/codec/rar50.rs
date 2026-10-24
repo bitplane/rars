@@ -2001,7 +2001,7 @@ impl<B: Budget> HuffmanState<B> {
         validate_huffman_counts(&count)?;
 
         Ok(Self {
-            state: super::canonical::Huffman::from_counts(lengths, count, allowance)?,
+            state: super::canonical::Huffman::from_counts_with_lookup(lengths, count, allowance)?,
         })
     }
     fn try_clone(&self) -> Result<Self> {
@@ -2015,20 +2015,15 @@ impl<B: Budget> HuffmanState<B> {
     /// that runs past the end of the input needs more input, and a code is
     /// invalid only when 15 real bits start none.
     fn decode(&self, bits: &mut BitReader<'_>) -> Result<usize> {
-        if self.state.is_empty() {
-            return Err(Error::InvalidData("RAR 5 empty Huffman table"));
-        }
         let (peek, available) = bits.peek15();
-        match self.state.decode_peeked(peek) {
-            Some((symbol, len)) if len <= available => {
-                bits.skip(len);
-                Ok(symbol)
-            }
-            // The code needs bits past the end of the input, or the input
-            // ends before any code is complete.
-            _ if available < 15 => Err(Error::NeedMoreInput),
-            _ => Err(Error::InvalidData("RAR 5 invalid Huffman code")),
-        }
+        let (symbol, len) = self.state.decode_peeked_checked(
+            peek,
+            available,
+            "RAR 5 empty Huffman table",
+            "RAR 5 invalid Huffman code",
+        )?;
+        bits.skip(len);
+        Ok(symbol)
     }
 }
 
@@ -2147,3 +2142,6 @@ mod checkpoint_tests;
 #[cfg(all(test, feature = "write"))]
 #[path = "rar50/history_retention_tests.rs"]
 mod history_retention_tests;
+
+#[cfg(test)]
+mod bit_lookup_tests;
