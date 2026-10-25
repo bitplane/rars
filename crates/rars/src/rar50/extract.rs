@@ -1215,7 +1215,10 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
         file: &FileHeader,
         writer: &mut dyn Write,
     ) -> Result<()> {
-        let mut streaming_decoder = self.decoder.try_clone_for_stream()?;
+        // Read just the solid flag here; full header validation stays in decode.
+        let mut streaming_decoder = self
+            .decoder
+            .try_prepare_for_stream(file.compression_info & 0x40 != 0, file.unpacked_size)?;
         let (mut packed, keys) = file
             .packed_reader_with_allowance(archive, self.password, &self.allowance)
             .map_err(|error| file.entry_error("reading", error))?;
@@ -1275,7 +1278,10 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
         // Keep solid state only after successful emission and integrity checks,
         // just as for a non-split streaming member.
         self.decoder.read_control.check()?;
-        let mut decoder = self.decoder.try_clone_for_stream()?;
+        let mut decoder = self.decoder.try_prepare_for_stream(
+            final_file.compression_info & 0x40 != 0,
+            final_file.unpacked_size,
+        )?;
         let control = decoder.read_control.clone();
         let mut packed =
             split.fragment_reader_with_allowance(volumes, decryptor, &self.allowance)?;
@@ -2207,6 +2213,79 @@ mod tests {
     }
 
     #[test]
+    fn independent_streaming_allocations_do_not_depend_on_previous_history() {
+        use crate::codec::workspace::RefusingBudget;
+
+        let data = b"independent streaming member".repeat(100);
+        let mut builder = crate::Builder::new(ArchiveVersion::Rar50)
+            .store(false)
+            .compression_level(Some(1));
+        builder
+            .add_bytes(b"member".to_vec(), data.clone(), None, None)
+            .unwrap();
+        let archive = Archive::parse_owned(builder.to_bytes().unwrap()).unwrap();
+        let file = archive.files().next().unwrap();
+        assert!(!file.is_stored());
+        assert!(!file.decoded_compression_info().unwrap().solid);
+        let volumes = [
+            include_bytes!("../../tests/fixtures/rar50/multivol.part1.rar").as_slice(),
+            include_bytes!("../../tests/fixtures/rar50/multivol.part2.rar").as_slice(),
+            include_bytes!("../../tests/fixtures/rar50/multivol.part3.rar").as_slice(),
+        ]
+        .map(|bytes| Archive::parse(bytes).unwrap());
+        let first = volumes[0].files().next().unwrap();
+        let last = volumes[2].files().next().unwrap();
+        assert!(!last.decoded_compression_info().unwrap().solid);
+        let seed = vec![b'X'; 1024 * 1024];
+        let packed_seed = crate::codec::rar50::encode_literal_only(&seed, 0).unwrap();
+
+        for split in [false, true] {
+            let mut counts = Vec::new();
+            for seeded in [false, true] {
+                let budget = RefusingBudget::new(usize::MAX);
+                let mut session = DecoderSession::with_allowance(None, 0, &budget);
+                if seeded {
+                    session
+                        .decoder
+                        .decode_member_with_dictionary(
+                            &packed_seed,
+                            0,
+                            seed.len(),
+                            seed.len(),
+                            false,
+                            DecodeMode::Lz,
+                        )
+                        .unwrap();
+                    assert!(budget.used() >= seed.len() as u64);
+                }
+                let mut pending = PendingSplitRefs::with_allowance(first, 0, 0, &budget).unwrap();
+                pending.append(1, 0).unwrap();
+                pending.append(2, 0).unwrap();
+                let before = budget.attempts();
+                let mut output = Vec::new();
+                if split {
+                    session
+                        .stream_split_to(&volumes, &pending, last, None, &mut output)
+                        .unwrap();
+                    assert_eq!(output.len(), 4096);
+                    assert_eq!(crc32(&output), 0xb9c5_4415);
+                } else {
+                    session.write_file_to(&archive, file, &mut output).unwrap();
+                    assert_eq!(output, data);
+                }
+                counts.push(budget.attempts() - before);
+                drop(pending);
+                drop(session);
+                assert_eq!(budget.used(), 0);
+            }
+            assert_eq!(
+                counts[0], counts[1],
+                "split={split}: fresh versus seeded allocations"
+            );
+        }
+    }
+
+    #[test]
     fn streaming_checkpoint_rolls_back_sink_cancellation_and_integrity_failures() {
         let mut word = 0x1234_5678u32;
         // Avoid a period aligned with the 64 KiB flush: appending or resetting
@@ -2234,6 +2313,7 @@ mod tests {
         let archive = Archive::parse_owned(builder.to_bytes().unwrap()).unwrap();
         let files: Vec<_> = archive.files().collect();
         assert!(files.iter().all(|file| !file.is_stored()));
+        assert!(!files[0].decoded_compression_info().unwrap().solid);
         assert!(files[1].decoded_compression_info().unwrap().solid);
         assert!(
             files[1].packed_size() < 128,

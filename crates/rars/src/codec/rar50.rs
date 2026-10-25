@@ -611,8 +611,26 @@ impl<B: Budget> ReaderState<B> {
         self.try_clone_with_spare_capacity(false)
     }
 
-    pub(crate) fn try_clone_for_stream(&self) -> Result<Self> {
-        self.try_clone_with_spare_capacity(!B::LIMITED)
+    pub(crate) fn try_prepare_for_stream(&self, solid: bool, output_size: u64) -> Result<Self> {
+        if solid {
+            self.try_clone_with_spare_capacity(!B::LIMITED)
+        } else {
+            // Match reset() without copying history or tables that it discards.
+            // Keep the original state alive until output and integrity succeed.
+            let mut decoder = Self::new(&self.allowance());
+            decoder.read_control = self.read_control.clone();
+            if !B::LIMITED {
+                // Preserve useful capacity without copying bytes. Cap it by the
+                // next member's size so small members shed large old buffers.
+                // StreamingOutput still handles a smaller dictionary as before.
+                let capacity = self
+                    .history
+                    .capacity()
+                    .min(usize::try_from(output_size).unwrap_or(usize::MAX));
+                decoder.history = Buffer::with_capacity(capacity, &self.allowance())?;
+            }
+            Ok(decoder)
+        }
     }
 
     fn try_clone_with_spare_capacity(&self, preserve_capacity: bool) -> Result<Self> {

@@ -467,7 +467,7 @@ fn optional_crc_keeps_limited_growth_and_refusals_identical_to_legacy_streaming(
 }
 
 #[test]
-fn optional_crc_preserves_bad_hash_checkpoint_for_a_history_dependent_successor() {
+fn failed_independent_stream_preserves_checkpoint_for_history_dependent_successor() {
     let mut random = 0x1234_5678u32;
     let seed: Vec<_> = (0..32749)
         .map(|_| {
@@ -499,30 +499,61 @@ fn optional_crc_preserves_bad_hash_checkpoint_for_a_history_dependent_successor(
 
     let different = b"failed member replaces the old raw dictionary\n".repeat(4096);
     let (failed_archive, valid) = fixture(&different, false, false);
-    let mut corrupt = valid.clone();
-    corrupt.hash.as_mut().unwrap().data[0] ^= 1;
-    let mut session = DecoderSession::with_allowance(None, 0, &Allowance::default());
-    session
-        .write_file_to(&archive, files[0], &mut std::io::sink())
-        .unwrap();
-    let (result, work) =
-        measured(|| session.write_file_to(&failed_archive, &corrupt, &mut std::io::sink()));
-    assert!(matches!(
-        result.unwrap_err().root_cause(),
-        Error::HashMismatch { hash_type: 0 }
-    ));
-    assert_eq!(
-        work.bytes + work.zeroes,
-        0,
-        "bad digest does not change hash authority"
-    );
-    let mut output = Vec::new();
-    session
-        .write_file_to(&archive, files[1], &mut output)
-        .unwrap();
-    assert_eq!(output, next);
+    assert!(!valid.decoded_compression_info().unwrap().solid);
+    for split in [false, true] {
+        for bad_hash in [false, true] {
+            let mut corrupt = valid.clone();
+            if bad_hash {
+                corrupt.hash.as_mut().unwrap().data[0] ^= 1;
+            } else {
+                corrupt.hash = None;
+                corrupt.data_crc32 = Some(crc32(&different) ^ 1);
+            }
+            let mut session = DecoderSession::with_allowance(None, 0, &Allowance::default());
+            session
+                .write_file_to(&archive, files[0], &mut std::io::sink())
+                .unwrap();
+            let (result, work) = measured(|| {
+                if split {
+                    let pending = PendingSplitRefs::new(&valid, 0, 0);
+                    session.stream_split_to(
+                        std::slice::from_ref(&failed_archive),
+                        &pending,
+                        &corrupt,
+                        None,
+                        &mut std::io::sink(),
+                    )
+                } else {
+                    session.write_file_to(&failed_archive, &corrupt, &mut std::io::sink())
+                }
+            });
+            let error = result.unwrap_err();
+            if bad_hash {
+                assert!(matches!(
+                    error.root_cause(),
+                    Error::HashMismatch { hash_type: 0 }
+                ));
+            } else {
+                assert_eq!(error.kind(), crate::ErrorKind::ChecksumMismatch);
+            }
+            // Only ordinary hash-verified streams omit CRC work.
+            if !split && bad_hash {
+                assert_eq!(
+                    work.bytes + work.zeroes,
+                    0,
+                    "bad digest does not change hash authority"
+                );
+            }
+            let mut output = Vec::new();
+            session
+                .write_file_to(&archive, files[1], &mut output)
+                .unwrap();
+            assert_eq!(output, next, "split={split}, bad_hash={bad_hash}");
+        }
+    }
 
     // Prove a mistakenly committed failed dictionary cannot pass the fixture.
+    let mut session = DecoderSession::with_allowance(None, 0, &Allowance::default());
     session
         .write_file_to(&failed_archive, &valid, &mut std::io::sink())
         .unwrap();
