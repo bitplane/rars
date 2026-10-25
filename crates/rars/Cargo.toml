@@ -90,3 +90,8 @@ required-features = ["write"]
 name = "huffman_decode"
 harness = false
 required-features = ["write"]
+
+[[bench]]
+name = "rar20_decode"
+harness = false
+required-features = ["write"]

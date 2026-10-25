@@ -9,6 +9,8 @@ pub use encoder::{
 };
 
 #[cfg(test)]
+mod bit_lookup_tests;
+#[cfg(test)]
 mod match_copy_tests;
 
 use super::workspace::{Allowance, Budget, Buffer};
@@ -110,9 +112,9 @@ pub(crate) struct Reader20State<B: Budget> {
     bits: BitReader<B>,
     levels: [u8; OLD_LEVEL_COUNT],
     main: Huffman<B>,
-    offsets: Huffman<B>,
-    lengths: Huffman<B>,
-    audio_tables: [Huffman<B>; MAX_CHANNELS],
+    offsets: BitwiseHuffman<B>,
+    lengths: BitwiseHuffman<B>,
+    audio_tables: [BitwiseHuffman<B>; MAX_CHANNELS],
     audio_block: bool,
     channels: usize,
     cur_channel: usize,
@@ -134,9 +136,9 @@ impl<B: Budget> Reader20State<B> {
             bits: BitReader::with_allowance(allowance),
             levels: [0; OLD_LEVEL_COUNT],
             main: Huffman::with_allowance(allowance),
-            offsets: Huffman::with_allowance(allowance),
-            lengths: Huffman::with_allowance(allowance),
-            audio_tables: std::array::from_fn(|_| Huffman::with_allowance(allowance)),
+            offsets: BitwiseHuffman::with_allowance(allowance),
+            lengths: BitwiseHuffman::with_allowance(allowance),
+            audio_tables: std::array::from_fn(|_| BitwiseHuffman::with_allowance(allowance)),
             audio_block: false,
             channels: 1,
             cur_channel: 0,
@@ -287,7 +289,7 @@ impl<B: Budget> Reader20State<B> {
         };
 
         let level_lengths = Self::read_level_lengths(&mut self.bits)?;
-        let level_decoder = Huffman::with_lengths(&level_lengths, &self.output.allowance())?;
+        let level_decoder = BitwiseHuffman::with_lengths(&level_lengths, &self.output.allowance())?;
         let mut new_levels = [0u8; OLD_LEVEL_COUNT];
         let mut pos = 0usize;
         while pos < table_size {
@@ -321,7 +323,7 @@ impl<B: Budget> Reader20State<B> {
         if self.audio_block {
             for channel in 0..self.channels {
                 let start = channel * AUDIO_COUNT;
-                self.audio_tables[channel] = Huffman::with_lengths(
+                self.audio_tables[channel] = BitwiseHuffman::with_lengths(
                     &self.levels[start..start + AUDIO_COUNT],
                     &self.output.allowance(),
                 )?;
@@ -329,11 +331,11 @@ impl<B: Budget> Reader20State<B> {
         } else {
             self.main =
                 Huffman::with_lengths(&self.levels[..MAIN_COUNT], &self.output.allowance())?;
-            self.offsets = Huffman::with_lengths(
+            self.offsets = BitwiseHuffman::with_lengths(
                 &self.levels[MAIN_COUNT..MAIN_COUNT + OFFSET_COUNT],
                 &self.output.allowance(),
             )?;
-            self.lengths = Huffman::with_lengths(
+            self.lengths = BitwiseHuffman::with_lengths(
                 &self.levels[MAIN_COUNT + OFFSET_COUNT..TABLE_COUNT],
                 &self.output.allowance(),
             )?;
@@ -678,11 +680,15 @@ fn fill_levels(levels: &mut [u8], pos: &mut usize, count: usize, value: u8) -> R
 }
 
 #[derive(Debug)]
-struct Huffman<B: Budget = Allowance> {
+struct Huffman<B: Budget = Allowance, const LOOKUP: bool = true> {
     state: super::canonical::Huffman<B>,
 }
 
-impl<B: Budget> Huffman<B> {
+// Accelerate the large LZ alphabet. Keep metadata and audio bitwise to
+// avoid lookup setup for small tables and extra work for one-bit audio codes.
+type BitwiseHuffman<B = Allowance> = Huffman<B, false>;
+
+impl<B: Budget, const LOOKUP: bool> Huffman<B, LOOKUP> {
     fn with_allowance(allowance: &B) -> Self {
         Self {
             state: super::canonical::Huffman::with_allowance(allowance),
@@ -704,7 +710,11 @@ impl<B: Budget> Huffman<B> {
         validate_huffman_counts(&count)?;
 
         Ok(Self {
-            state: super::canonical::Huffman::from_counts(lengths, count, allowance)?,
+            state: if LOOKUP {
+                super::canonical::Huffman::from_counts_with_lookup(lengths, count, allowance)?
+            } else {
+                super::canonical::Huffman::from_counts(lengths, count, allowance)?
+            },
         })
     }
     fn try_clone(&self) -> Result<Self> {
@@ -712,17 +722,40 @@ impl<B: Budget> Huffman<B> {
             state: self.state.try_clone()?,
         })
     }
+    #[inline]
     fn decode(&self, bits: &mut BitReader<B>) -> Result<usize> {
-        self.state.decode(
-            || bits.read_bit().map(|bit| bit as u16),
+        if !LOOKUP {
+            return self.state.decode(
+                || bits.read_bit(),
+                "RAR 2.0 empty Huffman table",
+                "RAR 2.0 invalid Huffman code",
+            );
+        }
+        let (peek, available) = bits.peek15();
+        match self.state.decode_peeked_checked(
+            peek,
+            available,
             "RAR 2.0 empty Huffman table",
             "RAR 2.0 invalid Huffman code",
-        )
+        ) {
+            Ok((symbol, len)) => {
+                bits.bit_pos += len;
+                Ok(symbol)
+            }
+            Err(error) => {
+                // RAR 2.0's original bitwise decoder consumed all available
+                // bits (up to 15) on failure, except for an empty table.
+                if !self.state.is_empty() {
+                    bits.bit_pos += available;
+                }
+                Err(error)
+            }
+        }
     }
 }
 
 #[cfg(all(test, feature = "write"))]
-impl Huffman<Allowance> {
+impl<const LOOKUP: bool> Huffman<Allowance, LOOKUP> {
     fn from_lengths(lengths: &[u8]) -> Result<Self> {
         Self::with_lengths(lengths, &Allowance::default())
     }
@@ -766,8 +799,15 @@ impl<B: Budget> BitReader<B> {
         self.bit_pos -= bytes * 8;
     }
 
-    fn read_bit(&mut self) -> Result<u8> {
-        self.read_bits(1).map(|value| value as u8)
+    #[inline]
+    fn read_bit(&mut self) -> Result<u16> {
+        let byte = *self
+            .input
+            .get(self.bit_pos / 8)
+            .ok_or(Error::NeedMoreInput)?;
+        let bit = (byte >> (7 - self.bit_pos % 8)) & 1;
+        self.bit_pos += 1;
+        Ok(u16::from(bit))
     }
 
     fn read_bits(&mut self, count: u8) -> Result<u32> {
@@ -780,14 +820,41 @@ impl<B: Budget> BitReader<B> {
         if count > 24 {
             return Err(Error::InvalidData("RAR 2.0 bit read is too wide"));
         }
-        let mut value = 0u32;
-        for i in 0..count as usize {
-            let bit_index = self.bit_pos + i;
-            let byte = *self.input.get(bit_index / 8).ok_or(Error::NeedMoreInput)?;
-            let bit = (byte >> (7 - (bit_index % 8))) & 1;
-            value = (value << 1) | bit as u32;
+        if count == 0 {
+            return Ok(0);
         }
-        Ok(value)
+        // The at most four bytes the bits span, read at once and shifted
+        // into place.
+        let byte_pos = self.bit_pos / 8;
+        let bit_offset = self.bit_pos % 8;
+        let needed = (bit_offset + usize::from(count)).div_ceil(8);
+        let bytes = self
+            .input
+            .get(byte_pos..byte_pos + needed)
+            .ok_or(Error::NeedMoreInput)?;
+        let word = bytes.iter().fold(0u32, |w, &b| (w << 8) | u32::from(b));
+        let shift = needed * 8 - bit_offset - usize::from(count);
+        Ok((word >> shift) & ((1u32 << count) - 1))
+    }
+
+    /// The next 15 bits, most significant first, with zeros past the end of
+    /// the input, and how many of them are real (at most 15).
+    #[inline]
+    fn peek15(&self) -> (u32, usize) {
+        let byte_pos = self.bit_pos / 8;
+        let bit_offset = self.bit_pos % 8;
+        let rest = self.input.get(byte_pos..).unwrap_or_default();
+        let (word, available) = match rest {
+            [a, b, c, ..] => (u32::from_be_bytes([0, *a, *b, *c]), 15),
+            [a, b] => (
+                u32::from_be_bytes([0, *a, *b, 0]),
+                (16 - bit_offset).min(15),
+            ),
+            [a] => (u32::from_be_bytes([0, *a, 0, 0]), 8 - bit_offset),
+            [] => (0, 0),
+        };
+        let peek = (word >> (24 - bit_offset - 15)) & 0x7fff;
+        (peek, available)
     }
 
     fn remaining_bytes_from_current(&self) -> usize {
