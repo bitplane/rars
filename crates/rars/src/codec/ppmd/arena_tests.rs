@@ -103,7 +103,7 @@ fn state_growth_shrink_cycles_preserve_values_and_stop_growing_storage() {
             num_stats: 1,
             summ_freq: 0,
             suffix: None,
-            header_offset: NULL_OFFSET,
+            _header_offset: NULL_OFFSET,
             array_offset: NULL_OFFSET,
         })
         .unwrap();
