@@ -136,8 +136,8 @@ impl<B: Budget> Huffman<B> {
     /// up to 10 bits; bounded readers scan without extra storage. The caller
     /// consumes only the code's bits, and must
     /// check that they were real input rather than padding past its end.
-    // Always inlined: it is the inner loop of two decoders, and with both
-    // calling it the compiler stopped inlining it into RAR5's (11% slower).
+    // Always inlined: adding a second caller previously stopped the compiler
+    // from inlining this inner loop into RAR5 (11% slower).
     #[inline(always)]
     pub(super) fn decode_peeked(&self, peek: u32) -> Option<(usize, usize)> {
         if B::LIMITED {
@@ -204,8 +204,8 @@ impl<B: Budget> Huffman<B> {
         }
     }
 
-    /// Bitwise decoder used by RAR 2.0, which does not need a lookup table.
-    /// Also serves as an independent oracle for the lookup decoder in tests.
+    /// Bitwise decoder for small RAR 2.0 tables and an independent oracle
+    /// for the lookup decoders in tests.
     pub(super) fn decode(
         &self,
         mut read_bit: impl FnMut() -> Result<u16>,

@@ -136,7 +136,7 @@ fn decodes_rar20_lz_member() {
 #[test]
 fn rejects_oversubscribed_rar20_huffman_tables() {
     assert!(matches!(
-        Huffman::from_lengths(&[1, 1, 1]),
+        Huffman::<_, true>::from_lengths(&[1, 1, 1]),
         Err(Error::InvalidData("RAR 2.0 oversubscribed Huffman table"))
     ));
 }
@@ -164,7 +164,7 @@ fn rejects_an_empty_main_huffman_table() {
 #[test]
 fn internal_bit_and_huffman_helpers_reject_out_of_range_requests() {
     assert!(matches!(
-        Huffman::from_lengths(&[16]),
+        Huffman::<_, true>::from_lengths(&[16]),
         Err(Error::InvalidData("RAR 2.0 Huffman length is too large"))
     ));
     assert!(matches!(
