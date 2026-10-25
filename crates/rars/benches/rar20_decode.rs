@@ -97,12 +97,96 @@ fn decode(c: &mut Criterion) {
     group.finish();
 }
 
+// Seed a fresh decoder rather than cloning it: cloning changes Vec capacity
+// and would turn every case into a checkpoint-restoration measurement.
+fn seeded_solid_decoder(mut seed: &[u8]) -> Unpack20 {
+    let mut decoder = Unpack20::new();
+    decoder
+        .decode_member_from_reader(&mut seed, 1024 * 1024, &mut std::io::sink())
+        .unwrap();
+    decoder
+}
+
+fn solid_history(c: &mut Criterion) {
+    const WINDOW: usize = 1024 * 1024;
+    let mut group = c.benchmark_group("rar20_solid_history");
+    for size in [1024, 4093, 16384, 65537, WINDOW] {
+        let mut encoder =
+            Unpack20Encoder::with_options(EncodeOptions::new(16).with_try_audio(false));
+        let prefix = vec![b'A'; WINDOW];
+        let data = vec![b'A'; size];
+        let seed = encoder.encode_member(&prefix).unwrap();
+        let packed = encoder.encode_member(&data).unwrap();
+        let members = (2 * WINDOW).div_ceil(size);
+        assert_eq!(
+            Unpack20::new().decode_member(&seed, WINDOW).unwrap(),
+            prefix
+        );
+        eprintln!(
+            "solid fixture: {members} members of {size} bytes; seed crc32 {:08x}, member {} packed bytes, crc32 {:08x}",
+            rars::crc32::crc32(&seed), packed.len(), rars::crc32::crc32(&packed)
+        );
+        group.throughput(Throughput::Bytes((members * size) as u64));
+        for mode in ["owned", "streaming", "checkpoint", "restore"] {
+            if size != 1024 && matches!(mode, "checkpoint" | "restore") {
+                continue;
+            }
+            // The same packed continuation is reused only after verifying the
+            // entire sequence, including its offset/table state and checkpoints.
+            let mut decoder = seeded_solid_decoder(&seed);
+            for _ in 0..members {
+                if mode == "streaming" {
+                    let mut output = Vec::new();
+                    decoder
+                        .decode_member_from_reader(&mut packed.as_slice(), size, &mut output)
+                        .unwrap();
+                    assert_eq!(output, data);
+                } else {
+                    assert_eq!(decoder.decode_member(&packed, size).unwrap(), data);
+                }
+                if mode == "restore" {
+                    decoder = decoder.clone();
+                } else if mode == "checkpoint" {
+                    black_box(decoder.clone());
+                }
+            }
+            group.bench_function(format!("{mode}/{size}"), |b| {
+                b.iter_batched(
+                    || seeded_solid_decoder(&seed),
+                    |mut decoder| {
+                        for _ in 0..members {
+                            if mode == "streaming" {
+                                decoder
+                                    .decode_member_from_reader(
+                                        &mut packed.as_slice(),
+                                        size,
+                                        &mut std::io::sink(),
+                                    )
+                                    .unwrap();
+                            } else {
+                                black_box(decoder.decode_member(&packed, size).unwrap());
+                            }
+                            if mode == "restore" {
+                                decoder = decoder.clone();
+                            } else if mode == "checkpoint" {
+                                black_box(decoder.clone());
+                            }
+                        }
+                    },
+                    criterion::BatchSize::PerIteration,
+                );
+            });
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     name = benches;
     config = Criterion::default()
         .sample_size(15)
         .warm_up_time(Duration::from_millis(500))
         .measurement_time(Duration::from_secs(2));
-    targets = decode
+    targets = decode, solid_history
 );
 criterion_main!(benches);

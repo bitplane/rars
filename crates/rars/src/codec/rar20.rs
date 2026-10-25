@@ -11,6 +11,8 @@ pub use encoder::{
 #[cfg(test)]
 mod bit_lookup_tests;
 #[cfg(test)]
+mod history_tests;
+#[cfg(test)]
 mod match_copy_tests;
 
 use super::workspace::{Allowance, Budget, Buffer};
@@ -26,6 +28,8 @@ const AUDIO_COUNT: usize = 257;
 const MAX_CHANNELS: usize = 4;
 const OLD_LEVEL_COUNT: usize = AUDIO_COUNT * MAX_CHANNELS;
 const MAX_HISTORY: usize = 1024 * 1024;
+// Maximum obsolete history retained between successful unlimited member reads.
+const HISTORY_TRIM_BATCH: usize = 64 * 1024;
 // Longest match that stays on the scalar copy path.
 const SHORT_MATCH: usize = 64;
 
@@ -155,6 +159,13 @@ impl<B: Budget> Reader20State<B> {
     }
 
     pub(crate) fn try_clone(&self) -> Result<Self> {
+        // A future match needs only the last window. Do not copy deferred
+        // bytes into a checkpoint; bounded copies keep their charge sequence.
+        let drain = if B::LIMITED {
+            0
+        } else {
+            self.output.len().saturating_sub(MAX_HISTORY)
+        };
         Ok(Self {
             read_control: self.read_control.clone(),
             bits: self.bits.try_clone()?,
@@ -178,8 +189,8 @@ impl<B: Budget> Reader20State<B> {
             last_length: self.last_length,
             pending_match: self.pending_match,
             in_block: self.in_block,
-            output: Buffer::copied(&self.output, &self.output.allowance())?,
-            base_offset: self.base_offset,
+            output: Buffer::copied(&self.output[drain..], &self.output.allowance())?,
+            base_offset: self.base_offset + drain,
         })
     }
     pub fn decode_member_owned(
@@ -192,6 +203,7 @@ impl<B: Budget> Reader20State<B> {
         let target = start
             .checked_add(output_size)
             .ok_or(Error::InvalidData("RAR 2.0 output size overflows"))?;
+        self.prepare_history(output_size);
         if !input.is_empty() {
             self.bits = BitReader::with_allowance(&self.output.allowance());
         }
@@ -202,7 +214,7 @@ impl<B: Budget> Reader20State<B> {
         })?;
         self.read_last_tables()?;
         let out = Buffer::copied(self.raw_range(start, target), &self.output.allowance())?;
-        self.trim_history(target, target);
+        self.finish_history();
         Ok(out)
     }
 
@@ -230,6 +242,7 @@ impl<B: Budget> Reader20State<B> {
         let target = start
             .checked_add(output_size)
             .ok_or(Error::InvalidData("RAR 2.0 output size overflows"))?;
+        self.prepare_history(output_size);
         self.bits = BitReader::with_allowance(&self.output.allowance());
         self.bits.input.read_to_end(input)?;
         if !self.in_block && self.bits.remaining_bytes_from_current() > 0 {
@@ -247,7 +260,7 @@ impl<B: Budget> Reader20State<B> {
 
         let decoded = self.raw_range(start, target);
         out.write_all(decoded).map_err(Error::from)?;
-        self.trim_history(target, target);
+        self.finish_history();
         Ok(())
     }
 
@@ -635,6 +648,23 @@ impl<B: Budget> Reader20State<B> {
         let rel_start = start - self.base_offset;
         let rel_end = end - self.base_offset;
         &self.output[rel_start..rel_end]
+    }
+
+    fn prepare_history(&mut self, output_size: usize) {
+        // Reclaim deferred bytes before they could cause an allocation. Keep
+        // bounded readers' growth and failure prefixes exactly as before.
+        if !B::LIMITED && output_size > self.output.capacity() - self.output.len() {
+            let current = self.current_pos();
+            self.trim_history(current, current);
+        }
+    }
+
+    fn finish_history(&mut self) {
+        // Amortize window moves across small members using existing capacity.
+        if B::LIMITED || self.output.len().saturating_sub(MAX_HISTORY) >= HISTORY_TRIM_BATCH {
+            let current = self.current_pos();
+            self.trim_history(current, current);
+        }
     }
 
     fn trim_history(&mut self, flushed_pos: usize, current_pos: usize) {

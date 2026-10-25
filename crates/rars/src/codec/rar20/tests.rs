@@ -915,7 +915,7 @@ fn write_fresh_lz_zero_block(bits: &mut BitWriter, count: usize, end: bool) {
 }
 
 #[test]
-fn decoder_and_encoder_retain_only_the_last_window_of_solid_history() {
+fn decoder_batches_trimming_while_encoder_keeps_only_the_last_window() {
     let first = vec![b'A'; super::MAX_HISTORY / 2 + 64];
     let second = vec![b'B'; super::MAX_HISTORY / 2 + 64];
     let mut encoder = Unpack20Encoder::with_options(EncodeOptions::new(0));
@@ -932,8 +932,16 @@ fn decoder_and_encoder_retain_only_the_last_window_of_solid_history() {
         decoder.decode_member(&second_packed, second.len()).unwrap(),
         second
     );
-    assert_eq!(decoder.output.len(), super::MAX_HISTORY);
-    assert_eq!(decoder.base_offset, 128);
+    let current = first.len() + second.len();
+    assert_eq!(decoder.current_pos(), current);
+    assert!(
+        (super::MAX_HISTORY..super::MAX_HISTORY + super::HISTORY_TRIM_BATCH)
+            .contains(&decoder.output.len())
+    );
+    assert_eq!(
+        decoder.raw_range(current - super::MAX_HISTORY, current),
+        encoder.history
+    );
 }
 
 #[test]
