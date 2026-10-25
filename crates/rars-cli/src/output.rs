@@ -14,6 +14,10 @@ use std::time::SystemTime;
 /// Private, same-filesystem storage for a verified extraction's pending outputs.
 pub(crate) struct ExtractionStaging {
     pub(crate) root: PathBuf,
+    /// The root resolved once, when it is created: every destination is
+    /// checked against it, and resolving it again for each one cost a walk
+    /// of its path per member.
+    identity: PathBuf,
 }
 
 impl ExtractionStaging {
@@ -34,7 +38,15 @@ impl ExtractionStaging {
                 builder.mode(0o700);
             }
             match builder.create(&root) {
-                Ok(()) => return Ok(Self { root }),
+                Ok(()) => {
+                    return match fs::canonicalize(&root) {
+                        Ok(identity) => Ok(Self { root, identity }),
+                        Err(error) => {
+                            let _ = fs::remove_dir(&root);
+                            Err(error)
+                        }
+                    };
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error),
             }
@@ -45,18 +57,24 @@ impl ExtractionStaging {
         ))
     }
 
-    pub(crate) fn reject_alias(&self, destination: &Path) -> rars::Result<()> {
-        let storage = fs::canonicalize(&self.root)?;
+    /// Refuses a destination that resolves into the storage. Returns the
+    /// destination's resolved path when it exists, so callers need not
+    /// resolve it again.
+    pub(crate) fn reject_alias(&self, destination: &Path) -> rars::Result<Option<PathBuf>> {
         let mut ancestor = Some(destination);
         while let Some(path) = ancestor {
+            if missing(path) {
+                ancestor = path.parent();
+                continue;
+            }
             match fs::canonicalize(path) {
                 Ok(identity) => {
-                    if identity.starts_with(&storage) {
+                    if identity.starts_with(&self.identity) {
                         return Err(Error::InvalidHeader(
                             "archive path conflicts with extraction storage",
                         ));
                     }
-                    return Ok(());
+                    return Ok((path == destination).then_some(identity));
                 }
                 Err(error)
                     if matches!(
@@ -69,8 +87,27 @@ impl ExtractionStaging {
                 Err(error) => return Err(error.into()),
             }
         }
-        Ok(())
+        Ok(None)
     }
+}
+
+/// Whether `path` certainly does not exist, so resolving it can only fail:
+/// one lstat instead of resolving every component to learn the same. Other
+/// errors are left for `canonicalize` to report. On Windows a failed resolve
+/// is already a single failed open, so the question would only add one.
+#[cfg(unix)]
+fn missing(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_err_and(|error| {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn missing(_path: &Path) -> bool {
+    false
 }
 
 impl Drop for ExtractionStaging {

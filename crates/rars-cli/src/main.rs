@@ -836,9 +836,8 @@ impl<'a> ExtractOutputState<'a> {
         archive_name: &[u8],
     ) -> rars::Result<Box<dyn Write>> {
         self.publish_verified()?;
-        let planned = output_path_for_entry(self.out_dir, meta)?;
-        self.reserve_output_path(planned)?;
         let destination = output_path_for_entry(self.out_dir, meta)?;
+        self.reserve_output_path(destination.clone())?;
         self.remember_directory_time(&destination, meta)?;
         let staging = self.prepare_staged_path(&destination, meta.is_directory)?;
         let (path, writer) =
@@ -861,9 +860,8 @@ impl<'a> ExtractOutputState<'a> {
     ) -> rars::Result<Box<dyn Write>> {
         self.publish_verified()?;
         let common = rar50_extracted_meta(meta);
-        let planned = output_path_for_rar50_entry(self.out_dir, meta)?;
-        self.reserve_output_path(planned)?;
         let destination = output_path_for_rar50_entry(self.out_dir, meta)?;
+        self.reserve_output_path(destination.clone())?;
         self.remember_directory_time(&destination, &common)?;
         let staging = self.prepare_staged_path(&destination, common.is_directory)?;
         let (path, writer) = open_output_writer(
@@ -891,9 +889,8 @@ impl<'a> ExtractOutputState<'a> {
         redirection: &rars::rar50::FileRedirection,
     ) -> rars::Result<()> {
         self.publish_verified()?;
-        let planned = output_path_for_rar50_entry(self.out_dir, meta)?;
-        self.reserve_output_path(planned)?;
         let destination = output_path_for_rar50_entry(self.out_dir, meta)?;
+        self.reserve_output_path(destination.clone())?;
         let staging = self.prepare_staged_path(&destination, false)?;
         let (path, restore_metadata) = create_rar50_redirection_output(
             &staging,
@@ -1019,10 +1016,12 @@ impl<'a> ExtractOutputState<'a> {
                 .map_err(|_| rars::Error::InvalidHeader("unsafe archive path"))?
                 .to_path_buf();
             let destination = output::checked_output_path(self.out_dir, &relative)?;
-            if let Some(staging) = &self.staging {
-                staging.reject_alias(&destination)?;
-            }
-            if let Ok(identity) = fs::canonicalize(&destination) {
+            // The alias check resolves the destination already when it exists.
+            let existing = match &self.staging {
+                Some(staging) => staging.reject_alias(&destination)?,
+                None => fs::canonicalize(&destination).ok(),
+            };
+            if let Some(identity) = existing {
                 if self.published_identities.contains(&identity) {
                     return Err(rars::Error::InvalidHeader(
                         "multiple archive entries map to the same output path",
