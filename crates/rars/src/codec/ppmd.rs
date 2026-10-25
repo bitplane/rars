@@ -188,9 +188,22 @@ impl<B: Budget> Suballocator<B> {
         side: AllocSide,
         text_len_bytes: usize,
     ) -> Result<Option<u32>> {
+        self.try_alloc_reserving_release(units, side, text_len_bytes, None)
+    }
+
+    // Reserve the old block's eventual release before acquiring its replacement.
+    // Glue and splitting can fill this bucket, so renew the reservation there.
+    fn try_alloc_reserving_release(
+        &mut self,
+        units: usize,
+        side: AllocSide,
+        text_len_bytes: usize,
+        release: Option<usize>,
+    ) -> Result<Option<u32>> {
         let Some(bucket) = Self::bucket_for(units) else {
             return Ok(None);
         };
+        self.reserve_release(release)?;
         // Reference ordering differs by side. Lo-side state arrays go through
         // `Ppmd7_AllocUnits` (free_list first, then lo-bump, then rare). Hi-side
         // 1-unit context headers go through the inlined sequence in
@@ -224,16 +237,21 @@ impl<B: Budget> Suballocator<B> {
         if self.glue_count == 0 {
             self.glue_inner()?;
             self.glue_count = GLUE_RESET;
+            // Successful glue is a checkpoint: a later refusal retains the
+            // glued lists, with every free block still owned by the allocator.
+            self.reserve_release(release)?;
             if let Some(offset) = self.free_lists[bucket].pop() {
                 return Ok(Some(offset));
             }
         }
         for i in (bucket + 1)..N_BUCKETS {
-            if let Some(offset) = self.free_lists[i].pop() {
+            if let Some(&offset) = self.free_lists[i].last() {
                 let large_size = Self::bucket_units(i) as u32;
                 let need = Self::bucket_units(bucket) as u32;
                 let leftover = large_size - need;
-                self.emit_run(offset + need, leftover)?;
+                self.reserve_run(offset + need, leftover, release)?;
+                self.free_lists[i].pop();
+                self.emit_run_admitted(offset + need, leftover);
                 return Ok(Some(offset));
             }
         }
@@ -312,22 +330,7 @@ impl<B: Budget> Suballocator<B> {
         old_units: u32,
         new_units: u32,
     ) -> Result<()> {
-        let nu = old_units - new_units;
-        let residue_offset = base_offset + new_units;
-        // Both inputs are distinct bucket sizes; their difference is 1..128.
-        let mut i = Self::bucket_for(nu as usize).expect("split residue is a valid bucket size");
-        if Self::bucket_units(i) as u32 != nu {
-            // Inexact fit: the C reference pushes the smaller piece first
-            // (at offset + bucket_units(i-1)) onto bucket index `nu - k - 1`,
-            // then the i-1-sized prefix onto bucket i-1. Order across
-            // buckets is irrelevant; per-bucket LIFO is unaffected.
-            let k = Self::bucket_units(i - 1) as u32;
-            let small_bucket = (nu - k - 1) as usize;
-            self.free_lists[small_bucket].try_push(residue_offset + k)?;
-            i -= 1;
-        }
-        self.free_lists[i].try_push(residue_offset)?;
-        Ok(())
+        self.emit_run(base_offset + new_units, old_units - new_units)
     }
 
     // Faithful port of Ppmd7_GlueFreeBlocks (§4.4). The earlier
@@ -363,7 +366,6 @@ impl<B: Budget> Suballocator<B> {
                 poller.check_codec(0)?;
                 list.push_admitted((off, nu));
             }
-            self.free_lists[bucket].clear();
         }
         if list.is_empty() {
             return Ok(());
@@ -397,42 +399,86 @@ impl<B: Budget> Suballocator<B> {
             nu_at.insert(off, cur);
         }
 
-        // Step 3: fill pass in list order.
+        // Step 3: admit every destination before replacing the original lists.
+        // Count in exactly the fill order, including repeated offsets.
+        let mut counts = [0usize; N_BUCKETS];
         for &(off, _) in list.iter() {
             poller.check_codec(0)?;
-            let nu = match nu_at.get(&off) {
-                Some(&n) if n != 0 => n,
-                _ => continue,
-            };
-            self.emit_run(off, nu)?;
+            if let Some(&nu) = nu_at.get(&off).filter(|&&nu| nu != 0) {
+                Self::visit_run(off, nu, |bucket, _| counts[bucket] += 1);
+            }
+        }
+        for (bucket, &count) in counts.iter().enumerate() {
+            self.free_lists[bucket].reserve_total_capacity(count)?;
+        }
+        self.read_control.check_codec()?;
+
+        // Commit without any further allocation or cancellation points.
+        for free in &mut self.free_lists {
+            free.clear();
+        }
+        for &(off, _) in list.iter() {
+            if let Some(&nu) = nu_at.get(&off).filter(|&&nu| nu != 0) {
+                self.emit_run_admitted(off, nu);
+            }
+        }
+        for (bucket, &count) in counts.iter().enumerate() {
+            debug_assert_eq!(self.free_lists[bucket].len(), count);
         }
         Ok(())
     }
 
-    // Re-bucket a single merged run exactly as Ppmd7_GlueFreeBlocks' fill /
-    // Ppmd7_SplitBlock do: peel 128-unit (bucket 37) blocks, then split the
-    // <=128 remainder into its exact bucket, or two pieces when inexact.
-    fn emit_run(&mut self, mut offset: u32, mut remaining: u32) -> Result<()> {
-        const LAST_BUCKET: usize = N_BUCKETS - 1; // 37 == 128 units
+    // Visit pieces in the reference's fill/SplitBlock order: full 128-unit
+    // chunks, then an exact remainder or its small tail followed by its prefix.
+    fn visit_run(mut offset: u32, mut remaining: u32, mut visit: impl FnMut(usize, u32)) {
+        const LAST_BUCKET: usize = N_BUCKETS - 1;
         while remaining > MAX_BUCKET_UNITS as u32 {
-            self.push_free(LAST_BUCKET, offset)?;
+            visit(LAST_BUCKET, offset);
             offset += MAX_BUCKET_UNITS as u32;
             remaining -= MAX_BUCKET_UNITS as u32;
         }
-        // Callers pass positive runs; the loop leaves 1..=128 units.
         let mut i = Self::bucket_for(remaining as usize).expect("run remainder fits a bucket");
         if Self::bucket_units(i) as u32 != remaining {
             let k = Self::bucket_units(i - 1) as u32;
-            let small_bucket = (remaining - k - 1) as usize;
-            self.push_free(small_bucket, offset + k)?;
+            visit((remaining - k - 1) as usize, offset + k);
             i -= 1;
         }
-        self.push_free(i, offset)?;
+        visit(i, offset);
+    }
+
+    fn reserve_release(&mut self, release: Option<usize>) -> Result<()> {
+        if let Some(bucket) = release {
+            let list = &mut self.free_lists[bucket];
+            list.reserve_total_capacity(list.len() + 1)?;
+        }
         Ok(())
     }
 
-    fn push_free(&mut self, bucket: usize, offset: u32) -> Result<()> {
-        self.free_lists[bucket].try_push(offset)
+    fn reserve_run(&mut self, offset: u32, units: u32, release: Option<usize>) -> Result<()> {
+        let mut counts = [0usize; N_BUCKETS];
+        Self::visit_run(offset, units, |bucket, _| counts[bucket] += 1);
+        if let Some(bucket) = release {
+            counts[bucket] += 1;
+        }
+        for (bucket, &count) in counts.iter().enumerate() {
+            if count != 0 {
+                let list = &mut self.free_lists[bucket];
+                list.reserve_total_capacity(list.len() + count)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_run_admitted(&mut self, offset: u32, units: u32) {
+        Self::visit_run(offset, units, |bucket, offset| {
+            self.free_lists[bucket].push_admitted(offset);
+        });
+    }
+
+    fn emit_run(&mut self, offset: u32, units: u32) -> Result<()> {
+        self.reserve_run(offset, units, None)?;
+        self.emit_run_admitted(offset, units);
+        Ok(())
     }
 
     fn text_has_room(&self, text_len: usize) -> bool {
@@ -529,10 +575,10 @@ struct Context {
     summ_freq: u16,
     suffix: Option<u32>,
     // Simulated suballoc offsets so gluing (spec §4.3) can detect adjacency.
-    // header_offset: from Hi side (1 unit). array_offset: from Lo side,
-    // set to NULL_OFFSET for binary contexts (num_stats == 1) which
-    // carry their state inline.
-    header_offset: u32,
+    // Headers live until model reset; retain their Hi-side offsets for
+    // diagnostics. Lo-side array offsets are needed when resizing/freeing.
+    // Binary contexts carry the state inline and have a NULL_OFFSET array.
+    _header_offset: u32,
     array_offset: u32,
 }
 
@@ -1007,6 +1053,8 @@ impl<B: Budget> PpmdState<B> {
         Ok(())
     }
 
+    // An error ends this decode: range/model updates across a whole symbol
+    // are not transactional, even though allocator operations preserve ownership.
     pub fn decode_symbol(&mut self, input: &mut impl PpmdByteReader) -> Result<Option<u8>> {
         // Ordinary symbol/context work is bounded by the model order and the
         // 256-symbol alphabet; the enclosing decoder polls between symbols.
@@ -1308,7 +1356,7 @@ impl<B: Budget> PpmdState<B> {
             num_stats: 256,
             summ_freq: 257,
             suffix: None,
-            header_offset,
+            _header_offset: header_offset,
             array_offset,
         })?;
         self.min_context = 0;
@@ -1696,56 +1744,43 @@ impl<B: Budget> PpmdState<B> {
             }) as u8
         };
         while let Some(state_ref) = ps.pop() {
-            let context = pressure!(self.push_context(Context {
-                stats: Stats::One(State {
+            // c is an existing context index; Successor::context below
+            // checks the newly allocated one's representation.
+            let context = pressure!(self.push_context(
+                State {
                     symbol: new_sym,
                     freq: new_freq,
                     successor: up_successor,
-                }),
-                num_stats: 1,
-                summ_freq: 0,
-                // An existing context's index; `Successor::context` below
-                // checks the new one's.
-                suffix: Some(c as u32),
-                header_offset: NULL_OFFSET,
-                array_offset: NULL_OFFSET,
-            })?);
+                },
+                Some(c as u32),
+            )?);
             pressure!(self.state_mut(state_ref).ok()).successor = Successor::context(context)?;
             c = context;
         }
         Ok(Some(c))
     }
 
-    fn push_context(&mut self, mut context: Context) -> Result<Option<usize>> {
+    fn push_context(&mut self, state: State, suffix: Option<u32>) -> Result<Option<usize>> {
         if self.contexts.len() >= self.max_contexts {
             return Ok(None);
         }
-        // 1 unit for the context header (Hi side); binary contexts (1 state)
-        // carry their state inline, multi-state contexts also need a state
-        // array (Lo side).
-        let text_len = self.text.len();
-        let Some(header_offset) = self.suballoc.try_alloc(1, AllocSide::Hi, text_len)? else {
+        // CreateSuccessors only creates binary contexts with an inline state.
+        // Admit the real context before consuming its simulated header.
+        self.contexts
+            .reserve_total_capacity(self.contexts.len() + 1)?;
+        let Some(header_offset) = self.suballoc.try_alloc(1, AllocSide::Hi, self.text.len())?
+        else {
             return Ok(None);
         };
-        let array_units = Self::state_array_units(context.num_stats as usize);
-        let array_offset = if array_units > 0 {
-            match self
-                .suballoc
-                .try_alloc(array_units, AllocSide::Lo, text_len)?
-            {
-                Some(off) => off,
-                None => {
-                    self.suballoc.try_free(header_offset, 1)?;
-                    return Ok(None);
-                }
-            }
-        } else {
-            NULL_OFFSET
-        };
-        context.header_offset = header_offset;
-        context.array_offset = array_offset;
         let index = self.contexts.len();
-        self.contexts.try_push(context)?;
+        self.contexts.push_admitted(Context {
+            stats: Stats::One(state),
+            num_stats: 1,
+            summ_freq: 0,
+            suffix,
+            _header_offset: header_offset,
+            array_offset: NULL_OFFSET,
+        });
         Ok(Some(index))
     }
 
@@ -1768,16 +1803,19 @@ impl<B: Budget> PpmdState<B> {
             }
         }
         let text_len = self.text.len();
-        let new_offset = match self
-            .suballoc
-            .try_alloc(new_units, AllocSide::Lo, text_len)?
-        {
+        let new_offset = match self.suballoc.try_alloc_reserving_release(
+            new_units,
+            AllocSide::Lo,
+            text_len,
+            Suballocator::<B>::bucket_for(old_units),
+        )? {
             Some(off) => off,
             None => return Ok(false),
         };
         if old_units > 0 {
             let old_offset = self.contexts[ctx_idx].array_offset;
-            self.suballoc.try_free(old_offset, old_units)?;
+            let bucket = Suballocator::<B>::bucket_for(old_units).expect("old array fits a bucket");
+            self.suballoc.free_lists[bucket].push_admitted(old_offset);
         }
         self.contexts[ctx_idx].array_offset = new_offset;
         Ok(true)
@@ -1816,11 +1854,13 @@ impl<B: Budget> PpmdState<B> {
             return Ok(());
         }
         let old_offset = self.contexts[ctx_idx].array_offset;
-        if let Some(swap_offset) = self.suballoc.free_lists[i1].pop() {
+        if let Some(&swap_offset) = self.suballoc.free_lists[i1].last() {
             // Swap path: take a same-sized block from the target bucket,
             // return the oversized block to its bucket. Data lives in
             // the state arena, so no MEM_12_CPY needed.
-            self.suballoc.try_free(old_offset, old_units)?;
+            self.suballoc.reserve_release(Some(i0))?;
+            self.suballoc.free_lists[i1].pop();
+            self.suballoc.free_lists[i0].push_admitted(old_offset);
             self.contexts[ctx_idx].array_offset = swap_offset;
         } else {
             // SplitBlock in place: keep the first I2U(i1) units at the same
@@ -2373,3 +2413,6 @@ mod arena_tests;
 
 #[cfg(test)]
 mod allocation_failure_tests;
+
+#[cfg(test)]
+mod suballocator_failure_tests;

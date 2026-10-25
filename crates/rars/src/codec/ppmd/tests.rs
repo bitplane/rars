@@ -165,20 +165,36 @@ impl PpmdDecoder {
             num_stats: states.len() as u16,
             summ_freq,
             suffix: suffix.map(|suffix| suffix as u32),
-            header_offset: NULL_OFFSET,
+            _header_offset: NULL_OFFSET,
             array_offset: NULL_OFFSET,
         }
     }
 
-    // Through `push_context`, as the model adds its own.
+    // Create an inline context, then grow its simulated array when the fixture
+    // needs multiple states. Production CreateSuccessors only creates inline ones.
+    // Fixtures must provide states and enough array space unless the context
+    // count limit already prevents creation (checked before reading states[0]).
     fn push_test_context(
         &mut self,
         states: Vec<State>,
         summ_freq: u16,
         suffix: Option<usize>,
     ) -> Result<Option<usize>> {
+        if self.contexts.len() >= self.max_contexts {
+            return Ok(None);
+        }
+        let first = states[0];
         let context = self.context(states, summ_freq, suffix);
-        self.push_context(context)
+        let Some(index) = self.push_context(first, context.suffix)? else {
+            return Ok(None);
+        };
+        if context.num_stats > 1 {
+            assert!(self.grow_state_array(index, context.num_stats as usize)?);
+        }
+        self.contexts[index].stats = context.stats;
+        self.contexts[index].num_stats = context.num_stats;
+        self.contexts[index].summ_freq = context.summ_freq;
+        Ok(Some(index))
     }
 
     // Straight onto the list, with no simulated allocation.
@@ -849,7 +865,7 @@ fn context_header_pressure_is_distinct_from_the_context_count_limit() {
     while decoder.suballoc.alloc(128, AllocSide::Lo, 0).is_some() {}
     while decoder.suballoc.alloc(1, AllocSide::Hi, 0).is_some() {}
     assert!(decoder.contexts.len() < decoder.max_contexts);
-    let root_header = decoder.contexts[0].header_offset;
+    let root_header = decoder.contexts[0]._header_offset;
     let root_array = decoder.contexts[0].array_offset;
     let new_context = || {
         vec![State {
@@ -865,7 +881,7 @@ fn context_header_pressure_is_distinct_from_the_context_count_limit() {
         None
     );
     assert_eq!(decoder.contexts.len(), 1);
-    assert_eq!(decoder.contexts[0].header_offset, root_header);
+    assert_eq!(decoder.contexts[0]._header_offset, root_header);
     assert_eq!(decoder.contexts[0].array_offset, root_array);
     assert_eq!(decoder.states(0).len(), 256);
 
@@ -876,22 +892,6 @@ fn context_header_pressure_is_distinct_from_the_context_count_limit() {
             .unwrap(),
         Some(1)
     );
-}
-
-#[test]
-fn context_allocation_releases_header_when_state_array_does_not_fit() {
-    let mut decoder = PpmdDecoder::new();
-    decoder.max_contexts = 10;
-    decoder.suballoc.reset(16 * ALLOC_UNIT_BYTES);
-    let state = State {
-        symbol: 0,
-        freq: 1,
-        successor: Successor::None,
-    };
-    let context = decoder.context(vec![state; 256], 257, None);
-    assert_eq!(decoder.push_context(context).unwrap(), None);
-    assert_eq!(decoder.suballoc.free_lists[0].len(), 1);
-    assert!(decoder.contexts.is_empty());
 }
 
 #[test]
@@ -1192,8 +1192,10 @@ fn shrink_array_reuses_a_free_bucket_or_splits_in_place() {
         freq: 1,
         successor: Successor::None,
     };
-    let context = decoder.context(vec![state; 12], 13, None);
-    let ctx = decoder.push_context(context).unwrap().unwrap();
+    let ctx = decoder
+        .push_test_context(vec![state; 12], 13, None)
+        .unwrap()
+        .unwrap();
     let original = decoder.contexts[ctx].array_offset;
     decoder.shrink_state_array(ctx, 12, 12).unwrap();
     assert_eq!(decoder.contexts[ctx].array_offset, original);

@@ -25,7 +25,7 @@ fn add_context<B: Budget>(model: &mut PpmdState<B>, class: usize) {
             num_stats: len as u16,
             summ_freq: len as u16,
             suffix: None,
-            header_offset: NULL_OFFSET,
+            _header_offset: NULL_OFFSET,
             array_offset: NULL_OFFSET,
         })
         .unwrap();
