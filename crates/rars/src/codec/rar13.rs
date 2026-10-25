@@ -8,6 +8,9 @@ pub use encoder::{
     Unpack15Encoder,
 };
 
+#[cfg(all(test, feature = "write"))]
+mod streaming_tests;
+
 use super::workspace::{Allowance, Budget, Buffer};
 use super::{Error, Result};
 use std::io::{Read, Write};
@@ -312,17 +315,24 @@ impl<B: Budget> Reader15State<B> {
         self.bits = ReaderBits::with_allowance(&[], &self.window.allowance())?;
         self.bits.input.read_to_end(input)?;
 
+        let allowance = self.window.allowance();
+        let mut chunk = Buffer::new(&allowance);
         while self.output_written < self.target {
             let chunk_target = self
                 .output_written
                 .saturating_add(OUTPUT_CHUNK)
                 .min(self.target);
-            let mut chunk = Buffer::with_capacity(
-                chunk_target - self.output_written,
-                &self.window.allowance(),
-            )?;
+            let capacity = chunk_target - self.output_written;
+            if chunk.capacity() < capacity || (B::LIMITED && chunk.capacity() != capacity) {
+                // Matches can grow a chunk past its target. Bounded readers
+                // start each chunk at its requested capacity, including the tail.
+                // Release the previous charge before admitting its replacement.
+                drop(chunk);
+                chunk = Buffer::with_capacity(capacity, &allowance)?;
+            }
             self.decode_loop_until(chunk_target, &mut chunk)?;
             out.write_all(&chunk).map_err(Error::from)?;
+            chunk.clear();
         }
         Ok(())
     }
