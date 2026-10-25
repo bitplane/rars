@@ -5,6 +5,7 @@ use rars::{
     Archive as DetectedArchive, ArchiveFamily, ArchiveVersion, AttrSource, Error,
     ExtractedEntryMeta,
 };
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -14,6 +15,9 @@ use std::time::SystemTime;
 /// Private, same-filesystem storage for a verified extraction's pending outputs.
 pub(crate) struct ExtractionStaging {
     pub(crate) root: PathBuf,
+    /// Resolve once, on the first alias check. Publication-only staging
+    /// never needs the resolved root.
+    identity: OnceCell<PathBuf>,
 }
 
 impl ExtractionStaging {
@@ -34,7 +38,12 @@ impl ExtractionStaging {
                 builder.mode(0o700);
             }
             match builder.create(&root) {
-                Ok(()) => return Ok(Self { root }),
+                Ok(()) => {
+                    return Ok(Self {
+                        root,
+                        identity: OnceCell::new(),
+                    });
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error),
             }
@@ -45,18 +54,31 @@ impl ExtractionStaging {
         ))
     }
 
-    pub(crate) fn reject_alias(&self, destination: &Path) -> rars::Result<()> {
-        let storage = fs::canonicalize(&self.root)?;
+    /// Refuses a destination that resolves into the storage. Returns the
+    /// destination's resolved path when it exists, so callers need not
+    /// resolve it again.
+    pub(crate) fn reject_alias(&self, destination: &Path) -> rars::Result<Option<PathBuf>> {
+        let storage = match self.identity.get() {
+            Some(storage) => storage,
+            None => {
+                let storage = fs::canonicalize(&self.root)?;
+                self.identity.get_or_init(|| storage)
+            }
+        };
         let mut ancestor = Some(destination);
         while let Some(path) = ancestor {
+            if missing(path) {
+                ancestor = path.parent();
+                continue;
+            }
             match fs::canonicalize(path) {
                 Ok(identity) => {
-                    if identity.starts_with(&storage) {
+                    if identity.starts_with(storage) {
                         return Err(Error::InvalidHeader(
                             "archive path conflicts with extraction storage",
                         ));
                     }
-                    return Ok(());
+                    return Ok((path == destination).then_some(identity));
                 }
                 Err(error)
                     if matches!(
@@ -69,8 +91,27 @@ impl ExtractionStaging {
                 Err(error) => return Err(error.into()),
             }
         }
-        Ok(())
+        Ok(None)
     }
+}
+
+/// Whether `path` certainly does not exist, so resolving it can only fail:
+/// one lstat instead of resolving every component to learn the same. Other
+/// errors are left for `canonicalize` to report. On Windows a failed resolve
+/// is already a single failed open, so the question would only add one.
+#[cfg(unix)]
+fn missing(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_err_and(|error| {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn missing(_path: &Path) -> bool {
+    false
 }
 
 impl Drop for ExtractionStaging {
@@ -828,6 +869,126 @@ mod tests {
             assert!(root.join("ordinary").exists());
         } else {
             assert!(result.is_ok());
+        }
+    }
+
+    #[test]
+    fn alias_checks_return_only_existing_destination_identities() {
+        use super::*;
+        let root = scratch("alias-identities");
+        let staging = ExtractionStaging::new(&root).unwrap();
+        let directory = root.join("ordinary");
+        fs::create_dir(&directory).unwrap();
+        let file = directory.join("file");
+        fs::write(&file, b"ordinary contents").unwrap();
+        for path in [&directory, &file] {
+            assert_eq!(
+                staging.reject_alias(path).unwrap(),
+                Some(fs::canonicalize(path).unwrap())
+            );
+        }
+        assert_eq!(
+            staging
+                .reject_alias(&directory.join("missing/child"))
+                .unwrap(),
+            None
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            assert_eq!(staging.reject_alias(&file.join("child")).unwrap(), None);
+            let dangling = root.join("dangling");
+            symlink(root.join("absent"), &dangling).unwrap();
+            assert_eq!(staging.reject_alias(&dangling).unwrap(), None);
+            let alias = root.join("ordinary-alias");
+            symlink(&file, &alias).unwrap();
+            assert_eq!(
+                staging.reject_alias(&alias).unwrap(),
+                Some(fs::canonicalize(&file).unwrap())
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn alias_checks_reject_missing_descendants_of_a_staging_symlink() {
+        use super::*;
+        use std::os::unix::fs::symlink;
+        let root = scratch("missing-staging-alias");
+        let staging = ExtractionStaging::new(&root).unwrap();
+        let alias = root.join("alias");
+        symlink(&staging.root, &alias).unwrap();
+        // The first check both resolves the staging root and walks past two
+        // missing components to find the alias. Repeat with the cached root.
+        for path in [alias.join("missing/child"), alias, staging.root.clone()] {
+            assert!(matches!(
+                staging.reject_alias(&path),
+                Err(Error::InvalidHeader(
+                    "archive path conflicts with extraction storage"
+                ))
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn alias_checks_propagate_loops_and_permission_errors() {
+        use super::*;
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = scratch("alias-errors");
+        let staging = ExtractionStaging::new(&root).unwrap();
+        let cycle = root.join("cycle");
+        symlink("cycle", &cycle).unwrap();
+        assert!(matches!(staging.reject_alias(&cycle), Err(Error::Io(_))));
+
+        let locked = root.join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o600)).unwrap();
+        let destination = locked.join("missing");
+        let probe = fs::symlink_metadata(&destination);
+        let result = staging.reject_alias(&destination);
+        // Restore search permission before assertions, including on runners
+        // that can bypass the mode bits.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+        match probe {
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                assert!(matches!(
+                    result,
+                    Err(Error::Io(error)) if error.kind == std::io::ErrorKind::PermissionDenied
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("permission-denial case unavailable on privileged runner");
+                assert_eq!(result.unwrap(), None);
+            }
+            other => panic!("unexpected permission probe: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn alias_checks_retry_a_failed_initial_root_resolution() {
+        use super::*;
+        let root = scratch("alias-resolution-retry");
+        let staging = ExtractionStaging::new(&root).unwrap();
+        let ordinary = root.join("ordinary");
+        fs::write(&ordinary, b"ordinary contents").unwrap();
+        fs::remove_dir(&staging.root).unwrap();
+        assert!(matches!(staging.reject_alias(&ordinary), Err(Error::Io(_))));
+        fs::create_dir(&staging.root).unwrap();
+        assert_eq!(
+            staging.reject_alias(&ordinary).unwrap(),
+            Some(fs::canonicalize(&ordinary).unwrap())
+        );
+        #[cfg(unix)]
+        {
+            let alias = root.join("alias");
+            std::os::unix::fs::symlink(&staging.root, &alias).unwrap();
+            assert!(matches!(
+                staging.reject_alias(&alias.join("missing/child")),
+                Err(Error::InvalidHeader(
+                    "archive path conflicts with extraction storage"
+                ))
+            ));
         }
     }
 
