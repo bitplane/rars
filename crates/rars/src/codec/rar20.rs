@@ -8,6 +8,9 @@ pub use encoder::{
     unpack20_encode_literals_with_options, EncodeOptions, Unpack20Encoder,
 };
 
+#[cfg(test)]
+mod match_copy_tests;
+
 use super::workspace::{Allowance, Budget, Buffer};
 use super::{Error, Result};
 use std::io::{Read, Write};
@@ -21,6 +24,8 @@ const AUDIO_COUNT: usize = 257;
 const MAX_CHANNELS: usize = 4;
 const OLD_LEVEL_COUNT: usize = AUDIO_COUNT * MAX_CHANNELS;
 const MAX_HISTORY: usize = 1024 * 1024;
+// Longest match that stays on the scalar copy path.
+const SHORT_MATCH: usize = 64;
 
 const LENGTH_BASES: [usize; LENGTH_COUNT] = [
     0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 28, 32, 40, 48, 56, 64, 80, 96, 112, 128,
@@ -525,6 +530,7 @@ impl<B: Budget> Reader20State<B> {
         self.copy_match_with_window(length, offset, output_size, before_window)
     }
 
+    #[inline]
     fn copy_match_with_window(
         &mut self,
         length: usize,
@@ -532,18 +538,45 @@ impl<B: Budget> Reader20State<B> {
         output_size: usize,
         before_window: bool,
     ) -> Result<()> {
-        for index in 0..length {
-            if self.current_pos() >= output_size {
-                self.pending_match = Some((length - index, offset, before_window));
-                break;
+        if B::LIMITED || length <= SHORT_MATCH {
+            // Keep short copies cheap and preserve growth/failure prefixes under a quota.
+            for index in 0..length {
+                if self.current_pos() >= output_size {
+                    self.pending_match = Some((length - index, offset, before_window));
+                    break;
+                }
+                let byte = if before_window {
+                    0
+                } else {
+                    let src = self.current_pos() - offset;
+                    self.raw_byte(src)
+                };
+                self.output.try_push(byte)?;
             }
-            let byte = if before_window {
-                0
+            return Ok(());
+        }
+
+        let now = length.min(output_size.saturating_sub(self.current_pos()));
+        if now > 0 {
+            if before_window {
+                self.output.resize(self.output.len() + now, 0)?;
             } else {
-                let src = self.current_pos() - offset;
-                self.raw_byte(src)
-            };
-            self.output.try_push(byte)?;
+                // Encoded offsets fit the retained window. Offset zero has
+                // already been normalized to one by copy_match.
+                debug_assert!(offset <= self.output.len());
+                let start = self.output.len() - offset;
+                // Newly appended bytes extend the repeating pattern, so
+                // overlapping matches can copy successively larger runs.
+                let mut remaining = now;
+                while remaining > 0 {
+                    let take = remaining.min(self.output.len() - start);
+                    self.output.extend_from_within(start..start + take)?;
+                    remaining -= take;
+                }
+            }
+        }
+        if now < length {
+            self.pending_match = Some((length - now, offset, before_window));
         }
         Ok(())
     }
