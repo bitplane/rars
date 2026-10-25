@@ -119,7 +119,14 @@ fn pending_long_matches_survive_history_trimming() {
                 .extend_from_slice(&seed)
                 .map_err(Into::<Error>::into)
                 .unwrap();
-            let mut actual = expected.try_clone().unwrap();
+            // Start with identical physical histories: unlimited checkpoints
+            // may omit obsolete bytes before the forced trim exercised here.
+            let mut actual = Reader20State::with_allowance(budget);
+            actual
+                .output
+                .extend_from_slice(&seed)
+                .map_err(Into::<Error>::into)
+                .unwrap();
             let begin = actual.current_pos();
             start(true, &mut expected, 260, offset, begin + 67).unwrap();
             start(false, &mut actual, 260, offset, begin + 67).unwrap();
