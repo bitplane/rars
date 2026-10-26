@@ -3,6 +3,7 @@ use crate::codec::rar13::Reader15State;
 use crate::codec::rar20::Reader20State;
 use crate::codec::rar29::Reader29State;
 use crate::codec::workspace::{Allowance, Boxed, Budget, Buffer};
+use crate::extraction_links::{check_legacy_size, legacy_output, LegacyLink};
 use crate::volume_extract::{ChainedReader, SplitVolumeState, SplitVolumeStep};
 use std::io::{Read, Write};
 
@@ -257,16 +258,35 @@ pub fn extract_volumes_to<F>(
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
 {
+    extract_volumes_with_links(volumes, options, open, None)
+}
+
+pub(crate) fn extract_volumes_with_links<F>(
+    volumes: &[Archive],
+    options: crate::ArchiveReadOptions<'_>,
+    open: F,
+    links: Option<&mut LegacyLink<'_>>,
+) -> Result<()>
+where
+    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+{
     if let Some(limit) = options.max_reader_workspace_bytes {
-        return extract_volumes_with_allowance(volumes, options, open, &Allowance::limited(limit));
+        return extract_volumes_with_allowance(
+            volumes,
+            options,
+            open,
+            links,
+            &Allowance::limited(limit),
+        );
     }
-    extract_volumes_with_allowance(volumes, options, open, &Allowance::default())
+    extract_volumes_with_allowance(volumes, options, open, links, &Allowance::default())
 }
 
 fn extract_volumes_with_allowance<F, B: Budget>(
     volumes: &[Archive],
     options: crate::ArchiveReadOptions<'_>,
     mut open: F,
+    mut links: Option<&mut LegacyLink<'_>>,
     allowance: &B,
 ) -> Result<()>
 where
@@ -301,25 +321,34 @@ where
                     } else {
                         budget.check(file.unp_size, &file.name)?;
                         options.check_cancelled()?;
-                        let mut writer = open(&meta)?;
-                        options.check_cancelled()?;
-                        budget.run(&file.name, &mut writer, |mut writer| {
-                            if file.is_stored() {
-                                file.write_stored_with_allowance(
-                                    archive,
-                                    password,
-                                    &mut writer,
-                                    allowance,
-                                )
-                                .map_err(|error| file.entry_error("extracting", error))?;
-                            } else {
-                                session
-                                    .write_file_to(archive, file, &mut writer)
-                                    .map_err(|error| file.entry_error("extracting", error))?;
-                            }
-                            options.check_cancelled()?;
-                            Ok(())
-                        })?;
+                        check_legacy_size(&meta, file.unp_size, links.is_some())?;
+                        let control = budget.control.clone();
+                        legacy_output(
+                            &meta,
+                            allowance,
+                            &control,
+                            &mut links,
+                            || open(&meta),
+                            |writer| {
+                                budget.run(&file.name, writer, |mut writer| {
+                                    if file.is_stored() {
+                                        file.write_stored_with_allowance(
+                                            archive,
+                                            password,
+                                            &mut writer,
+                                            allowance,
+                                        )
+                                        .map_err(|error| file.entry_error("extracting", error))?;
+                                    } else {
+                                        session.write_file_to(archive, file, &mut writer).map_err(
+                                            |error| file.entry_error("extracting", error),
+                                        )?;
+                                    }
+                                    options.check_cancelled()?;
+                                    Ok(())
+                                })
+                            },
+                        )?;
                     }
                 }
                 SplitVolumeStep::Start => {
@@ -341,10 +370,10 @@ where
                     completed.write_to(
                         volumes,
                         file,
-                        password,
                         &mut session,
                         &mut budget,
                         &mut open,
+                        &mut links,
                     )?;
                 }
                 SplitVolumeStep::MissingFirst => {
@@ -457,14 +486,15 @@ impl<B: Budget> PendingSplitRefs<B> {
         self,
         volumes: &[Archive],
         final_file: &FileHeader,
-        password: Option<&[u8]>,
         session: &mut DecoderSession<'_, B>,
         budget: &mut crate::output_limit::OutputBudget,
         open: &mut F,
+        links: &mut Option<&mut LegacyLink<'_>>,
     ) -> Result<()>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
+        let password = session.password;
         budget.check(final_file.unp_size, &final_file.name)?;
         let meta = ExtractedEntryMeta {
             name_is_unicode: final_file.unicode_name.is_some(),
@@ -475,53 +505,67 @@ impl<B: Budget> PendingSplitRefs<B> {
             host_os: self.host_os,
             is_directory: false,
         };
-        let mut writer = open(&meta)?;
-        budget.run(&final_file.name, &mut writer, |mut writer| {
-            let mut reader = self.fragment_reader_with_allowance(
-                volumes,
-                password,
-                &self.fragments.allowance(),
-            )?;
+        check_legacy_size(&meta, final_file.unp_size, links.is_some())?;
+        let allowance = self.fragments.allowance();
+        let control = budget.control.clone();
+        legacy_output(
+            &meta,
+            &allowance,
+            &control,
+            links,
+            || open(&meta),
+            |writer| {
+                budget.run(&final_file.name, writer, |mut writer| {
+                    let mut reader = self.fragment_reader_with_allowance(
+                        volumes,
+                        password,
+                        &self.fragments.allowance(),
+                    )?;
 
-            if final_file.is_stored() {
-                let expected_len = usize::try_from(final_file.unp_size).map_err(|_| {
-                    Error::InvalidHeader("RAR 1.5 split unpacked size overflows usize")
-                })?;
-                let actual_len = self.packed_size(volumes)?;
-                let expected_packed_len = if self.encrypted && self.unp_ver >= 20 {
-                    expected_len.checked_add(15).map(|len| len & !15).ok_or(
-                        Error::InvalidHeader("RAR 2.x encrypted split stored size overflows"),
-                    )?
-                } else {
-                    expected_len
-                };
-                if actual_len != expected_packed_len {
-                    return Err(Error::InvalidHeader(
-                        "RAR 1.5 split stored file has wrong reassembled size",
-                    ));
-                }
+                    if final_file.is_stored() {
+                        let expected_len = usize::try_from(final_file.unp_size).map_err(|_| {
+                            Error::InvalidHeader("RAR 1.5 split unpacked size overflows usize")
+                        })?;
+                        let actual_len = self.packed_size(volumes)?;
+                        let expected_packed_len = if self.encrypted && self.unp_ver >= 20 {
+                            expected_len.checked_add(15).map(|len| len & !15).ok_or(
+                                Error::InvalidHeader(
+                                    "RAR 2.x encrypted split stored size overflows",
+                                ),
+                            )?
+                        } else {
+                            expected_len
+                        };
+                        if actual_len != expected_packed_len {
+                            return Err(Error::InvalidHeader(
+                                "RAR 1.5 split stored file has wrong reassembled size",
+                            ));
+                        }
 
-                let mut crc = Crc32::new();
-                let mut crc_writer = CrcWriter {
-                    inner: &mut writer,
-                    crc: &mut crc,
-                };
-                let copied = std::io::copy(&mut reader.take(expected_len as u64), &mut crc_writer)?;
-                if copied != expected_len as u64 {
-                    return Err(Error::InvalidHeader(
-                        "RAR 1.5 split stored file ended before unpacked size",
-                    ));
-                }
-                let actual = crc.finish();
-                final_file
-                    .crc_result(actual, password)
-                    .map_err(|error| final_file.entry_error("extracting", error))
-            } else {
-                session
-                    .write_split_to(&mut reader, final_file, &mut writer)
-                    .map_err(|error| final_file.entry_error("extracting", error))
-            }
-        })
+                        let mut crc = Crc32::new();
+                        let mut crc_writer = CrcWriter {
+                            inner: &mut writer,
+                            crc: &mut crc,
+                        };
+                        let copied =
+                            std::io::copy(&mut reader.take(expected_len as u64), &mut crc_writer)?;
+                        if copied != expected_len as u64 {
+                            return Err(Error::InvalidHeader(
+                                "RAR 1.5 split stored file ended before unpacked size",
+                            ));
+                        }
+                        let actual = crc.finish();
+                        final_file
+                            .crc_result(actual, password)
+                            .map_err(|error| final_file.entry_error("extracting", error))
+                    } else {
+                        session
+                            .write_split_to(&mut reader, final_file, &mut writer)
+                            .map_err(|error| final_file.entry_error("extracting", error))
+                    }
+                })
+            },
+        )
     }
 
     fn packed_size(&self, volumes: &[Archive]) -> Result<usize> {

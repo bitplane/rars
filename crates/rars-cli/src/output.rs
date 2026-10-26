@@ -1,10 +1,7 @@
 use crate::time::extracted_system_time;
 use crate::CliResult;
 use rars::atomic64::AtomicU64;
-use rars::{
-    Archive as DetectedArchive, ArchiveFamily, ArchiveVersion, AttrSource, Error,
-    ExtractedEntryMeta,
-};
+use rars::{Archive as DetectedArchive, ArchiveFamily, AttrSource, Error, ExtractedEntryMeta};
 use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -134,67 +131,36 @@ pub(crate) struct ExtractedOutput {
     pub(crate) restore_metadata: bool,
 }
 
+#[cfg(test)]
 const FSREDIR_UNIX_SYMLINK: u64 = 0x01;
-const FSREDIR_WINDOWS_SYMLINK: u64 = 0x02;
-const FSREDIR_WINDOWS_JUNCTION: u64 = 0x03;
+#[cfg(test)]
 const FSREDIR_HARDLINK: u64 = 0x04;
+#[cfg(test)]
 const FSREDIR_FILE_COPY: u64 = 0x05;
 #[cfg(windows)]
 const FHEXTRA_REDIR_DIR: u64 = 0x01;
 
-/// Whether a backslash in an entry name separates path components.
-///
-/// RAR 1.5-4.x uses it as the wire separator, so there it does. RAR 5.0 uses
-/// `/` for every host and a backslash is an ordinary character; see
-/// [`rar50_entry_name`].
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Backslash {
-    Separator,
-    Literal,
-}
-
-impl Backslash {
-    fn is_separator(self) -> bool {
-        self == Self::Separator
-    }
-}
-
 pub(crate) fn open_output_writer(
     out_dir: &Path,
-    entry: &ExtractedEntryMeta,
+    relative: &Path,
+    directory: bool,
     overwrite: OverwritePolicy,
-    backslash: Backslash,
 ) -> rars::Result<(PathBuf, Box<dyn std::io::Write>)> {
-    let resolve = |name: &[u8]| {
-        relative_path(name, backslash.is_separator())
-            .map_err(|_| Error::InvalidHeader("unsafe archive path"))
-    };
-    let rel = resolve(&entry.name)?;
-    let mut out_path = checked_output_path(out_dir, &rel)?;
-    if entry.is_directory {
+    let mut out_path = checked_output_path(out_dir, relative)?;
+    if directory {
         fs::create_dir_all(&out_path)?;
         return Ok((out_path, Box::new(std::io::sink())));
     }
-    // A validated nonempty relative name always leaves a final path component.
     fs::create_dir_all(
         out_path
             .parent()
             .expect("validated output path has a parent"),
     )?;
-    out_path = checked_output_path(out_dir, &rel)?;
+    out_path = checked_output_path(out_dir, relative)?;
     Ok((
         out_path.clone(),
         Box::new(create_output_file(&out_path, overwrite)?),
     ))
-}
-
-pub(crate) fn output_path_for_entry(
-    out_dir: &Path,
-    entry: &ExtractedEntryMeta,
-) -> rars::Result<PathBuf> {
-    let rel = output_relative_path(&entry.name)
-        .map_err(|_| Error::InvalidHeader("unsafe archive path"))?;
-    checked_output_path(out_dir, &rel)
 }
 
 /// RAR 5.0 uses `/` as the separator for every host, so a backslash that
@@ -220,95 +186,67 @@ pub(crate) fn rar50_entry_name(name: &[u8], host_os: u64) -> Vec<u8> {
         .collect()
 }
 
-pub(crate) fn output_path_for_rar50_entry(
-    out_dir: &Path,
-    entry: &rars::rar50::ExtractedEntryMeta,
-) -> rars::Result<PathBuf> {
-    let rel = rar50_output_relative_path(&entry.name, entry.host_os)
-        .map_err(|_| Error::InvalidHeader("unsafe archive path"))?;
-    checked_output_path(out_dir, &rel)
-}
-
 /// [`output_relative_path`] for a RAR 5.0 entry, which does not treat a
 /// backslash as a separator. See [`rar50_entry_name`].
 pub(crate) fn rar50_output_relative_path(name: &[u8], host_os: u64) -> CliResult<PathBuf> {
     relative_path(&rar50_entry_name(name, host_os), false)
 }
 
-pub(crate) fn create_rar50_redirection(
+pub(crate) fn create_link_output(
     out_dir: &Path,
-    entry: &rars::rar50::ExtractedEntryMeta,
-    redirection: &rars::rar50::FileRedirection,
+    relative: &Path,
+    target: &Path,
+    link: rars::ExtractedLink<'_>,
     overwrite: OverwritePolicy,
     created_paths: &HashMap<PathBuf, PathBuf>,
 ) -> rars::Result<(PathBuf, bool)> {
-    // Validate the operation and its target before removing an existing output.
-    let prepare_destination = || -> rars::Result<PathBuf> {
-        let rel = rar50_output_relative_path(&entry.name, entry.host_os)
-            .map_err(|_| Error::InvalidHeader("unsafe archive path"))?;
-        let mut out_path = checked_output_path(out_dir, &rel)?;
-        fs::create_dir_all(
-            out_path
-                .parent()
-                .expect("validated output path has a parent"),
-        )?;
-        out_path = checked_output_path(out_dir, &rel)?;
-        prepare_redirection_destination(&out_path, overwrite)?;
-        Ok(out_path)
+    // Resolve hard-link/copy sources before touching an existing destination.
+    let source = match link {
+        rars::ExtractedLink::HardLink { .. } | rars::ExtractedLink::FileCopy { .. } => {
+            Some(link_source_path(target, created_paths)?)
+        }
+        rars::ExtractedLink::Symlink { .. } | rars::ExtractedLink::Junction { .. } => None,
+        _ => return Err(Error::InvalidHeader("unsupported archive link type")),
     };
-
-    match redirection.redirection_type {
-        FSREDIR_UNIX_SYMLINK | FSREDIR_WINDOWS_SYMLINK | FSREDIR_WINDOWS_JUNCTION => {
-            let target_rel = rar50_output_relative_path(&redirection.target_name, entry.host_os)
-                .map_err(|_| Error::InvalidHeader("unsafe archive redirection target"))?;
-            let out_path = prepare_destination()?;
-            create_symlink_redirection(&target_rel, &out_path, redirection.flags)?;
+    let mut out_path = checked_output_path(out_dir, relative)?;
+    fs::create_dir_all(
+        out_path
+            .parent()
+            .expect("validated output path has a parent"),
+    )?;
+    out_path = checked_output_path(out_dir, relative)?;
+    prepare_redirection_destination(&out_path, overwrite)?;
+    match link {
+        rars::ExtractedLink::Symlink { directory, .. } => {
+            create_symlink_redirection(target, &out_path, u64::from(directory))?;
             Ok((out_path, false))
         }
-        FSREDIR_HARDLINK => {
-            let source = redirection_source_path(redirection, entry.host_os, created_paths)?;
-            let out_path = prepare_destination()?;
-            fs::hard_link(source, &out_path)?;
+        rars::ExtractedLink::Junction { .. } => {
+            create_symlink_redirection(target, &out_path, 1)?;
+            Ok((out_path, false))
+        }
+        rars::ExtractedLink::HardLink { .. } => {
+            fs::hard_link(source.expect("source checked above"), &out_path)?;
             Ok((out_path, true))
         }
-        FSREDIR_FILE_COPY => {
-            let source = redirection_source_path(redirection, entry.host_os, created_paths)?;
-            let out_path = prepare_destination()?;
-            fs::copy(source, &out_path)?;
+        rars::ExtractedLink::FileCopy { .. } => {
+            fs::copy(source.expect("source checked above"), &out_path)?;
             Ok((out_path, true))
         }
-        _ => Err(Error::UnsupportedFeature {
-            version: ArchiveVersion::Rar50,
-            feature: "RAR 5 unsupported file redirection type",
-        }),
+        _ => Err(Error::InvalidHeader("unsupported archive link type")),
     }
 }
 
-fn redirection_source_path<'a>(
-    redirection: &rars::rar50::FileRedirection,
-    host_os: u64,
+pub(crate) fn link_source_path<'a>(
+    target: &Path,
     created_paths: &'a HashMap<PathBuf, PathBuf>,
 ) -> rars::Result<&'a Path> {
-    let target = rar50_output_relative_path(&redirection.target_name, host_os)
-        .map_err(|_| Error::InvalidHeader("unsafe archive redirection target"))?;
     created_paths
-        .get(&target)
+        .get(target)
         .map(PathBuf::as_path)
         .ok_or(Error::InvalidHeader(
             "RAR 5 redirection target was not extracted earlier",
         ))
-}
-
-pub(crate) fn rar50_hardlink_source<'a>(
-    redirection: &rars::rar50::FileRedirection,
-    host_os: u64,
-    created_paths: &'a HashMap<PathBuf, PathBuf>,
-) -> rars::Result<Option<&'a Path>> {
-    if redirection.redirection_type == FSREDIR_HARDLINK {
-        redirection_source_path(redirection, host_os, created_paths).map(Some)
-    } else {
-        Ok(None)
-    }
 }
 
 fn prepare_redirection_destination(path: &Path, overwrite: OverwritePolicy) -> std::io::Result<()> {
@@ -1008,7 +946,7 @@ mod tests {
         ] {
             assert!(output_relative_path(name).is_err(), "{name:?}");
             let meta = ExtractedEntryMeta::new(name.to_vec(), None, 0, false);
-            assert!(output_path_for_entry(&dir, &meta).is_err());
+            assert!(rars::filename::relative_path(&meta.name, true).is_err());
             let (mut rar50_meta, _) = redirection_fixture();
             rar50_meta.name = name.to_vec();
             assert!(output_path_for_rar50_entry(&dir, &rar50_meta).is_err());
@@ -1036,9 +974,7 @@ mod tests {
         fs::create_dir(&target).unwrap();
         symlink(&target, dir.join("link")).unwrap();
         let meta = ExtractedEntryMeta::new(b"link/child".to_vec(), None, 0, false);
-        assert!(
-            open_output_writer(&dir, &meta, OverwritePolicy::Always, Backslash::Separator).is_err()
-        );
+        assert!(open_test_writer(&dir, &meta, OverwritePolicy::Always).is_err());
         assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
         let (mut link_meta, mut link_redirection) = redirection_fixture();
         link_meta.name = b"link/child".to_vec();
@@ -1083,24 +1019,16 @@ mod tests {
         let dir = scratch("writer-errors");
         let mut meta = ExtractedEntryMeta::new(b"existing".to_vec(), None, 0, false);
         fs::write(dir.join("existing"), b"keep").unwrap();
-        assert!(
-            open_output_writer(&dir, &meta, OverwritePolicy::Never, Backslash::Separator).is_err()
-        );
+        assert!(open_test_writer(&dir, &meta, OverwritePolicy::Never).is_err());
         assert_eq!(fs::read(dir.join("existing")).unwrap(), b"keep");
         for name in [b"../escape".as_slice(), b"invalid\0name"] {
             meta.name = name.to_vec();
-            assert!(
-                open_output_writer(&dir, &meta, OverwritePolicy::Always, Backslash::Separator)
-                    .is_err()
-            );
+            assert!(open_test_writer(&dir, &meta, OverwritePolicy::Always).is_err());
         }
         meta.name = b"existing/child".to_vec();
         for directory in [false, true] {
             meta.is_directory = directory;
-            assert!(
-                open_output_writer(&dir, &meta, OverwritePolicy::Always, Backslash::Separator)
-                    .is_err()
-            );
+            assert!(open_test_writer(&dir, &meta, OverwritePolicy::Always).is_err());
         }
         assert_eq!(fs::read(dir.join("existing")).unwrap(), b"keep");
     }
@@ -1174,14 +1102,15 @@ mod tests {
                     let (mut meta, mut redirection) = redirection_fixture();
                     meta.name = b"source".to_vec();
                     state
-                        .open_rar50_entry(&meta)
+                        .open_entry(&rars::rar50_meta(&meta))
                         .unwrap()
                         .write_all(b"payload")
                         .unwrap();
                     meta.name = b"destination".to_vec();
                     redirection.target_name = b"source".to_vec();
                     redirection.redirection_type = kind;
-                    let staged = state.create_rar50_redirection(&meta, &redirection);
+                    let staged = state
+                        .create_link(&rars::rar50_meta(&meta), test_link(&redirection).unwrap());
                     assert!(
                         destination.is_dir(),
                         "destination changed before verification"
@@ -1334,6 +1263,58 @@ mod tests {
         }
     }
 
+    // Keep raw RAR5 fixtures to exercise the same filename and filesystem cases.
+    fn test_link(link: &rars::rar50::FileRedirection) -> rars::Result<rars::ExtractedLink<'_>> {
+        use rars::ExtractedLink::*;
+        let target = &link.target_name;
+        Ok(match link.redirection_type {
+            1 | 2 => Symlink {
+                target,
+                directory: link.flags & 1 != 0,
+            },
+            3 => Junction { target },
+            4 => HardLink { target },
+            5 => FileCopy { target },
+            _ => return Err(rars::Error::InvalidHeader("unsupported archive link type")),
+        })
+    }
+    fn create_rar50_redirection(
+        out: &std::path::Path,
+        meta: &rars::rar50::ExtractedEntryMeta,
+        link: &rars::rar50::FileRedirection,
+        overwrite: super::OverwritePolicy,
+        created: &std::collections::HashMap<std::path::PathBuf, std::path::PathBuf>,
+    ) -> rars::Result<(std::path::PathBuf, bool)> {
+        let relative = super::rar50_output_relative_path(&meta.name, meta.host_os)
+            .map_err(|_| rars::Error::InvalidHeader("unsafe archive path"))?;
+        let target = super::rar50_output_relative_path(&link.target_name, meta.host_os)
+            .map_err(|_| rars::Error::InvalidHeader("unsafe archive redirection target"))?;
+        super::create_link_output(
+            out,
+            &relative,
+            &target,
+            test_link(link)?,
+            overwrite,
+            created,
+        )
+    }
+    fn output_path_for_rar50_entry(
+        out: &std::path::Path,
+        meta: &rars::rar50::ExtractedEntryMeta,
+    ) -> rars::Result<std::path::PathBuf> {
+        let relative = super::rar50_output_relative_path(&meta.name, meta.host_os)
+            .map_err(|_| rars::Error::InvalidHeader("unsafe archive path"))?;
+        super::checked_output_path(out, &relative)
+    }
+    fn open_test_writer(
+        out: &std::path::Path,
+        meta: &rars::ExtractedEntryMeta,
+        overwrite: super::OverwritePolicy,
+    ) -> rars::Result<(std::path::PathBuf, Box<dyn std::io::Write>)> {
+        let relative = rars::filename::relative_path(&meta.name, true)?;
+        super::open_output_writer(out, &relative, meta.is_directory, overwrite)
+    }
+
     fn redirection_fixture() -> (
         rars::rar50::ExtractedEntryMeta,
         rars::rar50::FileRedirection,
@@ -1389,7 +1370,7 @@ mod tests {
             };
             meta.name = rars::filename::encode_rar50(native).into_owned();
             state
-                .open_rar50_entry(&meta)
+                .open_entry(&rars::rar50_meta(&meta))
                 .unwrap()
                 .write_all(b"payload")
                 .unwrap();
@@ -1402,7 +1383,9 @@ mod tests {
                 b"link-unicode".as_slice()
             };
             meta.name = rars::filename::encode_rar50(link).into_owned();
-            state.create_rar50_redirection(&meta, &redirection).unwrap();
+            state
+                .create_link(&rars::rar50_meta(&meta), test_link(&redirection).unwrap())
+                .unwrap();
             state.publish().unwrap();
             assert_eq!(
                 fs::read(dir.join(OsStr::from_bytes(link))).unwrap(),
@@ -1440,7 +1423,7 @@ mod tests {
                 ] {
                     meta.name = name.to_vec();
                     state
-                        .open_rar50_entry(&meta)
+                        .open_entry(&rars::rar50_meta(&meta))
                         .unwrap()
                         .write_all(data)
                         .unwrap();
@@ -1449,7 +1432,9 @@ mod tests {
                 meta.name = br"links\item".to_vec();
                 redirection.redirection_type = kind;
                 redirection.target_name = br"sub\file".to_vec();
-                state.create_rar50_redirection(&meta, &redirection).unwrap();
+                state
+                    .create_link(&rars::rar50_meta(&meta), test_link(&redirection).unwrap())
+                    .unwrap();
                 let (source, destination) = if cfg!(unix) && host_os == 1 {
                     (r"sub\file", r"links\item")
                 } else {
@@ -1459,7 +1444,9 @@ mod tests {
                     // Redirections must also be recorded under the same path rules.
                     meta.name = b"chain".to_vec();
                     redirection.target_name = br"links\item".to_vec();
-                    state.create_rar50_redirection(&meta, &redirection).unwrap();
+                    state
+                        .create_link(&rars::rar50_meta(&meta), test_link(&redirection).unwrap())
+                        .unwrap();
                 }
                 state.publish().unwrap();
                 assert_eq!(fs::read(dir.join(destination)).unwrap(), b"literal");
@@ -1496,7 +1483,7 @@ mod tests {
             meta.host_os = host_os;
             meta.name = br"same\name".to_vec();
             state
-                .open_rar50_entry(&meta)
+                .open_entry(&rars::rar50_meta(&meta))
                 .unwrap()
                 .write_all(b"keep me")
                 .unwrap();
@@ -1509,7 +1496,7 @@ mod tests {
             redirection.redirection_type = FSREDIR_FILE_COPY;
             redirection.target_name = br"same\name".to_vec();
             assert!(matches!(
-                state.create_rar50_redirection(&meta, &redirection),
+                state.create_link(&rars::rar50_meta(&meta), test_link(&redirection).unwrap()),
                 Err(Error::InvalidHeader(
                     "multiple archive entries map to the same output path"
                 ))

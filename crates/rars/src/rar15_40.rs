@@ -30,11 +30,13 @@ mod extract;
 mod producer;
 #[cfg(feature = "write")]
 mod write;
+use crate::extraction_links::{check_legacy_size, emit_legacy_link, legacy_output, LegacyLink};
 #[cfg(feature = "write")]
 pub use crate::streaming::{EntrySource, WriterResources};
 #[cfg(feature = "write")]
 pub use crate::write_plan::MemberCoding;
 pub use extract::extract_volumes_to;
+pub(crate) use extract::extract_volumes_with_links;
 use extract::{DecoderSession, DecryptingReader, PackedReader};
 #[cfg(feature = "write")]
 pub(crate) use write::write_stored_volumes_with_progress;
@@ -1352,7 +1354,7 @@ impl Archive {
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
-        self.extract_impl(options, &mut open, None, None)
+        self.extract_impl(options, &mut open, None, None, None)
             .map(|_| ())
     }
 
@@ -1367,6 +1369,7 @@ impl Archive {
             &mut |_| unreachable!("controlled selection supplies writer"),
             Some(selector),
             on_error,
+            None,
         )
     }
 
@@ -1376,6 +1379,7 @@ impl Archive {
         open: &mut F,
         selector: Option<&mut crate::extraction_control::Selector<'_>>,
         on_error: Option<&mut crate::extraction_control::ErrorHandler<'_>>,
+        links: Option<&mut LegacyLink<'_>>,
     ) -> Result<crate::ExtractionOutcome>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -1386,6 +1390,7 @@ impl Archive {
                 open,
                 selector,
                 on_error,
+                links,
                 &crate::codec::workspace::Allowance::limited(limit),
             );
         }
@@ -1394,6 +1399,7 @@ impl Archive {
             open,
             selector,
             on_error,
+            links,
             &crate::codec::workspace::Allowance::default(),
         )
     }
@@ -1404,11 +1410,13 @@ impl Archive {
         open: &mut F,
         mut selector: Option<&mut crate::extraction_control::Selector<'_>>,
         mut on_error: Option<&mut crate::extraction_control::ErrorHandler<'_>>,
+        mut links: Option<&mut LegacyLink<'_>>,
         allowance: &B,
     ) -> Result<crate::ExtractionOutcome>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
+        debug_assert!(links.is_none() || selector.is_none());
         options.check_cancelled()?;
         let password = options.password;
         let mut budget = crate::output_limit::OutputBudget::new(options);
@@ -1450,22 +1458,36 @@ impl Archive {
                 }
                 budget.check(file.unp_size, &file.name)?;
                 options.check_cancelled()?;
-                let mut writer = match selected_writer.take() {
-                    Some(writer) => writer,
-                    None => open(&meta)?,
-                };
-                options.check_cancelled()?;
-                budget.run(&file.name, &mut writer, |mut writer| {
-                    if file.is_stored() {
-                        file.write_stored_with_allowance(self, password, &mut writer, allowance)
-                            .map_err(|error| file.entry_error("extracting", error))?;
-                    } else {
-                        session
-                            .write_file_to(self, file, &mut writer)
-                            .map_err(|error| file.entry_error("extracting", error))?;
-                    }
-                    Ok(())
-                })?;
+                check_legacy_size(&meta, file.unp_size, links.is_some())?;
+                let control = budget.control.clone();
+                legacy_output(
+                    &meta,
+                    allowance,
+                    &control,
+                    &mut links,
+                    || match selected_writer.take() {
+                        Some(writer) => Ok(writer),
+                        None => open(&meta),
+                    },
+                    |writer| {
+                        budget.run(&file.name, writer, |mut writer| {
+                            if file.is_stored() {
+                                file.write_stored_with_allowance(
+                                    self,
+                                    password,
+                                    &mut writer,
+                                    allowance,
+                                )
+                                .map_err(|error| file.entry_error("extracting", error))?;
+                            } else {
+                                session
+                                    .write_file_to(self, file, &mut writer)
+                                    .map_err(|error| file.entry_error("extracting", error))?;
+                            }
+                            Ok(())
+                        })
+                    },
+                )?;
                 Ok(())
             })();
             if crate::extraction_control::finish_member(
@@ -1491,7 +1513,19 @@ impl Archive {
     pub fn extract_to_parallel_buffered<F>(
         &self,
         options: crate::ArchiveReadOptions<'_>,
+        open: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    {
+        self.extract_parallel_with_links(options, open, None)
+    }
+
+    pub(crate) fn extract_parallel_with_links<F>(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
         mut open: F,
+        mut links: Option<&mut LegacyLink<'_>>,
     ) -> Result<()>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -1504,9 +1538,12 @@ impl Archive {
                 .files()
                 .any(|file| file.is_solid() || file.is_split_before() || file.is_split_after())
         {
-            return self.extract_to(options, open);
+            return self
+                .extract_impl(options, &mut open, None, None, links)
+                .map(|_| ());
         }
 
+        let emit_links = links.is_some();
         if let Some(limit) = options.max_reader_workspace_bytes {
             let ledger = Allowance::limited(limit);
             let publication = crate::read_control::ReadControl::new(options.cancellation);
@@ -1527,9 +1564,9 @@ impl Archive {
                 },
                 |file, local| {
                     options.check_cancelled()?;
-                    decode_parallel_entry_with_allowance(self, file, options, local)
+                    decode_parallel_entry_with_allowance(self, file, options, local, emit_links)
                 },
-                |entry| write_parallel_entry(entry, &mut open, &publication),
+                |entry| write_parallel_entry(entry, &mut open, &publication, &mut links),
             );
         }
 
@@ -1541,10 +1578,10 @@ impl Archive {
             let batch = files.by_ref().take(window).collect();
             // Write the verified members ahead of a failure before reporting it.
             let (entries, failure) = crate::parallel::map_prefix(batch, |file| {
-                decode_parallel_entry(self, file, options)
+                decode_parallel_entry(self, file, options, emit_links)
             });
             for entry in entries {
-                write_parallel_entry(entry, &mut open, &publication)?;
+                write_parallel_entry(entry, &mut open, &publication, &mut links)?;
             }
             if let Some(error) = failure {
                 return Err(error);
@@ -1626,8 +1663,9 @@ fn decode_parallel_entry(
     archive: &Archive,
     file: &FileHeader,
     options: crate::ArchiveReadOptions<'_>,
+    links: bool,
 ) -> Result<ParallelExtractedEntry> {
-    decode_parallel_entry_with_allowance(archive, file, options, &Allowance::default())
+    decode_parallel_entry_with_allowance(archive, file, options, &Allowance::default(), links)
 }
 
 enum ParallelExtractedEntry<B: Budget = Allowance> {
@@ -1643,6 +1681,7 @@ fn decode_parallel_entry_with_allowance<B: Budget>(
     file: &FileHeader,
     options: crate::ArchiveReadOptions<'_>,
     allowance: &B,
+    links: bool,
 ) -> Result<ParallelExtractedEntry<B>> {
     options.check_cancelled()?;
     let password = options.password;
@@ -1653,6 +1692,7 @@ fn decode_parallel_entry_with_allowance<B: Budget>(
         return Ok(ParallelExtractedEntry::Directory(meta));
     }
     budget.check(file.unp_size, &file.name)?;
+    check_legacy_size(&meta, file.unp_size, links)?;
     let mut data = Buffer::new(allowance);
     let control = budget.control.clone();
     budget.run(&file.name, &mut data, |mut data| {
@@ -1676,6 +1716,7 @@ fn write_parallel_entry<F, B: Budget>(
     entry: ParallelExtractedEntry<B>,
     open: &mut F,
     control: &crate::read_control::ReadControl,
+    links: &mut Option<&mut LegacyLink<'_>>,
 ) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -1686,6 +1727,9 @@ where
             let _ = open(&meta)?;
         }
         ParallelExtractedEntry::File { meta, data } => {
+            if emit_legacy_link(&meta, &data, links, control)? {
+                return Ok(());
+            }
             let mut writer = open(&meta)?;
             control.check()?;
             control
