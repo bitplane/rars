@@ -66,6 +66,7 @@ mod progress;
 mod read_control;
 pub use read_control::ReadCancellation;
 mod extraction_control;
+mod extraction_links;
 mod file_times;
 pub mod rar13;
 pub mod rar15_40;
@@ -104,6 +105,7 @@ pub use builder::Builder;
 pub use detect::{detect_archive_family, find_archive_start, ArchiveSignature, SFX_SCAN_LIMIT};
 pub use error::{Error, ErrorKind, Result};
 pub use extraction_control::{ExtractionDecision, ExtractionErrorAction, ExtractionOutcome};
+pub use extraction_links::{extract_volumes_with_links, ExtractedLink};
 pub use features::{Feature, FeatureSet};
 pub use filename::{entry_relative_path, validate_entry_name};
 pub use filter::{

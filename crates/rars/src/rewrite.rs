@@ -122,7 +122,7 @@ impl Archive {
         let target = self
             .read_member_at(index, password)?
             .ok_or(crate::Error::EntryNotFound)?;
-        validate_legacy_link_target(&target, &member.meta.name)?;
+        crate::extraction_links::validate_legacy_target(&target, &member.meta.name)?;
         Ok(Some(target))
     }
 
@@ -190,7 +190,7 @@ impl Archive {
                         .ok_or(Error::InvalidHeader(
                             "legacy link target disappeared while reading",
                         ))?;
-                validate_legacy_link_target(&target, &member.meta.name)?;
+                crate::extraction_links::validate_legacy_target(&target, &member.meta.name)?;
                 Ok(Some(target))
             })
             .collect()
@@ -583,19 +583,11 @@ pub(crate) fn special_entry(meta: &ArchiveMemberMeta) -> bool {
         || (meta.attr_source() == AttrSource::Dos && meta.file_attr & 0x400 != 0)
 }
 
-fn validate_legacy_link_target(target: &[u8], name: &[u8]) -> crate::Result<()> {
-    if target.is_empty() || target.contains(&0) {
-        return Err(crate::Error::InvalidArgument(
-            "legacy symbolic link target is empty or contains NUL",
-        )
-        .at_entry(name.to_vec(), "reading link target"));
-    }
-    Ok(())
-}
-
 impl crate::ArchiveMember {
     /// Legacy Unix links store the native target as ordinary member data.
     pub fn is_legacy_unix_symlink(&self) -> bool {
+        // Preserve this inspection API's historical Unix-attribute interpretation,
+        // including BeOS. Filesystem extraction follows the wire host instead.
         self.meta.family == crate::ArchiveFamily::Rar15To40
             && self.meta.attr_source() == AttrSource::Unix
             && self.meta.file_attr & !0o7777 == 0o120000

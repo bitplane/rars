@@ -21,10 +21,9 @@ use cli::{AddArgs, Command, ExtractArgs, InfoArgs, PasswordArgs, TestArgs};
 use error::{CliError, CliResult};
 use input::{collect_inputs, rar15_file_attr, read_inputs_with_progress};
 use output::{
-    create_rar50_redirection as create_rar50_redirection_output, open_output_writer,
-    output_path_for_entry, output_path_for_rar50_entry, print_ok_entry, rar50_entry_name,
-    rar50_output_relative_path, restore_output_metadata, warn_rar50_redirections, Backslash,
-    ExtractedOutput, ExtractionStaging, OverwritePolicy,
+    create_link_output, open_output_writer, print_ok_entry, rar50_output_relative_path,
+    restore_output_metadata, warn_rar50_redirections, ExtractedOutput, ExtractionStaging,
+    OverwritePolicy,
 };
 use password::{
     classify_rars_error, ensure_password_for_archives_extract, ensure_password_for_extract,
@@ -40,9 +39,8 @@ use rars::rar15_40::{
     WriterOptions as Rar15WriterOptions,
 };
 use rars::{
-    extract_volumes_to_with_options, test_volumes_with_options_and_callback,
-    Archive as DetectedArchive, ArchiveReadOptions, ArchiveReader, ArchiveVersion, FeatureSet,
-    MemberCoding,
+    extract_volumes_with_links, test_volumes_with_options_and_callback, Archive as DetectedArchive,
+    ArchiveReadOptions, ArchiveReader, ArchiveVersion, FeatureSet, MemberCoding,
 };
 use repair::cmd_repair;
 use std::cell::RefCell;
@@ -112,17 +110,6 @@ fn configure_threads(threads: Option<usize>) -> CliResult<()> {
     builder
         .build_global()
         .map_err(|err| CliError::general(format!("failed to configure parallel workers: {err}")))
-}
-
-fn extract_archive_to_with_options<F>(
-    archive: &DetectedArchive,
-    options: ArchiveReadOptions<'_>,
-    open: F,
-) -> rars::Result<()>
-where
-    F: FnMut(&rars::ExtractedEntryMeta) -> rars::Result<Box<dyn Write>>,
-{
-    archive.extract_to_parallel_buffered_with_options(options, open)
 }
 
 fn rar50_buffered_decode_limit_hint(error: &rars::Error) -> String {
@@ -704,59 +691,43 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
         sort_volume_paths(&mut paths);
     }
 
-    if paths.len() == 1 {
-        let archive =
-            read_archive_path_prompting_with_options(&paths[0], &mut password, &args.read_options)?;
-        ensure_password_for_extract(&archive, &mut password)?;
-        let family = archive.family();
-        let state = RefCell::new(ExtractOutputState::new(&out_dir, overwrite, family));
-        let options = args
-            .read_options
-            .options(password_bytes(&password), scratch.as_ref());
-        extract_single_archive(&archive, options, &state)
-            // Keep the members that verified before the failure. The extraction
-            // error is the one to report, even if publishing them also fails.
-            .inspect_err(|err| {
-                let _ = state.borrow_mut().publish_before_failure(err);
-            })
-            .map_err(|err| {
-                classify_rars_error(err, |err| {
+    let archives = if paths.len() == 1 {
+        vec![read_archive_path_prompting_with_options(
+            &paths[0],
+            &mut password,
+            &args.read_options,
+        )?]
+    } else {
+        parse_archives_prompting(&paths, &mut password, &args.read_options)?
+    };
+    ensure_password_for_archives_extract(&archives, &mut password)?;
+    let family = archives
+        .first()
+        .map(DetectedArchive::family)
+        .ok_or("no archive parts provided")?;
+    let state = RefCell::new(ExtractOutputState::new(&out_dir, overwrite, family));
+    let options = args
+        .read_options
+        .options(password_bytes(&password), scratch.as_ref());
+    let result = if archives.len() == 1 {
+        extract_single_archive(&archives[0], options, &state)
+    } else {
+        extract_volume_archives(&archives, options, &state)
+    };
+    result
+        .inspect_err(|err| {
+            // Keep verified predecessors; retain the extraction error if publication fails.
+            let _ = state.borrow_mut().publish_before_failure(err);
+        })
+        .map_err(|err| {
+            classify_rars_error(err, |err| {
+                if archives.len() == 1 {
                     format!(
                         "failed to write extracted entry to '{}': {err}{}",
                         out_dir.display(),
                         rar50_buffered_decode_limit_hint(err)
                     )
-                })
-            })?;
-        let outputs = state.into_inner().publish()?;
-        restore_output_metadata(&outputs).map_err(|err| {
-            CliError::general(format!(
-                "failed to restore extracted metadata under '{}': {err}",
-                out_dir.display()
-            ))
-        })?;
-        for output in &outputs {
-            println!("x {}", display_bytes_lossy(&output.name));
-        }
-    } else {
-        let archives = parse_archives_prompting(&paths, &mut password, &args.read_options)?;
-        ensure_password_for_archives_extract(&archives, &mut password)?;
-        let family = archives
-            .first()
-            .map(DetectedArchive::family)
-            .ok_or("no archive parts provided")?;
-        let state = RefCell::new(ExtractOutputState::new(&out_dir, overwrite, family));
-        let options = args
-            .read_options
-            .options(password_bytes(&password), scratch.as_ref());
-        extract_volume_archives(&archives, options, &state)
-            // Keep the members that verified before the failure. The extraction
-            // error is the one to report, even if publishing them also fails.
-            .inspect_err(|err| {
-                let _ = state.borrow_mut().publish_before_failure(err);
-            })
-            .map_err(|err| {
-                classify_rars_error(err, |err| {
+                } else {
                     format!(
                         "failed to extract volume set '{}': {err}{}",
                         paths
@@ -766,19 +737,20 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
                             .join(", "),
                         rar50_buffered_decode_limit_hint(err)
                     )
-                })
-            })?;
-        let outputs = state.into_inner().publish()?;
-        restore_output_metadata(&outputs).map_err(|err| {
-            CliError::general(format!(
-                "failed to restore extracted metadata under '{}': {err}",
-                out_dir.display()
-            ))
+                }
+            })
         })?;
-        for output in &outputs {
-            println!("x {}", display_bytes_lossy(&output.name));
-        }
+    let outputs = state.into_inner().publish()?;
+    restore_output_metadata(&outputs).map_err(|err| {
+        CliError::general(format!(
+            "failed to restore extracted metadata under '{}': {err}",
+            out_dir.display()
+        ))
+    })?;
+    for output in &outputs {
+        println!("x {}", display_bytes_lossy(&output.name));
     }
+
     Ok(())
 }
 
@@ -786,6 +758,7 @@ struct ExtractOutputState<'a> {
     out_dir: &'a Path,
     overwrite: OverwritePolicy,
     family: rars::ArchiveFamily,
+    legacy_name_encoding: Option<rars::filename::LegacyNameEncoding>,
     outputs: Vec<ExtractedOutput>,
     planned_paths: HashSet<PathBuf>,
     created_paths: HashMap<PathBuf, PathBuf>,
@@ -809,6 +782,7 @@ impl<'a> ExtractOutputState<'a> {
             out_dir,
             overwrite,
             family,
+            legacy_name_encoding: None,
             outputs: Vec::new(),
             planned_paths: HashSet::new(),
             created_paths: HashMap::new(),
@@ -825,27 +799,47 @@ impl<'a> ExtractOutputState<'a> {
         }
     }
 
-    fn open_entry(&mut self, meta: &rars::ExtractedEntryMeta) -> rars::Result<Box<dyn Write>> {
-        self.open_entry_named(meta, &meta.name)
+    // Decode names once at the filesystem boundary, retaining the archive's
+    // raw identity for errors and publication. RAR5 Unix hosts map to AttrSource::Unix.
+    fn entry_path(&self, meta: &rars::ExtractedEntryMeta) -> rars::Result<(Vec<u8>, PathBuf)> {
+        if self.family == rars::ArchiveFamily::Rar50Plus {
+            let path = rar50_output_relative_path(
+                &meta.name,
+                u64::from(meta.attr_source == rars::AttrSource::Unix),
+            )
+            .map_err(|_| rars::Error::InvalidHeader("unsafe archive path"))?;
+            Ok((meta.name.clone(), path))
+        } else {
+            let name = rars::filename::decoded_name(
+                &meta.name,
+                meta.name_is_unicode,
+                self.legacy_name_encoding,
+            )?
+            .into_owned();
+            let path = output::output_relative_path(&name)
+                .map_err(|_| rars::Error::InvalidHeader("unsafe archive path"))?;
+            Ok((name, path))
+        }
     }
 
-    /// Open an entry whose name was re-decoded, remembering its archive name.
-    fn open_entry_named(
-        &mut self,
-        meta: &rars::ExtractedEntryMeta,
-        archive_name: &[u8],
-    ) -> rars::Result<Box<dyn Write>> {
+    fn open_entry(&mut self, meta: &rars::ExtractedEntryMeta) -> rars::Result<Box<dyn Write>> {
         self.publish_verified()?;
-        let destination = output_path_for_entry(self.out_dir, meta)?;
+        let (name, relative) = self.entry_path(meta)?;
+        let destination = output::checked_output_path(self.out_dir, &relative)?;
         self.reserve_output_path(destination.clone())?;
         self.remember_directory_time(&destination, meta)?;
         let staging = self.prepare_staged_path(&destination, meta.is_directory)?;
-        let (path, writer) =
-            open_output_writer(&staging, meta, OverwritePolicy::Never, Backslash::Separator)?;
+        let (path, writer) = open_output_writer(
+            &staging,
+            &relative,
+            meta.is_directory,
+            OverwritePolicy::Never,
+        )?;
         self.record_staged_path(&path, meta.is_directory)?;
-        self.archive_names.push(archive_name.to_vec());
+        self.created_paths.insert(relative, path.clone());
+        self.archive_names.push(meta.name.clone());
         self.outputs.push(ExtractedOutput {
-            name: meta.name.clone(),
+            name,
             path: destination,
             meta: meta.clone(),
             family: self.family,
@@ -854,65 +848,50 @@ impl<'a> ExtractOutputState<'a> {
         Ok(writer)
     }
 
-    fn open_rar50_entry(
+    fn create_link(
         &mut self,
-        meta: &rars::rar50::ExtractedEntryMeta,
-    ) -> rars::Result<Box<dyn Write>> {
-        self.publish_verified()?;
-        let common = rar50_extracted_meta(meta);
-        let destination = output_path_for_rar50_entry(self.out_dir, meta)?;
-        self.reserve_output_path(destination.clone())?;
-        self.remember_directory_time(&destination, &common)?;
-        let staging = self.prepare_staged_path(&destination, common.is_directory)?;
-        let (path, writer) = open_output_writer(
-            &staging,
-            &common,
-            OverwritePolicy::Never,
-            Backslash::Literal,
-        )?;
-        self.record_staged_path(&path, common.is_directory)?;
-        self.record_rar50_created_path(meta, path.clone())?;
-        self.archive_names.push(meta.name.clone());
-        self.outputs.push(ExtractedOutput {
-            name: meta.name.clone(),
-            path: destination,
-            meta: common,
-            family: self.family,
-            restore_metadata: true,
-        });
-        Ok(writer)
-    }
-
-    fn create_rar50_redirection(
-        &mut self,
-        meta: &rars::rar50::ExtractedEntryMeta,
-        redirection: &rars::rar50::FileRedirection,
+        meta: &rars::ExtractedEntryMeta,
+        link: rars::ExtractedLink<'_>,
     ) -> rars::Result<()> {
         self.publish_verified()?;
-        let destination = output_path_for_rar50_entry(self.out_dir, meta)?;
+        let (name, relative) = self.entry_path(meta)?;
+        let destination = output::checked_output_path(self.out_dir, &relative)?;
         self.reserve_output_path(destination.clone())?;
+        // Keep the existing RAR5 policy for all links: reject absolute paths,
+        // parent components and drive prefixes. Native legacy targets are not
+        // member names: neither their codepage nor their backslashes are decoded.
+        let target = if self.family == rars::ArchiveFamily::Rar50Plus {
+            rar50_output_relative_path(
+                link.target(),
+                u64::from(meta.attr_source == rars::AttrSource::Unix),
+            )
+            .map_err(|_| rars::Error::InvalidHeader("unsafe archive redirection target"))?
+        } else {
+            rars::filename::relative_path(link.target(), false)
+                .map_err(|_| rars::Error::InvalidHeader("unsafe archive redirection target"))?
+        };
         let staging = self.prepare_staged_path(&destination, false)?;
-        let (path, restore_metadata) = create_rar50_redirection_output(
+        let (path, restore_metadata) = create_link_output(
             &staging,
-            meta,
-            redirection,
+            &relative,
+            &target,
+            link,
             OverwritePolicy::Never,
             &self.created_paths,
         )?;
         self.record_staged_path(&path, false)?;
         self.staged_redirections.insert(path.clone());
-        if let Some(target) =
-            output::rar50_hardlink_source(redirection, meta.host_os, &self.created_paths)?
-        {
+        if matches!(link, rars::ExtractedLink::HardLink { .. }) {
+            let source = output::link_source_path(&target, &self.created_paths)?;
             self.hardlink_targets
-                .insert(path.clone(), target.to_path_buf());
+                .insert(path.clone(), source.to_path_buf());
         }
-        self.record_rar50_created_path(meta, path.clone())?;
+        self.created_paths.insert(relative, path.clone());
         self.archive_names.push(meta.name.clone());
         self.outputs.push(ExtractedOutput {
-            name: meta.name.clone(),
+            name,
             path: destination,
-            meta: rar50_extracted_meta(meta),
+            meta: meta.clone(),
             family: self.family,
             restore_metadata,
         });
@@ -1095,25 +1074,6 @@ impl<'a> ExtractOutputState<'a> {
         }
         Ok(std::mem::take(&mut self.outputs))
     }
-
-    fn record_rar50_created_path(
-        &mut self,
-        meta: &rars::rar50::ExtractedEntryMeta,
-        path: PathBuf,
-    ) -> rars::Result<()> {
-        let key = rar50_output_relative_path(&meta.name, meta.host_os)
-            .map_err(|_| rars::Error::InvalidHeader("unsafe archive path"))?;
-        self.created_paths.insert(key, path);
-        Ok(())
-    }
-}
-
-fn rar50_extracted_meta(meta: &rars::rar50::ExtractedEntryMeta) -> rars::ExtractedEntryMeta {
-    // The library resolves attributes against the host OS. Convert the name
-    // only for this destination adapter; outputs retain the original identity.
-    let mut common = rars::rar50_meta(meta);
-    common.name = rar50_entry_name(&meta.name, meta.host_os);
-    common
 }
 
 fn extract_single_archive(
@@ -1121,30 +1081,12 @@ fn extract_single_archive(
     options: ArchiveReadOptions<'_>,
     state: &RefCell<ExtractOutputState<'_>>,
 ) -> rars::Result<()> {
-    match archive {
-        DetectedArchive::Rar50Plus(archive) => archive.extract_to_with_redirections(
-            options,
-            |meta| state.borrow_mut().open_rar50_entry(meta),
-            |meta, redirection| {
-                state
-                    .borrow_mut()
-                    .create_rar50_redirection(meta, redirection)
-            },
-        ),
-        _ => extract_archive_to_with_options(archive, options, |meta| {
-            if options.legacy_name_encoding.is_none() || meta.name_is_unicode {
-                return state.borrow_mut().open_entry(meta);
-            }
-            let mut decoded = meta.clone();
-            decoded.name = rars::filename::decoded_name(
-                &meta.name,
-                meta.name_is_unicode,
-                options.legacy_name_encoding,
-            )?
-            .into_owned();
-            state.borrow_mut().open_entry_named(&decoded, &meta.name)
-        }),
-    }
+    state.borrow_mut().legacy_name_encoding = options.legacy_name_encoding;
+    archive.extract_with_links(
+        options,
+        |meta| state.borrow_mut().open_entry(meta),
+        |meta, link| state.borrow_mut().create_link(meta, link),
+    )
 }
 
 fn extract_volume_archives(
@@ -1152,42 +1094,13 @@ fn extract_volume_archives(
     options: ArchiveReadOptions<'_>,
     state: &RefCell<ExtractOutputState<'_>>,
 ) -> rars::Result<()> {
-    if archives
-        .iter()
-        .all(|archive| matches!(archive, DetectedArchive::Rar50Plus(_)))
-    {
-        let rar50_archives: Vec<_> = archives
-            .iter()
-            .map(|archive| match archive {
-                DetectedArchive::Rar50Plus(archive) => archive.clone(),
-                _ => unreachable!("all archives are RAR5"),
-            })
-            .collect();
-        return rars::rar50::extract_volumes_to_with_redirections(
-            &rar50_archives,
-            options,
-            |meta| state.borrow_mut().open_rar50_entry(meta),
-            |meta, redirection| {
-                state
-                    .borrow_mut()
-                    .create_rar50_redirection(meta, redirection)
-            },
-        );
-    }
-
-    extract_volumes_to_with_options(archives, options, |meta| {
-        if options.legacy_name_encoding.is_none() || meta.name_is_unicode {
-            return state.borrow_mut().open_entry(meta);
-        }
-        let mut decoded = meta.clone();
-        decoded.name = rars::filename::decoded_name(
-            &meta.name,
-            meta.name_is_unicode,
-            options.legacy_name_encoding,
-        )?
-        .into_owned();
-        state.borrow_mut().open_entry_named(&decoded, &meta.name)
-    })
+    state.borrow_mut().legacy_name_encoding = options.legacy_name_encoding;
+    extract_volumes_with_links(
+        archives,
+        options,
+        |meta| state.borrow_mut().open_entry(meta),
+        |meta, link| state.borrow_mut().create_link(meta, link),
+    )
 }
 
 fn validate_extract_destination(out_dir: &Path) -> CliResult<()> {
