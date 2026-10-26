@@ -2104,6 +2104,9 @@ impl<B: Budget> HuffmanState<B> {
     /// are consumed, and the results are those of reading bit by bit: a code
     /// that runs past the end of the input needs more input, and a code is
     /// invalid only when 15 real bits start none.
+    // Always inlined: it runs once per symbol, and as a call it saved and
+    // restored registers every time.
+    #[inline(always)]
     fn decode(&self, bits: &mut BitReader<'_>) -> Result<usize> {
         let (peek, available) = bits.peek15();
         let (symbol, len) = self.state.decode_peeked_checked(
@@ -2133,6 +2136,12 @@ impl<'a> BitReader<'a> {
     fn peek15(&self) -> (u32, usize) {
         let byte_pos = self.bit_pos / 8;
         let bit_offset = self.bit_pos % 8;
+        // Away from the end of the input, one four-byte load holds all 15
+        // bits (they start at most 7 bits in).
+        if let Some(&[a, b, c, d]) = self.input.get(byte_pos..byte_pos + 4) {
+            let word = u32::from_be_bytes([a, b, c, d]);
+            return ((word << bit_offset) >> 17, 15);
+        }
         let rest = self.input.get(byte_pos..).unwrap_or_default();
         let word = match rest {
             [a, b, c, ..] => u32::from_be_bytes([0, *a, *b, *c]),
