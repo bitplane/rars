@@ -23,7 +23,7 @@ create_exception!(rars, PasswordRequired, BadRarFile);
 create_exception!(rars, UnsupportedRarFeature, Error);
 create_exception!(rars, UnsafeArchivePath, Error);
 
-#[pyclass(frozen, module = "rars", skip_from_py_object)]
+#[pyclass(frozen, module = "rars")]
 #[derive(Debug, Clone)]
 struct ProgressEvent {
     #[pyo3(get)]
@@ -43,7 +43,7 @@ struct ProgressEvent {
     finished: bool,
 }
 
-#[pyclass(frozen, module = "rars", skip_from_py_object)]
+#[pyclass(frozen, module = "rars")]
 #[derive(Debug, Clone)]
 struct RepairReport {
     #[pyo3(get)]
@@ -73,7 +73,7 @@ impl From<rars_rs::RecoveryRepairReport> for RepairReport {
     }
 }
 
-#[pyclass(frozen, module = "rars", skip_from_py_object)]
+#[pyclass(frozen, module = "rars")]
 struct RepairResult {
     #[pyo3(get)]
     data: Vec<u8>,
@@ -97,7 +97,7 @@ impl ProgressEvent {
 }
 
 /// A thread-safe, one-way cancellation signal for reading, writing and repair.
-#[pyclass(frozen, module = "rars", skip_from_py_object)]
+#[pyclass(frozen, module = "rars")]
 #[derive(Debug, Clone, Default)]
 struct CancellationToken {
     inner: rars_rs::ReadCancellation,
@@ -121,7 +121,7 @@ impl CancellationToken {
 }
 
 /// Per-call parsing, decoding and extraction policies.
-#[pyclass(frozen, module = "rars", skip_from_py_object)]
+#[pyclass(frozen, module = "rars")]
 #[derive(Debug, Clone, Default)]
 struct ReadOptions {
     #[pyo3(get)]
@@ -361,7 +361,7 @@ fn progress_phase(operation: rars_rs::WriteOperation) -> &'static str {
     }
 }
 
-#[pyclass(frozen, module = "rars", skip_from_py_object)]
+#[pyclass(frozen, module = "rars")]
 #[derive(Debug, Clone)]
 struct RarInfo {
     #[pyo3(get)]
@@ -423,7 +423,7 @@ impl RarInfo {
     }
 }
 
-#[pyclass(module = "rars", skip_from_py_object)]
+#[pyclass(module = "rars")]
 struct RarFile {
     identity: Arc<()>,
     encoding: Option<rars_rs::filename::LegacyNameEncoding>,
@@ -888,7 +888,7 @@ impl RarFile {
 /// mapping members onto entry types and splitting volumes lives in the core
 /// crate; what is left here is argument conversion and the exception types
 /// Python callers catch.
-#[pyclass(module = "rars", skip_from_py_object)]
+#[pyclass(module = "rars")]
 #[derive(Debug, Clone)]
 struct RarBuilder {
     inner: rars_rs::Builder,
