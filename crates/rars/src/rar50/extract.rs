@@ -1935,13 +1935,25 @@ impl<R: Read, B: Budget> Read for PackedReader<R, B> {
 type Rar50DecryptingReader<R> = crate::crypto::unavailable::Reader<R>;
 
 #[cfg(feature = "encryption")]
+const DECRYPT_WINDOW: usize = 64 * 1024;
+
+/// Decrypts a RAR 5 AES-256-CBC payload as it is read.
+///
+/// The source is usually an unbuffered `File::take`, so every `read` here is a
+/// syscall. This reader used to ask it for one 16-byte AES block at a time,
+/// and a 256 MiB `-hp` set took 38 s to extract, 35 s of it in the kernel,
+/// against unrar's 0.25 s. Keep the window.
+///
+/// `window[pos..plain_end]` is decrypted and not yet handed out, and
+/// `window[plain_end..filled]` is ciphertext short of a whole block.
+#[cfg(feature = "encryption")]
 struct Rar50DecryptingReader<R> {
     inner: R,
     cipher: Rar50Cipher,
-    buffer: [u8; 16],
-    encrypted_len: usize,
+    window: [u8; DECRYPT_WINDOW],
     pos: usize,
-    len: usize,
+    plain_end: usize,
+    filled: usize,
 }
 
 #[cfg(feature = "encryption")]
@@ -1954,20 +1966,28 @@ impl<R: Read> Rar50DecryptingReader<R> {
         Self {
             inner,
             cipher: Rar50Cipher::new(key, iv),
-            buffer: [0; 16],
-            encrypted_len: 0,
+            window: [0; DECRYPT_WINDOW],
             pos: 0,
-            len: 0,
+            plain_end: 0,
+            filled: 0,
         }
     }
 
-    fn fill_buffer(&mut self) -> std::io::Result<bool> {
-        // Preserve bytes already consumed if the source returns an error.
-        // In particular, Read::read_to_end retries Interrupted automatically.
-        while self.encrypted_len < self.buffer.len() {
-            let count = self.inner.read(&mut self.buffer[self.encrypted_len..])?;
+    /// Refills the window once everything decrypted has been handed out.
+    /// Returns false at a clean end of stream.
+    fn fill_window(&mut self) -> std::io::Result<bool> {
+        self.window.copy_within(self.plain_end..self.filled, 0);
+        self.filled -= self.plain_end;
+        self.pos = 0;
+        self.plain_end = 0;
+        // Stops at one whole block, not a full window, so a source that
+        // returns short reads is never waited on for more than is needed.
+        // Bytes already read stay in the window if the source errors, so a
+        // retry (read_to_end retries Interrupted) loses nothing.
+        while self.filled < 16 {
+            let count = self.inner.read(&mut self.window[self.filled..])?;
             if count == 0 {
-                if self.encrypted_len == 0 {
+                if self.filled == 0 {
                     return Ok(false);
                 }
                 return Err(std::io::Error::new(
@@ -1975,12 +1995,13 @@ impl<R: Read> Rar50DecryptingReader<R> {
                     "truncated RAR 5 encrypted stream",
                 ));
             }
-            self.encrypted_len += count;
+            self.filled += count;
         }
-        self.cipher.decrypt_block(&mut self.buffer);
-        self.encrypted_len = 0;
-        self.pos = 0;
-        self.len = self.buffer.len();
+        let whole = self.filled / 16 * 16;
+        self.cipher
+            .decrypt_in_place(&mut self.window[..whole])
+            .expect("window is decrypted in whole blocks");
+        self.plain_end = whole;
         Ok(true)
     }
 }
@@ -1991,11 +2012,11 @@ impl<R: Read> Read for Rar50DecryptingReader<R> {
         if out.is_empty() {
             return Ok(0);
         }
-        if self.pos == self.len && !self.fill_buffer()? {
+        if self.pos == self.plain_end && !self.fill_window()? {
             return Ok(0);
         }
-        let count = out.len().min(self.len - self.pos);
-        out[..count].copy_from_slice(&self.buffer[self.pos..self.pos + count]);
+        let count = out.len().min(self.plain_end - self.pos);
+        out[..count].copy_from_slice(&self.window[self.pos..self.pos + count]);
         self.pos += count;
         Ok(count)
     }
@@ -2601,6 +2622,58 @@ mod tests {
         }
 
         assert_eq!(out, plain);
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn decrypting_reader_pulls_ciphertext_in_large_reads() {
+        let key = [3u8; 32];
+        let iv = [4u8; 16];
+        let plain: Vec<u8> = (0..1024 * 1024u32)
+            .map(|i| (i * 7 + i / 251) as u8)
+            .collect();
+        let mut encrypted = plain.clone();
+        Rar50Cipher::new(key, iv)
+            .encrypt_in_place(&mut encrypted)
+            .unwrap();
+
+        struct CountingReads {
+            inner: Cursor<Vec<u8>>,
+            calls: usize,
+        }
+        impl Read for CountingReads {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                self.calls += 1;
+                self.inner.read(out)
+            }
+        }
+
+        let mut reader = Rar50DecryptingReader::new(
+            CountingReads {
+                inner: Cursor::new(encrypted),
+                calls: 0,
+            },
+            key,
+            iv,
+        );
+        // A caller reading in small pieces must not turn into small source reads.
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let count = reader.read(&mut buf).unwrap();
+            if count == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..count]);
+        }
+
+        assert!(out == plain, "decrypted output differs");
+        // 1 MiB through a 64 KiB window: 16 fills plus the EOF probe.
+        assert!(
+            reader.inner.calls <= 17,
+            "{} source reads for 1 MiB",
+            reader.inner.calls
+        );
     }
 
     #[test]
