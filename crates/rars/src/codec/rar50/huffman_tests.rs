@@ -19,5 +19,5 @@ fn public_huffman_constructor_keeps_wide_sparse_symbol_indices() {
     let table = HuffmanTable::from_lengths(&lengths).unwrap();
     let mut bits = BitReader::new(&[0]);
     assert_eq!(table.state.decode(&mut bits), Ok(65_537));
-    assert_eq!(bits.bit_pos, 1);
+    assert_eq!(bits.position(), 1);
 }

@@ -597,11 +597,10 @@ fn reference_decode<B: Budget>(
             .tables
             .take()
             .ok_or(Error::InvalidData("RAR 5 block reuses missing tables"))?;
-        let mut bits = BitReader::new(payload);
-        bits.bit_pos = payload_bit_pos;
+        let mut bits = BitReader::at(payload, payload_bit_pos);
 
         let mut poller = state.read_control.poller();
-        while bits.bit_pos < block.header.payload_bits && output.len() < output_size {
+        while bits.position() < block.header.payload_bits && output.len() < output_size {
             poller.check_codec(output.len())?;
             let symbol = tables.main.decode(&mut bits)?;
             match symbol {

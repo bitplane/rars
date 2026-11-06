@@ -7,9 +7,8 @@ fn padded_peek_matches_individual_bits_at_every_byte_boundary() {
             let input: Vec<_> = (0..size)
                 .map(|i| pattern.rotate_left(i as u32 * 3))
                 .collect();
-            let mut bits = BitReader::new(&input);
-            for position in 0..=size * 8 + 8 {
-                bits.bit_pos = position;
+            for position in 0..=size * 8 {
+                let mut bits = BitReader::at(&input, position);
                 let available = (size * 8).saturating_sub(position).min(15);
                 let expected = (0..15).fold(0, |value, i| {
                     let pos = position + i;
@@ -17,7 +16,7 @@ fn padded_peek_matches_individual_bits_at_every_byte_boundary() {
                     (value << 1) | u32::from(bit)
                 });
                 assert_eq!(bits.peek15(), (expected, available));
-                assert_eq!(bits.bit_pos, position);
+                assert_eq!(bits.position(), position);
             }
         }
     }
@@ -29,14 +28,13 @@ fn short_and_long_codes_require_real_bits_and_consume_exact_lengths() {
         let table = HuffmanState::from_lengths(&[len as u8], &Allowance::default()).unwrap();
         for available in 0..=16 {
             let input = [0u8; 2];
-            let mut bits = BitReader::new(&input);
-            bits.bit_pos = 16 - available;
+            let mut bits = BitReader::at(&input, 16 - available);
             if available < len {
                 assert_eq!(table.decode(&mut bits), Err(Error::NeedMoreInput));
-                assert_eq!(bits.bit_pos, 16 - available);
+                assert_eq!(bits.position(), 16 - available);
             } else {
                 assert_eq!(table.decode(&mut bits), Ok(0));
-                assert_eq!(bits.bit_pos, 16 - available + len);
+                assert_eq!(bits.position(), 16 - available + len);
             }
         }
     }
