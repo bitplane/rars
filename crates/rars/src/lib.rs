@@ -1411,6 +1411,14 @@ impl ArchiveReader {
         path: impl AsRef<Path>,
         options: ArchiveReadOptions<'_>,
     ) -> Result<Archive> {
+        Self::read_path_cached(path, options, &mut rar50::Rar50KeyCache::default())
+    }
+
+    fn read_path_cached(
+        path: impl AsRef<Path>,
+        options: ArchiveReadOptions<'_>,
+        key_cache: &mut rar50::Rar50KeyCache,
+    ) -> Result<Archive> {
         options.check_cancelled()?;
         let path = path.as_ref();
         let mut file = std::fs::File::open(path)?;
@@ -1426,9 +1434,40 @@ impl ArchiveReader {
                 rar15_40::Archive::parse_path_with_signature(path, signature, options)?,
             )),
             ArchiveFamily::Rar50Plus => Ok(Archive::Rar50Plus(
-                rar50::Archive::parse_path_with_signature(path, signature, options)?,
+                rar50::Archive::parse_path_with_signature_cached(
+                    path, signature, options, key_cache,
+                )?,
             )),
         }
+    }
+}
+
+/// Parses a volume set so its shared RAR 5 key is derived once, not once per volume.
+pub struct ReadSession<'a> {
+    options: ArchiveReadOptions<'a>,
+    key_cache: rar50::Rar50KeyCache,
+}
+
+impl<'a> ReadSession<'a> {
+    /// Starts a session that parses every volume with `options`.
+    pub fn new(options: ArchiveReadOptions<'a>) -> Self {
+        Self {
+            options,
+            key_cache: rar50::Rar50KeyCache::default(),
+        }
+    }
+
+    /// Parses one volume as [`ArchiveReader::read_path_with_options`] does.
+    pub fn read_path(&mut self, path: impl AsRef<Path>) -> Result<Archive> {
+        ArchiveReader::read_path_cached(path, self.options, &mut self.key_cache)
+    }
+}
+
+impl std::fmt::Debug for ReadSession<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadSession")
+            .field("options", &self.options)
+            .finish_non_exhaustive()
     }
 }
 
@@ -5905,5 +5944,60 @@ mod tests {
             read_volume_members_at(&archives, &[0, 0, usize::MAX], None).unwrap(),
             vec![Some(payload.clone()), Some(payload), None]
         );
+    }
+
+    #[cfg(feature = "encryption")]
+    fn rar50_fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/rar50")
+            .join(name)
+    }
+
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn read_session_derives_each_volume_set_key_once() {
+        // WinRAR 7.12 salts a whole set once, so every volume shares one key.
+        for stem in ["encrypted_multivol", "header_encrypted_stored_multivol"] {
+            let before = derivations();
+            let mut session = ReadSession::new(ArchiveReadOptions::with_password(b"password"));
+            let volumes = (1..=3)
+                .map(|part| {
+                    session
+                        .read_path(rar50_fixture(&format!("{stem}.part{part}.rar")))
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(derivations() - before, 1, "{stem}");
+
+            let mut extracted = 0;
+            extract_volumes_to(&volumes, Some(b"password"), |_| {
+                extracted += 1;
+                Ok(Box::new(std::io::sink()))
+            })
+            .unwrap();
+            assert!(extracted > 0, "{stem}");
+        }
+    }
+
+    #[cfg(feature = "encryption")]
+    fn derivations() -> usize {
+        crate::crypto::rar50::DERIVATIONS.with(std::cell::Cell::get)
+    }
+
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn read_session_reports_a_wrong_password_on_every_volume() {
+        for stem in ["encrypted_multivol", "header_encrypted_stored_multivol"] {
+            let mut session = ReadSession::new(ArchiveReadOptions::with_password(b"wrong"));
+            for part in 1..=3 {
+                let error = session
+                    .read_path(rar50_fixture(&format!("{stem}.part{part}.rar")))
+                    .unwrap_err();
+                assert!(
+                    matches!(error.root_cause(), Error::WrongPasswordOrCorruptData),
+                    "{stem} part {part}: {error:?}"
+                );
+            }
+        }
     }
 }
