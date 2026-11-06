@@ -865,6 +865,8 @@ impl RarFile {
         options: Option<&ReadOptions>,
     ) -> PyResult<Self> {
         Self::parse(py, password, options, |options| {
+            // Payload reads reopen the path, so retain its meaning across chdir.
+            let path = std::path::absolute(path)?;
             rars_rs::ArchiveReader::read_path_with_options(path, options)
         })
     }

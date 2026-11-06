@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import subprocess
 import sys
 import textwrap
@@ -55,3 +56,24 @@ def test_path_open_parses_cancellably(tmp_path):
     with pytest.raises(InterruptedError):
         rars.RarFile(archive, options=rars.ReadOptions(cancellation=token))
     assert rars.RarFile(archive).read("member") == b"payload"
+
+
+@pytest.mark.parametrize("format", ["rar14", "rar29", "rar50"])
+@pytest.mark.parametrize("as_path", [False, True])
+def test_relative_path_survives_working_directory_change(tmp_path, monkeypatch, format, as_path):
+    builder = rars.RarBuilder(format=format, store=True)
+    builder.add_bytes(b"payload", "member")
+    builder.write(tmp_path / "archive.rar")
+    monkeypatch.chdir(tmp_path)
+    source = Path("archive.rar") if as_path else "archive.rar"
+    archive = rars.RarFile(source)
+    rewrite = rars.RarBuilder.from_archive(source)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    assert archive.read("member") == b"payload"
+    archive.extractall("out")
+    assert (elsewhere / "out" / "member").read_bytes() == b"payload"
+    rewritten = rars.RarFile.from_bytes(rewrite.to_bytes())
+    assert rewritten.read("member") == b"payload"
