@@ -49,6 +49,8 @@ const MAX_VM_USER_GLOBAL_DATA: usize = MAX_VM_GLOBAL_DATA - VM_SYSTEM_GLOBAL_SIZ
 const MAX_VM_CODE_SIZE: usize = 64 * 1024;
 const MAX_VM_PROGRAMS: usize = 8192;
 const MAX_VM_FILTERS: usize = 8192;
+// A filter holds output until its block is decoded; a block larger than RARVM memory cannot be filtered.
+const MAX_VM_BLOCK_SIZE: usize = rarvm::MEMORY_SIZE;
 
 const LENGTH_BASES: [usize; LENGTH_COUNT] = [
     0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 28, 32, 40, 48, 56, 64, 80, 96, 112, 128,
@@ -247,6 +249,13 @@ struct VmFilter<B: Budget = Allowance> {
     size: usize,
     regs: [u32; 7],
     global_data: Buffer<u8, B>,
+}
+
+impl<B: Budget> VmFilter<B> {
+    /// Saturates so a block near the top of a 32-bit address space never wraps into range.
+    fn end(&self) -> usize {
+        self.start.saturating_add(self.size)
+    }
 }
 
 #[derive(Debug)]
@@ -908,7 +917,9 @@ impl<B: Budget> Reader29State<B> {
 
         let mut block_start = vm.read_encoded_u32()? as usize;
         if first_byte & 0x40 != 0 {
-            block_start += 258;
+            block_start = block_start
+                .checked_add(258)
+                .ok_or(Error::InvalidData("RAR 2.9 VM block start overflows"))?;
         }
         block_start = self
             .current_pos()
@@ -922,6 +933,9 @@ impl<B: Budget> Reader29State<B> {
             .unwrap_or(0);
         if first_byte & 0x20 != 0 {
             block_size = vm.read_encoded_u32()? as usize;
+        }
+        if block_size > MAX_VM_BLOCK_SIZE {
+            return Err(Error::InvalidData("RAR 2.9 VM filter block is too large"));
         }
 
         let mut regs = [0u32; 7];
@@ -1017,7 +1031,7 @@ impl<B: Budget> Reader29State<B> {
                 .iter()
                 .enumerate()
                 .filter_map(|(index, filter)| {
-                    (filter.start >= start && filter.start + filter.size <= end).then_some(index)
+                    (filter.start >= start && filter.end() <= end).then_some(index)
                 }),
             &self.output.allowance(),
         )?;
@@ -1029,14 +1043,14 @@ impl<B: Budget> Reader29State<B> {
                 .get(filters[index])
                 .ok_or(Error::InvalidData("RAR 2.9 VM filter is missing"))?;
             let filter_start = first.start;
-            let filter_size = first.size;
+            let filter_end = first.end();
             if filter_start < pos {
                 return Err(Error::InvalidData("RAR 2.9 VM filters partially overlap"));
             }
             out.extend_from_slice(self.raw_range(pos, filter_start)?)
                 .map_err(Into::into)?;
             let mut block = Buffer::copied(
-                self.raw_range(filter_start, filter_start + filter_size)?,
+                self.raw_range(filter_start, filter_end)?,
                 &self.output.allowance(),
             )?;
             let file_offset = filter_start
@@ -1093,7 +1107,7 @@ impl<B: Budget> Reader29State<B> {
                 }
             }
             out.extend_from_slice(&block).map_err(Into::into)?;
-            pos = filter_start + filter_size;
+            pos = filter_end;
         }
         out.extend_from_slice(self.raw_range(pos, end)?)
             .map_err(Into::into)?;
@@ -1110,10 +1124,7 @@ impl<B: Budget> Reader29State<B> {
         let current = self.current_pos();
         let mut safe_end = end;
         for filter in &self.filters {
-            let filter_end = filter
-                .start
-                .checked_add(filter.size)
-                .ok_or(Error::InvalidData("RAR 2.9 VM filter size overflows"))?;
+            let filter_end = filter.end();
             if filter.start >= safe_end || filter_end <= start {
                 continue;
             }
@@ -1251,7 +1262,7 @@ impl<B: Budget> Reader29State<B> {
         self.output.discard_prefix(drain);
         self.base_offset = keep_from;
         self.filters
-            .retain(|filter| filter.start + filter.size > self.base_offset);
+            .retain(|filter| filter.end() > self.base_offset);
     }
 }
 

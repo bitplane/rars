@@ -1,7 +1,7 @@
 use super::workspace::{Allowance, Budget, Buffer};
 use super::{Error, Result};
 
-const MEMORY_SIZE: usize = 0x40000;
+pub(super) const MEMORY_SIZE: usize = 0x40000;
 const MEMORY_MASK: u32 = 0x3ffff;
 const GLOBAL_BASE: usize = 0x3c000;
 const SYSTEM_GLOBAL_SIZE: usize = 64;
