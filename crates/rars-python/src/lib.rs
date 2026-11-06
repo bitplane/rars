@@ -466,6 +466,7 @@ impl MemberNames {
 
 #[pymethods]
 impl RarFile {
+    /// A path is read on demand, so the file must stay unchanged while the archive is open.
     #[new]
     #[pyo3(signature = (source, mode = "r", password = None, *, options = None))]
     fn new(
@@ -481,9 +482,10 @@ impl RarFile {
             ));
         }
         let password = py_password(password)?;
-        let token = options.and_then(ReadOptions::cancellation);
-        let bytes = py_input_bytes_with_cancellation(py, source, token.as_ref())?;
-        Self::from_bytes(py, bytes, password, options)
+        if let Ok(bytes) = source.extract::<Vec<u8>>() {
+            return Self::from_bytes(py, bytes, password, options);
+        }
+        Self::from_path(py, py_path_buf(py, source)?, password, options)
     }
 
     #[staticmethod]
@@ -851,12 +853,32 @@ impl RarFile {
         password: Option<Vec<u8>>,
         options: Option<&ReadOptions>,
     ) -> PyResult<Self> {
-        let parse_password = password.clone();
+        Self::parse(py, password, options, |options| {
+            rars_rs::ArchiveReader::read_owned_with_options(bytes, options)
+        })
+    }
+
+    fn from_path(
+        py: Python<'_>,
+        path: PathBuf,
+        password: Option<Vec<u8>>,
+        options: Option<&ReadOptions>,
+    ) -> PyResult<Self> {
+        Self::parse(py, password, options, |options| {
+            // Payload reads reopen the path, so retain its meaning across chdir.
+            let path = std::path::absolute(path)?;
+            rars_rs::ArchiveReader::read_path_with_options(path, options)
+        })
+    }
+
+    fn parse(
+        py: Python<'_>,
+        password: Option<Vec<u8>>,
+        options: Option<&ReadOptions>,
+        read: impl Send + FnOnce(rars_rs::ArchiveReadOptions<'_>) -> rars_rs::Result<rars_rs::Archive>,
+    ) -> PyResult<Self> {
         let archive = py
-            .detach(|| {
-                let options = python_read_options(options, parse_password.as_deref());
-                rars_rs::ArchiveReader::read_owned_with_options(bytes, options)
-            })
+            .detach(|| read(python_read_options(options, password.as_deref())))
             .map_err(map_error)?;
         let encoding = options.and_then(|settings| settings.encoding);
         let identity = Arc::new(());
