@@ -771,8 +771,10 @@ impl Archive {
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
         R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
     {
+        let attached = super::with_missing_keys(std::slice::from_ref(self), options.password);
+        let archive = attached.as_ref().map_or(self, |volumes| &volumes[0]);
         if let Some(limit) = options.max_reader_workspace_bytes {
-            return self.extract_with_allowance(
+            return archive.extract_with_allowance(
                 options,
                 open,
                 redirect,
@@ -782,7 +784,7 @@ impl Archive {
                 &crate::codec::workspace::Allowance::limited(limit),
             );
         }
-        self.extract_with_allowance(
+        archive.extract_with_allowance(
             options,
             open,
             redirect,
@@ -926,6 +928,20 @@ impl Archive {
     }
 
     fn parallel_to_impl<F>(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+        open: &mut F,
+        verification: bool,
+    ) -> Result<()>
+    where
+        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    {
+        let attached = super::with_missing_keys(std::slice::from_ref(self), options.password);
+        let archive = attached.as_ref().map_or(self, |volumes| &volumes[0]);
+        archive.parallel_with_keys(options, open, verification)
+    }
+
+    fn parallel_with_keys<F>(
         &self,
         options: crate::ArchiveReadOptions<'_>,
         open: &mut F,
@@ -1427,6 +1443,8 @@ where
         return Err(Error::InvalidHeader("RAR 5 volume set is empty"));
     }
 
+    let attached = super::with_missing_keys(volumes, options.password);
+    let volumes = attached.as_deref().unwrap_or(volumes);
     let password = options.password;
     let mut budget = crate::output_limit::OutputBudget::new(options);
     let mut split = SplitVolumeState::new();

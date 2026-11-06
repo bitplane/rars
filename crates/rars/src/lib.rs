@@ -5986,6 +5986,36 @@ mod tests {
 
     #[cfg(feature = "encryption")]
     #[test]
+    fn extracting_a_set_parsed_without_its_password_derives_its_key_once() {
+        let mut session = ReadSession::new(ArchiveReadOptions::new());
+        let volumes = (1..=4)
+            .map(|part| {
+                session
+                    .read_path(rar50_fixture(&format!(
+                        "encrypted_members_multivol.part{part}.rar"
+                    )))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let before = derivations();
+        let outputs = Rc::new(RefCell::new(Vec::new()));
+        extract_volumes_to(&volumes, Some(b"password"), |_| {
+            let output = Rc::new(RefCell::new(Vec::new()));
+            outputs.borrow_mut().push(output.clone());
+            Ok(Box::new(CollectWriter { data: output }))
+        })
+        .unwrap();
+        assert_eq!(derivations() - before, 1);
+        let crcs = outputs
+            .borrow()
+            .iter()
+            .map(|output| crc32fast::hash(&output.borrow()))
+            .collect::<Vec<_>>();
+        assert_eq!(crcs, [0x2d62b28b, 0x9ac9e626, 0xe8045ecc, 0x64c8dbc2]);
+    }
+
+    #[cfg(feature = "encryption")]
+    #[test]
     fn read_session_reports_a_wrong_password_on_every_volume() {
         for stem in ["encrypted_multivol", "header_encrypted_stored_multivol"] {
             let mut session = ReadSession::new(ArchiveReadOptions::with_password(b"wrong"));

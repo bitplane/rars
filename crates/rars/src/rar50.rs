@@ -1801,6 +1801,34 @@ pub(crate) struct Rar50KeyCache {
     entries: Vec<([u8; 16], u8, Box<Rar50Keys>)>,
 }
 
+/// Copies `volumes` with keys attached where a parse lacked the password, so a set's members share one derivation.
+pub(crate) fn with_missing_keys(
+    volumes: &[Archive],
+    password: Option<&[u8]>,
+) -> Option<Vec<Archive>> {
+    let missing = |file: &FileHeader| file.encrypted && file.crypto.is_none();
+    if !cfg!(feature = "encryption") || password.is_none() {
+        return None;
+    }
+    if !volumes.iter().flat_map(Archive::files).any(missing) {
+        return None;
+    }
+    let mut key_cache = Rar50KeyCache::default();
+    let mut volumes = volumes.to_vec();
+    for block in volumes
+        .iter_mut()
+        .flat_map(|volume| volume.blocks.iter_mut())
+    {
+        if let Block::File(file) = block {
+            if missing(file) {
+                // A member that fails here reports it when it is extracted.
+                let _ = attach_file_crypto(file, password, &mut key_cache);
+            }
+        }
+    }
+    Some(volumes)
+}
+
 #[cfg(feature = "encryption")]
 impl Rar50KeyCache {
     pub(crate) fn get_or_derive(
