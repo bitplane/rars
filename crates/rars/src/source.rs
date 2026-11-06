@@ -82,8 +82,8 @@ impl Seek for SourceCursor {
 /// existing source. Reading a member does not need another heap allocation.
 pub(crate) enum RangeReader<'a> {
     Memory(Cursor<&'a [u8]>),
-    File(std::io::Take<File>),
-    Reader(std::io::Take<SourceCursor>),
+    File(Bounded<File>),
+    Reader(Bounded<SourceCursor>),
 }
 impl Read for RangeReader<'_> {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
@@ -92,6 +92,41 @@ impl Read for RangeReader<'_> {
             Self::File(reader) => reader.read(bytes),
             Self::Reader(reader) => reader.read(bytes),
         }
+    }
+}
+
+/// Like [`std::io::Take`], but a source that ends early is an error, not EOF.
+pub(crate) struct Bounded<R> {
+    inner: R,
+    remaining: u64,
+}
+
+impl<R: Read> Bounded<R> {
+    fn new(inner: R, len: usize) -> Self {
+        Self {
+            inner,
+            remaining: len as u64,
+        }
+    }
+}
+
+impl<R: Read> Read for Bounded<R> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let count = bytes
+            .len()
+            .min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
+        if count == 0 {
+            return Ok(0);
+        }
+        let read = self.inner.read(&mut bytes[..count])?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "archive volume ended before its declared length",
+            ));
+        }
+        self.remaining -= read as u64;
+        Ok(read)
     }
 }
 
@@ -119,19 +154,13 @@ impl ArchiveSource {
 
     pub(crate) fn copy_range_to(&self, range: Range<usize>, writer: &mut dyn Write) -> Result<()> {
         match self {
-            Self::Reader(_) => {
-                let mut reader = self.range_reader(range)?;
-                std::io::copy(&mut reader, writer)?;
-            }
             Self::Memory(data) => {
                 let data = data.get(range).ok_or(Error::TooShort)?;
                 writer.write_all(data)?;
             }
-            Self::File(path) => {
-                let mut file = File::open(path.as_ref())?;
-                file.seek(SeekFrom::Start(range.start as u64))?;
-                let mut limited = file.take(range.len() as u64);
-                std::io::copy(&mut limited, writer)?;
+            Self::Reader(_) | Self::File(_) => {
+                let mut reader = self.range_reader(range)?;
+                std::io::copy(&mut reader, writer)?;
             }
         }
         Ok(())
@@ -145,7 +174,7 @@ impl ArchiveSource {
                 }
                 let mut reader = source.cursor();
                 reader.seek(SeekFrom::Start(range.start as u64))?;
-                Ok(RangeReader::Reader(reader.take(range.len() as u64)))
+                Ok(RangeReader::Reader(Bounded::new(reader, range.len())))
             }
             Self::Memory(data) => {
                 let data = data.get(range).ok_or(Error::TooShort)?;
@@ -154,7 +183,7 @@ impl ArchiveSource {
             Self::File(path) => {
                 let mut file = File::open(path.as_ref())?;
                 file.seek(SeekFrom::Start(range.start as u64))?;
-                Ok(RangeReader::File(file.take(range.len() as u64)))
+                Ok(RangeReader::File(Bounded::new(file, range.len())))
             }
         }
     }

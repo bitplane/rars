@@ -85,7 +85,10 @@ fn rar13_stored_path_sources_reject_short_successful_copies() {
             .set_len((original.len() - 255) as u64)
             .unwrap();
         let error = archive.read_member_at(0, None).unwrap_err();
-        assert!(matches!(error.root_cause(), Error::InvalidHeader(_)));
+        assert!(matches!(
+            error.root_cause(),
+            Error::Io(io) if io.kind == std::io::ErrorKind::UnexpectedEof
+        ));
     }
 }
 

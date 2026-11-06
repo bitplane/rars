@@ -3375,7 +3375,7 @@ mod tests {
         assert_eq!(*captured.borrow(), data[..data.len() - 3]);
         assert!(matches!(
             error.root_cause(),
-            Error::InvalidHeader("RAR 5 stored file has mismatched packed and unpacked sizes")
+            Error::Io(io) if io.kind == std::io::ErrorKind::UnexpectedEof
         ));
     }
 

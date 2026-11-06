@@ -178,7 +178,7 @@ fn legacy_stored_member_reports_source_truncation_after_header_read() {
     let error = file.write_to(&archive, None, &mut output).unwrap_err();
     assert!(matches!(
         error.root_cause(),
-        Error::InvalidHeader("RAR 1.5 stored file ended before unpacked size")
+        Error::Io(io) if io.kind == std::io::ErrorKind::UnexpectedEof
     ));
     assert_eq!(output, b"pa");
 }
