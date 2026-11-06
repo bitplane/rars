@@ -1988,8 +1988,8 @@ mod tests {
         })
         .unwrap_err();
         assert!(matches!(
-            err,
-            Error::InvalidHeader("RAR 1.5 split stored file ended before unpacked size")
+            err.root_cause(),
+            Error::Io(io) if io.kind == std::io::ErrorKind::UnexpectedEof
         ));
     }
 
