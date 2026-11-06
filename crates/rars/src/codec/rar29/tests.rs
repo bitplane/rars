@@ -368,10 +368,10 @@ use super::{
     OwnedVmFilterRecord, PpmdEncodeToken, PpmdEncoder, Rar29MatchFinder, Result, StandardFilter,
     Unpack29Encoder, VmFilter, VmProgram, VmProgramKind, LENGTH_COUNT, LOW_OFFSET_COUNT,
     MAIN_COUNT, MAX_ENCODER_MATCH_LENGTH, MAX_ENCODER_MATCH_OFFSET, MAX_HISTORY,
-    MAX_MATCH_CANDIDATES, MAX_VM_AUDIO_FILTER_BLOCK_SIZE, MAX_VM_DELTA_FILTER_BLOCK_SIZE,
-    MAX_VM_FILTER_BLOCK_SIZE, OFFSET_COUNT, PPMD_DICTIONARY_MB, PPMD_ESC, PPMD_ORDER,
-    RAR3_AUDIO_FILTER_BYTECODE, RAR3_DELTA_FILTER_BYTECODE, RAR3_ITANIUM_FILTER_BYTECODE,
-    RAR3_RGB_FILTER_BYTECODE, STREAM_CHUNK, TABLE_COUNT,
+    MAX_MATCH_CANDIDATES, MAX_VM_AUDIO_FILTER_BLOCK_SIZE, MAX_VM_BLOCK_SIZE,
+    MAX_VM_DELTA_FILTER_BLOCK_SIZE, MAX_VM_FILTER_BLOCK_SIZE, OFFSET_COUNT, PPMD_DICTIONARY_MB,
+    PPMD_ESC, PPMD_ORDER, RAR3_AUDIO_FILTER_BYTECODE, RAR3_DELTA_FILTER_BYTECODE,
+    RAR3_ITANIUM_FILTER_BYTECODE, RAR3_RGB_FILTER_BYTECODE, STREAM_CHUNK, TABLE_COUNT,
 };
 
 /// A flat code charges the same for every symbol in play. The keep-tables
@@ -1475,12 +1475,11 @@ fn solid_ppmd_match_rejects_distance_beyond_retained_history() {
     );
 }
 
-#[test]
-fn ppmd_member_rejects_a_vm_filter_range_beyond_native_output() {
+fn decode_ppmd_member_with_filter_block(block_size: usize, output_size: usize) -> Result<Vec<u8>> {
     let record = super::encode_vm_filter_record_inner(
         super::VmFilterRecord {
             block_start: 0,
-            block_size: u32::MAX as usize,
+            block_size,
             init_regs: &[],
             code: super::RAR3_E8_FILTER_BYTECODE,
             global_data: &[],
@@ -1490,21 +1489,60 @@ fn ppmd_member_rejects_a_vm_filter_range_beyond_native_output() {
     )
     .unwrap();
     let mut encoder = PpmdEncoder::new(PPMD_ORDER, PPMD_ESC, 1).unwrap();
-    encoder.encode_literal(b'A').unwrap();
     encoder.encode_vm_filter_record(&record).unwrap();
-    encoder.encode_literal(b'B').unwrap();
+    for _ in 0..64 {
+        encoder.encode_literal(b'A').unwrap();
+    }
     let (body, _) = encoder.finish_keeping_model().unwrap();
     let mut packed = vec![0x80 | 0x20 | (PPMD_ORDER as u8 - 1), 0];
     packed.extend_from_slice(&body);
-    let message = if cfg!(target_pointer_width = "32") {
-        "RAR 2.9 VM filter size overflows"
-    } else {
-        "RAR 2.9 VM filter extends beyond output"
-    };
+    unpack29_decode(&packed, output_size)
+}
+
+#[test]
+fn vm_filter_block_larger_than_rarvm_memory_is_rejected_before_it_holds_output() {
+    let too_large = Err(Error::InvalidData("RAR 2.9 VM filter block is too large"));
     assert_eq!(
-        unpack29_decode(&packed, 2),
-        Err(Error::InvalidData(message))
+        decode_ppmd_member_with_filter_block(0x40001, 64 * 1024 * 1024),
+        too_large
     );
+    assert_eq!(
+        decode_ppmd_member_with_filter_block(0x40000, 64),
+        Err(Error::InvalidData(
+            "RAR 2.9 VM filter extends beyond output"
+        ))
+    );
+}
+
+#[test]
+fn ppmd_member_rejects_a_vm_filter_range_beyond_native_output() {
+    assert_eq!(
+        decode_ppmd_member_with_filter_block(1024, 2),
+        Err(Error::InvalidData(
+            "RAR 2.9 VM filter extends beyond output"
+        ))
+    );
+}
+
+#[test]
+fn filter_ending_past_the_address_space_is_never_in_range() {
+    let decoded = MAX_HISTORY + MAX_HISTORY / 4;
+    let mut decoder = Unpack29::new();
+    decoder.output.resize(decoded, 0x5a).unwrap();
+    decoder
+        .filters
+        .push(VmFilter {
+            program: usize::MAX,
+            start: usize::MAX - 1,
+            size: MAX_VM_BLOCK_SIZE,
+            regs: [0; 7],
+            global_data: Vec::new().into(),
+        })
+        .unwrap();
+
+    assert_eq!(decoder.filtered_range(0, 32, 0).unwrap(), vec![0x5a; 32]);
+    decoder.trim_history(decoded, decoded);
+    assert_eq!(decoder.filters.len(), 1);
 }
 
 #[test]
