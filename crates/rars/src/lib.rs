@@ -1466,7 +1466,7 @@ impl<'a> ReadSession<'a> {
 impl std::fmt::Debug for ReadSession<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReadSession")
-            .field("options", &self.options)
+            .field("has_password", &self.options.password.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -6029,5 +6029,143 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "encryption"))]
+mod key_cache_extraction_tests {
+    use super::*;
+    fn archive() -> Archive {
+        ArchiveReader::read_path(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/rar50/encrypted_members_multivol.part1.rar"),
+        )
+        .unwrap()
+    }
+    fn derivations() -> usize {
+        crate::crypto::rar50::DERIVATIONS.with(std::cell::Cell::get)
+    }
+    #[test]
+    fn skipping_members_does_not_derive_keys() {
+        let archive = archive();
+        let before = derivations();
+        archive
+            .extract_with_control(ArchiveReadOptions::with_password(b"password"), |_| {
+                Ok(ExtractionDecision::Skip)
+            })
+            .unwrap();
+        assert_eq!(derivations() - before, 0);
+    }
+    #[test]
+    fn stopping_before_first_member_does_not_derive_keys() {
+        let archive = archive();
+        let before = derivations();
+        archive
+            .extract_with_control(ArchiveReadOptions::with_password(b"password"), |_| {
+                Ok(ExtractionDecision::Stop)
+            })
+            .unwrap();
+        assert_eq!(derivations() - before, 0);
+    }
+    #[test]
+    fn cancelled_controlled_extraction_does_not_derive_keys() {
+        let archive = archive();
+        let token = ReadCancellation::new();
+        token.cancel();
+        let before = derivations();
+        let error = archive
+            .extract_with_control(
+                ArchiveReadOptions::with_password(b"password").with_cancellation(&token),
+                |_| panic!("cancelled operation called selector"),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Cancelled);
+        assert_eq!(derivations() - before, 0);
+    }
+    #[cfg(feature = "write")]
+    fn independent_archive() -> Archive {
+        let mut builder = Builder::new(ArchiveVersion::Rar50)
+            .store(true)
+            .password(Some(b"password".to_vec()));
+        for name in [b"first".to_vec(), b"second".to_vec()] {
+            builder
+                .add_bytes(name, b"payload".to_vec(), None, None)
+                .unwrap();
+        }
+        ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap()
+    }
+
+    #[cfg(feature = "write")]
+    #[test]
+    fn selection_derives_only_the_selected_members_key() {
+        let archive = independent_archive();
+        let before = derivations();
+        archive
+            .extract_with_control(ArchiveReadOptions::with_password(b"password"), |member| {
+                Ok(if member.meta.name_bytes() == b"first" {
+                    ExtractionDecision::Extract(Box::new(std::io::sink()))
+                } else {
+                    ExtractionDecision::Skip
+                })
+            })
+            .unwrap();
+        assert_eq!(derivations() - before, 1);
+    }
+
+    #[cfg(feature = "write")]
+    #[test]
+    fn resource_refusal_does_not_derive_keys() {
+        let archive = independent_archive();
+        let before = derivations();
+        let error = archive
+            .extract_to_with_options(
+                ArchiveReadOptions::with_password(b"password").with_max_member_output_bytes(0),
+                |_| panic!("refused member opened output"),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::ResourceLimit);
+        assert_eq!(derivations() - before, 0);
+    }
+
+    #[cfg(feature = "write")]
+    #[test]
+    fn wrong_password_fails_before_deriving_later_members() {
+        let archive = independent_archive();
+        for parallel_fallback in [false, true] {
+            let before = derivations();
+            let options =
+                ArchiveReadOptions::with_password(b"wrong").with_max_total_output_bytes(100);
+            let error = if parallel_fallback {
+                archive.extract_to_parallel_buffered_with_options(options, |_| {
+                    Ok(Box::new(std::io::sink()))
+                })
+            } else {
+                archive.extract_to_with_options(options, |_| Ok(Box::new(std::io::sink())))
+            }
+            .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::BadPassword);
+            assert_eq!(derivations() - before, 1);
+        }
+    }
+    #[test]
+    fn read_session_debug_does_not_expose_password_bytes() {
+        let session = ReadSession::new(ArchiveReadOptions::with_password(b"secret"));
+        assert_eq!(
+            format!("{session:?}"),
+            "ReadSession { has_password: true, .. }"
+        );
+    }
+
+    #[test]
+    fn cache_distinguishes_salts_and_kdf_counts() {
+        let cache = rar50::Rar50KeyCache::default();
+        let before = derivations();
+        let first = cache.get_or_derive(b"password", [1; 16], 0).unwrap();
+        let other_salt = cache.get_or_derive(b"password", [2; 16], 0).unwrap();
+        let other_count = cache.get_or_derive(b"password", [1; 16], 1).unwrap();
+        assert_ne!(first, other_salt);
+        assert_ne!(first, other_count);
+        assert_eq!(first, cache.get_or_derive(b"password", [1; 16], 0).unwrap());
+        assert_eq!(derivations() - before, 3);
     }
 }

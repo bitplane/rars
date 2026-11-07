@@ -1794,57 +1794,37 @@ fn attach_service_crypto(
     attach_file_crypto(service, password, key_cache)
 }
 
-/// Derived keys by salt and KDF count for one password; boxed so growth never leaves key copies behind.
+#[cfg(feature = "encryption")]
+type CachedRar50Key = std::sync::Arc<std::sync::OnceLock<Result<Rar50Keys>>>;
+
+/// One password's keys, initialized once per salt/count without serializing distinct keys.
 #[derive(Default)]
 pub(crate) struct Rar50KeyCache {
     #[cfg(feature = "encryption")]
-    entries: Vec<([u8; 16], u8, Box<Rar50Keys>)>,
-}
-
-/// Copies `volumes` with keys attached where a parse lacked the password, so a set's members share one derivation.
-pub(crate) fn with_missing_keys(
-    volumes: &[Archive],
-    password: Option<&[u8]>,
-) -> Option<Vec<Archive>> {
-    let missing = |file: &FileHeader| file.encrypted && file.crypto.is_none();
-    if !cfg!(feature = "encryption") || password.is_none() {
-        return None;
-    }
-    if !volumes.iter().flat_map(Archive::files).any(missing) {
-        return None;
-    }
-    let mut key_cache = Rar50KeyCache::default();
-    let mut volumes = volumes.to_vec();
-    for block in volumes
-        .iter_mut()
-        .flat_map(|volume| volume.blocks.iter_mut())
-    {
-        if let Block::File(file) = block {
-            if missing(file) {
-                // A member that fails here reports it when it is extracted.
-                let _ = attach_file_crypto(file, password, &mut key_cache);
-            }
-        }
-    }
-    Some(volumes)
+    entries: std::sync::Mutex<std::collections::HashMap<([u8; 16], u8), CachedRar50Key>>,
 }
 
 #[cfg(feature = "encryption")]
 impl Rar50KeyCache {
     pub(crate) fn get_or_derive(
-        &mut self,
+        &self,
         password: &[u8],
         salt: [u8; 16],
         kdf_count: u8,
     ) -> Result<Rar50Keys> {
-        if let Some((_, _, keys)) = self.entries.iter().find(|(cached_salt, cached_count, _)| {
-            *cached_salt == salt && *cached_count == kdf_count
-        }) {
-            return Ok((**keys).clone());
-        }
-        let keys = Rar50Keys::derive(password, salt, kdf_count).map_err(map_rar50_crypto_error)?;
-        self.entries.push((salt, kdf_count, Box::new(keys.clone())));
-        Ok(keys)
+        // Only lookup is serialized. Slots stay at fixed addresses, so growing
+        // the map moves pointers rather than leaving key copies in old storage.
+        let slot = self
+            .entries
+            .lock()
+            .map_err(|_| std::io::Error::other("RAR 5 key cache lock poisoned"))?
+            .entry((salt, kdf_count))
+            .or_default()
+            .clone();
+        slot.get_or_init(|| {
+            Rar50Keys::derive(password, salt, kdf_count).map_err(map_rar50_crypto_error)
+        })
+        .clone()
     }
 }
 
