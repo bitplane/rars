@@ -500,6 +500,7 @@ impl FileHeader {
             | Error::UnsupportedFeature { .. }
             | Error::UnsupportedWriterOption { .. }
             | Error::CannotSkipSolidMember
+            | Error::BrokenSolidChain
             | Error::MemberOutputLimitExceeded { .. }
             | Error::HeaderCountLimitExceeded { .. }
             | Error::HeaderBytesLimitExceeded { .. }

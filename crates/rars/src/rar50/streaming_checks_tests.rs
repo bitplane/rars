@@ -473,7 +473,7 @@ fn optional_crc_keeps_limited_growth_and_refusals_identical_to_legacy_streaming(
 }
 
 #[test]
-fn failed_independent_stream_preserves_checkpoint_for_history_dependent_successor() {
+fn failed_independent_stream_breaks_the_solid_chain() {
     let mut random = 0x1234_5678u32;
     let seed: Vec<_> = (0..32749)
         .map(|_| {
@@ -493,7 +493,7 @@ fn failed_independent_stream_preserves_checkpoint_for_history_dependent_successo
         .add_bytes(b"first".to_vec(), first, None, None)
         .unwrap();
     builder
-        .add_bytes(b"next".to_vec(), next.clone(), None, None)
+        .add_bytes(b"next".to_vec(), next, None, None)
         .unwrap();
     let archive = Archive::parse_owned(builder.to_bytes().unwrap()).unwrap();
     let files: Vec<_> = archive.files().collect();
@@ -506,7 +506,7 @@ fn failed_independent_stream_preserves_checkpoint_for_history_dependent_successo
     let different = b"failed member replaces the old raw dictionary\n".repeat(4096);
     let (failed_archive, valid) = fixture(&different, false, false);
     assert!(!valid.decoded_compression_info().unwrap().solid);
-    for split in [false, true] {
+    for (split, limit) in [(false, 0), (true, 0), (true, u64::MAX)] {
         for bad_hash in [false, true] {
             let mut corrupt = valid.clone();
             if bad_hash {
@@ -515,14 +515,14 @@ fn failed_independent_stream_preserves_checkpoint_for_history_dependent_successo
                 corrupt.hash = None;
                 corrupt.data_crc32 = Some(crc32(&different) ^ 1);
             }
-            let mut session = DecoderSession::with_allowance(None, 0, &Allowance::default());
+            let mut session = DecoderSession::with_allowance(None, limit, &Allowance::default());
             session
                 .write_file_to(&archive, files[0], &mut std::io::sink())
                 .unwrap();
             let (result, work) = measured(|| {
                 if split {
                     let pending = PendingSplitRefs::new(&valid, 0, 0);
-                    session.stream_split_to(
+                    session.write_split_to(
                         std::slice::from_ref(&failed_archive),
                         &pending,
                         &corrupt,
@@ -534,13 +534,12 @@ fn failed_independent_stream_preserves_checkpoint_for_history_dependent_successo
                 }
             });
             let error = result.unwrap_err();
-            if bad_hash {
+            assert_eq!(error.kind(), crate::ErrorKind::ChecksumMismatch);
+            if bad_hash && limit == 0 {
                 assert!(matches!(
                     error.root_cause(),
                     Error::HashMismatch { hash_type: 0 }
                 ));
-            } else {
-                assert_eq!(error.kind(), crate::ErrorKind::ChecksumMismatch);
             }
             // Only ordinary hash-verified streams omit CRC work.
             if !split && bad_hash {
@@ -550,21 +549,30 @@ fn failed_independent_stream_preserves_checkpoint_for_history_dependent_successo
                     "bad digest does not change hash authority"
                 );
             }
-            let mut output = Vec::new();
-            session
-                .write_file_to(&archive, files[1], &mut output)
-                .unwrap();
-            assert_eq!(output, next, "split={split}, bad_hash={bad_hash}");
+            let error = session
+                .write_file_to(&archive, files[1], &mut std::io::sink())
+                .unwrap_err();
+            assert!(
+                matches!(error.root_cause(), Error::BrokenSolidChain),
+                "split={split}, limit={limit}, bad_hash={bad_hash}: {error}"
+            );
+
+            if split {
+                let pending = PendingSplitRefs::new(&valid, 0, 0);
+                session
+                    .write_split_to(
+                        std::slice::from_ref(&failed_archive),
+                        &pending,
+                        &valid,
+                        None,
+                        &mut std::io::sink(),
+                    )
+                    .unwrap();
+                let error = session
+                    .write_file_to(&archive, files[1], &mut std::io::sink())
+                    .unwrap_err();
+                assert_eq!(error.kind(), crate::ErrorKind::ChecksumMismatch);
+            }
         }
     }
-
-    // Prove a mistakenly committed failed dictionary cannot pass the fixture.
-    let mut session = DecoderSession::with_allowance(None, 0, &Allowance::default());
-    session
-        .write_file_to(&failed_archive, &valid, &mut std::io::sink())
-        .unwrap();
-    let error = session
-        .write_file_to(&archive, files[1], &mut std::io::sink())
-        .unwrap_err();
-    assert_eq!(error.kind(), crate::ErrorKind::ChecksumMismatch);
 }

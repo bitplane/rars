@@ -431,9 +431,17 @@ impl<T, B: Budget> Deque<T, B> {
     pub(crate) fn discard_prefix(&mut self, count: usize) {
         self.values.drain(..count);
     }
+    pub(crate) fn clear(&mut self) {
+        self.values.clear();
+    }
     pub(crate) fn extend_admitted(&mut self, values: impl ExactSizeIterator<Item = T>) {
         assert!(values.len() <= self.values.capacity() - self.values.len());
         self.values.extend(values);
+    }
+}
+impl<T, B: Budget> From<Buffer<T, B>> for Deque<T, B> {
+    fn from(buffer: Buffer<T, B>) -> Self {
+        Self::from_buffer(buffer)
     }
 }
 impl<T, B: Budget> std::ops::Deref for Deque<T, B> {

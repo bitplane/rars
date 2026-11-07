@@ -1,79 +1,41 @@
 use super::*;
 
 #[test]
-fn unlimited_checkpoint_retains_capacity_and_independent_history() {
-    let mut history = Buffer::with_capacity(16, &Allowance::default()).unwrap();
+fn solid_stream_takes_the_state_without_copying_or_charging() {
+    let budget = Allowance::limited(16);
+    let mut history = Buffer::with_capacity(16, &budget).unwrap();
     history.extend_from_slice(b"ABCDE").unwrap();
     let mut original = ReaderState::with_history(history);
     original.reps = [1, 2, 3, 4];
     original.last_length = 7;
-    let public_copy = original.try_clone().unwrap();
-    assert_eq!(public_copy.history.capacity(), 5);
-    assert_eq!(&*public_copy.history, b"ABCDE");
-    let mut copied = original.try_prepare_for_stream(true, 0).unwrap();
-    assert_eq!(copied.history.capacity(), 16);
-    assert_eq!(&*copied.history, b"ABCDE");
-    assert_ne!(copied.history.as_ptr(), original.history.as_ptr());
-    assert_eq!(copied.reps, original.reps);
-    assert_eq!(copied.last_length, original.last_length);
-    copied.history[0] = b'X';
-    assert_eq!(&*original.history, b"ABCDE");
-    drop(original);
-    assert_eq!(&*copied.history, b"XBCDE");
-}
-
-#[test]
-fn limited_checkpoint_keeps_its_existing_length_charge_and_refusal() {
-    for limit in [20, 21] {
-        let budget = Allowance::limited(limit);
-        let mut history = Buffer::with_capacity(16, &budget).unwrap();
-        history.extend_from_slice(b"ABCDE").unwrap();
-        let original = ReaderState::with_history(history);
-        assert_eq!(budget.used(), 16);
-        match original.try_prepare_for_stream(true, 0) {
-            Ok(copied) => {
-                assert_eq!(limit, 21);
-                assert_eq!(copied.history.capacity(), 5);
-                assert_eq!(&*copied.history, b"ABCDE");
-                assert_ne!(copied.history.as_ptr(), original.history.as_ptr());
-                assert_eq!(budget.used(), 21);
-                drop(copied);
-            }
-            Err(error) => {
-                assert_eq!(limit, 20);
-                assert!(matches!(error, Error::WorkspaceLimitExceeded(_)));
-            }
-        }
-        assert_eq!(budget.used(), 16);
-        assert_eq!(&*original.history, b"ABCDE");
-        assert_eq!(original.history.capacity(), 16);
-        drop(original);
-        assert_eq!(budget.used(), 0);
-    }
-}
-
-#[test]
-fn refused_checkpoint_preserves_the_previous_history_owner() {
-    let budget = super::super::workspace::RefusingBudget::new(1);
-    let mut history = Buffer::with_capacity(16, &budget).unwrap();
-    history.extend_from_slice(b"ABCDE").unwrap();
-    let original = ReaderState::with_history(history);
+    let token = crate::ReadCancellation::new();
+    original.read_control = crate::read_control::ReadControl::new(Some(&token));
     let address = original.history.as_ptr();
+
+    let taken = original.take_for_stream(true, 0).unwrap();
+    assert_eq!(taken.history.as_ptr(), address);
+    assert_eq!(taken.history.capacity(), 16);
+    assert_eq!(taken.reachable_history(), b"ABCDE");
+    assert_eq!(taken.reps, [1, 2, 3, 4]);
+    assert_eq!(taken.last_length, 7);
+    assert_eq!(budget.used(), 16);
+
+    assert!(original.history.is_empty());
+    assert_eq!(original.history_window, 0);
+    assert!(original.tables.is_none());
+    assert_eq!(original.reps, [0; 4]);
+    token.cancel();
     assert!(matches!(
-        original.try_prepare_for_stream(true, 0),
+        original.read_control.check_codec(),
         Err(Error::Cancelled)
     ));
-    assert_eq!(original.history.as_ptr(), address);
-    assert_eq!(original.history.capacity(), 16);
-    assert_eq!(&*original.history, b"ABCDE");
-    assert_eq!(budget.used(), 16);
-    drop(original);
+    drop(taken);
     assert_eq!(budget.used(), 0);
 }
 
 #[cfg(feature = "write")]
 #[test]
-fn solid_streaming_checkpoints_keep_geometric_capacity_between_small_members() {
+fn solid_streaming_keeps_geometric_capacity_between_small_members() {
     use std::collections::BTreeSet;
     let dictionary = 16 * 1024;
     let data = b"solid checkpoint history and repeated match bytes\n".repeat(20);
@@ -82,8 +44,9 @@ fn solid_streaming_checkpoints_keep_geometric_capacity_between_small_members() {
     let mut decoder = ReaderState::new(&Allowance::default());
     for member in 0..40 {
         let packed = encode_lz_member_with_history(&data, &expected_history, 0).unwrap();
-        let mut checkpoint = decoder.try_prepare_for_stream(true, 0).unwrap();
-        assert_eq!(checkpoint.history.capacity(), decoder.history.capacity());
+        let capacity = decoder.history_capacity();
+        let mut checkpoint = decoder.take_for_stream(true, 0).unwrap();
+        assert_eq!(checkpoint.history_capacity(), capacity);
         let mut decoded = Vec::new();
         checkpoint
             .decode_member_from_reader_with_dictionary_to_sink(
@@ -107,13 +70,11 @@ fn solid_streaming_checkpoints_keep_geometric_capacity_between_small_members() {
         expected_history.extend_from_slice(&data);
         let discard = expected_history.len().saturating_sub(dictionary);
         expected_history.drain(..discard);
-        assert_eq!(&*checkpoint.history, &expected_history);
-        assert!(checkpoint.history.capacity() <= dictionary + dictionary / 4);
-        capacities.insert(checkpoint.history.capacity());
+        assert_eq!(checkpoint.history_bytes(), expected_history);
+        assert!(checkpoint.history_capacity() <= dictionary + dictionary / 4);
+        capacities.insert(checkpoint.history_capacity());
         decoder = checkpoint;
     }
-    // Each checkpoint retains the preceding geometric capacity. Copying only
-    // the length creates a fresh capacity on almost every small solid member.
     assert!(capacities.len() <= 6, "capacities: {capacities:?}");
 }
 
@@ -127,7 +88,7 @@ fn independent_stream_preparation_preserves_control_and_exhausted_budget() {
     original.last_length = 7;
     let token = crate::ReadCancellation::new();
     original.read_control = crate::read_control::ReadControl::new(Some(&token));
-    let mut fresh = original.try_prepare_for_stream(false, 3).unwrap();
+    let mut fresh = original.take_for_stream(false, 3).unwrap();
     assert_eq!(budget.used(), 1024 * 1024);
     assert_eq!(fresh.history.capacity(), 0);
     assert_eq!(fresh.history_window, 0);
@@ -162,15 +123,16 @@ fn independent_stream_preparation_does_not_copy_populated_tables_or_history() {
             .unwrap();
         assert!(original.tables.is_some());
         let address = original.history.as_ptr();
-        let fresh = original.try_prepare_for_stream(false, 3).unwrap();
+        let fresh = original.take_for_stream(false, 3).unwrap();
         assert!(fresh.tables.is_none());
         assert!(fresh.history.is_empty());
         assert_eq!(fresh.history.capacity(), if B::LIMITED { 0 } else { 3 });
         assert_eq!(original.history.as_ptr(), address);
         assert_eq!(original.reachable_history(), data);
-        let solid = original.try_prepare_for_stream(true, 0).unwrap();
+        let solid = original.take_for_stream(true, 0).unwrap();
         assert!(solid.tables.is_some());
         assert_eq!(solid.reachable_history(), data);
+        assert!(original.tables.is_none());
     }
     check(&Allowance::default());
     check(&Allowance::limited(1024 * 1024));
@@ -182,7 +144,7 @@ fn independent_stream_preparation_does_not_copy_populated_tables_or_history() {
         .decode_member(&packed, 0, 11, false, DecodeMode::Lz)
         .unwrap();
     let before = (budget.attempts(), budget.used());
-    let fresh = original.try_prepare_for_stream(false, 3).unwrap();
+    let fresh = original.take_for_stream(false, 3).unwrap();
     assert_eq!((budget.attempts(), budget.used()), before);
     drop(original);
     drop(fresh);
@@ -193,9 +155,9 @@ fn independent_stream_preparation_does_not_copy_populated_tables_or_history() {
 fn independent_stream_capacity_hint_is_capped_without_copying_history() {
     let mut history = Buffer::with_capacity(16, &Allowance::default()).unwrap();
     history.extend_from_slice(b"ABCDE").unwrap();
-    let original = ReaderState::with_history(history);
+    let mut original = ReaderState::with_history(history);
     for (size, capacity) in [(0, 0), (3, 3), (16, 16), (u64::MAX, 16)] {
-        let fresh = original.try_prepare_for_stream(false, size).unwrap();
+        let fresh = original.take_for_stream(false, size).unwrap();
         assert_eq!(fresh.history.capacity(), capacity);
         assert!(fresh.history.is_empty());
         assert_eq!(fresh.history_window, 0);

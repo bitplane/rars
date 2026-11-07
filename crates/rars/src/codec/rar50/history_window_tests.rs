@@ -38,8 +38,11 @@ fn dictionary_growth_does_not_make_slack_reachable_in_original_or_clones() {
     assert_eq!(&*state.history, b"ABCDEFGHx");
     assert_eq!(state.reachable_history(), b"BCDEFGHx");
     let public_clone = state.try_clone().unwrap();
-    let streaming_clone = state.try_prepare_for_stream(true, 0).unwrap();
-    for mut state in [state, public_clone, streaming_clone] {
+    let mut source = ReaderState::new(&Allowance::default());
+    source.remember_history(b"ABCDEFGH", 8).unwrap();
+    source.remember_history(b"x", 8).unwrap();
+    let streamed = source.take_for_stream(true, 0).unwrap();
+    for mut state in [state, public_clone, streamed] {
         let mut output = Buffer::new(&Allowance::default());
         state.copy_match(&mut output, 9, 3, 3, 16).unwrap();
         assert_eq!(&*output, &[0; 3]);
@@ -114,8 +117,8 @@ fn buffered_and_streamed_members_reuse_unlimited_history_in_both_directions() {
         .remember_history(&vec![b'A'; dictionary], dictionary)
         .unwrap();
     state.remember_history(b"x", dictionary).unwrap();
-    let mut state = state.try_prepare_for_stream(true, 0).unwrap();
-    assert_eq!(state.history.len(), dictionary);
+    let mut state = state.take_for_stream(true, 0).unwrap();
+    assert_eq!(state.reachable_history().len(), dictionary);
     let address = state.history.as_ptr();
     let capacity = state.history.capacity();
     let data = vec![b'B'; STREAM_FLUSH_THRESHOLD + 1];
@@ -140,8 +143,7 @@ fn buffered_and_streamed_members_reuse_unlimited_history_in_both_directions() {
         )
         .unwrap();
     assert_eq!(decoded, data);
-    assert_eq!(state.history.as_ptr(), address);
-    assert_eq!(state.history.capacity(), capacity);
+    assert_eq!(state.history_capacity(), capacity);
     assert_eq!(state.history_window, dictionary);
     state.remember_history(b"c", dictionary).unwrap();
     assert_eq!(state.history.as_ptr(), address);
