@@ -1267,7 +1267,7 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
         // Read just the solid flag here; full header validation stays in decode.
         let mut streaming_decoder = self
             .decoder
-            .take_for_stream(file.compression_info & 0x40 != 0, file.unpacked_size)?;
+            .take_for_stream(file.compression_info & 0x40 != 0);
         let (mut packed, keys) = file
             .packed_reader_with_allowance(
                 archive,
@@ -1356,10 +1356,9 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
         writer: &mut dyn Write,
     ) -> Result<()> {
         self.decoder.read_control.check()?;
-        let mut decoder = self.decoder.take_for_stream(
-            final_file.compression_info & 0x40 != 0,
-            final_file.unpacked_size,
-        )?;
+        let mut decoder = self
+            .decoder
+            .take_for_stream(final_file.compression_info & 0x40 != 0);
         let control = decoder.read_control.clone();
         let mut packed =
             split.fragment_reader_with_allowance(volumes, decryptor, &self.allowance)?;

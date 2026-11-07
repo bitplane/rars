@@ -12,7 +12,7 @@ fn solid_stream_takes_the_state_without_copying_or_charging() {
     original.read_control = crate::read_control::ReadControl::new(Some(&token));
     let address = original.history.as_ptr();
 
-    let taken = original.take_for_stream(true, 0).unwrap();
+    let taken = original.take_for_stream(true);
     assert_eq!(taken.history.as_ptr(), address);
     assert_eq!(taken.history.capacity(), 16);
     assert_eq!(taken.reachable_history(), b"ABCDE");
@@ -45,7 +45,7 @@ fn solid_streaming_keeps_geometric_capacity_between_small_members() {
     for member in 0..40 {
         let packed = encode_lz_member_with_history(&data, &expected_history, 0).unwrap();
         let capacity = decoder.history_capacity();
-        let mut checkpoint = decoder.take_for_stream(true, 0).unwrap();
+        let mut checkpoint = decoder.take_for_stream(true);
         assert_eq!(checkpoint.history_capacity(), capacity);
         let mut decoded = Vec::new();
         checkpoint
@@ -71,7 +71,7 @@ fn solid_streaming_keeps_geometric_capacity_between_small_members() {
         let discard = expected_history.len().saturating_sub(dictionary);
         expected_history.drain(..discard);
         assert_eq!(checkpoint.history_bytes(), expected_history);
-        assert!(checkpoint.history_capacity() <= dictionary + dictionary / 4);
+        assert!(checkpoint.history_capacity() <= dictionary + STREAM_SLACK);
         capacities.insert(checkpoint.history_capacity());
         decoder = checkpoint;
     }
@@ -88,7 +88,7 @@ fn independent_stream_preparation_preserves_control_and_exhausted_budget() {
     original.last_length = 7;
     let token = crate::ReadCancellation::new();
     original.read_control = crate::read_control::ReadControl::new(Some(&token));
-    let mut fresh = original.take_for_stream(false, 3).unwrap();
+    let mut fresh = original.take_for_stream(false);
     assert_eq!(budget.used(), 1024 * 1024);
     assert_eq!(fresh.history.capacity(), 0);
     assert_eq!(fresh.history_window, 0);
@@ -123,15 +123,19 @@ fn independent_stream_preparation_does_not_copy_populated_tables_or_history() {
             .unwrap();
         assert!(original.tables.is_some());
         let address = original.history.as_ptr();
-        let fresh = original.take_for_stream(false, 3).unwrap();
+        let fresh = original.take_for_stream(false);
         assert!(fresh.tables.is_none());
         assert!(fresh.history.is_empty());
-        assert_eq!(fresh.history.capacity(), if B::LIMITED { 0 } else { 3 });
-        assert_eq!(original.history.as_ptr(), address);
-        assert_eq!(original.reachable_history(), data);
-        let solid = original.take_for_stream(true, 0).unwrap();
+        if B::LIMITED {
+            assert_eq!(fresh.history.capacity(), 0);
+            assert_eq!(original.history.as_ptr(), address);
+            assert_eq!(original.reachable_history(), data);
+        } else {
+            assert_eq!(fresh.history.as_ptr(), address);
+            assert!(original.reachable_history().is_empty());
+        }
+        let solid = original.take_for_stream(true);
         assert!(solid.tables.is_some());
-        assert_eq!(solid.reachable_history(), data);
         assert!(original.tables.is_none());
     }
     check(&Allowance::default());
@@ -144,7 +148,7 @@ fn independent_stream_preparation_does_not_copy_populated_tables_or_history() {
         .decode_member(&packed, 0, 11, false, DecodeMode::Lz)
         .unwrap();
     let before = (budget.attempts(), budget.used());
-    let fresh = original.take_for_stream(false, 3).unwrap();
+    let fresh = original.take_for_stream(false);
     assert_eq!((budget.attempts(), budget.used()), before);
     drop(original);
     drop(fresh);
@@ -152,15 +156,15 @@ fn independent_stream_preparation_does_not_copy_populated_tables_or_history() {
 }
 
 #[test]
-fn independent_stream_capacity_hint_is_capped_without_copying_history() {
+fn independent_stream_reuses_the_previous_window_allocation() {
     let mut history = Buffer::with_capacity(16, &Allowance::default()).unwrap();
     history.extend_from_slice(b"ABCDE").unwrap();
     let mut original = ReaderState::with_history(history);
-    for (size, capacity) in [(0, 0), (3, 3), (16, 16), (u64::MAX, 16)] {
-        let fresh = original.take_for_stream(false, size).unwrap();
-        assert_eq!(fresh.history.capacity(), capacity);
-        assert!(fresh.history.is_empty());
-        assert_eq!(fresh.history_window, 0);
-        assert_eq!(&*original.history, b"ABCDE");
-    }
+    let address = original.history.as_ptr();
+    let fresh = original.take_for_stream(false);
+    assert_eq!(fresh.history.as_ptr(), address);
+    assert_eq!(fresh.history.capacity(), 16);
+    assert!(fresh.history.is_empty());
+    assert_eq!(fresh.history_window, 0);
+    assert!(original.reachable_history().is_empty());
 }

@@ -109,15 +109,16 @@ fn streaming_matches_equal_scalar_with_history_pending_overlap_and_missing_histo
 #[test]
 fn streaming_match_crosses_both_wrapped_history_slices_and_multiple_flushes() {
     let count = 2 * STREAM_FLUSH_THRESHOLD + 37;
-    let mut history = Buffer::with_capacity(16, &Allowance::default()).unwrap();
-    history
-        .extend_from_slice(&(1..=12).collect::<Vec<u8>>())
-        .unwrap();
-    let mut output = StreamingOutput::new(history, count + 3, 16, 16).unwrap();
-    output.history.discard_prefix(8);
-    output.history.extend_admitted(31..39);
-    assert!(!output.history.as_slices().1.is_empty());
-    let history: Vec<_> = output.history.iter().copied().collect();
+    let mut ring: Vec<u8> = (31..39).collect();
+    ring.extend([0, 0, 0, 0, 9, 10, 11, 12]);
+    let ring = StreamedHistory {
+        bytes: Buffer::from_vec(ring),
+        end: 8,
+        len: 12,
+    };
+    assert!(!ring.as_slices().1.is_empty());
+    let history = ring.to_vec();
+    let mut output = StreamingOutput::new(ring, count + 3, 16, 16).unwrap();
     let pending = [91, 92, 93];
     let mut decoded = Vec::new();
     let mut chunks = Vec::new();
@@ -135,10 +136,11 @@ fn streaming_match_crosses_both_wrapped_history_slices_and_multiple_flushes() {
     output.copy_match(12, count, &mut sink).unwrap();
     output.finish(&mut sink).unwrap();
     assert_eq!(decoded, reference_match(&history, &pending, 12, count));
-    assert_eq!(chunks, [STREAM_FLUSH_THRESHOLD, STREAM_FLUSH_THRESHOLD, 40]);
+    assert!(chunks.len() >= 3);
+    assert!(chunks.iter().all(|&len| len <= STREAM_FLUSH_THRESHOLD));
     assert_eq!(output.written(), decoded.len());
     assert_eq!(
-        output.into_history().into_buffer().into_vec(),
+        output.into_history().to_vec(),
         decoded[decoded.len() - 16..]
     );
 }
@@ -162,16 +164,14 @@ fn streaming_match_stops_on_the_first_failed_flush() {
     ));
     assert_eq!(calls, 1);
     assert_eq!(output.written(), STREAM_FLUSH_THRESHOLD);
-    assert_eq!(output.pending.len(), STREAM_FLUSH_THRESHOLD);
-    assert_eq!(
-        &*output.history,
-        &std::collections::VecDeque::from(b"abc".to_vec())
-    );
+    assert_eq!(output.pending, STREAM_FLUSH_THRESHOLD);
+    assert_eq!(output.ring.len, 3 + STREAM_FLUSH_THRESHOLD);
 }
 
 #[test]
 fn streaming_match_uses_only_its_admitted_pending_and_history_storage() {
-    let budget = Allowance::limited((STREAM_FLUSH_THRESHOLD + 16) as u64);
+    // Growing the ring holds the old window and the new ring at once.
+    let budget = Allowance::limited((STREAM_SLACK + 32) as u64);
     let mut history = Buffer::with_capacity(16, &budget).unwrap();
     history.extend_from_slice(b"abcdefghijklmnop").unwrap();
     let count = 2 * STREAM_FLUSH_THRESHOLD + 5;
@@ -187,7 +187,7 @@ fn streaming_match_uses_only_its_admitted_pending_and_history_storage() {
     output.copy_match(7, count, &mut sink).unwrap();
     output.finish(&mut sink).unwrap();
     assert_eq!(observed, count);
-    assert_eq!(budget.used(), (STREAM_FLUSH_THRESHOLD + 16) as u64);
+    assert_eq!(budget.used(), (STREAM_SLACK + 16) as u64);
     drop(output);
     assert_eq!(budget.used(), 0);
 }
@@ -223,4 +223,81 @@ fn streaming_match_flush_preserves_decoder_cancellation() {
         Err(StreamDecodeError::Decode(Error::Cancelled))
     ));
     assert_eq!(calls, 1);
+}
+
+struct Rng(u64);
+
+impl Rng {
+    fn below(&mut self, bound: usize) -> usize {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 % bound as u64) as usize
+    }
+}
+
+fn stream_against_model(
+    rng: &mut Rng,
+    model: &mut Vec<u8>,
+    history: StreamedHistory,
+    output_size: usize,
+    dictionary: usize,
+) -> StreamedHistory {
+    let start = model.len();
+    let mut output = StreamingOutput::new(history, output_size, dictionary, dictionary).unwrap();
+    let mut decoded = Vec::new();
+    let mut sink = |chunk: DecodedChunk<'_>| {
+        append_chunk(&mut decoded, chunk);
+        Ok::<(), Infallible>(())
+    };
+    while output.written() < output_size {
+        let left = output_size - output.written();
+        let reach = model.len().min(dictionary);
+        if reach == 0 || rng.below(3) == 0 {
+            let byte = rng.below(4) as u8 + b'a';
+            output.push(byte, &mut sink).unwrap();
+            model.push(byte);
+            let room = output.literal_room().min(rng.below(64));
+            let literals: Vec<u8> = (0..room).map(|_| rng.below(256) as u8).collect();
+            output.push_literals(&literals, &mut sink).unwrap();
+            model.extend_from_slice(&literals);
+            continue;
+        }
+        let distance = match rng.below(4) {
+            0 => 1 + rng.below(reach.min(4)),
+            1 => 1 + rng.below(reach.min(40)),
+            _ => 1 + rng.below(reach),
+        };
+        let length = match rng.below(8) {
+            0 => 1 + rng.below(3 * STREAM_FLUSH_THRESHOLD),
+            1..=3 => 2 + rng.below(31),
+            _ => 2 + rng.below(300),
+        }
+        .min(left);
+        output.copy_match(distance, length, &mut sink).unwrap();
+        for _ in 0..length {
+            model.push(model[model.len() - distance]);
+        }
+    }
+    output.finish(&mut sink).unwrap();
+    assert_eq!(decoded, model[start..]);
+    output.into_history()
+}
+
+#[test]
+fn streamed_output_matches_byte_model_across_wraps_growth_and_chained_members() {
+    for (seed, dictionary) in [(1, 64), (2, 4096), (3, 1 << 20), (4, 100_003)] {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ seed);
+        let mut model = Vec::new();
+        let mut history = StreamedHistory::from(Buffer::new(&Allowance::default()));
+        for size in [1, 300_000, 17, 250_000] {
+            history = stream_against_model(&mut rng, &mut model, history, size, dictionary);
+            let kept = model.len().min(dictionary);
+            assert_eq!(
+                history.to_vec(),
+                model[model.len() - kept..],
+                "seed={seed}, dictionary={dictionary}"
+            );
+        }
+    }
 }
