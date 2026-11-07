@@ -65,7 +65,7 @@ pub(crate) struct ReadOptionsArgs {
     /// Source encoding for legacy names without Unicode (e.g. cp850)
     #[arg(long, value_name = "ENCODING")]
     pub legacy_name_encoding: Option<rars::filename::LegacyNameEncoding>,
-    /// Maximum RAR 5 member size to decode in memory; larger ones stream (e.g. 512m, 1g)
+    /// Maximum RAR 5 member size to decode in memory; larger ones stream (default 16m)
     #[arg(long, value_name = "SIZE", value_parser = crate::parse_size_string)]
     pub rar50_buffered_decode_limit: Option<usize>,
     /// Maximum declared RAR5/7 dictionary size (not total memory)

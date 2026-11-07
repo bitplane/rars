@@ -162,7 +162,8 @@ pub struct ArchiveReadOptions<'a> {
     /// returned on refusal. Existing end-record and tolerant-tail handling stays.
     pub max_header_bytes: Option<u64>,
     /// Optional RAR 5 whole-member buffered decode limit, including logical
-    /// members split across volumes. This does not bound decoder dictionaries.
+    /// members split across volumes; 16 MiB when unset. This does not bound
+    /// decoder dictionaries.
     ///
     /// Compressed members above this limit use the streaming path, which holds
     /// each filtered block in the reader workspace until it is complete and then

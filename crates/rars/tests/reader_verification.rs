@@ -289,7 +289,7 @@ fn cancellation_during_payload_read_is_not_hidden_or_reported_as_success() {
 fn filtered_member_above_the_default_buffer_limit_streams_once() {
     let (bytes, _) = late_filtered();
     let (mut archive, attempts) = reader(bytes, false, None);
-    let required = 512 * 1024 * 1024 + 1;
+    let required = 16 * 1024 * 1024 + 1;
     let Archive::Rar50Plus(typed) = &mut archive else {
         unreachable!()
     };
