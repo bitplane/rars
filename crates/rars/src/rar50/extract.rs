@@ -63,7 +63,7 @@ impl FileHeader {
         Ok(())
     }
 
-    #[cfg(all(test, feature = "write"))]
+    #[cfg(all(test, feature = "write", feature = "encryption"))]
     fn encryption_keys(&self, password: Option<&[u8]>) -> Result<Rar50Keys> {
         self.encryption_keys_cached(password, &super::Rar50KeyCache::default())
     }
