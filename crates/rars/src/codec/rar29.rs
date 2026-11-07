@@ -39,6 +39,11 @@ const MAX_HISTORY: usize = 4 * 1024 * 1024;
 // Matches up to this long are copied byte by byte (see `copy_match`).
 const SHORT_MATCH: usize = 64;
 const STREAM_CHUNK: usize = 1024 * 1024;
+// Packed input is read through a window this size, not whole, so memory does not grow with the member.
+const PACKED_WINDOW: usize = 1024 * 1024;
+// Above the most one decode step can read without a refill: an LZ VM code is at most 64 KiB.
+const PACKED_LOW_WATER: usize = 128 * 1024;
+const PACKED_READ_CHUNK: usize = 32 * 1024;
 // RARVM's standard AUDIO filter reserves an eight-bit-ish compatibility
 // range wider than WinRAR's usual 1..=4 channel choices. UnRAR accepts up to
 // 128; keep this distinct from DELTA's 1024-channel ceiling.
@@ -436,9 +441,8 @@ impl<B: Budget> Reader29State<B> {
         self.read_control.check_codec()?;
         let control = self.read_control.clone();
         let input = &mut control.reader(input);
-        self.bits = BitReader::with_allowance(&self.output.allowance());
-        self.bits.input.read_to_end(input)?;
-        self.decode_bits_member_to(output_size, out)
+        self.bits = BitReader::streaming(&self.output.allowance());
+        self.decode_bits_member_to(output_size, out, input)
     }
 
     /// Decodes one complete packed member while retaining solid dictionary,
@@ -451,9 +455,14 @@ impl<B: Budget> Reader29State<B> {
     ) -> Result<()> {
         self.read_control.check_codec()?;
         self.bits = BitReader::from_bytes_with_allowance(packed, &self.output.allowance())?;
-        self.decode_bits_member_to(output_size, out)
+        self.decode_bits_member_to(output_size, out, &mut std::io::empty())
     }
-    fn decode_bits_member_to(&mut self, output_size: usize, out: &mut impl Write) -> Result<()> {
+    fn decode_bits_member_to(
+        &mut self,
+        output_size: usize,
+        out: &mut impl Write,
+        src: &mut dyn Read,
+    ) -> Result<()> {
         // `last_block_end` describes control flow within one member. A solid
         // follower legitimately starts after the previous member's new-file
         // marker, so do not mistake that marker for an early end in this one.
@@ -469,6 +478,7 @@ impl<B: Budget> Reader29State<B> {
         // flush). When output_size is zero, decode_until skips its loop body
         // and never reads tables, so do the init here so finish_member can
         // observe the block end.
+        self.bits.top_up(src)?;
         if final_target == start && !self.in_lz_block && !self.bits.input.is_empty() {
             self.read_tables().map_err(|error| match error {
                 Error::NeedMoreInput => Error::InvalidData("RAR 2.9 bitstream is truncated"),
@@ -478,10 +488,11 @@ impl<B: Budget> Reader29State<B> {
         }
 
         while flushed < final_target {
-            self.decode_until(target).map_err(|error| match error {
-                Error::NeedMoreInput => Error::InvalidData("RAR 2.9 bitstream is truncated"),
-                error => error,
-            })?;
+            self.decode_until(target, src)
+                .map_err(|error| match error {
+                    Error::NeedMoreInput => Error::InvalidData("RAR 2.9 bitstream is truncated"),
+                    error => error,
+                })?;
 
             let safe_end = self.safe_flush_end(flushed, target, final_target)?;
             if safe_end <= flushed {
@@ -506,14 +517,14 @@ impl<B: Budget> Reader29State<B> {
                 "RAR 2.9 member produces more output than its declared size",
             ));
         }
-        self.finish_member().map_err(|error| match error {
+        self.finish_member(src).map_err(|error| match error {
             Error::NeedMoreInput => Error::InvalidData("RAR 2.9 bitstream is truncated"),
             error => error,
         })?;
         Ok(())
     }
 
-    fn decode_until(&mut self, target: usize) -> Result<()> {
+    fn decode_until(&mut self, target: usize, src: &mut dyn Read) -> Result<()> {
         let mut poller = self.read_control.poller();
         while self.current_pos() < target {
             poller.check_codec(self.current_pos())?;
@@ -530,12 +541,13 @@ impl<B: Budget> Reader29State<B> {
                         "RAR 2.9 member ended before its declared size",
                     ));
                 }
+                self.bits.top_up(src)?;
                 self.read_tables()?;
                 self.in_lz_block = true;
             }
             match self.block_mode {
-                BlockMode::Lz => self.decode_lz(target)?,
-                BlockMode::Ppmd => self.decode_ppmd(target)?,
+                BlockMode::Lz => self.decode_lz(target, src)?,
+                BlockMode::Ppmd => self.decode_ppmd(target, src)?,
             }
         }
         Ok(())
@@ -640,10 +652,11 @@ impl<B: Budget> Reader29State<B> {
         Ok(lengths)
     }
 
-    fn decode_lz(&mut self, output_size: usize) -> Result<()> {
+    fn decode_lz(&mut self, output_size: usize, src: &mut dyn Read) -> Result<()> {
         let mut poller = self.read_control.poller();
         while self.current_pos() < output_size {
             poller.check_codec(self.current_pos())?;
+            self.bits.top_up(src)?;
             let symbol = self.main.decode(&mut self.bits)?;
             match symbol {
                 0..=255 => self.output.try_push(symbol as u8)?,
@@ -704,10 +717,11 @@ impl<B: Budget> Reader29State<B> {
         Ok(())
     }
 
-    fn decode_ppmd(&mut self, output_size: usize) -> Result<()> {
+    fn decode_ppmd(&mut self, output_size: usize, src: &mut dyn Read) -> Result<()> {
         let mut poller = self.read_control.poller();
         while self.current_pos() < output_size {
             poller.check_codec(self.current_pos())?;
+            self.bits.top_up(src)?;
             let symbol = require_ppmd_symbol(self.ppmd.decode_symbol(&mut self.bits)?)?;
             if symbol != self.ppmd_esc {
                 self.output.try_push(symbol)?;
@@ -727,7 +741,7 @@ impl<B: Budget> Reader29State<B> {
                     ));
                 }
                 3 => {
-                    self.read_vm_code_ppmd()?;
+                    self.read_vm_code_ppmd(src)?;
                 }
                 4 => {
                     let mut offset = 0usize;
@@ -775,8 +789,9 @@ impl<B: Budget> Reader29State<B> {
         }
     }
 
-    fn finish_member(&mut self) -> Result<()> {
+    fn finish_member(&mut self, src: &mut dyn Read) -> Result<()> {
         loop {
+            self.bits.top_up(src)?;
             let finished = match self.block_mode {
                 BlockMode::Lz => self.finish_lz_member()?,
                 BlockMode::Ppmd => self.finish_ppmd_member()?,
@@ -872,7 +887,7 @@ impl<B: Budget> Reader29State<B> {
         self.parse_vm_code_owned(first_byte, data)
     }
 
-    fn read_vm_code_ppmd(&mut self) -> Result<()> {
+    fn read_vm_code_ppmd(&mut self, src: &mut dyn Read) -> Result<()> {
         let mut poller = self.read_control.poller();
         let first_byte = u32::from(self.read_ppmd_required_byte()?);
         let mut len = (first_byte & 7) + 1;
@@ -883,8 +898,10 @@ impl<B: Budget> Reader29State<B> {
                 | u32::from(self.read_ppmd_required_byte()?);
         }
         let mut data = Buffer::with_capacity(len as usize, &self.output.allowance())?;
+        // PPMd may spend several packed bytes on each of up to 64 KiB code bytes.
         for _ in 0..len {
             poller.check_codec(data.len())?;
+            self.bits.top_up(src)?;
             data.push_admitted(self.read_ppmd_required_byte()?);
         }
 
@@ -895,6 +912,7 @@ impl<B: Budget> Reader29State<B> {
         let mut vm = BitReader {
             input: data,
             bit_pos: 0,
+            refill_at: usize::MAX,
         };
         let program_index = if first_byte & 0x80 != 0 {
             let value = vm.read_encoded_u32()?;
@@ -1362,6 +1380,8 @@ fn validate_huffman_counts(count: &[u16; 16]) -> Result<()> {
 struct BitReader<B: Budget = Allowance> {
     input: Buffer<u8, B>,
     bit_pos: usize,
+    // Bit position to refill the window at; `usize::MAX` once the source is drained.
+    refill_at: usize,
 }
 
 impl<B: Budget> BitReader<B> {
@@ -1369,6 +1389,14 @@ impl<B: Budget> BitReader<B> {
         Self {
             input: Buffer::new(allowance),
             bit_pos: 0,
+            refill_at: usize::MAX,
+        }
+    }
+
+    fn streaming(allowance: &B) -> Self {
+        Self {
+            refill_at: 0,
+            ..Self::with_allowance(allowance)
         }
     }
 
@@ -1376,13 +1404,46 @@ impl<B: Budget> BitReader<B> {
         Ok(Self {
             input: Buffer::copied(input, allowance)?,
             bit_pos: 0,
+            refill_at: usize::MAX,
         })
     }
     fn try_clone(&self) -> Result<Self> {
         Ok(Self {
             input: Buffer::copied(&self.input, &self.input.allowance())?,
             bit_pos: self.bit_pos,
+            refill_at: self.refill_at,
         })
+    }
+
+    #[inline]
+    fn top_up(&mut self, src: &mut dyn Read) -> Result<()> {
+        if self.bit_pos < self.refill_at {
+            return Ok(());
+        }
+        self.refill(src)
+    }
+
+    #[cold]
+    fn refill(&mut self, src: &mut dyn Read) -> Result<()> {
+        self.compact();
+        let mut chunk = [0u8; PACKED_READ_CHUNK];
+        while self.input.len() < PACKED_WINDOW {
+            let want = (PACKED_WINDOW - self.input.len()).min(chunk.len());
+            let len = match src.read(&mut chunk[..want]) {
+                Ok(0) => {
+                    self.refill_at = usize::MAX;
+                    return Ok(());
+                }
+                Ok(len) => len,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(Error::from(error)),
+            };
+            self.input
+                .extend_from_slice(&chunk[..len])
+                .map_err(Into::into)?;
+        }
+        self.refill_at = (PACKED_WINDOW - PACKED_LOW_WATER) * 8;
+        Ok(())
     }
 
     #[cfg(all(test, feature = "write"))]
@@ -1394,7 +1455,6 @@ impl<B: Budget> BitReader<B> {
             .expect("test input allowance");
     }
 
-    #[cfg(all(test, feature = "write"))]
     fn compact(&mut self) {
         let bytes = self.bit_pos / 8;
         if bytes == 0 {
