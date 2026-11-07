@@ -2180,10 +2180,8 @@ fn read_archives_from_paths(
     paths: &[PathBuf],
     options: rars_rs::ArchiveReadOptions<'_>,
 ) -> rars_rs::Result<Vec<rars_rs::Archive>> {
-    paths
-        .iter()
-        .map(|path| rars_rs::ArchiveReader::read_path_with_options(path, options))
-        .collect()
+    let mut session = rars_rs::ReadSession::new(options);
+    paths.iter().map(|path| session.read_path(path)).collect()
 }
 
 #[cfg(test)]

@@ -598,6 +598,20 @@ impl Archive {
         signature: ArchiveSignature,
         options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Self> {
+        Self::parse_path_with_signature_cached(
+            path,
+            signature,
+            options,
+            &mut Rar50KeyCache::default(),
+        )
+    }
+
+    pub(crate) fn parse_path_with_signature_cached(
+        path: impl AsRef<Path>,
+        signature: ArchiveSignature,
+        options: crate::ArchiveReadOptions<'_>,
+        key_cache: &mut Rar50KeyCache,
+    ) -> Result<Self> {
         options.check_cancelled()?;
         if signature.family != ArchiveFamily::Rar50Plus {
             return Err(Error::UnsupportedSignature);
@@ -609,12 +623,13 @@ impl Archive {
             .map_err(|_| Error::InvalidHeader("RAR 5 archive size overflows usize"))?
             .checked_sub(signature.offset)
             .ok_or(Error::TooShort)?;
-        Self::parse_file_backed(
+        Self::parse_file_backed_cached(
             &mut file,
             archive_len,
             signature.offset,
             ArchiveSource::File(path),
             options,
+            key_cache,
         )
     }
 
@@ -648,6 +663,7 @@ impl Archive {
         let (main, blocks) = parse_archive_blocks(
             archive_len,
             options,
+            &mut Rar50KeyCache::default(),
             |offset, budget| {
                 parse_block_header_bytes(input, offset, archive_len, sfx_offset, budget)
             },
@@ -679,6 +695,24 @@ impl Archive {
         source: ArchiveSource,
         options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Self> {
+        Self::parse_file_backed_cached(
+            file,
+            archive_len,
+            sfx_offset,
+            source,
+            options,
+            &mut Rar50KeyCache::default(),
+        )
+    }
+
+    fn parse_file_backed_cached(
+        file: &mut (impl Read + std::io::Seek),
+        archive_len: usize,
+        sfx_offset: usize,
+        source: ArchiveSource,
+        options: crate::ArchiveReadOptions<'_>,
+        key_cache: &mut Rar50KeyCache,
+    ) -> Result<Self> {
         options.check_cancelled()?;
         let signature = read_exact_at(file, sfx_offset, RAR50_SIGNATURE.len())?;
         if signature != RAR50_SIGNATURE {
@@ -690,6 +724,7 @@ impl Archive {
         let (main, blocks) = parse_archive_blocks(
             archive_len,
             options,
+            key_cache,
             |offset, budget| {
                 read_block_header_at(
                     &mut *file_cell.borrow_mut(),
@@ -1297,7 +1332,7 @@ pub(crate) fn recovery_end_header(
         &mut crate::parse_budget::ParseBudget::new(options),
     )?;
     let keys = if first.block.header_type == HEAD_CRYPT {
-        Some(parse_archive_encryption_header(&first, password)?.0)
+        Some(parse_archive_encryption_header(&first, password, &mut Rar50KeyCache::default())?.0)
     } else {
         None
     };
@@ -1654,10 +1689,11 @@ fn parse_file_encryption_record(input: &[u8], range: Range<usize>) -> Result<Fil
 fn parse_archive_encryption_header(
     parsed: &ParsedBlockHeader,
     password: Option<&[u8]>,
+    key_cache: &mut Rar50KeyCache,
 ) -> Result<(Rar50Keys, bool)> {
     #[cfg(not(feature = "encryption"))]
     {
-        let _ = (parsed, password);
+        let _ = (parsed, password, key_cache);
         Err(Error::FeatureDisabled {
             feature: "encryption",
         })
@@ -1689,7 +1725,7 @@ fn parse_archive_encryption_header(
                 "RAR 5 archive encryption header has trailing bytes",
             ));
         }
-        let keys = Rar50Keys::derive(password, salt, kdf_count).map_err(map_rar50_crypto_error)?;
+        let keys = key_cache.get_or_derive(password, salt, kdf_count)?;
         if let Some(check_value) = check_value {
             keys.check_password(&check_value)
                 .map_err(map_rar50_crypto_error)?;
@@ -1698,10 +1734,14 @@ fn parse_archive_encryption_header(
     }
 }
 
-fn attach_file_crypto(file: &mut FileHeader, password: Option<&[u8]>) -> Result<()> {
+fn attach_file_crypto(
+    file: &mut FileHeader,
+    password: Option<&[u8]>,
+    key_cache: &mut Rar50KeyCache,
+) -> Result<()> {
     #[cfg(not(feature = "encryption"))]
     {
-        let _ = (file, password);
+        let _ = (file, password, key_cache);
         Ok(())
     }
     #[cfg(feature = "encryption")]
@@ -1726,8 +1766,7 @@ fn attach_file_crypto(file: &mut FileHeader, password: Option<&[u8]>) -> Result<
                 feature: "RAR 5 unknown file encryption version",
             });
         }
-        let keys = Rar50Keys::derive(password, encryption.salt, encryption.kdf_count)
-            .map_err(map_rar50_crypto_error)?;
+        let keys = key_cache.get_or_derive(password, encryption.salt, encryption.kdf_count)?;
         if let Some(check_value) = encryption.check_value {
             keys.check_password(&check_value)
                 .map_err(map_rar50_crypto_error)?;
@@ -1740,7 +1779,11 @@ fn attach_file_crypto(file: &mut FileHeader, password: Option<&[u8]>) -> Result<
     }
 }
 
-fn attach_service_crypto(service: &mut FileHeader, password: Option<&[u8]>) -> Result<()> {
+fn attach_service_crypto(
+    service: &mut FileHeader,
+    password: Option<&[u8]>,
+    key_cache: &mut Rar50KeyCache,
+) -> Result<()> {
     // WinRAR can emit encrypted QO metadata whose service-local password
     // check does not validate with the archive password. QuickOpen is an
     // optional cache, so keep archive parsing and file extraction independent
@@ -1748,7 +1791,41 @@ fn attach_service_crypto(service: &mut FileHeader, password: Option<&[u8]>) -> R
     if service.name == b"QO" {
         return Ok(());
     }
-    attach_file_crypto(service, password)
+    attach_file_crypto(service, password, key_cache)
+}
+
+#[cfg(feature = "encryption")]
+type CachedRar50Key = std::sync::Arc<std::sync::OnceLock<Result<Rar50Keys>>>;
+
+/// One password's keys, initialized once per salt/count without serializing distinct keys.
+#[derive(Default)]
+pub(crate) struct Rar50KeyCache {
+    #[cfg(feature = "encryption")]
+    entries: std::sync::Mutex<std::collections::HashMap<([u8; 16], u8), CachedRar50Key>>,
+}
+
+#[cfg(feature = "encryption")]
+impl Rar50KeyCache {
+    pub(crate) fn get_or_derive(
+        &self,
+        password: &[u8],
+        salt: [u8; 16],
+        kdf_count: u8,
+    ) -> Result<Rar50Keys> {
+        // Only lookup is serialized. Slots stay at fixed addresses, so growing
+        // the map moves pointers rather than leaving key copies in old storage.
+        let slot = self
+            .entries
+            .lock()
+            .map_err(|_| std::io::Error::other("RAR 5 key cache lock poisoned"))?
+            .entry((salt, kdf_count))
+            .or_default()
+            .clone();
+        slot.get_or_init(|| {
+            Rar50Keys::derive(password, salt, kdf_count).map_err(map_rar50_crypto_error)
+        })
+        .clone()
+    }
 }
 
 #[cfg(feature = "encryption")]
@@ -1781,6 +1858,7 @@ fn read_array_at<const N: usize>(input: &[u8], pos: &mut usize, end: usize) -> R
 fn parse_archive_blocks<F, G>(
     archive_len: usize,
     options: crate::ArchiveReadOptions<'_>,
+    key_cache: &mut Rar50KeyCache,
     mut read_block: F,
     mut read_encrypted_block: G,
 ) -> Result<(MainHeader, Vec<Block>)>
@@ -1800,7 +1878,7 @@ where
     let first = read_block(pos, &mut budget).map_err(|error| at_offset(error, pos))?;
     let (header_keys, header_metadata_complete) = if first.block.header_type == HEAD_CRYPT {
         pos = first.next_offset;
-        let (keys, complete) = parse_archive_encryption_header(&first, password)?;
+        let (keys, complete) = parse_archive_encryption_header(&first, password, key_cache)?;
         (Some(keys), complete)
     } else {
         (None, true)
@@ -1835,13 +1913,14 @@ where
             HEAD_FILE => {
                 let mut file =
                     parse_file_header_bytes(&parsed).map_err(|error| at_offset(error, pos))?;
-                attach_file_crypto(&mut file, password).map_err(|error| at_offset(error, pos))?;
+                attach_file_crypto(&mut file, password, key_cache)
+                    .map_err(|error| at_offset(error, pos))?;
                 blocks.push(Block::File(file));
             }
             HEAD_SERVICE => {
                 let mut service =
                     parse_file_header_bytes(&parsed).map_err(|error| at_offset(error, pos))?;
-                attach_service_crypto(&mut service, password)
+                attach_service_crypto(&mut service, password, key_cache)
                     .map_err(|error| at_offset(error, pos))?;
                 blocks.push(Block::Service(service));
             }
@@ -2484,7 +2563,8 @@ mod tests {
             let mut file = archive.files().next().unwrap().clone();
             file.encrypted = true;
             file.encryption = Some(plain.clone());
-            attach_file_crypto(&mut file, Some(b"password")).unwrap();
+            attach_file_crypto(&mut file, Some(b"password"), &mut Rar50KeyCache::default())
+                .unwrap();
             assert!(file.crypto.is_some());
 
             let mut unsupported = archive.files().next().unwrap().clone();
@@ -2494,7 +2574,11 @@ mod tests {
                 ..plain
             });
             assert!(matches!(
-                attach_file_crypto(&mut unsupported, Some(b"password")),
+                attach_file_crypto(
+                    &mut unsupported,
+                    Some(b"password"),
+                    &mut Rar50KeyCache::default()
+                ),
                 Err(Error::UnsupportedFeature {
                     feature: "RAR 5 unknown file encryption version",
                     ..
@@ -3168,7 +3252,11 @@ mod tests {
                     let parsed = parse(&header).unwrap();
                     assert!(
                         matches!(
-                            parse_archive_encryption_header(&parsed, Some(b"pw")),
+                            parse_archive_encryption_header(
+                                &parsed,
+                                Some(b"pw"),
+                                &mut Rar50KeyCache::default()
+                            ),
                             Err(Error::TooShort)
                         ),
                         "flags {flags}, end {end}"
@@ -3176,11 +3264,20 @@ mod tests {
                 }
                 if flags == 0 {
                     let header = image(&body);
-                    parse_archive_encryption_header(&parse(&header).unwrap(), Some(b"pw")).unwrap();
+                    parse_archive_encryption_header(
+                        &parse(&header).unwrap(),
+                        Some(b"pw"),
+                        &mut Rar50KeyCache::default(),
+                    )
+                    .unwrap();
                     body.push(0);
                     let header = image(&body);
                     assert!(matches!(
-                        parse_archive_encryption_header(&parse(&header).unwrap(), Some(b"pw")),
+                        parse_archive_encryption_header(
+                            &parse(&header).unwrap(),
+                            Some(b"pw"),
+                            &mut Rar50KeyCache::default(),
+                        ),
                         Err(Error::InvalidHeader(
                             "RAR 5 archive encryption header has trailing bytes"
                         ))
@@ -3768,7 +3865,7 @@ mod tests {
         file.encrypted = true;
         file.encryption = None;
         assert!(matches!(
-            attach_file_crypto(&mut file, Some(b"pw")),
+            attach_file_crypto(&mut file, Some(b"pw"), &mut Rar50KeyCache::default()),
             Err(Error::InvalidHeader(
                 "RAR 5 encrypted file is missing encryption record"
             ))
@@ -3782,7 +3879,7 @@ mod tests {
             check_value: Some([0; 12]),
         });
         assert!(matches!(
-            attach_file_crypto(&mut file, Some(b"pw")),
+            attach_file_crypto(&mut file, Some(b"pw"), &mut Rar50KeyCache::default()),
             Err(Error::UnsupportedFeature {
                 feature: "RAR 5 KDF count",
                 ..
@@ -3791,11 +3888,11 @@ mod tests {
         file.encryption.as_mut().unwrap().kdf_count = 0;
         // WinRAR 5.21 and earlier wrote an all-zero password check, which
         // deliberately defers verification to the data checksum.
-        attach_file_crypto(&mut file, Some(b"pw")).unwrap();
+        attach_file_crypto(&mut file, Some(b"pw"), &mut Rar50KeyCache::default()).unwrap();
         let mut bad_check = file.clone();
         bad_check.encryption.as_mut().unwrap().check_value = Some([1; 12]);
         assert!(matches!(
-            attach_file_crypto(&mut bad_check, Some(b"pw")),
+            attach_file_crypto(&mut bad_check, Some(b"pw"), &mut Rar50KeyCache::default()),
             Err(Error::WrongPasswordOrCorruptData)
         ));
     }

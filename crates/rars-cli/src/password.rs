@@ -1,5 +1,5 @@
 use crate::{CliError, CliResult};
-use rars::{Archive as DetectedArchive, ArchiveReader, Error};
+use rars::{Archive as DetectedArchive, ArchiveReader, Error, ReadSession};
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -91,13 +91,49 @@ pub(crate) fn parse_archives_prompting(
     password: &mut Option<Password>,
     settings: &crate::cli::ReadOptionsArgs,
 ) -> CliResult<Vec<DetectedArchive>> {
-    let mut archives = Vec::new();
-    for path in paths {
-        archives.push(read_archive_path_prompting_with_options(
-            path, password, settings,
-        )?);
-    }
+    let mut archives = Vec::with_capacity(paths.len());
+    for_each_archive_prompting(paths, password, settings, |_, archive, _| {
+        archives.push(archive);
+        Ok(())
+    })?;
     Ok(archives)
+}
+
+/// Shares one session per password so a volume set derives its key once.
+pub(crate) fn for_each_archive_prompting(
+    paths: &[PathBuf],
+    password: &mut Option<Password>,
+    settings: &crate::cli::ReadOptionsArgs,
+    mut each: impl FnMut(&Path, DetectedArchive, Option<&[u8]>) -> CliResult<()>,
+) -> CliResult<()> {
+    let mut next = 0;
+    while next < paths.len() {
+        let refused = {
+            let bytes = password_bytes(password);
+            let mut session = ReadSession::new(settings.options(bytes, None));
+            let mut refused = None;
+            for path in &paths[next..] {
+                match session.read_path(path) {
+                    Ok(archive) => {
+                        next += 1;
+                        each(path, archive, bytes)?;
+                    }
+                    Err(error) if bytes.is_none() && error_needs_password(&error) => {
+                        refused = Some(error);
+                        break;
+                    }
+                    Err(error) => return Err(read_archive_cli_error(path, error)),
+                }
+            }
+            refused
+        };
+        let Some(error) = refused else { break };
+        match prompt_password_if_tty()? {
+            Some(prompted) => *password = Some(prompted),
+            None => return Err(read_archive_cli_error(&paths[next], error)),
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn ensure_password_for_archives_extract(

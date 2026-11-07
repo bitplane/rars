@@ -27,7 +27,7 @@ use output::{
 };
 use password::{
     classify_rars_error, ensure_password_for_archives_extract, ensure_password_for_extract,
-    error_is_password_class, parse_archives_prompting, password_bytes,
+    error_is_password_class, for_each_archive_prompting, parse_archives_prompting, password_bytes,
     read_archive_path_prompting_with_options, resolve_password, Password,
 };
 use progress::CliProgress;
@@ -166,51 +166,51 @@ fn display_bytes_lossy(bytes: &[u8]) -> String {
 fn cmd_info(args: InfoArgs) -> CliResult<()> {
     let scratch = args.read_options.scratch();
     let mut password = resolve_password_args(&args.password)?;
-    for path in &args.paths {
-        let archive =
-            read_archive_path_prompting_with_options(path, &mut password, &args.read_options)?;
-        let path_display = path.to_string_lossy();
-        let path = path_display.as_ref();
-        let family = archive.family();
-        if args.verbose {
-            println!("{path}: {family:?} at offset {}", archive.sfx_offset());
-        } else {
-            print_terse_header(path, &archive);
-        }
-        let options = args
-            .read_options
-            .options(password_bytes(&password), scratch.as_ref());
-        match archive {
-            DetectedArchive::Rar13(archive) => {
-                if args.verbose {
-                    info_rar13_verbose(path, &archive, options)?;
-                } else {
-                    info_rar13_terse(path, &archive, options)?;
+    for_each_archive_prompting(
+        &args.paths,
+        &mut password,
+        &args.read_options,
+        |path, archive, password| {
+            let path_display = path.to_string_lossy();
+            let path = path_display.as_ref();
+            let family = archive.family();
+            if args.verbose {
+                println!("{path}: {family:?} at offset {}", archive.sfx_offset());
+            } else {
+                print_terse_header(path, &archive);
+            }
+            let options = args.read_options.options(password, scratch.as_ref());
+            match archive {
+                DetectedArchive::Rar13(archive) => {
+                    if args.verbose {
+                        info_rar13_verbose(path, &archive, options)?;
+                    } else {
+                        info_rar13_terse(path, &archive, options)?;
+                    }
+                }
+                DetectedArchive::Rar15To40(archive) => {
+                    if args.verbose {
+                        info_rar15_40_verbose(path, &archive, options)?;
+                    } else {
+                        info_rar15_40_terse(path, &archive, options)?;
+                    }
+                }
+                DetectedArchive::Rar50Plus(archive) => {
+                    if args.verbose {
+                        info_rar50_verbose(path, &archive, options)?;
+                    } else {
+                        info_rar50_terse(path, &archive, options)?;
+                    }
+                }
+                _ => {
+                    return Err(CliError::general(format!(
+                        "archive family {family:?} is not handled by info output"
+                    )));
                 }
             }
-            DetectedArchive::Rar15To40(archive) => {
-                if args.verbose {
-                    info_rar15_40_verbose(path, &archive, options)?;
-                } else {
-                    info_rar15_40_terse(path, &archive, options)?;
-                }
-            }
-            DetectedArchive::Rar50Plus(archive) => {
-                if args.verbose {
-                    info_rar50_verbose(path, &archive, options)?;
-                } else {
-                    info_rar50_terse(path, &archive, options)?;
-                }
-            }
-            _ => {
-                return Err(CliError::general(format!(
-                    "archive family {family:?} is not handled by info output"
-                )));
-            }
-        }
-    }
-
-    Ok(())
+            Ok(())
+        },
+    )
 }
 
 fn print_terse_header(path: &str, archive: &DetectedArchive) {
