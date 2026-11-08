@@ -104,6 +104,8 @@ pub enum Error {
     },
     /// Skipping payload decoding would leave solid history unavailable.
     CannotSkipSolidMember,
+    /// An earlier member of this solid chain failed, so its history is gone.
+    BrokenSolidChain,
     UnsupportedFeature {
         version: ArchiveVersion,
         feature: &'static str,
@@ -256,6 +258,9 @@ impl std::fmt::Display for Error {
             Self::UnsupportedVersion(version) => write!(f, "unsupported version: {version}"),
             Self::FeatureDisabled { feature } => write!(f, "Cargo feature {feature} is disabled"),
             Self::CannotSkipSolidMember => write!(f, "cannot skip file data in a solid archive"),
+            Self::BrokenSolidChain => {
+                write!(f, "an earlier member of this solid archive failed to extract")
+            }
             Self::UnsupportedFeature { version, feature } => {
                 write!(f, "feature {feature} is not supported by {version}")
             }
@@ -430,6 +435,7 @@ impl Error {
             Self::FeatureDisabled { .. }
             | Self::Rar50Crypto(crate::crypto::rar50::Error::FeatureDisabled)
             | Self::CannotSkipSolidMember
+            | Self::BrokenSolidChain
             | Self::UnsupportedFeature { .. }
             | Self::UnsupportedFamilyFeature { .. }
             | Self::UnsupportedCompression { .. }
@@ -616,6 +622,12 @@ mod tests {
             ErrorKind::UnsupportedFeature
         );
         assert!(Error::CannotSkipSolidMember.entry_context().is_none());
+        // The archive may be fine: the earlier member could have failed on
+        // its sink or been cancelled.
+        assert_eq!(
+            Error::BrokenSolidChain.kind(),
+            ErrorKind::UnsupportedFeature
+        );
     }
 
     #[test]

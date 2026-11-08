@@ -138,7 +138,7 @@ fn streaming_match_crosses_both_wrapped_history_slices_and_multiple_flushes() {
     assert_eq!(chunks, [STREAM_FLUSH_THRESHOLD, STREAM_FLUSH_THRESHOLD, 40]);
     assert_eq!(output.written(), decoded.len());
     assert_eq!(
-        output.into_history().into_vec(),
+        output.into_history().into_buffer().into_vec(),
         decoded[decoded.len() - 16..]
     );
 }

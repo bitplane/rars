@@ -77,7 +77,7 @@ fn reader_workspace_refusals_release_streaming_history_and_input() {
         match result {
             Ok(()) => {
                 assert_eq!(emitted, data.len());
-                assert_eq!(&*state.history, &data[data.len() - 1024..]);
+                assert_eq!(state.history_bytes(), &data[data.len() - 1024..]);
                 Ok(())
             }
             Err(StreamDecodeError::Decode(error)) => Err(error),
@@ -4709,8 +4709,11 @@ fn streaming_reader_history_capacity_follows_the_active_dictionary() {
         )
         .unwrap();
     assert_eq!(decoded, data);
-    assert_eq!(&*decoder.state.history, &data[data.len() - 1024..][..]);
-    assert!(decoder.state.history.capacity() <= 1024 + 1024 / 4);
+    assert_eq!(
+        decoder.state.history_bytes(),
+        &data[data.len() - 1024..][..]
+    );
+    assert!(decoder.state.history_capacity() <= 1024 + 1024 / 4);
     let next = b"next solid member";
     let packed = encode_literal_only(next, 0).unwrap();
     decoder
@@ -4723,8 +4726,8 @@ fn streaming_reader_history_capacity_follows_the_active_dictionary() {
             |_| Ok::<(), std::convert::Infallible>(()),
         )
         .unwrap();
-    assert_eq!(&*decoder.state.history, &next[next.len() - 8..][..]);
-    assert!(decoder.state.history.capacity() <= 8 + 8 / 4);
+    assert_eq!(decoder.state.history_bytes(), &next[next.len() - 8..][..]);
+    assert!(decoder.state.history_capacity() <= 8 + 8 / 4);
 }
 
 #[test]
@@ -4757,7 +4760,7 @@ fn streaming_decoder_history_is_capped_without_reordering() {
         )
         .unwrap();
     assert_eq!(decoded, b"ABBA");
-    assert_eq!(&*decoder.state.history, &b"ABBA"[..]);
+    assert_eq!(decoder.state.history_bytes(), &b"ABBA"[..]);
 
     decoded.clear();
     decoder
@@ -4779,7 +4782,7 @@ fn streaming_decoder_history_is_capped_without_reordering() {
         )
         .unwrap();
     assert_eq!(decoded, b"BAAB");
-    assert_eq!(&*decoder.state.history, &b"BABAAB"[..]);
+    assert_eq!(decoder.state.history_bytes(), &b"BABAAB"[..]);
 }
 
 #[test]
@@ -4810,7 +4813,7 @@ fn solid_streaming_decoder_trims_inherited_history_before_member() {
         .unwrap();
 
     assert_eq!(decoded, b"AB");
-    assert_eq!(&*decoder.state.history, &b"56AB"[..]);
+    assert_eq!(decoder.state.history_bytes(), &b"56AB"[..]);
 }
 
 #[test]
@@ -5576,7 +5579,7 @@ fn streaming_output_rejects_overruns_without_partial_emission() {
     assert!(emitted.borrow().is_empty());
     zeroes.push_zeroes(1, &mut sink).unwrap();
     assert_eq!(&*emitted.borrow(), &[0]);
-    assert_eq!(zeroes.into_history().into_vec(), [0]);
+    assert_eq!(zeroes.into_history().into_buffer().into_vec(), [0]);
 }
 
 #[test]
@@ -5774,7 +5777,7 @@ fn streaming_zero_history_emits_large_match_without_materializing_it() {
         .unwrap();
     assert_eq!(chunks, [(0, 100_000)]);
     assert_eq!(output.written(), 100_000);
-    assert_eq!(output.into_history().into_vec(), [0, 0]);
+    assert_eq!(output.into_history().into_buffer().into_vec(), [0, 0]);
 }
 
 #[test]
@@ -5803,7 +5806,7 @@ fn streaming_match_keeps_its_window_across_flushes() {
             .collect::<Vec<_>>()
     );
     assert!(output.history.capacity() <= 3);
-    assert_eq!(output.into_history().into_vec(), b"abc");
+    assert_eq!(output.into_history().into_buffer().into_vec(), b"abc");
 }
 
 #[test]

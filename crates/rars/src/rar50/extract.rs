@@ -1181,6 +1181,8 @@ struct DecoderSession<'a, B: Budget = Allowance> {
     shared_key_cache: Option<&'a super::Rar50KeyCache>,
     buffered_decode_limit: u64,
     scratch: Option<&'a crate::Rar50Scratch>,
+    // Set by a failed compressed member; a solid successor has no history.
+    solid_chain_broken: bool,
 }
 
 impl<'a, B: Budget> DecoderSession<'a, B> {
@@ -1197,7 +1199,21 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
             shared_key_cache: None,
             buffered_decode_limit,
             scratch: None,
+            solid_chain_broken: false,
         }
+    }
+
+    fn guard_solid_chain<T>(
+        &mut self,
+        file: &FileHeader,
+        decode: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        if file.compression_info & 0x40 != 0 && self.solid_chain_broken {
+            return Err(file.entry_error("decoding", Error::BrokenSolidChain));
+        }
+        let result = decode(self);
+        self.solid_chain_broken = result.is_err();
+        result
     }
 
     fn write_file_to(
@@ -1226,18 +1242,20 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
                 &self.allowance,
             );
         }
-        if file.should_stream_decode(self.buffered_decode_limit) {
-            return self.stream_file_to(archive, file, writer);
-        }
-        let decoded = self
-            .decoded_file_data(archive, file, history)
-            .map_err(|error| file.entry_error("decoding", error))?;
-        file.verify_integrity_with_keys(&decoded.data, decoded.keys.as_ref())
-            .map_err(|error| file.entry_error("verifying", error))?;
-        writer
-            .write_all(&decoded.data)
-            .map_err(Error::from)
-            .map_err(|error| file.entry_error("writing", error))
+        self.guard_solid_chain(file, |session| {
+            if file.should_stream_decode(session.buffered_decode_limit) {
+                return session.stream_file_to(archive, file, writer);
+            }
+            let decoded = session
+                .decoded_file_data(archive, file, history)
+                .map_err(|error| file.entry_error("decoding", error))?;
+            file.verify_integrity_with_keys(&decoded.data, decoded.keys.as_ref())
+                .map_err(|error| file.entry_error("verifying", error))?;
+            writer
+                .write_all(&decoded.data)
+                .map_err(Error::from)
+                .map_err(|error| file.entry_error("writing", error))
+        })
     }
 
     fn stream_file_to(
@@ -1249,7 +1267,7 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
         // Read just the solid flag here; full header validation stays in decode.
         let mut streaming_decoder = self
             .decoder
-            .try_prepare_for_stream(file.compression_info & 0x40 != 0, file.unpacked_size)?;
+            .take_for_stream(file.compression_info & 0x40 != 0, file.unpacked_size)?;
         let (mut packed, keys) = file
             .packed_reader_with_allowance(
                 archive,
@@ -1301,14 +1319,32 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
         Ok(decryptor)
     }
 
-    fn decode_split(
+    fn write_split_to(
         &mut self,
         volumes: &[Archive],
         split: &PendingSplitRefs<B>,
         final_file: &FileHeader,
         decryptor: Option<&SplitDecryptor>,
-    ) -> Result<Buffer<u8, B>> {
-        final_file.decode_split_with_decoder(volumes, split, &mut self.decoder, decryptor)
+        writer: &mut dyn Write,
+    ) -> Result<()> {
+        self.guard_solid_chain(final_file, |session| {
+            if final_file.should_stream_decode(session.buffered_decode_limit) {
+                return session
+                    .stream_split_to(volumes, split, final_file, decryptor, writer)
+                    .map_err(|error| final_file.entry_error("decoding", error));
+            }
+            let data = final_file
+                .decode_split_with_decoder(volumes, split, &mut session.decoder, decryptor)
+                .map_err(|error| final_file.entry_error("decoding", error))?;
+            final_file
+                .verify_integrity_with_keys(&data, decryptor.map(|decryptor| &decryptor.keys))
+                .map_err(|error| split.checksum_error(volumes).unwrap_or(error))
+                .map_err(|error| final_file.entry_error("verifying", error))?;
+            writer
+                .write_all(&data)
+                .map_err(Error::from)
+                .map_err(|error| final_file.entry_error("writing", error))
+        })
     }
 
     fn stream_split_to(
@@ -1319,10 +1355,8 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
         decryptor: Option<&SplitDecryptor>,
         writer: &mut dyn Write,
     ) -> Result<()> {
-        // Keep solid state only after successful emission and integrity checks,
-        // just as for a non-split streaming member.
         self.decoder.read_control.check()?;
-        let mut decoder = self.decoder.try_prepare_for_stream(
+        let mut decoder = self.decoder.take_for_stream(
             final_file.compression_info & 0x40 != 0,
             final_file.unpacked_size,
         )?;
@@ -1658,27 +1692,7 @@ impl<B: Budget> PendingSplitRefs<B> {
                     .map_err(|error| final_file.entry_error("extracting", error));
             }
 
-            if final_file.should_stream_decode(session.buffered_decode_limit) {
-                return session
-                    .stream_split_to(volumes, &self, final_file, decryptor.as_ref(), &mut writer)
-                    .map_err(|error| final_file.entry_error("decoding", error));
-            }
-
-            let data = session
-                .decode_split(volumes, &self, final_file, decryptor.as_ref())
-                .map_err(|error| final_file.entry_error("decoding", error))?;
-            final_file
-                .verify_integrity_with_keys(
-                    &data,
-                    decryptor.as_ref().map(|decryptor| &decryptor.keys),
-                )
-                .map_err(|error| self.checksum_error(volumes).unwrap_or(error))
-                .map_err(|error| final_file.entry_error("verifying", error))?;
-            writer
-                .write_all(&data)
-                .map_err(Error::from)
-                .map_err(|error| final_file.entry_error("writing", error))?;
-            Ok(())
+            session.write_split_to(volumes, &self, final_file, decryptor.as_ref(), &mut writer)
         })
     }
 
@@ -2352,10 +2366,8 @@ mod tests {
     }
 
     #[test]
-    fn streaming_checkpoint_rolls_back_sink_cancellation_and_integrity_failures() {
+    fn failed_member_breaks_the_solid_chain_until_an_independent_member() {
         let mut word = 0x1234_5678u32;
-        // Avoid a period aligned with the 64 KiB flush: appending or resetting
-        // to the first failed flush must change the successor's match bytes.
         let seed: Vec<_> = (0..32749)
             .map(|_| {
                 word ^= word << 13;
@@ -2410,8 +2422,14 @@ mod tests {
             }
         }
 
-        for failure in ["sink", "cancellation", "integrity"] {
-            let mut session = DecoderSession::with_allowance(None, 0, &Allowance::default());
+        for (limit, failure) in [
+            (0, "sink"),
+            (0, "cancellation"),
+            (0, "integrity"),
+            (u64::MAX, "sink"),
+            (u64::MAX, "integrity"),
+        ] {
+            let mut session = DecoderSession::with_allowance(None, limit, &Allowance::default());
             session
                 .write_file_to(&archive, files[0], &mut std::io::sink())
                 .unwrap();
@@ -2448,40 +2466,22 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
-            // The successor references the old, nonperiodic raw dictionary.
-            // A failed checkpoint must not have reset or appended to it.
+            let error = session
+                .write_file_to(&archive, files[1], &mut std::io::sink())
+                .unwrap_err();
+            assert!(
+                matches!(error.root_cause(), Error::BrokenSolidChain),
+                "limit={limit}, after {failure}: {error}"
+            );
+
+            session
+                .write_file_to(&archive, files[0], &mut std::io::sink())
+                .unwrap();
             let mut decoded = Vec::new();
             session
                 .write_file_to(&archive, files[1], &mut decoded)
                 .unwrap();
-            assert_eq!(decoded, next_data, "after {failure}");
-        }
-
-        // Prove the successor detects the two erroneous history states that
-        // the failed first flush could publish, rather than accepting a fixture
-        // whose repeating phase accidentally masks a broken checkpoint.
-        let prefix = &first_data[..64 * 1024];
-        let packed_prefix = crate::codec::rar50::encode_literal_only(prefix, 0).unwrap();
-        for appended in [false, true] {
-            let mut session = DecoderSession::with_allowance(None, 0, &Allowance::default());
-            session
-                .write_file_to(&archive, files[0], &mut std::io::sink())
-                .unwrap();
-            session
-                .decoder
-                .decode_member_from_reader_with_dictionary_to_sink(
-                    &mut packed_prefix.as_slice(),
-                    0,
-                    prefix.len(),
-                    4 * 1024 * 1024,
-                    appended,
-                    |_| Ok::<(), std::convert::Infallible>(()),
-                )
-                .unwrap();
-            let error = session
-                .write_file_to(&archive, files[1], &mut std::io::sink())
-                .unwrap_err();
-            assert_eq!(error.kind(), crate::ErrorKind::ChecksumMismatch);
+            assert_eq!(decoded, next_data, "limit={limit}, after {failure}");
         }
     }
 
@@ -4402,30 +4402,5 @@ mod key_cache_tests {
                 0
             );
         }
-    }
-
-    #[test]
-    fn streaming_workspace_refusal_precedes_key_derivation() {
-        let archive = archive();
-        let mut file = archive.files().next().unwrap().clone();
-        file.compression_info = (1 << 7) | 0x40;
-        let budget = Allowance::limited(1024 * 1024);
-        let mut session = DecoderSession::with_allowance(Some(b"wrong"), 0, &budget);
-        let packed = crate::codec::rar50::encode_literal_only(b"history", 0).unwrap();
-        session
-            .decoder
-            .decode_member(&packed, 0, 7, false, DecodeMode::Lz)
-            .unwrap();
-        let _held =
-            Buffer::filled((budget.limit() - budget.used()) as usize, 0u8, &budget).unwrap();
-        let before = crate::crypto::rar50::DERIVATIONS.with(std::cell::Cell::get);
-        let error = session
-            .write_file_to(&archive, &file, &mut std::io::sink())
-            .unwrap_err();
-        assert_eq!(error.kind(), crate::ErrorKind::ResourceLimit);
-        assert_eq!(
-            crate::crypto::rar50::DERIVATIONS.with(std::cell::Cell::get) - before,
-            0
-        );
     }
 }

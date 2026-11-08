@@ -17,7 +17,7 @@ pub(crate) use encoder::{
 };
 
 use super::filters::{self, DeltaErrorMessages};
-use super::workspace::{Allowance, Budget, Buffer};
+use super::workspace::{Allowance, Budget, Buffer, Deque};
 use super::{Error, Result};
 use std::io::Read;
 use std::ops::Range;
@@ -576,6 +576,8 @@ pub(crate) struct ReaderState<B: Budget> {
     reps: [usize; 4],
     last_length: usize,
     history: Buffer<u8, B>,
+    // A streamed member's history, kept as is so the next stream reuses it.
+    streamed_history: Option<Deque<u8, B>>,
     // Only this tail is reachable. Older bytes may remain as physical slack.
     history_window: usize,
 }
@@ -591,13 +593,35 @@ impl<B: Budget> ReaderState<B> {
             reps: [0; 4],
             last_length: 0,
             history: Buffer::new(allowance),
+            streamed_history: None,
             history_window: 0,
         }
     }
 
+    fn flatten_streamed_history(&mut self) {
+        if let Some(history) = self.streamed_history.take() {
+            self.history = history.into_buffer();
+        }
+    }
+
     fn reachable_history(&self) -> &[u8] {
+        debug_assert!(self.streamed_history.is_none());
         debug_assert!(self.history_window <= self.history.len());
         &self.history[self.history.len() - self.history_window..]
+    }
+
+    #[cfg(all(test, feature = "write"))]
+    fn history_bytes(&self) -> Vec<u8> {
+        match &self.streamed_history {
+            Some(history) => history.iter().copied().collect(),
+            None => self.reachable_history().to_vec(),
+        }
+    }
+
+    fn history_capacity(&self) -> usize {
+        self.streamed_history
+            .as_ref()
+            .map_or(self.history.capacity(), |history| history.capacity())
     }
 
     #[cfg(test)]
@@ -609,32 +633,6 @@ impl<B: Budget> ReaderState<B> {
     }
 
     pub(crate) fn try_clone(&self) -> Result<Self> {
-        self.try_clone_with_spare_capacity(false)
-    }
-
-    pub(crate) fn try_prepare_for_stream(&self, solid: bool, output_size: u64) -> Result<Self> {
-        if solid {
-            self.try_clone_with_spare_capacity(!B::LIMITED)
-        } else {
-            // Match reset() without copying history or tables that it discards.
-            // Keep the original state alive until output and integrity succeed.
-            let mut decoder = Self::new(&self.allowance());
-            decoder.read_control = self.read_control.clone();
-            if !B::LIMITED {
-                // Preserve useful capacity without copying bytes. Cap it by the
-                // next member's size so small members shed large old buffers.
-                // StreamingOutput still handles a smaller dictionary as before.
-                let capacity = self
-                    .history
-                    .capacity()
-                    .min(usize::try_from(output_size).unwrap_or(usize::MAX));
-                decoder.history = Buffer::with_capacity(capacity, &self.allowance())?;
-            }
-            Ok(decoder)
-        }
-    }
-
-    fn try_clone_with_spare_capacity(&self, preserve_capacity: bool) -> Result<Self> {
         Ok(Self {
             read_control: self.read_control.clone(),
             tables: self
@@ -645,23 +643,39 @@ impl<B: Budget> ReaderState<B> {
             reps: self.reps,
             last_length: self.last_length,
             history_window: self.history_window,
-            history: if preserve_capacity {
-                // Solid streaming checkpoints otherwise discard geometric spare
-                // capacity and grow again after each member. Keep the capacity
-                // so a run of small members reuses a few allocation sizes.
-                let mut history =
-                    Buffer::with_capacity(self.history.capacity(), &self.history.allowance())?;
-                history
-                    .extend_from_slice(self.reachable_history())
-                    .map_err(Into::into)?;
-                history
-            } else {
-                // Slack is not reachable history and need not be checkpointed.
-                // Bounded histories have no slack, preserving their old charge.
-                Buffer::copied(self.reachable_history(), &self.history.allowance())?
+            history: match &self.streamed_history {
+                Some(streamed) => {
+                    let (front, back) = streamed.as_slices();
+                    let mut history = Buffer::with_capacity(streamed.len(), &streamed.allowance())?;
+                    history.extend_from_slice(front).map_err(Into::into)?;
+                    history.extend_from_slice(back).map_err(Into::into)?;
+                    history
+                }
+                // Slack is not reachable history and need not be copied.
+                None => Buffer::copied(self.reachable_history(), &self.history.allowance())?,
             },
+            streamed_history: None,
         })
     }
+
+    /// Solid state moves rather than copies, so a failed decode loses the chain.
+    pub(crate) fn take_for_stream(&mut self, solid: bool, output_size: u64) -> Result<Self> {
+        let mut decoder = Self::new(&self.allowance());
+        decoder.read_control = self.read_control.clone();
+        if solid {
+            return Ok(std::mem::replace(self, decoder));
+        }
+        if !B::LIMITED {
+            // Preserve useful capacity without copying bytes. Cap it by the
+            // next member's size so small members shed large old buffers.
+            let capacity = self
+                .history_capacity()
+                .min(usize::try_from(output_size).unwrap_or(usize::MAX));
+            decoder.history = Buffer::with_capacity(capacity, &self.allowance())?;
+        }
+        Ok(decoder)
+    }
+
     pub fn decode_member(
         &mut self,
         input: &[u8],
@@ -786,6 +800,7 @@ impl<B: Budget> ReaderState<B> {
         if !solid {
             self.reset();
         }
+        self.flatten_streamed_history();
 
         let allowance = self.history.allowance();
         let mut output =
@@ -998,19 +1013,25 @@ impl<B: Budget> ReaderState<B> {
         // reference instead of silently truncating the window at 64 MiB.
         let history_limit = dictionary_size;
         let retained = self.history_window.min(history_limit);
-        self.history.discard_prefix(self.history.len() - retained);
-        // The buffer is moved out below. Keep the empty state consistent even
+        let history = match self.streamed_history.take() {
+            Some(mut history) => {
+                history.discard_prefix(history.len() - retained);
+                history
+            }
+            None => {
+                self.history.discard_prefix(self.history.len() - retained);
+                let allowance = self.history.allowance();
+                Deque::from_buffer(std::mem::replace(
+                    &mut self.history,
+                    Buffer::new(&allowance),
+                ))
+            }
+        };
+        // The history is moved out. Keep the empty state consistent even
         // if streaming setup or decoding fails; callers checkpoint as needed.
         self.history_window = 0;
-        let mut output = StreamingOutput::new(
-            {
-                let allowance = self.history.allowance();
-                std::mem::replace(&mut self.history, Buffer::new(&allowance))
-            },
-            output_size,
-            dictionary_size,
-            history_limit,
-        )?;
+        let mut output =
+            StreamingOutput::new(history, output_size, dictionary_size, history_limit)?;
         output.stage.control = self.read_control.clone();
         let mut literals = [0; LITERAL_BURST];
 
@@ -1130,8 +1151,9 @@ impl<B: Budget> ReaderState<B> {
 
         if output.written() == output_size {
             output.finish(&mut sink)?;
-            self.history = output.into_history();
-            self.history_window = self.history.len();
+            let history = output.into_history();
+            self.history_window = history.len();
+            self.streamed_history = Some(history);
             Ok(())
         } else {
             Err(Error::NeedMoreInput.into())
@@ -1139,6 +1161,7 @@ impl<B: Budget> ReaderState<B> {
     }
 
     fn remember_history(&mut self, output: &[u8], dictionary_size: usize) -> Result<()> {
+        self.flatten_streamed_history();
         let incoming = &output[output.len().saturating_sub(dictionary_size)..];
         let keep = self.history_window.min(dictionary_size - incoming.len());
         let required = keep + incoming.len();
@@ -1187,6 +1210,9 @@ impl<B: Budget> ReaderState<B> {
         self.reps = [0; 4];
         self.last_length = 0;
         self.history.clear();
+        if let Some(history) = &mut self.streamed_history {
+            history.clear();
+        }
         self.history_window = 0;
     }
 
@@ -1292,7 +1318,7 @@ fn reader_history_capacity<B: Budget>(
 }
 
 struct StreamingOutput<B: Budget = Allowance> {
-    history: super::workspace::Deque<u8, B>,
+    history: Deque<u8, B>,
     pending: Buffer<u8, B>,
     stage: FilterStage<B>,
     written: usize,
@@ -1304,24 +1330,23 @@ struct StreamingOutput<B: Budget = Allowance> {
 
 impl<B: Budget> StreamingOutput<B> {
     fn new(
-        mut history: Buffer<u8, B>,
+        history: impl Into<Deque<u8, B>>,
         output_limit: usize,
         dictionary_size: usize,
         history_limit: usize,
     ) -> Result<Self> {
+        let mut history = history.into();
         if history.capacity() > reader_history_limit::<B>(history_limit) {
             let capacity =
                 reader_history_capacity::<B>(history.capacity(), history.len(), history_limit);
-            let mut replacement = Buffer::with_capacity(capacity, &history.allowance())?;
-            replacement
-                .extend_from_slice(&history)
-                .map_err(Into::into)?;
+            let mut replacement = Deque::with_capacity(capacity, &history.allowance())?;
+            replacement.extend_admitted(history.iter().copied());
             history = replacement;
         }
         let allowance = history.allowance();
         Ok(Self {
             all_zero: history.iter().all(|&byte| byte == 0),
-            history: super::workspace::Deque::from_buffer(history),
+            history,
             pending: Buffer::with_capacity(STREAM_FLUSH_THRESHOLD, &allowance)?,
             stage: FilterStage::new(&allowance),
             written: 0,
@@ -1538,8 +1563,7 @@ impl<B: Budget> StreamingOutput<B> {
         {
             let capacity =
                 reader_history_capacity::<B>(self.history.capacity(), required, self.history_limit);
-            let mut history =
-                super::workspace::Deque::with_capacity(capacity, &self.history.allowance())?;
+            let mut history = Deque::with_capacity(capacity, &self.history.allowance())?;
             history.extend_admitted(self.history.iter().skip(self.history.len() - keep).copied());
             history.extend_admitted(incoming.iter().copied());
             self.history = history;
@@ -1559,8 +1583,8 @@ impl<B: Budget> StreamingOutput<B> {
         self.stage.finish()
     }
 
-    fn into_history(self) -> Buffer<u8, B> {
-        self.history.into_buffer()
+    fn into_history(self) -> Deque<u8, B> {
+        self.history
     }
 }
 
