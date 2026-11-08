@@ -31,6 +31,8 @@ pub const LENGTH_TABLE_SIZE: usize = 44;
 const DEFAULT_DICTIONARY_SIZE: usize = 4 * 1024 * 1024;
 const MAX_INITIAL_OUTPUT_CAPACITY: usize = 1024 * 1024;
 const STREAM_FLUSH_THRESHOLD: usize = 64 * 1024;
+// Literals decoded per burst before the loop polls again.
+const LITERAL_BURST: usize = 256;
 /// The longest filter the streaming decoder holds back to apply in place:
 /// unrar's `MAX_FILTER_BLOCK_SIZE`. A longer one ends streaming with
 /// `StreamDecodeError::FilteredMember`, leaving the member to a caller that
@@ -226,7 +228,7 @@ pub fn read_level_lengths(input: &[u8]) -> Result<([u8; LEVEL_TABLE_SIZE], usize
             pos += 1;
         }
     }
-    Ok((lengths, bits.bit_pos))
+    Ok((lengths, bits.position()))
 }
 
 #[derive(Debug)]
@@ -295,8 +297,7 @@ fn read_table_lengths_with_allowance<B: Budget>(
     let table_size = table_length_count(algorithm_version)?;
     let (level_lengths, level_bits) = read_level_lengths(input)?;
     let level_decoder = HuffmanState::from_lengths(&level_lengths, allowance)?;
-    let mut bits = BitReader::new(input);
-    bits.bit_pos = level_bits;
+    let mut bits = BitReader::at(input, level_bits);
 
     let mut lengths = Buffer::with_capacity(table_size, allowance)?;
     while lengths.len() < table_size {
@@ -356,7 +357,7 @@ fn read_table_lengths_with_allowance<B: Budget>(
             align: Buffer::copied(&lengths[align_start..length_start], allowance)?,
             length: Buffer::copied(&lengths[length_start..], allowance)?,
         },
-        bits.bit_pos,
+        bits.position(),
     ))
 }
 
@@ -790,6 +791,7 @@ impl<B: Budget> ReaderState<B> {
         let mut output =
             Buffer::with_capacity(output_size.min(MAX_INITIAL_OUTPUT_CAPACITY), &allowance)?;
         let mut filters = Buffer::new(&allowance);
+        let mut literals = [0; LITERAL_BURST];
 
         loop {
             let block = read_compressed_block_with_allowance(input, &self.history.allowance())?;
@@ -811,15 +813,25 @@ impl<B: Budget> ReaderState<B> {
                 .tables
                 .take()
                 .ok_or(Error::InvalidData("RAR 5 block reuses missing tables"))?;
-            let mut bits = BitReader::new(payload);
-            bits.bit_pos = payload_bit_pos;
+            let mut bits = BitReader::at(payload, payload_bit_pos);
+            let payload_bits = block.header.payload_bits;
 
             let mut poller = self.read_control.poller();
-            while bits.bit_pos < block.header.payload_bits && output.len() < output_size {
+            while bits.position() < payload_bits && output.len() < output_size {
                 poller.check_codec(output.len())?;
                 let symbol = tables.main.decode(&mut bits)?;
                 match symbol {
-                    0..=255 => output.try_push(symbol as u8)?,
+                    0..=255 => {
+                        output.try_push(symbol as u8)?;
+                        let room = (output_size - output.len()).min(LITERAL_BURST);
+                        let count =
+                            bits.literal_burst(&tables.main, payload_bits, &mut literals[..room]);
+                        if count != 0 {
+                            output
+                                .extend_from_slice(&literals[..count])
+                                .map_err(Into::into)?;
+                        }
+                    }
                     256 if mode.uses_lz() => {
                         filters.try_push(read_filter(&mut bits, output.len())?)?;
                     }
@@ -1000,6 +1012,7 @@ impl<B: Budget> ReaderState<B> {
             history_limit,
         )?;
         output.stage.control = self.read_control.clone();
+        let mut literals = [0; LITERAL_BURST];
 
         loop {
             let block = read_compressed_block_with_allowance(input, &output.history.allowance())?;
@@ -1021,15 +1034,23 @@ impl<B: Budget> ReaderState<B> {
                 .tables
                 .take()
                 .ok_or(Error::InvalidData("RAR 5 block reuses missing tables"))?;
-            let mut bits = BitReader::new(payload);
-            bits.bit_pos = payload_bit_pos;
+            let mut bits = BitReader::at(payload, payload_bit_pos);
+            let payload_bits = block.header.payload_bits;
 
             let mut poller = self.read_control.poller();
-            while bits.bit_pos < block.header.payload_bits && output.written() < output_size {
+            while bits.position() < payload_bits && output.written() < output_size {
                 poller.check_codec(output.written())?;
                 let symbol = tables.main.decode(&mut bits)?;
                 match symbol {
-                    0..=255 => output.push(symbol as u8, &mut sink)?,
+                    0..=255 => {
+                        output.push(symbol as u8, &mut sink)?;
+                        let room = output.literal_room();
+                        let count =
+                            bits.literal_burst(&tables.main, payload_bits, &mut literals[..room]);
+                        if count != 0 {
+                            output.push_literals(&literals[..count], &mut sink)?;
+                        }
+                    }
                     256 => {
                         let filter = read_filter(&mut bits, output.written())?;
                         if filter
@@ -1327,6 +1348,34 @@ impl<B: Budget> StreamingOutput<B> {
         }
         self.pending.try_push(byte)?;
         self.written += 1;
+        if self.pending.len() >= STREAM_FLUSH_THRESHOLD {
+            self.flush(sink)?;
+        }
+        Ok(())
+    }
+
+    // None straight after a flush, so the decoder polls before more output.
+    fn literal_room(&self) -> usize {
+        if self.pending.is_empty() {
+            return 0;
+        }
+        (STREAM_FLUSH_THRESHOLD - self.pending.len())
+            .min(self.output_limit - self.written)
+            .min(LITERAL_BURST)
+    }
+
+    fn push_literals<E>(
+        &mut self,
+        literals: &[u8],
+        sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), StreamDecodeError<E>> {
+        if self.all_zero && literals.iter().any(|&byte| byte != 0) {
+            self.all_zero = false;
+        }
+        self.pending
+            .extend_from_slice(literals)
+            .map_err(|error| StreamDecodeError::Decode(error.into()))?;
+        self.written += literals.len();
         if self.pending.len() >= STREAM_FLUSH_THRESHOLD {
             self.flush(sink)?;
         }
@@ -2099,6 +2148,10 @@ impl<B: Budget> HuffmanState<B> {
             state: self.state.try_clone()?,
         })
     }
+    #[inline(always)]
+    fn quick_entry(&self, peek: u32) -> u32 {
+        self.state.quick_entry(peek)
+    }
     /// Decodes from a 15-bit peek: one table lookup for nearly every code
     /// rather than a bounds-checked read per bit. Only the code's own bits
     /// are consumed, and the results are those of reading bit by bit: a code
@@ -2120,101 +2173,146 @@ impl<B: Budget> HuffmanState<B> {
     }
 }
 
+#[derive(Clone, Copy)]
 struct BitReader<'a> {
     input: &'a [u8],
-    bit_pos: usize,
+    byte_pos: usize,
+    // MSB-first; bits below `cache_bits` may preview the next input bytes.
+    cache: u64,
+    cache_bits: u32,
 }
 
 impl<'a> BitReader<'a> {
     fn new(input: &'a [u8]) -> Self {
-        Self { input, bit_pos: 0 }
+        Self::at(input, 0)
+    }
+
+    fn at(input: &'a [u8], bit_pos: usize) -> Self {
+        debug_assert!(bit_pos.div_ceil(8) <= input.len());
+        let mut reader = Self {
+            input,
+            byte_pos: bit_pos / 8,
+            cache: 0,
+            cache_bits: 0,
+        };
+        let offset = (bit_pos % 8) as u32;
+        if offset != 0 {
+            reader.refill();
+            reader.skip(offset.min(reader.cache_bits) as usize);
+        }
+        reader
+    }
+
+    #[inline(always)]
+    fn position(&self) -> usize {
+        self.byte_pos * 8 - self.cache_bits as usize
+    }
+
+    #[inline(always)]
+    fn refill(&mut self) {
+        if let Some(bytes) = self
+            .input
+            .get(self.byte_pos..)
+            .and_then(|rest| rest.first_chunk::<8>())
+        {
+            self.cache |= u64::from_be_bytes(*bytes) >> self.cache_bits;
+            let whole = (64 - self.cache_bits) & !7;
+            self.byte_pos += (whole / 8) as usize;
+            self.cache_bits += whole;
+        } else {
+            // Inline: any call here spills the burst's reader to the stack.
+            while self.cache_bits <= 56 && self.byte_pos < self.input.len() {
+                self.cache |= u64::from(self.input[self.byte_pos]) << (56 - self.cache_bits);
+                self.byte_pos += 1;
+                self.cache_bits += 8;
+            }
+        }
     }
 
     /// The next 15 bits, most significant first, with zeros past the end of
     /// the input, and how many of them are real (at most 15).
-    #[inline]
-    fn peek15(&self) -> (u32, usize) {
-        let byte_pos = self.bit_pos / 8;
-        let bit_offset = self.bit_pos % 8;
-        // Away from the end of the input, one four-byte load holds all 15
-        // bits (they start at most 7 bits in).
-        if let Some(&[a, b, c, d]) = self.input.get(byte_pos..byte_pos + 4) {
-            let word = u32::from_be_bytes([a, b, c, d]);
-            return ((word << bit_offset) >> 17, 15);
+    #[inline(always)]
+    fn peek15(&mut self) -> (u32, usize) {
+        if self.cache_bits < 15 {
+            self.refill();
         }
-        let rest = self.input.get(byte_pos..).unwrap_or_default();
-        let word = match rest {
-            [a, b, c, ..] => u32::from_be_bytes([0, *a, *b, *c]),
-            [a, b] => u32::from_be_bytes([0, *a, *b, 0]),
-            [a] => u32::from_be_bytes([0, *a, 0, 0]),
-            [] => 0,
-        };
-        let peek = (word >> (24 - bit_offset - 15)) & 0x7fff;
-        let available = rest
-            .len()
-            .saturating_mul(8)
-            .saturating_sub(bit_offset)
-            .min(15);
-        (peek, available)
+        ((self.cache >> 49) as u32, self.cache_bits.min(15) as usize)
     }
 
     /// Consumes `count` bits already seen through [`Self::peek15`].
-    #[inline]
+    #[inline(always)]
     fn skip(&mut self, count: usize) {
-        self.bit_pos += count;
+        debug_assert!(count <= self.cache_bits as usize);
+        self.cache <<= count;
+        self.cache_bits -= count as u32;
     }
 
-    #[inline]
+    #[inline(always)]
     fn read_bits(&mut self, count: u8) -> Result<u32> {
-        let count = usize::from(count);
-        let byte_pos = self.bit_pos / 8;
-        let bit_offset = self.bit_pos % 8;
-        // Compare the local byte span instead of multiplying the entire input
-        // length by eight, which can overflow for a huge slice.
-        let bytes_needed = (bit_offset + count).div_ceil(8);
-        if bytes_needed > self.input.len().saturating_sub(byte_pos) {
-            return Err(Error::NeedMoreInput);
-        }
-
+        let count = u32::from(count);
         if count == 0 {
             return Ok(0);
         }
-        if count <= 32 {
-            // Read the at-most-five physical bytes once, then discard the
-            // leading and trailing bits. No speculative padding is read, and
-            // input refusal leaves the cursor at its original position.
-            let bytes = &self.input[byte_pos..byte_pos + bytes_needed];
-            let word = match bytes {
-                [a] => u64::from(*a),
-                [a, b] => u64::from(u16::from_be_bytes([*a, *b])),
-                [a, b, c] => u64::from(u32::from_be_bytes([0, *a, *b, *c])),
-                [a, b, c, d] => u64::from(u32::from_be_bytes([*a, *b, *c, *d])),
-                [a, b, c, d, e] => u64::from_be_bytes([0, 0, 0, *a, *b, *c, *d, *e]),
-                _ => unreachable!("a nonempty 32-bit read spans at most five bytes"),
-            };
-            let shift = bytes_needed * 8 - bit_offset - count;
-            let value = ((word >> shift) & ((1u64 << count) - 1)) as u32;
-            self.bit_pos += count;
+        if count > 32 || self.cache_bits < count {
+            return self.read_bits_slow(count);
+        }
+        let value = (self.cache >> (64 - count)) as u32;
+        self.skip(count as usize);
+        Ok(value)
+    }
+
+    #[inline(never)]
+    fn read_bits_slow(&mut self, count: u32) -> Result<u32> {
+        let remaining = (self.input.len().saturating_sub(self.byte_pos))
+            .saturating_mul(8)
+            .saturating_add(self.cache_bits as usize);
+        // Refusal consumes nothing, even for wide reads.
+        if remaining < count as usize {
+            return Err(Error::NeedMoreInput);
+        }
+        if count > 32 {
+            // Wider internal reads keep the low 32 bits.
+            let mut value = 0u32;
+            let mut left = count;
+            while left != 0 {
+                let take = left.min(16);
+                value = (value << take) | self.read_bits(take as u8)?;
+                left -= take;
+            }
             return Ok(value);
         }
-
-        // Preserve the existing low-32-bit result for larger internal reads.
-        let mut value = 0u32;
-        let mut remaining = count;
-        while remaining != 0 {
-            let byte = self.input[self.bit_pos / 8];
-            let bit_offset = self.bit_pos % 8;
-            let available = 8 - bit_offset;
-            let take = available.min(remaining);
-            let shift = available - take;
-            let mask = ((1u16 << take) - 1) as u8;
-            let chunk = (byte >> shift) & mask;
-            value = (value << take) | u32::from(chunk);
-            self.bit_pos += take;
-            remaining -= take;
-        }
-
+        self.refill();
+        let value = (self.cache >> (64 - count)) as u32;
+        self.skip(count as usize);
         Ok(value)
+    }
+
+    /// A call-free loop over a copy, so the reader stays in registers per literal.
+    #[inline(always)]
+    fn literal_burst<B: Budget>(
+        &mut self,
+        table: &HuffmanState<B>,
+        end: usize,
+        out: &mut [u8],
+    ) -> usize {
+        if B::LIMITED {
+            return 0;
+        }
+        let mut bits = *self;
+        let mut count = 0;
+        while count < out.len() && bits.position() < end {
+            let (peek, available) = bits.peek15();
+            let entry = table.quick_entry(peek);
+            let len = (entry & 15) as usize;
+            if entry == 0 || entry >= 256 << 4 || len > available {
+                break;
+            }
+            bits.skip(len);
+            out[count] = (entry >> 4) as u8;
+            count += 1;
+        }
+        *self = bits;
+        count
     }
 }
 

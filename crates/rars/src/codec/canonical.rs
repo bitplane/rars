@@ -130,6 +130,16 @@ impl<B: Budget> Huffman<B> {
         self.symbols.is_empty()
     }
 
+    /// The quick-table entry (`symbol << 4 | length`) for a 15-bit peek, or 0.
+    #[inline(always)]
+    pub(super) fn quick_entry(&self, peek: u32) -> u32 {
+        if B::LIMITED {
+            return 0;
+        }
+        let index = (peek >> (15 - QUICK_BITS)) as usize;
+        self.quick.get(index).copied().unwrap_or(0)
+    }
+
     /// Decodes from the next 15 bits of input, most significant first (`peek`),
     /// without consuming them: the symbol and its code's length, or `None` if
     /// they start no code. Unrestricted readers use one lookup for codes of

@@ -2693,8 +2693,7 @@ fn truncated_filter_fields_and_overflowing_start_fail() {
     try_write_filter_data(&mut type_missing, 0).unwrap();
     try_write_filter_data(&mut type_missing, 1).unwrap();
     let data = type_missing.finish();
-    let mut bits = BitReader::new(&data);
-    bits.bit_pos = 4;
+    let mut bits = BitReader::at(&data, 4);
     assert_eq!(read_filter(&mut bits, 0), Err(Error::NeedMoreInput));
 
     let mut channels_missing = BitWriter::new();
@@ -3150,10 +3149,7 @@ fn encodes_lz_member_with_multiple_filter_records() {
     let block = parse_compressed_block(&input).unwrap();
     let (lengths, table_bits) = read_table_lengths(&input[block.payload.clone()], 0).unwrap();
     let tables = DecodeTables::from_lengths(&lengths).unwrap();
-    let mut bits = BitReader {
-        input: &input[block.payload],
-        bit_pos: table_bits,
-    };
+    let mut bits = BitReader::at(&input[block.payload], table_bits);
     assert_eq!(tables.main.decode(&mut bits).unwrap(), 256);
     let first = read_filter(&mut bits, 0).unwrap();
     assert_eq!(tables.main.decode(&mut bits).unwrap(), 256);
