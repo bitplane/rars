@@ -638,39 +638,33 @@ impl FileHeader {
         let check_crc = self.needs_crc32();
         let mut hash =
             streaming_hash_verifier(self).map_err(|error| self.entry_error("decoding", error))?;
-        let mut written = 0u64;
-        let mut buf = [0u8; 64 * 1024];
-
-        loop {
-            let count = reader
-                .read(&mut buf)
-                .map_err(Error::from)
-                .map_err(|error| self.entry_error("decoding", error))?;
-            if count == 0 {
-                break;
+        // Past the unpacked size is the cipher block's padding, which may hold
+        // any bytes; only the unpacked bytes are written.
+        let written = crate::stored_copy::copy(
+            &mut reader,
+            self.unpacked_size,
+            self.encrypted,
+            &mut |chunk: &[u8]| {
+                if check_crc {
+                    #[cfg(all(test, feature = "write"))]
+                    streaming_checks_tests::record_crc_work(chunk.len(), false);
+                    crc.update(chunk);
+                }
+                if let Some((_, hasher)) = &mut hash {
+                    hasher.update(chunk);
+                }
+            },
+            writer,
+            allowance,
+        )
+        .map_err(|error| match error {
+            crate::stored_copy::CopyError::Read(error) => {
+                self.entry_error("decoding", Error::from(error))
             }
-            let remaining =
-                usize::try_from(self.unpacked_size.saturating_sub(written)).unwrap_or(usize::MAX);
-            let chunk_len = count.min(remaining);
-            // Past the unpacked size is the cipher block's padding, which
-            // may hold any bytes; only the unpacked bytes are written.
-            let chunk = &buf[..chunk_len];
-            // chunk_len is bounded by unpacked_size - written, so this sum
-            // cannot exceed the declared u64 size, including u64::MAX.
-            written += chunk.len() as u64;
-            if check_crc {
-                #[cfg(all(test, feature = "write"))]
-                streaming_checks_tests::record_crc_work(chunk.len(), false);
-                crc.update(chunk);
+            crate::stored_copy::CopyError::Write(error) => {
+                self.entry_error("writing", Error::from(error))
             }
-            if let Some((_, hasher)) = &mut hash {
-                hasher.update(chunk);
-            }
-            writer
-                .write_all(chunk)
-                .map_err(Error::from)
-                .map_err(|error| self.entry_error("writing", error))?;
-        }
+        })?;
 
         if written != self.unpacked_size {
             return Err(self.entry_error(
@@ -1699,33 +1693,20 @@ impl<B: Budget> PendingSplitRefs<B> {
             self.fragment_reader_with_allowance(volumes, decryptor, &self.fragments.allowance())?;
         let mut crc = Crc32::new();
         let mut hash = streaming_hash_verifier(final_file)?;
-        let mut written = 0u64;
-        let mut buf = [0u8; 64 * 1024];
-
-        loop {
-            let count = reader.read(&mut buf)?;
-            if count == 0 {
-                break;
-            }
-            let chunk = if final_file.encrypted {
-                let remaining = usize::try_from(final_file.unpacked_size.saturating_sub(written))
-                    .unwrap_or(usize::MAX);
-                // The padding after the unpacked size may hold any bytes, as
-                // unrar accepts.
-                let chunk_len = count.min(remaining);
-                &buf[..chunk_len]
-            } else {
-                &buf[..count]
-            };
-            written = written
-                .checked_add(chunk.len() as u64)
-                .ok_or(Error::InvalidHeader("RAR 5 stored split size overflows"))?;
-            crc.update(chunk);
-            if let Some((_, hasher)) = &mut hash {
-                hasher.update(chunk);
-            }
-            writer.write_all(chunk)?;
-        }
+        // Padding after the unpacked size may hold any bytes.
+        let written = crate::stored_copy::copy(
+            &mut reader,
+            final_file.unpacked_size,
+            final_file.encrypted,
+            &mut |chunk: &[u8]| {
+                crc.update(chunk);
+                if let Some((_, hasher)) = &mut hash {
+                    hasher.update(chunk);
+                }
+            },
+            writer,
+            &self.fragments.allowance(),
+        )?;
 
         if written != final_file.unpacked_size {
             return Err(Error::InvalidHeader(

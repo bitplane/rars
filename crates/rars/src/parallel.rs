@@ -97,6 +97,11 @@ mod threaded {
     pub(crate) fn threads() -> usize {
         rayon::current_num_threads().max(1)
     }
+
+    /// Not inside the pool, where members already run side by side, nor at one thread.
+    pub(crate) fn may_spawn() -> bool {
+        rayon::current_thread_index().is_none() && threads() > 1
+    }
 }
 
 #[cfg(any(
@@ -162,6 +167,10 @@ mod sequential {
         1
     }
 
+    pub(crate) fn may_spawn() -> bool {
+        false
+    }
+
     #[cfg(any(test, feature = "write"))]
     pub(crate) fn threads() -> usize {
         1
@@ -197,6 +206,7 @@ mod tests {
         assert_eq!(*visited.lock().unwrap(), [3, 1]);
         assert_eq!(sequential::default_window(), 1);
         assert_eq!(sequential::threads(), 1);
+        assert!(!sequential::may_spawn());
     }
 
     #[test]

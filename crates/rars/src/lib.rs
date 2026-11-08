@@ -82,6 +82,7 @@ mod rewrite_staging;
 #[cfg(feature = "write")]
 pub use rewrite_staging::RewriteStaging;
 mod source;
+mod stored_copy;
 #[cfg(feature = "write")]
 mod streaming;
 mod temp_file;
