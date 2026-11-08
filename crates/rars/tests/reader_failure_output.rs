@@ -138,3 +138,32 @@ fn sink_failure_keeps_the_accepted_prefix_and_stops_later_members() {
         }
     }
 }
+
+#[test]
+fn default_rar5_limit_streams_unverified_bytes_only_above_16_mib() {
+    const LIMIT: usize = 16 * 1024 * 1024;
+    for (size, streamed) in [(LIMIT, false), (LIMIT + 1, true)] {
+        let data: Vec<u8> = (0..size).map(|at| b'a' + (at % 7) as u8).collect();
+        let mut builder = Builder::new(ArchiveVersion::Rar50).compression_level(Some(1));
+        builder
+            .add_bytes(b"failing".to_vec(), data, None, None)
+            .unwrap();
+        let mut archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        corrupt_second_checksum(&mut archive);
+        let bytes = Rc::new(RefCell::new(Vec::new()));
+        let error = archive
+            .extract_to_with_options(ArchiveReadOptions::new(), |_| {
+                Ok(Box::new(Capture {
+                    bytes: bytes.clone(),
+                    remaining: usize::MAX,
+                }))
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), rars::ErrorKind::ChecksumMismatch);
+        assert_eq!(
+            bytes.borrow().len(),
+            if streamed { size } else { 0 },
+            "size={size}"
+        );
+    }
+}

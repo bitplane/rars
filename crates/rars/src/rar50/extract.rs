@@ -18,7 +18,7 @@ use std::io::{Read, Write};
 // filter it cannot hold (longer than unrar's 4 MiB block, out of order, or past
 // unrar's 8192 pending filters) through the codec's typed sentinel.
 #[cfg(not(test))]
-const BUFFERED_DECODE_LIMIT: u64 = 512 * 1024 * 1024;
+const BUFFERED_DECODE_LIMIT: u64 = 16 * 1024 * 1024;
 #[cfg(test)]
 const BUFFERED_DECODE_LIMIT: u64 = 1024;
 

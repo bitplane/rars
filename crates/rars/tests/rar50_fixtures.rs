@@ -1909,7 +1909,7 @@ fn reference_rar_accepts_rar50_acl_and_stream_file_service_records() {
 }
 
 #[test]
-#[ignore = "requires RARS_RAR50_LARGE_STREAM_FIXTURE pointing at an external >512 MiB sparse unfiltered RAR5 fixture"]
+#[ignore = "requires RARS_RAR50_LARGE_STREAM_FIXTURE pointing at an external >16 MiB sparse unfiltered RAR5 fixture"]
 fn external_sparse_rar50_large_member_streams_to_sink() {
     let Some(path) = std::env::var_os("RARS_RAR50_LARGE_STREAM_FIXTURE") else {
         eprintln!(
@@ -1924,8 +1924,8 @@ fn external_sparse_rar50_large_member_streams_to_sink() {
         .max()
         .unwrap_or(0);
     assert!(
-        largest > 512 * 1024 * 1024,
-        "fixture must contain a member larger than the filtered-buffer fallback"
+        largest > 16 * 1024 * 1024,
+        "fixture must contain a member larger than the buffered decode limit"
     );
 
     archive
