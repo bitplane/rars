@@ -351,3 +351,45 @@ fn solid_rar5_mixed_decode_paths_preserve_bounded_workspace() {
         assert_eq!(*output.borrow(), expected);
     }
 }
+
+fn big_member() -> Vec<u8> {
+    // Over the 16 MiB batch budget, and periodic so encoders stay quick.
+    (0..17 << 20).map(|at| (at % 251) as u8).collect()
+}
+
+#[test]
+fn members_over_the_batch_budget_stream_inline_under_a_small_workspace() {
+    let small = b"small member".repeat(100);
+    let big = big_member();
+    for version in [
+        ArchiveVersion::Rar15,
+        ArchiveVersion::Rar20,
+        ArchiveVersion::Rar29,
+        ArchiveVersion::Rar50,
+    ] {
+        let mut builder = Builder::new(version).store(true);
+        for (name, data) in [
+            (b"a".to_vec(), &small),
+            (b"big".to_vec(), &big),
+            (b"z".to_vec(), &small),
+        ] {
+            builder.add_bytes(name, data.clone(), None, None).unwrap();
+        }
+        let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        // Smaller than the big member: buffering it on a worker would be refused.
+        let options = ArchiveReadOptions::new().with_max_reader_workspace_bytes(8 << 20);
+        let output = Rc::new(RefCell::new(Vec::new()));
+        archive
+            .extract_to_parallel_buffered_with_options(options, |_| {
+                Ok(Box::new(Capture(output.clone())) as Box<dyn Write>)
+            })
+            .unwrap_or_else(|error| panic!("{version:?}: {error}"));
+        assert!(
+            *output.borrow() == [&small[..], &big, &small].concat(),
+            "{version:?}"
+        );
+        archive
+            .test_with_options(options)
+            .unwrap_or_else(|error| panic!("{version:?}: {error}"));
+    }
+}
