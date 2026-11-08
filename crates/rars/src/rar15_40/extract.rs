@@ -1976,7 +1976,7 @@ mod tests {
         let path = scratch.join("second.part");
         std::fs::write(&path, &payload[split..]).unwrap();
         let mut second_volume = archive_with(vec![Block::File(second)]);
-        second_volume.source = ArchiveSource::File(Arc::new(path.clone()));
+        second_volume.source = ArchiveSource::file(&path);
         std::fs::write(&path, &payload[split..payload.len() - 3]).unwrap();
 
         let volumes = [

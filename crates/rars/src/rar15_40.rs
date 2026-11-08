@@ -725,8 +725,8 @@ impl Archive {
         options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Self> {
         options.check_cancelled()?;
-        let path = Arc::new(path.as_ref().to_path_buf());
-        let mut file = File::open(path.as_ref())?;
+        let path = path.as_ref();
+        let mut file = File::open(path)?;
         let len = file.metadata()?.len();
         let scan_len = len.min(SFX_SCAN_LIMIT as u64) as usize;
         let mut scan = vec![0; scan_len];
@@ -736,7 +736,7 @@ impl Archive {
         if sig.family != ArchiveFamily::Rar15To40 {
             return Err(Error::UnsupportedSignature);
         }
-        Self::parse_seekable(file, len, sig.offset, ArchiveSource::File(path), options)
+        Self::parse_seekable(file, len, sig.offset, ArchiveSource::file(path), options)
     }
 
     pub fn parse_path_with_signature_and_password(
@@ -760,14 +760,14 @@ impl Archive {
         if signature.family != ArchiveFamily::Rar15To40 {
             return Err(Error::UnsupportedSignature);
         }
-        let path = Arc::new(path.as_ref().to_path_buf());
-        let file = File::open(path.as_ref())?;
+        let path = path.as_ref();
+        let file = File::open(path)?;
         let len = file.metadata()?.len();
         Self::parse_seekable(
             file,
             len,
             signature.offset,
-            ArchiveSource::File(path),
+            ArchiveSource::file(path),
             options,
         )
     }
