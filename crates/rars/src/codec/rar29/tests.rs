@@ -369,9 +369,10 @@ use super::{
     Unpack29Encoder, VmFilter, VmProgram, VmProgramKind, LENGTH_COUNT, LOW_OFFSET_COUNT,
     MAIN_COUNT, MAX_ENCODER_MATCH_LENGTH, MAX_ENCODER_MATCH_OFFSET, MAX_HISTORY,
     MAX_MATCH_CANDIDATES, MAX_VM_AUDIO_FILTER_BLOCK_SIZE, MAX_VM_BLOCK_SIZE,
-    MAX_VM_DELTA_FILTER_BLOCK_SIZE, MAX_VM_FILTER_BLOCK_SIZE, OFFSET_COUNT, PPMD_DICTIONARY_MB,
-    PPMD_ESC, PPMD_ORDER, RAR3_AUDIO_FILTER_BYTECODE, RAR3_DELTA_FILTER_BYTECODE,
-    RAR3_ITANIUM_FILTER_BYTECODE, RAR3_RGB_FILTER_BYTECODE, STREAM_CHUNK, TABLE_COUNT,
+    MAX_VM_DELTA_FILTER_BLOCK_SIZE, MAX_VM_FILTER_BLOCK_SIZE, OFFSET_COUNT, PACKED_WINDOW,
+    PPMD_DICTIONARY_MB, PPMD_ESC, PPMD_ORDER, RAR3_AUDIO_FILTER_BYTECODE,
+    RAR3_DELTA_FILTER_BYTECODE, RAR3_ITANIUM_FILTER_BYTECODE, RAR3_RGB_FILTER_BYTECODE,
+    STREAM_CHUNK, TABLE_COUNT,
 };
 
 /// A flat code charges the same for every symbol in play. The keep-tables
@@ -2048,7 +2049,7 @@ fn an_undefined_repeat_distance_zero_fills_like_reference_readers() {
     }
     decoder.bits = BitReader::from_bytes(&bits.finish());
 
-    decoder.decode_lz(5).unwrap();
+    decoder.decode_lz(5, &mut std::io::empty()).unwrap();
 
     assert_eq!(&decoder.output[..], b"Z\0\0\0\0");
 }
@@ -2070,7 +2071,7 @@ fn an_undefined_last_match_repeat_is_a_noop_like_reference_readers() {
     }
     decoder.bits = BitReader::from_bytes(&bits.finish());
 
-    decoder.decode_lz(2).unwrap();
+    decoder.decode_lz(2, &mut std::io::empty()).unwrap();
 
     assert_eq!(&decoder.output[..], b"XY");
     assert_eq!(decoder.last_length, 0);
@@ -4283,4 +4284,136 @@ fn itanium_filter_round_trips_with_high_file_offset() {
 
 fn expected_text() -> Vec<u8> {
     "Hello, RAR 3.x fixture world.\n".repeat(80).into_bytes()
+}
+
+fn noise(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = seed | 1;
+    let mut out = Vec::with_capacity(len + 8);
+    while out.len() < len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        out.extend_from_slice(&state.to_le_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
+struct DribbleReader<'a> {
+    data: &'a [u8],
+    consumed: std::rc::Rc<std::cell::Cell<usize>>,
+    max_read: usize,
+}
+
+impl std::io::Read for DribbleReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let at = self.consumed.get();
+        let len = buf.len().min(self.max_read).min(self.data.len() - at);
+        buf[..len].copy_from_slice(&self.data[at..at + len]);
+        self.consumed.set(at + len);
+        Ok(len)
+    }
+}
+
+struct FirstWriteSink {
+    consumed: std::rc::Rc<std::cell::Cell<usize>>,
+    at_first_write: Option<usize>,
+    data: Vec<u8>,
+}
+
+impl std::io::Write for FirstWriteSink {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.at_first_write.get_or_insert(self.consumed.get());
+        self.data.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn reader_decoding_holds_a_bounded_window_of_packed_input() {
+    let input = noise(5, 9 << 18);
+    for (engine, packed) in [
+        ("lz", unpack29_encode_literals(&input).unwrap()),
+        ("ppmd", unpack29_encode_ppmd_literals(&input).unwrap()),
+    ] {
+        let consumed = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut reader = DribbleReader {
+            data: &packed,
+            consumed: consumed.clone(),
+            max_read: 4093,
+        };
+        let mut sink = FirstWriteSink {
+            consumed: consumed.clone(),
+            at_first_write: None,
+            data: Vec::new(),
+        };
+        let mut decoder = Unpack29::new();
+        decoder
+            .decode_non_solid_member_from_reader(&mut reader, input.len(), &mut sink)
+            .unwrap();
+
+        assert!(sink.data == input, "{engine} output differs");
+        let at_first_write = sink.at_first_write.unwrap();
+        assert!(
+            at_first_write <= STREAM_CHUNK + 2 * PACKED_WINDOW && at_first_write < packed.len(),
+            "{engine} read {at_first_write} of {} packed bytes before its first output",
+            packed.len()
+        );
+        assert!(decoder.bits.input.capacity() <= 2 * PACKED_WINDOW);
+    }
+}
+
+fn assert_same_carried_state(slice: &Unpack29, reader: &Unpack29) {
+    assert_eq!(slice.levels, reader.levels);
+    assert_eq!(slice.old_offsets, reader.old_offsets);
+    assert_eq!(slice.last_offset, reader.last_offset);
+    assert_eq!(slice.last_length, reader.last_length);
+    assert_eq!(slice.last_low_offset, reader.last_low_offset);
+    assert_eq!(slice.low_offset_repeats, reader.low_offset_repeats);
+    assert_eq!(slice.pending_match, reader.pending_match);
+    assert_eq!(slice.in_lz_block, reader.in_lz_block);
+    assert_eq!(slice.block_mode, reader.block_mode);
+    assert_eq!(slice.ppmd_esc, reader.ppmd_esc);
+    assert_eq!(slice.last_filter, reader.last_filter);
+    assert_eq!(slice.filters.len(), reader.filters.len());
+    assert_eq!(slice.programs.len(), reader.programs.len());
+    assert_eq!(slice.base_offset, reader.base_offset);
+    assert!(slice.output[..] == reader.output[..]);
+}
+
+#[test]
+fn solid_reader_decoding_carries_the_same_state_as_slice_decoding() {
+    let members = [
+        (noise(1, 5 << 18), ChainEngine::Lz),
+        (related_text_member(2, 4000), ChainEngine::Ppmd),
+        (related_text_member(3, 4000), ChainEngine::Ppmd),
+        (noise(4, 5 << 18), ChainEngine::Lz),
+        (related_text_member(5, 4000), ChainEngine::Lz),
+    ];
+    let mut chain = Unpack29Encoder::with_options(EncodeOptions::default());
+    let mut from_slice = Unpack29::new();
+    let mut from_reader = Unpack29::new();
+    for (member, engine) in &members {
+        let packed = chain
+            .encode_member_with_engine(member, *engine, &[], &mut |_| true)
+            .unwrap();
+        assert!(packed.len() > PACKED_WINDOW || member.len() < PACKED_WINDOW);
+        assert!(from_slice.decode_member(&packed, member.len()).unwrap() == *member);
+
+        let mut reader = DribbleReader {
+            data: &packed,
+            consumed: Default::default(),
+            max_read: 4093,
+        };
+        let mut out = Vec::new();
+        from_reader
+            .decode_member_from_reader(&mut reader, member.len(), &mut out)
+            .unwrap();
+        assert!(out == *member);
+        assert_same_carried_state(&from_slice, &from_reader);
+    }
 }
