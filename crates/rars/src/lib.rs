@@ -51,6 +51,7 @@ pub mod filter;
 mod filter_search;
 mod io_util;
 mod member;
+mod member_batches;
 pub use member::{ArchiveIndex, ArchiveMemberRef, ArchiveMemberRefs};
 mod member_read;
 pub use member_read::{read_volume_members_at, read_volume_members_at_with_options};
