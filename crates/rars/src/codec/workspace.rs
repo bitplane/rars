@@ -18,7 +18,7 @@ impl Allowance {
     }
 }
 
-pub(crate) trait Budget: Clone + std::fmt::Debug {
+pub(crate) trait Budget: Clone + std::fmt::Debug + Send {
     type Charge: std::fmt::Debug + Send;
     type Failure: Into<Error>;
     fn grow<T>(

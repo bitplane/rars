@@ -43,7 +43,6 @@ const MHD_AV: u8 = 0x20;
 #[cfg(feature = "write")]
 const MHD_ALWAYS_SET: u8 = 0x80;
 const RAR13_AV_PREFIX: &[u8; 6] = b"\x1ai\x6d\x02\xda\xae";
-const COPY_BUFFER_SIZE: usize = 64 * 1024;
 const LHD_SPLIT_BEFORE: u8 = 0x01;
 const LHD_SPLIT_AFTER: u8 = 0x02;
 const LHD_PASSWORD: u8 = 0x04;
@@ -513,41 +512,6 @@ impl Archive {
         self.source.range_reader(range)
     }
 
-    fn copy_decrypted_range_to(
-        &self,
-        range: Range<usize>,
-        mut cipher: Rar13Cipher,
-        out: &mut impl Write,
-    ) -> Result<()> {
-        let mut buffer = [0u8; COPY_BUFFER_SIZE];
-        match &self.source {
-            ArchiveSource::Memory(data) => {
-                let data = data.get(range).ok_or(Error::TooShort)?;
-                for chunk in data.chunks(COPY_BUFFER_SIZE) {
-                    buffer[..chunk.len()].copy_from_slice(chunk);
-                    for byte in &mut buffer[..chunk.len()] {
-                        *byte = cipher.decrypt_byte(*byte);
-                    }
-                    out.write_all(&buffer[..chunk.len()])?;
-                }
-            }
-            ArchiveSource::File(_) | ArchiveSource::Reader(_) => {
-                let mut file = self.source.range_reader(range.clone())?;
-                let mut remaining = range.len();
-                while remaining > 0 {
-                    let to_read = remaining.min(buffer.len());
-                    file.read_exact(&mut buffer[..to_read])?;
-                    for byte in &mut buffer[..to_read] {
-                        *byte = cipher.decrypt_byte(*byte);
-                    }
-                    out.write_all(&buffer[..to_read])?;
-                    remaining -= to_read;
-                }
-            }
-        }
-        Ok(())
-    }
-
     /// Streams extracted entries to caller-provided writers.
     pub fn extract_to<F>(&self, password: Option<&[u8]>, open: F) -> Result<()>
     where
@@ -953,36 +917,26 @@ impl Entry {
         password: Option<&[u8]>,
         out: &mut impl Write,
     ) -> Result<()> {
-        if self.is_encrypted() {
+        let source = archive.range_reader(self.packed_range.clone())?;
+        let mut reader = if self.is_encrypted() {
             crate::crypto::require_encryption()?;
             let password = password.ok_or(Error::NeedPassword)?;
-            let mut checksum = Rar13Checksum::new();
-            let mut checksum_writer = Rar13ChecksumWriter {
-                inner: out,
-                checksum: &mut checksum,
-            };
-            archive.copy_decrypted_range_to(
-                self.packed_range.clone(),
+            PackedReader::Encrypted(Rar13DecryptReader::new(
+                source,
                 Rar13Cipher::for_password(password)?,
-                &mut checksum_writer,
-            )?;
-            checksum.verify_stored_length(self.header.unp_size)?;
-            let actual = checksum.finish();
-            return if actual == self.header.file_crc {
-                Ok(())
-            } else {
-                Err(Error::CrcMismatch {
-                    expected: self.header.file_crc,
-                    actual,
-                })
-            };
-        }
-        let mut checksum = Rar13Checksum::new();
-        let mut checksum_writer = Rar13ChecksumWriter {
-            inner: out,
-            checksum: &mut checksum,
+            ))
+        } else {
+            PackedReader::Plain(source)
         };
-        self.write_packed_data(archive, &mut checksum_writer)?;
+        let mut checksum = Rar13Checksum::new();
+        crate::stored_copy::copy(
+            &mut reader,
+            u64::from(self.header.unp_size),
+            false,
+            &mut |chunk: &[u8]| checksum.update(chunk),
+            out,
+            &Allowance::default(),
+        )?;
         checksum.verify_stored_length(self.header.unp_size)?;
         let actual = checksum.finish();
         if actual == self.header.file_crc {
@@ -1345,14 +1299,21 @@ impl<B: Budget> PendingSplitRefs<B> {
         options.check_cancelled()?;
         budget.run(&meta.name, &mut writer, |mut writer| {
             let mut checksum = Rar13Checksum::new();
-            let mut checksum_writer = Rar13ChecksumWriter {
-                inner: &mut writer,
-                checksum: &mut checksum,
-            };
             if self.method == METHOD_STORE {
-                std::io::copy(&mut reader, &mut checksum_writer)?;
+                crate::stored_copy::copy(
+                    &mut reader,
+                    u64::from(final_entry.header.unp_size),
+                    false,
+                    &mut |chunk: &[u8]| checksum.update(chunk),
+                    &mut writer,
+                    &unpack15.allowance,
+                )?;
                 checksum.verify_stored_length(final_entry.header.unp_size)?;
             } else {
+                let mut checksum_writer = Rar13ChecksumWriter {
+                    inner: &mut writer,
+                    checksum: &mut checksum,
+                };
                 unpack15.decode_member_from_reader(
                     &mut reader,
                     final_entry.header.unp_size as usize,
