@@ -435,6 +435,7 @@ impl Error {
             Self::FeatureDisabled { .. }
             | Self::Rar50Crypto(crate::crypto::rar50::Error::FeatureDisabled)
             | Self::CannotSkipSolidMember
+            | Self::BrokenSolidChain
             | Self::UnsupportedFeature { .. }
             | Self::UnsupportedFamilyFeature { .. }
             | Self::UnsupportedCompression { .. }
@@ -476,7 +477,6 @@ impl Error {
             Self::SourceChanged(_) => ErrorKind::SourceChanged,
             Self::WriterFailure(_) => ErrorKind::WriterFailure,
             Self::TooShort
-            | Self::BrokenSolidChain
             | Self::InvalidHeader(_)
             | Self::Codec(_)
             | Self::Rar3Recovery(_)
@@ -622,6 +622,12 @@ mod tests {
             ErrorKind::UnsupportedFeature
         );
         assert!(Error::CannotSkipSolidMember.entry_context().is_none());
+        // The archive may be fine: the earlier member could have failed on
+        // its sink or been cancelled.
+        assert_eq!(
+            Error::BrokenSolidChain.kind(),
+            ErrorKind::UnsupportedFeature
+        );
     }
 
     #[test]
