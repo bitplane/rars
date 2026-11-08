@@ -41,7 +41,7 @@ fn dictionary_growth_does_not_make_slack_reachable_in_original_or_clones() {
     let mut source = ReaderState::new(&Allowance::default());
     source.remember_history(b"ABCDEFGH", 8).unwrap();
     source.remember_history(b"x", 8).unwrap();
-    let streamed = source.take_for_stream(true, 0).unwrap();
+    let streamed = source.take_for_stream(true);
     for mut state in [state, public_clone, streamed] {
         let mut output = Buffer::new(&Allowance::default());
         state.copy_match(&mut output, 9, 3, 3, 16).unwrap();
@@ -111,13 +111,14 @@ fn refused_history_replacement_preserves_bytes_window_and_charge() {
 #[cfg(feature = "write")]
 #[test]
 fn buffered_and_streamed_members_reuse_unlimited_history_in_both_directions() {
-    let dictionary = 1024;
+    // Large enough that the buffered quarter-dictionary slack holds a flush.
+    let dictionary = 1 << 20;
     let mut state = ReaderState::new(&Allowance::default());
     state
         .remember_history(&vec![b'A'; dictionary], dictionary)
         .unwrap();
     state.remember_history(b"x", dictionary).unwrap();
-    let mut state = state.take_for_stream(true, 0).unwrap();
+    let mut state = state.take_for_stream(true);
     assert_eq!(state.reachable_history().len(), dictionary);
     let address = state.history.as_ptr();
     let capacity = state.history.capacity();
@@ -178,9 +179,9 @@ fn dictionary_shrink_after_reset_allocates_only_for_live_history() {
     assert_eq!(state.reachable_history(), b"x");
     assert_eq!(state.history.capacity(), 8);
 
-    // The streaming setup uses the same rule after a non-solid reset.
-    let history = Buffer::with_capacity(160, &Allowance::default()).unwrap();
+    // The streaming setup sheds a ring sized for the old dictionary too.
+    let history = Buffer::with_capacity(80 + STREAM_SLACK + 1, &Allowance::default()).unwrap();
     let output = StreamingOutput::new(history, 1, 64, 64).unwrap();
-    assert!(output.history.is_empty());
-    assert_eq!(output.history.capacity(), 8);
+    assert_eq!(output.ring.len, 0);
+    assert_eq!(output.ring.capacity(), STREAM_SLACK);
 }

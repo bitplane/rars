@@ -17,7 +17,7 @@ pub(crate) use encoder::{
 };
 
 use super::filters::{self, DeltaErrorMessages};
-use super::workspace::{Allowance, Budget, Buffer, Deque};
+use super::workspace::{Allowance, Budget, Buffer};
 use super::{Error, Result};
 use std::io::Read;
 use std::ops::Range;
@@ -577,7 +577,7 @@ pub(crate) struct ReaderState<B: Budget> {
     last_length: usize,
     history: Buffer<u8, B>,
     // A streamed member's history, kept as is so the next stream reuses it.
-    streamed_history: Option<Deque<u8, B>>,
+    streamed_history: Option<StreamedHistory<B>>,
     // Only this tail is reachable. Older bytes may remain as physical slack.
     history_window: usize,
 }
@@ -598,10 +598,16 @@ impl<B: Budget> ReaderState<B> {
         }
     }
 
-    fn flatten_streamed_history(&mut self) {
+    fn flatten_streamed_history(&mut self, dictionary_size: usize) -> Result<()> {
         if let Some(history) = self.streamed_history.take() {
             self.history = history.into_buffer();
+            // Bounded readers give back the ring's flush slack.
+            let limit = reader_history_limit::<B>(dictionary_size).max(self.history.len());
+            if B::LIMITED && self.history.capacity() > limit {
+                self.history.shrink_to(limit)?;
+            }
         }
+        Ok(())
     }
 
     fn reachable_history(&self) -> &[u8] {
@@ -613,15 +619,16 @@ impl<B: Budget> ReaderState<B> {
     #[cfg(all(test, feature = "write"))]
     fn history_bytes(&self) -> Vec<u8> {
         match &self.streamed_history {
-            Some(history) => history.iter().copied().collect(),
+            Some(history) => history.to_vec(),
             None => self.reachable_history().to_vec(),
         }
     }
 
+    #[cfg(all(test, feature = "write"))]
     fn history_capacity(&self) -> usize {
         self.streamed_history
             .as_ref()
-            .map_or(self.history.capacity(), |history| history.capacity())
+            .map_or(self.history.capacity(), |history| history.allocated())
     }
 
     #[cfg(test)]
@@ -646,7 +653,7 @@ impl<B: Budget> ReaderState<B> {
             history: match &self.streamed_history {
                 Some(streamed) => {
                     let (front, back) = streamed.as_slices();
-                    let mut history = Buffer::with_capacity(streamed.len(), &streamed.allowance())?;
+                    let mut history = Buffer::with_capacity(streamed.len, &streamed.allowance())?;
                     history.extend_from_slice(front).map_err(Into::into)?;
                     history.extend_from_slice(back).map_err(Into::into)?;
                     history
@@ -659,21 +666,24 @@ impl<B: Budget> ReaderState<B> {
     }
 
     /// Solid state moves rather than copies, so a failed decode loses the chain.
-    pub(crate) fn take_for_stream(&mut self, solid: bool, output_size: u64) -> Result<Self> {
+    pub(crate) fn take_for_stream(&mut self, solid: bool) -> Self {
         let mut decoder = Self::new(&self.allowance());
         decoder.read_control = self.read_control.clone();
         if solid {
-            return Ok(std::mem::replace(self, decoder));
+            return std::mem::replace(self, decoder);
         }
         if !B::LIMITED {
-            // Preserve useful capacity without copying bytes. Cap it by the
-            // next member's size so small members shed large old buffers.
-            let capacity = self
-                .history_capacity()
-                .min(usize::try_from(output_size).unwrap_or(usize::MAX));
-            decoder.history = Buffer::with_capacity(capacity, &self.allowance())?;
+            // An independent member needs no old bytes. Reusing the allocation
+            // keeps allocators from retaining a freed window per member.
+            let mut history = match self.streamed_history.take() {
+                Some(ring) => ring.bytes,
+                None => std::mem::replace(&mut self.history, Buffer::new(&decoder.allowance())),
+            };
+            history.clear();
+            self.history_window = 0;
+            decoder.history = history;
         }
-        Ok(decoder)
+        decoder
     }
 
     pub fn decode_member(
@@ -800,7 +810,7 @@ impl<B: Budget> ReaderState<B> {
         if !solid {
             self.reset();
         }
-        self.flatten_streamed_history();
+        self.flatten_streamed_history(dictionary_size)?;
 
         let allowance = self.history.allowance();
         let mut output =
@@ -1007,7 +1017,7 @@ impl<B: Budget> ReaderState<B> {
             self.reset();
         }
 
-        // VecDeque grows as decoded bytes arrive, so using the declared
+        // The ring grows as decoded bytes arrive, so using the declared
         // dictionary here does not allocate a potentially huge RAR 7 window
         // up front. It does, however, retain every byte that a legal match may
         // reference instead of silently truncating the window at 64 MiB.
@@ -1015,13 +1025,13 @@ impl<B: Budget> ReaderState<B> {
         let retained = self.history_window.min(history_limit);
         let history = match self.streamed_history.take() {
             Some(mut history) => {
-                history.discard_prefix(history.len() - retained);
+                history.keep_newest(retained);
                 history
             }
             None => {
                 self.history.discard_prefix(self.history.len() - retained);
                 let allowance = self.history.allowance();
-                Deque::from_buffer(std::mem::replace(
+                StreamedHistory::from(std::mem::replace(
                     &mut self.history,
                     Buffer::new(&allowance),
                 ))
@@ -1036,7 +1046,7 @@ impl<B: Budget> ReaderState<B> {
         let mut literals = [0; LITERAL_BURST];
 
         loop {
-            let block = read_compressed_block_with_allowance(input, &output.history.allowance())?;
+            let block = read_compressed_block_with_allowance(input, &output.ring.allowance())?;
             let payload = &*block.payload;
             let mut payload_bit_pos = 0;
             if block.header.has_tables {
@@ -1152,7 +1162,7 @@ impl<B: Budget> ReaderState<B> {
         if output.written() == output_size {
             output.finish(&mut sink)?;
             let history = output.into_history();
-            self.history_window = history.len();
+            self.history_window = history.len;
             self.streamed_history = Some(history);
             Ok(())
         } else {
@@ -1161,7 +1171,7 @@ impl<B: Budget> ReaderState<B> {
     }
 
     fn remember_history(&mut self, output: &[u8], dictionary_size: usize) -> Result<()> {
-        self.flatten_streamed_history();
+        self.flatten_streamed_history(dictionary_size)?;
         let incoming = &output[output.len().saturating_sub(dictionary_size)..];
         let keep = self.history_window.min(dictionary_size - incoming.len());
         let required = keep + incoming.len();
@@ -1211,7 +1221,7 @@ impl<B: Budget> ReaderState<B> {
         self.last_length = 0;
         self.history.clear();
         if let Some(history) = &mut self.streamed_history {
-            history.clear();
+            history.keep_newest(0);
         }
         self.history_window = 0;
     }
@@ -1256,6 +1266,20 @@ impl<B: Budget> ReaderState<B> {
                     remaining = 0;
                 } else {
                     let start = output.len() - distance;
+                    let len = output.len();
+                    if remaining <= SHORT_MATCH
+                        && distance >= SHORT_MATCH
+                        && output.capacity() - len >= SHORT_MATCH
+                    {
+                        // A fixed-width copy into spare capacity, cut back to
+                        // the match: cheaper than a variable-length memcpy.
+                        let bytes: [u8; SHORT_MATCH] = output[start..start + SHORT_MATCH]
+                            .try_into()
+                            .expect("fixed-width slice");
+                        output.extend_from_slice(&bytes).map_err(Into::into)?;
+                        output.truncate(len + remaining);
+                        return Ok(());
+                    }
                     if remaining <= distance {
                         return output.extend_from_within(start..start + remaining);
                     }
@@ -1317,9 +1341,124 @@ fn reader_history_capacity<B: Budget>(
     }
 }
 
+/// A streamed member's window: the newest `len` bytes of a ring end before `end`.
+#[derive(Debug)]
+pub(crate) struct StreamedHistory<B: Budget = Allowance> {
+    bytes: Buffer<u8, B>,
+    end: usize,
+    len: usize,
+}
+
+impl<B: Budget> StreamedHistory<B> {
+    // Initialized ring space; fixed-width copies may land anywhere in it.
+    fn capacity(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn allocated(&self) -> usize {
+        self.bytes.capacity()
+    }
+
+    /// Ring index of the byte `distance` back from the newest.
+    fn back(&self, distance: usize) -> usize {
+        debug_assert!(distance <= self.capacity());
+        if distance <= self.end {
+            self.end - distance
+        } else {
+            self.end + self.capacity() - distance
+        }
+    }
+
+    fn advance(&mut self, count: usize) {
+        self.end += count;
+        self.len += count;
+    }
+
+    fn allowance(&self) -> B {
+        self.bytes.allowance()
+    }
+
+    /// Oldest bytes first.
+    fn as_slices(&self) -> (&[u8], &[u8]) {
+        if self.len <= self.end {
+            (&self.bytes[self.end - self.len..self.end], &[])
+        } else {
+            let start = self.capacity() - (self.len - self.end);
+            (&self.bytes[start..], &self.bytes[..self.end])
+        }
+    }
+
+    #[cfg(test)]
+    fn to_vec(&self) -> Vec<u8> {
+        let (older, newer) = self.as_slices();
+        [older, newer].concat()
+    }
+
+    fn keep_newest(&mut self, count: usize) {
+        self.len = self.len.min(count);
+    }
+
+    /// Flattens in place, oldest byte first, without allocating.
+    fn into_buffer(mut self) -> Buffer<u8, B> {
+        let start = self.back(self.len);
+        self.bytes.rotate_left(start);
+        self.bytes.truncate(self.len);
+        self.bytes
+    }
+
+    /// Grows the allocation itself so no second copy is resident; true if it moved.
+    fn grow(&mut self, capacity: usize) -> Result<bool> {
+        if B::LIMITED {
+            // Keep the exact charge rather than the ledger's doubling.
+            self.relocate(capacity)?;
+            return Ok(true);
+        }
+        let moved = self.len > self.end;
+        if moved {
+            let start = self.back(self.len);
+            self.bytes.rotate_left(start);
+            self.end = self.len;
+        }
+        self.bytes.reserve_exact(capacity - self.bytes.len());
+        self.bytes.resize(capacity, 0)?;
+        Ok(moved)
+    }
+
+    /// Moves the window into a fresh ring of `capacity` bytes, ending at `len`.
+    fn relocate(&mut self, capacity: usize) -> Result<()> {
+        debug_assert!(capacity > self.len);
+        let mut bytes = Buffer::with_capacity(capacity, &self.allowance())?;
+        let (older, newer) = self.as_slices();
+        bytes.extend_from_slice(older).map_err(Into::into)?;
+        bytes.extend_from_slice(newer).map_err(Into::into)?;
+        bytes.resize(capacity, 0)?;
+        self.bytes = bytes;
+        self.end = self.len;
+        Ok(())
+    }
+}
+
+impl<B: Budget> From<Buffer<u8, B>> for StreamedHistory<B> {
+    // Spare capacity becomes ring space only as the ring grows into it.
+    fn from(history: Buffer<u8, B>) -> Self {
+        Self {
+            end: history.len(),
+            len: history.len(),
+            bytes: history,
+        }
+    }
+}
+
+// Room past the newest byte for a fixed-width short match to over-copy into.
+const SHORT_MATCH: usize = 32;
+// Ring space beyond the reachable history: unflushed output plus over-copy.
+const STREAM_SLACK: usize = STREAM_FLUSH_THRESHOLD + SHORT_MATCH;
+
 struct StreamingOutput<B: Budget = Allowance> {
-    history: Deque<u8, B>,
-    pending: Buffer<u8, B>,
+    // History, then the `pending` bytes not yet flushed, which never wrap.
+    ring: StreamedHistory<B>,
+    pending: usize,
+    max_capacity: usize,
     stage: FilterStage<B>,
     written: usize,
     output_limit: usize,
@@ -1330,24 +1469,27 @@ struct StreamingOutput<B: Budget = Allowance> {
 
 impl<B: Budget> StreamingOutput<B> {
     fn new(
-        history: impl Into<Deque<u8, B>>,
+        history: impl Into<StreamedHistory<B>>,
         output_limit: usize,
         dictionary_size: usize,
         history_limit: usize,
     ) -> Result<Self> {
-        let mut history = history.into();
-        if history.capacity() > reader_history_limit::<B>(history_limit) {
-            let capacity =
-                reader_history_capacity::<B>(history.capacity(), history.len(), history_limit);
-            let mut replacement = Deque::with_capacity(capacity, &history.allowance())?;
-            replacement.extend_admitted(history.iter().copied());
-            history = replacement;
+        let mut ring = history.into();
+        ring.keep_newest(history_limit);
+        let max_capacity = history_limit.saturating_add(STREAM_SLACK);
+        // A reset can leave a large ring under a smaller dictionary.
+        if ring.allocated() > reader_history_limit::<B>(history_limit).saturating_add(STREAM_SLACK)
+        {
+            ring.relocate(ring.len + STREAM_SLACK)?;
         }
-        let allowance = history.allowance();
+        let (older, newer) = ring.as_slices();
+        let all_zero = older.iter().chain(newer).all(|&byte| byte == 0);
+        let allowance = ring.allowance();
         Ok(Self {
-            all_zero: history.iter().all(|&byte| byte == 0),
-            history,
-            pending: Buffer::with_capacity(STREAM_FLUSH_THRESHOLD, &allowance)?,
+            all_zero,
+            ring,
+            pending: 0,
+            max_capacity,
             stage: FilterStage::new(&allowance),
             written: 0,
             output_limit,
@@ -1360,49 +1502,92 @@ impl<B: Budget> StreamingOutput<B> {
         self.written
     }
 
-    fn push<E>(
+    /// Grows the ring so `count` more bytes cannot overwrite history; true if it moved.
+    fn make_room(&mut self, count: usize) -> Result<bool> {
+        let capacity = self.ring.capacity();
+        let required = self.ring.len + count + SHORT_MATCH;
+        if required <= capacity || capacity >= self.max_capacity {
+            return Ok(false);
+        }
+        debug_assert!(required <= self.max_capacity);
+        // Room for a whole flush at once, so small dictionaries grow only once.
+        let capacity = required
+            .max(capacity.saturating_mul(2))
+            .max(self.ring.len + STREAM_SLACK)
+            .min(self.max_capacity);
+        self.ring.grow(capacity)
+    }
+
+    /// Contiguous room at the end of the ring before the next flush.
+    fn room(&self) -> usize {
+        (STREAM_FLUSH_THRESHOLD - self.pending).min(self.ring.capacity() - self.ring.end)
+    }
+
+    fn advance<E>(
         &mut self,
-        byte: u8,
+        count: usize,
         sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), StreamDecodeError<E>> {
-        if self.written >= self.output_limit {
-            return Err(Error::InvalidData("RAR 5 match exceeds output limit").into());
-        }
-        if byte != 0 {
-            self.all_zero = false;
-        }
-        self.pending.try_push(byte)?;
-        self.written += 1;
-        if self.pending.len() >= STREAM_FLUSH_THRESHOLD {
+        self.ring.advance(count);
+        self.pending += count;
+        self.written += count;
+        if self.pending == STREAM_FLUSH_THRESHOLD || self.ring.end == self.ring.capacity() {
             self.flush(sink)?;
         }
         Ok(())
     }
 
+    fn check_limit(&self, count: usize) -> Result<()> {
+        if self
+            .written
+            .checked_add(count)
+            .is_none_or(|end| end > self.output_limit)
+        {
+            return Err(Error::InvalidData("RAR 5 match exceeds output limit"));
+        }
+        Ok(())
+    }
+
+    fn push<E>(
+        &mut self,
+        byte: u8,
+        sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), StreamDecodeError<E>> {
+        self.check_limit(1)?;
+        if byte != 0 {
+            self.all_zero = false;
+        }
+        self.make_room(1)?;
+        self.ring.bytes[self.ring.end] = byte;
+        self.advance(1, sink)
+    }
+
     // None straight after a flush, so the decoder polls before more output.
     fn literal_room(&self) -> usize {
-        if self.pending.is_empty() {
+        if self.pending == 0 {
             return 0;
         }
-        (STREAM_FLUSH_THRESHOLD - self.pending.len())
+        (STREAM_FLUSH_THRESHOLD - self.pending)
             .min(self.output_limit - self.written)
             .min(LITERAL_BURST)
     }
 
     fn push_literals<E>(
         &mut self,
-        literals: &[u8],
+        mut literals: &[u8],
         sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), StreamDecodeError<E>> {
+        self.check_limit(literals.len())?;
         if self.all_zero && literals.iter().any(|&byte| byte != 0) {
             self.all_zero = false;
         }
-        self.pending
-            .extend_from_slice(literals)
-            .map_err(|error| StreamDecodeError::Decode(error.into()))?;
-        self.written += literals.len();
-        if self.pending.len() >= STREAM_FLUSH_THRESHOLD {
-            self.flush(sink)?;
+        while !literals.is_empty() {
+            self.make_room(literals.len().min(STREAM_FLUSH_THRESHOLD - self.pending))?;
+            let take = literals.len().min(self.room());
+            let end = self.ring.end;
+            self.ring.bytes[end..end + take].copy_from_slice(&literals[..take]);
+            literals = &literals[take..];
+            self.advance(take, sink)?;
         }
         Ok(())
     }
@@ -1413,26 +1598,17 @@ impl<B: Budget> StreamingOutput<B> {
         mut count: usize,
         sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), StreamDecodeError<E>> {
-        if self
-            .written
-            .checked_add(count)
-            .is_none_or(|end| end > self.output_limit)
-        {
-            return Err(Error::InvalidData("RAR 5 match exceeds output limit").into());
-        }
+        self.check_limit(count)?;
         if byte != 0 {
             self.all_zero = false;
         }
         while count > 0 {
-            let available = STREAM_FLUSH_THRESHOLD - self.pending.len();
-            let take = count.min(available.max(1));
-            let old_len = self.pending.len();
-            self.pending.resize(old_len + take, byte)?;
-            self.written += take;
+            self.make_room(count.min(STREAM_FLUSH_THRESHOLD - self.pending))?;
+            let take = count.min(self.room());
+            let end = self.ring.end;
+            self.ring.bytes[end..end + take].fill(byte);
             count -= take;
-            if self.pending.len() >= STREAM_FLUSH_THRESHOLD {
-                self.flush(sink)?;
-            }
+            self.advance(take, sink)?;
         }
         Ok(())
     }
@@ -1442,18 +1618,11 @@ impl<B: Budget> StreamingOutput<B> {
         count: usize,
         sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), StreamDecodeError<E>> {
-        if self
-            .written
-            .checked_add(count)
-            .is_none_or(|end| end > self.output_limit)
-        {
-            return Err(Error::InvalidData("RAR 5 match exceeds output limit").into());
-        }
+        self.check_limit(count)?;
         self.flush(sink)?;
         // copy_match only reaches this path with an initialized positive
-        // distance. Either retained history exists, or flushing the pending
-        // zero literals retains at least one byte (the dictionary is nonzero).
-        debug_assert!(!self.history.is_empty());
+        // distance, so the window holds at least one (zero) byte.
+        debug_assert!(self.ring.len != 0);
         self.stage.emit(
             DecodedChunk::Repeated {
                 byte: 0,
@@ -1471,107 +1640,83 @@ impl<B: Budget> StreamingOutput<B> {
         length: usize,
         sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), StreamDecodeError<E>> {
-        if self.all_zero && distance <= self.written + self.history.len() {
+        if self.all_zero && distance <= self.written + self.ring.len - self.pending {
             return self.push_zeroes(length, sink);
         }
         // Zero-fill out-of-window matches, as the buffered decoder does.
-        if distance == 0
-            || distance > self.dictionary_size
-            || distance > self.history.len() + self.pending.len()
-        {
+        if distance == 0 || distance > self.dictionary_size || distance > self.ring.len {
             return self.push_repeated(0, length, sink);
         }
-        if self
-            .written
-            .checked_add(length)
-            .is_none_or(|end| end > self.output_limit)
-        {
-            return Err(Error::InvalidData("RAR 5 match exceeds output limit").into());
-        }
+        self.check_limit(length)?;
         if distance == 1 {
-            let byte = self.byte_at_distance(1);
+            let byte = self.ring.bytes[self.ring.back(1)];
             return self.push_repeated(byte, length, sink);
         }
+        // Start of the run being repeated, while the ring has not wrapped or
+        // moved under it. Each copy extends that run, so overlapping
+        // short-distance matches double instead of copying one period at a time.
+        let mut run = None;
         let mut remaining = length;
         while remaining != 0 {
-            let available = STREAM_FLUSH_THRESHOLD - self.pending.len();
-            if distance <= self.pending.len() {
-                // Seed the repeated run from the preceding distance bytes.
-                // Each append makes a larger initialized run available, so
-                // overlapping short-distance matches double instead of
-                // copying one period (or one byte) at a time.
-                let start = self.pending.len() - distance;
-                let mut run = remaining.min(available);
-                while run != 0 {
-                    let take = run.min(self.pending.len() - start);
-                    self.pending.extend_from_within(start..start + take)?;
-                    self.written += take;
-                    remaining -= take;
-                    run -= take;
-                }
+            if self.make_room(remaining.min(STREAM_FLUSH_THRESHOLD - self.pending))? {
+                run = None;
+            }
+            let capacity = self.ring.capacity();
+            let end = self.ring.end;
+            let room = self.room();
+            if remaining <= SHORT_MATCH
+                && distance >= remaining
+                && distance <= end
+                && remaining <= room
+                && end + SHORT_MATCH <= capacity
+            {
+                // make_room keeps SHORT_MATCH unreachable bytes past the end.
+                let source = end - distance;
+                let bytes: [u8; SHORT_MATCH] = self.ring.bytes[source..source + SHORT_MATCH]
+                    .try_into()
+                    .expect("fixed-width slice");
+                self.ring.bytes[end..end + SHORT_MATCH].copy_from_slice(&bytes);
+                return self.advance(remaining, sink);
+            }
+            let source = match run {
+                Some(start) if start < end => start,
+                _ => self.ring.back(distance),
+            };
+            let available = if source < end {
+                run = Some(source);
+                end - source
             } else {
-                // VecDeque history can wrap into two slices. Copy only the
-                // current contiguous part; once the source reaches pending,
-                // the initialized-run path above handles the overlap.
-                let history_distance = distance - self.pending.len();
-                let start = self.history.len() - history_distance;
-                let (first, second) = self.history.as_slices();
-                let source = if start < first.len() {
-                    &first[start..]
-                } else {
-                    &second[start - first.len()..]
-                };
-                let take = remaining.min(available).min(source.len());
-                self.pending
-                    .extend_from_slice(&source[..take])
-                    .map_err(|error| StreamDecodeError::Decode(error.into()))?;
-                self.written += take;
-                remaining -= take;
+                run = None;
+                capacity - source
+            };
+            let take = remaining.min(room).min(available);
+            self.ring.bytes.copy_within(source..source + take, end);
+            if take != available {
+                // The run stays a whole number of periods only if copied whole.
+                run = None;
             }
-            if self.pending.len() == STREAM_FLUSH_THRESHOLD {
-                self.flush(sink)?;
-            }
+            remaining -= take;
+            self.advance(take, sink)?;
         }
         Ok(())
-    }
-
-    fn byte_at_distance(&self, distance: usize) -> u8 {
-        // copy_match admits only distances inside the current window. Every
-        // copied byte extends that window; flush retains at least distance
-        // bytes because distance is bounded by dictionary_size.
-        if distance <= self.pending.len() {
-            self.pending[self.pending.len() - distance]
-        } else {
-            let history_distance = distance - self.pending.len();
-            self.history[self.history.len() - history_distance]
-        }
     }
 
     fn flush<E>(
         &mut self,
         sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), StreamDecodeError<E>> {
-        if self.pending.is_empty() {
-            return Ok(());
+        if self.pending != 0 {
+            let end = self.ring.end;
+            self.stage.emit(
+                DecodedChunk::Bytes(&self.ring.bytes[end - self.pending..end]),
+                sink,
+            )?;
+            self.pending = 0;
+            self.ring.keep_newest(self.history_limit);
         }
-        self.stage.emit(DecodedChunk::Bytes(&self.pending), sink)?;
-        let incoming = &self.pending[self.pending.len().saturating_sub(self.history_limit)..];
-        let keep = self.history.len().min(self.history_limit - incoming.len());
-        let required = keep + incoming.len();
-        if self.history.capacity() > reader_history_limit::<B>(self.history_limit)
-            || self.history.capacity() < required
-        {
-            let capacity =
-                reader_history_capacity::<B>(self.history.capacity(), required, self.history_limit);
-            let mut history = Deque::with_capacity(capacity, &self.history.allowance())?;
-            history.extend_admitted(self.history.iter().skip(self.history.len() - keep).copied());
-            history.extend_admitted(incoming.iter().copied());
-            self.history = history;
-        } else {
-            self.history.discard_prefix(self.history.len() - keep);
-            self.history.extend_admitted(incoming.iter().copied());
+        if self.ring.end == self.ring.capacity() {
+            self.ring.end = 0;
         }
-        self.pending.clear();
         Ok(())
     }
 
@@ -1583,8 +1728,8 @@ impl<B: Budget> StreamingOutput<B> {
         self.stage.finish()
     }
 
-    fn into_history(self) -> Deque<u8, B> {
-        self.history
+    fn into_history(self) -> StreamedHistory<B> {
+        self.ring
     }
 }
 

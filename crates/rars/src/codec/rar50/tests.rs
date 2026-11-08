@@ -4713,7 +4713,7 @@ fn streaming_reader_history_capacity_follows_the_active_dictionary() {
         decoder.state.history_bytes(),
         &data[data.len() - 1024..][..]
     );
-    assert!(decoder.state.history_capacity() <= 1024 + 1024 / 4);
+    assert!(decoder.state.history_capacity() <= 1024 + STREAM_SLACK);
     let next = b"next solid member";
     let packed = encode_literal_only(next, 0).unwrap();
     decoder
@@ -4727,7 +4727,7 @@ fn streaming_reader_history_capacity_follows_the_active_dictionary() {
         )
         .unwrap();
     assert_eq!(decoder.state.history_bytes(), &next[next.len() - 8..][..]);
-    assert!(decoder.state.history_capacity() <= 8 + 8 / 4);
+    assert!(decoder.state.history_capacity() <= 8 + STREAM_SLACK);
 }
 
 #[test]
@@ -5596,47 +5596,38 @@ fn virtual_zero_history_does_not_overallocate_a_tiny_dictionary() {
         })
         .unwrap();
     assert_eq!(emitted, 100_000);
-    assert_eq!(output.history.iter().copied().collect::<Vec<_>>(), [0]);
-    assert_eq!(output.history.capacity(), 1);
+    assert_eq!(output.ring.to_vec(), [0]);
+    assert_eq!(output.ring.capacity(), 1);
 }
 
 #[test]
-fn virtual_zero_history_flush_refusal_releases_streaming_charge() {
-    let budget = RefusingBudget::new(1);
+fn ring_growth_refusal_releases_streaming_charge() {
+    let budget = RefusingBudget::new(0);
     {
         let mut output = StreamingOutput::new(Buffer::new(&budget), 3, 1, 1).unwrap();
-        output
-            .push(0, &mut |_| Ok::<(), std::convert::Infallible>(()))
-            .unwrap();
-        let mut emitted = Vec::new();
+        let mut emitted = 0;
         let error = output
-            .copy_match(1, 2, &mut |chunk| {
-                let DecodedChunk::Bytes(bytes) = chunk else {
-                    panic!("expected initial literal")
-                };
-                emitted.extend_from_slice(bytes);
+            .push(7, &mut |_| {
+                emitted += 1;
                 Ok::<(), std::convert::Infallible>(())
             })
             .unwrap_err();
         assert!(matches!(error, StreamDecodeError::Decode(Error::Cancelled)));
-        // The initial literal is streamed before retaining its history fails.
-        assert_eq!(emitted, [0]);
-        assert_eq!(output.written(), 1);
-        assert!(output.history.is_empty());
-        assert_eq!(budget.attempts(), 2);
+        assert_eq!(emitted, 0);
+        assert_eq!(output.written(), 0);
+        assert_eq!(output.ring.len, 0);
     }
     assert_eq!(budget.used(), 0);
 }
 
 #[test]
 fn streaming_flush_preserves_dictionary_tail_with_excess_allocation_capacity() {
-    let mut output = StreamingOutput::new(Buffer::from_vec(b"ABC".to_vec()), 1, 3, 3).unwrap();
     // Model an allocator returning more capacity than requested. Vec's
     // public contract permits this even though this host allocates exactly.
     let mut history = Vec::with_capacity(8);
     history.extend_from_slice(b"ABC");
-    output.history = crate::codec::workspace::Deque::from_buffer(Buffer::from_vec(history));
-    assert!(output.history.capacity() > output.history_limit);
+    let mut output = StreamingOutput::new(Buffer::from_vec(history), 1, 3, 3).unwrap();
+    assert!(output.ring.allocated() > output.history_limit);
     let mut emitted = Vec::new();
     let mut sink = |chunk: DecodedChunk<'_>| {
         let DecodedChunk::Bytes(bytes) = chunk else {
@@ -5648,7 +5639,7 @@ fn streaming_flush_preserves_dictionary_tail_with_excess_allocation_capacity() {
     output.push(b'D', &mut sink).unwrap();
     output.finish(&mut sink).unwrap();
     assert_eq!(emitted, b"D");
-    assert_eq!(output.history.iter().copied().collect::<Vec<_>>(), b"BCD");
+    assert_eq!(output.ring.to_vec(), b"BCD");
 }
 
 #[test]
@@ -5805,7 +5796,7 @@ fn streaming_match_keeps_its_window_across_flushes() {
             .take(count)
             .collect::<Vec<_>>()
     );
-    assert!(output.history.capacity() <= 3);
+    assert!(output.ring.capacity() <= 3 + STREAM_SLACK);
     assert_eq!(output.into_history().into_buffer().into_vec(), b"abc");
 }
 

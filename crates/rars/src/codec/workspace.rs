@@ -314,7 +314,17 @@ impl<T, B: Budget> Buffer<T, B> {
     pub(crate) fn retain(&mut self, keep: impl FnMut(&T) -> bool) {
         self.values.retain(keep);
     }
-    #[cfg(any(feature = "write", feature = "encryption"))]
+    pub(crate) fn reserve_exact(&mut self, additional: usize) {
+        debug_assert!(!B::LIMITED);
+        self.values.reserve_exact(additional);
+    }
+    pub(crate) fn shrink_to(&mut self, capacity: usize) -> Result<()> {
+        self.values.shrink_to(capacity);
+        B::resize(
+            &mut self.charge,
+            allocation_size::<T>(self.values.capacity())?,
+        )
+    }
     pub(crate) fn truncate(&mut self, len: usize) {
         self.values.truncate(len);
     }
@@ -395,59 +405,6 @@ impl<T, B: Budget> Buffer<T, B> {
         let inserted = self.values.len() - old_len;
         self.values.rotate_right(inserted);
         Ok(())
-    }
-}
-/// A charged ring keeps its allocation ownership when converted to or from a
-/// contiguous history. Neither conversion allocates new storage.
-#[derive(Debug)]
-pub(crate) struct Deque<T, B: Budget = Allowance> {
-    values: std::collections::VecDeque<T>,
-    charge: B::Charge,
-}
-impl<T, B: Budget> Deque<T, B> {
-    pub(crate) fn from_buffer(buffer: Buffer<T, B>) -> Self {
-        Self {
-            values: buffer.values.into(),
-            charge: buffer.charge,
-        }
-    }
-    pub(crate) fn into_buffer(self) -> Buffer<T, B> {
-        Buffer {
-            values: self.values.into(),
-            charge: self.charge,
-        }
-    }
-    pub(crate) fn with_capacity(capacity: usize, allowance: &B) -> Result<Self> {
-        Ok(Self::from_buffer(Buffer::with_capacity(
-            capacity, allowance,
-        )?))
-    }
-    pub(crate) fn allowance(&self) -> B {
-        B::allowance(&self.charge)
-    }
-    pub(crate) fn capacity(&self) -> usize {
-        self.values.capacity()
-    }
-    pub(crate) fn discard_prefix(&mut self, count: usize) {
-        self.values.drain(..count);
-    }
-    pub(crate) fn clear(&mut self) {
-        self.values.clear();
-    }
-    pub(crate) fn extend_admitted(&mut self, values: impl ExactSizeIterator<Item = T>) {
-        assert!(values.len() <= self.values.capacity() - self.values.len());
-        self.values.extend(values);
-    }
-}
-impl<T, B: Budget> From<Buffer<T, B>> for Deque<T, B> {
-    fn from(buffer: Buffer<T, B>) -> Self {
-        Self::from_buffer(buffer)
-    }
-}
-impl<T, B: Budget> std::ops::Deref for Deque<T, B> {
-    type Target = std::collections::VecDeque<T>;
-    fn deref(&self) -> &Self::Target {
-        &self.values
     }
 }
 pub(crate) struct BufferIter<T, B: Budget> {
@@ -662,29 +619,6 @@ mod tests {
         ));
         assert!(buffer.is_empty());
         assert_eq!(ledger.used(), 0);
-    }
-
-    #[test]
-    fn reader_ring_preserves_capacity_charge_through_wrapped_conversion() {
-        let ledger = Allowance::limited(8);
-        let buffer = Buffer::copied(b"ABCDEFGH", &ledger).unwrap();
-        let storage = buffer.as_ptr();
-        let mut ring = Deque::from_buffer(buffer);
-        ring.discard_prefix(5);
-        ring.extend_admitted(b"12345".iter().copied());
-        assert!(!ring.as_slices().1.is_empty());
-        assert_eq!(ledger.used(), 8);
-        let buffer = ring.into_buffer();
-        assert_eq!(&*buffer, b"FGH12345");
-        assert_eq!(buffer.as_ptr(), storage);
-        assert_eq!(buffer.capacity(), 8);
-        assert_eq!(ledger.used(), 8);
-        drop(buffer);
-        assert_eq!(ledger.used(), 0);
-        assert_eq!(
-            std::mem::size_of::<Deque<u8>>(),
-            std::mem::size_of::<std::collections::VecDeque<u8>>()
-        );
     }
 
     #[test]
