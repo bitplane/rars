@@ -2441,7 +2441,7 @@ mod tests {
 
         let root = crate::scratch::case("collection-extract-unicode");
         let archive = rars::rar15_40::Archive::parse_path(
-            fixtures.join("rar15_40/encrypted/rar4_junrar_file_content_encrypted_unicode.rar"),
+            fixtures.join("rar15_40/encrypted/rar4_unicode_name_encrypted.rar"),
         )
         .unwrap();
         let state = std::cell::RefCell::new(super::ExtractOutputState::new(

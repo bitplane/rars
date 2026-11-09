@@ -61,7 +61,7 @@ def test_unicode_wire_bytes_survive_and_rename_keeps_unicode(tmp_path, format, n
         assert (out / renamed).read_bytes() == b"payload" * 50
 
 
-@pytest.mark.parametrize("fixture", ["rar4_sharpcompress_files_only.rar", "rar4_junrar_file_content_encrypted_unicode.rar"])
+@pytest.mark.parametrize("fixture", ["rar4_encrypted_files_and_dirs.rar", "rar4_unicode_name_encrypted.rar"])
 def test_reference_encrypted_unicode_archives_retain_exact_names(tmp_path, fixture):
     path = ROOT / "crates/rars/tests/fixtures/rar15_40/encrypted" / fixture
     source = rars.RarFile(path, password="test")

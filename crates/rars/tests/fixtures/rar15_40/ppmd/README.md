@@ -11,7 +11,7 @@ spec repository's `fixtures/ppmd/` set plus small regression fixtures.
 | `ppmd_solid_rar300.rar` | Solid PPMd model reuse across members. |
 | `ppmd_lz_repeat_rar3.cbr` | PPMd stream with embedded one-byte LZ repeats. |
 | `ppmd_lz_match_rar300.rar` | PPMd stream with embedded LZ distance matches. |
-| `farmanager170.rar` | Wild solid PPMd archive whose model reaches large-context allocator territory before `Addons\Shell\FARHere.inf`. |
+| `ppmd_solid_restarts_rar393.rar` | RAR 3.93 `-s -m5 -mc63:1t+`: eight solid members of generated text through a 1 MB order-61 model. The suballocator runs out and the model restarts seven times. |
 
 The `.txt` and `.bin` files in this directory are expected plaintext payloads
 used by tests.

@@ -9,8 +9,8 @@ external corpus samples promoted as regression fixtures.
 | `AUTOREJ.RAR` | Same `-mm` path on text input where the encoder rejects audio mode and emits normal Unpack20 LZ. |
 | `BIGLZ.RAR` | Longer Unpack20 LZ history/table-stress stream. |
 | `SOLID.RAR` | Solid Unpack20 state carry-over across two members. |
-| `unpack20_audio_text.rar` | External `junrar` corpus archive with a WAV-named payload and stored text member. The first compressed member's table-read peek is `0x2221`, so it also exercises normal Unpack20 LZ rather than audio mode. |
-| `unpack20_keep_tables.rar` | Unpack20 keep-table coverage. |
+| `unpack20_audio_text.rar` | WinRAR 2.90 `-m3` over a synthetic speech-shaped WAV and a stored text member. The first table-read peek is `0x1819`, so it exercises normal Unpack20 LZ rather than audio mode; the RAR 2.0 writer test reuses the WAV as audio-block input. |
+| `unpack20_keep_tables.rar` | WinRAR 2.90 `-m3`. `SHIFT.BIN` moves between text, x86-shaped code and noise, so the encoder emits two mid-stream tables that keep the previous lengths; `NOTES.TXT` then starts a fresh table. |
 | `unpack20_multiblock.rar` | Explicit multiblock Unpack20 stream from the local corpus. |
 
 Known remaining gap: no vintage-encoder fixture currently proves a true

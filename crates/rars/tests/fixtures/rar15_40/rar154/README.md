@@ -10,8 +10,8 @@ single-file README fixtures.
 | `readme_154_password.rar` | Same payload patched to set `FHD_PASSWORD` and encrypt the packed stream with CRYPT_RAR15, password `password`; validated by RAR 3.93. |
 | `readme_154_store_solid.rar` | Single-file solid-archive flag variant; same payload. |
 | `doc_154_best.rar` | Multi-file compressed text corpus, 17 entries. |
-| `audio_win_names_unpack15.rar` | Audio-shaped WAV payload with Windows long names. |
-| `audio_dos_names_unpack15.rar` | Same audio-shaped payload with DOS 8.3 names. |
+| `audio_win_names_unpack15.rar` | Synthetic speech-shaped WAV and a short note with Windows long names, method `0x35`, `UNP_VER = 15`. Written by rars and validated by unrar, since WinRAR 1.54 is a Win16 program that wine cannot run. |
+| `audio_dos_names_unpack15.rar` | The same payloads under DOS 8.3 names. |
 | `random.rar` + `.r00` + `.r01` | Old-numbered multi-volume archive. |
 
 Expected `README.md` CRC32 is `0x509e5e3c`.

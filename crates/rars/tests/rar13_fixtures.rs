@@ -259,7 +259,7 @@ fn decodes_real_rar1402_stored_file() {
     assert_eq!(entry.name, b"README");
     assert_eq!(entry.header.pack_size, README_EXPECTED.len() as u32);
     assert_eq!(entry.header.unp_size, README_EXPECTED.len() as u32);
-    assert_eq!(entry.header.file_crc, 0xe079);
+    assert_eq!(entry.header.file_crc, 0x0fd8);
     assert_eq!(entry.header.head_size, 27);
     assert_eq!(entry.header.file_attr, 0x20);
     assert_eq!(entry.header.flags, 0);
@@ -281,8 +281,8 @@ fn real_rar1402_stored_checksum_matches_rolling_sum_rotate() {
     let entry = &archive.entries[0];
     let decoded = collect_entry(&archive, entry, None).expect("stored data");
 
-    assert_eq!(entry.header.file_crc, 0xe079);
-    assert_eq!(file_checksum(&decoded), 0xe079);
+    assert_eq!(entry.header.file_crc, 0x0fd8);
+    assert_eq!(file_checksum(&decoded), 0x0fd8);
     entry
         .verify_checksum(&decoded)
         .expect("RAR 1.3 rolling checksum");
@@ -294,9 +294,9 @@ fn decodes_real_rar1402_compressed_file() {
     assert_eq!(archive.entries.len(), 1);
     let entry = &archive.entries[0];
     assert_eq!(entry.name, b"README");
-    assert_eq!(entry.header.pack_size, 1078);
+    assert_eq!(entry.header.pack_size, 749);
     assert_eq!(entry.header.unp_size, README_EXPECTED.len() as u32);
-    assert_eq!(entry.header.file_crc, 0xe079);
+    assert_eq!(entry.header.file_crc, 0x0fd8);
     assert_eq!(entry.header.method, 3);
     assert!(!entry.is_stored());
 
@@ -304,7 +304,7 @@ fn decodes_real_rar1402_compressed_file() {
     assert_eq!(extracted.len(), 1);
     assert_eq!(extracted[0].name, b"README");
     assert_eq!(extracted[0].data, README_EXPECTED);
-    assert_eq!(file_checksum(&extracted[0].data), 0xe079);
+    assert_eq!(file_checksum(&extracted[0].data), 0x0fd8);
 }
 
 #[test]
@@ -446,9 +446,9 @@ fn parses_encrypted_compressed_file_metadata() {
     let entry = &archive.entries[0];
 
     assert_eq!(entry.name, b"README");
-    assert_eq!(entry.header.pack_size, 1078);
+    assert_eq!(entry.header.pack_size, 749);
     assert_eq!(entry.header.unp_size, README_EXPECTED.len() as u32);
-    assert_eq!(entry.header.file_crc, 0xe079);
+    assert_eq!(entry.header.file_crc, 0x0fd8);
     assert_eq!(entry.header.flags, 0x04);
     assert_eq!(entry.header.method, 3);
     assert!(entry.is_encrypted());
@@ -466,7 +466,7 @@ fn decodes_real_rar1402_encrypted_compressed_file() {
     assert_eq!(extracted.len(), 1);
     assert_eq!(extracted[0].name, b"README");
     assert_eq!(extracted[0].data, README_EXPECTED);
-    assert_eq!(file_checksum(&extracted[0].data), 0xe079);
+    assert_eq!(file_checksum(&extracted[0].data), 0x0fd8);
 }
 
 #[test]
@@ -497,7 +497,7 @@ fn extract_to_decodes_real_rar1402_encrypted_compressed_file() {
 
     let extracted = extracted.borrow();
     assert_eq!(&*extracted, README_EXPECTED);
-    assert_eq!(file_checksum(&extracted), 0xe079);
+    assert_eq!(file_checksum(&extracted), 0x0fd8);
 }
 
 #[test]

@@ -78,7 +78,7 @@ fn info_lists_rar13_entries() {
     let stdout = stdout(&output);
     assert!(stdout.contains("Rar13"));
     assert!(stdout.contains("README"));
-    assert!(stdout.contains("checksum=0xe079"));
+    assert!(stdout.contains("checksum=0x0fd8"));
 }
 
 #[test]
@@ -622,7 +622,7 @@ fn unicode_archive_names_override_explicit_legacy_encoding() {
             "test",
         ])
         .arg(fixture_rar15_40(
-            "encrypted/rar4_junrar_file_content_encrypted_unicode.rar",
+            "encrypted/rar4_unicode_name_encrypted.rar",
         ))
         .arg(&root)
         .output()
@@ -1274,7 +1274,7 @@ fn extracts_encrypted_compressed_fixture() {
         .output()
         .unwrap();
     assert!(output.status.success(), "stderr: {}", stderr(&output));
-    assert_eq!(fs::read(out_dir.join("README")).unwrap().len(), 2016);
+    assert_eq!(fs::read(out_dir.join("README")).unwrap().len(), 1514);
 }
 
 #[test]
