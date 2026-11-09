@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 
 use crate::codec::workspace::Budget;
 
@@ -97,6 +97,7 @@ where
                                 break None;
                             }
                         }
+                        Err(error) if error.kind() == ErrorKind::Interrupted => {}
                         Err(error) => break Some(error),
                     }
                 };
@@ -160,7 +161,10 @@ fn inline<R: Read, C: FnMut(&[u8])>(
     let mut read = 0u64;
     let mut written = 0u64;
     loop {
-        let count = reader.read(&mut buf).map_err(CopyError::Read)?;
+        let count = match reader.read(&mut buf) {
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            count => count.map_err(CopyError::Read)?,
+        };
         if count == 0 {
             return Ok(written);
         }
@@ -338,6 +342,44 @@ mod tests {
             )
             .unwrap_err();
             assert!(matches!(error, CopyError::Read(error) if error.to_string() == "truncated"));
+            assert_eq!(out, data);
+        }
+    }
+
+    /// Interrupts every other read, as a signal arriving mid-read does.
+    struct Interrupting<'a> {
+        data: &'a [u8],
+        interrupt: bool,
+    }
+
+    impl Read for Interrupting<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.interrupt = !self.interrupt;
+            if self.interrupt {
+                return Err(ErrorKind::Interrupted.into());
+            }
+            self.data.read(buf)
+        }
+    }
+
+    #[test]
+    fn interrupted_reads_are_retried() {
+        for len in [1000, 3 << 20] {
+            let data = pattern(len);
+            let mut out = Vec::new();
+            let written = copy(
+                &mut Interrupting {
+                    data: &data,
+                    interrupt: false,
+                },
+                len as u64,
+                false,
+                &mut |_: &[u8]| {},
+                &mut out,
+                &Allowance::default(),
+            )
+            .unwrap();
+            assert_eq!(written, len as u64);
             assert_eq!(out, data);
         }
     }
