@@ -11,6 +11,7 @@ pub use encoder::{
 #[cfg(all(test, feature = "write"))]
 mod streaming_tests;
 
+use super::packed_window::DRAINED;
 use super::workspace::{Allowance, Budget, Buffer};
 use super::{Error, Result};
 use std::io::{Read, Write};
@@ -312,8 +313,9 @@ impl<B: Budget> Reader15State<B> {
         const OUTPUT_CHUNK: usize = 64 * 1024;
 
         self.init_member(target, solid);
-        self.bits = ReaderBits::with_allowance(&[], &self.window.allowance())?;
-        self.bits.input.read_to_end(input)?;
+        self.bits = ReaderBits::streaming(&self.window.allowance());
+        // Read even for an empty member, so a failing source still surfaces.
+        self.bits.top_up(input)?;
 
         let allowance = self.window.allowance();
         let mut chunk = Buffer::new(&allowance);
@@ -330,7 +332,7 @@ impl<B: Budget> Reader15State<B> {
                 drop(chunk);
                 chunk = Buffer::with_capacity(capacity, &allowance)?;
             }
-            self.decode_loop_until(chunk_target, &mut chunk)?;
+            self.decode_loop_until(chunk_target, &mut chunk, input)?;
             out.write_all(&chunk).map_err(Error::from)?;
             chunk.clear();
         }
@@ -355,13 +357,21 @@ impl<B: Budget> Reader15State<B> {
             return Ok(());
         }
 
-        self.decode_loop_until(self.target, out)
+        self.decode_loop_until(self.target, out, &mut std::io::empty())
     }
 
-    fn decode_loop_until(&mut self, target: usize, out: &mut impl Write) -> Result<()> {
+    fn decode_loop_until(
+        &mut self,
+        target: usize,
+        out: &mut impl Write,
+        src: &mut dyn Read,
+    ) -> Result<()> {
         let mut poller = self.read_control.poller();
         while self.output_written < target {
             poller.check_codec(self.output_written)?;
+            // Bits past the end read as zeros, so the window must be topped
+            // up before every step, not only when a read runs short.
+            self.bits.top_up(src)?;
             self.decode_step(out)?;
         }
 
@@ -893,6 +903,8 @@ fn corr_huff(char_set: &mut [u16; 256], num_to_place: &mut [u8; 256]) {
 struct ReaderBits<B: Budget> {
     input: Buffer<u8, B>,
     bit_pos: usize,
+    // Bit position to refill the window at; `DRAINED` once the source is.
+    refill_at: usize,
 }
 
 impl<B: Budget> ReaderBits<B> {
@@ -900,12 +912,30 @@ impl<B: Budget> ReaderBits<B> {
         Ok(Self {
             input: Buffer::copied(input, allowance)?,
             bit_pos: 0,
+            refill_at: DRAINED,
         })
+    }
+
+    fn streaming(allowance: &B) -> Self {
+        Self {
+            input: Buffer::new(allowance),
+            bit_pos: 0,
+            refill_at: 0,
+        }
+    }
+
+    #[inline]
+    fn top_up(&mut self, src: &mut dyn Read) -> Result<()> {
+        if self.bit_pos >= self.refill_at {
+            self.refill_at = super::packed_window::refill(&mut self.input, &mut self.bit_pos, src)?;
+        }
+        Ok(())
     }
     fn try_clone(&self) -> Result<Self> {
         Ok(Self {
             input: Buffer::copied(&self.input, &self.input.allowance())?,
             bit_pos: self.bit_pos,
+            refill_at: self.refill_at,
         })
     }
 

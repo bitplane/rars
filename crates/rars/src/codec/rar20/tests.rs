@@ -440,7 +440,7 @@ fn repeat_last_without_a_previous_match_is_a_no_op() {
     decoder.in_block = true;
     decoder.bits.append(&[0b1000_0000]).unwrap(); // Repeat last, then literal zero.
 
-    decoder.decode_until(1).unwrap();
+    decoder.decode_until(1, &mut std::io::empty()).unwrap();
     assert_eq!(&*decoder.output, b"\0");
     assert_eq!(decoder.last_length, 0);
 }
@@ -459,7 +459,7 @@ fn old_offset_match_applies_the_long_distance_length_adjustment() {
     decoder.in_block = true;
     decoder.bits.append(&[0b1000_0000]).unwrap(); // Old offset 0, length slot 0.
 
-    decoder.decode_until(1).unwrap();
+    decoder.decode_until(1, &mut std::io::empty()).unwrap();
     assert_eq!(&*decoder.output, b"\0");
     assert_eq!(decoder.last_length, 5); // 2 + three distance adjustments.
     assert_eq!(decoder.pending_match, Some((4, 0x40000, true)));
@@ -478,7 +478,7 @@ fn unset_old_offset_match_uses_the_first_dictionary_byte() {
     decoder.in_block = true;
     decoder.bits.append(&[0b1000_0000]).unwrap();
 
-    decoder.decode_until(2).unwrap();
+    decoder.decode_until(2, &mut std::io::empty()).unwrap();
     assert_eq!(&*decoder.output, b"\0\0");
     assert_eq!(decoder.last_offset, 0);
 }

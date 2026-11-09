@@ -10,6 +10,7 @@ use crate::crc32::{crc32, Crc32};
 use crate::crypto::rar50::Rar50Cipher;
 use crate::crypto::rar50::Rar50Keys;
 use crate::error::{Error, Result};
+use crate::member_batches::{self, Plan};
 use crate::volume_extract::{ChainedReader, SplitVolumeState, SplitVolumeStep};
 use std::io::{Read, Write};
 
@@ -872,25 +873,12 @@ impl Archive {
                     }
                     return Ok(());
                 }
-                if file.is_split_before() || file.is_split_after() {
-                    return Err(Error::InvalidHeader(
-                        "RAR 5 split entry requires multivolume extraction",
-                    ));
-                }
-                file.check_output_limit(&budget)?;
-                let meta = file.metadata();
-                options.check_cancelled()?;
-                let mut writer = match selected_writer {
-                    Some(writer) => writer,
-                    None => open(&meta)?,
-                };
-                options.check_cancelled()?;
-                if !meta.is_directory {
-                    budget.run(&file.name, &mut writer, |writer| {
-                        session.write_file_to(self, file, writer)
-                    })?;
-                }
-                Ok(())
+                self.stream_member(file, options, &mut budget, &mut session, |meta| {
+                    match selected_writer {
+                        Some(writer) => Ok(writer),
+                        None => open(meta),
+                    }
+                })
             })();
             if crate::extraction_control::finish_member(
                 &mut on_error,
@@ -912,6 +900,57 @@ impl Archive {
         }
         options.check_cancelled()?;
         Ok(crate::ExtractionOutcome::Complete)
+    }
+
+    /// Decodes one non-redirection member straight to the writer `open` returns.
+    fn stream_member<B: Budget>(
+        &self,
+        file: &FileHeader,
+        options: crate::ArchiveReadOptions<'_>,
+        budget: &mut crate::output_limit::OutputBudget,
+        session: &mut DecoderSession<'_, B>,
+        open: impl FnOnce(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    ) -> Result<()> {
+        if file.is_split_before() || file.is_split_after() {
+            return Err(Error::InvalidHeader(
+                "RAR 5 split entry requires multivolume extraction",
+            ));
+        }
+        file.check_output_limit(budget)?;
+        let meta = file.metadata();
+        options.check_cancelled()?;
+        let mut writer = open(&meta)?;
+        options.check_cancelled()?;
+        if !meta.is_directory {
+            budget.run(&file.name, &mut writer, |writer| {
+                session.write_file_to(self, file, writer)
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Streams one independent member on the calling thread, between batches.
+    #[allow(clippy::too_many_arguments)]
+    fn extract_inline<F, B: Budget>(
+        &self,
+        file: &FileHeader,
+        options: crate::ArchiveReadOptions<'_>,
+        key_cache: &super::Rar50KeyCache,
+        buffered_decode_limit: u64,
+        allowance: &B,
+        open: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    {
+        options.check_cancelled()?;
+        file.check_dictionary_limit(options.rar50_dictionary_size_limit)?;
+        let mut budget = crate::output_limit::OutputBudget::new(options);
+        let mut session =
+            DecoderSession::with_allowance(options.password, buffered_decode_limit, allowance);
+        session.shared_key_cache = Some(key_cache);
+        session.decoder.read_control = budget.control.clone();
+        self.stream_member(file, options, &mut budget, &mut session, |meta| open(meta))
     }
 
     /// Decodes independent members in bounded batches, emitting in archive order.
@@ -957,130 +996,116 @@ impl Archive {
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
         options.check_cancelled()?;
-        // Admit and charge total-limited work in archive order before dispatch.
+        // Solid chains, ordered total-output charging and the shared scratch
+        // all need one session in archive order.
         if options.rar50_scratch.is_some()
             || options.max_total_output_bytes.is_some()
             || self.main.is_solid()
-            || self.files().any(|file| {
-                file.is_split_before()
-                    || file.is_split_after()
-                    || file.unpacked_size > rar50_buffered_decode_limit(options)
-                    || file.decoded_compression_info().is_ok_and(|info| info.solid)
-            })
+            || self
+                .files()
+                .any(|file| file.decoded_compression_info().is_ok_and(|info| info.solid))
         {
             return self.extract_to(options, open);
         }
 
-        let key_cache = super::Rar50KeyCache::default();
-        if let Some(limit) = options.max_reader_workspace_bytes {
-            let ledger = Allowance::limited(limit);
-            let publication = crate::read_control::ReadControl::new(options.cancellation);
-            return crate::codec::workspace::coordinator::extract_windowed(
-                self.files(),
-                &ledger,
-                |file| {
-                    if file.is_directory() || file.redirection.is_some() {
-                        0
-                    } else if file.is_stored() {
-                        if verification {
-                            0
-                        } else {
-                            file.unpacked_size
-                        }
-                    } else {
-                        file.unpacked_size
-                            .saturating_add(file.packed_size())
-                            .saturating_add(8192)
-                    }
-                },
-                |file, local| {
-                    options.check_cancelled()?;
-                    decode_parallel_entry_with_allowance(
-                        self,
-                        file,
-                        &key_cache,
-                        rar50_buffered_decode_limit(options),
-                        options,
-                        verification,
-                        local,
-                    )
-                },
-                |entry| write_parallel_entry(entry, open, &mut |_, _| Ok(()), &publication),
-            );
-        }
-
-        let buffered_decode_limit = rar50_buffered_decode_limit(options);
-        let mut files = self.files().peekable();
-        let window = crate::parallel::default_window().max(1);
-        let publication = crate::read_control::ReadControl::new(options.cancellation);
-        while files.peek().is_some() {
-            options.check_cancelled()?;
-            let mut batch = Vec::new();
-            let mut remaining = buffered_decode_limit;
-            while batch.len() < window {
-                let Some(file) = files.peek() else { break };
-                if file.unpacked_size > remaining {
-                    break;
-                }
-                remaining -= file.unpacked_size;
-                batch.push(files.next().expect("peeked file"));
+        match options.max_reader_workspace_bytes {
+            Some(limit) => {
+                self.parallel_with(options, open, verification, &Allowance::limited(limit))
             }
-            // Write the verified members ahead of a failure before reporting it.
-            let (entries, failure) = crate::parallel::map_prefix(batch, |file| {
-                decode_parallel_entry(
-                    self,
+            None => self.parallel_with(options, open, verification, &Allowance::default()),
+        }?;
+        options.check_cancelled()
+    }
+
+    fn parallel_with<F, B: member_batches::Workers>(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+        open: &mut F,
+        verification: bool,
+        allowance: &B,
+    ) -> Result<()>
+    where
+        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    {
+        let buffered_decode_limit = rar50_buffered_decode_limit(options);
+        let key_cache = super::Rar50KeyCache::default();
+        let publication = crate::read_control::ReadControl::new(options.cancellation);
+        let plan = |file: &FileHeader| {
+            if file.is_split_before() || file.is_split_after() {
+                // Fails inline, as sequential extraction does.
+                Plan::Inline
+            } else if file.is_directory() || file.redirection.is_some() {
+                Plan::Batch(0)
+            } else if verification && file.is_stored() {
+                // Verified as it is read, so nothing is buffered.
+                Plan::Batch(0)
+            } else if file.should_stream_decode(buffered_decode_limit) {
+                Plan::Inline
+            } else {
+                Plan::Batch(file.unpacked_size)
+            }
+        };
+        // Workspace admission also counts the packed input a decoder holds.
+        let hint = |file: &FileHeader| {
+            let Plan::Batch(cost) = plan(file) else {
+                unreachable!("only batched members are admitted")
+            };
+            if file.is_directory() || file.redirection.is_some() || file.is_stored() {
+                cost
+            } else {
+                cost.saturating_add(file.packed_size()).saturating_add(8192)
+            }
+        };
+        member_batches::run(
+            self.files(),
+            open,
+            plan,
+            |open, members| {
+                allowance.batches(
+                    members,
+                    buffered_decode_limit,
+                    open,
+                    hint,
+                    || options.check_cancelled(),
+                    |file, local| {
+                        decode_parallel_entry(
+                            self,
+                            file,
+                            &key_cache,
+                            buffered_decode_limit,
+                            options,
+                            verification,
+                            local,
+                        )
+                    },
+                    |open, entry| {
+                        member_batches::publish(
+                            entry,
+                            open,
+                            &publication,
+                            |meta| meta.name.clone(),
+                            |_, _| Ok(false),
+                        )
+                    },
+                )
+            },
+            |open, file| {
+                self.extract_inline(
                     file,
+                    options,
                     &key_cache,
                     buffered_decode_limit,
-                    options,
-                    verification,
+                    allowance,
+                    open,
                 )
-            });
-            for entry in entries {
-                write_parallel_entry(entry, open, &mut |_, _| Ok(()), &publication)?;
-            }
-            if let Some(error) = failure {
-                return Err(error);
-            }
-        }
-        options.check_cancelled()?;
-        Ok(())
+            },
+        )
     }
 }
 
-fn decode_parallel_entry(
-    archive: &Archive,
-    file: &FileHeader,
-    key_cache: &super::Rar50KeyCache,
-    buffered_decode_limit: u64,
-    options: crate::ArchiveReadOptions<'_>,
-    verification: bool,
-) -> Result<ParallelExtractedEntry> {
-    decode_parallel_entry_with_allowance(
-        archive,
-        file,
-        key_cache,
-        buffered_decode_limit,
-        options,
-        verification,
-        &Allowance::default(),
-    )
-}
+type ParallelExtractedEntry<B> = member_batches::Decoded<ExtractedEntryMeta, B>;
 
-enum ParallelExtractedEntry<B: Budget = Allowance> {
-    Directory(ExtractedEntryMeta),
-    Verified(ExtractedEntryMeta),
-    File {
-        meta: ExtractedEntryMeta,
-        data: Buffer<u8, B>,
-    },
-    Redirection {
-        meta: ExtractedEntryMeta,
-        redirection: FileRedirection,
-    },
-}
-
-fn decode_parallel_entry_with_allowance<B: Budget>(
+fn decode_parallel_entry<B: Budget>(
     archive: &Archive,
     file: &FileHeader,
     key_cache: &super::Rar50KeyCache,
@@ -1093,16 +1118,14 @@ fn decode_parallel_entry_with_allowance<B: Budget>(
     let mut budget = crate::output_limit::OutputBudget::new(options);
     file.check_dictionary_limit(options.rar50_dictionary_size_limit)?;
     file.check_output_limit(&budget)?;
-    if let Some(redirection) = &file.redirection {
-        return Ok(ParallelExtractedEntry::Redirection {
-            meta: file.metadata(),
-            redirection: redirection.clone(),
-        });
+    if file.redirection.is_some() {
+        // Redirections are not extracted here, as in sequential extraction.
+        return Ok(ParallelExtractedEntry::Nothing);
     }
     // The only caller dispatches workers after excluding split members.
     let meta = file.metadata();
     if meta.is_directory {
-        return Ok(ParallelExtractedEntry::Directory(meta));
+        return Ok(ParallelExtractedEntry::Opened(meta));
     }
     options.check_cancelled()?;
     let mut session =
@@ -1129,43 +1152,13 @@ fn decode_parallel_entry_with_allowance<B: Budget>(
         budget.run(&file.name, std::io::sink(), |writer| {
             session.write_file_to_with_history(archive, file, writer, history)
         })?;
-        return Ok(ParallelExtractedEntry::Verified(meta));
+        return Ok(ParallelExtractedEntry::Opened(meta));
     }
     let mut data = Buffer::new(allowance);
     budget.run(&file.name, &mut data, |writer| {
         session.write_file_to_with_history(archive, file, writer, history)
     })?;
     Ok(ParallelExtractedEntry::File { meta, data })
-}
-
-fn write_parallel_entry<F, R, B: Budget>(
-    entry: ParallelExtractedEntry<B>,
-    open: &mut F,
-    redirect: &mut R,
-    control: &crate::read_control::ReadControl,
-) -> Result<()>
-where
-    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-    R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
-{
-    control.check()?;
-    match entry {
-        ParallelExtractedEntry::Directory(meta) | ParallelExtractedEntry::Verified(meta) => {
-            let _ = open(&meta)?;
-        }
-        ParallelExtractedEntry::File { meta, data } => {
-            let mut writer = open(&meta)?;
-            control.check()?;
-            control
-                .write_all(&mut writer, &data)
-                .map_err(|error| Error::from(error).at_entry(meta.name.clone(), "extracting"))?;
-        }
-        ParallelExtractedEntry::Redirection { meta, redirection } => {
-            redirect(&meta, &redirection)?;
-        }
-    }
-    control.check()?;
-    Ok(())
 }
 
 struct DecodedData<B: Budget = Allowance> {
@@ -4357,6 +4350,7 @@ mod key_cache_tests {
                             BUFFERED_DECODE_LIMIT,
                             crate::ArchiveReadOptions::with_password(b"password"),
                             false,
+                            &Allowance::default(),
                         )
                         .unwrap();
                         match entry {

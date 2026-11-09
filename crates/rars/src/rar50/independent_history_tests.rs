@@ -195,12 +195,8 @@ fn entry_result<B: Budget>(
     value
         .map(|entry| match entry {
             ParallelExtractedEntry::File { meta, data } => (format!("{meta:?}"), data.to_vec()),
-            ParallelExtractedEntry::Directory(meta) | ParallelExtractedEntry::Verified(meta) => {
-                (format!("{meta:?}"), Vec::new())
-            }
-            ParallelExtractedEntry::Redirection { meta, redirection } => {
-                (format!("{meta:?} {redirection:?}"), Vec::new())
-            }
+            ParallelExtractedEntry::Opened(meta) => (format!("{meta:?}"), Vec::new()),
+            ParallelExtractedEntry::Nothing => (String::new(), Vec::new()),
         })
         .map_err(|error| format!("{error:?}"))
 }
@@ -241,7 +237,7 @@ fn independent_history_worker_limited_keeps_original_attempts_callbacks_and_erro
                     old_options,
                     &old,
                 ));
-                let output = entry_result(decode_parallel_entry_with_allowance(
+                let output = entry_result(decode_parallel_entry(
                     &archive,
                     file,
                     &crate::rar50::Rar50KeyCache::default(),
@@ -344,16 +340,13 @@ fn reference_decode_parallel_entry<B: Budget>(
     let mut budget = crate::output_limit::OutputBudget::new(options);
     file.check_dictionary_limit(options.rar50_dictionary_size_limit)?;
     file.check_output_limit(&budget)?;
-    if let Some(redirection) = &file.redirection {
-        return Ok(ParallelExtractedEntry::Redirection {
-            meta: file.metadata(),
-            redirection: redirection.clone(),
-        });
+    if file.redirection.is_some() {
+        return Ok(ParallelExtractedEntry::Nothing);
     }
     // The only caller dispatches workers after excluding split members.
     let meta = file.metadata();
     if meta.is_directory {
-        return Ok(ParallelExtractedEntry::Directory(meta));
+        return Ok(ParallelExtractedEntry::Opened(meta));
     }
     let mut data = Buffer::new(allowance);
     let mut session = DecoderSession::with_allowance(password, buffered_decode_limit, allowance);

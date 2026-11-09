@@ -70,7 +70,7 @@ fn old_stream<B: Budget>(
             .min(decoder.target);
         let mut chunk =
             Buffer::with_capacity(target - decoder.output_written, &decoder.window.allowance())?;
-        decoder.decode_loop_until(target, &mut chunk)?;
+        decoder.decode_loop_until(target, &mut chunk, &mut std::io::empty())?;
         out.write_all(&chunk).map_err(Error::from)?;
     }
     Ok(())
@@ -317,4 +317,27 @@ fn empty_target_keeps_input_errors_and_emits_nothing() {
     ));
     drop(decoder);
     assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn reader_decoding_holds_a_bounded_window_of_packed_input() {
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let data: Vec<u8> = (0..3 << 19)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as u8
+        })
+        .collect();
+    let packed = super::unpack15_encode(&data).unwrap();
+    assert!(packed.len() > crate::codec::packed_window::PACKED_WINDOW);
+    let mut decoder =
+        Reader15State::with_allowance(&crate::codec::workspace::Allowance::default()).unwrap();
+    let mut out = Vec::new();
+    decoder
+        .decode_member_from_reader(&mut packed.as_slice(), data.len(), false, &mut out)
+        .unwrap();
+    assert!(out == data);
+    assert!(decoder.bits.input.capacity() <= crate::codec::packed_window::PACKED_WINDOW);
 }

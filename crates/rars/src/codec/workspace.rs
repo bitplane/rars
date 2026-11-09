@@ -279,6 +279,20 @@ impl<T, B: Budget> Buffer<T, B> {
     fn reserve(&mut self, additional: usize) -> Result<()> {
         B::grow(&mut self.values, &mut self.charge, additional).map_err(Into::into)
     }
+    /// Grows to hold `total` values, doubling as usual but never past
+    /// `ceiling` unless `total` itself needs more. A window that settles at a
+    /// known size then never pays for a doubling beyond it.
+    pub(crate) fn reserve_up_to(&mut self, total: usize, ceiling: usize) -> Result<()> {
+        let capacity = self.values.capacity();
+        if total <= capacity {
+            return Ok(());
+        }
+        let capacity = capacity.saturating_mul(2).min(ceiling).max(total);
+        let mut replacement = Self::with_capacity(capacity, &self.allowance())?;
+        replacement.values.append(&mut self.values);
+        *self = replacement;
+        Ok(())
+    }
     pub(crate) fn reserve_total_capacity(&mut self, total: usize) -> Result<()> {
         if total > self.values.capacity() {
             self.reserve(total.saturating_sub(self.values.len()))?;

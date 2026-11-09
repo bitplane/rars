@@ -51,6 +51,7 @@ pub mod filter;
 mod filter_search;
 mod io_util;
 mod member;
+mod member_batches;
 pub use member::{ArchiveIndex, ArchiveMemberRef, ArchiveMemberRefs};
 mod member_read;
 pub use member_read::{read_volume_members_at, read_volume_members_at_with_options};
@@ -978,8 +979,14 @@ impl Archive {
         F: FnMut(&ExtractedEntryMeta) -> Result<()>,
     {
         options.check_cancelled()?;
-        if let Self::Rar50Plus(archive) = self {
-            return archive.test_to(options, |meta| tested(&rar50_meta(meta)));
+        match self {
+            Self::Rar50Plus(archive) => {
+                return archive.test_to(options, |meta| tested(&rar50_meta(meta)));
+            }
+            Self::Rar15To40(archive) => {
+                return archive.test_to(options, |meta| tested(&rar15_40_meta(meta)));
+            }
+            Self::Rar13(_) => {}
         }
         self.extract_to_parallel_buffered_with_options(options, |meta| {
             tested(meta)?;
