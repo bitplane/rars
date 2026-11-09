@@ -4703,14 +4703,7 @@ mod tests {
     #[test]
     fn preservation_end_records_require_complete_supported_layout() {
         let seed = preservation_seed(ArchiveVersion::Rar29);
-        let mut bytes = seed
-            .source
-            .read_range(0..seed.source.len().unwrap())
-            .unwrap();
-        let start = bytes.len();
-        bytes.extend([0, 0, ENDARC_HEAD, 0, 0, 7, 0]);
-        test_write_header_crc(&mut bytes[start..], 0);
-        let seed = Archive::parse_owned(bytes).unwrap();
+        assert!(matches!(seed.blocks.last(), Some(Block::End(_))));
         assert!(seed.rewrite_preservation_issues().is_empty());
         type Edit = fn(&mut BlockHeader);
         let edits: &[Edit] = &[

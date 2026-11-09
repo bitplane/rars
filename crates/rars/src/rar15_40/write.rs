@@ -688,7 +688,9 @@ fn write_members_to(
         )?;
     }
     if let Some(password) = header_password {
-        write_encrypted_end_block(output, password)?;
+        write_encrypted_end_block(output, ENDARC_FLAGS, password)?;
+    } else if writes_end_block(options.target) {
+        output.write_all(&end_block(ENDARC_FLAGS))?;
     }
     Ok(())
 }
@@ -2499,7 +2501,35 @@ fn random_rar30_salt() -> Result<[u8; 8]> {
 /// What WinRAR writes on an end-of-archive block. The bit marks the block as
 /// one a reader may skip without understanding it.
 const ENDARC_FLAGS: u16 = 0x4000;
+/// Set on every volume but the last, so a reader knows another follows.
+const EARC_NEXT_VOLUME: u16 = 0x0001;
 const END_HEADER_SIZE: usize = 7;
+
+/// RAR 3.00 beta 2, the first build writing the 2.9 format, closes with this block; 2.90 did not.
+fn writes_end_block(target: ArchiveVersion) -> bool {
+    matches!(
+        target,
+        ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
+    )
+}
+
+fn volume_end_flags(more_volumes: bool) -> u16 {
+    if more_volumes {
+        ENDARC_FLAGS | EARC_NEXT_VOLUME
+    } else {
+        ENDARC_FLAGS
+    }
+}
+
+fn end_block(flags: u16) -> [u8; END_HEADER_SIZE] {
+    let mut header = Vec::with_capacity(END_HEADER_SIZE);
+    header.extend_from_slice(&0u16.to_le_bytes());
+    header.push(ENDARC_HEAD);
+    header.extend_from_slice(&flags.to_le_bytes());
+    header.extend_from_slice(&(END_HEADER_SIZE as u16).to_le_bytes());
+    write_header_crc(&mut header, 0);
+    header.try_into().expect("end block is seven bytes")
+}
 
 fn write_main_header(out: &mut Vec<u8>, flags: u16) {
     let start = out.len();
@@ -2647,8 +2677,8 @@ fn write_archive_comment(
     Ok(())
 }
 
-/// Closes a header-encrypted archive with an end-of-archive block in a group of
-/// its own.
+/// Closes a header-encrypted archive or volume with an end-of-archive block in a
+/// group of its own.
 ///
 /// Every encrypted header carries its own salt, so a reader that reaches the end
 /// of the last member's payload reads eight more bytes looking for the next
@@ -2656,16 +2686,8 @@ fn write_archive_comment(
 /// clean end, and 7-Zip treats that as a decryption failure and refuses to open
 /// the archive at all. WinRAR closes the same way. unrar stops at the last
 /// member and never looks, which is why nothing caught this.
-fn write_encrypted_end_block(out: &mut dyn Write, password: &[u8]) -> Result<()> {
-    let mut header = Vec::new();
-    let start = header.len();
-    header.extend_from_slice(&0u16.to_le_bytes());
-    header.push(ENDARC_HEAD);
-    header.extend_from_slice(&ENDARC_FLAGS.to_le_bytes());
-    header.extend_from_slice(&(END_HEADER_SIZE as u16).to_le_bytes());
-    write_header_crc(&mut header, start);
-    debug_assert_eq!(header.len(), END_HEADER_SIZE);
-    write_encrypted_header(out, &header, password)
+fn write_encrypted_end_block(out: &mut dyn Write, flags: u16, password: &[u8]) -> Result<()> {
+    write_encrypted_header(out, &end_block(flags), password)
 }
 
 fn write_encrypted_header(out: &mut dyn Write, header: &[u8], password: &[u8]) -> Result<()> {
@@ -2919,6 +2941,9 @@ fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
         .map_err(|error| {
             crate::write_stream::member_error(error, entry.name, "writing volume member")
         })?;
+        if writes_end_block(entry.target) {
+            out.extend_from_slice(&end_block(volume_end_flags(split_after)));
+        }
         report_volume(entry.progress, index, chunks.len(), out.len())?;
         volumes.push(out);
     }
@@ -3010,6 +3035,7 @@ fn write_header_encrypted_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<
             crate::write_stream::member_error(error, entry.name, "writing volume member")
         })?;
         out.extend_from_slice(chunk);
+        write_encrypted_end_block(&mut out, volume_end_flags(split_after), password)?;
         report_volume(entry.progress, index, chunks.len(), out.len())?;
         volumes.push(out);
     }
