@@ -2808,7 +2808,7 @@ mod tests {
                     file.data_crc32 = None;
                 }
                 1 => {}
-                2 => first.source = ArchiveSource::File(Arc::new(missing.clone())),
+                2 => first.source = ArchiveSource::file(&missing),
                 3 | 4 => {
                     let Block::File(file) = &mut first.blocks[0] else {
                         unreachable!();
@@ -3390,7 +3390,7 @@ mod tests {
         let path = scratch.join("member.part");
         std::fs::write(&path, data).unwrap();
         let mut archive = archive_with_blocks(vec![Block::File(file)], Vec::new());
-        archive.source = ArchiveSource::File(Arc::new(path.clone()));
+        archive.source = ArchiveSource::file(&path);
         std::fs::write(&path, &data[..data.len() - 3]).unwrap();
 
         let captured = Rc::new(RefCell::new(Vec::new()));

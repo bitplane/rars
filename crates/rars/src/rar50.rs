@@ -557,8 +557,8 @@ impl Archive {
         options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Self> {
         options.check_cancelled()?;
-        let path = Arc::new(path.as_ref().to_path_buf());
-        let mut file = File::open(path.as_ref())?;
+        let path = path.as_ref();
+        let mut file = File::open(path)?;
         let len = file.metadata()?.len();
         let scan_len = len.min(SFX_SCAN_LIMIT as u64) as usize;
         let mut scan = vec![0; scan_len];
@@ -576,7 +576,7 @@ impl Archive {
             &mut file,
             archive_len,
             sig.offset,
-            ArchiveSource::File(path),
+            ArchiveSource::file(path),
             options,
         )
     }
@@ -616,8 +616,8 @@ impl Archive {
         if signature.family != ArchiveFamily::Rar50Plus {
             return Err(Error::UnsupportedSignature);
         }
-        let path = Arc::new(path.as_ref().to_path_buf());
-        let mut file = File::open(path.as_ref())?;
+        let path = path.as_ref();
+        let mut file = File::open(path)?;
         let len = file.metadata()?.len();
         let archive_len = usize::try_from(len)
             .map_err(|_| Error::InvalidHeader("RAR 5 archive size overflows usize"))?
@@ -627,7 +627,7 @@ impl Archive {
             &mut file,
             archive_len,
             signature.offset,
-            ArchiveSource::File(path),
+            ArchiveSource::file(path),
             options,
             key_cache,
         )
