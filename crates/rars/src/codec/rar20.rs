@@ -15,6 +15,7 @@ mod history_tests;
 #[cfg(test)]
 mod match_copy_tests;
 
+use super::packed_window::DRAINED;
 use super::workspace::{Allowance, Budget, Buffer};
 use super::{Error, Result};
 use std::io::{Read, Write};
@@ -32,6 +33,12 @@ const MAX_HISTORY: usize = 1024 * 1024;
 const HISTORY_TRIM_BATCH: usize = 64 * 1024;
 // Longest match that stays on the scalar copy path.
 const SHORT_MATCH: usize = 64;
+// Reader-based decoding writes and trims its history this often, so its
+// memory does not grow with the member.
+const STREAM_CHUNK: usize = 256 * 1024;
+// The most history a streamed member holds: the window, up to a quarter
+// window not yet trimmed, and the chunk being decoded.
+const STREAM_HISTORY: usize = MAX_HISTORY + MAX_HISTORY / 4 + STREAM_CHUNK;
 
 const LENGTH_BASES: [usize; LENGTH_COUNT] = [
     0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 28, 32, 40, 48, 56, 64, 80, 96, 112, 128,
@@ -208,11 +215,9 @@ impl<B: Budget> Reader20State<B> {
             self.bits = BitReader::with_allowance(&self.output.allowance());
         }
         self.bits.append(input)?;
-        self.decode_until(target).map_err(|error| match error {
-            Error::NeedMoreInput => Error::InvalidData("RAR 2.0 bitstream is truncated"),
-            error => error,
-        })?;
-        self.read_last_tables()?;
+        let src = &mut std::io::empty();
+        self.decode_until(target, src).map_err(truncated)?;
+        self.read_last_tables(src)?;
         let out = Buffer::copied(self.raw_range(start, target), &self.output.allowance())?;
         self.finish_history();
         Ok(out)
@@ -242,29 +247,39 @@ impl<B: Budget> Reader20State<B> {
         let target = start
             .checked_add(output_size)
             .ok_or(Error::InvalidData("RAR 2.0 output size overflows"))?;
-        self.prepare_history(output_size);
-        self.bits = BitReader::with_allowance(&self.output.allowance());
-        self.bits.input.read_to_end(input)?;
+        let src: &mut dyn Read = input;
+        self.bits = BitReader::streaming(&self.output.allowance());
+        self.bits.top_up(src)?;
         if !self.in_block && self.bits.remaining_bytes_from_current() > 0 {
-            self.read_tables().map_err(|error| match error {
-                Error::NeedMoreInput => Error::InvalidData("RAR 2.0 bitstream is truncated"),
-                error => error,
-            })?;
+            self.read_tables().map_err(truncated)?;
             self.in_block = true;
         }
-        self.decode_until(target).map_err(|error| match error {
-            Error::NeedMoreInput => Error::InvalidData("RAR 2.0 bitstream is truncated"),
-            error => error,
-        })?;
-        self.read_last_tables()?;
-
-        let decoded = self.raw_range(start, target);
-        out.write_all(decoded).map_err(Error::from)?;
+        let mut flushed = start;
+        while flushed < target {
+            let end = flushed.saturating_add(STREAM_CHUNK).min(target);
+            // A member that will fill the window gets its steady size at once,
+            // rather than growing through copies that briefly hold both.
+            let len = self.output.len();
+            let next = end.saturating_sub(self.current_pos());
+            let rest = target.saturating_sub(self.current_pos());
+            let total = (len + rest).min(STREAM_HISTORY).max(len + next);
+            self.output.reserve_up_to(total, STREAM_HISTORY)?;
+            self.decode_until(end, src).map_err(truncated)?;
+            out.write_all(self.raw_range(flushed, end))
+                .map_err(Error::from)?;
+            flushed = end;
+            // Keep the window and drop the rest, a quarter window at a time
+            // so the move is amortized.
+            if flushed.saturating_sub(MAX_HISTORY) >= self.base_offset + MAX_HISTORY / 4 {
+                self.trim_history(flushed, flushed);
+            }
+        }
+        self.read_last_tables(src)?;
         self.finish_history();
         Ok(())
     }
 
-    fn decode_until(&mut self, target: usize) -> Result<()> {
+    fn decode_until(&mut self, target: usize, src: &mut dyn Read) -> Result<()> {
         let mut poller = self.read_control.poller();
         while self.current_pos() < target {
             poller.check_codec(self.current_pos())?;
@@ -272,11 +287,12 @@ impl<B: Budget> Reader20State<B> {
             if self.current_pos() >= target {
                 break;
             }
+            self.bits.top_up(src)?;
             if !self.in_block {
                 self.read_tables()?;
                 self.in_block = true;
             }
-            self.decode_lz(target)?;
+            self.decode_lz(target, src)?;
         }
         Ok(())
     }
@@ -364,10 +380,11 @@ impl<B: Budget> Reader20State<B> {
         Ok(lengths)
     }
 
-    fn decode_lz(&mut self, output_size: usize) -> Result<()> {
+    fn decode_lz(&mut self, output_size: usize, src: &mut dyn Read) -> Result<()> {
         let mut poller = self.read_control.poller();
         while self.current_pos() < output_size {
             poller.check_codec(self.current_pos())?;
+            self.bits.top_up(src)?;
             if self.audio_block {
                 self.decode_audio_byte()?;
                 if !self.in_block {
@@ -603,7 +620,8 @@ impl<B: Budget> Reader20State<B> {
         self.copy_match_with_window(length, offset, output_size, before_window)
     }
 
-    fn read_last_tables(&mut self) -> Result<()> {
+    fn read_last_tables(&mut self, src: &mut dyn Read) -> Result<()> {
+        self.bits.top_up(src)?;
         if self.bits.remaining_bytes_from_current() < 5 {
             return Ok(());
         }
@@ -799,6 +817,8 @@ fn validate_huffman_counts(count: &[u16; 16]) -> Result<()> {
 struct BitReader<B: Budget = Allowance> {
     input: Buffer<u8, B>,
     bit_pos: usize,
+    // Bit position to refill the window at; `DRAINED` once the source is.
+    refill_at: usize,
 }
 
 impl<B: Budget> BitReader<B> {
@@ -806,13 +826,30 @@ impl<B: Budget> BitReader<B> {
         Self {
             input: Buffer::new(allowance),
             bit_pos: 0,
+            refill_at: DRAINED,
         }
+    }
+
+    fn streaming(allowance: &B) -> Self {
+        Self {
+            refill_at: 0,
+            ..Self::with_allowance(allowance)
+        }
+    }
+
+    #[inline]
+    fn top_up(&mut self, src: &mut dyn Read) -> Result<()> {
+        if self.bit_pos >= self.refill_at {
+            self.refill_at = super::packed_window::refill(&mut self.input, &mut self.bit_pos, src)?;
+        }
+        Ok(())
     }
 
     fn try_clone(&self) -> Result<Self> {
         Ok(Self {
             input: Buffer::copied(&self.input, &self.input.allowance())?,
             bit_pos: self.bit_pos,
+            refill_at: self.refill_at,
         })
     }
     fn append(&mut self, input: &[u8]) -> Result<()> {
@@ -896,5 +933,12 @@ impl<B: Budget> BitReader<B> {
 impl BitReader<Allowance> {
     fn new() -> Self {
         Self::with_allowance(&Allowance::default())
+    }
+}
+
+fn truncated(error: Error) -> Error {
+    match error {
+        Error::NeedMoreInput => Error::InvalidData("RAR 2.0 bitstream is truncated"),
+        error => error,
     }
 }

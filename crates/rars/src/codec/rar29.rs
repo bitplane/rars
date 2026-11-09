@@ -23,6 +23,7 @@ use standard_filters::{apply_standard_filter_with_allowance, identify_standard_f
 use super::filters::DeltaErrorMessages;
 #[cfg(all(test, feature = "write"))]
 use super::filters::MAX_DELTA_CHANNELS;
+use super::packed_window::DRAINED;
 use super::ppmd::{PpmdByteReader, PpmdState};
 use super::rarvm;
 use super::workspace::{Allowance, Budget, Buffer};
@@ -39,11 +40,9 @@ const MAX_HISTORY: usize = 4 * 1024 * 1024;
 // Matches up to this long are copied byte by byte (see `copy_match`).
 const SHORT_MATCH: usize = 64;
 const STREAM_CHUNK: usize = 1024 * 1024;
-// Packed input is read through a window this size, not whole, so memory does not grow with the member.
-const PACKED_WINDOW: usize = 1024 * 1024;
-// Above the most one decode step can read without a refill: an LZ VM code is at most 64 KiB.
-const PACKED_LOW_WATER: usize = 128 * 1024;
-const PACKED_READ_CHUNK: usize = 32 * 1024;
+// The most history a streamed member holds: the window, up to a quarter
+// window not yet trimmed, and the chunk being decoded.
+const STREAM_HISTORY: usize = MAX_HISTORY + MAX_HISTORY / 4 + STREAM_CHUNK;
 // RARVM's standard AUDIO filter reserves an eight-bit-ish compatibility
 // range wider than WinRAR's usual 1..=4 channel choices. UnRAR accepts up to
 // 128; keep this distinct from DELTA's 1024-channel ceiling.
@@ -488,6 +487,13 @@ impl<B: Budget> Reader29State<B> {
         }
 
         while flushed < final_target {
+            // A member that will fill the window gets its steady size at once,
+            // rather than growing through copies that briefly hold both.
+            let len = self.output.len();
+            let next = target.saturating_sub(self.current_pos());
+            let rest = final_target.saturating_sub(self.current_pos());
+            let total = (len + rest).min(STREAM_HISTORY).max(len + next);
+            self.output.reserve_up_to(total, STREAM_HISTORY)?;
             self.decode_until(target, src)
                 .map_err(|error| match error {
                     Error::NeedMoreInput => Error::InvalidData("RAR 2.9 bitstream is truncated"),
@@ -503,8 +509,19 @@ impl<B: Budget> Reader29State<B> {
                 continue;
             }
 
-            let decoded = self.filtered_range_owned(flushed, safe_end, start)?;
-            out.write_all(&decoded).map_err(Error::from)?;
+            // Unfiltered output is written straight from the history, without
+            // a copy that would double the chunk's memory.
+            if self
+                .filters
+                .iter()
+                .any(|filter| filter.start >= flushed && filter.end() <= safe_end)
+            {
+                let decoded = self.filtered_range_owned(flushed, safe_end, start)?;
+                out.write_all(&decoded).map_err(Error::from)?;
+            } else {
+                out.write_all(self.raw_range(flushed, safe_end)?)
+                    .map_err(Error::from)?;
+            }
             flushed = safe_end;
             self.trim_history(flushed, self.current_pos());
             target = self
@@ -912,7 +929,7 @@ impl<B: Budget> Reader29State<B> {
         let mut vm = BitReader {
             input: data,
             bit_pos: 0,
-            refill_at: usize::MAX,
+            refill_at: DRAINED,
         };
         let program_index = if first_byte & 0x80 != 0 {
             let value = vm.read_encoded_u32()?;
@@ -1389,7 +1406,7 @@ impl<B: Budget> BitReader<B> {
         Self {
             input: Buffer::new(allowance),
             bit_pos: 0,
-            refill_at: usize::MAX,
+            refill_at: DRAINED,
         }
     }
 
@@ -1404,7 +1421,7 @@ impl<B: Budget> BitReader<B> {
         Ok(Self {
             input: Buffer::copied(input, allowance)?,
             bit_pos: 0,
-            refill_at: usize::MAX,
+            refill_at: DRAINED,
         })
     }
     fn try_clone(&self) -> Result<Self> {
@@ -1425,24 +1442,7 @@ impl<B: Budget> BitReader<B> {
 
     #[cold]
     fn refill(&mut self, src: &mut dyn Read) -> Result<()> {
-        self.compact();
-        let mut chunk = [0u8; PACKED_READ_CHUNK];
-        while self.input.len() < PACKED_WINDOW {
-            let want = (PACKED_WINDOW - self.input.len()).min(chunk.len());
-            let len = match src.read(&mut chunk[..want]) {
-                Ok(0) => {
-                    self.refill_at = usize::MAX;
-                    return Ok(());
-                }
-                Ok(len) => len,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(Error::from(error)),
-            };
-            self.input
-                .extend_from_slice(&chunk[..len])
-                .map_err(Into::into)?;
-        }
-        self.refill_at = (PACKED_WINDOW - PACKED_LOW_WATER) * 8;
+        self.refill_at = super::packed_window::refill(&mut self.input, &mut self.bit_pos, src)?;
         Ok(())
     }
 
@@ -1455,6 +1455,7 @@ impl<B: Budget> BitReader<B> {
             .expect("test input allowance");
     }
 
+    #[cfg(all(test, feature = "write"))]
     fn compact(&mut self) {
         let bytes = self.bit_pos / 8;
         if bytes == 0 {

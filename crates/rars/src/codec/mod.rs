@@ -9,6 +9,7 @@ mod huffman;
 mod match_finder;
 #[cfg(feature = "write")]
 mod packed_chain;
+pub(crate) mod packed_window;
 mod ppmd;
 pub mod rar13;
 pub mod rar20;

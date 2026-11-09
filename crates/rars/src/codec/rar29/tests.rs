@@ -339,6 +339,7 @@ fn cancellation_propagates_from_shared_standard_filter_decoders() {
     }
 }
 use super::rarvm::{Instruction, Opcode, Operand, Program};
+use crate::codec::packed_window::PACKED_WINDOW;
 use std::ops::Range;
 
 fn encode_tokens(input: &[u8], history: &[u8], options: EncodeOptions) -> Vec<EncodeToken> {
@@ -369,10 +370,9 @@ use super::{
     Unpack29Encoder, VmFilter, VmProgram, VmProgramKind, LENGTH_COUNT, LOW_OFFSET_COUNT,
     MAIN_COUNT, MAX_ENCODER_MATCH_LENGTH, MAX_ENCODER_MATCH_OFFSET, MAX_HISTORY,
     MAX_MATCH_CANDIDATES, MAX_VM_AUDIO_FILTER_BLOCK_SIZE, MAX_VM_BLOCK_SIZE,
-    MAX_VM_DELTA_FILTER_BLOCK_SIZE, MAX_VM_FILTER_BLOCK_SIZE, OFFSET_COUNT, PACKED_WINDOW,
-    PPMD_DICTIONARY_MB, PPMD_ESC, PPMD_ORDER, RAR3_AUDIO_FILTER_BYTECODE,
-    RAR3_DELTA_FILTER_BYTECODE, RAR3_ITANIUM_FILTER_BYTECODE, RAR3_RGB_FILTER_BYTECODE,
-    STREAM_CHUNK, TABLE_COUNT,
+    MAX_VM_DELTA_FILTER_BLOCK_SIZE, MAX_VM_FILTER_BLOCK_SIZE, OFFSET_COUNT, PPMD_DICTIONARY_MB,
+    PPMD_ESC, PPMD_ORDER, RAR3_AUDIO_FILTER_BYTECODE, RAR3_DELTA_FILTER_BYTECODE,
+    RAR3_ITANIUM_FILTER_BYTECODE, RAR3_RGB_FILTER_BYTECODE, STREAM_CHUNK, TABLE_COUNT,
 };
 
 /// A flat code charges the same for every symbol in play. The keep-tables
@@ -4416,4 +4416,20 @@ fn solid_reader_decoding_carries_the_same_state_as_slice_decoding() {
         assert!(out == *member);
         assert_same_carried_state(&from_slice, &from_reader);
     }
+}
+
+#[test]
+fn reader_decoding_holds_its_history_at_the_window_size() {
+    // Growing a 4 MiB history by doubling would need 12 MiB at the copy.
+    let input = noise(9, 6 << 20);
+    let packed = unpack29_encode_literals(&input).unwrap();
+    let budget = crate::codec::workspace::Allowance::limited(8 << 20);
+    let mut state = super::Reader29State::with_allowance(&budget);
+    let mut out = Vec::new();
+    state
+        .decode_non_solid_member_from_reader(&mut packed.as_slice(), input.len(), &mut out)
+        .unwrap();
+    assert!(out == input);
+    drop(state);
+    assert_eq!(budget.used(), 0);
 }
