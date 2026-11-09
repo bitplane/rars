@@ -441,13 +441,13 @@ impl FileHeader {
         let expected_len = usize::try_from(self.unp_size)
             .map_err(|_| Error::InvalidHeader("RAR 1.5 unpacked size overflows usize"))?;
         let mut crc = Crc32::new();
-        let mut crc_writer = CrcWriter {
-            inner: out,
-            crc: &mut crc,
-        };
-        let copied = std::io::copy(
+        let copied = crate::stored_copy::copy(
             &mut reader.by_ref().take(expected_len as u64),
-            &mut crc_writer,
+            expected_len as u64,
+            false,
+            &mut |chunk: &[u8]| crc.update(chunk),
+            out,
+            allowance,
         )?;
         if copied != expected_len as u64 {
             return Err(self.map_encrypted_payload_error(

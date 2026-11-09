@@ -543,12 +543,14 @@ impl<B: Budget> PendingSplitRefs<B> {
                         }
 
                         let mut crc = Crc32::new();
-                        let mut crc_writer = CrcWriter {
-                            inner: &mut writer,
-                            crc: &mut crc,
-                        };
-                        let copied =
-                            std::io::copy(&mut reader.take(expected_len as u64), &mut crc_writer)?;
+                        let copied = crate::stored_copy::copy(
+                            &mut reader.take(expected_len as u64),
+                            expected_len as u64,
+                            false,
+                            &mut |chunk: &[u8]| crc.update(chunk),
+                            &mut writer,
+                            &self.fragments.allowance(),
+                        )?;
                         if copied != expected_len as u64 {
                             return Err(Error::InvalidHeader(
                                 "RAR 1.5 split stored file ended before unpacked size",

@@ -3103,8 +3103,7 @@ mod tests {
     #[cfg(feature = "encryption")]
     fn extract_to_encrypted_archive_reads_through_file_backed_decrypted_range() {
         // The Memory-backed path is already exercised; this test takes the
-        // same encrypted archive out to disk so copy_decrypted_range_to runs
-        // its ArchiveSource::File branch.
+        // same encrypted archive out to disk so the stored copy reads a file.
         let input = [StoredEntry {
             name: b"secret.bin",
             data: b"file-backed secret payload",
