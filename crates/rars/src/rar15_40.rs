@@ -1590,7 +1590,7 @@ impl Archive {
         &self,
         options: crate::ArchiveReadOptions<'_>,
         open: &mut F,
-        mut links: Option<&mut LegacyLink<'_>>,
+        links: Option<&mut LegacyLink<'_>>,
         verification: bool,
     ) -> Result<()>
     where
@@ -1607,6 +1607,30 @@ impl Archive {
                 .map(|_| ());
         }
 
+        match options.max_reader_workspace_bytes {
+            Some(limit) => self.parallel_with(
+                options,
+                open,
+                links,
+                verification,
+                &Allowance::limited(limit),
+            ),
+            None => self.parallel_with(options, open, links, verification, &Allowance::default()),
+        }?;
+        options.check_cancelled()
+    }
+
+    fn parallel_with<F, B: member_batches::Workers>(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+        open: &mut F,
+        mut links: Option<&mut LegacyLink<'_>>,
+        verification: bool,
+        allowance: &B,
+    ) -> Result<()>
+    where
+        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    {
         let emit_links = links.is_some();
         let publication = crate::read_control::ReadControl::new(options.cancellation);
         let plan = |file: &FileHeader| {
@@ -1622,60 +1646,33 @@ impl Archive {
                 Plan::Batch(file.unp_size)
             }
         };
-        let mut ctx = (open, &mut links);
-
-        if let Some(limit) = options.max_reader_workspace_bytes {
-            let ledger = Allowance::limited(limit);
-            return member_batches::run(
-                self.files(),
-                &mut ctx,
-                plan,
-                |(open, links), members| {
-                    crate::codec::workspace::coordinator::extract_windowed(
-                        members.iter().map(|&(file, _)| file),
-                        &ledger,
-                        |file| parallel_hint(file, verification),
-                        |file, local| {
-                            options.check_cancelled()?;
-                            decode_parallel_entry_with_allowance(
-                                self,
-                                file,
-                                options,
-                                local,
-                                emit_links,
-                                verification,
-                            )
-                        },
-                        |entry| write_parallel_entry(entry, &mut **open, &publication, links),
-                    )
-                },
-                |(open, links), file| self.extract_inline(file, options, &ledger, *open, links),
-            );
-        }
-
         member_batches::run(
             self.files(),
-            &mut ctx,
+            &mut (open, &mut links),
             plan,
             |ctx, members| {
-                // Write the members ahead of a failure before reporting it.
-                member_batches::in_windows(
+                allowance.batches(
                     members,
                     member_batches::LEGACY_BATCH_BYTES,
                     ctx,
+                    |file| parallel_hint(file, verification),
                     || options.check_cancelled(),
-                    |file| decode_parallel_entry(self, file, options, emit_links, verification),
+                    |file, local| {
+                        decode_parallel_entry(self, file, options, local, emit_links, verification)
+                    },
                     |(open, links), entry| {
-                        write_parallel_entry(entry, &mut **open, &publication, links)
+                        member_batches::publish(
+                            entry,
+                            &mut **open,
+                            &publication,
+                            |meta| meta.name.clone(),
+                            |meta, data| emit_legacy_link(meta, data, links, &publication),
+                        )
                     },
                 )
             },
-            |(open, links), file| {
-                self.extract_inline(file, options, &Allowance::default(), *open, links)
-            },
-        )?;
-        options.check_cancelled()?;
-        Ok(())
+            |(open, links), file| self.extract_inline(file, options, allowance, *open, links),
+        )
     }
 
     pub fn archive_comment(&self) -> Result<Option<Vec<u8>>> {
@@ -1746,23 +1743,6 @@ impl Archive {
     }
 }
 
-fn decode_parallel_entry(
-    archive: &Archive,
-    file: &FileHeader,
-    options: crate::ArchiveReadOptions<'_>,
-    links: bool,
-    verification: bool,
-) -> Result<ParallelExtractedEntry> {
-    decode_parallel_entry_with_allowance(
-        archive,
-        file,
-        options,
-        &Allowance::default(),
-        links,
-        verification,
-    )
-}
-
 /// Workspace admission hint for one worker. Verification keeps no output, so
 /// it holds the packed input and at most a 4 MiB window.
 fn parallel_hint(file: &FileHeader, verification: bool) -> u64 {
@@ -1783,16 +1763,9 @@ fn parallel_hint(file: &FileHeader, verification: bool) -> u64 {
         .saturating_add(8192)
 }
 
-enum ParallelExtractedEntry<B: Budget = Allowance> {
-    Directory(ExtractedEntryMeta),
-    Verified(ExtractedEntryMeta),
-    File {
-        meta: ExtractedEntryMeta,
-        data: Buffer<u8, B>,
-    },
-}
+type ParallelExtractedEntry<B> = member_batches::Decoded<ExtractedEntryMeta, B>;
 
-fn decode_parallel_entry_with_allowance<B: Budget>(
+fn decode_parallel_entry<B: Budget>(
     archive: &Archive,
     file: &FileHeader,
     options: crate::ArchiveReadOptions<'_>,
@@ -1806,7 +1779,7 @@ fn decode_parallel_entry_with_allowance<B: Budget>(
     // Split members are planned inline, never onto a worker.
     let meta = file.metadata();
     if meta.is_directory {
-        return Ok(ParallelExtractedEntry::Directory(meta));
+        return Ok(ParallelExtractedEntry::Opened(meta));
     }
     budget.check(file.unp_size, &file.name)?;
     check_legacy_size(&meta, file.unp_size, links)?;
@@ -1817,7 +1790,7 @@ fn decode_parallel_entry_with_allowance<B: Budget>(
             decode_member_into(archive, file, password, &mut session, allowance, writer)?;
             options.check_cancelled()
         })?;
-        return Ok(ParallelExtractedEntry::Verified(meta));
+        return Ok(ParallelExtractedEntry::Opened(meta));
     }
     let mut data = Buffer::new(allowance);
     budget.run(&file.name, &mut data, |writer| {
@@ -1842,35 +1815,6 @@ fn decode_member_into<B: Budget>(
         session.write_file_to(archive, file, writer)
     }
     .map_err(|error| file.entry_error("extracting", error))
-}
-
-fn write_parallel_entry<F, B: Budget>(
-    entry: ParallelExtractedEntry<B>,
-    open: &mut F,
-    control: &crate::read_control::ReadControl,
-    links: &mut Option<&mut LegacyLink<'_>>,
-) -> Result<()>
-where
-    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-{
-    control.check()?;
-    match entry {
-        ParallelExtractedEntry::Directory(meta) | ParallelExtractedEntry::Verified(meta) => {
-            let _ = open(&meta)?;
-        }
-        ParallelExtractedEntry::File { meta, data } => {
-            if emit_legacy_link(&meta, &data, links, control)? {
-                return Ok(());
-            }
-            let mut writer = open(&meta)?;
-            control.check()?;
-            control
-                .write_all(&mut writer, &data)
-                .map_err(|error| Error::from(error).at_entry(meta.name.clone(), "extracting"))?;
-        }
-    }
-    control.check()?;
-    Ok(())
 }
 
 fn classify_new_sub(name: &[u8]) -> NewSubKind {

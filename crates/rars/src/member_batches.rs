@@ -7,7 +7,10 @@
 //! archive, and inline members leave the worker pool idle for any parallelism
 //! inside their own decode.
 
-use crate::Result;
+use crate::codec::workspace::{coordinator, Allowance, Budget, Buffer, Limited};
+use crate::read_control::ReadControl;
+use crate::{Error, Result};
+use std::io::Write;
 
 /// Archive-wide byte budget for a batch of legacy members whose decoded output
 /// is buffered for in-order publication. Larger members stream inline.
@@ -51,34 +54,121 @@ pub(crate) fn run<T: Copy, C: ?Sized>(
     Ok(())
 }
 
-/// Decodes `members` on workers, at most one per worker and `capacity` bytes of
-/// cost per batch, and publishes each batch in order before starting the next.
-/// A member costing more than `capacity` forms a batch of its own. The members
-/// ahead of a failure in its batch are published before the failure returns.
-pub(crate) fn in_windows<T: Copy + Send, O: Send, C: ?Sized>(
-    members: &[(T, u64)],
-    capacity: u64,
-    ctx: &mut C,
-    check: impl Fn() -> Result<()>,
-    decode: impl Fn(T) -> Result<O> + Sync + Send,
-    mut publish: impl FnMut(&mut C, O) -> Result<()>,
+/// What a worker hands back for in-order publication.
+pub(crate) enum Decoded<M, B: Budget> {
+    /// Nothing to publish, such as a redirection that is not extracted.
+    Nothing,
+    /// Published by opening its writer: a directory, or a verified member.
+    Opened(M),
+    /// Decoded output, written once the members before it are published.
+    File { meta: M, data: Buffer<u8, B> },
+}
+
+/// Publishes one worker result through `open`. `divert` can take a file's
+/// output instead, as legacy symbolic links do; it returns whether it did.
+pub(crate) fn publish<M, B: Budget>(
+    entry: Decoded<M, B>,
+    open: &mut impl FnMut(&M) -> Result<Box<dyn Write>>,
+    control: &ReadControl,
+    name: impl Fn(&M) -> Vec<u8>,
+    divert: impl FnOnce(&M, &[u8]) -> Result<bool>,
 ) -> Result<()> {
-    let window = crate::parallel::default_window().max(1);
-    let mut rest = members;
-    while !rest.is_empty() {
-        check()?;
-        let (batch, tail) = rest.split_at(batch_len(rest, window, capacity));
-        rest = tail;
-        let batch = batch.iter().map(|&(member, _)| member).collect();
-        let (outputs, failure) = crate::parallel::map_prefix(batch, &decode);
-        for output in outputs {
-            publish(ctx, output)?;
+    control.check()?;
+    match entry {
+        Decoded::Nothing => {}
+        Decoded::Opened(meta) => {
+            open(&meta)?;
         }
-        if let Some(error) = failure {
-            return Err(error);
+        Decoded::File { meta, data } => {
+            if divert(&meta, &data)? {
+                return Ok(());
+            }
+            let mut writer = open(&meta)?;
+            control.check()?;
+            control
+                .write_all(&mut writer, &data)
+                .map_err(|error| Error::from(error).at_entry(name(&meta), "extracting"))?;
         }
     }
-    Ok(())
+    control.check()
+}
+
+/// A workspace policy the driver can schedule worker batches under. Each
+/// worker decodes with the allowance it is handed.
+pub(crate) trait Workers: Budget<Charge: Send> + Sync {
+    /// Decodes `members` on workers and publishes them in archive order.
+    /// `capacity` bounds an unlimited batch's planned cost; a limited
+    /// workspace instead admits each batch by `hint` against its ledger.
+    #[allow(clippy::too_many_arguments)]
+    fn batches<T: Copy + Send, O: Send, C: ?Sized>(
+        &self,
+        members: &[(T, u64)],
+        capacity: u64,
+        ctx: &mut C,
+        hint: impl Fn(T) -> u64,
+        check: impl Fn() -> Result<()> + Sync,
+        decode: impl Fn(T, &Self) -> Result<O> + Sync + Send,
+        publish: impl FnMut(&mut C, O) -> Result<()>,
+    ) -> Result<()>;
+}
+
+/// At most one member per worker and `capacity` bytes of cost per batch; a
+/// member costing more than `capacity` forms a batch of its own. The members
+/// ahead of a failure in its batch are published before the failure returns.
+impl Workers for Allowance {
+    fn batches<T: Copy + Send, O: Send, C: ?Sized>(
+        &self,
+        members: &[(T, u64)],
+        capacity: u64,
+        ctx: &mut C,
+        _: impl Fn(T) -> u64,
+        check: impl Fn() -> Result<()> + Sync,
+        decode: impl Fn(T, &Self) -> Result<O> + Sync + Send,
+        mut publish: impl FnMut(&mut C, O) -> Result<()>,
+    ) -> Result<()> {
+        let window = crate::parallel::default_window().max(1);
+        let mut rest = members;
+        while !rest.is_empty() {
+            check()?;
+            let (batch, tail) = rest.split_at(batch_len(rest, window, capacity));
+            rest = tail;
+            let batch = batch.iter().map(|&(member, _)| member).collect();
+            let (outputs, failure) =
+                crate::parallel::map_prefix(batch, |member| decode(member, self));
+            for output in outputs {
+                publish(ctx, output)?;
+            }
+            if let Some(error) = failure {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Workers for Limited {
+    /// Publishes nothing from a batch with a failure in it.
+    fn batches<T: Copy + Send, O: Send, C: ?Sized>(
+        &self,
+        members: &[(T, u64)],
+        _: u64,
+        ctx: &mut C,
+        hint: impl Fn(T) -> u64,
+        check: impl Fn() -> Result<()> + Sync,
+        decode: impl Fn(T, &Self) -> Result<O> + Sync + Send,
+        mut publish: impl FnMut(&mut C, O) -> Result<()>,
+    ) -> Result<()> {
+        coordinator::extract_windowed(
+            members.iter().map(|&(member, _)| member),
+            self,
+            hint,
+            |member, local| {
+                check()?;
+                decode(member, local)
+            },
+            |output| publish(ctx, output),
+        )
+    }
 }
 
 /// How many of `members` the next batch takes: at least one, at most `window`,
@@ -183,24 +273,26 @@ mod tests {
     fn windows_publish_the_prefix_ahead_of_a_failure() {
         let members = [(0u32, 0), (1, 0), (2, 0)];
         let mut published = Vec::new();
-        let error = in_windows(
-            &members,
-            10,
-            &mut published,
-            || Ok(()),
-            |member| {
-                if member == 1 {
-                    Err(Error::Cancelled)
-                } else {
-                    Ok(member)
-                }
-            },
-            |published, member| {
-                published.push(member);
-                Ok(())
-            },
-        )
-        .unwrap_err();
+        let error = Allowance::default()
+            .batches(
+                &members,
+                10,
+                &mut published,
+                |_| 0,
+                || Ok(()),
+                |member, _| {
+                    if member == 1 {
+                        Err(Error::Cancelled)
+                    } else {
+                        Ok(member)
+                    }
+                },
+                |published, member| {
+                    published.push(member);
+                    Ok(())
+                },
+            )
+            .unwrap_err();
         assert!(matches!(error, Error::Cancelled));
         assert_eq!(published, [0]);
     }
