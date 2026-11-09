@@ -1757,8 +1757,12 @@ fn parallel_hint(file: &FileHeader, verification: bool) -> u64 {
     } else {
         file.unp_size
     };
+    // Packed input is read through a fixed window, not whole.
+    let packed = file
+        .pack_size
+        .min(crate::codec::packed_window::PACKED_WINDOW as u64);
     output
-        .saturating_add(file.pack_size)
+        .saturating_add(packed)
         .saturating_add(if file.unp_ver == 15 { 65536 } else { 0 })
         .saturating_add(8192)
 }

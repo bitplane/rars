@@ -26,9 +26,15 @@ where
     M: Fn(T, &Limited) -> Result<O> + Sync + Send,
     P: FnMut(O) -> Result<()>,
 {
+    let overhead = std::mem::size_of::<Slot<T, O>>() as u64;
+    // A member estimated above the whole workspace runs alone with all of it,
+    // as it would sequentially; its real allocations decide.
+    let ceiling = ledger
+        .available()
+        .saturating_sub(overhead + RESERVATION_BYTES);
+    let hint = |item| hint(item).min(ceiling);
     let mut items = items.peekable();
     while let Some(&first) = items.peek() {
-        let overhead = std::mem::size_of::<Slot<T, O>>() as u64;
         let first_cost = hint(first)
             .saturating_add(overhead)
             .saturating_add(RESERVATION_BYTES);
@@ -78,16 +84,20 @@ where
             }
             reservation.retire();
         });
-        // No successful sibling is published on a batch failure. Dropping slots
-        // frees their results, including results whose reservations have retired.
-        for slot in &mut slots {
-            if slot.result.as_ref().is_some_and(Result::is_err) {
-                return Err(slot.result.take().expect("failed worker").err().unwrap());
+        // The members ahead of a failure are published, as sequential
+        // extraction would; a member skipped once a later one failed ends the
+        // prefix. Dropping slots frees the rest, including results whose
+        // reservations have retired.
+        for index in 0..slots.len() {
+            match slots[index].result.take() {
+                Some(result) => publish(result?)?,
+                None => {
+                    let failure = slots[index..]
+                        .iter_mut()
+                        .find_map(|slot| slot.result.take()?.err());
+                    return Err(failure.unwrap_or(Error::Cancelled));
+                }
             }
-        }
-        for slot in &mut slots {
-            let result = slot.result.take().ok_or(Error::Cancelled)??;
-            publish(result)?;
         }
     }
     Ok(())
@@ -129,6 +139,62 @@ mod tests {
         )
         .unwrap();
         assert_eq!(published.load(Ordering::SeqCst), 3);
+        assert_eq!(ledger.used(), 0);
+    }
+
+    #[test]
+    fn a_hint_above_the_whole_workspace_runs_alone_with_all_of_it() {
+        let ledger = Allowance::limited(1 << 20);
+        let mut published = Vec::new();
+        extract_windowed(
+            0..3usize,
+            &ledger,
+            |index| if index == 1 { u64::MAX } else { 16 },
+            |index, local| {
+                Ok(Buffer::filled(
+                    if index == 1 { 900 << 10 } else { 16 },
+                    0u8,
+                    local,
+                )?)
+            },
+            |data| {
+                published.push(data.len());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(published, [16, 900 << 10, 16]);
+        assert_eq!(ledger.used(), 0);
+    }
+
+    #[test]
+    fn the_members_ahead_of_a_failure_are_published() {
+        let ledger = Allowance::limited(1 << 20);
+        let finished = AtomicUsize::new(0);
+        let mut published = Vec::new();
+        let error = extract_windowed(
+            0..3usize,
+            &ledger,
+            |_| 16,
+            |index, _| {
+                if index < 2 {
+                    finished.fetch_add(1, Ordering::SeqCst);
+                    return Ok(index);
+                }
+                // Fail only once the others are done, so none is skipped.
+                while finished.load(Ordering::SeqCst) < 2 {
+                    std::hint::spin_loop();
+                }
+                Err(Error::Cancelled)
+            },
+            |index| {
+                published.push(index);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::Cancelled));
+        assert_eq!(published, [0, 1]);
         assert_eq!(ledger.used(), 0);
     }
 

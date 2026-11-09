@@ -96,7 +96,8 @@ pub(crate) fn publish<M, B: Budget>(
 /// A workspace policy the driver can schedule worker batches under. Each
 /// worker decodes with the allowance it is handed.
 pub(crate) trait Workers: Budget<Charge: Send> + Sync {
-    /// Decodes `members` on workers and publishes them in archive order.
+    /// Decodes `members` on workers and publishes them in archive order. The
+    /// members ahead of a failure are published before it returns.
     /// `capacity` bounds an unlimited batch's planned cost; a limited
     /// workspace instead admits each batch by `hint` against its ledger.
     #[allow(clippy::too_many_arguments)]
@@ -113,8 +114,7 @@ pub(crate) trait Workers: Budget<Charge: Send> + Sync {
 }
 
 /// At most one member per worker and `capacity` bytes of cost per batch; a
-/// member costing more than `capacity` forms a batch of its own. The members
-/// ahead of a failure in its batch are published before the failure returns.
+/// member costing more than `capacity` forms a batch of its own.
 impl Workers for Allowance {
     fn batches<T: Copy + Send, O: Send, C: ?Sized>(
         &self,
@@ -147,7 +147,6 @@ impl Workers for Allowance {
 }
 
 impl Workers for Limited {
-    /// Publishes nothing from a batch with a failure in it.
     fn batches<T: Copy + Send, O: Send, C: ?Sized>(
         &self,
         members: &[(T, u64)],
