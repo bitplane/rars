@@ -633,7 +633,7 @@ impl Archive {
                 budget.run(&meta.name, &mut writer, |mut writer| {
                     if entry.is_stored() && !entry.is_encrypted() {
                         entry
-                            .write_stored_to(self, password, &mut writer)
+                            .write_stored_to(self, password, &mut writer, &unpack15.allowance)
                             .map_err(|error| entry.entry_error("extracting", error))?;
                     } else {
                         entry
@@ -911,11 +911,12 @@ impl Entry {
         }
     }
 
-    fn write_stored_to(
+    fn write_stored_to<B: Budget>(
         &self,
         archive: &Archive,
         password: Option<&[u8]>,
         out: &mut impl Write,
+        allowance: &B,
     ) -> Result<()> {
         let source = archive.range_reader(self.packed_range.clone())?;
         let mut reader = if self.is_encrypted() {
@@ -935,7 +936,7 @@ impl Entry {
             false,
             &mut |chunk: &[u8]| checksum.update(chunk),
             out,
-            &Allowance::default(),
+            allowance,
         )?;
         checksum.verify_stored_length(self.header.unp_size)?;
         let actual = checksum.finish();
@@ -958,7 +959,7 @@ impl Entry {
         out: &mut impl Write,
     ) -> Result<()> {
         if self.is_stored() {
-            return self.write_stored_to(archive, password, out);
+            return self.write_stored_to(archive, password, out, &unpack15.allowance);
         }
         let mut checksum = Rar13Checksum::new();
         let mut checksum_writer = Rar13ChecksumWriter {
