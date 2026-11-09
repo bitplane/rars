@@ -73,24 +73,6 @@ fn solid_e8_filters_use_member_relative_offsets() {
 }
 
 #[test]
-fn vm_filter_control_stream_accepts_32_bit_encoded_integers() {
-    let archive = Archive::parse_path(fixture("vm_encoded_u32_filter.rar")).unwrap();
-    let files: Vec<_> = archive.files().collect();
-    assert_eq!(files.len(), 1);
-    assert_eq!(files[0].name, b"bsdcat.exe");
-
-    let mut extracted = Vec::new();
-    archive
-        .extract_to(ArchiveReadOptions::default(), |meta| {
-            extracted.push(meta.name.clone());
-            Ok(Box::new(std::io::sink()))
-        })
-        .unwrap();
-
-    assert_eq!(extracted, vec![b"bsdcat.exe".to_vec()]);
-}
-
-#[test]
 fn non_standard_vm_filter_uses_generic_executor() {
     let archive = Archive::parse_path(fixture("generic_delta_padding_mutation.rar")).unwrap();
     let files: Vec<_> = archive.files().collect();
@@ -125,13 +107,17 @@ fn ppmd_embedded_vm_filter_is_applied() {
 }
 
 #[test]
-fn real_executable_filter_archive_decodes() {
-    let archive = Archive::parse_path(fixture("filter_bsdcat_exe.rar")).unwrap();
+fn wide_e8e9_filter_blocks_use_32_bit_encoded_sizes() {
+    // WinRAR 6.02 (`-ma4 -m5 -mcE+`) cuts 64 KiB E8E9 blocks over a synthetic
+    // executable image. A block size of 0x10000 does not fit the 16-bit
+    // integer form, so the filter control stream carries 32-bit integers.
+    let archive = Archive::parse_path(fixture("x86_e8e9_64k_blocks_rar602.rar")).unwrap();
     let extracted = collect_extract(&archive).unwrap();
 
     assert_eq!(extracted.len(), 1);
-    assert_eq!(extracted[0].name, b"bsdcat.exe");
-    assert_eq!(crc32(&extracted[0].data), 0x4db1_0349);
+    assert_eq!(extracted[0].name, b"synthetic.exe");
+    assert_eq!(extracted[0].data.len(), 204_288);
+    assert_eq!(crc32(&extracted[0].data), 0xb077_02c9);
 }
 
 #[test]

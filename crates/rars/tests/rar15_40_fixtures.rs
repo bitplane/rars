@@ -2680,14 +2680,14 @@ fn rar20_writer_uses_audio_block_for_pcm_like_payload_when_smaller() {
 }
 
 #[test]
-fn rar20_writer_uses_audio_block_for_boat_modern_english_fixture() {
+fn rar20_writer_uses_audio_block_for_synthetic_speech_fixture() {
     let source = std::fs::read(fixture("rar250/unpack20_audio_text.rar")).unwrap();
     let source_archive = Archive::parse(&source).unwrap();
     let source_entries = collect_extract(&source_archive).unwrap();
     let payload = &source_entries[0].data;
     let lz_packed = rars::codec::rar20::unpack20_encode_literals(payload).unwrap();
     let entries = [FileEntry {
-        name: b"BoatModernEnglish.wav",
+        name: b"SyntheticSpeech.wav",
         data: payload,
         file_time: 0x5a21_0000,
         file_attr: 0x20,
@@ -5882,8 +5882,8 @@ fn extracts_rar4_aes_encrypted_compressed_member() {
 }
 
 #[test]
-fn extracts_rar4_junrar_encrypted_member_with_correct_password() {
-    let bytes = std::fs::read(fixture("encrypted/rar4_junrar_password.rar")).unwrap();
+fn extracts_rar4_encrypted_member_with_correct_password() {
+    let bytes = std::fs::read(fixture("encrypted/rar4_password.rar")).unwrap();
     let archive = Archive::parse(&bytes).unwrap();
     let file = archive.files().next().unwrap();
 
@@ -5896,7 +5896,7 @@ fn extracts_rar4_junrar_encrypted_member_with_correct_password() {
         Err(Error::NeedPassword)
     ));
 
-    let extracted = collect_extract_with_password(&archive, Some(b"junrar")).unwrap();
+    let extracted = collect_extract_with_password(&archive, Some(b"password")).unwrap();
     assert_eq!(extracted.len(), 1);
     assert_eq!(extracted[0].name, b"file1.txt");
     assert_eq!(extracted[0].data, b"file1\n");
@@ -5905,7 +5905,7 @@ fn extracts_rar4_junrar_encrypted_member_with_correct_password() {
 
 #[test]
 fn rejects_wrong_password_for_rar4_encrypted_file_as_password_error() {
-    let bytes = std::fs::read(fixture("encrypted/rar4_junrar_password.rar")).unwrap();
+    let bytes = std::fs::read(fixture("encrypted/rar4_password.rar")).unwrap();
     let archive = Archive::parse(&bytes).unwrap();
 
     assert_eq!(
@@ -5915,14 +5915,14 @@ fn rejects_wrong_password_for_rar4_encrypted_file_as_password_error() {
 }
 
 #[test]
-fn extracts_rar4_junrar_header_encrypted_member_with_correct_password() {
-    let bytes = std::fs::read(fixture("encrypted/rar4_junrar_header_encrypted.rar")).unwrap();
+fn extracts_rar4_header_encrypted_member_with_correct_password() {
+    let bytes = std::fs::read(fixture("encrypted/rar4_header_encrypted.rar")).unwrap();
 
     assert!(matches!(Archive::parse(&bytes), Err(Error::NeedPassword)));
-    let archive = Archive::parse_with_password(&bytes, Some(b"junrar")).unwrap();
+    let archive = Archive::parse_with_password(&bytes, Some(b"password")).unwrap();
     assert!(archive.main.has_encrypted_headers());
 
-    let extracted = collect_extract_with_password(&archive, Some(b"junrar")).unwrap();
+    let extracted = collect_extract_with_password(&archive, Some(b"password")).unwrap();
     assert_eq!(extracted.len(), 1);
     assert_eq!(extracted[0].name, b"file1.txt");
     assert_eq!(extracted[0].data, b"file1\n");
@@ -5931,10 +5931,7 @@ fn extracts_rar4_junrar_header_encrypted_member_with_correct_password() {
 
 #[test]
 fn decodes_rar4_compact_unicode_name_before_extraction() {
-    let bytes = std::fs::read(fixture(
-        "encrypted/rar4_junrar_file_content_encrypted_unicode.rar",
-    ))
-    .unwrap();
+    let bytes = std::fs::read(fixture("encrypted/rar4_unicode_name_encrypted.rar")).unwrap();
     let archive = Archive::parse(&bytes).unwrap();
     let file = archive.files().next().unwrap();
 
@@ -5949,8 +5946,8 @@ fn decodes_rar4_compact_unicode_name_before_extraction() {
 }
 
 #[test]
-fn extracts_rar4_sharpcompress_encrypted_files_only_archive() {
-    let bytes = std::fs::read(fixture("encrypted/rar4_sharpcompress_files_only.rar")).unwrap();
+fn extracts_rar4_encrypted_files_and_directories_archive() {
+    let bytes = std::fs::read(fixture("encrypted/rar4_encrypted_files_and_dirs.rar")).unwrap();
     let archive = Archive::parse(&bytes).unwrap();
     let files: Vec<_> = archive.files().collect();
 
@@ -5968,13 +5965,13 @@ fn extracts_rar4_sharpcompress_encrypted_files_only_archive() {
     assert_eq!(extracted.len(), 6);
     assert_eq!(extracted[0].name, b"exe\\test.exe");
     assert_eq!(extracted[0].data.len(), 45056);
-    assert_eq!(crc32(&extracted[0].data), 0xcfb109c8);
+    assert_eq!(crc32(&extracted[0].data), 0x549eb227);
     assert_eq!(extracted[1].name, b"jpg\\test.jpg");
-    assert_eq!(extracted[1].data.len(), 40372);
-    assert_eq!(crc32(&extracted[1].data), 0x088814e3);
+    assert_eq!(extracted[1].data.len(), 40022);
+    assert_eq!(crc32(&extracted[1].data), 0xf3d20ea8);
     assert_eq!(extracted[2].name, "тест.txt".as_bytes());
-    assert_eq!(extracted[2].data.len(), 15498);
-    assert_eq!(crc32(&extracted[2].data), 0x9bd160fa);
+    assert_eq!(extracted[2].data.len(), 17330);
+    assert_eq!(crc32(&extracted[2].data), 0x08d7ae99);
     assert!(extracted[3..].iter().all(|entry| entry.is_directory));
 }
 
@@ -6227,12 +6224,12 @@ fn extracts_rar154_unp15_audio_shaped_windows_archive() {
     let extracted = collect_extract(&archive).unwrap();
 
     assert_eq!(extracted.len(), 2);
-    assert_eq!(extracted[0].name, b"BoatModernEnglish.wav");
+    assert_eq!(extracted[0].name, b"SyntheticSpeech.wav");
     assert_eq!(extracted[0].data.len(), 56_464);
-    assert_eq!(crc32(&extracted[0].data), 0x82d2ed89);
-    assert_eq!(extracted[1].name, b"LICENSE.txt");
-    assert_eq!(extracted[1].data.len(), 107);
-    assert_eq!(crc32(&extracted[1].data), 0x8eaf20c4);
+    assert_eq!(crc32(&extracted[0].data), 0xaa104a7f);
+    assert_eq!(extracted[1].name, b"NOTES.txt");
+    assert_eq!(extracted[1].data.len(), 69);
+    assert_eq!(crc32(&extracted[1].data), 0xaf7902ad);
 }
 
 #[test]
@@ -6242,12 +6239,12 @@ fn extracts_rar154_unp15_audio_shaped_dos_archive() {
     let extracted = collect_extract(&archive).unwrap();
 
     assert_eq!(extracted.len(), 2);
-    assert_eq!(extracted[0].name, b"BOATMO~1.WAV");
+    assert_eq!(extracted[0].name, b"SYNTHE~1.WAV");
     assert_eq!(extracted[0].data.len(), 56_464);
-    assert_eq!(crc32(&extracted[0].data), 0x82d2ed89);
-    assert_eq!(extracted[1].name, b"LICENSE.TXT");
-    assert_eq!(extracted[1].data.len(), 107);
-    assert_eq!(crc32(&extracted[1].data), 0x8eaf20c4);
+    assert_eq!(crc32(&extracted[0].data), 0xaa104a7f);
+    assert_eq!(extracted[1].name, b"NOTES.TXT");
+    assert_eq!(extracted[1].data.len(), 69);
+    assert_eq!(crc32(&extracted[1].data), 0xaf7902ad);
 }
 
 #[test]
@@ -7040,16 +7037,16 @@ fn extracts_rar250_unp20_audio_shaped_and_text_lz_archive() {
     let files: Vec<_> = archive.files().collect();
 
     assert_eq!(files.len(), 2);
-    assert_eq!(files[0].name, b"BoatModernEnglish.wav");
-    assert_eq!(files[1].name, b"LICENSE.txt");
+    assert_eq!(files[0].name, b"SyntheticSpeech.wav");
+    assert_eq!(files[1].name, b"NOTES.txt");
     assert!(files.iter().all(|file| file.unp_ver == 20));
-    assert_eq!(rar15_first_file_data_peek(&bytes), 0x2221);
+    assert_eq!(rar15_first_file_data_peek(&bytes), 0x1819);
 
     let extracted = collect_extract(&archive).unwrap();
     assert_eq!(extracted.len(), 2);
-    assert_eq!(extracted[0].name, b"BoatModernEnglish.wav");
+    assert_eq!(extracted[0].name, b"SyntheticSpeech.wav");
     assert_eq!(crc32(&extracted[0].data), files[0].file_crc);
-    assert_eq!(extracted[1].name, b"LICENSE.txt");
+    assert_eq!(extracted[1].name, b"NOTES.txt");
     assert_eq!(crc32(&extracted[1].data), files[1].file_crc);
 }
 
@@ -7101,24 +7098,27 @@ fn extracts_rar250_unp20_keep_tables_archive() {
     let archive = Archive::parse(&bytes).unwrap();
     let files: Vec<_> = archive.files().collect();
 
+    // WinRAR 2.90 rewrites the tables twice inside SHIFT.BIN as its content
+    // moves between text, code and noise, keeping the previous lengths each
+    // time. NOTES.TXT then starts a fresh table.
     assert_eq!(files.len(), 2);
-    assert_eq!(files[0].name, b"unrar");
+    assert_eq!(files[0].name, b"SHIFT.BIN");
     assert_eq!(files[0].method, 0x33);
     assert_eq!(files[0].unp_ver, 20);
-    assert_eq!(files[0].pack_size, 25_077);
-    assert_eq!(files[0].unp_size, 54_212);
-    assert_eq!(files[0].file_crc, 0xbf94ba22);
-    assert_eq!(files[1].name, b"file_id.diz");
+    assert_eq!(files[0].pack_size, 34_935);
+    assert_eq!(files[0].unp_size, 88_000);
+    assert_eq!(files[0].file_crc, 0x65106d81);
+    assert_eq!(files[1].name, b"NOTES.TXT");
     assert_eq!(files[1].method, 0x33);
     assert_eq!(files[1].unp_ver, 20);
-    assert_eq!(files[1].pack_size, 85);
-    assert_eq!(files[1].unp_size, 76);
-    assert_eq!(files[1].file_crc, 0x497a718f);
+    assert_eq!(files[1].pack_size, 117);
+    assert_eq!(files[1].unp_size, 395);
+    assert_eq!(files[1].file_crc, 0x0c63e952);
 
     let extracted = collect_extract(&archive).unwrap();
     assert_eq!(extracted.len(), 2);
-    assert_eq!(crc32(&extracted[0].data), 0xbf94ba22);
-    assert_eq!(crc32(&extracted[1].data), 0x497a718f);
+    assert_eq!(crc32(&extracted[0].data), 0x65106d81);
+    assert_eq!(crc32(&extracted[1].data), 0x0c63e952);
 }
 
 #[test]
@@ -7274,36 +7274,31 @@ fn extracts_rar300_solid_ppmd_archive() {
 }
 
 #[test]
-fn extracts_wild_solid_ppmd_farmanager_archive() {
-    let bytes = std::fs::read(fixture("ppmd/farmanager170.rar")).unwrap();
+fn extracts_solid_ppmd_archive_whose_model_restarts_when_memory_runs_out() {
+    // RAR 3.93 `-s -m5 -mc63:1t+`: a 1 MB model at order 61 over 384 KiB of
+    // varied text. The suballocator runs out and the model restarts seven
+    // times across the solid members, so restart timing has to match.
+    let bytes = std::fs::read(fixture("ppmd/ppmd_solid_restarts_rar393.rar")).unwrap();
     let archive = Archive::parse(&bytes).unwrap();
-    let opened = Rc::new(RefCell::new(Vec::<Vec<u8>>::new()));
+    let files: Vec<_> = archive.files().collect();
 
     assert!(archive.main.is_solid());
-    assert!(archive
-        .files()
-        .any(|file| file.unp_ver >= 29 && file.method == 0x35));
-
-    let result = archive.extract_to(ArchiveReadOptions::default(), {
-        let opened = Rc::clone(&opened);
-        move |meta| {
-            opened.borrow_mut().push(meta.name.clone());
-            if meta.name == b"Far.exe" {
-                return Err(Error::InvalidHeader("stopped after PPMd regression target"));
-            }
-            Ok(Box::new(std::io::sink()))
-        }
-    });
-
-    assert!(matches!(
-        result,
-        Err(Error::InvalidHeader("stopped after PPMd regression target"))
-    ));
-    let opened = opened.borrow();
-    assert!(opened
+    assert_eq!(files.len(), 8);
+    assert!(files
         .iter()
-        .any(|name| name == b"Addons\\Shell\\FARHere.inf"));
-    assert!(opened.iter().any(|name| name == b"Far.exe"));
+        .all(|file| file.unp_ver == 29 && file.method == 0x35));
+
+    let expected_crcs = [
+        0x45bf2a6f, 0x97127c47, 0x1abc5380, 0xb26f123f, 0x12586d67, 0x0c0d9159, 0x0b0189d6,
+        0xe18acb60,
+    ];
+    let extracted = collect_extract(&archive).unwrap();
+    assert_eq!(extracted.len(), 8);
+    for (index, (entry, crc)) in extracted.iter().zip(expected_crcs).enumerate() {
+        assert_eq!(entry.name, format!("part{index}.txt").as_bytes());
+        assert_eq!(entry.data.len(), 49_152);
+        assert_eq!(crc32(&entry.data), crc, "part{index}.txt");
+    }
 }
 
 #[test]

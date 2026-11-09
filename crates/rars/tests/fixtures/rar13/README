@@ -1,49 +1,36 @@
- Этот архив содержит архиватор RAR версии 1.40 (beta)
+RARS TEST FIXTURE
+=================
 
-********************************************************************
- Никаких гарантий к данному программному обеспечению не прилагается.
- Автор не несет никакой ответственности за любой вред или упущенную
- выгоду при использовании или неиспользовании данного программного
- обеспечения.
-********************************************************************
+This file is a plain-text payload written for the rars test suite. It is
+archived three times by the DOS RAR 1.402 command-line archiver: once stored,
+once with normal compression and once with a password, so the reader can be
+checked against the same bytes along three different paths.
 
-   Основные особенности RAR
+Nothing here comes from any other product. The text only needs to be long
+enough to give the RAR 1.3 compressor some repetition to work with, and
+short enough to keep the fixtures small.
 
-1. Более высокая чем у PKZIP 2.04 и ARJ 2.41 на большинстве
-   файлов (.EXE,.LIB,большие TXT,...) степень сжатия.
+What the three archives cover
+-----------------------------
 
-2. Работа с полноэкранным интерфейсом (mouse, сохранение конфигурации,
-   встроенный viewer,...), либо с командной строкой.
+1. The stored archive keeps these bytes unchanged after the file header, so
+   a test can compare the packed data directly with this file.
 
-3. Создание непрерывных (solid) архивов, позволяющих повысить
-   степень сжатия при упаковке значительного количества небольших
-   однотипных файлов на 10 - 40 % (а иногда и больше) по сравнению
-   с обычными архивами.
+2. The compressed archive runs the bytes through the adaptive Huffman and
+   LZ coder that RAR 1.3 and RAR 1.4 share. Decoding it proves the coder,
+   the sliding window and the rolling checksum together.
 
-4. Работа в полноэкранном режиме с архивами .ZIP,.ARJ,.LZH(.ICE)
-   типа ARCVIEW, но с более мощными возможностями (преобразование
-   архива в SFX, добавление и модификация комментариев, установка
-   временного подкаталога,...).
+3. The password archive encrypts the same compressed stream, which checks
+   the RAR 1.3 cipher on top of the decoder.
 
-5. Создание и модификация SFX архивов.
+Some repetition for the matcher
+-------------------------------
 
-6. Создание последовательности архивных томов указанного размера,
-   создание SFX архивных томов.
+The quick brown fox jumps over the lazy dog. The quick brown fox jumps over
+the lazy dog again. Pack my box with five dozen liquor jugs. Pack my box
+with five dozen liquor jugs once more. Sphinx of black quartz, judge my vow.
 
-7. Установка паролей, комментарии, защита архивов от модификации,
-   добавление к архиву информации об авторе и времени последней
-   модификации, об имени архива, восстановление архивов с поврежденной
-   структурой.
+0123456789 0123456789 0123456789 0123456789 0123456789 0123456789
+ABCDEFGHIJ ABCDEFGHIJ ABCDEFGHIJ ABCDEFGHIJ ABCDEFGHIJ ABCDEFGHIJ
 
-8. Встроенная поддержка ANSI escape последовательностей в комментариях.
-
-   В данном архиве содержатся следующие файлы:
-
-   README
-   RAR      EXE - архиватор RAR
-   RAR      DOC - документация
-   OPTIONS  DOC - список команд и ключей RAR
-   TECHNOTE DOC - формат архива RAR и замечания по методу сжатия
-   RAR_BBS  DOC - BBS на которых есть последняя версия RAR
-   WHATSNEW DOC - отличия этой версии RAR от предыдущих
-   LICENSE  DOC - информация о лицензии по использованию RAR
+End of file.

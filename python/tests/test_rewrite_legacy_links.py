@@ -133,7 +133,7 @@ def test_reference_legacy_directory_headers_retain_metadata():
     from test_rewrite_legacy import ROOT, headers
     # Isolate the unchanged directory records from this reference fixture;
     # its Unicode file names are outside the current preservation subset.
-    data = (ROOT / "crates/rars/tests/fixtures/rar15_40/encrypted/rar4_sharpcompress_files_only.rar").read_bytes()
+    data = (ROOT / "crates/rars/tests/fixtures/rar15_40/encrypted/rar4_encrypted_files_and_dirs.rar").read_bytes()
     blocks = [data[:7]]
     for offset, kind, flags, size in headers(data):
         if kind in [0x73, 0x7b] or (kind == 0x74 and flags & 0xe0 == 0xe0):

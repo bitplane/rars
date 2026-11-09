@@ -1,6 +1,8 @@
 # RAR 2.02 Fixtures
 
-Copied from the spec repository's `fixtures/2.02/` directory.
+Copied from the spec repository's `fixtures/2.02/` directory, which took them
+from rarfile's test suite (`test/files/rar202-comment-*.rar`, ISC licence; see
+`../../LICENSES.md`).
 
 These archives pin three RAR 2.x behaviors:
 
