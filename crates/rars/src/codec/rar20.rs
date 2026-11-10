@@ -281,8 +281,7 @@ impl<B: Budget> Reader20State<B> {
         Ok(())
     }
 
-    // A final match past the declared size is not output, but its tail stays
-    // in the window for the next solid member.
+    // A final match's bytes past the declared size go to the window only.
     fn keep_overrun(&mut self) -> Result<()> {
         self.drain_pending_match(usize::MAX)
     }

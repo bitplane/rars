@@ -8497,7 +8497,7 @@ fn final_match_past_the_declared_size_truncates_and_feeds_the_solid_member() {
         let archive = Archive::parse(&bytes).unwrap();
         let entries = RefCell::new(Vec::new());
         archive
-            .extract_to(ArchiveReadOptions::default(), |meta| {
+            .extract_to(ArchiveReadOptions::default(), |_| {
                 let data = Rc::new(RefCell::new(Vec::new()));
                 entries.borrow_mut().push(Rc::clone(&data));
                 Ok(Box::new(CollectWriter { data }))

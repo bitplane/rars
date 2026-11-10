@@ -824,10 +824,8 @@ impl<B: Budget> Reader15State<B> {
             if self.output_written < self.target {
                 self.put_byte(byte, out)?;
             } else {
-                // Past the declared size the match only fills the window, for
-                // the next solid member.
-                self.window[self.unp_ptr] = byte;
-                self.unp_ptr = (self.unp_ptr + 1) & 0xffff;
+                // Past the declared size, kept only for the next solid member.
+                self.push_window(byte);
             }
         }
         Ok(())
@@ -837,11 +835,15 @@ impl<B: Budget> Reader15State<B> {
         if self.output_written >= self.target {
             return Err(Error::InvalidData("RAR 1.3 literal exceeds output size"));
         }
-        self.window[self.unp_ptr] = byte;
-        self.unp_ptr = (self.unp_ptr + 1) & 0xffff;
+        self.push_window(byte);
         out.write_all(&[byte]).map_err(Error::from)?;
         self.output_written += 1;
         Ok(())
+    }
+
+    fn push_window(&mut self, byte: u8) {
+        self.window[self.unp_ptr] = byte;
+        self.unp_ptr = (self.unp_ptr + 1) & 0xffff;
     }
 
     fn remember_match(&mut self, distance: u32, length: u32) {

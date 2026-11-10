@@ -1250,7 +1250,6 @@ impl<B: Budget> ReaderState<B> {
         self.history_window = 0;
     }
 
-    /// Copies the part of a match within `output_limit` and returns the rest.
     fn copy_match(
         &self,
         output: &mut Buffer<u8, B>,
@@ -1480,8 +1479,7 @@ impl<B: Budget> From<Buffer<u8, B>> for StreamedHistory<B> {
     }
 }
 
-/// The tail of a member's final match past its declared size: not output, but
-/// kept in the window so a following solid member can reach it.
+/// A final match's bytes past the declared size, kept for the next solid member.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Overrun {
     // None when the match zero-fills.
@@ -1705,7 +1703,7 @@ impl<B: Budget> StreamingOutput<B> {
         Ok(())
     }
 
-    /// Appends to the window without emitting, after flushing what is pending.
+    // Flushes first so the overrun is never part of a pending chunk.
     fn retain_overrun<E>(
         &mut self,
         overrun: Overrun,
