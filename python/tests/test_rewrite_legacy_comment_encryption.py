@@ -6,7 +6,7 @@ import zlib
 import pytest
 import rars
 
-from test_rewrite_legacy import headers, service_headers
+from test_rewrite_legacy import headers, service_headers, without_end_block
 from test_rewrite_older import check_unrar
 
 
@@ -63,7 +63,7 @@ def encrypted_comment_source():
     plain.add_bytes(b"public", "plain")
     plain_data = plain.to_bytes()
     member = next(offset for offset, kind, _, _ in headers(plain_data) if kind == 0x74)
-    return bytes(data) + plain_data[member:]
+    return without_end_block(bytes(data)) + plain_data[member:]
 
 
 def test_encrypted_archive_comment_retains_password_with_plain_members(tmp_path):

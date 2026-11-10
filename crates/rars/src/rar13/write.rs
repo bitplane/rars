@@ -623,18 +623,21 @@ fn write_member(
     }
 }
 
+/// Splits one member across a volume set. No volume is longer than
+/// `volume_size` bytes, headers and end-of-archive block included, as RAR's
+/// own `-v` switch counts them.
 pub fn write_stored_volumes(
     entry: StoredEntry<'_>,
     options: WriterOptions,
-    max_packed_per_volume: usize,
+    volume_size: usize,
 ) -> Result<Vec<Vec<u8>>> {
-    write_stored_volumes_with_progress(entry, options, max_packed_per_volume, None)
+    write_stored_volumes_with_progress(entry, options, volume_size, None)
 }
 
 pub(crate) fn write_stored_volumes_with_progress(
     entry: StoredEntry<'_>,
     options: WriterOptions,
-    max_packed_per_volume: usize,
+    volume_size: usize,
     progress: Option<&dyn WriteProgress>,
 ) -> Result<Vec<Vec<u8>>> {
     let resources = WriterResources::default();
@@ -665,22 +668,25 @@ pub(crate) fn write_stored_volumes_with_progress(
         method: METHOD_STORE,
         base_flags: 0,
         features: options.features,
-        max_packed_per_volume,
+        volume_size,
     })
 }
 
+/// Splits one member across a volume set. No volume is longer than
+/// `volume_size` bytes, headers and end-of-archive block included, as RAR's
+/// own `-v` switch counts them.
 pub fn write_compressed_volumes(
     entry: FileEntry<'_>,
     options: WriterOptions,
-    max_packed_per_volume: usize,
+    volume_size: usize,
 ) -> Result<Vec<Vec<u8>>> {
-    write_compressed_volumes_with_progress(entry, options, max_packed_per_volume, None)
+    write_compressed_volumes_with_progress(entry, options, volume_size, None)
 }
 
 pub fn write_compressed_volumes_with_progress(
     entry: FileEntry<'_>,
     options: WriterOptions,
-    max_packed_per_volume: usize,
+    volume_size: usize,
     progress: Option<&dyn WriteProgress>,
 ) -> Result<Vec<Vec<u8>>> {
     let resources = WriterResources::default();
@@ -737,7 +743,7 @@ pub fn write_compressed_volumes_with_progress(
         method,
         base_flags: 0,
         features: options.features,
-        max_packed_per_volume,
+        volume_size,
     });
     report_compression_entry(
         reporting,
@@ -1040,16 +1046,11 @@ struct SplitVolumeRecord<'a> {
     method: u8,
     base_flags: u8,
     features: FeatureSet,
-    max_packed_per_volume: usize,
+    volume_size: usize,
 }
 
 fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
     crate::write_progress::check_cancelled(Some(entry.progress))?;
-    if entry.max_packed_per_volume == 0 {
-        return Err(Error::InvalidArgument(
-            "RAR 1.3 volume payload size must be non-zero",
-        ));
-    }
     if entry.packed.is_empty() {
         return Err(Error::InvalidArgument(
             "RAR 1.3 volume writer needs a non-empty packed payload",
@@ -1057,17 +1058,9 @@ fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
         .at_entry(entry.name.to_vec(), "preparing volume member"));
     }
 
-    // One volume is a legitimate answer when the payload fits; see the note in
-    // rar15_40::write::write_split_volumes.
-    let chunks: Vec<&[u8]> = entry.packed.chunks(entry.max_packed_per_volume).collect();
-
-    let mut volumes = Vec::with_capacity(chunks.len());
-    for (index, chunk) in chunks.iter().enumerate() {
-        crate::write_progress::check_cancelled(Some(entry.progress))?;
-        let split_before = index > 0;
-        let split_after = index + 1 < chunks.len();
+    let render = |index: usize, split_after: bool, chunk: &[u8]| -> Result<Vec<u8>> {
         let mut flags = entry.base_flags;
-        if split_before {
+        if index > 0 {
             flags |= LHD_SPLIT_BEFORE;
         }
         if split_after {
@@ -1079,7 +1072,7 @@ fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
 
         let mut out = Vec::new();
         write_main_header_with_flags(&mut out, entry.features, None, MHD_VOLUME)?;
-        let checksum_data = if split_after { *chunk } else { entry.unpacked };
+        let checksum_data = if split_after { chunk } else { entry.unpacked };
         // Both public callers validate the 255-byte name limit and forbid
         // comments, so this header is at most 21 + 255 bytes.
         write_file_header(
@@ -1099,16 +1092,19 @@ fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
         )
         .expect("validated legacy volume header fits the u16 size field");
         out.extend_from_slice(chunk);
-        entry.progress.report(WriteProgressEvent::VolumeFinished {
-            volume_number: index + 1,
-            total_volumes: Some(chunks.len()),
-            bytes: out.len() as u64,
-        });
-        crate::write_progress::check_cancelled(Some(entry.progress))?;
-        volumes.push(out);
-    }
-
-    Ok(volumes)
+        Ok(out)
+    };
+    let payload =
+        crate::rar15_40::legacy_volume_payload(entry.volume_size, entry.packed, |probe| {
+            render(0, true, probe)
+        })?;
+    crate::rar15_40::render_legacy_volumes(
+        entry.packed,
+        payload,
+        entry.volume_size,
+        entry.progress,
+        render,
+    )
 }
 
 fn encode_archive_comment(comment: Option<&[u8]>) -> Result<Vec<u8>> {
@@ -1260,18 +1256,20 @@ mod tests {
     fn volume_headers_accept_the_largest_legacy_name() {
         let name = vec![b'N'; 255];
         let payload = b"abcdef";
-        let volumes = write_stored_volumes(
-            StoredEntry {
-                name: &name,
-                data: payload,
-                file_time: 0,
-                file_attr: 0x20,
-                password: None,
-                file_comment: None,
-            },
-            WriterOptions::default(),
-            3,
-        )
+        let volumes = crate::volume_test_support::sized_for_payload(3, |volume_size| {
+            write_stored_volumes(
+                StoredEntry {
+                    name: &name,
+                    data: payload,
+                    file_time: 0,
+                    file_attr: 0x20,
+                    password: None,
+                    file_comment: None,
+                },
+                WriterOptions::default(),
+                volume_size,
+            )
+        })
         .unwrap();
         assert_eq!(volumes.len(), 2);
         let archives: Vec<_> = volumes.iter().map(|v| Archive::parse(v).unwrap()).collect();
@@ -1727,7 +1725,10 @@ mod tests {
             password: None,
             file_comment: None,
         };
-        let volumes = write_stored_volumes(entry, WriterOptions::default(), 8).unwrap();
+        let volumes = crate::volume_test_support::sized_for_payload(8, |volume_size| {
+            write_stored_volumes(entry, WriterOptions::default(), volume_size)
+        })
+        .unwrap();
         let first = Archive::parse(&volumes[0]).unwrap();
 
         assert_eq!(
@@ -1754,7 +1755,10 @@ mod tests {
             password: None,
             file_comment: None,
         };
-        let volumes = write_stored_volumes(entry, WriterOptions::default(), 8).unwrap();
+        let volumes = crate::volume_test_support::sized_for_payload(8, |volume_size| {
+            write_stored_volumes(entry, WriterOptions::default(), volume_size)
+        })
+        .unwrap();
         for volume in [&volumes[0], volumes.last().unwrap()] {
             let archive = crate::Archive::Rar13(Archive::parse(volume).unwrap());
             let error = archive
@@ -2259,7 +2263,10 @@ mod tests {
             file_comment: None,
         };
 
-        let bytes = write_stored_volumes(entry, WriterOptions::default(), 10).unwrap();
+        let bytes = crate::volume_test_support::sized_for_payload(10, |volume_size| {
+            write_stored_volumes(entry, WriterOptions::default(), volume_size)
+        })
+        .unwrap();
         assert_eq!(bytes.len(), 4);
         let volumes: Vec<_> = bytes
             .iter()
@@ -2292,7 +2299,10 @@ mod tests {
             file_comment: None,
         };
 
-        let bytes = write_compressed_volumes(entry, WriterOptions::default(), 8).unwrap();
+        let bytes = crate::volume_test_support::sized_for_payload(8, |volume_size| {
+            write_compressed_volumes(entry, WriterOptions::default(), volume_size)
+        })
+        .unwrap();
         assert!(bytes.len() >= 2);
         let volumes: Vec<_> = bytes
             .iter()
@@ -2503,7 +2513,10 @@ mod tests {
             file_comment: None,
         };
 
-        let mut volume_bytes = write_stored_volumes(entry, WriterOptions::default(), 10).unwrap();
+        let mut volume_bytes = crate::volume_test_support::sized_for_payload(10, |volume_size| {
+            write_stored_volumes(entry, WriterOptions::default(), volume_size)
+        })
+        .unwrap();
         assert!(
             volume_bytes.len() >= 2,
             "need at least two volumes to exercise the split-completion path"
@@ -2570,18 +2583,20 @@ mod tests {
     }
 
     fn split_volumes_for(name: &[u8], data: &[u8]) -> Vec<Vec<u8>> {
-        write_stored_volumes(
-            StoredEntry {
-                name,
-                data,
-                file_time: 0,
-                file_attr: 0x20,
-                password: None,
-                file_comment: None,
-            },
-            WriterOptions::default(),
-            10,
-        )
+        crate::volume_test_support::sized_for_payload(10, |volume_size| {
+            write_stored_volumes(
+                StoredEntry {
+                    name,
+                    data,
+                    file_time: 0,
+                    file_attr: 0x20,
+                    password: None,
+                    file_comment: None,
+                },
+                WriterOptions::default(),
+                volume_size,
+            )
+        })
         .unwrap()
     }
 
@@ -3571,7 +3586,10 @@ mod tests {
         let mut features = FeatureSet::store_only();
         features.solid = true;
         let options = WriterOptions::new(ArchiveVersion::Rar14, features);
-        let volumes = write_compressed_volumes(entry, options, 8).unwrap();
+        let volumes = crate::volume_test_support::sized_for_payload(8, |volume_size| {
+            write_compressed_volumes(entry, options, volume_size)
+        })
+        .unwrap();
         assert!(volumes.len() > 1);
         let archives = parse_volumes(&volumes);
         assert!(archives
@@ -3648,10 +3666,14 @@ mod tests {
             password: None,
             file_comment: None,
         };
+        // Size the volumes first: probing with the reporter would cancel it.
+        let volume_size = crate::volume_test_support::smallest_volume_size(|volume_size| {
+            write_compressed_volumes(entry, WriterOptions::default(), volume_size)
+        }) + 15;
         let error = write_compressed_volumes_with_progress(
             entry,
             WriterOptions::default(),
-            16,
+            volume_size,
             Some(&reporter),
         )
         .unwrap_err();
@@ -3769,10 +3791,14 @@ mod tests {
                 );
             }
         };
+        // Size the volumes first, so the probing writes stay out of the count.
+        let volume_size = crate::volume_test_support::smallest_volume_size(|volume_size| {
+            write_compressed_volumes(entry, WriterOptions::default(), volume_size)
+        }) + 31;
         let volumes = write_compressed_volumes_with_progress(
             entry,
             WriterOptions::default(),
-            32,
+            volume_size,
             Some(&reporter),
         )
         .unwrap();
@@ -3795,7 +3821,7 @@ mod tests {
         let error = write_compressed_volumes_with_progress(
             entry,
             WriterOptions::default(),
-            32,
+            volume_size,
             Some(&cancelling),
         )
         .unwrap_err();

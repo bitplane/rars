@@ -9,8 +9,10 @@ STORED = ROOT / "crates/rars/tests/fixtures/rar50/stored.rar"
 
 
 def test_legacy_volume_name_refusal_preserves_existing_parts(tmp_path):
-    builder = rars.RarBuilder(format="rar14", store=True, volume_size=1)
-    builder.add_bytes(bytes(range(128)), "payload.bin")
+    # Each volume carries about 70 bytes, so this needs more than the 101
+    # names .rar and .r00 through .r99 allow.
+    builder = rars.RarBuilder(format="rar14", store=True, volume_size=150)
+    builder.add_bytes(bytes(range(256)) * 40, "payload.bin")
     first = tmp_path / "archive.rar"
     second = tmp_path / "archive.r00"
     first.write_bytes(b"original first")
@@ -80,8 +82,8 @@ def test_volume_path_conversion_errors(operation, tmp_path):
 
 @pytest.mark.parametrize("stem", ["archive.part01.rar", "archive.part.rar", "archive.partxy.RAR", "archive", "archive.RAR"])
 def test_modern_volume_stems_and_roundtrip(tmp_path, stem):
-    builder = rars.RarBuilder(store=True, volume_size=64)
-    builder.add_bytes(b"payload" * 20, "file.txt")
+    builder = rars.RarBuilder(store=True, volume_size=512)
+    builder.add_bytes(b"payload" * 200, "file.txt")
     paths = builder.write_volumes(tmp_path / stem)
     base = stem.removesuffix(".rar").removesuffix(".RAR")
     if base.endswith(".part01"):
@@ -101,14 +103,14 @@ def test_directory_only_extraction_preserves_empty_directories(tmp_path, selecte
 
 
 def test_volume_extraction_directories_overwrite_and_open_failures(tmp_path):
-    builder = rars.RarBuilder(store=True, volume_size=64)
+    builder = rars.RarBuilder(store=True, volume_size=512)
     builder.add_directory("empty")
-    builder.add_bytes(b"payload" * 20, "nested/file.txt")
+    builder.add_bytes(b"payload" * 200, "nested/file.txt")
     paths = builder.write_volumes(tmp_path / "archive.part01.rar")
     output = tmp_path / "output"
     rars.extract_volumes(paths, output)
     assert (output / "empty").is_dir()
-    assert (output / "nested/file.txt").read_bytes() == b"payload" * 20
+    assert (output / "nested/file.txt").read_bytes() == b"payload" * 200
     rars.extract_volumes(paths, output, overwrite=True)
     with pytest.raises(OSError):
         rars.extract_volumes(paths, output)
@@ -139,7 +141,7 @@ def test_invalid_argument_types_and_missing_output_names(tmp_path):
         builder.add_bytes(b"payload", object())
     with pytest.raises(ValueError, match="no file name"):
         builder.add(Path("/"))
-    builder = rars.RarBuilder(store=True, volume_size=64)
+    builder = rars.RarBuilder(store=True, volume_size=512)
     builder.add_bytes(b"payload", "file.txt")
     with pytest.raises(ValueError, match="needs a file name"):
         builder.write_volumes(Path("/"))
@@ -195,8 +197,8 @@ def test_selected_file_skips_directory_and_empty_selection(tmp_path):
 
 
 def test_cancelled_volume_publication_preserves_old_destination(tmp_path):
-    builder = rars.RarBuilder(format="rar14", store=True, volume_size=64)
-    builder.add_bytes(b"payload" * 20, "file.txt")
+    builder = rars.RarBuilder(format="rar14", store=True, volume_size=512)
+    builder.add_bytes(b"payload" * 200, "file.txt")
     cancellation = rars.CancellationToken()
 
     def finish(event):
@@ -419,8 +421,8 @@ def test_pathlike_errors_survive_binding_conversion(tmp_path):
 
 @pytest.mark.parametrize("format", ["rar14", "rar50"])
 def test_volume_write_failure_names_an_oserror(tmp_path, format):
-    builder = rars.RarBuilder(format=format, store=True, volume_size=64)
-    builder.add_bytes(b"payload" * 20, "file.txt")
+    builder = rars.RarBuilder(format=format, store=True, volume_size=512)
+    builder.add_bytes(b"payload" * 200, "file.txt")
     with pytest.raises(OSError):
         builder.write_volumes(tmp_path / "missing/archive.rar")
     assert not (tmp_path / "missing").exists()

@@ -1,5 +1,7 @@
 #![cfg(feature = "write")]
 
+#[path = "support/volume_size.rs"]
+mod volume_size;
 use rars::{ArchiveReader, ArchiveVersion, Builder};
 
 const DATA: &[u8] = concat!("rars/", env!("CARGO_PKG_VERSION"), "\nmarker-schema=1\n").as_bytes();
@@ -106,10 +108,12 @@ fn old_rewrite_refuses_unknown_damaged_and_duplicate_records() {
 #[test]
 fn every_old_volume_has_a_producer() {
     for store in [false, true] {
-        let volumes = builder(store, false)
-            .volume_size(Some(16))
-            .build_volumes(None)
-            .unwrap();
+        let volumes = volume_size::sized_for_payload(16, |size| {
+            builder(store, false)
+                .volume_size(Some(size))
+                .build_volumes(None)
+        })
+        .unwrap();
         assert!(volumes.len() > 1);
         for bytes in volumes {
             check(&bytes);

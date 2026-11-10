@@ -1,5 +1,7 @@
 #![cfg(feature = "write")]
 
+#[path = "support/volume_size.rs"]
+mod volume_size;
 use rars::{Archive, ArchiveReadOptions, ArchiveReader, ArchiveVersion, Builder, ErrorKind};
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
@@ -226,7 +228,7 @@ fn split_and_parallel_sink_failures_keep_member_context() {
         for stored in [false, true] {
             let mut builder = Builder::new(version)
                 .compression_level(Some(if stored { 0 } else { 1 }))
-                .volume_size(Some(if stored { 512 } else { 8 }));
+                .volume_size(Some(512));
             // Store mode uses noise; compressed mode uses repeated bytes and
             // very small fragments so the writer cannot choose a stored fallback.
             let mut state = 0x12345678u32;
@@ -246,8 +248,14 @@ fn split_and_parallel_sink_failures_keep_member_context() {
             builder
                 .add_bytes(b"payload".to_vec(), payload, None, None)
                 .unwrap();
-            let mut volumes: Vec<_> = builder
-                .build_volumes(None)
+            let built = if stored {
+                builder.build_volumes(None)
+            } else {
+                volume_size::sized_for_payload(8, |size| {
+                    builder.clone().volume_size(Some(size)).build_volumes(None)
+                })
+            };
+            let mut volumes: Vec<_> = built
                 .unwrap()
                 .into_iter()
                 .map(|b| ArchiveReader::read_owned(b).unwrap())

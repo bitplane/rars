@@ -277,11 +277,15 @@ impl VolumeSink for CollectedVolumes {
 
 /// Writes a multi-volume RAR 5 or RAR 7 archive, handing each volume to `sink`
 /// as it completes so the set is never held in memory.
+///
+/// No volume is longer than `volume_size` bytes. That counts every header and
+/// the recovery record, as RAR's own `-v` switch does, so the parts fit the
+/// medium they were sized for.
 pub fn write_streaming_volumes_to(
     entries: &[ArchiveEntry],
     options: WriterOptions,
     extras: ArchiveExtras<'_>,
-    max_payload_per_volume: u64,
+    volume_size: u64,
     sink: &mut dyn VolumeSink,
     resources: &WriterResources,
 ) -> Result<()> {
@@ -289,7 +293,7 @@ pub fn write_streaming_volumes_to(
         entries,
         options,
         extras,
-        max_payload_per_volume,
+        volume_size,
         sink,
         resources,
         None,
@@ -302,7 +306,7 @@ pub fn write_streaming_volumes_with_progress(
     entries: &[ArchiveEntry],
     options: WriterOptions,
     extras: ArchiveExtras<'_>,
-    max_payload_per_volume: u64,
+    volume_size: u64,
     sink: &mut dyn VolumeSink,
     resources: &WriterResources,
     progress: Option<&dyn WriteProgress>,
@@ -388,7 +392,7 @@ pub fn write_streaming_volumes_with_progress(
             quick_open: false,
             progress: progress.map(ProgressReporter),
         },
-        max_payload_per_volume,
+        volume_size,
         sink,
         resources,
     )
@@ -1459,7 +1463,7 @@ mod tests {
             &[simple_entry(b"payload")],
             super::WriterOptions::new(crate::ArchiveVersion::Rar50, features),
             extras,
-            64,
+            4096,
             &mut sink,
             &crate::WriterResources::default(),
         )

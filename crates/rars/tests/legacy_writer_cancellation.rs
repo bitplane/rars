@@ -210,7 +210,7 @@ fn cancellation_after_a_volume_does_not_return_a_partial_set() {
         for store in [false, true] {
             let stop = StopVolume(AtomicBool::new(false));
             let result = builder(format, store)
-                .volume_size(Some(64))
+                .volume_size(Some(512))
                 .build_volumes(Some(&stop));
             assert_eq!(
                 result.unwrap_err().kind(),

@@ -398,9 +398,9 @@ fn staging_rejects_redirections_and_split_volume_fragments() {
 
     let mut builder = Builder::new(ArchiveVersion::Rar50)
         .store(true)
-        .volume_size(Some(4));
+        .volume_size(Some(512));
     builder
-        .add_bytes(b"file".to_vec(), b"a split payload".to_vec(), None, None)
+        .add_bytes(b"file".to_vec(), b"a split payload".repeat(64), None, None)
         .unwrap();
     let volumes = builder.build_volumes(None).unwrap();
     assert!(volumes.len() >= 2);

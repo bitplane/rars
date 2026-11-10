@@ -1,5 +1,7 @@
 #![cfg(feature = "write")]
 
+#[path = "support/volume_size.rs"]
+mod volume_size;
 use rars::rar15_40::{Archive, Block, NewSubKind};
 use rars::{ArchiveReader, ArchiveVersion, Builder};
 
@@ -124,11 +126,14 @@ fn each_legacy_volume_has_a_producer() {
         ArchiveVersion::Rar40,
     ] {
         for store in [false, true] {
-            let mut builder = Builder::new(version).store(store).volume_size(Some(16));
+            let mut builder = Builder::new(version).store(store);
             builder
                 .add_bytes(b"file".to_vec(), (0..128).collect(), None, None)
                 .unwrap();
-            let volumes = builder.build_volumes(None).unwrap();
+            let volumes = volume_size::sized_for_payload(16, |size| {
+                builder.clone().volume_size(Some(size)).build_volumes(None)
+            })
+            .unwrap();
             assert!(volumes.len() > 1);
             for volume in volumes {
                 marker(&Archive::parse(&volume).unwrap());
@@ -158,7 +163,11 @@ fn encrypted_legacy_headers_leave_only_producer_payload_public() {
         assert!(rars::Archive::Rar15To40(raw)
             .preserving_builder(Some(b"secret"))
             .is_ok());
-        for volume in builder.volume_size(Some(16)).build_volumes(None).unwrap() {
+        for volume in volume_size::sized_for_payload(16, |size| {
+            builder.clone().volume_size(Some(size)).build_volumes(None)
+        })
+        .unwrap()
+        {
             marker(&Archive::parse_with_password(&volume, Some(b"secret")).unwrap());
         }
     }
