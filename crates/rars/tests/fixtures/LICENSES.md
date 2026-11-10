@@ -38,6 +38,7 @@ licences below.
 | `rar50/wild/libarchive_solid.rar` | libarchive `libarchive/test/test_read_format_rar5_solid.rar.uu`, uudecoded | BSD-2-Clause (libarchive) |
 | `rar15_40/rar202/comment_nopsw.rar` | rarfile `test/files/rar202-comment-nopsw.rar` | ISC (rarfile) |
 | `rar15_40/rar202/comment_psw.rar` | rarfile `test/files/rar202-comment-psw.rar` | ISC (rarfile) |
+| `rar15_40/wild/rarfile_unix_owner.rar` | rarfile `test/files/rar2-unix-owner.rar` | ISC (rarfile) |
 | `rar50/wild/rarfile_hlink.rar` | rarfile `test/files/rar5-hlink.rar` | ISC (rarfile) |
 | `rar50/wild/rarfile_solid.rar` | rarfile `test/files/rar5-solid.rar` | ISC (rarfile) |
 | `rar50/wild/rarfile_solid_qo.rar` | rarfile `test/files/rar5-solid-qo.rar` | ISC (rarfile) |

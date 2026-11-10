@@ -8437,3 +8437,55 @@ fn extracts_legacy_matches_that_reach_past_the_start_of_the_window() {
         assert_eq!(entry.data, expected, "{name}");
     }
 }
+
+fn unix_owner_fixture_with_corrupted_owner() -> Vec<u8> {
+    let mut bytes = std::fs::read(fixture("wild/rarfile_unix_owner.rar")).unwrap();
+    // Owner and group are both "root", stored back to back.
+    let owner = bytes.windows(8).position(|w| w == b"rootroot").unwrap();
+    bytes[owner] = b'R';
+    bytes
+}
+
+#[test]
+fn extracts_rar20_archive_with_unix_owner_subblock() {
+    let bytes = std::fs::read(fixture("wild/rarfile_unix_owner.rar")).unwrap();
+    let archive = Archive::parse(&bytes).unwrap();
+
+    let extracted = collect_extract(&archive).unwrap();
+    assert_eq!(extracted.len(), 1);
+    assert_eq!(extracted[0].name, b"file.txt");
+    assert_eq!(extracted[0].data, b"foo\n");
+}
+
+#[test]
+fn rejects_rar20_unix_owner_subblock_with_corrupted_owner_name() {
+    let bytes = unix_owner_fixture_with_corrupted_owner();
+
+    assert!(matches!(
+        Archive::parse(&bytes),
+        Err(Error::CrcMismatch { .. })
+    ));
+}
+
+#[test]
+fn extracts_rar20_archive_with_unix_owner_subblock_from_path() {
+    let archive = Archive::parse_path(fixture("wild/rarfile_unix_owner.rar")).unwrap();
+
+    let extracted = collect_extract(&archive).unwrap();
+    assert_eq!(extracted.len(), 1);
+    assert_eq!(extracted[0].name, b"file.txt");
+    assert_eq!(extracted[0].data, b"foo\n");
+}
+
+#[test]
+fn rejects_corrupted_rar20_unix_owner_name_from_path() {
+    let bytes = unix_owner_fixture_with_corrupted_owner();
+    let dir = scratch::case("rars-rar20-unix-owner-corrupt");
+    let path = dir.join("corrupt.rar");
+    std::fs::write(&path, bytes).unwrap();
+
+    assert!(matches!(
+        Archive::parse_path(&path),
+        Err(Error::CrcMismatch { .. })
+    ));
+}

@@ -60,9 +60,12 @@ const MARK_HEAD: u8 = 0x72;
 const MAIN_HEAD: u8 = 0x73;
 const FILE_HEAD: u8 = 0x74;
 const COMM_HEAD: u8 = 0x75;
+const SUB_HEAD: u8 = 0x77;
 const PROTECT_HEAD: u8 = 0x78;
 const NEWSUB_HEAD: u8 = 0x7a;
 const ENDARC_HEAD: u8 = 0x7b;
+
+const UNIX_OWNER_SUBTYPE: [u8; 2] = [0x01, 0x01];
 
 const LONG_BLOCK: u16 = 0x8000;
 const MHD_VOLUME: u16 = 0x0001;
@@ -2748,11 +2751,19 @@ fn read_block_header_at(
     if offset != 0 {
         budget.admit(head_size, offset)?;
     }
-    let header = if head_size == 7 {
+    let mut header = if head_size == 7 {
         base
     } else {
         read_exact_at(file, absolute, head_size)?
     };
+    let names = unix_owner_names_size(&header);
+    if names != 0 {
+        // Two u16 name lengths keep this read under 128 KiB.
+        if (head_size + names) as u64 > remaining {
+            return Err(Error::TooShort);
+        }
+        header = read_exact_at(file, absolute, head_size + names)?;
+    }
     let mut block = parse_block_header(&header, 0)?;
     block.offset = offset;
     Ok(block)
@@ -2831,6 +2842,13 @@ fn header_crc_end(
     head_size: u16,
 ) -> Result<usize> {
     let full_end = offset + head_size as usize;
+    if head_type == SUB_HEAD {
+        let end = full_end + unix_owner_names_size(&input[offset..]);
+        if end > input.len() {
+            return Err(Error::TooShort);
+        }
+        return Ok(end);
+    }
     let fixed_end = match head_type {
         MAIN_HEAD if flags & MHD_COMMENT != 0 => Some(offset + 13),
         COMM_HEAD => Some(offset + 13),
@@ -2838,6 +2856,27 @@ fn header_crc_end(
         _ => None,
     };
     Ok(fixed_end.unwrap_or(full_end).min(full_end))
+}
+
+/// RAR 2.x checksums the unix-owner names with the header, though they follow HEAD_SIZE.
+fn unix_owner_names_size(block: &[u8]) -> usize {
+    // Callers pass at least the block's HEAD_SIZE bytes.
+    let flags = u16::from_le_bytes([block[3], block[4]]);
+    let head_size = u16::from_le_bytes([block[5], block[6]]);
+    if block[2] != SUB_HEAD
+        || flags & LONG_BLOCK == 0
+        || head_size < 18
+        || block[11..13] != UNIX_OWNER_SUBTYPE
+    {
+        return 0;
+    }
+    let data_size = u32::from_le_bytes([block[7], block[8], block[9], block[10]]) as u64;
+    let owner = u16::from_le_bytes([block[14], block[15]]) as usize;
+    let group = u16::from_le_bytes([block[16], block[17]]) as usize;
+    if (owner + group) as u64 > data_size {
+        return 0;
+    }
+    owner + group
 }
 
 fn file_header_comment_crc_end(input: &[u8], offset: usize) -> Result<usize> {
