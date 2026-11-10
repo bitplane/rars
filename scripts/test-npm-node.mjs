@@ -82,6 +82,18 @@ try {
     for (const [index, file] of actual.entries()) assert.deepEqual(await readFile(file), Buffer.of(index));
   }
 
+  // RAR follows the case of the first extension, and unrar looks only for that name.
+  for (const [firstName, later] of [["archive.RAR", "R"], ["archive.Rar", "R"], ["archive.rAR", "r"]]) {
+    const directory = path.join(temporary, `legacy-case-${firstName}`);
+    const actual = await writeVolumes(directory, firstName, 3);
+    assert.deepEqual(actual, [firstName, `archive.${later}00`, `archive.${later}01`].map((name) => path.join(directory, name)));
+  }
+  {
+    const directory = path.join(temporary, "rar50-upper");
+    const actual = await writeVolumes(directory, "archive.RAR", 2, "rar50");
+    assert.deepEqual(actual, [1, 2].map((index) => path.join(directory, `archive.part0${index}.RAR`)));
+  }
+
   const maximum = path.join(temporary, "legacy-maximum");
   const paths = await writeVolumes(maximum, "archive.rar", 101);
   assert.equal(paths.at(-1), path.join(maximum, "archive.r99"));

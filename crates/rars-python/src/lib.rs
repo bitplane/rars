@@ -2339,7 +2339,15 @@ fn legacy_volume_part_path(first_path: &Path, index: usize) -> PyResult<PathBuf>
             "legacy RAR volume names only support .r00 through .r99",
         ));
     }
-    Ok(first_path.with_extension(format!("r{:02}", index - 1)))
+    // RAR follows the case of the first extension: A.RAR, A.R00; a.rar, a.r00.
+    let letter = match first_path
+        .extension()
+        .and_then(|extension| extension.as_encoded_bytes().first())
+    {
+        Some(b'R') => 'R',
+        _ => 'r',
+    };
+    Ok(first_path.with_extension(format!("{letter}{:02}", index - 1)))
 }
 
 fn rar50_volume_part_path(
@@ -2354,8 +2362,15 @@ fn rar50_volume_part_path(
         .to_string_lossy();
     let stem = rar50_volume_stem(&file_name);
     let width = total_parts.to_string().len().max(2);
+    // Keep the first name's ".rar" as written, as RAR does: A.RAR, A.part01.RAR.
+    let suffix = file_name
+        .len()
+        .checked_sub(4)
+        .and_then(|start| file_name.get(start..))
+        .filter(|suffix| suffix.eq_ignore_ascii_case(".rar"))
+        .unwrap_or(".rar");
     Ok(parent.join(format!(
-        "{stem}.part{:0width$}.rar",
+        "{stem}.part{:0width$}{suffix}",
         index + 1,
         width = width
     )))
@@ -2363,9 +2378,14 @@ fn rar50_volume_part_path(
 
 fn rar50_volume_stem(file_name: &str) -> &str {
     let without_rar = file_name
-        .strip_suffix(".rar")
-        .or_else(|| file_name.strip_suffix(".RAR"))
-        .unwrap_or(file_name);
+        .len()
+        .checked_sub(4)
+        .filter(|&start| {
+            file_name
+                .get(start..)
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".rar"))
+        })
+        .map_or(file_name, |start| &file_name[..start]);
     if let Some((base, digits)) = without_rar.rsplit_once(".part") {
         if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) {
             return base;

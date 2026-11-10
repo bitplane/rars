@@ -9,10 +9,14 @@ function volumePath(firstPath, index, total, format) {
   if (format === "rar50" || format === "rar70") {
     const stem = parsed.name.replace(/\.part\d+$/i, "");
     const width = Math.max(2, String(total).length);
-    return path.join(parsed.dir, `${stem}.part${String(index + 1).padStart(width, "0")}.rar`);
+    // Keep the first name's ".rar" as written, as RAR does: A.RAR, A.part01.RAR.
+    const suffix = /^\.rar$/i.test(parsed.ext) ? parsed.ext : ".rar";
+    return path.join(parsed.dir, `${stem}.part${String(index + 1).padStart(width, "0")}${suffix}`);
   }
   if (index === 0) return firstPath;
-  return path.join(parsed.dir, `${parsed.name}.r${String(index - 1).padStart(2, "0")}`);
+  // RAR follows the case of the first extension: A.RAR, A.R00; a.rar, a.r00.
+  const letter = parsed.ext.startsWith(".R") ? "R" : "r";
+  return path.join(parsed.dir, `${parsed.name}.${letter}${String(index - 1).padStart(2, "0")}`);
 }
 
 function volumePaths(firstPath, total, format) {
