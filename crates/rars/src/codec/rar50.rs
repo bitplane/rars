@@ -1,3 +1,13 @@
+#[cfg(all(
+    feature = "parallel",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
+mod block_ops;
+#[cfg(all(
+    feature = "parallel",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
+mod blocks_ahead;
 #[cfg(feature = "write")]
 mod encoder;
 #[cfg(feature = "write")]
@@ -1047,6 +1057,25 @@ impl<B: Budget> ReaderState<B> {
         let mut output =
             StreamingOutput::new(history, output_size, dictionary_size, history_limit)?;
         output.stage.control = self.read_control.clone();
+        #[cfg(all(
+            feature = "parallel",
+            not(all(target_arch = "wasm32", target_os = "unknown"))
+        ))]
+        // A bounded reader's peak charge must not depend on thread timing.
+        if !B::LIMITED && output_size != 0 {
+            let workers = crate::parallel::block_decode_workers(self.read_control.decode_workers());
+            if workers != 0 {
+                self.decode_blocks_ahead(
+                    workers,
+                    input,
+                    algorithm_version,
+                    &mut output,
+                    &mut sink,
+                    &mut filters,
+                )?;
+                return self.finish_stream(output, &mut sink);
+            }
+        }
         self.decode_blocks(
             input,
             algorithm_version,
@@ -1712,8 +1741,7 @@ impl<B: Budget> StreamingOutput<B> {
         Ok(())
     }
 
-    /// The usual match, taken whole from the ring with no flush, growth or
-    /// sink call; false leaves it to the general copy.
+    /// The usual match needs no flush, growth or sink call; false leaves it to the general copy.
     #[inline(always)]
     fn copy_short(&mut self, distance: usize, length: usize) -> bool {
         let end = self.ring.end;

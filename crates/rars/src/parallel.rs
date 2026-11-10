@@ -102,6 +102,24 @@ mod threaded {
     pub(crate) fn may_spawn() -> bool {
         rayon::current_thread_index().is_none() && threads() > 1
     }
+
+    const DEFAULT_BLOCK_DECODE_WORKERS: usize = 8;
+
+    /// None inside the pool, where members already decode side by side.
+    pub(crate) fn block_decode_workers(policy: crate::read_control::DecodeWorkers) -> usize {
+        use crate::read_control::DecodeWorkers;
+        if rayon::current_thread_index().is_some() {
+            return 0;
+        }
+        match policy {
+            DecodeWorkers::Serial => 0,
+            DecodeWorkers::AtMost(cap) => cap.min(threads()),
+            // Unit tests take the worker path even on one core.
+            DecodeWorkers::Auto => (threads() - 1)
+                .min(DEFAULT_BLOCK_DECODE_WORKERS)
+                .max(usize::from(cfg!(test))),
+        }
+    }
 }
 
 #[cfg(any(
