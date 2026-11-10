@@ -812,21 +812,22 @@ impl<B: Budget> Reader15State<B> {
     }
 
     fn copy_string(&mut self, distance: u32, length: u32, out: &mut impl Write) -> Result<()> {
-        if self.output_written + length as usize > self.target {
-            return Err(Error::InvalidData("RAR 1.3 match exceeds output size"));
-        }
-
-        if (!self.first_win_done && distance as usize > self.unp_ptr)
+        let zero_fill = (!self.first_win_done && distance as usize > self.unp_ptr)
             || distance as usize > 0x10000
-            || distance == 0
-        {
-            for _ in 0..length {
-                self.put_byte(0, out)?;
-            }
-        } else {
-            for _ in 0..length {
-                let byte = self.window[(self.unp_ptr.wrapping_sub(distance as usize)) & 0xffff];
+            || distance == 0;
+        for _ in 0..length {
+            let byte = if zero_fill {
+                0
+            } else {
+                self.window[(self.unp_ptr.wrapping_sub(distance as usize)) & 0xffff]
+            };
+            if self.output_written < self.target {
                 self.put_byte(byte, out)?;
+            } else {
+                // Past the declared size the match only fills the window, for
+                // the next solid member.
+                self.window[self.unp_ptr] = byte;
+                self.unp_ptr = (self.unp_ptr + 1) & 0xffff;
             }
         }
         Ok(())

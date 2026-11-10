@@ -138,16 +138,55 @@ fn invalid_flag_rank_preserves_the_table_and_match_overrun_writes_nothing() {
         .unwrap();
     assert_eq!(output, [0; 2]);
     assert_eq!(streaming.state.ch_set_c, alphabet);
+    // Empty input reads as a zero-filled match longer than the member.
     assert_eq!(
-        super::Unpack15::new().decode_member(&[], 1, false),
-        Err(Error::InvalidData("RAR 1.3 match exceeds output size"))
+        super::Unpack15::new().decode_member(&[], 1, false).unwrap(),
+        [0]
     );
     output.clear();
+    super::Unpack15::new()
+        .decode_member_from_reader(&mut &[][..], 1, false, &mut output)
+        .unwrap();
+    assert_eq!(output, [0]);
+}
+
+#[test]
+fn a_match_crossing_the_declared_size_truncates_and_keeps_the_overrun() {
+    let first = b"repeated tail ".repeat(256);
+    let second = b"repeated tail, then a fresh ending".to_vec();
+    let mut encoder = super::Unpack15Encoder::new();
+    let first_packed = encoder.encode_member(&first).unwrap();
+    let second_packed = encoder.encode_member(&second).unwrap();
+    let declared = first.len() - 5;
+
+    let mut from_slice = super::Unpack15::new();
     assert_eq!(
-        super::Unpack15::new().decode_member_from_reader(&mut &[][..], 1, false, &mut output),
-        Err(Error::InvalidData("RAR 1.3 match exceeds output size"))
+        from_slice
+            .decode_member(&first_packed, declared, false)
+            .unwrap(),
+        first[..declared]
     );
-    assert!(output.is_empty());
+    // The encoder never matches across members, so check the window itself.
+    assert_eq!(from_slice.state.unp_ptr, first.len());
+    assert_eq!(from_slice.state.window[..first.len()], first);
+    assert_eq!(
+        from_slice
+            .decode_member(&second_packed, second.len(), true)
+            .unwrap(),
+        second
+    );
+
+    let mut from_reader = super::Unpack15::new();
+    for (packed, size, solid, expected) in [
+        (&first_packed, declared, false, &first[..declared]),
+        (&second_packed, second.len(), true, &second[..]),
+    ] {
+        let mut out = Vec::new();
+        from_reader
+            .decode_member_from_reader(&mut packed.as_slice(), size, solid, &mut out)
+            .unwrap();
+        assert_eq!(out, expected);
+    }
 }
 
 #[test]
