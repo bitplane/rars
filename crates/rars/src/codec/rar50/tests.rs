@@ -4562,15 +4562,14 @@ fn zero_fills_a_zero_distance_match_in_both_outputs() {
 }
 
 #[test]
-fn rejects_a_match_that_runs_past_the_output_limit() {
+fn copies_only_the_part_of_a_match_within_the_output_limit() {
     let decoder = Unpack50Decoder::new();
     let mut output = b"AB".to_vec();
 
-    assert_eq!(
-        decoder.copy_match(&mut output, 1, 2, 3, DEFAULT_DICTIONARY_SIZE),
-        Err(Error::InvalidData("RAR 5 match exceeds output limit"))
-    );
-    assert_eq!(output, b"AB");
+    decoder
+        .copy_match(&mut output, 1, 2, 3, DEFAULT_DICTIONARY_SIZE)
+        .unwrap();
+    assert_eq!(output, b"ABB");
 }
 
 #[test]
@@ -5079,38 +5078,67 @@ fn decoders_handle_uninitialized_match_controls() {
 }
 
 #[test]
-fn decoders_reject_match_that_exceeds_declared_output() {
-    for (payload, declared_size) in [
-        (new_match_payload(), 3), // AB, then a two-byte match.
-        (repeat_payload(257), 5), // ABAB, then the previous match.
-        (repeat_payload(258), 5), // ABAB, then a repeat distance.
+fn final_match_past_declared_size_truncates_and_keeps_overrun_for_solid_member() {
+    // The follow-on member copies two bytes from distance 2, so it reads the
+    // overrun byte only if the window kept it.
+    let follow_on = {
+        let payload = match_only_payload();
+        encode_compressed_block(&payload, payload.len() * 8, true, true).unwrap()
+    };
+    for (payload, declared_size, expected, next) in [
+        // AB, then a two-byte match: ABA|B.
+        (new_match_payload(), 3, &b"ABA"[..], b"AB"),
+        // ABAB, then the previous match: ABABA|B.
+        (repeat_payload(257), 5, b"ABABA", b"AB"),
+        // ABAB, then a repeat distance: ABABA|B.
+        (repeat_payload(258), 5, b"ABABA", b"AB"),
     ] {
         let input = encode_compressed_block(&payload, payload.len() * 8, true, true).unwrap();
-        assert_eq!(
-            Unpack50Decoder::new().decode_member_with_dictionary(
-                &input,
+        let mut buffered = Unpack50Decoder::new();
+        let decode = |decoder: &mut Unpack50Decoder, input: &[u8], size, solid| {
+            decoder.decode_member_with_dictionary(
+                input,
                 0,
-                declared_size,
+                size,
                 DEFAULT_DICTIONARY_SIZE,
-                false,
+                solid,
                 DecodeMode::Lz,
-            ),
-            Err(Error::InvalidData("RAR 5 match exceeds output limit"))
+            )
+        };
+        assert_eq!(
+            decode(&mut buffered, &input, declared_size, false).unwrap(),
+            expected
         );
-        let result = Unpack50Decoder::new().decode_member_from_reader_with_dictionary_to_sink(
-            &mut input.as_slice(),
-            0,
-            declared_size,
-            DEFAULT_DICTIONARY_SIZE,
-            false,
-            |_chunk| Ok::<(), std::convert::Infallible>(()),
+        assert_eq!(decode(&mut buffered, &follow_on, 2, true).unwrap(), next);
+
+        let mut streaming = Unpack50Decoder::new();
+        let stream = |decoder: &mut Unpack50Decoder, input: &[u8], size, solid| {
+            let mut out = Vec::new();
+            decoder
+                .decode_member_from_reader_with_dictionary_to_sink(
+                    &mut &*input,
+                    0,
+                    size,
+                    DEFAULT_DICTIONARY_SIZE,
+                    solid,
+                    |chunk| {
+                        match chunk {
+                            DecodedChunk::Bytes(bytes) => out.extend_from_slice(bytes),
+                            DecodedChunk::Repeated { byte, len } => {
+                                out.extend(std::iter::repeat_n(byte, len));
+                            }
+                        }
+                        Ok::<(), std::convert::Infallible>(())
+                    },
+                )
+                .unwrap();
+            out
+        };
+        assert_eq!(
+            stream(&mut streaming, &input, declared_size, false),
+            expected
         );
-        assert!(matches!(
-            result,
-            Err(StreamDecodeError::Decode(Error::InvalidData(
-                "RAR 5 match exceeds output limit"
-            )))
-        ));
+        assert_eq!(stream(&mut streaming, &follow_on, 2, true), next);
     }
 }
 
@@ -5910,6 +5938,26 @@ fn new_match_payload() -> Vec<u8> {
     writer.write_bits(0b00, 2); // 'A'
     writer.write_bits(0b01, 2); // 'B'
     writer.write_bits(0b10, 2); // match length 2
+    writer.write_bits(0, 1); // distance slot 1
+    writer.finish()
+}
+
+fn match_only_payload() -> Vec<u8> {
+    let mut lengths = TableLengths {
+        main: vec![0; MAIN_TABLE_SIZE],
+        distance: vec![0; DISTANCE_TABLE_SIZE_50],
+        align: vec![0; ALIGN_TABLE_SIZE],
+        length: vec![0; LENGTH_TABLE_SIZE],
+    };
+    lengths.main[b'A' as usize] = 1;
+    lengths.main[262] = 1;
+    lengths.distance[1] = 1;
+    let (bytes, bit_pos) = encode_table_lengths_with_bit_count(&lengths, 0).unwrap();
+    let mut writer = BitWriter {
+        bytes: Buffer::from_vec(bytes),
+        bit_pos,
+    };
+    writer.write_bits(1, 1); // match length 2
     writer.write_bits(0, 1); // distance slot 1
     writer.finish()
 }

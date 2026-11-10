@@ -219,6 +219,7 @@ impl<B: Budget> Reader20State<B> {
         self.decode_until(target, src).map_err(truncated)?;
         self.read_last_tables(src)?;
         let out = Buffer::copied(self.raw_range(start, target), &self.output.allowance())?;
+        self.keep_overrun()?;
         self.finish_history();
         Ok(out)
     }
@@ -275,8 +276,14 @@ impl<B: Budget> Reader20State<B> {
             }
         }
         self.read_last_tables(src)?;
+        self.keep_overrun()?;
         self.finish_history();
         Ok(())
+    }
+
+    // A final match's bytes past the declared size go to the window only.
+    fn keep_overrun(&mut self) -> Result<()> {
+        self.drain_pending_match(usize::MAX)
     }
 
     fn decode_until(&mut self, target: usize, src: &mut dyn Read) -> Result<()> {

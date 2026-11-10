@@ -204,15 +204,20 @@ fn bounded_limits_and_every_refusal_keep_the_scalar_failure_prefix() {
 #[test]
 fn encoded_long_matches_preserve_member_splits_and_streaming_solid_history() {
     fn check<B: Budget>(budget: &B, data: &[u8], packed: &[u8], next: &[u8], packed_next: &[u8]) {
+        // A declared size inside the match truncates the output; the window
+        // keeps the rest of that match.
         let mut decoder = Reader20State::with_allowance(budget);
         let first = decoder.decode_member_owned(packed, 100).unwrap();
-        assert!(decoder.pending_match.is_some());
+        assert_eq!(&*first, &data[..100]);
+        assert!(decoder.pending_match.is_none());
+        let window = decoder.raw_range(0, decoder.current_pos());
+        assert!(window.len() > 100 && data.starts_with(window));
+
+        let mut decoder = Reader20State::with_allowance(budget);
         let mut checkpoint = decoder.try_clone().unwrap();
         for state in [&mut decoder, &mut checkpoint] {
-            let rest = state
-                .decode_member_owned(&[], data.len() - first.len())
-                .unwrap();
-            assert_eq!([&*first, &*rest].concat(), data);
+            let whole = state.decode_member_owned(packed, data.len()).unwrap();
+            assert_eq!(&*whole, data);
             let mut out = Vec::new();
             let mut input = packed_next;
             state
@@ -228,7 +233,7 @@ fn encoded_long_matches_preserve_member_splits_and_streaming_solid_history() {
             .unwrap();
         assert_eq!(output, data);
     }
-    // One long encoded match can straddle the declared member boundary.
+    // One long encoded match can straddle a declared member boundary.
     let data = b"ABC".repeat(80);
     let next = data[37..234].to_vec();
     let mut encoder = Unpack20Encoder::with_options(EncodeOptions::new(16).with_try_audio(false));

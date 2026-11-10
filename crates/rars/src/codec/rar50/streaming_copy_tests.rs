@@ -55,10 +55,13 @@ fn buffered_overlap_preserves_output_limit_and_workspace_refusal() {
     decoder.copy_match(&mut output, 2, 126, 128, 128).unwrap();
     assert_eq!(&*output, b"ab".repeat(64));
     assert_eq!(budget.used(), 128);
-    assert!(matches!(
+    assert_eq!(
         decoder.copy_match(&mut output, 2, 1, 128, 128),
-        Err(Error::InvalidData("RAR 5 match exceeds output limit"))
-    ));
+        Ok(Some(Overrun {
+            distance: Some(2),
+            len: 1
+        }))
+    );
     assert!(matches!(
         decoder.copy_match(&mut output, 2, 1, 129, 128),
         Err(Error::WorkspaceLimitExceeded(_))
