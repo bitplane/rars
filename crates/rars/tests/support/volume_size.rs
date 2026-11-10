@@ -17,16 +17,29 @@ pub fn sized_for_payload<T, E: std::fmt::Display>(
 /// The smallest volume size `write` does not refuse as too small for its
 /// headers. Any other outcome, success or a different error, counts as
 /// accepted, so a writer that refuses for another reason still reports it.
+/// Sizes just above the smallest split the data into one-byte volumes, so only the final scan probes there.
 pub fn smallest_volume_size<T, E: std::fmt::Display>(
     mut write: impl FnMut(usize) -> Result<T, E>,
 ) -> usize {
-    let (mut refused, mut accepted) = (0usize, 1usize << 16);
-    while accepted - refused > 1 {
+    let mut refuses =
+        |size| matches!(write(size), Err(error) if error.to_string().contains("too small"));
+    let (mut refused, mut accepted) = (0usize, 64usize);
+    while refuses(accepted) {
+        assert!(
+            accepted < 1 << 16,
+            "every volume size up to {accepted} was refused"
+        );
+        refused = accepted;
+        accepted *= 2;
+    }
+    while accepted - refused > 16 {
         let middle = refused + (accepted - refused) / 2;
-        match write(middle) {
-            Err(error) if error.to_string().contains("too small") => refused = middle,
-            _ => accepted = middle,
+        match refuses(middle) {
+            true => refused = middle,
+            false => accepted = middle,
         }
     }
-    accepted
+    (refused + 1..accepted)
+        .find(|&size| !refuses(size))
+        .unwrap_or(accepted)
 }
