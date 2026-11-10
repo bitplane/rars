@@ -64,20 +64,27 @@ def test_plain_builder_removal_and_decoded_missing_name():
     assert builder.member_ids() == []
 
 
-@pytest.mark.parametrize("operation", [rars.test_volumes, rars.extract_volumes])
-def test_volume_path_conversion_errors(operation, tmp_path):
-    args = (tmp_path,) if operation is rars.extract_volumes else ()
-    with pytest.raises(ValueError, match="volume path list is empty"):
-        operation([], *args)
-    with pytest.raises(TypeError):
-        operation([object()], *args)
+@pytest.mark.parametrize("operation", ["testrar", "extractall"])
+def test_volume_conversion_errors(operation, tmp_path):
+    builder = rars.RarBuilder(store=True, volume_size=512)
+    builder.add_bytes(b"payload" * 200, "file.txt")
+    paths = builder.write_volumes(tmp_path / "archive.part01.rar")
+    args = (tmp_path / "out", None, None, True) if operation == "extractall" else ()
+    with rars.RarFile(paths[0]) as archive:
+        method = getattr(archive, operation)
+        with pytest.raises(rars.Error, match="volume is missing"):
+            method(*args, volumes=[])
+        with pytest.raises(TypeError):
+            method(*args, volumes=[object()])
+        with pytest.raises(TypeError):
+            method(*args, volumes=object())
 
-    def broken_paths():
-        yield STORED
-        raise RuntimeError("path iterator failed")
+        def broken_paths():
+            yield paths[1]
+            raise RuntimeError("path iterator failed")
 
-    with pytest.raises(RuntimeError, match="path iterator failed"):
-        operation(broken_paths(), *args)
+        with pytest.raises(RuntimeError, match="path iterator failed"):
+            method(*args, volumes=broken_paths())
 
 
 @pytest.mark.parametrize("stem", ["archive.part01.rar", "archive.part.rar", "archive.partxy.RAR", "archive", "archive.RAR"])
@@ -91,7 +98,8 @@ def test_modern_volume_stems_and_roundtrip(tmp_path, stem):
         base = base[:-7]
     # RAR keeps the first name's ".rar" as written: archive.RAR, archive.part01.RAR.
     assert Path(paths[0]).name == f"{base}.part01{suffix}"
-    rars.test_volumes(paths)
+    with rars.RarFile(paths[0]) as archive:
+        archive.testrar(volumes=paths[1:])
 
 
 @pytest.mark.parametrize("selected", [False, True])
@@ -110,12 +118,13 @@ def test_volume_extraction_directories_overwrite_and_open_failures(tmp_path):
     builder.add_bytes(b"payload" * 200, "nested/file.txt")
     paths = builder.write_volumes(tmp_path / "archive.part01.rar")
     output = tmp_path / "output"
-    rars.extract_volumes(paths, output)
-    assert (output / "empty").is_dir()
-    assert (output / "nested/file.txt").read_bytes() == b"payload" * 200
-    rars.extract_volumes(paths, output, overwrite=True)
-    with pytest.raises(OSError):
-        rars.extract_volumes(paths, output)
+    with rars.RarFile(paths[0]) as archive:
+        archive.extractall(output, volumes=paths[1:])
+        assert (output / "empty").is_dir()
+        assert (output / "nested/file.txt").read_bytes() == b"payload" * 200
+        archive.extractall(output, overwrite=True, volumes=paths[1:])
+        with pytest.raises(OSError):
+            archive.extractall(output, volumes=paths[1:])
 
 
 def test_volume_decoded_collisions_preserve_first_file(tmp_path):
@@ -128,8 +137,8 @@ def test_volume_decoded_collisions_preserve_first_file(tmp_path):
     path.write_bytes(replace_first_name(builder.to_bytes(), unicode_wire("café.txt")))
     out = tmp_path / "output"
     with pytest.raises(ValueError, match="same decoded output path"):
-        rars.extract_volumes([path], out, overwrite=True,
-                             options=rars.ReadOptions(legacy_name_encoding="cp850"))
+        rars.RarFile(path).extractall(out, overwrite=True, volumes=[],
+                                      options=rars.ReadOptions(legacy_name_encoding="cp850"))
     assert (out / "café.txt").read_bytes() == b"unicode"
 
 
@@ -430,14 +439,10 @@ def test_volume_write_failure_names_an_oserror(tmp_path, format):
     assert not (tmp_path / "missing").exists()
 
 
-@pytest.mark.parametrize("operation", [rars.repair, rars.repair_detailed, rars.repair_to_path,
-                                       rars.test_volumes, rars.extract_volumes])
+@pytest.mark.parametrize("operation", [rars.repair, rars.repair_detailed, rars.repair_to_path])
 def test_module_password_conversion_errors_are_typeerrors(tmp_path, operation):
-    if operation in {rars.test_volumes, rars.extract_volumes}:
-        args = ([STORED],)
-    else:
-        args = (STORED,)
-    if operation in {rars.repair_to_path, rars.extract_volumes}:
+    args = (STORED,)
+    if operation is rars.repair_to_path:
         args += (tmp_path / "output",)
     with pytest.raises(TypeError):
         operation(*args, password=object())
@@ -466,4 +471,5 @@ def test_legacy_volume_names_follow_the_first_extension_case(tmp_path, first, se
     builder.add_bytes(b"payload" * 200, "file.txt")
     paths = builder.write_volumes(tmp_path / first)
     assert [Path(path).name for path in paths[:2]] == [first, second]
-    rars.test_volumes(paths)
+    with rars.RarFile(paths[0]) as archive:
+        archive.testrar(volumes=paths[1:])

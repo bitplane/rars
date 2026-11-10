@@ -749,6 +749,85 @@ impl Archive {
         }
     }
 
+    /// Extracts the volume set this first volume begins, pulling each later
+    /// volume from `volumes` only when extraction reaches it.
+    ///
+    /// `volumes` yields the second volume onwards, in order, and is advanced
+    /// once per volume. It may block until that volume is complete. Running out
+    /// is an error while the set still needs a volume. It is not advanced past
+    /// a volume marked as the last; RAR 1.3 to 2.0 volumes carry no such mark,
+    /// so it is advanced once more there and must end rather than wait.
+    /// Volumes are read front to back: once volume N+1 is pulled, nothing reads
+    /// volume N again, except to name a damaged volume after a member has
+    /// already failed. The exception is a RAR 5 member whose earlier parts do not
+    /// record its size; its later volumes are pulled before it is decoded.
+    /// It may be advanced from a worker thread, and cancellation cannot
+    /// interrupt it while it blocks.
+    ///
+    /// A split member's writer opens at its first part, so a later volume that
+    /// turns out wrong leaves partial output, as with [`Self::extract_to`].
+    pub fn extract_with_volumes<V, F>(
+        &self,
+        volumes: V,
+        options: ArchiveReadOptions<'_>,
+        mut open: F,
+    ) -> Result<()>
+    where
+        V: IntoIterator<Item = Result<Archive>>,
+        V::IntoIter: Send,
+        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    {
+        let mut volumes = volumes.into_iter();
+        options.check_cancelled()?;
+        match self {
+            Self::Rar13(first) => {
+                let mut set = with_later_volumes(first, &mut volumes, |volume| match volume {
+                    Self::Rar13(volume) => Some(volume),
+                    _ => None,
+                });
+                let mut feed = volume_extract::VolumeFeed::arriving(&mut set, options);
+                rar13::extract_from_feed(&mut feed, options, |meta| open(&rar13_meta(meta)))
+            }
+            Self::Rar15To40(first) => {
+                let mut set = with_later_volumes(first, &mut volumes, |volume| match volume {
+                    Self::Rar15To40(volume) => Some(volume),
+                    _ => None,
+                });
+                let mut feed = volume_extract::VolumeFeed::arriving(&mut set, options);
+                rar15_40::extract_from_feed(&mut feed, options, |meta| open(&rar15_40_meta(meta)))
+            }
+            Self::Rar50Plus(first) => {
+                let mut set = with_later_volumes(first, &mut volumes, |volume| match volume {
+                    Self::Rar50Plus(volume) => Some(volume),
+                    _ => None,
+                })
+                .enumerate()
+                .map(|(index, volume)| {
+                    let volume = volume?;
+                    if volume
+                        .main
+                        .volume_number
+                        .is_some_and(|number| number != index as u64)
+                    {
+                        return Err(Error::InVolume {
+                            number: index + 1,
+                            source: Box::new(Error::InvalidHeader("volume is out of order")),
+                        });
+                    }
+                    Ok(volume)
+                });
+                let mut feed = volume_extract::VolumeFeed::arriving(&mut set, options);
+                rar50::extract_from_feed(
+                    &mut feed,
+                    options,
+                    &mut |meta| open(&rar50_meta(meta)),
+                    &mut |_, _| Ok(()),
+                    false,
+                )
+            }
+        }
+    }
+
     /// Visits members in archive order, choosing whether to extract, skip or stop.
     ///
     /// The callback receives full metadata before payload limits, dictionary
@@ -1530,6 +1609,17 @@ fn read_archive_signature(
 #[cfg(test)]
 #[path = "reader_signature_tests.rs"]
 mod reader_signature_tests;
+
+/// The first volume, then each later one, refused unless it is the same family.
+fn with_later_volumes<'a, A: Clone + Send + Sync>(
+    first: &'a A,
+    later: &'a mut (impl Iterator<Item = Result<Archive>> + Send),
+    family: fn(Archive) -> Option<A>,
+) -> impl Iterator<Item = Result<A>> + Send + 'a {
+    std::iter::once(Ok(first.clone())).chain(later.map(move |volume| {
+        family(volume?).ok_or(Error::InvalidHeader("mixed archive families in volume set"))
+    }))
+}
 
 fn read_options(password: Option<&[u8]>) -> ArchiveReadOptions<'_> {
     match password {

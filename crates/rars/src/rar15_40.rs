@@ -37,7 +37,7 @@ pub use crate::streaming::{EntrySource, WriterResources};
 #[cfg(feature = "write")]
 pub use crate::write_plan::MemberCoding;
 pub use extract::extract_volumes_to;
-pub(crate) use extract::extract_volumes_with_links;
+pub(crate) use extract::{extract_from_feed, extract_volumes_with_links};
 use extract::{DecoderSession, DecryptingReader, PackedReader};
 #[cfg(feature = "write")]
 pub(crate) use write::write_stored_volumes_with_progress;

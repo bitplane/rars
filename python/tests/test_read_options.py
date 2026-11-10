@@ -170,21 +170,24 @@ def test_volume_policies_cover_parsing_and_logical_member_limits(tmp_path, forma
     output.mkdir()
     target = output / "file"
     target.write_bytes(b"keep")
-    for options in [rars.ReadOptions(max_header_count=0),
-                    rars.ReadOptions(max_header_bytes=0),
-                    rars.ReadOptions(max_member_output_bytes=len(payload) - 1),
-                    rars.ReadOptions(max_total_output_bytes=len(payload) - 1)]:
+    # Output limits refuse before the writer opens; header limits trip on the second volume, after it.
+    for options, kept in [(rars.ReadOptions(max_member_output_bytes=len(payload) - 1), True),
+                          (rars.ReadOptions(max_total_output_bytes=len(payload) - 1), True),
+                          (rars.ReadOptions(max_header_count=0), False),
+                          (rars.ReadOptions(max_header_bytes=0), False)]:
         with pytest.raises(MemoryError):
-            rars.test_volumes(paths, options=options)
+            rars.RarFile(paths[0]).testrar(options=options, volumes=paths[1:])
         with pytest.raises(MemoryError):
-            rars.extract_volumes(paths, output, overwrite=True, options=options)
-        assert target.read_bytes() == b"keep"
+            rars.RarFile(paths[0]).extractall(output, overwrite=True, options=options, volumes=paths[1:])
+        assert (target.read_bytes() == b"keep") == kept
     options = rars.ReadOptions(max_member_output_bytes=len(payload), max_total_output_bytes=len(payload))
-    rars.test_volumes(paths, options=options)
-    rars.extract_volumes(paths, output, overwrite=True, options=options)
+    rars.RarFile(paths[0]).testrar(options=options, volumes=paths[1:])
+    rars.RarFile(paths[0]).extractall(output, overwrite=True, options=options, volumes=paths[1:])
     assert target.read_bytes() == payload
     token = rars.CancellationToken()
     token.cancel()
-    for method in [rars.test_volumes, rars.extract_volumes]:
-        with pytest.raises(InterruptedError):
-            method([tmp_path / "missing.rar"], options=rars.ReadOptions(cancellation=token))
+    cancelled = rars.ReadOptions(cancellation=token)
+    with pytest.raises(InterruptedError):
+        rars.RarFile(paths[0]).testrar(options=cancelled, volumes=[tmp_path / "missing.rar"])
+    with pytest.raises(InterruptedError):
+        rars.RarFile(paths[0]).extractall(output, options=cancelled, volumes=[tmp_path / "missing.rar"])

@@ -2,6 +2,7 @@
 
 #[cfg(feature = "write")]
 mod producer;
+mod volumes;
 #[cfg(feature = "write")]
 pub(crate) mod write;
 #[cfg(feature = "write")]
@@ -26,7 +27,7 @@ use crate::error::{Error, Result};
 use crate::io_util::{read_exact_at, read_u16, read_u32};
 pub(crate) use crate::source::ArchiveSource;
 use crate::version::ArchiveFamily;
-use crate::volume_extract::ChainedReader;
+use crate::volume_extract::VolumeFeed;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::ops::Range;
@@ -1065,106 +1066,29 @@ where
 fn extract_volumes_with_allowance<F, B: Budget>(
     volumes: &[Archive],
     options: crate::ArchiveReadOptions<'_>,
-    mut open: F,
+    open: F,
     allowance: &B,
 ) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
 {
-    options.check_cancelled()?;
-    let password = options.password;
-    let mut budget = crate::output_limit::OutputBudget::new(options);
-    let mut pending: Option<PendingSplitRefs<B>> = None;
-    let mut unpack15 = Decoder15::with_allowance(allowance);
-    unpack15.read_control = budget.control.clone();
-    let mut extracted_count = 0usize;
+    let mut volumes = volumes.iter().cloned().map(Ok);
+    let mut feed = VolumeFeed::complete(&mut volumes, options);
+    volumes::extract(&mut feed, options, open, allowance)
+}
 
-    for (volume_index, archive) in volumes.iter().enumerate() {
-        for (entry_index, entry) in archive.entries.iter().enumerate() {
-            options.check_cancelled()?;
-            if !entry.is_split_before() && !entry.is_split_after() {
-                if pending.is_some() {
-                    return Err(Error::InvalidHeader(
-                        "RAR 1.3 split entry is interrupted by a regular entry",
-                    ));
-                }
-                let meta = entry.metadata();
-                if meta.is_directory {
-                    options.check_cancelled()?;
-                    let _ = open(&meta)?;
-                    options.check_cancelled()?;
-                    extracted_count += 1;
-                    continue;
-                }
-                budget.check(u64::from(entry.header.unp_size), &meta.name)?;
-                options.check_cancelled()?;
-                let mut writer = open(&meta)?;
-                options.check_cancelled()?;
-                budget.run(&meta.name, &mut writer, |mut writer| {
-                    entry
-                        .write_compressed_to(
-                            archive,
-                            password,
-                            &mut unpack15,
-                            archive.main.is_solid() && extracted_count != 0,
-                            &mut writer,
-                        )
-                        .map_err(|error| entry.entry_error("extracting", error))?;
-                    options.check_cancelled()?;
-                    Ok(())
-                })?;
-                extracted_count += 1;
-                continue;
-            }
-
-            match (
-                &mut pending,
-                entry.is_split_before(),
-                entry.is_split_after(),
-            ) {
-                (None, false, true) => {
-                    pending = Some(PendingSplitRefs::with_allowance(
-                        entry,
-                        volume_index,
-                        entry_index,
-                        allowance,
-                    )?);
-                }
-                (Some(current), true, true) => {
-                    current.append(entry, volume_index, entry_index)?;
-                }
-                (Some(current), true, false) => {
-                    current.append(entry, volume_index, entry_index)?;
-                    let completed = pending.take().expect("pending split");
-                    let solid = archive.main.is_solid() && extracted_count != 0;
-                    completed
-                        .write_to(
-                            volumes,
-                            entry,
-                            options,
-                            &mut budget,
-                            &mut unpack15,
-                            solid,
-                            &mut open,
-                        )
-                        .map_err(|error| entry.entry_error("extracting", error))?;
-                    extracted_count += 1;
-                }
-                _ => {
-                    return Err(Error::InvalidHeader(
-                        "RAR 1.3 split entry flags are inconsistent",
-                    ));
-                }
-            }
-        }
+pub(crate) fn extract_from_feed<F>(
+    feed: &mut VolumeFeed<'_, '_, Archive>,
+    options: crate::ArchiveReadOptions<'_>,
+    open: F,
+) -> Result<()>
+where
+    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+{
+    if let Some(limit) = options.max_reader_workspace_bytes {
+        return volumes::extract(feed, options, open, &Allowance::limited(limit));
     }
-
-    if pending.is_some() {
-        return Err(Error::InvalidHeader("RAR 1.3 split entry is incomplete"));
-    }
-
-    options.check_cancelled()?;
-    Ok(())
+    volumes::extract(feed, options, open, &Allowance::default())
 }
 
 struct Rar13ChecksumWriter<'a, W: Write + ?Sized> {
@@ -1215,156 +1139,6 @@ impl Rar13Checksum {
 
     fn finish(self) -> u16 {
         self.value
-    }
-}
-
-struct PendingSplitRefs<B: Budget = Allowance> {
-    name: Vec<u8>,
-    fragments: Buffer<(usize, usize), B>,
-    file_time: u32,
-    file_attr: u8,
-    method: u8,
-    unp_ver: u8,
-    was_encrypted: bool,
-}
-
-impl<B: Budget> PendingSplitRefs<B> {
-    fn with_allowance(
-        entry: &Entry,
-        volume_index: usize,
-        entry_index: usize,
-        allowance: &B,
-    ) -> Result<Self> {
-        Ok(Self {
-            name: entry.name.clone(),
-            fragments: Buffer::copied(&[(volume_index, entry_index)], allowance)?,
-            file_time: entry.header.file_time,
-            file_attr: entry.header.file_attr,
-            method: entry.header.method,
-            unp_ver: entry.header.unp_ver,
-            was_encrypted: entry.is_encrypted(),
-        })
-    }
-
-    fn append(&mut self, entry: &Entry, volume_index: usize, entry_index: usize) -> Result<()> {
-        if entry.name != self.name {
-            return Err(Error::InvalidHeader("RAR 1.3 split entry name changed"));
-        }
-        if entry.header.method != self.method {
-            return Err(Error::InvalidHeader(
-                "RAR 1.3 split entry compression method changed",
-            ));
-        }
-        if entry.header.unp_ver != self.unp_ver {
-            return Err(Error::InvalidHeader(
-                "RAR 1.3 split entry unpack version changed",
-            ));
-        }
-        if entry.is_encrypted() != self.was_encrypted {
-            return Err(Error::InvalidHeader(
-                "RAR 1.3 split entry encryption flag changed",
-            ));
-        }
-        self.fragments.try_push((volume_index, entry_index))?;
-        Ok(())
-    }
-
-    // Split decoding needs format state, policy accounting and the output callback.
-    #[allow(clippy::too_many_arguments)]
-    fn write_to<F>(
-        self,
-        volumes: &[Archive],
-        final_entry: &Entry,
-        options: crate::ArchiveReadOptions<'_>,
-        budget: &mut crate::output_limit::OutputBudget,
-        unpack15: &mut Decoder15<B>,
-        solid: bool,
-        open: &mut F,
-    ) -> Result<()>
-    where
-        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-    {
-        options.check_cancelled()?;
-        let password = options.password;
-        budget.check(u64::from(final_entry.header.unp_size), &self.name)?;
-        let mut reader =
-            self.fragment_reader_with_allowance(volumes, password, &unpack15.allowance)?;
-        let meta = ExtractedEntryMeta {
-            name: self.name,
-            file_time: self.file_time,
-            file_attr: self.file_attr,
-            is_directory: false,
-        };
-        options.check_cancelled()?;
-        let mut writer = open(&meta)?;
-        options.check_cancelled()?;
-        budget.run(&meta.name, &mut writer, |mut writer| {
-            let mut checksum = Rar13Checksum::new();
-            if self.method == METHOD_STORE {
-                crate::stored_copy::copy(
-                    &mut reader,
-                    u64::from(final_entry.header.unp_size),
-                    false,
-                    &mut |chunk: &[u8]| checksum.update(chunk),
-                    &mut writer,
-                    &unpack15.allowance,
-                )?;
-                checksum.verify_stored_length(final_entry.header.unp_size)?;
-            } else {
-                let mut checksum_writer = Rar13ChecksumWriter {
-                    inner: &mut writer,
-                    checksum: &mut checksum,
-                };
-                unpack15.decode_member_from_reader(
-                    &mut reader,
-                    final_entry.header.unp_size as usize,
-                    solid,
-                    &mut checksum_writer,
-                )?;
-            }
-            let actual = checksum.finish();
-            if actual == final_entry.header.file_crc {
-                options.check_cancelled()?;
-                Ok(())
-            } else {
-                Err(Error::CrcMismatch {
-                    expected: final_entry.header.file_crc,
-                    actual,
-                })
-            }
-        })
-    }
-
-    fn fragment_reader_with_allowance<'a>(
-        &self,
-        volumes: &'a [Archive],
-        password: Option<&'a [u8]>,
-        allowance: &B,
-    ) -> Result<PackedReader<ChainedReader<crate::source::RangeReader<'a>, B>>> {
-        let mut readers = Buffer::with_capacity(self.fragments.len(), allowance)?;
-        for &(volume_index, entry_index) in &self.fragments {
-            let archive = volumes
-                .get(volume_index)
-                .ok_or(Error::InvalidHeader("RAR 1.3 split volume is missing"))?;
-            let entry = archive
-                .entries
-                .get(entry_index)
-                .ok_or(Error::InvalidHeader("RAR 1.3 split entry is missing"))?;
-            readers.push_admitted(archive.range_reader(entry.packed_range.clone())?);
-        }
-        let chained = ChainedReader::with_readers(readers);
-        if self.was_encrypted {
-            crate::crypto::require_encryption()?;
-            let password = password.ok_or(Error::NeedPassword)?;
-            // RAR 1.402 encrypts the logical packed stream continuously across
-            // split volumes; restarting the cipher at each part corrupts it.
-            Ok(PackedReader::Encrypted(Rar13DecryptReader::new(
-                chained,
-                Rar13Cipher::for_password(password)?,
-            )))
-        } else {
-            Ok(PackedReader::Plain(chained))
-        }
     }
 }
 

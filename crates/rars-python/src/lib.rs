@@ -615,7 +615,13 @@ impl RarFile {
             .ok_or_else(|| PyKeyError::new_err("member has no extractable payload"))
     }
 
-    #[pyo3(signature = (path = None, members = None, pwd = None, overwrite = false, *, options = None))]
+    /// `volumes` yields the volumes after this one, in order: `bytes` are archive
+    /// data, `str` or `PathLike` are paths. Each is pulled when needed, so a
+    /// generator may wait for downloads. If the last volume isn't marked as last
+    /// (all RAR 1.3 to 2.0 sets, some later ones), the iterator is advanced once
+    /// more and must stop, not wait.
+    #[pyo3(signature = (path = None, members = None, pwd = None, overwrite = false, *, options = None, volumes = None))]
+    #[allow(clippy::too_many_arguments)]
     fn extractall(
         &self,
         py: Python<'_>,
@@ -624,9 +630,30 @@ impl RarFile {
         pwd: Option<&Bound<'_, PyAny>>,
         overwrite: bool,
         options: Option<&ReadOptions>,
+        volumes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<PathBuf>> {
         check_read_options_cancellation(options)?;
         let out_dir = path.unwrap_or_else(|| PathBuf::from("."));
+        if let Some(volumes) = volumes {
+            if members.is_some() {
+                return Err(PyValueError::new_err(
+                    "members cannot be combined with volumes",
+                ));
+            }
+            let password = py_password(pwd)?.or_else(|| self.password.clone());
+            let options = self.extraction_options(options, password.as_deref());
+            let first = &self.archive;
+            let written = Arc::new(Mutex::new(Vec::new()));
+            with_python_volumes(py, volumes, options, |volumes| {
+                first.extract_with_volumes(
+                    volumes,
+                    options,
+                    output_opener(&out_dir, first.family(), options, overwrite, &written),
+                )
+            })?;
+            let out = written.lock().expect("written lock poisoned").clone();
+            return Ok(out);
+        }
         let selected = match members {
             Some(members) => Some(
                 members
@@ -649,19 +676,28 @@ impl RarFile {
         .map_err(map_error)
     }
 
-    #[pyo3(signature = (pwd = None, *, options = None))]
+    /// `volumes` works as in `extractall`.
+    #[pyo3(signature = (pwd = None, *, options = None, volumes = None))]
     fn testrar(
         &self,
         py: Python<'_>,
         pwd: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
+        volumes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         let password = py_password(pwd)?.or_else(|| self.password.clone());
-        py.detach(|| {
-            self.archive
-                .test_with_options(self.extraction_options(options, password.as_deref()))
-        })
-        .map_err(map_error)
+        let options = self.extraction_options(options, password.as_deref());
+        let first = &self.archive;
+        match volumes {
+            Some(volumes) => with_python_volumes(py, volumes, options, |volumes| {
+                first.extract_with_volumes(volumes, options, |_| {
+                    Ok(Box::new(io::sink()) as Box<dyn Write>)
+                })
+            }),
+            None => py
+                .detach(|| first.test_with_options(options))
+                .map_err(map_error),
+        }
     }
 
     #[getter]
@@ -1790,47 +1826,6 @@ fn repair_to_path(
     .map_err(map_error)
 }
 
-#[pyfunction]
-#[pyo3(signature = (paths, path = None, password = None, overwrite = false, *, options = None))]
-fn extract_volumes(
-    py: Python<'_>,
-    paths: &Bound<'_, PyAny>,
-    path: Option<PathBuf>,
-    password: Option<&Bound<'_, PyAny>>,
-    overwrite: bool,
-    options: Option<&ReadOptions>,
-) -> PyResult<Vec<PathBuf>> {
-    let archive_paths = py_paths(paths)?;
-    let out_dir = path.unwrap_or_else(|| PathBuf::from("."));
-    let password = py_password(password)?;
-    py.detach(|| {
-        let options = python_read_options(options, password.as_deref());
-        let archives = read_archives_from_paths(&archive_paths, options)?;
-        extract_volumes_archive(&archives, &out_dir, options, overwrite)
-    })
-    .map_err(map_error)
-}
-
-#[pyfunction]
-#[pyo3(signature = (paths, password = None, *, options = None))]
-fn test_volumes(
-    py: Python<'_>,
-    paths: &Bound<'_, PyAny>,
-    password: Option<&Bound<'_, PyAny>>,
-    options: Option<&ReadOptions>,
-) -> PyResult<()> {
-    let archive_paths = py_paths(paths)?;
-    let password = py_password(password)?;
-    py.detach(|| {
-        let options = python_read_options(options, password.as_deref());
-        let archives = read_archives_from_paths(&archive_paths, options)?;
-        rars_rs::extract_volumes_to_with_options(&archives, options, |_| {
-            Ok(Box::new(io::sink()) as Box<dyn Write>)
-        })
-    })
-    .map_err(map_error)
-}
-
 #[pymodule]
 fn rars(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RarFile>()?;
@@ -1844,8 +1839,6 @@ fn rars(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(repair, m)?)?;
     m.add_function(wrap_pyfunction!(repair_detailed, m)?)?;
     m.add_function(wrap_pyfunction!(repair_to_path, m)?)?;
-    m.add_function(wrap_pyfunction!(extract_volumes, m)?)?;
-    m.add_function(wrap_pyfunction!(test_volumes, m)?)?;
     m.add("Error", py.get_type::<Error>())?;
     m.add("BadRarFile", py.get_type::<BadRarFile>())?;
     m.add("BadPassword", py.get_type::<BadPassword>())?;
@@ -1867,17 +1860,6 @@ fn py_path_buf(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<PathBuf> {
     let os = py.import("os")?;
     let path = os.call_method1("fspath", (value,))?;
     path.extract::<PathBuf>()
-}
-
-fn py_paths(value: &Bound<'_, PyAny>) -> PyResult<Vec<PathBuf>> {
-    let mut out = Vec::new();
-    for item in value.try_iter()? {
-        out.push(item?.extract::<PathBuf>()?);
-    }
-    if out.is_empty() {
-        return Err(PyValueError::new_err("volume path list is empty"));
-    }
-    Ok(out)
 }
 
 fn py_password(value: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Vec<u8>>> {
@@ -2132,61 +2114,101 @@ fn extract_archive<S: Selection>(
     Ok(out)
 }
 
-fn extract_volumes_archive(
-    archives: &[rars_rs::Archive],
-    out_dir: &Path,
+/// Runs `run` with an iterator that pulls each later volume, as a path or bytes,
+/// from a Python iterable. The GIL is released except while it is advanced, and
+/// an exception it raises is re-raised as itself.
+fn with_python_volumes<T: Send>(
+    py: Python<'_>,
+    volumes: &Bound<'_, PyAny>,
     options: rars_rs::ArchiveReadOptions<'_>,
-    overwrite: bool,
-) -> rars_rs::Result<Vec<PathBuf>> {
-    let written = Arc::new(Mutex::new(Vec::new()));
-    rars_rs::extract_volumes_to_with_options(archives, options, {
-        let written = Arc::clone(&written);
-        move |meta| {
-            let path = checked_output_path(
-                out_dir,
-                meta,
-                archives[0].family(),
-                options.legacy_name_encoding,
-            )?;
-            if options.legacy_name_encoding.is_some()
-                && written
-                    .lock()
-                    .expect("written lock poisoned")
-                    .contains(&path)
-            {
-                return Err(rars_rs::Error::InvalidArgument(
-                    "multiple entries map to the same decoded output path",
-                ));
+    run: impl FnOnce(
+            &mut (dyn Iterator<Item = rars_rs::Result<rars_rs::Archive>> + Send),
+        ) -> rars_rs::Result<T>
+        + Send,
+) -> PyResult<T> {
+    let iterator = volumes.try_iter()?.unbind();
+    let raised: Mutex<Option<PyErr>> = Mutex::new(None);
+    let result = py.detach(|| {
+        // Keeps one RAR 5 key derivation for the whole set.
+        let mut session = rars_rs::ReadSession::new(options);
+        let mut pulled = std::iter::from_fn(|| {
+            let source = Python::attach(|py| -> PyResult<Option<VolumeSource>> {
+                let Some(volume) = iterator.bind(py).clone().next() else {
+                    return Ok(None);
+                };
+                let volume = volume?;
+                if let Ok(bytes) = volume.extract::<Vec<u8>>() {
+                    return Ok(Some(VolumeSource::Bytes(bytes)));
+                }
+                Ok(Some(VolumeSource::Path(std::path::absolute(py_path_buf(
+                    py, &volume,
+                )?)?)))
+            });
+            match source {
+                Ok(None) => None,
+                Ok(Some(VolumeSource::Bytes(bytes))) => Some(
+                    rars_rs::ArchiveReader::read_owned_with_options(bytes, options),
+                ),
+                Ok(Some(VolumeSource::Path(path))) => Some(session.read_path(path)),
+                Err(error) => {
+                    *raised.lock().expect("raised lock poisoned") = Some(error);
+                    Some(Err(rars_rs::Error::InvalidArgument(
+                        "volumes raised an exception",
+                    )))
+                }
             }
-            if meta.is_directory {
-                fs::create_dir_all(&path)?;
-                written.lock().expect("written lock poisoned").push(path);
-                return Ok(Box::new(io::sink()) as Box<dyn Write>);
-            }
-            fs::create_dir_all(path.parent().expect("checked output path has a file name"))?;
-            let mut options = fs::OpenOptions::new();
-            options.write(true);
-            if overwrite {
-                options.create(true).truncate(true);
-            } else {
-                options.create_new(true);
-            }
-            set_no_follow(&mut options);
-            let file = options.open(&path)?;
-            written.lock().expect("written lock poisoned").push(path);
-            Ok(Box::new(file) as Box<dyn Write>)
-        }
-    })?;
-    let out = written.lock().expect("written lock poisoned").clone();
-    Ok(out)
+        });
+        run(&mut pulled)
+    });
+    if let Some(error) = raised.into_inner().expect("raised lock poisoned") {
+        return Err(error);
+    }
+    result.map_err(map_error)
 }
 
-fn read_archives_from_paths(
-    paths: &[PathBuf],
-    options: rars_rs::ArchiveReadOptions<'_>,
-) -> rars_rs::Result<Vec<rars_rs::Archive>> {
-    let mut session = rars_rs::ReadSession::new(options);
-    paths.iter().map(|path| session.read_path(path)).collect()
+enum VolumeSource {
+    Bytes(Vec<u8>),
+    Path(PathBuf),
+}
+
+fn output_opener<'a>(
+    out_dir: &'a Path,
+    family: rars_rs::ArchiveFamily,
+    options: rars_rs::ArchiveReadOptions<'a>,
+    overwrite: bool,
+    written: &Arc<Mutex<Vec<PathBuf>>>,
+) -> impl FnMut(&rars_rs::ExtractedEntryMeta) -> rars_rs::Result<Box<dyn Write>> + 'a {
+    let written = Arc::clone(written);
+    move |meta| {
+        let path = checked_output_path(out_dir, meta, family, options.legacy_name_encoding)?;
+        if options.legacy_name_encoding.is_some()
+            && written
+                .lock()
+                .expect("written lock poisoned")
+                .contains(&path)
+        {
+            return Err(rars_rs::Error::InvalidArgument(
+                "multiple entries map to the same decoded output path",
+            ));
+        }
+        if meta.is_directory {
+            fs::create_dir_all(&path)?;
+            written.lock().expect("written lock poisoned").push(path);
+            return Ok(Box::new(io::sink()) as Box<dyn Write>);
+        }
+        fs::create_dir_all(path.parent().expect("checked output path has a file name"))?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true);
+        if overwrite {
+            options.create(true).truncate(true);
+        } else {
+            options.create_new(true);
+        }
+        set_no_follow(&mut options);
+        let file = options.open(&path)?;
+        written.lock().expect("written lock poisoned").push(path);
+        Ok(Box::new(file) as Box<dyn Write>)
+    }
 }
 
 #[cfg(test)]

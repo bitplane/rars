@@ -1,88 +1,134 @@
-use crate::codec::workspace::{Allowance, Budget, Buffer};
+use crate::source::RangeReader;
 use std::io::{Read, Result};
 
-pub(crate) struct SplitVolumeState<P> {
-    pending: Option<P>,
-}
+pub(crate) type Volumes<'p, A> = dyn Iterator<Item = crate::Result<A>> + Send + 'p;
 
-impl<P> SplitVolumeState<P> {
-    pub(crate) fn new() -> Self {
-        Self { pending: None }
-    }
-
-    pub(crate) fn advance(
-        &mut self,
-        split_before: bool,
-        split_after: bool,
-    ) -> SplitVolumeStep<'_, P> {
-        match (self.pending.is_some(), split_before, split_after) {
-            (false, false, false) => SplitVolumeStep::Regular,
-            (false, false, true) => SplitVolumeStep::Start,
-            // The match arm's first field proves a pending split exists.
-            (true, true, true) => {
-                SplitVolumeStep::Continue(self.pending.as_mut().expect("pending split"))
-            }
-            // The match arm's first field proves a pending split exists.
-            (true, true, false) => {
-                SplitVolumeStep::Finish(self.pending.take().expect("pending split"))
-            }
-            // Error states leave pending untouched; callers currently return
-            // the error immediately rather than attempting recovery.
-            (false, true, _) => SplitVolumeStep::MissingFirst,
-            (true, false, _) => SplitVolumeStep::Interrupted,
-        }
-    }
-
-    pub(crate) fn begin(&mut self, pending: P) {
-        debug_assert!(self.pending.is_none());
-        self.pending = Some(pending);
-    }
-
-    pub(crate) fn is_pending(&self) -> bool {
-        self.pending.is_some()
-    }
-}
-
-pub(crate) enum SplitVolumeStep<'a, P> {
-    Regular,
-    Start,
-    Continue(&'a mut P),
-    Finish(P),
-    MissingFirst,
-    Interrupted,
-}
-
-pub(crate) struct ChainedReader<R, B: Budget = Allowance> {
-    readers: Buffer<R, B>,
+/// Hands out a set's volumes front to back, each exactly once.
+pub(crate) struct VolumeFeed<'p, 'o, A> {
+    volumes: &'p mut Volumes<'p, A>,
     index: usize,
+    stop_at_last: bool,
+    ended: bool,
+    options: crate::ArchiveReadOptions<'o>,
 }
 
-impl<R, B: Budget> ChainedReader<R, B> {
-    pub(crate) fn with_readers(readers: Buffer<R, B>) -> Self {
-        Self { readers, index: 0 }
-    }
-}
-#[cfg(test)]
-impl<R> ChainedReader<R, Allowance> {
-    pub(crate) fn new(readers: Vec<R>) -> Self {
+impl<'p, 'o, A> VolumeFeed<'p, 'o, A> {
+    /// Volumes may still be arriving, so it is not advanced past one marked last.
+    pub(crate) fn arriving(
+        volumes: &'p mut Volumes<'p, A>,
+        options: crate::ArchiveReadOptions<'o>,
+    ) -> Self {
         Self {
-            readers: Buffer::from_vec(readers),
+            volumes,
             index: 0,
+            stop_at_last: true,
+            ended: false,
+            options,
+        }
+    }
+
+    pub(crate) fn complete(
+        volumes: &'p mut Volumes<'p, A>,
+        options: crate::ArchiveReadOptions<'o>,
+    ) -> Self {
+        Self {
+            volumes,
+            index: 0,
+            stop_at_last: false,
+            ended: false,
+            options,
+        }
+    }
+
+    pub(crate) fn options(&self) -> crate::ArchiveReadOptions<'o> {
+        self.options
+    }
+
+    /// Zero-based index of the volume most recently handed out.
+    pub(crate) fn current_index(&self) -> usize {
+        self.index.saturating_sub(1)
+    }
+
+    /// Once the set has ended, the iterator is never advanced again.
+    pub(crate) fn next(&mut self) -> crate::Result<Option<A>> {
+        self.options.check_cancelled()?;
+        if self.ended {
+            return Ok(None);
+        }
+        let volume = self.volumes.next().transpose();
+        self.ended = !matches!(volume, Ok(Some(_)));
+        let volume = volume?;
+        self.index += 1;
+        self.options.check_cancelled()?;
+        Ok(volume)
+    }
+
+    /// The volume after one whose members are all done, unless it says it was the last.
+    pub(crate) fn after(&mut self, end: VolumeEnd) -> crate::Result<Option<A>> {
+        if !self.stop_at_last {
+            return self.next();
+        }
+        match end {
+            VolumeEnd::Last => Ok(None),
+            VolumeEnd::Unknown => self.next(),
+            VolumeEnd::More => self.next_part(),
+        }
+    }
+
+    /// A volume the set still needs; running out fails the same way wherever it happens.
+    pub(crate) fn next_part(&mut self) -> crate::Result<Option<A>> {
+        let number = self.index + 1;
+        match self.next()? {
+            None if self.stop_at_last => Err(crate::Error::InVolume {
+                number,
+                source: Box::new(crate::Error::InvalidHeader("volume is missing")),
+            }),
+            volume => Ok(volume),
         }
     }
 }
 
-impl<R: Read, B: Budget> Read for ChainedReader<R, B> {
+/// What a volume's own headers say about the volumes after it.
+pub(crate) enum VolumeEnd {
+    Last,
+    More,
+    /// Volumes without an end record; the iterator ending ends the set.
+    Unknown,
+}
+
+/// Yields a split member's packed fragments, fetching later volumes on demand.
+pub(crate) trait FragmentWalk {
+    fn next_fragment(&mut self) -> crate::Result<Option<RangeReader<'static>>>;
+}
+
+/// Reads a split member's fragments as one stream, asking the walk for each next one.
+pub(crate) struct LazyChain<'w, W> {
+    walk: &'w mut W,
+    current: Option<RangeReader<'static>>,
+}
+
+impl<'w, W: FragmentWalk> LazyChain<'w, W> {
+    pub(crate) fn new(walk: &'w mut W, first: RangeReader<'static>) -> Self {
+        Self {
+            walk,
+            current: Some(first),
+        }
+    }
+}
+
+impl<W: FragmentWalk> Read for LazyChain<'_, W> {
     fn read(&mut self, out: &mut [u8]) -> Result<usize> {
         if out.is_empty() {
             return Ok(0);
         }
-        while let Some(reader) = self.readers.get_mut(self.index) {
+        while let Some(reader) = &mut self.current {
             let read = reader.read(out)?;
             if read != 0 {
                 return Ok(read);
             }
-            self.index += 1;
+            // Drop the spent fragment before pulling the next volume.
+            self.current = None;
+            self.current = self.walk.next_fragment().map_err(std::io::Error::other)?;
         }
         Ok(0)
     }
@@ -91,93 +137,45 @@ impl<R: Read, B: Budget> Read for ChainedReader<R, B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use crate::source::ArchiveSource;
+    use std::collections::VecDeque;
+    use std::sync::Arc;
 
-    #[test]
-    fn split_volume_state_reports_regular_member_without_pending_split() {
-        let mut state = SplitVolumeState::<u8>::new();
+    struct Fragments(VecDeque<crate::Result<RangeReader<'static>>>);
 
-        assert!(matches!(
-            state.advance(false, false),
-            SplitVolumeStep::Regular
-        ));
-        assert!(!state.is_pending());
-    }
-
-    #[test]
-    fn split_volume_state_tracks_start_continue_and_finish() {
-        let mut state = SplitVolumeState::new();
-
-        assert!(matches!(state.advance(false, true), SplitVolumeStep::Start));
-        state.begin(vec![1]);
-        assert!(state.is_pending());
-
-        match state.advance(true, true) {
-            SplitVolumeStep::Continue(parts) => parts.push(2),
-            _ => panic!("expected split continuation"),
+    impl FragmentWalk for Fragments {
+        fn next_fragment(&mut self) -> crate::Result<Option<RangeReader<'static>>> {
+            self.0.pop_front().transpose()
         }
-        assert!(state.is_pending());
+    }
 
-        match state.advance(true, false) {
-            SplitVolumeStep::Finish(parts) => assert_eq!(parts, vec![1, 2]),
-            _ => panic!("expected split finish"),
-        }
-        assert!(!state.is_pending());
+    fn fragment(bytes: &[u8]) -> RangeReader<'static> {
+        ArchiveSource::Memory(Arc::from(bytes))
+            .owned_range_reader(0..bytes.len())
+            .unwrap()
     }
 
     #[test]
-    fn split_volume_state_reports_orphan_continuation() {
-        let mut state = SplitVolumeState::<u8>::new();
-
-        assert!(matches!(
-            state.advance(true, false),
-            SplitVolumeStep::MissingFirst
-        ));
-        assert!(matches!(
-            state.advance(true, true),
-            SplitVolumeStep::MissingFirst
-        ));
-        assert!(!state.is_pending());
-    }
-
-    #[test]
-    fn split_volume_state_reports_regular_entry_interrupting_pending_split() {
-        let mut state = SplitVolumeState::new();
-        assert!(matches!(state.advance(false, true), SplitVolumeStep::Start));
-        state.begin(7u8);
-
-        assert!(matches!(
-            state.advance(false, false),
-            SplitVolumeStep::Interrupted
-        ));
-        assert!(state.is_pending());
-    }
-
-    #[test]
-    fn chained_reader_empty_reads_do_not_consume_fragments() {
-        let mut reader = ChainedReader::new(vec![Cursor::new(b"one"), Cursor::new(b"two")]);
+    fn lazy_chain_reads_every_fragment_in_order_and_skips_empty_ones() {
+        let mut walk = Fragments(VecDeque::from([Ok(fragment(b"")), Ok(fragment(b"two"))]));
+        let mut reader = LazyChain::new(&mut walk, fragment(b"one"));
         assert_eq!(reader.read(&mut []).unwrap(), 0);
-        let mut byte = [0];
-        reader.read_exact(&mut byte).unwrap();
-        assert_eq!(&byte, b"o");
-        assert_eq!(reader.read(&mut []).unwrap(), 0);
-        let mut rest = Vec::new();
-        reader.read_to_end(&mut rest).unwrap();
-        assert_eq!(rest, b"netwo");
-    }
-
-    #[test]
-    fn chained_reader_reads_all_fragments_in_order() {
-        let readers: Vec<Box<dyn Read>> = vec![
-            Box::new(Cursor::new(b"one".to_vec())),
-            Box::new(Cursor::new(Vec::new())),
-            Box::new(Cursor::new(b"two".to_vec())),
-        ];
-        let mut reader = ChainedReader::new(readers);
         let mut out = Vec::new();
-
         reader.read_to_end(&mut out).unwrap();
-
         assert_eq!(out, b"onetwo");
+        assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+    }
+
+    #[test]
+    fn lazy_chain_reports_the_walk_error_as_itself() {
+        let mut walk = Fragments(VecDeque::from([Err(crate::Error::InvalidHeader(
+            "refused",
+        ))]));
+        let mut reader = LazyChain::new(&mut walk, fragment(b"one"));
+        let error = reader.read_to_end(&mut Vec::new()).unwrap_err();
+        assert_eq!(
+            crate::Error::from(error),
+            crate::Error::InvalidHeader("refused")
+        );
     }
 }

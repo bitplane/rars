@@ -26,6 +26,7 @@ pub(crate) mod producer;
 #[cfg(feature = "write")]
 pub(crate) mod write;
 
+pub(crate) use extract::extract_from_feed;
 pub(crate) use extract::test_volumes_to;
 pub use extract::{extract_volumes_to, extract_volumes_to_with_redirections};
 #[cfg(feature = "write")]
@@ -759,22 +760,13 @@ impl Archive {
         self.source.read_range(range)
     }
 
+    #[cfg(any(all(test, feature = "write"), feature = "recovery"))]
     fn source_len(&self) -> Result<usize> {
         self.source.len()
     }
 
     fn range_reader(&self, range: Range<usize>) -> Result<crate::source::RangeReader<'_>> {
         self.source.range_reader(range)
-    }
-
-    fn copy_range_to(&self, range: Range<usize>, writer: &mut dyn Write) -> Result<()> {
-        let source_len = self.source_len()?;
-        if range.start > range.end || range.end > source_len {
-            return Err(Error::InvalidHeader("RAR 5 repair range is out of bounds"));
-        }
-        let mut reader = self.range_reader(range)?;
-        std::io::copy(&mut reader, writer)?;
-        Ok(())
     }
 
     pub fn files(&self) -> impl Iterator<Item = &FileHeader> {

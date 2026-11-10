@@ -171,19 +171,19 @@ thread_local! {
         const { RefCell::new(None) };
 }
 
-pub(crate) struct FileCursor<'a> {
-    source: &'a Arc<FileSource>,
+pub(crate) struct FileCursor {
+    source: Arc<FileSource>,
     position: u64,
     end: u64,
     window: Option<Window>,
 }
 
-impl<'a> FileCursor<'a> {
-    fn new(source: &'a Arc<FileSource>, range: Range<usize>) -> Self {
+impl FileCursor {
+    fn new(source: Arc<FileSource>, range: Range<usize>) -> Self {
         let position = range.start as u64;
         let window = PARKED.with_borrow_mut(|parked| {
             let adopt = parked.as_ref().is_some_and(|(owner, window)| {
-                std::ptr::eq(owner.as_ptr(), Arc::as_ptr(source)) && window.holds(position)
+                std::ptr::eq(owner.as_ptr(), Arc::as_ptr(&source)) && window.holds(position)
             });
             if adopt {
                 parked.take().map(|(_, window)| window)
@@ -209,13 +209,13 @@ impl<'a> FileCursor<'a> {
 
     fn park(&mut self) {
         if let Some(window) = self.window.take() {
-            let owner = Arc::downgrade(self.source);
+            let owner = Arc::downgrade(&self.source);
             let _ = PARKED.try_with(|parked| *parked.borrow_mut() = Some((owner, window)));
         }
     }
 }
 
-impl Read for FileCursor<'_> {
+impl Read for FileCursor {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
         if bytes.is_empty() {
             return Ok(0);
@@ -258,7 +258,7 @@ impl Read for FileCursor<'_> {
     }
 }
 
-impl Drop for FileCursor<'_> {
+impl Drop for FileCursor {
     fn drop(&mut self) {
         self.park();
     }
@@ -268,13 +268,15 @@ impl Drop for FileCursor<'_> {
 /// existing source. Reading a member does not need another heap allocation.
 pub(crate) enum RangeReader<'a> {
     Memory(Cursor<&'a [u8]>),
-    File(Bounded<FileCursor<'a>>),
+    SharedMemory(Bounded<Cursor<Arc<[u8]>>>),
+    File(Bounded<FileCursor>),
     Reader(Bounded<SourceCursor>),
 }
 impl Read for RangeReader<'_> {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Self::Memory(reader) => reader.read(bytes),
+            Self::SharedMemory(reader) => reader.read(bytes),
             Self::File(reader) => reader.read(bytes),
             Self::Reader(reader) => reader.read(bytes),
         }
@@ -372,6 +374,26 @@ impl ArchiveSource {
 
     pub(crate) fn range_reader(&self, range: Range<usize>) -> Result<RangeReader<'_>> {
         match self {
+            Self::Memory(data) => {
+                let data = data.get(range).ok_or(Error::TooShort)?;
+                Ok(RangeReader::Memory(Cursor::new(data)))
+            }
+            Self::Reader(_) | Self::File(_) => self.owned_range_reader(range),
+        }
+    }
+
+    /// Like [`Self::range_reader`], but keeps the source alive instead of borrowing it.
+    pub(crate) fn owned_range_reader(&self, range: Range<usize>) -> Result<RangeReader<'static>> {
+        match self {
+            Self::Memory(data) => {
+                if range.start > range.end || range.end > data.len() {
+                    return Err(Error::TooShort);
+                }
+                let len = range.len();
+                let mut cursor = Cursor::new(data.clone());
+                cursor.set_position(range.start as u64);
+                Ok(RangeReader::SharedMemory(Bounded::new(cursor, len)))
+            }
             Self::Reader(source) => {
                 if range.start > range.end || range.end > source.len {
                     return Err(Error::TooShort);
@@ -380,19 +402,14 @@ impl ArchiveSource {
                 reader.seek(SeekFrom::Start(range.start as u64))?;
                 Ok(RangeReader::Reader(Bounded::new(reader, range.len())))
             }
-            Self::Memory(data) => {
-                let data = data.get(range).ok_or(Error::TooShort)?;
-                Ok(RangeReader::Memory(Cursor::new(data)))
-            }
             Self::File(source) => {
                 if range.start > range.end {
                     return Err(Error::TooShort);
                 }
-                // Opening here makes a missing volume fail before any member checks.
                 source.handle()?;
                 let len = range.len();
                 Ok(RangeReader::File(Bounded::new(
-                    FileCursor::new(source, range),
+                    FileCursor::new(source.clone(), range),
                     len,
                 )))
             }

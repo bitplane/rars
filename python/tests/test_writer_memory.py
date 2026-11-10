@@ -52,7 +52,8 @@ def test_encrypted_recovery_and_volume_output_obey_memory_policy(tmp_path, encry
     builder.add_bytes(b"payload" * 1024, "member")
     parts = builder.write_volumes(tmp_path / "set.part1.rar")
     assert len(parts) > 1
-    rars.test_volumes(parts, password="secret")
     output = tmp_path / "extracted"
-    rars.extract_volumes(parts, output, password="secret")
+    with rars.RarFile(parts[0], password="secret") as archive:
+        archive.testrar(volumes=parts[1:])
+        archive.extractall(output, volumes=parts[1:])
     assert (output / "member").read_bytes() == b"payload" * 1024
