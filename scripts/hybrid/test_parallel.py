@@ -98,7 +98,9 @@ class ParallelScreenTests(unittest.TestCase):
         self.assertFalse(any(r.get("event") == "phase-done" for r in runner.journal(self.run)))
 
     def test_one_deadline_bounds_all_slots_and_timeout_skips_configuration(self):
-        m = self.parallel_manifest(slots=2, budget=.12)
+        # The phase clock starts before the reservation and journal writes, so
+        # the budget has to outlast those on a slow disk or no task starts.
+        m = self.parallel_manifest(slots=2, budget=1)
         calls = []
 
         def sample(run, manifest, task, deadline):
@@ -118,7 +120,7 @@ class ParallelScreenTests(unittest.TestCase):
         accounting = [row for row in rows if row.get("event") == "phase-accounting"]
         self.assertEqual(len(accounting), 1)
         self.assertEqual(runner.consumed(rows, "screen", "local"), accounting[0]["charged_seconds"])
-        self.assertGreaterEqual(accounting[0]["charged_seconds"], .12)
+        self.assertGreaterEqual(accounting[0]["charged_seconds"], 1)
         self.assertEqual(runner.available(m, rows, "screen", "local"), 0)
 
     def test_interruption_cancels_jobs_and_charges_reservation_once(self):
