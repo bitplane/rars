@@ -366,31 +366,53 @@ fn ordinary_streaming_admission_and_source_open_precede_malformed_hash() {
     }
 }
 
+fn split_in_two(archive: &Archive, member: &FileHeader, last: &FileHeader) -> [Archive; 2] {
+    let middle = member.block.data_range.start + member.packed_size() as usize / 2;
+    let mut head = member.clone();
+    head.block.flags |= HFL_SPLIT_AFTER;
+    head.block.data_range.end = middle;
+    head.block.data_size = Some(head.block.data_range.len() as u64);
+    head.data_crc32 = None;
+    let mut tail = last.clone();
+    tail.block.flags |= HFL_SPLIT_BEFORE;
+    tail.block.data_range = middle..member.block.data_range.end;
+    tail.block.data_size = Some(tail.block.data_range.len() as u64);
+    let mut first = archive.clone();
+    first.blocks = vec![Block::File(head)];
+    let mut second = archive.clone();
+    second.blocks = vec![Block::File(tail)];
+    [first, second]
+}
+
+fn write_split<B: Budget>(
+    session: &mut DecoderSession<'_, B>,
+    volumes: &[Archive],
+    writer: &mut dyn Write,
+) -> Result<()> {
+    let allowance = session.allowance.clone();
+    super::volumes::with_walk(
+        volumes,
+        crate::ArchiveReadOptions::new(),
+        &allowance,
+        |volume, first, walk| {
+            let reader = volume
+                .source
+                .owned_range_reader(first.block.data_range.clone())?;
+            session.write_lazy_split_to(first, walk, reader, None, writer)
+        },
+    )
+}
+
 #[test]
 fn split_compressed_members_retain_always_crc_work() {
     let data = b"split compressed hash and crc\n".repeat(8192);
     let (archive, original) = fixture(&data, false, false);
-    let middle = original.block.data_range.start + original.packed_size() as usize / 2;
-    let mut first = original.clone();
-    first.block.flags |= HFL_SPLIT_AFTER;
-    first.block.data_range.end = middle;
-    first.block.data_size = Some(first.block.data_range.len() as u64);
-    let mut last = original;
-    last.block.flags |= HFL_SPLIT_BEFORE;
-    last.block.data_range.start = middle;
-    last.block.data_size = Some(last.block.data_range.len() as u64);
+    let mut last = original.clone();
     last.data_crc32 = Some(1); // Its valid BLAKE remains authoritative.
-    let mut volume1 = archive.clone();
-    volume1.blocks = vec![Block::File(first.clone())];
-    let mut volume2 = archive;
-    volume2.blocks = vec![Block::File(last.clone())];
-    let volumes = [volume1, volume2];
-    let mut split = PendingSplitRefs::with_allowance(&first, 0, 0, &Allowance::default()).unwrap();
-    split.append(1, 0).unwrap();
+    let volumes = split_in_two(&archive, &original, &last);
     let mut session = DecoderSession::with_allowance(None, 0, &Allowance::default());
     let mut output = Vec::new();
-    let (result, work) =
-        measured(|| session.stream_split_to(&volumes, &split, &last, None, &mut output));
+    let (result, work) = measured(|| write_split(&mut session, &volumes, &mut output));
     result.unwrap();
     assert_eq!(output, data);
     assert_eq!(work.bytes + work.zeroes, data.len());
@@ -521,14 +543,8 @@ fn failed_independent_stream_breaks_the_solid_chain() {
                 .unwrap();
             let (result, work) = measured(|| {
                 if split {
-                    let pending = PendingSplitRefs::new(&valid, 0, 0);
-                    session.write_split_to(
-                        std::slice::from_ref(&failed_archive),
-                        &pending,
-                        &corrupt,
-                        None,
-                        &mut std::io::sink(),
-                    )
+                    let volumes = split_in_two(&failed_archive, &valid, &corrupt);
+                    write_split(&mut session, &volumes, &mut std::io::sink())
                 } else {
                     session.write_file_to(&failed_archive, &corrupt, &mut std::io::sink())
                 }
@@ -558,16 +574,8 @@ fn failed_independent_stream_breaks_the_solid_chain() {
             );
 
             if split {
-                let pending = PendingSplitRefs::new(&valid, 0, 0);
-                session
-                    .write_split_to(
-                        std::slice::from_ref(&failed_archive),
-                        &pending,
-                        &valid,
-                        None,
-                        &mut std::io::sink(),
-                    )
-                    .unwrap();
+                let volumes = split_in_two(&failed_archive, &valid, &valid);
+                write_split(&mut session, &volumes, &mut std::io::sink()).unwrap();
                 let error = session
                     .write_file_to(&archive, files[1], &mut std::io::sink())
                     .unwrap_err();

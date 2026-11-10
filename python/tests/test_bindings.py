@@ -188,9 +188,10 @@ def test_builder_writes_and_extracts_volumes(tmp_path):
     paths = builder.write_volumes(tmp_path / "archive.part01.rar")
 
     assert len(paths) > 1
-    rars.test_volumes(paths)
     out_dir = tmp_path / "out"
-    rars.extract_volumes(paths, out_dir)
+    with rars.RarFile(paths[0]) as archive:
+        archive.testrar(volumes=paths[1:])
+        archive.extractall(out_dir, volumes=paths[1:])
     assert (out_dir / "large.txt").read_bytes() == b"0123456789" * 200
 
 
@@ -203,9 +204,10 @@ def test_builder_writes_volumes_from_added_paths(tmp_path):
     paths = builder.write_volumes(tmp_path / "archive.part01.rar")
 
     assert len(paths) > 1
-    rars.test_volumes(paths)
     out_dir = tmp_path / "out"
-    rars.extract_volumes(paths, out_dir)
+    with rars.RarFile(paths[0]) as archive:
+        archive.testrar(volumes=paths[1:])
+        archive.extractall(out_dir, volumes=paths[1:])
     assert (out_dir / "large.txt").read_bytes() == b"0123456789" * 200
 
 

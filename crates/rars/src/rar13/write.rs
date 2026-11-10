@@ -2721,10 +2721,8 @@ mod tests {
 
     #[test]
     fn extract_volumes_to_routes_pending_split_reader_through_fragment_chain() {
-        // Larger payload over more volumes guarantees that the chained
-        // fragment reader reads from each volume's range_reader at least once,
-        // exercising the success arms of fragment_reader, write_to, and
-        // ChainedReader::read across multiple volumes.
+        // Larger payload over more volumes guarantees that the split reader
+        // reads from every volume at least once.
         let payload: Vec<u8> = (0..96).map(|i| ((i * 53) ^ 0xa5) as u8).collect();
         let bytes = split_volumes_for(b"chain.bin", &payload);
         assert!(

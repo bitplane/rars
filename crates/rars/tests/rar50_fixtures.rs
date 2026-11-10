@@ -4670,7 +4670,7 @@ fn extracts_rar50_solid_multivolume_archive() {
 /// protected end to end.
 ///
 /// RAR 7.12 and UnRAR 7.20 both abort with a bad-archive error rather than
-/// extract. rars refuses too, and must write nothing while doing so.
+/// extract. rars refuses too, before reading anything from the spliced volume.
 #[test]
 fn rar50_refuses_a_volume_set_that_changes_encryption_partway() {
     let volumes: Vec<_> = [

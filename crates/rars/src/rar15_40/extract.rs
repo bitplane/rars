@@ -1,10 +1,12 @@
 use super::*;
+#[path = "volumes.rs"]
+mod volumes;
 use crate::codec::rar13::Reader15State;
 use crate::codec::rar20::Reader20State;
 use crate::codec::rar29::Reader29State;
 use crate::codec::workspace::{Allowance, Boxed, Budget, Buffer};
 use crate::extraction_links::{check_legacy_size, legacy_output, LegacyLink};
-use crate::volume_extract::{ChainedReader, SplitVolumeState, SplitVolumeStep};
+use crate::volume_extract::VolumeFeed;
 use std::io::{Read, Write};
 
 enum CodecState<B: Budget = Allowance> {
@@ -60,7 +62,8 @@ impl<B: Budget> CodecState<B> {
         let mut packed = file
             .packed_reader_with_allowance(archive, password, allowance)
             .map_err(|error| file.map_encrypted_payload_error(password, error))?;
-        self.write_split_to(&mut packed, file, solid, password, out)
+        let crc = self.decode_split_to(&mut packed, file, solid, password, out)?;
+        file.crc_result(crc, password)
     }
 
     fn decode_to(
@@ -92,21 +95,22 @@ impl<B: Budget> CodecState<B> {
         }
         Ok(())
     }
-    fn write_split_to(
+    /// Returns the output's CRC; a split member's last header holds the one to check it against.
+    fn decode_split_to(
         &mut self,
         input: &mut impl Read,
         file: &FileHeader,
         solid: bool,
         password: Option<&[u8]>,
         out: &mut impl Write,
-    ) -> Result<()> {
+    ) -> Result<u32> {
         let mut crc = Crc32::new();
         let mut crc_writer = CrcWriter {
             inner: out,
             crc: &mut crc,
         };
         self.decode_to(input, file, solid, password, &mut crc_writer)?;
-        file.crc_result(crc.finish(), password)
+        Ok(crc.finish())
     }
 }
 
@@ -159,18 +163,19 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
         Ok(())
     }
 
-    fn write_split_to(
+    fn decode_split_to(
         &mut self,
         input: &mut impl Read,
-        final_file: &FileHeader,
+        first: &FileHeader,
         out: &mut impl Write,
-    ) -> Result<()> {
-        let solid = self.file_is_solid(final_file);
+    ) -> Result<u32> {
+        let solid = self.file_is_solid(first);
         let password = self.password;
-        self.codec_for(final_file)?
-            .write_split_to(input, final_file, solid, password, out)?;
+        let crc = self
+            .codec_for(first)?
+            .decode_split_to(input, first, solid, password, out)?;
         self.decoded_files += 1;
-        Ok(())
+        Ok(crc)
     }
 
     /// Decode compressed recovery data into a charged buffer.
@@ -285,362 +290,30 @@ where
 fn extract_volumes_with_allowance<F, B: Budget>(
     volumes: &[Archive],
     options: crate::ArchiveReadOptions<'_>,
-    mut open: F,
-    mut links: Option<&mut LegacyLink<'_>>,
+    open: F,
+    links: Option<&mut LegacyLink<'_>>,
     allowance: &B,
 ) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
 {
-    options.check_cancelled()?;
-    if volumes.is_empty() {
-        return Err(Error::InvalidHeader("RAR 1.5 volume set is empty"));
-    }
-
-    let password = options.password;
-    let mut budget = crate::output_limit::OutputBudget::new(options);
-    let mut split = SplitVolumeState::new();
-    let mut session = DecoderSession::with_allowance(
-        volumes
-            .first()
-            .is_some_and(|archive| archive.main.is_solid()),
-        password,
-        allowance,
-    );
-    session.read_control = budget.control.clone();
-    for (volume_index, archive) in volumes.iter().enumerate() {
-        for (file_index, file) in archive.files().enumerate() {
-            options.check_cancelled()?;
-            match split.advance(file.is_split_before(), file.is_split_after()) {
-                SplitVolumeStep::Regular => {
-                    let meta = file.metadata();
-                    if meta.is_directory {
-                        options.check_cancelled()?;
-                        let _ = open(&meta)?;
-                        options.check_cancelled()?;
-                    } else {
-                        budget.check(file.unp_size, &file.name)?;
-                        options.check_cancelled()?;
-                        check_legacy_size(&meta, file.unp_size, links.is_some())?;
-                        let control = budget.control.clone();
-                        legacy_output(
-                            &meta,
-                            allowance,
-                            &control,
-                            &mut links,
-                            || open(&meta),
-                            |writer| {
-                                budget.run(&file.name, writer, |mut writer| {
-                                    if file.is_stored() {
-                                        file.write_stored_with_allowance(
-                                            archive,
-                                            password,
-                                            &mut writer,
-                                            allowance,
-                                        )
-                                        .map_err(|error| file.entry_error("extracting", error))?;
-                                    } else {
-                                        session.write_file_to(archive, file, &mut writer).map_err(
-                                            |error| file.entry_error("extracting", error),
-                                        )?;
-                                    }
-                                    options.check_cancelled()?;
-                                    Ok(())
-                                })
-                            },
-                        )?;
-                    }
-                }
-                SplitVolumeStep::Start => {
-                    validate_split_fragment(file, password)?;
-                    split.begin(PendingSplitRefs::with_allowance(
-                        file,
-                        volume_index,
-                        file_index,
-                        allowance,
-                    )?);
-                }
-                SplitVolumeStep::Continue(current) => {
-                    validate_split_continuation_refs(current, file, password)?;
-                    current.append(file, volume_index, file_index)?;
-                }
-                SplitVolumeStep::Finish(mut completed) => {
-                    validate_split_continuation_refs(&completed, file, password)?;
-                    completed.append(file, volume_index, file_index)?;
-                    completed.write_to(
-                        volumes,
-                        file,
-                        &mut session,
-                        &mut budget,
-                        &mut open,
-                        &mut links,
-                    )?;
-                }
-                SplitVolumeStep::MissingFirst => {
-                    return Err(Error::InvalidHeader(
-                        "RAR 1.5 split entry is missing its first part",
-                    ));
-                }
-                SplitVolumeStep::Interrupted => {
-                    return Err(Error::InvalidHeader(
-                        "RAR 1.5 split entry is interrupted by a regular entry",
-                    ));
-                }
-            }
-        }
-    }
-
-    if split.is_pending() {
-        return Err(Error::InvalidHeader("RAR 1.5 split entry is incomplete"));
-    }
-
-    options.check_cancelled()?;
-    Ok(())
+    let mut volumes = volumes.iter().cloned().map(Ok);
+    let mut feed = VolumeFeed::complete(&mut volumes, options);
+    volumes::extract(&mut feed, options, open, links, allowance)
 }
 
-fn validate_split_fragment(file: &FileHeader, password: Option<&[u8]>) -> Result<()> {
-    if file.is_directory() {
-        return Err(Error::InvalidHeader(
-            "RAR 1.5 split directory entry is invalid",
-        ));
+pub(crate) fn extract_from_feed<F>(
+    feed: &mut VolumeFeed<'_, '_, Archive>,
+    options: crate::ArchiveReadOptions<'_>,
+    open: F,
+) -> Result<()>
+where
+    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+{
+    if let Some(limit) = options.max_reader_workspace_bytes {
+        return volumes::extract(feed, options, open, None, &Allowance::limited(limit));
     }
-    if file.is_encrypted() {
-        crate::crypto::require_encryption()?;
-    }
-    if file.is_encrypted() && password.is_none() {
-        return Err(Error::NeedPassword);
-    }
-    Ok(())
-}
-
-fn validate_split_continuation_refs<B: Budget>(
-    pending: &PendingSplitRefs<B>,
-    file: &FileHeader,
-    password: Option<&[u8]>,
-) -> Result<()> {
-    validate_split_fragment(file, password)?;
-    if file.name != pending.name {
-        return Err(Error::InvalidHeader("RAR 1.5 split entry name changed"));
-    }
-    if file.method != pending.method {
-        return Err(Error::InvalidHeader(
-            "RAR 1.5 split entry compression method changed",
-        ));
-    }
-    if file.unp_ver != pending.unp_ver {
-        return Err(Error::InvalidHeader(
-            "RAR 1.5 split entry unpack version changed",
-        ));
-    }
-    if file.is_encrypted() != pending.encrypted {
-        return Err(Error::InvalidHeader(
-            "RAR 1.5 split entry encryption flag changed",
-        ));
-    }
-    if pending.encrypted && pending.unp_ver >= 29 && file.salt != pending.salt {
-        return Err(Error::InvalidHeader("RAR 3.x split entry salt changed"));
-    }
-    Ok(())
-}
-
-struct PendingSplitRefs<B: Budget = Allowance> {
-    name: Vec<u8>,
-    fragments: Buffer<(usize, usize), B>,
-    file_time: u32,
-    mtime_refinement: Option<crate::TimeRefinement>,
-    attr: u32,
-    host_os: u8,
-    method: u8,
-    unp_ver: u8,
-    encrypted: bool,
-    salt: Option<[u8; 8]>,
-}
-
-impl<B: Budget> PendingSplitRefs<B> {
-    fn with_allowance(
-        file: &FileHeader,
-        volume_index: usize,
-        file_index: usize,
-        allowance: &B,
-    ) -> Result<Self> {
-        Ok(Self {
-            name: file.name.clone(),
-            fragments: Buffer::copied(&[(volume_index, file_index)], allowance)?,
-            file_time: file.file_time,
-            mtime_refinement: file.mtime_refinement(),
-            attr: file.attr,
-            host_os: file.host_os,
-            method: file.method,
-            unp_ver: file.unp_ver,
-            encrypted: file.is_encrypted(),
-            salt: file.salt,
-        })
-    }
-
-    fn append(&mut self, _file: &FileHeader, volume_index: usize, file_index: usize) -> Result<()> {
-        self.fragments.try_push((volume_index, file_index))?;
-        Ok(())
-    }
-
-    fn write_to<F>(
-        self,
-        volumes: &[Archive],
-        final_file: &FileHeader,
-        session: &mut DecoderSession<'_, B>,
-        budget: &mut crate::output_limit::OutputBudget,
-        open: &mut F,
-        links: &mut Option<&mut LegacyLink<'_>>,
-    ) -> Result<()>
-    where
-        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-    {
-        let password = session.password;
-        budget.check(final_file.unp_size, &final_file.name)?;
-        let meta = ExtractedEntryMeta {
-            name_is_unicode: final_file.unicode_name.is_some(),
-            name: self.name.clone(),
-            file_time: self.file_time,
-            mtime_refinement: self.mtime_refinement,
-            attr: self.attr,
-            host_os: self.host_os,
-            is_directory: false,
-        };
-        check_legacy_size(&meta, final_file.unp_size, links.is_some())?;
-        let allowance = self.fragments.allowance();
-        let control = budget.control.clone();
-        legacy_output(
-            &meta,
-            &allowance,
-            &control,
-            links,
-            || open(&meta),
-            |writer| {
-                budget.run(&final_file.name, writer, |mut writer| {
-                    let mut reader = self.fragment_reader_with_allowance(
-                        volumes,
-                        password,
-                        &self.fragments.allowance(),
-                    )?;
-
-                    if final_file.is_stored() {
-                        let expected_len = usize::try_from(final_file.unp_size).map_err(|_| {
-                            Error::InvalidHeader("RAR 1.5 split unpacked size overflows usize")
-                        })?;
-                        let actual_len = self.packed_size(volumes)?;
-                        let expected_packed_len = if self.encrypted && self.unp_ver >= 20 {
-                            expected_len.checked_add(15).map(|len| len & !15).ok_or(
-                                Error::InvalidHeader(
-                                    "RAR 2.x encrypted split stored size overflows",
-                                ),
-                            )?
-                        } else {
-                            expected_len
-                        };
-                        if actual_len != expected_packed_len {
-                            return Err(Error::InvalidHeader(
-                                "RAR 1.5 split stored file has wrong reassembled size",
-                            ));
-                        }
-
-                        let mut crc = Crc32::new();
-                        let copied = crate::stored_copy::copy(
-                            &mut reader.take(expected_len as u64),
-                            expected_len as u64,
-                            false,
-                            &mut |chunk: &[u8]| crc.update(chunk),
-                            &mut writer,
-                            &self.fragments.allowance(),
-                        )?;
-                        if copied != expected_len as u64 {
-                            return Err(Error::InvalidHeader(
-                                "RAR 1.5 split stored file ended before unpacked size",
-                            ));
-                        }
-                        let actual = crc.finish();
-                        final_file
-                            .crc_result(actual, password)
-                            .map_err(|error| final_file.entry_error("extracting", error))
-                    } else {
-                        session
-                            .write_split_to(&mut reader, final_file, &mut writer)
-                            .map_err(|error| final_file.entry_error("extracting", error))
-                    }
-                })
-            },
-        )
-    }
-
-    fn packed_size(&self, volumes: &[Archive]) -> Result<usize> {
-        // Fragments index the same immutable volume slice enumerated by
-        // extract_volumes_to; their member indices cannot disappear.
-        self.fragments
-            .iter()
-            .try_fold(0usize, |total, &(volume_index, file_index)| {
-                let archive = &volumes[volume_index];
-                let file = archive
-                    .files()
-                    .nth(file_index)
-                    .expect("split fragment index comes from archive enumeration");
-                total
-                    .checked_add(usize::try_from(file.pack_size).map_err(|_| {
-                        Error::InvalidHeader("RAR 1.5 split packed size overflows usize")
-                    })?)
-                    .ok_or(Error::InvalidHeader(
-                        "RAR 1.5 split packed size overflows usize",
-                    ))
-            })
-    }
-
-    fn fragment_reader_with_allowance<'a>(
-        &self,
-        volumes: &'a [Archive],
-        password: Option<&[u8]>,
-        allowance: &B,
-    ) -> Result<PackedReader<ChainedReader<crate::source::RangeReader<'a>, B>, B>> {
-        let mut readers = Buffer::with_capacity(self.fragments.len(), allowance)?;
-        for &(volume_index, file_index) in &self.fragments {
-            let archive = &volumes[volume_index];
-            let file = archive
-                .files()
-                .nth(file_index)
-                .expect("split fragment index comes from archive enumeration");
-            readers.push_admitted(archive.range_reader(file.packed_range.clone())?);
-        }
-        let reader = ChainedReader::with_readers(readers);
-        if !self.encrypted {
-            return Ok(PackedReader::Plain(reader));
-        }
-
-        let password = password.expect("encrypted split fragments were admitted with a password");
-        Ok(PackedReader::Encrypted(Boxed::try_new(
-            || {
-                DecryptingReader::with_allowance(
-                    reader,
-                    self.unp_ver,
-                    password,
-                    self.salt,
-                    allowance,
-                )
-            },
-            allowance,
-        )?))
-    }
-}
-
-#[cfg(all(test, feature = "write"))]
-impl PendingSplitRefs<Allowance> {
-    fn new(file: &FileHeader, volume_index: usize, file_index: usize) -> Self {
-        Self::with_allowance(file, volume_index, file_index, &Allowance::default())
-            .expect("unlimited split bookkeeping")
-    }
-    #[cfg(all(test, feature = "write"))]
-    fn fragment_reader<'a>(
-        &self,
-        volumes: &'a [Archive],
-        password: Option<&[u8]>,
-    ) -> Result<PackedReader<ChainedReader<crate::source::RangeReader<'a>>>> {
-        self.fragment_reader_with_allowance(volumes, password, &Allowance::default())
-    }
+    volumes::extract(feed, options, open, None, &Allowance::default())
 }
 
 #[cfg(feature = "encryption")]
@@ -857,20 +530,6 @@ impl<R: Read> DecryptingReader<R, Allowance> {
 }
 #[cfg(all(test, feature = "write"))]
 mod tests {
-    #[test]
-    fn reader_workspace_split_descriptor_growth_is_admitted_before_mutation() {
-        let first = file(b"a.txt", FHD_SPLIT_AFTER);
-        let bytes = std::mem::size_of::<(usize, usize)>() as u64;
-        let quota = Allowance::limited(bytes);
-        let mut pending = PendingSplitRefs::with_allowance(&first, 0, 0, &quota).unwrap();
-        assert_eq!(quota.used(), bytes);
-        let error = pending.append(&first, 1, 0).unwrap_err();
-        assert_eq!(error.kind(), crate::ErrorKind::ResourceLimit);
-        assert_eq!(&pending.fragments[..], &[(0, 0)]);
-        assert_eq!(quota.used(), bytes);
-        drop(pending);
-        assert_eq!(quota.used(), 0);
-    }
 
     #[test]
     fn reader_session_workspace_refusals_charge_every_legacy_decoder_and_encrypted_payload() {
@@ -1272,7 +931,7 @@ mod tests {
     fn validate_split_fragment_rejects_directories_and_demands_password_for_encrypted() {
         let dir = file(b"d", FHD_DIRECTORY_MASK | FHD_SPLIT_AFTER);
         assert!(matches!(
-            validate_split_fragment(&dir, None),
+            volumes::validate_split_fragment(&dir, None),
             Err(Error::InvalidHeader(_))
         ));
 
@@ -1280,15 +939,15 @@ mod tests {
         #[cfg(feature = "encryption")]
         {
             assert!(matches!(
-                validate_split_fragment(&encrypted, None),
+                volumes::validate_split_fragment(&encrypted, None),
                 Err(Error::NeedPassword)
             ));
-            validate_split_fragment(&encrypted, Some(b"pw")).unwrap();
+            volumes::validate_split_fragment(&encrypted, Some(b"pw")).unwrap();
         }
         #[cfg(not(feature = "encryption"))]
         for password in [None, Some(b"pw".as_slice())] {
             assert!(matches!(
-                validate_split_fragment(&encrypted, password),
+                volumes::validate_split_fragment(&encrypted, password),
                 Err(Error::FeatureDisabled {
                     feature: "encryption"
                 })
@@ -1296,69 +955,84 @@ mod tests {
         }
 
         let plain = file(b"a", FHD_SPLIT_AFTER);
-        validate_split_fragment(&plain, None).unwrap();
+        volumes::validate_split_fragment(&plain, None).unwrap();
+    }
+
+    fn continuation_check(
+        first: FileHeader,
+        continuation: &FileHeader,
+        password: Option<&[u8]>,
+    ) -> Result<()> {
+        let volumes = [archive_with(vec![Block::File(first)])];
+        volumes::with_walk(&volumes, password, |_, _, walk| {
+            walk.validate_continuation(continuation)
+        })
     }
 
     #[test]
-    fn validate_split_continuation_refs_rejects_property_drift_between_fragments() {
+    fn split_continuations_must_match_the_first_fragment() {
         let first = file(b"a.txt", FHD_SPLIT_AFTER);
-        let pending = PendingSplitRefs::new(&first, 0, 0);
 
         let renamed = file(b"b.txt", FHD_SPLIT_BEFORE);
         assert!(matches!(
-            validate_split_continuation_refs(&pending, &renamed, None),
+            continuation_check(first.clone(), &renamed, None),
             Err(Error::InvalidHeader(_))
         ));
 
         let mut new_method = file(b"a.txt", FHD_SPLIT_BEFORE);
         new_method.method = 0x35;
         assert!(matches!(
-            validate_split_continuation_refs(&pending, &new_method, None),
+            continuation_check(first.clone(), &new_method, None),
             Err(Error::InvalidHeader(_))
         ));
 
         let mut new_version = file(b"a.txt", FHD_SPLIT_BEFORE);
         new_version.unp_ver = 20;
         assert!(matches!(
-            validate_split_continuation_refs(&pending, &new_version, None),
+            continuation_check(first.clone(), &new_version, None),
             Err(Error::InvalidHeader(_))
         ));
 
         let new_encryption = file(b"a.txt", FHD_PASSWORD | FHD_SPLIT_BEFORE);
         #[cfg(feature = "encryption")]
         assert!(matches!(
-            validate_split_continuation_refs(&pending, &new_encryption, Some(b"pw")),
+            continuation_check(first.clone(), &new_encryption, Some(b"pw")),
             Err(Error::InvalidHeader(_))
         ));
         #[cfg(not(feature = "encryption"))]
         assert!(matches!(
-            validate_split_continuation_refs(&pending, &new_encryption, Some(b"pw")),
+            continuation_check(first.clone(), &new_encryption, Some(b"pw")),
             Err(Error::FeatureDisabled {
                 feature: "encryption"
             })
         ));
 
+        let not_continued = file(b"a.txt", 0);
+        assert!(matches!(
+            continuation_check(first.clone(), &not_continued, None),
+            Err(Error::InvalidHeader(_))
+        ));
+
         let same = file(b"a.txt", FHD_SPLIT_BEFORE);
-        validate_split_continuation_refs(&pending, &same, None).unwrap();
+        continuation_check(first, &same, None).unwrap();
     }
 
     #[test]
     #[cfg(feature = "encryption")]
-    fn validate_split_continuation_refs_rejects_salt_drift_for_rar3_encrypted_entries() {
+    fn rar3_encrypted_split_continuations_must_keep_the_salt() {
         let mut first = file(b"a.txt", FHD_PASSWORD | FHD_SPLIT_AFTER);
         first.salt = Some([1u8; 8]);
-        let pending = PendingSplitRefs::new(&first, 0, 0);
 
         let mut other_salt = file(b"a.txt", FHD_PASSWORD | FHD_SPLIT_BEFORE);
         other_salt.salt = Some([2u8; 8]);
         assert!(matches!(
-            validate_split_continuation_refs(&pending, &other_salt, Some(b"pw")),
+            continuation_check(first.clone(), &other_salt, Some(b"pw")),
             Err(Error::InvalidHeader(_))
         ));
 
         let mut same_salt = file(b"a.txt", FHD_PASSWORD | FHD_SPLIT_BEFORE);
         same_salt.salt = Some([1u8; 8]);
-        validate_split_continuation_refs(&pending, &same_salt, Some(b"pw")).unwrap();
+        continuation_check(first, &same_salt, Some(b"pw")).unwrap();
     }
 
     fn empty_archive() -> Archive {
@@ -1419,15 +1093,12 @@ mod tests {
         second.pack_size = (encrypted.len() - split) as u64;
         second.packed_range = 0..(encrypted.len() - split);
 
-        let mut pending = PendingSplitRefs::new(&first, 0, 0);
-        pending.append(&second, 1, 0).unwrap();
         let volumes = vec![
             archive_with_source(vec![Block::File(first)], encrypted[..split].to_vec()),
             archive_with_source(vec![Block::File(second)], encrypted[split..].to_vec()),
         ];
 
-        let reader = pending.fragment_reader(&volumes, Some(b"pw")).unwrap();
-        let out = read_in_small_chunks(reader);
+        let out = read_split(&volumes, Some(b"pw"));
 
         assert_eq!(out, plain);
     }
@@ -1475,11 +1146,9 @@ mod tests {
             FHD_SPLIT_AFTER,
         ))])];
         assert!(matches!(
-            extract_volumes_to(
-                &incomplete,
-                crate::ArchiveReadOptions::default(),
-                never_open,
-            ),
+            extract_volumes_to(&incomplete, crate::ArchiveReadOptions::default(), |_| Ok(
+                Box::new(std::io::sink()) as Box<dyn Write>
+            ),),
             Err(Error::InvalidHeader(_))
         ));
     }
@@ -1686,7 +1355,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_split_refs_fragment_reader_chains_unencrypted_volumes() {
+    fn split_reader_chains_unencrypted_volumes() {
         let plain: &[u8] = b"hello, this string is split across two volumes!";
         let split = 11usize;
 
@@ -1697,51 +1366,36 @@ mod tests {
         second.pack_size = (plain.len() - split) as u64;
         second.packed_range = 0..(plain.len() - split);
 
-        let mut pending = PendingSplitRefs::new(&first, 0, 0);
-        pending.append(&second, 1, 0).unwrap();
         let volumes = vec![
             archive_with_source(vec![Block::File(first)], plain[..split].to_vec()),
             archive_with_source(vec![Block::File(second)], plain[split..].to_vec()),
         ];
 
-        let reader = pending.fragment_reader(&volumes, None).unwrap();
-        let out = read_in_small_chunks(reader);
+        let out = read_split(&volumes, None);
         assert_eq!(out, plain);
     }
 
     #[test]
-    fn pending_split_refs_packed_size_sums_fragment_pack_sizes() {
-        let mut first = file(b"a.txt", FHD_SPLIT_AFTER);
-        first.pack_size = 7;
-        let mut second = file(b"a.txt", FHD_SPLIT_BEFORE);
-        second.pack_size = 5;
-
-        let mut pending = PendingSplitRefs::new(&first, 0, 0);
-        pending.append(&second, 1, 0).unwrap();
-        let volumes = vec![
-            archive_with(vec![Block::File(first)]),
-            archive_with(vec![Block::File(second)]),
-        ];
-        assert_eq!(pending.packed_size(&volumes).unwrap(), 12);
-    }
-
-    #[test]
-    fn pending_split_refs_rejects_advertised_packed_size_overflow() {
-        let mut first = file(b"a.txt", FHD_SPLIT_AFTER);
-        first.pack_size = u64::MAX;
-        let mut second = file(b"a.txt", FHD_SPLIT_BEFORE);
-        second.pack_size = 1;
-
-        let mut pending = PendingSplitRefs::new(&first, 0, 0);
-        pending.append(&second, 1, 0).unwrap();
-        let volumes = vec![
-            archive_with(vec![Block::File(first)]),
-            archive_with(vec![Block::File(second)]),
-        ];
+    fn split_packed_length_sums_fragments_and_refuses_overflow() {
+        let mut fragment = file(b"a.txt", FHD_SPLIT_AFTER);
+        fragment.pack_size = 5;
+        assert_eq!(volumes::packed_len(7, &fragment).unwrap(), 12);
         assert_eq!(
-            pending.packed_size(&volumes).unwrap_err(),
+            volumes::packed_len(usize::MAX, &fragment).unwrap_err(),
             Error::InvalidHeader("RAR 1.5 split packed size overflows usize")
         );
+    }
+
+    fn read_split(volumes: &[Archive], password: Option<&[u8]>) -> Vec<u8> {
+        volumes::with_walk(volumes, password, |volume, first, walk| {
+            let reader = volume
+                .source
+                .owned_range_reader(first.packed_range.clone())?;
+            let chain = crate::volume_extract::LazyChain::new(walk, reader);
+            let reader = volumes::packed_reader(chain, first, password, &Allowance::default())?;
+            Ok(read_in_small_chunks(reader))
+        })
+        .unwrap()
     }
 
     #[derive(Default, Clone)]
