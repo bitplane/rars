@@ -17,7 +17,9 @@ cargo +nightly fuzz build
 Builds, corpora and artifacts stay on disk under the repository, rather than
 putting large working data in a potentially RAM-backed `/tmp`. After a rars
 version/dependency change, refresh this workspace's lockfile with
-`cargo check --manifest-path fuzz/Cargo.toml --bins`, then commit `fuzz/Cargo.lock`.
+`RUSTFLAGS="--cfg fuzzing" cargo check --manifest-path fuzz/Cargo.toml --bins`, then
+commit `fuzz/Cargo.lock`. The `--cfg fuzzing` flag, which `cargo fuzz` sets itself,
+is what makes rars expose its RAR 3 VM to `rarvm_parse_execute`.
 
 ## Targets
 
@@ -29,6 +31,8 @@ version/dependency change, refresh this workspace's lockfile with
   sanitizer failures are not. Passwords and multi-volume assembly are not covered.
 - `unpack29_decode`, `ppmd_decode`, `unpack50_decode`: decoder primitives.
 - `rarvm_parse_execute`: VM parsing and execution. Small programs can still loop.
+  The decoder and archive targets enable non-standard RAR 3 VM programs, which
+  readers refuse by default.
 - `unpack15_round_trip`: encoder/decoder agreement across encoding options.
 - `rar3_recovery`, `rar5_recovery`: recovery records and reconstruction.
 - `rar30_crypto`, `rar50_crypto`: crypto primitives. The RAR5 target limits KDF

@@ -7397,3 +7397,23 @@ fn aggregate_memory_policy_refuses_without_replacing_output() {
         }
     }
 }
+
+#[test]
+fn custom_rar3_vm_programs_need_the_allow_flag() {
+    let archive = fixture_rar15_40("rarvm/generic_delta_padding_mutation.rar");
+    let refused = rars().arg("test").arg(&archive).output().unwrap();
+    assert!(!refused.status.success());
+    let message = stderr(&refused);
+    assert!(
+        message.contains("custom RAR 3 VM filter program"),
+        "{message}"
+    );
+    assert!(message.contains("--allow-rar3-vm"), "{message}");
+
+    let allowed = rars()
+        .args(["test", "--allow-rar3-vm"])
+        .arg(&archive)
+        .output()
+        .unwrap();
+    assert!(allowed.status.success(), "stderr: {}", stderr(&allowed));
+}

@@ -43,6 +43,12 @@ export function createApi(runtime) {
       }
       limits[key] = value;
     }
+    if (options.allowRar3VmPrograms != null) {
+      if (typeof options.allowRar3VmPrograms !== "boolean") {
+        throw new RarError("INVALID_OPTION", "allowRar3VmPrograms must be a boolean");
+      }
+      limits.allowRar3VmPrograms = options.allowRar3VmPrograms;
+    }
     return limits;
   }
 

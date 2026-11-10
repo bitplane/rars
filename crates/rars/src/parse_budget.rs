@@ -12,7 +12,7 @@ pub(crate) struct ParseBudget {
 impl ParseBudget {
     pub(crate) fn new(options: ArchiveReadOptions<'_>) -> Self {
         Self {
-            control: crate::read_control::ReadControl::new(options.cancellation),
+            control: crate::read_control::ReadControl::for_options(&options),
             count_limit: options.max_header_count,
             byte_limit: options.max_header_bytes,
             count: 0,

@@ -31,6 +31,12 @@ export interface ReadOptions extends OperationOptions {
   maxReaderWorkspaceBytes?: number | bigint;
   rar50DictionarySizeLimit?: number | bigint;
   rar50BufferedDecodeLimit?: number | bigint;
+  /**
+   * Run RAR 3 VM filter programs other than the six standard ones. Off by
+   * default: they are arbitrary bytecode from the archive and can use a lot of
+   * CPU time. Members that need one fail with UNSUPPORTED_FEATURE otherwise.
+   */
+  allowRar3VmPrograms?: boolean;
 }
 
 export interface RepairReport {

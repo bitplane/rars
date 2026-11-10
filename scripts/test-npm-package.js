@@ -28,6 +28,9 @@ const text = new TextEncoder();
 const decode = (bytes) => new TextDecoder().decode(bytes);
 const HELLO = text.encode("hello from rars ".repeat(64));
 const SECOND = text.encode("a second member");
+// Volume sizes include headers, so split tests need a payload several times
+// the size of one volume's headers.
+const LARGE = text.encode("hello from rars ".repeat(512));
 
 console.log(`rars ${version}`);
 
@@ -205,6 +208,15 @@ await check("read options preserve integer precision and reject invalid limits",
   assert.equal(await archive.readComment(), undefined);
 });
 
+await check("custom RAR 3 VM programs run only when allowed", async () => {
+  const archive = await RarArchive.open(await readFile(new URL(
+    "../crates/rars/tests/fixtures/rar15_40/rarvm/generic_delta_padding_mutation.rar", import.meta.url)));
+  await assert.rejects(archive.entries[0].bytes(), (error) => error.code === "UNSUPPORTED_FEATURE");
+  assert.equal((await archive.entries[0].bytes({ allowRar3VmPrograms: true })).length, 1048576);
+  await assert.rejects(archive.entries[0].bytes({ allowRar3VmPrograms: "yes" }),
+    (error) => error.code === "INVALID_OPTION");
+});
+
 await check("RAR5 decoder and volume budgets reach WASM", async () => {
   const limited = (error) => error.code === "RESOURCE_LIMIT";
   const compressed = await new RarWriter({ format: "rar50", level: 5 }).add("a.txt", HELLO).bytes();
@@ -256,8 +268,8 @@ await check("legacy filename views preserve bytes and Unicode names", async () =
 
 await check("aggregate writer memory policy crosses the worker boundary", async () => {
   for (const format of ["rar50", "rar70"]) {
-    const expected = await new RarWriter({ format, level: 0 }).add("member", HELLO).bytes();
-    const writer = new RarWriter({ format, level: 0, maxMemoryBytes: 16n << 20n }).add("member", HELLO);
+    const expected = await new RarWriter({ format, level: 0 }).add("member", LARGE).bytes();
+    const writer = new RarWriter({ format, level: 0, maxMemoryBytes: 16n << 20n }).add("member", LARGE);
     assert.deepEqual(await writer.bytes(), expected);
     assert.deepEqual(await writer.bytes(), expected);
     const denied = new RarWriter({ format, level: 0, maxMemoryBytes: 0 }).add("member", HELLO);
@@ -269,7 +281,7 @@ await check("aggregate writer memory policy crosses the worker boundary", async 
         return true;
       });
     }
-    const volumes = await writer.volumes(512);
+    const volumes = await writer.volumes(2048);
     assert.ok(volumes.length > 1);
   }
   for (const format of ["rar13", "rar14", "rar15", "rar20", "rar29", "rar30", "rar40"]) {
@@ -282,15 +294,15 @@ await check("bounded WASM encryption and recovery retain readable output", async
   for (const encryptHeaders of [false, true]) {
     const writer = new RarWriter({ format: "rar50", level: 0, password: "secret",
       encryptHeaders, recoveryPercent: 10, maxMemoryBytes: 32 * 1024 * 1024 })
-      .add("member", HELLO);
+      .add("member", LARGE);
     const bytes = await writer.bytes();
     const archive = await RarArchive.open(bytes, { password: "secret" });
-    assert.deepEqual(await archive.get("member").bytes(), HELLO);
+    assert.deepEqual(await archive.get("member").bytes(), LARGE);
     archive.close();
-    const volumes = await writer.volumes(512);
+    const volumes = await writer.volumes(2048);
     assert.ok(volumes.length > 1);
     const set = await RarArchive.open(volumes, { password: "secret" });
-    assert.deepEqual(await set.get("member").bytes(), HELLO);
+    assert.deepEqual(await set.get("member").bytes(), LARGE);
     set.close();
   }
 });

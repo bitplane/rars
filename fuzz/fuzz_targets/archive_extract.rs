@@ -18,7 +18,9 @@ fuzz_target!(|data: &[u8]| {
         .with_max_member_output_bytes(1024 * 1024)
         .with_max_total_output_bytes(4 * 1024 * 1024)
         .with_rar50_dictionary_size_limit(8 * 1024 * 1024)
-        .with_rar50_buffered_decode_limit(1024 * 1024);
+        .with_rar50_buffered_decode_limit(1024 * 1024)
+        // Off by default, but the interpreter still needs fuzzing.
+        .with_rar3_vm_programs(true);
     // No password: encrypted-input refusals are expected. Crypto primitives
     // have dedicated targets; volume-set extraction is separate future work.
     if let Ok(archive) = ArchiveReader::read_with_options(data, options) {

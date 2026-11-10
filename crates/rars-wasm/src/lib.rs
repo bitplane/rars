@@ -1028,6 +1028,7 @@ fn read_options<'a>(
     options.max_reader_workspace_bytes = read_limit(settings, "maxReaderWorkspaceBytes")?;
     options.rar50_dictionary_size_limit = read_limit(settings, "rar50DictionarySizeLimit")?;
     options.rar50_buffered_decode_limit = read_limit(settings, "rar50BufferedDecodeLimit")?;
+    options.allow_rar3_vm_programs = opt_bool(settings, "allowRar3VmPrograms")?;
     Ok(options)
 }
 

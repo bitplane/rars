@@ -440,3 +440,18 @@ def test_module_password_conversion_errors_are_typeerrors(tmp_path, operation):
     with pytest.raises(TypeError):
         operation(*args, password=object())
     assert list(tmp_path.iterdir()) == []
+
+
+RARVM_CUSTOM = ROOT / "crates/rars/tests/fixtures/rar15_40/rarvm/generic_delta_padding_mutation.rar"
+
+
+def test_custom_rar3_vm_programs_are_refused_unless_allowed():
+    archive = rars.RarFile(RARVM_CUSTOM)
+    name = archive.namelist()[0]
+    with pytest.raises(rars.UnsupportedRarFeature, match="allow_rar3_vm_programs"):
+        archive.read(name)
+    assert rars.ReadOptions().allow_rar3_vm_programs is False
+
+    allowed = rars.ReadOptions(allow_rar3_vm_programs=True)
+    assert allowed.allow_rar3_vm_programs is True
+    assert len(archive.read(name, options=allowed)) == 1_048_576

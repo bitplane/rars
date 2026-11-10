@@ -1,6 +1,6 @@
 use rars::crc32::crc32;
 use rars::rar15_40::Archive;
-use rars::{ArchiveReadOptions, Result};
+use rars::{ArchiveReadOptions, Error, ErrorKind, Result};
 use std::cell::RefCell;
 use std::io::{Result as IoResult, Write};
 use std::path::{Path, PathBuf};
@@ -33,8 +33,15 @@ impl Write for CollectWriter {
 }
 
 fn collect_extract(archive: &Archive) -> Result<Vec<CollectedEntry>> {
+    collect_extract_with(archive, ArchiveReadOptions::default())
+}
+
+fn collect_extract_with(
+    archive: &Archive,
+    options: ArchiveReadOptions<'_>,
+) -> Result<Vec<CollectedEntry>> {
     let entries = RefCell::new(Vec::new());
-    archive.extract_to(ArchiveReadOptions::default(), |meta| {
+    archive.extract_to(options, |meta| {
         let data = Rc::new(RefCell::new(Vec::new()));
         entries.borrow_mut().push((meta.clone(), Rc::clone(&data)));
         Ok(Box::new(CollectWriter { data }))
@@ -81,10 +88,36 @@ fn non_standard_vm_filter_uses_generic_executor() {
     assert_eq!(files[0].unp_size, 1_048_576);
     assert_eq!(files[0].file_crc, 0x3908_6451);
 
-    let extracted = collect_extract(&archive).unwrap();
+    let options = ArchiveReadOptions::new().with_rar3_vm_programs(true);
+    let extracted = collect_extract_with(&archive, options).unwrap();
     assert_eq!(extracted.len(), 1);
     assert_eq!(extracted[0].data.len(), 1_048_576);
     assert_eq!(crc32(&extracted[0].data), 0x3908_6451);
+}
+
+#[test]
+fn non_standard_vm_filter_is_refused_by_default() {
+    let archive = Archive::parse_path(fixture("generic_delta_padding_mutation.rar")).unwrap();
+
+    let error = match collect_extract(&archive) {
+        Err(error) => error,
+        Ok(_) => panic!("a non-standard program ran without being allowed"),
+    };
+    assert_eq!(error.kind(), ErrorKind::UnsupportedFeature);
+    assert_eq!(error.root_cause(), &Error::Rar3VmProgramRefused);
+    assert!(
+        error.to_string().contains("allow_rar3_vm_programs"),
+        "{error}"
+    );
+}
+
+#[test]
+fn standard_filters_run_without_allowing_vm_programs() {
+    // Every other fixture here uses only the six standard programs, which run
+    // as native code whatever the option says.
+    let archive = Archive::parse_path(fixture("ppmd_embedded_vm_filter.rar")).unwrap();
+    let extracted = collect_extract(&archive).unwrap();
+    assert_eq!(crc32(&extracted[0].data), 0xa0fa_ad59);
 }
 
 #[test]

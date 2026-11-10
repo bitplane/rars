@@ -27,7 +27,7 @@ pub(crate) struct OutputBudget {
 impl OutputBudget {
     pub(crate) fn new(options: crate::ArchiveReadOptions<'_>) -> Self {
         Self {
-            control: crate::read_control::ReadControl::new(options.cancellation),
+            control: crate::read_control::ReadControl::for_options(&options),
             member_limit: options.max_member_output_bytes,
             total_limit: options.max_total_output_bytes,
             used: 0,

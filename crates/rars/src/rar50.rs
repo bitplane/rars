@@ -719,7 +719,7 @@ impl Archive {
             return Err(Error::UnsupportedSignature);
         }
 
-        let control = crate::read_control::ReadControl::new(options.cancellation);
+        let control = crate::read_control::ReadControl::for_options(&options);
         let file_cell = std::cell::RefCell::new(control.reader(file));
         let (main, blocks) = parse_archive_blocks(
             archive_len,
@@ -888,7 +888,7 @@ impl Archive {
         {
             options.check_cancelled()?;
             let password = options.password;
-            let control = crate::read_control::ReadControl::new(options.cancellation);
+            let control = crate::read_control::ReadControl::for_options(&options);
             let recovery = self.recovery_service()?;
             let recovery_data = recovery.decoded_recovery_data(self, password, &control)?;
             let (available, expected) =
@@ -1279,7 +1279,7 @@ pub fn repair_inline_recovery_bytes_with_options(
         }
         let repair_options = crate::recovery::rar5::InlineRepairOptions {
             password: options.password,
-            control: crate::read_control::ReadControl::new(options.cancellation),
+            control: crate::read_control::ReadControl::for_options(&options),
             ..Default::default()
         };
         let (repaired, report) = crate::recovery::rar5::repair_inline_recovery_archive_with_report(

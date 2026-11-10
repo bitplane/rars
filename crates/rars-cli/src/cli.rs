@@ -95,6 +95,11 @@ pub(crate) struct ReadOptionsArgs {
     /// Maximum workspace per RAR5 scratch filter
     #[arg(long, value_name = "SIZE", value_parser = crate::parse_size_string, requires = "rar50_scratch_dir")]
     pub rar50_filter_memory_limit: Option<usize>,
+    /// Run RAR 3 VM filter programs other than the six standard ones. Off by
+    /// default: they are arbitrary bytecode from the archive and can use a lot
+    /// of CPU time. Enable only for archives you trust.
+    #[arg(long)]
+    pub allow_rar3_vm: bool,
 }
 
 impl ReadOptionsArgs {
@@ -128,6 +133,7 @@ impl ReadOptionsArgs {
         options.rar50_buffered_decode_limit =
             self.rar50_buffered_decode_limit.map(|value| value as u64);
         options.rar50_scratch = scratch;
+        options.allow_rar3_vm_programs = self.allow_rar3_vm;
         options
     }
 }
@@ -405,6 +411,7 @@ mod tests {
             max_header_bytes: Some(16),
             rar50_scratch_dir: Some("scratch".into()),
             rar50_scratch_bytes: Some(17),
+            allow_rar3_vm: true,
             ..Default::default()
         };
         let scratch = args.scratch().unwrap();
@@ -418,7 +425,9 @@ mod tests {
         assert_eq!(options.max_header_count, Some(15));
         assert_eq!(options.max_header_bytes, Some(16));
         assert!(std::ptr::eq(options.rar50_scratch.unwrap(), &scratch));
+        assert!(options.allow_rar3_vm_programs);
         let defaults = ReadOptionsArgs::default();
+        assert!(!defaults.options(None, None).allow_rar3_vm_programs);
         assert!(defaults.scratch().is_none());
         assert!(defaults.options(None, None).password.is_none());
         assert!(defaults.options(None, None).rar50_scratch.is_none());

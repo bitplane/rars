@@ -28,6 +28,7 @@ use super::ppmd::{PpmdByteReader, PpmdState};
 use super::rarvm;
 use super::workspace::{Allowance, Budget, Buffer};
 use super::{Error, Result};
+use crate::read_control::Rar3VmPrograms;
 use std::io::{Read, Write};
 
 const MAIN_COUNT: usize = 299;
@@ -149,6 +150,15 @@ impl Unpack29 {
     }
     pub fn reset_non_solid(&mut self) {
         self.state.reset_non_solid();
+    }
+    /// Run filter programs other than the six standard ones. Off by default;
+    /// see [`crate::ArchiveReadOptions::allow_rar3_vm_programs`].
+    pub fn allow_vm_programs(&mut self, allow: bool) {
+        self.read_control.set_rar3_vm_programs(if allow {
+            Rar3VmPrograms::Run
+        } else {
+            Rar3VmPrograms::Refuse
+        });
     }
     pub fn decode_member(&mut self, input: &[u8], output_size: usize) -> Result<Vec<u8>> {
         self.state.read_control = self.read_control.clone();
@@ -1000,15 +1010,16 @@ impl<B: Budget> Reader29State<B> {
             for _ in 0..code_size {
                 code.push_admitted(vm.read_bits(8)? as u8);
             }
-            let kind = identify_standard_filter(&code)
-                .map(VmProgramKind::Standard)
-                .map_or_else(
-                    || {
-                        rarvm::OwnedProgram::parse(&code, &self.output.allowance())
-                            .map(VmProgramKind::Generic)
-                    },
-                    Ok,
-                )?;
+            let kind = match identify_standard_filter(&code) {
+                Some(filter) => VmProgramKind::Standard(filter),
+                None if self.read_control.rar3_vm_programs() == Rar3VmPrograms::Run => {
+                    VmProgramKind::Generic(rarvm::OwnedProgram::parse(
+                        &code,
+                        &self.output.allowance(),
+                    )?)
+                }
+                None => return Err(Error::Rar3VmProgramRefused),
+            };
             self.programs.try_push(VmProgram {
                 kind,
                 block_size,
