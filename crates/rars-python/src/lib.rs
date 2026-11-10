@@ -617,7 +617,14 @@ impl RarFile {
             .ok_or_else(|| PyKeyError::new_err("member has no extractable payload"))
     }
 
-    /// On a volume set, extracts the whole set; see `extract_set` for where its volumes come from.
+    /// On a volume set, extracts the whole set. Without `volumes`, a set opened
+    /// from a path finds its later volumes by name beside it.
+    ///
+    /// `volumes` yields the volumes after this one, in order: `bytes` are archive
+    /// data, `str` or `PathLike` are paths. Each is pulled when needed, so a
+    /// generator may wait for downloads. If the last volume isn't marked as last
+    /// (all RAR 1.3 to 2.0 sets, some later ones), the iterator is advanced once
+    /// more and must stop, not wait.
     #[pyo3(signature = (path = None, members = None, pwd = None, overwrite = false, *, options = None, volumes = None))]
     #[allow(clippy::too_many_arguments)]
     fn extractall(
@@ -674,6 +681,7 @@ impl RarFile {
         .map_err(map_error)
     }
 
+    /// `volumes` works as in `extractall`.
     #[pyo3(signature = (pwd = None, *, options = None, volumes = None))]
     fn testrar(
         &self,
