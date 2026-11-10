@@ -12,7 +12,39 @@ pub(crate) fn volume_part_path(first_path: &Path, index: usize) -> CliResult<Pat
     if index > 100 {
         return Err("RAR 1.4 old-style volume names only support .r00 through .r99 here".into());
     }
-    Ok(first_path.with_extension(format!("r{:02}", index - 1)))
+    Ok(first_path.with_extension(format!(
+        "{}{:02}",
+        legacy_volume_letter(first_path),
+        index - 1
+    )))
+}
+
+/// RAR names the volumes after `A.RAR` `A.R00`, `A.R01` and so on, and after
+/// `A.rar` `A.r00`: the letter follows the case of the first volume's
+/// extension. On a case-sensitive filesystem unrar looks only for that name.
+fn legacy_volume_letter(first_path: &Path) -> char {
+    match first_path
+        .extension()
+        .and_then(|extension| extension.as_encoded_bytes().first())
+    {
+        Some(b'R') => 'R',
+        _ => 'r',
+    }
+}
+
+/// The first volume's `.rar` as it was written, so `A.RAR` gives
+/// `A.part01.RAR` as RAR itself names them.
+fn rar_suffix(file_name: &[u8]) -> &str {
+    match file_name
+        .len()
+        .checked_sub(4)
+        .map(|start| &file_name[start..])
+    {
+        Some(suffix) if suffix.eq_ignore_ascii_case(b".rar") => {
+            std::str::from_utf8(suffix).expect("ASCII suffix")
+        }
+        _ => ".rar",
+    }
 }
 
 pub(crate) fn rar50_volume_part_path(
@@ -31,7 +63,11 @@ pub(crate) fn rar50_volume_part_path(
     // Unix accepts any native bytes; elsewhere removing ASCII suffixes keeps UTF-8 valid.
     let mut name = rars::filename::native_string(stem)
         .expect("stem from a native filename remains representable");
-    name.push(format!(".part{:0width$}.rar", index + 1));
+    name.push(format!(
+        ".part{:0width$}{}",
+        index + 1,
+        rar_suffix(file_name)
+    ));
     Ok(parent.join(name))
 }
 
@@ -216,9 +252,22 @@ mod tests {
             Path::new("dir/set.r99")
         );
         assert!(volume_part_path(first, 101).is_err());
+        // The letter follows the first extension's, as RAR 3.93 -vn names them.
         for (input, expected) in [
-            ("set.RAR", "set.part01.rar"),
-            ("set.PART009.RAR", "set.part01.rar"),
+            ("set.RAR", "set.R00"),
+            ("set.Rar", "set.R00"),
+            ("set.rAR", "set.r00"),
+            ("set", "set.r00"),
+        ] {
+            assert_eq!(
+                volume_part_path(Path::new(input), 1).unwrap(),
+                Path::new(expected)
+            );
+        }
+        for (input, expected) in [
+            ("set.RAR", "set.part01.RAR"),
+            ("set.Rar", "set.part01.Rar"),
+            ("set.PART009.RAR", "set.part01.RAR"),
             ("set.part.rar", "set.part.part01.rar"),
             ("set.partx.rar", "set.partx.part01.rar"),
             ("set", "set.part01.rar"),

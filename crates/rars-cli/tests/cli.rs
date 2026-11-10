@@ -7417,3 +7417,48 @@ fn custom_rar3_vm_programs_need_the_allow_flag() {
         .unwrap();
     assert!(allowed.status.success(), "stderr: {}", stderr(&allowed));
 }
+
+#[test]
+fn volume_names_follow_the_case_of_the_first_volume() {
+    // RAR names the volumes after SPLIT.RAR SPLIT.R00, SPLIT.R01, and new-style
+    // ones SPLIT.part01.RAR. On a case-sensitive filesystem unrar looks for
+    // exactly those names, so lowercase ones broke the set.
+    let dir = scratch("volume-name-case");
+    let source = dir.join("noise.bin");
+    fs::write(&source, deterministic_noise(1500)).unwrap();
+    for (format, first, later) in [
+        ("rar29", "SPLIT.RAR", "SPLIT.R00"),
+        ("rar50", "SPLIT.RAR", "SPLIT.part02.RAR"),
+    ] {
+        let out = dir.join(format);
+        fs::create_dir_all(&out).unwrap();
+        let create = rars()
+            .args(["a", "--format", format, "--volume-size", "512"])
+            .arg(out.join(first))
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(create.status.success(), "stderr: {}", stderr(&create));
+        let names: Vec<_> = fs::read_dir(&out)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert!(
+            names.iter().any(|name| name == later),
+            "{format}: {names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .all(|name| !name.ends_with(".rar") && !name.contains(".r0")),
+            "{format}: {names:?}"
+        );
+        let first_path = if format == "rar50" {
+            out.join("SPLIT.part01.RAR")
+        } else {
+            out.join(first)
+        };
+        let test = rars().arg("test").arg(first_path).output().unwrap();
+        assert!(test.status.success(), "{format}: {}", stderr(&test));
+    }
+}

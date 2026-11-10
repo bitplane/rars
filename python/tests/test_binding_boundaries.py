@@ -86,9 +86,11 @@ def test_modern_volume_stems_and_roundtrip(tmp_path, stem):
     builder.add_bytes(b"payload" * 200, "file.txt")
     paths = builder.write_volumes(tmp_path / stem)
     base = stem.removesuffix(".rar").removesuffix(".RAR")
+    suffix = stem[len(base):] or ".rar"
     if base.endswith(".part01"):
         base = base[:-7]
-    assert Path(paths[0]).name == f"{base}.part01.rar"
+    # RAR keeps the first name's ".rar" as written: archive.RAR, archive.part01.RAR.
+    assert Path(paths[0]).name == f"{base}.part01{suffix}"
     rars.test_volumes(paths)
 
 
@@ -455,3 +457,13 @@ def test_custom_rar3_vm_programs_are_refused_unless_allowed():
     allowed = rars.ReadOptions(allow_rar3_vm_programs=True)
     assert allowed.allow_rar3_vm_programs is True
     assert len(archive.read(name, options=allowed)) == 1_048_576
+
+
+@pytest.mark.parametrize("first,second", [("archive.rar", "archive.r00"), ("archive.RAR", "archive.R00"), ("archive.Rar", "archive.R00")])
+def test_legacy_volume_names_follow_the_first_extension_case(tmp_path, first, second):
+    # unrar looks for archive.R00 after archive.RAR on a case-sensitive filesystem.
+    builder = rars.RarBuilder(format="rar29", store=True, volume_size=512)
+    builder.add_bytes(b"payload" * 200, "file.txt")
+    paths = builder.write_volumes(tmp_path / first)
+    assert [Path(path).name for path in paths[:2]] == [first, second]
+    rars.test_volumes(paths)
