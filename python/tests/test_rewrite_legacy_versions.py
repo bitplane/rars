@@ -4,7 +4,7 @@ import zlib
 import pytest
 import rars
 
-from test_rewrite_legacy import DOS_TIME, headers, file_metadata
+from test_rewrite_legacy import DOS_TIME, file_metadata, headers, without_end_block
 from test_rewrite_older import check_unrar
 
 
@@ -25,7 +25,7 @@ def test_mixed_unpackers_keep_archive_requirement_even_after_removing_newer_memb
     first = versioned_file(versions[0], "first", password)
     second = versioned_file(versions[1], "second")
     start = next(offset for offset, kind, _, _ in headers(second) if kind == 0x74)
-    source = rars.RarFile.from_bytes(first + second[start:], password=password)
+    source = rars.RarFile.from_bytes(without_end_block(first) + second[start:], password=password)
     editor = rars.RarBuilder.from_archive(source)
     data = editor.to_bytes()
     output = rars.RarFile.from_bytes(data, password=password)

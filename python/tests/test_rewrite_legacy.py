@@ -21,6 +21,15 @@ def headers(data):
         offset += size + packed
 
 
+def without_end_block(data):
+    """Cut a trailing end-of-archive block, so another archive's members can
+    be appended after the last one. RAR 2.9 and later close with one."""
+    for offset, kind, _, _ in headers(data):
+        if kind == 0x7b:
+            return data[:offset]
+    return data
+
+
 def service_headers(data, name):
     """Select a service by its wire name, independently of producer records."""
     for header in headers(data):
@@ -280,7 +289,7 @@ def test_mixed_legacy_encryption_keeps_plaintext_members_plain(tmp_path, format,
     first, second = (encrypted, plain) if encrypted_first else (plain, encrypted)
     second_bytes = second.to_bytes()
     member_offset = next(offset for offset, kind, _, _ in headers(second_bytes) if kind == 0x74)
-    source = rars.RarFile.from_bytes(first.to_bytes() + second_bytes[member_offset:], password="secret")
+    source = rars.RarFile.from_bytes(without_end_block(first.to_bytes()) + second_bytes[member_offset:], password="secret")
     rewritten = rars.RarBuilder.from_archive(source).to_bytes()
     output = rars.RarFile.from_bytes(rewritten)
     assert not output.getinfo("plain").is_encrypted
