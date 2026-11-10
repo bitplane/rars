@@ -1153,16 +1153,37 @@ fn rejects_an_lz_literal_after_the_declared_member_size() {
 }
 
 #[test]
-fn rejects_an_lz_match_crossing_the_declared_member_size() {
-    let input = b"repeated tail ".repeat(256);
-    let packed = Unpack29Encoder::new().encode_member(&input).unwrap();
+fn an_lz_match_crossing_the_declared_size_truncates_and_keeps_the_overrun() {
+    let first = b"repeated tail ".repeat(256);
+    let second = b"repeated tail, then a fresh ending".to_vec();
+    let mut encoder = Unpack29Encoder::new();
+    let first_packed = encoder.encode_member(&first).unwrap();
+    let second_packed = encoder.encode_member(&second).unwrap();
+    let declared = first.len() - 5;
 
-    assert!(matches!(
-        unpack29_decode(&packed, input.len() - 1),
-        Err(Error::InvalidData(
-            "RAR 2.9 member produces more output than its declared size"
-        ))
-    ));
+    let mut from_slice = Unpack29::new();
+    assert_eq!(
+        from_slice.decode_member(&first_packed, declared).unwrap(),
+        first[..declared]
+    );
+    assert_eq!(
+        from_slice
+            .decode_member(&second_packed, second.len())
+            .unwrap(),
+        second
+    );
+
+    let mut from_reader = Unpack29::new();
+    for (packed, size, expected) in [
+        (&first_packed, declared, &first[..declared]),
+        (&second_packed, second.len(), &second[..]),
+    ] {
+        let mut out = Vec::new();
+        from_reader
+            .decode_member_from_reader(&mut packed.as_slice(), size, &mut out)
+            .unwrap();
+        assert_eq!(out, expected);
+    }
 }
 
 #[test]

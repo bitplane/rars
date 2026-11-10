@@ -529,11 +529,9 @@ impl<B: Budget> Reader29State<B> {
                 .saturating_add(STREAM_CHUNK)
                 .min(final_target);
         }
-        if self.pending_match.is_some() {
-            return Err(Error::InvalidData(
-                "RAR 2.9 member produces more output than its declared size",
-            ));
-        }
+        // A final match past the declared size is not output, but its tail
+        // stays in the window for the next solid member.
+        self.drain_pending_match(usize::MAX)?;
         self.finish_member(src).map_err(|error| match error {
             Error::NeedMoreInput => Error::InvalidData("RAR 2.9 bitstream is truncated"),
             error => error,
