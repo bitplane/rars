@@ -433,6 +433,8 @@ struct RarFile {
     identity: Arc<()>,
     encoding: Option<rars_rs::filename::LegacyNameEncoding>,
     archive: rars_rs::Archive,
+    /// Where it was opened from, to find a set's later volumes by name.
+    path: Option<PathBuf>,
     password: Option<Vec<u8>>,
     infos: Vec<RarInfo>,
     names: OnceLock<MemberNames>,
@@ -615,7 +617,7 @@ impl RarFile {
             .ok_or_else(|| PyKeyError::new_err("member has no extractable payload"))
     }
 
-    /// With `volumes`, extracts the set this first volume begins; see `with_python_volumes`.
+    /// On a volume set, extracts the whole set; see `extract_set` for where its volumes come from.
     #[pyo3(signature = (path = None, members = None, pwd = None, overwrite = false, *, options = None, volumes = None))]
     #[allow(clippy::too_many_arguments)]
     fn extractall(
@@ -630,17 +632,17 @@ impl RarFile {
     ) -> PyResult<Vec<PathBuf>> {
         check_read_options_cancellation(options)?;
         let out_dir = path.unwrap_or_else(|| PathBuf::from("."));
-        if let Some(volumes) = volumes {
-            if members.is_some() {
-                return Err(PyValueError::new_err(
-                    "members cannot be combined with volumes",
-                ));
-            }
+        if volumes.is_some() && members.is_some() {
+            return Err(PyValueError::new_err(
+                "members cannot be combined with volumes",
+            ));
+        }
+        if volumes.is_some() || (members.is_none() && self.archive.is_volume()) {
             let password = py_password(pwd)?.or_else(|| self.password.clone());
             let options = self.extraction_options(options, password.as_deref());
             let first = &self.archive;
             let written = Arc::new(Mutex::new(Vec::new()));
-            with_python_volumes(py, volumes, options, |volumes| {
+            self.extract_set(py, volumes, options, |volumes| {
                 first.extract_with_volumes(
                     volumes,
                     options,
@@ -683,16 +685,16 @@ impl RarFile {
         let password = py_password(pwd)?.or_else(|| self.password.clone());
         let options = self.extraction_options(options, password.as_deref());
         let first = &self.archive;
-        match volumes {
-            Some(volumes) => with_python_volumes(py, volumes, options, |volumes| {
-                first.extract_with_volumes(volumes, options, |_| {
-                    Ok(Box::new(io::sink()) as Box<dyn Write>)
-                })
-            }),
-            None => py
+        if volumes.is_none() && !first.is_volume() {
+            return py
                 .detach(|| first.test_with_options(options))
-                .map_err(map_error),
+                .map_err(map_error);
         }
+        self.extract_set(py, volumes, options, |volumes| {
+            first.extract_with_volumes(volumes, options, |_| {
+                Ok(Box::new(io::sink()) as Box<dyn Write>)
+            })
+        })
     }
 
     #[getter]
@@ -826,6 +828,87 @@ impl RarFile {
 }
 
 impl RarFile {
+    /// Runs `run` over the set, its later volumes from `volumes`, else found by name beside the first.
+    fn extract_set<T: Send>(
+        &self,
+        py: Python<'_>,
+        volumes: Option<&Bound<'_, PyAny>>,
+        options: rars_rs::ArchiveReadOptions<'_>,
+        run: impl FnOnce(
+                &mut (dyn Iterator<Item = rars_rs::Result<rars_rs::Archive>> + Send),
+            ) -> rars_rs::Result<T>
+            + Send,
+    ) -> PyResult<T> {
+        if let Some(volumes) = volumes {
+            let iterator = volumes.try_iter()?.unbind();
+            return with_volume_sources(
+                py,
+                options,
+                || {
+                    Python::attach(|py| {
+                        let Some(volume) = iterator.bind(py).clone().next() else {
+                            return Ok(None);
+                        };
+                        let volume = volume?;
+                        if let Ok(bytes) = volume.extract::<Vec<u8>>() {
+                            return Ok(Some(VolumeSource::Bytes(bytes)));
+                        }
+                        Ok(Some(VolumeSource::Path(std::path::absolute(py_path_buf(
+                            py, &volume,
+                        )?)?)))
+                    })
+                },
+                run,
+            )?
+            .map_err(map_error);
+        }
+        let Some(first_path) = &self.path else {
+            let mut asked = false;
+            let result = with_volume_sources(
+                py,
+                options,
+                || {
+                    asked = true;
+                    Ok(None)
+                },
+                run,
+            )?;
+            return result.map_err(|error| {
+                if asked {
+                    map_error_with(
+                        py,
+                        error,
+                        "; an archive opened from bytes cannot find its later volumes, so pass them as volumes=",
+                    )
+                } else {
+                    map_error(error)
+                }
+            });
+        };
+        let mut index = 0;
+        let mut missing = None;
+        let result = with_volume_sources(
+            py,
+            options,
+            || {
+                index += 1;
+                let path = self.archive.volume_path(first_path, index);
+                if let Some(path) = path.as_ref().filter(|path| !path.is_file()) {
+                    missing = Some(path.clone());
+                    return Ok(None);
+                }
+                Ok(path.map(VolumeSource::Path))
+            },
+            run,
+        )?;
+        result.map_err(|error| match &missing {
+            Some(path) if is_missing_volume(&error) => {
+                map_error_with(py, error, &format!(": {}", path.display()))
+            }
+            _ => map_error(error),
+        })
+    }
+
     fn resolve_index(&self, member: &Bound<'_, PyAny>) -> PyResult<usize> {
         if let Ok(info) = member.extract::<PyRef<'_, RarInfo>>() {
             if !info
@@ -900,11 +983,13 @@ impl RarFile {
         password: Option<Vec<u8>>,
         options: Option<&ReadOptions>,
     ) -> PyResult<Self> {
-        Self::parse(py, password, options, |options| {
-            // Payload reads reopen the path, so retain its meaning across chdir.
-            let path = std::path::absolute(path)?;
-            rars_rs::ArchiveReader::read_path_with_options(path, options)
-        })
+        // Payload reads reopen the path, so retain its meaning across chdir.
+        let path = std::path::absolute(path)?;
+        let mut file = Self::parse(py, password, options, |options| {
+            rars_rs::ArchiveReader::read_path_with_options(&path, options)
+        })?;
+        file.path = Some(path);
+        Ok(file)
     }
 
     fn parse(
@@ -935,6 +1020,7 @@ impl RarFile {
             identity,
             encoding,
             archive,
+            path: None,
             password,
             infos,
             names: OnceLock::new(),
@@ -1173,6 +1259,7 @@ impl RarBuilder {
                 identity: archive.identity.clone(),
                 encoding: None,
                 archive: archive.archive.clone(),
+                path: archive.path.clone(),
                 password: archive.password.clone(),
                 infos: archive.infos.clone(),
                 names: OnceLock::new(),
@@ -2109,56 +2196,66 @@ fn extract_archive<S: Selection>(
     Ok(out)
 }
 
-/// Runs `run` with an iterator that pulls each later volume, as a path or bytes,
-/// from a Python iterable. The GIL is released except while it is advanced, and
-/// an exception it raises is re-raised as itself.
-fn with_python_volumes<T: Send>(
+/// Runs `run` without the GIL over the volumes `next` gives; an exception `next` raises wins over `run`'s error.
+fn with_volume_sources<T: Send>(
     py: Python<'_>,
-    volumes: &Bound<'_, PyAny>,
     options: rars_rs::ArchiveReadOptions<'_>,
+    mut next: impl FnMut() -> PyResult<Option<VolumeSource>> + Send,
     run: impl FnOnce(
             &mut (dyn Iterator<Item = rars_rs::Result<rars_rs::Archive>> + Send),
         ) -> rars_rs::Result<T>
         + Send,
-) -> PyResult<T> {
-    let iterator = volumes.try_iter()?.unbind();
+) -> PyResult<rars_rs::Result<T>> {
     let raised: Mutex<Option<PyErr>> = Mutex::new(None);
     let result = py.detach(|| {
         // Keeps one RAR 5 key derivation for the whole set.
         let mut session = rars_rs::ReadSession::new(options);
-        let mut pulled = std::iter::from_fn(|| {
-            let source = Python::attach(|py| -> PyResult<Option<VolumeSource>> {
-                let Some(volume) = iterator.bind(py).clone().next() else {
-                    return Ok(None);
-                };
-                let volume = volume?;
-                if let Ok(bytes) = volume.extract::<Vec<u8>>() {
-                    return Ok(Some(VolumeSource::Bytes(bytes)));
-                }
-                Ok(Some(VolumeSource::Path(std::path::absolute(py_path_buf(
-                    py, &volume,
-                )?)?)))
-            });
-            match source {
-                Ok(None) => None,
-                Ok(Some(VolumeSource::Bytes(bytes))) => Some(
-                    rars_rs::ArchiveReader::read_owned_with_options(bytes, options),
-                ),
-                Ok(Some(VolumeSource::Path(path))) => Some(session.read_path(path)),
-                Err(error) => {
-                    *raised.lock().expect("raised lock poisoned") = Some(error);
-                    Some(Err(rars_rs::Error::InvalidArgument(
-                        "volumes raised an exception",
-                    )))
-                }
+        let mut pulled = std::iter::from_fn(|| match next() {
+            Ok(None) => None,
+            Ok(Some(VolumeSource::Bytes(bytes))) => Some(
+                rars_rs::ArchiveReader::read_owned_with_options(bytes, options),
+            ),
+            Ok(Some(VolumeSource::Path(path))) => Some(session.read_path(path)),
+            Err(error) => {
+                *raised.lock().expect("raised lock poisoned") = Some(error);
+                Some(Err(rars_rs::Error::InvalidArgument(
+                    "volumes raised an exception",
+                )))
             }
         });
         run(&mut pulled)
     });
-    if let Some(error) = raised.into_inner().expect("raised lock poisoned") {
-        return Err(error);
+    match raised.into_inner().expect("raised lock poisoned") {
+        Some(error) => Err(error),
+        None => Ok(result),
     }
-    result.map_err(map_error)
+}
+
+fn is_missing_volume(error: &rars_rs::Error) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(error) = current {
+        // Wrapped errors expose their source as a `Box<Error>`.
+        let error_ref = error.downcast_ref::<rars_rs::Error>().or_else(|| {
+            error
+                .downcast_ref::<Box<rars_rs::Error>>()
+                .map(|boxed| &**boxed)
+        });
+        if matches!(
+            error_ref,
+            Some(rars_rs::Error::InvalidHeader("volume is missing"))
+        ) {
+            return true;
+        }
+        current = error.source();
+    }
+    false
+}
+
+/// `error` as Python would raise it, with `detail` appended to its message.
+fn map_error_with(py: Python<'_>, error: rars_rs::Error, detail: &str) -> PyErr {
+    let error = map_error(error);
+    let message = format!("{}{detail}", error.value(py));
+    PyErr::from_type(error.get_type(py), message)
 }
 
 enum VolumeSource {
@@ -2348,23 +2445,9 @@ fn set_no_follow(options: &mut fs::OpenOptions) {
 fn set_no_follow(_options: &mut fs::OpenOptions) {}
 
 fn legacy_volume_part_path(first_path: &Path, index: usize) -> PyResult<PathBuf> {
-    if index == 0 {
-        return Ok(first_path.to_path_buf());
-    }
-    if index > 100 {
-        return Err(PyValueError::new_err(
-            "legacy RAR volume names only support .r00 through .r99",
-        ));
-    }
-    // RAR follows the case of the first extension: A.RAR, A.R00; a.rar, a.r00.
-    let letter = match first_path
-        .extension()
-        .and_then(|extension| extension.as_encoded_bytes().first())
-    {
-        Some(b'R') => 'R',
-        _ => 'r',
-    };
-    Ok(first_path.with_extension(format!("{letter}{:02}", index - 1)))
+    rars_rs::volume_name::old_style(first_path, index).ok_or_else(|| {
+        PyValueError::new_err("legacy RAR volume names only support .r00 through .r99")
+    })
 }
 
 fn rar50_volume_part_path(
@@ -2372,43 +2455,9 @@ fn rar50_volume_part_path(
     index: usize,
     total_parts: usize,
 ) -> PyResult<PathBuf> {
-    let parent = first_path.parent().unwrap_or_else(|| Path::new(""));
-    let file_name = first_path
-        .file_name()
-        .ok_or_else(|| PyValueError::new_err("RAR 5 volume path needs a file name"))?
-        .to_string_lossy();
-    let stem = rar50_volume_stem(&file_name);
     let width = total_parts.to_string().len().max(2);
-    // Keep the first name's ".rar" as written, as RAR does: A.RAR, A.part01.RAR.
-    let suffix = file_name
-        .len()
-        .checked_sub(4)
-        .and_then(|start| file_name.get(start..))
-        .filter(|suffix| suffix.eq_ignore_ascii_case(".rar"))
-        .unwrap_or(".rar");
-    Ok(parent.join(format!(
-        "{stem}.part{:0width$}{suffix}",
-        index + 1,
-        width = width
-    )))
-}
-
-fn rar50_volume_stem(file_name: &str) -> &str {
-    let without_rar = file_name
-        .len()
-        .checked_sub(4)
-        .filter(|&start| {
-            file_name
-                .get(start..)
-                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".rar"))
-        })
-        .map_or(file_name, |start| &file_name[..start]);
-    if let Some((base, digits)) = without_rar.rsplit_once(".part") {
-        if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) {
-            return base;
-        }
-    }
-    without_rar
+    rars_rs::volume_name::part_style(first_path, index, width)
+        .ok_or_else(|| PyValueError::new_err("RAR 5 volume path needs a file name"))
 }
 
 fn map_io_error(error: io::Error) -> PyErr {
@@ -2732,6 +2781,7 @@ mod tests {
                     infos: archive.members().map(info_from_member).collect(),
                     names: OnceLock::new(),
                     archive,
+                    path: None,
                     password: None,
                 };
                 let token = CancellationToken::new();
@@ -2936,6 +2986,7 @@ mod tests {
                             identity: Arc::new(()),
                             encoding: None,
                             archive,
+                            path: None,
                             password: None,
                             infos: Vec::new(),
                             names: OnceLock::new(),

@@ -4,47 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub(crate) fn volume_part_path(first_path: &Path, index: usize) -> CliResult<PathBuf> {
-    if index == 0 {
-        return Ok(first_path.to_path_buf());
-    }
-    // Extension-based RAR volume names are finite: first .rar, then .r00
-    // through .r99. Later RAR families use part-number names instead.
-    if index > 100 {
-        return Err("RAR 1.4 old-style volume names only support .r00 through .r99 here".into());
-    }
-    Ok(first_path.with_extension(format!(
-        "{}{:02}",
-        legacy_volume_letter(first_path),
-        index - 1
-    )))
-}
-
-/// RAR names the volumes after `A.RAR` `A.R00`, `A.R01` and so on, and after
-/// `A.rar` `A.r00`: the letter follows the case of the first volume's
-/// extension. On a case-sensitive filesystem unrar looks only for that name.
-fn legacy_volume_letter(first_path: &Path) -> char {
-    match first_path
-        .extension()
-        .and_then(|extension| extension.as_encoded_bytes().first())
-    {
-        Some(b'R') => 'R',
-        _ => 'r',
-    }
-}
-
-/// The first volume's `.rar` as it was written, so `A.RAR` gives
-/// `A.part01.RAR` as RAR itself names them.
-fn rar_suffix(file_name: &[u8]) -> &str {
-    match file_name
-        .len()
-        .checked_sub(4)
-        .map(|start| &file_name[start..])
-    {
-        Some(suffix) if suffix.eq_ignore_ascii_case(b".rar") => {
-            std::str::from_utf8(suffix).expect("ASCII suffix")
-        }
-        _ => ".rar",
-    }
+    Ok(rars::volume_name::old_style(first_path, index)
+        .ok_or("RAR 1.4 old-style volume names only support .r00 through .r99 here")?)
 }
 
 pub(crate) fn rar50_volume_part_path(
@@ -52,42 +13,9 @@ pub(crate) fn rar50_volume_part_path(
     index: usize,
     total_parts: usize,
 ) -> CliResult<PathBuf> {
-    let parent = first_path.parent().unwrap_or_else(|| Path::new(""));
-    let file_name = rars::filename::native_bytes(
-        first_path
-            .file_name()
-            .ok_or("RAR 5 volume path needs a file name")?,
-    )?;
-    let stem = rar50_volume_stem(file_name);
     let width = total_parts.to_string().len().max(2);
-    // Unix accepts any native bytes; elsewhere removing ASCII suffixes keeps UTF-8 valid.
-    let mut name = rars::filename::native_string(stem)
-        .expect("stem from a native filename remains representable");
-    name.push(format!(
-        ".part{:0width$}{}",
-        index + 1,
-        rar_suffix(file_name)
-    ));
-    Ok(parent.join(name))
-}
-
-fn rar50_volume_stem(file_name: &[u8]) -> &[u8] {
-    let without_rar =
-        if file_name.len() >= 4 && file_name[file_name.len() - 4..].eq_ignore_ascii_case(b".rar") {
-            &file_name[..file_name.len() - 4]
-        } else {
-            file_name
-        };
-    if let Some(pos) = without_rar
-        .windows(5)
-        .rposition(|s| s.eq_ignore_ascii_case(b".part"))
-    {
-        let digits = &without_rar[pos + 5..];
-        if !digits.is_empty() && digits.iter().all(u8::is_ascii_digit) {
-            return &without_rar[..pos];
-        }
-    }
-    without_rar
+    Ok(rars::volume_name::part_style(first_path, index, width)
+        .ok_or("RAR 5 volume path needs a file name")?)
 }
 
 pub(crate) fn sort_volume_paths(paths: &mut [PathBuf]) {
