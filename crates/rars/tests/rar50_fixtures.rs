@@ -6860,3 +6860,48 @@ fn head_crypt_kdf_count(bytes: &[u8]) -> u8 {
     read_vint(&mut pos); // encryption flags
     bytes[pos]
 }
+
+fn assert_final_match_overrun_members(entries: &[(Vec<u8>, Vec<u8>)]) {
+    let [(first_name, first), (second_name, second)] = entries else {
+        panic!("expected two members, got {}", entries.len());
+    };
+    assert_eq!(first_name, b"first.bin");
+    assert_eq!(second_name, b"second.bin");
+    assert_eq!(first.len(), 1990);
+    assert_eq!(first[1000..], first[..990]);
+    assert_eq!(second.len(), 1050);
+    assert_eq!(second[..500], first[..500]);
+    assert_eq!(second[550..], first[500..1000]);
+}
+
+#[test]
+fn final_match_past_the_declared_size_truncates_and_feeds_the_solid_member() {
+    let bytes = std::fs::read(fixture("final_match_overrun.rar")).unwrap();
+    let archive = Archive::parse(&bytes).unwrap();
+    let buffered: Vec<_> = collect_extract(&archive)
+        .unwrap()
+        .into_iter()
+        .map(|entry| (entry.name, entry.data))
+        .collect();
+    assert_final_match_overrun_members(&buffered);
+
+    let streamed = RefCell::new(Vec::new());
+    archive
+        .extract_to(
+            ArchiveReadOptions::default().with_rar50_buffered_decode_limit(0),
+            |meta| {
+                let data = Rc::new(RefCell::new(Vec::new()));
+                streamed
+                    .borrow_mut()
+                    .push((meta.name.clone(), Rc::clone(&data)));
+                Ok(Box::new(CollectWriter { data }))
+            },
+        )
+        .unwrap();
+    let streamed: Vec<_> = streamed
+        .into_inner()
+        .into_iter()
+        .map(|(name, data)| (name, data.take()))
+        .collect();
+    assert_final_match_overrun_members(&streamed);
+}

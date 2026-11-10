@@ -8489,3 +8489,28 @@ fn rejects_corrupted_rar20_unix_owner_name_from_path() {
         Err(Error::CrcMismatch { .. })
     ));
 }
+
+#[test]
+fn final_match_past_the_declared_size_truncates_and_feeds_the_solid_member() {
+    for name in ["rar15", "rar20", "rar29"] {
+        let bytes = std::fs::read(fixture(&format!("final_match_overrun/{name}.rar"))).unwrap();
+        let archive = Archive::parse(&bytes).unwrap();
+        let entries = RefCell::new(Vec::new());
+        archive
+            .extract_to(ArchiveReadOptions::default(), |meta| {
+                let data = Rc::new(RefCell::new(Vec::new()));
+                entries.borrow_mut().push(Rc::clone(&data));
+                Ok(Box::new(CollectWriter { data }))
+            })
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        let entries: Vec<_> = entries.into_inner().into_iter().map(|d| d.take()).collect();
+        let [first, second] = &entries[..] else {
+            panic!("{name}: expected two members");
+        };
+        assert_eq!(first.len(), 1990, "{name}");
+        assert_eq!(first[1000..], first[..990], "{name}");
+        assert_eq!(second.len(), 1050, "{name}");
+        assert_eq!(second[..500], first[..500], "{name}");
+        assert_eq!(second[550..], first[500..1000], "{name}");
+    }
+}
