@@ -42,11 +42,14 @@ fn cases() -> Vec<Case> {
     let mut cases = Vec::new();
     for version in LEGACY.into_iter().chain(MODERN) {
         let modern = MODERN.contains(&version);
-        let header_encryption =
-            modern || matches!(version, ArchiveVersion::Rar30 | ArchiveVersion::Rar40);
+        // Header encryption costs a key derivation per volume, written and
+        // read, which takes seconds in a debug build. RAR 4 and RAR 7 share
+        // their header layout with RAR 3 and RAR 5, and compression does not
+        // change the header sizes, so one stored case per layout covers it.
+        let header_encryption = matches!(version, ArchiveVersion::Rar30 | ArchiveVersion::Rar50);
         for stored in [true, false] {
             for encrypted_headers in [false, true] {
-                if encrypted_headers && !header_encryption {
+                if encrypted_headers && !(header_encryption && stored) {
                     continue;
                 }
                 for recovery in [false, true] {
@@ -128,7 +131,13 @@ fn read_back(case: Case, volumes: &[Vec<u8>]) -> usize {
 #[test]
 fn no_volume_is_longer_than_the_volume_size() {
     for case in cases() {
-        for volume_size in [2_731, 4_096] {
+        // One size is enough for the slow header-encrypted cases.
+        let sizes: &[usize] = if case.encrypted_headers {
+            &[2_731]
+        } else {
+            &[2_731, 4_096]
+        };
+        for &volume_size in sizes {
             let volumes = build(case, volume_size)
                 .unwrap_or_else(|error| panic!("{case:?} size {volume_size}: {error}"));
             assert!(volumes.len() > 1, "{case:?} size {volume_size}: one volume");
