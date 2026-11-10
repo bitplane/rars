@@ -123,4 +123,9 @@ for (const value of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1, -1n, 1n << 64n]) {
   await assert.rejects(QuotaArchive.open(new Uint8Array(), { maxReaderWorkspaceBytes: value }),
     (error) => error.code === "INVALID_OPTION");
 }
+quotaRequests.length = 0;
+await quotaArchive.test({ allowRar3VmPrograms: true });
+assert.deepEqual(quotaRequests, [["test", { allowRar3VmPrograms: true }]]);
+await assert.rejects(quotaArchive.test({ allowRar3VmPrograms: 1 }),
+  (error) => error.code === "INVALID_OPTION");
 console.log("npm reader workspace forwarding checks passed");

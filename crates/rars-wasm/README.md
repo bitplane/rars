@@ -69,6 +69,12 @@ list. Directories are rejected; RAR5 redirections have no readable file payload.
 The cached `archive.comment` is decoded under the options passed to `open()`;
 `readComment()` decodes it again with fresh options and an optional password.
 
+`allowRar3VmPrograms: true` lets RAR 2.9-4.x members run filter programs other
+than the six standard ones (E8, E8E9, Itanium, Delta, RGB and Audio). It is off
+by default because such programs are arbitrary bytecode from the archive and can
+use a lot of CPU time; a member that needs one fails with `UNSUPPORTED_FEATURE`.
+Current WinRAR does not run them either. Enable it only for archives you trust.
+
 Output limits count logical decoded bytes, including discarded solid-prefix
 output. Reading a volume entry currently decodes the whole volume set, so its
 total-output limit includes other members. Limits are not an aggregate RAM

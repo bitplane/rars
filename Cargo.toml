@@ -41,6 +41,9 @@ zeroize = { version = "1.8", default-features = false, features = ["alloc", "zer
 [workspace.lints.rust]
 unsafe_code = "forbid"
 unused_must_use = "deny"
+# cargo-fuzz builds with --cfg fuzzing; rars exposes its RAR 3 VM to the fuzz
+# targets under it.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 
 [workspace.lints.clippy]
 dbg_macro = "warn"

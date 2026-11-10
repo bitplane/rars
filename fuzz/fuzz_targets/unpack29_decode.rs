@@ -11,5 +11,7 @@ fuzz_target!(|data: &[u8]| {
     }
     let output_size = u16::from_le_bytes([data[0], data[1]]) as usize % (MAX_OUTPUT_SIZE + 1);
     let mut decoder = Unpack29::new();
+    // Off by default, but the interpreter still needs fuzzing.
+    decoder.allow_vm_programs(true);
     let _ = decoder.decode_non_solid_member(&data[2..], output_size);
 });

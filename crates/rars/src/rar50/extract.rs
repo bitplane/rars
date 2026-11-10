@@ -1023,7 +1023,7 @@ impl Archive {
     {
         let buffered_decode_limit = rar50_buffered_decode_limit(options);
         let key_cache = super::Rar50KeyCache::default();
-        let publication = crate::read_control::ReadControl::new(options.cancellation);
+        let publication = crate::read_control::ReadControl::for_options(&options);
         let plan = |file: &FileHeader| {
             if file.is_split_before() || file.is_split_after() {
                 // Fails inline, as sequential extraction does.

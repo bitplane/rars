@@ -15,7 +15,11 @@ pub mod rar13;
 pub mod rar20;
 pub mod rar29;
 pub mod rar50;
+// Public only to the fuzz targets, which drive the interpreter directly.
+#[cfg(fuzzing)]
 pub mod rarvm;
+#[cfg(not(fuzzing))]
+mod rarvm;
 pub(crate) mod workspace;
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -26,6 +30,9 @@ pub enum Error {
     InvalidData(&'static str),
     NeedMoreInput,
     Cancelled,
+    /// A RAR 2.9-4.x stream defines a filter program other than the six
+    /// standard ones, and running such programs was not enabled.
+    Rar3VmProgramRefused,
     WorkspaceLimitExceeded(Box<WorkspaceLimitError>),
     /// An error carried by a reader or writer, including typed library errors
     /// transported through `io::Error`. Successful decoding allocates no
@@ -49,6 +56,9 @@ impl std::fmt::Display for Error {
             Self::InvalidData(msg) => write!(f, "{msg}"),
             Self::NeedMoreInput => write!(f, "codec input is truncated"),
             Self::Cancelled => f.write_str("codec operation was cancelled"),
+            Self::Rar3VmProgramRefused => {
+                f.write_str("RAR 3 VM filter program refused: only standard filters are enabled")
+            }
             Self::WorkspaceLimitExceeded(details) => {
                 write!(f,
                 "codec workspace limit {} exceeded: owner requires {} bytes with {} bytes in use",

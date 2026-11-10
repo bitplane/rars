@@ -547,6 +547,9 @@ impl FileHeader {
             | Error::CrcMismatch { .. }
             | Error::Crc32Mismatch { .. }
             | Error::HashMismatch { .. }
+            // A wrong password decrypts to noise, which can decode as a filter
+            // program definition well before any checksum is reached.
+            | Error::Rar3VmProgramRefused
             | Error::WrongPasswordOrCorruptData => Error::WrongPasswordOrCorruptData,
         }
     }
@@ -1321,7 +1324,7 @@ impl Archive {
         #[cfg(feature = "recovery")]
         {
             options.check_cancelled()?;
-            let control = crate::read_control::ReadControl::new(options.cancellation);
+            let control = crate::read_control::ReadControl::for_options(&options);
             let (data, data_repaired) = if let Some(recovery) = self
                 .new_subs()
                 .find(|sub| sub.kind == NewSubKind::RecoveryRecord)
@@ -1637,7 +1640,7 @@ impl Archive {
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
         let emit_links = links.is_some();
-        let publication = crate::read_control::ReadControl::new(options.cancellation);
+        let publication = crate::read_control::ReadControl::for_options(&options);
         let plan = |file: &FileHeader| {
             if file.is_split_before() || file.is_split_after() {
                 // Fails inline, as sequential extraction does.

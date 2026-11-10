@@ -74,7 +74,7 @@ fn main() {
 
 impl From<rars::Error> for CliError {
     fn from(error: rars::Error) -> Self {
-        let message = format!("{error}{}", rar50_buffered_decode_limit_hint(&error));
+        let message = format!("{error}{}", retry_hint(&error));
         if error_is_password_class(&error) {
             Self::password(message)
         } else {
@@ -112,7 +112,11 @@ fn configure_threads(threads: Option<usize>) -> CliResult<()> {
         .map_err(|err| CliError::general(format!("failed to configure parallel workers: {err}")))
 }
 
-fn rar50_buffered_decode_limit_hint(error: &rars::Error) -> String {
+/// A line telling the user which option would let a refused operation run.
+fn retry_hint(error: &rars::Error) -> String {
+    if error.root_cause() == &rars::Error::Rar3VmProgramRefused {
+        return "\nhint: retry with --allow-rar3-vm if you trust this archive".to_string();
+    }
     let Some((_, required)) = find_rar50_buffered_decode_limit_error(error) else {
         return String::new();
     };
@@ -632,7 +636,7 @@ fn cmd_test(args: TestArgs) -> CliResult<()> {
                     format!(
                         "failed to test archive '{}': {err}{}",
                         paths[0].display(),
-                        rar50_buffered_decode_limit_hint(err)
+                        retry_hint(err)
                     )
                 })
             })?;
@@ -662,7 +666,7 @@ fn cmd_test(args: TestArgs) -> CliResult<()> {
                         .map(|p| p.display().to_string())
                         .collect::<Vec<_>>()
                         .join(", "),
-                    rar50_buffered_decode_limit_hint(err)
+                    retry_hint(err)
                 )
             })
         })?;
@@ -725,7 +729,7 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
                     format!(
                         "failed to write extracted entry to '{}': {err}{}",
                         out_dir.display(),
-                        rar50_buffered_decode_limit_hint(err)
+                        retry_hint(err)
                     )
                 } else {
                     format!(
@@ -735,7 +739,7 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
                             .map(|p| p.display().to_string())
                             .collect::<Vec<_>>()
                             .join(", "),
-                        rar50_buffered_decode_limit_hint(err)
+                        retry_hint(err)
                     )
                 }
             })
@@ -3040,7 +3044,7 @@ mod tests {
         assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
     }
 
-    use super::{display_text, parse_size, rar50_buffered_decode_limit_hint};
+    use super::{display_text, parse_size, retry_hint};
     use crate::output::{checked_output_path, output_relative_path, redirection_warning};
     use crate::password::{error_needs_password, should_prompt_password};
     use crate::volumes::{infer_part_index, rar50_volume_part_path, volume_part_path};
@@ -3097,6 +3101,19 @@ mod tests {
     }
 
     #[test]
+    fn rar3_vm_refusal_hint_names_cli_option() {
+        let error = Error::AtEntry {
+            name: b"filtered.bin".to_vec(),
+            operation: "decoding",
+            source: Box::new(Error::Rar3VmProgramRefused),
+        };
+        assert_eq!(
+            retry_hint(&error),
+            "\nhint: retry with --allow-rar3-vm if you trust this archive"
+        );
+    }
+
+    #[test]
     fn rar50_buffered_decode_limit_hint_names_cli_option() {
         let error = Error::AtEntry {
             name: b"large.bin".to_vec(),
@@ -3108,7 +3125,7 @@ mod tests {
         };
 
         assert_eq!(
-            rar50_buffered_decode_limit_hint(&error),
+            retry_hint(&error),
             "\nhint: retry with --rar50-buffered-decode-limit 943718400 if you trust this archive and have enough memory"
         );
         let offset_context = Error::AtArchiveOffset {
@@ -3119,7 +3136,7 @@ mod tests {
             super::find_rar50_buffered_decode_limit_error(&offset_context),
             Some((512 * 1024 * 1024, 900 * 1024 * 1024))
         );
-        assert!(rar50_buffered_decode_limit_hint(&offset_context).contains("943718400"));
+        assert!(retry_hint(&offset_context).contains("943718400"));
     }
 
     #[test]

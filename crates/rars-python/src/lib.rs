@@ -142,13 +142,15 @@ struct ReadOptions {
     rar50_dictionary_size_limit: Option<u64>,
     #[pyo3(get)]
     rar50_buffered_decode_limit: Option<u64>,
+    #[pyo3(get)]
+    allow_rar3_vm_programs: bool,
 }
 
 #[pymethods]
 impl ReadOptions {
     #[new]
     #[allow(clippy::too_many_arguments)] // Python keyword-only policy fields.
-    #[pyo3(signature = (*, cancellation=None, max_member_output_bytes=None, max_total_output_bytes=None, max_reader_workspace_bytes=None, rar50_dictionary_size_limit=None, rar50_buffered_decode_limit=None, max_header_count=None, max_header_bytes=None, legacy_name_encoding=None))]
+    #[pyo3(signature = (*, cancellation=None, max_member_output_bytes=None, max_total_output_bytes=None, max_reader_workspace_bytes=None, rar50_dictionary_size_limit=None, rar50_buffered_decode_limit=None, max_header_count=None, max_header_bytes=None, legacy_name_encoding=None, allow_rar3_vm_programs=false))]
     fn new(
         cancellation: Option<&CancellationToken>,
         max_member_output_bytes: Option<u64>,
@@ -159,6 +161,7 @@ impl ReadOptions {
         max_header_count: Option<u64>,
         max_header_bytes: Option<u64>,
         legacy_name_encoding: Option<String>,
+        allow_rar3_vm_programs: bool,
     ) -> PyResult<Self> {
         let encoding = legacy_name_encoding
             .as_deref()
@@ -176,6 +179,7 @@ impl ReadOptions {
             rar50_buffered_decode_limit,
             max_header_count,
             max_header_bytes,
+            allow_rar3_vm_programs,
         })
     }
 
@@ -202,6 +206,7 @@ fn python_read_options<'a>(
         options.max_reader_workspace_bytes = settings.max_reader_workspace_bytes;
         options.rar50_dictionary_size_limit = settings.rar50_dictionary_size_limit;
         options.rar50_buffered_decode_limit = settings.rar50_buffered_decode_limit;
+        options.allow_rar3_vm_programs = settings.allow_rar3_vm_programs;
     }
     options
 }
@@ -2693,9 +2698,19 @@ mod tests {
                     password: None,
                 };
                 let token = CancellationToken::new();
-                let options =
-                    ReadOptions::new(Some(&token), None, None, None, None, None, None, None, None)
-                        .unwrap();
+                let options = ReadOptions::new(
+                    Some(&token),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                )
+                .unwrap();
                 let cancel_object = Py::new(py, token).unwrap();
                 armed.store(true, Ordering::Relaxed);
                 let worker = std::thread::spawn(move || {

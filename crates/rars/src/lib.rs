@@ -236,6 +236,19 @@ pub struct ArchiveReadOptions<'a> {
     /// borrow a sibling's spare. Insufficient allowance returns ResourceLimit;
     /// increase the limit or use sequential extraction. Partial output can remain.
     pub max_reader_workspace_bytes: Option<u64>,
+    /// Run RAR 2.9-4.x filter programs other than the six standard ones
+    /// (E8, E8E9, Itanium, Delta, RGB and Audio). Off by default.
+    ///
+    /// The standard filters always run, as native code. Any other program is
+    /// arbitrary RARVM bytecode from the archive. It runs in a sandbox with no
+    /// I/O, but each run may execute up to 25 million instructions and an
+    /// archive may run programs many times, so an untrusted archive can cost a
+    /// lot of CPU time. When this is off, a member that defines such a
+    /// program fails with [`Error::Rar3VmProgramRefused`], whose
+    /// [`ErrorKind`] is `UnsupportedFeature`. Current WinRAR and unrar do not
+    /// run these programs either; WinRAR 3.x did. Enable this for trusted
+    /// archives that need them. Parsing does not retain it.
+    pub allow_rar3_vm_programs: bool,
 }
 
 impl<'a> ArchiveReadOptions<'a> {
@@ -320,6 +333,13 @@ impl<'a> ArchiveReadOptions<'a> {
     /// Enables caller-configured disk scratch for large RAR5/7 members.
     pub fn with_rar50_scratch(mut self, scratch: &'a Rar50Scratch) -> Self {
         self.rar50_scratch = Some(scratch);
+        self
+    }
+
+    /// Allows RAR 2.9-4.x filter programs other than the six standard ones to
+    /// run. See [`ArchiveReadOptions::allow_rar3_vm_programs`].
+    pub fn with_rar3_vm_programs(mut self, allow: bool) -> Self {
+        self.allow_rar3_vm_programs = allow;
         self
     }
 }
@@ -1389,7 +1409,7 @@ impl ArchiveReader {
         let len = source.len()?;
         let mut cursor = reader.cursor();
         let signature = read_archive_signature(
-            &mut crate::read_control::ReadControl::new(options.cancellation).reader(&mut cursor),
+            &mut crate::read_control::ReadControl::for_options(&options).reader(&mut cursor),
             len.min(SFX_SCAN_LIMIT),
         )?;
         options.check_cancelled()?;

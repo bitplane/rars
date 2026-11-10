@@ -27,6 +27,13 @@ fn public_decoder_clone_keeps_independent_lz_and_ppmd_solid_state() {
     }
 }
 
+/// Decodes with non-standard VM programs allowed, for tests of the interpreter.
+fn unpack29_decode_with_vm(input: &[u8], output_size: usize) -> Result<Vec<u8>> {
+    let mut decoder = super::Unpack29::new();
+    decoder.allow_vm_programs(true);
+    decoder.decode_non_solid_member(input, output_size)
+}
+
 fn refuse_each_rar29_allocation(
     mut run: impl FnMut(&crate::codec::workspace::RefusingBudget) -> Result<()>,
 ) {
@@ -99,6 +106,9 @@ fn reader_rar29_refusals_release_vm_code_records_globals_execution_and_filters()
     .unwrap();
     refuse_each_rar29_allocation(|budget| {
         let mut state = super::Reader29State::with_allowance(budget);
+        state
+            .read_control
+            .set_rar3_vm_programs(crate::read_control::Rar3VmPrograms::Run);
         let decoded = state.decode_member_owned(&packed, 2)?;
         assert_eq!(&decoded[..], b"AB");
         let checkpoint = state.try_clone()?;
@@ -3704,7 +3714,11 @@ fn generic_vm_filter_uses_explicit_then_retained_user_globals() {
     )
     .unwrap();
 
-    assert_eq!(unpack29_decode(&packed, 2).unwrap(), b"AB");
+    assert_eq!(unpack29_decode_with_vm(&packed, 2).unwrap(), b"AB");
+    assert_eq!(
+        unpack29_decode(&packed, 2),
+        Err(Error::Rar3VmProgramRefused)
+    );
 }
 
 #[test]
@@ -4172,7 +4186,7 @@ fn archive_decoder_rejects_invalid_vm_program_records() {
             None,
         )
         .unwrap();
-        assert_eq!(unpack29_decode(&packed, 1), Err(expected));
+        assert_eq!(unpack29_decode_with_vm(&packed, 1), Err(expected));
     }
 }
 
@@ -4201,7 +4215,7 @@ fn archive_decoder_rejects_generic_vm_block_larger_than_work_memory() {
     .unwrap();
 
     assert_eq!(
-        unpack29_decode(&packed, TOO_LARGE),
+        unpack29_decode_with_vm(&packed, TOO_LARGE),
         Err(Error::InvalidData("RARVM filter input is too large"))
     );
 }

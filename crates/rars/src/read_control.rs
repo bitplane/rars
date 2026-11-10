@@ -53,8 +53,19 @@ impl ReadCancellation {
     }
 }
 
+/// Per-operation cancellation, plus the read policy decoders need to see
+/// without each one taking the whole of [`crate::ArchiveReadOptions`].
 #[derive(Clone, Debug, Default)]
-pub(crate) struct ReadControl(Option<Arc<Observation>>);
+pub(crate) struct ReadControl(Option<Arc<Observation>>, Rar3VmPrograms);
+
+/// Whether RAR 3 decoding may run filter programs other than the six
+/// standard ones, which always run as native code.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Rar3VmPrograms {
+    #[default]
+    Refuse,
+    Run,
+}
 
 #[derive(Debug)]
 struct Observation {
@@ -72,15 +83,31 @@ impl ReadControl {
     pub(crate) fn is_enabled(&self) -> bool {
         self.0.is_some()
     }
+    pub(crate) fn for_options(options: &crate::ArchiveReadOptions<'_>) -> Self {
+        let mut control = Self::new(options.cancellation);
+        if options.allow_rar3_vm_programs {
+            control.1 = Rar3VmPrograms::Run;
+        }
+        control
+    }
+    pub(crate) fn rar3_vm_programs(&self) -> Rar3VmPrograms {
+        self.1
+    }
+    pub(crate) fn set_rar3_vm_programs(&mut self, programs: Rar3VmPrograms) {
+        self.1 = programs;
+    }
     pub(crate) fn new(token: Option<&ReadCancellation>) -> Self {
-        Self(token.map(|token| {
-            Arc::new(Observation {
-                token: token.clone(),
-                observed: AtomicBool::new(false),
-                #[cfg(test)]
-                checks_remaining: std::sync::atomic::AtomicUsize::new(usize::MAX),
-            })
-        }))
+        Self(
+            token.map(|token| {
+                Arc::new(Observation {
+                    token: token.clone(),
+                    observed: AtomicBool::new(false),
+                    #[cfg(test)]
+                    checks_remaining: std::sync::atomic::AtomicUsize::new(usize::MAX),
+                })
+            }),
+            Rar3VmPrograms::Refuse,
+        )
     }
     pub(crate) fn check(&self) -> Result<()> {
         if let Some(state) = &self.0 {

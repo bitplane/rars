@@ -1,3 +1,7 @@
+//! The RAR 2.9-4.x virtual machine, for filter programs other than the six
+//! standard ones. Decoding reaches it only when
+//! `ArchiveReadOptions::allow_rar3_vm_programs` is set. The `Program` wrapper
+//! with plain vectors exists for the unit tests and fuzz targets.
 use super::workspace::{Allowance, Budget, Buffer};
 use super::{Error, Result};
 
@@ -12,12 +16,14 @@ const FLAG_C: u32 = 1;
 const FLAG_Z: u32 = 2;
 const FLAG_S: u32 = 0x8000_0000;
 
+#[cfg(any(test, fuzzing))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Program {
     pub static_data: Vec<u8>,
     pub instructions: Vec<Instruction>,
 }
 
+#[cfg(any(test, fuzzing))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Instruction {
     pub opcode: Opcode,
@@ -88,6 +94,7 @@ pub struct Invocation<'a> {
     pub exec_count: u32,
 }
 
+#[cfg(any(test, fuzzing))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionResult {
     pub output: Vec<u8>,
@@ -95,6 +102,7 @@ pub struct ExecutionResult {
     pub regs: [u32; 8],
 }
 
+#[cfg(any(test, fuzzing))]
 impl Program {
     pub fn parse(blob: &[u8]) -> Result<Self> {
         OwnedProgram::parse(blob, &Allowance::default()).map(OwnedProgram::into_public)
@@ -223,6 +231,7 @@ impl From<Program> for OwnedProgram<Allowance> {
         }
     }
 }
+#[cfg(any(test, fuzzing))]
 impl OwnedProgram<Allowance> {
     fn into_public(self) -> Program {
         Program {
@@ -250,6 +259,7 @@ trait ProgramCode {
     fn instruction(&self, index: usize) -> Option<InstructionRef<'_>>;
     fn instruction_count(&self) -> usize;
 }
+#[cfg(any(test, fuzzing))]
 impl ProgramCode for Program {
     fn static_data(&self) -> &[u8] {
         &self.static_data
@@ -288,8 +298,10 @@ impl<B: Budget> ProgramCode for OwnedProgram<B> {
 pub(crate) struct OwnedExecutionResult<B: Budget> {
     pub(crate) output: Buffer<u8, B>,
     pub(crate) globals: Buffer<u8, B>,
+    #[cfg(any(test, fuzzing))]
     pub(crate) regs: [u32; 8],
 }
+#[cfg(any(test, fuzzing))]
 impl OwnedExecutionResult<Allowance> {
     fn into_public(self) -> ExecutionResult {
         ExecutionResult {
@@ -635,6 +647,7 @@ impl<B: Budget> Vm<B> {
         Ok(OwnedExecutionResult {
             output,
             globals,
+            #[cfg(any(test, fuzzing))]
             regs: self.regs,
         })
     }

@@ -120,16 +120,16 @@ check('comments passwords and indexed volume extraction round trip', () => {
     archive.test();archive.free();builder.free();
   }
   for (const format of ['rar14', 'rar29', 'rar50', 'rar70']) {
-    const builder = new engine.RarBuilder({format, store: true, volumeSize: 64});
-    builder.addBytes('file', bytes('payload'.repeat(30)));
+    const builder = new engine.RarBuilder({format, store: true, volumeSize: 300});
+    builder.addBytes('file', bytes('payload'.repeat(100)));
     if (format === 'rar50' || format === 'rar70') builder.addBytes('later', bytes('last member'));
     const parts = builder.toVolumes();
     assert.ok(parts.length > 1);
     const archive = engine.RarFile.openVolumes(parts);
-    assert.deepEqual(archive.readAt(0), bytes('payload'.repeat(30)));
-    assert.deepEqual(archive.read('file'), bytes('payload'.repeat(30)));
+    assert.deepEqual(archive.readAt(0), bytes('payload'.repeat(100)));
+    assert.deepEqual(archive.read('file'), bytes('payload'.repeat(100)));
     if (format === 'rar50' || format === 'rar70') assert.deepEqual(archive.read('later'), bytes('last member'));
-    assert.deepEqual(archive.readMany([0, 0]), [bytes('payload'.repeat(30)), bytes('payload'.repeat(30))]);
+    assert.deepEqual(archive.readMany([0, 0]), [bytes('payload'.repeat(100)), bytes('payload'.repeat(100))]);
     refuses(() => archive.read('missing'), 'ENTRY_NOT_FOUND');
     refuses(() => archive.readAt(0, undefined, {maxMemberOutputBytes: 'bad'}), 'INVALID_OPTION');
     refuses(() => archive.test(undefined, {maxMemberOutputBytes: 'bad'}), 'INVALID_OPTION');
@@ -159,7 +159,7 @@ check('null options and resource-aware stored outputs retain their defaults', ()
   for (const format of ['rar14', 'rar29', 'rar50']) {
     const builder = new engine.RarBuilder({format, store: true, compression: null,
       password: null, comment: null, maxMemoryBytes: 64n * 1024n * 1024n});
-    builder.addBytesRaw(bytes('file'), bytes('payload'.repeat(30)), {mtime: null, mode: null});
+    builder.addBytesRaw(bytes('file'), bytes('payload'.repeat(100)), {mtime: null, mode: null});
     if (format !== 'rar50') {
       refuses(() => builder.toBytes(), 'UNSUPPORTED_FEATURE');
       refuses(() => builder.toVolumes(), 'UNSUPPORTED_FEATURE');
@@ -167,10 +167,10 @@ check('null options and resource-aware stored outputs retain their defaults', ()
     }
     const archive = new engine.RarFile(builder.toBytes(), null, null);
     archive.test(null, null);
-    assert.deepEqual(archive.read('file', null, null), bytes('payload'.repeat(30)));
+    assert.deepEqual(archive.read('file', null, null), bytes('payload'.repeat(100)));
     assert.equal(archive.readComment(null, null), undefined);archive.free();
-    const volumeBuilder = new engine.RarBuilder({format, store: true, volumeSize: 64, maxMemoryBytes: 64n * 1024n * 1024n});
-    volumeBuilder.addBytes('file', bytes('payload'.repeat(30)));
+    const volumeBuilder = new engine.RarBuilder({format, store: true, volumeSize: 300, maxMemoryBytes: 64n * 1024n * 1024n});
+    volumeBuilder.addBytes('file', bytes('payload'.repeat(100)));
     const volumes = engine.RarFile.openVolumes(volumeBuilder.toVolumes(), undefined, {legacyNameEncoding: null});
     volumes.test();volumes.free();volumeBuilder.free();builder.free();
   }

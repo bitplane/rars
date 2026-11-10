@@ -106,6 +106,9 @@ pub enum Error {
     CannotSkipSolidMember,
     /// An earlier member of this solid chain failed, so its history is gone.
     BrokenSolidChain,
+    /// A RAR 2.9-4.x member defines a filter program other than the six
+    /// standard ones, and `ArchiveReadOptions::allow_rar3_vm_programs` is off.
+    Rar3VmProgramRefused,
     UnsupportedFeature {
         version: ArchiveVersion,
         feature: &'static str,
@@ -258,6 +261,10 @@ impl std::fmt::Display for Error {
             Self::UnsupportedVersion(version) => write!(f, "unsupported version: {version}"),
             Self::FeatureDisabled { feature } => write!(f, "Cargo feature {feature} is disabled"),
             Self::CannotSkipSolidMember => write!(f, "cannot skip file data in a solid archive"),
+            Self::Rar3VmProgramRefused => write!(
+                f,
+                "archive uses a custom RAR 3 VM filter program; enable allow_rar3_vm_programs to run it"
+            ),
             Self::BrokenSolidChain => {
                 write!(f, "an earlier member of this solid archive failed to extract")
             }
@@ -436,6 +443,7 @@ impl Error {
             | Self::Rar50Crypto(crate::crypto::rar50::Error::FeatureDisabled)
             | Self::CannotSkipSolidMember
             | Self::BrokenSolidChain
+            | Self::Rar3VmProgramRefused
             | Self::UnsupportedFeature { .. }
             | Self::UnsupportedFamilyFeature { .. }
             | Self::UnsupportedCompression { .. }
@@ -507,6 +515,7 @@ impl From<crate::codec::Error> for Error {
     fn from(error: crate::codec::Error) -> Self {
         match error {
             crate::codec::Error::Cancelled => Self::Cancelled,
+            crate::codec::Error::Rar3VmProgramRefused => Self::Rar3VmProgramRefused,
             crate::codec::Error::Io(error) => *error,
             error => Self::Codec(error),
         }
