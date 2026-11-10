@@ -85,6 +85,7 @@ mod rewrite;
 mod rewrite_staging;
 #[cfg(feature = "write")]
 pub use rewrite_staging::RewriteStaging;
+mod output_pipeline;
 mod source;
 mod stored_copy;
 #[cfg(feature = "write")]

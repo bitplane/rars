@@ -1,6 +1,7 @@
 use std::io::{ErrorKind, Read, Write};
 
 use crate::codec::workspace::Budget;
+use crate::output_pipeline::{self, PipeError};
 
 #[derive(Debug)]
 pub(crate) enum CopyError {
@@ -31,124 +32,36 @@ where
     B: Budget,
 {
     let limit = if padded { size } else { u64::MAX };
-    if size > INLINE_LIMIT && crate::parallel::may_spawn() {
-        let mut charge = allowance.charge();
-        if B::resize(&mut charge, (CHUNK * BUFFERS) as u64).is_ok() {
-            return pipelined(reader, limit, check, writer);
-        }
+    if let Some(_charge) = output_pipeline::admit(size, allowance) {
+        return output_pipeline::run(|chunks| produce(reader, limit, chunks), check, writer)
+            .map_err(|error| match error {
+                PipeError::Produce(error) => CopyError::Read(error),
+                PipeError::Write(error) => CopyError::Write(error),
+            });
     }
     inline(reader, limit, check, writer)
 }
 
-const INLINE_LIMIT: u64 = 256 << 10;
-const CHUNK: usize = 1 << 20;
-const BUFFERS: usize = 4;
-
-/// Overlaps reading, checksumming and writing; each buffer's last holder returns it so the reader never starves.
-fn pipelined<R, C>(
+fn produce<R: Read>(
     reader: &mut R,
     limit: u64,
-    check: &mut C,
-    writer: &mut dyn Write,
-) -> Result<u64, CopyError>
-where
-    R: Read + Send,
-    C: FnMut(&[u8]) + Send,
-{
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{mpsc, Arc};
-
-    let stop = AtomicBool::new(false);
-    let (spare_tx, spare_rx) = mpsc::sync_channel::<Vec<u8>>(BUFFERS);
-    let (full_tx, full_rx) = mpsc::sync_channel::<std::io::Result<Arc<Vec<u8>>>>(BUFFERS);
-    let (check_tx, check_rx) = mpsc::sync_channel::<Arc<Vec<u8>>>(BUFFERS);
-    let give_back = |chunk: Arc<Vec<u8>>, spare: &mpsc::SyncSender<Vec<u8>>| {
-        if let Some(buffer) = Arc::into_inner(chunk) {
-            let _ = spare.send(buffer);
+    chunks: &mut output_pipeline::Chunks<'_>,
+) -> std::io::Result<u64> {
+    let mut read = 0u64;
+    let mut written = 0u64;
+    loop {
+        let count = match reader.read(chunks.space()?) {
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            count => count?,
+        };
+        if count == 0 {
+            return Ok(written);
         }
-    };
-
-    std::thread::scope(|scope| {
-        let stop = &stop;
-        let producer = scope.spawn(move || {
-            let mut allocated = 0;
-            let mut read = 0u64;
-            let mut written = 0u64;
-            while !stop.load(Ordering::Relaxed) {
-                let mut buffer = match spare_rx.try_recv() {
-                    Ok(buffer) => buffer,
-                    Err(_) if allocated < BUFFERS => {
-                        allocated += 1;
-                        Vec::new()
-                    }
-                    Err(_) => match spare_rx.recv() {
-                        Ok(buffer) => buffer,
-                        Err(_) => break,
-                    },
-                };
-                buffer.resize(CHUNK, 0);
-                let mut filled = 0;
-                let failure = loop {
-                    match reader.read(&mut buffer[filled..]) {
-                        Ok(0) => break None,
-                        Ok(count) => {
-                            filled += count;
-                            if filled == CHUNK {
-                                break None;
-                            }
-                        }
-                        Err(error) if error.kind() == ErrorKind::Interrupted => {}
-                        Err(error) => break Some(error),
-                    }
-                };
-                buffer.truncate(kept_len(read, filled, limit));
-                read = read.saturating_add(filled as u64);
-                written += buffer.len() as u64;
-                if !buffer.is_empty() {
-                    let chunk = Arc::new(buffer);
-                    if check_tx.send(chunk.clone()).is_err() || full_tx.send(Ok(chunk)).is_err() {
-                        break;
-                    }
-                }
-                if let Some(error) = failure {
-                    let _ = full_tx.send(Err(error));
-                    break;
-                }
-                if filled < CHUNK {
-                    break;
-                }
-            }
-            written
-        });
-        let spare = spare_tx.clone();
-        scope.spawn(move || {
-            for chunk in check_rx {
-                check(&chunk);
-                give_back(chunk, &spare);
-            }
-        });
-
-        let mut outcome = Ok(());
-        for item in full_rx {
-            match item {
-                Ok(chunk) => {
-                    if outcome.is_ok() {
-                        if let Err(error) = writer.write_all(&chunk) {
-                            outcome = Err(CopyError::Write(error));
-                            stop.store(true, Ordering::Relaxed);
-                        }
-                    }
-                    give_back(chunk, &spare_tx);
-                }
-                Err(error) if outcome.is_ok() => outcome = Err(CopyError::Read(error)),
-                Err(_) => {}
-            }
-        }
-        let written = producer
-            .join()
-            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-        outcome.map(|()| written)
-    })
+        let kept = kept_len(read, count, limit);
+        read = read.saturating_add(count as u64);
+        written += kept as u64;
+        chunks.commit(kept)?;
+    }
 }
 
 fn inline<R: Read, C: FnMut(&[u8])>(
@@ -324,6 +237,40 @@ mod tests {
             assert!(matches!(error, CopyError::Write(error) if error.to_string() == "disk full"));
             assert!(pulled.into_inner() < 16 << 20);
         }
+    }
+
+    struct PanicsAfter(usize);
+
+    impl Write for PanicsAfter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.0 < buf.len() {
+                // Lets the producer use up every buffer first.
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                panic!("writer panicked");
+            }
+            self.0 -= buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_panicking_writer_unwinds_instead_of_hanging() {
+        let pulled = std::sync::atomic::AtomicUsize::new(0);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            copy(
+                &mut Endless(&pulled),
+                1 << 40,
+                false,
+                &mut |_: &[u8]| {},
+                &mut PanicsAfter(5 << 20),
+                &Allowance::default(),
+            )
+        }));
+        assert!(unwound.is_err());
+        assert!(pulled.into_inner() < 16 << 20);
     }
 
     #[test]

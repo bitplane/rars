@@ -13,6 +13,7 @@ use crate::crypto::rar50::Rar50Cipher;
 use crate::crypto::rar50::Rar50Keys;
 use crate::error::{Error, Result};
 use crate::member_batches::{self, Plan};
+use crate::output_pipeline::{self, PipeError};
 use crate::volume_extract::VolumeFeed;
 use std::io::{Read, Write};
 
@@ -536,7 +537,7 @@ impl FileHeader {
     }
 
     #[cfg(all(test, feature = "write"))]
-    fn stream_packed_with_decoder<R: Read, B: Budget>(
+    fn stream_packed_with_decoder<R: Read + Send, B: Budget>(
         &self,
         packed: &mut R,
         keys: Option<&Rar50Keys>,
@@ -557,7 +558,7 @@ impl FileHeader {
         )
     }
 
-    fn stream_packed_with_crc_policy<const OPTIONAL_CRC: bool, R: Read, B: Budget>(
+    fn stream_packed_with_crc_policy<const OPTIONAL_CRC: bool, R: Read + Send, B: Budget>(
         &self,
         packed: &mut R,
         keys: Option<&Rar50Keys>,
@@ -579,6 +580,56 @@ impl FileHeader {
         let mut crc = Crc32::new();
         let check_crc = !OPTIONAL_CRC || self.needs_crc32();
         let mut hash = streaming_hash_verifier(self)?;
+        let decode_error = |error| match error {
+            StreamDecodeError::Decode(error) => Error::from(error),
+            StreamDecodeError::FilteredMember => Error::Rar50BufferedDecodeLimitExceeded {
+                limit: buffered_decode_limit,
+                required: self.unpacked_size,
+            },
+            StreamDecodeError::Sink(error) => Error::from(error),
+        };
+        if let Some(_charge) =
+            crate::output_pipeline::admit(self.unpacked_size, &decoder.allowance())
+        {
+            #[cfg(all(test, feature = "write"))]
+            let mut crc_bytes = 0;
+            let decoded = output_pipeline::run(
+                |chunks| {
+                    decoder.decode_member_from_reader_with_dictionary_to_sink(
+                        packed,
+                        info.algorithm_version,
+                        output_size,
+                        dictionary_size,
+                        info.solid,
+                        |chunk| match chunk {
+                            DecodedChunk::Bytes(bytes) => chunks.push(bytes),
+                            DecodedChunk::Repeated { byte, len } => chunks.push_repeated(byte, len),
+                        },
+                    )
+                },
+                &mut |chunk: &[u8]| {
+                    if check_crc {
+                        #[cfg(all(test, feature = "write"))]
+                        {
+                            crc_bytes += chunk.len();
+                        }
+                        crc.update(chunk);
+                    }
+                    if let Some((_, hasher)) = &mut hash {
+                        hasher.update(chunk);
+                    }
+                },
+                writer,
+            );
+            // Counted here because the checksum ran on its own thread.
+            #[cfg(all(test, feature = "write"))]
+            streaming_checks_tests::record_crc_work(crc_bytes, false);
+            decoded.map_err(|error| match error {
+                PipeError::Produce(error) => decode_error(error),
+                PipeError::Write(error) => Error::from(error),
+            })?;
+            return self.verify_streaming_integrity(crc, hash, keys);
+        }
         decoder
             .decode_member_from_reader_with_dictionary_to_sink(
                 packed,
@@ -609,14 +660,7 @@ impl FileHeader {
                     }
                 },
             )
-            .map_err(|error| match error {
-                StreamDecodeError::Decode(error) => Error::from(error),
-                StreamDecodeError::FilteredMember => Error::Rar50BufferedDecodeLimitExceeded {
-                    limit: buffered_decode_limit,
-                    required: self.unpacked_size,
-                },
-                StreamDecodeError::Sink(error) => Error::from(error),
-            })?;
+            .map_err(decode_error)?;
         self.verify_streaming_integrity(crc, hash, keys)
     }
 
