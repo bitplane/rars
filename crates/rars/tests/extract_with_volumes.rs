@@ -370,7 +370,8 @@ fn a_missing_volume_is_reported_the_same_inside_and_between_members() {
                 (index != missing).then_some(volume)
             });
         assert!(
-            matches!(result, Err(rars::Error::InVolume { number, .. }) if number == missing + 1),
+            matches!(&result, Err(error @ rars::Error::InVolume { number, .. })
+                if *number == missing + 1 && error.root_cause() == &rars::Error::MissingVolume),
             "volume {missing}: {result:?}"
         );
     }

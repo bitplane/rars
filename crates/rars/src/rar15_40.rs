@@ -529,6 +529,7 @@ impl FileHeader {
             | Error::AtArchiveOffset { .. }
             | Error::AtEntry { .. }
             | Error::InVolume { .. }
+            | Error::MissingVolume
             | Error::Cancelled
             | Error::InvalidArgument(_)
             | Error::WriterFailure(_)
