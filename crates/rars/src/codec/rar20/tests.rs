@@ -407,27 +407,57 @@ fn encoded_zero_fill_match_survives_member_boundaries() {
         Unpack20::new().decode_member(&packed, 12).unwrap(),
         expected
     );
-    for split in 1..12 {
+    // A shorter declared size truncates the output, and the window still
+    // holds the whole zero-filled match.
+    for split in 3..12 {
         let mut decoder = Unpack20::new();
         let first = decoder.decode_member(&packed, split).unwrap();
-        for mut resumed in [decoder.clone(), decoder] {
-            let rest = resumed.decode_member(&[], 12 - split).unwrap();
-            assert_eq!(
-                [first.as_slice(), &rest].concat(),
-                expected,
-                "split={split}"
-            );
-        }
+        assert_eq!(first, expected[..split], "split={split}");
+        assert_eq!(&*decoder.output, expected, "split={split}");
+        assert!(decoder.pending_match.is_none());
+
+        let mut decoder = Unpack20::new();
+        let mut output = Vec::new();
+        decoder
+            .decode_member_from_reader(&mut packed.as_slice(), split, &mut output)
+            .unwrap();
+        assert_eq!(output, expected[..split], "split={split}");
+        assert_eq!(&*decoder.output, expected, "split={split}");
     }
-    let mut decoder = Unpack20::new();
-    let mut output = Vec::new();
-    decoder
-        .decode_member_from_reader(&mut packed.as_slice(), 3, &mut output)
-        .unwrap();
-    decoder
-        .decode_member_from_reader(&mut [].as_slice(), 9, &mut output)
-        .unwrap();
-    assert_eq!(output, expected);
+}
+
+#[test]
+fn a_match_crossing_the_declared_size_truncates_and_keeps_the_overrun() {
+    let first = b"repeated tail ".repeat(256);
+    let second = b"repeated tail, then a fresh ending".to_vec();
+    let mut encoder = Unpack20Encoder::new();
+    let first_packed = encoder.encode_member(&first).unwrap();
+    let second_packed = encoder.encode_member(&second).unwrap();
+    let declared = first.len() - 5;
+
+    let mut from_slice = Unpack20::new();
+    assert_eq!(
+        from_slice.decode_member(&first_packed, declared).unwrap(),
+        first[..declared]
+    );
+    assert_eq!(
+        from_slice
+            .decode_member(&second_packed, second.len())
+            .unwrap(),
+        second
+    );
+
+    let mut from_reader = Unpack20::new();
+    for (packed, size, expected) in [
+        (&first_packed, declared, &first[..declared]),
+        (&second_packed, second.len(), &second[..]),
+    ] {
+        let mut out = Vec::new();
+        from_reader
+            .decode_member_from_reader(&mut packed.as_slice(), size, &mut out)
+            .unwrap();
+        assert_eq!(out, expected);
+    }
 }
 
 #[test]
@@ -942,22 +972,6 @@ fn decoder_batches_trimming_while_encoder_keeps_only_the_last_window() {
         decoder.raw_range(current - super::MAX_HISTORY, current),
         encoder.history
     );
-}
-
-#[test]
-fn decode_member_carries_a_match_across_output_boundary() {
-    let input = b"ABCD".repeat(20);
-    let packed = unpack20_encode_literals(&input).unwrap();
-    let mut decoder = Unpack20::new();
-
-    let first = decoder.decode_member(&packed, 6).unwrap();
-    assert!(decoder.pending_match.is_some());
-    let second = decoder
-        .decode_member(&[], input.len() - first.len())
-        .unwrap();
-
-    assert_eq!([first, second].concat(), input);
-    assert!(decoder.pending_match.is_none());
 }
 
 fn expected_text() -> Vec<u8> {
