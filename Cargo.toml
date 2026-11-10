@@ -63,3 +63,40 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Key derivation and hashing run hundreds of thousands of rounds per volume, too slow unoptimised in tests.
+[profile.dev.package.aes]
+opt-level = 3
+
+[profile.dev.package.blake2s_simd]
+opt-level = 3
+
+[profile.dev.package.block-buffer]
+opt-level = 3
+
+[profile.dev.package.cipher]
+opt-level = 3
+
+[profile.dev.package.crc32fast]
+opt-level = 3
+
+[profile.dev.package.crypto-common]
+opt-level = 3
+
+[profile.dev.package.digest]
+opt-level = 3
+
+[profile.dev.package.hmac]
+opt-level = 3
+
+[profile.dev.package.hybrid-array]
+opt-level = 3
+
+[profile.dev.package.inout]
+opt-level = 3
+
+[profile.dev.package.sha1]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
