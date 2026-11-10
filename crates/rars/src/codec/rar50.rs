@@ -1681,12 +1681,46 @@ impl<B: Budget> StreamingOutput<B> {
         Ok(())
     }
 
+    /// The usual match, taken whole from the ring with no flush, growth or
+    /// sink call; false leaves it to the general copy.
+    #[inline(always)]
+    fn copy_short(&mut self, distance: usize, length: usize) -> bool {
+        let end = self.ring.end;
+        let capacity = self.ring.capacity();
+        if self.all_zero
+            || length > SHORT_MATCH
+            || distance < length
+            || distance > end
+            || distance > self.ring.len
+            || distance > self.dictionary_size
+            || length > self.output_limit - self.written
+            || self.pending + length >= STREAM_FLUSH_THRESHOLD
+            || end + SHORT_MATCH >= capacity
+            || (self.ring.len + length + SHORT_MATCH > capacity && capacity < self.max_capacity)
+        {
+            return false;
+        }
+        let source = end - distance;
+        let bytes: [u8; SHORT_MATCH] = self.ring.bytes[source..source + SHORT_MATCH]
+            .try_into()
+            .expect("fixed-width slice");
+        self.ring.bytes[end..end + SHORT_MATCH].copy_from_slice(&bytes);
+        self.ring.advance(length);
+        self.pending += length;
+        self.written += length;
+        true
+    }
+
+    #[inline]
     fn copy_match<E>(
         &mut self,
         distance: usize,
         length: usize,
         sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), StreamDecodeError<E>> {
+        if self.copy_short(distance, length) {
+            return Ok(());
+        }
         let visible = length.min(self.output_limit - self.written);
         if self.all_zero && distance <= self.written + self.ring.len - self.pending {
             // Zeroes that never reach the ring are implied by its zero fill.
