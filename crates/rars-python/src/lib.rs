@@ -2248,10 +2248,7 @@ fn is_missing_volume(error: &rars_rs::Error) -> bool {
                 .downcast_ref::<Box<rars_rs::Error>>()
                 .map(|boxed| &**boxed)
         });
-        if matches!(
-            error_ref,
-            Some(rars_rs::Error::InvalidHeader("volume is missing"))
-        ) {
+        if matches!(error_ref, Some(rars_rs::Error::MissingVolume)) {
             return true;
         }
         current = error.source();

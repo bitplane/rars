@@ -97,6 +97,8 @@ pub enum Error {
         number: usize,
         source: Box<Error>,
     },
+    /// The set needs a volume that never arrived; [`Error::InVolume`] around it numbers it.
+    MissingVolume,
     UnsupportedVersion(ArchiveVersion),
     /// The requested implementation was omitted at compile time.
     FeatureDisabled {
@@ -247,6 +249,7 @@ impl std::fmt::Display for Error {
                 write!(f, "at archive offset {offset:#x}: {source}")
             }
             Self::InVolume { number, source } => write!(f, "in volume {number}: {source}"),
+            Self::MissingVolume => f.write_str("volume is missing"),
             Self::AtEntry {
                 name,
                 operation,
@@ -486,6 +489,7 @@ impl Error {
             Self::WriterFailure(_) => ErrorKind::WriterFailure,
             Self::TooShort
             | Self::InvalidHeader(_)
+            | Self::MissingVolume
             | Self::Codec(_)
             | Self::Rar3Recovery(_)
             | Self::Rar5Recovery(_)

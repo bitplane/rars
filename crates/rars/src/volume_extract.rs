@@ -81,7 +81,7 @@ impl<'p, 'o, A> VolumeFeed<'p, 'o, A> {
         match self.next()? {
             None if self.stop_at_last => Err(crate::Error::InVolume {
                 number,
-                source: Box::new(crate::Error::InvalidHeader("volume is missing")),
+                source: Box::new(crate::Error::MissingVolume),
             }),
             volume => Ok(volume),
         }
