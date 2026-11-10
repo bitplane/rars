@@ -95,6 +95,7 @@ pub use file_times::{FileTimes, FileTimestamp};
 mod tzif;
 pub mod version;
 mod volume_extract;
+pub mod volume_name;
 #[cfg(feature = "write")]
 pub mod write_plan;
 #[cfg(feature = "write")]
@@ -668,6 +669,32 @@ impl Archive {
             Self::Rar15To40(_) => ArchiveFamily::Rar15To40,
             Self::Rar50Plus(_) => ArchiveFamily::Rar50Plus,
         }
+    }
+
+    /// Whether this archive is one volume of a set.
+    pub fn is_volume(&self) -> bool {
+        match self {
+            Self::Rar13(archive) => archive.main.is_volume(),
+            Self::Rar15To40(archive) => archive.main.is_volume(),
+            Self::Rar50Plus(archive) => archive.main.is_volume(),
+        }
+    }
+
+    /// Volume `index` of the set this first volume begins, named as RAR names it beside `first_path`.
+    pub fn volume_path(&self, first_path: &Path, index: usize) -> Option<std::path::PathBuf> {
+        let part_names = match self {
+            Self::Rar13(_) => false,
+            // Only RAR 3.0 and later mark the first volume, and only they name volumes by part.
+            Self::Rar15To40(archive) => {
+                archive.main.uses_new_numbering() && archive.main.is_first_volume()
+            }
+            Self::Rar50Plus(_) => true,
+        };
+        if index == 0 || !part_names {
+            return volume_name::old_style(first_path, index);
+        }
+        let width = volume_name::part_width(first_path).unwrap_or(2);
+        volume_name::part_style(first_path, index, width)
     }
 
     /// Returns the byte offset where the RAR archive begins after any SFX stub.

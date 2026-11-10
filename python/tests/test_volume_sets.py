@@ -103,3 +103,105 @@ def test_volumes_cannot_be_combined_with_members(tmp_path):
     with rars.RarFile(paths[0]) as archive:
         with pytest.raises(ValueError):
             archive.extractall(tmp_path / "out", members=["small.txt"], volumes=paths[1:])
+
+
+FIXTURES = Path(__file__).resolve().parents[2] / "crates/rars/tests/fixtures"
+
+
+def write_named_set(tmp_path, format):
+    builder = rars.RarBuilder(format=format, store=True, volume_size=4096)
+    builder.add_bytes(PAYLOAD, "large.bin")
+    first = "set.part01.rar" if format == "rar50" else "set.rar"
+    (tmp_path / "made").mkdir()
+    paths = builder.write_volumes(tmp_path / "made" / first)
+    assert len(paths) > 3
+    return paths
+
+
+@pytest.mark.parametrize("format", ["rar13", "rar15", "rar20", "rar29", "rar30", "rar40", "rar50"])
+def test_extractall_finds_later_volumes_by_name(tmp_path, format):
+    paths = write_named_set(tmp_path, format)
+    with rars.RarFile(paths[0]) as archive:
+        archive.testrar()
+        written = archive.extractall(tmp_path / "out")
+    assert (tmp_path / "out" / "large.bin").read_bytes() == PAYLOAD
+    assert [Path(p).name for p in written] == ["large.bin"]
+
+
+@pytest.mark.parametrize(
+    "first",
+    [
+        "rar15_40/rar300/multivol_oldnaming_rar300.rar",
+        "rar15_40/rar300/multivol_newnaming_rar300.part01.rar",
+        "rar15_40/rar154/random.rar",
+        "rar13/MULTIVOL.RAR",
+        "rar50/multivol.part1.rar",
+        "rar50/solid_multivol.part01.rar",
+    ],
+)
+def test_extractall_names_volumes_as_the_archive_does(tmp_path, first):
+    first = FIXTURES / first
+    later = sorted(
+        p
+        for p in first.parent.iterdir()
+        if p != first and p.name.lower().startswith(first.name.lower().split(".")[0] + ".")
+        and p.suffix.lower() != ".rev"
+    )
+    with rars.RarFile(first) as archive:
+        expected = archive.extractall(tmp_path / "given", volumes=later)
+        archive.testrar()
+        found = archive.extractall(tmp_path / "found")
+    assert len(expected) > 0
+    for given, guessed in zip(expected, found):
+        assert Path(given).read_bytes() == Path(guessed).read_bytes()
+    assert len(found) == len(expected)
+
+
+@pytest.mark.parametrize("format", ["rar29", "rar50"])
+def test_a_missing_middle_volume_is_named(tmp_path, format):
+    paths = write_named_set(tmp_path, format)
+    paths[2].unlink()
+    with rars.RarFile(paths[0]) as archive:
+        with pytest.raises(rars.Error, match=f"volume is missing.*{paths[2].name}"):
+            archive.extractall(tmp_path / "out")
+        with pytest.raises(rars.Error, match="volume is missing"):
+            archive.testrar()
+
+
+@pytest.mark.parametrize("format", ["rar13", "rar15", "rar20"])
+def test_a_set_without_end_blocks_ends_at_its_last_volume(tmp_path, format):
+    paths = write_named_set(tmp_path, format)
+    with rars.RarFile(paths[0]) as archive:
+        archive.testrar()
+        archive.extractall(tmp_path / "out")
+    assert [p.name for p in (tmp_path / "out").iterdir()] == ["large.bin"]
+
+
+def test_volumes_overrides_the_guessed_names(tmp_path):
+    paths = write_named_set(tmp_path, "rar29")
+    renamed = []
+    for index, path in enumerate(paths[1:]):
+        renamed.append(path.rename(path.with_name(f"{index:03}.bin")))
+    # A decoy where the guess would look.
+    shutil.copy(paths[0], paths[1])
+    asked = []
+
+    def volumes():
+        for path in renamed:
+            asked.append(path)
+            yield path
+
+    with rars.RarFile(paths[0]) as archive:
+        archive.extractall(tmp_path / "out", volumes=volumes())
+    assert asked == renamed
+    assert (tmp_path / "out" / "large.bin").read_bytes() == PAYLOAD
+
+
+@pytest.mark.parametrize("format", ["rar29", "rar50"])
+def test_a_set_opened_from_bytes_points_at_volumes(tmp_path, format):
+    paths = write_named_set(tmp_path, format)
+    with rars.RarFile(paths[0].read_bytes()) as archive:
+        with pytest.raises(rars.Error, match="volumes="):
+            archive.extractall(tmp_path / "out")
+        with pytest.raises(rars.Error, match="volumes="):
+            archive.testrar()
