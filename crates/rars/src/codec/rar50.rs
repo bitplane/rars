@@ -446,7 +446,7 @@ impl Unpack50Decoder {
             self.state
                 .copy_match(&mut owned, distance, length, output_limit, dictionary_size);
         *output = owned.into_vec();
-        result
+        result.map(drop)
     }
     pub fn decode_member(
         &mut self,
@@ -817,6 +817,7 @@ impl<B: Budget> ReaderState<B> {
             Buffer::with_capacity(output_size.min(MAX_INITIAL_OUTPUT_CAPACITY), &allowance)?;
         let mut filters = Buffer::new(&allowance);
         let mut literals = [0; LITERAL_BURST];
+        let mut overrun = None;
 
         loop {
             let block = read_compressed_block_with_allowance(input, &self.history.allowance())?;
@@ -862,7 +863,7 @@ impl<B: Budget> ReaderState<B> {
                     }
                     257 if mode.uses_lz() => {
                         if self.last_length != 0 {
-                            self.copy_match(
+                            overrun = self.copy_match(
                                 &mut output,
                                 self.reps[0],
                                 self.last_length,
@@ -887,7 +888,7 @@ impl<B: Budget> ReaderState<B> {
                         self.reps[..=rep_index].rotate_right(1);
                         self.reps[0] = distance;
                         self.last_length = length;
-                        self.copy_match(
+                        overrun = self.copy_match(
                             &mut output,
                             distance,
                             length,
@@ -921,7 +922,7 @@ impl<B: Budget> ReaderState<B> {
                         self.reps.rotate_right(1);
                         self.reps[0] = distance;
                         self.last_length = length;
-                        self.copy_match(
+                        overrun = self.copy_match(
                             &mut output,
                             distance,
                             length,
@@ -968,6 +969,9 @@ impl<B: Budget> ReaderState<B> {
                     history_output.as_deref().unwrap_or(&output),
                     dictionary_size,
                 )?;
+                if let Some(overrun) = overrun {
+                    self.remember_overrun(overrun, dictionary_size)?;
+                }
             }
             Ok(output)
         } else {
@@ -1215,6 +1219,26 @@ impl<B: Budget> ReaderState<B> {
         Ok(())
     }
 
+    fn remember_overrun(&mut self, overrun: Overrun, dictionary_size: usize) -> Result<()> {
+        let mut bytes = Buffer::with_capacity(overrun.len, &self.history.allowance())?;
+        match overrun.distance {
+            None => bytes.resize(overrun.len, 0)?,
+            Some(distance) => {
+                // The window already holds `distance` bytes: copy_match checked.
+                let history = self.reachable_history();
+                for index in 0..overrun.len {
+                    let byte = if index < distance {
+                        history[history.len() - distance + index]
+                    } else {
+                        bytes[index - distance]
+                    };
+                    bytes.try_push(byte)?;
+                }
+            }
+        }
+        self.remember_history(&bytes, dictionary_size)
+    }
+
     fn reset(&mut self) {
         self.tables = None;
         self.reps = [0; 4];
@@ -1226,6 +1250,7 @@ impl<B: Budget> ReaderState<B> {
         self.history_window = 0;
     }
 
+    /// Copies the part of a match within `output_limit` and returns the rest.
     fn copy_match(
         &self,
         output: &mut Buffer<u8, B>,
@@ -1233,24 +1258,30 @@ impl<B: Budget> ReaderState<B> {
         length: usize,
         output_limit: usize,
         dictionary_size: usize,
-    ) -> Result<()> {
-        if output
-            .len()
-            .checked_add(length)
-            .is_none_or(|end| end > output_limit)
-        {
-            return Err(Error::InvalidData("RAR 5 match exceeds output limit"));
-        }
+    ) -> Result<Option<Overrun>> {
         // A match reaching past the start of the window writes zeroes rather
         // than failing. WinRAR never clears its window and guards the copy
         // with a first-wrap flag instead, so those bytes read as zero there,
         // and an archive that leans on it stays readable here. Nothing is
         // swallowed: a stream that is damaged rather than merely odd still
         // fails its file hash.
-        if distance == 0
+        let zero_fill = distance == 0
             || distance > dictionary_size
-            || distance > self.history_window + output.len()
-        {
+            || distance > self.history_window + output.len();
+        let visible = length.min(output_limit.saturating_sub(output.len()));
+        let overrun = Overrun::of(distance, zero_fill, length - visible);
+        self.copy_visible(output, distance, visible, zero_fill)?;
+        Ok(overrun)
+    }
+
+    fn copy_visible(
+        &self,
+        output: &mut Buffer<u8, B>,
+        distance: usize,
+        length: usize,
+        zero_fill: bool,
+    ) -> Result<()> {
+        if zero_fill {
             output.resize(output.len() + length, 0)?;
             return Ok(());
         }
@@ -1449,6 +1480,24 @@ impl<B: Budget> From<Buffer<u8, B>> for StreamedHistory<B> {
     }
 }
 
+/// The tail of a member's final match past its declared size: not output, but
+/// kept in the window so a following solid member can reach it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Overrun {
+    // None when the match zero-fills.
+    distance: Option<usize>,
+    len: usize,
+}
+
+impl Overrun {
+    fn of(distance: usize, zero_fill: bool, len: usize) -> Option<Self> {
+        (len != 0).then_some(Self {
+            distance: (!zero_fill).then_some(distance),
+            len,
+        })
+    }
+}
+
 // Room past the newest byte for a fixed-width short match to over-copy into.
 const SHORT_MATCH: usize = 32;
 // Ring space beyond the reachable history: unflushed output plus over-copy.
@@ -1640,11 +1689,56 @@ impl<B: Budget> StreamingOutput<B> {
         length: usize,
         sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), StreamDecodeError<E>> {
+        let visible = length.min(self.output_limit - self.written);
         if self.all_zero && distance <= self.written + self.ring.len - self.pending {
-            return self.push_zeroes(length, sink);
+            // Zeroes that never reach the ring are implied by its zero fill.
+            return self.push_zeroes(visible, sink);
         }
         // Zero-fill out-of-window matches, as the buffered decoder does.
-        if distance == 0 || distance > self.dictionary_size || distance > self.ring.len {
+        let zero_fill =
+            distance == 0 || distance > self.dictionary_size || distance > self.ring.len;
+        let overrun = Overrun::of(distance, zero_fill, length - visible);
+        self.copy_visible(distance, visible, zero_fill, sink)?;
+        if let Some(overrun) = overrun {
+            self.retain_overrun(overrun, sink)?;
+        }
+        Ok(())
+    }
+
+    /// Appends to the window without emitting, after flushing what is pending.
+    fn retain_overrun<E>(
+        &mut self,
+        overrun: Overrun,
+        sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), StreamDecodeError<E>> {
+        self.flush(sink)?;
+        for _ in 0..overrun.len {
+            self.make_room(1)?;
+            let byte = overrun
+                .distance
+                .map_or(0, |distance| self.ring.bytes[self.ring.back(distance)]);
+            if byte != 0 {
+                self.all_zero = false;
+            }
+            let end = self.ring.end;
+            self.ring.bytes[end] = byte;
+            self.ring.advance(1);
+            if self.ring.end == self.ring.capacity() {
+                self.ring.end = 0;
+            }
+            self.ring.keep_newest(self.history_limit);
+        }
+        Ok(())
+    }
+
+    fn copy_visible<E>(
+        &mut self,
+        distance: usize,
+        length: usize,
+        zero_fill: bool,
+        sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), StreamDecodeError<E>> {
+        if zero_fill {
             return self.push_repeated(0, length, sink);
         }
         self.check_limit(length)?;
