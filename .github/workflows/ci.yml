@@ -79,6 +79,40 @@ jobs:
           cargo build -p rars-cli --locked
           python3 -m unittest discover -s scripts/hybrid -v
 
+  python:
+    name: Python bindings
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # The oldest version the abi3 wheels claim to support.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.10'
+
+      # Several tests check rewritten archives with unrar and skip without it.
+      # Built from source like the release gate: Ubuntu's unrar-free cannot
+      # read RAR 5.
+      - name: Install unrar
+        run: |
+          set -euo pipefail
+          curl -sSfLO https://www.rarlab.com/rar/unrarsrc-7.1.6.tar.gz
+          echo "ca5e1da37dd6fa1b78bb5ed675486413f79e4a917709744aa04b6f93dfd914f0  unrarsrc-7.1.6.tar.gz" | sha256sum -c -
+          tar xf unrarsrc-7.1.6.tar.gz
+          make -C unrar -j"$(nproc)"
+          sudo install -m 0755 unrar/unrar /usr/local/bin/unrar
+          unrar | head -2
+
+      # Until this job existed the suite only ran in the release gate, so a
+      # change could break it on master without any PR showing a failure.
+      - name: Build the extension and run python/tests
+        run: python3 scripts/test-python-bindings.py
+
   native-cli:
     name: Native CLI (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
