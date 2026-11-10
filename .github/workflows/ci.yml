@@ -113,6 +113,45 @@ jobs:
       - name: Build the extension and run python/tests
         run: python3 scripts/test-python-bindings.py
 
+  npm:
+    name: npm package
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      # build-npm.sh reads the wasm-bindgen version from Cargo.lock.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      # The generated glue only loads a module built against the same
+      # wasm-bindgen crate, so the CLI version follows Cargo.lock. wasm-opt
+      # is left out: build-npm.sh ships unoptimised modules without it, which
+      # is enough to test them.
+      - name: Install wasm-bindgen
+        run: |
+          set -euo pipefail
+          cargo install wasm-bindgen-cli --version "$(python3 scripts/wasm-bindgen-version.py)" --locked
+          wasm-bindgen --version
+
+      # Until this job existed the npm checks only ran in the release gate, so
+      # a change could break them on master without any PR showing a failure.
+      - name: Build the npm package and run its checks
+        run: |
+          ./scripts/build-npm.sh
+          node scripts/test-npm-package.js
+
   native-cli:
     name: Native CLI (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
