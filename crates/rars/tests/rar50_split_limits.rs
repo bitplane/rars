@@ -1,5 +1,7 @@
 #![cfg(feature = "write")]
 
+#[path = "support/volume_size.rs"]
+mod volume_size;
 use rars::rar50::{self, Archive, Block};
 use rars::{ArchiveReadOptions, Error};
 use std::cell::RefCell;
@@ -97,20 +99,22 @@ fn oversized_filtered_split_member_streams_like_unsplit() {
         b"filtered".to_vec(),
         rars::EntrySource::from_bytes(payload.clone()),
     );
-    let mut sink = rar50::CollectedVolumes::new();
     let root = scratch::case("filtered-split-limit");
-    rar50::write_streaming_volumes_to(
-        &[entry],
-        rar50::WriterOptions::new(rars::ArchiveVersion::Rar50, rars::FeatureSet::store_only()),
-        rar50::ArchiveExtras::default()
-            .with_filter_policy(rar50::FilterPolicy::explicit(rar50::FilterKind::E8)),
-        32,
-        &mut sink,
-        &rars::WriterResources::new(128 * 1024 * 1024).with_temp_dir(root.to_path_buf()),
-    )
+    let volumes = volume_size::sized_for_payload(32, |volume_size| {
+        let mut sink = rar50::CollectedVolumes::new();
+        rar50::write_streaming_volumes_to(
+            std::slice::from_ref(&entry),
+            rar50::WriterOptions::new(rars::ArchiveVersion::Rar50, rars::FeatureSet::store_only()),
+            rar50::ArchiveExtras::default()
+                .with_filter_policy(rar50::FilterPolicy::explicit(rar50::FilterKind::E8)),
+            volume_size as u64,
+            &mut sink,
+            &rars::WriterResources::new(128 * 1024 * 1024).with_temp_dir(root.to_path_buf()),
+        )?;
+        Ok::<_, rars::Error>(sink.take())
+    })
     .unwrap();
-    let volumes: Vec<_> = sink
-        .take()
+    let volumes: Vec<_> = volumes
         .into_iter()
         .map(|bytes| Archive::parse_owned(bytes).unwrap())
         .collect();

@@ -1524,18 +1524,21 @@ fn write_member(
     }
 }
 
+/// Splits one member across a volume set. No volume is longer than
+/// `volume_size` bytes, headers and end-of-archive block included, as RAR's
+/// own `-v` switch counts them.
 pub fn write_stored_volumes(
     entry: StoredEntry<'_>,
     options: WriterOptions,
-    max_packed_per_volume: usize,
+    volume_size: usize,
 ) -> Result<Vec<Vec<u8>>> {
-    write_stored_volumes_with_progress(entry, options, max_packed_per_volume, None)
+    write_stored_volumes_with_progress(entry, options, volume_size, None)
 }
 
 pub(crate) fn write_stored_volumes_with_progress(
     entry: StoredEntry<'_>,
     options: WriterOptions,
-    max_packed_per_volume: usize,
+    volume_size: usize,
     progress: Option<&dyn WriteProgress>,
 ) -> Result<Vec<Vec<u8>>> {
     let resources = WriterResources::default();
@@ -1560,7 +1563,7 @@ pub(crate) fn write_stored_volumes_with_progress(
             base_flags: writer_file_flags(entry.password, None, false),
             main_flags: 0,
             password: entry.password,
-            max_packed_per_volume,
+            volume_size,
         });
     }
 
@@ -1578,22 +1581,25 @@ pub(crate) fn write_stored_volumes_with_progress(
         base_flags: writer_file_flags(entry.password, None, false),
         main_flags: 0,
         password: entry.password,
-        max_packed_per_volume,
+        volume_size,
     })
 }
 
+/// Splits one member across a volume set. No volume is longer than
+/// `volume_size` bytes, headers and end-of-archive block included, as RAR's
+/// own `-v` switch counts them.
 pub fn write_compressed_volumes(
     entry: FileEntry<'_>,
     options: WriterOptions,
-    max_packed_per_volume: usize,
+    volume_size: usize,
 ) -> Result<Vec<Vec<u8>>> {
-    write_compressed_volumes_with_progress(entry, options, max_packed_per_volume, None)
+    write_compressed_volumes_with_progress(entry, options, volume_size, None)
 }
 
 pub fn write_compressed_volumes_with_progress(
     entry: FileEntry<'_>,
     options: WriterOptions,
-    max_packed_per_volume: usize,
+    volume_size: usize,
     progress: Option<&dyn WriteProgress>,
 ) -> Result<Vec<Vec<u8>>> {
     let resources = WriterResources::default();
@@ -1613,7 +1619,7 @@ pub fn write_compressed_volumes_with_progress(
         WriteOperation::Compression,
         total_work,
     );
-    let result = write_compressed_volumes_impl(entry, options, max_packed_per_volume, &work);
+    let result = write_compressed_volumes_impl(entry, options, volume_size, &work);
     let result = result?;
     if !work.finish() {
         return Err(Error::Cancelled);
@@ -1626,7 +1632,7 @@ pub fn write_compressed_volumes_with_progress(
 fn write_compressed_volumes_impl(
     entry: FileEntry<'_>,
     mut options: WriterOptions,
-    max_packed_per_volume: usize,
+    volume_size: usize,
     progress: &WorkTracker<'_>,
 ) -> Result<Vec<Vec<u8>>> {
     validate_plan(
@@ -1667,7 +1673,7 @@ fn write_compressed_volumes_impl(
             base_flags: writer_file_flags(entry.password, None, false),
             main_flags: if options.features.solid { MHD_SOLID } else { 0 },
             password: entry.password,
-            max_packed_per_volume,
+            volume_size,
         });
     }
 
@@ -1687,7 +1693,7 @@ fn write_compressed_volumes_impl(
         base_flags: writer_file_flags(entry.password, None, false),
         main_flags: if options.features.solid { MHD_SOLID } else { 0 },
         password: entry.password,
-        max_packed_per_volume,
+        volume_size,
     })
 }
 
@@ -2842,7 +2848,7 @@ struct SplitVolumeRecord<'a> {
     base_flags: u16,
     main_flags: u16,
     password: Option<&'a [u8]>,
-    max_packed_per_volume: usize,
+    volume_size: usize,
 }
 
 fn report_volume(
@@ -2861,11 +2867,6 @@ fn report_volume(
 
 fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
     crate::write_progress::check_cancelled(Some(entry.progress))?;
-    if entry.max_packed_per_volume == 0 {
-        return Err(Error::InvalidArgument(
-            "RAR 1.5 volume payload size must be non-zero",
-        ));
-    }
     if entry.packed.is_empty() {
         return Err(Error::InvalidArgument(
             "RAR 1.5 volume writer needs a non-empty packed payload",
@@ -2883,22 +2884,10 @@ fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
     };
     let base_flags = entry.base_flags | if split_salt.is_some() { FHD_SALT } else { 0 };
 
-    // Packing well enough to need only one volume is not an error. The loop
-    // below already writes that set correctly: with one chunk neither split
-    // flag is set, so the member is an ordinary unsplit file inside a volume
-    // set of one, which is what WinRAR writes and what RAR 5 here already did.
-    // Refusing it meant a fixed `--volume-size` in a script could start failing
-    // because compression improved, which is how it was found.
-    let chunks: Vec<&[u8]> = packed.chunks(entry.max_packed_per_volume).collect();
-
-    let mut volumes = Vec::with_capacity(chunks.len());
     let unpacked_crc = crc32(entry.unpacked);
-    for (index, chunk) in chunks.iter().enumerate() {
-        crate::write_progress::check_cancelled(Some(entry.progress))?;
-        let split_before = index > 0;
-        let split_after = index + 1 < chunks.len();
+    let render = |index: usize, split_after: bool, chunk: &[u8]| -> Result<Vec<u8>> {
         let mut file_flags = base_flags;
-        if split_before {
+        if index > 0 {
             file_flags |= FHD_SPLIT_BEFORE;
         }
         if split_after {
@@ -2944,22 +2933,17 @@ fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
         if writes_end_block(entry.target) {
             out.extend_from_slice(&end_block(volume_end_flags(split_after)));
         }
-        report_volume(entry.progress, index, chunks.len(), out.len())?;
-        volumes.push(out);
-    }
-
-    Ok(volumes)
+        Ok(out)
+    };
+    let payload =
+        legacy_volume_payload(entry.volume_size, &packed, |probe| render(0, true, probe))?;
+    render_legacy_volumes(&packed, payload, entry.volume_size, entry.progress, render)
 }
 
 fn write_header_encrypted_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
     crate::write_progress::check_cancelled(Some(entry.progress))?;
     validate_header_encrypted_archive_options(entry.target, entry.password.is_some())?;
     let password = entry.password.ok_or(Error::NeedPassword)?;
-    if entry.max_packed_per_volume == 0 {
-        return Err(Error::InvalidArgument(
-            "RAR 1.5 volume payload size must be non-zero",
-        ));
-    }
     if entry.packed.is_empty() {
         return Err(Error::InvalidArgument(
             "RAR 1.5 volume writer needs a non-empty packed payload",
@@ -2973,22 +2957,10 @@ fn write_header_encrypted_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<
             crate::write_stream::member_error(error, entry.name, "encrypting volume member")
         })?;
     let base_flags = entry.base_flags | FHD_SALT;
-    // Packing well enough to need only one volume is not an error. The loop
-    // below already writes that set correctly: with one chunk neither split
-    // flag is set, so the member is an ordinary unsplit file inside a volume
-    // set of one, which is what WinRAR writes and what RAR 5 here already did.
-    // Refusing it meant a fixed `--volume-size` in a script could start failing
-    // because compression improved, which is how it was found.
-    let chunks: Vec<&[u8]> = packed.chunks(entry.max_packed_per_volume).collect();
-
-    let mut volumes = Vec::with_capacity(chunks.len());
     let unpacked_crc = crc32(entry.unpacked);
-    for (index, chunk) in chunks.iter().enumerate() {
-        crate::write_progress::check_cancelled(Some(entry.progress))?;
-        let split_before = index > 0;
-        let split_after = index + 1 < chunks.len();
+    let render = |index: usize, split_after: bool, chunk: &[u8]| -> Result<Vec<u8>> {
         let mut file_flags = base_flags;
-        if split_before {
+        if index > 0 {
             file_flags |= FHD_SPLIT_BEFORE;
         }
         if split_after {
@@ -3036,10 +3008,64 @@ fn write_header_encrypted_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<
         })?;
         out.extend_from_slice(chunk);
         write_encrypted_end_block(&mut out, volume_end_flags(split_after), password)?;
-        report_volume(entry.progress, index, chunks.len(), out.len())?;
+        Ok(out)
+    };
+    let payload =
+        legacy_volume_payload(entry.volume_size, &packed, |probe| render(0, true, probe))?;
+    render_legacy_volumes(&packed, payload, entry.volume_size, entry.progress, render)
+}
+
+/// How many packed bytes fit in each volume of `volume_size` bytes.
+///
+/// Every volume repeats the same headers around its slice of the payload, and
+/// no header field grows as the slice shrinks, so measuring one volume around
+/// the largest slice any volume could hold gives an overhead that holds for
+/// all of them. RAR 1.3 volumes are framed the same way and share this.
+pub(crate) fn legacy_volume_payload(
+    volume_size: usize,
+    packed: &[u8],
+    render: impl Fn(&[u8]) -> Result<Vec<u8>>,
+) -> Result<usize> {
+    if volume_size == 0 {
+        return Err(Error::InvalidArgument("volume size must be non-zero"));
+    }
+    let probe = &packed[..packed.len().min(volume_size)];
+    let overhead = render(probe)?.len() - probe.len();
+    match volume_size.checked_sub(overhead) {
+        Some(payload) if payload > 0 => Ok(payload),
+        _ => Err(Error::InvalidArgument(
+            "volume size is too small to hold the volume headers",
+        )),
+    }
+}
+
+/// Cuts `packed` into `payload`-byte slices and renders a volume around each,
+/// checking that none came out longer than `volume_size`.
+pub(crate) fn render_legacy_volumes(
+    packed: &[u8],
+    payload: usize,
+    volume_size: usize,
+    progress: ProgressReporter<'_>,
+    render: impl Fn(usize, bool, &[u8]) -> Result<Vec<u8>>,
+) -> Result<Vec<Vec<u8>>> {
+    // Packing well enough to need only one volume is not an error. With one
+    // chunk neither split flag is set, so the member is an ordinary unsplit
+    // file inside a volume set of one, which is what WinRAR writes. Refusing
+    // it meant a fixed `--volume-size` in a script could start failing because
+    // compression improved, which is how it was found.
+    let chunks: Vec<&[u8]> = packed.chunks(payload).collect();
+    let mut volumes = Vec::with_capacity(chunks.len());
+    for (index, chunk) in chunks.iter().enumerate() {
+        crate::write_progress::check_cancelled(Some(progress))?;
+        let out = render(index, index + 1 < chunks.len(), chunk)?;
+        if out.len() > volume_size {
+            return Err(Error::WriterFailure(
+                "legacy volume came out longer than the volume size",
+            ));
+        }
+        report_volume(progress, index, chunks.len(), out.len())?;
         volumes.push(out);
     }
-
     Ok(volumes)
 }
 

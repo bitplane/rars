@@ -1,5 +1,7 @@
 #![cfg(feature = "write")]
 
+#[path = "support/volume_size.rs"]
+mod volume_size;
 use rars::rar50::{Archive, Block};
 use rars::{ArchiveReader, ArchiveVersion, Builder};
 
@@ -51,11 +53,14 @@ fn producer_is_not_a_member_or_a_user_comment_including_empty_archives() {
 #[test]
 fn every_volume_has_an_independent_producer_record() {
     for version in [ArchiveVersion::Rar50, ArchiveVersion::Rar70] {
-        let mut builder = Builder::new(version).store(true).volume_size(Some(16));
+        let mut builder = Builder::new(version).store(true);
         builder
             .add_bytes(b"file".to_vec(), vec![42; 49], None, None)
             .unwrap();
-        let volumes = builder.build_volumes(None).unwrap();
+        let volumes = volume_size::sized_for_payload(16, |size| {
+            builder.clone().volume_size(Some(size)).build_volumes(None)
+        })
+        .unwrap();
         assert!(volumes.len() > 1);
         for volume in volumes {
             assert_marker(&Archive::parse(&volume).unwrap());
@@ -84,7 +89,11 @@ fn encrypted_headers_keep_producer_payload_public_and_rewritable() {
         assert!(rars::Archive::Rar50Plus(archive)
             .preserving_builder(Some(b"secret"))
             .is_ok());
-        for volume in builder.volume_size(Some(16)).build_volumes(None).unwrap() {
+        for volume in volume_size::sized_for_payload(16, |size| {
+            builder.clone().volume_size(Some(size)).build_volumes(None)
+        })
+        .unwrap()
+        {
             assert_marker(&Archive::parse_with_password(&volume, Some(b"secret")).unwrap());
         }
     }

@@ -2,6 +2,8 @@
 
 #[path = "support/scratch.rs"]
 mod scratch;
+#[path = "support/volume_size.rs"]
+mod volume_size;
 
 use rars::codec::rar50::{
     decode_lz, encode_lz_member, encode_table_lengths, parse_compressed_block, read_table_lengths,
@@ -520,23 +522,26 @@ fn write_encrypted_archive_with_comment(
 
 /// Collects a volume set in memory. The writer still holds one volume at a
 /// time; only the test keeps them all.
+/// Writes a set whose volumes carry about `payload` bytes of member data
+/// each, so the tests can force many small volumes.
 fn write_volumes(
     entries: &[rar50::ArchiveEntry],
     options: rar50::WriterOptions,
-    max_payload_per_volume: u64,
+    payload: u64,
     recovery_percent: Option<u64>,
 ) -> Result<Vec<Vec<u8>>, Error> {
-    let mut sink = rar50::CollectedVolumes::new();
-    rar50::write_streaming_volumes_to(
-        entries,
-        options,
-        rar50::ArchiveExtras::default().with_recovery_percent(recovery_percent),
-        max_payload_per_volume,
-        &mut sink,
-        &rars::WriterResources::default(),
-    )?;
-    let volumes = sink.take();
-    Ok(volumes)
+    volume_size::sized_for_payload(payload as usize, |volume_size| {
+        let mut sink = rar50::CollectedVolumes::new();
+        rar50::write_streaming_volumes_to(
+            entries,
+            options,
+            rar50::ArchiveExtras::default().with_recovery_percent(recovery_percent),
+            volume_size as u64,
+            &mut sink,
+            &rars::WriterResources::default(),
+        )?;
+        Ok(sink.take())
+    })
 }
 
 fn assert_rar5_inline_recovery_chunks(data: &[u8]) {

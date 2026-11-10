@@ -2,6 +2,8 @@
 #![cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 #[path = "support/scratch.rs"]
 mod scratch;
+#[path = "support/volume_size.rs"]
+mod volume_size;
 use rars::rar50::{ArchiveEntry, Rar50Writer, WriterOptions};
 use rars::{
     Archive, ArchiveReadOptions, ArchiveReader, ArchiveVersion, EntrySource, Error, FeatureSet,
@@ -159,19 +161,22 @@ fn integrity_and_sink_failures_release_scratch() {
 fn split_filtered_members_use_scratch_and_keep_limit_errors() {
     let dir = scratch::case("reader-scratch-split");
     for encrypted in [false, true] {
-        let mut sink = rars::rar50::CollectedVolumes::new();
-        rars::rar50::write_streaming_volumes_to(
-            &[entry(&payload(), encrypted)],
-            options(ArchiveVersion::Rar50),
-            rars::rar50::ArchiveExtras::default()
-                .with_filter_policy(FilterPolicy::explicit(FilterKind::E8)),
-            64,
-            &mut sink,
-            &rars::WriterResources::default().with_temp_dir(&*dir),
-        )
+        let member = entry(&payload(), encrypted);
+        let volumes = volume_size::sized_for_payload(64, |volume_size| {
+            let mut sink = rars::rar50::CollectedVolumes::new();
+            rars::rar50::write_streaming_volumes_to(
+                std::slice::from_ref(&member),
+                options(ArchiveVersion::Rar50),
+                rars::rar50::ArchiveExtras::default()
+                    .with_filter_policy(FilterPolicy::explicit(FilterKind::E8)),
+                volume_size as u64,
+                &mut sink,
+                &rars::WriterResources::default().with_temp_dir(&*dir),
+            )?;
+            Ok::<_, rars::Error>(sink.take())
+        })
         .unwrap();
-        let volumes: Vec<_> = sink
-            .take()
+        let volumes: Vec<_> = volumes
             .into_iter()
             .map(|bytes| ArchiveReader::read_owned(bytes).unwrap())
             .collect();

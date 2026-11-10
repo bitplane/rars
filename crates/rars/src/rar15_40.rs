@@ -41,6 +41,7 @@ pub(crate) use extract::extract_volumes_with_links;
 use extract::{DecoderSession, DecryptingReader, PackedReader};
 #[cfg(feature = "write")]
 pub(crate) use write::write_stored_volumes_with_progress;
+pub(crate) use write::{legacy_volume_payload, render_legacy_volumes};
 #[cfg(feature = "write")]
 pub(crate) use write::{
     write_archive_with_retained_metadata, RetainedFileEntry, RetainedMemberMetadata,

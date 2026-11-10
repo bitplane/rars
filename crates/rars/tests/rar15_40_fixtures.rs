@@ -2,6 +2,8 @@
 
 #[path = "support/scratch.rs"]
 mod scratch;
+#[path = "support/volume_size.rs"]
+mod volume_size;
 
 use rars::crc32::crc32;
 use rars::rar15_40::{
@@ -1930,7 +1932,10 @@ fn rejects_unsupported_stored_split_cipher_without_decoding_or_diagnostics() {
         password: Some(b"secret"),
         file_comment: None,
     };
-    let parts = write_stored_volumes(entry, WriterOptions::default(), 64).unwrap();
+    let parts = volume_size::sized_for_payload(64, |volume_size| {
+        write_stored_volumes(entry, WriterOptions::default(), volume_size)
+    })
+    .unwrap();
     assert!(parts.len() > 1);
     let mut archives: Vec<_> = parts
         .iter()
@@ -4821,7 +4826,10 @@ fn writes_stored_rar15_volume_set_that_reader_reassembles() {
         file_comment: None,
     };
 
-    let parts = write_stored_volumes(entry, WriterOptions::default(), 10).unwrap();
+    let parts = volume_size::sized_for_payload(10, |volume_size| {
+        write_stored_volumes(entry, WriterOptions::default(), volume_size)
+    })
+    .unwrap();
     assert_eq!(parts.len(), 4);
 
     let archives: Vec<_> = parts
@@ -4889,7 +4897,10 @@ fn writes_compressed_rar15_volume_set_that_reader_reassembles() {
         file_comment: None,
     };
 
-    let parts = write_compressed_volumes(entry, WriterOptions::default(), 8).unwrap();
+    let parts = volume_size::sized_for_payload(8, |volume_size| {
+        write_compressed_volumes(entry, WriterOptions::default(), volume_size)
+    })
+    .unwrap();
     assert!(parts.len() >= 2);
 
     let archives: Vec<_> = parts
@@ -4926,8 +4937,10 @@ fn solid_compressed_volume_sets_keep_the_solid_main_flag() {
             password: encrypted_headers.then_some(b"password".as_slice()),
             file_comment: None,
         };
-        let parts =
-            write_compressed_volumes(entry, WriterOptions::new(target, features), 24).unwrap();
+        let parts = volume_size::sized_for_payload(24, |volume_size| {
+            write_compressed_volumes(entry, WriterOptions::new(target, features), volume_size)
+        })
+        .unwrap();
         assert!(parts.len() > 1, "{target:?}");
         let archives: Vec<_> = parts
             .iter()
@@ -4956,7 +4969,10 @@ fn compressed_rar29_volumes_keep_requested_dictionary_size() {
     };
     let options = WriterOptions::new(ArchiveVersion::Rar29, FeatureSet::store_only())
         .with_dictionary_size(2 * 1024 * 1024);
-    let parts = write_compressed_volumes(entry, options, 24).unwrap();
+    let parts = volume_size::sized_for_payload(24, |volume_size| {
+        write_compressed_volumes(entry, options, volume_size)
+    })
+    .unwrap();
     assert!(parts.len() > 1);
     let archives: Vec<_> = parts
         .iter()
@@ -4981,7 +4997,10 @@ fn writes_compressed_rar20_volume_set_that_reader_reassembles() {
     };
     let options = WriterOptions::new(ArchiveVersion::Rar20, FeatureSet::store_only());
 
-    let parts = write_compressed_volumes(entry, options, 8).unwrap();
+    let parts = volume_size::sized_for_payload(8, |volume_size| {
+        write_compressed_volumes(entry, options, volume_size)
+    })
+    .unwrap();
     assert!(parts.len() >= 2);
 
     let archives: Vec<_> = parts
@@ -5013,7 +5032,10 @@ fn writes_compressed_rar29_volume_set_that_reader_reassembles() {
     };
     let options = WriterOptions::new(ArchiveVersion::Rar29, FeatureSet::store_only());
 
-    let parts = write_compressed_volumes(entry, options, 8).unwrap();
+    let parts = volume_size::sized_for_payload(8, |volume_size| {
+        write_compressed_volumes(entry, options, volume_size)
+    })
+    .unwrap();
     assert!(parts.len() >= 2);
 
     let archives: Vec<_> = parts
@@ -5046,7 +5068,10 @@ fn writes_encrypted_rar15_volume_sets_that_reader_reassembles_with_password() {
         password: Some(b"password"),
         file_comment: None,
     };
-    let stored_parts = write_stored_volumes(stored, options, 24).unwrap();
+    let stored_parts = volume_size::sized_for_payload(24, |volume_size| {
+        write_stored_volumes(stored, options, volume_size)
+    })
+    .unwrap();
     let stored_archives: Vec<_> = stored_parts
         .iter()
         .map(|part| Archive::parse(part).unwrap())
@@ -5069,7 +5094,10 @@ fn writes_encrypted_rar15_volume_sets_that_reader_reassembles_with_password() {
         password: Some(b"password"),
         file_comment: None,
     };
-    let compressed_parts = write_compressed_volumes(compressed, options, 24).unwrap();
+    let compressed_parts = volume_size::sized_for_payload(24, |volume_size| {
+        write_compressed_volumes(compressed, options, volume_size)
+    })
+    .unwrap();
     let compressed_archives: Vec<_> = compressed_parts
         .iter()
         .map(|part| Archive::parse(part).unwrap())
@@ -5102,7 +5130,10 @@ fn writes_encrypted_rar20_volume_sets_that_reader_reassembles_with_password() {
         password: Some(b"password"),
         file_comment: None,
     };
-    let stored_parts = write_stored_volumes(stored, options, 24).unwrap();
+    let stored_parts = volume_size::sized_for_payload(24, |volume_size| {
+        write_stored_volumes(stored, options, volume_size)
+    })
+    .unwrap();
     let stored_archives: Vec<_> = stored_parts
         .iter()
         .map(|part| Archive::parse(part).unwrap())
@@ -5131,7 +5162,10 @@ fn writes_encrypted_rar20_volume_sets_that_reader_reassembles_with_password() {
         password: Some(b"password"),
         file_comment: None,
     };
-    let compressed_parts = write_compressed_volumes(compressed, options, 24).unwrap();
+    let compressed_parts = volume_size::sized_for_payload(24, |volume_size| {
+        write_compressed_volumes(compressed, options, volume_size)
+    })
+    .unwrap();
     let compressed_archives: Vec<_> = compressed_parts
         .iter()
         .map(|part| Archive::parse(part).unwrap())
@@ -5162,7 +5196,10 @@ fn writes_encrypted_rar29_volume_sets_that_reader_reassembles_with_password() {
         password: Some(b"password"),
         file_comment: None,
     };
-    let stored_parts = write_stored_volumes(stored, options, 24).unwrap();
+    let stored_parts = volume_size::sized_for_payload(24, |volume_size| {
+        write_stored_volumes(stored, options, volume_size)
+    })
+    .unwrap();
     let stored_archives: Vec<_> = stored_parts
         .iter()
         .map(|part| Archive::parse(part).unwrap())
@@ -5195,7 +5232,10 @@ fn writes_encrypted_rar29_volume_sets_that_reader_reassembles_with_password() {
         password: Some(b"password"),
         file_comment: None,
     };
-    let compressed_parts = write_compressed_volumes(compressed, options, 24).unwrap();
+    let compressed_parts = volume_size::sized_for_payload(24, |volume_size| {
+        write_compressed_volumes(compressed, options, volume_size)
+    })
+    .unwrap();
     let compressed_archives: Vec<_> = compressed_parts
         .iter()
         .map(|part| Archive::parse(part).unwrap())
@@ -5243,7 +5283,10 @@ fn assert_encrypted_rar3_volume_sets_round_trip(target: ArchiveVersion) {
         password: Some(b"password"),
         file_comment: None,
     };
-    let stored_parts = write_stored_volumes(stored, options, 10).unwrap();
+    let stored_parts = volume_size::sized_for_payload(10, |volume_size| {
+        write_stored_volumes(stored, options, volume_size)
+    })
+    .unwrap();
     let stored_archives: Vec<_> = stored_parts
         .iter()
         .map(|part| Archive::parse(part).unwrap())
@@ -5279,7 +5322,10 @@ fn assert_encrypted_rar3_volume_sets_round_trip(target: ArchiveVersion) {
         password: Some(b"password"),
         file_comment: None,
     };
-    let compressed_parts = write_compressed_volumes(compressed, options, 8).unwrap();
+    let compressed_parts = volume_size::sized_for_payload(8, |volume_size| {
+        write_compressed_volumes(compressed, options, volume_size)
+    })
+    .unwrap();
     let compressed_archives: Vec<_> = compressed_parts
         .iter()
         .map(|part| Archive::parse(part).unwrap())
@@ -5321,7 +5367,10 @@ fn assert_header_encrypted_rar3_volume_sets_round_trip(target: ArchiveVersion) {
         password: Some(b"password"),
         file_comment: None,
     };
-    let stored_parts = write_stored_volumes(stored, options, 24).unwrap();
+    let stored_parts = volume_size::sized_for_payload(24, |volume_size| {
+        write_stored_volumes(stored, options, volume_size)
+    })
+    .unwrap();
     assert!(matches!(
         Archive::parse(&stored_parts[0]),
         Err(Error::NeedPassword)
@@ -5349,7 +5398,10 @@ fn assert_header_encrypted_rar3_volume_sets_round_trip(target: ArchiveVersion) {
         password: Some(b"password"),
         file_comment: None,
     };
-    let compressed_parts = write_compressed_volumes(compressed, options, 24).unwrap();
+    let compressed_parts = volume_size::sized_for_payload(24, |volume_size| {
+        write_compressed_volumes(compressed, options, volume_size)
+    })
+    .unwrap();
     assert!(matches!(
         Archive::parse(&compressed_parts[0]),
         Err(Error::NeedPassword)

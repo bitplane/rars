@@ -570,7 +570,7 @@ fn explicit_utf8_legacy_decoding_refuses_invalid_names_without_outputs() {
 #[test]
 fn split_legacy_name_decoding_errors_do_not_create_output() {
     let root = scratch("split-legacy-name-decoding-error");
-    let payload = [b'x'; 128];
+    let payload = [b'x'; 512];
     let parts = rars::rar13::write_stored_volumes(
         StoredEntry {
             name: b"\xff.txt",
@@ -581,7 +581,7 @@ fn split_legacy_name_decoding_errors_do_not_create_output() {
             file_comment: None,
         },
         WriterOptions::default(),
-        64,
+        256,
     )
     .unwrap();
     assert!(parts.len() > 1);
@@ -965,11 +965,18 @@ fn legacy_volume_name_exhaustion_preserves_existing_archives() {
     let source = root.join("p");
     let archive = root.join("archive.rar");
     let second = root.join("archive.r00");
-    fs::write(&source, [b'x'; 128]).unwrap();
+    fs::write(&source, deterministic_noise(10000)).unwrap();
     fs::write(&archive, b"existing archive").unwrap();
     fs::write(&second, b"existing second volume").unwrap();
     let output = rars()
-        .args(["add", "--format", "rar14", "--store", "--volume-size", "1"])
+        .args([
+            "add",
+            "--format",
+            "rar14",
+            "--store",
+            "--volume-size",
+            "150",
+        ])
         .arg(&archive)
         .arg(&source)
         .output()
@@ -2084,11 +2091,7 @@ fn creates_rar50_header_encrypted_recovery_volumes() {
     let dir = scratch("rar50-header-encrypted-recovery-volume");
     let source = dir.join("payload.txt");
     let archive = dir.join("split.rar");
-    fs::write(
-        &source,
-        b"rar50 header encrypted recovery volume cli payload\n".repeat(10),
-    )
-    .unwrap();
+    fs::write(&source, deterministic_noise(12000)).unwrap();
 
     let create = rars()
         .args([
@@ -2101,7 +2104,7 @@ fn creates_rar50_header_encrypted_recovery_volumes() {
             "--recovery-percent",
             "8",
             "--volume-size",
-            "16",
+            "4k",
         ])
         .arg(&archive)
         .arg(&source)
@@ -3451,10 +3454,10 @@ fn creates_stored_multivolume_archive_that_can_be_tested() {
     let dir = scratch("create-stored-multivolume");
     let source = dir.join("payload.bin");
     let archive = dir.join("split.rar");
-    fs::write(&source, b"abcdefghijklmnopqrstuvwxyz0123456789").unwrap();
+    fs::write(&source, deterministic_noise(1500)).unwrap();
 
     let create = rars()
-        .args(["a", "--format", "rar14", "--store", "--volume-size", "10"])
+        .args(["a", "--format", "rar14", "--store", "--volume-size", "512"])
         .arg(&archive)
         .arg(&source)
         .output()
@@ -3482,10 +3485,10 @@ fn creates_compressed_multivolume_archive_that_can_be_tested() {
     let dir = scratch("create-compressed-multivolume");
     let source = dir.join("repeat.txt");
     let archive = dir.join("split.rar");
-    fs::write(&source, b"abcabcabcabcabcabcabcabcabcabcabcabcabcabc").unwrap();
+    fs::write(&source, deterministic_noise(600)).unwrap();
 
     let create = rars()
-        .args(["a", "--format", "rar14", "--volume-size", "8"])
+        .args(["a", "--format", "rar14", "--volume-size", "512"])
         .arg(&archive)
         .arg(&source)
         .output()
@@ -3509,10 +3512,10 @@ fn creates_rar15_stored_multivolume_archive_that_can_be_tested() {
     let dir = scratch("create-rar15-stored-multivolume");
     let source = dir.join("payload.bin");
     let archive = dir.join("split.rar");
-    fs::write(&source, b"abcdefghijklmnopqrstuvwxyz0123456789").unwrap();
+    fs::write(&source, deterministic_noise(1500)).unwrap();
 
     let create = rars()
-        .args(["a", "--format", "rar15", "--store", "--volume-size", "10"])
+        .args(["a", "--format", "rar15", "--store", "--volume-size", "512"])
         .arg(&archive)
         .arg(&source)
         .output()
@@ -3540,10 +3543,10 @@ fn creates_rar15_compressed_multivolume_archive_that_can_be_tested() {
     let dir = scratch("create-rar15-compressed-multivolume");
     let source = dir.join("repeat.txt");
     let archive = dir.join("split.rar");
-    fs::write(&source, b"abcabcabcabcabcabcabcabcabcabcabcabcabcabc").unwrap();
+    fs::write(&source, deterministic_noise(600)).unwrap();
 
     let create = rars()
-        .args(["a", "--format", "rar15", "--volume-size", "8"])
+        .args(["a", "--format", "rar15", "--volume-size", "512"])
         .arg(&archive)
         .arg(&source)
         .output()
@@ -3567,14 +3570,10 @@ fn creates_rar20_compressed_multivolume_archive_that_can_be_tested() {
     let dir = scratch("create-rar20-compressed-multivolume");
     let source = dir.join("repeat.txt");
     let archive = dir.join("split.rar");
-    fs::write(
-        &source,
-        b"rar20 split phrase alpha beta gamma rar20 split phrase alpha beta gamma\n".repeat(24),
-    )
-    .unwrap();
+    fs::write(&source, deterministic_noise(1500)).unwrap();
 
     let create = rars()
-        .args(["a", "--format", "rar20", "--volume-size", "8"])
+        .args(["a", "--format", "rar20", "--volume-size", "512"])
         .arg(&archive)
         .arg(&source)
         .output()
@@ -3601,14 +3600,10 @@ fn creates_rar29_compressed_multivolume_archive_that_can_be_tested() {
     let dir = scratch("create-rar29-compressed-multivolume");
     let source = dir.join("repeat.txt");
     let archive = dir.join("split.rar");
-    fs::write(
-        &source,
-        b"rar29 split phrase alpha beta gamma rar29 split phrase alpha beta gamma\n".repeat(24),
-    )
-    .unwrap();
+    fs::write(&source, deterministic_noise(1500)).unwrap();
 
     let create = rars()
-        .args(["a", "--format", "rar29", "--volume-size", "8"])
+        .args(["a", "--format", "rar29", "--volume-size", "512"])
         .arg(&archive)
         .arg(&source)
         .output()
@@ -3635,11 +3630,7 @@ fn creates_rar15_encrypted_multivolume_archive_that_can_be_tested() {
     let dir = scratch("create-rar15-encrypted-multivolume");
     let source = dir.join("secret.txt");
     let archive = dir.join("split.rar");
-    fs::write(
-        &source,
-        b"secret split compressed secret split compressed\n",
-    )
-    .unwrap();
+    fs::write(&source, deterministic_noise(1500)).unwrap();
 
     let create = rars()
         .args([
@@ -3649,7 +3640,7 @@ fn creates_rar15_encrypted_multivolume_archive_that_can_be_tested() {
             "--format",
             "rar15",
             "--volume-size",
-            "8",
+            "512",
         ])
         .arg(&archive)
         .arg(&source)
@@ -3684,11 +3675,7 @@ fn creates_rar30_encrypted_multivolume_archive_that_can_be_tested() {
     let dir = scratch("create-rar30-encrypted-multivolume");
     let source = dir.join("secret.txt");
     let archive = dir.join("split.rar");
-    fs::write(
-        &source,
-        b"rar30 secret split compressed rar30 secret split compressed\n",
-    )
-    .unwrap();
+    fs::write(&source, deterministic_noise(1500)).unwrap();
 
     let create = rars()
         .args([
@@ -3698,7 +3685,7 @@ fn creates_rar30_encrypted_multivolume_archive_that_can_be_tested() {
             "--format",
             "rar30",
             "--volume-size",
-            "8",
+            "512",
         ])
         .arg(&archive)
         .arg(&source)
@@ -3733,11 +3720,7 @@ fn creates_rar29_encrypted_multivolume_archive_that_can_be_tested() {
     let dir = scratch("create-rar29-encrypted-multivolume");
     let source = dir.join("secret.txt");
     let archive = dir.join("split.rar");
-    fs::write(
-        &source,
-        b"rar29 secret split compressed rar29 secret split compressed\n",
-    )
-    .unwrap();
+    fs::write(&source, deterministic_noise(1500)).unwrap();
 
     let create = rars()
         .args([
@@ -3747,7 +3730,7 @@ fn creates_rar29_encrypted_multivolume_archive_that_can_be_tested() {
             "--format",
             "rar29",
             "--volume-size",
-            "8",
+            "512",
         ])
         .arg(&archive)
         .arg(&source)
@@ -3782,11 +3765,7 @@ fn creates_rar30_header_encrypted_multivolume_archive_that_can_be_tested() {
     let dir = scratch("create-rar30-header-encrypted-multivolume");
     let source = dir.join("secret.txt");
     let archive = dir.join("split.rar");
-    fs::write(
-        &source,
-        b"rar30 header encrypted split compressed payload payload payload\n",
-    )
-    .unwrap();
+    fs::write(&source, deterministic_noise(1500)).unwrap();
 
     let create = rars()
         .args([
@@ -3797,7 +3776,7 @@ fn creates_rar30_header_encrypted_multivolume_archive_that_can_be_tested() {
             "rar30",
             "--encrypt-headers",
             "--volume-size",
-            "8",
+            "512",
         ])
         .arg(&archive)
         .arg(&source)
@@ -4663,11 +4642,7 @@ fn creates_rar50_encrypted_stored_multivolume_archive_that_can_be_tested() {
     let dir = scratch("create-rar50-encrypted-stored-volume");
     let source = dir.join("secret.txt");
     let archive = dir.join("created.rar");
-    fs::write(
-        &source,
-        b"rar50 encrypted stored volume cli payload\n".repeat(12),
-    )
-    .unwrap();
+    fs::write(&source, deterministic_noise(3000)).unwrap();
 
     let create = rars()
         .args([
@@ -4678,7 +4653,7 @@ fn creates_rar50_encrypted_stored_multivolume_archive_that_can_be_tested() {
             "rar50",
             "--store",
             "--volume-size",
-            "97",
+            "1k",
         ])
         .arg(&archive)
         .arg(&source)
@@ -4711,11 +4686,7 @@ fn creates_rar50_header_encrypted_stored_multivolume_archive_that_can_be_tested(
     let dir = scratch("create-rar50-header-encrypted-stored-volume");
     let source = dir.join("secret.txt");
     let archive = dir.join("created.rar");
-    fs::write(
-        &source,
-        b"rar50 header encrypted stored volume cli payload\n".repeat(12),
-    )
-    .unwrap();
+    fs::write(&source, deterministic_noise(3000)).unwrap();
 
     let create = rars()
         .args([
@@ -4727,7 +4698,7 @@ fn creates_rar50_header_encrypted_stored_multivolume_archive_that_can_be_tested(
             "--store",
             "--encrypt-headers",
             "--volume-size",
-            "97",
+            "1k",
         ])
         .arg(&archive)
         .arg(&source)
@@ -5180,10 +5151,10 @@ fn creates_rar50_stored_multivolume_archive_that_can_be_tested() {
     let dir = scratch("create-rar50-stored-multivolume");
     let source = dir.join("payload.txt");
     let archive = dir.join("split.rar");
-    fs::write(&source, b"rar50 stored volume cli payload\n".repeat(20)).unwrap();
+    fs::write(&source, deterministic_noise(1500)).unwrap();
 
     let create = rars()
-        .args(["a", "--format", "rar50", "--store", "--volume-size", "90"])
+        .args(["a", "--format", "rar50", "--store", "--volume-size", "512"])
         .arg(&archive)
         .arg(&source)
         .output()
@@ -5223,11 +5194,7 @@ fn creates_rar50_stored_recovery_multivolume_archive_that_can_be_tested_and_list
     let dir = scratch("create-rar50-stored-recovery-multivolume");
     let source = dir.join("payload.txt");
     let archive = dir.join("split.rar");
-    fs::write(
-        &source,
-        b"rar50 stored recovery volume cli payload\n".repeat(20),
-    )
-    .unwrap();
+    fs::write(&source, deterministic_noise(8000)).unwrap();
 
     let create = rars()
         .args([
@@ -5238,7 +5205,7 @@ fn creates_rar50_stored_recovery_multivolume_archive_that_can_be_tested_and_list
             "--recovery-percent",
             "8",
             "--volume-size",
-            "90",
+            "2k",
         ])
         .arg(&archive)
         .arg(&source)
@@ -5598,12 +5565,11 @@ fn creates_rar50_compressed_multivolume_archive_that_can_be_tested() {
     let dir = scratch("create-rar50-compressed-multivolume");
     let source = dir.join("payload.txt");
     let archive = dir.join("split.rar");
-    let payload =
-        b"rar50 compressed split cli payload\nrar50 compressed split cli payload\n".repeat(16);
+    let payload = deterministic_noise(1500);
     fs::write(&source, &payload).unwrap();
 
     let create = rars()
-        .args(["a", "--format", "rar50", "--volume-size", "32"])
+        .args(["a", "--format", "rar50", "--volume-size", "512"])
         .arg(&archive)
         .arg(&source)
         .output()
@@ -6163,15 +6129,10 @@ fn creates_rar50_solid_compressed_multivolume_archive_that_can_be_tested() {
     let dir = scratch("create-rar50-solid-compressed-multivolume");
     let source = dir.join("payload.txt");
     let archive = dir.join("split.rar");
-    fs::write(
-        &source,
-        b"rar50 solid compressed split cli payload\nrar50 solid compressed split cli payload\n"
-            .repeat(16),
-    )
-    .unwrap();
+    fs::write(&source, deterministic_noise(3000)).unwrap();
 
     let create = rars()
-        .args(["a", "--format", "rar50", "--solid", "--volume-size", "32"])
+        .args(["a", "--format", "rar50", "--solid", "--volume-size", "1k"])
         .arg(&archive)
         .arg(&source)
         .output()
@@ -6248,9 +6209,7 @@ fn creates_rar50_encrypted_compressed_multivolume_archive_that_can_be_tested() {
     let dir = scratch("create-rar50-encrypted-compressed-multivolume");
     let source = dir.join("secret.txt");
     let archive = dir.join("split.rar");
-    let payload =
-        b"rar50 encrypted compressed split cli payload\nrar50 encrypted compressed split cli payload\n"
-            .repeat(16);
+    let payload = deterministic_noise(3000);
     fs::write(&source, &payload).unwrap();
 
     let create = rars()
@@ -6261,7 +6220,7 @@ fn creates_rar50_encrypted_compressed_multivolume_archive_that_can_be_tested() {
             "--password",
             "pass",
             "--volume-size",
-            "32",
+            "1k",
         ])
         .arg(&archive)
         .arg(&source)
@@ -6287,9 +6246,7 @@ fn creates_rar50_encrypted_solid_compressed_multivolume_archive_that_can_be_test
     let dir = scratch("create-rar50-encrypted-solid-compressed-multivolume");
     let source = dir.join("secret.txt");
     let archive = dir.join("split.rar");
-    let payload =
-        b"rar50 encrypted solid compressed split cli payload\nrar50 encrypted solid compressed split cli payload\n"
-            .repeat(16);
+    let payload = deterministic_noise(3000);
     fs::write(&source, &payload).unwrap();
 
     let create = rars()
@@ -6301,7 +6258,7 @@ fn creates_rar50_encrypted_solid_compressed_multivolume_archive_that_can_be_test
             "pass",
             "--solid",
             "--volume-size",
-            "32",
+            "1k",
         ])
         .arg(&archive)
         .arg(&source)
@@ -6327,9 +6284,7 @@ fn creates_rar50_header_encrypted_compressed_multivolume_archive_that_can_be_tes
     let dir = scratch("create-rar50-header-encrypted-compressed-multivolume");
     let source = dir.join("secret.txt");
     let archive = dir.join("split.rar");
-    let payload =
-        b"rar50 header encrypted compressed split cli payload\nrar50 header encrypted compressed split cli payload\n"
-            .repeat(16);
+    let payload = deterministic_noise(3000);
     fs::write(&source, &payload).unwrap();
 
     let create = rars()
@@ -6341,7 +6296,7 @@ fn creates_rar50_header_encrypted_compressed_multivolume_archive_that_can_be_tes
             "pass",
             "--encrypt-headers",
             "--volume-size",
-            "32",
+            "1k",
         ])
         .arg(&archive)
         .arg(&source)
@@ -6370,9 +6325,7 @@ fn creates_rar50_header_encrypted_solid_compressed_multivolume_archive_that_can_
     let dir = scratch("create-rar50-header-encrypted-solid-compressed-multivolume");
     let source = dir.join("secret.txt");
     let archive = dir.join("split.rar");
-    let payload =
-        b"rar50 header encrypted solid compressed split cli payload\nrar50 header encrypted solid compressed split cli payload\n"
-            .repeat(16);
+    let payload = deterministic_noise(3000);
     fs::write(&source, &payload).unwrap();
 
     let create = rars()
@@ -6385,7 +6338,7 @@ fn creates_rar50_header_encrypted_solid_compressed_multivolume_archive_that_can_
             "--encrypt-headers",
             "--solid",
             "--volume-size",
-            "32",
+            "1k",
         ])
         .arg(&archive)
         .arg(&source)

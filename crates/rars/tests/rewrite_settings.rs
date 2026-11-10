@@ -846,7 +846,7 @@ fn preserving_builder_retains_encrypted_rar5_archive_comment_settings() {
 fn preservation_preflight_refuses_volume_layout() {
     let mut builder = Builder::new(ArchiveVersion::Rar50)
         .store(true)
-        .volume_size(Some(64));
+        .volume_size(Some(512));
     builder
         .add_bytes(b"file".to_vec(), vec![42; 1024], None, None)
         .unwrap();

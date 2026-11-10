@@ -26,6 +26,10 @@ mod scratch;
 #[cfg(test)]
 mod test_features;
 
+#[cfg(all(test, feature = "write"))]
+#[path = "../tests/support/volume_size.rs"]
+mod volume_test_support;
+
 #[cfg(all(test, feature = "write", feature = "encryption"))]
 #[path = "../tests/support/read_errors.rs"]
 mod read_errors;
@@ -2202,23 +2206,27 @@ mod tests {
         )
     }
 
+    /// Writes a set whose volumes carry about `payload` bytes of member data
+    /// each, so the tests can force many small volumes.
     fn write_rar50_volume_set(
         entries: &[rar50::ArchiveEntry],
         options: rar50::WriterOptions,
-        max_payload_per_volume: u64,
+        payload: usize,
         recovery_percent: Option<u64>,
     ) -> Vec<Vec<u8>> {
-        let mut sink = rar50::CollectedVolumes::new();
-        rar50::write_streaming_volumes_to(
-            entries,
-            options,
-            rar50::ArchiveExtras::default().with_recovery_percent(recovery_percent),
-            max_payload_per_volume,
-            &mut sink,
-            &WriterResources::default(),
-        )
-        .unwrap();
-        sink.take()
+        crate::volume_test_support::sized_for_payload(payload, |volume_size| {
+            let mut sink = rar50::CollectedVolumes::new();
+            rar50::write_streaming_volumes_to(
+                entries,
+                options,
+                rar50::ArchiveExtras::default().with_recovery_percent(recovery_percent),
+                volume_size as u64,
+                &mut sink,
+                &WriterResources::default(),
+            )?;
+            Ok::<_, Error>(sink.take())
+        })
+        .unwrap()
     }
 
     fn write_rar29_filter(
@@ -3404,19 +3412,21 @@ mod tests {
 
     #[test]
     fn direct_writer_creates_rar15_stored_volumes() {
-        let parts = rar15_40::write_stored_volumes(
-            rar15_40::StoredEntry {
-                name: b"split.bin",
-                data: b"abcdefghijklmnopqrstuvwxyz0123456789",
-                file_time: 0,
-                file_attr: 0x20,
-                host_os: 3,
-                password: None,
-                file_comment: None,
-            },
-            rar15_options(ArchiveVersion::Rar15),
-            10,
-        )
+        let parts = crate::volume_test_support::sized_for_payload(10, |volume_size| {
+            rar15_40::write_stored_volumes(
+                rar15_40::StoredEntry {
+                    name: b"split.bin",
+                    data: b"abcdefghijklmnopqrstuvwxyz0123456789",
+                    file_time: 0,
+                    file_attr: 0x20,
+                    host_os: 3,
+                    password: None,
+                    file_comment: None,
+                },
+                rar15_options(ArchiveVersion::Rar15),
+                volume_size,
+            )
+        })
         .unwrap();
         let archives: Vec<_> = parts
             .iter()
@@ -3431,19 +3441,21 @@ mod tests {
     #[test]
     fn direct_writer_creates_rar20_compressed_volumes() {
         let data = b"facade rar20 split phrase alpha beta gamma\n".repeat(32);
-        let parts = rar15_40::write_compressed_volumes(
-            rar15_40::FileEntry {
-                name: b"split-rar20.txt",
-                data: &data,
-                file_time: 0,
-                file_attr: 0x20,
-                host_os: 3,
-                password: None,
-                file_comment: None,
-            },
-            rar15_options(ArchiveVersion::Rar20),
-            8,
-        )
+        let parts = crate::volume_test_support::sized_for_payload(8, |volume_size| {
+            rar15_40::write_compressed_volumes(
+                rar15_40::FileEntry {
+                    name: b"split-rar20.txt",
+                    data: &data,
+                    file_time: 0,
+                    file_attr: 0x20,
+                    host_os: 3,
+                    password: None,
+                    file_comment: None,
+                },
+                rar15_options(ArchiveVersion::Rar20),
+                volume_size,
+            )
+        })
         .unwrap();
         let archives: Vec<_> = parts
             .iter()
@@ -3461,19 +3473,21 @@ mod tests {
     #[test]
     fn direct_writer_creates_rar29_compressed_volumes() {
         let data = b"facade rar29 split phrase alpha beta gamma\n".repeat(32);
-        let parts = rar15_40::write_compressed_volumes(
-            rar15_40::FileEntry {
-                name: b"split-rar29.txt",
-                data: &data,
-                file_time: 0,
-                file_attr: 0x20,
-                host_os: 3,
-                password: None,
-                file_comment: None,
-            },
-            rar15_options(ArchiveVersion::Rar29),
-            8,
-        )
+        let parts = crate::volume_test_support::sized_for_payload(8, |volume_size| {
+            rar15_40::write_compressed_volumes(
+                rar15_40::FileEntry {
+                    name: b"split-rar29.txt",
+                    data: &data,
+                    file_time: 0,
+                    file_attr: 0x20,
+                    host_os: 3,
+                    password: None,
+                    file_comment: None,
+                },
+                rar15_options(ArchiveVersion::Rar29),
+                volume_size,
+            )
+        })
         .unwrap();
         let archives: Vec<_> = parts
             .iter()
@@ -3492,19 +3506,21 @@ mod tests {
     #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar29_encrypted_compressed_volumes() {
         let features = FeatureSet::store_only();
-        let parts = rar15_40::write_compressed_volumes(
-            rar15_40::FileEntry {
-                name: b"split-rar29-secret.txt",
-                data: b"facade rar29 encrypted split facade rar29 encrypted split\n",
-                file_time: 0,
-                file_attr: 0x20,
-                host_os: 3,
-                password: Some(b"password"),
-                file_comment: None,
-            },
-            rar15_options_with_features(ArchiveVersion::Rar29, features),
-            8,
-        )
+        let parts = crate::volume_test_support::sized_for_payload(8, |volume_size| {
+            rar15_40::write_compressed_volumes(
+                rar15_40::FileEntry {
+                    name: b"split-rar29-secret.txt",
+                    data: b"facade rar29 encrypted split facade rar29 encrypted split\n",
+                    file_time: 0,
+                    file_attr: 0x20,
+                    host_os: 3,
+                    password: Some(b"password"),
+                    file_comment: None,
+                },
+                rar15_options_with_features(ArchiveVersion::Rar29, features),
+                volume_size,
+            )
+        })
         .unwrap();
         let archives: Vec<_> = parts
             .iter()
@@ -3527,19 +3543,21 @@ mod tests {
     #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar15_encrypted_compressed_volumes() {
         let features = FeatureSet::store_only();
-        let parts = rar15_40::write_compressed_volumes(
-            rar15_40::FileEntry {
-                name: b"split-secret.txt",
-                data: b"facade encrypted split facade encrypted split\n",
-                file_time: 0,
-                file_attr: 0x20,
-                host_os: 3,
-                password: Some(b"password"),
-                file_comment: None,
-            },
-            rar15_options_with_features(ArchiveVersion::Rar15, features),
-            8,
-        )
+        let parts = crate::volume_test_support::sized_for_payload(8, |volume_size| {
+            rar15_40::write_compressed_volumes(
+                rar15_40::FileEntry {
+                    name: b"split-secret.txt",
+                    data: b"facade encrypted split facade encrypted split\n",
+                    file_time: 0,
+                    file_attr: 0x20,
+                    host_os: 3,
+                    password: Some(b"password"),
+                    file_comment: None,
+                },
+                rar15_options_with_features(ArchiveVersion::Rar15, features),
+                volume_size,
+            )
+        })
         .unwrap();
         let archives: Vec<_> = parts
             .iter()
@@ -3562,19 +3580,21 @@ mod tests {
     #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar30_encrypted_compressed_volumes() {
         let features = FeatureSet::store_only();
-        let parts = rar15_40::write_compressed_volumes(
-            rar15_40::FileEntry {
-                name: b"split-rar30-secret.txt",
-                data: b"facade rar30 encrypted split facade rar30 encrypted split\n",
-                file_time: 0,
-                file_attr: 0x20,
-                host_os: 3,
-                password: Some(b"password"),
-                file_comment: None,
-            },
-            rar15_options_with_features(ArchiveVersion::Rar30, features),
-            8,
-        )
+        let parts = crate::volume_test_support::sized_for_payload(8, |volume_size| {
+            rar15_40::write_compressed_volumes(
+                rar15_40::FileEntry {
+                    name: b"split-rar30-secret.txt",
+                    data: b"facade rar30 encrypted split facade rar30 encrypted split\n",
+                    file_time: 0,
+                    file_attr: 0x20,
+                    host_os: 3,
+                    password: Some(b"password"),
+                    file_comment: None,
+                },
+                rar15_options_with_features(ArchiveVersion::Rar30, features),
+                volume_size,
+            )
+        })
         .unwrap();
         let archives: Vec<_> = parts
             .iter()
@@ -3598,7 +3618,9 @@ mod tests {
     fn direct_writer_creates_rar30_header_encrypted_compressed_volumes() {
         let mut features = FeatureSet::store_only();
         features.header_encryption = true;
-        let parts = rar15_40::write_compressed_volumes(
+        let parts =
+            crate::volume_test_support::sized_for_payload(8, |volume_size| {
+                rar15_40::write_compressed_volumes(
             rar15_40::FileEntry {
                 name: b"split-rar30-header-secret.txt",
                 data: b"facade rar30 header encrypted split facade rar30 header encrypted split\n",
@@ -3609,9 +3631,9 @@ mod tests {
                 file_comment: None,
             },
             rar15_options_with_features(ArchiveVersion::Rar30, features),
-            8,
-        )
-        .unwrap();
+            volume_size)
+            })
+            .unwrap();
         assert!(matches!(
             rar15_40::Archive::parse(&parts[0]),
             Err(Error::NeedPassword)

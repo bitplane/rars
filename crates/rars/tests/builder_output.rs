@@ -59,9 +59,9 @@ fn legacy_volumes_accept_regular_unix_mode_files() {
         ArchiveVersion::Rar29,
         ArchiveVersion::Rar40,
     ] {
-        let mut builder = Builder::new(version).store(true).volume_size(Some(64));
+        let mut builder = Builder::new(version).store(true).volume_size(Some(512));
         builder
-            .add_bytes(b"file".to_vec(), vec![42; 128], None, Some(0o100640))
+            .add_bytes(b"file".to_vec(), vec![42; 2048], None, Some(0o100640))
             .unwrap();
         let volumes = builder.build_volumes(None).unwrap();
         assert!(volumes.len() > 1, "{version:?}");
