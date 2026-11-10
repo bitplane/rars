@@ -1047,6 +1047,41 @@ impl<B: Budget> ReaderState<B> {
         let mut output =
             StreamingOutput::new(history, output_size, dictionary_size, history_limit)?;
         output.stage.control = self.read_control.clone();
+        self.decode_blocks(
+            input,
+            algorithm_version,
+            &mut output,
+            &mut sink,
+            &mut filters,
+        )?;
+        self.finish_stream(output, &mut sink)
+    }
+
+    fn finish_stream<E>(
+        &mut self,
+        mut output: StreamingOutput<B>,
+        sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), StreamDecodeError<E>> {
+        if output.written() == output.output_limit {
+            output.finish(sink)?;
+            let history = output.into_history();
+            self.history_window = history.len;
+            self.streamed_history = Some(history);
+            Ok(())
+        } else {
+            Err(Error::NeedMoreInput.into())
+        }
+    }
+
+    fn decode_blocks<E>(
+        &mut self,
+        input: &mut impl Read,
+        algorithm_version: u8,
+        output: &mut StreamingOutput<B>,
+        sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
+        filters: &mut Option<&mut dyn FnMut(PendingFilter) -> std::result::Result<(), E>>,
+    ) -> std::result::Result<(), StreamDecodeError<E>> {
+        let output_size = output.output_limit;
         let mut literals = [0; LITERAL_BURST];
 
         loop {
@@ -1078,33 +1113,21 @@ impl<B: Budget> ReaderState<B> {
                 let symbol = tables.main.decode(&mut bits)?;
                 match symbol {
                     0..=255 => {
-                        output.push(symbol as u8, &mut sink)?;
+                        output.push(symbol as u8, sink)?;
                         let room = output.literal_room();
                         let count =
                             bits.literal_burst(&tables.main, payload_bits, &mut literals[..room]);
                         if count != 0 {
-                            output.push_literals(&literals[..count], &mut sink)?;
+                            output.push_literals(&literals[..count], sink)?;
                         }
                     }
                     256 => {
                         let filter = read_filter(&mut bits, output.written())?;
-                        if filter
-                            .start
-                            .checked_add(filter.length)
-                            .is_none_or(|end| end > output_size)
-                        {
-                            return Err(
-                                Error::InvalidData("RAR 5 filter range exceeds output").into()
-                            );
-                        }
-                        match filters.as_mut() {
-                            Some(filters) => filters(filter).map_err(StreamDecodeError::Sink)?,
-                            None => output.stage.hold(filter)?,
-                        }
+                        output.accept_filter(filter, filters)?;
                     }
                     257 => {
                         if self.last_length != 0 {
-                            output.copy_match(self.reps[0], self.last_length, &mut sink)?;
+                            output.copy_match(self.reps[0], self.last_length, sink)?;
                         }
                     }
                     258..=261 => {
@@ -1124,7 +1147,7 @@ impl<B: Budget> ReaderState<B> {
                         self.reps[..=rep_index].rotate_right(1);
                         self.reps[0] = distance;
                         self.last_length = length;
-                        output.copy_match(distance, length, &mut sink)?;
+                        output.copy_match(distance, length, sink)?;
                     }
                     262.. => {
                         let length_slot = symbol - 262;
@@ -1152,25 +1175,15 @@ impl<B: Budget> ReaderState<B> {
                         self.reps.rotate_right(1);
                         self.reps[0] = distance;
                         self.last_length = length;
-                        output.copy_match(distance, length, &mut sink)?;
+                        output.copy_match(distance, length, sink)?;
                     }
                 }
             }
 
             self.tables = Some(tables);
             if block.header.is_last || output.written() >= output_size {
-                break;
+                return Ok(());
             }
-        }
-
-        if output.written() == output_size {
-            output.finish(&mut sink)?;
-            let history = output.into_history();
-            self.history_window = history.len;
-            self.streamed_history = Some(history);
-            Ok(())
-        } else {
-            Err(Error::NeedMoreInput.into())
         }
     }
 
@@ -1547,6 +1560,24 @@ impl<B: Budget> StreamingOutput<B> {
 
     fn written(&self) -> usize {
         self.written
+    }
+
+    fn accept_filter<E>(
+        &mut self,
+        filter: PendingFilter,
+        filters: &mut Option<&mut dyn FnMut(PendingFilter) -> std::result::Result<(), E>>,
+    ) -> std::result::Result<(), StreamDecodeError<E>> {
+        if filter
+            .start
+            .checked_add(filter.length)
+            .is_none_or(|end| end > self.output_limit)
+        {
+            return Err(Error::InvalidData("RAR 5 filter range exceeds output").into());
+        }
+        match filters.as_mut() {
+            Some(filters) => filters(filter).map_err(StreamDecodeError::Sink),
+            None => self.stage.hold(filter),
+        }
     }
 
     /// Grows the ring so `count` more bytes cannot overwrite history; true if it moved.
