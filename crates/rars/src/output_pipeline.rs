@@ -125,9 +125,12 @@ where
         }
     };
 
+    // The decoder's own workers follow the caller's cap.
+    let cap = crate::parallel::ThreadCap::current();
     std::thread::scope(|scope| {
         let stop = &stop;
         let producer = scope.spawn(move || {
+            let _cap = crate::parallel::ThreadCap::set(cap);
             let mut chunks = Chunks {
                 buffer: Vec::new(),
                 filled: 0,
@@ -176,4 +179,26 @@ where
         outcome.map_err(PipeError::Write)?;
         produced.map_err(PipeError::Produce)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::parallel::ThreadCap;
+
+    #[test]
+    fn the_producer_keeps_the_callers_thread_cap() {
+        let _cap = ThreadCap::set(Some(3));
+        let mut out = Vec::new();
+        let seen = super::run(
+            |chunks| {
+                chunks.push(b"x")?;
+                Ok::<_, std::io::Error>(ThreadCap::current())
+            },
+            &mut |_: &[u8]| {},
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(seen, Some(3));
+        assert_eq!(out, b"x");
+    }
 }

@@ -18,6 +18,39 @@ pub(crate) use sequential::*;
 ))]
 pub(crate) use threaded::*;
 
+thread_local! {
+    static CAP: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Caps this thread's fan-out until dropped; `None` leaves the cap it finds.
+pub(crate) struct ThreadCap(Option<Option<usize>>);
+
+impl ThreadCap {
+    pub(crate) fn set(threads: Option<usize>) -> Self {
+        Self(threads.map(|threads| CAP.replace(Some(threads.max(1)))))
+    }
+
+    /// The cap in force here, for a helper thread to take on.
+    #[cfg_attr(
+        any(
+            not(feature = "parallel"),
+            all(target_arch = "wasm32", target_os = "unknown")
+        ),
+        allow(dead_code)
+    )]
+    pub(crate) fn current() -> Option<usize> {
+        CAP.get()
+    }
+}
+
+impl Drop for ThreadCap {
+    fn drop(&mut self) {
+        if let Some(previous) = self.0 {
+            CAP.set(previous);
+        }
+    }
+}
+
 #[cfg(all(
     feature = "parallel",
     not(all(target_arch = "wasm32", target_os = "unknown"))
@@ -32,6 +65,9 @@ mod threaded {
         T: Send,
         F: Fn(usize, &mut T) + Sync + Send,
     {
+        if items.len() == 1 {
+            return apply(0, &mut items[0]);
+        }
         items
             .par_iter_mut()
             .enumerate()
@@ -48,6 +84,13 @@ mod threaded {
         E: Send,
         F: Fn(T) -> Result<O, E> + Sync + Send,
     {
+        if let [_] = items.as_slice() {
+            let item = items.into_iter().next().expect("one item");
+            return match map(item) {
+                Ok(output) => (vec![output], None),
+                Err(error) => (Vec::new(), Some(error)),
+            };
+        }
         let mut outputs = Vec::with_capacity(items.len());
         for result in items.into_par_iter().map(map).collect::<Vec<_>>() {
             match result {
@@ -93,9 +136,10 @@ mod threaded {
         threads()
     }
 
-    /// How many members can be worked on at the same time.
+    /// How many members can be worked on at the same time, within this thread's cap.
     pub(crate) fn threads() -> usize {
-        rayon::current_num_threads().max(1)
+        let pool = rayon::current_num_threads().max(1);
+        super::ThreadCap::current().map_or(pool, |cap| cap.min(pool))
     }
 
     /// Not inside the pool, where members already run side by side, nor at one thread.
@@ -105,10 +149,10 @@ mod threaded {
 
     const DEFAULT_BLOCK_DECODE_WORKERS: usize = 8;
 
-    /// None inside the pool, where members already decode side by side.
+    /// None inside the pool, where members already decode side by side, or under a cap of one.
     pub(crate) fn block_decode_workers(policy: crate::read_control::DecodeWorkers) -> usize {
         use crate::read_control::DecodeWorkers;
-        if rayon::current_thread_index().is_some() {
+        if rayon::current_thread_index().is_some() || super::ThreadCap::current() == Some(1) {
             return 0;
         }
         match policy {
@@ -198,6 +242,61 @@ mod sequential {
 #[cfg(test)]
 mod tests {
     use super::sequential;
+
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
+    #[test]
+    fn a_thread_cap_bounds_fan_out_until_dropped() {
+        use super::{block_decode_workers, default_window, may_spawn, threads, ThreadCap};
+        use crate::read_control::DecodeWorkers;
+        let uncapped = threads();
+        {
+            let _one = ThreadCap::set(Some(1));
+            assert_eq!(default_window(), 1);
+            assert!(!may_spawn());
+            assert_eq!(block_decode_workers(DecodeWorkers::Auto), 0);
+            assert_eq!(block_decode_workers(DecodeWorkers::AtMost(4)), 0);
+            {
+                let _unset = ThreadCap::set(None);
+                assert_eq!(threads(), 1);
+                let _two = ThreadCap::set(Some(2));
+                assert_eq!(threads(), uncapped.min(2));
+                assert!(block_decode_workers(DecodeWorkers::AtMost(8)) <= 2);
+            }
+            assert_eq!(threads(), 1);
+        }
+        assert_eq!(ThreadCap::current(), None);
+        assert_eq!(threads(), uncapped);
+        let _zero = ThreadCap::set(Some(0));
+        assert!(!may_spawn());
+    }
+
+    #[cfg(feature = "write")]
+    #[test]
+    fn read_entry_points_cap_the_calling_thread_for_the_call() {
+        use super::ThreadCap;
+        let mut builder = crate::Builder::new(crate::ArchiveVersion::Rar50);
+        builder
+            .add_bytes(b"a".to_vec(), b"x".to_vec(), None, None)
+            .unwrap();
+        let archive = crate::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        let options = crate::ArchiveReadOptions::new().with_threads(1);
+        archive
+            .extract_to_parallel_buffered_with_options(options, |_| {
+                assert_eq!(ThreadCap::current(), Some(1));
+                Ok(Box::new(std::io::sink()))
+            })
+            .unwrap();
+        archive
+            .test_with_options_and_callback(options, |_| {
+                assert_eq!(ThreadCap::current(), Some(1));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(ThreadCap::current(), None);
+    }
 
     #[test]
     fn sequential_slots_and_collect_keep_order_and_stop_on_error() {

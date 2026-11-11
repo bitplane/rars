@@ -189,6 +189,12 @@ mod tests {
     }
 
     #[test]
+    fn a_thread_cap_of_one_keeps_large_members_on_the_caller() {
+        let _cap = crate::parallel::ThreadCap::set(Some(1));
+        assert!(read_on_caller(4 << 20, &Allowance::default()));
+    }
+
+    #[test]
     fn large_members_are_read_off_the_caller() {
         if crate::parallel::may_spawn() {
             assert!(!read_on_caller(4 << 20, &Allowance::default()));

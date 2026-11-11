@@ -102,6 +102,23 @@ def test_options_are_immutable_reusable_and_preserve_password_handling():
             rars.ReadOptions(max_total_output_bytes=value)
 
 
+@pytest.mark.parametrize("threads", [0, 1, 2, None])
+def test_thread_cap_extracts_and_tests_the_same_bytes(tmp_path, threads):
+    builder = rars.RarBuilder()
+    payloads = {f"m{index}": bytes([index]) * 300_000 + b"tail" for index in range(6)}
+    for name, payload in payloads.items():
+        builder.add_bytes(payload, name)
+    archive = rars.RarFile.from_bytes(builder.to_bytes())
+    options = rars.ReadOptions(threads=threads, rar50_buffered_decode_limit=0)
+    assert options.threads == threads
+    archive.extractall(tmp_path, options=options)
+    archive.testrar(options=options)
+    for name, payload in payloads.items():
+        assert (tmp_path / name).read_bytes() == payload
+    with pytest.raises(OverflowError):
+        rars.ReadOptions(threads=-1)
+
+
 @pytest.mark.parametrize("format", ["rar50", "rar70"])
 def test_rar5_dictionary_policy_and_streaming_decode_option(format):
     builder = rars.RarBuilder(format=format)
