@@ -60,8 +60,8 @@ pub use member::{ArchiveIndex, ArchiveMemberRef, ArchiveMemberRefs};
 mod member_read;
 pub use member_read::{read_volume_members_at, read_volume_members_at_with_options};
 mod output_limit;
+#[doc(hidden)]
 pub mod output_times;
-pub use output_times::OutputTimes;
 mod parallel;
 mod parse_budget;
 #[cfg(any(feature = "write", feature = "recovery"))]
