@@ -213,3 +213,87 @@ def test_a_refused_member_is_named_in_the_error(tmp_path, members):
 
     assert str(raised.value) == "while extracting entry 'sub/file.txt': unsafe archive path crosses symlink"
     assert not (tmp_path / "outside/file.txt").exists()
+
+
+@pytest.mark.parametrize("call", ["extract", "extractall"])
+def test_in_place_overwrites_the_existing_file_itself(tmp_path, call):
+    existing = tmp_path / "file.txt"
+    existing.write_bytes(b"a longer old file\n")
+    inode = os.stat(existing).st_ino
+    archive = archive_of(**{"file.txt": b"archive bytes"})
+
+    getattr(archive, call)(*(["file.txt"] if call == "extract" else []), tmp_path,
+                           overwrite=True, in_place=True)
+
+    assert existing.read_bytes() == b"archive bytes"
+    assert os.stat(existing).st_ino == inode
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="POSIX permissions")
+def test_in_place_needs_no_write_permission_on_the_directory(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "file.txt").write_bytes(b"old")
+    archive = archive_of(**{"file.txt": b"archive bytes"})
+    out.chmod(0o555)
+    try:
+        with pytest.raises(OSError):
+            archive.extractall(out, overwrite=True)
+        archive.extractall(out, overwrite=True, in_place=True)
+    finally:
+        out.chmod(0o755)
+
+    assert (out / "file.txt").read_bytes() == b"archive bytes"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX links and FIFOs")
+@pytest.mark.parametrize("kind", ["hard link", "symlink", "fifo"])
+def test_in_place_refuses_to_write_through_anything_but_a_lone_file(tmp_path, kind):
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"victim\n")
+    out = tmp_path / "out"
+    out.mkdir()
+    target = out / "file.txt"
+    if kind == "hard link":
+        os.link(victim, target)
+    elif kind == "symlink":
+        target.symlink_to(victim)
+    else:
+        os.mkfifo(target)
+    archive = archive_of(**{"file.txt": b"archive bytes"})
+
+    blocked, outcome = extract_in_thread(
+        lambda: archive.extractall(out, overwrite=True, in_place=True))
+    if blocked:
+        os.close(os.open(target, os.O_RDONLY | os.O_NONBLOCK))
+    assert not blocked
+
+    assert isinstance(outcome["error"], (OSError, rars.UnsafeArchivePath))
+    assert victim.read_bytes() == b"victim\n"
+
+
+def test_in_place_without_overwrite_refuses_an_existing_file(tmp_path):
+    (tmp_path / "file.txt").write_bytes(b"old")
+
+    with pytest.raises(OSError):
+        archive_of(**{"file.txt": b"archive bytes"}).extractall(tmp_path, in_place=True)
+
+    assert (tmp_path / "file.txt").read_bytes() == b"old"
+
+
+def test_in_place_extracts_a_volume_set_without_staging(tmp_path):
+    paths = write_set(tmp_path)
+    out = tmp_path / "out"
+    seen = []
+
+    def watching():
+        for path in paths[1:]:
+            seen.extend(staging_left(out))
+            yield path
+
+    with rars.RarFile(paths[0]) as archive:
+        archive.extractall(out, volumes=watching(), in_place=True)
+
+    assert seen == []
+    assert (out / "small.txt").read_bytes() == b"small payload"
+    assert (out / "large.bin").read_bytes() == bytes(range(256)) * 80

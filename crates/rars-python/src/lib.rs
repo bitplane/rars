@@ -603,7 +603,8 @@ impl RarFile {
             .collect()
     }
 
-    #[pyo3(signature = (member, path = None, pwd = None, overwrite = false, *, options = None, restore_times = true))]
+    /// `in_place` works as in `extractall`.
+    #[pyo3(signature = (member, path = None, pwd = None, overwrite = false, *, options = None, restore_times = true, in_place = false))]
     #[allow(clippy::too_many_arguments)]
     fn extract(
         &self,
@@ -614,6 +615,7 @@ impl RarFile {
         overwrite: bool,
         options: Option<&ReadOptions>,
         restore_times: bool,
+        in_place: bool,
     ) -> PyResult<PathBuf> {
         check_read_options_cancellation(options)?;
         let target = self.resolve_index(member)?;
@@ -626,8 +628,11 @@ impl RarFile {
                     Some(&target),
                     &out_dir,
                     self.extraction_options(options, password.as_deref()),
-                    overwrite,
-                    restore_times,
+                    OutputMode {
+                        overwrite,
+                        in_place,
+                        restore_times,
+                    },
                 )
             })
             .map_err(map_error)?;
@@ -645,7 +650,13 @@ impl RarFile {
     /// generator may wait for downloads. If the last volume isn't marked as last
     /// (all RAR 1.3 to 2.0 sets, some later ones), the iterator is advanced once
     /// more and must stop, not wait.
-    #[pyo3(signature = (path = None, members = None, pwd = None, overwrite = false, *, options = None, volumes = None, restore_times = true))]
+    ///
+    /// Each file is written to a private directory inside `path` and moved into
+    /// place once verified. `in_place=True` writes the destination itself
+    /// instead: an existing file keeps its identity and metadata, and the
+    /// directory needn't be writable, but a member that fails verification
+    /// leaves a partly written file. Links and special files are still refused.
+    #[pyo3(signature = (path = None, members = None, pwd = None, overwrite = false, *, options = None, volumes = None, restore_times = true, in_place = false))]
     #[allow(clippy::too_many_arguments)]
     fn extractall(
         &self,
@@ -657,8 +668,14 @@ impl RarFile {
         options: Option<&ReadOptions>,
         volumes: Option<&Bound<'_, PyAny>>,
         restore_times: bool,
+        in_place: bool,
     ) -> PyResult<Vec<PathBuf>> {
         check_read_options_cancellation(options)?;
+        let mode = OutputMode {
+            overwrite,
+            in_place,
+            restore_times,
+        };
         let out_dir = path.unwrap_or_else(|| PathBuf::from("."));
         if volumes.is_some() && members.is_some() {
             return Err(PyValueError::new_err(
@@ -670,12 +687,11 @@ impl RarFile {
             let options = self.extraction_options(options, password.as_deref());
             let first = &self.archive;
             return self.extract_set(py, volumes, options, |volumes| {
-                let outputs = std::cell::RefCell::new(StagedOutputs::new(
+                let outputs = std::cell::RefCell::new(ExtractOutputs::new(
                     &out_dir,
                     first.family(),
                     options,
-                    overwrite,
-                    restore_times,
+                    mode,
                 ));
                 let result = first
                     .extract_with_volumes(volumes, options, |meta| outputs.borrow_mut().open(meta));
@@ -698,8 +714,7 @@ impl RarFile {
                 selected.as_ref(),
                 &out_dir,
                 self.extraction_options(options, password.as_deref()),
-                overwrite,
-                restore_times,
+                mode,
             )
         })
         .map_err(map_error)
@@ -2095,12 +2110,20 @@ impl Selection for HashSet<usize> {
     }
 }
 
-/// Stages each file and publishes it once verified, so a hard link or FIFO at the destination is never written through.
-struct StagedOutputs<'a> {
+#[derive(Clone, Copy)]
+struct OutputMode {
+    overwrite: bool,
+    in_place: bool,
+    restore_times: bool,
+}
+
+/// Stages each file and publishes it once verified, so a hard link or FIFO at the destination is never written through, unless writing in place.
+struct ExtractOutputs<'a> {
     out_dir: &'a Path,
     family: rars_rs::ArchiveFamily,
     encoding: Option<rars_rs::filename::LegacyNameEncoding>,
     overwrite: OverwritePolicy,
+    in_place: bool,
     times: Option<rars_rs::output_times::OutputTimes>,
     staging: Option<ExtractionStaging>,
     staged: usize,
@@ -2109,29 +2132,32 @@ struct StagedOutputs<'a> {
 }
 
 struct PendingOutput {
-    staged: PathBuf,
+    /// None when the member is written in place.
+    staged: Option<PathBuf>,
     destination: PathBuf,
     meta: rars_rs::ExtractedEntryMeta,
 }
 
-impl<'a> StagedOutputs<'a> {
+impl<'a> ExtractOutputs<'a> {
     fn new(
         out_dir: &'a Path,
         family: rars_rs::ArchiveFamily,
         options: rars_rs::ArchiveReadOptions<'_>,
-        overwrite: bool,
-        restore_times: bool,
+        mode: OutputMode,
     ) -> Self {
         Self {
             out_dir,
             family,
             encoding: options.legacy_name_encoding,
-            overwrite: if overwrite {
+            overwrite: if mode.overwrite {
                 OverwritePolicy::Always
             } else {
                 OverwritePolicy::Never
             },
-            times: restore_times.then(rars_rs::output_times::OutputTimes::new),
+            in_place: mode.in_place,
+            times: mode
+                .restore_times
+                .then(rars_rs::output_times::OutputTimes::new),
             staging: None,
             staged: 0,
             pending: None,
@@ -2167,6 +2193,22 @@ impl<'a> StagedOutputs<'a> {
         if self.overwrite == OverwritePolicy::Never && fs::symlink_metadata(&destination).is_ok() {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, "File exists").into());
         }
+        if self.in_place {
+            fs::create_dir_all(
+                destination
+                    .parent()
+                    .expect("checked output path has a file name"),
+            )?;
+            // Creating the parents may have raced a symlink into place.
+            let destination = self.destination(meta)?;
+            let file = open_in_place(&destination, self.overwrite)?;
+            self.pending = Some(PendingOutput {
+                staged: None,
+                destination,
+                meta: meta.clone(),
+            });
+            return Ok(Box::new(file));
+        }
         let staging = match &mut self.staging {
             Some(staging) => staging,
             None => self.staging.insert(ExtractionStaging::new(self.out_dir)?),
@@ -2181,7 +2223,7 @@ impl<'a> StagedOutputs<'a> {
             .create_new(true)
             .open(&staged)?;
         self.pending = Some(PendingOutput {
-            staged,
+            staged: Some(staged),
             destination,
             meta: meta.clone(),
         });
@@ -2192,6 +2234,10 @@ impl<'a> StagedOutputs<'a> {
         let Some(pending) = self.pending.take() else {
             return Ok(());
         };
+        let Some(staged) = &pending.staged else {
+            self.record_published(pending.destination, &pending.meta);
+            return Ok(());
+        };
         fs::create_dir_all(
             pending
                 .destination
@@ -2200,7 +2246,7 @@ impl<'a> StagedOutputs<'a> {
         )?;
         // Creating the parents may have raced a symlink into place.
         let destination = self.destination(&pending.meta)?;
-        publish_verified_output(&pending.staged, &destination, self.overwrite, None)?;
+        publish_verified_output(staged, &destination, self.overwrite, None)?;
         self.record_published(destination, &pending.meta);
         Ok(())
     }
@@ -2244,8 +2290,7 @@ fn extract_archive<S: Selection>(
     selected: Option<&S>,
     out_dir: &Path,
     options: rars_rs::ArchiveReadOptions<'_>,
-    overwrite: bool,
-    restore_times: bool,
+    mode: OutputMode,
 ) -> rars_rs::Result<Vec<PathBuf>> {
     if options
         .cancellation
@@ -2253,22 +2298,68 @@ fn extract_archive<S: Selection>(
     {
         return Err(rars_rs::Error::Cancelled);
     }
-    let outputs = std::cell::RefCell::new(StagedOutputs::new(
+    let outputs = std::cell::RefCell::new(ExtractOutputs::new(
         out_dir,
         archive.family(),
         options,
-        overwrite,
-        restore_times,
+        mode,
     ));
     let result = extract_selected(archive, selected, options, &outputs);
     outputs.into_inner().finish(result)
+}
+
+/// Opens the destination itself, refusing a link or special file that writing would reach through.
+fn open_in_place(path: &Path, overwrite: OverwritePolicy) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true);
+    if overwrite == OverwritePolicy::Never {
+        return options.create_new(true).open(path);
+    }
+    options.create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        // O_NONBLOCK fails a FIFO with no reader instead of waiting for one.
+        let file = options
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.nlink() > 1 {
+            return Err(refused_in_place());
+        }
+        file.set_len(0)?;
+        Ok(file)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        let file = options
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(refused_in_place());
+        }
+        file.set_len(0)?;
+        Ok(file)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let file = options.open(path)?;
+        file.set_len(0)?;
+        Ok(file)
+    }
+}
+
+fn refused_in_place() -> io::Error {
+    io::Error::other("refusing to write in place through a link or special file")
 }
 
 fn extract_selected<S: Selection>(
     archive: &rars_rs::Archive,
     selected: Option<&S>,
     options: rars_rs::ArchiveReadOptions<'_>,
-    outputs: &std::cell::RefCell<StagedOutputs<'_>>,
+    outputs: &std::cell::RefCell<ExtractOutputs<'_>>,
 ) -> rars_rs::Result<()> {
     let Some(selected) = selected else {
         return archive.extract_to_parallel_buffered_with_options(options, |meta| {
@@ -2894,8 +2985,11 @@ mod tests {
                 Some(&first),
                 &directory,
                 rars_rs::ArchiveReadOptions::new(),
-                false,
-                true,
+                OutputMode {
+                    overwrite: false,
+                    in_place: false,
+                    restore_times: true,
+                },
             )
             .unwrap();
             assert_eq!(paths, vec![directory.join("first")]);
@@ -2905,8 +2999,11 @@ mod tests {
                 Some(&last),
                 &directory,
                 rars_rs::ArchiveReadOptions::new(),
-                false,
-                true,
+                OutputMode {
+                    overwrite: false,
+                    in_place: false,
+                    restore_times: true,
+                },
             )
             .unwrap_err();
             assert_eq!(error.kind(), rars_rs::ErrorKind::PasswordRequired);
@@ -2916,8 +3013,11 @@ mod tests {
                 Some(&last),
                 &directory,
                 rars_rs::ArchiveReadOptions::with_password(b"password"),
-                false,
-                true,
+                OutputMode {
+                    overwrite: false,
+                    in_place: false,
+                    restore_times: true,
+                },
             )
             .unwrap();
             assert_eq!(paths, vec![directory.join("last")]);
