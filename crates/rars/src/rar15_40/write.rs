@@ -517,7 +517,7 @@ fn write_archive_to(
     for member in members {
         let unpacked = member.unpacked_size().map_err(|error| {
             crate::write_stream::member_error(error, member.name, "reading source")
-        })? as u64;
+        })?;
         total_bytes = total_bytes.saturating_add(unpacked);
         largest_member = largest_member.max(unpacked);
     }
@@ -1328,16 +1328,15 @@ impl<'a> Member<'a> {
         }
     }
 
-    fn unpacked_size(&self) -> Result<usize> {
-        usize::try_from(self.bytes.len()?)
-            .map_err(|_| Error::InvalidArgument("RAR 1.5 writer does not support large files"))
+    fn unpacked_size(&self) -> Result<u64> {
+        self.bytes.len()
     }
 }
 
 struct EncodedMember<'a> {
     payload: MemberPayload<'a>,
     method: u8,
-    unpacked_size: usize,
+    unpacked_size: u64,
     file_crc: u32,
 }
 
@@ -1383,7 +1382,13 @@ fn encode_member<'a>(
 ) -> Result<EncodedMember<'a>> {
     progress.check()?;
     let unpacked_size = member.unpacked_size()?;
-    validate_member(member.name, unpacked_size)?;
+    validate_member(member.name, options.target, unpacked_size)?;
+    // Compressing or encrypting holds the whole member, which past 4 GiB is too much.
+    if unpacked_size > MAX_SHORT_SIZE && (coding.compresses() || member.password.is_some()) {
+        return Err(Error::InvalidArgument(
+            "a member over 4 GiB can only be stored, without a password",
+        ));
+    }
     if member.is_directory {
         if unpacked_size != 0 {
             return Err(Error::InvalidArgument("directory source must be empty"));
@@ -1396,7 +1401,7 @@ fn encode_member<'a>(
         });
     }
     let _permit = resources.acquire_serialising_cancellable(
-        member_workspace(options, unpacked_size as u64, coding.compresses()),
+        member_workspace(options, unpacked_size, coding.compresses()),
         &|| progress.is_cancelled(),
     )?;
 
@@ -1423,7 +1428,7 @@ fn encode_member<'a>(
             file_crc: {
                 let mut crc = Crc32::new();
                 member.bytes.walk_exact_with_progress(
-                    unpacked_size as u64,
+                    unpacked_size,
                     progress.reporter(),
                     |chunk| {
                         crc.update(chunk);
@@ -1437,7 +1442,7 @@ fn encode_member<'a>(
 
     let data = member
         .bytes
-        .load_exact_with_progress(unpacked_size as u64, progress.reporter())?;
+        .load_exact_with_progress(unpacked_size, progress.reporter())?;
     let mut crc = Crc32::new();
     for chunk in data.chunks(64 * 1024) {
         progress.check()?;
@@ -1490,9 +1495,7 @@ fn write_member(
         // payload and their size is the member's.
         copied => (copied, None),
     };
-    let packed_size = payload.size(encoded.unpacked_size as u64);
-    let packed_size = usize::try_from(packed_size)
-        .map_err(|_| Error::InvalidArgument("RAR 1.5 packed size overflows u32"))?;
+    let packed_size = payload.size(encoded.unpacked_size);
     let mut flags = writer_file_flags(member.password, member.file_comment, solid_continuation);
     if salt.is_some() {
         flags |= FHD_SALT;
@@ -1545,7 +1548,7 @@ fn write_member(
                 inner: output,
                 crc: &mut checksum,
             },
-            packed_size as u64,
+            packed_size,
         )?;
         if checksum.finish() != encoded.file_crc {
             return Err(Error::SourceChanged(
@@ -1554,7 +1557,7 @@ fn write_member(
         }
         Ok(())
     } else {
-        payload.write_to(output, packed_size as u64)
+        payload.write_to(output, packed_size)
     }
 }
 
@@ -2327,7 +2330,7 @@ fn validate_volume_writer_inputs(
     file_comment: Option<&[u8]>,
     options: WriterOptions,
 ) -> Result<()> {
-    validate_file_entry(name, data).map_err(|error| {
+    validate_volume_member(name, options.target, data.len() as u64).map_err(|error| {
         crate::write_stream::member_error(error, name, "preparing volume member")
     })?;
     if file_comment.is_some() {
@@ -2639,9 +2642,9 @@ fn write_producer(
         &FileRecord {
             head_type: NEWSUB_HEAD,
             name: crate::producer::NAME,
-            unpacked_size: data.len(),
+            unpacked_size: data.len() as u64,
             file_crc: crc32(data),
-            packed_size: data.len(),
+            packed_size: data.len() as u64,
             file_time: 0,
             file_attr: 0,
             host_os: 0,
@@ -2694,9 +2697,9 @@ fn write_archive_comment(
         &FileRecord {
             head_type: NEWSUB_HEAD,
             name: b"CMT",
-            unpacked_size: comment.len(),
+            unpacked_size: comment.len() as u64,
             file_crc: crc32(comment),
-            packed_size: packed.len(),
+            packed_size: packed.len() as u64,
             file_time: metadata.map_or(0, |metadata| metadata.0),
             file_attr: 0,
             host_os: metadata.map_or(3, |metadata| metadata.1),
@@ -2759,31 +2762,54 @@ fn write_encrypted_header(out: &mut dyn Write, header: &[u8], password: &[u8]) -
     }
 }
 
-fn validate_member(name: &[u8], unpacked_size: usize) -> Result<()> {
+/// Larger sizes need the FHD_LARGE high halves.
+const MAX_SHORT_SIZE: u64 = u32::MAX as u64;
+
+/// RAR 2.9 introduced the high size fields; earlier readers stop at 4 GiB.
+fn supports_large_members(target: ArchiveVersion) -> bool {
+    matches!(
+        target,
+        ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
+    )
+}
+
+fn large_member_refusal(target: ArchiveVersion) -> Error {
+    Error::InvalidArgument(match target {
+        ArchiveVersion::Rar15 => "RAR 1.5 archives cannot hold a member over 4 GiB",
+        ArchiveVersion::Rar20 => "RAR 2.0 archives cannot hold a member over 4 GiB",
+        _ => "this archive format cannot hold a member over 4 GiB",
+    })
+}
+
+fn validate_member(name: &[u8], target: ArchiveVersion, unpacked_size: u64) -> Result<()> {
     if name.is_empty() {
         return Err(Error::InvalidArgument("RAR 1.5 file name is empty"));
     }
     if name.len() > u16::MAX as usize {
         return Err(Error::InvalidArgument("RAR 1.5 file name is too long"));
     }
-    if unpacked_size > u32::MAX as usize {
+    if unpacked_size > MAX_SHORT_SIZE && !supports_large_members(target) {
+        return Err(large_member_refusal(target));
+    }
+    Ok(())
+}
+
+fn validate_volume_member(name: &[u8], target: ArchiveVersion, unpacked_size: u64) -> Result<()> {
+    validate_member(name, target, unpacked_size)?;
+    if unpacked_size > MAX_SHORT_SIZE {
         return Err(Error::InvalidArgument(
-            "RAR 1.5 writer does not support large files",
+            "legacy volume sets cannot hold a member over 4 GiB",
         ));
     }
     Ok(())
 }
 
-fn validate_file_entry(name: &[u8], data: &[u8]) -> Result<()> {
-    validate_member(name, data.len())
-}
-
 struct FileRecord<'a> {
     head_type: u8,
     name: &'a [u8],
-    unpacked_size: usize,
+    unpacked_size: u64,
     file_crc: u32,
-    packed_size: usize,
+    packed_size: u64,
     file_time: u32,
     file_attr: u32,
     host_os: u8,
@@ -2807,15 +2833,16 @@ fn write_file_header_and_data(
 
 fn write_file_header(out: &mut Vec<u8>, record: &FileRecord<'_>) -> Result<()> {
     let start = out.len();
-    let flags = record.flags | record.dictionary_flags;
+    let large = record.packed_size > MAX_SHORT_SIZE || record.unpacked_size > MAX_SHORT_SIZE;
+    if large && !supports_large_members(record.target) {
+        return Err(large_member_refusal(record.target));
+    }
+    let flags = record.flags | record.dictionary_flags | if large { FHD_LARGE } else { 0 };
     let (host_os, file_attr) =
         rar15_compatible_metadata(record.target, record.host_os, record.file_attr);
-    let packed_size = u32::try_from(record.packed_size)
-        .map_err(|_| Error::InvalidArgument("RAR 1.5 packed size overflows u32"))?;
-    let unpacked_size = u32::try_from(record.unpacked_size)
-        .map_err(|_| Error::InvalidArgument("RAR 1.5 unpacked size overflows u32"))?;
     let head_size = 32usize
-        .checked_add(record.name.len())
+        .checked_add(if large { 8 } else { 0 })
+        .and_then(|size| size.checked_add(record.name.len()))
         .and_then(|size| size.checked_add(if record.salt.is_some() { 8 } else { 0 }))
         .and_then(|size| size.checked_add(record.extra.len()))
         .ok_or(Error::InvalidArgument("RAR 1.5 file header size overflows"))?;
@@ -2831,8 +2858,8 @@ fn write_file_header(out: &mut Vec<u8>, record: &FileRecord<'_>) -> Result<()> {
     out.push(record.head_type);
     out.extend_from_slice(&(LONG_BLOCK | flags).to_le_bytes());
     out.extend_from_slice(&head_size.to_le_bytes());
-    out.extend_from_slice(&packed_size.to_le_bytes());
-    out.extend_from_slice(&unpacked_size.to_le_bytes());
+    out.extend_from_slice(&(record.packed_size as u32).to_le_bytes());
+    out.extend_from_slice(&(record.unpacked_size as u32).to_le_bytes());
     out.push(host_os);
     out.extend_from_slice(&record.file_crc.to_le_bytes());
     out.extend_from_slice(&record.file_time.to_le_bytes());
@@ -2840,6 +2867,10 @@ fn write_file_header(out: &mut Vec<u8>, record: &FileRecord<'_>) -> Result<()> {
     out.push(record.method);
     out.extend_from_slice(&(record.name.len() as u16).to_le_bytes());
     out.extend_from_slice(&file_attr.to_le_bytes());
+    if large {
+        out.extend_from_slice(&((record.packed_size >> 32) as u32).to_le_bytes());
+        out.extend_from_slice(&((record.unpacked_size >> 32) as u32).to_le_bytes());
+    }
     out.extend_from_slice(record.name);
     if let Some(salt) = record.salt {
         out.extend_from_slice(&salt);
@@ -2950,13 +2981,13 @@ fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
             FileRecord {
                 head_type: FILE_HEAD,
                 name: entry.name,
-                unpacked_size: entry.unpacked.len(),
+                unpacked_size: entry.unpacked.len() as u64,
                 file_crc: if split_after {
                     crc32(chunk)
                 } else {
                     unpacked_crc
                 },
-                packed_size: chunk.len(),
+                packed_size: chunk.len() as u64,
                 file_time: entry.file_time,
                 file_attr: entry.file_attr,
                 host_os: entry.host_os,
@@ -3030,13 +3061,13 @@ fn write_header_encrypted_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<
             &FileRecord {
                 head_type: FILE_HEAD,
                 name: entry.name,
-                unpacked_size: entry.unpacked.len(),
+                unpacked_size: entry.unpacked.len() as u64,
                 file_crc: if split_after {
                     crc32(chunk)
                 } else {
                     unpacked_crc
                 },
-                packed_size: chunk.len(),
+                packed_size: chunk.len() as u64,
                 file_time: entry.file_time,
                 file_attr: entry.file_attr,
                 host_os: entry.host_os,
@@ -3136,7 +3167,8 @@ fn write_file_header_crc(out: &mut [u8], start: usize, name_len: usize, flags: u
         // out the comment block. Miss the salt out of the range and an
         // encrypted member with a comment gets a CRC nothing agrees with.
         let salt_len = if flags & FHD_SALT != 0 { 8 } else { 0 };
-        start + 32 + name_len + salt_len
+        let large_len = if flags & FHD_LARGE != 0 { 8 } else { 0 };
+        start + 32 + large_len + name_len + salt_len
     } else {
         out.len()
     };
@@ -3294,8 +3326,8 @@ mod tests {
     #[test]
     fn writer_limits_and_invalid_options_are_not_archive_corruption() {
         for error in [
-            super::validate_member(b"", 0).unwrap_err(),
-            super::validate_member(&vec![b'a'; 65536], 0).unwrap_err(),
+            super::validate_member(b"", ArchiveVersion::Rar40, 0).unwrap_err(),
+            super::validate_member(&vec![b'a'; 65536], ArchiveVersion::Rar40, 0).unwrap_err(),
             super::checked_align16(usize::MAX, "padding overflow").unwrap_err(),
             super::write_comment_header(&mut Vec::new(), Some(&vec![0; 65536])).unwrap_err(),
             super::header_encryption_password([Some(&b"one"[..]), Some(&b"two"[..])].into_iter())
@@ -3316,13 +3348,85 @@ mod tests {
             super::header_encryption_password([None].into_iter()).unwrap_err(),
             crate::Error::NeedPassword
         );
-        #[cfg(target_pointer_width = "64")]
+        let large = u64::from(u32::MAX) + 1;
         assert_eq!(
-            super::validate_member(b"large", u32::MAX as usize + 1)
-                .unwrap_err()
-                .kind(),
-            crate::ErrorKind::InvalidArgument
+            super::validate_member(b"large", ArchiveVersion::Rar15, large).unwrap_err(),
+            crate::Error::InvalidArgument("RAR 1.5 archives cannot hold a member over 4 GiB")
         );
+        assert_eq!(
+            super::validate_member(b"large", ArchiveVersion::Rar20, large).unwrap_err(),
+            crate::Error::InvalidArgument("RAR 2.0 archives cannot hold a member over 4 GiB")
+        );
+        for target in [
+            ArchiveVersion::Rar29,
+            ArchiveVersion::Rar30,
+            ArchiveVersion::Rar40,
+        ] {
+            super::validate_member(b"large", target, large).unwrap();
+        }
+    }
+
+    fn file_header_of_size(size: u64, comment: Option<&[u8]>) -> Vec<u8> {
+        let extra = super::encode_file_comment(comment).unwrap();
+        let mut header = Vec::new();
+        super::write_file_header(
+            &mut header,
+            &super::FileRecord {
+                head_type: super::FILE_HEAD,
+                name: b"big.bin",
+                unpacked_size: size,
+                file_crc: 0x1234_5678,
+                packed_size: size,
+                file_time: 0,
+                file_attr: 0x20,
+                host_os: 0,
+                target: ArchiveVersion::Rar40,
+                method: 0x30,
+                dictionary_flags: 0,
+                flags: super::writer_file_flags(None, comment, false),
+                salt: None,
+                extra: &extra,
+            },
+        )
+        .unwrap();
+        header
+    }
+
+    #[test]
+    fn members_up_to_4_gib_keep_the_short_header() {
+        let header = file_header_of_size(u64::from(u32::MAX), None);
+        assert_eq!(u16::from_le_bytes([header[3], header[4]]) & 0x0100, 0);
+        assert_eq!(header.len(), 32 + b"big.bin".len());
+        assert_eq!(header[7..11], [0xff; 4]);
+        assert_eq!(header[11..15], [0xff; 4]);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn a_member_past_4_gib_reads_back_at_its_full_size() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let size = u64::from(u32::MAX) + 2;
+        for comment in [None, Some(&b"note"[..])] {
+            let dir = crate::scratch::case("rars-rar15-40-large-header");
+            let path = dir.join("big.rar");
+            let mut file = std::fs::File::create(&path).unwrap();
+            let mut head = super::RAR15_SIGNATURE.to_vec();
+            super::write_main_header(&mut head, 0);
+            head.extend_from_slice(&file_header_of_size(size, comment));
+            file.write_all(&head).unwrap();
+            // Sparse: the payload is never written, only skipped over.
+            file.seek(SeekFrom::Current(size as i64)).unwrap();
+            file.write_all(&super::end_block(super::ENDARC_FLAGS))
+                .unwrap();
+            drop(file);
+
+            let archive = crate::rar15_40::Archive::parse_path(&path).unwrap();
+            let member = archive.files().next().unwrap();
+            assert_eq!(member.name, b"big.bin");
+            assert_eq!((member.pack_size, member.unp_size), (size, size));
+            assert_eq!(member.file_crc, 0x1234_5678);
+        }
     }
 
     use super::{
