@@ -28,7 +28,7 @@ impl<'a> ExtractedLink<'a> {
         }
     }
 
-    fn rar50(link: &'a crate::rar50::FileRedirection) -> Result<Self> {
+    pub(crate) fn rar50(link: &'a crate::rar50::FileRedirection) -> Result<Self> {
         let target = link.target_name.as_slice();
         Ok(match link.redirection_type {
             1 | 2 => Self::Symlink {
@@ -156,6 +156,19 @@ where
     }
 }
 
+pub(crate) type ArchiveLink<'a> =
+    dyn FnMut(&ExtractedEntryMeta, ExtractedLink<'_>) -> Result<()> + 'a;
+
+pub(crate) fn emit_rar50_link(
+    meta: &crate::rar50::ExtractedEntryMeta,
+    redirection: &crate::rar50::FileRedirection,
+    link: &mut ArchiveLink<'_>,
+) -> Result<()> {
+    ExtractedLink::rar50(redirection)
+        .and_then(|kind| link(&crate::rar50_meta(meta), kind))
+        .map_err(|error| link_error(error, &meta.name))
+}
+
 pub(crate) type LegacyLink<'a> =
     dyn FnMut(&crate::rar15_40::ExtractedEntryMeta, &[u8]) -> Result<()> + 'a;
 
@@ -175,12 +188,14 @@ pub(crate) fn validate_legacy_target(target: &[u8], name: &[u8]) -> Result<()> {
     Ok(())
 }
 
+pub(crate) const LEGACY_TARGET_LIMIT: u64 = 64 * 1024;
+
 pub(crate) fn check_legacy_size(
     meta: &crate::rar15_40::ExtractedEntryMeta,
     size: u64,
     links: bool,
 ) -> Result<()> {
-    if links && legacy_meta_is_link(meta) && size > 64 * 1024 {
+    if links && legacy_meta_is_link(meta) && size > LEGACY_TARGET_LIMIT {
         return Err(
             Error::InvalidHeader("legacy symbolic link target exceeds 64 KiB")
                 .at_entry(meta.name.clone(), "reading link target"),

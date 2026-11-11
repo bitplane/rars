@@ -1,6 +1,5 @@
 use crate::CliResult;
 use rars::{Archive as DetectedArchive, ArchiveFamily, AttrSource, Error, ExtractedEntryMeta};
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -59,12 +58,7 @@ pub(crate) fn open_output_writer(
 /// separator, which is why [`output_relative_path`] still splits on it.
 pub(crate) fn rar50_entry_name(name: &[u8], host_os: u64) -> Vec<u8> {
     const HOST5_UNIX: u64 = 1;
-    if cfg!(unix) && host_os == HOST5_UNIX {
-        return rars::filename::decode_rar50(name).into_owned();
-    }
-    name.iter()
-        .map(|&byte| if byte == b'\\' { b'_' } else { byte })
-        .collect()
+    rars::output_links::rar50_native_name(name, host_os == HOST5_UNIX)
 }
 
 /// [`output_relative_path`] for a RAR 5.0 entry, which does not treat a
@@ -73,82 +67,7 @@ pub(crate) fn rar50_output_relative_path(name: &[u8], host_os: u64) -> CliResult
     relative_path(&rar50_entry_name(name, host_os), false)
 }
 
-pub(crate) fn create_link_output(
-    out_dir: &Path,
-    relative: &Path,
-    target: &Path,
-    link: rars::ExtractedLink<'_>,
-    overwrite: OverwritePolicy,
-    created_paths: &HashMap<PathBuf, PathBuf>,
-) -> rars::Result<(PathBuf, bool)> {
-    // Resolve hard-link/copy sources before touching an existing destination.
-    let source = match link {
-        rars::ExtractedLink::HardLink { .. } | rars::ExtractedLink::FileCopy { .. } => {
-            Some(link_source_path(target, created_paths)?)
-        }
-        rars::ExtractedLink::Symlink { .. } | rars::ExtractedLink::Junction { .. } => None,
-        _ => return Err(Error::InvalidHeader("unsupported archive link type")),
-    };
-    let mut out_path = checked_output_path(out_dir, relative)?;
-    fs::create_dir_all(
-        out_path
-            .parent()
-            .expect("validated output path has a parent"),
-    )?;
-    out_path = checked_output_path(out_dir, relative)?;
-    prepare_redirection_destination(&out_path, overwrite)?;
-    match link {
-        rars::ExtractedLink::Symlink { directory, .. } => {
-            rars::output_staging::create_symlink(target, &out_path, directory)?;
-            Ok((out_path, false))
-        }
-        rars::ExtractedLink::Junction { .. } => {
-            rars::output_staging::create_symlink(target, &out_path, true)?;
-            Ok((out_path, false))
-        }
-        rars::ExtractedLink::HardLink { .. } => {
-            fs::hard_link(source.expect("source checked above"), &out_path)?;
-            Ok((out_path, true))
-        }
-        rars::ExtractedLink::FileCopy { .. } => {
-            fs::copy(source.expect("source checked above"), &out_path)?;
-            Ok((out_path, true))
-        }
-        _ => Err(Error::InvalidHeader("unsupported archive link type")),
-    }
-}
-
-pub(crate) fn link_source_path<'a>(
-    target: &Path,
-    created_paths: &'a HashMap<PathBuf, PathBuf>,
-) -> rars::Result<&'a Path> {
-    created_paths
-        .get(target)
-        .map(PathBuf::as_path)
-        .ok_or(Error::InvalidHeader(
-            "RAR 5 redirection target was not extracted earlier",
-        ))
-}
-
-fn prepare_redirection_destination(path: &Path, overwrite: OverwritePolicy) -> std::io::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => match overwrite {
-            OverwritePolicy::Never => Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "file exists",
-            )),
-            OverwritePolicy::Always => {
-                if metadata.is_dir() {
-                    fs::remove_dir(path)
-                } else {
-                    fs::remove_file(path)
-                }
-            }
-        },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
-}
+pub(crate) use rars::output_links::{create_link_output, link_source_path};
 
 pub(crate) fn restore_output_metadata(outputs: &[ExtractedOutput]) -> std::io::Result<()> {
     let restored: Vec<_> = outputs
@@ -260,6 +179,14 @@ pub(crate) fn redirection_warning(name: impl AsRef<str>) -> String {
     )
 }
 
+pub(crate) fn skipped_link_warning(name: &[u8], target: &[u8]) -> String {
+    format!(
+        "warning: skipping link '{}' -> '{}': it would point outside the output directory",
+        display_archive_bytes(name),
+        display_archive_bytes(target)
+    )
+}
+
 fn display_archive_text(text: impl AsRef<str>) -> String {
     let mut out = String::new();
     for ch in text.as_ref().chars() {
@@ -318,6 +245,7 @@ mod tests {
         restore_output_metadata, ExtractedOutput,
     };
     use rars::{ArchiveFamily, ExtractedEntryMeta};
+    use std::collections::HashMap;
     use std::fs;
 
     fn scratch(name: &str) -> crate::scratch::Scratch {

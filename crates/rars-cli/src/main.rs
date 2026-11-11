@@ -739,7 +739,9 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
                 }
             })
         })?;
-    let outputs = state.into_inner().publish()?;
+    let state = state.into_inner();
+    let skipped_links = state.skipped_links;
+    let outputs = state.publish()?;
     restore_output_metadata(&outputs).map_err(|err| {
         CliError::general(format!(
             "failed to restore extracted metadata under '{}': {err}",
@@ -749,7 +751,12 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
     for output in &outputs {
         println!("x {}", display_bytes_lossy(&output.name));
     }
-
+    if skipped_links > 0 {
+        return Err(CliError::general(format!(
+            "skipped {skipped_links} link(s) that would point outside '{}'",
+            out_dir.display()
+        )));
+    }
     Ok(())
 }
 
@@ -774,6 +781,7 @@ struct ExtractOutputState<'a> {
     published: usize,
     published_identities: HashSet<PathBuf>,
     published_paths: HashMap<PathBuf, PathBuf>,
+    skipped_links: usize,
 }
 
 impl<'a> ExtractOutputState<'a> {
@@ -802,6 +810,7 @@ impl<'a> ExtractOutputState<'a> {
             published: 0,
             published_identities: HashSet::new(),
             published_paths: HashMap::new(),
+            skipped_links: 0,
         }
     }
 
@@ -860,20 +869,14 @@ impl<'a> ExtractOutputState<'a> {
         let (name, relative) = self.entry_path(meta)?;
         let destination = output::checked_output_path(self.out_dir, &relative)
             .map_err(|error| refused_output(error, &meta.name))?;
-        self.reserve_output_path(destination.clone())?;
-        // Keep the existing RAR5 policy for all links: reject absolute paths,
-        // parent components and drive prefixes. Native legacy targets are not
-        // member names: neither their codepage nor their backslashes are decoded.
-        let target = if self.family == rars::ArchiveFamily::Rar50Plus {
-            rar50_output_relative_path(
-                link.target(),
-                u64::from(meta.attr_source == rars::AttrSource::Unix),
-            )
-            .map_err(|_| rars::Error::InvalidHeader("unsafe archive redirection target"))?
-        } else {
-            rars::filename::relative_path(link.target(), false)
-                .map_err(|_| rars::Error::InvalidHeader("unsafe archive redirection target"))?
+        let Some(target) =
+            rars::output_links::link_target(self.out_dir, &relative, meta, link, self.family)?
+        else {
+            eprintln!("{}", output::skipped_link_warning(&name, link.target()));
+            self.skipped_links += 1;
+            return Ok(());
         };
+        self.reserve_output_path(destination.clone())?;
         let staging = self.prepare_staged_path(&destination, false)?;
         let (path, restore_metadata) = create_link_output(
             &staging,

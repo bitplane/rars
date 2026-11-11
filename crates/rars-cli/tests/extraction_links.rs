@@ -113,48 +113,66 @@ fn native_legacy_targets_ignore_codepages_and_preserve_backslashes() {
 }
 
 #[test]
-fn unsafe_or_corrupt_link_targets_keep_verified_predecessors_and_existing_destinations() {
-    for case in 0..4 {
+fn links_that_leave_the_output_directory_are_skipped_and_reported() {
+    for version in [ArchiveVersion::Rar40, ArchiveVersion::Rar50] {
+        for target in [b"../escape".as_slice(), b"/absolute"] {
+            let root = scratch::case("unsafe-link-skipped");
+            let archive = root.join("links.rar");
+            write_archive(&archive, version, true, false, target);
+            let out = root.join("out");
+            fs::create_dir(&out).unwrap();
+            fs::write(out.join("link-to-real.txt"), b"keep").unwrap();
+            let result = extract(&archive, &out, &["--overwrite=always"]);
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert_eq!(result.status.code(), Some(1), "{version:?} {stderr}");
+            assert!(
+                stderr.contains("link-to-real.txt")
+                    && stderr.contains(std::str::from_utf8(target).unwrap()),
+                "{stderr}"
+            );
+            assert_eq!(fs::read(out.join("real.txt")).unwrap(), b"hello\n");
+            assert_eq!(fs::read(out.join("link-to-real.txt")).unwrap(), b"keep");
+            assert_eq!(fs::read(out.join("after")).unwrap(), b"hello\n".repeat(100));
+        }
+    }
+}
+
+#[test]
+fn corrupt_link_targets_keep_verified_predecessors_and_existing_destinations() {
+    for case in 0..2 {
         let root = scratch::case("legacy-link-refusal");
         let archive = root.join("links.rar");
-        let target = match case {
-            0 => b"../escape".as_slice(),
-            1 => b"/absolute",
-            _ => b"unique-target",
-        };
+        let target = b"unique-target";
         let mut bytes = write_archive(&archive, ArchiveVersion::Rar40, true, false, target);
-        if case >= 2 {
-            let offset = bytes
-                .windows(target.len())
-                .position(|v| v == target)
-                .unwrap();
-            bytes[offset] ^= 1;
-            if case == 3 {
-                // NUL with a valid payload CRC tests validation after verification.
-                bytes[offset] = 0;
-                let mut at = 7;
-                while at < bytes.len() {
-                    let kind = bytes[at + 2];
-                    let flags = u16::from_le_bytes(bytes[at + 3..at + 5].try_into().unwrap());
-                    let size =
-                        u16::from_le_bytes(bytes[at + 5..at + 7].try_into().unwrap()) as usize;
-                    let packed = if flags & 0x8000 != 0 {
-                        u32::from_le_bytes(bytes[at + 7..at + 11].try_into().unwrap()) as usize
-                    } else {
-                        0
-                    };
-                    if kind == 0x74 && at + size == offset {
-                        let crc = rars::crc32::crc32(&bytes[offset..offset + target.len()]);
-                        bytes[at + 16..at + 20].copy_from_slice(&crc.to_le_bytes());
-                        let header = rars::crc32::crc32(&bytes[at + 2..at + size]) as u16;
-                        bytes[at..at + 2].copy_from_slice(&header.to_le_bytes());
-                        break;
-                    }
-                    at += size + packed;
+        let offset = bytes
+            .windows(target.len())
+            .position(|v| v == target)
+            .unwrap();
+        bytes[offset] ^= 1;
+        if case == 1 {
+            // NUL with a valid payload CRC tests validation after verification.
+            bytes[offset] = 0;
+            let mut at = 7;
+            while at < bytes.len() {
+                let kind = bytes[at + 2];
+                let flags = u16::from_le_bytes(bytes[at + 3..at + 5].try_into().unwrap());
+                let size = u16::from_le_bytes(bytes[at + 5..at + 7].try_into().unwrap()) as usize;
+                let packed = if flags & 0x8000 != 0 {
+                    u32::from_le_bytes(bytes[at + 7..at + 11].try_into().unwrap()) as usize
+                } else {
+                    0
+                };
+                if kind == 0x74 && at + size == offset {
+                    let crc = rars::crc32::crc32(&bytes[offset..offset + target.len()]);
+                    bytes[at + 16..at + 20].copy_from_slice(&crc.to_le_bytes());
+                    let header = rars::crc32::crc32(&bytes[at + 2..at + size]) as u16;
+                    bytes[at..at + 2].copy_from_slice(&header.to_le_bytes());
+                    break;
                 }
+                at += size + packed;
             }
-            fs::write(&archive, bytes).unwrap();
         }
+        fs::write(&archive, bytes).unwrap();
         let out = root.join("out");
         fs::create_dir(&out).unwrap();
         fs::write(out.join("link-to-real.txt"), b"keep").unwrap();
@@ -164,6 +182,53 @@ fn unsafe_or_corrupt_link_targets_keep_verified_predecessors_and_existing_destin
         assert_eq!(fs::read(out.join("link-to-real.txt")).unwrap(), b"keep");
         assert!(!out.join("after").exists());
         assert_eq!(fs::read_dir(out).unwrap().count(), 2);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn links_that_stay_inside_keep_parent_components_but_chains_cannot_climb_out() {
+    for version in [ArchiveVersion::Rar40, ArchiveVersion::Rar50] {
+        let root = scratch::case("inside-links");
+        let mut builder = Builder::new(version).store(true);
+        builder
+            .add_bytes(b"c/target.txt".to_vec(), b"target".to_vec(), None, None)
+            .unwrap();
+        for (name, target) in [
+            (b"a/sym.txt".as_slice(), b"../c/target.txt".as_slice()),
+            (b"a/near.txt", b"local.txt"),
+            (b"a/up", b".."),
+            (b"x", b"a/up/.."),
+            (b"a/b/k", b"m/../../y"),
+            (b"a/b/m", b".."),
+        ] {
+            builder
+                .add_unix_symlink(name.to_vec(), target.to_vec(), false, None, None)
+                .unwrap();
+        }
+        let archive = root.join("links.rar");
+        fs::write(&archive, builder.to_bytes().unwrap()).unwrap();
+        let out = root.join("out");
+        let result = extract(&archive, &out, &[]);
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert_eq!(result.status.code(), Some(1), "{version:?} {stderr}");
+        assert!(
+            stderr.contains("a/up/..") && stderr.contains("m/../../y"),
+            "{stderr}"
+        );
+        assert_eq!(fs::read(out.join("a/sym.txt")).unwrap(), b"target");
+        assert_eq!(
+            fs::read_link(out.join("a/sym.txt")).unwrap(),
+            Path::new("../c/target.txt")
+        );
+        assert_eq!(
+            fs::read_link(out.join("a/near.txt")).unwrap(),
+            Path::new("local.txt")
+        );
+        assert_eq!(fs::read_link(out.join("a/up")).unwrap(), Path::new(".."));
+        assert!(fs::symlink_metadata(out.join("x")).is_err());
+        assert!(fs::symlink_metadata(out.join("a/b/k")).is_err());
+        assert_eq!(fs::read_link(out.join("a/b/m")).unwrap(), Path::new(".."));
     }
 }
 

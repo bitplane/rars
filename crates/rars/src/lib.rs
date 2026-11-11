@@ -61,6 +61,8 @@ mod member_read;
 pub use member_read::{read_volume_members_at, read_volume_members_at_with_options};
 mod output_limit;
 #[doc(hidden)]
+pub mod output_links;
+#[doc(hidden)]
 pub mod output_staging;
 #[doc(hidden)]
 pub mod output_times;
@@ -839,6 +841,20 @@ impl Archive {
         V::IntoIter: Send,
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
+        self.extract_arriving(volumes, options, &mut open, None)
+    }
+
+    pub(crate) fn extract_arriving<V>(
+        &self,
+        volumes: V,
+        options: ArchiveReadOptions<'_>,
+        open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+        mut link: Option<&mut extraction_links::ArchiveLink<'_>>,
+    ) -> Result<()>
+    where
+        V: IntoIterator<Item = Result<Archive>>,
+        V::IntoIter: Send,
+    {
         let _cap = crate::parallel::ThreadCap::set(options.threads);
         let mut volumes = volumes.into_iter();
         options.check_cancelled()?;
@@ -857,7 +873,25 @@ impl Archive {
                     _ => None,
                 });
                 let mut feed = volume_extract::VolumeFeed::arriving(&mut set, options);
-                rar15_40::extract_from_feed(&mut feed, options, |meta| open(&rar15_40_meta(meta)))
+                let mut legacy = link.map(|link| {
+                    move |meta: &rar15_40::ExtractedEntryMeta, target: &[u8]| {
+                        link(
+                            &rar15_40_meta(meta),
+                            ExtractedLink::Symlink {
+                                target,
+                                directory: false,
+                            },
+                        )
+                    }
+                });
+                rar15_40::extract_from_feed(
+                    &mut feed,
+                    options,
+                    |meta| open(&rar15_40_meta(meta)),
+                    legacy
+                        .as_mut()
+                        .map(|link| link as &mut extraction_links::LegacyLink<'_>),
+                )
             }
             Self::Rar50Plus(first) => {
                 let mut set = with_later_volumes(first, &mut volumes, |volume| match volume {
@@ -880,12 +914,16 @@ impl Archive {
                     Ok(volume)
                 });
                 let mut feed = volume_extract::VolumeFeed::arriving(&mut set, options);
+                let emit = link.is_some();
                 rar50::extract_from_feed(
                     &mut feed,
                     options,
                     &mut |meta| open(&rar50_meta(meta)),
-                    &mut |_, _| Ok(()),
-                    false,
+                    &mut |meta, redirection| match link.as_mut() {
+                        Some(link) => extraction_links::emit_rar50_link(meta, redirection, link),
+                        None => Ok(()),
+                    },
+                    emit,
                 )
             }
         }
