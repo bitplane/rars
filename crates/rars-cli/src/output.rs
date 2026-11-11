@@ -294,7 +294,7 @@ pub(crate) fn restore_output_metadata(outputs: &[ExtractedOutput]) -> std::io::R
         .iter()
         .filter(|output| output.restore_metadata)
         .collect();
-    let mut times = rars::OutputTimes::new();
+    let mut times = rars::output_times::OutputTimes::new();
     for output in &restored {
         times.opened(output.path.clone(), output.family, &output.meta);
     }

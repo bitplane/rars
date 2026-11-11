@@ -653,7 +653,8 @@ impl RarFile {
             let options = self.extraction_options(options, password.as_deref());
             let first = &self.archive;
             let written = Arc::new(Mutex::new(Vec::new()));
-            let times = restore_times.then(|| Arc::new(Mutex::new(rars_rs::OutputTimes::new())));
+            let times = restore_times
+                .then(|| Arc::new(Mutex::new(rars_rs::output_times::OutputTimes::new())));
             self.extract_set(py, volumes, options, |volumes| {
                 let result = first.extract_with_volumes(
                     volumes,
@@ -2095,7 +2096,8 @@ fn extract_archive<S: Selection>(
         return Err(rars_rs::Error::Cancelled);
     }
     let written = Arc::new(Mutex::new(Vec::new()));
-    let times = restore_times.then(|| Arc::new(Mutex::new(rars_rs::OutputTimes::new())));
+    let times =
+        restore_times.then(|| Arc::new(Mutex::new(rars_rs::output_times::OutputTimes::new())));
     let mut open = output_opener(
         out_dir,
         archive.family(),
@@ -2114,7 +2116,7 @@ fn extract_archive<S: Selection>(
 
 /// Sets the outputs' stored times; extraction's own error wins over a failure to set them.
 fn apply_output_times(
-    times: Option<&Mutex<rars_rs::OutputTimes>>,
+    times: Option<&Mutex<rars_rs::output_times::OutputTimes>>,
     result: rars_rs::Result<()>,
 ) -> rars_rs::Result<()> {
     let Some(times) = times else {
@@ -2137,7 +2139,7 @@ fn extract_selected<S: Selection>(
     options: rars_rs::ArchiveReadOptions<'_>,
     overwrite: bool,
     written: &Arc<Mutex<Vec<PathBuf>>>,
-    times: &Option<Arc<Mutex<rars_rs::OutputTimes>>>,
+    times: &Option<Arc<Mutex<rars_rs::output_times::OutputTimes>>>,
     open: &mut impl FnMut(&rars_rs::ExtractedEntryMeta) -> rars_rs::Result<Box<dyn Write>>,
 ) -> rars_rs::Result<()> {
     if let Some(selected) = selected {
@@ -2305,7 +2307,7 @@ fn output_opener<'a>(
     options: rars_rs::ArchiveReadOptions<'a>,
     overwrite: bool,
     written: &Arc<Mutex<Vec<PathBuf>>>,
-    times: &Option<Arc<Mutex<rars_rs::OutputTimes>>>,
+    times: &Option<Arc<Mutex<rars_rs::output_times::OutputTimes>>>,
 ) -> impl FnMut(&rars_rs::ExtractedEntryMeta) -> rars_rs::Result<Box<dyn Write>> + 'a {
     let written = Arc::clone(written);
     let times = times.clone();

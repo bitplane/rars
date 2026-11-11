@@ -1,4 +1,5 @@
 //! Stored modified times for extracted outputs, set once extraction ends because writing into a directory moves its time.
+//! Shared by the CLI and the Python binding; not part of the stable API.
 
 use crate::timestamp::extracted_system_time;
 use crate::{ArchiveFamily, ExtractedEntryMeta};
