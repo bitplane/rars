@@ -6,6 +6,9 @@ use pyo3::prelude::*;
 use pyo3::types::{PyByteArray, PyBytes, PyList, PyModule, PyString};
 use pyo3::{create_exception, PyErr};
 use rars_rs::filename::relative_path as output_relative_path;
+use rars_rs::output_staging::{
+    failed_entry_name, publish_verified_output, refused_output, ExtractionStaging, OverwritePolicy,
+};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
@@ -666,26 +669,18 @@ impl RarFile {
             let password = py_password(pwd)?.or_else(|| self.password.clone());
             let options = self.extraction_options(options, password.as_deref());
             let first = &self.archive;
-            let written = Arc::new(Mutex::new(Vec::new()));
-            let times = restore_times
-                .then(|| Arc::new(Mutex::new(rars_rs::output_times::OutputTimes::new())));
-            self.extract_set(py, volumes, options, |volumes| {
-                let result = first.extract_with_volumes(
-                    volumes,
+            return self.extract_set(py, volumes, options, |volumes| {
+                let outputs = std::cell::RefCell::new(StagedOutputs::new(
+                    &out_dir,
+                    first.family(),
                     options,
-                    output_opener(
-                        &out_dir,
-                        first.family(),
-                        options,
-                        overwrite,
-                        &written,
-                        &times,
-                    ),
-                );
-                apply_output_times(times.as_deref(), result)
-            })?;
-            let out = written.lock().expect("written lock poisoned").clone();
-            return Ok(out);
+                    overwrite,
+                    restore_times,
+                ));
+                let result = first
+                    .extract_with_volumes(volumes, options, |meta| outputs.borrow_mut().open(meta));
+                outputs.into_inner().finish(result)
+            });
         }
         let selected = match members {
             Some(members) => Some(
@@ -2100,43 +2095,147 @@ impl Selection for HashSet<usize> {
     }
 }
 
-// Controlled extraction chooses a sink before core admission. Defer opening a
-// selected file so a declared-size refusal cannot truncate an existing target.
-struct DeferredExtractedFile {
-    path: PathBuf,
-    overwrite: bool,
-    file: Option<fs::File>,
-    written: Arc<Mutex<Vec<PathBuf>>>,
+/// Stages each file and publishes it once verified, so a hard link or FIFO at the destination is never written through.
+struct StagedOutputs<'a> {
+    out_dir: &'a Path,
+    family: rars_rs::ArchiveFamily,
+    encoding: Option<rars_rs::filename::LegacyNameEncoding>,
+    overwrite: OverwritePolicy,
+    times: Option<rars_rs::output_times::OutputTimes>,
+    staging: Option<ExtractionStaging>,
+    staged: usize,
+    pending: Option<PendingOutput>,
+    published: Vec<PathBuf>,
 }
-impl DeferredExtractedFile {
-    fn open(&mut self) -> io::Result<&mut fs::File> {
-        if self.file.is_none() {
-            fs::create_dir_all(
-                self.path
-                    .parent()
-                    .expect("checked output path has a file name"),
-            )?;
-            let mut options = fs::OpenOptions::new();
-            options.write(true);
-            if self.overwrite {
-                options.create(true).truncate(true);
+
+struct PendingOutput {
+    staged: PathBuf,
+    destination: PathBuf,
+    meta: rars_rs::ExtractedEntryMeta,
+}
+
+impl<'a> StagedOutputs<'a> {
+    fn new(
+        out_dir: &'a Path,
+        family: rars_rs::ArchiveFamily,
+        options: rars_rs::ArchiveReadOptions<'_>,
+        overwrite: bool,
+        restore_times: bool,
+    ) -> Self {
+        Self {
+            out_dir,
+            family,
+            encoding: options.legacy_name_encoding,
+            overwrite: if overwrite {
+                OverwritePolicy::Always
             } else {
-                options.create_new(true);
-            }
-            set_no_follow(&mut options);
-            self.file = Some(options.open(&self.path)?);
-            self.written.lock().unwrap().push(self.path.clone());
+                OverwritePolicy::Never
+            },
+            times: restore_times.then(rars_rs::output_times::OutputTimes::new),
+            staging: None,
+            staged: 0,
+            pending: None,
+            published: Vec::new(),
         }
-        Ok(self.file.as_mut().expect("opened above"))
     }
-}
-struct DeferredExtractedSink(std::rc::Rc<std::cell::RefCell<DeferredExtractedFile>>);
-impl Write for DeferredExtractedSink {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.borrow_mut().open()?.write(bytes)
+
+    fn destination(&self, meta: &rars_rs::ExtractedEntryMeta) -> rars_rs::Result<PathBuf> {
+        let path = checked_output_path(self.out_dir, meta, self.family, self.encoding)
+            .map_err(|error| refused_output(error, &meta.name))?;
+        if let Some(staging) = &self.staging {
+            staging
+                .reject_alias(&path)
+                .map_err(|error| refused_output(error, &meta.name))?;
+        }
+        Ok(path)
     }
-    fn flush(&mut self) -> io::Result<()> {
-        self.0.borrow_mut().open()?.flush()
+
+    /// The library has verified the previous member by the time it asks for another output.
+    fn open(&mut self, meta: &rars_rs::ExtractedEntryMeta) -> rars_rs::Result<Box<dyn Write>> {
+        self.publish_pending()?;
+        let destination = self.destination(meta)?;
+        if self.encoding.is_some() && self.published.contains(&destination) {
+            return Err(rars_rs::Error::InvalidArgument(
+                "multiple entries map to the same decoded output path",
+            ));
+        }
+        if meta.is_directory {
+            fs::create_dir_all(&destination)?;
+            self.record_published(destination, meta);
+            return Ok(Box::new(io::sink()));
+        }
+        if self.overwrite == OverwritePolicy::Never && fs::symlink_metadata(&destination).is_ok() {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "File exists").into());
+        }
+        let staging = match &mut self.staging {
+            Some(staging) => staging,
+            None => self.staging.insert(ExtractionStaging::new(self.out_dir)?),
+        };
+        staging
+            .reject_alias(&destination)
+            .map_err(|error| refused_output(error, &meta.name))?;
+        let staged = staging.root.join(self.staged.to_string());
+        self.staged += 1;
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged)?;
+        self.pending = Some(PendingOutput {
+            staged,
+            destination,
+            meta: meta.clone(),
+        });
+        Ok(Box::new(file))
+    }
+
+    fn publish_pending(&mut self) -> rars_rs::Result<()> {
+        let Some(pending) = self.pending.take() else {
+            return Ok(());
+        };
+        fs::create_dir_all(
+            pending
+                .destination
+                .parent()
+                .expect("checked output path has a file name"),
+        )?;
+        // Creating the parents may have raced a symlink into place.
+        let destination = self.destination(&pending.meta)?;
+        publish_verified_output(&pending.staged, &destination, self.overwrite, None)?;
+        self.record_published(destination, &pending.meta);
+        Ok(())
+    }
+
+    fn record_published(&mut self, path: PathBuf, meta: &rars_rs::ExtractedEntryMeta) {
+        if let Some(times) = &mut self.times {
+            times.opened(path.clone(), self.family, meta);
+            times.finish();
+        }
+        self.published.push(path);
+    }
+
+    /// A member still in flight when extraction failed never reaches its destination.
+    fn finish(mut self, result: rars_rs::Result<()>) -> rars_rs::Result<Vec<PathBuf>> {
+        let published = match result {
+            Ok(()) => self.publish_pending(),
+            Err(error) => {
+                let verified = matches!(
+                    (failed_entry_name(&error), &self.pending),
+                    (Some(failed), Some(pending)) if failed != pending.meta.name.as_slice()
+                );
+                if verified {
+                    // The extraction's own error wins over a failure to publish.
+                    let _ = self.publish_pending();
+                }
+                Err(error)
+            }
+        };
+        let restored = match &self.times {
+            Some(times) => times.restore(),
+            None => Ok(()),
+        };
+        published?;
+        restored?;
+        Ok(std::mem::take(&mut self.published))
     }
 }
 
@@ -2154,146 +2253,75 @@ fn extract_archive<S: Selection>(
     {
         return Err(rars_rs::Error::Cancelled);
     }
-    let written = Arc::new(Mutex::new(Vec::new()));
-    let times =
-        restore_times.then(|| Arc::new(Mutex::new(rars_rs::output_times::OutputTimes::new())));
-    let mut open = output_opener(
+    let outputs = std::cell::RefCell::new(StagedOutputs::new(
         out_dir,
         archive.family(),
         options,
         overwrite,
-        &written,
-        &times,
-    );
-    let result = extract_selected(
-        archive, selected, out_dir, options, overwrite, &written, &times, &mut open,
-    );
-    apply_output_times(times.as_deref(), result)?;
-    let out = written.lock().expect("written lock poisoned").clone();
-    Ok(out)
+        restore_times,
+    ));
+    let result = extract_selected(archive, selected, options, &outputs);
+    outputs.into_inner().finish(result)
 }
 
-/// Sets the outputs' stored times; extraction's own error wins over a failure to set them.
-fn apply_output_times(
-    times: Option<&Mutex<rars_rs::output_times::OutputTimes>>,
-    result: rars_rs::Result<()>,
-) -> rars_rs::Result<()> {
-    let Some(times) = times else {
-        return result;
-    };
-    let mut times = times.lock().expect("times lock poisoned");
-    if result.is_ok() {
-        times.finish();
-    }
-    let restored = times.restore();
-    result?;
-    Ok(restored?)
-}
-
-#[allow(clippy::too_many_arguments)]
 fn extract_selected<S: Selection>(
     archive: &rars_rs::Archive,
     selected: Option<&S>,
-    out_dir: &Path,
     options: rars_rs::ArchiveReadOptions<'_>,
-    overwrite: bool,
-    written: &Arc<Mutex<Vec<PathBuf>>>,
-    times: &Option<Arc<Mutex<rars_rs::output_times::OutputTimes>>>,
-    open: &mut impl FnMut(&rars_rs::ExtractedEntryMeta) -> rars_rs::Result<Box<dyn Write>>,
+    outputs: &std::cell::RefCell<StagedOutputs<'_>>,
 ) -> rars_rs::Result<()> {
-    if let Some(selected) = selected {
-        let last = archive
-            .member_refs()
-            .enumerate()
-            .filter(|(index, member)| {
-                !member.is_redirection() && selected.contains_member(*index, member.name_bytes())
-            })
-            .map(|(index, _)| index)
-            .last();
-        if let Some(last) = last {
-            let solid = archive.is_solid();
-            let mut index = 0;
-            let mut pending: Option<std::rc::Rc<std::cell::RefCell<DeferredExtractedFile>>> = None;
-            archive.extract_with_control(options, |member| {
-                // The previous payload has passed decoding and integrity checks.
-                // Materialize a successful empty file even if no writes occurred.
-                if let Some(file) = pending.take() {
-                    file.borrow_mut().open()?;
-                }
-                if let Some(times) = times {
-                    times.lock().expect("times lock poisoned").finish();
-                }
-                let current = index;
-                index += 1;
-                if current > last {
-                    return Ok(rars_rs::ExtractionDecision::Stop);
-                }
-                let meta = &member.meta;
-                if meta.is_redirection {
-                    return Ok(rars_rs::ExtractionDecision::Skip);
-                }
-                if !selected.contains_member(current, &meta.name) {
-                    return Ok(if solid && !meta.is_directory {
-                        rars_rs::ExtractionDecision::Extract(Box::new(io::sink()))
-                    } else {
-                        rars_rs::ExtractionDecision::Skip
-                    });
-                }
-                let unicode = member.name_is_unicode();
-                let mut meta = rars_rs::ExtractedEntryMeta::new(
-                    meta.name.clone(),
-                    meta.file_time,
-                    meta.file_attr,
-                    meta.is_directory,
-                )
-                .with_attr_source(meta.attr_source())
-                .with_mtime_refinement(meta.mtime_refinement);
-                meta.name_is_unicode = unicode;
-                if meta.is_directory {
-                    return Ok(rars_rs::ExtractionDecision::Extract(open(&meta)?));
-                }
-                let path = checked_output_path(
-                    out_dir,
-                    &meta,
-                    archive.family(),
-                    options.legacy_name_encoding,
-                )?;
-                if options.legacy_name_encoding.is_some()
-                    && written
-                        .lock()
-                        .expect("written lock poisoned")
-                        .contains(&path)
-                {
-                    return Err(rars_rs::Error::InvalidArgument(
-                        "multiple entries map to the same decoded output path",
-                    ));
-                }
-                if let Some(times) = times {
-                    times.lock().expect("times lock poisoned").opened(
-                        path.clone(),
-                        archive.family(),
-                        &meta,
-                    );
-                }
-                let file = std::rc::Rc::new(std::cell::RefCell::new(DeferredExtractedFile {
-                    path,
-                    overwrite,
-                    file: None,
-                    written: written.clone(),
-                }));
-                pending = Some(file.clone());
-                Ok(rars_rs::ExtractionDecision::Extract(Box::new(
-                    DeferredExtractedSink(file),
-                )))
-            })?;
-            if let Some(file) = pending.take() {
-                file.borrow_mut().open()?;
-            }
+    let Some(selected) = selected else {
+        return archive.extract_to_parallel_buffered_with_options(options, |meta| {
+            outputs.borrow_mut().open(meta)
+        });
+    };
+    let last = archive
+        .member_refs()
+        .enumerate()
+        .filter(|(index, member)| {
+            !member.is_redirection() && selected.contains_member(*index, member.name_bytes())
+        })
+        .map(|(index, _)| index)
+        .last();
+    let Some(last) = last else {
+        return Ok(());
+    };
+    let solid = archive.is_solid();
+    let mut index = 0;
+    archive.extract_with_control(options, |member| {
+        // The previous payload has passed decoding and integrity checks.
+        outputs.borrow_mut().publish_pending()?;
+        let current = index;
+        index += 1;
+        if current > last {
+            return Ok(rars_rs::ExtractionDecision::Stop);
         }
-        Ok(())
-    } else {
-        archive.extract_to_parallel_buffered_with_options(options, open)
-    }
+        let meta = &member.meta;
+        if meta.is_redirection {
+            return Ok(rars_rs::ExtractionDecision::Skip);
+        }
+        if !selected.contains_member(current, &meta.name) {
+            return Ok(if solid && !meta.is_directory {
+                rars_rs::ExtractionDecision::Extract(Box::new(io::sink()))
+            } else {
+                rars_rs::ExtractionDecision::Skip
+            });
+        }
+        let unicode = member.name_is_unicode();
+        let mut meta = rars_rs::ExtractedEntryMeta::new(
+            meta.name.clone(),
+            meta.file_time,
+            meta.file_attr,
+            meta.is_directory,
+        )
+        .with_attr_source(meta.attr_source())
+        .with_mtime_refinement(meta.mtime_refinement);
+        meta.name_is_unicode = unicode;
+        Ok(rars_rs::ExtractionDecision::Extract(
+            outputs.borrow_mut().open(&meta)?,
+        ))
+    })?;
+    Ok(())
 }
 
 /// Runs `run` without the GIL over the volumes `next` gives; an exception `next` raises wins over `run`'s error.
@@ -2358,58 +2386,6 @@ fn map_error_with(py: Python<'_>, error: rars_rs::Error, detail: &str) -> PyErr 
 enum VolumeSource {
     Bytes(Vec<u8>),
     Path(PathBuf),
-}
-
-fn output_opener<'a>(
-    out_dir: &'a Path,
-    family: rars_rs::ArchiveFamily,
-    options: rars_rs::ArchiveReadOptions<'a>,
-    overwrite: bool,
-    written: &Arc<Mutex<Vec<PathBuf>>>,
-    times: &Option<Arc<Mutex<rars_rs::output_times::OutputTimes>>>,
-) -> impl FnMut(&rars_rs::ExtractedEntryMeta) -> rars_rs::Result<Box<dyn Write>> + 'a {
-    let written = Arc::clone(written);
-    let times = times.clone();
-    let record = move |path: &Path, meta: &rars_rs::ExtractedEntryMeta| {
-        if let Some(times) = &times {
-            times
-                .lock()
-                .expect("times lock poisoned")
-                .opened(path.to_path_buf(), family, meta);
-        }
-    };
-    move |meta| {
-        let path = checked_output_path(out_dir, meta, family, options.legacy_name_encoding)?;
-        if options.legacy_name_encoding.is_some()
-            && written
-                .lock()
-                .expect("written lock poisoned")
-                .contains(&path)
-        {
-            return Err(rars_rs::Error::InvalidArgument(
-                "multiple entries map to the same decoded output path",
-            ));
-        }
-        if meta.is_directory {
-            fs::create_dir_all(&path)?;
-            record(&path, meta);
-            written.lock().expect("written lock poisoned").push(path);
-            return Ok(Box::new(io::sink()) as Box<dyn Write>);
-        }
-        fs::create_dir_all(path.parent().expect("checked output path has a file name"))?;
-        let mut options = fs::OpenOptions::new();
-        options.write(true);
-        if overwrite {
-            options.create(true).truncate(true);
-        } else {
-            options.create_new(true);
-        }
-        set_no_follow(&mut options);
-        let file = options.open(&path)?;
-        record(&path, meta);
-        written.lock().expect("written lock poisoned").push(path);
-        Ok(Box::new(file) as Box<dyn Write>)
-    }
 }
 
 #[cfg(test)]
@@ -2543,15 +2519,6 @@ fn archive_base_name(path: &Path) -> PyResult<Vec<u8>> {
         .map(<[u8]>::to_vec)
         .map_err(map_error)
 }
-
-#[cfg(unix)]
-fn set_no_follow(options: &mut fs::OpenOptions) {
-    use std::os::unix::fs::OpenOptionsExt;
-    options.custom_flags(libc::O_NOFOLLOW);
-}
-
-#[cfg(not(unix))]
-fn set_no_follow(_options: &mut fs::OpenOptions) {}
 
 fn legacy_volume_part_path(first_path: &Path, index: usize) -> PyResult<PathBuf> {
     rars_rs::volume_name::old_style(first_path, index).ok_or_else(|| {
@@ -2757,38 +2724,6 @@ mod tests {
                 .is_instance_of::<pyo3::exceptions::PyZeroDivisionError>(py));
             assert!(progress.take_error().is_none());
         });
-    }
-
-    #[test]
-    fn deferred_sink_flush_materializes_empty_files_and_reuses_open_file() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target")
-            .join(format!(
-                "python-deferred-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-        fs::create_dir_all(&root).unwrap();
-        let path = root.join("nested/file");
-        let written = Arc::new(Mutex::new(Vec::new()));
-        let file = std::rc::Rc::new(std::cell::RefCell::new(DeferredExtractedFile {
-            path: path.clone(),
-            overwrite: false,
-            file: None,
-            written: written.clone(),
-        }));
-        let mut sink = DeferredExtractedSink(file);
-        sink.flush().unwrap();
-        assert_eq!(fs::read(&path).unwrap(), b"");
-        sink.write_all(b"payload").unwrap();
-        sink.flush().unwrap();
-        assert_eq!(fs::read(&path).unwrap(), b"payload");
-        assert_eq!(*written.lock().unwrap(), vec![path]);
-        drop(sink);
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

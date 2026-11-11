@@ -88,11 +88,10 @@ def test_failed_extraction_restores_completed_outputs_only(tmp_path, members):
         archive.extractall(tmp_path, members=members)
 
     assert os.stat(tmp_path / "good.txt").st_mtime == 1_600_000_000
-    if (tmp_path / "bad.txt").exists():
-        assert os.stat(tmp_path / "bad.txt").st_mtime > 1_600_000_000
+    assert not (tmp_path / "bad.txt").exists()
 
 
-def test_cancelled_volume_set_restores_outputs_already_completed(tmp_path):
+def test_cancelled_volume_set_restores_completed_outputs_and_drops_the_rest(tmp_path):
     builder = rars.RarBuilder(store=True, volume_size=4096)
     builder.add_bytes(b"small", "small.txt", mtime=1_600_000_000)
     builder.add_bytes(bytes(20_000), "large.bin", mtime=1_600_000_000)
@@ -108,4 +107,4 @@ def test_cancelled_volume_set_restores_outputs_already_completed(tmp_path):
         archive.extractall(tmp_path / "out", volumes=volumes(), options=rars.ReadOptions(cancellation=token))
 
     assert os.stat(tmp_path / "out/small.txt").st_mtime == 1_600_000_000
-    assert os.stat(tmp_path / "out/large.bin").st_mtime > 1_600_000_000
+    assert not (tmp_path / "out/large.bin").exists()

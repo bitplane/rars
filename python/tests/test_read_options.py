@@ -187,16 +187,16 @@ def test_volume_policies_cover_parsing_and_logical_member_limits(tmp_path, forma
     output.mkdir()
     target = output / "file"
     target.write_bytes(b"keep")
-    # Output limits refuse before the writer opens; header limits trip on the second volume, after it.
-    for options, kept in [(rars.ReadOptions(max_member_output_bytes=len(payload) - 1), True),
-                          (rars.ReadOptions(max_total_output_bytes=len(payload) - 1), True),
-                          (rars.ReadOptions(max_header_count=0), False),
-                          (rars.ReadOptions(max_header_bytes=0), False)]:
+    # Header limits trip on the second volume, after the member is staged; the old file survives either way.
+    for options in [rars.ReadOptions(max_member_output_bytes=len(payload) - 1),
+                    rars.ReadOptions(max_total_output_bytes=len(payload) - 1),
+                    rars.ReadOptions(max_header_count=0),
+                    rars.ReadOptions(max_header_bytes=0)]:
         with pytest.raises(MemoryError):
             rars.RarFile(paths[0]).testrar(options=options, volumes=paths[1:])
         with pytest.raises(MemoryError):
             rars.RarFile(paths[0]).extractall(output, overwrite=True, options=options, volumes=paths[1:])
-        assert (target.read_bytes() == b"keep") == kept
+        assert target.read_bytes() == b"keep"
     options = rars.ReadOptions(max_member_output_bytes=len(payload), max_total_output_bytes=len(payload))
     rars.RarFile(paths[0]).testrar(options=options, volumes=paths[1:])
     rars.RarFile(paths[0]).extractall(output, overwrite=True, options=options, volumes=paths[1:])

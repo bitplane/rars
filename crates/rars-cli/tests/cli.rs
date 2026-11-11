@@ -1426,6 +1426,46 @@ fn rejects_output_path_that_is_existing_symlink() {
     assert_eq!(fs::read(&target).unwrap(), b"do not overwrite\n");
 }
 
+#[cfg(unix)]
+#[test]
+fn a_refused_member_is_named_in_the_error() {
+    let dir = scratch("refused-member-name");
+    let archive = dir.join("refused.rar");
+    let out_dir = dir.join("out");
+    fs::create_dir_all(dir.join("outside")).unwrap();
+    fs::create_dir_all(&out_dir).unwrap();
+    std::os::unix::fs::symlink("../outside", out_dir.join("sub")).unwrap();
+    let bytes = write_stored_archive(
+        &[StoredEntry {
+            name: b"sub\\file.txt",
+            data: b"payload\n",
+            file_time: 0,
+            file_attr: 0x20,
+            password: None,
+            file_comment: None,
+        }],
+        WriterOptions::default(),
+    )
+    .unwrap();
+    fs::write(&archive, bytes).unwrap();
+
+    let extract = rars()
+        .arg("x")
+        .arg(&archive)
+        .arg(&out_dir)
+        .output()
+        .unwrap();
+
+    assert!(!extract.status.success());
+    let stderr = stderr(&extract);
+    assert!(
+        stderr.contains("while extracting entry 'sub\\file.txt': ")
+            && stderr.contains("unsafe archive path crosses symlink"),
+        "{stderr}"
+    );
+    assert!(!dir.join("outside/file.txt").exists());
+}
+
 #[test]
 fn test_reports_directory_entries_and_redirection_warnings() {
     let output = rars()

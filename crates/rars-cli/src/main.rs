@@ -31,6 +31,7 @@ use password::{
     read_archive_path_prompting_with_options, resolve_password, Password,
 };
 use progress::CliProgress;
+use rars::output_staging::{failed_entry_name, refused_output};
 use rars::rar13::{
     self, FileEntry, StoredEntry as Rar13StoredEntry, WriterOptions as Rar13WriterOptions,
 };
@@ -123,17 +124,6 @@ fn retry_hint(error: &rars::Error) -> String {
     format!(
         "\nhint: retry with --rar50-buffered-decode-limit {required} if you trust this archive and have enough memory"
     )
-}
-
-/// The archive name of the entry an extraction error is attributed to.
-fn failed_entry_name(error: &rars::Error) -> Option<&[u8]> {
-    match error {
-        rars::Error::AtEntry { name, .. } => Some(name),
-        rars::Error::AtArchiveOffset { source, .. } | rars::Error::InVolume { source, .. } => {
-            failed_entry_name(source)
-        }
-        _ => None,
-    }
 }
 
 fn find_rar50_buffered_decode_limit_error(error: &rars::Error) -> Option<(u64, u64)> {
@@ -829,7 +819,8 @@ impl<'a> ExtractOutputState<'a> {
     fn open_entry(&mut self, meta: &rars::ExtractedEntryMeta) -> rars::Result<Box<dyn Write>> {
         self.publish_verified()?;
         let (name, relative) = self.entry_path(meta)?;
-        let destination = output::checked_output_path(self.out_dir, &relative)?;
+        let destination = output::checked_output_path(self.out_dir, &relative)
+            .map_err(|error| refused_output(error, &meta.name))?;
         self.reserve_output_path(destination.clone())?;
         self.remember_directory_time(&destination, meta)?;
         let staging = self.prepare_staged_path(&destination, meta.is_directory)?;
@@ -859,7 +850,8 @@ impl<'a> ExtractOutputState<'a> {
     ) -> rars::Result<()> {
         self.publish_verified()?;
         let (name, relative) = self.entry_path(meta)?;
-        let destination = output::checked_output_path(self.out_dir, &relative)?;
+        let destination = output::checked_output_path(self.out_dir, &relative)
+            .map_err(|error| refused_output(error, &meta.name))?;
         self.reserve_output_path(destination.clone())?;
         // Keep the existing RAR5 policy for all links: reject absolute paths,
         // parent components and drive prefixes. Native legacy targets are not
@@ -998,7 +990,9 @@ impl<'a> ExtractOutputState<'a> {
                 .strip_prefix(self.out_dir)
                 .map_err(|_| rars::Error::InvalidHeader("unsafe archive path"))?
                 .to_path_buf();
-            let destination = output::checked_output_path(self.out_dir, &relative)?;
+            let name = &self.archive_names[self.published];
+            let destination = output::checked_output_path(self.out_dir, &relative)
+                .map_err(|error| refused_output(error, name))?;
             // The alias check resolves the destination already when it exists.
             let existing = match &self.staging {
                 Some(staging) => staging.reject_alias(&destination)?,
@@ -1015,7 +1009,8 @@ impl<'a> ExtractOutputState<'a> {
                 fs::create_dir_all(&destination)?;
             } else {
                 fs::create_dir_all(destination.parent().expect("validated path has parent"))?;
-                output::checked_output_path(self.out_dir, &relative)?;
+                output::checked_output_path(self.out_dir, &relative)
+                    .map_err(|error| refused_output(error, name))?;
                 if self.overwrite == OverwritePolicy::Always
                     && self.staged_redirections.contains(&staged)
                 {
