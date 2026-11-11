@@ -32,7 +32,7 @@ pub(crate) fn discover_sibling_volumes(first_path: &Path) -> Vec<PathBuf> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let Some(first_key) = volume_name_key(first) else {
+    let Some(first_key) = volume_name_key(first).or_else(|| sfx_volume_name_key(first)) else {
         return vec![first_path.to_path_buf()];
     };
     let Ok(entries) = fs::read_dir(parent) else {
@@ -45,11 +45,29 @@ pub(crate) fn discover_sibling_volumes(first_path: &Path) -> Vec<PathBuf> {
             paths.push(path);
         }
     }
-    if paths.is_empty() {
+    // A self-extracting first volume names the set without matching the scan.
+    if paths.is_empty() || volume_sort_key(first).is_none() {
         paths.push(first_path.to_path_buf());
     }
     sort_volume_paths(&mut paths);
     paths
+}
+
+/// The set key of a self-extracting first volume: `name.partN.exe` or `name.exe` (or `.sfx`).
+fn sfx_volume_name_key(path: &Path) -> Option<Vec<u8>> {
+    let name = rars::filename::native_bytes(path.file_name()?).ok()?;
+    let (stem, extension) = name.split_at(name.len().checked_sub(4)?);
+    if !rars::volume_name::is_sfx_extension(extension) {
+        return None;
+    }
+    let lower = stem.to_ascii_lowercase();
+    if let Some(pos) = lower.windows(5).rposition(|s| s == b".part") {
+        let digits = &lower[pos + 5..];
+        if !digits.is_empty() && digits.iter().all(u8::is_ascii_digit) {
+            return Some([b"part:".as_slice(), &stem[..pos]].concat());
+        }
+    }
+    Some([b"old:".as_slice(), stem].concat())
 }
 
 fn volume_name_key(path: &Path) -> Option<Vec<u8>> {
@@ -247,6 +265,33 @@ mod tests {
             paths,
             ["set.part1.rar", "set.part2.rar", "set.part10.rar"].map(PathBuf::from)
         );
+    }
+
+    #[test]
+    fn discovery_starts_from_a_self_extracting_first_volume() {
+        let dir = crate::scratch::case("volume-discovery-sfx");
+        for name in [
+            "set.part1.sfx",
+            "set.part2.rar",
+            "set.part3.rar",
+            "old.exe",
+            "old.r00",
+            "old.r01",
+            "OLD.EXE",
+            "other.part2.rar",
+        ] {
+            fs::write(dir.join(name), []).unwrap();
+        }
+        assert_eq!(
+            discover_sibling_volumes(&dir.join("set.part1.sfx")),
+            ["set.part1.sfx", "set.part2.rar", "set.part3.rar"].map(|name| dir.join(name))
+        );
+        assert_eq!(
+            discover_sibling_volumes(&dir.join("old.exe")),
+            ["old.exe", "old.r00", "old.r01"].map(|name| dir.join(name))
+        );
+        let lone = dir.join("lone.exe");
+        assert_eq!(discover_sibling_volumes(&lone), vec![lone]);
     }
 
     #[test]
