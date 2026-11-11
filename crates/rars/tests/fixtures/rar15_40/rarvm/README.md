@@ -26,3 +26,17 @@ match.
 
 Written by rars with the writer's own 32-channel limit temporarily lifted. That
 limit is a choice about what to emit and stays in place.
+
+## generic_static_data_call_ret.rar
+
+One member, `static_call.bin`, 4,096 bytes. Its non-standard filter program
+keeps a four-byte XOR table in static data and CALLs a subroutine per byte
+that XORs the byte with `table[i & 3]`. The program only produces the right
+output if static data survives the system globals on its first run and a
+subroutine RET that empties the stack resumes after the CALL.
+
+Written by rars: a test-only encoder pass wrapped in a hand-built RAR 2.9
+container. UnRAR 4.20 (Linux) extracts it byte-identically to the test's
+expected output. UnRAR 7.23 and RAR 7.12 no longer run non-standard VM
+programs and report a checksum error, as they do for
+`generic_delta_padding_mutation.rar`.

@@ -544,7 +544,8 @@ impl<B: Budget> Vm<B> {
         let global_len = invocation.global_data.len().min(0x2000);
         memory[GLOBAL_BASE..GLOBAL_BASE + global_len]
             .copy_from_slice(&invocation.global_data[..global_len]);
-        let static_start = GLOBAL_BASE + global_len;
+        // A first run passes no globals; the system globals below must not overwrite static data.
+        let static_start = GLOBAL_BASE + global_len.max(SYSTEM_GLOBAL_SIZE);
         let static_len = program
             .static_data()
             .len()
@@ -615,10 +616,6 @@ impl<B: Budget> Vm<B> {
                     break;
                 }
                 ip = next_ip;
-            }
-            if instruction.opcode == Opcode::Ret && self.regs[7] >= MEMORY_SIZE as u32 {
-                terminated = true;
-                break;
             }
         }
         if !terminated {

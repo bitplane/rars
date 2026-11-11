@@ -1154,6 +1154,52 @@ fn parse_rejects_static_data_larger_than_vm_memory() {
     assert_eq!(err, Error::InvalidData("RARVM static data is too large"));
 }
 
+#[test]
+fn a_return_that_empties_the_stack_resumes_after_the_call() {
+    let result = execute_instructions(vec![
+        instr(Opcode::Call, false, vec![Operand::Immediate(3)]),
+        instr(
+            Opcode::Add,
+            false,
+            vec![Operand::Register(0), Operand::Immediate(1)],
+        ),
+        instr(Opcode::Ret, false, Vec::new()),
+        instr(
+            Opcode::Mov,
+            false,
+            vec![Operand::Register(0), Operand::Immediate(41)],
+        ),
+        instr(Opcode::Ret, false, Vec::new()),
+    ]);
+
+    assert_eq!(result.regs[0], 42);
+}
+
+#[test]
+fn static_data_follows_the_system_globals_on_a_first_run() {
+    let result = Program {
+        static_data: vec![1, 2, 3, 4],
+        instructions: vec![instr(
+            Opcode::Mov,
+            false,
+            vec![
+                Operand::Register(0),
+                Operand::Absolute((GLOBAL_BASE + SYSTEM_GLOBAL_SIZE) as u32),
+            ],
+        )],
+    }
+    .execute(Invocation {
+        input: &[0; 8],
+        regs: [0; 7],
+        global_data: &[],
+        file_offset: 0,
+        exec_count: 0,
+    })
+    .unwrap();
+
+    assert_eq!(result.regs[0], 0x0403_0201);
+}
+
 fn instr(opcode: Opcode, byte_mode: bool, operands: Vec<Operand>) -> Instruction {
     Instruction {
         opcode,
