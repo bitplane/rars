@@ -184,6 +184,17 @@ impl<'a> MemberBytes<'a> {
         Ok(())
     }
 
+    /// A reader over the member, for callers that walk it more than once.
+    pub(crate) fn open(&self) -> Result<Box<dyn Read + 'a>> {
+        match self {
+            Self::Borrowed(data) => Ok(Box::new(*data)),
+            Self::Source(source) | Self::NamedSource(source, _) => source
+                .open()
+                .map(|reader| Box::new(reader) as Box<dyn Read + 'a>)
+                .map_err(|error| self.source_error(error)),
+        }
+    }
+
     /// The source behind this member, when there is one to copy from.
     pub(crate) fn source(&self) -> Option<&'a EntrySource> {
         match self {

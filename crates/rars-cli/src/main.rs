@@ -1444,8 +1444,8 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
     }
     let write_plan = AddWritePlan::for_target(target)?;
 
-    // A volume set is still built in memory: the split has to see the whole
-    // packed payload before it can decide where the parts break.
+    // A stored RAR 1.5 to 4.x set streams; the rest are still built in memory,
+    // because the split has to see the whole packed payload first.
     if let Some(volume_size) = volume_size {
         return write_legacy_volumes(
             LegacyVolumeWrite {
@@ -1639,7 +1639,7 @@ fn legacy_filter_policy(
     Some(rars::FilterPolicy::Explicit(FilterSpec::whole(kind)))
 }
 
-/// What a legacy volume set needs, which is still every input in memory.
+/// What a legacy volume set needs.
 struct LegacyVolumeWrite<'a> {
     write_plan: AddWritePlan,
     input_paths: &'a [PathBuf],
@@ -1657,8 +1657,14 @@ struct LegacyVolumeWrite<'a> {
 
 fn write_legacy_volumes(plan: LegacyVolumeWrite<'_>, progress: &CliProgress) -> CliResult<()> {
     let inputs = collect_inputs(plan.input_paths)?;
-    if inputs.len() != 1 || inputs[0].is_directory {
+    let [input] = inputs.as_slice() else {
         return Err("multivolume writer supports one regular input file".into());
+    };
+    if input.is_directory {
+        return Err("multivolume writer supports one regular input file".into());
+    }
+    if matches!(plan.write_plan, AddWritePlan::Rar15To40) && !plan.compress {
+        return write_stored_legacy_volumes(&plan, input, progress);
     }
     warn_if_buffered_write_is_large(plan.input_paths, plan.target);
     progress.spinner("Scanning inputs");
@@ -1777,6 +1783,52 @@ fn write_legacy_volumes(plan: LegacyVolumeWrite<'_>, progress: &CliProgress) -> 
     Ok(())
 }
 
+/// Stored RAR 1.5 to 4.x sets copy straight from the source, so nothing is held.
+fn write_stored_legacy_volumes(
+    plan: &LegacyVolumeWrite<'_>,
+    input: &input::LazyInput,
+    progress: &CliProgress,
+) -> CliResult<()> {
+    let entry = rars::rar15_40::StreamingEntry::new(input.name.clone(), input.source())
+        .with_file_time(input.dos_mtime)
+        .with_file_attr(rar15_file_attr(input.unix_mode, input.file_attr))
+        .with_host_os(RAR15_HOST_NATIVE);
+    let entry = match plan.file_comment {
+        Some(comment) => entry.with_file_comment(comment.to_vec()),
+        None => entry,
+    };
+    let entry = match plan.password {
+        Some(password) => entry.with_password(password.to_vec()),
+        None => entry,
+    };
+    let mut features = FeatureSet::store_only();
+    features.solid = plan.solid;
+    features.header_encryption = plan.header_encryption;
+    let mut options = Rar15WriterOptions::new(plan.target, features);
+    if let Some(level) = plan.compression_level {
+        options = options.with_compression_level(level);
+    }
+    if let Some(size) = plan.dictionary_size {
+        options = options.with_dictionary_size(size);
+    }
+    progress.bar("Writing volumes", input.size);
+    let mut sink = CliVolumeSink::new(plan.archive_path, |first, index, _| {
+        volume_part_path(first, index)
+    });
+    let result = rars::rar15_40::write_stored_volumes_to(
+        &entry,
+        options,
+        plan.volume_size,
+        &mut sink,
+        &rars::WriterResources::default(),
+        Some(progress),
+    );
+    let paths = sink.finish(result)?;
+    progress.finish("Volumes written");
+    print_created_volumes(&paths);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_plain_rar50_streaming(
     input_paths: &[PathBuf],
@@ -1875,10 +1927,7 @@ fn write_plain_rar50_streaming(
         if archive_path == Path::new("-") || archive_path == Path::new("/dev/stdout") {
             return Err("volume sets cannot be written to stdout".into());
         }
-        let mut sink = CliVolumeSink {
-            first_path: archive_path,
-            temporaries: Vec::new(),
-        };
+        let mut sink = CliVolumeSink::new(archive_path, rar50_volume_part_path);
         let result = rars::rar50::write_streaming_volumes_with_progress(
             &entries,
             options,
@@ -1911,8 +1960,8 @@ fn write_plain_rar50_streaming(
 
 /// Warns before a volume set that will not fit comfortably in memory.
 ///
-/// Every writer streams a plain archive now, but a legacy volume set is still
-/// built whole: the split has to see the entire packed payload before it can
+/// Every writer streams a plain archive now, but a compressed or RAR 1.3 set is
+/// still built whole: the split has to see the entire packed payload before it can
 /// decide where the parts break, so the input, the packed member and every part
 /// are all resident at once. RAR 5 and RAR 7 split as they go, so this never
 /// applies to them. Saying so up front beats an allocation failure an hour in.
@@ -1942,9 +1991,19 @@ fn warn_if_buffered_write_is_large(input_paths: &[PathBuf], target: ArchiveVersi
 struct CliVolumeSink<'a> {
     first_path: &'a Path,
     temporaries: Vec<PathBuf>,
+    /// Names part `index` of a set of `total`.
+    part_path: fn(&Path, usize, usize) -> CliResult<PathBuf>,
 }
 
-impl CliVolumeSink<'_> {
+impl<'a> CliVolumeSink<'a> {
+    fn new(first_path: &'a Path, part_path: fn(&Path, usize, usize) -> CliResult<PathBuf>) -> Self {
+        Self {
+            first_path,
+            temporaries: Vec::new(),
+            part_path,
+        }
+    }
+
     fn finish(self, result: rars::Result<()>) -> CliResult<Vec<PathBuf>> {
         self.finish_with_rename(result, |source, destination| {
             fs::rename(source, destination)
@@ -1958,7 +2017,7 @@ impl CliVolumeSink<'_> {
     ) -> CliResult<Vec<PathBuf>> {
         result?;
         let paths = (0..self.temporaries.len())
-            .map(|index| rar50_volume_part_path(self.first_path, index, self.temporaries.len()))
+            .map(|index| (self.part_path)(self.first_path, index, self.temporaries.len()))
             .collect::<CliResult<Vec<_>>>()?;
         // Check every destination before moving any existing archive out of the way.
         for path in &paths {
@@ -2052,6 +2111,10 @@ impl Drop for CliVolumeSink<'_> {
 
 impl rars::rar50::VolumeSink for CliVolumeSink<'_> {
     fn start_volume(&mut self, index: u64) -> rars::Result<Box<dyn std::io::Write + Send>> {
+        // Refuse a name that cannot exist before writing a volume that would need it.
+        let part = usize::try_from(index).unwrap_or(usize::MAX);
+        (self.part_path)(self.first_path, part, part.saturating_add(1))
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
         let base = self
             .first_path
             .with_file_name(format!("rars-volume-{index:06}"));
@@ -2920,10 +2983,7 @@ mod tests {
     fn stage_two_volumes(first_path: &std::path::Path) -> super::CliVolumeSink<'_> {
         use rars::rar50::VolumeSink;
         use std::io::Write;
-        let mut sink = super::CliVolumeSink {
-            first_path,
-            temporaries: Vec::new(),
-        };
+        let mut sink = super::CliVolumeSink::new(first_path, super::rar50_volume_part_path);
         for index in 0..2 {
             sink.start_volume(index)
                 .unwrap()

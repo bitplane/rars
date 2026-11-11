@@ -35,6 +35,8 @@ use crate::extraction_links::{check_legacy_size, emit_legacy_link, legacy_output
 #[cfg(feature = "write")]
 pub use crate::streaming::{EntrySource, WriterResources};
 #[cfg(feature = "write")]
+pub use crate::volume_sink::{CollectedVolumes, VolumeSink};
+#[cfg(feature = "write")]
 pub use crate::write_plan::MemberCoding;
 pub use extract::extract_volumes_to;
 pub(crate) use extract::{extract_from_feed, extract_volumes_with_links};
@@ -53,7 +55,8 @@ pub use write::{
     write_compressed_archive_with_comment_and_progress, write_compressed_volumes,
     write_compressed_volumes_with_progress, write_rar29_compressed_archive_with_filter_policy,
     write_rar29_compressed_archive_with_filter_policy_and_progress, write_stored_archive,
-    write_stored_archive_with_comment, write_stored_volumes, write_streaming_archive_to,
+    write_stored_archive_with_comment, write_stored_volumes, write_stored_volumes_to,
+    write_streaming_archive_to,
 };
 
 const MARK_HEAD: u8 = 0x72;

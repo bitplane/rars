@@ -336,6 +336,43 @@ fn creates_legacy_volumes_with_explicit_compression_settings() {
 }
 
 #[test]
+fn stored_legacy_volumes_stream_without_the_in_memory_warning() {
+    let root = scratch("legacy-stored-volume-stream");
+    let source = root.join("sparse.bin");
+    let archive = root.join("split.rar");
+    // Large enough to have drawn the in-memory warning, sparse so it costs no disk.
+    fs::File::create(&source)
+        .unwrap()
+        .set_len(256 * 1024 * 1024)
+        .unwrap();
+    let create = rars()
+        .args([
+            "add",
+            "--format",
+            "rar40",
+            "--store",
+            "--volume-size",
+            "100m",
+        ])
+        .arg(&archive)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(create.status.success(), "{}", stderr(&create));
+    assert!(
+        !stderr(&create).contains("in memory"),
+        "{}",
+        stderr(&create)
+    );
+    for name in ["split.rar", "split.r00", "split.r01"] {
+        assert!(root.join(name).is_file(), "{name} missing");
+    }
+    assert!(!root.join("split.r02").exists());
+    let test = rars().arg("test").arg(&archive).output().unwrap();
+    assert!(test.status.success(), "{}", stderr(&test));
+}
+
+#[test]
 fn info_reports_comment_output_limits_for_every_archive_family() {
     for path in [
         fixture("COMMENT.RAR"),
