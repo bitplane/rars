@@ -584,3 +584,139 @@ fn failed_independent_stream_breaks_the_solid_chain() {
         }
     }
 }
+
+fn large_text() -> Vec<u8> {
+    let mut state = 1u32;
+    (0..3 << 20)
+        .map(|_| {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            b"abcdefgh ijklmnop\n"[(state >> 16) as usize % 18]
+        })
+        .collect()
+}
+
+struct ThreadRecordingReader<R> {
+    inner: R,
+    threads: Vec<std::thread::ThreadId>,
+}
+
+impl<R: Read> Read for ThreadRecordingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.threads.push(std::thread::current().id());
+        self.inner.read(buf)
+    }
+}
+
+#[test]
+fn large_compressed_members_decode_off_the_caller() {
+    let data = large_text();
+    let (archive, file) = fixture(&data, false, false);
+    let (packed, _) = file
+        .packed_reader_with_allowance(
+            &archive,
+            None,
+            &crate::rar50::Rar50KeyCache::default(),
+            &Allowance::default(),
+        )
+        .unwrap();
+    let mut packed = ThreadRecordingReader {
+        inner: packed,
+        threads: Vec::new(),
+    };
+    let mut decoder = ReaderState::new(&Allowance::default());
+    let mut output = Vec::new();
+    file.stream_packed_with_decoder(&mut packed, None, &mut decoder, 0, None, &mut output)
+        .unwrap();
+    assert_eq!(output, data);
+    let caller = std::thread::current().id();
+    assert_eq!(
+        packed.threads.iter().any(|thread| *thread != caller),
+        crate::parallel::may_spawn(),
+    );
+}
+
+#[test]
+fn large_compressed_members_still_fail_their_checksums() {
+    let data = large_text();
+    let (archive, original) = fixture(&data, false, false);
+    let mut bad_hash = original.clone();
+    bad_hash.hash.as_mut().unwrap().data[0] ^= 1;
+    let (result, work) = ordinary(&archive, &bad_hash);
+    assert!(matches!(
+        result.unwrap_err().root_cause(),
+        Error::HashMismatch { hash_type: 0 }
+    ));
+    assert_eq!(work.bytes + work.zeroes, 0);
+
+    let mut bad_crc = original;
+    bad_crc.hash = None;
+    bad_crc.data_crc32 = Some(crc32(&data) ^ 1);
+    let (result, work) = ordinary(&archive, &bad_crc);
+    assert!(matches!(
+        result.unwrap_err().root_cause(),
+        Error::Crc32Mismatch { .. }
+    ));
+    assert_eq!(work.bytes + work.zeroes, data.len());
+}
+
+#[test]
+fn large_compressed_members_report_write_failures() {
+    let data = large_text();
+    let (archive, file) = fixture(&data, false, false);
+    let mut session = DecoderSession::with_allowance(None, 0, &Allowance::default());
+    let error = session
+        .write_file_to(&archive, &file, &mut RejectWrite)
+        .unwrap_err();
+    assert_eq!(error.kind(), crate::ErrorKind::Io);
+    assert_eq!(error.entry_context().unwrap().1, "decoding");
+    assert!(error.to_string().contains("ordinary streaming sink failed"));
+}
+
+struct FailsAfter(usize);
+impl Write for FailsAfter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.0 < buf.len() {
+            return Err(std::io::Error::other("disk full"));
+        }
+        self.0 -= buf.len();
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn large_compressed_members_report_write_failures_mid_stream() {
+    let data = large_text();
+    let (archive, file) = fixture(&data, false, false);
+    let mut session = DecoderSession::with_allowance(None, 0, &Allowance::default());
+    let error = session
+        .write_file_to(&archive, &file, &mut FailsAfter(1 << 20))
+        .unwrap_err();
+    assert_eq!(error.kind(), crate::ErrorKind::Io);
+    assert!(error.to_string().contains("disk full"), "{error}");
+}
+
+#[test]
+fn large_split_compressed_members_count_and_check_their_sums() {
+    let data = large_text();
+    let (archive, original) = fixture(&data, false, false);
+    let volumes = split_in_two(&archive, &original, &original);
+    let mut session = DecoderSession::with_allowance(None, 0, &Allowance::default());
+    let mut output = Vec::new();
+    let (result, work) = measured(|| write_split(&mut session, &volumes, &mut output));
+    result.unwrap();
+    assert_eq!(output, data);
+    assert_eq!(work.bytes + work.zeroes, data.len());
+
+    let mut bad_hash = original.clone();
+    bad_hash.hash.as_mut().unwrap().data[0] ^= 1;
+    let volumes = split_in_two(&archive, &original, &bad_hash);
+    let mut session = DecoderSession::with_allowance(None, 0, &Allowance::default());
+    let error = write_split(&mut session, &volumes, &mut std::io::sink()).unwrap_err();
+    assert!(
+        matches!(error.root_cause(), Error::HashMismatch { hash_type: 0 }),
+        "{error}"
+    );
+}

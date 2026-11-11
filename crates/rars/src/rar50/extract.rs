@@ -13,6 +13,7 @@ use crate::crypto::rar50::Rar50Cipher;
 use crate::crypto::rar50::Rar50Keys;
 use crate::error::{Error, Result};
 use crate::member_batches::{self, Plan};
+use crate::output_pipeline::{self, PipeError};
 use crate::volume_extract::VolumeFeed;
 use std::io::{Read, Write};
 
@@ -536,7 +537,7 @@ impl FileHeader {
     }
 
     #[cfg(all(test, feature = "write"))]
-    fn stream_packed_with_decoder<R: Read, B: Budget>(
+    fn stream_packed_with_decoder<R: Read + Send, B: Budget>(
         &self,
         packed: &mut R,
         keys: Option<&Rar50Keys>,
@@ -553,21 +554,44 @@ impl FileHeader {
             decoder,
             buffered_decode_limit,
             scratch_policy,
+            None,
             writer,
         )
     }
 
-    fn stream_packed_with_crc_policy<const OPTIONAL_CRC: bool, R: Read, B: Budget>(
+    /// `outer_check` sees every output byte, on the checksum thread when there is one.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn stream_packed_with_crc_policy<
+        const OPTIONAL_CRC: bool,
+        R: Read + Send,
+        B: Budget,
+    >(
         &self,
         packed: &mut R,
         keys: Option<&Rar50Keys>,
         decoder: &mut ReaderState<B>,
         buffered_decode_limit: u64,
         scratch_policy: Option<&crate::Rar50Scratch>,
+        mut outer_check: Option<OuterCheck<'_>>,
         writer: &mut dyn Write,
     ) -> Result<()> {
+        let pipelined = scratch_policy
+            .is_none()
+            .then(|| output_pipeline::admit(self.unpacked_size, &decoder.allowance()))
+            .flatten();
+        let mut checked;
+        let inline_writer: &mut dyn Write = match outer_check.as_deref_mut() {
+            Some(check) if pipelined.is_none() => {
+                checked = ChecksumWriter {
+                    inner: &mut *writer,
+                    check,
+                };
+                &mut checked
+            }
+            _ => &mut *writer,
+        };
         if let Some(policy) = scratch_policy {
-            return scratch::decode(self, packed, keys, decoder, policy, writer);
+            return scratch::decode(self, packed, keys, decoder, policy, inline_writer);
         }
 
         let info = self.decoded_compression_info()?;
@@ -579,6 +603,61 @@ impl FileHeader {
         let mut crc = Crc32::new();
         let check_crc = !OPTIONAL_CRC || self.needs_crc32();
         let mut hash = streaming_hash_verifier(self)?;
+        let decode_error = |error| match error {
+            StreamDecodeError::Decode(error) => Error::from(error),
+            StreamDecodeError::FilteredMember => Error::Rar50BufferedDecodeLimitExceeded {
+                limit: buffered_decode_limit,
+                required: self.unpacked_size,
+            },
+            StreamDecodeError::Sink(error) => Error::from(error),
+        };
+        if let Some(_charge) = pipelined {
+            #[cfg(all(test, feature = "write"))]
+            let mut crc_bytes = 0;
+            let decoded = output_pipeline::run(
+                |chunks| {
+                    decoder.decode_member_from_reader_with_dictionary_to_sink(
+                        packed,
+                        info.algorithm_version,
+                        output_size,
+                        dictionary_size,
+                        info.solid,
+                        |chunk| match chunk {
+                            DecodedChunk::Bytes(bytes) => chunks.push(bytes),
+                            DecodedChunk::Repeated { byte, len } => chunks.push_repeated(byte, len),
+                        },
+                    )
+                },
+                &mut |chunk: &[u8]| {
+                    if check_crc {
+                        #[cfg(all(test, feature = "write"))]
+                        {
+                            crc_bytes += chunk.len();
+                        }
+                        crc.update(chunk);
+                    }
+                    if let Some((_, hasher)) = &mut hash {
+                        hasher.update(chunk);
+                    }
+                    if let Some(check) = outer_check.as_deref_mut() {
+                        #[cfg(all(test, feature = "write"))]
+                        {
+                            crc_bytes += chunk.len();
+                        }
+                        check(chunk);
+                    }
+                },
+                writer,
+            );
+            // Counted here because the checksum ran on its own thread.
+            #[cfg(all(test, feature = "write"))]
+            streaming_checks_tests::record_crc_work(crc_bytes, false);
+            decoded.map_err(|error| match error {
+                PipeError::Produce(error) => decode_error(error),
+                PipeError::Write(error) => Error::from(error),
+            })?;
+            return self.verify_streaming_integrity(crc, hash, keys);
+        }
         decoder
             .decode_member_from_reader_with_dictionary_to_sink(
                 packed,
@@ -596,27 +675,24 @@ impl FileHeader {
                         if let Some((_, hasher)) = &mut hash {
                             hasher.update(chunk);
                         }
-                        writer.write_all(chunk)
+                        inline_writer.write_all(chunk)
                     }
                     DecodedChunk::Repeated { byte, len } => {
                         if check_crc {
-                            write_repeated_chunk(writer, &mut crc, &mut hash, byte, len)
+                            write_repeated_chunk(inline_writer, &mut crc, &mut hash, byte, len)
                         } else {
                             write_repeated_chunk_with_optional_crc(
-                                writer, None, &mut hash, byte, len,
+                                inline_writer,
+                                None,
+                                &mut hash,
+                                byte,
+                                len,
                             )
                         }
                     }
                 },
             )
-            .map_err(|error| match error {
-                StreamDecodeError::Decode(error) => Error::from(error),
-                StreamDecodeError::FilteredMember => Error::Rar50BufferedDecodeLimitExceeded {
-                    limit: buffered_decode_limit,
-                    required: self.unpacked_size,
-                },
-                StreamDecodeError::Sink(error) => Error::from(error),
-            })?;
+            .map_err(decode_error)?;
         self.verify_streaming_integrity(crc, hash, keys)
     }
 
@@ -691,6 +767,27 @@ impl FileHeader {
 
     fn entry_error(&self, operation: &'static str, error: Error) -> Error {
         error.at_entry(self.name.clone(), operation)
+    }
+}
+
+type OuterCheck<'a> = &'a mut (dyn FnMut(&[u8]) + Send);
+
+struct ChecksumWriter<'a> {
+    inner: &'a mut dyn Write,
+    check: OuterCheck<'a>,
+}
+
+impl Write for ChecksumWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        #[cfg(all(test, feature = "write"))]
+        streaming_checks_tests::record_crc_work(written, false);
+        (self.check)(&buf[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -1272,6 +1369,7 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
             &mut streaming_decoder,
             self.buffered_decode_limit,
             self.scratch,
+            None,
             writer,
         )
         .map_err(|error| file.entry_error("decoding", error))?;
