@@ -373,6 +373,27 @@ fn stored_legacy_volumes_stream_without_the_in_memory_warning() {
 }
 
 #[test]
+fn stored_legacy_volumes_refuse_unnameable_sets_before_writing() {
+    let root = scratch("legacy-stored-volume-names");
+    let source = root.join("payload.bin");
+    let archive = root.join("split.rar");
+    fs::write(&source, deterministic_noise(200_000)).unwrap();
+    let create = rars()
+        .args(["add", "--format", "rar40", "--store", "--volume-size", "1k"])
+        .arg(&archive)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(!create.status.success());
+    assert!(stderr(&create).contains(".r99"), "{}", stderr(&create));
+    let left: Vec<_> = fs::read_dir(&root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(left, ["payload.bin"]);
+}
+
+#[test]
 fn info_reports_comment_output_limits_for_every_archive_family() {
     for path in [
         fixture("COMMENT.RAR"),

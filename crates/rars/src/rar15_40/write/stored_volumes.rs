@@ -1,6 +1,6 @@
 use super::*;
 use crate::volume_sink::VolumeSink;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 
 /// A multiple of the cipher block, so only the last piece is ever padded.
 const STREAM_CHUNK: usize = 64 * 1024;
@@ -117,8 +117,7 @@ pub(super) fn split_stored(
         salt: cipher.salt,
         packed_len,
         final_crc: None,
-        ahead: PackedStream::open(&member.bytes, source_len, &cipher, progress, None)?,
-        emit: PackedStream::open(&member.bytes, source_len, &cipher, progress, Some(&work))?,
+        payload: PackedStream::open(&member.bytes, source_len, &cipher, progress, Some(&work))?,
     };
     packer.expect_only(&member)?;
     packer.write_member(member)?;
@@ -148,11 +147,9 @@ struct VolumeMember<'a> {
     file_flags: u16,
     salt: Option<[u8; 8]>,
     packed_len: u64,
-    /// Known when packing worked it out; otherwise the read ahead finds it.
+    /// Known when packing worked it out; otherwise found while copying the payload.
     final_crc: Option<u32>,
-    /// Headers carry their fragment's CRC, so each is read ahead, then again to copy.
-    ahead: PackedStream<'a>,
-    emit: PackedStream<'a>,
+    payload: PackedStream<'a>,
 }
 
 impl VolumeMember<'_> {
@@ -220,7 +217,7 @@ struct VolumePacker<'a> {
 }
 
 struct OpenVolume {
-    out: Box<dyn Write + Send>,
+    out: Box<dyn crate::volume_sink::VolumeOutput>,
     used: u64,
     fragments: u64,
 }
@@ -255,7 +252,9 @@ impl<'a> VolumePacker<'a> {
         })?;
         let overhead = self.head(0)?.len() as u64 + header_len + self.tail_len;
         if let Some(payload) = self.volume_size.checked_sub(overhead).filter(|&p| p > 0) {
-            self.total_volumes = usize::try_from(member.packed_len.div_ceil(payload)).ok();
+            let total = member.packed_len.div_ceil(payload);
+            self.sink.expect_volumes(total)?;
+            self.total_volumes = usize::try_from(total).ok();
         }
         Ok(())
     }
@@ -301,22 +300,32 @@ impl<'a> VolumePacker<'a> {
             }
             let len = remaining.min(room);
             let split_after = start + len < member.packed_len;
-            let fragment_crc = member.ahead.copy(len, &mut std::io::sink())?;
+            // The header carries the CRC of what follows it, so it goes out as
+            // a placeholder and is patched once the payload has been copied.
+            let volume = self.open.as_mut().expect("volume started");
+            volume.out.write_all(&vec![0; header_len as usize])?;
+            let fragment_crc = member.payload.copy(len, &mut *volume.out)?;
             let file_crc = match (split_after, member.final_crc) {
                 (true, _) => fragment_crc,
                 (false, Some(crc)) => crc,
-                (false, None) => member.ahead.unpacked_crc(),
+                (false, None) => member.payload.unpacked_crc(),
             };
             let header =
                 member.header(start > 0, split_after, len, file_crc, self.header_password)?;
-            let volume = self.open.as_mut().expect("volume started");
-            volume.out.write_all(&header)?;
-            if member.emit.copy(len, &mut *volume.out)? != fragment_crc {
-                return Err(Error::SourceChanged(
-                    "entry source contents changed while writing",
+            if header.len() as u64 != header_len {
+                return Err(Error::WriterFailure(
+                    "legacy file header changed length when patched",
                 ));
             }
-            volume.used += header.len() as u64 + len;
+            let volume = self.open.as_mut().expect("volume started");
+            let back = i64::try_from(header_len + len)
+                .map_err(|_| Error::InvalidArgument("legacy volume fragment is too long"))?;
+            volume.out.seek(SeekFrom::Current(-back))?;
+            volume.out.write_all(&header)?;
+            volume
+                .out
+                .seek(SeekFrom::Current(back - header_len as i64))?;
+            volume.used += header_len + len;
             volume.fragments += 1;
             start += len;
             if !split_after {

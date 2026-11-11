@@ -2110,7 +2110,17 @@ impl Drop for CliVolumeSink<'_> {
 }
 
 impl rars::rar50::VolumeSink for CliVolumeSink<'_> {
-    fn start_volume(&mut self, index: u64) -> rars::Result<Box<dyn std::io::Write + Send>> {
+    fn expect_volumes(&mut self, total: u64) -> rars::Result<()> {
+        // Names only get harder to form as the index grows.
+        let total = usize::try_from(total).unwrap_or(usize::MAX);
+        for index in [0, total.saturating_sub(1)] {
+            (self.part_path)(self.first_path, index, total)
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn start_volume(&mut self, index: u64) -> rars::Result<Box<dyn rars::rar50::VolumeOutput>> {
         // Refuse a name that cannot exist before writing a volume that would need it.
         let part = usize::try_from(index).unwrap_or(usize::MAX);
         (self.part_path)(self.first_path, part, part.saturating_add(1))

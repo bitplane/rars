@@ -35,7 +35,7 @@ use crate::extraction_links::{check_legacy_size, emit_legacy_link, legacy_output
 #[cfg(feature = "write")]
 pub use crate::streaming::{EntrySource, WriterResources};
 #[cfg(feature = "write")]
-pub use crate::volume_sink::{CollectedVolumes, VolumeSink};
+pub use crate::volume_sink::{CollectedVolumes, VolumeOutput, VolumeSink};
 #[cfg(feature = "write")]
 pub use crate::write_plan::MemberCoding;
 pub use extract::extract_volumes_to;

@@ -202,18 +202,36 @@ fn encrypted_streamed_volumes_extract_to_the_source() {
 }
 
 #[test]
-fn a_source_that_changes_between_reads_is_refused() {
+fn the_source_is_read_once() {
     let opens = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let source = {
         let opens = opens.clone();
         EntrySource::from_opener(10_003, move || {
-            let mut bytes = data();
-            if opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
-                bytes[5000] ^= 1;
-            }
-            Ok(Box::new(std::io::Cursor::new(bytes)))
+            opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::new(std::io::Cursor::new(data())))
         })
     };
+    for (target, password) in [
+        (ArchiveVersion::Rar40, None),
+        (ArchiveVersion::Rar30, Some(&b"secret"[..])),
+    ] {
+        opens.store(0, std::sync::atomic::Ordering::SeqCst);
+        let options = WriterOptions::new(target, FeatureSet::store_only());
+        let volumes = stream(&entry(source.clone(), password), options, 3000).unwrap();
+        assert_eq!(volumes.len(), 4);
+        assert_eq!(
+            opens.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "{target:?}"
+        );
+    }
+}
+
+#[test]
+fn a_source_shorter_than_it_claimed_is_refused() {
+    let source = EntrySource::from_opener(10_003, || {
+        Ok(Box::new(std::io::Cursor::new(data()[..9_000].to_vec())))
+    });
     let options = WriterOptions::new(ArchiveVersion::Rar40, FeatureSet::store_only());
     let error = stream(&entry(source, None), options, 3000).unwrap_err();
     assert_eq!(error.kind(), rars::ErrorKind::SourceChanged);
@@ -248,5 +266,38 @@ fn every_finished_volume_reports_the_size_of_the_set() {
     assert_eq!(
         totals.0.into_inner().unwrap(),
         [(1, Some(4)), (2, Some(4)), (3, Some(4)), (4, Some(4))]
+    );
+}
+
+#[test]
+fn the_sink_hears_the_set_size_before_the_first_volume() {
+    #[derive(Default)]
+    struct Calls(Vec<String>, CollectedVolumes);
+    impl rars::rar15_40::VolumeSink for Calls {
+        fn expect_volumes(&mut self, total: u64) -> rars::Result<()> {
+            self.0.push(format!("expect {total}"));
+            Ok(())
+        }
+        fn start_volume(
+            &mut self,
+            index: u64,
+        ) -> rars::Result<Box<dyn rars::rar15_40::VolumeOutput>> {
+            self.0.push(format!("start {index}"));
+            self.1.start_volume(index)
+        }
+    }
+    let mut sink = Calls::default();
+    write_stored_volumes_to(
+        &entry(EntrySource::from_bytes(data()), None),
+        WriterOptions::new(ArchiveVersion::Rar40, FeatureSet::store_only()),
+        3000,
+        &mut sink,
+        &WriterResources::default(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        sink.0,
+        ["expect 4", "start 0", "start 1", "start 2", "start 3"]
     );
 }

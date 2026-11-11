@@ -275,7 +275,7 @@ fn cancellation_interrupts_encrypted_volume_preparation() {
     }
     struct NoVolumes;
     impl rar50::VolumeSink for NoVolumes {
-        fn start_volume(&mut self, _: u64) -> rars::Result<Box<dyn Write + Send>> {
+        fn start_volume(&mut self, _: u64) -> rars::Result<Box<dyn rar50::VolumeOutput>> {
             panic!("cancelled encryption must not publish a volume");
         }
     }

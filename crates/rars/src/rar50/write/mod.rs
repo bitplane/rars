@@ -4,7 +4,7 @@ use crate::crc32::Crc32;
 use crate::crypto::rar50::Rar50Cipher;
 use crate::crypto::rar50::Rar50Keys;
 pub use crate::filter::{FilterKind, FilterPolicy, FilterSpec};
-pub use crate::volume_sink::{CollectedVolumes, VolumeSink};
+pub use crate::volume_sink::{CollectedVolumes, VolumeOutput, VolumeSink};
 use crate::write_plan::{PlanShape, WriterOption};
 use crate::write_progress::ProgressReporter;
 use crate::{EntrySource, WriteProgress, WriterResources};

@@ -104,6 +104,7 @@ pub(crate) struct VolumeCollector {
 struct VolumeOutput {
     shared: Arc<Shared>,
     index: usize,
+    position: usize,
     _charge: Option<CapacityCharge>,
 }
 impl VolumeCollector {
@@ -130,7 +131,7 @@ impl VolumeCollector {
     }
 }
 impl crate::rar50::VolumeSink for VolumeCollector {
-    fn start_volume(&mut self, index: u64) -> Result<Box<dyn Write + Send>> {
+    fn start_volume(&mut self, index: u64) -> Result<Box<dyn crate::volume_sink::VolumeOutput>> {
         let index =
             usize::try_from(index).map_err(|_| Error::InvalidArgument("volume index overflows"))?;
         let mut outputs = self.shared.outputs.lock().unwrap();
@@ -145,16 +146,33 @@ impl crate::rar50::VolumeSink for VolumeCollector {
         Ok(Box::new(VolumeOutput {
             shared: self.shared.clone(),
             index,
+            position: 0,
             _charge: charge,
         }))
     }
 }
 impl Write for VolumeOutput {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.shared.outputs.lock().unwrap()[self.index].write(bytes)
+        let mut outputs = self.shared.outputs.lock().unwrap();
+        let output = &mut outputs[self.index].bytes;
+        let overlap = bytes.len().min(output.len() - self.position);
+        output[self.position..self.position + overlap].copy_from_slice(&bytes[..overlap]);
+        output
+            .extend_from_slice(&bytes[overlap..])
+            .map_err(io::Error::other)?;
+        self.position += bytes.len();
+        Ok(bytes.len())
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+impl io::Seek for VolumeOutput {
+    fn seek(&mut self, from: io::SeekFrom) -> io::Result<u64> {
+        let len = self.shared.outputs.lock().unwrap()[self.index].bytes.len();
+        self.position = crate::volume_sink::seek_within(self.position, len, from)?;
+        Ok(self.position as u64)
     }
 }
 

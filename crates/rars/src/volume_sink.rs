@@ -1,10 +1,21 @@
 use crate::error::{Error, Result};
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
+
+/// One volume's output, seekable so a header can be finished after its data.
+pub trait VolumeOutput: Write + Seek + Send {}
+
+impl<T: Write + Seek + Send> VolumeOutput for T {}
 
 /// Receives each volume of a multi-volume archive as it is finished.
 pub trait VolumeSink {
+    /// Told the set's size before the first volume, when the writer knows it up front.
+    fn expect_volumes(&mut self, total: u64) -> Result<()> {
+        let _ = total;
+        Ok(())
+    }
+
     /// Opens the output for volume `index`, numbered from zero.
-    fn start_volume(&mut self, index: u64) -> Result<Box<dyn Write + Send>>;
+    fn start_volume(&mut self, index: u64) -> Result<Box<dyn VolumeOutput>>;
 
     /// Called once volume `index` has been written and flushed.
     fn finish_volume(&mut self, index: u64, len: u64) -> Result<()> {
@@ -27,6 +38,7 @@ pub struct CollectedVolumes {
 struct CollectedVolume {
     volumes: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
     index: usize,
+    position: usize,
 }
 
 impl CollectedVolumes {
@@ -48,10 +60,15 @@ impl CollectedVolumes {
 
 impl Write for CollectedVolume {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.volumes
+        let mut volumes = self
+            .volumes
             .lock()
-            .expect("volume collector is not poisoned")[self.index]
-            .extend_from_slice(buf);
+            .expect("volume collector is not poisoned");
+        let volume = &mut volumes[self.index];
+        let overlap = buf.len().min(volume.len() - self.position);
+        volume[self.position..self.position + overlap].copy_from_slice(&buf[..overlap]);
+        volume.extend_from_slice(&buf[overlap..]);
+        self.position += buf.len();
         Ok(buf.len())
     }
 
@@ -60,8 +77,36 @@ impl Write for CollectedVolume {
     }
 }
 
+impl Seek for CollectedVolume {
+    fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+        let len = self
+            .volumes
+            .lock()
+            .expect("volume collector is not poisoned")[self.index]
+            .len();
+        self.position = seek_within(self.position, len, from)?;
+        Ok(self.position as u64)
+    }
+}
+
+/// Resolves a seek inside a buffer; past the end would leave a gap, which no writer needs.
+pub(crate) fn seek_within(position: usize, len: usize, from: SeekFrom) -> std::io::Result<usize> {
+    let target = match from {
+        SeekFrom::Start(offset) => i128::from(offset),
+        SeekFrom::Current(delta) => position as i128 + i128::from(delta),
+        SeekFrom::End(delta) => len as i128 + i128::from(delta),
+    };
+    if !(0..=len as i128).contains(&target) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "volume seek outside what was written",
+        ));
+    }
+    Ok(target as usize)
+}
+
 impl VolumeSink for CollectedVolumes {
-    fn start_volume(&mut self, index: u64) -> Result<Box<dyn Write + Send>> {
+    fn start_volume(&mut self, index: u64) -> Result<Box<dyn VolumeOutput>> {
         let mut volumes = self
             .volumes
             .lock()
@@ -74,6 +119,7 @@ impl VolumeSink for CollectedVolumes {
         Ok(Box::new(CollectedVolume {
             volumes: std::sync::Arc::clone(&self.volumes),
             index: index as usize,
+            position: 0,
         }))
     }
 
