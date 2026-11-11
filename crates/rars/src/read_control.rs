@@ -112,6 +112,9 @@ impl ReadControl {
     pub(crate) fn decode_workers(&self) -> DecodeWorkers {
         self.2
     }
+    pub(crate) fn set_decode_workers(&mut self, workers: DecodeWorkers) {
+        self.2 = workers;
+    }
     pub(crate) fn rar3_vm_programs(&self) -> Rar3VmPrograms {
         self.1
     }

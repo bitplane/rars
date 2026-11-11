@@ -89,3 +89,10 @@ path = "fuzz_targets/unpack15_round_trip.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "unpack50_workers"
+path = "fuzz_targets/unpack50_workers.rs"
+test = false
+doc = false
+bench = false
