@@ -2,7 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
-/// Volume `index` as `.rar`, `.r00`, ..., `.r99`, with `.R00` after `.RAR`; RAR documents no name past `.r99`.
+/// Volume `index` as `.rar`, `.r00`, ..., `.r99`, with `.R00` after an upper-case extension
+/// such as `.RAR` or a DOS `.EXE`; RAR documents no name past `.r99`.
 pub fn old_style(first: &Path, index: usize) -> Option<PathBuf> {
     let Some(number) = index.checked_sub(1) else {
         return Some(first.to_path_buf());
@@ -14,16 +15,20 @@ pub fn old_style(first: &Path, index: usize) -> Option<PathBuf> {
         .extension()
         .and_then(|extension| extension.as_encoded_bytes().first())
     {
-        Some(b'R') => 'R',
+        Some(letter) if letter.is_ascii_uppercase() => 'R',
         _ => 'r',
     };
     Some(first.with_extension(format!("{letter}{number:02}")))
 }
 
 /// Volume `index` as `name.partN.rar`, keeping the first volume's `.RAR` case as RAR does.
+/// A self-extracting first volume (`name.part1.exe`, `.sfx`) is followed by `.rar` volumes.
 pub fn part_style(first: &Path, index: usize, width: usize) -> Option<PathBuf> {
     let file_name = crate::filename::native_bytes(first.file_name()?).ok()?;
-    let (stem, suffix) = split_rar_suffix(file_name);
+    let (stem, suffix) = match split_rar_suffix(file_name) {
+        (stem, "") => split_sfx_suffix(stem).unwrap_or((stem, "")),
+        split => split,
+    };
     let stem = part_number(stem).map_or(stem, |(base, _)| base);
     // Removing ASCII suffixes from a native name keeps it native.
     let mut name = crate::filename::native_string(stem).ok()?;
@@ -32,13 +37,32 @@ pub fn part_style(first: &Path, index: usize, width: usize) -> Option<PathBuf> {
     Some(first.with_file_name(name))
 }
 
-/// The digit count of the first volume's `.partN.rar` number, if it has one.
+/// The digit count of the first volume's `.partN.rar` (or `.partN.exe`) number, if it has one.
 pub fn part_width(first: &Path) -> Option<usize> {
     let file_name = crate::filename::native_bytes(first.file_name()?).ok()?;
     match split_rar_suffix(file_name) {
         (stem, suffix) if !suffix.is_empty() => part_number(stem).map(|(_, digits)| digits.len()),
-        _ => None,
+        (stem, _) => {
+            split_sfx_suffix(stem).map(|(stem, _)| part_number(stem).expect("part").1.len())
+        }
     }
+}
+
+/// `name.partN` and the `.rar` its later volumes take, when the name is `name.partN.exe` or `.sfx`.
+fn split_sfx_suffix(file_name: &[u8]) -> Option<(&[u8], &'static str)> {
+    let start = file_name.len().checked_sub(4)?;
+    let (stem, extension) = file_name.split_at(start);
+    if !is_sfx_extension(extension) {
+        return None;
+    }
+    part_number(stem)?;
+    let upper = extension.iter().all(|byte| !byte.is_ascii_lowercase());
+    Some((stem, if upper { ".RAR" } else { ".rar" }))
+}
+
+/// `.exe` or `.sfx` in any case: the names RAR gives a self-extracting first volume.
+pub fn is_sfx_extension(extension: &[u8]) -> bool {
+    extension.eq_ignore_ascii_case(b".exe") || extension.eq_ignore_ascii_case(b".sfx")
 }
 
 /// The name without a trailing `.rar`, and that `.rar` as written (empty when absent).
@@ -79,6 +103,9 @@ mod tests {
             ("set.Rar", "set.R00"),
             ("set.rAR", "set.r00"),
             ("set", "set.r00"),
+            ("set.sfx", "set.r00"),
+            ("SET.sfx", "SET.r00"),
+            ("SET.EXE", "SET.R00"),
         ] {
             assert_eq!(
                 old_style(Path::new(input), 1).as_deref(),
@@ -100,6 +127,12 @@ mod tests {
             ("set.bin", 0, 2, "set.bin.part01.rar"),
             ("set.part2.part3.rar", 0, 2, "set.part2.part01.rar"),
             ("dir/set.rar", 9, 3, "dir/set.part010.rar"),
+            ("set.part1.sfx", 1, 1, "set.part2.rar"),
+            ("set.part01.exe", 12, 2, "set.part13.rar"),
+            ("SET.part1.sfx", 1, 1, "SET.part2.rar"),
+            ("SET.PART1.EXE", 1, 1, "SET.part2.RAR"),
+            ("set.part1.tar.gz", 0, 2, "set.part1.tar.gz.part01.rar"),
+            ("set.part1.bin", 0, 2, "set.part1.bin.part01.rar"),
         ] {
             assert_eq!(
                 part_style(Path::new(input), index, width).as_deref(),
@@ -120,6 +153,11 @@ mod tests {
             ("set.part.rar", None),
             ("set.partx.rar", None),
             ("set.part01", None),
+            ("set.part1.sfx", Some(1)),
+            ("set.part01.EXE", Some(2)),
+            ("set.part1.", None),
+            ("set.part1.bin", None),
+            ("set.exe", None),
         ] {
             assert_eq!(part_width(Path::new(input)), expected, "{input}");
         }
