@@ -75,6 +75,7 @@ impl Archive {
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
         L: FnMut(&ExtractedEntryMeta, ExtractedLink<'_>) -> Result<()>,
     {
+        let _cap = crate::parallel::ThreadCap::set(options.threads);
         options.check_cancelled()?;
         match self {
             Self::Rar13(archive) => {
@@ -119,6 +120,7 @@ where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     L: FnMut(&ExtractedEntryMeta, ExtractedLink<'_>) -> Result<()>,
 {
+    let _cap = crate::parallel::ThreadCap::set(options.threads);
     options.check_cancelled()?;
     let first = archives
         .first()

@@ -212,6 +212,11 @@ pub struct ArchiveReadOptions<'a> {
     /// `max_reader_workspace_bytes` and calls made from inside the thread pool
     /// decode serially. Needs the `parallel` feature.
     pub rar50_decode_workers: Option<usize>,
+    /// Caps one extraction or test's members decoded side by side, and a large
+    /// RAR5/7 member's block decoders (see `rar50_decode_workers`). 0 or 1 keeps
+    /// the whole call on the calling thread. Unset follows the thread pool's
+    /// size. Needs the `parallel` feature.
+    pub threads: Option<usize>,
     /// Inclusive logical member output ceiling for every archive family, independent of RAM usage.
     /// None preserves defaults; zero permits empty output. Apply to extraction,
     /// not parsing. Known oversized members and unsupported unknown-size members
@@ -343,6 +348,12 @@ impl<'a> ArchiveReadOptions<'a> {
     /// Caps the threads decoding one RAR5/7 member's blocks; zero is serial.
     pub fn with_rar50_decode_workers(mut self, workers: usize) -> Self {
         self.rar50_decode_workers = Some(workers);
+        self
+    }
+
+    /// Caps one extraction or test's parallelism; 0 or 1 keeps it on the calling thread.
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = Some(threads);
         self
     }
 
@@ -785,6 +796,7 @@ impl Archive {
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
+        let _cap = crate::parallel::ThreadCap::set(options.threads);
         options.check_cancelled()?;
         match self {
             Self::Rar13(archive) => {
@@ -825,6 +837,7 @@ impl Archive {
         V::IntoIter: Send,
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
+        let _cap = crate::parallel::ThreadCap::set(options.threads);
         let mut volumes = volumes.into_iter();
         options.check_cancelled()?;
         match self {
@@ -921,6 +934,7 @@ impl Archive {
     where
         F: FnMut(&ArchiveMember) -> Result<ExtractionDecision>,
     {
+        let _cap = crate::parallel::ThreadCap::set(options.threads);
         match self {
             Self::Rar13(archive) => archive.extract_controlled(options, &mut decide, None),
             Self::Rar15To40(archive) => archive.extract_controlled(options, &mut decide, None),
@@ -947,6 +961,7 @@ impl Archive {
         F: FnMut(&ArchiveMember) -> Result<ExtractionDecision>,
         E: FnMut(&ArchiveMember, &Error) -> Result<ExtractionErrorAction>,
     {
+        let _cap = crate::parallel::ThreadCap::set(options.threads);
         match self {
             Self::Rar13(archive) => {
                 archive.extract_controlled(options, &mut decide, Some(&mut on_error))
@@ -986,6 +1001,7 @@ impl Archive {
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
+        let _cap = crate::parallel::ThreadCap::set(options.threads);
         options.check_cancelled()?;
         match self {
             Self::Rar13(archive) => {
@@ -1023,6 +1039,7 @@ impl Archive {
         name: &[u8],
         options: ArchiveReadOptions<'_>,
     ) -> Result<Option<Vec<u8>>> {
+        let _cap = crate::parallel::ThreadCap::set(options.threads);
         options.check_cancelled()?;
         let index = self
             .member_refs()
@@ -1058,6 +1075,7 @@ impl Archive {
         index: usize,
         options: ArchiveReadOptions<'_>,
     ) -> Result<Option<Vec<u8>>> {
+        let _cap = crate::parallel::ThreadCap::set(options.threads);
         options.check_cancelled()?;
         let Some(member) = self.member_refs().nth(index) else {
             return Ok(None);
@@ -1107,6 +1125,7 @@ impl Archive {
     /// Parsing-only limits are not reapplied; comments and recovery are outside
     /// this payload test. Each call starts fresh output budgets.
     pub fn test_with_options(&self, options: ArchiveReadOptions<'_>) -> Result<()> {
+        let _cap = crate::parallel::ThreadCap::set(options.threads);
         self.test_with_options_and_callback(options, |_| Ok(()))
     }
 
@@ -1130,6 +1149,7 @@ impl Archive {
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<()>,
     {
+        let _cap = crate::parallel::ThreadCap::set(options.threads);
         options.check_cancelled()?;
         match self {
             Self::Rar50Plus(archive) => {
@@ -1696,6 +1716,7 @@ pub fn extract_volumes_to_with_options<F>(
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
 {
+    let _cap = crate::parallel::ThreadCap::set(options.threads);
     options.check_cancelled()?;
     let Some(first) = archives.first() else {
         return Err(Error::InvalidHeader("volume set is empty"));
@@ -1723,6 +1744,7 @@ pub fn test_volumes_with_options(
     archives: &[Archive],
     options: ArchiveReadOptions<'_>,
 ) -> Result<()> {
+    let _cap = crate::parallel::ThreadCap::set(options.threads);
     test_volumes_with_options_and_callback(archives, options, |_| Ok(()))
 }
 
@@ -1737,6 +1759,7 @@ pub fn test_volumes_with_options_and_callback<F>(
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<()>,
 {
+    let _cap = crate::parallel::ThreadCap::set(options.threads);
     options.check_cancelled()?;
     let Some(first) = archives.first() else {
         return Err(Error::InvalidHeader("volume set is empty"));
@@ -1808,6 +1831,7 @@ pub fn read_volume_member_at_with_options(
     index: usize,
     options: ArchiveReadOptions<'_>,
 ) -> Result<Option<Vec<u8>>> {
+    let _cap = crate::parallel::ThreadCap::set(options.threads);
     options.check_cancelled()?;
     let mut output_indices = member_read::volume_output_indices(archives);
     let collected = std::sync::Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));

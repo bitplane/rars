@@ -144,13 +144,16 @@ struct ReadOptions {
     rar50_buffered_decode_limit: Option<u64>,
     #[pyo3(get)]
     allow_rar3_vm_programs: bool,
+    /// Caps members decoded side by side and a large RAR 5 member's block decoders; 0 or 1 keeps the call on the calling thread.
+    #[pyo3(get)]
+    threads: Option<usize>,
 }
 
 #[pymethods]
 impl ReadOptions {
     #[new]
     #[allow(clippy::too_many_arguments)] // Python keyword-only policy fields.
-    #[pyo3(signature = (*, cancellation=None, max_member_output_bytes=None, max_total_output_bytes=None, max_reader_workspace_bytes=None, rar50_dictionary_size_limit=None, rar50_buffered_decode_limit=None, max_header_count=None, max_header_bytes=None, legacy_name_encoding=None, allow_rar3_vm_programs=false))]
+    #[pyo3(signature = (*, cancellation=None, max_member_output_bytes=None, max_total_output_bytes=None, max_reader_workspace_bytes=None, rar50_dictionary_size_limit=None, rar50_buffered_decode_limit=None, max_header_count=None, max_header_bytes=None, legacy_name_encoding=None, allow_rar3_vm_programs=false, threads=None))]
     fn new(
         cancellation: Option<&CancellationToken>,
         max_member_output_bytes: Option<u64>,
@@ -162,6 +165,7 @@ impl ReadOptions {
         max_header_bytes: Option<u64>,
         legacy_name_encoding: Option<String>,
         allow_rar3_vm_programs: bool,
+        threads: Option<usize>,
     ) -> PyResult<Self> {
         let encoding = legacy_name_encoding
             .as_deref()
@@ -180,6 +184,7 @@ impl ReadOptions {
             max_header_count,
             max_header_bytes,
             allow_rar3_vm_programs,
+            threads,
         })
     }
 
@@ -207,6 +212,7 @@ fn python_read_options<'a>(
         options.rar50_dictionary_size_limit = settings.rar50_dictionary_size_limit;
         options.rar50_buffered_decode_limit = settings.rar50_buffered_decode_limit;
         options.allow_rar3_vm_programs = settings.allow_rar3_vm_programs;
+        options.threads = settings.threads;
     }
     options
 }
@@ -2846,6 +2852,7 @@ mod tests {
                     None,
                     None,
                     false,
+                    None,
                 )
                 .unwrap();
                 let cancel_object = Py::new(py, token).unwrap();
