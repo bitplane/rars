@@ -442,6 +442,13 @@ impl Unpack50Decoder {
             state: ReaderState::new(&Allowance::default()),
         }
     }
+    /// Lets streamed decodes use up to `workers` block decoders; 0 is serial, as by default.
+    #[doc(hidden)]
+    pub fn with_decode_workers(mut self, workers: usize) -> Self {
+        self.read_control
+            .set_decode_workers(crate::read_control::DecodeWorkers::AtMost(workers));
+        self
+    }
     #[cfg(all(test, feature = "write"))]
     fn copy_match(
         &self,

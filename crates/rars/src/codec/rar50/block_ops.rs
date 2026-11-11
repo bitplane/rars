@@ -8,13 +8,14 @@ use super::{
 use crate::read_control::Poller;
 
 // A list holds at most 4 MiB of each; a longer block takes several lists.
-#[cfg(not(test))]
+// Tests and fuzzing use tiny lists so small inputs still split blocks.
+#[cfg(not(any(test, fuzzing)))]
 const MAX_OPS: usize = 512 * 1024;
-#[cfg(not(test))]
+#[cfg(not(any(test, fuzzing)))]
 const MAX_LITERALS: usize = 4 * 1024 * 1024;
-#[cfg(test)]
+#[cfg(any(test, fuzzing))]
 const MAX_OPS: usize = 48;
-#[cfg(test)]
+#[cfg(any(test, fuzzing))]
 const MAX_LITERALS: usize = 300;
 // Literals copied between cancellation polls.
 const LITERAL_POLL: usize = 64 * 1024;

@@ -14,9 +14,9 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 // Packed bytes read ahead of the output, whatever the worker count.
 const MAX_AHEAD_BYTES: usize = 32 * 1024 * 1024;
 // Packed bytes that make a batch worth a task of its own.
-#[cfg(not(test))]
+#[cfg(not(any(test, fuzzing)))]
 const BATCH_BYTES: usize = 256 * 1024;
-#[cfg(test)]
+#[cfg(any(test, fuzzing))]
 const BATCH_BYTES: usize = 256;
 
 type Tables<B> = Arc<ReaderTables<B>>;
