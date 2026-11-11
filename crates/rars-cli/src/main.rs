@@ -1074,7 +1074,7 @@ impl<'a> ExtractOutputState<'a> {
     fn publish(mut self) -> rars::Result<Vec<ExtractedOutput>> {
         self.publish_verified()?;
         for (path, modified) in &self.directory_times {
-            output::set_modified_time(path, *modified)?;
+            rars::output_times::set_modified_time(path, *modified)?;
         }
         Ok(std::mem::take(&mut self.outputs))
     }

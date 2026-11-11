@@ -586,7 +586,8 @@ impl RarFile {
             .collect()
     }
 
-    #[pyo3(signature = (member, path = None, pwd = None, overwrite = false, *, options = None))]
+    #[pyo3(signature = (member, path = None, pwd = None, overwrite = false, *, options = None, restore_times = true))]
+    #[allow(clippy::too_many_arguments)]
     fn extract(
         &self,
         py: Python<'_>,
@@ -595,6 +596,7 @@ impl RarFile {
         pwd: Option<&Bound<'_, PyAny>>,
         overwrite: bool,
         options: Option<&ReadOptions>,
+        restore_times: bool,
     ) -> PyResult<PathBuf> {
         check_read_options_cancellation(options)?;
         let target = self.resolve_index(member)?;
@@ -608,6 +610,7 @@ impl RarFile {
                     &out_dir,
                     self.extraction_options(options, password.as_deref()),
                     overwrite,
+                    restore_times,
                 )
             })
             .map_err(map_error)?;
@@ -625,7 +628,7 @@ impl RarFile {
     /// generator may wait for downloads. If the last volume isn't marked as last
     /// (all RAR 1.3 to 2.0 sets, some later ones), the iterator is advanced once
     /// more and must stop, not wait.
-    #[pyo3(signature = (path = None, members = None, pwd = None, overwrite = false, *, options = None, volumes = None))]
+    #[pyo3(signature = (path = None, members = None, pwd = None, overwrite = false, *, options = None, volumes = None, restore_times = true))]
     #[allow(clippy::too_many_arguments)]
     fn extractall(
         &self,
@@ -636,6 +639,7 @@ impl RarFile {
         overwrite: bool,
         options: Option<&ReadOptions>,
         volumes: Option<&Bound<'_, PyAny>>,
+        restore_times: bool,
     ) -> PyResult<Vec<PathBuf>> {
         check_read_options_cancellation(options)?;
         let out_dir = path.unwrap_or_else(|| PathBuf::from("."));
@@ -649,12 +653,21 @@ impl RarFile {
             let options = self.extraction_options(options, password.as_deref());
             let first = &self.archive;
             let written = Arc::new(Mutex::new(Vec::new()));
+            let times = restore_times.then(|| Arc::new(Mutex::new(rars_rs::OutputTimes::new())));
             self.extract_set(py, volumes, options, |volumes| {
-                first.extract_with_volumes(
+                let result = first.extract_with_volumes(
                     volumes,
                     options,
-                    output_opener(&out_dir, first.family(), options, overwrite, &written),
-                )
+                    output_opener(
+                        &out_dir,
+                        first.family(),
+                        options,
+                        overwrite,
+                        &written,
+                        &times,
+                    ),
+                );
+                apply_output_times(times.as_deref(), result)
             })?;
             let out = written.lock().expect("written lock poisoned").clone();
             return Ok(out);
@@ -676,6 +689,7 @@ impl RarFile {
                 &out_dir,
                 self.extraction_options(options, password.as_deref()),
                 overwrite,
+                restore_times,
             )
         })
         .map_err(map_error)
@@ -2072,6 +2086,7 @@ fn extract_archive<S: Selection>(
     out_dir: &Path,
     options: rars_rs::ArchiveReadOptions<'_>,
     overwrite: bool,
+    restore_times: bool,
 ) -> rars_rs::Result<Vec<PathBuf>> {
     if options
         .cancellation
@@ -2080,44 +2095,51 @@ fn extract_archive<S: Selection>(
         return Err(rars_rs::Error::Cancelled);
     }
     let written = Arc::new(Mutex::new(Vec::new()));
-    let open = {
-        let written = Arc::clone(&written);
-        move |meta: &rars_rs::ExtractedEntryMeta| {
-            let path = checked_output_path(
-                out_dir,
-                meta,
-                archive.family(),
-                options.legacy_name_encoding,
-            )?;
-            if options.legacy_name_encoding.is_some()
-                && written
-                    .lock()
-                    .expect("written lock poisoned")
-                    .contains(&path)
-            {
-                return Err(rars_rs::Error::InvalidArgument(
-                    "multiple entries map to the same decoded output path",
-                ));
-            }
-            if meta.is_directory {
-                fs::create_dir_all(&path)?;
-                written.lock().expect("written lock poisoned").push(path);
-                return Ok(Box::new(io::sink()) as Box<dyn Write>);
-            }
-            fs::create_dir_all(path.parent().expect("checked output path has a file name"))?;
-            let mut options = fs::OpenOptions::new();
-            options.write(true);
-            if overwrite {
-                options.create(true).truncate(true);
-            } else {
-                options.create_new(true);
-            }
-            set_no_follow(&mut options);
-            let file = options.open(&path)?;
-            written.lock().expect("written lock poisoned").push(path);
-            Ok(Box::new(file) as Box<dyn Write>)
-        }
+    let times = restore_times.then(|| Arc::new(Mutex::new(rars_rs::OutputTimes::new())));
+    let mut open = output_opener(
+        out_dir,
+        archive.family(),
+        options,
+        overwrite,
+        &written,
+        &times,
+    );
+    let result = extract_selected(
+        archive, selected, out_dir, options, overwrite, &written, &times, &mut open,
+    );
+    apply_output_times(times.as_deref(), result)?;
+    let out = written.lock().expect("written lock poisoned").clone();
+    Ok(out)
+}
+
+/// Sets the outputs' stored times; extraction's own error wins over a failure to set them.
+fn apply_output_times(
+    times: Option<&Mutex<rars_rs::OutputTimes>>,
+    result: rars_rs::Result<()>,
+) -> rars_rs::Result<()> {
+    let Some(times) = times else {
+        return result;
     };
+    let mut times = times.lock().expect("times lock poisoned");
+    if result.is_ok() {
+        times.finish();
+    }
+    let restored = times.restore();
+    result?;
+    Ok(restored?)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn extract_selected<S: Selection>(
+    archive: &rars_rs::Archive,
+    selected: Option<&S>,
+    out_dir: &Path,
+    options: rars_rs::ArchiveReadOptions<'_>,
+    overwrite: bool,
+    written: &Arc<Mutex<Vec<PathBuf>>>,
+    times: &Option<Arc<Mutex<rars_rs::OutputTimes>>>,
+    open: &mut impl FnMut(&rars_rs::ExtractedEntryMeta) -> rars_rs::Result<Box<dyn Write>>,
+) -> rars_rs::Result<()> {
     if let Some(selected) = selected {
         let last = archive
             .member_refs()
@@ -2136,6 +2158,9 @@ fn extract_archive<S: Selection>(
                 // Materialize a successful empty file even if no writes occurred.
                 if let Some(file) = pending.take() {
                     file.borrow_mut().open()?;
+                }
+                if let Some(times) = times {
+                    times.lock().expect("times lock poisoned").finish();
                 }
                 let current = index;
                 index += 1;
@@ -2182,6 +2207,13 @@ fn extract_archive<S: Selection>(
                         "multiple entries map to the same decoded output path",
                     ));
                 }
+                if let Some(times) = times {
+                    times.lock().expect("times lock poisoned").opened(
+                        path.clone(),
+                        archive.family(),
+                        &meta,
+                    );
+                }
                 let file = std::rc::Rc::new(std::cell::RefCell::new(DeferredExtractedFile {
                     path,
                     overwrite,
@@ -2197,11 +2229,10 @@ fn extract_archive<S: Selection>(
                 file.borrow_mut().open()?;
             }
         }
+        Ok(())
     } else {
-        archive.extract_to_parallel_buffered_with_options(options, open)?;
+        archive.extract_to_parallel_buffered_with_options(options, open)
     }
-    let out = written.lock().expect("written lock poisoned").clone();
-    Ok(out)
 }
 
 /// Runs `run` without the GIL over the volumes `next` gives; an exception `next` raises wins over `run`'s error.
@@ -2274,8 +2305,18 @@ fn output_opener<'a>(
     options: rars_rs::ArchiveReadOptions<'a>,
     overwrite: bool,
     written: &Arc<Mutex<Vec<PathBuf>>>,
+    times: &Option<Arc<Mutex<rars_rs::OutputTimes>>>,
 ) -> impl FnMut(&rars_rs::ExtractedEntryMeta) -> rars_rs::Result<Box<dyn Write>> + 'a {
     let written = Arc::clone(written);
+    let times = times.clone();
+    let record = move |path: &Path, meta: &rars_rs::ExtractedEntryMeta| {
+        if let Some(times) = &times {
+            times
+                .lock()
+                .expect("times lock poisoned")
+                .opened(path.to_path_buf(), family, meta);
+        }
+    };
     move |meta| {
         let path = checked_output_path(out_dir, meta, family, options.legacy_name_encoding)?;
         if options.legacy_name_encoding.is_some()
@@ -2290,6 +2331,7 @@ fn output_opener<'a>(
         }
         if meta.is_directory {
             fs::create_dir_all(&path)?;
+            record(&path, meta);
             written.lock().expect("written lock poisoned").push(path);
             return Ok(Box::new(io::sink()) as Box<dyn Write>);
         }
@@ -2303,6 +2345,7 @@ fn output_opener<'a>(
         }
         set_no_follow(&mut options);
         let file = options.open(&path)?;
+        record(&path, meta);
         written.lock().expect("written lock poisoned").push(path);
         Ok(Box::new(file) as Box<dyn Write>)
     }
@@ -2855,6 +2898,7 @@ mod tests {
                 &directory,
                 rars_rs::ArchiveReadOptions::new(),
                 false,
+                true,
             )
             .unwrap();
             assert_eq!(paths, vec![directory.join("first")]);
@@ -2865,6 +2909,7 @@ mod tests {
                 &directory,
                 rars_rs::ArchiveReadOptions::new(),
                 false,
+                true,
             )
             .unwrap_err();
             assert_eq!(error.kind(), rars_rs::ErrorKind::PasswordRequired);
@@ -2875,6 +2920,7 @@ mod tests {
                 &directory,
                 rars_rs::ArchiveReadOptions::with_password(b"password"),
                 false,
+                true,
             )
             .unwrap();
             assert_eq!(paths, vec![directory.join("last")]);

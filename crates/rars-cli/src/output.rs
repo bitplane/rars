@@ -1,4 +1,3 @@
-use crate::time::extracted_system_time;
 use crate::CliResult;
 use rars::atomic64::AtomicU64;
 use rars::{Archive as DetectedArchive, ArchiveFamily, AttrSource, Error, ExtractedEntryMeta};
@@ -7,7 +6,6 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::time::SystemTime;
 
 /// Private, same-filesystem storage for a verified extraction's pending outputs.
 pub(crate) struct ExtractionStaging {
@@ -292,17 +290,20 @@ fn create_symlink_redirection(_target: &Path, _link: &Path, _flags: u64) -> std:
 }
 
 pub(crate) fn restore_output_metadata(outputs: &[ExtractedOutput]) -> std::io::Result<()> {
-    for output in outputs
+    let restored: Vec<_> = outputs
         .iter()
-        .filter(|output| output.restore_metadata && !output.meta.is_directory)
-    {
-        if let Some(time) = extracted_system_time(
-            output.family,
-            output.meta.file_time,
-            output.meta.mtime_refinement,
-        ) {
-            set_modified_time(&output.path, time)?;
-        }
+        .filter(|output| output.restore_metadata)
+        .collect();
+    let mut times = rars::OutputTimes::new();
+    for output in &restored {
+        times.opened(output.path.clone(), output.family, &output.meta);
+    }
+    times.finish();
+    times.restore()?;
+    let (mut directories, files): (Vec<_>, Vec<_>) = restored
+        .into_iter()
+        .partition(|output| output.meta.is_directory);
+    for output in files {
         set_extracted_permissions(
             &output.path,
             output.meta.file_attr,
@@ -310,20 +311,9 @@ pub(crate) fn restore_output_metadata(outputs: &[ExtractedOutput]) -> std::io::R
             false,
         )?;
     }
-    let mut directories: Vec<_> = outputs
-        .iter()
-        .filter(|output| output.restore_metadata && output.meta.is_directory)
-        .collect();
     // Finish descendants before a parent's mode can deny access to them.
     directories.sort_by_cached_key(|output| std::cmp::Reverse(output.path.components().count()));
     for output in directories {
-        if let Some(time) = extracted_system_time(
-            output.family,
-            output.meta.file_time,
-            output.meta.mtime_refinement,
-        ) {
-            set_modified_time(&output.path, time)?;
-        }
         set_extracted_permissions(
             &output.path,
             output.meta.file_attr,
@@ -332,25 +322,6 @@ pub(crate) fn restore_output_metadata(outputs: &[ExtractedOutput]) -> std::io::R
         )?;
     }
     Ok(())
-}
-
-#[cfg(windows)]
-pub(crate) fn set_modified_time(path: &Path, time: SystemTime) -> std::io::Result<()> {
-    use std::os::windows::fs::OpenOptionsExt;
-
-    const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-
-    OpenOptions::new()
-        .access_mode(FILE_WRITE_ATTRIBUTES)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)?
-        .set_modified(time)
-}
-
-#[cfg(not(windows))]
-pub(crate) fn set_modified_time(path: &Path, time: SystemTime) -> std::io::Result<()> {
-    File::open(path)?.set_modified(time)
 }
 
 #[cfg(unix)]
