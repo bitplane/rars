@@ -2201,7 +2201,7 @@ impl<'a> ExtractOutputs<'a> {
             )?;
             // Creating the parents may have raced a symlink into place.
             let destination = self.destination(meta)?;
-            let file = open_in_place(&destination, self.overwrite)?;
+            let file = rars_rs::output_staging::open_in_place(&destination, self.overwrite)?;
             self.pending = Some(PendingOutput {
                 staged: None,
                 destination,
@@ -2306,53 +2306,6 @@ fn extract_archive<S: Selection>(
     ));
     let result = extract_selected(archive, selected, options, &outputs);
     outputs.into_inner().finish(result)
-}
-
-/// Opens the destination itself, refusing a link or special file that writing would reach through.
-fn open_in_place(path: &Path, overwrite: OverwritePolicy) -> io::Result<fs::File> {
-    let mut options = fs::OpenOptions::new();
-    options.write(true);
-    if overwrite == OverwritePolicy::Never {
-        return options.create_new(true).open(path);
-    }
-    options.create(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-        // O_NONBLOCK fails a FIFO with no reader instead of waiting for one.
-        let file = options
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file() || metadata.nlink() > 1 {
-            return Err(refused_in_place());
-        }
-        file.set_len(0)?;
-        Ok(file)
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        let file = options
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)?;
-        if !file.metadata()?.is_file() {
-            return Err(refused_in_place());
-        }
-        file.set_len(0)?;
-        Ok(file)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let file = options.open(path)?;
-        file.set_len(0)?;
-        Ok(file)
-    }
-}
-
-fn refused_in_place() -> io::Error {
-    io::Error::other("refusing to write in place through a link or special file")
 }
 
 fn extract_selected<S: Selection>(

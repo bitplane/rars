@@ -1,7 +1,7 @@
 use crate::CliResult;
 use rars::{Archive as DetectedArchive, ArchiveFamily, AttrSource, Error, ExtractedEntryMeta};
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 pub(crate) use rars::output_staging::{ExtractionStaging, OverwritePolicy};
@@ -40,7 +40,7 @@ pub(crate) fn open_output_writer(
     out_path = checked_output_path(out_dir, relative)?;
     Ok((
         out_path.clone(),
-        Box::new(create_output_file(&out_path, overwrite)?),
+        Box::new(rars::output_staging::open_in_place(&out_path, overwrite)?),
     ))
 }
 
@@ -309,35 +309,7 @@ fn relative_path(name: &[u8], backslash_is_separator: bool) -> CliResult<PathBuf
     }
 }
 
-fn create_output_file(path: &Path, overwrite: OverwritePolicy) -> std::io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.write(true);
-    match overwrite {
-        OverwritePolicy::Never => {
-            options.create_new(true);
-        }
-        OverwritePolicy::Always => {
-            options.create(true).truncate(true);
-        }
-    }
-    set_no_follow(&mut options);
-    options.open(path)
-}
-
 pub(crate) use rars::output_staging::publish_verified_output;
-
-#[cfg(unix)]
-fn set_no_follow(options: &mut OpenOptions) {
-    use std::os::unix::fs::OpenOptionsExt;
-    options.custom_flags(libc::O_NOFOLLOW);
-}
-
-#[cfg(not(unix))]
-fn set_no_follow(_options: &mut OpenOptions) {
-    // checked_output_path validates archive path components before open. The
-    // standard library does not expose a cross-platform final-component
-    // no-follow flag for this target family.
-}
 
 #[cfg(test)]
 mod tests {
@@ -359,6 +331,7 @@ mod tests {
         let mut state = crate::ExtractOutputState::new(
             &root,
             OverwritePolicy::Always,
+            false,
             ArchiveFamily::Rar50Plus,
         );
         state
@@ -561,8 +534,12 @@ mod tests {
                     if nonempty {
                         fs::write(destination.join("keep"), b"keep").unwrap();
                     }
-                    let mut state =
-                        crate::ExtractOutputState::new(&root, overwrite, ArchiveFamily::Rar50Plus);
+                    let mut state = crate::ExtractOutputState::new(
+                        &root,
+                        overwrite,
+                        false,
+                        ArchiveFamily::Rar50Plus,
+                    );
                     let (mut meta, mut redirection) = redirection_fixture();
                     meta.name = b"source".to_vec();
                     state
@@ -806,6 +783,7 @@ mod tests {
             let mut state = crate::ExtractOutputState::new(
                 &dir,
                 OverwritePolicy::Always,
+                false,
                 ArchiveFamily::Rar50Plus,
             );
             let (mut meta, mut redirection) = redirection_fixture();
@@ -876,6 +854,7 @@ mod tests {
                 let mut state = crate::ExtractOutputState::new(
                     &dir,
                     OverwritePolicy::Always,
+                    false,
                     ArchiveFamily::Rar50Plus,
                 );
                 let (mut meta, mut redirection) = redirection_fixture();
@@ -941,6 +920,7 @@ mod tests {
             let mut state = crate::ExtractOutputState::new(
                 &dir,
                 OverwritePolicy::Always,
+                false,
                 ArchiveFamily::Rar50Plus,
             );
             let (mut meta, mut redirection) = redirection_fixture();

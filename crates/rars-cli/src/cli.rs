@@ -176,6 +176,9 @@ pub(crate) struct ExtractArgs {
     /// Behaviour when an extracted file already exists on disk
     #[arg(long, value_enum, default_value_t = OverwriteCli::Never)]
     pub overwrite: OverwriteCli,
+    /// Write each file at its destination instead of staging it; a failed member leaves a partial file
+    #[arg(long)]
+    pub in_place: bool,
     /// Archive (and optional sibling parts) followed by an output directory
     #[arg(value_name = "PATH", required = true, num_args = 2..)]
     pub paths: Vec<std::path::PathBuf>,
