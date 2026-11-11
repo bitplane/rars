@@ -1,8 +1,9 @@
 use pyo3::exceptions::{
-    PyInterruptedError, PyKeyError, PyMemoryError, PyNotImplementedError, PyOSError, PyValueError,
+    PyInterruptedError, PyKeyError, PyMemoryError, PyNotImplementedError, PyOSError, PyTypeError,
+    PyValueError,
 };
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyList, PyModule};
+use pyo3::types::{PyByteArray, PyBytes, PyList, PyModule, PyString};
 use pyo3::{create_exception, PyErr};
 use rars_rs::filename::relative_path as output_relative_path;
 use std::collections::{HashMap, HashSet};
@@ -434,6 +435,8 @@ impl RarInfo {
     }
 }
 
+/// An archive opened from a bytes-like object (`bytes`, `bytearray`, `memoryview`,
+/// `mmap`...) or a path (`str` or `PathLike`).
 #[pyclass(module = "rars")]
 struct RarFile {
     identity: Arc<()>,
@@ -495,7 +498,7 @@ impl RarFile {
             ));
         }
         let password = py_password(password)?;
-        if let Ok(bytes) = source.extract::<Vec<u8>>() {
+        if let Some(bytes) = py_bytes_like(source)? {
             return Self::from_bytes(py, bytes, password, options);
         }
         Self::from_path(py, py_path_buf(py, source)?, password, options)
@@ -506,11 +509,16 @@ impl RarFile {
     #[pyo3(signature = (data, password = None, *, options = None))]
     fn from_bytes_py(
         py: Python<'_>,
-        data: Vec<u8>,
+        data: &Bound<'_, PyAny>,
         password: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
     ) -> PyResult<Self> {
-        Self::from_bytes(py, data, py_password(password)?, options)
+        Self::from_bytes(
+            py,
+            py_required_bytes(data)?,
+            py_password(password)?,
+            options,
+        )
     }
 
     fn namelist(&self) -> Vec<String> {
@@ -629,8 +637,8 @@ impl RarFile {
     /// On a volume set, extracts the whole set. Without `volumes`, a set opened
     /// from a path finds its later volumes by name beside it.
     ///
-    /// `volumes` yields the volumes after this one, in order: `bytes` are archive
-    /// data, `str` or `PathLike` are paths. Each is pulled when needed, so a
+    /// `volumes` yields the volumes after this one, in order: bytes-like objects
+    /// are archive data, `str` or `PathLike` are paths. Each is pulled when needed, so a
     /// generator may wait for downloads. If the last volume isn't marked as last
     /// (all RAR 1.3 to 2.0 sets, some later ones), the iterator is advanced once
     /// more and must stop, not wait.
@@ -879,7 +887,7 @@ impl RarFile {
                             return Ok(None);
                         };
                         let volume = volume?;
-                        if let Ok(bytes) = volume.extract::<Vec<u8>>() {
+                        if let Some(bytes) = py_bytes_like(&volume)? {
                             return Ok(Some(VolumeSource::Bytes(bytes)));
                         }
                         Ok(Some(VolumeSource::Path(std::path::absolute(py_path_buf(
@@ -1563,13 +1571,18 @@ impl RarBuilder {
     #[pyo3(signature = (data, arcname, mtime = None, mode = None))]
     fn add_bytes(
         &mut self,
-        data: Vec<u8>,
+        data: &Bound<'_, PyAny>,
         arcname: &Bound<'_, PyAny>,
         mtime: Option<u32>,
         mode: Option<u32>,
     ) -> PyResult<()> {
         self.inner
-            .add_bytes(member_name_bytes(arcname)?, data, mtime, mode)
+            .add_bytes(
+                member_name_bytes(arcname)?,
+                py_required_bytes(data)?,
+                mtime,
+                mode,
+            )
             .map_err(map_builder_error)
     }
 
@@ -1839,7 +1852,7 @@ fn py_input_bytes_with_cancellation(
     cancellation: Option<&CancellationToken>,
 ) -> PyResult<Vec<u8>> {
     check_python_cancellation(cancellation)?;
-    if let Ok(bytes) = source.extract::<Vec<u8>>() {
+    if let Some(bytes) = py_bytes_like(source)? {
         check_python_cancellation(cancellation)?;
         return Ok(bytes);
     }
@@ -1965,6 +1978,46 @@ fn rars(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add(version.to_ascii_uppercase(), version)?;
     }
     Ok(())
+}
+
+/// Archive data from a bytes-like object (anything `memoryview` accepts), or None for anything else.
+fn py_bytes_like(value: &Bound<'_, PyAny>) -> PyResult<Option<Vec<u8>>> {
+    if let Ok(bytes) = value.cast::<PyBytes>() {
+        return Ok(Some(bytes.as_bytes().to_vec()));
+    }
+    if let Ok(bytes) = value.cast::<PyByteArray>() {
+        return Ok(Some(bytes.to_vec()));
+    }
+    if value.is_instance_of::<PyString>() {
+        return Ok(None);
+    }
+    let py = value.py();
+    match py
+        .import("builtins")?
+        .getattr("memoryview")?
+        .call1((value,))
+    {
+        Ok(view) => Ok(Some(
+            view.call_method0("tobytes")?
+                .cast::<PyBytes>()?
+                .as_bytes()
+                .to_vec(),
+        )),
+        Err(error) if error.is_instance_of::<PyTypeError>(py) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn py_required_bytes(value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+    py_bytes_like(value)?.ok_or_else(|| {
+        PyTypeError::new_err(format!(
+            "expected a bytes-like object, not {}",
+            value
+                .get_type()
+                .name()
+                .map_or_else(|_| "?".into(), |name| name.to_string())
+        ))
+    })
 }
 
 fn py_path_buf(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<PathBuf> {
