@@ -202,7 +202,7 @@ pub struct ArchiveReadOptions<'a> {
     pub rar50_dictionary_size_limit: Option<u64>,
     /// The most pool threads that decode one streamed RAR5/7 member's blocks
     /// ahead of its output; zero decodes on the calling thread alone. Unset
-    /// uses one fewer than the pool's threads, at most eight.
+    /// uses one fewer than the pool's threads, at most four.
     ///
     /// Output, errors and the point where a damaged member stops are the same
     /// at every setting. Each worker holds one batch of blocks, about 256 KiB
