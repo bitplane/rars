@@ -250,25 +250,6 @@ impl SplitChecksums {
     }
 }
 
-struct ChecksumWriter<'a> {
-    inner: &'a mut dyn Write,
-    sums: &'a mut SplitChecksums,
-}
-
-impl Write for ChecksumWriter<'_> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let written = self.inner.write(buf)?;
-        #[cfg(all(test, feature = "write"))]
-        streaming_checks_tests::record_crc_work(written, false);
-        self.sums.update(&buf[..written]);
-        Ok(written)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
-    }
-}
-
 pub(super) fn write_stored<B: Budget>(
     first: &FileHeader,
     walk: &mut SplitWalk<'_, '_, '_, B>,
@@ -353,17 +334,14 @@ impl<B: Budget> DecoderSession<'_, B> {
                 decryptor,
                 &self.allowance,
             )?;
-            let mut writer = ChecksumWriter {
-                inner: writer,
-                sums: &mut sums,
-            };
             control.finish(unchecked.stream_packed_with_crc_policy::<true, _, _>(
                 &mut packed,
                 None,
                 &mut decoder,
                 self.buffered_decode_limit,
                 self.scratch,
-                &mut writer,
+                Some(&mut |chunk: &[u8]| sums.update(chunk)),
+                writer,
             ))
         };
         decoded

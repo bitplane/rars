@@ -697,3 +697,26 @@ fn large_compressed_members_report_write_failures_mid_stream() {
     assert_eq!(error.kind(), crate::ErrorKind::Io);
     assert!(error.to_string().contains("disk full"), "{error}");
 }
+
+#[test]
+fn large_split_compressed_members_count_and_check_their_sums() {
+    let data = large_text();
+    let (archive, original) = fixture(&data, false, false);
+    let volumes = split_in_two(&archive, &original, &original);
+    let mut session = DecoderSession::with_allowance(None, 0, &Allowance::default());
+    let mut output = Vec::new();
+    let (result, work) = measured(|| write_split(&mut session, &volumes, &mut output));
+    result.unwrap();
+    assert_eq!(output, data);
+    assert_eq!(work.bytes + work.zeroes, data.len());
+
+    let mut bad_hash = original.clone();
+    bad_hash.hash.as_mut().unwrap().data[0] ^= 1;
+    let volumes = split_in_two(&archive, &original, &bad_hash);
+    let mut session = DecoderSession::with_allowance(None, 0, &Allowance::default());
+    let error = write_split(&mut session, &volumes, &mut std::io::sink()).unwrap_err();
+    assert!(
+        matches!(error.root_cause(), Error::HashMismatch { hash_type: 0 }),
+        "{error}"
+    );
+}
