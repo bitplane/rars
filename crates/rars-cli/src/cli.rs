@@ -68,7 +68,7 @@ pub(crate) struct ReadOptionsArgs {
     /// Maximum RAR 5 member size to decode in memory; larger ones stream (default 16m)
     #[arg(long, value_name = "SIZE", value_parser = crate::parse_size_string)]
     pub rar50_buffered_decode_limit: Option<usize>,
-    /// Threads decoding one streamed RAR5/7 member's blocks; 0 decodes serially (default: up to 8)
+    /// Threads decoding one streamed RAR5/7 member's blocks; 0 decodes serially (default: up to 4)
     #[arg(long, value_name = "N")]
     pub rar50_decode_workers: Option<usize>,
     /// Maximum declared RAR5/7 dictionary size (not total memory)

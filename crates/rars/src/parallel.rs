@@ -147,7 +147,7 @@ mod threaded {
         rayon::current_thread_index().is_none() && threads() > 1
     }
 
-    const DEFAULT_BLOCK_DECODE_WORKERS: usize = 8;
+    const DEFAULT_BLOCK_DECODE_WORKERS: usize = 4;
 
     /// None inside the pool, where members already decode side by side, or under a cap of one.
     pub(crate) fn block_decode_workers(policy: crate::read_control::DecodeWorkers) -> usize {
