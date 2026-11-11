@@ -199,6 +199,18 @@ pub struct ArchiveReadOptions<'a> {
     /// codec calls are outside its scope. Earlier members may already be emitted
     /// when a later member exceeds the limit; its output callback is not opened.
     pub rar50_dictionary_size_limit: Option<u64>,
+    /// The most pool threads that decode one streamed RAR5/7 member's blocks
+    /// ahead of its output; zero decodes on the calling thread alone. Unset
+    /// uses one fewer than the pool's threads, at most eight.
+    ///
+    /// Output, errors and the point where a damaged member stops are the same
+    /// at every setting. Each worker holds one batch of blocks, about 256 KiB
+    /// packed (a single larger block is at most 16 MiB), and up to 8 MiB of
+    /// decoded operations; about 32 MiB of packed input is read ahead at most.
+    /// Members at or below `rar50_buffered_decode_limit`, readers with
+    /// `max_reader_workspace_bytes` and calls made from inside the thread pool
+    /// decode serially. Needs the `parallel` feature.
+    pub rar50_decode_workers: Option<usize>,
     /// Inclusive logical member output ceiling for every archive family, independent of RAM usage.
     /// None preserves defaults; zero permits empty output. Apply to extraction,
     /// not parsing. Known oversized members and unsupported unknown-size members
@@ -324,6 +336,12 @@ impl<'a> ArchiveReadOptions<'a> {
     /// Sets the RAR5/7 declared dictionary-size ceiling for member extraction.
     pub fn with_rar50_dictionary_size_limit(mut self, limit: u64) -> Self {
         self.rar50_dictionary_size_limit = Some(limit);
+        self
+    }
+
+    /// Caps the threads decoding one RAR5/7 member's blocks; zero is serial.
+    pub fn with_rar50_decode_workers(mut self, workers: usize) -> Self {
+        self.rar50_decode_workers = Some(workers);
         self
     }
 

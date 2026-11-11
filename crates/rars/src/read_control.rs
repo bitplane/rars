@@ -56,7 +56,7 @@ impl ReadCancellation {
 /// Per-operation cancellation, plus the read policy decoders need to see
 /// without each one taking the whole of [`crate::ArchiveReadOptions`].
 #[derive(Clone, Debug, Default)]
-pub(crate) struct ReadControl(Option<Arc<Observation>>, Rar3VmPrograms);
+pub(crate) struct ReadControl(Option<Arc<Observation>>, Rar3VmPrograms, DecodeWorkers);
 
 /// Whether RAR 3 decoding may run filter programs other than the six
 /// standard ones, which always run as native code.
@@ -65,6 +65,15 @@ pub(crate) enum Rar3VmPrograms {
     #[default]
     Refuse,
     Run,
+}
+
+/// Serial by default, so direct codec calls read no input past a member's end.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum DecodeWorkers {
+    #[default]
+    Serial,
+    Auto,
+    AtMost(usize),
 }
 
 #[derive(Debug)]
@@ -88,7 +97,20 @@ impl ReadControl {
         if options.allow_rar3_vm_programs {
             control.1 = Rar3VmPrograms::Run;
         }
+        control.2 = options
+            .rar50_decode_workers
+            .map_or(DecodeWorkers::Auto, DecodeWorkers::AtMost);
         control
+    }
+    #[cfg_attr(
+        any(
+            not(feature = "parallel"),
+            all(target_arch = "wasm32", target_os = "unknown")
+        ),
+        allow(dead_code)
+    )]
+    pub(crate) fn decode_workers(&self) -> DecodeWorkers {
+        self.2
     }
     pub(crate) fn rar3_vm_programs(&self) -> Rar3VmPrograms {
         self.1
@@ -107,6 +129,7 @@ impl ReadControl {
                 })
             }),
             Rar3VmPrograms::Refuse,
+            DecodeWorkers::Serial,
         )
     }
     pub(crate) fn check(&self) -> Result<()> {

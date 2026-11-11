@@ -1,3 +1,13 @@
+#[cfg(all(
+    feature = "parallel",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
+mod block_ops;
+#[cfg(all(
+    feature = "parallel",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
+mod blocks_ahead;
 #[cfg(feature = "write")]
 mod encoder;
 #[cfg(feature = "write")]
@@ -1047,6 +1057,60 @@ impl<B: Budget> ReaderState<B> {
         let mut output =
             StreamingOutput::new(history, output_size, dictionary_size, history_limit)?;
         output.stage.control = self.read_control.clone();
+        #[cfg(all(
+            feature = "parallel",
+            not(all(target_arch = "wasm32", target_os = "unknown"))
+        ))]
+        // A bounded reader's peak charge must not depend on thread timing.
+        if !B::LIMITED && output_size != 0 {
+            let workers = crate::parallel::block_decode_workers(self.read_control.decode_workers());
+            if workers != 0 {
+                self.decode_blocks_ahead(
+                    workers,
+                    input,
+                    algorithm_version,
+                    &mut output,
+                    &mut sink,
+                    &mut filters,
+                )?;
+                return self.finish_stream(output, &mut sink);
+            }
+        }
+        self.decode_blocks(
+            input,
+            algorithm_version,
+            &mut output,
+            &mut sink,
+            &mut filters,
+        )?;
+        self.finish_stream(output, &mut sink)
+    }
+
+    fn finish_stream<E>(
+        &mut self,
+        mut output: StreamingOutput<B>,
+        sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), StreamDecodeError<E>> {
+        if output.written() == output.output_limit {
+            output.finish(sink)?;
+            let history = output.into_history();
+            self.history_window = history.len;
+            self.streamed_history = Some(history);
+            Ok(())
+        } else {
+            Err(Error::NeedMoreInput.into())
+        }
+    }
+
+    fn decode_blocks<E>(
+        &mut self,
+        input: &mut impl Read,
+        algorithm_version: u8,
+        output: &mut StreamingOutput<B>,
+        sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
+        filters: &mut Option<&mut dyn FnMut(PendingFilter) -> std::result::Result<(), E>>,
+    ) -> std::result::Result<(), StreamDecodeError<E>> {
+        let output_size = output.output_limit;
         let mut literals = [0; LITERAL_BURST];
 
         loop {
@@ -1078,33 +1142,21 @@ impl<B: Budget> ReaderState<B> {
                 let symbol = tables.main.decode(&mut bits)?;
                 match symbol {
                     0..=255 => {
-                        output.push(symbol as u8, &mut sink)?;
+                        output.push(symbol as u8, sink)?;
                         let room = output.literal_room();
                         let count =
                             bits.literal_burst(&tables.main, payload_bits, &mut literals[..room]);
                         if count != 0 {
-                            output.push_literals(&literals[..count], &mut sink)?;
+                            output.push_literals(&literals[..count], sink)?;
                         }
                     }
                     256 => {
                         let filter = read_filter(&mut bits, output.written())?;
-                        if filter
-                            .start
-                            .checked_add(filter.length)
-                            .is_none_or(|end| end > output_size)
-                        {
-                            return Err(
-                                Error::InvalidData("RAR 5 filter range exceeds output").into()
-                            );
-                        }
-                        match filters.as_mut() {
-                            Some(filters) => filters(filter).map_err(StreamDecodeError::Sink)?,
-                            None => output.stage.hold(filter)?,
-                        }
+                        output.accept_filter(filter, filters)?;
                     }
                     257 => {
                         if self.last_length != 0 {
-                            output.copy_match(self.reps[0], self.last_length, &mut sink)?;
+                            output.copy_match(self.reps[0], self.last_length, sink)?;
                         }
                     }
                     258..=261 => {
@@ -1124,7 +1176,7 @@ impl<B: Budget> ReaderState<B> {
                         self.reps[..=rep_index].rotate_right(1);
                         self.reps[0] = distance;
                         self.last_length = length;
-                        output.copy_match(distance, length, &mut sink)?;
+                        output.copy_match(distance, length, sink)?;
                     }
                     262.. => {
                         let length_slot = symbol - 262;
@@ -1152,25 +1204,15 @@ impl<B: Budget> ReaderState<B> {
                         self.reps.rotate_right(1);
                         self.reps[0] = distance;
                         self.last_length = length;
-                        output.copy_match(distance, length, &mut sink)?;
+                        output.copy_match(distance, length, sink)?;
                     }
                 }
             }
 
             self.tables = Some(tables);
             if block.header.is_last || output.written() >= output_size {
-                break;
+                return Ok(());
             }
-        }
-
-        if output.written() == output_size {
-            output.finish(&mut sink)?;
-            let history = output.into_history();
-            self.history_window = history.len;
-            self.streamed_history = Some(history);
-            Ok(())
-        } else {
-            Err(Error::NeedMoreInput.into())
         }
     }
 
@@ -1549,6 +1591,24 @@ impl<B: Budget> StreamingOutput<B> {
         self.written
     }
 
+    fn accept_filter<E>(
+        &mut self,
+        filter: PendingFilter,
+        filters: &mut Option<&mut dyn FnMut(PendingFilter) -> std::result::Result<(), E>>,
+    ) -> std::result::Result<(), StreamDecodeError<E>> {
+        if filter
+            .start
+            .checked_add(filter.length)
+            .is_none_or(|end| end > self.output_limit)
+        {
+            return Err(Error::InvalidData("RAR 5 filter range exceeds output").into());
+        }
+        match filters.as_mut() {
+            Some(filters) => filters(filter).map_err(StreamDecodeError::Sink),
+            None => self.stage.hold(filter),
+        }
+    }
+
     /// Grows the ring so `count` more bytes cannot overwrite history; true if it moved.
     fn make_room(&mut self, count: usize) -> Result<bool> {
         let capacity = self.ring.capacity();
@@ -1681,12 +1741,45 @@ impl<B: Budget> StreamingOutput<B> {
         Ok(())
     }
 
+    /// The usual match needs no flush, growth or sink call; false leaves it to the general copy.
+    #[inline(always)]
+    fn copy_short(&mut self, distance: usize, length: usize) -> bool {
+        let end = self.ring.end;
+        let capacity = self.ring.capacity();
+        if self.all_zero
+            || length > SHORT_MATCH
+            || distance < length
+            || distance > end
+            || distance > self.ring.len
+            || distance > self.dictionary_size
+            || length > self.output_limit - self.written
+            || self.pending + length >= STREAM_FLUSH_THRESHOLD
+            || end + SHORT_MATCH >= capacity
+            || (self.ring.len + length + SHORT_MATCH > capacity && capacity < self.max_capacity)
+        {
+            return false;
+        }
+        let source = end - distance;
+        let bytes: [u8; SHORT_MATCH] = self.ring.bytes[source..source + SHORT_MATCH]
+            .try_into()
+            .expect("fixed-width slice");
+        self.ring.bytes[end..end + SHORT_MATCH].copy_from_slice(&bytes);
+        self.ring.advance(length);
+        self.pending += length;
+        self.written += length;
+        true
+    }
+
+    #[inline]
     fn copy_match<E>(
         &mut self,
         distance: usize,
         length: usize,
         sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), StreamDecodeError<E>> {
+        if self.copy_short(distance, length) {
+            return Ok(());
+        }
         let visible = length.min(self.output_limit - self.written);
         if self.all_zero && distance <= self.written + self.ring.len - self.pending {
             // Zeroes that never reach the ring are implied by its zero fill.

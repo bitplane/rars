@@ -68,6 +68,9 @@ pub(crate) struct ReadOptionsArgs {
     /// Maximum RAR 5 member size to decode in memory; larger ones stream (default 16m)
     #[arg(long, value_name = "SIZE", value_parser = crate::parse_size_string)]
     pub rar50_buffered_decode_limit: Option<usize>,
+    /// Threads decoding one streamed RAR5/7 member's blocks; 0 decodes serially (default: up to 8)
+    #[arg(long, value_name = "N")]
+    pub rar50_decode_workers: Option<usize>,
     /// Maximum declared RAR5/7 dictionary size (not total memory)
     #[arg(long, value_name = "SIZE", value_parser = crate::parse_size_string)]
     pub rar50_dictionary_size_limit: Option<usize>,
@@ -132,6 +135,7 @@ impl ReadOptionsArgs {
             self.rar50_dictionary_size_limit.map(|value| value as u64);
         options.rar50_buffered_decode_limit =
             self.rar50_buffered_decode_limit.map(|value| value as u64);
+        options.rar50_decode_workers = self.rar50_decode_workers;
         options.rar50_scratch = scratch;
         options.allow_rar3_vm_programs = self.allow_rar3_vm;
         options
@@ -403,6 +407,7 @@ mod tests {
     fn reader_policy_forwards_all_limits_and_optional_password_without_loss() {
         let args = ReadOptionsArgs {
             rar50_buffered_decode_limit: Some(0),
+            rar50_decode_workers: Some(3),
             rar50_dictionary_size_limit: Some(11),
             max_member_output_bytes: Some(12),
             max_total_output_bytes: Some(13),
@@ -418,6 +423,7 @@ mod tests {
         let options = args.options(Some(b""), Some(&scratch));
         assert_eq!(options.password, Some(b"".as_slice()));
         assert_eq!(options.rar50_buffered_decode_limit, Some(0));
+        assert_eq!(options.rar50_decode_workers, Some(3));
         assert_eq!(options.rar50_dictionary_size_limit, Some(11));
         assert_eq!(options.max_member_output_bytes, Some(12));
         assert_eq!(options.max_total_output_bytes, Some(13));
