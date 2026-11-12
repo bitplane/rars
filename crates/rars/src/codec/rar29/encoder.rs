@@ -22,6 +22,7 @@ const MAX_PPMD_REPEAT_LENGTH: usize = 259;
 // The parameters rar 3.00 itself declares at -m5, read out of its streams.
 const PPMD_ORDER: usize = 8;
 const PPMD_DICTIONARY_MB: u8 = 25;
+pub(crate) const PPMD_MODEL_BYTES: u64 = PPMD_DICTIONARY_MB as u64 * 1024 * 1024;
 const PPMD_ESC: u8 = 2;
 // Seeds and weights for the escape-token cost model in `encode_ppmd_hybrid`.
 // The seeds only steer the first few decisions; measured costs take over as

@@ -164,6 +164,21 @@ mod threaded {
         threads()
     }
 
+    /// Runs both, side by side when there is a thread free.
+    #[cfg(feature = "write")]
+    pub(crate) fn join<A, B, RA, RB>(a: A, b: B) -> (RA, RB)
+    where
+        A: FnOnce() -> RA + Send,
+        B: FnOnce() -> RB + Send,
+        RA: Send,
+        RB: Send,
+    {
+        if !may_nest() {
+            return (a(), b());
+        }
+        rayon::join(a, b)
+    }
+
     /// How many members can be worked on at the same time, within this thread's cap.
     pub(crate) fn threads() -> usize {
         let pool = rayon::current_num_threads().max(1);
@@ -276,6 +291,18 @@ mod sequential {
     #[cfg(any(test, feature = "write"))]
     pub(crate) fn threads() -> usize {
         1
+    }
+
+    #[cfg(feature = "write")]
+    #[cfg_attr(all(test, feature = "parallel"), allow(dead_code))]
+    pub(crate) fn join<A, B, RA, RB>(a: A, b: B) -> (RA, RB)
+    where
+        A: FnOnce() -> RA + Send,
+        B: FnOnce() -> RB + Send,
+        RA: Send,
+        RB: Send,
+    {
+        (a(), b())
     }
 }
 
