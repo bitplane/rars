@@ -1410,3 +1410,67 @@ fn decode_member_to_streams_decoded_payload_through_writer_sink() {
         .unwrap_err();
     assert_eq!(err, Error::from(std::io::Error::other("disk full")));
 }
+
+fn windowed_payload(len: usize) -> Vec<u8> {
+    let sources: [&[u8]; 3] = [
+        include_bytes!("../../../tests/fixtures/rar15_40/ppmd/binary_64k.bin"),
+        include_bytes!("../../../tests/fixtures/rar15_40/ppmd/escape_64k.bin"),
+        include_bytes!("../../../tests/fixtures/rar15_40/ppmd/lorem_127k.txt"),
+    ];
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut out = Vec::with_capacity(len);
+    let mut round = 0usize;
+    while out.len() < len {
+        let source = sources[round % sources.len()];
+        let offset = (next() % (source.len() - 4096) as u64) as usize;
+        out.extend_from_slice(&source[offset..offset + 4096]);
+        out.extend((0..1024).map(|_| next() as u8));
+        round += 1;
+    }
+    out.truncate(len);
+    out
+}
+
+#[test]
+fn priced_parses_code_to_the_unpruned_search_bytes() {
+    let windowed = windowed_payload(64 * 1024);
+    let text = &include_bytes!("../../../tests/fixtures/rar15_40/ppmd/lorem_127k.txt")[..32 * 1024];
+    let level = |candidates, optimal| {
+        EncodeOptions::new(candidates)
+            .with_lazy_matching(true)
+            .with_lazy_lookahead(2)
+            .with_optimal_parse(optimal)
+            .with_try_audio(false)
+    };
+    let cases = [
+        (&windowed[..], level(1024, true)),
+        (text, level(1024, true)),
+        (&windowed[..], level(256, false)),
+        (text, level(256, false)),
+    ];
+    let fingerprints: Vec<_> = cases
+        .iter()
+        .map(|&(input, options)| {
+            let packed = super::unpack20_encode_literals_with_options(input, options).unwrap();
+            assert_eq!(unpack20_decode(&packed, input.len()).unwrap(), input);
+            (packed.len(), crate::crc32::crc32(&packed))
+        })
+        .collect();
+
+    // Captured from the encoder that priced every candidate in full.
+    assert_eq!(
+        fingerprints,
+        [
+            (32_479, 1_342_981_877),
+            (5_915, 3_334_173_363),
+            (32_596, 1_397_434_958),
+            (5_948, 2_954_067_044),
+        ]
+    );
+}
