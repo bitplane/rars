@@ -3150,7 +3150,7 @@ mod tests {
             filter_policy: FilterPolicy::Auto,
             candidates: vec![options].into(),
         };
-        let run = |threads, budget| {
+        let run = |threads: usize, budget| {
             let workers = Mutex::new(HashSet::new());
             let result = rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
@@ -3163,6 +3163,16 @@ mod tests {
                         &WriterResources::new(budget),
                         &|_| {
                             workers.lock().unwrap().insert(std::thread::current().id());
+                            // Optimised, one thread can finish every member before another starts,
+                            // so each waits up to 5 s for a second thread to join.
+                            let deadline =
+                                std::time::Instant::now() + std::time::Duration::from_secs(5);
+                            while threads > 1
+                                && workers.lock().unwrap().len() < 2
+                                && std::time::Instant::now() < deadline
+                            {
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            }
                             true
                         },
                     )
