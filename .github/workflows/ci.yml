@@ -54,8 +54,9 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      # Test runs dominate CI, and unoptimised rars spends them decoding. Local
-      # debug builds keep opt-level 0 for debugging and fast rebuilds.
+      # Test runs dominate this job, and unoptimised rars spends them decoding.
+      # Only here: jobs that build with one core or run few tests got slower.
+      # Local debug builds keep opt-level 0 for debugging and fast rebuilds.
       - name: Optimise the rars crates in test builds
         shell: bash
         run: |
@@ -177,11 +178,6 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
-      - name: Optimise the rars crates in test builds
-        shell: bash
-        run: |
-          mkdir -p "${CARGO_HOME:-$HOME/.cargo}"
-          printf '[profile.dev.package.rars]\nopt-level = 1\n[profile.dev.package.rars-cli]\nopt-level = 1\n' >> "${CARGO_HOME:-$HOME/.cargo}/config.toml"
       - name: Test the CLI on the native filesystem
         run: cargo test -p rars-cli --locked
 
@@ -287,11 +283,6 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
-      - name: Optimise the rars crates in test builds
-        shell: bash
-        run: |
-          mkdir -p "${CARGO_HOME:-$HOME/.cargo}"
-          printf '[profile.dev.package.rars]\nopt-level = 1\n[profile.dev.package.rars-cli]\nopt-level = 1\n' >> "${CARGO_HOME:-$HOME/.cargo}/config.toml"
       - name: Test the library without workspace feature unification
         run: python3 scripts/check-unit-features.py --features '${{ matrix.features }}'
       - name: Check encoder memory bounds without workspace feature unification
