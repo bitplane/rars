@@ -1014,8 +1014,11 @@ fn encode_rar29_auto_filtered_member_with_progress(
     // well was a second full pass over every binary member on the default
     // settings. Text goes nowhere near the search, so it still needs one.
     let text = is_text_ppmd_candidate(data);
+    if include_ppmd && text {
+        return encode_rar29_text_member(data, options, lz_method, progress);
+    }
     let searching = !text && crate::filter_search::search_applies(data);
-    let mut best = EncodedPayload {
+    let best = EncodedPayload {
         data: if searching {
             let mut last = 0usize;
             crate::filter_search::choose_filter(
@@ -1042,6 +1045,33 @@ fn encode_rar29_auto_filtered_member_with_progress(
         },
         method: lz_method,
     };
+    if best.data.len() >= data.len() {
+        return Ok(EncodedPayload {
+            data: data.to_vec(),
+            method: 0x30,
+        });
+    }
+    Ok(best)
+}
+
+/// Codes text as LZ, PPMd with escapes and plain PPMd side by side; the smallest wins.
+fn encode_rar29_text_member(
+    data: &[u8],
+    options: Rar29EncodeOptions,
+    lz_method: u8,
+    progress: Option<&WorkTracker<'_>>,
+) -> Result<EncodedPayload> {
+    let ppmd = |lz_escapes: bool, max_match_distance: usize| {
+        with_codec_progress(progress, |report| {
+            crate::codec::rar29::unpack29_encode_ppmd_with_progress(
+                data,
+                lz_escapes,
+                None,
+                max_match_distance,
+                report,
+            )
+        })
+    };
     // Whichever engine wins, it wins because it was measured against the other
     // over the whole member. Size used to decide it instead: under 1 MiB text
     // was measured, over 16 MiB it went to PPMd unmeasured, and everything
@@ -1059,47 +1089,34 @@ fn encode_rar29_auto_filtered_member_with_progress(
     // wide, the sample cannot see the repetition at all. PPMd costs about
     // three times LZ on the same bytes, so text at the top two levels pays for
     // both engines. Levels 1 to 4 skip the trial as they always have.
-    if include_ppmd && text {
-        let ppmd = EncodedPayload {
-            data: with_codec_progress(progress, |report| {
-                crate::codec::rar29::unpack29_encode_ppmd_with_progress(
-                    data,
-                    true,
-                    None,
-                    options.max_match_distance,
-                    report,
-                )
-            })?,
-            method: lz_method,
-        };
-        if ppmd.data.len() < best.data.len() {
-            best = ppmd;
-        }
+    let (lz, (escaped, literals)) = crate::parallel::join(
+        || {
+            with_codec_progress(progress, |report| {
+                unpack29_encode_literals_with_options_and_progress(data, options, report)
+            })
+        },
         // The escape tokens price themselves against costs measured off the
         // stream they are shaping, so a member where every escape loses can
         // still ratify a few before the measurements catch up. A pure-literal
-        // stream is the direct check. It costs a second PPMd pass over the
-        // member, paid only where PPMd is already being tried: text at the
-        // top two levels.
-        let ppmd_literals = EncodedPayload {
-            data: with_codec_progress(progress, |report| {
-                crate::codec::rar29::unpack29_encode_ppmd_with_progress(
-                    data, false, None, 0, report,
-                )
-            })?,
-            method: lz_method,
-        };
-        if ppmd_literals.data.len() < best.data.len() {
-            best = ppmd_literals;
+        // stream is the direct check.
+        || crate::parallel::join(|| ppmd(true, options.max_match_distance), || ppmd(false, 0)),
+    );
+    let mut best = lz?;
+    for candidate in [escaped?, literals?] {
+        if candidate.len() < best.len() {
+            best = candidate;
         }
     }
-    if best.data.len() >= data.len() {
+    if best.len() >= data.len() {
         return Ok(EncodedPayload {
             data: data.to_vec(),
             method: 0x30,
         });
     }
-    Ok(best)
+    Ok(EncodedPayload {
+        data: best,
+        method: lz_method,
+    })
 }
 
 fn is_text_ppmd_candidate(data: &[u8]) -> bool {
@@ -1328,16 +1345,28 @@ struct EncodedMember<'a> {
 ///
 /// This is the admission weight that decides how many members run at once, not
 /// a prediction: the encoder holds the member, its packed output, and a match
-/// finder sized by the block it works in.
+/// finder sized by the block it works in. Text at the levels that try PPMd
+/// also holds two PPMd models at once, one per trial.
 fn member_workspace(options: WriterOptions, unpacked: u64, compressing: bool) -> u64 {
     if !compressing {
         return 1024 * 1024;
     }
     let dictionary =
         dictionary_size_for_options(options).unwrap_or(RAR29_MAX_DICTIONARY_SIZE) as u64;
+    let ppmd_trials =
+        matches!(
+            options.target,
+            ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
+        ) && ppmd_trial_pays(compression_method_for_level(options).saturating_sub(0x30));
+    let ppmd_models = if ppmd_trials {
+        2 * crate::codec::rar29::PPMD_MODEL_BYTES
+    } else {
+        0
+    };
     unpacked
         .saturating_mul(2)
         .saturating_add(dictionary.saturating_mul(12))
+        .saturating_add(ppmd_models)
         .saturating_add(2 * 1024 * 1024)
 }
 

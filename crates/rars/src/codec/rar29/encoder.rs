@@ -22,6 +22,7 @@ const MAX_PPMD_REPEAT_LENGTH: usize = 259;
 // The parameters rar 3.00 itself declares at -m5, read out of its streams.
 const PPMD_ORDER: usize = 8;
 const PPMD_DICTIONARY_MB: u8 = 25;
+pub(crate) const PPMD_MODEL_BYTES: u64 = PPMD_DICTIONARY_MB as u64 * 1024 * 1024;
 const PPMD_ESC: u8 = 2;
 // Seeds and weights for the escape-token cost model in `encode_ppmd_hybrid`.
 // The seeds only steer the first few decisions; measured costs take over as
@@ -34,14 +35,65 @@ const PPMD_TOKEN_EMA_WEIGHT: f64 = 1.0 / 8.0;
 // An escape token's copied bytes never reach the model, so the literals right
 // after it are predicted from the token's own bytes and pay for the broken
 // context. That cost lands on the literals' ledger, not the token's, so the
-// token is charged a flat estimate of it here.
-const PPMD_CONTEXT_BREAK_BITS: f64 = 16.0;
+// token is charged a flat estimate of it here. 16 took matches that cost more
+// than the literals: 64 packs 4 MiB of Rust source 4% smaller.
+const PPMD_CONTEXT_BREAK_BITS: f64 = 64.0;
 // After a match is priced out, nearby positions almost always price out the
 // same way, so the search sleeps a few bytes rather than re-walking the hash
 // chain at every literal.
 const PPMD_REJECT_SEARCH_COOLDOWN: usize = 8;
 
 type Rar29MatchFinder = match_finder::MatchFinder<4>;
+/// PPMd takes only 32-byte matches; a 4-byte key fills text chains with words that never get there.
+type PpmdMatchFinder = match_finder::MatchFinder<MIN_PPMD_MATCH_LENGTH>;
+
+/// A finder filled as the parse goes, or ahead of it and skipping what the parse has not reached.
+trait Candidates {
+    fn first(&self, input: &[u8], pos: usize, limit: usize) -> usize;
+    fn previous(&self, candidate: usize) -> usize;
+    fn insert(&mut self, input: &[u8], pos: usize);
+}
+
+impl Candidates for Rar29MatchFinder {
+    fn first(&self, input: &[u8], pos: usize, _limit: usize) -> usize {
+        Rar29MatchFinder::first(self, input, pos)
+    }
+
+    fn previous(&self, candidate: usize) -> usize {
+        Rar29MatchFinder::previous(self, candidate)
+    }
+
+    fn insert(&mut self, input: &[u8], pos: usize) {
+        Rar29MatchFinder::insert(self, input, pos);
+    }
+}
+
+struct FilledAhead<'a>(&'a Rar29MatchFinder);
+
+impl Candidates for FilledAhead<'_> {
+    fn first(&self, _input: &[u8], pos: usize, limit: usize) -> usize {
+        self.0.first_before(pos, limit)
+    }
+
+    fn previous(&self, candidate: usize) -> usize {
+        self.0.previous(candidate)
+    }
+
+    fn insert(&mut self, _input: &[u8], _pos: usize) {}
+}
+
+/// Heads follow the reach, not the window, so filling ahead offers the same candidates.
+fn match_finder_for<const MIN_MATCH: usize>(
+    window: usize,
+    reach: usize,
+) -> match_finder::MatchFinder<MIN_MATCH> {
+    let bits = reach
+        .max(1)
+        .next_power_of_two()
+        .trailing_zeros()
+        .clamp(17, 20);
+    match_finder::MatchFinder::with_hash_bits(window, bits)
+}
 
 // RAR 3.x standard filters are stored as RARVM bytecode in the compressed
 // stream. RAR15_40_FORMAT_SPECIFICATION.md §20 and FILTER_TRANSFORMS.md §9
@@ -233,8 +285,7 @@ fn filtered_members_with_progress(
             if progress.as_mut().is_some_and(|report| !report(0)) {
                 return Err(Error::Cancelled);
             }
-            let filtered = filtered_member(&data, filter)?;
-            data[range.clone()].copy_from_slice(&filtered.data[range.clone()]);
+            let filtered = filter_in_place(&mut data, filter)?;
             group_records.push(OwnedVmFilterRecord {
                 block_start: filtered.block_start,
                 block_size: filtered.block_size,
@@ -440,16 +491,15 @@ fn rar29_filter(kind: crate::FilterKind) -> Result<Rar29Filter> {
 }
 
 struct FilteredMember {
-    data: Vec<u8>,
     block_start: usize,
     block_size: usize,
     init_regs: Vec<(usize, u32)>,
     code: &'static [u8],
 }
 
-fn filtered_member(input: &[u8], filter: &crate::FilterSpec) -> Result<FilteredMember> {
-    let range = checked_filter_range(input.len(), filter)?;
-    let mut filtered = input.to_vec();
+/// In place: copying the member per record made many-record members quadratic.
+fn filter_in_place(filtered: &mut [u8], filter: &crate::FilterSpec) -> Result<FilteredMember> {
+    let range = checked_filter_range(filtered.len(), filter)?;
     let (init_regs, code): (Vec<(usize, u32)>, &'static [u8]) = match rar29_filter(filter.kind)? {
         Rar29Filter::E8 => {
             filters::e8e9_encode(&mut filtered[range.clone()], range.start as u32, false);
@@ -473,11 +523,8 @@ fn filtered_member(input: &[u8], filter: &crate::FilterSpec) -> Result<FilteredM
             (Vec::new(), RAR3_ITANIUM_FILTER_BYTECODE)
         }
         Rar29Filter::Rgb { width, pos_r } => {
-            filtered[range.clone()].copy_from_slice(&rgb_encode(
-                &input[range.clone()],
-                width,
-                pos_r,
-            )?);
+            let encoded = rgb_encode(&filtered[range.clone()], width, pos_r)?;
+            filtered[range.clone()].copy_from_slice(&encoded);
             let init_regs = if pos_r == 0 {
                 vec![(0, width as u32 + 3)]
             } else {
@@ -486,13 +533,12 @@ fn filtered_member(input: &[u8], filter: &crate::FilterSpec) -> Result<FilteredM
             (init_regs, RAR3_RGB_FILTER_BYTECODE)
         }
         Rar29Filter::Audio { channels } => {
-            filtered[range.clone()]
-                .copy_from_slice(&audio_encode(&input[range.clone()], channels)?);
+            let encoded = audio_encode(&filtered[range.clone()], channels)?;
+            filtered[range.clone()].copy_from_slice(&encoded);
             (vec![(0, channels as u32)], RAR3_AUDIO_FILTER_BYTECODE)
         }
     };
     Ok(FilteredMember {
-        data: filtered,
         block_start: range.start,
         block_size: range.end - range.start,
         init_regs,
@@ -908,36 +954,78 @@ fn encode_member_blocks(
     mut options: EncodeOptions,
     block_size: usize,
     levels: &mut [u8; TABLE_COUNT],
-    mut progress: Option<&mut dyn FnMut(usize) -> bool>,
+    progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<u8>> {
     options.block_size = None;
     let mut out = Vec::new();
-    let mut local_history = history[history.len().saturating_sub(MAX_HISTORY)..].to_vec();
-    let mut completed = 0usize;
-    let block_count = input.chunks(block_size).count();
-    for (index, chunk) in input.chunks(block_size).enumerate() {
-        let mut chunk_progress = |position: usize| {
-            progress
-                .as_deref_mut()
-                .is_none_or(|report| report(completed.saturating_add(position)))
+    for_each_block(
+        input,
+        history,
+        options,
+        block_size,
+        progress,
+        |_, end, tokens| {
+            out.extend_from_slice(&code_block(tokens, &[], end < input.len(), levels)?);
+            Ok(())
+        },
+    )?;
+    Ok(out)
+}
+
+fn for_each_block(
+    input: &[u8],
+    history: &[u8],
+    options: EncodeOptions,
+    block_size: usize,
+    mut progress: Option<&mut dyn FnMut(usize) -> bool>,
+    mut code: impl FnMut(usize, usize, &[EncodeToken]) -> Result<()>,
+) -> Result<()> {
+    let block_size = block_size.max(1);
+    let reach = options.max_match_distance.min(MAX_HISTORY);
+    let history = &history[history.len().saturating_sub(reach)..];
+    let mut ends: Vec<usize> = (block_size..input.len()).step_by(block_size).collect();
+    ends.push(input.len());
+    let per_batch = (LzParser::batch_bytes(block_size) / block_size).max(1);
+    // Segments bound what a parser holds, for one re-hashed reach each.
+    let per_segment = per_batch
+        * reach
+            .saturating_mul(4)
+            .div_ceil(per_batch * block_size)
+            .max(1);
+    let mut block_start = 0;
+    for segment in ends.chunks(per_segment) {
+        let segment_end = *segment.last().expect("chunks are never empty");
+        let behind = reach.min(block_start);
+        let combined: std::borrow::Cow<'_, [u8]> = if behind == reach || history.is_empty() {
+            std::borrow::Cow::Borrowed(&input[block_start - behind..segment_end])
+        } else {
+            let carried = &history[history.len().saturating_sub(reach - behind)..];
+            let mut joined = Vec::with_capacity(carried.len() + segment_end - block_start + behind);
+            joined.extend_from_slice(carried);
+            joined.extend_from_slice(&input[block_start - behind..segment_end]);
+            std::borrow::Cow::Owned(joined)
         };
-        out.extend_from_slice(&encode_member_inner(
-            chunk,
-            &local_history,
-            &[],
-            options,
-            index + 1 < block_count,
-            levels,
-            Some(&mut chunk_progress),
-        )?);
-        completed = completed.saturating_add(chunk.len());
-        local_history.extend_from_slice(chunk);
-        let keep_from = local_history.len().saturating_sub(MAX_HISTORY);
-        if keep_from != 0 {
-            local_history.drain(..keep_from);
+        let base = combined.len() - (segment_end - block_start);
+        let mut parser = LzParser::new(&combined, base, options, block_size);
+        let origin = block_start;
+        for batch in segment.chunks(per_batch) {
+            if progress
+                .as_deref_mut()
+                .is_some_and(|report| !report(block_start))
+            {
+                return Err(Error::Cancelled);
+            }
+            let local: Vec<usize> = batch.iter().map(|&end| base + end - origin).collect();
+            for (tokens, &end) in parser.parse_blocks(&local).iter().zip(batch) {
+                code(block_start, end, tokens)?;
+                block_start = end;
+                if progress.as_deref_mut().is_some_and(|report| !report(end)) {
+                    return Err(Error::Cancelled);
+                }
+            }
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 /// `more_blocks_follow` is what the block's terminator says.
@@ -962,18 +1050,33 @@ fn encode_member_inner(
     progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<u8>> {
     let tokens = encode_tokens_with_progress(input, history, options, progress)?;
+    code_block(
+        &tokens,
+        initial_filters,
+        more_blocks_follow,
+        previous_levels,
+    )
+}
+
+fn code_block(
+    tokens: &[EncodeToken],
+    initial_filters: &[Vec<u8>],
+    more_blocks_follow: bool,
+    previous_levels: &mut [u8; TABLE_COUNT],
+) -> Result<Vec<u8>> {
     let mut main_frequencies = vec![0usize; MAIN_COUNT];
     let mut offset_frequencies = vec![0usize; OFFSET_COUNT];
     let mut low_offset_frequencies = vec![0usize; LOW_OFFSET_COUNT];
     let mut length_frequencies = vec![0usize; LENGTH_COUNT];
     main_frequencies[257] += initial_filters.len();
     let mut match_state = EncoderMatchState::default();
-    for token in &tokens {
+    for token in tokens {
         match *token {
             EncodeToken::Literal(byte) => {
                 main_frequencies[byte as usize] += 1;
             }
             EncodeToken::Match { length, offset } => {
+                let (length, offset) = (length as usize, offset as usize);
                 match match_state.encode_match(length, offset)? {
                     EncodedMatch::LastLengthRepeat => {
                         main_frequencies[258] += 1;
@@ -1067,13 +1170,14 @@ fn encode_member_inner(
         }
     }
     let mut match_state = EncoderMatchState::default();
-    for token in tokens {
+    for &token in tokens {
         match token {
             EncodeToken::Literal(byte) => {
                 let code = main_codes[byte as usize].expect("counted literal Huffman code");
                 bits.write_bits(code.code as u32, code.len);
             }
             EncodeToken::Match { length, offset } => {
+                let (length, offset) = (length as usize, offset as usize);
                 match match_state.encode_match(length, offset)? {
                     EncodedMatch::LastLengthRepeat => {
                         let code =
@@ -1221,7 +1325,7 @@ fn encode_filtered_member_blocks(
     filters: &[OwnedVmFilterRecord],
     options: EncodeOptions,
     levels: &mut [u8; TABLE_COUNT],
-    mut progress: Option<&mut dyn FnMut(usize) -> bool>,
+    progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<u8>> {
     // A record's offset is relative to the head of its own block, so a block no
     // larger than the window keeps every offset inside it.
@@ -1236,40 +1340,24 @@ fn encode_filtered_member_blocks(
     inner.block_size = None;
     let mut programs: Vec<&'static [u8]> = Vec::new();
     let mut out = Vec::new();
-    let mut local_history = history[history.len().saturating_sub(MAX_HISTORY)..].to_vec();
-    let mut base = 0usize;
-    while base < data.len().max(1) {
-        let end = (base + block_size).min(data.len());
-        let chunk = &data[base..end];
-        let in_block: Vec<&OwnedVmFilterRecord> = filters
-            .iter()
-            .filter(|record| record.block_start >= base && record.block_start < end.max(base + 1))
-            .collect();
-        let records = encoded_filter_records_at(&in_block, base, window, &mut programs)?;
-        let mut chunk_progress = |position: usize| {
-            progress
-                .as_deref_mut()
-                .is_none_or(|report| report(base.saturating_add(position)))
-        };
-        out.extend_from_slice(&encode_member_inner(
-            chunk,
-            &local_history,
-            &records,
-            inner,
-            end < data.len(),
-            levels,
-            Some(&mut chunk_progress),
-        )?);
-        local_history.extend_from_slice(chunk);
-        let keep_from = local_history.len().saturating_sub(MAX_HISTORY);
-        if keep_from != 0 {
-            local_history.drain(..keep_from);
-        }
-        base = end;
-        if chunk.is_empty() {
-            break;
-        }
-    }
+    for_each_block(
+        data,
+        history,
+        inner,
+        block_size,
+        progress,
+        |base, end, tokens| {
+            let in_block: Vec<&OwnedVmFilterRecord> = filters
+                .iter()
+                .filter(|record| {
+                    record.block_start >= base && record.block_start < end.max(base + 1)
+                })
+                .collect();
+            let records = encoded_filter_records_at(&in_block, base, window, &mut programs)?;
+            out.extend_from_slice(&code_block(tokens, &records, end < data.len(), levels)?);
+            Ok(())
+        },
+    )?;
     Ok(out)
 }
 
@@ -1492,7 +1580,8 @@ fn itanium_encode(data: &mut [u8], file_offset: u32) {
 #[derive(Debug, Clone, Copy)]
 enum EncodeToken {
     Literal(u8),
-    Match { length: usize, offset: usize },
+    // u32 halves a token, and a parse batch holds one per byte at worst.
+    Match { length: u32, offset: u32 },
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1583,50 +1672,149 @@ fn encode_tokens_with_progress(
     input: &[u8],
     history: &[u8],
     options: EncodeOptions,
-    mut progress: Option<&mut dyn FnMut(usize) -> bool>,
+    progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<EncodeToken>> {
-    let mut tokens = Vec::new();
+    let combined = with_history(history, input, options);
+    let start = combined.len() - input.len();
+    let reach = options.max_match_distance.min(MAX_HISTORY);
+    let mut finder = match_finder_for(reach, reach);
+    for history_pos in 0..start {
+        finder.insert(&combined, history_pos);
+    }
+    parse_range(
+        &combined,
+        start,
+        combined.len(),
+        &mut finder,
+        options,
+        progress,
+    )
+}
+
+fn with_history<'a>(
+    history: &[u8],
+    input: &'a [u8],
+    options: EncodeOptions,
+) -> std::borrow::Cow<'a, [u8]> {
     let history = &history[history.len().saturating_sub(options.max_match_distance)..];
+    if history.is_empty() {
+        return std::borrow::Cow::Borrowed(input);
+    }
     let mut combined = Vec::with_capacity(history.len() + input.len());
     combined.extend_from_slice(history);
     combined.extend_from_slice(input);
-    let mut finder = Rar29MatchFinder::new(combined.len());
-    for history_pos in 0..history.len() {
-        finder.insert(&combined, history_pos);
+    std::borrow::Cow::Owned(combined)
+}
+
+/// Blocks start with no repeat offsets, so a batch parses in parallel against a finder filled ahead.
+struct LzParser<'a> {
+    data: &'a [u8],
+    filled: usize,
+    batch_bytes: usize,
+    finder: Rar29MatchFinder,
+    options: EncodeOptions,
+}
+
+impl<'a> LzParser<'a> {
+    /// Two blocks per thread, up to 16 threads, so the window stays bounded.
+    fn batch_bytes(block_size: usize) -> usize {
+        block_size
+            .saturating_mul(crate::parallel::threads().min(16) * 2)
+            .max(block_size)
     }
 
-    let mut pos = history.len();
-    let end = combined.len();
+    fn new(data: &'a [u8], start: usize, options: EncodeOptions, block_size: usize) -> Self {
+        let reach = options.max_match_distance.min(MAX_HISTORY);
+        let batch_bytes = Self::batch_bytes(block_size);
+        // Reach plus a batch, so filling a batch only overwrites links nothing in it can reach.
+        let mut finder = match_finder_for(reach.saturating_add(batch_bytes), reach);
+        for history_pos in 0..start {
+            finder.insert(data, history_pos);
+        }
+        Self {
+            data,
+            filled: start,
+            batch_bytes,
+            finder,
+            options,
+        }
+    }
+
+    /// `ends` must stay within one batch of where the last call ended.
+    fn parse_blocks(&mut self, ends: &[usize]) -> Vec<Vec<EncodeToken>> {
+        let Some(&last) = ends.last() else {
+            return Vec::new();
+        };
+        debug_assert!(last - self.filled <= self.batch_bytes);
+        let first = self.filled;
+        for pos in self.filled..last {
+            self.finder.insert(self.data, pos);
+        }
+        self.filled = last;
+        let ranges: Vec<(usize, usize)> = std::iter::once(first)
+            .chain(ends[..ends.len() - 1].iter().copied())
+            .zip(ends.iter().copied())
+            .collect();
+        let (data, options, finder) = (self.data, self.options, &self.finder);
+        let parse = |(start, end): (usize, usize)| {
+            parse_range(data, start, end, &mut FilledAhead(finder), options, None)
+        };
+        if !crate::parallel::may_nest() {
+            return ranges
+                .into_iter()
+                .map(|range| parse(range).expect("a parse without progress cannot fail"))
+                .collect();
+        }
+        let (tokens, failure) = crate::parallel::map_prefix(ranges, parse);
+        debug_assert!(failure.is_none(), "a parse without progress cannot fail");
+        tokens
+    }
+}
+
+/// No match crosses `end`, so a block covers exactly the bytes it was given.
+fn parse_range<C: Candidates>(
+    data: &[u8],
+    start: usize,
+    end: usize,
+    finder: &mut C,
+    options: EncodeOptions,
+    mut progress: Option<&mut dyn FnMut(usize) -> bool>,
+) -> Result<Vec<EncodeToken>> {
+    let mut tokens = Vec::new();
     let mut state = EncoderMatchState::default();
     let mut next_report = 0usize;
     let mut pending_match: Option<MatchCandidate> = None;
+    let mut pos = start;
     while pos < end {
         let candidate = pending_match
             .take()
-            .or_else(|| best_match(&combined, pos, end, &finder, options, &state));
+            .or_else(|| best_match_before(data, pos, end, pos, finder, options, &state));
         if let Some(candidate) = candidate {
             let (emit_literal, cached_next) =
-                lazy_match_decision(&combined, pos, &finder, options, &state, candidate);
+                lazy_match_decision(data, pos, end, finder, options, &state, candidate);
             if emit_literal {
-                tokens.push(EncodeToken::Literal(combined[pos]));
-                finder.insert(&combined, pos);
+                tokens.push(EncodeToken::Literal(data[pos]));
+                finder.insert(data, pos);
                 pos += 1;
                 pending_match = cached_next;
                 continue;
             }
             let MatchCandidate { length, offset, .. } = candidate;
-            tokens.push(EncodeToken::Match { length, offset });
+            tokens.push(EncodeToken::Match {
+                length: length as u32,
+                offset: offset as u32,
+            });
             state.remember(length, offset);
             for history_pos in pos..pos + length {
-                finder.insert(&combined, history_pos);
+                finder.insert(data, history_pos);
             }
             pos += length;
         } else {
-            tokens.push(EncodeToken::Literal(combined[pos]));
-            finder.insert(&combined, pos);
+            tokens.push(EncodeToken::Literal(data[pos]));
+            finder.insert(data, pos);
             pos += 1;
         }
-        let consumed = pos.saturating_sub(history.len());
+        let consumed = pos - start;
         if consumed >= next_report {
             if progress
                 .as_deref_mut()
@@ -1637,7 +1825,7 @@ fn encode_tokens_with_progress(
             next_report = consumed.saturating_add(1024 * 1024);
         }
     }
-    if progress.is_some_and(|report| !report(input.len())) {
+    if progress.is_some_and(|report| !report(end - start)) {
         return Err(Error::Cancelled);
     }
     Ok(tokens)
@@ -1647,15 +1835,15 @@ fn encode_tokens_with_progress(
 /// better match starts within the lazy lookahead window. Also returns the
 /// match found one byte ahead (when computed) so the caller can reuse it for
 /// the next position instead of searching again.
-fn lazy_match_decision(
+fn lazy_match_decision<C: Candidates>(
     input: &[u8],
     pos: usize,
-    finder: &Rar29MatchFinder,
+    end: usize,
+    finder: &C,
     options: EncodeOptions,
     state: &EncoderMatchState,
     current: MatchCandidate,
 ) -> (bool, Option<MatchCandidate>) {
-    let end = input.len();
     if !options.lazy_matching {
         return (false, None);
     }
@@ -1665,7 +1853,7 @@ fn lazy_match_decision(
         if pos + offset >= end {
             break;
         }
-        let next = best_match(input, pos + offset, end, finder, options, state);
+        let next = best_match_before(input, pos + offset, end, pos, finder, options, state);
         if offset == 1 {
             cached_next = next;
         }
@@ -1764,7 +1952,8 @@ fn encode_ppmd_hybrid_with_progress(
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<()> {
     let mut costs = PpmdTokenCosts::new();
-    let mut finder = Rar29MatchFinder::new(input.len());
+    let reach = input.len().min(max_match_distance).min(MAX_HISTORY);
+    let mut finder: PpmdMatchFinder = match_finder_for(reach, reach);
     let mut pos = 0usize;
     let mut search_from = 0usize;
     let mut next_check = 0usize;
@@ -1834,7 +2023,7 @@ fn ppmd_offset_one_repeat(input: &[u8], pos: usize) -> Option<usize> {
 fn best_ppmd_match(
     input: &[u8],
     pos: usize,
-    finder: &Rar29MatchFinder,
+    finder: &PpmdMatchFinder,
     max_match_distance: usize,
 ) -> Option<(usize, usize)> {
     let max_offset = pos.min(0x1000001).min(MAX_HISTORY).min(max_match_distance);
@@ -1857,6 +2046,16 @@ fn best_ppmd_match(
             continue;
         }
         checked += 1;
+        // Only a candidate reaching past the current best (or the minimum) can
+        // win, so probe that one byte before measuring the whole match.
+        let probe = best.map_or(MIN_PPMD_MATCH_LENGTH - 1, |(best_length, _)| best_length);
+        if input[candidate + probe] != input[pos + probe] {
+            if checked >= MAX_MATCH_CANDIDATES {
+                break;
+            }
+            candidate = finder.previous(candidate);
+            continue;
+        }
         let length = match_length(input, pos, offset, max_length);
         if length >= MIN_PPMD_MATCH_LENGTH
             && best.is_none_or(|(best_length, best_offset)| {
@@ -1876,11 +2075,24 @@ fn best_ppmd_match(
     best
 }
 
+#[cfg(test)]
 fn best_match(
     input: &[u8],
     pos: usize,
     end: usize,
     finder: &Rar29MatchFinder,
+    options: EncodeOptions,
+    state: &EncoderMatchState,
+) -> Option<MatchCandidate> {
+    best_match_before(input, pos, end, pos, finder, options, state)
+}
+
+fn best_match_before<C: Candidates>(
+    input: &[u8],
+    pos: usize,
+    end: usize,
+    limit: usize,
+    finder: &C,
     options: EncodeOptions,
     state: &EncoderMatchState,
 ) -> Option<MatchCandidate> {
@@ -1903,7 +2115,7 @@ fn best_match(
             return Some(best);
         }
     }
-    let mut candidate = finder.first(input, pos);
+    let mut candidate = finder.first(input, pos, limit);
     while candidate != match_finder::NO_POSITION {
         // MatchFinder chains contain only previously inserted positions and
         // each link moves strictly backwards.

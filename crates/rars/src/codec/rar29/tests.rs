@@ -365,7 +365,7 @@ fn should_lazy_emit_literal(
     state: &EncoderMatchState,
     current: MatchCandidate,
 ) -> bool {
-    lazy_match_decision(input, pos, finder, options, state, current).0
+    lazy_match_decision(input, pos, input.len(), finder, options, state, current).0
 }
 
 use super::{
@@ -1293,7 +1293,7 @@ fn solid_follower_can_match_the_oldest_retained_history() {
         let follower_tokens = encode_tokens(&marker, &encoder.history, options);
         assert!(follower_tokens.iter().any(|token| matches!(
             token,
-            EncodeToken::Match { offset, .. } if *offset == MAX_HISTORY
+            EncodeToken::Match { offset, .. } if *offset as usize == MAX_HISTORY
         )));
         let follower_packed = encoder.encode_member(&marker).unwrap();
 
@@ -1951,12 +1951,12 @@ fn match_finder_respects_configured_maximum_distance() {
         EncodeOptions::new(MAX_MATCH_CANDIDATES).with_max_match_distance(1024 * 1024),
     );
 
-    assert!(!bounded
-        .iter()
-        .any(|token| matches!(token, EncodeToken::Match { offset, .. } if *offset > 128 * 1024)));
-    assert!(unbounded
-        .iter()
-        .any(|token| matches!(token, EncodeToken::Match { offset, .. } if *offset > 128 * 1024)));
+    assert!(!bounded.iter().any(
+        |token| matches!(token, EncodeToken::Match { offset, .. } if *offset as usize > 128 * 1024)
+    ));
+    assert!(unbounded.iter().any(
+        |token| matches!(token, EncodeToken::Match { offset, .. } if *offset as usize > 128 * 1024)
+    ));
 }
 
 #[test]
@@ -2016,7 +2016,7 @@ fn ppmd_match_finder_uses_the_declared_dictionary_past_one_megabyte() {
     let mut input = vec![0u8; distance + phrase.len()];
     input[..phrase.len()].copy_from_slice(phrase);
     input[distance..].copy_from_slice(phrase);
-    let mut finder = Rar29MatchFinder::new(input.len());
+    let mut finder = super::PpmdMatchFinder::new(input.len());
     finder.insert(&input, 0);
 
     assert_eq!(
@@ -4467,4 +4467,99 @@ fn reader_decoding_holds_its_history_at_the_window_size() {
     assert!(out == input);
     drop(state);
     assert_eq!(budget.used(), 0);
+}
+
+fn mixed_member(len: usize) -> Vec<u8> {
+    let words = [
+        &b"alpha "[..],
+        b"bravo ",
+        b"charlie ",
+        b"delta ",
+        b"echo\n",
+        b"foxtrot ",
+    ];
+    let mut state = 0x2545_f491_u32;
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        if state.is_multiple_of(7) {
+            out.extend_from_slice(&state.to_le_bytes());
+        } else {
+            out.extend_from_slice(words[state as usize % words.len()]);
+        }
+    }
+    out.truncate(len);
+    out
+}
+
+fn packed_fingerprint(packed: &[u8]) -> (usize, u32) {
+    (packed.len(), crate::crc32::crc32(packed))
+}
+
+#[test]
+fn block_parsed_members_code_to_the_serial_parse_bytes() {
+    let input = mixed_member(600 * 1024);
+    let options = EncodeOptions::new(64)
+        .with_lazy_matching(true)
+        .with_max_match_distance(256 * 1024)
+        .with_block_size(4096);
+
+    let plain = Unpack29Encoder::with_options(options)
+        .encode_member(&input)
+        .unwrap();
+    assert_eq!(super::unpack29_decode(&plain, input.len()).unwrap(), input);
+
+    let mut chain = Unpack29Encoder::with_options(options);
+    chain.encode_member(&input[..300 * 1024]).unwrap();
+    let continued = chain.encode_member(&input[300 * 1024..]).unwrap();
+
+    let filtered = Unpack29Encoder::with_options(options)
+        .encode_member_with_filter(
+            &input,
+            crate::FilterSpec::whole(crate::FilterKind::Delta { channels: 2 }),
+        )
+        .unwrap();
+    assert_eq!(
+        super::unpack29_decode(&filtered, input.len()).unwrap(),
+        input
+    );
+
+    let ppmd = super::unpack29_encode_ppmd(&input, 256 * 1024).unwrap();
+    assert_eq!(super::unpack29_decode(&ppmd, input.len()).unwrap(), input);
+
+    // Captured from the serial parse, one block after another on one finder.
+    assert_eq!(packed_fingerprint(&plain), (148_381, 3_735_200_713));
+    assert_eq!(packed_fingerprint(&continued), (74_257, 1_312_368_026));
+    assert_eq!(packed_fingerprint(&filtered), (239_799, 1_353_944_033));
+    // The PPMd search keys on whole matches now; it must not lose to the
+    // four-byte key it replaced, which packed this member to 109,636 bytes.
+    assert!(ppmd.len() <= 109_636, "{}", ppmd.len());
+}
+
+#[test]
+fn members_parsed_in_segments_code_to_the_serial_parse_bytes() {
+    let input = mixed_member(600 * 1024);
+    let options = EncodeOptions::new(64)
+        .with_lazy_matching(true)
+        .with_max_match_distance(16 * 1024)
+        .with_block_size(4096);
+
+    let plain = Unpack29Encoder::with_options(options)
+        .encode_member(&input)
+        .unwrap();
+    assert_eq!(super::unpack29_decode(&plain, input.len()).unwrap(), input);
+    let mut chain = Unpack29Encoder::with_options(options);
+    chain.encode_member(&input[..300 * 1024]).unwrap();
+    let continued = chain.encode_member(&input[300 * 1024..]).unwrap();
+    let one_thread = {
+        let _cap = crate::parallel::ThreadCap::set(Some(1));
+        Unpack29Encoder::with_options(options)
+            .encode_member(&input)
+            .unwrap()
+    };
+    assert_eq!(one_thread, plain);
+    assert_eq!(packed_fingerprint(&plain), (146_951, 4_071_059_742));
+    assert_eq!(packed_fingerprint(&continued), (73_398, 3_211_860_258));
 }
