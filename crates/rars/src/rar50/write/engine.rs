@@ -1354,6 +1354,8 @@ pub(super) fn write_volumes(
         body_budget: None,
         fragments_in_volume: 0,
         volume_index: 0,
+        trailing_producer: None,
+        trailing_len: 0,
     };
 
     for mut member in members {
@@ -1499,6 +1501,10 @@ struct VolumeWriter<'a> {
     body_budget: Option<u64>,
     fragments_in_volume: u64,
     volume_index: u64,
+    /// A later volume's producer record, written after its files when it closes.
+    trailing_producer: Option<PreparedBlock<'static>>,
+    /// Its length, which the volume's budget sets aside.
+    trailing_len: u64,
 }
 
 impl VolumeWriter<'_> {
@@ -1582,7 +1588,8 @@ impl VolumeWriter<'_> {
         split_before: bool,
         remaining: u64,
     ) -> Result<Option<u64>> {
-        let used = self.body.as_ref().expect("volume started").len();
+        // A later volume's producer record joins the body when it closes.
+        let used = self.body.as_ref().expect("volume started").len() + self.trailing_len;
         // Most of the time the rest of the member fits as it is, and one
         // layout check says so without working out the whole budget.
         let header = self.fragment_header_len(member, remaining, split_before)?;
@@ -1766,8 +1773,16 @@ impl VolumeWriter<'_> {
     fn start_volume(&mut self) -> Result<()> {
         let mut body = Spool::create(self.resources)?;
         let marker = producer_block(self.header_keys, self.resources)?;
-        body.write_all(&marker.header)?;
-        write_payload(marker.payload, &mut body, self.resources, self.progress)?;
+        self.trailing_len = 0;
+        if self.volume_index == 0 {
+            body.write_all(&marker.header)?;
+            write_payload(marker.payload, &mut body, self.resources, self.progress)?;
+        } else {
+            // A split member's header comes first in a later volume, as RAR
+            // writes it; python-rarfile reads stored members on that basis.
+            self.trailing_len = marker.header.len() as u64 + marker.payload_len;
+            self.trailing_producer = Some(marker);
+        }
         self.body = Some(body);
         self.head_crypt_len = self.head_crypt()?.len() as u64;
         self.fixed_len =
@@ -1779,6 +1794,10 @@ impl VolumeWriter<'_> {
 
     fn finish_volume(&mut self, more_volumes_follow: bool) -> Result<()> {
         let mut body = self.body.take().expect("volume started");
+        if let Some(marker) = self.trailing_producer.take() {
+            body.write_all(&marker.header)?;
+            write_payload(marker.payload, &mut body, self.resources, self.progress)?;
+        }
         let volume_number = self.volume_index;
         self.volume_index += 1;
 

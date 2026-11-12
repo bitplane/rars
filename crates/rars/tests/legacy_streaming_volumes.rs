@@ -35,7 +35,8 @@ fn stream(
     Ok(sink.take())
 }
 
-// Lengths and CRCs of what the in-memory writer produced before it streamed.
+// Lengths and CRCs of what the in-memory writer produced before it streamed,
+// updated when later volumes moved the producer record after their files.
 #[test]
 fn streamed_volumes_match_the_in_memory_writer_byte_for_byte() {
     type Golden = &'static [(usize, u32)];
@@ -46,9 +47,9 @@ fn streamed_volumes_match_the_in_memory_writer_byte_for_byte() {
             3000,
             &[
                 (0xbb8, 0x944c6d0a),
-                (0xbb8, 0x285133e7),
-                (0xbb8, 0x3f5a56ac),
-                (0x5db, 0x951a0818),
+                (0xbb8, 0x0ee85015),
+                (0xbb8, 0xaaf9d913),
+                (0x5db, 0xa8c63371),
             ],
         ),
         (ArchiveVersion::Rar15, None, 20_000, &[(0x278f, 0x07b254b4)]),
@@ -58,9 +59,9 @@ fn streamed_volumes_match_the_in_memory_writer_byte_for_byte() {
             3000,
             &[
                 (0xbb8, 0x760ca9ab),
-                (0xbb8, 0xca11f746),
-                (0xbb8, 0xdd1a920d),
-                (0x5db, 0x15cd408f),
+                (0xbb8, 0x926a1649),
+                (0xbb8, 0x367b9f4f),
+                (0x5db, 0x454d69f5),
             ],
         ),
         (ArchiveVersion::Rar20, None, 20_000, &[(0x278f, 0x5b60263c)]),
@@ -70,9 +71,9 @@ fn streamed_volumes_match_the_in_memory_writer_byte_for_byte() {
             3000,
             &[
                 (0xbb8, 0x94fc7e41),
-                (0xbb8, 0xf8469902),
-                (0xbb8, 0xdfc9f934),
-                (0x5f7, 0xb1b435ec),
+                (0xbb8, 0x0714ba45),
+                (0xbb8, 0x15f82bb2),
+                (0x5f7, 0xd776a0c6),
             ],
         ),
         (ArchiveVersion::Rar29, None, 20_000, &[(0x2796, 0x29c6b903)]),
@@ -82,9 +83,9 @@ fn streamed_volumes_match_the_in_memory_writer_byte_for_byte() {
             3000,
             &[
                 (0xbb8, 0xb06e9dcf),
-                (0xbb8, 0xdcd47a8c),
-                (0xbb8, 0xfb5b1aba),
-                (0x5f7, 0xff02d2d9),
+                (0xbb8, 0xc36e3872),
+                (0xbb8, 0xd182a985),
+                (0x5f7, 0x9a54a47a),
             ],
         ),
         (ArchiveVersion::Rar30, None, 20_000, &[(0x2796, 0x2b46b6e7)]),
@@ -94,9 +95,9 @@ fn streamed_volumes_match_the_in_memory_writer_byte_for_byte() {
             3000,
             &[
                 (0xbb8, 0xb06e9dcf),
-                (0xbb8, 0xdcd47a8c),
-                (0xbb8, 0xfb5b1aba),
-                (0x5f7, 0xff02d2d9),
+                (0xbb8, 0xc36e3872),
+                (0xbb8, 0xd182a985),
+                (0x5f7, 0x9a54a47a),
             ],
         ),
         (ArchiveVersion::Rar40, None, 20_000, &[(0x2796, 0x2b46b6e7)]),
@@ -106,9 +107,9 @@ fn streamed_volumes_match_the_in_memory_writer_byte_for_byte() {
             3000,
             &[
                 (0xbb8, 0x1786223f),
-                (0xbb8, 0xc41339d9),
-                (0xbb8, 0xa1c228e2),
-                (0x5db, 0x64e8c6b7),
+                (0xbb8, 0xd758ad7e),
+                (0xbb8, 0x07d0d5d4),
+                (0x5db, 0xd9df9f4a),
             ],
         ),
         (
@@ -123,9 +124,9 @@ fn streamed_volumes_match_the_in_memory_writer_byte_for_byte() {
             3000,
             &[
                 (0xbb8, 0xbb0b111c),
-                (0xbb8, 0x5d314ef1),
-                (0xbb8, 0x3c345873),
-                (0x5e8, 0x903e5e0f),
+                (0xbb8, 0x1aee5156),
+                (0xbb8, 0xaabdeb2b),
+                (0x5e8, 0x043f7837),
             ],
         ),
         (
