@@ -38,4 +38,7 @@ rars a --format rar29 --solid archive.rar files...
 rars a --format rar70 --volume-size 10m archive.part1.rar files...
 ```
 
+For programs that link against libunrar, bgermann's
+[unrars](https://crates.io/crates/unrars) wraps rars in the same C ABI.
+
 Licensed under the [Apache License, Version 2.0](COPYING).
