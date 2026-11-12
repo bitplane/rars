@@ -6249,7 +6249,8 @@ fn creates_rar50_solid_compressed_multivolume_archive_that_can_be_tested() {
 
     let info = rars().args(["info", "-v"]).arg(&parts[0]).output().unwrap();
     assert!(info.status.success(), "stderr: {}", stderr(&info));
-    assert!(stdout(&info).contains("rar50 main: flags=0x0007"));
+    // Volume and solid; only later volumes carry a volume number.
+    assert!(stdout(&info).contains("rar50 main: flags=0x0005"));
 
     let test = rars().arg("test").args(&parts).output().unwrap();
     assert!(test.status.success(), "stderr: {}", stderr(&test));

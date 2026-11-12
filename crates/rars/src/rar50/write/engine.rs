@@ -1689,8 +1689,13 @@ impl VolumeWriter<'_> {
         Ok(budget)
     }
 
-    fn main_flags(&self) -> u64 {
-        let mut main_flags = crate::rar50::MHFL_VOLUME | crate::rar50::MHFL_VOLUME_NUMBER;
+    /// The first volume carries no volume number: RAR leaves it out there, and
+    /// python-rarfile only treats a volume without one as the first.
+    fn main_flags(&self, volume_number: u64) -> u64 {
+        let mut main_flags = crate::rar50::MHFL_VOLUME;
+        if volume_number > 0 {
+            main_flags |= crate::rar50::MHFL_VOLUME_NUMBER;
+        }
         if self.solid {
             main_flags |= MHFL_SOLID;
         }
@@ -1709,8 +1714,8 @@ impl VolumeWriter<'_> {
         LayoutInputs {
             header_encrypted: self.header_keys.is_some(),
             head_crypt_len,
-            main_flags: self.main_flags(),
-            volume_number: Some(volume_number),
+            main_flags: self.main_flags(volume_number),
+            volume_number: (volume_number > 0).then_some(volume_number),
             archive_metadata: None,
             metadata_record: None,
             body_len,
@@ -1778,7 +1783,8 @@ impl VolumeWriter<'_> {
         self.volume_index += 1;
 
         let head_crypt = self.head_crypt()?;
-        let main_flags = self.main_flags();
+        let main_flags = self.main_flags(volume_number);
+        let stored_number = (volume_number > 0).then_some(volume_number);
         let layout = resolve_layout(
             &self.layout_inputs(volume_number, head_crypt.len() as u64, body.len()),
             self.resources,
@@ -1804,7 +1810,7 @@ impl VolumeWriter<'_> {
                 Some(keys) => encrypted_main_header_block(
                     &keys.keys,
                     main_flags,
-                    Some(volume_number),
+                    stored_number,
                     &layout.main_extra,
                     self.resources,
                 )?,
@@ -1813,7 +1819,7 @@ impl VolumeWriter<'_> {
                     write_main_header(
                         &mut main,
                         main_flags,
-                        Some(volume_number),
+                        stored_number,
                         &layout.main_extra,
                         self.resources,
                     )?;
