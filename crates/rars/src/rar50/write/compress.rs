@@ -2226,7 +2226,8 @@ mod tests {
             assert_eq!(opens.load(Ordering::Relaxed), 1);
             assert_eq!(ledger.used(), 0);
             let sources = [EntrySource::from_bytes(vec![7; 8192])];
-            let too_small = Allowance::limited(16 * 1024 * 1024);
+            // Below the fixed 3 MiB every streaming job is charged, whatever its input.
+            let too_small = Allowance::limited(1024 * 1024);
             let constrained = resources
                 .clone()
                 .with_execution_allowance(too_small.clone());

@@ -52,8 +52,14 @@ impl ExecutionPlan {
         let whole_members = !settings.solid
             && (settings.filter_policy != FilterPolicy::None || settings.candidates.len() > 1);
         if !whole_members {
+            // A solid job's window can span members; an independent one cannot.
+            let largest = if settings.solid {
+                sizes.fold(0u64, u64::saturating_add)
+            } else {
+                sizes.max().unwrap_or(0)
+            };
             return Ok(Self::Blocks {
-                workspace: streaming_workspace(settings, true),
+                workspace: streaming_workspace(settings, true, largest),
             });
         }
         Ok(Self::IndependentMembers(Records::collect(
@@ -78,7 +84,7 @@ impl ExecutionPlan {
                                 },
                             },
                             // Automatic fallback uses only the base encoder candidate.
-                            workspace: streaming_workspace(settings, false),
+                            workspace: streaming_workspace(settings, false, size),
                         }
                     },
                 )
@@ -96,7 +102,8 @@ impl ExecutionPlan {
     }
 }
 
-fn streaming_workspace(settings: &CompressPlan, include_candidates: bool) -> u64 {
+/// A job never holds more than its input, so small members are not charged a 1 MiB block.
+fn streaming_workspace(settings: &CompressPlan, include_candidates: bool, input: u64) -> u64 {
     let optimal = settings.encode_options.optimal_parse
         || (include_candidates
             && settings
@@ -105,7 +112,7 @@ fn streaming_workspace(settings: &CompressPlan, include_candidates: bool) -> u64
                 .any(|options| options.optimal_parse));
     super::streaming_lz_workspace(
         settings.dictionary_size,
-        crate::codec::rar50::MAX_LZ_BLOCK_SIZE,
+        input.min(crate::codec::rar50::MAX_LZ_BLOCK_SIZE as u64) as usize,
         optimal,
     )
 }
@@ -206,6 +213,28 @@ mod tests {
             assert_eq!(execution.members()[0].execution, Execution::WholeMember);
             assert!(execution.members()[0].workspace > 1);
         }
+    }
+
+    #[test]
+    fn streaming_blocks_are_charged_for_the_input_not_a_full_block() {
+        let mut settings = settings();
+        settings.filter_policy = FilterPolicy::None;
+        settings.encode_options = settings.encode_options.with_optimal_parse(true);
+        settings.candidates = vec![settings.encode_options].into();
+        let member = 160 * 1024;
+        let charge = |input: u64| {
+            super::super::streaming_lz_workspace(settings.dictionary_size, input as usize, true)
+        };
+        let full = charge(crate::codec::rar50::MAX_LZ_BLOCK_SIZE as u64);
+        for (solid, expected) in [(false, charge(member)), (true, charge(2 * member))] {
+            settings.solid = solid;
+            let plan = ExecutionPlan::new(&settings, [member, member].into_iter(), u64::MAX);
+            assert!(matches!(plan, ExecutionPlan::Blocks { workspace } if workspace == expected));
+            assert!(expected < full);
+        }
+        settings.solid = false;
+        let large = ExecutionPlan::new(&settings, [16 * 1024 * 1024].into_iter(), u64::MAX);
+        assert!(matches!(large, ExecutionPlan::Blocks { workspace } if workspace == full));
     }
 
     #[test]

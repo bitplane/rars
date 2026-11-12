@@ -2218,6 +2218,35 @@ mod tests {
     }
 
     #[test]
+    fn unfiltered_optimal_streaming_fits_a_ceiling_sized_for_its_members() {
+        // Charging every job a full 1 MiB optimal block asked for 173 MB here.
+        let mut state = 0x1234_5678u32;
+        let data: Vec<u8> = (0..160 * 1024)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect();
+        let entries = ["first", "second"].map(|name| {
+            ArchiveEntry::new(name, EntrySource::from_bytes(Arc::<[u8]>::from(&data[..])))
+        });
+        let limit = 96 * 1024 * 1024;
+        let mut bytes = Vec::new();
+        write_streaming_archive_to(
+            &entries,
+            WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
+                .with_compression_level(3)
+                .with_dictionary_size(128 * 1024),
+            ArchiveExtras::default().with_filter_policy(FilterPolicy::None),
+            &WriterResources::new(limit).with_max_memory_bytes(limit),
+            &mut bytes,
+        )
+        .unwrap();
+        let archive = crate::ArchiveReader::read_owned(bytes).unwrap();
+        assert_eq!(archive.read_member(b"second", None).unwrap().unwrap(), data);
+    }
+
+    #[test]
     fn streaming_writer_rejects_a_source_larger_than_its_declared_size() {
         let source = EntrySource::from_opener(4, || Ok(Box::new(Cursor::new(b"data!".to_vec()))));
         let entry = ArchiveEntry::new(b"changing.bin".to_vec(), source)
