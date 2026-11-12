@@ -169,3 +169,24 @@ fn vm_delta_filter_accepts_more_than_thirty_two_channels() {
     assert_eq!(extracted[0].name, b"delta64.bin");
     assert_eq!(extracted[0].data, expected);
 }
+
+#[test]
+fn generic_program_reads_static_data_through_a_called_subroutine() {
+    let line = b"RAR VM static data and CALL/RET fixture line\n";
+    let table = [0x5a, 0xa5, 0x3c, 0xc3];
+    let expected: Vec<u8> = line
+        .iter()
+        .cycle()
+        .take(4096)
+        .enumerate()
+        .map(|(index, byte)| byte ^ table[index & 3])
+        .collect();
+    let archive = Archive::parse_path(fixture("generic_static_data_call_ret.rar")).unwrap();
+
+    let options = ArchiveReadOptions::new().with_rar3_vm_programs(true);
+    let extracted = collect_extract_with(&archive, options).unwrap();
+
+    assert_eq!(extracted.len(), 1);
+    assert_eq!(extracted[0].name, b"static_call.bin");
+    assert_eq!(extracted[0].data, expected);
+}
