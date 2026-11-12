@@ -57,6 +57,30 @@ impl Drop for ThreadCap {
 ))]
 mod threaded {
     use rayon::prelude::*;
+    #[cfg(any(test, feature = "write"))]
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Windows of several items in the pool, whose items may block on what their siblings hold.
+    #[cfg(any(test, feature = "write"))]
+    static FANNED_OUT: AtomicUsize = AtomicUsize::new(0);
+
+    #[cfg(any(test, feature = "write"))]
+    struct FanOut;
+
+    #[cfg(any(test, feature = "write"))]
+    impl FanOut {
+        fn start() -> Self {
+            FANNED_OUT.fetch_add(1, Ordering::SeqCst);
+            Self
+        }
+    }
+
+    #[cfg(any(test, feature = "write"))]
+    impl Drop for FanOut {
+        fn drop(&mut self) {
+            FANNED_OUT.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
 
     /// Process preallocated slots without allocating a separate result vector.
     /// Returns only after every admitted callback has finished.
@@ -123,7 +147,11 @@ mod threaded {
     {
         let window = window.max(1);
         for chunk in items.chunks(window) {
-            let mapped: Vec<O> = chunk.par_iter().map(&map).collect::<Result<_, E>>()?;
+            // A lone item has no sibling to steal, so its own work may still fan out.
+            let fan_out = (chunk.len() > 1).then(FanOut::start);
+            let mapped: Result<Vec<O>, E> = chunk.par_iter().map(&map).collect();
+            drop(fan_out);
+            let mapped = mapped?;
             for (item, output) in chunk.iter().zip(mapped) {
                 consume(item, output)?;
             }
@@ -140,6 +168,12 @@ mod threaded {
     pub(crate) fn threads() -> usize {
         let pool = rayon::current_num_threads().max(1);
         super::ThreadCap::current().map_or(pool, |cap| cap.min(pool))
+    }
+
+    /// Whether work inside an item may fan out: not while blocking siblings wait in the pool.
+    #[cfg(feature = "write")]
+    pub(crate) fn may_nest() -> bool {
+        threads() > 1 && FANNED_OUT.load(Ordering::SeqCst) == 0
     }
 
     /// Not inside the pool, where members already run side by side, nor at one thread.
@@ -230,6 +264,12 @@ mod sequential {
     }
 
     pub(crate) fn may_spawn() -> bool {
+        false
+    }
+
+    #[cfg(feature = "write")]
+    #[cfg_attr(all(test, feature = "parallel"), allow(dead_code))]
+    pub(crate) fn may_nest() -> bool {
         false
     }
 

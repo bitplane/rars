@@ -95,8 +95,8 @@ impl<const MIN_MATCH: usize> MatchFinder<MIN_MATCH> {
 impl<const MIN_MATCH: usize, B: Budget> MatchFinder<MIN_MATCH, B> {
     const HASH_BITS: u32 = match MIN_MATCH {
         3 => 16,
-        4 => 17,
-        _ => panic!("match finder supports MIN_MATCH of 3 or 4"),
+        4 | 32 => 17,
+        _ => panic!("match finder supports MIN_MATCH of 3, 4 or 32"),
     };
 
     /// Builds a finder that remembers the last `window` positions.
@@ -139,6 +139,15 @@ impl<const MIN_MATCH: usize, B: Budget> MatchFinder<MIN_MATCH, B> {
             u32::from(input[pos])
                 | (u32::from(input[pos + 1]) << 8)
                 | (u32::from(input[pos + 2]) << 16)
+        } else if MIN_MATCH == 32 {
+            let (words, _) = input[pos..pos + 32].as_chunks::<8>();
+            let wide = words
+                .iter()
+                .map(|&word| u64::from_le_bytes(word))
+                .fold(0u64, |hash, word| {
+                    (hash ^ word).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                });
+            (wide ^ (wide >> 32)) as u32
         } else {
             u32::from_le_bytes([input[pos], input[pos + 1], input[pos + 2], input[pos + 3]])
         };
@@ -161,6 +170,18 @@ impl<const MIN_MATCH: usize, B: Budget> MatchFinder<MIN_MATCH, B> {
     /// readable at `pos`.
     pub(crate) fn first(&self, input: &[u8], pos: usize) -> usize {
         resolve(self.newest, self.head[self.hash(input, pos)])
+    }
+
+    /// The newest candidate older than `limit` sharing `pos`'s hash, for a
+    /// finder filled ahead of the parse: `pos` must already be inserted, and
+    /// positions from `limit` on are ones an in-order parse has not reached.
+    #[cfg(feature = "write")]
+    pub(crate) fn first_before(&self, pos: usize, limit: usize) -> usize {
+        let mut candidate = self.previous(pos);
+        while candidate != NO_POSITION && candidate >= limit {
+            candidate = self.previous(candidate);
+        }
+        candidate
     }
 
     /// Returns the next-older candidate in `candidate`'s chain, or
@@ -355,16 +376,12 @@ impl<B: Budget> TreeMatchFinder<B> {
     /// Builds a finder that remembers the last `window` positions, at eight
     /// bytes of links per byte of window.
     pub(crate) fn with_allowance(window: usize, allowance: &B) -> Result<Self> {
-        Self::build(window, Self::HASH_BITS, allowance)
-    }
-
-    fn build(window: usize, hash_bits: u32, allowance: &B) -> Result<Self> {
         let window = window
             .max(1)
             .checked_next_power_of_two()
             .ok_or(super::Error::InvalidData("finder window overflows"))?;
         Ok(Self {
-            head: Buffer::filled(1 << hash_bits, NO_LINK, allowance)?,
+            head: Buffer::filled(1 << Self::HASH_BITS, NO_LINK, allowance)?,
             // Zero rather than the sentinel for the same reason as the chain
             // finder's `prev`: a slot is always written during its position's
             // own insertion before any link can lead to it, and untouched
