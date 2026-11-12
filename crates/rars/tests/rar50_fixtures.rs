@@ -2655,7 +2655,8 @@ fn writes_stored_rar50_volume_set_that_reader_reassembles() {
         .map(|part| Archive::parse(part).unwrap())
         .collect();
     assert!(archives.iter().all(|archive| archive.main.is_volume()));
-    assert_eq!(archives[0].main.volume_number, Some(0));
+    // As RAR writes it: only later volumes carry a number, which python-rarfile relies on.
+    assert_eq!(archives[0].main.volume_number, None);
     assert_eq!(archives[1].main.volume_number, Some(1));
     assert!(archives[0].files().next().unwrap().is_split_after());
     // A fragment that is not the last one checksums the bytes it stores rather
