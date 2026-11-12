@@ -102,6 +102,8 @@ pub mod version;
 mod volume_extract;
 pub mod volume_name;
 #[cfg(feature = "write")]
+mod volume_sink;
+#[cfg(feature = "write")]
 pub mod write_plan;
 #[cfg(feature = "write")]
 mod write_progress;

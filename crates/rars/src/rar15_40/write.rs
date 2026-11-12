@@ -22,6 +22,9 @@ use crate::FeatureSet;
 use crate::{WriteOperation, WriteProgress, WriteProgressEvent};
 use std::io::Write;
 
+mod stored_volumes;
+pub use stored_volumes::write_stored_volumes_to;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct WriterOptions {
@@ -1541,48 +1544,24 @@ pub(crate) fn write_stored_volumes_with_progress(
     volume_size: usize,
     progress: Option<&dyn WriteProgress>,
 ) -> Result<Vec<Vec<u8>>> {
-    let resources = WriterResources::default();
-    let control =
-        crate::write_progress::ResourceProgress::new(&resources, progress.map(ProgressReporter));
-    let progress = ProgressReporter(&control);
-    crate::write_progress::check_cancelled(Some(progress))?;
-    validate_plan(options, PlanShape::new().volumes(true), false, false)?;
-    validate_volume_writer_inputs(entry.name, entry.data, entry.file_comment, options)?;
-    if options.features.header_encryption {
-        return write_header_encrypted_split_volumes(SplitVolumeRecord {
-            progress,
+    let mut sink = crate::volume_sink::CollectedVolumes::new();
+    stored_volumes::split_stored(
+        stored_volumes::StoredSplit {
             name: entry.name,
-            unpacked: entry.data,
-            packed: entry.data,
+            bytes: MemberBytes::Borrowed(entry.data),
             file_time: entry.file_time,
             file_attr: entry.file_attr,
             host_os: entry.host_os,
-            target: options.target,
-            method: 0x30,
-            dictionary_flags: dictionary_flags_for_options(options)?,
-            base_flags: writer_file_flags(entry.password, None, false),
-            main_flags: 0,
             password: entry.password,
-            volume_size,
-        });
-    }
-
-    write_split_volumes(SplitVolumeRecord {
-        progress,
-        name: entry.name,
-        unpacked: entry.data,
-        packed: entry.data,
-        file_time: entry.file_time,
-        file_attr: entry.file_attr,
-        host_os: entry.host_os,
-        target: options.target,
-        method: 0x30,
-        dictionary_flags: dictionary_flags_for_options(options)?,
-        base_flags: writer_file_flags(entry.password, None, false),
-        main_flags: 0,
-        password: entry.password,
+            file_comment: entry.file_comment,
+        },
+        options,
         volume_size,
-    })
+        &mut sink,
+        &WriterResources::default(),
+        progress,
+    )?;
+    Ok(sink.take())
 }
 
 /// Splits one member across a volume set. No volume is longer than

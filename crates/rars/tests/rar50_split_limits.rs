@@ -180,3 +180,56 @@ fn split_streaming_preserves_sink_io_failure() {
         "{error:?}"
     );
 }
+
+#[test]
+fn stored_split_member_reads_its_source_at_most_twice() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    struct Counted(io::Cursor<Vec<u8>>, Arc<AtomicUsize>);
+    impl io::Read for Counted {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let read = self.0.read(buf)?;
+            self.1.fetch_add(read, Ordering::SeqCst);
+            Ok(read)
+        }
+    }
+    impl io::Seek for Counted {
+        fn seek(&mut self, from: io::SeekFrom) -> io::Result<u64> {
+            self.0.seek(from)
+        }
+    }
+    let payload: Vec<u8> = (0..64 * 1024u32).map(|i| (i * 31 + i / 7) as u8).collect();
+    let read = Arc::new(AtomicUsize::new(0));
+    let source = {
+        let (payload, read) = (payload.clone(), read.clone());
+        rars::EntrySource::from_opener(payload.len() as u64, move || {
+            Ok(Box::new(Counted(
+                io::Cursor::new(payload.clone()),
+                read.clone(),
+            )))
+        })
+    };
+    let root = scratch::case("stored-split-reads");
+    let mut sink = rar50::CollectedVolumes::new();
+    rar50::write_streaming_volumes_to(
+        &[rar50::ArchiveEntry::new(b"stored".to_vec(), source)],
+        rar50::WriterOptions::new(rars::ArchiveVersion::Rar50, rars::FeatureSet::store_only())
+            .with_compression_level(0),
+        rar50::ArchiveExtras::default(),
+        4096,
+        &mut sink,
+        &rars::WriterResources::default().with_temp_dir(root.to_path_buf()),
+    )
+    .unwrap();
+    let volumes: Vec<_> = sink
+        .take()
+        .into_iter()
+        .map(|bytes| Archive::parse_owned(bytes).unwrap())
+        .collect();
+    assert!(volumes.len() > 10);
+    assert_eq!(
+        collect(&volumes, payload.len() as u64, None).unwrap(),
+        vec![payload.clone()]
+    );
+    assert!(read.load(Ordering::SeqCst) <= 2 * payload.len() + 1);
+}

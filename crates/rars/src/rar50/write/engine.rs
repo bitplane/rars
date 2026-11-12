@@ -389,7 +389,7 @@ pub(super) fn write_archive(
     {
         let mut sink = Tee {
             output,
-            mirror: mirror.as_mut(),
+            mirror: mirror.as_mut().map(|spool| spool as &mut dyn Write),
         };
 
         let main = match &header_keys {
@@ -1098,7 +1098,7 @@ fn recovery_service_with_allowance<B: crate::codec::workspace::Budget>(
 /// for the parity pass to read.
 struct Tee<'a> {
     output: &'a mut dyn Write,
-    mirror: Option<&'a mut Spool>,
+    mirror: Option<&'a mut dyn Write>,
 }
 
 impl Write for Tee<'_> {
@@ -1125,101 +1125,65 @@ enum FragmentSource {
 }
 
 impl FragmentSource {
-    /// Checksums of the bytes a fragment will store, read ahead of writing them.
-    ///
-    /// The fragment's header carries these and the header goes out before the
-    /// payload, so the range is read twice: once here and once to copy it. The
-    /// alternative is patching the fields after the copy, which an encrypted
-    /// header will not allow.
-    fn checksums_range(
-        &mut self,
-        start: u64,
-        len: u64,
-        progress: Option<ProgressReporter<'_>>,
-    ) -> Result<FragmentChecksums> {
-        let mut sink = ChecksumSink::default();
-        self.copy_range_unverified(
-            start,
-            len,
-            &mut CancellableIo {
-                inner: &mut sink,
-                progress,
-            },
-        )?;
-        Ok(FragmentChecksums {
-            crc32: sink.crc.finish(),
-            hash: sink.hash.finalize(),
-        })
-    }
-
+    /// Copies a fragment's bytes to `output`, returning their checksums when
+    /// asked, so the fragment's header can be patched without a second read.
     fn emit_range(
         &mut self,
         start: u64,
         len: u64,
         output: &mut dyn Write,
-        expected_fragment: Option<FragmentChecksums>,
+        want_checksums: bool,
         resources: &WriterResources,
-    ) -> Result<()> {
-        let Self::Stored { prepared, emitted } = self else {
-            return self.copy_range_unverified(start, len, output);
-        };
-        let mut buffer = Bytes::zeroed(64 * 1024, resources)?;
-        let mut reader = prepared.source.open()?;
-        reader.seek(std::io::SeekFrom::Start(start))?;
-        let mut fragment = ChecksumSink::default();
-        let mut remaining = len;
-        while remaining != 0 {
-            let want = remaining.min(buffer.len() as u64) as usize;
-            reader.read_exact(&mut buffer[..want])?;
-            output.write_all(&buffer[..want])?;
-            emitted.write_all(&buffer[..want])?;
-            if expected_fragment.is_some() {
-                fragment.write_all(&buffer[..want])?;
-            }
-            remaining -= want as u64;
-        }
-        if let Some(expected) = expected_fragment {
-            if fragment.crc.finish() != expected.crc32 || fragment.hash.finalize() != expected.hash
-            {
-                return Err(Error::SourceChanged(
-                    "entry source contents changed while writing",
-                ));
-            }
-        }
-        if start + len == prepared.len {
-            crate::write_stream::check_source_length(
-                &mut *reader,
-                start + len,
-                prepared.len,
-                "entry source size changed while writing",
-            )?;
-            prepared.verify(std::mem::take(&mut **emitted))?;
-        }
-        Ok(())
-    }
-
-    fn copy_range_unverified(
-        &mut self,
-        start: u64,
-        len: u64,
-        output: &mut dyn Write,
-    ) -> Result<()> {
+    ) -> Result<Option<FragmentChecksums>> {
+        let mut fragment = want_checksums.then(ChecksumSink::default);
         match self {
             Self::Packed(spool) => {
-                spool.copy_range_to(start, len, output)?;
+                spool.copy_range_to(
+                    start,
+                    len,
+                    &mut Tee {
+                        output,
+                        mirror: fragment.as_mut().map(|sink| sink as &mut dyn Write),
+                    },
+                )?;
             }
-            Self::Stored { prepared, .. } => {
+            Self::Stored { prepared, emitted } => {
+                let mut buffer = Bytes::zeroed(64 * 1024, resources)?;
                 let mut reader = prepared.source.open()?;
                 reader.seek(std::io::SeekFrom::Start(start))?;
-                let copied = std::io::copy(&mut reader.by_ref().take(len), output)?;
-                if copied != len {
-                    return Err(Error::SourceChanged(
+                let mut remaining = len;
+                while remaining != 0 {
+                    let want = remaining.min(buffer.len() as u64) as usize;
+                    reader
+                        .read_exact(&mut buffer[..want])
+                        .map_err(|error| match error.kind() {
+                            std::io::ErrorKind::UnexpectedEof => {
+                                Error::SourceChanged("entry source size changed while writing")
+                            }
+                            _ => error.into(),
+                        })?;
+                    output.write_all(&buffer[..want])?;
+                    emitted.write_all(&buffer[..want])?;
+                    if let Some(fragment) = fragment.as_mut() {
+                        fragment.write_all(&buffer[..want])?;
+                    }
+                    remaining -= want as u64;
+                }
+                if start + len == prepared.len {
+                    crate::write_stream::check_source_length(
+                        &mut *reader,
+                        start + len,
+                        prepared.len,
                         "entry source size changed while writing",
-                    ));
+                    )?;
+                    prepared.verify(std::mem::take(&mut **emitted))?;
                 }
             }
         }
-        Ok(())
+        Ok(fragment.map(|sink| FragmentChecksums {
+            crc32: sink.crc.finish(),
+            hash: sink.hash.finalize(),
+        }))
     }
 }
 
@@ -1565,16 +1529,23 @@ impl VolumeWriter<'_> {
             // A fragment that is not the last one has no whole-member checksum
             // to report, so the field carries the CRC32 of the bytes this
             // volume stores. That is what WinRAR puts there, and it lets a
-            // single volume be checked on its own.
-            let fragment_checksums = match split_after {
-                true => Some(
-                    member
-                        .source
-                        .checksums_range(start, fragment_len, self.progress)?,
-                ),
-                false => None,
-            };
-
+            // single volume be checked on its own. Those are only known once
+            // the bytes are copied, so the header goes out as a placeholder of
+            // the same length and is patched afterwards.
+            let header_len = self.fragment_header_len(member, fragment_len, split_before)?;
+            let body = self.body.as_mut().expect("volume started");
+            let header_at = body.len();
+            body.write_all(&vec![0; header_len as usize])?;
+            let fragment_checksums = member.source.emit_range(
+                start,
+                fragment_len,
+                &mut CancellableIo {
+                    inner: &mut *body,
+                    progress: self.progress,
+                },
+                split_after,
+                self.resources,
+            )?;
             let header = fragment_header(
                 member,
                 fragment_len,
@@ -1583,18 +1554,14 @@ impl VolumeWriter<'_> {
                 self.header_keys,
                 self.resources,
             )?;
-            let body = self.body.as_mut().expect("volume started");
+            if header.len() as u64 != header_len {
+                return Err(Error::WriterFailure(
+                    "RAR 5 fragment header changed length when patched",
+                ));
+            }
+            body.seek_to(header_at)?;
             body.write_all(&header)?;
-            member.source.emit_range(
-                start,
-                fragment_len,
-                &mut CancellableIo {
-                    inner: body,
-                    progress: self.progress,
-                },
-                fragment_checksums,
-                self.resources,
-            )?;
+            body.seek_to(body.len())?;
 
             self.fragments_in_volume += 1;
             start += fragment_len;
@@ -1831,7 +1798,7 @@ impl VolumeWriter<'_> {
         {
             let mut tee = Tee {
                 output: &mut output,
-                mirror: mirror.as_mut(),
+                mirror: mirror.as_mut().map(|spool| spool as &mut dyn Write),
             };
             let main = match self.header_keys {
                 Some(keys) => encrypted_main_header_block(
@@ -2599,8 +2566,13 @@ mod emission_ledger_tests {
                 }
             }
         }
+        impl std::io::Seek for Volume {
+            fn seek(&mut self, _: std::io::SeekFrom) -> std::io::Result<u64> {
+                Err(std::io::Error::other("the RAR 5 writer does not seek"))
+            }
+        }
         impl super::super::VolumeSink for Sink {
-            fn start_volume(&mut self, _: u64) -> Result<Box<dyn Write + Send>> {
+            fn start_volume(&mut self, _: u64) -> Result<Box<dyn super::super::VolumeOutput>> {
                 if self.fail_start {
                     return Err(std::io::Error::other("injected volume start failure").into());
                 }
