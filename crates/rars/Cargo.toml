@@ -51,8 +51,8 @@ rayon = { workspace = true, optional = true }
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 getrandom = { workspace = true, optional = true, features = ["wasm_js"] }
 
-# Native filename tests distinguish EILSEQ from unrelated filesystem failures.
-[target.'cfg(unix)'.dev-dependencies]
+# In-place extraction opens without following links or waiting on FIFOs.
+[target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
 [dev-dependencies]

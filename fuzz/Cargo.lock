@@ -337,6 +337,7 @@ dependencies = [
  "crc32fast",
  "getrandom 0.4.3",
  "hmac",
+ "libc",
  "rayon",
  "sha1",
  "sha2",

@@ -241,3 +241,86 @@ fn case_aliases_are_refused_on_insensitive_filesystems_and_kept_on_sensitive_one
         );
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn in_place_overwrites_the_existing_file_itself() {
+    use std::os::unix::fs::MetadataExt;
+    let root = scratch::case("extraction-in-place-inode");
+    let archive = root.join("archive.rar");
+    write_archive(&archive, ArchiveVersion::Rar50, &[(b"file.txt", b"new")]);
+    let destination = root.join("out");
+    fs::create_dir(&destination).unwrap();
+    fs::write(destination.join("file.txt"), b"a longer old file").unwrap();
+    let inode = fs::metadata(destination.join("file.txt")).unwrap().ino();
+
+    let result = extract(&archive, &destination, &["--in-place"]);
+
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(fs::read(destination.join("file.txt")).unwrap(), b"new");
+    assert_eq!(
+        fs::metadata(destination.join("file.txt")).unwrap().ino(),
+        inode
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn in_place_needs_no_write_permission_on_the_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = scratch::case("extraction-in-place-readonly");
+    let archive = root.join("archive.rar");
+    write_archive(&archive, ArchiveVersion::Rar50, &[(b"file.txt", b"new")]);
+    let destination = root.join("out");
+    fs::create_dir(&destination).unwrap();
+    fs::write(destination.join("file.txt"), b"old").unwrap();
+    fs::set_permissions(&destination, fs::Permissions::from_mode(0o555)).unwrap();
+    if fs::write(destination.join("probe"), b"").is_ok() {
+        return; // Permissions don't bind root.
+    }
+
+    let staged = extract(&archive, &destination, &[]);
+    let in_place = extract(&archive, &destination, &["--in-place"]);
+    fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(!staged.status.success());
+    assert!(
+        in_place.status.success(),
+        "{}",
+        String::from_utf8_lossy(&in_place.stderr)
+    );
+    assert_eq!(fs::read(destination.join("file.txt")).unwrap(), b"new");
+}
+
+#[cfg(unix)]
+#[test]
+fn in_place_refuses_a_hard_link_or_fifo_at_the_destination() {
+    for kind in ["hard link", "fifo"] {
+        let root = scratch::case("extraction-in-place-refusal");
+        let archive = root.join("archive.rar");
+        write_archive(&archive, ArchiveVersion::Rar50, &[(b"file.txt", b"new")]);
+        let destination = root.join("out");
+        fs::create_dir(&destination).unwrap();
+        let outside = root.join("outside.txt");
+        fs::write(&outside, b"outside").unwrap();
+        let target = destination.join("file.txt");
+        if kind == "hard link" {
+            fs::hard_link(&outside, &target).unwrap();
+        } else {
+            assert!(Command::new("mkfifo")
+                .arg(&target)
+                .status()
+                .unwrap()
+                .success());
+        }
+
+        let result = extract(&archive, &destination, &["--in-place"]);
+
+        assert!(!result.status.success(), "{kind}");
+        assert_eq!(fs::read(&outside).unwrap(), b"outside");
+    }
+}

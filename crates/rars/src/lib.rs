@@ -61,6 +61,8 @@ mod member_read;
 pub use member_read::{read_volume_members_at, read_volume_members_at_with_options};
 mod output_limit;
 #[doc(hidden)]
+pub mod output_staging;
+#[doc(hidden)]
 pub mod output_times;
 mod parallel;
 mod parse_budget;

@@ -31,6 +31,7 @@ use password::{
     read_archive_path_prompting_with_options, resolve_password, Password,
 };
 use progress::CliProgress;
+use rars::output_staging::{failed_entry_name, refused_output};
 use rars::rar13::{
     self, FileEntry, StoredEntry as Rar13StoredEntry, WriterOptions as Rar13WriterOptions,
 };
@@ -123,17 +124,6 @@ fn retry_hint(error: &rars::Error) -> String {
     format!(
         "\nhint: retry with --rar50-buffered-decode-limit {required} if you trust this archive and have enough memory"
     )
-}
-
-/// The archive name of the entry an extraction error is attributed to.
-fn failed_entry_name(error: &rars::Error) -> Option<&[u8]> {
-    match error {
-        rars::Error::AtEntry { name, .. } => Some(name),
-        rars::Error::AtArchiveOffset { source, .. } | rars::Error::InVolume { source, .. } => {
-            failed_entry_name(source)
-        }
-        _ => None,
-    }
 }
 
 fn find_rar50_buffered_decode_limit_error(error: &rars::Error) -> Option<(u64, u64)> {
@@ -709,7 +699,12 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
         .first()
         .map(DetectedArchive::family)
         .ok_or("no archive parts provided")?;
-    let state = RefCell::new(ExtractOutputState::new(&out_dir, overwrite, family));
+    let state = RefCell::new(ExtractOutputState::new(
+        &out_dir,
+        overwrite,
+        args.in_place,
+        family,
+    ));
     let options = args
         .read_options
         .options(password_bytes(&password), scratch.as_ref());
@@ -761,6 +756,7 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
 struct ExtractOutputState<'a> {
     out_dir: &'a Path,
     overwrite: OverwritePolicy,
+    in_place: bool,
     family: rars::ArchiveFamily,
     legacy_name_encoding: Option<rars::filename::LegacyNameEncoding>,
     outputs: Vec<ExtractedOutput>,
@@ -781,10 +777,16 @@ struct ExtractOutputState<'a> {
 }
 
 impl<'a> ExtractOutputState<'a> {
-    fn new(out_dir: &'a Path, overwrite: OverwritePolicy, family: rars::ArchiveFamily) -> Self {
+    fn new(
+        out_dir: &'a Path,
+        overwrite: OverwritePolicy,
+        in_place: bool,
+        family: rars::ArchiveFamily,
+    ) -> Self {
         Self {
             out_dir,
             overwrite,
+            in_place,
             family,
             legacy_name_encoding: None,
             outputs: Vec::new(),
@@ -829,16 +831,13 @@ impl<'a> ExtractOutputState<'a> {
     fn open_entry(&mut self, meta: &rars::ExtractedEntryMeta) -> rars::Result<Box<dyn Write>> {
         self.publish_verified()?;
         let (name, relative) = self.entry_path(meta)?;
-        let destination = output::checked_output_path(self.out_dir, &relative)?;
+        let destination = output::checked_output_path(self.out_dir, &relative)
+            .map_err(|error| refused_output(error, &meta.name))?;
         self.reserve_output_path(destination.clone())?;
         self.remember_directory_time(&destination, meta)?;
         let staging = self.prepare_staged_path(&destination, meta.is_directory)?;
-        let (path, writer) = open_output_writer(
-            &staging,
-            &relative,
-            meta.is_directory,
-            OverwritePolicy::Never,
-        )?;
+        let (path, writer) =
+            open_output_writer(&staging, &relative, meta.is_directory, self.staged_policy())?;
         self.record_staged_path(&path, meta.is_directory)?;
         self.created_paths.insert(relative, path.clone());
         self.archive_names.push(meta.name.clone());
@@ -859,7 +858,8 @@ impl<'a> ExtractOutputState<'a> {
     ) -> rars::Result<()> {
         self.publish_verified()?;
         let (name, relative) = self.entry_path(meta)?;
-        let destination = output::checked_output_path(self.out_dir, &relative)?;
+        let destination = output::checked_output_path(self.out_dir, &relative)
+            .map_err(|error| refused_output(error, &meta.name))?;
         self.reserve_output_path(destination.clone())?;
         // Keep the existing RAR5 policy for all links: reject absolute paths,
         // parent components and drive prefixes. Native legacy targets are not
@@ -880,7 +880,7 @@ impl<'a> ExtractOutputState<'a> {
             &relative,
             &target,
             link,
-            OverwritePolicy::Never,
+            self.staged_policy(),
             &self.created_paths,
         )?;
         self.record_staged_path(&path, false)?;
@@ -924,6 +924,17 @@ impl<'a> ExtractOutputState<'a> {
                 std::io::Error::new(std::io::ErrorKind::AlreadyExists, "File exists").into(),
             );
         }
+        if self.in_place {
+            // A collision would otherwise overwrite an earlier member before any check.
+            if let Ok(identity) = fs::canonicalize(destination) {
+                if self.published_identities.contains(&identity) {
+                    return Err(rars::Error::InvalidHeader(
+                        "multiple archive entries map to the same output path",
+                    ));
+                }
+            }
+            return Ok(self.out_dir.to_path_buf());
+        }
         if self.staging.is_none() {
             self.staging = Some(ExtractionStaging::new(self.out_dir)?);
         }
@@ -953,6 +964,15 @@ impl<'a> ExtractOutputState<'a> {
             }
         }
         Ok(root.clone())
+    }
+
+    /// Staged outputs are always new files; in-place ones follow the caller's policy.
+    fn staged_policy(&self) -> OverwritePolicy {
+        if self.in_place {
+            self.overwrite
+        } else {
+            OverwritePolicy::Never
+        }
     }
 
     fn record_staged_path(&mut self, path: &Path, directory: bool) -> rars::Result<()> {
@@ -993,12 +1013,20 @@ impl<'a> ExtractOutputState<'a> {
         // Publish new inodes rather than truncating any existing hard-link target.
         while self.published < self.outputs.len() {
             let staged = self.staged_paths[self.published].clone();
+            if self.in_place {
+                // Checked and written at its destination when it was opened.
+                self.record_identity(&staged)?;
+                self.published += 1;
+                continue;
+            }
             let relative = self.outputs[self.published]
                 .path
                 .strip_prefix(self.out_dir)
                 .map_err(|_| rars::Error::InvalidHeader("unsafe archive path"))?
                 .to_path_buf();
-            let destination = output::checked_output_path(self.out_dir, &relative)?;
+            let name = &self.archive_names[self.published];
+            let destination = output::checked_output_path(self.out_dir, &relative)
+                .map_err(|error| refused_output(error, name))?;
             // The alias check resolves the destination already when it exists.
             let existing = match &self.staging {
                 Some(staging) => staging.reject_alias(&destination)?,
@@ -1015,7 +1043,8 @@ impl<'a> ExtractOutputState<'a> {
                 fs::create_dir_all(&destination)?;
             } else {
                 fs::create_dir_all(destination.parent().expect("validated path has parent"))?;
-                output::checked_output_path(self.out_dir, &relative)?;
+                output::checked_output_path(self.out_dir, &relative)
+                    .map_err(|error| refused_output(error, name))?;
                 if self.overwrite == OverwritePolicy::Always
                     && self.staged_redirections.contains(&staged)
                 {
@@ -1045,13 +1074,18 @@ impl<'a> ExtractOutputState<'a> {
             }
             self.published_paths
                 .insert(staged.clone(), destination.clone());
-            // Symlinks may be dangling; their destination entries were reserved above.
-            if let Ok(identity) = fs::canonicalize(&destination) {
-                if !fs::symlink_metadata(&destination)?.file_type().is_symlink() {
-                    self.published_identities.insert(identity);
-                }
-            }
+            self.record_identity(&destination)?;
             self.published += 1;
+        }
+        Ok(())
+    }
+
+    // Symlinks may be dangling; their destination entries were reserved on open.
+    fn record_identity(&mut self, destination: &Path) -> rars::Result<()> {
+        if let Ok(identity) = fs::canonicalize(destination) {
+            if !fs::symlink_metadata(destination)?.file_type().is_symlink() {
+                self.published_identities.insert(identity);
+            }
         }
         Ok(())
     }
@@ -2404,6 +2438,7 @@ mod tests {
         let state = std::cell::RefCell::new(super::ExtractOutputState::new(
             &root,
             super::OverwritePolicy::Never,
+            false,
             rars::ArchiveFamily::Rar50Plus,
         ));
         super::extract_volume_archives(
@@ -2430,6 +2465,7 @@ mod tests {
         let state = std::cell::RefCell::new(super::ExtractOutputState::new(
             &root,
             super::OverwritePolicy::Never,
+            false,
             rars::ArchiveFamily::Rar50Plus,
         ));
         assert!(super::extract_volume_archives(
@@ -2451,6 +2487,7 @@ mod tests {
         let state = std::cell::RefCell::new(super::ExtractOutputState::new(
             &root,
             super::OverwritePolicy::Never,
+            false,
             rars::ArchiveFamily::Rar15To40,
         ));
         let mut options = super::ArchiveReadOptions::with_optional_password(Some(b"test"));
@@ -2770,6 +2807,7 @@ mod tests {
         let mut state = super::ExtractOutputState::new(
             &root,
             super::OverwritePolicy::Always,
+            false,
             rars::ArchiveFamily::Rar50Plus,
         );
         state.reserve_output_path(file.clone()).unwrap();
