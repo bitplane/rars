@@ -58,7 +58,9 @@ jobs:
       # debug builds keep opt-level 0 for debugging and fast rebuilds.
       - name: Optimise the rars crates in test builds
         shell: bash
-        run: printf '[profile.dev.package.rars]\nopt-level = 1\n[profile.dev.package.rars-cli]\nopt-level = 1\n' >> "${CARGO_HOME:-$HOME/.cargo}/config.toml"
+        run: |
+          mkdir -p "${CARGO_HOME:-$HOME/.cargo}"
+          printf '[profile.dev.package.rars]\nopt-level = 1\n[profile.dev.package.rars-cli]\nopt-level = 1\n' >> "${CARGO_HOME:-$HOME/.cargo}/config.toml"
 
       # The workspace includes PyO3 tests that embed Python.
       - uses: actions/setup-python@v7
@@ -177,7 +179,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Optimise the rars crates in test builds
         shell: bash
-        run: printf '[profile.dev.package.rars]\nopt-level = 1\n[profile.dev.package.rars-cli]\nopt-level = 1\n' >> "${CARGO_HOME:-$HOME/.cargo}/config.toml"
+        run: |
+          mkdir -p "${CARGO_HOME:-$HOME/.cargo}"
+          printf '[profile.dev.package.rars]\nopt-level = 1\n[profile.dev.package.rars-cli]\nopt-level = 1\n' >> "${CARGO_HOME:-$HOME/.cargo}/config.toml"
       - name: Test the CLI on the native filesystem
         run: cargo test -p rars-cli --locked
 
@@ -285,7 +289,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Optimise the rars crates in test builds
         shell: bash
-        run: printf '[profile.dev.package.rars]\nopt-level = 1\n[profile.dev.package.rars-cli]\nopt-level = 1\n' >> "${CARGO_HOME:-$HOME/.cargo}/config.toml"
+        run: |
+          mkdir -p "${CARGO_HOME:-$HOME/.cargo}"
+          printf '[profile.dev.package.rars]\nopt-level = 1\n[profile.dev.package.rars-cli]\nopt-level = 1\n' >> "${CARGO_HOME:-$HOME/.cargo}/config.toml"
       - name: Test the library without workspace feature unification
         run: python3 scripts/check-unit-features.py --features '${{ matrix.features }}'
       - name: Check encoder memory bounds without workspace feature unification
