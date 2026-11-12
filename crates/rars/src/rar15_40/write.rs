@@ -2910,7 +2910,11 @@ fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
         let mut out = Vec::new();
         out.extend_from_slice(RAR15_SIGNATURE);
         write_main_header(&mut out, main_flags);
-        write_producer(&mut out, entry.target, None, Some(entry.progress))?;
+        // Later volumes put it after the data, so a split member's header comes
+        // first, as RAR writes it and python-rarfile reads it.
+        if index == 0 {
+            write_producer(&mut out, entry.target, None, Some(entry.progress))?;
+        }
         write_file_header_and_data(
             &mut out,
             FileRecord {
@@ -2938,6 +2942,9 @@ fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
         .map_err(|error| {
             crate::write_stream::member_error(error, entry.name, "writing volume member")
         })?;
+        if index > 0 {
+            write_producer(&mut out, entry.target, None, Some(entry.progress))?;
+        }
         if writes_end_block(entry.target) {
             out.extend_from_slice(&end_block(volume_end_flags(split_after)));
         }
@@ -2983,7 +2990,9 @@ fn write_header_encrypted_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<
         let mut out = Vec::new();
         out.extend_from_slice(RAR15_SIGNATURE);
         write_main_header(&mut out, main_flags);
-        write_producer(&mut out, entry.target, Some(password), Some(entry.progress))?;
+        if index == 0 {
+            write_producer(&mut out, entry.target, Some(password), Some(entry.progress))?;
+        }
         let mut header = Vec::new();
         write_file_header(
             &mut header,
@@ -3015,6 +3024,9 @@ fn write_header_encrypted_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<
             crate::write_stream::member_error(error, entry.name, "writing volume member")
         })?;
         out.extend_from_slice(chunk);
+        if index > 0 {
+            write_producer(&mut out, entry.target, Some(password), Some(entry.progress))?;
+        }
         write_encrypted_end_block(&mut out, volume_end_flags(split_after), password)?;
         Ok(out)
     };
