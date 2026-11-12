@@ -240,8 +240,7 @@ fn filtered_members_with_progress(
             if progress.as_mut().is_some_and(|report| !report(0)) {
                 return Err(Error::Cancelled);
             }
-            let filtered = filtered_member(&data, filter)?;
-            data[range.clone()].copy_from_slice(&filtered.data[range.clone()]);
+            let filtered = filter_in_place(&mut data, filter)?;
             group_records.push(OwnedVmFilterRecord {
                 block_start: filtered.block_start,
                 block_size: filtered.block_size,
@@ -447,16 +446,16 @@ fn rar29_filter(kind: crate::FilterKind) -> Result<Rar29Filter> {
 }
 
 struct FilteredMember {
-    data: Vec<u8>,
     block_start: usize,
     block_size: usize,
     init_regs: Vec<(usize, u32)>,
     code: &'static [u8],
 }
 
-fn filtered_member(input: &[u8], filter: &crate::FilterSpec) -> Result<FilteredMember> {
-    let range = checked_filter_range(input.len(), filter)?;
-    let mut filtered = input.to_vec();
+/// Filters only the record's own range: copying the whole member per record
+/// made a member split into many records quadratic.
+fn filter_in_place(filtered: &mut [u8], filter: &crate::FilterSpec) -> Result<FilteredMember> {
+    let range = checked_filter_range(filtered.len(), filter)?;
     let (init_regs, code): (Vec<(usize, u32)>, &'static [u8]) = match rar29_filter(filter.kind)? {
         Rar29Filter::E8 => {
             filters::e8e9_encode(&mut filtered[range.clone()], range.start as u32, false);
@@ -480,11 +479,8 @@ fn filtered_member(input: &[u8], filter: &crate::FilterSpec) -> Result<FilteredM
             (Vec::new(), RAR3_ITANIUM_FILTER_BYTECODE)
         }
         Rar29Filter::Rgb { width, pos_r } => {
-            filtered[range.clone()].copy_from_slice(&rgb_encode(
-                &input[range.clone()],
-                width,
-                pos_r,
-            )?);
+            let encoded = rgb_encode(&filtered[range.clone()], width, pos_r)?;
+            filtered[range.clone()].copy_from_slice(&encoded);
             let init_regs = if pos_r == 0 {
                 vec![(0, width as u32 + 3)]
             } else {
@@ -493,13 +489,12 @@ fn filtered_member(input: &[u8], filter: &crate::FilterSpec) -> Result<FilteredM
             (init_regs, RAR3_RGB_FILTER_BYTECODE)
         }
         Rar29Filter::Audio { channels } => {
-            filtered[range.clone()]
-                .copy_from_slice(&audio_encode(&input[range.clone()], channels)?);
+            let encoded = audio_encode(&filtered[range.clone()], channels)?;
+            filtered[range.clone()].copy_from_slice(&encoded);
             (vec![(0, channels as u32)], RAR3_AUDIO_FILTER_BYTECODE)
         }
     };
     Ok(FilteredMember {
-        data: filtered,
         block_start: range.start,
         block_size: range.end - range.start,
         init_regs,
