@@ -83,9 +83,7 @@ impl<const MIN_MATCH: usize> MatchFinder<MIN_MATCH> {
         Self::with_allowance(window, &Allowance::default()).expect("unlimited finder allocation")
     }
 
-    /// A finder with `2^hash_bits` heads. A window much wider than the default
-    /// table puts unrelated positions on every chain, and each one costs a
-    /// cache miss to reject.
+    /// More heads keep a long reach from crowding each chain with collisions.
     #[cfg(feature = "write")]
     pub(crate) fn with_hash_bits(window: usize, hash_bits: u32) -> Self {
         Self::build(window, hash_bits, &Allowance::default()).expect("unlimited finder allocation")
@@ -172,9 +170,7 @@ impl<const MIN_MATCH: usize, B: Budget> MatchFinder<MIN_MATCH, B> {
         resolve(self.newest, self.head[self.hash(input, pos)])
     }
 
-    /// The newest candidate older than `limit` sharing `pos`'s hash, for a
-    /// finder filled ahead of the parse: `pos` must already be inserted, and
-    /// positions from `limit` on are ones an in-order parse has not reached.
+    /// For a finder filled ahead: skips candidates an in-order parse at `limit` has not inserted.
     #[cfg(feature = "write")]
     pub(crate) fn first_before(&self, pos: usize, limit: usize) -> usize {
         let mut candidate = self.previous(pos);

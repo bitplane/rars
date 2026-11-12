@@ -4537,3 +4537,29 @@ fn block_parsed_members_code_to_the_serial_parse_bytes() {
     // four-byte key it replaced, which packed this member to 109,636 bytes.
     assert!(ppmd.len() <= 109_636, "{}", ppmd.len());
 }
+
+#[test]
+fn members_parsed_in_segments_code_to_the_serial_parse_bytes() {
+    let input = mixed_member(600 * 1024);
+    let options = EncodeOptions::new(64)
+        .with_lazy_matching(true)
+        .with_max_match_distance(16 * 1024)
+        .with_block_size(4096);
+
+    let plain = Unpack29Encoder::with_options(options)
+        .encode_member(&input)
+        .unwrap();
+    assert_eq!(super::unpack29_decode(&plain, input.len()).unwrap(), input);
+    let mut chain = Unpack29Encoder::with_options(options);
+    chain.encode_member(&input[..300 * 1024]).unwrap();
+    let continued = chain.encode_member(&input[300 * 1024..]).unwrap();
+    let one_thread = {
+        let _cap = crate::parallel::ThreadCap::set(Some(1));
+        Unpack29Encoder::with_options(options)
+            .encode_member(&input)
+            .unwrap()
+    };
+    assert_eq!(one_thread, plain);
+    assert_eq!(packed_fingerprint(&plain), (146_951, 4_071_059_742));
+    assert_eq!(packed_fingerprint(&continued), (73_398, 3_211_860_258));
+}

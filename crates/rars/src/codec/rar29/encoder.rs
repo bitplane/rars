@@ -44,16 +44,11 @@ const PPMD_CONTEXT_BREAK_BITS: f64 = 64.0;
 const PPMD_REJECT_SEARCH_COOLDOWN: usize = 8;
 
 type Rar29MatchFinder = match_finder::MatchFinder<4>;
-/// PPMd only takes a match of 32 bytes or more, so its chains key on all 32:
-/// keyed on four, text fills them with common words that never get that far.
+/// PPMd takes only 32-byte matches; a 4-byte key fills text chains with words that never get there.
 type PpmdMatchFinder = match_finder::MatchFinder<MIN_PPMD_MATCH_LENGTH>;
 
-/// Where a match search finds its candidates: a finder the parse fills as it
-/// goes, or one filled ahead that has to skip positions the parse has not
-/// reached yet.
+/// A finder filled as the parse goes, or ahead of it and skipping what the parse has not reached.
 trait Candidates {
-    /// The newest candidate for `pos` older than `limit`, the position up to
-    /// which an in-order parse would have inserted.
     fn first(&self, input: &[u8], pos: usize, limit: usize) -> usize;
     fn previous(&self, candidate: usize) -> usize;
     fn insert(&mut self, input: &[u8], pos: usize);
@@ -87,10 +82,7 @@ impl Candidates for FilledAhead<'_> {
     fn insert(&mut self, _input: &[u8], _pos: usize) {}
 }
 
-/// Sizes the hash table to how far a match reaches, up to 4 MiB of heads, so a
-/// long reach does not fill every chain with positions that only share a hash.
-/// The table follows the reach rather than the window, so a finder filled
-/// ahead offers the same candidates as one filled as the parse goes.
+/// Heads follow the reach, not the window, so filling ahead offers the same candidates.
 fn match_finder_for<const MIN_MATCH: usize>(
     window: usize,
     reach: usize,
@@ -505,8 +497,7 @@ struct FilteredMember {
     code: &'static [u8],
 }
 
-/// Filters only the record's own range: copying the whole member per record
-/// made a member split into many records quadratic.
+/// In place: copying the member per record made many-record members quadratic.
 fn filter_in_place(filtered: &mut [u8], filter: &crate::FilterSpec) -> Result<FilteredMember> {
     let range = checked_filter_range(filtered.len(), filter)?;
     let (init_regs, code): (Vec<(usize, u32)>, &'static [u8]) = match rar29_filter(filter.kind)? {
@@ -981,8 +972,6 @@ fn encode_member_blocks(
     Ok(out)
 }
 
-/// Parses `input` in blocks of `block_size` and hands each block's range and
-/// tokens to `code` in order.
 fn for_each_block(
     input: &[u8],
     history: &[u8],
@@ -992,26 +981,47 @@ fn for_each_block(
     mut code: impl FnMut(usize, usize, &[EncodeToken]) -> Result<()>,
 ) -> Result<()> {
     let block_size = block_size.max(1);
-    let combined = with_history(history, input, options);
-    let start = combined.len() - input.len();
-    let mut parser = LzParser::new(&combined, start, options, block_size);
+    let reach = options.max_match_distance.min(MAX_HISTORY);
+    let history = &history[history.len().saturating_sub(reach)..];
     let mut ends: Vec<usize> = (block_size..input.len()).step_by(block_size).collect();
     ends.push(input.len());
-    let per_batch = (parser.batch_bytes / block_size).max(1);
+    let per_batch = (LzParser::batch_bytes(block_size) / block_size).max(1);
+    // Segments bound what a parser holds, for one re-hashed reach each.
+    let per_segment = per_batch
+        * reach
+            .saturating_mul(4)
+            .div_ceil(per_batch * block_size)
+            .max(1);
     let mut block_start = 0;
-    for batch in ends.chunks(per_batch) {
-        if progress
-            .as_deref_mut()
-            .is_some_and(|report| !report(block_start))
-        {
-            return Err(Error::Cancelled);
-        }
-        let absolute: Vec<usize> = batch.iter().map(|&end| start + end).collect();
-        for (tokens, &end) in parser.parse_blocks(&absolute).iter().zip(batch) {
-            code(block_start, end, tokens)?;
-            block_start = end;
-            if progress.as_deref_mut().is_some_and(|report| !report(end)) {
+    for segment in ends.chunks(per_segment) {
+        let segment_end = *segment.last().expect("chunks are never empty");
+        let behind = reach.min(block_start);
+        let combined: std::borrow::Cow<'_, [u8]> = if behind == reach || history.is_empty() {
+            std::borrow::Cow::Borrowed(&input[block_start - behind..segment_end])
+        } else {
+            let carried = &history[history.len().saturating_sub(reach - behind)..];
+            let mut joined = Vec::with_capacity(carried.len() + segment_end - block_start + behind);
+            joined.extend_from_slice(carried);
+            joined.extend_from_slice(&input[block_start - behind..segment_end]);
+            std::borrow::Cow::Owned(joined)
+        };
+        let base = combined.len() - (segment_end - block_start);
+        let mut parser = LzParser::new(&combined, base, options, block_size);
+        let origin = block_start;
+        for batch in segment.chunks(per_batch) {
+            if progress
+                .as_deref_mut()
+                .is_some_and(|report| !report(block_start))
+            {
                 return Err(Error::Cancelled);
+            }
+            let local: Vec<usize> = batch.iter().map(|&end| base + end - origin).collect();
+            for (tokens, &end) in parser.parse_blocks(&local).iter().zip(batch) {
+                code(block_start, end, tokens)?;
+                block_start = end;
+                if progress.as_deref_mut().is_some_and(|report| !report(end)) {
+                    return Err(Error::Cancelled);
+                }
             }
         }
     }
@@ -1681,8 +1691,6 @@ fn encode_tokens_with_progress(
     )
 }
 
-/// The member with as much of the chain's history in front of it as a match
-/// can reach, borrowed when there is no history to prepend.
 fn with_history<'a>(
     history: &[u8],
     input: &'a [u8],
@@ -1698,14 +1706,7 @@ fn with_history<'a>(
     std::borrow::Cow::Owned(combined)
 }
 
-/// Parses a member's blocks several at a time, one block per thread.
-///
-/// A block's parse depends only on the bytes before it, since every block
-/// starts with no repeat offsets, so blocks can be parsed in any order. The
-/// finder is filled serially one batch ahead, which is cheap next to the
-/// search, and each block reads it as an in-order parse would have seen it.
-/// The window holds the batch on top of the match distance, so filling a batch
-/// only overwrites links no block in it can reach.
+/// Blocks start with no repeat offsets, so a batch parses in parallel against a finder filled ahead.
 struct LzParser<'a> {
     data: &'a [u8],
     filled: usize,
@@ -1715,12 +1716,17 @@ struct LzParser<'a> {
 }
 
 impl<'a> LzParser<'a> {
-    /// `data[..start]` is history the member can match against.
+    /// Two blocks per thread, up to 16 threads, so the window stays bounded.
+    fn batch_bytes(block_size: usize) -> usize {
+        block_size
+            .saturating_mul(crate::parallel::threads().min(16) * 2)
+            .max(block_size)
+    }
+
     fn new(data: &'a [u8], start: usize, options: EncodeOptions, block_size: usize) -> Self {
         let reach = options.max_match_distance.min(MAX_HISTORY);
-        let batch_bytes = block_size
-            .saturating_mul(crate::parallel::threads().saturating_mul(2))
-            .max(block_size);
+        let batch_bytes = Self::batch_bytes(block_size);
+        // Reach plus a batch, so filling a batch only overwrites links nothing in it can reach.
         let mut finder = match_finder_for(reach.saturating_add(batch_bytes), reach);
         for history_pos in 0..start {
             finder.insert(data, history_pos);
@@ -1734,8 +1740,7 @@ impl<'a> LzParser<'a> {
         }
     }
 
-    /// Parses consecutive blocks starting where the last call ended; `ends`
-    /// must not reach further than one batch.
+    /// `ends` must stay within one batch of where the last call ended.
     fn parse_blocks(&mut self, ends: &[usize]) -> Vec<Vec<EncodeToken>> {
         let Some(&last) = ends.last() else {
             return Vec::new();
@@ -1766,8 +1771,7 @@ impl<'a> LzParser<'a> {
     }
 }
 
-/// Parses `data[start..end]` into tokens; no match crosses `end`, so a block
-/// covers exactly the bytes it was given.
+/// No match crosses `end`, so a block covers exactly the bytes it was given.
 fn parse_range<C: Candidates>(
     data: &[u8],
     start: usize,
