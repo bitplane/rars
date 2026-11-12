@@ -6,9 +6,11 @@ use pyo3::prelude::*;
 use pyo3::types::{PyByteArray, PyBytes, PyList, PyModule, PyString};
 use pyo3::{create_exception, PyErr};
 use rars_rs::filename::relative_path as output_relative_path;
+use rars_rs::output_links::{create_link_output, link_source_path};
 use rars_rs::output_staging::{
     failed_entry_name, publish_verified_output, refused_output, ExtractionStaging, OverwritePolicy,
 };
+use rars_rs::ExtractedLink;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
@@ -26,6 +28,7 @@ create_exception!(rars, BadPassword, BadRarFile);
 create_exception!(rars, PasswordRequired, BadRarFile);
 create_exception!(rars, UnsupportedRarFeature, Error);
 create_exception!(rars, UnsafeArchivePath, Error);
+create_exception!(rars, UnsafeLinkWarning, pyo3::exceptions::PyUserWarning);
 
 #[pyclass(frozen, module = "rars")]
 #[derive(Debug, Clone)]
@@ -621,7 +624,7 @@ impl RarFile {
         let target = self.resolve_index(member)?;
         let out_dir = path.unwrap_or_else(|| PathBuf::from("."));
         let password = py_password(pwd)?.or_else(|| self.password.clone());
-        let written = py
+        let extracted = py
             .detach(|| {
                 extract_archive(
                     &self.archive,
@@ -636,7 +639,8 @@ impl RarFile {
                 )
             })
             .map_err(map_error)?;
-        written
+        extracted
+            .warn(py)?
             .into_iter()
             .next()
             .ok_or_else(|| PyKeyError::new_err("member has no extractable payload"))
@@ -655,7 +659,8 @@ impl RarFile {
     /// place once verified. `in_place=True` writes the destination itself
     /// instead: an existing file keeps its identity and metadata, and the
     /// directory needn't be writable, but a member that fails verification
-    /// leaves a partly written file. Links and special files are still refused.
+    /// leaves a partly written file. An existing link or special file at a
+    /// destination is still refused.
     #[pyo3(signature = (path = None, members = None, pwd = None, overwrite = false, *, options = None, volumes = None, restore_times = true, in_place = false))]
     #[allow(clippy::too_many_arguments)]
     fn extractall(
@@ -686,17 +691,24 @@ impl RarFile {
             let password = py_password(pwd)?.or_else(|| self.password.clone());
             let options = self.extraction_options(options, password.as_deref());
             let first = &self.archive;
-            return self.extract_set(py, volumes, options, |volumes| {
-                let outputs = std::cell::RefCell::new(ExtractOutputs::new(
-                    &out_dir,
-                    first.family(),
-                    options,
-                    mode,
-                ));
-                let result = first
-                    .extract_with_volumes(volumes, options, |meta| outputs.borrow_mut().open(meta));
-                outputs.into_inner().finish(result)
-            });
+            return self
+                .extract_set(py, volumes, options, |volumes| {
+                    let outputs = std::cell::RefCell::new(ExtractOutputs::new(
+                        &out_dir,
+                        first.family(),
+                        options,
+                        mode,
+                    ));
+                    let result = rars_rs::output_links::extract_arriving_with_links(
+                        first,
+                        volumes,
+                        options,
+                        |meta| outputs.borrow_mut().open(meta),
+                        |meta, link| outputs.borrow_mut().link(meta, link),
+                    );
+                    outputs.into_inner().finish(result)
+                })?
+                .warn(py);
         }
         let selected = match members {
             Some(members) => Some(
@@ -717,7 +729,8 @@ impl RarFile {
                 mode,
             )
         })
-        .map_err(map_error)
+        .map_err(map_error)?
+        .warn(py)
     }
 
     /// `volumes` works as in `extractall`.
@@ -1982,6 +1995,7 @@ fn rars(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         py.get_type::<UnsupportedRarFeature>(),
     )?;
     m.add("UnsafeArchivePath", py.get_type::<UnsafeArchivePath>())?;
+    m.add("UnsafeLinkWarning", py.get_type::<UnsafeLinkWarning>())?;
     for version in [
         "rar13", "rar14", "rar15", "rar20", "rar29", "rar30", "rar40", "rar50", "rar70",
     ] {
@@ -2129,6 +2143,9 @@ struct ExtractOutputs<'a> {
     staged: usize,
     pending: Option<PendingOutput>,
     published: Vec<PathBuf>,
+    /// Where each output went, by its path relative to `out_dir`, for hard links and copies.
+    created: HashMap<PathBuf, PathBuf>,
+    skipped_links: Vec<SkippedLink>,
 }
 
 struct PendingOutput {
@@ -2136,6 +2153,51 @@ struct PendingOutput {
     staged: Option<PathBuf>,
     destination: PathBuf,
     meta: rars_rs::ExtractedEntryMeta,
+    /// A legacy symlink's target, buffered until verified.
+    link_target: Option<Arc<Mutex<Vec<u8>>>>,
+}
+
+struct SkippedLink {
+    name: Vec<u8>,
+    target: Vec<u8>,
+}
+
+struct Extracted {
+    paths: Vec<PathBuf>,
+    skipped_links: Vec<SkippedLink>,
+}
+
+impl Extracted {
+    /// Raises nothing unless the warnings filter turns a skipped link into an error.
+    fn warn(self, py: Python<'_>) -> PyResult<Vec<PathBuf>> {
+        for link in &self.skipped_links {
+            let message = format!(
+                "skipped link '{}' -> '{}': it would point outside the output directory",
+                String::from_utf8_lossy(&link.name),
+                String::from_utf8_lossy(&link.target)
+            );
+            let message = std::ffi::CString::new(message.replace('\0', "\\0"))
+                .expect("NUL bytes were escaped");
+            PyErr::warn(py, py.get_type::<UnsafeLinkWarning>().as_any(), &message, 1)?;
+        }
+        Ok(self.paths)
+    }
+}
+
+struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
+
+impl Write for SharedBuffer {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .expect("link target lock poisoned")
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl<'a> ExtractOutputs<'a> {
@@ -2162,6 +2224,8 @@ impl<'a> ExtractOutputs<'a> {
             staged: 0,
             pending: None,
             published: Vec::new(),
+            created: HashMap::new(),
+            skipped_links: Vec::new(),
         }
     }
 
@@ -2187,7 +2251,7 @@ impl<'a> ExtractOutputs<'a> {
         }
         if meta.is_directory {
             fs::create_dir_all(&destination)?;
-            self.record_published(destination, meta);
+            self.record_published(destination, meta, true);
             return Ok(Box::new(io::sink()));
         }
         if self.overwrite == OverwritePolicy::Never && fs::symlink_metadata(&destination).is_ok() {
@@ -2206,6 +2270,7 @@ impl<'a> ExtractOutputs<'a> {
                 staged: None,
                 destination,
                 meta: meta.clone(),
+                link_target: None,
             });
             return Ok(Box::new(file));
         }
@@ -2226,6 +2291,7 @@ impl<'a> ExtractOutputs<'a> {
             staged: Some(staged),
             destination,
             meta: meta.clone(),
+            link_target: None,
         });
         Ok(Box::new(file))
     }
@@ -2234,8 +2300,23 @@ impl<'a> ExtractOutputs<'a> {
         let Some(pending) = self.pending.take() else {
             return Ok(());
         };
+        if let Some(target) = pending.link_target {
+            let target = std::mem::take(&mut *target.lock().expect("link target lock poisoned"));
+            rars_rs::output_links::check_legacy_symlink_target(
+                &pending.meta.name,
+                target.len() as u64,
+                Some(&target),
+            )?;
+            return self.link(
+                &pending.meta,
+                ExtractedLink::Symlink {
+                    target: &target,
+                    directory: false,
+                },
+            );
+        }
         let Some(staged) = &pending.staged else {
-            self.record_published(pending.destination, &pending.meta);
+            self.record_published(pending.destination, &pending.meta, true);
             return Ok(());
         };
         fs::create_dir_all(
@@ -2247,20 +2328,121 @@ impl<'a> ExtractOutputs<'a> {
         // Creating the parents may have raced a symlink into place.
         let destination = self.destination(&pending.meta)?;
         publish_verified_output(staged, &destination, self.overwrite, None)?;
-        self.record_published(destination, &pending.meta);
+        self.record_published(destination, &pending.meta, true);
         Ok(())
     }
 
-    fn record_published(&mut self, path: PathBuf, meta: &rars_rs::ExtractedEntryMeta) {
-        if let Some(times) = &mut self.times {
+    /// Buffers a legacy symlink's target; the link is made once the target is verified.
+    fn open_legacy_link(
+        &mut self,
+        meta: &rars_rs::ExtractedEntryMeta,
+    ) -> rars_rs::Result<Box<dyn Write>> {
+        self.publish_pending()?;
+        let target = Arc::new(Mutex::new(Vec::new()));
+        self.pending = Some(PendingOutput {
+            staged: None,
+            destination: PathBuf::new(),
+            meta: meta.clone(),
+            link_target: Some(Arc::clone(&target)),
+        });
+        Ok(Box::new(SharedBuffer(target)))
+    }
+
+    fn link(
+        &mut self,
+        meta: &rars_rs::ExtractedEntryMeta,
+        link: ExtractedLink<'_>,
+    ) -> rars_rs::Result<()> {
+        self.publish_pending()?;
+        let destination = self.destination(meta)?;
+        let relative = destination
+            .strip_prefix(self.out_dir)
+            .expect("checked output path is under the output directory")
+            .to_path_buf();
+        let Some(target) =
+            rars_rs::output_links::link_target(self.out_dir, &relative, meta, link, self.family)?
+        else {
+            self.skipped_links.push(SkippedLink {
+                name: meta.name.clone(),
+                target: link.target().to_vec(),
+            });
+            return Ok(());
+        };
+        if self.encoding.is_some() && self.published.contains(&destination) {
+            return Err(rars_rs::Error::InvalidArgument(
+                "multiple entries map to the same decoded output path",
+            ));
+        }
+        if self.in_place {
+            let (path, file) = create_link_output(
+                self.out_dir,
+                &relative,
+                &target,
+                link,
+                self.overwrite,
+                &self.created,
+            )?;
+            self.record_published(path, meta, file);
+            return Ok(());
+        }
+        if self.overwrite == OverwritePolicy::Never && fs::symlink_metadata(&destination).is_ok() {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "File exists").into());
+        }
+        let staging = match &mut self.staging {
+            Some(staging) => staging,
+            None => self.staging.insert(ExtractionStaging::new(self.out_dir)?),
+        };
+        let (staged, file) = create_link_output(
+            &staging.root,
+            Path::new(&self.staged.to_string()),
+            &target,
+            link,
+            OverwritePolicy::Never,
+            &self.created,
+        )?;
+        self.staged += 1;
+        let source = match link {
+            ExtractedLink::HardLink { .. } => {
+                Some(link_source_path(&target, &self.created)?.to_path_buf())
+            }
+            _ => None,
+        };
+        fs::create_dir_all(
+            destination
+                .parent()
+                .expect("checked output path has a file name"),
+        )?;
+        // Creating the parents may have raced a symlink into place.
+        let destination = self.destination(meta)?;
+        if self.overwrite == OverwritePolicy::Always
+            && fs::symlink_metadata(&destination).is_ok_and(|metadata| metadata.is_dir())
+        {
+            fs::remove_dir(&destination)?;
+        }
+        publish_verified_output(&staged, &destination, self.overwrite, source.as_deref())?;
+        self.record_published(destination, meta, file);
+        Ok(())
+    }
+
+    /// Symlinks keep their own times: setting them would follow the link.
+    fn record_published(
+        &mut self,
+        path: PathBuf,
+        meta: &rars_rs::ExtractedEntryMeta,
+        restore_times: bool,
+    ) {
+        if let (Some(times), true) = (&mut self.times, restore_times) {
             times.opened(path.clone(), self.family, meta);
             times.finish();
+        }
+        if let Ok(relative) = path.strip_prefix(self.out_dir) {
+            self.created.insert(relative.to_path_buf(), path.clone());
         }
         self.published.push(path);
     }
 
     /// A member still in flight when extraction failed never reaches its destination.
-    fn finish(mut self, result: rars_rs::Result<()>) -> rars_rs::Result<Vec<PathBuf>> {
+    fn finish(mut self, result: rars_rs::Result<()>) -> rars_rs::Result<Extracted> {
         let published = match result {
             Ok(()) => self.publish_pending(),
             Err(error) => {
@@ -2281,7 +2463,10 @@ impl<'a> ExtractOutputs<'a> {
         };
         published?;
         restored?;
-        Ok(std::mem::take(&mut self.published))
+        Ok(Extracted {
+            paths: std::mem::take(&mut self.published),
+            skipped_links: std::mem::take(&mut self.skipped_links),
+        })
     }
 }
 
@@ -2291,7 +2476,7 @@ fn extract_archive<S: Selection>(
     out_dir: &Path,
     options: rars_rs::ArchiveReadOptions<'_>,
     mode: OutputMode,
-) -> rars_rs::Result<Vec<PathBuf>> {
+) -> rars_rs::Result<Extracted> {
     if options
         .cancellation
         .is_some_and(rars_rs::ReadCancellation::is_cancelled)
@@ -2315,16 +2500,24 @@ fn extract_selected<S: Selection>(
     outputs: &std::cell::RefCell<ExtractOutputs<'_>>,
 ) -> rars_rs::Result<()> {
     let Some(selected) = selected else {
-        return archive.extract_to_parallel_buffered_with_options(options, |meta| {
-            outputs.borrow_mut().open(meta)
-        });
+        // RAR 5 decodes members in parallel only where there are no links to create.
+        if archive.family() == rars_rs::ArchiveFamily::Rar50Plus
+            && !archive.member_refs().any(|member| member.is_redirection())
+        {
+            return archive.extract_to_parallel_buffered_with_options(options, |meta| {
+                outputs.borrow_mut().open(meta)
+            });
+        }
+        return archive.extract_with_links(
+            options,
+            |meta| outputs.borrow_mut().open(meta),
+            |meta, link| outputs.borrow_mut().link(meta, link),
+        );
     };
     let last = archive
         .member_refs()
         .enumerate()
-        .filter(|(index, member)| {
-            !member.is_redirection() && selected.contains_member(*index, member.name_bytes())
-        })
+        .filter(|(index, member)| selected.contains_member(*index, member.name_bytes()))
         .map(|(index, _)| index)
         .last();
     let Some(last) = last else {
@@ -2341,31 +2534,58 @@ fn extract_selected<S: Selection>(
             return Ok(rars_rs::ExtractionDecision::Stop);
         }
         let meta = &member.meta;
+        let chosen = selected.contains_member(current, &meta.name);
         if meta.is_redirection {
+            if chosen {
+                if let rars_rs::ArchiveMemberDetail::Rar50Plus {
+                    redirection: Some(redirection),
+                    ..
+                } = &member.detail
+                {
+                    let link = rars_rs::output_links::rar50_link(redirection)?;
+                    outputs.borrow_mut().link(&extracted_meta(member), link)?;
+                }
+            }
             return Ok(rars_rs::ExtractionDecision::Skip);
         }
-        if !selected.contains_member(current, &meta.name) {
+        if !chosen {
             return Ok(if solid && !meta.is_directory {
                 rars_rs::ExtractionDecision::Extract(Box::new(io::sink()))
             } else {
                 rars_rs::ExtractionDecision::Skip
             });
         }
-        let unicode = member.name_is_unicode();
-        let mut meta = rars_rs::ExtractedEntryMeta::new(
-            meta.name.clone(),
-            meta.file_time,
-            meta.file_attr,
-            meta.is_directory,
-        )
-        .with_attr_source(meta.attr_source())
-        .with_mtime_refinement(meta.mtime_refinement);
-        meta.name_is_unicode = unicode;
+        if rars_rs::output_links::is_legacy_symlink_member(meta) {
+            rars_rs::output_links::check_legacy_symlink_target(
+                &meta.name,
+                meta.unpacked_size,
+                None,
+            )?;
+            return Ok(rars_rs::ExtractionDecision::Extract(
+                outputs
+                    .borrow_mut()
+                    .open_legacy_link(&extracted_meta(member))?,
+            ));
+        }
         Ok(rars_rs::ExtractionDecision::Extract(
-            outputs.borrow_mut().open(&meta)?,
+            outputs.borrow_mut().open(&extracted_meta(member))?,
         ))
     })?;
     Ok(())
+}
+
+fn extracted_meta(member: &rars_rs::ArchiveMember) -> rars_rs::ExtractedEntryMeta {
+    let meta = &member.meta;
+    let mut extracted = rars_rs::ExtractedEntryMeta::new(
+        meta.name.clone(),
+        meta.file_time,
+        meta.file_attr,
+        meta.is_directory,
+    )
+    .with_attr_source(meta.attr_source())
+    .with_mtime_refinement(meta.mtime_refinement);
+    extracted.name_is_unicode = member.name_is_unicode();
+    extracted
 }
 
 /// Runs `run` without the GIL over the volumes `next` gives; an exception `next` raises wins over `run`'s error.
@@ -2541,13 +2761,11 @@ fn checked_output_path(
     // backslash traversal) before applying host-aware destination conversion.
     rars_rs::validate_entry_name(meta.name.clone())?;
     let rar50 = family == rars_rs::ArchiveFamily::Rar50Plus;
-    let name = if rar50 && cfg!(unix) && meta.attr_source == rars_rs::AttrSource::Unix {
-        rars_rs::filename::decode_rar50(&meta.name).into_owned()
-    } else if rar50 {
-        meta.name
-            .iter()
-            .map(|&b| if b == b'\\' { b'_' } else { b })
-            .collect()
+    let name = if rar50 {
+        rars_rs::output_links::rar50_native_name(
+            &meta.name,
+            meta.attr_source == rars_rs::AttrSource::Unix,
+        )
     } else {
         rars_rs::filename::decoded_name(&meta.name, meta.name_is_unicode, encoding)?.into_owned()
     };
@@ -2944,7 +3162,8 @@ mod tests {
                     restore_times: true,
                 },
             )
-            .unwrap();
+            .unwrap()
+            .paths;
             assert_eq!(paths, vec![directory.join("first")]);
             assert_eq!(fs::read(&paths[0]).unwrap(), first.repeat(100));
             let error = extract_archive(
@@ -2958,6 +3177,7 @@ mod tests {
                     restore_times: true,
                 },
             )
+            .map(|extracted| extracted.paths)
             .unwrap_err();
             assert_eq!(error.kind(), rars_rs::ErrorKind::PasswordRequired);
             assert!(!directory.join("last").exists());
@@ -2972,7 +3192,8 @@ mod tests {
                     restore_times: true,
                 },
             )
-            .unwrap();
+            .unwrap()
+            .paths;
             assert_eq!(paths, vec![directory.join("last")]);
             assert_eq!(fs::read(&paths[0]).unwrap(), last.repeat(100));
         }

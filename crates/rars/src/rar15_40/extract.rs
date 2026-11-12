@@ -306,14 +306,15 @@ pub(crate) fn extract_from_feed<F>(
     feed: &mut VolumeFeed<'_, '_, Archive>,
     options: crate::ArchiveReadOptions<'_>,
     open: F,
+    links: Option<&mut LegacyLink<'_>>,
 ) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
 {
     if let Some(limit) = options.max_reader_workspace_bytes {
-        return volumes::extract(feed, options, open, None, &Allowance::limited(limit));
+        return volumes::extract(feed, options, open, links, &Allowance::limited(limit));
     }
-    volumes::extract(feed, options, open, None, &Allowance::default())
+    volumes::extract(feed, options, open, links, &Allowance::default())
 }
 
 #[cfg(feature = "encryption")]

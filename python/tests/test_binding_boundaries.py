@@ -1,4 +1,5 @@
 """Small public API regressions for binding-only behavior."""
+import os
 from pathlib import Path
 
 import pytest
@@ -272,14 +273,18 @@ def test_modern_dos_backslash_name_uses_portable_destination(tmp_path):
     assert (tmp_path / "one_two.txt").read_bytes() == b"owned\n"
 
 
-def test_selected_extraction_skips_redirection_before_later_file(tmp_path):
+def test_selected_extraction_creates_only_selected_redirections(tmp_path):
     builder = rars.RarBuilder(store=True)
     builder.add_unix_symlink("link", "target")
     builder.add_bytes(b"payload", "selected")
     archive = rars.RarFile.from_bytes(builder.to_bytes())
-    archive.extractall(tmp_path, members=["selected"])
-    assert not (tmp_path / "link").exists()
-    assert (tmp_path / "selected").read_bytes() == b"payload"
+    archive.extractall(tmp_path / "file", members=["selected"])
+    assert not os.path.lexists(tmp_path / "file" / "link")
+    assert (tmp_path / "file" / "selected").read_bytes() == b"payload"
+    if os.name != "nt":
+        archive.extractall(tmp_path / "link", members=["link"])
+        assert os.readlink(tmp_path / "link" / "link") == "target"
+        assert not (tmp_path / "link" / "selected").exists()
 
 
 def test_explicit_none_password_and_comment_arguments_remain_optional():
