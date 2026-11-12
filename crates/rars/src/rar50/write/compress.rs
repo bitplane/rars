@@ -234,7 +234,7 @@ impl<B: Budget> BlockJob<B> {
     }
 }
 
-fn run_size(plan: &CompressPlan) -> usize {
+pub(super) fn run_size(plan: &CompressPlan) -> usize {
     plan.encode_options
         .max_match_distance
         .max(crate::codec::rar50::MAX_LZ_BLOCK_SIZE)

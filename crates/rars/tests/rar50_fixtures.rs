@@ -5899,17 +5899,34 @@ fn streaming_solid_archives_round_trip() {
 
 #[test]
 fn streaming_solid_chains_history_across_block_and_member_boundaries() {
-    // Members larger than the 1 MiB block size, so the dictionary has to carry
-    // both from block to block and from member to member.
-    let entries: Vec<_> = (0..3u8)
-        .map(|index| {
-            let mut data: Vec<u8> = (0..1_600_000u32)
-                .map(|offset| (offset.wrapping_mul(2_654_435_761) >> 24) as u8)
-                .collect();
-            data[0] = index;
+    // Two 64 KiB chunks of noise over disjoint alphabets, so every chunk cuts a
+    // block and only history can shrink a repeat of either.
+    const CHUNK: usize = 64 * 1024;
+    let noise = |seed: u64, high: u8| {
+        let mut state = seed;
+        (0..CHUNK)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                high | (state >> 57) as u8
+            })
+            .collect::<Vec<u8>>()
+    };
+    let a = noise(0x9e37_79b9_7f4a_7c15, 0);
+    let b = noise(0xd1b5_4a32_d192_ed03, 0x80);
+    let members = [
+        [&a[..], &b, &a].concat(),
+        [&b[..], &a].concat(),
+        [&a[..], &b].concat(),
+    ];
+    let entries: Vec<_> = members
+        .iter()
+        .enumerate()
+        .map(|(index, data)| {
             rar50::ArchiveEntry::new(
                 format!("big-{index}.bin").into_bytes(),
-                rars::EntrySource::from_bytes(std::sync::Arc::<[u8]>::from(data)),
+                rars::EntrySource::from_bytes(std::sync::Arc::<[u8]>::from(&data[..])),
             )
             .with_attributes(0x20)
         })
@@ -5917,18 +5934,39 @@ fn streaming_solid_chains_history_across_block_and_member_boundaries() {
 
     let archive_bytes = write_streaming(&entries, true);
     let archive = Archive::parse(&archive_bytes).unwrap();
-    let extracted = collect_extract(&archive).unwrap();
+    let packed: Vec<&[u8]> = archive
+        .files()
+        .map(|file| &archive_bytes[file.block.data_range.clone()])
+        .collect();
+    for (index, member) in packed.iter().enumerate() {
+        let mut rest = *member;
+        let mut blocks = 0;
+        while !rest.is_empty() {
+            rest = &rest[parse_compressed_block(rest).unwrap().payload.end..];
+            blocks += 1;
+        }
+        assert!(blocks > 1, "member {index} is a single block");
+    }
+    // The first member's third chunk repeats its first across two blocks, and
+    // the later members repeat the first member, so only two chunks of noise
+    // should need literals.
+    assert!(
+        packed[0].len() < 2 * CHUNK * 15 / 16,
+        "member 0 packed to {} bytes, so its repeat missed the earlier block",
+        packed[0].len()
+    );
+    for (index, member) in packed.iter().enumerate().skip(1) {
+        assert!(
+            member.len() < CHUNK / 8,
+            "member {index} packed to {} bytes, so it missed the earlier member",
+            member.len()
+        );
+    }
 
+    let extracted = collect_extract(&archive).unwrap();
     assert_eq!(extracted.len(), 3);
     for (index, entry) in extracted.iter().enumerate() {
-        let mut expected = Vec::new();
-        entries[index]
-            .source
-            .open()
-            .unwrap()
-            .read_to_end(&mut expected)
-            .unwrap();
-        assert_eq!(entry.data, expected, "member {index} did not survive");
+        assert_eq!(entry.data, members[index], "member {index} did not survive");
     }
 
     if let Some(output) = reference_test_archive("solid-multiblock", &archive_bytes) {
