@@ -1,5 +1,5 @@
 use crate::filename::{native_str, relative_path};
-use crate::output_staging::{create_symlink, OverwritePolicy};
+use crate::output_staging::{claim_free_name, create_symlink, OverwritePolicy};
 use crate::{ArchiveFamily, Error, ExtractedLink, Result};
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -73,6 +73,7 @@ pub fn link_target(
     meta: &crate::ExtractedEntryMeta,
     link: ExtractedLink<'_>,
     family: ArchiveFamily,
+    flat: bool,
 ) -> Result<Option<PathBuf>> {
     let unix_host = meta.attr_source == crate::AttrSource::Unix;
     match link {
@@ -82,9 +83,35 @@ pub fn link_target(
                 .map(Some)
                 .map_err(|_| Error::InvalidHeader("unsafe archive redirection target"))
         }
+        ExtractedLink::Symlink { target, .. } | ExtractedLink::Junction { target } if flat => {
+            Ok(flat_target(target, family, unix_host))
+        }
         ExtractedLink::Symlink { target, .. } | ExtractedLink::Junction { target } => Ok(
             safe_symlink_target(root, relative, target, family, unix_host)?,
         ),
+    }
+}
+
+/// Flat output has no directories, so only a symlink to a bare name still means what it did.
+fn flat_target(target: &[u8], family: ArchiveFamily, unix_host: bool) -> Option<PathBuf> {
+    // Other hosts' RAR5 backslashes were separators, though the native name turns them into `_`.
+    if family == ArchiveFamily::Rar50Plus && !unix_host && target.contains(&b'\\') {
+        return None;
+    }
+    let target = native_target(target, family, unix_host);
+    if target.contains(&0)
+        || target
+            .iter()
+            .any(|&byte| std::path::is_separator(byte.into()))
+        || (target.len() >= 2 && target[0].is_ascii_alphabetic() && target[1] == b':')
+    {
+        return None;
+    }
+    let path = Path::new(native_str(&target).ok()?);
+    let mut components = path.components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(name)), None) => Some(PathBuf::from(name)),
+        _ => None,
     }
 }
 
@@ -233,24 +260,31 @@ pub fn create_link_output(
     )?;
     out_path = checked(out_dir)?;
     prepare_link_destination(&out_path, overwrite)?;
-    match link {
+    // Each refuses an existing destination, so `Rename` can claim a free name.
+    let create = |out_path: &Path| match link {
         ExtractedLink::Symlink { directory, .. } => {
-            create_symlink(target, &out_path, directory)?;
-            Ok((out_path, false))
+            create_symlink(target, out_path, directory).map(|()| false)
         }
-        ExtractedLink::Junction { .. } => {
-            create_symlink(target, &out_path, true)?;
-            Ok((out_path, false))
-        }
+        ExtractedLink::Junction { .. } => create_symlink(target, out_path, true).map(|()| false),
         ExtractedLink::HardLink { .. } => {
-            fs::hard_link(source.expect("source checked above"), &out_path)?;
-            Ok((out_path, true))
+            fs::hard_link(source.expect("source checked above"), out_path).map(|()| true)
         }
         ExtractedLink::FileCopy { .. } => {
-            fs::copy(source.expect("source checked above"), &out_path)?;
-            Ok((out_path, true))
+            // Open the source first, so a vanished one leaves no empty destination.
+            let mut input = fs::File::open(source.expect("source checked above"))?;
+            let mut output = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(out_path)?;
+            std::io::copy(&mut input, &mut output)?;
+            Ok(true)
         }
+    };
+    if overwrite == OverwritePolicy::Rename {
+        return claim_free_name(&out_path, create);
     }
+    let file = create(&out_path)?;
+    Ok((out_path, file))
 }
 
 pub fn link_source_path<'a>(
@@ -272,6 +306,7 @@ fn prepare_link_destination(path: &Path, overwrite: OverwritePolicy) -> std::io:
                 std::io::ErrorKind::AlreadyExists,
                 "file exists",
             )),
+            OverwritePolicy::Rename => Ok(()),
             OverwritePolicy::Always => {
                 if metadata.is_dir() {
                     fs::remove_dir(path)
@@ -300,6 +335,35 @@ mod tests {
             true,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn flat_extraction_keeps_only_bare_targets() {
+        let flat = |target: &[u8], unix_host: bool| {
+            flat_target(target, ArchiveFamily::Rar50Plus, unix_host)
+        };
+        assert_eq!(flat(b"local.txt", true), Some(PathBuf::from("local.txt")));
+        // A Unix host's backslash is a literal character.
+        assert_eq!(flat(br"odd\name", true), Some(PathBuf::from(r"odd\name")));
+        for target in [
+            b"../c/target.txt".as_slice(),
+            b"c/target.txt",
+            b"/etc/hosts",
+            b"..",
+            b".",
+            b"",
+            b"C:x",
+        ] {
+            assert_eq!(flat(target, true), None, "{target:?}");
+        }
+        for target in [
+            br"..\c\target.txt".as_slice(),
+            br"C:\x",
+            br"\??\C:\x",
+            b"C:x",
+        ] {
+            assert_eq!(flat(target, false), None, "{target:?}");
+        }
     }
 
     #[test]

@@ -3,6 +3,7 @@
 use crate::atomic64::AtomicU64;
 use crate::Error;
 use std::cell::OnceCell;
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -139,6 +140,77 @@ pub fn refused_output(error: Error, name: &[u8]) -> Error {
 pub enum OverwritePolicy {
     Never,
     Always,
+    /// Writes beside what is there as `name(N).ext`, keeping both.
+    Rename,
+}
+
+/// `path` with `(n)` before its last dot, or at its end when it has none.
+fn numbered(path: &Path, n: u32) -> crate::Result<PathBuf> {
+    let name = crate::filename::native_bytes(path.file_name().expect("output path has a name"))?;
+    let split = name
+        .iter()
+        .rposition(|&byte| byte == b'.')
+        .unwrap_or(name.len());
+    let mut renamed = name[..split].to_vec();
+    renamed.extend_from_slice(format!("({n})").as_bytes());
+    renamed.extend_from_slice(&name[split..]);
+    Ok(path.with_file_name(crate::filename::native_string(&renamed)?))
+}
+
+/// Tries `path`, then `name(1).ext` upwards, until `create` makes one that did not exist.
+pub(crate) fn claim_free_name<T>(
+    path: &Path,
+    mut create: impl FnMut(&Path) -> std::io::Result<T>,
+) -> crate::Result<(PathBuf, T)> {
+    let mut candidate = path.to_path_buf();
+    for n in 1..=u32::MAX {
+        match create(&candidate) {
+            Ok(value) => return Ok((candidate, value)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                candidate = numbered(path, n)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists).into())
+}
+
+/// Where a member goes in flat mode: straight under the output directory.
+pub fn flat_relative(relative: &Path) -> PathBuf {
+    PathBuf::from(relative.file_name().expect("output path has a name"))
+}
+
+/// The first member to take each flattened name, so a refused repeat names both.
+#[derive(Default)]
+pub struct FlatNames {
+    first: HashMap<PathBuf, Vec<u8>>,
+}
+
+impl FlatNames {
+    pub fn claim(
+        &mut self,
+        relative: &Path,
+        member: &[u8],
+        overwrite: OverwritePolicy,
+    ) -> crate::Result<()> {
+        match self.first.get(relative) {
+            Some(first) if overwrite == OverwritePolicy::Never => Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "'{}' and '{}' both extract to '{}'",
+                    String::from_utf8_lossy(first),
+                    String::from_utf8_lossy(member),
+                    relative.display()
+                ),
+            )
+            .into()),
+            Some(_) => Ok(()),
+            None => {
+                self.first.insert(relative.to_path_buf(), member.to_vec());
+                Ok(())
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -203,13 +275,20 @@ fn publish_no_replace(
 }
 
 /// Opens the destination itself, refusing a link or special file that writing would reach through.
-pub fn open_in_place(path: &Path, overwrite: OverwritePolicy) -> std::io::Result<File> {
+pub fn open_in_place(path: &Path, overwrite: OverwritePolicy) -> crate::Result<(PathBuf, File)> {
     let mut options = fs::OpenOptions::new();
-    options.write(true);
-    if overwrite == OverwritePolicy::Never {
-        return options.create_new(true).open(path);
+    options.write(true).create_new(true);
+    match overwrite {
+        OverwritePolicy::Never => return Ok((path.to_path_buf(), options.open(path)?)),
+        OverwritePolicy::Rename => return claim_free_name(path, |path| options.open(path)),
+        OverwritePolicy::Always => {}
     }
-    options.create(true);
+    Ok((path.to_path_buf(), replace_in_place(path)?))
+}
+
+fn replace_in_place(path: &Path) -> std::io::Result<File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -259,7 +338,7 @@ pub fn publish_verified_output(
     destination: &Path,
     overwrite: OverwritePolicy,
     hardlink_target: Option<&Path>,
-) -> crate::Result<()> {
+) -> crate::Result<PathBuf> {
     publish_verified_output_with_rename(
         source,
         destination,
@@ -275,13 +354,20 @@ fn publish_verified_output_with_rename(
     overwrite: OverwritePolicy,
     hardlink_target: Option<&Path>,
     mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
-) -> crate::Result<()> {
-    match overwrite {
-        OverwritePolicy::Never => publish_no_replace(source, destination, |from, to| {
+) -> crate::Result<PathBuf> {
+    let link = |to: &Path| {
+        publish_no_replace(source, to, |from, to| {
             fs::hard_link(hardlink_target.unwrap_or(from), to)
-        })?,
+        })
+    };
+    let published = match overwrite {
+        OverwritePolicy::Never => {
+            link(destination)?;
+            destination.to_path_buf()
+        }
+        OverwritePolicy::Rename => claim_free_name(destination, link)?.0,
         OverwritePolicy::Always => match rename(source, destination) {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(destination.to_path_buf()),
             Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {
                 // Stage on this destination's filesystem before atomic replacement.
                 let staging = ExtractionStaging::new(
@@ -296,12 +382,13 @@ fn publish_verified_output_with_rename(
                     copy_verified_output(source, &local)?;
                 }
                 rename(&local, destination)?;
+                destination.to_path_buf()
             }
             Err(error) => return Err(error.into()),
         },
-    }
+    };
     remove_staged_output(source)?;
-    Ok(())
+    Ok(published)
 }
 
 fn remove_staged_output(source: &Path) -> std::io::Result<()> {
@@ -321,6 +408,21 @@ mod tests {
 
     fn scratch(name: &str) -> crate::scratch::Scratch {
         crate::scratch::case(&format!("rars-output-{name}"))
+    }
+
+    #[test]
+    fn renamed_outputs_number_before_the_last_dot() {
+        for (name, renamed) in [
+            ("readme.txt", "readme(2).txt"),
+            ("noext", "noext(2)"),
+            (".hidden", "(2).hidden"),
+            ("x.tar.gz", "x.tar(2).gz"),
+        ] {
+            assert_eq!(
+                numbered(Path::new("out").join(name).as_path(), 2).unwrap(),
+                Path::new("out").join(renamed)
+            );
+        }
     }
 
     #[test]
