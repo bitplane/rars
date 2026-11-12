@@ -365,7 +365,7 @@ fn should_lazy_emit_literal(
     state: &EncoderMatchState,
     current: MatchCandidate,
 ) -> bool {
-    lazy_match_decision(input, pos, finder, options, state, current).0
+    lazy_match_decision(input, pos, input.len(), finder, options, state, current).0
 }
 
 use super::{

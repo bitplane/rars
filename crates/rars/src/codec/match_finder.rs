@@ -71,6 +71,7 @@ pub(crate) struct MatchFinder<const MIN_MATCH: usize, B: Budget = Allowance> {
     head: Buffer<u32, B>,
     prev: Buffer<u32, B>,
     mask: usize,
+    hash_bits: u32,
     /// The highest position inserted so far, and so at least as high as any
     /// position a link can name. Truncated links are read back against it.
     newest: usize,
@@ -80,6 +81,14 @@ pub(crate) struct MatchFinder<const MIN_MATCH: usize, B: Budget = Allowance> {
 impl<const MIN_MATCH: usize> MatchFinder<MIN_MATCH> {
     pub(crate) fn new(window: usize) -> Self {
         Self::with_allowance(window, &Allowance::default()).expect("unlimited finder allocation")
+    }
+
+    /// A finder with `2^hash_bits` heads. A window much wider than the default
+    /// table puts unrelated positions on every chain, and each one costs a
+    /// cache miss to reject.
+    #[cfg(feature = "write")]
+    pub(crate) fn with_hash_bits(window: usize, hash_bits: u32) -> Self {
+        Self::build(window, hash_bits, &Allowance::default()).expect("unlimited finder allocation")
     }
 }
 
@@ -98,12 +107,16 @@ impl<const MIN_MATCH: usize, B: Budget> MatchFinder<MIN_MATCH, B> {
     /// names the position it named, so that check rejects it the same way it
     /// rejects a match that is merely too far away.
     pub(crate) fn with_allowance(window: usize, allowance: &B) -> Result<Self> {
+        Self::build(window, Self::HASH_BITS, allowance)
+    }
+
+    fn build(window: usize, hash_bits: u32, allowance: &B) -> Result<Self> {
         let window = window
             .max(1)
             .checked_next_power_of_two()
             .ok_or(super::Error::InvalidData("finder window overflows"))?;
         Ok(Self {
-            head: Buffer::filled(1 << Self::HASH_BITS, NO_LINK, allowance)?,
+            head: Buffer::filled(1 << hash_bits, NO_LINK, allowance)?,
             // Zero rather than the sentinel, and nothing reads it either way: a
             // link is only ever followed from a position that has been
             // inserted, and inserting a position writes its slot first. Zero
@@ -111,6 +124,7 @@ impl<const MIN_MATCH: usize, B: Budget> MatchFinder<MIN_MATCH, B> {
             // window wider than the data has reached costs nothing yet.
             prev: Buffer::filled(window, 0, allowance)?,
             mask: window - 1,
+            hash_bits,
             newest: 0,
         })
     }
@@ -120,7 +134,7 @@ impl<const MIN_MATCH: usize, B: Budget> MatchFinder<MIN_MATCH, B> {
         self.head.allowance()
     }
 
-    fn hash(input: &[u8], pos: usize) -> usize {
+    fn hash(&self, input: &[u8], pos: usize) -> usize {
         let value = if MIN_MATCH == 3 {
             u32::from(input[pos])
                 | (u32::from(input[pos + 1]) << 8)
@@ -128,14 +142,14 @@ impl<const MIN_MATCH: usize, B: Budget> MatchFinder<MIN_MATCH, B> {
         } else {
             u32::from_le_bytes([input[pos], input[pos + 1], input[pos + 2], input[pos + 3]])
         };
-        mix(value, Self::HASH_BITS)
+        mix(value, self.hash_bits)
     }
 
     /// Records `pos` as a future match candidate. Positions too close to the
     /// end of the input to fit `MIN_MATCH` bytes are ignored.
     pub(crate) fn insert(&mut self, input: &[u8], pos: usize) {
         if pos + MIN_MATCH <= input.len() {
-            let hash = Self::hash(input, pos);
+            let hash = self.hash(input, pos);
             self.prev[pos & self.mask] = self.head[hash];
             self.head[hash] = pos as u32;
             self.newest = self.newest.max(pos);
@@ -146,7 +160,7 @@ impl<const MIN_MATCH: usize, B: Budget> MatchFinder<MIN_MATCH, B> {
     /// [`NO_POSITION`]. The caller must ensure at least `MIN_MATCH` bytes are
     /// readable at `pos`.
     pub(crate) fn first(&self, input: &[u8], pos: usize) -> usize {
-        resolve(self.newest, self.head[Self::hash(input, pos)])
+        resolve(self.newest, self.head[self.hash(input, pos)])
     }
 
     /// Returns the next-older candidate in `candidate`'s chain, or
@@ -172,7 +186,7 @@ impl<B: Budget> MatchFinder<4, B> {
     #[inline]
     pub(crate) fn insert_and_first(&mut self, input: &[u8], pos: usize) -> usize {
         debug_assert!(pos + 4 <= input.len());
-        self.record_and_first(Self::hash(input, pos), pos)
+        self.record_and_first(self.hash(input, pos), pos)
     }
 
     #[inline]
@@ -341,12 +355,16 @@ impl<B: Budget> TreeMatchFinder<B> {
     /// Builds a finder that remembers the last `window` positions, at eight
     /// bytes of links per byte of window.
     pub(crate) fn with_allowance(window: usize, allowance: &B) -> Result<Self> {
+        Self::build(window, Self::HASH_BITS, allowance)
+    }
+
+    fn build(window: usize, hash_bits: u32, allowance: &B) -> Result<Self> {
         let window = window
             .max(1)
             .checked_next_power_of_two()
             .ok_or(super::Error::InvalidData("finder window overflows"))?;
         Ok(Self {
-            head: Buffer::filled(1 << Self::HASH_BITS, NO_LINK, allowance)?,
+            head: Buffer::filled(1 << hash_bits, NO_LINK, allowance)?,
             // Zero rather than the sentinel for the same reason as the chain
             // finder's `prev`: a slot is always written during its position's
             // own insertion before any link can lead to it, and untouched
@@ -734,11 +752,12 @@ mod tests {
 
     fn raw_collision_fixture() -> Vec<u8> {
         let prefix = b"abcd";
-        let hash = MatchFinder::<4>::hash(prefix, 0);
+        let finder = MatchFinder::<4>::new(64);
+        let hash = finder.hash(prefix, 0);
         let collision = (0u32..1 << 24)
             .find_map(|upper| {
                 let word = (u32::from(b'a') | (upper << 8)).to_le_bytes();
-                (word[1] != b'b' && MatchFinder::<4>::hash(&word, 0) == hash).then_some(word)
+                (word[1] != b'b' && finder.hash(&word, 0) == hash).then_some(word)
             })
             .unwrap();
         let mut input = vec![0; 48];
