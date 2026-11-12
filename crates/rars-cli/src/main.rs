@@ -774,6 +774,7 @@ struct ExtractOutputState<'a> {
     in_place: bool,
     flatten: bool,
     flat_names: rars::output_staging::FlatNames,
+    renames: rars::output_staging::RenameCounters,
     family: rars::ArchiveFamily,
     legacy_name_encoding: Option<rars::filename::LegacyNameEncoding>,
     outputs: Vec<ExtractedOutput>,
@@ -808,6 +809,7 @@ impl<'a> ExtractOutputState<'a> {
             in_place,
             flatten,
             flat_names: Default::default(),
+            renames: Default::default(),
             family,
             legacy_name_encoding: None,
             outputs: Vec::new(),
@@ -863,8 +865,13 @@ impl<'a> ExtractOutputState<'a> {
         self.reserve_output_path(destination.clone())?;
         self.remember_directory_time(&destination, meta)?;
         let staging = self.prepare_staged_path(&destination, meta.is_directory)?;
-        let (path, writer) =
-            open_output_writer(&staging, &relative, meta.is_directory, self.staged_policy())?;
+        let (path, writer) = open_output_writer(
+            &staging,
+            &relative,
+            meta.is_directory,
+            self.staged_policy(),
+            &mut self.renames,
+        )?;
         self.record_staged_path(&path, meta.is_directory)?;
         self.created_paths.insert(stored.clone(), path.clone());
         self.archive_names.push(meta.name.clone());
@@ -913,6 +920,7 @@ impl<'a> ExtractOutputState<'a> {
             link,
             self.staged_policy(),
             &self.created_paths,
+            &mut self.renames,
         )?;
         self.record_staged_path(&path, false)?;
         self.staged_redirections.insert(path.clone());
@@ -1122,6 +1130,7 @@ impl<'a> ExtractOutputState<'a> {
                     &destination,
                     self.overwrite,
                     hardlink_target,
+                    &mut self.renames,
                 )?;
                 self.outputs[self.published].path = published;
             }

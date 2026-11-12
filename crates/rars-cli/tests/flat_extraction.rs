@@ -439,3 +439,31 @@ fn member_times_are_restored_on_flattened_and_renamed_files() {
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn flat_symlinks_do_not_follow_an_existing_link_out() {
+    for version in [ArchiveVersion::Rar29, ArchiveVersion::Rar50] {
+        let root = scratch::case("flat-existing-escape");
+        let archive = root.join("links.rar");
+        let mut builder = Builder::new(version);
+        builder
+            .add_unix_symlink(b"x".to_vec(), b"escape".to_vec(), false, None, None)
+            .unwrap();
+        fs::write(&archive, builder.to_bytes().unwrap()).unwrap();
+        for flatten in [&[][..], &["--flatten"]] {
+            let out = root.join(format!("out{}", flatten.len()));
+            fs::create_dir(&out).unwrap();
+            std::os::unix::fs::symlink("/", out.join("escape")).unwrap();
+            let result = extract(&archive, &out, flatten);
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert_eq!(
+                result.status.code(),
+                Some(1),
+                "{version:?} {flatten:?} {stderr}"
+            );
+            assert!(stderr.contains("'x'"), "{stderr}");
+            assert!(fs::symlink_metadata(out.join("x")).is_err());
+        }
+    }
+}

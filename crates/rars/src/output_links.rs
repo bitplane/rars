@@ -1,5 +1,5 @@
 use crate::filename::{native_str, relative_path};
-use crate::output_staging::{claim_free_name, create_symlink, OverwritePolicy};
+use crate::output_staging::{create_symlink, OverwritePolicy, RenameCounters};
 use crate::{ArchiveFamily, Error, ExtractedLink, Result};
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -84,12 +84,26 @@ pub fn link_target(
                 .map_err(|_| Error::InvalidHeader("unsafe archive redirection target"))
         }
         ExtractedLink::Symlink { target, .. } | ExtractedLink::Junction { target } if flat => {
-            Ok(flat_target(target, family, unix_host))
+            Ok(flat_symlink_target(root, target, family, unix_host)?)
         }
         ExtractedLink::Symlink { target, .. } | ExtractedLink::Junction { target } => Ok(
             safe_symlink_target(root, relative, target, family, unix_host)?,
         ),
     }
+}
+
+/// A bare name can still lead out through a link already in `root`, as in nested output.
+fn flat_symlink_target(
+    root: &Path,
+    target: &[u8],
+    family: ArchiveFamily,
+    unix_host: bool,
+) -> std::io::Result<Option<PathBuf>> {
+    let Some(name) = flat_target(target, family, unix_host) else {
+        return Ok(None);
+    };
+    let step = Step::Down(name.clone().into_os_string());
+    Ok(stays_inside(root, Vec::new(), &[step])?.then_some(name))
 }
 
 /// Flat output has no directories, so only a symlink to a bare name still means what it did.
@@ -238,6 +252,7 @@ pub fn create_link_output(
     link: ExtractedLink<'_>,
     overwrite: OverwritePolicy,
     created_paths: &HashMap<PathBuf, PathBuf>,
+    renames: &mut RenameCounters,
 ) -> Result<(PathBuf, bool)> {
     // Resolve hard-link/copy sources before touching an existing destination.
     let source = match link {
@@ -281,7 +296,7 @@ pub fn create_link_output(
         }
     };
     if overwrite == OverwritePolicy::Rename {
-        return claim_free_name(&out_path, create);
+        return renames.claim(&out_path, create);
     }
     let file = create(&out_path)?;
     Ok((out_path, file))
@@ -438,6 +453,19 @@ mod tests {
             check(&root, "a/b/k", b"../../y"),
             Some(PathBuf::from("../../y"))
         );
+    }
+
+    #[test]
+    fn flat_targets_do_not_follow_existing_links_out_of_the_root() {
+        let root = crate::scratch::case("links-flat-existing");
+        symlink("/", root.join("escape")).unwrap();
+        symlink("local", root.join("inside")).unwrap();
+        let flat = |target: &[u8]| {
+            flat_symlink_target(&root, target, ArchiveFamily::Rar50Plus, true).unwrap()
+        };
+        assert_eq!(flat(b"escape"), None);
+        assert_eq!(flat(b"inside"), Some(PathBuf::from("inside")));
+        assert_eq!(flat(b"local"), Some(PathBuf::from("local")));
     }
 
     #[test]

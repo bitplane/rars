@@ -27,6 +27,7 @@ pub(crate) fn open_output_writer(
     relative: &Path,
     directory: bool,
     overwrite: OverwritePolicy,
+    renames: &mut rars::output_staging::RenameCounters,
 ) -> rars::Result<(PathBuf, Box<dyn std::io::Write>)> {
     let mut out_path = checked_output_path(out_dir, relative)?;
     if directory {
@@ -39,7 +40,7 @@ pub(crate) fn open_output_writer(
             .expect("validated output path has a parent"),
     )?;
     out_path = checked_output_path(out_dir, relative)?;
-    let (out_path, file) = rars::output_staging::open_in_place(&out_path, overwrite)?;
+    let (out_path, file) = rars::output_staging::open_in_place(&out_path, overwrite, renames)?;
     Ok((out_path, Box::new(file)))
 }
 
@@ -668,6 +669,7 @@ mod tests {
             test_link(link)?,
             overwrite,
             created,
+            &mut Default::default(),
         )
     }
     fn output_path_for_rar50_entry(
@@ -684,7 +686,13 @@ mod tests {
         overwrite: super::OverwritePolicy,
     ) -> rars::Result<(std::path::PathBuf, Box<dyn std::io::Write>)> {
         let relative = rars::filename::relative_path(&meta.name, true)?;
-        super::open_output_writer(out, &relative, meta.is_directory, overwrite)
+        super::open_output_writer(
+            out,
+            &relative,
+            meta.is_directory,
+            overwrite,
+            &mut Default::default(),
+        )
     }
 
     fn redirection_fixture() -> (

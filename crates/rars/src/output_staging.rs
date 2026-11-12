@@ -157,22 +157,37 @@ fn numbered(path: &Path, n: u32) -> crate::Result<PathBuf> {
     Ok(path.with_file_name(crate::filename::native_string(&renamed)?))
 }
 
-/// Tries `path`, then `name(1).ext` upwards, until `create` makes one that did not exist.
-pub(crate) fn claim_free_name<T>(
-    path: &Path,
-    mut create: impl FnMut(&Path) -> std::io::Result<T>,
-) -> crate::Result<(PathBuf, T)> {
-    let mut candidate = path.to_path_buf();
-    for n in 1..=u32::MAX {
-        match create(&candidate) {
-            Ok(value) => return Ok((candidate, value)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                candidate = numbered(path, n)?;
+/// The next number `Rename` tries for each destination, so an archive repeating one name costs linear time.
+#[derive(Default)]
+pub struct RenameCounters {
+    next: HashMap<PathBuf, u32>,
+}
+
+impl RenameCounters {
+    /// Tries `path`, then `name(N).ext` upwards, until `create` makes one that did not exist.
+    pub(crate) fn claim<T>(
+        &mut self,
+        path: &Path,
+        mut create: impl FnMut(&Path) -> std::io::Result<T>,
+    ) -> crate::Result<(PathBuf, T)> {
+        let first = self.next.get(path).copied().unwrap_or(0);
+        for n in first..=u32::MAX {
+            let candidate = if n == 0 {
+                path.to_path_buf()
+            } else {
+                numbered(path, n)?
+            };
+            match create(&candidate) {
+                Ok(value) => {
+                    self.next.insert(path.to_path_buf(), n.saturating_add(1));
+                    return Ok((candidate, value));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
             }
-            Err(error) => return Err(error.into()),
         }
+        Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists).into())
     }
-    Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists).into())
 }
 
 /// Where a member goes in flat mode: straight under the output directory.
@@ -275,12 +290,16 @@ fn publish_no_replace(
 }
 
 /// Opens the destination itself, refusing a link or special file that writing would reach through.
-pub fn open_in_place(path: &Path, overwrite: OverwritePolicy) -> crate::Result<(PathBuf, File)> {
+pub fn open_in_place(
+    path: &Path,
+    overwrite: OverwritePolicy,
+    renames: &mut RenameCounters,
+) -> crate::Result<(PathBuf, File)> {
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     match overwrite {
         OverwritePolicy::Never => return Ok((path.to_path_buf(), options.open(path)?)),
-        OverwritePolicy::Rename => return claim_free_name(path, |path| options.open(path)),
+        OverwritePolicy::Rename => return renames.claim(path, |path| options.open(path)),
         OverwritePolicy::Always => {}
     }
     Ok((path.to_path_buf(), replace_in_place(path)?))
@@ -338,12 +357,14 @@ pub fn publish_verified_output(
     destination: &Path,
     overwrite: OverwritePolicy,
     hardlink_target: Option<&Path>,
+    renames: &mut RenameCounters,
 ) -> crate::Result<PathBuf> {
     publish_verified_output_with_rename(
         source,
         destination,
         overwrite,
         hardlink_target,
+        renames,
         |from, to| fs::rename(from, to),
     )
 }
@@ -353,6 +374,7 @@ fn publish_verified_output_with_rename(
     destination: &Path,
     overwrite: OverwritePolicy,
     hardlink_target: Option<&Path>,
+    renames: &mut RenameCounters,
     mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
 ) -> crate::Result<PathBuf> {
     let link = |to: &Path| {
@@ -365,7 +387,7 @@ fn publish_verified_output_with_rename(
             link(destination)?;
             destination.to_path_buf()
         }
-        OverwritePolicy::Rename => claim_free_name(destination, link)?.0,
+        OverwritePolicy::Rename => renames.claim(destination, link)?.0,
         OverwritePolicy::Always => match rename(source, destination) {
             Ok(()) => return Ok(destination.to_path_buf()),
             Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {
@@ -408,6 +430,26 @@ mod tests {
 
     fn scratch(name: &str) -> crate::scratch::Scratch {
         crate::scratch::case(&format!("rars-output-{name}"))
+    }
+
+    #[test]
+    fn repeated_renames_resume_after_the_last_number_taken() {
+        let mut taken = std::collections::HashSet::from([PathBuf::from("x(1)")]);
+        let mut tried = Vec::new();
+        let mut renames = RenameCounters::default();
+        for _ in 0..3 {
+            renames
+                .claim(Path::new("x"), |path| {
+                    tried.push(path.to_path_buf());
+                    if taken.insert(path.to_path_buf()) {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+                    }
+                })
+                .unwrap();
+        }
+        assert_eq!(tried, ["x", "x(1)", "x(2)", "x(3)"].map(PathBuf::from));
     }
 
     #[test]
@@ -460,6 +502,7 @@ mod tests {
             &destination,
             OverwritePolicy::Always,
             None,
+            &mut RenameCounters::default(),
             |from, to| {
                 calls += 1;
                 if calls == 1 {
@@ -498,6 +541,7 @@ mod tests {
                 &target,
                 OverwritePolicy::Always,
                 None,
+                &mut RenameCounters::default(),
                 |from, to| {
                     if from.starts_with(&staging.root) {
                         Err(std::io::Error::from(std::io::ErrorKind::CrossesDevices))
@@ -512,6 +556,7 @@ mod tests {
                 &destination,
                 overwrite,
                 Some(&target),
+                &mut RenameCounters::default(),
                 |from, to| {
                     if from.starts_with(&staging.root) {
                         Err(std::io::Error::from(std::io::ErrorKind::CrossesDevices))
@@ -556,6 +601,7 @@ mod tests {
                 &destination,
                 overwrite,
                 None,
+                &mut RenameCounters::default(),
                 |from, to| {
                     calls += 1;
                     if calls == 1 {

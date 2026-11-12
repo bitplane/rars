@@ -2177,6 +2177,7 @@ struct ExtractOutputs<'a> {
     in_place: bool,
     flatten: bool,
     flat_names: rars_rs::output_staging::FlatNames,
+    renames: rars_rs::output_staging::RenameCounters,
     /// Destinations taken under `Rename`, so a repeated stored path fails as in the CLI.
     rename_claims: HashSet<PathBuf>,
     times: Option<rars_rs::output_times::OutputTimes>,
@@ -2257,6 +2258,7 @@ impl<'a> ExtractOutputs<'a> {
             in_place: mode.in_place,
             flatten: mode.flatten,
             flat_names: Default::default(),
+            renames: Default::default(),
             rename_claims: HashSet::new(),
             times: mode
                 .restore_times
@@ -2340,8 +2342,11 @@ impl<'a> ExtractOutputs<'a> {
             )?;
             // Creating the parents may have raced a symlink into place.
             let (_, destination) = self.destination(meta)?;
-            let (destination, file) =
-                rars_rs::output_staging::open_in_place(&destination, self.overwrite)?;
+            let (destination, file) = rars_rs::output_staging::open_in_place(
+                &destination,
+                self.overwrite,
+                &mut self.renames,
+            )?;
             self.pending = Some(PendingOutput {
                 staged: None,
                 stored,
@@ -2405,7 +2410,13 @@ impl<'a> ExtractOutputs<'a> {
         )?;
         // Creating the parents may have raced a symlink into place.
         let (_, destination) = self.destination(&pending.meta)?;
-        let destination = publish_verified_output(staged, &destination, self.overwrite, None)?;
+        let destination = publish_verified_output(
+            staged,
+            &destination,
+            self.overwrite,
+            None,
+            &mut self.renames,
+        )?;
         self.record_published(pending.stored, destination, &pending.meta, true);
         Ok(())
     }
@@ -2462,6 +2473,7 @@ impl<'a> ExtractOutputs<'a> {
                 link,
                 self.overwrite,
                 &self.created,
+                &mut self.renames,
             )?;
             self.record_published(stored, path, meta, file);
             return Ok(());
@@ -2480,6 +2492,7 @@ impl<'a> ExtractOutputs<'a> {
             link,
             OverwritePolicy::Never,
             &self.created,
+            &mut self.renames,
         )?;
         self.staged += 1;
         let source = match link {
@@ -2500,8 +2513,13 @@ impl<'a> ExtractOutputs<'a> {
         {
             fs::remove_dir(&destination)?;
         }
-        let destination =
-            publish_verified_output(&staged, &destination, self.overwrite, source.as_deref())?;
+        let destination = publish_verified_output(
+            &staged,
+            &destination,
+            self.overwrite,
+            source.as_deref(),
+            &mut self.renames,
+        )?;
         self.record_published(stored, destination, meta, file);
         Ok(())
     }
