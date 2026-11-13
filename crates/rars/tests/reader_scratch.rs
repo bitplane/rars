@@ -2,8 +2,6 @@
 #![cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 #[path = "support/scratch.rs"]
 mod scratch;
-#[path = "support/volume_size.rs"]
-mod volume_size;
 use rars::rar50::{ArchiveEntry, Rar50Writer, WriterOptions};
 use rars::{
     Archive, ArchiveReadOptions, ArchiveReader, ArchiveVersion, EntrySource, Error, FeatureSet,
@@ -38,7 +36,7 @@ fn entry(data: &[u8], encrypted: bool) -> ArchiveEntry {
     }
 }
 fn options(version: ArchiveVersion) -> WriterOptions {
-    WriterOptions::new(version, FeatureSet::store_only())
+    WriterOptions::new(version, FeatureSet::store_only()).with_compression_level(1)
 }
 fn archive(kind: FilterKind, encrypted: bool, version: ArchiveVersion) -> Archive {
     ArchiveReader::read_owned(
@@ -162,25 +160,24 @@ fn split_filtered_members_use_scratch_and_keep_limit_errors() {
     let dir = scratch::case("reader-scratch-split");
     for encrypted in [false, true] {
         let member = entry(&payload(), encrypted);
-        let volumes = volume_size::sized_for_payload(64, |volume_size| {
-            let mut sink = rars::rar50::CollectedVolumes::new();
-            rars::rar50::write_streaming_volumes_to(
-                std::slice::from_ref(&member),
-                options(ArchiveVersion::Rar50),
-                rars::rar50::ArchiveExtras::default()
-                    .with_filter_policy(FilterPolicy::explicit(FilterKind::E8)),
-                volume_size as u64,
-                &mut sink,
-                &rars::WriterResources::default().with_temp_dir(&*dir),
-            )?;
-            Ok::<_, rars::Error>(sink.take())
-        })
+        // Past any volume's headers, yet still splits the member.
+        let mut sink = rars::rar50::CollectedVolumes::new();
+        rars::rar50::write_streaming_volumes_to(
+            std::slice::from_ref(&member),
+            options(ArchiveVersion::Rar50),
+            rars::rar50::ArchiveExtras::default()
+                .with_filter_policy(FilterPolicy::explicit(FilterKind::E8)),
+            4096,
+            &mut sink,
+            &rars::WriterResources::default().with_temp_dir(&*dir),
+        )
         .unwrap();
+        let volumes = sink.take();
         let volumes: Vec<_> = volumes
             .into_iter()
             .map(|bytes| ArchiveReader::read_owned(bytes).unwrap())
             .collect();
-        assert!(volumes.len() > 1);
+        assert!(volumes.len() > 2, "{} volumes", volumes.len());
         for disk in [1_000_000, 100] {
             let policy = Rar50Scratch::new(&*dir, disk);
             let mut options = ArchiveReadOptions::new()

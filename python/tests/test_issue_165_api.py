@@ -53,13 +53,13 @@ def test_flatten_drops_directories_and_renames_a_clash(tmp_path):
     builder.add_bytes(b"second", "other/readme.txt")
     builder.add_directory("dir")
     archive = rars.RarFile.from_bytes(builder.to_bytes())
-    written = archive.extractall(tmp_path / "flat", flatten=True)
+    written = archive.extractall(tmp_path / "flat", flatten=True, overwrite="rename")
     names = sorted(path.name for path in written)
     assert names == ["readme(1).txt", "readme.txt"]
     assert (tmp_path / "flat" / "readme.txt").read_bytes() == b"first"
     assert (tmp_path / "flat" / "readme(1).txt").read_bytes() == b"second"
     assert not (tmp_path / "flat" / "dir").exists()
-    again = archive.extractall(tmp_path / "flat2", flatten=True)
+    again = archive.extractall(tmp_path / "flat2", flatten=True, overwrite="rename")
     assert sorted(Path(path).name for path in again) == names
 
 

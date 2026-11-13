@@ -44,6 +44,38 @@ fn reader20_workspace_refusals_release_lz_audio_input_and_checkpoints() {
 }
 
 #[test]
+fn reader_decoding_stays_in_a_workspace_that_does_not_grow_with_the_member() {
+    // Literal noise, so the packed input is as large as the output. Holding
+    // both whole would need over 4 MiB.
+    let mut seed = 1u64;
+    let data: Vec<u8> = (0..2 << 20)
+        .map(|_| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 56) as u8
+        })
+        .collect();
+    // Packs the literals as they are; noise has no match worth searching for.
+    let tokens: Vec<_> = data
+        .iter()
+        .map(|&byte| EncodeToken::Literal(byte))
+        .collect();
+    let tables = super::table_lengths_for_tokens(&tokens, None).unwrap();
+    let packed = super::encode_member_with_tables(&tokens, &[], None, &tables).unwrap();
+    assert!(packed.len() > data.len() * 9 / 10);
+    let budget = super::Allowance::limited(3 << 20);
+    let mut state = super::Reader20State::with_allowance(&budget);
+    let mut out = Vec::new();
+    state
+        .decode_member_from_reader(&mut packed.as_slice(), data.len(), &mut out)
+        .unwrap();
+    assert!(out == data);
+    drop(state);
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
 fn reader20_workspace_keeps_returned_data_charged_after_decoder_drop() {
     let data = b"owned legacy result".repeat(32);
     let packed = unpack20_encode_literals(&data).unwrap();

@@ -8,8 +8,7 @@ use pyo3::{create_exception, PyErr};
 use rars_rs::filename::relative_path as output_relative_path;
 use rars_rs::output_links::{create_link_output, link_source_path};
 use rars_rs::output_staging::{
-    clash_name, failed_entry_name, flat_file_name, publish_verified_output, refused_output,
-    ExtractionStaging, OverwritePolicy,
+    failed_entry_name, publish_verified_output, refused_output, ExtractionStaging, OverwritePolicy,
 };
 use rars_rs::ExtractedLink;
 use std::collections::{HashMap, HashSet};
@@ -684,8 +683,9 @@ impl RarFile {
         Ok(data)
     }
 
-    /// `in_place` works as in `extractall`.
-    #[pyo3(signature = (member, path = None, pwd = None, overwrite = false, *, options = None, restore_times = true, in_place = false, volumes = None, flatten = false))]
+    /// `overwrite`, `in_place` and `flatten` work as in `extractall`.
+    /// On a volume set, extracts that member from the set.
+    #[pyo3(signature = (member, path = None, pwd = None, overwrite = Overwrite(OverwritePolicy::Never), *, options = None, restore_times = true, in_place = false, volumes = None, flatten = false))]
     #[allow(clippy::too_many_arguments)]
     fn extract(
         &self,
@@ -693,7 +693,7 @@ impl RarFile {
         member: &Bound<'_, PyAny>,
         path: Option<PathBuf>,
         pwd: Option<&Bound<'_, PyAny>>,
-        overwrite: bool,
+        overwrite: Overwrite,
         options: Option<&ReadOptions>,
         restore_times: bool,
         in_place: bool,
@@ -701,6 +701,7 @@ impl RarFile {
         flatten: bool,
     ) -> PyResult<PathBuf> {
         check_read_options_cancellation(options)?;
+        let Overwrite(overwrite) = overwrite;
         let out_dir = path.unwrap_or_else(|| PathBuf::from("."));
         let password = py_password(pwd)?.or_else(|| self.password.clone());
         let mode = OutputMode {
@@ -768,7 +769,13 @@ impl RarFile {
     /// directory needn't be writable, but a member that fails verification
     /// leaves a partly written file. An existing link or special file at a
     /// destination is still refused.
-    #[pyo3(signature = (path = None, members = None, pwd = None, overwrite = false, *, options = None, volumes = None, restore_times = true, in_place = false, flatten = false, progress = None))]
+    ///
+    /// `overwrite` is `False` to refuse an existing file, `True` to replace it,
+    /// or `"rename"` to write beside it as `name(N).ext`. `flatten=True` writes
+    /// every file straight into `path` under its base name and creates no
+    /// directories; symlinks are kept only when they point at a bare name.
+    /// `progress`, when set, is called with each member name as it is written.
+    #[pyo3(signature = (path = None, members = None, pwd = None, overwrite = Overwrite(OverwritePolicy::Never), *, options = None, volumes = None, restore_times = true, in_place = false, flatten = false, progress = None))]
     #[allow(clippy::too_many_arguments)]
     fn extractall(
         &self,
@@ -776,7 +783,7 @@ impl RarFile {
         path: Option<PathBuf>,
         members: Option<&Bound<'_, PyAny>>,
         pwd: Option<&Bound<'_, PyAny>>,
-        overwrite: bool,
+        overwrite: Overwrite,
         options: Option<&ReadOptions>,
         volumes: Option<&Bound<'_, PyAny>>,
         restore_times: bool,
@@ -786,7 +793,7 @@ impl RarFile {
     ) -> PyResult<Vec<PathBuf>> {
         check_read_options_cancellation(options)?;
         let mode = OutputMode {
-            overwrite,
+            overwrite: overwrite.0,
             in_place,
             restore_times,
             flatten,
@@ -2452,10 +2459,36 @@ impl Selection for HashSet<usize> {
 
 #[derive(Clone, Copy)]
 struct OutputMode {
-    overwrite: bool,
+    overwrite: OverwritePolicy,
     in_place: bool,
     restore_times: bool,
     flatten: bool,
+}
+
+/// `True`, `False` or `"rename"`, as `extract` and `extractall` accept it.
+struct Overwrite(OverwritePolicy);
+
+impl<'a, 'py> FromPyObject<'a, 'py> for Overwrite {
+    type Error = PyErr;
+
+    fn extract(value: pyo3::Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        if let Ok(value) = value.cast::<pyo3::types::PyBool>() {
+            return Ok(Self(if value.is_true() {
+                OverwritePolicy::Always
+            } else {
+                OverwritePolicy::Never
+            }));
+        }
+        match value.extract::<&str>() {
+            Ok("rename") => Ok(Self(OverwritePolicy::Rename)),
+            Ok(other) => Err(PyValueError::new_err(format!(
+                "overwrite must be True, False or \"rename\", not {other:?}"
+            ))),
+            Err(_) => Err(pyo3::exceptions::PyTypeError::new_err(
+                "overwrite must be True, False or \"rename\"",
+            )),
+        }
+    }
 }
 
 /// Stages each file and publishes it once verified, so a hard link or FIFO at the destination is never written through, unless writing in place.
@@ -2465,22 +2498,26 @@ struct ExtractOutputs<'a> {
     encoding: Option<rars_rs::filename::LegacyNameEncoding>,
     overwrite: OverwritePolicy,
     in_place: bool,
+    flatten: bool,
+    flat_names: rars_rs::output_staging::FlatNames,
+    renames: rars_rs::output_staging::RenameCounters,
+    /// Destinations taken under `Rename`, so a repeated stored path fails as in the CLI.
+    rename_claims: HashSet<PathBuf>,
     times: Option<rars_rs::output_times::OutputTimes>,
     staging: Option<ExtractionStaging>,
     staged: usize,
     pending: Option<PendingOutput>,
     published: Vec<PathBuf>,
-    /// Where each output went, by its path relative to `out_dir`, for hard links and copies.
+    /// Where each output went, by its stored path, for hard links and copies.
     created: HashMap<PathBuf, PathBuf>,
     skipped_links: Vec<SkippedLink>,
-    flatten: bool,
-    claimed: HashSet<PathBuf>,
     progress: Option<Py<PyAny>>,
 }
 
 struct PendingOutput {
     /// None when the member is written in place.
     staged: Option<PathBuf>,
+    stored: PathBuf,
     destination: PathBuf,
     meta: rars_rs::ExtractedEntryMeta,
     /// A legacy symlink's target, buffered until verified.
@@ -2541,12 +2578,12 @@ impl<'a> ExtractOutputs<'a> {
             out_dir,
             family,
             encoding: options.legacy_name_encoding,
-            overwrite: if mode.overwrite {
-                OverwritePolicy::Always
-            } else {
-                OverwritePolicy::Never
-            },
+            overwrite: mode.overwrite,
             in_place: mode.in_place,
+            flatten: mode.flatten,
+            flat_names: Default::default(),
+            renames: Default::default(),
+            rename_claims: HashSet::new(),
             times: mode
                 .restore_times
                 .then(rars_rs::output_times::OutputTimes::new),
@@ -2556,41 +2593,54 @@ impl<'a> ExtractOutputs<'a> {
             published: Vec::new(),
             created: HashMap::new(),
             skipped_links: Vec::new(),
-            flatten: mode.flatten,
-            claimed: HashSet::new(),
             progress: None,
         }
     }
 
-    fn destination(&mut self, meta: &rars_rs::ExtractedEntryMeta) -> rars_rs::Result<PathBuf> {
-        let path = checked_output_path(self.out_dir, meta, self.family, self.encoding)
-            .map_err(|error| refused_output(error, &meta.name))?;
-        let path = if self.flatten && !meta.is_directory {
-            let base = flat_file_name(&path).ok_or_else(|| {
-                refused_output(
-                    rars_rs::Error::InvalidArgument("archive entry has no file name"),
-                    &meta.name,
-                )
-            })?;
-            let mut leaf = PathBuf::from(base);
-            let mut generation = 1u32;
-            loop {
-                let candidate = self.out_dir.join(&leaf);
-                if self.claimed.insert(candidate.clone()) {
-                    break candidate;
-                }
-                leaf = PathBuf::from(clash_name(base, generation));
-                generation += 1;
-            }
-        } else {
-            path
-        };
+    /// Stored path for link lookups, and destination, which flattening reduces to the base name.
+    fn destination(
+        &self,
+        meta: &rars_rs::ExtractedEntryMeta,
+    ) -> rars_rs::Result<(PathBuf, PathBuf)> {
+        let (stored, path) =
+            checked_output_path(self.out_dir, meta, self.family, self.encoding, self.flatten)
+                .map_err(|error| refused_output(error, &meta.name))?;
         if let Some(staging) = &self.staging {
             staging
                 .reject_alias(&path)
                 .map_err(|error| refused_output(error, &meta.name))?;
         }
-        Ok(path)
+        Ok((stored, path))
+    }
+
+    fn claim(
+        &mut self,
+        destination: &Path,
+        meta: &rars_rs::ExtractedEntryMeta,
+    ) -> rars_rs::Result<()> {
+        if self.flatten {
+            let relative = destination
+                .strip_prefix(self.out_dir)
+                .expect("checked output path is under the output directory");
+            return self
+                .flat_names
+                .claim(relative, &meta.name, self.overwrite)
+                .map_err(|error| refused_output(error, &meta.name));
+        }
+        if self.overwrite == OverwritePolicy::Rename
+            && !meta.is_directory
+            && !self.rename_claims.insert(destination.to_path_buf())
+        {
+            return Err(rars_rs::Error::InvalidHeader(
+                "multiple archive entries map to the same output path",
+            ));
+        }
+        if self.encoding.is_some() && self.published.iter().any(|path| path == destination) {
+            return Err(rars_rs::Error::InvalidArgument(
+                "multiple entries map to the same decoded output path",
+            ));
+        }
+        Ok(())
     }
 
     fn report(&self, meta: &rars_rs::ExtractedEntryMeta) -> rars_rs::Result<()> {
@@ -2614,15 +2664,11 @@ impl<'a> ExtractOutputs<'a> {
         if self.flatten && meta.is_directory {
             return Ok(Box::new(io::sink()));
         }
-        let destination = self.destination(meta)?;
-        if self.encoding.is_some() && self.published.contains(&destination) {
-            return Err(rars_rs::Error::InvalidArgument(
-                "multiple entries map to the same decoded output path",
-            ));
-        }
+        let (stored, destination) = self.destination(meta)?;
+        self.claim(&destination, meta)?;
         if meta.is_directory {
             fs::create_dir_all(&destination)?;
-            self.record_published(destination, meta, true);
+            self.record_published(stored, destination, meta, true);
             return Ok(Box::new(io::sink()));
         }
         if self.overwrite == OverwritePolicy::Never && fs::symlink_metadata(&destination).is_ok() {
@@ -2635,14 +2681,15 @@ impl<'a> ExtractOutputs<'a> {
                     .expect("checked output path has a file name"),
             )?;
             // Creating the parents may have raced a symlink into place.
-            let destination = if self.flatten {
-                destination
-            } else {
-                self.destination(meta)?
-            };
-            let file = rars_rs::output_staging::open_in_place(&destination, self.overwrite)?;
+            let (_, destination) = self.destination(meta)?;
+            let (destination, file) = rars_rs::output_staging::open_in_place(
+                &destination,
+                self.overwrite,
+                &mut self.renames,
+            )?;
             self.pending = Some(PendingOutput {
                 staged: None,
+                stored,
                 destination,
                 meta: meta.clone(),
                 link_target: None,
@@ -2664,6 +2711,7 @@ impl<'a> ExtractOutputs<'a> {
             .open(&staged)?;
         self.pending = Some(PendingOutput {
             staged: Some(staged),
+            stored,
             destination,
             meta: meta.clone(),
             link_target: None,
@@ -2691,7 +2739,7 @@ impl<'a> ExtractOutputs<'a> {
             );
         }
         let Some(staged) = &pending.staged else {
-            self.record_published(pending.destination, &pending.meta, true);
+            self.record_published(pending.stored, pending.destination, &pending.meta, true);
             return Ok(());
         };
         fs::create_dir_all(
@@ -2701,13 +2749,15 @@ impl<'a> ExtractOutputs<'a> {
                 .expect("checked output path has a file name"),
         )?;
         // Creating the parents may have raced a symlink into place.
-        let destination = if self.flatten {
-            pending.destination.clone()
-        } else {
-            self.destination(&pending.meta)?
-        };
-        publish_verified_output(staged, &destination, self.overwrite, None)?;
-        self.record_published(destination, &pending.meta, true);
+        let (_, destination) = self.destination(&pending.meta)?;
+        let destination = publish_verified_output(
+            staged,
+            &destination,
+            self.overwrite,
+            None,
+            &mut self.renames,
+        )?;
+        self.record_published(pending.stored, destination, &pending.meta, true);
         Ok(())
     }
 
@@ -2720,6 +2770,7 @@ impl<'a> ExtractOutputs<'a> {
         let target = Arc::new(Mutex::new(Vec::new()));
         self.pending = Some(PendingOutput {
             staged: None,
+            stored: PathBuf::new(),
             destination: PathBuf::new(),
             meta: meta.clone(),
             link_target: Some(Arc::clone(&target)),
@@ -2733,13 +2784,19 @@ impl<'a> ExtractOutputs<'a> {
         link: ExtractedLink<'_>,
     ) -> rars_rs::Result<()> {
         self.publish_pending()?;
-        let destination = self.destination(meta)?;
+        let (stored, destination) = self.destination(meta)?;
         let relative = destination
             .strip_prefix(self.out_dir)
             .expect("checked output path is under the output directory")
             .to_path_buf();
-        let Some(target) =
-            rars_rs::output_links::link_target(self.out_dir, &relative, meta, link, self.family)?
+        let Some(target) = rars_rs::output_links::link_target(
+            self.out_dir,
+            &relative,
+            meta,
+            link,
+            self.family,
+            self.flatten,
+        )?
         else {
             self.skipped_links.push(SkippedLink {
                 name: meta.name.clone(),
@@ -2747,11 +2804,7 @@ impl<'a> ExtractOutputs<'a> {
             });
             return Ok(());
         };
-        if self.encoding.is_some() && self.published.contains(&destination) {
-            return Err(rars_rs::Error::InvalidArgument(
-                "multiple entries map to the same decoded output path",
-            ));
-        }
+        self.claim(&destination, meta)?;
         if self.in_place {
             let (path, file) = create_link_output(
                 self.out_dir,
@@ -2760,8 +2813,9 @@ impl<'a> ExtractOutputs<'a> {
                 link,
                 self.overwrite,
                 &self.created,
+                &mut self.renames,
             )?;
-            self.record_published(path, meta, file);
+            self.record_published(stored, path, meta, file);
             return Ok(());
         }
         if self.overwrite == OverwritePolicy::Never && fs::symlink_metadata(&destination).is_ok() {
@@ -2778,6 +2832,7 @@ impl<'a> ExtractOutputs<'a> {
             link,
             OverwritePolicy::Never,
             &self.created,
+            &mut self.renames,
         )?;
         self.staged += 1;
         let source = match link {
@@ -2792,24 +2847,27 @@ impl<'a> ExtractOutputs<'a> {
                 .expect("checked output path has a file name"),
         )?;
         // Creating the parents may have raced a symlink into place.
-        let destination = if self.flatten {
-            destination
-        } else {
-            self.destination(meta)?
-        };
+        let (_, destination) = self.destination(meta)?;
         if self.overwrite == OverwritePolicy::Always
             && fs::symlink_metadata(&destination).is_ok_and(|metadata| metadata.is_dir())
         {
             fs::remove_dir(&destination)?;
         }
-        publish_verified_output(&staged, &destination, self.overwrite, source.as_deref())?;
-        self.record_published(destination, meta, file);
+        let destination = publish_verified_output(
+            &staged,
+            &destination,
+            self.overwrite,
+            source.as_deref(),
+            &mut self.renames,
+        )?;
+        self.record_published(stored, destination, meta, file);
         Ok(())
     }
 
     /// Symlinks keep their own times: setting them would follow the link.
     fn record_published(
         &mut self,
+        stored: PathBuf,
         path: PathBuf,
         meta: &rars_rs::ExtractedEntryMeta,
         restore_times: bool,
@@ -2818,9 +2876,7 @@ impl<'a> ExtractOutputs<'a> {
             times.opened(path.clone(), self.family, meta);
             times.finish();
         }
-        if let Ok(relative) = path.strip_prefix(self.out_dir) {
-            self.created.insert(relative.to_path_buf(), path.clone());
-        }
+        self.created.insert(stored, path.clone());
         self.published.push(path);
     }
 
@@ -2846,8 +2902,16 @@ impl<'a> ExtractOutputs<'a> {
         };
         published?;
         restored?;
+        let mut paths = std::mem::take(&mut self.published);
+        if self.flatten && self.overwrite == OverwritePolicy::Always {
+            // A member that replaced an earlier one is listed once, where it last landed.
+            let mut seen = HashSet::new();
+            paths.reverse();
+            paths.retain(|path| seen.insert(path.clone()));
+            paths.reverse();
+        }
         Ok(Extracted {
-            paths: std::mem::take(&mut self.published),
+            paths,
             skipped_links: std::mem::take(&mut self.skipped_links),
         })
     }
@@ -3159,12 +3223,14 @@ fn parse_version(value: &str) -> PyResult<rars_rs::ArchiveVersion> {
         .ok_or_else(|| PyValueError::new_err(format!("unsupported RAR format: {value}")))
 }
 
+/// The member's stored relative path, and where it goes under `out_dir`.
 fn checked_output_path(
     out_dir: &Path,
     meta: &rars_rs::ExtractedEntryMeta,
     family: rars_rs::ArchiveFamily,
     encoding: Option<rars_rs::filename::LegacyNameEncoding>,
-) -> rars_rs::Result<PathBuf> {
+    flatten: bool,
+) -> rars_rs::Result<(PathBuf, PathBuf)> {
     // Retain the binding's conservative name preflight (including legacy
     // backslash traversal) before applying host-aware destination conversion.
     rars_rs::validate_entry_name(meta.name.clone())?;
@@ -3177,8 +3243,14 @@ fn checked_output_path(
     } else {
         rars_rs::filename::decoded_name(&meta.name, meta.name_is_unicode, encoding)?.into_owned()
     };
-    let rel = output_relative_path(&name, !rar50)?;
-    rars_rs::filename::checked_output_path(out_dir, &rel)
+    let stored = output_relative_path(&name, !rar50)?;
+    let relative = if flatten {
+        rars_rs::output_staging::flat_relative(&stored)
+    } else {
+        stored.clone()
+    };
+    let path = rars_rs::filename::checked_output_path(out_dir, &relative)?;
+    Ok((stored, path))
 }
 
 fn archive_base_name(path: &Path) -> PyResult<Vec<u8>> {
@@ -3565,7 +3637,7 @@ mod tests {
                 &directory,
                 rars_rs::ArchiveReadOptions::new(),
                 OutputMode {
-                    overwrite: false,
+                    overwrite: OverwritePolicy::Never,
                     in_place: false,
                     restore_times: true,
                     flatten: false,
@@ -3582,7 +3654,7 @@ mod tests {
                 &directory,
                 rars_rs::ArchiveReadOptions::new(),
                 OutputMode {
-                    overwrite: false,
+                    overwrite: OverwritePolicy::Never,
                     in_place: false,
                     restore_times: true,
                     flatten: false,
@@ -3599,7 +3671,7 @@ mod tests {
                 &directory,
                 rars_rs::ArchiveReadOptions::with_password(b"password"),
                 OutputMode {
-                    overwrite: false,
+                    overwrite: OverwritePolicy::Never,
                     in_place: false,
                     restore_times: true,
                     flatten: false,
