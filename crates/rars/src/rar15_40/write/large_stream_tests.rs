@@ -644,6 +644,80 @@ fn solid_rar29_members_stream() {
     let _ = std::fs::remove_file(path);
 }
 
+#[test]
+fn solid_stream_stores_noise_and_the_next_member_still_extracts() {
+    let len = 80 * 1024;
+    let (ramp_a, _) = pattern_source(len, ramp);
+    let (middle, _) = pattern_source(len, noise);
+    let (ramp_b, _) = pattern_source(len, ramp);
+    let entries = [
+        StreamingEntry::new(b"a.bin".to_vec(), ramp_a),
+        StreamingEntry::new(b"b.bin".to_vec(), middle),
+        StreamingEntry::new(b"c.bin".to_vec(), ramp_b),
+    ];
+    let features = crate::FeatureSet {
+        solid: true,
+        ..crate::FeatureSet::default()
+    };
+    let path = tempfile_path("solid-store");
+    {
+        let mut out = std::fs::File::create(&path).unwrap();
+        write_streaming_archive_to(
+            &entries,
+            WriterOptions::new(crate::ArchiveVersion::Rar30, features).with_compression_level(1),
+            crate::MemberCoding::Compressed,
+            None,
+            &WriterResources::default(),
+            None,
+            &mut out,
+        )
+        .unwrap();
+    }
+    let archive = ArchiveReader::read_path(&path).unwrap();
+    let methods = file_methods(&archive);
+    assert_eq!(methods.len(), 3, "{methods:?}");
+    assert_eq!(methods[1], 0x30, "noise must be stored, got {methods:?}");
+    assert_ne!(methods[0], 0x30, "{methods:?}");
+    assert_ne!(methods[2], 0x30, "{methods:?}");
+    let parts = Arc::new(Mutex::new(Vec::new()));
+    archive
+        .extract_to(None, {
+            let parts = Arc::clone(&parts);
+            move |_| {
+                Ok(Box::new(PartWriter {
+                    buf: Vec::new(),
+                    out: Arc::clone(&parts),
+                }) as Box<dyn Write>)
+            }
+        })
+        .unwrap();
+    let parts = parts.lock().expect("parts");
+    assert_eq!(parts.len(), 3);
+    let patterns = [ramp, noise, ramp];
+    for (part, byte) in parts.iter().zip(patterns) {
+        assert_eq!(part.len() as u64, len);
+        assert!(part
+            .iter()
+            .enumerate()
+            .all(|(i, value)| *value == byte(i as u64)));
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+fn file_methods(archive: &crate::Archive) -> Vec<u8> {
+    let crate::Archive::Rar15To40(parsed) = archive else {
+        panic!("expected a legacy archive");
+    };
+    parsed
+        .blocks
+        .iter()
+        .filter_map(|block| match block {
+            super::super::Block::File(file) => Some(file.method),
+            _ => None,
+        })
+        .collect()
+}
+
 struct EventSink {
     volumes: Arc<Mutex<Vec<Vec<u8>>>>,
     events: Vec<&'static str>,

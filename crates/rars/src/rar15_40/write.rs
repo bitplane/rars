@@ -1466,6 +1466,9 @@ fn stream_rar29_member<'a>(
     // coded the same way, without being loaded to make that decision.
     let choice = choose_stream_from_sample(&sample, encode_options, coding)?;
     let StreamChoice::Lz(filter) = choice else {
+        // Storing ends the solid chain. The encoder still holds the previous
+        // member, and the next header will say the chain stopped here.
+        rebuild_solid_encoder_after_store(solid_encoder, options)?;
         let mut crc = Crc32::new();
         member
             .bytes
@@ -1522,6 +1525,10 @@ fn stream_rar29_member<'a>(
     }
     if salt.is_none() && packed_len >= unpacked_size {
         if let Some(source) = member.bytes.source() {
+            // The trial encode already fed this member into the solid encoder.
+            // Keeping that dictionary would code the next member as a
+            // continuation of bytes this header stores on its own.
+            rebuild_solid_encoder_after_store(solid_encoder, options)?;
             return Ok(EncodedMember {
                 payload: MemberPayload::Copied(source),
                 method: 0x30,
@@ -1539,6 +1546,16 @@ fn stream_rar29_member<'a>(
         file_crc,
         salt,
     })
+}
+
+fn rebuild_solid_encoder_after_store(
+    solid_encoder: &mut Option<SolidEncoder>,
+    options: WriterOptions,
+) -> Result<()> {
+    if solid_encoder.is_some() {
+        *solid_encoder = Some(SolidEncoder::for_target(options)?);
+    }
+    Ok(())
 }
 
 struct CrcReader<'a, R> {

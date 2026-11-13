@@ -47,6 +47,30 @@ def test_progress_callbacks_run_for_extractall_testrar_and_read_many(tmp_path):
     assert ("read", "two.txt", 3) in seen
 
 
+def test_volume_progress_names_members_past_the_first_volume(tmp_path):
+    payload = b"0123456789" * 40
+    tail = b"abcde"
+    builder = rars.RarBuilder(format="rar50", store=True, volume_size=220)
+    builder.add_bytes(payload, "dir/file.bin")
+    builder.add_bytes(tail, "tail.txt")
+    (tmp_path / "in").mkdir()
+    parts = builder.write_volumes(tmp_path / "in" / "set.part01.rar")
+    assert len(parts) >= 2
+    with rars.RarFile(parts[0]) as archive:
+        assert "tail.txt" not in archive.namelist()
+        tested = []
+        archive.testrar(volumes=parts[1:], progress=lambda name: tested.append(name))
+        assert tested == ["dir/file.bin", "tail.txt"]
+        read = []
+        chunks = archive.read_many(
+            ["dir/file.bin", "tail.txt"],
+            volumes=parts[1:],
+            progress=lambda name, size: read.append((name, size)),
+        )
+    assert chunks == [payload, tail]
+    assert read == [("dir/file.bin", len(payload)), ("tail.txt", len(tail))]
+
+
 def test_flatten_drops_directories_and_renames_a_clash(tmp_path):
     builder = rars.RarBuilder(format="rar50", store=True)
     builder.add_bytes(b"first", "dir/readme.txt")

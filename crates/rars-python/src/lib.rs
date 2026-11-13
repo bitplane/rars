@@ -634,7 +634,7 @@ impl RarFile {
     ) -> PyResult<Vec<Vec<u8>>> {
         check_read_options_cancellation(options)?;
         let password = py_password(pwd)?.or_else(|| self.password.clone());
-        let (indices, data) = if self.follows(volumes) {
+        let (names, data) = if self.follows(volumes) {
             let read_options = self.extraction_options(options, password.as_deref());
             let archives = self.collect_volumes(py, volumes, read_options)?;
             let indices = members
@@ -650,11 +650,26 @@ impl RarFile {
                     )
                 })
                 .map_err(map_error)?;
-            (indices, data)
+            let logical = rars_rs::volume_members(&archives).map_err(map_error)?;
+            let names = indices
+                .iter()
+                .map(|index| logical_member_name(self.encoding, logical.get(*index)))
+                .collect::<PyResult<Vec<_>>>()?;
+            (names, data)
         } else {
             let indices = members
                 .try_iter()?
                 .map(|member| self.resolve_index(&member?))
+                .collect::<PyResult<Vec<_>>>()?;
+            let names = indices
+                .iter()
+                .map(|index| {
+                    Ok(self
+                        .infos
+                        .get(*index)
+                        .map(|info| info.filename.clone())
+                        .unwrap_or_default())
+                })
                 .collect::<PyResult<Vec<_>>>()?;
             let data = py
                 .detach(|| {
@@ -664,19 +679,14 @@ impl RarFile {
                     )
                 })
                 .map_err(map_error)?;
-            (indices, data)
+            (names, data)
         };
         let data = data
             .into_iter()
             .map(|bytes| bytes.ok_or_else(|| PyKeyError::new_err("member has no file payload")))
             .collect::<PyResult<Vec<_>>>()?;
         if let Some(progress) = progress {
-            for (index, bytes) in indices.iter().zip(&data) {
-                let name = self
-                    .infos
-                    .get(*index)
-                    .map(|info| info.filename.clone())
-                    .unwrap_or_default();
+            for (name, bytes) in names.iter().zip(&data) {
                 progress.call1((name, bytes.len()))?;
             }
         }
@@ -907,7 +917,17 @@ impl RarFile {
                 .map_err(map_error);
         }
         self.extract_set(py, volumes, options, |volumes| {
-            first.extract_with_volumes(volumes, options, |_| {
+            first.extract_with_volumes(volumes, options, |meta| {
+                if let Some(progress) = &progress {
+                    let name = String::from_utf8_lossy(meta.name_bytes()).into_owned();
+                    Python::attach(|py| {
+                        progress
+                            .bind(py)
+                            .call1((name,))
+                            .map(|_| ())
+                            .map_err(|_| rars_rs::Error::Cancelled)
+                    })?;
+                }
                 Ok(Box::new(io::sink()) as Box<dyn Write>)
             })
         })
@@ -3122,6 +3142,17 @@ fn map_error_with(py: Python<'_>, error: rars_rs::Error, detail: &str) -> PyErr 
 enum VolumeSource {
     Bytes(Vec<u8>),
     Path(PathBuf),
+}
+
+fn logical_member_name(
+    encoding: Option<rars_rs::filename::LegacyNameEncoding>,
+    member: Option<&rars_rs::ArchiveMember>,
+) -> PyResult<String> {
+    let Some(member) = member else {
+        return Ok(String::new());
+    };
+    let name = member.decoded_name(encoding).map_err(map_error)?;
+    Ok(String::from_utf8_lossy(&name).into_owned())
 }
 
 #[cfg(test)]
