@@ -680,6 +680,18 @@ fn table_regions<B: Budget>(
             _ => regions.try_push((start..start + TABLE_SCAN_WINDOW, stride))?,
         }
     }
+    // The scan steps in whole windows, so a file that is one table loses its
+    // last partial window. Keep that tail when it has the same stride. A
+    // different tail stays out, which is what keeps a table from swallowing
+    // the bytes after it.
+    if let Some((last, last_stride)) = regions.last_mut() {
+        if last.end < data.len() {
+            let tail = &data[last.end..];
+            if tail.len() > max_stride && table_stride(tail, max_stride) == Some(*last_stride) {
+                last.end = data.len();
+            }
+        }
+    }
     regions.retain(|(range, _)| range.len() >= MIN_TABLE_REGION);
     Ok(regions)
 }
@@ -1981,6 +1993,50 @@ mod tests {
             region.len() * 10 >= data.len() * 9,
             "the region has to cover the table: {region:?} of {}",
             data.len()
+        );
+    }
+
+    #[test]
+    fn a_table_keeps_the_partial_window_at_the_end_of_the_file() {
+        // 2,000 records is 48,000 bytes, two scan windows plus a tail. The
+        // scanner only steps in whole windows, so without the tail check the
+        // delta would stop 15,232 bytes early and those records would be
+        // stored as they are.
+        let data = reloc_table(2_000);
+        assert!(data.len() > MIN_TABLE_REGION);
+        assert!(!data.len().is_multiple_of(TABLE_SCAN_WINDOW));
+        let regions = delta_table_regions(&data, MAX_TABLE_STRIDE);
+        assert_eq!(regions, vec![(0..data.len(), 24)]);
+
+        let cut = (data.len() / TABLE_SCAN_WINDOW * TABLE_SCAN_WINDOW) / 24 * 24;
+        assert!(cut < data.len());
+        let truncated = FULL
+            .encode_filtered(
+                &data,
+                &[FilterSpec::range(
+                    FilterKind::Delta { channels: 24 },
+                    0..cut,
+                )],
+                options(),
+                None,
+            )
+            .unwrap();
+        let covered = FULL
+            .encode_filtered(
+                &data,
+                &[FilterSpec::range(
+                    FilterKind::Delta { channels: 24 },
+                    0..data.len(),
+                )],
+                options(),
+                None,
+            )
+            .unwrap();
+        assert!(
+            covered.len() < truncated.len(),
+            "covering the tail packed {} against {} for the cut at {cut}",
+            covered.len(),
+            truncated.len()
         );
     }
 
