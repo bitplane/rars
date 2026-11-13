@@ -1346,9 +1346,16 @@ struct EncodedMember<'a> {
 /// a prediction: the encoder holds the member, its packed output, and a match
 /// finder sized by the block it works in. Text at the levels that try PPMd
 /// also holds two PPMd models at once, one per trial, and the escape search.
-fn member_workspace(options: WriterOptions, unpacked: u64, compressing: bool) -> u64 {
+fn member_workspace(
+    options: WriterOptions,
+    unpacked: u64,
+    compressing: bool,
+    encrypting: bool,
+) -> u64 {
     if !compressing {
-        return 1024 * 1024;
+        // An encrypted stored member is loaded whole and encrypted in place.
+        let held = if encrypting { unpacked } else { 0 };
+        return held.saturating_add(1024 * 1024);
     }
     let dictionary =
         dictionary_size_for_options(options).unwrap_or(RAR29_MAX_DICTIONARY_SIZE) as u64;
@@ -1383,12 +1390,6 @@ fn encode_member<'a>(
     progress.check()?;
     let unpacked_size = member.unpacked_size()?;
     validate_member(member.name, options.target, unpacked_size)?;
-    // Compressing or encrypting holds the whole member, which past 4 GiB is too much.
-    if unpacked_size > MAX_SHORT_SIZE && (coding.compresses() || member.password.is_some()) {
-        return Err(Error::InvalidArgument(
-            "a member over 4 GiB can only be stored, without a password",
-        ));
-    }
     if member.is_directory {
         if unpacked_size != 0 {
             return Err(Error::InvalidArgument("directory source must be empty"));
@@ -1401,7 +1402,12 @@ fn encode_member<'a>(
         });
     }
     let _permit = resources.acquire_serialising_cancellable(
-        member_workspace(options, unpacked_size, coding.compresses()),
+        member_workspace(
+            options,
+            unpacked_size,
+            coding.compresses(),
+            member.password.is_some(),
+        ),
         &|| progress.is_cancelled(),
     )?;
 
@@ -3355,6 +3361,17 @@ mod tests {
         assert_eq!(header.len(), 32 + b"big.bin".len());
         assert_eq!(header[7..11], [0xff; 4]);
         assert_eq!(header[11..15], [0xff; 4]);
+    }
+
+    #[test]
+    fn an_encrypted_stored_member_is_charged_for_the_member_it_holds() {
+        let options = super::WriterOptions::new(ArchiveVersion::Rar40, FeatureSet::store_only());
+        let size = 5u64 << 30;
+        assert!(super::member_workspace(options, size, false, true) > size);
+        assert_eq!(
+            super::member_workspace(options, size, false, false),
+            1024 * 1024
+        );
     }
 
     #[test]

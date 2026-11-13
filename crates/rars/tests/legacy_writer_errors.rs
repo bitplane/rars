@@ -943,66 +943,29 @@ fn legacy_emission_propagates_failure_at_every_output_write() {
     }
 }
 
-fn write_over_4_gib(
-    target: ArchiveVersion,
-    coding: MemberCoding,
-    password: Option<&[u8]>,
-) -> Error {
-    let mut entry = rar15_40::StreamingEntry::new(
+#[test]
+fn rar15_refuses_members_over_4_gib_before_opening_them() {
+    let entry = rar15_40::StreamingEntry::new(
         b"big.bin".to_vec(),
         EntrySource::from_opener(u64::from(u32::MAX) + 1, || {
             panic!("a refused member opened its source")
         }),
     );
-    entry.password = password.map(<[u8]>::to_vec);
-    let features = if coding == MemberCoding::Stored {
-        FeatureSet::store_only()
-    } else {
-        FeatureSet::default()
-    };
-    rar15_40::write_streaming_archive_to(
+    let error = rar15_40::write_streaming_archive_to(
         &[entry],
-        rar15_40::WriterOptions::new(target, features),
-        coding,
+        rar15_40::WriterOptions::new(ArchiveVersion::Rar15, FeatureSet::store_only()),
+        MemberCoding::Stored,
         None,
         &WriterResources::default(),
         None,
         &mut io::sink(),
     )
-    .unwrap_err()
-}
-
-#[test]
-fn rar15_refuses_members_over_4_gib() {
-    let error = write_over_4_gib(ArchiveVersion::Rar15, MemberCoding::Stored, None);
+    .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::InvalidArgument);
     assert!(
         error
             .to_string()
             .contains("RAR 1.5 archives cannot hold a member over 4 GiB"),
-        "{error}"
-    );
-}
-
-#[test]
-fn members_over_4_gib_are_only_written_stored() {
-    let error = write_over_4_gib(ArchiveVersion::Rar40, MemberCoding::Compressed, None);
-    assert!(
-        error
-            .to_string()
-            .contains("a member over 4 GiB can only be stored, without a password"),
-        "{error}"
-    );
-}
-
-#[cfg(feature = "encryption")]
-#[test]
-fn encrypted_members_over_4_gib_are_refused() {
-    let error = write_over_4_gib(ArchiveVersion::Rar30, MemberCoding::Stored, Some(b"pw"));
-    assert!(
-        error
-            .to_string()
-            .contains("a member over 4 GiB can only be stored, without a password"),
         "{error}"
     );
 }
