@@ -20,7 +20,7 @@ all-features = true
 
 [[bin]]
 name = "rars"
-path = "src/main.rs"
+path = "src/lib.rs"
 
 [features]
 # Compatibility alias for existing build commands.
