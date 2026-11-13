@@ -1,4 +1,5 @@
 //! RAR20 member encoding and bit emission.
+use super::super::workspace::{Allowance, Buffer};
 use super::super::{huffman, match_finder};
 use super::*;
 
@@ -210,9 +211,9 @@ fn encode_member(
 
     let tokens = match progress.as_mut() {
         Some(report) => {
-            encode_tokens_with_progress(input, history, options, None, Some(&mut **report))?
+            encode_tokens_with_progress(input, history, options, None, None, Some(&mut **report))?
         }
-        None => encode_tokens_with_progress(input, history, options, None, None)?,
+        None => encode_tokens_with_progress(input, history, options, None, None, None)?,
     };
     let table_lengths = table_lengths_for_tokens(&tokens, fixed_table)?;
     let packed = encode_member_with_tables(&tokens, history, fixed_table, &table_lengths)?;
@@ -225,6 +226,14 @@ fn encode_member(
     // re-parse and a second buys 0.02%, but the shortest-path parse is far more
     // sensitive to its prices and a second pass is worth 0.12% to it.
     let refinements = if options.optimal_parse { 2 } else { 1 };
+    // Matches do not depend on prices, so both priced passes share one search.
+    let matches = if options.optimal_parse {
+        let (combined, start) = combined_input(input, history, options);
+        let end = combined.len();
+        Some(collect_match_lists(&combined, start, end, options))
+    } else {
+        None
+    };
     let mut best_tokens = tokens;
     let mut best_table = table_lengths;
     let mut best_packed = packed;
@@ -236,9 +245,17 @@ fn encode_member(
                 history,
                 options,
                 Some(&cost_model),
+                matches.as_ref(),
                 Some(&mut **report),
             )?,
-            None => encode_tokens_with_progress(input, history, options, Some(&cost_model), None)?,
+            None => encode_tokens_with_progress(
+                input,
+                history,
+                options,
+                Some(&cost_model),
+                matches.as_ref(),
+                None,
+            )?,
         };
         if next_tokens == best_tokens {
             break;
@@ -485,6 +502,123 @@ fn candidate_lengths(best_length: usize, offset: usize, out: &mut Vec<usize>) {
     out.dedup();
 }
 
+/// The nearest match per length at each position, so the parse can trade length against offset.
+struct MatchLists {
+    counts: Vec<u16>,
+    /// Lengths and offsets both rise within a position, so a longer match is never also nearer.
+    runs: Vec<FoundMatch>,
+}
+
+/// A length and an offset in four bytes, since there is one per match found.
+#[derive(Debug, Clone, Copy)]
+struct FoundMatch(u32);
+
+impl FoundMatch {
+    const LENGTH_BITS: u32 = 9;
+
+    fn new(length: usize, offset: usize) -> Self {
+        debug_assert!(length <= MAX_ENCODER_MATCH_LENGTH && offset <= MAX_ENCODER_MATCH_OFFSET);
+        Self(((offset as u32) << Self::LENGTH_BITS) | length as u32)
+    }
+
+    fn length(self) -> usize {
+        (self.0 & ((1 << Self::LENGTH_BITS) - 1)) as usize
+    }
+
+    fn offset(self) -> usize {
+        (self.0 >> Self::LENGTH_BITS) as usize
+    }
+}
+
+/// A run reaching this far is taken without pricing the positions it covers.
+const NICE_MATCH_LENGTH: usize = MAX_ENCODER_MATCH_LENGTH;
+
+/// From here a fresh match needs one more byte, so three-byte matches stop.
+const LONGER_FRESH_OFFSET: usize = 0x2000;
+
+/// How many chain candidates to try for a three-byte match the tree cannot report.
+const THREE_BYTE_CANDIDATES: usize = 16;
+
+fn collect_match_lists(
+    input: &[u8],
+    start: usize,
+    end: usize,
+    options: EncodeOptions,
+) -> MatchLists {
+    let allowance = Allowance::default();
+    // Slots only have to outlive the furthest match accepted.
+    let window = options.max_match_distance.saturating_add(1).min(end.max(1));
+    let mut tree = match_finder::TreeMatchFinder::with_allowance(window, &allowance)
+        .expect("unlimited finder allocation");
+    let mut chain = Rar20MatchFinder::new(window);
+    let mut found: Buffer<(u32, u32), Allowance> = Buffer::new(&allowance);
+    let candidates = options.max_match_candidates;
+    let mut lists = MatchLists {
+        counts: Vec::with_capacity(end - start),
+        runs: Vec::new(),
+    };
+    for pos in 0..end {
+        let max_offset = pos.min(options.max_match_distance);
+        let max_length = (end - pos).min(MAX_ENCODER_MATCH_LENGTH);
+        found.clear();
+        // Inserting into the tree is a search, so history positions search too.
+        if max_length >= 4 && candidates != 0 {
+            tree.matches(input, pos, max_length, max_offset, candidates, &mut found)
+                .expect("unlimited match allocation");
+        }
+        if pos >= start {
+            let before = lists.runs.len();
+            let nearest_tree = found
+                .first()
+                .map_or(usize::MAX, |&(_, offset)| offset as usize);
+            if candidates != 0 && max_length >= 3 {
+                if let Some(offset) = nearest_three_byte_match(
+                    input,
+                    pos,
+                    &chain,
+                    max_offset
+                        .min(nearest_tree - 1)
+                        .min(LONGER_FRESH_OFFSET - 1),
+                ) {
+                    lists.runs.push(FoundMatch::new(3, offset));
+                }
+            }
+            lists.runs.extend(
+                found
+                    .iter()
+                    .map(|&(length, offset)| (length as usize, offset as usize))
+                    .filter(|&(length, offset)| {
+                        offset <= MAX_ENCODER_MATCH_OFFSET
+                            && length >= 3 + match_length_adjustment(offset)
+                    })
+                    .map(|(length, offset)| FoundMatch::new(length, offset)),
+            );
+            lists.counts.push((lists.runs.len() - before) as u16);
+        }
+        chain.insert(input, pos);
+    }
+    lists
+}
+
+fn nearest_three_byte_match(
+    input: &[u8],
+    pos: usize,
+    chain: &Rar20MatchFinder,
+    max_offset: usize,
+) -> Option<usize> {
+    let mut candidate = chain.first(input, pos);
+    for _ in 0..THREE_BYTE_CANDIDATES {
+        if candidate == match_finder::NO_POSITION || pos - candidate > max_offset {
+            return None;
+        }
+        if input[candidate..candidate + 3] == input[pos..pos + 3] {
+            return Some(pos - candidate);
+        }
+        candidate = chain.previous(candidate);
+    }
+    None
+}
+
 /// Parse the member by shortest path, priced by the previous pass's tables.
 ///
 /// The greedy parse commits to a match the moment it finds one, with a two
@@ -501,8 +635,7 @@ fn encode_tokens_optimal(
     input: &[u8],
     start: usize,
     end: usize,
-    finder: &mut Rar20MatchFinder,
-    options: EncodeOptions,
+    matches: &MatchLists,
     cost_model: &CostModel<'_>,
 ) -> Vec<EncodeToken> {
     const UNREACHED: u64 = u64::MAX / 4;
@@ -512,13 +645,28 @@ fn encode_tokens_optimal(
     let mut token: Vec<Option<EncodeToken>> = vec![None; span + 1];
     let mut reps = vec![[0usize; 4]; span + 1];
     let mut lengths = Vec::new();
+    let mut next_run = 0usize;
+    // Positions inside a match long enough to take outright relax nothing.
+    let mut committed_through = 0usize;
+    debug_assert_eq!(
+        matches.counts.len(),
+        span,
+        "lists collected for another buffer"
+    );
     cost[0] = 0;
 
     for index in 0..span {
         // Every position is reachable through the one-byte literal edge.
+        let runs = &matches.runs[next_run..next_run + usize::from(matches.counts[index])];
+        next_run += runs.len();
+        if index < committed_through {
+            continue;
+        }
         let pos = start + index;
         let here = cost[index];
         let node_reps = reps[index];
+        let cap = (end - pos).min(MAX_ENCODER_MATCH_LENGTH);
+        let nice = NICE_MATCH_LENGTH.min(cap);
 
         let mut relax = |next: usize, price: u64, what: EncodeToken, next_reps: [usize; 4]| {
             // Literal, fresh, old-offset and short-match edges all end within span.
@@ -537,14 +685,16 @@ fn encode_tokens_optimal(
             node_reps,
         );
 
-        let cap = (end - pos).min(MAX_ENCODER_MATCH_LENGTH);
-        if let Some((best_length, offset)) =
-            best_match(input, pos, end, finder, options, Some(cost_model))
-        {
+        // Only an edge actually relaxed can be committed to.
+        let mut longest = 0usize;
+        // Shorter lengths are left to the nearer run before, assuming a nearer offset is not dearer.
+        let mut covered = 2usize;
+        for &run in runs {
+            let (reach, offset) = (run.length().min(cap), run.offset());
             let mut pushed = node_reps;
             push_old_offset(&mut pushed, offset);
-            candidate_lengths(best_length.min(cap), offset, &mut lengths);
-            for &length in &lengths {
+            candidate_lengths(reach, offset, &mut lengths);
+            for &length in lengths.iter().filter(|&&length| length > covered) {
                 let candidate = SelectedMatch::Fresh { length, offset };
                 if let Some(price) = cost_model.selected_cost(candidate) {
                     relax(
@@ -553,8 +703,10 @@ fn encode_tokens_optimal(
                         EncodeToken::Match { length, offset },
                         pushed,
                     );
+                    longest = longest.max(length);
                 }
             }
+            covered = reach;
         }
 
         for (rep_index, &offset) in node_reps.iter().enumerate() {
@@ -582,6 +734,7 @@ fn encode_tokens_optimal(
                         },
                         pushed,
                     );
+                    longest = longest.max(length);
                 }
             }
         }
@@ -601,7 +754,9 @@ fn encode_tokens_optimal(
             );
         }
 
-        finder.insert(input, pos);
+        if longest >= nice {
+            committed_through = index + longest;
+        }
     }
 
     let mut out = Vec::new();
@@ -627,34 +782,37 @@ fn match_run_length(input: &[u8], pos: usize, offset: usize, cap: usize) -> usiz
     length
 }
 
+fn combined_input(input: &[u8], history: &[u8], options: EncodeOptions) -> (Vec<u8>, usize) {
+    let history = &history[history.len().saturating_sub(options.max_match_distance)..];
+    let mut combined = Vec::with_capacity(history.len() + input.len());
+    combined.extend_from_slice(history);
+    combined.extend_from_slice(input);
+    (combined, history.len())
+}
+
 fn encode_tokens_with_progress(
     input: &[u8],
     history: &[u8],
     options: EncodeOptions,
     cost_model: Option<&CostModel>,
+    matches: Option<&MatchLists>,
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<EncodeToken>> {
-    let mut tokens = Vec::new();
-    let history = &history[history.len().saturating_sub(options.max_match_distance)..];
-    let mut combined = Vec::with_capacity(history.len() + input.len());
-    combined.extend_from_slice(history);
-    combined.extend_from_slice(input);
-    let mut finder = Rar20MatchFinder::new(combined.len());
-    for history_pos in 0..history.len() {
-        finder.insert(&combined, history_pos);
-    }
-
-    if let Some(cost_model) = cost_model.filter(|_| options.optimal_parse) {
-        let start = history.len();
-        let end = combined.len();
+    let (combined, start) = combined_input(input, history, options);
+    if let (Some(cost_model), Some(matches)) = (cost_model, matches) {
         return Ok(encode_tokens_optimal(
             &combined,
             start,
-            end,
-            &mut finder,
-            options,
+            combined.len(),
+            matches,
             cost_model,
         ));
+    }
+    let history = &combined[..start];
+    let mut tokens = Vec::new();
+    let mut finder = Rar20MatchFinder::new(combined.len());
+    for history_pos in 0..history.len() {
+        finder.insert(&combined, history_pos);
     }
 
     let mut pos = history.len();
@@ -1126,7 +1284,7 @@ fn match_length_at_offset(input: &[u8], pos: usize, max_length: usize, offset: u
 }
 
 fn match_length_adjustment(offset: usize) -> usize {
-    usize::from(offset >= 0x2000) + usize::from(offset >= 0x40000)
+    usize::from(offset >= LONGER_FRESH_OFFSET) + usize::from(offset >= 0x40000)
 }
 
 fn old_length_adjustment(offset: usize) -> usize {

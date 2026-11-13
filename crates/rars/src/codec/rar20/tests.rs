@@ -146,7 +146,7 @@ fn encode_tokens(
     options: EncodeOptions,
     cost_model: Option<&CostModel>,
 ) -> Vec<EncodeToken> {
-    encode_tokens_with_progress(input, history, options, cost_model, None)
+    encode_tokens_with_progress(input, history, options, cost_model, None, None)
         .expect("encoding without cancellation cannot be cancelled")
 }
 
@@ -860,18 +860,48 @@ fn optimal_parser_skips_an_out_of_format_fresh_match() {
     let mut input = vec![b'X'; end];
     input[..5].copy_from_slice(b"abcde");
     input[start..].copy_from_slice(b"abcde");
-    let mut finder = super::Rar20MatchFinder::new(input.len());
-    finder.insert(&input, 0);
     let mut options = EncodeOptions::new(1).with_optimal_parse(true);
     options.max_match_distance = start;
     let lengths = [0u8; super::TABLE_COUNT];
     let prices = CostModel::new(&lengths);
 
-    let tokens = super::encode_tokens_optimal(&input, start, end, &mut finder, options, &prices);
+    let matches = super::collect_match_lists(&input, start, end, options);
+    let tokens = super::encode_tokens_optimal(&input, start, end, &matches, &prices);
     assert_eq!(tokens.len(), 5);
     assert!(tokens
         .iter()
         .all(|token| matches!(token, EncodeToken::Literal(_))));
+}
+
+#[test]
+fn optimal_parser_covers_a_long_repeat_with_full_length_matches() {
+    let input: Vec<u8> = b"abcdefg".iter().cycle().take(64 * 1024).copied().collect();
+    let options = EncodeOptions::new(1024).with_optimal_parse(true);
+    let lengths = [0u8; super::TABLE_COUNT];
+    let prices = CostModel::new(&lengths);
+
+    let matches = super::collect_match_lists(&input, 0, input.len(), options);
+    let tokens = super::encode_tokens_optimal(&input, 0, input.len(), &matches, &prices);
+    let mut decoded = Vec::new();
+    for token in &tokens {
+        match *token {
+            EncodeToken::Literal(byte) => decoded.push(byte),
+            EncodeToken::Match { length, offset }
+            | EncodeToken::OldOffset { length, offset, .. } => {
+                for _ in 0..length {
+                    decoded.push(decoded[decoded.len() - offset]);
+                }
+            }
+            ref other => panic!("unexpected token {other:?}"),
+        }
+    }
+    assert_eq!(decoded, input);
+    // 7 literals, then 258-byte matches; anything near one token per byte means the parse broke up the run.
+    assert!(
+        tokens.len() <= 7 + input.len() / 258 + 2,
+        "{} tokens",
+        tokens.len()
+    );
 }
 
 #[test]
