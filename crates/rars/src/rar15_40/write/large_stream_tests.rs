@@ -81,9 +81,43 @@ fn tempfile_path(label: &str) -> std::path::PathBuf {
     ))
 }
 
+/// Free bytes on the temp filesystem, from POSIX `df -kP`. `None` if `df`
+/// cannot be read, so the large-file tests still run.
+fn available_temp_bytes() -> Option<u64> {
+    let output = std::process::Command::new("df")
+        .args(["-kP"])
+        .arg(std::env::temp_dir())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let available_kib = text.lines().nth(1)?.split_whitespace().nth(3)?;
+    available_kib
+        .parse::<u64>()
+        .ok()
+        .map(|kib| kib.saturating_mul(1024))
+}
+
+/// Hosted CI disks are smaller than these archives. Skip only when `df`
+/// reports too little free space.
+fn skip_unless_temp_can_hold(bytes: u64) -> bool {
+    match available_temp_bytes() {
+        Some(free) if free < bytes => {
+            eprintln!("skipping large-file test: {free} bytes free in the temp dir, need {bytes}");
+            true
+        }
+        _ => false,
+    }
+}
+
 #[test]
 fn rar29_plain_archive_round_trips_a_member_over_four_gibibytes() {
     let len = u64::from(u32::MAX) + 4096;
+    if skip_unless_temp_can_hold(len + 64 * 1024 * 1024) {
+        return;
+    }
     let source = EntrySource::from_factory(Repeat {
         len,
         reads: Arc::new(AtomicU64::new(0)),
@@ -834,6 +868,9 @@ impl crate::volume_sink::VolumeSink for DiskSink {
 #[test]
 fn stored_legacy_volume_set_splits_twenty_one_gigabytes_in_bounded_memory() {
     let len = 21 * 1024 * 1024 * 1024;
+    if skip_unless_temp_can_hold(len + 1024 * 1024 * 1024) {
+        return;
+    }
     let (source, _) = pattern_source(len, ramp);
     let entry = StreamingEntry::new(b"huge.bin".to_vec(), source);
     let dir = tempfile_path("vol21");
