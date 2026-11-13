@@ -18,9 +18,17 @@ workspace = true
 [package.metadata.docs.rs]
 all-features = true
 
+[lib]
+name = "rars_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "rars"
 path = "src/main.rs"
+
+[[bin]]
+name = "unrars"
+path = "src/unrars_main.rs"
 
 [features]
 # Compatibility alias for existing build commands.
