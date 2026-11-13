@@ -58,7 +58,10 @@ pub(super) fn split_stored(
     validate_plan(options, PlanShape::new().volumes(true), false, false)?;
     let name = member.name;
     let source_len = member.bytes.len()?;
-    validate_volume_member(name, options.target, source_len).map_err(|error| {
+    // The in-memory volume writer still refuses a member over 4 GiB. This path
+    // reads the member as it splits, so the large-file header is enough. RAR 1.5
+    // cannot claim that header.
+    validate_member(name, options.target, source_len).map_err(|error| {
         crate::write_stream::member_error(error, name, "preparing volume member")
     })?;
     if member.file_comment.is_some() {

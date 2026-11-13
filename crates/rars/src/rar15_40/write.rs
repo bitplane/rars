@@ -25,6 +25,9 @@ use std::io::Write;
 mod stored_volumes;
 pub use stored_volumes::write_stored_volumes_to;
 
+#[cfg(test)]
+mod large_volume_tests;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct WriterOptions {
