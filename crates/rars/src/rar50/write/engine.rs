@@ -443,7 +443,7 @@ pub(super) fn write_archive(
         debug_assert_eq!(layout.recovery_prefix_len, Some(mirror.len()));
         debug_assert_eq!(
             layout.recovery_offset,
-            Some(mirror.len() - RAR50_SIGNATURE.len() as u64),
+            Some(mirror.len() - RAR50_SIGNATURE.len() as u64 - head_crypt.len() as u64),
             "recovery record is not where the locator points"
         );
         write_recovery_service(
@@ -674,7 +674,7 @@ fn encrypted_service_block<'a>(
 
     let mut extra = Bytes::new(resources);
     write_extra_record(&mut extra, FHEXTRA_SUBDATA, service_data)?;
-    write_file_encryption_record(&mut extra, salt, iv, keys.checked_password_record()?)?;
+    write_file_encryption_record(&mut extra, salt, iv, keys.checked_password_record()?, true)?;
     write_hash_record_with_value(
         &mut extra,
         keys.checked_hash_mac(crate::rar50::blake2sp::hash(data))?,
@@ -767,7 +767,13 @@ fn prepare_member(
             )?;
             let keys =
                 Rar50Keys::derive(password, salt, WRITE_KDF_COUNT_LOG).map_err(Error::from)?;
-            write_file_encryption_record(&mut extra, salt, iv, keys.checked_password_record()?)?;
+            write_file_encryption_record(
+                &mut extra,
+                salt,
+                iv,
+                keys.checked_password_record()?,
+                true,
+            )?;
             let crc32 = keys.checked_crc_mac(member.crc32)?;
             let hash = keys.checked_hash_mac(member.hash)?;
             (
@@ -1892,7 +1898,8 @@ impl VolumeWriter<'_> {
 /// member's own checksum and hash; the rest carry `fragment` over the bytes
 /// they store, which is what WinRAR puts there and lets one volume be checked
 /// on its own. Encrypted fragments checksum the ciphertext, so that check needs
-/// no password.
+/// no password, and like WinRAR they leave the hash-MAC flag off; with it set,
+/// unrar MACs the checksum it computes and reports a packed data checksum error.
 ///
 /// Both a CRC32 and a hash record go on every fragment. A reader takes the hash
 /// record as the member's checksum type when it has one, and unrar picks that
@@ -1910,7 +1917,7 @@ fn fragment_header(
     let split_after = fragment.is_some();
     let mut extra = Bytes::new(resources);
     if let Some((salt, iv, check_value)) = member.encryption {
-        write_file_encryption_record(&mut extra, salt, iv, check_value)?;
+        write_file_encryption_record(&mut extra, salt, iv, check_value, !split_after)?;
     }
     write_hash_record_with_value(&mut extra, fragment.map_or(member.hash, |f| f.hash))?;
     super::headers::write_mtime_record(&mut extra, member.mtime, member.mtime_nanoseconds)?;

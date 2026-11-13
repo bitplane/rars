@@ -101,8 +101,11 @@ pub(super) fn resolve_layout(
             .checked_add(quick_open_block_len)
             .ok_or(Error::InvalidArgument("RAR 5 archive layout overflows"))?;
 
-        let next_quick_open = quick_open_offset.map(|_| quick_open_position - signature_len);
-        let next_recovery = recovery_offset.map(|_| recovery_position - signature_len);
+        // Locator offsets count from the main header, which follows the
+        // encryption header when there is one.
+        let main_position = signature_len + inputs.head_crypt_len;
+        let next_quick_open = quick_open_offset.map(|_| quick_open_position - main_position);
+        let next_recovery = recovery_offset.map(|_| recovery_position - main_position);
 
         if next_quick_open == quick_open_offset && next_recovery == recovery_offset {
             return Ok(ResolvedLayout {
@@ -230,8 +233,8 @@ mod tests {
     /// the archive is assembled from the sizes it computed.
     fn assert_self_consistent(inputs: &LayoutInputs<'_>, layout: &ResolvedLayout) {
         let signature_len = RAR50_SIGNATURE.len() as u64;
-        let quick_open_position =
-            signature_len + inputs.head_crypt_len + layout.main_header_len + inputs.body_len;
+        let main_position = signature_len + inputs.head_crypt_len;
+        let quick_open_position = main_position + layout.main_header_len + inputs.body_len;
 
         // Rebuilding the header with the settled offsets must not resize it.
         let rebuilt = super::main_header_len(
@@ -255,7 +258,7 @@ mod tests {
                     locator.quick_open_offset,
                     inputs
                         .quick_open_payload_len
-                        .map(|_| quick_open_position - signature_len)
+                        .map(|_| quick_open_position - main_position)
                         .or_else(|| inputs.archive_metadata.map(|_| 0))
                 );
                 assert_eq!(locator.recovery_record_offset, layout.recovery_offset);
@@ -276,11 +279,11 @@ mod tests {
             };
             assert_eq!(
                 offset,
-                quick_open_position + quick_open_block_len - signature_len
+                quick_open_position + quick_open_block_len - main_position
             );
             assert_eq!(
                 layout.recovery_prefix_len,
-                Some(offset + signature_len),
+                Some(offset + main_position),
                 "recovery protects everything before its own block"
             );
         }
@@ -320,8 +323,7 @@ mod tests {
                     let initial = resolve_layout(&inputs, &resources).unwrap();
                     for bits in (7..=63).step_by(7) {
                         let boundary = 1u64 << bits;
-                        let base = boundary
-                            .saturating_sub(inputs.head_crypt_len + initial.main_header_len);
+                        let base = boundary.saturating_sub(initial.main_header_len);
                         for delta in -32i64..=32 {
                             inputs.body_len = base.saturating_add_signed(delta);
                             let layout = resolve_layout(&inputs, &resources).unwrap();

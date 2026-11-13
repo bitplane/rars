@@ -82,15 +82,20 @@ pub(super) fn write_hash_record_with_value(
     Ok(())
 }
 
+/// `hash_mac` says the header's CRC32 and hash are MACs keyed by the password.
+/// A split part that is not the last stores plain checksums of its ciphertext,
+/// and RAR leaves the flag off there, so readers check those as they are.
 pub(super) fn write_file_encryption_record(
     out: &mut impl HeaderOutput,
     salt: [u8; 16],
     iv: [u8; 16],
     check_value: [u8; 12],
+    hash_mac: bool,
 ) -> Result<()> {
     let mut record = HeaderScratch::<47>::new();
     record.vint(0);
-    record.vint(0x0003);
+    // Password check present, and the checksums MACed when `hash_mac`.
+    record.vint(0x0001 | if hash_mac { 0x0002 } else { 0 });
     record.extend_from_slice(&[WRITE_KDF_COUNT_LOG]);
     record.extend_from_slice(&salt);
     record.extend_from_slice(&iv);
@@ -788,13 +793,15 @@ mod scratch_tests {
     #[test]
     fn fixed_records_fit_their_stack_capacity_and_keep_wire_bytes() {
         let mut actual = Vec::new();
-        write_file_encryption_record(&mut actual, [1; 16], [2; 16], [3; 12]).unwrap();
-        let mut body = vec![0, 3, WRITE_KDF_COUNT_LOG];
-        body.extend_from_slice(&[1; 16]);
-        body.extend_from_slice(&[2; 16]);
-        body.extend_from_slice(&[3; 12]);
-        assert_eq!(actual, buffered_record(FHEXTRA_CRYPT, &body));
-        actual.clear();
+        for (hash_mac, flags) in [(true, 3), (false, 1)] {
+            write_file_encryption_record(&mut actual, [1; 16], [2; 16], [3; 12], hash_mac).unwrap();
+            let mut body = vec![0, flags, WRITE_KDF_COUNT_LOG];
+            body.extend_from_slice(&[1; 16]);
+            body.extend_from_slice(&[2; 16]);
+            body.extend_from_slice(&[3; 12]);
+            assert_eq!(actual, buffered_record(FHEXTRA_CRYPT, &body));
+            actual.clear();
+        }
         write_hash_record_with_value(&mut actual, [7; 32]).unwrap();
         let mut body = vec![0];
         body.extend_from_slice(&[7; 32]);
