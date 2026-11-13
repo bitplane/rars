@@ -680,6 +680,7 @@ fn encode_tokens_optimal(
     let mut next_run = 0usize;
     // Positions inside a match long enough to take outright relax nothing.
     let mut committed_through = 0usize;
+    let mut pairs = PairTable::new(input, start);
     debug_assert_eq!(
         matches.counts.len(),
         span,
@@ -767,9 +768,8 @@ fn encode_tokens_optimal(
             }
         }
 
-        if let Some(SelectedMatch::ShortOffset { offset }) =
-            best_short_offset_match(input, pos, end)
-        {
+        pairs.advance(input, pos);
+        if let Some(SelectedMatch::ShortOffset { offset }) = pairs.nearest(input, pos, end) {
             let slot = short_slot_index(offset);
             let price = usize::from(cost_model.main[261 + slot]) + usize::from(SHORT_BITS[slot]);
             let mut pushed = node_reps;
@@ -865,6 +865,7 @@ fn encode_tokens_with_progress(
     for history_pos in 0..start {
         finder.insert(combined, history_pos);
     }
+    let mut pairs = PairTable::new(combined, start);
     let mut literal_totals = LiteralTotals::default();
     // A lazy look ahead prices a whole match from each position it tries.
     let priced_reach = options
@@ -883,25 +884,18 @@ fn encode_tokens_with_progress(
         }
         let priced = cost_model.map(|model| model.with_literal_totals(&literal_totals));
         let cost_model = priced.as_ref();
-        let selected = select_match(
-            combined,
-            pos,
+        pairs.advance(combined, pos);
+        let search = SearchContext {
+            input: combined,
             end,
-            &finder,
+            finder: &finder,
+            pairs: &pairs,
             options,
-            &old_offsets,
+            old_offsets: &old_offsets,
             cost_model,
-        );
-        if let Some(selected) = selected {
-            let lazy = LazyMatchContext {
-                input: combined,
-                end,
-                finder: &finder,
-                options,
-                old_offsets: &old_offsets,
-                cost_model,
-            };
-            if should_lazy_emit_literal(pos, selected, lazy) {
+        };
+        if let Some(selected) = select_match(&search, pos) {
+            if should_lazy_emit_literal(pos, selected, &search) {
                 tokens.push(EncodeToken::Literal(combined[pos]));
                 finder.insert(combined, pos);
                 pos += 1;
@@ -1162,15 +1156,16 @@ impl SelectedMatch {
     }
 }
 
-fn select_match(
-    input: &[u8],
-    pos: usize,
-    end: usize,
-    finder: &Rar20MatchFinder,
-    options: EncodeOptions,
-    old_offsets: &[usize; 4],
-    cost_model: Option<&CostModel<'_>>,
-) -> Option<SelectedMatch> {
+fn select_match(context: &SearchContext<'_>, pos: usize) -> Option<SelectedMatch> {
+    let SearchContext {
+        input,
+        end,
+        finder,
+        pairs,
+        options,
+        old_offsets,
+        cost_model,
+    } = *context;
     let fresh = best_match(input, pos, end, finder, options, cost_model);
     let old = best_old_offset_match(input, pos, end, old_offsets, cost_model);
     if let Some(cost_model) = cost_model {
@@ -1181,7 +1176,7 @@ fn select_match(
                 length,
                 offset,
             }),
-            best_short_offset_match(input, pos, end),
+            pairs.nearest(input, pos, end),
         ]
         .into_iter()
         .flatten()
@@ -1211,14 +1206,16 @@ fn select_match(
             length,
             offset,
         }),
-        (None, None) => best_short_offset_match(input, pos, end),
+        (None, None) => pairs.nearest(input, pos, end),
     }
 }
 
-struct LazyMatchContext<'a> {
+#[derive(Clone, Copy)]
+struct SearchContext<'a> {
     input: &'a [u8],
     end: usize,
     finder: &'a Rar20MatchFinder,
+    pairs: &'a PairTable,
     options: EncodeOptions,
     old_offsets: &'a [usize; 4],
     cost_model: Option<&'a CostModel<'a>>,
@@ -1227,7 +1224,7 @@ struct LazyMatchContext<'a> {
 fn should_lazy_emit_literal(
     pos: usize,
     current: SelectedMatch,
-    context: LazyMatchContext<'_>,
+    context: &SearchContext<'_>,
 ) -> bool {
     if !context.options.lazy_matching {
         return false;
@@ -1236,16 +1233,7 @@ fn should_lazy_emit_literal(
     (1..=lookahead)
         .take_while(|offset| pos + offset < context.end)
         .any(|offset| {
-            select_match(
-                context.input,
-                pos + offset,
-                context.end,
-                context.finder,
-                context.options,
-                context.old_offsets,
-                context.cost_model,
-            )
-            .is_some_and(|next| {
+            select_match(context, pos + offset).is_some_and(|next| {
                 let current_score = context
                     .cost_model
                     .and_then(|cost_model| cost_model.selected_score(current, context.input, pos))
@@ -1450,16 +1438,59 @@ fn is_better_old_offset_match(
     length > best_length || (length == best_length && offset < best_offset)
 }
 
-fn best_short_offset_match(input: &[u8], pos: usize, end: usize) -> Option<SelectedMatch> {
-    if end - pos < 2 {
-        return None;
+const MAX_SHORT_OFFSET: usize = 256;
+
+/// Last start of each two-byte pair, so the nearest short match is one lookup, not a scan of every offset.
+struct PairTable {
+    // Positions wrap past 4 GiB; a lookup re-checks the bytes it is pointed at.
+    last: Vec<u32>,
+    indexed_to: usize,
+}
+
+impl PairTable {
+    /// Pairs further back than a short offset reaches can never match.
+    fn new(input: &[u8], start: usize) -> Self {
+        let mut table = Self {
+            last: vec![0; 1 << 16],
+            indexed_to: start.saturating_sub(MAX_SHORT_OFFSET),
+        };
+        table.advance(input, start);
+        table
     }
-    let max_offset = pos.min(256);
-    (1..=max_offset)
-        .find(|&offset| {
-            input[pos] == input[pos - offset] && input[pos + 1] == input[pos + 1 - offset]
-        })
-        .map(|offset| SelectedMatch::ShortOffset { offset })
+
+    fn pair(input: &[u8], pos: usize) -> usize {
+        usize::from(u16::from_le_bytes([input[pos], input[pos + 1]]))
+    }
+
+    fn advance(&mut self, input: &[u8], pos: usize) {
+        let through = pos.min(input.len().saturating_sub(1));
+        for at in self.indexed_to..through {
+            self.last[Self::pair(input, at)] = at as u32;
+        }
+        self.indexed_to = self.indexed_to.max(through);
+    }
+
+    fn nearest(&self, input: &[u8], pos: usize, end: usize) -> Option<SelectedMatch> {
+        if end - pos < 2 {
+            return None;
+        }
+        debug_assert!(
+            pos >= self.indexed_to,
+            "short-match lookup behind the table"
+        );
+        let pair = Self::pair(input, pos);
+        let floor = pos.saturating_sub(MAX_SHORT_OFFSET);
+        // A lazy lookahead asks about positions the table has not reached yet.
+        let unindexed = (self.indexed_to.max(floor)..pos)
+            .rev()
+            .find(|&at| Self::pair(input, at) == pair);
+        let found = unindexed.or_else(|| {
+            let offset = (pos as u32).wrapping_sub(self.last[pair]) as usize;
+            let at = pos.checked_sub(offset)?;
+            (offset != 0 && at >= floor && Self::pair(input, at) == pair).then_some(at)
+        });
+        found.map(|at| SelectedMatch::ShortOffset { offset: pos - at })
+    }
 }
 
 fn match_length_at_offset(input: &[u8], pos: usize, max_length: usize, offset: usize) -> usize {
@@ -1527,7 +1558,7 @@ fn offset_slot_for_match(offset: usize) -> Result<(usize, usize)> {
 }
 
 fn short_slot_for_match(offset: usize) -> Result<(usize, usize)> {
-    if offset == 0 || offset > 256 {
+    if offset == 0 || offset > MAX_SHORT_OFFSET {
         return Err(Error::InvalidData(
             "RAR 2.0 short match offset is out of range",
         ));
