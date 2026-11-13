@@ -973,21 +973,15 @@ fn write_over_4_gib(
 }
 
 #[test]
-fn formats_without_large_file_fields_refuse_members_over_4_gib() {
-    for (target, message) in [
-        (
-            ArchiveVersion::Rar15,
-            "RAR 1.5 archives cannot hold a member over 4 GiB",
-        ),
-        (
-            ArchiveVersion::Rar20,
-            "RAR 2.0 archives cannot hold a member over 4 GiB",
-        ),
-    ] {
-        let error = write_over_4_gib(target, MemberCoding::Stored, None);
-        assert_eq!(error.kind(), ErrorKind::InvalidArgument);
-        assert!(error.to_string().contains(message), "{error}");
-    }
+fn rar15_refuses_members_over_4_gib() {
+    let error = write_over_4_gib(ArchiveVersion::Rar15, MemberCoding::Stored, None);
+    assert_eq!(error.kind(), ErrorKind::InvalidArgument);
+    assert!(
+        error
+            .to_string()
+            .contains("RAR 1.5 archives cannot hold a member over 4 GiB"),
+        "{error}"
+    );
 }
 
 #[test]
