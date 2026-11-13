@@ -2112,22 +2112,26 @@ mod tests {
 
     #[test]
     fn parallel_streaming_blocks_are_byte_identical_to_serial_blocks() {
-        let mut data = Vec::new();
-        for index in 0..52_000u32 {
-            data.extend_from_slice(b"parallel block identity payload ");
-            data.extend_from_slice(&index.to_le_bytes());
+        let block_size = crate::codec::rar50::LZ_BLOCK_SIZE;
+        let pattern = |run: usize| (0..8).map(move |offset| (run * 8 + offset) as u8).cycle();
+        // Each chunk opens with the previous chunk's pattern, so every block
+        // reaches back into the one before it, including across the job cut.
+        let mut data: Vec<u8> = pattern(0).take(1024).collect();
+        for run in 1..=34 {
+            data.extend(pattern(run).take(block_size));
         }
         // A stretch that does not move, so the two loops have to agree about
         // growing a block and not only about cutting one every block_size.
-        data.extend(std::iter::repeat_n(0u8, 3 * 1024 * 1024));
-        data.extend((0..400_000u32).map(|index| (index as u8).wrapping_mul(37)));
-        let options = WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only());
+        data.extend(std::iter::repeat_n(0xff, 4 * block_size));
+        data.extend(pattern(19).take(10_000));
+        // The smallest dictionary, so a job ends at a mebibyte of input.
+        let options = WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
+            .with_dictionary_size(DEFAULT_RAR50_DICTIONARY_SIZE);
         let dictionary_size =
             dictionary_size_for_options(options, data.len() as u64, u64::MAX).unwrap();
         let algorithm_version = rar50_algorithm_version(options, dictionary_size).unwrap();
         let encode_options =
             encode_options_for_level(options.compression_level, dictionary_size).unwrap();
-        let block_size = crate::codec::rar50::LZ_BLOCK_SIZE;
         let mut serial = Vec::new();
         crate::codec::rar50::encode_lz_reader_to(
             &mut Cursor::new(&data),
@@ -2140,6 +2144,33 @@ mod tests {
         )
         .unwrap();
 
+        let mut blocks = 0;
+        let mut rest = &serial[..];
+        while !rest.is_empty() {
+            let block = crate::codec::rar50::parse_compressed_block(rest).unwrap();
+            rest = &rest[block.payload.end..];
+            blocks += 1;
+        }
+        let chunks = data.len().div_ceil(block_size);
+        assert!(blocks > 2, "only {blocks} blocks");
+        assert!(blocks < chunks, "no block grew past one chunk");
+
+        let plan = compress::CompressPlan {
+            algorithm_version,
+            encode_options,
+            dictionary_size,
+            block_size,
+            solid: false,
+            method: 1,
+            filter_policy: FilterPolicy::None,
+            candidates: vec![encode_options].into(),
+        };
+        // A job stops at the first block ending past run_size, and a block
+        // spans at most MAX_LZ_BLOCK_SIZE, so this much input needs two jobs.
+        assert!(
+            data.len() > compress::run_size(&plan) + crate::codec::rar50::MAX_LZ_BLOCK_SIZE,
+            "the input fits in one job"
+        );
         let source = EntrySource::from_bytes(Arc::<[u8]>::from(data));
         let required = streaming_lz_workspace(
             dictionary_size,
@@ -2148,16 +2179,7 @@ mod tests {
         );
         let mut prepared = compress::compress_members_reporting(
             &[source],
-            compress::CompressPlan {
-                algorithm_version,
-                encode_options,
-                dictionary_size,
-                block_size,
-                solid: false,
-                method: 1,
-                filter_policy: FilterPolicy::None,
-                candidates: vec![encode_options].into(),
-            },
+            plan,
             &WriterResources::new(required.saturating_mul(4)),
             &|_| true,
         )
