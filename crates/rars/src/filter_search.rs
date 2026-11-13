@@ -683,9 +683,11 @@ fn table_regions<B: Budget>(
     // The scan steps in whole windows, so a file that is one table loses its
     // last partial window. Keep that tail when it has the same stride. A
     // different tail stays out, which is what keeps a table from swallowing
-    // the bytes after it.
+    // the bytes after it. The last region has to reach the last whole window,
+    // or the tail would also cover the windows the scan rejected.
+    let whole_windows = data.len() - data.len() % TABLE_SCAN_WINDOW;
     if let Some((last, last_stride)) = regions.last_mut() {
-        if last.end < data.len() {
+        if last.end == whole_windows && last.end < data.len() {
             let tail = &data[last.end..];
             if tail.len() > max_stride && table_stride(tail, max_stride) == Some(*last_stride) {
                 last.end = data.len();
@@ -2037,6 +2039,29 @@ mod tests {
             "covering the tail packed {} against {} for the cut at {cut}",
             covered.len(),
             truncated.len()
+        );
+    }
+
+    #[test]
+    fn the_table_tail_does_not_reach_back_over_a_rejected_window() {
+        // A table window, a noise window, then a partial window of table.
+        let table = reloc_table(4_000);
+        let mut data = table[..TABLE_SCAN_WINDOW].to_vec();
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..TABLE_SCAN_WINDOW {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            data.push(x as u8);
+        }
+        data.extend_from_slice(&table[TABLE_SCAN_WINDOW..TABLE_SCAN_WINDOW + 16_000]);
+        let regions = delta_table_regions(&data, MAX_TABLE_STRIDE);
+        assert!(
+            regions
+                .iter()
+                .all(|(range, _)| range.end <= TABLE_SCAN_WINDOW
+                    || range.start >= 2 * TABLE_SCAN_WINDOW),
+            "{regions:?}"
         );
     }
 
