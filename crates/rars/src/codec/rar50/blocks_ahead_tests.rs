@@ -406,3 +406,19 @@ fn concurrent_members_share_the_workers_and_decode_as_the_serial_decoder_does() 
         }
     });
 }
+
+#[test]
+fn decode_pools_are_kept_per_worker_count() {
+    let mut pools = DecodePools::new();
+    let two = pools.get(2).unwrap();
+    let three = pools.get(3).unwrap();
+    assert!(Arc::ptr_eq(&two, &pools.get(2).unwrap()));
+    assert!(Arc::ptr_eq(&three, &pools.get(3).unwrap()));
+    assert_eq!(two.current_num_threads(), 2);
+    // A fifth size pushes out the least recently used one, here 2.
+    for workers in [4, 5, 6] {
+        pools.get(workers).unwrap();
+    }
+    assert!(!Arc::ptr_eq(&two, &pools.get(2).unwrap()));
+    assert_eq!(pools.0.len(), DECODE_POOL_SIZES);
+}
