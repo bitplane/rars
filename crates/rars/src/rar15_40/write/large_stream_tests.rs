@@ -547,6 +547,85 @@ fn streamed_member_stores_when_the_sample_does_not_shrink() {
 }
 
 #[test]
+fn streamed_password_member_stores_noise_encrypted() {
+    let len = 80 * 1024;
+    let (source, _) = pattern_source(len, noise);
+    let entry = StreamingEntry::new(b"noise.bin".to_vec(), source).with_password(b"secret");
+    let path = tempfile_path("pw-noise");
+    {
+        let mut out = std::fs::File::create(&path).unwrap();
+        write_streaming_archive_to(
+            &[entry],
+            WriterOptions::new(crate::ArchiveVersion::Rar30, crate::FeatureSet::default())
+                .with_compression_level(1),
+            crate::MemberCoding::Compressed,
+            None,
+            &WriterResources::default(),
+            None,
+            &mut out,
+        )
+        .unwrap();
+    }
+    let bytes = std::fs::read(&path).unwrap();
+    let archive = ArchiveReader::read(&bytes).unwrap();
+    let crate::Archive::Rar15To40(parsed) = &archive else {
+        panic!("expected a legacy archive");
+    };
+    let file = parsed
+        .blocks
+        .iter()
+        .find_map(|block| match block {
+            super::super::Block::File(file) => Some(file),
+            _ => None,
+        })
+        .expect("file");
+    assert_eq!(file.method, 0x30);
+    assert_ne!(file.block.flags & super::super::FHD_PASSWORD, 0);
+    assert_ne!(file.block.flags & super::super::FHD_SALT, 0);
+    assert!(file.salt.is_some());
+    let packed = &bytes[file.packed_range.clone()];
+    let mut plain = vec![0u8; 32];
+    for (index, byte) in plain.iter_mut().enumerate() {
+        *byte = noise(index as u64);
+    }
+    assert_ne!(&packed[..plain.len()], plain.as_slice());
+    assert!(archive
+        .extract_to(None, |_| Ok(Box::new(std::io::sink())))
+        .is_err());
+    assert!(archive
+        .extract_to(Some(b"nope"), |_| Ok(Box::new(std::io::sink())))
+        .is_err());
+    check_extract_password(&archive, len, noise, b"secret");
+    let _ = std::fs::remove_file(path);
+}
+
+fn check_extract_password(
+    archive: &crate::Archive,
+    len: u64,
+    byte: fn(u64) -> u8,
+    password: &[u8],
+) {
+    let mismatch = Arc::new(Mutex::new(None));
+    let seen = Arc::new(AtomicU64::new(0));
+    archive
+        .extract_to(Some(password), {
+            let mismatch = Arc::clone(&mismatch);
+            let seen = Arc::clone(&seen);
+            move |_| {
+                Ok(Box::new(CheckWriter {
+                    pos: 0,
+                    mismatch: Arc::clone(&mismatch),
+                    seen: Arc::clone(&seen),
+                    byte,
+                }) as Box<dyn Write>)
+            }
+        })
+        .unwrap();
+    assert_eq!(seen.load(Ordering::Relaxed), len);
+    assert!(mismatch.lock().expect("check lock").is_none());
+}
+
+#[test]
 fn password_protected_rar29_member_streams() {
     let len = 300 * 1024;
     let (source, reads) = pattern_source(len, ramp);

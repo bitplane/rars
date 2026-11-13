@@ -1470,6 +1470,36 @@ fn stream_rar29_member<'a>(
         // member, and the next header will say the chain stopped here.
         rebuild_solid_encoder_after_store(solid_encoder, options)?;
         let mut crc = Crc32::new();
+        if let Some(password) = member.password {
+            // A copied payload is written verbatim. The header still sets
+            // FHD_PASSWORD from the member, so the stored bytes have to be
+            // ciphertext with a salt, the same as an in-memory packed member.
+            let mut spool = crate::write_stream::SpoolFile::create()?;
+            let mut left = unpacked_size;
+            let mut buf = vec![0u8; 64 * 1024];
+            while left > 0 {
+                progress.check()?;
+                let want = (left as usize).min(buf.len());
+                reader.read_exact(&mut buf[..want])?;
+                crc.update(&buf[..want]);
+                spool.file_mut().write_all(&buf[..want])?;
+                if !progress.advance(want as u64) {
+                    return Err(Error::Cancelled);
+                }
+                left -= want as u64;
+            }
+            let file_crc = crc.finish();
+            let packed_len = spool.file_mut().stream_position()?;
+            spool.set_len(packed_len);
+            let salt = encrypt_spool(&mut spool, options.target, password)?;
+            return Ok(EncodedMember {
+                payload: MemberPayload::Spool(spool),
+                method: 0x30,
+                unpacked_size,
+                file_crc,
+                salt,
+            });
+        }
         member
             .bytes
             .walk_exact_with_progress(unpacked_size, progress.reporter(), |chunk| {
