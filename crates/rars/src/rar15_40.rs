@@ -67,6 +67,9 @@ const SUB_HEAD: u8 = 0x77;
 const PROTECT_HEAD: u8 = 0x78;
 const NEWSUB_HEAD: u8 = 0x7a;
 const ENDARC_HEAD: u8 = 0x7b;
+const EARC_NEXT_VOLUME: u16 = 0x0001;
+const EARC_DATACRC: u16 = 0x0002;
+const EARC_VOLNUMBER: u16 = 0x0008;
 
 const UNIX_OWNER_SUBTYPE: [u8; 2] = [0x01, 0x01];
 
@@ -153,8 +156,23 @@ pub enum Block {
     Comment(CommentHeader),
     Protect(ProtectHeader),
     NewSub(NewSubHeader),
-    End(BlockHeader),
+    End(EndHeader),
     Unknown(BlockHeader),
+}
+
+/// The block that ends an archive or one volume of a set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct EndHeader {
+    pub block: BlockHeader,
+    /// The volume's place in its set, from 0, when the writer recorded it (RAR 3.0 on).
+    pub volume_number: Option<u16>,
+}
+
+impl EndHeader {
+    pub fn has_next_volume(&self) -> bool {
+        self.block.flags & EARC_NEXT_VOLUME != 0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -873,7 +891,7 @@ impl Archive {
                 }
                 ENDARC_HEAD => {
                     let _next = checked_block_next(&block, total, archive.len())?;
-                    blocks.push(Block::End(block));
+                    blocks.push(Block::End(parse_end_header(&header, block)));
                     break;
                 }
                 _ => {
@@ -1005,7 +1023,7 @@ impl Archive {
                 }
                 ENDARC_HEAD => {
                     let _next = checked_file_block_next(sfx_offset, &block, total, file_len)?;
-                    blocks.push(Block::End(block));
+                    blocks.push(Block::End(parse_end_header(&header, block)));
                     break;
                 }
                 _ => {
@@ -1241,7 +1259,7 @@ impl Archive {
             issues.push("missing or malformed legacy archive comment".into());
         }
         let complete_end = match self.blocks.last() {
-            Some(Block::End(end)) => {
+            Some(Block::End(EndHeader { block: end, .. })) => {
                 end.flags & !0x4000 == 0
                     && end.head_size == 7
                     && end.add_size.is_none()
@@ -1276,6 +1294,14 @@ impl Archive {
 
     fn range_reader(&self, range: Range<usize>) -> Result<crate::source::RangeReader<'_>> {
         self.source.range_reader(range)
+    }
+
+    /// The volume number in this volume's end block, from 0, if the writer recorded one.
+    pub fn end_volume_number(&self) -> Option<u16> {
+        self.blocks.iter().find_map(|block| match block {
+            Block::End(end) => end.volume_number,
+            _ => None,
+        })
     }
 
     pub fn files(&self) -> impl Iterator<Item = &FileHeader> {
@@ -1930,6 +1956,22 @@ fn nested_main_comment(
     Ok(Some(comment))
 }
 
+/// The data CRC comes first, then the volume number, both inside the header.
+fn parse_end_header(header: &[u8], block: BlockHeader) -> EndHeader {
+    let mut at = 7 + if block.add_size.is_some() { 4 } else { 0 };
+    if block.flags & EARC_DATACRC != 0 {
+        at += 4;
+    }
+    let volume_number = (block.flags & EARC_VOLNUMBER != 0 && at + 2 <= block.head_size as usize)
+        .then(|| header.get(at..at + 2))
+        .flatten()
+        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]));
+    EndHeader {
+        block,
+        volume_number,
+    }
+}
+
 fn parse_protect_header(
     input: &[u8],
     block: &BlockHeader,
@@ -2283,7 +2325,7 @@ fn truncate_repaired_rev3_volume(mut bytes: Vec<u8>) -> Vec<u8> {
         return bytes;
     };
     let Some(end) = archive.blocks.iter().find_map(|block| match block {
-        Block::End(end) => Some(end),
+        Block::End(EndHeader { block: end, .. }) => Some(end),
         _ => None,
     }) else {
         return bytes;
@@ -4763,7 +4805,7 @@ mod tests {
         ];
         for edit in edits {
             let mut archive = seed.clone();
-            let Some(Block::End(end)) = archive.blocks.last_mut() else {
+            let Some(Block::End(EndHeader { block: end, .. })) = archive.blocks.last_mut() else {
                 unreachable!()
             };
             edit(end);
@@ -4774,7 +4816,8 @@ mod tests {
         }
         let mut encrypted_header = seed.clone();
         encrypted_header.main.flags |= MHD_PASSWORD;
-        let Some(Block::End(end)) = encrypted_header.blocks.last_mut() else {
+        let Some(Block::End(EndHeader { block: end, .. })) = encrypted_header.blocks.last_mut()
+        else {
             unreachable!()
         };
         // Header encryption requires salt plus a padded AES header block.
@@ -4961,7 +5004,7 @@ mod tests {
             .blocks
             .iter()
             .find_map(|block| match block {
-                Block::End(end) => Some(end),
+                Block::End(EndHeader { block: end, .. }) => Some(end),
                 _ => None,
             })
             .unwrap();

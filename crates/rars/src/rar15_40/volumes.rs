@@ -3,8 +3,6 @@ use crate::output_limit::OutputBudget;
 use crate::source::RangeReader;
 use crate::volume_extract::{FragmentWalk, LazyChain, VolumeEnd, VolumeFeed};
 
-const EARC_NEXT_VOLUME: u16 = 0x0001;
-
 pub(super) fn extract<F, B: Budget>(
     feed: &mut VolumeFeed<'_, '_, Archive>,
     options: crate::ArchiveReadOptions<'_>,
@@ -114,7 +112,7 @@ fn volume_end(archive: &Archive) -> VolumeEnd {
         return VolumeEnd::Last;
     }
     match archive.blocks.iter().find_map(|block| match block {
-        Block::End(end) => Some(end.flags & EARC_NEXT_VOLUME != 0),
+        Block::End(end) => Some(end.has_next_volume()),
         _ => None,
     }) {
         Some(true) => VolumeEnd::More,
