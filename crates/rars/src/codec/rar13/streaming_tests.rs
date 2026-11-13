@@ -322,7 +322,8 @@ fn empty_target_keeps_input_errors_and_emits_nothing() {
 #[test]
 fn reader_decoding_holds_a_bounded_window_of_packed_input() {
     let mut seed = 0x9e37_79b9_7f4a_7c15u64;
-    let data: Vec<u8> = (0..3 << 19)
+    // Noise packs a little larger than itself, so this crosses the window.
+    let data: Vec<u8> = (0..9 << 17)
         .map(|_| {
             seed ^= seed << 13;
             seed ^= seed >> 7;

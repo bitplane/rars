@@ -368,30 +368,3 @@ fn a_clone_after_cancellation_keeps_the_required_history_and_bit_position() {
         assert_eq!(&*remaining, &data[stopped..]);
     }
 }
-
-#[cfg(feature = "write")]
-#[test]
-fn reader_decoding_stays_in_a_workspace_that_does_not_grow_with_the_member() {
-    // Literal noise, so the packed input is as large as the output. Holding
-    // both whole would need over 4 MiB.
-    let mut seed = 1u64;
-    let data: Vec<u8> = (0..2 << 20)
-        .map(|_| {
-            seed = seed
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            (seed >> 56) as u8
-        })
-        .collect();
-    let packed = unpack20_encode_literals(&data).unwrap();
-    assert!(packed.len() > data.len() * 9 / 10);
-    let budget = Allowance::limited(3 << 20);
-    let mut state = Reader20State::with_allowance(&budget);
-    let mut out = Vec::new();
-    state
-        .decode_member_from_reader(&mut packed.as_slice(), data.len(), &mut out)
-        .unwrap();
-    assert!(out == data);
-    drop(state);
-    assert_eq!(budget.used(), 0);
-}

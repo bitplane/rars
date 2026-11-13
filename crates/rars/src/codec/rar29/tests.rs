@@ -4368,13 +4368,40 @@ impl std::io::Write for FirstWriteSink {
     }
 }
 
+fn order_two_ppmd_literals(input: &[u8]) -> Vec<u8> {
+    const ORDER: u8 = 2;
+    let mut packed = vec![0x80 | 0x20 | (ORDER - 1), PPMD_DICTIONARY_MB - 1];
+    let mut encoder = PpmdEncoder::new(
+        usize::from(ORDER),
+        PPMD_ESC,
+        usize::from(PPMD_DICTIONARY_MB),
+    )
+    .unwrap();
+    for &byte in input {
+        encoder.encode_literal(byte).unwrap();
+    }
+    packed.extend_from_slice(&encoder.finish_keeping_model().unwrap().0);
+    packed
+}
+
 #[test]
 fn reader_decoding_holds_a_bounded_window_of_packed_input() {
-    let input = noise(5, 9 << 18);
-    for (engine, packed) in [
-        ("lz", unpack29_encode_literals(&input).unwrap()),
-        ("ppmd", unpack29_encode_ppmd_literals(&input).unwrap()),
+    let noise_bytes = noise(5, 9 << 18);
+    // Nibbles keep PPMd contexts small; byte noise scans 256 entries per symbol.
+    let nibbles: Vec<u8> = noise(5, 9 << 19).iter().map(|byte| byte & 0x0f).collect();
+    for (engine, input, packed) in [
+        (
+            "lz",
+            &noise_bytes,
+            unpack29_encode_literals(&noise_bytes).unwrap(),
+        ),
+        ("ppmd", &nibbles, order_two_ppmd_literals(&nibbles)),
     ] {
+        assert!(
+            packed.len() > 2 * PACKED_WINDOW,
+            "{engine} packed {}",
+            packed.len()
+        );
         let consumed = std::rc::Rc::new(std::cell::Cell::new(0));
         let mut reader = DribbleReader {
             data: &packed,
@@ -4391,7 +4418,7 @@ fn reader_decoding_holds_a_bounded_window_of_packed_input() {
             .decode_non_solid_member_from_reader(&mut reader, input.len(), &mut sink)
             .unwrap();
 
-        assert!(sink.data == input, "{engine} output differs");
+        assert!(sink.data == *input, "{engine} output differs");
         let at_first_write = sink.at_first_write.unwrap();
         assert!(
             at_first_write <= STREAM_CHUNK + 2 * PACKED_WINDOW && at_first_write < packed.len(),
