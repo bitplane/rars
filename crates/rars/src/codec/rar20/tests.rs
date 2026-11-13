@@ -889,7 +889,7 @@ fn optimal_parser_covers_a_long_repeat_with_full_length_matches() {
             EncodeToken::Match { length, offset }
             | EncodeToken::OldOffset { length, offset, .. } => {
                 for _ in 0..length {
-                    decoded.push(decoded[decoded.len() - offset]);
+                    decoded.push(decoded[decoded.len() - offset as usize]);
                 }
             }
             ref other => panic!("unexpected token {other:?}"),

@@ -220,6 +220,9 @@ fn encode_member(
     if fixed_table.is_some() {
         return Ok(packed);
     }
+    // Each pass's tokens die once packed; a pass that reproduces the last one
+    // packs to the same length, which ends the loop.
+    drop(tokens);
 
     // Re-parse against the prices the first pass implies, then again against
     // the prices that produced. A greedy parse has converged by the first
@@ -234,7 +237,6 @@ fn encode_member(
     } else {
         None
     };
-    let mut best_tokens = tokens;
     let mut best_table = table_lengths;
     let mut best_packed = packed;
     for _ in 0..refinements {
@@ -257,16 +259,12 @@ fn encode_member(
                 None,
             )?,
         };
-        if next_tokens == best_tokens {
-            break;
-        }
         let next_table = table_lengths_for_tokens(&next_tokens, fixed_table)?;
         let next_packed =
             encode_member_with_tables(&next_tokens, history, fixed_table, &next_table)?;
         if next_packed.len() >= best_packed.len() {
             break;
         }
-        best_tokens = next_tokens;
         best_table = next_table;
         best_packed = next_packed;
     }
@@ -289,15 +287,16 @@ fn table_lengths_for_tokens(
                 length,
                 offset,
             } => {
-                main_frequencies[257 + index] += 1;
-                let (slot, _) = old_length_slot_for_match(length, offset)?;
+                main_frequencies[257 + usize::from(index)] += 1;
+                let (slot, _) = old_length_slot_for_match(usize::from(length), offset as usize)?;
                 length_frequencies[slot] += 1;
             }
             EncodeToken::ShortOffset { offset } => {
-                let (slot, _) = short_slot_for_match(offset)?;
+                let (slot, _) = short_slot_for_match(offset as usize)?;
                 main_frequencies[261 + slot] += 1;
             }
             EncodeToken::Match { length, offset } => {
+                let (length, offset) = (usize::from(length), offset as usize);
                 let encoded_length = length - match_length_adjustment(offset);
                 let (slot, _) = length_slot_for_match(encoded_length)?;
                 main_frequencies[270 + slot] += 1;
@@ -403,11 +402,12 @@ fn encode_member_with_tables(
                 length,
                 offset,
             } => {
-                let code = main_codes[257 + index].ok_or(Error::InvalidData(
+                let code = main_codes[257 + usize::from(index)].ok_or(Error::InvalidData(
                     "RAR 2.0 encoder missing old-offset Huffman code",
                 ))?;
                 bits.write_bits(code.code as u32, code.len);
-                let (slot, extra) = old_length_slot_for_match(length, offset)?;
+                let (slot, extra) =
+                    old_length_slot_for_match(usize::from(length), offset as usize)?;
                 let length_code = length_codes[slot].ok_or(Error::InvalidData(
                     "RAR 2.0 encoder missing old-offset length Huffman code",
                 ))?;
@@ -417,7 +417,7 @@ fn encode_member_with_tables(
                 }
             }
             EncodeToken::ShortOffset { offset } => {
-                let (slot, extra) = short_slot_for_match(offset)?;
+                let (slot, extra) = short_slot_for_match(offset as usize)?;
                 let code = main_codes[261 + slot].ok_or(Error::InvalidData(
                     "RAR 2.0 encoder missing short-offset Huffman code",
                 ))?;
@@ -425,6 +425,7 @@ fn encode_member_with_tables(
                 bits.write_bits(extra as u32, SHORT_BITS[slot]);
             }
             EncodeToken::Match { length, offset } => {
+                let (length, offset) = (usize::from(length), offset as usize);
                 let encoded_length = length - match_length_adjustment(offset);
                 let (slot, extra) = length_slot_for_match(encoded_length)?;
                 let code = main_codes[270 + slot].ok_or(Error::InvalidData(
@@ -461,22 +462,51 @@ impl FixedEncodeTable {
     }
 }
 
+/// Eight bytes, not thirty-two: random input is one token per byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EncodeToken {
     Literal(u8),
     RepeatLast,
-    OldOffset {
-        index: usize,
-        length: usize,
-        offset: usize,
-    },
-    ShortOffset {
-        offset: usize,
-    },
-    Match {
-        length: usize,
-        offset: usize,
-    },
+    OldOffset { index: u8, length: u16, offset: u32 },
+    ShortOffset { offset: u32 },
+    Match { length: u16, offset: u32 },
+}
+
+impl EncodeToken {
+    fn fresh(length: usize, offset: usize) -> Self {
+        debug_assert!(length <= MAX_ENCODER_MATCH_LENGTH && offset <= MAX_ENCODER_MATCH_OFFSET);
+        Self::Match {
+            length: length as u16,
+            offset: offset as u32,
+        }
+    }
+
+    fn old_offset(index: usize, length: usize, offset: usize) -> Self {
+        debug_assert!(index < 4 && length <= MAX_ENCODER_MATCH_LENGTH);
+        debug_assert!(offset <= MAX_ENCODER_MATCH_OFFSET);
+        Self::OldOffset {
+            index: index as u8,
+            length: length as u16,
+            offset: offset as u32,
+        }
+    }
+
+    fn short_offset(offset: usize) -> Self {
+        debug_assert!(offset <= MAX_ENCODER_MATCH_OFFSET);
+        Self::ShortOffset {
+            offset: offset as u32,
+        }
+    }
+
+    /// Lets the shortest-path parse walk back without storing back-links.
+    fn parsed_length(self) -> usize {
+        match self {
+            Self::Literal(_) => 1,
+            Self::RepeatLast => unreachable!("the shortest-path parse emits no repeats"),
+            Self::OldOffset { length, .. } | Self::Match { length, .. } => usize::from(length),
+            Self::ShortOffset { .. } => 2,
+        }
+    }
 }
 
 /// Lengths worth trying for a match at one position.
@@ -638,12 +668,8 @@ fn encode_tokens_optimal(
     matches: &MatchLists,
     cost_model: &CostModel<'_>,
 ) -> Vec<EncodeToken> {
-    const UNREACHED: u64 = u64::MAX / 4;
     let span = end - start;
-    let mut cost = vec![UNREACHED; span + 1];
-    let mut from = vec![0usize; span + 1];
-    let mut token: Vec<Option<EncodeToken>> = vec![None; span + 1];
-    let mut reps = vec![[0usize; 4]; span + 1];
+    let mut nodes = vec![ParseNode::UNREACHED; span + 1];
     let mut lengths = Vec::new();
     let mut next_run = 0usize;
     // Positions inside a match long enough to take outright relax nothing.
@@ -653,7 +679,7 @@ fn encode_tokens_optimal(
         span,
         "lists collected for another buffer"
     );
-    cost[0] = 0;
+    nodes[0].cost = 0;
 
     for index in 0..span {
         // Every position is reachable through the one-byte literal edge.
@@ -663,18 +689,18 @@ fn encode_tokens_optimal(
             continue;
         }
         let pos = start + index;
-        let here = cost[index];
-        let node_reps = reps[index];
+        let here = nodes[index].cost;
+        let node_reps = nodes[index].reps.map(|offset| offset as usize);
         let cap = (end - pos).min(MAX_ENCODER_MATCH_LENGTH);
         let nice = NICE_MATCH_LENGTH.min(cap);
 
         let mut relax = |next: usize, price: u64, what: EncodeToken, next_reps: [usize; 4]| {
             // Literal, fresh, old-offset and short-match edges all end within span.
-            if here + price < cost[next] {
-                cost[next] = here + price;
-                from[next] = index;
-                token[next] = Some(what);
-                reps[next] = next_reps;
+            let node = &mut nodes[next];
+            if here + price < node.cost {
+                node.cost = here + price;
+                node.token = what;
+                node.reps = next_reps.map(|offset| offset as u32);
             }
         };
 
@@ -700,7 +726,7 @@ fn encode_tokens_optimal(
                     relax(
                         index + length,
                         price as u64,
-                        EncodeToken::Match { length, offset },
+                        EncodeToken::fresh(length, offset),
                         pushed,
                     );
                     longest = longest.max(length);
@@ -727,11 +753,7 @@ fn encode_tokens_optimal(
                     relax(
                         index + length,
                         price as u64,
-                        EncodeToken::OldOffset {
-                            index: rep_index,
-                            length,
-                            offset,
-                        },
+                        EncodeToken::old_offset(rep_index, length, offset),
                         pushed,
                     );
                     longest = longest.max(length);
@@ -749,7 +771,7 @@ fn encode_tokens_optimal(
             relax(
                 index + 2,
                 price as u64,
-                EncodeToken::ShortOffset { offset },
+                EncodeToken::short_offset(offset),
                 pushed,
             );
         }
@@ -762,12 +784,29 @@ fn encode_tokens_optimal(
     let mut out = Vec::new();
     let mut at = span;
     while at > 0 {
-        let what = token[at].expect("every parse position has a literal edge");
+        let what = nodes[at].token;
         out.push(what);
-        at = from[at];
+        at -= what.parsed_length();
     }
     out.reverse();
     out
+}
+
+/// Thirty-two bytes per input byte, where separate cost, link, token and rep arrays took eighty.
+#[derive(Debug, Clone, Copy)]
+struct ParseNode {
+    cost: u64,
+    token: EncodeToken,
+    reps: [u32; 4],
+}
+
+impl ParseNode {
+    // The repeat stands in for "no edge yet"; every reached node replaces it.
+    const UNREACHED: Self = Self {
+        cost: u64::MAX / 4,
+        token: EncodeToken::RepeatLast,
+        reps: [0; 4],
+    };
 }
 
 /// How far the bytes at `pos` repeat the bytes `offset` back, up to `cap`.
@@ -853,7 +892,7 @@ fn encode_tokens_with_progress(
                     if last_match == Some((length, offset)) {
                         tokens.push(EncodeToken::RepeatLast);
                     } else {
-                        tokens.push(EncodeToken::Match { length, offset });
+                        tokens.push(EncodeToken::fresh(length, offset));
                         last_match = Some((length, offset));
                     }
                     (length, offset)
@@ -866,18 +905,14 @@ fn encode_tokens_with_progress(
                     if last_match == Some((length, offset)) {
                         tokens.push(EncodeToken::RepeatLast);
                     } else {
-                        tokens.push(EncodeToken::OldOffset {
-                            index,
-                            length,
-                            offset,
-                        });
+                        tokens.push(EncodeToken::old_offset(index, length, offset));
                         last_match = Some((length, offset));
                     }
                     (length, offset)
                 }
                 SelectedMatch::ShortOffset { offset } => {
                     let length = 2;
-                    tokens.push(EncodeToken::ShortOffset { offset });
+                    tokens.push(EncodeToken::short_offset(offset));
                     last_match = Some((length, offset));
                     (length, offset)
                 }
