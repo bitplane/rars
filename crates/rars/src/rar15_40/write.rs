@@ -691,7 +691,7 @@ fn write_members_to(
         )?;
     }
     if let Some(password) = header_password {
-        write_encrypted_end_block(output, ENDARC_FLAGS, password)?;
+        write_encrypted_end_block(output, &end_block(ENDARC_FLAGS), password)?;
     } else if writes_end_block(options.target) {
         output.write_all(&end_block(ENDARC_FLAGS))?;
     }
@@ -2537,6 +2537,34 @@ fn volume_end_flags(more_volumes: bool) -> u16 {
     }
 }
 
+/// Set when a volume's end block carries the CRC32 of the bytes before it.
+const EARC_DATACRC: u16 = 0x0002;
+/// Set when seven reserved bytes follow, room recovery volumes can use.
+const EARC_REVSPACE: u16 = 0x0004;
+/// Set when a volume's end block records its place in the set.
+const EARC_VOLNUMBER: u16 = 0x0008;
+
+/// The end block RAR 3.93 writes on every volume: the CRC32 of every byte
+/// before the block (before its salt, under encrypted headers), the volume's
+/// number from 0, and seven reserved bytes. The number lets a reader tell a
+/// swapped or renamed volume. RAR 3.93 refuses an encrypted end block with the
+/// number but without the other two, so all three go in.
+fn volume_end_block(index: u64, more_volumes: bool, data_crc: u32) -> Vec<u8> {
+    let size = END_HEADER_SIZE + 13;
+    let mut header = Vec::with_capacity(size);
+    header.extend_from_slice(&0u16.to_le_bytes());
+    header.push(ENDARC_HEAD);
+    let flags = volume_end_flags(more_volumes) | EARC_DATACRC | EARC_REVSPACE | EARC_VOLNUMBER;
+    header.extend_from_slice(&flags.to_le_bytes());
+    header.extend_from_slice(&(size as u16).to_le_bytes());
+    header.extend_from_slice(&data_crc.to_le_bytes());
+    // A 16-bit field, so a set past 65,536 volumes counts round again.
+    header.extend_from_slice(&(index as u16).to_le_bytes());
+    header.extend_from_slice(&[0; 7]);
+    write_header_crc(&mut header, 0);
+    header
+}
+
 fn end_block(flags: u16) -> [u8; END_HEADER_SIZE] {
     let mut header = Vec::with_capacity(END_HEADER_SIZE);
     header.extend_from_slice(&0u16.to_le_bytes());
@@ -2702,8 +2730,8 @@ fn write_archive_comment(
 /// clean end, and 7-Zip treats that as a decryption failure and refuses to open
 /// the archive at all. WinRAR closes the same way. unrar stops at the last
 /// member and never looks, which is why nothing caught this.
-fn write_encrypted_end_block(out: &mut dyn Write, flags: u16, password: &[u8]) -> Result<()> {
-    write_encrypted_header(out, &end_block(flags), password)
+fn write_encrypted_end_block(out: &mut dyn Write, end: &[u8], password: &[u8]) -> Result<()> {
+    write_encrypted_header(out, end, password)
 }
 
 fn write_encrypted_header(out: &mut dyn Write, header: &[u8], password: &[u8]) -> Result<()> {
@@ -2948,7 +2976,8 @@ fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
             write_producer(&mut out, entry.target, None, Some(entry.progress))?;
         }
         if writes_end_block(entry.target) {
-            out.extend_from_slice(&end_block(volume_end_flags(split_after)));
+            let data_crc = crc32(&out);
+            out.extend_from_slice(&volume_end_block(index as u64, split_after, data_crc));
         }
         Ok(out)
     };
@@ -3029,7 +3058,12 @@ fn write_header_encrypted_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<
         if index > 0 {
             write_producer(&mut out, entry.target, Some(password), Some(entry.progress))?;
         }
-        write_encrypted_end_block(&mut out, volume_end_flags(split_after), password)?;
+        let data_crc = crc32(&out);
+        write_encrypted_end_block(
+            &mut out,
+            &volume_end_block(index as u64, split_after, data_crc),
+            password,
+        )?;
         Ok(out)
     };
     let payload =
