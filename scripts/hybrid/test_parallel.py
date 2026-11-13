@@ -47,7 +47,9 @@ class ParallelScreenTests(unittest.TestCase):
                 active[0] += 1
                 peak[0] = max(peak[0], active[0])
                 seen.setdefault(configuration, []).append(task["case"])
-            time.sleep(.03)
+            # Long enough that the overlapped sleeps outweigh the serial journal
+            # writes on a slow runner, or the charge check below fails.
+            time.sleep(.2)
             self.receipt(run, manifest, task, deadline)
             with guard:
                 configurations.remove(configuration)
