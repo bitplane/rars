@@ -1346,7 +1346,7 @@ struct EncodedMember<'a> {
 /// This is the admission weight that decides how many members run at once, not
 /// a prediction: the encoder holds the member, its packed output, and a match
 /// finder sized by the block it works in. Text at the levels that try PPMd
-/// also holds two PPMd models at once, one per trial.
+/// also holds two PPMd models at once, one per trial, and the escape search.
 fn member_workspace(options: WriterOptions, unpacked: u64, compressing: bool) -> u64 {
     if !compressing {
         return 1024 * 1024;
@@ -1359,7 +1359,9 @@ fn member_workspace(options: WriterOptions, unpacked: u64, compressing: bool) ->
             ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
         ) && ppmd_trial_pays(compression_method_for_level(options).saturating_sub(0x30));
     let ppmd_models = if ppmd_trials {
-        2 * crate::codec::rar29::PPMD_MODEL_BYTES
+        (2 * crate::codec::rar29::PPMD_MODEL_BYTES).saturating_add(
+            crate::codec::rar29::ppmd_search_workspace(dictionary as usize),
+        )
     } else {
         0
     };

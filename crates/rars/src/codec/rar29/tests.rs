@@ -4590,3 +4590,106 @@ fn members_parsed_in_segments_code_to_the_serial_parse_bytes() {
     assert_eq!(packed_fingerprint(&plain), (146_951, 4_071_059_742));
     assert_eq!(packed_fingerprint(&continued), (73_398, 3_211_860_258));
 }
+
+fn phrase_member(len: usize) -> Vec<u8> {
+    let phrases = [
+        &b"the model predicts each byte from the bytes before it, "[..],
+        b"an escape copies a long match the model would code slowly; ",
+        b"short words ",
+        b"and a run of spaces:                                         ",
+        b"or a line of dashes -------------------------------------\n",
+    ];
+    let mut state = 0x9e37_79b9_u32;
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        match state % 5 {
+            0 => out.extend_from_slice(phrases[(state >> 8) as usize % phrases.len()]),
+            1 => out.extend_from_slice(&state.to_le_bytes()),
+            _ => {
+                for _ in 0..=state % 3 {
+                    out.push(b'a' + (state >> 3) as u8 % 26);
+                    state = state.rotate_left(7);
+                }
+                out.push(b' ');
+            }
+        }
+    }
+    out.truncate(len);
+    out
+}
+
+#[test]
+fn ppmd_members_code_to_the_bytes_before_the_search_ran_ahead() {
+    let fixture = |name: &str| {
+        std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/rar15_40/ppmd")
+                .join(name),
+        )
+        .unwrap()
+    };
+    let text = phrase_member(1200 * 1024);
+    let mut packed = Vec::new();
+    for distance in [16 * 1024, 256 * 1024, 4 * 1024 * 1024] {
+        packed.push(super::unpack29_encode_ppmd(&text, distance).unwrap());
+    }
+    let one_thread = {
+        let _cap = crate::parallel::ThreadCap::set(Some(1));
+        super::unpack29_encode_ppmd(&text, 16 * 1024).unwrap()
+    };
+    assert_eq!(one_thread, packed[0]);
+    packed.push(super::unpack29_encode_ppmd_literals(&text).unwrap());
+    packed.push(
+        super::unpack29_encode_ppmd_with_filter(
+            &text,
+            crate::FilterSpec::whole(crate::FilterKind::Delta { channels: 2 }),
+            64 * 1024,
+        )
+        .unwrap(),
+    );
+    for name in [
+        "lorem_127k.txt",
+        "escape_64k.bin",
+        "binary_64k.bin",
+        "ppmd_lz_match.txt",
+    ] {
+        packed.push(super::unpack29_encode_ppmd(&fixture(name), 4 * 1024 * 1024).unwrap());
+    }
+    let mut chain = Unpack29Encoder::new();
+    for part in text.chunks(300 * 1024) {
+        packed.push(
+            chain
+                .encode_member_with_engine(part, super::ChainEngine::Ppmd, &[], &mut |_| true)
+                .unwrap(),
+        );
+    }
+    for member in &packed[..3] {
+        assert_eq!(super::unpack29_decode(member, text.len()).unwrap(), text);
+    }
+    let fingerprints: Vec<_> = packed
+        .iter()
+        .map(|member| packed_fingerprint(member))
+        .collect();
+    // Captured from master, where the search ran in step with the model.
+    assert_eq!(
+        fingerprints,
+        [
+            (228_677, 1_472_184_063),
+            (230_348, 1_494_863_526),
+            (231_226, 2_092_742_637),
+            (209_736, 3_414_149_300),
+            (301_487, 2_610_911_824),
+            (13_268, 4_063_589_940),
+            (60, 1_624_776_514),
+            (67_188, 3_120_010_630),
+            (74, 4_256_341_906),
+            (57_718, 1_290_491_000),
+            (58_049, 3_776_985_692),
+            (57_229, 2_861_356_758),
+            (57_757, 2_262_218_879),
+        ]
+    );
+}

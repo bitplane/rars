@@ -54,23 +54,23 @@ trait Candidates {
     fn insert(&mut self, input: &[u8], pos: usize);
 }
 
-impl Candidates for Rar29MatchFinder {
+impl<const MIN_MATCH: usize> Candidates for match_finder::MatchFinder<MIN_MATCH> {
     fn first(&self, input: &[u8], pos: usize, _limit: usize) -> usize {
-        Rar29MatchFinder::first(self, input, pos)
+        match_finder::MatchFinder::first(self, input, pos)
     }
 
     fn previous(&self, candidate: usize) -> usize {
-        Rar29MatchFinder::previous(self, candidate)
+        match_finder::MatchFinder::previous(self, candidate)
     }
 
     fn insert(&mut self, input: &[u8], pos: usize) {
-        Rar29MatchFinder::insert(self, input, pos);
+        match_finder::MatchFinder::insert(self, input, pos);
     }
 }
 
-struct FilledAhead<'a>(&'a Rar29MatchFinder);
+struct FilledAhead<'a, const MIN_MATCH: usize = 4>(&'a match_finder::MatchFinder<MIN_MATCH>);
 
-impl Candidates for FilledAhead<'_> {
+impl<const MIN_MATCH: usize> Candidates for FilledAhead<'_, MIN_MATCH> {
     fn first(&self, _input: &[u8], pos: usize, limit: usize) -> usize {
         self.0.first_before(pos, limit)
     }
@@ -1677,7 +1677,7 @@ fn encode_tokens_with_progress(
     let combined = with_history(history, input, options);
     let start = combined.len() - input.len();
     let reach = options.max_match_distance.min(MAX_HISTORY);
-    let mut finder = match_finder_for(reach, reach);
+    let mut finder: Rar29MatchFinder = match_finder_for(reach, reach);
     for history_pos in 0..start {
         finder.insert(&combined, history_pos);
     }
@@ -1952,8 +1952,7 @@ fn encode_ppmd_hybrid_with_progress(
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<()> {
     let mut costs = PpmdTokenCosts::new();
-    let reach = input.len().min(max_match_distance).min(MAX_HISTORY);
-    let mut finder: PpmdMatchFinder = match_finder_for(reach, reach);
+    let mut search = PpmdMatchSearch::new(input, max_match_distance);
     let mut pos = 0usize;
     let mut search_from = 0usize;
     let mut next_check = 0usize;
@@ -1970,25 +1969,18 @@ fn encode_ppmd_hybrid_with_progress(
                 encoder.encode_repeat_offset_one(length)?;
                 costs.record_repeat(encoder.spent_bits() - before);
                 on_token(PpmdEncodeToken::RepeatOffsetOne { length });
-                for history_pos in pos..pos + length {
-                    finder.insert(input, history_pos);
-                }
                 pos += length;
                 continue;
             }
         }
 
         if pos >= search_from {
-            if let Some((length, offset)) = best_ppmd_match(input, pos, &finder, max_match_distance)
-            {
+            if let Some((length, offset)) = search.best(pos) {
                 if costs.match_pays(length) {
                     let before = encoder.spent_bits();
                     encoder.encode_match(offset, length)?;
                     costs.record_match(encoder.spent_bits() - before);
                     on_token(PpmdEncodeToken::Match { offset, length });
-                    for history_pos in pos..pos + length {
-                        finder.insert(input, history_pos);
-                    }
                     pos += length;
                     continue;
                 }
@@ -2000,7 +1992,6 @@ fn encode_ppmd_hybrid_with_progress(
         encoder.encode_literal(input[pos])?;
         costs.record_literal(encoder.spent_bits() - before);
         on_token(PpmdEncodeToken::Literal(input[pos]));
-        finder.insert(input, pos);
         pos += 1;
     }
     Ok(())
@@ -2020,10 +2011,99 @@ fn ppmd_offset_one_repeat(input: &[u8], pos: usize) -> Option<usize> {
     (length >= 4).then_some(length)
 }
 
+/// Every position enters the finder whatever the model codes, so searches can run a batch ahead.
+struct PpmdMatchSearch<'a> {
+    input: &'a [u8],
+    max_match_distance: usize,
+    batch: usize,
+    finder: PpmdMatchFinder,
+    filled: usize,
+    found_from: usize,
+    found: Vec<Option<(u8, u32)>>,
+}
+
+impl<'a> PpmdMatchSearch<'a> {
+    const CHUNK: usize = 16 * 1024;
+    const MAX_BATCH: usize = Self::CHUNK * 16 * 2;
+
+    fn new(input: &'a [u8], max_match_distance: usize) -> Self {
+        let reach = input.len().min(max_match_distance).min(MAX_HISTORY);
+        let batch = (Self::CHUNK * crate::parallel::threads() * 2).min(Self::MAX_BATCH);
+        Self {
+            input,
+            max_match_distance,
+            batch,
+            // Reach plus a batch, so filling a batch only overwrites links nothing in it can reach.
+            finder: match_finder_for(reach.saturating_add(batch), reach),
+            filled: 0,
+            found_from: 0,
+            found: Vec::new(),
+        }
+    }
+
+    /// `pos` must not go back.
+    fn best(&mut self, pos: usize) -> Option<(usize, usize)> {
+        debug_assert!(pos >= self.found_from);
+        if pos >= self.filled {
+            self.fill_from(pos);
+        }
+        match self.found.get(pos - self.found_from) {
+            Some(found) => found.map(|(length, offset)| (usize::from(length), offset as usize)),
+            None => self.search(pos),
+        }
+    }
+
+    fn search(&self, pos: usize) -> Option<(usize, usize)> {
+        best_ppmd_match(
+            self.input,
+            pos,
+            &FilledAhead(&self.finder),
+            self.max_match_distance,
+        )
+    }
+
+    // Searched ahead only when other threads share the batch; alone, searches
+    // inside a match or a rejection's cooldown would be wasted.
+    fn fill_from(&mut self, pos: usize) {
+        let end = pos.saturating_add(self.batch).min(self.input.len());
+        for history_pos in self.filled..end {
+            self.finder.insert(self.input, history_pos);
+        }
+        self.filled = end;
+        self.found_from = pos;
+        self.found.clear();
+        if !crate::parallel::may_nest() {
+            return;
+        }
+        self.found.resize(end - pos, None);
+        let mut chunks: Vec<_> = self.found.chunks_mut(Self::CHUNK).collect();
+        let (input, finder, distance) = (self.input, &self.finder, self.max_match_distance);
+        crate::parallel::for_each_mut(&mut chunks, |index, chunk| {
+            let start = pos + index * Self::CHUNK;
+            for (at, found) in chunk.iter_mut().enumerate() {
+                // An escape match is at most 255 bytes long and 4 MiB back.
+                *found = best_ppmd_match(input, start + at, &FilledAhead(finder), distance)
+                    .map(|(length, offset)| (length as u8, offset as u32));
+            }
+        });
+    }
+}
+
+/// The most an escape search holds: links over the reach and a batch, the heads, and a batch found.
+pub(crate) fn ppmd_search_workspace(max_match_distance: usize) -> u64 {
+    let batch = PpmdMatchSearch::MAX_BATCH;
+    let links = max_match_distance
+        .min(MAX_HISTORY)
+        .saturating_add(batch)
+        .next_power_of_two();
+    let found = batch * std::mem::size_of::<Option<(u8, u32)>>();
+    (links as u64 + (1 << 20)) * 4 + found as u64
+}
+
 fn best_ppmd_match(
     input: &[u8],
     pos: usize,
-    finder: &PpmdMatchFinder,
+    finder: &impl Candidates,
     max_match_distance: usize,
 ) -> Option<(usize, usize)> {
     let max_offset = pos.min(0x1000001).min(MAX_HISTORY).min(max_match_distance);
@@ -2033,7 +2113,7 @@ fn best_ppmd_match(
     }
     let mut best = None;
     let mut checked = 0usize;
-    let mut candidate = finder.first(input, pos);
+    let mut candidate = finder.first(input, pos, pos);
     while candidate != match_finder::NO_POSITION {
         // MatchFinder chains contain only previously inserted positions and
         // each link moves strictly backwards.
