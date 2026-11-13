@@ -1,4 +1,4 @@
-//! Command-line frontend for the `rars` RAR archive toolkit.
+//! The `rars` and `unrars` command-line tools. Not a stable API: the binaries are the interface.
 
 /// Where the unit tests write their files. Shared with the integration tests
 /// by path rather than by API.
@@ -14,7 +14,9 @@ mod output;
 mod password;
 mod progress;
 mod repair;
+mod unrars;
 use rars::timestamp as time;
+pub use unrars::unrars_main;
 mod volumes;
 
 use cli::{AddArgs, Command, ExtractArgs, InfoArgs, PasswordArgs, TestArgs};
@@ -66,7 +68,8 @@ const RAR50_HOST_NATIVE: u64 = 1;
 const RAR50_STRUCTURAL_RR_WARNING: &str =
     "warning: RAR 5 recovery writer emits validation-ready RR metadata; WinRAR recovery layout matching is not expected";
 
-fn main() {
+#[doc(hidden)]
+pub fn rars_main() {
     if let Err(err) = run() {
         eprintln!("error: {err}");
         std::process::exit(err.exit_code());
@@ -768,6 +771,9 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
     Ok(())
 }
 
+type Selection<'a> = dyn Fn(&rars::ExtractedEntryMeta) -> bool + 'a;
+type PublishReport<'a> = dyn FnMut(&ExtractedOutput) + 'a;
+
 struct ExtractOutputState<'a> {
     out_dir: &'a Path,
     overwrite: OverwritePolicy,
@@ -793,6 +799,14 @@ struct ExtractOutputState<'a> {
     published_identities: HashSet<PathBuf>,
     published_paths: HashMap<PathBuf, PathBuf>,
     skipped_links: usize,
+    /// Leaves a file already at its destination alone instead of failing (`unrars -o-`).
+    skip_existing: bool,
+    /// Members `skip_existing` left alone.
+    kept_existing: usize,
+    /// Members outside this set are decoded but not written.
+    selected: Option<Box<Selection<'a>>>,
+    /// Told about each output once it is verified and in place.
+    on_published: Option<Box<PublishReport<'a>>>,
 }
 
 impl<'a> ExtractOutputState<'a> {
@@ -826,6 +840,10 @@ impl<'a> ExtractOutputState<'a> {
             published_identities: HashSet::new(),
             published_paths: HashMap::new(),
             skipped_links: 0,
+            skip_existing: false,
+            kept_existing: 0,
+            selected: None,
+            on_published: None,
         }
     }
 
@@ -859,9 +877,12 @@ impl<'a> ExtractOutputState<'a> {
             return Ok(Box::new(std::io::sink()));
         }
         let relative = self.output_relative(&stored);
-        self.claim_flat_name(&relative, &meta.name)?;
         let destination = output::checked_output_path(self.out_dir, &relative)
             .map_err(|error| refused_output(error, &meta.name))?;
+        if self.passed_over(meta, &destination) {
+            return Ok(Box::new(std::io::sink()));
+        }
+        self.claim_flat_name(&relative, &meta.name)?;
         self.reserve_output_path(destination.clone())?;
         self.remember_directory_time(&destination, meta)?;
         let staging = self.prepare_staged_path(&destination, meta.is_directory)?;
@@ -897,6 +918,9 @@ impl<'a> ExtractOutputState<'a> {
         let relative = self.output_relative(&stored);
         let destination = output::checked_output_path(self.out_dir, &relative)
             .map_err(|error| refused_output(error, &meta.name))?;
+        if self.passed_over(meta, &destination) {
+            return Ok(());
+        }
         let Some(target) = rars::output_links::link_target(
             self.out_dir,
             &relative,
@@ -963,6 +987,24 @@ impl<'a> ExtractOutputState<'a> {
     fn repeats_allowed(&self) -> bool {
         self.overwrite == OverwritePolicy::Rename
             || (self.flatten && self.overwrite == OverwritePolicy::Always)
+    }
+
+    /// Whether a member is left unwritten: not selected, or kept out by an existing file,
+    /// including one an earlier member is writing.
+    fn passed_over(&mut self, meta: &rars::ExtractedEntryMeta, destination: &Path) -> bool {
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|selected| !selected(meta))
+        {
+            return true;
+        }
+        let kept = self.skip_existing
+            && !meta.is_directory
+            && (self.planned_paths.contains(destination)
+                || fs::symlink_metadata(destination).is_ok());
+        self.kept_existing += usize::from(kept);
+        kept
     }
 
     fn reserve_output_path(&mut self, path: PathBuf) -> rars::Result<()> {
@@ -1081,6 +1123,7 @@ impl<'a> ExtractOutputState<'a> {
             if self.in_place {
                 // Checked and written at its destination when it was opened.
                 self.record_identity(&staged)?;
+                self.report_published();
                 self.published += 1;
                 continue;
             }
@@ -1144,9 +1187,16 @@ impl<'a> ExtractOutputState<'a> {
             self.published_paths
                 .insert(staged.clone(), destination.clone());
             self.record_identity(&destination)?;
+            self.report_published();
             self.published += 1;
         }
         Ok(())
+    }
+
+    fn report_published(&mut self) {
+        if let Some(report) = &mut self.on_published {
+            report(&self.outputs[self.published]);
+        }
     }
 
     // Symlinks may be dangling; their destination entries were reserved on open.
