@@ -55,9 +55,14 @@ fn extracts_with_the_lines_callers_parse() {
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     let text = stdout(&output);
     assert!(text.contains("Extracting from plain.rar"), "{text}");
+    // The destination as given, then the member's path with native separators.
+    let extracted = format!(
+        "Extracting  {}",
+        Path::new("out/").join("sub").join("b.bin").display()
+    );
     assert!(
         text.lines()
-            .any(|line| line.starts_with("Extracting  out/sub/b.bin") && line.ends_with("OK")),
+            .any(|line| line.starts_with(&extracted) && line.ends_with("OK")),
         "{text}"
     );
     assert!(text.contains("Creating    out/sub"), "{text}");
