@@ -203,19 +203,43 @@ impl<R: Read, B: Budget> Scan<'_, R, B> {
 
 /// Just the workers, since idle threads of a larger pool spin-yield on every spawn; shared so concurrent members stay within them.
 fn decode_pool(workers: usize) -> Option<Arc<rayon::ThreadPool>> {
-    static POOL: Mutex<Option<(usize, Arc<rayon::ThreadPool>)>> = Mutex::new(None);
-    let mut cached = POOL.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some((_, pool)) = cached.as_ref().filter(|(size, _)| *size == workers) {
-        return Some(Arc::clone(pool));
+    static POOLS: Mutex<DecodePools> = Mutex::new(DecodePools::new());
+    POOLS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(workers)
+}
+
+/// Readers with different worker counts would otherwise rebuild one pool back and forth.
+const DECODE_POOL_SIZES: usize = 4;
+
+/// One pool per recent worker count, most recently used last.
+struct DecodePools(Vec<(usize, Arc<rayon::ThreadPool>)>);
+
+impl DecodePools {
+    const fn new() -> Self {
+        Self(Vec::new())
     }
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(workers)
-        .thread_name(|index| format!("rars-block-decode-{index}"))
-        .build()
-        .ok()
-        .map(Arc::new)?;
-    *cached = Some((workers, Arc::clone(&pool)));
-    Some(pool)
+
+    fn get(&mut self, workers: usize) -> Option<Arc<rayon::ThreadPool>> {
+        if let Some(index) = self.0.iter().position(|(size, _)| *size == workers) {
+            let entry = self.0.remove(index);
+            let pool = Arc::clone(&entry.1);
+            self.0.push(entry);
+            return Some(pool);
+        }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .thread_name(|index| format!("rars-block-decode-{index}"))
+            .build()
+            .ok()
+            .map(Arc::new)?;
+        if self.0.len() == DECODE_POOL_SIZES {
+            self.0.remove(0);
+        }
+        self.0.push((workers, Arc::clone(&pool)));
+        Some(pool)
+    }
 }
 
 fn in_place_scope<'scope, R>(
