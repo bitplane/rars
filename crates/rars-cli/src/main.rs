@@ -703,6 +703,7 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
         &out_dir,
         overwrite,
         args.in_place,
+        args.flatten,
         family,
     ));
     let options = args
@@ -749,7 +750,14 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
         ))
     })?;
     for output in &outputs {
-        println!("x {}", display_bytes_lossy(&output.name));
+        match output.path.strip_prefix(&out_dir) {
+            Ok(relative) if relative != output.stored => println!(
+                "x {} -> {}",
+                display_bytes_lossy(&output.name),
+                relative.display()
+            ),
+            _ => println!("x {}", display_bytes_lossy(&output.name)),
+        }
     }
     if skipped_links > 0 {
         return Err(CliError::general(format!(
@@ -764,6 +772,9 @@ struct ExtractOutputState<'a> {
     out_dir: &'a Path,
     overwrite: OverwritePolicy,
     in_place: bool,
+    flatten: bool,
+    flat_names: rars::output_staging::FlatNames,
+    renames: rars::output_staging::RenameCounters,
     family: rars::ArchiveFamily,
     legacy_name_encoding: Option<rars::filename::LegacyNameEncoding>,
     outputs: Vec<ExtractedOutput>,
@@ -789,12 +800,16 @@ impl<'a> ExtractOutputState<'a> {
         out_dir: &'a Path,
         overwrite: OverwritePolicy,
         in_place: bool,
+        flatten: bool,
         family: rars::ArchiveFamily,
     ) -> Self {
         Self {
             out_dir,
             overwrite,
             in_place,
+            flatten,
+            flat_names: Default::default(),
+            renames: Default::default(),
             family,
             legacy_name_encoding: None,
             outputs: Vec::new(),
@@ -839,20 +854,32 @@ impl<'a> ExtractOutputState<'a> {
 
     fn open_entry(&mut self, meta: &rars::ExtractedEntryMeta) -> rars::Result<Box<dyn Write>> {
         self.publish_verified()?;
-        let (name, relative) = self.entry_path(meta)?;
+        let (name, stored) = self.entry_path(meta)?;
+        if self.flatten && meta.is_directory {
+            return Ok(Box::new(std::io::sink()));
+        }
+        let relative = self.output_relative(&stored);
+        self.claim_flat_name(&relative, &meta.name)?;
         let destination = output::checked_output_path(self.out_dir, &relative)
             .map_err(|error| refused_output(error, &meta.name))?;
         self.reserve_output_path(destination.clone())?;
         self.remember_directory_time(&destination, meta)?;
         let staging = self.prepare_staged_path(&destination, meta.is_directory)?;
-        let (path, writer) =
-            open_output_writer(&staging, &relative, meta.is_directory, self.staged_policy())?;
+        let (path, writer) = open_output_writer(
+            &staging,
+            &relative,
+            meta.is_directory,
+            self.staged_policy(),
+            &mut self.renames,
+        )?;
         self.record_staged_path(&path, meta.is_directory)?;
-        self.created_paths.insert(relative, path.clone());
+        self.created_paths.insert(stored.clone(), path.clone());
         self.archive_names.push(meta.name.clone());
         self.outputs.push(ExtractedOutput {
             name,
-            path: destination,
+            stored,
+            // In place, `Rename` chose the name when it opened.
+            path: if self.in_place { path } else { destination },
             meta: meta.clone(),
             family: self.family,
             restore_metadata: true,
@@ -866,16 +893,24 @@ impl<'a> ExtractOutputState<'a> {
         link: rars::ExtractedLink<'_>,
     ) -> rars::Result<()> {
         self.publish_verified()?;
-        let (name, relative) = self.entry_path(meta)?;
+        let (name, stored) = self.entry_path(meta)?;
+        let relative = self.output_relative(&stored);
         let destination = output::checked_output_path(self.out_dir, &relative)
             .map_err(|error| refused_output(error, &meta.name))?;
-        let Some(target) =
-            rars::output_links::link_target(self.out_dir, &relative, meta, link, self.family)?
+        let Some(target) = rars::output_links::link_target(
+            self.out_dir,
+            &relative,
+            meta,
+            link,
+            self.family,
+            self.flatten,
+        )?
         else {
             eprintln!("{}", output::skipped_link_warning(&name, link.target()));
             self.skipped_links += 1;
             return Ok(());
         };
+        self.claim_flat_name(&relative, &meta.name)?;
         self.reserve_output_path(destination.clone())?;
         let staging = self.prepare_staged_path(&destination, false)?;
         let (path, restore_metadata) = create_link_output(
@@ -885,6 +920,7 @@ impl<'a> ExtractOutputState<'a> {
             link,
             self.staged_policy(),
             &self.created_paths,
+            &mut self.renames,
         )?;
         self.record_staged_path(&path, false)?;
         self.staged_redirections.insert(path.clone());
@@ -893,11 +929,12 @@ impl<'a> ExtractOutputState<'a> {
             self.hardlink_targets
                 .insert(path.clone(), source.to_path_buf());
         }
-        self.created_paths.insert(relative, path.clone());
+        self.created_paths.insert(stored.clone(), path.clone());
         self.archive_names.push(meta.name.clone());
         self.outputs.push(ExtractedOutput {
             name,
-            path: destination,
+            stored,
+            path: if self.in_place { path } else { destination },
             meta: meta.clone(),
             family: self.family,
             restore_metadata,
@@ -905,8 +942,33 @@ impl<'a> ExtractOutputState<'a> {
         Ok(())
     }
 
+    fn output_relative(&self, stored: &Path) -> PathBuf {
+        if self.flatten {
+            rars::output_staging::flat_relative(stored)
+        } else {
+            stored.to_path_buf()
+        }
+    }
+
+    fn claim_flat_name(&mut self, relative: &Path, member: &[u8]) -> rars::Result<()> {
+        if !self.flatten {
+            return Ok(());
+        }
+        self.flat_names
+            .claim(relative, member, self.overwrite)
+            .map_err(|error| refused_output(error, member))
+    }
+
+    /// Whether a later member may land where an earlier one did: beside it, or over it when flattening.
+    fn repeats_allowed(&self) -> bool {
+        self.overwrite == OverwritePolicy::Rename
+            || (self.flatten && self.overwrite == OverwritePolicy::Always)
+    }
+
     fn reserve_output_path(&mut self, path: PathBuf) -> rars::Result<()> {
-        if !self.planned_paths.insert(path) {
+        if !self.planned_paths.insert(path)
+            && !(self.flatten && self.overwrite != OverwritePolicy::Never)
+        {
             return Err(rars::Error::InvalidHeader(
                 "multiple archive entries map to the same output path",
             ));
@@ -930,7 +992,7 @@ impl<'a> ExtractOutputState<'a> {
         if self.in_place {
             // A collision would otherwise overwrite an earlier member before any check.
             if let Ok(identity) = fs::canonicalize(destination) {
-                if self.published_identities.contains(&identity) {
+                if self.published_identities.contains(&identity) && !self.repeats_allowed() {
                     return Err(rars::Error::InvalidHeader(
                         "multiple archive entries map to the same output path",
                     ));
@@ -1036,7 +1098,7 @@ impl<'a> ExtractOutputState<'a> {
                 None => fs::canonicalize(&destination).ok(),
             };
             if let Some(identity) = existing {
-                if self.published_identities.contains(&identity) {
+                if self.published_identities.contains(&identity) && !self.repeats_allowed() {
                     return Err(rars::Error::InvalidHeader(
                         "multiple archive entries map to the same output path",
                     ));
@@ -1063,17 +1125,21 @@ impl<'a> ExtractOutputState<'a> {
                     .hardlink_targets
                     .get(&staged)
                     .map(|target| self.published_paths.get(target).unwrap_or(target).as_path());
-                output::publish_verified_output(
+                let published = output::publish_verified_output(
                     &staged,
                     &destination,
                     self.overwrite,
                     hardlink_target,
+                    &mut self.renames,
                 )?;
+                self.outputs[self.published].path = published;
             }
+            let destination = self.outputs[self.published].path.clone();
             // Later redirections resolve this entry at its published location.
-            if self.created_paths.get(&relative) == Some(&staged) {
+            let stored = &self.outputs[self.published].stored;
+            if self.created_paths.get(stored) == Some(&staged) {
                 self.created_paths
-                    .insert(relative.clone(), destination.clone());
+                    .insert(stored.clone(), destination.clone());
             }
             self.published_paths
                 .insert(staged.clone(), destination.clone());
@@ -2515,6 +2581,7 @@ mod tests {
             &root,
             super::OverwritePolicy::Never,
             false,
+            false,
             rars::ArchiveFamily::Rar50Plus,
         ));
         super::extract_volume_archives(
@@ -2542,6 +2609,7 @@ mod tests {
             &root,
             super::OverwritePolicy::Never,
             false,
+            false,
             rars::ArchiveFamily::Rar50Plus,
         ));
         assert!(super::extract_volume_archives(
@@ -2563,6 +2631,7 @@ mod tests {
         let state = std::cell::RefCell::new(super::ExtractOutputState::new(
             &root,
             super::OverwritePolicy::Never,
+            false,
             false,
             rars::ArchiveFamily::Rar15To40,
         ));
@@ -2883,6 +2952,7 @@ mod tests {
         let mut state = super::ExtractOutputState::new(
             &root,
             super::OverwritePolicy::Always,
+            false,
             false,
             rars::ArchiveFamily::Rar50Plus,
         );

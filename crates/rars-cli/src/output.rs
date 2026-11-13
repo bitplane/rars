@@ -7,6 +7,8 @@ pub(crate) use rars::output_staging::{ExtractionStaging, OverwritePolicy};
 
 pub(crate) struct ExtractedOutput {
     pub(crate) name: Vec<u8>,
+    /// The member's stored path, which flattening or renaming may move it from.
+    pub(crate) stored: PathBuf,
     pub(crate) path: PathBuf,
     pub(crate) meta: ExtractedEntryMeta,
     pub(crate) family: ArchiveFamily,
@@ -25,6 +27,7 @@ pub(crate) fn open_output_writer(
     relative: &Path,
     directory: bool,
     overwrite: OverwritePolicy,
+    renames: &mut rars::output_staging::RenameCounters,
 ) -> rars::Result<(PathBuf, Box<dyn std::io::Write>)> {
     let mut out_path = checked_output_path(out_dir, relative)?;
     if directory {
@@ -37,10 +40,8 @@ pub(crate) fn open_output_writer(
             .expect("validated output path has a parent"),
     )?;
     out_path = checked_output_path(out_dir, relative)?;
-    Ok((
-        out_path.clone(),
-        Box::new(rars::output_staging::open_in_place(&out_path, overwrite)?),
-    ))
+    let (out_path, file) = rars::output_staging::open_in_place(&out_path, overwrite, renames)?;
+    Ok((out_path, Box::new(file)))
 }
 
 /// RAR 5.0 uses `/` as the separator for every host, so a backslash that
@@ -260,6 +261,7 @@ mod tests {
             &root,
             OverwritePolicy::Always,
             false,
+            false,
             ArchiveFamily::Rar50Plus,
         );
         state
@@ -466,6 +468,7 @@ mod tests {
                         &root,
                         overwrite,
                         false,
+                        false,
                         ArchiveFamily::Rar50Plus,
                     );
                     let (mut meta, mut redirection) = redirection_fixture();
@@ -570,6 +573,7 @@ mod tests {
             for timestamp in [None, Some(1_704_067_200)] {
                 let output = ExtractedOutput {
                     name: b"missing".to_vec(),
+                    stored: PathBuf::new(),
                     path: dir.join("missing"),
                     meta: ExtractedEntryMeta::new(
                         b"missing".to_vec(),
@@ -665,6 +669,7 @@ mod tests {
             test_link(link)?,
             overwrite,
             created,
+            &mut Default::default(),
         )
     }
     fn output_path_for_rar50_entry(
@@ -681,7 +686,13 @@ mod tests {
         overwrite: super::OverwritePolicy,
     ) -> rars::Result<(std::path::PathBuf, Box<dyn std::io::Write>)> {
         let relative = rars::filename::relative_path(&meta.name, true)?;
-        super::open_output_writer(out, &relative, meta.is_directory, overwrite)
+        super::open_output_writer(
+            out,
+            &relative,
+            meta.is_directory,
+            overwrite,
+            &mut Default::default(),
+        )
     }
 
     fn redirection_fixture() -> (
@@ -711,6 +722,7 @@ mod tests {
             let mut state = crate::ExtractOutputState::new(
                 &dir,
                 OverwritePolicy::Always,
+                false,
                 false,
                 ArchiveFamily::Rar50Plus,
             );
@@ -783,6 +795,7 @@ mod tests {
                     &dir,
                     OverwritePolicy::Always,
                     false,
+                    false,
                     ArchiveFamily::Rar50Plus,
                 );
                 let (mut meta, mut redirection) = redirection_fixture();
@@ -848,6 +861,7 @@ mod tests {
             let mut state = crate::ExtractOutputState::new(
                 &dir,
                 OverwritePolicy::Always,
+                false,
                 false,
                 ArchiveFamily::Rar50Plus,
             );
@@ -1027,6 +1041,7 @@ mod tests {
         let outputs = [
             ExtractedOutput {
                 name: b"payload.exe".to_vec(),
+                stored: std::path::PathBuf::new(),
                 path: file,
                 meta: ExtractedEntryMeta::new(b"payload.exe".to_vec(), 1_704_067_200, 0x20, false),
                 family: ArchiveFamily::Rar50Plus,
@@ -1034,6 +1049,7 @@ mod tests {
             },
             ExtractedOutput {
                 name: b"nested".to_vec(),
+                stored: std::path::PathBuf::new(),
                 path: dir,
                 meta: ExtractedEntryMeta::new(b"nested".to_vec(), 1_704_067_200, 0x10, true),
                 family: ArchiveFamily::Rar50Plus,
@@ -1071,6 +1087,7 @@ mod tests {
                     .to_vec();
                 ExtractedOutput {
                     name: name.clone(),
+                    stored: std::path::PathBuf::new(),
                     path: paths[index].clone(),
                     meta: ExtractedEntryMeta::new(
                         name,
