@@ -3,6 +3,27 @@ use std::io::{Read, Result};
 
 pub(crate) type Volumes<'p, A> = dyn Iterator<Item = crate::Result<A>> + Send + 'p;
 
+/// A volume that can say it belongs somewhere else in its set.
+pub(crate) trait PlacedVolume {
+    /// True when the volume records a number other than `index`, counted from 0.
+    fn placed_elsewhere(&self, _index: usize) -> bool {
+        false
+    }
+}
+
+impl PlacedVolume for crate::rar13::Archive {}
+
+// RAR 5 checks its main header's number in `extract_with_volumes`.
+impl PlacedVolume for crate::rar50::Archive {}
+
+impl PlacedVolume for crate::rar15_40::Archive {
+    fn placed_elsewhere(&self, index: usize) -> bool {
+        // A 16-bit field, so a set past 65,536 volumes counts round again.
+        self.end_volume_number()
+            .is_some_and(|number| number != index as u16)
+    }
+}
+
 /// Hands out a set's volumes front to back, each exactly once.
 pub(crate) struct VolumeFeed<'p, 'o, A> {
     volumes: &'p mut Volumes<'p, A>,
@@ -12,7 +33,7 @@ pub(crate) struct VolumeFeed<'p, 'o, A> {
     options: crate::ArchiveReadOptions<'o>,
 }
 
-impl<'p, 'o, A> VolumeFeed<'p, 'o, A> {
+impl<'p, 'o, A: PlacedVolume> VolumeFeed<'p, 'o, A> {
     /// Volumes may still be arriving, so it is not advanced past one marked last.
     pub(crate) fn arriving(
         volumes: &'p mut Volumes<'p, A>,
@@ -59,6 +80,16 @@ impl<'p, 'o, A> VolumeFeed<'p, 'o, A> {
         self.ended = !matches!(volume, Ok(Some(_)));
         let volume = volume?;
         self.index += 1;
+        if volume
+            .as_ref()
+            .is_some_and(|volume| volume.placed_elsewhere(self.index - 1))
+        {
+            self.ended = true;
+            return Err(crate::Error::InVolume {
+                number: self.index,
+                source: Box::new(crate::Error::InvalidHeader("volume is out of order")),
+            });
+        }
         self.options.check_cancelled()?;
         Ok(volume)
     }

@@ -17,7 +17,8 @@ fn headers(a: &Archive, raw: &[u8]) -> Vec<u64> {
                     rars::rar15_40::Block::NewSub(s) => &s.file.block,
                     rars::rar15_40::Block::Comment(c) => &c.block,
                     rars::rar15_40::Block::Protect(p) => &p.block,
-                    rars::rar15_40::Block::End(h) | rars::rar15_40::Block::Unknown(h) => h,
+                    rars::rar15_40::Block::End(e) => &e.block,
+                    rars::rar15_40::Block::Unknown(h) => h,
                     _ => unreachable!(),
                 };
                 // A nested main comment is represented separately in blocks.
