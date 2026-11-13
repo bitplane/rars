@@ -149,20 +149,32 @@ fn update_password_data_sha1(data: &mut [u8]) {
 }
 
 fn derive_key_iv_fast(raw: &[u8]) -> ([u8; 16], [u8; 16]) {
+    // Raw never changes on this path, so one SHA-1 update can absorb many rounds.
+    let record = raw.len() + 3;
+    let mut staging = Zeroizing::new([0u8; 1024]);
+    let records_per_buffer = staging.len() / record;
+    for slot in staging[..records_per_buffer * record].chunks_exact_mut(record) {
+        slot[..raw.len()].copy_from_slice(raw);
+    }
+
     let mut sha1 = FastSha1::new();
     let mut iv = [0; 16];
+    let mut staged = 0;
     for i in 0..HASH_ROUNDS {
-        sha1.update(raw);
-        sha1.update([
-            (i & 0xff) as u8,
-            ((i >> 8) & 0xff) as u8,
-            ((i >> 16) & 0xff) as u8,
-        ]);
-        if i.is_multiple_of(HASH_ROUNDS / 16) {
+        let counter_at = staged * record + raw.len();
+        staging[counter_at..counter_at + 3].copy_from_slice(&i.to_le_bytes()[..3]);
+        staged += 1;
+        let sample = i.is_multiple_of(HASH_ROUNDS / 16);
+        if sample || staged == records_per_buffer {
+            sha1.update(&staging[..staged * record]);
+            staged = 0;
+        }
+        if sample {
             let digest = sha1.clone().finalize();
             iv[(i / (HASH_ROUNDS / 16)) as usize] = digest[19];
         }
     }
+    sha1.update(&staging[..staged * record]);
 
     let digest = sha1.finalize();
     let mut key = [0; 16];
@@ -290,6 +302,77 @@ mod tests {
     }
 
     #[test]
+    fn kdf_keys_and_ivs_match_known_vectors() {
+        let max = "🙂".repeat(crate::crypto::MAX_PASSWORD_CHARS);
+        type Case<'a> = (&'a [u8], Option<[u8; 8]>, [u8; 16], [u8; 16]);
+        let cases: [Case; 5] = [
+            (
+                b"",
+                None,
+                [
+                    0x1c, 0xa3, 0xe7, 0xbf, 0x37, 0xbd, 0x39, 0x5f, 0xb3, 0x3d, 0x33, 0x91, 0x34,
+                    0x4b, 0x44, 0x66,
+                ],
+                [
+                    0x7d, 0xaa, 0x41, 0xef, 0x28, 0xe1, 0x2a, 0xf5, 0x20, 0xdc, 0x5b, 0x9e, 0x0e,
+                    0x33, 0x17, 0xe5,
+                ],
+            ),
+            (
+                b"password",
+                Some(*b"rarsalt!"),
+                [
+                    0x83, 0x23, 0x26, 0x91, 0x20, 0xf7, 0x6f, 0xcb, 0x29, 0x95, 0xbd, 0xdf, 0x24,
+                    0xc3, 0xbb, 0x4a,
+                ],
+                [
+                    0xef, 0x87, 0x2f, 0xb1, 0xe2, 0xef, 0x91, 0x7d, 0x20, 0x24, 0x52, 0x8e, 0x6d,
+                    0x38, 0x5e, 0xbf,
+                ],
+            ),
+            (
+                b"abcdefghijklmnopqrstuvwxyz01234",
+                None,
+                [
+                    0xde, 0x5b, 0x6b, 0xfb, 0x0d, 0xdf, 0x08, 0x0e, 0x16, 0x4e, 0x39, 0x47, 0xbf,
+                    0x6b, 0xb6, 0x92,
+                ],
+                [
+                    0xf6, 0xd2, 0x14, 0x4c, 0x96, 0xe0, 0xfc, 0xd4, 0xb7, 0x13, 0xe3, 0x43, 0xd6,
+                    0xe8, 0x6c, 0x73,
+                ],
+            ),
+            (
+                b"abcdefghijklmnopqrstuvwxyz012345",
+                None,
+                [
+                    0x03, 0x6f, 0x38, 0xca, 0xeb, 0x01, 0x07, 0xc1, 0x90, 0x6c, 0xe2, 0x4c, 0xf8,
+                    0xb5, 0x3c, 0xc3,
+                ],
+                [
+                    0x8e, 0x7b, 0xa4, 0xb5, 0xe2, 0xe5, 0x15, 0x38, 0x74, 0x15, 0xa6, 0xc0, 0x2a,
+                    0x87, 0x6a, 0x82,
+                ],
+            ),
+            (
+                max.as_bytes(),
+                Some(*b"longsalt"),
+                [
+                    0x73, 0xb0, 0xc0, 0x1f, 0x35, 0xff, 0x15, 0xca, 0xd9, 0xae, 0xbf, 0x9f, 0xca,
+                    0xa6, 0x6e, 0xa8,
+                ],
+                [
+                    0x44, 0xd9, 0x4e, 0x6c, 0xa0, 0xfe, 0xfe, 0x85, 0xc9, 0xfa, 0xe7, 0x4f, 0x19,
+                    0x41, 0x43, 0xc0,
+                ],
+            ),
+        ];
+        for (password, salt, key, iv) in cases {
+            assert_eq!(derive_key_iv(password, salt).unwrap(), (key, iv));
+        }
+    }
+
+    #[test]
     fn rar30_fast_kdf_matches_reference_path_for_short_material() {
         for (password, salt) in [
             (b"".as_slice(), None),
@@ -308,5 +391,11 @@ mod tests {
 
             assert_eq!(fast, reference);
         }
+
+        let raw: Vec<u8> = (0..63).collect();
+        assert_eq!(
+            derive_key_iv_fast(&raw),
+            derive_key_iv_slow(&mut raw.clone())
+        );
     }
 }
