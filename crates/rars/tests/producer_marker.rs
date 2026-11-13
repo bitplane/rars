@@ -9,8 +9,34 @@ const PRODUCER: &[u8] =
     concat!("rars/", env!("CARGO_PKG_VERSION"), "\nmarker-schema=1\n").as_bytes();
 
 fn assert_marker(archive: &Archive) {
-    let Block::Service(marker) = &archive.blocks[0] else {
-        panic!("producer must precede files and user comments");
+    assert!(
+        matches!(&archive.blocks[0], Block::Service(marker) if marker.name == b"RARS"),
+        "producer must precede files and user comments"
+    );
+    check_marker(archive, 0);
+}
+
+/// Later volumes start with their split member, as RAR writes them, and carry
+/// the producer after their files.
+fn assert_volume_marker(archive: &Archive, index: usize) {
+    if index == 0 {
+        return assert_marker(archive);
+    }
+    assert!(matches!(&archive.blocks[0], Block::File(_)));
+    let at = archive
+        .blocks
+        .iter()
+        .position(|block| matches!(block, Block::Service(marker) if marker.name == b"RARS"))
+        .expect("every volume has a producer record");
+    assert!(archive.blocks[at..]
+        .iter()
+        .all(|block| !matches!(block, Block::File(_))));
+    check_marker(archive, at);
+}
+
+fn check_marker(archive: &Archive, at: usize) {
+    let Block::Service(marker) = &archive.blocks[at] else {
+        unreachable!("checked by the caller");
     };
     assert_eq!(marker.name, b"RARS");
     assert_eq!(marker.block.flags, 6);
@@ -62,8 +88,8 @@ fn every_volume_has_an_independent_producer_record() {
         })
         .unwrap();
         assert!(volumes.len() > 1);
-        for volume in volumes {
-            assert_marker(&Archive::parse(&volume).unwrap());
+        for (index, volume) in volumes.iter().enumerate() {
+            assert_volume_marker(&Archive::parse(volume).unwrap(), index);
         }
     }
 }
@@ -89,12 +115,17 @@ fn encrypted_headers_keep_producer_payload_public_and_rewritable() {
         assert!(rars::Archive::Rar50Plus(archive)
             .preserving_builder(Some(b"secret"))
             .is_ok());
-        for volume in volume_size::sized_for_payload(16, |size| {
+        for (index, volume) in volume_size::sized_for_payload(16, |size| {
             builder.clone().volume_size(Some(size)).build_volumes(None)
         })
         .unwrap()
+        .iter()
+        .enumerate()
         {
-            assert_marker(&Archive::parse_with_password(&volume, Some(b"secret")).unwrap());
+            assert_volume_marker(
+                &Archive::parse_with_password(volume, Some(b"secret")).unwrap(),
+                index,
+            );
         }
     }
 }

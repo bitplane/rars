@@ -241,7 +241,7 @@ impl<'a> VolumePacker<'a> {
             index: 0,
             total_volumes: None,
         };
-        packer.tail_len = packer.tail(false)?.len() as u64;
+        packer.tail_len = packer.tail(0, false)?.len() as u64;
         Ok(packer)
     }
 
@@ -353,16 +353,20 @@ impl<'a> VolumePacker<'a> {
         let mut head = Vec::new();
         head.extend_from_slice(RAR15_SIGNATURE);
         write_main_header(&mut head, main_flags);
-        write_producer(
-            &mut head,
-            self.target,
-            self.header_password,
-            Some(self.progress),
-        )?;
+        // Later volumes carry it in their tail instead: see `tail`.
+        if index == 0 {
+            write_producer(
+                &mut head,
+                self.target,
+                self.header_password,
+                Some(self.progress),
+            )?;
+        }
         Ok(head)
     }
 
     fn start_volume(&mut self) -> Result<()> {
+        self.tail_len = self.tail(self.index, false)?.len() as u64;
         let head = self.head(self.index)?;
         let mut out = self.sink.start_volume(self.index)?;
         out.write_all(&head)?;
@@ -376,7 +380,7 @@ impl<'a> VolumePacker<'a> {
 
     fn close_volume(&mut self, more: bool) -> Result<()> {
         let mut volume = self.open.take().expect("volume open");
-        let tail = self.tail(more)?;
+        let tail = self.tail(self.index, more)?;
         let len = volume.used + tail.len() as u64;
         if len > self.volume_size {
             return Err(Error::WriterFailure(
@@ -400,8 +404,18 @@ impl<'a> VolumePacker<'a> {
         crate::write_progress::check_cancelled(Some(self.progress))
     }
 
-    fn tail(&self, more: bool) -> Result<Vec<u8>> {
+    /// A later volume's producer record goes after its files, so a split
+    /// member's header comes first, as RAR writes it and python-rarfile reads it.
+    fn tail(&self, index: u64, more: bool) -> Result<Vec<u8>> {
         let mut out = Vec::new();
+        if index > 0 {
+            write_producer(
+                &mut out,
+                self.target,
+                self.header_password,
+                Some(self.progress),
+            )?;
+        }
         match self.header_password {
             Some(password) => {
                 write_encrypted_end_block(&mut out, volume_end_flags(more), password)?
