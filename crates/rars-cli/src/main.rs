@@ -704,6 +704,7 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
         overwrite,
         args.in_place,
         family,
+        args.flatten,
     ));
     let options = args
         .read_options
@@ -764,6 +765,7 @@ struct ExtractOutputState<'a> {
     out_dir: &'a Path,
     overwrite: OverwritePolicy,
     in_place: bool,
+    flatten: bool,
     family: rars::ArchiveFamily,
     legacy_name_encoding: Option<rars::filename::LegacyNameEncoding>,
     outputs: Vec<ExtractedOutput>,
@@ -790,12 +792,14 @@ impl<'a> ExtractOutputState<'a> {
         overwrite: OverwritePolicy,
         in_place: bool,
         family: rars::ArchiveFamily,
+        flatten: bool,
     ) -> Self {
         Self {
             out_dir,
             overwrite,
             in_place,
             family,
+            flatten,
             legacy_name_encoding: None,
             outputs: Vec::new(),
             planned_paths: HashSet::new(),
@@ -839,7 +843,21 @@ impl<'a> ExtractOutputState<'a> {
 
     fn open_entry(&mut self, meta: &rars::ExtractedEntryMeta) -> rars::Result<Box<dyn Write>> {
         self.publish_verified()?;
-        let (name, relative) = self.entry_path(meta)?;
+        if self.flatten && meta.is_directory {
+            return Ok(Box::new(std::io::sink()));
+        }
+        let (name, mut relative) = self.entry_path(meta)?;
+        if self.flatten {
+            let base = rars::output_staging::flat_file_name(&relative)
+                .ok_or(rars::Error::InvalidHeader("archive entry has no file name"))?;
+            let base = base.to_os_string();
+            relative = PathBuf::from(&base);
+            let mut generation = 1u32;
+            while self.planned_paths.contains(&self.out_dir.join(&relative)) {
+                relative = PathBuf::from(rars::output_staging::clash_name(&base, generation));
+                generation += 1;
+            }
+        }
         let destination = output::checked_output_path(self.out_dir, &relative)
             .map_err(|error| refused_output(error, &meta.name))?;
         self.reserve_output_path(destination.clone())?;
@@ -2516,6 +2534,7 @@ mod tests {
             super::OverwritePolicy::Never,
             false,
             rars::ArchiveFamily::Rar50Plus,
+            false,
         ));
         super::extract_volume_archives(
             &[super::DetectedArchive::Rar50Plus(archive)],
@@ -2543,6 +2562,7 @@ mod tests {
             super::OverwritePolicy::Never,
             false,
             rars::ArchiveFamily::Rar50Plus,
+            false,
         ));
         assert!(super::extract_volume_archives(
             &[super::DetectedArchive::Rar50Plus(archive)],
@@ -2565,6 +2585,7 @@ mod tests {
             super::OverwritePolicy::Never,
             false,
             rars::ArchiveFamily::Rar15To40,
+            false,
         ));
         let mut options = super::ArchiveReadOptions::with_optional_password(Some(b"test"));
         options.legacy_name_encoding = Some(rars::filename::LegacyNameEncoding::Cp850);
@@ -2885,6 +2906,7 @@ mod tests {
             super::OverwritePolicy::Always,
             false,
             rars::ArchiveFamily::Rar50Plus,
+            false,
         );
         state.reserve_output_path(file.clone()).unwrap();
         assert!(matches!(

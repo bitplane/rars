@@ -2777,8 +2777,10 @@ fn decode_with_raw_standard_filter(
         &[],
         &[filter],
         EncodeOptions::default(),
+        false,
         &mut levels,
         None,
+        &mut Vec::new(),
     )?;
     unpack29_decode(&packed, data.len())
 }

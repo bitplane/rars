@@ -13,6 +13,16 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
+if sys.version_info < (3, 10):
+    for candidate in (
+        Path("/opt/homebrew/bin/python3"),
+        Path("/opt/homebrew/bin/python3.14"),
+        Path.home() / ".local/bin/python3.11",
+    ):
+        if candidate.is_file():
+            os.execv(candidate, [str(candidate), *sys.argv])
+    sys.exit("rars bindings need Python 3.10 or newer")
+
 
 def run(cmd: list[str], *, env: dict[str, str] | None = None) -> None:
     print("+", " ".join(cmd), flush=True)

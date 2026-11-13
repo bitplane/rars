@@ -58,6 +58,7 @@ pub use write::{
     write_stored_archive_with_comment, write_stored_volumes, write_stored_volumes_to,
     write_streaming_archive_to,
 };
+pub use write::{write_compressed_entries_to, write_stored_entries_to};
 
 const MARK_HEAD: u8 = 0x72;
 const MAIN_HEAD: u8 = 0x73;

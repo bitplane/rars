@@ -499,14 +499,25 @@ struct FilteredMember {
 
 /// In place: copying the member per record made many-record members quadratic.
 fn filter_in_place(filtered: &mut [u8], filter: &crate::FilterSpec) -> Result<FilteredMember> {
+    filter_in_place_at(filtered, filter, 0)
+}
+
+/// `file_base` is where `filtered` sits in the member. E8 and Itanium addresses
+/// are file positions, and a later block is not at offset zero.
+fn filter_in_place_at(
+    filtered: &mut [u8],
+    filter: &crate::FilterSpec,
+    file_base: u32,
+) -> Result<FilteredMember> {
     let range = checked_filter_range(filtered.len(), filter)?;
+    let file_offset = file_base.wrapping_add(range.start as u32);
     let (init_regs, code): (Vec<(usize, u32)>, &'static [u8]) = match rar29_filter(filter.kind)? {
         Rar29Filter::E8 => {
-            filters::e8e9_encode(&mut filtered[range.clone()], range.start as u32, false);
+            filters::e8e9_encode(&mut filtered[range.clone()], file_offset, false);
             (Vec::new(), RAR3_E8_FILTER_BYTECODE)
         }
         Rar29Filter::E8E9 => {
-            filters::e8e9_encode(&mut filtered[range.clone()], range.start as u32, true);
+            filters::e8e9_encode(&mut filtered[range.clone()], file_offset, true);
             (Vec::new(), RAR3_E8E9_FILTER_BYTECODE)
         }
         Rar29Filter::Delta { channels } => {
@@ -519,7 +530,7 @@ fn filter_in_place(filtered: &mut [u8], filter: &crate::FilterSpec) -> Result<Fi
             (vec![(0, channels as u32)], RAR3_DELTA_FILTER_BYTECODE)
         }
         Rar29Filter::Itanium => {
-            itanium_encode(&mut filtered[range.clone()], range.start as u32);
+            itanium_encode(&mut filtered[range.clone()], file_offset);
             (Vec::new(), RAR3_ITANIUM_FILTER_BYTECODE)
         }
         Rar29Filter::Rgb { width, pos_r } => {
@@ -671,6 +682,86 @@ impl Unpack29Encoder {
         }
     }
 
+    /// Encodes `total` bytes from `input` a block at a time.
+    ///
+    /// Each block is a complete RAR 2.9 block. Every block but the last says
+    /// another block follows, and the encoder keeps only the match window, so
+    /// the caller never has to hold the member.
+    pub(crate) fn encode_blocks_from_reader(
+        &mut self,
+        input: &mut dyn std::io::Read,
+        total: u64,
+        block_size: usize,
+        filter: Option<crate::FilterKind>,
+        output: &mut dyn std::io::Write,
+    ) -> Result<()> {
+        let block_size = block_size.max(1);
+        let mut buf = vec![0u8; block_size];
+        let mut programs: Vec<&'static [u8]> = Vec::new();
+        let mut done = 0u64;
+        while done < total {
+            let want = ((total - done) as usize).min(block_size);
+            std::io::Read::read_exact(input, &mut buf[..want])?;
+            done += want as u64;
+            let more = done < total;
+            let origin = done - want as u64;
+            let mut block = buf[..want].to_vec();
+            let packed = if let Some(kind) = filter {
+                let spec = crate::FilterSpec::range(kind, 0..block.len());
+                match filter_in_place_at(&mut block, &spec, origin as u32) {
+                    Ok(filtered) => {
+                        let record = OwnedVmFilterRecord {
+                            block_start: filtered.block_start,
+                            block_size: filtered.block_size,
+                            init_regs: filtered.init_regs,
+                            code: filtered.code,
+                            global_data: Vec::new(),
+                        };
+                        let packed = encode_filtered_member_blocks(
+                            &block,
+                            &self.history,
+                            &[record],
+                            self.options,
+                            more,
+                            &mut self.levels,
+                            None,
+                            &mut programs,
+                        )?;
+                        self.remember(&block);
+                        packed
+                    }
+                    Err(_) => {
+                        let packed = encode_member_inner(
+                            &buf[..want],
+                            &self.history,
+                            &[],
+                            self.options,
+                            more,
+                            &mut self.levels,
+                            None,
+                        )?;
+                        self.remember(&buf[..want]);
+                        packed
+                    }
+                }
+            } else {
+                let packed = encode_member_inner(
+                    &buf[..want],
+                    &self.history,
+                    &[],
+                    self.options,
+                    more,
+                    &mut self.levels,
+                    None,
+                )?;
+                self.remember(&buf[..want]);
+                packed
+            };
+            output.write_all(&packed)?;
+        }
+        Ok(())
+    }
+
     pub fn encode_member(&mut self, input: &[u8]) -> Result<Vec<u8>> {
         let packed = encode_member_with_options_impl(
             input,
@@ -790,8 +881,10 @@ impl Unpack29Encoder {
                     &self.history,
                     &filtered.records,
                     self.options,
+                    false,
                     &mut levels,
                     Some(&mut report),
+                    &mut Vec::new(),
                 )?;
                 LzCandidate {
                     packed,
@@ -844,8 +937,10 @@ impl Unpack29Encoder {
             &self.history,
             &filtered.records,
             self.options,
+            false,
             &mut levels,
             None,
+            &mut Vec::new(),
         )?;
         // The LZ layer coded the filtered bytes, so that is what a decoder's
         // window holds and what the next member in a solid chain can match
@@ -889,8 +984,10 @@ impl Unpack29Encoder {
             &self.history,
             &filtered.records,
             self.options,
+            false,
             &mut levels,
             progress,
+            &mut Vec::new(),
         )?;
         // The LZ layer coded the filtered bytes, so that is what a decoder's
         // window holds and what the next member in a solid chain can match
@@ -1319,13 +1416,16 @@ fn encoded_filter_records_at(
 /// Codes filtered bytes a block at a time, so that no filter is declared
 /// further ahead of its block than the decoder's window can express, and so a
 /// large member does not need a whole LZ pass in memory at once.
+#[allow(clippy::too_many_arguments)]
 fn encode_filtered_member_blocks(
     data: &[u8],
     history: &[u8],
     filters: &[OwnedVmFilterRecord],
     options: EncodeOptions,
+    more_follows: bool,
     levels: &mut [u8; TABLE_COUNT],
     progress: Option<&mut dyn FnMut(usize) -> bool>,
+    programs: &mut Vec<&'static [u8]>,
 ) -> Result<Vec<u8>> {
     // A record's offset is relative to the head of its own block, so a block no
     // larger than the window keeps every offset inside it.
@@ -1338,7 +1438,6 @@ fn encode_filtered_member_blocks(
     let window = options.max_match_distance.max(1);
     let mut inner = options;
     inner.block_size = None;
-    let mut programs: Vec<&'static [u8]> = Vec::new();
     let mut out = Vec::new();
     for_each_block(
         data,
@@ -1353,8 +1452,13 @@ fn encode_filtered_member_blocks(
                     record.block_start >= base && record.block_start < end.max(base + 1)
                 })
                 .collect();
-            let records = encoded_filter_records_at(&in_block, base, window, &mut programs)?;
-            out.extend_from_slice(&code_block(tokens, &records, end < data.len(), levels)?);
+            let records = encoded_filter_records_at(&in_block, base, window, programs)?;
+            out.extend_from_slice(&code_block(
+                tokens,
+                &records,
+                more_follows || end < data.len(),
+                levels,
+            )?);
             Ok(())
         },
     )?;

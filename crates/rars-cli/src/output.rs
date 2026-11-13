@@ -261,6 +261,7 @@ mod tests {
             OverwritePolicy::Always,
             false,
             ArchiveFamily::Rar50Plus,
+            false,
         );
         state
             .open_entry(&rars::ExtractedEntryMeta::new(
@@ -467,6 +468,7 @@ mod tests {
                         overwrite,
                         false,
                         ArchiveFamily::Rar50Plus,
+                        false,
                     );
                     let (mut meta, mut redirection) = redirection_fixture();
                     meta.name = b"source".to_vec();
@@ -713,6 +715,7 @@ mod tests {
                 OverwritePolicy::Always,
                 false,
                 ArchiveFamily::Rar50Plus,
+                false,
             );
             let (mut meta, mut redirection) = redirection_fixture();
             meta.host_os = 1;
@@ -784,6 +787,7 @@ mod tests {
                     OverwritePolicy::Always,
                     false,
                     ArchiveFamily::Rar50Plus,
+                    false,
                 );
                 let (mut meta, mut redirection) = redirection_fixture();
                 meta.host_os = host_os;
@@ -850,6 +854,7 @@ mod tests {
                 OverwritePolicy::Always,
                 false,
                 ArchiveFamily::Rar50Plus,
+                false,
             );
             let (mut meta, mut redirection) = redirection_fixture();
             meta.host_os = host_os;

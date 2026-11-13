@@ -141,6 +141,24 @@ pub enum OverwritePolicy {
     Always,
 }
 
+/// The file name flat extraction keeps. Directory components are dropped.
+pub fn flat_file_name(stored: &Path) -> Option<&std::ffi::OsStr> {
+    stored.file_name().filter(|name| !name.is_empty())
+}
+
+/// The next name after a clash: `readme.txt` becomes `readme(1).txt`.
+///
+/// The split is the last dot, including a leading one, so `.hidden` becomes
+/// `(1).hidden` and a name with no dot becomes `noext(1)`.
+pub fn clash_name(name: &std::ffi::OsStr, generation: u32) -> std::ffi::OsString {
+    let name = name.to_string_lossy();
+    let (stem, ext) = match name.rfind('.') {
+        Some(dot) => (&name[..dot], &name[dot..]),
+        None => (name.as_ref(), ""),
+    };
+    format!("{stem}({generation}){ext}").into()
+}
+
 #[cfg(unix)]
 pub fn create_symlink(target: &Path, link: &Path, _directory: bool) -> std::io::Result<()> {
     std::os::unix::fs::symlink(target, link)

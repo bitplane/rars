@@ -3,12 +3,13 @@ use pyo3::exceptions::{
     PyValueError,
 };
 use pyo3::prelude::*;
-use pyo3::types::{PyByteArray, PyBytes, PyList, PyModule, PyString};
+use pyo3::types::{PyBool, PyByteArray, PyBytes, PyInt, PyList, PyModule, PyString};
 use pyo3::{create_exception, PyErr};
 use rars_rs::filename::relative_path as output_relative_path;
 use rars_rs::output_links::{create_link_output, link_source_path};
 use rars_rs::output_staging::{
-    failed_entry_name, publish_verified_output, refused_output, ExtractionStaging, OverwritePolicy,
+    clash_name, failed_entry_name, flat_file_name, publish_verified_output, refused_output,
+    ExtractionStaging, OverwritePolicy,
 };
 use rars_rs::ExtractedLink;
 use std::collections::{HashMap, HashSet};
@@ -507,7 +508,25 @@ impl RarFile {
         if let Some(bytes) = py_bytes_like(source)? {
             return Self::from_bytes(py, bytes, password, options);
         }
-        Self::from_path(py, py_path_buf(py, source)?, password, options)
+        if source.hasattr("read")? {
+            let bytes = py_file_bytes(source)?.ok_or_else(|| {
+                PyTypeError::new_err(format!(
+                    "expected a binary file, not {}",
+                    py_type_name(source)
+                ))
+            })?;
+            return Self::from_bytes(py, bytes, password, options);
+        }
+        match py_path_buf(py, source) {
+            Ok(path) => Self::from_path(py, path, password, options),
+            Err(error) if error.is_instance_of::<PyTypeError>(py) => {
+                Err(PyTypeError::new_err(format!(
+                    "expected a path, bytes-like object, or binary file, not {}",
+                    py_type_name(source)
+                )))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     #[staticmethod]
@@ -538,21 +557,45 @@ impl RarFile {
         self.infos.clone()
     }
 
-    fn getinfo(&self, name: &Bound<'_, PyAny>) -> PyResult<RarInfo> {
+    #[pyo3(signature = (name, pwd = None, *, options = None))]
+    fn getinfo(
+        &self,
+        name: &Bound<'_, PyAny>,
+        pwd: Option<&Bound<'_, PyAny>>,
+        options: Option<&ReadOptions>,
+    ) -> PyResult<RarInfo> {
+        let _ = py_password(pwd)?;
+        check_read_options_cancellation(options)?;
         Ok(self.infos[self.resolve_index(name)?].clone())
     }
 
-    #[pyo3(signature = (name, pwd = None, *, options = None))]
+    #[pyo3(signature = (name, pwd = None, *, options = None, volumes = None))]
     fn read(
         &self,
         py: Python<'_>,
         name: &Bound<'_, PyAny>,
         pwd: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
+        volumes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<u8>> {
         check_read_options_cancellation(options)?;
-        let index = self.resolve_index(name)?;
         let password = py_password(pwd)?.or_else(|| self.password.clone());
+        if self.follows(volumes) {
+            let read_options = self.extraction_options(options, password.as_deref());
+            let archives = self.collect_volumes(py, volumes, read_options)?;
+            let index = self.resolve_logical(name, &archives)?;
+            return py
+                .detach(|| {
+                    rars_rs::read_volume_member_at_with_options(
+                        &archives,
+                        index,
+                        self.extraction_options(options, password.as_deref()),
+                    )
+                })
+                .map_err(map_error)?
+                .ok_or_else(|| PyKeyError::new_err("member has no file payload"));
+        }
+        let index = self.resolve_index(name)?;
         py.detach(|| {
             self.archive.read_member_at_with_options(
                 index,
@@ -563,15 +606,16 @@ impl RarFile {
         .ok_or_else(|| PyKeyError::new_err("member has no file payload"))
     }
 
-    #[pyo3(signature = (name, pwd = None, *, options = None))]
+    #[pyo3(signature = (name, pwd = None, *, options = None, volumes = None))]
     fn open(
         &self,
         py: Python<'_>,
         name: &Bound<'_, PyAny>,
         pwd: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
+        volumes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
-        let data = self.read(py, name, pwd, options)?;
+        let data = self.read(py, name, pwd, options, volumes)?;
         let io = py.import("io")?;
         let bytes = PyBytes::new(py, &data);
         Ok(io.getattr("BytesIO")?.call1((bytes,))?.unbind())
@@ -579,35 +623,69 @@ impl RarFile {
 
     /// Read selected members in one session, preserving request order and duplicates.
     /// Output limits apply to the whole call, including required solid predecessors.
-    #[pyo3(signature = (members, pwd = None, *, options = None))]
+    #[pyo3(signature = (members, pwd = None, *, options = None, volumes = None, progress = None))]
     fn read_many(
         &self,
         py: Python<'_>,
         members: &Bound<'_, PyAny>,
         pwd: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
+        volumes: Option<&Bound<'_, PyAny>>,
+        progress: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<Vec<u8>>> {
         check_read_options_cancellation(options)?;
-        let indices = members
-            .try_iter()?
-            .map(|member| self.resolve_index(&member?))
-            .collect::<PyResult<Vec<_>>>()?;
         let password = py_password(pwd)?.or_else(|| self.password.clone());
-        let data = py
-            .detach(|| {
-                self.archive.read_members_at_with_options(
-                    &indices,
-                    self.extraction_options(options, password.as_deref()),
-                )
-            })
-            .map_err(map_error)?;
-        data.into_iter()
+        let (indices, data) = if self.follows(volumes) {
+            let read_options = self.extraction_options(options, password.as_deref());
+            let archives = self.collect_volumes(py, volumes, read_options)?;
+            let indices = members
+                .try_iter()?
+                .map(|member| self.resolve_logical(&member?, &archives))
+                .collect::<PyResult<Vec<_>>>()?;
+            let data = py
+                .detach(|| {
+                    rars_rs::read_volume_members_at_with_options(
+                        &archives,
+                        &indices,
+                        self.extraction_options(options, password.as_deref()),
+                    )
+                })
+                .map_err(map_error)?;
+            (indices, data)
+        } else {
+            let indices = members
+                .try_iter()?
+                .map(|member| self.resolve_index(&member?))
+                .collect::<PyResult<Vec<_>>>()?;
+            let data = py
+                .detach(|| {
+                    self.archive.read_members_at_with_options(
+                        &indices,
+                        self.extraction_options(options, password.as_deref()),
+                    )
+                })
+                .map_err(map_error)?;
+            (indices, data)
+        };
+        let data = data
+            .into_iter()
             .map(|bytes| bytes.ok_or_else(|| PyKeyError::new_err("member has no file payload")))
-            .collect()
+            .collect::<PyResult<Vec<_>>>()?;
+        if let Some(progress) = progress {
+            for (index, bytes) in indices.iter().zip(&data) {
+                let name = self
+                    .infos
+                    .get(*index)
+                    .map(|info| info.filename.clone())
+                    .unwrap_or_default();
+                progress.call1((name, bytes.len()))?;
+            }
+        }
+        Ok(data)
     }
 
     /// `in_place` works as in `extractall`.
-    #[pyo3(signature = (member, path = None, pwd = None, overwrite = false, *, options = None, restore_times = true, in_place = false))]
+    #[pyo3(signature = (member, path = None, pwd = None, overwrite = false, *, options = None, restore_times = true, in_place = false, volumes = None, flatten = false))]
     #[allow(clippy::too_many_arguments)]
     fn extract(
         &self,
@@ -619,11 +697,43 @@ impl RarFile {
         options: Option<&ReadOptions>,
         restore_times: bool,
         in_place: bool,
+        volumes: Option<&Bound<'_, PyAny>>,
+        flatten: bool,
     ) -> PyResult<PathBuf> {
         check_read_options_cancellation(options)?;
-        let target = self.resolve_index(member)?;
         let out_dir = path.unwrap_or_else(|| PathBuf::from("."));
         let password = py_password(pwd)?.or_else(|| self.password.clone());
+        let mode = OutputMode {
+            overwrite,
+            in_place,
+            restore_times,
+            flatten,
+        };
+        let read_options = self.extraction_options(options, password.as_deref());
+        if self.follows(volumes) {
+            let archives = self.collect_volumes(py, volumes, read_options)?;
+            let index = self.resolve_logical(member, &archives)?;
+            let mut selected = HashSet::new();
+            selected.insert(index);
+            let extracted = py
+                .detach(|| {
+                    extract_archives(
+                        &archives,
+                        Some(&selected),
+                        &out_dir,
+                        self.extraction_options(options, password.as_deref()),
+                        mode,
+                        None,
+                    )
+                })
+                .map_err(map_error)?;
+            return extracted
+                .warn(py)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| PyKeyError::new_err("member has no extractable payload"));
+        }
+        let target = self.resolve_index(member)?;
         let extracted = py
             .detach(|| {
                 extract_archive(
@@ -631,11 +741,8 @@ impl RarFile {
                     Some(&target),
                     &out_dir,
                     self.extraction_options(options, password.as_deref()),
-                    OutputMode {
-                        overwrite,
-                        in_place,
-                        restore_times,
-                    },
+                    mode,
+                    None,
                 )
             })
             .map_err(map_error)?;
@@ -661,7 +768,7 @@ impl RarFile {
     /// directory needn't be writable, but a member that fails verification
     /// leaves a partly written file. An existing link or special file at a
     /// destination is still refused.
-    #[pyo3(signature = (path = None, members = None, pwd = None, overwrite = false, *, options = None, volumes = None, restore_times = true, in_place = false))]
+    #[pyo3(signature = (path = None, members = None, pwd = None, overwrite = false, *, options = None, volumes = None, restore_times = true, in_place = false, flatten = false, progress = None))]
     #[allow(clippy::too_many_arguments)]
     fn extractall(
         &self,
@@ -674,35 +781,58 @@ impl RarFile {
         volumes: Option<&Bound<'_, PyAny>>,
         restore_times: bool,
         in_place: bool,
+        flatten: bool,
+        progress: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<PathBuf>> {
         check_read_options_cancellation(options)?;
         let mode = OutputMode {
             overwrite,
             in_place,
             restore_times,
+            flatten,
         };
         let out_dir = path.unwrap_or_else(|| PathBuf::from("."));
-        if volumes.is_some() && members.is_some() {
-            return Err(PyValueError::new_err(
-                "members cannot be combined with volumes",
-            ));
-        }
-        if volumes.is_some() || (members.is_none() && self.archive.is_volume()) {
+        let progress = progress.map(|callback| callback.clone().unbind());
+        if self.follows(volumes) {
             let password = py_password(pwd)?.or_else(|| self.password.clone());
-            let options = self.extraction_options(options, password.as_deref());
+            let read_options = self.extraction_options(options, password.as_deref());
+            if members.is_some() {
+                let archives = self.collect_volumes(py, volumes, read_options)?;
+                let selected = match members {
+                    Some(members) => Some(
+                        members
+                            .try_iter()?
+                            .map(|member| self.resolve_logical(&member?, &archives))
+                            .collect::<PyResult<HashSet<usize>>>()?,
+                    ),
+                    None => None,
+                };
+                return py
+                    .detach(|| {
+                        extract_archives(
+                            &archives,
+                            selected.as_ref(),
+                            &out_dir,
+                            self.extraction_options(options, password.as_deref()),
+                            mode,
+                            progress,
+                        )
+                    })
+                    .map_err(map_error)?
+                    .warn(py);
+            }
             let first = &self.archive;
+            let set_progress = progress.as_ref().map(|callback| callback.clone_ref(py));
             return self
-                .extract_set(py, volumes, options, |volumes| {
-                    let outputs = std::cell::RefCell::new(ExtractOutputs::new(
-                        &out_dir,
-                        first.family(),
-                        options,
-                        mode,
-                    ));
+                .extract_set(py, volumes, read_options, |volumes| {
+                    let mut outputs =
+                        ExtractOutputs::new(&out_dir, first.family(), read_options, mode);
+                    outputs.progress = set_progress;
+                    let outputs = std::cell::RefCell::new(outputs);
                     let result = rars_rs::output_links::extract_arriving_with_links(
                         first,
                         volumes,
-                        options,
+                        read_options,
                         |meta| outputs.borrow_mut().open(meta),
                         |meta, link| outputs.borrow_mut().link(meta, link),
                     );
@@ -727,6 +857,7 @@ impl RarFile {
                 &out_dir,
                 self.extraction_options(options, password.as_deref()),
                 mode,
+                progress,
             )
         })
         .map_err(map_error)?
@@ -734,20 +865,38 @@ impl RarFile {
     }
 
     /// `volumes` works as in `extractall`.
-    #[pyo3(signature = (pwd = None, *, options = None, volumes = None))]
+    #[pyo3(signature = (pwd = None, *, options = None, volumes = None, progress = None))]
     fn testrar(
         &self,
         py: Python<'_>,
         pwd: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
         volumes: Option<&Bound<'_, PyAny>>,
+        progress: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         let password = py_password(pwd)?.or_else(|| self.password.clone());
         let options = self.extraction_options(options, password.as_deref());
         let first = &self.archive;
+        let progress = progress.map(|callback| callback.clone().unbind());
         if volumes.is_none() && !first.is_volume() {
             return py
-                .detach(|| first.test_with_options(options))
+                .detach(|| {
+                    if let Some(progress) = progress {
+                        first.test_with_options_and_callback(options, |meta| {
+                            Python::attach(|py| {
+                                progress
+                                    .bind(py)
+                                    .call1((
+                                        String::from_utf8_lossy(meta.name_bytes()).into_owned(),
+                                    ))
+                                    .map(|_| ())
+                                    .map_err(|_| rars_rs::Error::Cancelled)
+                            })
+                        })
+                    } else {
+                        first.test_with_options(options)
+                    }
+                })
                 .map_err(map_error);
         }
         self.extract_set(py, volumes, options, |volumes| {
@@ -784,13 +933,15 @@ impl RarFile {
     }
 
     /// Returns the decoded comment attached to a member, or None if absent.
-    #[pyo3(signature = (member, pwd = None))]
+    #[pyo3(signature = (member, pwd = None, *, options = None))]
     fn getcomment(
         &self,
         py: Python<'_>,
         member: &Bound<'_, PyAny>,
         pwd: Option<&Bound<'_, PyAny>>,
+        options: Option<&ReadOptions>,
     ) -> PyResult<Option<Vec<u8>>> {
+        check_read_options_cancellation(options)?;
         let index = self.resolve_index(member)?;
         let password = py_password(pwd)?.or_else(|| self.password.clone());
         py.detach(|| self.archive.member_comment_at(index, password.as_deref()))
@@ -799,7 +950,15 @@ impl RarFile {
 
     /// Returns raw target bytes for a supported RAR5 or legacy Unix link.
     /// This reads archive metadata and never follows the link.
-    fn readlink(&self, member: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+    #[pyo3(signature = (member, pwd = None, *, options = None))]
+    fn readlink(
+        &self,
+        member: &Bound<'_, PyAny>,
+        pwd: Option<&Bound<'_, PyAny>>,
+        options: Option<&ReadOptions>,
+    ) -> PyResult<Vec<u8>> {
+        check_read_options_cancellation(options)?;
+        let password = py_password(pwd)?.or_else(|| self.password.clone());
         let index = self.resolve_index(member)?;
         let member = self
             .archive
@@ -809,7 +968,7 @@ impl RarFile {
         if member.is_legacy_unix_symlink() {
             return Ok(self
                 .archive
-                .legacy_symlink_target_at(index, self.password.as_deref())
+                .legacy_symlink_target_at(index, password.as_deref())
                 .map_err(map_error)?
                 .expect("legacy symlink predicate checked above"));
         }
@@ -820,7 +979,15 @@ impl RarFile {
     }
 
     /// Stored file timestamps as exact integer Unix nanoseconds. Missing kinds are absent.
-    fn gettimes(&self, member: &Bound<'_, PyAny>) -> PyResult<HashMap<String, i128>> {
+    #[pyo3(signature = (member, pwd = None, *, options = None))]
+    fn gettimes(
+        &self,
+        member: &Bound<'_, PyAny>,
+        pwd: Option<&Bound<'_, PyAny>>,
+        options: Option<&ReadOptions>,
+    ) -> PyResult<HashMap<String, i128>> {
+        check_read_options_cancellation(options)?;
+        let _ = py_password(pwd)?;
         let index = self.resolve_index(member)?;
         let member = self
             .archive
@@ -888,6 +1055,54 @@ impl RarFile {
 }
 
 impl RarFile {
+    fn follows(&self, volumes: Option<&Bound<'_, PyAny>>) -> bool {
+        volumes.is_some() || self.archive.is_volume()
+    }
+
+    fn collect_volumes(
+        &self,
+        py: Python<'_>,
+        volumes: Option<&Bound<'_, PyAny>>,
+        options: rars_rs::ArchiveReadOptions<'_>,
+    ) -> PyResult<Vec<rars_rs::Archive>> {
+        let mut later = Vec::new();
+        self.extract_set(py, volumes, options, |volumes| {
+            for volume in volumes {
+                later.push(volume?);
+            }
+            Ok(())
+        })?;
+        let mut archives = Vec::with_capacity(later.len() + 1);
+        archives.push(self.archive.clone());
+        archives.extend(later);
+        Ok(archives)
+    }
+
+    fn resolve_logical(
+        &self,
+        member: &Bound<'_, PyAny>,
+        archives: &[rars_rs::Archive],
+    ) -> PyResult<usize> {
+        let logical = rars_rs::volume_members(archives).map_err(map_error)?;
+        if member.is_instance_of::<PyInt>() && !member.is_instance_of::<PyBool>() {
+            let index: usize = member.extract()?;
+            if index < logical.len() {
+                return Ok(index);
+            }
+            return Err(PyKeyError::new_err(index));
+        }
+        if let Ok(index) = self.resolve_index(member) {
+            if index < logical.len() {
+                return Ok(index);
+            }
+        }
+        let name = member_name_bytes(member)?;
+        logical
+            .iter()
+            .position(|member| member.meta.name_bytes() == name)
+            .ok_or_else(|| PyKeyError::new_err(String::from_utf8_lossy(&name).into_owned()))
+    }
+
     /// Runs `run` over the set, its later volumes from `volumes`, else found by name beside the first.
     fn extract_set<T: Send>(
         &self,
@@ -911,6 +1126,9 @@ impl RarFile {
                         };
                         let volume = volume?;
                         if let Some(bytes) = py_bytes_like(&volume)? {
+                            return Ok(Some(VolumeSource::Bytes(bytes)));
+                        }
+                        if let Some(bytes) = py_file_bytes(&volume)? {
                             return Ok(Some(VolumeSource::Bytes(bytes)));
                         }
                         Ok(Some(VolumeSource::Path(std::path::absolute(py_path_buf(
@@ -970,6 +1188,13 @@ impl RarFile {
     }
 
     fn resolve_index(&self, member: &Bound<'_, PyAny>) -> PyResult<usize> {
+        if member.is_instance_of::<PyInt>() && !member.is_instance_of::<PyBool>() {
+            let index: usize = member.extract()?;
+            if index < self.infos.len() {
+                return Ok(index);
+            }
+            return Err(PyKeyError::new_err(index));
+        }
         if let Ok(info) = member.extract::<PyRef<'_, RarInfo>>() {
             if !info
                 .archive_identity
@@ -1289,6 +1514,78 @@ impl RarBuilder {
         })
     }
 
+    #[staticmethod]
+    fn rewrite_with_options(
+        py: Python<'_>,
+        source: &Bound<'_, PyAny>,
+        password: Option<&Bound<'_, PyAny>>,
+        options: &Bound<'_, PyAny>,
+        volumes: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        let configured = options.extract::<PyRef<'_, RarBuilder>>()?;
+        let mut inner = configured.inner.clone();
+        let format = inner.format();
+        drop(configured);
+        let opened = match source.extract::<PyRef<'_, RarFile>>() {
+            Ok(archive) => RarFile {
+                identity: archive.identity.clone(),
+                encoding: None,
+                archive: archive.archive.clone(),
+                path: archive.path.clone(),
+                password: archive.password.clone().or(py_password(password)?),
+                infos: archive.infos.clone(),
+                names: OnceLock::new(),
+            },
+            Err(_) => RarFile::new(py, source, "r", password, None)?,
+        };
+        let read_password = opened.password.clone();
+        let archives = if opened.follows(volumes) {
+            opened.collect_volumes(
+                py,
+                volumes,
+                rars_rs::ArchiveReadOptions::with_optional_password(read_password.as_deref()),
+            )?
+        } else {
+            vec![opened.archive.clone()]
+        };
+        let members = if archives.len() > 1 || archives[0].is_volume() {
+            rars_rs::volume_members(&archives).map_err(map_error)?
+        } else {
+            opened.archive.members().collect::<Vec<_>>()
+        };
+        for (index, member) in members.iter().enumerate() {
+            if member.meta.is_directory {
+                inner
+                    .add_directory(member.meta.name.clone(), member.meta.file_time, None)
+                    .map_err(map_builder_error)?;
+                continue;
+            }
+            if member.meta.is_redirection {
+                continue;
+            }
+            let bytes = if archives.len() > 1 || archives[0].is_volume() {
+                rars_rs::read_volume_member_at(&archives, index, read_password.as_deref())
+            } else {
+                opened
+                    .archive
+                    .read_member_at(index, read_password.as_deref())
+            }
+            .map_err(map_error)?;
+            let Some(bytes) = bytes else {
+                continue;
+            };
+            inner
+                .add_bytes(member.meta.name.clone(), bytes, member.meta.file_time, None)
+                .map_err(map_builder_error)?;
+        }
+        Ok(Self {
+            inner,
+            format,
+            rewrite: None,
+            resources: rars_rs::WriterResources::default(),
+        })
+    }
+
     /// Create a rewrite builder. Supported RAR1.3–4.x files retain
     /// native names, supported DOS timestamps, attributes, solid mode and
     /// supported data/header encryption.
@@ -1305,7 +1602,8 @@ impl RarBuilder {
     /// Payload staging happens afresh during each write. staging_dir defaults
     /// to the output directory (current directory for to_bytes); max_staged_bytes
     /// defaults to the retained payloads' combined declared uncompressed size.
-    #[pyo3(signature = (source, password = None, *, preserve = true, staging_dir = None, max_staged_bytes = None))]
+    #[pyo3(signature = (source, password = None, *, preserve = true, staging_dir = None, max_staged_bytes = None, options = None, volumes = None))]
+    #[allow(clippy::too_many_arguments)]
     fn from_archive(
         py: Python<'_>,
         source: &Bound<'_, PyAny>,
@@ -1313,7 +1611,13 @@ impl RarBuilder {
         preserve: bool,
         staging_dir: Option<&Bound<'_, PyAny>>,
         max_staged_bytes: Option<u64>,
+        options: Option<&Bound<'_, PyAny>>,
+        volumes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
+        if let Some(options) = options {
+            return Self::rewrite_with_options(py, source, password, options, volumes);
+        }
+        let _ = volumes;
         let archive = match source.extract::<PyRef<'_, RarFile>>() {
             Ok(archive) => RarFile {
                 identity: archive.identity.clone(),
@@ -2032,16 +2336,38 @@ fn py_bytes_like(value: &Bound<'_, PyAny>) -> PyResult<Option<Vec<u8>>> {
     }
 }
 
+fn py_type_name(value: &Bound<'_, PyAny>) -> String {
+    value
+        .get_type()
+        .name()
+        .map_or_else(|_| "?".into(), |name| name.to_string())
+}
+
+fn py_file_bytes(value: &Bound<'_, PyAny>) -> PyResult<Option<Vec<u8>>> {
+    if !value.hasattr("read")? {
+        return Ok(None);
+    }
+    let data = value.call_method0("read")?;
+    match py_bytes_like(&data)? {
+        Some(bytes) => Ok(Some(bytes)),
+        None => Err(PyTypeError::new_err(format!(
+            "binary file read() must return bytes, not {}",
+            py_type_name(&data)
+        ))),
+    }
+}
+
 fn py_required_bytes(value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
-    py_bytes_like(value)?.ok_or_else(|| {
-        PyTypeError::new_err(format!(
-            "expected a bytes-like object, not {}",
-            value
-                .get_type()
-                .name()
-                .map_or_else(|_| "?".into(), |name| name.to_string())
-        ))
-    })
+    if let Some(bytes) = py_bytes_like(value)? {
+        return Ok(bytes);
+    }
+    if let Some(bytes) = py_file_bytes(value)? {
+        return Ok(bytes);
+    }
+    Err(PyTypeError::new_err(format!(
+        "expected a bytes-like object or a binary file, not {}",
+        py_type_name(value)
+    )))
 }
 
 fn py_path_buf(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<PathBuf> {
@@ -2129,6 +2455,7 @@ struct OutputMode {
     overwrite: bool,
     in_place: bool,
     restore_times: bool,
+    flatten: bool,
 }
 
 /// Stages each file and publishes it once verified, so a hard link or FIFO at the destination is never written through, unless writing in place.
@@ -2146,6 +2473,9 @@ struct ExtractOutputs<'a> {
     /// Where each output went, by its path relative to `out_dir`, for hard links and copies.
     created: HashMap<PathBuf, PathBuf>,
     skipped_links: Vec<SkippedLink>,
+    flatten: bool,
+    claimed: HashSet<PathBuf>,
+    progress: Option<Py<PyAny>>,
 }
 
 struct PendingOutput {
@@ -2226,12 +2556,35 @@ impl<'a> ExtractOutputs<'a> {
             published: Vec::new(),
             created: HashMap::new(),
             skipped_links: Vec::new(),
+            flatten: mode.flatten,
+            claimed: HashSet::new(),
+            progress: None,
         }
     }
 
-    fn destination(&self, meta: &rars_rs::ExtractedEntryMeta) -> rars_rs::Result<PathBuf> {
+    fn destination(&mut self, meta: &rars_rs::ExtractedEntryMeta) -> rars_rs::Result<PathBuf> {
         let path = checked_output_path(self.out_dir, meta, self.family, self.encoding)
             .map_err(|error| refused_output(error, &meta.name))?;
+        let path = if self.flatten && !meta.is_directory {
+            let base = flat_file_name(&path).ok_or_else(|| {
+                refused_output(
+                    rars_rs::Error::InvalidArgument("archive entry has no file name"),
+                    &meta.name,
+                )
+            })?;
+            let mut leaf = PathBuf::from(base);
+            let mut generation = 1u32;
+            loop {
+                let candidate = self.out_dir.join(&leaf);
+                if self.claimed.insert(candidate.clone()) {
+                    break candidate;
+                }
+                leaf = PathBuf::from(clash_name(base, generation));
+                generation += 1;
+            }
+        } else {
+            path
+        };
         if let Some(staging) = &self.staging {
             staging
                 .reject_alias(&path)
@@ -2240,9 +2593,27 @@ impl<'a> ExtractOutputs<'a> {
         Ok(path)
     }
 
+    fn report(&self, meta: &rars_rs::ExtractedEntryMeta) -> rars_rs::Result<()> {
+        let Some(progress) = &self.progress else {
+            return Ok(());
+        };
+        let name = String::from_utf8_lossy(&meta.name).into_owned();
+        Python::attach(|py| {
+            progress
+                .bind(py)
+                .call1((name,))
+                .map(|_| ())
+                .map_err(|_| rars_rs::Error::Cancelled)
+        })
+    }
+
     /// The library has verified the previous member by the time it asks for another output.
     fn open(&mut self, meta: &rars_rs::ExtractedEntryMeta) -> rars_rs::Result<Box<dyn Write>> {
         self.publish_pending()?;
+        self.report(meta)?;
+        if self.flatten && meta.is_directory {
+            return Ok(Box::new(io::sink()));
+        }
         let destination = self.destination(meta)?;
         if self.encoding.is_some() && self.published.contains(&destination) {
             return Err(rars_rs::Error::InvalidArgument(
@@ -2264,7 +2635,11 @@ impl<'a> ExtractOutputs<'a> {
                     .expect("checked output path has a file name"),
             )?;
             // Creating the parents may have raced a symlink into place.
-            let destination = self.destination(meta)?;
+            let destination = if self.flatten {
+                destination
+            } else {
+                self.destination(meta)?
+            };
             let file = rars_rs::output_staging::open_in_place(&destination, self.overwrite)?;
             self.pending = Some(PendingOutput {
                 staged: None,
@@ -2326,7 +2701,11 @@ impl<'a> ExtractOutputs<'a> {
                 .expect("checked output path has a file name"),
         )?;
         // Creating the parents may have raced a symlink into place.
-        let destination = self.destination(&pending.meta)?;
+        let destination = if self.flatten {
+            pending.destination.clone()
+        } else {
+            self.destination(&pending.meta)?
+        };
         publish_verified_output(staged, &destination, self.overwrite, None)?;
         self.record_published(destination, &pending.meta, true);
         Ok(())
@@ -2413,7 +2792,11 @@ impl<'a> ExtractOutputs<'a> {
                 .expect("checked output path has a file name"),
         )?;
         // Creating the parents may have raced a symlink into place.
-        let destination = self.destination(meta)?;
+        let destination = if self.flatten {
+            destination
+        } else {
+            self.destination(meta)?
+        };
         if self.overwrite == OverwritePolicy::Always
             && fs::symlink_metadata(&destination).is_ok_and(|metadata| metadata.is_dir())
         {
@@ -2470,12 +2853,40 @@ impl<'a> ExtractOutputs<'a> {
     }
 }
 
+fn extract_archives(
+    archives: &[rars_rs::Archive],
+    selected: Option<&HashSet<usize>>,
+    out_dir: &Path,
+    options: rars_rs::ArchiveReadOptions<'_>,
+    mode: OutputMode,
+    progress: Option<Py<PyAny>>,
+) -> rars_rs::Result<Extracted> {
+    let family = archives
+        .first()
+        .map(rars_rs::Archive::family)
+        .ok_or(rars_rs::Error::InvalidHeader("volume set is empty"))?;
+    let mut outputs = ExtractOutputs::new(out_dir, family, options, mode);
+    outputs.progress = progress;
+    let outputs = std::cell::RefCell::new(outputs);
+    let mut next = 0usize;
+    let result = rars_rs::extract_volumes_to_with_options(archives, options, |meta| {
+        let index = next;
+        next += 1;
+        if selected.is_some_and(|chosen| !chosen.contains(&index)) {
+            return Ok(Box::new(io::sink()) as Box<dyn Write>);
+        }
+        outputs.borrow_mut().open(meta)
+    });
+    outputs.into_inner().finish(result)
+}
+
 fn extract_archive<S: Selection>(
     archive: &rars_rs::Archive,
     selected: Option<&S>,
     out_dir: &Path,
     options: rars_rs::ArchiveReadOptions<'_>,
     mode: OutputMode,
+    progress: Option<Py<PyAny>>,
 ) -> rars_rs::Result<Extracted> {
     if options
         .cancellation
@@ -2483,12 +2894,9 @@ fn extract_archive<S: Selection>(
     {
         return Err(rars_rs::Error::Cancelled);
     }
-    let outputs = std::cell::RefCell::new(ExtractOutputs::new(
-        out_dir,
-        archive.family(),
-        options,
-        mode,
-    ));
+    let mut outputs = ExtractOutputs::new(out_dir, archive.family(), options, mode);
+    outputs.progress = progress;
+    let outputs = std::cell::RefCell::new(outputs);
     let result = extract_selected(archive, selected, options, &outputs);
     outputs.into_inner().finish(result)
 }
@@ -3116,7 +3524,7 @@ mod tests {
                 });
                 let name = PyBytes::new(py, b"file");
                 let error = file
-                    .read(py, name.as_any(), None, Some(&options))
+                    .read(py, name.as_any(), None, Some(&options), None)
                     .unwrap_err();
                 py.detach(|| worker.join().unwrap());
                 assert!(
@@ -3124,7 +3532,7 @@ mod tests {
                     "{format}: {error}"
                 );
                 assert_eq!(
-                    file.read(py, name.as_any(), None, None).unwrap(),
+                    file.read(py, name.as_any(), None, None, None).unwrap(),
                     b"payload"
                 );
             }
@@ -3160,7 +3568,9 @@ mod tests {
                     overwrite: false,
                     in_place: false,
                     restore_times: true,
+                    flatten: false,
                 },
+                None,
             )
             .unwrap()
             .paths;
@@ -3175,7 +3585,9 @@ mod tests {
                     overwrite: false,
                     in_place: false,
                     restore_times: true,
+                    flatten: false,
                 },
+                None,
             )
             .map(|extracted| extracted.paths)
             .unwrap_err();
@@ -3190,7 +3602,9 @@ mod tests {
                     overwrite: false,
                     in_place: false,
                     restore_times: true,
+                    flatten: false,
                 },
+                None,
             )
             .unwrap()
             .paths;
@@ -3322,6 +3736,8 @@ mod tests {
                         None,
                         true,
                         Some(directory.as_any()),
+                        None,
+                        None,
                         None,
                     )
                     .unwrap();

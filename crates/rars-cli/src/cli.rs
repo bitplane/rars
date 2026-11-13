@@ -179,6 +179,9 @@ pub(crate) struct ExtractArgs {
     /// Write each file at its destination instead of staging it; a failed member leaves a partial file
     #[arg(long)]
     pub in_place: bool,
+    /// Drop stored directories and write each file under its base name. A clash becomes `name(1).ext`.
+    #[arg(long)]
+    pub flatten: bool,
     /// Archive (and optional sibling parts) followed by an output directory
     #[arg(value_name = "PATH", required = true, num_args = 2..)]
     pub paths: Vec<std::path::PathBuf>,

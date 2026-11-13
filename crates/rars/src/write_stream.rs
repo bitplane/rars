@@ -9,7 +9,7 @@
 use crate::error::{Error, Result};
 use crate::streaming::EntrySource;
 use std::borrow::Cow;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 pub(crate) use crate::entropy::fill_entropy;
 
@@ -220,6 +220,52 @@ pub(crate) enum MemberPayload<'a> {
     /// Copied from the source as the archive is written, which keeps a stored
     /// member off the heap however large it is.
     Copied(&'a EntrySource),
+    /// Compressed bytes in a temporary file. The member itself was never resident.
+    Spool(SpoolFile),
+}
+
+pub(crate) struct SpoolFile {
+    file: std::fs::File,
+    len: u64,
+    path: std::path::PathBuf,
+}
+
+impl SpoolFile {
+    pub(crate) fn create() -> Result<Self> {
+        let path = std::env::temp_dir().join(format!(
+            "rars-spool-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)?;
+        Ok(Self { file, len: 0, path })
+    }
+
+    pub(crate) fn file_mut(&mut self) -> &mut std::fs::File {
+        &mut self.file
+    }
+
+    pub(crate) fn set_len(&mut self, len: u64) {
+        self.len = len;
+    }
+
+    pub(crate) fn len(&self) -> u64 {
+        self.len
+    }
+}
+
+impl Drop for SpoolFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 impl MemberPayload<'_> {
@@ -229,12 +275,23 @@ impl MemberPayload<'_> {
         match self {
             Self::Packed(packed) => packed.len() as u64,
             Self::Copied(_) => unpacked_size,
+            Self::Spool(spool) => spool.len(),
         }
     }
 
     pub(crate) fn write_to(&self, output: &mut dyn Write, expected: u64) -> Result<()> {
         match self {
             Self::Packed(packed) => output.write_all(packed)?,
+            Self::Spool(spool) => {
+                let mut file = spool.file.try_clone()?;
+                file.seek(SeekFrom::Start(0))?;
+                let copied = std::io::copy(&mut file.take(expected), output)?;
+                if copied != expected {
+                    return Err(Error::WriterFailure(
+                        "spooled member changed length while writing",
+                    ));
+                }
+            }
             Self::Copied(source) => {
                 let mut reader = source.open()?;
                 let copied = std::io::copy(&mut reader.by_ref().take(expected), output)?;

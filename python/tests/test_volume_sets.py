@@ -98,11 +98,18 @@ def test_volumes_ending_before_the_last_aborts(tmp_path):
             archive.extractall(tmp_path / "out", volumes=paths[1:2])
 
 
-def test_volumes_cannot_be_combined_with_members(tmp_path):
+def test_extractall_members_follow_the_volume_set(tmp_path):
     paths = write_set(tmp_path, compressed=False)
     with rars.RarFile(paths[0]) as archive:
-        with pytest.raises(ValueError):
-            archive.extractall(tmp_path / "out", members=["small.txt"], volumes=paths[1:])
+        assert archive.read("large.bin", volumes=paths[1:]) == PAYLOAD
+        assert archive.read(0, volumes=paths[1:]) == PAYLOAD
+        assert archive.open("small.txt", volumes=paths[1:]).read() == b"small"
+        written = archive.extractall(tmp_path / "out", members=["large.bin"], volumes=paths[1:])
+        extracted = archive.extract("small.txt", tmp_path / "one", volumes=paths[1:])
+    assert (tmp_path / "out" / "large.bin").read_bytes() == PAYLOAD
+    assert not (tmp_path / "out" / "small.txt").exists()
+    assert Path(extracted).read_bytes() == b"small"
+    assert [Path(path).name for path in written] == ["large.bin"]
 
 
 FIXTURES = Path(__file__).resolve().parents[2] / "crates/rars/tests/fixtures"

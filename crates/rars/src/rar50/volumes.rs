@@ -172,7 +172,7 @@ where
                     if error.kind() == crate::ErrorKind::Io {
                         error
                     } else {
-                        walk.checksum_error().unwrap_or(error)
+                        walk.explain(error)
                     }
                 })
                 .map_err(|error| first.entry_error("extracting", error));
@@ -301,7 +301,7 @@ impl<B: Budget> DecoderSession<'_, B> {
                 .finish()
                 .map_err(|error| first.entry_error("decoding", error))?;
             last.verify_integrity_with_keys(&data, decryptor.map(|decryptor| &decryptor.keys))
-                .map_err(|error| walk.checksum_error().unwrap_or(error))
+                .map_err(|error| walk.explain(error))
                 .map_err(|error| first.entry_error("verifying", error))?;
             writer
                 .write_all(&data)
@@ -360,7 +360,7 @@ impl<B: Budget> DecoderSession<'_, B> {
                 {
                     error
                 }
-                error => walk.checksum_error().unwrap_or(error),
+                error => walk.explain(error),
             })?;
         self.decoder = decoder;
         Ok(())
@@ -412,7 +412,7 @@ impl<B: Budget> DecoderSession<'_, B> {
             {
                 Err(error)
             }
-            Err(error) => Err(walk.checksum_error().unwrap_or(error)),
+            Err(error) => Err(walk.explain(error)),
             decoded => decoded,
         }
     }
@@ -502,9 +502,8 @@ impl<'f, 'p, 'o, B: Budget> SplitWalk<'f, 'p, 'o, B> {
         }
         file.check_dictionary_limit(self.options.rar50_dictionary_size_limit)?;
         validate_split_fragment(file, self.options.password)?;
-        if file.name != self.first.name {
-            return Err(Error::InvalidHeader("RAR 5 split entry name changed"));
-        }
+        // The continuation's stored name is not the chain. A later volume can
+        // change case, or carry a header that was sealed again under another name.
         if file.compression_info != self.first.compression_info {
             return Err(Error::InvalidHeader(
                 "RAR 5 split entry compression info changed",
@@ -553,6 +552,29 @@ impl<'f, 'p, 'o, B: Budget> SplitWalk<'f, 'p, 'o, B> {
             }
         }
         None
+    }
+
+    /// Prefer a fragment checksum, and otherwise name the volume that was open
+    /// when a BLAKE2sp or CRC check failed. CRC32 sets already get a number
+    /// from [`Self::checksum_error`]; a BLAKE2sp set has no per-fragment CRC.
+    pub(super) fn explain(&self, error: Error) -> Error {
+        if let Some(found) = self.checksum_error() {
+            return found;
+        }
+        match error.kind() {
+            crate::ErrorKind::ChecksumMismatch => {
+                let number = self
+                    .fragments
+                    .last()
+                    .map(|fragment| fragment.volume + 1)
+                    .unwrap_or(1);
+                Error::InVolume {
+                    number,
+                    source: Box::new(error),
+                }
+            }
+            _ => error,
+        }
     }
 }
 
