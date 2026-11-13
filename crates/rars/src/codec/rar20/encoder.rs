@@ -814,6 +814,9 @@ fn encode_tokens_with_progress(
     for history_pos in 0..history.len() {
         finder.insert(&combined, history_pos);
     }
+    let mut literal_prefix = Vec::new();
+    let priced = cost_model.map(|model| model.with_literal_prefix(&combined, &mut literal_prefix));
+    let cost_model = priced.as_ref();
 
     let mut pos = history.len();
     let end = combined.len();
@@ -914,15 +917,68 @@ struct CostModel<'a> {
     main: &'a [u8],
     offsets: &'a [u8],
     lengths: &'a [u8],
+    /// Running literal totals, so pricing a span is two lookups, not a loop.
+    literal_prefix: Option<&'a [u32]>,
+    cheapest_fresh_length: usize,
 }
 
 impl<'a> CostModel<'a> {
     fn new(table_lengths: &'a [u8; TABLE_COUNT]) -> Self {
+        let main = &table_lengths[..MAIN_COUNT];
+        let cheapest_fresh_length = (0..LENGTH_COUNT)
+            .map(|slot| usize::from(main[270 + slot]) + usize::from(LENGTH_BITS[slot]))
+            .min()
+            .unwrap_or(0);
         Self {
-            main: &table_lengths[..MAIN_COUNT],
+            main,
             offsets: &table_lengths[MAIN_COUNT..MAIN_COUNT + OFFSET_COUNT],
             lengths: &table_lengths[MAIN_COUNT + OFFSET_COUNT..TABLE_COUNT],
+            literal_prefix: None,
+            cheapest_fresh_length,
         }
+    }
+
+    /// Totals wrap past a few hundred MiB; a span is at most a match, so differences stay exact.
+    fn with_literal_prefix<'b>(self, input: &[u8], prefix: &'b mut Vec<u32>) -> CostModel<'b>
+    where
+        'a: 'b,
+    {
+        prefix.clear();
+        prefix.reserve(input.len() + 1);
+        let mut total = 0u32;
+        prefix.push(total);
+        for &byte in input {
+            total = total.wrapping_add(self.literal_price(byte) as u32);
+            prefix.push(total);
+        }
+        CostModel {
+            literal_prefix: Some(prefix),
+            ..self
+        }
+    }
+
+    fn literal_price(self, byte: u8) -> usize {
+        match self.main[usize::from(byte)] {
+            0 => ABSENT_LITERAL_BITS,
+            bits => usize::from(bits),
+        }
+    }
+
+    /// A candidate shorter than this cannot save `bits`, so one byte rules it out.
+    fn shortest_saving_length(
+        self,
+        input: &[u8],
+        pos: usize,
+        bits: usize,
+        max_length: usize,
+    ) -> Option<usize> {
+        let Some(prefix) = self.literal_prefix else {
+            return (1..=max_length).find(|&length| self.literal_bits(input, pos, length) >= bits);
+        };
+        let base = prefix[pos];
+        let span = &prefix[pos + 1..=pos + max_length];
+        let below = span.partition_point(|&total| (total.wrapping_sub(base) as usize) < bits);
+        (below < max_length).then_some(below + 1)
     }
 
     fn selected_cost(self, selected: SelectedMatch) -> Option<usize> {
@@ -962,12 +1018,14 @@ impl<'a> CostModel<'a> {
     /// A symbol the previous pass never emitted as a literal has no code, so it
     /// cannot be spelled that way at all. Price it high rather than free.
     fn literal_bits(self, input: &[u8], pos: usize, length: usize) -> usize {
-        input[pos..(pos + length).min(input.len())]
+        let end = (pos + length).min(input.len());
+        if let Some(prefix) = self.literal_prefix {
+            debug_assert_eq!(prefix.len(), input.len() + 1);
+            return prefix[end].wrapping_sub(prefix[pos]) as usize;
+        }
+        input[pos..end]
             .iter()
-            .map(|&byte| match self.main[usize::from(byte)] {
-                0 => ABSENT_LITERAL_BITS,
-                bits => usize::from(bits),
-            })
+            .map(|&byte| self.literal_price(byte))
             .sum()
     }
 
@@ -1134,7 +1192,13 @@ fn best_match(
     if options.max_match_candidates == 0 || max_offset == 0 || max_length < 3 {
         return None;
     }
-    let mut best = None;
+    let mut best: Option<(usize, usize)> = None;
+    let mut best_score = isize::MIN;
+    let mut reach_cache = PricedReach {
+        offsets: 0..0,
+        score: isize::MIN,
+        length: 0,
+    };
     let mut checked = 0usize;
     let mut candidate = finder.first(input, pos);
     while candidate != match_finder::NO_POSITION {
@@ -1144,19 +1208,48 @@ fn best_match(
             break;
         }
         checked += 1;
-        // Without a cost model, a candidate can only improve on the current
-        // best when it matches at least one byte past the best length, so
-        // probe that byte first. The cost-model pass may prefer shorter but
-        // cheaper matches, so it must evaluate every candidate. Probing is
-        // safe because a best match reaching `max_length` breaks the loop.
         let best_length = best.map_or(0, |(length, _)| length);
-        let probe_ok = cost_model.is_some()
-            || best_length == 0
-            || input[candidate + best_length] == input[pos + best_length];
-        if probe_ok {
+        // The shortest match that could still displace the best. A candidate
+        // shorter than that cannot win, and one byte decides whether it is.
+        let must_reach = match cost_model {
+            None => best_length + 1,
+            Some(model) if best_score != isize::MIN => {
+                // Offsets only grow along the chain, so one slot's threshold
+                // serves every candidate until the slot or the best changes.
+                if !(reach_cache.offsets.contains(&offset) && reach_cache.score == best_score) {
+                    reach_cache = priced_reach(model, input, pos, offset, best_score, max_length);
+                }
+                reach_cache.length
+            }
+            Some(_) => 0,
+        };
+        // A best match reaching `max_length` breaks the loop, so without a
+        // cost model `must_reach` never passes it.
+        let reachable = must_reach <= 1
+            || (must_reach <= max_length
+                && input[candidate + must_reach - 1] == input[pos + must_reach - 1]);
+        if reachable {
             let length = super::super::fast::match_length(input, pos, offset, max_length);
             let encodable = length >= 3 + match_length_adjustment(offset);
-            if encodable && is_better_fresh_match(cost_model, input, pos, length, offset, best) {
+            let better = encodable
+                && match cost_model {
+                    Some(model) => {
+                        let score = model
+                            .selected_score(SelectedMatch::Fresh { length, offset }, input, pos)
+                            .unwrap_or(isize::MIN);
+                        let better = best.is_none()
+                            || score > best_score
+                            || (score == best_score && length > best_length);
+                        if better {
+                            best_score = score;
+                        }
+                        better
+                    }
+                    // The hash chain visits nearest matches first, so an
+                    // equal-length later candidate cannot have a smaller offset.
+                    None => length > best_length,
+                };
+            if better {
                 best = Some((length, offset));
                 if length == max_length {
                     break;
@@ -1171,41 +1264,44 @@ fn best_match(
     best
 }
 
+struct PricedReach {
+    offsets: std::ops::Range<usize>,
+    score: isize,
+    length: usize,
+}
+
+/// Every offset in a slot costs the same, so one threshold covers the slot.
+fn priced_reach(
+    model: &CostModel<'_>,
+    input: &[u8],
+    pos: usize,
+    offset: usize,
+    best_score: isize,
+    max_length: usize,
+) -> PricedReach {
+    let Ok((slot, _)) = offset_slot_for_match(offset) else {
+        return PricedReach {
+            offsets: offset..offset + 1,
+            score: best_score,
+            length: 0,
+        };
+    };
+    let first = OFFSET_BASES[slot] + 1;
+    let offset_cost = usize::from(model.offsets[slot]) + usize::from(OFFSET_BITS[slot]);
+    let worth = best_score + (model.cheapest_fresh_length + offset_cost) as isize;
+    PricedReach {
+        offsets: first..first + (1usize << OFFSET_BITS[slot]),
+        score: best_score,
+        length: model
+            .shortest_saving_length(input, pos, worth.max(0) as usize, max_length)
+            .unwrap_or(usize::MAX),
+    }
+}
+
 fn offset_slot_index(offset: usize) -> usize {
     offset_slot_for_match(offset)
         .map(|(slot, _)| slot)
         .unwrap_or(OFFSET_BITS.len() - 1)
-}
-
-fn is_better_fresh_match(
-    cost_model: Option<&CostModel<'_>>,
-    input: &[u8],
-    pos: usize,
-    length: usize,
-    offset: usize,
-    best: Option<(usize, usize)>,
-) -> bool {
-    let Some((best_length, best_offset)) = best else {
-        return true;
-    };
-    if let Some(cost_model) = cost_model {
-        let candidate = SelectedMatch::Fresh { length, offset };
-        let best = SelectedMatch::Fresh {
-            length: best_length,
-            offset: best_offset,
-        };
-        let candidate_score = cost_model
-            .selected_score(candidate, input, pos)
-            .unwrap_or(isize::MIN);
-        let best_score = cost_model
-            .selected_score(best, input, pos)
-            .unwrap_or(isize::MIN);
-        return candidate_score > best_score
-            || (candidate_score == best_score && length > best_length);
-    }
-    // The hash chain visits nearest matches first, so an equal-length later
-    // candidate cannot have a smaller offset.
-    length > best_length
 }
 
 fn best_old_offset_match(
