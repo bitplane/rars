@@ -165,6 +165,8 @@ pub enum Block {
 #[non_exhaustive]
 pub struct EndHeader {
     pub block: BlockHeader,
+    /// CRC32 of the volume's bytes before this block, when the writer recorded it.
+    pub data_crc: Option<u32>,
     /// The volume's place in its set, from 0, when the writer recorded it (RAR 3.0 on).
     pub volume_number: Option<u16>,
 }
@@ -1958,16 +1960,23 @@ fn nested_main_comment(
 
 /// The data CRC comes first, then the volume number, both inside the header.
 fn parse_end_header(header: &[u8], block: BlockHeader) -> EndHeader {
+    let size = block.head_size as usize;
+    let field = |at: usize, len: usize| header.get(at..at + len).filter(|_| at + len <= size);
     let mut at = 7 + if block.add_size.is_some() { 4 } else { 0 };
+    let data_crc = (block.flags & EARC_DATACRC != 0)
+        .then(|| field(at, 4))
+        .flatten()
+        .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
     if block.flags & EARC_DATACRC != 0 {
         at += 4;
     }
-    let volume_number = (block.flags & EARC_VOLNUMBER != 0 && at + 2 <= block.head_size as usize)
-        .then(|| header.get(at..at + 2))
+    let volume_number = (block.flags & EARC_VOLNUMBER != 0)
+        .then(|| field(at, 2))
         .flatten()
         .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]));
     EndHeader {
         block,
+        data_crc,
         volume_number,
     }
 }

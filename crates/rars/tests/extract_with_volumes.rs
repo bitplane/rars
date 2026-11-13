@@ -361,41 +361,10 @@ fn refuses_a_rar5_volume_out_of_order() {
     assert_eq!(pulled, [1, 2]);
 }
 
-fn crc32(bytes: &[u8]) -> u32 {
-    !bytes.iter().fold(!0u32, |crc, &byte| {
-        (0..8).fold(crc ^ u32::from(byte), |crc, _| {
-            (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1))
-        })
-    })
-}
-
-/// Swaps each volume's seven-byte end block for the twenty-byte one RAR 3.93
-/// writes: a data CRC, the volume number from 0, and seven reserved bytes.
-fn with_volume_numbers(volumes: &[Vec<u8>]) -> Vec<Vec<u8>> {
-    volumes
-        .iter()
-        .enumerate()
-        .map(|(index, volume)| {
-            let (body, end) = volume.split_at(volume.len() - 7);
-            assert_eq!(end[2], 0x7b, "the volume ends in its end block");
-            let flags = u16::from_le_bytes([end[3], end[4]]) | 0x000e;
-            let mut header = vec![0, 0, 0x7b];
-            header.extend_from_slice(&flags.to_le_bytes());
-            header.extend_from_slice(&20u16.to_le_bytes());
-            header.extend_from_slice(&[0; 4]);
-            header.extend_from_slice(&(index as u16).to_le_bytes());
-            header.extend_from_slice(&[0; 7]);
-            let crc = crc32(&header[2..]) as u16;
-            header[..2].copy_from_slice(&crc.to_le_bytes());
-            [body, &header].concat()
-        })
-        .collect()
-}
-
 #[test]
 fn reads_rar3_end_block_volume_numbers_and_refuses_a_volume_out_of_order() {
+    // rars writes the end block RAR 3.93 does, with each volume's number.
     let (expected, volumes) = build_set(ArchiveVersion::Rar29, true);
-    let volumes = with_volume_numbers(&volumes);
     let last = ArchiveReader::read_owned(volumes[3].clone()).unwrap();
     let rars::Archive::Rar15To40(archive) = &last else {
         panic!("a RAR 2.9 volume");
@@ -445,4 +414,62 @@ fn a_missing_volume_is_reported_the_same_inside_and_between_members() {
             "volume {missing}: {result:?}"
         );
     }
+}
+
+#[test]
+fn rar3_volumes_rars_writes_record_their_numbers() {
+    // Each volume's number, after checking its end block's data CRC covers
+    // every byte before the block, as RAR 3.93's does.
+    let numbers = |volumes: &[Vec<u8>], password: Option<&[u8]>| -> Vec<Option<u16>> {
+        volumes
+            .iter()
+            .map(|volume| {
+                let archive =
+                    rars::rar15_40::Archive::parse_with_password(volume, password).unwrap();
+                let Some(rars::rar15_40::Block::End(end)) = archive.blocks.last() else {
+                    panic!("the volume ends in its end block");
+                };
+                assert_eq!(end.data_crc.is_some(), end.volume_number.is_some());
+                if let Some(crc) = end.data_crc {
+                    assert_eq!(crc, rars::crc32::crc32(&volume[..end.block.offset]));
+                }
+                end.volume_number
+            })
+            .collect()
+    };
+    // Stored sets go through the streaming packer, compressed ones through the
+    // in-memory split, and header encryption has its own path.
+    for stored in [true, false] {
+        let (_, volumes) = build_set(ArchiveVersion::Rar29, stored);
+        let expected: Vec<_> = (0..volumes.len() as u16).map(Some).collect();
+        assert_eq!(numbers(&volumes, None), expected, "stored={stored}");
+    }
+    for stored in [true, false] {
+        let mut builder = Builder::new(ArchiveVersion::Rar30)
+            .store(stored)
+            .password(Some(b"pw".to_vec()))
+            .header_encryption(true)
+            .volume_size(Some(VOLUME_SIZE));
+        builder
+            .add_bytes(b"m".to_vec(), noise(7, 30_000), None, None)
+            .unwrap();
+        let volumes = builder.build_volumes(None).unwrap();
+        let expected: Vec<_> = (0..volumes.len() as u16).map(Some).collect();
+        assert_eq!(
+            numbers(&volumes, Some(b"pw")),
+            expected,
+            "encrypted stored={stored}"
+        );
+    }
+
+    // A single archive closes with the plain block, as RAR 3.93's do.
+    let mut single = Vec::new();
+    let mut builder = Builder::new(ArchiveVersion::Rar29);
+    builder
+        .add_bytes(b"m".to_vec(), noise(7, 3_000), None, None)
+        .unwrap();
+    builder
+        .write_to(&mut single, &rars::WriterResources::default(), None)
+        .unwrap();
+    assert_eq!(numbers(&[single], None), [None]);
 }

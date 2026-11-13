@@ -45,6 +45,18 @@ pub fn crc32(input: &[u8]) -> u32 {
     crc.finish()
 }
 
+/// The CRC32 of two byte runs end to end, from each run's CRC32 and the second's length.
+pub fn crc32_combine(first: u32, second: u32, second_len: u64) -> u32 {
+    // A CRC is linear in its register, so feeding the second run after the
+    // first is the first register shifted past it, plus the second run's own
+    // contribution: its CRC with the shifted initial register taken back out.
+    let mut shifted = Crc32 { value: !first };
+    shifted.update_zeroes(second_len);
+    let mut initial = Crc32::new();
+    initial.update_zeroes(second_len);
+    !(shifted.value ^ !second ^ initial.value)
+}
+
 pub fn crc32_raw(input: &[u8]) -> u32 {
     update_raw(0xffff_ffff, input)
 }
@@ -156,6 +168,19 @@ const fn crc32_tables() -> [[u32; 256]; 8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn combining_two_crcs_matches_the_crc_of_both_runs() {
+        let data: Vec<u8> = (0..5000u32).map(|n| (n * 31 % 251) as u8).collect();
+        for split in [0, 1, 7, 64, 4999, 5000] {
+            let (first, second) = data.split_at(split);
+            assert_eq!(
+                crc32_combine(crc32(first), crc32(second), second.len() as u64),
+                crc32(&data),
+                "split at {split}"
+            );
+        }
+    }
 
     #[test]
     fn crc32_matches_standard_check_value() {

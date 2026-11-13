@@ -1,4 +1,5 @@
 use super::*;
+use crate::crc32::crc32_combine;
 use crate::volume_sink::VolumeSink;
 use std::io::{Read, Seek, SeekFrom};
 
@@ -220,6 +221,8 @@ struct OpenVolume {
     out: Box<dyn crate::volume_sink::VolumeOutput>,
     used: u64,
     fragments: u64,
+    /// CRC32 of the volume's bytes so far, as they end up once headers are patched.
+    crc: u32,
 }
 
 impl<'a> VolumePacker<'a> {
@@ -241,7 +244,7 @@ impl<'a> VolumePacker<'a> {
             index: 0,
             total_volumes: None,
         };
-        packer.tail_len = packer.tail(0, false)?.len() as u64;
+        packer.tail_len = packer.tail(0, false, 0)?.len() as u64;
         Ok(packer)
     }
 
@@ -325,6 +328,8 @@ impl<'a> VolumePacker<'a> {
             volume
                 .out
                 .seek(SeekFrom::Current(back - header_len as i64))?;
+            volume.crc = crc32_combine(volume.crc, crc32(&header), header_len);
+            volume.crc = crc32_combine(volume.crc, fragment_crc, len);
             volume.used += header_len + len;
             volume.fragments += 1;
             start += len;
@@ -366,7 +371,7 @@ impl<'a> VolumePacker<'a> {
     }
 
     fn start_volume(&mut self) -> Result<()> {
-        self.tail_len = self.tail(self.index, false)?.len() as u64;
+        self.tail_len = self.tail(self.index, false, 0)?.len() as u64;
         let head = self.head(self.index)?;
         let mut out = self.sink.start_volume(self.index)?;
         out.write_all(&head)?;
@@ -374,13 +379,14 @@ impl<'a> VolumePacker<'a> {
             out,
             used: head.len() as u64,
             fragments: 0,
+            crc: crc32(&head),
         });
         Ok(())
     }
 
     fn close_volume(&mut self, more: bool) -> Result<()> {
         let mut volume = self.open.take().expect("volume open");
-        let tail = self.tail(self.index, more)?;
+        let tail = self.tail(self.index, more, volume.crc)?;
         let len = volume.used + tail.len() as u64;
         if len > self.volume_size {
             return Err(Error::WriterFailure(
@@ -406,7 +412,8 @@ impl<'a> VolumePacker<'a> {
 
     /// A later volume's producer record goes after its files, so a split
     /// member's header comes first, as RAR writes it and python-rarfile reads it.
-    fn tail(&self, index: u64, more: bool) -> Result<Vec<u8>> {
+    /// `data_crc` covers the volume up to the tail; the end block's CRC takes in the producer record too.
+    fn tail(&self, index: u64, more: bool, data_crc: u32) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         if index > 0 {
             write_producer(
@@ -416,12 +423,15 @@ impl<'a> VolumePacker<'a> {
                 Some(self.progress),
             )?;
         }
+        let data_crc = crc32_combine(data_crc, crc32(&out), out.len() as u64);
         match self.header_password {
-            Some(password) => {
-                write_encrypted_end_block(&mut out, volume_end_flags(more), password)?
-            }
+            Some(password) => write_encrypted_end_block(
+                &mut out,
+                &volume_end_block(index, more, data_crc),
+                password,
+            )?,
             None if writes_end_block(self.target) => {
-                out.extend_from_slice(&end_block(volume_end_flags(more)))
+                out.extend_from_slice(&volume_end_block(index, more, data_crc))
             }
             None => {}
         }
