@@ -865,8 +865,8 @@ impl Unpack15Encoder {
         self.n_to_pl = [0; 256];
         self.n_to_pl_b = [0; 256];
         self.n_to_pl_c = [0; 256];
-        for i in 0..256 {
-            self.ch_set_a[i] = i as u16;
+        for (i, entry) in self.ch_set_a.iter_mut().enumerate() {
+            *entry = i as u16;
         }
         corr_huff(&mut self.ch_set_b, &mut self.n_to_pl_b);
     }
