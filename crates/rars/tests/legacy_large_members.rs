@@ -39,9 +39,10 @@ impl Seek for Pattern {
 }
 
 #[test]
-#[ignore = "writes and reads back three archives of over 4 GiB each"]
+#[ignore = "writes and reads back four archives of over 4 GiB each"]
 fn stored_members_over_4_gib_round_trip() {
     for target in [
+        ArchiveVersion::Rar20,
         ArchiveVersion::Rar29,
         ArchiveVersion::Rar30,
         ArchiveVersion::Rar40,

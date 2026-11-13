@@ -2765,21 +2765,12 @@ fn write_encrypted_header(out: &mut dyn Write, header: &[u8], password: &[u8]) -
 /// Larger sizes need the FHD_LARGE high halves.
 const MAX_SHORT_SIZE: u64 = u32::MAX as u64;
 
-/// RAR 2.9 introduced the high size fields; earlier readers stop at 4 GiB.
-fn supports_large_members(target: ArchiveVersion) -> bool {
-    matches!(
-        target,
-        ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
-    )
-}
+/// The format spec gives RAR 2.0 members past this UNP_VER 26; RAR 2.9 members keep 29.
+const MAX_RAR20_SIZE: u64 = i32::MAX as u64;
 
-fn large_member_refusal(target: ArchiveVersion) -> Error {
-    Error::InvalidArgument(match target {
-        ArchiveVersion::Rar15 => "RAR 1.5 archives cannot hold a member over 4 GiB",
-        ArchiveVersion::Rar20 => "RAR 2.0 archives cannot hold a member over 4 GiB",
-        _ => "this archive format cannot hold a member over 4 GiB",
-    })
-}
+/// The high size fields came with UNP_VER 26, which a RAR 1.5 member cannot claim.
+const RAR15_LARGE_MEMBER: Error =
+    Error::InvalidArgument("RAR 1.5 archives cannot hold a member over 4 GiB");
 
 fn validate_member(name: &[u8], target: ArchiveVersion, unpacked_size: u64) -> Result<()> {
     if name.is_empty() {
@@ -2788,8 +2779,8 @@ fn validate_member(name: &[u8], target: ArchiveVersion, unpacked_size: u64) -> R
     if name.len() > u16::MAX as usize {
         return Err(Error::InvalidArgument("RAR 1.5 file name is too long"));
     }
-    if unpacked_size > MAX_SHORT_SIZE && !supports_large_members(target) {
-        return Err(large_member_refusal(target));
+    if unpacked_size > MAX_SHORT_SIZE && target == ArchiveVersion::Rar15 {
+        return Err(RAR15_LARGE_MEMBER);
     }
     Ok(())
 }
@@ -2834,9 +2825,10 @@ fn write_file_header_and_data(
 fn write_file_header(out: &mut Vec<u8>, record: &FileRecord<'_>) -> Result<()> {
     let start = out.len();
     let large = record.packed_size > MAX_SHORT_SIZE || record.unpacked_size > MAX_SHORT_SIZE;
-    if large && !supports_large_members(record.target) {
-        return Err(large_member_refusal(record.target));
+    if large && record.target == ArchiveVersion::Rar15 {
+        return Err(RAR15_LARGE_MEMBER);
     }
+    let past_rar20_size = record.packed_size.max(record.unpacked_size) > MAX_RAR20_SIZE;
     let flags = record.flags | record.dictionary_flags | if large { FHD_LARGE } else { 0 };
     let (host_os, file_attr) =
         rar15_compatible_metadata(record.target, record.host_os, record.file_attr);
@@ -2850,6 +2842,7 @@ fn write_file_header(out: &mut Vec<u8>, record: &FileRecord<'_>) -> Result<()> {
         .map_err(|_| Error::InvalidArgument("RAR 1.5 file header size overflows"))?;
     let unp_ver = match record.target {
         ArchiveVersion::Rar15 => 15,
+        ArchiveVersion::Rar20 if past_rar20_size => 26,
         ArchiveVersion::Rar20 => 20,
         ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40 => 29,
         _ => return Err(Error::UnsupportedVersion(record.target)),
@@ -3353,11 +3346,8 @@ mod tests {
             super::validate_member(b"large", ArchiveVersion::Rar15, large).unwrap_err(),
             crate::Error::InvalidArgument("RAR 1.5 archives cannot hold a member over 4 GiB")
         );
-        assert_eq!(
-            super::validate_member(b"large", ArchiveVersion::Rar20, large).unwrap_err(),
-            crate::Error::InvalidArgument("RAR 2.0 archives cannot hold a member over 4 GiB")
-        );
         for target in [
+            ArchiveVersion::Rar20,
             ArchiveVersion::Rar29,
             ArchiveVersion::Rar30,
             ArchiveVersion::Rar40,
@@ -3366,7 +3356,7 @@ mod tests {
         }
     }
 
-    fn file_header_of_size(size: u64, comment: Option<&[u8]>) -> Vec<u8> {
+    fn file_header_of_size(target: ArchiveVersion, size: u64, comment: Option<&[u8]>) -> Vec<u8> {
         let extra = super::encode_file_comment(comment).unwrap();
         let mut header = Vec::new();
         super::write_file_header(
@@ -3380,7 +3370,7 @@ mod tests {
                 file_time: 0,
                 file_attr: 0x20,
                 host_os: 0,
-                target: ArchiveVersion::Rar40,
+                target,
                 method: 0x30,
                 dictionary_flags: 0,
                 flags: super::writer_file_flags(None, comment, false),
@@ -3394,11 +3384,26 @@ mod tests {
 
     #[test]
     fn members_up_to_4_gib_keep_the_short_header() {
-        let header = file_header_of_size(u64::from(u32::MAX), None);
+        let header = file_header_of_size(ArchiveVersion::Rar40, u64::from(u32::MAX), None);
         assert_eq!(u16::from_le_bytes([header[3], header[4]]) & 0x0100, 0);
         assert_eq!(header.len(), 32 + b"big.bin".len());
         assert_eq!(header[7..11], [0xff; 4]);
         assert_eq!(header[11..15], [0xff; 4]);
+    }
+
+    #[test]
+    fn rar20_members_past_2_gib_ask_for_a_large_file_reader() {
+        let two_gib = 1u64 << 31;
+        for (target, size, unp_ver) in [
+            (ArchiveVersion::Rar20, two_gib - 1, 20),
+            (ArchiveVersion::Rar20, two_gib, 26),
+            (ArchiveVersion::Rar20, two_gib << 2, 26),
+            (ArchiveVersion::Rar29, two_gib, 29),
+            (ArchiveVersion::Rar40, two_gib << 2, 29),
+        ] {
+            let header = file_header_of_size(target, size, None);
+            assert_eq!(header[24], unp_ver, "{target} at {size}");
+        }
     }
 
     #[cfg(target_pointer_width = "64")]
@@ -3407,13 +3412,17 @@ mod tests {
         use std::io::{Seek, SeekFrom, Write};
 
         let size = u64::from(u32::MAX) + 2;
-        for comment in [None, Some(&b"note"[..])] {
+        for (target, comment) in [
+            (ArchiveVersion::Rar20, None),
+            (ArchiveVersion::Rar40, None),
+            (ArchiveVersion::Rar40, Some(&b"note"[..])),
+        ] {
             let dir = crate::scratch::case("rars-rar15-40-large-header");
             let path = dir.join("big.rar");
             let mut file = std::fs::File::create(&path).unwrap();
             let mut head = super::RAR15_SIGNATURE.to_vec();
             super::write_main_header(&mut head, 0);
-            head.extend_from_slice(&file_header_of_size(size, comment));
+            head.extend_from_slice(&file_header_of_size(target, size, comment));
             file.write_all(&head).unwrap();
             // Sparse: the payload is never written, only skipped over.
             file.seek(SeekFrom::Current(size as i64)).unwrap();
