@@ -3135,6 +3135,119 @@ mod tests {
         assert!(!constant_time_eq(b"abc", b"abd"));
     }
 
+    #[test]
+    fn a_continuation_with_a_different_stored_name_still_extracts() {
+        struct Capture(Rc<RefCell<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let first = b"stored ";
+        let second = b"split payload";
+        let full = [first.as_slice(), second.as_slice()].concat();
+        let expected_crc = crc32(&full);
+        let head = stored_split_archive(first, &full, expected_crc, HFL_SPLIT_AFTER);
+        for renamed in [b"Split.TXT".as_slice(), b"resealed.bin".as_slice()] {
+            let mut tail = stored_split_archive(second, &full, expected_crc, HFL_SPLIT_BEFORE);
+            let Block::File(file) = &mut tail.blocks[0] else {
+                unreachable!();
+            };
+            file.name = renamed.to_vec();
+            let captured = Rc::new(RefCell::new(Vec::new()));
+            extract_volumes_to(
+                &[head.clone(), tail],
+                crate::ArchiveReadOptions::default(),
+                {
+                    let captured = captured.clone();
+                    move |_meta| Ok(Box::new(Capture(captured.clone())) as Box<dyn Write>)
+                },
+            )
+            .unwrap_or_else(|error| panic!("renamed continuation {renamed:?} failed: {error}"));
+            assert_eq!(&*captured.borrow(), &full);
+        }
+    }
+
+    #[test]
+    fn a_damaged_blake2sp_split_names_the_volume() {
+        let first = b"stored ";
+        let second = b"split payload";
+        let full = [first.as_slice(), second.as_slice()].concat();
+        let mut head = stored_split_archive(first, &full, crc32(first), HFL_SPLIT_AFTER);
+        let mut tail = stored_split_archive(second, &full, crc32(second), HFL_SPLIT_BEFORE);
+        for volume in [&mut head, &mut tail] {
+            let Block::File(file) = &mut volume.blocks[0] else {
+                unreachable!();
+            };
+            // No per-fragment CRC, so the failure is the member BLAKE2sp.
+            file.data_crc32 = None;
+        }
+        let mut corrupt = second.to_vec();
+        corrupt[0] ^= 0xff;
+        tail.source = ArchiveSource::Memory(Arc::from(corrupt.into_boxed_slice()));
+        let error = extract_volumes_to(&[head, tail], crate::ArchiveReadOptions::default(), |_| {
+            Ok(Box::new(Vec::new()) as Box<dyn Write>)
+        })
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("in volume 2"),
+            "blake failure should name the volume: {message}"
+        );
+        assert!(
+            message.contains("hash mismatch"),
+            "expected the blake check, got {message}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn a_damaged_encrypted_blake2sp_split_names_the_volume() {
+        let data = vec![0x5au8; 24 * 1024];
+        let mut builder = crate::Builder::new(crate::ArchiveVersion::Rar50)
+            .password(Some(b"secret".to_vec()))
+            .store(true)
+            .volume_size(Some(4_096));
+        builder
+            .add_bytes(b"split.txt".to_vec(), data.to_vec(), None, None)
+            .unwrap();
+        let mut parts = builder.build_volumes(None).unwrap();
+        assert!(parts.len() >= 2, "volume size should split the member");
+        let last = parts.len() - 1;
+        let parsed = crate::ArchiveReader::read(&parts[last]).unwrap();
+        let crate::Archive::Rar50Plus(archive) = &parsed else {
+            panic!("rar5");
+        };
+        let range = archive
+            .files()
+            .next()
+            .expect("file")
+            .block
+            .data_range
+            .clone();
+        assert!(!range.is_empty());
+        parts[last][range.start] ^= 0x5a;
+        let archives: Vec<_> = parts
+            .iter()
+            .map(|part| crate::ArchiveReader::read(part).unwrap())
+            .collect();
+        let error = crate::extract_volumes_to_with_options(
+            &archives,
+            crate::ArchiveReadOptions::with_password(b"secret"),
+            |_| Ok(Box::new(Vec::new()) as Box<dyn Write>),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("in volume {}", parts.len())),
+            "encrypted blake failure should name the volume: {message}"
+        );
+    }
+
     fn stored_split_archive(data: &[u8], full: &[u8], crc: u32, flags: u64) -> Archive {
         let source: Arc<[u8]> = Arc::from(data.to_vec().into_boxed_slice());
         Archive {
@@ -3331,11 +3444,9 @@ mod tests {
             })
         };
 
+        // A later volume may change case or carry a header sealed under another name.
         let renamed = split_fragment_file(b"b.txt", HFL_SPLIT_BEFORE);
-        assert!(matches!(
-            check(&renamed, None),
-            Err(Error::InvalidHeader(_))
-        ));
+        check(&renamed, None).unwrap();
 
         let mut new_compression = split_fragment_file(b"a.txt", HFL_SPLIT_BEFORE);
         new_compression.compression_info = 0x123;
