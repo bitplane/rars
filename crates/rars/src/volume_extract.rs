@@ -3,11 +3,12 @@ use std::io::{Read, Result};
 
 pub(crate) type Volumes<'p, A> = dyn Iterator<Item = crate::Result<A>> + Send + 'p;
 
-/// A volume that can say it belongs somewhere else in its set.
+/// A volume that may record its place in its set.
 pub(crate) trait PlacedVolume {
-    /// True when the volume records a number other than `index`, counted from 0.
-    fn placed_elsewhere(&self, _index: usize) -> bool {
-        false
+    /// The number the volume records, if any. Each is one more than the one
+    /// before, wrapping at 65,536 as the 16-bit RAR 3.x field does.
+    fn volume_number(&self) -> Option<u16> {
+        None
     }
 }
 
@@ -17,10 +18,8 @@ impl PlacedVolume for crate::rar13::Archive {}
 impl PlacedVolume for crate::rar50::Archive {}
 
 impl PlacedVolume for crate::rar15_40::Archive {
-    fn placed_elsewhere(&self, index: usize) -> bool {
-        // A 16-bit field, so a set past 65,536 volumes counts round again.
+    fn volume_number(&self) -> Option<u16> {
         self.end_volume_number()
-            .is_some_and(|number| number != index as u16)
     }
 }
 
@@ -28,6 +27,8 @@ impl PlacedVolume for crate::rar15_40::Archive {
 pub(crate) struct VolumeFeed<'p, 'o, A> {
     volumes: &'p mut Volumes<'p, A>,
     index: usize,
+    /// The number the last volume handed out recorded.
+    previous_number: Option<u16>,
     stop_at_last: bool,
     ended: bool,
     options: crate::ArchiveReadOptions<'o>,
@@ -42,6 +43,7 @@ impl<'p, 'o, A: PlacedVolume> VolumeFeed<'p, 'o, A> {
         Self {
             volumes,
             index: 0,
+            previous_number: None,
             stop_at_last: true,
             ended: false,
             options,
@@ -55,6 +57,7 @@ impl<'p, 'o, A: PlacedVolume> VolumeFeed<'p, 'o, A> {
         Self {
             volumes,
             index: 0,
+            previous_number: None,
             stop_at_last: false,
             ended: false,
             options,
@@ -80,9 +83,12 @@ impl<'p, 'o, A: PlacedVolume> VolumeFeed<'p, 'o, A> {
         self.ended = !matches!(volume, Ok(Some(_)));
         let volume = volume?;
         self.index += 1;
-        if volume
-            .as_ref()
-            .is_some_and(|volume| volume.placed_elsewhere(self.index - 1))
+        // Relative to the volume before, so a run that starts later in a set,
+        // or follows other archives, still reads; a swap or a gap breaks it.
+        let number = volume.as_ref().and_then(PlacedVolume::volume_number);
+        let previous = std::mem::replace(&mut self.previous_number, number);
+        if matches!((previous, number), (Some(previous), Some(number))
+            if number != previous.wrapping_add(1))
         {
             self.ended = true;
             return Err(crate::Error::InVolume {

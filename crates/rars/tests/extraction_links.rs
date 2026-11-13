@@ -44,7 +44,8 @@ fn raw_link(target: &[u8], split: bool) -> Vec<Archive> {
         write_stored_volumes(
             entry,
             WriterOptions::new(ArchiveVersion::Rar40, rars::FeatureSet::store_only()),
-            128,
+            // 128, plus the 13 bytes a RAR 3.93-style end block adds, keeps the same split.
+            141,
         )
         .unwrap()
     } else {
