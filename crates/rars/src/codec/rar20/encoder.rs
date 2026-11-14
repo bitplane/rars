@@ -586,7 +586,7 @@ fn collect_match_lists(
     let window = options.max_match_distance.saturating_add(1).min(end.max(1));
     let mut tree = match_finder::TreeMatchFinder::with_allowance(window, &allowance)
         .expect("unlimited finder allocation");
-    let mut chain = Rar20MatchFinder::new(window);
+    let mut chain = Rar20MatchFinder::for_reach(window, window.min(LONGER_FRESH_OFFSET));
     let mut found: Buffer<(u32, u32), Allowance> = Buffer::new(&allowance);
     let candidates = options.max_match_candidates;
     let mut lists = MatchLists {
@@ -861,7 +861,8 @@ fn encode_tokens_with_progress(
     }
     let mut tokens = Vec::new();
     // No match reaches past the dictionary, so the finder need not either.
-    let mut finder = Rar20MatchFinder::new(options.max_match_distance.max(1).min(combined.len()));
+    let reach = options.max_match_distance.max(1).min(combined.len());
+    let mut finder = Rar20MatchFinder::for_reach(reach, reach);
     for history_pos in 0..start {
         finder.insert(combined, history_pos);
     }
