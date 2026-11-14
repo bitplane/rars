@@ -185,12 +185,6 @@ where
                 let last = walk
                     .finish()
                     .map_err(|error| first.entry_error("extracting", error))?;
-                if last.unp_size != first.unp_size {
-                    return Err(first.entry_error(
-                        "extracting",
-                        Error::InvalidHeader("RAR 1.5 split entry unpacked size changed"),
-                    ));
-                }
                 last.crc_result(crc, password)
                     .map_err(|error| first.entry_error("extracting", error))
             })
@@ -238,7 +232,7 @@ fn write_stored<B: Budget>(
         )
     };
     let last = walk.finish()?.clone();
-    if walk.packed_len != expected_packed_len || last.unp_size != first.unp_size {
+    if walk.packed_len != expected_packed_len {
         return Err(Error::InvalidHeader(
             "RAR 1.5 split stored file has wrong reassembled size",
         ));
@@ -335,8 +329,11 @@ impl<'f, 'p, 'o, B: Budget> SplitWalk<'f, 'p, 'o, B> {
         }
         validate_split_fragment(file, self.feed.options().password)?;
         let first = &self.first;
-        if file.name != first.name {
-            return Err(Error::InvalidHeader("RAR 1.5 split entry name changed"));
+        // The stored name may differ; size, method and CRC still tie the fragment to its member.
+        if file.unp_size != first.unp_size {
+            return Err(Error::InvalidHeader(
+                "RAR 1.5 split entry unpacked size changed",
+            ));
         }
         if file.method != first.method {
             return Err(Error::InvalidHeader(
