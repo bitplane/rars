@@ -58,12 +58,9 @@ pub(super) fn split_stored(
     validate_plan(options, PlanShape::new().volumes(true), false, false)?;
     let name = member.name;
     let source_len = member.bytes.len()?;
-    let unpacked = usize::try_from(source_len)
-        .map_err(|_| Error::InvalidArgument("RAR 1.5 writer does not support large files"))
-        .and_then(|len| validate_member(name, len).map(|()| len))
-        .map_err(|error| {
-            crate::write_stream::member_error(error, name, "preparing volume member")
-        })?;
+    validate_volume_member(name, options.target, source_len).map_err(|error| {
+        crate::write_stream::member_error(error, name, "preparing volume member")
+    })?;
     if member.file_comment.is_some() {
         return Err(Error::UnsupportedFeature {
             version: options.target,
@@ -76,7 +73,7 @@ pub(super) fn split_stored(
     } else {
         None
     };
-    if unpacked == 0 {
+    if source_len == 0 {
         return Err(Error::InvalidArgument(
             "RAR 1.5 volume writer needs a non-empty packed payload",
         )
@@ -169,19 +166,15 @@ impl VolumeMember<'_> {
         if split_after {
             flags |= FHD_SPLIT_AFTER;
         }
-        let size = |value: u64| {
-            usize::try_from(value)
-                .map_err(|_| Error::InvalidArgument("RAR 1.5 writer does not support large files"))
-        };
         let mut header = Vec::new();
         write_file_header(
             &mut header,
             &FileRecord {
                 head_type: FILE_HEAD,
                 name: self.name,
-                unpacked_size: size(self.unpacked_size)?,
+                unpacked_size: self.unpacked_size,
                 file_crc,
-                packed_size: size(packed_size)?,
+                packed_size,
                 file_time: self.file_time,
                 file_attr: self.file_attr,
                 host_os: self.host_os,
