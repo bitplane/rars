@@ -2898,9 +2898,8 @@ fn archive_base_name(path: &Path) -> PyResult<Vec<u8>> {
 }
 
 fn legacy_volume_part_path(first_path: &Path, index: usize) -> PyResult<PathBuf> {
-    rars_rs::volume_name::old_style(first_path, index).ok_or_else(|| {
-        PyValueError::new_err("legacy RAR volume names only support .r00 through .r99")
-    })
+    rars_rs::volume_name::old_style(first_path, index)
+        .ok_or_else(|| PyValueError::new_err("old-style volume names run out after .z99"))
 }
 
 fn rar50_volume_part_path(
