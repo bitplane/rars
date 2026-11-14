@@ -2460,7 +2460,7 @@ fn write_volume_parts(
     parts: &[Vec<u8>],
     progress: &CliProgress,
 ) -> CliResult<()> {
-    // Naming can fail before any filesystem work (for example after .r99).
+    // Naming can fail before any filesystem work (for example after .z99).
     // Plan the complete set first so that refusal cannot overwrite old parts.
     let paths = (0..parts.len())
         .map(|index| volume_part_path(first_path, index))
@@ -3305,7 +3305,7 @@ mod tests {
     }
 
     #[test]
-    fn old_style_volume_writer_stops_at_r99() {
+    fn old_style_volume_writer_rolls_past_r99() {
         assert_eq!(
             volume_part_path(Path::new("archive.rar"), 0).unwrap(),
             PathBuf::from("archive.rar")
@@ -3318,7 +3318,11 @@ mod tests {
             volume_part_path(Path::new("archive.rar"), 100).unwrap(),
             PathBuf::from("archive.r99")
         );
-        assert!(volume_part_path(Path::new("archive.rar"), 101).is_err());
+        assert_eq!(
+            volume_part_path(Path::new("archive.rar"), 101).unwrap(),
+            PathBuf::from("archive.s00")
+        );
+        assert!(volume_part_path(Path::new("archive.rar"), 901).is_err());
     }
 
     #[test]

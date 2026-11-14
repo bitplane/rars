@@ -239,11 +239,9 @@ fn repaired_volume_path(
         }
     }
     if lower.ends_with(".rar")
-        || lower.rsplit_once('.').is_some_and(|(_, ext)| {
-            ext.len() == 3
-                && ext.starts_with('r')
-                && ext[1..].bytes().all(|byte| byte.is_ascii_digit())
-        })
+        || lower
+            .rsplit_once('.')
+            .is_some_and(|(_, ext)| crate::volumes::old_style_index(ext.as_bytes()).is_some())
     {
         let first_out = out_dir.join(file_name);
         let first_out = if lower.ends_with(".rar") {
@@ -330,7 +328,8 @@ mod tests {
             ("set.partx.rar", 1, 2, "set.partx.r00"),
             ("set.part.rar", 0, 2, "set.part.rar"),
             ("set.part1.bin", 0, 2, "repaired.part1.rar"),
-            ("set.rar", 101, 200, "repaired.part102.rar"),
+            ("set.rar", 101, 200, "set.s00"),
+            ("set.rar", 901, 1000, "repaired.part902.rar"),
             ("set.r01", 2, 3, "set.r01"),
             ("set.rXX", 0, 2, "repaired.part1.rar"),
             ("set.rev", 0, 2, "repaired.part1.rar"),

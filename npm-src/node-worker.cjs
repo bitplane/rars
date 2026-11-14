@@ -15,16 +15,18 @@ function volumePath(firstPath, index, total, format) {
   }
   if (index === 0) return firstPath;
   // RAR follows the case of the first extension: A.RAR, A.R00; a.rar, a.r00.
-  const letter = parsed.ext.startsWith(".R") ? "R" : "r";
-  return path.join(parsed.dir, `${parsed.name}.${letter}${String(index - 1).padStart(2, "0")}`);
+  // RAR 4 rolls .r99 on to .s00, and so on up to .z99.
+  const number = index - 1;
+  const letter = String.fromCharCode((parsed.ext.startsWith(".R") ? 82 : 114) + Math.floor(number / 100));
+  return path.join(parsed.dir, `${parsed.name}.${letter}${String(number % 100).padStart(2, "0")}`);
 }
 
 function volumePaths(firstPath, total, format) {
   if (!path.parse(firstPath).base) {
     throw new TypeError("volume output needs a file name");
   }
-  if (format !== "rar50" && format !== "rar70" && total > 101) {
-    throw new RangeError("legacy RAR volume names only support .r00 through .r99");
+  if (format !== "rar50" && format !== "rar70" && total > 901) {
+    throw new RangeError("old-style volume names run out after .z99");
   }
   const paths = Array.from({ length: total }, (_, index) => volumePath(firstPath, index, total, format));
   // Volume discovery is case insensitive, and these names must also remain
