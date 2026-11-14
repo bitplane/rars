@@ -108,8 +108,9 @@ const parts = await writer.volumes(5 * 1024 * 1024);
 `encryptHeaders`, `comment` and `recoveryPercent`. Node additionally provides
 `addFile()`, `writeTo()` and `writeVolumesTo()`.
 For legacy formats, `writeVolumesTo()` keeps the first path and names later
-volumes `.r00` through `.r99` in the same directory. Sets exceeding 101 volumes
-or containing overlapping output paths are rejected before any file is written.
+volumes `.r00` through `.r99`, then `.s00` on up to `.z99` as RAR 4 does, in the
+same directory. Sets exceeding 901 volumes or containing overlapping output
+paths are rejected before any file is written.
 
 Long operations accept an `AbortSignal` and progress callback:
 

@@ -94,14 +94,19 @@ try {
     assert.deepEqual(actual, [1, 2].map((index) => path.join(directory, `archive.part0${index}.RAR`)));
   }
 
+  // RAR 4 rolls .r99 on to .s00, and so on up to .z99.
   const maximum = path.join(temporary, "legacy-maximum");
-  const paths = await writeVolumes(maximum, "archive.rar", 101);
-  assert.equal(paths.at(-1), path.join(maximum, "archive.r99"));
-  assert.equal((await readdir(maximum)).length, 101);
-  assert.deepEqual(await readFile(paths.at(-1)), Buffer.of(100));
+  const paths = await writeVolumes(maximum, "archive.rar", 901);
+  assert.equal(paths[100], path.join(maximum, "archive.r99"));
+  assert.equal(paths[101], path.join(maximum, "archive.s00"));
+  assert.equal(paths.at(-1), path.join(maximum, "archive.z99"));
+  assert.equal((await readdir(maximum)).length, 901);
+  assert.deepEqual(await readFile(paths.at(-1)), Buffer.of(900));
+  assert.equal((await writeVolumes(path.join(temporary, "legacy-upper"), "archive.RAR", 102)).at(-1),
+    path.join(temporary, "legacy-upper", "archive.S00"));
 
   for (const [caseIndex, [firstName, total, message]] of [
-    ["archive.rar", 102, /\.r00 through \.r99/],
+    ["archive.rar", 902, /run out after \.z99/],
     ["archive.r00", 3, /paths must be distinct/],
     ["archive.R00", 3, /paths must be distinct/],
   ].entries()) {
