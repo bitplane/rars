@@ -422,7 +422,38 @@ pub(super) struct Fragment {
     volume: usize,
     source: ArchiveSource,
     range: Range<usize>,
-    crc: Option<u32>,
+    check: Option<FragmentCheck>,
+}
+
+impl Fragment {
+    fn feed(&self, update: impl FnMut(&[u8])) -> bool {
+        self.source
+            .copy_range_to(self.range.clone(), &mut UpdateSink(update))
+            .is_ok()
+    }
+}
+
+/// WinRAR's `-htb` volumes drop the CRC32 and keep only a hash record.
+enum FragmentCheck {
+    Crc32(u32),
+    Blake2sp([u8; 32]),
+}
+
+impl FragmentCheck {
+    fn of(file: &FileHeader) -> Option<Self> {
+        // A MAC'd CRC32 or hash needs the password; RAR 7 and rars key only the final fragment.
+        if file.uses_hash_mac() {
+            return None;
+        }
+        if let Some(crc) = file.data_crc32 {
+            return Some(Self::Crc32(crc));
+        }
+        let hash = file.hash.as_ref()?;
+        (hash.hash_type == 0)
+            .then(|| hash.data.as_slice().try_into().ok())
+            .flatten()
+            .map(Self::Blake2sp)
+    }
 }
 
 /// Fetches a split member's later volumes as its reader reaches each fragment's end.
@@ -451,7 +482,7 @@ impl<'f, 'p, 'o, B: Budget> SplitWalk<'f, 'p, 'o, B> {
             volume: feed.current_index(),
             source: volume.source.clone(),
             range: first.block.data_range.clone(),
-            crc: first.data_crc32,
+            check: FragmentCheck::of(first),
         })?;
         Ok(Self {
             feed,
@@ -533,24 +564,36 @@ impl<'f, 'p, 'o, B: Budget> SplitWalk<'f, 'p, 'o, B> {
             if index == last && !self.split_after {
                 break;
             }
-            let Some(expected) = fragment.crc else {
+            let Some(check) = &fragment.check else {
                 continue;
             };
-            let mut crc = Crc32::new();
-            if fragment
-                .source
-                .copy_range_to(fragment.range.clone(), &mut CrcSink(&mut crc))
-                .is_err()
-            {
-                continue;
-            }
-            let actual = crc.finish();
-            if actual != expected {
-                return Some(Error::InVolume {
-                    number: fragment.volume + 1,
-                    source: Box::new(Error::Crc32Mismatch { expected, actual }),
-                });
-            }
+            let source = match check {
+                FragmentCheck::Crc32(expected) => {
+                    let mut crc = Crc32::new();
+                    if !fragment.feed(|buf| crc.update(buf)) {
+                        continue;
+                    }
+                    let actual = crc.finish();
+                    if actual == *expected {
+                        continue;
+                    }
+                    Error::Crc32Mismatch {
+                        expected: *expected,
+                        actual,
+                    }
+                }
+                FragmentCheck::Blake2sp(expected) => {
+                    let mut hash = blake2sp::Hasher::new();
+                    if !fragment.feed(|buf| hash.update(buf)) || hash.finalize() == *expected {
+                        continue;
+                    }
+                    Error::HashMismatch { hash_type: 0 }
+                }
+            };
+            return Some(Error::InVolume {
+                number: fragment.volume + 1,
+                source: Box::new(source),
+            });
         }
         None
     }
@@ -594,7 +637,7 @@ impl<B: Budget> SplitWalk<'_, '_, '_, B> {
                 volume: self.feed.current_index(),
                 source: volume.source.clone(),
                 range: file.block.data_range.clone(),
-                crc: file.data_crc32,
+                check: FragmentCheck::of(file),
             })?;
             self.split_after = file.is_split_after();
             self.last = Some(volume);

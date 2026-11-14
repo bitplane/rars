@@ -3010,6 +3010,69 @@ mod tests {
     }
 
     #[test]
+    fn winrar_htb_fragments_hash_the_bytes_each_volume_stores() {
+        let parts: [&[u8]; 3] = [
+            include_bytes!("../tests/fixtures/rar50/htb_multivol.part1.rar"),
+            include_bytes!("../tests/fixtures/rar50/htb_multivol.part2.rar"),
+            include_bytes!("../tests/fixtures/rar50/htb_multivol.part3.rar"),
+        ];
+        let mut member = Vec::new();
+        for (index, part) in parts.iter().enumerate() {
+            let archive = Archive::parse(part).unwrap();
+            let file = archive.files().next().unwrap();
+            let stored = file.packed_data(&archive).unwrap();
+            member.extend_from_slice(&stored);
+            assert_eq!(file.data_crc32, None, "volume {}", index + 1);
+            let hash = &file.hash.as_ref().unwrap().data;
+            match file.is_split_after() {
+                true => assert_eq!(hash, &blake2sp::hash(&stored), "volume {}", index + 1),
+                false => assert_eq!(hash, &blake2sp::hash(&member)),
+            }
+        }
+    }
+
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn encrypted_winrar_htb_fragments_hash_their_ciphertext_unkeyed() {
+        // Header-encrypted sets key no fragment; `-p` keys only the final one.
+        let sets: [(&[&[u8]], bool); 2] = [
+            (
+                &[
+                    include_bytes!("../tests/fixtures/rar50/htb_multivol_p.part1.rar"),
+                    include_bytes!("../tests/fixtures/rar50/htb_multivol_p.part2.rar"),
+                    include_bytes!("../tests/fixtures/rar50/htb_multivol_p.part3.rar"),
+                ],
+                true,
+            ),
+            (
+                &[
+                    include_bytes!("../tests/fixtures/rar50/htb_multivol_hp.part1.rar"),
+                    include_bytes!("../tests/fixtures/rar50/htb_multivol_hp.part2.rar"),
+                    include_bytes!("../tests/fixtures/rar50/htb_multivol_hp.part3.rar"),
+                    include_bytes!("../tests/fixtures/rar50/htb_multivol_hp.part4.rar"),
+                ],
+                false,
+            ),
+        ];
+        for (parts, final_keyed) in sets {
+            for (index, part) in parts.iter().enumerate() {
+                let archive = Archive::parse_with_password(part, Some(b"password")).unwrap();
+                let file = archive.files().next().unwrap();
+                assert!(file.encrypted);
+                assert_eq!(file.data_crc32, None, "volume {}", index + 1);
+                if !file.is_split_after() {
+                    assert_eq!(file.uses_hash_mac(), final_keyed);
+                    continue;
+                }
+                assert!(!file.uses_hash_mac(), "volume {}", index + 1);
+                let stored = file.packed_data(&archive).unwrap();
+                let hash = &file.hash.as_ref().unwrap().data;
+                assert_eq!(hash, &blake2sp::hash(&stored), "volume {}", index + 1);
+            }
+        }
+    }
+
+    #[test]
     fn recovery_record_distinguishes_other_services_and_rejects_missing_or_extra_data() {
         let archive = build_archive_with_optional_comment(None);
         let mut file = archive.files().next().unwrap().clone();

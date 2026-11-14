@@ -1557,12 +1557,12 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     diff == 0
 }
 
-/// Feeds what it is given to a running CRC32 and keeps none of it.
-struct CrcSink<'a>(&'a mut Crc32);
+/// Feeds what it is given to a running checksum and keeps none of it.
+struct UpdateSink<F: FnMut(&[u8])>(F);
 
-impl Write for CrcSink<'_> {
+impl<F: FnMut(&[u8])> Write for UpdateSink<F> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.update(buf);
+        (self.0)(buf);
         Ok(buf.len())
     }
 
@@ -1681,7 +1681,7 @@ mod tests {
     fn checksum_sink_flush_preserves_accumulated_checksum() {
         let mut crc = Crc32::new();
         {
-            let mut sink = CrcSink(&mut crc);
+            let mut sink = UpdateSink(|buf: &[u8]| crc.update(buf));
             sink.flush().unwrap();
             assert_eq!(sink.write(b"").unwrap(), 0);
             assert_eq!(sink.write(b"a").unwrap(), 1);
