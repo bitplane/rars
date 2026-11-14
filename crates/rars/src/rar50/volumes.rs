@@ -502,8 +502,15 @@ impl<'f, 'p, 'o, B: Budget> SplitWalk<'f, 'p, 'o, B> {
         }
         file.check_dictionary_limit(self.options.rar50_dictionary_size_limit)?;
         validate_split_fragment(file, self.options.password)?;
-        if file.name != self.first.name {
-            return Err(Error::InvalidHeader("RAR 5 split entry name changed"));
+        // The stored name may differ; size, compression info and checksums still tie it to its member.
+        if let (Some(size), Some(first)) =
+            (file.known_unpacked_size(), self.first.known_unpacked_size())
+        {
+            if size != first {
+                return Err(Error::InvalidHeader(
+                    "RAR 5 split entry unpacked size changed",
+                ));
+            }
         }
         if file.compression_info != self.first.compression_info {
             return Err(Error::InvalidHeader(
