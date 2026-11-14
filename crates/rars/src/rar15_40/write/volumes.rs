@@ -94,10 +94,16 @@ pub(super) fn split_stored(
         total_entries: Some(1),
         pass: 1,
     });
+    // Derive the key before the volume headers do, so a bad password names the member.
+    let payload = PackedStream::open(&member.bytes, source_len, &cipher, progress, Some(&work))
+        .map_err(|error| {
+            crate::write_stream::member_error(error, name, "encrypting volume member")
+        })?;
     let mut packer = VolumePacker::new(
         sink,
         volume_size as u64,
         options.target,
+        0,
         header_password,
         progress,
     )?;
@@ -115,7 +121,7 @@ pub(super) fn split_stored(
         salt: cipher.salt,
         packed_len,
         final_crc: None,
-        payload: PackedStream::open(&member.bytes, source_len, &cipher, progress, Some(&work))?,
+        payload,
     };
     packer.expect_only(&member)?;
     packer.write_member(member)?;
@@ -130,6 +136,81 @@ pub(super) fn split_stored(
         pass: 1,
     });
     crate::write_progress::check_cancelled(Some(progress))
+}
+
+pub(super) struct PackedSplit<'a> {
+    pub(super) name: &'a [u8],
+    pub(super) unpacked: &'a [u8],
+    pub(super) packed: &'a [u8],
+    pub(super) method: u8,
+    pub(super) file_time: u32,
+    pub(super) file_attr: u32,
+    pub(super) host_os: u8,
+    pub(super) password: Option<&'a [u8]>,
+}
+
+/// Splits a member that has already been packed, encrypting it as it is copied.
+pub(super) fn split_packed(
+    member: PackedSplit<'_>,
+    options: WriterOptions,
+    volume_size: usize,
+    sink: &mut dyn VolumeSink,
+    progress: ProgressReporter<'_>,
+) -> Result<()> {
+    crate::write_progress::check_cancelled(Some(progress))?;
+    let name = member.name;
+    let header_password = if options.features.header_encryption {
+        validate_header_encrypted_archive_options(options.target, member.password.is_some())?;
+        Some(member.password.ok_or(Error::NeedPassword)?)
+    } else {
+        None
+    };
+    if member.packed.is_empty() {
+        return Err(Error::InvalidArgument(
+            "RAR 1.5 volume writer needs a non-empty packed payload",
+        )
+        .at_entry(name.to_vec(), "preparing volume member"));
+    }
+    let cipher = CipherPlan::new(options.target, member.password).map_err(|error| {
+        crate::write_stream::member_error(error, name, "encrypting volume member")
+    })?;
+    let packed_len = cipher.packed_len(member.packed.len() as u64)?;
+    if volume_size == 0 {
+        return Err(Error::InvalidArgument("volume size must be non-zero"));
+    }
+    let packed = MemberBytes::Borrowed(member.packed);
+    let payload = PackedStream::open(&packed, member.packed.len() as u64, &cipher, progress, None)
+        .map_err(|error| {
+            crate::write_stream::member_error(error, name, "encrypting volume member")
+        })?;
+    let main_flags = if options.features.solid { MHD_SOLID } else { 0 };
+    let mut packer = VolumePacker::new(
+        sink,
+        volume_size as u64,
+        options.target,
+        main_flags,
+        header_password,
+        progress,
+    )?;
+    let member = VolumeMember {
+        name,
+        target: options.target,
+        unpacked_size: member.unpacked.len() as u64,
+        file_time: member.file_time,
+        file_attr: member.file_attr,
+        host_os: member.host_os,
+        method: member.method,
+        dictionary_flags: dictionary_flags_for_options(options)?,
+        file_flags: writer_file_flags(member.password, None, false)
+            | if cipher.salt.is_some() { FHD_SALT } else { 0 },
+        salt: cipher.salt,
+        packed_len,
+        final_crc: Some(crc32(member.unpacked)),
+        payload,
+    };
+    packer.expect_only(&member)?;
+    packer.write_member(member)?;
+    packer.finish()
 }
 
 /// Header fields and two readers over one member's packed bytes.
@@ -202,6 +283,8 @@ struct VolumePacker<'a> {
     sink: &'a mut dyn VolumeSink,
     volume_size: u64,
     target: ArchiveVersion,
+    /// Flags beyond the volume ones every main header carries, such as solid.
+    main_flags: u16,
     header_password: Option<&'a [u8]>,
     progress: ProgressReporter<'a>,
     tail_len: u64,
@@ -223,6 +306,7 @@ impl<'a> VolumePacker<'a> {
         sink: &'a mut dyn VolumeSink,
         volume_size: u64,
         target: ArchiveVersion,
+        main_flags: u16,
         header_password: Option<&'a [u8]>,
         progress: ProgressReporter<'a>,
     ) -> Result<Self> {
@@ -230,6 +314,7 @@ impl<'a> VolumePacker<'a> {
             sink,
             volume_size,
             target,
+            main_flags,
             header_password,
             progress,
             tail_len: 0,
@@ -341,7 +426,7 @@ impl<'a> VolumePacker<'a> {
     }
 
     fn head(&self, index: u64) -> Result<Vec<u8>> {
-        let mut main_flags = MHD_VOLUME;
+        let mut main_flags = MHD_VOLUME | self.main_flags;
         if self.header_password.is_some() {
             main_flags |= MHD_PASSWORD;
         }
