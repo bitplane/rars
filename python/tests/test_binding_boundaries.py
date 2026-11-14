@@ -10,15 +10,15 @@ STORED = ROOT / "crates/rars/tests/fixtures/rar50/stored.rar"
 
 
 def test_legacy_volume_name_refusal_preserves_existing_parts(tmp_path):
-    # Each volume carries about 70 bytes, so this needs more than the 101
-    # names .rar and .r00 through .r99 allow.
+    # Each volume carries about 70 bytes, so this needs more than the 901
+    # names .rar and .r00 through .z99 allow.
     builder = rars.RarBuilder(format="rar14", store=True, volume_size=150)
-    builder.add_bytes(bytes(range(256)) * 40, "payload.bin")
+    builder.add_bytes(bytes(range(256)) * 400, "payload.bin")
     first = tmp_path / "archive.rar"
     second = tmp_path / "archive.r00"
     first.write_bytes(b"original first")
     second.write_bytes(b"original second")
-    with pytest.raises(ValueError, match=r"\.r00 through \.r99"):
+    with pytest.raises(ValueError, match=r"run out after \.z99"):
         builder.write_volumes(first)
     assert first.read_bytes() == b"original first"
     assert second.read_bytes() == b"original second"
