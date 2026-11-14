@@ -1280,6 +1280,41 @@ fn a_damaged_rar50_volume_is_reported_by_its_number() {
 }
 
 #[test]
+fn a_damaged_winrar_htb_volume_is_reported_by_its_number() {
+    let mut parts: Vec<Vec<u8>> = (1..=3)
+        .map(|part| std::fs::read(fixture(&format!("htb_multivol.part{part}.rar"))).unwrap())
+        .collect();
+    let damaged = 1;
+    let range = Archive::parse(&parts[damaged])
+        .unwrap()
+        .files()
+        .next()
+        .unwrap()
+        .block
+        .data_range
+        .clone();
+    parts[damaged][range.start] ^= 0xff;
+
+    let archives: Vec<_> = parts
+        .iter()
+        .map(|part| Archive::parse(part).unwrap())
+        .collect();
+    let error = collect_extract_volumes(&archives).unwrap_err();
+    let mut source = &error;
+    while let Error::AtEntry { source: inner, .. } | Error::AtArchiveOffset { source: inner, .. } =
+        source
+    {
+        source = inner;
+    }
+    assert!(
+        matches!(source, Error::InVolume { number, source }
+            if *number == damaged + 1 && matches!(**source, Error::HashMismatch { hash_type: 0 })),
+        "expected volume {} to be named, got {error}",
+        damaged + 1
+    );
+}
+
+#[test]
 fn compressed_rar50_volume_writer_stores_member_when_lz_payload_would_grow() {
     let data = deterministic_noise(8192);
     assert!(encode_lz_member(&data, 0).unwrap().len() >= data.len());
