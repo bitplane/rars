@@ -146,7 +146,8 @@ fn encode_tokens(
     options: EncodeOptions,
     cost_model: Option<&CostModel>,
 ) -> Vec<EncodeToken> {
-    encode_tokens_with_progress(input, history, options, cost_model, None, None)
+    let (combined, start) = super::combined_input(input, history, options);
+    encode_tokens_with_progress(&combined, start, options, cost_model, None, None)
         .expect("encoding without cancellation cannot be cancelled")
 }
 
@@ -1471,6 +1472,82 @@ fn priced_parses_code_to_the_unpruned_search_bytes() {
             (5_915, 3_334_173_363),
             (32_596, 1_397_434_958),
             (5_948, 2_954_067_044),
+        ]
+    );
+}
+
+#[test]
+fn level_ladder_codes_to_the_bytes_it_always_has() {
+    let level = |level: u8| {
+        EncodeOptions::new([16, 256, 1024][usize::from(level / 2)])
+            .with_lazy_matching(true)
+            .with_lazy_lookahead(2)
+            .with_optimal_parse(level >= 4)
+            .with_try_audio(false)
+    };
+    let text = include_bytes!("../../../tests/fixtures/rar15_40/ppmd/lorem_127k.txt");
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let random: Vec<u8> = (0..160 * 1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect();
+    let windowed = windowed_payload(192 * 1024);
+
+    let mut fingerprints = Vec::new();
+    for level_number in [1, 3, 5] {
+        let options = level(level_number);
+        for (input, options) in [
+            (&text[..], options),
+            (&random[..], options),
+            (&windowed[..], options.with_max_match_distance(16 * 1024)),
+        ] {
+            let packed = super::unpack20_encode_literals_with_options(input, options).unwrap();
+            assert_eq!(unpack20_decode(&packed, input.len()).unwrap(), input);
+            fingerprints.push((packed.len(), crate::crc32::crc32(&packed)));
+        }
+        for distance in [1024 * 1024, 16 * 1024] {
+            let (first, second) = (&text[..64 * 1024], &text[32 * 1024..]);
+            let mut encoder =
+                Unpack20Encoder::with_options(options.with_max_match_distance(distance));
+            let first_packed = encoder.encode_member(first).unwrap();
+            let second_packed = encoder.encode_member(second).unwrap();
+            let mut decoder = Unpack20::new();
+            assert_eq!(
+                decoder.decode_member(&first_packed, first.len()).unwrap(),
+                first
+            );
+            assert_eq!(
+                decoder.decode_member(&second_packed, second.len()).unwrap(),
+                second
+            );
+            fingerprints.push((second_packed.len(), crate::crc32::crc32(&second_packed)));
+        }
+    }
+
+    // Captured from master 61e9cbe0: per level, text, random, windowed, then the
+    // second solid member at a full and a 16 KiB window.
+    assert_eq!(
+        fingerprints,
+        [
+            (25_867, 375_757_556),
+            (164_043, 1_793_404_310),
+            (103_519, 1_847_793_703),
+            (21_255, 3_686_877_865),
+            (31_358, 4_238_223_832),
+            (22_250, 695_168_011),
+            (164_043, 1_793_404_310),
+            (102_295, 2_521_304_095),
+            (16_600, 3_409_808_212),
+            (25_963, 4_073_131_303),
+            (21_196, 2_351_889_793),
+            (164_042, 643_216_834),
+            (101_981, 1_052_764_375),
+            (15_486, 1_553_409_529),
+            (25_937, 4_031_144_444),
         ]
     );
 }

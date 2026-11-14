@@ -2,6 +2,7 @@
 use super::super::workspace::{Allowance, Buffer};
 use super::super::{huffman, match_finder};
 use super::*;
+use std::borrow::Cow;
 
 const MAX_ENCODER_MATCH_OFFSET: usize = MAX_HISTORY;
 
@@ -208,12 +209,14 @@ fn encode_member(
     }
     // The public field can be assigned directly, bypassing the builder clamp.
     let options = options.constrained();
+    // Every pass and the match lists parse this one buffer.
+    let (combined, start) = combined_input(input, history, options);
 
     let tokens = match progress.as_mut() {
         Some(report) => {
-            encode_tokens_with_progress(input, history, options, None, None, Some(&mut **report))?
+            encode_tokens_with_progress(&combined, start, options, None, None, Some(&mut **report))?
         }
-        None => encode_tokens_with_progress(input, history, options, None, None, None)?,
+        None => encode_tokens_with_progress(&combined, start, options, None, None, None)?,
     };
     let table_lengths = table_lengths_for_tokens(&tokens, fixed_table)?;
     let packed = encode_member_with_tables(&tokens, history, fixed_table, &table_lengths)?;
@@ -231,9 +234,12 @@ fn encode_member(
     let refinements = if options.optimal_parse { 2 } else { 1 };
     // Matches do not depend on prices, so both priced passes share one search.
     let matches = if options.optimal_parse {
-        let (combined, start) = combined_input(input, history, options);
-        let end = combined.len();
-        Some(collect_match_lists(&combined, start, end, options))
+        Some(collect_match_lists(
+            &combined,
+            start,
+            combined.len(),
+            options,
+        ))
     } else {
         None
     };
@@ -243,16 +249,16 @@ fn encode_member(
         let cost_model = CostModel::new(&best_table);
         let next_tokens = match progress.as_mut() {
             Some(report) => encode_tokens_with_progress(
-                input,
-                history,
+                &combined,
+                start,
                 options,
                 Some(&cost_model),
                 matches.as_ref(),
                 Some(&mut **report),
             )?,
             None => encode_tokens_with_progress(
-                input,
-                history,
+                &combined,
+                start,
                 options,
                 Some(&cost_model),
                 matches.as_ref(),
@@ -821,50 +827,64 @@ fn match_run_length(input: &[u8], pos: usize, offset: usize, cap: usize) -> usiz
     length
 }
 
-fn combined_input(input: &[u8], history: &[u8], options: EncodeOptions) -> (Vec<u8>, usize) {
+fn combined_input<'a>(
+    input: &'a [u8],
+    history: &[u8],
+    options: EncodeOptions,
+) -> (Cow<'a, [u8]>, usize) {
     let history = &history[history.len().saturating_sub(options.max_match_distance)..];
+    if history.is_empty() {
+        return (Cow::Borrowed(input), 0);
+    }
     let mut combined = Vec::with_capacity(history.len() + input.len());
     combined.extend_from_slice(history);
     combined.extend_from_slice(input);
-    (combined, history.len())
+    (Cow::Owned(combined), history.len())
 }
 
 fn encode_tokens_with_progress(
-    input: &[u8],
-    history: &[u8],
+    combined: &[u8],
+    start: usize,
     options: EncodeOptions,
     cost_model: Option<&CostModel>,
     matches: Option<&MatchLists>,
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<EncodeToken>> {
-    let (combined, start) = combined_input(input, history, options);
     if let (Some(cost_model), Some(matches)) = (cost_model, matches) {
         return Ok(encode_tokens_optimal(
-            &combined,
+            combined,
             start,
             combined.len(),
             matches,
             cost_model,
         ));
     }
-    let history = &combined[..start];
     let mut tokens = Vec::new();
-    let mut finder = Rar20MatchFinder::new(combined.len());
-    for history_pos in 0..history.len() {
-        finder.insert(&combined, history_pos);
+    // No match reaches past the dictionary, so the finder need not either.
+    let mut finder = Rar20MatchFinder::new(options.max_match_distance.max(1).min(combined.len()));
+    for history_pos in 0..start {
+        finder.insert(combined, history_pos);
     }
-    let mut literal_prefix = Vec::new();
-    let priced = cost_model.map(|model| model.with_literal_prefix(&combined, &mut literal_prefix));
-    let cost_model = priced.as_ref();
+    let mut literal_totals = LiteralTotals::default();
+    // A lazy look ahead prices a whole match from each position it tries.
+    let priced_reach = options
+        .lazy_lookahead
+        .max(1)
+        .saturating_add(MAX_ENCODER_MATCH_LENGTH);
 
-    let mut pos = history.len();
+    let mut pos = start;
     let end = combined.len();
     let mut last_match = None;
     let mut old_offsets = [0usize; 4];
     let mut next_report = 0usize;
     while pos < end {
+        if let Some(&model) = cost_model {
+            literal_totals.cover(model, combined, pos, priced_reach);
+        }
+        let priced = cost_model.map(|model| model.with_literal_totals(&literal_totals));
+        let cost_model = priced.as_ref();
         let selected = select_match(
-            &combined,
+            combined,
             pos,
             end,
             &finder,
@@ -874,7 +894,7 @@ fn encode_tokens_with_progress(
         );
         if let Some(selected) = selected {
             let lazy = LazyMatchContext {
-                input: &combined,
+                input: combined,
                 end,
                 finder: &finder,
                 options,
@@ -883,7 +903,7 @@ fn encode_tokens_with_progress(
             };
             if should_lazy_emit_literal(pos, selected, lazy) {
                 tokens.push(EncodeToken::Literal(combined[pos]));
-                finder.insert(&combined, pos);
+                finder.insert(combined, pos);
                 pos += 1;
                 continue;
             }
@@ -919,15 +939,15 @@ fn encode_tokens_with_progress(
             };
             push_old_offset(&mut old_offsets, offset);
             for history_pos in pos..pos + length {
-                finder.insert(&combined, history_pos);
+                finder.insert(combined, history_pos);
             }
             pos += length;
         } else {
             tokens.push(EncodeToken::Literal(combined[pos]));
-            finder.insert(&combined, pos);
+            finder.insert(combined, pos);
             pos += 1;
         }
-        let consumed = pos.saturating_sub(history.len());
+        let consumed = pos - start;
         if consumed >= next_report {
             if progress
                 .as_deref_mut()
@@ -938,7 +958,7 @@ fn encode_tokens_with_progress(
             next_report = consumed.saturating_add(1024 * 1024);
         }
     }
-    if progress.is_some_and(|report| !report(input.len())) {
+    if progress.is_some_and(|report| !report(end - start)) {
         return Err(Error::Cancelled);
     }
     Ok(tokens)
@@ -953,7 +973,7 @@ struct CostModel<'a> {
     offsets: &'a [u8],
     lengths: &'a [u8],
     /// Running literal totals, so pricing a span is two lookups, not a loop.
-    literal_prefix: Option<&'a [u32]>,
+    literal_totals: Option<&'a LiteralTotals>,
     cheapest_fresh_length: usize,
 }
 
@@ -968,26 +988,17 @@ impl<'a> CostModel<'a> {
             main,
             offsets: &table_lengths[MAIN_COUNT..MAIN_COUNT + OFFSET_COUNT],
             lengths: &table_lengths[MAIN_COUNT + OFFSET_COUNT..TABLE_COUNT],
-            literal_prefix: None,
+            literal_totals: None,
             cheapest_fresh_length,
         }
     }
 
-    /// Totals wrap past a few hundred MiB; a span is at most a match, so differences stay exact.
-    fn with_literal_prefix<'b>(self, input: &[u8], prefix: &'b mut Vec<u32>) -> CostModel<'b>
+    fn with_literal_totals<'b>(self, totals: &'b LiteralTotals) -> CostModel<'b>
     where
         'a: 'b,
     {
-        prefix.clear();
-        prefix.reserve(input.len() + 1);
-        let mut total = 0u32;
-        prefix.push(total);
-        for &byte in input {
-            total = total.wrapping_add(self.literal_price(byte) as u32);
-            prefix.push(total);
-        }
         CostModel {
-            literal_prefix: Some(prefix),
+            literal_totals: Some(totals),
             ..self
         }
     }
@@ -1007,13 +1018,10 @@ impl<'a> CostModel<'a> {
         bits: usize,
         max_length: usize,
     ) -> Option<usize> {
-        let Some(prefix) = self.literal_prefix else {
+        let Some(totals) = self.literal_totals else {
             return (1..=max_length).find(|&length| self.literal_bits(input, pos, length) >= bits);
         };
-        let base = prefix[pos];
-        let span = &prefix[pos + 1..=pos + max_length];
-        let below = span.partition_point(|&total| (total.wrapping_sub(base) as usize) < bits);
-        (below < max_length).then_some(below + 1)
+        totals.shortest_reaching(pos, bits, max_length)
     }
 
     fn selected_cost(self, selected: SelectedMatch) -> Option<usize> {
@@ -1054,9 +1062,8 @@ impl<'a> CostModel<'a> {
     /// cannot be spelled that way at all. Price it high rather than free.
     fn literal_bits(self, input: &[u8], pos: usize, length: usize) -> usize {
         let end = (pos + length).min(input.len());
-        if let Some(prefix) = self.literal_prefix {
-            debug_assert_eq!(prefix.len(), input.len() + 1);
-            return prefix[end].wrapping_sub(prefix[pos]) as usize;
+        if let Some(totals) = self.literal_totals {
+            return totals.between(pos, end);
         }
         input[pos..end]
             .iter()
@@ -1073,6 +1080,51 @@ impl<'a> CostModel<'a> {
         let cost = self.selected_cost(selected)?;
         let saved = self.literal_bits(input, pos, selected.length());
         Some(saved as isize - cost as isize)
+    }
+}
+
+/// How far ahead each rebuild prices; re-pricing the overlapped reach costs under 1% at this span.
+const LITERAL_TOTALS_SPAN: usize = 64 * 1024;
+
+/// Totals over the stretch ahead of the parse only, since no span priced reaches further.
+#[derive(Debug, Default)]
+struct LiteralTotals {
+    base: usize,
+    totals: Vec<u32>,
+}
+
+impl LiteralTotals {
+    /// Rebuilds only when the parse has run past what was priced.
+    fn cover(&mut self, model: CostModel<'_>, input: &[u8], pos: usize, reach: usize) {
+        let want = pos.saturating_add(reach).min(input.len());
+        if pos >= self.base && want - self.base < self.totals.len() {
+            return;
+        }
+        let end = pos
+            .saturating_add(reach.max(LITERAL_TOTALS_SPAN))
+            .min(input.len());
+        self.base = pos;
+        self.totals.clear();
+        // Totals wrap past a few hundred MiB; a span is at most a match, so differences stay exact.
+        let mut total = 0u32;
+        self.totals.push(total);
+        for &byte in &input[pos..end] {
+            total = total.wrapping_add(model.literal_price(byte) as u32);
+            self.totals.push(total);
+        }
+    }
+
+    fn between(&self, pos: usize, end: usize) -> usize {
+        self.totals[end - self.base].wrapping_sub(self.totals[pos - self.base]) as usize
+    }
+
+    /// Totals only rise along a span, so a binary search finds the first length reaching `bits`.
+    fn shortest_reaching(&self, pos: usize, bits: usize, max_length: usize) -> Option<usize> {
+        let at = pos - self.base;
+        let base = self.totals[at];
+        let span = &self.totals[at + 1..=at + max_length];
+        let below = span.partition_point(|&total| (total.wrapping_sub(base) as usize) < bits);
+        (below < max_length).then_some(below + 1)
     }
 }
 
