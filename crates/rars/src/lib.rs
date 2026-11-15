@@ -136,7 +136,8 @@ use std::path::Path;
 pub use streaming::output::{WriterOutput, WriterVolumes};
 #[cfg(feature = "write")]
 pub use streaming::{
-    EntryReader, EntrySource, WriteCancellation, WriterResources, DEFAULT_WRITER_MEMORY_LIMIT,
+    default_writer_memory_limit, EntryReader, EntrySource, WriteCancellation, WriterResources,
+    DEFAULT_WRITER_MEMORY_LIMIT, DEFAULT_WRITER_MEMORY_PER_THREAD,
 };
 pub use timestamp::StoredTimestamp;
 pub use version::{ArchiveFamily, ArchiveVersion};

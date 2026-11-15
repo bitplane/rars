@@ -16,14 +16,15 @@ pub use encoder::{
     encode_lz_member_with_history_and_options, encode_lz_member_with_options, encode_table_lengths,
     encode_table_lengths_with_bit_count, EncodeOptions, Unpack50Encoder,
 };
+#[cfg(feature = "write")]
+pub(crate) use encoder::{
+    encode_filtered_run, encode_owned_member, filtered_owned_member, filtered_run_bytes,
+    streaming_blocks_with_allowance, BlockSplitter, LZ_BLOCK_SIZE, MAX_DELTA_CHANNELS,
+    MAX_LZ_BLOCK_SIZE,
+};
 #[cfg(all(test, feature = "write"))]
 pub(crate) use encoder::{
     encode_lz_member_with_options_and_progress, encode_lz_reader_to, filtered_lz_member,
-};
-#[cfg(feature = "write")]
-pub(crate) use encoder::{
-    encode_owned_member, filtered_owned_member, streaming_blocks_with_allowance, BlockSplitter,
-    LZ_BLOCK_SIZE, MAX_DELTA_CHANNELS, MAX_LZ_BLOCK_SIZE,
 };
 
 use super::filters::{self, DeltaErrorMessages};

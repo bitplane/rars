@@ -504,7 +504,7 @@ fn large_member_search_setup_failures_release_the_allowance() {
         for limit in [128, data.len() as u64 + 4096] {
             let filtered = Allowance::limited(limit);
             assert!(matches!(
-                filtered_lz_blocks(&data, &filters, &[], 0, options, None, &filtered),
+                filtered_lz_blocks(&data, &filters, &[], 0, true, 0, options, None, &filtered),
                 Err(Error::WorkspaceLimitExceeded(_))
             ));
             assert_eq!(filtered.used(), 0);
@@ -759,12 +759,21 @@ fn member_allocation_refusals_release_search_and_output_owners() {
         assert!(attempts > 1);
 
         let specs = [crate::FilterSpec::whole(crate::FilterKind::E8)];
-        let expected =
-            filtered_lz_blocks(&data, &specs, &[], 0, options, None, &Allowance::default())
-                .unwrap();
+        let expected = filtered_lz_blocks(
+            &data,
+            &specs,
+            &[],
+            0,
+            true,
+            0,
+            options,
+            None,
+            &Allowance::default(),
+        )
+        .unwrap();
         assert_eq!(decode_lz(&expected, 0, data.len()).unwrap(), data);
         let attempts = assert_each_allocation_refusal(|budget| {
-            filtered_lz_blocks(&data, &specs, &[], 0, options, None, budget)
+            filtered_lz_blocks(&data, &specs, &[], 0, true, 0, options, None, budget)
         });
         assert!(attempts > 1);
     }
@@ -780,6 +789,8 @@ fn filtered_multiblock_output_growth_refusals_release_storage() {
         &filters,
         &[],
         0,
+        true,
+        0,
         options,
         None,
         &Allowance::default(),
@@ -787,7 +798,7 @@ fn filtered_multiblock_output_growth_refusals_release_storage() {
     .unwrap();
     assert_eq!(decode_lz(&expected, 0, data.len()).unwrap(), data);
     assert_each_allocation_refusal(|budget| {
-        filtered_lz_blocks(&data, &filters, &[], 0, options, None, budget)
+        filtered_lz_blocks(&data, &filters, &[], 0, true, 0, options, None, budget)
     });
 }
 

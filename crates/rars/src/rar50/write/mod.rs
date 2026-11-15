@@ -287,7 +287,7 @@ pub fn write_streaming_volumes_with_progress(
                 options,
                 extras.filter_policy,
                 dictionary_reach(entries, options.features.solid),
-                resources.memory_limit(),
+                resources.planning_memory_limit(),
                 resources,
             )?,
             recovery_percent: extras.recovery_percent,
@@ -435,7 +435,7 @@ pub(crate) fn write_streaming_archive_reporting(
                 options,
                 extras.filter_policy,
                 dictionary_reach(entries, options.features.solid),
-                resources.memory_limit(),
+                resources.planning_memory_limit(),
                 resources,
             )?,
             recovery_percent,
@@ -600,11 +600,41 @@ fn source_integrity_with_allowance<B: crate::codec::workspace::Budget>(
 /// those with room to spare, and the fifth byte per window position absorbs the
 /// rest rather than pretending to predict it.
 ///
-/// The optimal parse searches a binary tree instead of hash chains, and a tree
-/// holds two links per window position where a chain holds one. So it is eight
-/// bytes per byte of window rather than four, and the charge doubles the links
-/// and keeps the one byte of slack. Measured on the same 16 MiB member, over
-/// the member, against a 512-candidate parse:
+/// The optimal parse in a block job searches the packed hash chains rather than
+/// a tree, and spends most of its workspace on the match runs it collects for a
+/// block: about six per position on two-symbol noise, the worst found, against
+/// one on real data. Counted allocation peaks per job under `--max-memory`,
+/// level 3, over 16 MiB (4 MiB dictionary) and 64 MiB (16 MiB) members:
+///
+/// ```text
+/// input                 4 MiB dict   16 MiB dict
+/// text                    36.2 MiB      136.0 MiB
+/// binary                  33.7 MiB      126.1 MiB
+/// random                  47.3 MiB      168.7 MiB
+/// three-symbol noise      96.0 MiB
+/// two-symbol noise       125.2 MiB      199.1 MiB
+/// ```
+///
+/// Random data costs the most per window byte, 654 MiB at a 64 MiB dictionary,
+/// because its chain deltas pack worst. Noise costs the most per block byte.
+/// The charge covers both at once: 151 MiB at 4 MiB, 307 MiB at 16 MiB.
+///
+/// `block_size` is the largest block the parse can be holding, not the size the
+/// reader asks for: a block grows past that when the data it covers is not
+/// moving, and the parse's arrays grow with it. See
+/// [`crate::codec::rar50::MAX_LZ_BLOCK_SIZE`].
+fn streaming_lz_workspace(dictionary_size: u64, block_size: usize, optimal_parse: bool) -> u64 {
+    if optimal_parse {
+        return lz_workspace(dictionary_size, block_size, 13, 96);
+    }
+    lz_workspace(dictionary_size, block_size, 13, 64)
+}
+
+/// What a whole-member optimal parse holds besides the member copies. It
+/// searches a binary tree, two links per window position, and on low-entropy
+/// data the tree reports far more runs per position than the chains do: two-
+/// symbol noise peaks at 233 MB counted at 4 MiB of input, against 247 MB charged.
+/// Measured on 16 MiB of manpage text at level 5, resident:
 ///
 /// ```text
 /// dictionary    measured    tree links alone
@@ -619,22 +649,20 @@ fn source_integrity_with_allowance<B: crate::codec::workspace::Budget>(
 /// 16 MiB window: the pages behind the untouched slots never become resident.
 /// The charge covers the allocation anyway, since data that does fill the
 /// window will touch them.
-///
-/// `block_size` is the largest block the parse can be holding, not the size the
-/// reader asks for: a block grows past that when the data it covers is not
-/// moving, and the parse's arrays grow with it. See
-/// [`crate::codec::rar50::MAX_LZ_BLOCK_SIZE`].
-fn streaming_lz_workspace(dictionary_size: u64, block_size: usize, optimal_parse: bool) -> u64 {
+fn tree_lz_workspace(reach: u64, block_size: usize) -> u64 {
+    lz_workspace(reach, block_size, 17, 160)
+}
+
+fn lz_workspace(window: u64, block_size: usize, per_window_byte: u64, per_block_byte: u64) -> u64 {
     // Runs retain up to a dictionary of new input as well as history and
     // combined search bytes. Charge those buffers alongside finder links.
-    let per_window_byte = if optimal_parse { 17 } else { 13 };
-    dictionary_size
+    window
         .checked_next_power_of_two()
-        .unwrap_or(dictionary_size)
+        .unwrap_or(window)
         .saturating_mul(per_window_byte)
         // Repricing can retain an earlier winner beside the current and next
-        // token streams, in addition to the reused DP arrays and match cache.
-        .saturating_add((block_size as u64).saturating_mul(if optimal_parse { 160 } else { 64 }))
+        // token streams, in addition to the reused DP arrays and match runs.
+        .saturating_add((block_size as u64).saturating_mul(per_block_byte))
         .saturating_add(3 * 1024 * 1024)
 }
 
@@ -1749,7 +1777,7 @@ mod tests {
             (8 * 1024 * 1024, 75_390_976),
         ];
         for (dictionary, peak) in measured {
-            let charged = streaming_lz_workspace(dictionary, block, true);
+            let charged = tree_lz_workspace(dictionary, block);
             let chain = streaming_lz_workspace(dictionary, block, false);
             assert!(
                 charged > chain,
@@ -1764,6 +1792,20 @@ mod tests {
                 charged + copies >= peak,
                 "a {dictionary}-byte dictionary measured {peak} against a charge of {charged}",
             );
+        }
+    }
+
+    /// Counted allocation peaks for one block job, from the ledger under
+    /// `--max-memory`: the worst input per dictionary from the table on
+    /// [`streaming_lz_workspace`]. A job that outgrows its charge fails there.
+    #[test]
+    fn the_block_job_charge_covers_its_counted_peaks() {
+        const MIB: f64 = 1024.0 * 1024.0;
+        let block = crate::codec::rar50::MAX_LZ_BLOCK_SIZE;
+        for (dictionary, peak) in [(4u64, 125.2), (16, 199.1), (64, 654.3)] {
+            let charged = streaming_lz_workspace(dictionary << 20, block, true);
+            let peak = (peak * MIB) as u64;
+            assert!(charged >= peak, "{dictionary} MiB: {charged} < {peak}");
         }
     }
 

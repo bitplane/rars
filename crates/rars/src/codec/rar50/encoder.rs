@@ -509,6 +509,11 @@ pub struct EncodeOptions {
     pub lazy_lookahead: usize,
     pub max_match_distance: usize,
     pub optimal_parse: bool,
+    /// A match this long is taken without searching or pricing the positions
+    /// it covers. Held between 8 and the longest match the encoder emits.
+    pub nice_match_length: usize,
+    /// How many times the optimal parse prices each block, at least once.
+    pub parse_passes: usize,
 }
 
 impl EncodeOptions {
@@ -519,7 +524,23 @@ impl EncodeOptions {
             lazy_lookahead: 1,
             max_match_distance: MAX_ENCODER_MATCH_OFFSET,
             optimal_parse: false,
+            nice_match_length: NICE_MATCH_LENGTH,
+            parse_passes: OPTIMAL_PARSE_PASSES,
         }
+    }
+
+    pub const fn with_nice_match_length(mut self, length: usize) -> Self {
+        self.nice_match_length = length;
+        self
+    }
+
+    pub const fn with_parse_passes(mut self, passes: usize) -> Self {
+        self.parse_passes = passes;
+        self
+    }
+
+    fn nice(&self) -> usize {
+        self.nice_match_length.clamp(8, MAX_ENCODER_MATCH_LENGTH)
     }
 
     pub const fn with_optimal_parse(mut self, enabled: bool) -> Self {
@@ -854,6 +875,47 @@ pub(crate) fn filtered_lz_member(
         .map(|(data, records)| (data.into_vec(), records.into_vec()))
 }
 
+/// The bytes a decoder's window holds after [`encode_filtered_run`] codes
+/// `data`, which starts `file_offset` bytes into its member, with `filters`.
+pub(crate) fn filtered_run_bytes<B: Budget>(
+    data: &[u8],
+    filters: &[crate::FilterSpec],
+    file_offset: usize,
+    allowance: &B,
+) -> Result<Buffer<u8, B>> {
+    let mut filtered = Buffer::copied(data, allowance)?;
+    filter_blocks_in_place(&mut filtered, filters, file_offset, allowance)?;
+    Ok(filtered)
+}
+
+/// One run of a member, `file_offset` bytes in, with `filters` ranged over the
+/// run. `history` is what the window already holds, so it is filtered bytes
+/// wherever earlier runs were filtered.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_filtered_run<B: Budget>(
+    data: &[u8],
+    filters: &[crate::FilterSpec],
+    history: &[u8],
+    file_offset: usize,
+    is_last: bool,
+    algorithm_version: u8,
+    options: EncodeOptions,
+    progress: Option<&mut dyn FnMut(usize) -> bool>,
+    allowance: &B,
+) -> Result<Buffer<u8, B>> {
+    filtered_lz_blocks(
+        data,
+        filters,
+        history,
+        file_offset,
+        is_last,
+        algorithm_version,
+        options,
+        progress,
+        allowance,
+    )
+}
+
 fn filtered_member_with_allowance<B: Budget>(
     data: &[u8],
     filters: &[crate::FilterSpec],
@@ -934,51 +996,22 @@ fn encode_filter_data<B: Budget>(
 /// cost [`encode_lz_member_inner`] took off the unfiltered path and left
 /// here: at 64 KiB a block, a four-megabyte member re-copied and re-inserted
 /// 126 MiB of history, thirty-one times what it holds.
+#[allow(clippy::too_many_arguments)]
 fn filtered_lz_blocks<B: Budget>(
     data: &[u8],
     filters: &[crate::FilterSpec],
     history: &[u8],
+    file_offset: usize,
+    is_last: bool,
     algorithm_version: u8,
     options: EncodeOptions,
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
     allowance: &B,
 ) -> Result<Buffer<u8, B>> {
-    let filters = normalized_filter_specs(data.len(), filters, allowance)?;
     let history = &history[history.len().saturating_sub(options.max_match_distance)..];
     let start = history.len();
     let mut combined = Buffer::from_slices(&[history, data], allowance)?;
-
-    let mut blocks = Buffer::new(allowance);
-    let mut chunk_start = 0usize;
-    while chunk_start < data.len() {
-        let chunk_end = (chunk_start + FILTERED_LZ_BLOCK_SIZE).min(data.len());
-        let mut records = Buffer::new(allowance);
-        for filter in filters.iter() {
-            let filter_start = filter.range.start.max(chunk_start);
-            let filter_end = filter.range.end.min(chunk_end);
-            if filter_start >= filter_end {
-                continue;
-            }
-            let (filter_type, channels) = encode_filter_data(
-                filter.kind,
-                &mut combined[start + filter_start..start + filter_end],
-                filter_start,
-                allowance,
-            )?;
-            records
-                .push(EncodeFilter {
-                    offset: filter_start - chunk_start,
-                    length: filter_end - filter_start,
-                    filter_type,
-                    channels,
-                })
-                .map_err(Into::into)?;
-        }
-        blocks
-            .push((chunk_start..chunk_end, records))
-            .map_err(Into::into)?;
-        chunk_start = chunk_end;
-    }
+    let blocks = filter_blocks_in_place(&mut combined[start..], filters, file_offset, allowance)?;
 
     // One search state for the whole member, as the unfiltered path has.
     let mut search = if options.optimal_parse {
@@ -1005,13 +1038,61 @@ fn filtered_lz_blocks<B: Budget>(
             algorithm_version,
             &records,
             options,
-            block.end == data.len(),
+            is_last && block.end == data.len(),
             Some(&mut chunk_progress),
             allowance,
         )?;
         out.extend_from_slice(&packed).map_err(Into::into)?;
     }
     Ok(out)
+}
+
+type FilteredBlocks<B> = Buffer<(Range<usize>, Buffer<EncodeFilter, B>), B>;
+
+/// Transforms `data`, which starts `file_offset` bytes into its member, one
+/// [`FILTERED_LZ_BLOCK_SIZE`] block at a time, which is how the decoder undoes
+/// it: a filter record covers one block, so an x86 call or a delta plane that
+/// straddles a cut converts on each side separately. Returns each block's range
+/// and records.
+fn filter_blocks_in_place<B: Budget>(
+    data: &mut [u8],
+    filters: &[crate::FilterSpec],
+    file_offset: usize,
+    allowance: &B,
+) -> Result<FilteredBlocks<B>> {
+    let filters = normalized_filter_specs(data.len(), filters, allowance)?;
+    let mut blocks = Buffer::new(allowance);
+    let mut chunk_start = 0usize;
+    while chunk_start < data.len() {
+        let chunk_end = (chunk_start + FILTERED_LZ_BLOCK_SIZE).min(data.len());
+        let mut records = Buffer::new(allowance);
+        for filter in filters.iter() {
+            let filter_start = filter.range.start.max(chunk_start);
+            let filter_end = filter.range.end.min(chunk_end);
+            if filter_start >= filter_end {
+                continue;
+            }
+            let (filter_type, channels) = encode_filter_data(
+                filter.kind,
+                &mut data[filter_start..filter_end],
+                file_offset + filter_start,
+                allowance,
+            )?;
+            records
+                .push(EncodeFilter {
+                    offset: filter_start - chunk_start,
+                    length: filter_end - filter_start,
+                    filter_type,
+                    channels,
+                })
+                .map_err(Into::into)?;
+        }
+        blocks
+            .push((chunk_start..chunk_end, records))
+            .map_err(Into::into)?;
+        chunk_start = chunk_end;
+    }
+    Ok(blocks)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1450,7 +1531,7 @@ impl<B: Budget> OptimalCollector<B> {
                     block,
                     options.max_match_distance,
                     options.max_match_candidates,
-                    NICE_MATCH_LENGTH,
+                    options.nice(),
                     MAX_ENCODER_MATCH_LENGTH,
                     &mut matches.runs,
                     &mut matches.starts,
@@ -1483,7 +1564,7 @@ impl<B: Budget> OptimalCollector<B> {
                     // alternatives. A match that reaches that far is measured
                     // out to its real end, which is the length the parse
                     // commits to and steps over.
-                    let len_limit = avail.min(NICE_MATCH_LENGTH);
+                    let len_limit = avail.min(options.nice());
                     tree.matches(
                         combined,
                         pos,
@@ -1523,7 +1604,7 @@ impl<B: Budget> OptimalCollector<B> {
                             max_length,
                             max_distance,
                             options.max_match_candidates,
-                            NICE_MATCH_LENGTH,
+                            options.nice(),
                             &mut matches.runs,
                         )
                         .map_err(Into::into)?;
@@ -1535,7 +1616,7 @@ impl<B: Budget> OptimalCollector<B> {
                 let reach = (length as usize)
                     .min(block.end - pos)
                     .min(MAX_ENCODER_MATCH_LENGTH);
-                if reach >= NICE_MATCH_LENGTH {
+                if reach >= options.nice() {
                     committed_through = pos + reach;
                 }
             }
@@ -1833,6 +1914,8 @@ impl<B: Budget> EncoderState<B> {
                 input,
                 filters,
                 &self.history,
+                0,
+                true,
                 version,
                 self.options,
                 progress,
@@ -2470,6 +2553,7 @@ fn price_optimal_paths_with_state<const RING: bool>(
     // priced from the positions before it. See [`NICE_MATCH_LENGTH`].
     let mut committed_through = 0usize;
     let match_prices = OptimalMatchPrices::new(prices);
+    let nice = options.nice();
 
     for index in 0..span {
         let pos = start + index;
@@ -2589,7 +2673,7 @@ fn price_optimal_paths_with_state<const RING: bool>(
             .iter()
             .map(|&(_, end, _)| end)
             .max()
-            .filter(|&length| length >= NICE_MATCH_LENGTH);
+            .filter(|&length| length >= nice);
         for &(run_start, run_end, distance) in reaches.iter() {
             let mut length = run_start.max(4);
             if let Some(committed) = committed_reach {
@@ -2621,12 +2705,12 @@ fn price_optimal_paths_with_state<const RING: bool>(
             }
         }
 
-        // A committed match is at least 512 bytes long. Even after the
+        // A committed match is at least eight bytes long. Even after the
         // distance bonus, that length and every collected u32 distance fit
         // their encoder tables, so the endpoint has already been priced.
         let longest_reach = reaches.iter().map(|&(_, length, _)| length).max();
         if let Some(reach) = longest_reach {
-            if reach >= NICE_MATCH_LENGTH {
+            if reach >= nice {
                 committed_through = index + reach;
             }
         }
@@ -2834,7 +2918,7 @@ fn encode_tokens_with_allowance<B: Budget>(
         let passes = if !B::LIMITED && matches.runs.is_empty() {
             1
         } else {
-            OPTIMAL_PARSE_PASSES
+            options.parse_passes.max(1)
         };
         let mut best = None;
         for _ in 1..passes {
@@ -3034,7 +3118,7 @@ fn best_match<B: Budget>(
         consider_match_candidate(&mut best, state, distance_size, length, distance);
     }
     if let Some(best) = best {
-        if best.length == max_length || best.length >= NICE_MATCH_LENGTH {
+        if best.length == max_length || best.length >= options.nice() {
             return Some(best);
         }
     }
@@ -3055,7 +3139,7 @@ fn best_match<B: Budget>(
                 consider_match_candidate(&mut best, state, distance_size, length, distance);
             }
             if let Some(best) = best {
-                if best.length == max_length || best.length >= NICE_MATCH_LENGTH {
+                if best.length == max_length || best.length >= options.nice() {
                     break;
                 }
             }

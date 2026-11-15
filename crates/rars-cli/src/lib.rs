@@ -1650,9 +1650,9 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
     features.solid = solid;
     features.header_encryption = header_encryption;
     let password = password_bytes(&password);
-    let resources = rars::WriterResources::new(
-        memory_limit.map_or(rars::DEFAULT_WRITER_MEMORY_LIMIT, |limit| limit as u64),
-    );
+    let resources = memory_limit.map_or_else(rars::WriterResources::default, |limit| {
+        rars::WriterResources::new(limit as u64)
+    });
     progress.bar("Compressing archive", total);
 
     write_archive_streaming(&archive_path, |output| {
@@ -2044,9 +2044,9 @@ fn write_plain_rar50_streaming(
     let default_temp = archive_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty());
-    let mut resources = rars::WriterResources::new(
-        memory_limit.map_or(rars::DEFAULT_WRITER_MEMORY_LIMIT, |limit| limit as u64),
-    );
+    let mut resources = memory_limit.map_or_else(rars::WriterResources::default, |limit| {
+        rars::WriterResources::new(limit as u64)
+    });
     if let Some(limit) = max_memory {
         resources = resources.with_max_memory_bytes(limit as u64);
     }
