@@ -55,6 +55,19 @@ fn prepared_run_prices_preserve_every_length_and_distance_boundary() {
                                 "seed={seed}, actual={}, state={state:?}, distance={distance}, length={length}, table={distance_size}",
                                 prices.is_some(),
                             );
+                            // Every length a span covers costs what it says.
+                            let span = run.as_ref().and_then(|run| run.span(length));
+                            assert_eq!(span.map(|(cost, _)| cost), expected);
+                            if let (Some(run), Some((cost, last))) = (&run, span) {
+                                assert!(last >= length);
+                                for covered in length..=last.min(MAX_ENCODER_MATCH_LENGTH) {
+                                    assert_eq!(
+                                        run.cost(covered),
+                                        Some(cost),
+                                        "length={length}, covered={covered}"
+                                    );
+                                }
+                            }
                         }
                     }
                 }

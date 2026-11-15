@@ -2447,6 +2447,35 @@ impl OptimalMatchPrices {
 }
 
 impl MatchRunPrice<'_> {
+    /// The cost of `length`, and the longest length from there that costs the
+    /// same: the end of its length slot, or just short of the remembered last
+    /// length, which is priced on its own.
+    #[inline]
+    fn span(&self, length: usize) -> Option<(u32, usize)> {
+        if self.last_length == Some(length) {
+            return Some((self.last_repeat, length));
+        }
+        let encoded = length.checked_sub(self.bonus)?;
+        if encoded < 2 {
+            return None;
+        }
+        let (slot, _) = length_slot_for_valid_match(encoded);
+        let value = encoded - 2;
+        let slot_last = if value < 8 {
+            value
+        } else {
+            value | ((1 << (value.ilog2() - 2)) - 1)
+        };
+        let mut last = slot_last + 2 + self.bonus;
+        if let Some(repeat) = self.last_length {
+            if repeat > length && repeat <= last {
+                last = repeat - 1;
+            }
+        }
+        Some((self.distance + self.lengths[slot], last))
+    }
+
+    #[cfg(test)]
     #[inline]
     fn cost(&self, length: usize) -> Option<u32> {
         if self.last_length == Some(length) {
@@ -2671,10 +2700,16 @@ fn price_optimal_paths_with_state<const RING: bool>(
             let Ok(run_price) = match_prices.run(&state, distance, distance_size, prices) else {
                 continue;
             };
+            // Lengths in one slot cost the same, so each span of them is
+            // priced once and its targets only compared.
             while length <= run_end {
-                let reach = length;
-                if let Some(cost) = run_price.cost(reach) {
-                    let reached = here.saturating_add(cost);
+                let Some((cost, last)) = run_price.span(length) else {
+                    length += 1;
+                    continue;
+                };
+                let reached = here.saturating_add(cost);
+                let last = last.min(run_end);
+                for reach in length..=last {
                     let target = index + reach;
                     if reached < price[target] {
                         price[target] = reached;
@@ -2682,7 +2717,7 @@ fn price_optimal_paths_with_state<const RING: bool>(
                         arrive_distance[target] = distance as u32;
                     }
                 }
-                length = reach + 1;
+                length = last + 1;
             }
         }
 
