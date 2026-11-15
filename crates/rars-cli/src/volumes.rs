@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 pub(crate) fn volume_part_path(first_path: &Path, index: usize) -> CliResult<PathBuf> {
     Ok(rars::volume_name::old_style(first_path, index)
-        .ok_or("RAR 1.4 old-style volume names only support .r00 through .r99 here")?)
+        .ok_or("old-style volume names run out after .z99")?)
 }
 
 pub(crate) fn rar50_volume_part_path(
@@ -16,6 +16,21 @@ pub(crate) fn rar50_volume_part_path(
     let width = total_parts.to_string().len().max(2);
     Ok(rars::volume_name::part_style(first_path, index, width)
         .ok_or("RAR 5 volume path needs a file name")?)
+}
+
+/// The volume index of an old-style extension, the reverse of `volume_part_path`.
+pub(crate) fn old_style_index(extension: &[u8]) -> Option<usize> {
+    let &[letter, tens, units] = extension else {
+        return None;
+    };
+    let step = letter
+        .to_ascii_lowercase()
+        .checked_sub(b'r')
+        .filter(|&step| step <= b'z' - b'r')?;
+    if !tens.is_ascii_digit() || !units.is_ascii_digit() {
+        return None;
+    }
+    Some(1 + usize::from(step) * 100 + usize::from(tens - b'0') * 10 + usize::from(units - b'0'))
 }
 
 pub(crate) fn sort_volume_paths(paths: &mut [PathBuf]) {
@@ -50,6 +65,22 @@ pub(crate) fn discover_sibling_volumes(first_path: &Path) -> Vec<PathBuf> {
         paths.push(first_path.to_path_buf());
     }
     sort_volume_paths(&mut paths);
+    // Only a set that reaches .r99 goes on to .s00, so a stray .s01 or a
+    // split zip's .z01 beside a short set is not one of its volumes.
+    let mut previous = None;
+    paths.retain(|path| {
+        let index = path
+            .extension()
+            .and_then(|extension| old_style_index(extension.as_encoded_bytes()));
+        match index {
+            Some(index) if index > 100 && previous != Some(index - 1) => false,
+            Some(index) => {
+                previous = Some(index);
+                true
+            }
+            None => true,
+        }
+    });
     paths
 }
 
@@ -83,8 +114,8 @@ fn volume_name_key(path: &Path) -> Option<Vec<u8>> {
     }
     if lower.ends_with(b".rar")
         || (lower.len() >= 4
-            && lower[lower.len() - 4..lower.len() - 2] == *b".r"
-            && lower[lower.len() - 2..].iter().all(u8::is_ascii_digit))
+            && lower[lower.len() - 4] == b'.'
+            && old_style_index(&lower[lower.len() - 3..]).is_some())
     {
         return Some([b"old:".as_slice(), &name[..name.len() - 4]].concat());
     }
@@ -106,11 +137,7 @@ fn volume_sort_key(path: &Path) -> Option<usize> {
     if lower.ends_with(b".rar") {
         return Some(0);
     }
-    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-    if ext.len() == 3 && ext.starts_with('r') {
-        return ext[1..].parse::<usize>().ok().map(|index| index + 1);
-    }
-    None
+    old_style_index(path.extension()?.as_encoded_bytes())
 }
 
 pub(crate) fn path_has_extension(path: &Path, extension: &str) -> bool {
@@ -197,7 +224,11 @@ mod tests {
             volume_part_path(first, 100).unwrap(),
             Path::new("dir/set.r99")
         );
-        assert!(volume_part_path(first, 101).is_err());
+        assert_eq!(
+            volume_part_path(first, 101).unwrap(),
+            Path::new("dir/set.s00")
+        );
+        assert!(volume_part_path(first, 901).is_err());
         // The letter follows the first extension's, as RAR 3.93 -vn names them.
         for (input, expected) in [
             ("set.RAR", "set.R00"),
@@ -237,6 +268,9 @@ mod tests {
         for (name, expected) in [
             ("set.rar", Some(0)),
             ("set.R99", Some(100)),
+            ("set.s00", Some(101)),
+            ("set.Z99", Some(900)),
+            ("set.q00", None),
             ("set.part2.rar", Some(1)),
             ("set.part0.rar", None),
             ("set.part.rar", None),
@@ -292,6 +326,40 @@ mod tests {
         );
         let lone = dir.join("lone.exe");
         assert_eq!(discover_sibling_volumes(&lone), vec![lone]);
+    }
+
+    #[test]
+    fn old_style_indices_read_back_the_names_volume_part_path_gives() {
+        for (extension, expected) in [
+            (&b"r00"[..], Some(1)),
+            (b"R99", Some(100)),
+            (b"s00", Some(101)),
+            (b"z99", Some(900)),
+            (b"q99", None),
+            (b"r1x", None),
+            (b"r100", None),
+            (b"rar", None),
+        ] {
+            assert_eq!(old_style_index(extension), expected, "{extension:?}");
+        }
+    }
+
+    #[test]
+    fn discovery_takes_letters_past_r_only_when_the_set_reaches_them() {
+        let dir = crate::scratch::case("volume-discovery-rolled-letters");
+        let mut long = vec![dir.join("long.rar")];
+        long.extend((1..=102).map(|index| volume_part_path(&dir.join("long.rar"), index).unwrap()));
+        for path in &long {
+            fs::write(path, []).unwrap();
+        }
+        for name in ["short.rar", "short.r00", "short.s01", "short.z01"] {
+            fs::write(dir.join(name), []).unwrap();
+        }
+        assert_eq!(discover_sibling_volumes(&dir.join("long.rar")), long);
+        assert_eq!(
+            discover_sibling_volumes(&dir.join("short.rar")),
+            vec![dir.join("short.rar"), dir.join("short.r00")]
+        );
     }
 
     #[test]

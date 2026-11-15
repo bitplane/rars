@@ -2,23 +2,20 @@
 
 use std::path::{Path, PathBuf};
 
-/// Volume `index` as `.rar`, `.r00`, ..., `.r99`, with `.R00` after an upper-case extension
-/// such as `.RAR` or a DOS `.EXE`; RAR documents no name past `.r99`.
+/// Volume `index` as `.r00` on, rolling `.r99` to `.s00` up to `.z99` as rar 4.2's `-vn` does; upper case follows the first extension's.
 pub fn old_style(first: &Path, index: usize) -> Option<PathBuf> {
     let Some(number) = index.checked_sub(1) else {
         return Some(first.to_path_buf());
     };
-    if number > 99 {
-        return None;
-    }
-    let letter = match first
+    let step = u8::try_from(number / 100)
+        .ok()
+        .filter(|&step| step <= b'z' - b'r')?;
+    let upper = first
         .extension()
         .and_then(|extension| extension.as_encoded_bytes().first())
-    {
-        Some(letter) if letter.is_ascii_uppercase() => 'R',
-        _ => 'r',
-    };
-    Some(first.with_extension(format!("{letter}{number:02}")))
+        .is_some_and(u8::is_ascii_uppercase);
+    let letter = if upper { b'R' } else { b'r' } + step;
+    Some(first.with_extension(format!("{}{:02}", letter as char, number % 100)))
 }
 
 /// Volume `index` as `name.partN.rar`, keeping the first volume's `.RAR` case as RAR does.
@@ -89,15 +86,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn old_style_names_stop_at_r99() {
+    fn old_style_names_roll_from_r99_to_s00_as_rar_4_does() {
         let first = Path::new("dir/set.rar");
-        for (index, expected) in [(0, "dir/set.rar"), (1, "dir/set.r00"), (100, "dir/set.r99")] {
+        for (index, expected) in [
+            (0, "dir/set.rar"),
+            (1, "dir/set.r00"),
+            (100, "dir/set.r99"),
+            (101, "dir/set.s00"),
+            (200, "dir/set.s99"),
+            (201, "dir/set.t00"),
+            (900, "dir/set.z99"),
+        ] {
             assert_eq!(
                 old_style(first, index).as_deref(),
                 Some(Path::new(expected))
             );
         }
-        assert_eq!(old_style(first, 101), None);
+        assert_eq!(old_style(first, 901), None);
+        assert_eq!(
+            old_style(Path::new("SET.RAR"), 101).as_deref(),
+            Some(Path::new("SET.S00"))
+        );
         for (input, expected) in [
             ("set.RAR", "set.R00"),
             ("set.Rar", "set.R00"),

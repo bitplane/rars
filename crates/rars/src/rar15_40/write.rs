@@ -2795,7 +2795,7 @@ fn validate_volume_member(name: &[u8], target: ArchiveVersion, unpacked_size: u6
     validate_member(name, target, unpacked_size)?;
     if unpacked_size > MAX_SHORT_SIZE {
         return Err(Error::InvalidArgument(
-            "legacy volume sets cannot hold a member over 4 GiB",
+            "compressed legacy volume sets cannot hold a member over 4 GiB",
         ));
     }
     Ok(())

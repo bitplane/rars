@@ -58,7 +58,7 @@ pub(super) fn split_stored(
     validate_plan(options, PlanShape::new().volumes(true), false, false)?;
     let name = member.name;
     let source_len = member.bytes.len()?;
-    validate_volume_member(name, options.target, source_len).map_err(|error| {
+    validate_member(name, options.target, source_len).map_err(|error| {
         crate::write_stream::member_error(error, name, "preparing volume member")
     })?;
     if member.file_comment.is_some() {

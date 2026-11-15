@@ -377,7 +377,7 @@ fn stored_legacy_volumes_refuse_unnameable_sets_before_writing() {
     let root = scratch("legacy-stored-volume-names");
     let source = root.join("payload.bin");
     let archive = root.join("split.rar");
-    fs::write(&source, deterministic_noise(200_000)).unwrap();
+    fs::write(&source, deterministic_noise(1_000_000)).unwrap();
     let create = rars()
         .args(["add", "--format", "rar40", "--store", "--volume-size", "1k"])
         .arg(&archive)
@@ -385,7 +385,7 @@ fn stored_legacy_volumes_refuse_unnameable_sets_before_writing() {
         .output()
         .unwrap();
     assert!(!create.status.success());
-    assert!(stderr(&create).contains(".r99"), "{}", stderr(&create));
+    assert!(stderr(&create).contains(".z99"), "{}", stderr(&create));
     let left: Vec<_> = fs::read_dir(&root)
         .unwrap()
         .map(|e| e.unwrap().file_name())
@@ -1023,7 +1023,7 @@ fn legacy_volume_name_exhaustion_preserves_existing_archives() {
     let source = root.join("p");
     let archive = root.join("archive.rar");
     let second = root.join("archive.r00");
-    fs::write(&source, deterministic_noise(10000)).unwrap();
+    fs::write(&source, deterministic_noise(200_000)).unwrap();
     fs::write(&archive, b"existing archive").unwrap();
     fs::write(&second, b"existing second volume").unwrap();
     let output = rars()
@@ -1041,7 +1041,7 @@ fn legacy_volume_name_exhaustion_preserves_existing_archives() {
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
     assert!(
-        stderr(&output).contains(".r00 through .r99"),
+        stderr(&output).contains("run out after .z99"),
         "{}",
         stderr(&output)
     );
