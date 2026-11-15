@@ -3010,6 +3010,28 @@ mod tests {
     }
 
     #[test]
+    fn winrar_htb_fragments_hash_the_bytes_each_volume_stores() {
+        let parts: [&[u8]; 3] = [
+            include_bytes!("../tests/fixtures/rar50/htb_multivol.part1.rar"),
+            include_bytes!("../tests/fixtures/rar50/htb_multivol.part2.rar"),
+            include_bytes!("../tests/fixtures/rar50/htb_multivol.part3.rar"),
+        ];
+        let mut member = Vec::new();
+        for (index, part) in parts.iter().enumerate() {
+            let archive = Archive::parse(part).unwrap();
+            let file = archive.files().next().unwrap();
+            let stored = file.packed_data(&archive).unwrap();
+            member.extend_from_slice(&stored);
+            assert_eq!(file.data_crc32, None, "volume {}", index + 1);
+            let hash = &file.hash.as_ref().unwrap().data;
+            match file.is_split_after() {
+                true => assert_eq!(hash, &blake2sp::hash(&stored), "volume {}", index + 1),
+                false => assert_eq!(hash, &blake2sp::hash(&member)),
+            }
+        }
+    }
+
+    #[test]
     fn recovery_record_distinguishes_other_services_and_rejects_missing_or_extra_data() {
         let archive = build_archive_with_optional_comment(None);
         let mut file = archive.files().next().unwrap().clone();
