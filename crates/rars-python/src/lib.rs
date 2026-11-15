@@ -955,6 +955,55 @@ impl RarFile {
         self.archive.rewrite_preservation_issues()
     }
 
+    /// Stops at the first volume missing or unreadable rather than raising, so clean-up gets what is there.
+    fn volume_paths(&self, py: Python<'_>) -> PyResult<Vec<PathBuf>> {
+        let Some(first_path) = &self.path else {
+            return Err(PyValueError::new_err(
+                "an archive opened from bytes has no volume paths",
+            ));
+        };
+        if !self.archive.is_volume() {
+            return Ok(vec![first_path.clone()]);
+        }
+        if !starts_set(&self.archive) {
+            return Err(PyValueError::new_err(
+                "volume_paths names a set's volumes from its first volume, and this is a later one",
+            ));
+        }
+        let options = self.extraction_options(self.options.as_ref(), self.password.as_deref());
+        let mut paths = vec![first_path.clone()];
+        let mut index = 0;
+        let readable = with_volume_sources(
+            py,
+            &self.archive,
+            options,
+            || {
+                index += 1;
+                let path = self
+                    .archive
+                    .volume_path(first_path, index)
+                    .filter(|path| path.is_file());
+                paths.extend(path.clone());
+                Ok(path.map(VolumeSource::Path))
+            },
+            |volumes| {
+                let mut readable = 1;
+                let mut end = volume_end(&self.archive);
+                while end != VolumeEnd::Last {
+                    let Some(Ok(volume)) = volumes.next() else {
+                        break;
+                    };
+                    readable += 1;
+                    end = volume_end(&volume);
+                }
+                Ok(readable)
+            },
+        )?
+        .map_err(map_error)?;
+        paths.truncate(readable);
+        Ok(paths)
+    }
+
     #[getter]
     fn sfx_offset(&self) -> usize {
         self.archive.sfx_offset()
