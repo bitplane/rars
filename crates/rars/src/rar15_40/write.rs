@@ -1372,10 +1372,38 @@ fn member_workspace(
         0
     };
     unpacked
-        .saturating_mul(2)
+        .saturating_mul(held_per_byte(options))
         .saturating_add(dictionary.saturating_mul(12))
         .saturating_add(ppmd_models)
         .saturating_add(2 * 1024 * 1024)
+}
+
+/// Bytes held per member byte while it is coded.
+///
+/// The RAR 2.0 shortest-path parse keeps a 32-byte node and the match list for
+/// every position of the member. Peak RSS of one member at one thread on brett,
+/// in bytes per input byte:
+///
+/// ```text
+///              2 MiB   8 MiB   32 MiB
+/// rar20 m3      9-11     4-5       3
+/// rar20 m4-5   47-50   47-50   45-46
+/// rar15 m3, m5 12-13      12      11
+/// ```
+///
+/// Charged 2 per byte, 32 threads admitted 32 8 MiB RAR 2.0 members at once
+/// against a 5.2 GB budget, and peaked at 9.2 GB.
+fn held_per_byte(options: WriterOptions) -> u64 {
+    match options.target {
+        ArchiveVersion::Rar15 => 12,
+        ArchiveVersion::Rar20
+            if rar20_encode_options_for_options(options)
+                .is_ok_and(|options| options.optimal_parse) =>
+        {
+            50
+        }
+        _ => 2,
+    }
 }
 
 /// Codes one member, holding its bytes only while it is being coded.
@@ -3152,6 +3180,22 @@ mod tests {
             super::member_workspace(options, size, false, false),
             1024 * 1024
         );
+    }
+
+    #[test]
+    fn rar15_and_rar20_parse_levels_are_charged_for_what_they_hold() {
+        let size = 8u64 << 20;
+        let charge = |target, level| {
+            let mut options = super::WriterOptions::new(target, FeatureSet::default());
+            options.compression_level = Some(level);
+            super::member_workspace(options, size, true, false)
+        };
+        for level in [4, 5] {
+            assert!(charge(ArchiveVersion::Rar20, level) >= 50 * size);
+        }
+        assert!(charge(ArchiveVersion::Rar20, 3) < 4 * size);
+        assert!(charge(ArchiveVersion::Rar15, 3) >= 12 * size);
+        assert!(charge(ArchiveVersion::Rar29, 5) < 50 * size);
     }
 
     #[test]
