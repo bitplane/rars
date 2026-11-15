@@ -79,13 +79,20 @@ pub(crate) struct MatchFinder<const MIN_MATCH: usize, B: Budget = Allowance> {
 
 #[cfg(any(test, feature = "write"))]
 impl<const MIN_MATCH: usize> MatchFinder<MIN_MATCH> {
+    #[cfg(test)]
     pub(crate) fn new(window: usize) -> Self {
         Self::with_allowance(window, &Allowance::default()).expect("unlimited finder allocation")
     }
 
     /// More heads keep a long reach from crowding each chain with collisions.
     #[cfg(feature = "write")]
-    pub(crate) fn with_hash_bits(window: usize, hash_bits: u32) -> Self {
+    pub(crate) fn for_reach(window: usize, reach: usize) -> Self {
+        // Heads follow the reach, not the window, so filling ahead offers the same candidates.
+        let hash_bits = reach
+            .max(1)
+            .next_power_of_two()
+            .trailing_zeros()
+            .clamp(Self::HASH_BITS, 20);
         Self::build(window, hash_bits, &Allowance::default()).expect("unlimited finder allocation")
     }
 }
@@ -891,6 +898,17 @@ mod tests {
         finder.matches(&input, 0, 16, 0, 8, &mut matches).unwrap();
         finder.matches(&input, 16, 16, 8, 8, &mut matches).unwrap();
         assert!(matches.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "write")]
+    fn heads_follow_the_reach_between_the_default_and_a_mebibyte() {
+        let heads = |reach| MatchFinder::<3>::for_reach(reach, reach).head.len();
+        assert_eq!(heads(1000), 1 << 16);
+        assert_eq!(heads(300_000), 1 << 19);
+        assert_eq!(heads(1 << 20), 1 << 20);
+        assert_eq!(heads(4 << 20), 1 << 20);
+        assert_eq!(MatchFinder::<4>::for_reach(1000, 1000).head.len(), 1 << 17);
     }
 
     #[test]

@@ -82,19 +82,6 @@ impl<const MIN_MATCH: usize> Candidates for FilledAhead<'_, MIN_MATCH> {
     fn insert(&mut self, _input: &[u8], _pos: usize) {}
 }
 
-/// Heads follow the reach, not the window, so filling ahead offers the same candidates.
-fn match_finder_for<const MIN_MATCH: usize>(
-    window: usize,
-    reach: usize,
-) -> match_finder::MatchFinder<MIN_MATCH> {
-    let bits = reach
-        .max(1)
-        .next_power_of_two()
-        .trailing_zeros()
-        .clamp(17, 20);
-    match_finder::MatchFinder::with_hash_bits(window, bits)
-}
-
 // RAR 3.x standard filters are stored as RARVM bytecode in the compressed
 // stream. RAR15_40_FORMAT_SPECIFICATION.md §20 and FILTER_TRANSFORMS.md §9
 // define these blobs by byte length plus CRC32 fingerprint; keep the bytes
@@ -1677,7 +1664,7 @@ fn encode_tokens_with_progress(
     let combined = with_history(history, input, options);
     let start = combined.len() - input.len();
     let reach = options.max_match_distance.min(MAX_HISTORY);
-    let mut finder: Rar29MatchFinder = match_finder_for(reach, reach);
+    let mut finder = Rar29MatchFinder::for_reach(reach, reach);
     for history_pos in 0..start {
         finder.insert(&combined, history_pos);
     }
@@ -1727,7 +1714,7 @@ impl<'a> LzParser<'a> {
         let reach = options.max_match_distance.min(MAX_HISTORY);
         let batch_bytes = Self::batch_bytes(block_size);
         // Reach plus a batch, so filling a batch only overwrites links nothing in it can reach.
-        let mut finder = match_finder_for(reach.saturating_add(batch_bytes), reach);
+        let mut finder = Rar29MatchFinder::for_reach(reach.saturating_add(batch_bytes), reach);
         for history_pos in 0..start {
             finder.insert(data, history_pos);
         }
@@ -2034,7 +2021,7 @@ impl<'a> PpmdMatchSearch<'a> {
             max_match_distance,
             batch,
             // Reach plus a batch, so filling a batch only overwrites links nothing in it can reach.
-            finder: match_finder_for(reach.saturating_add(batch), reach),
+            finder: PpmdMatchFinder::for_reach(reach.saturating_add(batch), reach),
             filled: 0,
             found_from: 0,
             found: Vec::new(),
