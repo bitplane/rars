@@ -52,17 +52,37 @@ impl Archive {
         index: usize,
         password: Option<&[u8]>,
     ) -> crate::Result<Option<Vec<u8>>> {
+        self.member_comment_at_with_options(
+            index,
+            crate::ArchiveReadOptions::with_optional_password(password),
+        )
+    }
+
+    /// [`Self::member_comment_at`] under per-call output limits, decoder limits and cancellation.
+    pub fn member_comment_at_with_options(
+        &self,
+        index: usize,
+        options: crate::ArchiveReadOptions<'_>,
+    ) -> crate::Result<Option<Vec<u8>>> {
+        options.check_cancelled()?;
         match self {
-            Archive::Rar13(a) => a
-                .entries
-                .get(index)
-                .ok_or(crate::Error::EntryNotFound)?
-                .file_comment(),
+            Archive::Rar13(a) => {
+                let comment = a
+                    .entries
+                    .get(index)
+                    .ok_or(crate::Error::EntryNotFound)?
+                    .file_comment()?;
+                if let Some(comment) = &comment {
+                    crate::output_limit::OutputBudget::new(options)
+                        .check(comment.len() as u64, b"CMT")?;
+                }
+                Ok(comment)
+            }
             Archive::Rar15To40(a) => a
                 .files()
                 .nth(index)
                 .ok_or(crate::Error::EntryNotFound)?
-                .file_comment(),
+                .file_comment_with_options(options),
             Archive::Rar50Plus(a) => {
                 let mut current = None;
                 let mut next = 0;
@@ -96,9 +116,11 @@ impl Archive {
                 }
                 comment
                     .map(|service| {
-                        let mut data = Vec::new();
-                        service.write_to(a, password, &mut data)?;
-                        Ok(data)
+                        service.decoded_comment_with_options(
+                            a,
+                            options,
+                            crate::rar50::CommentChecksum::Verify,
+                        )
                     })
                     .transpose()
             }
@@ -112,6 +134,19 @@ impl Archive {
         index: usize,
         password: Option<&[u8]>,
     ) -> crate::Result<Option<Vec<u8>>> {
+        self.legacy_symlink_target_at_with_options(
+            index,
+            crate::ArchiveReadOptions::with_optional_password(password),
+        )
+    }
+
+    /// [`Self::legacy_symlink_target_at`] under per-call output limits, decoder limits and cancellation.
+    pub fn legacy_symlink_target_at_with_options(
+        &self,
+        index: usize,
+        options: crate::ArchiveReadOptions<'_>,
+    ) -> crate::Result<Option<Vec<u8>>> {
+        options.check_cancelled()?;
         let member = self
             .members()
             .nth(index)
@@ -120,7 +155,7 @@ impl Archive {
             return Ok(None);
         }
         let target = self
-            .read_member_at(index, password)?
+            .read_member_at_with_options(index, options)?
             .ok_or(crate::Error::EntryNotFound)?;
         crate::extraction_links::validate_legacy_target(&target, &member.meta.name)?;
         Ok(Some(target))

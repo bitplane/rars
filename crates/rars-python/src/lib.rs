@@ -792,22 +792,33 @@ impl RarFile {
     }
 
     /// Returns the decoded comment attached to a member, or None if absent.
-    #[pyo3(signature = (member, pwd = None))]
+    #[pyo3(signature = (member, pwd = None, *, options = None))]
     fn getcomment(
         &self,
         py: Python<'_>,
         member: &Bound<'_, PyAny>,
         pwd: Option<&Bound<'_, PyAny>>,
+        options: Option<&ReadOptions>,
     ) -> PyResult<Option<Vec<u8>>> {
+        check_read_options_cancellation(options)?;
         let index = self.resolve_index(member)?;
         let password = py_password(pwd)?.or_else(|| self.password.clone());
-        py.detach(|| self.archive.member_comment_at(index, password.as_deref()))
+        let options = self.extraction_options(options, password.as_deref());
+        py.detach(|| self.archive.member_comment_at_with_options(index, options))
             .map_err(map_error)
     }
 
     /// Returns raw target bytes for a supported RAR5 or legacy Unix link.
     /// This reads archive metadata and never follows the link.
-    fn readlink(&self, member: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+    #[pyo3(signature = (member, pwd = None, *, options = None))]
+    fn readlink(
+        &self,
+        py: Python<'_>,
+        member: &Bound<'_, PyAny>,
+        pwd: Option<&Bound<'_, PyAny>>,
+        options: Option<&ReadOptions>,
+    ) -> PyResult<Vec<u8>> {
+        check_read_options_cancellation(options)?;
         let index = self.resolve_index(member)?;
         let member = self
             .archive
@@ -815,9 +826,13 @@ impl RarFile {
             .nth(index)
             .ok_or_else(|| PyKeyError::new_err("member not found"))?;
         if member.is_legacy_unix_symlink() {
-            return Ok(self
-                .archive
-                .legacy_symlink_target_at(index, self.password.as_deref())
+            let password = py_password(pwd)?.or_else(|| self.password.clone());
+            let options = self.extraction_options(options, password.as_deref());
+            return Ok(py
+                .detach(|| {
+                    self.archive
+                        .legacy_symlink_target_at_with_options(index, options)
+                })
                 .map_err(map_error)?
                 .expect("legacy symlink predicate checked above"));
         }
@@ -827,8 +842,14 @@ impl RarFile {
             .ok_or_else(|| UnsupportedRarFeature::new_err("member is not a supported redirection"))
     }
 
-    /// Stored file timestamps as exact integer Unix nanoseconds. Missing kinds are absent.
-    fn gettimes(&self, member: &Bound<'_, PyAny>) -> PyResult<HashMap<String, i128>> {
+    /// Exact Unix nanoseconds, absent kinds omitted; no `pwd` since headers were decrypted at open.
+    #[pyo3(signature = (member, *, options = None))]
+    fn gettimes(
+        &self,
+        member: &Bound<'_, PyAny>,
+        options: Option<&ReadOptions>,
+    ) -> PyResult<HashMap<String, i128>> {
+        check_read_options_cancellation(options)?;
         let index = self.resolve_index(member)?;
         let member = self
             .archive
@@ -1679,7 +1700,7 @@ impl RarBuilder {
     ) -> PyResult<()> {
         let path = py_path_buf(py, path)?;
         let base = match arcname {
-            Some(name) => member_name_bytes(name)?,
+            Some(name) => new_member_name(name)?,
             None => archive_base_name(&path)?,
         };
         self.inner.add_path(&path, &base).map_err(map_builder_error)
@@ -1694,7 +1715,7 @@ impl RarBuilder {
         mode: Option<u32>,
     ) -> PyResult<()> {
         self.inner
-            .add_directory(member_name_bytes(arcname)?, mtime, mode)
+            .add_directory(new_member_name(arcname)?, mtime, mode)
             .map_err(map_builder_error)
     }
 
@@ -1708,7 +1729,7 @@ impl RarBuilder {
     ) -> PyResult<()> {
         self.inner
             .add_bytes(
-                member_name_bytes(arcname)?,
+                new_member_name(arcname)?,
                 py_required_bytes(data)?,
                 mtime,
                 mode,
@@ -1733,7 +1754,7 @@ impl RarBuilder {
     fn rename(&mut self, old: &Bound<'_, PyAny>, new: &Bound<'_, PyAny>) -> PyResult<()> {
         let id = self.edit_member_id(old)?;
         self.inner
-            .rename_by_id(id, member_name_bytes(new)?)
+            .rename_by_id(id, new_member_name(new)?)
             .map_err(map_builder_error)
     }
 
@@ -1750,8 +1771,8 @@ impl RarBuilder {
     ) -> PyResult<()> {
         self.inner
             .add_unix_symlink(
-                member_name_bytes(arcname)?,
-                member_name_bytes(target)?,
+                new_member_name(arcname)?,
+                new_member_name(target)?,
                 target_is_directory,
                 mtime,
                 mode,
@@ -2191,6 +2212,16 @@ fn member_name_bytes(value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
         return Ok(bytes);
     }
     Ok(value.extract::<String>()?.into_bytes())
+}
+
+/// A `RarInfo` names a member that already exists, so it cannot name a new one.
+fn new_member_name(value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+    if value.is_instance_of::<RarInfo>() {
+        return Err(PyTypeError::new_err(
+            "a new member's name must be str or bytes, not RarInfo",
+        ));
+    }
+    member_name_bytes(value)
 }
 
 fn check_read_options_cancellation(options: Option<&ReadOptions>) -> PyResult<()> {

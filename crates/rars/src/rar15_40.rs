@@ -307,6 +307,15 @@ impl FileHeader {
     /// The block is a comment header followed by its data, both covered by the
     /// file header's size but not by its CRC.
     pub fn file_comment(&self) -> Result<Option<Vec<u8>>> {
+        self.file_comment_with_options(crate::ArchiveReadOptions::new())
+    }
+
+    /// [`Self::file_comment`] under per-call output limits, workspace limit and cancellation.
+    pub(crate) fn file_comment_with_options(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+    ) -> Result<Option<Vec<u8>>> {
+        options.check_cancelled()?;
         if !self.has_file_comment() {
             return Ok(None);
         }
@@ -320,7 +329,14 @@ impl FileHeader {
         let header = parse_comment_header(&self.file_comment, block)?;
         // Block admission bounded head_size; comment admission requires >=13.
         let packed = &self.file_comment[COMMENT_HEADER_SIZE..head_size];
-        header.decode(packed).map(Some)
+        let mut budget = crate::output_limit::OutputBudget::new(options);
+        match options.max_reader_workspace_bytes {
+            Some(limit) => {
+                header.decode_with_allowance(packed, &mut budget, &Allowance::limited(limit))
+            }
+            None => header.decode_with_budget(packed, &mut budget),
+        }
+        .map(Some)
     }
 
     pub fn is_stored(&self) -> bool {
@@ -630,13 +646,6 @@ impl CommentHeader {
     }
 
     /// Unpacks comment data and checks it against the header's 16-bit CRC.
-    fn decode(&self, packed: &[u8]) -> Result<Vec<u8>> {
-        self.decode_with_budget(
-            packed,
-            &mut crate::output_limit::OutputBudget::new(crate::ArchiveReadOptions::new()),
-        )
-    }
-
     fn decode_with_budget(
         &self,
         packed: &[u8],
@@ -3780,7 +3789,12 @@ mod tests {
                 comment_crc: (crc32(text) & 0xffff) as u16,
                 packed_range: 0..packed.len(),
             };
-            assert_eq!(comment.decode(&packed).unwrap(), text);
+            let mut budget =
+                crate::output_limit::OutputBudget::new(crate::ArchiveReadOptions::new());
+            assert_eq!(
+                comment.decode_with_budget(&packed, &mut budget).unwrap(),
+                text
+            );
             let mut limited = crate::output_limit::OutputBudget::new(
                 crate::ArchiveReadOptions::new().with_max_member_output_bytes(0),
             );

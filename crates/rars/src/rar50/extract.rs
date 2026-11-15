@@ -364,27 +364,31 @@ impl FileHeader {
         Ok(decoded.data.into_vec())
     }
 
-    pub(super) fn decoded_comment_with_options(
+    pub(crate) fn decoded_comment_with_options(
         &self,
         archive: &Archive,
         options: crate::ArchiveReadOptions<'_>,
+        checksum: CommentChecksum,
     ) -> Result<Vec<u8>> {
         if let Some(limit) = options.max_reader_workspace_bytes {
             return self.decoded_comment_with_allowance(
                 archive,
                 options,
+                checksum,
                 &Allowance::limited(limit),
             );
         }
-        self.decoded_comment_with_allowance(archive, options, &Allowance::default())
+        self.decoded_comment_with_allowance(archive, options, checksum, &Allowance::default())
     }
 
     fn decoded_comment_with_allowance<B: Budget>(
         &self,
         archive: &Archive,
         options: crate::ArchiveReadOptions<'_>,
+        checksum: CommentChecksum,
         allowance: &B,
     ) -> Result<Vec<u8>> {
+        let verify = checksum == CommentChecksum::Verify;
         let mut budget = crate::output_limit::OutputBudget::new(options);
         if budget.is_limited() && self.known_unpacked_size().is_none() {
             return Err(Error::UnsupportedFeature {
@@ -404,8 +408,6 @@ impl FileHeader {
                 }
             }
         }
-        // Comment services historically decode without checking payload hashes.
-        // Reuse bounded member decoding while retaining that checksum contract.
         let payload = FileHeader {
             block: self.block.clone(),
             file_flags: self.file_flags,
@@ -416,11 +418,11 @@ impl FileHeader {
             htime_mtime: self.htime_mtime,
             htime_mtime_refinement: self.htime_mtime_refinement,
             file_times: self.file_times,
-            data_crc32: None,
+            data_crc32: self.data_crc32.filter(|_| verify),
             compression_info: self.compression_info,
             host_os: self.host_os,
             name: self.name.clone(),
-            hash: None,
+            hash: self.hash.clone().filter(|_| verify),
             redirection: None,
             // Parsed service payloads belong to the archive. Decoding reads its
             // source range; copying service_data would create uncharged staging.
@@ -444,6 +446,7 @@ impl FileHeader {
                     &mut session.decoder,
                     options.password,
                 )?;
+                payload.verify_integrity_with_keys(&decoded.data, decoded.keys.as_ref())?;
                 writer.write_all(&decoded.data)?;
                 Ok(())
             } else {
@@ -1240,6 +1243,13 @@ fn decode_parallel_entry<B: Budget>(
         session.write_file_to_with_history(archive, file, writer, history)
     })?;
     Ok(ParallelExtractedEntry::File { meta, data })
+}
+
+/// Archive comments have never had their checksum checked; member comments always have.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommentChecksum {
+    Skip,
+    Verify,
 }
 
 struct DecodedData<B: Budget = Allowance> {
