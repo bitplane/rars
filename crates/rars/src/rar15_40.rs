@@ -2397,6 +2397,40 @@ fn map_rar30_crypto_error(error: Rar30Error) -> Error {
     Error::from(error)
 }
 
+/// None when the headers are not encrypted; `input` starts at the signature.
+pub(crate) fn first_encrypted_header_offset(input: &[u8]) -> Result<Option<usize>> {
+    let marker_size = RAR15_SIGNATURE.len();
+    let main_block = parse_block_header(input, marker_size)?;
+    if main_block.head_type != MAIN_HEAD {
+        return Err(Error::InvalidHeader("RAR 1.5 main header is missing"));
+    }
+    let end = marker_size + main_block.head_size as usize;
+    let main = parse_main_header(input.get(..end).ok_or(Error::TooShort)?, &main_block)?;
+    Ok(main.has_encrypted_headers().then_some(end))
+}
+
+/// The same first-header test that makes opening raise a wrong password.
+pub(crate) fn header_password_matches(
+    input: &[u8],
+    offset: usize,
+    password: &[u8],
+    options: crate::ArchiveReadOptions<'_>,
+) -> Result<bool> {
+    let mut budget = crate::parse_budget::ParseBudget::new(options);
+    match decrypt_encrypted_header_at(
+        input,
+        offset,
+        password,
+        true,
+        &mut EncryptedHeaderCipherCache::default(),
+        &mut budget,
+    ) {
+        Ok(_) => Ok(true),
+        Err(Error::WrongPasswordOrCorruptData) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 fn decrypt_encrypted_header_at(
     archive: &[u8],
     offset: usize,
