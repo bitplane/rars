@@ -680,6 +680,38 @@ fn choose_owned_filter<B: Budget>(
         progress,
     )
 }
+/// The filters for one run of a member too large to search whole, ranged over
+/// the run. The run is searched on its own, without the history it is later
+/// coded against, so the choice never waits on the runs before it.
+///
+/// The decoder converts x86 and ARM addresses from a 32-bit file offset, and
+/// the encoder refuses one past that, so a run reaching beyond 4 GiB stays
+/// unfiltered.
+pub(super) fn run_filters_with_allowance<B: Budget>(
+    data: &[u8],
+    file_offset: usize,
+    algorithm_version: u8,
+    options: EncodeOptions,
+    cancelled: &dyn Fn() -> bool,
+    allowance: &B,
+) -> Result<Buffer<FilterSpec, B>> {
+    let past_offsets = file_offset
+        .checked_add(data.len())
+        .is_none_or(|end| end > u32::MAX as usize);
+    if past_offsets || !auto_size_filter_search_applies(data) {
+        return Ok(Buffer::new(allowance));
+    }
+    let mut progress = |_| !cancelled();
+    choose_owned_filter(
+        data,
+        algorithm_version,
+        options,
+        Some(&mut progress),
+        allowance,
+    )
+    .map(|(specs, _)| specs)
+}
+
 fn specs_with_allowance<B: Budget>(
     data: &[u8],
     algorithm_version: u8,

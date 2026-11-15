@@ -6,6 +6,10 @@
 //! needs is known before any compression happens, and blocks can be compressed
 //! in parallel while their packed output is written back in order.
 //!
+//! A member too large to filter whole chooses filters run by run. The window
+//! then holds filtered bytes, so its runs pick filters in one parallel pass and
+//! take their histories from the filtered runs before them in a second.
+//!
 //! Non-solid members each carry their own history and are interleaved so that
 //! several small members keep every core busy. Solid members share one history
 //! chain that runs across member boundaries, so their blocks are produced by a
@@ -211,7 +215,7 @@ pub(super) struct CompressedMember {
 #[cfg(test)]
 use super::plan::whole_member_workspace;
 pub(super) use super::plan::CompressPlan;
-use super::plan::{Execution, ExecutionPlan, MemberPlan};
+use super::plan::{Execution, ExecutionPlan, MemberPlan, FILTER_SEARCH_BYTES};
 
 /// A bounded run of adjacent blocks, sharing one copy of the preceding input.
 struct BlockJob<B: Budget> {
@@ -219,6 +223,11 @@ struct BlockJob<B: Budget> {
     history: Buffer<u8, B>,
     /// Member index, end within `data`, and final-block flag.
     blocks: Records<(usize, usize, bool)>,
+    /// Where `data` starts in its member. Only filtered runs read it.
+    offset: usize,
+    /// Filters ranged over `data`. A run with any is coded as one filtered
+    /// stream, cut where its filter records fit rather than at `blocks`.
+    filters: Records<crate::FilterSpec>,
 }
 
 impl<B: Budget> BlockJob<B> {
@@ -354,6 +363,7 @@ pub(super) fn compress_members_with_context(
             sources,
             &mut integrity,
             plan,
+            false,
             workspace,
             resources,
             advance,
@@ -395,6 +405,7 @@ fn compress_streaming_members(
     sources: &[EntrySource],
     integrity: &mut [(u64, u32, [u8; 32])],
     plan: &CompressPlan,
+    run_filters: bool,
     required: u64,
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
@@ -421,6 +432,7 @@ fn compress_streaming_members(
             sources,
             integrity,
             plan,
+            run_filters,
             batch_capacity,
             required,
             resources,
@@ -435,6 +447,7 @@ fn compress_streaming_members(
             sources,
             integrity,
             plan,
+            false,
             batch_capacity,
             required,
             resources,
@@ -447,6 +460,7 @@ fn compress_streaming_members(
             sources,
             integrity,
             plan,
+            run_filters,
             batch_capacity,
             required,
             resources,
@@ -504,7 +518,7 @@ fn compress_members_whole(
         if advance.is_cancelled() || resources.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        if members[start].execution != Execution::WholeMember {
+        if let Execution::Blocks { run_filters, .. } = members[start].execution {
             results
                 .push(
                     compress_fallback_member(
@@ -512,6 +526,7 @@ fn compress_members_whole(
                         &sources[start],
                         integrity[start],
                         plan,
+                        run_filters,
                         members[start].workspace,
                         resources,
                         advance,
@@ -742,15 +757,15 @@ fn compress_whole_member<B: Budget>(
 }
 
 /// Execute the planned automatic-filter fallback without re-entering planning.
-/// Block execution uses only `encode_options`; filter search and the candidate
-/// list belong to whole-member execution. Store fallback follows that unfiltered
-/// base encoding, while the shared codec settings remain intact.
+/// Block execution uses only `encode_options` and searches filters per run;
+/// the candidate list belongs to whole-member execution.
 #[allow(clippy::too_many_arguments)]
 fn compress_fallback_member(
     index: usize,
     source: &EntrySource,
     integrity: (u64, u32, [u8; 32]),
     plan: &CompressPlan,
+    run_filters: bool,
     required: u64,
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
@@ -782,6 +797,7 @@ fn compress_fallback_member(
         std::slice::from_ref(source),
         &mut integrity,
         plan,
+        run_filters,
         required,
         resources,
         &Remapped {
@@ -808,12 +824,14 @@ fn compress_fallback_member(
 }
 
 /// Members with independent dictionaries, interleaved so a batch of small
-/// members can still saturate the machine.
+/// members can still saturate the machine. With `filter_runs`, each run chooses
+/// its own filters.
 #[allow(clippy::too_many_arguments)]
 fn compress_independent_members<B: Budget + Send + Sync>(
     sources: &[EntrySource],
     integrity: &mut [(u64, u32, [u8; 32])],
     plan: &CompressPlan,
+    filter_runs: bool,
     batch_capacity: usize,
     required: u64,
     resources: &WriterResources,
@@ -851,6 +869,7 @@ where
             (0..streams.len()).map(|_| Ok(Buffer::new(allowance))),
             resources,
         )?;
+        let mut offsets = Records::collect((0..streams.len()).map(|_| Ok(0usize)), resources)?;
         let mut cursor = 0usize;
         while streams.iter().any(MemberStream::has_more) {
             let wave_capacity = streaming_wave_capacity(batch_capacity, required, plan, resources);
@@ -873,8 +892,17 @@ where
 
                 let mut job = BlockJob {
                     data: Buffer::new(allowance),
-                    history: Buffer::copied(&histories[member], allowance)?,
+                    // A filtered run's history is the window the decoder will
+                    // hold, which is not known until the runs before it have
+                    // chosen their filters.
+                    history: if filter_runs {
+                        Buffer::new(allowance)
+                    } else {
+                        Buffer::copied(&histories[member], allowance)?
+                    },
                     blocks: Records::new(0, resources)?,
+                    offset: offsets[member],
+                    filters: Records::new(0, resources)?,
                 };
                 while stream.has_more() && job.data.len() < run_size(plan) {
                     job.append(
@@ -884,7 +912,10 @@ where
                     job.blocks
                         .push_growing((member, job.data.len(), !stream.has_more()))?;
                 }
-                if stream.has_more() {
+                offsets[member] += job.data.len();
+                if filter_runs {
+                    // Histories are kept below, once the filters are known.
+                } else if stream.has_more() {
                     histories[member]
                         .remember(&job.data, plan.encode_options.max_match_distance)?;
                 } else {
@@ -894,6 +925,30 @@ where
                     histories[member] = Buffer::new(allowance);
                 }
                 jobs.push(job)?;
+            }
+
+            if filter_runs {
+                choose_run_filters(&mut jobs, plan, required, resources, advance)?;
+                for job in jobs.iter_mut() {
+                    let (member, _, _) = job.blocks[0];
+                    let last = job.blocks.last().is_some_and(|&(_, _, last)| last);
+                    job.history = Buffer::copied(&histories[member], allowance)?;
+                    if last {
+                        histories[member] = Buffer::new(allowance);
+                    } else if job.filters.is_empty() {
+                        histories[member]
+                            .remember(&job.data, plan.encode_options.max_match_distance)?;
+                    } else {
+                        let window = crate::codec::rar50::filtered_run_bytes(
+                            &job.data,
+                            &job.filters,
+                            job.offset,
+                            allowance,
+                        )?;
+                        histories[member]
+                            .remember(&window, plan.encode_options.max_match_distance)?;
+                    }
+                }
             }
 
             compress_wave(
@@ -924,6 +979,8 @@ fn compress_solid_chain<B: Budget + Send + Sync>(
     sources: &[EntrySource],
     integrity: &mut [(u64, u32, [u8; 32])],
     plan: &CompressPlan,
+    // Shares the independent path's signature; a solid chain never filters.
+    _filter_runs: bool,
     batch_capacity: usize,
     required: u64,
     resources: &WriterResources,
@@ -971,6 +1028,8 @@ where
                 data: Buffer::new(allowance),
                 history: Buffer::copied(&history, allowance)?,
                 blocks: Records::new(0, resources)?,
+                offset: 0,
+                filters: Records::new(0, resources)?,
             };
             while job.data.len() < run_size(plan) {
                 while next < streams.len() && !streams[next].has_more() {
@@ -1094,6 +1153,87 @@ fn check_source_end(reader: &mut dyn Read) -> Result<()> {
     Ok(())
 }
 
+/// Chooses each run's filters, in parallel and against the same admission as
+/// the wave that will code them: at most one search per job at a time.
+///
+/// A run is searched in pieces of [`FILTER_SEARCH_BYTES`], so one search fits
+/// the budget whatever the dictionary, and the pieces' ranges are offset into
+/// the run.
+fn choose_run_filters<B: Budget + Send + Sync>(
+    jobs: &mut Records<BlockJob<B>>,
+    plan: &CompressPlan,
+    required: u64,
+    resources: &WriterResources,
+    advance: &dyn CompressionProgress,
+) -> Result<()>
+where
+    B::Charge: Send,
+{
+    let mut pieces = Records::new(0, resources)?;
+    for (index, job) in jobs.iter().enumerate() {
+        let mut start = 0;
+        while start < job.data.len() {
+            let end = (start + FILTER_SEARCH_BYTES).min(job.data.len());
+            pieces.push_growing((index, start..end))?;
+            start = end;
+        }
+    }
+    let mut chosen = Records::new(pieces.len(), resources)?;
+    for batch in pieces.chunks(jobs.len().max(1)) {
+        let searches = Records::collect(
+            batch.iter().map(|(index, range)| {
+                let job = &jobs[*index];
+                Ok((&job.data[range.clone()], job.offset + range.start))
+            }),
+            resources,
+        )?;
+        let found = if resources.execution.is_some() {
+            run_jobs_admitted(
+                searches,
+                resources,
+                advance,
+                |_| required,
+                |(data, offset), worker, progress, allowance| {
+                    let specs = super::filter_policy::run_filters_with_allowance(
+                        data,
+                        offset,
+                        plan.algorithm_version,
+                        plan.encode_options,
+                        &|| progress.is_cancelled(),
+                        allowance,
+                    )?;
+                    Records::collect(specs.iter().cloned().map(Ok), worker)
+                },
+            )?
+        } else {
+            run_jobs(searches, resources, advance, |(data, offset), progress| {
+                let specs = super::filter_policy::run_filters_with_allowance(
+                    data,
+                    offset,
+                    plan.algorithm_version,
+                    plan.encode_options,
+                    &|| progress.is_cancelled(),
+                    &Allowance::default(),
+                )?;
+                Records::collect(specs.iter().cloned().map(Ok), resources)
+            })?
+        };
+        for specs in found {
+            chosen.push(specs)?;
+        }
+    }
+    for ((index, range), specs) in pieces.iter().zip(chosen) {
+        let filters = &mut jobs[*index].filters;
+        for spec in specs {
+            let span = spec.range.map_or(range.clone(), |r| {
+                range.start + r.start..range.start + r.end
+            });
+            filters.push_growing(crate::FilterSpec::range(spec.kind, span))?;
+        }
+    }
+    Ok(())
+}
+
 /// Compresses a wave of blocks in parallel, then appends the results to their
 /// members in job order so output does not depend on scheduling.
 fn compress_wave<B: Budget + Send + Sync>(
@@ -1155,6 +1295,31 @@ fn encode_block_job<B: Budget, C: Budget>(
     progress: &dyn CompressionProgress,
     allowance: &C,
 ) -> Result<PackedBlocks<C>> {
+    if !job.filters.is_empty() {
+        let (member, _, last) = *job.blocks.last().expect("a job holds a block");
+        let mut reported = 0usize;
+        let mut run_progress = |position: usize| {
+            let delta = position.saturating_sub(reported);
+            reported = reported.max(position);
+            progress.advance(delta as u64)
+        };
+        let packed = crate::codec::rar50::encode_filtered_run(
+            &job.data,
+            &job.filters,
+            &job.history,
+            job.offset,
+            last,
+            plan.algorithm_version,
+            plan.encode_options,
+            Some(&mut run_progress),
+            allowance,
+        )?;
+        if reported < job.data.len() && !progress.advance((job.data.len() - reported) as u64) {
+            return Err(Error::Cancelled);
+        }
+        output.push((member, packed, last))?;
+        return Ok(output);
+    }
     let mut block_done = |bytes: usize| progress.advance(bytes as u64);
     let packed = streaming_blocks_with_allowance(
         &job.data,
@@ -1810,6 +1975,7 @@ mod tests {
                     &EntrySource::from_factory(Untouched),
                     (7, 0, [0; 32]),
                     &plan,
+                    false,
                     0,
                     &resources,
                     progress,
@@ -1839,6 +2005,7 @@ mod tests {
                     required: 100,
                     limit: 99,
                 },
+                run_filters: false,
             },
             workspace: 10,
         };
@@ -1925,6 +2092,7 @@ mod tests {
                 &sources,
                 &mut expected_integrity,
                 &plan,
+                false,
                 2,
                 1,
                 &resources,
@@ -1958,6 +2126,7 @@ mod tests {
                     &sources,
                     &mut integrity,
                     &plan,
+                    false,
                     2,
                     1,
                     &resources,
@@ -1996,6 +2165,7 @@ mod tests {
                 &sources,
                 &mut integrity,
                 &plan,
+                false,
                 2,
                 1,
                 &resources,
@@ -2043,6 +2213,7 @@ mod tests {
                 &sources,
                 &mut expected_integrity,
                 &plan,
+                false,
                 1,
                 1,
                 &resources,
@@ -2061,6 +2232,7 @@ mod tests {
                 &sources,
                 &mut actual_integrity,
                 &plan,
+                false,
                 2,
                 1,
                 &resources,

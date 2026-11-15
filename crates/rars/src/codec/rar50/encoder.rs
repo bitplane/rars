@@ -854,6 +854,47 @@ pub(crate) fn filtered_lz_member(
         .map(|(data, records)| (data.into_vec(), records.into_vec()))
 }
 
+/// The bytes a decoder's window holds after [`encode_filtered_run`] codes
+/// `data`, which starts `file_offset` bytes into its member, with `filters`.
+pub(crate) fn filtered_run_bytes<B: Budget>(
+    data: &[u8],
+    filters: &[crate::FilterSpec],
+    file_offset: usize,
+    allowance: &B,
+) -> Result<Buffer<u8, B>> {
+    let mut filtered = Buffer::copied(data, allowance)?;
+    filter_blocks_in_place(&mut filtered, filters, file_offset, allowance)?;
+    Ok(filtered)
+}
+
+/// One run of a member, `file_offset` bytes in, with `filters` ranged over the
+/// run. `history` is what the window already holds, so it is filtered bytes
+/// wherever earlier runs were filtered.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_filtered_run<B: Budget>(
+    data: &[u8],
+    filters: &[crate::FilterSpec],
+    history: &[u8],
+    file_offset: usize,
+    is_last: bool,
+    algorithm_version: u8,
+    options: EncodeOptions,
+    progress: Option<&mut dyn FnMut(usize) -> bool>,
+    allowance: &B,
+) -> Result<Buffer<u8, B>> {
+    filtered_lz_blocks(
+        data,
+        filters,
+        history,
+        file_offset,
+        is_last,
+        algorithm_version,
+        options,
+        progress,
+        allowance,
+    )
+}
+
 fn filtered_member_with_allowance<B: Budget>(
     data: &[u8],
     filters: &[crate::FilterSpec],
@@ -934,51 +975,22 @@ fn encode_filter_data<B: Budget>(
 /// cost [`encode_lz_member_inner`] took off the unfiltered path and left
 /// here: at 64 KiB a block, a four-megabyte member re-copied and re-inserted
 /// 126 MiB of history, thirty-one times what it holds.
+#[allow(clippy::too_many_arguments)]
 fn filtered_lz_blocks<B: Budget>(
     data: &[u8],
     filters: &[crate::FilterSpec],
     history: &[u8],
+    file_offset: usize,
+    is_last: bool,
     algorithm_version: u8,
     options: EncodeOptions,
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
     allowance: &B,
 ) -> Result<Buffer<u8, B>> {
-    let filters = normalized_filter_specs(data.len(), filters, allowance)?;
     let history = &history[history.len().saturating_sub(options.max_match_distance)..];
     let start = history.len();
     let mut combined = Buffer::from_slices(&[history, data], allowance)?;
-
-    let mut blocks = Buffer::new(allowance);
-    let mut chunk_start = 0usize;
-    while chunk_start < data.len() {
-        let chunk_end = (chunk_start + FILTERED_LZ_BLOCK_SIZE).min(data.len());
-        let mut records = Buffer::new(allowance);
-        for filter in filters.iter() {
-            let filter_start = filter.range.start.max(chunk_start);
-            let filter_end = filter.range.end.min(chunk_end);
-            if filter_start >= filter_end {
-                continue;
-            }
-            let (filter_type, channels) = encode_filter_data(
-                filter.kind,
-                &mut combined[start + filter_start..start + filter_end],
-                filter_start,
-                allowance,
-            )?;
-            records
-                .push(EncodeFilter {
-                    offset: filter_start - chunk_start,
-                    length: filter_end - filter_start,
-                    filter_type,
-                    channels,
-                })
-                .map_err(Into::into)?;
-        }
-        blocks
-            .push((chunk_start..chunk_end, records))
-            .map_err(Into::into)?;
-        chunk_start = chunk_end;
-    }
+    let blocks = filter_blocks_in_place(&mut combined[start..], filters, file_offset, allowance)?;
 
     // One search state for the whole member, as the unfiltered path has.
     let mut search = if options.optimal_parse {
@@ -1005,13 +1017,61 @@ fn filtered_lz_blocks<B: Budget>(
             algorithm_version,
             &records,
             options,
-            block.end == data.len(),
+            is_last && block.end == data.len(),
             Some(&mut chunk_progress),
             allowance,
         )?;
         out.extend_from_slice(&packed).map_err(Into::into)?;
     }
     Ok(out)
+}
+
+type FilteredBlocks<B> = Buffer<(Range<usize>, Buffer<EncodeFilter, B>), B>;
+
+/// Transforms `data`, which starts `file_offset` bytes into its member, one
+/// [`FILTERED_LZ_BLOCK_SIZE`] block at a time, which is how the decoder undoes
+/// it: a filter record covers one block, so an x86 call or a delta plane that
+/// straddles a cut converts on each side separately. Returns each block's range
+/// and records.
+fn filter_blocks_in_place<B: Budget>(
+    data: &mut [u8],
+    filters: &[crate::FilterSpec],
+    file_offset: usize,
+    allowance: &B,
+) -> Result<FilteredBlocks<B>> {
+    let filters = normalized_filter_specs(data.len(), filters, allowance)?;
+    let mut blocks = Buffer::new(allowance);
+    let mut chunk_start = 0usize;
+    while chunk_start < data.len() {
+        let chunk_end = (chunk_start + FILTERED_LZ_BLOCK_SIZE).min(data.len());
+        let mut records = Buffer::new(allowance);
+        for filter in filters.iter() {
+            let filter_start = filter.range.start.max(chunk_start);
+            let filter_end = filter.range.end.min(chunk_end);
+            if filter_start >= filter_end {
+                continue;
+            }
+            let (filter_type, channels) = encode_filter_data(
+                filter.kind,
+                &mut data[filter_start..filter_end],
+                file_offset + filter_start,
+                allowance,
+            )?;
+            records
+                .push(EncodeFilter {
+                    offset: filter_start - chunk_start,
+                    length: filter_end - filter_start,
+                    filter_type,
+                    channels,
+                })
+                .map_err(Into::into)?;
+        }
+        blocks
+            .push((chunk_start..chunk_end, records))
+            .map_err(Into::into)?;
+        chunk_start = chunk_end;
+    }
+    Ok(blocks)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1833,6 +1893,8 @@ impl<B: Budget> EncoderState<B> {
                 input,
                 filters,
                 &self.history,
+                0,
+                true,
                 version,
                 self.options,
                 progress,

@@ -5,6 +5,16 @@ use crate::codec::rar50::EncodeOptions;
 use crate::streaming::preparation::Records;
 use crate::{Result, WriterResources};
 
+/// How much of a run one filter search covers when a member is too large to
+/// search whole. Larger dictionaries make longer runs, and this keeps each
+/// search inside the one-thread default budget at every level.
+pub(super) const FILTER_SEARCH_BYTES: usize = 4 * 1024 * 1024;
+
+/// The most one filter search covers: a run, or a piece of one.
+fn search_piece(settings: &CompressPlan) -> u64 {
+    super::compress::run_size(settings).min(FILTER_SEARCH_BYTES) as u64
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FallbackReason {
     AutomaticFilterWorkspace { required: u64, limit: u64 },
@@ -13,7 +23,11 @@ pub(super) enum FallbackReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Execution {
     WholeMember,
-    Blocks { fallback: FallbackReason },
+    /// `run_filters` when each run's filter search fits the budget too.
+    Blocks {
+        fallback: FallbackReason,
+        run_filters: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -78,15 +92,26 @@ impl ExecutionPlan {
                             workspace: required,
                         }
                     } else {
+                        let blocks = streaming_workspace(settings, false, size);
+                        // Automatic fallback uses only the base encoder
+                        // candidate, and searches each run for filters as if
+                        // it were a member of its own when that fits.
+                        let search =
+                            whole_member_workspace(size.min(search_piece(settings)), settings);
+                        let run_filters = search <= limit;
                         MemberPlan {
                             execution: Execution::Blocks {
                                 fallback: FallbackReason::AutomaticFilterWorkspace {
                                     required,
                                     limit,
                                 },
+                                run_filters,
                             },
-                            // Automatic fallback uses only the base encoder candidate.
-                            workspace: streaming_workspace(settings, false, size),
+                            workspace: if run_filters {
+                                blocks.max(search)
+                            } else {
+                                blocks
+                            },
                         }
                     },
                 )
@@ -130,8 +155,9 @@ pub(super) struct CompressPlan {
     /// The RAR 5 compression method. Method zero means the members are stored
     /// verbatim, so nothing is compressed at all.
     pub(super) method: u8,
-    /// Filters and multi-candidate encoding both need the whole member at
-    /// once, so they only run for members that fit the memory budget.
+    /// Multi-candidate encoding needs the whole member at once. Automatic
+    /// filters search the whole member when it fits the memory budget, and
+    /// each run of it when it does not.
     pub(super) filter_policy: FilterPolicy,
     pub(super) candidates: Records<EncodeOptions>,
 }
@@ -195,9 +221,25 @@ mod tests {
                     required,
                     limit: required - 1
                 },
+                run_filters: true,
             }
         );
-        assert!(below.members()[0].workspace < required);
+        // Charged for one run's filter search, which is smaller than the member.
+        let search = whole_member_workspace(search_piece(&settings), &settings);
+        assert_eq!(below.members()[0].workspace, search);
+        assert!(search < required);
+
+        // A member no longer than one search cannot search a part of itself.
+        let size = search_piece(&settings);
+        let required = whole_member_workspace(size, &settings);
+        let below = ExecutionPlan::new(&settings, [size].into_iter(), required - 1);
+        assert!(matches!(
+            below.members()[0].execution,
+            Execution::Blocks {
+                run_filters: false,
+                ..
+            }
+        ));
     }
 
     #[test]
