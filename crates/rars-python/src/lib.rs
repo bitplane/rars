@@ -1014,6 +1014,29 @@ impl RarFile {
         family_name(self.archive.family()).to_string()
     }
 
+    #[getter]
+    fn is_volume(&self) -> bool {
+        self.archive.is_volume()
+    }
+
+    #[getter]
+    fn volume_number(&self) -> Option<u64> {
+        self.archive.volume_number()
+    }
+
+    #[getter]
+    fn is_first_volume(&self) -> Option<bool> {
+        self.archive.is_first_volume()
+    }
+
+    #[getter]
+    fn volume_naming(&self) -> &'static str {
+        match self.archive.volume_naming() {
+            rars_rs::volume_name::VolumeNaming::Part => "part",
+            rars_rs::volume_name::VolumeNaming::Old => "old",
+        }
+    }
+
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }

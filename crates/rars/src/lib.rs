@@ -722,6 +722,49 @@ impl Archive {
         }
     }
 
+    /// 1-based to match "in volume N" errors; None when the headers don't record it.
+    pub fn volume_number(&self) -> Option<u64> {
+        if !self.is_volume() {
+            return Some(1);
+        }
+        match self {
+            Self::Rar13(_) => None,
+            // WinRAR 3.00 marks every part-named volume first, so a continued member overrules the flag.
+            Self::Rar15To40(archive) => archive
+                .end_volume_number()
+                .map(|number| u64::from(number) + 1)
+                .or_else(|| {
+                    (archive.main.is_first_volume() && !self.first_member_continues()).then_some(1)
+                }),
+            Self::Rar50Plus(archive) => Some(archive.main.volume_number.unwrap_or(0) + 1),
+        }
+    }
+
+    /// Whether this volume starts its set, or None when its headers can't tell.
+    pub fn is_first_volume(&self) -> Option<bool> {
+        match self.volume_number() {
+            Some(number) => Some(number == 1),
+            None => self.first_member_continues().then_some(false),
+        }
+    }
+
+    /// Read from the headers, since an obfuscated file name no longer says.
+    pub fn volume_naming(&self) -> volume_name::VolumeNaming {
+        match self {
+            Self::Rar15To40(archive) if archive.main.uses_new_numbering() => {
+                volume_name::VolumeNaming::Part
+            }
+            Self::Rar50Plus(_) => volume_name::VolumeNaming::Part,
+            Self::Rar13(_) | Self::Rar15To40(_) => volume_name::VolumeNaming::Old,
+        }
+    }
+
+    fn first_member_continues(&self) -> bool {
+        self.member_refs()
+            .next()
+            .is_some_and(|member| member.is_split_before())
+    }
+
     /// Volume `index` of the set this first volume begins, named as RAR names it beside `first_path`.
     pub fn volume_path(&self, first_path: &Path, index: usize) -> Option<std::path::PathBuf> {
         let part_names = match self {
