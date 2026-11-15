@@ -27,6 +27,7 @@ create_exception!(rars, BadRarFile, Error);
 create_exception!(rars, BadPassword, BadRarFile);
 create_exception!(rars, PasswordRequired, BadRarFile);
 create_exception!(rars, UnsupportedRarFeature, Error);
+create_exception!(rars, NotRarFile, Error);
 create_exception!(rars, UnsafeArchivePath, Error);
 create_exception!(rars, UnsafeLinkWarning, pyo3::exceptions::PyUserWarning);
 
@@ -2101,6 +2102,7 @@ fn rars(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         "UnsupportedRarFeature",
         py.get_type::<UnsupportedRarFeature>(),
     )?;
+    m.add("NotRarFile", py.get_type::<NotRarFile>())?;
     m.add("UnsafeArchivePath", py.get_type::<UnsafeArchivePath>())?;
     m.add("UnsafeLinkWarning", py.get_type::<UnsafeLinkWarning>())?;
     for version in [
@@ -3096,6 +3098,9 @@ fn map_error(error: rars_rs::Error) -> PyErr {
     }
     if error_is_bad_password(&error) {
         return BadPassword::new_err(message);
+    }
+    if matches!(error.root_cause(), rars_rs::Error::UnsupportedSignature) {
+        return NotRarFile::new_err(message);
     }
     use rars_rs::ErrorKind;
     match error.kind() {
