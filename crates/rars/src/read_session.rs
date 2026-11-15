@@ -31,6 +31,14 @@ impl<'a> ReadSession<'a> {
         crate::ArchiveReader::read_path_cached(path, self.options, Arc::clone(&self.key_cache))
     }
 
+    /// Parses one seekable volume as [`ArchiveReader::read_reader_with_options`] does.
+    pub fn read_reader<R: std::io::Read + std::io::Seek + Send + 'static>(
+        &mut self,
+        reader: R,
+    ) -> Result<Archive> {
+        crate::ArchiveReader::read_reader_cached(reader, self.options, Arc::clone(&self.key_cache))
+    }
+
     /// Parses one in-memory volume as [`ArchiveReader::read_owned_with_options`] does.
     pub fn read_owned(&mut self, input: Vec<u8>) -> Result<Archive> {
         crate::ArchiveReader::read_owned_cached(input, self.options, Arc::clone(&self.key_cache))

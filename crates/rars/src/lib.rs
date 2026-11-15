@@ -1649,6 +1649,14 @@ impl ArchiveReader {
         reader: R,
         options: ArchiveReadOptions<'_>,
     ) -> Result<Archive> {
+        Self::read_reader_cached(reader, options, Arc::default())
+    }
+
+    fn read_reader_cached<R: Read + std::io::Seek + Send + 'static>(
+        reader: R,
+        options: ArchiveReadOptions<'_>,
+        key_cache: Arc<rar50::Rar50KeyCache>,
+    ) -> Result<Archive> {
         options.check_cancelled()?;
         let reader = crate::source::ReaderSource::new(reader)?;
         let source = crate::source::ArchiveSource::Reader(reader.clone());
@@ -1675,13 +1683,16 @@ impl ArchiveReader {
                 source,
                 options,
             )?)),
-            ArchiveFamily::Rar50Plus => Ok(Archive::Rar50Plus(rar50::Archive::parse_file_backed(
-                &mut cursor,
-                len,
-                signature.offset,
-                source,
-                options,
-            )?)),
+            ArchiveFamily::Rar50Plus => Ok(Archive::Rar50Plus(
+                rar50::Archive::parse_file_backed_cached(
+                    &mut cursor,
+                    len,
+                    signature.offset,
+                    source,
+                    options,
+                    key_cache,
+                )?,
+            )),
         }
     }
 
