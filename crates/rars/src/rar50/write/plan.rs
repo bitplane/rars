@@ -155,9 +155,11 @@ pub(super) fn whole_member_workspace(input_size: u64, plan: &CompressPlan) -> u6
     let block = input_size.min(crate::codec::rar50::MAX_LZ_BLOCK_SIZE as u64) as usize;
     // Input, transformed input and competing packed outputs stay live alongside
     // the finder and the per-block token/parse workspace, not instead of them.
-    input_size
-        .saturating_mul(4)
-        .saturating_add(super::streaming_lz_workspace(reach, block, optimal))
+    input_size.saturating_mul(4).saturating_add(if optimal {
+        super::tree_lz_workspace(reach, block)
+    } else {
+        super::streaming_lz_workspace(reach, block, false)
+    })
 }
 
 #[cfg(test)]
