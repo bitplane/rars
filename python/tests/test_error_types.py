@@ -118,3 +118,15 @@ def test_a_corrupt_encrypted_rar4_member_stays_a_bad_password(tmp_path):
     with rars.RarFile(path, password="pw") as archive:
         with pytest.raises(rars.BadPassword):
             archive.testrar()
+
+
+def test_a_corrupt_encrypted_rar5_member_is_a_checksum_error(tmp_path):
+    builder = rars.RarBuilder(format="rar50", store=True, password="pw")
+    builder.add_bytes(PAYLOAD, "large.bin")
+    path = tmp_path / "encrypted.rar"
+    path.write_bytes(builder.to_bytes())
+    flip_byte(path, 20_000)
+    with rars.RarFile(path, password="pw") as archive:
+        with pytest.raises(rars.ChecksumError) as raised:
+            archive.testrar()
+    assert raised.value.member == "large.bin"
