@@ -9,7 +9,8 @@ use crate::codec::rar20::{
 use crate::codec::rar29::{
     unpack29_encode_literals, unpack29_encode_literals_streamed,
     unpack29_encode_literals_with_options, unpack29_encode_literals_with_options_and_progress,
-    ChainEngine, EncodeOptions as Rar29EncodeOptions, Unpack29Encoder,
+    unpack29_encode_ppmd_streamed, ChainEngine, EncodeOptions as Rar29EncodeOptions,
+    Unpack29Encoder,
 };
 use crate::crc32::Crc32;
 pub use crate::filter::{FilterKind, FilterPolicy, FilterSpec};
@@ -802,7 +803,7 @@ fn write_members_to(
                     ),
                     None => match sink {
                         Sink::Seekable(output, _) => {
-                            stream_member(output, member, options, resources, progress)
+                            stream_member(output, member, options, coding, resources, progress)
                         }
                         Sink::Stream(_) => unreachable!("only a seekable output streams"),
                     },
@@ -1187,17 +1188,6 @@ fn encode_rar29_text_member(
     lz_method: u8,
     progress: Option<&WorkTracker<'_>>,
 ) -> Result<EncodedPayload> {
-    let ppmd = |lz_escapes: bool, max_match_distance: usize| {
-        with_codec_progress(progress, |report| {
-            crate::codec::rar29::unpack29_encode_ppmd_with_progress(
-                data,
-                lz_escapes,
-                None,
-                max_match_distance,
-                report,
-            )
-        })
-    };
     // Whichever engine wins, it wins because it was measured against the other
     // over the whole member. Size used to decide it instead: under 1 MiB text
     // was measured, over 16 MiB it went to PPMd unmeasured, and everything
@@ -1215,24 +1205,9 @@ fn encode_rar29_text_member(
     // wide, the sample cannot see the repetition at all. PPMd costs about
     // three times LZ on the same bytes, so text at the top two levels pays for
     // both engines. Levels 1 to 4 skip the trial as they always have.
-    let (lz, (escaped, literals)) = crate::parallel::join(
-        || {
-            with_codec_progress(progress, |report| {
-                unpack29_encode_literals_with_options_and_progress(data, options, report)
-            })
-        },
-        // The escape tokens price themselves against costs measured off the
-        // stream they are shaping, so a member where every escape loses can
-        // still ratify a few before the measurements catch up. A pure-literal
-        // stream is the direct check.
-        || crate::parallel::join(|| ppmd(true, options.max_match_distance), || ppmd(false, 0)),
-    );
-    let mut best = lz?;
-    for candidate in [escaped?, literals?] {
-        if candidate.len() < best.len() {
-            best = candidate;
-        }
-    }
+    let (_, best) = text_trial(data, options, &|encode| {
+        with_codec_progress(progress, |report| encode(report))
+    })?;
     if best.len() >= data.len() {
         return Ok(EncodedPayload {
             data: data.to_vec(),
@@ -1243,6 +1218,59 @@ fn encode_rar29_text_member(
         data: best,
         method: lz_method,
     })
+}
+
+/// One way to run a trial's encode, which decides what its progress reports do.
+type TrialRun<'a> = dyn Fn(
+        &mut dyn FnMut(&mut dyn FnMut(usize) -> bool) -> crate::codec::Result<Vec<u8>>,
+    ) -> Result<Vec<u8>>
+    + Sync
+    + 'a;
+
+/// Codes text as LZ, PPMd with escapes and plain PPMd side by side; the smallest wins, LZ then escapes on a tie.
+fn text_trial(
+    data: &[u8],
+    options: Rar29EncodeOptions,
+    run: &TrialRun<'_>,
+) -> Result<(StreamedEngine, Vec<u8>)> {
+    let ppmd = |escapes: Option<usize>| {
+        run(&mut |report| {
+            crate::codec::rar29::unpack29_encode_ppmd_with_progress(
+                data,
+                escapes.is_some(),
+                None,
+                escapes.unwrap_or(0),
+                report,
+            )
+        })
+    };
+    let (lz, (escaped, literals)) = crate::parallel::join(
+        || {
+            run(&mut |report| {
+                unpack29_encode_literals_with_options_and_progress(data, options, report)
+            })
+        },
+        // The escape tokens price themselves against costs measured off the
+        // stream they are shaping, so a member where every escape loses can
+        // still ratify a few before the measurements catch up. A pure-literal
+        // stream is the direct check.
+        || crate::parallel::join(|| ppmd(Some(options.max_match_distance)), || ppmd(None)),
+    );
+    let mut best = (
+        StreamedEngine::Lz {
+            filter_search: false,
+        },
+        lz?,
+    );
+    for (escapes, candidate) in [
+        (Some(options.max_match_distance), escaped?),
+        (None, literals?),
+    ] {
+        if candidate.len() < best.1.len() {
+            best = (StreamedEngine::Ppmd { escapes }, candidate);
+        }
+    }
+    Ok(best)
 }
 
 fn is_text_ppmd_candidate(data: &[u8]) -> bool {
@@ -1700,7 +1728,7 @@ fn member_header(
     Ok(header)
 }
 
-/// Only plain LZ streams: text, asked-for filters, solid and encryption need the whole member.
+/// A named filter, solid and encryption need the whole member.
 fn streams_member(
     member: &Member<'_>,
     options: WriterOptions,
@@ -1715,25 +1743,90 @@ fn streams_member(
         || member.is_symlink
         || options.features.solid
         || level == 0
-        || options.method == Rar29Method::Ppmd
         || !matches!(
             options.target,
             ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
         )
         || !matches!(
             coding,
-            MemberCoding::Compressed | MemberCoding::Filtered(FilterPolicy::None)
+            MemberCoding::Compressed
+                | MemberCoding::Filtered(FilterPolicy::None | FilterPolicy::Auto)
         )
     {
         return Ok(false);
     }
-    let len = member.unpacked_size()?;
-    if len <= stream_above {
-        return Ok(false);
+    Ok(member.unpacked_size()? > stream_above)
+}
+
+/// Decided before any of the member is coded, since nothing it codes can be taken back.
+#[derive(Clone, Copy)]
+enum StreamedEngine {
+    Lz {
+        filter_search: bool,
+    },
+    /// `escapes` is how far LZ escapes reach back, `None` for literals only.
+    Ppmd {
+        escapes: Option<usize>,
+    },
+}
+
+/// A sample of four reaches stands in for the whole member in the in-memory trials.
+///
+/// That is enough output for the engines to be compared on, which a 128 KiB
+/// screen is not, but repeats further apart than the sample stay invisible to
+/// it, the other case [`encode_rar29_text_member`] records against sampling.
+fn streamed_engine(
+    member: &Member<'_>,
+    len: usize,
+    options: WriterOptions,
+    coding: &MemberCoding,
+    encode_options: Rar29EncodeOptions,
+    progress: &WorkTracker<'_>,
+) -> Result<StreamedEngine> {
+    if options.method == Rar29Method::Ppmd {
+        return Ok(StreamedEngine::Ppmd {
+            escapes: Some(encode_options.max_match_distance),
+        });
     }
-    Ok(!(options.method == Rar29Method::Auto
-        && ppmd_trial_pays(level)
-        && sampled_text(&member.bytes, len)?))
+    let text = sampled_text(&member.bytes, len as u64)?;
+    if !(text && trials_engines(options)) {
+        let policy_searches = match coding {
+            MemberCoding::Filtered(policy) => matches!(policy, FilterPolicy::Auto),
+            _ => true,
+        };
+        return Ok(StreamedEngine::Lz {
+            filter_search: policy_searches && !text,
+        });
+    }
+    let sample_len = engine_sample_len(options).min(len);
+    let mut sample = Vec::with_capacity(sample_len);
+    let mut reader = member.bytes.open()?;
+    reader.seek(SeekFrom::Start(((len - sample_len) / 2) as u64))?;
+    reader
+        .by_ref()
+        .take(sample_len as u64)
+        .read_to_end(&mut sample)?;
+    if sample.len() != sample_len {
+        return Err(Error::SourceChanged(
+            "entry source size changed while compressing",
+        ));
+    }
+    let (engine, _) = text_trial(&sample, encode_options, &|encode| {
+        encode(&mut |_| !progress.is_cancelled()).map_err(map_codec_cancel)
+    })?;
+    Ok(engine)
+}
+
+fn trials_engines(options: WriterOptions) -> bool {
+    options.method == Rar29Method::Auto
+        && ppmd_trial_pays(compression_method_for_level(options).saturating_sub(0x30))
+}
+
+/// As much as one segment of the streamed LZ parse codes.
+fn engine_sample_len(options: WriterOptions) -> usize {
+    dictionary_size_for_options(options)
+        .unwrap_or(RAR29_MAX_DICTIONARY_SIZE)
+        .saturating_mul(4)
 }
 
 /// [`is_text_ppmd_candidate`] on the same windows, read without loading the member.
@@ -1757,13 +1850,31 @@ fn sampled_text(bytes: &MemberBytes<'_>, len: u64) -> Result<bool> {
     Ok(windows_read_as_text(windows.iter().map(Vec::as_slice)))
 }
 
-/// A finder over reach plus batch, and segments of about five reaches.
-fn streamed_workspace(options: WriterOptions) -> u64 {
+/// A filter search holds a filtered segment and a candidate; a PPMd trial holds the sample and two models.
+fn streamed_workspace(options: WriterOptions, coding: &MemberCoding) -> u64 {
     let dictionary =
         dictionary_size_for_options(options).unwrap_or(RAR29_MAX_DICTIONARY_SIZE) as u64;
-    dictionary
+    let segment = engine_sample_len(options) as u64;
+    let lz = dictionary
         .saturating_mul(12 + 6)
-        .saturating_add(2 * 1024 * 1024)
+        .saturating_add(2 * 1024 * 1024);
+    let searching = options.method != Rar29Method::Ppmd
+        && !matches!(coding, MemberCoding::Filtered(FilterPolicy::None));
+    let search = if searching {
+        segment.saturating_mul(2)
+    } else {
+        0
+    };
+    let ppmd = if options.method == Rar29Method::Ppmd || trials_engines(options) {
+        segment
+            .saturating_add(2 * crate::codec::rar29::PPMD_MODEL_BYTES)
+            .saturating_add(crate::codec::rar29::ppmd_search_workspace(
+                dictionary as usize,
+            ))
+    } else {
+        0
+    };
+    lz.saturating_add(search.max(ppmd))
 }
 
 /// The attempt stops short of the member's size, so a stored fallback overwrites all of it.
@@ -1771,6 +1882,7 @@ fn stream_member(
     output: &mut dyn SeekWrite,
     member: &Member<'_>,
     options: WriterOptions,
+    coding: &MemberCoding,
     resources: &WriterResources,
     progress: &WorkTracker<'_>,
 ) -> Result<()> {
@@ -1781,9 +1893,10 @@ fn stream_member(
         .map_err(|_| Error::InvalidArgument("member is larger than this host can hold"))?;
     let encode_options = rar29_encode_options_for_options(options)?;
     let _permit = resources
-        .acquire_serialising_cancellable(streamed_workspace(options), &|| {
+        .acquire_serialising_cancellable(streamed_workspace(options, coding), &|| {
             progress.is_cancelled()
         })?;
+    let engine = streamed_engine(member, len, options, coding, encode_options, progress)?;
     let method = compression_method_for_level(options);
     let header_at = output.stream_position()?;
     let mut sizes = HeaderPayload {
@@ -1807,24 +1920,44 @@ fn stream_member(
         ended: false,
     };
     let mut last = 0usize;
-    let flow = unpack29_encode_literals_streamed(
-        &mut counted,
-        len,
-        encode_options,
-        &mut |position| {
-            let delta = position.saturating_sub(last);
-            last = last.max(position);
-            progress.advance(delta as u64)
-        },
-        &mut |block| {
-            if sizes.packed_size + block.len() as u64 >= unpacked_size {
-                return Ok(ControlFlow::Break(()));
-            }
-            output.write_all(block)?;
-            sizes.packed_size += block.len() as u64;
-            Ok(ControlFlow::Continue(()))
-        },
-    )
+    let mut advance = |position: usize| {
+        let delta = position.saturating_sub(last);
+        last = last.max(position);
+        progress.advance(delta as u64)
+    };
+    let mut write = |block: &[u8]| {
+        if sizes.packed_size + block.len() as u64 >= unpacked_size {
+            return Ok(ControlFlow::Break(()));
+        }
+        output.write_all(block)?;
+        sizes.packed_size += block.len() as u64;
+        Ok(ControlFlow::Continue(()))
+    };
+    let mut choose = |segment: &[u8]| -> crate::codec::Result<Vec<FilterSpec>> {
+        if !crate::filter_search::search_applies(segment) {
+            return Ok(Vec::new());
+        }
+        let mut poll = |_| !progress.is_cancelled();
+        crate::filter_search::choose_filter(&Rar29Search, segment, encode_options, Some(&mut poll))
+            .map(|(specs, _)| specs)
+            .map_err(|error| crate::codec::Error::Io(Box::new(error)))
+    };
+    let flow = match engine {
+        StreamedEngine::Lz { filter_search } => unpack29_encode_literals_streamed(
+            &mut counted,
+            len,
+            encode_options,
+            match filter_search {
+                true => Some(&mut choose),
+                false => None,
+            },
+            &mut advance,
+            &mut write,
+        ),
+        StreamedEngine::Ppmd { escapes } => {
+            unpack29_encode_ppmd_streamed(&mut counted, len, escapes, &mut advance, &mut write)
+        }
+    }
     .map_err(|error| match counted.ended {
         true => Error::SourceChanged("entry source size changed while compressing"),
         false => map_codec_cancel(error),
@@ -3566,17 +3699,111 @@ mod tests {
         );
     }
 
+    fn word_text(len: usize) -> Vec<u8> {
+        let words = [
+            &b"model"[..],
+            b"predicts",
+            b"each",
+            b"byte",
+            b"from",
+            b"context",
+            b"escape",
+            b"window",
+            b"archive",
+            b"the",
+            b"of",
+            b"and",
+        ];
+        let mut state = 0x2545_f491_u32;
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            out.extend_from_slice(words[(state >> 7) as usize % words.len()]);
+            out.push(if state.is_multiple_of(11) {
+                b'\n'
+            } else {
+                b' '
+            });
+        }
+        out.truncate(len);
+        out
+    }
+
+    fn streamed_member(archive: &[u8], index: usize, data: &[u8]) -> Vec<u8> {
+        let parsed = crate::rar15_40::Archive::parse(archive).unwrap();
+        let file = parsed.files().nth(index).unwrap();
+        let packed = file.packed_data(&parsed).unwrap();
+        assert_eq!(file.method, 0x33);
+        assert_eq!(unpack29_decode(&packed, data.len()).unwrap(), data);
+        let mut crc = crate::crc32::Crc32::new();
+        crc.update(data);
+        assert_eq!(file.file_crc, crc.finish());
+        packed
+    }
+
     #[test]
-    fn text_over_the_threshold_keeps_the_whole_member_trials() {
-        let text = b"a line of prose that PPMd would rather code than LZ\n".repeat(8192);
-        let members = entries(&[("text.txt", &text)]);
+    fn text_over_the_threshold_streams_with_the_engine_the_whole_member_trial_picks() {
+        // RAR 2.9 opens a PPMd block with its top bit set and an LZ one without.
+        let ppmd = |packed: &[u8]| packed[0] & 0x80 != 0;
+        let words = word_text(600 * 1024);
+        // The trial's answer is close here: plain PPMd against escapes.
+        let repeated = word_text(200 * 1024).repeat(3);
+
+        let mut engines = Vec::new();
+        for text in [&words, &repeated] {
+            let members = entries(&[("text.txt", text)]);
+            let out = streamed(&members, crate::MemberCoding::Compressed, None).unwrap();
+
+            assert!(out.seeks > 0, "the text member was not streamed");
+            let packed = streamed_member(&out.inner.into_inner(), 0, text);
+            let whole = in_memory(&members, crate::MemberCoding::Compressed);
+            let whole_packed = streamed_member(&whole, 0, text);
+            assert_eq!(ppmd(&packed), ppmd(&whole_packed));
+            engines.push(ppmd(&packed));
+        }
+        assert_eq!(engines, [true, true]);
+    }
+
+    #[test]
+    fn a_filter_friendly_member_streams_close_to_the_in_memory_ratio() {
+        // A random walk per channel: no repeats for LZ, small steps for a filter.
+        let mut audio = Vec::new();
+        let (mut state, mut left, mut right) = (0x2545_f491_u32, 0i16, 0i16);
+        while audio.len() < 1536 * 1024 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            left = left.wrapping_add((state & 0x3f) as i16 - 32);
+            right = right.wrapping_add((state >> 8 & 0x3f) as i16 - 32);
+            audio.extend_from_slice(&left.to_le_bytes());
+            audio.extend_from_slice(&right.to_le_bytes());
+        }
+        let members = entries(&[("audio.wav", &audio)]);
 
         let out = streamed(&members, crate::MemberCoding::Compressed, None).unwrap();
 
-        assert_eq!(out.seeks, 0);
-        assert_eq!(
-            out.inner.into_inner(),
-            in_memory(&members, crate::MemberCoding::Compressed)
+        assert!(out.seeks > 0, "the audio member was not streamed");
+        let packed = streamed_member(&out.inner.into_inner(), 0, &audio);
+        let whole = in_memory(&members, crate::MemberCoding::Compressed);
+        let whole = crate::rar15_40::Archive::parse(&whole).unwrap();
+        let whole = whole.files().next().unwrap().pack_size;
+        let unfiltered = in_memory(
+            &members,
+            crate::MemberCoding::Filtered(crate::FilterPolicy::None),
+        );
+        let unfiltered = crate::rar15_40::Archive::parse(&unfiltered).unwrap();
+        let unfiltered = unfiltered.files().next().unwrap().pack_size;
+        assert!(
+            (packed.len() as u64) < unfiltered / 2,
+            "{} streamed against {unfiltered} unfiltered",
+            packed.len()
+        );
+        assert!(
+            (packed.len() as u64) * 100 <= whole * 102,
+            "{} streamed against {whole} in memory",
+            packed.len()
         );
     }
 

@@ -244,23 +244,35 @@ pub(crate) fn filtered_members(
 fn filtered_members_with_progress(
     input: &[u8],
     filters: &[crate::FilterSpec],
-    mut progress: Option<&mut dyn FnMut(usize) -> bool>,
+    progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<FilteredMembers> {
+    let mut data = input.to_vec();
+    let records = filter_window(&mut data, 0, filters, progress)?;
+    Ok(FilteredMembers { data, records })
+}
+
+/// `data` is the member from `offset` on, so a streamed segment filters where it lies.
+fn filter_window(
+    data: &mut [u8],
+    offset: usize,
+    filters: &[crate::FilterSpec],
+    mut progress: Option<&mut dyn FnMut(usize) -> bool>,
+) -> Result<Vec<OwnedVmFilterRecord>> {
+    let member_len = offset + data.len();
     let mut ordered = filters.iter().collect::<Vec<_>>();
     ordered.sort_by_key(|filter| filter.range.as_ref().map_or(0, |range| range.start));
-    let mut data = input.to_vec();
     let mut records = Vec::with_capacity(filters.len());
     let mut index = 0;
     let mut previous_end = 0;
     while index < ordered.len() {
-        let range = checked_filter_range(input.len(), ordered[index])?;
+        let range = checked_filter_range(member_len, ordered[index])?;
         if range.start < previous_end {
             return Err(Error::InvalidData("RAR 2.9 VM filters partially overlap"));
         }
 
         let mut group_end = index + 1;
         while group_end < ordered.len()
-            && ordered[group_end].range.clone().unwrap_or(0..input.len()) == range
+            && ordered[group_end].range.clone().unwrap_or(0..member_len) == range
         {
             group_end += 1;
         }
@@ -274,7 +286,7 @@ fn filtered_members_with_progress(
             if progress.as_mut().is_some_and(|report| !report(0)) {
                 return Err(Error::Cancelled);
             }
-            let filtered = filter_in_place(&mut data, filter)?;
+            let filtered = filter_in_place(data, offset, filter)?;
             group_records.push(OwnedVmFilterRecord {
                 block_start: filtered.block_start,
                 block_size: filtered.block_size,
@@ -288,7 +300,7 @@ fn filtered_members_with_progress(
         previous_end = range.end;
         index = group_end;
     }
-    Ok(FilteredMembers { data, records })
+    Ok(records)
 }
 
 pub(crate) struct FilteredMembers {
@@ -368,6 +380,7 @@ fn checked_filter_range(
     Ok(range)
 }
 
+#[derive(Clone)]
 struct OwnedVmFilterRecord {
     block_start: usize,
     block_size: usize,
@@ -486,34 +499,42 @@ struct FilteredMember {
     code: &'static [u8],
 }
 
-/// In place: copying the member per record made many-record members quadratic.
-fn filter_in_place(filtered: &mut [u8], filter: &crate::FilterSpec) -> Result<FilteredMember> {
-    let range = checked_filter_range(filtered.len(), filter)?;
+/// In place, from `offset` on: copying the member per record made many-record members quadratic.
+fn filter_in_place(
+    filtered: &mut [u8],
+    offset: usize,
+    filter: &crate::FilterSpec,
+) -> Result<FilteredMember> {
+    let range = checked_filter_range(offset + filtered.len(), filter)?;
+    if range.start < offset {
+        return Err(Error::InvalidData("RAR 2.9 VM filter range is invalid"));
+    }
+    let local = range.start - offset..range.end - offset;
     let (init_regs, code): (Vec<(usize, u32)>, &'static [u8]) = match rar29_filter(filter.kind)? {
         Rar29Filter::E8 => {
-            filters::e8e9_encode(&mut filtered[range.clone()], range.start as u32, false);
+            filters::e8e9_encode(&mut filtered[local.clone()], range.start as u32, false);
             (Vec::new(), RAR3_E8_FILTER_BYTECODE)
         }
         Rar29Filter::E8E9 => {
-            filters::e8e9_encode(&mut filtered[range.clone()], range.start as u32, true);
+            filters::e8e9_encode(&mut filtered[local.clone()], range.start as u32, true);
             (Vec::new(), RAR3_E8E9_FILTER_BYTECODE)
         }
         Rar29Filter::Delta { channels } => {
             filters::encode_in_place(
                 FilterOp::Delta { channels },
-                &mut filtered[range.clone()],
+                &mut filtered[local.clone()],
                 0,
                 rar29_delta_messages(),
             )?;
             (vec![(0, channels as u32)], RAR3_DELTA_FILTER_BYTECODE)
         }
         Rar29Filter::Itanium => {
-            itanium_encode(&mut filtered[range.clone()], range.start as u32);
+            itanium_encode(&mut filtered[local.clone()], range.start as u32);
             (Vec::new(), RAR3_ITANIUM_FILTER_BYTECODE)
         }
         Rar29Filter::Rgb { width, pos_r } => {
-            let encoded = rgb_encode(&filtered[range.clone()], width, pos_r)?;
-            filtered[range.clone()].copy_from_slice(&encoded);
+            let encoded = rgb_encode(&filtered[local.clone()], width, pos_r)?;
+            filtered[local.clone()].copy_from_slice(&encoded);
             let init_regs = if pos_r == 0 {
                 vec![(0, width as u32 + 3)]
             } else {
@@ -522,8 +543,8 @@ fn filter_in_place(filtered: &mut [u8], filter: &crate::FilterSpec) -> Result<Fi
             (init_regs, RAR3_RGB_FILTER_BYTECODE)
         }
         Rar29Filter::Audio { channels } => {
-            let encoded = audio_encode(&filtered[range.clone()], channels)?;
-            filtered[range.clone()].copy_from_slice(&encoded);
+            let encoded = audio_encode(&filtered[local.clone()], channels)?;
+            filtered[local.clone()].copy_from_slice(&encoded);
             (vec![(0, channels as u32)], RAR3_AUDIO_FILTER_BYTECODE)
         }
     };
@@ -948,11 +969,11 @@ fn encode_member_blocks(
     options.block_size = None;
     let mut out = Vec::new();
     for_each_block(
-        &mut InMemory::new(input, history, options),
+        &mut InMemory::new(input, history, &[], options),
         options,
         block_size,
         progress,
-        |_, end, tokens| {
+        |_, end, tokens, _| {
             out.extend_from_slice(&code_block(tokens, &[], end < input.len(), levels)?);
             Ok(ControlFlow::Continue(()))
         },
@@ -962,15 +983,40 @@ fn encode_member_blocks(
     Ok(out)
 }
 
-/// The bytes of [`unpack29_encode_literals_with_options`] without holding the member; `out` breaks to abandon it.
+/// Ranges are the segment's own, so a chooser needs no member to measure against.
+pub(crate) type SegmentFilters<'a> = &'a mut dyn FnMut(&[u8]) -> Result<Vec<crate::FilterSpec>>;
+
+/// The bytes of [`unpack29_encode_literals_with_options`], or with `filters` of [`Unpack29Encoder::encode_member_with_filters`], without holding the member.
 pub(crate) fn unpack29_encode_literals_streamed(
     input: &mut dyn Read,
     len: usize,
     options: EncodeOptions,
+    filters: Option<SegmentFilters<'_>>,
     progress: &mut dyn FnMut(usize) -> bool,
     out: &mut dyn FnMut(&[u8]) -> Result<ControlFlow<()>>,
 ) -> Result<ControlFlow<()>> {
     let mut options = options.constrained();
+    if let Some(choose) = filters {
+        let block_size = filtered_block_size(options, len);
+        options.block_size = None;
+        let window = options.max_match_distance.max(1);
+        let (mut levels, mut programs) = ([0; TABLE_COUNT], Vec::new());
+        return for_each_block(
+            &mut ReadSegments {
+                input,
+                len,
+                window: Vec::new(),
+                filters: Some(choose),
+            },
+            options,
+            block_size,
+            Some(progress),
+            |base, end, tokens, records| {
+                let records = block_filter_records(records, base, end, window, &mut programs)?;
+                out(&code_block(tokens, &records, end < len, &mut levels)?)
+            },
+        );
+    }
     let Some(block_size) = options.block_size.filter(|&size| size != 0 && len > size) else {
         // A single block parses against a smaller finder, so it is read whole to match.
         let mut data = Vec::with_capacity(len);
@@ -989,12 +1035,92 @@ pub(crate) fn unpack29_encode_literals_streamed(
             input,
             len,
             window: Vec::new(),
+            filters: None,
         },
         options,
         block_size,
         Some(progress),
-        |_, end, tokens| out(&code_block(tokens, &[], end < len, &mut levels)?),
+        |_, end, tokens, _| out(&code_block(tokens, &[], end < len, &mut levels)?),
     )
+}
+
+/// The least a streamed PPMd member codes between reads; it codes four reaches when that is more.
+const PPMD_STREAM_SEGMENT: usize = 256 * 1024;
+/// A batch filled ahead and the longest token, so a search by a segment's end sees what the in-memory one does.
+const PPMD_STREAM_LOOKAHEAD: usize = PpmdMatchSearch::MAX_BATCH + MAX_PPMD_REPEAT_LENGTH;
+
+/// The bytes of [`unpack29_encode_ppmd_with_progress`] without holding the member; `out` breaks to abandon it.
+///
+/// `escapes` is the distance LZ escapes reach back, or `None` for literals only.
+pub(crate) fn unpack29_encode_ppmd_streamed(
+    input: &mut dyn Read,
+    len: usize,
+    escapes: Option<usize>,
+    progress: &mut dyn FnMut(usize) -> bool,
+    out: &mut dyn FnMut(&[u8]) -> Result<ControlFlow<()>>,
+) -> Result<ControlFlow<()>> {
+    if !progress(0) {
+        return Err(Error::Cancelled);
+    }
+    if out(&[
+        0x80 | 0x20 | ((PPMD_ORDER as u8) - 1),
+        PPMD_DICTIONARY_MB - 1,
+    ])?
+    .is_break()
+    {
+        return Ok(ControlFlow::Break(()));
+    }
+    let mut encoder = PpmdEncoder::new(PPMD_ORDER, PPMD_ESC, usize::from(PPMD_DICTIONARY_MB))?;
+    let reach = escapes.map_or(0, |distance| len.min(distance).min(MAX_HISTORY));
+    let mut state = PpmdHybrid::new();
+    let mut window = Vec::new();
+    // The member position of `window[0]`.
+    let mut origin = 0usize;
+    let mut pos = 0usize;
+    while pos < len {
+        let keep_from = pos.saturating_sub(reach);
+        window.drain(..keep_from - origin);
+        state.rebase(keep_from - origin);
+        origin = keep_from;
+        let end = pos
+            .saturating_add(reach.saturating_mul(4).max(PPMD_STREAM_SEGMENT))
+            .min(len);
+        let lookahead = escapes.map_or(0, |_| PPMD_STREAM_LOOKAHEAD);
+        let want = end.saturating_add(lookahead).min(len) - origin;
+        let have = window.len();
+        window.resize(want.max(have), 0);
+        input.read_exact(&mut window[have..])?;
+        if let Some(distance) = escapes {
+            let mut report = |local: usize| progress(origin + local);
+            pos = origin
+                + encode_ppmd_hybrid_span(
+                    &mut PpmdMatchSearch::new(&window, distance, reach),
+                    pos - origin,
+                    end - origin,
+                    &mut encoder,
+                    &mut state,
+                    |_| (),
+                    Some(&mut report),
+                )?;
+        } else {
+            for (at, &byte) in window[pos - origin..end - origin].iter().enumerate() {
+                if (pos + at).is_multiple_of(4096) && !progress(pos + at) {
+                    return Err(Error::Cancelled);
+                }
+                encoder.encode_literal(byte)?;
+            }
+            pos = end;
+        }
+        if out(&encoder.take_output())?.is_break() {
+            return Ok(ControlFlow::Break(()));
+        }
+    }
+    let (packed, _) = encoder.finish_keeping_model()?;
+    let flow = out(&packed)?;
+    if !progress(len) {
+        return Err(Error::Cancelled);
+    }
+    Ok(flow)
 }
 
 /// Where a block parse reads its member from, one segment at a time.
@@ -1008,20 +1134,34 @@ trait Segments {
         behind: usize,
         end: usize,
         reach: usize,
-    ) -> Result<std::borrow::Cow<'_, [u8]>>;
+    ) -> Result<Segment<'_>>;
+}
+
+struct Segment<'a> {
+    bytes: std::borrow::Cow<'a, [u8]>,
+    /// Those whose blocks start in the segment, which its blocks declare.
+    records: std::borrow::Cow<'a, [OwnedVmFilterRecord]>,
 }
 
 struct InMemory<'a> {
     input: &'a [u8],
     history: &'a [u8],
+    /// In the order their blocks start.
+    records: &'a [OwnedVmFilterRecord],
 }
 
 impl<'a> InMemory<'a> {
-    fn new(input: &'a [u8], history: &'a [u8], options: EncodeOptions) -> Self {
+    fn new(
+        input: &'a [u8],
+        history: &'a [u8],
+        records: &'a [OwnedVmFilterRecord],
+        options: EncodeOptions,
+    ) -> Self {
         let reach = options.max_match_distance.min(MAX_HISTORY);
         Self {
             input,
             history: &history[history.len().saturating_sub(reach)..],
+            records,
         }
     }
 }
@@ -1037,9 +1177,16 @@ impl Segments for InMemory<'_> {
         behind: usize,
         end: usize,
         reach: usize,
-    ) -> Result<std::borrow::Cow<'_, [u8]>> {
+    ) -> Result<Segment<'_>> {
         let (input, history) = (self.input, self.history);
-        Ok(if behind == reach || history.is_empty() {
+        let first = self
+            .records
+            .partition_point(|record| record.block_start < start);
+        let last = self
+            .records
+            .partition_point(|record| record.block_start < end);
+        let records = std::borrow::Cow::Borrowed(&self.records[first..last]);
+        let bytes = if behind == reach || history.is_empty() {
             std::borrow::Cow::Borrowed(&input[start - behind..end])
         } else {
             let carried = &history[history.len().saturating_sub(reach - behind)..];
@@ -1047,18 +1194,20 @@ impl Segments for InMemory<'_> {
             joined.extend_from_slice(carried);
             joined.extend_from_slice(&input[start - behind..end]);
             std::borrow::Cow::Owned(joined)
-        })
+        };
+        Ok(Segment { bytes, records })
     }
 }
 
-/// Keeps the last reach of what it has read, which is all a segment looks back at.
-struct ReadSegments<'a> {
+/// Keeps the last reach of what it has read, filtered as a decoder's window holds it.
+struct ReadSegments<'a, 'f> {
     input: &'a mut dyn Read,
     len: usize,
     window: Vec<u8>,
+    filters: Option<SegmentFilters<'f>>,
 }
 
-impl Segments for ReadSegments<'_> {
+impl Segments for ReadSegments<'_, '_> {
     fn len(&self) -> usize {
         self.len
     }
@@ -1069,11 +1218,26 @@ impl Segments for ReadSegments<'_> {
         behind: usize,
         end: usize,
         _reach: usize,
-    ) -> Result<std::borrow::Cow<'_, [u8]>> {
+    ) -> Result<Segment<'_>> {
         self.window.drain(..self.window.len() - behind);
         self.window.resize(behind + end - start, 0);
         self.input.read_exact(&mut self.window[behind..])?;
-        Ok(std::borrow::Cow::Borrowed(&self.window))
+        let mut records = Vec::new();
+        if let Some(choose) = self.filters.as_mut() {
+            let fresh = &mut self.window[behind..];
+            let mut split = Vec::new();
+            for filter in choose(fresh)? {
+                let range = checked_filter_range(fresh.len(), &filter)?;
+                let moved =
+                    crate::FilterSpec::range(filter.kind, start + range.start..start + range.end);
+                split.extend(split_large_filter(end, moved)?);
+            }
+            records = filter_window(fresh, start, &split, None)?;
+        }
+        Ok(Segment {
+            bytes: std::borrow::Cow::Borrowed(&self.window),
+            records: std::borrow::Cow::Owned(records),
+        })
     }
 }
 
@@ -1082,7 +1246,12 @@ fn for_each_block(
     options: EncodeOptions,
     block_size: usize,
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
-    mut code: impl FnMut(usize, usize, &[EncodeToken]) -> Result<ControlFlow<()>>,
+    mut code: impl FnMut(
+        usize,
+        usize,
+        &[EncodeToken],
+        &[OwnedVmFilterRecord],
+    ) -> Result<ControlFlow<()>>,
 ) -> Result<ControlFlow<()>> {
     let block_size = block_size.max(1);
     let reach = options.max_match_distance.min(MAX_HISTORY);
@@ -1100,7 +1269,10 @@ fn for_each_block(
     for segment in ends.chunks(per_segment) {
         let segment_end = *segment.last().expect("chunks are never empty");
         let behind = reach.min(block_start);
-        let combined = input.segment(block_start, behind, segment_end, reach)?;
+        let Segment {
+            bytes: combined,
+            records,
+        } = input.segment(block_start, behind, segment_end, reach)?;
         let base = combined.len() - (segment_end - block_start);
         let mut parser = LzParser::new(&combined, base, options, block_size);
         let origin = block_start;
@@ -1113,7 +1285,7 @@ fn for_each_block(
             }
             let local: Vec<usize> = batch.iter().map(|&end| base + end - origin).collect();
             for (tokens, &end) in parser.parse_blocks(&local).iter().zip(batch) {
-                if code(block_start, end, tokens)?.is_break() {
+                if code(block_start, end, tokens, &records)?.is_break() {
                     return Ok(ControlFlow::Break(()));
                 }
                 block_start = end;
@@ -1425,32 +1597,19 @@ fn encode_filtered_member_blocks(
     levels: &mut [u8; TABLE_COUNT],
     progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<u8>> {
-    // A record's offset is relative to the head of its own block, so a block no
-    // larger than the window keeps every offset inside it.
-    let block_size = options
-        .block_size
-        .filter(|&size| size != 0)
-        .unwrap_or(data.len().max(1))
-        .min(options.max_match_distance.max(1))
-        .max(1);
+    let block_size = filtered_block_size(options, data.len());
     let window = options.max_match_distance.max(1);
     let mut inner = options;
     inner.block_size = None;
     let mut programs: Vec<&'static [u8]> = Vec::new();
     let mut out = Vec::new();
     for_each_block(
-        &mut InMemory::new(data, history, inner),
+        &mut InMemory::new(data, history, filters, inner),
         inner,
         block_size,
         progress,
-        |base, end, tokens| {
-            let in_block: Vec<&OwnedVmFilterRecord> = filters
-                .iter()
-                .filter(|record| {
-                    record.block_start >= base && record.block_start < end.max(base + 1)
-                })
-                .collect();
-            let records = encoded_filter_records_at(&in_block, base, window, &mut programs)?;
+        |base, end, tokens, records| {
+            let records = block_filter_records(records, base, end, window, &mut programs)?;
             out.extend_from_slice(&code_block(tokens, &records, end < data.len(), levels)?);
             Ok(ControlFlow::Continue(()))
         },
@@ -1458,6 +1617,32 @@ fn encode_filtered_member_blocks(
     .continue_value()
     .expect("an in-memory member codes every block");
     Ok(out)
+}
+
+/// A record's offset is relative to the head of its own block, so a block no
+/// larger than the window keeps every offset inside it.
+fn filtered_block_size(options: EncodeOptions, len: usize) -> usize {
+    options
+        .block_size
+        .filter(|&size| size != 0)
+        .unwrap_or(len.max(1))
+        .min(options.max_match_distance.max(1))
+        .max(1)
+}
+
+/// A block declares the filters that start in it, relative to its head.
+fn block_filter_records(
+    records: &[OwnedVmFilterRecord],
+    base: usize,
+    end: usize,
+    window: usize,
+    programs: &mut Vec<&'static [u8]>,
+) -> Result<Vec<Vec<u8>>> {
+    let in_block: Vec<&OwnedVmFilterRecord> = records
+        .iter()
+        .filter(|record| record.block_start >= base && record.block_start < end.max(base + 1))
+        .collect();
+    encoded_filter_records_at(&in_block, base, window, programs)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2047,53 +2232,95 @@ fn encode_ppmd_hybrid_with_progress(
     input: &[u8],
     max_match_distance: usize,
     encoder: &mut PpmdEncoder,
+    on_token: impl FnMut(PpmdEncodeToken),
+    progress: Option<&mut dyn FnMut(usize) -> bool>,
+) -> Result<()> {
+    let reach = input.len().min(max_match_distance).min(MAX_HISTORY);
+    encode_ppmd_hybrid_span(
+        &mut PpmdMatchSearch::new(input, max_match_distance, reach),
+        0,
+        input.len(),
+        encoder,
+        &mut PpmdHybrid::new(),
+        on_token,
+        progress,
+    )
+    .map(|_| ())
+}
+
+/// Carried across spans so a streamed member decides as one coded whole would.
+struct PpmdHybrid {
+    costs: PpmdTokenCosts,
+    search_from: usize,
+    next_check: usize,
+}
+
+impl PpmdHybrid {
+    fn new() -> Self {
+        Self {
+            costs: PpmdTokenCosts::new(),
+            search_from: 0,
+            next_check: 0,
+        }
+    }
+
+    /// Follows a window whose start moved `by` bytes on.
+    fn rebase(&mut self, by: usize) {
+        self.search_from = self.search_from.saturating_sub(by);
+        self.next_check = self.next_check.saturating_sub(by);
+    }
+}
+
+/// Returns where it stopped, since a token that starts before `end` may finish past it.
+fn encode_ppmd_hybrid_span(
+    search: &mut PpmdMatchSearch<'_>,
+    mut pos: usize,
+    end: usize,
+    encoder: &mut PpmdEncoder,
+    state: &mut PpmdHybrid,
     mut on_token: impl FnMut(PpmdEncodeToken),
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
-) -> Result<()> {
-    let mut costs = PpmdTokenCosts::new();
-    let mut search = PpmdMatchSearch::new(input, max_match_distance);
-    let mut pos = 0usize;
-    let mut search_from = 0usize;
-    let mut next_check = 0usize;
-    while pos < input.len() {
-        if pos >= next_check {
+) -> Result<usize> {
+    let input = search.input;
+    while pos < end {
+        if pos >= state.next_check {
             if progress.as_mut().is_some_and(|report| !report(pos)) {
                 return Err(Error::Cancelled);
             }
-            next_check = pos.saturating_add(4096);
+            state.next_check = pos.saturating_add(4096);
         }
         if let Some(length) = ppmd_offset_one_repeat(input, pos) {
-            if costs.repeat_pays(length) {
+            if state.costs.repeat_pays(length) {
                 let before = encoder.spent_bits();
                 encoder.encode_repeat_offset_one(length)?;
-                costs.record_repeat(encoder.spent_bits() - before);
+                state.costs.record_repeat(encoder.spent_bits() - before);
                 on_token(PpmdEncodeToken::RepeatOffsetOne { length });
                 pos += length;
                 continue;
             }
         }
 
-        if pos >= search_from {
+        if pos >= state.search_from {
             if let Some((length, offset)) = search.best(pos) {
-                if costs.match_pays(length) {
+                if state.costs.match_pays(length) {
                     let before = encoder.spent_bits();
                     encoder.encode_match(offset, length)?;
-                    costs.record_match(encoder.spent_bits() - before);
+                    state.costs.record_match(encoder.spent_bits() - before);
                     on_token(PpmdEncodeToken::Match { offset, length });
                     pos += length;
                     continue;
                 }
-                search_from = pos + PPMD_REJECT_SEARCH_COOLDOWN;
+                state.search_from = pos + PPMD_REJECT_SEARCH_COOLDOWN;
             }
         }
 
         let before = encoder.spent_bits();
         encoder.encode_literal(input[pos])?;
-        costs.record_literal(encoder.spent_bits() - before);
+        state.costs.record_literal(encoder.spent_bits() - before);
         on_token(PpmdEncodeToken::Literal(input[pos]));
         pos += 1;
     }
-    Ok(())
+    Ok(pos)
 }
 
 fn ppmd_offset_one_repeat(input: &[u8], pos: usize) -> Option<usize> {
@@ -2125,8 +2352,8 @@ impl<'a> PpmdMatchSearch<'a> {
     const CHUNK: usize = 16 * 1024;
     const MAX_BATCH: usize = Self::CHUNK * 16 * 2;
 
-    fn new(input: &'a [u8], max_match_distance: usize) -> Self {
-        let reach = input.len().min(max_match_distance).min(MAX_HISTORY);
+    /// `reach` is the member's, which a window of it can be shorter than.
+    fn new(input: &'a [u8], max_match_distance: usize, reach: usize) -> Self {
         let batch = (Self::CHUNK * crate::parallel::threads() * 2).min(Self::MAX_BATCH);
         Self {
             input,

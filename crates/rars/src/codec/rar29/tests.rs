@@ -4707,6 +4707,7 @@ fn a_member_read_in_segments_codes_to_the_in_memory_bytes() {
         &mut &input[..],
         input.len(),
         options,
+        None,
         &mut |_| true,
         &mut |block| {
             blocks += 1;
@@ -4730,6 +4731,7 @@ fn a_streamed_member_stops_at_the_block_its_sink_refuses() {
         &mut &input[..],
         input.len(),
         options,
+        None,
         &mut |_| true,
         &mut |_| {
             blocks += 1;
@@ -4744,4 +4746,95 @@ fn a_streamed_member_stops_at_the_block_its_sink_refuses() {
 
     assert_eq!(flow, std::ops::ControlFlow::Break(()));
     assert_eq!(blocks, 3);
+}
+
+#[test]
+fn a_ppmd_member_read_in_segments_codes_to_the_in_memory_bytes() {
+    let text = phrase_member(1200 * 1024);
+    for (escapes, fingerprint) in [
+        (Some(16 * 1024), (228_677, 1_472_184_063)),
+        (None, (209_736, 3_414_149_300)),
+    ] {
+        let mut streamed = Vec::new();
+        let mut writes = 0;
+        let flow = super::unpack29_encode_ppmd_streamed(
+            &mut &text[..],
+            text.len(),
+            escapes,
+            &mut |_| true,
+            &mut |bytes| {
+                writes += 1;
+                streamed.extend_from_slice(bytes);
+                Ok(std::ops::ControlFlow::Continue(()))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(flow, std::ops::ControlFlow::Continue(()));
+        // The header, five segments and the end of the block.
+        assert_eq!(
+            writes, 7,
+            "the packed bytes were not written as they were coded"
+        );
+        assert_eq!(packed_fingerprint(&streamed), fingerprint);
+    }
+}
+
+fn stereo_member(len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len);
+    let mut phase = 0u32;
+    while out.len() < len {
+        phase = phase.wrapping_add(0x0123_4567);
+        let left = ((phase >> 20) as i16).wrapping_mul(3);
+        let right = left.wrapping_sub((phase >> 26) as i16);
+        out.extend_from_slice(&left.to_le_bytes());
+        out.extend_from_slice(&right.to_le_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
+#[test]
+fn a_member_filtered_a_segment_at_a_time_codes_to_the_in_memory_bytes() {
+    use crate::{FilterKind, FilterSpec};
+
+    let input = stereo_member(1024 * 1024 + 6);
+    let options = EncodeOptions::new(16)
+        .with_max_match_distance(64 * 1024)
+        .with_block_size(16 * 1024);
+    let (mut chosen, mut read) = (Vec::new(), 0);
+    let mut streamed = Vec::new();
+    let flow = super::unpack29_encode_literals_streamed(
+        &mut &input[..],
+        input.len(),
+        options,
+        Some(&mut |segment: &[u8]| {
+            // E8 on every other segment, so its file offset has to be the member's.
+            let kind = match chosen.len() % 2 {
+                0 => FilterKind::Delta { channels: 4 },
+                _ => FilterKind::E8,
+            };
+            chosen.push(FilterSpec::range(kind, read..read + segment.len()));
+            read += segment.len();
+            Ok(vec![FilterSpec::whole(kind)])
+        }),
+        &mut |_| true,
+        &mut |block| {
+            streamed.extend_from_slice(block);
+            Ok(std::ops::ControlFlow::Continue(()))
+        },
+    )
+    .unwrap();
+
+    assert_eq!(flow, std::ops::ControlFlow::Continue(()));
+    assert!(
+        chosen.len() > 2,
+        "the member was read in {} segments",
+        chosen.len()
+    );
+    let in_memory = Unpack29Encoder::with_options(options)
+        .encode_member_with_filters(&input, &chosen)
+        .unwrap();
+    assert_eq!(streamed, in_memory);
+    assert_eq!(unpack29_decode(&streamed, input.len()).unwrap(), input);
 }
