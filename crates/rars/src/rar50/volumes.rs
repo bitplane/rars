@@ -142,7 +142,7 @@ where
     };
     first.check_output_limit(budget)?;
     budget.control.check()?;
-    let decryptor = split_decryptor(first, session)?;
+    let decryptor = split_decryptor(volume, first, session)?;
     budget.control.check()?;
     let first_reader = volume
         .source
@@ -184,16 +184,14 @@ where
 }
 
 fn split_decryptor<B: Budget>(
+    volume: &Archive,
     first: &FileHeader,
     session: &DecoderSession<'_, B>,
 ) -> Result<Option<SplitDecryptor>> {
     if !first.encrypted {
         return Ok(None);
     }
-    let keys = first.encryption_keys_cached(
-        session.password,
-        session.shared_key_cache.unwrap_or(&session.key_cache),
-    )?;
+    let keys = first.encryption_keys_cached(session.password, &volume.key_cache)?;
     Ok(Some(SplitDecryptor {
         keys,
         iv: first.encryption_iv()?,

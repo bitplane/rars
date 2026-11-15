@@ -14,7 +14,6 @@ const MAX_KDF_COUNT_LOG: u8 = 24;
 
 type HmacSha256 = Hmac<Sha256>;
 
-#[cfg(test)]
 thread_local! {
     pub(crate) static DERIVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -24,7 +23,6 @@ impl Rar50Keys {
         if kdf_count_log > MAX_KDF_COUNT_LOG {
             return Err(Error::KdfCountTooLarge);
         }
-        #[cfg(test)]
         DERIVATIONS.with(|count| count.set(count.get() + 1));
         let password = crate::crypto::clamp_password(password);
 

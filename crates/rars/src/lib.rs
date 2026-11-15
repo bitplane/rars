@@ -75,6 +75,8 @@ mod producer;
 #[cfg(any(feature = "write", feature = "recovery"))]
 mod progress;
 mod read_control;
+#[doc(hidden)]
+pub mod read_session;
 pub use read_control::ReadCancellation;
 mod extraction_control;
 mod extraction_links;
@@ -132,6 +134,7 @@ pub use progress::{WriteOperation, WriteProgress, WriteProgressEvent};
 pub use reader_scratch::Rar50Scratch;
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::Arc;
 #[cfg(feature = "write")]
 pub use streaming::output::{WriterOutput, WriterVolumes};
 #[cfg(feature = "write")]
@@ -1539,6 +1542,14 @@ impl ArchiveReader {
         input: Vec<u8>,
         options: ArchiveReadOptions<'_>,
     ) -> Result<Archive> {
+        Self::read_owned_cached(input, options, Arc::default())
+    }
+
+    fn read_owned_cached(
+        input: Vec<u8>,
+        options: ArchiveReadOptions<'_>,
+        key_cache: Arc<rar50::Rar50KeyCache>,
+    ) -> Result<Archive> {
         options.check_cancelled()?;
         let signature =
             find_archive_start(&input, SFX_SCAN_LIMIT).ok_or(Error::UnsupportedSignature)?;
@@ -1549,9 +1560,9 @@ impl ArchiveReader {
             ArchiveFamily::Rar15To40 => Ok(Archive::Rar15To40(
                 rar15_40::Archive::parse_owned_with_options(input, options)?,
             )),
-            ArchiveFamily::Rar50Plus => Ok(Archive::Rar50Plus(
-                rar50::Archive::parse_owned_with_options(input, options)?,
-            )),
+            ArchiveFamily::Rar50Plus => Ok(Archive::Rar50Plus(rar50::Archive::parse_owned_cached(
+                input, options, key_cache,
+            )?)),
         }
     }
 
@@ -1634,13 +1645,13 @@ impl ArchiveReader {
         path: impl AsRef<Path>,
         options: ArchiveReadOptions<'_>,
     ) -> Result<Archive> {
-        Self::read_path_cached(path, options, &mut rar50::Rar50KeyCache::default())
+        Self::read_path_cached(path, options, Arc::default())
     }
 
     fn read_path_cached(
         path: impl AsRef<Path>,
         options: ArchiveReadOptions<'_>,
-        key_cache: &mut rar50::Rar50KeyCache,
+        key_cache: Arc<rar50::Rar50KeyCache>,
     ) -> Result<Archive> {
         options.check_cancelled()?;
         let path = path.as_ref();
@@ -1662,35 +1673,6 @@ impl ArchiveReader {
                 )?,
             )),
         }
-    }
-}
-
-/// Parses a volume set so its shared RAR 5 key is derived once, not once per volume.
-pub struct ReadSession<'a> {
-    options: ArchiveReadOptions<'a>,
-    key_cache: rar50::Rar50KeyCache,
-}
-
-impl<'a> ReadSession<'a> {
-    /// Starts a session that parses every volume with `options`.
-    pub fn new(options: ArchiveReadOptions<'a>) -> Self {
-        Self {
-            options,
-            key_cache: rar50::Rar50KeyCache::default(),
-        }
-    }
-
-    /// Parses one volume as [`ArchiveReader::read_path_with_options`] does.
-    pub fn read_path(&mut self, path: impl AsRef<Path>) -> Result<Archive> {
-        ArchiveReader::read_path_cached(path, self.options, &mut self.key_cache)
-    }
-}
-
-impl std::fmt::Debug for ReadSession<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ReadSession")
-            .field("has_password", &self.options.password.is_some())
-            .finish_non_exhaustive()
     }
 }
 
@@ -6215,7 +6197,9 @@ mod tests {
         // WinRAR 7.12 salts a whole set once, so every volume shares one key.
         for stem in ["encrypted_multivol", "header_encrypted_stored_multivol"] {
             let before = derivations();
-            let mut session = ReadSession::new(ArchiveReadOptions::with_password(b"password"));
+            let mut session = crate::read_session::ReadSession::new(
+                ArchiveReadOptions::with_password(b"password"),
+            );
             let volumes = (1..=3)
                 .map(|part| {
                     session
@@ -6243,7 +6227,7 @@ mod tests {
     #[cfg(feature = "encryption")]
     #[test]
     fn extracting_a_set_parsed_without_its_password_derives_its_key_once() {
-        let mut session = ReadSession::new(ArchiveReadOptions::new());
+        let mut session = crate::read_session::ReadSession::new(ArchiveReadOptions::new());
         let volumes = (1..=4)
             .map(|part| {
                 session
@@ -6274,7 +6258,8 @@ mod tests {
     #[test]
     fn read_session_reports_a_wrong_password_on_every_volume() {
         for stem in ["encrypted_multivol", "header_encrypted_stored_multivol"] {
-            let mut session = ReadSession::new(ArchiveReadOptions::with_password(b"wrong"));
+            let mut session =
+                crate::read_session::ReadSession::new(ArchiveReadOptions::with_password(b"wrong"));
             for part in 1..=3 {
                 let error = session
                     .read_path(rar50_fixture(&format!("{stem}.part{part}.rar")))
@@ -6291,6 +6276,7 @@ mod tests {
 #[cfg(all(test, feature = "encryption"))]
 mod key_cache_extraction_tests {
     use super::*;
+    use crate::read_session::ReadSession;
     fn archive() -> Archive {
         ArchiveReader::read_path(
             Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -6340,6 +6326,11 @@ mod key_cache_extraction_tests {
     }
     #[cfg(feature = "write")]
     fn independent_archive() -> Archive {
+        ArchiveReader::read_owned(independent_bytes()).unwrap()
+    }
+
+    #[cfg(feature = "write")]
+    fn independent_bytes() -> Vec<u8> {
         let mut builder = Builder::new(ArchiveVersion::Rar50)
             .store(true)
             .password(Some(b"password".to_vec()));
@@ -6348,7 +6339,7 @@ mod key_cache_extraction_tests {
                 .add_bytes(name, b"payload".to_vec(), None, None)
                 .unwrap();
         }
-        ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap()
+        builder.to_bytes().unwrap()
     }
 
     #[cfg(feature = "write")]
@@ -6384,10 +6375,86 @@ mod key_cache_extraction_tests {
     }
 
     #[cfg(feature = "write")]
+    fn opened_with_password() -> Archive {
+        ArchiveReader::read_owned_with_options(
+            independent_bytes(),
+            ArchiveReadOptions::with_password(b"password"),
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "write")]
+    #[test]
+    fn an_archive_reuses_the_keys_it_checked_at_open() {
+        let archive = opened_with_password();
+        let before = derivations();
+        for options in [
+            ArchiveReadOptions::new().with_threads(1),
+            ArchiveReadOptions::with_password(b"password").with_threads(1),
+        ] {
+            for _ in 0..2 {
+                archive.test_with_options(options).unwrap();
+                archive
+                    .extract_to_parallel_buffered_with_options(options, |_| {
+                        Ok(Box::new(std::io::sink()))
+                    })
+                    .unwrap();
+            }
+        }
+        assert_eq!(derivations() - before, 0);
+    }
+
+    #[cfg(feature = "write")]
+    #[test]
+    fn a_call_password_wins_over_the_open_password() {
+        let archive = opened_with_password();
+        let before = derivations();
+        for _ in 0..2 {
+            let error = archive
+                .read_member_at_with_options(0, ArchiveReadOptions::with_password(b"wrong"))
+                .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::BadPassword);
+        }
+        assert_eq!(
+            archive
+                .read_member_at_with_options(0, ArchiveReadOptions::new())
+                .unwrap()
+                .unwrap(),
+            b"payload"
+        );
+        assert_eq!(derivations() - before, 1);
+    }
+
+    #[test]
+    fn a_session_continuing_a_volume_reuses_its_keys() {
+        let fixture = |part| {
+            Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+                "tests/fixtures/rar50/encrypted_multivol.part{part}.rar"
+            ))
+        };
+        let options = ArchiveReadOptions::with_password(b"password");
+        let before = derivations();
+        let first = ArchiveReader::read_path_with_options(fixture(1), options).unwrap();
+        let mut session = ReadSession::continuing(&first, options);
+        let volumes = vec![
+            first.clone(),
+            session.read_path(fixture(2)).unwrap(),
+            session
+                .read_owned(std::fs::read(fixture(3)).unwrap())
+                .unwrap(),
+        ];
+        extract_volumes_to(&volumes, Some(b"password"), |_| {
+            Ok(Box::new(std::io::sink()))
+        })
+        .unwrap();
+        assert_eq!(derivations() - before, 1);
+    }
+
+    #[cfg(feature = "write")]
     #[test]
     fn wrong_password_fails_before_deriving_later_members() {
-        let archive = independent_archive();
         for parallel_fallback in [false, true] {
+            let archive = independent_archive();
             let before = derivations();
             let options =
                 ArchiveReadOptions::with_password(b"wrong").with_max_total_output_bytes(100);
@@ -6413,15 +6480,21 @@ mod key_cache_extraction_tests {
     }
 
     #[test]
-    fn cache_distinguishes_salts_and_kdf_counts() {
+    fn cache_distinguishes_passwords_salts_and_kdf_counts() {
         let cache = rar50::Rar50KeyCache::default();
         let before = derivations();
         let first = cache.get_or_derive(b"password", [1; 16], 0).unwrap();
         let other_salt = cache.get_or_derive(b"password", [2; 16], 0).unwrap();
         let other_count = cache.get_or_derive(b"password", [1; 16], 1).unwrap();
+        let other_password = cache.get_or_derive(b"other", [1; 16], 0).unwrap();
         assert_ne!(first, other_salt);
         assert_ne!(first, other_count);
+        assert_ne!(first, other_password);
         assert_eq!(first, cache.get_or_derive(b"password", [1; 16], 0).unwrap());
-        assert_eq!(derivations() - before, 3);
+        assert_eq!(
+            other_password,
+            cache.get_or_derive(b"other", [1; 16], 0).unwrap()
+        );
+        assert_eq!(derivations() - before, 4);
     }
 }

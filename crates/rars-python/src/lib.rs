@@ -911,6 +911,7 @@ impl RarFile {
             let iterator = volumes.try_iter()?.unbind();
             return with_volume_sources(
                 py,
+                &self.archive,
                 options,
                 || {
                     Python::attach(|py| {
@@ -934,6 +935,7 @@ impl RarFile {
             let mut asked = false;
             let result = with_volume_sources(
                 py,
+                &self.archive,
                 options,
                 || {
                     asked = true;
@@ -957,6 +959,7 @@ impl RarFile {
         let mut missing = None;
         let result = with_volume_sources(
             py,
+            &self.archive,
             options,
             || {
                 index += 1;
@@ -2869,6 +2872,7 @@ fn extracted_meta(member: &rars_rs::ArchiveMember) -> rars_rs::ExtractedEntryMet
 /// Runs `run` without the GIL over the volumes `next` gives; an exception `next` raises wins over `run`'s error.
 fn with_volume_sources<T: Send>(
     py: Python<'_>,
+    first: &rars_rs::Archive,
     options: rars_rs::ArchiveReadOptions<'_>,
     mut next: impl FnMut() -> PyResult<Option<VolumeSource>> + Send,
     run: impl FnOnce(
@@ -2878,13 +2882,11 @@ fn with_volume_sources<T: Send>(
 ) -> PyResult<rars_rs::Result<T>> {
     let raised: Mutex<Option<PyErr>> = Mutex::new(None);
     let result = py.detach(|| {
-        // Keeps one RAR 5 key derivation for the whole set.
-        let mut session = rars_rs::ReadSession::new(options);
+        // Reuses the keys `first` derived, so the set derives each RAR 5 key once.
+        let mut session = rars_rs::read_session::ReadSession::continuing(first, options);
         let mut pulled = std::iter::from_fn(|| match next() {
             Ok(None) => None,
-            Ok(Some(VolumeSource::Bytes(bytes))) => Some(
-                rars_rs::ArchiveReader::read_owned_with_options(bytes, options),
-            ),
+            Ok(Some(VolumeSource::Bytes(bytes))) => Some(session.read_owned(bytes)),
             Ok(Some(VolumeSource::Path(path))) => Some(session.read_path(path)),
             Err(error) => {
                 *raised.lock().expect("raised lock poisoned") = Some(error);
@@ -3122,6 +3124,105 @@ fn error_is_bad_password(error: &rars_rs::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn encrypted_set() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../rars/tests/fixtures/rar50/encrypted_multivol.part1.rar")
+    }
+
+    // Keeps every derivation on this thread, where the counter sees it.
+    fn one_thread(py: Python<'_>) -> PyRef<'_, ReadOptions> {
+        let kwargs = pyo3::types::PyDict::new(py);
+        kwargs.set_item("threads", 1).unwrap();
+        py.get_type::<ReadOptions>()
+            .call((), Some(&kwargs))
+            .unwrap()
+            .extract::<PyRef<'_, ReadOptions>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_rarfile_derives_each_key_once_however_many_calls_follow() {
+        Python::initialize();
+        let out = std::env::temp_dir().join(format!("rars-key-reuse-{}", std::process::id()));
+        Python::attach(|py| {
+            let options = one_thread(py);
+            let before = rars_rs::crypto::rar50_key_derivations();
+            let file = RarFile::from_path(
+                py,
+                encrypted_set(),
+                Some(b"password".to_vec()),
+                Some(&options),
+            )
+            .unwrap();
+            file.testrar(py, None, Some(&options), None).unwrap();
+            let first = PyString::new(py, &file.infos[0].filename);
+            for _ in 0..2 {
+                file.read(py, &first, None, Some(&options), None).unwrap();
+                file.extract(
+                    py,
+                    &first,
+                    Some(out.clone()),
+                    None,
+                    Overwrite(OverwritePolicy::Always),
+                    Some(&options),
+                    None,
+                    true,
+                    false,
+                    false,
+                )
+                .unwrap();
+                file.extractall(
+                    py,
+                    Some(out.clone()),
+                    None,
+                    None,
+                    Overwrite(OverwritePolicy::Always),
+                    Some(&options),
+                    None,
+                    true,
+                    false,
+                    false,
+                )
+                .unwrap();
+            }
+            assert_eq!(rars_rs::crypto::rar50_key_derivations() - before, 1);
+        });
+        fs::remove_dir_all(out).unwrap();
+    }
+
+    #[test]
+    fn a_volume_given_as_bytes_reuses_the_rarfiles_keys() {
+        Python::initialize();
+        Python::attach(|py| {
+            let options = one_thread(py);
+            let before = rars_rs::crypto::rar50_key_derivations();
+            let file = RarFile::from_path(
+                py,
+                encrypted_set(),
+                Some(b"password".to_vec()),
+                Some(&options),
+            )
+            .unwrap();
+            let later = PyList::new(
+                py,
+                (2..=3).map(|part| {
+                    PyBytes::new(
+                        py,
+                        &fs::read(
+                            encrypted_set()
+                                .with_file_name(format!("encrypted_multivol.part{part}.rar")),
+                        )
+                        .unwrap(),
+                    )
+                }),
+            )
+            .unwrap();
+            file.testrar(py, None, Some(&options), Some(&later))
+                .unwrap();
+            assert_eq!(rars_rs::crypto::rar50_key_derivations() - before, 1);
+        });
+    }
 
     #[test]
     fn binding_preserves_rar5_member_solid_flags() {

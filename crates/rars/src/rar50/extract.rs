@@ -88,11 +88,15 @@ impl FileHeader {
         {
             crate::crypto::require_encryption()?;
 
-            // Both callers have already selected an encrypted member.
-            if let Some(crypto) = &self.crypto {
-                return Ok(crypto.keys.clone());
-            }
-            let password = password.ok_or(Error::NeedPassword)?;
+            // Both callers have already selected an encrypted member. Without a
+            // call password, the keys checked at open stand in for it.
+            let Some(password) = password else {
+                return self
+                    .crypto
+                    .as_ref()
+                    .map(|crypto| crypto.keys.clone())
+                    .ok_or(Error::NeedPassword);
+            };
             let encryption = self.encryption.as_ref().ok_or(Error::InvalidHeader(
                 "RAR 5 encrypted file is missing encryption record",
             ))?;
@@ -459,7 +463,7 @@ impl FileHeader {
             archive,
             decoder,
             password,
-            &super::Rar50KeyCache::default(),
+            &archive.key_cache,
             HistoryRetention::Retain,
         )
     }
@@ -981,13 +985,11 @@ impl Archive {
                 solid,
                 result,
             )? {
-                let key_cache = std::mem::take(&mut session.key_cache);
                 session = DecoderSession::with_allowance(
                     options.password,
                     buffered_decode_limit,
                     allowance,
                 );
-                session.key_cache = key_cache;
                 session.decoder.read_control = budget.control.clone();
                 session.scratch = options.rar50_scratch;
             }
@@ -1029,7 +1031,6 @@ impl Archive {
         &self,
         file: &FileHeader,
         options: crate::ArchiveReadOptions<'_>,
-        key_cache: &super::Rar50KeyCache,
         buffered_decode_limit: u64,
         allowance: &B,
         open: &mut F,
@@ -1042,7 +1043,6 @@ impl Archive {
         let mut budget = crate::output_limit::OutputBudget::new(options);
         let mut session =
             DecoderSession::with_allowance(options.password, buffered_decode_limit, allowance);
-        session.shared_key_cache = Some(key_cache);
         session.decoder.read_control = budget.control.clone();
         self.stream_member(file, options, &mut budget, &mut session, |meta| open(meta))
     }
@@ -1122,7 +1122,6 @@ impl Archive {
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
         let buffered_decode_limit = rar50_buffered_decode_limit(options);
-        let key_cache = super::Rar50KeyCache::default();
         let publication = crate::read_control::ReadControl::for_options(&options);
         let plan = |file: &FileHeader| {
             if file.is_split_before() || file.is_split_after() {
@@ -1165,7 +1164,6 @@ impl Archive {
                         decode_parallel_entry(
                             self,
                             file,
-                            &key_cache,
                             buffered_decode_limit,
                             options,
                             verification,
@@ -1183,16 +1181,7 @@ impl Archive {
                     },
                 )
             },
-            |open, file| {
-                self.extract_inline(
-                    file,
-                    options,
-                    &key_cache,
-                    buffered_decode_limit,
-                    allowance,
-                    open,
-                )
-            },
+            |open, file| self.extract_inline(file, options, buffered_decode_limit, allowance, open),
         )
     }
 }
@@ -1202,7 +1191,6 @@ type ParallelExtractedEntry<B> = member_batches::Decoded<ExtractedEntryMeta, B>;
 fn decode_parallel_entry<B: Budget>(
     archive: &Archive,
     file: &FileHeader,
-    key_cache: &super::Rar50KeyCache,
     buffered_decode_limit: u64,
     options: crate::ArchiveReadOptions<'_>,
     verification: bool,
@@ -1224,7 +1212,6 @@ fn decode_parallel_entry<B: Budget>(
     options.check_cancelled()?;
     let mut session =
         DecoderSession::with_allowance(options.password, buffered_decode_limit, allowance);
-    session.shared_key_cache = Some(key_cache);
     session.decoder.read_control = budget.control.clone();
     session.scratch = options.rar50_scratch;
     // Only a disposable buffered worker can omit the final dictionary copy.
@@ -1264,8 +1251,6 @@ struct DecoderSession<'a, B: Budget = Allowance> {
     decoder: ReaderState<B>,
     allowance: B,
     password: Option<&'a [u8]>,
-    key_cache: super::Rar50KeyCache,
-    shared_key_cache: Option<&'a super::Rar50KeyCache>,
     buffered_decode_limit: u64,
     scratch: Option<&'a crate::Rar50Scratch>,
     // Set by a failed compressed member; a solid successor has no history.
@@ -1282,8 +1267,6 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
             decoder: ReaderState::new(allowance),
             allowance: allowance.clone(),
             password,
-            key_cache: super::Rar50KeyCache::default(),
-            shared_key_cache: None,
             buffered_decode_limit,
             scratch: None,
             solid_chain_broken: false,
@@ -1324,7 +1307,7 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
             return file.write_stored_with_allowance(
                 archive,
                 self.password,
-                self.shared_key_cache.unwrap_or(&self.key_cache),
+                &archive.key_cache,
                 writer,
                 &self.allowance,
             );
@@ -1359,7 +1342,7 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
             .packed_reader_with_allowance(
                 archive,
                 self.password,
-                self.shared_key_cache.unwrap_or(&self.key_cache),
+                &archive.key_cache,
                 &self.allowance,
             )
             .map_err(|error| file.entry_error("reading", error))?;
@@ -1387,7 +1370,7 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
             archive,
             &mut self.decoder,
             self.password,
-            self.shared_key_cache.unwrap_or(&self.key_cache),
+            &archive.key_cache,
             history,
         )
     }
@@ -3172,6 +3155,7 @@ mod tests {
                 crypto: None,
             })],
             source: ArchiveSource::Memory(source),
+            key_cache: Arc::default(),
         }
     }
 
@@ -3231,6 +3215,7 @@ mod tests {
             },
             blocks,
             source: ArchiveSource::Memory(bytes),
+            key_cache: Arc::default(),
         }
     }
 
@@ -3956,20 +3941,18 @@ mod key_cache_tests {
     #[test]
     fn parallel_workers_sharing_a_key_derive_once() {
         let archive = archive();
-        let cache = super::super::Rar50KeyCache::default();
         let barrier = std::sync::Barrier::new(4);
         let count: usize = std::thread::scope(|scope| {
             let jobs: Vec<_> = archive
                 .files()
                 .map(|file| {
-                    let (archive, cache, barrier) = (&archive, &cache, &barrier);
+                    let (archive, barrier) = (&archive, &barrier);
                     scope.spawn(move || {
                         barrier.wait();
                         let before = crate::crypto::rar50::DERIVATIONS.with(std::cell::Cell::get);
                         let entry = decode_parallel_entry(
                             archive,
                             file,
-                            cache,
                             BUFFERED_DECODE_LIMIT,
                             crate::ArchiveReadOptions::with_password(b"password"),
                             false,

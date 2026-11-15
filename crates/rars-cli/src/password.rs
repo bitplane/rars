@@ -1,5 +1,6 @@
 use crate::{CliError, CliResult};
-use rars::{Archive as DetectedArchive, ArchiveReader, Error, ReadSession};
+use rars::read_session::ReadSession;
+use rars::{Archive as DetectedArchive, ArchiveReader, Error};
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
