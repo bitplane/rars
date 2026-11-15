@@ -2883,7 +2883,7 @@ fn with_volume_sources<T: Send>(
     let raised: Mutex<Option<PyErr>> = Mutex::new(None);
     let result = py.detach(|| {
         // Reuses the keys `first` derived, so the set derives each RAR 5 key once.
-        let mut session = rars_rs::ReadSession::continuing(first, options);
+        let mut session = rars_rs::read_session::ReadSession::continuing(first, options);
         let mut pulled = std::iter::from_fn(|| match next() {
             Ok(None) => None,
             Ok(Some(VolumeSource::Bytes(bytes))) => Some(session.read_owned(bytes)),

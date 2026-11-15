@@ -75,6 +75,8 @@ mod producer;
 #[cfg(any(feature = "write", feature = "recovery"))]
 mod progress;
 mod read_control;
+#[doc(hidden)]
+pub mod read_session;
 pub use read_control::ReadCancellation;
 mod extraction_control;
 mod extraction_links;
@@ -1671,49 +1673,6 @@ impl ArchiveReader {
                 )?,
             )),
         }
-    }
-}
-
-/// Parses a volume set so its shared RAR 5 key is derived once, not once per volume.
-pub struct ReadSession<'a> {
-    options: ArchiveReadOptions<'a>,
-    key_cache: Arc<rar50::Rar50KeyCache>,
-}
-
-impl<'a> ReadSession<'a> {
-    /// Starts a session that parses every volume with `options`.
-    pub fn new(options: ArchiveReadOptions<'a>) -> Self {
-        Self {
-            options,
-            key_cache: Arc::default(),
-        }
-    }
-
-    /// Continues a set from `first`, reusing the RAR 5 keys it has already derived.
-    pub fn continuing(first: &Archive, options: ArchiveReadOptions<'a>) -> Self {
-        let key_cache = match first {
-            Archive::Rar50Plus(archive) => Arc::clone(&archive.key_cache),
-            _ => Arc::default(),
-        };
-        Self { options, key_cache }
-    }
-
-    /// Parses one volume as [`ArchiveReader::read_path_with_options`] does.
-    pub fn read_path(&mut self, path: impl AsRef<Path>) -> Result<Archive> {
-        ArchiveReader::read_path_cached(path, self.options, Arc::clone(&self.key_cache))
-    }
-
-    /// Parses one in-memory volume as [`ArchiveReader::read_owned_with_options`] does.
-    pub fn read_owned(&mut self, input: Vec<u8>) -> Result<Archive> {
-        ArchiveReader::read_owned_cached(input, self.options, Arc::clone(&self.key_cache))
-    }
-}
-
-impl std::fmt::Debug for ReadSession<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ReadSession")
-            .field("has_password", &self.options.password.is_some())
-            .finish_non_exhaustive()
     }
 }
 
@@ -6238,7 +6197,9 @@ mod tests {
         // WinRAR 7.12 salts a whole set once, so every volume shares one key.
         for stem in ["encrypted_multivol", "header_encrypted_stored_multivol"] {
             let before = derivations();
-            let mut session = ReadSession::new(ArchiveReadOptions::with_password(b"password"));
+            let mut session = crate::read_session::ReadSession::new(
+                ArchiveReadOptions::with_password(b"password"),
+            );
             let volumes = (1..=3)
                 .map(|part| {
                     session
@@ -6266,7 +6227,7 @@ mod tests {
     #[cfg(feature = "encryption")]
     #[test]
     fn extracting_a_set_parsed_without_its_password_derives_its_key_once() {
-        let mut session = ReadSession::new(ArchiveReadOptions::new());
+        let mut session = crate::read_session::ReadSession::new(ArchiveReadOptions::new());
         let volumes = (1..=4)
             .map(|part| {
                 session
@@ -6297,7 +6258,8 @@ mod tests {
     #[test]
     fn read_session_reports_a_wrong_password_on_every_volume() {
         for stem in ["encrypted_multivol", "header_encrypted_stored_multivol"] {
-            let mut session = ReadSession::new(ArchiveReadOptions::with_password(b"wrong"));
+            let mut session =
+                crate::read_session::ReadSession::new(ArchiveReadOptions::with_password(b"wrong"));
             for part in 1..=3 {
                 let error = session
                     .read_path(rar50_fixture(&format!("{stem}.part{part}.rar")))
@@ -6314,6 +6276,7 @@ mod tests {
 #[cfg(all(test, feature = "encryption"))]
 mod key_cache_extraction_tests {
     use super::*;
+    use crate::read_session::ReadSession;
     fn archive() -> Archive {
         ArchiveReader::read_path(
             Path::new(env!("CARGO_MANIFEST_DIR"))
