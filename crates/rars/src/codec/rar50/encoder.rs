@@ -509,6 +509,11 @@ pub struct EncodeOptions {
     pub lazy_lookahead: usize,
     pub max_match_distance: usize,
     pub optimal_parse: bool,
+    /// A match this long is taken without searching or pricing the positions
+    /// it covers. Held between 8 and the longest match the encoder emits.
+    pub nice_match_length: usize,
+    /// How many times the optimal parse prices each block, at least once.
+    pub parse_passes: usize,
 }
 
 impl EncodeOptions {
@@ -519,7 +524,23 @@ impl EncodeOptions {
             lazy_lookahead: 1,
             max_match_distance: MAX_ENCODER_MATCH_OFFSET,
             optimal_parse: false,
+            nice_match_length: NICE_MATCH_LENGTH,
+            parse_passes: OPTIMAL_PARSE_PASSES,
         }
+    }
+
+    pub const fn with_nice_match_length(mut self, length: usize) -> Self {
+        self.nice_match_length = length;
+        self
+    }
+
+    pub const fn with_parse_passes(mut self, passes: usize) -> Self {
+        self.parse_passes = passes;
+        self
+    }
+
+    fn nice(&self) -> usize {
+        self.nice_match_length.clamp(8, MAX_ENCODER_MATCH_LENGTH)
     }
 
     pub const fn with_optimal_parse(mut self, enabled: bool) -> Self {
@@ -1510,7 +1531,7 @@ impl<B: Budget> OptimalCollector<B> {
                     block,
                     options.max_match_distance,
                     options.max_match_candidates,
-                    NICE_MATCH_LENGTH,
+                    options.nice(),
                     MAX_ENCODER_MATCH_LENGTH,
                     &mut matches.runs,
                     &mut matches.starts,
@@ -1543,7 +1564,7 @@ impl<B: Budget> OptimalCollector<B> {
                     // alternatives. A match that reaches that far is measured
                     // out to its real end, which is the length the parse
                     // commits to and steps over.
-                    let len_limit = avail.min(NICE_MATCH_LENGTH);
+                    let len_limit = avail.min(options.nice());
                     tree.matches(
                         combined,
                         pos,
@@ -1583,7 +1604,7 @@ impl<B: Budget> OptimalCollector<B> {
                             max_length,
                             max_distance,
                             options.max_match_candidates,
-                            NICE_MATCH_LENGTH,
+                            options.nice(),
                             &mut matches.runs,
                         )
                         .map_err(Into::into)?;
@@ -1595,7 +1616,7 @@ impl<B: Budget> OptimalCollector<B> {
                 let reach = (length as usize)
                     .min(block.end - pos)
                     .min(MAX_ENCODER_MATCH_LENGTH);
-                if reach >= NICE_MATCH_LENGTH {
+                if reach >= options.nice() {
                     committed_through = pos + reach;
                 }
             }
@@ -2532,6 +2553,7 @@ fn price_optimal_paths_with_state<const RING: bool>(
     // priced from the positions before it. See [`NICE_MATCH_LENGTH`].
     let mut committed_through = 0usize;
     let match_prices = OptimalMatchPrices::new(prices);
+    let nice = options.nice();
 
     for index in 0..span {
         let pos = start + index;
@@ -2651,7 +2673,7 @@ fn price_optimal_paths_with_state<const RING: bool>(
             .iter()
             .map(|&(_, end, _)| end)
             .max()
-            .filter(|&length| length >= NICE_MATCH_LENGTH);
+            .filter(|&length| length >= nice);
         for &(run_start, run_end, distance) in reaches.iter() {
             let mut length = run_start.max(4);
             if let Some(committed) = committed_reach {
@@ -2683,12 +2705,12 @@ fn price_optimal_paths_with_state<const RING: bool>(
             }
         }
 
-        // A committed match is at least 512 bytes long. Even after the
+        // A committed match is at least eight bytes long. Even after the
         // distance bonus, that length and every collected u32 distance fit
         // their encoder tables, so the endpoint has already been priced.
         let longest_reach = reaches.iter().map(|&(_, length, _)| length).max();
         if let Some(reach) = longest_reach {
-            if reach >= NICE_MATCH_LENGTH {
+            if reach >= nice {
                 committed_through = index + reach;
             }
         }
@@ -2896,7 +2918,7 @@ fn encode_tokens_with_allowance<B: Budget>(
         let passes = if !B::LIMITED && matches.runs.is_empty() {
             1
         } else {
-            OPTIMAL_PARSE_PASSES
+            options.parse_passes.max(1)
         };
         let mut best = None;
         for _ in 1..passes {
@@ -3096,7 +3118,7 @@ fn best_match<B: Budget>(
         consider_match_candidate(&mut best, state, distance_size, length, distance);
     }
     if let Some(best) = best {
-        if best.length == max_length || best.length >= NICE_MATCH_LENGTH {
+        if best.length == max_length || best.length >= options.nice() {
             return Some(best);
         }
     }
@@ -3117,7 +3139,7 @@ fn best_match<B: Budget>(
                 consider_match_candidate(&mut best, state, distance_size, length, distance);
             }
             if let Some(best) = best {
-                if best.length == max_length || best.length >= NICE_MATCH_LENGTH {
+                if best.length == max_length || best.length >= options.nice() {
                     break;
                 }
             }

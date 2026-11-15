@@ -241,7 +241,35 @@ pub(super) fn encode_options_for_level(
         // quick, it already beats WinRAR's own level 1 by 2.71%, and it is the
         // only place left to go when the parse is too slow for the job.
         .with_optimal_parse(level >= 2)
+        .with_nice_match_length(parse_effort_for_level(level).0)
+        .with_parse_passes(parse_effort_for_level(level).1)
         .with_max_match_distance(max_match_distance))
+}
+
+/// The nice match length and parse passes for a level.
+///
+/// Search depth alone barely separates the parsing levels on a member that
+/// fits one window: over eight 4 MiB slices of the bench tars, levels 2, 3 and
+/// 5 packed within 0.07% of each other. These two are what does, on that set
+/// at one thread:
+///
+/// ```text
+/// level  nice  passes       size     time
+///   2      64       2   8,500,998   15.0s
+///   3     512       3   8,447,596   38.6s
+///   4     512       4   8,444,136   47.2s
+///   5    1024       6   8,440,881   75.5s
+/// ```
+///
+/// Level 3 keeps what it always had. Past it, larger members gain more from
+/// the dictionary the level fits than from either of these.
+fn parse_effort_for_level(level: u8) -> (usize, usize) {
+    match level {
+        2 => (64, 2),
+        4 => (512, 4),
+        5.. => (1024, 6),
+        _ => (512, 3),
+    }
 }
 
 /// The encoder settings to try for a level, smallest output kept.
