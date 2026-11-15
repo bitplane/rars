@@ -5846,6 +5846,45 @@ fn parses_rar300_header_encrypted_archive_from_path_with_password() {
 }
 
 #[test]
+fn header_encrypted_archives_reject_a_wrong_password_at_open() {
+    for name in [
+        "encrypted/header_rar300_password.rar",
+        "encrypted/header_rar420_password.rar",
+    ] {
+        let bytes = std::fs::read(fixture(name)).unwrap();
+        let memory = Archive::parse_with_password(&bytes, Some(b"wrong-password"));
+        let path = Archive::parse_path_with_password(fixture(name), Some(b"wrong-password"));
+
+        for result in [memory, path] {
+            let error = result.err().unwrap();
+            assert_eq!(error, Error::WrongPasswordOrCorruptData, "{name}");
+            assert_eq!(error.kind(), rars::ErrorKind::BadPassword, "{name}");
+        }
+    }
+}
+
+#[test]
+fn header_encrypted_archive_with_a_damaged_second_header_is_not_a_wrong_password() {
+    let mut bytes = std::fs::read(fixture("encrypted/header_rar300_password.rar")).unwrap();
+    let archive = Archive::parse_with_password(&bytes, Some(b"password")).unwrap();
+    let second_header = archive.files().next().unwrap().packed_range.end;
+    // Past the eight-byte salt, inside the header's first AES block.
+    bytes[second_header + 8] ^= 0x01;
+    let root = scratch::case("damaged-second-encrypted-header");
+    let path = root.join("damaged.rar");
+    std::fs::write(&path, &bytes).unwrap();
+
+    for result in [
+        Archive::parse_with_password(&bytes, Some(b"password")),
+        Archive::parse_path_with_password(&path, Some(b"password")),
+    ] {
+        let error = result.err().unwrap();
+        assert_ne!(error.kind(), rars::ErrorKind::BadPassword, "{error:?}");
+        assert_ne!(error, Error::WrongPasswordOrCorruptData);
+    }
+}
+
+#[test]
 fn extracts_rar420_header_encrypted_archive_with_password() {
     let bytes = std::fs::read(fixture("encrypted/header_rar420_password.rar")).unwrap();
     let archive = Archive::parse_with_password(&bytes, Some(b"password")).unwrap();

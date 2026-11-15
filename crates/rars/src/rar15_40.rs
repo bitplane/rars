@@ -834,6 +834,7 @@ impl Archive {
             blocks.push(Block::Comment(comment));
         }
         let mut encrypted_header_ciphers = EncryptedHeaderCipherCache::default();
+        let blocks_before_first_header = blocks.len();
 
         while pos < archive.len() {
             if archive.len() - pos < 7 {
@@ -846,6 +847,7 @@ impl Archive {
                     archive,
                     pos,
                     password,
+                    blocks.len() == blocks_before_first_header,
                     &mut encrypted_header_ciphers,
                     &mut budget,
                 )?;
@@ -960,6 +962,7 @@ impl Archive {
             blocks.push(Block::Comment(comment));
         }
         let mut encrypted_header_ciphers = EncryptedHeaderCipherCache::default();
+        let blocks_before_first_header = blocks.len();
 
         while file_len.saturating_sub((sfx_offset + pos) as u64) >= 7 {
             let (block, header, total) = if main.has_encrypted_headers() {
@@ -971,6 +974,7 @@ impl Archive {
                     sfx_offset,
                     pos,
                     password,
+                    blocks.len() == blocks_before_first_header,
                     &mut encrypted_header_ciphers,
                     &mut budget,
                 )?;
@@ -2388,12 +2392,13 @@ fn decrypt_encrypted_header_at(
     archive: &[u8],
     offset: usize,
     password: &[u8],
+    first: bool,
     cipher_cache: &mut EncryptedHeaderCipherCache,
     budget: &mut crate::parse_budget::ParseBudget,
 ) -> Result<EncryptedHeader> {
     #[cfg(not(feature = "encryption"))]
     {
-        let _ = (archive, offset, password, cipher_cache, budget);
+        let _ = (archive, offset, password, first, cipher_cache, budget);
         Err(Error::FeatureDisabled {
             feature: "encryption",
         })
@@ -2411,7 +2416,10 @@ fn decrypt_encrypted_header_at(
         cipher.decrypt_block(&mut first_block);
         let head_size = u16::from_le_bytes([first_block[5], first_block[6]]) as usize;
         if head_size < 7 {
-            return Err(Error::InvalidHeader("RAR 1.5 block header is too short"));
+            return Err(first_header_error(
+                first,
+                Error::InvalidHeader("RAR 1.5 block header is too short"),
+            ));
         }
         // A u16 wire length rounds to at most 65536, including on 32-bit hosts.
         let encrypted_header_size = head_size.next_multiple_of(16);
@@ -2419,7 +2427,7 @@ fn decrypt_encrypted_header_at(
         // length adds at most 65544, which fits usize on both supported widths.
         let encrypted_end = offset + 8 + encrypted_header_size;
         if encrypted_end > archive.len() {
-            return Err(Error::TooShort);
+            return Err(first_header_error(first, Error::TooShort));
         }
         budget.admit(head_size, offset)?;
         // The first 24 bytes and the rounded header end were admitted above.
@@ -2433,7 +2441,8 @@ fn decrypt_encrypted_header_at(
         }
         header.truncate(head_size);
 
-        let mut block = parse_block_header(&header, 0)?;
+        let mut block =
+            parse_decrypted_header(&header, first).map_err(|e| first_header_error(first, e))?;
         block.offset = offset;
         // Parsed add_size is a widened wire u32 and fits both supported widths.
         let payload_size = block.add_size.unwrap_or(0) as usize;
@@ -2449,12 +2458,14 @@ fn decrypt_encrypted_header_at(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_encrypted_header_at(
     file: &mut (impl Read + std::io::Seek),
     file_len: u64,
     archive_offset: usize,
     offset: usize,
     password: &[u8],
+    first: bool,
     cipher_cache: &mut EncryptedHeaderCipherCache,
     budget: &mut crate::parse_budget::ParseBudget,
 ) -> Result<EncryptedHeader> {
@@ -2466,6 +2477,7 @@ fn read_encrypted_header_at(
             archive_offset,
             offset,
             password,
+            first,
             cipher_cache,
             budget,
         );
@@ -2484,16 +2496,19 @@ fn read_encrypted_header_at(
         if remaining < 24 {
             return Err(Error::TooShort);
         }
-        let first = read_exact_at(file, absolute, 24)?;
-        let salt = read_header_salt(&first, 0)?;
+        let prefix = read_exact_at(file, absolute, 24)?;
+        let salt = read_header_salt(&prefix, 0)?;
         budget.check_count(offset)?;
         let mut cipher = cipher_cache.cipher(password, salt)?;
         let mut first_block = [0u8; 16];
-        first_block.copy_from_slice(&first[8..24]);
+        first_block.copy_from_slice(&prefix[8..24]);
         cipher.decrypt_block(&mut first_block);
         let head_size = u16::from_le_bytes([first_block[5], first_block[6]]) as usize;
         if head_size < 7 {
-            return Err(Error::InvalidHeader("RAR 1.5 block header is too short"));
+            return Err(first_header_error(
+                first,
+                Error::InvalidHeader("RAR 1.5 block header is too short"),
+            ));
         }
         // A u16 wire length rounds to at most 65536, including on 32-bit hosts.
         let encrypted_header_size = head_size.next_multiple_of(16);
@@ -2501,7 +2516,7 @@ fn read_encrypted_header_at(
             .checked_add(8)
             .ok_or(Error::InvalidHeader("RAR 1.5 block offset overflows usize"))?;
         if encrypted_header_size as u64 > remaining - 8 {
-            return Err(Error::TooShort);
+            return Err(first_header_error(first, Error::TooShort));
         }
         budget.admit(head_size, offset)?;
         let encrypted_rest_start = encrypted_start
@@ -2517,7 +2532,8 @@ fn read_encrypted_header_at(
         }
         header.truncate(head_size);
 
-        let mut block = parse_block_header(&header, 0)?;
+        let mut block =
+            parse_decrypted_header(&header, first).map_err(|e| first_header_error(first, e))?;
         block.offset = offset;
         // Parsed add_size is a widened wire u32 and fits both supported widths.
         let payload_size = block.add_size.unwrap_or(0) as usize;
@@ -2531,6 +2547,33 @@ fn read_encrypted_header_at(
             total_size,
         })
     }
+}
+
+/// RAR 1.5-4 has no password check, so a damaged first header reads as a wrong key.
+#[cfg(feature = "encryption")]
+fn first_header_error(first: bool, error: Error) -> Error {
+    match error {
+        Error::TooShort | Error::InvalidHeader(_) | Error::CrcMismatch { .. } if first => {
+            Error::WrongPasswordOrCorruptData
+        }
+        error => error,
+    }
+}
+
+/// A wrong key can decrypt to a block type whose CRC is otherwise skipped.
+#[cfg(feature = "encryption")]
+fn parse_decrypted_header(header: &[u8], first: bool) -> Result<BlockHeader> {
+    let block = parse_block_header(header, 0)?;
+    if first && !should_validate_header_crc(block.head_type) {
+        let actual = (crc32(&header[2..]) & 0xffff) as u16;
+        if actual != block.head_crc {
+            return Err(Error::CrcMismatch {
+                expected: block.head_crc,
+                actual,
+            });
+        }
+    }
+    Ok(block)
 }
 
 #[cfg(feature = "encryption")]
@@ -2871,7 +2914,7 @@ fn parse_block_header(input: &[u8], offset: usize) -> Result<BlockHeader> {
     if offset + head_size as usize > input.len() {
         return Err(Error::TooShort);
     }
-    if head_type != MARK_HEAD && should_validate_header_crc(head_type) {
+    if should_validate_header_crc(head_type) {
         let header_end = header_crc_end(input, offset, head_type, flags, head_size)?;
         let actual = (crc32(&input[offset + 2..header_end]) & 0xffff) as u16;
         if actual != head_crc {
@@ -2959,9 +3002,9 @@ fn file_header_comment_crc_end(input: &[u8], offset: usize) -> Result<usize> {
 }
 
 fn should_validate_header_crc(head_type: u8) -> bool {
-    // Historical AV/SIGN blocks are documented with inconsistent CRC fields in
-    // real archives, so readers must not reject them solely on HEAD_CRC.
-    !matches!(head_type, 0x76 | 0x79)
+    // The marker's CRC field is fixed signature bytes, and historical AV/SIGN
+    // blocks carry inconsistent CRC fields in real archives.
+    !matches!(head_type, MARK_HEAD | 0x76 | 0x79)
 }
 
 fn validate_legacy_auth_block_size(head_type: u8, head_size: u16) -> Result<()> {
@@ -3071,6 +3114,7 @@ mod tests {
                 0,
                 0,
                 b"secret",
+                false,
                 &mut super::EncryptedHeaderCipherCache::default(),
                 &mut ParseBudget::new(options),
             )
@@ -3296,7 +3340,12 @@ mod tests {
                         options,
                     ),
                 ] {
-                    if corrupt {
+                    if corrupt && encrypted {
+                        assert!(
+                            matches!(result, Err(Error::WrongPasswordOrCorruptData)),
+                            "{result:?}"
+                        );
+                    } else if corrupt {
                         assert!(
                             matches!(result, Err(Error::CrcMismatch { .. })),
                             "{result:?}"
@@ -3517,6 +3566,7 @@ mod tests {
             start as usize,
             0,
             b"pw",
+            false,
             &mut EncryptedHeaderCipherCache::default(),
             &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new()),
         );
@@ -5039,6 +5089,56 @@ mod tests {
 
     #[test]
     #[cfg(feature = "encryption")]
+    fn first_encrypted_header_checks_crc_even_where_plain_headers_skip_it() {
+        for head_type in [MARK_HEAD, 0x76] {
+            first_encrypted_header_checks_crc(head_type);
+        }
+    }
+
+    #[cfg(feature = "encryption")]
+    fn first_encrypted_header_checks_crc(head_type: u8) {
+        let mut plain = legacy_auth_block(head_type, 32);
+        plain[0..2].copy_from_slice(&0xbeefu16.to_le_bytes());
+        let mut cache = EncryptedHeaderCipherCache::default();
+        cache
+            .cipher(b"pw", [0; 8])
+            .unwrap()
+            .encrypt_in_place(&mut plain)
+            .unwrap();
+        let mut bytes = vec![0; 8];
+        bytes.extend_from_slice(&plain);
+        let options = crate::ArchiveReadOptions::new();
+        for first in [true, false] {
+            let memory = decrypt_encrypted_header_at(
+                &bytes,
+                0,
+                b"pw",
+                first,
+                &mut cache,
+                &mut crate::parse_budget::ParseBudget::new(options),
+            );
+            let seekable = read_encrypted_header_at(
+                &mut std::io::Cursor::new(&bytes),
+                bytes.len() as u64,
+                0,
+                0,
+                b"pw",
+                first,
+                &mut cache,
+                &mut crate::parse_budget::ParseBudget::new(options),
+            );
+            for result in [memory, seekable] {
+                if first {
+                    assert!(matches!(result, Err(Error::WrongPasswordOrCorruptData)));
+                } else {
+                    assert_eq!(result.unwrap().block.head_type, head_type);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
     fn encrypted_header_readers_reject_short_prefixes_and_declared_headers() {
         let mut cache = EncryptedHeaderCipherCache::default();
         for size in [0u16, 6, 17, 65] {
@@ -5056,6 +5156,7 @@ mod tests {
                 &bytes,
                 0,
                 b"pw",
+                false,
                 &mut cache,
                 &mut crate::parse_budget::ParseBudget::new(options),
             )
@@ -5067,6 +5168,7 @@ mod tests {
                 0,
                 0,
                 b"pw",
+                false,
                 &mut cache,
                 &mut crate::parse_budget::ParseBudget::new(options),
             )
@@ -5093,6 +5195,7 @@ mod tests {
                     &bytes,
                     0,
                     b"pw",
+                    false,
                     &mut cache,
                     &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new())
                 ),
@@ -5105,6 +5208,7 @@ mod tests {
                     0,
                     0,
                     b"pw",
+                    false,
                     &mut cache,
                     &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new())
                 ),

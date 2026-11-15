@@ -1,9 +1,12 @@
+from pathlib import Path
+
 import pytest
 import rars
 
 
 FORMATS = ["rar15", "rar20", "rar29", "rar50"]
 PAYLOAD = b"secret payload " * 64
+ENCRYPTED = Path(__file__).resolve().parents[2] / "crates/rars/tests/fixtures/rar15_40/encrypted"
 
 
 def encrypted(format, compressed=True):
@@ -53,3 +56,10 @@ def test_a_call_password_wins_in_later_volumes(tmp_path):
     with pytest.raises(rars.BadPassword):
         archive.testrar(pwd="wrong")
     assert archive.read("large.bin") == bytes(range(256)) * 64
+
+
+@pytest.mark.parametrize("name", ["header_rar300_password.rar", "header_rar420_password.rar"])
+def test_a_wrong_password_on_rar4_header_encryption_raises_at_open(name):
+    with pytest.raises(rars.BadPassword):
+        rars.RarFile(ENCRYPTED / name, password="wrong")
+    assert rars.RarFile(ENCRYPTED / name, password="password").namelist() == ["hello.txt"]
