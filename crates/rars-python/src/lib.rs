@@ -26,7 +26,10 @@ create_exception!(rars, Error, pyo3::exceptions::PyException);
 create_exception!(rars, BadRarFile, Error);
 create_exception!(rars, BadPassword, BadRarFile);
 create_exception!(rars, PasswordRequired, BadRarFile);
+create_exception!(rars, MissingVolume, BadRarFile);
+create_exception!(rars, ChecksumError, BadRarFile);
 create_exception!(rars, UnsupportedRarFeature, Error);
+create_exception!(rars, NotRarFile, Error);
 create_exception!(rars, UnsafeArchivePath, Error);
 create_exception!(rars, UnsafeLinkWarning, pyo3::exceptions::PyUserWarning);
 
@@ -946,7 +949,6 @@ impl RarFile {
             return result.map_err(|error| {
                 if asked {
                     map_error_with(
-                        py,
                         error,
                         "; an archive opened from bytes cannot find its later volumes, so pass them as volumes=",
                     )
@@ -973,9 +975,12 @@ impl RarFile {
             run,
         )?;
         result.map_err(|error| match &missing {
-            Some(path) if is_missing_volume(&error) => {
-                map_error_with(py, error, &format!(": {}", path.display()))
-            }
+            Some(path) if set_fault(&error, is_missing_volume).is_some() => with_attribute(
+                py,
+                map_error_with(error, &format!(": {}", path.display())),
+                "path",
+                path,
+            ),
             _ => map_error(error),
         })
     }
@@ -1167,7 +1172,7 @@ impl RarFile {
     ) -> PyResult<Self> {
         let archive = py
             .detach(|| read(python_read_options(options, password.as_deref())))
-            .map_err(map_error)?;
+            .map_err(map_open_error)?;
         let encoding = options.and_then(|settings| settings.encoding);
         let identity = Arc::new(());
         let infos = archive
@@ -2097,10 +2102,19 @@ fn rars(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("BadRarFile", py.get_type::<BadRarFile>())?;
     m.add("BadPassword", py.get_type::<BadPassword>())?;
     m.add("PasswordRequired", py.get_type::<PasswordRequired>())?;
+    let missing_volume = py.get_type::<MissingVolume>();
+    missing_volume.setattr("volume_number", py.None())?;
+    missing_volume.setattr("path", py.None())?;
+    m.add("MissingVolume", missing_volume)?;
+    let checksum_error = py.get_type::<ChecksumError>();
+    checksum_error.setattr("member", py.None())?;
+    checksum_error.setattr("volume_number", py.None())?;
+    m.add("ChecksumError", checksum_error)?;
     m.add(
         "UnsupportedRarFeature",
         py.get_type::<UnsupportedRarFeature>(),
     )?;
+    m.add("NotRarFile", py.get_type::<NotRarFile>())?;
     m.add("UnsafeArchivePath", py.get_type::<UnsafeArchivePath>())?;
     m.add("UnsafeLinkWarning", py.get_type::<UnsafeLinkWarning>())?;
     for version in [
@@ -2903,28 +2917,73 @@ fn with_volume_sources<T: Send>(
     }
 }
 
-fn is_missing_volume(error: &rars_rs::Error) -> bool {
+/// Callers need the failing volume and member as values, and the core keeps them only in wrappers.
+fn set_fault(
+    error: &rars_rs::Error,
+    is_cause: impl Fn(&rars_rs::Error) -> bool,
+) -> Option<SetFault> {
+    let mut fault = SetFault::default();
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(error) = current {
+        current = error.source();
         // Wrapped errors expose their source as a `Box<Error>`.
-        let error_ref = error.downcast_ref::<rars_rs::Error>().or_else(|| {
+        let Some(error) = error.downcast_ref::<rars_rs::Error>().or_else(|| {
             error
                 .downcast_ref::<Box<rars_rs::Error>>()
                 .map(|boxed| &**boxed)
-        });
-        if matches!(error_ref, Some(rars_rs::Error::MissingVolume)) {
-            return true;
+        }) else {
+            continue;
+        };
+        match error {
+            rars_rs::Error::InVolume { number, .. } => fault.volume_number = Some(*number),
+            rars_rs::Error::AtEntry { name, .. } if fault.member.is_none() => {
+                fault.member = Some(String::from_utf8_lossy(name).into_owned());
+            }
+            error if is_cause(error) => return Some(fault),
+            _ => {}
         }
-        current = error.source();
     }
-    false
+    None
+}
+
+#[derive(Default)]
+struct SetFault {
+    /// The innermost volume, where the fault is rather than where reading began.
+    volume_number: Option<usize>,
+    /// The outermost member, which is the one the caller asked for.
+    member: Option<String>,
+}
+
+fn is_missing_volume(error: &rars_rs::Error) -> bool {
+    matches!(error, rars_rs::Error::MissingVolume)
+}
+
+fn is_checksum_mismatch(error: &rars_rs::Error) -> bool {
+    matches!(
+        error,
+        rars_rs::Error::CrcMismatch { .. }
+            | rars_rs::Error::Crc32Mismatch { .. }
+            | rars_rs::Error::HashMismatch { .. }
+    )
 }
 
 /// `error` as Python would raise it, with `detail` appended to its message.
-fn map_error_with(py: Python<'_>, error: rars_rs::Error, detail: &str) -> PyErr {
-    let error = map_error(error);
-    let message = format!("{}{detail}", error.value(py));
-    PyErr::from_type(error.get_type(py), message)
+fn map_error_with(error: rars_rs::Error, detail: &str) -> PyErr {
+    let message = format!("{error}{detail}");
+    typed_error(error, message)
+}
+
+/// Sets `name` on `error`'s exception object, so callers read details instead of parsing text.
+fn with_attribute<'py>(
+    py: Python<'py>,
+    error: PyErr,
+    name: &str,
+    value: impl IntoPyObject<'py>,
+) -> PyErr {
+    match error.value(py).setattr(name, value) {
+        Ok(()) => error,
+        Err(failed) => failed,
+    }
 }
 
 enum VolumeSource {
@@ -3089,13 +3148,44 @@ fn map_io_error(error: io::Error) -> PyErr {
     PyOSError::new_err(error.to_string())
 }
 
+/// Only the file being opened can be "not a RAR"; a non-RAR later volume is a broken set.
+fn map_open_error(error: rars_rs::Error) -> PyErr {
+    if matches!(error.root_cause(), rars_rs::Error::UnsupportedSignature) {
+        return NotRarFile::new_err(error.to_string());
+    }
+    map_error(error)
+}
+
 fn map_error(error: rars_rs::Error) -> PyErr {
     let message = error.to_string();
+    typed_error(error, message)
+}
+
+fn typed_error(error: rars_rs::Error, message: String) -> PyErr {
     if error_is_need_password(&error) {
         return PasswordRequired::new_err(message);
     }
     if error_is_bad_password(&error) {
         return BadPassword::new_err(message);
+    }
+    if let Some(fault) = set_fault(&error, is_missing_volume) {
+        return Python::attach(|py| {
+            with_attribute(
+                py,
+                MissingVolume::new_err(message),
+                "volume_number",
+                fault.volume_number,
+            )
+        });
+    }
+    // Comment and recovery-record checksums name no member, so they stay plain BadRarFile.
+    if let Some(fault) =
+        set_fault(&error, is_checksum_mismatch).filter(|fault| fault.member.is_some())
+    {
+        return Python::attach(|py| {
+            let error = with_attribute(py, ChecksumError::new_err(message), "member", fault.member);
+            with_attribute(py, error, "volume_number", fault.volume_number)
+        });
     }
     use rars_rs::ErrorKind;
     match error.kind() {
