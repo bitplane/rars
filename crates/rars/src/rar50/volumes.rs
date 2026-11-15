@@ -441,11 +441,14 @@ enum FragmentCheck {
 
 impl FragmentCheck {
     fn of(file: &FileHeader) -> Option<Self> {
+        // A MAC'd CRC32 or hash needs the password; RAR 7 and rars key only the final fragment.
+        if file.uses_hash_mac() {
+            return None;
+        }
         if let Some(crc) = file.data_crc32 {
             return Some(Self::Crc32(crc));
         }
-        // Unconfirmed for encrypted sets, and a keyed hash needs the password.
-        let hash = file.hash.as_ref().filter(|_| !file.encrypted)?;
+        let hash = file.hash.as_ref()?;
         (hash.hash_type == 0)
             .then(|| hash.data.as_slice().try_into().ok())
             .flatten()
