@@ -44,7 +44,9 @@ impl ExecutionPlan {
         sizes: impl ExactSizeIterator<Item = u64>,
         resources: &WriterResources,
     ) -> Result<Self> {
-        let limit = resources.memory_limit();
+        // Output follows from these decisions, so they use the budget for one
+        // job, which a thread count never changes.
+        let limit = resources.planning_memory_limit();
         // Select the requested mode before estimating its active workspace.
         if settings.method == 0 {
             return Ok(Self::Stored);

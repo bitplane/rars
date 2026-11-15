@@ -12,8 +12,47 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-/// Default aggregate compression workspace budget (256 MiB).
+/// Default aggregate compression workspace budget at one thread (256 MiB).
 pub const DEFAULT_WRITER_MEMORY_LIMIT: u64 = 256 * 1024 * 1024;
+
+/// What each worker thread past the first adds to the default budget: one RAR 5
+/// block job at the default level and dictionary, so every thread can hold one.
+pub const DEFAULT_WRITER_MEMORY_PER_THREAD: u64 = 160 * 1024 * 1024;
+
+/// The default compression workspace budget for the current thread count.
+///
+/// [`DEFAULT_WRITER_MEMORY_LIMIT`] plus [`DEFAULT_WRITER_MEMORY_PER_THREAD`] for
+/// each thread past the first. On Linux it stops at a quarter of physical
+/// memory, but never below the one-thread default.
+pub fn default_writer_memory_limit() -> u64 {
+    scaled_writer_memory_limit(crate::parallel::threads(), physical_memory())
+}
+
+fn scaled_writer_memory_limit(threads: usize, physical: Option<u64>) -> u64 {
+    let extra = u64::try_from(threads.saturating_sub(1)).unwrap_or(u64::MAX);
+    let scaled = DEFAULT_WRITER_MEMORY_LIMIT
+        .saturating_add(DEFAULT_WRITER_MEMORY_PER_THREAD.saturating_mul(extra));
+    physical.map_or(scaled, |total| {
+        scaled.min((total / 4).max(DEFAULT_WRITER_MEMORY_LIMIT))
+    })
+}
+
+/// Total physical memory, where the platform says so without a system call.
+fn physical_memory() -> Option<u64> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kib = info
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))?
+        .trim()
+        .strip_suffix("kB")?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    kib.checked_mul(1024)
+}
 
 /// A rewindable input reader used by streaming archive writers.
 pub trait EntryReader: Read + Seek + Send {}
@@ -234,6 +273,8 @@ impl WriteCancellation {
 /// bare-WASM spool payload and index capacity, excluding other writer memory.
 pub struct WriterResources {
     memory_limit: u64,
+    /// The budget for one job, which decides what gets written.
+    planning_limit: u64,
     temp_dir: Option<Arc<PathBuf>>,
     budget: Arc<MemoryBudget>,
     spool_budget: Option<Arc<StorageBudget>>,
@@ -245,8 +286,14 @@ pub struct WriterResources {
 }
 
 impl Default for WriterResources {
+    /// Budgets [`default_writer_memory_limit`] for the thread count at the time
+    /// of the call. Each job is still planned within
+    /// [`DEFAULT_WRITER_MEMORY_LIMIT`], so threads add room for more jobs at
+    /// once and never change the archive written.
     fn default() -> Self {
-        Self::new(DEFAULT_WRITER_MEMORY_LIMIT)
+        let mut resources = Self::new(default_writer_memory_limit());
+        resources.planning_limit = DEFAULT_WRITER_MEMORY_LIMIT.min(resources.memory_limit);
+        resources
     }
 }
 
@@ -254,6 +301,7 @@ impl WriterResources {
     pub fn new(memory_limit: u64) -> Self {
         Self {
             memory_limit,
+            planning_limit: memory_limit,
             temp_dir: None,
             budget: Arc::new(MemoryBudget::new(memory_limit)),
             spool_budget: None,
@@ -473,6 +521,13 @@ impl WriterResources {
 
     pub fn memory_limit(&self) -> u64 {
         self.memory_limit
+    }
+
+    /// What one job may plan to use: the dictionary it fits and how it splits
+    /// a member are decided within this, so the output never depends on how
+    /// many jobs run at once.
+    pub(crate) fn planning_memory_limit(&self) -> u64 {
+        self.planning_limit
     }
 
     pub fn temp_dir(&self) -> Option<&Path> {
@@ -1013,6 +1068,23 @@ impl Drop for MemoryPermit {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_default_budget_grows_with_threads_up_to_a_quarter_of_memory() {
+        use super::*;
+
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(scaled_writer_memory_limit(1, None), 256 * MIB);
+        assert_eq!(scaled_writer_memory_limit(0, None), 256 * MIB);
+        assert_eq!(scaled_writer_memory_limit(8, None), (256 + 7 * 160) * MIB);
+        assert_eq!(
+            scaled_writer_memory_limit(32, Some(8 * 1024 * MIB)),
+            2 * 1024 * MIB
+        );
+        // A small machine keeps the one-thread default rather than shrinking it.
+        assert_eq!(scaled_writer_memory_limit(32, Some(512 * MIB)), 256 * MIB);
+        assert_eq!(scaled_writer_memory_limit(usize::MAX, None), u64::MAX);
+    }
+
     #[test]
     fn entry_source_length_helpers_handle_empty_data_and_length_errors() {
         use super::*;
