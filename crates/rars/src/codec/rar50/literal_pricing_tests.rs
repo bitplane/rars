@@ -397,7 +397,12 @@ fn real_no_match_collections_use_the_shortcut_and_later_matches_reset_poison() {
             if matches.runs.is_empty() {
                 assert_eq!(workspace_state(&workspace), before);
             } else {
-                assert_eq!(workspace_state(&workspace), workspace_state(&old));
+                // Distance memory is scratch past the positions priced from.
+                let (now, then) = (workspace_state(&workspace), workspace_state(&old));
+                assert_eq!(
+                    (now.price, now.length, now.distance),
+                    (then.price, then.length, then.distance)
+                );
             }
         }
     }
