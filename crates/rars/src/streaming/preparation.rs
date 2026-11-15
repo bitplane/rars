@@ -205,6 +205,8 @@ impl<T> Records<T> {
         self.push(value)
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)] // Only feature combinations with the fallback tests use it.
     pub(crate) fn pop(&mut self) -> Option<T> {
         self.values.pop()
     }

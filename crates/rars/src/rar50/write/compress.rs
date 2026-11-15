@@ -519,23 +519,41 @@ fn compress_members_whole(
             return Err(Error::Cancelled);
         }
         if let Execution::Blocks { run_filters, .. } = members[start].execution {
-            results
-                .push(
-                    compress_fallback_member(
-                        start,
-                        &sources[start],
-                        integrity[start],
-                        plan,
-                        run_filters,
-                        members[start].workspace,
-                        resources,
-                        advance,
-                        error_context,
-                    )
-                    .map_err(|error| error_context(start, error))?,
-                )
-                .expect("one compression result per source was admitted");
-            start += 1;
+            // Consecutive fallback members share waves, so a set of mid-size
+            // members fills the machine instead of running one member's two
+            // or three runs at a time. Each member keeps its own runs,
+            // history and filters, so the bytes do not depend on the grouping.
+            let end = start
+                + members[start..]
+                    .iter()
+                    .take_while(|member| {
+                        matches!(
+                            member.execution,
+                            Execution::Blocks { run_filters: same, .. } if same == run_filters
+                        )
+                    })
+                    .count();
+            let required = members[start..end]
+                .iter()
+                .map(|member| member.workspace)
+                .max()
+                .unwrap_or(0);
+            for member in compress_fallback_members(
+                start,
+                &sources[start..end],
+                &integrity[start..end],
+                plan,
+                run_filters,
+                required,
+                resources,
+                advance,
+                error_context,
+            )? {
+                results
+                    .push(member)
+                    .expect("one compression result per source was admitted");
+            }
+            start = end;
             continue;
         }
         let (end, reserved) = whole_member_wave(
@@ -760,19 +778,19 @@ fn compress_whole_member<B: Budget>(
 /// Block execution uses only `encode_options` and searches filters per run;
 /// the candidate list belongs to whole-member execution.
 #[allow(clippy::too_many_arguments)]
-fn compress_fallback_member(
-    index: usize,
-    source: &EntrySource,
-    integrity: (u64, u32, [u8; 32]),
+fn compress_fallback_members(
+    first: usize,
+    sources: &[EntrySource],
+    integrity: &[(u64, u32, [u8; 32])],
     plan: &CompressPlan,
     run_filters: bool,
     required: u64,
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
     error_context: &(dyn Fn(usize, Error) -> Error + Sync),
-) -> Result<CompressedMember> {
+) -> Result<Records<CompressedMember>> {
     struct Remapped<'a> {
-        index: usize,
+        first: usize,
         progress: &'a dyn CompressionProgress,
     }
     impl CompressionProgress for Remapped<'_> {
@@ -782,45 +800,52 @@ fn compress_fallback_member(
         fn advance(&self, bytes: u64) -> bool {
             self.progress.advance(bytes)
         }
-        fn started(&self, _: usize, size: u64) {
-            self.progress.started(self.index, size);
+        fn started(&self, member: usize, size: u64) {
+            self.progress.started(self.first + member, size);
         }
-        fn finished(&self, _: usize, size: u64) {
-            self.progress.finished(self.index, size);
+        fn finished(&self, member: usize, size: u64) {
+            self.progress.finished(self.first + member, size);
         }
     }
     if advance.is_cancelled() || resources.is_cancelled() {
         return Err(Error::Cancelled);
     }
-    let mut integrity = [integrity];
-    let mut packed = compress_streaming_members(
-        std::slice::from_ref(source),
+    let mut integrity = Records::collect(integrity.iter().copied().map(Ok), resources)?;
+    let packed = compress_streaming_members(
+        sources,
         &mut integrity,
         plan,
         run_filters,
         required,
         resources,
         &Remapped {
-            index,
+            first,
             progress: advance,
         },
-        &|_, error| error_context(index, error),
-    )?;
-    let packed = packed.pop().expect("one fallback member");
-    let (input_size, crc32, hash) = integrity[0];
-    Ok(CompressedMember {
-        input_size,
-        crc32,
-        hash,
-        store: should_store_compressed_payload(
-            input_size,
-            packed.len(),
-            false,
-            &FilterPolicy::None,
-        ),
-        packed,
-        solid_continuation: false,
-    })
+        &|member, error| error_context(first + member, error),
+    )
+    .map_err(|error| error_context(first, error))?;
+    Records::collect(
+        packed
+            .into_iter()
+            .zip(integrity.iter())
+            .map(|(packed, &(input_size, crc32, hash))| {
+                Ok(CompressedMember {
+                    input_size,
+                    crc32,
+                    hash,
+                    store: should_store_compressed_payload(
+                        input_size,
+                        packed.len(),
+                        false,
+                        &FilterPolicy::None,
+                    ),
+                    packed,
+                    solid_continuation: false,
+                })
+            }),
+        resources,
+    )
 }
 
 /// Members with independent dictionaries, interleaved so a batch of small
@@ -1970,10 +1995,10 @@ mod tests {
             (resources, &running as &dyn CompressionProgress),
         ] {
             assert_eq!(
-                compress_fallback_member(
+                compress_fallback_members(
                     0,
-                    &EntrySource::from_factory(Untouched),
-                    (7, 0, [0; 32]),
+                    &[EntrySource::from_factory(Untouched)],
+                    &[(7, 0, [0; 32])],
                     &plan,
                     false,
                     0,
@@ -3096,6 +3121,65 @@ mod tests {
             }
             assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
         }
+    }
+
+    #[test]
+    fn fallback_members_packed_together_match_each_packed_alone() {
+        let scratch = crate::scratch::case("grouped-fallback");
+        let first = b"grouped automatic filter fallback\n".repeat(65536);
+        let second: Vec<u8> = (0..600_000u32)
+            .flat_map(|n| (n.wrapping_mul(2_654_435_761) >> 7).to_le_bytes())
+            .collect();
+        let sources = [
+            EntrySource::from_bytes(first.clone()),
+            EntrySource::from_bytes(second.clone()),
+        ];
+        let encode_options = EncodeOptions::new(8).with_max_match_distance(128 * 1024);
+        let plan = CompressPlan {
+            algorithm_version: 0,
+            encode_options,
+            dictionary_size: 128 * 1024,
+            block_size: crate::codec::rar50::LZ_BLOCK_SIZE,
+            solid: false,
+            method: 1,
+            filter_policy: FilterPolicy::Auto,
+            candidates: vec![encode_options].into(),
+        };
+        let resources = WriterResources::new(70 * 1024 * 1024).with_temp_dir(&*scratch);
+        let members = ExecutionPlan::with_resources(
+            &plan,
+            [first.len() as u64, second.len() as u64].into_iter(),
+            &resources,
+        )
+        .unwrap();
+        let ExecutionPlan::IndependentMembers(members) = members else {
+            panic!("automatic filters plan independent members");
+        };
+        assert!(members
+            .iter()
+            .all(|member| matches!(member.execution, Execution::Blocks { .. })));
+
+        let bytes = |member: &mut CompressedMember| {
+            let mut bytes = Vec::new();
+            member.packed.copy_to(&mut bytes).unwrap();
+            bytes
+        };
+        let mut together =
+            compress_members_reporting(&sources, plan.clone(), &resources, &|_| true).unwrap();
+        assert_eq!(together[0].hash, blake2sp::hash(&first));
+        assert_eq!(together[1].hash, blake2sp::hash(&second));
+        for index in 0..2 {
+            let mut alone = compress_members_reporting(
+                &sources[index..index + 1],
+                plan.clone(),
+                &resources,
+                &|_| true,
+            )
+            .unwrap();
+            assert_eq!(bytes(&mut together[index]), bytes(&mut alone[0]));
+        }
+        drop(together);
+        assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
     }
 
     #[test]
