@@ -31,7 +31,7 @@ def test_chunked_legacy_encryption_round_trip(format):
     payload = bytes(range(256)) * 601
     builder.add_bytes(payload, "file")
     archive = rars.RarFile.from_bytes(builder.to_bytes())
-    assert archive.read("file", pwd="secret") == payload
+    assert archive.read("file", password="secret") == payload
 
 
 @pytest.mark.parametrize("format", ["rar13", "rar14", "rar15", "rar20", "rar29", "rar30", "rar40"])

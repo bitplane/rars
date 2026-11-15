@@ -28,6 +28,7 @@ pub(crate) mod write;
 
 pub(crate) use extract::extract_from_feed;
 pub(crate) use extract::test_volumes_to;
+pub(crate) use extract::CommentChecksum;
 pub use extract::{extract_volumes_to, extract_volumes_to_with_redirections};
 #[cfg(feature = "write")]
 pub use write::{
@@ -827,7 +828,7 @@ impl Archive {
                 Block::File(_) => return Ok(None),
                 Block::Service(service) if service.name == b"CMT" => {
                     return service
-                        .decoded_comment_with_options(self, options)
+                        .decoded_comment_with_options(self, options, CommentChecksum::Skip)
                         .map(Some);
                 }
                 _ => {}

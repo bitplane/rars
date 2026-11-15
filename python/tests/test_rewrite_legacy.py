@@ -295,10 +295,10 @@ def test_mixed_legacy_encryption_keeps_plaintext_members_plain(tmp_path, format,
     assert not output.getinfo("plain").is_encrypted
     assert output.read("plain") == b"public"
     assert output.open("plain").read() == b"public"
-    assert output.read("plain", pwd="wrong") == b"public"
+    assert output.read("plain", password="wrong") == b"public"
     extracted = output.extract("plain", tmp_path / "single")
     assert extracted.read_bytes() == b"public"
-    paths = output.extractall(tmp_path / "filtered", members=["plain"], pwd="wrong")
+    paths = output.extractall(tmp_path / "filtered", members=["plain"], password="wrong")
     assert [path.read_bytes() for path in paths] == [b"public"]
     with pytest.raises(KeyError):
         output.extract("missing", tmp_path / "missing")

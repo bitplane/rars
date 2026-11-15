@@ -1,6 +1,9 @@
 #![cfg(feature = "write")]
 
-use rars::{Archive, ArchiveReader, ArchiveVersion, Builder, ErrorKind};
+use rars::{
+    Archive, ArchiveReadOptions, ArchiveReader, ArchiveVersion, Builder, ErrorKind,
+    ReadCancellation,
+};
 
 #[test]
 fn recovery_service_does_not_change_rar5_member_comments() {
@@ -286,5 +289,64 @@ fn legacy_archive_comment_encryption_is_independent_of_member_passwords() {
         } else {
             panic!("legacy output expected");
         }
+    }
+}
+
+#[test]
+fn member_comment_reads_apply_output_limits_and_cancellation() {
+    for version in [
+        ArchiveVersion::Rar14,
+        ArchiveVersion::Rar15,
+        ArchiveVersion::Rar20,
+        ArchiveVersion::Rar29,
+        ArchiveVersion::Rar30,
+        ArchiveVersion::Rar40,
+        ArchiveVersion::Rar50,
+        ArchiveVersion::Rar70,
+    ] {
+        let mut builder = Builder::new(version);
+        builder
+            .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+        builder
+            .set_file_comment(b"file", Some(b"member note".to_vec()))
+            .unwrap();
+        let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        for limit in [
+            ArchiveReadOptions::new().with_max_member_output_bytes(11),
+            ArchiveReadOptions::new().with_max_total_output_bytes(11),
+        ] {
+            assert_eq!(
+                archive.member_comment_at_with_options(0, limit).unwrap(),
+                Some(b"member note".to_vec()),
+                "{version:?}"
+            );
+        }
+        for limit in [
+            ArchiveReadOptions::new().with_max_member_output_bytes(10),
+            ArchiveReadOptions::new().with_max_total_output_bytes(10),
+        ] {
+            assert_eq!(
+                archive
+                    .member_comment_at_with_options(0, limit)
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::ResourceLimit,
+                "{version:?}"
+            );
+        }
+        let token = ReadCancellation::new();
+        token.cancel();
+        assert_eq!(
+            archive
+                .member_comment_at_with_options(
+                    0,
+                    ArchiveReadOptions::new().with_cancellation(&token)
+                )
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Cancelled,
+            "{version:?}"
+        );
     }
 }

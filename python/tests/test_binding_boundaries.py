@@ -294,8 +294,8 @@ def test_explicit_none_password_and_comment_arguments_remain_optional():
     builder.set_file_comment("file.txt", None)
     archive = rars.RarFile.from_bytes(builder.to_bytes(), password=None)
     assert archive.comment is None
-    assert archive.getcomment("file.txt", pwd=None) is None
-    assert archive.read("file.txt", pwd=None) == b"payload"
+    assert archive.getcomment("file.txt", password=None) is None
+    assert archive.read("file.txt", password=None) == b"payload"
 
 
 def test_conversion_refuses_unknown_redirection_kind():
@@ -395,7 +395,7 @@ def test_member_conversion_errors_are_typeerrors(method):
 def test_per_call_password_conversion_errors_are_typeerrors(tmp_path, method):
     archive = rars.RarFile(STORED)
     args = (archive.namelist()[0],) if method in {"read", "extract", "getcomment"} else ()
-    kwargs = {"pwd": object()}
+    kwargs = {"password": object()}
     if method == "extract":
         kwargs["path"] = tmp_path
     if method == "extractall":

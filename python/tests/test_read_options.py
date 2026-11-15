@@ -94,8 +94,8 @@ def test_options_are_immutable_reusable_and_preserve_password_handling():
         options.max_total_output_bytes = 100
     with pytest.raises(rars.PasswordRequired):
         archive.read("file", options=options)
-    assert archive.read("file", pwd="secret", options=options) == b"encrypted payload"
-    archive.testrar(pwd="secret", options=options)
+    assert archive.read("file", password="secret", options=options) == b"encrypted payload"
+    archive.testrar(password="secret", options=options)
     assert not token.is_cancelled()
     for value in [-1, 2**64]:
         with pytest.raises(OverflowError):

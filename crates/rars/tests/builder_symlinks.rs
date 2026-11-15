@@ -1,6 +1,8 @@
 #![cfg(feature = "write")]
 
-use rars::{ArchiveReader, ArchiveVersion, Builder};
+use rars::{
+    ArchiveReadOptions, ArchiveReader, ArchiveVersion, Builder, ErrorKind, ReadCancellation,
+};
 
 #[test]
 fn unix_symlinks_round_trip_without_resolving_targets() {
@@ -468,4 +470,36 @@ fn batch_link_targets_reject_invalid_targets_and_corrupt_dependencies() {
             );
         }
     }
+}
+
+#[test]
+fn legacy_link_targets_apply_per_call_password_limits_and_cancellation() {
+    let mut builder = Builder::new(ArchiveVersion::Rar40).password(Some(b"secret".to_vec()));
+    builder
+        .add_bytes(b"link".to_vec(), b"target".to_vec(), None, Some(0o120750))
+        .unwrap();
+    let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    let password = ArchiveReadOptions::with_password(b"secret");
+    assert_eq!(
+        archive
+            .legacy_symlink_target_at_with_options(0, password.with_max_member_output_bytes(6))
+            .unwrap(),
+        Some(b"target".to_vec())
+    );
+    assert_eq!(
+        archive
+            .legacy_symlink_target_at_with_options(0, password.with_max_member_output_bytes(5))
+            .unwrap_err()
+            .kind(),
+        ErrorKind::ResourceLimit
+    );
+    let token = ReadCancellation::new();
+    token.cancel();
+    assert_eq!(
+        archive
+            .legacy_symlink_target_at_with_options(0, password.with_cancellation(&token))
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Cancelled
+    );
 }
