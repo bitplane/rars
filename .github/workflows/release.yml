@@ -284,67 +284,7 @@ jobs:
           retention-days: 7
 
   # ----------------------------------------------------------------------
-  # 4. Publish public crates to crates.io in dependency order. Requires the
-  #    `release` environment so CARGO_REGISTRY_TOKEN is reachable. Configure
-  #    that environment in GitHub repo settings and put the token there.
-  # ----------------------------------------------------------------------
-  publish-crates:
-    name: Publish crates to crates.io
-    needs: [verify-tag, test]
-    if: github.event_name == 'push' || inputs.publish == 'all'
-    runs-on: ubuntu-latest
-    environment: release
-    permissions:
-      contents: read
-    env:
-      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ env.RELEASE_REF }}
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Publish crates
-        run: |
-          set -euo pipefail
-
-          publish() {
-            local package="$1"
-            local log
-            log="$(mktemp)"
-            echo "::group::Publishing $package"
-            for attempt in 1 2 3 4 5; do
-              if cargo publish --locked -p "$package" 2>&1 | tee "$log"; then
-                echo "::endgroup::"
-                rm -f "$log"
-                return 0
-              fi
-              if grep -Eq "crate .+@.+ already exists on crates.io index|crate version .+ is already uploaded" "$log"; then
-                echo "$package is already published; continuing"
-                echo "::endgroup::"
-                rm -f "$log"
-                return 0
-              fi
-              if [ "$attempt" = 5 ]; then
-                echo "::endgroup::"
-                rm -f "$log"
-                return 1
-              fi
-              echo "Publish failed for $package; waiting for registry/index propagation before retry $((attempt + 1))"
-              sleep 30
-            done
-            echo "::endgroup::"
-            rm -f "$log"
-          }
-
-          publish rars
-          publish rars-cli
-
-  # ----------------------------------------------------------------------
-  # 5. Build Python wheels and an sdist for PyPI. The Python extension uses
+  # 4. Build Python wheels and an sdist for PyPI. The Python extension uses
   #    abi3-py310, so one wheel per OS/architecture covers CPython 3.10+.
   # ----------------------------------------------------------------------
   build-python-wheels:
@@ -432,7 +372,7 @@ jobs:
           retention-days: 7
 
   # ----------------------------------------------------------------------
-  # 5b. Build the npm package. One WebAssembly module serves every platform,
+  # 4b. Build the npm package. One WebAssembly module serves every platform,
   #     so unlike the wheels this is a single job with no matrix.
   # ----------------------------------------------------------------------
   build-npm:
@@ -489,58 +429,109 @@ jobs:
           retention-days: 7
 
   # ----------------------------------------------------------------------
-  # 6. Publish Python wheels and sdist to PyPI using Trusted Publishing.
-  #    Configure the `release` environment as a PyPI trusted publisher.
+  # 5. Publish to crates.io, PyPI and npm, in that order, from one job.
+  #
+  #    The `release` environment holds CARGO_REGISTRY_TOKEN and is the PyPI
+  #    and npm trusted publisher. It needs a reviewer's approval, and GitHub
+  #    asks once per job, so all three registries share this job: one click
+  #    publishes the release. A failed step stops the later registries.
+  #
+  #    A dispatch with `pypi` or `npm` publishes only that registry; its
+  #    build jobs run and the others are skipped.
   # ----------------------------------------------------------------------
-  publish-pypi:
-    name: Publish Python package to PyPI
-    needs: [verify-tag, build-python-wheels, build-python-sdist, publish-crates]
+  publish:
+    name: Publish to crates.io, PyPI and npm
+    needs: [verify-tag, test, build-python-wheels, build-python-sdist, build-npm]
     if: >-
       always()
       && needs.verify-tag.result == 'success'
-      && needs.build-python-wheels.result == 'success'
-      && needs.build-python-sdist.result == 'success'
-      && (
-        needs.publish-crates.result == 'success'
-        || (github.event_name == 'workflow_dispatch' && inputs.publish == 'pypi' && needs.publish-crates.result == 'skipped')
-      )
+      && needs.test.result == 'success'
+      && !contains(needs.*.result, 'failure')
+      && !contains(needs.*.result, 'cancelled')
     runs-on: ubuntu-latest
     environment: release
     permissions:
       contents: read
       id-token: write
+    env:
+      CRATES: ${{ github.event_name == 'push' || inputs.publish == 'all' }}
+      PYPI: ${{ github.event_name == 'push' || inputs.publish == 'pypi' || inputs.publish == 'all' }}
+      NPM: ${{ github.event_name == 'push' || inputs.publish == 'npm' || inputs.publish == 'all' }}
     steps:
+      # crates.io, in dependency order.
+      - uses: actions/checkout@v7
+        if: env.CRATES == 'true'
+        with:
+          ref: ${{ env.RELEASE_REF }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: env.CRATES == 'true'
+
+      - uses: Swatinem/rust-cache@v2
+        if: env.CRATES == 'true'
+
+      - name: Publish crates
+        if: env.CRATES == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          publish() {
+            local package="$1"
+            local log
+            log="$(mktemp)"
+            echo "::group::Publishing $package"
+            for attempt in 1 2 3 4 5; do
+              if cargo publish --locked -p "$package" 2>&1 | tee "$log"; then
+                echo "::endgroup::"
+                rm -f "$log"
+                return 0
+              fi
+              if grep -Eq "crate .+@.+ already exists on crates.io index|crate version .+ is already uploaded" "$log"; then
+                echo "$package is already published; continuing"
+                echo "::endgroup::"
+                rm -f "$log"
+                return 0
+              fi
+              if [ "$attempt" = 5 ]; then
+                echo "::endgroup::"
+                rm -f "$log"
+                return 1
+              fi
+              echo "Publish failed for $package; waiting for registry/index propagation before retry $((attempt + 1))"
+              sleep 30
+            done
+            echo "::endgroup::"
+            rm -f "$log"
+          }
+
+          publish rars
+          publish rars-cli
+
+      # PyPI, by trusted publishing. The wheels get their own directory, kept
+      # apart from the npm tarball: the publish action uploads everything in it.
       - name: Download Python artifacts
+        if: env.PYPI == 'true'
         uses: actions/download-artifact@v8
         with:
-          path: dist
+          path: pypi-dist
           pattern: python-${{ needs.verify-tag.outputs.version }}-*
           merge-multiple: true
 
       - name: Publish Python package
+        if: env.PYPI == 'true'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
+          packages-dir: pypi-dist
           skip-existing: true
 
-  # ----------------------------------------------------------------------
-  # 6b. Publish the npm package.
-  #
-  #     npm trusted publishing needs the package to already exist and to have
-  #     this repository registered as its publisher, so the very first version
-  #     goes up by hand with `npm publish` and every later one comes from here.
-  #     `id-token: write` is what mints the provenance attestation.
-  # ----------------------------------------------------------------------
-  publish-npm:
-    name: Publish npm package
-    needs: [verify-tag, build-npm]
-    if: github.event_name == 'push' || inputs.publish == 'npm' || inputs.publish == 'all'
-    runs-on: ubuntu-latest
-    environment: release
-    permissions:
-      contents: read
-      id-token: write
-    steps:
+      # npm, by trusted publishing. That needs the package to already exist
+      # and to have this repository registered as its publisher, so the very
+      # first version went up by hand with `npm publish`. `id-token: write`
+      # mints the provenance attestation.
       - uses: actions/setup-node@v7
+        if: env.NPM == 'true'
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
@@ -548,13 +539,15 @@ jobs:
       # Trusted publishing needs npm 11.5.1 or newer to mint the OIDC token.
       # Node 22 ships npm 10.
       - name: Update npm
+        if: env.NPM == 'true'
         run: npm install --global npm@latest
 
       - name: Download npm artifact
+        if: env.NPM == 'true'
         uses: actions/download-artifact@v8
         with:
           name: npm-${{ needs.verify-tag.outputs.version }}
-          path: dist
+          path: npm-dist
 
       # No token: npm trusted publishing exchanges the workflow's OIDC identity
       # for a short-lived credential, and attaches a provenance attestation
@@ -565,7 +558,8 @@ jobs:
       #
       # Republishing a version npm already has is an error, and a re-run of a
       # release should not fail on it, so ask first.
-      - name: Publish
+      - name: Publish npm package
+        if: env.NPM == 'true'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           VERSION: ${{ needs.verify-tag.outputs.version }}
@@ -575,18 +569,18 @@ jobs:
             echo "@bitplane/rars@$VERSION is already published; nothing to do"
             exit 0
           fi
-          # The leading ./ is load-bearing. npm parses a bare `dist/foo.tgz` as
-          # the git shorthand `github:dist/foo.tgz` and refuses it with
+          # The leading ./ is load-bearing. npm parses a bare `npm-dist/foo.tgz`
+          # as the git shorthand `github:npm-dist/foo.tgz` and refuses it with
           # EALLOWGIT; only an explicit relative or absolute path is read as a
           # file. npm pack flattens the scope into the filename.
-          npm publish --provenance --access public "./dist/bitplane-rars-$VERSION.tgz"
+          npm publish --provenance --access public "./npm-dist/bitplane-rars-$VERSION.tgz"
 
   # ----------------------------------------------------------------------
-  # 7. Publish the packaged binaries to the tagged GitHub Release.
+  # 6. Publish the packaged binaries to the tagged GitHub Release.
   # ----------------------------------------------------------------------
   publish-github-release:
     name: Publish GitHub Release
-    needs: [verify-tag, build, publish-crates, publish-pypi, publish-npm]
+    needs: [verify-tag, build, publish]
     if: github.event_name == 'push' || inputs.publish == 'all'
     runs-on: ubuntu-latest
     permissions:
