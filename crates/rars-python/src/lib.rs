@@ -10,6 +10,7 @@ use rars_rs::output_links::{create_link_output, link_source_path};
 use rars_rs::output_staging::{
     failed_entry_name, publish_verified_output, refused_output, ExtractionStaging, OverwritePolicy,
 };
+use rars_rs::password_check::{PasswordProbe, PasswordVerdict};
 use rars_rs::ExtractedLink;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -2285,6 +2286,97 @@ fn py_input_bytes_with_cancellation(
     })
 }
 
+#[pyclass(frozen, module = "rars")]
+struct PasswordCheck {
+    #[pyo3(get)]
+    correct: Option<Py<PyAny>>,
+    undetermined: Vec<Py<PyAny>>,
+    #[pyo3(get)]
+    archive: Option<Py<RarFile>>,
+    #[pyo3(get)]
+    needs_password: bool,
+}
+
+#[pymethods]
+impl PasswordCheck {
+    #[getter]
+    fn undetermined<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        PyList::new(
+            py,
+            self.undetermined.iter().map(|candidate| candidate.bind(py)),
+        )
+    }
+}
+
+/// Candidates are taken one at a time, and none after the first proved correct.
+#[pyfunction]
+#[pyo3(signature = (source, candidates, *, options = None))]
+fn check_password(
+    py: Python<'_>,
+    source: &Bound<'_, PyAny>,
+    candidates: &Bound<'_, PyAny>,
+    options: Option<&ReadOptions>,
+) -> PyResult<PasswordCheck> {
+    check_read_options_cancellation(options)?;
+    let read_options = python_read_options(options, None);
+    let (probe, path) = match py_bytes_like(source)? {
+        Some(bytes) => (
+            py.detach(|| PasswordProbe::read_owned(bytes, read_options)),
+            None,
+        ),
+        None => {
+            let path = std::path::absolute(py_path_buf(py, source)?)?;
+            (
+                py.detach(|| PasswordProbe::read_path(&path, read_options)),
+                Some(path),
+            )
+        }
+    };
+    let probe = probe.map_err(map_open_error)?;
+    let needs_password = probe.needs_password();
+    let mut winner = None;
+    let mut undetermined = Vec::new();
+    if needs_password {
+        for candidate in candidates.try_iter()? {
+            let candidate = candidate?;
+            let password = py_password(Some(&candidate))?.unwrap_or_default();
+            match py
+                .detach(|| probe.check(&password, read_options))
+                .map_err(map_error)?
+            {
+                PasswordVerdict::Correct => {
+                    winner = Some((candidate.unbind(), password));
+                    break;
+                }
+                PasswordVerdict::Undetermined => undetermined.push(candidate.unbind()),
+                PasswordVerdict::Wrong => {}
+            }
+        }
+    }
+    let (archive, password) = match &winner {
+        Some((_, password)) if probe.headers_encrypted() => {
+            let archive = py
+                .detach(|| probe.open(password, read_options))
+                .map_err(map_error)?;
+            (Some(archive), Some(password.clone()))
+        }
+        _ => (probe.into_archive(), None),
+    };
+    let archive = archive
+        .map(|archive| -> PyResult<Py<RarFile>> {
+            let mut file = RarFile::parse(py, password, options, |_| Ok(archive))?;
+            file.path = path;
+            Py::new(py, file.with_set(true, None))
+        })
+        .transpose()?;
+    Ok(PasswordCheck {
+        correct: winner.map(|(candidate, _)| candidate),
+        undetermined,
+        archive,
+        needs_password,
+    })
+}
+
 #[pyfunction]
 #[pyo3(signature = (source, password = None, *, cancellation = None))]
 fn repair(
@@ -2366,6 +2458,8 @@ fn rars(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ReadOptions>()?;
     m.add_class::<RepairReport>()?;
     m.add_class::<RepairResult>()?;
+    m.add_class::<PasswordCheck>()?;
+    m.add_function(wrap_pyfunction!(check_password, m)?)?;
     m.add_function(wrap_pyfunction!(repair, m)?)?;
     m.add_function(wrap_pyfunction!(repair_detailed, m)?)?;
     m.add_function(wrap_pyfunction!(repair_to_path, m)?)?;

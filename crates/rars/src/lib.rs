@@ -68,6 +68,8 @@ pub mod output_staging;
 pub mod output_times;
 mod parallel;
 mod parse_budget;
+#[doc(hidden)]
+pub mod password_check;
 #[cfg(any(feature = "write", feature = "recovery"))]
 mod pending_archive;
 #[cfg(feature = "write")]

@@ -1708,35 +1708,185 @@ fn parse_archive_encryption_header(
     {
         crate::crypto::require_encryption()?;
 
-        let mut reader = HeaderReader::new(&parsed.header, parsed.type_specific_range.clone());
-        let version = reader.read_vint()?;
-        let flags = reader.read_vint()?;
-        // The first encrypted-header fields are decoded before password refusal.
+        let (record, flags) = archive_encryption_record(parsed, password.is_some())?;
         let password = password.ok_or(Error::NeedPassword)?;
-        if version != 0 {
-            return Err(Error::UnsupportedFeature {
-                version: crate::version::ArchiveVersion::Rar50,
-                feature: "RAR 5 unknown header encryption version",
-            });
-        }
-        let kdf_count = reader.read_byte()?;
-        let salt = reader.read_array::<16>()?;
-        let check_value = if flags & 0x0001 != 0 {
-            Some(reader.read_array::<12>()?)
-        } else {
-            None
-        };
-        if reader.pos != reader.range.end {
-            return Err(Error::InvalidHeader(
-                "RAR 5 archive encryption header has trailing bytes",
-            ));
-        }
-        let keys = key_cache.get_or_derive(password, salt, kdf_count)?;
-        if let Some(check_value) = check_value {
+        let keys = key_cache.get_or_derive(password, record.salt, record.kdf_count)?;
+        if let Some(check_value) = record.check_value {
             keys.check_password(&check_value)
                 .map_err(map_rar50_crypto_error)?;
         }
         Ok((keys, flags & !1 == 0))
+    }
+}
+
+/// Read apart from opening, so a password check needs no password to find it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArchiveEncryptionRecord {
+    kdf_count: u8,
+    salt: [u8; 16],
+    check_value: Option<[u8; 12]>,
+}
+
+fn archive_encryption_record(
+    parsed: &ParsedBlockHeader,
+    has_password: bool,
+) -> Result<(ArchiveEncryptionRecord, u64)> {
+    let mut reader = HeaderReader::new(&parsed.header, parsed.type_specific_range.clone());
+    let version = reader.read_vint()?;
+    let flags = reader.read_vint()?;
+    // The first encrypted-header fields are decoded before password refusal.
+    if !has_password {
+        return Err(Error::NeedPassword);
+    }
+    if version != 0 {
+        return Err(Error::UnsupportedFeature {
+            version: crate::version::ArchiveVersion::Rar50,
+            feature: "RAR 5 unknown header encryption version",
+        });
+    }
+    let kdf_count = reader.read_byte()?;
+    let salt = reader.read_array::<16>()?;
+    let check_value = if flags & 0x0001 != 0 {
+        Some(reader.read_array::<12>()?)
+    } else {
+        None
+    };
+    if reader.pos != reader.range.end {
+        return Err(Error::InvalidHeader(
+            "RAR 5 archive encryption header has trailing bytes",
+        ));
+    }
+    Ok((
+        ArchiveEncryptionRecord {
+            kdf_count,
+            salt,
+            check_value,
+        },
+        flags,
+    ))
+}
+
+/// None for an all-zero value: WinRAR 5.21 and earlier wrote that, and it proves nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PasswordCheckValue {
+    salt: [u8; 16],
+    kdf_count: u8,
+    value: [u8; 12],
+}
+
+impl PasswordCheckValue {
+    fn new(salt: [u8; 16], kdf_count: u8, value: Option<[u8; 12]>) -> Option<Self> {
+        value
+            .filter(|value| value[..8] != [0; 8])
+            .map(|value| Self {
+                salt,
+                kdf_count,
+                value,
+            })
+    }
+
+    pub(crate) fn of_file(encryption: &FileEncryption) -> Option<Self> {
+        Self::new(
+            encryption.salt,
+            encryption.kdf_count,
+            encryption.check_value,
+        )
+    }
+
+    pub(crate) fn matches(&self, password: &[u8], key_cache: &Rar50KeyCache) -> Result<bool> {
+        #[cfg(not(feature = "encryption"))]
+        {
+            let _ = (password, key_cache);
+            Err(Error::FeatureDisabled {
+                feature: "encryption",
+            })
+        }
+        #[cfg(feature = "encryption")]
+        {
+            let keys = key_cache.get_or_derive(password, self.salt, self.kdf_count)?;
+            match keys.check_password(&self.value) {
+                Ok(()) => Ok(true),
+                Err(crate::crypto::rar50::Error::BadPassword) => Ok(false),
+                Err(error) => Err(map_rar50_crypto_error(error)),
+            }
+        }
+    }
+}
+
+/// Kept so each candidate is checked against bytes already read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HeaderEncryption {
+    record: ArchiveEncryptionRecord,
+    main_offset: usize,
+}
+
+/// None when the headers are not encrypted; `input` starts at the signature.
+pub(crate) fn header_encryption(
+    input: &[u8],
+    sfx_offset: usize,
+    options: crate::ArchiveReadOptions<'_>,
+) -> Result<Option<HeaderEncryption>> {
+    let mut budget = crate::parse_budget::ParseBudget::new(options);
+    let first = parse_block_header_bytes(
+        input,
+        RAR50_SIGNATURE.len(),
+        input.len(),
+        sfx_offset,
+        &mut budget,
+    )?;
+    if first.block.header_type != HEAD_CRYPT {
+        return Ok(None);
+    }
+    Ok(Some(HeaderEncryption {
+        record: archive_encryption_record(&first, true)?.0,
+        main_offset: first.next_offset,
+    }))
+}
+
+/// `at_volume_end` says a short main header is garbage from a wrong key, not a cut-off read.
+pub(crate) fn header_password_matches(
+    input: &[u8],
+    at_volume_end: bool,
+    sfx_offset: usize,
+    encryption: &HeaderEncryption,
+    password: &[u8],
+    key_cache: &Rar50KeyCache,
+    options: crate::ArchiveReadOptions<'_>,
+) -> Result<bool> {
+    let record = &encryption.record;
+    if let Some(check_value) =
+        PasswordCheckValue::new(record.salt, record.kdf_count, record.check_value)
+    {
+        return check_value.matches(password, key_cache);
+    }
+    #[cfg(not(feature = "encryption"))]
+    {
+        let _ = (input, at_volume_end, sfx_offset, options);
+        Err(Error::FeatureDisabled {
+            feature: "encryption",
+        })
+    }
+    #[cfg(feature = "encryption")]
+    {
+        // With no check value, the main header's CRC is the only evidence. A
+        // damaged main header reads as a wrong password: one CRC can't tell them apart.
+        let keys = key_cache.get_or_derive(password, record.salt, record.kdf_count)?;
+        let mut budget = crate::parse_budget::ParseBudget::new(options);
+        match parse_encrypted_block_header_bytes(
+            input,
+            encryption.main_offset,
+            input.len(),
+            sfx_offset,
+            &keys,
+            &mut budget,
+        ) {
+            Ok(_) => Ok(true),
+            Err(Error::TooShort) if !at_volume_end => Err(Error::TooShort),
+            Err(Error::TooShort | Error::InvalidHeader(_) | Error::Crc32Mismatch { .. }) => {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -2399,7 +2549,6 @@ impl<'a> HeaderReader<'a> {
         self.read_array::<4>().map(u32::from_le_bytes)
     }
 
-    #[cfg(feature = "encryption")]
     fn read_byte(&mut self) -> Result<u8> {
         if self.pos >= self.range.end {
             return Err(Error::TooShort);
