@@ -733,11 +733,42 @@ pub(super) fn run_filters_with_allowance<B: Budget>(
     choose_owned_filter(
         data,
         algorithm_version,
-        options,
+        run_search_options(options),
         Some(&mut progress),
         allowance,
     )
     .map(|(specs, _)| specs)
+}
+
+/// The parse a run's filter search measures with: the member's own, but no
+/// more than level 2's.
+///
+/// The search only ranks filters. Its encodes are thrown away, and the run is
+/// coded again later against its history. Over 16 binary and 16 text 32 MiB
+/// slices of the bench tars at level 3, total packed size and search time:
+///
+/// ```text
+/// search at     binary                text
+/// level 3     167,933,642  367s    121,100,147  373s
+/// level 2     167,919,441  219s    121,075,675  213s
+/// level 1     167,767,504  140s    121,255,533  163s
+/// ```
+///
+/// Level 2 changed eight members by at most 0.17% either way. The greedy
+/// parse of level 1 passes over delta filters the shortest-path parse uses:
+/// one text slice came out 1.05% larger.
+fn run_search_options(options: EncodeOptions) -> EncodeOptions {
+    if !options.optimal_parse {
+        return options;
+    }
+    let (nice, passes) = parse_effort_for_level(2);
+    let mut search = options
+        .with_nice_match_length(options.nice_match_length.min(nice))
+        .with_parse_passes(options.parse_passes.min(passes));
+    search.max_match_candidates = options
+        .max_match_candidates
+        .min(match_candidates_for_level(2).expect("level 2 is a level"));
+    search
 }
 
 fn specs_with_allowance<B: Budget>(
@@ -1017,5 +1048,22 @@ mod allowance_tests {
                 assert_eq!(allowance.used(), 0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod run_search_tests {
+    use super::*;
+
+    #[test]
+    fn run_searches_parse_no_harder_than_level_two() {
+        let dictionary = 4 << 20;
+        let two = encode_options_for_level(Some(2), dictionary).unwrap();
+        for level in 2..=5 {
+            let options = encode_options_for_level(Some(level), dictionary).unwrap();
+            assert_eq!(run_search_options(options), two);
+        }
+        let one = encode_options_for_level(Some(1), dictionary).unwrap();
+        assert_eq!(run_search_options(one), one);
     }
 }
