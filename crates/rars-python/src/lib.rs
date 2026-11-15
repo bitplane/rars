@@ -3,7 +3,7 @@ use pyo3::exceptions::{
     PyValueError,
 };
 use pyo3::prelude::*;
-use pyo3::types::{PyByteArray, PyBytes, PyList, PyModule, PyString};
+use pyo3::types::{PyByteArray, PyBytes, PyList, PyModule, PyString, PyTuple};
 use pyo3::{create_exception, PyErr};
 use rars_rs::filename::relative_path as output_relative_path;
 use rars_rs::output_links::{create_link_output, link_source_path};
@@ -11,6 +11,7 @@ use rars_rs::output_staging::{
     failed_entry_name, publish_verified_output, refused_output, ExtractionStaging, OverwritePolicy,
 };
 use rars_rs::ExtractedLink;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
@@ -418,6 +419,9 @@ struct RarInfo {
     #[pyo3(get)]
     detail: HashMap<String, String>,
     is_directory: bool,
+    /// Counted from 0.
+    #[pyo3(get)]
+    volume: usize,
 }
 
 #[pymethods]
@@ -454,8 +458,52 @@ struct RarFile {
     /// Where it was opened from, to find a set's later volumes by name.
     path: Option<PathBuf>,
     password: Option<Vec<u8>>,
+    /// The opening options, which listing later volumes reads with too.
+    options: Option<ReadOptions>,
+    /// Later volumes given at opening; a tuple, so listing and every read can walk them again.
+    volumes: Option<Py<PyTuple>>,
+    first_volume_only: bool,
+    first: SetListing,
+    /// The whole set, listed the first time a call needs a member past the first volume.
+    whole: OnceLock<SetListing>,
+}
+
+struct SetListing {
     infos: Vec<RarInfo>,
+    places: Vec<Place>,
     names: OnceLock<MemberNames>,
+}
+
+#[derive(Default)]
+struct SelectionEnd {
+    name: Option<Vec<u8>>,
+    last_volume: Option<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct Place {
+    /// Metadata calls reopen the member's own volume, which numbers its members from 0.
+    index_in_volume: usize,
+    /// Reads of the member stop pulling volumes here; None until its last part is listed.
+    last_volume: Option<usize>,
+}
+
+impl SetListing {
+    fn new(infos: Vec<RarInfo>) -> Self {
+        let places = infos
+            .iter()
+            .enumerate()
+            .map(|(index_in_volume, info)| Place {
+                index_in_volume,
+                last_volume: (!info.is_split_after).then_some(0),
+            })
+            .collect();
+        Self {
+            infos,
+            places,
+            names: OnceLock::new(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -493,13 +541,15 @@ impl MemberNames {
 impl RarFile {
     /// A path is read on demand, so the file must stay unchanged while the archive is open.
     #[new]
-    #[pyo3(signature = (source, mode = "r", password = None, *, options = None))]
+    #[pyo3(signature = (source, mode = "r", password = None, *, options = None, first_volume_only = false, volumes = None))]
     fn new(
         py: Python<'_>,
         source: &Bound<'_, PyAny>,
         mode: &str,
         password: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
+        first_volume_only: bool,
+        volumes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         if mode != "r" {
             return Err(PyNotImplementedError::new_err(
@@ -507,42 +557,57 @@ impl RarFile {
             ));
         }
         let password = py_password(password)?;
-        if let Some(bytes) = py_bytes_like(source)? {
-            return Self::from_bytes(py, bytes, password, options);
-        }
-        Self::from_path(py, py_path_buf(py, source)?, password, options)
+        let volumes = stored_volumes(volumes)?;
+        let file = match py_bytes_like(source)? {
+            Some(bytes) => Self::from_bytes(py, bytes, password, options)?,
+            None => Self::from_path(py, py_path_buf(py, source)?, password, options)?,
+        };
+        Ok(file.with_set(first_volume_only, volumes))
     }
 
     #[staticmethod]
     #[pyo3(name = "from_bytes")]
-    #[pyo3(signature = (data, password = None, *, options = None))]
+    #[pyo3(signature = (data, password = None, *, options = None, first_volume_only = false, volumes = None))]
     fn from_bytes_py(
         py: Python<'_>,
         data: &Bound<'_, PyAny>,
         password: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
+        first_volume_only: bool,
+        volumes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
-        Self::from_bytes(
+        let volumes = stored_volumes(volumes)?;
+        let file = Self::from_bytes(
             py,
             py_required_bytes(data)?,
             py_password(password)?,
             options,
-        )
+        )?;
+        Ok(file.with_set(first_volume_only, volumes))
     }
 
-    fn namelist(&self) -> Vec<String> {
-        self.infos
+    fn namelist(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        Ok(self
+            .listing(py)?
+            .infos
             .iter()
             .map(|info| info.filename.clone())
-            .collect()
+            .collect())
     }
 
-    fn infolist(&self) -> Vec<RarInfo> {
-        self.infos.clone()
+    fn infolist(&self, py: Python<'_>) -> PyResult<Vec<RarInfo>> {
+        Ok(self.listing(py)?.infos.clone())
     }
 
-    fn getinfo(&self, name: &Bound<'_, PyAny>) -> PyResult<RarInfo> {
-        Ok(self.infos[self.resolve_index(name)?].clone())
+    fn getinfo(&self, py: Python<'_>, name: &Bound<'_, PyAny>) -> PyResult<RarInfo> {
+        let index = self.resolve_index(py, name)?;
+        // A first-volume member never waits for later volumes; its split sizes are whole once the set is listed.
+        let listing = match self.whole.get() {
+            Some(whole) => whole,
+            None if index < self.first.infos.len() => &self.first,
+            None => self.listing(py)?,
+        };
+        Ok(listing.infos[index].clone())
     }
 
     /// `volumes` works as in `extractall`, for a member that continues into later volumes.
@@ -556,7 +621,7 @@ impl RarFile {
         volumes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<u8>> {
         check_read_options_cancellation(options)?;
-        let index = self.resolve_index(name)?;
+        let index = self.resolve_index(py, name)?;
         let password = py_password(password)?.or_else(|| self.password.clone());
         let options = self.extraction_options(options, password.as_deref());
         let data = if self.needs_later_volumes(index) {
@@ -599,7 +664,7 @@ impl RarFile {
         check_read_options_cancellation(options)?;
         let indices = members
             .try_iter()?
-            .map(|member| self.resolve_index(&member?))
+            .map(|member| self.resolve_index(py, &member?))
             .collect::<PyResult<Vec<_>>>()?;
         let password = py_password(password)?.or_else(|| self.password.clone());
         let options = self.extraction_options(options, password.as_deref());
@@ -632,7 +697,7 @@ impl RarFile {
     ) -> PyResult<PathBuf> {
         check_read_options_cancellation(options)?;
         let Overwrite(overwrite) = overwrite;
-        let target = self.resolve_index(member)?;
+        let target = self.resolve_index(py, member)?;
         let out_dir = path.unwrap_or_else(|| PathBuf::from("."));
         let password = py_password(password)?.or_else(|| self.password.clone());
         let options = self.extraction_options(options, password.as_deref());
@@ -729,7 +794,7 @@ impl RarFile {
         };
         let selected = members
             .try_iter()?
-            .map(|member| self.resolve_index(&member?))
+            .map(|member| self.resolve_index(py, &member?))
             .collect::<PyResult<HashSet<usize>>>()?;
         if selected
             .iter()
@@ -791,7 +856,7 @@ impl RarFile {
 
     #[getter]
     fn needs_password(&self) -> bool {
-        self.infos.iter().any(|info| info.is_encrypted)
+        self.first.infos.iter().any(|info| info.is_encrypted)
     }
 
     /// Returns the decoded comment attached to a member, or None if absent.
@@ -804,10 +869,11 @@ impl RarFile {
         options: Option<&ReadOptions>,
     ) -> PyResult<Option<Vec<u8>>> {
         check_read_options_cancellation(options)?;
-        let index = self.resolve_index(member)?;
+        let index = self.resolve_index(py, member)?;
         let password = py_password(password)?.or_else(|| self.password.clone());
         let options = self.extraction_options(options, password.as_deref());
-        py.detach(|| self.archive.member_comment_at_with_options(index, options))
+        let (archive, index) = self.member_volume(py, index, options)?;
+        py.detach(|| archive.member_comment_at_with_options(index, options))
             .map_err(map_error)
     }
 
@@ -822,20 +888,17 @@ impl RarFile {
         options: Option<&ReadOptions>,
     ) -> PyResult<Vec<u8>> {
         check_read_options_cancellation(options)?;
-        let index = self.resolve_index(member)?;
-        let member = self
-            .archive
+        let index = self.resolve_index(py, member)?;
+        let password = py_password(password)?.or_else(|| self.password.clone());
+        let options = self.extraction_options(options, password.as_deref());
+        let (archive, index) = self.member_volume(py, index, options)?;
+        let member = archive
             .members()
             .nth(index)
             .ok_or_else(|| PyKeyError::new_err("member not found"))?;
         if member.is_legacy_unix_symlink() {
-            let password = py_password(password)?.or_else(|| self.password.clone());
-            let options = self.extraction_options(options, password.as_deref());
             return Ok(py
-                .detach(|| {
-                    self.archive
-                        .legacy_symlink_target_at_with_options(index, options)
-                })
+                .detach(|| archive.legacy_symlink_target_at_with_options(index, options))
                 .map_err(map_error)?
                 .expect("legacy symlink predicate checked above"));
         }
@@ -849,13 +912,15 @@ impl RarFile {
     #[pyo3(signature = (member, *, options = None))]
     fn gettimes(
         &self,
+        py: Python<'_>,
         member: &Bound<'_, PyAny>,
         options: Option<&ReadOptions>,
     ) -> PyResult<HashMap<String, i128>> {
         check_read_options_cancellation(options)?;
-        let index = self.resolve_index(member)?;
-        let member = self
-            .archive
+        let index = self.resolve_index(py, member)?;
+        let options = self.extraction_options(options, self.password.as_deref());
+        let (archive, index) = self.member_volume(py, index, options)?;
+        let member = archive
             .members()
             .nth(index)
             .ok_or_else(|| PyKeyError::new_err("member not found"))?;
@@ -914,12 +979,18 @@ impl RarFile {
     }
 
     fn __iter__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let list = PyList::new(py, self.infos.clone())?;
+        let list = PyList::new(py, self.listing(py)?.infos.clone())?;
         Ok(list.call_method0("__iter__")?.unbind())
     }
 }
 
 impl RarFile {
+    fn with_set(mut self, first_volume_only: bool, volumes: Option<Py<PyTuple>>) -> Self {
+        self.first_volume_only = first_volume_only;
+        self.volumes = volumes;
+        self
+    }
+
     /// Runs `run` over the set, its later volumes from `volumes`, else found by name beside the first.
     fn extract_set<T: Send>(
         &self,
@@ -931,7 +1002,11 @@ impl RarFile {
             ) -> rars_rs::Result<T>
             + Send,
     ) -> PyResult<T> {
-        if let Some(volumes) = volumes {
+        let stored = self
+            .volumes
+            .as_ref()
+            .map(|volumes| volumes.bind(py).as_any());
+        if let Some(volumes) = volumes.or(stored) {
             let iterator = volumes.try_iter()?.unbind();
             return with_volume_sources(
                 py,
@@ -1006,9 +1081,79 @@ impl RarFile {
         })
     }
 
-    /// Only the first volume's last member can continue, and reading it needs the set.
+    /// A member that continues past, or starts after, the first volume needs the set to read.
     fn needs_later_volumes(&self, index: usize) -> bool {
-        self.infos[index].is_split_after
+        self.first
+            .infos
+            .get(index)
+            .is_none_or(|info| info.is_split_after)
+    }
+
+    /// Lists the set only when asked, so opening never waits for volumes that may still be arriving.
+    fn listing(&self, py: Python<'_>) -> PyResult<&SetListing> {
+        if self.first_volume_only || !self.lists_later_volumes() {
+            return Ok(&self.first);
+        }
+        if let Some(whole) = self.whole.get() {
+            return Ok(whole);
+        }
+        let options = self.extraction_options(self.options.as_ref(), self.password.as_deref());
+        let (first, archive, identity, encoding) =
+            (&self.first, &self.archive, &self.identity, self.encoding);
+        let whole = self.extract_set(py, None, options, |volumes| {
+            list_later_volumes(archive, first, volumes, encoding, identity)
+        })?;
+        Ok(self.whole.get_or_init(|| whole))
+    }
+
+    /// Only a set's first volume knows where the set starts, and bytes alone can't find the rest.
+    fn lists_later_volumes(&self) -> bool {
+        self.archive.is_volume()
+            && starts_set(&self.archive)
+            && (self.path.is_some() || self.volumes.is_some())
+    }
+
+    /// Headers of later volumes aren't kept, so a later member's metadata reparses its volume.
+    fn member_volume(
+        &self,
+        py: Python<'_>,
+        index: usize,
+        options: rars_rs::ArchiveReadOptions<'_>,
+    ) -> PyResult<(Cow<'_, rars_rs::Archive>, usize)> {
+        if index < self.first.infos.len() {
+            return Ok((Cow::Borrowed(&self.archive), index));
+        }
+        let listing = self.listing(py)?;
+        let volume = listing.infos[index].volume;
+        let archive = self.extract_set(py, None, options, |volumes| {
+            volumes.nth(volume - 1).unwrap_or_else(|| {
+                Err(rars_rs::Error::InVolume {
+                    number: volume + 1,
+                    source: Box::new(rars_rs::Error::MissingVolume),
+                })
+            })
+        })?;
+        Ok((Cow::Owned(archive), listing.places[index].index_in_volume))
+    }
+
+    /// A later member's end comes from the listing; a first-volume member's is found while reading.
+    fn selection_end(&self, selected: &HashSet<usize>) -> SelectionEnd {
+        let Some(&last) = selected.iter().max() else {
+            return SelectionEnd::default();
+        };
+        let listing = match self.first.infos.get(last) {
+            Some(_) => &self.first,
+            None => match self.whole.get() {
+                Some(whole) => whole,
+                None => return SelectionEnd::default(),
+            },
+        };
+        SelectionEnd {
+            name: Some(listing.infos[last].orig_filename_bytes.to_vec()),
+            last_volume: listing.places[last]
+                .last_volume
+                .filter(|&volume| volume > 0),
+        }
     }
 
     /// One pass over the set, so solid history and split members decode once.
@@ -1039,6 +1184,7 @@ impl RarFile {
                     volumes,
                     options,
                     selected,
+                    self.selection_end(selected),
                     |_, meta| open(meta),
                     link,
                 ),
@@ -1067,6 +1213,7 @@ impl RarFile {
                 volumes,
                 options,
                 &selected,
+                self.selection_end(&selected),
                 |index, meta| {
                     if meta.is_directory {
                         return Ok(Box::new(io::sink()));
@@ -1092,7 +1239,7 @@ impl RarFile {
             .collect())
     }
 
-    fn resolve_index(&self, member: &Bound<'_, PyAny>) -> PyResult<usize> {
+    fn resolve_index(&self, py: Python<'_>, member: &Bound<'_, PyAny>) -> PyResult<usize> {
         if let Ok(info) = member.extract::<PyRef<'_, RarInfo>>() {
             if !info
                 .archive_identity
@@ -1105,47 +1252,69 @@ impl RarFile {
             }
             return Ok(info.member_index);
         }
+        // The first volume answers without looking for later volumes, which may not exist yet.
+        if let Some(index) = self.find(&self.first, member)? {
+            return Ok(index);
+        }
+        let listing = self.listing(py)?;
+        if !std::ptr::eq(listing, &self.first) {
+            if let Some(index) = self.find(listing, member)? {
+                return Ok(index);
+            }
+        }
+        let name = match member.extract::<String>() {
+            Ok(text) => text,
+            Err(_) => String::from_utf8_lossy(&member_name_bytes(member)?).into_owned(),
+        };
+        Err(self.not_found(name))
+    }
+
+    fn find(&self, listing: &SetListing, member: &Bound<'_, PyAny>) -> PyResult<Option<usize>> {
         if self.encoding.is_some() {
             if let Ok(text) = member.extract::<String>() {
-                let names = self
+                let names = listing
                     .names
-                    .get_or_init(|| MemberNames::new(&self.infos, true));
+                    .get_or_init(|| MemberNames::new(&listing.infos, true));
                 return match names.decoded.get(&text) {
-                    Some(Some(index)) => Ok(*index),
+                    Some(Some(index)) => Ok(Some(*index)),
                     Some(None) => Err(PyValueError::new_err(
                         "ambiguous decoded name; select an entry by its RarInfo or original bytes",
                     )),
-                    None => Err(self.not_found(text)),
+                    None => Ok(None),
                 };
             }
         }
         let name = member_name_bytes(member)?;
         // Retain reverse lookup's constant-time last-entry case without
         // building an index for callers reading only that one entry.
-        if self
+        if listing
             .infos
             .last()
             .is_some_and(|info| info.orig_filename_bytes.as_ref() == name)
         {
-            return Ok(self.infos.len() - 1);
+            return Ok(Some(listing.infos.len() - 1));
         }
-        let names = self
+        let names = listing
             .names
-            .get_or_init(|| MemberNames::new(&self.infos, self.encoding.is_some()));
-        names
-            .raw
-            .get(name.as_slice())
-            .copied()
-            .ok_or_else(|| self.not_found(String::from_utf8_lossy(&name).into_owned()))
+            .get_or_init(|| MemberNames::new(&listing.infos, self.encoding.is_some()));
+        Ok(names.raw.get(name.as_slice()).copied())
     }
 
-    /// Names are listed from the first volume only, so a set's later members are not found.
+    /// A set listed from its first volume alone can't find members that start later.
     fn not_found(&self, name: String) -> PyErr {
-        if !self.archive.is_volume() {
+        if !self.archive.is_volume() || self.whole.get().is_some() {
+            return PyKeyError::new_err(name);
+        }
+        if self.first_volume_only {
+            return PyKeyError::new_err(format!(
+                "{name} is not in the first volume; members that start in a later volume cannot be selected with first_volume_only=True"
+            ));
+        }
+        if self.path.is_some() || self.volumes.is_some() {
             return PyKeyError::new_err(name);
         }
         PyKeyError::new_err(format!(
-            "{name} is not in the first volume; members that start in a later volume cannot be selected yet"
+            "{name} is not in the first volume; an archive opened from bytes lists its later volumes only when given them as volumes="
         ))
     }
 
@@ -1215,8 +1384,11 @@ impl RarFile {
             archive,
             path: None,
             password,
-            infos,
-            names: OnceLock::new(),
+            options: options.cloned(),
+            volumes: None,
+            first_volume_only: false,
+            first: SetListing::new(infos),
+            whole: OnceLock::new(),
         })
     }
 }
@@ -1454,10 +1626,16 @@ impl RarBuilder {
                 archive: archive.archive.clone(),
                 path: archive.path.clone(),
                 password: archive.password.clone(),
-                infos: archive.infos.clone(),
-                names: OnceLock::new(),
+                options: archive.options.clone(),
+                volumes: archive
+                    .volumes
+                    .as_ref()
+                    .map(|volumes| volumes.clone_ref(py)),
+                first_volume_only: archive.first_volume_only,
+                first: SetListing::new(archive.first.infos.clone()),
+                whole: OnceLock::new(),
             },
-            Err(_) => RarFile::new(py, source, "r", password, None)?,
+            Err(_) => RarFile::new(py, source, "r", password, None, false, None)?,
         };
         let password = archive.password.clone();
         if preserve {
@@ -2829,16 +3007,17 @@ fn extract_arriving_selected(
     volumes: &mut (dyn Iterator<Item = rars_rs::Result<rars_rs::Archive>> + Send),
     options: rars_rs::ArchiveReadOptions<'_>,
     selected: &HashSet<usize>,
+    SelectionEnd {
+        name: last_name,
+        last_volume,
+    }: SelectionEnd,
     mut open: impl FnMut(usize, &rars_rs::ExtractedEntryMeta) -> rars_rs::Result<Box<dyn Write>>,
     mut link: impl FnMut(&rars_rs::ExtractedEntryMeta, ExtractedLink<'_>) -> rars_rs::Result<()>,
 ) -> rars_rs::Result<()> {
     let last = selected.iter().copied().max().unwrap_or_default();
-    let last_name = first
-        .member_refs()
-        .nth(last)
-        .map(|member| member.name_bytes().to_vec());
     let finished = AtomicBool::new(false);
     let mut last_volume_seen = false;
+    let mut pulled = 0;
     let volumes = std::iter::from_fn(|| {
         // Asking past the volume where the last selected member ends means it has been verified.
         if last_volume_seen {
@@ -2846,12 +3025,17 @@ fn extract_arriving_selected(
             return None;
         }
         let volume = volumes.next()?;
-        last_volume_seen = volume.as_ref().is_ok_and(|volume| {
-            volume
-                .members()
-                .next()
-                .is_some_and(|member| !member.meta.is_split_after)
-        });
+        pulled += 1;
+        // Without a listing, a first-volume member ends where a volume's first member stops continuing.
+        last_volume_seen = match last_volume {
+            Some(last_volume) => pulled >= last_volume,
+            None => volume.as_ref().is_ok_and(|volume| {
+                volume
+                    .members()
+                    .next()
+                    .is_some_and(|member| !member.meta.is_split_after)
+            }),
+        };
         Some(volume)
     });
     // The extractor calls `open` or `link` once per member, in archive order.
@@ -3022,6 +3206,156 @@ enum VolumeSource {
     Path(PathBuf),
 }
 
+/// Listing walks the volumes and every later read walks them again, so a one-shot iterator won't do.
+fn stored_volumes(volumes: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Py<PyTuple>>> {
+    let Some(volumes) = volumes else {
+        return Ok(None);
+    };
+    if !volumes.is_instance_of::<PyList>() && !volumes.is_instance_of::<PyTuple>() {
+        return Err(PyTypeError::new_err(
+            "volumes must be a list or tuple of paths or bytes-like objects; listing would use up a one-shot iterator",
+        ));
+    }
+    Ok(Some(
+        PyTuple::new(
+            volumes.py(),
+            volumes.try_iter()?.collect::<PyResult<Vec<_>>>()?,
+        )?
+        .unbind(),
+    ))
+}
+
+/// A later volume names the set's earlier ones as if it were the first, so listing from it would go astray.
+fn starts_set(archive: &rars_rs::Archive) -> bool {
+    let first_member_continues = archive
+        .member_refs()
+        .next()
+        .is_some_and(|member| member.is_split_before());
+    !first_member_continues
+        && match archive {
+            rars_rs::Archive::Rar15To40(archive) => {
+                !archive.main.uses_new_numbering() || archive.main.is_first_volume()
+            }
+            rars_rs::Archive::Rar50Plus(archive) => {
+                archive.main.volume_number.is_none_or(|number| number == 0)
+            }
+            _ => true,
+        }
+}
+
+#[derive(PartialEq)]
+enum VolumeEnd {
+    Last,
+    More,
+    /// No end record says; the set ends where its volumes run out.
+    Unknown,
+}
+
+fn volume_end(archive: &rars_rs::Archive) -> VolumeEnd {
+    if !archive.is_volume() {
+        return VolumeEnd::Last;
+    }
+    let next = match archive {
+        rars_rs::Archive::Rar15To40(archive) => {
+            archive.blocks.iter().find_map(|block| match block {
+                rars_rs::rar15_40::Block::End(end) => Some(end.has_next_volume()),
+                _ => None,
+            })
+        }
+        rars_rs::Archive::Rar50Plus(archive) => {
+            archive.blocks.iter().find_map(|block| match block {
+                rars_rs::rar50::Block::End(end) => Some(end.has_next_volume()),
+                _ => None,
+            })
+        }
+        _ => None,
+    };
+    match next {
+        Some(true) => VolumeEnd::More,
+        Some(false) => VolumeEnd::Last,
+        None => VolumeEnd::Unknown,
+    }
+}
+
+/// Reads only headers, so a listing never waits on or decrypts member data.
+fn list_later_volumes(
+    first: &rars_rs::Archive,
+    listing: &SetListing,
+    volumes: &mut (dyn Iterator<Item = rars_rs::Result<rars_rs::Archive>> + Send),
+    encoding: Option<rars_rs::filename::LegacyNameEncoding>,
+    identity: &Arc<()>,
+) -> rars_rs::Result<SetListing> {
+    let in_volume = |index: usize, error: rars_rs::Error| rars_rs::Error::InVolume {
+        number: index + 1,
+        source: Box::new(error),
+    };
+    let broken = rars_rs::Error::InvalidHeader(
+        "volume does not continue the member split from the volume before it",
+    );
+    let mut infos = listing.infos.clone();
+    let mut places = listing.places.clone();
+    let mut pending = infos.last().is_some_and(|info| info.is_split_after);
+    let mut end = volume_end(first);
+    let mut index = 0;
+    while end != VolumeEnd::Last {
+        index += 1;
+        let Some(volume) = volumes.next() else {
+            if pending || end == VolumeEnd::More {
+                return Err(in_volume(index, rars_rs::Error::MissingVolume));
+            }
+            break;
+        };
+        let volume = volume.map_err(|error| in_volume(index, error))?;
+        for (index_in_volume, member) in volume.members().enumerate() {
+            let split_after = member.meta.is_split_after;
+            if member.meta.is_split_before {
+                let (Some(info), Some(place)) = (infos.last_mut(), places.last_mut()) else {
+                    return Err(in_volume(index, broken));
+                };
+                if !pending
+                    || index_in_volume != 0
+                    || *info.orig_filename_bytes != *member.meta.name
+                {
+                    return Err(in_volume(index, broken));
+                }
+                info.compress_size += member.meta.packed_size;
+                if !split_after {
+                    // Only the last part records the whole member's CRC and hash.
+                    let mut last = info_from_member_named(member, String::new());
+                    info.file_size = last.file_size;
+                    info.crc = last.crc;
+                    if let Some(hash) = last.detail.remove("hash") {
+                        info.detail.insert("hash".to_string(), hash);
+                    }
+                    place.last_volume = Some(index);
+                }
+            } else {
+                if pending {
+                    return Err(in_volume(index, broken));
+                }
+                let filename =
+                    String::from_utf8_lossy(&member.decoded_name(encoding)?).into_owned();
+                let mut info = info_from_member_named(member, filename);
+                info.member_index = infos.len();
+                info.archive_identity = Some(identity.clone());
+                info.volume = index;
+                infos.push(info);
+                places.push(Place {
+                    index_in_volume,
+                    last_volume: (!split_after).then_some(index),
+                });
+            }
+            pending = split_after;
+        }
+        end = volume_end(&volume);
+    }
+    Ok(SetListing {
+        infos,
+        places,
+        names: OnceLock::new(),
+    })
+}
+
 #[cfg(test)]
 fn info_from_member(member: rars_rs::ArchiveMember) -> RarInfo {
     let filename = String::from_utf8_lossy(&member.meta.name).into_owned();
@@ -3095,6 +3429,7 @@ fn info_from_member_named(member: rars_rs::ArchiveMember, filename: String) -> R
         file_attr: member.meta.file_attr,
         detail,
         is_directory: member.meta.is_directory,
+        volume: 0,
     }
 }
 
@@ -3277,7 +3612,7 @@ mod tests {
             )
             .unwrap();
             file.testrar(py, None, Some(&options), None).unwrap();
-            let first = PyString::new(py, &file.infos[0].filename);
+            let first = PyString::new(py, &file.first.infos[0].filename);
             for _ in 0..2 {
                 file.read(py, &first, None, Some(&options), None).unwrap();
                 file.extract(
@@ -3310,6 +3645,24 @@ mod tests {
             assert_eq!(rars_rs::crypto::rar50_key_derivations() - before, 1);
         });
         fs::remove_dir_all(out).unwrap();
+    }
+
+    #[test]
+    fn listing_a_header_encrypted_set_derives_its_key_once() {
+        Python::initialize();
+        Python::attach(|py| {
+            let options = one_thread(py);
+            let before = rars_rs::crypto::rar50_key_derivations();
+            let file = RarFile::from_path(
+                py,
+                encrypted_set().with_file_name("header_encrypted_stored_multivol.part1.rar"),
+                Some(b"password".to_vec()),
+                Some(&options),
+            )
+            .unwrap();
+            assert_eq!(file.namelist(py).unwrap(), ["stored_4k.bin"]);
+            assert_eq!(rars_rs::crypto::rar50_key_derivations() - before, 1);
+        });
     }
 
     #[test]
@@ -3591,8 +3944,11 @@ mod tests {
                 let file = RarFile {
                     identity: Arc::new(()),
                     encoding: None,
-                    infos: archive.members().map(info_from_member).collect(),
-                    names: OnceLock::new(),
+                    first: SetListing::new(archive.members().map(info_from_member).collect()),
+                    options: None,
+                    volumes: None,
+                    first_volume_only: false,
+                    whole: OnceLock::new(),
                     archive,
                     path: None,
                     password: None,
@@ -3820,8 +4176,11 @@ mod tests {
                             archive,
                             path: None,
                             password: None,
-                            infos: Vec::new(),
-                            names: OnceLock::new(),
+                            options: None,
+                            volumes: None,
+                            first_volume_only: false,
+                            first: SetListing::new(Vec::new()),
+                            whole: OnceLock::new(),
                         },
                     )
                     .unwrap();

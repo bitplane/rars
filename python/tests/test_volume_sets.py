@@ -344,15 +344,6 @@ def test_reading_a_split_member_opened_from_bytes_points_at_volumes(tmp_path, fo
         assert archive.read("large.bin", volumes=[p.read_bytes() for p in paths[1:]]) == PAYLOAD
 
 
-def test_a_member_starting_in_a_later_volume_cannot_be_selected(tmp_path):
-    paths = write_mixed_set(tmp_path)
-    with rars.RarFile(paths[0]) as archive:
-        with pytest.raises(KeyError, match="later volume"):
-            archive.read("after.bin")
-        with pytest.raises(KeyError, match="later volume"):
-            archive.extractall(tmp_path / "out", members=["after.bin"])
-
-
 def test_a_later_member_over_a_limit_does_not_fail_a_finished_read(tmp_path):
     paths = write_mixed_set(tmp_path)
     options = rars.ReadOptions(max_total_output_bytes=45_000)
