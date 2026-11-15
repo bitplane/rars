@@ -205,6 +205,7 @@ impl<T> Records<T> {
         self.push(value)
     }
 
+    #[cfg(test)]
     pub(crate) fn pop(&mut self) -> Option<T> {
         self.values.pop()
     }
