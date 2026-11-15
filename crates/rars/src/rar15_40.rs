@@ -58,9 +58,9 @@ pub use write::{
     write_compressed_archive_with_comment_and_progress, write_compressed_volumes,
     write_compressed_volumes_to, write_compressed_volumes_with_progress,
     write_rar29_compressed_archive_with_filter_policy,
-    write_rar29_compressed_archive_with_filter_policy_and_progress, write_stored_archive,
-    write_stored_archive_with_comment, write_stored_volumes, write_stored_volumes_to,
-    write_streaming_archive_to,
+    write_rar29_compressed_archive_with_filter_policy_and_progress, write_seekable_archive_to,
+    write_stored_archive, write_stored_archive_with_comment, write_stored_volumes,
+    write_stored_volumes_to, write_streaming_archive_to,
 };
 
 const MARK_HEAD: u8 = 0x72;

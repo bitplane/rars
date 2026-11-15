@@ -1655,7 +1655,7 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
     });
     progress.bar("Compressing archive", total);
 
-    write_archive_streaming(&archive_path, |output| {
+    write_archive_streaming(&archive_path, |mut output| {
         let written = match write_plan {
             AddWritePlan::Rar15To40 => {
                 let entries: Vec<_> = inputs
@@ -1692,15 +1692,26 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
                 } else {
                     rars::rar15_40::Rar29Method::Auto
                 });
-                rars::rar15_40::write_streaming_archive_to(
-                    &entries,
-                    options,
-                    coding.clone(),
-                    archive_comment.as_deref(),
-                    &resources,
-                    Some(&progress),
-                    output,
-                )
+                match output {
+                    ArchiveDestination::File(file) => rars::rar15_40::write_seekable_archive_to(
+                        &entries,
+                        options,
+                        coding.clone(),
+                        archive_comment.as_deref(),
+                        &resources,
+                        Some(&progress),
+                        file,
+                    ),
+                    ArchiveDestination::Pipe(pipe) => rars::rar15_40::write_streaming_archive_to(
+                        &entries,
+                        options,
+                        coding.clone(),
+                        archive_comment.as_deref(),
+                        &resources,
+                        Some(&progress),
+                        pipe,
+                    ),
+                }
             }
             AddWritePlan::Rar13 => {
                 let entries: Vec<_> = inputs
@@ -1731,7 +1742,7 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
                     archive_comment.as_deref(),
                     &resources,
                     Some(&progress),
-                    output,
+                    output.writer(),
                 )
             }
         };
@@ -2082,14 +2093,14 @@ fn write_plain_rar50_streaming(
         print_created_volumes(&paths);
         return Ok(());
     }
-    write_archive_streaming(archive_path, |output| {
+    write_archive_streaming(archive_path, |mut output| {
         rars::rar50::write_streaming_archive_with_progress(
             &entries,
             options,
             extras.clone(),
             &resources,
             Some(progress),
-            output,
+            output.writer(),
         )?;
         Ok(())
     })?;
@@ -2341,19 +2352,35 @@ fn streaming_extras<'a>(
 /// `/dev/stdout` go straight out, where there is nothing to rename.
 fn write_archive_streaming(
     archive_path: &Path,
-    write: impl FnOnce(&mut dyn Write) -> CliResult<()>,
+    write: impl FnOnce(ArchiveDestination<'_>) -> CliResult<()>,
 ) -> CliResult<()> {
     if archive_path == Path::new("-") || archive_path == Path::new("/dev/stdout") {
-        return write(&mut std::io::stdout());
+        return write(ArchiveDestination::Pipe(&mut std::io::stdout()));
     }
-    write_archive_file(archive_path, write)
+    write_archive_file(archive_path, |file| write(ArchiveDestination::File(file)))
+}
+
+/// Where an archive goes: a file a writer can go back in to finish a header, or
+/// a pipe it cannot.
+enum ArchiveDestination<'a> {
+    File(&'a mut fs::File),
+    Pipe(&'a mut dyn Write),
+}
+
+impl ArchiveDestination<'_> {
+    fn writer(&mut self) -> &mut dyn Write {
+        match self {
+            Self::File(file) => *file,
+            Self::Pipe(pipe) => *pipe,
+        }
+    }
 }
 
 /// Replaces the destination entry only after writing and syncing succeeds.
 /// Existing symlinks and hard links are replaced rather than written through.
 fn write_archive_file<T>(
     archive_path: &Path,
-    write: impl FnOnce(&mut dyn Write) -> CliResult<T>,
+    write: impl FnOnce(&mut fs::File) -> CliResult<T>,
 ) -> CliResult<T> {
     let (temporary, mut output) = create_streaming_archive_temp(archive_path)?;
     let result = (|| -> CliResult<T> {
@@ -3055,6 +3082,8 @@ mod tests {
 
     #[test]
     fn archive_publication_failures_preserve_destinations_and_clean_staging() {
+        use std::io::Write;
+
         let root = crate::scratch::case("archive-publication-errors");
         let archive = root.join("archive.rar");
         std::fs::write(&archive, b"original").unwrap();
