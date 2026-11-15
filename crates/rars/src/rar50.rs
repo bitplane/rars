@@ -84,6 +84,8 @@ pub struct Archive {
     pub main: MainHeader,
     pub blocks: Vec<Block>,
     source: ArchiveSource,
+    // Shared with later volumes parsed in the same session, so keys outlive one call.
+    pub(crate) key_cache: Arc<Rar50KeyCache>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -514,15 +516,23 @@ impl Archive {
     ) -> Result<Self> {
         options.check_cancelled()?;
         let data: Arc<[u8]> = Arc::from(input.to_vec().into_boxed_slice());
-        Self::parse_shared(data, options)
+        Self::parse_shared(data, options, Arc::default())
     }
 
     pub fn parse_owned_with_options(
         input: Vec<u8>,
         options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Self> {
+        Self::parse_owned_cached(input, options, Arc::default())
+    }
+
+    pub(crate) fn parse_owned_cached(
+        input: Vec<u8>,
+        options: crate::ArchiveReadOptions<'_>,
+        key_cache: Arc<Rar50KeyCache>,
+    ) -> Result<Self> {
         options.check_cancelled()?;
-        Self::parse_shared(Arc::from(input.into_boxed_slice()), options)
+        Self::parse_shared(Arc::from(input.into_boxed_slice()), options, key_cache)
     }
 
     pub fn parse_with_password(input: &[u8], password: Option<&[u8]>) -> Result<Self> {
@@ -599,19 +609,14 @@ impl Archive {
         signature: ArchiveSignature,
         options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Self> {
-        Self::parse_path_with_signature_cached(
-            path,
-            signature,
-            options,
-            &mut Rar50KeyCache::default(),
-        )
+        Self::parse_path_with_signature_cached(path, signature, options, Arc::default())
     }
 
     pub(crate) fn parse_path_with_signature_cached(
         path: impl AsRef<Path>,
         signature: ArchiveSignature,
         options: crate::ArchiveReadOptions<'_>,
-        key_cache: &mut Rar50KeyCache,
+        key_cache: Arc<Rar50KeyCache>,
     ) -> Result<Self> {
         options.check_cancelled()?;
         if signature.family != ArchiveFamily::Rar50Plus {
@@ -634,7 +639,11 @@ impl Archive {
         )
     }
 
-    fn parse_shared(input: Arc<[u8]>, options: crate::ArchiveReadOptions<'_>) -> Result<Self> {
+    fn parse_shared(
+        input: Arc<[u8]>,
+        options: crate::ArchiveReadOptions<'_>,
+        key_cache: Arc<Rar50KeyCache>,
+    ) -> Result<Self> {
         options.check_cancelled()?;
         let sig = find_archive_start(&input, SFX_SCAN_LIMIT).ok_or(Error::UnsupportedSignature)?;
         if sig.family != ArchiveFamily::Rar50Plus {
@@ -647,6 +656,7 @@ impl Archive {
             sig.offset,
             ArchiveSource::Memory(Arc::clone(&input)),
             options,
+            key_cache,
         )?;
         parsed.sfx_offset = sig.offset;
         Ok(parsed)
@@ -657,6 +667,7 @@ impl Archive {
         sfx_offset: usize,
         source: ArchiveSource,
         options: crate::ArchiveReadOptions<'_>,
+        key_cache: Arc<Rar50KeyCache>,
     ) -> Result<Self> {
         options.check_cancelled()?;
         // parse_shared supplies the exact signature found in this buffer.
@@ -664,7 +675,7 @@ impl Archive {
         let (main, blocks) = parse_archive_blocks(
             archive_len,
             options,
-            &mut Rar50KeyCache::default(),
+            &key_cache,
             |offset, budget| {
                 parse_block_header_bytes(input, offset, archive_len, sfx_offset, budget)
             },
@@ -686,6 +697,7 @@ impl Archive {
             main,
             blocks,
             source,
+            key_cache,
         })
     }
 
@@ -702,7 +714,7 @@ impl Archive {
             sfx_offset,
             source,
             options,
-            &mut Rar50KeyCache::default(),
+            Arc::default(),
         )
     }
 
@@ -712,7 +724,7 @@ impl Archive {
         sfx_offset: usize,
         source: ArchiveSource,
         options: crate::ArchiveReadOptions<'_>,
-        key_cache: &mut Rar50KeyCache,
+        key_cache: Arc<Rar50KeyCache>,
     ) -> Result<Self> {
         options.check_cancelled()?;
         let signature = read_exact_at(file, sfx_offset, RAR50_SIGNATURE.len())?;
@@ -725,7 +737,7 @@ impl Archive {
         let (main, blocks) = parse_archive_blocks(
             archive_len,
             options,
-            key_cache,
+            &key_cache,
             |offset, budget| {
                 read_block_header_at(
                     &mut *file_cell.borrow_mut(),
@@ -753,6 +765,7 @@ impl Archive {
             main,
             blocks,
             source,
+            key_cache,
         })
     }
 
@@ -1324,7 +1337,7 @@ pub(crate) fn recovery_end_header(
         &mut crate::parse_budget::ParseBudget::new(options),
     )?;
     let keys = if first.block.header_type == HEAD_CRYPT {
-        Some(parse_archive_encryption_header(&first, password, &mut Rar50KeyCache::default())?.0)
+        Some(parse_archive_encryption_header(&first, password, &Rar50KeyCache::default())?.0)
     } else {
         None
     };
@@ -1681,7 +1694,7 @@ fn parse_file_encryption_record(input: &[u8], range: Range<usize>) -> Result<Fil
 fn parse_archive_encryption_header(
     parsed: &ParsedBlockHeader,
     password: Option<&[u8]>,
-    key_cache: &mut Rar50KeyCache,
+    key_cache: &Rar50KeyCache,
 ) -> Result<(Rar50Keys, bool)> {
     #[cfg(not(feature = "encryption"))]
     {
@@ -1729,7 +1742,7 @@ fn parse_archive_encryption_header(
 fn attach_file_crypto(
     file: &mut FileHeader,
     password: Option<&[u8]>,
-    key_cache: &mut Rar50KeyCache,
+    key_cache: &Rar50KeyCache,
 ) -> Result<()> {
     #[cfg(not(feature = "encryption"))]
     {
@@ -1774,7 +1787,7 @@ fn attach_file_crypto(
 fn attach_service_crypto(
     service: &mut FileHeader,
     password: Option<&[u8]>,
-    key_cache: &mut Rar50KeyCache,
+    key_cache: &Rar50KeyCache,
 ) -> Result<()> {
     // WinRAR can emit encrypted QO metadata whose service-local password
     // check does not validate with the archive password. QuickOpen is an
@@ -1789,11 +1802,20 @@ fn attach_service_crypto(
 #[cfg(feature = "encryption")]
 type CachedRar50Key = std::sync::Arc<std::sync::OnceLock<Result<Rar50Keys>>>;
 
-/// One password's keys, initialized once per salt/count without serializing distinct keys.
+#[cfg(feature = "encryption")]
+type CachedPasswordKeys = Vec<(zeroize::Zeroizing<Vec<u8>>, CachedRar50Key)>;
+
+/// Keys per password, salt and count, each derived once without serializing distinct keys.
 #[derive(Default)]
 pub(crate) struct Rar50KeyCache {
     #[cfg(feature = "encryption")]
-    entries: std::sync::Mutex<std::collections::HashMap<([u8; 16], u8), CachedRar50Key>>,
+    entries: std::sync::Mutex<std::collections::HashMap<([u8; 16], u8), CachedPasswordKeys>>,
+}
+
+impl std::fmt::Debug for Rar50KeyCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Rar50KeyCache").finish_non_exhaustive()
+    }
 }
 
 #[cfg(feature = "encryption")]
@@ -1806,13 +1828,24 @@ impl Rar50KeyCache {
     ) -> Result<Rar50Keys> {
         // Only lookup is serialized. Slots stay at fixed addresses, so growing
         // the map moves pointers rather than leaving key copies in old storage.
-        let slot = self
-            .entries
-            .lock()
-            .map_err(|_| std::io::Error::other("RAR 5 key cache lock poisoned"))?
-            .entry((salt, kdf_count))
-            .or_default()
-            .clone();
+        let slot = {
+            let mut entries = self
+                .entries
+                .lock()
+                .map_err(|_| std::io::Error::other("RAR 5 key cache lock poisoned"))?;
+            let passwords = entries.entry((salt, kdf_count)).or_default();
+            match passwords
+                .iter()
+                .find(|(known, _)| known.as_slice() == password)
+            {
+                Some((_, slot)) => slot.clone(),
+                None => {
+                    let slot = CachedRar50Key::default();
+                    passwords.push((zeroize::Zeroizing::new(password.to_vec()), slot.clone()));
+                    slot
+                }
+            }
+        };
         slot.get_or_init(|| {
             Rar50Keys::derive(password, salt, kdf_count).map_err(map_rar50_crypto_error)
         })
@@ -1850,7 +1883,7 @@ fn read_array_at<const N: usize>(input: &[u8], pos: &mut usize, end: usize) -> R
 fn parse_archive_blocks<F, G>(
     archive_len: usize,
     options: crate::ArchiveReadOptions<'_>,
-    key_cache: &mut Rar50KeyCache,
+    key_cache: &Rar50KeyCache,
     mut read_block: F,
     mut read_encrypted_block: G,
 ) -> Result<(MainHeader, Vec<Block>)>
@@ -2555,8 +2588,7 @@ mod tests {
             let mut file = archive.files().next().unwrap().clone();
             file.encrypted = true;
             file.encryption = Some(plain.clone());
-            attach_file_crypto(&mut file, Some(b"password"), &mut Rar50KeyCache::default())
-                .unwrap();
+            attach_file_crypto(&mut file, Some(b"password"), &Rar50KeyCache::default()).unwrap();
             assert!(file.crypto.is_some());
 
             let mut unsupported = archive.files().next().unwrap().clone();
@@ -2569,7 +2601,7 @@ mod tests {
                 attach_file_crypto(
                     &mut unsupported,
                     Some(b"password"),
-                    &mut Rar50KeyCache::default()
+                    &Rar50KeyCache::default()
                 ),
                 Err(Error::UnsupportedFeature {
                     feature: "RAR 5 unknown file encryption version",
@@ -3310,7 +3342,7 @@ mod tests {
                             parse_archive_encryption_header(
                                 &parsed,
                                 Some(b"pw"),
-                                &mut Rar50KeyCache::default()
+                                &Rar50KeyCache::default()
                             ),
                             Err(Error::TooShort)
                         ),
@@ -3322,7 +3354,7 @@ mod tests {
                     parse_archive_encryption_header(
                         &parse(&header).unwrap(),
                         Some(b"pw"),
-                        &mut Rar50KeyCache::default(),
+                        &Rar50KeyCache::default(),
                     )
                     .unwrap();
                     body.push(0);
@@ -3331,7 +3363,7 @@ mod tests {
                         parse_archive_encryption_header(
                             &parse(&header).unwrap(),
                             Some(b"pw"),
-                            &mut Rar50KeyCache::default(),
+                            &Rar50KeyCache::default(),
                         ),
                         Err(Error::InvalidHeader(
                             "RAR 5 archive encryption header has trailing bytes"
@@ -3920,7 +3952,7 @@ mod tests {
         file.encrypted = true;
         file.encryption = None;
         assert!(matches!(
-            attach_file_crypto(&mut file, Some(b"pw"), &mut Rar50KeyCache::default()),
+            attach_file_crypto(&mut file, Some(b"pw"), &Rar50KeyCache::default()),
             Err(Error::InvalidHeader(
                 "RAR 5 encrypted file is missing encryption record"
             ))
@@ -3934,7 +3966,7 @@ mod tests {
             check_value: Some([0; 12]),
         });
         assert!(matches!(
-            attach_file_crypto(&mut file, Some(b"pw"), &mut Rar50KeyCache::default()),
+            attach_file_crypto(&mut file, Some(b"pw"), &Rar50KeyCache::default()),
             Err(Error::UnsupportedFeature {
                 feature: "RAR 5 KDF count",
                 ..
@@ -3943,11 +3975,11 @@ mod tests {
         file.encryption.as_mut().unwrap().kdf_count = 0;
         // WinRAR 5.21 and earlier wrote an all-zero password check, which
         // deliberately defers verification to the data checksum.
-        attach_file_crypto(&mut file, Some(b"pw"), &mut Rar50KeyCache::default()).unwrap();
+        attach_file_crypto(&mut file, Some(b"pw"), &Rar50KeyCache::default()).unwrap();
         let mut bad_check = file.clone();
         bad_check.encryption.as_mut().unwrap().check_value = Some([1; 12]);
         assert!(matches!(
-            attach_file_crypto(&mut bad_check, Some(b"pw"), &mut Rar50KeyCache::default()),
+            attach_file_crypto(&mut bad_check, Some(b"pw"), &Rar50KeyCache::default()),
             Err(Error::WrongPasswordOrCorruptData)
         ));
     }

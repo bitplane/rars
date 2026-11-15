@@ -240,7 +240,6 @@ fn independent_history_worker_limited_keeps_original_attempts_callbacks_and_erro
                 let output = entry_result(decode_parallel_entry(
                     &archive,
                     file,
-                    &crate::rar50::Rar50KeyCache::default(),
                     u64::MAX,
                     actual_options,
                     false,
